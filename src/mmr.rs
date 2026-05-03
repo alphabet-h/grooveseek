@@ -350,6 +350,27 @@ mod tests {
         );
     }
 
+    /// F-54: release build (debug_assertions disabled) で `debug_assert_eq!` は no-op になり、
+    /// 続く `if a.len() != b.len() || a.is_empty() { return 0.0; }` で fail-safe 0.0 が返る
+    /// ことを直接 assert する。debug build では debug_assert_eq! が panic するので test を
+    /// skip する必要があり、`#[cfg(not(debug_assertions))]` で gate する。
+    ///
+    /// 通常 `cargo test` (debug build) では skip、`cargo test --release` で初めて実行される。
+    /// 既存 `debug_assert_eq!` は **削除しない** (= debug build での早期検知を維持) ので、
+    /// 本 test は release-build invariant の document 化と regression catcher の役割。
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn test_cosine_similarity_dim_mismatch_returns_zero_release_only() {
+        // dim mismatch (5 vs 7) で 0.0 fail-safe
+        let a = vec![1.0_f32; 5];
+        let b = vec![1.0_f32; 7];
+        let r = cosine_similarity(&a, &b);
+        assert_eq!(r, 0.0, "dim mismatch must return 0.0 in release build");
+        // empty 入力も同 path (= `a.is_empty()` 分岐) で 0.0
+        let empty: Vec<f32> = vec![];
+        assert_eq!(cosine_similarity(&empty, &empty), 0.0);
+    }
+
     proptest::proptest! {
         #[test]
         fn prop_mmr_select_length_invariant(
