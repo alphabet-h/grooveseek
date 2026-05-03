@@ -4,7 +4,36 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
-(empty)
+### Fixed
+
+- **`expand_adjacent` cap-exceeded invariant breach (F-51)**:
+  the cap-exceeded branch in `parent.rs::expand_adjacent` previously
+  guarded `match_spans = None` clear and `expanded_from = Some(Adjacent
+  {chunk_idx, chunk_idx})` set inside an `if let Some(c) = ...find(...)`
+  block, so when the lookup failed (= rare DB inconsistency where the
+  hit chunk's `chunk_index` is excluded from the fetched range) the
+  hit was returned unchanged. Callers (`run_search_pipeline`) inspect
+  `expanded_from` to decide whether to recompute `match_spans`, so the
+  miss could leak stale offsets. Fix: keep `hit.content` overwrite
+  inside the `if let Some` guard (defensive against undefined content),
+  but apply `match_spans` clear and `expanded_from` set unconditionally
+  to always notify callers of the cap-degrade event.
+
+### Tests / Internal
+
+- F-52: extracted `is_small_chunk(Option<i64>, u32) -> bool` helper from
+  `expand_parent` and added proptest coverage for the strict-less-than
+  boundary (`token == threshold` yields `is_small = false`) and the
+  `None` arm.
+- F-53: added `test_apply_parent_retriever_disabled_pass_through` to
+  guard the `enabled=false` path's invariant that `content` /
+  `expanded_from` / `match_spans` are unchanged.
+- F-54: added `#[cfg(not(debug_assertions))]`-gated test
+  `test_cosine_similarity_dim_mismatch_returns_zero_release_only` to
+  document the release-build fail-safe (`debug_assert_eq!` is no-op,
+  followed by an explicit length-mismatch / empty-input early-return to
+  `0.0`). Exercised via `cargo test --release` (CI integration deferred
+  to F-58 / F-59 CI infra bundle).
 
 ## [0.7.3] - 2026-05-04
 

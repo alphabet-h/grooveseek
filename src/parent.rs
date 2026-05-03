@@ -26,6 +26,19 @@ fn estimated_tokens(chunk: &ChunkRow) -> u32 {
     }
 }
 
+/// `token_count` が `threshold` 未満のとき small chunk と判定する。
+/// `<` strict less than = `token == threshold` のとき small ではない (= adjacent merge path)。
+/// `token_count = None` (legacy DB / 計測失敗) は false (= small ではない、adjacent path)。
+///
+/// **設計判断 (F-52)**: 既存 `expand_parent` 内 inline ロジック (`is_small =
+/// token_count.map(|t| (t as u32) < threshold).unwrap_or(false)`) を抽出。
+/// 直接 proptest できる pure fn にすることで境界値 (token == threshold で
+/// is_small == false) の regression を catch する (= F-49 の
+/// `compute_reranker_input_limit` 抽出 pattern と整合)。
+pub(crate) fn is_small_chunk(token_count: Option<i64>, threshold: u32) -> bool {
+    token_count.map(|t| (t as u32) < threshold).unwrap_or(false)
+}
+
 /// Parent retriever 設定。kb-mcp.toml `[search.parent_retriever]` と
 /// 1:1 対応する。Task 3.5 で `ParentRetrieverConfig` を加えた後はこの構造体を
 /// 該当 config から構築する。
@@ -83,9 +96,7 @@ pub fn expand_parent(
     // small chunk: token_count が threshold 未満なら whole-doc fallback。
     // token_count = None (legacy / 計測失敗) は adjacent merge にフォールバック
     // (保守的: small かどうか判断不能なので展開しすぎないよう adjacent を選ぶ)。
-    let is_small = token_count
-        .map(|t| (t as u32) < params.whole_doc_threshold_tokens)
-        .unwrap_or(false);
+    let is_small = is_small_chunk(token_count, params.whole_doc_threshold_tokens);
 
     if is_small {
         expand_whole_document(hit, doc_id, chunk_idx, db, params)
@@ -120,14 +131,23 @@ fn expand_adjacent(
     // 防ぐ。realistic な KB では trigger されないが defense-in-depth。
     let total_tokens: u64 = neighbors.iter().map(|c| estimated_tokens(c) as u64).sum();
     if total_tokens > params.max_expanded_tokens as u64 {
+        // hit chunk が neighbors に含まれていれば content を復元する。
+        // find が None になるのは DB inconsistency (chunk_idx と fetch range の
+        // 不整合) という rare case のみで、その場合 hit.content は元のまま残す
+        // (= 未定義 content での書き換え回避の defensive ガード継続)。
         if let Some(c) = neighbors.into_iter().find(|c| c.chunk_index == chunk_idx) {
             hit.content = c.content;
-            hit.match_spans = None;
-            hit.expanded_from = Some(ExpandedRange::Adjacent {
-                from_index: chunk_idx as usize,
-                to_index: chunk_idx as usize,
-            });
         }
+        // F-51 (audit-todos): cap-degrade した事実を always 通知する invariant。
+        // caller (run_search_pipeline) は expanded_from を見て match_spans の
+        // 再計算判断をするため、find 成否に関わらず clear / set する。これで
+        // find 失敗時も拡張前 match_spans が stale で残らず、observability
+        // 上 cap-exceeded path 通過が常に検出できる。
+        hit.match_spans = None;
+        hit.expanded_from = Some(ExpandedRange::Adjacent {
+            from_index: chunk_idx as usize,
+            to_index: chunk_idx as usize,
+        });
         return Ok(hit);
     }
 
@@ -716,6 +736,173 @@ mod tests {
             other => panic!(
                 "expected Adjacent {{1,1}} (cap-degrade with NULL token_count), got {other:?}"
             ),
+        }
+    }
+
+    /// F-51 regression catcher: `expand_adjacent` cap-exceeded branch で
+    /// `find(|c| c.chunk_index == chunk_idx)` が None を返す経路 (= DB
+    /// inconsistency / fetch range が hit chunk を除外する rare case) で、
+    /// `match_spans = None` clear と `expanded_from = Some(Adjacent {chunk_idx, chunk_idx})`
+    /// set が **無条件** に行われることを assert する。
+    ///
+    /// **simulation**: c_prev (idx=0) と c_next (idx=2) のみ insert (各 ~5000 tokens)、
+    /// hit chunk (idx=1) は **doc 内に存在しない gap** とする。test は `expand_adjacent`
+    /// を直接呼び (Rust visibility ルール: 子 module は親 module の private アイテムに
+    /// アクセス可)、`chunk_idx=1` を渡す:
+    /// - `fetch_chunks_by_index_range(doc_id, 0, 2, 16)` → c_prev (idx=0) + c_next (idx=2) の 2 件返却
+    /// - `total_tokens` ≈ 10000 > cap=2000 → cap-exceeded branch
+    /// - `find(|c| c.chunk_index == 1)` → idx=0 / idx=2 マッチなし = None = find 失敗
+    /// - F-51 fix 後: `match_spans=None` + `expanded_from=Some(Adjacent {1, 1})` 無条件 set
+    ///
+    /// fix 適用前: `if let Some` ガードで何もせず return → assert fail (= TDD red)
+    /// fix 適用後: 無条件 set 実施 → assert pass (= TDD green)
+    #[test]
+    fn test_parent_cap_exceeded_with_missing_hit_chunk() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .expect("upsert");
+        // c_prev (idx=0) と c_next (idx=2) のみ insert (idx=1 は gap)。各 ~20000 byte
+        // (= token_count ~5000) で 2 chunks 合計 = 10000 > cap=2000 を満たす。
+        let big_body = format!("big {}", "body content body content ".repeat(800));
+        let _c_prev = db
+            .insert_chunk(
+                doc_id,
+                0,
+                Some("h0"),
+                None,
+                &big_body,
+                &dummy_emb_384(),
+                1.0,
+            )
+            .expect("c_prev");
+        let _c_next = db
+            .insert_chunk(
+                doc_id,
+                2,
+                Some("h2"),
+                None,
+                &big_body,
+                &dummy_emb_384(),
+                1.0,
+            )
+            .expect("c_next");
+
+        let original_marker = "ORIGINAL_HIT_CONTENT_MARKER";
+        let hit = make_hit("/doc.md", original_marker);
+        let p = ParentRetrieverParams {
+            whole_doc_threshold_tokens: 100,
+            max_expanded_tokens: 2000,
+        };
+        // expand_adjacent を直接呼ぶ (private fn、`mod tests` から super:: で呼出し可)。
+        // chunk_idx=1 を artificially 渡す = doc 内に idx=1 chunk は存在しないので find 失敗を保証。
+        let expanded = expand_adjacent(hit, doc_id, 1, &db, p).expect("expand_adjacent");
+
+        // F-51 fix 適用前は以下の 3 assert がすべて fail する:
+        // - expanded_from は None のまま (`if let Some` ガード内で set されないため)
+        // - match_spans は None のまま (これは make_hit の初期値が None なので fix 前後で同じ、
+        //   ただし `Some(...)` を仕込んだ test だと clear が無条件であることを区別できる -
+        //   本 test では make_hit の初期値が None なので clear の 「無条件性」は expanded_from
+        //   set の有無で代替検出する)
+        // - content は元のまま (find 失敗で書き換えなし、fix 前後で同じ)
+        match expanded.expanded_from {
+            Some(ExpandedRange::Adjacent {
+                from_index: 1,
+                to_index: 1,
+            }) => {}
+            ref other => {
+                panic!("expected Adjacent {{1, 1}} (cap-degrade with find-failure), got {other:?}")
+            }
+        }
+        assert!(
+            expanded.match_spans.is_none(),
+            "match_spans must be None after cap-degrade (find failure path)"
+        );
+        // hit.content は make_hit 由来の original_marker のまま (find 失敗で `hit.content =
+        // c.content` 経路は通らない、`if let Some(c)` ガード残存を担保)
+        assert_eq!(
+            expanded.content, original_marker,
+            "hit.content must be unchanged when find fails (if let Some guard preserves it)"
+        );
+    }
+
+    /// F-53: `apply_parent_retriever(enabled=false)` の pass-through 確認。
+    /// `content` / `expanded_from` / `match_spans` の 3 field がすべて入力時から
+    /// 不変であることを直接 assert する。enabled=false 経路 (line 59-61) は
+    /// chunk_id を捨てるだけで他 field は触らない invariant を guard する
+    /// regression catcher。
+    ///
+    /// **MatchSpan 比較**: `MatchSpan` (db.rs:52) は `PartialEq` 未 derive (= MCP
+    /// serialize/deserialize の本質型なので加算 derive は別 cycle 判断)。本 test は
+    /// field (start / end) 個別 assert で比較する。
+    #[test]
+    fn test_apply_parent_retriever_disabled_pass_through() {
+        use crate::db::MatchSpan;
+
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        // Database::open + verify_embedding_meta は既存 helper pattern を流用。
+        // enabled=false 経路は DB を参照しないが、将来 signature が変わって DB を触る経路が増えた
+        // 場合の安全性のため initialize は省略しない。
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+
+        // 入力 hit に 3 field を pre-set (= pass-through で全 field 不変であることを assert)
+        let mut hit = make_hit("/doc.md", "input content");
+        hit.expanded_from = Some(ExpandedRange::WholeDocument { total_chunks: 5 });
+        hit.match_spans = Some(vec![MatchSpan { start: 10, end: 20 }]);
+
+        let input: Vec<(i64, SearchHit)> = vec![(42, hit)];
+        let result = apply_parent_retriever(input, &db, false, params());
+
+        assert_eq!(result.len(), 1);
+        let out = &result[0];
+        assert_eq!(out.content, "input content");
+        match out.expanded_from {
+            Some(ExpandedRange::WholeDocument { total_chunks: 5 }) => {}
+            ref other => panic!("expanded_from must be unchanged, got {other:?}"),
+        }
+        // MatchSpan は PartialEq 未 derive、field 個別 assert で比較
+        let spans = out
+            .match_spans
+            .as_ref()
+            .expect("match_spans must be Some after pass-through");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, 10);
+        assert_eq!(spans[0].end, 20);
+    }
+
+    proptest::proptest! {
+        /// F-52: `is_small_chunk` の `<` strict less than 境界値固定。
+        /// token == threshold のとき is_small == false (= adjacent merge path) を proptest 化。
+        /// 将来 `<=` や `<` の判定ロジックが書き換わる regression を catch する。
+        ///
+        /// **range**: `token in 0i64..100_000` は実運用 token_count 範囲 (= chunk content
+        /// `bytes / 4`、典型的に < 10K) を十分カバー。`i64` 全域 / `i64::MAX` 級は `t as u32`
+        /// cast truncation の挙動と乖離するため scope 外。
+        /// `threshold in 1u32..1_000` は `whole_doc_threshold_tokens` の実運用範囲 (= default 100、typical 50-500)。
+        #[test]
+        fn prop_is_small_chunk_strict_less_than(
+            token in 0i64..100_000_i64,
+            threshold in 1u32..1_000_u32,
+        ) {
+            let is_small = is_small_chunk(Some(token), threshold);
+            proptest::prop_assert_eq!(is_small, (token as u32) < threshold);
+            // 境界: token == threshold は is_small == false
+            if (token as u32) == threshold {
+                proptest::prop_assert!(!is_small, "boundary: token == threshold must yield is_small == false");
+            }
+        }
+
+        /// `token_count = None` のとき is_small は無条件 false (= adjacent path)。
+        #[test]
+        fn prop_is_small_chunk_none_yields_false(threshold in 1u32..10_000_u32) {
+            proptest::prop_assert!(!is_small_chunk(None, threshold));
         }
     }
 }
