@@ -4,9 +4,13 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+(empty)
+
+## [0.7.4] - 2026-05-04
+
 ### Fixed
 
-- **`expand_adjacent` cap-exceeded invariant breach (F-51)**:
+- **`expand_adjacent` cap-exceeded invariant breach (F-51, #45)**:
   the cap-exceeded branch in `parent.rs::expand_adjacent` previously
   guarded `match_spans = None` clear and `expanded_from = Some(Adjacent
   {chunk_idx, chunk_idx})` set inside an `if let Some(c) = ...find(...)`
@@ -690,7 +694,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.0...v0.7.1
