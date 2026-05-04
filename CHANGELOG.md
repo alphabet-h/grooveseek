@@ -4,6 +4,36 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-05-04
+
+### Added
+
+- **F-64**: `[transport.http].healthz_public` opt-in flag (default `true`,
+  current behavior). Setting it to `false` places `/healthz` under the same
+  `allowed_hosts` Host-header validation as `/mcp`, preventing kb-mcp
+  fingerprinting from non-allowlisted hosts. `None` falls back to the rmcp
+  default loopback list (`localhost` / `127.0.0.1` / `::1`); `Some([])`
+  matches rmcp's `disable_allowed_hosts` (= allow any host, opt-out).
+
+### Security
+
+- **F-62**: `collect_source_files` (`kb-mcp index`) and `validate_collect_md_files`
+  (`kb-mcp validate`) now always skip `.git`, `.svn`, and `node_modules`
+  directories regardless of the user's `[indexer].exclude_dirs` config
+  (union semantics). `DEFAULT_EXCLUDE_DIRS` already contains these entries
+  for the section-absent case, but a user who overrides `exclude_dirs =
+  ["custom"]` without re-listing VCS metadata would previously have
+  `.git/HEAD` / `.git/config` indexed — leading to `.kb-mcp.db` bloat and
+  retrieval noise. Watcher path (`is_under_excluded_dir`) is unaffected by
+  design (extension filter rejects non-`.md` files).
+
+### Documentation
+
+- Document the implicit "stdout = data output, stderr = progress / status /
+  diagnostics" CLI convention in `CLAUDE.md` and `docs/ARCHITECTURE.{md,ja.md}`.
+  Surfaced by feature-36 / F-67 where a subprocess test failed because it
+  grepped `Documents: 6` from stdout while `Commands::Status` emits to stderr.
+
 ### Internal
 
 - **F-55**: Extracted 9 MCP / kb-mcp binary helpers (kb_mcp_bin /
@@ -43,6 +73,9 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   default and chunker+embedder throughput under the `heavy-bench`
   feature gate (mirrors the existing `search_latency` reranker
   pattern). Source code unchanged.
+- Add `tower 0.5` to `[dev-dependencies]` (with `util` feature) for the
+  F-64 `/healthz` middleware unit tests (`ServiceExt::oneshot`). Release
+  binary unaffected.
 
 ## [0.7.4] - 2026-05-04
 

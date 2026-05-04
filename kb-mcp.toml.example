@@ -110,6 +110,12 @@ bind = "127.0.0.1:3100"
 # 相当、public 公開時は推奨されない)。
 #allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100"]
 
+# F-64 (v0.7.5+): /healthz endpoint も allowed_hosts allow-list 配下に置くか。
+# 既定は true (= public、現行挙動、Host check なし)。false にすると
+# /healthz も Host header 検証され、non-allowlisted host から 403。
+# kb-mcp の存在 fingerprinting を防ぎたい時に opt-in。
+#healthz_public = false
+
 # --- eval (retrieval quality evaluation, optional power-user feature) ---
 # 詳細は docs/eval.md / docs/eval.ja.md を参照。省略時は全デフォルトで動作する。
 # セクション自体を丸ごと削除してよい。残す場合、各フィールドはすべて optional

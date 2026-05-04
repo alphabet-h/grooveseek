@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "kb-mcp"
-version = "0.7.4"
+version = "0.7.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1812,6 +1812,7 @@ dependencies = [
  "sqlite-vec",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "walkdir",

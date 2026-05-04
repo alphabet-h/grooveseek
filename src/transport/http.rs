@@ -12,12 +12,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    body::Body,
+    extract::{Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 
 use crate::server::{KbServer, KbServerShared};
+
+/// rmcp's default loopback-only allow-list, mirrored locally so the F-64
+/// `/healthz` middleware can apply identical semantics when
+/// `allowed_hosts = None`. Keep in sync with rmcp upstream.
+const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 /// Start an axum-based HTTP server that exposes the MCP service at `/mcp`.
 /// Blocks until SIGINT or a bind error. On bind failure, returns with a
@@ -39,6 +52,7 @@ use crate::server::{KbServer, KbServerShared};
 pub async fn run_http(
     addr: SocketAddr,
     allowed_hosts: Option<Vec<String>>,
+    healthz_public: bool,
     shared: KbServerShared,
 ) -> Result<()> {
     // bind 範囲と allow-list の組合せが噛み合っていない時に warn を出す。
@@ -64,15 +78,28 @@ pub async fn run_http(
     let factory =
         move || -> Result<KbServer, std::io::Error> { Ok(KbServer::from_shared(&factory_shared)) };
 
-    let mcp_config = match allowed_hosts {
+    let mcp_config = match allowed_hosts.clone() {
         Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
         None => StreamableHttpServerConfig::default(),
     };
     let mcp_service = StreamableHttpService::new(factory, session_manager, mcp_config);
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .nest_service("/mcp", mcp_service);
+    // F-64: `/healthz` を `allowed_hosts` 検証配下に置く opt-in。
+    // healthz_public = true (default) の場合は従来通り Host check なしで public。
+    // false の場合は `allowed_hosts` を `Arc` で middleware state に渡し、
+    // Host header を検証して non-allowlisted は 403。
+    let healthz_router = if healthz_public {
+        Router::new().route("/healthz", get(healthz))
+    } else {
+        let allowed_state = Arc::new(allowed_hosts.clone());
+        Router::new()
+            .route("/healthz", get(healthz))
+            .layer(middleware::from_fn_with_state(
+                allowed_state,
+                healthz_host_check,
+            ))
+    };
+    let app = healthz_router.nest_service("/mcp", mcp_service);
 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
@@ -94,6 +121,46 @@ pub async fn run_http(
         .await
         .context("axum::serve failed")?;
     Ok(())
+}
+
+/// F-64: `/healthz` 用 axum middleware。`Host` header を `allowed_hosts`
+/// (state) と照合し、不一致なら 403 を返す。`allowed_hosts` の semantics は
+/// rmcp の `with_allowed_hosts` と同等:
+/// - `None` → `DEFAULT_LOOPBACK_HOSTS` (`localhost` / `127.0.0.1` / `::1`) のみ pass
+/// - `Some(empty)` → 全 Host 許可 (= `disable_allowed_hosts` 相当)
+/// - `Some(non_empty)` → list と case-insensitive 一致のみ pass
+async fn healthz_host_check(
+    State(allowed): State<Arc<Option<Vec<String>>>>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Response {
+    let host_raw = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    // strip port (= host:port → host)
+    let host = host_raw.split(':').next().unwrap_or(host_raw);
+
+    let allowed_match = match allowed.as_ref() {
+        // None → rmcp default loopback list 互換
+        None => DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(host)),
+        // Some(empty) → 全許可 (= disable_allowed_hosts 相当)
+        Some(v) if v.is_empty() => true,
+        // Some(non_empty) → 一致のみ pass
+        Some(v) => v.iter().any(|a| a.as_str().eq_ignore_ascii_case(host)),
+    };
+
+    if allowed_match {
+        next.run(req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("forbidden"))
+            .expect("static response build")
+    }
 }
 
 /// `addr` が非 loopback (0.0.0.0、unspecified、または LAN IP 等) で、かつ
@@ -171,5 +238,106 @@ mod tests {
     fn test_warn_on_lan_ip_bind_with_default_allowed_hosts() {
         let addr: SocketAddr = "192.168.1.10:3100".parse().unwrap();
         assert!(should_warn_non_loopback_bind(&addr, None));
+    }
+
+    // -----------------------------------------------------------------------
+    // F-64: /healthz Host check middleware (healthz_public opt-in).
+    // -----------------------------------------------------------------------
+
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    /// Build a minimal Router with only the `/healthz` route, mirroring the
+    /// `run_http` pattern but without spawning an actual TCP server.
+    fn build_test_router(healthz_public: bool, allowed_hosts: Option<Vec<String>>) -> Router {
+        if healthz_public {
+            Router::new().route("/healthz", get(healthz))
+        } else {
+            let allowed_state = Arc::new(allowed_hosts);
+            Router::new()
+                .route("/healthz", get(healthz))
+                .layer(middleware::from_fn_with_state(
+                    allowed_state,
+                    healthz_host_check,
+                ))
+        }
+    }
+
+    /// `healthz_public = true` (default) なら任意 Host から 200。
+    #[tokio::test]
+    async fn test_healthz_public_true_allows_any_host() {
+        let app = build_test_router(true, None);
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `healthz_public = false` + 明示 allow-list で allowlisted Host から 200。
+    #[tokio::test]
+    async fn test_healthz_public_false_with_explicit_allowed_hosts_allows_allowlisted() {
+        let app = build_test_router(false, Some(vec!["custom.example".into()]));
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "custom.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `healthz_public = false` + 明示 allow-list で non-allowlisted Host から 403。
+    #[tokio::test]
+    async fn test_healthz_public_false_with_explicit_allowed_hosts_rejects_non_allowlisted() {
+        let app = build_test_router(false, Some(vec!["custom.example".into()]));
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `healthz_public = false` + `allowed_hosts = None` → rmcp default
+    /// loopback list 互換 (= localhost / 127.0.0.1 / ::1 のみ pass)。
+    #[tokio::test]
+    async fn test_healthz_public_false_with_none_allowed_hosts_uses_loopback_default() {
+        // non-loopback Host → 403
+        let app1 = build_test_router(false, None);
+        let req1 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp_evil = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp_evil.status(), StatusCode::FORBIDDEN);
+
+        // loopback Host → 200
+        let app2 = build_test_router(false, None);
+        let req2 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let resp_loopback = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp_loopback.status(), StatusCode::OK);
+    }
+
+    /// `healthz_public = false` + `allowed_hosts = Some(empty)` → 全許可
+    /// (= rmcp の `disable_allowed_hosts` 相当、operator 自己責任 opt-out)。
+    #[tokio::test]
+    async fn test_healthz_public_false_with_empty_allowed_hosts_allows_any() {
+        let app = build_test_router(false, Some(vec![]));
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "anything.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

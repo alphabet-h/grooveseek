@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 description = "MCP server providing semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a Markdown / plain-text knowledge base."
 authors = ["koshian"]
@@ -55,6 +55,11 @@ heavy-bench = []
 # Property-based testing for f64 invariant guards (recall_at_k / ndcg_at_k /
 # chunk_quality_score の値域 [0.0, 1.0] を proptest で固定)。
 proptest = "1"
+# F-64 (feature-38): /healthz middleware の unit test (= ServiceExt::oneshot
+# で Router を 1 リクエスト処理) 用。axum 0.8 の transitive 経由で workspace
+# に存在するが、direct dep 宣言なしで `use tower::...` するのは resolver = "2"
+# 配下で warning / 不安定なので direct dep 宣言する。
+tower = { version = "0.5", features = ["util"] }
 # [F-39 PR-B] criterion-based benchmarking infrastructure. The benches under
 # `benches/` call into the lib crate (and subprocess where needed), since the
 # lib surface is intentionally unstable (see src/lib.rs).

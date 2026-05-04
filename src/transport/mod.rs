@@ -49,6 +49,14 @@ pub struct HttpTransportConfig {
     /// `disable_allowed_hosts` と同等)。public 公開時は推奨されない。
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
+
+    /// `/healthz` を `allowed_hosts` allow-list 配下に置くか (= F-64
+    /// fingerprinting hardening)。`None` (省略) or `Some(true)` =
+    /// 現行挙動 (`/healthz` は public、Host check なし)。`Some(false)`
+    /// = `/healthz` も `allowed_hosts` で gate、non-allowlisted host
+    /// から 403。default = true で backward compat 維持。
+    #[serde(default)]
+    pub healthz_public: Option<bool>,
 }
 
 /// `[transport]` config section.
@@ -75,6 +83,10 @@ pub enum Transport {
         /// `Some(vec)` = 明示 list (空 `Vec` を渡すと rmcp 側で全 Host
         /// 許可になる)。F-33 で `kb-mcp.toml` から surface した。
         allowed_hosts: Option<Vec<String>>,
+        /// F-64: `/healthz` を `allowed_hosts` 検証配下に置くか。
+        /// `true` (default) = 現行挙動 (Host check なし、public)。
+        /// `false` = `/healthz` も Host check (= non-allowlisted から 403)。
+        healthz_public: bool,
     },
 }
 
@@ -119,9 +131,14 @@ impl Transport {
                 let allowed_hosts = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.allowed_hosts.clone());
+                let healthz_public = cfg
+                    .and_then(|c| c.http.as_ref())
+                    .and_then(|h| h.healthz_public)
+                    .unwrap_or(true);
                 Ok(Transport::Http {
                     addr,
                     allowed_hosts,
+                    healthz_public,
                 })
             }
         }
@@ -172,6 +189,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:3100".parse().unwrap(),
                 allowed_hosts: None,
+                healthz_public: true,
             }
         );
     }
@@ -184,6 +202,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:4000".parse().unwrap(),
                 allowed_hosts: None,
+                healthz_public: true,
             }
         );
     }
@@ -202,6 +221,7 @@ mod tests {
             Transport::Http {
                 addr: "0.0.0.0:9000".parse().unwrap(),
                 allowed_hosts: None,
+                healthz_public: true,
             }
         );
     }
@@ -225,6 +245,7 @@ mod tests {
             http: Some(HttpTransportConfig {
                 bind: Some("127.0.0.1:5555".into()),
                 allowed_hosts: None,
+                ..HttpTransportConfig::default()
             }),
         };
         let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
@@ -233,6 +254,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:5555".parse().unwrap(),
                 allowed_hosts: None,
+                healthz_public: true,
             }
         );
     }
@@ -244,6 +266,7 @@ mod tests {
             http: Some(HttpTransportConfig {
                 bind: Some("not-an-address".into()),
                 allowed_hosts: None,
+                ..HttpTransportConfig::default()
             }),
         };
         let err = Transport::resolve(None, None, None, Some(&cfg)).expect_err("must reject");
@@ -262,6 +285,7 @@ mod tests {
                     "kb.example.lan".to_string(),
                     "192.168.1.10".to_string(),
                 ]),
+                ..HttpTransportConfig::default()
             }),
         };
         let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
@@ -269,6 +293,7 @@ mod tests {
             Transport::Http {
                 addr,
                 allowed_hosts,
+                healthz_public: _,
             } => {
                 assert_eq!(addr, "0.0.0.0:3100".parse().unwrap());
                 assert_eq!(
