@@ -31,7 +31,7 @@ use common::mcp::{
 use common::temp::TempKbLayout;
 
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Place a single `.md` file under `layout.kb()` so the initial
 /// `build_index` run has something to chunk + embed.
@@ -95,30 +95,46 @@ fn test_watcher_picks_up_new_file() {
         ),
     );
 
-    // Wait for: debounce window (500ms) + handle_events (db lock +
-    // embed + commit) + flush. Empirically ~1-1.5s on Linux; budget 3s.
-    sleep(Duration::from_millis(3000));
-
-    // Search for the marker we only put in the new file. If MMR off
-    // does not surface it, the watcher did not pick it up.
-    let resp = mcp_search_call(
-        &base,
-        &session,
-        serde_json::json!({
-            "query": FRESH_MARKER,
-            "limit": 5,
-            "mmr": false,
-        }),
-    );
-    let order = extract_path_heading_order(&resp);
-    assert!(
-        order
+    // Poll `mcp_search` until the watcher has indexed `freshly_added.md`
+    // or `deadline` expires. Replaces a previous fixed `sleep(3000)`
+    // (codex review P2): on slower CI hosts the watcher can index just
+    // past a fixed deadline and produce a false failure. Polling is
+    // bounded by `deadline` so we still surface a real hang.
+    //
+    // Deadline budget = debounce window (500ms) + handle_events (db
+    // lock + embed + commit) + flush. Empirically ~1-1.5s on Linux;
+    // 8s gives plenty of headroom for slower CI hosts (mirrors the
+    // wait_http_200 pattern).
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    let order_at_deadline = loop {
+        let resp = mcp_search_call(
+            &base,
+            &session,
+            serde_json::json!({
+                "query": FRESH_MARKER,
+                "limit": 5,
+                "mmr": false,
+            }),
+        );
+        let order = extract_path_heading_order(&resp);
+        if order
             .iter()
-            .any(|(path, _heading)| path.ends_with("freshly_added.md")),
-        "watcher did not surface `freshly_added.md` after sleep budget; \
-         got {order:?}.\n\
+            .any(|(path, _heading)| path.ends_with("freshly_added.md"))
+        {
+            return;
+        }
+        if start.elapsed() >= deadline {
+            break order;
+        }
+        sleep(poll_interval);
+    };
+    panic!(
+        "watcher did not surface `freshly_added.md` within {deadline:?}; \
+         last search result {order_at_deadline:?}.\n\
          If this is intermittent on macOS/Windows, the test is best-effort \
-         opt-in there (Linux is primary). On Linux, increase the post-create \
-         sleep or investigate handle_events latency.",
+         opt-in there (Linux is primary). On Linux, increase the deadline \
+         or investigate handle_events latency.",
     );
 }
