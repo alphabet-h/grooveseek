@@ -4,7 +4,21 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
-(empty)
+### Internal
+
+- **F-55**: Extracted 9 MCP / kb-mcp binary helpers (kb_mcp_bin /
+  pick_free_port / wait_http_200 / spawn_mcp_server / ServerGuard /
+  mcp_initialize / mcp_search_call / build_index /
+  extract_path_heading_order) from `tests/search_mmr_integration.rs` and
+  `tests/search_parent_integration.rs` into a shared
+  `tests/common/mcp.rs` module. Each test file now imports them via
+  `use common::mcp::...;`. Existing test bodies and `#[ignore]` attributes
+  are byte-identical.
+- **F-56**: Added `tests/fixtures/kb-small/` shared KB fixture (6 docs:
+  ASCII + CJK + frontmatter rich / empty / none variants). New
+  `tests/kb_small_smoke.rs` exercises the fixture end-to-end via
+  `kb-mcp index` + `kb-mcp serve` (MCP HTTP transport), including a
+  Japanese-CJK query smoke test.
 
 ## [0.7.4] - 2026-05-04
 
