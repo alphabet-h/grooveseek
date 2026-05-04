@@ -19,6 +19,14 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `tests/kb_small_smoke.rs` exercises the fixture end-to-end via
   `kb-mcp index` + `kb-mcp serve` (MCP HTTP transport), including a
   Japanese-CJK query smoke test.
+- **F-58 / F-59**: CI infra — clippy 3-OS matrix in
+  `.github/workflows/ci.yml` (replaces the single ubuntu-latest job
+  with a `[ubuntu-latest, macos-latest, windows-latest]` matrix,
+  `fail-fast: false`) and a nightly `cargo-llvm-cov` line-coverage
+  job in `.github/workflows/nightly.yml` (uses
+  `taiki-e/install-action@v2` for pre-built install,
+  `--summary-only` output redirected to `$GITHUB_STEP_SUMMARY`).
+  Source code unchanged.
 
 ## [0.7.4] - 2026-05-04
 
