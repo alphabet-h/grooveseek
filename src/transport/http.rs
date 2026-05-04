@@ -123,34 +123,56 @@ pub async fn run_http(
     Ok(())
 }
 
-/// `Host` header から host portion を取り出す (port を除外)。
+/// `Host` header / allow-list entry を `(host, Option<port>)` に分解する。
 /// RFC 7230 の Host header 文法に従う:
-/// - IPv6 literal: `[::1]:3100` → `::1` (= 角括弧と port を剥がす)
-/// - IPv6 literal w/o port: `[::1]` → `::1`
-/// - IPv4 / hostname w/ port: `localhost:3100` → `localhost`、`192.168.1.10:3100` → `192.168.1.10`
-/// - IPv4 / hostname w/o port: そのまま
+/// - IPv6 literal w/ port: `[::1]:3100` → (`"::1"`, `Some("3100")`)
+/// - IPv6 literal w/o port: `[::1]` → (`"::1"`, `None`)
+/// - IPv6 unbracketed (config 形式): `"::1"` → (`"::1"`, `None`)
+/// - IPv4 / hostname w/ port: `192.168.1.10:3100` → (`"192.168.1.10"`, `Some("3100")`)
+/// - IPv4 / hostname w/o port: `192.168.1.10` → (`"192.168.1.10"`, `None`)
 ///
-/// codex P2 (#50): 単純な `split(':').next()` だと IPv6 が `[` だけになり、
-/// またユーザが `allowed_hosts = ["192.168.1.10:3100"]` のように port 込みで
-/// 列挙したとき (kb-mcp.toml.example の document 例) match しなくなる。
-/// 本関数は port を剥がした「host のみ」を返し、呼び出し側は full Host
-/// header と host-only の **両方** を allow-list と比較することで両 form の
-/// allow-list entry を許容する。
-fn extract_host_part(host_raw: &str) -> &str {
-    // IPv6 literal: `[ipv6]:port` または `[ipv6]`
-    if let Some(rest) = host_raw.strip_prefix('[')
+/// codex P2 (#50 round 1-4): port-aware にすることで以下を一貫させる:
+/// - IPv6 literal の bracket 剥がし
+/// - allow-list の host-only entry は port-agnostic match
+/// - allow-list の host:port entry は **port 厳密一致**
+///   (= `["example.com:8080"]` が `Host: example.com:9999` を accept しない)
+fn split_host_port(s: &str) -> (&str, Option<&str>) {
+    // Bracketed IPv6: `[ipv6]:port` or `[ipv6]`
+    if let Some(rest) = s.strip_prefix('[')
         && let Some(end) = rest.find(']')
     {
-        return &rest[..end];
+        let host = &rest[..end];
+        let after = &rest[end + 1..];
+        if let Some(port) = after.strip_prefix(':') {
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                return (host, Some(port));
+            }
+        }
+        return (host, None);
     }
-    // IPv4 / hostname: 最後の `:` で port を剥がす (port は all-digit のはず)
-    if let Some(colon) = host_raw.rfind(':') {
-        let port_part = &host_raw[colon + 1..];
-        if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
-            return &host_raw[..colon];
+    // No brackets. Count colons to disambiguate IPv4/hostname:port vs IPv6 unbracketed.
+    let colon_count = s.bytes().filter(|&b| b == b':').count();
+    if colon_count >= 2 {
+        // IPv6 unbracketed (config 形式 like "::1") — no port form.
+        return (s, None);
+    }
+    if colon_count == 1 {
+        if let Some(colon) = s.rfind(':') {
+            let port_part = &s[colon + 1..];
+            if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
+                return (&s[..colon], Some(port_part));
+            }
         }
     }
-    host_raw
+    (s, None)
+}
+
+/// `split_host_port` の host portion のみを返す薄い wrapper。
+/// 既存 unit test との後方互換性のため残す (= production code は
+/// `split_host_port` を直接使用、本関数は test 範囲のみ参照)。
+#[cfg(test)]
+fn extract_host_part(s: &str) -> &str {
+    split_host_port(s).0
 }
 
 /// F-64: `/healthz` 用 axum middleware。`Host` header を `allowed_hosts`
@@ -180,22 +202,27 @@ async fn healthz_host_check(
         .and_then(|h| h.to_str().ok())
         .or(authority_owned.as_deref())
         .unwrap_or("");
-    let host_part = extract_host_part(host_full);
+    let (incoming_host, incoming_port) = split_host_port(host_full);
 
-    // allow-list entry も同じく normalize (= host_part) してから比較。
-    // codex P2 (#50 round 3): rmcp の `with_allowed_hosts` は authority を
-    // parse し `"[::1]"` を host `::1` として扱う。本 middleware も同 semantics
-    // にするため、allow-list 側も extract_host_part を通す = bracketed IPv6
-    // entry が incoming `Host: [::1]:3100` と (or `Host: [::1]`) と match する。
-    // 4 通りの組合せ (allow_full × incoming_full / allow_full × incoming_part /
-    // allow_part × incoming_full / allow_part × incoming_part) のいずれかで
-    // 一致すれば pass。eq_ignore_ascii_case で hostname の大文字小文字は同等。
+    // codex P2 (#50 round 1-4): allow-list entry を `(host, port)` に分解、
+    // host は normalize (= bracket / port 剥がし) で比較。port は:
+    // - allow に port 指定あり → incoming も同じ port のみ pass (strict)
+    // - allow に port 指定なし → incoming の port は無視 (port-agnostic)
+    // これで以下が満たされる:
+    //   - `["192.168.1.10"]` (= host-only) は `Host: 192.168.1.10` も
+    //     `Host: 192.168.1.10:3100` も match
+    //   - `["192.168.1.10:3100"]` (= port 込み) は `Host: 192.168.1.10:3100` のみ match、
+    //     `Host: 192.168.1.10:9999` は **403** (codex round 4 の P2 fix)
+    //   - `["[::1]"]` も `["::1"]` も IPv6 loopback の任意 form と match
     let matches = |allow: &str| -> bool {
-        let allow_part = extract_host_part(allow);
-        allow.eq_ignore_ascii_case(host_full)
-            || allow.eq_ignore_ascii_case(host_part)
-            || allow_part.eq_ignore_ascii_case(host_full)
-            || allow_part.eq_ignore_ascii_case(host_part)
+        let (allow_host, allow_port) = split_host_port(allow);
+        if !allow_host.eq_ignore_ascii_case(incoming_host) {
+            return false;
+        }
+        match allow_port {
+            Some(ap) => incoming_port == Some(ap),
+            None => true,
+        }
     };
 
     let allowed_match = match allowed.as_ref() {
@@ -482,6 +509,42 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// codex P2 (#50 round 4): allow-list entry が **port 込み** の場合は
+    /// incoming Host header の port も **strict 一致** (= port-aware)。
+    /// `["example.com:8080"]` は `Host: example.com:9999` を accept しない。
+    #[tokio::test]
+    async fn test_healthz_public_false_with_port_qualified_allowlist_strict() {
+        // 同じ port → 200
+        let app1 = build_test_router(false, Some(vec!["example.com:8080".into()]));
+        let req1 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "example.com:8080")
+            .body(Body::empty())
+            .unwrap();
+        let resp1 = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // 異なる port → 403 (codex round 4 fix の核心)
+        let app2 = build_test_router(false, Some(vec!["example.com:8080".into()]));
+        let req2 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "example.com:9999")
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+
+        // port 抜きの incoming Host も 403 (allow が port 指定なので strict)
+        let app3 = build_test_router(false, Some(vec!["example.com:8080".into()]));
+        let req3 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp3 = app3.oneshot(req3).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::FORBIDDEN);
     }
 
     /// codex P2 (#50 round 3): allow-list entry も normalize して比較。
