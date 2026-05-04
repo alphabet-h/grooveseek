@@ -138,18 +138,28 @@ pub async fn run_http(
 ///   (= `["example.com:8080"]` が `Host: example.com:9999` を accept しない)
 fn split_host_port(s: &str) -> (&str, Option<&str>) {
     // Bracketed IPv6: `[ipv6]:port` or `[ipv6]`
+    // codex P1 (#50 round 5): `]` の後ろに任意の文字列 (例: `[::1]evil.example`)
+    // を許すと、malformed Host が allow-list bypass になる (= host="::1" に
+    // 正規化されてしまい loopback default に通る)。`after` は **空** または
+    // `:<digits>` のみ許容、それ以外は raw 文字列を返して match 不能化する。
     if let Some(rest) = s.strip_prefix('[')
         && let Some(end) = rest.find(']')
     {
         let host = &rest[..end];
         let after = &rest[end + 1..];
+        if after.is_empty() {
+            return (host, None);
+        }
         if let Some(port) = after.strip_prefix(':')
             && !port.is_empty()
             && port.chars().all(|c| c.is_ascii_digit())
         {
             return (host, Some(port));
         }
-        return (host, None);
+        // Malformed bracketed Host (`]` 後に予期しない文字列) → raw を返す。
+        // 比較側は host_full == raw or host_part == raw のみで判定するので、
+        // 通常の allow-list entry とは一致しない = 403 (= bypass を防ぐ)。
+        return (s, None);
     }
     // No brackets. Count colons to disambiguate IPv4/hostname:port vs IPv6 unbracketed.
     let colon_count = s.bytes().filter(|&b| b == b':').count();
@@ -510,6 +520,21 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// codex P1 (#50 round 5): malformed bracketed Host (`[::1]evil.example`)
+    /// が host-only に正規化されて allow-list bypass になる security 罠の
+    /// regression test。loopback default で 403 を返すこと。
+    #[tokio::test]
+    async fn test_healthz_public_false_rejects_malformed_bracketed_host() {
+        let app = build_test_router(false, None);
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "[::1]evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     /// codex P2 (#50 round 4): allow-list entry が **port 込み** の場合は
