@@ -34,6 +34,15 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   rest of `Commands::Status`), reserving stdout for data output such
   as `kb-mcp search` JSON results. Surfaced by feature-35's first live
   nightly run; production behavior is unchanged.
+- **F-57 / F-60残**: Watcher real-disk e2e test (`tests/watcher_e2e.rs`,
+  `#[ignore]`-gated, Linux primary) and an index_throughput criterion
+  bench (`benches/index_throughput.rs`). The test exercises
+  notify-debouncer-full -> run_watch_loop -> indexer end-to-end via a
+  new `spawn_mcp_server_with_watch` helper appended to
+  `tests/common/mcp.rs`. The bench measures chunker throughput by
+  default and chunker+embedder throughput under the `heavy-bench`
+  feature gate (mirrors the existing `search_latency` reranker
+  pattern). Source code unchanged.
 
 ## [0.7.4] - 2026-05-04
 
