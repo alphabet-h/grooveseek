@@ -169,9 +169,16 @@ async fn healthz_host_check(
     req: Request,
     next: Next,
 ) -> Response {
+    // codex P2 (#50 round 2): HTTP/2 では `Host` header の代わりに
+    // `:authority` pseudo-header が使われ、`headers.get("host")` が `None`
+    // を返す。rmcp の `/mcp` 経路はこれを `uri.authority()` で fallback して
+    // accept するので、本 middleware も同じ semantics に揃える (= HTTP/2 や
+    // proxy-forwarded health check で false reject を出さない)。
+    let authority_owned: Option<String> = req.uri().authority().map(|a| a.to_string());
     let host_full = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
+        .or(authority_owned.as_deref())
         .unwrap_or("");
     let host_part = extract_host_part(host_full);
 
@@ -448,5 +455,21 @@ mod tests {
     #[test]
     fn test_extract_host_part_empty() {
         assert_eq!(extract_host_part(""), "");
+    }
+
+    /// codex P2 (#50 round 2): Host header 不在時に URI authority を
+    /// fallback として読む (= HTTP/2 / proxy-forwarded request の `:authority`
+    /// pseudo-header 互換)。Host header を **付けず**、URI に
+    /// `http://localhost/healthz` を渡して authority 経由で match。
+    #[tokio::test]
+    async fn test_healthz_public_false_falls_back_to_uri_authority_when_host_missing() {
+        let app = build_test_router(false, None);
+        // No `Host` header. URI carries the authority (= `localhost`).
+        let req = HttpRequest::builder()
+            .uri("http://localhost/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
