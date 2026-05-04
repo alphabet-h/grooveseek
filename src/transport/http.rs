@@ -182,9 +182,20 @@ async fn healthz_host_check(
         .unwrap_or("");
     let host_part = extract_host_part(host_full);
 
-    // allow-list entry を full Host header / host-only の両方と比較。
+    // allow-list entry も同じく normalize (= host_part) してから比較。
+    // codex P2 (#50 round 3): rmcp の `with_allowed_hosts` は authority を
+    // parse し `"[::1]"` を host `::1` として扱う。本 middleware も同 semantics
+    // にするため、allow-list 側も extract_host_part を通す = bracketed IPv6
+    // entry が incoming `Host: [::1]:3100` と (or `Host: [::1]`) と match する。
+    // 4 通りの組合せ (allow_full × incoming_full / allow_full × incoming_part /
+    // allow_part × incoming_full / allow_part × incoming_part) のいずれかで
+    // 一致すれば pass。eq_ignore_ascii_case で hostname の大文字小文字は同等。
     let matches = |allow: &str| -> bool {
-        allow.eq_ignore_ascii_case(host_full) || allow.eq_ignore_ascii_case(host_part)
+        let allow_part = extract_host_part(allow);
+        allow.eq_ignore_ascii_case(host_full)
+            || allow.eq_ignore_ascii_case(host_part)
+            || allow_part.eq_ignore_ascii_case(host_full)
+            || allow_part.eq_ignore_ascii_case(host_part)
     };
 
     let allowed_match = match allowed.as_ref() {
@@ -470,6 +481,43 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// codex P2 (#50 round 3): allow-list entry も normalize して比較。
+    /// `["[::1]"]` (= bracketed IPv6 entry) は incoming `Host: [::1]:3100`
+    /// (or `Host: ::1`) と match (= rmcp の `with_allowed_hosts` 互換)。
+    #[tokio::test]
+    async fn test_healthz_public_false_with_bracketed_ipv6_allowlist_entry() {
+        // allow-list 側も extract_host_part で normalize されるので、
+        // bracketed entry が bracketed Host と match
+        let app1 = build_test_router(false, Some(vec!["[::1]".into()]));
+        let req1 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "[::1]:3100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app1.oneshot(req1).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // allow-list `["[::1]"]` + incoming Host `[::1]` (no port) も match
+        let app2 = build_test_router(false, Some(vec!["[::1]".into()]));
+        let req2 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "[::1]")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app2.oneshot(req2).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // allow-list `["::1"]` (= host-only) + incoming bracketed Host も match
+        let app3 = build_test_router(false, Some(vec!["::1".into()]));
+        let req3 = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "[::1]:3100")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app3.oneshot(req3).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
