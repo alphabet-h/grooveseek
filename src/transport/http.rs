@@ -143,10 +143,11 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
     {
         let host = &rest[..end];
         let after = &rest[end + 1..];
-        if let Some(port) = after.strip_prefix(':') {
-            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
-                return (host, Some(port));
-            }
+        if let Some(port) = after.strip_prefix(':')
+            && !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+        {
+            return (host, Some(port));
         }
         return (host, None);
     }
@@ -156,12 +157,12 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
         // IPv6 unbracketed (config 形式 like "::1") — no port form.
         return (s, None);
     }
-    if colon_count == 1 {
-        if let Some(colon) = s.rfind(':') {
-            let port_part = &s[colon + 1..];
-            if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
-                return (&s[..colon], Some(port_part));
-            }
+    if colon_count == 1
+        && let Some(colon) = s.rfind(':')
+    {
+        let port_part = &s[colon + 1..];
+        if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
+            return (&s[..colon], Some(port_part));
         }
     }
     (s, None)
