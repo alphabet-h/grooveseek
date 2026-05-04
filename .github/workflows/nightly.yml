@@ -75,3 +75,48 @@ jobs:
       # 既知 advisory を一時的に許容したい場合は --ignore RUSTSEC-... を渡す。
       - name: cargo audit
         run: cargo audit
+
+  coverage:
+    name: line coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8
+
+      # `cargo test` の non-ignored セット (= unit + integration test、
+      # `#[ignore]` 除外) で coverage を取る (~5-10 min)。
+      # `--include-ignored` (model DL ~5 GB) は別 job (= ignored-tests)
+      # で実行済なので、本 job は coverage 数値の baseline 観測が目的。
+      # `--summary-only` で per-region detail を抑制し、file 単位 summary
+      # table + TOTAL 行のみ出力 (= F-59 「死角を定量化」要件)。
+      # `--color never` で ANSI escape を抑制し GITHUB_STEP_SUMMARY の
+      # code block 整合性を保つ。
+      - name: Run coverage (non-ignored only)
+        run: cargo llvm-cov --summary-only --color never > coverage_summary.txt
+
+      - name: Append summary to GITHUB_STEP_SUMMARY
+        run: |
+          {
+            echo "## Line coverage (cargo-llvm-cov, non-ignored tests)"
+            echo ""
+            echo '```'
+            cat coverage_summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 通常 log (= workflow run の Raw logs / `gh run view --log`
+          # で参照可) にも summary を直接出力。HEREDOC 内の `cat` は
+          # GITHUB_STEP_SUMMARY への redirection 専用なので stdout に
+          # 何も出ない、ここで bare `cat` により通常 log でも summary を
+          # grep 可能にする。
+          cat coverage_summary.txt
