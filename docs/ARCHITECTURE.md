@@ -73,6 +73,20 @@ First run downloads the chosen ONNX model to a HuggingFace-hub-compatible cache 
 
 If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS inspection), see the README's "Working around HuggingFace TLS failures" section for a `huggingface_hub` CLI workaround.
 
+## CLI output convention
+
+The `kb-mcp` CLI follows a **stdout = data, stderr = progress** convention:
+
+- **stdout** is reserved for machine-parseable data output:
+  - `kb-mcp search` JSON results
+  - `kb-mcp eval` golden-query evaluation results
+- **stderr** carries human-readable progress, status, warnings, and errors:
+  - `kb-mcp index` progress lines (`Indexing ...`, `Done in ...`)
+  - `kb-mcp status` statistics (`Documents: N`, `Chunks: N`)
+  - All `tracing` / `eprintln!` diagnostics
+
+When writing subprocess tests, grep `src/main.rs` for the corresponding `Commands::*` block to confirm which channel each subcommand uses before asserting on the captured output. Only `Commands::Search` writes its result to stdout; everything else is stderr-centric.
+
 ## Key dependencies
 
 - **`rmcp`** 1.x — MCP server framework (stdio + Streamable HTTP transports)

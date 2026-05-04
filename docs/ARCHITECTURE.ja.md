@@ -72,6 +72,20 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 `fastembed-rs` の native TLS が HuggingFace への接続に失敗する場合 (企業プロキシや TLS inspection の影響) は、README の「HuggingFace の TLS 失敗への対処」節を参照して `huggingface_hub` CLI で迂回する。
 
+## CLI 出力規約
+
+`kb-mcp` CLI は **stdout = データ出力 / stderr = 進捗** の規約に従う:
+
+- **stdout** は machine-parseable な data 出力のみ:
+  - `kb-mcp search` の JSON 結果
+  - `kb-mcp eval` の golden query 評価結果
+- **stderr** は人間向けの進捗 / 統計 / warning / error:
+  - `kb-mcp index` の進捗行 (`Indexing ...`, `Done in ...`)
+  - `kb-mcp status` の統計 (`Documents: N`, `Chunks: N`)
+  - すべての `tracing` / `eprintln!` 系診断メッセージ
+
+新規 subprocess test を書く場合は、`src/main.rs` の対応する `Commands::*` block を grep して、その subcommand が stdout / stderr のどちらに書くかを必ず先に確認する。**stdout に出るのは `Commands::Search` の JSON のみ**で、それ以外はすべて stderr 中心。
+
 ## 主要な依存
 
 - **`rmcp`** 1.x — MCP サーバフレームワーク (stdio + Streamable HTTP トランスポート)

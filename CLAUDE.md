@@ -26,6 +26,20 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 `index` / `status` / `serve` / `search` / `graph` / `validate` / `eval`。フラグの詳細、`kb-mcp.toml` 設定、`.mcp.json` 接続例は README を参照。
 
+## CLI 出力規約 (= stdout/stderr の責務分離)
+
+`kb-mcp` の各 subcommand は出力先を以下の規約で使い分ける:
+
+- **stdout** = data output 専用 (= machine-parseable な結果の出力先)
+  - `kb-mcp search` の JSON 結果
+  - `kb-mcp eval` の golden query 評価結果
+- **stderr** = status / progress / 診断 (= 人間向けの進捗 / warning / error)
+  - `kb-mcp index` の `Indexing ...` / `Done in ...` 進捗
+  - `kb-mcp status` の `Documents: N` / `Chunks: N` 統計
+  - すべての warning / info / error メッセージ (`tracing` / `eprintln!`)
+
+**新規 subprocess test を書く時の注意**: subcommand の出力先を `src/main.rs` の `Commands::*` block で `println!` (stdout) か `eprintln!` (stderr) かを必ず先に grep 確認すること。`Commands::Search` 以外は基本 stderr に出る (= F-67 で `kb-mcp status` を stdout から読もうとして fail した過去あり)。
+
 ## 運用の細則
 
 - **`Cargo.lock` はコミットする** (binary crate)
