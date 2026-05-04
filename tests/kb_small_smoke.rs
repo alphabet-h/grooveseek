@@ -83,17 +83,20 @@ fn test_kb_small_indexes_six_documents() {
 
     build_index(layout.kb());
 
-    // `kb-mcp status` prints a human-readable block starting with `Documents: <N>`.
+    // `kb-mcp status` prints a human-readable block starting with `Documents: <N>`
+    // to **stderr** (= matches the rest of `Commands::Index` / `Commands::Status` in
+    // `src/main.rs`, which reserve stdout for data output like search JSON results
+    // and use stderr for status/progress reporting).
     let bin = kb_mcp_bin();
     let out = Command::new(&bin)
         .args(["status", "--kb-path", &layout.kb().display().to_string()])
         .output()
         .expect("kb-mcp status");
     assert!(out.status.success(), "kb-mcp status failed: {:?}", out);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Documents: 6"),
-        "expected `Documents: 6` in status output, got:\n{stdout}"
+        stderr.contains("Documents: 6"),
+        "expected `Documents: 6` in status stderr, got:\n{stderr}"
     );
 }
 

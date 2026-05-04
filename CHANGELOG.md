@@ -27,6 +27,13 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `taiki-e/install-action@v2` for pre-built install,
   `--summary-only` output redirected to `$GITHUB_STEP_SUMMARY`).
   Source code unchanged.
+- **F-67**: Fix `tests/kb_small_smoke.rs::test_kb_small_indexes_six_documents`
+  to read from stderr instead of stdout when grepping `Documents: 6`
+  in `kb-mcp status` output. The CLI uses `eprintln!` for all
+  status/progress reporting (= consistent with `Commands::Index` and the
+  rest of `Commands::Status`), reserving stdout for data output such
+  as `kb-mcp search` JSON results. Surfaced by feature-35's first live
+  nightly run; production behavior is unchanged.
 
 ## [0.7.4] - 2026-05-04
 
