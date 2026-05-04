@@ -11,6 +11,28 @@ use crate::parser::Registry;
 use crate::quality;
 
 // ---------------------------------------------------------------------------
+// Hardcoded denylist (F-62)
+// ---------------------------------------------------------------------------
+
+/// Hardcoded directory basenames to *always* skip during indexing /
+/// validation walks, regardless of user `exclude_dirs` config. Acts as
+/// a fail-safe so that `[indexer].exclude_dirs = ["custom"]` (= default
+/// override forgetting VCS metadata) or `exclude_dirs = []` (= explicit
+/// "walk everything") does not index `.git/` / `.svn/` / `node_modules/`.
+/// User `exclude_dirs` is *additionally* applied (union semantics).
+pub const HARDCODED_EXCLUDE_DIRS: &[&str] = &[".git", ".svn", "node_modules"];
+
+/// Returns `true` if `basename` matches a hardcoded skip entry, regardless
+/// of user `exclude_dirs` config. Shared by `collect_source_files` (index)
+/// and `validate_collect_md_files` (validate, in `src/main.rs`) so the two
+/// paths agree. `pub` because the bin target accesses it via the lib
+/// (`kb_mcp::indexer::is_hardcoded_excluded`); the library API is
+/// intentionally unstable per `src/lib.rs:4-6`.
+pub fn is_hardcoded_excluded(basename: &str) -> bool {
+    HARDCODED_EXCLUDE_DIRS.contains(&basename)
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -492,6 +514,12 @@ fn collect_source_files(
                 return true;
             }
             let name = e.file_name().to_string_lossy();
+            // F-62: hardcoded denylist (.git / .svn / node_modules) is always
+            // applied as a fail-safe, then user exclude_dirs is layered on top
+            // (union semantics). See HARDCODED_EXCLUDE_DIRS doc.
+            if is_hardcoded_excluded(name.as_ref()) {
+                return false;
+            }
             !exclude_dirs.iter().any(|d| d.as_str() == name.as_ref())
         })
     {
@@ -796,6 +824,87 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .starts_with("aaa")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-62: hardcoded denylist (.git / .svn / node_modules) is always applied
+    // as a fail-safe alongside user `exclude_dirs` (union semantics).
+    // -----------------------------------------------------------------------
+
+    /// `exclude_dirs = []` (= "walk everything") でも `.git/` 配下は skip。
+    #[test]
+    fn test_collect_source_files_skips_dot_git_even_with_empty_exclude_dirs() {
+        let tmp = mk_tmp("hardenedgit");
+        write_file(&tmp.0, ".git/inside.md", "# git inside");
+        write_file(&tmp.0, "normal.md", "# normal");
+
+        let reg = Registry::defaults();
+        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"normal.md".to_string()),
+            "normal.md must be kept, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "inside.md"),
+            ".git/inside.md must be skipped by hardcoded denylist, got: {names:?}"
+        );
+    }
+
+    /// User が `exclude_dirs` を default 上書きしつつ `.git` を含め忘れた case
+    /// (= 本 cycle の主たる fail-safe shape)。
+    #[test]
+    fn test_collect_source_files_skips_dot_git_when_user_exclude_dirs_overrides_default() {
+        let tmp = mk_tmp("hardenedoverride");
+        write_file(&tmp.0, ".git/inside.md", "# git inside");
+        write_file(&tmp.0, "normal.md", "# normal");
+
+        let reg = Registry::defaults();
+        // User overrides DEFAULT_EXCLUDE_DIRS with their own list, forgetting
+        // to re-list `.git`. Hardcoded denylist still skips `.git/inside.md`.
+        let files = collect_source_files(&tmp.0, &reg, &["custom".to_string()]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"normal.md".to_string()));
+        assert!(
+            !names.iter().any(|n| n == "inside.md"),
+            ".git/inside.md must remain skipped despite user override, got: {names:?}"
+        );
+    }
+
+    /// Hardcoded denylist + user `exclude_dirs` の union semantics 確認。
+    #[test]
+    fn test_collect_source_files_union_of_hardcoded_and_user_excludes() {
+        let tmp = mk_tmp("hardenedunion");
+        write_file(&tmp.0, ".git/git_inside.md", "# git");
+        write_file(&tmp.0, ".obsidian/note.md", "# obsidian note");
+        write_file(&tmp.0, "keep.md", "# keep");
+
+        let reg = Registry::defaults();
+        // User explicitly excludes `.obsidian`. Hardcoded denylist also
+        // skips `.git`. Both must be skipped (union).
+        let files = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"keep.md".to_string()),
+            "keep.md must be kept, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "git_inside.md"),
+            "hardcoded .git skip failed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "note.md"),
+            "user .obsidian skip failed: {names:?}"
         );
     }
 

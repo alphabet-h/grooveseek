@@ -977,6 +977,11 @@ fn validate_collect_md_files(kb_path: &Path, exclude_dirs: &[String]) -> Result<
                 return true;
             }
             let name = e.file_name().to_string_lossy();
+            // F-62: same hardcoded denylist as indexer::collect_source_files,
+            // applied as a fail-safe alongside user exclude_dirs (union).
+            if kb_mcp::indexer::is_hardcoded_excluded(name.as_ref()) {
+                return false;
+            }
             !exclude_dirs.iter().any(|d| d.as_str() == name.as_ref())
         })
     {
