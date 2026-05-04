@@ -30,11 +30,38 @@ const KB_SMALL_FILES: &[&str] = &[
 /// Copy the 6 read-only fixture files from `tests/fixtures/kb-small/` into
 /// `layout.kb()`. `TempKbLayout::new` already created `kb()` via
 /// `create_dir_all`, so no extra `mkdir` is needed.
+///
+/// Includes a drift guard (codex review P3 follow-up): the directory
+/// contents must exactly match `KB_SMALL_FILES`. If a 7th file is added
+/// to the fixture without updating `KB_SMALL_FILES` (and hence the
+/// `Documents: <N>` assertion in the smoke test), this assertion fires
+/// before indexing — preventing the fixture corpus from evolving while
+/// the test silently keeps passing on stale expectations.
 fn setup_kb_small(layout: &TempKbLayout) {
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("kb-small");
+
+    // Drift guard: actual fixture directory entries vs the hard-coded list.
+    let mut actual: Vec<String> = std::fs::read_dir(&src_root)
+        .unwrap_or_else(|e| panic!("read fixture dir {}: {e}", src_root.display()))
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    actual.sort();
+    let mut expected: Vec<String> = KB_SMALL_FILES.iter().map(|s| (*s).to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        actual,
+        expected,
+        "kb-small fixture directory contents drifted from KB_SMALL_FILES; \
+         either add new files to KB_SMALL_FILES (and update the `Documents: <N>` \
+         assertion in test_kb_small_indexes_six_documents) or remove the \
+         unexpected file from {}",
+        src_root.display()
+    );
+
     for name in KB_SMALL_FILES {
         let src = src_root.join(name);
         let dst = layout.kb().join(name);
