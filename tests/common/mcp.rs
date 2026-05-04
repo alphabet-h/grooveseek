@@ -93,6 +93,51 @@ pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, Str
     (guard, base)
 }
 
+/// Same as [`spawn_mcp_server`] but **without** `--no-watch`, so the
+/// watcher (= `notify-debouncer-full` -> `run_watch_loop`) starts.
+///
+/// Used by F-57 watcher_e2e where the test specifically exercises the
+/// real-disk file event pipeline. All other callers should keep using
+/// [`spawn_mcp_server`], which freezes the index state for deterministic
+/// search assertions in mmr/parent integration tests.
+pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
+    let port = pick_free_port();
+    let bin = kb_mcp_bin();
+    assert!(
+        bin.exists(),
+        "binary not found at {} — run `cargo build` first",
+        bin.display()
+    );
+
+    let child = Command::new(&bin)
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "serve",
+            "--kb-path",
+            kb_path.to_str().unwrap(),
+            "--transport",
+            "http",
+            "--port",
+            &port.to_string(),
+            // NOTE: `--no-watch` is intentionally absent here so the
+            // watcher starts. This is the only difference from
+            // `spawn_mcp_server`.
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kb-mcp serve (with watcher)");
+
+    let base = format!("http://127.0.0.1:{port}");
+    let guard = ServerGuard { child: Some(child) };
+
+    if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
+        panic!("kb-mcp serve (with watcher) did not become ready on {base}/healthz within 60s");
+    }
+    (guard, base)
+}
+
 /// RAII handle for the spawned MCP server child. Kills + reaps on Drop so
 /// a panicking test does not orphan the server process.
 pub struct ServerGuard {
