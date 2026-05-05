@@ -123,6 +123,15 @@ enum Commands {
         /// Embedding model to use
         #[arg(long, value_enum)]
         model: Option<ModelChoice>,
+        /// Suppress per-file progress output (only print start/end summary).
+        /// Mutually exclusive with `--progress`. Useful for harness / CI runs
+        /// where streaming output is buffered until exit.
+        #[arg(long, default_value_t = false, conflicts_with = "progress")]
+        quiet: bool,
+        /// Show progress bar (TTY) or periodic flushed updates (non-TTY).
+        /// Mutually exclusive with `--quiet`.
+        #[arg(long, default_value_t = false)]
+        progress: bool,
     },
     /// Show index status and statistics
     Status {
@@ -492,6 +501,8 @@ fn main() -> anyhow::Result<()> {
             kb_path,
             force,
             model,
+            quiet,
+            progress,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
@@ -511,6 +522,8 @@ fn main() -> anyhow::Result<()> {
             let registry = cfg.build_parser_registry()?;
             eprintln!("Indexing {}...", kb_path.display());
             let exclude_dirs = cfg.resolve_exclude_dirs();
+            let progress_reporter =
+                kb_mcp::indexer::progress::ProgressReporter::from_cli_flags(quiet, progress);
             let result = kb_mcp::indexer::rebuild_index(
                 &db,
                 &mut embedder,
@@ -519,6 +532,7 @@ fn main() -> anyhow::Result<()> {
                 cfg.exclude_headings.as_deref(),
                 &exclude_dirs,
                 &registry,
+                progress_reporter,
             )?;
             eprintln!(
                 "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted), {} chunks",
