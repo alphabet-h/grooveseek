@@ -146,6 +146,7 @@ pub fn rebuild_index(
     exclude_headings: Option<&[String]>,
     exclude_dirs: &[String],
     registry: &Registry,
+    mut progress: progress::ProgressReporter,
 ) -> Result<IndexResult> {
     let start = Instant::now();
 
@@ -175,6 +176,10 @@ pub fn rebuild_index(
         source_files.len(),
         registry.extensions()
     );
+
+    // 罠 H2: bar lifetime を rebuild_index 内に閉じる lazy init。
+    // Backfilled / Found 行を出した後に bar を構築するので衝突しない。
+    progress.start_indexing(source_files.len());
 
     // ファイル移動検出の前段階として、disk 側の全ファイルの
     // **hash だけ** を先に計算する。content は持ち回らない (evaluator 指摘
@@ -212,7 +217,7 @@ pub fn rebuild_index(
         // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
         db.rename_documents_atomic(&pairs)?;
         for (old_path, new_path) in &pairs {
-            eprintln!("  renamed: {old_path} -> {new_path}");
+            progress.report_renamed(old_path, new_path);
         }
         pairs.len() as u32
     };
@@ -228,7 +233,7 @@ pub fn rebuild_index(
         match index_single_disk_entry(db, embedder, entry, exclude_headings, registry, force)? {
             SingleResult::Updated { chunks } => {
                 updated += 1;
-                eprintln!("  indexed: {} ({} chunks)", entry.rel, chunks);
+                progress.report_indexed(&entry.rel, chunks);
             }
             SingleResult::Unchanged | SingleResult::Skipped { .. } => {}
         }
@@ -241,7 +246,7 @@ pub fn rebuild_index(
         if !visited_paths.contains(db_path) {
             db.delete_document(db_path)?;
             deleted += 1;
-            eprintln!("  deleted: {}", db_path);
+            progress.report_deleted(db_path);
         }
     }
 
@@ -251,6 +256,8 @@ pub fn rebuild_index(
     let total_chunks_in_db = db.chunk_count()?;
 
     let duration_ms = start.elapsed().as_millis() as u64;
+
+    progress.finish();
 
     Ok(IndexResult {
         total_documents,
