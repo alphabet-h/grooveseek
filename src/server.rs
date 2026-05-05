@@ -639,6 +639,7 @@ impl KbServer {
             self.exclude_headings.as_deref(),
             &self.exclude_dirs,
             &self.parser_registry,
+            indexer::progress::ProgressReporter::new(indexer::progress::ProgressMode::Quiet),
         ) {
             Ok(result) => {
                 let stats = IndexStats {
