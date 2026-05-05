@@ -10,6 +10,8 @@ use crate::embedder::Embedder;
 use crate::parser::Registry;
 use crate::quality;
 
+pub mod progress;
+
 // ---------------------------------------------------------------------------
 // Hardcoded denylist (F-62)
 // ---------------------------------------------------------------------------
