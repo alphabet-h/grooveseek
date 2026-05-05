@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// RRF の定数項。原論文および多くの実装で慣例 60。
 const RRF_K: f32 = 60.0;
@@ -222,22 +223,6 @@ fn parse_dim_from_create_sql(sql: &str) -> Option<u32> {
     rest[..end].trim().parse().ok()
 }
 
-/// `documents.tags` 列 (JSON 文字列) を `Vec<String>` に展開する。
-/// NULL / 空文字 / 不正 JSON は空 Vec として扱う (検索フィルタでヒット 0 件に
-/// なるだけで、エラーで検索を中断させない)。
-fn parse_tags_json(json: Option<String>) -> Vec<String> {
-    match json {
-        Some(s) if !s.is_empty() => match serde_json::from_str(&s) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "malformed documents.tags JSON, treating as empty");
-                Vec::new()
-            }
-        },
-        _ => Vec::new(),
-    }
-}
-
 /// `tags_any` フィルタ: hit の tags のいずれかが `any_pool` に含まれていれば pass。
 /// `any_pool` が空なら常に pass (= フィルタ無効)。
 fn matches_tags_any(hit_tags: &[String], any_pool: &[String]) -> bool {
@@ -322,7 +307,18 @@ fn ensure_vec_extension() {
 /// (documents, chunks, vec_chunks, index_meta) and exposes CRUD + vector-search
 /// helpers.
 pub struct Database {
+    // F-63: field 宣言順は **`conn` を第 1、`tags_parse_failures` を第 2 に固定**。
+    // Rust の drop 順序は宣言順の逆 = `tags_parse_failures` (AtomicU64) が先に
+    // drop され、`conn` (rusqlite::Connection) は後で drop される。本 struct の
+    // 手動 `Drop` impl は `self.conn.execute(...)` で counter を `index_meta` に
+    // best-effort flush するため、`conn` が生存している必要がある。field 順序を
+    // 逆転させると、`Connection::drop` が先に走って ROLLBACK が発火する罠が出る
+    // (= 本 spec を必ず再 review すること)。
     conn: Connection,
+    /// `parse_tags_json` 失敗カウンタ (F-63)。session 中は atomic increment、
+    /// `Database::open` 起動時に `index_meta` から read、`Database::drop` で
+    /// best-effort flush。silent fail-open の visibility 確保。
+    tags_parse_failures: AtomicU64,
 }
 
 /// RRF score の HashMap と row HashMap を受け取り、score DESC + id ASC の
@@ -362,8 +358,15 @@ impl Database {
         ensure_vec_extension();
         let conn =
             Connection::open(path).with_context(|| format!("failed to open database at {path}"))?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            tags_parse_failures: AtomicU64::new(0),
+        };
         db.init()?;
+        // F-63: 過去 session の永続値を index_meta から復元
+        if let Ok(Some(prev)) = db.read_tags_parse_failure_count() {
+            db.tags_parse_failures.store(prev, Ordering::Relaxed);
+        }
         Ok(db)
     }
 
@@ -371,8 +374,16 @@ impl Database {
     pub fn open_in_memory() -> Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            tags_parse_failures: AtomicU64::new(0),
+        };
         db.init()?;
+        // F-63: 過去 session の永続値を index_meta から復元 (= 通常 in-memory DB
+        // は空なので no-op だが、外部 init で値が seeding された場合に整合する)
+        if let Ok(Some(prev)) = db.read_tags_parse_failure_count() {
+            db.tags_parse_failures.store(prev, Ordering::Relaxed);
+        }
         Ok(db)
     }
 
@@ -848,7 +859,7 @@ impl Database {
                     title,
                     topic,
                     date,
-                    tags: parse_tags_json(tags_json),
+                    tags: self.parse_tags_json_recording(tags_json),
                 },
             ));
         }
@@ -1126,7 +1137,7 @@ impl Database {
                 continue;
             }
             // tags_any / tags_all filter (Task 3 追加)
-            let hit_tags = parse_tags_json(tags_json);
+            let hit_tags = self.parse_tags_json_recording(tags_json);
             if !matches_tags_any(&hit_tags, filters.tags_any) {
                 continue;
             }
@@ -1333,7 +1344,7 @@ impl Database {
                 continue;
             }
             // tags_any / tags_all filter (Task 3 追加)
-            let hit_tags = parse_tags_json(tags_json);
+            let hit_tags = self.parse_tags_json_recording(tags_json);
             if !matches_tags_any(&hit_tags, filters.tags_any) {
                 continue;
             }
@@ -1457,6 +1468,47 @@ impl Database {
             params![dim.to_string()],
         )?;
         Ok(())
+    }
+
+    /// `index_meta` から `tags_parse_failures` key を read する (F-63)。
+    /// 値が無い / `u64::from_str` に失敗する malformed 値は `None` 扱い
+    /// (= 起動時 restore で 0 にフォールバック)。
+    fn read_tags_parse_failure_count(&self) -> Result<Option<u64>> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'tags_parse_failures'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|s| s.parse::<u64>().ok()))
+    }
+
+    /// `documents.tags` 列 (JSON 文字列) を `Vec<String>` に展開する。
+    /// NULL / 空文字 / 不正 JSON は空 Vec として扱う (検索フィルタでヒット 0 件に
+    /// なるだけで、エラーで検索を中断させない)。
+    /// 不正 JSON 時は `tags_parse_failures` カウンタを atomic increment し、
+    /// `tracing::warn!` も併発する (F-63: silent fail-open 可視化)。
+    pub(crate) fn parse_tags_json_recording(&self, json: Option<String>) -> Vec<String> {
+        match json {
+            Some(s) if !s.is_empty() => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "malformed documents.tags JSON, treating as empty");
+                    self.tags_parse_failures.fetch_add(1, Ordering::Relaxed);
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// 現在の `tags_parse_failures` 値を atomic load する (F-63)。
+    /// `kb-mcp status` 表示用。
+    pub fn tags_parse_failure_count(&self) -> u64 {
+        self.tags_parse_failures.load(Ordering::Relaxed)
     }
 
     /// Verify the runtime `(model, dim)` matches the values recorded in
@@ -1674,6 +1726,31 @@ impl Database {
     /// 通常の Drop は **rollback**。成功時は `tx.commit()` を必ず呼ぶこと。
     pub fn begin_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
         Ok(self.conn.unchecked_transaction()?)
+    }
+}
+
+impl Drop for Database {
+    /// F-63: session shutdown 時に `tags_parse_failures` の最新値を
+    /// `index_meta` に best-effort flush する。
+    ///
+    /// **設計上の注意**:
+    /// - drop 中の panic は process abort になるため、`expect` / `unwrap` は禁止。
+    ///   SQLite write が失敗しても `tracing::warn!` で log するだけで握り潰す。
+    /// - `Database` struct の field 宣言順 (= `conn` 第 1、`tags_parse_failures`
+    ///   第 2) に依存している。Rust の drop 順序は宣言順の逆なので、本 impl が
+    ///   走るタイミングでは `conn` (= `rusqlite::Connection`) はまだ生存している。
+    fn drop(&mut self) {
+        let n = self.tags_parse_failures.load(Ordering::Relaxed);
+        let result = self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('tags_parse_failures', ?1)",
+            params![n.to_string()],
+        );
+        if let Err(e) = result {
+            tracing::warn!(
+                error = %e,
+                "failed to flush tags_parse_failures to index_meta on drop"
+            );
+        }
     }
 }
 
@@ -3962,6 +4039,110 @@ mod tests {
             let result_ids: std::collections::HashSet<i64> = result.iter().map(|(id, _)| *id).collect();
             let scores_ids: std::collections::HashSet<i64> = scores.keys().copied().collect();
             prop_assert!(result_ids.is_subset(&scores_ids));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F-63: tags_parse_failures counter tests
+    // -----------------------------------------------------------------------
+
+    /// `tempfile` crate を避けるための file-internal temp dir helper
+    /// (= CLAUDE.local.md 規約)。`std::env::temp_dir()` + PID + nanos で
+    /// unique path を生成し、`Drop` で `remove_dir_all` cleanup する。
+    struct F63TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl F63TempDir {
+        fn new(prefix: &str) -> Self {
+            let pid = std::process::id();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}"));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for F63TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn test_parse_tags_failure_counter_increments_on_malformed_json() {
+        let db = Database::open_in_memory().unwrap();
+        // counter は初期 0
+        assert_eq!(db.tags_parse_failure_count(), 0);
+
+        // malformed JSON を直接 method に渡して increment を観測
+        let _ = db.parse_tags_json_recording(Some("not-a-json".into()));
+        assert_eq!(db.tags_parse_failure_count(), 1);
+
+        // もう 1 件 malformed → 2
+        let _ = db.parse_tags_json_recording(Some("{broken".into()));
+        assert_eq!(db.tags_parse_failure_count(), 2);
+    }
+
+    #[test]
+    fn test_parse_tags_failure_counter_zero_for_valid_json() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.tags_parse_failure_count(), 0);
+
+        // valid JSON
+        let v = db.parse_tags_json_recording(Some(r#"["mcp","rust"]"#.into()));
+        assert_eq!(v, vec!["mcp".to_string(), "rust".to_string()]);
+        assert_eq!(db.tags_parse_failure_count(), 0);
+
+        // NULL (None) も failure ではない
+        let v = db.parse_tags_json_recording(None);
+        assert!(v.is_empty());
+        assert_eq!(db.tags_parse_failure_count(), 0);
+
+        // 空文字も failure ではない
+        let v = db.parse_tags_json_recording(Some(String::new()));
+        assert!(v.is_empty());
+        assert_eq!(db.tags_parse_failure_count(), 0);
+    }
+
+    #[test]
+    fn test_parse_tags_failure_counter_persists_across_sessions() {
+        let tmp = F63TempDir::new("kb-mcp-f63-persist");
+        let db_path = tmp.path.join("kb.sqlite");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // session 1: counter を 5 に bump して drop (= flush)
+        {
+            let db = Database::open(&db_path_str).expect("open session 1");
+            for _ in 0..5 {
+                let _ = db.parse_tags_json_recording(Some("{malformed".into()));
+            }
+            assert_eq!(db.tags_parse_failure_count(), 5);
+            // drop で index_meta に flush
+        }
+
+        // session 2: 再 open で前 session の値が復元される
+        {
+            let db = Database::open(&db_path_str).expect("open session 2");
+            assert_eq!(
+                db.tags_parse_failure_count(),
+                5,
+                "tags_parse_failures should be restored from index_meta after re-open"
+            );
+
+            // session 2 で +2 して合計 7
+            let _ = db.parse_tags_json_recording(Some("[".into()));
+            let _ = db.parse_tags_json_recording(Some("[".into()));
+            assert_eq!(db.tags_parse_failure_count(), 7);
+        }
+
+        // session 3: 累計が伝播していること
+        {
+            let db = Database::open(&db_path_str).expect("open session 3");
+            assert_eq!(db.tags_parse_failure_count(), 7);
         }
     }
 }
