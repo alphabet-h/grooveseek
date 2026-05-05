@@ -125,6 +125,31 @@ impl ProgressReporter {
         }
     }
 
+    /// Tick progress for an `Unchanged` / `Skipped` file (= incremental run
+    /// で hash 一致した case)。Verbose mode は何も出さない (= 既存挙動を保つ、
+    /// per-file `  indexed:` は更新時のみ)。Tty / NonTty は **必ず tick** して、
+    /// 進捗 100% / bar full を保証する (= codex P1 round 1 on PR #55、
+    /// incremental run で `force=false` + 多数 unchanged の場合に bar が
+    /// 100% に到達せず stale 値で終わる罠)。
+    pub fn report_unchanged(&self, rel: &str) {
+        match &self.inner {
+            ProgressInner::Verbose | ProgressInner::Quiet | ProgressInner::AutoPending => {}
+            ProgressInner::Tty(bar) => {
+                bar.inc(1);
+                // message は updated 時のものを上書きしないよう、unchanged では設定しない。
+                let _ = rel;
+            }
+            ProgressInner::NonTty { total, step, count } => {
+                let new_count = count.fetch_add(1, Ordering::Relaxed) + 1;
+                if should_emit(new_count, *total, *step) {
+                    let pct = (new_count * 100) / total;
+                    eprintln!("Progress: {new_count}/{total} ({pct}%)");
+                }
+                let _ = rel;
+            }
+        }
+    }
+
     pub fn report_renamed(&self, old: &str, new: &str) {
         match &self.inner {
             ProgressInner::Verbose => {
@@ -277,5 +302,41 @@ mod tests {
         } else {
             panic!("expected NonTty variant");
         }
+    }
+
+    #[test]
+    fn test_nontty_report_unchanged_also_ticks_count() {
+        // 罠 codex P1 round 1: incremental run の unchanged file も tick されないと
+        // 100% アンカーに届かない。report_unchanged が NonTty で counter を tick する
+        // ことを直接検証。
+        let r = ProgressReporter {
+            inner: ProgressInner::NonTty {
+                total: 3,
+                step: 1,
+                count: AtomicU64::new(0),
+            },
+        };
+        r.report_indexed("a.md", 1);
+        r.report_unchanged("b.md");
+        r.report_unchanged("c.md");
+        if let ProgressInner::NonTty { count, .. } = &r.inner {
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                3,
+                "report_indexed + 2x report_unchanged should advance count to 3 (= 100%)"
+            );
+        } else {
+            panic!("expected NonTty variant");
+        }
+    }
+
+    #[test]
+    fn test_verbose_report_unchanged_does_not_emit() {
+        // Verbose mode で report_unchanged が「  indexed: ...」を出すと regression。
+        // 既存挙動 (= unchanged は何も出さない) を保つことを panic 不発で確認。
+        let r = ProgressReporter::new(ProgressMode::Verbose);
+        r.report_unchanged("foo.md");
+        // 出力 capture は subprocess test (Task 7) で間接的に保証されている
+        // (= test_index_default_emits_per_file は unchanged 行を期待しない)。
     }
 }

@@ -236,7 +236,11 @@ pub fn rebuild_index(
                 updated += 1;
                 progress.report_indexed(&entry.rel, chunks);
             }
-            SingleResult::Unchanged | SingleResult::Skipped { .. } => {}
+            SingleResult::Unchanged | SingleResult::Skipped { .. } => {
+                // Progress mode (= Tty/NonTty) で bar / counter を tick する。
+                // Verbose / Quiet は no-op (= 既存挙動保持)。
+                progress.report_unchanged(&entry.rel);
+            }
         }
     }
 
