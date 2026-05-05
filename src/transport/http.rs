@@ -35,7 +35,6 @@ use crate::server::{KbServer, KbServerShared};
 /// Encoding error (= `HeaderValue::to_str()` 失敗) は middleware 内で helper を
 /// 経由せず直接返すため、本 enum には対応 variant を持たせない (= dead variant 回避)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Task 7 で `healthz_host_check` middleware が helper を呼ぶようになったら外す
 pub(crate) enum HostRejection {
     /// Host header と URI authority の双方が不在。
     MissingHost,
@@ -49,7 +48,6 @@ pub(crate) enum HostRejection {
 /// Allow-list entry / incoming Host header の比較用 normalized form。
 /// rmcp 1.4 `tower.rs::NormalizedAuthority` (line 169-180) の mirror。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Task 7 で middleware が helper を呼ぶようになったら外す
 struct NormalizedAuthority {
     /// host: bracket 剥がし + ASCII lowercase。`Authority::host()` は IPv6 で
     /// brackets を含む文字列を返すため、`trim_matches('[' / ']')` + lowercase 化。
@@ -58,7 +56,6 @@ struct NormalizedAuthority {
     port: Option<u16>,
 }
 
-#[allow(dead_code)] // Task 7 で middleware が helper を呼ぶようになったら外す
 impl NormalizedAuthority {
     /// 既に parse 済の `Authority` から作る (= incoming Host header 用、infallible)。
     fn from_authority(authority: &http::uri::Authority) -> Self {
@@ -115,7 +112,6 @@ impl NormalizedAuthority {
 ///
 /// 入力前提: `Authority::try_from` 成功後に呼ばれる post-check のため、
 /// malformed bracketed (= 二重 `]`、不一致 `[`) は到達しない。
-#[allow(dead_code)] // Task 7 で middleware が helper を呼ぶようになったら外す
 fn has_explicit_port_suffix(raw: &str) -> bool {
     // bracketed: `]:` の後ろを見る
     if let Some(end) = raw.find(']') {
@@ -157,7 +153,6 @@ const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
 ///   + ASCII lowercase で正規化 (= rmcp `normalize_host` mirror)
 /// - port: allow に port 指定あり → strict 一致、なし → port-agnostic
 /// - kb-mcp 拡張の defensive reject: userinfo (`user@`) / port out-of-range
-#[allow(dead_code)] // Task 7 で `healthz_host_check` middleware が helper を呼ぶようになったら外す
 pub(crate) fn validate_host_header(
     host_raw: Option<&str>,
     allowed: Option<&[String]>,
@@ -234,7 +229,6 @@ pub(crate) fn validate_host_header(
 ///
 /// 呼び出し側は prefix を **含めない** 文字列を渡すこと
 /// (= 内部で `"Bad Request: "` を付加するため二重付与防止)。
-#[allow(dead_code)] // Task 7 で middleware が builder を呼ぶようになったら外す
 fn bad_request_typed(msg: &str) -> Response {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
@@ -248,7 +242,6 @@ fn bad_request_typed(msg: &str) -> Response {
 /// - status: 403
 /// - body: `format!("Forbidden: {msg}")`
 /// - Content-Type: (なし、rmcp と同じく非設定)
-#[allow(dead_code)] // Task 7 で middleware が builder を呼ぶようになったら外す
 fn forbidden_plain(msg: &str) -> Response {
     Response::builder()
         .status(StatusCode::FORBIDDEN)
@@ -365,6 +358,12 @@ pub async fn run_http(
 /// `99999` のような u16 範囲外は **invalid port** として全体を raw 扱い、
 /// allow-list match から外す (= rmcp の `Authority::try_from` が同条件で
 /// reject するのに合わせる)。
+///
+/// Note (Phase C / D-11): `healthz_host_check` middleware は
+/// `validate_host_header` 経由になり、production code では本 fn は
+/// 呼ばれなくなった。残存する `extract_host_part` 経由の test 経路だけが
+/// 参照するため `#[cfg(test)]` で test build 限定にする (Task 8 で完全削除予定)。
+#[cfg(test)]
 fn split_host_port(s: &str) -> (&str, Option<&str>) {
     // Bracketed IPv6: `[ipv6]:port` or `[ipv6]`
     // codex P1 (#50 round 5): `]` の後ろに任意の文字列 (例: `[::1]evil.example`)
@@ -422,78 +421,46 @@ fn extract_host_part(s: &str) -> &str {
     split_host_port(s).0
 }
 
-/// F-64: `/healthz` 用 axum middleware。`Host` header を `allowed_hosts`
-/// (state) と照合し、不一致なら 403 を返す。`allowed_hosts` の semantics は
-/// rmcp の `with_allowed_hosts` と同等:
-/// - `None` → `DEFAULT_LOOPBACK_HOSTS` (`localhost` / `127.0.0.1` / `::1`) のみ pass
-/// - `Some(empty)` → 全 Host 許可 (= `disable_allowed_hosts` 相当)
-/// - `Some(non_empty)` → list と case-insensitive 一致のみ pass
+/// F-64: `/healthz` 用 axum middleware。Host header を allowed_hosts と照合し
+/// 不一致なら 400 / 403 を返す。実際の比較は pure helper `validate_host_header`
+/// に委譲、本 fn は HTTP-specific layer (= header / authority / response builder) のみ。
 ///
-/// 比較は **full Host header と host-only の両方**で行うので、allow-list
-/// entry が `"192.168.1.10"` でも `"192.168.1.10:3100"` でも match する
-/// (= kb-mcp.toml.example の document 例と整合)。
+/// rmcp 1.4 `tower.rs::validate_dns_rebinding_headers` と semantic parity:
+/// - missing Host → 400 "Bad Request: missing Host header"
+/// - non-UTF8 Host → 400 "Bad Request: Invalid Host header encoding"
+/// - parse 失敗 → 400 "Bad Request: Invalid Host header"
+/// - allow-list 不一致 → 403 "Forbidden: Host header is not allowed"
+///
+/// kb-mcp 拡張: HTTP/2 `:authority` fallback (= Q4=C2 で意図的に維持、
+/// rmcp の superset)。Host header 不在時に URI authority を fallback として読む。
 async fn healthz_host_check(
     State(allowed): State<Arc<Option<Vec<String>>>>,
     headers: HeaderMap,
     req: Request,
     next: Next,
 ) -> Response {
-    // codex P2 (#50 round 2): HTTP/2 では `Host` header の代わりに
-    // `:authority` pseudo-header が使われ、`headers.get("host")` が `None`
-    // を返す。rmcp の `/mcp` 経路はこれを `uri.authority()` で fallback して
-    // accept するので、本 middleware も同じ semantics に揃える (= HTTP/2 や
-    // proxy-forwarded health check で false reject を出さない)。
+    // non-UTF8 Host header value は helper を経由せず middleware で直接 catch
+    // (= rmcp tower.rs:227-229 と同じ責務分担、helper には str しか渡さない)
+    let host_str: Option<Result<&str, _>> = headers.get("host").map(|h| h.to_str());
+    if let Some(Err(_)) = host_str {
+        return bad_request_typed("Invalid Host header encoding");
+    }
+    let host_from_header: Option<&str> = host_str.and_then(|r| r.ok());
+
+    // Host 不在時の URI authority fallback (= HTTP/2 / proxy-forwarded 互換)
     let authority_owned: Option<String> = req.uri().authority().map(|a| a.to_string());
-    let host_full = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .or(authority_owned.as_deref())
-        .unwrap_or("");
-    let (incoming_host, incoming_port) = split_host_port(host_full);
+    let host_raw: Option<&str> = host_from_header.or(authority_owned.as_deref());
 
-    // codex P2 (#50 round 1-4): allow-list entry を `(host, port)` に分解、
-    // host は normalize (= bracket / port 剥がし) で比較。port は:
-    // - allow に port 指定あり → incoming も同じ port のみ pass (strict)
-    // - allow に port 指定なし → incoming の port は無視 (port-agnostic)
-    // これで以下が満たされる:
-    //   - `["192.168.1.10"]` (= host-only) は `Host: 192.168.1.10` も
-    //     `Host: 192.168.1.10:3100` も match
-    //   - `["192.168.1.10:3100"]` (= port 込み) は `Host: 192.168.1.10:3100` のみ match、
-    //     `Host: 192.168.1.10:9999` は **403** (codex round 4 の P2 fix)
-    //   - `["[::1]"]` も `["::1"]` も IPv6 loopback の任意 form と match
-    //
-    // codex P2 (#50 round 7): port は raw string ではなく **`u16` numeric** で
-    // 比較する (= `"080"` と `"80"` を semantically 等価扱い)。`split_host_port`
-    // は port を u16 範囲内のみ許容 = parse 失敗はあり得ないが、念のため
-    // `parse::<u16>().ok()` で defensive 比較。
-    let matches = |allow: &str| -> bool {
-        let (allow_host, allow_port) = split_host_port(allow);
-        if !allow_host.eq_ignore_ascii_case(incoming_host) {
-            return false;
-        }
-        match (allow_port, incoming_port) {
-            (None, _) => true,        // allow に port なし = port-agnostic
-            (Some(_), None) => false, // allow has port, incoming doesn't
-            (Some(ap), Some(ip)) => ap.parse::<u16>().ok() == ip.parse::<u16>().ok(),
-        }
-    };
+    // Arc<Option<Vec<String>>> → Option<&[String]> 変換
+    // (= `Option<Vec<String>>::as_deref()` は `Option<&[String]>` を返す。Vec の Deref<Target=[T]> による)
+    let allowed_slice: Option<&[String]> = allowed.as_ref().as_deref();
 
-    let allowed_match = match allowed.as_ref() {
-        // None → rmcp default loopback list 互換
-        None => DEFAULT_LOOPBACK_HOSTS.iter().any(|a| matches(a)),
-        // Some(empty) → 全許可 (= disable_allowed_hosts 相当)
-        Some(v) if v.is_empty() => true,
-        // Some(non_empty) → 一致のみ pass
-        Some(v) => v.iter().any(|a| matches(a.as_str())),
-    };
-
-    if allowed_match {
-        next.run(req).await
-    } else {
-        Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("forbidden"))
-            .expect("static response build")
+    match validate_host_header(host_raw, allowed_slice) {
+        Ok(()) => next.run(req).await,
+        // 呼び出し側は prefix を含めない文字列を渡す (二重付与防止)
+        Err(HostRejection::MissingHost) => bad_request_typed("missing Host header"),
+        Err(HostRejection::MalformedHost) => bad_request_typed("Invalid Host header"),
+        Err(HostRejection::NotAllowed) => forbidden_plain("Host header is not allowed"),
     }
 }
 
