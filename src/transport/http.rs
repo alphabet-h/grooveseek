@@ -340,87 +340,6 @@ pub async fn run_http(
     Ok(())
 }
 
-/// `Host` header / allow-list entry を `(host, Option<port>)` に分解する。
-/// RFC 7230 の Host header 文法に従う:
-/// - IPv6 literal w/ port: `[::1]:3100` → (`"::1"`, `Some("3100")`)
-/// - IPv6 literal w/o port: `[::1]` → (`"::1"`, `None`)
-/// - IPv6 unbracketed (config 形式): `"::1"` → (`"::1"`, `None`)
-/// - IPv4 / hostname w/ port: `192.168.1.10:3100` → (`"192.168.1.10"`, `Some("3100")`)
-/// - IPv4 / hostname w/o port: `192.168.1.10` → (`"192.168.1.10"`, `None`)
-///
-/// codex P2 (#50 round 1-4): port-aware にすることで以下を一貫させる:
-/// - IPv6 literal の bracket 剥がし
-/// - allow-list の host-only entry は port-agnostic match
-/// - allow-list の host:port entry は **port 厳密一致**
-///   (= `["example.com:8080"]` が `Host: example.com:9999` を accept しない)
-///
-/// codex P2 (#50 round 6): port は `u16` 範囲 (0-65535) のみ valid。
-/// `99999` のような u16 範囲外は **invalid port** として全体を raw 扱い、
-/// allow-list match から外す (= rmcp の `Authority::try_from` が同条件で
-/// reject するのに合わせる)。
-///
-/// Note (Phase C / D-11): `healthz_host_check` middleware は
-/// `validate_host_header` 経由になり、production code では本 fn は
-/// 呼ばれなくなった。残存する `extract_host_part` 経由の test 経路だけが
-/// 参照するため `#[cfg(test)]` で test build 限定にする (Task 8 で完全削除予定)。
-#[cfg(test)]
-fn split_host_port(s: &str) -> (&str, Option<&str>) {
-    // Bracketed IPv6: `[ipv6]:port` or `[ipv6]`
-    // codex P1 (#50 round 5): `]` の後ろに任意の文字列 (例: `[::1]evil.example`)
-    // を許すと、malformed Host が allow-list bypass になる (= host="::1" に
-    // 正規化されてしまい loopback default に通る)。`after` は **空** または
-    // `:<valid u16 port>` のみ許容、それ以外は raw 文字列を返して match 不能化する。
-    if let Some(rest) = s.strip_prefix('[')
-        && let Some(end) = rest.find(']')
-    {
-        let host = &rest[..end];
-        let after = &rest[end + 1..];
-        if after.is_empty() {
-            return (host, None);
-        }
-        if let Some(port) = after.strip_prefix(':')
-            && !port.is_empty()
-            && port.chars().all(|c| c.is_ascii_digit())
-            && port.parse::<u16>().is_ok()
-        {
-            return (host, Some(port));
-        }
-        // Malformed bracketed Host (`]` 後に予期しない文字列、または
-        // u16 範囲外 port) → raw を返す。比較側は host_full == raw or
-        // host_part == raw のみで判定するので、通常の allow-list entry とは
-        // 一致しない = 403 (= bypass を防ぐ)。
-        return (s, None);
-    }
-    // No brackets. Count colons to disambiguate IPv4/hostname:port vs IPv6 unbracketed.
-    let colon_count = s.bytes().filter(|&b| b == b':').count();
-    if colon_count >= 2 {
-        // IPv6 unbracketed (config 形式 like "::1") — no port form.
-        return (s, None);
-    }
-    if colon_count == 1
-        && let Some(colon) = s.rfind(':')
-    {
-        let port_part = &s[colon + 1..];
-        if !port_part.is_empty()
-            && port_part.chars().all(|c| c.is_ascii_digit())
-            && port_part.parse::<u16>().is_ok()
-        {
-            return (&s[..colon], Some(port_part));
-        }
-        // u16 範囲外 port (`localhost:99999` 等) → raw を返す。
-        return (s, None);
-    }
-    (s, None)
-}
-
-/// `split_host_port` の host portion のみを返す薄い wrapper。
-/// 既存 unit test との後方互換性のため残す (= production code は
-/// `split_host_port` を直接使用、本関数は test 範囲のみ参照)。
-#[cfg(test)]
-fn extract_host_part(s: &str) -> &str {
-    split_host_port(s).0
-}
-
 /// F-64: `/healthz` 用 axum middleware。Host header を allowed_hosts と照合し
 /// 不一致なら 400 / 403 を返す。実際の比較は pure helper `validate_host_header`
 /// に委譲、本 fn は HTTP-specific layer (= header / authority / response builder) のみ。
@@ -694,38 +613,6 @@ mod tests {
             .unwrap();
         let resp = app2.oneshot(req2).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    // --- extract_host_part unit tests ---
-
-    #[test]
-    fn test_extract_host_part_ipv4_with_port() {
-        assert_eq!(extract_host_part("192.168.1.10:3100"), "192.168.1.10");
-    }
-
-    #[test]
-    fn test_extract_host_part_ipv4_without_port() {
-        assert_eq!(extract_host_part("192.168.1.10"), "192.168.1.10");
-    }
-
-    #[test]
-    fn test_extract_host_part_hostname_with_port() {
-        assert_eq!(extract_host_part("localhost:3100"), "localhost");
-    }
-
-    #[test]
-    fn test_extract_host_part_ipv6_with_port() {
-        assert_eq!(extract_host_part("[::1]:3100"), "::1");
-    }
-
-    #[test]
-    fn test_extract_host_part_ipv6_without_port() {
-        assert_eq!(extract_host_part("[::1]"), "::1");
-    }
-
-    #[test]
-    fn test_extract_host_part_empty() {
-        assert_eq!(extract_host_part(""), "");
     }
 
     /// codex P2 (#50 round 2): Host header 不在時に URI authority を
