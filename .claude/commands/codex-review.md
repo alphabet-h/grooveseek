@@ -24,9 +24,9 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 - リポジトリで `chatgpt-codex-connector[bot]` の GitHub App install 済
 - 本 command は **destructive 操作なし** (= GitHub API read + comment post のみ)、ローカル file system 改変なし
 
-## 設計の柱 (= 21 罠の構造的回避)
+## 設計の柱 (= 22 罠の構造的回避)
 
-本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-32 を **構造的に回避** する設計:
+本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-33 を **構造的に回避** する設計:
 
 | 罠 | 回避手段 |
 |---|---|
@@ -51,6 +51,7 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 30 (P2-only round で controller が判断材料を取れない) | Step 5 整形に `=== Inline P2 (controller-judgment items, current round only) ===` section を追加し、P2 inline の path + body を必ず出力する (= P0/P1 = 0 + P2 > 0 の round で convergence indeterminate になる時、controller が「取り込み or skip」判断するために具体内容を必ず提示) |
 | 罠 31 (gh api --paginate --jq で multi-page が単一 array にならない) | snapshot helpers は `?per_page=100` で page 数最小化 + 内部 `--jq "[.[] \| select(...) \| {...}]"` で per-page 配列化 + 外部 `jq -s "add // [] \| sort_by(.id)"` で merge して single array 化 (= --paginate と --jq は per-page 別々に走るため、外部 slurp なしでは multi-page で multiple JSON document concatenation になり、downstream `--argjson prev` 等が壊れる) |
 | 罠 32 (initial delta で convergence 判定 = codex multi-write を miss) | Phase A (initial activity detection) → Phase B (`QUIET_WINDOW_SEC=30s` の quiet window 確認) の 2 phase polling で round complete を待つ。codex は review submission の後に inline comment を秒〜数十秒遅れで post するため、初回 delta で convergence 判定すると stale state で false-converge する |
+| 罠 33 (sentinel / terminal-error が PR 全 history で評価される) | `LATEST_ISSUE_BODY` を `NEW_ISSUES = $CUR_ISSUES − $PREV_ISSUES` (= current round で post された issue comment のみ) から derive する。罠 27 (P-badge round-scoping) と同じ pattern を sentinel + terminal-error チェック側にも適用、prior round の sentinel "Didn't find any major issues" が後続 round に漏れて false-converge する race を排除 |
 
 ## 実行フロー
 
@@ -181,8 +182,19 @@ done
 罠 14 の文言依存を緩和、業界 defacto Pattern C (= state-base) を primary に:
 
 ```bash
+# 罠 33 (codex P1 round 5 on PR #54): sentinel / terminal-error checks must
+# be scoped to **current round** issue comments (= delta vs PREV_ISSUES),
+# not全 PR history。prior round で sentinel ("Didn't find any major issues")
+# が出ていた場合、current round が new review/inline を出して new issue
+# comment が無い state でも `LATEST_ISSUE_BODY` は prior round の sentinel を
+# 拾い続けて SENTINEL_MATCH=true → false-converge する。
 LATEST_REVIEW=$(snapshot_reviews | jq '.[-1]')
-LATEST_ISSUE_BODY=$(snapshot_issues | jq -r '.[-1].body // ""')
+CUR_ISSUES_FRESH=$(snapshot_issues)
+NEW_ISSUES=$(jq -n --argjson prev "$PREV_ISSUES" --argjson cur "$CUR_ISSUES_FRESH" '
+  ($prev | map({key: (.id|tostring), value: .updated_at}) | from_entries) as $prev_map |
+  $cur | map(select(.id as $i | ($prev_map[$i|tostring] // null) != .updated_at))
+')
+LATEST_ISSUE_BODY=$(echo "$NEW_ISSUES" | jq -r '.[-1].body // ""')
 HEAD_SHA=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha)
 
 # 罠 10: error string detect → terminal failure、retry しない
@@ -334,7 +346,7 @@ Round ${N} fix (commit \`<SHA>\`):
 
 ## 関連
 
-- 動機 + 罠 7-19 + 21-23 + 24-32 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
+- 動機 + 罠 7-19 + 21-23 + 24-33 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
 - `/feature-flow` orchestrator: `.claude/commands/feature-flow.md` (= 本 command の caller、Phase 6)
 - CLAUDE.local.md `/feature-flow` 常時 guardrail 節
 - 公式 source:
