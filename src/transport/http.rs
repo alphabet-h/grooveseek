@@ -46,6 +46,69 @@ pub(crate) enum HostRejection {
     NotAllowed,
 }
 
+/// Allow-list entry / incoming Host header の比較用 normalized form。
+/// rmcp 1.4 `tower.rs::NormalizedAuthority` (line 169-180) の mirror。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Task 5 で `validate_host_header` 本体実装後に外す
+struct NormalizedAuthority {
+    /// host: bracket 剥がし + ASCII lowercase。`Authority::host()` は IPv6 で
+    /// brackets を含む文字列を返すため、`trim_matches('[' / ']')` + lowercase 化。
+    host: String,
+    /// port: `Authority::port_u16()` を u16 として保持、port なしは `None`。
+    port: Option<u16>,
+}
+
+#[allow(dead_code)] // Task 5 で外す
+impl NormalizedAuthority {
+    /// 既に parse 済の `Authority` から作る (= incoming Host header 用、infallible)。
+    fn from_authority(authority: &http::uri::Authority) -> Self {
+        Self {
+            host: authority
+                .host()
+                .trim_matches('[')
+                .trim_matches(']')
+                .to_ascii_lowercase(),
+            port: authority.port_u16(),
+        }
+    }
+
+    /// allow-list entry の raw 文字列から作る (= rmcp `parse_allowed_authority`
+    /// line 182-193 mirror、infallible で fallback semantics)。
+    fn from_allowed_entry(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Self {
+                host: String::new(),
+                port: None,
+            };
+        }
+        if let Ok(authority) = http::uri::Authority::try_from(trimmed) {
+            return Self::from_authority(&authority);
+        }
+        // try_from 失敗 = fallback: raw を host-only として保存
+        // (= unbracketed IPv6 `"::1"` のような config 形式を救済)
+        Self {
+            host: trimmed
+                .trim_matches('[')
+                .trim_matches(']')
+                .to_ascii_lowercase(),
+            port: None,
+        }
+    }
+
+    /// host eq + port-strict / port-agnostic match。
+    /// rmcp `host_is_allowed` line 200-209 mirror。
+    fn matches(&self, incoming: &Self) -> bool {
+        if self.host != incoming.host {
+            return false;
+        }
+        match self.port {
+            Some(p) => incoming.port == Some(p), // strict
+            None => true,                        // port-agnostic
+        }
+    }
+}
+
 /// rmcp's default loopback-only allow-list, mirrored locally so the F-64
 /// `/healthz` middleware can apply identical semantics when
 /// `allowed_hosts = None`. Keep in sync with rmcp upstream.
@@ -688,5 +751,55 @@ mod tests {
             .unwrap();
         let resp = app3.oneshot(req3).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ===========================================================================
+    // feature-39 / D-11: NormalizedAuthority unit tests
+    // ===========================================================================
+
+    #[test]
+    fn test_normalized_authority_from_authority_strips_brackets_and_lowercases() {
+        let auth = http::uri::Authority::try_from("[::1]:80").unwrap();
+        let normalized = NormalizedAuthority::from_authority(&auth);
+        assert_eq!(normalized.host, "::1");
+        assert_eq!(normalized.port, Some(80));
+    }
+
+    #[test]
+    fn test_normalized_authority_from_authority_uppercase_hostname() {
+        let auth = http::uri::Authority::try_from("EXAMPLE.COM:8080").unwrap();
+        let normalized = NormalizedAuthority::from_authority(&auth);
+        assert_eq!(normalized.host, "example.com");
+        assert_eq!(normalized.port, Some(8080));
+    }
+
+    #[test]
+    fn test_normalized_authority_from_allowed_entry_unbracketed_ipv6_fallback() {
+        // rmcp `parse_allowed_authority` mirror: try_from 失敗で raw fallback
+        let normalized = NormalizedAuthority::from_allowed_entry("::1");
+        assert_eq!(normalized.host, "::1");
+        assert_eq!(normalized.port, None);
+    }
+
+    #[test]
+    fn test_normalized_authority_matches_port_strict() {
+        let allow = NormalizedAuthority::from_allowed_entry("example.com:8080");
+        let incoming_match = NormalizedAuthority::from_authority(
+            &http::uri::Authority::try_from("example.com:8080").unwrap(),
+        );
+        let incoming_diff = NormalizedAuthority::from_authority(
+            &http::uri::Authority::try_from("example.com:9999").unwrap(),
+        );
+        assert!(allow.matches(&incoming_match));
+        assert!(!allow.matches(&incoming_diff));
+    }
+
+    #[test]
+    fn test_normalized_authority_matches_port_agnostic_when_allow_has_no_port() {
+        let allow = NormalizedAuthority::from_allowed_entry("example.com");
+        let incoming = NormalizedAuthority::from_authority(
+            &http::uri::Authority::try_from("example.com:8080").unwrap(),
+        );
+        assert!(allow.matches(&incoming)); // allow に port なし = port-agnostic
     }
 }

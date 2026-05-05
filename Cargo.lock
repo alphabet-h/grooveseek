@@ -1797,6 +1797,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "globset",
+ "http",
  "notify",
  "notify-debouncer-full",
  "proptest",
