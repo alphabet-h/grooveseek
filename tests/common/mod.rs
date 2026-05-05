@@ -17,5 +17,6 @@
 
 #![allow(dead_code)] // helpers are referenced lazily from individual integration tests
 
+pub mod ansi;
 pub mod mcp;
 pub mod temp;
