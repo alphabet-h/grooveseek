@@ -578,6 +578,7 @@ mod tests {
     // F-64: /healthz Host check middleware (healthz_public opt-in).
     // -----------------------------------------------------------------------
 
+    use axum::body::to_bytes;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
@@ -634,6 +635,12 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(
+            body.starts_with(b"Forbidden: Host header is not allowed"),
+            "body should match rmcp forbidden_response, got: {:?}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// `healthz_public = false` + `allowed_hosts = None` → rmcp default
@@ -649,6 +656,12 @@ mod tests {
             .unwrap();
         let resp_evil = app1.oneshot(req1).await.unwrap();
         assert_eq!(resp_evil.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp_evil.into_body(), 1024).await.unwrap();
+        assert!(
+            body.starts_with(b"Forbidden: Host header is not allowed"),
+            "body should match rmcp forbidden_response, got: {:?}",
+            String::from_utf8_lossy(&body)
+        );
 
         // loopback Host → 200
         let app2 = build_test_router(false, None);
@@ -766,7 +779,7 @@ mod tests {
 
     /// codex P1 (#50 round 5): malformed bracketed Host (`[::1]evil.example`)
     /// が host-only に正規化されて allow-list bypass になる security 罠の
-    /// regression test。loopback default で 403 を返すこと。
+    /// regression test。rmcp parity で 400 Bad Request を返すこと。
     #[tokio::test]
     async fn test_healthz_public_false_rejects_malformed_bracketed_host() {
         let app = build_test_router(false, None);
@@ -776,11 +789,17 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(
+            body.starts_with(b"Bad Request: Invalid Host header"),
+            "body should match rmcp bad_request, got: {:?}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// codex P2 (#50 round 6): u16 範囲外 port (`99999`) が parse できないことを
-    /// 確認 = `Host: localhost:99999` が loopback default で 403。
+    /// 確認 = `Host: localhost:99999` は rmcp parity で 400 Bad Request。
     #[tokio::test]
     async fn test_healthz_public_false_rejects_invalid_port() {
         let app = build_test_router(false, None);
@@ -790,10 +809,16 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(
+            body.starts_with(b"Bad Request: Invalid Host header"),
+            "body should match rmcp bad_request, got: {:?}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
-    /// codex P2 (#50 round 6): IPv6 literal でも u16 範囲外 port は reject。
+    /// codex P2 (#50 round 6): IPv6 literal でも u16 範囲外 port は reject (400)。
     #[tokio::test]
     async fn test_healthz_public_false_rejects_invalid_port_ipv6() {
         let app = build_test_router(false, None);
@@ -803,7 +828,13 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(
+            body.starts_with(b"Bad Request: Invalid Host header"),
+            "body should match rmcp bad_request, got: {:?}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// codex P2 (#50 round 7): port は u16 numeric 比較 (= `"080"` == `"80"`)。
@@ -846,6 +877,12 @@ mod tests {
             .unwrap();
         let resp2 = app2.oneshot(req2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
+        let body2 = to_bytes(resp2.into_body(), 1024).await.unwrap();
+        assert!(
+            body2.starts_with(b"Forbidden: Host header is not allowed"),
+            "body should match rmcp forbidden_response, got: {:?}",
+            String::from_utf8_lossy(&body2)
+        );
 
         // port 抜きの incoming Host も 403 (allow が port 指定なので strict)
         let app3 = build_test_router(false, Some(vec!["example.com:8080".into()]));
@@ -856,6 +893,12 @@ mod tests {
             .unwrap();
         let resp3 = app3.oneshot(req3).await.unwrap();
         assert_eq!(resp3.status(), StatusCode::FORBIDDEN);
+        let body3 = to_bytes(resp3.into_body(), 1024).await.unwrap();
+        assert!(
+            body3.starts_with(b"Forbidden: Host header is not allowed"),
+            "body should match rmcp forbidden_response, got: {:?}",
+            String::from_utf8_lossy(&body3)
+        );
     }
 
     /// codex P2 (#50 round 3): allow-list entry も normalize して比較。
