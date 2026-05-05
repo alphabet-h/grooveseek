@@ -194,6 +194,18 @@ kb-mcp index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 
 
 既存インデックスでのモデル切替には `--force` が必須 (DB の `index_meta` テーブルにモデル / 次元が記録されており、不一致時は起動が拒否される)。
 
+#### 進捗出力フラグ (v0.7.8+)
+
+`kb-mcp index` の進捗表示を切り替える 2 フラグ。**相互排他** + フラグなしの既定動作は不変 (= 既存の per-file `  indexed: foo.md (N chunks)` 出力をそのまま維持)。
+
+- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。
+- `--progress`: 進捗 UI を表示。stderr の `IsTerminal` で自動分岐 — TTY なら `indicatif` バー (経過時間 / 件数 / % / ETA)、非 TTY (pipe / redirect) なら `Progress: N/M (P%)` 行を約 20 回 + 100% アンカー 1 回で flush。`tail -f indexing.log` で監視可能。
+
+```bash
+kb-mcp index --kb-path ./big-kb --quiet         # 完了まで silence
+kb-mcp index --kb-path ./big-kb --progress      # TTY ではバー、pipe では定期行
+```
+
 #### モデル選択のトレードオフ
 
 | 観点 | BGE-small-en-v1.5 | BGE-M3 |

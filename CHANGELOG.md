@@ -4,6 +4,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- **D-10**: `kb-mcp index --quiet` flag to suppress per-file progress output
+  (only `Indexing` / `Found N source files` / `Done in ...` summary lines remain).
+  Useful when running from harnesses (e.g. Claude Code Bash tool) where streaming
+  output is buffered until exit. Mutually exclusive with `--progress`.
+- **D-10**: `kb-mcp index --progress` flag to show progress UI. On TTY: an
+  `indicatif` progress bar with elapsed / position / percent / ETA. On non-TTY
+  (pipe / redirect): periodic `Progress: N/M (P%)` lines (~20 emits per run +
+  100% anchor). Auto-detected via `std::io::IsTerminal` on stderr.
+
+### Changed
+
+- **D-10**: MCP server `rebuild_index` tool now suppresses per-file progress
+  output (= `ProgressMode::Quiet` fixed). The `IndexStats` JSON response
+  returned to the client is unchanged; this only affects what the server
+  process prints to its own stderr.
+
 ## [0.7.7] - 2026-05-05
 
 ### Added

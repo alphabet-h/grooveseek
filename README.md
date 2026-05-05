@@ -194,6 +194,18 @@ Scans source files under the given directory, skipping the default `exclude_dirs
 
 Switching models on an existing index requires `--force` (the DB records the model/dim in `index_meta` and rejects mismatched runtimes).
 
+#### Progress reporting flags (v0.7.8+)
+
+Two flags control how `kb-mcp index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
+
+- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang.
+- `--progress`: show progress UI. Auto-detects via `IsTerminal` on stderr — TTY gets an `indicatif` bar with elapsed / position / percent / ETA, non-TTY gets periodic `Progress: N/M (P%)` lines (~20 emits per run plus a 100 % anchor) so `tail -f indexing.log` works.
+
+```bash
+kb-mcp index --kb-path ./big-kb --quiet         # silent except for start / done
+kb-mcp index --kb-path ./big-kb --progress      # bar in TTY, periodic lines in pipe
+```
+
 #### Model selection trade-offs
 
 | Aspect | BGE-small-en-v1.5 | BGE-M3 |
