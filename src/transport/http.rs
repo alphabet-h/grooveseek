@@ -1201,4 +1201,35 @@ mod tests {
             Ok(())
         );
     }
+
+    /// feature-39 / D-11: middleware 経路で `HeaderValue::to_str()` 失敗 path を直叩き
+    /// (= encoding error path の regression catcher)。
+    ///
+    /// `HeaderValue::from_bytes(&[0xFF, 0xFE])` は valid HeaderValue (byte 32-255 範囲、
+    /// `http-1.4.0/src/header/value.rs:129`) だが `to_str()` は byte > 127 で `Err` を返す
+    /// = middleware が helper を経由せず `bad_request_typed("Invalid Host header encoding")`
+    /// を直接返す path を踏ませる。
+    #[tokio::test]
+    async fn test_healthz_public_false_rejects_non_utf8_host_header_at_middleware() {
+        let app = build_test_router(false, None);
+        let raw_bytes = [0xFF_u8, 0xFE_u8];
+        let invalid_value = http::HeaderValue::from_bytes(&raw_bytes).unwrap();
+
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let mut req = req;
+        req.headers_mut().insert("host", invalid_value);
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            body.as_ref(),
+            b"Bad Request: Invalid Host header encoding".as_slice(),
+            "body should be byte-identical to rmcp"
+        );
+    }
 }
