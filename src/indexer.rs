@@ -138,6 +138,7 @@ pub enum SingleResult {
 /// - `None` → use [`markdown::DEFAULT_EXCLUDED_HEADINGS`]
 /// - `Some(list)` → completely overrides the default list (pass `&[]` to
 ///   disable heading-based exclusion entirely).
+#[allow(clippy::too_many_arguments)] // D-10 で 8 個に。config struct 化は別 cycle
 pub fn rebuild_index(
     db: &Database,
     embedder: &mut Embedder,
