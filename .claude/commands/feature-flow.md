@@ -106,7 +106,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
-3. **`/codex-review <PR#>` skill を invoke** (= `.claude/commands/codex-review.md`)。本 skill が以下を 1 step で固定化:
+3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/commands/codex-review.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。本 skill が以下を 1 step で固定化:
    - `@codex review` mention で codex trigger
    - `pulls/<N>/comments` (inline) + `issues/<N>/comments` (top-level) + `pulls/<N>/reviews` (review body) の 3 endpoint を **count-base で同時 polling** (= `submitted_at` / `created_at` の時刻比較を avoid、bash quirks 回避)
    - 5 round 上限で auto break (CLAUDE.local.md guardrail と整合)

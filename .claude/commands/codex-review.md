@@ -24,9 +24,9 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 - リポジトリで `chatgpt-codex-connector[bot]` の GitHub App install 済
 - 本 command は **destructive 操作なし** (= GitHub API read + comment post のみ)、ローカル file system 改変なし
 
-## 設計の柱 (= 15 罠の構造的回避)
+## 設計の柱 (= 17 罠の構造的回避)
 
-本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-26 を **構造的に回避** する設計:
+本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-28 を **構造的に回避** する設計:
 
 | 罠 | 回避手段 |
 |---|---|
@@ -45,6 +45,8 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 24 (codex P2 dogfood: snapshot drops path/line) | `snapshot_inline` の jq projection に `path, line, original_line` を残し、Step 5 の inline 整形で `\(.path):\(.line)` を表示できるようにする |
 | 罠 25 (codex P1 dogfood: P-badge text vs image) | Step 5 の inline 抽出も Step 4 Layer 2 と同じ `contains("![P0 Badge")`/`contains("![P1 Badge")` で揃える (= 2 call site の lockstep) |
 | 罠 26 (baseline-after-trigger race) | baseline (`PREV_INLINE` / `PREV_REVIEWS` / `PREV_ISSUES`) を **trigger 投稿前** に取る (= Step 1)。codex は 1-30 秒で応答する場合があり、trigger 後 baseline では response が baseline に取り込まれて diff 永久 false → wall-clock timeout |
+| 罠 27 (P-badge を全 history で数える) | `pulls/<N>/comments` は PR 全 history を返すため、prior round の P0/P1 が resolved 状態でも残り続ける。Step 4 で `NEW_INLINE = CUR - PREV_INLINE` を取り、**当該 round で新規追加された inline のみ** を P-badge カウント対象にする。Step 5 整形も同じ `NEW_INLINE` を使用 (= 2 call site lockstep) |
+| 罠 28 (feature-flow と codex-review の max_rounds 不整合) | feature-flow Phase 6 は `/codex-review <PR#> 5` と explicit に渡す (= CLAUDE.local.md guardrail "5 round 経過で user 報告" と整合)。codex-review 単体 default は cost-aware の 3、feature-flow から呼ぶ時のみ 5 (= 計画的 5 round budget) |
 
 ## 実行フロー
 
@@ -156,8 +158,18 @@ COMMIT_FRESH=$([ "$REVIEW_COMMIT" = "$HEAD_SHA" ] && echo "true" || echo "false"
 # image markdown format。`[P0]` text 直書きではない
 # 罠 23: 公式 docs は P0/P1 only と書いているが実例で P2 も surface する → P0/P1/P2 全部を track
 # 罠 1 (jq escape): jq regex 内で `\[` は invalid escape、`contains()` で safe な substring match
-P0_P1_TAGS_PRESENT=$(snapshot_inline | jq '[.[] | .body | select(contains("![P0 Badge") or contains("![P1 Badge"))] | length')
-P2_TAGS_PRESENT=$(snapshot_inline | jq '[.[] | .body | select(contains("![P2 Badge"))] | length')
+# 罠 27 (codex P1 round 2 on PR #54): `pulls/<N>/comments` は PR の全 history を返す。
+# round 2 以降に counter を全件で取ると、prior round で残っている P0/P1 が
+# resolved 状態でも count > 0 のままで、convergence が永久に false になる。
+# Step 1 で取った PREV_INLINE (= round baseline) との set diff を取り、
+# **当該 round で新規に追加された inline** だけを評価対象にする。
+CUR_INLINE_FRESH=$(snapshot_inline)
+NEW_INLINE=$(jq -n --argjson prev "$PREV_INLINE" --argjson cur "$CUR_INLINE_FRESH" '
+  ($prev | map(.id)) as $prev_ids |
+  $cur | map(select(.id as $i | ($prev_ids | index($i)) | not))
+')
+P0_P1_TAGS_PRESENT=$(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P0 Badge") or contains("![P1 Badge"))] | length')
+P2_TAGS_PRESENT=$(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P2 Badge"))] | length')
 
 # Layer 3 (tertiary): sentinel text variations (罠 14)、broader pattern set
 SENTINEL_PATTERN="Didn't find any major issues|Hooray|Bravo|Looks good|Keep them coming|no issues found|All good|All clear|approved"
@@ -194,13 +206,16 @@ fi
 echo "=== Top-level summary (review body) ==="
 echo "$LATEST_REVIEW" | jq -r '.body // "(no review body)"'
 echo ""
-echo "=== Inline P0/P1 (review-blocking issues) ==="
+echo "=== Inline P0/P1 (review-blocking issues, current round only) ==="
 # 罠 25 (codex P1 on PR #54): codex emits image markdown badges like
 # `![P0 Badge](...)` / `![P1 Badge](...)`, NOT bare `[P0]` text. Filtering with
 # `test("\\[P[01]\\]")` would silently drop every actionable finding. Use the
-# same `contains("![P0 Badge")` / `contains("![P1 Badge")` predicate as Step 3
+# same `contains("![P0 Badge")` / `contains("![P1 Badge")` predicate as Step 4
 # Layer 2 detection (= keep both call sites in lockstep).
-snapshot_inline | jq -r '.[] | select(.body | (contains("![P0 Badge") or contains("![P1 Badge"))) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
+# 罠 27 (codex P1 round 2 on PR #54): scope to NEW_INLINE (= delta vs round
+# baseline) so prior-round P0/P1 (now resolved by fixes) aren't re-listed as
+# "current actionable" issues.
+echo "$NEW_INLINE" | jq -r '.[] | select(.body | (contains("![P0 Badge") or contains("![P1 Badge"))) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
 echo ""
 echo "=== Top-level issue comments by codex (full) ==="
 snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
@@ -252,7 +267,7 @@ Round ${N} fix (commit \`<SHA>\`):
 
 ## 関連
 
-- 動機 + 罠 7-19 + 21-23 + 24-26 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
+- 動機 + 罠 7-19 + 21-23 + 24-28 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
 - `/feature-flow` orchestrator: `.claude/commands/feature-flow.md` (= 本 command の caller、Phase 6)
 - CLAUDE.local.md `/feature-flow` 常時 guardrail 節
 - 公式 source:
