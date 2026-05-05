@@ -27,6 +27,25 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::server::{KbServer, KbServerShared};
 
+/// `/healthz` 用 Host validation の reject 理由。
+/// HTTP status code への mapping は middleware 側で決定:
+/// - `MissingHost` / `MalformedHost` → 400 Bad Request (= rmcp parity)
+/// - `NotAllowed` → 403 Forbidden (= DNS rebinding 試行想定)
+///
+/// Encoding error (= `HeaderValue::to_str()` 失敗) は middleware 内で helper を
+/// 経由せず直接返すため、本 enum には対応 variant を持たせない (= dead variant 回避)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Task 5 で `validate_host_header` 本体実装後に外す
+pub(crate) enum HostRejection {
+    /// Host header と URI authority の双方が不在。
+    MissingHost,
+    /// Host header の文字列が `Authority::try_from` で parse 失敗、または
+    /// kb-mcp 拡張の defensive reject (= userinfo / port out-of-range)。
+    MalformedHost,
+    /// parse 成功したが allow-list と一致しなかった。
+    NotAllowed,
+}
+
 /// rmcp's default loopback-only allow-list, mirrored locally so the F-64
 /// `/healthz` middleware can apply identical semantics when
 /// `allowed_hosts = None`. Keep in sync with rmcp upstream.
