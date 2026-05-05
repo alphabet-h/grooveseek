@@ -24,9 +24,9 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 - リポジトリで `chatgpt-codex-connector[bot]` の GitHub App install 済
 - 本 command は **destructive 操作なし** (= GitHub API read + comment post のみ)、ローカル file system 改変なし
 
-## 設計の柱 (= 19 罠の構造的回避)
+## 設計の柱 (= 21 罠の構造的回避)
 
-本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-30 を **構造的に回避** する設計:
+本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-32 を **構造的に回避** する設計:
 
 | 罠 | 回避手段 |
 |---|---|
@@ -49,6 +49,8 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 28 (feature-flow と codex-review の max_rounds 不整合) | feature-flow Phase 6 は `/codex-review <PR#> 5` と explicit に渡す (= CLAUDE.local.md guardrail "5 round 経過で user 報告" と整合)。codex-review 単体 default は cost-aware の 3、feature-flow から呼ぶ時のみ 5 (= 計画的 5 round budget) |
 | 罠 29 (id-only set diff が edit を miss) | NEW_INLINE の set diff を `(id, updated_at)` compound key で取り、codex が既存 inline (= 同 id) の body を update して P-badge を追加 / 昇格しても捕捉する |
 | 罠 30 (P2-only round で controller が判断材料を取れない) | Step 5 整形に `=== Inline P2 (controller-judgment items, current round only) ===` section を追加し、P2 inline の path + body を必ず出力する (= P0/P1 = 0 + P2 > 0 の round で convergence indeterminate になる時、controller が「取り込み or skip」判断するために具体内容を必ず提示) |
+| 罠 31 (gh api --paginate --jq で multi-page が単一 array にならない) | snapshot helpers は `?per_page=100` で page 数最小化 + 内部 `--jq "[.[] \| select(...) \| {...}]"` で per-page 配列化 + 外部 `jq -s "add // [] \| sort_by(.id)"` で merge して single array 化 (= --paginate と --jq は per-page 別々に走るため、外部 slurp なしでは multi-page で multiple JSON document concatenation になり、downstream `--argjson prev` 等が壊れる) |
+| 罠 32 (initial delta で convergence 判定 = codex multi-write を miss) | Phase A (initial activity detection) → Phase B (`QUIET_WINDOW_SEC=30s` の quiet window 確認) の 2 phase polling で round complete を待つ。codex は review submission の後に inline comment を秒〜数十秒遅れで post するため、初回 delta で convergence 判定すると stale state で false-converge する |
 
 ## 実行フロー
 
@@ -62,20 +64,31 @@ PR=<PR#>
 BOT="chatgpt-codex-connector[bot]"
 
 # snapshot helper (paginate で罠 8 回避、bot user filter で罠 11 回避)
+# 罠 31 (codex P1 round 4 on PR #54): `gh api --paginate --jq` は **page ごと**
+# に jq filter を適用して結果を stdout に concatenate するため、multi-page で
+# 1 つの JSON array にならず、`jq --argjson prev` 等の downstream consumer に
+# invalid JSON を渡してしまう (= 30+ 件の inline comment で発生)。
+# 解決: per_page=100 で page 数を最小化 + 内部 --jq で per-page array を作る +
+# 外部 `jq -s "add // [] | sort_by(.id)"` で merge して single array にする。
+# 罠 19 (Windows CRLF) は jq への JSON パイプでは発生しない (= jq の JSON
+# parser は CR を whitespace として許容)。
 snapshot_inline() {
   # 罠 24 (codex P2 on PR #54): preserve path/line/original_line so Step 5 can
   # render `<file>:<line>` for each finding. Dropping these in the projection
   # left every reported P0/P1 finding pointing at "null:null".
-  gh api --paginate "repos/${OWNER_REPO}/pulls/${PR}/comments" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, path, line, original_line, body}] | sort_by(.id)"
+  gh api --paginate "repos/${OWNER_REPO}/pulls/${PR}/comments?per_page=100" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, path, line, original_line, body}]" \
+    | jq -s "add // [] | sort_by(.id)"
 }
 snapshot_reviews() {
-  gh api --paginate "repos/${OWNER_REPO}/pulls/${PR}/reviews" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, state, submitted_at, commit_id, body}] | sort_by(.id)"
+  gh api --paginate "repos/${OWNER_REPO}/pulls/${PR}/reviews?per_page=100" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, state, submitted_at, commit_id, body}]" \
+    | jq -s "add // [] | sort_by(.id)"
 }
 snapshot_issues() {
-  gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}] | sort_by(.id)"
+  gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
+    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}]" \
+    | jq -s "add // [] | sort_by(.id)"
 }
 
 # 罠 26: baseline first, trigger second (順序を逆にしない)
@@ -92,14 +105,16 @@ gh pr comment <PR#> --body "@codex review"
 
 mention は **冒頭 1 回のみ**、本文に追加 context を書く場合 `@codex` 文字列を bare word として使わない (= 罠 15)。
 
-### Step 3 — round-level polling with state snapshot diff
+### Step 3 — round-level polling with state snapshot diff + quiet-window completion
 
-snapshot per round で 3 endpoint を `(id, updated_at)` set として取得。Step 1 baseline との diff があれば「activity detected」と判定 (= 罠 13、count saturation 罠 8 と edit miss 罠 13 を同時回避):
+snapshot per round で 3 endpoint を `(id, updated_at)` set として取得。Step 1 baseline との diff があれば「activity detected」、その後 **quiet window** (= N 秒間 snapshot 不変) を確認してから convergence 判定に進む (= 罠 13 + 罠 32 完了検知):
 
 ```bash
 ROUND_START=$(date +%s)
 PER_ROUND_TIMEOUT=600   # 罠 9 wall-clock timeout
+QUIET_WINDOW_SEC=30     # 罠 32: codex multi-write が落ち着くまで wait
 
+# Phase A: wait for first activity
 while true; do
   ELAPSED=$(( $(date +%s) - ROUND_START ))
   if [ "$ELAPSED" -gt "$PER_ROUND_TIMEOUT" ]; then
@@ -115,10 +130,49 @@ while true; do
   if [ "$CUR_INLINE" != "$PREV_INLINE" ] || \
      [ "$CUR_REVIEWS" != "$PREV_REVIEWS" ] || \
      [ "$CUR_ISSUES" != "$PREV_ISSUES" ]; then
-    echo "=== codex activity detected after ${ELAPSED}s ==="
+    echo "=== codex initial activity detected after ${ELAPSED}s ==="
     break
   fi
   sleep 30
+done
+
+# Phase B: wait for quiet window — 罠 32 (codex P1 round 4 on PR #54): codex は
+# review submission を post してから秒〜数十秒遅れて inline comment を post する
+# multi-write pattern。最初の delta で convergence 判定すると stale な inline
+# state で false-converge する (= 後続の P0/P1 が見えない)。`QUIET_WINDOW_SEC`
+# 秒間 snapshot が不変な状態を確認してから Step 4 へ進む。
+QUIET_START=$(date +%s)
+LAST_INLINE=$CUR_INLINE
+LAST_REVIEWS=$CUR_REVIEWS
+LAST_ISSUES=$CUR_ISSUES
+while true; do
+  WALL_ELAPSED=$(( $(date +%s) - ROUND_START ))
+  if [ "$WALL_ELAPSED" -gt "$PER_ROUND_TIMEOUT" ]; then
+    echo "WARN: quiet window not reached within ${PER_ROUND_TIMEOUT}s wall-clock. Proceeding to Step 4."
+    break
+  fi
+
+  sleep 15
+  CHECK_INLINE=$(snapshot_inline)
+  CHECK_REVIEWS=$(snapshot_reviews)
+  CHECK_ISSUES=$(snapshot_issues)
+
+  if [ "$CHECK_INLINE" = "$LAST_INLINE" ] && \
+     [ "$CHECK_REVIEWS" = "$LAST_REVIEWS" ] && \
+     [ "$CHECK_ISSUES" = "$LAST_ISSUES" ]; then
+    QUIET_ELAPSED=$(( $(date +%s) - QUIET_START ))
+    if [ "$QUIET_ELAPSED" -ge "$QUIET_WINDOW_SEC" ]; then
+      echo "=== quiet window of ${QUIET_WINDOW_SEC}s confirmed, round complete ==="
+      break
+    fi
+  else
+    # still active, reset quiet window
+    QUIET_START=$(date +%s)
+    LAST_INLINE=$CHECK_INLINE
+    LAST_REVIEWS=$CHECK_REVIEWS
+    LAST_ISSUES=$CHECK_ISSUES
+    echo "  (still receiving codex writes, reset quiet window)"
+  fi
 done
 ```
 
@@ -280,7 +334,7 @@ Round ${N} fix (commit \`<SHA>\`):
 
 ## 関連
 
-- 動機 + 罠 7-19 + 21-23 + 24-30 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
+- 動機 + 罠 7-19 + 21-23 + 24-32 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
 - `/feature-flow` orchestrator: `.claude/commands/feature-flow.md` (= 本 command の caller、Phase 6)
 - CLAUDE.local.md `/feature-flow` 常時 guardrail 節
 - 公式 source:
