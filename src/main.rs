@@ -544,8 +544,10 @@ fn main() -> anyhow::Result<()> {
             let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
             let total_docs = db.document_count()?;
             let total_chunks = db.chunk_count()?;
+            let tags_failures = db.tags_parse_failure_count();
             eprintln!("Documents: {total_docs}");
             eprintln!("Chunks: {total_chunks}");
+            eprintln!("Tags parse failures: {tags_failures}");
             // Quality filter: 設定済みの threshold で filter される件数を表示
             let qf = cfg.quality_filter.clone().unwrap_or_default();
             let threshold = qf.effective_threshold();
