@@ -1681,9 +1681,28 @@ impl Database {
 // Tests
 // ===========================================================================
 
+/// F-65 (feature-40): per-id dummy `SearchResult` for `rrf_topk` proptest.
+/// proptest 内で score / id 以外を default 値にした row を生成するための
+/// module-private helper。production code から呼べない。
+#[cfg(test)]
+fn dummy_search_result_for_id(id: i64) -> SearchResult {
+    SearchResult {
+        score: 0.0, // overwritten by rrf_topk
+        content: String::new(),
+        heading: None,
+        document_id: id,
+        path: format!("dummy-{}.md", id),
+        title: None,
+        topic: None,
+        date: None,
+        tags: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// Helper: create a dummy 384-dim embedding filled with `val`.
     fn dummy_embedding(val: f32) -> Vec<f32> {
@@ -3887,5 +3906,62 @@ mod tests {
         let normal_len: usize = 1024;
         let normal_result = i32::try_from(normal_len).unwrap_or(i32::MAX);
         assert_eq!(normal_result, 1024_i32);
+    }
+
+    proptest! {
+        /// F-65: rrf_topk が任意 input に対して **score DESC + id ASC** の deterministic
+        /// total order を返すことを fixation する。HashMap iteration の非決定性に依存
+        /// しないことを保証 (invariant #1)。
+        ///
+        /// generator:
+        /// - `entries`: `Vec<(i64, f32)>`、id は重複可だが HashMap で deduped、score は finite f32 のみ
+        /// - `limit`: `Option<u32>`、None / Some(0..=200) を生成
+        ///
+        /// `partial_cmp` の NaN は `unwrap_or(Ordering::Equal)` で degraded されるが、本 test
+        /// は finite f32 のみ generate するため NaN 道は踏まない (= 別 test corpus で扱う想定)。
+        #[test]
+        fn prop_rrf_topk_total_order_stable(
+            entries in prop::collection::vec(
+                (any::<i64>(), prop::num::f32::ANY.prop_filter("finite", |x| x.is_finite())),
+                0..50,
+            ),
+            limit in prop::option::of(0u32..=200u32),
+        ) {
+            let scores: HashMap<i64, f32> = entries.iter().copied().collect();
+            let rows: HashMap<i64, SearchResult> = scores.keys()
+                .map(|&id| (id, dummy_search_result_for_id(id)))
+                .collect();
+
+            let result = rrf_topk(scores.clone(), rows, limit);
+
+            // 1. score DESC + id ASC の total order を verify
+            for window in result.windows(2) {
+                let (a_id, a) = &window[0];
+                let (b_id, b) = &window[1];
+                let a_score = scores[a_id];
+                let b_score = scores[b_id];
+                prop_assert!(
+                    a.score > b.score
+                        || (a.score == b.score && a_id < b_id),
+                    "ordering violated: ({}, {}) vs ({}, {}) scores=({}, {})",
+                    a_id, a.score, b_id, b.score, a_score, b_score
+                );
+            }
+
+            // 2. limit constraint
+            if let Some(n) = limit {
+                prop_assert!(result.len() <= n as usize);
+            }
+
+            // 3. result の score field が input score と一致 (rrf overwrite)
+            for (id, r) in &result {
+                prop_assert_eq!(r.score, scores[id]);
+            }
+
+            // 4. result の id 集合が input scores の **subset** (limit 適用後の任意の n 件)
+            let result_ids: std::collections::HashSet<i64> = result.iter().map(|(id, _)| *id).collect();
+            let scores_ids: std::collections::HashSet<i64> = scores.keys().copied().collect();
+            prop_assert!(result_ids.is_subset(&scores_ids));
+        }
     }
 }
