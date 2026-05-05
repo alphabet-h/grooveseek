@@ -136,12 +136,17 @@ pub async fn run_http(
 /// - allow-list の host-only entry は port-agnostic match
 /// - allow-list の host:port entry は **port 厳密一致**
 ///   (= `["example.com:8080"]` が `Host: example.com:9999` を accept しない)
+///
+/// codex P2 (#50 round 6): port は `u16` 範囲 (0-65535) のみ valid。
+/// `99999` のような u16 範囲外は **invalid port** として全体を raw 扱い、
+/// allow-list match から外す (= rmcp の `Authority::try_from` が同条件で
+/// reject するのに合わせる)。
 fn split_host_port(s: &str) -> (&str, Option<&str>) {
     // Bracketed IPv6: `[ipv6]:port` or `[ipv6]`
     // codex P1 (#50 round 5): `]` の後ろに任意の文字列 (例: `[::1]evil.example`)
     // を許すと、malformed Host が allow-list bypass になる (= host="::1" に
     // 正規化されてしまい loopback default に通る)。`after` は **空** または
-    // `:<digits>` のみ許容、それ以外は raw 文字列を返して match 不能化する。
+    // `:<valid u16 port>` のみ許容、それ以外は raw 文字列を返して match 不能化する。
     if let Some(rest) = s.strip_prefix('[')
         && let Some(end) = rest.find(']')
     {
@@ -153,12 +158,14 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
         if let Some(port) = after.strip_prefix(':')
             && !port.is_empty()
             && port.chars().all(|c| c.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
         {
             return (host, Some(port));
         }
-        // Malformed bracketed Host (`]` 後に予期しない文字列) → raw を返す。
-        // 比較側は host_full == raw or host_part == raw のみで判定するので、
-        // 通常の allow-list entry とは一致しない = 403 (= bypass を防ぐ)。
+        // Malformed bracketed Host (`]` 後に予期しない文字列、または
+        // u16 範囲外 port) → raw を返す。比較側は host_full == raw or
+        // host_part == raw のみで判定するので、通常の allow-list entry とは
+        // 一致しない = 403 (= bypass を防ぐ)。
         return (s, None);
     }
     // No brackets. Count colons to disambiguate IPv4/hostname:port vs IPv6 unbracketed.
@@ -171,9 +178,14 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
         && let Some(colon) = s.rfind(':')
     {
         let port_part = &s[colon + 1..];
-        if !port_part.is_empty() && port_part.chars().all(|c| c.is_ascii_digit()) {
+        if !port_part.is_empty()
+            && port_part.chars().all(|c| c.is_ascii_digit())
+            && port_part.parse::<u16>().is_ok()
+        {
             return (&s[..colon], Some(port_part));
         }
+        // u16 範囲外 port (`localhost:99999` 等) → raw を返す。
+        return (s, None);
     }
     (s, None)
 }
@@ -531,6 +543,33 @@ mod tests {
         let req = HttpRequest::builder()
             .uri("/healthz")
             .header("host", "[::1]evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// codex P2 (#50 round 6): u16 範囲外 port (`99999`) が parse できないことを
+    /// 確認 = `Host: localhost:99999` が loopback default で 403。
+    #[tokio::test]
+    async fn test_healthz_public_false_rejects_invalid_port() {
+        let app = build_test_router(false, None);
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "localhost:99999")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// codex P2 (#50 round 6): IPv6 literal でも u16 範囲外 port は reject。
+    #[tokio::test]
+    async fn test_healthz_public_false_rejects_invalid_port_ipv6() {
+        let app = build_test_router(false, None);
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "[::1]:99999")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
