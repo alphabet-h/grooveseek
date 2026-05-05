@@ -108,6 +108,8 @@ bind = "127.0.0.1:3100"
 # これは通常 operator のミスなので、起動時に warn が出る)。
 # 空配列を渡すと **全 Host 許可** になる (rmcp の disable_allowed_hosts
 # 相当、public 公開時は推奨されない)。
+# IPv6 entries: bracketed form `"[::1]"` is recommended for clarity.
+# The unbracketed form `"::1"` is also accepted for backward compatibility.
 #allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100"]
 
 # F-64 (v0.7.5+): /healthz endpoint も allowed_hosts allow-list 配下に置くか。

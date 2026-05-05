@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "kb-mcp"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "anyhow",
  "axum",

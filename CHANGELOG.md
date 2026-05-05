@@ -4,6 +4,43 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-05-05
+
+### Changed
+
+- **D-11 (= F-64 follow-up)**: `[transport.http].healthz_public = false`
+  設定時の `/healthz` Host header validation を `http::uri::Authority::try_from`
+  委譲に refactor し、rmcp 1.4 と semantic parity を達成 (詳細は
+  `.dev/feature-ideas.md` D-11)。挙動変更:
+  - malformed Host header → status code が **403 → 400** Bad Request
+    (response body は `Bad Request: Invalid Host header` /
+    `Bad Request: Invalid Host header encoding` /
+    `Bad Request: missing Host header` のいずれか、Content-Type は
+    `text/plain; charset=utf-8`)
+  - DNS rebinding (= parse OK + allow-list 不一致) は **403 のまま**、
+    response body 文言を `Forbidden: Host header is not allowed` に変更
+    (= rmcp と byte-identical)
+  - 既存 v0.7.5 で `healthz_public = false` を opt-in 設定した user のみ影響、
+    default `true` の user は完全に無影響
+- kb-mcp 拡張として **`:authority` URI fallback は維持** (= HTTP/2 /
+  proxy-forwarded health check 互換性)。これは rmcp と意図的に外す superset
+
+### Internal
+
+- 自前 `split_host_port` / `extract_host_part` / 旧 4-way matching を全削除し、
+  `http::uri::Authority::try_from` 委譲 + `NormalizedAuthority` struct
+  (= rmcp `parse_allowed_authority` mirror) に置換。
+- 新規 helper / struct: `validate_host_header` pure helper / `HostRejection` enum
+  (3 variant) / `NormalizedAuthority` / `has_explicit_port_suffix` /
+  `bad_request_typed` / `forbidden_plain`。
+- test: 新規 36 件 (= 5 NormalizedAuthority + 8 has_explicit_port_suffix
+  + 28 validate_host_header helper + middleware integration #29) 追加、
+  既存 6 件 modify (= status/body assertion を rmcp parity 化)、
+  旧 6 件 delete (= 旧 `extract_host_part_*`、新 helper test に 1-1 mapping
+  で意味的統合)。最終 transport::http::tests 計 62 件。
+- `http` crate を Cargo.toml に direct dependency として追加
+  (= axum 0.8 transitive と同 v1.4.0、resolution 操作のみ、新規 download なし)。
+
 ## [0.7.5] - 2026-05-04
 
 ### Added
