@@ -48,6 +48,9 @@ shellexpand = "3"
 # [feature-31] f32x8 SIMD kernel for mmr::cosine_similarity (pure-rust, ~50 KB)。
 # `From<[f32; 8]>` のみ実装、`From<&[f32]>` は無いので [f32; 8] buffer 経由で構築する。
 wide = "0.7"
+# [feature-42 / D-10] Progress bar for `kb-mcp index --progress` (TTY) +
+# IsTerminal-aware fallback for non-TTY (pipe / harness). MSRV 1.70 per cargo info.
+indicatif = "0.18"
 
 [features]
 # Reranker (~2.3 GB) を要求する bench を default 起動から除外する gate。
