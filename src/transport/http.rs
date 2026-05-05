@@ -237,14 +237,20 @@ async fn healthz_host_check(
     //   - `["192.168.1.10:3100"]` (= port 込み) は `Host: 192.168.1.10:3100` のみ match、
     //     `Host: 192.168.1.10:9999` は **403** (codex round 4 の P2 fix)
     //   - `["[::1]"]` も `["::1"]` も IPv6 loopback の任意 form と match
+    //
+    // codex P2 (#50 round 7): port は raw string ではなく **`u16` numeric** で
+    // 比較する (= `"080"` と `"80"` を semantically 等価扱い)。`split_host_port`
+    // は port を u16 範囲内のみ許容 = parse 失敗はあり得ないが、念のため
+    // `parse::<u16>().ok()` で defensive 比較。
     let matches = |allow: &str| -> bool {
         let (allow_host, allow_port) = split_host_port(allow);
         if !allow_host.eq_ignore_ascii_case(incoming_host) {
             return false;
         }
-        match allow_port {
-            Some(ap) => incoming_port == Some(ap),
-            None => true,
+        match (allow_port, incoming_port) {
+            (None, _) => true,        // allow に port なし = port-agnostic
+            (Some(_), None) => false, // allow has port, incoming doesn't
+            (Some(ap), Some(ip)) => ap.parse::<u16>().ok() == ip.parse::<u16>().ok(),
         }
     };
 
@@ -574,6 +580,22 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// codex P2 (#50 round 7): port は u16 numeric 比較 (= `"080"` == `"80"`)。
+    /// rmcp の Authority::try_from と同 semantics。
+    #[tokio::test]
+    async fn test_healthz_public_false_normalizes_port_numerically() {
+        // allow `"example.com:80"` + incoming `Host: example.com:080` → 200
+        // (= zero-padded port を numeric 比較で同値扱い)
+        let app = build_test_router(false, Some(vec!["example.com:80".into()]));
+        let req = HttpRequest::builder()
+            .uri("/healthz")
+            .header("host", "example.com:080")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// codex P2 (#50 round 4): allow-list entry が **port 込み** の場合は
