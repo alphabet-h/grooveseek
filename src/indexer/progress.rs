@@ -82,10 +82,17 @@ impl ProgressReporter {
             let total_u64 = total as u64;
             let is_tty = std::io::stderr().is_terminal();
             self.inner = if is_tty {
-                // Task 3 で Tty(ProgressBar) を構築する。本 Task では一時的に
-                // Verbose に落として TTY 経路でも従来通りの per-file 出力を
-                // 維持する (= regression 防止)。
-                ProgressInner::Verbose
+                use indicatif::{ProgressBar, ProgressStyle};
+                let bar = ProgressBar::new(total_u64);
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "[{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} ({percent}%, ETA {eta}) {msg}",
+                    )
+                    .expect("static template")
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
+                );
+                bar.enable_steady_tick(std::time::Duration::from_millis(100));
+                ProgressInner::Tty(bar)
             } else {
                 let step = std::cmp::max(1u64, total_u64 / 20);
                 ProgressInner::NonTty {
@@ -103,8 +110,9 @@ impl ProgressReporter {
                 eprintln!("  indexed: {rel} ({chunks} chunks)");
             }
             ProgressInner::Quiet | ProgressInner::AutoPending => {}
-            ProgressInner::Tty(_) => {
-                // Task 3 で bar.inc(1) + bar.set_message(...) を実装。
+            ProgressInner::Tty(bar) => {
+                bar.inc(1);
+                bar.set_message(format!("{rel} ({chunks} chunks)"));
             }
             ProgressInner::NonTty { total, step, count } => {
                 let new_count = count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -112,7 +120,6 @@ impl ProgressReporter {
                     let pct = (new_count * 100) / total;
                     eprintln!("Progress: {new_count}/{total} ({pct}%)");
                 }
-                // chunks / rel は NonTty mode では使わない (= 1 行に summary のみ)
                 let _ = (rel, chunks);
             }
         }
@@ -123,11 +130,10 @@ impl ProgressReporter {
             ProgressInner::Verbose => {
                 eprintln!("  renamed: {old} -> {new}");
             }
-            ProgressInner::Quiet
-            | ProgressInner::AutoPending
-            | ProgressInner::Tty(_)
-            | ProgressInner::NonTty { .. } => {
-                // Tty は Task 3 で `bar.println(...)` 経由に置換。
+            ProgressInner::Tty(bar) => {
+                bar.println(format!("  renamed: {old} -> {new}"));
+            }
+            ProgressInner::Quiet | ProgressInner::AutoPending | ProgressInner::NonTty { .. } => {
                 // NonTty は per-file 進捗 = indexed のみカウント、
                 // renamed / deleted は補助情報として silence。
             }
@@ -139,20 +145,32 @@ impl ProgressReporter {
             ProgressInner::Verbose => {
                 eprintln!("  deleted: {rel}");
             }
-            ProgressInner::Quiet
-            | ProgressInner::AutoPending
-            | ProgressInner::Tty(_)
-            | ProgressInner::NonTty { .. } => {
-                // Task 3 で Tty bar.println を実装、それ以外は no-op。
+            ProgressInner::Tty(bar) => {
+                bar.println(format!("  deleted: {rel}"));
             }
+            ProgressInner::Quiet | ProgressInner::AutoPending | ProgressInner::NonTty { .. } => {}
         }
     }
 
     /// Tear down (clear bar, etc.). Owned consume so the caller can rely on
     /// "the reporter is done at this point".
     pub fn finish(self) {
-        // Tty cleanup は Task 3 で追加。それ以外は何も clean しない。
-        let _ = self.inner;
+        if let ProgressInner::Tty(bar) = &self.inner {
+            bar.finish_and_clear();
+        }
+        // Verbose / Quiet / NonTty / AutoPending は何もしない
+    }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        // 罠 M5 (Ctrl-C / panic): finish() が呼ばれずに drop された case で
+        // bar 描画を必ず clear する。Tty 以外は no-op。
+        // 既に finish() で finish_and_clear 済の bar を再度 clear するのは
+        // indicatif 仕様上 idempotent (= 二重 finish も safe)。
+        if let ProgressInner::Tty(bar) = &self.inner {
+            bar.finish_and_clear();
+        }
     }
 }
 
@@ -164,7 +182,7 @@ fn should_emit(count: u64, total: u64, step: u64) -> bool {
     if total == 0 {
         return false;
     }
-    count > 0 && (count % step == 0 || count == total)
+    count > 0 && (count.is_multiple_of(step) || count == total)
 }
 
 #[cfg(test)]
