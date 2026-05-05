@@ -13,6 +13,7 @@
 //! pre-loop `Backfilled ...` / `Found N source files` lines are emitted
 //! through plain `eprintln!` without colliding with an active bar.
 
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Caller-facing intent for progress output.
@@ -73,16 +74,26 @@ impl ProgressReporter {
     /// Initialise bar / counter once `total` is known (= after source-file
     /// discovery). `total == 0` keeps the reporter no-op for the rest of
     /// the run (= 罠 H1: empty KB の早期 no-op、bar 不構築)。
-    ///
-    /// Task 1 では `Auto` 経路を `Verbose` に落とす placeholder 実装。
-    /// Task 2 で `NonTty`、Task 3 で `Tty` を実装して `_total` を消費する。
     pub fn start_indexing(&mut self, total: usize) {
         if total == 0 {
             return;
         }
         if matches!(self.inner, ProgressInner::AutoPending) {
-            let _total = total;
-            self.inner = ProgressInner::Verbose;
+            let total_u64 = total as u64;
+            let is_tty = std::io::stderr().is_terminal();
+            self.inner = if is_tty {
+                // Task 3 で Tty(ProgressBar) を構築する。本 Task では一時的に
+                // Verbose に落として TTY 経路でも従来通りの per-file 出力を
+                // 維持する (= regression 防止)。
+                ProgressInner::Verbose
+            } else {
+                let step = std::cmp::max(1u64, total_u64 / 20);
+                ProgressInner::NonTty {
+                    total: total_u64,
+                    step,
+                    count: AtomicU64::new(0),
+                }
+            };
         }
     }
 
@@ -92,8 +103,18 @@ impl ProgressReporter {
                 eprintln!("  indexed: {rel} ({chunks} chunks)");
             }
             ProgressInner::Quiet | ProgressInner::AutoPending => {}
-            // Tty / NonTty は Task 2-3 で実装
-            ProgressInner::Tty(_) | ProgressInner::NonTty { .. } => {}
+            ProgressInner::Tty(_) => {
+                // Task 3 で bar.inc(1) + bar.set_message(...) を実装。
+            }
+            ProgressInner::NonTty { total, step, count } => {
+                let new_count = count.fetch_add(1, Ordering::Relaxed) + 1;
+                if should_emit(new_count, *total, *step) {
+                    let pct = (new_count * 100) / total;
+                    eprintln!("Progress: {new_count}/{total} ({pct}%)");
+                }
+                // chunks / rel は NonTty mode では使わない (= 1 行に summary のみ)
+                let _ = (rel, chunks);
+            }
         }
     }
 
@@ -102,8 +123,14 @@ impl ProgressReporter {
             ProgressInner::Verbose => {
                 eprintln!("  renamed: {old} -> {new}");
             }
-            ProgressInner::Quiet | ProgressInner::AutoPending => {}
-            ProgressInner::Tty(_) | ProgressInner::NonTty { .. } => {}
+            ProgressInner::Quiet
+            | ProgressInner::AutoPending
+            | ProgressInner::Tty(_)
+            | ProgressInner::NonTty { .. } => {
+                // Tty は Task 3 で `bar.println(...)` 経由に置換。
+                // NonTty は per-file 進捗 = indexed のみカウント、
+                // renamed / deleted は補助情報として silence。
+            }
         }
     }
 
@@ -112,17 +139,32 @@ impl ProgressReporter {
             ProgressInner::Verbose => {
                 eprintln!("  deleted: {rel}");
             }
-            ProgressInner::Quiet | ProgressInner::AutoPending => {}
-            ProgressInner::Tty(_) | ProgressInner::NonTty { .. } => {}
+            ProgressInner::Quiet
+            | ProgressInner::AutoPending
+            | ProgressInner::Tty(_)
+            | ProgressInner::NonTty { .. } => {
+                // Task 3 で Tty bar.println を実装、それ以外は no-op。
+            }
         }
     }
 
     /// Tear down (clear bar, etc.). Owned consume so the caller can rely on
     /// "the reporter is done at this point".
     pub fn finish(self) {
-        // Tty / NonTty cleanup は Task 2-3 で追加
+        // Tty cleanup は Task 3 で追加。それ以外は何も clean しない。
         let _ = self.inner;
     }
+}
+
+/// 非 TTY mode で emit を判定するヘルパ。
+/// `count` は 1-based (= report_indexed が呼ばれた回数)。
+/// `total == 0` のとき `start_indexing` で early return するので呼ばれない
+/// 想定だが、defensive に false を返す。
+fn should_emit(count: u64, total: u64, step: u64) -> bool {
+    if total == 0 {
+        return false;
+    }
+    count > 0 && (count % step == 0 || count == total)
 }
 
 #[cfg(test)]
@@ -171,5 +213,51 @@ mod tests {
         r.report_renamed("a.md", "b.md");
         r.report_deleted("c.md");
         r.finish();
+    }
+
+    #[test]
+    fn test_should_emit_basic() {
+        // total=320, step=16 (= 320/20)
+        assert!(!should_emit(0, 320, 16), "count=0 must not emit");
+        assert!(should_emit(16, 320, 16), "first step boundary");
+        assert!(should_emit(32, 320, 16));
+        assert!(!should_emit(15, 320, 16));
+        assert!(!should_emit(17, 320, 16));
+        assert!(should_emit(320, 320, 16), "100% always emits");
+    }
+
+    #[test]
+    fn test_should_emit_small_total() {
+        // total=5, step=max(1, 5/20)=1 (= 全件 emit)
+        assert!(!should_emit(0, 5, 1));
+        assert!(should_emit(1, 5, 1));
+        assert!(should_emit(5, 5, 1));
+    }
+
+    #[test]
+    fn test_should_emit_total_zero_never_called() {
+        // start_indexing(0) で no-op になるため should_emit は呼ばれない前提だが、
+        // defensive に呼ばれた場合の挙動も「emit しない」であることを確認
+        assert!(!should_emit(0, 0, 1));
+        assert!(!should_emit(1, 0, 1)); // count > total ありえないが defensive
+    }
+
+    #[test]
+    fn test_nontty_report_indexed_emits_at_boundary() {
+        // 内部 count を直接 inspect。emit 検証は subprocess test で行うが、
+        // count increment が正しく走ることだけ確認。
+        let r = ProgressReporter {
+            inner: ProgressInner::NonTty {
+                total: 5,
+                step: 1,
+                count: AtomicU64::new(0),
+            },
+        };
+        r.report_indexed("foo.md", 3);
+        if let ProgressInner::NonTty { count, .. } = &r.inner {
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        } else {
+            panic!("expected NonTty variant");
+        }
     }
 }
