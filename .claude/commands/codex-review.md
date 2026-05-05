@@ -24,9 +24,9 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 - リポジトリで `chatgpt-codex-connector[bot]` の GitHub App install 済
 - 本 command は **destructive 操作なし** (= GitHub API read + comment post のみ)、ローカル file system 改変なし
 
-## 設計の柱 (= 12 罠の構造的回避)
+## 設計の柱 (= 15 罠の構造的回避)
 
-本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 を **構造的に回避** する設計:
+本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-26 を **構造的に回避** する設計:
 
 | 罠 | 回避手段 |
 |---|---|
@@ -42,20 +42,15 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 17 (P0/P1 only) | docs に "GitHub では P0/P1 のみ surface、P2/P3 は AGENTS.md で override" を明記 |
 | 罠 18 (`@codex address` ≠ verb) | re-trigger は **必ず `@codex review`**、別 verb 不使用 |
 | 罠 19 (Windows jq CRLF) | 全 jq filter を `gh api --jq` 内部 jq で実行、外部 `\| jq` パイプ禁止 |
+| 罠 24 (codex P2 dogfood: snapshot drops path/line) | `snapshot_inline` の jq projection に `path, line, original_line` を残し、Step 5 の inline 整形で `\(.path):\(.line)` を表示できるようにする |
+| 罠 25 (codex P1 dogfood: P-badge text vs image) | Step 5 の inline 抽出も Step 4 Layer 2 と同じ `contains("![P0 Badge")`/`contains("![P1 Badge")` で揃える (= 2 call site の lockstep) |
+| 罠 26 (baseline-after-trigger race) | baseline (`PREV_INLINE` / `PREV_REVIEWS` / `PREV_ISSUES`) を **trigger 投稿前** に取る (= Step 1)。codex は 1-30 秒で応答する場合があり、trigger 後 baseline では response が baseline に取り込まれて diff 永久 false → wall-clock timeout |
 
 ## 実行フロー
 
-### Step 1 — initial trigger
+### Step 1 — setup helpers + take baseline (BEFORE trigger)
 
-```bash
-gh pr comment <PR#> --body "@codex review"
-```
-
-mention は **冒頭 1 回のみ**、本文に追加 context を書く場合 `@codex` 文字列を bare word として使わない (= 罠 15)。
-
-### Step 2 — round-level polling with state snapshot
-
-snapshot per round で 3 endpoint を `(id, updated_at)` set として取得。前 round との diff があれば「activity detected」と判定 (= 罠 13、count saturation 罠 8 と edit miss 罠 13 を同時回避):
+罠 26 (= dogfood PR #54): codex は trigger 後 **1-30 秒で応答することが多い**。trigger を先に投げてから baseline を取ると、baseline 時点で既に response が含まれており、Step 3 polling の diff 判定が永久に false → wall-clock timeout (`exit 3`)。**baseline は trigger 投稿 *前* に取る** こと:
 
 ```bash
 OWNER_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
@@ -64,8 +59,11 @@ BOT="chatgpt-codex-connector[bot]"
 
 # snapshot helper (paginate で罠 8 回避、bot user filter で罠 11 回避)
 snapshot_inline() {
+  # 罠 24 (codex P2 on PR #54): preserve path/line/original_line so Step 5 can
+  # render `<file>:<line>` for each finding. Dropping these in the projection
+  # left every reported P0/P1 finding pointing at "null:null".
   gh api --paginate "repos/${OWNER_REPO}/pulls/${PR}/comments" \
-    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}] | sort_by(.id)"
+    --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, path, line, original_line, body}] | sort_by(.id)"
 }
 snapshot_reviews() {
   gh api --paginate "repos/${OWNER_REPO}/pulls/${PR}/reviews" \
@@ -76,10 +74,25 @@ snapshot_issues() {
     --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}] | sort_by(.id)"
 }
 
+# 罠 26: baseline first, trigger second (順序を逆にしない)
 PREV_INLINE=$(snapshot_inline)
 PREV_REVIEWS=$(snapshot_reviews)
 PREV_ISSUES=$(snapshot_issues)
+```
 
+### Step 2 — post @codex review trigger
+
+```bash
+gh pr comment <PR#> --body "@codex review"
+```
+
+mention は **冒頭 1 回のみ**、本文に追加 context を書く場合 `@codex` 文字列を bare word として使わない (= 罠 15)。
+
+### Step 3 — round-level polling with state snapshot diff
+
+snapshot per round で 3 endpoint を `(id, updated_at)` set として取得。Step 1 baseline との diff があれば「activity detected」と判定 (= 罠 13、count saturation 罠 8 と edit miss 罠 13 を同時回避):
+
+```bash
 ROUND_START=$(date +%s)
 PER_ROUND_TIMEOUT=600   # 罠 9 wall-clock timeout
 
@@ -105,7 +118,7 @@ while true; do
 done
 ```
 
-### Step 3 — 3 layer convergence detection
+### Step 4 — 3 layer convergence detection
 
 罠 14 の文言依存を緩和、業界 defacto Pattern C (= state-base) を primary に:
 
@@ -175,34 +188,44 @@ else
 fi
 ```
 
-### Step 4 — 結果 fetch + 整形
+### Step 5 — 結果 fetch + 整形
 
 ```bash
 echo "=== Top-level summary (review body) ==="
 echo "$LATEST_REVIEW" | jq -r '.body // "(no review body)"'
 echo ""
 echo "=== Inline P0/P1 (review-blocking issues) ==="
-snapshot_inline | jq -r '.[] | select(.body | test("\\[P[01]\\]"; "i")) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
+# 罠 25 (codex P1 on PR #54): codex emits image markdown badges like
+# `![P0 Badge](...)` / `![P1 Badge](...)`, NOT bare `[P0]` text. Filtering with
+# `test("\\[P[01]\\]")` would silently drop every actionable finding. Use the
+# same `contains("![P0 Badge")` / `contains("![P1 Badge")` predicate as Step 3
+# Layer 2 detection (= keep both call sites in lockstep).
+snapshot_inline | jq -r '.[] | select(.body | (contains("![P0 Badge") or contains("![P1 Badge"))) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
 echo ""
 echo "=== Top-level issue comments by codex (full) ==="
 snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 ```
 
-### Step 5 — controller 判定 + retry
+### Step 6 — controller 判定 + retry
 
 | 状態 | アクション |
 |---|---|
 | `CONVERGED=true` | **収束**、merge / tag に進む |
-| `P0_P1_TAGS_PRESENT > 0` | controller が指摘内容を理解 → fix 実装 → push → goto Step 1 (= re-trigger)。**ただし** `current_round >= max_rounds` (= default 3) なら user 報告 |
+| `P0_P1_TAGS_PRESENT > 0` | controller が指摘内容を理解 → fix 実装 → push → goto Step 1 (= 新 baseline 取得 + re-trigger)。**ただし** `current_round >= max_rounds` (= default 3) なら user 報告 |
 | `STATE_OK=false` でも `P0/P1` も sentinel もなし (= indeterminate) | controller が manual review (= human 判断)、必要なら `@codex review` 再 trigger |
 | `exit 3` (= 罠 9 wall-clock timeout) | user に escalate (= "codex no response, suspect stale connector") |
 | `exit 4` (= 罠 10 terminal error) | user に escalate (= "codex returned terminal failure, retry will not help") |
 
-### Step 6 — re-review trigger (= round 2 以降)
+### Step 7 — re-review trigger (= round 2 以降)
 
-P0/P1 fix → push 後の re-trigger:
+P0/P1 fix → push 後の re-trigger。**罠 26 適用**: Step 1 と同じ要領で baseline を新 trigger 投稿の **前** に取り直す:
 
 ```bash
+# 罠 26: baseline first, trigger second — round 2 以降も順序は同じ
+PREV_INLINE=$(snapshot_inline)
+PREV_REVIEWS=$(snapshot_reviews)
+PREV_ISSUES=$(snapshot_issues)
+
 # 罠 15 + 罠 18: @codex review 冒頭 1 回、本文中で codex を bare word でも mention しない、verb は review のみ
 gh pr comment <PR#> --body "@codex review
 
@@ -212,7 +235,7 @@ Round ${N} fix (commit \`<SHA>\`):
 "
 ```
 
-戻って Step 2 から polling 再開。
+戻って Step 3 から polling 再開。
 
 ## max_rounds 上限の根拠
 
@@ -229,7 +252,7 @@ Round ${N} fix (commit \`<SHA>\`):
 
 ## 関連
 
-- 動機 + 罠 7-19 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
+- 動機 + 罠 7-19 + 21-23 + 24-26 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
 - `/feature-flow` orchestrator: `.claude/commands/feature-flow.md` (= 本 command の caller、Phase 6)
 - CLAUDE.local.md `/feature-flow` 常時 guardrail 節
 - 公式 source:
