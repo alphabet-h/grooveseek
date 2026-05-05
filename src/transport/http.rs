@@ -226,6 +226,36 @@ pub(crate) fn validate_host_header(
     }
 }
 
+/// 400 Bad Request response builder。
+/// rmcp `tower.rs::bad_request_response` (line 212-220) と byte-identical body:
+/// - status: 400
+/// - body: `format!("Bad Request: {msg}")`
+/// - Content-Type: `text/plain; charset=utf-8`
+///
+/// 呼び出し側は prefix を **含めない** 文字列を渡すこと
+/// (= 内部で `"Bad Request: "` を付加するため二重付与防止)。
+#[allow(dead_code)] // Task 7 で middleware が builder を呼ぶようになったら外す
+fn bad_request_typed(msg: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(format!("Bad Request: {msg}")))
+        .expect("static response build")
+}
+
+/// 403 Forbidden response builder。
+/// rmcp `tower.rs::forbidden_response` (line 156-161) と byte-identical:
+/// - status: 403
+/// - body: `format!("Forbidden: {msg}")`
+/// - Content-Type: (なし、rmcp と同じく非設定)
+#[allow(dead_code)] // Task 7 で middleware が builder を呼ぶようになったら外す
+fn forbidden_plain(msg: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Body::from(format!("Forbidden: {msg}")))
+        .expect("static response build")
+}
+
 /// Start an axum-based HTTP server that exposes the MCP service at `/mcp`.
 /// Blocks until SIGINT or a bind error. On bind failure, returns with a
 /// helpful context message.
