@@ -109,6 +109,30 @@ impl NormalizedAuthority {
     }
 }
 
+/// `host:port` form の port 部分が空でない explicit port suffix を持つか判定。
+/// `port_u16().is_none() && has_explicit_port_suffix(raw)` の組み合わせで
+/// port out-of-range silent degrade (`"localhost:99999"` 等) を検知する。
+///
+/// 入力前提: `Authority::try_from` 成功後に呼ばれる post-check のため、
+/// malformed bracketed (= 二重 `]`、不一致 `[`) は到達しない。
+#[allow(dead_code)] // Task 5 で外す
+fn has_explicit_port_suffix(raw: &str) -> bool {
+    // bracketed: `]:` の後ろを見る
+    if let Some(end) = raw.find(']') {
+        let after = &raw[end + 1..];
+        return after.starts_with(':') && after.len() > 1;
+    }
+    // unbracketed IPv6 (= 3 つ以上の `:`): port なし扱い
+    if raw.split(':').count() >= 3 {
+        return false;
+    }
+    // unbracketed `host:port`: 末尾 `:` の後ろが non-empty
+    if let Some((_, port)) = raw.rsplit_once(':') {
+        return !port.is_empty();
+    }
+    false
+}
+
 /// rmcp's default loopback-only allow-list, mirrored locally so the F-64
 /// `/healthz` middleware can apply identical semantics when
 /// `allowed_hosts = None`. Keep in sync with rmcp upstream.
@@ -801,5 +825,59 @@ mod tests {
             &http::uri::Authority::try_from("example.com:8080").unwrap(),
         );
         assert!(allow.matches(&incoming)); // allow に port なし = port-agnostic
+    }
+
+    // ===========================================================================
+    // feature-39 / D-11: has_explicit_port_suffix unit tests (#30-#37)
+    // ===========================================================================
+
+    #[test]
+    fn test_has_explicit_port_suffix_hostname_no_colon() {
+        // #30: localhost (= hostname、colon なし) → false
+        assert!(!has_explicit_port_suffix("localhost"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_hostname_with_port() {
+        // #31: localhost:80 → true
+        assert!(has_explicit_port_suffix("localhost:80"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_hostname_empty_port() {
+        // #32: localhost: (= 末尾 colon、port 部空) → false
+        assert!(!has_explicit_port_suffix("localhost:"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_bracketed_ipv6_no_port() {
+        // #33: [::1] (= bracketed IPv6 without port) → false
+        assert!(!has_explicit_port_suffix("[::1]"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_bracketed_ipv6_with_port() {
+        // #34: [::1]:80 → true
+        assert!(has_explicit_port_suffix("[::1]:80"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_bracketed_ipv6_empty_port() {
+        // #35: [::1]: (= bracketed IPv6 with empty port) → false
+        assert!(!has_explicit_port_suffix("[::1]:"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_unbracketed_ipv6() {
+        // #36: ::1 (= unbracketed IPv6、3 つ以上の colon) → false
+        // 注: production code では Authority::try_from("::1") が Err を返すため
+        // post-check に到達しないが、単体 fn の境界 case として検証
+        assert!(!has_explicit_port_suffix("::1"));
+    }
+
+    #[test]
+    fn test_has_explicit_port_suffix_ipv4_no_colon() {
+        // #37: 0.0.0.0 (= IPv4、colon なし) → false
+        assert!(!has_explicit_port_suffix("0.0.0.0"));
     }
 }
