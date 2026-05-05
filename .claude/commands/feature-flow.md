@@ -106,20 +106,22 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
-3. `gh pr comment <N> --body "@codex review"` で codex を trigger
-4. **polling loop** (background bash で `until [ "$(gh api repos/<owner>/<repo>/issues/<N>/comments --jq 'length' 2>/dev/null)" -gt "<initial_count>" ] || ...; do sleep 30; done`):
-   - 新着 inline comment (`pulls/<N>/comments`) と issue comment (`issues/<N>/comments`) の両方を track
-   - codex の verdict を判定:
-     - 指摘あり → 妥当な範囲で取り込み (P1 = 必須 fix、P2 = scaling/UX 退化、P3 以下は判断)、regression test を 1 件追加、`@codex review` で再 trigger
-     - `Didn't find any major issues` (top-level issue comment に landing) → 収束
-   - 5 round で収束しないなら設計再検討 = ユーザに相談 (← 介入ポイント 3)
+3. **`/codex-review <PR#>` skill を invoke** (= `.claude/commands/codex-review.md`)。本 skill が以下を 1 step で固定化:
+   - `@codex review` mention で codex trigger
+   - `pulls/<N>/comments` (inline) + `issues/<N>/comments` (top-level) + `pulls/<N>/reviews` (review body) の 3 endpoint を **count-base で同時 polling** (= `submitted_at` / `created_at` の時刻比較を avoid、bash quirks 回避)
+   - 5 round 上限で auto break (CLAUDE.local.md guardrail と整合)
+   - 結果 fetch + 整形して controller に提示 (= top-level summary + inline P1/P2 detail + review body)
+4. controller (= main agent) が `/codex-review` の出力を判定:
+   - top-level に `Didn't find any major issues` (variation: `Hooray!` / `Keep them coming!` / `Bravo` 等) → **収束**、step 5 へ
+   - inline に P1/P2 → 妥当な範囲で取り込み (P1 = 必須 fix、P2 = scaling/UX 退化、P3 以下は判断)、regression test を 1 件追加、再 push → goto step 3 (= `/codex-review` 再 invoke で re-review)
+   - 5 round 経過しても収束しない → ユーザに相談 (← 介入ポイント 3)
 5. 収束したら `gh pr merge <N> --squash --delete-branch`
 
 review 取り込み時の判断はすべて controller (= main agent) が行い、user 介入はしない。**ただし**:
 - 取り込みが「Phase 3 で承認した spec の前提を覆す」内容なら user に確認
 - 5 round 経過した時点で必ず user に状況を投げ、続行 / 妥協 / scope 縮小を判断してもらう
 
-参照: `.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠カテゴリ蓄積)
+参照: `.claude/commands/codex-review.md` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠カテゴリ蓄積、罠 7 = last-writer-wins まで記録済)
 
 ### Phase 7 — CHANGELOG / version bump / tag (該当 PR が release worthy な場合のみ)
 
@@ -199,7 +201,8 @@ handoff doc の生成テンプレは `.dev/knowledge/feature-28-pr-4-handoff.md`
 - `CLAUDE.md` の「リリース前チェックリスト」 (= Phase 7 の docs sync 元)
 - `CLAUDE.local.md` の「開発フロー」節 (= 本 command の常時 guardrail)
 - `.claude/commands/full-audit.md` (Phase 7 で起動判断)
-- `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference)
+- `.claude/commands/codex-review.md` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke)
+- `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference、罠 1-7 蓄積)
 - `.dev/knowledge/index-progress-buffering-pitfall.md` (background bash の罠 reference)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` (orchestrate される 3 skill)
 
