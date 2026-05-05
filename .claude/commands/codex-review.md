@@ -24,9 +24,9 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 - リポジトリで `chatgpt-codex-connector[bot]` の GitHub App install 済
 - 本 command は **destructive 操作なし** (= GitHub API read + comment post のみ)、ローカル file system 改変なし
 
-## 設計の柱 (= 17 罠の構造的回避)
+## 設計の柱 (= 19 罠の構造的回避)
 
-本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-28 を **構造的に回避** する設計:
+本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-30 を **構造的に回避** する設計:
 
 | 罠 | 回避手段 |
 |---|---|
@@ -47,6 +47,8 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 26 (baseline-after-trigger race) | baseline (`PREV_INLINE` / `PREV_REVIEWS` / `PREV_ISSUES`) を **trigger 投稿前** に取る (= Step 1)。codex は 1-30 秒で応答する場合があり、trigger 後 baseline では response が baseline に取り込まれて diff 永久 false → wall-clock timeout |
 | 罠 27 (P-badge を全 history で数える) | `pulls/<N>/comments` は PR 全 history を返すため、prior round の P0/P1 が resolved 状態でも残り続ける。Step 4 で `NEW_INLINE = CUR - PREV_INLINE` を取り、**当該 round で新規追加された inline のみ** を P-badge カウント対象にする。Step 5 整形も同じ `NEW_INLINE` を使用 (= 2 call site lockstep) |
 | 罠 28 (feature-flow と codex-review の max_rounds 不整合) | feature-flow Phase 6 は `/codex-review <PR#> 5` と explicit に渡す (= CLAUDE.local.md guardrail "5 round 経過で user 報告" と整合)。codex-review 単体 default は cost-aware の 3、feature-flow から呼ぶ時のみ 5 (= 計画的 5 round budget) |
+| 罠 29 (id-only set diff が edit を miss) | NEW_INLINE の set diff を `(id, updated_at)` compound key で取り、codex が既存 inline (= 同 id) の body を update して P-badge を追加 / 昇格しても捕捉する |
+| 罠 30 (P2-only round で controller が判断材料を取れない) | Step 5 整形に `=== Inline P2 (controller-judgment items, current round only) ===` section を追加し、P2 inline の path + body を必ず出力する (= P0/P1 = 0 + P2 > 0 の round で convergence indeterminate になる時、controller が「取り込み or skip」判断するために具体内容を必ず提示) |
 
 ## 実行フロー
 
@@ -163,10 +165,13 @@ COMMIT_FRESH=$([ "$REVIEW_COMMIT" = "$HEAD_SHA" ] && echo "true" || echo "false"
 # resolved 状態でも count > 0 のままで、convergence が永久に false になる。
 # Step 1 で取った PREV_INLINE (= round baseline) との set diff を取り、
 # **当該 round で新規に追加された inline** だけを評価対象にする。
+# 罠 29 (codex P2 round 3 on PR #54): id 単独の set diff は **edit を miss する** —
+# codex が既存 inline (= 同じ id) の body を update して P-badge を追加 / 昇格する
+# case で false-converge する。`(id, updated_at)` の compound key で diff を取る。
 CUR_INLINE_FRESH=$(snapshot_inline)
 NEW_INLINE=$(jq -n --argjson prev "$PREV_INLINE" --argjson cur "$CUR_INLINE_FRESH" '
-  ($prev | map(.id)) as $prev_ids |
-  $cur | map(select(.id as $i | ($prev_ids | index($i)) | not))
+  ($prev | map({key: (.id|tostring), value: .updated_at}) | from_entries) as $prev_map |
+  $cur | map(select(.id as $i | ($prev_map[$i|tostring] // null) != .updated_at))
 ')
 P0_P1_TAGS_PRESENT=$(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P0 Badge") or contains("![P1 Badge"))] | length')
 P2_TAGS_PRESENT=$(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P2 Badge"))] | length')
@@ -216,6 +221,14 @@ echo "=== Inline P0/P1 (review-blocking issues, current round only) ==="
 # baseline) so prior-round P0/P1 (now resolved by fixes) aren't re-listed as
 # "current actionable" issues.
 echo "$NEW_INLINE" | jq -r '.[] | select(.body | (contains("![P0 Badge") or contains("![P1 Badge"))) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
+echo ""
+echo "=== Inline P2 (controller-judgment items, current round only) ==="
+# 罠 30 (codex P2 round 3 on PR #54): P2 だけの round で本 section が空だと
+# controller は P-badge カウントを見て convergence 判定するが「具体的に何の
+# P2 を取り込むか / skip するか」を決める material が無い。Step 4 が
+# P2_TAGS_PRESENT > 0 を warning した時、必ずここに該当 P2 の path + body
+# を出して controller が判断できる状態にする。
+echo "$NEW_INLINE" | jq -r '.[] | select(.body | contains("![P2 Badge")) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
 echo ""
 echo "=== Top-level issue comments by codex (full) ==="
 snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
@@ -267,7 +280,7 @@ Round ${N} fix (commit \`<SHA>\`):
 
 ## 関連
 
-- 動機 + 罠 7-19 + 21-23 + 24-28 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
+- 動機 + 罠 7-19 + 21-23 + 24-30 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
 - `/feature-flow` orchestrator: `.claude/commands/feature-flow.md` (= 本 command の caller、Phase 6)
 - CLAUDE.local.md `/feature-flow` 常時 guardrail 節
 - 公式 source:
