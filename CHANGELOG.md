@@ -4,6 +4,16 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-05-05
+
+### Added
+
+- **F-63**: `parse_tags_json` の silent fail-open を可視化する `tags_parse_failures`
+  counter を `Database` に追加。`index_meta` table に永続化 (= session shutdown
+  時の best-effort flush + 起動時 read で前 session の値を復元)。`kb-mcp status`
+  出力に新規 `Tags parse failures: N` 行を追加 (= 既存 `Documents:` / `Chunks:`
+  の直後)。malformed `documents.tags` JSON の発火を operator が確認できる。
+
 ## [0.7.6] - 2026-05-05
 
 ### Changed

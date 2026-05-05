@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp"
-version = "0.7.6"
+version = "0.7.7"
 edition = "2024"
 description = "MCP server providing semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a Markdown / plain-text knowledge base."
 authors = ["koshian"]
