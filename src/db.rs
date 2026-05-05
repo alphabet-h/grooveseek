@@ -358,15 +358,15 @@ impl Database {
         ensure_vec_extension();
         let conn =
             Connection::open(path).with_context(|| format!("failed to open database at {path}"))?;
+        // F-63: AtomicU64 は **session-local delta** として 0 で start。
+        // 過去 session の永続値は `tags_parse_failure_count()` が DB read 時に
+        // 直接合算するため、startup restore は不要 (= codex P2 fix、
+        // multi-instance での last-writer-wins を防ぐ)。
         let db = Self {
             conn,
             tags_parse_failures: AtomicU64::new(0),
         };
         db.init()?;
-        // F-63: 過去 session の永続値を index_meta から復元
-        if let Ok(Some(prev)) = db.read_tags_parse_failure_count() {
-            db.tags_parse_failures.store(prev, Ordering::Relaxed);
-        }
         Ok(db)
     }
 
@@ -374,16 +374,12 @@ impl Database {
     pub fn open_in_memory() -> Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
+        // F-63: AtomicU64 は session-local delta、startup restore 不要 (= codex P2 fix)
         let db = Self {
             conn,
             tags_parse_failures: AtomicU64::new(0),
         };
         db.init()?;
-        // F-63: 過去 session の永続値を index_meta から復元 (= 通常 in-memory DB
-        // は空なので no-op だが、外部 init で値が seeding された場合に整合する)
-        if let Ok(Some(prev)) = db.read_tags_parse_failure_count() {
-            db.tags_parse_failures.store(prev, Ordering::Relaxed);
-        }
         Ok(db)
     }
 
@@ -1505,10 +1501,23 @@ impl Database {
         }
     }
 
-    /// 現在の `tags_parse_failures` 値を atomic load する (F-63)。
-    /// `kb-mcp status` 表示用。
+    /// 現在の `tags_parse_failures` cumulative 値を返す (F-63、`kb-mcp status` 表示用)。
+    ///
+    /// `index_meta` の永続値 (= 過去 session までの累計) と本 session の AtomicU64
+    /// delta (= 本 session 中に増えた失敗数) を合算する。codex P2 fix:
+    /// **AtomicU64 は session-local delta** として持つ設計で、multi-instance で
+    /// 同 SQLite file を開いた場合の last-writer-wins を回避する。
+    ///
+    /// DB read が失敗した場合 (= I/O エラー / schema 不整合等) は session delta だけを
+    /// 返す best-effort 表示。`kb-mcp status` は人間向け診断なので panic より degrade。
     pub fn tags_parse_failure_count(&self) -> u64 {
-        self.tags_parse_failures.load(Ordering::Relaxed)
+        let persisted = self
+            .read_tags_parse_failure_count()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let delta = self.tags_parse_failures.load(Ordering::Relaxed);
+        persisted.saturating_add(delta)
     }
 
     /// Verify the runtime `(model, dim)` matches the values recorded in
@@ -1740,15 +1749,26 @@ impl Drop for Database {
     ///   第 2) に依存している。Rust の drop 順序は宣言順の逆なので、本 impl が
     ///   走るタイミングでは `conn` (= `rusqlite::Connection`) はまだ生存している。
     fn drop(&mut self) {
-        let n = self.tags_parse_failures.load(Ordering::Relaxed);
+        let delta = self.tags_parse_failures.load(Ordering::Relaxed);
+        if delta == 0 {
+            // session 中に increment ゼロなら SQL roundtrip skip。
+            return;
+        }
+        // codex P2 fix: last-writer-wins ではなく atomic SQL increment で flush。
+        // INSERT 時 (= 既存 row なし) は delta を初期値、UPDATE 時 (= 既存 row あり) は
+        // 既存 value に delta を加算。両 placeholder ともに本 session の delta を渡す。
+        // multi-instance で同 SQLite file を開く運用 (= long-lived `serve` daemon +
+        // 別 CLI 並行) でも、各 session の delta が漏れなく加算される。
+        let delta_signed: i64 = delta.try_into().unwrap_or(i64::MAX);
         let result = self.conn.execute(
-            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('tags_parse_failures', ?1)",
-            params![n.to_string()],
+            "INSERT INTO index_meta (key, value) VALUES ('tags_parse_failures', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?2",
+            params![delta.to_string(), delta_signed],
         );
         if let Err(e) = result {
             tracing::warn!(
                 error = %e,
-                "failed to flush tags_parse_failures to index_meta on drop"
+                "failed to flush tags_parse_failures delta to index_meta on drop"
             );
         }
     }
@@ -4144,5 +4164,64 @@ mod tests {
             let db = Database::open(&db_path_str).expect("open session 3");
             assert_eq!(db.tags_parse_failure_count(), 7);
         }
+    }
+
+    /// codex P2 regression catcher (PR #53): 同一 SQLite file を 2 つの `Database`
+    /// instance が同時に open し、それぞれが独立に increment した場合、両 instance
+    /// が drop された後の **再 open 値が両者の delta の和** であることを確認する。
+    ///
+    /// 旧設計 (= startup restore + `INSERT OR REPLACE` flush) では last-writer-wins で
+    /// 後 drop した instance が前者の delta を上書きしていた。新設計 (= session-local
+    /// delta + UPSERT atomic add) ではこれが起こらない。
+    #[test]
+    fn test_parse_tags_failure_counter_concurrent_instances_atomic_add() {
+        let tmp = F63TempDir::new("kb-mcp-f63-concurrent");
+        let db_path = tmp.path.join("kb.sqlite");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // pre-seed: index_meta に既存値 10 を持っている状態を simulate
+        // (= 過去 session の累計が DB に残っている state を再現)
+        {
+            let db = Database::open(&db_path_str).expect("open seed");
+            for _ in 0..10 {
+                let _ = db.parse_tags_json_recording(Some("seed".into()));
+            }
+            assert_eq!(db.tags_parse_failure_count(), 10);
+            // drop で 10 が `index_meta` に flush される
+        }
+
+        // 2 つの instance を同時に open し、独立に増分を持たせる
+        let db_a = Database::open(&db_path_str).expect("open A");
+        let db_b = Database::open(&db_path_str).expect("open B");
+
+        // どちらも startup 値 10 を見ている
+        assert_eq!(db_a.tags_parse_failure_count(), 10);
+        assert_eq!(db_b.tags_parse_failure_count(), 10);
+
+        // A: +3、B: +5 をそれぞれ独立に increment
+        for _ in 0..3 {
+            let _ = db_a.parse_tags_json_recording(Some("a".into()));
+        }
+        for _ in 0..5 {
+            let _ = db_b.parse_tags_json_recording(Some("b".into()));
+        }
+
+        // それぞれ自セッションでは「永続 10 + 自 delta」を見る (= 他 instance の
+        // delta は flush 前なので見えない、これは設計上の許容範囲)
+        assert_eq!(db_a.tags_parse_failure_count(), 13);
+        assert_eq!(db_b.tags_parse_failure_count(), 15);
+
+        // 両者を drop (= 順序問わず両 delta が atomic add で flush される)
+        drop(db_a);
+        drop(db_b);
+
+        // 再 open して累計を確認: 10 (seed) + 3 (A delta) + 5 (B delta) = 18
+        // **これが旧設計では last-writer-wins で 13 or 15 にしかならなかった**
+        let db_final = Database::open(&db_path_str).expect("open final");
+        assert_eq!(
+            db_final.tags_parse_failure_count(),
+            18,
+            "concurrent delta must be additively merged (no last-writer-wins)"
+        );
     }
 }
