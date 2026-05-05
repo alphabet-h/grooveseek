@@ -35,7 +35,7 @@ use crate::server::{KbServer, KbServerShared};
 /// Encoding error (= `HeaderValue::to_str()` 失敗) は middleware 内で helper を
 /// 経由せず直接返すため、本 enum には対応 variant を持たせない (= dead variant 回避)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Task 5 で `validate_host_header` 本体実装後に外す
+#[allow(dead_code)] // Task 7 で `healthz_host_check` middleware が helper を呼ぶようになったら外す
 pub(crate) enum HostRejection {
     /// Host header と URI authority の双方が不在。
     MissingHost,
@@ -49,7 +49,7 @@ pub(crate) enum HostRejection {
 /// Allow-list entry / incoming Host header の比較用 normalized form。
 /// rmcp 1.4 `tower.rs::NormalizedAuthority` (line 169-180) の mirror。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Task 5 で `validate_host_header` 本体実装後に外す
+#[allow(dead_code)] // Task 7 で middleware が helper を呼ぶようになったら外す
 struct NormalizedAuthority {
     /// host: bracket 剥がし + ASCII lowercase。`Authority::host()` は IPv6 で
     /// brackets を含む文字列を返すため、`trim_matches('[' / ']')` + lowercase 化。
@@ -58,7 +58,7 @@ struct NormalizedAuthority {
     port: Option<u16>,
 }
 
-#[allow(dead_code)] // Task 5 で外す
+#[allow(dead_code)] // Task 7 で middleware が helper を呼ぶようになったら外す
 impl NormalizedAuthority {
     /// 既に parse 済の `Authority` から作る (= incoming Host header 用、infallible)。
     fn from_authority(authority: &http::uri::Authority) -> Self {
@@ -115,7 +115,7 @@ impl NormalizedAuthority {
 ///
 /// 入力前提: `Authority::try_from` 成功後に呼ばれる post-check のため、
 /// malformed bracketed (= 二重 `]`、不一致 `[`) は到達しない。
-#[allow(dead_code)] // Task 5 で外す
+#[allow(dead_code)] // Task 7 で middleware が helper を呼ぶようになったら外す
 fn has_explicit_port_suffix(raw: &str) -> bool {
     // bracketed: `]:` の後ろを見る
     if let Some(end) = raw.find(']') {
@@ -133,10 +133,98 @@ fn has_explicit_port_suffix(raw: &str) -> bool {
     false
 }
 
-/// rmcp's default loopback-only allow-list, mirrored locally so the F-64
-/// `/healthz` middleware can apply identical semantics when
-/// `allowed_hosts = None`. Keep in sync with rmcp upstream.
-const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+/// rmcp 1.4 default loopback list の mirror。本 helper では IPv6 を **bracketed**
+/// (`"[::1]"`) で保持。allow-list 側は `NormalizedAuthority::from_allowed_entry`
+/// の fallback で unbracketed (`"::1"`) も同等扱いされるため、`Authority::try_from`
+/// が parse できる bracketed 形式を一次形にすると helper 内 normalize が単純化される。
+const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+
+/// `/healthz` 用 Host validation の pure helper (no I/O、test 容易)。
+///
+/// 引数:
+/// - `host_raw`: HTTP Host header 文字列、または URI authority の文字列
+///   (HTTP/2 / proxy-forwarded fallback)。両方不在なら `None` で `MissingHost`
+/// - `allowed`:
+///   - `None` → `DEFAULT_LOOPBACK_HOSTS` ("localhost" / "127.0.0.1" / "[::1]")
+///   - `Some(&[])` → 全許可 (= rmcp `disable_allowed_hosts` 相当)
+///   - `Some(&[..])` → 厳密 match
+///
+/// 比較 semantics:
+/// - host parse は `http::uri::Authority::try_from` 委譲、失敗 → `MalformedHost`
+/// - allow-list entry は rmcp `parse_allowed_authority` mirror で fallback
+///   (= unbracketed IPv6 config 救済)
+/// - host comparison: `Authority::host()` の bracket を `trim_matches('[' / ']')`
+///   + ASCII lowercase で正規化 (= rmcp `normalize_host` mirror)
+/// - port: allow に port 指定あり → strict 一致、なし → port-agnostic
+/// - kb-mcp 拡張の defensive reject: userinfo (`user@`) / port out-of-range
+#[allow(dead_code)] // Task 7 で `healthz_host_check` middleware が helper を呼ぶようになったら外す
+pub(crate) fn validate_host_header(
+    host_raw: Option<&str>,
+    allowed: Option<&[String]>,
+) -> Result<(), HostRejection> {
+    let raw = host_raw.ok_or(HostRejection::MissingHost)?;
+
+    // userinfo pre-check: Authority::try_from("user@host") は Ok を返し
+    // userinfo を strip するが、kb-mcp は defensive に reject する
+    // (= authentication bypass の予兆を operator log に残す)
+    if raw.contains('@') {
+        return Err(HostRejection::MalformedHost);
+    }
+
+    // bracketed IPv6 pre-check: `Authority::try_from` は `[::1]evil.example` を
+    // Ok で返す (host=`[::1]`、as_str に trailing garbage 保持) pitfall がある。
+    // また `[]:80` (= empty host) も Ok で通る。本前段で **input が `[` で始まる
+    // なら必ず単一 `]` を含み、`]` の直後は空 or `:<port>` のみ、bracket 内 host
+    // は non-empty** という constraint を defensive に check する。
+    if raw.starts_with('[') {
+        match raw.find(']') {
+            None => return Err(HostRejection::MalformedHost),
+            Some(end) => {
+                // bracket 内 host が空 (`[]:80` 等) は reject
+                if end == 1 {
+                    return Err(HostRejection::MalformedHost);
+                }
+                let after = &raw[end + 1..];
+                // `]` の後ろは空 or `:port` のみ valid
+                // (= `[::1]evil.example` の trailing garbage を reject)
+                if !after.is_empty() && !after.starts_with(':') {
+                    return Err(HostRejection::MalformedHost);
+                }
+            }
+        }
+    }
+
+    let authority =
+        http::uri::Authority::try_from(raw).map_err(|_| HostRejection::MalformedHost)?;
+
+    // port out-of-range post-check: Authority::try_from("localhost:99999") は
+    // Ok を返し port_u16() が None に degrade する pitfall。明示 reject。
+    if authority.port_u16().is_none() && has_explicit_port_suffix(raw) {
+        return Err(HostRejection::MalformedHost);
+    }
+
+    let incoming = NormalizedAuthority::from_authority(&authority);
+
+    // allow-list 解決: None → loopback default、Some(empty) → 全許可、
+    // Some(non_empty) → 厳密 match。`DEFAULT_LOOPBACK_HOSTS` は `&[&str]` 型のため
+    // Iterator pattern で各 entry を順次 normalize して any 検査する形に展開
+    // (= 不要な Vec allocation 回避)。
+    let any_match = match allowed {
+        None => DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .any(|e| NormalizedAuthority::from_allowed_entry(e).matches(&incoming)),
+        Some([]) => return Ok(()),
+        Some(v) => v
+            .iter()
+            .any(|e| NormalizedAuthority::from_allowed_entry(e.as_str()).matches(&incoming)),
+    };
+
+    if any_match {
+        Ok(())
+    } else {
+        Err(HostRejection::NotAllowed)
+    }
+}
 
 /// Start an axum-based HTTP server that exposes the MCP service at `/mcp`.
 /// Blocks until SIGINT or a bind error. On bind failure, returns with a
@@ -879,5 +967,311 @@ mod tests {
     fn test_has_explicit_port_suffix_ipv4_no_colon() {
         // #37: 0.0.0.0 (= IPv4、colon なし) → false
         assert!(!has_explicit_port_suffix("0.0.0.0"));
+    }
+
+    // ===========================================================================
+    // feature-39 / D-11: validate_host_header unit tests (#1-#28)
+    // ===========================================================================
+
+    fn allow(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- 正常系 (Ok) — 9 件 ----
+
+    #[test]
+    fn test_validate_host_header_hostname_only_ok() {
+        // #1: hostname-only allow + hostname-only Host
+        assert_eq!(
+            validate_host_header(Some("localhost"), Some(&allow(&["localhost"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_ipv4_with_and_without_port() {
+        // #2: IPv4 allow + IPv4 Host (port なし、port あり)
+        assert_eq!(
+            validate_host_header(Some("192.168.1.10"), Some(&allow(&["192.168.1.10"]))),
+            Ok(())
+        );
+        assert_eq!(
+            validate_host_header(
+                Some("192.168.1.10:3100"),
+                Some(&allow(&["192.168.1.10:3100"]))
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_bracketed_ipv6_ok() {
+        // #3: bracketed IPv6 allow + bracketed IPv6 Host (port なし / あり)
+        assert_eq!(
+            validate_host_header(Some("[::1]"), Some(&allow(&["[::1]"]))),
+            Ok(())
+        );
+        assert_eq!(
+            validate_host_header(Some("[::1]:3100"), Some(&allow(&["[::1]"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_unbracketed_ipv6_config_with_bracketed_host() {
+        // #4: unbracketed IPv6 config allow ["::1"] + bracketed Host [::1]:3100
+        // (rmcp parse_allowed_authority mirror の救済)
+        assert_eq!(
+            validate_host_header(Some("[::1]:3100"), Some(&allow(&["::1"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_case_insensitive() {
+        // #5: 大文字 hostname EXAMPLE.COM + 小文字 allow
+        assert_eq!(
+            validate_host_header(Some("EXAMPLE.COM"), Some(&allow(&["example.com"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_port_numeric_normalize() {
+        // #6: Host: example.com:080 + allow: example.com:80 → Ok
+        // (port_u16() が "080" を 80 に正規化)
+        assert_eq!(
+            validate_host_header(Some("example.com:080"), Some(&allow(&["example.com:80"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_port_agnostic_allow() {
+        // #7: allow: example.com (port なし) → Host: example.com:8080 も Ok
+        assert_eq!(
+            validate_host_header(Some("example.com:8080"), Some(&allow(&["example.com"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_some_empty_allows_any() {
+        // #8: Some(empty) allow → 任意 Host が Ok
+        assert_eq!(
+            validate_host_header(Some("evil.example"), Some(&allow(&[]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_none_uses_loopback_default() {
+        // #9: None allow → loopback 3 entry のみ Ok
+        assert_eq!(validate_host_header(Some("localhost"), None), Ok(()));
+        assert_eq!(validate_host_header(Some("127.0.0.1"), None), Ok(()));
+        assert_eq!(validate_host_header(Some("[::1]"), None), Ok(()));
+        // non-loopback は NotAllowed
+        assert_eq!(
+            validate_host_header(Some("evil.example"), None),
+            Err(HostRejection::NotAllowed)
+        );
+    }
+
+    // ---- MalformedHost (400) — 8 件 ----
+
+    #[test]
+    fn test_validate_host_header_unbracketed_ipv6_in_host_rejected() {
+        // #10: unbracketed IPv6 in Host header (rmcp parity で reject)
+        assert_eq!(
+            validate_host_header(Some("::1"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_malformed_bracketed() {
+        // #11: malformed bracketed [::1]evil.example
+        assert_eq!(
+            validate_host_header(Some("[::1]evil.example"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_unclosed_bracket() {
+        // #12: unclosed bracket [::1
+        assert_eq!(
+            validate_host_header(Some("[::1"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_empty_bracket() {
+        // #13: empty bracket []:80
+        assert_eq!(
+            validate_host_header(Some("[]:80"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_control_chars_rejected() {
+        // #14: control char in host
+        for ctrl in ["host\rname", "host\nname", "host\tname"] {
+            assert_eq!(
+                validate_host_header(Some(ctrl), None),
+                Err(HostRejection::MalformedHost),
+                "control char {ctrl:?} should be MalformedHost"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_host_header_userinfo_rejected() {
+        // #15: userinfo (user@host) → defensive reject
+        assert_eq!(
+            validate_host_header(Some("user@host:80"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_null_byte_rejected() {
+        // #16: control byte \x00
+        assert_eq!(
+            validate_host_header(Some("host\x00"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_port_out_of_range_rejected() {
+        // #17: port out-of-range (localhost:99999) → MalformedHost
+        // port_u16() が None に degrade するが、has_explicit_port_suffix で reject
+        assert_eq!(
+            validate_host_header(Some("localhost:99999"), None),
+            Err(HostRejection::MalformedHost)
+        );
+        assert_eq!(
+            validate_host_header(Some("[::1]:99999"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    // ---- NotAllowed (403) — 4 件 ----
+
+    #[test]
+    fn test_validate_host_header_not_in_allowlist() {
+        // #18: allow に無い hostname
+        assert_eq!(
+            validate_host_header(Some("evil.example"), Some(&allow(&["example.com"]))),
+            Err(HostRejection::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_port_strict_mismatch() {
+        // #19: port-strict 不一致
+        assert_eq!(
+            validate_host_header(
+                Some("example.com:9999"),
+                Some(&allow(&["example.com:8080"]))
+            ),
+            Err(HostRejection::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_port_strict_no_port_in_host() {
+        // #20: port-strict + port なし Host
+        assert_eq!(
+            validate_host_header(Some("example.com"), Some(&allow(&["example.com:8080"]))),
+            Err(HostRejection::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_ipv6_unauthorized() {
+        // #21: IPv6 bracketed unauthorized
+        assert_eq!(
+            validate_host_header(Some("[::1]:3100"), Some(&allow(&["192.168.1.10"]))),
+            Err(HostRejection::NotAllowed)
+        );
+    }
+
+    // ---- MissingHost (400) — 1 件 ----
+
+    #[test]
+    fn test_validate_host_header_missing_when_none() {
+        // #22: host_raw = None
+        assert_eq!(
+            validate_host_header(None, Some(&allow(&["localhost"]))),
+            Err(HostRejection::MissingHost)
+        );
+    }
+
+    // ---- rmcp parse_allowed_authority mirror — 3 件 ----
+
+    #[test]
+    fn test_validate_host_header_bracketed_allow_unbracketed_host_rejected() {
+        // #23: allowed = ["[::1]"] + Host: ::1 → Host 側は MalformedHost で reject
+        assert_eq!(
+            validate_host_header(Some("::1"), Some(&allow(&["[::1]"]))),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_bracketed_allow_bracketed_host() {
+        // #24: allowed = ["[::1]"] + Host: [::1]:3100 → Ok
+        assert_eq!(
+            validate_host_header(Some("[::1]:3100"), Some(&allow(&["[::1]"]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_unbracketed_allow_bracketed_host() {
+        // #25: allowed = ["::1"] + Host: [::1]:3100 → Ok (= unbracketed config 救済)
+        assert_eq!(
+            validate_host_header(Some("[::1]:3100"), Some(&allow(&["::1"]))),
+            Ok(())
+        );
+    }
+
+    // ---- non-ASCII / 高位 byte — 1 件 ----
+
+    #[test]
+    fn test_validate_host_header_non_ascii_high_byte_rejected() {
+        // #26: non-ASCII 高位 byte (BOM 等) → Authority::try_from が Err → MalformedHost
+        assert_eq!(
+            validate_host_header(Some("\u{FEFF}example.com"), None),
+            Err(HostRejection::MalformedHost)
+        );
+    }
+
+    // ---- trailing dot — 2 件 ----
+
+    #[test]
+    fn test_validate_host_header_trailing_dot_not_in_allowlist() {
+        // #27: allow ["example.com"] + Host: example.com. → NotAllowed
+        // (Authority::try_from は Ok だが host() が trailing dot 保持で mismatch)
+        assert_eq!(
+            validate_host_header(Some("example.com."), Some(&allow(&["example.com"]))),
+            Err(HostRejection::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn test_validate_host_header_trailing_dot_explicitly_allowed() {
+        // #28: allow ["example.com", "example.com."] + Host: example.com. → Ok
+        assert_eq!(
+            validate_host_header(
+                Some("example.com."),
+                Some(&allow(&["example.com", "example.com."]))
+            ),
+            Ok(())
+        );
     }
 }
