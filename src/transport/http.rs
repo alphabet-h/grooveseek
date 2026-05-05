@@ -760,7 +760,7 @@ mod tests {
     /// (or `Host: ::1`) と match (= rmcp の `with_allowed_hosts` 互換)。
     #[tokio::test]
     async fn test_healthz_public_false_with_bracketed_ipv6_allowlist_entry() {
-        // allow-list 側も extract_host_part で normalize されるので、
+        // allow-list 側も NormalizedAuthority::from_allowed_entry で normalize されるので、
         // bracketed entry が bracketed Host と match
         let app1 = build_test_router(false, Some(vec!["[::1]".into()]));
         let req1 = HttpRequest::builder()
