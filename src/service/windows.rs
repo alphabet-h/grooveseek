@@ -13,8 +13,13 @@ pub fn render_task_xml(ctx: &InstallContext) -> String {
     // codex P2 round 4 on PR #56: render UTF-8 and DECLARE UTF-8.
     // schtasks /Create /XML accepts both UTF-8 and UTF-16, but the bytes
     // must match the declaration. The previous `encoding="UTF-16"` while
-    // writing UTF-8 bytes caused parse failures on some Windows builds
-    // (= silent install failure before service registration).
+    // writing UTF-8 bytes caused parse failures on some Windows builds.
+    //
+    // codex P2 round 5 on PR #56: honor `--no-auto-start` by emitting
+    // `<Enabled>false</Enabled>` for the LogonTrigger. Skipping `schtasks /Run`
+    // alone leaves the task armed for the next logon — `--no-auto-start`
+    // would otherwise be a one-shot suppression, not a backend setting.
+    let trigger_enabled = if ctx.auto_start { "true" } else { "false" };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -23,7 +28,7 @@ pub fn render_task_xml(ctx: &InstallContext) -> String {
     <URI>\kb-mcp-{name}</URI>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>
+    <LogonTrigger><Enabled>{trigger_enabled}</Enabled></LogonTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">

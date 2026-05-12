@@ -11,6 +11,16 @@ use std::process::Command;
 pub(crate) struct LaunchAgent;
 
 pub fn render_plist(ctx: &InstallContext) -> String {
+    // codex P2 round 5 on PR #56: honor `--no-auto-start` by emitting
+    // `<false/>` for `RunAtLoad` and `KeepAlive` when auto_start is false.
+    // Otherwise launchd would still start (and keep alive) the agent at the
+    // next login as soon as it's loaded — `--no-auto-start` becomes a no-op
+    // for the LaunchAgent backend.
+    let bool_val = if ctx.auto_start {
+        "<true/>"
+    } else {
+        "<false/>"
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
@@ -25,9 +35,9 @@ pub fn render_plist(ctx: &InstallContext) -> String {
     <key>WorkingDirectory</key>
     <string>{home}</string>
     <key>RunAtLoad</key>
-    <true/>
+    {bool_val}
     <key>KeepAlive</key>
-    <true/>
+    {bool_val}
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
