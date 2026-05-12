@@ -154,11 +154,15 @@ fn windows_register_scheduledtask_smoke_test() {
     std::fs::write(&tmp, bytes).unwrap();
 
     let task_name = format!("kb-mcp-{}", svc_name);
+    // codex P2 round 1 on PR #59: match the production helper's PowerShell
+    // single-quote escaping so usernames containing apostrophes (= O'Brien)
+    // don't break the inline literal.
+    let escaped_path = tmp.display().to_string().replace('\'', "''");
     let register_script = format!(
         "$ErrorActionPreference='Stop'; \
          $xml = [System.IO.File]::ReadAllText('{path}'); \
          Register-ScheduledTask -TaskName '{name}' -Xml $xml -Force | Out-Null",
-        path = tmp.display(),
+        path = escaped_path,
         name = task_name,
     );
     let register = Command::new("powershell")

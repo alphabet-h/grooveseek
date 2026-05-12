@@ -101,12 +101,19 @@ fn run_schtasks(args: &[&str]) -> Result<()> {
 /// generated UTF-16 LE BOM file inside the PowerShell command via
 /// `[System.IO.File]::ReadAllText` (which auto-detects the BOM).
 ///
-/// Safety note: `task_name` is validated upstream by `validate_service_name`
-/// (= `[a-zA-Z0-9_-]+`) so it cannot contain a single quote that would break
-/// the inline PS string literal. `xml_path` comes from `std::env::temp_dir()`
-/// + the same validated service name, which also can't introduce quotes.
+/// `task_name` is upstream-validated by `validate_service_name`
+/// (= `[a-zA-Z0-9_-]+`) so it cannot contain `'`. `xml_path` comes from
+/// `std::env::temp_dir()` + a validated suffix, but `temp_dir()` can include
+/// the user's profile path on Windows — accounts like `O'Brien` would yield
+/// `C:\Users\O'Brien\AppData\Local\Temp\...`. We escape any `'` in the path
+/// per PowerShell single-quoted string rules (= double the quote: `''`).
 fn register_via_powershell(task_name: &str, xml_path: &std::path::Path, force: bool) -> Result<()> {
     let force_clause = if force { " -Force" } else { "" };
+    // codex P2 round 1 on PR #59: escape single quotes in the temp path
+    // (e.g. `C:\Users\O'Brien\AppData\Local\Temp\...`) so the inline
+    // PowerShell single-quoted literal stays syntactically valid.
+    // PowerShell: doubling `'` inside a `'...'` literal yields a literal `'`.
+    let escaped_path = xml_path.display().to_string().replace('\'', "''");
     // `$ErrorActionPreference='Stop'` ensures cmdlet failures propagate as
     // non-zero exit codes (= without this, a non-terminating error would still
     // return exit 0 and we'd miss the failure).
@@ -114,7 +121,7 @@ fn register_via_powershell(task_name: &str, xml_path: &std::path::Path, force: b
         "$ErrorActionPreference='Stop'; \
          $xml = [System.IO.File]::ReadAllText('{path}'); \
          Register-ScheduledTask -TaskName '{name}' -Xml $xml{force} | Out-Null",
-        path = xml_path.display(),
+        path = escaped_path,
         name = task_name,
         force = force_clause,
     );
