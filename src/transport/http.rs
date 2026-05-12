@@ -417,14 +417,20 @@ pub async fn run_http(
         listener.local_addr().unwrap_or(addr)
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            // Ctrl-C でグレースフルシャットダウン。Windows / Linux 両対応。
-            let _ = tokio::signal::ctrl_c().await;
-            eprintln!("kb-mcp: shutdown signal received");
-        })
-        .await
-        .context("axum::serve failed")?;
+    // codex P1 round 6 on PR #57: `into_make_service_with_connect_info::<SocketAddr>()`
+    // populates the `ConnectInfo<SocketAddr>` request extension so the
+    // admin Host check can verify peer.is_loopback() (= remote attackers
+    // cannot bypass via spoofed Host: 127.0.0.1).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("kb-mcp: shutdown signal received");
+    })
+    .await
+    .context("axum::serve failed")?;
     Ok(())
 }
 
@@ -595,35 +601,55 @@ async fn admin_host_check(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
+    // codex P1 round 6 on PR #57: enforce loopback by **peer address** for
+    // admin routes. Host header alone is client-controlled — a remote
+    // attacker on the same LAN as a `--bind 0.0.0.0` daemon can send
+    // `Host: 127.0.0.1` and bypass the allow-list. Production code path
+    // (`run_http` -> `into_make_service_with_connect_info::<SocketAddr>()`)
+    // populates the `ConnectInfo<SocketAddr>` extension; tests via
+    // `oneshot` may leave it unset, in which case we fall through to the
+    // Host-only check (= test convenience, the production listener always
+    // wraps with connect_info so production is fail-closed).
+    if let Some(axum::extract::ConnectInfo(peer)) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        && !peer.ip().is_loopback()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "admin endpoints are loopback-only; peer {} is not loopback",
+                peer
+            ),
+        ));
+    }
+
+    // codex P2 round 5+6 on PR #57: reuse `validate_host_header` so admin
+    // Host validation shares /healthz's hardened defenses (= userinfo /
+    // trailing garbage / port out-of-range rejected, NormalizedAuthority
+    // normalization for IPv6 and case).
     let host_header = req
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .ok_or((StatusCode::BAD_REQUEST, "missing Host header".to_string()))?;
-    // codex P2 round 5 on PR #57: reuse `NormalizedAuthority` (= same helper
-    // `/healthz` uses) so IPv6 forms like `[::1]:3100` parse correctly. The
-    // previous string-splitting comparison broke for bracketed IPv6 (where
-    // `rsplit_once(':')` would split inside the address) and didn't normalize
-    // case, so `[::1]:port` was rejected even though `::1` is in the allow-list.
-    let incoming_authority = match http::uri::Authority::try_from(host_header) {
-        Ok(a) => a,
-        Err(_) => {
+        .and_then(|h| h.to_str().ok());
+    let host_for_err = host_header.unwrap_or("").to_string();
+    match validate_host_header(host_header, Some(shared.allowed_admin_hosts.as_slice())) {
+        Ok(()) => {}
+        Err(HostRejection::MissingHost) => {
+            return Err((StatusCode::BAD_REQUEST, "missing Host header".to_string()));
+        }
+        Err(HostRejection::MalformedHost) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("malformed Host header '{host_header}'"),
+                format!("malformed Host header '{host_for_err}'"),
             ));
         }
-    };
-    let incoming = NormalizedAuthority::from_authority(&incoming_authority);
-    let allowed = shared
-        .allowed_admin_hosts
-        .iter()
-        .any(|entry| NormalizedAuthority::from_allowed_entry(entry).matches(&incoming));
-    if !allowed {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!("Host '{host_header}' not in admin allow-list"),
-        ));
+        Err(HostRejection::NotAllowed) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Host '{host_for_err}' not in admin allow-list"),
+            ));
+        }
     }
     Ok(next.run(req).await)
 }
