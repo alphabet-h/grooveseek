@@ -111,7 +111,20 @@ impl ServiceBackend for LaunchAgent {
             .args(["list", &format!("com.kb-mcp.{}", service_name)])
             .output()
             .context("launchctl list 実行失敗")?;
-        Ok(if out.status.success() {
+        if !out.status.success() {
+            // exit 1 from launchctl list <label> = label not loaded
+            return Ok(ServiceState::NotFound);
+        }
+        // codex P2 round 4 on PR #56: `launchctl list <label>` exits 0 for
+        // loaded-but-not-running agents (= LastExitStatus != 0, no PID).
+        // Distinguish Running vs Stopped by checking for a numeric PID line
+        // in the plist-style output (`"PID" = NNN;`).
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let has_pid = stdout
+            .lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("\"PID\" =") || l.starts_with("PID ="));
+        Ok(if has_pid {
             ServiceState::Running {
                 uptime_secs: 0,
                 bind: None,
@@ -119,7 +132,10 @@ impl ServiceBackend for LaunchAgent {
                 model: None,
             }
         } else {
-            ServiceState::NotFound
+            ServiceState::Stopped {
+                bind: None,
+                kb_path: None,
+            }
         })
     }
     fn list(&self) -> Result<Vec<(String, ServiceState)>> {

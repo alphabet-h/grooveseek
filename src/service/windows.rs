@@ -10,8 +10,13 @@ use std::process::Command;
 pub(crate) struct TaskScheduler;
 
 pub fn render_task_xml(ctx: &InstallContext) -> String {
+    // codex P2 round 4 on PR #56: render UTF-8 and DECLARE UTF-8.
+    // schtasks /Create /XML accepts both UTF-8 and UTF-16, but the bytes
+    // must match the declaration. The previous `encoding="UTF-16"` while
+    // writing UTF-8 bytes caused parse failures on some Windows builds
+    // (= silent install failure before service registration).
     format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>kb-mcp loopback HTTP MCP server ({name})</Description>

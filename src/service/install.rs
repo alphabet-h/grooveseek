@@ -101,13 +101,16 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
     // Schema must match `kb_mcp::config::Config` (= top-level `kb_path` +
     // `[transport.http]`). `Config` uses `#[serde(deny_unknown_fields)]` so
     // any other section (e.g. `[index]`) would crash `kb-mcp serve` at
-    // startup with a parse error. TOML literal strings (single quotes) avoid
-    // `\U`-style escape issues on Windows paths.
-    let content = format!(
-        "kb_path = '{kb}'\n\n[transport.http]\nbind = '{bind}'\n",
-        kb = kb_path.display(),
-        bind = bind,
-    );
+    // startup with a parse error.
+    //
+    // codex P2 round 4 on PR #56: single-quoted TOML literal strings cannot
+    // contain `'`, so a path like `/Users/O'Brien/kb` would produce invalid
+    // TOML. Use `toml::Value::String(...).to_string()` which emits a proper
+    // basic-quoted string with backslash escaping for all path characters
+    // (including `\U` on Windows, `'`, etc).
+    let kb_lit = toml::Value::String(kb_path.display().to_string()).to_string();
+    let bind_lit = toml::Value::String(bind.to_string()).to_string();
+    let content = format!("kb_path = {kb_lit}\n\n[transport.http]\nbind = {bind_lit}\n");
     std::fs::write(path, content)?;
     Ok(())
 }
