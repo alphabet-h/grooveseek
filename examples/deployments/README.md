@@ -1,6 +1,6 @@
 # Deployment recipes
 
-Four opinionated deployment patterns for kb-mcp. Each subdirectory ships
+Three opinionated deployment patterns for kb-mcp. Each subdirectory ships
 ready-to-adapt `kb-mcp.toml` and `.mcp.json` files plus a short README.
 Pick the one closest to your situation, copy the files into the target
 machine, and adjust paths.
@@ -10,9 +10,16 @@ machine, and adjust paths.
 | Scenario | Best for | Transport | Indexer machines |
 | --- | --- | --- | --- |
 | [`personal/`](./personal/) | Single user, single Claude Code session at a time | stdio | 1 (this machine) |
-| [`personal-http/`](./personal-http/) | Single user, **multiple** Claude Code sessions in parallel on one machine | Streamable HTTP, loopback only | 1 (this machine, daemonized) |
 | [`nas-shared/`](./nas-shared/) | KB on a NAS, multiple machines reading | stdio (each client) | 1 dedicated indexer |
 | [`intranet-http/`](./intranet-http/) | Team server, multiple users at once | Streamable HTTP | 1 (the server) |
+
+For **single-user personal-http** (= 1 machine, 1 user, 1 daemon, loopback only — multiple parallel Claude Code sessions on the same host), the prior `personal-http/` recipe was removed in v0.8.0. Use the built-in service installer instead:
+
+```bash
+kb-mcp service install --kb-path /path/to/your/kb
+```
+
+It self-registers an OS service (Linux systemd-user / macOS LaunchAgent / Windows Task Scheduler AT_LOGON) without needing manual template editing. Run `kb-mcp service --help` for full flag reference.
 
 ## Selection guide
 
@@ -21,7 +28,7 @@ Are you the only person using this KB?
 ├── Yes → personal flavors
 │   ├── Only one Claude Code session at a time? → personal/  (stdio, no daemon)
 │   └── Multiple Claude Code sessions in parallel on the same machine?
-│       → personal-http/  (one local daemon, every session connects via HTTP)
+│       → kb-mcp service install  (built-in OS service registration, v0.8.0+)
 │
 └── No
     ├── Each user keeps their own copy of the KB? → personal/ on every machine
