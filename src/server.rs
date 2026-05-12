@@ -52,6 +52,10 @@ pub struct KbServer {
     /// の per-call override 解決時に `SearchOverrides::resolve(&search_config)`
     /// で参照する。toml に section が無ければ `SearchConfig::default()` (MMR off)。
     search_config: crate::config::SearchConfig,
+    /// Shared indexing-state slot — `rebuild_index` flips it Some/None so
+    /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
+    /// in-process index operation (codex P2 round 1 on PR #57).
+    indexing_state: Arc<Mutex<Option<IndexingState>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -626,6 +630,25 @@ impl KbServer {
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
         let force = params.force.unwrap_or(false);
+
+        // codex P2 round 1 on PR #57: flip `indexing_state` to Some while
+        // the rebuild runs so `/api/admin/status` reports indexing.active=true.
+        // Drop guard clears the slot on any exit path (early return, panic).
+        struct IndexingGuard(Arc<Mutex<Option<IndexingState>>>);
+        impl Drop for IndexingGuard {
+            fn drop(&mut self) {
+                if let Ok(mut guard) = self.0.lock() {
+                    *guard = None;
+                }
+            }
+        }
+        if let Ok(mut guard) = self.indexing_state.lock() {
+            *guard = Some(IndexingState {
+                started_at: std::time::SystemTime::now(),
+                progress: None,
+            });
+        }
+        let _indexing_guard = IndexingGuard(Arc::clone(&self.indexing_state));
 
         // Lock order: embedder first, then db (consistent with search)
         let mut embedder = self.embedder.lock().unwrap();
@@ -1349,6 +1372,7 @@ impl KbServer {
             parser_registry: Arc::clone(&shared.parser_registry),
             min_confidence_ratio: shared.min_confidence_ratio,
             search_config: shared.search_config.clone(),
+            indexing_state: Arc::clone(&shared.indexing_state),
             tool_router: KbServer::tool_router(),
         }
     }
