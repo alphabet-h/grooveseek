@@ -27,6 +27,73 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::server::{KbServer, KbServerShared};
 
+// ---------------------------------------------------------------------------
+// (feature-43 PR-2) Admin endpoint response types + small ISO timestamp helper.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct AdminStatus {
+    pub daemon: DaemonInfo,
+    pub indexing: IndexingInfo,
+    pub watcher: WatcherInfo,
+    pub kb: crate::server::KbInfo,
+    pub config_source: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct DaemonInfo {
+    pub version: String,
+    pub uptime_secs: u64,
+    pub started_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct IndexingInfo {
+    pub active: bool,
+    pub started_at: Option<String>,
+    pub progress: Option<IndexingProgressView>,
+}
+
+#[derive(serde::Serialize)]
+pub struct IndexingProgressView {
+    pub current: u64,
+    pub total: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct WatcherInfo {
+    pub active: bool,
+    pub debounce_ms: u64,
+}
+
+/// Format a `SystemTime` as a minimal RFC3339 string (`YYYY-MM-DDTHH:MM:SSZ`,
+/// seconds precision, UTC). Avoids pulling chrono just for this; uses Howard
+/// Hinnant's civil-from-days algorithm so the conversion stays a pure fn.
+fn format_iso(t: std::time::SystemTime) -> String {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Civil-from-days (Howard Hinnant 2013): days since 1970-01-01 → (y, m, d).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, d, h, m, s
+    )
+}
+
 /// `/healthz` 用 Host validation の reject 理由。
 /// HTTP status code への mapping は middleware 側で決定:
 /// - `MissingHost` / `MalformedHost` → 400 Bad Request (= rmcp parity)
@@ -289,11 +356,16 @@ pub async fn run_http(
 
     // Service factory: invoked per new MCP session. Builds a fresh `KbServer`
     // handle that clones the Arc-shared heavy resources. The factory must
-    // return `Result<_, std::io::Error>` per rmcp's trait. `shared` は以降
-    // 使わないので clone せず move する (evaluator Med #4)。
-    let factory_shared = shared;
-    let factory =
-        move || -> Result<KbServer, std::io::Error> { Ok(KbServer::from_shared(&factory_shared)) };
+    // return `Result<_, std::io::Error>` per rmcp's trait.
+    //
+    // (feature-43 PR-2) The admin sub-router also needs `Arc<KbServerShared>`
+    // in its state, so wrap `shared` in Arc upfront and clone for both the
+    // factory closure and the admin router.
+    let factory_shared = Arc::new(shared);
+    let factory = {
+        let f = Arc::clone(&factory_shared);
+        move || -> Result<KbServer, std::io::Error> { Ok(KbServer::from_shared(&f)) }
+    };
 
     let mcp_config = match allowed_hosts.clone() {
         Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
@@ -316,7 +388,21 @@ pub async fn run_http(
                 healthz_host_check,
             ))
     };
-    let app = healthz_router.nest_service("/mcp", mcp_service);
+
+    // (feature-43 PR-2) Admin sub-router — loopback only via Host check
+    // middleware. `/api/admin/*` lives here; the public sub-router (`/mcp`,
+    // `/healthz`) is untouched, so admin gating cannot affect the MCP path.
+    let admin_router = Router::new()
+        .route("/api/admin/status", get(api_admin_status))
+        .with_state(Arc::clone(&factory_shared))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&factory_shared),
+            admin_host_check,
+        ));
+
+    let app = healthz_router
+        .merge(admin_router)
+        .nest_service("/mcp", mcp_service);
 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
@@ -400,6 +486,116 @@ fn should_warn_non_loopback_bind(addr: &SocketAddr, allowed_hosts: Option<&[Stri
 /// Health check endpoint. Always returns 200 with body "ok".
 async fn healthz() -> &'static str {
     "ok"
+}
+
+// ---------------------------------------------------------------------------
+// (feature-43 PR-2) Admin sub-router: `/api/admin/status` + Host check.
+// ---------------------------------------------------------------------------
+
+/// `/api/admin/status` endpoint — returns daemon / indexing / watcher / kb
+/// state. Gated by `admin_host_check` middleware (loopback only by default,
+/// callers add their bind addr to `KbServerShared.allowed_admin_hosts`).
+async fn api_admin_status(
+    State(shared): State<Arc<KbServerShared>>,
+) -> Result<axum::Json<AdminStatus>, (StatusCode, String)> {
+    let kb = shared.kb_info().map_err(|e| {
+        tracing::warn!("admin_status kb_info failure: {e:?}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "kb info unavailable".to_string(),
+        )
+    })?;
+    let indexing_info = {
+        let guard = shared.indexing_state.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "indexing_state mutex poisoned".to_string(),
+            )
+        })?;
+        match guard.as_ref() {
+            Some(s) => IndexingInfo {
+                active: true,
+                started_at: Some(format_iso(s.started_at)),
+                progress: s.progress.as_ref().map(|p| IndexingProgressView {
+                    current: p.current,
+                    total: p.total,
+                }),
+            },
+            None => IndexingInfo {
+                active: false,
+                started_at: None,
+                progress: None,
+            },
+        }
+    };
+    Ok(axum::Json(AdminStatus {
+        daemon: DaemonInfo {
+            version: env!("CARGO_PKG_VERSION").into(),
+            uptime_secs: shared.started_instant.elapsed().as_secs(),
+            started_at: format_iso(shared.started_at),
+        },
+        indexing: indexing_info,
+        watcher: WatcherInfo {
+            active: shared
+                .watcher_active
+                .load(std::sync::atomic::Ordering::Relaxed),
+            debounce_ms: shared.watcher_debounce_ms,
+        },
+        kb,
+        config_source: shared.config_source_label.clone(),
+    }))
+}
+
+/// (feature-43 PR-2) `admin_host_check` middleware — exact-match Host header
+/// against `shared.allowed_admin_hosts` (= loopback aliases + bind addr).
+/// Substring match is rejected since `10.0.127.0.1.evil.com` would otherwise
+/// match `127.0.0.1`. Port suffix is stripped before comparison so
+/// `127.0.0.1:3100` matches the bare `127.0.0.1` entry.
+async fn admin_host_check(
+    State(shared): State<Arc<KbServerShared>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let host_header = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .ok_or((StatusCode::BAD_REQUEST, "missing Host header".to_string()))?;
+    // Strip port suffix: "127.0.0.1:3100" -> "127.0.0.1".
+    // For IPv6 we accept the full `[::1]:port` form via the second arm below.
+    let host_only = host_header.rsplit_once(':').map_or(host_header, |(h, _)| h);
+    let allowed = shared.allowed_admin_hosts.iter().any(|h| {
+        // Compare both as host-only (port stripped) and as the raw entry, so
+        // an allow-list entry with an explicit port still matches its bare form.
+        let entry_host_only = h.rsplit_once(':').map_or(h.as_str(), |(host, _)| host);
+        entry_host_only == host_only || h == host_header
+    });
+    if !allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("Host '{host_header}' not in admin allow-list"),
+        ));
+    }
+    Ok(next.run(req).await)
+}
+
+/// (feature-43 PR-2) Build the axum app router with admin endpoints only.
+/// Used by integration tests in `tests/webui_integration.rs` — the production
+/// app composes the admin sub-router with `/healthz` + `/mcp` in `run_http`.
+///
+/// Gated by the `test-helpers` feature so production binaries do not carry
+/// the helper. `#[cfg(test)]` alone would not make this visible to the
+/// integration test crate (a separate compilation unit).
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
+    let admin_router = axum::Router::new()
+        .route("/api/admin/status", get(api_admin_status))
+        .with_state(Arc::clone(&shared))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&shared),
+            admin_host_check,
+        ));
+    axum::Router::new().merge(admin_router)
 }
 
 // ===========================================================================

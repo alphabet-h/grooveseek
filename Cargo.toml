@@ -57,6 +57,11 @@ indicatif = "0.18"
 # `cargo bench --features heavy-bench --bench search_latency` で reranker bench fn が
 # compile + 実行される (criterion 0.5 には #[ignore] 機構がないため Cargo feature で gate)。
 heavy-bench = []
+# (feature-43 PR-2) `KbServerShared::for_test` などの test-only constructor を
+# integration test crate (= tests/*.rs) から参照可能にする gate。
+# `#[cfg(test)]` は lib 内 test にしか効かないため、tests/ 配下から触りたい
+# helper は feature flag を立てる必要がある。default off (production には載らない)。
+test-helpers = []
 
 [dev-dependencies]
 # Property-based testing for f64 invariant guards (recall_at_k / ndcg_at_k /

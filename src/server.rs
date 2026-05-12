@@ -1354,6 +1354,80 @@ impl KbServer {
     }
 }
 
+/// (feature-43 PR-2) Snapshot of KB-level info for the admin
+/// `/api/admin/status` endpoint. Captured under db / embedder mutex.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KbInfo {
+    pub path: String,
+    pub documents: u64,
+    pub chunks: u64,
+    pub model: String,
+}
+
+impl KbServerShared {
+    /// (feature-43 PR-2) Compute current KB stats (documents, chunks, model
+    /// id). Locks `db` + `embedder` briefly. Used by the admin status endpoint.
+    pub fn kb_info(&self) -> Result<KbInfo> {
+        let documents;
+        let chunks;
+        {
+            let db = self
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            documents = db.document_count()? as u64;
+            chunks = db.chunk_count()? as u64;
+        }
+        let model = {
+            let embedder = self
+                .embedder
+                .lock()
+                .map_err(|_| anyhow::anyhow!("embedder mutex poisoned"))?;
+            embedder.model_id().to_string()
+        };
+        Ok(KbInfo {
+            path: self.kb_path.display().to_string(),
+            documents,
+            chunks,
+            model,
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl KbServerShared {
+    /// (feature-43 PR-2) Test-only minimal constructor. Production code paths
+    /// go through `run_server`; this helper exists so integration tests can
+    /// build a `KbServerShared` without booting the full transport stack.
+    /// All non-essential fields are filled with defaults (loopback-only admin
+    /// allow-list, no reranker, no watcher).
+    pub fn for_test(db: Database, embedder: Embedder, kb_path: PathBuf) -> Self {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Instant, SystemTime};
+        Self {
+            db: Arc::new(Mutex::new(db)),
+            embedder: Arc::new(Mutex::new(embedder)),
+            reranker: Arc::new(Mutex::new(None)),
+            rerank_by_default: false,
+            kb_path,
+            exclude_headings: None,
+            exclude_dirs: vec![],
+            quality_threshold: 0.0,
+            best_practice_templates: vec![],
+            parser_registry: Arc::new(Registry::default()),
+            min_confidence_ratio: 1.5,
+            search_config: crate::config::SearchConfig::default(),
+            started_at: SystemTime::now(),
+            started_instant: Instant::now(),
+            indexing_state: Arc::new(Mutex::new(None)),
+            watcher_active: Arc::new(AtomicBool::new(false)),
+            watcher_debounce_ms: 500,
+            config_source_label: "TestStub".into(),
+            allowed_admin_hosts: vec!["127.0.0.1".into(), "::1".into(), "localhost".into()],
+        }
+    }
+}
+
 /// Run the MCP server on the selected transport.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
