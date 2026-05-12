@@ -265,6 +265,36 @@ Symptoms that suggest you should turn rerank on:
 
 Because rerank is index-independent, you can enable it for a week, measure the quality delta, and disable it if the benefit is not visible — no re-indexing needed.
 
+### Registering kb-mcp as an OS service (v0.8.0+)
+
+`kb-mcp service install` registers the daemon as an OS-level user service (no admin/sudo required) and configures auto-start at login.
+
+```bash
+# Default: service name 'kb-mcp', bind 127.0.0.1:3100, auto-start ON
+kb-mcp service install --kb-path /path/to/your-kb
+
+# Multi-instance (= run multiple KBs as separate services)
+kb-mcp service install --service-name work --kb-path /path/to/work-kb --bind 127.0.0.1:3100
+kb-mcp service install --service-name personal --kb-path /path/to/personal-kb --bind 127.0.0.1:3101
+
+# Inspect / manage
+kb-mcp service status                              # default 'kb-mcp'
+kb-mcp service list                                # all instances
+kb-mcp service uninstall personal                  # remove unit, keep config + DB
+kb-mcp service uninstall personal --purge --yes    # also remove config + DB
+```
+
+OS-specific backends:
+- **Linux**: systemd-user (`~/.config/systemd/user/kb-mcp-<name>.service`). Run `sudo loginctl enable-linger $USER` to keep the daemon running after logout.
+- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`).
+- **Windows**: Task Scheduler AT_LOGON (= no admin required, `\kb-mcp-<name>` task).
+
+The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name>/` containing `kb-mcp.toml` (with `kb_path` and `bind`). Override the base directory via `KB_MCP_CONFIG_HOME` env var.
+
+Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mcp has no authentication.
+
+> **Migration from v0.7.x personal-http recipe**: The `examples/deployments/personal-http/` templates were removed in v0.8.0. If you have a manually installed unit at `~/.config/systemd/user/kb-mcp.service` (or equivalent macOS/Windows path), run `systemctl --user disable kb-mcp.service && rm ~/.config/systemd/user/kb-mcp.service` (or platform equivalent) before running `kb-mcp service install`.
+
 ### Show index status
 
 ```bash
