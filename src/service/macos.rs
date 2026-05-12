@@ -6,7 +6,6 @@ use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 use std::process::Command;
 
-#[allow(dead_code)]
 pub(crate) struct LaunchAgent;
 
 pub fn render_plist(ctx: &InstallContext) -> String {
@@ -45,7 +44,6 @@ pub fn render_plist(ctx: &InstallContext) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn plist_path(service_name: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("HOME 解決失敗"))?;
     Ok(home.join(format!(
@@ -54,7 +52,6 @@ fn plist_path(service_name: &str) -> Result<PathBuf> {
     )))
 }
 
-#[allow(dead_code)]
 fn current_uid() -> Result<String> {
     let out = Command::new("id")
         .arg("-u")
@@ -63,7 +60,6 @@ fn current_uid() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-#[allow(dead_code)]
 fn run_launchctl(args: &[&str]) -> Result<()> {
     let status = Command::new("launchctl")
         .args(args)

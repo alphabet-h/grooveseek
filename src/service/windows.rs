@@ -5,7 +5,6 @@ use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};
 use std::process::Command;
 
-#[allow(dead_code)]
 pub(crate) struct TaskScheduler;
 
 pub fn render_task_xml(ctx: &InstallContext) -> String {
@@ -47,12 +46,10 @@ pub fn render_task_xml(ctx: &InstallContext) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn task_name(service_name: &str) -> String {
     format!("kb-mcp-{}", service_name)
 }
 
-#[allow(dead_code)]
 fn run_schtasks(args: &[&str]) -> Result<()> {
     let status = Command::new("schtasks")
         .args(args)

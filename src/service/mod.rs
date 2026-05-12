@@ -26,7 +26,6 @@ pub mod macos;
 pub mod windows;
 
 /// install command が backend に渡す context。
-#[allow(dead_code)]
 pub struct InstallContext {
     pub service_name: String,
     pub kb_path: PathBuf,        // resolved (= flag or toml)
@@ -40,7 +39,6 @@ pub struct InstallContext {
 /// service の現在状態。2-tier resolve (= spec § 2 status info source):
 /// 1. OS native (= systemctl / launchctl / schtasks) で running / stopped / not-found 判定
 /// 2. running 時のみ `/api/admin/status` で dynamic info (uptime / model) を取得
-#[allow(dead_code)]
 pub enum ServiceState {
     Running {
         uptime_secs: u64,
@@ -66,9 +64,29 @@ pub(crate) trait ServiceBackend {
     fn stop(&self, service_name: &str) -> Result<()>;
 }
 
+/// Host-OS の `ServiceBackend` を構築する factory。
+/// cfg(target_os = ...) で一つだけ branch が compile される。
+pub(crate) fn backend() -> Box<dyn ServiceBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::SystemdUser)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::LaunchAgent)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(windows::TaskScheduler)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        compile_error!("kb-mcp service install is only supported on Linux / macOS / Windows")
+    }
+}
+
 /// `<config_dir>/kb-mcp/<service-name>/` を返す。
 /// 優先順: (1) `KB_MCP_CONFIG_HOME` env var、(2) `dirs::config_dir()` (= XDG_CONFIG_HOME / OS 標準)。
-#[allow(dead_code)]
 pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
     let base = std::env::var("KB_MCP_CONFIG_HOME")
         .ok()
@@ -80,7 +98,6 @@ pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
 
 /// service-name は path-safe / unit-naming-safe にするため `[a-zA-Z0-9_-]+` のみ受け付ける。
 /// 空文字 / slash / dot / 空白 / 非 ASCII は reject。spec § 1 / 8.1 (= 確定済) 参照。
-#[allow(dead_code)]
 pub fn validate_service_name(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("service-name must not be empty".into());
