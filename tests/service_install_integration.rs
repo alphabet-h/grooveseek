@@ -64,3 +64,24 @@ fn linux_unit_template_renders_correctly() {
     assert!(unit.contains("Description=kb-mcp loopback HTTP MCP server (kb-mcp)"));
     assert!(unit.contains("Restart=on-failure"));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_plist_template_renders_correctly() {
+    use kb_mcp::service::*;
+    let ctx = InstallContext {
+        service_name: "kb-mcp".into(),
+        kb_path: PathBuf::from("/Users/me/kb"),
+        bind: "127.0.0.1:3100".into(),
+        config_home: PathBuf::from("/Users/me/Library/Application Support/kb-mcp/kb-mcp"),
+        binary_path: PathBuf::from("/Users/me/.cargo/bin/kb-mcp"),
+        auto_start: true,
+        force: false,
+    };
+    let plist = kb_mcp::service::macos::render_plist(&ctx);
+    assert!(plist.contains("<key>Label</key>"));
+    assert!(plist.contains("<string>com.kb-mcp.kb-mcp</string>"));
+    assert!(plist.contains("<string>/Users/me/.cargo/bin/kb-mcp</string>"));
+    assert!(plist.contains("<string>serve</string>"));
+    assert!(plist.contains("<key>WorkingDirectory</key>"));
+}
