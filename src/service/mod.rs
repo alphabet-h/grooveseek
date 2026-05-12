@@ -11,8 +11,53 @@
 //!
 //! 3rd-party tool (NSSM / WiX) は使わず、Rust crate のみで完結 (= "1 binary value prop")。
 
+use std::path::PathBuf;
+use anyhow::Result;
+
+/// install command が backend に渡す context。`pub(crate)` で crate 内に閉じる。
+#[allow(dead_code)]
+pub(crate) struct InstallContext {
+    pub service_name: String,
+    pub kb_path: PathBuf,        // resolved (= flag or toml)
+    pub bind: String,            // e.g. "127.0.0.1:3100"
+    pub config_home: PathBuf,    // <dirs::config_dir()>/kb-mcp/<name>/
+    pub binary_path: PathBuf,    // std::env::current_exe() を install 時 freeze (spec § 8.2 a)
+    pub auto_start: bool,
+    pub force: bool,
+}
+
+/// service の現在状態。2-tier resolve (= spec § 2 status info source):
+/// 1. OS native (= systemctl / launchctl / schtasks) で running / stopped / not-found 判定
+/// 2. running 時のみ `/api/admin/status` で dynamic info (uptime / model) を取得
+#[allow(dead_code)]
+pub(crate) enum ServiceState {
+    Running {
+        uptime_secs: u64,
+        bind: Option<String>,
+        kb_path: Option<PathBuf>,
+        model: Option<String>,
+    },
+    Stopped {
+        bind: Option<String>,
+        kb_path: Option<PathBuf>,
+    },
+    NotFound,
+}
+
+/// platform-specific backend abstraction。Phase 4+ で --system 切替時は別 struct を増やす想定。
+#[allow(dead_code)]
+pub(crate) trait ServiceBackend {
+    fn install(&self, ctx: &InstallContext) -> Result<()>;
+    fn uninstall(&self, service_name: &str) -> Result<()>;
+    fn status(&self, service_name: &str) -> Result<ServiceState>;
+    fn list(&self) -> Result<Vec<(String, ServiceState)>>;
+    /// uninstall で daemon 起動中を stop してから unit を消すための内部 helper。
+    fn stop(&self, service_name: &str) -> Result<()>;
+}
+
 /// service-name は path-safe / unit-naming-safe にするため `[a-zA-Z0-9_-]+` のみ受け付ける。
 /// 空文字 / slash / dot / 空白 / 非 ASCII は reject。spec § 1 / 8.1 (= 確定済) 参照。
+#[allow(dead_code)]
 pub(crate) fn validate_service_name(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("service-name must not be empty".into());
