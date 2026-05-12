@@ -284,7 +284,7 @@ impl KbServer {
         name = "search",
         description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query terms."
     )]
-    async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
+    pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         let limit = params.limit.unwrap_or(5);
 
         // feature-28 Task 2.7: per-call MMR override の範囲チェック。
@@ -1392,6 +1392,27 @@ impl KbServerShared {
             model,
         })
     }
+}
+
+/// (feature-43 PR-2) Plain-JSON search entry for the WebUI `/api/search` POST.
+///
+/// Constructs a minimal `SearchParams` (= query + limit only) and dispatches
+/// through the same `KbServer::search` tool method the MCP clients use.
+/// Returns the raw JSON string from `KbServer::search` (already
+/// pretty-printed `SearchResponse` or `ErrorResponse`).
+///
+/// Defined as a free function (instead of a method on `KbServerShared`) so
+/// the private `SearchParams` type does not need to leak to the public API
+/// of `KbServerShared`. Same-module access to `SearchParams` + `pub(crate)`
+/// `KbServer::search` keeps the MCP tool surface untouched.
+pub async fn web_search(shared: &KbServerShared, query: String, limit: Option<u32>) -> String {
+    let kb_server = KbServer::from_shared(shared);
+    let params = SearchParams {
+        query,
+        limit,
+        ..Default::default()
+    };
+    kb_server.search(Parameters(params)).await
 }
 
 #[cfg(any(test, feature = "test-helpers"))]

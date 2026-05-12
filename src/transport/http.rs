@@ -13,13 +13,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::get,
+    routing::{get, post},
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -394,6 +394,8 @@ pub async fn run_http(
     // `/healthz`) is untouched, so admin gating cannot affect the MCP path.
     let admin_router = Router::new()
         .route("/api/admin/status", get(api_admin_status))
+        .route("/api/search", post(api_search))
+        .route("/ui", get(ui_index))
         .with_state(Arc::clone(&factory_shared))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&factory_shared),
@@ -546,6 +548,39 @@ async fn api_admin_status(
     }))
 }
 
+/// (feature-43 PR-2) `/ui` — serves the WebUI MVP placeholder HTML (XSS-safe
+/// via `textContent` + `createElement`, no CSS framework). Phase 3+ で本格
+/// redesign 前提の disposable placeholder。
+async fn ui_index() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("webui_index.html"))
+}
+
+#[derive(serde::Deserialize)]
+struct WebSearchRequest {
+    query: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// (feature-43 PR-2) `/api/search` POST — JSON-in / JSON-out wrapper around
+/// `KbServer::search` for the WebUI. Gated by the same admin Host check
+/// middleware as `/api/admin/status`.
+///
+/// `web_search` returns an already pretty-printed JSON string
+/// (`SearchResponse` or `ErrorResponse`); pass it through verbatim with an
+/// explicit `Content-Type: application/json` so we do not re-serialize.
+async fn api_search(
+    State(shared): State<Arc<KbServerShared>>,
+    Json(req): Json<WebSearchRequest>,
+) -> Result<Response, (StatusCode, String)> {
+    let body = crate::server::web_search(&shared, req.query, req.limit).await;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// (feature-43 PR-2) `admin_host_check` middleware — exact-match Host header
 /// against `shared.allowed_admin_hosts` (= loopback aliases + bind addr).
 /// Substring match is rejected since `10.0.127.0.1.evil.com` would otherwise
@@ -590,6 +625,8 @@ async fn admin_host_check(
 pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
     let admin_router = axum::Router::new()
         .route("/api/admin/status", get(api_admin_status))
+        .route("/api/search", post(api_search))
+        .route("/ui", get(ui_index))
         .with_state(Arc::clone(&shared))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared),

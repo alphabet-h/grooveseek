@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>kb-mcp WebUI (MVP)</title>
+</head>
+<body>
+    <h1>kb-mcp</h1>
+    <p style="color:#888">WebUI MVP — to be redesigned in Phase 3+</p>
+    <form id="search-form">
+        <input type="search" id="q" placeholder="Search your knowledge base..." size="60">
+        <button type="submit">Search</button>
+    </form>
+    <ul id="results"></ul>
+    <script>
+        const form = document.getElementById('search-form');
+        const results = document.getElementById('results');
+
+        // XSS-safe: textContent / createElement only, never innerHTML.
+        function renderResults(items) {
+            results.textContent = '';
+            if (!items || items.length === 0) {
+                const li = document.createElement('li');
+                li.textContent = 'No results.';
+                results.appendChild(li);
+                return;
+            }
+            for (const r of items) {
+                const li = document.createElement('li');
+                const strong = document.createElement('strong');
+                strong.textContent = r.title || '(untitled)';
+                li.appendChild(strong);
+                const meta = document.createElement('span');
+                meta.style.color = '#888';
+                const score = (typeof r.score === 'number') ? r.score.toFixed(2) : '-';
+                meta.textContent = ' — ' + (r.path || '') + ' (score ' + score + ')';
+                li.appendChild(meta);
+                const snippet = document.createElement('p');
+                snippet.textContent = r.snippet || r.content || '';
+                li.appendChild(snippet);
+                results.appendChild(li);
+            }
+        }
+
+        function setLoading() {
+            results.textContent = '';
+            const li = document.createElement('li');
+            li.textContent = 'Searching...';
+            results.appendChild(li);
+        }
+
+        function renderError(message) {
+            results.textContent = '';
+            const li = document.createElement('li');
+            li.style.color = '#c00';
+            li.textContent = 'Error: ' + message;
+            results.appendChild(li);
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const q = document.getElementById('q').value;
+            setLoading();
+            try {
+                const resp = await fetch('/api/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: q, limit: 10 })
+                });
+                if (!resp.ok) {
+                    const text = await resp.text();
+                    renderError('HTTP ' + resp.status + ': ' + text);
+                    return;
+                }
+                const data = await resp.json();
+                renderResults(data.results || []);
+            } catch (err) {
+                renderError('network error (' + err.message + ')');
+            }
+        });
+    </script>
+</body>
+</html>
