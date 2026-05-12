@@ -14,9 +14,20 @@
 use std::path::PathBuf;
 use anyhow::Result;
 
-/// install command が backend に渡す context。`pub(crate)` で crate 内に閉じる。
+pub mod install;
+pub mod uninstall;
+pub mod status;
+
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+/// install command が backend に渡す context。
 #[allow(dead_code)]
-pub(crate) struct InstallContext {
+pub struct InstallContext {
     pub service_name: String,
     pub kb_path: PathBuf,        // resolved (= flag or toml)
     pub bind: String,            // e.g. "127.0.0.1:3100"
@@ -30,7 +41,7 @@ pub(crate) struct InstallContext {
 /// 1. OS native (= systemctl / launchctl / schtasks) で running / stopped / not-found 判定
 /// 2. running 時のみ `/api/admin/status` で dynamic info (uptime / model) を取得
 #[allow(dead_code)]
-pub(crate) enum ServiceState {
+pub enum ServiceState {
     Running {
         uptime_secs: u64,
         bind: Option<String>,
@@ -70,7 +81,7 @@ pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
 /// service-name は path-safe / unit-naming-safe にするため `[a-zA-Z0-9_-]+` のみ受け付ける。
 /// 空文字 / slash / dot / 空白 / 非 ASCII は reject。spec § 1 / 8.1 (= 確定済) 参照。
 #[allow(dead_code)]
-pub(crate) fn validate_service_name(s: &str) -> Result<String, String> {
+pub fn validate_service_name(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("service-name must not be empty".into());
     }
