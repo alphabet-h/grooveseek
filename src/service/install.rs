@@ -42,6 +42,19 @@ pub fn run(params: InstallParams) -> Result<()> {
         params.kb_path,
         Some(toml_path.clone()).filter(|p| p.exists()),
     )?;
+    // Relative `--kb-path` values must be normalised against the install-time
+    // CWD before persisting to `kb-mcp.toml`. The installed service runs with
+    // `WorkingDirectory=config_home`, and `Config::load_from` resolves
+    // relative `kb_path` against the directory containing the toml — so a
+    // raw relative path would point the daemon at `<config_home>/<rel>`
+    // instead of the user's actual KB. canonicalize() also resolves symlinks
+    // which is desirable here (= snapshot the install-time target).
+    let kb_path = std::fs::canonicalize(&kb_path).with_context(|| {
+        format!(
+            "kb_path を絶対パスに正規化できませんでした: {}",
+            kb_path.display()
+        )
+    })?;
     write_toml(&toml_path, &kb_path, &params.bind)?;
     #[cfg(unix)]
     {
