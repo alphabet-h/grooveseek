@@ -22,6 +22,7 @@ pub mod parser;
 pub mod quality;
 pub mod schema;
 pub mod server;
+pub mod service;
 pub mod transport;
 pub mod watcher;
 
