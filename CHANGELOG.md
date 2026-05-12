@@ -4,6 +4,8 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-13
+
 ### Added
 
 - **F-6 + H-9 Phase 1 (PR-1)**: `kb-mcp service install/uninstall/status/list`
@@ -18,7 +20,22 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `--bind 127.0.0.1:3100`, auto-start ON (`--no-auto-start` to opt out);
   `--bind 0.0.0.0` and other non-loopback addresses require `--i-know` since
   kb-mcp has no authentication. `--purge --yes` deletes both config and
-  index DB.
+  index DB. `--no-auto-start` is honored at the OS layer (Linux: skip
+  `systemctl enable`; macOS: `RunAtLoad=false` + `KeepAlive=false`; Windows:
+  `<LogonTrigger><Enabled>false</Enabled></LogonTrigger>`).
+- **F-6 + H-9 Phase 1 (PR-2)**: WebUI MVP + admin API on the HTTP transport.
+  New admin sub-router with `/ui` (XSS-safe placeholder HTML — `textContent`
+  + `createElement` only, no `innerHTML`), `/api/admin/status` (daemon /
+  indexing / watcher / kb info JSON), and `/api/search` (POST JSON-in /
+  JSON-out wrapper around the existing MCP `search` tool). All three routes
+  are gated by `admin_host_check` middleware (exact-match Host header
+  against loopback aliases + bind addr; substring match rejected to block
+  bypass via `10.0.127.0.1.evil.com`). `/mcp` + `/healthz` remain on the
+  public path with no behavior change. `KbServerShared` gained
+  `started_at` / `started_instant` / `indexing_state` / `watcher_active` /
+  `watcher_debounce_ms` / `config_source_label` / `allowed_admin_hosts`
+  fields to drive the admin status response; watcher start/stop flips
+  `watcher_active` via a Drop guard.
 
 ### Changed
 
