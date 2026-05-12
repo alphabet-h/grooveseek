@@ -10,10 +10,13 @@ use std::process::Command;
 pub(crate) struct TaskScheduler;
 
 pub fn render_task_xml(ctx: &InstallContext) -> String {
-    // codex P2 round 4 on PR #56: render UTF-8 and DECLARE UTF-8.
-    // schtasks /Create /XML accepts both UTF-8 and UTF-16, but the bytes
-    // must match the declaration. The previous `encoding="UTF-16"` while
-    // writing UTF-8 bytes caused parse failures on some Windows builds.
+    // (v0.8.1 hot-fix) The XML declares `encoding="UTF-16"` AND the file is
+    // written as UTF-16 LE with a BOM by `write_task_xml_utf16` below. Some
+    // Japanese-locale Windows builds reject the `encoding="UTF-8"` variant
+    // with "エンコードを切り替えることができません" (= "cannot switch
+    // encoding") even though Microsoft's docs say schtasks /XML accepts
+    // both — empirically UTF-16 LE BOM is the broadest-compatible form, so
+    // we always emit that.
     //
     // codex P2 round 5 on PR #56: honor `--no-auto-start` by emitting
     // `<Enabled>false</Enabled>` for the LogonTrigger. Skipping `schtasks /Run`
@@ -21,7 +24,7 @@ pub fn render_task_xml(ctx: &InstallContext) -> String {
     // would otherwise be a one-shot suppression, not a backend setting.
     let trigger_enabled = if ctx.auto_start { "true" } else { "false" };
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>kb-mcp loopback HTTP MCP server ({name})</Description>
@@ -58,6 +61,20 @@ pub fn render_task_xml(ctx: &InstallContext) -> String {
     )
 }
 
+/// (v0.8.1 hot-fix) Encode `xml` as UTF-16 LE bytes with a `0xFF 0xFE` BOM
+/// and write to `path`. Required because `schtasks /Create /XML` on
+/// Japanese-locale Windows rejects UTF-8 XML (= "エンコードを切り替える
+/// ことができません") even when the declaration says `encoding="UTF-8"`.
+/// UTF-16 LE BOM is the broadest-compatible form across Windows locales.
+pub fn encode_utf16_le_bom(xml: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 + xml.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]); // UTF-16 LE BOM
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
 fn task_name(service_name: &str) -> String {
     format!("kb-mcp-{}", service_name)
 }
@@ -81,7 +98,9 @@ impl ServiceBackend for TaskScheduler {
     fn install(&self, ctx: &InstallContext) -> Result<()> {
         let xml = render_task_xml(ctx);
         let tmp = std::env::temp_dir().join(format!("kb-mcp-task-{}.xml", ctx.service_name));
-        std::fs::write(&tmp, xml)?;
+        // v0.8.1 hot-fix: write UTF-16 LE BOM bytes (= broadest-compatible
+        // schtasks XML format). See `encode_utf16_le_bom` doc-comment.
+        std::fs::write(&tmp, encode_utf16_le_bom(&xml))?;
         let task = task_name(&ctx.service_name);
         let force_flag = if ctx.force { vec!["/F"] } else { vec![] };
         let mut args: Vec<&str> = vec!["/Create", "/TN", &task, "/XML"];

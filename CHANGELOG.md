@@ -4,6 +4,21 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-13
+
+### Fixed
+
+- **Windows `kb-mcp service install`**: schtasks XML rejected on
+  Japanese-locale Windows with "エンコードを切り替えることができません".
+  v0.8.0 wrote `<?xml encoding="UTF-8"?>` + UTF-8 bytes (= valid XML
+  but empirically broken on Japanese-locale schtasks). v0.8.1 emits
+  `<?xml encoding="UTF-16"?>` declaration + UTF-16 LE bytes prefixed by
+  a `0xFF 0xFE` BOM, which is the broadest-compatible form across
+  Windows locales. New regression test `windows_task_xml_is_utf16_le_with_bom`
+  pins the exact byte sequence so a future "encoding cleanup" can't
+  silently revert. (= dogfood discovery during local v0.8.0 install on
+  日本語 Windows)
+
 ## [0.8.0] - 2026-05-13
 
 ### Added
