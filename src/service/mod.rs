@@ -55,6 +55,18 @@ pub(crate) trait ServiceBackend {
     fn stop(&self, service_name: &str) -> Result<()>;
 }
 
+/// `<config_dir>/kb-mcp/<service-name>/` を返す。
+/// 優先順: (1) `KB_MCP_CONFIG_HOME` env var、(2) `dirs::config_dir()` (= XDG_CONFIG_HOME / OS 標準)。
+#[allow(dead_code)]
+pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
+    let base = std::env::var("KB_MCP_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .ok_or_else(|| anyhow::anyhow!("config dir 解決失敗 (KB_MCP_CONFIG_HOME / XDG_CONFIG_HOME / HOME いずれも未設定)"))?;
+    Ok(base.join("kb-mcp").join(service_name))
+}
+
 /// service-name は path-safe / unit-naming-safe にするため `[a-zA-Z0-9_-]+` のみ受け付ける。
 /// 空文字 / slash / dot / 空白 / 非 ASCII は reject。spec § 1 / 8.1 (= 確定済) 参照。
 #[allow(dead_code)]
@@ -89,5 +101,21 @@ mod tests {
         assert!(validate_service_name("kb mcp").is_err());
         assert!(validate_service_name("kb.mcp").is_err());
         assert!(validate_service_name("日本語").is_err());
+    }
+
+    #[test]
+    fn resolve_config_home_uses_env_var_when_set() {
+        let original = std::env::var("KB_MCP_CONFIG_HOME").ok();
+        // SAFETY: edition 2024 made env mutation unsafe due to thread-safety
+        // 懸念。本 test は service::tests 内に閉じており他 env mutation と並走しない。
+        unsafe { std::env::set_var("KB_MCP_CONFIG_HOME", "/tmp/kb-mcp-test-override"); }
+        let result = resolve_config_home("svc").unwrap();
+        assert_eq!(result, PathBuf::from("/tmp/kb-mcp-test-override/kb-mcp/svc"));
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("KB_MCP_CONFIG_HOME", v),
+                None => std::env::remove_var("KB_MCP_CONFIG_HOME"),
+            }
+        }
     }
 }
