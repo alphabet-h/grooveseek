@@ -84,85 +84,43 @@ fn macos_plist_template_renders_correctly() {
     assert!(plist.contains("<key>WorkingDirectory</key>"));
 }
 
-#[cfg(target_os = "windows")]
-#[test]
-fn windows_task_xml_renders_correctly() {
-    use kb_mcp::service::*;
-    let ctx = InstallContext {
-        service_name: "kb-mcp".into(),
-        kb_path: PathBuf::from(r"C:\Users\me\kb"),
-        bind: "127.0.0.1:3100".into(),
-        config_home: PathBuf::from(r"C:\Users\me\AppData\Roaming\kb-mcp\kb-mcp"),
-        binary_path: PathBuf::from(r"C:\Users\me\.cargo\bin\kb-mcp.exe"),
-        auto_start: true,
-        force: false,
-    };
-    let xml = kb_mcp::service::windows::render_task_xml(&ctx);
-    assert!(xml.contains("LogonTrigger"));
-    assert!(xml.contains("LeastPrivilege"));
-    assert!(xml.contains(r"C:\Users\me\.cargo\bin\kb-mcp.exe"));
-    assert!(xml.contains(r"C:\Users\me\AppData\Roaming\kb-mcp\kb-mcp"));
-    assert!(xml.contains("kb-mcp-kb-mcp"));
-    // v0.8.1 hot-fix: XML declares UTF-16 (= matches the BOM-prefixed UTF-16 LE
-    // bytes written by `encode_utf16_le_bom`).
-    assert!(xml.contains(r#"encoding="UTF-16""#));
-}
-
-/// v0.8.2 hot-fix smoke test: invokes `Register-ScheduledTask -Xml` via
-/// PowerShell with the produced UTF-16 LE BOM bytes — matches the v0.8.2
-/// production install path. Verifies user-level root-path registration
-/// works without elevation (= the spec § Q4 "Phase 1 = no admin" promise).
-/// Cleans up via `Unregister-ScheduledTask` regardless of test outcome.
+/// v0.8.3 hot-fix smoke test: invokes `Register-ScheduledTask` via PowerShell
+/// using the **Action / Trigger / Settings** parameter set — matches the
+/// v0.8.3 production install path. Validates user-level root-path
+/// registration without admin elevation (= spec § Q4 promise).
+/// Cleans up via `Unregister-ScheduledTask` regardless of outcome.
 ///
 /// **Must be run from an interactive logon session** (= the user's own
-/// `cmd.exe` / `powershell.exe` / Windows Terminal, NOT a network logon /
-/// service-style session). PowerShell scheduled-task APIs need an
-/// interactive token to talk to the Task Scheduler service for the current
-/// user — calls from NTLM / service logon sessions (cargo-spawned shells
-/// inside CI runners, SSH sessions, WSL-bridged shells, etc.) hit
-/// "Access is denied" even though the user is the same.
+/// `powershell.exe` / Windows Terminal, NOT a network logon / service-style
+/// session). The Task Scheduler COM API needs an interactive token to
+/// register tasks for the current user — calls from NTLM / service logon
+/// sessions (cargo-spawned shells inside CI runners, SSH sessions, WSL-
+/// bridged shells) hit "Access is denied" even though the user is the same.
 ///
 /// Run manually from an interactive shell:
 /// ```text
 /// cargo test --test service_install_integration windows_register_scheduledtask_smoke_test -- --ignored
 /// ```
 ///
-/// The byte-level test `windows_task_xml_is_utf16_le_with_bom` is the primary
-/// CI regression guard for the XML shape; this smoke test is end-to-end OS
-/// integration and explicitly opt-in (= no CI coverage by design).
+/// This smoke test is opt-in (= no CI coverage by design). Compile-time
+/// shape correctness is covered by `cargo check` of the production helper.
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "mutates Windows Task Scheduler — run manually for end-to-end verify"]
 fn windows_register_scheduledtask_smoke_test() {
-    use kb_mcp::service::*;
     use std::process::Command;
 
     let unique = std::process::id();
     let svc_name = format!("smoke{}", unique);
-    let ctx = InstallContext {
-        service_name: svc_name.clone(),
-        kb_path: PathBuf::from(r"C:\nonexistent\kb"),
-        bind: "127.0.0.1:9999".into(),
-        config_home: PathBuf::from(r"C:\nonexistent\cfg"),
-        binary_path: PathBuf::from(r"C:\nonexistent\kb-mcp.exe"),
-        auto_start: false,
-        force: false,
-    };
-    let xml = kb_mcp::service::windows::render_task_xml(&ctx);
-    let bytes = kb_mcp::service::windows::encode_utf16_le_bom(&xml);
-    let tmp = std::env::temp_dir().join(format!("kbmcp-ps-smoke-{}.xml", unique));
-    std::fs::write(&tmp, bytes).unwrap();
-
     let task_name = format!("kb-mcp-{}", svc_name);
-    // codex P2 round 1 on PR #59: match the production helper's PowerShell
-    // single-quote escaping so usernames containing apostrophes (= O'Brien)
-    // don't break the inline literal.
-    let escaped_path = tmp.display().to_string().replace('\'', "''");
+
     let register_script = format!(
         "$ErrorActionPreference='Stop'; \
-         $xml = [System.IO.File]::ReadAllText('{path}'); \
-         Register-ScheduledTask -TaskName '{name}' -Xml $xml -Force | Out-Null",
-        path = escaped_path,
+         $action = New-ScheduledTaskAction -Execute 'C:\\nonexistent\\kb-mcp.exe' -Argument 'serve' -WorkingDirectory 'C:\\nonexistent\\cfg'; \
+         $trigger = New-ScheduledTaskTrigger -AtLogOn -User \"$env:USERDOMAIN\\$env:USERNAME\"; \
+         $trigger.Enabled = $false; \
+         $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 7; \
+         Register-ScheduledTask -TaskName '{name}' -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Force | Out-Null",
         name = task_name,
     );
     let register = Command::new("powershell")
@@ -193,7 +151,6 @@ fn windows_register_scheduledtask_smoke_test() {
             &unregister_script,
         ])
         .output();
-    let _ = std::fs::remove_file(&tmp);
 
     assert!(
         register.status.success(),
@@ -202,48 +159,6 @@ fn windows_register_scheduledtask_smoke_test() {
         String::from_utf8_lossy(&register.stderr),
         String::from_utf8_lossy(&register.stdout),
     );
-}
-
-/// v0.8.1 hot-fix regression: schtasks /XML on Japanese-locale Windows
-/// requires UTF-16 LE bytes with `0xFF 0xFE` BOM. Re-emitting plain UTF-8
-/// (= the v0.8.0 code path) caused "エンコードを切り替えることができません".
-/// This test pins the exact byte sequence so a future "encoding cleanup"
-/// can't silently revert.
-#[cfg(target_os = "windows")]
-#[test]
-fn windows_task_xml_is_utf16_le_with_bom() {
-    use kb_mcp::service::*;
-    let ctx = InstallContext {
-        service_name: "kb-mcp".into(),
-        kb_path: PathBuf::from(r"C:\kb"),
-        bind: "127.0.0.1:3100".into(),
-        config_home: PathBuf::from(r"C:\cfg"),
-        binary_path: PathBuf::from(r"C:\bin\kb-mcp.exe"),
-        auto_start: true,
-        force: false,
-    };
-    let xml = kb_mcp::service::windows::render_task_xml(&ctx);
-    let bytes = kb_mcp::service::windows::encode_utf16_le_bom(&xml);
-
-    // 1) BOM in the first two bytes (0xFF 0xFE = UTF-16 LE)
-    assert_eq!(&bytes[0..2], &[0xFF, 0xFE], "missing UTF-16 LE BOM");
-
-    // 2) Total byte length = 2 (BOM) + 2 * codepoint count (= xml is ASCII so
-    //    `encode_utf16().count()` equals `chars().count()`)
-    let codepoints = xml.encode_utf16().count();
-    assert_eq!(
-        bytes.len(),
-        2 + codepoints * 2,
-        "UTF-16 LE encoding length mismatch"
-    );
-
-    // 3) Round-trip: drop the BOM, decode as UTF-16 LE, must match `xml`.
-    let utf16_units: Vec<u16> = bytes[2..]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    let decoded = String::from_utf16(&utf16_units).expect("decoded UTF-16 must be valid");
-    assert_eq!(decoded, xml, "UTF-16 LE round-trip mismatch");
 }
 
 #[test]

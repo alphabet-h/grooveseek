@@ -4,6 +4,25 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-05-13
+
+### Fixed
+
+- **Windows `kb-mcp service install`**: third (and final) attempt at user-
+  level root-path registration. v0.8.2 switched from `schtasks /Create /XML`
+  to `Register-ScheduledTask -Xml`, which fixed the elevation error but
+  immediately hit a new "Access is denied" (HRESULT 0x80070005) — the
+  `-Xml` parameter set doesn't auto-populate `<UserId>` in the task's
+  Principal, so Task Scheduler falls back to a user-ambiguous principal
+  that needs admin. v0.8.3 abandons the `-Xml` parameter set entirely and
+  uses `Register-ScheduledTask -Action $a -Trigger $t -Settings $s
+  -RunLevel Limited`, the parameter set that auto-builds the Principal
+  from the current logon identity (= the exact pattern users had been
+  using as a manual fallback). XML rendering (`render_task_xml`) and
+  UTF-16 LE BOM encoding (`encode_utf16_le_bom`) helpers — historical
+  workarounds from v0.8.0 → v0.8.2 — were removed along with their
+  regression tests; the production install path no longer touches XML.
+
 ## [0.8.2] - 2026-05-13
 
 ### Fixed
