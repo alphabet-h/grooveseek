@@ -500,13 +500,10 @@ async fn healthz() -> &'static str {
 async fn api_admin_status(
     State(shared): State<Arc<KbServerShared>>,
 ) -> Result<axum::Json<AdminStatus>, (StatusCode, String)> {
-    let kb = shared.kb_info().map_err(|e| {
-        tracing::warn!("admin_status kb_info failure: {e:?}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "kb info unavailable".to_string(),
-        )
-    })?;
+    // codex P2 round 2 on PR #57: read the cheap mutexes first (indexing_state,
+    // watcher_active, started_*) so the response can be assembled even when
+    // `rebuild_index` is holding the db / embedder locks. `kb_info()` itself
+    // uses `try_lock` and yields `None` counts on contention.
     let indexing_info = {
         let guard = shared.indexing_state.lock().map_err(|_| {
             (
@@ -530,6 +527,13 @@ async fn api_admin_status(
             },
         }
     };
+    let kb = shared.kb_info().map_err(|e| {
+        tracing::warn!("admin_status kb_info failure: {e:?}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "kb info unavailable".to_string(),
+        )
+    })?;
     Ok(axum::Json(AdminStatus {
         daemon: DaemonInfo {
             version: env!("CARGO_PKG_VERSION").into(),

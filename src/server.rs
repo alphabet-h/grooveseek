@@ -1379,36 +1379,37 @@ impl KbServer {
 }
 
 /// (feature-43 PR-2) Snapshot of KB-level info for the admin
-/// `/api/admin/status` endpoint. Captured under db / embedder mutex.
+/// `/api/admin/status` endpoint. Counts are `Option` because `rebuild_index`
+/// holds the db / embedder mutex for the duration of the rebuild, so a
+/// concurrent admin-status request must not block — it returns `None` to
+/// signal "unavailable, retry after indexing completes" (codex P2 round 2
+/// on PR #57).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KbInfo {
     pub path: String,
-    pub documents: u64,
-    pub chunks: u64,
-    pub model: String,
+    pub documents: Option<u64>,
+    pub chunks: Option<u64>,
+    pub model: Option<String>,
 }
 
 impl KbServerShared {
-    /// (feature-43 PR-2) Compute current KB stats (documents, chunks, model
-    /// id). Locks `db` + `embedder` briefly. Used by the admin status endpoint.
+    /// (feature-43 PR-2) Best-effort snapshot of KB stats. Uses `try_lock`
+    /// on `db` / `embedder` so a long-running `rebuild_index` does not stall
+    /// the admin status response — busy locks yield `None` instead of waiting.
     pub fn kb_info(&self) -> Result<KbInfo> {
-        let documents;
-        let chunks;
-        {
-            let db = self
-                .db
-                .lock()
-                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
-            documents = db.document_count()? as u64;
-            chunks = db.chunk_count()? as u64;
-        }
-        let model = {
-            let embedder = self
-                .embedder
-                .lock()
-                .map_err(|_| anyhow::anyhow!("embedder mutex poisoned"))?;
-            embedder.model_id().to_string()
+        let (documents, chunks) = match self.db.try_lock() {
+            Ok(db) => {
+                let docs = db.document_count().ok().map(|n| n as u64);
+                let chks = db.chunk_count().ok().map(|n| n as u64);
+                (docs, chks)
+            }
+            Err(_) => (None, None),
         };
+        let model = self
+            .embedder
+            .try_lock()
+            .ok()
+            .map(|e| e.model_id().to_string());
         Ok(KbInfo {
             path: self.kb_path.display().to_string(),
             documents,
