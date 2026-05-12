@@ -545,6 +545,7 @@ fn main() -> anyhow::Result<()> {
                     resolved_transport,
                     min_confidence_ratio,
                     search_config,
+                    source,
                 )
                 .await
             })?;

@@ -1300,6 +1300,36 @@ pub struct KbServerShared {
     /// `[search]` セクション (toml) のスナップショット。serve 起動時に Config
     /// から取り出し、shutdown まで不変。`KbServer::from_shared` で clone する。
     pub search_config: crate::config::SearchConfig,
+
+    // (v0.8.0+, feature-43 PR-2) Fields surfaced by `/api/admin/status`.
+    /// Wall-clock daemon start time, used for ISO formatting in admin status.
+    pub started_at: std::time::SystemTime,
+    /// Monotonic daemon start time, used for uptime calculation (NTP-jump safe).
+    pub started_instant: std::time::Instant,
+    /// Current indexing operation state, or `None` when idle.
+    pub indexing_state: std::sync::Arc<std::sync::Mutex<Option<IndexingState>>>,
+    /// `true` while the file watcher loop is running.
+    pub watcher_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Watcher debounce window (= `[watch].debounce_ms` from config).
+    pub watcher_debounce_ms: u64,
+    /// Human-readable label of which source `Config::discover()` used.
+    /// e.g. "Explicit" / "Cwd" / "GitRoot" / "AlongsideBinary" / "NotFound".
+    pub config_source_label: String,
+    /// Hosts allowed by the admin sub-router Host header check.
+    /// Always includes the loopback aliases; HTTP transport also adds its bind addr.
+    pub allowed_admin_hosts: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct IndexingState {
+    pub started_at: std::time::SystemTime,
+    pub progress: Option<IndexingProgress>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexingProgress {
+    pub current: u64,
+    pub total: u64,
 }
 
 impl KbServer {
@@ -1340,7 +1370,11 @@ pub async fn run_server(
     transport: crate::transport::Transport,
     min_confidence_ratio: f32,
     search_config: crate::config::SearchConfig,
+    config_source: crate::config::ConfigSource,
 ) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Instant, SystemTime};
+
     let db_path = crate::resolve_db_path(kb_path);
     let db = Database::open(&db_path.to_string_lossy())?;
 
@@ -1352,6 +1386,31 @@ pub async fn run_server(
     let kb_path = kb_path
         .canonicalize()
         .unwrap_or_else(|_| kb_path.to_path_buf());
+
+    // (feature-43 PR-2) prepare admin/status auxiliary state before the
+    // KbServerShared literal so we can pass an Arc::clone into the watcher.
+    let watcher_active = Arc::new(AtomicBool::new(false));
+    let watcher_debounce_ms = watch_config.debounce_ms;
+    let allowed_admin_hosts = {
+        let mut hosts = vec![
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+            "localhost".to_string(),
+        ];
+        if let crate::transport::Transport::Http { addr, .. } = &transport {
+            // also include the bind addr (e.g. "127.0.0.1:3100") and the
+            // bare ip if different from 127.0.0.1
+            let bind_str = addr.to_string();
+            let ip_str = addr.ip().to_string();
+            if !hosts.contains(&bind_str) {
+                hosts.push(bind_str);
+            }
+            if !hosts.contains(&ip_str) {
+                hosts.push(ip_str);
+            }
+        }
+        hosts
+    };
 
     // watcher と共有するため Arc 化。
     // HTTP service factory でも共有するため KbServerShared にまとめる。
@@ -1368,6 +1427,13 @@ pub async fn run_server(
         parser_registry: Arc::new(parser_registry),
         min_confidence_ratio,
         search_config,
+        started_at: SystemTime::now(),
+        started_instant: Instant::now(),
+        indexing_state: Arc::new(Mutex::new(None)),
+        watcher_active: Arc::clone(&watcher_active),
+        watcher_debounce_ms,
+        config_source_label: format!("{:?}", config_source),
+        allowed_admin_hosts,
     };
 
     // watcher をバックグラウンドで並走。
