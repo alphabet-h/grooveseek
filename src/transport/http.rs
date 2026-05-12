@@ -600,15 +600,25 @@ async fn admin_host_check(
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
         .ok_or((StatusCode::BAD_REQUEST, "missing Host header".to_string()))?;
-    // Strip port suffix: "127.0.0.1:3100" -> "127.0.0.1".
-    // For IPv6 we accept the full `[::1]:port` form via the second arm below.
-    let host_only = host_header.rsplit_once(':').map_or(host_header, |(h, _)| h);
-    let allowed = shared.allowed_admin_hosts.iter().any(|h| {
-        // Compare both as host-only (port stripped) and as the raw entry, so
-        // an allow-list entry with an explicit port still matches its bare form.
-        let entry_host_only = h.rsplit_once(':').map_or(h.as_str(), |(host, _)| host);
-        entry_host_only == host_only || h == host_header
-    });
+    // codex P2 round 5 on PR #57: reuse `NormalizedAuthority` (= same helper
+    // `/healthz` uses) so IPv6 forms like `[::1]:3100` parse correctly. The
+    // previous string-splitting comparison broke for bracketed IPv6 (where
+    // `rsplit_once(':')` would split inside the address) and didn't normalize
+    // case, so `[::1]:port` was rejected even though `::1` is in the allow-list.
+    let incoming_authority = match http::uri::Authority::try_from(host_header) {
+        Ok(a) => a,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("malformed Host header '{host_header}'"),
+            ));
+        }
+    };
+    let incoming = NormalizedAuthority::from_authority(&incoming_authority);
+    let allowed = shared
+        .allowed_admin_hosts
+        .iter()
+        .any(|entry| NormalizedAuthority::from_allowed_entry(entry).matches(&incoming));
     if !allowed {
         return Err((
             StatusCode::FORBIDDEN,
