@@ -15,6 +15,18 @@ pub struct InstallParams {
 pub fn run(params: InstallParams) -> Result<()> {
     let name = validate_service_name(&params.service_name).map_err(|e| anyhow!(e))?;
 
+    // codex P2 round 3 on PR #56: validate bind as SocketAddr at install time
+    // instead of waiting for the daemon to fail at startup. A typo like
+    // "localhost:3100" or a missing port like "127.0.0.1" passes is_loopback
+    // but Transport::resolve() rejects it later — by which point the user has
+    // already registered the service and would not see the error.
+    let _: std::net::SocketAddr = params.bind.parse().with_context(|| {
+        format!(
+            "--bind '{}' is not a valid socket address (e.g. '127.0.0.1:3100')",
+            params.bind
+        )
+    })?;
+
     if !is_loopback_addr(&params.bind) && !params.i_know_non_loopback {
         return Err(anyhow!(
             "bind={} は non-loopback です。kb-mcp は auth を持ちません — \

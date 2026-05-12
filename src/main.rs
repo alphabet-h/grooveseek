@@ -439,6 +439,17 @@ fn main() -> anyhow::Result<()> {
     // CLI parse を先に行い、--config の値を discover に渡す。
     // discover が FASTEMBED_CACHE_DIR を解決するので embedder 初期化より前に来る順序は維持。
     let cli = Cli::parse();
+
+    // codex P2 round 3 on PR #56: `service install/uninstall/status/list` do not
+    // consume `Config` — they read their own `kb-mcp.toml` from `config_home`
+    // (or none at all for `list`). Dispatch them BEFORE `Config::discover` so
+    // users with a malformed `kb-mcp.toml` in CWD can still recover by
+    // running `kb-mcp service uninstall` (otherwise discover would error out
+    // before reaching the service arm).
+    if let Commands::Service { action } = cli.command {
+        return run_service(action);
+    }
+
     let (cfg, source) = Config::discover(cli.config.as_deref())?;
     tracing::info!(
         target: "kb_mcp::config",
@@ -940,46 +951,58 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Service { action } => match action {
-            ServiceSubcommand::Install {
+        Commands::Service { .. } => {
+            // Dispatched at the top of main() before Config::discover
+            // (codex P2 round 3 on PR #56). Unreachable here.
+            unreachable!("Commands::Service dispatched before Config::discover");
+        }
+    }
+
+    Ok(())
+}
+
+/// Service subcommand dispatcher. Called from `main()` BEFORE
+/// `Config::discover` so users with a malformed `kb-mcp.toml` in CWD can
+/// still uninstall / inspect existing service registrations.
+fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
+    match action {
+        ServiceSubcommand::Install {
+            service_name,
+            kb_path,
+            bind,
+            no_auto_start,
+            force,
+            i_know_non_loopback,
+        } => {
+            kb_mcp::service::install::run(kb_mcp::service::install::InstallParams {
                 service_name,
                 kb_path,
                 bind,
-                no_auto_start,
+                auto_start: !no_auto_start,
                 force,
                 i_know_non_loopback,
-            } => {
-                kb_mcp::service::install::run(kb_mcp::service::install::InstallParams {
-                    service_name,
-                    kb_path,
-                    bind,
-                    auto_start: !no_auto_start,
-                    force,
-                    i_know_non_loopback,
-                })?;
-            }
-            ServiceSubcommand::Uninstall {
+            })?;
+        }
+        ServiceSubcommand::Uninstall {
+            service_name,
+            purge,
+            yes,
+        } => {
+            kb_mcp::service::uninstall::run(kb_mcp::service::uninstall::UninstallParams {
                 service_name,
                 purge,
                 yes,
-            } => {
-                kb_mcp::service::uninstall::run(kb_mcp::service::uninstall::UninstallParams {
-                    service_name,
-                    purge,
-                    yes,
-                })?;
-            }
-            ServiceSubcommand::Status { service_name } => {
-                let text = kb_mcp::service::status::run_status(&service_name)?;
-                eprintln!("{}", text);
-            }
-            ServiceSubcommand::List => {
-                let text = kb_mcp::service::status::run_list()?;
-                eprintln!("{}", text);
-            }
-        },
+            })?;
+        }
+        ServiceSubcommand::Status { service_name } => {
+            let text = kb_mcp::service::status::run_status(&service_name)?;
+            eprintln!("{}", text);
+        }
+        ServiceSubcommand::List => {
+            let text = kb_mcp::service::status::run_list()?;
+            eprintln!("{}", text);
+        }
     }
-
     Ok(())
 }
 
