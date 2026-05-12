@@ -631,22 +631,36 @@ impl KbServer {
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
         let force = params.force.unwrap_or(false);
 
-        // codex P2 round 1 on PR #57: flip `indexing_state` to Some while
-        // the rebuild runs so `/api/admin/status` reports indexing.active=true.
-        // Drop guard clears the slot on any exit path (early return, panic).
+        // codex P2 round 1 + P2 round 4 on PR #57: flip `indexing_state` to
+        // `Some` while the rebuild runs so `/api/admin/status` reports
+        // indexing.active=true. Use a refcount (`active_count`) so concurrent
+        // rebuild_index calls don't clear each other's state — first caller
+        // sets Some(count=1), subsequent callers ++count; on Drop, --count
+        // and clear the slot to None only when reaching 0.
         struct IndexingGuard(Arc<Mutex<Option<IndexingState>>>);
         impl Drop for IndexingGuard {
             fn drop(&mut self) {
-                if let Ok(mut guard) = self.0.lock() {
-                    *guard = None;
+                if let Ok(mut guard) = self.0.lock()
+                    && let Some(s) = guard.as_mut()
+                {
+                    s.active_count = s.active_count.saturating_sub(1);
+                    if s.active_count == 0 {
+                        *guard = None;
+                    }
                 }
             }
         }
         if let Ok(mut guard) = self.indexing_state.lock() {
-            *guard = Some(IndexingState {
-                started_at: std::time::SystemTime::now(),
-                progress: None,
-            });
+            match guard.as_mut() {
+                Some(s) => s.active_count += 1,
+                None => {
+                    *guard = Some(IndexingState {
+                        started_at: std::time::SystemTime::now(),
+                        progress: None,
+                        active_count: 1,
+                    });
+                }
+            }
         }
         let _indexing_guard = IndexingGuard(Arc::clone(&self.indexing_state));
 
@@ -1347,6 +1361,13 @@ pub struct KbServerShared {
 pub struct IndexingState {
     pub started_at: std::time::SystemTime,
     pub progress: Option<IndexingProgress>,
+    /// (codex P2 round 4 on PR #57) Concurrent rebuild_index refcount.
+    /// Two HTTP clients can both reach `rebuild_index` before the first
+    /// finishes — without a refcount, the first caller's Drop guard would
+    /// clear the shared slot while the second is still running. Now: start
+    /// = `Some(count=1)` or `+=1` on existing; drop = `-=1` and clear to
+    /// `None` only when reaching 0.
+    pub active_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1517,9 +1538,15 @@ pub async fn run_server(
             "::1".to_string(),
             "localhost".to_string(),
         ];
-        if let crate::transport::Transport::Http { addr, .. } = &transport {
-            // also include the bind addr (e.g. "127.0.0.1:3100") and the
-            // bare ip if different from 127.0.0.1
+        // codex P1 round 4 on PR #57: only include the bind addr when it is
+        // a loopback IP. Otherwise a non-loopback bind (e.g. 192.168.1.10:3100
+        // or 0.0.0.0:3100) would let LAN browsers reach /ui + /api/admin/status
+        // via the bind addr Host header — that contradicts the spec § 7
+        // "admin is loopback-only" decision and the install-time Note that
+        // promises LAN browsers see 403.
+        if let crate::transport::Transport::Http { addr, .. } = &transport
+            && addr.ip().is_loopback()
+        {
             let bind_str = addr.to_string();
             let ip_str = addr.ip().to_string();
             if !hosts.contains(&bind_str) {
