@@ -106,3 +106,14 @@ fn windows_task_xml_renders_correctly() {
     assert!(xml.contains(r"C:\Users\me\AppData\Roaming\kb-mcp\kb-mcp"));
     assert!(xml.contains("kb-mcp-kb-mcp"));
 }
+
+#[test]
+fn uninstall_purge_without_yes_returns_abort_msg() {
+    let result = kb_mcp::service::uninstall::run(kb_mcp::service::uninstall::UninstallParams {
+        service_name: "test".into(),
+        purge: true,
+        yes: false,
+    });
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("--yes") || err.contains("confirm"));
+}
