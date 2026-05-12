@@ -1445,6 +1445,7 @@ pub async fn run_server(
         exclude_headings: shared.exclude_headings.clone(),
         exclude_dirs: shared.exclude_dirs.clone(),
         config: watch_config,
+        watcher_active: Arc::clone(&watcher_active),
     };
     let watcher_handle = tokio::spawn(async move {
         if let Err(e) = crate::watcher::run_watch_loop(watcher_state).await {

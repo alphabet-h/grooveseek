@@ -92,6 +92,9 @@ pub struct WatcherState {
     pub exclude_headings: Option<Vec<String>>,
     pub exclude_dirs: Vec<String>,
     pub config: WatchConfig,
+    /// Set to `true` for the duration of the watch loop (feature-43 PR-2).
+    /// Shared with `KbServerShared` so `/api/admin/status` can report it.
+    pub watcher_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `rel` (forward-slash 相対パス) が `exclude_dirs` のいずれかの配下に
@@ -116,6 +119,20 @@ pub async fn run_watch_loop(state: WatcherState) -> Result<()> {
     if !state.config.enabled {
         return Ok(());
     }
+
+    // (feature-43 PR-2) Mark the watcher as active for the duration of this
+    // function, and clear the flag on any exit path via a Drop guard so that
+    // `/api/admin/status` always reflects the true state — including early
+    // return / panic / `?` propagation.
+    use std::sync::atomic::Ordering;
+    state.watcher_active.store(true, Ordering::Relaxed);
+    struct ActiveGuard(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let _active_guard = ActiveGuard(Arc::clone(&state.watcher_active));
 
     // F-36: bounded channel で event flood 時のメモリ無制限増を防ぐ。
     // 1 element = debounce 窓内の events 塊 (DebouncedEvent ベクトル) なので、
