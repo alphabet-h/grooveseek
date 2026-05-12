@@ -7,6 +7,9 @@
 mod common;
 use common::temp::TempRoot;
 
+#[allow(unused_imports)]
+use std::path::PathBuf;
+
 #[test]
 fn install_resolves_kb_path_from_flag() {
     let tmp = TempRoot::new("install_flag");
@@ -39,4 +42,25 @@ fn install_resolves_kb_path_from_toml_when_no_flag() {
 #[test]
 fn install_resolve_kb_path_errors_when_neither_provided() {
     assert!(kb_mcp::service::install::resolve_kb_path(None, None).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_unit_template_renders_correctly() {
+    use kb_mcp::service::*;
+    let ctx = InstallContext {
+        service_name: "kb-mcp".into(),
+        kb_path: PathBuf::from("/home/u/kb"),
+        bind: "127.0.0.1:3100".into(),
+        config_home: PathBuf::from("/home/u/.config/kb-mcp/kb-mcp"),
+        binary_path: PathBuf::from("/home/u/.cargo/bin/kb-mcp"),
+        auto_start: true,
+        force: false,
+    };
+    let unit = kb_mcp::service::linux::render_unit(&ctx);
+    assert!(unit.contains("[Unit]"));
+    assert!(unit.contains("ExecStart=/home/u/.cargo/bin/kb-mcp serve"));
+    assert!(unit.contains("WorkingDirectory=/home/u/.config/kb-mcp/kb-mcp"));
+    assert!(unit.contains("Description=kb-mcp loopback HTTP MCP server (kb-mcp)"));
+    assert!(unit.contains("Restart=on-failure"));
 }
