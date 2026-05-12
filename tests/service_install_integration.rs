@@ -108,24 +108,32 @@ fn windows_task_xml_renders_correctly() {
     assert!(xml.contains(r#"encoding="UTF-16""#));
 }
 
-/// v0.8.1 hot-fix smoke test: actually invokes `schtasks /Create /XML` with
-/// the produced UTF-16 LE BOM bytes against the live Task Scheduler service,
-/// then deletes the resulting throwaway task.
+/// v0.8.2 hot-fix smoke test: invokes `Register-ScheduledTask -Xml` via
+/// PowerShell with the produced UTF-16 LE BOM bytes — matches the v0.8.2
+/// production install path. Verifies user-level root-path registration
+/// works without elevation (= the spec § Q4 "Phase 1 = no admin" promise).
+/// Cleans up via `Unregister-ScheduledTask` regardless of test outcome.
 ///
-/// **Requires an elevated shell.** `schtasks /Create` at the root task path
-/// (`\`) returns "Access is denied" from non-elevated contexts (cargo test
-/// runs un-elevated by default). The byte-level test
-/// `windows_task_xml_is_utf16_le_with_bom` is the primary CI regression
-/// guard; this smoke test is for manual end-to-end verification from an
-/// elevated PowerShell:
+/// **Must be run from an interactive logon session** (= the user's own
+/// `cmd.exe` / `powershell.exe` / Windows Terminal, NOT a network logon /
+/// service-style session). PowerShell scheduled-task APIs need an
+/// interactive token to talk to the Task Scheduler service for the current
+/// user — calls from NTLM / service logon sessions (cargo-spawned shells
+/// inside CI runners, SSH sessions, WSL-bridged shells, etc.) hit
+/// "Access is denied" even though the user is the same.
 ///
+/// Run manually from an interactive shell:
 /// ```text
-/// cargo test --test service_install_integration windows_task_xml_smoke_test_schtasks_create -- --ignored
+/// cargo test --test service_install_integration windows_register_scheduledtask_smoke_test -- --ignored
 /// ```
+///
+/// The byte-level test `windows_task_xml_is_utf16_le_with_bom` is the primary
+/// CI regression guard for the XML shape; this smoke test is end-to-end OS
+/// integration and explicitly opt-in (= no CI coverage by design).
 #[cfg(target_os = "windows")]
 #[test]
-#[ignore = "mutates Windows Task Scheduler and requires elevated shell — run manually"]
-fn windows_task_xml_smoke_test_schtasks_create() {
+#[ignore = "mutates Windows Task Scheduler — run manually for end-to-end verify"]
+fn windows_register_scheduledtask_smoke_test() {
     use kb_mcp::service::*;
     use std::process::Command;
 
@@ -142,28 +150,53 @@ fn windows_task_xml_smoke_test_schtasks_create() {
     };
     let xml = kb_mcp::service::windows::render_task_xml(&ctx);
     let bytes = kb_mcp::service::windows::encode_utf16_le_bom(&xml);
-    let tmp = std::env::temp_dir().join(format!("kbmcp-utf16-smoke-{}.xml", unique));
+    let tmp = std::env::temp_dir().join(format!("kbmcp-ps-smoke-{}.xml", unique));
     std::fs::write(&tmp, bytes).unwrap();
 
     let task_name = format!("kb-mcp-{}", svc_name);
-    let create = Command::new("schtasks")
-        .args(["/Create", "/TN", &task_name, "/XML"])
-        .arg(&tmp)
+    let register_script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $xml = [System.IO.File]::ReadAllText('{path}'); \
+         Register-ScheduledTask -TaskName '{name}' -Xml $xml -Force | Out-Null",
+        path = tmp.display(),
+        name = task_name,
+    );
+    let register = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &register_script,
+        ])
         .output()
-        .expect("schtasks /Create invocation failed");
+        .expect("powershell Register-ScheduledTask invocation failed");
 
-    // Best-effort cleanup before assert so a failed test still leaves no junk.
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", &task_name, "/F"])
+    // Best-effort cleanup before assert so a failed test leaves no junk.
+    let unregister_script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false | Out-Null",
+        name = task_name,
+    );
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &unregister_script,
+        ])
         .output();
     let _ = std::fs::remove_file(&tmp);
 
     assert!(
-        create.status.success(),
-        "schtasks /Create /XML failed (status: {:?})\nstderr: {}\nstdout: {}",
-        create.status.code(),
-        String::from_utf8_lossy(&create.stderr),
-        String::from_utf8_lossy(&create.stdout),
+        register.status.success(),
+        "Register-ScheduledTask failed (status: {:?})\nstderr: {}\nstdout: {}",
+        register.status.code(),
+        String::from_utf8_lossy(&register.stderr),
+        String::from_utf8_lossy(&register.stdout),
     );
 }
 

@@ -94,19 +94,70 @@ fn run_schtasks(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// v0.8.2 hot-fix: register a task at the root path via PowerShell's
+/// `Register-ScheduledTask -Xml` cmdlet, which (unlike `schtasks /Create`)
+/// works under user-level (non-elevated) permissions for root-path tasks.
+/// The cmdlet expects an XML **string**, not a file path, so we read the
+/// generated UTF-16 LE BOM file inside the PowerShell command via
+/// `[System.IO.File]::ReadAllText` (which auto-detects the BOM).
+///
+/// Safety note: `task_name` is validated upstream by `validate_service_name`
+/// (= `[a-zA-Z0-9_-]+`) so it cannot contain a single quote that would break
+/// the inline PS string literal. `xml_path` comes from `std::env::temp_dir()`
+/// + the same validated service name, which also can't introduce quotes.
+fn register_via_powershell(task_name: &str, xml_path: &std::path::Path, force: bool) -> Result<()> {
+    let force_clause = if force { " -Force" } else { "" };
+    // `$ErrorActionPreference='Stop'` ensures cmdlet failures propagate as
+    // non-zero exit codes (= without this, a non-terminating error would still
+    // return exit 0 and we'd miss the failure).
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         $xml = [System.IO.File]::ReadAllText('{path}'); \
+         Register-ScheduledTask -TaskName '{name}' -Xml $xml{force} | Out-Null",
+        path = xml_path.display(),
+        name = task_name,
+        force = force_clause,
+    );
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .context("powershell Register-ScheduledTask invocation failed")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(anyhow!(
+            "PowerShell Register-ScheduledTask failed (status: {})\nstderr: {}\nstdout: {}",
+            out.status,
+            stderr.trim(),
+            stdout.trim(),
+        ));
+    }
+    Ok(())
+}
+
 impl ServiceBackend for TaskScheduler {
     fn install(&self, ctx: &InstallContext) -> Result<()> {
         let xml = render_task_xml(ctx);
         let tmp = std::env::temp_dir().join(format!("kb-mcp-task-{}.xml", ctx.service_name));
-        // v0.8.1 hot-fix: write UTF-16 LE BOM bytes (= broadest-compatible
-        // schtasks XML format). See `encode_utf16_le_bom` doc-comment.
+        // v0.8.1: write UTF-16 LE BOM bytes (= matches XML declaration, broadest
+        // compatibility). v0.8.2 reads this back via PowerShell's
+        // `[System.IO.File]::ReadAllText` (which auto-detects the BOM).
         std::fs::write(&tmp, encode_utf16_le_bom(&xml))?;
         let task = task_name(&ctx.service_name);
-        let force_flag = if ctx.force { vec!["/F"] } else { vec![] };
-        let mut args: Vec<&str> = vec!["/Create", "/TN", &task, "/XML"];
-        args.push(tmp.to_str().unwrap());
-        args.extend(force_flag);
-        run_schtasks(&args)?;
+        // v0.8.2 hot-fix: register via PowerShell's `Register-ScheduledTask`
+        // cmdlet instead of `schtasks /Create /XML`. The schtasks CLI requires
+        // admin elevation to register a task at the root path (`\<name>`),
+        // while the PowerShell scheduledtasks module (COM-backed) accepts
+        // user-level registration. Spec § Q4 promised "Phase 1 = no admin",
+        // so user-level registration is required.
+        register_via_powershell(&task, &tmp, ctx.force)?;
         if ctx.auto_start {
             run_schtasks(&["/Run", "/TN", &task])?;
         }

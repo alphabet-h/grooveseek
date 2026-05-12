@@ -4,6 +4,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-05-13
+
+### Fixed
+
+- **Windows `kb-mcp service install`**: even after the v0.8.1 UTF-16 LE BOM
+  fix, `schtasks /Create /XML` returned "Access is denied" when registering
+  a task at the root path (`\<name>`) from a non-elevated shell — violating
+  the spec § Q4 promise of "Phase 1 = no admin required". Switched the
+  install path from `schtasks /Create /XML` to PowerShell's
+  `Register-ScheduledTask -Xml` cmdlet (= scheduledtasks PowerShell module,
+  COM-backed) which accepts user-level root-path registration. XML rendering
+  + UTF-16 LE BOM encoding from v0.8.1 are preserved; PowerShell reads the
+  file via `[System.IO.File]::ReadAllText` (= auto-detects the BOM). New
+  `#[ignore]` smoke test `windows_register_scheduledtask_smoke_test` mirrors
+  the production path and is opt-in for manual verification from an
+  interactive logon session (= network / service logon sessions hit Access
+  Denied at the Task Scheduler boundary even without elevation).
+
 ## [0.8.1] - 2026-05-13
 
 ### Fixed
