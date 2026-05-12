@@ -73,9 +73,13 @@ fn is_loopback_addr(s: &str) -> bool {
 }
 
 fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> Result<()> {
-    // TOML literal strings (single quotes) avoid \U escape issues on Windows paths.
+    // Schema must match `kb_mcp::config::Config` (= top-level `kb_path` +
+    // `[transport.http]`). `Config` uses `#[serde(deny_unknown_fields)]` so
+    // any other section (e.g. `[index]`) would crash `kb-mcp serve` at
+    // startup with a parse error. TOML literal strings (single quotes) avoid
+    // `\U`-style escape issues on Windows paths.
     let content = format!(
-        "[index]\nkb_path = '{kb}'\n\n[transport.http]\nbind = '{bind}'\n",
+        "kb_path = '{kb}'\n\n[transport.http]\nbind = '{bind}'\n",
         kb = kb_path.display(),
         bind = bind,
     );
@@ -85,7 +89,8 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
 
 /// kb_path を解決 (spec § Q1 c-3 hybrid):
 /// 1. `--kb-path` flag (= Some(flag)) が指定されたらそれ
-/// 2. それ以外で toml_path が指定されたら toml の `[index].kb_path` を読む
+/// 2. それ以外で toml_path が指定されたら toml の top-level `kb_path` を読む
+///    (= `kb_mcp::config::Config` schema と同じ key、`[index]` は存在しない)
 /// 3. 両方 None なら error
 pub fn resolve_kb_path(flag: Option<PathBuf>, toml_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = flag {
@@ -93,16 +98,20 @@ pub fn resolve_kb_path(flag: Option<PathBuf>, toml_path: Option<PathBuf>) -> Res
     }
     let Some(toml_path) = toml_path else {
         return Err(anyhow!(
-            "kb_path が解決できません: --kb-path flag を指定するか、kb-mcp.toml に [index].kb_path を書いてください"
+            "kb_path が解決できません: --kb-path flag を指定するか、kb-mcp.toml に top-level `kb_path` を書いてください"
         ));
     };
     let content = std::fs::read_to_string(&toml_path)
         .with_context(|| format!("kb-mcp.toml 読込失敗: {}", toml_path.display()))?;
     let parsed: toml::Value = toml::from_str(&content)?;
     let kb_path = parsed
-        .get("index")
-        .and_then(|v| v.get("kb_path"))
+        .get("kb_path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("{} に [index].kb_path がありません", toml_path.display()))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "{} に top-level `kb_path` がありません",
+                toml_path.display()
+            )
+        })?;
     Ok(PathBuf::from(kb_path))
 }

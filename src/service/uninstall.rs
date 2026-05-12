@@ -24,10 +24,38 @@ pub fn run(params: UninstallParams) -> Result<()> {
 
     if params.purge {
         let home = resolve_config_home(&name)?;
+        // `.kb-mcp.db` lives next to the user's KB (= `resolve_db_path(kb_path)`),
+        // NOT inside config_home. Read the configured `kb_path` from the
+        // install-generated toml before deleting config_home so that the
+        // advertised `--purge` cleanup actually removes the index database.
+        let db_path = std::fs::read_to_string(home.join("kb-mcp.toml"))
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+            .and_then(|v| {
+                v.get("kb_path")
+                    .and_then(|p| p.as_str())
+                    .map(std::path::PathBuf::from)
+            })
+            .map(|kb| crate::resolve_db_path(&kb));
+
+        if let Some(db) = db_path.as_ref()
+            && db.exists()
+        {
+            if let Err(e) = std::fs::remove_file(db) {
+                eprintln!(
+                    "Warning: failed to remove .kb-mcp.db at {}: {}",
+                    db.display(),
+                    e
+                );
+            } else {
+                eprintln!("Removed index database: {}", db.display());
+            }
+        }
+
         if home.exists() {
             std::fs::remove_dir_all(&home)?;
             eprintln!(
-                "Removed config home: {} (includes kb-mcp.toml and .kb-mcp.db)",
+                "Removed config home: {} (kb-mcp.toml + service files)",
                 home.display()
             );
         }

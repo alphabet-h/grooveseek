@@ -28,11 +28,11 @@ fn install_resolves_kb_path_from_toml_when_no_flag() {
     // TOML literal strings ('...') do not interpret backslash escapes, which
     // matters on Windows where path separators are `\` (a double-quoted TOML
     // string would treat `\U` as a unicode escape and fail to parse).
-    std::fs::write(
-        &toml_path,
-        format!("[index]\nkb_path = '{}'\n", kb.display()),
-    )
-    .unwrap();
+    // Match the Config schema (top-level `kb_path`, no `[index]` section)
+    // — `Config` uses `deny_unknown_fields` so unrecognised tables would crash
+    // `kb-mcp serve` at startup. TOML literal strings ('...') do not
+    // interpret backslash escapes (Windows `\U` issue).
+    std::fs::write(&toml_path, format!("kb_path = '{}'\n", kb.display())).unwrap();
     let result = kb_mcp::service::install::resolve_kb_path(None, Some(toml_path)).unwrap();
     assert_eq!(result, kb);
 }

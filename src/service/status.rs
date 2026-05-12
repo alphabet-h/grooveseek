@@ -37,11 +37,7 @@ fn enrich_with_toml(name: &str, state: ServiceState) -> ServiceState {
                 .and_then(|h| h.get("bind"))
                 .and_then(|b| b.as_str())
                 .map(String::from);
-            let kb = v
-                .get("index")
-                .and_then(|i| i.get("kb_path"))
-                .and_then(|p| p.as_str())
-                .map(PathBuf::from);
+            let kb = v.get("kb_path").and_then(|p| p.as_str()).map(PathBuf::from);
             (bind, kb)
         })
         .unwrap_or((None, None));
