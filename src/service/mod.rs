@@ -54,13 +54,15 @@ pub enum ServiceState {
 }
 
 /// platform-specific backend abstraction。Phase 4+ で --system 切替時は別 struct を増やす想定。
-#[allow(dead_code)]
 pub(crate) trait ServiceBackend {
     fn install(&self, ctx: &InstallContext) -> Result<()>;
     fn uninstall(&self, service_name: &str) -> Result<()>;
     fn status(&self, service_name: &str) -> Result<ServiceState>;
     fn list(&self) -> Result<Vec<(String, ServiceState)>>;
     /// uninstall で daemon 起動中を stop してから unit を消すための内部 helper。
+    /// 現状は per-OS の `uninstall` impl が自前で stop しており unused だが、
+    /// Phase 4+ の `--system` 切替 / 明示的 stop subcommand 追加時に使う想定。
+    #[allow(dead_code)]
     fn stop(&self, service_name: &str) -> Result<()>;
 }
 
