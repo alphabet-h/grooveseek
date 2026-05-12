@@ -87,10 +87,7 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
 /// 1. `--kb-path` flag (= Some(flag)) が指定されたらそれ
 /// 2. それ以外で toml_path が指定されたら toml の `[index].kb_path` を読む
 /// 3. 両方 None なら error
-pub fn resolve_kb_path(
-    flag: Option<PathBuf>,
-    toml_path: Option<PathBuf>,
-) -> Result<PathBuf> {
+pub fn resolve_kb_path(flag: Option<PathBuf>, toml_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = flag {
         return Ok(p);
     }

@@ -1,5 +1,7 @@
 //! Windows Task Scheduler backend for kb-mcp service.
-#![cfg(target_os = "windows")]
+//!
+//! Module-level `#[cfg(target_os = "windows")]` lives on the `pub mod windows;`
+//! declaration in `src/service/mod.rs`; no inner `#![cfg]` needed.
 
 use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};

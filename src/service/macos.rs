@@ -1,5 +1,7 @@
 //! macOS LaunchAgent backend for kb-mcp service.
-#![cfg(target_os = "macos")]
+//!
+//! Module-level `#[cfg(target_os = "macos")]` lives on the `pub mod macos;`
+//! declaration in `src/service/mod.rs`; no inner `#![cfg]` needed.
 
 use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};
@@ -80,16 +82,15 @@ impl ServiceBackend for LaunchAgent {
         let path = plist_path(&ctx.service_name)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         if path.exists() && !ctx.force {
-            return Err(anyhow!("plist が既存: {} (--force で上書き)", path.display()));
+            return Err(anyhow!(
+                "plist が既存: {} (--force で上書き)",
+                path.display()
+            ));
         }
         std::fs::write(&path, render_plist(ctx))?;
         if ctx.auto_start {
             let uid = current_uid()?;
-            run_launchctl(&[
-                "bootstrap",
-                &format!("gui/{}", uid),
-                path.to_str().unwrap(),
-            ])?;
+            run_launchctl(&["bootstrap", &format!("gui/{}", uid), path.to_str().unwrap()])?;
         }
         Ok(())
     }

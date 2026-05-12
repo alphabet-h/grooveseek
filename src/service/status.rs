@@ -13,7 +13,8 @@ pub fn run_status(service_name: &str) -> Result<String> {
 
 pub fn run_list() -> Result<String> {
     let entries = backend().list()?;
-    let mut s = String::from("NAME       STATUS     BIND               KB_PATH                UPTIME\n");
+    let mut s =
+        String::from("NAME       STATUS     BIND               KB_PATH                UPTIME\n");
     for (name, state) in entries {
         let state = enrich_with_toml(&name, state);
         s.push_str(&format_row(&name, &state));
@@ -23,17 +24,21 @@ pub fn run_list() -> Result<String> {
 }
 
 fn enrich_with_toml(name: &str, state: ServiceState) -> ServiceState {
-    let toml_path = resolve_config_home(name).ok().map(|h| h.join("kb-mcp.toml"));
+    let toml_path = resolve_config_home(name)
+        .ok()
+        .map(|h| h.join("kb-mcp.toml"));
     let (bind_toml, kb_toml) = toml_path
         .and_then(|p| std::fs::read_to_string(&p).ok())
         .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
         .map(|v| {
-            let bind = v.get("transport")
+            let bind = v
+                .get("transport")
                 .and_then(|t| t.get("http"))
                 .and_then(|h| h.get("bind"))
                 .and_then(|b| b.as_str())
                 .map(String::from);
-            let kb = v.get("index")
+            let kb = v
+                .get("index")
                 .and_then(|i| i.get("kb_path"))
                 .and_then(|p| p.as_str())
                 .map(PathBuf::from);
@@ -41,7 +46,12 @@ fn enrich_with_toml(name: &str, state: ServiceState) -> ServiceState {
         })
         .unwrap_or((None, None));
     match state {
-        ServiceState::Running { uptime_secs, model, bind, kb_path } => ServiceState::Running {
+        ServiceState::Running {
+            uptime_secs,
+            model,
+            bind,
+            kb_path,
+        } => ServiceState::Running {
             uptime_secs,
             bind: bind.or(bind_toml),
             kb_path: kb_path.or(kb_toml),
@@ -57,19 +67,30 @@ fn enrich_with_toml(name: &str, state: ServiceState) -> ServiceState {
 
 fn format_state(name: &str, state: &ServiceState) -> String {
     match state {
-        ServiceState::Running { uptime_secs, bind, kb_path, model } => format!(
+        ServiceState::Running {
+            uptime_secs,
+            bind,
+            kb_path,
+            model,
+        } => format!(
             "{}: running (uptime {}s, bind {}, kb_path {}, model {})",
             name,
             uptime_secs,
             bind.as_deref().unwrap_or("(unknown)"),
-            kb_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(unknown)".into()),
+            kb_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".into()),
             model.as_deref().unwrap_or("(unknown)"),
         ),
         ServiceState::Stopped { bind, kb_path } => format!(
             "{}: stopped (bind {}, kb_path {})",
             name,
             bind.as_deref().unwrap_or("(unknown)"),
-            kb_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(unknown)".into()),
+            kb_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".into()),
         ),
         ServiceState::NotFound => format!("{}: not found", name),
     }
@@ -77,18 +98,29 @@ fn format_state(name: &str, state: &ServiceState) -> String {
 
 fn format_row(name: &str, state: &ServiceState) -> String {
     match state {
-        ServiceState::Running { uptime_secs, bind, kb_path, .. } => format!(
+        ServiceState::Running {
+            uptime_secs,
+            bind,
+            kb_path,
+            ..
+        } => format!(
             "{:<10} running    {:<18} {:<22} {}s",
             name,
             bind.as_deref().unwrap_or("(unknown)"),
-            kb_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(unknown)".into()),
+            kb_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".into()),
             uptime_secs,
         ),
         ServiceState::Stopped { bind, kb_path } => format!(
             "{:<10} stopped    {:<18} {:<22} -",
             name,
             bind.as_deref().unwrap_or("(unknown)"),
-            kb_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(unknown)".into()),
+            kb_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(unknown)".into()),
         ),
         ServiceState::NotFound => format!("{:<10} not-found", name),
     }

@@ -31,13 +31,13 @@ pub fn run(params: UninstallParams) -> Result<()> {
                 home.display()
             );
         }
-    } else if let Ok(h) = resolve_config_home(&name) {
-        if h.exists() {
-            eprintln!(
-                "Kept config home: {} (use --purge --yes to remove)",
-                h.display()
-            );
-        }
+    } else if let Ok(h) = resolve_config_home(&name)
+        && h.exists()
+    {
+        eprintln!(
+            "Kept config home: {} (use --purge --yes to remove)",
+            h.display()
+        );
     }
     Ok(())
 }

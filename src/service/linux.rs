@@ -1,5 +1,7 @@
 //! Linux systemd-user backend for kb-mcp service.
-#![cfg(target_os = "linux")]
+//!
+//! Module-level `#[cfg(target_os = "linux")]` lives on the `pub mod linux;`
+//! declaration in `src/service/mod.rs`; no inner `#![cfg]` needed.
 
 use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};

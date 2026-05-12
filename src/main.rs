@@ -958,7 +958,11 @@ fn main() -> anyhow::Result<()> {
                     i_know_non_loopback,
                 })?;
             }
-            ServiceSubcommand::Uninstall { service_name, purge, yes } => {
+            ServiceSubcommand::Uninstall {
+                service_name,
+                purge,
+                yes,
+            } => {
                 kb_mcp::service::uninstall::run(kb_mcp::service::uninstall::UninstallParams {
                     service_name,
                     purge,

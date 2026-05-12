@@ -11,12 +11,12 @@
 //!
 //! 3rd-party tool (NSSM / WiX) は使わず、Rust crate のみで完結 (= "1 binary value prop")。
 
-use std::path::PathBuf;
 use anyhow::Result;
+use std::path::PathBuf;
 
 pub mod install;
-pub mod uninstall;
 pub mod status;
+pub mod uninstall;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -28,10 +28,10 @@ pub mod windows;
 /// install command が backend に渡す context。
 pub struct InstallContext {
     pub service_name: String,
-    pub kb_path: PathBuf,        // resolved (= flag or toml)
-    pub bind: String,            // e.g. "127.0.0.1:3100"
-    pub config_home: PathBuf,    // <dirs::config_dir()>/kb-mcp/<name>/
-    pub binary_path: PathBuf,    // std::env::current_exe() を install 時 freeze (spec § 8.2 a)
+    pub kb_path: PathBuf,     // resolved (= flag or toml)
+    pub bind: String,         // e.g. "127.0.0.1:3100"
+    pub config_home: PathBuf, // <dirs::config_dir()>/kb-mcp/<name>/
+    pub binary_path: PathBuf, // std::env::current_exe() を install 時 freeze (spec § 8.2 a)
     pub auto_start: bool,
     pub force: bool,
 }
@@ -94,7 +94,11 @@ pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .or_else(dirs::config_dir)
-        .ok_or_else(|| anyhow::anyhow!("config dir 解決失敗 (KB_MCP_CONFIG_HOME / XDG_CONFIG_HOME / HOME いずれも未設定)"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "config dir 解決失敗 (KB_MCP_CONFIG_HOME / XDG_CONFIG_HOME / HOME いずれも未設定)"
+            )
+        })?;
     Ok(base.join("kb-mcp").join(service_name))
 }
 
@@ -104,7 +108,10 @@ pub fn validate_service_name(s: &str) -> Result<String, String> {
     if s.is_empty() {
         return Err("service-name must not be empty".into());
     }
-    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!(
             "invalid service-name {s:?}: must match [a-zA-Z0-9_-]+"
         ));
@@ -138,9 +145,14 @@ mod tests {
         let original = std::env::var("KB_MCP_CONFIG_HOME").ok();
         // SAFETY: edition 2024 made env mutation unsafe due to thread-safety
         // 懸念。本 test は service::tests 内に閉じており他 env mutation と並走しない。
-        unsafe { std::env::set_var("KB_MCP_CONFIG_HOME", "/tmp/kb-mcp-test-override"); }
+        unsafe {
+            std::env::set_var("KB_MCP_CONFIG_HOME", "/tmp/kb-mcp-test-override");
+        }
         let result = resolve_config_home("svc").unwrap();
-        assert_eq!(result, PathBuf::from("/tmp/kb-mcp-test-override/kb-mcp/svc"));
+        assert_eq!(
+            result,
+            PathBuf::from("/tmp/kb-mcp-test-override/kb-mcp/svc")
+        );
         unsafe {
             match original {
                 Some(v) => std::env::set_var("KB_MCP_CONFIG_HOME", v),
