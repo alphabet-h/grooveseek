@@ -85,3 +85,24 @@ fn macos_plist_template_renders_correctly() {
     assert!(plist.contains("<string>serve</string>"));
     assert!(plist.contains("<key>WorkingDirectory</key>"));
 }
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_task_xml_renders_correctly() {
+    use kb_mcp::service::*;
+    let ctx = InstallContext {
+        service_name: "kb-mcp".into(),
+        kb_path: PathBuf::from(r"C:\Users\me\kb"),
+        bind: "127.0.0.1:3100".into(),
+        config_home: PathBuf::from(r"C:\Users\me\AppData\Roaming\kb-mcp\kb-mcp"),
+        binary_path: PathBuf::from(r"C:\Users\me\.cargo\bin\kb-mcp.exe"),
+        auto_start: true,
+        force: false,
+    };
+    let xml = kb_mcp::service::windows::render_task_xml(&ctx);
+    assert!(xml.contains("LogonTrigger"));
+    assert!(xml.contains("LeastPrivilege"));
+    assert!(xml.contains(r"C:\Users\me\.cargo\bin\kb-mcp.exe"));
+    assert!(xml.contains(r"C:\Users\me\AppData\Roaming\kb-mcp\kb-mcp"));
+    assert!(xml.contains("kb-mcp-kb-mcp"));
+}

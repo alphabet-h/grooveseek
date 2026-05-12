@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 use std::process::Command;
 
+#[allow(dead_code)]
 pub(crate) struct SystemdUser;
 
 pub fn render_unit(ctx: &InstallContext) -> String {
@@ -32,6 +33,7 @@ pub fn render_unit(ctx: &InstallContext) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn unit_path(service_name: &str) -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .ok_or_else(|| anyhow!("XDG_CONFIG_HOME / HOME 解決失敗"))?
@@ -39,6 +41,7 @@ fn unit_path(service_name: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("kb-mcp-{}.service", service_name)))
 }
 
+#[allow(dead_code)]
 fn run_systemctl(args: &[&str]) -> Result<()> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("--user").args(args);
