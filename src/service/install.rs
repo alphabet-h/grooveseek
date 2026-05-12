@@ -34,6 +34,20 @@ pub fn run(params: InstallParams) -> Result<()> {
             params.bind
         ));
     }
+    // (codex P2 round 3 on PR #57, design clarification) Loopback-only admin
+    // is by spec § 7 — even on non-loopback bind, /ui + /api/admin/status +
+    // /api/search reject Host headers outside the loopback aliases + bind
+    // addr. Warn the user that LAN browsers will see 403 on admin paths so
+    // they expect to SSH to the host (or use http://127.0.0.1:<port>/ui) for
+    // the WebUI even when /mcp is exposed on LAN.
+    if !is_loopback_addr(&params.bind) {
+        eprintln!(
+            "Note: admin endpoints (/ui, /api/admin/status, /api/search) are \
+             loopback-only by design. Browsers on the LAN will get 403 from \
+             these paths even though /mcp accepts the same Host. Use \
+             http://127.0.0.1:<port>/ui (locally) or SSH to the host for the WebUI."
+        );
+    }
 
     let config_home = resolve_config_home(&name)?;
     std::fs::create_dir_all(&config_home)?;
