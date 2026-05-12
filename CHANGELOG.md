@@ -4,6 +4,29 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- **F-6 + H-9 Phase 1 (PR-1)**: `kb-mcp service install/uninstall/status/list`
+  subcommand for cross-platform user-level service registration. Linux =
+  systemd-user (`~/.config/systemd/user/kb-mcp-<name>.service`), macOS =
+  LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`), Windows =
+  Task Scheduler AT_LOGON (`\kb-mcp-<name>`). No admin/sudo required, no
+  NSSM / WiX / 3rd-party tooling — only Rust crates. Multi-instance via
+  `--service-name` (default `"kb-mcp"`). Config home at
+  `<dirs::config_dir()>/kb-mcp/<service-name>/` with `kb-mcp.toml` written
+  at install time; `KB_MCP_CONFIG_HOME` env var overrides the base. Defaults:
+  `--bind 127.0.0.1:3100`, auto-start ON (`--no-auto-start` to opt out);
+  `--bind 0.0.0.0` and other non-loopback addresses require `--i-know` since
+  kb-mcp has no authentication. `--purge --yes` deletes both config and
+  index DB.
+
+### Changed
+
+- **F-6 + H-9 Phase 1 (PR-1)**: Removed `examples/deployments/personal-http/`
+  recipe — superseded by `kb-mcp service install`. README migration note
+  guides users on disabling any pre-existing manually installed units before
+  re-installing via the new subcommand.
+
 ## [0.7.8] - 2026-05-05
 
 ### Added
