@@ -7,9 +7,26 @@ mod config;
 #[cfg(target_os = "windows")]
 mod logger;
 #[cfg(target_os = "windows")]
+mod poll;
+#[cfg(target_os = "windows")]
 mod state;
 #[cfg(target_os = "windows")]
 mod tray;
+
+/// User-defined events sent through the tao EventLoopProxy from the tokio
+/// polling task (StatusUpdate) and the muda menu thread (MenuClicked /
+/// Quit) into the main-thread event loop, where the tray UI is updated
+/// and daemon control actions are dispatched back to the tokio runtime.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone)]
+pub enum UserEvent {
+    StatusUpdate {
+        dot: state::StatusDot,
+        text: String,
+    },
+    MenuClicked(String),
+    Quit,
+}
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
