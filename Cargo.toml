@@ -1,5 +1,5 @@
 [workspace]
-members = ["kb-mcp"]
+members = ["kb-mcp", "crates/kb-mcp-tray"]
 resolver = "2"
 
 # The profile that 'dist' will build with (moved from kb-mcp/Cargo.toml during
