@@ -56,21 +56,24 @@ impl StatusState {
 
     pub fn on_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        // (codex P2 round 2 on PR #62): a failure is just as much a
-        // "we've talked to the polling layer" signal as a success — flip
-        // initialized so that 12 consecutive failures from the very first
-        // poll still transition Gray -> Red after 1 minute. Without this,
-        // a daemon that was never up keeps the tray stuck at
-        // "Status: Connecting..." indefinitely.
-        self.initialized = true;
+        // Do NOT flip initialized here. A failure means we have not yet
+        // observed a successful daemon response, so the tray should stay
+        // in Gray ("Status: Connecting...") for the first 11 polls and
+        // only escalate to Red once consecutive_failures reaches 12.
     }
 
     pub fn current_dot(&self) -> StatusDot {
-        if !self.initialized {
-            return StatusDot::Gray;
-        }
+        // (codex P2 round 3 on PR #62): check the failure threshold BEFORE
+        // the initialized gate so a daemon that is down at tray startup
+        // still transitions Gray -> Red after 12 consecutive failures. The
+        // previous round 2 fix flipped `initialized = true` in on_failure,
+        // which made failures between 1 and 11 fall through to Green
+        // ("Status: Running") even though no successful poll had occurred.
         if self.consecutive_failures >= 12 {
             return StatusDot::Red;
+        }
+        if !self.initialized {
+            return StatusDot::Gray;
         }
         if self.indexing_active {
             return StatusDot::Yellow;
@@ -153,21 +156,20 @@ mod tests {
 
     #[test]
     fn failures_before_first_success_eventually_turn_red() {
-        // codex P2 round 2 on PR #62: on_failure now flips initialized so
-        // a daemon that was never up still transitions Gray -> Red after
-        // 12 failures (1 minute at 5s interval).
+        // codex P2 round 3 on PR #62: pre-success failures stay in Gray
+        // ("Status: Connecting...") for the first 11 polls, then flip to
+        // Red on the 12th (= 1 minute at 5s interval). Never report
+        // Green / "Status: Running" without an actual successful poll.
         let mut s = StatusState::new();
         assert_eq!(s.current_dot(), StatusDot::Gray);
         for _ in 0..11 {
             s.on_failure();
+            assert_eq!(
+                s.current_dot(),
+                StatusDot::Gray,
+                "must stay Gray before reaching the 12-failure threshold"
+            );
         }
-        // initialized is now true (failures count as "we talked to the
-        // polling layer"), so we have left Gray. With 11 < 12 failures
-        // and no indexing data, the state machine treats us as Green.
-        // The important guarantee is that we no longer stay in Gray
-        // forever; turning to Green for a sub-minute window is acceptable
-        // because the 12th failure flips us to Red on schedule.
-        assert_ne!(s.current_dot(), StatusDot::Gray);
         s.on_failure();
         assert_eq!(s.current_dot(), StatusDot::Red);
     }

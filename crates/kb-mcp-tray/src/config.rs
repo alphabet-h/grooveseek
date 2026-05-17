@@ -90,41 +90,50 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
     })
 }
 
-/// Replace wildcard / non-loopback host components with 127.0.0.1 while
-/// keeping the port. The tray always talks to the daemon on the same
-/// machine, and admin routes only accept loopback hosts.
+/// Pick the host the tray should talk to.
+///
+/// - Loopback (127.0.0.1 / localhost / ::1) → keep as-is.
+/// - Wildcard (0.0.0.0 / ::) → rewrite to 127.0.0.1: the daemon
+///   accepts every interface including loopback, so admin allow-list
+///   passes.
+/// - Specific non-loopback (e.g. `192.168.1.5:3100` from
+///   `--bind 192.168.1.5:3100 --i-know`) → keep as-is. Rewriting to
+///   127.0.0.1 would target an interface the daemon does NOT listen
+///   on, breaking polling forever (codex P2 round 3 on PR #62).
 fn normalize_to_loopback(bind: &str) -> String {
-    // Split host:port. IPv6 brackets must be honored.
     let (host, port) = if let Some(rest) = bind.strip_prefix('[') {
-        // "[host]:port" form
+        // "[host]:port" form (IPv6)
         if let Some(close) = rest.find(']') {
             let host = &rest[..close];
             let port = &rest[close + 1..].trim_start_matches(':');
             (host.to_string(), (*port).to_string())
         } else {
-            return format!("127.0.0.1:{}", bind);
+            return bind.to_string();
         }
     } else if let Some(idx) = bind.rfind(':') {
-        // "host:port" form
         (bind[..idx].to_string(), bind[idx + 1..].to_string())
     } else {
-        return format!("127.0.0.1:{}", bind);
+        return bind.to_string();
     };
 
-    let is_loopback = host == "127.0.0.1"
-        || host == "localhost"
-        || host == "::1"
-        || host.to_ascii_lowercase() == "[::1]";
+    let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
+    let is_wildcard = host == "0.0.0.0" || host == "::";
+
     if is_loopback {
-        // keep IPv4 / hostname as-is. IPv6 ::1 needs brackets when joined
-        // with :port so URLs parse correctly.
+        // IPv6 loopback needs bracket-wrapping when joined with :port.
         if host == "::1" {
             format!("[::1]:{port}")
         } else {
             format!("{host}:{port}")
         }
-    } else {
+    } else if is_wildcard {
         format!("127.0.0.1:{port}")
+    } else {
+        // Specific non-loopback (e.g. 192.168.1.5): keep as-is. The
+        // server's admin allow-list will likely reject this, but
+        // rewriting to 127.0.0.1 would point us at an interface the
+        // daemon is not listening on, which is strictly worse.
+        format!("{host}:{port}")
     }
 }
 
@@ -207,9 +216,20 @@ bind = "0.0.0.0:3100"
     }
 
     #[test]
-    fn non_loopback_bind_rewrites_host() {
+    fn wildcard_bind_rewrites_host_to_loopback() {
         assert_eq!(normalize_to_loopback("0.0.0.0:3100"), "127.0.0.1:3100");
-        assert_eq!(normalize_to_loopback("192.168.1.5:8080"), "127.0.0.1:8080");
         assert_eq!(normalize_to_loopback("[::]:3100"), "127.0.0.1:3100");
+    }
+
+    #[test]
+    fn specific_non_loopback_bind_preserved() {
+        // codex P2 round 3 on PR #62: a daemon bound to a specific NIC
+        // (e.g. 192.168.1.5) is NOT listening on loopback, so rewriting
+        // would break polling. Keep the bind as-is.
+        assert_eq!(
+            normalize_to_loopback("192.168.1.5:8080"),
+            "192.168.1.5:8080"
+        );
+        assert_eq!(normalize_to_loopback("10.0.0.42:3100"), "10.0.0.42:3100");
     }
 }
