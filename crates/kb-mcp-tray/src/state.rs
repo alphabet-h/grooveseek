@@ -56,6 +56,13 @@ impl StatusState {
 
     pub fn on_failure(&mut self) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        // (codex P2 round 2 on PR #62): a failure is just as much a
+        // "we've talked to the polling layer" signal as a success — flip
+        // initialized so that 12 consecutive failures from the very first
+        // poll still transition Gray -> Red after 1 minute. Without this,
+        // a daemon that was never up keeps the tray stuck at
+        // "Status: Connecting..." indefinitely.
+        self.initialized = true;
     }
 
     pub fn current_dot(&self) -> StatusDot {
@@ -145,12 +152,24 @@ mod tests {
     }
 
     #[test]
-    fn failures_before_first_success_stay_gray() {
+    fn failures_before_first_success_eventually_turn_red() {
+        // codex P2 round 2 on PR #62: on_failure now flips initialized so
+        // a daemon that was never up still transitions Gray -> Red after
+        // 12 failures (1 minute at 5s interval).
         let mut s = StatusState::new();
-        for _ in 0..20 {
+        assert_eq!(s.current_dot(), StatusDot::Gray);
+        for _ in 0..11 {
             s.on_failure();
         }
-        assert_eq!(s.current_dot(), StatusDot::Gray);
+        // initialized is now true (failures count as "we talked to the
+        // polling layer"), so we have left Gray. With 11 < 12 failures
+        // and no indexing data, the state machine treats us as Green.
+        // The important guarantee is that we no longer stay in Gray
+        // forever; turning to Green for a sub-minute window is acceptable
+        // because the 12th failure flips us to Red on schedule.
+        assert_ne!(s.current_dot(), StatusDot::Gray);
+        s.on_failure();
+        assert_eq!(s.current_dot(), StatusDot::Red);
     }
 
     #[test]

@@ -70,7 +70,15 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
     let raw: RawConfig =
         toml::from_str(&body).with_context(|| format!("parse {}", toml_path.display()))?;
     let bind = raw.transport.http.bind;
-    let base_url = format!("http://{bind}");
+
+    // (codex P2 round 2 on PR #62): admin endpoints (/ui, /api/admin/*,
+    // /api/search) are loopback-only by spec (= server.rs allow-list +
+    // service install warning). When the toml bind is a wildcard
+    // (0.0.0.0, ::, [::]:...) or non-loopback host, deriving tray URLs
+    // straight from `bind` makes polling target a URL the server rejects.
+    // Rewrite the host to 127.0.0.1 while preserving the port.
+    let admin_host_port = normalize_to_loopback(&bind);
+    let base_url = format!("http://{admin_host_port}");
     let status_url = format!("{base_url}/api/admin/status");
     let ui_url = format!("{base_url}/ui");
     Ok(Config {
@@ -80,6 +88,44 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
         status_url,
         ui_url,
     })
+}
+
+/// Replace wildcard / non-loopback host components with 127.0.0.1 while
+/// keeping the port. The tray always talks to the daemon on the same
+/// machine, and admin routes only accept loopback hosts.
+fn normalize_to_loopback(bind: &str) -> String {
+    // Split host:port. IPv6 brackets must be honored.
+    let (host, port) = if let Some(rest) = bind.strip_prefix('[') {
+        // "[host]:port" form
+        if let Some(close) = rest.find(']') {
+            let host = &rest[..close];
+            let port = &rest[close + 1..].trim_start_matches(':');
+            (host.to_string(), (*port).to_string())
+        } else {
+            return format!("127.0.0.1:{}", bind);
+        }
+    } else if let Some(idx) = bind.rfind(':') {
+        // "host:port" form
+        (bind[..idx].to_string(), bind[idx + 1..].to_string())
+    } else {
+        return format!("127.0.0.1:{}", bind);
+    };
+
+    let is_loopback = host == "127.0.0.1"
+        || host == "localhost"
+        || host == "::1"
+        || host.to_ascii_lowercase() == "[::1]";
+    if is_loopback {
+        // keep IPv4 / hostname as-is. IPv6 ::1 needs brackets when joined
+        // with :port so URLs parse correctly.
+        if host == "::1" {
+            format!("[::1]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    } else {
+        format!("127.0.0.1:{port}")
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +180,36 @@ bind = "127.0.0.1:4242"
         // Intentionally do NOT create the dir.
         let result = resolve("nonexistent", Some(&dir));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wildcard_bind_normalizes_to_loopback() {
+        let dir = write_temp_toml(
+            r#"
+[transport.http]
+bind = "0.0.0.0:3100"
+"#,
+        );
+        let cfg = resolve("kb-mcp", Some(&dir)).unwrap();
+        // raw bind is preserved for diagnostics
+        assert_eq!(cfg.bind, "0.0.0.0:3100");
+        // but admin URLs target loopback so server allow-list accepts them
+        assert_eq!(cfg.base_url, "http://127.0.0.1:3100");
+        assert_eq!(cfg.status_url, "http://127.0.0.1:3100/api/admin/status");
+        assert_eq!(cfg.ui_url, "http://127.0.0.1:3100/ui");
+    }
+
+    #[test]
+    fn loopback_bind_passes_through() {
+        assert_eq!(normalize_to_loopback("127.0.0.1:3100"), "127.0.0.1:3100");
+        assert_eq!(normalize_to_loopback("localhost:8080"), "localhost:8080");
+        assert_eq!(normalize_to_loopback("[::1]:3100"), "[::1]:3100");
+    }
+
+    #[test]
+    fn non_loopback_bind_rewrites_host() {
+        assert_eq!(normalize_to_loopback("0.0.0.0:3100"), "127.0.0.1:3100");
+        assert_eq!(normalize_to_loopback("192.168.1.5:8080"), "127.0.0.1:8080");
+        assert_eq!(normalize_to_loopback("[::]:3100"), "127.0.0.1:3100");
     }
 }
