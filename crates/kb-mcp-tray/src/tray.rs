@@ -28,7 +28,8 @@ pub struct Tray {
 /// (= Status::Gray => awaiting first poll).
 pub fn build(tooltip: &str) -> Result<Tray> {
     let menu = Menu::new();
-    let status_item = MenuItem::with_id(MenuId::new("status"), "Status: Connecting...", false, None);
+    let status_item =
+        MenuItem::with_id(MenuId::new("status"), "Status: Connecting...", false, None);
     let open_item = MenuItem::with_id(MenuId::new("open"), "Open Web UI", true, None);
     let start_item = MenuItem::with_id(MenuId::new("start"), "Start", true, None);
     let stop_item = MenuItem::with_id(MenuId::new("stop"), "Stop", false, None);

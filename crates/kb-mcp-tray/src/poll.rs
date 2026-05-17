@@ -30,10 +30,7 @@ pub async fn run(status_url: String, proxy: EventLoopProxy<UserEvent>) {
         interval.tick().await;
         match fetch(&client, &status_url).await {
             Ok(resp) => {
-                tracing::debug!(
-                    "polling success: indexing.active={}",
-                    resp.indexing.active
-                );
+                tracing::debug!("polling success: indexing.active={}", resp.indexing.active);
                 state.on_success(&resp);
             }
             Err(err) => {

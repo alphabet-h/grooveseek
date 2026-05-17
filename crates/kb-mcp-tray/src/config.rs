@@ -8,6 +8,9 @@ use std::path::PathBuf;
 pub struct Config {
     pub service_name: String,
     pub bind: String,
+    /// Reserved for future endpoint additions (= status_url / ui_url are
+    /// pre-built from this so we don't re-derive them per call site).
+    #[allow(dead_code)]
     pub base_url: String,
     pub status_url: String,
     pub ui_url: String,
