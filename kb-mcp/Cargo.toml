@@ -7,7 +7,11 @@ authors = ["koshian"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alphabet-h/kb-mcp"
 homepage = "https://github.com/alphabet-h/kb-mcp"
-readme = "README.md"
+# README は repo root に残してある (= GitHub の repo home で表示される)。
+# workspace 化 (feature-44 PR-1) でこの Cargo.toml は kb-mcp/ に動いたので、
+# crates.io publish / cargo package validation が見れるよう relative path で
+# 上 1 階層を指す (= codex P2 round 2 on PR #61)。
+readme = "../README.md"
 keywords = ["mcp", "rag", "search", "embedding", "sqlite-vec"]
 categories = ["command-line-utilities", "database", "text-processing"]
 
