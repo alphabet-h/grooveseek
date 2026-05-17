@@ -20,10 +20,12 @@ kb-mcp.toml
 # tests/fixtures/kb-bench/ generate `.kb-mcp.db` next to them when indexed.
 **/.kb-mcp.db
 
-# Deployment recipe templates under examples/deployments/ are meant to be
+# Deployment recipe templates under kb-mcp/examples/deployments/ are meant to be
 # committed (they are example artifacts, not user-local runtime files).
-!examples/deployments/**/.mcp.json
-!examples/deployments/**/kb-mcp.toml
+# (feature-44 PR-1 / codex P3 round 3 on PR #61): updated path after workspace
+# split moved examples/ to kb-mcp/examples/.
+!kb-mcp/examples/deployments/**/.mcp.json
+!kb-mcp/examples/deployments/**/kb-mcp.toml
 
 # /codex-review skill working directory (= per-round baseline JSON snapshots)
 .codex-review-tmp/

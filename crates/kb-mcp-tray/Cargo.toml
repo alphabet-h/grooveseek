@@ -7,7 +7,9 @@ authors = ["koshian"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alphabet-h/kb-mcp"
 homepage = "https://github.com/alphabet-h/kb-mcp"
-readme = "README.md"
+# NOTE (codex P2 round 3 on PR #61): `publish = false` の internal crate なので
+# readme field は不要。crates/kb-mcp-tray/README.md は存在せず metadata
+# validation が fail するため削除。
 publish = false
 
 # cargo-dist per-crate target gating: kb-mcp-tray.exe is Windows-only, so we
