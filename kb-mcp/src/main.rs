@@ -261,6 +261,20 @@ enum ServiceSubcommand {
     },
     /// List all installed kb-mcp service instances
     List,
+    /// (Windows-only) Install only the kb-mcp-tray.exe shell:startup shortcut
+    /// without touching the daemon registration.
+    TrayInstall {
+        #[arg(long, default_value = "kb-mcp", value_parser = kb_mcp::service::validate_service_name)]
+        service_name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// (Windows-only) Remove only the kb-mcp-tray.exe shell:startup shortcut
+    /// without touching the daemon registration.
+    TrayUninstall {
+        #[arg(long, default_value = "kb-mcp", value_parser = kb_mcp::service::validate_service_name)]
+        service_name: String,
+    },
 }
 
 /// Parse a `[0.0, 1.0]` f32 from CLI. NaN / Inf / out-of-range は reject。
@@ -1008,6 +1022,15 @@ fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
         ServiceSubcommand::List => {
             let text = kb_mcp::service::status::run_list()?;
             eprintln!("{}", text);
+        }
+        ServiceSubcommand::TrayInstall {
+            service_name,
+            force,
+        } => {
+            kb_mcp::service::install::run_tray_install(&service_name, force)?;
+        }
+        ServiceSubcommand::TrayUninstall { service_name } => {
+            kb_mcp::service::uninstall::run_tray_uninstall(&service_name)?;
         }
     }
     Ok(())

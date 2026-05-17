@@ -22,6 +22,16 @@ pub fn run(params: UninstallParams) -> Result<()> {
     backend().uninstall(&name)?;
     eprintln!("Removed service unit for '{}'.", name);
 
+    // (feature-44 PR-3) Best-effort tray autostart cleanup. uninstall_autostart
+    // is idempotent — a missing shortcut is a no-op. Failure is logged as a
+    // warning so the rest of the uninstall (config_home cleanup) still runs.
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = kb_mcp_tray::install::uninstall_autostart(&name) {
+            eprintln!("Warning: tray autostart cleanup failed: {e}");
+        }
+    }
+
     if params.purge {
         let home = resolve_config_home(&name)?;
         // `.kb-mcp.db` lives next to the user's KB (= `resolve_db_path(kb_path)`),
@@ -68,4 +78,17 @@ pub fn run(params: UninstallParams) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_tray_uninstall(service_name: &str) -> Result<()> {
+    let name = validate_service_name(service_name).map_err(|e| anyhow!(e))?;
+    kb_mcp_tray::install::uninstall_autostart(&name)?;
+    eprintln!("Tray autostart shortcut removed for service '{}'", name);
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_tray_uninstall(_service_name: &str) -> Result<()> {
+    Err(anyhow!("tray-uninstall is only supported on Windows"))
 }
