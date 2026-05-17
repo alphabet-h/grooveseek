@@ -40,8 +40,8 @@ pub fn init_file_logger() -> anyhow::Result<()> {
         .set(guard)
         .map_err(|_| anyhow::anyhow!("logger already initialized"))?;
 
-    let filter = EnvFilter::try_from_env("KB_MCP_TRAY_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_env("KB_MCP_TRAY_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)

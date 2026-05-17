@@ -4,7 +4,11 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "kb-mcp-tray", version, about = "kb-mcp daemon tray monitor (Windows)")]
+#[command(
+    name = "kb-mcp-tray",
+    version,
+    about = "kb-mcp daemon tray monitor (Windows)"
+)]
 pub struct Cli {
     /// Service name (matches `--service-name` passed to `kb-mcp service install`)
     #[arg(long, default_value = "kb-mcp")]

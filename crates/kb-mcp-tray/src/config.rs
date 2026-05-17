@@ -33,7 +33,9 @@ struct RawHttp {
 
 impl Default for RawHttp {
     fn default() -> Self {
-        Self { bind: default_bind() }
+        Self {
+            bind: default_bind(),
+        }
     }
 }
 
@@ -62,8 +64,8 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
 
     let body = std::fs::read_to_string(&toml_path)
         .with_context(|| format!("read {}", toml_path.display()))?;
-    let raw: RawConfig = toml::from_str(&body)
-        .with_context(|| format!("parse {}", toml_path.display()))?;
+    let raw: RawConfig =
+        toml::from_str(&body).with_context(|| format!("parse {}", toml_path.display()))?;
     let bind = raw.transport.http.bind;
     let base_url = format!("http://{bind}");
     let status_url = format!("{base_url}/api/admin/status");
@@ -124,10 +126,8 @@ bind = "127.0.0.1:4242"
 
     #[test]
     fn fails_when_toml_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "kb-mcp-tray-cfg-missing-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kb-mcp-tray-cfg-missing-{}", std::process::id()));
         // Intentionally do NOT create the dir.
         let result = resolve("nonexistent", Some(&dir));
         assert!(result.is_err());

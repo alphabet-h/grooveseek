@@ -1,11 +1,11 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 #[cfg(target_os = "windows")]
-mod logger;
-#[cfg(target_os = "windows")]
 mod cli;
 #[cfg(target_os = "windows")]
 mod config;
+#[cfg(target_os = "windows")]
+mod logger;
 #[cfg(target_os = "windows")]
 mod tray;
 
@@ -32,7 +32,9 @@ fn main() -> anyhow::Result<()> {
     // Task 19 (PR-2) で fail-fast 化 (= `config::resolve(...)?` 直書き、spec
     // section 6 末尾の「kb-mcp.toml 不在 → fail-fast」と一致)。
     let cfg = config::resolve(&args.service_name, args.kb_path.as_ref()).or_else(|e| {
-        tracing::warn!("config resolve failed: {e}, falling back to default bind (PR-1 skeleton only)");
+        tracing::warn!(
+            "config resolve failed: {e}, falling back to default bind (PR-1 skeleton only)"
+        );
         Ok::<_, anyhow::Error>(config::Config {
             service_name: args.service_name.clone(),
             bind: "127.0.0.1:3100".into(),
