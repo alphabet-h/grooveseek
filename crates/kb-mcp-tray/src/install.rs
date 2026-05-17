@@ -82,6 +82,36 @@ fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Preflight check: verify that `tray_exe_path` exists and that there is
+/// no pre-existing autostart entry for this service (unless `force` is
+/// set). Used by `kb-mcp service install --with-tray` to validate the
+/// tray side BEFORE registering the daemon, so a tray failure does not
+/// leave a half-installed service (codex P2 round 1 on PR #63).
+pub fn preflight_check(service_name: &str, tray_exe_path: &Path, force: bool) -> Result<()> {
+    if !tray_exe_path.exists() {
+        return Err(anyhow!(
+            "{} not found. Install kb-mcp-tray.exe from the v0.9.0 release zip into the same directory as kb-mcp.exe.",
+            tray_exe_path.display()
+        ));
+    }
+    if !force {
+        let check = build_duplicate_check_script(service_name);
+        let out = run_ps(&check)?;
+        let v: serde_json::Value =
+            serde_json::from_str(out.trim()).context("parse duplicate check JSON")?;
+        if v["startup"].as_bool().unwrap_or(false)
+            || v["run"].as_bool().unwrap_or(false)
+            || v["task"].as_bool().unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "tray autostart entry already exists for service '{}'. Use --force to overwrite.",
+                service_name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Install the tray autostart shortcut. `force=true` skips the
 /// duplicate-check. Returns the absolute path of the created `.lnk`.
 pub fn install_autostart(

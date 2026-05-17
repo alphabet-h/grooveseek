@@ -102,6 +102,33 @@ pub fn run(params: InstallParams) -> Result<()> {
         force: params.force,
     };
 
+    // (codex P2 round 1 on PR #63): preflight the tray side BEFORE
+    // registering the daemon so a tray failure does not leave a
+    // half-installed service. Catches: non-Windows host, missing
+    // kb-mcp-tray.exe sibling, pre-existing autostart entry without
+    // --force. The actual `install_autostart` call below runs only if
+    // preflight passed.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    let preflight_tray_exe: Option<PathBuf> = if params.with_tray {
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err(anyhow!("--with-tray is only supported on Windows"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let bin_dir = ctx
+                .binary_path
+                .parent()
+                .ok_or_else(|| anyhow!("no parent directory for the current kb-mcp.exe"))?
+                .to_path_buf();
+            let tray_exe = bin_dir.join("kb-mcp-tray.exe");
+            kb_mcp_tray::install::preflight_check(&name, &tray_exe, params.force)?;
+            Some(tray_exe)
+        }
+    } else {
+        None
+    };
+
     backend().install(&ctx)?;
     eprintln!(
         "Service '{}' installed (config_home: {}).",
@@ -109,33 +136,14 @@ pub fn run(params: InstallParams) -> Result<()> {
         config_home.display()
     );
 
-    if params.with_tray {
-        #[cfg(target_os = "windows")]
-        {
-            let bin_dir = std::env::current_exe()?
-                .parent()
-                .ok_or_else(|| anyhow!("no parent directory for the current kb-mcp.exe"))?
-                .to_path_buf();
-            let tray_exe = bin_dir.join("kb-mcp-tray.exe");
-            if !tray_exe.exists() {
-                return Err(anyhow!(
-                    "--with-tray specified but {} not found. \
-                     Install kb-mcp-tray.exe from the v0.9.0 release zip into the same directory as kb-mcp.exe.",
-                    tray_exe.display()
-                ));
-            }
-            let lnk = kb_mcp_tray::install::install_autostart(
-                &name,
-                &tray_exe,
-                &config_home,
-                params.force,
-            )?;
-            eprintln!("Tray autostart shortcut: {}", lnk.display());
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            return Err(anyhow!("--with-tray is only supported on Windows"));
-        }
+    // Tray install runs ONLY if preflight passed above. force=true is
+    // safe here because preflight has already validated the duplicate-
+    // check rule (= duplicate without --force was rejected before
+    // backend().install() ran).
+    #[cfg(target_os = "windows")]
+    if let Some(tray_exe) = preflight_tray_exe {
+        let lnk = kb_mcp_tray::install::install_autostart(&name, &tray_exe, &config_home, true)?;
+        eprintln!("Tray autostart shortcut: {}", lnk.display());
     }
 
     Ok(())
