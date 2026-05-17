@@ -24,3 +24,6 @@ kb-mcp.toml
 # committed (they are example artifacts, not user-local runtime files).
 !examples/deployments/**/.mcp.json
 !examples/deployments/**/kb-mcp.toml
+
+# /codex-review skill working directory (= per-round baseline JSON snapshots)
+.codex-review-tmp/

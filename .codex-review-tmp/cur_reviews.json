@@ -1,9 +1,0 @@
-[
-  {
-    "body": "\n### 💡 Codex Review\n\nhttps://github.com/alphabet-h/kb-mcp/blob/0d6f5e7830628602c182e24844382605dffa7472/kb-mcp/tests/index_progress_cli.rs#L33-L34\n**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Point subprocess tests at the workspace target dir**\n\nAfter this crate move, `env!(\"CARGO_MANIFEST_DIR\")` is `/workspace/kb-mcp/kb-mcp`, while Cargo still places workspace binaries under `/workspace/kb-mcp/target` by default. These tests therefore try to spawn `kb-mcp/target/{debug,release}/kb-mcp`, which does not exist when running from the workspace unless `CARGO_TARGET_DIR` is manually set, so `cargo test -p kb-mcp --test index_progress_cli` fails before exercising the CLI. Use Cargo's `CARGO_BIN_EXE_kb-mcp` or resolve the workspace target directory instead.\n    \n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
-    "commit_id": "0d6f5e7830628602c182e24844382605dffa7472",
-    "id": 4305179552,
-    "state": "COMMENTED",
-    "submitted_at": "2026-05-17T09:11:21Z"
-  }
-]
