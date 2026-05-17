@@ -7,11 +7,15 @@ mod config;
 #[cfg(target_os = "windows")]
 mod logger;
 #[cfg(target_os = "windows")]
+mod daemon;
+#[cfg(target_os = "windows")]
 mod poll;
 #[cfg(target_os = "windows")]
 mod state;
 #[cfg(target_os = "windows")]
 mod tray;
+#[cfg(target_os = "windows")]
+mod ui;
 
 /// User-defined events sent through the tao EventLoopProxy from the tokio
 /// polling task (StatusUpdate) and the muda menu thread (MenuClicked /
