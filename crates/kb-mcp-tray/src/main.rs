@@ -6,6 +6,8 @@ mod logger;
 mod cli;
 #[cfg(target_os = "windows")]
 mod config;
+#[cfg(target_os = "windows")]
+mod tray;
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
@@ -18,9 +20,37 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
+    use tao::event::Event;
+    use tao::event_loop::{ControlFlow, EventLoopBuilder};
+
     logger::install_panic_hook();
     logger::init_file_logger()?;
     let args = cli::parse();
-    tracing::info!("kb-mcp-tray starting for service='{}'", args.service_name);
-    Ok(())
+
+    // PR-1 skeleton: PR-1 では polling/menu なしなので config 不在でも tray
+    // icon が出ることを確認するため fallback で進む = debug aid 専用。
+    // Task 19 (PR-2) で fail-fast 化 (= `config::resolve(...)?` 直書き、spec
+    // section 6 末尾の「kb-mcp.toml 不在 → fail-fast」と一致)。
+    let cfg = config::resolve(&args.service_name, args.kb_path.as_ref()).or_else(|e| {
+        tracing::warn!("config resolve failed: {e}, falling back to default bind (PR-1 skeleton only)");
+        Ok::<_, anyhow::Error>(config::Config {
+            service_name: args.service_name.clone(),
+            bind: "127.0.0.1:3100".into(),
+            base_url: "http://127.0.0.1:3100".into(),
+            status_url: "http://127.0.0.1:3100/api/admin/status".into(),
+            ui_url: "http://127.0.0.1:3100/ui".into(),
+        })
+    })?;
+    tracing::info!("config resolved: bind={}", cfg.bind);
+
+    let event_loop = EventLoopBuilder::<()>::with_user_event().build();
+    let _tray = tray::build(&format!("kb-mcp ({})", cfg.service_name))?;
+    tracing::info!("tray icon started");
+
+    event_loop.run(move |event, _, control_flow| {
+        if let Event::LoopDestroyed = event {
+            tracing::info!("tray quitting");
+        }
+        *control_flow = ControlFlow::Wait;
+    });
 }
