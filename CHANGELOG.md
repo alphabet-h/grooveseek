@@ -20,6 +20,22 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   is published only for `x86_64-pc-windows-msvc`; the main `kb-mcp` binary
   inherits the workspace-wide 4-target matrix (Linux x86_64/aarch64, macOS
   aarch64, Windows x86_64).
+- (feature-44 PR-2) `kb-mcp-tray.exe` polls `/api/admin/status` every 5
+  seconds (3 second timeout) and renders a 4-state status dot:
+  - **green** = daemon healthy (last poll succeeded, not indexing)
+  - **yellow** = daemon indexing (`indexing.active == true`)
+  - **red** = daemon down for >= 1 minute (= 12 consecutive failed polls)
+  - **gray** = polling pending (pre-first-poll)
+- (feature-44 PR-2) Tray menu with 6 actionable items + 3 separators:
+  Status (read-only) / Open Web UI / Start / Stop / Restart / Quit Tray.
+  Start enabled only when Red/Gray; Stop and Restart enabled only when
+  Green/Yellow.
+- (feature-44 PR-2) Daemon control via async PowerShell
+  `Start-ScheduledTask` / `Stop-ScheduledTask` cmdlets (= reuses the
+  feature-43 PowerShell path, runs on a dedicated tokio runtime so the
+  main event loop never blocks).
+- (feature-44 PR-2) Open Web UI menu item launches the default browser
+  at `<bind>/ui`.
 
 ## [0.8.3] - 2026-05-13
 
