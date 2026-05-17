@@ -7,6 +7,8 @@ mod config;
 #[cfg(target_os = "windows")]
 mod logger;
 #[cfg(target_os = "windows")]
+mod state;
+#[cfg(target_os = "windows")]
 mod tray;
 
 #[cfg(not(target_os = "windows"))]
