@@ -1,5 +1,8 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+#[cfg(target_os = "windows")]
+mod logger;
+
 #[cfg(not(target_os = "windows"))]
 fn main() {
     eprintln!(
@@ -11,6 +14,8 @@ fn main() {
 
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<()> {
-    println!("kb-mcp-tray skeleton: not yet implemented");
+    logger::install_panic_hook();
+    logger::init_file_logger()?;
+    tracing::info!("kb-mcp-tray starting (skeleton mode)");
     Ok(())
 }
