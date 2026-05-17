@@ -27,6 +27,27 @@ fn main() -> anyhow::Result<()> {
     logger::init_file_logger()?;
     let args = cli::parse();
 
+    // (codex P3 round 4 on PR #61): wire up --debug to attach the parent
+    // process's console if possible (= cmd.exe with `--debug`), otherwise
+    // alloc a fresh console. Without this, the flag is parsed but ignored,
+    // which is what GUI subsystem release builds discard stdout/stderr
+    // make confusing. Plan Task 19 (PR-2) originally scheduled this; pulled
+    // forward to PR-1 to avoid shipping a dead flag in the skeleton release.
+    if args.debug {
+        unsafe {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn AttachConsole(dwProcessId: u32) -> i32;
+                fn AllocConsole() -> i32;
+            }
+            const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+                let _ = AllocConsole();
+            }
+        }
+        tracing::info!("--debug: console attached");
+    }
+
     // PR-1 skeleton: PR-1 では polling/menu なしなので config 不在でも tray
     // icon が出ることを確認するため fallback で進む = debug aid 専用。
     // Task 19 (PR-2) で fail-fast 化 (= `config::resolve(...)?` 直書き、spec
