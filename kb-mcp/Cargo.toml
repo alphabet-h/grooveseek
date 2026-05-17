@@ -37,7 +37,7 @@ toml = "0.8"
 # user-customized configs (= regression discovered during feature-44 dogfood).
 # `toml_edit` keeps the original document layout while letting us overwrite
 # only the CLI-managed fields (kb_path / [transport.http].bind).
-toml_edit = "0.22"
+toml_edit = "0.25"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 chrono = "0.4"

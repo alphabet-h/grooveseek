@@ -199,7 +199,7 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
     // cannot contain `'`, so a path like `/Users/O'Brien/kb` would produce
     // invalid TOML. `toml_edit::value()` emits a basic-quoted string with
     // backslash escaping (same as the legacy `toml::Value` path).
-    use toml_edit::{DocumentMut, value};
+    use toml_edit::{DocumentMut, Item, Table, value};
 
     let mut doc: DocumentMut = if path.exists() {
         let existing = std::fs::read_to_string(path)
@@ -214,11 +214,40 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
         DocumentMut::new()
     };
 
-    // `doc[k1][k2]` auto-creates intermediate tables when the path is
-    // absent. Existing `[transport]` / `[transport.http]` tables (and any
-    // sibling keys under them) are retained.
     doc["kb_path"] = value(kb_path.display().to_string());
-    doc["transport"]["http"]["bind"] = value(bind.to_string());
+
+    // (codex-review P2 round 1 on PR #65) The naive
+    // `doc["transport"]["http"]["bind"] = value(...)` form panics at runtime
+    // when an existing toml has `transport` (or `transport.http`) as a non-
+    // table item (= scalar, array). Hand-edited configs occasionally hit
+    // this; surface a descriptive error pointing at the path instead of
+    // exploding. Also force `set_implicit(true/false)` so a fresh install
+    // produces the canonical `[transport.http]` block form instead of the
+    // dotted-key style that `IndexMut` auto-creates by default.
+    let root = doc.as_table_mut();
+    let transport_item = root.entry("transport").or_insert_with(|| {
+        let mut t = Table::new();
+        t.set_implicit(true); // [transport] header is unused; [transport.http] is the canonical block.
+        Item::Table(t)
+    });
+    let transport = transport_item.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "kb-mcp.toml の `transport` キーが table ではありません: {}。手動で修正してから再 install してください",
+            path.display()
+        )
+    })?;
+    let http_item = transport.entry("http").or_insert_with(|| {
+        let mut t = Table::new();
+        t.set_implicit(false); // emit `[transport.http]` header verbatim on fresh installs.
+        Item::Table(t)
+    });
+    let http = http_item.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "kb-mcp.toml の `[transport.http]` セクションが table ではありません: {}。手動で修正してから再 install してください",
+            path.display()
+        )
+    })?;
+    http["bind"] = value(bind.to_string());
 
     std::fs::write(path, doc.to_string())?;
     Ok(())
@@ -302,6 +331,41 @@ mod tests {
             parsed["transport"]["http"]["bind"].as_str().unwrap(),
             "127.0.0.1:3100"
         );
+        // (P2 round 1 on PR #65) Lock down the canonical `[transport.http]`
+        // header form for fresh installs. Without `set_implicit(false)` on
+        // the new table, toml_edit emits dotted-key syntax
+        // (`transport.http.bind = ...`) which parses identically but is
+        // unfamiliar to users reading the example files.
+        assert!(
+            body.contains("[transport.http]"),
+            "fresh install should emit explicit [transport.http] header, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn write_toml_errors_when_existing_transport_is_scalar_not_table() {
+        // (P2 round 1 on PR #65) Defense against a panic when a hand-edited
+        // toml has `transport = "something"` (= scalar) at top level: the
+        // naive `doc["transport"]["http"]` IndexMut would panic. The merge
+        // path must instead surface a descriptive error so the user can
+        // fix the file by hand.
+        let tmp = TempDir::new("scalar");
+        let toml_path = tmp.path().join("kb-mcp.toml");
+        std::fs::write(&toml_path, "kb_path = \"/old\"\ntransport = \"stdio\"\n").unwrap();
+
+        let result = write_toml(&toml_path, &PathBuf::from("/new"), "127.0.0.1:3100");
+        assert!(
+            result.is_err(),
+            "expected error when `transport` is a scalar"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("`transport`") && err.contains("table"),
+            "error should explain that `transport` is not a table, got: {err}"
+        );
+        // File must remain untouched (= no partial overwrite).
+        let body = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(body.contains("transport = \"stdio\""));
     }
 
     #[test]
