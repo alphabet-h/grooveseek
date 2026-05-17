@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 description = "MCP server providing semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a Markdown / plain-text knowledge base."
 authors = ["koshian"]
@@ -31,6 +31,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_bw = "2"
 toml = "0.8"
+# [v0.9.2 hot-fix] Preserve comments / field ordering / formatting when
+# `kb-mcp service install --force` re-runs over an existing kb-mcp.toml.
+# `toml` (= serde-based) drops comments on round-trip, which destroys
+# user-customized configs (= regression discovered during feature-44 dogfood).
+# `toml_edit` keeps the original document layout while letting us overwrite
+# only the CLI-managed fields (kb_path / [transport.http].bind).
+toml_edit = "0.22"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 chrono = "0.4"

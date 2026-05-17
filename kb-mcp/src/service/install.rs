@@ -184,15 +184,43 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
     // any other section (e.g. `[index]`) would crash `kb-mcp serve` at
     // startup with a parse error.
     //
-    // codex P2 round 4 on PR #56: single-quoted TOML literal strings cannot
-    // contain `'`, so a path like `/Users/O'Brien/kb` would produce invalid
-    // TOML. Use `toml::Value::String(...).to_string()` which emits a proper
-    // basic-quoted string with backslash escaping for all path characters
-    // (including `\U` on Windows, `'`, etc).
-    let kb_lit = toml::Value::String(kb_path.display().to_string()).to_string();
-    let bind_lit = toml::Value::String(bind.to_string()).to_string();
-    let content = format!("kb_path = {kb_lit}\n\n[transport.http]\nbind = {bind_lit}\n");
-    std::fs::write(path, content)?;
+    // (v0.9.2 hot-fix) When `path` already exists (= `install --force` re-
+    // running over a user-customized toml), parse with `toml_edit` and
+    // overwrite ONLY `kb_path` and `[transport.http].bind`. All other
+    // user-set fields (`model`, `fastembed_cache_dir`, `exclude_dirs`,
+    // `[best_practice]`, etc.), inline comments, and field ordering are
+    // preserved verbatim. Without this, v0.9.0 / v0.9.1 dogfood revealed
+    // that `--force` replaced a 1.6 KB user config with a 5-line minimal
+    // toml — making the daemon crash with `embedding model mismatch`
+    // when the DB had been indexed with `bge-m3` (1024 dim) but the
+    // regenerated toml fell back to the default `bge-small` (384 dim).
+    //
+    // (codex P2 round 4 on PR #56) Single-quoted TOML literal strings
+    // cannot contain `'`, so a path like `/Users/O'Brien/kb` would produce
+    // invalid TOML. `toml_edit::value()` emits a basic-quoted string with
+    // backslash escaping (same as the legacy `toml::Value` path).
+    use toml_edit::{DocumentMut, value};
+
+    let mut doc: DocumentMut = if path.exists() {
+        let existing = std::fs::read_to_string(path)
+            .with_context(|| format!("kb-mcp.toml 読込失敗: {}", path.display()))?;
+        existing.parse::<DocumentMut>().with_context(|| {
+            format!(
+                "kb-mcp.toml が invalid TOML です: {}。手動で修正してから再 install してください (--force でも auto-overwrite しません)",
+                path.display()
+            )
+        })?
+    } else {
+        DocumentMut::new()
+    };
+
+    // `doc[k1][k2]` auto-creates intermediate tables when the path is
+    // absent. Existing `[transport]` / `[transport.http]` tables (and any
+    // sibling keys under them) are retained.
+    doc["kb_path"] = value(kb_path.display().to_string());
+    doc["transport"]["http"]["bind"] = value(bind.to_string());
+
+    std::fs::write(path, doc.to_string())?;
     Ok(())
 }
 
@@ -223,4 +251,160 @@ pub fn resolve_kb_path(flag: Option<PathBuf>, toml_path: Option<PathBuf>) -> Res
             )
         })?;
     Ok(PathBuf::from(kb_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // CLAUDE.local.md: do NOT use `tempfile` crate. Build a unique path under
+    // `std::env::temp_dir()` from pid + nanos + counter, and clean up via Drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("kb-mcp-write-toml-test-{tag}-{pid}-{nanos}-{seq}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_toml_creates_minimal_doc_when_file_absent() {
+        let tmp = TempDir::new("new");
+        let toml_path = tmp.path().join("kb-mcp.toml");
+        let kb = PathBuf::from("/tmp/kb");
+        write_toml(&toml_path, &kb, "127.0.0.1:3100").unwrap();
+
+        let body = std::fs::read_to_string(&toml_path).unwrap();
+        let parsed: toml_edit::DocumentMut = body.parse().unwrap();
+        assert_eq!(parsed["kb_path"].as_str().unwrap(), "/tmp/kb");
+        assert_eq!(
+            parsed["transport"]["http"]["bind"].as_str().unwrap(),
+            "127.0.0.1:3100"
+        );
+    }
+
+    #[test]
+    fn write_toml_preserves_user_customized_fields_on_force_rewrite() {
+        // Regression test for the v0.9.0 dogfood finding: `install --force`
+        // used to obliterate `model` / `fastembed_cache_dir` / `exclude_dirs`
+        // and crash the daemon with `embedding model mismatch`. The merge
+        // logic must keep every key that isn't `kb_path` or
+        // `[transport.http].bind`.
+        let tmp = TempDir::new("preserve");
+        let toml_path = tmp.path().join("kb-mcp.toml");
+        let original = concat!(
+            "kb_path = \"/old/path\"\n",
+            "model = \"bge-m3\"\n",
+            "fastembed_cache_dir = \"/cache/hf\"\n",
+            "exclude_dirs = [\".obsidian\", \"weeknotes\"]\n",
+            "\n",
+            "[best_practice]\n",
+            "path_templates = [\"best-practices/{target}/PERFECT.md\"]\n",
+            "\n",
+            "[transport.http]\n",
+            "bind = \"127.0.0.1:3000\"\n",
+        );
+        std::fs::write(&toml_path, original).unwrap();
+
+        write_toml(&toml_path, &PathBuf::from("/new/path"), "127.0.0.1:3100").unwrap();
+
+        let body = std::fs::read_to_string(&toml_path).unwrap();
+        let doc: toml_edit::DocumentMut = body.parse().unwrap();
+        // CLI-managed fields overwritten:
+        assert_eq!(doc["kb_path"].as_str().unwrap(), "/new/path");
+        assert_eq!(
+            doc["transport"]["http"]["bind"].as_str().unwrap(),
+            "127.0.0.1:3100"
+        );
+        // User-customized fields preserved:
+        assert_eq!(doc["model"].as_str().unwrap(), "bge-m3");
+        assert_eq!(doc["fastembed_cache_dir"].as_str().unwrap(), "/cache/hf");
+        let exclude_dirs = doc["exclude_dirs"].as_array().unwrap();
+        assert_eq!(exclude_dirs.len(), 2);
+        assert_eq!(exclude_dirs.get(0).unwrap().as_str().unwrap(), ".obsidian");
+        assert_eq!(exclude_dirs.get(1).unwrap().as_str().unwrap(), "weeknotes");
+        let path_templates = doc["best_practice"]["path_templates"].as_array().unwrap();
+        assert_eq!(path_templates.len(), 1);
+        assert_eq!(
+            path_templates.get(0).unwrap().as_str().unwrap(),
+            "best-practices/{target}/PERFECT.md"
+        );
+    }
+
+    #[test]
+    fn write_toml_preserves_inline_comments_on_force_rewrite() {
+        // toml_edit (= unlike `toml`/serde) round-trips comments. Verify
+        // explicitly so we catch a regression if the dep gets swapped back.
+        let tmp = TempDir::new("comments");
+        let toml_path = tmp.path().join("kb-mcp.toml");
+        let original = concat!(
+            "# top-level comment about kb_path\n",
+            "kb_path = \"/old/path\"\n",
+            "# inline reasoning for model choice\n",
+            "model = \"bge-m3\"\n",
+            "\n",
+            "[transport.http]\n",
+            "# bind is loopback-only by default\n",
+            "bind = \"127.0.0.1:3100\"\n",
+        );
+        std::fs::write(&toml_path, original).unwrap();
+
+        write_toml(&toml_path, &PathBuf::from("/new/path"), "127.0.0.1:3200").unwrap();
+
+        let body = std::fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            body.contains("# top-level comment about kb_path"),
+            "lost top-level comment:\n{body}"
+        );
+        assert!(
+            body.contains("# inline reasoning for model choice"),
+            "lost model comment:\n{body}"
+        );
+        assert!(
+            body.contains("# bind is loopback-only by default"),
+            "lost bind comment:\n{body}"
+        );
+    }
+
+    #[test]
+    fn write_toml_errors_on_invalid_toml_instead_of_overwriting() {
+        // If the existing file is unparseable, refuse to overwrite — the
+        // user might have an in-progress hand-edit. Surface a clear error
+        // pointing at the path so they can fix it manually.
+        let tmp = TempDir::new("invalid");
+        let toml_path = tmp.path().join("kb-mcp.toml");
+        std::fs::write(&toml_path, "this = is = not = valid = toml").unwrap();
+
+        let result = write_toml(&toml_path, &PathBuf::from("/new/path"), "127.0.0.1:3100");
+        assert!(result.is_err(), "expected error on invalid TOML");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid TOML"),
+            "error should mention invalid TOML, got: {err}"
+        );
+        // Existing (invalid) file must not have been overwritten.
+        let body = std::fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(body, "this = is = not = valid = toml");
+    }
 }

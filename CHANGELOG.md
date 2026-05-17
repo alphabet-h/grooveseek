@@ -4,6 +4,38 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-05-18
+
+### Fixed
+
+- (v0.9.2 hot-fix) **`kb-mcp service install --force` config-preservation
+  regression** (carried over since v0.8.0): the install path used to
+  rewrite `kb-mcp.toml` from scratch with only `kb_path` + `[transport.http]
+  .bind`, obliterating every user-customized field (`model`,
+  `fastembed_cache_dir`, `exclude_dirs`, `[best_practice]`, etc.). On
+  a daemon whose index DB was built with `bge-m3` (1024-dim), this made
+  `kb-mcp serve` crash at startup with `embedding model mismatch`
+  because the regenerated toml fell back to the default `bge-small`
+  (384-dim). Discovered during the feature-44 / v0.9.0 dogfood and
+  documented as 罠 10 in `.dev/knowledge/feature-44-summary.md`.
+
+  v0.9.2 switches the install path to `toml_edit` for the merge step.
+  When `kb-mcp.toml` already exists, it is parsed in place and only
+  `kb_path` and `[transport.http].bind` are overwritten — every other
+  key, inline comment, and the original field ordering are preserved
+  verbatim. If the existing toml is unparseable, the install fails with
+  a descriptive error pointing at the path so the user can fix it by
+  hand rather than silently lose their config.
+
+  Behaviour delta:
+  - `install` over a fresh / absent toml: unchanged (= minimal toml).
+  - `install --force` over an existing toml: now merges. The user
+    custom fields survive intact.
+  - Invalid pre-existing toml: now errors out instead of overwriting.
+
+  4 new unit tests under `src/service/install.rs::tests` cover the
+  fresh-write, merge, comment-preservation, and invalid-TOML paths.
+
 ## [0.9.1] - 2026-05-17
 
 ### Fixed
