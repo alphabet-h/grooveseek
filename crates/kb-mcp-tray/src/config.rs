@@ -71,13 +71,18 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
         toml::from_str(&body).with_context(|| format!("parse {}", toml_path.display()))?;
     let bind = raw.transport.http.bind;
 
-    // (codex P2 round 2 on PR #62): admin endpoints (/ui, /api/admin/*,
-    // /api/search) are loopback-only by spec (= server.rs allow-list +
-    // service install warning). When the toml bind is a wildcard
-    // (0.0.0.0, ::, [::]:...) or non-loopback host, deriving tray URLs
-    // straight from `bind` makes polling target a URL the server rejects.
-    // Rewrite the host to 127.0.0.1 while preserving the port.
-    let admin_host_port = normalize_to_loopback(&bind);
+    // (codex P2 rounds 2-4 on PR #62): admin endpoints (/ui,
+    // /api/admin/*, /api/search) are loopback-only by spec, so the tray
+    // always targets 127.0.0.1:<port> regardless of the daemon's bind.
+    // - Wildcard binds (0.0.0.0 / ::): daemon listens on loopback too,
+    //   so loopback polling succeeds. No warning.
+    // - Specific non-loopback binds (e.g. 192.168.1.5): daemon does NOT
+    //   listen on loopback, so loopback polling will fail with
+    //   "connection refused". The user is expected to use `--with-tray`
+    //   together with a loopback-capable bind (loopback or wildcard);
+    //   we emit a warning so the misconfiguration is discoverable from
+    //   the tray log.
+    let admin_host_port = normalize_to_loopback_with_warning(&bind);
     let base_url = format!("http://{admin_host_port}");
     let status_url = format!("{base_url}/api/admin/status");
     let ui_url = format!("{base_url}/ui");
@@ -90,51 +95,63 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
     })
 }
 
-/// Pick the host the tray should talk to.
-///
-/// - Loopback (127.0.0.1 / localhost / ::1) → keep as-is.
-/// - Wildcard (0.0.0.0 / ::) → rewrite to 127.0.0.1: the daemon
-///   accepts every interface including loopback, so admin allow-list
-///   passes.
-/// - Specific non-loopback (e.g. `192.168.1.5:3100` from
-///   `--bind 192.168.1.5:3100 --i-know`) → keep as-is. Rewriting to
-///   127.0.0.1 would target an interface the daemon does NOT listen
-///   on, breaking polling forever (codex P2 round 3 on PR #62).
-fn normalize_to_loopback(bind: &str) -> String {
-    let (host, port) = if let Some(rest) = bind.strip_prefix('[') {
-        // "[host]:port" form (IPv6)
-        if let Some(close) = rest.find(']') {
-            let host = &rest[..close];
-            let port = &rest[close + 1..].trim_start_matches(':');
-            (host.to_string(), (*port).to_string())
-        } else {
-            return bind.to_string();
-        }
-    } else if let Some(idx) = bind.rfind(':') {
-        (bind[..idx].to_string(), bind[idx + 1..].to_string())
-    } else {
-        return bind.to_string();
-    };
-
+/// Build the host:port the tray should talk to for admin polling.
+/// Always returns a loopback host (127.0.0.1 / [::1]) since admin routes
+/// are loopback-only. Logs a warning for specific non-loopback binds —
+/// in that case the daemon is NOT listening on loopback and polling
+/// will fail with "connection refused", which is a `--with-tray` user
+/// misconfiguration (= daemon should be bound to loopback or wildcard).
+fn normalize_to_loopback_with_warning(bind: &str) -> String {
+    let host_port = normalize_to_loopback(bind);
+    let host = host_of(bind);
     let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
     let is_wildcard = host == "0.0.0.0" || host == "::";
+    if !is_loopback && !is_wildcard {
+        tracing::warn!(
+            "daemon bind '{bind}' is specific non-loopback; tray polls 127.0.0.1 \
+             but the daemon does not listen there. Either change the daemon bind \
+             to loopback (127.0.0.1) or wildcard (0.0.0.0), or remove --with-tray.",
+        );
+    }
+    host_port
+}
 
+/// Pure split + loopback rewrite. Always returns a loopback host:port.
+fn normalize_to_loopback(bind: &str) -> String {
+    let (host, port) = split_host_port(bind);
+    let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
     if is_loopback {
-        // IPv6 loopback needs bracket-wrapping when joined with :port.
         if host == "::1" {
             format!("[::1]:{port}")
         } else {
             format!("{host}:{port}")
         }
-    } else if is_wildcard {
-        format!("127.0.0.1:{port}")
     } else {
-        // Specific non-loopback (e.g. 192.168.1.5): keep as-is. The
-        // server's admin allow-list will likely reject this, but
-        // rewriting to 127.0.0.1 would point us at an interface the
-        // daemon is not listening on, which is strictly worse.
-        format!("{host}:{port}")
+        // Wildcard AND specific non-loopback both fall here: tray must
+        // target a loopback URL because admin routes enforce loopback.
+        // Wildcard daemon listens on loopback, so polling succeeds.
+        // Specific non-loopback daemon does NOT — caller logs a warning.
+        format!("127.0.0.1:{port}")
     }
+}
+
+fn split_host_port(bind: &str) -> (String, String) {
+    if let Some(rest) = bind.strip_prefix('[') {
+        if let Some(close) = rest.find(']') {
+            let host = rest[..close].to_string();
+            let port = rest[close + 1..].trim_start_matches(':').to_string();
+            return (host, port);
+        }
+        return (bind.to_string(), String::new());
+    }
+    if let Some(idx) = bind.rfind(':') {
+        return (bind[..idx].to_string(), bind[idx + 1..].to_string());
+    }
+    (bind.to_string(), String::new())
+}
+
+fn host_of(bind: &str) -> String {
+    split_host_port(bind).0
 }
 
 #[cfg(test)]
