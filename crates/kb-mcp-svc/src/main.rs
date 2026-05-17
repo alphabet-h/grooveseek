@@ -43,9 +43,31 @@ fn main() -> std::io::Result<()> {
     let svc_exe = std::env::current_exe()?;
     let kb_mcp_exe = svc_exe.with_file_name("kb-mcp.exe");
 
+    // Descriptive diagnostic for the Task Scheduler history when the install
+    // layout is broken (= someone deleted kb-mcp.exe but left kb-mcp-svc.exe).
+    // Without this check the bare `spawn()` error surfaces as "The system
+    // cannot find the file specified" which does not point at the missing
+    // file. svc is a GUI-subsystem binary so the task history is the only
+    // diagnostic surface — make it actionable.
+    if !kb_mcp_exe.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "kb-mcp.exe not found at {} (kb-mcp-svc expects it as a sibling)",
+                kb_mcp_exe.display()
+            ),
+        ));
+    }
+
     // Forward any args we received to the child (= Task Scheduler may pass
     // extra flags in future revisions). The first arg of std::env::args()
     // is our own exe path; skip it.
+    //
+    // INVARIANT: the Task Scheduler Action MUST NOT pass `serve` as an
+    // Argument. kb-mcp-svc unconditionally adds `serve` below, so doubling it
+    // would produce `kb-mcp.exe serve serve` which fails with
+    // "unknown subcommand: serve". `register_via_powershell` enforces this
+    // by leaving `argument_clause` empty when it points at the svc binary.
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 
     Command::new(&kb_mcp_exe)
