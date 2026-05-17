@@ -4,6 +4,8 @@
 mod logger;
 #[cfg(target_os = "windows")]
 mod cli;
+#[cfg(target_os = "windows")]
+mod config;
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
