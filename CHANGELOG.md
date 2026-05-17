@@ -36,6 +36,36 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   main event loop never blocks).
 - (feature-44 PR-2) Open Web UI menu item launches the default browser
   at `<bind>/ui`.
+- (feature-44 PR-3) `kb-mcp service install --with-tray` flag
+  (Windows-only) installs a shell:startup `.lnk` shortcut launching
+  `kb-mcp-tray.exe --service-name <name>` at the next logon. `--force`
+  doubles as the duplicate-check override (= overwrite existing
+  shortcut / HKCU Run value / Task Scheduler entry).
+- (feature-44 PR-3) `kb-mcp service uninstall` now performs a
+  best-effort cleanup of the tray autostart shortcut. Idempotent and
+  warning-only on failure so the daemon uninstall always runs.
+- (feature-44 PR-3) New `kb-mcp service tray-install` /
+  `kb-mcp service tray-uninstall` standalone subcommands for managing
+  the tray shortcut independently of the daemon registration.
+- (feature-44 PR-3) `kb-mcp-tray` library API:
+  `install::install_autostart` and `install::uninstall_autostart`
+  generate PowerShell scripts (`WScript.Shell` COM) to create / remove
+  the `.lnk` shortcut. 4 unit tests cover script generation + apostrophe
+  escaping; 2 `#[ignore]` integration tests exercise the actual
+  PowerShell round-trip (run with `cargo test -- --ignored` on Windows).
+
+### Changed
+
+- (feature-44 PR-3) `README.md` / `README.ja.md` updated: links to
+  `examples/deployments/` and `examples/hooks/` now point at the new
+  `kb-mcp/examples/` location (= workspace-split fallout). New
+  "Tray monitor (Windows only)" section documents `--with-tray`, the
+  4-state dot, the 6-item right-click menu, log paths, and the
+  loopback-bind requirement.
+- (feature-44 PR-3) `docs/ARCHITECTURE.md` / `.ja.md` source layout
+  table gains a `crates/kb-mcp-tray/` row plus a dep section
+  enumerating the Windows-only crates (`tray-icon` 0.24 / `tao` 0.35 /
+  `image` 0.25 / `tracing-appender` 0.2 / `winresource` 0.1).
 
 ## [0.8.3] - 2026-05-13
 

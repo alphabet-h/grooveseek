@@ -124,7 +124,10 @@ fn run_ps(script: &str) -> Result<String> {
         .output()
         .context("spawn powershell")?;
     if !out.status.success() {
-        anyhow::bail!("powershell failed: {}", String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -166,7 +169,10 @@ mod tests {
             .expect("TargetPath line");
         let single_quote_count = target_line.matches('\'').count();
         // Each ' is doubled, plus 2 outer quotes — so an even count.
-        assert!(single_quote_count % 2 == 0, "unbalanced quotes: {target_line}");
+        assert!(
+            single_quote_count % 2 == 0,
+            "unbalanced quotes: {target_line}"
+        );
     }
 
     #[test]

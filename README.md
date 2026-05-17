@@ -293,12 +293,48 @@ The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name
 
 Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mcp has no authentication.
 
-> **Migration from v0.7.x personal-http recipe**: The `examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `kb-mcp service install`:
+> **Migration from v0.7.x personal-http recipe**: The `kb-mcp/examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `kb-mcp service install`:
 > - Linux: `systemctl --user disable kb-mcp.service && rm ~/.config/systemd/user/kb-mcp.service`
 > - macOS: `launchctl bootout gui/<uid>/com.kb-mcp.kb-mcp && rm ~/Library/LaunchAgents/com.kb-mcp.kb-mcp.plist`
 > - Windows: `schtasks /End /TN '\kb-mcp' ; schtasks /Delete /TN '\kb-mcp' /F` (replace `\kb-mcp` with whatever name the old task used)
 >
 > If you're carrying settings over from the old `kb-mcp.toml` (e.g. `model = "bge-m3"`, `exclude_dirs`, `best_practice`, `fastembed_cache_dir`), edit the **new** config at `<dirs::config_dir()>/kb-mcp/<service-name>/kb-mcp.toml` after install. **`kb_path` must be an absolute path** — the new daemon's `WorkingDirectory` is `config_home`, so a relative `kb_path = "./knowledge-base"` will resolve to `<config_home>/knowledge-base` and miss the real KB. Use TOML literal strings (single quotes) to avoid Windows backslash escapes: `kb_path = 'C:\Users\you\your-kb'`.
+
+### Tray monitor (Windows only, v0.9.0+)
+
+`kb-mcp-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. Shipped in the Windows release zip alongside `kb-mcp.exe`.
+
+Install alongside the daemon:
+
+```bash
+kb-mcp service install --kb-path C:\path\to\kb --with-tray
+```
+
+On next logon the tray icon appears with a colored status dot:
+
+- **green** — daemon healthy (last `/api/admin/status` poll succeeded)
+- **yellow** — daemon is indexing
+- **red** — daemon has been unreachable for >= 1 minute (= 12 consecutive failed polls at 5s interval)
+- **gray** — pre-first-poll (= within the first 5 seconds of startup)
+
+Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. Start/Stop/Restart drive the daemon through PowerShell `Start/Stop-ScheduledTask` cmdlets.
+
+Tray logs live at `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (daily rotation). Set `KB_MCP_TRAY_LOG=debug` for verbose output. Pass `--debug` to attach a console for live stdout/stderr.
+
+Uninstalling the daemon also removes the tray shortcut:
+
+```bash
+kb-mcp service uninstall --service-name kb-mcp
+```
+
+To manage the tray shortcut independently of the daemon registration:
+
+```bash
+kb-mcp service tray-install --service-name kb-mcp     # add shortcut only
+kb-mcp service tray-uninstall --service-name kb-mcp   # remove shortcut only
+```
+
+The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound to either loopback (`127.0.0.1`) or a wildcard (`0.0.0.0`). A daemon bound to a specific NIC such as `192.168.1.5:3100` is not listening on loopback, and the tray logs a warning at startup so the misconfiguration is discoverable.
 
 ### Show index status
 
@@ -451,7 +487,7 @@ See [docs/eval.md](docs/eval.md) for the golden YAML reference, metric definitio
 
 ## Connecting to Claude Code / Cursor
 
-> **Looking for full deployment recipes?** See [`examples/deployments/`](./examples/deployments/) for ready-to-adapt configs covering four patterns: personal stdio, personal-http (one local daemon for multiple parallel Claude Code sessions), NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). The snippets below are the canonical stdio entry point you'll find in those recipes.
+> **Looking for full deployment recipes?** See [`kb-mcp/examples/deployments/`](./kb-mcp/examples/deployments/) for ready-to-adapt configs covering four patterns: personal stdio, personal-http (one local daemon for multiple parallel Claude Code sessions), NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). The snippets below are the canonical stdio entry point you'll find in those recipes.
 
 Add the following to `.mcp.json` in your project root (or the equivalent MCP config for your client):
 
@@ -544,7 +580,7 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 }
 ```
 
-SHA-256 diffing in `kb-mcp index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`examples/hooks/`](./examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+SHA-256 diffing in `kb-mcp index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`kb-mcp/examples/hooks/`](./kb-mcp/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
 
 ### Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:

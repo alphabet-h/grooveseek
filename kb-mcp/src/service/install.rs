@@ -156,8 +156,7 @@ pub fn run_tray_install(service_name: &str, force: bool) -> Result<()> {
         ));
     }
     let config_home = resolve_config_home(&name)?;
-    let lnk =
-        kb_mcp_tray::install::install_autostart(&name, &tray_exe, &config_home, force)?;
+    let lnk = kb_mcp_tray::install::install_autostart(&name, &tray_exe, &config_home, force)?;
     eprintln!("Tray autostart shortcut: {}", lnk.display());
     Ok(())
 }
