@@ -239,14 +239,14 @@ bind = "0.0.0.0:3100"
     }
 
     #[test]
-    fn specific_non_loopback_bind_preserved() {
-        // codex P2 round 3 on PR #62: a daemon bound to a specific NIC
-        // (e.g. 192.168.1.5) is NOT listening on loopback, so rewriting
-        // would break polling. Keep the bind as-is.
-        assert_eq!(
-            normalize_to_loopback("192.168.1.5:8080"),
-            "192.168.1.5:8080"
-        );
-        assert_eq!(normalize_to_loopback("10.0.0.42:3100"), "10.0.0.42:3100");
+    fn specific_non_loopback_bind_rewrites_to_loopback() {
+        // codex P2 round 4 on PR #62: tray admin routes are loopback-only,
+        // so the URL always targets 127.0.0.1. A daemon bound to a
+        // specific NIC (not loopback, not wildcard) makes polling fail
+        // with "connection refused" — that's a misconfiguration the
+        // caller surfaces via tracing::warn! in
+        // normalize_to_loopback_with_warning.
+        assert_eq!(normalize_to_loopback("192.168.1.5:8080"), "127.0.0.1:8080");
+        assert_eq!(normalize_to_loopback("10.0.0.42:3100"), "127.0.0.1:3100");
     }
 }
