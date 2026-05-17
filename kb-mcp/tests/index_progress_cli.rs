@@ -30,19 +30,11 @@ fn build_small_kb() -> TempKbLayout {
 }
 
 fn kb_mcp_binary() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("target");
-    if cfg!(debug_assertions) {
-        p.push("debug");
-    } else {
-        p.push("release");
-    }
-    p.push(if cfg!(windows) {
-        "kb-mcp.exe"
-    } else {
-        "kb-mcp"
-    });
-    p
+    // Workspace 化 (feature-44 PR-1) 以降、CARGO_MANIFEST_DIR は kb-mcp/
+    // を指すが、Cargo は binary を workspace root の target/ に置く。
+    // CARGO_BIN_EXE_kb-mcp は cargo が test build 時に絶対 path を set する
+    // built-in env var (Cargo 1.39+) で workspace 構成にも追従する。
+    PathBuf::from(env!("CARGO_BIN_EXE_kb-mcp"))
 }
 
 fn run_index(kb: &Path, args: &[&str]) -> (String, std::process::ExitStatus) {

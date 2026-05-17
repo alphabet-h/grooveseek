@@ -14,18 +14,24 @@ use std::process::Command;
 // ---------------------------------------------------------------------------
 
 fn kb_mcp_bin() -> Option<PathBuf> {
-    let target = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
-    let profile = if cfg!(debug_assertions) {
-        "debug"
+    // Workspace 化 (feature-44 PR-1) 以降の fallback。CARGO_TARGET_DIR
+    // override は維持、未設定なら CARGO_BIN_EXE_kb-mcp (cargo が test build
+    // 時に absolute path を set する built-in env var、Cargo 1.39+) を使う。
+    let bin: PathBuf = if let Ok(custom_target) = std::env::var("CARGO_TARGET_DIR") {
+        let target = PathBuf::from(custom_target);
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        #[cfg(windows)]
+        let b = target.join(profile).join("kb-mcp.exe");
+        #[cfg(not(windows))]
+        let b = target.join(profile).join("kb-mcp");
+        b
     } else {
-        "release"
+        PathBuf::from(env!("CARGO_BIN_EXE_kb-mcp"))
     };
-    #[cfg(windows)]
-    let bin = target.join(profile).join("kb-mcp.exe");
-    #[cfg(not(windows))]
-    let bin = target.join(profile).join("kb-mcp");
     if bin.exists() { Some(bin) } else { None }
 }
 

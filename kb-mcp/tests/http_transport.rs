@@ -110,19 +110,25 @@ fn test_http_serve_healthz_and_initialize() {
 // ---------------------------------------------------------------------------
 
 fn kb_mcp_bin() -> std::path::PathBuf {
-    let target = std::env::var("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"));
-    let profile = if cfg!(debug_assertions) {
-        "debug"
+    // Workspace 化 (feature-44 PR-1) 以降、CARGO_MANIFEST_DIR は kb-mcp/ で
+    // workspace target dir と一致しない。CARGO_BIN_EXE_kb-mcp は cargo が
+    // test build 時に absolute path を set する built-in env var で workspace
+    // 構成に追従する (Cargo 1.39+)。
+    if let Ok(custom_target) = std::env::var("CARGO_TARGET_DIR") {
+        let target = std::path::PathBuf::from(custom_target);
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        #[cfg(windows)]
+        let bin = target.join(profile).join("kb-mcp.exe");
+        #[cfg(not(windows))]
+        let bin = target.join(profile).join("kb-mcp");
+        bin
     } else {
-        "release"
-    };
-    #[cfg(windows)]
-    let bin = target.join(profile).join("kb-mcp.exe");
-    #[cfg(not(windows))]
-    let bin = target.join(profile).join("kb-mcp");
-    bin
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_kb-mcp"))
+    }
 }
 
 fn tempdir(prefix: &str) -> std::path::PathBuf {
