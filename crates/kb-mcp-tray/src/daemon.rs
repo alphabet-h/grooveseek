@@ -3,10 +3,14 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
 
-/// `\kb-mcp-<service>` is the Task Scheduler task name registered by
-/// `kb-mcp service install` (= feature-43 PR-1 confirmed pattern).
+/// `kb-mcp-<service>` is the Task Scheduler task name registered by
+/// `kb-mcp service install` (= feature-43 `kb-mcp/src/service/windows.rs`
+/// `task_name` helper, line 31-32). PowerShell `Start-ScheduledTask
+/// -TaskName <name>` accepts the bare name without a TaskPath prefix
+/// (= codex P2 round 1 on PR #62: prefixing with `\` makes the cmdlet
+/// search for a path that doesn't exist and daemon control fails).
 pub fn task_name(service_name: &str) -> String {
-    format!(r"\kb-mcp-{}", service_name)
+    format!("kb-mcp-{}", service_name)
 }
 
 /// PowerShell single-quoted literal escape (= each `'` becomes `''`).
@@ -60,9 +64,9 @@ mod tests {
 
     #[test]
     fn task_name_uses_kb_mcp_prefix() {
-        assert_eq!(task_name("kb-mcp"), r"\kb-mcp-kb-mcp");
-        assert_eq!(task_name("work"), r"\kb-mcp-work");
-        assert_eq!(task_name("a-b"), r"\kb-mcp-a-b");
+        assert_eq!(task_name("kb-mcp"), "kb-mcp-kb-mcp");
+        assert_eq!(task_name("work"), "kb-mcp-work");
+        assert_eq!(task_name("a-b"), "kb-mcp-a-b");
     }
 
     #[test]

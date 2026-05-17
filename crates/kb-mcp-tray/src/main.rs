@@ -110,20 +110,27 @@ fn main() -> anyhow::Result<()> {
     // and dispatched as MenuEvent above. Capture so the receiver isn't dropped.
     let _tray_channel = TrayIconEvent::receiver();
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::UserEvent(UserEvent::StatusUpdate { dot, text }) => {
-            if let Err(e) = tray::apply_dot(&tray, dot, &text) {
-                tracing::warn!("apply_dot failed: {e}");
+    event_loop.run(move |event, _, control_flow| {
+        // (codex P2 round 1 on PR #62): tao 0.35 defaults to Poll which
+        // spins the GUI thread continuously when there are no OS events.
+        // Always-running tray app must use Wait to idle until something
+        // actually happens (UserEvent or Win32 message).
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::UserEvent(UserEvent::StatusUpdate { dot, text }) => {
+                if let Err(e) = tray::apply_dot(&tray, dot, &text) {
+                    tracing::warn!("apply_dot failed: {e}");
+                }
             }
+            Event::UserEvent(UserEvent::MenuClicked(id)) => {
+                handle_menu(&id, &runtime, &cfg, &proxy);
+            }
+            Event::UserEvent(UserEvent::Quit) => {
+                tracing::info!("quit requested");
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
         }
-        Event::UserEvent(UserEvent::MenuClicked(id)) => {
-            handle_menu(&id, &runtime, &cfg, &proxy);
-        }
-        Event::UserEvent(UserEvent::Quit) => {
-            tracing::info!("quit requested");
-            *control_flow = ControlFlow::Exit;
-        }
-        _ => {}
     });
 }
 
