@@ -10,6 +10,12 @@ homepage = "https://github.com/alphabet-h/kb-mcp"
 readme = "README.md"
 publish = false
 
+# cargo-dist per-crate target gating: kb-mcp-tray.exe is Windows-only, so we
+# narrow the dist matrix to a single target. The main `kb-mcp` crate inherits
+# the workspace-wide target list (= 4 targets) from dist-workspace.toml.
+[package.metadata.dist]
+targets = ["x86_64-pc-windows-msvc"]
+
 [[bin]]
 name = "kb-mcp-tray"
 path = "src/main.rs"
