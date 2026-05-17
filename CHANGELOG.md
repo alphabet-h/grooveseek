@@ -4,6 +4,23 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- (feature-44 PR-1) **Workspace split**: main `kb-mcp` crate moved to `kb-mcp/`
+  subdirectory, root `Cargo.toml` becomes a workspace manifest, `[profile.dist]`
+  relocated to workspace root.
+- (feature-44 PR-1) New `crates/kb-mcp-tray/` member crate — Windows-only
+  skeleton binary (`kb-mcp-tray.exe`, GUI subsystem in release). PR-1 ships
+  just a gray tray icon; polling, menu, and daemon control land in PR-2.
+- (feature-44 PR-1) Panic hook + daily-rotating file logger at
+  `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (override level via
+  `KB_MCP_TRAY_LOG=debug`). Required because GUI-subsystem binaries discard
+  stdout/stderr in release builds.
+- (feature-44 PR-1) `cargo-dist` per-crate target gating: `kb-mcp-tray.exe`
+  is published only for `x86_64-pc-windows-msvc`; the main `kb-mcp` binary
+  inherits the workspace-wide 4-target matrix (Linux x86_64/aarch64, macOS
+  aarch64, Windows x86_64).
+
 ## [0.8.3] - 2026-05-13
 
 ### Fixed
