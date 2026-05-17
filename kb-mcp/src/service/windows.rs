@@ -66,7 +66,30 @@ fn register_via_powershell(
     force: bool,
 ) -> Result<()> {
     let task = task_name(service_name);
-    let bin_escaped = binary_path.display().to_string().replace('\'', "''");
+    // (v0.9.1 hot-fix) Prefer the windows-subsystem `kb-mcp-svc.exe` sibling
+    // when present so Task Scheduler's AtLogOn trigger spawns a console-less
+    // launcher that detach-spawns `kb-mcp.exe serve`. Without this the bare
+    // `kb-mcp.exe` Action surfaces a visible console window on every login —
+    // Windows allocates conhost before the process starts so even
+    // `-WindowStyle Hidden` / `FreeConsole()` only hide *after* a ~1 sec
+    // flash. The svc binary has `#![windows_subsystem = "windows"]` so the
+    // kernel never allocates a console for the parent, and the child kb-mcp
+    // inherits an empty console handle = true 0-flash. If the sibling is
+    // absent (e.g. `cargo install --path kb-mcp` only installs the main
+    // binary), fall back to the legacy console-visible Action so a dev
+    // install still produces a working daemon.
+    let (execute_path, argument_clause) = match binary_path.parent() {
+        Some(dir) => {
+            let svc = dir.join("kb-mcp-svc.exe");
+            if svc.exists() {
+                (svc, String::new())
+            } else {
+                (binary_path.to_path_buf(), " -Argument 'serve'".to_string())
+            }
+        }
+        None => (binary_path.to_path_buf(), " -Argument 'serve'".to_string()),
+    };
+    let bin_escaped = execute_path.display().to_string().replace('\'', "''");
     let home_escaped = config_home.display().to_string().replace('\'', "''");
     let auto_start_val = if auto_start { "$true" } else { "$false" };
     let force_clause = if force { " -Force" } else { "" };
@@ -79,12 +102,13 @@ fn register_via_powershell(
     // auto-constructs for registration, no admin needed).
     let script = format!(
         "$ErrorActionPreference='Stop'; \
-         $action = New-ScheduledTaskAction -Execute '{bin}' -Argument 'serve' -WorkingDirectory '{home}'; \
+         $action = New-ScheduledTaskAction -Execute '{bin}'{argument} -WorkingDirectory '{home}'; \
          $trigger = New-ScheduledTaskTrigger -AtLogOn -User \"$env:USERDOMAIN\\$env:USERNAME\"; \
          $trigger.Enabled = {auto_start}; \
          $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 7; \
          Register-ScheduledTask -TaskName '{name}' -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Description 'kb-mcp loopback HTTP MCP server ({name})'{force} | Out-Null",
         bin = bin_escaped,
+        argument = argument_clause,
         home = home_escaped,
         auto_start = auto_start_val,
         name = task,

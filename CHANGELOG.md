@@ -4,6 +4,42 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-17
+
+### Fixed
+
+- (v0.9.1 hot-fix) **Windows `kb-mcp service install`**: the Task Scheduler
+  Action launched `kb-mcp.exe serve` directly, which surfaced a visible
+  console window on every login because Windows allocates `conhost.exe`
+  before a console-subsystem process starts (`-WindowStyle Hidden` /
+  `FreeConsole()` only hide it *after* a ~1-second flash; tracked upstream
+  as microsoft/terminal#249 and PowerShell/PowerShell#3028 since 2018).
+  v0.9.1 introduces a new tiny `kb-mcp-svc.exe` helper crate
+  (`crates/kb-mcp-svc/`, ~230 KB, `#![windows_subsystem = "windows"]`) that
+  the install path uses as the Action when the sibling binary is present.
+  The helper spawns `kb-mcp.exe serve` with `CREATE_NO_WINDOW` so the
+  child inherits no console — true 0-flash hidden launch. The bare
+  `kb-mcp.exe` Action remains as a fallback for `cargo install --path
+  kb-mcp` users who do not have the svc helper installed.
+
+### Migration (existing v0.9.0 users)
+
+Existing v0.9.0 installs continue to work but still show the console
+window. To pick up the hidden-launcher Action, drop in the new
+`kb-mcp-svc.exe` from the v0.9.1 zip alongside your existing
+`kb-mcp.exe` / `kb-mcp-tray.exe`, then either:
+
+- Re-run `kb-mcp service install --kb-path <path> --with-tray --force`
+  (= regenerates the Action via the v0.9.1 install path), **or**
+- Swap the Action manually without re-creating the rest of the task:
+
+  ```powershell
+  schtasks /End /TN '\kb-mcp-<service-name>'
+  $action = New-ScheduledTaskAction -Execute 'C:\Users\<you>\.cargo\bin\kb-mcp-svc.exe' -WorkingDirectory '<config_home>'
+  Set-ScheduledTask -TaskName 'kb-mcp-<service-name>' -Action $action
+  schtasks /Run /TN '\kb-mcp-<service-name>'
+  ```
+
 ## [0.9.0] - 2026-05-17
 
 ### Added
