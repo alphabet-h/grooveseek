@@ -56,6 +56,13 @@ wide = "0.7"
 # IsTerminal-aware fallback for non-TTY (pipe / harness). MSRV 1.70 per cargo info.
 indicatif = "0.18"
 
+# (feature-44 PR-3) Windows-only path dep on the tray crate so
+# `kb-mcp service install --with-tray` can call into the tray's
+# shell:startup shortcut installer. Library API only — the
+# `kb-mcp-tray.exe` binary is shipped separately via cargo-dist.
+[target.'cfg(windows)'.dependencies]
+kb-mcp-tray = { path = "../crates/kb-mcp-tray" }
+
 [features]
 # Reranker (~2.3 GB) を要求する bench を default 起動から除外する gate。
 # `cargo bench --features heavy-bench --bench search_latency` で reranker bench fn が

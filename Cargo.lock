@@ -2401,6 +2401,7 @@ dependencies = [
  "globset",
  "http",
  "indicatif 0.18.4",
+ "kb-mcp-tray",
  "notify",
  "notify-debouncer-full",
  "proptest",

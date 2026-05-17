@@ -240,6 +240,10 @@ enum ServiceSubcommand {
         force: bool,
         #[arg(long = "i-know")]
         i_know_non_loopback: bool,
+        /// (Windows-only) Also install the kb-mcp-tray.exe shell:startup
+        /// shortcut so the tray monitor launches at the next logon.
+        #[arg(long)]
+        with_tray: bool,
     },
     /// Uninstall the kb-mcp service (use --purge --yes to also delete index DB and config)
     Uninstall {
@@ -974,6 +978,7 @@ fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
             no_auto_start,
             force,
             i_know_non_loopback,
+            with_tray,
         } => {
             kb_mcp::service::install::run(kb_mcp::service::install::InstallParams {
                 service_name,
@@ -982,6 +987,7 @@ fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
                 auto_start: !no_auto_start,
                 force,
                 i_know_non_loopback,
+                with_tray,
             })?;
         }
         ServiceSubcommand::Uninstall {
