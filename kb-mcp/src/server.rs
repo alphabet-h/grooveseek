@@ -212,7 +212,7 @@ struct TopicEntry {
     titles: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct DocumentResponse {
     path: String,
     title: Option<String>,
@@ -220,6 +220,9 @@ struct DocumentResponse {
     topic: Option<String>,
     tags: Vec<String>,
     content: String,
+    /// 抽出テキストが 1 MiB を超え truncate された場合 true (既存応答は常に false)。
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[derive(Serialize)]
@@ -511,11 +514,27 @@ impl KbServer {
         description = "Get the full content and metadata of a document by its relative path within knowledge-base/."
     )]
     async fn get_document(&self, Parameters(params): Parameters<GetDocumentParams>) -> String {
+        // cap 分類は canonicalize 前の拡張子から (§4.4)。registry に無い拡張子は
+        // text 扱い (1 MiB) で validate に流し、extension membership check で弾く。
+        let req_ext = std::path::Path::new(&params.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let is_binary = self
+            .parser_registry
+            .by_extension(req_ext)
+            .map(|p| p.is_binary())
+            .unwrap_or(false);
+        let max_bytes = if is_binary {
+            crate::parser::MAX_RAW_BINARY_BYTES
+        } else {
+            GET_DOCUMENT_MAX_BYTES
+        };
         let canonical = match validate_get_document_path(
             &self.kb_path,
             &params.path,
             &self.parser_registry,
-            GET_DOCUMENT_MAX_BYTES,
+            max_bytes,
         ) {
             ValidatePathOutcome::Found(p) => p,
             ValidatePathOutcome::NotFound(e) => {
@@ -526,10 +545,15 @@ impl KbServer {
             }
         };
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
-        match std::fs::read_to_string(&canonical) {
-            Ok(raw) => {
-                let resp = build_document_response(&self.parser_registry, &params.path, ext, raw);
-                serde_json::to_string_pretty(&resp).unwrap_or_default()
+        match std::fs::read(&canonical) {
+            Ok(bytes) => {
+                match build_document_response(&self.parser_registry, &params.path, ext, &bytes) {
+                    Ok(resp) => serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                    Err(e) => serde_json::to_string_pretty(&ErrorResponse {
+                        error: format!("Failed to extract document: {e}"),
+                    })
+                    .unwrap_or_default(),
+                }
             }
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
                 error: format!("Failed to read file: {e}"),
@@ -1096,6 +1120,24 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
 /// 一括読みでのメモリ膨張・レスポンス過大を避けるため拒否する。
 pub(crate) const GET_DOCUMENT_MAX_BYTES: u64 = 1024 * 1024;
 
+/// get_document がバイナリ形式で応答する抽出テキストの上限 (1 MiB)。超過分は
+/// char 境界で truncate し `DocumentResponse.truncated = true` を立てる (§4.4)。
+pub(crate) const EXTRACTED_TEXT_MAX_BYTES: usize = 1024 * 1024;
+
+/// `s` を UTF-8 char 境界を保って最大 `max_bytes` バイトに truncate する。
+/// truncate したら `true`、無切り詰めなら `false`。
+fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> bool {
+    if s.len() <= max_bytes {
+        return false;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    s.truncate(boundary);
+    true
+}
+
 /// `search` MCP tool が受理する query 文字列の最大バイト数 (1 KiB)。
 /// 上限超えは ErrorResponse で reject する。embedder / FTS5 layer は内部で
 /// truncate するが、上流で reject した方がレスポンスが予測可能になり、
@@ -1206,28 +1248,37 @@ pub(crate) fn validate_get_document_path(
     ValidatePathOutcome::Found(canonical)
 }
 
-///
-/// 登録されていない拡張子はフォールバックで Markdown parser を使う (pre-
-/// feature-20 と同じ挙動)。`.txt` はファイル名から title を derive するため
-/// `path_hint` を必ず渡す。
+/// `get_document` ツール用に、拡張子に対応する Parser で `parse_bytes` を呼び、
+/// frontmatter + 抽出テキストから DocumentResponse を組む。抽出失敗 (不正 UTF-8 /
+/// 暗号化 PDF 等) は `Err` にして handler が既存のエラー応答形式へ流す。
+/// 登録されていない拡張子はフォールバックで Markdown parser を使う (pre-feature-20 挙動)。
 fn build_document_response(
     registry: &Registry,
     path_hint: &str,
     ext: &str,
-    raw: String,
-) -> DocumentResponse {
+    bytes: &[u8],
+) -> anyhow::Result<DocumentResponse> {
     let parsed = match registry.by_extension(ext) {
-        Some(p) => p.parse(&raw, path_hint, &[]),
-        None => markdown::parse(&raw),
+        Some(p) => p.parse_bytes(bytes, path_hint, &[])?,
+        None => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| anyhow::anyhow!("{path_hint}: not valid UTF-8: {e}"))?;
+            markdown::parse(s)
+        }
     };
-    DocumentResponse {
+    // text 形式: raw_content = ファイル全体 (既存 `content: raw` と一致)。
+    // binary 形式: raw_content = 抽出テキスト全体。1 MiB 超は truncate。
+    let mut content = parsed.raw_content;
+    let truncated = truncate_on_char_boundary(&mut content, EXTRACTED_TEXT_MAX_BYTES);
+    Ok(DocumentResponse {
         path: path_hint.to_string(),
         title: parsed.frontmatter.title,
         date: parsed.frontmatter.date,
         topic: parsed.frontmatter.topic,
         tags: parsed.frontmatter.tags,
-        content: raw,
-    }
+        content,
+        truncated,
+    })
 }
 
 /// `get_best_practice` のパス解決結果。
@@ -1897,7 +1948,7 @@ mod tests {
     fn test_build_document_response_md_with_frontmatter() {
         let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
         let md = "---\ntitle: Hello\ntags: [a, b]\n---\n\n# body";
-        let resp = build_document_response(&reg, "notes/hello.md", "md", md.to_string());
+        let resp = build_document_response(&reg, "notes/hello.md", "md", md.as_bytes()).unwrap();
         assert_eq!(resp.title.as_deref(), Some("Hello"));
         assert_eq!(resp.tags, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(resp.path, "notes/hello.md");
@@ -1912,8 +1963,9 @@ mod tests {
             &reg,
             "nature/forest-ecosystem-notes.txt",
             "txt",
-            raw.to_string(),
-        );
+            raw.as_bytes(),
+        )
+        .unwrap();
         // .txt has no frontmatter — title must come from the filename
         assert_eq!(
             resp.title.as_deref(),
@@ -1932,9 +1984,42 @@ mod tests {
         // 到達しないが、外部からの直接 path 指定でも落ちないように。
         let reg = Registry::defaults(); // md only
         let raw = "---\ntitle: x\n---\n\nbody";
-        let resp = build_document_response(&reg, "a.unknown", "unknown", raw.to_string());
+        let resp = build_document_response(&reg, "a.unknown", "unknown", raw.as_bytes()).unwrap();
         // markdown::parse が frontmatter を拾う
         assert_eq!(resp.title.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn test_truncate_on_char_boundary_respects_multibyte() {
+        // "あ" = 3 bytes。max_bytes=4 → 1 文字 (3 bytes) で止まり panic しない。
+        let mut s = "あああ".to_string(); // 9 bytes
+        let truncated = truncate_on_char_boundary(&mut s, 4);
+        assert!(truncated);
+        assert_eq!(s, "あ");
+        // 上限が長さ以上なら無切り詰め。
+        let mut s2 = "abc".to_string();
+        assert!(!truncate_on_char_boundary(&mut s2, 100));
+        assert_eq!(s2, "abc");
+    }
+
+    #[test]
+    fn test_build_document_response_text_format_unchanged() {
+        let reg = Registry::from_enabled(&["md".into()]).unwrap();
+        let raw = "---\ntitle: T\n---\n\n## H\n\nbody enough enough enough enough enough";
+        let resp = build_document_response(&reg, "a.md", "md", raw.as_bytes()).unwrap();
+        assert_eq!(resp.title.as_deref(), Some("T"));
+        assert_eq!(
+            resp.content, raw,
+            "text content must be the full raw file (unchanged)"
+        );
+        assert!(!resp.truncated);
+    }
+
+    #[test]
+    fn test_build_document_response_invalid_utf8_text_is_err() {
+        let reg = Registry::from_enabled(&["md".into()]).unwrap();
+        let err = build_document_response(&reg, "a.md", "md", &[0xff, 0xfe]).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"));
     }
 
     // -----------------------------------------------------------------------
