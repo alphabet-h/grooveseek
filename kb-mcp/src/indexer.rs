@@ -197,6 +197,8 @@ pub struct IndexResult {
     /// `documents.path` だけが UPDATE された数。
     pub renamed: u32,
     pub deleted: u32,
+    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
+    pub skipped: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
 }
@@ -313,7 +315,11 @@ pub fn rebuild_index(
                 updated += 1;
                 progress.report_indexed(&entry.rel, chunks);
             }
-            SingleResult::Unchanged | SingleResult::Skipped { .. } => {
+            SingleResult::Skipped { .. } => {
+                skipped_count += 1;
+                progress.report_unchanged(&entry.rel);
+            }
+            SingleResult::Unchanged => {
                 // Progress mode (= Tty/NonTty) で bar / counter を tick する。
                 // Verbose / Quiet は no-op (= 既存挙動保持)。
                 progress.report_unchanged(&entry.rel);
@@ -345,6 +351,7 @@ pub fn rebuild_index(
         updated,
         renamed,
         deleted,
+        skipped: skipped_count,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })

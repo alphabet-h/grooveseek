@@ -238,6 +238,9 @@ struct IndexStats {
     #[serde(default)]
     renamed: u32,
     deleted: u32,
+    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
+    #[serde(default)]
+    skipped: u32,
     total_chunks: u32,
     duration_ms: u64,
 }
@@ -684,6 +687,7 @@ impl KbServer {
                     updated: result.updated,
                     renamed: result.renamed,
                     deleted: result.deleted,
+                    skipped: result.skipped,
                     total_chunks: result.total_chunks,
                     duration_ms: result.duration_ms,
                 };
