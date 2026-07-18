@@ -137,8 +137,8 @@ pub trait Parser: Send + Sync {
         path_hint: &str,
         exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        let s = std::str::from_utf8(bytes)
-            .with_context(|| format!("{path_hint}: not valid UTF-8"))?;
+        let s =
+            std::str::from_utf8(bytes).with_context(|| format!("{path_hint}: not valid UTF-8"))?;
         Ok(self.parse(s, path_hint, exclude_headings))
     }
 
@@ -215,7 +215,11 @@ mod tests {
     fn test_parse_bytes_default_delegates_to_parse_on_utf8() {
         // MarkdownParser は parse_bytes を override しない = default impl 経由。
         let doc = MarkdownParser
-            .parse_bytes(b"## H\n\nbody enough body enough body enough body enough", "x.md", &[])
+            .parse_bytes(
+                b"## H\n\nbody enough body enough body enough body enough",
+                "x.md",
+                &[],
+            )
             .expect("valid utf-8 must parse");
         assert_eq!(doc.chunks.len(), 1);
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("H"));

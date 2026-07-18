@@ -290,7 +290,12 @@ pub fn rebuild_index(
     // もう一度 read_to_string する — ファイル OS キャッシュで 2 度目の
     // read は十分安く、代わりにピークメモリを `filecount * avg_size` から
     // `filecount * avg_path_len + 1 file worth of content` に圧縮できる。
-    let scan = scan_disk_entries(&source_files, &kb_path, registry, crate::parser::MAX_RAW_BINARY_BYTES);
+    let scan = scan_disk_entries(
+        &source_files,
+        &kb_path,
+        registry,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+    );
     let disk_entries = scan.entries;
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
@@ -544,8 +549,8 @@ pub fn reindex_single_file(
             reason: "file no longer exists",
         });
     }
-    let bytes = std::fs::read(&full)
-        .with_context(|| format!("failed to read {}", full.display()))?;
+    let bytes =
+        std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
     let hash = sha256_hex_bytes(&bytes);
     let entry = DiskEntry {
         rel: rel.to_string(),
@@ -607,8 +612,8 @@ pub fn rename_single_file(
         db.delete_document(new_rel)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
     }
-    let new_bytes = std::fs::read(&full)
-        .with_context(|| format!("failed to read {}", full.display()))?;
+    let new_bytes =
+        std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
     let new_hash = sha256_hex_bytes(&new_bytes);
     if new_hash == old_hash {
         return Ok(RenameOutcome::Renamed);
@@ -795,11 +800,18 @@ mod tests {
     fn test_documents_to_delete_retains_skipped_paths() {
         // DB に a.md / b.md / c.md。visited = {a.md} (今回 index), skipped = {b.md}
         // (read 失敗 or size skip)。c.md だけが「disk から消えた」= 削除対象。
-        let all_db: Vec<String> = ["a.md", "b.md", "c.md"].iter().map(|s| s.to_string()).collect();
+        let all_db: Vec<String> = ["a.md", "b.md", "c.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let visited: HashSet<String> = ["a.md".to_string()].into_iter().collect();
         let skipped: HashSet<String> = ["b.md".to_string()].into_iter().collect();
         let to_delete = documents_to_delete(&all_db, &visited, &skipped);
-        assert_eq!(to_delete, vec!["c.md".to_string()], "skipped path must be retained");
+        assert_eq!(
+            to_delete,
+            vec!["c.md".to_string()],
+            "skipped path must be retained"
+        );
     }
 
     #[test]
@@ -863,8 +875,17 @@ mod tests {
     fn test_sha256_hex_bytes_matches_string_hash_for_utf8() {
         // read_to_string は無変換 (CRLF/BOM 保持) なので、UTF-8 ファイルの
         // raw バイト hash = 旧文字列 hash。既存 DB の再 index 暴発を防ぐ要。
-        for s in ["hello world", "日本語テキスト", "line1\r\nline2\n", "\u{feff}bom-prefixed"] {
-            assert_eq!(sha256_hex(s), sha256_hex_bytes(s.as_bytes()), "mismatch for {s:?}");
+        for s in [
+            "hello world",
+            "日本語テキスト",
+            "line1\r\nline2\n",
+            "\u{feff}bom-prefixed",
+        ] {
+            assert_eq!(
+                sha256_hex(s),
+                sha256_hex_bytes(s.as_bytes()),
+                "mismatch for {s:?}"
+            );
         }
     }
 
@@ -1140,7 +1161,11 @@ mod tests {
         let reg = Registry::defaults();
         // md は is_binary=false なので size cap の対象外 = cap を 1 にしても通る。
         let scan = scan_disk_entries(&[tmp.0.join("small.md")], &tmp.0, &reg, 1);
-        assert_eq!(scan.entries.len(), 1, "text files ignore the binary size cap");
+        assert_eq!(
+            scan.entries.len(),
+            1,
+            "text files ignore the binary size cap"
+        );
         assert!(scan.skipped.is_empty());
     }
 
