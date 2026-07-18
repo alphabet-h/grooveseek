@@ -38,7 +38,10 @@ pub fn is_hardcoded_excluded(basename: &str) -> bool {
 /// ファイルを拡張子に関わらず skip する。`~$` 版は拡張子が `docx` のまま走査に
 /// 乗るため明示フィルタ必須。`.~lock.*#` 版は拡張子が `docx#` になり既存の
 /// 拡張子 membership で偶然弾かれるが、暗黙挙動に依存せず明示フィルタする。
-fn is_office_lock_file(name: &str) -> bool {
+/// `pub(crate)` は `collect_source_files` (フル re-index) に加えて
+/// `watcher::should_process` (incremental reindex) からも同じ判定を再利用する
+/// ため。
+pub(crate) fn is_office_lock_file(name: &str) -> bool {
     name.starts_with("~$") || (name.starts_with(".~lock.") && name.ends_with('#'))
 }
 

@@ -346,6 +346,13 @@ fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
     if rel.ends_with(".kb-mcp.db") || rel.ends_with(".kb-mcp.db-journal") {
         return false;
     }
+    // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
+    // (フル re-index) と同じ判定で skip する。放置すると Office ファイルを
+    // 開くたびに create イベント → parse 失敗 warn がスパムする。
+    let name = full.file_name().unwrap_or_default().to_string_lossy();
+    if indexer::is_office_lock_file(name.as_ref()) {
+        return false;
+    }
     let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
     state
         .registry
@@ -508,6 +515,10 @@ mod tests {
         if rel.ends_with(".kb-mcp.db") || rel.ends_with(".kb-mcp.db-journal") {
             return false;
         }
+        let name = full.file_name().unwrap_or_default().to_string_lossy();
+        if indexer::is_office_lock_file(name.as_ref()) {
+            return false;
+        }
         let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
         registry
             .extensions()
@@ -580,6 +591,48 @@ mod tests {
         let full = Path::new("/tmp/a/.kb-mcp.db");
         assert!(!should_process_lite(
             ".kb-mcp.db",
+            full,
+            &reg,
+            &default_exclude_dirs()
+        ));
+    }
+
+    #[test]
+    fn test_should_process_lite_office_owner_file_rejected() {
+        let reg = Registry::defaults();
+        let full = Path::new("/tmp/a/notes/~$report.docx");
+        assert!(!should_process_lite(
+            "notes/~$report.docx",
+            full,
+            &reg,
+            &default_exclude_dirs()
+        ));
+    }
+
+    #[test]
+    fn test_should_process_lite_libreoffice_lock_file_rejected() {
+        let reg = Registry::defaults();
+        let full = Path::new("/tmp/a/notes/.~lock.report.docx#");
+        assert!(!should_process_lite(
+            "notes/.~lock.report.docx#",
+            full,
+            &reg,
+            &default_exclude_dirs()
+        ));
+    }
+
+    // docx はこのブランチではまだ未登録拡張子 (Registry::defaults() は md のみ)
+    // なので上記 2 test は「lock 判定」と「拡張子未登録」のどちらが理由で
+    // false になったか区別できない。lock 判定自体が効いていることを保証する
+    // ため、registered 拡張子 (md) でも office lock file なら false になる
+    // ことを追加で確認する (indexer::tests::test_collect_source_files_skips_office_lock
+    // の watcher 版に相当する regression guard)。
+    #[test]
+    fn test_should_process_lite_office_owner_file_with_registered_extension_rejected() {
+        let reg = Registry::defaults(); // md registered
+        let full = Path::new("/tmp/a/notes/~$report.md");
+        assert!(!should_process_lite(
+            "notes/~$report.md",
             full,
             &reg,
             &default_exclude_dirs()
