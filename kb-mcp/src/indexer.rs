@@ -34,6 +34,14 @@ pub fn is_hardcoded_excluded(basename: &str) -> bool {
     HARDCODED_EXCLUDE_DIRS.contains(&basename)
 }
 
+/// MS Office (`~$doc.docx`) / LibreOffice (`.~lock.doc.docx#`) のロック・owner
+/// ファイルを拡張子に関わらず skip する。`~$` 版は拡張子が `docx` のまま走査に
+/// 乗るため明示フィルタ必須。`.~lock.*#` 版は拡張子が `docx#` になり既存の
+/// 拡張子 membership で偶然弾かれるが、暗黙挙動に依存せず明示フィルタする。
+fn is_office_lock_file(name: &str) -> bool {
+    name.starts_with("~$") || (name.starts_with(".~lock.") && name.ends_with('#'))
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -636,12 +644,17 @@ fn collect_source_files(
         })
     {
         let entry = entry.context("walkdir error")?;
-        if entry.file_type().is_file()
-            && let Some(ext) = entry.path().extension()
-            && let Some(ext_str) = ext.to_str()
-            && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
-        {
-            files.push(entry.into_path());
+        if entry.file_type().is_file() {
+            let name = entry.file_name().to_string_lossy();
+            if is_office_lock_file(name.as_ref()) {
+                continue;
+            }
+            if let Some(ext) = entry.path().extension()
+                && let Some(ext_str) = ext.to_str()
+                && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
+            {
+                files.push(entry.into_path());
+            }
         }
     }
 
@@ -1058,6 +1071,35 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "note.md"),
             "user .obsidian skip failed: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_office_lock_file() {
+        assert!(is_office_lock_file("~$report.docx")); // MS Office owner file
+        assert!(is_office_lock_file("~$budget.xlsx"));
+        assert!(is_office_lock_file(".~lock.report.docx#")); // LibreOffice lock
+        assert!(!is_office_lock_file("report.docx"));
+        assert!(!is_office_lock_file("notes.md"));
+        assert!(!is_office_lock_file("~draft.md")); // ~$ で始まらない
+    }
+
+    #[test]
+    fn test_collect_source_files_skips_office_lock() {
+        let tmp = mk_tmp("officelock");
+        write_file(&tmp.0, "a.md", "# a");
+        write_file(&tmp.0, "~$a.md", "owner file"); // ~$ prefix, md 拡張子
+        write_file(&tmp.0, ".~lock.a.md#", "lo lock");
+        let reg = Registry::defaults();
+        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.md".to_string()],
+            "lock files must be skipped, got {names:?}"
         );
     }
 
