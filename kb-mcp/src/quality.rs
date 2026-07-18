@@ -273,9 +273,15 @@ mod tests {
         // text 扱いなら length(-0.6)+structure(-0.3) で 0.1 に落ちるが、
         // is_binary=true なら両免除で 1.0 を保つ。
         let text_score = chunk_quality_score(Some("Slide 1"), "第3章 リスク管理", false);
-        assert!(text_score < 0.2, "text short content should be penalized, got {text_score}");
+        assert!(
+            text_score < 0.2,
+            "text short content should be penalized, got {text_score}"
+        );
         let bin_score = chunk_quality_score(Some("Slide 1"), "第3章 リスク管理", true);
-        assert!((bin_score - 1.0).abs() < 1e-5, "binary short content must be exempt, got {bin_score}");
+        assert!(
+            (bin_score - 1.0).abs() < 1e-5,
+            "binary short content must be exempt, got {bin_score}"
+        );
     }
 
     #[test]
@@ -283,7 +289,10 @@ mod tests {
         // BOILERPLATE_PENALTY は据え置き (免除しない)。ただし length/structure は
         // 免除なので、is_binary=true の "TBD" は -0.5 のみ = 0.5。
         let score = chunk_quality_score(None, "TBD", true);
-        assert!((score - 0.5).abs() < 1e-5, "binary boilerplate keeps -0.5 only, got {score}");
+        assert!(
+            (score - 0.5).abs() < 1e-5,
+            "binary boilerplate keeps -0.5 only, got {score}"
+        );
     }
 
     #[test]
