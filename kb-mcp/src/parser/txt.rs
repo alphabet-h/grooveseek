@@ -95,6 +95,11 @@ fn derive_title(path_hint: &str) -> Option<String> {
     }
 }
 
+/// `derive_title` の crate 内公開ラッパ (parser::single_text_chunk 用)。
+pub(crate) fn derive_title_pub(path_hint: &str) -> Option<String> {
+    derive_title(path_hint)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

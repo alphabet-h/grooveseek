@@ -65,6 +65,16 @@ impl Registry {
     pub fn has_extension(&self, ext: &str) -> bool {
         self.parsers.iter().any(|p| p.extension() == ext)
     }
+
+    /// `is_binary()` が true な parser の拡張子だけを返す。indexer の size-skip
+    /// 判定 (§4.2) と backfill_quality の is_binary 伝搬 (§4.8) で使う。
+    pub fn binary_extensions(&self) -> Vec<&'static str> {
+        self.parsers
+            .iter()
+            .filter(|p| p.is_binary())
+            .map(|p| p.extension())
+            .collect()
+    }
 }
 
 impl Default for Registry {
@@ -133,5 +143,12 @@ mod tests {
         // "MD" in config normalises to "md" — both accepted
         let r = Registry::from_enabled(&["MD".into()]).unwrap();
         assert_eq!(r.extensions(), vec!["md"]);
+    }
+
+    #[test]
+    fn test_binary_extensions_empty_for_text_only_registry() {
+        // md / txt は is_binary=false なので binary_extensions は空。
+        let r = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        assert!(r.binary_extensions().is_empty());
     }
 }
