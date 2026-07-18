@@ -570,11 +570,19 @@ fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Compute the hex-encoded SHA-256 digest of a string.
-fn sha256_hex(content: &str) -> String {
+/// Compute the hex-encoded SHA-256 digest of raw bytes. Byte-level hashing is the
+/// canonical form since feature-45: text formats hash their UTF-8 bytes (identical
+/// to the pre-feature-45 string hash), binary formats hash their raw file bytes.
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Compute the hex-encoded SHA-256 digest of a string (thin wrapper over
+/// [`sha256_hex_bytes`]). Retained for the reindex/rename hash-compare call sites.
+fn sha256_hex(content: &str) -> String {
+    sha256_hex_bytes(content.as_bytes())
 }
 
 // ===========================================================================
@@ -707,6 +715,15 @@ mod tests {
         let hash1 = sha256_hex("hello");
         let hash2 = sha256_hex("world");
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_sha256_hex_bytes_matches_string_hash_for_utf8() {
+        // read_to_string は無変換 (CRLF/BOM 保持) なので、UTF-8 ファイルの
+        // raw バイト hash = 旧文字列 hash。既存 DB の再 index 暴発を防ぐ要。
+        for s in ["hello world", "日本語テキスト", "line1\r\nline2\n", "\u{feff}bom-prefixed"] {
+            assert_eq!(sha256_hex(s), sha256_hex_bytes(s.as_bytes()), "mismatch for {s:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
