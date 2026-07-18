@@ -96,6 +96,9 @@ fn derive_title(path_hint: &str) -> Option<String> {
 }
 
 /// `derive_title` の crate 内公開ラッパ (parser::single_text_chunk 用)。
+// single_text_chunk 経由の間接呼び出しのみで、PR-1 時点では直接の呼び出し元が
+// 未実装のため未使用。PR-2/3 で消費予定 (feature-45)。
+#[allow(dead_code)]
 pub(crate) fn derive_title_pub(path_hint: &str) -> Option<String> {
     derive_title(path_hint)
 }

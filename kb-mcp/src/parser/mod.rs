@@ -73,6 +73,9 @@ pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 /// 抽出済みテキストを 1 チャンクに包む共通 helper。バイナリ parser の trait 契約用
 /// `parse` (&str 版 = 「既に抽出済みテキストを受け取った」fallback) 実装で使う。
 /// path_hint からファイル名ベースの title を derive する。
+// PR-1 時点では呼び出し元 (PDF/Office parser) が未実装のため未使用。
+// PR-2/3 で消費予定 (feature-45)。
+#[allow(dead_code)]
 pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
     let body = raw.replace("\r\n", "\n").replace('\r', "\n");
     let title = txt::derive_title_pub(path_hint);
