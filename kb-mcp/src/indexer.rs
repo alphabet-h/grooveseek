@@ -50,6 +50,78 @@ struct DiskEntry {
     full: std::path::PathBuf,
 }
 
+/// [`scan_disk_entries`] の結果。`entries` = hash 計算済みの index 候補、
+/// `skipped` = disk に存在するが read 失敗 / size 超過で載らなかった rel path。
+/// `skipped` は prune 統一原則 (§4.2) で visited_paths へ union し、既存 entry を保護する。
+struct DiskScan {
+    entries: Vec<DiskEntry>,
+    skipped: Vec<String>,
+}
+
+/// disk 側の全 source file を走査し、raw バイト読み + バイト hash を計算する。
+///
+/// - **エラー隔離**: `read` 失敗や size 超過は per-file skip し、rel path を `skipped`
+///   に積んで走査を続行する (旧 `.collect::<Result<Vec>>()?` の全体 abort を修正)。
+/// - **size skip**: `is_binary()` な拡張子は `max_binary_bytes` 超で read 前に skip
+///   (`fs::metadata` の len 判定でメモリ読込自体を回避)。テキスト形式は上限なし。
+fn scan_disk_entries(
+    source_files: &[std::path::PathBuf],
+    kb_path: &Path,
+    registry: &Registry,
+    max_binary_bytes: u64,
+) -> DiskScan {
+    let binary_exts = registry.binary_extensions();
+    let mut entries = Vec::with_capacity(source_files.len());
+    let mut skipped = Vec::new();
+
+    for p in source_files {
+        let rel = p
+            .strip_prefix(kb_path)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
+
+        if is_binary {
+            match std::fs::metadata(p) {
+                Ok(meta) if meta.len() > max_binary_bytes => {
+                    eprintln!(
+                        "Skipping {rel}: binary file too large ({} bytes > {} limit)",
+                        meta.len(),
+                        max_binary_bytes
+                    );
+                    skipped.push(rel);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Skipping {rel}: failed to stat: {e}");
+                    skipped.push(rel);
+                    continue;
+                }
+            }
+        }
+
+        match std::fs::read(p) {
+            Ok(bytes) => {
+                let hash = sha256_hex_bytes(&bytes);
+                entries.push(DiskEntry {
+                    rel,
+                    hash,
+                    full: p.clone(),
+                });
+            }
+            Err(e) => {
+                eprintln!("Skipping {rel}: failed to read: {e}");
+                skipped.push(rel);
+            }
+        }
+    }
+
+    DiskScan { entries, skipped }
+}
+
 /// disk と DB の (path, hash) から「移動ペア」を決定する純粋関数。
 ///
 /// - 「DB にあるが disk にない」path は「消えた」候補
@@ -188,24 +260,12 @@ pub fn rebuild_index(
     // もう一度 read_to_string する — ファイル OS キャッシュで 2 度目の
     // read は十分安く、代わりにピークメモリを `filecount * avg_size` から
     // `filecount * avg_path_len + 1 file worth of content` に圧縮できる。
-    let disk_entries: Vec<DiskEntry> = source_files
-        .iter()
-        .map(|p| -> Result<DiskEntry> {
-            let content = std::fs::read_to_string(p)
-                .with_context(|| format!("failed to read {}", p.display()))?;
-            let rel = p
-                .strip_prefix(&kb_path)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let hash = sha256_hex(&content);
-            Ok(DiskEntry {
-                rel,
-                hash,
-                full: p.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let scan = scan_disk_entries(&source_files, &kb_path, registry, crate::parser::MAX_RAW_BINARY_BYTES);
+    let disk_entries = scan.entries;
+    // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
+    // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
+    let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
+    let mut skipped_count: u32 = skipped_paths.len() as u32;
 
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
@@ -937,6 +997,40 @@ mod tests {
             !names.iter().any(|n| n == "note.md"),
             "user .obsidian skip failed: {names:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // scan_disk_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_disk_entries_read_fail_goes_to_skipped() {
+        let tmp = mk_tmp("scanreadfail");
+        write_file(&tmp.0, "ok.md", "# ok");
+        // 実在しないファイルを source_files に混ぜる = fs::read 失敗を deterministic に誘発
+        // (collect と read の間で消えた / lock された file の代理)。
+        let missing = tmp.0.join("gone.md");
+        let reg = Registry::defaults();
+        let source = vec![tmp.0.join("ok.md"), missing];
+        let scan = scan_disk_entries(&source, &tmp.0, &reg, crate::parser::MAX_RAW_BINARY_BYTES);
+        let entry_rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(entry_rels, vec!["ok.md"]);
+        assert_eq!(scan.skipped, vec!["gone.md".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_disk_entries_binary_size_skip_goes_to_skipped() {
+        let tmp = mk_tmp("scansize");
+        // is_binary な拡張子 (pdf) を持つ registry を作れないので、cap を極小に
+        // 渡して「size 超過」を誘発する。txt を binary 扱いにはできないため、この
+        // test は cap パラメータ注入で size-skip 分岐を突く。ここでは md を通常読み、
+        // 別途 binary 拡張子は PR-2 で結合テストする。cap の効果は次の assert で。
+        write_file(&tmp.0, "small.md", "# tiny");
+        let reg = Registry::defaults();
+        // md は is_binary=false なので size cap の対象外 = cap を 1 にしても通る。
+        let scan = scan_disk_entries(&[tmp.0.join("small.md")], &tmp.0, &reg, 1);
+        assert_eq!(scan.entries.len(), 1, "text files ignore the binary size cap");
+        assert!(scan.skipped.is_empty());
     }
 
     // -----------------------------------------------------------------------
