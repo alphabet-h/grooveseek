@@ -671,7 +671,10 @@ fn sha256_hex_bytes(bytes: &[u8]) -> String {
 }
 
 /// Compute the hex-encoded SHA-256 digest of a string (thin wrapper over
-/// [`sha256_hex_bytes`]). Retained for the reindex/rename hash-compare call sites.
+/// [`sha256_hex_bytes`]). All production call sites moved to the byte
+/// variant in feature-45; kept test-only for the hash-parity regression
+/// tests that pin old-string-hash == new-byte-hash.
+#[cfg(test)]
 fn sha256_hex(content: &str) -> String {
     sha256_hex_bytes(content.as_bytes())
 }
