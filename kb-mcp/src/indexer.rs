@@ -266,7 +266,7 @@ pub fn rebuild_index(
 
     // legacy DB (quality_score = 1.0 のまま) を一度だけ再評価する。
     // 既にスコアが入っているチャンクは触らないため冪等。
-    let quality_updated = db.backfill_quality()?;
+    let quality_updated = db.backfill_quality(&registry.binary_extensions())?;
     if quality_updated > 0 {
         eprintln!("Backfilled {quality_updated} chunks with quality scores");
     }
@@ -496,7 +496,11 @@ fn index_single_disk_entry(
     )?;
 
     for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
-        let score = quality::chunk_quality_score(chunk.heading.as_deref(), &chunk.content);
+        let score = quality::chunk_quality_score(
+            chunk.heading.as_deref(),
+            &chunk.content,
+            parser.is_binary(),
+        );
         db.insert_chunk(
             doc_id,
             chunk.index as i32,

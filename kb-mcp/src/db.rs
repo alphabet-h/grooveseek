@@ -1578,23 +1578,36 @@ impl Database {
         Ok(count)
     }
 
-    /// legacy DB で `quality_score` が DEFAULT 1.0 のまま放置されて
-    /// いるチャンクを検出し、[`quality::chunk_quality_score`] で再計算して
-    /// UPDATE する (冪等)。既に default 以外のスコアが入っている行は更新
-    /// しないため、2 回目以降の呼び出しは no-op。戻り値は更新件数。
-    pub fn backfill_quality(&self) -> Result<u32> {
+    /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
+    /// チャンクを検出し、[`quality::chunk_quality_score`] で再計算して UPDATE する (冪等)。
+    ///
+    /// `binary_exts` = is_binary な parser の拡張子集合。document の path 拡張子が
+    /// これに含まれれば `is_binary=true` で再計算し、length/structure penalty を免除する。
+    /// これを怠ると初回 index で免除された binary chunk が 2 回目 backfill で penalty
+    /// 転落する (§4.8 P0)。
+    pub fn backfill_quality(&self, binary_exts: &[&str]) -> Result<u32> {
         // 旧 DB (= default 1.0 のまま) のみを対象にする: score != 1.0 の行は
         // 既に計算済みとみなしてスキップ。初期値 1.0 で再計算結果も 1.0 の
         // 正当な行は再 UPDATE されないが、冪等性のためには十分 (挙動上同じ)。
-        let sql = "SELECT id, heading, content FROM chunks WHERE quality_score = 1.0";
+        let sql = "SELECT c.id, c.heading, c.content, d.path
+                   FROM chunks c JOIN documents d ON d.id = c.document_id
+                   WHERE c.quality_score = 1.0";
         let mut stmt = self.conn.prepare(sql)?;
-        let rows: Vec<(i64, Option<String>, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        let rows: Vec<(i64, Option<String>, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut updated = 0u32;
-        for (id, heading, content) in rows {
-            let score = crate::quality::chunk_quality_score(heading.as_deref(), &content);
+        for (id, heading, content, path) in rows {
+            let ext = std::path::Path::new(&path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
+            let score =
+                crate::quality::chunk_quality_score(heading.as_deref(), &content, is_binary);
             if (score - 1.0).abs() < f32::EPSILON {
                 // 再計算でも 1.0 (高品質) → UPDATE 不要
                 continue;
@@ -2105,10 +2118,67 @@ mod tests {
         )
         .unwrap();
 
-        let updated1 = db.backfill_quality().unwrap();
+        let updated1 = db.backfill_quality(&[]).unwrap();
         assert!(updated1 >= 1, "stub chunk must be updated, got {updated1}");
-        let updated2 = db.backfill_quality().unwrap();
+        let updated2 = db.backfill_quality(&[]).unwrap();
         assert_eq!(updated2, 0, "second call must be a no-op");
+    }
+
+    #[test]
+    fn test_backfill_quality_exempts_binary_extension_and_is_stable() {
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        // binary 由来を模した短い chunk (page/slide の表紙相当)。path 拡張子 = pdf。
+        let doc_id = db
+            .upsert_document(
+                "docs/report.pdf",
+                Some("R"),
+                None,
+                Some("docs"),
+                None,
+                &[],
+                None,
+                "h",
+            )
+            .unwrap();
+        let emb = vec![0.0f32; 384];
+        // quality_score は 1.0 で insert (免除された初回 index 相当)。
+        db.insert_chunk(doc_id, 0, Some("p.1"), None, "第3章 リスク管理", &emb, 1.0)
+            .unwrap();
+
+        // binary_exts に "pdf" を渡す → 免除で 1.0 維持。2 回連続でも安定。
+        let u1 = db.backfill_quality(&["pdf"]).unwrap();
+        let u2 = db.backfill_quality(&["pdf"]).unwrap();
+        assert_eq!(u1, 0, "binary chunk must stay exempt (no update)");
+        assert_eq!(u2, 0, "second backfill must be a no-op too");
+        let (above, _below) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(above, 1, "exempt binary chunk must remain above threshold");
+    }
+
+    #[test]
+    fn test_backfill_quality_penalizes_when_not_binary() {
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let doc_id = db
+            .upsert_document(
+                "notes/short.md",
+                Some("S"),
+                None,
+                Some("notes"),
+                None,
+                &[],
+                None,
+                "h",
+            )
+            .unwrap();
+        let emb = vec![0.0f32; 384];
+        db.insert_chunk(doc_id, 0, Some("p.1"), None, "短い本文。", &emb, 1.0)
+            .unwrap();
+        // md は binary_exts に無い → penalty 適用で 1.0 未満へ。
+        let updated = db.backfill_quality(&[]).unwrap();
+        assert_eq!(updated, 1);
+        let (_above, below) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(below, 1, "non-binary short chunk drops below threshold");
     }
 
     #[test]
