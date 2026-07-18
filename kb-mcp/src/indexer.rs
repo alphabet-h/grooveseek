@@ -390,13 +390,28 @@ fn index_single_disk_entry(
             reason: "no parser for extension",
         });
     };
-    let content = std::fs::read_to_string(&entry.full)
-        .with_context(|| format!("failed to read {}", entry.full.display()))?;
+    let bytes = match std::fs::read(&entry.full) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Skipping {}: failed to read: {e}", entry.rel);
+            return Ok(SingleResult::Skipped {
+                reason: "read failed",
+            });
+        }
+    };
     let excludes: Vec<&str> = match exclude_headings {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => crate::parser::DEFAULT_EXCLUDED_HEADINGS.to_vec(),
     };
-    let parsed = parser.parse(&content, &entry.rel, &excludes);
+    let parsed = match parser.parse_bytes(&bytes, &entry.rel, &excludes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping {}: parse failed: {e}", entry.rel);
+            return Ok(SingleResult::Skipped {
+                reason: "parse failed",
+            });
+        }
+    };
 
     if parsed.chunks.is_empty() {
         return Ok(SingleResult::Skipped {
@@ -507,9 +522,9 @@ pub fn reindex_single_file(
             reason: "file no longer exists",
         });
     }
-    let content = std::fs::read_to_string(&full)
+    let bytes = std::fs::read(&full)
         .with_context(|| format!("failed to read {}", full.display()))?;
-    let hash = sha256_hex(&content);
+    let hash = sha256_hex_bytes(&bytes);
     let entry = DiskEntry {
         rel: rel.to_string(),
         hash,
@@ -570,9 +585,9 @@ pub fn rename_single_file(
         db.delete_document(new_rel)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
     }
-    let new_content = std::fs::read_to_string(&full)
+    let new_bytes = std::fs::read(&full)
         .with_context(|| format!("failed to read {}", full.display()))?;
-    let new_hash = sha256_hex(&new_content);
+    let new_hash = sha256_hex_bytes(&new_bytes);
     if new_hash == old_hash {
         return Ok(RenameOutcome::Renamed);
     }
