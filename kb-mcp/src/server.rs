@@ -1116,8 +1116,8 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
 /// `get_document` ツール用に、拡張子に対応する Parser で
 /// frontmatter (title/date/topic/tags) を抽出し DocumentResponse を組む。
 /// 純粋関数化してテスト可能にしている。
-/// `get_document` の最大バイト数。1 MiB を超える文書は read_to_string
-/// 一括読みでのメモリ膨張・レスポンス過大を避けるため拒否する。
+/// `get_document` の最大バイト数。1 MiB を超える文書は `fs::read` による
+/// バイト一括読みでのメモリ膨張・レスポンス過大を避けるため拒否する。
 pub(crate) const GET_DOCUMENT_MAX_BYTES: u64 = 1024 * 1024;
 
 /// get_document がバイナリ形式で応答する抽出テキストの上限 (1 MiB)。超過分は
