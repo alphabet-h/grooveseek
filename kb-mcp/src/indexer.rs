@@ -172,6 +172,23 @@ fn detect_renames(
     pairs
 }
 
+/// prune 対象 (= disk から消えた document path) を決める純粋関数。
+///
+/// 「visited (今回 index した) でも skipped (read 失敗 / size skip で保持) でもない」
+/// DB path のみ削除対象とする (§4.2 skip 統一原則)。理由の別 (IO エラー / サイズ超過)
+/// によらず「skip = 保持、削除は disk から消えた時のみ」を単一原則で表現する。
+fn documents_to_delete(
+    all_db_paths: &[String],
+    visited: &HashSet<String>,
+    skipped: &HashSet<String>,
+) -> Vec<String> {
+    all_db_paths
+        .iter()
+        .filter(|p| !visited.contains(p.as_str()) && !skipped.contains(p.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Summary returned by [`rebuild_index`].
 pub struct IndexResult {
     pub total_documents: u32,
@@ -304,15 +321,14 @@ pub fn rebuild_index(
         }
     }
 
-    // 3. Delete documents in DB that no longer exist on disk
+    // 3. Delete documents in DB that no longer exist on disk.
+    //    §4.2 統一原則: visited ∪ skipped は保持、それ以外 (= disk から消えた) のみ削除。
     let all_db_paths = db.all_document_paths()?;
     let mut deleted: u32 = 0;
-    for db_path in &all_db_paths {
-        if !visited_paths.contains(db_path) {
-            db.delete_document(db_path)?;
-            deleted += 1;
-            progress.report_deleted(db_path);
-        }
+    for db_path in documents_to_delete(&all_db_paths, &visited_paths, &skipped_paths) {
+        db.delete_document(&db_path)?;
+        deleted += 1;
+        progress.report_deleted(&db_path);
     }
 
     // Count total documents remaining (includes unchanged ones)
@@ -728,6 +744,27 @@ mod tests {
         let pairs = detect_renames(&disk, &db);
         // hash 不一致なのでペアにしない (old.md は削除対象、new.md は新規追加)
         assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_documents_to_delete_retains_skipped_paths() {
+        // DB に a.md / b.md / c.md。visited = {a.md} (今回 index), skipped = {b.md}
+        // (read 失敗 or size skip)。c.md だけが「disk から消えた」= 削除対象。
+        let all_db: Vec<String> = ["a.md", "b.md", "c.md"].iter().map(|s| s.to_string()).collect();
+        let visited: HashSet<String> = ["a.md".to_string()].into_iter().collect();
+        let skipped: HashSet<String> = ["b.md".to_string()].into_iter().collect();
+        let to_delete = documents_to_delete(&all_db, &visited, &skipped);
+        assert_eq!(to_delete, vec!["c.md".to_string()], "skipped path must be retained");
+    }
+
+    #[test]
+    fn test_documents_to_delete_empty_skipped_deletes_unvisited() {
+        // skipped 空 = 従来挙動: visited に無い DB path は削除。
+        let all_db: Vec<String> = ["a.md", "gone.md"].iter().map(|s| s.to_string()).collect();
+        let visited: HashSet<String> = ["a.md".to_string()].into_iter().collect();
+        let skipped: HashSet<String> = HashSet::new();
+        let to_delete = documents_to_delete(&all_db, &visited, &skipped);
+        assert_eq!(to_delete, vec!["gone.md".to_string()]);
     }
 
     #[test]
