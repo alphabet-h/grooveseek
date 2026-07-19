@@ -7,53 +7,95 @@
 
 use std::io::{Cursor, Read};
 
+use anyhow::{Result, bail};
 use quick_xml::events::{BytesRef, Event};
 use quick_xml::reader::Reader;
 
 use super::Frontmatter;
 
-/// zip 内 `name` エントリを丸ごとバイト列で読む。無ければ None。
-///
-/// codex P2 (PR #70 round 1, zip-bomb hardening): `read_to_end` は元々
-/// unbounded だったため、crafted 高圧縮ファイル (zip bomb) で
-/// `super::MAX_RAW_BINARY_BYTES` (raw 50 MiB cap) をすり抜けてメモリ枯渇
-/// し得た。2 段で bound する:
-/// 1. エントリの申告 uncompressed size (`ZipFile::size()`、local file header
-///    由来) が cap を超えていれば、展開を試みる前に即座に None を返す。
-/// 2. 実読みも `Read::take` で cap+1 バイトまでに bound し、申告 size が
-///    偽装された crafted zip (実際の解凍結果が申告よりずっと大きい) でも
-///    メモリ確保は cap+1 バイトどまりにした上で、読めたバイト数が cap を
-///    超えていれば None として拒否する。
+/// zip 内 `name` エントリを丸ごとバイト列で読む。無ければ `Ok(None)`。
+/// `budget` (呼び出し側が文書単位で保持する累積展開済みバイト数) を通じて
+/// 文書全体の解凍量を bound する。詳細は [`read_zip_entry_capped`] 参照
+/// (このラッパーは cap に `super::MAX_RAW_BINARY_BYTES` を固定で使う)。
 pub(crate) fn read_zip_entry(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     name: &str,
-) -> Option<Vec<u8>> {
-    let mut file = zip.by_name(name).ok()?;
-    if file.size() > super::MAX_RAW_BINARY_BYTES {
-        return None;
+    budget: &mut u64,
+) -> Result<Option<Vec<u8>>> {
+    read_zip_entry_capped(zip, name, budget, super::MAX_RAW_BINARY_BYTES)
+}
+
+/// `read_zip_entry` の cap 注入版。unit test が小さい cap で累積 budget
+/// 超過分岐を突くため分離する (xlsx.rs::parse_workbook_bytes_capped の
+/// cap 注入パターンを踏襲)。
+///
+/// zip-bomb hardening を 2 レイヤで行う:
+///
+/// - **codex P2 (PR #70 round 1)**: per-entry の展開を 2 段で bound する。
+///   1. エントリの申告 uncompressed size (`ZipFile::size()`、local file
+///      header 由来) が `cap` を超えていれば、展開を試みる前に即座に
+///      `Ok(None)` を返す。
+///   2. 実読みも `Read::take` で `cap+1` バイトまでに bound し、申告 size
+///      が偽装された crafted zip (実際の解凍結果が申告よりずっと大きい)
+///      でもメモリ確保は `cap+1` バイトどまりにした上で、読めたバイト数が
+///      `cap` を超えていれば `Ok(None)` として拒否する。
+/// - **codex P2 (PR #70 round 2)**: 上記は「1 エントリ」単位の防御であり、
+///   `cap` 未満のエントリを多数読むと文書全体では累積が青天井になり得た
+///   (例: 数百個の notesSlide/rels パートを合計すると数百 MB)。呼び出し側
+///   が文書単位で保持する `budget` にこの関数の呼び出しごとに読んだバイト
+///   数を加算し、累積が `cap` を超えたら `Err` を返す。1 エントリ拒否
+///   (`Ok(None)`) ではなく文書単位で abort する — 既に相当量を展開済みの
+///   文書をさらに読み進めるのは危険なため、呼び出し側 (`docx.rs` /
+///   `pptx.rs` の `parse_bytes`) はこの `Err` を `?` でそのまま伝播し、
+///   文書全体の parse を諦める。
+fn read_zip_entry_capped(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    name: &str,
+    budget: &mut u64,
+    cap: u64,
+) -> Result<Option<Vec<u8>>> {
+    let mut file = match zip.by_name(name) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    if file.size() > cap {
+        return Ok(None);
     }
     let mut buf = Vec::new();
     // cap+1 まで読めれば「申告 size が嘘だった (cap を実際は超えている)」と
     // 判定できる。ちょうど cap バイトのエントリは正常に許可する。
-    let limit = super::MAX_RAW_BINARY_BYTES.saturating_add(1);
-    (&mut file).take(limit).read_to_end(&mut buf).ok()?;
-    if buf.len() as u64 > super::MAX_RAW_BINARY_BYTES {
-        return None;
+    let limit = cap.saturating_add(1);
+    if (&mut file).take(limit).read_to_end(&mut buf).is_err() {
+        return Ok(None);
     }
-    Some(buf)
+    if buf.len() as u64 > cap {
+        return Ok(None);
+    }
+    *budget = budget.saturating_add(buf.len() as u64);
+    if *budget > cap {
+        bail!(
+            "cumulative decompressed size across zip entries exceeds {cap} bytes \
+             (zip-bomb guard)"
+        );
+    }
+    Ok(Some(buf))
 }
 
 /// `docProps/core.xml` があれば Frontmatter に map、無ければ filename fallback。
+/// `budget` は `read_zip_entry` に渡す文書単位の累積展開済みバイト数
+/// (呼び出し側が document.xml / slides 等の読み出しと共有する)。累積 cap
+/// 超過時は `Err` を返す (呼び出し側は文書全体の parse を諦める)。
 pub(crate) fn core_xml_frontmatter(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     path_hint: &str,
-) -> Frontmatter {
-    match read_zip_entry(zip, "docProps/core.xml") {
-        Some(bytes) => parse_core_xml(&bytes, path_hint),
-        None => Frontmatter {
+    budget: &mut u64,
+) -> Result<Frontmatter> {
+    match read_zip_entry(zip, "docProps/core.xml", budget)? {
+        Some(bytes) => Ok(parse_core_xml(&bytes, path_hint)),
+        None => Ok(Frontmatter {
             title: super::txt::derive_title_pub(path_hint),
             ..Frontmatter::default()
-        },
+        }),
     }
 }
 
@@ -227,8 +269,11 @@ mod tests {
         drop(payload);
 
         let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        let mut budget: u64 = 0;
         assert!(
-            read_zip_entry(&mut archive, "big.bin").is_none(),
+            read_zip_entry(&mut archive, "big.bin", &mut budget)
+                .unwrap()
+                .is_none(),
             "entry declaring uncompressed size > MAX_RAW_BINARY_BYTES must be rejected \
              without attempting to decompress it"
         );
@@ -246,9 +291,45 @@ mod tests {
             zip.finish().unwrap();
         }
         let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        let mut budget: u64 = 0;
         assert_eq!(
-            read_zip_entry(&mut archive, "small.bin"),
+            read_zip_entry(&mut archive, "small.bin", &mut budget).unwrap(),
             Some(b"hello world".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_read_zip_entry_capped_rejects_cumulative_budget_over_cap() {
+        // codex P2 (PR #70 round 2): 1 エントリずつは cap 未満でも、複数
+        // エントリを積算すると budget を超え得る (例: 数百個の
+        // notesSlide/rels パートの合計)。小さい cap を注入して、2 エントリ目
+        // で累積が cap を超えたら Err になることを、実データを MB 単位で
+        // 書かずに確認する (xlsx.rs::parse_workbook_bytes_capped と同じ
+        // cap 注入パターン)。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("a.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap(); // 10 bytes
+            zip.start_file("b.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap(); // 10 bytes
+            zip.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        let mut budget: u64 = 0;
+        let cap: u64 = 15; // 1 エントリ (10 byte) は cap 未満だが 2 つ合計 20 byte は超える
+
+        let first = read_zip_entry_capped(&mut archive, "a.bin", &mut budget, cap).unwrap();
+        assert_eq!(first, Some(b"0123456789".to_vec()));
+        assert_eq!(budget, 10);
+
+        let second = read_zip_entry_capped(&mut archive, "b.bin", &mut budget, cap);
+        assert!(
+            second.is_err(),
+            "cumulative budget (20 bytes) exceeding cap (15 bytes) across 2 within-cap \
+             entries must be Err"
         );
     }
 

@@ -31,10 +31,15 @@ impl Parser for DocxParser {
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| {
             anyhow!("{path_hint}: cannot open docx zip (corrupt or encrypted): {e}")
         })?;
-        let doc_xml = super::ooxml::read_zip_entry(&mut zip, "word/document.xml")
+        // 文書単位の累積展開済みバイト数。word/document.xml + docProps/core.xml
+        // の両読み出しで共有し、累積が cap を超えたら Err にする (codex P2,
+        // PR #70 round 2 zip-bomb hardening: 個々のエントリが cap 未満でも
+        // 積算で無制限に膨らむのを防ぐ)。
+        let mut budget: u64 = 0;
+        let doc_xml = super::ooxml::read_zip_entry(&mut zip, "word/document.xml", &mut budget)?
             .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
         let chunks = parse_document_xml(&doc_xml, exclude_headings);
-        let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint);
+        let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
         let raw_content = chunks
             .iter()
             .map(|c| c.content.as_str())

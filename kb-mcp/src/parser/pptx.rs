@@ -44,6 +44,12 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("{path_hint}: cannot open pptx zip (corrupt or encrypted): {e}"))?;
 
+    // 文書単位の累積展開済みバイト数。この pptx から読む全エントリ (slides /
+    // notes / rels / presentation.xml / core.xml) で共有し、累積が cap を
+    // 超えたら Err にする (codex P2, PR #70 round 2 zip-bomb hardening:
+    // 個々のエントリが cap 未満でも積算で無制限に膨らむのを防ぐ)。
+    let mut budget: u64 = 0;
+
     // slide エントリをファイル番号順に集める (zip 内順序非依存。
     // presentation.xml が読めない場合のフォールバック用)。
     let mut slide_nums: Vec<usize> = zip
@@ -57,7 +63,8 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     // 解決できればそちらを優先し、`Slide {n}` ラベルは可視順の 1-origin
     // 連番 (= 実際のファイル番号ではない) とする。読めない/非標準な zip
     // では file 番号ソートにフォールバックする (index 全体を諦めさせない)。
-    let ordered_file_nums = resolve_visible_slide_order(&mut zip).unwrap_or(slide_nums);
+    let ordered_file_nums =
+        resolve_visible_slide_order(&mut zip, &mut budget)?.unwrap_or(slide_nums);
 
     let mut chunks = Vec::new();
     for (display_idx, file_n) in ordered_file_nums.into_iter().enumerate() {
@@ -65,7 +72,8 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         let slide_xml = match super::ooxml::read_zip_entry(
             &mut zip,
             &format!("ppt/slides/slide{file_n}.xml"),
-        ) {
+            &mut budget,
+        )? {
             Some(b) => b,
             None => continue,
         };
@@ -80,10 +88,11 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         let notes_path = super::ooxml::read_zip_entry(
             &mut zip,
             &format!("ppt/slides/_rels/slide{file_n}.xml.rels"),
-        )
+            &mut budget,
+        )?
         .and_then(|rels_xml| resolve_notes_path(&rels_xml));
         if let Some(path) = notes_path
-            && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path)
+            && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path, &mut budget)?
         {
             let notes_text = collect_a_t(&notes_xml);
             if !notes_text.trim().is_empty() {
@@ -106,7 +115,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         });
     }
 
-    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint);
+    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
     let raw_content = chunks
         .iter()
         .map(|c| c.content.as_str())
@@ -190,16 +199,28 @@ fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
 /// の可視順とズレて `Slide {n}` ラベルが実際の表示順と食い違っていた。
 ///
 /// presentation.xml / rels が読めない、`sldIdLst` が空、あるいは 1 件も
-/// slide 番号へ解決できない場合は None を返す (呼び出し側は file 番号ソート
-/// にフォールバックする — 壊れた/非標準な zip で index 全体を諦めさせない)。
-fn resolve_visible_slide_order(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Option<Vec<usize>> {
-    let presentation_xml = super::ooxml::read_zip_entry(zip, "ppt/presentation.xml")?;
+/// slide 番号へ解決できない場合は `Ok(None)` を返す (呼び出し側は file
+/// 番号ソートにフォールバックする — 壊れた/非標準な zip で index 全体を
+/// 諦めさせない)。`budget` の累積 cap 超過時は `Err` を返す (codex P2,
+/// PR #70 round 2 zip-bomb hardening: `read_zip_entry` 参照)。
+fn resolve_visible_slide_order(
+    zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    budget: &mut u64,
+) -> Result<Option<Vec<usize>>> {
+    let Some(presentation_xml) = super::ooxml::read_zip_entry(zip, "ppt/presentation.xml", budget)?
+    else {
+        return Ok(None);
+    };
     let rids = parse_sld_id_list(&presentation_xml);
     if rids.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let rels_xml = super::ooxml::read_zip_entry(zip, "ppt/_rels/presentation.xml.rels")?;
+    let Some(rels_xml) =
+        super::ooxml::read_zip_entry(zip, "ppt/_rels/presentation.xml.rels", budget)?
+    else {
+        return Ok(None);
+    };
     let rid_to_path: HashMap<String, String> = parse_relationships(&rels_xml)
         .into_iter()
         .map(|(id, _, target)| (id, resolve_relative_target("ppt", &target)))
@@ -210,7 +231,7 @@ fn resolve_visible_slide_order(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Opti
         .filter_map(|rid| rid_to_path.get(rid))
         .filter_map(|path| slide_number(path, "ppt/slides/slide", ".xml"))
         .collect();
-    if order.is_empty() { None } else { Some(order) }
+    Ok(if order.is_empty() { None } else { Some(order) })
 }
 
 /// `ppt/presentation.xml` の `<p:sldIdLst>` 内 `<p:sldId r:id="rIdX" .../>` から

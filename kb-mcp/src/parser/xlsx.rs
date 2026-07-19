@@ -75,12 +75,30 @@ fn parse_workbook_bytes_capped(
     path_hint: &str,
     sheet_max_bytes: usize,
 ) -> Result<ParsedDocument> {
+    // codex P2 (PR #70 round 2, zip-bomb hardening): calamine は zip 展開を
+    // 内部で行うため `ooxml::read_zip_entry` の累積 budget 機構が効かない。
+    // calamine を呼ぶ前に、実際に読まれる XML part (worksheets/
+    // sharedStrings/styles) の申告 uncompressed size 合計を検査する。
+    preflight_xlsx_decompression_budget(bytes, path_hint)?;
+
     let cursor = Cursor::new(bytes);
     let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
         .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
     let mut chunks = Vec::new();
-    for (name, range) in workbook.worksheets() {
+    // codex P2 (PR #70 round 2): `workbook.worksheets()` は全シートを一括で
+    // `Vec<(String, Range<Data>)>` に materialize するため、シート数×サイズ
+    // が大きい workbook でピークメモリが跳ね上がる。`sheet_names()` +
+    // シート毎 `worksheet_range()` の逐次処理に変え、各シートの Range を
+    // 処理し終えたら都度 drop してメモリを解放する。
+    for name in workbook.sheet_names() {
+        let range = match workbook.worksheet_range(&name) {
+            Ok(r) => r,
+            // 旧実装 (`worksheets()`) も内部で `.ok()?` により読めない
+            // シートを黙って skip していたのと同じ挙動
+            // (calamine::xlsx::Xlsx::worksheets 実装参照)。
+            Err(_) => continue,
+        };
         let mut text = String::new();
         for row in range.rows() {
             let line: Vec<String> = row
@@ -101,6 +119,7 @@ fn parse_workbook_bytes_capped(
                 break;
             }
         }
+        drop(range); // シート毎に明示的に drop してメモリを解放 (逐次処理)
         if text.trim().is_empty() {
             continue; // 空シートは chunk を作らない
         }
@@ -127,9 +146,62 @@ fn parse_workbook_bytes_capped(
     })
 }
 
+/// calamine 呼び出し前の pre-flight 検査 (cap は固定で `super::MAX_RAW_BINARY_BYTES`
+/// を使う薄い wrapper)。詳細は [`preflight_xlsx_decompression_budget_capped`] 参照。
+fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<()> {
+    preflight_xlsx_decompression_budget_capped(bytes, path_hint, super::MAX_RAW_BINARY_BYTES)
+}
+
+/// `xl/worksheets/*.xml` + `xl/sharedStrings.xml` + `xl/styles.xml` の申告
+/// uncompressed size (zip local file header 由来、展開はしない) を合計し、
+/// `cap` を超えていれば calamine を呼ぶ前に `Err` にする。
+///
+/// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
+/// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
+/// parser は zip 展開を経由しない)。
+///
+/// cap を注入できる版として分離する (unit test が小さい cap で on-the-fly の
+/// 小さい fixture のまま超過分岐を突くため。`parse_workbook_bytes_capped`
+/// の `sheet_max_bytes` 注入パターンを踏襲)。
+fn preflight_xlsx_decompression_budget_capped(
+    bytes: &[u8],
+    path_hint: &str,
+    cap: u64,
+) -> Result<()> {
+    let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return Ok(());
+    };
+    let mut total: u64 = 0;
+    for i in 0..zip.len() {
+        let Ok(entry) = zip.by_index_raw(i) else {
+            continue;
+        };
+        let name = entry.name();
+        let is_target = name == "xl/sharedStrings.xml"
+            || name == "xl/styles.xml"
+            || (name.starts_with("xl/worksheets/") && name.ends_with(".xml"));
+        if is_target {
+            total = total.saturating_add(entry.size());
+        }
+    }
+    if total > cap {
+        anyhow::bail!(
+            "{path_hint}: declared xl worksheets/sharedStrings/styles size ({total} bytes) \
+             exceeds {cap} bytes cap (zip-bomb guard)"
+        );
+    }
+    Ok(())
+}
+
 fn xlsx_frontmatter(bytes: &[u8], path_hint: &str) -> super::Frontmatter {
     if let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) {
-        super::ooxml::core_xml_frontmatter(&mut zip, path_hint)
+        let mut budget: u64 = 0;
+        super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget).unwrap_or_else(|_| {
+            super::Frontmatter {
+                title: super::txt::derive_title_pub(path_hint),
+                ..Default::default()
+            }
+        })
     } else {
         super::Frontmatter {
             title: super::txt::derive_title_pub(path_hint),
@@ -221,6 +293,34 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn test_xlsx_preflight_rejects_cumulative_declared_size_over_cap() {
+        // codex P2 (PR #70 round 2, zip-bomb hardening): calamine は zip
+        // 展開を内部で行うため `ooxml::read_zip_entry` の累積 budget 機構が
+        // 効かない。calamine を呼ぶ前に xl/worksheets/*.xml の申告
+        // uncompressed size を検査し、cap 超過なら Err にする。実データを
+        // MB 単位で書かずに、小さい cap を注入して on-the-fly の小さい
+        // fixture のまま再現する (xlsx.rs::parse_workbook_bytes_capped と
+        // 同じ cap 注入パターン)。
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+        let err = preflight_xlsx_decompression_budget_capped(&bytes, "x.xlsx", 5)
+            .expect_err("declared worksheet xml size over the injected 5-byte cap must be Err");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_xlsx_preflight_allows_within_real_cap() {
+        // 通常サイズの xlsx は実 cap (MAX_RAW_BINARY_BYTES) 内で問題なく通る
+        // (回帰確認)。公開 wrapper (`preflight_xlsx_decompression_budget`)
+        // 経由でも検証する。
+        let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
+        preflight_xlsx_decompression_budget(&bytes, "x.xlsx")
+            .expect("declared size well within the real cap must be Ok");
     }
 
     #[test]
