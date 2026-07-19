@@ -58,6 +58,14 @@ pub(crate) fn core_xml_frontmatter(
 }
 
 /// core.xml バイト列を parse する (名前空間 prefix を無視し local name で判定)。
+///
+/// codex P2 (PR #70 round 2): 旧実装は `Event::Text` を都度直接代入していた
+/// ため、entity 参照 (quick-xml 0.38+ で `Event::Text` に含まれず
+/// `Event::GeneralRef` として別 event で届く) を挟む値
+/// (`<dc:title>R&amp;D</dc:title>` 等) が最後の Text fragment だけで
+/// 上書きされ、それより前の部分 ("R&") が失われていた。docx/pptx 本文と
+/// 同じく要素単位で Text + GeneralRef をバッファに蓄積してから `End` で
+/// 確定する方式に変更する。
 fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -66,14 +74,16 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
     let mut modified: Option<String> = None;
     let mut buf = Vec::new();
     let mut cur: Option<Vec<u8>> = None; // 現在開いている要素の local name
+    let mut text_buf = String::new(); // cur 要素の Text + GeneralRef 蓄積用
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 cur = Some(local_name_pub(e.name().as_ref()).to_vec());
+                text_buf.clear();
             }
             Ok(Event::Text(t)) => {
-                if let Some(name) = &cur {
+                if cur.is_some() {
                     // quick-xml 0.41 は `BytesText::unescape()` を廃止し、
                     // encoding decode (`decode()`) と entity unescape
                     // (`quick_xml::escape::unescape()`) を分離した。
@@ -81,16 +91,30 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
                     let text = quick_xml::escape::unescape(&decoded)
                         .map(|c| c.into_owned())
                         .unwrap_or_else(|_| decoded.into_owned());
+                    text_buf.push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                // quick-xml 0.38+ は entity 参照 (`&amp;` 等) を `Event::Text`
+                // に含めず `Event::GeneralRef` として別 event で届ける。ここを
+                // 処理しないと `<dc:title>R&amp;D</dc:title>` の "&" が欠落する
+                // (docx.rs/pptx.rs 同様の必須処理)。
+                if cur.is_some() {
+                    text_buf.push_str(&resolve_general_ref(&r));
+                }
+            }
+            Ok(Event::End(_)) => {
+                if let Some(name) = cur.take() {
                     match name.as_slice() {
                         b"title" => {
-                            if !text.trim().is_empty() {
-                                fm.title = Some(text.trim().to_string());
+                            if !text_buf.trim().is_empty() {
+                                fm.title = Some(text_buf.trim().to_string());
                             }
                         }
-                        b"created" => created = Some(text),
-                        b"modified" => modified = Some(text),
+                        b"created" => created = Some(text_buf.clone()),
+                        b"modified" => modified = Some(text_buf.clone()),
                         b"keywords" => {
-                            fm.tags = text
+                            fm.tags = text_buf
                                 .split([',', ';'])
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty())
@@ -99,8 +123,8 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
                         _ => {}
                     }
                 }
+                text_buf.clear();
             }
-            Ok(Event::End(_)) => cur = None,
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
@@ -246,6 +270,28 @@ mod tests {
             fm.tags,
             vec!["売上".to_string(), "予測".to_string(), "分析".to_string()]
         );
+    }
+
+    #[test]
+    fn test_parse_core_xml_preserves_entity_references() {
+        // codex P2 (PR #70 round 2): 旧実装は Text event を都度直接代入して
+        // いたため、entity 参照 (quick-xml 0.38+ で `Event::GeneralRef` として
+        // 別 event で届く) を挟む値が最後の Text fragment だけで上書きされて
+        // いた。`<dc:title>R&amp;D</dc:title>` は
+        // Text("R") → 代入 "R" → GeneralRef("amp") は `_ => {}` で無視
+        // → Text("D") → 代入 "D" (上書き) という経路を辿り、最終的に
+        // fm.title == "D" になり "R&" が失われるバグがあった (keywords も同型)。
+        // docx/pptx 本文と同じく要素単位で Text + GeneralRef を蓄積してから
+        // End で確定する。
+        let xml = r#"<?xml version="1.0"?>
+<cp:coreProperties xmlns:cp="x" xmlns:dc="y">
+  <dc:title>R&amp;D</dc:title>
+  <cp:keywords>A&amp;B, C</cp:keywords>
+</cp:coreProperties>"#
+            .as_bytes();
+        let fm = parse_core_xml(xml, "docs/rd.docx");
+        assert_eq!(fm.title.as_deref(), Some("R&D"));
+        assert_eq!(fm.tags, vec!["A&B".to_string(), "C".to_string()]);
     }
 
     #[test]
