@@ -335,13 +335,28 @@ fn cp1252_char_to_byte(c: char) -> Option<u8> {
 fn normalize_pdf_date(raw: &str) -> Option<String> {
     let s = raw.trim();
     let s = s.strip_prefix("D:").unwrap_or(s);
-    // (1) 先頭 8 桁が数字 = PDF `D:YYYYMMDD...` / bare `YYYYMMDD`。
+    // (1) 先頭 8 桁が数字 = PDF `D:YYYYMMDD...` / bare `YYYYMMDD`。8 byte
+    // 全てが ASCII digit だと確認済みなので、その内側の &s[0..4] 等の
+    // スライスは常に char 境界上にあり panic しない。
     if s.len() >= 8 && s.as_bytes()[..8].iter().all(u8::is_ascii_digit) {
         return Some(format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]));
     }
-    // (2) ISO `YYYY-MM-DD...` 形式ならその先頭 10 文字。
-    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
-        return Some(s[..10].to_string());
+    // (2) ISO `YYYY-MM-DD...` 形式ならその先頭 10 文字。旧実装の `s[..10]`
+    // は byte 境界チェック無しの panic-prone slice で、CreationDate に
+    // multibyte 文字が混入し (例: "2026-07-あ...") byte offset 10 がその
+    // 文字の内側に来ると "byte index 10 is not a char boundary" で panic
+    // していた。panic は catch_unwind に拾われ、本来抽出できたはずの文書
+    // 全体が「PDF extraction panicked」として丸ごと skip される事故に
+    // つながる (codex P2, PR #69 round 3)。`s.get(..10)` で境界外/境界
+    // 不一致を安全に `None` 化し、さらに切り出した 10 byte が全て ASCII
+    // digit か `-` であることも検証して意味のある日付部分だけを受理する。
+    if s.len() >= 10
+        && s.as_bytes()[4] == b'-'
+        && s.as_bytes()[7] == b'-'
+        && let Some(candidate) = s.get(..10)
+        && candidate.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    {
+        return Some(candidate.to_string());
     }
     None
 }
@@ -535,6 +550,18 @@ mod tests {
             Some("2026-07-19")
         );
         assert_eq!(normalize_pdf_date("garbage"), None);
+    }
+
+    #[test]
+    fn test_normalize_pdf_date_multibyte_at_boundary_returns_none_not_panic() {
+        // codex P2 follow-up (PR #69 round 3): "あ" (U+3042) is a 3-byte
+        // UTF-8 char occupying bytes 8..11, so it straddles the ISO-branch's
+        // byte offset 10. The old `s[..10]` byte-range slice panicked with
+        // "byte index 10 is not a char boundary" for CreationDate values
+        // like this (multibyte garbage mixed into an otherwise ISO-shaped
+        // date). Must return None instead of panicking — the containing
+        // document should still index normally, just without a date.
+        assert_eq!(normalize_pdf_date("2026-07-あ"), None);
     }
 
     #[test]

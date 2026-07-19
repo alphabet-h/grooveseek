@@ -31,16 +31,20 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   disable panic reporting process-wide or hide unrelated threads' panics
   (found by codex review on PR #69). Post-processing applies a
   conservative line-end hyphenation join (only when both neighbors of
-  `-\n` are ASCII lowercase, to avoid
-  corrupting hyphenated model numbers, dates, or CJK-adjacent hyphens)
-  and normalizes common ligatures (ﬁ/ﬂ/ﬀ/ﬃ/ﬄ). Also recovers UTF-16BE PDF
-  Info-dict `Title` strings (common for non-ASCII titles) that
-  `oxidize-pdf` mis-decodes one byte at a time when it doesn't detect the
-  byte-order-mark — found while dogfooding a real Japanese PDF; falls
-  back to the filename-derived title when recovery isn't possible instead
-  of surfacing mojibake. See the README "PDF indexing" note for remaining
-  known limitations (no OCR, multi-column reading order, unfiltered
-  garbage `Title` metadata that doesn't match the UTF-16BE pattern).
+  `-\n` are ASCII lowercase, to avoid corrupting hyphenated model
+  numbers, dates, or CJK-adjacent hyphens) and normalizes common
+  ligatures (ﬁ/ﬂ/ﬀ/ﬃ/ﬄ). Also recovers UTF-16BE PDF Info-dict `Title`
+  strings (common for non-ASCII titles) that `oxidize-pdf` mis-decodes
+  one byte at a time when it doesn't detect the byte-order-mark — found
+  while dogfooding a real Japanese PDF; falls back to the
+  filename-derived title when recovery isn't possible instead of
+  surfacing mojibake. `CreationDate` parsing no longer panics on a
+  multibyte-contaminated ISO date string (found by codex review on
+  PR #69) — an invalid date is now silently ignored (`date: null`)
+  instead of taking down the whole document's extraction. See the
+  README "PDF indexing" note for remaining known limitations (no OCR,
+  multi-column reading order, unfiltered garbage `Title` metadata that
+  doesn't match the UTF-16BE pattern).
 
 ### Changed
 
