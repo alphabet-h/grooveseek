@@ -7,7 +7,7 @@
 
 use std::io::{Cursor, Read};
 
-use quick_xml::events::Event;
+use quick_xml::events::{BytesRef, Event};
 use quick_xml::reader::Reader;
 
 use super::Frontmatter;
@@ -113,6 +113,27 @@ pub(crate) fn local_name_pub(qname: &[u8]) -> &[u8] {
     match qname.iter().position(|&b| b == b':') {
         Some(i) => &qname[i + 1..],
         None => qname,
+    }
+}
+
+/// `Event::GeneralRef` (`&ref;` / `&#NN;`) を解決した文字列に変換する。数値参照
+/// (`&#38;` / `&#x26;`) と XML 定義済み 5 entity (`amp`/`lt`/`gt`/`apos`/`quot`)
+/// を解決する。未知の named entity (docx/pptx では実質発生しない、カスタム DTD
+/// 前提) は best-effort でリテラル `&name;` として残す。
+///
+/// docx.rs (Task 3.4) と pptx.rs (Task 3.5) の両方が同じ quick-xml 0.38+ の
+/// `Event::GeneralRef` 分割挙動 (entity 参照が `Event::Text` に含まれず別
+/// event で届く) に対処する必要があるため、ここに共通化する (重複実装を避ける)。
+pub(crate) fn resolve_general_ref(r: &BytesRef) -> String {
+    if let Ok(Some(ch)) = r.resolve_char_ref() {
+        return ch.to_string();
+    }
+    match r.decode() {
+        Ok(name) => match quick_xml::escape::resolve_xml_entity(&name) {
+            Some(s) => s.to_string(),
+            None => format!("&{name};"),
+        },
+        Err(_) => String::new(),
     }
 }
 

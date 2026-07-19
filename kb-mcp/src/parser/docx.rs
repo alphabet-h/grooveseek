@@ -2,7 +2,7 @@
 use std::io::Cursor;
 
 use anyhow::{Result, anyhow};
-use quick_xml::events::{BytesRef, BytesStart, Event};
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
 use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
@@ -114,7 +114,7 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
                 // quick-xml 0.38+ は entity 参照 (`&amp;` 等) を `Event::Text`
                 // に含めず `Event::GeneralRef` として別 event で届ける。ここを
                 // 処理しないと `<w:t>A&amp;B</w:t>` の "&" が欠落する。
-                para_text.push_str(&resolve_general_ref(&r));
+                para_text.push_str(&super::ooxml::resolve_general_ref(&r));
             }
             Ok(Event::End(e)) => match super::ooxml_local(e.name().as_ref()) {
                 b"t" => in_text = false,
@@ -163,23 +163,6 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
             content: s.body,
         })
         .collect()
-}
-
-/// `Event::GeneralRef` (`&ref;` / `&#NN;`) を解決した文字列に変換する。数値参照
-/// (`&#38;` / `&#x26;`) と XML 定義済み 5 entity (`amp`/`lt`/`gt`/`apos`/`quot`)
-/// を解決する。未知の named entity (docx では実質発生しない、カスタム DTD 前提)
-/// は best-effort でリテラル `&name;` として残す。
-fn resolve_general_ref(r: &BytesRef) -> String {
-    if let Ok(Some(ch)) = r.resolve_char_ref() {
-        return ch.to_string();
-    }
-    match r.decode() {
-        Ok(name) => match quick_xml::escape::resolve_xml_entity(&name) {
-            Some(s) => s.to_string(),
-            None => format!("&{name};"),
-        },
-        Err(_) => String::new(),
-    }
 }
 
 /// `<w:pStyle w:val="HeadingN">` の N から chunk level を返す (Heading1→2, ...,
