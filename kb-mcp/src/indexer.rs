@@ -57,7 +57,7 @@ struct DiskEntry {
     rel: String,
     /// SHA-256 hex。DB 側 `content_hash` と比較する。
     hash: String,
-    /// 実ファイルの絶対パス。embed/upsert 段階で再 read_to_string する。
+    /// 実ファイルの絶対パス。embed/upsert 段階で再 `fs::read` する。
     full: std::path::PathBuf,
 }
 
@@ -287,7 +287,7 @@ pub fn rebuild_index(
     // ファイル移動検出の前段階として、disk 側の全ファイルの
     // **hash だけ** を先に計算する。content は持ち回らない (evaluator 指摘
     // High #1: 大規模 KB の memory regression 回避)。embed/upsert 段階で
-    // もう一度 read_to_string する — ファイル OS キャッシュで 2 度目の
+    // もう一度 `fs::read` する — ファイル OS キャッシュで 2 度目の
     // read は十分安く、代わりにピークメモリを `filecount * avg_size` から
     // `filecount * avg_path_len + 1 file worth of content` に圧縮できる。
     let scan = scan_disk_entries(
