@@ -24,8 +24,14 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `PdfDocument::extract_text` / `metadata` call sequence is wrapped in
   `catch_unwind` so a malformed PDF that panics inside the parser's
   dependencies degrades to a per-file skip-and-warn instead of aborting
-  the run. Post-processing applies a conservative line-end hyphenation
-  join (only when both neighbors of `-\n` are ASCII lowercase, to avoid
+  the run. The panic-report-suppressing hook is installed once (`Once`)
+  instead of being swapped per extraction, gated by a thread-local flag
+  around the `catch_unwind` call, so concurrent PDF extractions (e.g.
+  multiple `get_document` HTTP requests) can't race and permanently
+  disable panic reporting process-wide or hide unrelated threads' panics
+  (found by codex review on PR #69). Post-processing applies a
+  conservative line-end hyphenation join (only when both neighbors of
+  `-\n` are ASCII lowercase, to avoid
   corrupting hyphenated model numbers, dates, or CJK-adjacent hyphens)
   and normalizes common ligatures (ﬁ/ﬂ/ﬀ/ﬃ/ﬄ). Also recovers UTF-16BE PDF
   Info-dict `Title` strings (common for non-ASCII titles) that

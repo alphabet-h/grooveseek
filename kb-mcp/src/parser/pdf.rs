@@ -2,7 +2,9 @@
 //! 抽出は oxidize-pdf (純 Rust, ParseResult ベース)。念のため malformed PDF の
 //! panic は catch_unwind で per-file skip に正規化する (§4.5 / spec §3 #14)。
 
+use std::cell::Cell;
 use std::io::Cursor;
+use std::sync::Once;
 
 use anyhow::{Result, anyhow};
 use oxidize_pdf::parser::{PdfDocument, PdfReader};
@@ -11,6 +13,67 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 
 /// スキャン PDF 判定閾値: 平均 chars/page がこれ未満なら text layer 無し扱い。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
+
+thread_local! {
+    /// PDF 抽出中 (= `extract_pdf` の `catch_unwind` 内) は true。process-global
+    /// な panic hook が「この panic はこのスレッドの PDF 抽出由来だから
+    /// backtrace 出力を抑制すべきか」を判定するために読む。詳細は
+    /// `install_panic_hook_once` / `SuppressPanicOutputGuard` を参照。
+    static SUPPRESS_PANIC_OUTPUT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// panic hook を once-install するためのフラグ。
+static INSTALL_PANIC_HOOK: Once = Once::new();
+
+/// panic hook を **一度だけ** インストールする。
+///
+/// 旧実装は `extract_pdf` の呼び出し毎に `take_hook`/`set_hook` で
+/// process-global な hook を no-op ↔ 元の hook に swap していた。これは
+/// 並行 (例: HTTP `get_document` からの複数リクエスト、embedder/DB の
+/// Mutex 外) に複数スレッドが PDF を抽出すると race する (codex P2, PR #69
+/// round 2): (1) 片方の抽出が終わって `set_hook(prev_hook)` で「元の
+/// hook」として復元する値が、実は他方の抽出が仕込んだ no-op hook だった
+/// 場合、以後プロセス全体で panic 報告が恒久的に無効化される。(2) 抽出中
+/// (no-op hook が刺さっている間) は PDF 抽出と無関係な他スレッドの panic
+/// まで一緒に隠れてしまう。
+///
+/// 新方式: wrapper hook を最初の PDF 抽出時に一度だけ install し、以後は
+/// **二度と入れ替えない**。wrapper は `SUPPRESS_PANIC_OUTPUT`
+/// (thread-local) を見て、抽出中の **その panic を起こしたスレッド自身**
+/// の出力だけを抑制し、他スレッドの panic は常に元の hook (`prev`) に
+/// そのまま委譲する。これにより複数スレッドが同時に PDF を抽出しても
+/// race せず、他スレッドの panic 報告も常に生きたままになる。
+fn install_panic_hook_once() {
+    INSTALL_PANIC_HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let suppress = SUPPRESS_PANIC_OUTPUT.with(Cell::get);
+            if !suppress {
+                prev(info);
+            }
+        }));
+    });
+}
+
+/// `SUPPRESS_PANIC_OUTPUT` (thread-local) を true にする RAII guard。
+/// Drop で必ず false に戻す — `catch_unwind` 内で実際に panic して unwind
+/// される場合も Drop は呼ばれるため、"panic した後ずっと抑制されたまま"
+/// になることはない (`test_suppress_panic_output_guard_resets_flag_even_on_panic`
+/// で保証)。
+struct SuppressPanicOutputGuard;
+
+impl SuppressPanicOutputGuard {
+    fn new() -> Self {
+        SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+impl Drop for SuppressPanicOutputGuard {
+    fn drop(&mut self) {
+        SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(false));
+    }
+}
 
 /// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
 ///
@@ -104,14 +167,18 @@ impl Parser for PdfParser {
 /// `catch_unwind` でラップし、malformed PDF の panic を per-file Err に正規化する
 /// (spec §3 #14: dry-run の 4 標本では panic しなかったが、未知 PDF / 依存 crate
 /// 由来の panic に対する保険として catch_unwind + hook 抑止を維持する)。default
-/// panic hook の生 backtrace は前後で hook を swap して抑止する (indexer は逐次実行
-/// なので global swap は安全。並列化する場合は要再設計)。
+/// panic hook の生 backtrace 出力は `install_panic_hook_once` が一度だけ
+/// install する wrapper hook + `SuppressPanicOutputGuard` (thread-local flag)
+/// で抑止する。process-global な hook を毎回 swap していた旧実装は並行
+/// PDF 抽出で race したため撤廃した (codex P2, PR #69 round 2。詳細は
+/// `install_panic_hook_once` のコメント参照) — 抽出処理自体は逐次でも
+/// 並行でも安全に動く。
 ///
 /// oxidize-pdf は `ParseResult` ベースのエラー設計なので、open / extract 失敗 (暗号化
 /// PDF 等) は panic ではなく `Err` として返る (dry-run で確認、docs.rs 4.1.1)。
 fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatter)> {
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    install_panic_hook_once();
+    let suppress_guard = SuppressPanicOutputGuard::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(Vec<String>, Frontmatter)> {
             // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
@@ -131,7 +198,7 @@ fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatte
             Ok((pages, frontmatter))
         },
     ));
-    std::panic::set_hook(prev_hook);
+    drop(suppress_guard); // 抽出終了 (成功/panic 問わず) 後は即座に抑制解除
 
     match result {
         Ok(inner) => inner,
@@ -593,5 +660,44 @@ mod tests {
     fn test_non_empty_page_stats_no_pages_returns_zero() {
         let pages: Vec<String> = vec![];
         assert_eq!(non_empty_page_stats(&pages), (0, 0));
+    }
+
+    // codex P2 follow-up (PR #69 round 2): panic hook を process-global に
+    // swap する旧実装は並行 PDF 抽出で race する。新方式 (once-installed
+    // wrapper hook + thread-local suppress flag) の RAII guard 部分の TDD。
+
+    #[test]
+    fn test_suppress_panic_output_guard_sets_and_resets_flag() {
+        assert!(
+            !SUPPRESS_PANIC_OUTPUT.with(Cell::get),
+            "flag must start false"
+        );
+        {
+            let _guard = SuppressPanicOutputGuard::new();
+            assert!(
+                SUPPRESS_PANIC_OUTPUT.with(Cell::get),
+                "guard construction must set the flag true"
+            );
+        }
+        assert!(
+            !SUPPRESS_PANIC_OUTPUT.with(Cell::get),
+            "guard Drop must reset the flag false"
+        );
+    }
+
+    #[test]
+    fn test_suppress_panic_output_guard_resets_flag_even_on_panic() {
+        // guard が生きたまま panic → unwind されても Drop は必ず走る、という
+        // RAII の不変条件そのものを検証する (これが崩れると、一度 panic した
+        // スレッドではそれ以降ずっと panic report が抑制されたままになる)。
+        let result = std::panic::catch_unwind(|| {
+            let _guard = SuppressPanicOutputGuard::new();
+            panic!("boom");
+        });
+        assert!(result.is_err());
+        assert!(
+            !SUPPRESS_PANIC_OUTPUT.with(Cell::get),
+            "flag must reset to false even when the guarded closure panics"
+        );
     }
 }
