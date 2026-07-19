@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "MCP server providing semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a Markdown / plain-text knowledge base."
 authors = ["koshian"]
@@ -67,6 +67,12 @@ indicatif = "0.18"
 # するため採用。純 Rust・MIT。詳細: .dev/knowledge/feature-45-pdf-crate-dryrun.md。
 # metadata() が Title/CreationDate を返すため lopdf 直接依存は不要。
 oxidize-pdf = "=4.1.1"
+# [feature-45 PR-3] Office 抽出。calamine=xlsx/xls (streaming, 純 Rust)。
+# zip/quick-xml は calamine が transitive で導入済のため direct dep に昇格
+# (docx/pptx を自前実装するのに使う。XML スタックを 1 本化して追加 heavy dep ゼロ)。
+calamine = "0.36"
+zip = "8"
+quick-xml = "0.41"
 
 # (feature-44 PR-3) Windows-only path dep on the tray crate so
 # `kb-mcp service install --with-tray` can call into the tray's

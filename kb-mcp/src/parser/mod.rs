@@ -12,15 +12,22 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+pub mod docx;
 pub mod markdown;
+pub mod ooxml;
 pub mod pdf;
+pub mod pptx;
 pub mod registry;
 pub mod txt;
+pub mod xlsx;
 
+pub use docx::DocxParser;
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;
+pub use pptx::PptxParser;
 pub use registry::Registry;
 pub use txt::TxtParser;
+pub use xlsx::{XlsParser, XlsxParser};
 
 // ---------------------------------------------------------------------------
 // Data types (formerly in src/markdown.rs)
@@ -99,6 +106,13 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
         chunks,
         raw_content: raw.to_string(),
     }
+}
+
+/// `ooxml::local_name_pub` の薄い re-export。namespace prefix 付き QName
+/// (`w:p` / `w:pStyle` 等) から local part を取り出す。docx/pptx parser が
+/// XML 要素名判定に使う (Task 3.4/3.5 で消費)。
+pub(crate) fn ooxml_local(qname: &[u8]) -> &[u8] {
+    ooxml::local_name_pub(qname)
 }
 
 // ---------------------------------------------------------------------------

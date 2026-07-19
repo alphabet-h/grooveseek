@@ -70,14 +70,16 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 #   - セクション自体なし        … ["md"] のみ (デフォルト)
 #   - 明示的な空配列           … エラー (silent failure 防止)
 #   - 独自リスト                … そのリストに含まれる拡張子だけを対象に
-# 現状のバイナリで対応する id: "md" / "txt" / "pdf" (v0.10.0+)
-# ("docx" / "rst" / "adoc" 等は将来追加予定、現在指定するとエラー)
+# 現状のバイナリで対応する id: "md" / "txt" / "pdf" (v0.10.0+) /
+# "docx" / "xlsx" / "xls" / "pptx" (v0.11.0+)
+# ("rst" / "adoc" 等は将来追加予定、現在指定するとエラー)
 # 下記は .txt も index したい場合の例 ("md" のみ既定なら [parsers] ごと削除)。
 [parsers]
 enabled = ["md", "txt"]
-# .pdf も index したい場合は ["md", "pdf"] のように書き換える (v0.10.0+;
-# 既知の制限 (OCR 非対応 / 多段組の reading order 乱れ等) は README.md /
-# README.ja.md 参照)。
+# 全形式を index する例: enabled = ["md", "txt", "pdf", "docx", "xlsx", "xls", "pptx"]
+# 既知の制限 (PDF: OCR 非対応 / 多段組の reading order 乱れ。Office 共通:
+# legacy .doc/.ppt 非対応 / OpenDocument 非対応 / パスワード保護は検出して
+# skip / 表構造は plain text 化) は README.md / README.ja.md 参照。
 
 # ファイルウォッチャー。`kb-mcp serve` 中のみ有効。
 # 有効時は kb_path 配下の変更 / 追加 / 削除 / rename を検知して
