@@ -91,52 +91,170 @@ fn parse_workbook_bytes(
 }
 
 /// cap を注入できる本体 (unit test が小さい cap で truncate 分岐を突くため分離)。
+/// XLSX/XLS で抽出方式が異なる (下記 fn 群 の doc comment 参照) ため format
+/// 別の実装へ dispatch するだけの薄い wrapper。
 fn parse_workbook_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
     format: WorkbookFormat,
     sheet_max_bytes: usize,
 ) -> Result<ParsedDocument> {
-    // codex P2 (PR #70 round 2, zip-bomb hardening): xlsx (zip container) の
-    // みが対象。calamine は zip 展開を内部で行うため `ooxml::read_zip_entry`
-    // の累積 budget 機構が効かない。calamine を呼ぶ前に、実際に読まれる
-    // XML part (worksheets/sharedStrings/styles) の申告 uncompressed size
-    // 合計を検査する。xls (BIFF、非 zip container) はこの経路の対象外。
-    if matches!(format, WorkbookFormat::Xlsx) {
-        preflight_xlsx_decompression_budget(bytes, path_hint)?;
+    match format {
+        WorkbookFormat::Xlsx => parse_xlsx_bytes_capped(bytes, path_hint, sheet_max_bytes),
+        WorkbookFormat::Xls => parse_xls_bytes_capped(bytes, path_hint, sheet_max_bytes),
     }
+}
+
+/// xlsx (zip container) の抽出本体。streaming cell reader を使う (下記
+/// `extract_xlsx_sheet_text_streaming` 参照)。
+fn parse_xlsx_bytes_capped(
+    bytes: &[u8],
+    path_hint: &str,
+    sheet_max_bytes: usize,
+) -> Result<ParsedDocument> {
+    // codex P2 (PR #70 round 2, zip-bomb hardening): calamine は zip 展開を
+    // 内部で行うため `ooxml::read_zip_entry` の累積 budget 機構が効かない。
+    // calamine を呼ぶ前に、実際に読まれる XML part の申告 uncompressed
+    // size 合計を検査する。
+    preflight_xlsx_decompression_budget(bytes, path_hint)?;
 
     let cursor = Cursor::new(bytes);
     // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
     // ではなく、登録拡張子に一致する reader を明示的に使う (WorkbookFormat
-    // の doc comment 参照)。`calamine::Sheets` に手動で包むことで、以降の
-    // コード (sheet_names / worksheet_range 呼び出し) は auto-probe 版と
-    // 同じ trait インタフェースのまま変更不要にする。
-    let mut workbook: calamine::Sheets<_> = match format {
-        WorkbookFormat::Xlsx => calamine::Xlsx::new(cursor)
-            .map(calamine::Sheets::Xlsx)
-            .map_err(|e| {
-                anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}")
-            })?,
-        WorkbookFormat::Xls => calamine::Xls::new(cursor)
-            .map(calamine::Sheets::Xls)
-            .map_err(|e| {
-                anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}")
-            })?,
-    };
+    // の doc comment 参照)。
+    let mut xlsx = calamine::Xlsx::new(cursor)
+        .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
     let mut chunks = Vec::new();
-    // codex P2 (PR #70 round 2): `workbook.worksheets()` は全シートを一括で
-    // `Vec<(String, Range<Data>)>` に materialize するため、シート数×サイズ
-    // が大きい workbook でピークメモリが跳ね上がる。`sheet_names()` +
-    // シート毎 `worksheet_range()` の逐次処理に変え、各シートの Range を
-    // 処理し終えたら都度 drop してメモリを解放する。
-    for name in workbook.sheet_names() {
-        let range = match workbook.worksheet_range(&name) {
+    // `sheet_names()` は Vec<String> を owned で返すため、ループ中に
+    // `&mut xlsx` を再度借用しても (streaming reader との) 競合はない。
+    for name in xlsx.sheet_names() {
+        let Some(text) =
+            extract_xlsx_sheet_text_streaming(&mut xlsx, &name, path_hint, sheet_max_bytes)
+        else {
+            // open 失敗 / 途中の XML エラーはシート丸ごと skip
+            // (旧実装の `worksheet_range()` エラー時と同じ挙動)。
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue; // 空シートは chunk を作らない
+        }
+        chunks.push(Chunk {
+            index: chunks.len(),
+            heading: Some(format!("Sheet: {name}")),
+            level: Some(2),
+            content: text.trim_end().to_string(),
+        });
+    }
+
+    let frontmatter = xlsx_frontmatter(bytes, path_hint);
+    let raw_content = chunks
+        .iter()
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(ParsedDocument {
+        frontmatter,
+        chunks,
+        raw_content,
+    })
+}
+
+/// xlsx 1 シート分のテキストを streaming cell reader (`Xlsx::worksheet_cells_reader`)
+/// で抽出する。open 失敗 / 途中の XML エラーは `None` を返し、呼び出し側は
+/// このシート全体を skip する (旧実装の `worksheet_range()` エラー時の
+/// 「シート丸ごと skip」と同じ挙動)。
+///
+/// codex P1 (PR #70 round 6): `worksheet_range()` は bounding rectangle
+/// (最初と最後の populated セルで決まる矩形) 全体を dense `Range` として
+/// materialize する (`Range::from_sparse` が `vec![Data::default(); rows *
+/// cols]` を eager allocate する)。sparse な sheet (例: A1 と
+/// XFD1048576 のみ populate) では、ファイル自体は小さいのに rows × cols
+/// 個の `Data::Empty` を allocate しようとして OOM し得る。解凍 preflight
+/// (`.xml`/`.bin`/`.rels` の申告 size 合計) では防げない — ファイルの
+/// 実バイト数は小さいまま dimension だけが巨大なため。
+///
+/// `Xlsx::worksheet_cells_reader` (XML イベント駆動の streaming reader、
+/// dense Range を作らない) に切り替え、実際に XML 上に `<c>` として存在
+/// するセルだけを到着順に読む。**存在するセルだけを `\t` で連結する
+/// (位置忠実な padding はしない)**: 検索用途のテキスト抽出であり、セル間の
+/// gap を空文字で埋める必要はないため。行が変わったら直前の行を確定して
+/// `\n` を付けて `text` に push し、その時点で `sheet_max_bytes` を超えて
+/// いれば warn + 読み込み打ち切り (既存の「行単位」truncate 意味論 —
+/// 超過を招いた行は保持、次の行には進まない、巨大 1 行も丸ごと残す — を
+/// 維持する)。
+fn extract_xlsx_sheet_text_streaming(
+    xlsx: &mut calamine::Xlsx<Cursor<&[u8]>>,
+    name: &str,
+    path_hint: &str,
+    sheet_max_bytes: usize,
+) -> Option<String> {
+    let mut reader = xlsx.worksheet_cells_reader(name).ok()?;
+    let mut text = String::new();
+    let mut row_cells: Vec<String> = Vec::new();
+    let mut current_row: Option<u32> = None;
+
+    loop {
+        let cell = match reader.next_cell() {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                if current_row.is_some() {
+                    flush_xlsx_row(&mut text, &row_cells);
+                }
+                break;
+            }
+            Err(_) => return None,
+        };
+        let (row, _col) = cell.get_position();
+        if current_row != Some(row) {
+            if current_row.is_some() {
+                flush_xlsx_row(&mut text, &row_cells);
+                row_cells.clear();
+                if text.len() > sheet_max_bytes {
+                    eprintln!(
+                        "{path_hint}: sheet {name:?} exceeds {sheet_max_bytes} bytes; truncating"
+                    );
+                    return Some(text);
+                }
+            }
+            current_row = Some(row);
+        }
+        let data: Data = cell.get_value().clone().into();
+        row_cells.push(match data {
+            Data::Empty => String::new(),
+            other => other.to_string(),
+        });
+    }
+    Some(text)
+}
+
+/// `row_cells` (存在したセルだけ) を `\t` join して 1 行として `text` に
+/// 追記する (改行込み)。
+fn flush_xlsx_row(text: &mut String, row_cells: &[String]) {
+    text.push_str(&row_cells.join("\t"));
+    text.push('\n');
+}
+
+/// xls (BIFF、非 zip container) の抽出本体。
+///
+/// codex P1 (PR #70 round 6): xls には streaming cell reader が無く (calamine
+/// は open 時に workbook 全体を eager parse する)、BIFF フォーマット自体が
+/// 65536 行 × 256 列 (Excel 97-2003 の仕様上限) に有界なため、dense Range
+/// を作っても xlsx のような無制限 OOM のリスクが無い。よって xlsx のみ
+/// streaming 化し、xls は従来通り `worksheet_range()` (dense Range) を使う。
+fn parse_xls_bytes_capped(
+    bytes: &[u8],
+    path_hint: &str,
+    sheet_max_bytes: usize,
+) -> Result<ParsedDocument> {
+    let cursor = Cursor::new(bytes);
+    let mut xls = calamine::Xls::new(cursor)
+        .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
+
+    let mut chunks = Vec::new();
+    for name in xls.sheet_names() {
+        let range = match xls.worksheet_range(&name) {
             Ok(r) => r,
-            // 旧実装 (`worksheets()`) も内部で `.ok()?` により読めない
-            // シートを黙って skip していたのと同じ挙動
-            // (calamine::xlsx::Xlsx::worksheets 実装参照)。
             Err(_) => continue,
         };
         let mut text = String::new();
@@ -150,8 +268,6 @@ fn parse_workbook_bytes_capped(
                 .collect();
             text.push_str(&line.join("\t"));
             text.push('\n');
-            // 行 push 後に判定 = 超過を招いた行は保持される (overshoot は 1 行ぶん、
-            // 巨大 1 行もその行は丸ごと残す)。次の行には進まず break + warn。
             if text.len() > sheet_max_bytes {
                 eprintln!(
                     "{path_hint}: sheet {name:?} exceeds {sheet_max_bytes} bytes; truncating"
@@ -159,9 +275,9 @@ fn parse_workbook_bytes_capped(
                 break;
             }
         }
-        drop(range); // シート毎に明示的に drop してメモリを解放 (逐次処理)
+        drop(range);
         if text.trim().is_empty() {
-            continue; // 空シートは chunk を作らない
+            continue;
         }
         chunks.push(Chunk {
             index: chunks.len(),
@@ -171,8 +287,7 @@ fn parse_workbook_bytes_capped(
         });
     }
 
-    // frontmatter: xlsx は docProps/core.xml。xls (BIFF) は core.xml が無いため
-    // 常に filename fallback。zip として開けなければ filename fallback。
+    // xls (BIFF) には core.xml が無いため常にファイル名 fallback。
     let frontmatter = xlsx_frontmatter(bytes, path_hint);
     let raw_content = chunks
         .iter()
@@ -600,7 +715,7 @@ mod tests {
     #[test]
     fn test_xlsx_single_row_larger_than_cap_emits_that_row_whole() {
         // 1 行だけで cap を超える境界: その行は丸ごと emit してから break し、
-        // 後続行は落とす (= 行途中での切断はしない、という明示された挙動)。
+        // 後続行は落とす (= 行途中では切断はしない、という明示された挙動)。
         let big = "x".repeat(200);
         let bytes = make_minimal_xlsx(&[("S", &[&[big.as_str()], &["next"]])]);
         let doc = parse_workbook_bytes_capped(&bytes, "x.xlsx", WorkbookFormat::Xlsx, 50).unwrap();
@@ -612,6 +727,77 @@ mod tests {
         assert!(
             !content.contains("next"),
             "subsequent rows are dropped after the cap"
+        );
+    }
+
+    /// 1-based 列番号を Excel 列名 (`A`, `B`, ..., `Z`, `AA`, ...) に変換する。
+    fn column_letters(mut n: usize) -> String {
+        let mut s = String::new();
+        while n > 0 {
+            let rem = (n - 1) % 26;
+            s.insert(0, (b'A' + rem as u8) as char);
+            n = (n - 1) / 26;
+        }
+        s
+    }
+
+    /// `A1` と `(far_row, far_col)` の 2 セルだけを populate した、bounding
+    /// rectangle は巨大だが実データはスカスカな xlsx を組む。
+    /// `dimension` 要素も遠いセルまでの範囲で宣言する (Excel が実際に書き出す
+    /// xlsx と同じ形)。
+    fn make_sparse_xlsx(far_row: usize, far_col: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#).unwrap();
+
+            zip.start_file("_rels/.rels", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#).unwrap();
+
+            zip.start_file("xl/workbook.xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#).unwrap();
+
+            zip.start_file("xl/_rels/workbook.xml.rels", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#).unwrap();
+
+            let far_ref = format!("{}{far_row}", column_letters(far_col));
+            let dim_ref = format!("A1:{far_ref}");
+            let sheet_xml = format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="{dim_ref}"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>near</t></is></c></row><row r="{far_row}"><c r="{far_ref}" t="inlineStr"><is><t>far</t></is></c></row></sheetData></worksheet>"#
+            );
+            zip.start_file("xl/worksheets/sheet1.xml", opt).unwrap();
+            zip.write_all(sheet_xml.as_bytes()).unwrap();
+
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_xlsx_sparse_far_cell_does_not_materialize_dense_range() {
+        // codex P1 (PR #70 round 6): sparse な xlsx (例: A1 と遠く離れた
+        // 1 セルのみ populate) では、bounding rectangle 全体を dense
+        // Range として materialize する `worksheet_range()` だと
+        // rows × cols 個の `Data::Empty` を allocate してしまい OOM し得る
+        // (解凍 preflight は素通り — ファイル自体は数百 byte しかない)。
+        // streaming cell reader に切り替えたことで、実際に populate された
+        // 2 セル分だけを読み、Excel の実用上限に近い座標
+        // (1,048,576 行 × 16,384 列) でも即座に完走できることを確認する。
+        let bytes = make_sparse_xlsx(1_000_000, 16_000);
+        let doc = XlsxParser.parse_bytes(&bytes, "sparse.xlsx", &[]).unwrap();
+        assert_eq!(doc.chunks.len(), 1);
+        assert!(
+            doc.chunks[0].content.contains("near"),
+            "got: {:?}",
+            doc.chunks[0].content
+        );
+        assert!(
+            doc.chunks[0].content.contains("far"),
+            "got: {:?}",
+            doc.chunks[0].content
         );
     }
 }
