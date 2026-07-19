@@ -3,7 +3,9 @@
 
 use anyhow::Result;
 
-use super::{MarkdownParser, Parser, PdfParser, TxtParser};
+use super::{
+    DocxParser, MarkdownParser, Parser, PdfParser, PptxParser, TxtParser, XlsParser, XlsxParser,
+};
 
 pub struct Registry {
     parsers: Vec<Box<dyn Parser>>,
@@ -28,9 +30,13 @@ impl Registry {
                 "md" => Box::new(MarkdownParser),
                 "txt" => Box::new(TxtParser),
                 "pdf" => Box::new(PdfParser),
+                "xlsx" => Box::new(XlsxParser),
+                "xls" => Box::new(XlsParser),
+                "docx" => Box::new(DocxParser),
+                "pptx" => Box::new(PptxParser),
                 other => anyhow::bail!(
                     "[parsers].enabled contains unknown id {:?} — \
-                     supported in this build: md, txt, pdf",
+                     supported in this build: md, txt, pdf, docx, xlsx, xls, pptx",
                     other
                 ),
             };
@@ -151,5 +157,18 @@ mod tests {
         // md / txt は is_binary=false なので binary_extensions は空。
         let r = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
         assert!(r.binary_extensions().is_empty());
+    }
+
+    #[test]
+    fn test_from_enabled_registers_office_formats_as_binary() {
+        // feature-45 PR-3: xlsx/xls/docx/pptx は全て is_binary=true。
+        let ids = ["xlsx", "xls", "docx", "pptx"].map(String::from);
+        let r = Registry::from_enabled(&ids).unwrap();
+        for ext in ["xlsx", "xls", "docx", "pptx"] {
+            assert!(r.by_extension(ext).is_some(), "{ext} must be registered");
+        }
+        let mut binary_exts = r.binary_extensions();
+        binary_exts.sort_unstable();
+        assert_eq!(binary_exts, vec!["docx", "pptx", "xls", "xlsx"]);
     }
 }

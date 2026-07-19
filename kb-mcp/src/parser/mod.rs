@@ -12,15 +12,22 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+pub mod docx;
 pub mod markdown;
+pub mod ooxml;
 pub mod pdf;
+pub mod pptx;
 pub mod registry;
 pub mod txt;
+pub mod xlsx;
 
+pub use docx::DocxParser;
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;
+pub use pptx::PptxParser;
 pub use registry::Registry;
 pub use txt::TxtParser;
+pub use xlsx::{XlsParser, XlsxParser};
 
 // ---------------------------------------------------------------------------
 // Data types (formerly in src/markdown.rs)
