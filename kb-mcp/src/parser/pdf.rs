@@ -164,8 +164,27 @@ fn normalize_pdf_date(raw: &str) -> Option<String> {
 /// ページ抽出テキストの後処理: (1) 行末ハイフン結合 `-\n` → 連結、
 /// (2) よく使われるリガチャ (ﬁ ﬂ ﬀ ﬃ ﬄ) を ASCII 展開。
 fn post_process(page: &str) -> String {
-    // (1) 行末ハイフネーション結合。
-    let dehyphenated = page.replace("-\n", "");
+    // (1) 行末ハイフネーション結合。無条件結合は日本語文書中の型番/日付等
+    //     (例: "型番ABC-\n123") のハイフンを誤って消してしまうため、
+    //     "-" の直前と "\n" の直後がともに ASCII 小文字 (a-z) の場合
+    //     (= 英単語がハイフネーションで分断されたと推定できる場合) に限定する。
+    //     それ以外 (大文字・数字・CJK 隣接等) は "-\n" をそのまま残す。
+    let chars: Vec<char> = page.chars().collect();
+    let mut dehyphenated = String::with_capacity(page.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '-' && chars.get(i + 1) == Some(&'\n') {
+            let prev_lower = i > 0 && chars[i - 1].is_ascii_lowercase();
+            let next_lower = chars.get(i + 2).is_some_and(char::is_ascii_lowercase);
+            if prev_lower && next_lower {
+                // "-\n" をまとめて読み飛ばし、両側の単語を連結する。
+                i += 2;
+                continue;
+            }
+        }
+        dehyphenated.push(chars[i]);
+        i += 1;
+    }
     // (2) リガチャ正規化 (NFKC の代表 subset を明示展開; 全 NFKC は過剰変換の
     //     恐れがあるため必要な合字だけ扱う)。
     dehyphenated
@@ -240,6 +259,23 @@ mod tests {
             post_process("normal\nmultiline\ntext"),
             "normal\nmultiline\ntext"
         );
+    }
+
+    #[test]
+    fn test_post_process_preserves_hyphen_before_digits() {
+        // 型番のような ASCII 数字文脈の "-\n" は結合しない (改行・ハイフンとも保持)。
+        assert_eq!(post_process("型番ABC-\n123"), "型番ABC-\n123");
+    }
+
+    #[test]
+    fn test_post_process_joins_lowercase_hyphenation() {
+        assert_eq!(post_process("infor-\nmation"), "information");
+    }
+
+    #[test]
+    fn test_post_process_preserves_hyphen_cjk_adjacent() {
+        // CJK に隣接する "-\n" は結合しない (改行・ハイフンとも保持)。
+        assert_eq!(post_process("日本語-\nテキスト"), "日本語-\nテキスト");
     }
 
     #[test]
