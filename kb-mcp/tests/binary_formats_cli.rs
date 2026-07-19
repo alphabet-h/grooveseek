@@ -22,7 +22,8 @@ use common::temp::TempKbLayout;
 
 /// `[parsers].enabled = ["md", "pdf"]` — opts the `pdf` parser in, alongside
 /// the always-on default `md`.
-const PARSERS_MD_PDF: &str = "model = \"bge-small-en-v1.5\"\n[parsers]\nenabled = [\"md\", \"pdf\"]\n";
+const PARSERS_MD_PDF: &str =
+    "model = \"bge-small-en-v1.5\"\n[parsers]\nenabled = [\"md\", \"pdf\"]\n";
 
 /// Default config: no `[parsers]` section, so `build_parser_registry()`
 /// falls back to `Registry::defaults()` = `["md"]` only (see
@@ -264,10 +265,7 @@ fn test_prune_retains_binary_grown_past_size_cap() {
     //    skip path). `set_len` produces a sparse file — logical size is
     //    what the size-cap check reads, so no real 51 MiB of I/O happens.
     {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&pdf)
-            .unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&pdf).unwrap();
         f.set_len(51 * 1024 * 1024).unwrap(); // logical length 51 MiB (sparse) > 50 MiB cap
     }
     let stderr = run_index(&bin, &cfg, layout.kb());

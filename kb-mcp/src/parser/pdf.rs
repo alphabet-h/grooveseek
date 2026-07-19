@@ -324,7 +324,10 @@ mod tests {
             normalize_pdf_date("D:20260719120000Z").as_deref(),
             Some("2026-07-19")
         );
-        assert_eq!(normalize_pdf_date("20260719").as_deref(), Some("2026-07-19"));
+        assert_eq!(
+            normalize_pdf_date("20260719").as_deref(),
+            Some("2026-07-19")
+        );
         assert_eq!(
             normalize_pdf_date("2026-07-19T12:00:00Z").as_deref(),
             Some("2026-07-19")
