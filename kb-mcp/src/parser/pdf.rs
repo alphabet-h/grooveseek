@@ -201,4 +201,28 @@ mod tests {
             .expect_err("garbage must be Err");
         let _ = err; // メッセージ内容は crate 依存なので存在のみ assert
     }
+
+    #[test]
+    fn test_pdf_scanned_no_text_layer_is_err() {
+        // text object を一切含まない (Contents ストリームが空の) 1 ページ PDF。
+        // minimal.pdf の生成手法を流用した手組み fixture (Task 2.7 で正式化予定)。
+        const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/binary/empty_text.pdf");
+        let err = PdfParser
+            .parse_bytes(EMPTY, "scan.pdf", &[])
+            .expect_err("no text layer must be Err");
+        assert!(err.to_string().contains("no text layer"));
+    }
+
+    #[test]
+    fn test_pdf_encrypted_is_err() {
+        // 実 encrypted fixture (qpdf 等で生成) は環境に qpdf が無いため用意できず、
+        // Task 2.7 に委譲する。ここでは PdfReader::new の open 失敗パスが暗号化 PDF と
+        // 同じ "encrypted or unreadable" 文言を返すこと (dry-run で確認済み) を、壊れた
+        // xref を持つバイト列で代替検証する。
+        let err = PdfParser
+            .parse_bytes(b"%PDF-1.4\n%garbage\nendobj\nendobj\n%%EOF", "enc.pdf", &[])
+            .expect_err("broken PDF open path must be Err");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("encrypted") || msg.contains("unreadable"));
+    }
 }
