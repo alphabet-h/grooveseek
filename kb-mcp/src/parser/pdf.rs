@@ -2,9 +2,15 @@
 //! 抽出は oxidize-pdf (純 Rust, ParseResult ベース)。念のため malformed PDF の
 //! panic は catch_unwind で per-file skip に正規化する (§4.5 / spec §3 #14)。
 
+use std::io::Cursor;
+
 use anyhow::{Result, anyhow};
+use oxidize_pdf::parser::{PdfDocument, PdfReader};
 
 use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
+
+/// スキャン PDF 判定閾値: 平均 chars/page がこれ未満なら text layer 無し扱い。
+const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 
 pub struct PdfParser;
 
@@ -29,8 +35,170 @@ impl Parser for PdfParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        // Task 2.3 で実装。skeleton では未実装エラー。
-        let _ = (bytes, path_hint);
-        Err(anyhow!("PdfParser::parse_bytes not yet implemented"))
+        let (pages, frontmatter) = extract_pdf(bytes, path_hint)?;
+
+        // スキャン PDF 判定: 総抽出文字数 / ページ数 < 50 なら text layer 無しとみなす。
+        let total_chars: usize = pages.iter().map(|p| p.chars().count()).sum();
+        if !pages.is_empty() && total_chars / pages.len() < SCANNED_PDF_MIN_CHARS_PER_PAGE {
+            return Err(anyhow!(
+                "{path_hint}: PDF appears to have no text layer (scanned image PDF); \
+                 average {} chars/page < {} threshold — skipping (OCR not supported)",
+                total_chars / pages.len(),
+                SCANNED_PDF_MIN_CHARS_PER_PAGE
+            ));
+        }
+
+        let mut chunks = Vec::new();
+        for (i, page_text) in pages.iter().enumerate() {
+            let content = post_process(page_text);
+            if content.trim().is_empty() {
+                continue; // 空ページは chunk を作らない
+            }
+            chunks.push(super::Chunk {
+                index: chunks.len(),
+                heading: Some(format!("p.{}", i + 1)),
+                level: None,
+                content,
+            });
+        }
+
+        // frontmatter は extract_pdf が同じ PdfDocument から抽出済み (§4.5)。
+        let raw_content = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        Ok(ParsedDocument {
+            frontmatter,
+            chunks,
+            raw_content,
+        })
+    }
+}
+
+/// oxidize-pdf でページ本文 (`Vec<String>`, 1 要素 = 1 ページ) + metadata frontmatter
+/// を抽出する。
+///
+/// `PdfReader::new(Cursor)` + `PdfDocument::extract_text` + `metadata` の一連を
+/// `catch_unwind` でラップし、malformed PDF の panic を per-file Err に正規化する
+/// (spec §3 #14: dry-run の 4 標本では panic しなかったが、未知 PDF / 依存 crate
+/// 由来の panic に対する保険として catch_unwind + hook 抑止を維持する)。default
+/// panic hook の生 backtrace は前後で hook を swap して抑止する (indexer は逐次実行
+/// なので global swap は安全。並列化する場合は要再設計)。
+///
+/// oxidize-pdf は `ParseResult` ベースのエラー設計なので、open / extract 失敗 (暗号化
+/// PDF 等) は panic ではなく `Err` として返る (dry-run で確認、docs.rs 4.1.1)。
+fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatter)> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<(Vec<String>, Frontmatter)> {
+            // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
+            // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs 4.1.1 で確認)。
+            let reader = PdfReader::new(Cursor::new(bytes)).map_err(|e| {
+                anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}")
+            })?;
+            let document = PdfDocument::new(reader);
+            // extract_text() -> ParseResult<Vec<ExtractedText>>、各 .text がページ本文。
+            let extracted = document.extract_text().map_err(|e| {
+                anyhow!(
+                    "{path_hint}: PDF text extraction failed (possibly encrypted or unreadable): {e}"
+                )
+            })?;
+            let pages: Vec<String> = extracted.into_iter().map(|t| t.text).collect();
+            let frontmatter = pdf_metadata_frontmatter(&document, path_hint);
+            Ok((pages, frontmatter))
+        },
+    ));
+    std::panic::set_hook(prev_hook);
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow!(
+            "{path_hint}: PDF extraction panicked (malformed PDF)"
+        )),
+    }
+}
+
+/// oxidize-pdf の `DocumentMetadata` (docs.rs 4.1.1 で確認: `title` / `creation_date`
+/// はいずれも `Option<String>`) から Title / CreationDate を map する。metadata が
+/// 取れない / title が空なら filename fallback。どのエラーでも parse は失敗させない。
+/// spec §4.5: PDF は Title と CreationDate のみ取り、他フィールドは取らない。
+fn pdf_metadata_frontmatter<R: std::io::Read + std::io::Seek>(
+    document: &PdfDocument<R>,
+    path_hint: &str,
+) -> Frontmatter {
+    let mut fm = Frontmatter::default();
+    if let Ok(meta) = document.metadata() {
+        if let Some(t) = meta.title.as_deref()
+            && !t.trim().is_empty()
+        {
+            fm.title = Some(t.trim().to_string());
+        }
+        fm.date = meta.creation_date.as_deref().and_then(normalize_pdf_date);
+    }
+    if fm.title.as_deref().map(str::is_empty).unwrap_or(true) {
+        fm.title = super::txt::derive_title_pub(path_hint);
+    }
+    fm
+}
+
+/// PDF の日付文字列から `YYYY-MM-DD` を取り出す。oxidize-pdf が `creation_date` を
+/// どの形式で返すか (raw `D:YYYYMMDD...` / bare `YYYYMMDD` / ISO `YYYY-MM-DD...`) は
+/// PDF 依存なので、3 形式すべてを許容する best-effort パーサとする。
+fn normalize_pdf_date(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let s = s.strip_prefix("D:").unwrap_or(s);
+    // (1) 先頭 8 桁が数字 = PDF `D:YYYYMMDD...` / bare `YYYYMMDD`。
+    if s.len() >= 8 && s.as_bytes()[..8].iter().all(u8::is_ascii_digit) {
+        return Some(format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]));
+    }
+    // (2) ISO `YYYY-MM-DD...` 形式ならその先頭 10 文字。
+    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        return Some(s[..10].to_string());
+    }
+    None
+}
+
+/// ページ抽出テキストの後処理 (行末ハイフン結合 + リガチャ正規化)。
+/// Task 2.5 (P1) で本実装。ここでは素通し。
+fn post_process(page: &str) -> String {
+    page.to_string()
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Task 2.7 で正式化 (生成手順の doc 化含む) する最小 2 ページ PDF。
+    // ページ 1="Hello World"、ページ 2="Second Page"。xref オフセット込みで
+    // 手組みした最小構成 (Info dict に Title/CreationDate も含む)。
+    const MINIMAL_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/minimal.pdf");
+
+    #[test]
+    fn test_pdf_page_chunks_have_heading_and_no_level() {
+        let doc = PdfParser
+            .parse_bytes(MINIMAL_PDF, "docs/minimal.pdf", &[])
+            .expect("minimal pdf must extract");
+        assert_eq!(doc.chunks.len(), 2, "one chunk per non-empty page");
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("p.1"));
+        assert_eq!(doc.chunks[1].heading.as_deref(), Some("p.2"));
+        assert!(doc.chunks[0].level.is_none());
+        assert!(doc.chunks[0].content.contains("Hello"));
+        assert!(doc.chunks[1].content.contains("Second"));
+    }
+
+    #[test]
+    fn test_pdf_malformed_bytes_is_err_not_panic() {
+        // 壊れた PDF は catch_unwind で Err に正規化され panic しない (edge #6)。
+        let err = PdfParser
+            .parse_bytes(b"%PDF-1.4 not really a pdf", "x.pdf", &[])
+            .expect_err("garbage must be Err");
+        let _ = err; // メッセージ内容は crate 依存なので存在のみ assert
     }
 }
