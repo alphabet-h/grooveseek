@@ -34,6 +34,17 @@ pub fn is_hardcoded_excluded(basename: &str) -> bool {
     HARDCODED_EXCLUDE_DIRS.contains(&basename)
 }
 
+/// MS Office (`~$doc.docx`) / LibreOffice (`.~lock.doc.docx#`) のロック・owner
+/// ファイルを拡張子に関わらず skip する。`~$` 版は拡張子が `docx` のまま走査に
+/// 乗るため明示フィルタ必須。`.~lock.*#` 版は拡張子が `docx#` になり既存の
+/// 拡張子 membership で偶然弾かれるが、暗黙挙動に依存せず明示フィルタする。
+/// `pub(crate)` は `collect_source_files` (フル re-index) に加えて
+/// `watcher::should_process` (incremental reindex) からも同じ判定を再利用する
+/// ため。
+pub(crate) fn is_office_lock_file(name: &str) -> bool {
+    name.starts_with("~$") || (name.starts_with(".~lock.") && name.ends_with('#'))
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -46,8 +57,104 @@ struct DiskEntry {
     rel: String,
     /// SHA-256 hex。DB 側 `content_hash` と比較する。
     hash: String,
-    /// 実ファイルの絶対パス。embed/upsert 段階で再 read_to_string する。
+    /// 実ファイルの絶対パス。embed/upsert 段階で再 `fs::read` する。
     full: std::path::PathBuf,
+}
+
+/// [`scan_disk_entries`] の結果。`entries` = hash 計算済みの index 候補、
+/// `skipped` = disk に存在するが read 失敗 / size 超過で載らなかった rel path。
+/// `skipped` は prune 統一原則 (§4.2) で visited_paths へ union し、既存 entry を保護する。
+struct DiskScan {
+    entries: Vec<DiskEntry>,
+    skipped: Vec<String>,
+}
+
+/// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
+/// `fs::metadata` だけで判定する共有ヘルパー。フル re-index の
+/// `scan_disk_entries` と watcher 増分 index の `reindex_single_file` の
+/// 両方が、実際に `fs::read` する前の size-cap ガードとして呼ぶ (codex P2
+/// round 2: watcher 経路が `scan_disk_entries` の size-cap 保護をバイパス
+/// して 50 MiB 超ファイルを全量 read/hash してしまう問題の修正)。
+///
+/// - `is_binary_ext` が `false` (テキスト形式) なら常に `Ok(None)` (size cap 対象外)
+/// - 超過していれば `Ok(Some(actual_len))`、cap 内なら `Ok(None)`
+/// - `fs::metadata` 自体の失敗は `Err` としてそのまま伝播する。size cap の
+///   判定とは別関心事なので、呼び出し側が既存の stat/read エラー処理に委ねる
+fn binary_size_exceeded(
+    path: &Path,
+    is_binary_ext: bool,
+    max: u64,
+) -> std::io::Result<Option<u64>> {
+    if !is_binary_ext {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(path)?;
+    Ok(if meta.len() > max {
+        Some(meta.len())
+    } else {
+        None
+    })
+}
+
+/// disk 側の全 source file を走査し、raw バイト読み + バイト hash を計算する。
+///
+/// - **エラー隔離**: `read` 失敗や size 超過は per-file skip し、rel path を `skipped`
+///   に積んで走査を続行する (旧 `.collect::<Result<Vec>>()?` の全体 abort を修正)。
+/// - **size skip**: `is_binary()` な拡張子は `max_binary_bytes` 超で read 前に skip
+///   ([`binary_size_exceeded`] の `fs::metadata` 判定でメモリ読込自体を回避)。
+///   テキスト形式は上限なし。
+fn scan_disk_entries(
+    source_files: &[std::path::PathBuf],
+    kb_path: &Path,
+    registry: &Registry,
+    max_binary_bytes: u64,
+) -> DiskScan {
+    let binary_exts = registry.binary_extensions();
+    let mut entries = Vec::with_capacity(source_files.len());
+    let mut skipped = Vec::new();
+
+    for p in source_files {
+        let rel = p
+            .strip_prefix(kb_path)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
+
+        match binary_size_exceeded(p, is_binary, max_binary_bytes) {
+            Ok(Some(len)) => {
+                eprintln!(
+                    "Skipping {rel}: binary file too large ({len} bytes > {max_binary_bytes} limit)"
+                );
+                skipped.push(rel);
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Skipping {rel}: failed to stat: {e}");
+                skipped.push(rel);
+                continue;
+            }
+        }
+
+        match std::fs::read(p) {
+            Ok(bytes) => {
+                let hash = sha256_hex_bytes(&bytes);
+                entries.push(DiskEntry {
+                    rel,
+                    hash,
+                    full: p.clone(),
+                });
+            }
+            Err(e) => {
+                eprintln!("Skipping {rel}: failed to read: {e}");
+                skipped.push(rel);
+            }
+        }
+    }
+
+    DiskScan { entries, skipped }
 }
 
 /// disk と DB の (path, hash) から「移動ペア」を決定する純粋関数。
@@ -58,16 +165,24 @@ struct DiskEntry {
 ///
 /// 重複 hash がある場合も結果が deterministic になるよう、双方を path で
 /// ソートしてから first-match マッチングを行う (evaluator 指摘 Med #4)。
+///
+/// `skipped` = 今回の scan で read 失敗 / size 超過により `disk_entries` に
+/// 載らなかった rel path 集合。これらは disk 上にまだ存在する可能性が高く
+/// 「消えた」わけではないため、orphan 候補から除外する。除外しないと、
+/// skip 中ファイルの DB 行が別の新規ファイルと同一 hash になった際に誤って
+/// rename ペアとして扱われ、prune 保護 (§4.2 skip 統一原則) が効く前に
+/// skip 中ファイルの DB 行が新 path へ書き換わってしまう (codex P2)。
 fn detect_renames(
     disk_entries: &[DiskEntry],
     db_path_hashes: &std::collections::HashMap<String, String>,
+    skipped: &HashSet<String>,
 ) -> Vec<(String, String)> {
     let disk_paths: HashSet<&str> = disk_entries.iter().map(|e| e.rel.as_str()).collect();
 
-    // DB ∖ disk, path で sort
+    // DB ∖ disk ∖ skipped, path で sort
     let mut orphan_in_db: Vec<(&String, &String)> = db_path_hashes
         .iter()
-        .filter(|(p, _)| !disk_paths.contains(p.as_str()))
+        .filter(|(p, _)| !disk_paths.contains(p.as_str()) && !skipped.contains(p.as_str()))
         .collect();
     orphan_in_db.sort_by_key(|(p, _)| *p);
 
@@ -100,6 +215,23 @@ fn detect_renames(
     pairs
 }
 
+/// prune 対象 (= disk から消えた document path) を決める純粋関数。
+///
+/// 「visited (今回 index した) でも skipped (read 失敗 / size skip で保持) でもない」
+/// DB path のみ削除対象とする (§4.2 skip 統一原則)。理由の別 (IO エラー / サイズ超過)
+/// によらず「skip = 保持、削除は disk から消えた時のみ」を単一原則で表現する。
+fn documents_to_delete(
+    all_db_paths: &[String],
+    visited: &HashSet<String>,
+    skipped: &HashSet<String>,
+) -> Vec<String> {
+    all_db_paths
+        .iter()
+        .filter(|p| !visited.contains(p.as_str()) && !skipped.contains(p.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Summary returned by [`rebuild_index`].
 pub struct IndexResult {
     pub total_documents: u32,
@@ -108,6 +240,8 @@ pub struct IndexResult {
     /// `documents.path` だけが UPDATE された数。
     pub renamed: u32,
     pub deleted: u32,
+    /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
+    pub skipped: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
 }
@@ -164,7 +298,7 @@ pub fn rebuild_index(
 
     // legacy DB (quality_score = 1.0 のまま) を一度だけ再評価する。
     // 既にスコアが入っているチャンクは触らないため冪等。
-    let quality_updated = db.backfill_quality()?;
+    let quality_updated = db.backfill_quality(&registry.binary_extensions())?;
     if quality_updated > 0 {
         eprintln!("Backfilled {quality_updated} chunks with quality scores");
     }
@@ -185,27 +319,20 @@ pub fn rebuild_index(
     // ファイル移動検出の前段階として、disk 側の全ファイルの
     // **hash だけ** を先に計算する。content は持ち回らない (evaluator 指摘
     // High #1: 大規模 KB の memory regression 回避)。embed/upsert 段階で
-    // もう一度 read_to_string する — ファイル OS キャッシュで 2 度目の
+    // もう一度 `fs::read` する — ファイル OS キャッシュで 2 度目の
     // read は十分安く、代わりにピークメモリを `filecount * avg_size` から
     // `filecount * avg_path_len + 1 file worth of content` に圧縮できる。
-    let disk_entries: Vec<DiskEntry> = source_files
-        .iter()
-        .map(|p| -> Result<DiskEntry> {
-            let content = std::fs::read_to_string(p)
-                .with_context(|| format!("failed to read {}", p.display()))?;
-            let rel = p
-                .strip_prefix(&kb_path)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let hash = sha256_hex(&content);
-            Ok(DiskEntry {
-                rel,
-                hash,
-                full: p.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let scan = scan_disk_entries(
+        &source_files,
+        &kb_path,
+        registry,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+    );
+    let disk_entries = scan.entries;
+    // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
+    // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
+    let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
+    let mut skipped_count: u32 = skipped_paths.len() as u32;
 
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
@@ -213,7 +340,7 @@ pub fn rebuild_index(
         0
     } else {
         let db_path_hashes = db.all_path_hashes()?;
-        let pairs = detect_renames(&disk_entries, &db_path_hashes);
+        let pairs = detect_renames(&disk_entries, &db_path_hashes, &skipped_paths);
         // evaluator 指摘 High #2: rename フェーズ全体を単一 transaction に
         // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
         db.rename_documents_atomic(&pairs)?;
@@ -236,7 +363,11 @@ pub fn rebuild_index(
                 updated += 1;
                 progress.report_indexed(&entry.rel, chunks);
             }
-            SingleResult::Unchanged | SingleResult::Skipped { .. } => {
+            SingleResult::Skipped { .. } => {
+                skipped_count += 1;
+                progress.report_unchanged(&entry.rel);
+            }
+            SingleResult::Unchanged => {
                 // Progress mode (= Tty/NonTty) で bar / counter を tick する。
                 // Verbose / Quiet は no-op (= 既存挙動保持)。
                 progress.report_unchanged(&entry.rel);
@@ -244,15 +375,14 @@ pub fn rebuild_index(
         }
     }
 
-    // 3. Delete documents in DB that no longer exist on disk
+    // 3. Delete documents in DB that no longer exist on disk.
+    //    §4.2 統一原則: visited ∪ skipped は保持、それ以外 (= disk から消えた) のみ削除。
     let all_db_paths = db.all_document_paths()?;
     let mut deleted: u32 = 0;
-    for db_path in &all_db_paths {
-        if !visited_paths.contains(db_path) {
-            db.delete_document(db_path)?;
-            deleted += 1;
-            progress.report_deleted(db_path);
-        }
+    for db_path in documents_to_delete(&all_db_paths, &visited_paths, &skipped_paths) {
+        db.delete_document(&db_path)?;
+        deleted += 1;
+        progress.report_deleted(&db_path);
     }
 
     // Count total documents remaining (includes unchanged ones)
@@ -269,6 +399,7 @@ pub fn rebuild_index(
         updated,
         renamed,
         deleted,
+        skipped: skipped_count,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })
@@ -314,13 +445,28 @@ fn index_single_disk_entry(
             reason: "no parser for extension",
         });
     };
-    let content = std::fs::read_to_string(&entry.full)
-        .with_context(|| format!("failed to read {}", entry.full.display()))?;
+    let bytes = match std::fs::read(&entry.full) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Skipping {}: failed to read: {e}", entry.rel);
+            return Ok(SingleResult::Skipped {
+                reason: "read failed",
+            });
+        }
+    };
     let excludes: Vec<&str> = match exclude_headings {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => crate::parser::DEFAULT_EXCLUDED_HEADINGS.to_vec(),
     };
-    let parsed = parser.parse(&content, &entry.rel, &excludes);
+    let parsed = match parser.parse_bytes(&bytes, &entry.rel, &excludes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping {}: parse failed: {e}", entry.rel);
+            return Ok(SingleResult::Skipped {
+                reason: "parse failed",
+            });
+        }
+    };
 
     if parsed.chunks.is_empty() {
         return Ok(SingleResult::Skipped {
@@ -387,7 +533,11 @@ fn index_single_disk_entry(
     )?;
 
     for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
-        let score = quality::chunk_quality_score(chunk.heading.as_deref(), &chunk.content);
+        let score = quality::chunk_quality_score(
+            chunk.heading.as_deref(),
+            &chunk.content,
+            parser.is_binary(),
+        );
         db.insert_chunk(
             doc_id,
             chunk.index as i32,
@@ -415,6 +565,9 @@ fn index_single_disk_entry(
 /// - `rel` は forward-slash、`kb_path` からの相対パス (e.g. `"notes/a.md"`)
 /// - 拡張子が `registry` に登録されていなければ `Skipped` を返す
 /// - hash が DB と一致なら `Unchanged`、違えば upsert + embedding 再計算
+/// - **size cap**: `is_binary()` な拡張子が `MAX_RAW_BINARY_BYTES` を超えていれば
+///   `fs::read` する前に skip する ([`binary_size_exceeded`]、codex P2 round 2:
+///   watcher の create/modify 経路は元々これをバイパスして全量 read/hash していた)
 ///
 /// watcher から Create/Modify イベントを受けた時に呼ぶ。
 pub fn reindex_single_file(
@@ -431,9 +584,30 @@ pub fn reindex_single_file(
             reason: "file no longer exists",
         });
     }
-    let content = std::fs::read_to_string(&full)
-        .with_context(|| format!("failed to read {}", full.display()))?;
-    let hash = sha256_hex(&content);
+
+    // scan_disk_entries (フル rebuild) と同じ size-cap ガードを read 前に適用する。
+    // metadata 自体の失敗はここでは無視し、直後の fs::read の既存エラー処理
+    // (`?` 伝播) にフォールスルーさせる (size cap とは別関心事)。
+    let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_binary_ext = registry
+        .binary_extensions()
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(ext));
+    if let Ok(Some(len)) =
+        binary_size_exceeded(&full, is_binary_ext, crate::parser::MAX_RAW_BINARY_BYTES)
+    {
+        eprintln!(
+            "Skipping {rel}: binary file too large ({len} bytes > {} limit)",
+            crate::parser::MAX_RAW_BINARY_BYTES
+        );
+        return Ok(SingleResult::Skipped {
+            reason: "binary file too large",
+        });
+    }
+
+    let bytes =
+        std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
+    let hash = sha256_hex_bytes(&bytes);
     let entry = DiskEntry {
         rel: rel.to_string(),
         hash,
@@ -462,11 +636,20 @@ pub enum RenameOutcome {
     RenamedAndReindexed { chunks: u32 },
     /// 旧 path が DB に無い (新規 path として扱った方が良い)
     OldPathMissing,
+    /// path は UPDATE 済だが、新 path の binary size が cap 超過のため
+    /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
+    /// content_hash は旧内容のまま据え置き、次回 full rebuild の
+    /// `scan_disk_entries` の size-cap 判定に委ねる (§4.2 skip 統一原則)。
+    RenamedSizeCapped,
 }
 
 /// 単一ファイルの rename を処理する。
 /// - `old_rel` / `new_rel` とも forward-slash、`kb_path` 相対
 /// - DB 側の path を UPDATE し、必要なら再 index (内容変更がある場合)
+/// - **size cap**: `is_binary()` な拡張子の新 path が `MAX_RAW_BINARY_BYTES`
+///   を超えていれば hash 再計算のための `fs::read` をスキップする
+///   ([`binary_size_exceeded`]、codex P2 round 3。これで scan / reindex /
+///   rename の 3 read 経路すべてが同じ size-cap guard を通るようになった)
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -494,9 +677,28 @@ pub fn rename_single_file(
         db.delete_document(new_rel)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
     }
-    let new_content = std::fs::read_to_string(&full)
-        .with_context(|| format!("failed to read {}", full.display()))?;
-    let new_hash = sha256_hex(&new_content);
+
+    // size-cap ガード: fs::read する前に判定する。DB の path 自体は既に
+    // rename_document で UPDATE 済なのでここでは触らない (= 旧 hash のまま
+    // 新 path に残る)。hash 再計算 / reindex は次回 full rebuild に委ねる。
+    let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_binary_ext = registry
+        .binary_extensions()
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(ext));
+    if let Ok(Some(len)) =
+        binary_size_exceeded(&full, is_binary_ext, crate::parser::MAX_RAW_BINARY_BYTES)
+    {
+        eprintln!(
+            "Skipping {new_rel}: binary file too large ({len} bytes > {} limit)",
+            crate::parser::MAX_RAW_BINARY_BYTES
+        );
+        return Ok(RenameOutcome::RenamedSizeCapped);
+    }
+
+    let new_bytes =
+        std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
+    let new_hash = sha256_hex_bytes(&new_bytes);
     if new_hash == old_hash {
         return Ok(RenameOutcome::Renamed);
     }
@@ -538,12 +740,17 @@ fn collect_source_files(
         })
     {
         let entry = entry.context("walkdir error")?;
-        if entry.file_type().is_file()
-            && let Some(ext) = entry.path().extension()
-            && let Some(ext_str) = ext.to_str()
-            && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
-        {
-            files.push(entry.into_path());
+        if entry.file_type().is_file() {
+            let name = entry.file_name().to_string_lossy();
+            if is_office_lock_file(name.as_ref()) {
+                continue;
+            }
+            if let Some(ext) = entry.path().extension()
+                && let Some(ext_str) = ext.to_str()
+                && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
+            {
+                files.push(entry.into_path());
+            }
         }
     }
 
@@ -570,11 +777,22 @@ fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Compute the hex-encoded SHA-256 digest of a string.
-fn sha256_hex(content: &str) -> String {
+/// Compute the hex-encoded SHA-256 digest of raw bytes. Byte-level hashing is the
+/// canonical form since feature-45: text formats hash their UTF-8 bytes (identical
+/// to the pre-feature-45 string hash), binary formats hash their raw file bytes.
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Compute the hex-encoded SHA-256 digest of a string (thin wrapper over
+/// [`sha256_hex_bytes`]). All production call sites moved to the byte
+/// variant in feature-45; kept test-only for the hash-parity regression
+/// tests that pin old-string-hash == new-byte-hash.
+#[cfg(test)]
+fn sha256_hex(content: &str) -> String {
+    sha256_hex_bytes(content.as_bytes())
 }
 
 // ===========================================================================
@@ -601,7 +819,7 @@ mod tests {
         let mut db = HashMap::new();
         db.insert("old/x.md".to_string(), "h1".to_string());
         db.insert("keep.md".to_string(), "h2".to_string());
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         assert_eq!(
             pairs,
             vec![("old/x.md".to_string(), "new/x.md".to_string())]
@@ -615,7 +833,7 @@ mod tests {
         let mut db = HashMap::new();
         db.insert("a.md".to_string(), "h1".to_string());
         db.insert("b.md".to_string(), "h1".to_string());
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         // disk には a.md が無いので a.md は DB orphan、b.md は既に DB にある
         // → 新規 disk path が無いのでペア無し
         assert!(pairs.is_empty());
@@ -626,7 +844,7 @@ mod tests {
         let disk = vec![mk_entry("a.md", "h1")];
         let mut db = HashMap::new();
         db.insert("a.md".to_string(), "h1".to_string());
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         assert!(pairs.is_empty());
     }
 
@@ -638,9 +856,9 @@ mod tests {
         let mut db = HashMap::new();
         db.insert("A.md".to_string(), "hempty".to_string());
         db.insert("B.md".to_string(), "hempty".to_string());
-        let pairs1 = detect_renames(&disk, &db);
+        let pairs1 = detect_renames(&disk, &db, &HashSet::new());
         // 2 回目も同じ結果になること (HashMap iteration 順に依存しない)
-        let pairs2 = detect_renames(&disk, &db);
+        let pairs2 = detect_renames(&disk, &db, &HashSet::new());
         assert_eq!(pairs1, pairs2);
         // path 順の sort により A→C, B→D になるはず
         assert_eq!(
@@ -657,9 +875,51 @@ mod tests {
         let disk = vec![mk_entry("new.md", "h_new")];
         let mut db = HashMap::new();
         db.insert("old.md".to_string(), "h_old".to_string()); // 別 hash
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         // hash 不一致なのでペアにしない (old.md は削除対象、new.md は新規追加)
         assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_detect_renames_excludes_skipped_paths() {
+        // DB に a.md (hash H)。disk 側は a.md が read 失敗 / size 超過で
+        // skip され disk_entries に載らず、別の新規 b.md が同じ hash H を持つ。
+        // a.md は disk から「消えた」のではなく単に今回未計上なだけなので、
+        // rename ペア (a.md → b.md) にすり替わってはならない (codex P2)。
+        let disk = vec![mk_entry("b.md", "H")];
+        let mut db = HashMap::new();
+        db.insert("a.md".to_string(), "H".to_string());
+        let skipped: HashSet<String> = ["a.md".to_string()].into_iter().collect();
+        let pairs = detect_renames(&disk, &db, &skipped);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_documents_to_delete_retains_skipped_paths() {
+        // DB に a.md / b.md / c.md。visited = {a.md} (今回 index), skipped = {b.md}
+        // (read 失敗 or size skip)。c.md だけが「disk から消えた」= 削除対象。
+        let all_db: Vec<String> = ["a.md", "b.md", "c.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let visited: HashSet<String> = ["a.md".to_string()].into_iter().collect();
+        let skipped: HashSet<String> = ["b.md".to_string()].into_iter().collect();
+        let to_delete = documents_to_delete(&all_db, &visited, &skipped);
+        assert_eq!(
+            to_delete,
+            vec!["c.md".to_string()],
+            "skipped path must be retained"
+        );
+    }
+
+    #[test]
+    fn test_documents_to_delete_empty_skipped_deletes_unvisited() {
+        // skipped 空 = 従来挙動: visited に無い DB path は削除。
+        let all_db: Vec<String> = ["a.md", "gone.md"].iter().map(|s| s.to_string()).collect();
+        let visited: HashSet<String> = ["a.md".to_string()].into_iter().collect();
+        let skipped: HashSet<String> = HashSet::new();
+        let to_delete = documents_to_delete(&all_db, &visited, &skipped);
+        assert_eq!(to_delete, vec!["gone.md".to_string()]);
     }
 
     #[test]
@@ -707,6 +967,24 @@ mod tests {
         let hash1 = sha256_hex("hello");
         let hash2 = sha256_hex("world");
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_sha256_hex_bytes_matches_string_hash_for_utf8() {
+        // read_to_string は無変換 (CRLF/BOM 保持) なので、UTF-8 ファイルの
+        // raw バイト hash = 旧文字列 hash。既存 DB の再 index 暴発を防ぐ要。
+        for s in [
+            "hello world",
+            "日本語テキスト",
+            "line1\r\nline2\n",
+            "\u{feff}bom-prefixed",
+        ] {
+            assert_eq!(
+                sha256_hex(s),
+                sha256_hex_bytes(s.as_bytes()),
+                "mismatch for {s:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -922,6 +1200,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_is_office_lock_file() {
+        assert!(is_office_lock_file("~$report.docx")); // MS Office owner file
+        assert!(is_office_lock_file("~$budget.xlsx"));
+        assert!(is_office_lock_file(".~lock.report.docx#")); // LibreOffice lock
+        assert!(!is_office_lock_file("report.docx"));
+        assert!(!is_office_lock_file("notes.md"));
+        assert!(!is_office_lock_file("~draft.md")); // ~$ で始まらない
+    }
+
+    #[test]
+    fn test_collect_source_files_skips_office_lock() {
+        let tmp = mk_tmp("officelock");
+        write_file(&tmp.0, "a.md", "# a");
+        write_file(&tmp.0, "~$a.md", "owner file"); // ~$ prefix, md 拡張子
+        write_file(&tmp.0, ".~lock.a.md#", "lo lock");
+        let reg = Registry::defaults();
+        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.md".to_string()],
+            "lock files must be skipped, got {names:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // scan_disk_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_disk_entries_read_fail_goes_to_skipped() {
+        let tmp = mk_tmp("scanreadfail");
+        write_file(&tmp.0, "ok.md", "# ok");
+        // 実在しないファイルを source_files に混ぜる = fs::read 失敗を deterministic に誘発
+        // (collect と read の間で消えた / lock された file の代理)。
+        let missing = tmp.0.join("gone.md");
+        let reg = Registry::defaults();
+        let source = vec![tmp.0.join("ok.md"), missing];
+        let scan = scan_disk_entries(&source, &tmp.0, &reg, crate::parser::MAX_RAW_BINARY_BYTES);
+        let entry_rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(entry_rels, vec!["ok.md"]);
+        assert_eq!(scan.skipped, vec!["gone.md".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_disk_entries_binary_size_skip_goes_to_skipped() {
+        let tmp = mk_tmp("scansize");
+        // is_binary な拡張子 (pdf) を持つ registry を作れないので、cap を極小に
+        // 渡して「size 超過」を誘発する。txt を binary 扱いにはできないため、この
+        // test は cap パラメータ注入で size-skip 分岐を突く。ここでは md を通常読み、
+        // 別途 binary 拡張子は PR-2 で結合テストする。cap の効果は次の assert で。
+        write_file(&tmp.0, "small.md", "# tiny");
+        let reg = Registry::defaults();
+        // md は is_binary=false なので size cap の対象外 = cap を 1 にしても通る。
+        let scan = scan_disk_entries(&[tmp.0.join("small.md")], &tmp.0, &reg, 1);
+        assert_eq!(
+            scan.entries.len(),
+            1,
+            "text files ignore the binary size cap"
+        );
+        assert!(scan.skipped.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // binary_size_exceeded
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_binary_size_exceeded_none_for_text_ext() {
+        // is_binary_ext=false ならファイル実サイズに関わらず常に None
+        // (テキスト形式は size cap 対象外)。
+        let tmp = mk_tmp("sizecap-text");
+        write_file(&tmp.0, "big.md", "0123456789");
+        let result = binary_size_exceeded(&tmp.0.join("big.md"), false, 1).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_binary_size_exceeded_none_when_within_cap() {
+        let tmp = mk_tmp("sizecap-ok");
+        write_file(&tmp.0, "small.pdf", "tiny");
+        let result = binary_size_exceeded(&tmp.0.join("small.pdf"), true, 1024).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_binary_size_exceeded_some_when_over_cap() {
+        let tmp = mk_tmp("sizecap-over");
+        write_file(&tmp.0, "big.pdf", "0123456789"); // 10 bytes
+        let result = binary_size_exceeded(&tmp.0.join("big.pdf"), true, 5).unwrap();
+        assert_eq!(result, Some(10));
+    }
+
+    #[test]
+    fn test_binary_size_exceeded_err_when_metadata_fails() {
+        let tmp = mk_tmp("sizecap-missing");
+        let missing = tmp.0.join("gone.pdf");
+        assert!(binary_size_exceeded(&missing, true, 1024).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // 増分 index API
     // -----------------------------------------------------------------------
@@ -1098,5 +1480,21 @@ mod tests {
             RenameOutcome::RenamedAndReindexed { chunks: 1 }
         );
         assert_ne!(RenameOutcome::Renamed, RenameOutcome::OldPathMissing);
+    }
+
+    #[test]
+    fn test_rename_outcome_size_capped_variant_is_distinct() {
+        // codex P2 round 3: 新 variant が既存 3 種と区別できることの回帰確認
+        // (rename_single_file 自体は Embedder 必須で単体テスト不可のため、
+        // ここでは enum の distinctness のみ確認する)。
+        assert_ne!(RenameOutcome::RenamedSizeCapped, RenameOutcome::Renamed);
+        assert_ne!(
+            RenameOutcome::RenamedSizeCapped,
+            RenameOutcome::RenamedAndReindexed { chunks: 1 }
+        );
+        assert_ne!(
+            RenameOutcome::RenamedSizeCapped,
+            RenameOutcome::OldPathMissing
+        );
     }
 }

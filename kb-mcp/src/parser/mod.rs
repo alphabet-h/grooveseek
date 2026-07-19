@@ -9,7 +9,7 @@
 //! が、形式非依存な表現として parser モジュールへ移した。
 //! `src/markdown.rs` は後方互換 shim として公開 API を保つ。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub mod markdown;
@@ -66,6 +66,39 @@ pub struct ParsedDocument {
 /// chunker.
 pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 
+/// バイナリ形式ファイルの生バイト上限 (50 MiB)。index 時の size skip (indexer)
+/// と get_document の raw cap (server) で共有する。テキスト形式には適用しない。
+pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 抽出済みテキストを 1 チャンクに包む共通 helper。バイナリ parser の trait 契約用
+/// `parse` (&str 版 = 「既に抽出済みテキストを受け取った」fallback) 実装で使う。
+/// path_hint からファイル名ベースの title を derive する。
+// PR-1 時点では呼び出し元 (PDF/Office parser) が未実装のため未使用。
+// PR-2/3 で消費予定 (feature-45)。
+#[allow(dead_code)]
+pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
+    let body = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let title = txt::derive_title_pub(path_hint);
+    let chunks = if body.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![Chunk {
+            index: 0,
+            heading: None,
+            level: None,
+            content: body,
+        }]
+    };
+    ParsedDocument {
+        frontmatter: Frontmatter {
+            title,
+            ..Frontmatter::default()
+        },
+        chunks,
+        raw_content: raw.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parser trait
 // ---------------------------------------------------------------------------
@@ -94,6 +127,29 @@ pub trait Parser: Send + Sync {
     /// - `exclude_headings` — 見出しベースのチャンク除外リスト (substring 一致)。
     ///   見出し概念のない形式は無視してよい
     fn parse(&self, raw: &str, path_hint: &str, exclude_headings: &[&str]) -> ParsedDocument;
+
+    /// バイト列から parse する。**全 call site (indexer / server) はこちらに統一する。**
+    ///
+    /// default impl = UTF-8 検証して `parse` に委譲する (md/txt は override 不要で動く)。
+    /// バイナリ parser (Pdf/Docx/Xlsx/Xls/Pptx) はこれを override して形式固有の
+    /// チャンクを直接生成する。`Err` の意味 = 「このファイルは index 不能」で、
+    /// 呼び出し側が skip + warn を行う。
+    fn parse_bytes(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        let s =
+            std::str::from_utf8(bytes).with_context(|| format!("{path_hint}: not valid UTF-8"))?;
+        Ok(self.parse(s, path_hint, exclude_headings))
+    }
+
+    /// バイナリ形式 parser は `true` を返す (default `false`)。
+    /// get_document の cap 分類 (§4.4) と quality filter 免除 (§4.8) の判定に使う。
+    fn is_binary(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,5 +212,35 @@ mod tests {
         assert!(c.heading.is_none());
         assert!(c.level.is_none());
         assert_eq!(c.content, "");
+    }
+
+    #[test]
+    fn test_parse_bytes_default_delegates_to_parse_on_utf8() {
+        // MarkdownParser は parse_bytes を override しない = default impl 経由。
+        let doc = MarkdownParser
+            .parse_bytes(
+                b"## H\n\nbody enough body enough body enough body enough",
+                "x.md",
+                &[],
+            )
+            .expect("valid utf-8 must parse");
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("H"));
+    }
+
+    #[test]
+    fn test_parse_bytes_default_errors_on_invalid_utf8() {
+        // 不正 UTF-8 (0xFF 0xFE) は default impl が Err にする = index 全体 abort ではなく
+        // per-file skip の起点。
+        let err = TxtParser
+            .parse_bytes(&[0xff, 0xfe, 0x00], "x.txt", &[])
+            .expect_err("invalid utf-8 must be Err");
+        assert!(err.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn test_is_binary_default_false_for_text_parsers() {
+        assert!(!MarkdownParser.is_binary());
+        assert!(!TxtParser.is_binary());
     }
 }

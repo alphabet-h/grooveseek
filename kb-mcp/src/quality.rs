@@ -95,13 +95,18 @@ impl QualityFilterConfig {
 ///
 /// `heading` は将来拡張 (depth=0 な見出しのみチャンクの追加減点等) のために
 /// 受けるが、MVP では減点には使わず `_` で無視する。
-pub fn chunk_quality_score(heading: Option<&str>, content: &str) -> f32 {
+///
+/// `is_binary` = true (Pdf/Docx/Xlsx/Xls/Pptx 由来チャンク) のときは `LENGTH_PENALTY`
+/// と `STRUCTURE_PENALTY` を免除する: ページ / シート / スライドの短さは「内容が
+/// 薄い」のではなく形式の構造であり、Markdown の薄いセクションと同列に扱うのは誤り
+/// (§4.8)。`BOILERPLATE_PENALTY` は is_binary でも据え置く。
+pub fn chunk_quality_score(heading: Option<&str>, content: &str, is_binary: bool) -> f32 {
     let _ = heading;
     let trimmed = content.trim();
     let char_count = trimmed.chars().count();
     let mut score: f32 = 1.0;
 
-    if char_count < SHORT_CONTENT_THRESHOLD {
+    if !is_binary && char_count < SHORT_CONTENT_THRESHOLD {
         score -= LENGTH_PENALTY;
     }
 
@@ -110,7 +115,7 @@ pub fn chunk_quality_score(heading: Option<&str>, content: &str) -> f32 {
     }
 
     let has_newline = trimmed.contains('\n');
-    if !has_newline && char_count < STRUCTURE_POOR_THRESHOLD {
+    if !is_binary && !has_newline && char_count < STRUCTURE_POOR_THRESHOLD {
         score -= STRUCTURE_PENALTY;
     }
 
@@ -188,7 +193,7 @@ mod tests {
                        複数行にわたり、定型語ではなく具体的な情報を含み、\n\
                        技術的な詳細も書かれています。文字数は 100 を軽く超えます。\n\
                        よって品質スコアは最大値の 1.0 になるはずです。";
-        let score = chunk_quality_score(Some("Overview"), content);
+        let score = chunk_quality_score(Some("Overview"), content, false);
         assert!((score - 1.0).abs() < 1e-5, "got {score}");
     }
 
@@ -197,25 +202,25 @@ mod tests {
         // < 30 文字 → 長さ減点
         // 改行なし + < 80 文字 → 構造減点も重なる
         // 合計 -0.9 で 0.1 付近
-        let score = chunk_quality_score(None, "短い本文。");
+        let score = chunk_quality_score(None, "短い本文。", false);
         assert!(score < 0.2, "got {score}");
     }
 
     #[test]
     fn test_score_boilerplate_only_is_near_zero() {
         // 定型語のみ + 短い + 改行なし で 3 項全部効く → 0.0 クランプ
-        let score = chunk_quality_score(None, "TBD");
+        let score = chunk_quality_score(None, "TBD", false);
         assert_eq!(score, 0.0);
-        let score = chunk_quality_score(None, "TODO。");
+        let score = chunk_quality_score(None, "TODO。", false);
         assert_eq!(score, 0.0);
-        let score = chunk_quality_score(None, "詳細は後述");
+        let score = chunk_quality_score(None, "詳細は後述", false);
         assert_eq!(score, 0.0);
     }
 
     #[test]
     fn test_score_boilerplate_case_insensitive() {
         // 小文字でもマッチする
-        let score = chunk_quality_score(None, "todo");
+        let score = chunk_quality_score(None, "todo", false);
         // 長さ減点 + 構造減点 + 定型語減点
         assert_eq!(score, 0.0);
     }
@@ -224,7 +229,7 @@ mod tests {
     fn test_score_structure_only_deduction() {
         // 30 <= len < 80 + 改行なし → 構造減点のみで 0.7
         let content = "これはちょうど三十文字を少しだけ超える程度の説明文で、改行はない。";
-        let score = chunk_quality_score(None, content);
+        let score = chunk_quality_score(None, content, false);
         assert!(
             (score - 0.7).abs() < 1e-5,
             "structure-only deduction should be 0.7, got {score}"
@@ -235,7 +240,7 @@ mod tests {
     fn test_score_long_single_line_no_penalty() {
         // >= 80 文字 + 改行なし → 構造シグナルは効かない (改行なしでも十分長い)
         let content: String = "あ".repeat(100);
-        let score = chunk_quality_score(None, &content);
+        let score = chunk_quality_score(None, &content, false);
         assert!((score - 1.0).abs() < 1e-5, "got {score}");
     }
 
@@ -247,7 +252,7 @@ mod tests {
         let content = "TBD について議論した結果をまとめる、今後の課題も含めて十分な文字数を確保した本文。\n\
                        さらに後続の段落を付け加えることで、構造減点も回避できる長さの文章となっている。\n\
                        すなわち定型語の部分一致ヒットは起きないことを確認したい。";
-        let score = chunk_quality_score(None, content);
+        let score = chunk_quality_score(None, content, false);
         assert!(
             (score - 1.0).abs() < 1e-5,
             "boilerplate partial-match should not deduct: got {score}"
@@ -257,9 +262,37 @@ mod tests {
     #[test]
     fn test_score_empty_content() {
         // 空文字列は長さ減点 + 構造減点 = -0.9 → 0.1
-        let score = chunk_quality_score(None, "");
+        let score = chunk_quality_score(None, "", false);
         assert!((score - 0.1).abs() < 1e-5, "got {score}");
         // trim 後空でも boilerplate_only は false 扱い (短さで十分補足)
+    }
+
+    #[test]
+    fn test_binary_chunk_short_content_is_exempt() {
+        // 「第3章: リスク管理」だけのタイトルスライド相当 = 短い・改行なし。
+        // text 扱いなら length(-0.6)+structure(-0.3) で 0.1 に落ちるが、
+        // is_binary=true なら両免除で 1.0 を保つ。
+        let text_score = chunk_quality_score(Some("Slide 1"), "第3章 リスク管理", false);
+        assert!(
+            text_score < 0.2,
+            "text short content should be penalized, got {text_score}"
+        );
+        let bin_score = chunk_quality_score(Some("Slide 1"), "第3章 リスク管理", true);
+        assert!(
+            (bin_score - 1.0).abs() < 1e-5,
+            "binary short content must be exempt, got {bin_score}"
+        );
+    }
+
+    #[test]
+    fn test_binary_chunk_boilerplate_still_penalized() {
+        // BOILERPLATE_PENALTY は据え置き (免除しない)。ただし length/structure は
+        // 免除なので、is_binary=true の "TBD" は -0.5 のみ = 0.5。
+        let score = chunk_quality_score(None, "TBD", true);
+        assert!(
+            (score - 0.5).abs() < 1e-5,
+            "binary boilerplate keeps -0.5 only, got {score}"
+        );
     }
 
     #[test]
@@ -390,8 +423,9 @@ mod tests {
         fn prop_chunk_quality_score_in_unit_range(
             heading in proptest::option::of("[\\PC]{0,32}"),
             content in "[\\PC]{0,4096}",
+            is_binary in proptest::bool::ANY,
         ) {
-            let s = chunk_quality_score(heading.as_deref(), &content);
+            let s = chunk_quality_score(heading.as_deref(), &content, is_binary);
             proptest::prop_assert!(
                 s.is_finite() && (0.0..=1.0).contains(&s),
                 "chunk_quality_score must be in [0.0, 1.0] and finite, got {} (heading={:?}, content_len={})",

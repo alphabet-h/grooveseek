@@ -4,6 +4,23 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Changed
+
+- **Index read layer is now byte-based.** All file read paths (`kb-mcp index`,
+  the watcher, and `get_document`) read raw bytes and hash them with SHA-256
+  instead of reading to a UTF-8 string. For existing Markdown/text knowledge
+  bases this is a no-op — the byte hash of a UTF-8 file equals the previous
+  string hash, so no re-index is triggered. This is the groundwork for binary
+  document formats (PDF / Office) landing in v0.10.0 / v0.11.0.
+
+### Fixed
+
+- **`kb-mcp index` no longer aborts when a file cannot be read or parsed.**
+  Previously a single unreadable / non-UTF-8 file in the tree failed the whole
+  run. Now such files are skipped with a warning and reported in the summary
+  (`... N skipped ...`), and — critically — a transiently unreadable file (AV
+  scan / editor lock) is **retained** in the index rather than silently pruned.
+
 ## [0.9.2] - 2026-05-18
 
 ### Fixed

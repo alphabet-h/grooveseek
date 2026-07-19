@@ -606,12 +606,13 @@ fn main() -> anyhow::Result<()> {
                 progress_reporter,
             )?;
             eprintln!(
-                "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted), {} chunks",
+                "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped), {} chunks",
                 result.duration_ms,
                 result.total_documents,
                 result.updated,
                 result.renamed,
                 result.deleted,
+                result.skipped,
                 result.total_chunks
             );
         }
