@@ -161,10 +161,19 @@ fn normalize_pdf_date(raw: &str) -> Option<String> {
     None
 }
 
-/// ページ抽出テキストの後処理 (行末ハイフン結合 + リガチャ正規化)。
-/// Task 2.5 (P1) で本実装。ここでは素通し。
+/// ページ抽出テキストの後処理: (1) 行末ハイフン結合 `-\n` → 連結、
+/// (2) よく使われるリガチャ (ﬁ ﬂ ﬀ ﬃ ﬄ) を ASCII 展開。
 fn post_process(page: &str) -> String {
-    page.to_string()
+    // (1) 行末ハイフネーション結合。
+    let dehyphenated = page.replace("-\n", "");
+    // (2) リガチャ正規化 (NFKC の代表 subset を明示展開; 全 NFKC は過剰変換の
+    //     恐れがあるため必要な合字だけ扱う)。
+    dehyphenated
+        .replace('\u{fb00}', "ff")
+        .replace('\u{fb01}', "fi")
+        .replace('\u{fb02}', "fl")
+        .replace('\u{fb03}', "ffi")
+        .replace('\u{fb04}', "ffl")
 }
 
 // ===========================================================================
@@ -211,6 +220,26 @@ mod tests {
             .parse_bytes(EMPTY, "scan.pdf", &[])
             .expect_err("no text layer must be Err");
         assert!(err.to_string().contains("no text layer"));
+    }
+
+    #[test]
+    fn test_post_process_joins_hyphenated_linebreaks() {
+        // "inter-\nnational" → "international"
+        assert_eq!(post_process("inter-\nnational text"), "international text");
+    }
+
+    #[test]
+    fn test_post_process_normalizes_ligatures() {
+        // U+FB01 (ﬁ) → "fi"
+        assert_eq!(post_process("ef\u{fb01}cient"), "efficient");
+    }
+
+    #[test]
+    fn test_post_process_preserves_normal_text() {
+        assert_eq!(
+            post_process("normal\nmultiline\ntext"),
+            "normal\nmultiline\ntext"
+        );
     }
 
     #[test]
