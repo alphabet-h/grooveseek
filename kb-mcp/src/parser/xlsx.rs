@@ -192,9 +192,10 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
     preflight_xlsx_decompression_budget_capped(bytes, path_hint, super::MAX_RAW_BINARY_BYTES)
 }
 
-/// アーカイブ内の全 entry のうち name が `.xml` または `.bin` で終わる
-/// もの全ての申告 uncompressed size (zip local file header 由来、展開は
-/// しない) を合計し、`cap` を超えていれば calamine を呼ぶ前に `Err` にする。
+/// アーカイブ内の全 entry のうち name が `.xml` / `.bin` / `.rels` の
+/// いずれか (大小文字を区別しない) で終わるもの全ての申告 uncompressed
+/// size (zip local file header 由来、展開はしない) を合計し、`cap` を
+/// 超えていれば calamine を呼ぶ前に `Err` にする。
 ///
 /// codex P1 (PR #70 round 4): 旧実装は `xl/worksheets/*.xml` +
 /// `xl/sharedStrings.xml` + `xl/styles.xml` という固定パスのみを検査して
@@ -203,11 +204,18 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// なり budget を丸ごと素通りしていた (calamine は rels から xl_path を
 /// 導出して開けるため、layout が非標準でも普通に読める)。rels を解決して
 /// 正しい xl_path を突き止めるより単純で保守的な方式として、**「name が
-/// `.xml`/`.bin` で終わる全 entry」という layout 非依存の superset** に
-/// 対象を広げることでこの抜け道を塞ぐ。xlsx の payload (worksheets /
+/// 対象拡張子で終わる全 entry」という layout 非依存の superset** に対象を
+/// 広げることでこの抜け道を塞ぐ。xlsx の payload (worksheets /
 /// sharedStrings / styles / vbaProject.bin 等) は置き場所によらず必ず
-/// この 2 拡張子のいずれかであり、media (画像等、`.png`/`.jpeg` 等) は
+/// これらの拡張子のいずれかであり、media (画像等、`.png`/`.jpeg` 等) は
 /// 対象外のままなので、正規の画像入り xlsx を誤って弾くことはない。
+///
+/// codex P1 (PR #70 round 5): `.xml`/`.bin` だけでは `_rels/.rels` /
+/// `xl/_rels/workbook.xml.rels` 等の `.rels` 拡張子が対象から漏れていた。
+/// calamine は workbook open 時に rels も読むため、巨大圧縮 `.rels` は
+/// budget を素通りし得る。`.rels` も対象に加え、かつ拡張子比較を
+/// case-insensitive にした (zip の entry name フィールドは大文字小文字を
+/// 保証しないため `.XML` 等も保守的に拾う)。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -229,15 +237,15 @@ fn preflight_xlsx_decompression_budget_capped(
         let Ok(entry) = zip.by_index_raw(i) else {
             continue;
         };
-        let name = entry.name();
-        let is_target = name.ends_with(".xml") || name.ends_with(".bin");
+        let name = entry.name().to_ascii_lowercase();
+        let is_target = name.ends_with(".xml") || name.ends_with(".bin") || name.ends_with(".rels");
         if is_target {
             total = total.saturating_add(entry.size());
         }
     }
     if total > cap {
         anyhow::bail!(
-            "{path_hint}: declared .xml/.bin entry size total ({total} bytes) exceeds \
+            "{path_hint}: declared .xml/.bin/.rels entry size total ({total} bytes) exceeds \
              {cap} bytes cap (zip-bomb guard)"
         );
     }
@@ -384,6 +392,52 @@ mod tests {
         }
         let err = preflight_xlsx_decompression_budget_capped(&buf, "x.xlsx", 5)
             .expect_err("declared size over the injected 5-byte cap must be Err even outside xl/");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_xlsx_preflight_catches_oversized_rels_entry() {
+        // codex P1 (PR #70 round 5): 旧実装は `.xml`/`.bin` で終わる entry
+        // しか合算しなかったため、`.rels` 拡張子 (`_rels/.rels` /
+        // `xl/_rels/workbook.xml.rels` 等) が漏れていた。calamine は
+        // workbook open 時に rels も読むため、巨大圧縮 `.rels` は budget を
+        // 素通りする。`.rels` も合算対象に含めたことで検出できることを
+        // 確認する。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("_rels/.rels", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap(); // 10 bytes, .rels 拡張子
+            zip.finish().unwrap();
+        }
+        let err = preflight_xlsx_decompression_budget_capped(&buf, "x.xlsx", 5)
+            .expect_err("declared .rels entry size over the injected 5-byte cap must be Err");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_xlsx_preflight_extension_check_is_case_insensitive() {
+        // codex P1 (PR #70 round 5): 拡張子比較を case-insensitive にする
+        // (`.XML` 等、通常は発生しないが zip の name フィールドは大文字小文字
+        // を保証しないため保守的に拾う)。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("XL/WORKSHEETS/SHEET1.XML", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap(); // 10 bytes, 大文字拡張子
+            zip.finish().unwrap();
+        }
+        let err = preflight_xlsx_decompression_budget_capped(&buf, "x.xlsx", 5).expect_err(
+            "declared size over the injected 5-byte cap must be Err for uppercase .XML too",
+        );
         assert!(
             err.to_string().contains("zip-bomb guard"),
             "error message should mention zip-bomb guard, got: {err}"
