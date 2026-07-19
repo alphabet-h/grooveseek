@@ -76,8 +76,7 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # 下記は .txt も index したい場合の例 ("md" のみ既定なら [parsers] ごと削除)。
 [parsers]
 enabled = ["md", "txt"]
-# 全部入り (バイナリ形式込み) にしたい場合はこう書き換える:
-# enabled = ["md", "txt", "pdf", "docx", "xlsx", "xls", "pptx"]
+# 全形式を index する例: enabled = ["md", "txt", "pdf", "docx", "xlsx", "xls", "pptx"]
 # 既知の制限 (PDF: OCR 非対応 / 多段組の reading order 乱れ。Office 共通:
 # legacy .doc/.ppt 非対応 / OpenDocument 非対応 / パスワード保護は検出して
 # skip / 表構造は plain text 化) は README.md / README.ja.md 参照。
