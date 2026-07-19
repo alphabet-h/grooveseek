@@ -97,10 +97,25 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
 }
 
 /// `2026-07-19T09:00:00Z` → `2026-07-19`。
+///
+/// 旧実装の `d[..10]` は byte 境界チェック無しの panic-prone slice で、
+/// `dcterms:created` / `modified` に multibyte 文字が混入し (例:
+/// `"2026-07-1é..."`) byte offset 10 がその文字の内側に来ると
+/// "byte index 10 is not a char boundary" で panic していた。docx/xlsx/pptx
+/// parser は (PDF と違い) `catch_unwind` の外で呼ばれるため、この panic は
+/// per-file skip に隔離されず `index` 実行全体を落とす — PR-1 で確立した
+/// per-file 隔離原則への違反になる。`pdf.rs::normalize_pdf_date` の
+/// ISO 分岐 (PR #69 round 3 の codex fix) と同じパターンで `d.get(..10)`
+/// による境界安全化 + ASCII digit/`-` 検証に変更する。
 fn iso_date_prefix(s: &str) -> Option<String> {
     let d = s.split('T').next().unwrap_or(s).trim();
-    if d.len() >= 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-' {
-        Some(d[..10].to_string())
+    if d.len() >= 10
+        && d.as_bytes()[4] == b'-'
+        && d.as_bytes()[7] == b'-'
+        && let Some(candidate) = d.get(..10)
+        && candidate.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    {
+        Some(candidate.to_string())
     } else {
         None
     }
@@ -172,5 +187,22 @@ mod tests {
         assert_eq!(fm.title.as_deref(), Some("no meta")); // filename fallback
         assert!(fm.date.is_none());
         assert!(fm.tags.is_empty());
+    }
+
+    #[test]
+    fn test_iso_date_prefix_multibyte_at_boundary_returns_none_not_panic() {
+        // "2026-07-1" (9 ASCII bytes) の直後に 2-byte 文字 "é" (0xC3 0xA9) が
+        // 続くため、byte offset 10 は "é" の内部にあり char 境界ではない。
+        // 旧実装の `d[..10]` はここで panic していた (pdf.rs::normalize_pdf_date
+        // の byte 境界 panic、PR #69 round 3 の codex fix と同一パターン)。
+        assert_eq!(iso_date_prefix("2026-07-1é"), None);
+    }
+
+    #[test]
+    fn test_iso_date_prefix_accepts_valid_iso_date() {
+        assert_eq!(
+            iso_date_prefix("2026-07-19T09:00:00Z"),
+            Some("2026-07-19".to_string())
+        );
     }
 }
