@@ -30,6 +30,11 @@ const PARSERS_MD_PDF: &str =
 /// `src/config.rs` around `build_parser_registry`).
 const PARSERS_DEFAULT: &str = "model = \"bge-small-en-v1.5\"\n";
 
+/// `[parsers].enabled = ["md", "docx", "xlsx", "pptx"]` — feature-45 PR-3
+/// Office formats, opted in alongside the always-on default `md`.
+const PARSERS_MD_OFFICE: &str =
+    "model = \"bge-small-en-v1.5\"\n[parsers]\nenabled = [\"md\", \"docx\", \"xlsx\", \"pptx\"]\n";
+
 /// Absolute path to `tests/fixtures/binary/<name>`.
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -279,5 +284,169 @@ fn test_prune_retains_binary_grown_past_size_cap() {
     assert!(
         status_stderr(&bin, layout.kb()).contains("Documents: 2"),
         "size-skipped binary must be retained, not pruned"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 3.6: Office formats (docx/xlsx/pptx) integration coverage
+// ---------------------------------------------------------------------------
+//
+// Valid docx/xlsx/pptx fixtures are generated in-process rather than
+// committed as binary assets (spec §7: minimize committed binary fixtures —
+// the unit-test `parse_bytes` coverage in `src/parser/{docx,xlsx,pptx}.rs`
+// already exercises real content extraction; these on-the-fly zips only
+// need to be *valid enough* to round-trip through `kb-mcp index` +
+// `get_document`). The builders below are trimmed re-implementations of the
+// `make_minimal_*` helpers in those modules' `#[cfg(test)]` blocks —
+// duplicated here because those helpers are private to their module and
+// this integration test compiles as a separate crate that cannot reach them.
+
+/// Minimal single-heading docx: `word/document.xml` with one `Heading1`
+/// paragraph followed by a body paragraph. Mirrors
+/// `docx::tests::make_minimal_docx`.
+fn make_office_docx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let doc_xml = r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Office Report</w:t></w:r></w:p><w:p><w:r><w:t>docx body content for search recall</w:t></w:r></w:p></w:body></w:document>"#;
+
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opt = SimpleFileOptions::default();
+        zip.start_file("[Content_Types].xml", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#).unwrap();
+        zip.start_file("word/document.xml", opt).unwrap();
+        zip.write_all(doc_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Minimal single-sheet xlsx using `inlineStr` cells (no `sharedStrings`
+/// part needed). Mirrors `xlsx::tests::make_minimal_xlsx`.
+fn make_office_xlsx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opt = SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#).unwrap();
+
+        zip.start_file("_rels/.rels", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#).unwrap();
+
+        zip.start_file("xl/workbook.xml", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#).unwrap();
+
+        zip.start_file("xl/_rels/workbook.xml.rels", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#).unwrap();
+
+        zip.start_file("xl/worksheets/sheet1.xml", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>xlsx cell content for search recall</t></is></c></row></sheetData></worksheet>"#).unwrap();
+
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Minimal single-slide pptx with a title placeholder + body shape. Mirrors
+/// `pptx::tests::make_minimal_pptx`.
+fn make_office_pptx() -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let slide_xml = r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>Office Slide</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:txBody><a:p><a:r><a:t>pptx body content for search recall</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opt = SimpleFileOptions::default();
+        zip.start_file("[Content_Types].xml", opt).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#).unwrap();
+        zip.start_file("ppt/slides/slide1.xml", opt).unwrap();
+        zip.write_all(slide_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// Scenario ⑤: `[parsers].enabled = ["md", "docx", "xlsx", "pptx"]` — a KB
+/// mixing a valid `.md` with on-the-fly-generated `.docx` / `.xlsx` /
+/// `.pptx` files indexes all four documents, and a `~$`-prefixed Office
+/// lock/owner file (garbage bytes, not a real zip) is silently excluded at
+/// the walk stage (`indexer::is_office_lock_file`) rather than attempted
+/// and skip-warned — same "opt-in gate, silent exclusion" shape as Scenario
+/// ② for the pdf-without-opt-in case.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_index_office_formats_and_ignores_lock_file() {
+    let layout = TempKbLayout::new("kb-mcp-bin-office");
+    std::fs::write(
+        layout.kb().join("valid.md"),
+        "# V\n\nbody enough body enough body enough",
+    )
+    .unwrap();
+    std::fs::write(layout.kb().join("report.docx"), make_office_docx()).unwrap();
+    std::fs::write(layout.kb().join("book.xlsx"), make_office_xlsx()).unwrap();
+    std::fs::write(layout.kb().join("deck.pptx"), make_office_pptx()).unwrap();
+    // MS Office owner/lock file: garbage bytes (not a real zip) under a
+    // `~$` name. If it were collected and handed to a parser, `parse_bytes`
+    // would error and the file would show up as a "Skipping ..." warning
+    // (like scenario ①'s encrypted.pdf) — instead it must never reach the
+    // parser at all, so no such warning is expected and it is not counted.
+    std::fs::write(
+        layout.kb().join("~$lock_dummy.docx"),
+        b"not a real docx, owner-file placeholder bytes",
+    )
+    .unwrap();
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, PARSERS_MD_OFFICE).unwrap();
+
+    let bin = kb_mcp_bin();
+    let stderr = run_index(&bin, &cfg, layout.kb());
+    assert!(
+        !stderr.to_lowercase().contains("lock_dummy"),
+        "the `~$` lock file must be excluded at the walk stage, not skip-warned:\n{stderr}"
+    );
+    // valid.md + report.docx + book.xlsx + deck.pptx = 4; ~$lock_dummy.docx
+    // is never collected as a source file.
+    assert!(
+        status_stderr(&bin, layout.kb()).contains("Documents: 4"),
+        "expected 4 indexed docs (md + docx + xlsx + pptx); lock file must be excluded"
+    );
+
+    let (_guard, base) = spawn_mcp_server(layout.kb(), &cfg);
+    let session_id = mcp_initialize(&base);
+
+    let docx_resp = mcp_get_document_call(&base, &session_id, "report.docx");
+    let docx_content = docx_resp["content"].as_str().unwrap_or_else(|| {
+        panic!("expected `content` string in get_document response, got: {docx_resp}")
+    });
+    assert!(
+        docx_content.contains("docx body content for search recall"),
+        "expected extracted docx body text, got: {docx_resp}"
+    );
+
+    let xlsx_resp = mcp_get_document_call(&base, &session_id, "book.xlsx");
+    let xlsx_content = xlsx_resp["content"].as_str().unwrap_or_else(|| {
+        panic!("expected `content` string in get_document response, got: {xlsx_resp}")
+    });
+    assert!(
+        xlsx_content.contains("xlsx cell content for search recall"),
+        "expected extracted xlsx cell text, got: {xlsx_resp}"
+    );
+
+    let pptx_resp = mcp_get_document_call(&base, &session_id, "deck.pptx");
+    let pptx_content = pptx_resp["content"].as_str().unwrap_or_else(|| {
+        panic!("expected `content` string in get_document response, got: {pptx_resp}")
+    });
+    assert!(
+        pptx_content.contains("pptx body content for search recall"),
+        "expected extracted pptx slide text, got: {pptx_resp}"
     );
 }
