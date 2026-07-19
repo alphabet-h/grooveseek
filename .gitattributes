@@ -1,0 +1,11 @@
+# Binary test fixtures (feature-45: binary document formats).
+# Mark explicitly so git never attempts CRLF normalization or textual diffing
+# on these formats, regardless of a contributor's core.autocrlf setting.
+*.pdf binary
+
+# PR-3 (Office formats: docx/xlsx/pptx/xls) fixtures — declared ahead of time
+# so newly added fixtures are covered from the first commit that adds them.
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.xls binary

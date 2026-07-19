@@ -4,14 +4,56 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-19
+
+### Added
+
+- **PDF indexing (opt-in `[parsers].enabled = [..., "pdf"]`)**: text is
+  extracted page-by-page via [oxidize-pdf](https://crates.io/crates/oxidize-pdf)
+  (pure Rust), and each non-empty page becomes one chunk with heading `p.N`.
+  `Title` / `CreationDate` PDF metadata become frontmatter when present,
+  falling back to a filename-derived title when the PDF has no `Title`.
+  Scanned / image-only PDFs (no text layer, detected via an average
+  chars-per-page heuristic **over non-empty pages only** — averaging over
+  every page, including blank/separator pages, wrongly rejected real-world
+  PDFs with a dense content page and many blank pages; found by codex
+  review on PR #69) and encrypted PDFs are skipped with a warning
+  instead of failing the whole `index` run. Like other binary formats,
+  `.pdf` files share the 50 MiB raw-byte size cap (`MAX_RAW_BINARY_BYTES`)
+  with the indexer's size-skip guard and `get_document`. The
+  `PdfDocument::extract_text` / `metadata` call sequence is wrapped in
+  `catch_unwind` so a malformed PDF that panics inside the parser's
+  dependencies degrades to a per-file skip-and-warn instead of aborting
+  the run. The panic-report-suppressing hook is installed once (`Once`)
+  instead of being swapped per extraction, gated by a thread-local flag
+  around the `catch_unwind` call, so concurrent PDF extractions (e.g.
+  multiple `get_document` HTTP requests) can't race and permanently
+  disable panic reporting process-wide or hide unrelated threads' panics
+  (found by codex review on PR #69). Post-processing applies a
+  conservative line-end hyphenation join (only when both neighbors of
+  `-\n` are ASCII lowercase, to avoid corrupting hyphenated model
+  numbers, dates, or CJK-adjacent hyphens) and normalizes common
+  ligatures (ﬁ/ﬂ/ﬀ/ﬃ/ﬄ). Also recovers UTF-16BE PDF Info-dict `Title`
+  strings (common for non-ASCII titles) that `oxidize-pdf` mis-decodes
+  one byte at a time when it doesn't detect the byte-order-mark — found
+  while dogfooding a real Japanese PDF; falls back to the
+  filename-derived title when recovery isn't possible instead of
+  surfacing mojibake. `CreationDate` parsing no longer panics on a
+  multibyte-contaminated ISO date string (found by codex review on
+  PR #69) — an invalid date is now silently ignored (`date: null`)
+  instead of taking down the whole document's extraction. See the
+  README "PDF indexing" note for remaining known limitations (no OCR,
+  multi-column reading order, unfiltered garbage `Title` metadata that
+  doesn't match the UTF-16BE pattern).
+
 ### Changed
 
 - **Index read layer is now byte-based.** All file read paths (`kb-mcp index`,
   the watcher, and `get_document`) read raw bytes and hash them with SHA-256
   instead of reading to a UTF-8 string. For existing Markdown/text knowledge
   bases this is a no-op — the byte hash of a UTF-8 file equals the previous
-  string hash, so no re-index is triggered. This is the groundwork for binary
-  document formats (PDF / Office) landing in v0.10.0 / v0.11.0.
+  string hash, so no re-index is triggered. This was the groundwork that
+  landed in this release for the byte-based PDF parser above.
 
 ### Fixed
 

@@ -13,10 +13,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub mod markdown;
+pub mod pdf;
 pub mod registry;
 pub mod txt;
 
 pub use markdown::MarkdownParser;
+pub use pdf::PdfParser;
 pub use registry::Registry;
 pub use txt::TxtParser;
 
