@@ -208,6 +208,13 @@ mod tests {
     // 手組みした最小構成 (Info dict に Title/CreationDate も含む)。
     const MINIMAL_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/minimal.pdf");
 
+    // filename title fallback 専用の 1 ページ PDF。minimal.pdf と同じ手組み手法
+    // (xref オフセット込み) で生成、Info dict は CreationDate のみで /Title を
+    // 意図的に含まない (Task 2.6: minimal.pdf は Task 2.3 test の前提として
+    // /Title 入りのまま維持するため、fallback 検証は本 fixture に分離した)。
+    // 本文はスキャン PDF 判定閾値 (50 chars/page) を超えるパディング入り。
+    const UNTITLED_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/untitled.pdf");
+
     #[test]
     fn test_pdf_page_chunks_have_heading_and_no_level() {
         let doc = PdfParser
@@ -289,5 +296,30 @@ mod tests {
             .expect_err("broken PDF open path must be Err");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("encrypted") || msg.contains("unreadable"));
+    }
+
+    #[test]
+    fn test_normalize_pdf_date_accepts_all_forms() {
+        // (1) PDF raw `D:YYYYMMDD...`、(2) bare `YYYYMMDD`、(3) ISO `YYYY-MM-DD...`。
+        // oxidize-pdf が creation_date をどの形式で返すか不明なため 3 形式許容 (§4.5)。
+        assert_eq!(
+            normalize_pdf_date("D:20260719120000Z").as_deref(),
+            Some("2026-07-19")
+        );
+        assert_eq!(normalize_pdf_date("20260719").as_deref(), Some("2026-07-19"));
+        assert_eq!(
+            normalize_pdf_date("2026-07-19T12:00:00Z").as_deref(),
+            Some("2026-07-19")
+        );
+        assert_eq!(normalize_pdf_date("garbage"), None);
+    }
+
+    #[test]
+    fn test_pdf_frontmatter_falls_back_to_filename() {
+        // metadata の title が無い untitled.pdf は filename 由来 title に fallback。
+        let doc = PdfParser
+            .parse_bytes(UNTITLED_PDF, "docs/untitled.pdf", &[])
+            .expect("untitled pdf must extract");
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("untitled"));
     }
 }
