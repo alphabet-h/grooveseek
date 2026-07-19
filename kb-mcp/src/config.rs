@@ -1056,15 +1056,15 @@ lambda = 0.5
         writeln!(
             file,
             "[parsers]\n\
-             enabled = [\"md\", \"pdf\"]\n"
+             enabled = [\"md\", \"rst\"]\n"
         )
         .unwrap();
         let cfg = Config::load_from(file.path()).unwrap();
-        // validate is passed, but build_parser_registry should fail on "pdf"
+        // validate is passed, but build_parser_registry should fail on "rst"
         let err = cfg
             .build_parser_registry()
-            .expect_err("pdf must be rejected");
-        assert!(err.to_string().contains("pdf"));
+            .expect_err("rst must be rejected");
+        assert!(err.to_string().contains("rst"));
     }
 
     #[test]

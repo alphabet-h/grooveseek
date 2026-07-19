@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use super::{MarkdownParser, Parser, TxtParser};
+use super::{MarkdownParser, Parser, PdfParser, TxtParser};
 
 pub struct Registry {
     parsers: Vec<Box<dyn Parser>>,
@@ -12,7 +12,7 @@ pub struct Registry {
 impl Registry {
     /// Build a Registry from a list of parser ids (from `[parsers].enabled`).
     /// Unknown ids fail loudly — this catches typos (`"markdown"` instead of
-    /// `"md"`) and parsers that don't exist yet (`"pdf"` / `"rst"` / `"adoc"`).
+    /// `"md"`) and parsers that don't exist yet (`"rst"` / `"adoc"`).
     pub fn from_enabled(ids: &[String]) -> Result<Self> {
         if ids.is_empty() {
             anyhow::bail!("[parsers].enabled must contain at least one id (got empty list)");
@@ -27,9 +27,10 @@ impl Registry {
             let parser: Box<dyn Parser> = match lower.as_str() {
                 "md" => Box::new(MarkdownParser),
                 "txt" => Box::new(TxtParser),
+                "pdf" => Box::new(PdfParser),
                 other => anyhow::bail!(
                     "[parsers].enabled contains unknown id {:?} — \
-                     supported in this build: md, txt",
+                     supported in this build: md, txt, pdf",
                     other
                 ),
             };
@@ -125,9 +126,9 @@ mod tests {
 
     #[test]
     fn test_from_enabled_rejects_unknown() {
-        let err = Registry::from_enabled(&["pdf".into()]).expect_err("unknown id must fail");
+        let err = Registry::from_enabled(&["rst".into()]).expect_err("unknown id must fail");
         let msg = err.to_string();
-        assert!(msg.contains("pdf"));
+        assert!(msg.contains("rst"));
         assert!(msg.contains("supported"));
     }
 

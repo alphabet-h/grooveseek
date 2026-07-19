@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp"
-version = "0.9.2"
+version = "0.10.0"
 edition = "2024"
 description = "MCP server providing semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a Markdown / plain-text knowledge base."
 authors = ["koshian"]
@@ -62,6 +62,11 @@ wide = "0.7"
 # [feature-42 / D-10] Progress bar for `kb-mcp index --progress` (TTY) +
 # IsTerminal-aware fallback for non-TTY (pipe / harness). MSRV 1.70 per cargo info.
 indicatif = "0.18"
+# [feature-45 PR-2] PDF text extraction. exact pin — 単独 maintainer の API 激変
+# 対策 (spec §3 #2)。dry-run で pdf-extract の panic / レイアウト崩壊 / 低速を回避
+# するため採用。純 Rust・MIT。詳細: .dev/knowledge/feature-45-pdf-crate-dryrun.md。
+# metadata() が Title/CreationDate を返すため lopdf 直接依存は不要。
+oxidize-pdf = "=4.1.1"
 
 # (feature-44 PR-3) Windows-only path dep on the tray crate so
 # `kb-mcp service install --with-tray` can call into the tray's
