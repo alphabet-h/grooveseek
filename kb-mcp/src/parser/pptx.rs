@@ -102,20 +102,37 @@ fn slide_number(name: &str, prefix: &str, suffix: &str) -> Option<usize> {
     mid.parse::<usize>().ok()
 }
 
-/// スライド XML から (title placeholder text, 全 a:t 連結本文) を返す。
-/// title placeholder = `<p:ph type="title"/>` を含む sp の最初の a:t 群。
+/// スライド XML から (title, body) を返す。
+///
+/// - title: 最初の title placeholder (`<p:ph type="title"/>` または
+///   `<p:ph type="ctrTitle"/>` — ECMA-376 では表紙スライド (title slide
+///   layout) の title placeholder は `ctrTitle` になる) を含む `<p:sp>` の
+///   a:t 連結テキスト。
+/// - body: title placeholder 配下を除く全ての `<a:p>` (段落) の a:t 連結
+///   テキストを、段落単位の改行区切りで連結したもの。`<p:sp>` 内の通常
+///   テキストだけでなく `<p:graphicFrame><a:tbl>` (表) セル内の a:t も同じ
+///   `<a:p>` 構造 (`a:tc > a:txBody > a:p`) を持つため区別なく拾う。
+///
+///   (旧実装は `<p:sp>` の Start/End でのみ本文バッファを flush していたため、
+///   sp の外側にある表のテキストが「次の sp の Start で握り潰される」/
+///   「最後の sp の後ろだと一度も flush されない」のいずれかで silent drop
+///   されるバグがあった。`<a:p>` 単位の flush に変えることで解消している。)
 fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
-    let mut all_text = String::new();
+    let mut body = String::new();
     let mut title: Option<String> = None;
 
-    // sp スコープ状態。
+    // `<p:sp>` スコープ状態。title placeholder 判定にのみ使う (本文の
+    // flush 単位はもはや sp ではなく `<a:p>`)。
     let mut in_sp = false;
     let mut sp_is_title = false;
-    let mut sp_text = String::new();
+
+    // `<a:p>` (段落) スコープ状態。sp 内外を問わず段落単位でテキストを蓄積し、
+    // `</a:p>` で title / body への振り分けを行う。
+    let mut para_text = String::new();
     let mut in_text = false;
 
     loop {
@@ -124,13 +141,13 @@ fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
                 b"sp" => {
                     in_sp = true;
                     sp_is_title = false;
-                    sp_text.clear();
                 }
                 b"ph" => {
                     if in_sp && ph_type_is_title(&e) {
                         sp_is_title = true;
                     }
                 }
+                b"p" => para_text.clear(),
                 b"t" => in_text = true,
                 _ => {}
             },
@@ -144,29 +161,32 @@ fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
             // (`decode()`) と entity unescape (`escape::unescape()`) を分離した
             // (docx.rs Task 3.4 前例踏襲)。
             Ok(Event::Text(t)) if in_text => {
-                sp_text.push_str(&decode_text(&t));
+                para_text.push_str(&decode_text(&t));
             }
             // quick-xml 0.38+ は entity 参照 (`&amp;` 等) を `Event::Text` に含めず
             // `Event::GeneralRef` として別 event で届ける。ここを処理しないと
             // `<a:t>A&amp;B</a:t>` の "&" が欠落する (docx.rs 同様の必須処理)。
             Ok(Event::GeneralRef(r)) if in_text => {
-                sp_text.push_str(&super::ooxml::resolve_general_ref(&r));
+                para_text.push_str(&super::ooxml::resolve_general_ref(&r));
             }
             Ok(Event::End(e)) => match super::ooxml_local(e.name().as_ref()) {
                 b"t" => in_text = false,
-                b"sp" => {
-                    let trimmed = sp_text.trim();
+                b"p" => {
+                    let trimmed = para_text.trim();
                     if !trimmed.is_empty() {
-                        if sp_is_title && title.is_none() {
-                            title = Some(trimmed.to_string());
+                        if in_sp && sp_is_title {
+                            if title.is_none() {
+                                title = Some(trimmed.to_string());
+                            }
+                        } else {
+                            if !body.is_empty() {
+                                body.push('\n');
+                            }
+                            body.push_str(trimmed);
                         }
-                        if !all_text.is_empty() {
-                            all_text.push('\n');
-                        }
-                        all_text.push_str(trimmed);
                     }
-                    in_sp = false;
                 }
+                b"sp" => in_sp = false,
                 _ => {}
             },
             Ok(Event::Eof) => break,
@@ -175,13 +195,16 @@ fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
         }
         buf.clear();
     }
-    (title, all_text)
+    (title, body)
 }
 
-/// `<p:ph>` の `type` 属性が `"title"` かどうか。
+/// `<p:ph>` の `type` 属性が title placeholder (`"title"` / `"ctrTitle"`) か
+/// どうか。`ctrTitle` は ECMA-376 で表紙スライド (title slide layout) の
+/// title placeholder に使われる値。
 fn ph_type_is_title(e: &quick_xml::events::BytesStart) -> bool {
     e.attributes().flatten().any(|attr| {
-        super::ooxml_local(attr.key.as_ref()) == b"type" && attr.value.as_ref() == b"title"
+        super::ooxml_local(attr.key.as_ref()) == b"type"
+            && matches!(attr.value.as_ref(), b"title" | b"ctrTitle")
     })
 }
 
@@ -327,6 +350,61 @@ mod tests {
         assert_eq!(doc.chunks.len(), 11);
         assert_eq!(doc.chunks[9].heading.as_deref(), Some("Slide 10"));
         assert_eq!(doc.chunks[10].heading.as_deref(), Some("Slide 11"));
+    }
+
+    /// 単一スライドの pptx zip を組み立てる (`slide_xml` = `<p:sld>...</p:sld>`
+    /// 全体)。ctrTitle / 表 (graphicFrame) 等、`make_minimal_pptx` のテンプレート
+    /// では組めない XML 構造を検証するテストで使う。
+    fn make_pptx_single_slide(slide_xml: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#).unwrap();
+            zip.start_file("ppt/slides/slide1.xml", opt).unwrap();
+            zip.write_all(slide_xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_pptx_ctr_title_placeholder_is_picked_up_as_title() {
+        // ECMA-376: 表紙スライド (title slide layout) の title placeholder は
+        // `type="ctrTitle"` になる (通常スライドの `type="title"` とは別値)。
+        let slide_xml = r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="ctrTitle"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>表紙タイトル</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let bytes = make_pptx_single_slide(slide_xml);
+        let doc = PptxParser.parse_bytes(&bytes, "cover.pptx", &[]).unwrap();
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Slide 1: 表紙タイトル"));
+    }
+
+    #[test]
+    fn test_pptx_table_text_included_in_body() {
+        // `<p:graphicFrame><a:tbl>` (表) 内の a:t は `<p:sp>` の外側にある。
+        // sp 単位でのみ本文バッファを flush する実装だと、表セルのテキストが
+        // 「次の sp の Start で握り潰される」/「最後の sp の後ろだと一度も
+        // flush されない」のいずれかで silent drop される (回帰テスト)。
+        let slide_xml = r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>本文</a:t></a:r></a:p></p:txBody></p:sp><p:graphicFrame><a:graphic><a:graphicData><a:tbl><a:tr><a:tc><a:txBody><a:p><a:r><a:t>セルA</a:t></a:r></a:p></a:txBody></a:tc></a:tr><a:tr><a:tc><a:txBody><a:p><a:r><a:t>セルB</a:t></a:r></a:p></a:txBody></a:tc></a:tr></a:tbl></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:cSld></p:sld>"#;
+        let bytes = make_pptx_single_slide(slide_xml);
+        let doc = PptxParser.parse_bytes(&bytes, "table.pptx", &[]).unwrap();
+        assert_eq!(doc.chunks.len(), 1);
+        assert!(
+            doc.chunks[0].content.contains("本文"),
+            "shape body text must survive, got: {:?}",
+            doc.chunks[0].content
+        );
+        assert!(
+            doc.chunks[0].content.contains("セルA"),
+            "table cell text must not be dropped, got: {:?}",
+            doc.chunks[0].content
+        );
+        assert!(
+            doc.chunks[0].content.contains("セルB"),
+            "table cell text must not be dropped, got: {:?}",
+            doc.chunks[0].content
+        );
     }
 
     #[test]
