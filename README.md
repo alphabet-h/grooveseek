@@ -2,7 +2,7 @@
 
 MCP server for semantic search over a Markdown / plain-text knowledge base.
 
-Parses Markdown (and optionally `.txt`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
+Parses Markdown (and optionally `.txt` / `.pdf`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
 A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `kb-mcp validate`.
 
@@ -65,11 +65,11 @@ enabled = true
 threshold = 0.3
 
 # Indexing extensions. Omit the section to keep the previous default
-# behavior (.md only). Opt-in to .txt via an explicit list. An empty array is
-# rejected to prevent silent "nothing is indexed" failures.
-# Currently supported ids: "md", "txt".
+# behavior (.md only). Opt-in to .txt / .pdf via an explicit list. An empty
+# array is rejected to prevent silent "nothing is indexed" failures.
+# Currently supported ids: "md", "txt", "pdf" (v0.10.0+).
 [parsers]
-enabled = ["md", "txt"]
+enabled = ["md", "pdf"]
 
 # Live-sync file watcher. When `kb-mcp serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally
@@ -694,7 +694,13 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   2. OS cache dir joined with `fastembed` (Linux: `~/.cache/fastembed`, macOS: `~/Library/Caches/fastembed`, Windows: `%LOCALAPPDATA%\fastembed`).
   3. `.fastembed_cache` under the current working directory (final fallback).
 - **Index storage**: The SQLite database is stored as `.kb-mcp.db` in the **parent** directory of the `--kb-path` (i.e. the repository root when `--kb-path` points to `knowledge-base/`).
-- **Parser registry**: only file extensions listed in `[parsers].enabled` are indexed. The section defaults to `["md"]` (the default behavior); `["md", "txt"]` opts into `.txt` where the title is derived from the filename. Unknown ids (e.g. `"pdf"` / `"rst"`) are rejected at startup; an empty array is also rejected to avoid silent "nothing is indexed" failures.
+- **Parser registry**: only file extensions listed in `[parsers].enabled` are indexed. The section defaults to `["md"]` (the default behavior); `["md", "txt"]` opts into `.txt` where the title is derived from the filename, and `["md", "pdf"]` (v0.10.0+) opts into `.pdf` (see the PDF indexing note below). Unknown ids (e.g. `"docx"` / `"rst"`) are rejected at startup; an empty array is also rejected to avoid silent "nothing is indexed" failures.
+- **PDF indexing (v0.10.0+)**: opt-in via `[parsers].enabled = ["md", "pdf"]`. Text is extracted page-by-page with [oxidize-pdf](https://crates.io/crates/oxidize-pdf) (pure Rust); each non-empty page becomes one chunk with heading `p.N`. `Title` / `CreationDate` PDF metadata become frontmatter when present, falling back to a filename-derived title when the PDF has no `Title`. Encrypted PDFs are skipped with a warning (no password support). Like other binary formats, `.pdf` files are subject to the 50 MiB raw-byte size cap — larger files are skipped with a warning instead of aborting the run. Known limitations:
+  - **No OCR**: scanned / image-only PDFs (no text layer) are detected — average extracted text below 50 chars/page — and skipped with a warning; they are never indexed.
+  - **Reading order on multi-column layouts**: extraction follows the PDF's internal text-drawing order, which can interleave columns on complex multi-column layouts (e.g. slide decks). Single-column documents are unaffected.
+  - **Garbage `Title` metadata is not filtered**: the filename fallback only triggers when the PDF's `Title` field is empty. A non-empty but meaningless auto-generated title (e.g. left over from an export pipeline) is used as-is.
+  - **Hyphenation join is a conservative heuristic**: a line-end `-\n` is joined only when the character before `-` and the character after `\n` are both ASCII lowercase letters (to avoid corrupting hyphenated model numbers, dates, or CJK-adjacent hyphens). This occasionally leaves a genuine word break unjoined, or joins a coincidental lowercase-lowercase pair that wasn't actually a hyphenation.
+  - **UTF-16BE `Title` metadata can appear garbled**: found via dogfooding a real Japanese PDF (2026-07-19). When a PDF's `/Title` uses the PDF spec's UTF-16BE string form (common for non-ASCII titles), the current `oxidize-pdf` dependency does not decode it, and the `title` field surfaces as mojibake instead. This affects only the displayed title — extracted page `content` is unaffected (verified mojibake-free on the same document), and the empty-title filename fallback does not catch this case because the title is non-empty, just garbled.
 - **Live-sync file watcher**: `kb-mcp serve` spawns a `notify`-based watcher by default (`[watch].enabled = true`, 500 ms debounce). Manual saves, `git pull`, and external scripts are re-indexed incrementally on the same Mutex-guarded resources used by MCP tools, so concurrent triggers are serialized. Disable with `--no-watch` or `[watch].enabled = false`.
 - **HTTP transport**: `--transport http --port 3100` serves MCP over rmcp's Streamable HTTP at `/mcp`, with `/healthz` for probes and a Mutex-serialized pipeline inside. Default bind is `127.0.0.1:3100` — `0.0.0.0` is opt-in and **has no built-in authentication yet**; restrict with a reverse proxy / firewall until that arrives.
 - **Embedding dimensions**: Depends on `--model`. BGE-small-en-v1.5 = 384, BGE-M3 = 1024. The chosen dim is declared on the `vec_chunks` virtual table and recorded in the `index_meta` table; a mismatch at runtime is detected and rejected.

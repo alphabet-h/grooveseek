@@ -2,7 +2,7 @@
 
 Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP サーバ。
 
-YAML frontmatter 付きの Markdown (および任意で `.txt`) をパースし、見出し単位でチャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
+YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf`) をパースし、見出し単位でチャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
 
 ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`kb-mcp validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。
 
@@ -65,10 +65,11 @@ enabled = true
 threshold = 0.3
 
 # index 対象拡張子。セクション省略で デフォルト挙動
-# (.md のみ)。明示リストで .txt にオプトイン。空配列 [] は「何もインデッ
-# クスされない」事故を防ぐため拒否される。現在サポート id: "md" / "txt"。
+# (.md のみ)。明示リストで .txt / .pdf にオプトイン。空配列 [] は「何もイン
+# デックスされない」事故を防ぐため拒否される。現在サポート id: "md" / "txt" /
+# "pdf" (v0.10.0+)。
 [parsers]
-enabled = ["md", "txt"]
+enabled = ["md", "pdf"]
 
 # ライブ同期ファイルウォッチャ。`kb-mcp serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
@@ -694,7 +695,13 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   2. OS キャッシュ + `fastembed` (Linux: `~/.cache/fastembed`、macOS: `~/Library/Caches/fastembed`、Windows: `%LOCALAPPDATA%\fastembed`)
   3. CWD 直下の `.fastembed_cache` (最終フォールバック)
 - **インデックス保存先**: SQLite DB は `--kb-path` の**親ディレクトリ**に `.kb-mcp.db` として保存される (例: `--kb-path ./knowledge-base` ならリポジトリルート)
-- **Parser registry**: `[parsers].enabled` に列挙された拡張子のみインデックス対象。既定は `["md"]` (従来デフォルト)、`["md", "txt"]` で `.txt` にオプトイン (タイトルはファイル名派生)。未知 id (例: `"pdf"` / `"rst"`) は起動時に拒否、空配列も「何もインデックスされない」事故防止のため拒否
+- **Parser registry**: `[parsers].enabled` に列挙された拡張子のみインデックス対象。既定は `["md"]` (従来デフォルト)、`["md", "txt"]` で `.txt` にオプトイン (タイトルはファイル名派生)、`["md", "pdf"]` (v0.10.0+) で `.pdf` にオプトイン (詳細は下記 PDF インデックスの補足)。未知 id (例: `"docx"` / `"rst"`) は起動時に拒否、空配列も「何もインデックスされない」事故防止のため拒否
+- **PDF インデックス (v0.10.0+)**: `[parsers].enabled = ["md", "pdf"]` でオプトイン。[oxidize-pdf](https://crates.io/crates/oxidize-pdf) (純 Rust) でページ単位にテキストを抽出し、空でない各ページが見出し `p.N` の 1 チャンクになる。PDF の `Title` / `CreationDate` メタデータがあれば frontmatter に反映、`Title` が無ければファイル名派生タイトルに fallback する。暗号化 PDF は warning 付きで skip (パスワード対応なし)。他のバイナリ形式と同様、`.pdf` にも 50 MiB の生バイト上限が適用され、超過分は実行全体を abort せず warning 付き skip になる。既知の制限:
+  - **OCR 非対応**: スキャン / 画像のみの PDF (text layer なし。抽出文字数の平均が 50 chars/page 未満で判定) は warning 付きで skip され、一切インデックスされない
+  - **多段組レイアウトの reading order 乱れ**: 抽出順は PDF 内部のテキスト描画順に従うため、複雑な多段組レイアウト (スライド資料等) では列が入り交じることがある。単一段組の文書は影響を受けない
+  - **`Title` メタデータのゴミは filename fallback しない**: filename fallback は PDF の `Title` フィールドが空の場合のみ発火する。空ではないが無意味な自動生成タイトル (エクスポートパイプライン由来の残骸等) はそのまま使われる
+  - **ハイフン結合は保守的なヒューリスティック**: 行末の `-\n` は、`-` の直前と `\n` の直後がともに ASCII 小文字の場合のみ結合する (型番・日付・CJK に隣接するハイフンを誤って壊さないため)。この結果、本来結合すべき単語分断が結合されない、あるいは偶然の小文字-小文字の並びを誤って結合してしまうケースが稀にある
+  - **UTF-16BE エンコードの `Title` メタデータが文字化けすることがある**: 実際の日本語 PDF での dogfood (2026-07-19) で発見。`/Title` が PDF 仕様の UTF-16BE 文字列形式 (非 ASCII タイトルで一般的) の場合、現行の `oxidize-pdf` 依存はこれをデコードせず、`title` フィールドが文字化けして現れる。影響は表示タイトルのみで、抽出されたページ本文 (`content`) は影響を受けない (同一文書で文字化けなしを確認済み)。空タイトルの filename fallback はこのケースを検知できない (タイトル自体は非空で、化けているだけ)
 - **ライブ同期ウォッチャ**: `kb-mcp serve` は `notify` ベースの watcher を既定 spawn (`[watch].enabled = true`、500ms debounce)。手動 save / `git pull` / 外部スクリプトを MCP ツールと同じ Mutex 付きリソース上で増分再インデックスするため、同時トリガは直列化される。`--no-watch` / `[watch].enabled = false` で無効化
 - **HTTP トランスポート**: `--transport http --port 3100` で rmcp の Streamable HTTP を `/mcp` に提供し、`/healthz` をプローブ用、内部は Mutex 直列化。既定 bind は `127.0.0.1:3100`、`0.0.0.0` は明示 opt-in かつ**まだ認証機構無し** — リバースプロキシ / ファイアウォール側で保護すること
 - **埋め込み次元**: `--model` で決まる。BGE-small-en-v1.5 = 384、BGE-M3 = 1024。選択した次元は `vec_chunks` 仮想テーブルに宣言され `index_meta` に記録される。実行時の不一致は検出して拒否
