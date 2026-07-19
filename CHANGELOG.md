@@ -24,11 +24,14 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   the run. Post-processing applies a conservative line-end hyphenation
   join (only when both neighbors of `-\n` are ASCII lowercase, to avoid
   corrupting hyphenated model numbers, dates, or CJK-adjacent hyphens)
-  and normalizes common ligatures (ﬁ/ﬂ/ﬀ/ﬃ/ﬄ). See the README "PDF
-  indexing" note for known limitations (no OCR, multi-column reading
-  order, unfiltered garbage `Title` metadata, and — found during
-  dogfooding a real Japanese PDF — UTF-16BE-encoded `Title` metadata
-  surfacing as mojibake; extracted page content is unaffected).
+  and normalizes common ligatures (ﬁ/ﬂ/ﬀ/ﬃ/ﬄ). Also recovers UTF-16BE PDF
+  Info-dict `Title` strings (common for non-ASCII titles) that
+  `oxidize-pdf` mis-decodes one byte at a time when it doesn't detect the
+  byte-order-mark — found while dogfooding a real Japanese PDF; falls
+  back to the filename-derived title when recovery isn't possible instead
+  of surfacing mojibake. See the README "PDF indexing" note for remaining
+  known limitations (no OCR, multi-column reading order, unfiltered
+  garbage `Title` metadata that doesn't match the UTF-16BE pattern).
 
 ### Changed
 

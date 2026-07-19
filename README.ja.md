@@ -701,7 +701,8 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   - **多段組レイアウトの reading order 乱れ**: 抽出順は PDF 内部のテキスト描画順に従うため、複雑な多段組レイアウト (スライド資料等) では列が入り交じることがある。単一段組の文書は影響を受けない
   - **`Title` メタデータのゴミは filename fallback しない**: filename fallback は PDF の `Title` フィールドが空の場合のみ発火する。空ではないが無意味な自動生成タイトル (エクスポートパイプライン由来の残骸等) はそのまま使われる
   - **ハイフン結合は保守的なヒューリスティック**: 行末の `-\n` は、`-` の直前と `\n` の直後がともに ASCII 小文字の場合のみ結合する (型番・日付・CJK に隣接するハイフンを誤って壊さないため)。この結果、本来結合すべき単語分断が結合されない、あるいは偶然の小文字-小文字の並びを誤って結合してしまうケースが稀にある
-  - **UTF-16BE エンコードの `Title` メタデータが文字化けすることがある**: 実際の日本語 PDF での dogfood (2026-07-19) で発見。`/Title` が PDF 仕様の UTF-16BE 文字列形式 (非 ASCII タイトルで一般的) の場合、現行の `oxidize-pdf` 依存はこれをデコードせず、`title` フィールドが文字化けして現れる。影響は表示タイトルのみで、抽出されたページ本文 (`content`) は影響を受けない (同一文書で文字化けなしを確認済み)。空タイトルの filename fallback はこのケースを検知できない (タイトル自体は非空で、化けているだけ)
+
+  実際の日本語 PDF での dogfood (2026-07-19) で発見した `oxidize-pdf` の癖には対処済み: `/Title` が PDF 仕様の UTF-16BE 文字列形式 (非 ASCII タイトルで一般的) の場合、この依存クレートは byte-order-mark を検出できず 1 byte ずつ mis-decode して文字化けを生む。kb-mcp はこの mis-decode パターンを検知して元のタイトルに復元する。復元できない (あるいは復元結果もなお不自然な) 場合は文字化けをそのまま出さず filename fallback に倒す。抽出されたページ本文 (`content`) はそもそもこの問題の影響を受けていない — 化けるのは `title` フィールドのみだった
 - **ライブ同期ウォッチャ**: `kb-mcp serve` は `notify` ベースの watcher を既定 spawn (`[watch].enabled = true`、500ms debounce)。手動 save / `git pull` / 外部スクリプトを MCP ツールと同じ Mutex 付きリソース上で増分再インデックスするため、同時トリガは直列化される。`--no-watch` / `[watch].enabled = false` で無効化
 - **HTTP トランスポート**: `--transport http --port 3100` で rmcp の Streamable HTTP を `/mcp` に提供し、`/healthz` をプローブ用、内部は Mutex 直列化。既定 bind は `127.0.0.1:3100`、`0.0.0.0` は明示 opt-in かつ**まだ認証機構無し** — リバースプロキシ / ファイアウォール側で保護すること
 - **埋め込み次元**: `--model` で決まる。BGE-small-en-v1.5 = 384、BGE-M3 = 1024。選択した次元は `vec_chunks` 仮想テーブルに宣言され `index_meta` に記録される。実行時の不一致は検出して拒否

@@ -15,6 +15,7 @@ fixtures.
 | `empty_text.pdf`   | 660 B     | 1 page whose `/Contents` stream is present but has zero text-showing operators (`/Length 0`) — simulates a scanned/image-only PDF | `test_pdf_scanned_no_text_layer_is_err` (avg chars/page below the 50-char scanned-PDF threshold → `Err`) |
 | `untitled.pdf`     | 848 B     | 1 page with real body text (padded past the scanned-PDF threshold) but **no `/Title`** in the Info dict, only `/CreationDate` | `test_pdf_frontmatter_falls_back_to_filename` (title must fall back to the filename stem) |
 | `encrypted.pdf`    | 2047 B    | `minimal.pdf`, re-saved by `pikepdf` under AES-256 (`R=6`) encryption with a **non-empty** user password | `test_pdf_encrypted_real_fixture_is_err` (real encrypted PDF must be `Err` without calling `unlock()`) |
+| `utf16_title.pdf`  | 761 B     | 1 page (padded past the scanned-PDF threshold) with `/Title` as a **literal PDF string** (`(...)`, raw bytes) encoding UTF-16BE `"日本語"` with a BOM (`0xFEFF`) | `test_pdf_recovers_utf16be_title_from_real_pdf_encoding` (Task 2.9 follow-up: `oxidize-pdf` mis-decodes this byte-by-byte through a CP1252/WinAnsi-style table instead of detecting the BOM; kb-mcp must recover the correct title) |
 
 `minimal.pdf` intentionally keeps `/Title` so it stays valid for the Task 2.3
 happy-path test; the filename-fallback case needed a *separate* fixture
@@ -126,6 +127,25 @@ def build_pdf(pages: list[str], title: str | None, creation_date: str) -> bytes:
 Adjust which object is Root/Info/page count as needed, write the result with
 `open(path, "wb")`, then run
 `cargo test --lib parser::pdf` to confirm oxidize-pdf accepts it.
+
+### `utf16_title.pdf` — encode `/Title` as a *literal* PDF string, not a hex string
+
+`utf16_title.pdf`'s Info dict `/Title` is written as `(` + raw bytes + `)`
+(the literal-string PDF syntax), i.e. `bytes([0xFE, 0xFF, 0x65, 0xE5, 0x67,
+0x2C, 0x8A, 0x9E])` (UTF-16BE BOM + "日本語") sandwiched directly between
+parentheses — **not** the hex-string form `<FEFF65E5672C8A9E>`. This
+distinction matters and is not interchangeable for this fixture's purpose:
+while building this fixture (Task 2.9 follow-up, 2026-07-19) a first attempt
+used a hex string, and `oxidize-pdf` (4.1.1) came back with an **empty**
+title (silently — no error, `meta.title` was `None`/empty), so the
+filename-fallback path fired instead of the mis-decode bug the fixture is
+meant to exercise. Switching to the literal-string form reproduced the exact
+mis-decode found in the real Downloads PDF during dogfooding. If you need
+another non-ASCII-title fixture, use the literal-string form and verify
+end-to-end (`cargo test --lib parser::pdf::tests::test_pdf_recovers_utf16be_title...`)
+that it actually reproduces mis-decoded output before wiring the fix's
+"before" state into a test — don't assume any Unicode PDF-string
+representation exercises oxidize-pdf's decode paths identically.
 
 ## `encrypted.pdf` — real encrypted fixture
 
