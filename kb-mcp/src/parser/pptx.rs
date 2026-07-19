@@ -57,11 +57,19 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             };
         let (title, body) = parse_slide_xml(&slide_xml);
         let mut content = body;
-        // notes: 同番号 heuristic (spec §4.5 で許可。rels 解決はしない)。
-        if let Some(notes_xml) = super::ooxml::read_zip_entry(
+        // notes: `ppt/slides/_rels/slide{n}.xml.rels` の notesSlide
+        // relationship を解決する (dry-run (Task 3.7) で同番号 heuristic の
+        // 誤帰属が実証されたため廃止。rels が無い / notesSlide relationship
+        // が無い slide は notes なしとし、フォールバック heuristic はしない
+        // — 誤帰属ゼロを優先する)。
+        let notes_path = super::ooxml::read_zip_entry(
             &mut zip,
-            &format!("ppt/notesSlides/notesSlide{n}.xml"),
-        ) {
+            &format!("ppt/slides/_rels/slide{n}.xml.rels"),
+        )
+        .and_then(|rels_xml| resolve_notes_path(&rels_xml));
+        if let Some(path) = notes_path
+            && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path)
+        {
             let notes_text = collect_a_t(&notes_xml);
             if !notes_text.trim().is_empty() {
                 content.push_str("\n\n[notes]\n");
@@ -100,6 +108,71 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
 fn slide_number(name: &str, prefix: &str, suffix: &str) -> Option<usize> {
     let mid = name.strip_prefix(prefix)?.strip_suffix(suffix)?;
     mid.parse::<usize>().ok()
+}
+
+/// `ppt/slides/_rels/slideN.xml.rels` から notesSlide relationship
+/// (`Type` が `.../relationships/notesSlide` で終わる `<Relationship>`) の
+/// `Target` を解決し、zip 内の絶対パス (例: `ppt/notesSlides/notesSlide1.xml`)
+/// を返す。該当する relationship が無ければ None (= 呼び出し側は notes なし
+/// として扱う。同番号 heuristic へのフォールバックはしない)。
+fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
+    let mut reader = Reader::from_reader(rels_xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if super::ooxml_local(e.name().as_ref()) != b"Relationship" {
+                    continue;
+                }
+                let mut rel_type: Option<String> = None;
+                let mut target: Option<String> = None;
+                for attr in e.attributes().flatten() {
+                    match super::ooxml_local(attr.key.as_ref()) {
+                        b"Type" => {
+                            rel_type = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        }
+                        b"Target" => {
+                            target = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        }
+                        _ => {}
+                    }
+                }
+                if let (Some(rel_type), Some(target)) = (rel_type, target)
+                    && rel_type.ends_with("/notesSlide")
+                {
+                    return Some(resolve_relative_target("ppt/slides", &target));
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
+}
+
+/// `base_dir` (例: `"ppt/slides"`、末尾スラッシュ無し) を基準に OOXML の
+/// relationship `Target` (例: `"../notesSlides/notesSlide1.xml"`) を解決し、
+/// zip 内の絶対パス (例: `"ppt/notesSlides/notesSlide1.xml"`) を返す。
+/// `Target` が `/` 始まりの絶対パス (`"/ppt/..."`) の場合は先頭の `/` を
+/// 除いてそのまま使う (OPC 仕様上のパッケージルート基準パス)。
+fn resolve_relative_target(base_dir: &str, target: &str) -> String {
+    if let Some(abs) = target.strip_prefix('/') {
+        return abs.to_string();
+    }
+    let mut stack: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            s => stack.push(s),
+        }
+    }
+    stack.join("/")
 }
 
 /// スライド XML から (title, body) を返す。
@@ -267,7 +340,11 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
-    /// slides = [(title_opt, body, notes_opt)]。
+    /// slides = [(title_opt, body, notes_opt)]。notes が Some の slide には
+    /// `ppt/slides/_rels/slide{n}.xml.rels` に notesSlide relationship
+    /// (Type=`.../notesSlide`, Target=`../notesSlides/notesSlide{n}.xml`) も
+    /// 書く (同番号 heuristic 廃止後は rels 経由でしか notes を解決しない
+    /// ため、fixture 側で明示的に対応させる必要がある)。
     fn make_minimal_pptx(slides: &[(Option<&str>, &str, Option<&str>)]) -> Vec<u8> {
         let mut buf = Vec::new();
         {
@@ -294,6 +371,12 @@ mod tests {
                     zip.start_file(format!("ppt/notesSlides/notesSlide{n}.xml"), opt)
                         .unwrap();
                     zip.write_all(notes_xml.as_bytes()).unwrap();
+                    let rels_xml = format!(
+                        r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>"#
+                    );
+                    zip.start_file(format!("ppt/slides/_rels/slide{n}.xml.rels"), opt)
+                        .unwrap();
+                    zip.write_all(rels_xml.as_bytes()).unwrap();
                 }
             }
             zip.finish().unwrap();
@@ -419,6 +502,84 @@ mod tests {
             doc.chunks[0].content.contains("セルB"),
             "table cell text must not be dropped, got: {:?}",
             doc.chunks[0].content
+        );
+    }
+
+    #[test]
+    fn test_pptx_notes_resolved_via_rels_not_same_number() {
+        // dry-run (Task 3.7) で実証された誤帰属回帰テスト: 同番号 heuristic の
+        // ままだと、notesSlide1.xml が (実際は rels 上 slide4 からのみ参照
+        // されているにもかかわらず) 同番号の slide1 に付いてしまう。
+        // rels 解決に切り替えたことで、notesSlide1.xml が実際に参照されて
+        // いる slide4 の chunk にだけ notes が付くことを検証する。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#).unwrap();
+
+            for n in 1..=4 {
+                let slide_xml = format!(
+                    r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>本文スライド{n}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+                );
+                zip.start_file(format!("ppt/slides/slide{n}.xml"), opt)
+                    .unwrap();
+                zip.write_all(slide_xml.as_bytes()).unwrap();
+            }
+
+            // slide1: rels はあるが notesSlide relationship を持たない
+            // (slideLayout relationship のみ = 「rels はあるが notes 対応は
+            // 無い」ケースも同時に検証する)。
+            zip.start_file("ppt/slides/_rels/slide1.xml.rels", opt)
+                .unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/></Relationships>"#).unwrap();
+
+            // slide2/slide3: rels ファイル自体が無い。
+
+            // slide4 の rels だけが notesSlide1.xml を参照する
+            // (= 同番号 heuristic なら slide1 の notes になるはずだが、
+            // 実際の所有者は slide4)。
+            zip.start_file("ppt/slides/_rels/slide4.xml.rels", opt)
+                .unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#).unwrap();
+
+            zip.start_file("ppt/notesSlides/notesSlide1.xml", opt)
+                .unwrap();
+            // 非 ASCII (日本語) を含むため raw byte string (`br#"..."#`) は使えない
+            // (raw byte string literal は ASCII 限定): `r#"..."#.as_bytes()` で代用。
+            zip.write_all(r#"<?xml version="1.0"?><p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>発表者ノート</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#.as_bytes()).unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let doc = PptxParser.parse_bytes(&buf, "misattr.pptx", &[]).unwrap();
+        assert_eq!(doc.chunks.len(), 4);
+        assert!(
+            !doc.chunks[0].content.contains("発表者ノート"),
+            "slide1 (rels has no notesSlide relationship) must NOT get slide4's \
+             notes via same-number heuristic, got: {:?}",
+            doc.chunks[0].content
+        );
+        assert!(
+            !doc.chunks[1].content.contains("発表者ノート"),
+            "slide2 (no rels file at all) must not get notes, got: {:?}",
+            doc.chunks[1].content
+        );
+        assert!(
+            !doc.chunks[2].content.contains("発表者ノート"),
+            "slide3 (no rels file at all) must not get notes, got: {:?}",
+            doc.chunks[2].content
+        );
+        assert!(
+            doc.chunks[3].content.contains("[notes]"),
+            "slide4 (rels references notesSlide1.xml) must get the notes, got: {:?}",
+            doc.chunks[3].content
+        );
+        assert!(
+            doc.chunks[3].content.contains("発表者ノート"),
+            "slide4 (rels references notesSlide1.xml) must get the notes, got: {:?}",
+            doc.chunks[3].content
         );
     }
 
