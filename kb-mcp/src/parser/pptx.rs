@@ -720,7 +720,8 @@ mod tests {
             zip.start_file("[Content_Types].xml", opt).unwrap();
             zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#).unwrap();
 
-            for (file_n, title) in [(1usize, "先頭ファイル"), (3usize, "末尾ファイル")] {
+            for (file_n, title) in [(1usize, "先頭ファイル"), (3usize, "末尾ファイル")]
+            {
                 let slide_xml = format!(
                     r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{title}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
                 );
@@ -764,7 +765,9 @@ mod tests {
         // このテストは実質 test_pptx_slides_sorted_numerically_not_zip_order の
         // fallback 経路が生きていることの明示的な回帰 guard。
         let bytes = make_minimal_pptx(&[(None, "本文A", None), (None, "本文B", None)]);
-        let doc = PptxParser.parse_bytes(&bytes, "no-presentation.pptx", &[]).unwrap();
+        let doc = PptxParser
+            .parse_bytes(&bytes, "no-presentation.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 2);
         assert!(doc.chunks[0].content.contains("本文A"));
         assert!(doc.chunks[1].content.contains("本文B"));
