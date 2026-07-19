@@ -275,13 +275,26 @@ fn parse_sld_id_list(xml: &[u8]) -> Vec<String> {
     ids
 }
 
-/// `<p:sldId id="256" r:id="rId1"/>` の `r:id` 属性値を取る。`id` (plain,
-/// relationship と無関係な slide の永続 ID) と衝突しないよう、namespace
-/// prefix を無視する `ooxml_local` ではなく生の QName `r:id` に厳密一致させる
-/// (OOXML では relationships namespace は事実上必ず prefix `r` で宣言される)。
+/// `<p:sldId id="256" r:id="rId1"/>` の relationship 参照属性 (`r:id`) の
+/// 値を取る。
+///
+/// codex P2 (PR #70 round 4): 当初は生 QName `r:id` への厳密一致だったが、
+/// relationships namespace は仕様上 prefix `r` に固定されているわけでは
+/// なく、正規の XML でも別 prefix (`rel:id` 等) に bind され得る。
+/// 「namespace prefix 付き (`:` を含む) かつ local name が `id`」という
+/// 条件に緩和して受理する。plain `id` 属性 (slide の永続 ID、
+/// relationship とは無関係) はコロンを含まないためこの条件で除外され、
+/// 誤って relationship id として拾うことはない (前回 `r:id` 厳密一致に
+/// した理由と両立)。完全な namespace URI 解決 (xmlns 宣言の追跡) までは
+/// 行わない — prefix 付き `:id` という緩い一致で実用上十分と判断した。
 fn r_id_attr(e: &quick_xml::events::BytesStart) -> Option<String> {
     e.attributes().flatten().find_map(|attr| {
-        if attr.key.as_ref() == b"r:id" {
+        let key = attr.key.as_ref();
+        let is_prefixed_id = key
+            .iter()
+            .position(|&b| b == b':')
+            .is_some_and(|colon| &key[colon + 1..] == b"id");
+        if is_prefixed_id {
             Some(String::from_utf8_lossy(&attr.value).into_owned())
         } else {
             None
@@ -774,6 +787,62 @@ mod tests {
             doc.chunks[1].heading.as_deref(),
             Some("Slide 2: 先頭ファイル"),
             "visible order (sldIdLst) must win over file-number order, got: {:?}",
+            doc.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_pptx_sld_id_accepts_alternate_relationship_namespace_prefix() {
+        // codex P2 (PR #70 round 4): sldId の relationship 参照属性が
+        // namespace prefix `r` 以外 (`rel:id` 等) に bind された正規 XML
+        // では、旧実装の生 QName `r:id` 厳密一致では取れず、可視順が
+        // 解決できずに file 番号 fallback へ落ちてしまっていた。prefix
+        // 付き (`:` を含む) かつ local name が `id` の属性を受理するよう
+        // 緩和したことで、`rel:id` prefix でも可視順が効くことを検証する。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#).unwrap();
+
+            for (file_n, title) in [(1usize, "先頭ファイル"), (3usize, "末尾ファイル")]
+            {
+                let slide_xml = format!(
+                    r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{title}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+                );
+                zip.start_file(format!("ppt/slides/slide{file_n}.xml"), opt)
+                    .unwrap();
+                zip.write_all(slide_xml.as_bytes()).unwrap();
+            }
+
+            // sldIdLst: relationships namespace が prefix `rel` に bind
+            // されている (通常の `r` ではない)。rId1 (→ slide3.xml) が
+            // rId2 (→ slide1.xml) より先。
+            zip.start_file("ppt/presentation.xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:rel="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" rel:id="rId1"/><p:sldId id="257" rel:id="rId2"/></p:sldIdLst></p:presentation>"#).unwrap();
+
+            zip.start_file("ppt/_rels/presentation.xml.rels", opt)
+                .unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide3.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let doc = PptxParser
+            .parse_bytes(&buf, "reordered-rel.pptx", &[])
+            .unwrap();
+        assert_eq!(doc.chunks.len(), 2);
+        assert_eq!(
+            doc.chunks[0].heading.as_deref(),
+            Some("Slide 1: 末尾ファイル"),
+            "rel:id prefix must still resolve visible order, got: {:?}",
+            doc.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            doc.chunks[1].heading.as_deref(),
+            Some("Slide 2: 先頭ファイル"),
+            "rel:id prefix must still resolve visible order, got: {:?}",
             doc.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
         );
     }
