@@ -209,7 +209,7 @@ fn test_parent_expanded_from_set_when_enabled() {
         content.contains("alpha") || content.contains("gamma"),
         "expanded content should contain at least one neighbor (alpha or gamma); \
          got content snippet: {}",
-        &content.chars().take(400).collect::<String>()
+        content.chars().take(400).collect::<String>()
     );
 }
 
