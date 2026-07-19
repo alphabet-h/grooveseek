@@ -1,5 +1,8 @@
 //! pptx (`.pptx`) parser. zip + quick-xml でスライド単位に `ppt/slides/slideN.xml`
-//! を読む。
+//! を読む。スライド順は `ppt/presentation.xml` の `<p:sldIdLst>` (可視順) を
+//! `ppt/_rels/presentation.xml.rels` で解決したものを優先し、読めない場合のみ
+//! ファイル番号ソートにフォールバックする。
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use anyhow::{Result, anyhow};
@@ -41,30 +44,44 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("{path_hint}: cannot open pptx zip (corrupt or encrypted): {e}"))?;
 
-    // slide エントリを番号順に集める (zip 内順序非依存)。
+    // slide エントリをファイル番号順に集める (zip 内順序非依存。
+    // presentation.xml が読めない場合のフォールバック用)。
     let mut slide_nums: Vec<usize> = zip
         .file_names()
         .filter_map(|n| slide_number(n, "ppt/slides/slide", ".xml"))
         .collect();
     slide_nums.sort_unstable();
 
+    // codex P2 (PR #70 round 1): ファイル番号ソートは、並べ替え/削除された
+    // deck では presentation.xml の可視順 (sldIdLst) とズレる。可視順が
+    // 解決できればそちらを優先し、`Slide {n}` ラベルは可視順の 1-origin
+    // 連番 (= 実際のファイル番号ではない) とする。読めない/非標準な zip
+    // では file 番号ソートにフォールバックする (index 全体を諦めさせない)。
+    let ordered_file_nums = resolve_visible_slide_order(&mut zip).unwrap_or(slide_nums);
+
     let mut chunks = Vec::new();
-    for n in slide_nums {
-        let slide_xml =
-            match super::ooxml::read_zip_entry(&mut zip, &format!("ppt/slides/slide{n}.xml")) {
-                Some(b) => b,
-                None => continue,
-            };
+    for (display_idx, file_n) in ordered_file_nums.into_iter().enumerate() {
+        let display_n = display_idx + 1;
+        let slide_xml = match super::ooxml::read_zip_entry(
+            &mut zip,
+            &format!("ppt/slides/slide{file_n}.xml"),
+        ) {
+            Some(b) => b,
+            None => continue,
+        };
         let (title, body) = parse_slide_xml(&slide_xml);
         let mut content = body;
-        // notes: `ppt/slides/_rels/slide{n}.xml.rels` の notesSlide
+        // notes: `ppt/slides/_rels/slide{file_n}.xml.rels` の notesSlide
         // relationship を解決する (dry-run (Task 3.7) で同番号 heuristic の
         // 誤帰属が実証されたため廃止。rels が無い / notesSlide relationship
         // が無い slide は notes なしとし、フォールバック heuristic はしない
-        // — 誤帰属ゼロを優先する)。
-        let notes_path =
-            super::ooxml::read_zip_entry(&mut zip, &format!("ppt/slides/_rels/slide{n}.xml.rels"))
-                .and_then(|rels_xml| resolve_notes_path(&rels_xml));
+        // — 誤帰属ゼロを優先する)。notes の対応はスライドの実ファイル番号
+        // (`file_n`) で引く (表示順の連番 `display_n` ではない)。
+        let notes_path = super::ooxml::read_zip_entry(
+            &mut zip,
+            &format!("ppt/slides/_rels/slide{file_n}.xml.rels"),
+        )
+        .and_then(|rels_xml| resolve_notes_path(&rels_xml));
         if let Some(path) = notes_path
             && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path)
         {
@@ -78,8 +95,8 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             continue;
         }
         let heading = match &title {
-            Some(t) if !t.trim().is_empty() => format!("Slide {n}: {}", t.trim()),
-            _ => format!("Slide {n}"),
+            Some(t) if !t.trim().is_empty() => format!("Slide {display_n}: {}", t.trim()),
+            _ => format!("Slide {display_n}"),
         };
         chunks.push(Chunk {
             index: chunks.len(),
@@ -108,25 +125,28 @@ fn slide_number(name: &str, prefix: &str, suffix: &str) -> Option<usize> {
     mid.parse::<usize>().ok()
 }
 
-/// `ppt/slides/_rels/slideN.xml.rels` から notesSlide relationship
-/// (`Type` が `.../relationships/notesSlide` で終わる `<Relationship>`) の
-/// `Target` を解決し、zip 内の絶対パス (例: `ppt/notesSlides/notesSlide1.xml`)
-/// を返す。該当する relationship が無ければ None (= 呼び出し側は notes なし
-/// として扱う。同番号 heuristic へのフォールバックはしない)。
-fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
+/// `*.rels` の `<Relationship Id="..." Type="..." Target="...">` を全て
+/// `(Id, Type, Target)` として出現順に列挙する。`ppt/slides/_rels/slideN.xml.rels`
+/// (notes 解決) と `ppt/_rels/presentation.xml.rels` (可視順解決) の両方が
+/// 同じ rels XML 構造を読むため、この parser を共通化する (重複実装を避ける)。
+/// いずれかの属性が欠けている `<Relationship>` はスキップする。
+fn parse_relationships(rels_xml: &[u8]) -> Vec<(String, String, String)> {
     let mut reader = Reader::from_reader(rels_xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
+    let mut out = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 if super::ooxml_local(e.name().as_ref()) != b"Relationship" {
                     continue;
                 }
+                let mut id: Option<String> = None;
                 let mut rel_type: Option<String> = None;
                 let mut target: Option<String> = None;
                 for attr in e.attributes().flatten() {
                     match super::ooxml_local(attr.key.as_ref()) {
+                        b"Id" => id = Some(String::from_utf8_lossy(&attr.value).into_owned()),
                         b"Type" => {
                             rel_type = Some(String::from_utf8_lossy(&attr.value).into_owned());
                         }
@@ -136,10 +156,8 @@ fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
                         _ => {}
                     }
                 }
-                if let (Some(rel_type), Some(target)) = (rel_type, target)
-                    && rel_type.ends_with("/notesSlide")
-                {
-                    return Some(resolve_relative_target("ppt/slides", &target));
+                if let (Some(id), Some(rel_type), Some(target)) = (id, rel_type, target) {
+                    out.push((id, rel_type, target));
                 }
             }
             Ok(Event::Eof) => break,
@@ -148,7 +166,106 @@ fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
         }
         buf.clear();
     }
-    None
+    out
+}
+
+/// `ppt/slides/_rels/slideN.xml.rels` から notesSlide relationship
+/// (`Type` が `.../relationships/notesSlide` で終わる `<Relationship>`) の
+/// `Target` を解決し、zip 内の絶対パス (例: `ppt/notesSlides/notesSlide1.xml`)
+/// を返す。該当する relationship が無ければ None (= 呼び出し側は notes なし
+/// として扱う。同番号 heuristic へのフォールバックはしない)。
+fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
+    parse_relationships(rels_xml)
+        .into_iter()
+        .find(|(_, rel_type, _)| rel_type.ends_with("/notesSlide"))
+        .map(|(_, _, target)| resolve_relative_target("ppt/slides", &target))
+}
+
+/// `ppt/presentation.xml` の `<p:sldIdLst>` (可視順) + `ppt/_rels/presentation.xml.rels`
+/// (`r:id` → `ppt/slides/slideN.xml` 解決) から、可視順に並んだ slide のファイル
+/// 番号列を返す。
+///
+/// codex P2 (PR #70 round 1): 旧実装は `ppt/slides/slideN.xml` のファイル番号
+/// ソートで処理していたため、並べ替え/削除された deck では presentation.xml
+/// の可視順とズレて `Slide {n}` ラベルが実際の表示順と食い違っていた。
+///
+/// presentation.xml / rels が読めない、`sldIdLst` が空、あるいは 1 件も
+/// slide 番号へ解決できない場合は None を返す (呼び出し側は file 番号ソート
+/// にフォールバックする — 壊れた/非標準な zip で index 全体を諦めさせない)。
+fn resolve_visible_slide_order(zip: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Option<Vec<usize>> {
+    let presentation_xml = super::ooxml::read_zip_entry(zip, "ppt/presentation.xml")?;
+    let rids = parse_sld_id_list(&presentation_xml);
+    if rids.is_empty() {
+        return None;
+    }
+
+    let rels_xml = super::ooxml::read_zip_entry(zip, "ppt/_rels/presentation.xml.rels")?;
+    let rid_to_path: HashMap<String, String> = parse_relationships(&rels_xml)
+        .into_iter()
+        .map(|(id, _, target)| (id, resolve_relative_target("ppt", &target)))
+        .collect();
+
+    let order: Vec<usize> = rids
+        .iter()
+        .filter_map(|rid| rid_to_path.get(rid))
+        .filter_map(|path| slide_number(path, "ppt/slides/slide", ".xml"))
+        .collect();
+    if order.is_empty() { None } else { Some(order) }
+}
+
+/// `ppt/presentation.xml` の `<p:sldIdLst>` 内 `<p:sldId r:id="rIdX" .../>` から
+/// `r:id` の値を出現順 (= 可視順) に集める。
+fn parse_sld_id_list(xml: &[u8]) -> Vec<String> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_list = false;
+    let mut ids = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match super::ooxml_local(e.name().as_ref()) {
+                b"sldIdLst" => in_list = true,
+                b"sldId" if in_list => {
+                    if let Some(id) = r_id_attr(&e) {
+                        ids.push(id);
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => {
+                if in_list
+                    && super::ooxml_local(e.name().as_ref()) == b"sldId"
+                    && let Some(id) = r_id_attr(&e)
+                {
+                    ids.push(id);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if super::ooxml_local(e.name().as_ref()) == b"sldIdLst" {
+                    in_list = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    ids
+}
+
+/// `<p:sldId id="256" r:id="rId1"/>` の `r:id` 属性値を取る。`id` (plain,
+/// relationship と無関係な slide の永続 ID) と衝突しないよう、namespace
+/// prefix を無視する `ooxml_local` ではなく生の QName `r:id` に厳密一致させる
+/// (OOXML では relationships namespace は事実上必ず prefix `r` で宣言される)。
+fn r_id_attr(e: &quick_xml::events::BytesStart) -> Option<String> {
+    e.attributes().flatten().find_map(|attr| {
+        if attr.key.as_ref() == b"r:id" {
+            Some(String::from_utf8_lossy(&attr.value).into_owned())
+        } else {
+            None
+        }
+    })
 }
 
 /// `base_dir` (例: `"ppt/slides"`、末尾スラッシュ無し) を基準に OOXML の
@@ -585,6 +702,72 @@ mod tests {
             "slide4 (rels references notesSlide1.xml) must get the notes, got: {:?}",
             doc.chunks[3].content
         );
+    }
+
+    #[test]
+    fn test_pptx_slides_ordered_by_presentation_visible_order_not_file_number() {
+        // codex P2 (PR #70 round 1): 旧実装は ppt/slides/slideN.xml のファイル
+        // 番号ソートで処理していたため、並べ替え/削除された deck では
+        // presentation.xml の可視順 (sldIdLst) とズレて `Slide {n}` ラベルが
+        // 実際の表示順と食い違っていた。sldIdLst が slide3.xml → slide1.xml
+        // の順を指す fixture (slide2.xml は存在しない = 番号に gap があっても
+        // 解決できることも同時に確認する) で、可視順の連番 "Slide 1" が
+        // slide3.xml の内容になることを検証する。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>"#).unwrap();
+
+            for (file_n, title) in [(1usize, "先頭ファイル"), (3usize, "末尾ファイル")] {
+                let slide_xml = format!(
+                    r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{title}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+                );
+                zip.start_file(format!("ppt/slides/slide{file_n}.xml"), opt)
+                    .unwrap();
+                zip.write_all(slide_xml.as_bytes()).unwrap();
+            }
+
+            // sldIdLst: rId1 (→ slide3.xml) が rId2 (→ slide1.xml) より先。
+            zip.start_file("ppt/presentation.xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/><p:sldId id="257" r:id="rId2"/></p:sldIdLst></p:presentation>"#).unwrap();
+
+            zip.start_file("ppt/_rels/presentation.xml.rels", opt)
+                .unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide3.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#).unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let doc = PptxParser.parse_bytes(&buf, "reordered.pptx", &[]).unwrap();
+        assert_eq!(doc.chunks.len(), 2);
+        assert_eq!(
+            doc.chunks[0].heading.as_deref(),
+            Some("Slide 1: 末尾ファイル"),
+            "visible order (sldIdLst) must win over file-number order, got: {:?}",
+            doc.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            doc.chunks[1].heading.as_deref(),
+            Some("Slide 2: 先頭ファイル"),
+            "visible order (sldIdLst) must win over file-number order, got: {:?}",
+            doc.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_pptx_slides_fall_back_to_file_number_order_without_presentation_xml() {
+        // presentation.xml が無い (壊れた/非標準な zip) 場合は file 番号ソートに
+        // フォールバックする (index 全体を諦めさせないための safety net)。
+        // 既存の make_minimal_pptx fixture には presentation.xml が無いため、
+        // このテストは実質 test_pptx_slides_sorted_numerically_not_zip_order の
+        // fallback 経路が生きていることの明示的な回帰 guard。
+        let bytes = make_minimal_pptx(&[(None, "本文A", None), (None, "本文B", None)]);
+        let doc = PptxParser.parse_bytes(&bytes, "no-presentation.pptx", &[]).unwrap();
+        assert_eq!(doc.chunks.len(), 2);
+        assert!(doc.chunks[0].content.contains("本文A"));
+        assert!(doc.chunks[1].content.contains("本文B"));
     }
 
     #[test]
