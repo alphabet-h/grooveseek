@@ -28,7 +28,7 @@ impl Parser for XlsxParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        parse_workbook_bytes(bytes, path_hint)
+        parse_workbook_bytes(bytes, path_hint, WorkbookFormat::Xlsx)
     }
 }
 
@@ -51,8 +51,26 @@ impl Parser for XlsParser {
         path_hint: &str,
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
-        parse_workbook_bytes(bytes, path_hint)
+        parse_workbook_bytes(bytes, path_hint, WorkbookFormat::Xls)
     }
+}
+
+/// `parse_workbook_bytes[_capped]` が開く対象の書式。
+///
+/// codex P2 (PR #70 round 3): `calamine::open_workbook_auto_from_rs` は
+/// bytes から XLS → XLSX → XLSB → ODS の順に reader を確率的に probe する。
+/// これだと `.xlsx` として登録されたファイルの実体が XLSB/ODS (payload が
+/// `.bin`/`content.xml` にあり、xlsx-layout 前提の pre-flight
+/// (`xl/worksheets/*.xml` 等の申告 size 合計) を素通りする) でも probe が
+/// 成功してしまい、xlsx 専用 pre-flight を完全にバイパスして calamine が
+/// 展開してしまう。登録拡張子に一致する reader だけを明示的に使うことで
+/// この抜け道を塞ぐ (拡張子と実形式が不一致なら reader open が Err になり
+/// 既存の per-file skip 経路に落ちる — 「登録した形式だけを parse する」
+/// opt-in 原則とも整合する)。
+#[derive(Clone, Copy)]
+enum WorkbookFormat {
+    Xlsx,
+    Xls,
 }
 
 /// シートあたりの抽出テキスト上限 (byte)。数百万行 xlsx で chunk が数百 MB に
@@ -64,26 +82,48 @@ impl Parser for XlsParser {
 const SHEET_MAX_BYTES: usize = 1024 * 1024;
 
 /// xlsx / xls 共有の抽出本体。`SHEET_MAX_BYTES` を渡す薄い wrapper。
-fn parse_workbook_bytes(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
-    parse_workbook_bytes_capped(bytes, path_hint, SHEET_MAX_BYTES)
+fn parse_workbook_bytes(
+    bytes: &[u8],
+    path_hint: &str,
+    format: WorkbookFormat,
+) -> Result<ParsedDocument> {
+    parse_workbook_bytes_capped(bytes, path_hint, format, SHEET_MAX_BYTES)
 }
 
 /// cap を注入できる本体 (unit test が小さい cap で truncate 分岐を突くため分離)。
-/// calamine は auto-detect で BIFF(xls)/OOXML(xlsx) 両対応。
 fn parse_workbook_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
+    format: WorkbookFormat,
     sheet_max_bytes: usize,
 ) -> Result<ParsedDocument> {
-    // codex P2 (PR #70 round 2, zip-bomb hardening): calamine は zip 展開を
-    // 内部で行うため `ooxml::read_zip_entry` の累積 budget 機構が効かない。
-    // calamine を呼ぶ前に、実際に読まれる XML part (worksheets/
-    // sharedStrings/styles) の申告 uncompressed size 合計を検査する。
-    preflight_xlsx_decompression_budget(bytes, path_hint)?;
+    // codex P2 (PR #70 round 2, zip-bomb hardening): xlsx (zip container) の
+    // みが対象。calamine は zip 展開を内部で行うため `ooxml::read_zip_entry`
+    // の累積 budget 機構が効かない。calamine を呼ぶ前に、実際に読まれる
+    // XML part (worksheets/sharedStrings/styles) の申告 uncompressed size
+    // 合計を検査する。xls (BIFF、非 zip container) はこの経路の対象外。
+    if matches!(format, WorkbookFormat::Xlsx) {
+        preflight_xlsx_decompression_budget(bytes, path_hint)?;
+    }
 
     let cursor = Cursor::new(bytes);
-    let mut workbook = calamine::open_workbook_auto_from_rs(cursor)
-        .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
+    // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` (auto-probe)
+    // ではなく、登録拡張子に一致する reader を明示的に使う (WorkbookFormat
+    // の doc comment 参照)。`calamine::Sheets` に手動で包むことで、以降の
+    // コード (sheet_names / worksheet_range 呼び出し) は auto-probe 版と
+    // 同じ trait インタフェースのまま変更不要にする。
+    let mut workbook: calamine::Sheets<_> = match format {
+        WorkbookFormat::Xlsx => calamine::Xlsx::new(cursor)
+            .map(calamine::Sheets::Xlsx)
+            .map_err(|e| {
+                anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}")
+            })?,
+        WorkbookFormat::Xls => calamine::Xls::new(cursor)
+            .map(calamine::Sheets::Xls)
+            .map_err(|e| {
+                anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}")
+            })?,
+    };
 
     let mut chunks = Vec::new();
     // codex P2 (PR #70 round 2): `workbook.worksheets()` は全シートを一括で
@@ -357,6 +397,54 @@ mod tests {
         assert!(err.to_string().contains("cannot open workbook"));
     }
 
+    /// ODS (OpenDocument Spreadsheet) として calamine の `Ods::new` が読める
+    /// 最小 zip を組む: `mimetype` (46 byte、非圧縮慣習だが zip crate は展開を
+    /// 透過的に扱うので圧縮でも可) + `META-INF/manifest.xml` (暗号化チェックが
+    /// 参照するため必須、無いと `FileNotFound` になる) + `content.xml`
+    /// (calamine の content.xml parser は generic な event loop で未知要素を
+    /// 無視するため、有効な XML であれば `office:document-content` 等の
+    /// ラッパーすら不要)。
+    fn make_fake_ods_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("mimetype", opt).unwrap();
+            zip.write_all(b"application/vnd.oasis.opendocument.spreadsheet")
+                .unwrap();
+            zip.start_file("META-INF/manifest.xml", opt).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2"><manifest:file-entry manifest:full-path="/" manifest:version="1.2" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/></manifest:manifest>"#,
+            )
+            .unwrap();
+            zip.start_file("content.xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><a/>"#).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_xlsx_parser_rejects_ods_payload_disguised_as_xlsx() {
+        // codex P2 (PR #70 round 3): `open_workbook_auto_from_rs` は bytes
+        // から XLS/XLSX/XLSB/ODS を確率的に probe するため、`.xlsx` 名の
+        // 実体が ODS (payload が content.xml にあり、xlsx-layout 前提の
+        // pre-flight = xl/worksheets 等の合計 が総和 0 で素通りする) でも
+        // auto-probe が ODS reader として成功してしまい、xlsx 専用
+        // pre-flight を完全にバイパスして calamine が展開してしまって
+        // いた。XlsxParser は拡張子に一致する Xlsx reader のみを明示使用
+        // するため、ODS payload では reader open 自体が Err になり
+        // per-file skip 経路に落ちることを検証する。
+        let bytes = make_fake_ods_bytes();
+        let err = XlsxParser.parse_bytes(&bytes, "fake.xlsx", &[]).expect_err(
+            "ODS payload disguised as .xlsx must be rejected (no cross-format probing)",
+        );
+        assert!(
+            err.to_string().contains("cannot open workbook"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn test_xlsx_parse_fallback_wraps_raw_text() {
         let doc = XlsxParser.parse("hello world content here", "x.xlsx", &[]);
@@ -403,7 +491,7 @@ mod tests {
         // 行3 は未処理で落ちる = test の意図 (a3 を含まない) と一致する。
         // (cap=15 だと行3 push 後 len=18 で初めて break し、a3 が保持されてしまうため不可)。
         let bytes = make_minimal_xlsx(&[("S", &[&["a1", "b1"], &["a2", "b2"], &["a3", "b3"]])]);
-        let doc = parse_workbook_bytes_capped(&bytes, "x.xlsx", 10).unwrap();
+        let doc = parse_workbook_bytes_capped(&bytes, "x.xlsx", WorkbookFormat::Xlsx, 10).unwrap();
         assert_eq!(doc.chunks.len(), 1);
         let content = &doc.chunks[0].content;
         assert!(
@@ -424,7 +512,7 @@ mod tests {
         // 後続行は落とす (= 行途中での切断はしない、という明示された挙動)。
         let big = "x".repeat(200);
         let bytes = make_minimal_xlsx(&[("S", &[&[big.as_str()], &["next"]])]);
-        let doc = parse_workbook_bytes_capped(&bytes, "x.xlsx", 50).unwrap();
+        let doc = parse_workbook_bytes_capped(&bytes, "x.xlsx", WorkbookFormat::Xlsx, 50).unwrap();
         let content = &doc.chunks[0].content;
         assert!(
             content.contains(&big),
