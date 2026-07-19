@@ -69,12 +69,40 @@ struct DiskScan {
     skipped: Vec<String>,
 }
 
+/// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
+/// `fs::metadata` だけで判定する共有ヘルパー。フル re-index の
+/// `scan_disk_entries` と watcher 増分 index の `reindex_single_file` の
+/// 両方が、実際に `fs::read` する前の size-cap ガードとして呼ぶ (codex P2
+/// round 2: watcher 経路が `scan_disk_entries` の size-cap 保護をバイパス
+/// して 50 MiB 超ファイルを全量 read/hash してしまう問題の修正)。
+///
+/// - `is_binary_ext` が `false` (テキスト形式) なら常に `Ok(None)` (size cap 対象外)
+/// - 超過していれば `Ok(Some(actual_len))`、cap 内なら `Ok(None)`
+/// - `fs::metadata` 自体の失敗は `Err` としてそのまま伝播する。size cap の
+///   判定とは別関心事なので、呼び出し側が既存の stat/read エラー処理に委ねる
+fn binary_size_exceeded(
+    path: &Path,
+    is_binary_ext: bool,
+    max: u64,
+) -> std::io::Result<Option<u64>> {
+    if !is_binary_ext {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(path)?;
+    Ok(if meta.len() > max {
+        Some(meta.len())
+    } else {
+        None
+    })
+}
+
 /// disk 側の全 source file を走査し、raw バイト読み + バイト hash を計算する。
 ///
 /// - **エラー隔離**: `read` 失敗や size 超過は per-file skip し、rel path を `skipped`
 ///   に積んで走査を続行する (旧 `.collect::<Result<Vec>>()?` の全体 abort を修正)。
 /// - **size skip**: `is_binary()` な拡張子は `max_binary_bytes` 超で read 前に skip
-///   (`fs::metadata` の len 判定でメモリ読込自体を回避)。テキスト形式は上限なし。
+///   ([`binary_size_exceeded`] の `fs::metadata` 判定でメモリ読込自体を回避)。
+///   テキスト形式は上限なし。
 fn scan_disk_entries(
     source_files: &[std::path::PathBuf],
     kb_path: &Path,
@@ -94,23 +122,19 @@ fn scan_disk_entries(
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
 
-        if is_binary {
-            match std::fs::metadata(p) {
-                Ok(meta) if meta.len() > max_binary_bytes => {
-                    eprintln!(
-                        "Skipping {rel}: binary file too large ({} bytes > {} limit)",
-                        meta.len(),
-                        max_binary_bytes
-                    );
-                    skipped.push(rel);
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Skipping {rel}: failed to stat: {e}");
-                    skipped.push(rel);
-                    continue;
-                }
+        match binary_size_exceeded(p, is_binary, max_binary_bytes) {
+            Ok(Some(len)) => {
+                eprintln!(
+                    "Skipping {rel}: binary file too large ({len} bytes > {max_binary_bytes} limit)"
+                );
+                skipped.push(rel);
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Skipping {rel}: failed to stat: {e}");
+                skipped.push(rel);
+                continue;
             }
         }
 
@@ -541,6 +565,9 @@ fn index_single_disk_entry(
 /// - `rel` は forward-slash、`kb_path` からの相対パス (e.g. `"notes/a.md"`)
 /// - 拡張子が `registry` に登録されていなければ `Skipped` を返す
 /// - hash が DB と一致なら `Unchanged`、違えば upsert + embedding 再計算
+/// - **size cap**: `is_binary()` な拡張子が `MAX_RAW_BINARY_BYTES` を超えていれば
+///   `fs::read` する前に skip する ([`binary_size_exceeded`]、codex P2 round 2:
+///   watcher の create/modify 経路は元々これをバイパスして全量 read/hash していた)
 ///
 /// watcher から Create/Modify イベントを受けた時に呼ぶ。
 pub fn reindex_single_file(
@@ -557,6 +584,27 @@ pub fn reindex_single_file(
             reason: "file no longer exists",
         });
     }
+
+    // scan_disk_entries (フル rebuild) と同じ size-cap ガードを read 前に適用する。
+    // metadata 自体の失敗はここでは無視し、直後の fs::read の既存エラー処理
+    // (`?` 伝播) にフォールスルーさせる (size cap とは別関心事)。
+    let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_binary_ext = registry
+        .binary_extensions()
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(ext));
+    if let Ok(Some(len)) =
+        binary_size_exceeded(&full, is_binary_ext, crate::parser::MAX_RAW_BINARY_BYTES)
+    {
+        eprintln!(
+            "Skipping {rel}: binary file too large ({len} bytes > {} limit)",
+            crate::parser::MAX_RAW_BINARY_BYTES
+        );
+        return Ok(SingleResult::Skipped {
+            reason: "binary file too large",
+        });
+    }
+
     let bytes =
         std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
     let hash = sha256_hex_bytes(&bytes);
@@ -1189,6 +1237,43 @@ mod tests {
             "text files ignore the binary size cap"
         );
         assert!(scan.skipped.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // binary_size_exceeded
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_binary_size_exceeded_none_for_text_ext() {
+        // is_binary_ext=false ならファイル実サイズに関わらず常に None
+        // (テキスト形式は size cap 対象外)。
+        let tmp = mk_tmp("sizecap-text");
+        write_file(&tmp.0, "big.md", "0123456789");
+        let result = binary_size_exceeded(&tmp.0.join("big.md"), false, 1).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_binary_size_exceeded_none_when_within_cap() {
+        let tmp = mk_tmp("sizecap-ok");
+        write_file(&tmp.0, "small.pdf", "tiny");
+        let result = binary_size_exceeded(&tmp.0.join("small.pdf"), true, 1024).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_binary_size_exceeded_some_when_over_cap() {
+        let tmp = mk_tmp("sizecap-over");
+        write_file(&tmp.0, "big.pdf", "0123456789"); // 10 bytes
+        let result = binary_size_exceeded(&tmp.0.join("big.pdf"), true, 5).unwrap();
+        assert_eq!(result, Some(10));
+    }
+
+    #[test]
+    fn test_binary_size_exceeded_err_when_metadata_fails() {
+        let tmp = mk_tmp("sizecap-missing");
+        let missing = tmp.0.join("gone.pdf");
+        assert!(binary_size_exceeded(&missing, true, 1024).is_err());
     }
 
     // -----------------------------------------------------------------------
