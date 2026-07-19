@@ -4,6 +4,53 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-20
+
+### Added
+
+- **Office document indexing (opt-in `[parsers].enabled = [..., "docx",
+  "xlsx", "xls", "pptx"]`)**: four new binary-format parsers, all
+  implemented in-tree (no LibreOffice / MS Office dependency):
+  - **`.docx`**: [zip](https://crates.io/crates/zip) +
+    [quick-xml](https://crates.io/crates/quick-xml) read `word/document.xml`
+    and chunk it by heading hierarchy — a `<w:pStyle w:val="HeadingN">`
+    paragraph style acts as a section boundary, the same rule Markdown
+    headings use, including `exclude_headings` support. Table cell text
+    flows through the same paragraph handling with no special-casing
+    needed (OOXML nests `w:tbl > w:tr > w:tc > w:p > w:r > w:t`).
+  - **`.xlsx` / `.xls`** (legacy BIFF): [calamine](https://crates.io/crates/calamine)
+    (pure Rust, auto-detects OOXML vs. BIFF) produces one chunk per
+    non-empty sheet (heading `Sheet: <name>`, tab-joined cell text per
+    row), truncated at 1 MiB per sheet with row-aligned truncation — the
+    row that pushes the running total past the cap is kept whole, then
+    extraction for that sheet stops (never cuts mid-row).
+  - **`.pptx`**: zip + quick-xml collect `ppt/slides/slideN.xml` parts in
+    numeric slide order (not zip iteration order), one chunk per slide
+    (heading `Slide N: <title>` picked up from a `ctrTitle`/`title`
+    placeholder shape, including in-slide table text in the body). Speaker
+    notes are appended as a trailing `[notes]` section, resolved through
+    the slide's `.rels` `notesSlide` relationship instead of a
+    same-numbered-file guess — a dry-run found the same-number heuristic
+    misattributes notes to the wrong slide once slide/notes numbering
+    diverges after edits.
+  - **Frontmatter**: `.docx` / `.xlsx` / `.pptx` all map `docProps/core.xml`
+    (Dublin Core `title` / `created`-or-`modified` date / `keywords` →
+    tags) to frontmatter, falling back to a filename-derived title when
+    the part is missing or `title` is empty. `.xls` predates
+    `docProps/core.xml` and always uses the filename-derived title.
+  - Password-protected or corrupt Office files fail to open as a zip (or
+    BIFF container) and are skipped with a warning instead of failing the
+    whole `index` run, matching the PDF behavior. All four formats share
+    the 50 MiB raw-byte size cap (`MAX_RAW_BINARY_BYTES`) with the
+    indexer's size-skip guard and `get_document`. Office lock files
+    (`~$*.docx`-style and `.~lock.*#`) are excluded from the directory
+    walk (landed in this cycle's PR-1, alongside the byte-based read
+    layer).
+  - Known limitations: no legacy `.doc`/`.ppt` (pre-2007 binary Office
+    formats), no OpenDocument (`.odt`/`.ods`/`.odp`), and table structure
+    is flattened to plain text — no row/column grid is preserved in the
+    chunk. See the README "Office document indexing" note for details.
+
 ## [0.10.0] - 2026-07-19
 
 ### Added
