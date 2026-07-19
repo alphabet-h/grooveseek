@@ -208,7 +208,9 @@ mod tests {
                 Some(s) => format!(r#"<w:pPr><w:pStyle w:val="{s}"/></w:pPr>"#),
                 None => String::new(),
             };
-            body.push_str(&format!(r#"<w:p>{pstyle}<w:r><w:t>{text}</w:t></w:r></w:p>"#));
+            body.push_str(&format!(
+                r#"<w:p>{pstyle}<w:r><w:t>{text}</w:t></w:r></w:p>"#
+            ));
         }
         wrap_document_xml(&body)
     }
@@ -276,9 +278,15 @@ mod tests {
     #[test]
     fn test_docx_leading_body_before_heading_is_none() {
         let bytes = make_minimal_docx(&[
-            (None, "前書き これは十分な長さの前書きですよ十分な長さの前書き"),
+            (
+                None,
+                "前書き これは十分な長さの前書きですよ十分な長さの前書き",
+            ),
             (Some("Heading1"), "章1"),
-            (None, "本文 これは十分な長さの本文ですよ十分な長さの本文ですよ"),
+            (
+                None,
+                "本文 これは十分な長さの本文ですよ十分な長さの本文ですよ",
+            ),
         ]);
         let doc = DocxParser.parse_bytes(&bytes, "a.docx", &[]).unwrap();
         assert_eq!(doc.chunks[0].heading, None);

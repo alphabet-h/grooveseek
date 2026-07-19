@@ -62,11 +62,9 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         // 誤帰属が実証されたため廃止。rels が無い / notesSlide relationship
         // が無い slide は notes なしとし、フォールバック heuristic はしない
         // — 誤帰属ゼロを優先する)。
-        let notes_path = super::ooxml::read_zip_entry(
-            &mut zip,
-            &format!("ppt/slides/_rels/slide{n}.xml.rels"),
-        )
-        .and_then(|rels_xml| resolve_notes_path(&rels_xml));
+        let notes_path =
+            super::ooxml::read_zip_entry(&mut zip, &format!("ppt/slides/_rels/slide{n}.xml.rels"))
+                .and_then(|rels_xml| resolve_notes_path(&rels_xml));
         if let Some(path) = notes_path
             && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path)
         {
@@ -230,8 +228,7 @@ fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
                 _ => {}
             },
             Ok(Event::Empty(e)) => {
-                if super::ooxml_local(e.name().as_ref()) == b"ph" && in_sp && ph_type_is_title(&e)
-                {
+                if super::ooxml_local(e.name().as_ref()) == b"ph" && in_sp && ph_type_is_title(&e) {
                     sp_is_title = true;
                 }
             }
@@ -355,7 +352,9 @@ mod tests {
             for (i, (title, body, notes)) in slides.iter().enumerate() {
                 let n = i + 1;
                 let title_shape = match title {
-                    Some(t) => format!(r#"<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:txBody></p:sp>"#),
+                    Some(t) => format!(
+                        r#"<p:sp><p:nvSpPr><p:nvPr><p:ph type="title"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>{t}</a:t></a:r></a:p></p:txBody></p:sp>"#
+                    ),
                     None => String::new(),
                 };
                 let slide_xml = format!(
@@ -415,7 +414,9 @@ mod tests {
             (Some("概要"), "本文スライド1", Some("発表ノート1")),
             (None, "本文スライド2", None),
         ]);
-        let doc = PptxParser.parse_bytes(&bytes, "docs/deck.pptx", &[]).unwrap();
+        let doc = PptxParser
+            .parse_bytes(&bytes, "docs/deck.pptx", &[])
+            .unwrap();
         assert_eq!(doc.chunks.len(), 2);
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("Slide 1: 概要"));
         assert_eq!(doc.chunks[0].level, Some(2));
@@ -465,7 +466,10 @@ mod tests {
         let bytes = make_pptx_single_slide(slide_xml);
         let doc = PptxParser.parse_bytes(&bytes, "cover.pptx", &[]).unwrap();
         assert_eq!(doc.chunks.len(), 1);
-        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Slide 1: 表紙タイトル"));
+        assert_eq!(
+            doc.chunks[0].heading.as_deref(),
+            Some("Slide 1: 表紙タイトル")
+        );
         // title 段落のテキストは body (= embed 対象の content) にも残す。
         // indexer は chunk.content のみを embed し heading は embed 対象外
         // (indexer.rs::embed_texts が `c.content` だけ収集する) なので、
