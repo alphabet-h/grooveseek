@@ -55,7 +55,7 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                cur = Some(local_name(e.name().as_ref()).to_vec());
+                cur = Some(local_name_pub(e.name().as_ref()).to_vec());
             }
             Ok(Event::Text(t)) => {
                 if let Some(name) = &cur {
@@ -112,7 +112,9 @@ fn iso_date_prefix(s: &str) -> Option<String> {
 }
 
 /// `cp:title` のような prefixed name から local part (`title`) を取る。
-fn local_name(qname: &[u8]) -> &[u8] {
+/// crate 内公開 (`pub(crate)`): docx/pptx parser が要素名判定 (namespace prefix
+/// 無視) に使う (`parser/mod.rs::ooxml_local` 経由、Task 3.4/3.5 で消費)。
+pub(crate) fn local_name_pub(qname: &[u8]) -> &[u8] {
     match qname.iter().position(|&b| b == b':') {
         Some(i) => &qname[i + 1..],
         None => qname,

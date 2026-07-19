@@ -108,6 +108,13 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
     }
 }
 
+/// `ooxml::local_name_pub` の薄い re-export。namespace prefix 付き QName
+/// (`w:p` / `w:pStyle` 等) から local part を取り出す。docx/pptx parser が
+/// XML 要素名判定に使う (Task 3.4/3.5 で消費)。
+pub(crate) fn ooxml_local(qname: &[u8]) -> &[u8] {
+    ooxml::local_name_pub(qname)
+}
+
 // ---------------------------------------------------------------------------
 // Parser trait
 // ---------------------------------------------------------------------------
