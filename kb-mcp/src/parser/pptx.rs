@@ -108,10 +108,15 @@ fn slide_number(name: &str, prefix: &str, suffix: &str) -> Option<usize> {
 ///   `<p:ph type="ctrTitle"/>` — ECMA-376 では表紙スライド (title slide
 ///   layout) の title placeholder は `ctrTitle` になる) を含む `<p:sp>` の
 ///   a:t 連結テキスト。
-/// - body: title placeholder 配下を除く全ての `<a:p>` (段落) の a:t 連結
-///   テキストを、段落単位の改行区切りで連結したもの。`<p:sp>` 内の通常
-///   テキストだけでなく `<p:graphicFrame><a:tbl>` (表) セル内の a:t も同じ
-///   `<a:p>` 構造 (`a:tc > a:txBody > a:p`) を持つため区別なく拾う。
+/// - body: **全ての** `<a:p>` (段落) の a:t 連結テキストを、段落単位の
+///   改行区切りで連結したもの (title placeholder 配下も含む — indexer
+///   (`indexer.rs`) が embed するのは `Chunk::content` のみで `heading` は
+///   embed 対象外なので、title 段落を body から除外すると title-only
+///   スライドが semantic search で拾えなくなる。よって title/body は
+///   排他ではなく、title 段落は heading にも content にも両方現れる)。
+///   `<p:sp>` 内の通常テキストだけでなく `<p:graphicFrame><a:tbl>` (表)
+///   セル内の a:t も同じ `<a:p>` 構造 (`a:tc > a:txBody > a:p`) を持つため
+///   区別なく拾う。
 ///
 ///   (旧実装は `<p:sp>` の Start/End でのみ本文バッファを flush していたため、
 ///   sp の外側にある表のテキストが「次の sp の Start で握り潰される」/
@@ -174,16 +179,16 @@ fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
                 b"p" => {
                     let trimmed = para_text.trim();
                     if !trimmed.is_empty() {
-                        if in_sp && sp_is_title {
-                            if title.is_none() {
-                                title = Some(trimmed.to_string());
-                            }
-                        } else {
-                            if !body.is_empty() {
-                                body.push('\n');
-                            }
-                            body.push_str(trimmed);
+                        // title 判定と body 追加は排他にしない: title 段落の
+                        // テキストも embed 対象の content (body) に残す (上の
+                        // doc comment 参照)。
+                        if in_sp && sp_is_title && title.is_none() {
+                            title = Some(trimmed.to_string());
                         }
+                        if !body.is_empty() {
+                            body.push('\n');
+                        }
+                        body.push_str(trimmed);
                     }
                 }
                 b"sp" => in_sp = false,
@@ -378,6 +383,16 @@ mod tests {
         let doc = PptxParser.parse_bytes(&bytes, "cover.pptx", &[]).unwrap();
         assert_eq!(doc.chunks.len(), 1);
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("Slide 1: 表紙タイトル"));
+        // title 段落のテキストは body (= embed 対象の content) にも残す。
+        // indexer は chunk.content のみを embed し heading は embed 対象外
+        // (indexer.rs::embed_texts が `c.content` だけ収集する) なので、
+        // title を content から排他すると title-only スライドが検索に
+        // 引っかからなくなる (semantic recall 劣化の回帰 guard)。
+        assert!(
+            doc.chunks[0].content.contains("表紙タイトル"),
+            "title text must also survive in content for embedding recall, got: {:?}",
+            doc.chunks[0].content
+        );
     }
 
     #[test]
