@@ -17,12 +17,29 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      # Force a uniform, cacheable model-cache path on all 3 OSes
+      # (resolve_cache_dir honors FASTEMBED_CACHE_DIR first).
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Cache embedding models (fastembed)
+        uses: actions/cache@v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-bge-small-${{ runner.os }}
       - name: cargo check
         run: cargo check --all-targets
+      - name: Pre-warm embedding model cache (serial)
+        # index_progress_cli spawns kb-mcp subprocesses that each need the
+        # BGE-small model. On a cold cache, running them in parallel makes
+        # the subprocesses race on the HuggingFace hub download lock
+        # (observed: "Lock acquisition failed" flake). Run this target
+        # single-threaded first so exactly one process downloads the model;
+        # the full suite below then runs against a warm cache.
+        run: cargo test --test index_progress_cli -- --test-threads=1
       - name: cargo test (non-ignored only; ignored tests download ONNX models)
         run: cargo test
 
