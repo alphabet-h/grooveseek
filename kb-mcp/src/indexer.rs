@@ -141,16 +141,24 @@ fn scan_disk_entries(
 ///
 /// 重複 hash がある場合も結果が deterministic になるよう、双方を path で
 /// ソートしてから first-match マッチングを行う (evaluator 指摘 Med #4)。
+///
+/// `skipped` = 今回の scan で read 失敗 / size 超過により `disk_entries` に
+/// 載らなかった rel path 集合。これらは disk 上にまだ存在する可能性が高く
+/// 「消えた」わけではないため、orphan 候補から除外する。除外しないと、
+/// skip 中ファイルの DB 行が別の新規ファイルと同一 hash になった際に誤って
+/// rename ペアとして扱われ、prune 保護 (§4.2 skip 統一原則) が効く前に
+/// skip 中ファイルの DB 行が新 path へ書き換わってしまう (codex P2)。
 fn detect_renames(
     disk_entries: &[DiskEntry],
     db_path_hashes: &std::collections::HashMap<String, String>,
+    skipped: &HashSet<String>,
 ) -> Vec<(String, String)> {
     let disk_paths: HashSet<&str> = disk_entries.iter().map(|e| e.rel.as_str()).collect();
 
-    // DB ∖ disk, path で sort
+    // DB ∖ disk ∖ skipped, path で sort
     let mut orphan_in_db: Vec<(&String, &String)> = db_path_hashes
         .iter()
-        .filter(|(p, _)| !disk_paths.contains(p.as_str()))
+        .filter(|(p, _)| !disk_paths.contains(p.as_str()) && !skipped.contains(p.as_str()))
         .collect();
     orphan_in_db.sort_by_key(|(p, _)| *p);
 
@@ -308,7 +316,7 @@ pub fn rebuild_index(
         0
     } else {
         let db_path_hashes = db.all_path_hashes()?;
-        let pairs = detect_renames(&disk_entries, &db_path_hashes);
+        let pairs = detect_renames(&disk_entries, &db_path_hashes, &skipped_paths);
         // evaluator 指摘 High #2: rename フェーズ全体を単一 transaction に
         // 包んで部分 rename 残留を防ぐ。pairs が空なら no-op。
         db.rename_documents_atomic(&pairs)?;
@@ -735,7 +743,7 @@ mod tests {
         let mut db = HashMap::new();
         db.insert("old/x.md".to_string(), "h1".to_string());
         db.insert("keep.md".to_string(), "h2".to_string());
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         assert_eq!(
             pairs,
             vec![("old/x.md".to_string(), "new/x.md".to_string())]
@@ -749,7 +757,7 @@ mod tests {
         let mut db = HashMap::new();
         db.insert("a.md".to_string(), "h1".to_string());
         db.insert("b.md".to_string(), "h1".to_string());
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         // disk には a.md が無いので a.md は DB orphan、b.md は既に DB にある
         // → 新規 disk path が無いのでペア無し
         assert!(pairs.is_empty());
@@ -760,7 +768,7 @@ mod tests {
         let disk = vec![mk_entry("a.md", "h1")];
         let mut db = HashMap::new();
         db.insert("a.md".to_string(), "h1".to_string());
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         assert!(pairs.is_empty());
     }
 
@@ -772,9 +780,9 @@ mod tests {
         let mut db = HashMap::new();
         db.insert("A.md".to_string(), "hempty".to_string());
         db.insert("B.md".to_string(), "hempty".to_string());
-        let pairs1 = detect_renames(&disk, &db);
+        let pairs1 = detect_renames(&disk, &db, &HashSet::new());
         // 2 回目も同じ結果になること (HashMap iteration 順に依存しない)
-        let pairs2 = detect_renames(&disk, &db);
+        let pairs2 = detect_renames(&disk, &db, &HashSet::new());
         assert_eq!(pairs1, pairs2);
         // path 順の sort により A→C, B→D になるはず
         assert_eq!(
@@ -791,8 +799,22 @@ mod tests {
         let disk = vec![mk_entry("new.md", "h_new")];
         let mut db = HashMap::new();
         db.insert("old.md".to_string(), "h_old".to_string()); // 別 hash
-        let pairs = detect_renames(&disk, &db);
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
         // hash 不一致なのでペアにしない (old.md は削除対象、new.md は新規追加)
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_detect_renames_excludes_skipped_paths() {
+        // DB に a.md (hash H)。disk 側は a.md が read 失敗 / size 超過で
+        // skip され disk_entries に載らず、別の新規 b.md が同じ hash H を持つ。
+        // a.md は disk から「消えた」のではなく単に今回未計上なだけなので、
+        // rename ペア (a.md → b.md) にすり替わってはならない (codex P2)。
+        let disk = vec![mk_entry("b.md", "H")];
+        let mut db = HashMap::new();
+        db.insert("a.md".to_string(), "H".to_string());
+        let skipped: HashSet<String> = ["a.md".to_string()].into_iter().collect();
+        let pairs = detect_renames(&disk, &db, &skipped);
         assert!(pairs.is_empty());
     }
 
