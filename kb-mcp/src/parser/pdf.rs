@@ -287,13 +287,31 @@ mod tests {
 
     #[test]
     fn test_pdf_encrypted_is_err() {
-        // 実 encrypted fixture (qpdf 等で生成) は環境に qpdf が無いため用意できず、
-        // Task 2.7 に委譲する。ここでは PdfReader::new の open 失敗パスが暗号化 PDF と
-        // 同じ "encrypted or unreadable" 文言を返すこと (dry-run で確認済み) を、壊れた
-        // xref を持つバイト列で代替検証する。
+        // このバイト列は暗号化 PDF ではなく、xref テーブルもオブジェクト構造も
+        // 一切持たない (%PDF- ヘッダの直後に endobj が 2 つ並ぶだけの) 構造欠落
+        // バイト列。PdfReader::new の open 失敗パスが実暗号化 PDF (下の
+        // test_pdf_encrypted_real_fixture_is_err) と同じ "encrypted or unreadable"
+        // 文言を返すことを、この安価な壊れバイト列でも代替検証できる (どちらの
+        // 経路でも文言が共通なため)。
         let err = PdfParser
             .parse_bytes(b"%PDF-1.4\n%garbage\nendobj\nendobj\n%%EOF", "enc.pdf", &[])
             .expect_err("broken PDF open path must be Err");
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("encrypted") || msg.contains("unreadable"));
+    }
+
+    #[test]
+    fn test_pdf_encrypted_real_fixture_is_err() {
+        // pikepdf (AES-256 / R=6) で minimal.pdf を非空ユーザパスワード "userpw" で
+        // 暗号化した実 fixture (生成手順: tests/fixtures/binary/README.md)。
+        // oxidize-pdf は unlock() 未呼び出しの暗号化 PDF を text extraction 段階で
+        // Err にする (dry-run で確認: "PDF is locked: call unlock() with the
+        // correct password before reading objects")。
+        const REAL_ENCRYPTED_PDF: &[u8] =
+            include_bytes!("../../tests/fixtures/binary/encrypted.pdf");
+        let err = PdfParser
+            .parse_bytes(REAL_ENCRYPTED_PDF, "docs/encrypted.pdf", &[])
+            .expect_err("real encrypted PDF without unlock() must be Err");
         let msg = err.to_string().to_lowercase();
         assert!(msg.contains("encrypted") || msg.contains("unreadable"));
     }
