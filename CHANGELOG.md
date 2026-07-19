@@ -14,7 +14,10 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `Title` / `CreationDate` PDF metadata become frontmatter when present,
   falling back to a filename-derived title when the PDF has no `Title`.
   Scanned / image-only PDFs (no text layer, detected via an average
-  chars-per-page heuristic) and encrypted PDFs are skipped with a warning
+  chars-per-page heuristic **over non-empty pages only** — averaging over
+  every page, including blank/separator pages, wrongly rejected real-world
+  PDFs with a dense content page and many blank pages; found by codex
+  review on PR #69) and encrypted PDFs are skipped with a warning
   instead of failing the whole `index` run. Like other binary formats,
   `.pdf` files share the 50 MiB raw-byte size cap (`MAX_RAW_BINARY_BYTES`)
   with the indexer's size-skip guard and `get_document`. The

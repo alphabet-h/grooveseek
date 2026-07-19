@@ -12,6 +12,24 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// スキャン PDF 判定閾値: 平均 chars/page がこれ未満なら text layer 無し扱い。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 
+/// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
+///
+/// 戻り値: `(非空ページ数, 非空ページの平均文字数)`。非空ページが 1 つも
+/// 無ければ `(0, 0)` (0 除算を避けるための早期 return)。
+///
+/// codex P2 (PR #69 round 1): 空白 / セパレータページの多い実務 PDF
+/// (レポート・スライド) では、分母を「全ページ数」にすると本文ページの
+/// 密度が薄まり、本文が十分あるにも関わらず scanned 誤判定されていた。
+/// 分母を「trim 後に非空だったページ」に限定することで、この誤判定を防ぐ。
+fn non_empty_page_stats(pages: &[String]) -> (usize, usize) {
+    let non_empty: Vec<&String> = pages.iter().filter(|p| !p.trim().is_empty()).collect();
+    if non_empty.is_empty() {
+        return (0, 0);
+    }
+    let total_chars: usize = non_empty.iter().map(|p| p.chars().count()).sum();
+    (non_empty.len(), total_chars / non_empty.len())
+}
+
 pub struct PdfParser;
 
 impl Parser for PdfParser {
@@ -37,14 +55,16 @@ impl Parser for PdfParser {
     ) -> Result<ParsedDocument> {
         let (pages, frontmatter) = extract_pdf(bytes, path_hint)?;
 
-        // スキャン PDF 判定: 総抽出文字数 / ページ数 < 50 なら text layer 無しとみなす。
-        let total_chars: usize = pages.iter().map(|p| p.chars().count()).sum();
-        if !pages.is_empty() && total_chars / pages.len() < SCANNED_PDF_MIN_CHARS_PER_PAGE {
+        // スキャン PDF 判定: 非空ページの平均 chars/page < 50 なら text layer
+        // 無しとみなす (codex P2, PR #69 round 1: 空白/セパレータページの
+        // 多い実務 PDF で本文ページの密度が薄まり誤判定される問題の修正 —
+        // 分母を「全ページ数」ではなく「trim 後に非空だったページ数」にする)。
+        let (non_empty_pages, avg_chars) = non_empty_page_stats(&pages);
+        if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
             return Err(anyhow!(
                 "{path_hint}: PDF appears to have no text layer (scanned image PDF); \
-                 average {} chars/page < {} threshold — skipping (OCR not supported)",
-                total_chars / pages.len(),
-                SCANNED_PDF_MIN_CHARS_PER_PAGE
+                 average {avg_chars} chars/page across {non_empty_pages} non-empty page(s) \
+                 < {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping (OCR not supported)"
             ));
         }
 
@@ -314,12 +334,21 @@ mod tests {
     const UNTITLED_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/untitled.pdf");
 
     // Task 2.9 follow-up (2026-07-19): 1 ページ PDF、Info dict の /Title を
-    // UTF-16BE hex string (BOM 込み、"日本語" をエンコード) にした fixture。
-    // 実 PDF writer が非 ASCII タイトルを書く際と同じ表現形式で、dogfood で
-    // 発見した oxidize-pdf 4.1.1 の mis-decode (UTF-16BE BOM 未検出 →
-    // CP1252/WinAnsi 風の 1 byte = 1 codepoint 変換にフォールスルー) を
-    // 再現する。生成手順: tests/fixtures/binary/README.md と同じ手組みレシピ。
+    // UTF-16BE literal PDF string (`(...)`、BOM 込み raw bytes、"日本語" を
+    // エンコード) にした fixture。実 PDF writer が非 ASCII タイトルを書く際と
+    // 同じ表現形式で、dogfood で発見した oxidize-pdf 4.1.1 の mis-decode
+    // (UTF-16BE BOM 未検出 → CP1252/WinAnsi 風の 1 byte = 1 codepoint 変換に
+    // フォールスルー) を再現する。生成手順・hex string では再現しなかった
+    // 罠は tests/fixtures/binary/README.md 参照。
     const UTF16_TITLE_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/utf16_title.pdf");
+
+    // codex P2 follow-up (PR #69 round 1, 2026-07-19): 10 ページ PDF、9 ページ
+    // が空 (/Contents /Length 0、empty_text.pdf と同じ手法)、5 ページ目のみ
+    // 221 文字の実テキストを持つ。旧ロジック (全ページ数で割る) だと
+    // 221/10=22 < 50 で scanned 誤判定になるが、新ロジック (非空ページ数で
+    // 割る) では 221/1=221 >= 50 で正しく scanned とは判定されないことを
+    // 確認する fixture。生成手順: tests/fixtures/binary/README.md 参照。
+    const MOSTLY_BLANK_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/mostly_blank.pdf");
 
     #[test]
     fn test_pdf_page_chunks_have_heading_and_no_level() {
@@ -517,5 +546,52 @@ mod tests {
         // 復元不能な場合、化けた raw text をそのまま title にしてはいけない
         // (filename fallback に倒すため None を返す契約)。
         assert_eq!(decode_pdf_title("þÿ0"), None);
+    }
+
+    // codex P2 follow-up (PR #69 round 1): スキャン PDF 判定は「非空ページ」
+    // を分母にすべき、という指摘の TDD。
+
+    #[test]
+    fn test_pdf_mostly_blank_pages_not_misclassified_as_scanned() {
+        // 9/10 ページが空でも、実テキストを持つ 1 ページの密度 (221 chars)
+        // が非空ページ基準の閾値 (50 chars/page) を超えていれば scanned
+        // 扱いにしてはいけない (旧ロジックは全ページ数 10 で割るため
+        // 221/10=22 < 50 となり誤って scanned Err になっていた)。
+        let doc = PdfParser
+            .parse_bytes(MOSTLY_BLANK_PDF, "docs/mostly_blank.pdf", &[])
+            .expect("mostly-blank pdf with one dense page must not be classified as scanned");
+        assert_eq!(
+            doc.chunks.len(),
+            1,
+            "only the one non-empty page produces a chunk; blank pages are skipped as before"
+        );
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("p.5"));
+        assert!(doc.chunks[0].content.contains("real text layer"));
+    }
+
+    #[test]
+    fn test_non_empty_page_stats_ignores_blank_pages_in_average() {
+        let pages = vec![
+            String::new(),
+            "A".repeat(200),
+            String::new(),
+            "B".repeat(200),
+            "   \n".to_string(), // 空白のみ = 非空扱いしない
+        ];
+        let (non_empty_pages, avg_chars) = non_empty_page_stats(&pages);
+        assert_eq!(non_empty_pages, 2);
+        assert_eq!(avg_chars, 200);
+    }
+
+    #[test]
+    fn test_non_empty_page_stats_all_blank_returns_zero() {
+        let pages = vec![String::new(), "  ".to_string(), "\n\n".to_string()];
+        assert_eq!(non_empty_page_stats(&pages), (0, 0));
+    }
+
+    #[test]
+    fn test_non_empty_page_stats_no_pages_returns_zero() {
+        let pages: Vec<String> = vec![];
+        assert_eq!(non_empty_page_stats(&pages), (0, 0));
     }
 }

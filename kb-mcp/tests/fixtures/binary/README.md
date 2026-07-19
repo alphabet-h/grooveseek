@@ -16,6 +16,7 @@ fixtures.
 | `untitled.pdf`     | 848 B     | 1 page with real body text (padded past the scanned-PDF threshold) but **no `/Title`** in the Info dict, only `/CreationDate` | `test_pdf_frontmatter_falls_back_to_filename` (title must fall back to the filename stem) |
 | `encrypted.pdf`    | 2047 B    | `minimal.pdf`, re-saved by `pikepdf` under AES-256 (`R=6`) encryption with a **non-empty** user password | `test_pdf_encrypted_real_fixture_is_err` (real encrypted PDF must be `Err` without calling `unlock()`) |
 | `utf16_title.pdf`  | 761 B     | 1 page (padded past the scanned-PDF threshold) with `/Title` as a **literal PDF string** (`(...)`, raw bytes) encoding UTF-16BE `"日本語"` with a BOM (`0xFEFF`) | `test_pdf_recovers_utf16be_title_from_real_pdf_encoding` (Task 2.9 follow-up: `oxidize-pdf` mis-decodes this byte-by-byte through a CP1252/WinAnsi-style table instead of detecting the BOM; kb-mcp must recover the correct title) |
+| `mostly_blank.pdf` | 2920 B    | 10 pages: 9 with an empty `/Contents` stream (same technique as `empty_text.pdf`) and exactly 1 (page 5) with a real 221-char text layer | `test_pdf_mostly_blank_pages_not_misclassified_as_scanned` (codex P2, PR #69 round 1: the scanned-PDF heuristic must average over *non-empty* pages only — `221 / 10 = 22 < 50` wrongly rejected the whole PDF under the old total-page-count denominator, while `221 / 1 = 221` correctly does not) |
 
 `minimal.pdf` intentionally keeps `/Title` so it stays valid for the Task 2.3
 happy-path test; the filename-fallback case needed a *separate* fixture
@@ -146,6 +147,27 @@ end-to-end (`cargo test --lib parser::pdf::tests::test_pdf_recovers_utf16be_titl
 that it actually reproduces mis-decoded output before wiring the fix's
 "before" state into a test — don't assume any Unicode PDF-string
 representation exercises oxidize-pdf's decode paths identically.
+
+### `mostly_blank.pdf` — many blank pages, one dense page
+
+Same hand-crafted recipe as `minimal.pdf` / `untitled.pdf`, just extended to
+`NUM_PAGES = 10` in a loop instead of writing each `N 0 obj` by hand: for
+`i` in `1..=10`, emit a `(Page, Contents)` object pair, where `Contents` is
+an empty stream (`/Length 0`, same technique as `empty_text.pdf`) for every
+page except `i == 5`, which gets a `BT ... Tj ... ET` content stream with a
+221-character string. Object numbering: `1` = Catalog, `2` = Pages,
+`2+i` = page `i`, `2+NUM_PAGES+i` = that page's Contents, then Font, then
+Info — same offset-tracking `obj()` helper as the other fixtures, just
+called in a loop. Exists specifically to reproduce the codex P2 finding
+(PR #69 round 1) that averaging chars-per-page over *all* pages (including
+blank ones) dilutes a real content page's density below the scanned-PDF
+threshold; regenerate by adjusting `NUM_PAGES` / `TEXT_PAGE_INDEX` /
+`TEXT_PAGE_CONTENT` if a different page count or position is needed, and
+re-run `cargo test --lib parser::pdf::tests::test_pdf_mostly_blank_pages_not_misclassified_as_scanned`
+to confirm the offsets are correct and the fixture still exercises the
+intended density gap (i.e. verify it fails against the pre-fix code first —
+see the git history around the codex P2 fix commit for the exact numbers
+this fixture was tuned against).
 
 ## `encrypted.pdf` — real encrypted fixture
 
