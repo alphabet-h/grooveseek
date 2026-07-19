@@ -192,9 +192,22 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
     preflight_xlsx_decompression_budget_capped(bytes, path_hint, super::MAX_RAW_BINARY_BYTES)
 }
 
-/// `xl/worksheets/*.xml` + `xl/sharedStrings.xml` + `xl/styles.xml` の申告
-/// uncompressed size (zip local file header 由来、展開はしない) を合計し、
-/// `cap` を超えていれば calamine を呼ぶ前に `Err` にする。
+/// アーカイブ内の全 entry のうち name が `.xml` または `.bin` で終わる
+/// もの全ての申告 uncompressed size (zip local file header 由来、展開は
+/// しない) を合計し、`cap` を超えていれば calamine を呼ぶ前に `Err` にする。
+///
+/// codex P1 (PR #70 round 4): 旧実装は `xl/worksheets/*.xml` +
+/// `xl/sharedStrings.xml` + `xl/styles.xml` という固定パスのみを検査して
+/// いたため、`_rels/.rels` の officeDocument relationship で workbook 本体
+/// を `xl/` 以外の任意ディレクトリに配置した crafted xlsx では対象 0 件に
+/// なり budget を丸ごと素通りしていた (calamine は rels から xl_path を
+/// 導出して開けるため、layout が非標準でも普通に読める)。rels を解決して
+/// 正しい xl_path を突き止めるより単純で保守的な方式として、**「name が
+/// `.xml`/`.bin` で終わる全 entry」という layout 非依存の superset** に
+/// 対象を広げることでこの抜け道を塞ぐ。xlsx の payload (worksheets /
+/// sharedStrings / styles / vbaProject.bin 等) は置き場所によらず必ず
+/// この 2 拡張子のいずれかであり、media (画像等、`.png`/`.jpeg` 等) は
+/// 対象外のままなので、正規の画像入り xlsx を誤って弾くことはない。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -217,17 +230,15 @@ fn preflight_xlsx_decompression_budget_capped(
             continue;
         };
         let name = entry.name();
-        let is_target = name == "xl/sharedStrings.xml"
-            || name == "xl/styles.xml"
-            || (name.starts_with("xl/worksheets/") && name.ends_with(".xml"));
+        let is_target = name.ends_with(".xml") || name.ends_with(".bin");
         if is_target {
             total = total.saturating_add(entry.size());
         }
     }
     if total > cap {
         anyhow::bail!(
-            "{path_hint}: declared xl worksheets/sharedStrings/styles size ({total} bytes) \
-             exceeds {cap} bytes cap (zip-bomb guard)"
+            "{path_hint}: declared .xml/.bin entry size total ({total} bytes) exceeds \
+             {cap} bytes cap (zip-bomb guard)"
         );
     }
     Ok(())
@@ -347,6 +358,32 @@ mod tests {
         let bytes = make_minimal_xlsx(&[("S", &[&["x"]])]);
         let err = preflight_xlsx_decompression_budget_capped(&bytes, "x.xlsx", 5)
             .expect_err("declared worksheet xml size over the injected 5-byte cap must be Err");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_xlsx_preflight_catches_worksheets_outside_xl_directory() {
+        // codex P1 (PR #70 round 4): 旧実装は `xl/worksheets/*.xml` 等の
+        // 固定パスのみを検査していたため、`_rels/.rels` の officeDocument
+        // relationship で workbook 本体を `xl/` 以外の任意ディレクトリに
+        // 配置した crafted xlsx (calamine は rels から xl_path を導出して
+        // 開けるため layout 非標準でも普通に読める) では対象 0 件になり
+        // budget を素通りしていた。layout 非依存 (`.xml`/`.bin` 全件) の
+        // pre-flight に変更したことで、`xl/` 以外に置かれた XML でも申告
+        // size を正しく合算し cap 超過を検出できることを確認する。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("custom/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"0123456789").unwrap(); // 10 bytes, xl/ 配下ではない
+            zip.finish().unwrap();
+        }
+        let err = preflight_xlsx_decompression_budget_capped(&buf, "x.xlsx", 5)
+            .expect_err("declared size over the injected 5-byte cap must be Err even outside xl/");
         assert!(
             err.to_string().contains("zip-bomb guard"),
             "error message should mention zip-bomb guard, got: {err}"
