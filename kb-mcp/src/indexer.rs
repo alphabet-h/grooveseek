@@ -636,11 +636,20 @@ pub enum RenameOutcome {
     RenamedAndReindexed { chunks: u32 },
     /// 旧 path が DB に無い (新規 path として扱った方が良い)
     OldPathMissing,
+    /// path は UPDATE 済だが、新 path の binary size が cap 超過のため
+    /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
+    /// content_hash は旧内容のまま据え置き、次回 full rebuild の
+    /// `scan_disk_entries` の size-cap 判定に委ねる (§4.2 skip 統一原則)。
+    RenamedSizeCapped,
 }
 
 /// 単一ファイルの rename を処理する。
 /// - `old_rel` / `new_rel` とも forward-slash、`kb_path` 相対
 /// - DB 側の path を UPDATE し、必要なら再 index (内容変更がある場合)
+/// - **size cap**: `is_binary()` な拡張子の新 path が `MAX_RAW_BINARY_BYTES`
+///   を超えていれば hash 再計算のための `fs::read` をスキップする
+///   ([`binary_size_exceeded`]、codex P2 round 3。これで scan / reindex /
+///   rename の 3 read 経路すべてが同じ size-cap guard を通るようになった)
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
 pub fn rename_single_file(
@@ -668,6 +677,25 @@ pub fn rename_single_file(
         db.delete_document(new_rel)?;
         return Ok(RenameOutcome::Renamed); // path は UPDATE 済 (後で delete)
     }
+
+    // size-cap ガード: fs::read する前に判定する。DB の path 自体は既に
+    // rename_document で UPDATE 済なのでここでは触らない (= 旧 hash のまま
+    // 新 path に残る)。hash 再計算 / reindex は次回 full rebuild に委ねる。
+    let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let is_binary_ext = registry
+        .binary_extensions()
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(ext));
+    if let Ok(Some(len)) =
+        binary_size_exceeded(&full, is_binary_ext, crate::parser::MAX_RAW_BINARY_BYTES)
+    {
+        eprintln!(
+            "Skipping {new_rel}: binary file too large ({len} bytes > {} limit)",
+            crate::parser::MAX_RAW_BINARY_BYTES
+        );
+        return Ok(RenameOutcome::RenamedSizeCapped);
+    }
+
     let new_bytes =
         std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
     let new_hash = sha256_hex_bytes(&new_bytes);
@@ -1452,5 +1480,21 @@ mod tests {
             RenameOutcome::RenamedAndReindexed { chunks: 1 }
         );
         assert_ne!(RenameOutcome::Renamed, RenameOutcome::OldPathMissing);
+    }
+
+    #[test]
+    fn test_rename_outcome_size_capped_variant_is_distinct() {
+        // codex P2 round 3: 新 variant が既存 3 種と区別できることの回帰確認
+        // (rename_single_file 自体は Embedder 必須で単体テスト不可のため、
+        // ここでは enum の distinctness のみ確認する)。
+        assert_ne!(RenameOutcome::RenamedSizeCapped, RenameOutcome::Renamed);
+        assert_ne!(
+            RenameOutcome::RenamedSizeCapped,
+            RenameOutcome::RenamedAndReindexed { chunks: 1 }
+        );
+        assert_ne!(
+            RenameOutcome::RenamedSizeCapped,
+            RenameOutcome::OldPathMissing
+        );
     }
 }

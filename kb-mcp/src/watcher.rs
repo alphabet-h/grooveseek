@@ -446,6 +446,11 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         Ok(indexer::RenameOutcome::OldPathMissing) => {
             eprintln!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
         }
+        Ok(indexer::RenameOutcome::RenamedSizeCapped) => {
+            eprintln!(
+                "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
+            );
+        }
         Err(e) => eprintln!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
     }
 }
