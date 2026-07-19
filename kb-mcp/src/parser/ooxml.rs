@@ -2,7 +2,8 @@
 //! 読むための共有ロジックを置く。parser struct は持たない。
 //!
 //! `docProps/core.xml` (Dublin Core) → Frontmatter マッピング + zip entry
-//! 読み出しを docx/xlsx/pptx parser が共有する (Task 3.3/3.4 で消費予定)。
+//! 読み出しを docx/xlsx/pptx parser が共有する (xlsx: Task 3.3、docx: Task 3.4
+//! で消費済み。pptx は Task 3.5 で消費予定)。
 
 use std::io::{Cursor, Read};
 
@@ -12,9 +13,6 @@ use quick_xml::reader::Reader;
 use super::Frontmatter;
 
 /// zip 内 `name` エントリを丸ごとバイト列で読む。無ければ None。
-// Task 3.2 時点では呼び出し元 (docx/xlsx/pptx parser) が未実装のため未使用。
-// Task 3.3/3.4 で消費予定 (feature-45)。
-#[allow(dead_code)]
 pub(crate) fn read_zip_entry(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     name: &str,
@@ -26,9 +24,6 @@ pub(crate) fn read_zip_entry(
 }
 
 /// `docProps/core.xml` があれば Frontmatter に map、無ければ filename fallback。
-// Task 3.2 時点では呼び出し元 (docx/xlsx/pptx parser) が未実装のため未使用。
-// Task 3.3/3.4 で消費予定 (feature-45)。
-#[allow(dead_code)]
 pub(crate) fn core_xml_frontmatter(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     path_hint: &str,

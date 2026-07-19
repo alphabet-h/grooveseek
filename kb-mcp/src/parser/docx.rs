@@ -79,6 +79,9 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
     let mut para_style: Option<u8> = None; // HeadingN → level (2..=6)
     let mut para_text = String::new();
     let mut in_text = false;
+    // 除外対象見出し配下かどうか。true の間は本文段落を一切 push しない (次の
+    // 非除外見出しで解除、MarkdownParser::chunk_body と同じ excluded フラグ管理)。
+    let mut excluded = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -118,23 +121,21 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
                 b"p" => {
                     let text = para_text.trim().to_string();
                     if let Some(level) = para_style {
-                        // 見出し段落: 新セクション開始 (exclude 対象なら見出し
-                        // なし = 本文なしセクションとして開始し、後続本文は
-                        // 破棄される — MarkdownParser の chunk_body と同じ挙動)。
+                        // 見出し段落。exclude 対象なら新規 section を作らず
+                        // `excluded = true` にするだけ (= 次の非除外見出しまで
+                        // 本文段落を丸ごと捨てる。無題 chunk としても残さない
+                        // — MarkdownParser::chunk_body と同じ excluded フラグ管理)。
                         if excludes.iter().any(|ex| text.contains(ex)) {
-                            sections.push(Section {
-                                heading: None,
-                                level: None,
-                                body: String::new(),
-                            });
+                            excluded = true;
                         } else {
+                            excluded = false;
                             sections.push(Section {
                                 heading: Some(text),
                                 level: Some(level),
                                 body: String::new(),
                             });
                         }
-                    } else if !text.is_empty() {
+                    } else if !excluded && !text.is_empty() {
                         let last = sections.last_mut().expect("sections is never empty");
                         if !last.body.is_empty() {
                             last.body.push('\n');
@@ -332,6 +333,41 @@ mod tests {
             "entity reference must resolve, got: {:?}",
             doc.chunks[0].content
         );
+    }
+
+    #[test]
+    fn test_docx_exclude_headings_discards_body() {
+        // 除外対象見出し配下の本文は、無題 chunk としても含め一切 index に
+        // 残ってはいけない (leak すると exclude_headings が機密除外用途で
+        // 使い物にならない)。次の非除外見出し以降は通常通り拾われる。
+        let bytes = make_minimal_docx(&[
+            (Some("Heading1"), "Secret"),
+            (
+                None,
+                "confidential body enough length enough length enough length",
+            ),
+            (Some("Heading1"), "Public"),
+            (
+                None,
+                "public body enough length enough length enough length",
+            ),
+        ]);
+        let doc = DocxParser
+            .parse_bytes(&bytes, "docs/s.docx", &["Secret"])
+            .unwrap();
+        let joined: String = doc
+            .chunks
+            .iter()
+            .map(|c| format!("{:?} {}", c.heading, c.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("confidential"),
+            "excluded heading body must not leak into any chunk (incl. headless): {joined}"
+        );
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("Public"));
+        assert!(doc.chunks[0].content.contains("public body"));
     }
 
     #[test]

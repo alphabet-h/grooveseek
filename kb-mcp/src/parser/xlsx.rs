@@ -199,7 +199,7 @@ mod tests {
 
             // xl/worksheets/sheetN.xml (inlineStr)
             for (i, (_, rows)) in sheets.iter().enumerate() {
-                zip.start_file(&format!("xl/worksheets/sheet{}.xml", i + 1), opt)
+                zip.start_file(format!("xl/worksheets/sheet{}.xml", i + 1), opt)
                     .unwrap();
                 let mut sh = String::from(
                     r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
