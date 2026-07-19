@@ -13,13 +13,33 @@ use quick_xml::reader::Reader;
 use super::Frontmatter;
 
 /// zip 内 `name` エントリを丸ごとバイト列で読む。無ければ None。
+///
+/// codex P2 (PR #70 round 1, zip-bomb hardening): `read_to_end` は元々
+/// unbounded だったため、crafted 高圧縮ファイル (zip bomb) で
+/// `super::MAX_RAW_BINARY_BYTES` (raw 50 MiB cap) をすり抜けてメモリ枯渇
+/// し得た。2 段で bound する:
+/// 1. エントリの申告 uncompressed size (`ZipFile::size()`、local file header
+///    由来) が cap を超えていれば、展開を試みる前に即座に None を返す。
+/// 2. 実読みも `Read::take` で cap+1 バイトまでに bound し、申告 size が
+///    偽装された crafted zip (実際の解凍結果が申告よりずっと大きい) でも
+///    メモリ確保は cap+1 バイトどまりにした上で、読めたバイト数が cap を
+///    超えていれば None として拒否する。
 pub(crate) fn read_zip_entry(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     name: &str,
 ) -> Option<Vec<u8>> {
     let mut file = zip.by_name(name).ok()?;
+    if file.size() > super::MAX_RAW_BINARY_BYTES {
+        return None;
+    }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    // cap+1 まで読めれば「申告 size が嘘だった (cap を実際は超えている)」と
+    // 判定できる。ちょうど cap バイトのエントリは正常に許可する。
+    let limit = super::MAX_RAW_BINARY_BYTES.saturating_add(1);
+    (&mut file).take(limit).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > super::MAX_RAW_BINARY_BYTES {
+        return None;
+    }
     Some(buf)
 }
 
@@ -159,6 +179,54 @@ pub(crate) fn resolve_general_ref(r: &BytesRef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn test_read_zip_entry_rejects_entry_declaring_size_over_cap() {
+        // codex P2 (PR #70 round 1, zip-bomb hardening): `read_to_end` は
+        // unbounded だったため、crafted 高圧縮ファイルで raw 50 MiB cap
+        // (`parser::MAX_RAW_BINARY_BYTES`) をすり抜けてメモリ枯渇し得た。
+        // 全 0 バイトの highly-compressible payload (圧縮後の zip 自体は
+        // 小さいまま、申告 uncompressed size だけが cap を超える) で、
+        // 展開を試みる前に None を返すことを検証する。
+        let oversized_len = (super::super::MAX_RAW_BINARY_BYTES + 1) as usize;
+        let payload = vec![0u8; oversized_len];
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("big.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&payload).unwrap();
+            zip.finish().unwrap();
+        }
+        drop(payload);
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        assert!(
+            read_zip_entry(&mut archive, "big.bin").is_none(),
+            "entry declaring uncompressed size > MAX_RAW_BINARY_BYTES must be rejected \
+             without attempting to decompress it"
+        );
+    }
+
+    #[test]
+    fn test_read_zip_entry_accepts_entry_within_cap() {
+        // cap ちょうど手前の通常サイズのエントリは従来通り読める (回帰確認)。
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("small.bin", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"hello world").unwrap();
+            zip.finish().unwrap();
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(buf.as_slice())).unwrap();
+        assert_eq!(
+            read_zip_entry(&mut archive, "small.bin"),
+            Some(b"hello world".to_vec())
+        );
+    }
 
     #[test]
     fn test_parse_core_xml_maps_dublin_core() {
