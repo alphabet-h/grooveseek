@@ -1787,7 +1787,7 @@ impl Database {
 
     /// IMMEDIATE (RESERVED lock) トランザクションを開始する (feature-46)。
     /// FTS 3 列 migration の double-checked locking (§4.4) で書き手を単一化する
-    /// ために使う。`&self` で呼べるよう `unchecked_transaction` 系の
+    /// ために使う (Task 2.2 で消費)。`&self` で呼べるよう `unchecked_transaction` 系の
     /// `Transaction::new_unchecked` を behavior=Immediate で使う
     /// (`transaction_with_behavior` は `&mut Connection` 要求で不可)。
     /// 通常 Drop は rollback。成功時は `tx.commit()` を呼ぶこと。
@@ -2461,23 +2461,77 @@ mod tests {
 
     #[test]
     fn test_begin_immediate_tx_takes_reserved_lock() {
-        // IMMEDIATE tx は開始時点で書き込みロックを取る。commit まで別の
-        // unchecked_transaction からの書き込みが競合しないことを smoke で確認。
-        let db = Database::open_in_memory().unwrap();
-        let tx = db.begin_immediate_tx().unwrap();
-        tx.execute(
-            "INSERT INTO index_meta (key, value) VALUES ('probe', '1')",
-            [],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let v: String = db
-            .conn
-            .query_row("SELECT value FROM index_meta WHERE key='probe'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(v, "1");
+        // IMMEDIATE tx は開始時点で RESERVED lock を取得する。
+        // 別 connection からの書き込みが lock 取得まで待たされることを 2-connection で検証。
+        // (Deferred tx では出現時点でのみ lock 取得なので、BEGIN 直後は競合しない)。
+
+        // TmpDir パターン: PID + nanos で unique な一時ディレクトリ
+        struct TmpDir(std::path::PathBuf);
+        impl Drop for TmpDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir =
+            std::env::temp_dir().join(format!("kb-mcp-test-immediate-lock-{pid}-{nonce}"));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TmpDir(tmp_dir.clone());
+
+        let db_path = tmp_dir.join("test.db").to_string_lossy().to_string();
+
+        // conn A: Database wrapper で IMMEDIATE tx を開始 (未 commit)
+        let db_a = Database::open(&db_path).unwrap();
+        let _tx_a = db_a.begin_immediate_tx().unwrap();
+        // _tx_a を保持したまま next block へ
+
+        {
+            // conn B: 同じ DB に raw rusqlite connection で接続、busy_timeout=0 (即失敗)
+            let conn_b = rusqlite::Connection::open(&db_path).expect("failed to open db_path");
+            conn_b
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("failed to set busy_timeout");
+
+            // conn A が RESERVED lock を持っているため、conn B の BEGIN IMMEDIATE は
+            // SQLITE_BUSY で失敗するはず
+            let result = conn_b.execute("BEGIN IMMEDIATE", []);
+            assert!(
+                result.is_err(),
+                "Expected SQLITE_BUSY when IMMEDIATE tx encounters held RESERVED lock, but succeeded"
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("database is locked"),
+                "Expected 'database is locked' error, got: {err_msg}"
+            );
+        }
+        // conn_b は drop される (結果は無視)
+
+        // _tx_a を drop (rollback) してから、新 connection が成功することを確認
+        drop(_tx_a);
+
+        {
+            let conn_b =
+                rusqlite::Connection::open(&db_path).expect("failed to open db_path for retry");
+            conn_b
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("failed to set busy_timeout for retry");
+
+            // lock が解放されたので BEGIN IMMEDIATE が成功するはず
+            let result = conn_b.execute("BEGIN IMMEDIATE", []);
+            assert!(
+                result.is_ok(),
+                "Expected BEGIN IMMEDIATE to succeed after IMMEDIATE tx rollback, but got: {:?}",
+                result.unwrap_err()
+            );
+            // clean up: ROLLBACK を send
+            let _ = conn_b.execute_batch("ROLLBACK");
+        }
     }
 
     #[test]
