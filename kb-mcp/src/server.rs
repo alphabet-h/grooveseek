@@ -1547,7 +1547,7 @@ impl KbServerShared {
             parser_registry: Arc::new(Registry::default()),
             min_confidence_ratio: 1.5,
             search_config: crate::config::SearchConfig::default(),
-            context_mode_desired: crate::db::ContextMode::Static,
+            context_mode_desired: crate::db::ContextMode::Off,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
             indexing_state: Arc::new(Mutex::new(None)),

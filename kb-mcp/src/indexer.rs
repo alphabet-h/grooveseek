@@ -305,7 +305,9 @@ pub fn rebuild_index(
     }
 
     // feature-46: effective context mode を解決 (force / grandfather / warn を含む)。
-    // force の場合は main.rs 側で reset_for_model 済みなので DB は空 = desired を採用。
+    // force の場合、CLI 経路は main.rs 側で reset_for_model 済み (DB 空)、MCP
+    // rebuild_index 経路は reset しないが全 doc を upsert (DELETE+INSERT) で
+    // 再 embed するため、いずれも結果 index は一様に desired mode になる。
     let context_mode = resolve_context_mode(db, context_mode_desired, force)?;
 
     // Registry の対応拡張子リストで source files を収集する。

@@ -4,7 +4,7 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-07-XX
+## [0.12.0] - 2026-07-21
 
 ### Added
 
