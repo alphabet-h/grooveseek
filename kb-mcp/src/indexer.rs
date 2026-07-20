@@ -802,12 +802,42 @@ pub fn rename_single_file(
     let new_bytes =
         std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
     let new_hash = sha256_hex_bytes(&new_bytes);
-    if new_hash == old_hash {
+
+    // codex P2 round 2 (finding A): watcher は config-desired を持たないので
+    // DB 側モードに従う (`reindex_single_file` と同じ E-11 の規則)。
+    // rebuild_index の一括 rename (F3, PR #73) と同じ理由で、Static モードでは
+    // same-hash fast path を無効化する: rename は内容 (hash) を変えないが、
+    // Static モードでは frontmatter title が無い文書の context breadcrumb が
+    // filename stem 由来 (E-1) のため、再 parse しない限り旧 filename のまま
+    // stale 化してしまう。Off モードは context を embed に使わないため無害 =
+    // 従来通り fast path を維持する。
+    let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    let same_hash = new_hash == old_hash;
+    if same_hash && context_mode != ContextMode::Static {
         return Ok(RenameOutcome::Renamed);
     }
 
-    // 内容も変わっているので新 path で reindex
-    match reindex_single_file(db, embedder, kb_path, new_rel, exclude_headings, registry)? {
+    // 内容が変わっている、または (Static モードの same-hash rename として)
+    // breadcrumb 更新のため強制的に再 embed する。size-cap 判定は既に上で
+    // 済んでいるので、読み込み済みの bytes/hash をそのまま再利用して
+    // 二重 read を避ける (`reindex_single_file` を経由すると全 read をやり直す)。
+    let entry = DiskEntry {
+        rel: new_rel.to_string(),
+        hash: new_hash,
+        full,
+    };
+    // same_hash (= Static-mode-forced) の場合のみ force=true で
+    // hash 一致 fast path をバイパスする。内容が変わっている場合は
+    // 通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
+    match index_single_disk_entry(
+        db,
+        embedder,
+        &entry,
+        exclude_headings,
+        registry,
+        same_hash,
+        context_mode,
+    )? {
         SingleResult::Updated { chunks } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         _ => Ok(RenameOutcome::Renamed),
     }
