@@ -1588,8 +1588,6 @@ impl Database {
     }
 
     /// `index_meta.context_mode` を読む。key 不在 / 未知値は `None` (= grandfather 判定へ)。
-    /// Task 2.5 で context_mode versioning の配線に消費される (現時点では未配線)。
-    #[allow(dead_code)]
     pub fn read_context_mode(&self) -> Result<Option<ContextMode>> {
         use rusqlite::OptionalExtension;
         let raw: Option<String> = self
@@ -1604,8 +1602,6 @@ impl Database {
     }
 
     /// `index_meta.context_mode` を記録する (INSERT OR REPLACE)。
-    /// Task 2.5 で context_mode versioning の配線に消費される (現時点では未配線)。
-    #[allow(dead_code)]
     pub fn write_context_mode(&self, mode: ContextMode) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('context_mode', ?1)",

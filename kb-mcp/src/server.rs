@@ -52,6 +52,8 @@ pub struct KbServer {
     /// の per-call override 解決時に `SearchOverrides::resolve(&search_config)`
     /// で参照する。toml に section が無ければ `SearchConfig::default()` (MMR off)。
     search_config: crate::config::SearchConfig,
+    /// feature-46: `rebuild_index` MCP tool の force 時 adopt 値 (§4.8)。
+    context_mode_desired: crate::db::ContextMode,
     /// Shared indexing-state slot — `rebuild_index` flips it Some/None so
     /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
     /// in-process index operation (codex P2 round 1 on PR #57).
@@ -704,6 +706,7 @@ impl KbServer {
             &self.exclude_dirs,
             &self.parser_registry,
             indexer::progress::ProgressReporter::new(indexer::progress::ProgressMode::Quiet),
+            self.context_mode_desired,
         ) {
             Ok(result) => {
                 let stats = IndexStats {
@@ -1392,6 +1395,10 @@ pub struct KbServerShared {
     /// `[search]` セクション (toml) のスナップショット。serve 起動時に Config
     /// から取り出し、shutdown まで不変。`KbServer::from_shared` で clone する。
     pub search_config: crate::config::SearchConfig,
+    /// feature-46: index 時の desired context mode (config `[contextual].enabled`
+    /// から算出)。`rebuild_index` MCP tool が force 時の adopt 値に使う。非 force は
+    /// DB 側モードが優先されるため、この値は force 移行時のみ効く。
+    pub context_mode_desired: crate::db::ContextMode,
 
     // (v0.8.0+, feature-43 PR-2) Fields surfaced by `/api/admin/status`.
     /// Wall-clock daemon start time, used for ISO formatting in admin status.
@@ -1448,6 +1455,7 @@ impl KbServer {
             parser_registry: Arc::clone(&shared.parser_registry),
             min_confidence_ratio: shared.min_confidence_ratio,
             search_config: shared.search_config.clone(),
+            context_mode_desired: shared.context_mode_desired,
             indexing_state: Arc::clone(&shared.indexing_state),
             tool_router: KbServer::tool_router(),
         }
@@ -1539,6 +1547,7 @@ impl KbServerShared {
             parser_registry: Arc::new(Registry::default()),
             min_confidence_ratio: 1.5,
             search_config: crate::config::SearchConfig::default(),
+            context_mode_desired: crate::db::ContextMode::Static,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
             indexing_state: Arc::new(Mutex::new(None)),
@@ -1567,6 +1576,7 @@ pub async fn run_server(
     min_confidence_ratio: f32,
     search_config: crate::config::SearchConfig,
     config_source: crate::config::ConfigSource,
+    context_mode_desired: crate::db::ContextMode,
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::time::{Instant, SystemTime};
@@ -1629,6 +1639,7 @@ pub async fn run_server(
         parser_registry: Arc::new(parser_registry),
         min_confidence_ratio,
         search_config,
+        context_mode_desired,
         started_at: SystemTime::now(),
         started_instant: Instant::now(),
         indexing_state: Arc::new(Mutex::new(None)),

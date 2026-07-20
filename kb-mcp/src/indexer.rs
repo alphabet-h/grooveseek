@@ -282,6 +282,7 @@ pub fn rebuild_index(
     exclude_dirs: &[String],
     registry: &Registry,
     mut progress: progress::ProgressReporter,
+    context_mode_desired: ContextMode,
 ) -> Result<IndexResult> {
     let start = Instant::now();
 
@@ -302,6 +303,10 @@ pub fn rebuild_index(
     if quality_updated > 0 {
         eprintln!("Backfilled {quality_updated} chunks with quality scores");
     }
+
+    // feature-46: effective context mode を解決 (force / grandfather / warn を含む)。
+    // force の場合は main.rs 側で reset_for_model 済みなので DB は空 = desired を採用。
+    let context_mode = resolve_context_mode(db, context_mode_desired, force)?;
 
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
@@ -358,7 +363,15 @@ pub fn rebuild_index(
     for entry in &disk_entries {
         visited_paths.insert(entry.rel.clone());
 
-        match index_single_disk_entry(db, embedder, entry, exclude_headings, registry, force)? {
+        match index_single_disk_entry(
+            db,
+            embedder,
+            entry,
+            exclude_headings,
+            registry,
+            force,
+            context_mode,
+        )? {
             SingleResult::Updated { chunks } => {
                 updated += 1;
                 progress.report_indexed(&entry.rel, chunks);
@@ -420,7 +433,11 @@ fn index_single_disk_entry(
     exclude_headings: Option<&[String]>,
     registry: &Registry,
     force: bool,
+    context_mode: ContextMode,
 ) -> Result<SingleResult> {
+    // feature-46 Task 2.7 で embed 合成 / insert_chunk 充填に使う。
+    // 本 task (2.5) では resolve 済みの mode を受け取って通すだけ。
+    let _ = context_mode;
     // Skip unchanged files unless forced.
     // rename で path UPDATE 済のものは「DB 側 hash == disk hash」なので
     // ここで自然に skip される (embedding 再計算なし)。
@@ -614,7 +631,17 @@ pub fn reindex_single_file(
         hash,
         full,
     };
-    index_single_disk_entry(db, embedder, &entry, exclude_headings, registry, false)
+    // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
+    let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    index_single_disk_entry(
+        db,
+        embedder,
+        &entry,
+        exclude_headings,
+        registry,
+        false,
+        context_mode,
+    )
 }
 
 /// 指定 path の document / chunks を DB から削除する。
@@ -775,6 +802,55 @@ fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
         2 => (Some(parts[0].to_string()), None),
         // "deep-dive/chromadb/overview.md" or deeper — category + topic
         _ => (Some(parts[0].to_string()), Some(parts[1].to_string())),
+    }
+}
+
+use crate::db::ContextMode;
+
+/// force / config-desired / DB-stored から effective context mode を決める (feature-46 §4.8)。
+/// 副作用: fresh/legacy/force のケースで `index_meta.context_mode` を記録する。
+/// mismatch (config は static 期待だが DB は off 等) は stderr へ warn し、DB 側モードで
+/// 継続する (embedding 空間の一貫性維持、混在 index を作らない)。
+pub(crate) fn resolve_context_mode(
+    db: &Database,
+    desired: ContextMode,
+    force: bool,
+) -> Result<ContextMode> {
+    if force {
+        // reset_for_model 後 = DB は空。desired を採用して記録する。
+        db.write_context_mode(desired)?;
+        return Ok(desired);
+    }
+    match db.read_context_mode()? {
+        Some(stored) => {
+            if stored != desired {
+                eprintln!(
+                    "warning: [contextual] config expects '{}' mode but this index was built \
+                     with '{}'. Run `kb-mcp index --force` to migrate; continuing in '{}' mode.",
+                    desired.as_str(),
+                    stored.as_str(),
+                    stored.as_str()
+                );
+            }
+            Ok(stored)
+        }
+        None => {
+            // key 不在: fresh DB (chunk 0) は desired、legacy DB (chunk > 0) は off に grandfather
+            let mode = if db.chunk_count()? > 0 {
+                ContextMode::Off
+            } else {
+                desired
+            };
+            db.write_context_mode(mode)?;
+            if mode != desired {
+                eprintln!(
+                    "warning: existing index has no context data; grandfathering to '{}'. \
+                     Run `kb-mcp index --force` to build a contextual index.",
+                    mode.as_str()
+                );
+            }
+            Ok(mode)
+        }
     }
 }
 
@@ -1498,5 +1574,60 @@ mod tests {
             RenameOutcome::RenamedSizeCapped,
             RenameOutcome::OldPathMissing
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_context_mode (feature-46 Task 2.5)
+    // -----------------------------------------------------------------------
+
+    use crate::db::ContextMode;
+
+    #[test]
+    fn test_resolve_context_mode_fresh_db_adopts_desired() {
+        let db = test_db(); // 空 (chunk 0)
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(m, ContextMode::Static);
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+    }
+
+    #[test]
+    fn test_resolve_context_mode_legacy_db_grandfathers_to_off() {
+        let db = test_db();
+        // chunk を 1 件入れて legacy (key 不在 + chunk > 0) を作る
+        let doc_id = db
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(m, ContextMode::Off, "legacy DB grandfathers to off");
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Off));
+    }
+
+    #[test]
+    fn test_resolve_context_mode_stored_wins_over_desired() {
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(m, ContextMode::Off, "DB-stored mode wins on mismatch");
+    }
+
+    #[test]
+    fn test_resolve_context_mode_force_adopts_desired() {
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        // force: reset 済み前提で desired を採用 + 記録
+        let m = resolve_context_mode(&db, ContextMode::Static, true).unwrap();
+        assert_eq!(m, ContextMode::Static);
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
     }
 }
