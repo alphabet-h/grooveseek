@@ -165,9 +165,14 @@ bind = "127.0.0.1:3100"
 #max_expanded_tokens = 2000           # cap for adjacent merge / whole-doc (BGE-M3 supports up to 8192)
 
 # [contextual] (optional, feature-46+).
-# 静的 Contextual Retrieval: parser 生成の静的 context breadcrumb を
-# embedding / FTS / reranker に注入する。省略時は有効 (デフォルト on)。
-# 新規 index では追加コストほぼゼロで恩恵があり、既存 DB は context_mode
-# versioning により影響を受けない。
+# 静的 Contextual Retrieval: parser 生成の静的 context breadcrumb (doc title +
+# 見出しパンくず) を embedding / FTS / reranker に注入する。省略時は無効
+# (デフォルト off)。dogfood KB (574 docs) での A/B 計測で、kb-mcp の素の
+# default 構成 (reranker なし) では recall@5 / MRR がむしろ悪化することが
+# 分かったため opt-in とした。reranker (bge-v2-m3 等) を併用する場合は
+# 全指標で最良 (recall@5 +0.047 / MRR +0.102) になるため、reranker 併用時に
+# 限り有効化を推奨する (詳細: README の Contextual Retrieval 節)。
+# 既存 DB へ適用するには `index --force` が必要 (index_meta.context_mode に
+# よる versioning で、--force なしの mismatch は警告のみで現状維持)。
 # [contextual]
-# enabled = true   # 静的 context breadcrumb を embedding/FTS/reranker に注入 (feature-46, default true)
+# enabled = true   # reranker 併用時に opt-in 推奨。無指定/false は従来通り content のみ (feature-46, default false)

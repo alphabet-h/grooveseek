@@ -537,12 +537,12 @@ fn main() -> anyhow::Result<()> {
             let search_config = cfg.search.clone().unwrap_or_default();
 
             // feature-46: index 時と同じロジックで desired context mode を算出する。
-            let context_mode_desired = if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(true)
-            {
-                kb_mcp::db::ContextMode::Static
-            } else {
-                kb_mcp::db::ContextMode::Off
-            };
+            let context_mode_desired =
+                if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                    kb_mcp::db::ContextMode::Static
+                } else {
+                    kb_mcp::db::ContextMode::Off
+                };
 
             // evaluator 指摘 High #2: `--bind` / `--port` が指定されているのに
             // 実効 transport が Stdio なら silent ignore は footgun なので reject。
@@ -604,12 +604,12 @@ fn main() -> anyhow::Result<()> {
             let exclude_dirs = cfg.resolve_exclude_dirs();
             let progress_reporter =
                 kb_mcp::indexer::progress::ProgressReporter::from_cli_flags(quiet, progress);
-            let context_mode_desired = if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(true)
-            {
-                kb_mcp::db::ContextMode::Static
-            } else {
-                kb_mcp::db::ContextMode::Off
-            };
+            let context_mode_desired =
+                if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                    kb_mcp::db::ContextMode::Static
+                } else {
+                    kb_mcp::db::ContextMode::Off
+                };
             let result = kb_mcp::indexer::rebuild_index(
                 &db,
                 &mut embedder,

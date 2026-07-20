@@ -78,7 +78,7 @@ pub struct Config {
     /// `kb-mcp search` / MCP `search` ツールの設定。
     pub search: Option<SearchConfig>,
     /// 静的 Contextual Retrieval (feature-46) の設定。
-    /// 省略時 (`None`) は `ContextualConfig::default()` (enabled=true) 相当。
+    /// 省略時 (`None`) は `ContextualConfig::default()` (enabled=false) 相当。
     pub contextual: Option<ContextualConfig>,
 }
 
@@ -270,9 +270,12 @@ pub struct EvalConfig {
 }
 
 /// `[contextual]` セクション (feature-46)。静的 context の embedding/FTS/reranker
-/// 注入を有効化する。既定 on (新規 DB では追加コストほぼゼロで恩恵、既存 DB は
-/// context_mode versioning により影響なし)。将来のハイブリッド拡張 (source =
-/// "static" | "external") の置き場としても機能する。
+/// 注入を有効化する。既定 off ―― kb-mcp の素の default 構成 (reranker なし) で
+/// dogfood KB (574 docs) を A/B 計測したところ recall@5 -0.080 / MRR -0.041 と
+/// 悪化したため opt-in とした (`.dev/knowledge/eval-baseline-2026-07-20-context.md`)。
+/// reranker (bge-v2-m3 等) 併用時は全指標で最良 (recall@5 +0.047 / MRR +0.102) に
+/// 転じるため、reranker 併用ユーザには docs で有効化を推奨する。将来のハイブリッド
+/// 拡張 (source = "static" | "external") の置き場としても機能する。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextualConfig {
@@ -281,7 +284,7 @@ pub struct ContextualConfig {
 }
 
 fn default_contextual_enabled() -> bool {
-    true
+    false
 }
 
 impl Default for ContextualConfig {
@@ -680,9 +683,11 @@ mod tests {
     }
 
     #[test]
-    fn test_contextual_config_defaults_enabled_true() {
+    fn test_contextual_config_defaults_enabled_false() {
+        // judgment gate (eval-baseline-2026-07-20-context.md): kb-mcp の素の
+        // default 構成 (reranker なし) では recall@5/MRR が悪化するため opt-in。
         let c = ContextualConfig::default();
-        assert!(c.enabled);
+        assert!(!c.enabled);
     }
 
     #[test]
@@ -695,6 +700,15 @@ mod tests {
     }
 
     #[test]
+    fn test_contextual_config_parses_enabled_true_from_toml() {
+        let mut file = tempfile("kb-mcp-config-contextual-on");
+        writeln!(file, "[contextual]\nenabled = true\n").unwrap();
+        let cfg = Config::load_from(file.path()).unwrap();
+        let c = cfg.contextual.expect("contextual must be Some");
+        assert!(c.enabled);
+    }
+
+    #[test]
     fn test_contextual_config_rejects_unknown_field() {
         let toml = "[contextual]\nenabled = true\nbogus = 1\n";
         let result: std::result::Result<crate::config::Config, _> = toml::from_str(toml);
@@ -702,11 +716,11 @@ mod tests {
     }
 
     #[test]
-    fn test_contextual_section_only_defaults_enabled_true() {
+    fn test_contextual_section_only_defaults_enabled_false() {
         let mut file = tempfile("kb-mcp-config-contextual-only");
         writeln!(file, "[contextual]\n").unwrap();
         let cfg = Config::load_from(file.path()).unwrap();
-        assert!(cfg.contextual.expect("Some").enabled);
+        assert!(!cfg.contextual.expect("Some").enabled);
     }
 
     #[test]

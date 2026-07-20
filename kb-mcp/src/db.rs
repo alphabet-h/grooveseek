@@ -433,9 +433,13 @@ impl Database {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         // feature-46: FTS 3 列 migration の repopulate は数秒〜十数秒 lock を保持する。
         // busy_timeout 未設定 (default 0) だと serve 常駐中の別プロセス search/status が
-        // 即 SQLITE_BUSY で失敗する。10 秒待たせて migration 完了後に成功させる (spec §4.4)。
+        // 即 SQLITE_BUSY で失敗する。30 秒待たせて migration 完了後に成功させる (spec §4.4)。
+        // 10s→30s に引き上げ済み: dogfood KB (574 docs / 10,002 chunks) を embedding +
+        // reranker モデル同時ロード中の並行負荷下で計測したところ migration が
+        // 9.7〜12.3s かかり、4 trial 中 2 trial で旧 10s を実際に超過した実測に基づく
+        // (`.dev/knowledge/eval-baseline-2026-07-20-context.md`)。
         self.conn
-            .busy_timeout(std::time::Duration::from_millis(10_000))?;
+            .busy_timeout(std::time::Duration::from_millis(30_000))?;
 
         // vec_chunks は dim が未知の段階では作れないので遅延生成にする。
         // meta に dim が記録されていれば init 時に作るが、無ければ
@@ -5019,7 +5023,7 @@ mod tests {
     #[test]
     fn test_fts_migration_waits_out_concurrent_write_lock() {
         // §10 確定 #4: mpsc 2 本で「holder が RESERVED lock 保持」→「opener が
-        // open 試行」→「holder release」を決定的に順序付け。busy_timeout=10s 内の
+        // open 試行」→「holder release」を決定的に順序付け。busy_timeout=30s 内の
         // 待機後に open が成功する (即 SQLITE_BUSY にならない) ことを検証。
         //
         // NOTE: holder は生 rusqlite::Connection + 手動 `BEGIN IMMEDIATE` で write
