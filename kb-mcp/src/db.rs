@@ -223,6 +223,17 @@ fn parse_dim_from_create_sql(sql: &str) -> Option<u32> {
     rest[..end].trim().parse().ok()
 }
 
+/// `fts_chunks` に context 列があるか。`&Connection` を受けるので tx 内からも呼べる
+/// (`rusqlite::Transaction` は `Deref<Target = Connection>` なので deref coercion で通る)。
+fn fts_chunks_has_context_column_conn(conn: &Connection) -> Result<bool> {
+    let has = conn
+        .prepare("PRAGMA table_info(fts_chunks)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == "context");
+    Ok(has)
+}
+
 /// `tags_any` フィルタ: hit の tags のいずれかが `any_pool` に含まれていれば pass。
 /// `any_pool` が空なら常に pass (= フィルタ無効)。
 fn matches_tags_any(hit_tags: &[String], any_pool: &[String]) -> bool {
@@ -443,6 +454,7 @@ impl Database {
         self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
                 heading,
+                context,
                 content,
                 content='',
                 contentless_delete=1,
@@ -466,6 +478,11 @@ impl Database {
         // legacy DB 互換: chunks.context_text 列が無ければ ALTER で追加する
         // (feature-46。NULL のまま — 値は PR-2 の context_mode 導入後、再 index で埋まる)。
         self.ensure_context_text_column()?;
+
+        // legacy DB 互換: fts_chunks が旧 2 列 schema なら 3 列へ rebuild migration
+        // する (feature-46)。context_text 列の存在を前提に repopulate するため、
+        // 必ず `ensure_context_text_column` の後に呼ぶこと。
+        self.ensure_fts_context_column()?;
 
         Ok(())
     }
@@ -555,6 +572,48 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// `fts_chunks` に context 列が無ければ 3 列 schema へ rebuild migration する
+    /// (feature-46、init 内 one-time)。status / search / serve は rebuild_index を
+    /// 経由しないため、init で全 entry point の schema を保証する。table_info ガードで
+    /// 2 回目以降 O(1) no-op。DROP+CREATE+repopulate は BEGIN IMMEDIATE + double-checked
+    /// locking で multi-process race を防ぐ (spec §4.4)。**`ensure_context_text_column`
+    /// の後に呼ぶこと** (repopulate が chunks.context_text を読むため)。
+    ///
+    /// `backfill_fts` (rebuild_index 冒頭の欠損 rowid 補充) とは責務が別 (schema 変換 vs
+    /// 欠損補充)。本 fn は schema を 2→3 列へ変換するだけ。
+    fn ensure_fts_context_column(&self) -> Result<()> {
+        // 1) 高速パス: context 列が既にあれば no-op (O(1))
+        if self.fts_chunks_has_context_column()? {
+            return Ok(());
+        }
+        // 2) IMMEDIATE tx (RESERVED lock) で書き手を単一化
+        let tx = self.begin_immediate_tx()?;
+        // 3) double-checked: lock 取得後に再チェック (他プロセスが migration 済みなら no-op)
+        if fts_chunks_has_context_column_conn(&tx)? {
+            tx.commit()?;
+            return Ok(());
+        }
+        eprintln!("Migrating FTS index to 3-column schema (heading/context/content)...");
+        // 4) DROP + CREATE 3 列 + chunks から全 repopulate (原子的: DDL はトランザクショナル)
+        tx.execute_batch(
+            "DROP TABLE fts_chunks;
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                heading, context, content,
+                content='', contentless_delete=1,
+                tokenize = \"trigram remove_diacritics 1 case_sensitive 0\"
+             );
+             INSERT INTO fts_chunks (rowid, heading, context, content)
+                SELECT id, heading, COALESCE(context_text, ''), content FROM chunks;",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `fts_chunks` に context 列があるか (self.conn 版)。
+    fn fts_chunks_has_context_column(&self) -> Result<bool> {
+        fts_chunks_has_context_column_conn(&self.conn)
     }
 
     /// 現存する `vec_chunks` の宣言済み次元を返す。テーブルが無い or
@@ -1787,11 +1846,10 @@ impl Database {
 
     /// IMMEDIATE (RESERVED lock) トランザクションを開始する (feature-46)。
     /// FTS 3 列 migration の double-checked locking (§4.4) で書き手を単一化する
-    /// ために使う (Task 2.2 で消費)。`&self` で呼べるよう `unchecked_transaction` 系の
-    /// `Transaction::new_unchecked` を behavior=Immediate で使う
-    /// (`transaction_with_behavior` は `&mut Connection` 要求で不可)。
+    /// ために使う (`ensure_fts_context_column` が消費)。`&self` で呼べるよう
+    /// `unchecked_transaction` 系の `Transaction::new_unchecked` を behavior=Immediate
+    /// で使う (`transaction_with_behavior` は `&mut Connection` 要求で不可)。
     /// 通常 Drop は rollback。成功時は `tx.commit()` を呼ぶこと。
-    #[allow(dead_code)]
     fn begin_immediate_tx(&self) -> Result<rusqlite::Transaction<'_>> {
         Ok(rusqlite::Transaction::new_unchecked(
             &self.conn,
@@ -1862,6 +1920,30 @@ fn dummy_search_result_for_id(id: i64) -> SearchResult {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// feature-46: db.rs 専用の一時ディレクトリ helper (tempfile crate 禁止)。
+    /// `config.rs::DirGuard` / `tests/config_discovery.rs::TempDir` と同型。
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let pid = std::process::id();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir().join(format!("kb-mcp-dbtest-{prefix}-{pid}-{nonce}"));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Helper: create a dummy 384-dim embedding filled with `val`.
     fn dummy_embedding(val: f32) -> Vec<f32> {
@@ -4639,6 +4721,165 @@ mod tests {
             db_final.tags_parse_failure_count(),
             18,
             "concurrent delta must be additively merged (no last-writer-wins)"
+        );
+    }
+
+    // -- feature-46 PR-2 Task 2.2: FTS 3 列 migration ------------------------
+
+    /// 旧 2 列 FTS schema の DB file を作る (v0.11.0 相当)。chunks に context_text
+    /// 列はあり (PR-1 適用済み想定) だが FTS は 2 列 = PR-2 未適用状態を再現する。
+    ///
+    /// **brief からの逸脱 (main 承認済み)**: `PRAGMA journal_mode = WAL;` を明示的に
+    /// 先行させる。kb-mcp が作成した DB は `Database::init()` が必ず最初に journal_mode
+    /// を WAL へ切り替えて永続化するため、実運用では「一度でも kb-mcp が open した DB」
+    /// は常に WAL 状態にある。ここで WAL を先に設定しないと `test_fts_migration_waits_out_concurrent_write_lock`
+    /// が「migration の BEGIN IMMEDIATE 待機」ではなく「非 WAL→WAL の journal_mode 切替」
+    /// で落ちてしまう (詳細は当該テストの NOTE を参照)。
+    fn create_legacy_2col_fts_db(path: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,
+                title TEXT, topic TEXT, category TEXT, depth TEXT, tags TEXT, date TEXT,
+                content_hash TEXT NOT NULL, last_indexed TEXT NOT NULL);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, document_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL, heading TEXT, level INTEGER, content TEXT NOT NULL,
+                token_count INTEGER, quality_score REAL NOT NULL DEFAULT 1.0, context_text TEXT);
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(heading, content, content='',
+                contentless_delete=1, tokenize=\"trigram remove_diacritics 1 case_sensitive 0\");
+             INSERT INTO documents (path, title, content_hash, last_indexed)
+                VALUES ('a.md', 'A', 'h', '2026-01-01T00:00:00Z');
+             INSERT INTO chunks (document_id, chunk_index, heading, content, context_text)
+                VALUES (1, 0, 'H', 'body text here', 'A > H');
+             INSERT INTO fts_chunks (rowid, heading, content) VALUES (1, 'H', 'body text here');",
+        )
+        .unwrap();
+    }
+
+    /// db.conn (private field) から fts_chunks が context 列を持つか判定する test helper。
+    fn fts_has_context_col(db: &Database) -> bool {
+        db.conn
+            .prepare("PRAGMA table_info(fts_chunks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|n| n == "context")
+    }
+
+    #[test]
+    fn test_fts_migration_adds_context_column_and_repopulates() {
+        let dir = TempDir::new("fts-migrate");
+        let path = dir.path().join("k.db");
+        let path_str = path.to_string_lossy().to_string();
+        create_legacy_2col_fts_db(&path_str);
+        // open → init が migration を走らせる
+        let db = Database::open(&path_str).unwrap();
+        assert!(
+            fts_has_context_col(&db),
+            "context column must exist after migration"
+        );
+        // repopulate: 既存 chunk が FTS に残っていること
+        let cnt: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 1);
+        // context 列に 'A > H' が index されていること (MATCH でヒット)
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'context : \"A > H\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(hit >= 1, "context text must be searchable after repopulate");
+    }
+
+    #[test]
+    fn test_fts_migration_idempotent_noop_second_open() {
+        let dir = TempDir::new("fts-noop");
+        let path = dir.path().join("k.db");
+        let path_str = path.to_string_lossy().to_string();
+        create_legacy_2col_fts_db(&path_str);
+        let db1 = Database::open(&path_str).unwrap();
+        assert!(fts_has_context_col(&db1));
+        drop(db1);
+        // 2 回目 open: table_info ガードで no-op (double-checked)
+        let db2 = Database::open(&path_str).unwrap();
+        assert!(fts_has_context_col(&db2));
+    }
+
+    #[test]
+    fn test_fts_migration_waits_out_concurrent_write_lock() {
+        // §10 確定 #4: mpsc 2 本で「holder が RESERVED lock 保持」→「opener が
+        // open 試行」→「holder release」を決定的に順序付け。busy_timeout=10s 内の
+        // 待機後に open が成功する (即 SQLITE_BUSY にならない) ことを検証。
+        //
+        // NOTE: holder は生 rusqlite::Connection + 手動 `BEGIN IMMEDIATE` で write
+        // lock を握る (= migration の ensure_fts_context_column が実際に発行する
+        // BEGIN IMMEDIATE との「同種ロック同士の競合」を厳密に再現するわけではない)。
+        // 本テストが確かめているのは「busy_timeout を設定した接続が、他接続の write
+        // lock 保持中でも待機して成功する」という busy_timeout 全般の待機動作であり、
+        // migration の double-checked locking の正しさ自体は
+        // test_fts_migration_idempotent_noop_second_open (再チェック no-op) で担保する。
+        // 既知の隙間: 「lock 待機中に他プロセスが migration を完了し、lock 取得後の
+        // 再チェックで no-op commit になる」真の競合 double-checked path は 3 テスト
+        // (migrate / idempotent-noop / この lock-wait) のいずれも直接は再現していない。
+        // 機能の正しさは逐次 no-op テスト + tx (DDL) の原子性で担保しており、この
+        // 競合 path 専用の deterministic 再現は複雑さに見合わないと判断した。
+        //
+        // NOTE (fixture が WAL を事前設定する理由、実装中に発見): 非 WAL→WAL の
+        // journal_mode 切替は SQLite 側で exclusive lock を要求し、busy_timeout /
+        // busy handler を一切無視して即座に SQLITE_BUSY を返す。`create_legacy_2col_fts_db`
+        // が journal_mode を明示せず rollback-journal のまま DB を作ると、opener の
+        // `Database::open` が init() 冒頭の `PRAGMA journal_mode = WAL;` の時点で
+        // (holder が RESERVED lock を保持している間) 即座に失敗し、本テストが本来
+        // 検証したい `begin_immediate_tx` (BEGIN IMMEDIATE) の待機ロジックに到達すらしない。
+        // kb-mcp が作成した DB は初回 open で WAL がファイルヘッダに永続化される
+        // ("kb-mcp が一度でも open した DB は常に WAL" が実運用の不変条件) ため、
+        // fixture 側で WAL を事前設定することが実運用条件に忠実な再現になる。次にこの
+        // テストを触る人が同じ切り分けを繰り返さないための記録。
+        let dir = TempDir::new("fts-lock");
+        let path = dir.path().join("k.db");
+        let path_str = path.to_string_lossy().to_string();
+        create_legacy_2col_fts_db(&path_str);
+
+        let (tx_locked, rx_locked) = std::sync::mpsc::channel::<()>();
+        let (tx_release, rx_release) = std::sync::mpsc::channel::<()>();
+
+        let holder_path = path_str.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&holder_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // RESERVED write lock を実際に取る (INSERT で write intent)
+            conn.execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO index_meta (key, value) VALUES ('lock_probe', '1');",
+            )
+            .unwrap();
+            tx_locked.send(()).unwrap(); // ロック保持を通知
+            rx_release.recv().unwrap(); // release 指示を待つ
+            conn.execute_batch("COMMIT;").unwrap();
+        });
+
+        rx_locked.recv().unwrap(); // holder が write lock を取るまで待つ
+        let opener_path = path_str.clone();
+        let opener = std::thread::spawn(move || Database::open(&opener_path));
+        // opener が migration の BEGIN IMMEDIATE で block するのを少し待ってから release。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx_release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let db = opener
+            .join()
+            .unwrap()
+            .expect("open must succeed after lock released within busy_timeout");
+        assert!(
+            fts_has_context_col(&db),
+            "migration must complete after lock wait"
         );
     }
 }
