@@ -2771,7 +2771,7 @@ mod tests {
                         i as i32,
                         Some("h"),
                         None,
-                        "c",None,
+                        "c", None,
                         &dummy_embedding((i as f32) * 0.001),
                         1.0,
                     )

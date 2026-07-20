@@ -1,6 +1,4 @@
-#![cfg(target_os = "windows")]
-
-use crate::state::StatusDot;
+﻿use crate::state::StatusDot;
 use anyhow::{Context, Result};
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -100,3 +98,4 @@ fn load_icon(png_bytes: &[u8]) -> Result<Icon> {
     let (w, h) = img.dimensions();
     Icon::from_rgba(img.into_raw(), w, h).context("Icon::from_rgba")
 }
+

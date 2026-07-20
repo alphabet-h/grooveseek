@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 //! Shell:startup `.lnk` shortcut install/uninstall via PowerShell
 //! `WScript.Shell` COM. Re-uses the same `powershell.exe` invocation path
 //! established by feature-43 (kb-mcp/src/service/windows.rs), so no new

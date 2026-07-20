@@ -1,6 +1,4 @@
-#![cfg(target_os = "windows")]
-
-use anyhow::{Context, Result};
+﻿use anyhow::{Context, Result};
 use std::time::Duration;
 
 /// `kb-mcp-<service>` is the Task Scheduler task name registered by
@@ -77,3 +75,4 @@ mod tests {
         assert_eq!(escape_single_quote("''"), "''''");
     }
 }
+

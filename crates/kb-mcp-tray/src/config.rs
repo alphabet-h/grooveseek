@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;

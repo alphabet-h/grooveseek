@@ -1,6 +1,4 @@
-#![cfg(target_os = "windows")]
-
-use anyhow::{Context, Result};
+﻿use anyhow::{Context, Result};
 
 /// Launch the user's default browser at `ui_url` (= `Config::ui_url`,
 /// pre-built in config.rs so we never re-derive it from `base_url`).
@@ -15,3 +13,4 @@ pub fn open_web_ui(ui_url: &str) -> Result<()> {
         .context("spawn cmd /c start")?;
     Ok(())
 }
+
