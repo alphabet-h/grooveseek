@@ -397,9 +397,13 @@ larger body enough enough enough enough enough enough enough.";
     #[test]
     fn test_context_50char_merge_keeps_first_ancestry() {
         // E-9: 50-char merge 後 chunk は最初に出現した heading の ancestry を維持
-        let md =
-            "## Big\n\nshort.\n\n### Sub\n\nlarger body enough enough enough enough enough enough.";
+        // Sub の content は 50 字未満に保つ (merge 条件 `content.len() < 50` を
+        // 実際に踏ませるため。50 字以上だと merge 自体が起きず本テストの意図が
+        // 検証できない = レビュー指摘の Medium 修正)。
+        let md = "## Big\n\nshort.\n\n### Sub\n\nlarger body enough enough enough enough.";
         let doc = parse_ctx(md, "T", &[]);
+        // merge が実際に発生し、chunk が1個に collapse していることを確認
+        assert_eq!(doc.chunks.len(), 1);
         let merged = doc.chunks.first().unwrap();
         assert_eq!(merged.heading.as_deref(), Some("Big"));
         // merge 後も Big の ancestry (= title のみ) を保持
