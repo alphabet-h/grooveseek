@@ -84,8 +84,11 @@ pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 ///
 /// 例: `build_context(&["設計ノート", "検索パイプライン", "RRF の実装"])`
 ///     → `Some("設計ノート > 検索パイプライン > RRF の実装")`
+// PR-1 時点では parser からの呼び出しが未実装のため未使用。
+// Task 1.3 以降で消費される (feature-46)。
+#[allow(dead_code)]
 pub(crate) fn build_context(parts: &[&str]) -> Option<String> {
-    /// BGE-small の 512 token 制限保護 + 異常に長い見出しへの防御 (spec D-11)。
+    // BGE-small の 512 token 制限保護 + 異常に長い見出しへの防御 (spec D-11)。
     const MAX_CONTEXT_CHARS: usize = 200;
 
     let mut out: Vec<&str> = Vec::with_capacity(parts.len());
