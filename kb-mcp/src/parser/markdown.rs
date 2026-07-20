@@ -197,6 +197,7 @@ fn chunk_body(body: &str, excludes: &[&str]) -> Vec<Chunk> {
                 heading,
                 level,
                 content,
+                context: None,
             }
         })
         .collect()

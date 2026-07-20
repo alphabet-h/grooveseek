@@ -144,6 +144,7 @@ fn parse_xlsx_bytes_capped(
             heading: Some(format!("Sheet: {name}")),
             level: Some(2),
             content: text.trim_end().to_string(),
+            context: None,
         });
     }
 
@@ -284,6 +285,7 @@ fn parse_xls_bytes_capped(
             heading: Some(format!("Sheet: {name}")),
             level: Some(2),
             content: text.trim_end().to_string(),
+            context: None,
         });
     }
 

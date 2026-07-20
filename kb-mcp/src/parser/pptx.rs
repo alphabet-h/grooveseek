@@ -112,6 +112,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             heading: Some(heading),
             level: Some(2),
             content: content.trim().to_string(),
+            context: None,
         });
     }
 

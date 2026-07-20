@@ -166,6 +166,7 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
             heading: s.heading,
             level: s.level,
             content: s.body,
+            context: None,
         })
         .collect()
 }

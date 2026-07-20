@@ -34,6 +34,7 @@ impl Parser for TxtParser {
                 heading: None,
                 level: None,
                 content: body,
+                context: None,
             }]
         };
 

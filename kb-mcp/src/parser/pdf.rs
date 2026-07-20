@@ -142,6 +142,7 @@ impl Parser for PdfParser {
                 heading: Some(format!("p.{}", i + 1)),
                 level: None,
                 content,
+                context: None,
             });
         }
 

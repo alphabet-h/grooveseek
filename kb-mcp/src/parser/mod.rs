@@ -55,10 +55,15 @@ pub struct Chunk {
     pub index: usize,
     pub heading: Option<String>,
     /// Markdown 見出しレベル (h2=2, h3=3)。heading が None の場合や、
-    /// 見出し概念のない parser (.txt 等) では None。Parent retriever や
-    /// 将来の Contextual Retrieval (A-1) で hierarchy を利用する。
+    /// 見出し概念のない parser (.txt 等) では None。Parent retriever で
+    /// hierarchy を利用する。
     pub level: Option<u8>,
     pub content: String,
+    /// 静的 context (パンくず)。feature-46。index 時に embedding + FTS + reranker
+    /// 入力へ注入する検索 signal 専用フィールド。API 返却には露出しない。
+    /// 例: "設計ノート > 検索パイプライン > RRF の実装"。
+    /// None = context なし (生成不能ケース / 旧 parser 実装)。
+    pub context: Option<String>,
 }
 
 /// A fully parsed document: frontmatter + chunks + retained raw content.
@@ -124,6 +129,7 @@ pub(crate) fn build_context(parts: &[&str]) -> Option<String> {
 pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
     let body = raw.replace("\r\n", "\n").replace('\r', "\n");
     let title = txt::derive_title_pub(path_hint);
+    let context = build_context(&[title.as_deref().unwrap_or("")]);
     let chunks = if body.trim().is_empty() {
         Vec::new()
     } else {
@@ -132,6 +138,7 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
             heading: None,
             level: None,
             content: body,
+            context,
         }]
     };
     ParsedDocument {
@@ -264,6 +271,7 @@ mod tests {
         assert!(c.heading.is_none());
         assert!(c.level.is_none());
         assert_eq!(c.content, "");
+        assert!(c.context.is_none()); // feature-46: default は None
     }
 
     #[test]
@@ -315,7 +323,10 @@ mod tests {
     #[test]
     fn test_build_context_skips_consecutive_duplicates() {
         // E-2: title と h1 が同一 → 1 回のみ
-        assert_eq!(build_context(&["Foo", "Foo", "bar"]).as_deref(), Some("Foo > bar"));
+        assert_eq!(
+            build_context(&["Foo", "Foo", "bar"]).as_deref(),
+            Some("Foo > bar")
+        );
     }
 
     #[test]
