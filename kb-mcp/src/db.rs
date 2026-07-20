@@ -1623,8 +1623,7 @@ impl Database {
     }
 
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
-    /// 未 index / title NULL は `None`。Task 2.5/2.7 で消費される (現時点では未配線)。
-    #[allow(dead_code)]
+    /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
         let title: Option<Option<String>> = self

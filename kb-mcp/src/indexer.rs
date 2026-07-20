@@ -422,6 +422,18 @@ pub fn rebuild_index(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// embedding 入力を組む (feature-46 §4.5)。Static かつ context ありなら
+/// `context\n\ncontent`、それ以外 (Off / context なし) は content のみ。
+/// Anthropic 原典 cookbook の結合形 `f"{context}\n\n{chunk}"` に忠実。
+fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
+    match (mode, chunk.context.as_deref()) {
+        (ContextMode::Static, Some(ctx)) if !ctx.trim().is_empty() => {
+            format!("{ctx}\n\n{}", chunk.content)
+        }
+        _ => chunk.content.clone(),
+    }
+}
+
 /// 単一 DiskEntry を index する内部関数。
 /// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
@@ -435,9 +447,6 @@ fn index_single_disk_entry(
     force: bool,
     context_mode: ContextMode,
 ) -> Result<SingleResult> {
-    // feature-46 Task 2.7 で embed 合成 / insert_chunk 充填に使う。
-    // 本 task (2.5) では resolve 済みの mode を受け取って通すだけ。
-    let _ = context_mode;
     // Skip unchanged files unless forced.
     // rename で path UPDATE 済のものは「DB 側 hash == disk hash」なので
     // ここで自然に skip される (embedding 再計算なし)。
@@ -498,7 +507,15 @@ fn index_single_disk_entry(
     // 再 embedding せず documents 行のメタ (title/date/tags/topic/depth) と
     // content_hash のみ UPDATE する。BGE-M3 では数百 ms 〜秒規模の節約。
     // force=true / 新規ファイル / chunk 数変化は対象外。
+    //
+    // E-8: Static モードでは context が title 由来。title が変わったら frontmatter-only
+    // skip を取らず全 chunk を re-embed する (stale context 防止)。Off では context を
+    // embed しないので title 変更は無害 = 従来通り meta-only 更新でよい。
+    let title_unchanged = context_mode != ContextMode::Static
+        || db.get_document_title(&entry.rel)?.as_deref() == parsed.frontmatter.title.as_deref();
+
     if !force
+        && title_unchanged
         && let Ok(existing) = db.chunk_texts_for_path(&entry.rel)
         && !existing.is_empty()
         && existing.len() == parsed.chunks.len()
@@ -528,7 +545,13 @@ fn index_single_disk_entry(
     // Embed first, *outside* the DB tx — fastembed inference can take
     // hundreds of ms (BGE-small) or seconds (BGE-M3) per file, and we don't
     // want a long-lived write tx blocking concurrent readers in WAL mode.
-    let texts: Vec<&str> = parsed.chunks.iter().map(|c| c.content.as_str()).collect();
+    // feature-46: Static モードでは context を前置して embed する (§4.5)。
+    let embed_inputs: Vec<String> = parsed
+        .chunks
+        .iter()
+        .map(|c| embed_input_for(c, context_mode))
+        .collect();
+    let texts: Vec<&str> = embed_inputs.iter().map(String::as_str).collect();
     let embeddings = embedder
         .embed_texts(&texts)
         .with_context(|| format!("failed to embed chunks for {}", entry.rel))?;
@@ -555,13 +578,17 @@ fn index_single_disk_entry(
             &chunk.content,
             parser.is_binary(),
         );
+        let context = match context_mode {
+            ContextMode::Static => chunk.context.as_deref(),
+            ContextMode::Off => None,
+        };
         db.insert_chunk(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
             chunk.level,
             &chunk.content,
-            None, // PR-1: context は充填しない (PR-2 の context_mode 導入と同時に開始)
+            context,
             embedding,
             score,
         )?;
@@ -1629,5 +1656,42 @@ mod tests {
         let m = resolve_context_mode(&db, ContextMode::Static, true).unwrap();
         assert_eq!(m, ContextMode::Static);
         assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+    }
+
+    // -----------------------------------------------------------------------
+    // embed_input_for (feature-46 Task 2.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_embed_input_static_prepends_context() {
+        // clippy::field_reassign_with_default を避けるため struct literal で構築
+        // (ロジック / assert 文言は brief のテストと不変)。
+        let ch = crate::parser::Chunk {
+            content: "body".to_string(),
+            context: Some("T > H".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(embed_input_for(&ch, ContextMode::Static), "T > H\n\nbody");
+    }
+
+    #[test]
+    fn test_embed_input_off_is_content_only() {
+        let ch = crate::parser::Chunk {
+            content: "body".to_string(),
+            context: Some("T > H".to_string()),
+            ..Default::default()
+        };
+        // Off モードは parser が context を生成していても content のみ
+        assert_eq!(embed_input_for(&ch, ContextMode::Off), "body");
+    }
+
+    #[test]
+    fn test_embed_input_static_none_context_is_content_only() {
+        let ch = crate::parser::Chunk {
+            content: "body".to_string(),
+            context: None,
+            ..Default::default()
+        };
+        assert_eq!(embed_input_for(&ch, ContextMode::Static), "body");
     }
 }
