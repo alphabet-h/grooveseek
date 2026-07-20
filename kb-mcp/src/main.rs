@@ -536,6 +536,14 @@ fn main() -> anyhow::Result<()> {
             // serve 起動時にここから clone して KbServer に保持する。
             let search_config = cfg.search.clone().unwrap_or_default();
 
+            // feature-46: index 時と同じロジックで desired context mode を算出する。
+            let context_mode_desired =
+                if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                    kb_mcp::db::ContextMode::Static
+                } else {
+                    kb_mcp::db::ContextMode::Off
+                };
+
             // evaluator 指摘 High #2: `--bind` / `--port` が指定されているのに
             // 実効 transport が Stdio なら silent ignore は footgun なので reject。
             if matches!(resolved_transport, kb_mcp::transport::Transport::Stdio)
@@ -564,6 +572,7 @@ fn main() -> anyhow::Result<()> {
                     min_confidence_ratio,
                     search_config,
                     source,
+                    context_mode_desired,
                 )
                 .await
             })?;
@@ -595,6 +604,12 @@ fn main() -> anyhow::Result<()> {
             let exclude_dirs = cfg.resolve_exclude_dirs();
             let progress_reporter =
                 kb_mcp::indexer::progress::ProgressReporter::from_cli_flags(quiet, progress);
+            let context_mode_desired =
+                if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+                    kb_mcp::db::ContextMode::Static
+                } else {
+                    kb_mcp::db::ContextMode::Off
+                };
             let result = kb_mcp::indexer::rebuild_index(
                 &db,
                 &mut embedder,
@@ -604,6 +619,7 @@ fn main() -> anyhow::Result<()> {
                 &exclude_dirs,
                 &registry,
                 progress_reporter,
+                context_mode_desired,
             )?;
             eprintln!(
                 "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped), {} chunks",
@@ -634,6 +650,8 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Documents: {total_docs}");
             eprintln!("Chunks: {total_chunks}");
             eprintln!("Tags parse failures: {tags_failures}");
+            let context_mode = db.read_context_mode()?.map(|m| m.as_str()).unwrap_or("off");
+            eprintln!("Context mode: {context_mode}");
             // Quality filter: 設定済みの threshold で filter される件数を表示
             let qf = cfg.quality_filter.clone().unwrap_or_default();
             let threshold = qf.effective_threshold();

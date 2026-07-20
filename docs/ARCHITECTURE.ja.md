@@ -66,6 +66,25 @@ db.rs: chunks (メタデータ) + vec_chunks (embedding)
 
 v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent retriever → match_spans`**。各段は対応する設定が off なら no-op となるため、既定では v0.7.0 以前の挙動に等しい。narrative は [retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) を参照。
 
+## Contextual Retrieval (v0.12.0+)
+
+静的 Contextual Retrieval (feature-46) は、各チャンクが embedder / FTS index / reranker に渡る前に、ドキュメント構造由来の breadcrumb を前置する機能。すべて index 時に LLM 呼び出しなしで決定論的に生成される。`[contextual].enabled` で on/off する (v0.12.0 時点の既定は **off** ―― judgment gate の結果として false-by-default に転換した経緯は README の「Contextual Retrieval」節の A/B 数値を参照)。
+
+- **`Chunk.context: Option<String>`** (`src/parser/mod.rs`) は検索用の内部フィールドで、`search` / `get_document` の返却には一切現れない。`build_context(parts: &[&str]) -> Option<String>` が空要素・連続重複要素を skip しつつ `" > "` で結合し、BGE-small の 512 token 入力制限を守るため 200 文字 (char boundary 安全) で cap する。
+- **2 系統の ancestry 生成**。コードベース内の parser 形状にそのまま対応する:
+  1. **Markdown** (`src/parser/markdown.rs`): level をキーにした ancestry `stack: Vec<(u8, String)>` を、見出し遷移のたびに現在の見出しの深さまで pop してから push する (h2→h4 のような level 飛びでも、架空の h3 を補わず最も近い浅い祖先を継承する)。`exclude_headings` で除外された見出しも stack には積まれる (除外セクション自体は chunk を生成しないが、その子孫の ancestry は正しく保たれる)。`context = build_context(&[title, ...ancestry, heading])`。
+  2. **バイナリ / フラット形式** (PDF のページ chunk、Office の単一セクション chunk、プレーン `.txt`。`parser::single_text_chunk` および各形式の chunker 経由): これらは辿るべき見出し階層を持たないため、`[title]` のみの単層 context になる。
+- **`chunks.context_text TEXT`** (`src/db.rs`): nullable 列。feature-46 以前の DB には idempotent な `ensure_context_text_column` の `ALTER TABLE` で追加される。現在の `ContextMode` が `Static` のときのみ `Chunk.context` から埋まり、`Off` モードでは `NULL` のまま。
+- **`fts_chunks` の第 3 列** `context` (`heading` / `content` に加えて): 2 列の legacy index は `ensure_fts_context_column` で migration される ―― virtual table を drop + 再作成し、`INSERT ... SELECT id, heading, COALESCE(context_text, ''), content FROM chunks` で repopulate する。並行 opener との競合を避けるため `BEGIN IMMEDIATE` トランザクション (`begin_immediate_tx`) でラップする。この repopulate は write lock を保持し続ける処理で、574 doc / 10,002 chunks の KB を embedding + reranker モデル同時ロード中の並行負荷下で計測したところ 9.7〜12.3s かかったため、`Database::init` は `busy_timeout` を 30,000ms に設定している (v0.12.0 で 10s から引き上げ)。これにより `serve` 常駐プロセスの `search` / `status` が、進行中の migration を `SQLITE_BUSY` で即失敗せず待機できる。Contextual BM25 のスコアリングは `bm25(fts_chunks, heading_weight, context_weight, content_weight)` 呼び出しの `context_weight` を `FTS_BM25_CONTEXT_WEIGHT = 1.0` として重み付けする。
+- **embedding 入力の合成** (`indexer::embed_input_for`): `Static` モードかつ context が非空なら embedder には `"{context}\n\n{content}"` を渡す。それ以外 (`Off` モード、または context 未生成) は従来通り `content` のみを渡す ―― embedding 入力が v0.12.0 以前と異なるのはここだけ。
+- **reranker 入力の合成** (`embedder::contextualize_for_rerank`): `db.rs` の検索クエリから `SearchResult` が `context_text` を最後まで運び、reranker は候補ごとに同じ `"{context}\n\n{content}"` を合成してからスコアリングする。`context_text` 自体は MCP / CLI 呼び出し元に届く前に response から取り除かれる ―― あくまで内部のランキング signal に過ぎない。
+- **`index_meta.context_mode` の versioning** (`ContextMode::{Off, Static}`、`db::read_context_mode` / `write_context_mode`、`indexer::resolve_context_mode`): embedding 空間が意図せず混在した index を作らないよう、config の「desired」モードより DB に記録済みの「実際に構築された」モードを優先する。
+  - `--force`: desired モードを無条件に採用して記録する (`reset_for_model` 直後の DB は空)。
+  - `--force` なし、DB に記録済みモードがあり desired と異なる: **DB のモードを維持**し、`kb-mcp index --force` を促す警告を stderr に出す。
+  - `--force` なし、記録済みモードなし (`index_meta` に `context_mode` キーが無い、feature-46 以前の genuine な DB): DB に既に chunk があれば (= この機能より前からある既存 index) `Off` へ grandfather し、DB が空 (= 新規 index) なら desired モードを採用する。
+  - `kb-mcp status` は `read_context_mode` の値をそのまま `Context mode: static` / `Context mode: off` として stderr に出力する。
+- `main.rs` は `serve` / `index` の両方で `cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false)` から同一ロジックで desired モードを算出する。この `unwrap_or(false)` は `ContextualConfig::default()` と一致させてあり、`[contextual]` セクション省略時と明示的な `enabled = false` が同じ挙動になる。
+
 ## Embedding キャッシュの解決
 
 `embedder.rs::resolve_cache_dir()` が以下の順で解決する:

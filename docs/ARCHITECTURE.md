@@ -67,6 +67,25 @@ At query time the `search` tool runs a hybrid:
 
 The full v0.7.0 pipeline is **`RRF → reranker → MMR → parent retriever → match_spans`**. Each stage is a no-op when its config is off, so the pipeline collapses to pre-v0.7.0 behavior by default. See [retrieval-pipeline.md](./retrieval-pipeline.md) for the narrative.
 
+## Contextual Retrieval (v0.12.0+)
+
+Static Contextual Retrieval (feature-46) prepends a document-structure breadcrumb to each chunk before it reaches the embedder / FTS index / reranker, entirely at index time and with no LLM call. Gated by `[contextual].enabled` (default **off** as of v0.12.0 — a `false`-by-default judgment gate result, see the README's "Contextual Retrieval" section for the A/B numbers that drove it).
+
+- **`Chunk.context: Option<String>`** (`src/parser/mod.rs`) is a search-only field, never returned by `search` / `get_document`. `build_context(parts: &[&str]) -> Option<String>` joins non-empty, non-consecutive-duplicate parts with `" > "`, capped at 200 chars (char-boundary safe) to bound BGE-small's 512-token input.
+- **Two ancestry generation families**, matching the two parser shapes in the codebase:
+  1. **Markdown** (`src/parser/markdown.rs`): a level-keyed ancestry `stack: Vec<(u8, String)>` is popped down to the current heading's depth on every heading transition (so an h2→h4 level jump inherits the nearest shallower ancestor, not a synthetic h3), then pushed with the new heading — excluded headings (`exclude_headings`) are still pushed onto the stack so descendants keep correct ancestry even though the excluded section itself produces no chunk. `context = build_context(&[title, ...ancestry, heading])`.
+  2. **Binary / flat formats** (PDF page chunks, Office single-section chunks, plain `.txt`, via `parser::single_text_chunk` and the per-format chunkers): a single-level context of `[title]` only — these formats have no nested heading hierarchy to walk.
+- **`chunks.context_text TEXT`** (`src/db.rs`): nullable column, added via the idempotent `ensure_context_text_column` `ALTER TABLE` for pre-feature-46 DBs. Populated from `Chunk.context` only when the active `ContextMode` is `Static`; stays `NULL` in `Off` mode.
+- **FTS5 third column** `context` on `fts_chunks` (alongside `heading` / `content`): a legacy 2-column index is migrated via `ensure_fts_context_column` — drop + recreate the virtual table, then repopulate with `INSERT ... SELECT id, heading, COALESCE(context_text, ''), content FROM chunks`, wrapped in a `BEGIN IMMEDIATE` transaction (`begin_immediate_tx`) to serialize against concurrent openers. The migration holds the write lock for the full repopulate (measured 9.7–12.3s under concurrent embedding/reranker load on a 574-doc / 10,002-chunk KB), so `Database::init` sets `busy_timeout = 30_000ms` (raised from 10s in v0.12.0) so a `serve`-resident process's `search` / `status` waits out an in-flight migration instead of failing with `SQLITE_BUSY`. Contextual BM25 scoring weights the `context` column via `FTS_BM25_CONTEXT_WEIGHT = 1.0` in the `bm25(fts_chunks, heading_weight, context_weight, content_weight)` call.
+- **Embedding input composition** (`indexer::embed_input_for`): in `Static` mode with a non-empty context, the embedder receives `"{context}\n\n{content}"`; otherwise (Off mode, or no context available) it receives `content` unchanged — this is the only place the embedding input differs from pre-v0.12.0 behavior.
+- **Reranker input composition** (`embedder::contextualize_for_rerank`): `SearchResult` carries `context_text` end-to-end from `db.rs`'s search queries; the reranker composes the same `"{context}\n\n{content}"` string per candidate before scoring. `context_text` itself is stripped from the response before it reaches the MCP/CLI caller — it is purely an internal ranking signal.
+- **`index_meta.context_mode` versioning** (`ContextMode::{Off, Static}`, `db::read_context_mode` / `write_context_mode`, `indexer::resolve_context_mode`): the DB's *actual* built mode is authoritative over the config's *desired* mode to avoid silently mixing embedding spaces mid-index.
+  - `--force`: adopt the desired mode unconditionally (the DB was just reset by `reset_for_model`) and record it.
+  - No `--force`, DB already has a recorded mode that differs from desired: **stay in the DB's mode**, print a stderr warning pointing at `kb-mcp index --force`.
+  - No `--force`, no recorded mode (a genuine pre-feature-46 DB, `index_meta` has no `context_mode` key): grandfather to `Off` if the DB already has chunks (an existing index that predates this feature), or adopt the desired mode if the DB is empty (a brand-new index).
+  - `kb-mcp status` prints `Context mode: static` / `Context mode: off` on stderr, sourced directly from `read_context_mode`.
+- `main.rs` computes the desired mode identically for both `serve` and `index` from `cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false)` — the `unwrap_or(false)` mirrors `ContextualConfig::default()` so an absent `[contextual]` section and an explicit `enabled = false` behave identically.
+
 ## Embedding cache resolution
 
 `embedder.rs::resolve_cache_dir()` picks in order:

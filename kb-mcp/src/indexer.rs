@@ -282,6 +282,7 @@ pub fn rebuild_index(
     exclude_dirs: &[String],
     registry: &Registry,
     mut progress: progress::ProgressReporter,
+    context_mode_desired: ContextMode,
 ) -> Result<IndexResult> {
     let start = Instant::now();
 
@@ -302,6 +303,17 @@ pub fn rebuild_index(
     if quality_updated > 0 {
         eprintln!("Backfilled {quality_updated} chunks with quality scores");
     }
+
+    // feature-46: effective context mode を解決 (force / grandfather / warn を含む)。
+    // codex P2 (PR #73 F1): force 時は resolve より前に必ず DB を reset する
+    // (詳細は reset_and_resolve_context_mode のコメント参照)。
+    let context_mode = reset_and_resolve_context_mode(
+        db,
+        embedder.model_id(),
+        embedder.dimension() as u32,
+        context_mode_desired,
+        force,
+    )?;
 
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
@@ -336,6 +348,15 @@ pub fn rebuild_index(
 
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
+    // codex P2 (PR #73 F3): rename 先の new_path を集めておく。Static モードでは
+    // rename された entry だけ下の loop で force 扱いにし、same-hash fast path
+    // (index_single_disk_entry 冒頭の hash 一致 skip) を意図的に無効化する。
+    // rename は path UPDATE のみで内容 (hash) は変わらないため、そのまま fast
+    // path に乗ると、frontmatter title 無し文書で context 用 title が filename
+    // stem 由来 (E-1) にもかかわらず再 parse されず、breadcrumb (chunk.context)
+    // が旧 filename のまま stale 化する。Off モードは context を embed に使わない
+    // ため無害 = 従来通り fast path を維持する。
+    let mut renamed_new_paths: HashSet<String> = HashSet::new();
     let renamed: u32 = if force {
         0
     } else {
@@ -346,6 +367,9 @@ pub fn rebuild_index(
         db.rename_documents_atomic(&pairs)?;
         for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
+            if context_mode == ContextMode::Static {
+                renamed_new_paths.insert(new_path.clone());
+            }
         }
         pairs.len() as u32
     };
@@ -358,7 +382,19 @@ pub fn rebuild_index(
     for entry in &disk_entries {
         visited_paths.insert(entry.rel.clone());
 
-        match index_single_disk_entry(db, embedder, entry, exclude_headings, registry, force)? {
+        // rename された entry (Static モードのみ) は force=true で再 parse/embed
+        // させ、他の unchanged file の hash fast path はそのまま活かす。
+        let entry_force = force || renamed_new_paths.contains(&entry.rel);
+
+        match index_single_disk_entry(
+            db,
+            embedder,
+            entry,
+            exclude_headings,
+            registry,
+            entry_force,
+            context_mode,
+        )? {
             SingleResult::Updated { chunks } => {
                 updated += 1;
                 progress.report_indexed(&entry.rel, chunks);
@@ -409,6 +445,18 @@ pub fn rebuild_index(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// embedding 入力を組む (feature-46 §4.5)。Static かつ context ありなら
+/// `context\n\ncontent`、それ以外 (Off / context なし) は content のみ。
+/// Anthropic 原典 cookbook の結合形 `f"{context}\n\n{chunk}"` に忠実。
+fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
+    match (mode, chunk.context.as_deref()) {
+        (ContextMode::Static, Some(ctx)) if !ctx.trim().is_empty() => {
+            format!("{ctx}\n\n{}", chunk.content)
+        }
+        _ => chunk.content.clone(),
+    }
+}
+
 /// 単一 DiskEntry を index する内部関数。
 /// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
@@ -420,6 +468,7 @@ fn index_single_disk_entry(
     exclude_headings: Option<&[String]>,
     registry: &Registry,
     force: bool,
+    context_mode: ContextMode,
 ) -> Result<SingleResult> {
     // Skip unchanged files unless forced.
     // rename で path UPDATE 済のものは「DB 側 hash == disk hash」なので
@@ -481,15 +530,48 @@ fn index_single_disk_entry(
     // 再 embedding せず documents 行のメタ (title/date/tags/topic/depth) と
     // content_hash のみ UPDATE する。BGE-M3 では数百 ms 〜秒規模の節約。
     // force=true / 新規ファイル / chunk 数変化は対象外。
-    if !force
-        && let Ok(existing) = db.chunk_texts_for_path(&entry.rel)
-        && !existing.is_empty()
-        && existing.len() == parsed.chunks.len()
-        && existing
-            .iter()
-            .zip(parsed.chunks.iter())
-            .all(|((eh, ec), c)| eh.as_deref() == c.heading.as_deref() && *ec == c.content)
-    {
+    //
+    // codex P2 round 2 (finding B, 根治): 旧実装は「frontmatter.title の変化」
+    // だけを個別に検知する専用 gate (title_unchanged、`get_document_title` の
+    // 追加 SELECT) を持っていたが、title 以外の要因で context breadcrumb が
+    // 変わるケース (例: exclude_headings 変更で見出し構造が変わる) を検知
+    // できなかった (E-8 の不完全な包摂)。Static モードでは (heading, content)
+    // に加えて context_text も比較対象へ含めることで、context に影響し得る
+    // あらゆる変化を一括して検知する (title 変化もこれに包摂される)。これに
+    // より専用 title_unchanged gate と冗長な `get_document_title` SELECT は
+    // 不要になったため撤去した。Off モードは context を embed/保存しないため、
+    // 従来通り (heading, content) のみで比較する (挙動不変)。
+    let chunks_unchanged = if context_mode == ContextMode::Static {
+        db.chunk_texts_with_context_for_path(&entry.rel)
+            .map(|existing| {
+                !existing.is_empty()
+                    && existing.len() == parsed.chunks.len()
+                    && existing
+                        .iter()
+                        .zip(parsed.chunks.iter())
+                        .all(|((eh, ec, ectx), c)| {
+                            eh.as_deref() == c.heading.as_deref()
+                                && *ec == c.content
+                                && ectx.as_deref() == c.context.as_deref()
+                        })
+            })
+            .unwrap_or(false)
+    } else {
+        db.chunk_texts_for_path(&entry.rel)
+            .map(|existing| {
+                !existing.is_empty()
+                    && existing.len() == parsed.chunks.len()
+                    && existing
+                        .iter()
+                        .zip(parsed.chunks.iter())
+                        .all(|((eh, ec), c)| {
+                            eh.as_deref() == c.heading.as_deref() && *ec == c.content
+                        })
+            })
+            .unwrap_or(false)
+    };
+
+    if !force && chunks_unchanged {
         let updated = db.update_document_meta(
             &entry.rel,
             parsed.frontmatter.title.as_deref(),
@@ -511,7 +593,13 @@ fn index_single_disk_entry(
     // Embed first, *outside* the DB tx — fastembed inference can take
     // hundreds of ms (BGE-small) or seconds (BGE-M3) per file, and we don't
     // want a long-lived write tx blocking concurrent readers in WAL mode.
-    let texts: Vec<&str> = parsed.chunks.iter().map(|c| c.content.as_str()).collect();
+    // feature-46: Static モードでは context を前置して embed する (§4.5)。
+    let embed_inputs: Vec<String> = parsed
+        .chunks
+        .iter()
+        .map(|c| embed_input_for(c, context_mode))
+        .collect();
+    let texts: Vec<&str> = embed_inputs.iter().map(String::as_str).collect();
     let embeddings = embedder
         .embed_texts(&texts)
         .with_context(|| format!("failed to embed chunks for {}", entry.rel))?;
@@ -538,13 +626,17 @@ fn index_single_disk_entry(
             &chunk.content,
             parser.is_binary(),
         );
+        let context = match context_mode {
+            ContextMode::Static => chunk.context.as_deref(),
+            ContextMode::Off => None,
+        };
         db.insert_chunk(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
             chunk.level,
             &chunk.content,
-            None, // PR-1: context は充填しない (PR-2 の context_mode 導入と同時に開始)
+            context,
             embedding,
             score,
         )?;
@@ -614,7 +706,17 @@ pub fn reindex_single_file(
         hash,
         full,
     };
-    index_single_disk_entry(db, embedder, &entry, exclude_headings, registry, false)
+    // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
+    let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    index_single_disk_entry(
+        db,
+        embedder,
+        &entry,
+        exclude_headings,
+        registry,
+        false,
+        context_mode,
+    )
 }
 
 /// 指定 path の document / chunks を DB から削除する。
@@ -700,12 +802,42 @@ pub fn rename_single_file(
     let new_bytes =
         std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
     let new_hash = sha256_hex_bytes(&new_bytes);
-    if new_hash == old_hash {
+
+    // codex P2 round 2 (finding A): watcher は config-desired を持たないので
+    // DB 側モードに従う (`reindex_single_file` と同じ E-11 の規則)。
+    // rebuild_index の一括 rename (F3, PR #73) と同じ理由で、Static モードでは
+    // same-hash fast path を無効化する: rename は内容 (hash) を変えないが、
+    // Static モードでは frontmatter title が無い文書の context breadcrumb が
+    // filename stem 由来 (E-1) のため、再 parse しない限り旧 filename のまま
+    // stale 化してしまう。Off モードは context を embed に使わないため無害 =
+    // 従来通り fast path を維持する。
+    let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    let same_hash = new_hash == old_hash;
+    if same_hash && context_mode != ContextMode::Static {
         return Ok(RenameOutcome::Renamed);
     }
 
-    // 内容も変わっているので新 path で reindex
-    match reindex_single_file(db, embedder, kb_path, new_rel, exclude_headings, registry)? {
+    // 内容が変わっている、または (Static モードの same-hash rename として)
+    // breadcrumb 更新のため強制的に再 embed する。size-cap 判定は既に上で
+    // 済んでいるので、読み込み済みの bytes/hash をそのまま再利用して
+    // 二重 read を避ける (`reindex_single_file` を経由すると全 read をやり直す)。
+    let entry = DiskEntry {
+        rel: new_rel.to_string(),
+        hash: new_hash,
+        full,
+    };
+    // same_hash (= Static-mode-forced) の場合のみ force=true で
+    // hash 一致 fast path をバイパスする。内容が変わっている場合は
+    // 通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
+    match index_single_disk_entry(
+        db,
+        embedder,
+        &entry,
+        exclude_headings,
+        registry,
+        same_hash,
+        context_mode,
+    )? {
         SingleResult::Updated { chunks } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         _ => Ok(RenameOutcome::Renamed),
     }
@@ -776,6 +908,102 @@ fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
         // "deep-dive/chromadb/overview.md" or deeper — category + topic
         _ => (Some(parts[0].to_string()), Some(parts[1].to_string())),
     }
+}
+
+use crate::db::ContextMode;
+
+/// force / config-desired / DB-stored から effective context mode を決める (feature-46 §4.8)。
+/// 副作用: fresh/legacy/force のケースで `index_meta.context_mode` を記録する。
+/// mismatch (config は static 期待だが DB は off 等) は、index が空でなければ
+/// stderr へ warn し DB 側モードで継続する (embedding 空間の一貫性維持、混在
+/// index を作らない)。index が空 (chunk 0 件) なら守るべき embedding 空間が
+/// 存在しないため、代わりに desired を採用して記録を上書きする (codex P2
+/// round 3)。
+pub(crate) fn resolve_context_mode(
+    db: &Database,
+    desired: ContextMode,
+    force: bool,
+) -> Result<ContextMode> {
+    if force {
+        // reset_for_model 後 = DB は空。desired を採用して記録する。
+        db.write_context_mode(desired)?;
+        return Ok(desired);
+    }
+    match db.read_context_mode()? {
+        Some(stored) => {
+            if stored != desired {
+                // codex P2 round 3: mode が記録済みでも index が空 (chunk 0 件)
+                // なら、守るべき embedding 空間がそもそも存在しない。典型例は
+                // F2 fix (round 1) の副作用: `serve` 起動時に resolve_context_mode
+                // が fresh DB へ desired を書いた直後、まだ 1 件も index せずに
+                // user が `[contextual].enabled` を反転して再起動したケース。
+                // このとき stale な記録値を優先して `--force` を要求するのは
+                // 不合理なので、desired をそのまま採用して上書きする。
+                if db.chunk_count()? == 0 {
+                    db.write_context_mode(desired)?;
+                    eprintln!(
+                        "info: index is empty; adopting '{}' for empty index (was '{}').",
+                        desired.as_str(),
+                        stored.as_str()
+                    );
+                    return Ok(desired);
+                }
+                eprintln!(
+                    "warning: [contextual] config expects '{}' mode but this index was built \
+                     with '{}'. Run `kb-mcp index --force` to migrate; continuing in '{}' mode.",
+                    desired.as_str(),
+                    stored.as_str(),
+                    stored.as_str()
+                );
+            }
+            Ok(stored)
+        }
+        None => {
+            // key 不在: fresh DB (chunk 0) は desired、legacy DB (chunk > 0) は off に grandfather
+            let mode = if db.chunk_count()? > 0 {
+                ContextMode::Off
+            } else {
+                desired
+            };
+            db.write_context_mode(mode)?;
+            if mode != desired {
+                eprintln!(
+                    "warning: existing index has no context data; grandfathering to '{}'. \
+                     Run `kb-mcp index --force` to build a contextual index.",
+                    mode.as_str()
+                );
+            }
+            Ok(mode)
+        }
+    }
+}
+
+/// `force` 時に `resolve_context_mode` より前に必ず DB を reset してから解決する
+/// ラッパー (codex P2 on PR #73, finding F1)。
+///
+/// `resolve_context_mode(force=true)` は「呼ばれる時点で DB は既に空 (=
+/// `reset_for_model` 済み)」を前提に `desired` を即座に `index_meta` へ書く。
+/// CLI 経路 (`main.rs` の `Commands::Index`) はその前提を呼び出し側で満たして
+/// いたが、MCP `rebuild_index` tool (`server.rs`) はここに来るまで reset を
+/// 挟まないまま `rebuild_index(force=true)` を呼んでいた。そのため「新 mode を
+/// 記録した直後、まだ upsert していない旧 mode の chunk が残っている」状態で
+/// rebuild が abort すると、mixed index (meta は新 mode、chunk は旧 mode) に
+/// なり得た。呼び出し元 (`rebuild_index`) の先頭でこの関数を通すことで、
+/// force 時は必ず reset → resolve の順序を DB 層で強制する。
+///
+/// `reset_for_model` の DELETE は冪等なので、CLI 経路のように呼び出し側で
+/// 既に reset 済みの場合にここでもう一度呼んでも無害。
+pub(crate) fn reset_and_resolve_context_mode(
+    db: &Database,
+    model_id: &str,
+    dim: u32,
+    desired: ContextMode,
+    force: bool,
+) -> Result<ContextMode> {
+    if force {
+        db.reset_for_model(model_id, dim)?;
+    }
+    resolve_context_mode(db, desired, force)
 }
 
 /// Compute the hex-encoded SHA-256 digest of raw bytes. Byte-level hashing is the
@@ -1498,5 +1726,244 @@ mod tests {
             RenameOutcome::RenamedSizeCapped,
             RenameOutcome::OldPathMissing
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_context_mode (feature-46 Task 2.5)
+    // -----------------------------------------------------------------------
+
+    use crate::db::ContextMode;
+
+    #[test]
+    fn test_resolve_context_mode_fresh_db_adopts_desired() {
+        let db = test_db(); // 空 (chunk 0)
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(m, ContextMode::Static);
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+    }
+
+    #[test]
+    fn test_resolve_context_mode_legacy_db_grandfathers_to_off() {
+        let db = test_db();
+        // chunk を 1 件入れて legacy (key 不在 + chunk > 0) を作る
+        let doc_id = db
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(m, ContextMode::Off, "legacy DB grandfathers to off");
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Off));
+    }
+
+    #[test]
+    fn test_resolve_context_mode_stored_wins_over_desired() {
+        let db = test_db();
+        // codex P2 round 3: 「stored が desired に勝つ」のは index が空でない
+        // ときのみの挙動になったため (空 index は adopt する、次の test 参照)、
+        // この test の前提を「chunk が実在する non-empty index」に機械的に
+        // 更新する (assert! 文言 / 期待値は不変、fixture のみ追加)。
+        let doc_id = db
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(m, ContextMode::Off, "DB-stored mode wins on mismatch");
+    }
+
+    #[test]
+    fn test_resolve_context_mode_empty_index_adopts_desired_on_mismatch() {
+        // codex P2 round 3: mode が記録済みでも index が空 (chunk 0 件) なら、
+        // 守るべき embedding 空間が存在しないので `--force` を要求せず desired
+        // を採用して記録を上書きする。round 1 の F2 fix (server 起動時に
+        // resolve_context_mode を 1 回呼ぶ) の副作用として、1 件も index せず
+        // config を反転して再起動するケースを想定。
+        let db = test_db(); // 空 (chunk 0)
+        db.write_context_mode(ContextMode::Static).unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Off, false).unwrap();
+        assert_eq!(
+            m,
+            ContextMode::Off,
+            "empty index adopts desired, not stored"
+        );
+        assert_eq!(
+            db.read_context_mode().unwrap(),
+            Some(ContextMode::Off),
+            "adopted desired must be persisted, overwriting the stale stored value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_context_mode_empty_index_adopts_desired_on_mismatch_reverse() {
+        // 逆方向 (stored=Off, desired=Static) でも同じ規則が適用されることの確認。
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(
+            m,
+            ContextMode::Static,
+            "empty index adopts desired, not stored"
+        );
+        assert_eq!(
+            db.read_context_mode().unwrap(),
+            Some(ContextMode::Static),
+            "adopted desired must be persisted, overwriting the stale stored value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_context_mode_force_adopts_desired() {
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        // force: reset 済み前提で desired を採用 + 記録
+        let m = resolve_context_mode(&db, ContextMode::Static, true).unwrap();
+        assert_eq!(m, ContextMode::Static);
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+    }
+
+    #[test]
+    fn test_reset_and_resolve_context_mode_force_wipes_existing_chunks() {
+        // codex P2 on PR #73 (F1) regression: MCP `rebuild_index` tool の force
+        // 経路は (fix 前は) reset_for_model を呼ばずに resolve_context_mode だけ
+        // 呼んでいたため、「新 mode を記録した直後もまだ旧 mode の chunk が
+        // DB に残っている」瞬間が生じ得た。reset_and_resolve_context_mode は
+        // force 時に resolve より前で必ず reset_for_model を呼ぶことでこれを防ぐ。
+        // ここでは MCP 経路を model (Embedder 不要): 呼び出し側で reset を挟まず
+        // 「旧 mode で index 済みの DB」に直接 force call するシナリオを再現する。
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let doc_id = db
+            .upsert_document("stale.md", Some("Stale"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "stale body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(db.chunk_count().unwrap(), 1, "precondition: DB has 1 chunk");
+
+        let mode = reset_and_resolve_context_mode(
+            &db,
+            "bge-small-en-v1.5",
+            384,
+            ContextMode::Static,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(mode, ContextMode::Static);
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+        assert_eq!(
+            db.chunk_count().unwrap(),
+            0,
+            "force must wipe pre-existing chunks before the new mode is recorded, \
+             even when the caller (MCP rebuild_index tool) never called reset_for_model itself"
+        );
+        assert_eq!(
+            db.document_count().unwrap(),
+            0,
+            "force must wipe pre-existing documents alongside chunks"
+        );
+    }
+
+    #[test]
+    fn test_reset_and_resolve_context_mode_non_force_does_not_wipe() {
+        // 対照テスト: force=false では reset を経由せず resolve_context_mode の
+        // 通常挙動 (DB-stored mode 優先、chunk 保持) のまま。
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let doc_id = db
+            .upsert_document("kept.md", Some("Kept"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "kept body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+
+        let mode = reset_and_resolve_context_mode(
+            &db,
+            "bge-small-en-v1.5",
+            384,
+            ContextMode::Static,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(mode, ContextMode::Off, "non-force keeps DB-stored mode");
+        assert_eq!(
+            db.chunk_count().unwrap(),
+            1,
+            "non-force must not wipe existing chunks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // embed_input_for (feature-46 Task 2.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_embed_input_static_prepends_context() {
+        // clippy::field_reassign_with_default を避けるため struct literal で構築
+        // (ロジック / assert 文言は brief のテストと不変)。
+        let ch = crate::parser::Chunk {
+            content: "body".to_string(),
+            context: Some("T > H".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(embed_input_for(&ch, ContextMode::Static), "T > H\n\nbody");
+    }
+
+    #[test]
+    fn test_embed_input_off_is_content_only() {
+        let ch = crate::parser::Chunk {
+            content: "body".to_string(),
+            context: Some("T > H".to_string()),
+            ..Default::default()
+        };
+        // Off モードは parser が context を生成していても content のみ
+        assert_eq!(embed_input_for(&ch, ContextMode::Off), "body");
+    }
+
+    #[test]
+    fn test_embed_input_static_none_context_is_content_only() {
+        let ch = crate::parser::Chunk {
+            content: "body".to_string(),
+            context: None,
+            ..Default::default()
+        };
+        assert_eq!(embed_input_for(&ch, ContextMode::Static), "body");
     }
 }

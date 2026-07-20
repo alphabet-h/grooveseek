@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,9 +12,11 @@ const RRF_K: f32 = 60.0;
 const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
-/// FTS5 bm25 の column weight。heading と content に重みを与え、
-/// 見出し一致を本文一致より強く評価する。
+/// FTS5 bm25 の column weight。heading / context / content に重みを与え、
+/// 見出し一致を本文一致より強く評価する。列順は fts_chunks の CREATE 順
+/// (heading, context, content) と一致させる。
 const FTS_BM25_HEADING_WEIGHT: f32 = 2.0;
+const FTS_BM25_CONTEXT_WEIGHT: f32 = 1.0;
 const FTS_BM25_CONTENT_WEIGHT: f32 = 1.0;
 
 /// `fetch_embeddings_by_chunk_ids` の IN 句 batch サイズ。
@@ -43,6 +45,10 @@ pub struct SearchResult {
     pub topic: Option<String>,
     pub date: Option<String>,
     pub tags: Vec<String>,
+    /// feature-46: contextualized retrieval 用の context prefix (chunk 生成時に
+    /// LLM が付与)。`None` = context 機能 off の DB / context なし chunk。
+    /// reranker 入力合成にのみ使い、`SearchHit` へは carry しない (API 不変)。
+    pub context_text: Option<String>,
 }
 
 /// `SearchHit.content` (UTF-8) 内の byte offset 範囲。
@@ -127,6 +133,31 @@ pub struct ChunkRow {
     pub content: String,
     pub token_count: Option<i64>,
     pub level: Option<u8>,
+}
+
+/// index の context 適用状態 (feature-46)。`index_meta.context_mode` に永続化する。
+/// - `Off`: context を embedding / FTS に使わない (legacy DB は grandfather でここ)
+/// - `Static`: parser 生成の静的 context を embedding + FTS + reranker に注入
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMode {
+    Off,
+    Static,
+}
+
+impl ContextMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Static => "static",
+        }
+    }
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "static" => Some(Self::Static),
+            _ => None,
+        }
+    }
 }
 
 /// Search 系 API に渡す filter 引数の集約。
@@ -221,6 +252,17 @@ fn parse_dim_from_create_sql(sql: &str) -> Option<u32> {
     let rest = &sql[start..];
     let end = rest.find(']')?;
     rest[..end].trim().parse().ok()
+}
+
+/// `fts_chunks` に context 列があるか。`&Connection` を受けるので tx 内からも呼べる
+/// (`rusqlite::Transaction` は `Deref<Target = Connection>` なので deref coercion で通る)。
+fn fts_chunks_has_context_column_conn(conn: &Connection) -> Result<bool> {
+    let has = conn
+        .prepare("PRAGMA table_info(fts_chunks)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == "context");
+    Ok(has)
 }
 
 /// `tags_any` フィルタ: hit の tags のいずれかが `any_pool` に含まれていれば pass。
@@ -352,6 +394,10 @@ fn rrf_topk(
         .collect()
 }
 
+/// [`Database::chunk_texts_with_context_for_path`] の戻り値の要素型:
+/// `(heading, content, context_text)`。
+pub type ChunkTextWithContext = (Option<String>, String, Option<String>);
+
 impl Database {
     /// Open (or create) a file-backed database at `path`.
     pub fn open(path: &str) -> Result<Self> {
@@ -389,6 +435,15 @@ impl Database {
         // WAL mode + foreign keys
         self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // feature-46: FTS 3 列 migration の repopulate は数秒〜十数秒 lock を保持する。
+        // busy_timeout 未設定 (default 0) だと serve 常駐中の別プロセス search/status が
+        // 即 SQLITE_BUSY で失敗する。30 秒待たせて migration 完了後に成功させる (spec §4.4)。
+        // 10s→30s に引き上げ済み: dogfood KB (574 docs / 10,002 chunks) を embedding +
+        // reranker モデル同時ロード中の並行負荷下で計測したところ migration が
+        // 9.7〜12.3s かかり、4 trial 中 2 trial で旧 10s を実際に超過した実測に基づく
+        // (`.dev/knowledge/eval-baseline-2026-07-20-context.md`)。
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(30_000))?;
 
         // vec_chunks は dim が未知の段階では作れないので遅延生成にする。
         // meta に dim が記録されていれば init 時に作るが、無ければ
@@ -438,6 +493,7 @@ impl Database {
         self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
                 heading,
+                context,
                 content,
                 content='',
                 contentless_delete=1,
@@ -461,6 +517,11 @@ impl Database {
         // legacy DB 互換: chunks.context_text 列が無ければ ALTER で追加する
         // (feature-46。NULL のまま — 値は PR-2 の context_mode 導入後、再 index で埋まる)。
         self.ensure_context_text_column()?;
+
+        // legacy DB 互換: fts_chunks が旧 2 列 schema なら 3 列へ rebuild migration
+        // する (feature-46)。context_text 列の存在を前提に repopulate するため、
+        // 必ず `ensure_context_text_column` の後に呼ぶこと。
+        self.ensure_fts_context_column()?;
 
         Ok(())
     }
@@ -550,6 +611,48 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// `fts_chunks` に context 列が無ければ 3 列 schema へ rebuild migration する
+    /// (feature-46、init 内 one-time)。status / search / serve は rebuild_index を
+    /// 経由しないため、init で全 entry point の schema を保証する。table_info ガードで
+    /// 2 回目以降 O(1) no-op。DROP+CREATE+repopulate は BEGIN IMMEDIATE + double-checked
+    /// locking で multi-process race を防ぐ (spec §4.4)。**`ensure_context_text_column`
+    /// の後に呼ぶこと** (repopulate が chunks.context_text を読むため)。
+    ///
+    /// `backfill_fts` (rebuild_index 冒頭の欠損 rowid 補充) とは責務が別 (schema 変換 vs
+    /// 欠損補充)。本 fn は schema を 2→3 列へ変換するだけ。
+    fn ensure_fts_context_column(&self) -> Result<()> {
+        // 1) 高速パス: context 列が既にあれば no-op (O(1))
+        if self.fts_chunks_has_context_column()? {
+            return Ok(());
+        }
+        // 2) IMMEDIATE tx (RESERVED lock) で書き手を単一化
+        let tx = self.begin_immediate_tx()?;
+        // 3) double-checked: lock 取得後に再チェック (他プロセスが migration 済みなら no-op)
+        if fts_chunks_has_context_column_conn(&tx)? {
+            tx.commit()?;
+            return Ok(());
+        }
+        eprintln!("Migrating FTS index to 3-column schema (heading/context/content)...");
+        // 4) DROP + CREATE 3 列 + chunks から全 repopulate (原子的: DDL はトランザクショナル)
+        tx.execute_batch(
+            "DROP TABLE fts_chunks;
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                heading, context, content,
+                content='', contentless_delete=1,
+                tokenize = \"trigram remove_diacritics 1 case_sensitive 0\"
+             );
+             INSERT INTO fts_chunks (rowid, heading, context, content)
+                SELECT id, heading, COALESCE(context_text, ''), content FROM chunks;",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `fts_chunks` に context 列があるか (self.conn 版)。
+    fn fts_chunks_has_context_column(&self) -> Result<bool> {
+        fts_chunks_has_context_column_conn(&self.conn)
     }
 
     /// 現存する `vec_chunks` の宣言済み次元を返す。テーブルが無い or
@@ -742,10 +845,9 @@ impl Database {
             params![chunk_id, embedding_json],
         )?;
 
-        // PR-1: FTS は 2 列のまま (context 列は PR-2 で追加)。heading/content のみ。
         self.conn.execute(
-            "INSERT INTO fts_chunks (rowid, heading, content) VALUES (?1, ?2, ?3)",
-            params![chunk_id, heading, content],
+            "INSERT INTO fts_chunks (rowid, heading, context, content) VALUES (?1, ?2, ?3, ?4)",
+            params![chunk_id, heading, context, content],
         )?;
 
         if let Some(tx) = local_tx {
@@ -783,6 +885,40 @@ impl Database {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![path], |row| {
             Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::chunk_texts_for_path`] の `context_text` 込み版
+    /// (heading, content, context_text)。
+    ///
+    /// codex P2 round 2 (finding B): Static context mode の frontmatter-only
+    /// skip 判定は `context_text` (= ancestry breadcrumb) の変化も検知する
+    /// 必要があるため、既存 `chunk_texts_for_path` (Off モード用、2-tuple) とは
+    /// 別の専用メソッドとして追加した。既存の呼び出し元・テストに影響しない
+    /// ようシグネチャを分けている。
+    pub fn chunk_texts_with_context_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<ChunkTextWithContext>> {
+        let sql = "
+            SELECT c.heading, c.content, c.context_text
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.path = ?1
+            ORDER BY c.chunk_index
+        ";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![path], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {
@@ -886,6 +1022,8 @@ impl Database {
                     topic,
                     date,
                     tags: self.parse_tags_json_recording(tags_json),
+                    // graph seed は rerank しないので context 合成は不要。
+                    context_text: None,
                 },
             ));
         }
@@ -1091,20 +1229,21 @@ impl Database {
         };
 
         // bm25 に column weight を与え、見出し一致を優遇する。
-        // 引数順は FTS5 の CREATE VIRTUAL TABLE の列宣言順 (heading, content)。
+        // 引数順は FTS5 の CREATE VIRTUAL TABLE の列宣言順 (heading, context, content)。
         let sql = format!(
             "
-            SELECT c.id, bm25(fts_chunks, {h}, {c}) AS score,
+            SELECT c.id, bm25(fts_chunks, {h}, {ctx}, {c}) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
-                   d.path, d.title, d.topic, d.date, d.category, d.tags
+                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
             WHERE fts_chunks MATCH ?1
-            ORDER BY bm25(fts_chunks, {h}, {c})
+            ORDER BY bm25(fts_chunks, {h}, {ctx}, {c})
             LIMIT ?2
             ",
             h = FTS_BM25_HEADING_WEIGHT,
+            ctx = FTS_BM25_CONTEXT_WEIGHT,
             c = FTS_BM25_CONTENT_WEIGHT
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1124,6 +1263,7 @@ impl Database {
                 row.get::<_, Option<String>>(9)?,  // date
                 row.get::<_, Option<String>>(10)?, // category
                 row.get::<_, Option<String>>(11)?, // tags (JSON)
+                row.get::<_, Option<String>>(12)?, // context_text
             ))
         })?;
 
@@ -1142,6 +1282,7 @@ impl Database {
                 date,
                 r_category,
                 tags_json,
+                context_text,
             ) = row?;
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
@@ -1186,6 +1327,7 @@ impl Database {
                     topic: r_topic,
                     date,
                     tags: hit_tags,
+                    context_text,
                 },
             ));
             if results.len() >= limit as usize {
@@ -1307,7 +1449,7 @@ impl Database {
         let sql = "
             SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
-                   d.path, d.title, d.topic, d.date, d.category, d.tags
+                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
             FROM vec_chunks v
             JOIN chunks c ON c.id = v.chunk_id
             JOIN documents d ON d.id = c.document_id
@@ -1331,6 +1473,7 @@ impl Database {
                 row.get::<_, Option<String>>(9)?,  // date
                 row.get::<_, Option<String>>(10)?, // category
                 row.get::<_, Option<String>>(11)?, // tags (JSON)
+                row.get::<_, Option<String>>(12)?, // context_text
             ))
         })?;
 
@@ -1349,6 +1492,7 @@ impl Database {
                 date,
                 r_category,
                 tags_json,
+                context_text,
             ) = row?;
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
@@ -1393,6 +1537,7 @@ impl Database {
                     topic: r_topic,
                     date,
                     tags: hit_tags,
+                    context_text,
                 },
             ));
             if out.len() >= limit as usize {
@@ -1496,6 +1641,44 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.context_mode` を読む。key 不在 / 未知値は `None` (= grandfather 判定へ)。
+    pub fn read_context_mode(&self) -> Result<Option<ContextMode>> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'context_mode'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.as_deref().and_then(ContextMode::from_str_opt))
+    }
+
+    /// `index_meta.context_mode` を記録する (INSERT OR REPLACE)。
+    pub fn write_context_mode(&self, mode: ContextMode) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('context_mode', ?1)",
+            params![mode.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
+    /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
+    pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let title: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT title FROM documents WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(title.flatten())
+    }
+
     /// `index_meta` から `tags_parse_failures` key を read する (F-63)。
     /// 値が無い / `u64::from_str` に失敗する malformed 値は `None` 扱い
     /// (= 起動時 restore で 0 にフォールバック)。
@@ -1588,20 +1771,22 @@ impl Database {
     /// 埋め込み再計算は行わないので高速 (既存 content を INSERT するだけ)。
     pub fn backfill_fts(&self) -> Result<u32> {
         let sql = "
-            SELECT id, heading, content
+            SELECT id, heading, context_text, content
             FROM chunks
             WHERE id NOT IN (SELECT rowid FROM fts_chunks)
         ";
         let mut stmt = self.conn.prepare(sql)?;
-        let rows: Vec<(i64, Option<String>, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        let rows: Vec<(i64, Option<String>, Option<String>, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut count = 0u32;
-        for (id, heading, content) in rows {
+        for (id, heading, context, content) in rows {
             self.conn.execute(
-                "INSERT INTO fts_chunks (rowid, heading, content) VALUES (?1, ?2, ?3)",
-                params![id, heading, content],
+                "INSERT INTO fts_chunks (rowid, heading, context, content) VALUES (?1, ?2, ?3, ?4)",
+                params![id, heading, context, content],
             )?;
             count += 1;
         }
@@ -1779,6 +1964,19 @@ impl Database {
     pub fn begin_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
         Ok(self.conn.unchecked_transaction()?)
     }
+
+    /// IMMEDIATE (RESERVED lock) トランザクションを開始する (feature-46)。
+    /// FTS 3 列 migration の double-checked locking (§4.4) で書き手を単一化する
+    /// ために使う (`ensure_fts_context_column` が消費)。`&self` で呼べるよう
+    /// `unchecked_transaction` 系の `Transaction::new_unchecked` を behavior=Immediate
+    /// で使う (`transaction_with_behavior` は `&mut Connection` 要求で不可)。
+    /// 通常 Drop は rollback。成功時は `tx.commit()` を呼ぶこと。
+    fn begin_immediate_tx(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
+    }
 }
 
 impl Drop for Database {
@@ -1836,6 +2034,7 @@ fn dummy_search_result_for_id(id: i64) -> SearchResult {
         topic: None,
         date: None,
         tags: Vec::new(),
+        context_text: None,
     }
 }
 
@@ -1843,6 +2042,30 @@ fn dummy_search_result_for_id(id: i64) -> SearchResult {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// feature-46: db.rs 専用の一時ディレクトリ helper (tempfile crate 禁止)。
+    /// `config.rs::DirGuard` / `tests/config_discovery.rs::TempDir` と同型。
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let pid = std::process::id();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir().join(format!("kb-mcp-dbtest-{prefix}-{pid}-{nonce}"));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Helper: create a dummy 384-dim embedding filled with `val`.
     fn dummy_embedding(val: f32) -> Vec<f32> {
@@ -2438,6 +2661,81 @@ mod tests {
 
         let map = db.all_path_hashes().unwrap();
         assert_eq!(map.get("a.md"), Some(&"h_NEW".to_string()));
+    }
+
+    #[test]
+    fn test_begin_immediate_tx_takes_reserved_lock() {
+        // IMMEDIATE tx は開始時点で RESERVED lock を取得する。
+        // 別 connection からの書き込みが lock 取得まで待たされることを 2-connection で検証。
+        // (Deferred tx では出現時点でのみ lock 取得なので、BEGIN 直後は競合しない)。
+
+        // TmpDir パターン: PID + nanos で unique な一時ディレクトリ
+        struct TmpDir(std::path::PathBuf);
+        impl Drop for TmpDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir =
+            std::env::temp_dir().join(format!("kb-mcp-test-immediate-lock-{pid}-{nonce}"));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let _guard = TmpDir(tmp_dir.clone());
+
+        let db_path = tmp_dir.join("test.db").to_string_lossy().to_string();
+
+        // conn A: Database wrapper で IMMEDIATE tx を開始 (未 commit)
+        let db_a = Database::open(&db_path).unwrap();
+        let _tx_a = db_a.begin_immediate_tx().unwrap();
+        // _tx_a を保持したまま next block へ
+
+        {
+            // conn B: 同じ DB に raw rusqlite connection で接続、busy_timeout=0 (即失敗)
+            let conn_b = rusqlite::Connection::open(&db_path).expect("failed to open db_path");
+            conn_b
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("failed to set busy_timeout");
+
+            // conn A が RESERVED lock を持っているため、conn B の BEGIN IMMEDIATE は
+            // SQLITE_BUSY で失敗するはず
+            let result = conn_b.execute("BEGIN IMMEDIATE", []);
+            assert!(
+                result.is_err(),
+                "Expected SQLITE_BUSY when IMMEDIATE tx encounters held RESERVED lock, but succeeded"
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("database is locked"),
+                "Expected 'database is locked' error, got: {err_msg}"
+            );
+        }
+        // conn_b は drop される (結果は無視)
+
+        // _tx_a を drop (rollback) してから、新 connection が成功することを確認
+        drop(_tx_a);
+
+        {
+            let conn_b =
+                rusqlite::Connection::open(&db_path).expect("failed to open db_path for retry");
+            conn_b
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("failed to set busy_timeout for retry");
+
+            // lock が解放されたので BEGIN IMMEDIATE が成功するはず
+            let result = conn_b.execute("BEGIN IMMEDIATE", []);
+            assert!(
+                result.is_ok(),
+                "Expected BEGIN IMMEDIATE to succeed after IMMEDIATE tx rollback, but got: {:?}",
+                result.unwrap_err()
+            );
+            // clean up: ROLLBACK を send
+            let _ = conn_b.execute_batch("ROLLBACK");
+        }
     }
 
     #[test]
@@ -3317,6 +3615,69 @@ mod tests {
     }
 
     #[test]
+    fn test_fts_context_column_is_searchable_via_insert_chunk() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("n/a.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        let emb = dummy_embedding(0.1);
+        // content には無いが context にだけある語彙 "パイプライン設計"
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("RRF"),
+            Some(3),
+            "本文テキスト",
+            Some("設計ノート > パイプライン設計 > RRF"),
+            &emb,
+            1.0,
+        )
+        .unwrap();
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'パイプライン設計'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(hit >= 1, "context-only vocabulary must be FTS-searchable");
+    }
+
+    #[test]
+    fn test_backfill_fts_repopulates_context_column() {
+        // FTS から 1 行消して backfill が context 込みで再 index することを確認
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("n/b.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        let emb = dummy_embedding(0.1);
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "body",
+            Some("T > H"),
+            &emb,
+            1.0,
+        )
+        .unwrap();
+        db.conn.execute("DELETE FROM fts_chunks", []).unwrap();
+        let n = db.backfill_fts().unwrap();
+        assert_eq!(n, 1);
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'context : \"T > H\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(hit >= 1);
+    }
+
+    #[test]
     fn test_reset_for_model_switches_dim_and_wipes_data() {
         let db = db_with_384();
         let doc_id = db
@@ -3440,6 +3801,40 @@ mod tests {
             .unwrap();
         // dim missing → None (not an error, treated as unrecorded).
         assert!(db.read_embedding_meta().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_context_mode_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.read_context_mode().unwrap().is_none()); // key 不在
+        db.write_context_mode(ContextMode::Static).unwrap();
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+        db.write_context_mode(ContextMode::Off).unwrap();
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Off));
+    }
+
+    #[test]
+    fn test_context_mode_malformed_is_none() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO index_meta (key, value) VALUES ('context_mode', 'garbage')",
+                [],
+            )
+            .unwrap();
+        assert!(db.read_context_mode().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_document_title() {
+        let db = db_with_384();
+        db.upsert_document("n/a.md", Some("My Title"), None, None, None, &[], None, "h")
+            .unwrap();
+        assert_eq!(
+            db.get_document_title("n/a.md").unwrap().as_deref(),
+            Some("My Title")
+        );
+        assert!(db.get_document_title("missing.md").unwrap().is_none());
     }
 
     #[test]
@@ -3953,9 +4348,34 @@ mod tests {
             topic: None,
             date: None,
             tags: vec![],
+            context_text: None,
         };
         let h: SearchHit = r.into();
         assert!(h.match_spans.is_none());
+    }
+
+    #[test]
+    fn test_searchhit_does_not_serialize_context_text() {
+        // context_text を持つ SearchResult を SearchHit に変換 → JSON に context が出ない
+        let r = SearchResult {
+            score: 1.0,
+            content: "body".to_string(),
+            heading: Some("H".to_string()),
+            document_id: 1,
+            path: "a.md".to_string(),
+            title: Some("T".to_string()),
+            topic: None,
+            date: None,
+            tags: vec![],
+            context_text: Some("T > H".to_string()),
+        };
+        let hit: SearchHit = r.into();
+        let json = serde_json::to_string(&hit).unwrap();
+        assert!(
+            !json.contains("context"),
+            "context must not leak into SearchHit JSON: {json}"
+        );
+        assert!(!json.contains("T > H"));
     }
 
     /// Local helper: create a temp directory unique to this test process /
@@ -4228,6 +4648,7 @@ mod tests {
                     topic: None,
                     date: None,
                     tags: vec![],
+                    context_text: None,
                 },
             );
         }
@@ -4258,6 +4679,7 @@ mod tests {
                     topic: None,
                     date: None,
                     tags: vec![],
+                    context_text: None,
                 },
             );
         }
@@ -4545,6 +4967,165 @@ mod tests {
             db_final.tags_parse_failure_count(),
             18,
             "concurrent delta must be additively merged (no last-writer-wins)"
+        );
+    }
+
+    // -- feature-46 PR-2 Task 2.2: FTS 3 列 migration ------------------------
+
+    /// 旧 2 列 FTS schema の DB file を作る (v0.11.0 相当)。chunks に context_text
+    /// 列はあり (PR-1 適用済み想定) だが FTS は 2 列 = PR-2 未適用状態を再現する。
+    ///
+    /// **brief からの逸脱 (main 承認済み)**: `PRAGMA journal_mode = WAL;` を明示的に
+    /// 先行させる。kb-mcp が作成した DB は `Database::init()` が必ず最初に journal_mode
+    /// を WAL へ切り替えて永続化するため、実運用では「一度でも kb-mcp が open した DB」
+    /// は常に WAL 状態にある。ここで WAL を先に設定しないと `test_fts_migration_waits_out_concurrent_write_lock`
+    /// が「migration の BEGIN IMMEDIATE 待機」ではなく「非 WAL→WAL の journal_mode 切替」
+    /// で落ちてしまう (詳細は当該テストの NOTE を参照)。
+    fn create_legacy_2col_fts_db(path: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,
+                title TEXT, topic TEXT, category TEXT, depth TEXT, tags TEXT, date TEXT,
+                content_hash TEXT NOT NULL, last_indexed TEXT NOT NULL);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, document_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL, heading TEXT, level INTEGER, content TEXT NOT NULL,
+                token_count INTEGER, quality_score REAL NOT NULL DEFAULT 1.0, context_text TEXT);
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(heading, content, content='',
+                contentless_delete=1, tokenize=\"trigram remove_diacritics 1 case_sensitive 0\");
+             INSERT INTO documents (path, title, content_hash, last_indexed)
+                VALUES ('a.md', 'A', 'h', '2026-01-01T00:00:00Z');
+             INSERT INTO chunks (document_id, chunk_index, heading, content, context_text)
+                VALUES (1, 0, 'H', 'body text here', 'A > H');
+             INSERT INTO fts_chunks (rowid, heading, content) VALUES (1, 'H', 'body text here');",
+        )
+        .unwrap();
+    }
+
+    /// db.conn (private field) から fts_chunks が context 列を持つか判定する test helper。
+    fn fts_has_context_col(db: &Database) -> bool {
+        db.conn
+            .prepare("PRAGMA table_info(fts_chunks)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|n| n == "context")
+    }
+
+    #[test]
+    fn test_fts_migration_adds_context_column_and_repopulates() {
+        let dir = TempDir::new("fts-migrate");
+        let path = dir.path().join("k.db");
+        let path_str = path.to_string_lossy().to_string();
+        create_legacy_2col_fts_db(&path_str);
+        // open → init が migration を走らせる
+        let db = Database::open(&path_str).unwrap();
+        assert!(
+            fts_has_context_col(&db),
+            "context column must exist after migration"
+        );
+        // repopulate: 既存 chunk が FTS に残っていること
+        let cnt: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cnt, 1);
+        // context 列に 'A > H' が index されていること (MATCH でヒット)
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'context : \"A > H\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(hit >= 1, "context text must be searchable after repopulate");
+    }
+
+    #[test]
+    fn test_fts_migration_idempotent_noop_second_open() {
+        let dir = TempDir::new("fts-noop");
+        let path = dir.path().join("k.db");
+        let path_str = path.to_string_lossy().to_string();
+        create_legacy_2col_fts_db(&path_str);
+        let db1 = Database::open(&path_str).unwrap();
+        assert!(fts_has_context_col(&db1));
+        drop(db1);
+        // 2 回目 open: table_info ガードで no-op (double-checked)
+        let db2 = Database::open(&path_str).unwrap();
+        assert!(fts_has_context_col(&db2));
+    }
+
+    #[test]
+    fn test_fts_migration_waits_out_concurrent_write_lock() {
+        // §10 確定 #4: mpsc 2 本で「holder が RESERVED lock 保持」→「opener が
+        // open 試行」→「holder release」を決定的に順序付け。busy_timeout=30s 内の
+        // 待機後に open が成功する (即 SQLITE_BUSY にならない) ことを検証。
+        //
+        // NOTE: holder は生 rusqlite::Connection + 手動 `BEGIN IMMEDIATE` で write
+        // lock を握る (= migration の ensure_fts_context_column が実際に発行する
+        // BEGIN IMMEDIATE との「同種ロック同士の競合」を厳密に再現するわけではない)。
+        // 本テストが確かめているのは「busy_timeout を設定した接続が、他接続の write
+        // lock 保持中でも待機して成功する」という busy_timeout 全般の待機動作であり、
+        // migration の double-checked locking の正しさ自体は
+        // test_fts_migration_idempotent_noop_second_open (再チェック no-op) で担保する。
+        // 既知の隙間: 「lock 待機中に他プロセスが migration を完了し、lock 取得後の
+        // 再チェックで no-op commit になる」真の競合 double-checked path は 3 テスト
+        // (migrate / idempotent-noop / この lock-wait) のいずれも直接は再現していない。
+        // 機能の正しさは逐次 no-op テスト + tx (DDL) の原子性で担保しており、この
+        // 競合 path 専用の deterministic 再現は複雑さに見合わないと判断した。
+        //
+        // NOTE (fixture が WAL を事前設定する理由、実装中に発見): 非 WAL→WAL の
+        // journal_mode 切替は SQLite 側で exclusive lock を要求し、busy_timeout /
+        // busy handler を一切無視して即座に SQLITE_BUSY を返す。`create_legacy_2col_fts_db`
+        // が journal_mode を明示せず rollback-journal のまま DB を作ると、opener の
+        // `Database::open` が init() 冒頭の `PRAGMA journal_mode = WAL;` の時点で
+        // (holder が RESERVED lock を保持している間) 即座に失敗し、本テストが本来
+        // 検証したい `begin_immediate_tx` (BEGIN IMMEDIATE) の待機ロジックに到達すらしない。
+        // kb-mcp が作成した DB は初回 open で WAL がファイルヘッダに永続化される
+        // ("kb-mcp が一度でも open した DB は常に WAL" が実運用の不変条件) ため、
+        // fixture 側で WAL を事前設定することが実運用条件に忠実な再現になる。次にこの
+        // テストを触る人が同じ切り分けを繰り返さないための記録。
+        let dir = TempDir::new("fts-lock");
+        let path = dir.path().join("k.db");
+        let path_str = path.to_string_lossy().to_string();
+        create_legacy_2col_fts_db(&path_str);
+
+        let (tx_locked, rx_locked) = std::sync::mpsc::channel::<()>();
+        let (tx_release, rx_release) = std::sync::mpsc::channel::<()>();
+
+        let holder_path = path_str.clone();
+        let holder = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&holder_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // RESERVED write lock を実際に取る (INSERT で write intent)
+            conn.execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO index_meta (key, value) VALUES ('lock_probe', '1');",
+            )
+            .unwrap();
+            tx_locked.send(()).unwrap(); // ロック保持を通知
+            rx_release.recv().unwrap(); // release 指示を待つ
+            conn.execute_batch("COMMIT;").unwrap();
+        });
+
+        rx_locked.recv().unwrap(); // holder が write lock を取るまで待つ
+        let opener_path = path_str.clone();
+        let opener = std::thread::spawn(move || Database::open(&opener_path));
+        // opener が migration の BEGIN IMMEDIATE で block するのを少し待ってから release。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        tx_release.send(()).unwrap();
+        holder.join().unwrap();
+
+        let db = opener
+            .join()
+            .unwrap()
+            .expect("open must succeed after lock released within busy_timeout");
+        assert!(
+            fts_has_context_col(&db),
+            "migration must complete after lock wait"
         );
     }
 }

@@ -124,6 +124,12 @@ bind = "127.0.0.1:3100"
 # enabled = false
 # whole_doc_threshold_tokens = 100   # token_count below this -> whole document fallback
 # max_expanded_tokens = 2000         # cap for adjacent merge / whole-doc (BGE-M3 <= 8192)
+
+# Optional: static Contextual Retrieval (v0.12.0+). Off by default; strongly
+# recommended only when a reranker is also configured (see "Contextual
+# Retrieval" below for why).
+# [contextual]
+# enabled = true
 ```
 
 With the file in place `kb-mcp serve` / `index` / `status` / `graph` / `search` all work without any of those flags. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
@@ -419,6 +425,30 @@ CLI flags (also accepted by `kb-mcp eval`):
 MCP `search` tool gains the matching per-call params `mmr` / `mmr_lambda` / `mmr_same_doc_penalty` / `parent_retriever`. Toml defaults live in `[search.mmr]` and `[search.parent_retriever]` (see [Optional config file](#optional-config-file) above). Per-call params override toml; toml overrides built-in defaults.
 
 The pipeline order is **`RRF → reranker → MMR → parent retriever → match_spans`**. MMR re-orders candidates while the reranker score is still on the chunks; parent retriever runs last so the expanded content does not contaminate the relevance signal. See [docs/retrieval-pipeline.md](docs/retrieval-pipeline.md) for the full pipeline narrative and tuning advice.
+
+### Contextual Retrieval (v0.12.0+, opt-in)
+
+Each chunk can be prefixed with a short, **statically generated** context breadcrumb — the document title plus its heading ancestry (`Doc Title > Section > Subsection`, ` > `-joined) — and that breadcrumb is injected into the embedding input, the FTS5 index (a dedicated third column, scored via a Contextual BM25 weight), and the reranker input. Unlike Anthropic's original Contextual Retrieval technique, this context is derived purely from document structure at index time — no LLM call, no extra runtime dependency, no staleness beyond what a normal re-index already handles.
+
+Enable it via:
+
+```toml
+[contextual]
+enabled = true
+```
+
+**This defaults to off**, and the reason is a measured regression, not caution for its own sake: an A/B evaluation on a 574-document dogfood knowledge base (bge-m3 embeddings) showed that with kb-mcp's actual default pipeline (no reranker), enabling static context injection made retrieval *worse* — recall@5 dropped from 0.707 to 0.627 (-0.080) and MRR dropped by -0.041. The short chunk-local vector signal gets diluted by the prefixed breadcrumb text when nothing downstream re-scores the result.
+
+**With a reranker enabled** (`--reranker bge-v2-m3`), the picture flips: context injection improved every metric except a small recall@10 dip — recall@5 went from 0.760 to 0.807, MRR from 0.848 to 0.950, and nDCG@10 from 0.814 to 0.858. The cross-encoder reranker is able to use the extra structural signal that the raw embedding/BM25 stage cannot fully exploit on its own.
+
+**Recommendation**: only turn `[contextual] enabled = true` on if you also run with a reranker (`--reranker bge-v2-m3` or similar / `reranker = "bge-v2-m3"` in `kb-mcp.toml`). Leave it off for the plain default pipeline.
+
+Notes:
+
+- The returned search result schema is **unchanged** — context is an internal signal for ranking only, never exposed in `search` / `get_document` output.
+- Turning this on for an **existing** database requires `kb-mcp index --force` to rebuild the embeddings and FTS index with context injected; without `--force`, a config/DB mode mismatch just prints a warning on stderr and the database keeps its current mode (no silent mid-migration mixing of embedding spaces).
+- `kb-mcp status` reports the DB's current mode as `Context mode: static` or `Context mode: off`.
+- See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the context breadcrumb is generated and stored.
 
 ### Connection graph from a starting document
 

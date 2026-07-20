@@ -4,6 +4,52 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-21
+
+### Added
+
+- **Static Contextual Retrieval (opt-in, `[contextual].enabled = true`)**:
+  each chunk can be prefixed, at index time, with a deterministic context
+  breadcrumb — the document title plus its heading ancestry (` > `-joined,
+  200-char cap) — that gets injected into the embedding input, a new FTS5
+  third column (`context`, scored via a dedicated Contextual BM25 weight),
+  and the reranker input. Generated purely from document structure (two
+  ancestry families: Markdown's level-keyed heading stack, and a
+  single-level `[title]` for PDF/Office/`.txt` chunks) — no LLM call, no
+  extra runtime dependency, no drift beyond what a normal re-index already
+  handles. The returned `search` / `get_document` schema is entirely
+  unchanged; context is an internal ranking signal only.
+  - `index_meta.context_mode` (`ContextMode::{Off, Static}`) versions each
+    DB's actually-built mode independently of the config's desired mode:
+    a config/DB mismatch without `--force` prints a stderr warning and
+    keeps the DB's existing mode rather than silently mixing embedding
+    spaces mid-index; `kb-mcp index --force` migrates explicitly.
+    `kb-mcp status` reports `Context mode: static` / `Context mode: off`.
+  - **Judgment-gate result: defaults to off.** An A/B evaluation on a
+    574-document dogfood KB (bge-m3) showed that with kb-mcp's actual
+    default pipeline (no reranker), enabling context injection made
+    retrieval measurably worse (recall@5 -0.080, MRR -0.041). With a
+    reranker configured (`bge-v2-m3`), it improved every metric except a
+    small recall@10 dip (recall@5 +0.047, MRR +0.102, nDCG@10 +0.044). See
+    the README's "Contextual Retrieval" section for the full numbers and
+    the reranker-only recommendation.
+
+### Changed
+
+- **FTS5 schema: `fts_chunks` gains a third column (`heading`, `context`,
+  `content`)**, migrated automatically and once on first open of a
+  pre-v0.12.0 database (drop + recreate the virtual table, then
+  repopulate from `chunks`, inside a `BEGIN IMMEDIATE` transaction to
+  serialize against concurrent openers). `chunks.context_text` is added
+  the same way via an idempotent `ALTER TABLE`. No CLI action is required
+  — this runs transparently the next time any `kb-mcp` command opens the
+  database.
+- **`busy_timeout` raised from 10s to 30s** (`Database::init`): the FTS
+  migration above holds a write lock for its full repopulate, which was
+  measured at 9.7–12.3s under concurrent embedding/reranker model load on
+  a 10,002-chunk KB — exceeding the previous 10s budget in some trials.
+  30s keeps a comfortable margin over the worst observed case.
+
 ## [0.11.0] - 2026-07-20
 
 ### Added
