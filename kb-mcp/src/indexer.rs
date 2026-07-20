@@ -914,8 +914,11 @@ use crate::db::ContextMode;
 
 /// force / config-desired / DB-stored から effective context mode を決める (feature-46 §4.8)。
 /// 副作用: fresh/legacy/force のケースで `index_meta.context_mode` を記録する。
-/// mismatch (config は static 期待だが DB は off 等) は stderr へ warn し、DB 側モードで
-/// 継続する (embedding 空間の一貫性維持、混在 index を作らない)。
+/// mismatch (config は static 期待だが DB は off 等) は、index が空でなければ
+/// stderr へ warn し DB 側モードで継続する (embedding 空間の一貫性維持、混在
+/// index を作らない)。index が空 (chunk 0 件) なら守るべき embedding 空間が
+/// 存在しないため、代わりに desired を採用して記録を上書きする (codex P2
+/// round 3)。
 pub(crate) fn resolve_context_mode(
     db: &Database,
     desired: ContextMode,
@@ -929,6 +932,22 @@ pub(crate) fn resolve_context_mode(
     match db.read_context_mode()? {
         Some(stored) => {
             if stored != desired {
+                // codex P2 round 3: mode が記録済みでも index が空 (chunk 0 件)
+                // なら、守るべき embedding 空間がそもそも存在しない。典型例は
+                // F2 fix (round 1) の副作用: `serve` 起動時に resolve_context_mode
+                // が fresh DB へ desired を書いた直後、まだ 1 件も index せずに
+                // user が `[contextual].enabled` を反転して再起動したケース。
+                // このとき stale な記録値を優先して `--force` を要求するのは
+                // 不合理なので、desired をそのまま採用して上書きする。
+                if db.chunk_count()? == 0 {
+                    db.write_context_mode(desired)?;
+                    eprintln!(
+                        "info: index is empty; adopting '{}' for empty index (was '{}').",
+                        desired.as_str(),
+                        stored.as_str()
+                    );
+                    return Ok(desired);
+                }
                 eprintln!(
                     "warning: [contextual] config expects '{}' mode but this index was built \
                      with '{}'. Run `kb-mcp index --force` to migrate; continuing in '{}' mode.",
@@ -1749,9 +1768,67 @@ mod tests {
     #[test]
     fn test_resolve_context_mode_stored_wins_over_desired() {
         let db = test_db();
+        // codex P2 round 3: 「stored が desired に勝つ」のは index が空でない
+        // ときのみの挙動になったため (空 index は adopt する、次の test 参照)、
+        // この test の前提を「chunk が実在する non-empty index」に機械的に
+        // 更新する (assert! 文言 / 期待値は不変、fixture のみ追加)。
+        let doc_id = db
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
         db.write_context_mode(ContextMode::Off).unwrap();
         let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
         assert_eq!(m, ContextMode::Off, "DB-stored mode wins on mismatch");
+    }
+
+    #[test]
+    fn test_resolve_context_mode_empty_index_adopts_desired_on_mismatch() {
+        // codex P2 round 3: mode が記録済みでも index が空 (chunk 0 件) なら、
+        // 守るべき embedding 空間が存在しないので `--force` を要求せず desired
+        // を採用して記録を上書きする。round 1 の F2 fix (server 起動時に
+        // resolve_context_mode を 1 回呼ぶ) の副作用として、1 件も index せず
+        // config を反転して再起動するケースを想定。
+        let db = test_db(); // 空 (chunk 0)
+        db.write_context_mode(ContextMode::Static).unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Off, false).unwrap();
+        assert_eq!(
+            m,
+            ContextMode::Off,
+            "empty index adopts desired, not stored"
+        );
+        assert_eq!(
+            db.read_context_mode().unwrap(),
+            Some(ContextMode::Off),
+            "adopted desired must be persisted, overwriting the stale stored value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_context_mode_empty_index_adopts_desired_on_mismatch_reverse() {
+        // 逆方向 (stored=Off, desired=Static) でも同じ規則が適用されることの確認。
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let m = resolve_context_mode(&db, ContextMode::Static, false).unwrap();
+        assert_eq!(
+            m,
+            ContextMode::Static,
+            "empty index adopts desired, not stored"
+        );
+        assert_eq!(
+            db.read_context_mode().unwrap(),
+            Some(ContextMode::Static),
+            "adopted desired must be persisted, overwriting the stale stored value"
+        );
     }
 
     #[test]
