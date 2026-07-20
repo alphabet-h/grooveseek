@@ -518,3 +518,117 @@ fn test_status_shows_context_mode_static_without_model_download() {
     assert!(status.contains("Documents: 1"), "got:\n{status}");
     assert!(status.contains("Chunks: 1"), "got:\n{status}");
 }
+
+// ---------------------------------------------------------------------------
+// codex P2 on PR #73 (F3): Static-mode rename must not take the same-hash
+// fast path when the document's context-title is filename-derived.
+// ---------------------------------------------------------------------------
+
+/// No frontmatter at all -- `ctx_title` falls back to the filename stem
+/// (`parser::txt::derive_title_pub`, E-1: `-`/`_` become spaces). Renaming
+/// this file changes the filename-derived title even though the file's
+/// *content* (and hence its SHA-256 hash) does not change.
+const NO_TITLE_MD: &str = concat!(
+    "## Section\n",
+    "\n",
+    "Body content that is long enough to pass the quality filter comfortably, ",
+    "mentioning rename regression testing details for the F3 codex fix.\n",
+);
+
+/// codex P2 on PR #73 (F3): renaming a frontmatter-title-less file in Static
+/// mode must re-embed (not take the same-hash rename fast path in
+/// `index_single_disk_entry`), because the chunk's `context_text` breadcrumb
+/// is derived from the *filename* (E-1) and would otherwise go stale after
+/// the rename. Before the fix, `rebuild_index` applied `db.rename_document`
+/// (path UPDATE only) and then called `index_single_disk_entry` on the
+/// renamed entry with `force=false`; since the disk hash always matches the
+/// just-renamed `documents.content_hash` row, the hash-equality fast path
+/// fired unconditionally and skipped re-parsing -- so `context_text` kept
+/// the *old* filename-derived title forever. This test pins the fix that
+/// forces renamed entries through a full reparse/re-embed in Static mode.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_static_mode_rename_no_title_reembeds_and_updates_context() {
+    let layout = TempKbLayout::new("kb-mcp-ctx-f3-static");
+    layout.write("old-widget-doc.md", NO_TITLE_MD);
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, CONTEXTUAL_ON).unwrap();
+    let db_path = layout.root().join(".kb-mcp.db");
+
+    let bin = kb_mcp_bin();
+    run_index(&bin, &cfg, layout.kb(), false);
+    let (id_before, ctx_before) = chunk_row_for_path(&db_path, "old-widget-doc.md");
+    assert!(
+        ctx_before
+            .as_deref()
+            .is_some_and(|c| c.contains("old widget doc")),
+        "expected context_text to carry the filename-derived title, got: {ctx_before:?}"
+    );
+
+    // Rename on disk. Content is unchanged, so the disk hash after rename is
+    // identical to the pre-rename `documents.content_hash` row.
+    std::fs::rename(
+        layout.kb().join("old-widget-doc.md"),
+        layout.kb().join("new-gadget-doc.md"),
+    )
+    .expect("rename on disk");
+    run_index(&bin, &cfg, layout.kb(), false);
+
+    let (id_after, ctx_after) = chunk_row_for_path(&db_path, "new-gadget-doc.md");
+    assert_ne!(
+        id_before, id_after,
+        "Static-mode rename must re-embed (new chunks.id via full reparse), \
+         but rowid stayed {id_before} -- the rename fast path was not disabled"
+    );
+    assert!(
+        ctx_after
+            .as_deref()
+            .is_some_and(|c| c.contains("new gadget doc")),
+        "expected context_text to carry the new filename-derived title, got: {ctx_after:?}"
+    );
+    assert!(
+        ctx_after
+            .as_deref()
+            .is_some_and(|c| !c.contains("old widget doc")),
+        "expected the stale filename-derived title to be gone, got: {ctx_after:?}"
+    );
+}
+
+/// Off-mode control: the same rename scenario must still take the same-hash
+/// fast path (no re-embed) -- Off mode never embeds context, so a
+/// filename-derived title change is harmless and the perf optimization must
+/// be preserved (F3 fix must be Static-only).
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_off_mode_rename_no_title_keeps_fast_path() {
+    let layout = TempKbLayout::new("kb-mcp-ctx-f3-off");
+    layout.write("old-widget-doc.md", NO_TITLE_MD);
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, CONTEXTUAL_OFF).unwrap();
+    let db_path = layout.root().join(".kb-mcp.db");
+
+    let bin = kb_mcp_bin();
+    run_index(&bin, &cfg, layout.kb(), false);
+    let (id_before, ctx_before) = chunk_row_for_path(&db_path, "old-widget-doc.md");
+    assert!(
+        ctx_before.is_none(),
+        "Off mode never stores context_text, got: {ctx_before:?}"
+    );
+
+    std::fs::rename(
+        layout.kb().join("old-widget-doc.md"),
+        layout.kb().join("new-gadget-doc.md"),
+    )
+    .expect("rename on disk");
+    run_index(&bin, &cfg, layout.kb(), false);
+
+    let (id_after, ctx_after) = chunk_row_for_path(&db_path, "new-gadget-doc.md");
+    assert_eq!(
+        id_before, id_after,
+        "Off-mode rename must keep the same-hash fast path (chunks.id stable)"
+    );
+    assert!(
+        ctx_after.is_none(),
+        "Off mode never stores context_text, got: {ctx_after:?}"
+    );
+}

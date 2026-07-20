@@ -348,6 +348,15 @@ pub fn rebuild_index(
 
     // rename 検出 + atomically な rename 適用。
     // force=true のときは skip (embedding 全件再計算の意図)。
+    // codex P2 (PR #73 F3): rename 先の new_path を集めておく。Static モードでは
+    // rename された entry だけ下の loop で force 扱いにし、same-hash fast path
+    // (index_single_disk_entry 冒頭の hash 一致 skip) を意図的に無効化する。
+    // rename は path UPDATE のみで内容 (hash) は変わらないため、そのまま fast
+    // path に乗ると、frontmatter title 無し文書で context 用 title が filename
+    // stem 由来 (E-1) にもかかわらず再 parse されず、breadcrumb (chunk.context)
+    // が旧 filename のまま stale 化する。Off モードは context を embed に使わない
+    // ため無害 = 従来通り fast path を維持する。
+    let mut renamed_new_paths: HashSet<String> = HashSet::new();
     let renamed: u32 = if force {
         0
     } else {
@@ -358,6 +367,9 @@ pub fn rebuild_index(
         db.rename_documents_atomic(&pairs)?;
         for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
+            if context_mode == ContextMode::Static {
+                renamed_new_paths.insert(new_path.clone());
+            }
         }
         pairs.len() as u32
     };
@@ -370,13 +382,17 @@ pub fn rebuild_index(
     for entry in &disk_entries {
         visited_paths.insert(entry.rel.clone());
 
+        // rename された entry (Static モードのみ) は force=true で再 parse/embed
+        // させ、他の unchanged file の hash fast path はそのまま活かす。
+        let entry_force = force || renamed_new_paths.contains(&entry.rel);
+
         match index_single_disk_entry(
             db,
             embedder,
             entry,
             exclude_headings,
             registry,
-            force,
+            entry_force,
             context_mode,
         )? {
             SingleResult::Updated { chunks } => {
