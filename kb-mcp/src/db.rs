@@ -394,6 +394,10 @@ fn rrf_topk(
         .collect()
 }
 
+/// [`Database::chunk_texts_with_context_for_path`] の戻り値の要素型:
+/// `(heading, content, context_text)`。
+pub type ChunkTextWithContext = (Option<String>, String, Option<String>);
+
 impl Database {
     /// Open (or create) a file-backed database at `path`.
     pub fn open(path: &str) -> Result<Self> {
@@ -881,6 +885,40 @@ impl Database {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![path], |row| {
             Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::chunk_texts_for_path`] の `context_text` 込み版
+    /// (heading, content, context_text)。
+    ///
+    /// codex P2 round 2 (finding B): Static context mode の frontmatter-only
+    /// skip 判定は `context_text` (= ancestry breadcrumb) の変化も検知する
+    /// 必要があるため、既存 `chunk_texts_for_path` (Off モード用、2-tuple) とは
+    /// 別の専用メソッドとして追加した。既存の呼び出し元・テストに影響しない
+    /// ようシグネチャを分けている。
+    pub fn chunk_texts_with_context_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<ChunkTextWithContext>> {
+        let sql = "
+            SELECT c.heading, c.content, c.context_text
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.path = ?1
+            ORDER BY c.chunk_index
+        ";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![path], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {

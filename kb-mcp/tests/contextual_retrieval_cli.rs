@@ -632,3 +632,145 @@ fn test_off_mode_rename_no_title_keeps_fast_path() {
         "Off mode never stores context_text, got: {ctx_after:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// codex P2 round 2 (finding B, 根治): frontmatter-only skip must detect ANY
+// context_text change, not just a frontmatter `title` change.
+// ---------------------------------------------------------------------------
+
+/// `## Legacy Notes` is excluded from chunking by `exclude_headings =
+/// ["Legacy Notes"]`, but per E-6 (`src/parser/markdown.rs::chunk_body`) an
+/// excluded heading's text is still pushed onto the ancestry stack for its
+/// non-excluded descendants -- so `### Detail`'s `context` breadcrumb is
+/// "Ops Guide > Legacy Notes > Detail" even though "Legacy Notes" itself
+/// never becomes a chunk row.
+const EXCLUDE_HEADING_DOC_V1: &str = concat!(
+    "---\n",
+    "title: Ops Guide\n",
+    "---\n",
+    "\n",
+    "## Legacy Notes\n",
+    "\n",
+    "This section is excluded from chunking entirely by config.\n",
+    "\n",
+    "### Detail\n",
+    "\n",
+    "Body content that is long enough to pass the quality filter comfortably, ",
+    "mentioning exclude-heading regression testing details for the finding B fix.\n",
+);
+
+/// Same as V1, but the excluded heading's own wording changed (still
+/// matches `exclude_headings = ["Legacy Notes"]` via substring, so it stays
+/// excluded either way) -- `### Detail`'s own (heading, content) is
+/// byte-for-byte identical to V1, only its ancestry-derived `context`
+/// changes ("Legacy Notes" -> "Legacy Notes Archive").
+const EXCLUDE_HEADING_DOC_V2: &str = concat!(
+    "---\n",
+    "title: Ops Guide\n",
+    "---\n",
+    "\n",
+    "## Legacy Notes Archive\n",
+    "\n",
+    "This section is excluded from chunking entirely by config.\n",
+    "\n",
+    "### Detail\n",
+    "\n",
+    "Body content that is long enough to pass the quality filter comfortably, ",
+    "mentioning exclude-heading regression testing details for the finding B fix.\n",
+);
+
+const EXCLUDE_HEADING_TOML_STATIC: &str = concat!(
+    "model = \"bge-small-en-v1.5\"\n",
+    "exclude_headings = [\"Legacy Notes\"]\n",
+    "[contextual]\n",
+    "enabled = true\n",
+);
+
+const EXCLUDE_HEADING_TOML_OFF: &str = concat!(
+    "model = \"bge-small-en-v1.5\"\n",
+    "exclude_headings = [\"Legacy Notes\"]\n",
+    "[contextual]\n",
+    "enabled = false\n",
+);
+
+/// codex P2 round 2 (finding B): before the fix, the frontmatter-only skip
+/// gate only compared (heading, content) plus a title-only check
+/// (`get_document_title` == `parsed.frontmatter.title`). Since `### Detail`'s
+/// own heading/content never change here and `title` never changes either,
+/// the old gate incorrectly took the fast path and left `context_text`
+/// stale with the old "Legacy Notes" wording. The fix compares
+/// (heading, content, context_text) as a whole in Static mode, so this
+/// ancestry-only change is now detected and forces a re-embed.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_static_mode_exclude_heading_wording_change_forces_reembed_and_updates_context() {
+    let layout = TempKbLayout::new("kb-mcp-ctx-f8-b-static");
+    layout.write("ops-guide.md", EXCLUDE_HEADING_DOC_V1);
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, EXCLUDE_HEADING_TOML_STATIC).unwrap();
+    let db_path = layout.root().join(".kb-mcp.db");
+
+    let bin = kb_mcp_bin();
+    run_index(&bin, &cfg, layout.kb(), false);
+    let (id_before, ctx_before) = chunk_row_for_path(&db_path, "ops-guide.md");
+    assert!(
+        ctx_before
+            .as_deref()
+            .is_some_and(|c| c.contains("Legacy Notes") && !c.contains("Archive")),
+        "expected context_text to carry the original excluded-heading wording, got: {ctx_before:?}"
+    );
+
+    // Only the excluded heading's own wording changes; `### Detail`'s
+    // (heading, content) is unchanged.
+    layout.write("ops-guide.md", EXCLUDE_HEADING_DOC_V2);
+    run_index(&bin, &cfg, layout.kb(), false);
+    let (id_after, ctx_after) = chunk_row_for_path(&db_path, "ops-guide.md");
+
+    assert_ne!(
+        id_before, id_after,
+        "exclude-heading-only wording change must re-embed (new chunks.id via full reparse), \
+         but rowid stayed {id_before} -- the (heading, content)-only gate was not extended \
+         to context_text"
+    );
+    assert!(
+        ctx_after.as_deref().is_some_and(|c| c.contains("Archive")),
+        "expected context_text to carry the updated excluded-heading wording, got: {ctx_after:?}"
+    );
+}
+
+/// Off-mode control: the same wording change must still take the
+/// frontmatter-only skip fast path (no re-embed) -- Off mode never embeds
+/// or stores context_text, so an ancestry-only wording change is invisible
+/// and the perf optimization must be preserved (finding B's fix must be
+/// Static-only, matching finding A / F3).
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_off_mode_exclude_heading_wording_change_keeps_fast_path() {
+    let layout = TempKbLayout::new("kb-mcp-ctx-f8-b-off");
+    layout.write("ops-guide.md", EXCLUDE_HEADING_DOC_V1);
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, EXCLUDE_HEADING_TOML_OFF).unwrap();
+    let db_path = layout.root().join(".kb-mcp.db");
+
+    let bin = kb_mcp_bin();
+    run_index(&bin, &cfg, layout.kb(), false);
+    let (id_before, ctx_before) = chunk_row_for_path(&db_path, "ops-guide.md");
+    assert!(
+        ctx_before.is_none(),
+        "Off mode never stores context_text, got: {ctx_before:?}"
+    );
+
+    layout.write("ops-guide.md", EXCLUDE_HEADING_DOC_V2);
+    run_index(&bin, &cfg, layout.kb(), false);
+    let (id_after, ctx_after) = chunk_row_for_path(&db_path, "ops-guide.md");
+
+    assert_eq!(
+        id_before, id_after,
+        "Off-mode exclude-heading wording change must keep the frontmatter-only skip \
+         fast path (chunks.id stable)"
+    );
+    assert!(
+        ctx_after.is_none(),
+        "Off mode never stores context_text, got: {ctx_after:?}"
+    );
+}

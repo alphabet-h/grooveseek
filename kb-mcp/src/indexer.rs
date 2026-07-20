@@ -531,22 +531,47 @@ fn index_single_disk_entry(
     // content_hash のみ UPDATE する。BGE-M3 では数百 ms 〜秒規模の節約。
     // force=true / 新規ファイル / chunk 数変化は対象外。
     //
-    // E-8: Static モードでは context が title 由来。title が変わったら frontmatter-only
-    // skip を取らず全 chunk を re-embed する (stale context 防止)。Off では context を
-    // embed しないので title 変更は無害 = 従来通り meta-only 更新でよい。
-    let title_unchanged = context_mode != ContextMode::Static
-        || db.get_document_title(&entry.rel)?.as_deref() == parsed.frontmatter.title.as_deref();
+    // codex P2 round 2 (finding B, 根治): 旧実装は「frontmatter.title の変化」
+    // だけを個別に検知する専用 gate (title_unchanged、`get_document_title` の
+    // 追加 SELECT) を持っていたが、title 以外の要因で context breadcrumb が
+    // 変わるケース (例: exclude_headings 変更で見出し構造が変わる) を検知
+    // できなかった (E-8 の不完全な包摂)。Static モードでは (heading, content)
+    // に加えて context_text も比較対象へ含めることで、context に影響し得る
+    // あらゆる変化を一括して検知する (title 変化もこれに包摂される)。これに
+    // より専用 title_unchanged gate と冗長な `get_document_title` SELECT は
+    // 不要になったため撤去した。Off モードは context を embed/保存しないため、
+    // 従来通り (heading, content) のみで比較する (挙動不変)。
+    let chunks_unchanged = if context_mode == ContextMode::Static {
+        db.chunk_texts_with_context_for_path(&entry.rel)
+            .map(|existing| {
+                !existing.is_empty()
+                    && existing.len() == parsed.chunks.len()
+                    && existing
+                        .iter()
+                        .zip(parsed.chunks.iter())
+                        .all(|((eh, ec, ectx), c)| {
+                            eh.as_deref() == c.heading.as_deref()
+                                && *ec == c.content
+                                && ectx.as_deref() == c.context.as_deref()
+                        })
+            })
+            .unwrap_or(false)
+    } else {
+        db.chunk_texts_for_path(&entry.rel)
+            .map(|existing| {
+                !existing.is_empty()
+                    && existing.len() == parsed.chunks.len()
+                    && existing
+                        .iter()
+                        .zip(parsed.chunks.iter())
+                        .all(|((eh, ec), c)| {
+                            eh.as_deref() == c.heading.as_deref() && *ec == c.content
+                        })
+            })
+            .unwrap_or(false)
+    };
 
-    if !force
-        && title_unchanged
-        && let Ok(existing) = db.chunk_texts_for_path(&entry.rel)
-        && !existing.is_empty()
-        && existing.len() == parsed.chunks.len()
-        && existing
-            .iter()
-            .zip(parsed.chunks.iter())
-            .all(|((eh, ec), c)| eh.as_deref() == c.heading.as_deref() && *ec == c.content)
-    {
+    if !force && chunks_unchanged {
         let updated = db.update_document_meta(
             &entry.rel,
             parsed.frontmatter.title.as_deref(),
