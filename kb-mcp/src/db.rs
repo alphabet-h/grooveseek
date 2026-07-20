@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::collections::HashMap;
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -389,6 +389,11 @@ impl Database {
         // WAL mode + foreign keys
         self.conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // feature-46: FTS 3 列 migration の repopulate は数秒〜十数秒 lock を保持する。
+        // busy_timeout 未設定 (default 0) だと serve 常駐中の別プロセス search/status が
+        // 即 SQLITE_BUSY で失敗する。10 秒待たせて migration 完了後に成功させる (spec §4.4)。
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(10_000))?;
 
         // vec_chunks は dim が未知の段階では作れないので遅延生成にする。
         // meta に dim が記録されていれば init 時に作るが、無ければ
@@ -1779,6 +1784,20 @@ impl Database {
     pub fn begin_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
         Ok(self.conn.unchecked_transaction()?)
     }
+
+    /// IMMEDIATE (RESERVED lock) トランザクションを開始する (feature-46)。
+    /// FTS 3 列 migration の double-checked locking (§4.4) で書き手を単一化する
+    /// ために使う。`&self` で呼べるよう `unchecked_transaction` 系の
+    /// `Transaction::new_unchecked` を behavior=Immediate で使う
+    /// (`transaction_with_behavior` は `&mut Connection` 要求で不可)。
+    /// 通常 Drop は rollback。成功時は `tx.commit()` を呼ぶこと。
+    #[allow(dead_code)]
+    fn begin_immediate_tx(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
+    }
 }
 
 impl Drop for Database {
@@ -2438,6 +2457,27 @@ mod tests {
 
         let map = db.all_path_hashes().unwrap();
         assert_eq!(map.get("a.md"), Some(&"h_NEW".to_string()));
+    }
+
+    #[test]
+    fn test_begin_immediate_tx_takes_reserved_lock() {
+        // IMMEDIATE tx は開始時点で書き込みロックを取る。commit まで別の
+        // unchecked_transaction からの書き込みが競合しないことを smoke で確認。
+        let db = Database::open_in_memory().unwrap();
+        let tx = db.begin_immediate_tx().unwrap();
+        tx.execute(
+            "INSERT INTO index_meta (key, value) VALUES ('probe', '1')",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let v: String = db
+            .conn
+            .query_row("SELECT value FROM index_meta WHERE key='probe'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(v, "1");
     }
 
     #[test]
