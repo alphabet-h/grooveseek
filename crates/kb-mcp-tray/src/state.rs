@@ -30,7 +30,7 @@ pub struct IndexingState {
 
 /// Polling state machine. 1 minute (= 12 polls at 5s interval) of consecutive
 /// failures = Red. 1 successful poll resets failures to 0 (no hysteresis,
-/// spec section 6 "蝗槫ｾｩ繧ｻ繝槭Φ繝・ぅ繧ｯ繧ｹ").
+/// spec section 6 "回復セマンティクス").
 pub struct StatusState {
     pub consecutive_failures: u32,
     pub indexing_active: bool,

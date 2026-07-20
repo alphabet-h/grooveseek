@@ -9,7 +9,7 @@ use tao::event_loop::EventLoopProxy;
 ///
 /// Failures increment a counter; 12 consecutive failures (= 1 minute at 5s
 /// interval) flip the dot to Red. A single success resets the counter to 0
-/// (= no hysteresis, spec section 6 "蝗槫ｾｩ繧ｻ繝槭Φ繝・ぅ繧ｯ繧ｹ").
+/// (= no hysteresis, spec section 6 "回復セマンティクス").
 pub async fn run(status_url: String, proxy: EventLoopProxy<UserEvent>) {
     let mut state = StatusState::new();
     let mut interval = tokio::time::interval(Duration::from_secs(5));
