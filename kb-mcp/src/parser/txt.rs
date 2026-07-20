@@ -26,6 +26,7 @@ impl Parser for TxtParser {
 
         // MVP: single chunk. EXT-4 will break on paragraph boundaries.
         // Empty body → no chunks (indexer skips files with no chunks).
+        let context = super::build_context(&[frontmatter.title.as_deref().unwrap_or("")]);
         let chunks = if body.trim().is_empty() {
             Vec::new()
         } else {
@@ -34,7 +35,7 @@ impl Parser for TxtParser {
                 heading: None,
                 level: None,
                 content: body,
-                context: None,
+                context,
             }]
         };
 
@@ -196,5 +197,12 @@ mod tests {
         let p = TxtParser;
         assert_eq!(p.extension(), "txt");
         assert_eq!(p.id(), "txt");
+    }
+
+    #[test]
+    fn test_txt_context_is_title_only() {
+        let p = TxtParser;
+        let doc = p.parse("Hello world.\nSecond line.\n", "notes/hello.txt", &[]);
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("hello"));
     }
 }
