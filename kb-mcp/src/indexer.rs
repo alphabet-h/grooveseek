@@ -305,10 +305,15 @@ pub fn rebuild_index(
     }
 
     // feature-46: effective context mode を解決 (force / grandfather / warn を含む)。
-    // force の場合、CLI 経路は main.rs 側で reset_for_model 済み (DB 空)、MCP
-    // rebuild_index 経路は reset しないが全 doc を upsert (DELETE+INSERT) で
-    // 再 embed するため、いずれも結果 index は一様に desired mode になる。
-    let context_mode = resolve_context_mode(db, context_mode_desired, force)?;
+    // codex P2 (PR #73 F1): force 時は resolve より前に必ず DB を reset する
+    // (詳細は reset_and_resolve_context_mode のコメント参照)。
+    let context_mode = reset_and_resolve_context_mode(
+        db,
+        embedder.model_id(),
+        embedder.dimension() as u32,
+        context_mode_desired,
+        force,
+    )?;
 
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
@@ -881,6 +886,34 @@ pub(crate) fn resolve_context_mode(
             Ok(mode)
         }
     }
+}
+
+/// `force` 時に `resolve_context_mode` より前に必ず DB を reset してから解決する
+/// ラッパー (codex P2 on PR #73, finding F1)。
+///
+/// `resolve_context_mode(force=true)` は「呼ばれる時点で DB は既に空 (=
+/// `reset_for_model` 済み)」を前提に `desired` を即座に `index_meta` へ書く。
+/// CLI 経路 (`main.rs` の `Commands::Index`) はその前提を呼び出し側で満たして
+/// いたが、MCP `rebuild_index` tool (`server.rs`) はここに来るまで reset を
+/// 挟まないまま `rebuild_index(force=true)` を呼んでいた。そのため「新 mode を
+/// 記録した直後、まだ upsert していない旧 mode の chunk が残っている」状態で
+/// rebuild が abort すると、mixed index (meta は新 mode、chunk は旧 mode) に
+/// なり得た。呼び出し元 (`rebuild_index`) の先頭でこの関数を通すことで、
+/// force 時は必ず reset → resolve の順序を DB 層で強制する。
+///
+/// `reset_for_model` の DELETE は冪等なので、CLI 経路のように呼び出し側で
+/// 既に reset 済みの場合にここでもう一度呼んでも無害。
+pub(crate) fn reset_and_resolve_context_mode(
+    db: &Database,
+    model_id: &str,
+    dim: u32,
+    desired: ContextMode,
+    force: bool,
+) -> Result<ContextMode> {
+    if force {
+        db.reset_for_model(model_id, dim)?;
+    }
+    resolve_context_mode(db, desired, force)
 }
 
 /// Compute the hex-encoded SHA-256 digest of raw bytes. Byte-level hashing is the
@@ -1658,6 +1691,95 @@ mod tests {
         let m = resolve_context_mode(&db, ContextMode::Static, true).unwrap();
         assert_eq!(m, ContextMode::Static);
         assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+    }
+
+    #[test]
+    fn test_reset_and_resolve_context_mode_force_wipes_existing_chunks() {
+        // codex P2 on PR #73 (F1) regression: MCP `rebuild_index` tool の force
+        // 経路は (fix 前は) reset_for_model を呼ばずに resolve_context_mode だけ
+        // 呼んでいたため、「新 mode を記録した直後もまだ旧 mode の chunk が
+        // DB に残っている」瞬間が生じ得た。reset_and_resolve_context_mode は
+        // force 時に resolve より前で必ず reset_for_model を呼ぶことでこれを防ぐ。
+        // ここでは MCP 経路を model (Embedder 不要): 呼び出し側で reset を挟まず
+        // 「旧 mode で index 済みの DB」に直接 force call するシナリオを再現する。
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let doc_id = db
+            .upsert_document("stale.md", Some("Stale"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "stale body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(db.chunk_count().unwrap(), 1, "precondition: DB has 1 chunk");
+
+        let mode = reset_and_resolve_context_mode(
+            &db,
+            "bge-small-en-v1.5",
+            384,
+            ContextMode::Static,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(mode, ContextMode::Static);
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+        assert_eq!(
+            db.chunk_count().unwrap(),
+            0,
+            "force must wipe pre-existing chunks before the new mode is recorded, \
+             even when the caller (MCP rebuild_index tool) never called reset_for_model itself"
+        );
+        assert_eq!(
+            db.document_count().unwrap(),
+            0,
+            "force must wipe pre-existing documents alongside chunks"
+        );
+    }
+
+    #[test]
+    fn test_reset_and_resolve_context_mode_non_force_does_not_wipe() {
+        // 対照テスト: force=false では reset を経由せず resolve_context_mode の
+        // 通常挙動 (DB-stored mode 優先、chunk 保持) のまま。
+        let db = test_db();
+        db.write_context_mode(ContextMode::Off).unwrap();
+        let doc_id = db
+            .upsert_document("kept.md", Some("Kept"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "kept body",
+            None,
+            &vec![0.0f32; 384],
+            1.0,
+        )
+        .unwrap();
+
+        let mode = reset_and_resolve_context_mode(
+            &db,
+            "bge-small-en-v1.5",
+            384,
+            ContextMode::Static,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(mode, ContextMode::Off, "non-force keeps DB-stored mode");
+        assert_eq!(
+            db.chunk_count().unwrap(),
+            1,
+            "non-force must not wipe existing chunks"
+        );
     }
 
     // -----------------------------------------------------------------------
