@@ -38,6 +38,7 @@ fn search_result_carries_document_id() {
         Some("Heading 1"),
         Some(1),
         "rust async runtime",
+        None,
         &[0.1_f32; 384],
         1.0,
     )
@@ -48,6 +49,7 @@ fn search_result_carries_document_id() {
         Some("Heading 2"),
         Some(1),
         "tokio runtime details",
+        None,
         &[0.2_f32; 384],
         1.0,
     )
