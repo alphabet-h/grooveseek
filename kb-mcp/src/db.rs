@@ -131,6 +131,31 @@ pub struct ChunkRow {
     pub level: Option<u8>,
 }
 
+/// index の context 適用状態 (feature-46)。`index_meta.context_mode` に永続化する。
+/// - `Off`: context を embedding / FTS に使わない (legacy DB は grandfather でここ)
+/// - `Static`: parser 生成の静的 context を embedding + FTS + reranker に注入
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMode {
+    Off,
+    Static,
+}
+
+impl ContextMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Static => "static",
+        }
+    }
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "static" => Some(Self::Static),
+            _ => None,
+        }
+    }
+}
+
 /// Search 系 API に渡す filter 引数の集約。
 ///
 /// 既存の category / topic / min_quality に加え、feature-26 で path_globs /
@@ -1560,6 +1585,49 @@ impl Database {
             params![dim.to_string()],
         )?;
         Ok(())
+    }
+
+    /// `index_meta.context_mode` を読む。key 不在 / 未知値は `None` (= grandfather 判定へ)。
+    /// Task 2.5 で context_mode versioning の配線に消費される (現時点では未配線)。
+    #[allow(dead_code)]
+    pub fn read_context_mode(&self) -> Result<Option<ContextMode>> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'context_mode'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.as_deref().and_then(ContextMode::from_str_opt))
+    }
+
+    /// `index_meta.context_mode` を記録する (INSERT OR REPLACE)。
+    /// Task 2.5 で context_mode versioning の配線に消費される (現時点では未配線)。
+    #[allow(dead_code)]
+    pub fn write_context_mode(&self, mode: ContextMode) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('context_mode', ?1)",
+            params![mode.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
+    /// 未 index / title NULL は `None`。Task 2.5/2.7 で消費される (現時点では未配線)。
+    #[allow(dead_code)]
+    pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let title: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT title FROM documents WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(title.flatten())
     }
 
     /// `index_meta` から `tags_parse_failures` key を read する (F-63)。
@@ -3683,6 +3751,40 @@ mod tests {
             .unwrap();
         // dim missing → None (not an error, treated as unrecorded).
         assert!(db.read_embedding_meta().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_context_mode_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.read_context_mode().unwrap().is_none()); // key 不在
+        db.write_context_mode(ContextMode::Static).unwrap();
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Static));
+        db.write_context_mode(ContextMode::Off).unwrap();
+        assert_eq!(db.read_context_mode().unwrap(), Some(ContextMode::Off));
+    }
+
+    #[test]
+    fn test_context_mode_malformed_is_none() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO index_meta (key, value) VALUES ('context_mode', 'garbage')",
+                [],
+            )
+            .unwrap();
+        assert!(db.read_context_mode().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_document_title() {
+        let db = db_with_384();
+        db.upsert_document("n/a.md", Some("My Title"), None, None, None, &[], None, "h")
+            .unwrap();
+        assert_eq!(
+            db.get_document_title("n/a.md").unwrap().as_deref(),
+            Some("My Title")
+        );
+        assert!(db.get_document_title("missing.md").unwrap().is_none());
     }
 
     #[test]

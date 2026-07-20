@@ -163,3 +163,11 @@ bind = "127.0.0.1:3100"
 #enabled = false
 #whole_doc_threshold_tokens = 100     # token_count below this -> whole document fallback
 #max_expanded_tokens = 2000           # cap for adjacent merge / whole-doc (BGE-M3 supports up to 8192)
+
+# [contextual] (optional, feature-46+).
+# 静的 Contextual Retrieval: parser 生成の静的 context breadcrumb を
+# embedding / FTS / reranker に注入する。省略時は有効 (デフォルト on)。
+# 新規 index では追加コストほぼゼロで恩恵があり、既存 DB は context_mode
+# versioning により影響を受けない。
+# [contextual]
+# enabled = true   # 静的 context breadcrumb を embedding/FTS/reranker に注入 (feature-46, default true)
