@@ -45,6 +45,10 @@ pub struct SearchResult {
     pub topic: Option<String>,
     pub date: Option<String>,
     pub tags: Vec<String>,
+    /// feature-46: contextualized retrieval 用の context prefix (chunk 生成時に
+    /// LLM が付与)。`None` = context 機能 off の DB / context なし chunk。
+    /// reranker 入力合成にのみ使い、`SearchHit` へは carry しない (API 不変)。
+    pub context_text: Option<String>,
 }
 
 /// `SearchHit.content` (UTF-8) 内の byte offset 範囲。
@@ -976,6 +980,8 @@ impl Database {
                     topic,
                     date,
                     tags: self.parse_tags_json_recording(tags_json),
+                    // graph seed は rerank しないので context 合成は不要。
+                    context_text: None,
                 },
             ));
         }
@@ -1186,7 +1192,7 @@ impl Database {
             "
             SELECT c.id, bm25(fts_chunks, {h}, {ctx}, {c}) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
-                   d.path, d.title, d.topic, d.date, d.category, d.tags
+                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
@@ -1215,6 +1221,7 @@ impl Database {
                 row.get::<_, Option<String>>(9)?,  // date
                 row.get::<_, Option<String>>(10)?, // category
                 row.get::<_, Option<String>>(11)?, // tags (JSON)
+                row.get::<_, Option<String>>(12)?, // context_text
             ))
         })?;
 
@@ -1233,6 +1240,7 @@ impl Database {
                 date,
                 r_category,
                 tags_json,
+                context_text,
             ) = row?;
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
@@ -1277,6 +1285,7 @@ impl Database {
                     topic: r_topic,
                     date,
                     tags: hit_tags,
+                    context_text,
                 },
             ));
             if results.len() >= limit as usize {
@@ -1398,7 +1407,7 @@ impl Database {
         let sql = "
             SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
-                   d.path, d.title, d.topic, d.date, d.category, d.tags
+                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
             FROM vec_chunks v
             JOIN chunks c ON c.id = v.chunk_id
             JOIN documents d ON d.id = c.document_id
@@ -1422,6 +1431,7 @@ impl Database {
                 row.get::<_, Option<String>>(9)?,  // date
                 row.get::<_, Option<String>>(10)?, // category
                 row.get::<_, Option<String>>(11)?, // tags (JSON)
+                row.get::<_, Option<String>>(12)?, // context_text
             ))
         })?;
 
@@ -1440,6 +1450,7 @@ impl Database {
                 date,
                 r_category,
                 tags_json,
+                context_text,
             ) = row?;
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
@@ -1484,6 +1495,7 @@ impl Database {
                     topic: r_topic,
                     date,
                     tags: hit_tags,
+                    context_text,
                 },
             ));
             if out.len() >= limit as usize {
@@ -1981,6 +1993,7 @@ fn dummy_search_result_for_id(id: i64) -> SearchResult {
         topic: None,
         date: None,
         tags: Vec::new(),
+        context_text: None,
     }
 }
 
@@ -4294,9 +4307,34 @@ mod tests {
             topic: None,
             date: None,
             tags: vec![],
+            context_text: None,
         };
         let h: SearchHit = r.into();
         assert!(h.match_spans.is_none());
+    }
+
+    #[test]
+    fn test_searchhit_does_not_serialize_context_text() {
+        // context_text を持つ SearchResult を SearchHit に変換 → JSON に context が出ない
+        let r = SearchResult {
+            score: 1.0,
+            content: "body".to_string(),
+            heading: Some("H".to_string()),
+            document_id: 1,
+            path: "a.md".to_string(),
+            title: Some("T".to_string()),
+            topic: None,
+            date: None,
+            tags: vec![],
+            context_text: Some("T > H".to_string()),
+        };
+        let hit: SearchHit = r.into();
+        let json = serde_json::to_string(&hit).unwrap();
+        assert!(
+            !json.contains("context"),
+            "context must not leak into SearchHit JSON: {json}"
+        );
+        assert!(!json.contains("T > H"));
     }
 
     /// Local helper: create a temp directory unique to this test process /
@@ -4569,6 +4607,7 @@ mod tests {
                     topic: None,
                     date: None,
                     tags: vec![],
+                    context_text: None,
                 },
             );
         }
@@ -4599,6 +4638,7 @@ mod tests {
                     topic: None,
                     date: None,
                     tags: vec![],
+                    context_text: None,
                 },
             );
         }

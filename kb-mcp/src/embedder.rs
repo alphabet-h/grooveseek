@@ -208,6 +208,16 @@ impl RerankerChoice {
     }
 }
 
+/// reranker 入力用に context を前置する (feature-46)。context_text が空/None なら
+/// content のみ (off の DB / context なし chunk では従来と同一)。Anthropic 原典の
+/// 結合形 `f"{context}\n\n{chunk}"` に忠実。
+fn contextualize_for_rerank(r: &SearchResult) -> String {
+    match r.context_text.as_deref() {
+        Some(ctx) if !ctx.trim().is_empty() => format!("{ctx}\n\n{}", r.content),
+        _ => r.content.clone(),
+    }
+}
+
 /// Cross-encoder reranker。`search_hybrid` が返した候補を query との共同
 /// エンコードで再スコア付けし、上位 `limit` 件に絞る。
 pub struct Reranker {
@@ -265,7 +275,13 @@ impl Reranker {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let documents: Vec<&str> = candidates.iter().map(|(_, r)| r.content.as_str()).collect();
+        // context 込みで rerank する (D-3)。&str 参照ベースだと合成文字列を保持できないので
+        // 一時 Vec<String> バッファを経由する。
+        let contextualized: Vec<String> = candidates
+            .iter()
+            .map(|(_, r)| contextualize_for_rerank(r))
+            .collect();
+        let documents: Vec<&str> = contextualized.iter().map(String::as_str).collect();
         let rerank_results = self.model.rerank(query, documents, false, None)?;
 
         // rerank_results は score 降順でソート済み。index は documents (= candidates) の位置。
@@ -367,6 +383,41 @@ mod tests {
         assert!(r.is_none());
     }
 
+    /// `mk` (既存の rerank 統合テスト用 helper) の context_text 対応版。
+    /// model DL 不要な pure fn テストから使う test-local helper。
+    fn mk_with_context(content: &str, context_text: Option<&str>) -> SearchResult {
+        SearchResult {
+            score: 0.0,
+            content: content.to_string(),
+            heading: None,
+            document_id: 0,
+            path: "x.md".to_string(),
+            title: None,
+            topic: None,
+            date: None,
+            tags: Vec::new(),
+            context_text: context_text.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_contextualize_for_rerank_prepends_context() {
+        let r = mk_with_context("body", Some("T > H"));
+        assert_eq!(contextualize_for_rerank(&r), "T > H\n\nbody");
+    }
+
+    #[test]
+    fn test_contextualize_for_rerank_none_is_content_only() {
+        let r = mk_with_context("body", None);
+        assert_eq!(contextualize_for_rerank(&r), "body");
+    }
+
+    #[test]
+    fn test_contextualize_for_rerank_empty_is_content_only() {
+        let r = mk_with_context("body", Some(""));
+        assert_eq!(contextualize_for_rerank(&r), "body");
+    }
+
     #[test]
     #[ignore] // requires BGE-reranker-v2-m3 download (~2.3 GB)
     fn test_bge_reranker_v2_m3_reorders_ja() {
@@ -385,6 +436,7 @@ mod tests {
             topic: None,
             date: None,
             tags: Vec::new(),
+            context_text: None,
         };
         let candidates = vec![
             (1i64, mk("天気予報の話題です")),
