@@ -38,8 +38,9 @@ impl Parser for DocxParser {
         let mut budget: u64 = 0;
         let doc_xml = super::ooxml::read_zip_entry(&mut zip, "word/document.xml", &mut budget)?
             .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
-        let chunks = parse_document_xml(&doc_xml, exclude_headings);
+        // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
         let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
+        let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
         let raw_content = chunks
             .iter()
             .map(|c| c.content.as_str())
@@ -63,21 +64,23 @@ impl Parser for DocxParser {
 /// 表 (`w:tbl`) 内のテキストも専用ハンドリングはしない: OOXML 上は
 /// `w:tbl > w:tr > w:tc > w:p > w:r > w:t` と入れ子になっているだけなので、
 /// 通常の `<w:p>` 境界処理だけで現在のセクション本文に自然に取り込まれる。
-fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
+fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec<Chunk> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
 
-    // (heading, level, body) の raw セクション列を組む。見出し前本文は先頭の
-    // heading=None セクションに溜まる。
+    // (heading, level, 祖先見出しスナップショット, body) の raw セクション列を組む。
+    // 見出し前本文は先頭の heading=None セクションに溜まる。
     struct Section {
         heading: Option<String>,
         level: Option<u8>,
+        ancestry: Vec<String>,
         body: String,
     }
     let mut sections: Vec<Section> = vec![Section {
         heading: None,
         level: None,
+        ancestry: Vec::new(),
         body: String::new(),
     }];
 
@@ -87,6 +90,10 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
     // 除外対象見出し配下かどうか。true の間は本文段落を一切 push しない (次の
     // 非除外見出しで解除、MarkdownParser::chunk_body と同じ excluded フラグ管理)。
     let mut excluded = false;
+    // ancestry stack: 現在位置より浅い見出しの列 (level ASC)。markdown とは独立の
+    // 実装 (docx はフラット段落列を集めてから chunk 化する構造のため)。exclude
+    // された見出しも積む (E-6 の docx 版)。
+    let mut stack: Vec<(u8, String)> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -126,6 +133,17 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
                 b"p" => {
                     let text = para_text.trim().to_string();
                     if let Some(level) = para_style {
+                        // stack を pop → 祖先確定 → この見出しを push (exclude でも積む = E-6)。
+                        while let Some((l, _)) = stack.last() {
+                            if *l >= level {
+                                stack.pop();
+                            } else {
+                                break;
+                            }
+                        }
+                        let ancestry: Vec<String> = stack.iter().map(|(_, h)| h.clone()).collect();
+                        stack.push((level, text.clone()));
+
                         // 見出し段落。exclude 対象なら新規 section を作らず
                         // `excluded = true` にするだけ (= 次の非除外見出しまで
                         // 本文段落を丸ごと捨てる。無題 chunk としても残さない
@@ -137,6 +155,7 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
                             sections.push(Section {
                                 heading: Some(text),
                                 level: Some(level),
+                                ancestry,
                                 body: String::new(),
                             });
                         }
@@ -161,11 +180,26 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str]) -> Vec<Chunk> {
         .into_iter()
         .filter(|s| s.heading.is_some() || !s.body.trim().is_empty())
         .enumerate()
-        .map(|(i, s)| Chunk {
-            index: i,
-            heading: s.heading,
-            level: s.level,
-            content: s.body,
+        .map(|(i, s)| {
+            // context parts: [title, ...ancestry, heading]
+            let mut parts: Vec<&str> = Vec::with_capacity(s.ancestry.len() + 2);
+            if let Some(t) = title {
+                parts.push(t);
+            }
+            for a in &s.ancestry {
+                parts.push(a);
+            }
+            if let Some(h) = &s.heading {
+                parts.push(h);
+            }
+            let context = super::build_context(&parts);
+            Chunk {
+                index: i,
+                heading: s.heading,
+                level: s.level,
+                content: s.body,
+                context,
+            }
         })
         .collect()
 }
@@ -380,5 +414,59 @@ mod tests {
         assert_eq!(doc.chunks.len(), 1);
         assert_eq!(doc.chunks[0].heading.as_deref(), Some("章1"));
         assert!(doc.chunks[0].content.contains("表内セル"));
+    }
+
+    #[test]
+    fn test_docx_context_heading_hierarchy() {
+        // 章1 (Heading1→level2) > 節1.1 (Heading2→level3)。title は core.xml 無しなので
+        // filename fallback ("a")。
+        let bytes = make_minimal_docx(&[
+            (Some("Heading1"), "章1"),
+            (None, "本文A これは十分な長さの本文です十分な長さの本文です"),
+            (Some("Heading2"), "節1.1"),
+            (None, "本文B これは十分な長さの本文です十分な長さの本文です"),
+        ]);
+        let doc = DocxParser.parse_bytes(&bytes, "docs/a.docx", &[]).unwrap();
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("a > 章1"));
+        assert_eq!(doc.chunks[1].context.as_deref(), Some("a > 章1 > 節1.1"));
+    }
+
+    #[test]
+    fn test_docx_context_leading_body_is_title_only() {
+        // E-3 相当: 見出し前本文 (heading None) は title のみ
+        let bytes = make_minimal_docx(&[
+            (
+                None,
+                "前書き これは十分な長さの前書きですよ十分な長さの前書き",
+            ),
+            (Some("Heading1"), "章1"),
+            (
+                None,
+                "本文 これは十分な長さの本文ですよ十分な長さの本文ですよ",
+            ),
+        ]);
+        let doc = DocxParser.parse_bytes(&bytes, "a.docx", &[]).unwrap();
+        assert_eq!(doc.chunks[0].heading, None);
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn test_docx_context_true_level_skip_heading1_to_heading3() {
+        // E-7: docx は Heading1-6 → level 2-6 の全段階を持つため、markdown
+        // (h2/h3 のみ) では起こらない「真の level 飛び」(Heading1 直後に
+        // Heading2 を挟まず Heading3 が来る = level 2 → level 4) が実際に発生
+        // する。この場合も Heading3 の祖先は直近の浅い見出し (章1) のみになる
+        // ことを検証する。
+        let bytes =
+            make_minimal_docx(&[(Some("Heading1"), "章1"), (Some("Heading3"), "小節1.1.1")]);
+        let doc = DocxParser.parse_bytes(&bytes, "docs/a.docx", &[]).unwrap();
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("章1"));
+        assert_eq!(doc.chunks[0].level, Some(2));
+        assert_eq!(doc.chunks[1].heading.as_deref(), Some("小節1.1.1"));
+        assert_eq!(doc.chunks[1].level, Some(4));
+        assert_eq!(
+            doc.chunks[1].context.as_deref(),
+            Some("a > 章1 > 小節1.1.1")
+        );
     }
 }

@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use clap::Parser;
 use std::path::PathBuf;
 

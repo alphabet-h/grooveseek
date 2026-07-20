@@ -376,6 +376,7 @@ mod tests {
             Some(heading),
             None,
             content,
+            None,
             &dummy_embedding(val),
             1.0,
         )
@@ -575,6 +576,7 @@ mod tests {
             Some("h1"),
             None,
             "c1",
+            None,
             &dummy_embedding(0.0),
             1.0,
         )
@@ -585,6 +587,7 @@ mod tests {
             Some("h2"),
             None,
             "c2",
+            None,
             &dummy_embedding(0.1),
             1.0,
         )
@@ -650,6 +653,7 @@ mod tests {
             Some("h1"),
             None,
             "c1",
+            None,
             &dummy_embedding(0.001),
             1.0,
         )
@@ -660,6 +664,7 @@ mod tests {
             Some("h2"),
             None,
             "c2",
+            None,
             &dummy_embedding(0.002),
             1.0,
         )

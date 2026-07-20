@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use serde::Deserialize;
 
 /// Tray status indicator. 4 states total:

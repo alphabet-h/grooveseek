@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use std::sync::OnceLock;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;

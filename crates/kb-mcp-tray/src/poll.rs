@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use crate::UserEvent;
 use crate::state::{AdminStatus, StatusState};
 use std::time::Duration;

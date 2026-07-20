@@ -125,6 +125,8 @@ fn parse_xlsx_bytes_capped(
     let mut xlsx = calamine::Xlsx::new(cursor)
         .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
+    let frontmatter = xlsx_frontmatter(bytes, path_hint);
+    let title = frontmatter.title.as_deref().unwrap_or("");
     let mut chunks = Vec::new();
     // `sheet_names()` は Vec<String> を owned で返すため、ループ中に
     // `&mut xlsx` を再度借用しても (streaming reader との) 競合はない。
@@ -139,15 +141,17 @@ fn parse_xlsx_bytes_capped(
         if text.trim().is_empty() {
             continue; // 空シートは chunk を作らない
         }
+        let heading = format!("Sheet: {name}");
+        let context = super::build_context(&[title, &heading]);
         chunks.push(Chunk {
             index: chunks.len(),
-            heading: Some(format!("Sheet: {name}")),
+            heading: Some(heading),
             level: Some(2),
             content: text.trim_end().to_string(),
+            context,
         });
     }
 
-    let frontmatter = xlsx_frontmatter(bytes, path_hint);
     let raw_content = chunks
         .iter()
         .map(|c| c.content.as_str())
@@ -251,6 +255,9 @@ fn parse_xls_bytes_capped(
     let mut xls = calamine::Xls::new(cursor)
         .map_err(|e| anyhow!("{path_hint}: cannot open workbook (encrypted or corrupt): {e}"))?;
 
+    // xls (BIFF) には core.xml が無いため常にファイル名 fallback。
+    let frontmatter = xlsx_frontmatter(bytes, path_hint);
+    let title = frontmatter.title.as_deref().unwrap_or("");
     let mut chunks = Vec::new();
     for name in xls.sheet_names() {
         let range = match xls.worksheet_range(&name) {
@@ -279,16 +286,17 @@ fn parse_xls_bytes_capped(
         if text.trim().is_empty() {
             continue;
         }
+        let heading = format!("Sheet: {name}");
+        let context = super::build_context(&[title, &heading]);
         chunks.push(Chunk {
             index: chunks.len(),
-            heading: Some(format!("Sheet: {name}")),
+            heading: Some(heading),
             level: Some(2),
             content: text.trim_end().to_string(),
+            context,
         });
     }
 
-    // xls (BIFF) には core.xml が無いため常にファイル名 fallback。
-    let frontmatter = xlsx_frontmatter(bytes, path_hint);
     let raw_content = chunks
         .iter()
         .map(|c| c.content.as_str())
@@ -774,6 +782,19 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    #[test]
+    fn test_xlsx_context_is_title_and_sheet() {
+        let bytes = make_minimal_xlsx(&[("Sales", &[&["Q1", "100"]])]);
+        let doc = XlsxParser
+            .parse_bytes(&bytes, "docs/book.xlsx", &[])
+            .unwrap();
+        // core.xml 無し → filename title ("book")
+        assert_eq!(
+            doc.chunks[0].context.as_deref(),
+            Some("book > Sheet: Sales")
+        );
     }
 
     #[test]

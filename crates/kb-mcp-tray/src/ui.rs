@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use anyhow::{Context, Result};
 
 /// Launch the user's default browser at `ui_url` (= `Config::ui_url`,

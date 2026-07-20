@@ -544,6 +544,7 @@ fn index_single_disk_entry(
             chunk.heading.as_deref(),
             chunk.level,
             &chunk.content,
+            None, // PR-1: context は充填しない (PR-2 の context_mode 導入と同時に開始)
             embedding,
             score,
         )?;
@@ -1420,6 +1421,7 @@ mod tests {
             Some("intro"),
             None,
             "Hello world body.",
+            None,
             &emb,
             0.9,
         )

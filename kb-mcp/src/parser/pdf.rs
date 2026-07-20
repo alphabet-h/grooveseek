@@ -131,17 +131,21 @@ impl Parser for PdfParser {
             ));
         }
 
+        let title = frontmatter.title.as_deref().unwrap_or("");
         let mut chunks = Vec::new();
         for (i, page_text) in pages.iter().enumerate() {
             let content = post_process(page_text);
             if content.trim().is_empty() {
                 continue; // 空ページは chunk を作らない
             }
+            let heading = format!("p.{}", i + 1);
+            let context = super::build_context(&[title, &heading]);
             chunks.push(super::Chunk {
                 index: chunks.len(),
-                heading: Some(format!("p.{}", i + 1)),
+                heading: Some(heading),
                 level: None,
                 content,
+                context,
             });
         }
 
@@ -710,6 +714,25 @@ mod tests {
             !SUPPRESS_PANIC_OUTPUT.with(Cell::get),
             "guard Drop must reset the flag false"
         );
+    }
+
+    #[test]
+    fn test_pdf_context_is_title_and_page() {
+        // minimal.pdf は /Title 入り (Task 2.3 の前提)。context = "<title> > p.1"。
+        let doc = PdfParser
+            .parse_bytes(MINIMAL_PDF, "docs/minimal.pdf", &[])
+            .expect("minimal pdf must extract");
+        let c0 = doc.chunks[0].context.as_deref().unwrap();
+        assert!(c0.ends_with(" > p.1"), "got: {c0}");
+    }
+
+    #[test]
+    fn test_pdf_context_falls_back_to_filename_title() {
+        // untitled.pdf は /Title 無し → filename title ("untitled")
+        let doc = PdfParser
+            .parse_bytes(UNTITLED_PDF, "docs/untitled.pdf", &[])
+            .expect("untitled pdf must extract");
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("untitled > p.1"));
     }
 
     #[test]

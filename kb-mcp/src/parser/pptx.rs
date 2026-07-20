@@ -50,6 +50,10 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     // 個々のエントリが cap 未満でも積算で無制限に膨らむのを防ぐ)。
     let mut budget: u64 = 0;
 
+    // frontmatter を先に取得 (context の title に使う。budget は cumulative なので順序自由)
+    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
+    let title = frontmatter.title.as_deref().unwrap_or("").to_string();
+
     // slide エントリをファイル番号順に集める (zip 内順序非依存。
     // presentation.xml が読めない場合のフォールバック用)。
     let mut slide_nums: Vec<usize> = zip
@@ -77,7 +81,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             Some(b) => b,
             None => continue,
         };
-        let (title, body) = parse_slide_xml(&slide_xml);
+        let (title_opt, body) = parse_slide_xml(&slide_xml);
         let mut content = body;
         // notes: `ppt/slides/_rels/slide{file_n}.xml.rels` の notesSlide
         // relationship を解決する (dry-run (Task 3.7) で同番号 heuristic の
@@ -100,22 +104,23 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
                 content.push_str(notes_text.trim());
             }
         }
-        if content.trim().is_empty() && title.is_none() {
+        if content.trim().is_empty() && title_opt.is_none() {
             continue;
         }
-        let heading = match &title {
+        let heading = match &title_opt {
             Some(t) if !t.trim().is_empty() => format!("Slide {display_n}: {}", t.trim()),
             _ => format!("Slide {display_n}"),
         };
+        let context = super::build_context(&[title.as_str(), &heading]);
         chunks.push(Chunk {
             index: chunks.len(),
             heading: Some(heading),
             level: Some(2),
             content: content.trim().to_string(),
+            context,
         });
     }
 
-    let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
     let raw_content = chunks
         .iter()
         .map(|c| c.content.as_str())
@@ -861,6 +866,19 @@ mod tests {
         assert_eq!(doc.chunks.len(), 2);
         assert!(doc.chunks[0].content.contains("本文A"));
         assert!(doc.chunks[1].content.contains("本文B"));
+    }
+
+    #[test]
+    fn test_pptx_context_is_title_and_slide_heading() {
+        let bytes = make_minimal_pptx(&[(Some("概要"), "本文スライド1", None)]);
+        let doc = PptxParser
+            .parse_bytes(&bytes, "docs/deck.pptx", &[])
+            .unwrap();
+        // filename title ("deck") > "Slide 1: 概要"
+        assert_eq!(
+            doc.chunks[0].context.as_deref(),
+            Some("deck > Slide 1: 概要")
+        );
     }
 
     #[test]

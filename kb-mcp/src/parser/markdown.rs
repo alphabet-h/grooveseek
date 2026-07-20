@@ -15,9 +15,17 @@ impl Parser for MarkdownParser {
         "md"
     }
 
-    fn parse(&self, raw: &str, _path_hint: &str, exclude_headings: &[&str]) -> ParsedDocument {
+    fn parse(&self, raw: &str, path_hint: &str, exclude_headings: &[&str]) -> ParsedDocument {
         let (frontmatter, body) = extract_frontmatter(raw);
-        let chunks = chunk_body(&body, exclude_headings);
+        // context 用 title: frontmatter.title (非空) → filename stem fallback (E-1)。
+        // documents.title は frontmatter.title のまま (ここでは context 生成にのみ使う)。
+        let ctx_title = frontmatter
+            .title
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| super::txt::derive_title_pub(path_hint));
+        let chunks = chunk_body(&body, exclude_headings, ctx_title.as_deref());
         ParsedDocument {
             frontmatter,
             chunks,
@@ -121,82 +129,108 @@ fn extract_frontmatter(raw: &str) -> (Frontmatter, String) {
 // Heading-based chunking
 // ---------------------------------------------------------------------------
 
-fn chunk_body(body: &str, excludes: &[&str]) -> Vec<Chunk> {
-    let mut raw_chunks: Vec<(Option<(u8, String)>, String)> = Vec::new();
+/// (heading (level, text), 祖先見出しスナップショット, content)。
+/// clippy::type_complexity 回避のための alias。
+type RawChunk = (Option<(u8, String)>, Vec<String>, String);
+
+fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> {
+    // raw_chunks: (heading, 祖先見出しスナップショット, content)
+    let mut raw_chunks: Vec<RawChunk> = Vec::new();
     let mut current_heading: Option<(u8, String)> = None;
+    let mut current_ancestry: Vec<String> = Vec::new();
     let mut current_lines: Vec<&str> = Vec::new();
     let mut excluded = false;
+    // ancestry stack: 現在位置より浅い見出しの列 (level ASC)。exclude 見出しも積む (E-6)。
+    let mut stack: Vec<(u8, String)> = Vec::new();
 
     for line in body.lines() {
         if let Some((level, heading_text)) = strip_heading(line) {
-            if excludes.iter().any(|ex| heading_text.contains(ex)) {
-                if !excluded {
-                    let content = current_lines.join("\n").trim().to_string();
-                    if !content.is_empty() || current_heading.is_some() {
-                        raw_chunks.push((current_heading.clone(), content));
-                    }
-                }
-                excluded = true;
-                current_lines.clear();
-                current_heading = None;
-                continue;
-            }
-
+            // 1) 直前 chunk を flush (heading/ancestry は「今開いている chunk」のもの)
             if !excluded {
                 let content = current_lines.join("\n").trim().to_string();
                 if !content.is_empty() || current_heading.is_some() {
-                    raw_chunks.push((current_heading.clone(), content));
+                    raw_chunks.push((current_heading.clone(), current_ancestry.clone(), content));
                 }
             }
-
-            excluded = false;
-            current_heading = Some((level, heading_text));
             current_lines.clear();
+
+            // 2) この level に対して stack を pop → 残りが自見出しの祖先
+            while let Some((l, _)) = stack.last() {
+                if *l >= level {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+            let ancestry: Vec<String> = stack.iter().map(|(_, h)| h.clone()).collect();
+            // 3) この見出しを stack へ (exclude されても積む = E-6)
+            stack.push((level, heading_text.clone()));
+
+            // 4) 次 chunk の state を確定
+            if excludes.iter().any(|ex| heading_text.contains(ex)) {
+                excluded = true;
+                current_heading = None;
+                current_ancestry = Vec::new();
+            } else {
+                excluded = false;
+                current_heading = Some((level, heading_text));
+                current_ancestry = ancestry;
+            }
         } else if !excluded {
             current_lines.push(line);
         }
     }
-
     if !excluded {
         let content = current_lines.join("\n").trim().to_string();
         if !content.is_empty() || current_heading.is_some() {
-            raw_chunks.push((current_heading, content));
+            raw_chunks.push((current_heading, current_ancestry, content));
         }
     }
 
-    // 50-char 未満 chunk は直前 chunk に merge する。
-    // merge 後 chunk の heading / level は **最初に出現した heading のもの**
-    // を維持し、merge された後続 heading は content 側に `## h\n\n` で残す
-    // (legacy 挙動の継続)。
-    let mut merged: Vec<(Option<(u8, String)>, String)> = Vec::new();
-    for (heading, content) in raw_chunks {
+    // 50-char 未満 chunk は直前 chunk に merge。heading / level / **ancestry** は
+    // 最初に出現した heading のものを維持 (legacy 挙動 + E-9 の ancestry 引継ぎ)。
+    let mut merged: Vec<RawChunk> = Vec::new();
+    for (heading, ancestry, content) in raw_chunks {
         if content.len() < 50 && !merged.is_empty() {
             let prev = merged.last_mut().unwrap();
-            if !prev.1.is_empty() {
-                prev.1.push_str("\n\n");
+            if !prev.2.is_empty() {
+                prev.2.push_str("\n\n");
             }
             if let Some((_lvl, ref h)) = heading {
-                prev.1.push_str(&format!("## {h}\n\n"));
+                prev.2.push_str(&format!("## {h}\n\n"));
             }
-            prev.1.push_str(&content);
+            prev.2.push_str(&content);
         } else {
-            merged.push((heading, content));
+            merged.push((heading, ancestry, content));
         }
     }
 
     merged
         .into_iter()
         .enumerate()
-        .map(|(i, (heading_pair, content))| {
+        .map(|(i, (heading_pair, ancestry, content))| {
             let (level, heading) = match heading_pair {
                 Some((lvl, text)) => (Some(lvl), Some(text)),
                 None => (None, None),
             };
+            // context parts: [title, ...ancestry, heading]
+            let mut parts: Vec<&str> = Vec::with_capacity(ancestry.len() + 2);
+            if let Some(t) = title {
+                parts.push(t);
+            }
+            for a in &ancestry {
+                parts.push(a);
+            }
+            if let Some(h) = &heading {
+                parts.push(h);
+            }
+            let context = super::build_context(&parts);
             Chunk {
                 index: i,
                 heading,
                 level,
                 content,
+                context,
             }
         })
         .collect()
@@ -284,5 +318,95 @@ larger body enough enough enough enough enough enough enough.";
         let merged = doc.chunks.first().expect("expected at least one chunk");
         assert_eq!(merged.heading.as_deref(), Some("Big"));
         assert_eq!(merged.level, Some(2));
+    }
+
+    // brief 提供時の fixture では excludes を渡す手段がなく E-6 が検証不能だったため
+    // (team-lead 承認済み逸脱 1): excludes 引数を追加し全呼び出しをこちらに統一する。
+    fn parse_ctx(md: &str, title: &str, excludes: &[&str]) -> ParsedDocument {
+        MarkdownParser.parse(md, &format!("{title}.md"), excludes)
+    }
+
+    #[test]
+    fn test_context_simple_hierarchy() {
+        // title は path_hint (filename) 由来。h2 > h3 のパンくずが付く。
+        // (team-lead 承認済み逸脱 2: brief 原文の body は 50 字未満で 50-char merge に
+        // 飲まれ chunks[1] が存在しなくなるため、意図・期待 context 文字列は変えず
+        // body の文字数のみ 50 字以上に伸ばしている)
+        let md = "## 検索パイプライン\n\nintro body enough enough enough enough enough enough.\n\n### RRF の実装\n\nbody enough enough enough enough enough enough enough.";
+        let doc = parse_ctx(md, "設計ノート", &[]);
+        // preamble なし: chunk[0] = h2, chunk[1] = h3
+        assert_eq!(doc.chunks[0].heading.as_deref(), Some("検索パイプライン"));
+        assert_eq!(
+            doc.chunks[0].context.as_deref(),
+            Some("設計ノート > 検索パイプライン")
+        );
+        assert_eq!(doc.chunks[1].heading.as_deref(), Some("RRF の実装"));
+        assert_eq!(
+            doc.chunks[1].context.as_deref(),
+            Some("設計ノート > 検索パイプライン > RRF の実装")
+        );
+    }
+
+    #[test]
+    fn test_context_preamble_is_title_only() {
+        // E-3: heading なし preamble chunk は title のみ
+        let md = "leading prose without heading enough body to avoid the 50-char merge here.";
+        let doc = parse_ctx(md, "mydoc", &[]);
+        assert!(doc.chunks[0].heading.is_none());
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("mydoc"));
+    }
+
+    #[test]
+    fn test_context_level_skip_h2_to_h4() {
+        // E-7: level 飛び (h2 → h3 相当の deeper) — kb-mcp は h2/h3 のみ認識。
+        // h2 の直後に h3 が来た後、別 h2 が来ると h3 は pop され祖先から消える。
+        // (team-lead 承認済み逸脱 2: A/B の body を 50 字以上に伸ばし、A1 に merge
+        // されず A・B がそれぞれ独立 chunk として残るようにしている)
+        let md = "## A\n\nbody enough enough enough enough enough enough enough.\n\n### A1\n\nbody enough enough enough enough enough.\n\n## B\n\nbody enough enough enough enough enough enough enough.";
+        let doc = parse_ctx(md, "T", &[]);
+        let b = doc
+            .chunks
+            .iter()
+            .find(|c| c.heading.as_deref() == Some("B"))
+            .unwrap();
+        // B は h2 なので祖先は空、context = "T > B" (A/A1 は入らない)
+        assert_eq!(b.context.as_deref(), Some("T > B"));
+    }
+
+    #[test]
+    fn test_context_excluded_heading_still_on_stack() {
+        // E-6: 除外見出し配下の非除外 subsection は、除外見出しを祖先に持つ。
+        // (kb-mcp の exclude は「次見出しまで」= subtree 除外ではない)
+        let md = "## Secret\n\nsecret intro enough enough enough enough.\n\n### Detail\n\ndetail body enough enough enough enough.";
+        let doc = parse_ctx(md, "T", &["Secret"]);
+        // Secret 自身の chunk は出ない (excluded)。Detail (h3) は出る。
+        let detail = doc
+            .chunks
+            .iter()
+            .find(|c| c.heading.as_deref() == Some("Detail"))
+            .unwrap();
+        // ancestry に "Secret" が乗る (= 除外されても stack には積まれる、E-6 の本質)
+        assert_eq!(detail.context.as_deref(), Some("T > Secret > Detail"));
+        assert!(
+            !doc.chunks
+                .iter()
+                .any(|c| c.heading.as_deref() == Some("Secret"))
+        );
+    }
+
+    #[test]
+    fn test_context_50char_merge_keeps_first_ancestry() {
+        // E-9: 50-char merge 後 chunk は最初に出現した heading の ancestry を維持
+        // Sub の content は 50 字未満に保つ (merge 条件 `content.len() < 50` を
+        // 実際に踏ませるため。50 字以上だと merge 自体が起きず本テストの意図が
+        // 検証できない = レビュー指摘の Medium 修正)。
+        let md = "## Big\n\nshort.\n\n### Sub\n\nlarger body enough enough enough enough.";
+        let doc = parse_ctx(md, "T", &[]);
+        // merge が実際に発生し、chunk が1個に collapse していることを確認
+        assert_eq!(doc.chunks.len(), 1);
+        let merged = doc.chunks.first().unwrap();
+        assert_eq!(merged.heading.as_deref(), Some("Big"));
+        // merge 後も Big の ancestry (= title のみ) を保持
+        assert_eq!(merged.context.as_deref(), Some("T > Big"));
     }
 }

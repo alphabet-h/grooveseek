@@ -26,6 +26,7 @@ impl Parser for TxtParser {
 
         // MVP: single chunk. EXT-4 will break on paragraph boundaries.
         // Empty body → no chunks (indexer skips files with no chunks).
+        let context = super::build_context(&[frontmatter.title.as_deref().unwrap_or("")]);
         let chunks = if body.trim().is_empty() {
             Vec::new()
         } else {
@@ -34,6 +35,7 @@ impl Parser for TxtParser {
                 heading: None,
                 level: None,
                 content: body,
+                context,
             }]
         };
 
@@ -95,10 +97,7 @@ fn derive_title(path_hint: &str) -> Option<String> {
     }
 }
 
-/// `derive_title` の crate 内公開ラッパ (parser::single_text_chunk 用)。
-// single_text_chunk 経由の間接呼び出しのみで、PR-1 時点では直接の呼び出し元が
-// 未実装のため未使用。PR-2/3 で消費予定 (feature-45)。
-#[allow(dead_code)]
+/// `derive_title` の crate 内公開ラッパ (parser::single_text_chunk / markdown::parse 用)。
 pub(crate) fn derive_title_pub(path_hint: &str) -> Option<String> {
     derive_title(path_hint)
 }
@@ -198,5 +197,12 @@ mod tests {
         let p = TxtParser;
         assert_eq!(p.extension(), "txt");
         assert_eq!(p.id(), "txt");
+    }
+
+    #[test]
+    fn test_txt_context_is_title_only() {
+        let p = TxtParser;
+        let doc = p.parse("Hello world.\nSecond line.\n", "notes/hello.txt", &[]);
+        assert_eq!(doc.chunks[0].context.as_deref(), Some("hello"));
     }
 }

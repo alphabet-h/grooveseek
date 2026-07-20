@@ -55,10 +55,15 @@ pub struct Chunk {
     pub index: usize,
     pub heading: Option<String>,
     /// Markdown 見出しレベル (h2=2, h3=3)。heading が None の場合や、
-    /// 見出し概念のない parser (.txt 等) では None。Parent retriever や
-    /// 将来の Contextual Retrieval (A-1) で hierarchy を利用する。
+    /// 見出し概念のない parser (.txt 等) では None。Parent retriever で
+    /// hierarchy を利用する。
     pub level: Option<u8>,
     pub content: String,
+    /// 静的 context (パンくず)。feature-46。index 時に embedding + FTS + reranker
+    /// 入力へ注入する検索 signal 専用フィールド。API 返却には露出しない。
+    /// 例: "設計ノート > 検索パイプライン > RRF の実装"。
+    /// None = context なし (生成不能ケース / 旧 parser 実装)。
+    pub context: Option<String>,
 }
 
 /// A fully parsed document: frontmatter + chunks + retained raw content.
@@ -79,6 +84,39 @@ pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 /// と get_document の raw cap (server) で共有する。テキスト形式には適用しない。
 pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 
+/// パンくず合成 (feature-46)。空要素 skip + 連続重複 skip + `" > "` join + 200 chars
+/// cap (char boundary 安全)。全要素が空なら `None`。
+///
+/// 例: `build_context(&["設計ノート", "検索パイプライン", "RRF の実装"])`
+///     → `Some("設計ノート > 検索パイプライン > RRF の実装")`
+pub(crate) fn build_context(parts: &[&str]) -> Option<String> {
+    // BGE-small の 512 token 制限保護 + 異常に長い見出しへの防御 (spec D-11)。
+    const MAX_CONTEXT_CHARS: usize = 200;
+
+    let mut out: Vec<&str> = Vec::with_capacity(parts.len());
+    for p in parts {
+        let t = p.trim();
+        if t.is_empty() {
+            continue; // 空/whitespace-only は skip
+        }
+        if out.last().copied() == Some(t) {
+            continue; // 連続する同一要素は skip (title==h1 等)
+        }
+        out.push(t);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let joined = out.join(" > ");
+    // 200 chars 超過時は末尾切り。char_indices ベース (take(N)) で char boundary 安全。
+    let capped = if joined.chars().count() > MAX_CONTEXT_CHARS {
+        joined.chars().take(MAX_CONTEXT_CHARS).collect::<String>()
+    } else {
+        joined
+    };
+    Some(capped)
+}
+
 /// 抽出済みテキストを 1 チャンクに包む共通 helper。バイナリ parser の trait 契約用
 /// `parse` (&str 版 = 「既に抽出済みテキストを受け取った」fallback) 実装で使う。
 /// path_hint からファイル名ベースの title を derive する。
@@ -88,6 +126,7 @@ pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
     let body = raw.replace("\r\n", "\n").replace('\r', "\n");
     let title = txt::derive_title_pub(path_hint);
+    let context = build_context(&[title.as_deref().unwrap_or("")]);
     let chunks = if body.trim().is_empty() {
         Vec::new()
     } else {
@@ -96,6 +135,7 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
             heading: None,
             level: None,
             content: body,
+            context,
         }]
     };
     ParsedDocument {
@@ -228,6 +268,7 @@ mod tests {
         assert!(c.heading.is_none());
         assert!(c.level.is_none());
         assert_eq!(c.content, "");
+        assert!(c.context.is_none()); // feature-46: default は None
     }
 
     #[test]
@@ -258,5 +299,55 @@ mod tests {
     fn test_is_binary_default_false_for_text_parsers() {
         assert!(!MarkdownParser.is_binary());
         assert!(!TxtParser.is_binary());
+    }
+
+    #[test]
+    fn test_build_context_joins_with_breadcrumb() {
+        assert_eq!(
+            build_context(&["設計ノート", "検索パイプライン", "RRF の実装"]).as_deref(),
+            Some("設計ノート > 検索パイプライン > RRF の実装")
+        );
+    }
+
+    #[test]
+    fn test_build_context_skips_empty_and_whitespace() {
+        assert_eq!(
+            build_context(&["title", "   ", "", "leaf"]).as_deref(),
+            Some("title > leaf")
+        );
+    }
+
+    #[test]
+    fn test_build_context_skips_consecutive_duplicates() {
+        // E-2: title と h1 が同一 → 1 回のみ
+        assert_eq!(
+            build_context(&["Foo", "Foo", "bar"]).as_deref(),
+            Some("Foo > bar")
+        );
+    }
+
+    #[test]
+    fn test_build_context_all_empty_is_none() {
+        // E-4: 全要素空 → None
+        assert!(build_context(&["", "  ", "\t"]).is_none());
+        assert!(build_context(&[]).is_none());
+    }
+
+    #[test]
+    fn test_build_context_caps_at_200_chars_ascii() {
+        // E-5: 200 chars 超は末尾 cap
+        let long = "a".repeat(300);
+        let ctx = build_context(&[&long]).unwrap();
+        assert_eq!(ctx.chars().count(), 200);
+    }
+
+    #[test]
+    fn test_build_context_caps_at_200_chars_cjk_boundary_safe() {
+        // E-5: CJK でも char boundary 安全に cap (feature-45 B2 の boundary panic 再発防止)
+        let long = "あ".repeat(300);
+        let ctx = build_context(&[&long]).unwrap();
+        assert_eq!(ctx.chars().count(), 200);
+        // panic せず valid UTF-8 であること
+        assert!(ctx.chars().all(|c| c == 'あ'));
     }
 }

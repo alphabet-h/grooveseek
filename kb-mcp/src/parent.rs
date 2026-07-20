@@ -317,6 +317,7 @@ mod tests {
                 Some("h0"),
                 None,
                 &alpha_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -328,6 +329,7 @@ mod tests {
                 Some("h1"),
                 None,
                 &beta_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -339,6 +341,7 @@ mod tests {
                 Some("h2"),
                 None,
                 &gamma_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -381,6 +384,7 @@ mod tests {
                 Some("h0"),
                 None,
                 &alpha_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -392,6 +396,7 @@ mod tests {
                 Some("h1"),
                 None,
                 &beta_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -424,7 +429,16 @@ mod tests {
 
         // chunk_index=0 が small (token_count=30 < 100), c1 / c2 は普通サイズ
         let c0 = db
-            .insert_chunk(doc_id, 0, Some("h0"), None, "header", &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                0,
+                Some("h0"),
+                None,
+                "header",
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c0");
         // 上記の insert_chunk は token_count を内部で content.len()/4 で計算する。
         // "header" = 6 byte なので token_count = 1。これは threshold (100) 未満。
@@ -436,6 +450,7 @@ mod tests {
                 None,
                 // 200 tokens 相当の長文 (~800 byte content) を作る
                 &"longer body content body content body content".repeat(20),
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -447,6 +462,7 @@ mod tests {
                 Some("h2"),
                 None,
                 &"another longer body block another body block".repeat(20),
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -483,6 +499,7 @@ mod tests {
                 Some("h0"),
                 None,
                 "low quality body content",
+                None,
                 &dummy_emb_384(),
                 0.05, // 低 quality_score
             )
@@ -494,6 +511,7 @@ mod tests {
                 Some("h1"),
                 None,
                 "hit body content body content body content body content body content",
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -505,6 +523,7 @@ mod tests {
                 Some("h2"),
                 None,
                 "another low quality body content",
+                None,
                 &dummy_emb_384(),
                 0.05, // 低 quality_score
             )
@@ -547,6 +566,7 @@ mod tests {
                 Some("h0"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -558,6 +578,7 @@ mod tests {
                 Some("h1"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -569,6 +590,7 @@ mod tests {
                 Some("h2"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -606,13 +628,40 @@ mod tests {
         // 全 chunk で level = None (= NULL) を明示的に渡す
         let body = format!("body {}", "content body content body ".repeat(40));
         let _c0 = db
-            .insert_chunk(doc_id, 0, Some("h0"), None, &body, &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                0,
+                Some("h0"),
+                None,
+                &body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c0");
         let c1 = db
-            .insert_chunk(doc_id, 1, Some("h1"), None, &body, &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                1,
+                Some("h1"),
+                None,
+                &body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c1");
         let _c2 = db
-            .insert_chunk(doc_id, 2, Some("h2"), None, &body, &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                2,
+                Some("h2"),
+                None,
+                &body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c2");
 
         let hit = make_hit("/doc.md", "body content");
@@ -644,13 +693,40 @@ mod tests {
         // 日本語 + マルチバイト UTF-8 (絵文字、半角全角混在)
         let jp_body = format!("日本語の本文 {}", "テキストてきすと ".repeat(40));
         let _c0 = db
-            .insert_chunk(doc_id, 0, Some("h0"), None, &jp_body, &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                0,
+                Some("h0"),
+                None,
+                &jp_body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c0");
         let c1 = db
-            .insert_chunk(doc_id, 1, Some("h1"), None, &jp_body, &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                1,
+                Some("h1"),
+                None,
+                &jp_body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c1");
         let _c2 = db
-            .insert_chunk(doc_id, 2, Some("h2"), None, &jp_body, &dummy_emb_384(), 1.0)
+            .insert_chunk(
+                doc_id,
+                2,
+                Some("h2"),
+                None,
+                &jp_body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
             .expect("c2");
 
         let hit = make_hit("/doc.md", "日本語");
@@ -687,6 +763,7 @@ mod tests {
                 Some("h0"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -698,6 +775,7 @@ mod tests {
                 Some("h1"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -709,6 +787,7 @@ mod tests {
                 Some("h2"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -776,6 +855,7 @@ mod tests {
                 Some("h0"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )
@@ -787,6 +867,7 @@ mod tests {
                 Some("h2"),
                 None,
                 &big_body,
+                None,
                 &dummy_emb_384(),
                 1.0,
             )

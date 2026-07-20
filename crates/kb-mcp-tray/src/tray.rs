@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 use crate::state::StatusDot;
 use anyhow::{Context, Result};
 use tray_icon::{
