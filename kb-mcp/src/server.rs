@@ -1586,6 +1586,17 @@ pub async fn run_server(
 
     // モデル DL の前に meta 整合性を確認。不整合ならここで止めて DL を回避。
     db.verify_embedding_meta(model.model_id(), model.dimension() as u32)?;
+
+    // codex P2 (PR #73 F2): fresh DB (chunk 0 件、`index` 未実行のまま `serve`
+    // 起動) かつ `[contextual] enabled = true` の場合、watcher 経由の
+    // `reindex_single_file` は `read_context_mode()` が `None` を返すたびに
+    // `Off` へ fallback していた (= grandfather 判定は「レコードが無い」を
+    // legacy DB とみなす設計だが、fresh DB では正しくない)。watcher が動く前に
+    // ここで一度 resolve しておけば、fresh DB では desired mode が記録され、
+    // 既存 DB では従来通り grandfather / warning 挙動のままになる。watcher 自体は
+    // 「DB に記録された mode に追従する」設計を変えない (呼ぶのはここ 1 回だけ)。
+    indexer::resolve_context_mode(&db, context_mode_desired, false)?;
+
     let embedder = Embedder::with_model(model)?;
     let reranker = Reranker::try_new(reranker_choice)?;
 
@@ -2520,6 +2531,53 @@ mod tests {
         assert!(
             err.to_string().contains("mmr_lambda out of range"),
             "expected NaN lambda to be reported as out-of-range, got: {err}"
+        );
+    }
+
+    /// codex P2 on PR #73 (F2) regression: fresh DB (chunk 0 件, `kb-mcp
+    /// index` 未実行のまま `serve` 起動) かつ `[contextual] enabled = true`
+    /// だと、watcher 経由の `reindex_single_file` が
+    /// `db.read_context_mode()?.unwrap_or(ContextMode::Off)` で常に `None`
+    /// を引いて silent に `Off` へ fallback していた (grandfather 判定は
+    /// 「レコード不在 = legacy DB」前提だが、fresh DB では誤り)。
+    ///
+    /// `run_server` は DB open 直後・watcher 起動前に
+    /// `indexer::resolve_context_mode(&db, context_mode_desired, false)` を
+    /// 一度呼ぶよう修正済み (このテストが検証する呼び出しパターンそのもの)。
+    /// ここでは `run_server` を丸ごと起動せず (Embedder / listener 不要)、
+    /// その呼び出しパターンを直接再現して DB に記録される値と、
+    /// `reindex_single_file` が使うのと同じ fallback 式の結果を検証する。
+    #[test]
+    fn test_fresh_db_resolve_before_watcher_records_desired_mode() {
+        let db = crate::db::Database::open_in_memory().expect("in-memory db");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        assert_eq!(db.chunk_count().unwrap(), 0, "precondition: fresh DB");
+        assert_eq!(
+            db.read_context_mode().unwrap(),
+            None,
+            "precondition: no context_mode recorded yet"
+        );
+
+        // run_server が watcher 起動前に行うのと同じ呼び出し。
+        crate::indexer::resolve_context_mode(&db, crate::db::ContextMode::Static, false)
+            .expect("resolve_context_mode");
+
+        assert_eq!(
+            db.read_context_mode().unwrap(),
+            Some(crate::db::ContextMode::Static),
+            "fresh DB must adopt the desired mode once run_server resolves it up front"
+        );
+
+        // reindex_single_file (indexer.rs) が使うのと同じ fallback 式。fix 前は
+        // ここで None.unwrap_or(Off) が発火し、watcher が silent に Off 化していた。
+        let mode_seen_by_watcher = db
+            .read_context_mode()
+            .unwrap()
+            .unwrap_or(crate::db::ContextMode::Off);
+        assert_eq!(
+            mode_seen_by_watcher,
+            crate::db::ContextMode::Static,
+            "watcher's fallback read must now see Static, not silently fall back to Off"
         );
     }
 }
