@@ -1,4 +1,4 @@
-﻿use serde::Deserialize;
+use serde::Deserialize;
 
 /// Tray status indicator. 4 states total:
 /// - `Gray`: pre-first-poll (= polling pending)
@@ -185,4 +185,3 @@ mod tests {
         assert!(!s.indexing.active);
     }
 }
-

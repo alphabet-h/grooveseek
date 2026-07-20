@@ -1,4 +1,4 @@
-﻿use crate::UserEvent;
+use crate::UserEvent;
 use crate::state::{AdminStatus, StatusState};
 use std::time::Duration;
 use tao::event_loop::EventLoopProxy;
@@ -55,4 +55,3 @@ async fn fetch(client: &reqwest::Client, url: &str) -> anyhow::Result<AdminStatu
     }
     Ok(resp.json().await?)
 }
-
