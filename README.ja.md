@@ -124,6 +124,12 @@ bind = "127.0.0.1:3100"
 # enabled = false
 # whole_doc_threshold_tokens = 100   # token_count がこの未満なら whole-doc fallback
 # max_expanded_tokens = 2000         # adjacent merge / whole-doc の上限 (BGE-M3 <= 8192)
+
+# 任意: 静的 Contextual Retrieval (v0.12.0+)。既定 off。reranker を
+# 併用しない限り悪化するため、reranker 設定時のみ有効化を推奨
+# (詳細は下の「Contextual Retrieval」節を参照)。
+# [contextual]
+# enabled = true
 ```
 
 この設定ファイルを置けば `kb-mcp serve` / `index` / `status` / `graph` / `search` のどれも対応フラグを省略して動かせる。未知のキーはタイポ対策のため拒否される。`FASTEMBED_CACHE_DIR` の実環境変数は設定ファイルの同項目より優先される。
@@ -419,6 +425,30 @@ CLI フラグ (`kb-mcp eval` も同じものを受け付ける):
 MCP `search` ツールも同名の per-call params (`mmr` / `mmr_lambda` / `mmr_same_doc_penalty` / `parent_retriever`) を受ける。toml 既定値は `[search.mmr]` / `[search.parent_retriever]` (上の[設定ファイル (任意)](#設定ファイル-任意) 節)。優先順位は per-call > toml > built-in defaults。
 
 パイプライン順序は **`RRF → reranker → MMR → parent retriever → match_spans`**。MMR は reranker score を保ったまま並べ替え、parent retriever は最後に走るので展開 content が relevance signal を汚さない。完全な解説とチューニング指針は [docs/retrieval-pipeline.ja.md](docs/retrieval-pipeline.ja.md) 参照。
+
+### Contextual Retrieval (v0.12.0+、opt-in)
+
+各チャンクの先頭に短い context breadcrumb ―― ドキュメントタイトルと見出しの祖先パンくず (`ドキュメントタイトル > セクション > サブセクション`、` > ` 区切り) ―― を**静的に**生成して付与し、それを embedding の入力、FTS5 index (専用の第 3 列、Contextual BM25 の重み付きでスコアリング)、reranker の入力に注入する機能。Anthropic 原典の Contextual Retrieval 手法と異なり、この context は index 時にドキュメント構造だけから決定論的に生成される ―― LLM 呼び出しも追加の実行時依存も無く、通常の再 index で対応できる範囲を超える staleness も生じない。
+
+有効化するには:
+
+```toml
+[contextual]
+enabled = true
+```
+
+**既定は off** で、これは慎重さのためではなく実測された悪化が根拠になっている: 574 doc の dogfood knowledge base (bge-m3 embedding) で A/B 評価したところ、kb-mcp の実際の default パイプライン (reranker なし) では static context 注入によって retrieval が**むしろ悪化**した ―― recall@5 は 0.760 から 0.627 に低下し (reranker なし同士で比較すると -0.080)、MRR も -0.041 悪化した。短いチャンク本文のベクトル信号が、前置された breadcrumb テキストによって希釈され、かつそれを補正する後段の再スコアリングが無いためと見られる。
+
+**reranker を併用する場合** (`--reranker bge-v2-m3`) は様相が反転する: context 注入により recall@10 のわずかな低下を除く全指標が改善した ―― recall@5 は 0.760 から 0.807、MRR は 0.848 から 0.950、nDCG@10 は 0.814 から 0.858 へ向上。cross-encoder reranker は、生の embedding/BM25 段だけでは活かしきれない追加の構造的シグナルを利用できる。
+
+**推奨**: reranker (`--reranker bge-v2-m3` 等 / `kb-mcp.toml` の `reranker = "bge-v2-m3"`) を併用する場合に限り `[contextual] enabled = true` を有効化すること。素の default パイプラインでは off のままにする。
+
+補足:
+
+- 返却される検索結果の schema は**不変**。context はランキング内部のシグナルに過ぎず、`search` / `get_document` の出力には一切現れない。
+- **既存**の DB でこの機能を有効化するには `kb-mcp index --force` が必要 (embedding と FTS index を context 注入込みで再構築する)。`--force` なしで config と DB の mode が食い違うと stderr に警告が出るだけで DB は現在の mode を維持する (embedding 空間が意図せず混在した index を作らないための安全策)。
+- `kb-mcp status` は DB の現在の mode を `Context mode: static` / `Context mode: off` として表示する。
+- context breadcrumb の生成・格納の詳細は [docs/ARCHITECTURE.ja.md](docs/ARCHITECTURE.ja.md) を参照。
 
 ### 起点ドキュメントからの Connection Graph
 
