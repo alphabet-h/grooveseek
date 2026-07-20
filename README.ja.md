@@ -437,7 +437,7 @@ MCP `search` ツールも同名の per-call params (`mmr` / `mmr_lambda` / `mmr_
 enabled = true
 ```
 
-**既定は off** で、これは慎重さのためではなく実測された悪化が根拠になっている: 574 doc の dogfood knowledge base (bge-m3 embedding) で A/B 評価したところ、kb-mcp の実際の default パイプライン (reranker なし) では static context 注入によって retrieval が**むしろ悪化**した ―― recall@5 は 0.760 から 0.627 に低下し (reranker なし同士で比較すると -0.080)、MRR も -0.041 悪化した。短いチャンク本文のベクトル信号が、前置された breadcrumb テキストによって希釈され、かつそれを補正する後段の再スコアリングが無いためと見られる。
+**既定は off** で、これは慎重さのためではなく実測された悪化が根拠になっている: 574 doc の dogfood knowledge base (bge-m3 embedding) で A/B 評価したところ、kb-mcp の実際の default パイプライン (reranker なし) では static context 注入によって retrieval が**むしろ悪化**した ―― recall@5 は 0.707 から 0.627 に低下し (-0.080)、MRR も -0.041 悪化した。短いチャンク本文のベクトル信号が、前置された breadcrumb テキストによって希釈され、かつそれを補正する後段の再スコアリングが無いためと見られる。
 
 **reranker を併用する場合** (`--reranker bge-v2-m3`) は様相が反転する: context 注入により recall@10 のわずかな低下を除く全指標が改善した ―― recall@5 は 0.760 から 0.807、MRR は 0.848 から 0.950、nDCG@10 は 0.814 から 0.858 へ向上。cross-encoder reranker は、生の embedding/BM25 段だけでは活かしきれない追加の構造的シグナルを利用できる。
 

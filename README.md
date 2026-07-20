@@ -437,7 +437,7 @@ Enable it via:
 enabled = true
 ```
 
-**This defaults to off**, and the reason is a measured regression, not caution for its own sake: an A/B evaluation on a 574-document dogfood knowledge base (bge-m3 embeddings) showed that with kb-mcp's actual default pipeline (no reranker), enabling static context injection made retrieval *worse* — recall@5 dropped from 0.760 to 0.627 (or, comparing the two default-reranker-off configurations directly, -0.080) and MRR dropped by -0.041. The short chunk-local vector signal gets diluted by the prefixed breadcrumb text when nothing downstream re-scores the result.
+**This defaults to off**, and the reason is a measured regression, not caution for its own sake: an A/B evaluation on a 574-document dogfood knowledge base (bge-m3 embeddings) showed that with kb-mcp's actual default pipeline (no reranker), enabling static context injection made retrieval *worse* — recall@5 dropped from 0.707 to 0.627 (-0.080) and MRR dropped by -0.041. The short chunk-local vector signal gets diluted by the prefixed breadcrumb text when nothing downstream re-scores the result.
 
 **With a reranker enabled** (`--reranker bge-v2-m3`), the picture flips: context injection improved every metric except a small recall@10 dip — recall@5 went from 0.760 to 0.807, MRR from 0.848 to 0.950, and nDCG@10 from 0.814 to 0.858. The cross-encoder reranker is able to use the extra structural signal that the raw embedding/BM25 stage cannot fully exploit on its own.
 
