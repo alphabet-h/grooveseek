@@ -12,9 +12,11 @@ const RRF_K: f32 = 60.0;
 const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
-/// FTS5 bm25 の column weight。heading と content に重みを与え、
-/// 見出し一致を本文一致より強く評価する。
+/// FTS5 bm25 の column weight。heading / context / content に重みを与え、
+/// 見出し一致を本文一致より強く評価する。列順は fts_chunks の CREATE 順
+/// (heading, context, content) と一致させる。
 const FTS_BM25_HEADING_WEIGHT: f32 = 2.0;
+const FTS_BM25_CONTEXT_WEIGHT: f32 = 1.0;
 const FTS_BM25_CONTENT_WEIGHT: f32 = 1.0;
 
 /// `fetch_embeddings_by_chunk_ids` の IN 句 batch サイズ。
@@ -806,10 +808,9 @@ impl Database {
             params![chunk_id, embedding_json],
         )?;
 
-        // PR-1: FTS は 2 列のまま (context 列は PR-2 で追加)。heading/content のみ。
         self.conn.execute(
-            "INSERT INTO fts_chunks (rowid, heading, content) VALUES (?1, ?2, ?3)",
-            params![chunk_id, heading, content],
+            "INSERT INTO fts_chunks (rowid, heading, context, content) VALUES (?1, ?2, ?3, ?4)",
+            params![chunk_id, heading, context, content],
         )?;
 
         if let Some(tx) = local_tx {
@@ -1155,20 +1156,21 @@ impl Database {
         };
 
         // bm25 に column weight を与え、見出し一致を優遇する。
-        // 引数順は FTS5 の CREATE VIRTUAL TABLE の列宣言順 (heading, content)。
+        // 引数順は FTS5 の CREATE VIRTUAL TABLE の列宣言順 (heading, context, content)。
         let sql = format!(
             "
-            SELECT c.id, bm25(fts_chunks, {h}, {c}) AS score,
+            SELECT c.id, bm25(fts_chunks, {h}, {ctx}, {c}) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
                    d.path, d.title, d.topic, d.date, d.category, d.tags
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
             WHERE fts_chunks MATCH ?1
-            ORDER BY bm25(fts_chunks, {h}, {c})
+            ORDER BY bm25(fts_chunks, {h}, {ctx}, {c})
             LIMIT ?2
             ",
             h = FTS_BM25_HEADING_WEIGHT,
+            ctx = FTS_BM25_CONTEXT_WEIGHT,
             c = FTS_BM25_CONTENT_WEIGHT
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1652,20 +1654,22 @@ impl Database {
     /// 埋め込み再計算は行わないので高速 (既存 content を INSERT するだけ)。
     pub fn backfill_fts(&self) -> Result<u32> {
         let sql = "
-            SELECT id, heading, content
+            SELECT id, heading, context_text, content
             FROM chunks
             WHERE id NOT IN (SELECT rowid FROM fts_chunks)
         ";
         let mut stmt = self.conn.prepare(sql)?;
-        let rows: Vec<(i64, Option<String>, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        let rows: Vec<(i64, Option<String>, Option<String>, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut count = 0u32;
-        for (id, heading, content) in rows {
+        for (id, heading, context, content) in rows {
             self.conn.execute(
-                "INSERT INTO fts_chunks (rowid, heading, content) VALUES (?1, ?2, ?3)",
-                params![id, heading, content],
+                "INSERT INTO fts_chunks (rowid, heading, context, content) VALUES (?1, ?2, ?3, ?4)",
+                params![id, heading, context, content],
             )?;
             count += 1;
         }
@@ -3490,6 +3494,69 @@ mod tests {
         // 冪等: 2 回目は 0 件
         let n2 = db.backfill_fts().unwrap();
         assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn test_fts_context_column_is_searchable_via_insert_chunk() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("n/a.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        let emb = dummy_embedding(0.1);
+        // content には無いが context にだけある語彙 "パイプライン設計"
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("RRF"),
+            Some(3),
+            "本文テキスト",
+            Some("設計ノート > パイプライン設計 > RRF"),
+            &emb,
+            1.0,
+        )
+        .unwrap();
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'パイプライン設計'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(hit >= 1, "context-only vocabulary must be FTS-searchable");
+    }
+
+    #[test]
+    fn test_backfill_fts_repopulates_context_column() {
+        // FTS から 1 行消して backfill が context 込みで再 index することを確認
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("n/b.md", Some("T"), None, None, None, &[], None, "h")
+            .unwrap();
+        let emb = dummy_embedding(0.1);
+        db.insert_chunk(
+            doc_id,
+            0,
+            Some("H"),
+            Some(2),
+            "body",
+            Some("T > H"),
+            &emb,
+            1.0,
+        )
+        .unwrap();
+        db.conn.execute("DELETE FROM fts_chunks", []).unwrap();
+        let n = db.backfill_fts().unwrap();
+        assert_eq!(n, 1);
+        let hit: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'context : \"T > H\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(hit >= 1);
     }
 
     #[test]
