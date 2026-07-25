@@ -525,6 +525,23 @@ For CI: pass `--fail-on-regression` (v0.6.0+) to exit with code 1 when any aggre
 
 See [docs/eval.md](docs/eval.md) for the golden YAML reference, metric definitions, diff output guide, and troubleshooting.
 
+### Measuring the fusion parameters (`kb-mcp tune`, v0.13.0+)
+
+`[search.fusion]` exposes the RRF constant and the bm25 column weights, but the
+defaults are the industry convention and RRF is documented as requiring no
+tuning. If you want evidence rather than a guess for *your* KB, run:
+
+```bash
+kb-mcp tune --kb-path knowledge-base
+```
+
+It sweeps a fixed grid against your golden query set, guards the result with
+leave-one-query-out cross-validation, and prints either a paste-ready snippet
+or the conclusion that the defaults should stay. It applies nothing on its own.
+Note that the parameters can only move queries that appear **verbatim** in your
+documents, so a golden set of natural-language questions will report an
+effective N of 0 and exit 2. See [docs/eval.md](./docs/eval.md).
+
 ## Connecting to Claude Code / Cursor
 
 > **Looking for full deployment recipes?** See [`kb-mcp/examples/deployments/`](./kb-mcp/examples/deployments/) for ready-to-adapt configs covering four patterns: personal stdio, personal-http (one local daemon for multiple parallel Claude Code sessions), NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). The snippets below are the canonical stdio entry point you'll find in those recipes.

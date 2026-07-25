@@ -195,3 +195,65 @@ CI 例:
 - **Graded relevance (0 / 1 / 2)**: parse は寛容だが現状は無視
 - **Sweep / Matrix**: モデル比較は別 DB を 2 つ作って 2 回走らせる運用
 - **必須化**: `eval` は `index` / `serve` / `search` の挙動を 1 バイトも変えない
+
+## `kb-mcp tune` — fusion パラメータを測る (v0.13.0+)
+
+`kb-mcp eval` は「検索品質がどれくらい良いか」を教えてくれる。`kb-mcp tune` は
+「2 つの fusion つまみ (`rrf_k` と bm25 列重み) が **そもそもその数値を動かせるのか**」
+を教えてくれる。tune は何も適用しない — 出力は貼り付け可能な `[search.fusion]`
+スニペットか、「既定値のままにすべき」という結論のどちらかである。
+
+```bash
+kb-mcp tune --kb-path knowledge-base
+kb-mcp tune --kb-path knowledge-base --format json > tune.json
+```
+
+### golden セットに求められる条件
+
+kb-mcp の FTS はクエリ全体を 1 つのクォート済みフレーズとして trigram
+tokenizer に投げるため、**クエリが本文に逐語で出現するときにしか bm25 段に
+到達しない**。自然文の質問だけで構成された golden セットでは全 query の FTS
+候補が 0 件になり、grid のどの点でも同じ順位が返るので測るものが無い。
+そこで tune は pre-flight を先に走らせる:
+
+- query ごとの FTS 候補数を数え、**実効 N** (候補 2 件以上の query 数。0 件は
+  vector-only にフォールバックし、1 件は rank が固定なので重みに不感) を報告する
+- 実効 N が 0 なら診断を stderr に出して grid を実行せず **exit 2** する
+- 実効 N が 50 未満なら「IR 慣行の下限未満であり、結果は示唆であって結論ではない」
+  と警告する
+
+測定可能な golden にするには逐語クエリ (固有名詞・API 名・コマンド名・エラーコード等)
+を含めること。3 文字未満のクエリ (trigram 下限) と `heading:foo` のような column
+filter 構文は避ける (後者はクエリのサニタイズで無効化されるため filter として働かない)。
+
+### 推奨がどうガードされるか
+
+小さな golden セットでの argmax はほぼ確実に過学習するので、候補が推奨されるのは
+以下を **すべて** 満たすときだけ:
+
+1. refit された条件がビルトイン既定値と異なる
+2. held-out の平均 ΔnDCG@5 > 0.02
+3. held-out の平均 ΔnDCG@5 > 2 × paired SE (`SD({d_j}) / sqrt(N)`)
+4. selection stability > 0.5 — leave-one-query-out の fold の過半数が同じ条件を
+   選んだこと (fold 間の不一致は過学習の最も直接的な兆候)
+5. 副指標 (各 k の recall@k、MRR) が既定値より悪化していないこと
+
+満たさなければ結論は「ビルトイン既定値を維持」であり、これは正常かつ想定内の結果で
+ある: RRF 原論文は k ∈ [30, 100] で相対 MAP が約 0.4% しか動かないことを実測して
+おり、Elasticsearch は RRF を「チューニング不要」と明記している。
+
+レポートには per-query の内訳 (何件の query が悪化し、どれだけ悪化したか) も出る。
+rank fusion は平均の改善の裏に per-query の劣化を隠すことが常だからである。
+
+### 推奨を採用する前の確認
+
+tune は常に **reranker なし** の素の RRF 段を測る。したがって tune が見つけた改善が
+本番パイプラインでも残る保証は無い。`adopt` の判定が出たら、スニペットを
+`kb-mcp.toml` に貼った上で実構成の `eval` を回してから採用を決めること:
+
+```bash
+kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3 --no-history
+```
+
+`[search.fusion]` を外した状態の同じコマンドと比較する。rerank 後の数値が改善しない
+なら変更は破棄する — reranker は上流の順位差を吸収 (あるいは反転) することが多い。

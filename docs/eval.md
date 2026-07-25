@@ -208,3 +208,73 @@ when the previous run's fingerprint differs.
   different indexed databases
 - **Mandatory adoption**: running `eval` does not change anything about
   `index` / `serve` / `search`. It is a purely auxiliary tool
+
+## `kb-mcp tune` — measuring the fusion parameters (v0.13.0+)
+
+`kb-mcp eval` tells you how good retrieval is. `kb-mcp tune` tells you whether
+the two fusion knobs (`rrf_k` and the three bm25 column weights) can move that
+number **on your KB at all**. It applies nothing — the output is either a
+paste-ready `[search.fusion]` snippet or the conclusion that the built-in
+defaults should stay.
+
+```bash
+kb-mcp tune --kb-path knowledge-base
+kb-mcp tune --kb-path knowledge-base --format json > tune.json
+```
+
+### What it needs from your golden set
+
+kb-mcp's FTS wraps the entire query in a single quoted phrase over a trigram
+tokenizer, so **a query only reaches the bm25 stage when it occurs verbatim in
+the text**. A golden set made only of natural-language questions produces zero
+FTS candidates for every query, every grid point returns the same ranking, and
+there is nothing to measure. `tune` therefore starts with a pre-flight pass:
+
+- it counts FTS candidates per query and reports the **effective N** (queries
+  with at least 2 candidates — 0 candidates falls back to vector-only, 1
+  candidate has a fixed rank and so is insensitive to the weights)
+- if the effective N is 0 it prints the diagnosis to stderr and **exits 2**
+  without running the grid
+- if the effective N is below 50 it warns that this is under the IR convention
+  and the numbers are suggestive rather than conclusive
+
+To get a measurable golden set, include verbatim queries: proper nouns, API
+names, command names, error codes. Avoid queries under 3 characters (the
+trigram floor) and column-filter syntax such as `heading:foo` (it is neutralized
+by query sanitization, so it never acts as a filter).
+
+### How the recommendation is guarded
+
+Small golden sets almost always overfit an argmax, so a candidate is only
+recommended when **all** of the following hold:
+
+1. the refit condition differs from the built-in defaults
+2. held-out mean ΔnDCG@5 > 0.02
+3. held-out mean ΔnDCG@5 > 2 × paired SE (`SD({d_j}) / sqrt(N)`)
+4. selection stability > 0.5 — more than half of the leave-one-query-out folds
+   picked the same condition (folds disagreeing is the most direct overfitting
+   signal there is)
+5. no secondary metric (recall@k for any k, MRR) regressed against the defaults
+
+Otherwise the verdict is "keep the built-in defaults", which is a normal and
+expected outcome: the RRF paper measured only ~0.4% relative MAP movement
+across k ∈ [30, 100], and Elasticsearch documents RRF as requiring no tuning.
+
+The report also prints the per-query breakdown (how many queries got worse and
+by how much), because rank fusion routinely hides per-query losses behind an
+average gain.
+
+### Confirming a recommendation before you keep it
+
+`tune` always measures the plain RRF stage with **no reranker**, so a gain it
+finds has not been shown to survive the full pipeline. If you get an `adopt`
+verdict, paste the snippet into `kb-mcp.toml` and re-run `eval` with your real
+configuration before keeping it:
+
+```bash
+kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3 --no-history
+```
+
+Compare against the same command run with `[search.fusion]` removed. If the
+reranked numbers do not improve, drop the change — the reranker frequently
+absorbs (or reverses) upstream ranking differences.

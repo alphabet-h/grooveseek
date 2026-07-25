@@ -525,6 +525,22 @@ CI 用途には `--fail-on-regression` (v0.6.0+) を渡す。直前の **fingerp
 
 Golden YAML のリファレンス、指標の詳細説明、diff 出力の読み方、トラブルシューティングは [docs/eval.ja.md](docs/eval.ja.md) 参照。
 
+### fusion パラメータを測る (`kb-mcp tune`、v0.13.0+)
+
+`[search.fusion]` で RRF 定数と bm25 列重みを公開しているが、既定値は業界慣例値
+であり、RRF は公式に「チューニング不要」とされている。自分の KB について当て推量
+ではなく根拠が欲しい場合は:
+
+```bash
+kb-mcp tune --kb-path knowledge-base
+```
+
+golden query セットに対して固定グリッドを掃引し、leave-one-query-out 交差検証で
+結果をガードした上で、貼り付け可能なスニペットか「既定値を維持すべき」という結論
+を出力する。tune 自身は何も適用しない。なお、このパラメータが動かせるのは文書に
+**逐語で** 出現するクエリだけなので、自然文の質問だけの golden セットでは実効 N が
+0 と報告され exit 2 で終わる。詳細は [docs/eval.ja.md](./docs/eval.ja.md) を参照。
+
 ## Claude Code / Cursor への接続
 
 > **デプロイ用の完全なレシピは** [`kb-mcp/examples/deployments/`](./kb-mcp/examples/deployments/) **を参照**。4 パターン (個人 stdio / 個人 http = 1 マシン上で複数 Claude Code 並行用の loopback daemon / NAS 共有 = 1 writer + 多 read-only / 社内 HTTP サーバ = 1 サーバ + 多クライアント) で `kb-mcp.toml` / `.mcp.json` / systemd unit までセットで揃えてある。下のスニペットはそれらのレシピの中核を成す stdio エントリポイント。

@@ -2,7 +2,7 @@
 
 All notable changes to kb-mcp are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.0] - 2026-07-25
 
 ### Added
 
@@ -15,6 +15,18 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   (`rrf_k >= 1.0`, weights finite and `>= 0.0`, not all three zero); a
   non-default section is recorded in the eval `ConfigFingerprint` so tuned
   runs are never compared against untuned baselines.
+- **`kb-mcp tune` subcommand** — measures how much the fusion parameters move
+  retrieval quality on your own KB and prints a statistically guarded
+  recommendation. It **applies nothing**: the output is either a paste-ready
+  `[search.fusion]` snippet or the conclusion that the built-in defaults should
+  be kept. A pre-flight pass reports the effective query count (queries with at
+  least 2 FTS candidates) and exits 2 without sweeping when none is effective,
+  because kb-mcp's single-phrase trigram FTS only engages for verbatim matches.
+  The recommendation is gated on nested leave-one-query-out CV: held-out mean
+  ΔnDCG@5 above both 0.02 and 2× the paired standard error, selection stability
+  over half the folds, and no regression in recall@k or MRR. Always runs
+  without a reranker; the docs describe how to confirm a candidate through the
+  full pipeline with `kb-mcp eval`.
 
 ### Fixed
 
