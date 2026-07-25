@@ -55,6 +55,14 @@ enum EvalFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum TuneFormat {
+    /// Human-readable tables (default, ANSI color when TTY).
+    Text,
+    /// Structured JSON (single object).
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum CliSeedStrategy {
     AllChunks,
     Centroid,
@@ -216,6 +224,18 @@ enum Commands {
     /// Reports recall@k / MRR / nDCG@k and diffs against the previous run.
     /// Details: docs/eval.md
     Eval(EvalCliArgs),
+    /// Measure how much the RRF / bm25 fusion parameters move retrieval
+    /// quality on THIS knowledge base (optional, power-user feature).
+    ///
+    /// Runs a grid search over the golden query set and reports a
+    /// statistically guarded recommendation. Applies nothing automatically —
+    /// the output is either a paste-ready `[search.fusion]` snippet or the
+    /// conclusion that the built-in defaults should be kept.
+    ///
+    /// Exit code 2 means no golden query is sensitive to these parameters
+    /// (every query has fewer than 2 FTS candidates), so the sweep was
+    /// skipped. Details: docs/eval.md
+    Tune(TuneCliArgs),
     /// Register kb-mcp as an OS-level user service (auto-start at login).
     /// Phase 1: Linux systemd-user / macOS LaunchAgent / Windows Task Scheduler.
     Service {
@@ -412,6 +432,32 @@ pub(crate) struct EvalCliArgs {
     pub(crate) parent_retriever: Option<bool>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct TuneCliArgs {
+    /// Path to the knowledge-base directory
+    #[arg(long)]
+    pub(crate) kb_path: Option<PathBuf>,
+    /// Override golden file path. Default: <kb_path>/.kb-mcp-eval.yml or [eval].golden.
+    #[arg(long)]
+    pub(crate) golden: Option<PathBuf>,
+    /// Embedding model (must match the index)
+    #[arg(long, value_enum)]
+    pub(crate) model: Option<ModelChoice>,
+    /// Comma-separated k list to report (default: [eval].k_values or 1,5,10).
+    /// k=5 is always included: the adoption threshold is calibrated on nDCG@5.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) k: Option<Vec<usize>>,
+    /// Max hits to fetch per query (default: max of k list)
+    #[arg(long)]
+    pub(crate) limit: Option<u32>,
+    /// Output format
+    #[arg(long, value_enum, default_value_t = TuneFormat::Text)]
+    pub(crate) format: TuneFormat,
+    /// Disable ANSI color (auto-disabled when stdout is not a TTY)
+    #[arg(long = "no-color", default_value_t = false)]
+    pub(crate) no_color: bool,
+}
+
 impl From<&SearchCliArgs> for kb_mcp::config::SearchOverrides {
     fn from(a: &SearchCliArgs) -> Self {
         Self {
@@ -439,6 +485,22 @@ fn require_kb_path(cli_value: Option<PathBuf>, config_default: Option<PathBuf>) 
     cli_value
         .or(config_default)
         .context("--kb-path is required (pass on the command line or set `kb_path` in kb-mcp.toml)")
+}
+
+/// `kb-mcp tune` の `--k` / `[eval].k_values` / `--limit` から実効値を導出する。
+///
+/// 優先順位は CLI > `[eval]` > ビルトイン `[1, 5, 10]`。主指標 nDCG@5 が
+/// 落ちないよう `kb_mcp::tune::normalize_k_values` を通してから、`--limit`
+/// 未指定時の既定値を「k リストの最大値」として決める (eval と同じ規則)。
+fn resolve_tune_k_and_limit(
+    cli_k: Option<Vec<usize>>,
+    cfg_k: Option<Vec<usize>>,
+    cli_limit: Option<u32>,
+) -> (Vec<usize>, u32) {
+    let raw = cli_k.or(cfg_k).unwrap_or_else(|| vec![1, 5, 10]);
+    let k_values = kb_mcp::tune::normalize_k_values(&raw);
+    let limit = cli_limit.unwrap_or_else(|| *k_values.iter().max().unwrap_or(&10) as u32);
+    (k_values, limit)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -987,6 +1049,92 @@ fn main() -> anyhow::Result<()> {
                      --fail-on-regression was set."
                 );
                 std::process::exit(1);
+            }
+        }
+        Commands::Tune(args) => {
+            let TuneCliArgs {
+                kb_path,
+                golden,
+                model,
+                k,
+                limit,
+                format,
+                no_color,
+            } = args;
+
+            let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
+            let model_choice = model.or(cfg.model).unwrap_or_default();
+
+            let eval_cfg = cfg.eval.clone().unwrap_or_default();
+            let golden_path = golden
+                .or(eval_cfg.golden.clone())
+                .unwrap_or_else(|| kb_path.join(".kb-mcp-eval.yml"));
+
+            let (k_values, limit_val) =
+                resolve_tune_k_and_limit(k, eval_cfg.k_values.clone(), limit);
+
+            if cfg
+                .search
+                .as_ref()
+                .is_some_and(|s| s.mmr.enabled || s.parent_retriever.enabled)
+            {
+                eprintln!(
+                    "kb-mcp tune: note — [search.mmr] / [search.parent_retriever] are enabled in \
+                     kb-mcp.toml but tune measures the plain RRF stage only."
+                );
+            }
+            if !cfg
+                .search
+                .as_ref()
+                .map(|s| s.fusion.is_builtin_default())
+                .unwrap_or(true)
+            {
+                eprintln!(
+                    "kb-mcp tune: note — [search.fusion] is already customised in kb-mcp.toml; \
+                     tune still measures deltas against the BUILT-IN defaults, not your values."
+                );
+            }
+
+            let opts = kb_mcp::tune::TuneOpts {
+                kb_path,
+                golden_path,
+                model_choice,
+                k_values,
+                limit: limit_val,
+            };
+
+            match kb_mcp::tune::run(&opts)? {
+                kb_mcp::tune::TuneOutcome::NoEffectiveQueries {
+                    query_count,
+                    diagnostics,
+                } => {
+                    eprintln!(
+                        "kb-mcp tune: none of the {query_count} golden queries is sensitive to the \
+                         fusion parameters (every query has fewer than 2 FTS candidates), so the \
+                         grid was not run."
+                    );
+                    eprintln!(
+                        "  kb-mcp's FTS wraps the whole query in a single quoted phrase over a \
+                         trigram tokenizer, so a query only reaches FTS when it appears verbatim \
+                         in the text. Add verbatim queries (proper nouns, API names, command \
+                         names) to the golden set and re-run."
+                    );
+                    for (id, d) in &diagnostics {
+                        eprintln!("  {id}: FTS candidates = {}", d.fts_candidates);
+                    }
+                    std::process::exit(kb_mcp::tune::EXIT_NO_EFFECTIVE_QUERIES);
+                }
+                kb_mcp::tune::TuneOutcome::Report(report) => match format {
+                    TuneFormat::Text => {
+                        use std::io::IsTerminal;
+                        let tty = std::io::stdout().is_terminal() && !no_color;
+                        print!("{}", kb_mcp::tune::format_text(&report, tty));
+                    }
+                    TuneFormat::Json => {
+                        let v = kb_mcp::tune::format_json(&report);
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    }
+                },
             }
         }
         Commands::Service { .. } => {
@@ -1544,5 +1692,41 @@ mod tests {
             }
             _ => panic!("expected Eval subcommand"),
         }
+    }
+
+    #[test]
+    fn test_resolve_tune_k_and_limit_defaults() {
+        // CLI 未指定 + [eval] 未設定 -> ビルトイン [1, 5, 10]、limit は最大値。
+        let (k, limit) = resolve_tune_k_and_limit(None, None, None);
+        assert_eq!(k, vec![1, 5, 10]);
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn test_resolve_tune_k_and_limit_injects_primary_k() {
+        // --k 1,10 のように主指標 5 を外しても、tune 側で必ず補われる。
+        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 10]), None, None);
+        assert_eq!(k, vec![1, 5, 10]);
+        assert_eq!(limit, 10, "limit の既定は正規化後の k リストの最大値");
+    }
+
+    #[test]
+    fn test_resolve_tune_k_and_limit_cli_overrides_config() {
+        // CLI > [eval].k_values の優先順位。
+        let (k, _) = resolve_tune_k_and_limit(Some(vec![3]), Some(vec![1, 20]), None);
+        assert_eq!(k, vec![3, 5]);
+
+        // CLI 未指定なら [eval] を使う。
+        let (k, limit) = resolve_tune_k_and_limit(None, Some(vec![1, 20]), None);
+        assert_eq!(k, vec![1, 5, 20]);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn test_resolve_tune_k_and_limit_explicit_limit_wins() {
+        // --limit を明示したら k リストの最大値では上書きしない。
+        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5]), None, Some(100));
+        assert_eq!(k, vec![1, 5]);
+        assert_eq!(limit, 100);
     }
 }
