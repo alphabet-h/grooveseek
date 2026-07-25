@@ -19,6 +19,41 @@ const FTS_BM25_HEADING_WEIGHT: f32 = 2.0;
 const FTS_BM25_CONTEXT_WEIGHT: f32 = 1.0;
 const FTS_BM25_CONTENT_WEIGHT: f32 = 1.0;
 
+/// Fusion (RRF + FTS5 bm25 column weight) の実行時パラメータ。
+///
+/// feature-47 以前はすべてコンパイル時定数だった。`[search.fusion]` から
+/// 設定できるようにするため、`SearchFilters` (feature-26) と同じ
+/// 「引数 1 個に集約して渡す」方式で db 層に注入する。`Database` の
+/// フィールドにはしない — `Database` は drop 順序に依存する手動 `Drop`
+/// impl を持っており (db.rs の struct 宣言コメント参照)、フィールド追加は
+/// その制約と干渉するため。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusionParams {
+    /// RRF の定数項 k。小さいほど「片方の検索器が確信を持って 1 位に出した
+    /// 文書」を上位へ救い、大きいほど両リスト掲載 (合意) を重視する。
+    pub rrf_k: f32,
+    /// FTS5 bm25 の heading 列重み。
+    pub bm25_heading_weight: f32,
+    /// 同 context 列重み。
+    pub bm25_context_weight: f32,
+    /// 同 content 列重み。
+    pub bm25_content_weight: f32,
+}
+
+impl Default for FusionParams {
+    /// k=60 は RRF 原論文および主要実装 (Elasticsearch `rank_constant` /
+    /// Milvus / Vespa / LanceDB) の慣例値。bm25 の列順・既定重みは
+    /// `fts_chunks` の CREATE 順 (heading, context, content) と一致させる。
+    fn default() -> Self {
+        Self {
+            rrf_k: 60.0,
+            bm25_heading_weight: 2.0,
+            bm25_context_weight: 1.0,
+            bm25_content_weight: 1.0,
+        }
+    }
+}
+
 /// `fetch_embeddings_by_chunk_ids` の IN 句 batch サイズ。
 /// SQLite `SQLITE_MAX_VARIABLE_NUMBER` は modern SQLite で 32766 だが、
 /// 余裕を持たせ + prepared statement の準備コストとのバランスで 500 を採用。
@@ -5127,5 +5162,21 @@ mod tests {
             fts_has_context_col(&db),
             "migration must complete after lock wait"
         );
+    }
+
+    #[test]
+    fn test_fusion_params_default_matches_legacy_constants() {
+        // feature-47: config 化前のコンパイル時定数 (RRF_K=60.0 /
+        // FTS_BM25_HEADING=2.0 / CONTEXT=1.0 / CONTENT=1.0) と
+        // FusionParams::default() が完全一致することを固定する。
+        // この既定値がずれると PR-1 の behavior-invariant 前提が崩れる。
+        let f = FusionParams::default();
+        assert_eq!(f.rrf_k, 60.0);
+        assert_eq!(f.bm25_heading_weight, 2.0);
+        assert_eq!(f.bm25_context_weight, 1.0);
+        assert_eq!(f.bm25_content_weight, 1.0);
+        // Copy + PartialEq が derive されていること (db API で値渡しするため)
+        let g = f;
+        assert_eq!(f, g);
     }
 }
