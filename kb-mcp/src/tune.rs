@@ -311,6 +311,216 @@ pub fn to_hit_records(ranked: &[(i64, f32)], meta: &HashMap<i64, HitMeta>) -> Ve
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Metric table (D-10)
+// ---------------------------------------------------------------------------
+
+/// `rows[query_index][condition_index]` の per-query metric キャッシュ。
+///
+/// nested LOO は fold ごとに coordinate descent の勝者が変わり得るため、
+/// Phase K の全起点を含む **384 条件分** を先に埋めておく (D-10 の注)。
+/// D-9 の「全直積は冗長」は *探索・報告する条件数* の話であり、CV の
+/// キャッシュ量とは別問題。SQL 往復は 64 条件 × N query のまま増えない。
+pub struct MetricTable {
+    rows: Vec<Vec<crate::eval::QueryMetrics>>,
+    k_values: Vec<usize>,
+}
+
+impl MetricTable {
+    pub fn from_rows(rows: Vec<Vec<crate::eval::QueryMetrics>>, k_values: Vec<usize>) -> Self {
+        Self { rows, k_values }
+    }
+
+    pub fn query_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn k_values(&self) -> &[usize] {
+        &self.k_values
+    }
+
+    /// 主指標 (nDCG@`PRIMARY_K`) の値。
+    pub fn primary(&self, c: Condition, q: usize) -> f64 {
+        self.rows[q][c.index()]
+            .ndcg_at_k
+            .get(&PRIMARY_K)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// 指定 query 集合における主指標の平均。空集合は 0.0。
+    pub fn mean_primary(&self, c: Condition, query_idx: &[usize]) -> f64 {
+        if query_idx.is_empty() {
+            return 0.0;
+        }
+        query_idx.iter().map(|&q| self.primary(c, q)).sum::<f64>() / query_idx.len() as f64
+    }
+
+    /// 指定 query 集合における全指標の集計 (非悪化判定 D-11-3 用)。
+    /// `eval::aggregate_metrics` と同じ「単純平均」の定義。
+    pub fn aggregate_for(
+        &self,
+        c: Condition,
+        query_idx: &[usize],
+    ) -> crate::eval::AggregateMetrics {
+        let n = query_idx.len();
+        if n == 0 {
+            return crate::eval::AggregateMetrics::default();
+        }
+        let mut recall = std::collections::BTreeMap::new();
+        let mut ndcg = std::collections::BTreeMap::new();
+        for &k in &self.k_values {
+            let sr: f64 = query_idx
+                .iter()
+                .map(|&q| {
+                    self.rows[q][c.index()]
+                        .recall_at_k
+                        .get(&k)
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            let sn: f64 = query_idx
+                .iter()
+                .map(|&q| {
+                    self.rows[q][c.index()]
+                        .ndcg_at_k
+                        .get(&k)
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            recall.insert(k, sr / n as f64);
+            ndcg.insert(k, sn / n as f64);
+        }
+        let mrr: f64 = query_idx
+            .iter()
+            .map(|&q| self.rows[q][c.index()].reciprocal_rank)
+            .sum::<f64>()
+            / n as f64;
+        crate::eval::AggregateMetrics {
+            recall_at_k: recall,
+            mrr,
+            ndcg_at_k: ndcg,
+            query_count: n,
+        }
+    }
+}
+
+/// grid を掃いて metric table を埋める (D-10)。
+///
+/// 1. bm25 重み 1 条件につき query あたり SQL 1 往復 (重みは FTS の LIMIT
+///    通過集合を変えるので再実行が必要)
+/// 2. その FTS rank list に対し 6 通りの `rrf_k` を **メモリ内で** 再適用
+///    (`fuse_rrf_ids` は id と rank しか見ない)
+///
+/// `SearchResult` は `meta` へ path/heading を吸い出した直後に捨てる。
+/// 384 条件 × N query × pool 件の content を保持すると数百 MB になるため。
+pub fn build_metric_table(
+    db: &Database,
+    pre: &mut Preflight,
+    meta: &mut HashMap<i64, HitMeta>,
+    k_values: &[usize],
+    limit: u32,
+) -> Result<MetricTable> {
+    let filters = SearchFilters::default();
+    let pool = pre.pool_size;
+    let default_weight_index = Condition::builtin_default().weight_index();
+    // bm25 感度診断 (D-11-5) 用の grid 端 2 条件: heading 偏重 vs content 偏重。
+    let heading_heavy = Condition {
+        h: BM25_WEIGHT_GRID.len() - 1,
+        ctx: 0,
+        content: 0,
+        k: 0,
+    }
+    .weight_index();
+    let content_heavy = Condition {
+        h: 0,
+        ctx: 0,
+        content: BM25_WEIGHT_GRID.len() - 1,
+        k: 0,
+    }
+    .weight_index();
+
+    let mut rows: Vec<Vec<crate::eval::QueryMetrics>> = Vec::with_capacity(pre.queries.len());
+
+    // 診断値 (bm25_sensitive / rrf_ties) をループ内で `pre.queries[qi]` へ書き戻す
+    // ため、`pre.queries` を borrow したまま回さず index で回す。ループ先頭で
+    // 必要な入力だけ取り出しておく (`vec_ids` / `expected` は掃引中ずっと使う)。
+    let n_queries = pre.queries.len();
+    for qi in 0..n_queries {
+        let (qid, query_text, vec_ids, expected) = {
+            let pq = &pre.queries[qi];
+            (
+                pq.id.clone(),
+                pq.query.clone(),
+                pq.vec_ids.clone(),
+                pq.expected.clone(),
+            )
+        };
+        eprintln!(
+            "  [{}/{}] sweeping {} weight conditions for {}",
+            qi + 1,
+            n_queries,
+            WEIGHT_CONDITIONS,
+            qid
+        );
+        let mut row: Vec<crate::eval::QueryMetrics> =
+            vec![crate::eval::QueryMetrics::default(); TOTAL_CONDITIONS];
+        let mut extreme_lists: HashMap<usize, Vec<i64>> = HashMap::new();
+        let mut ties_at_default = 0usize;
+
+        for c in Condition::all() {
+            // 同じ重み組の 6 条件は FTS 結果を共有する。k==0 のときだけ引く。
+            if c.k != 0 {
+                // k != 0 の条件は下のブロックで一括処理済み
+                continue;
+            }
+            let params = c.to_params();
+            // rrf_k は search_fts_candidates では未使用 (bm25 重みだけが SQL に載る)
+            let fts_hits = db.search_fts_candidates(&query_text, pool, &filters, params)?;
+            let mut fts_ids = Vec::with_capacity(fts_hits.len());
+            for (id, sr) in &fts_hits {
+                meta.entry(*id).or_insert_with(|| HitMeta {
+                    path: sr.path.clone(),
+                    heading: sr.heading.clone(),
+                });
+                fts_ids.push(*id);
+            }
+            drop(fts_hits); // content 文字列をここで解放する
+
+            let wi = c.weight_index();
+            if wi == heading_heavy || wi == content_heavy {
+                extreme_lists.insert(wi, fts_ids.clone());
+            }
+
+            for (k, &rrf_k) in RRF_K_GRID.iter().enumerate() {
+                let cond = Condition { k, ..c };
+                let ranked = crate::db::fuse_rrf_ids(&vec_ids, &fts_ids, rrf_k, Some(limit));
+                if wi == default_weight_index && k == Condition::builtin_default().k {
+                    ties_at_default = ranked.windows(2).filter(|w| w[0].1 == w[1].1).count();
+                }
+                let top = to_hit_records(&ranked, meta);
+                row[cond.index()] = crate::eval::compute_query_metrics(&expected, &top, k_values);
+            }
+        }
+        rows.push(row);
+
+        // 診断値の後埋め
+        let sensitive = match (
+            extreme_lists.get(&heading_heavy),
+            extreme_lists.get(&content_heavy),
+        ) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        pre.queries[qi].diag.bm25_sensitive = sensitive;
+        pre.queries[qi].diag.rrf_ties = ties_at_default;
+    }
+
+    Ok(MetricTable::from_rows(rows, k_values.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +741,170 @@ mod tests {
         assert!(
             err.to_string().contains("embedding"),
             "mismatch must be reported explicitly: {err}"
+        );
+    }
+
+    /// テスト用: nDCG@PRIMARY_K だけを持つ MetricTable を組む。
+    /// `values[query][condition_index]` が nDCG@5 になる。
+    fn table_from_primary(values: Vec<Vec<f64>>) -> MetricTable {
+        let rows = values
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|v| {
+                        let mut m = crate::eval::QueryMetrics::default();
+                        m.ndcg_at_k.insert(PRIMARY_K, v);
+                        m.recall_at_k.insert(PRIMARY_K, v);
+                        m.reciprocal_rank = v;
+                        m
+                    })
+                    .collect()
+            })
+            .collect();
+        MetricTable::from_rows(rows, vec![PRIMARY_K])
+    }
+
+    /// 全条件を既定値と同じスコアで埋めた表 (= landscape 完全平坦)。
+    fn flat_table(n_queries: usize, value: f64) -> MetricTable {
+        table_from_primary(vec![vec![value; TOTAL_CONDITIONS]; n_queries])
+    }
+
+    #[test]
+    fn test_metric_table_reads_primary_metric() {
+        let mut rows = vec![vec![0.1_f64; TOTAL_CONDITIONS]; 2];
+        let target = Condition {
+            h: 3,
+            ctx: 0,
+            content: 0,
+            k: 0,
+        };
+        rows[1][target.index()] = 0.9;
+        let t = table_from_primary(rows);
+
+        assert!((t.primary(target, 1) - 0.9).abs() < 1e-12);
+        assert!((t.primary(target, 0) - 0.1).abs() < 1e-12);
+        // mean は指定 query 集合の平均
+        assert!((t.mean_primary(target, &[0, 1]) - 0.5).abs() < 1e-12);
+        assert!((t.mean_primary(target, &[1]) - 0.9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_metric_table_aggregate_matches_manual_mean() {
+        let t = flat_table(4, 0.25);
+        let agg = t.aggregate_for(Condition::builtin_default(), &[0, 1, 2, 3]);
+        assert_eq!(agg.query_count, 4);
+        assert!((agg.ndcg_at_k[&PRIMARY_K] - 0.25).abs() < 1e-12);
+        assert!((agg.recall_at_k[&PRIMARY_K] - 0.25).abs() < 1e-12);
+        assert!((agg.mrr - 0.25).abs() < 1e-12);
+    }
+
+    /// `build_metric_table` を実 DB 経路で回すための fixture。
+    /// heading にだけ語を置いた doc と content にだけ置いた doc を混ぜ、
+    /// bm25 重みの grid 端で FTS 順位が動く状態を作る。
+    fn sensitive_fixture() -> (crate::db::Database, Preflight, HashMap<i64, HitMeta>) {
+        let db = tune_db();
+        add_doc(
+            &db,
+            "h.md",
+            "zebrafish",
+            "body prose without the term",
+            0.10,
+        );
+        add_doc(
+            &db,
+            "c.md",
+            "unrelated",
+            "zebrafish zebrafish zebrafish",
+            0.11,
+        );
+        add_doc(
+            &db,
+            "m.md",
+            "zebrafish notes",
+            "zebrafish appears here too",
+            0.12,
+        );
+        add_doc(&db, "x.md", "other", "nothing relevant in this note", 0.90);
+
+        let golden = golden_with(vec![("zf", "zebrafish", vec!["h.md", "m.md"])]);
+        let mut meta = HashMap::new();
+        let pre = preflight_from_embeddings(&db, &golden, &[emb(0.10)], 10, &mut meta).unwrap();
+        (db, pre, meta)
+    }
+
+    #[test]
+    fn test_build_metric_table_fills_every_condition() {
+        let (db, mut pre, mut meta) = sensitive_fixture();
+        assert_eq!(
+            pre.effective,
+            vec![0],
+            "fixture must have an effective query"
+        );
+
+        let table = build_metric_table(&db, &mut pre, &mut meta, &[PRIMARY_K], 10).unwrap();
+
+        assert_eq!(table.query_count(), 1);
+        // 384 条件すべてに metric が入っていること。この fixture は全 4 chunk が
+        // 融合結果の top-5 に必ず入るので、どの条件でも expected 2 件が top-5 に
+        // 現れ nDCG@5 > 0 になる。したがって 0.0 は「`unwrap_or(0.0)` に落ちた
+        // 未充填セル」を意味する (= 0..=1 の範囲チェックでは検出できない)。
+        for c in Condition::all() {
+            let m = table.primary(c, 0);
+            assert!(
+                m > 0.0,
+                "condition {} left an unfilled metric (fell back to unwrap_or(0.0)): {m}",
+                c.label()
+            );
+        }
+        // expected 2 件のうち少なくとも 1 件は top-5 に入る fixture なので
+        // 既定条件の nDCG@5 は 0 より大きい。
+        assert!(
+            table.primary(Condition::builtin_default(), 0) > 0.0,
+            "the default condition must retrieve at least one expected hit"
+        );
+    }
+
+    #[test]
+    fn test_build_metric_table_k_axis_cells_are_consistent() {
+        // 同じ重み組の 6 つの rrf_k セルが正しい添字へ書き込まれていることの
+        // 検証。この fixture は候補が 4 chunk しかなく、どの rrf_k でも融合順位
+        // が変わらないので、6 セルすべてが同じ nDCG になるはずである。値がずれ
+        // るのは k 軸の添字計算が壊れたか、条件ごとに別の FTS 結果を掴んだ場合。
+        //
+        // 既知の未カバー領域: 「重み組ごとに SQL 1 往復」という往復回数の最適化
+        // 自体はここでは検証できない (往復回数を計測する手段がないため)。
+        let (db, mut pre, mut meta) = sensitive_fixture();
+        let table = build_metric_table(&db, &mut pre, &mut meta, &[PRIMARY_K], 10).unwrap();
+
+        let base = Condition::builtin_default();
+        let at = |k: usize| table.primary(Condition { k, ..base }, 0);
+        for (k, &rrf_k) in RRF_K_GRID.iter().enumerate() {
+            assert!(
+                (at(k) - at(base.k)).abs() < 1e-12,
+                "rrf_k={} produced a different metric than the default on a fixture \
+                 where the ranking cannot change: {} vs {}",
+                rrf_k,
+                at(k),
+                at(base.k)
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_metric_table_fills_bm25_sensitivity_diagnostic() {
+        // D-11-5: grid 端 (heading 偏重 vs content 偏重) で FTS 順位が動いたか。
+        // 本 fixture は heading のみ / content のみに語を置いてあるので立つ。
+        let (db, mut pre, mut meta) = sensitive_fixture();
+        assert!(
+            !pre.queries[0].diag.bm25_sensitive,
+            "pre-flight must leave the diagnostic unset"
+        );
+
+        let _ = build_metric_table(&db, &mut pre, &mut meta, &[PRIMARY_K], 10).unwrap();
+
+        assert!(
+            pre.queries[0].diag.bm25_sensitive,
+            "heading-only vs content-only docs must reorder between the grid extremes"
         );
     }
 }
