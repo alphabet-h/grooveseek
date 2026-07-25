@@ -130,19 +130,28 @@ pub fn reciprocal_rank(expected: &[ExpectedHit], top: &[HitRecord]) -> f64 {
 /// DCG  = Σ_{e ∈ expected} 1 / log2(first_hit_rank(e) + 1)  (rank ≤ k に制限、無ければ寄与 0)
 /// IDCG = Σ_{i=1..=min(|expected|, k)} 1 / log2(i + 1)
 ///
-/// expected ごとに「最初に hit した rank」を 1 回だけ gain として積む実装。
-/// 同一 path の複数 chunk が top-k に並んでも DCG が IDCG を超えないことが保証される
-/// (heading None の expected で path-only 一致する chunk が複数並ぶケースでも上限 1.0)。
+/// hit を rank 順に走査し、未消費の expected と 1:1 で貪欲マッチして gain を積む実装。
+/// 1 hit = 最大 1 gain なので、同一 path の複数 chunk が top-k に並ぶケースに加え、
+/// expected 側に同一 path が重複するケースや path-only expected と heading 指定
+/// expected が同一 hit にマッチするケースでも DCG ≤ IDCG が保たれる
+/// (i 番目にマッチした hit の rank は i 以上のため、gain は ideal の第 i 項を超えない)。
+/// 同一 hit に複数 expected がマッチする場合は heading 指定側を優先消費し、
+/// path-only expected を後続 hit に譲る (同順位内は expected の記載順)。
 pub fn ndcg_at_k(expected: &[ExpectedHit], top: &[HitRecord], k: usize) -> f64 {
     if expected.is_empty() || top.is_empty() || k == 0 {
         return 0.0;
     }
-    let window: Vec<&HitRecord> = top.iter().take(k).collect();
-    let dcg: f64 = expected
-        .iter()
-        .filter_map(|e| window.iter().find(|h| is_hit(e, h)).copied())
-        .map(|h| 1.0 / ((h.rank as f64 + 1.0).log2()))
-        .sum();
+    let mut consumed = vec![false; expected.len()];
+    let mut dcg = 0.0;
+    for h in top.iter().take(k) {
+        let candidate = (0..expected.len())
+            .filter(|&i| !consumed[i] && is_hit(&expected[i], h))
+            .min_by_key(|&i| (expected[i].heading.is_none(), i));
+        if let Some(i) = candidate {
+            consumed[i] = true;
+            dcg += 1.0 / ((h.rank as f64 + 1.0).log2());
+        }
+    }
     let ideal_count = expected.len().min(k);
     let idcg: f64 = (1..=ideal_count)
         .map(|i| 1.0 / ((i as f64 + 1.0).log2()))
@@ -1086,6 +1095,49 @@ mod tests {
         ];
         let score = ndcg_at_k(&expected, &top, 5);
         assert!(score <= 1.0 + 1e-9, "nDCG must not exceed 1.0, got {score}");
+    }
+
+    /// Regression: expected 側に同一 path が重複していても、1 つの hit は
+    /// 最大 1 回しか gain にならない (DCG ≤ IDCG)。golden yml に同じ path を
+    /// 二重記載したケース + prop_ndcg_at_k_in_unit_range の flaky 要因。
+    #[test]
+    fn test_ndcg_duplicate_expected_entries_capped_at_one() {
+        let expected = vec![exp("a.md", None), exp("a.md", None)];
+        let top = vec![hit(1, "a.md", None)];
+        let score = ndcg_at_k(&expected, &top, 5);
+        assert!(score <= 1.0 + 1e-9, "nDCG must not exceed 1.0, got {score}");
+        // 1:1 マッチでは gain は rank 1 の 1 回分のみ: 1.0 / (1/log2(2) + 1/log2(3))
+        let idcg = 1.0 / 2f64.log2() + 1.0 / 3f64.log2();
+        assert!(
+            (score - 1.0 / idcg).abs() < 1e-9,
+            "expected {}, got {score}",
+            1.0 / idcg
+        );
+    }
+
+    /// Regression: path-only expected と同 path の heading 指定 expected が
+    /// 同一 hit にマッチし得るケース。1 hit = 1 gain の 1:1 マッチで上限 1.0 を守る。
+    #[test]
+    fn test_ndcg_path_only_and_heading_expected_share_single_hit() {
+        let expected = vec![exp("a.md", None), exp("a.md", Some("X"))];
+        let top = vec![hit(1, "a.md", Some("X"))];
+        let score = ndcg_at_k(&expected, &top, 5);
+        assert!(score <= 1.0 + 1e-9, "nDCG must not exceed 1.0, got {score}");
+    }
+
+    /// 1:1 マッチの割当品質: heading 指定 expected を優先消費することで、
+    /// path-only expected が後続 hit に回り、両 expected が credit を得る。
+    #[test]
+    fn test_ndcg_heading_expected_preferred_over_path_only() {
+        let expected = vec![exp("a.md", None), exp("a.md", Some("X"))];
+        let top = vec![hit(1, "a.md", Some("X")), hit(2, "a.md", Some("Y"))];
+        // rank 1 は heading 指定の exp("a.md","X") が消費し、path-only は rank 2 で hit
+        // → DCG = 1/log2(2) + 1/log2(3) = IDCG → nDCG = 1.0
+        let score = ndcg_at_k(&expected, &top, 5);
+        assert!(
+            (score - 1.0).abs() < 1e-9,
+            "expected exactly 1.0, got {score}"
+        );
     }
 
     // -----------------------------------------------------------------------

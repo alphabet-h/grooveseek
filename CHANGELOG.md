@@ -4,6 +4,19 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ndcg_at_k` could exceed 1.0 when multiple expected entries matched the
+  same hit** — e.g. a golden query listing the same path twice, or a
+  path-only expected alongside a heading-specific expected for the same
+  path. The metric now walks hits in rank order and greedily consumes
+  expected entries one-to-one (preferring heading-specific entries over
+  path-only ones on the same hit), which mathematically bounds DCG ≤ IDCG
+  for arbitrary input. Well-formed golden sets with distinct expected paths
+  are unaffected — existing eval baselines remain valid. Also fixes the
+  flaky `prop_ndcg_at_k_in_unit_range` property test, which tripped over
+  this exact case when its narrow path space generated duplicates.
+
 ## [0.12.0] - 2026-07-21
 
 ### Added
