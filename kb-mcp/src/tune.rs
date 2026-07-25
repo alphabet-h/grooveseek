@@ -926,17 +926,27 @@ pub fn normalize_k_values(k_values: &[usize]) -> Vec<usize> {
     out
 }
 
+/// tune が受け付ける k / limit の上限。db 層の overfetch 上限
+/// (`FILTER_OVERFETCH_CAP` = 10,000) と同値。これを超える値は wrap (as cast、
+/// codex P2 round 3 on PR #79) や saturate (u32::MAX が下流の
+/// `Vec::with_capacity` に流れて allocation abort、同 round 4) のどちらの
+/// 変換でも壊れるため、変換せず reject する。
+pub const MAX_TUNE_K: usize = 10_000;
+
 /// `run` が実際に使う取得件数。limit が max(k) 未満だと fused ranking が
 /// limit 件に切り詰められ、recall@k / nDCG@k がラベルより浅い候補から計算
 /// されてしまうため、正規化後の k リスト最大値を下限として clamp する。
 /// CLI resolver (`main.rs`) と同じ不変条件を public API 側でも保証する
-/// (codex P2 round 2 on PR #79)。
-pub fn effective_limit(k_values: &[usize], limit: u32) -> u32 {
+/// (codex P2 round 2 on PR #79)。`MAX_TUNE_K` 超の k / limit は bail する。
+pub fn effective_limit(k_values: &[usize], limit: u32) -> Result<u32> {
     let max_k = *k_values.iter().max().unwrap_or(&PRIMARY_K);
-    // u32::MAX 超の k は as cast だと wrap して limit 0 になり得る (64-bit の
-    // --k 4294967296 等、codex P2 round 3 on PR #79)。saturate して clamp の
-    // 向きを保つ。
-    limit.max(u32::try_from(max_k).unwrap_or(u32::MAX))
+    if max_k > MAX_TUNE_K {
+        anyhow::bail!("k value {max_k} exceeds the supported maximum {MAX_TUNE_K}");
+    }
+    if limit as usize > MAX_TUNE_K {
+        anyhow::bail!("--limit {limit} exceeds the supported maximum {MAX_TUNE_K}");
+    }
+    Ok(limit.max(max_k as u32))
 }
 
 pub struct TuneReport {
@@ -1012,7 +1022,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     // limit も同じ理由で public API 側で clamp する (codex P2 round 2 on PR #79):
     // limit < max(k) だと fused ranking が limit 件に切り詰められ、recall@k /
     // nDCG@k がラベルより浅い候補から計算されてしまう。
-    let limit = effective_limit(&k_values, opts.limit);
+    let limit = effective_limit(&k_values, opts.limit)?;
 
     // query embedding をループ外で 1 回だけ (D-10-1)。現行 eval は query ごとに
     // `embed_single` を呼んでおりキャッシュも無いので、ここが tune の主な
@@ -2230,12 +2240,25 @@ mod tests {
     /// 計算される切り詰めバグが再現する。
     #[test]
     fn test_effective_limit_clamps_to_max_k() {
-        assert_eq!(effective_limit(&[1, 5, 10], 1), 10);
-        assert_eq!(effective_limit(&[1, 5], 100), 100);
-        assert_eq!(effective_limit(&[PRIMARY_K], 3), PRIMARY_K as u32);
-        // codex P2 round 3 on PR #79: u32::MAX 超の k を as cast すると wrap して
-        // effective limit 0 になり得る。saturate して invariant の向きを保つ。
-        assert_eq!(effective_limit(&[usize::MAX], 1), u32::MAX);
+        assert_eq!(effective_limit(&[1, 5, 10], 1).unwrap(), 10);
+        assert_eq!(effective_limit(&[1, 5], 100).unwrap(), 100);
+        assert_eq!(effective_limit(&[PRIMARY_K], 3).unwrap(), PRIMARY_K as u32);
+    }
+
+    /// Regression (codex P2 round 3/4 on PR #79): u32::MAX 超の k は as cast だと
+    /// wrap して limit 0 (round 3)、saturate だと u32::MAX が下流の
+    /// `Vec::with_capacity` に流れて allocation abort (round 4)。変換ではなく
+    /// MAX_TUNE_K 超えとして reject する。
+    #[test]
+    fn test_effective_limit_rejects_oversized_k_and_limit() {
+        assert!(effective_limit(&[usize::MAX], 1).is_err());
+        assert!(effective_limit(&[MAX_TUNE_K + 1], 1).is_err());
+        assert!(effective_limit(&[1, 5], MAX_TUNE_K as u32 + 1).is_err());
+        // 上限ちょうどは通る
+        assert_eq!(
+            effective_limit(&[MAX_TUNE_K], 1).unwrap(),
+            MAX_TUNE_K as u32
+        );
     }
 
     #[test]

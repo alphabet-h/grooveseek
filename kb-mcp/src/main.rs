@@ -499,13 +499,14 @@ fn resolve_tune_k_and_limit(
     cli_k: Option<Vec<usize>>,
     cfg_k: Option<Vec<usize>>,
     cli_limit: Option<u32>,
-) -> (Vec<usize>, u32) {
+) -> anyhow::Result<(Vec<usize>, u32)> {
     let raw = cli_k.or(cfg_k).unwrap_or_else(|| vec![1, 5, 10]);
     let k_values = kb_mcp::tune::normalize_k_values(&raw);
-    // clamp と u32 saturate は tune::effective_limit に集約 (codex P2 round 2/3
-    // on PR #79)。--limit 未指定は 0 を渡せば max(k) に解決される。
-    let limit = kb_mcp::tune::effective_limit(&k_values, cli_limit.unwrap_or(0));
-    (k_values, limit)
+    // clamp と上限検証 (MAX_TUNE_K 超は reject) は tune::effective_limit に集約
+    // (codex P2 round 2/3/4 on PR #79)。--limit 未指定は 0 を渡せば max(k) に
+    // 解決される。
+    let limit = kb_mcp::tune::effective_limit(&k_values, cli_limit.unwrap_or(0))?;
+    Ok((k_values, limit))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1076,7 +1077,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| kb_path.join(".kb-mcp-eval.yml"));
 
             let (k_values, limit_val) =
-                resolve_tune_k_and_limit(k, eval_cfg.k_values.clone(), limit);
+                resolve_tune_k_and_limit(k, eval_cfg.k_values.clone(), limit)?;
 
             if cfg
                 .search
@@ -1702,7 +1703,7 @@ mod tests {
     #[test]
     fn test_resolve_tune_k_and_limit_defaults() {
         // CLI 未指定 + [eval] 未設定 -> ビルトイン [1, 5, 10]、limit は最大値。
-        let (k, limit) = resolve_tune_k_and_limit(None, None, None);
+        let (k, limit) = resolve_tune_k_and_limit(None, None, None).unwrap();
         assert_eq!(k, vec![1, 5, 10]);
         assert_eq!(limit, 10);
     }
@@ -1710,7 +1711,7 @@ mod tests {
     #[test]
     fn test_resolve_tune_k_and_limit_injects_primary_k() {
         // --k 1,10 のように主指標 5 を外しても、tune 側で必ず補われる。
-        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 10]), None, None);
+        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 10]), None, None).unwrap();
         assert_eq!(k, vec![1, 5, 10]);
         assert_eq!(limit, 10, "limit の既定は正規化後の k リストの最大値");
     }
@@ -1718,11 +1719,11 @@ mod tests {
     #[test]
     fn test_resolve_tune_k_and_limit_cli_overrides_config() {
         // CLI > [eval].k_values の優先順位。
-        let (k, _) = resolve_tune_k_and_limit(Some(vec![3]), Some(vec![1, 20]), None);
+        let (k, _) = resolve_tune_k_and_limit(Some(vec![3]), Some(vec![1, 20]), None).unwrap();
         assert_eq!(k, vec![3, 5]);
 
         // CLI 未指定なら [eval] を使う。
-        let (k, limit) = resolve_tune_k_and_limit(None, Some(vec![1, 20]), None);
+        let (k, limit) = resolve_tune_k_and_limit(None, Some(vec![1, 20]), None).unwrap();
         assert_eq!(k, vec![1, 5, 20]);
         assert_eq!(limit, 20);
     }
@@ -1730,7 +1731,7 @@ mod tests {
     #[test]
     fn test_resolve_tune_k_and_limit_explicit_limit_wins() {
         // --limit を明示したら k リストの最大値では上書きしない。
-        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5]), None, Some(100));
+        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5]), None, Some(100)).unwrap();
         assert_eq!(k, vec![1, 5]);
         assert_eq!(limit, 100);
     }
@@ -1740,8 +1741,17 @@ mod tests {
     /// から計算されてしまう。max(k) を下限として clamp する。
     #[test]
     fn test_resolve_tune_k_and_limit_clamps_limit_to_max_k() {
-        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5, 10]), None, Some(1));
+        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5, 10]), None, Some(1)).unwrap();
         assert_eq!(k, vec![1, 5, 10]);
         assert_eq!(limit, 10, "limit は max(k) 未満に縮めない");
+    }
+
+    /// Regression (codex P2 round 3/4 on PR #79): u32 に収まらない k は wrap /
+    /// saturate のどちらでも壊れる (limit 0 化 or 下流 with_capacity abort) ため
+    /// エラーとして reject する。
+    #[test]
+    fn test_resolve_tune_k_and_limit_rejects_oversized_k() {
+        assert!(resolve_tune_k_and_limit(Some(vec![usize::MAX]), None, None).is_err());
+        assert!(resolve_tune_k_and_limit(Some(vec![1, 5]), None, Some(u32::MAX)).is_err());
     }
 }
