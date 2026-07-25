@@ -1542,6 +1542,21 @@ impl Database {
         Ok((vec_hits, fts_hits))
     }
 
+    /// FTS5 phrase 全体にマッチする chunk 数 (LIMIT / filter なし)。
+    /// `kb-mcp tune` の phrase doc-freq 診断専用 (feature-47 D-11-6)。
+    /// sanitize 後のクエリが trigram 下限未満なら `Ok(0)`。
+    pub(crate) fn count_fts_matches(&self, query_text: &str) -> Result<i64> {
+        let Some(fts_query) = sanitize_fts_query(query_text) else {
+            return Ok(0);
+        };
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM fts_chunks WHERE fts_chunks MATCH ?1",
+            params![fts_query],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// RRF 用: ベクトル検索の候補を `(chunk_id, SearchResult)` で返す。
     /// 既存の `search_similar` とロジックは同じだが chunk_id を外に出す。
     /// ベクトル検索で最大 `limit` 件の候補を `(chunk_id, SearchResult)` で返す。
@@ -1718,6 +1733,21 @@ impl Database {
         let count: u32 = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// context (contextual retrieval, feature-46) が実際に入っている chunk 数。
+    ///
+    /// `kb-mcp tune` が「`bm25_context_weight` 軸をこの KB で測定できるか」を
+    /// 判定するために使う (feature-47)。`[contextual]` を有効化せずに index した
+    /// KB では列が全て NULL / 空になり、context 重みを振っても bm25 スコアが
+    /// 1 bit も動かない = 掃引結果が「効かない」ではなく「測れていない」。
+    pub(crate) fn count_chunks_with_context(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE context_text IS NOT NULL AND context_text != ''",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(count)
     }
 
