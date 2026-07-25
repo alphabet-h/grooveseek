@@ -1736,6 +1736,21 @@ impl Database {
         Ok(count)
     }
 
+    /// context (contextual retrieval, feature-46) が実際に入っている chunk 数。
+    ///
+    /// `kb-mcp tune` が「`bm25_context_weight` 軸をこの KB で測定できるか」を
+    /// 判定するために使う (feature-47)。`[contextual]` を有効化せずに index した
+    /// KB では列が全て NULL / 空になり、context 重みを振っても bm25 スコアが
+    /// 1 bit も動かない = 掃引結果が「効かない」ではなく「測れていない」。
+    pub(crate) fn count_chunks_with_context(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE context_text IS NOT NULL AND context_text != ''",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Read `(model, dim)` from `index_meta`. Returns `None` if either key is
     /// missing or malformed (treated as "no meta recorded yet").
     pub fn read_embedding_meta(&self) -> Result<Option<(String, u32)>> {

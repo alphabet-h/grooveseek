@@ -15,12 +15,12 @@
 //! - 小 golden set の argmax は overfit するので、nested leave-one-query-out
 //!   CV + paired SE + sign test + selection stability で採否を判定する
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::db::{Database, FusionParams, SearchFilters};
-use crate::embedder::ModelChoice;
+use crate::embedder::{Embedder, ModelChoice};
 use crate::eval::{ExpectedHit, GoldenSet, HitRecord};
 
 // ---------------------------------------------------------------------------
@@ -196,17 +196,24 @@ pub struct Preflight {
 /// 扱いを、tune では入口で 1 回だけ適用する。`preflight_from_embeddings` に
 /// 渡す embedding の順序・件数はこの関数の結果と一致していなければならない。
 pub fn usable_queries(golden: &GoldenSet) -> Vec<&crate::eval::GoldenQuery> {
+    for q in &golden.queries {
+        if q.expected.is_empty() {
+            tracing::warn!(query = %q.query, "skipping golden query with no expected hits");
+        }
+    }
+    usable_queries_quiet(golden)
+}
+
+/// [`usable_queries`] と同じ絞り込みを警告なしで行う。
+///
+/// `run` は embedding を作るために `usable_queries` を先に呼び、その直後に
+/// `preflight_from_embeddings` が同じ絞り込みを再実行する。警告を両方で出すと
+/// 同じ query について 2 行出るため、内部再実行はこちらを使う。
+fn usable_queries_quiet(golden: &GoldenSet) -> Vec<&crate::eval::GoldenQuery> {
     golden
         .queries
         .iter()
-        .filter(|q| {
-            if q.expected.is_empty() {
-                tracing::warn!(query = %q.query, "skipping golden query with no expected hits");
-                false
-            } else {
-                true
-            }
-        })
+        .filter(|q| !q.expected.is_empty())
         .collect()
 }
 
@@ -230,7 +237,7 @@ pub fn preflight_from_embeddings(
     let filters = SearchFilters::default();
     let default_params = FusionParams::default();
 
-    let usable = usable_queries(golden);
+    let usable = usable_queries_quiet(golden);
     if usable.len() != embeddings.len() {
         anyhow::bail!(
             "embedding count mismatch: {} usable golden queries but {} embeddings supplied",
@@ -887,6 +894,589 @@ pub fn decide(table: &MetricTable, outcome: &LooOutcome, all: &[usize]) -> Verdi
     }
 }
 
+// ---------------------------------------------------------------------------
+// Report / orchestration (D-8)
+// ---------------------------------------------------------------------------
+
+/// 実効 query が 1 件も無いときの exit code。
+pub const EXIT_NO_EFFECTIVE_QUERIES: i32 = 2;
+
+/// この KB で `bm25_context_weight` 軸が測定不能 (no-op) かどうか。
+///
+/// `[contextual]` を無効のまま index した KB では `chunks.context_text` が
+/// 全件空になり、context 列の重みを 0.5 から 4.0 まで振っても bm25 スコアは
+/// 一切動かない。掃引結果の「context 重みは効かなかった」は、その場合
+/// **「効かない」ではなく「測っていない」** なので明示的に警告する。
+pub fn context_axis_is_noop(db: &Database) -> Result<bool> {
+    Ok(db.count_chunks_with_context()? == 0)
+}
+
+/// 報告する k のリストを正規化する。
+///
+/// 主指標 nDCG@[`PRIMARY_K`] を必ず含め、昇順・重複なしにする。採用閾値
+/// `ADOPT_MIN_MEAN_DELTA` は nDCG@5 を前提に較正されているため、`--k 1,10`
+/// のように 5 を外した指定でも主指標が欠落しないようにする。
+pub fn normalize_k_values(k_values: &[usize]) -> Vec<usize> {
+    let mut out: Vec<usize> = k_values.iter().copied().filter(|k| *k > 0).collect();
+    if !out.contains(&PRIMARY_K) {
+        out.push(PRIMARY_K);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+pub struct TuneReport {
+    pub kb_path: PathBuf,
+    pub golden_path: PathBuf,
+    pub model: String,
+    pub limit: u32,
+    /// E-8: 実際に使った候補プール。`limit*5 max 50` の **floor** であって
+    /// cap ではない。k との交互作用があるので出力ヘッダに必ず明記する。
+    pub pool_size: u32,
+    pub k_values: Vec<usize>,
+    pub chunk_total: u32,
+    /// `chunks.context_text` が全件空 = context 軸が測定不能。
+    /// [`context_axis_is_noop`] 参照。
+    pub context_axis_noop: bool,
+    /// golden の有効 query 総数 (expected 空を除いた数)。
+    pub query_count: usize,
+    /// 実効 query (FTS 候補 >= 2) の添字。
+    pub effective: Vec<usize>,
+    /// `(query id, 診断値)` を golden 順に並べたもの。
+    pub diagnostics: Vec<(String, QueryDiagnostics)>,
+    /// 既定条件での全 query 集計。
+    pub baseline: crate::eval::AggregateMetrics,
+    /// refit 条件での全 query 集計。
+    pub refit_aggregate: crate::eval::AggregateMetrics,
+    /// Phase W の上位 5 件 `(条件, 実効 query 平均 nDCG@5)`。
+    pub top_weight_conditions: Vec<(Condition, f64)>,
+    /// Phase K の 6 件 `(条件, 実効 query 平均 nDCG@5)`。
+    pub top_k_conditions: Vec<(Condition, f64)>,
+    pub outcome: LooOutcome,
+    pub sign: SignTest,
+    pub impact: PerQueryImpact,
+    pub violations: Vec<String>,
+    pub verdict: Verdict,
+}
+
+/// `run` の結果。実効 query 0 件は **エラーではない早期終了** なので
+/// `Err` ではなくこの enum の variant で表す (呼び出し側の main.rs が
+/// `EXIT_NO_EFFECTIVE_QUERIES` で終了する)。
+pub enum TuneOutcome {
+    /// 実効 query が 0 件。grid は実行していない。
+    NoEffectiveQueries {
+        query_count: usize,
+        diagnostics: Vec<(String, QueryDiagnostics)>,
+    },
+    Report(Box<TuneReport>),
+}
+
+/// golden を読み、pre-flight → grid 掃引 → 統計判定まで通す
+/// (`eval::run` と対になる orchestration 入口)。
+pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
+    let golden = GoldenSet::load(&opts.golden_path)?;
+
+    let db_path = crate::resolve_db_path(&opts.kb_path);
+    if !db_path.exists() {
+        anyhow::bail!(
+            "No index found at {}. Run `kb-mcp index --kb-path {}` first.",
+            db_path.display(),
+            opts.kb_path.display()
+        );
+    }
+    let db = Database::open(&db_path.to_string_lossy())?;
+    db.verify_embedding_meta(
+        opts.model_choice.model_id(),
+        opts.model_choice.dimension() as u32,
+    )?;
+    let mut embedder = Embedder::with_model(opts.model_choice)?;
+
+    // 主指標 nDCG@PRIMARY_K は必ず計算対象に含める。`run` は pub なので
+    // CLI 以外の呼び出しでもこの不変条件をここで保証する (CLI 側は limit の
+    // 既定値導出のために同じ正規化を先出しで呼ぶ)。
+    let k_values = normalize_k_values(&opts.k_values);
+
+    // query embedding をループ外で 1 回だけ (D-10-1)。現行 eval は query ごとに
+    // `embed_single` を呼んでおりキャッシュも無いので、ここが tune の主な
+    // 高速化ポイントになる。
+    let embeddings = {
+        let usable = usable_queries(&golden);
+        let texts: Vec<&str> = usable.iter().map(|q| q.query.as_str()).collect();
+        embedder
+            .embed_texts(&texts)
+            .context("failed to embed golden queries")?
+    };
+
+    let mut meta: HashMap<i64, HitMeta> = HashMap::new();
+    eprintln!("kb-mcp tune: pre-flight (measuring FTS candidates per query)...");
+    let mut pre = preflight_from_embeddings(&db, &golden, &embeddings, opts.limit, &mut meta)?;
+
+    let diagnostics: Vec<(String, QueryDiagnostics)> = pre
+        .queries
+        .iter()
+        .map(|q| (q.id.clone(), q.diag.clone()))
+        .collect();
+
+    if pre.effective.is_empty() {
+        return Ok(TuneOutcome::NoEffectiveQueries {
+            query_count: pre.queries.len(),
+            diagnostics,
+        });
+    }
+
+    let context_axis_noop = context_axis_is_noop(&db)?;
+    if context_axis_noop {
+        eprintln!(
+            "kb-mcp tune: WARNING — every chunk has an empty context column, so the \
+             bm25_context_weight axis is a no-op on this KB (contextual retrieval is off). \
+             Its rows below mean \"not measured\", not \"has no effect\"."
+        );
+    }
+
+    eprintln!(
+        "kb-mcp tune: {} of {} golden queries are effective (FTS candidates >= 2)",
+        pre.effective.len(),
+        pre.queries.len()
+    );
+    for (id, d) in &diagnostics {
+        if !d.is_effective() {
+            eprintln!(
+                "  insensitive: {id} (FTS candidates = {}; fusion parameters cannot move it)",
+                d.fts_candidates
+            );
+        }
+    }
+    if pre.effective.len() < SMALL_N_WARN {
+        eprintln!(
+            "kb-mcp tune: WARNING — effective N = {} is below the IR convention of {SMALL_N_WARN} \
+             topics. Treat the numbers below as suggestive, not conclusive.",
+            pre.effective.len()
+        );
+    }
+
+    eprintln!(
+        "kb-mcp tune: sweeping {WEIGHT_CONDITIONS} bm25 weight conditions x {} rrf_k values...",
+        RRF_K_GRID.len()
+    );
+    let table = build_metric_table(&db, &mut pre, &mut meta, &k_values, opts.limit)?;
+
+    // 診断値は build_metric_table で後埋めされるので取り直す。
+    let diagnostics: Vec<(String, QueryDiagnostics)> = pre
+        .queries
+        .iter()
+        .map(|q| (q.id.clone(), q.diag.clone()))
+        .collect();
+
+    let all: Vec<usize> = (0..pre.queries.len()).collect();
+    let outcome = nested_loo(&table, &pre.effective);
+    let sign = sign_test(&outcome.diffs);
+    let impact = per_query_impact(&table, outcome.refit, &all);
+    let (_, violations) = non_degradation(&table, outcome.refit, &all);
+    let verdict = decide(&table, &outcome, &all);
+
+    // Phase W / Phase K の上位を報告用に取り出す (実効 query 平均で評価)。
+    let base = Condition::builtin_default();
+    let mut weights: Vec<(Condition, f64)> = (0..BM25_WEIGHT_GRID.len())
+        .flat_map(|h| {
+            (0..BM25_WEIGHT_GRID.len()).flat_map(move |ctx| {
+                (0..BM25_WEIGHT_GRID.len()).map(move |content| Condition {
+                    h,
+                    ctx,
+                    content,
+                    k: base.k,
+                })
+            })
+        })
+        .map(|c| (c, table.mean_primary(c, &pre.effective)))
+        .collect();
+    weights.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    weights.truncate(5);
+
+    let top_k_conditions: Vec<(Condition, f64)> = (0..RRF_K_GRID.len())
+        .map(|k| {
+            let c = Condition { k, ..outcome.refit };
+            (c, table.mean_primary(c, &pre.effective))
+        })
+        .collect();
+
+    Ok(TuneOutcome::Report(Box::new(TuneReport {
+        kb_path: opts.kb_path.clone(),
+        golden_path: opts.golden_path.clone(),
+        model: opts.model_choice.model_id().to_string(),
+        limit: opts.limit,
+        pool_size: pre.pool_size,
+        k_values,
+        chunk_total: pre.chunk_total,
+        context_axis_noop,
+        query_count: pre.queries.len(),
+        effective: pre.effective.clone(),
+        diagnostics,
+        baseline: table.aggregate_for(base, &all),
+        refit_aggregate: table.aggregate_for(outcome.refit, &all),
+        top_weight_conditions: weights,
+        top_k_conditions,
+        outcome,
+        sign,
+        impact,
+        violations,
+        verdict,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Formatters (stdout = 結果、CLI 出力規約)
+// ---------------------------------------------------------------------------
+
+/// 採用推奨時に stdout へ出す、そのまま `kb-mcp.toml` に貼れるスニペット。
+pub fn toml_snippet(c: Condition) -> String {
+    let p = c.to_params();
+    // 整数値も **必ず小数点付き** で出す。TOML の `10` は integer リテラルで
+    // あり、serde は f32 フィールドへの integer を受け付けず
+    // "invalid type: integer `10`, expected f32" で落ちる。
+    let fmt = |v: f32| {
+        if v.fract() == 0.0 {
+            format!("{v:.1}")
+        } else {
+            format!("{v}")
+        }
+    };
+    format!(
+        "[search.fusion]\n\
+         rrf_k = {}\n\
+         bm25_heading_weight = {}\n\
+         bm25_context_weight = {}\n\
+         bm25_content_weight = {}\n",
+        fmt(p.rrf_k),
+        fmt(p.bm25_heading_weight),
+        fmt(p.bm25_context_weight),
+        fmt(p.bm25_content_weight)
+    )
+}
+
+pub fn format_text(report: &TuneReport, use_color: bool) -> String {
+    use std::fmt::Write;
+    let (bold, dim, reset) = if use_color {
+        ("\x1b[1m", "\x1b[90m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let mut s = String::new();
+    let n_eff = report.effective.len();
+
+    writeln!(s, "{bold}kb-mcp tune{reset} — {}", report.kb_path.display()).unwrap();
+    writeln!(
+        s,
+        "  golden: {}   model: {}   reranker: none (tune always measures the plain RRF stage)",
+        report.golden_path.display(),
+        report.model
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  limit: {}   candidate pool: {} (floor, not a cap)   chunks in index: {}",
+        report.limit, report.pool_size, report.chunk_total
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  queries: {} total / {} effective (FTS candidates >= 2)   primary metric: nDCG@{}",
+        report.query_count, n_eff, PRIMARY_K
+    )
+    .unwrap();
+    if report.context_axis_noop {
+        writeln!(
+            s,
+            "  WARNING: every chunk has an empty context column, so the bm25_context_weight axis \
+             is a no-op here (contextual retrieval is off) — read its rows as \"not measured\"."
+        )
+        .unwrap();
+    }
+    writeln!(s).unwrap();
+
+    // --- 5 / 6: 診断 ---
+    writeln!(s, "{bold}## Query diagnostics{reset}").unwrap();
+    writeln!(
+        s,
+        "  {:<28} {:>5} {:>8} {:>8} {:>6} {:>5} {:>5}",
+        "query", "fts", "docfreq", "overlap", "bm25?", "idf", "ties"
+    )
+    .unwrap();
+    for (id, d) in &report.diagnostics {
+        let short: String = id.chars().take(28).collect();
+        writeln!(
+            s,
+            "  {:<28} {:>5} {:>8} {:>8} {:>6} {:>5} {:>5}",
+            short,
+            d.fts_candidates,
+            d.fts_total_matches,
+            d.vec_fts_overlap,
+            if d.bm25_sensitive { "yes" } else { "no" },
+            if d.idf_clamped { "CLMP" } else { "ok" },
+            d.rrf_ties
+        )
+        .unwrap();
+    }
+    writeln!(
+        s,
+        "{dim}  fts = FTS candidates in pool; docfreq = chunks matching the whole phrase;\n  \
+         overlap = chunks present in BOTH the vec pool and the FTS list (0 means rrf_k cannot\n  \
+         change the ranking for that query); bm25? = ranking moved between the grid's\n  \
+         heading-heavy and content-heavy extremes; idf = CLMP means the phrase occurs in >= half\n  \
+         of all chunks, so FTS5 clamps its IDF to 1e-6 and no weight can revive it;\n  \
+         ties = adjacent equal f32 RRF scores at the default condition (informational).{reset}"
+    )
+    .unwrap();
+    writeln!(s).unwrap();
+
+    // --- grid ---
+    writeln!(
+        s,
+        "{bold}## Grid (coordinate descent over {} effective queries){reset}",
+        n_eff
+    )
+    .unwrap();
+    writeln!(s, "  Phase W — top 5 bm25 weight sets at k=60:").unwrap();
+    for (c, v) in &report.top_weight_conditions {
+        writeln!(s, "    {:<34} nDCG@{PRIMARY_K} {v:.4}", c.label()).unwrap();
+    }
+    writeln!(s, "  Phase K — rrf_k sweep at the winning weights:").unwrap();
+    for (c, v) in &report.top_k_conditions {
+        writeln!(s, "    {:<34} nDCG@{PRIMARY_K} {v:.4}", c.label()).unwrap();
+    }
+    writeln!(s).unwrap();
+
+    // --- 1 / 2: nested LOO ---
+    let m = mean(&report.outcome.diffs);
+    let se = paired_se(&report.outcome.diffs);
+    writeln!(s, "{bold}## Nested leave-one-query-out CV{reset}").unwrap();
+    writeln!(
+        s,
+        "  refit (all {n_eff} queries): {}",
+        report.outcome.refit.label()
+    )
+    .unwrap();
+    writeln!(s, "  folds: {}", report.outcome.fold_selections.len()).unwrap();
+    writeln!(
+        s,
+        "  held-out mean delta vs default: {m:+.4}   (threshold {ADOPT_MIN_MEAN_DELTA:.4})"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  paired SE (SD/sqrt(N)): {se:.4}   2 x SE: {:.4}",
+        2.0 * se
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  sign test: {} improved / {} degraded / {} tied   two-sided p = {:.4}",
+        report.sign.positive, report.sign.negative, report.sign.ties, report.sign.p_value
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  selection stability: {:.2} of folds picked the refit condition (threshold > {STABILITY_MIN:.2})",
+        report.outcome.stability
+    )
+    .unwrap();
+    writeln!(s).unwrap();
+
+    // --- 3: 全指標非悪化 ---
+    writeln!(
+        s,
+        "{bold}## Secondary metrics (all {} golden queries){reset}",
+        report.query_count
+    )
+    .unwrap();
+    for &k in &report.k_values {
+        let b = report.baseline.recall_at_k.get(&k).copied().unwrap_or(0.0);
+        let c = report
+            .refit_aggregate
+            .recall_at_k
+            .get(&k)
+            .copied()
+            .unwrap_or(0.0);
+        writeln!(
+            s,
+            "  recall@{k:<3} default {b:.4} -> refit {c:.4} ({:+.4})",
+            c - b
+        )
+        .unwrap();
+    }
+    writeln!(
+        s,
+        "  MRR      default {:.4} -> refit {:.4} ({:+.4})",
+        report.baseline.mrr,
+        report.refit_aggregate.mrr,
+        report.refit_aggregate.mrr - report.baseline.mrr
+    )
+    .unwrap();
+    if report.violations.is_empty() {
+        writeln!(s, "  no secondary metric degraded").unwrap();
+    } else {
+        for v in &report.violations {
+            writeln!(s, "  DEGRADED: {v}").unwrap();
+        }
+    }
+    writeln!(s).unwrap();
+
+    // --- 4: per-query 内訳 ---
+    writeln!(s, "{bold}## Per-query impact (refit vs default){reset}").unwrap();
+    writeln!(
+        s,
+        "  improved: {}   degraded: {}   worst delta: {:+.4}{}",
+        report.impact.improved,
+        report.impact.degraded,
+        report.impact.worst_delta,
+        match report.impact.worst_query {
+            Some(q) => format!(
+                " ({})",
+                report
+                    .diagnostics
+                    .get(q)
+                    .map(|d| d.0.as_str())
+                    .unwrap_or("?")
+            ),
+            None => String::new(),
+        }
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "{dim}  Rank fusion routinely hides per-query losses behind an average gain\n  \
+         (Benham & Culpepper), so read this line before the average.{reset}"
+    )
+    .unwrap();
+    writeln!(s).unwrap();
+
+    // --- verdict ---
+    writeln!(s, "{bold}## Verdict{reset}").unwrap();
+    match &report.verdict {
+        Verdict::KeepDefault { reasons } => {
+            writeln!(
+                s,
+                "  Recommendation: keep the built-in defaults ({}).",
+                Condition::builtin_default().label()
+            )
+            .unwrap();
+            for r in reasons {
+                writeln!(s, "    - {r}").unwrap();
+            }
+            writeln!(
+                s,
+                "{dim}  This is a normal and expected outcome. RRF is documented as requiring no\n  \
+                 tuning, and in-domain tuned constants are known not to transfer.{reset}"
+            )
+            .unwrap();
+        }
+        Verdict::Adopt(c) => {
+            writeln!(s, "  Recommendation: {}", c.label()).unwrap();
+            writeln!(
+                s,
+                "  All adoption conditions passed. Paste this into kb-mcp.toml, then re-run\n  \
+                 `kb-mcp eval` WITH your reranker (and `[contextual]`) enabled to confirm the\n  \
+                 gain survives the full pipeline before keeping it."
+            )
+            .unwrap();
+            writeln!(s).unwrap();
+            write!(s, "{}", toml_snippet(*c)).unwrap();
+        }
+    }
+    s
+}
+
+pub fn format_json(report: &TuneReport) -> serde_json::Value {
+    let m = mean(&report.outcome.diffs);
+    let se = paired_se(&report.outcome.diffs);
+    // 実効 N=1 では SE が INFINITY になる。`json!` の中に if 式を埋めると
+    // 読みづらいので手前で束縛しておく。
+    let se_json = if se.is_finite() {
+        serde_json::json!(se)
+    } else {
+        serde_json::Value::Null
+    };
+    let cond_json = |c: Condition| {
+        let p = c.to_params();
+        serde_json::json!({
+            "rrf_k": p.rrf_k,
+            "bm25_heading_weight": p.bm25_heading_weight,
+            "bm25_context_weight": p.bm25_context_weight,
+            "bm25_content_weight": p.bm25_content_weight,
+        })
+    };
+    let verdict = match &report.verdict {
+        Verdict::Adopt(c) => serde_json::json!({
+            "decision": "adopt",
+            "condition": cond_json(*c),
+            "toml_snippet": toml_snippet(*c),
+        }),
+        Verdict::KeepDefault { reasons } => serde_json::json!({
+            "decision": "keep_default",
+            "reasons": reasons,
+        }),
+    };
+    serde_json::json!({
+        "kb_path": report.kb_path.to_string_lossy(),
+        "golden_path": report.golden_path.to_string_lossy(),
+        "model": report.model,
+        "reranker": serde_json::Value::Null,
+        "limit": report.limit,
+        "candidate_pool": report.pool_size,
+        "primary_k": PRIMARY_K,
+        "k_values": report.k_values,
+        "chunk_total": report.chunk_total,
+        "context_axis_noop": report.context_axis_noop,
+        "query_count": report.query_count,
+        "effective_query_count": report.effective.len(),
+        "diagnostics": report.diagnostics.iter().map(|(id, d)| serde_json::json!({
+            "id": id,
+            "fts_candidates": d.fts_candidates,
+            "fts_total_matches": d.fts_total_matches,
+            "vec_fts_overlap": d.vec_fts_overlap,
+            "bm25_sensitive": d.bm25_sensitive,
+            "idf_clamped": d.idf_clamped,
+            "rrf_ties": d.rrf_ties,
+            "effective": d.is_effective(),
+        })).collect::<Vec<_>>(),
+        "grid": {
+            "rrf_k": RRF_K_GRID,
+            "bm25_weights": BM25_WEIGHT_GRID,
+            "top_weight_conditions": report.top_weight_conditions.iter()
+                .map(|(c, v)| serde_json::json!({"condition": cond_json(*c), "ndcg": v}))
+                .collect::<Vec<_>>(),
+            "rrf_k_sweep": report.top_k_conditions.iter()
+                .map(|(c, v)| serde_json::json!({"condition": cond_json(*c), "ndcg": v}))
+                .collect::<Vec<_>>(),
+        },
+        "loo": {
+            "refit": cond_json(report.outcome.refit),
+            "folds": report.outcome.fold_selections.len(),
+            "held_out_diffs": report.outcome.diffs,
+            "mean_delta": m,
+            "paired_se": se_json,
+            "selection_stability": report.outcome.stability,
+            "sign_test": {
+                "improved": report.sign.positive,
+                "degraded": report.sign.negative,
+                "tied": report.sign.ties,
+                "p_value": report.sign.p_value,
+            },
+        },
+        "secondary_metrics": {
+            "baseline": report.baseline,
+            "refit": report.refit_aggregate,
+            "violations": report.violations,
+        },
+        "per_query_impact": {
+            "improved": report.impact.improved,
+            "degraded": report.impact.degraded,
+            "worst_delta": report.impact.worst_delta,
+        },
+        "verdict": verdict,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,5 +2124,219 @@ mod tests {
         assert_eq!(impact.degraded, 1);
         assert!((impact.worst_delta + 0.25).abs() < 1e-12);
         assert_eq!(impact.worst_query, Some(1));
+    }
+
+    /// DB を使わずに TuneReport を組む (formatter だけをテストするため)。
+    fn synthetic_report() -> TuneReport {
+        let table = flat_table(3, 0.4);
+        let idx = vec![0_usize, 1, 2];
+        let outcome = nested_loo(&table, &idx);
+        let verdict = decide(&table, &outcome, &idx);
+        let impact = per_query_impact(&table, outcome.refit, &idx);
+        let (_, violations) = non_degradation(&table, outcome.refit, &idx);
+        TuneReport {
+            kb_path: PathBuf::from("kb"),
+            golden_path: PathBuf::from("kb/.kb-mcp-eval.yml"),
+            model: "bge-small-en-v1.5".to_string(),
+            limit: 10,
+            pool_size: 50,
+            k_values: vec![PRIMARY_K],
+            chunk_total: 100,
+            context_axis_noop: false,
+            query_count: 3,
+            effective: idx.clone(),
+            diagnostics: vec![
+                (
+                    "q0".to_string(),
+                    QueryDiagnostics {
+                        fts_candidates: 5,
+                        fts_total_matches: 12,
+                        vec_fts_overlap: 2,
+                        bm25_sensitive: true,
+                        idf_clamped: false,
+                        rrf_ties: 0,
+                    },
+                ),
+                (
+                    "q1".to_string(),
+                    QueryDiagnostics {
+                        fts_candidates: 3,
+                        fts_total_matches: 8,
+                        vec_fts_overlap: 0,
+                        bm25_sensitive: false,
+                        idf_clamped: false,
+                        rrf_ties: 1,
+                    },
+                ),
+                (
+                    "q2".to_string(),
+                    QueryDiagnostics {
+                        fts_candidates: 2,
+                        fts_total_matches: 60,
+                        vec_fts_overlap: 1,
+                        bm25_sensitive: true,
+                        idf_clamped: true,
+                        rrf_ties: 0,
+                    },
+                ),
+            ],
+            baseline: table.aggregate_for(Condition::builtin_default(), &idx),
+            refit_aggregate: table.aggregate_for(outcome.refit, &idx),
+            top_weight_conditions: vec![(Condition::builtin_default(), 0.4)],
+            top_k_conditions: vec![(Condition::builtin_default(), 0.4)],
+            sign: sign_test(&outcome.diffs),
+            impact,
+            violations,
+            outcome,
+            verdict,
+        }
+    }
+
+    #[test]
+    fn test_normalize_k_values_always_includes_the_primary_k() {
+        // 採用閾値は nDCG@PRIMARY_K を前提に較正されているので、主指標が
+        // 落ちる k 指定を許してはならない。
+        assert_eq!(normalize_k_values(&[1, 10]), vec![1, PRIMARY_K, 10]);
+        assert_eq!(normalize_k_values(&[]), vec![PRIMARY_K]);
+        // 昇順 + 重複除去
+        assert_eq!(normalize_k_values(&[10, 5, 1, 5]), vec![1, 5, 10]);
+        // k=0 は nDCG@0 が定義上 0.0 に潰れるだけなので落とす
+        assert_eq!(normalize_k_values(&[0, 3]), vec![3, PRIMARY_K]);
+        // 既に正規形ならそのまま
+        assert_eq!(normalize_k_values(&[1, 5, 10]), vec![1, 5, 10]);
+    }
+
+    #[test]
+    fn test_toml_snippet_is_pasteable() {
+        let c = Condition {
+            h: 3,
+            ctx: 0,
+            content: 1,
+            k: 1,
+        };
+        let s = toml_snippet(c);
+        assert!(s.contains("[search.fusion]"), "{s}");
+        // 整数値も小数点付きで出すこと (TOML の integer は f32 に deserialize できない)
+        assert!(s.contains("rrf_k = 10.0"), "{s}");
+        assert!(s.contains("bm25_heading_weight = 4.0"), "{s}");
+        assert!(s.contains("bm25_context_weight = 0.5"), "{s}");
+        assert!(s.contains("bm25_content_weight = 1.0"), "{s}");
+        // 貼り付けたものが実際に Config としてパースでき、validate も通ること
+        let cfg: crate::config::Config = toml::from_str(&s).expect("snippet must be valid toml");
+        assert!(cfg.validate().is_ok(), "snippet must pass validate()");
+        assert_eq!(
+            crate::db::FusionParams::from(&cfg.search.unwrap().fusion),
+            c.to_params()
+        );
+    }
+
+    #[test]
+    fn test_format_text_emits_all_seven_required_sections() {
+        let report = synthetic_report();
+        let out = format_text(&report, false);
+        for needle in [
+            "Nested leave-one-query-out CV",
+            "paired SE",
+            "sign test",
+            "selection stability",
+            "Secondary metrics",
+            "Per-query impact",
+            "Query diagnostics",
+            "candidate pool",
+            "Verdict",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn test_format_text_keeps_default_verdict_without_snippet() {
+        // default 維持のときは toml スニペットを出さない (誤って貼られるのを防ぐ)。
+        let report = synthetic_report();
+        assert!(matches!(report.verdict, Verdict::KeepDefault { .. }));
+        let out = format_text(&report, false);
+        assert!(
+            !out.contains("[search.fusion]"),
+            "keep-default output must not print a paste-ready snippet:\n{out}"
+        );
+        assert!(out.contains("keep the built-in defaults"), "{out}");
+    }
+
+    #[test]
+    fn test_format_json_round_trips() {
+        let report = synthetic_report();
+        let v = format_json(&report);
+        assert_eq!(v["effective_query_count"].as_u64(), Some(3));
+        assert_eq!(v["verdict"]["decision"].as_str(), Some("keep_default"));
+        assert!(v["diagnostics"].as_array().is_some());
+        assert!(v["loo"]["paired_se"].is_number());
+        // `serde_json` は NaN / Inf を Null に落とすので、to_string 自体は
+        // 混入していても成功する (= これは混入検知ではない)。paired_se が
+        // number であることの assert が実質の検知で、無限大は format_json 側の
+        // `is_finite()` ガードで明示的に Null になる。ここでは「生成した
+        // Value がそのまま文字列化できる」ことだけを確認する。
+        serde_json::to_string(&v).expect("report JSON must serialize");
+    }
+
+    #[test]
+    fn test_format_json_nulls_out_a_non_finite_paired_se() {
+        // 実効 N=1 では paired_se が INFINITY になる。JSON には Null で出す。
+        let table = flat_table(1, 0.4);
+        let idx = vec![0_usize];
+        let outcome = nested_loo(&table, &idx);
+        assert!(paired_se(&outcome.diffs).is_infinite());
+
+        let mut report = synthetic_report();
+        report.effective = idx;
+        report.outcome = outcome;
+        let v = format_json(&report);
+        assert!(
+            v["loo"]["paired_se"].is_null(),
+            "an infinite SE must serialize as null, got {}",
+            v["loo"]["paired_se"]
+        );
+    }
+
+    #[test]
+    fn test_context_axis_noop_is_detected_and_surfaced() {
+        // dogfood KB は contextual retrieval が off で context 列が全て空だった。
+        // その状態では bm25_context_weight 軸が構造的に測定不能なので、
+        // 「context 重みは効かなかった」と誤読されないよう診断として出す。
+        let db = tune_db();
+        add_doc(&db, "a.md", "A", "zebrafish larvae in assays", 0.1);
+        assert!(
+            context_axis_is_noop(&db).unwrap(),
+            "a KB indexed without contextual retrieval must report the axis as a no-op"
+        );
+
+        // context を持つ chunk が 1 件でもあれば軸は生きている
+        let doc = db
+            .upsert_document("b.md", Some("B"), None, None, None, &[], None, "hb")
+            .unwrap();
+        db.insert_chunk(
+            doc,
+            0,
+            Some("B"),
+            None,
+            "body prose",
+            Some("surrounding document context"),
+            &emb(0.2),
+            1.0,
+        )
+        .unwrap();
+        assert!(!context_axis_is_noop(&db).unwrap());
+
+        // text / JSON の双方に載ること
+        let mut report = synthetic_report();
+        report.context_axis_noop = true;
+        let out = format_text(&report, false);
+        assert!(
+            out.contains("bm25_context_weight"),
+            "the text report must warn about the dead context axis:\n{out}"
+        );
+        assert_eq!(
+            format_json(&report)["context_axis_noop"].as_bool(),
+            Some(true)
+        );
     }
 }
