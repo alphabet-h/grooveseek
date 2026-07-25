@@ -865,16 +865,29 @@ pub fn run_search_pipeline(
     //    `limit` 件 (invariant #3 の bit-exact path)。
     let mmr_pool_size = limit.saturating_mul(5).max(50);
     let candidates_pool: Vec<(i64, crate::db::SearchResult)> = if resolved.mmr_enabled {
-        db.search_hybrid_candidates_unbounded(query, query_embedding, mmr_pool_size, filters)?
+        db.search_hybrid_candidates_unbounded(
+            query,
+            query_embedding,
+            mmr_pool_size,
+            filters,
+            crate::db::FusionParams::default(),
+        )?
     } else if use_rerank {
         db.search_hybrid_candidates(
             query,
             query_embedding,
             limit.saturating_mul(5).max(50),
             filters,
+            crate::db::FusionParams::default(),
         )?
     } else {
-        db.search_hybrid_candidates(query, query_embedding, limit, filters)?
+        db.search_hybrid_candidates(
+            query,
+            query_embedding,
+            limit,
+            filters,
+            crate::db::FusionParams::default(),
+        )?
     };
 
     // 2. Optional reranker。MMR off の reranker 入力 limit は `limit` (元の挙動
