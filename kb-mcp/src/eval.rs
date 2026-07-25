@@ -260,6 +260,13 @@ pub struct ConfigFingerprint {
     /// 含める (これらが変われば baseline は別物として扱う)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_retriever: Option<ParentRetrieverFingerprint>,
+
+    /// `[search.fusion]` がビルトイン既定値 (60 / 2.0 / 1.0 / 1.0) から
+    /// 変更されている場合のみ Some。既定なら None で、feature-47 以前の
+    /// history JSON / 凍結 baseline との `PartialEq` 互換を維持する
+    /// (mmr / parent_retriever と同じ論理、feature-47 D-7 / E-10)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion: Option<FusionFingerprint>,
 }
 
 /// `[search.mmr]` の effective config を fingerprint に含めるための snapshot。
@@ -277,6 +284,17 @@ pub struct MmrFingerprint {
 pub struct ParentRetrieverFingerprint {
     pub whole_doc_threshold_tokens: u32,
     pub max_expanded_tokens: u32,
+}
+
+/// `[search.fusion]` の effective config を fingerprint に含めるための snapshot。
+/// ビルトイン既定値から変更されているときだけ [`ConfigFingerprint::fusion`] に
+/// Some で入る。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FusionFingerprint {
+    pub rrf_k: f32,
+    pub bm25_heading_weight: f32,
+    pub bm25_context_weight: f32,
+    pub bm25_content_weight: f32,
 }
 
 impl ConfigFingerprint {
@@ -308,6 +326,16 @@ impl ConfigFingerprint {
                 whole_doc_threshold_tokens: s.parent_retriever.whole_doc_threshold_tokens,
                 max_expanded_tokens: s.parent_retriever.max_expanded_tokens,
             });
+        let fusion = cfg
+            .search
+            .as_ref()
+            .filter(|s| !s.fusion.is_builtin_default())
+            .map(|s| FusionFingerprint {
+                rrf_k: s.fusion.rrf_k,
+                bm25_heading_weight: s.fusion.bm25_heading_weight,
+                bm25_context_weight: s.fusion.bm25_context_weight,
+                bm25_content_weight: s.fusion.bm25_content_weight,
+            });
         Self {
             model,
             reranker,
@@ -317,6 +345,7 @@ impl ConfigFingerprint {
             metric_version: METRIC_VERSION,
             mmr,
             parent_retriever,
+            fusion,
         }
     }
 }
@@ -844,6 +873,17 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     } else {
         None
     };
+    // fusion は per-call override を持たない (D-6) ので toml をそのまま見る。
+    let fusion_fp = if opts.search_config.fusion.is_builtin_default() {
+        None
+    } else {
+        Some(FusionFingerprint {
+            rrf_k: opts.search_config.fusion.rrf_k,
+            bm25_heading_weight: opts.search_config.fusion.bm25_heading_weight,
+            bm25_context_weight: opts.search_config.fusion.bm25_context_weight,
+            bm25_content_weight: opts.search_config.fusion.bm25_content_weight,
+        })
+    };
 
     Ok(EvalRun {
         timestamp: Utc::now(),
@@ -860,6 +900,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             metric_version: METRIC_VERSION,
             mmr: mmr_fp,
             parent_retriever: parent_fp,
+            fusion: fusion_fp,
         },
         per_query,
         aggregate,
@@ -1322,6 +1363,7 @@ mod tests {
                 metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
+                fusion: None,
             },
             per_query: vec![],
             aggregate: agg,
@@ -1389,6 +1431,7 @@ mod tests {
                 metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
+                fusion: None,
             },
             per_query: vec![],
             aggregate: agg,
@@ -1414,6 +1457,7 @@ mod tests {
             metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
+            fusion: None,
         };
         let mut a_now = AggregateMetrics::default();
         a_now.recall_at_k.insert(5, 0.8);
@@ -1452,6 +1496,7 @@ mod tests {
             metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
+            fusion: None,
         };
         let fp_prev = ConfigFingerprint {
             golden_hash: "BBB".into(),
@@ -1495,6 +1540,7 @@ mod tests {
                 metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
+                fusion: None,
             },
             per_query: vec![],
             aggregate: agg,
@@ -1522,6 +1568,7 @@ mod tests {
             metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
+            fusion: None,
         };
         let now = EvalRun {
             timestamp: Utc::now(),
@@ -1559,6 +1606,7 @@ mod tests {
             metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
+            fusion: None,
         };
         let fp_prev = ConfigFingerprint {
             metric_version: 1,
@@ -1602,6 +1650,7 @@ mod tests {
             metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
+            fusion: None,
         };
         let fp_prev = ConfigFingerprint {
             metric_version: 1,
@@ -1673,6 +1722,7 @@ mod tests {
                 metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
+                fusion: None,
             },
             per_query: vec![],
             aggregate: AggregateMetrics {
@@ -1925,5 +1975,85 @@ max_expanded_tokens = 1500
         let fp: ConfigFingerprint = serde_json::from_value(old_json).expect("load old");
         assert!(fp.parent_retriever.is_none());
         assert!(fp.mmr.is_none());
+    }
+
+    #[test]
+    fn test_fingerprint_fusion_is_none_for_builtin_default() {
+        // D-7 / E-10: 既定値なら fusion は None = 旧 history JSON と PartialEq 互換。
+        let cfg = crate::config::Config::default();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        assert!(fp.fusion.is_none(), "builtin default must not be recorded");
+
+        // 既定値を明示指定した場合も None
+        let toml = concat!(
+            "[search.fusion]\n",
+            "rrf_k = 60.0\n",
+            "bm25_heading_weight = 2.0\n",
+        );
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        assert!(fp.fusion.is_none());
+    }
+
+    #[test]
+    fn test_fingerprint_fusion_is_recorded_when_tuned() {
+        let toml = "[search.fusion]\nrrf_k = 10.0\nbm25_heading_weight = 4.0\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        let f = fp.fusion.as_ref().expect("tuned fusion must be recorded");
+        assert_eq!(f.rrf_k, 10.0);
+        assert_eq!(f.bm25_heading_weight, 4.0);
+        assert_eq!(f.bm25_context_weight, 1.0);
+        assert_eq!(f.bm25_content_weight, 1.0);
+    }
+
+    #[test]
+    fn test_fingerprint_without_fusion_field_deserializes() {
+        // 旧 history JSON (fusion field なし) が読めること = serde(default)。
+        let json = r#"{
+            "model": "bge-small-en-v1.5",
+            "reranker": null,
+            "limit": 10,
+            "k_values": [1, 5, 10],
+            "golden_hash": "abc",
+            "metric_version": 2
+        }"#;
+        let fp: ConfigFingerprint = serde_json::from_str(json).unwrap();
+        assert!(fp.fusion.is_none());
+
+        // かつ、既定 fusion の現行 fingerprint と PartialEq 互換であること
+        let now = ConfigFingerprint {
+            model: "bge-small-en-v1.5".into(),
+            reranker: None,
+            limit: 10,
+            k_values: vec![1, 5, 10],
+            golden_hash: "abc".into(),
+            metric_version: 2,
+            mmr: None,
+            parent_retriever: None,
+            fusion: None,
+        };
+        assert_eq!(fp, now);
     }
 }
