@@ -492,6 +492,9 @@ fn require_kb_path(cli_value: Option<PathBuf>, config_default: Option<PathBuf>) 
 /// 優先順位は CLI > `[eval]` > ビルトイン `[1, 5, 10]`。主指標 nDCG@5 が
 /// 落ちないよう `kb_mcp::tune::normalize_k_values` を通してから、`--limit`
 /// 未指定時の既定値を「k リストの最大値」として決める (eval と同じ規則)。
+/// 明示 `--limit` も max(k) を下限として clamp する — limit < max(k) だと
+/// fused ranking が limit 件に切り詰められ、recall@k / nDCG@k がラベルより
+/// 浅い候補から計算されてしまう (codex P2 on PR #79)。
 fn resolve_tune_k_and_limit(
     cli_k: Option<Vec<usize>>,
     cfg_k: Option<Vec<usize>>,
@@ -499,7 +502,8 @@ fn resolve_tune_k_and_limit(
 ) -> (Vec<usize>, u32) {
     let raw = cli_k.or(cfg_k).unwrap_or_else(|| vec![1, 5, 10]);
     let k_values = kb_mcp::tune::normalize_k_values(&raw);
-    let limit = cli_limit.unwrap_or_else(|| *k_values.iter().max().unwrap_or(&10) as u32);
+    let max_k = *k_values.iter().max().unwrap_or(&10) as u32;
+    let limit = cli_limit.unwrap_or(max_k).max(max_k);
     (k_values, limit)
 }
 
@@ -1728,5 +1732,15 @@ mod tests {
         let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5]), None, Some(100));
         assert_eq!(k, vec![1, 5]);
         assert_eq!(limit, 100);
+    }
+
+    /// Regression (codex P2 on PR #79): 明示 --limit が max(k) より小さいと
+    /// fused ranking が limit で切り詰められ、nDCG@5 等がラベルより浅い候補
+    /// から計算されてしまう。max(k) を下限として clamp する。
+    #[test]
+    fn test_resolve_tune_k_and_limit_clamps_limit_to_max_k() {
+        let (k, limit) = resolve_tune_k_and_limit(Some(vec![1, 5, 10]), None, Some(1));
+        assert_eq!(k, vec![1, 5, 10]);
+        assert_eq!(limit, 10, "limit は max(k) 未満に縮めない");
     }
 }
