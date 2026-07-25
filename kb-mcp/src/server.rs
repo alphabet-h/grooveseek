@@ -857,6 +857,9 @@ pub fn run_search_pipeline(
     }
 
     let resolved = overrides.resolve(toml_search);
+    // fusion は per-call override を持たない (MMR と違い resolve 機構を
+    // 通さない、feature-47 D-6)。toml をそのまま db 層へ渡す。
+    let fusion = crate::db::FusionParams::from(&toml_search.fusion);
     let use_rerank = reranker.is_some();
 
     // 1. RRF candidate pool. MMR on → unbounded (MMR が候補プール全件から
@@ -870,7 +873,7 @@ pub fn run_search_pipeline(
             query_embedding,
             mmr_pool_size,
             filters,
-            crate::db::FusionParams::default(),
+            fusion,
         )?
     } else if use_rerank {
         db.search_hybrid_candidates(
@@ -878,16 +881,10 @@ pub fn run_search_pipeline(
             query_embedding,
             limit.saturating_mul(5).max(50),
             filters,
-            crate::db::FusionParams::default(),
+            fusion,
         )?
     } else {
-        db.search_hybrid_candidates(
-            query,
-            query_embedding,
-            limit,
-            filters,
-            crate::db::FusionParams::default(),
-        )?
+        db.search_hybrid_candidates(query, query_embedding, limit, filters, fusion)?
     };
 
     // 2. Optional reranker。MMR off の reranker 入力 limit は `limit` (元の挙動
@@ -2591,6 +2588,79 @@ mod tests {
             mode_seen_by_watcher,
             crate::db::ContextMode::Static,
             "watcher's fallback read must now see Static, not silently fall back to Off"
+        );
+    }
+
+    #[test]
+    fn test_run_search_pipeline_honors_toml_fusion_rrf_k() {
+        // D-6: [search.fusion] が db 層まで届いていることの配線テスト。
+        //
+        // **rrf_k で検証する理由**: RRF スコアは必ず 1/(k + rank + 1) の形なので、
+        // k を 60 -> 5 に振れば順位に依らず top1 の score が桁で動く。一方
+        // bm25 重みの A/B で順位交代を assert する形にすると、対称な候補集合では
+        // 1/61 + 1/62 と 1/62 + 1/61 が IEEE754 的に厳密一致してしまい、
+        // 順位が入れ替わらず assert_ne! が決定的に fail する。
+        //
+        // **bm25 側の配線を重複検証しない理由**: `fusion` は run_search_pipeline 内の
+        // 単一ローカル変数として 3 つの db 呼び出しすべてへ渡るので、rrf_k が
+        // 届いていれば bm25 重みも同じ経路で届いている。bm25 重みが実際に順位を
+        // 動かすことは db.rs の test_fts_bm25_weights_are_bound_and_effective が
+        // 担保する。
+        let db = crate::db::Database::open_in_memory().expect("open_in_memory");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("verify_embedding_meta");
+        let emb = |v: f32| vec![v; 384];
+
+        let doc = db
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .unwrap();
+        db.insert_chunk(
+            doc,
+            0,
+            Some("zebrafish"),
+            None,
+            "zebrafish larvae are used in screening assays",
+            None,
+            &emb(0.2),
+            1.0,
+        )
+        .unwrap();
+
+        let mk = |k: f32| crate::config::SearchConfig {
+            fusion: crate::config::FusionConfig {
+                rrf_k: k,
+                ..crate::config::FusionConfig::default()
+            },
+            ..crate::config::SearchConfig::default()
+        };
+        let overrides = crate::config::SearchOverrides::default();
+        let filters = crate::db::SearchFilters::default();
+        let go = |cfg: &crate::config::SearchConfig| {
+            run_search_pipeline(
+                &db,
+                None,
+                "zebrafish",
+                &emb(0.2),
+                5,
+                &filters,
+                &overrides,
+                cfg,
+            )
+            .unwrap()
+        };
+
+        let k60 = go(&mk(60.0));
+        let k5 = go(&mk(5.0));
+
+        assert!(!k60.is_empty(), "fixture must return at least one hit");
+        assert_eq!(k60[0].0, k5[0].0, "the same chunk should top both runs");
+        // vec / FTS 双方で rank 0 なら 2/(60+1)=0.0328 vs 2/(5+1)=0.3333。
+        // vec-only でも 0.0164 vs 0.1667 で、いずれにせよ差は 1e-3 を大きく超える。
+        assert!(
+            (k60[0].1.score - k5[0].1.score).abs() > 1e-3,
+            "rrf_k from [search.fusion] must reach the db layer: k=60 score {} vs k=5 score {}",
+            k60[0].1.score,
+            k5[0].1.score
         );
     }
 }
