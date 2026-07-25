@@ -521,6 +521,372 @@ pub fn build_metric_table(
     Ok(MetricTable::from_rows(rows, k_values.to_vec()))
 }
 
+// ---------------------------------------------------------------------------
+// Statistics (D-11)
+// ---------------------------------------------------------------------------
+
+/// 採用に要求する held-out 平均改善の下限 (nDCG@5)。
+/// RRF 原論文の実測 (k∈[30,100] で MAP 相対 0.4%) を踏まえ、
+/// この程度の差が出なければ measurement noise と見なす。
+pub const ADOPT_MIN_MEAN_DELTA: f64 = 0.02;
+
+/// 採用に要求する selection stability の下限 (過半数)。
+/// fold 間で勝者が割れるのは過学習の最も直接的な兆候。
+pub const STABILITY_MIN: f64 = 0.5;
+
+/// これ未満の実効 N は IR 慣行の下限未満として stderr に警告する。
+pub const SMALL_N_WARN: usize = 50;
+
+/// 標本平均。空なら 0.0。
+pub fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<f64>() / xs.len() as f64
+}
+
+/// 不偏標本標準偏差 (分母 n-1)。n < 2 なら 0.0。
+pub fn sample_sd(xs: &[f64]) -> f64 {
+    let n = xs.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let m = mean(xs);
+    let var = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (n as f64 - 1.0);
+    var.sqrt()
+}
+
+/// paired per-query 差分から求める標準誤差 `SD({d_j}) / sqrt(N)` (D-11-2)。
+///
+/// **fold 平均の分散を SE と呼んではならない** — fold 平均は d_j のアフィン
+/// 変換なので SD が 1/(N−1) に縮み、有意判定が壊れる。fold が query を共有
+/// するため厳密には i.i.d. でない近似値だが、保守側 (過小評価しない) に働く。
+/// N < 2 は判定不能として無限大を返し、採用条件を必ず落とす。
+pub fn paired_se(diffs: &[f64]) -> f64 {
+    if diffs.len() < 2 {
+        return f64::INFINITY;
+    }
+    sample_sd(diffs) / (diffs.len() as f64).sqrt()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignTest {
+    pub positive: usize,
+    pub negative: usize,
+    pub ties: usize,
+    /// 帰無仮説 p=0.5 の二項分布による厳密両側 p 値。
+    pub p_value: f64,
+}
+
+/// paired sign test (D-11-2 の参考情報)。同値は捨てる標準的な扱い。
+pub fn sign_test(diffs: &[f64]) -> SignTest {
+    const EPS: f64 = 1e-12;
+    let positive = diffs.iter().filter(|d| **d > EPS).count();
+    let negative = diffs.iter().filter(|d| **d < -EPS).count();
+    let ties = diffs.len() - positive - negative;
+    let n = positive + negative;
+    if n == 0 {
+        return SignTest {
+            positive,
+            negative,
+            ties,
+            p_value: 1.0,
+        };
+    }
+    // 両側 p = 2 * P(X <= min(pos, neg)), X ~ Bin(n, 0.5)、1.0 でクランプ。
+    let m = positive.min(negative);
+    let mut tail = 0.0_f64;
+    let mut coeff = 1.0_f64; // C(n, 0)
+    for i in 0..=m {
+        if i > 0 {
+            coeff = coeff * ((n - i + 1) as f64) / (i as f64);
+        }
+        tail += coeff;
+    }
+    let p = (2.0 * tail / 2f64.powi(n as i32)).min(1.0);
+    SignTest {
+        positive,
+        negative,
+        ties,
+        p_value: p,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selection (D-9 / D-11)
+// ---------------------------------------------------------------------------
+
+/// プラトー (同点) 判定の許容幅。nDCG は `[0, 1]` なので 1e-9 は
+/// 「浮動小数の丸め誤差の範囲で同点」を意味する。
+const PLATEAU_EPS: f64 = 1e-9;
+
+/// グリッド中央からの距離 (各軸の添字距離の総和)。
+///
+/// D-11-7 後半: **プラトーでは端ではなく中央の値を推奨する**。端の値は
+/// golden の偶然に張り付いた結果であることが多く、同じスコアなら中央の方が
+/// 汎化しやすい (presearch R2)。
+fn distance_from_grid_center(c: Condition) -> f64 {
+    let wc = (BM25_WEIGHT_GRID.len() - 1) as f64 / 2.0; // 4 要素 -> 1.5
+    let kc = (RRF_K_GRID.len() - 1) as f64 / 2.0; // 6 要素 -> 2.5
+    (c.h as f64 - wc).abs()
+        + (c.ctx as f64 - wc).abs()
+        + (c.content as f64 - wc).abs()
+        + (c.k as f64 - kc).abs()
+}
+
+/// 同点集合から 1 条件を選ぶ。優先順位:
+///
+/// 1. **既定条件が同点で含まれていれば既定条件** (D-11-2 の default タイブレーク)
+/// 2. さもなくばグリッド中央に最も近い条件 (D-11-7)
+/// 3. なお同点ならグリッド順で最小の条件 (決定性の担保)
+fn pick_from_plateau(plateau: &[Condition], base: Condition) -> Condition {
+    if plateau.contains(&base) {
+        return base;
+    }
+    let mut best = plateau[0];
+    let mut best_d = distance_from_grid_center(best);
+    for &c in &plateau[1..] {
+        let d = distance_from_grid_center(c);
+        if d < best_d - 1e-12 || ((d - best_d).abs() <= 1e-12 && c.index() < best.index()) {
+            best = c;
+            best_d = d;
+        }
+    }
+    best
+}
+
+/// coordinate descent (D-9) を metric table 上で実行する。
+///
+/// - Phase W: `rrf_k` を既定 (60) に固定して 64 通りの重み組から最良を選ぶ
+/// - Phase K: 勝った重み組を固定して 6 通りの `rrf_k` から最良を選ぶ
+///
+/// 全直積 (384) を argmax しないのは overfit + 冗長だからであり、
+/// この手続き自体が「選択手続き」として nested LOO の評価対象になる。
+///
+/// 各 phase では最大値そのものではなく **同点集合 (プラトー)** を集め、
+/// [`pick_from_plateau`] で「default 優先 → 中央優先 → グリッド順」の順に
+/// 決める。初期値を既定条件に置いてあるので、完全に平坦な landscape では
+/// 必ず既定条件が返る。
+pub fn select_condition(table: &MetricTable, query_idx: &[usize]) -> Condition {
+    let base = Condition::builtin_default();
+    let mut best_score = table.mean_primary(base, query_idx);
+    let mut plateau = vec![base];
+
+    // Phase W
+    for h in 0..BM25_WEIGHT_GRID.len() {
+        for ctx in 0..BM25_WEIGHT_GRID.len() {
+            for content in 0..BM25_WEIGHT_GRID.len() {
+                let c = Condition {
+                    h,
+                    ctx,
+                    content,
+                    k: base.k,
+                };
+                let s = table.mean_primary(c, query_idx);
+                if s > best_score + PLATEAU_EPS {
+                    best_score = s;
+                    plateau.clear();
+                    plateau.push(c);
+                } else if (s - best_score).abs() <= PLATEAU_EPS && !plateau.contains(&c) {
+                    plateau.push(c);
+                }
+            }
+        }
+    }
+    let best_w = pick_from_plateau(&plateau, base);
+
+    // Phase K
+    plateau.clear();
+    plateau.push(best_w);
+    for k in 0..RRF_K_GRID.len() {
+        let c = Condition { k, ..best_w };
+        let s = table.mean_primary(c, query_idx);
+        if s > best_score + PLATEAU_EPS {
+            best_score = s;
+            plateau.clear();
+            plateau.push(c);
+        } else if (s - best_score).abs() <= PLATEAU_EPS && !plateau.contains(&c) {
+            plateau.push(c);
+        }
+    }
+    pick_from_plateau(&plateau, base)
+}
+
+pub struct LooOutcome {
+    /// 全 N query での argmax (refit)。**これが最終推奨値**。
+    /// nested LOO が出すのは「選択手続きの性能推定」であって単一の
+    /// パラメータではない (D-11-2)。
+    pub refit: Condition,
+    /// fold j の held-out query における default 比の per-query 差分。
+    pub diffs: Vec<f64>,
+    /// fold ごとの選択結果。
+    pub fold_selections: Vec<Condition>,
+    /// refit と同じ条件を選んだ fold の割合 (selection stability)。
+    pub stability: f64,
+}
+
+/// nested leave-one-query-out CV (D-11-1)。
+///
+/// fold j (query j を除外) ごとに N−1 query で `select_condition` を回し、
+/// **除外した query j で評価**して差分 d_j を得る。選択バイアス
+/// (Cawley & Talbot) をこの構成で吸収する。全 N argmax を fold で使い回す
+/// 実装は選択バイアスの再導入なので禁止。
+pub fn nested_loo(table: &MetricTable, effective: &[usize]) -> LooOutcome {
+    let refit = select_condition(table, effective);
+    let base = Condition::builtin_default();
+    let mut diffs = Vec::with_capacity(effective.len());
+    let mut fold_selections = Vec::with_capacity(effective.len());
+
+    for (j, &held_out) in effective.iter().enumerate() {
+        let train: Vec<usize> = effective
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != j)
+            .map(|(_, &q)| q)
+            .collect();
+        let sel = select_condition(table, &train);
+        diffs.push(table.primary(sel, held_out) - table.primary(base, held_out));
+        fold_selections.push(sel);
+    }
+
+    let stability = if fold_selections.is_empty() {
+        0.0
+    } else {
+        fold_selections.iter().filter(|c| **c == refit).count() as f64
+            / fold_selections.len() as f64
+    };
+
+    LooOutcome {
+        refit,
+        diffs,
+        fold_selections,
+        stability,
+    }
+}
+
+/// 全指標の非悪化条件 (D-11-3)。主指標は nDCG@5 だが、recall@k / MRR が
+/// baseline より悪化している候補は閾値を満たしても推奨しない。
+///
+/// 判定は **golden 全 query の集計** で行う (実効 query に限定しない)。
+/// production で効くのは全体の集計値だからである。
+pub fn non_degradation(table: &MetricTable, cand: Condition, all: &[usize]) -> (bool, Vec<String>) {
+    let base = Condition::builtin_default();
+    let a_cand = table.aggregate_for(cand, all);
+    let a_base = table.aggregate_for(base, all);
+    let mut violations = Vec::new();
+    for &k in table.k_values() {
+        let c = a_cand.recall_at_k.get(&k).copied().unwrap_or(0.0);
+        let b = a_base.recall_at_k.get(&k).copied().unwrap_or(0.0);
+        if c < b {
+            violations.push(format!("recall@{k} {c:.4} < baseline {b:.4}"));
+        }
+    }
+    if a_cand.mrr < a_base.mrr {
+        violations.push(format!(
+            "MRR {:.4} < baseline {:.4}",
+            a_cand.mrr, a_base.mrr
+        ));
+    }
+    (violations.is_empty(), violations)
+}
+
+/// per-query 内訳 (D-11-4)。rank fusion は平均改善が per-query 劣化を
+/// 隠すため (Benham & Culpepper)、悪化 query 数と最大悪化幅を必ず出す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerQueryImpact {
+    pub improved: usize,
+    pub degraded: usize,
+    /// 最も悪化した query の差分 (負値)。悪化なしなら 0.0。
+    pub worst_delta: f64,
+    /// 最も悪化した query の添字。
+    pub worst_query: Option<usize>,
+}
+
+pub fn per_query_impact(table: &MetricTable, cand: Condition, all: &[usize]) -> PerQueryImpact {
+    const EPS: f64 = 1e-12;
+    let base = Condition::builtin_default();
+    let mut improved = 0;
+    let mut degraded = 0;
+    let mut worst_delta = 0.0_f64;
+    let mut worst_query = None;
+    for &q in all {
+        let d = table.primary(cand, q) - table.primary(base, q);
+        if d > EPS {
+            improved += 1;
+        } else if d < -EPS {
+            degraded += 1;
+            if d < worst_delta {
+                worst_delta = d;
+                worst_query = Some(q);
+            }
+        }
+    }
+    PerQueryImpact {
+        improved,
+        degraded,
+        worst_delta,
+        worst_query,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    /// 全条件を満たしたので推奨する。
+    Adopt(Condition),
+    /// default 維持が結論。`reasons` に落ちた条件を列挙する。
+    KeepDefault { reasons: Vec<String> },
+}
+
+/// 採否判定 (D-11-2 / D-11-3)。以下を **すべて** 満たしたときだけ採用:
+///
+/// 1. refit が既定条件と異なる
+/// 2. `mean(d) > ADOPT_MIN_MEAN_DELTA`
+/// 3. `mean(d) > 2 * paired_se(d)`
+/// 4. selection stability > `STABILITY_MIN` (過半数の fold が refit に一致)
+/// 5. 全指標 (recall@k 各 k / MRR) が baseline を下回らない
+pub fn decide(table: &MetricTable, outcome: &LooOutcome, all: &[usize]) -> Verdict {
+    let mut reasons = Vec::new();
+    let m = mean(&outcome.diffs);
+    let se = paired_se(&outcome.diffs);
+
+    if outcome.refit == Condition::builtin_default() {
+        reasons.push("refit selected the built-in defaults".to_string());
+    }
+    if m <= ADOPT_MIN_MEAN_DELTA {
+        reasons.push(format!(
+            "held-out mean delta {m:+.4} <= threshold {ADOPT_MIN_MEAN_DELTA:.4}"
+        ));
+    }
+    // `m > 2*se` の否定を `m <= 2*se` と書いてはならない: se は N<2 で
+    // INFINITY、m は退化入力で NaN になり得るため、比較不能なケースを
+    // 「採用しない」側 (= reason を積む) へ倒す必要がある。
+    let two_se = 2.0 * se;
+    if !matches!(m.partial_cmp(&two_se), Some(std::cmp::Ordering::Greater)) {
+        reasons.push(format!(
+            "held-out mean delta {m:+.4} <= 2 x paired SE {two_se:.4}"
+        ));
+    }
+    if outcome.stability <= STABILITY_MIN {
+        reasons.push(format!(
+            "selection stability {:.2} <= {STABILITY_MIN:.2} (folds disagree = overfit signal)",
+            outcome.stability
+        ));
+    }
+    let (ok, violations) = non_degradation(table, outcome.refit, all);
+    if !ok {
+        reasons.push(format!(
+            "secondary metrics degraded: {}",
+            violations.join("; ")
+        ));
+    }
+
+    if reasons.is_empty() {
+        Verdict::Adopt(outcome.refit)
+    } else {
+        Verdict::KeepDefault { reasons }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,5 +1272,267 @@ mod tests {
             pre.queries[0].diag.bm25_sensitive,
             "heading-only vs content-only docs must reorder between the grid extremes"
         );
+    }
+
+    #[test]
+    fn test_mean_and_sample_sd() {
+        assert!((mean(&[1.0, 2.0, 3.0]) - 2.0).abs() < 1e-12);
+        assert_eq!(mean(&[]), 0.0);
+        // 不偏 SD (分母 n-1): [1,2,3] -> sqrt(1.0) == 1.0
+        assert!((sample_sd(&[1.0, 2.0, 3.0]) - 1.0).abs() < 1e-12);
+        assert_eq!(sample_sd(&[5.0]), 0.0);
+    }
+
+    #[test]
+    fn test_paired_se_is_sd_over_sqrt_n() {
+        // D-11-2: SE は paired per-query 差分の SD/sqrt(N)。
+        // fold 平均の SD (1/(N-1) に縮む) を SE と呼んではならない。
+        let d = [1.0, 2.0, 3.0, 4.0];
+        let expected = sample_sd(&d) / 2.0; // sqrt(4) == 2
+        assert!((paired_se(&d) - expected).abs() < 1e-12);
+        // N < 2 は判定不能 = 無限大にして採用を必ず落とす (保守側)
+        assert!(paired_se(&[0.5]).is_infinite());
+        assert!(paired_se(&[]).is_infinite());
+    }
+
+    #[test]
+    fn test_sign_test_counts_and_exact_p() {
+        let r = sign_test(&[1.0, 1.0, -1.0]);
+        assert_eq!((r.positive, r.negative, r.ties), (2, 1, 0));
+        // 2 * P(X <= 1), X ~ Bin(3, 0.5) = 2 * (1+3)/8 = 1.0
+        assert!((r.p_value - 1.0).abs() < 1e-12);
+
+        let r = sign_test(&[1.0; 5]);
+        assert_eq!((r.positive, r.negative), (5, 0));
+        // 2 * P(X <= 0) = 2 * 1/32 = 0.0625
+        assert!((r.p_value - 0.0625).abs() < 1e-12);
+
+        // 同値は捨てる (標準的な sign test)
+        let r = sign_test(&[0.0, 0.0, 1.0]);
+        assert_eq!((r.positive, r.negative, r.ties), (1, 0, 2));
+    }
+
+    #[test]
+    fn test_select_condition_prefers_default_on_a_flat_landscape() {
+        // landscape が完全平坦なら既定条件を選ぶ (タイブレークは default 優先)。
+        let t = flat_table(5, 0.4);
+        assert_eq!(
+            select_condition(&t, &[0, 1, 2, 3, 4]),
+            Condition::builtin_default()
+        );
+    }
+
+    #[test]
+    fn test_select_condition_prefers_the_grid_centre_on_a_plateau() {
+        // D-11-7 後半: プラトーでは端ではなく中央の値を推奨する。
+        // 既定条件を含まない 2 条件を完全同点にし、中央寄りが選ばれることを見る。
+        let base = Condition::builtin_default();
+        let edge = Condition {
+            h: 0,
+            ctx: 0,
+            content: 0,
+            k: base.k,
+        }; // 0.5 / 0.5 / 0.5 = グリッドの端
+        let centre = Condition {
+            h: 1,
+            ctx: 1,
+            content: 1,
+            k: base.k,
+        }; // 1.0 / 1.0 / 1.0 = 中央寄り
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 3];
+        for r in rows.iter_mut() {
+            r[edge.index()] = 0.60;
+            r[centre.index()] = 0.60;
+        }
+        let t = table_from_primary(rows);
+        // 距離: edge = 1.5*3 + 1.5 = 6.0 / centre = 0.5*3 + 1.5 = 3.0
+        assert_eq!(select_condition(&t, &[0, 1, 2]), centre);
+    }
+
+    #[test]
+    fn test_select_condition_prefers_default_over_the_centre_when_tied() {
+        // 既定条件が同点集合に含まれるなら、中央距離に関わらず既定条件が勝つ
+        // (D-11-2 の default タイブレークが D-11-7 より優先)。
+        let base = Condition::builtin_default();
+        let centre = Condition {
+            h: 1,
+            ctx: 1,
+            content: 1,
+            k: base.k,
+        };
+        // base = (2,1,1) の中央距離は 0.5*3 + 1.5 = 3.0 で centre と完全同値だが、
+        // それでも「既定条件優先」の規則で base が返ること。
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 3];
+        for r in rows.iter_mut() {
+            r[base.index()] = 0.60;
+            r[centre.index()] = 0.60;
+        }
+        let t = table_from_primary(rows);
+        assert_eq!(select_condition(&t, &[0, 1, 2]), base);
+    }
+
+    #[test]
+    fn test_select_condition_runs_coordinate_descent() {
+        // D-9: Phase W (k=60 固定で重み 64 通り) → Phase K (勝者重みで k 6 通り)。
+        // 「Phase W では負けるが、その重みの別 k では最良」という条件は
+        // coordinate descent では **選ばれない** ことを固定する。
+        let base = Condition::builtin_default();
+        let winner_w = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: base.k,
+        };
+        let winner_wk = Condition { k: 0, ..winner_w };
+        // 全直積でしか届かない罠条件 (Phase W では k=60 の値が低い)
+        let trap = Condition {
+            h: 0,
+            ctx: 0,
+            content: 3,
+            k: 1,
+        };
+
+        let mut rows = vec![vec![0.30_f64; TOTAL_CONDITIONS]; 3];
+        for r in rows.iter_mut() {
+            r[winner_w.index()] = 0.40;
+            r[winner_wk.index()] = 0.55;
+            r[trap.index()] = 0.90; // 全直積 argmax ならこれを選ぶ
+        }
+        let t = table_from_primary(rows);
+        assert_eq!(select_condition(&t, &[0, 1, 2]), winner_wk);
+    }
+
+    #[test]
+    fn test_nested_loo_reports_stability_and_paired_diffs() {
+        // 全 query で同じ条件が勝つ landscape なら stability = 1.0、
+        // 差分は per-query の実測差になる。
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 4];
+        for r in rows.iter_mut() {
+            r[winner.index()] = 0.50;
+        }
+        let t = table_from_primary(rows);
+        let out = nested_loo(&t, &[0, 1, 2, 3]);
+
+        assert_eq!(out.refit, winner);
+        assert_eq!(out.fold_selections.len(), 4);
+        assert!((out.stability - 1.0).abs() < 1e-12);
+        assert_eq!(out.diffs.len(), 4);
+        for d in &out.diffs {
+            assert!((d - 0.30).abs() < 1e-12, "held-out delta must be 0.5 - 0.2");
+        }
+    }
+
+    #[test]
+    fn test_nested_loo_stability_falls_when_folds_disagree() {
+        // fold ごとに違う条件が勝つ = 過学習の最も直接的な兆候。
+        let a = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let b = Condition {
+            h: 0,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 4];
+        // query 0,1 は a を、query 2,3 は b を強く支持する
+        rows[0][a.index()] = 0.9;
+        rows[1][a.index()] = 0.9;
+        rows[2][b.index()] = 0.9;
+        rows[3][b.index()] = 0.9;
+        let t = table_from_primary(rows);
+        let out = nested_loo(&t, &[0, 1, 2, 3]);
+        assert!(
+            out.stability < 1.0,
+            "folds must disagree here, got stability={}",
+            out.stability
+        );
+    }
+
+    #[test]
+    fn test_decide_keeps_default_when_gain_is_small() {
+        // mean(d) が 0.02 に届かなければ default 維持 (D-11-2)。
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let mut rows = vec![vec![0.500_f64; TOTAL_CONDITIONS]; 6];
+        for r in rows.iter_mut() {
+            r[winner.index()] = 0.505; // +0.005 のみ
+        }
+        let t = table_from_primary(rows);
+        let out = nested_loo(&t, &[0, 1, 2, 3, 4, 5]);
+        let verdict = decide(&t, &out, &[0, 1, 2, 3, 4, 5]);
+        match verdict {
+            Verdict::KeepDefault { reasons } => {
+                assert!(
+                    reasons.iter().any(|r| r.contains("mean")),
+                    "reason must mention the mean-delta threshold: {reasons:?}"
+                );
+            }
+            Verdict::Adopt(c) => panic!("must not adopt a +0.005 gain, got {c:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_keeps_default_on_a_flat_landscape() {
+        let t = flat_table(12, 0.4);
+        let idx: Vec<usize> = (0..12).collect();
+        let out = nested_loo(&t, &idx);
+        assert!(matches!(
+            decide(&t, &out, &idx),
+            Verdict::KeepDefault { .. }
+        ));
+    }
+
+    #[test]
+    fn test_decide_adopts_a_large_consistent_gain() {
+        // 全 query で +0.30、fold 完全一致、全指標非悪化 → 採用。
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 12];
+        for (i, r) in rows.iter_mut().enumerate() {
+            // 分散をわずかに入れて SE > 0 にする (SD=0 の退化を避ける)
+            r[winner.index()] = 0.50 + (i % 3) as f64 * 0.01;
+        }
+        let t = table_from_primary(rows);
+        let idx: Vec<usize> = (0..12).collect();
+        let out = nested_loo(&t, &idx);
+        assert_eq!(decide(&t, &out, &idx), Verdict::Adopt(winner));
+    }
+
+    #[test]
+    fn test_per_query_impact_reports_worst_degradation() {
+        let cand = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let mut rows = vec![vec![0.40_f64; TOTAL_CONDITIONS]; 3];
+        rows[0][cand.index()] = 0.80; // +0.40
+        rows[1][cand.index()] = 0.15; // -0.25 (最大悪化)
+        rows[2][cand.index()] = 0.40; // 同値
+        let t = table_from_primary(rows);
+        let impact = per_query_impact(&t, cand, &[0, 1, 2]);
+        assert_eq!(impact.improved, 1);
+        assert_eq!(impact.degraded, 1);
+        assert!((impact.worst_delta + 0.25).abs() < 1e-12);
+        assert_eq!(impact.worst_query, Some(1));
     }
 }
