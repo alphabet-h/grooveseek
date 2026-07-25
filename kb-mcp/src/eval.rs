@@ -507,8 +507,10 @@ pub fn format_json(run: &EvalRun, previous: Option<&EvalRun>) -> serde_json::Val
     let prev_val = previous
         .and_then(|p| serde_json::to_value(p).ok())
         .unwrap_or(serde_json::Value::Null);
+    // 表示 diff も full fingerprint 互換でのみ有効化する (golden_hash 単独だと
+    // metric_version / model 等が違う旧 run との apple-to-orange 差分を出してしまう)。
     let diff_val = match previous {
-        Some(p) if p.fingerprint.golden_hash == run.fingerprint.golden_hash => {
+        Some(p) if p.fingerprint == run.fingerprint => {
             let mut recall_diff = serde_json::Map::new();
             for (k, v) in &run.aggregate.recall_at_k {
                 let prev_v = p.aggregate.recall_at_k.get(k).copied().unwrap_or(0.0);
@@ -557,9 +559,10 @@ pub fn format_text(
     .unwrap();
     writeln!(s).unwrap();
 
-    // Fingerprint mismatch は diff を無効化
+    // Fingerprint mismatch は diff を無効化 (golden_hash 単独ではなく full 比較。
+    // metric_version / model 等が違う旧 run との表示 diff も apple-to-orange)
     let diff_enabled = match previous {
-        Some(p) => p.fingerprint.golden_hash == run.fingerprint.golden_hash,
+        Some(p) => p.fingerprint == run.fingerprint,
         None => false,
     };
 
@@ -567,8 +570,16 @@ pub fn format_text(
         Some(p) if diff_enabled => {
             writeln!(s, "Aggregate (previous run: {})", p.timestamp.to_rfc3339()).unwrap();
         }
-        Some(_) => {
+        Some(p) if p.fingerprint.golden_hash != run.fingerprint.golden_hash => {
             writeln!(s, "⚠️ golden changed since last run, diff disabled").unwrap();
+            writeln!(s, "Aggregate").unwrap();
+        }
+        Some(_) => {
+            writeln!(
+                s,
+                "⚠️ config or metric version changed since last run, diff disabled"
+            )
+            .unwrap();
             writeln!(s, "Aggregate").unwrap();
         }
         None => {
@@ -1528,6 +1539,93 @@ mod tests {
         assert!(!v["previous"].is_null());
         let diff5 = v["diff"]["recall_at_k"]["5"].as_f64().unwrap();
         assert!((diff5 - 0.2).abs() < 1e-9);
+    }
+
+    /// Metric version 違いの previous とは表示 diff も無効化する (codex P2 round 2
+    /// on PR #76)。--fail-on-regression 側は除外済みでも、表示側が golden_hash
+    /// のみで gate すると旧式との赤 delta が出てしまう。
+    #[test]
+    fn test_format_json_metric_version_mismatch_disables_diff() {
+        let mut a1 = AggregateMetrics::default();
+        a1.recall_at_k.insert(5, 0.6);
+        let mut a0 = AggregateMetrics::default();
+        a0.recall_at_k.insert(5, 0.8);
+        let fp_now = ConfigFingerprint {
+            model: "m".into(),
+            reranker: None,
+            limit: 10,
+            k_values: vec![5],
+            golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
+            mmr: None,
+            parent_retriever: None,
+        };
+        let fp_prev = ConfigFingerprint {
+            metric_version: 1,
+            ..fp_now.clone()
+        };
+        let now = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_now,
+            per_query: vec![],
+            aggregate: a1,
+        };
+        let prev = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_prev,
+            per_query: vec![],
+            aggregate: a0,
+        };
+        let v = format_json(&now, Some(&prev));
+        assert!(
+            v["diff"].is_null(),
+            "diff must be null across metric versions"
+        );
+    }
+
+    /// format_text も metric version 違いでは diff を無効化し、golden 変更とは
+    /// 区別されたメッセージを出す。
+    #[test]
+    fn test_format_text_metric_version_mismatch_disables_diff() {
+        let mut a1 = AggregateMetrics::default();
+        a1.recall_at_k.insert(5, 0.6);
+        a1.query_count = 1;
+        let mut a0 = AggregateMetrics::default();
+        a0.recall_at_k.insert(5, 0.8);
+        a0.query_count = 1;
+        let fp_now = ConfigFingerprint {
+            model: "m".into(),
+            reranker: None,
+            limit: 10,
+            k_values: vec![5],
+            golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
+            mmr: None,
+            parent_retriever: None,
+        };
+        let fp_prev = ConfigFingerprint {
+            metric_version: 1,
+            ..fp_now.clone()
+        };
+        let now = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_now,
+            per_query: vec![],
+            aggregate: a1,
+        };
+        let prev = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_prev,
+            per_query: vec![],
+            aggregate: a0,
+        };
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("diff disabled"), "got: {out}");
+        assert!(!out.contains("golden changed"), "got: {out}");
+        assert!(
+            !out.contains("↓"),
+            "must not render downward delta, got: {out}"
+        );
     }
 
     #[test]

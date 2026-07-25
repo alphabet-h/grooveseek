@@ -22,6 +22,11 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
     `--fail-on-regression` comparison, so this intentional metric
     correction can never be misreported as a retrieval regression. The
     first `kb-mcp eval` after upgrading starts a fresh comparison baseline.
+  - Displayed comparisons (`--format text` arrows / `--format json` `diff`)
+    now also require full fingerprint compatibility instead of only a
+    matching golden hash, so cross-metric-version (or cross-model) deltas
+    are no longer rendered; a dedicated "config or metric version changed"
+    notice is shown instead.
 
 ## [0.12.0] - 2026-07-21
 
