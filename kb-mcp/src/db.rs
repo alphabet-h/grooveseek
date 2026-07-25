@@ -404,6 +404,11 @@ pub struct Database {
 ///
 /// HashMap iteration の非決定性に依存しないよう、tie-break で id を使い
 /// プラットフォーム / 入力順に依存しない出力を保証する (invariant #1)。
+///
+/// production 経路は feature-47 で [`fuse_rrf`] へ移行した。本関数は
+/// `fuse_rrf` の等価性を照合する **oracle** としてテストからのみ参照される
+/// (同ファイルの `dummy_search_result_for_id` と同じ扱い)。
+#[cfg(test)]
 fn rrf_topk(
     mut scores: HashMap<i64, f32>,
     mut rows: HashMap<i64, SearchResult>,
@@ -422,6 +427,75 @@ fn rrf_topk(
         .into_iter()
         .filter_map(|(id, rrf)| {
             rows.remove(&id).map(|mut r| {
+                r.score = rrf;
+                (id, r)
+            })
+        })
+        .collect()
+}
+
+/// RRF の中核演算。2 本の rank list (要素は `chunk_id`、先頭が rank 0) を
+/// `1 / (k + rank + 1)` で加算融合し、**score DESC + chunk_id ASC** の順に
+/// 並べた `(chunk_id, rrf_score)` を返す。`limit=Some(n)` で上位 n 件に
+/// truncate、`None` なら全件。
+///
+/// `SearchResult` に触れないので、`kb-mcp tune` が同一の候補リストへ複数の
+/// `rrf_k` を再適用するときに候補プールを clone せずに済む (feature-47 D-5 /
+/// D-10)。スコア累算は production 挙動を変えないため **f32 のまま**。
+pub(crate) fn fuse_rrf_ids(
+    vec_ids: &[i64],
+    fts_ids: &[i64],
+    rrf_k: f32,
+    limit: Option<u32>,
+) -> Vec<(i64, f32)> {
+    let mut scores: HashMap<i64, f32> = HashMap::new();
+    for (rank, id) in vec_ids.iter().enumerate() {
+        *scores.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + (rank as f32) + 1.0);
+    }
+    for (rank, id) in fts_ids.iter().enumerate() {
+        *scores.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + (rank as f32) + 1.0);
+    }
+    let mut merged: Vec<(i64, f32)> = scores.into_iter().collect();
+    // HashMap iteration の非決定性に依存しないよう id で tie-break する
+    // (rrf_topk と同一の全順序、invariant #1)。
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if let Some(n) = limit {
+        merged.truncate(n as usize);
+    }
+    merged
+}
+
+/// [`fuse_rrf_ids`] の結果に `SearchResult` を貼り直すラッパ。
+///
+/// **truncate 後の勝者だけを clone する** ので、production 経路で増える
+/// allocation は最大 `limit` 件 (既定 10) に収まる (feature-47 D-5)。
+/// 同一 chunk が両リストに現れた場合の row は **vec 側を優先** する
+/// (旧 inline 実装が vec → fts の順に `rows.entry(id).or_insert(row)` を
+/// 回していた挙動と同一)。
+fn fuse_rrf(
+    vec_hits: &[(i64, SearchResult)],
+    fts_hits: &[(i64, SearchResult)],
+    rrf_k: f32,
+    limit: Option<u32>,
+) -> Vec<(i64, SearchResult)> {
+    let vec_ids: Vec<i64> = vec_hits.iter().map(|(id, _)| *id).collect();
+    let fts_ids: Vec<i64> = fts_hits.iter().map(|(id, _)| *id).collect();
+    let ranked = fuse_rrf_ids(&vec_ids, &fts_ids, rrf_k, limit);
+
+    let mut rows: HashMap<i64, &SearchResult> = HashMap::new();
+    for (id, row) in vec_hits.iter().chain(fts_hits.iter()) {
+        rows.entry(*id).or_insert(row);
+    }
+
+    ranked
+        .into_iter()
+        .filter_map(|(id, rrf)| {
+            rows.get(&id).map(|row| {
+                let mut r = (*row).clone();
                 r.score = rrf;
                 (id, r)
             })
@@ -1402,20 +1476,7 @@ impl Database {
 
         let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
         let fts_hits = self.search_fts_candidates(query_text, candidates, filters)?;
-
-        // RRF: chunk_id ごとに 1/(K + rank + 1) を加算
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        let mut rows: HashMap<i64, SearchResult> = HashMap::new();
-        for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-        for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-
-        Ok(rrf_topk(scores, rows, Some(limit)))
+        Ok(fuse_rrf(&vec_hits, &fts_hits, RRF_K, Some(limit)))
     }
 
     /// `search_hybrid_candidates` と同じ RRF を計算するが、最終 truncate を
@@ -1439,19 +1500,7 @@ impl Database {
         let candidates = desired_candidates.max(50);
         let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
         let fts_hits = self.search_fts_candidates(query_text, candidates, filters)?;
-
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        let mut rows: HashMap<i64, SearchResult> = HashMap::new();
-        for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-        for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-
-        Ok(rrf_topk(scores, rows, None))
+        Ok(fuse_rrf(&vec_hits, &fts_hits, RRF_K, None))
     }
 
     /// RRF 用: ベクトル検索の候補を `(chunk_id, SearchResult)` で返す。
@@ -5178,5 +5227,74 @@ mod tests {
         // Copy + PartialEq が derive されていること (db API で値渡しするため)
         let g = f;
         assert_eq!(f, g);
+    }
+
+    #[test]
+    fn test_fuse_rrf_matches_legacy_rrf_topk() {
+        // feature-47 D-5: 括り出した fuse_rrf が、旧 inline 実装
+        // (RRF ループ + rrf_topk) と同一の (chunk_id, score) 列を返すこと。
+        // rrf_topk は #[cfg(test)] の oracle として残してある。
+        let vec_hits: Vec<(i64, SearchResult)> = [3_i64, 1, 7, 2]
+            .iter()
+            .map(|id| (*id, dummy_search_result_for_id(*id)))
+            .collect();
+        let fts_hits: Vec<(i64, SearchResult)> = [7_i64, 5, 1]
+            .iter()
+            .map(|id| (*id, dummy_search_result_for_id(*id)))
+            .collect();
+
+        for limit in [None, Some(1_u32), Some(3), Some(100)] {
+            // 旧 inline 実装をその場で再現する (db.rs:1371-1383 と同形)。
+            let mut scores: HashMap<i64, f32> = HashMap::new();
+            let mut rows: HashMap<i64, SearchResult> = HashMap::new();
+            for (rank, (chunk_id, row)) in vec_hits.clone().into_iter().enumerate() {
+                *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (60.0 + (rank as f32) + 1.0);
+                rows.entry(chunk_id).or_insert(row);
+            }
+            for (rank, (chunk_id, row)) in fts_hits.clone().into_iter().enumerate() {
+                *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (60.0 + (rank as f32) + 1.0);
+                rows.entry(chunk_id).or_insert(row);
+            }
+            let legacy = rrf_topk(scores, rows, limit);
+            let fused = fuse_rrf(&vec_hits, &fts_hits, 60.0, limit);
+
+            let legacy_pairs: Vec<(i64, f32)> =
+                legacy.iter().map(|(id, r)| (*id, r.score)).collect();
+            let fused_pairs: Vec<(i64, f32)> = fused.iter().map(|(id, r)| (*id, r.score)).collect();
+            assert_eq!(
+                legacy_pairs, fused_pairs,
+                "fuse_rrf must match the legacy rrf_topk path for limit={limit:?}"
+            );
+            // row の対応も一致すること (両リスト掲載 id は vec 側の row を採る)
+            let legacy_paths: Vec<String> = legacy.iter().map(|(_, r)| r.path.clone()).collect();
+            let fused_paths: Vec<String> = fused.iter().map(|(_, r)| r.path.clone()).collect();
+            assert_eq!(legacy_paths, fused_paths, "row selection must match");
+        }
+    }
+
+    #[test]
+    fn test_fuse_rrf_ids_is_rank_only() {
+        // rrf_k を変えても vec/fts の rank list さえあれば融合できること
+        // (= tune がメモリ内で rrf_k を掃ける前提)。
+        let vec_ids = [10_i64, 20, 30];
+        let fts_ids = [30_i64, 40];
+
+        let k60 = fuse_rrf_ids(&vec_ids, &fts_ids, 60.0, None);
+        let k5 = fuse_rrf_ids(&vec_ids, &fts_ids, 5.0, None);
+
+        // 両リスト掲載の 30 (vec rank 2 / fts rank 0) は合意ボーナスで 1 位を取る。
+        // k=60: 1/62 + 1/61 = 0.0325 vs vec 1 位 (10) の 1/61 = 0.0164
+        // k=5:  1/8  + 1/6  = 0.2917 vs vec 1 位 (10) の 1/6  = 0.1667
+        // どちらの k でも 30 が 1 位 = **順位は変わらないがスコアの絶対値は
+        // 大きく変わる**。これが「rrf_k はメモリ内で掃ける」ことの根拠になる。
+        assert_eq!(k60[0].0, 30, "consensus doc wins at k=60: {k60:?}");
+        assert_eq!(k5[0].0, 30, "consensus doc still wins at k=5: {k5:?}");
+        assert!(
+            k5[0].1 > k60[0].1,
+            "smaller k must produce larger reciprocal-rank scores: {k5:?} vs {k60:?}"
+        );
+        // limit truncate
+        let truncated = fuse_rrf_ids(&vec_ids, &fts_ids, 60.0, Some(2));
+        assert_eq!(truncated.len(), 2);
     }
 }
