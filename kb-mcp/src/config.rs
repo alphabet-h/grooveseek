@@ -112,6 +112,10 @@ pub struct SearchConfig {
     /// セクション省略時は [`ParentRetrieverConfig::default()`] (enabled=false)。
     #[serde(default)]
     pub parent_retriever: ParentRetrieverConfig,
+    /// RRF / FTS5 bm25 の fusion パラメータ。セクション省略時は
+    /// [`FusionConfig::default()`] (= feature-47 以前の定数と同値)。
+    #[serde(default)]
+    pub fusion: FusionConfig,
 }
 
 /// `[search.mmr]` セクション。feature-28 PR-2 で追加。
@@ -185,6 +189,87 @@ impl Default for ParentRetrieverConfig {
             enabled: false,
             whole_doc_threshold_tokens: default_whole_doc_threshold(),
             max_expanded_tokens: default_max_expanded(),
+        }
+    }
+}
+
+/// `[search.fusion]` セクション。feature-47 で追加。
+///
+/// RRF の定数項と FTS5 bm25 の列重みを設定可能にする。**既定値は feature-47
+/// 以前のコンパイル時定数と同一**であり、セクション省略時・既定値明示時の
+/// いずれでも検索結果は 1 bit も変わらない。
+///
+/// 重みを配列ではなく 3 つの named field にしてあるのは、`bm25()` へ渡す
+/// 個数のミスを構造的に不可能にするため (FTS5 は個数不一致を silent に
+/// 処理する: 不足は 1.0 補完 / 過剰は無視)。
+///
+/// 値域チェックは [`Config::validate`] に集約する。db 層の bind parameter
+/// 経路は NaN / inf を **エラーにせず通す** ため、validate が唯一の防波堤
+/// である (feature-47 D-2)。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FusionConfig {
+    /// RRF の定数項 k。`>= 1.0` (Elasticsearch `rank_constant` 準拠の下限)。
+    /// 小さいほど「片方の検索器が 1 位に出した文書」を上位へ救う。
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f32,
+    /// FTS5 bm25 の heading 列重み。`>= 0.0`。
+    #[serde(default = "default_bm25_heading_weight")]
+    pub bm25_heading_weight: f32,
+    /// 同 context 列重み。`>= 0.0`。
+    #[serde(default = "default_bm25_context_weight")]
+    pub bm25_context_weight: f32,
+    /// 同 content 列重み。`>= 0.0`。
+    #[serde(default = "default_bm25_content_weight")]
+    pub bm25_content_weight: f32,
+}
+
+fn default_rrf_k() -> f32 {
+    60.0
+}
+
+fn default_bm25_heading_weight() -> f32 {
+    2.0
+}
+
+fn default_bm25_context_weight() -> f32 {
+    1.0
+}
+
+fn default_bm25_content_weight() -> f32 {
+    1.0
+}
+
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self {
+            rrf_k: default_rrf_k(),
+            bm25_heading_weight: default_bm25_heading_weight(),
+            bm25_context_weight: default_bm25_context_weight(),
+            bm25_content_weight: default_bm25_content_weight(),
+        }
+    }
+}
+
+impl FusionConfig {
+    /// ビルトイン既定値と完全一致するか。`true` のとき eval fingerprint に
+    /// fusion を **載せない** ことで、feature-47 以前の history JSON / 凍結
+    /// baseline との `PartialEq` 互換を保つ (feature-47 D-7 / E-10)。
+    pub fn is_builtin_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// config → db の一方向変換。既定値の二重管理はこの `From` に固定し、
+/// `FusionParams::from(&FusionConfig::default()) == FusionParams::default()`
+/// を回帰テストで押さえる (feature-47 D-3)。
+impl From<&FusionConfig> for crate::db::FusionParams {
+    fn from(c: &FusionConfig) -> Self {
+        Self {
+            rrf_k: c.rrf_k,
+            bm25_heading_weight: c.bm25_heading_weight,
+            bm25_context_weight: c.bm25_context_weight,
+            bm25_content_weight: c.bm25_content_weight,
         }
     }
 }
@@ -476,6 +561,9 @@ impl Config {
     /// - `[search.mmr].same_doc_penalty` が `0.0..=1.0`
     /// - `[search.parent_retriever].max_expanded_tokens > whole_doc_threshold_tokens`
     /// - `[search.parent_retriever].max_expanded_tokens <= 8192` (BGE-M3 ctx)
+    /// - `[search.fusion].rrf_k` が有限かつ `>= 1.0`
+    /// - `[search.fusion].bm25_*_weight` が有限かつ `>= 0.0`
+    /// - `[search.fusion]` の 3 重みが全て `0.0` でない
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
             // MMR レンジチェック
@@ -506,6 +594,40 @@ impl Config {
                 anyhow::bail!(
                     "[search.parent_retriever].max_expanded_tokens must be <= 8192 (BGE-M3 context window), got {}",
                     s.parent_retriever.max_expanded_tokens
+                );
+            }
+
+            // Fusion (RRF k / bm25 column weight) レンジチェック。
+            // feature-47 D-2: db 層の bind parameter 経路は NaN / inf を
+            // silent に通すため、ここが唯一のゲートである。
+            let f = &s.fusion;
+            if !f.rrf_k.is_finite() || f.rrf_k < 1.0 {
+                anyhow::bail!(
+                    "[search.fusion].rrf_k must be a finite value >= 1.0 (Elasticsearch \
+                     rank_constant convention), got {}",
+                    f.rrf_k
+                );
+            }
+            for (key, w) in [
+                ("bm25_heading_weight", f.bm25_heading_weight),
+                ("bm25_context_weight", f.bm25_context_weight),
+                ("bm25_content_weight", f.bm25_content_weight),
+            ] {
+                if !w.is_finite() || w < 0.0 {
+                    anyhow::bail!(
+                        "[search.fusion].{key} must be a finite value >= 0.0 (a negative weight \
+                         puts a pole in the BM25 denominator and silently inverts the ranking), \
+                         got {w}"
+                    );
+                }
+            }
+            if f.bm25_heading_weight == 0.0
+                && f.bm25_context_weight == 0.0
+                && f.bm25_content_weight == 0.0
+            {
+                anyhow::bail!(
+                    "[search.fusion]: all three bm25 weights are 0.0; bm25() then returns -0.0 for \
+                     every row and the FTS ranking collapses. Set at least one weight > 0.0."
                 );
             }
         }
@@ -1569,6 +1691,103 @@ lambda = 0.5
             .expect("discover ok");
         assert_eq!(src, ConfigSource::AlongsideBinary);
         assert_eq!(cfg.kb_path.as_deref(), Some(Path::new(kb)));
+    }
+
+    #[test]
+    fn test_fusion_defaults_when_section_omitted() {
+        // E-10: [search.fusion] 未指定 (既存ユーザ全員) で builtin default。
+        let toml = "[search]\nmin_confidence_ratio = 1.5\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let s = cfg.search.as_ref().unwrap();
+        assert_eq!(s.fusion, FusionConfig::default());
+        assert!(s.fusion.is_builtin_default());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fusion_explicit_defaults_are_still_builtin_default() {
+        // 既定値と同値を明示指定しても is_builtin_default = true
+        // (= eval fingerprint に載らず旧 history と互換、D-7)。
+        let toml = concat!(
+            "[search.fusion]\n",
+            "rrf_k = 60.0\n",
+            "bm25_heading_weight = 2.0\n",
+            "bm25_context_weight = 1.0\n",
+            "bm25_content_weight = 1.0\n",
+        );
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let s = cfg.search.as_ref().unwrap();
+        assert!(s.fusion.is_builtin_default());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fusion_params_conversion_matches_db_default() {
+        // D-3: config 側と db 側の既定値二重管理を From の一方向変換で固定する。
+        // lib 自身の #[cfg(test)] からは `kb_mcp::` は解決できない
+        // (lib.rs に `extern crate self as kb_mcp` は無い)。`crate::` を使う。
+        let p = crate::db::FusionParams::from(&FusionConfig::default());
+        assert_eq!(p, crate::db::FusionParams::default());
+    }
+
+    #[test]
+    fn test_fusion_rejects_negative_weight() {
+        // E-1: 負 weight は BM25 分母の極 → スコア発散・静かな順位破壊。
+        let toml = "[search.fusion]\nbm25_heading_weight = -1.0\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("bm25_heading_weight"),
+            "error must name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fusion_rejects_non_finite() {
+        // E-2: bind parameter 経路は NaN / inf を silent に通すので
+        // validate が唯一のゲート。
+        let toml = "[search.fusion]\nbm25_content_weight = nan\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_err(), "NaN weight must be rejected");
+
+        let toml = "[search.fusion]\nrrf_k = inf\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_err(), "inf rrf_k must be rejected");
+    }
+
+    #[test]
+    fn test_fusion_rejects_all_zero_weights() {
+        // E-3: 全カラム 0 だと bm25() が全行 -0.0 を返し順位が崩壊する。
+        let toml = concat!(
+            "[search.fusion]\n",
+            "bm25_heading_weight = 0.0\n",
+            "bm25_context_weight = 0.0\n",
+            "bm25_content_weight = 0.0\n",
+        );
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("all three bm25 weights"),
+            "error must explain the all-zero collapse: {err}"
+        );
+    }
+
+    #[test]
+    fn test_fusion_rejects_rrf_k_below_one() {
+        // E-5: Elasticsearch rank_constant 準拠の下限 1.0。
+        let toml = "[search.fusion]\nrrf_k = 0.5\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("rrf_k"), "error must name rrf_k: {err}");
+    }
+
+    #[test]
+    fn test_fusion_accepts_single_zero_weight() {
+        // 0.0 は単体では合法 (その列の tf 寄与が消えるだけ)。
+        let toml = "[search.fusion]\nbm25_context_weight = 0.0\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert!(!cfg.search.as_ref().unwrap().fusion.is_builtin_default());
     }
 
     /// テスト用 tempdir (Drop で自動削除)。`tests/validate_cli.rs::TempKb` の lib 版。

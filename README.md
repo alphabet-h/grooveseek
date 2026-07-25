@@ -125,6 +125,14 @@ bind = "127.0.0.1:3100"
 # whole_doc_threshold_tokens = 100   # token_count below this -> whole document fallback
 # max_expanded_tokens = 2000         # cap for adjacent merge / whole-doc (BGE-M3 <= 8192)
 
+# Optional: RRF / bm25 fusion parameters (v0.13.0+). Defaults shown.
+# Leave them alone unless `kb-mcp tune` says otherwise on your own KB.
+# [search.fusion]
+# rrf_k = 60.0                # >= 1.0; lower favors a single retriever's top hit
+# bm25_heading_weight = 2.0   # >= 0.0
+# bm25_context_weight = 1.0   # >= 0.0
+# bm25_content_weight = 1.0   # >= 0.0
+
 # Optional: static Contextual Retrieval (v0.12.0+). Off by default; strongly
 # recommended only when a reranker is also configured (see "Contextual
 # Retrieval" below for why).

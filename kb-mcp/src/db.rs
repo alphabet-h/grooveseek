@@ -4,20 +4,45 @@ use std::collections::HashMap;
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// RRF の定数項。原論文および多くの実装で慣例 60。
-const RRF_K: f32 = 60.0;
-
 /// filter (category / topic) を Rust 側で適用する際の KNN / FTS の over-fetch 倍率。
 /// filter が選択的な場合に target `limit` 件に届くよう多めに候補を取る。
 const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
-/// FTS5 bm25 の column weight。heading / context / content に重みを与え、
-/// 見出し一致を本文一致より強く評価する。列順は fts_chunks の CREATE 順
-/// (heading, context, content) と一致させる。
-const FTS_BM25_HEADING_WEIGHT: f32 = 2.0;
-const FTS_BM25_CONTEXT_WEIGHT: f32 = 1.0;
-const FTS_BM25_CONTENT_WEIGHT: f32 = 1.0;
+/// Fusion (RRF + FTS5 bm25 column weight) の実行時パラメータ。
+///
+/// feature-47 以前はすべてコンパイル時定数だった。`[search.fusion]` から
+/// 設定できるようにするため、`SearchFilters` (feature-26) と同じ
+/// 「引数 1 個に集約して渡す」方式で db 層に注入する。`Database` の
+/// フィールドにはしない — `Database` は drop 順序に依存する手動 `Drop`
+/// impl を持っており (db.rs の struct 宣言コメント参照)、フィールド追加は
+/// その制約と干渉するため。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusionParams {
+    /// RRF の定数項 k。小さいほど「片方の検索器が確信を持って 1 位に出した
+    /// 文書」を上位へ救い、大きいほど両リスト掲載 (合意) を重視する。
+    pub rrf_k: f32,
+    /// FTS5 bm25 の heading 列重み。
+    pub bm25_heading_weight: f32,
+    /// 同 context 列重み。
+    pub bm25_context_weight: f32,
+    /// 同 content 列重み。
+    pub bm25_content_weight: f32,
+}
+
+impl Default for FusionParams {
+    /// k=60 は RRF 原論文および主要実装 (Elasticsearch `rank_constant` /
+    /// Milvus / Vespa / LanceDB) の慣例値。bm25 の列順・既定重みは
+    /// `fts_chunks` の CREATE 順 (heading, context, content) と一致させる。
+    fn default() -> Self {
+        Self {
+            rrf_k: 60.0,
+            bm25_heading_weight: 2.0,
+            bm25_context_weight: 1.0,
+            bm25_content_weight: 1.0,
+        }
+    }
+}
 
 /// `fetch_embeddings_by_chunk_ids` の IN 句 batch サイズ。
 /// SQLite `SQLITE_MAX_VARIABLE_NUMBER` は modern SQLite で 32766 だが、
@@ -369,6 +394,11 @@ pub struct Database {
 ///
 /// HashMap iteration の非決定性に依存しないよう、tie-break で id を使い
 /// プラットフォーム / 入力順に依存しない出力を保証する (invariant #1)。
+///
+/// production 経路は feature-47 で [`fuse_rrf`] へ移行した。本関数は
+/// `fuse_rrf` の等価性を照合する **oracle** としてテストからのみ参照される
+/// (同ファイルの `dummy_search_result_for_id` と同じ扱い)。
+#[cfg(test)]
 fn rrf_topk(
     mut scores: HashMap<i64, f32>,
     mut rows: HashMap<i64, SearchResult>,
@@ -394,9 +424,83 @@ fn rrf_topk(
         .collect()
 }
 
+/// RRF の中核演算。2 本の rank list (要素は `chunk_id`、先頭が rank 0) を
+/// `1 / (k + rank + 1)` で加算融合し、**score DESC + chunk_id ASC** の順に
+/// 並べた `(chunk_id, rrf_score)` を返す。`limit=Some(n)` で上位 n 件に
+/// truncate、`None` なら全件。
+///
+/// `SearchResult` に触れないので、`kb-mcp tune` が同一の候補リストへ複数の
+/// `rrf_k` を再適用するときに候補プールを clone せずに済む (feature-47 D-5 /
+/// D-10)。スコア累算は production 挙動を変えないため **f32 のまま**。
+pub(crate) fn fuse_rrf_ids(
+    vec_ids: &[i64],
+    fts_ids: &[i64],
+    rrf_k: f32,
+    limit: Option<u32>,
+) -> Vec<(i64, f32)> {
+    let mut scores: HashMap<i64, f32> = HashMap::new();
+    for (rank, id) in vec_ids.iter().enumerate() {
+        *scores.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + (rank as f32) + 1.0);
+    }
+    for (rank, id) in fts_ids.iter().enumerate() {
+        *scores.entry(*id).or_insert(0.0) += 1.0 / (rrf_k + (rank as f32) + 1.0);
+    }
+    let mut merged: Vec<(i64, f32)> = scores.into_iter().collect();
+    // HashMap iteration の非決定性に依存しないよう id で tie-break する
+    // (rrf_topk と同一の全順序、invariant #1)。
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    if let Some(n) = limit {
+        merged.truncate(n as usize);
+    }
+    merged
+}
+
+/// [`fuse_rrf_ids`] の結果に `SearchResult` を貼り直すラッパ。
+///
+/// **truncate 後の勝者だけを clone する** ので、production 経路で増える
+/// allocation は最大 `limit` 件 (既定 10) に収まる (feature-47 D-5)。
+/// 同一 chunk が両リストに現れた場合の row は **vec 側を優先** する
+/// (旧 inline 実装が vec → fts の順に `rows.entry(id).or_insert(row)` を
+/// 回していた挙動と同一)。
+fn fuse_rrf(
+    vec_hits: &[(i64, SearchResult)],
+    fts_hits: &[(i64, SearchResult)],
+    rrf_k: f32,
+    limit: Option<u32>,
+) -> Vec<(i64, SearchResult)> {
+    let vec_ids: Vec<i64> = vec_hits.iter().map(|(id, _)| *id).collect();
+    let fts_ids: Vec<i64> = fts_hits.iter().map(|(id, _)| *id).collect();
+    let ranked = fuse_rrf_ids(&vec_ids, &fts_ids, rrf_k, limit);
+
+    let mut rows: HashMap<i64, &SearchResult> = HashMap::new();
+    for (id, row) in vec_hits.iter().chain(fts_hits.iter()) {
+        rows.entry(*id).or_insert(row);
+    }
+
+    ranked
+        .into_iter()
+        .filter_map(|(id, rrf)| {
+            rows.get(&id).map(|row| {
+                let mut r = (*row).clone();
+                r.score = rrf;
+                (id, r)
+            })
+        })
+        .collect()
+}
+
 /// [`Database::chunk_texts_with_context_for_path`] の戻り値の要素型:
 /// `(heading, content, context_text)`。
 pub type ChunkTextWithContext = (Option<String>, String, Option<String>);
+
+/// 融合前の候補リスト 1 本分 (`(chunk_id, SearchResult)` の列)。
+/// `clippy::type_complexity` 回避のための alias
+/// (`parser::markdown::RawChunk` と同じ扱い)。
+pub(crate) type CandidateHits = Vec<(i64, SearchResult)>;
 
 impl Database {
     /// Open (or create) a file-backed database at `path`.
@@ -1209,11 +1313,14 @@ impl Database {
     ///
     /// `search_vec_candidates` と同様に、category / topic フィルタが指定されて
     /// いる場合は `FILTER_OVERFETCH_FACTOR` 倍を取りに行き、Rust 側で絞り込む。
-    fn search_fts_candidates(
+    ///
+    /// `fusion` の bm25 列重みが `bm25()` の第 2〜4 引数として渡る (feature-47)。
+    pub(crate) fn search_fts_candidates(
         &self,
         query_text: &str,
         limit: u32,
         filters: &SearchFilters<'_>,
+        fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
         let Some(fts_query) = sanitize_fts_query(query_text) else {
             return Ok(Vec::new());
@@ -1230,42 +1337,54 @@ impl Database {
 
         // bm25 に column weight を与え、見出し一致を優遇する。
         // 引数順は FTS5 の CREATE VIRTUAL TABLE の列宣言順 (heading, context, content)。
-        let sql = format!(
-            "
-            SELECT c.id, bm25(fts_chunks, {h}, {ctx}, {c}) AS score,
+        //
+        // feature-47 D-4: 重みは **番号付き** bind parameter で渡す。匿名 `?` は
+        // SELECT と ORDER BY で別々に採番されて既存の `?1`/`?2` と衝突し
+        // "statement uses 6, 5 supplied" になるため使ってはならない。
+        // NaN / inf は bind 経路を silent に通ってしまうので、値域の防波堤は
+        // `Config::validate()` 唯一 (D-2 / E-2)。
+        let sql = "
+            SELECT c.id, bm25(fts_chunks, ?3, ?4, ?5) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
                    d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
             WHERE fts_chunks MATCH ?1
-            ORDER BY bm25(fts_chunks, {h}, {ctx}, {c})
+            ORDER BY bm25(fts_chunks, ?3, ?4, ?5)
             LIMIT ?2
-            ",
-            h = FTS_BM25_HEADING_WEIGHT,
-            ctx = FTS_BM25_CONTEXT_WEIGHT,
-            c = FTS_BM25_CONTENT_WEIGHT
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![fts_query, fetch_limit], |row| {
-            let chunk_id: i64 = row.get(0)?;
-            let score: f32 = row.get(1)?;
-            Ok((
-                chunk_id,
-                score,
-                row.get::<_, String>(2)?,          // content
-                row.get::<_, Option<String>>(3)?,  // heading
-                row.get::<_, f32>(4)?,             // quality_score
-                row.get::<_, i64>(5)?,             // document_id (F-41)
-                row.get::<_, String>(6)?,          // path
-                row.get::<_, Option<String>>(7)?,  // title
-                row.get::<_, Option<String>>(8)?,  // topic
-                row.get::<_, Option<String>>(9)?,  // date
-                row.get::<_, Option<String>>(10)?, // category
-                row.get::<_, Option<String>>(11)?, // tags (JSON)
-                row.get::<_, Option<String>>(12)?, // context_text
-            ))
-        })?;
+            ";
+        let mut stmt = self.conn.prepare(sql)?;
+        // f64 へ拡幅してから bind する。sqlite3_value_double が受けるのは double
+        // であり、f32 → f64 は値を変えない (2.0 / 1.0 / 0.5 / 4.0 いずれも厳密表現)。
+        let rows = stmt.query_map(
+            params![
+                fts_query,
+                fetch_limit,
+                fusion.bm25_heading_weight as f64,
+                fusion.bm25_context_weight as f64,
+                fusion.bm25_content_weight as f64
+            ],
+            |row| {
+                let chunk_id: i64 = row.get(0)?;
+                let score: f32 = row.get(1)?;
+                Ok((
+                    chunk_id,
+                    score,
+                    row.get::<_, String>(2)?,          // content
+                    row.get::<_, Option<String>>(3)?,  // heading
+                    row.get::<_, f32>(4)?,             // quality_score
+                    row.get::<_, i64>(5)?,             // document_id (F-41)
+                    row.get::<_, String>(6)?,          // path
+                    row.get::<_, Option<String>>(7)?,  // title
+                    row.get::<_, Option<String>>(8)?,  // topic
+                    row.get::<_, Option<String>>(9)?,  // date
+                    row.get::<_, Option<String>>(10)?, // category
+                    row.get::<_, Option<String>>(11)?, // tags (JSON)
+                    row.get::<_, Option<String>>(12)?, // context_text
+                ))
+            },
+        )?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1337,19 +1456,25 @@ impl Database {
         Ok(results)
     }
 
-    /// ベクトル検索 + FTS5 を Reciprocal Rank Fusion (RRF, k=60) で統合する
-    /// ハイブリッド検索。各側の順位だけを使うため、距離や bm25 の正規化は不要。
+    /// ベクトル検索 + FTS5 を Reciprocal Rank Fusion で統合するハイブリッド
+    /// 検索。各側の順位だけを使うため、距離や bm25 の正規化は不要。
     ///
     /// FTS 側でヒットが 0 件 (trigram 下限以下のクエリや予約語のみ等) の場合は
     /// vec-only の順位で結果を返す (スコアは RRF 公式で計算)。
+    ///
+    /// `fusion` は RRF の k と bm25 列重み (feature-47)。production 経路は
+    /// `[search.fusion]` 由来の値を渡す。テストや単発利用では
+    /// `FusionParams::default()` でよい。
     pub fn search_hybrid(
         &self,
         query_text: &str,
         query_embedding: &[f32],
         limit: u32,
         filters: &SearchFilters<'_>,
+        fusion: FusionParams,
     ) -> Result<Vec<SearchResult>> {
-        let hits = self.search_hybrid_candidates(query_text, query_embedding, limit, filters)?;
+        let hits =
+            self.search_hybrid_candidates(query_text, query_embedding, limit, filters, fusion)?;
         Ok(hits.into_iter().map(|(_, r)| r).collect())
     }
 
@@ -1362,25 +1487,12 @@ impl Database {
         query_embedding: &[f32],
         limit: u32,
         filters: &SearchFilters<'_>,
+        fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
         let candidates = limit.saturating_mul(5).max(50);
-
-        let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
-        let fts_hits = self.search_fts_candidates(query_text, candidates, filters)?;
-
-        // RRF: chunk_id ごとに 1/(K + rank + 1) を加算
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        let mut rows: HashMap<i64, SearchResult> = HashMap::new();
-        for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-        for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-
-        Ok(rrf_topk(scores, rows, Some(limit)))
+        let (vec_hits, fts_hits) =
+            self.search_split_candidates(query_text, query_embedding, candidates, filters, fusion)?;
+        Ok(fuse_rrf(&vec_hits, &fts_hits, fusion.rrf_k, Some(limit)))
     }
 
     /// `search_hybrid_candidates` と同じ RRF を計算するが、最終 truncate を
@@ -1400,23 +1512,34 @@ impl Database {
         query_embedding: &[f32],
         desired_candidates: u32,
         filters: &SearchFilters<'_>,
+        fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
         let candidates = desired_candidates.max(50);
+        let (vec_hits, fts_hits) =
+            self.search_split_candidates(query_text, query_embedding, candidates, filters, fusion)?;
+        Ok(fuse_rrf(&vec_hits, &fts_hits, fusion.rrf_k, None))
+    }
+
+    /// vec 側と FTS 側の候補リストを **融合前に** 返す (feature-47 D-3)。
+    ///
+    /// `kb-mcp tune` が「vec 候補は query あたり 1 回・FTS 候補は bm25 条件
+    /// ごと 1 回・rrf_k はメモリ内」で grid を掃くための分離 API であり、
+    /// production 側の 2 メソッドもここを通ることで融合経路が 1 本化される。
+    ///
+    /// `candidates` (pool サイズ) は **呼び出し側が算出して渡す**。bounded 経路は
+    /// `limit.saturating_mul(5).max(50)`、unbounded 経路は `desired.max(50)` と
+    /// 算出式が異なるため、ここでは一切補正しない。
+    pub(crate) fn search_split_candidates(
+        &self,
+        query_text: &str,
+        query_embedding: &[f32],
+        candidates: u32,
+        filters: &SearchFilters<'_>,
+        fusion: FusionParams,
+    ) -> Result<(CandidateHits, CandidateHits)> {
         let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
-        let fts_hits = self.search_fts_candidates(query_text, candidates, filters)?;
-
-        let mut scores: HashMap<i64, f32> = HashMap::new();
-        let mut rows: HashMap<i64, SearchResult> = HashMap::new();
-        for (rank, (chunk_id, row)) in vec_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-        for (rank, (chunk_id, row)) in fts_hits.into_iter().enumerate() {
-            *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f32) + 1.0);
-            rows.entry(chunk_id).or_insert(row);
-        }
-
-        Ok(rrf_topk(scores, rows, None))
+        let fts_hits = self.search_fts_candidates(query_text, candidates, filters, fusion)?;
+        Ok((vec_hits, fts_hits))
     }
 
     /// RRF 用: ベクトル検索の候補を `(chunk_id, SearchResult)` で返す。
@@ -2350,6 +2473,7 @@ mod tests {
                     min_quality: 0.5,
                     ..Default::default()
                 },
+                FusionParams::default(),
             )
             .unwrap();
         assert!(hits.iter().all(|h| h.heading.as_deref() != Some("low")));
@@ -3274,7 +3398,13 @@ mod tests {
             .unwrap();
 
         let hits = db
-            .search_hybrid("E0382", &dummy_embedding(0.5), 5, &SearchFilters::default())
+            .search_hybrid(
+                "E0382",
+                &dummy_embedding(0.5),
+                5,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
             .unwrap();
         assert_eq!(hits.len(), 2);
         // FTS でヒットするのは A だけ → A が上位
@@ -3306,7 +3436,13 @@ mod tests {
 
         // 2 文字クエリ → sanitize が None → vec-only
         let hits = db
-            .search_hybrid("ab", &dummy_embedding(0.1), 5, &SearchFilters::default())
+            .search_hybrid(
+                "ab",
+                &dummy_embedding(0.1),
+                5,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].score > 0.0, "RRF スコアは正の有限値");
@@ -3344,7 +3480,13 @@ mod tests {
             .unwrap();
 
         let hits = db
-            .search_hybrid_candidates("E0382", &dummy_embedding(0.1), 5, &SearchFilters::default())
+            .search_hybrid_candidates(
+                "E0382",
+                &dummy_embedding(0.1),
+                5,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
             .unwrap();
         assert!(!hits.is_empty());
         // 返ってきた chunk_id は insert 時の id と一致
@@ -3412,10 +3554,16 @@ mod tests {
         let filters = SearchFilters::default();
 
         let bounded = db
-            .search_hybrid_candidates(query_text, &query_emb, 2, &filters)
+            .search_hybrid_candidates(query_text, &query_emb, 2, &filters, FusionParams::default())
             .unwrap();
         let unbounded = db
-            .search_hybrid_candidates_unbounded(query_text, &query_emb, 50, &filters)
+            .search_hybrid_candidates_unbounded(
+                query_text,
+                &query_emb,
+                50,
+                &filters,
+                FusionParams::default(),
+            )
             .unwrap();
 
         assert!(
@@ -3475,7 +3623,12 @@ mod tests {
 
         // 直接 FTS 候補を取り、B が A より上位 (低 bm25) になることを確認
         let hits = db
-            .search_fts_candidates("kibarashi_unique_keyword", 10, &SearchFilters::default())
+            .search_fts_candidates(
+                "kibarashi_unique_keyword",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
             .unwrap();
         assert_eq!(hits.len(), 2);
         let (top_id, _) = hits[0];
@@ -3521,6 +3674,7 @@ mod tests {
                     category: Some("target"),
                     ..Default::default()
                 },
+                FusionParams::default(),
             )
             .unwrap();
         assert_eq!(hits.len(), 1, "target カテゴリの 1 件を取りこぼさない");
@@ -3562,6 +3716,7 @@ mod tests {
                 &dummy_embedding(0.7),
                 5,
                 &SearchFilters::default(),
+                FusionParams::default(),
             )
             .unwrap();
         assert!(!hits.is_empty());
@@ -4276,6 +4431,7 @@ mod tests {
                 &dummy_embedding(0.1),
                 10,
                 &filters,
+                FusionParams::default(),
             )
             .unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -4328,6 +4484,7 @@ mod tests {
                 &dummy_embedding(0.1),
                 10,
                 &filters,
+                FusionParams::default(),
             )
             .unwrap();
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -5126,6 +5283,178 @@ mod tests {
         assert!(
             fts_has_context_col(&db),
             "migration must complete after lock wait"
+        );
+    }
+
+    #[test]
+    fn test_fusion_params_default_matches_legacy_constants() {
+        // feature-47: config 化前のコンパイル時定数 (RRF_K=60.0 /
+        // FTS_BM25_HEADING=2.0 / CONTEXT=1.0 / CONTENT=1.0) と
+        // FusionParams::default() が完全一致することを固定する。
+        // この既定値がずれると PR-1 の behavior-invariant 前提が崩れる。
+        let f = FusionParams::default();
+        assert_eq!(f.rrf_k, 60.0);
+        assert_eq!(f.bm25_heading_weight, 2.0);
+        assert_eq!(f.bm25_context_weight, 1.0);
+        assert_eq!(f.bm25_content_weight, 1.0);
+        // Copy + PartialEq が derive されていること (db API で値渡しするため)
+        let g = f;
+        assert_eq!(f, g);
+    }
+
+    #[test]
+    fn test_fuse_rrf_matches_legacy_rrf_topk() {
+        // feature-47 D-5: 括り出した fuse_rrf が、旧 inline 実装
+        // (RRF ループ + rrf_topk) と同一の (chunk_id, score) 列を返すこと。
+        // rrf_topk は #[cfg(test)] の oracle として残してある。
+        let vec_hits: Vec<(i64, SearchResult)> = [3_i64, 1, 7, 2]
+            .iter()
+            .map(|id| (*id, dummy_search_result_for_id(*id)))
+            .collect();
+        let fts_hits: Vec<(i64, SearchResult)> = [7_i64, 5, 1]
+            .iter()
+            .map(|id| (*id, dummy_search_result_for_id(*id)))
+            .collect();
+
+        for limit in [None, Some(1_u32), Some(3), Some(100)] {
+            // 旧 inline 実装をその場で再現する (db.rs:1371-1383 と同形)。
+            let mut scores: HashMap<i64, f32> = HashMap::new();
+            let mut rows: HashMap<i64, SearchResult> = HashMap::new();
+            for (rank, (chunk_id, row)) in vec_hits.clone().into_iter().enumerate() {
+                *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (60.0 + (rank as f32) + 1.0);
+                rows.entry(chunk_id).or_insert(row);
+            }
+            for (rank, (chunk_id, row)) in fts_hits.clone().into_iter().enumerate() {
+                *scores.entry(chunk_id).or_insert(0.0) += 1.0 / (60.0 + (rank as f32) + 1.0);
+                rows.entry(chunk_id).or_insert(row);
+            }
+            let legacy = rrf_topk(scores, rows, limit);
+            let fused = fuse_rrf(&vec_hits, &fts_hits, 60.0, limit);
+
+            let legacy_pairs: Vec<(i64, f32)> =
+                legacy.iter().map(|(id, r)| (*id, r.score)).collect();
+            let fused_pairs: Vec<(i64, f32)> = fused.iter().map(|(id, r)| (*id, r.score)).collect();
+            assert_eq!(
+                legacy_pairs, fused_pairs,
+                "fuse_rrf must match the legacy rrf_topk path for limit={limit:?}"
+            );
+            // row の対応も一致すること (両リスト掲載 id は vec 側の row を採る)
+            let legacy_paths: Vec<String> = legacy.iter().map(|(_, r)| r.path.clone()).collect();
+            let fused_paths: Vec<String> = fused.iter().map(|(_, r)| r.path.clone()).collect();
+            assert_eq!(legacy_paths, fused_paths, "row selection must match");
+        }
+    }
+
+    #[test]
+    fn test_fuse_rrf_ids_is_rank_only() {
+        // rrf_k を変えても vec/fts の rank list さえあれば融合できること
+        // (= tune がメモリ内で rrf_k を掃ける前提)。
+        let vec_ids = [10_i64, 20, 30];
+        let fts_ids = [30_i64, 40];
+
+        let k60 = fuse_rrf_ids(&vec_ids, &fts_ids, 60.0, None);
+        let k5 = fuse_rrf_ids(&vec_ids, &fts_ids, 5.0, None);
+
+        // 両リスト掲載の 30 (vec rank 2 / fts rank 0) は合意ボーナスで 1 位を取る。
+        // k=60: 1/62 + 1/61 = 0.0325 vs vec 1 位 (10) の 1/61 = 0.0164
+        // k=5:  1/8  + 1/6  = 0.2917 vs vec 1 位 (10) の 1/6  = 0.1667
+        // どちらの k でも 30 が 1 位 = **順位は変わらないがスコアの絶対値は
+        // 大きく変わる**。これが「rrf_k はメモリ内で掃ける」ことの根拠になる。
+        assert_eq!(k60[0].0, 30, "consensus doc wins at k=60: {k60:?}");
+        assert_eq!(k5[0].0, 30, "consensus doc still wins at k=5: {k5:?}");
+        assert!(
+            k5[0].1 > k60[0].1,
+            "smaller k must produce larger reciprocal-rank scores: {k5:?} vs {k60:?}"
+        );
+        // limit truncate
+        let truncated = fuse_rrf_ids(&vec_ids, &fts_ids, 60.0, Some(2));
+        assert_eq!(truncated.len(), 2);
+    }
+
+    #[test]
+    fn test_fts_bm25_weights_are_bound_and_effective() {
+        // feature-47 D-4: bm25 重みを番号付き bind parameter (?3/?4/?5) で
+        // 渡す経路が生きていること。heading にだけ語を置いた doc と content
+        // にだけ置いた doc を作り、heading 重みを振ると順位が入れ替わる。
+        let db = db_with_384();
+        let doc_a = db
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .unwrap();
+        db.insert_chunk(
+            doc_a,
+            0,
+            Some("zebrafish"),
+            None,
+            "filler body text about nothing in particular",
+            None,
+            &dummy_embedding(0.2),
+            1.0,
+        )
+        .unwrap();
+        let doc_b = db
+            .upsert_document("b.md", Some("B"), None, None, None, &[], None, "hb")
+            .unwrap();
+        db.insert_chunk(
+            doc_b,
+            0,
+            Some("unrelated heading"),
+            None,
+            "zebrafish zebrafish zebrafish in the body",
+            None,
+            &dummy_embedding(0.8),
+            1.0,
+        )
+        .unwrap();
+
+        let heading_heavy = FusionParams {
+            bm25_heading_weight: 8.0,
+            bm25_content_weight: 0.5,
+            ..FusionParams::default()
+        };
+        let content_heavy = FusionParams {
+            bm25_heading_weight: 0.5,
+            bm25_content_weight: 8.0,
+            ..FusionParams::default()
+        };
+
+        let h = db
+            .search_fts_candidates("zebrafish", 10, &SearchFilters::default(), heading_heavy)
+            .unwrap();
+        let c = db
+            .search_fts_candidates("zebrafish", 10, &SearchFilters::default(), content_heavy)
+            .unwrap();
+        assert_eq!(h.len(), 2, "both docs must match the phrase");
+        assert_eq!(c.len(), 2);
+        assert_ne!(
+            h[0].1.path, c[0].1.path,
+            "heading-heavy and content-heavy weights must pick different top hits"
+        );
+    }
+
+    #[test]
+    fn test_fts_chunks_column_order_is_heading_context_content() {
+        // feature-47 E-4: bm25(fts_chunks, ?3, ?4, ?5) の 3 引数は fts_chunks が
+        // (heading, context, content) の 3 列であることに束縛されている。
+        // FTS5 は重み個数のミスマッチを silent に処理する (不足は 1.0 補完 /
+        // 過剰は無視) ので、init() の無条件 migration が保つこの不変条件を
+        // 回帰テストで固定する。
+        let db = db_with_384();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("PRAGMA table_info(fts_chunks)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                "heading".to_string(),
+                "context".to_string(),
+                "content".to_string()
+            ],
+            "fts_chunks column order is load-bearing for the bm25 weight positions"
         );
     }
 }

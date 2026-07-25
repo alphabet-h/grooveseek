@@ -7,7 +7,7 @@
 mod common;
 
 use common::temp::TempKbLayout;
-use kb_mcp::db::{Database, SearchFilters};
+use kb_mcp::db::{Database, FusionParams, SearchFilters};
 
 #[test]
 fn search_result_carries_document_id() {
@@ -56,7 +56,13 @@ fn search_result_carries_document_id() {
     .expect("insert_chunk 1");
 
     let hits = db
-        .search_hybrid_candidates("rust", &[0.1_f32; 384], 10, &SearchFilters::default())
+        .search_hybrid_candidates(
+            "rust",
+            &[0.1_f32; 384],
+            10,
+            &SearchFilters::default(),
+            FusionParams::default(),
+        )
         .expect("search_hybrid_candidates");
 
     assert!(!hits.is_empty(), "search must return at least one hit");
