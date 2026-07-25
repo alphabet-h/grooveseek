@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Six field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration, subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, or diagnosing "works on Linux, fails on Windows" failures
+description: Seven field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration, subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -70,6 +70,16 @@ CI runner / subagent の SSH・NTLM logon session からは `Register-ScheduledT
 **正しいやり方**: `cargo check` の実結果を正 (source of truth) とし、rust-analyzer 上の diagnostics は一時的ノイズとして無視して押し切る。
 
 出典: CLAUDE.local.md 運用上の気付き / `.dev/knowledge/feature-25-eval-notes.md` / `feature-27-summary.md`。**CLAUDE.md / CLAUDE.local.md と重複記載。乖離時はそちらを正とする**。
+
+## 7. PowerShell 5.1 は native コマンド引数内の `"` を escape せず渡して引数分解を壊す
+
+**症状**: `git commit -m @'...'@` の here-string メッセージ内に `"quoted phrase"` を含めたところ、git が `error: pathspec '...' did not match any file(s)` を多数出して commit 失敗。メッセージが `"` の位置で複数の引数に分解されていた。
+
+**原因**: Windows PowerShell 5.1 は native 実行ファイルへ引数を渡す際、引数値に含まれる `"` を Win32 コマンドラインへ再構成するときに escape しない (PowerShell 7.3+ の `PSNativeCommandArgumentPassing` で修正された既知問題)。here-string 自体は正しく単一文字列になっていても、native 側では `"` が引数区切りとして再解釈される。
+
+**正しいやり方**: `"` を含む複数行文字列を native コマンドに渡す場合は PowerShell を使わず **Bash tool + heredoc + `git commit -F -`** (stdin 経由) にする。PowerShell で完結させたい場合はメッセージ内の二重引用符を単一引用符に置き換えるか、一時ファイル + `-F <path>` を使う。
+
+出典: 2026-07-25 session (PR #76 の commit 時に実地で発火)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
