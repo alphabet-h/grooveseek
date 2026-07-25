@@ -125,6 +125,14 @@ bind = "127.0.0.1:3100"
 # whole_doc_threshold_tokens = 100   # token_count がこの未満なら whole-doc fallback
 # max_expanded_tokens = 2000         # adjacent merge / whole-doc の上限 (BGE-M3 <= 8192)
 
+# 任意: RRF / bm25 の fusion パラメータ (v0.13.0+)。以下は既定値。
+# 自分の KB で `kb-mcp tune` が推奨しない限り触らないこと。
+# [search.fusion]
+# rrf_k = 60.0                # >= 1.0。小さいほど片方の検索器の 1 位を重視
+# bm25_heading_weight = 2.0   # >= 0.0
+# bm25_context_weight = 1.0   # >= 0.0
+# bm25_content_weight = 1.0   # >= 0.0
+
 # 任意: 静的 Contextual Retrieval (v0.12.0+)。既定 off。reranker を
 # 併用しない限り悪化するため、reranker 設定時のみ有効化を推奨
 # (詳細は下の「Contextual Retrieval」節を参照)。

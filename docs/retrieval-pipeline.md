@@ -13,7 +13,7 @@ query
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. Hybrid candidate generation                                 │
 │       vec_chunks MATCH (top-N)  +  fts_chunks MATCH + bm25      │
-│       └─→ Reciprocal Rank Fusion (k=60)                         │
+│       └─→ Reciprocal Rank Fusion (k=60, configurable)           │
 └─────────────────────────────────────────────────────────────────┘
   │
   ▼
@@ -53,7 +53,9 @@ Every optional stage is a no-op when its config is off, so a v0.6.x configuratio
 
 ## Stage 1 — Hybrid candidate generation (always on)
 
-`vec_chunks` (sqlite-vec, cosine distance) and `fts_chunks` (FTS5 trigram + bm25 with 2× heading weight) each return their own top-N. Reciprocal Rank Fusion combines them on the Rust side with `k = 60` (the standard RRF constant). The score returned to clients is the RRF score (higher = better), not a distance.
+`vec_chunks` (sqlite-vec, L2 distance — its default metric) and `fts_chunks` (FTS5 trigram + bm25 with a 2× heading weight by default) each return their own top-N. Reciprocal Rank Fusion combines them on the Rust side with `k = 60` by default (the standard RRF constant). The score returned to clients is the RRF score (higher = better), not a distance.
+
+Both the RRF constant and the three bm25 column weights are configurable via `[search.fusion]` in `kb-mcp.toml` (v0.13.0+); the built-in defaults are `rrf_k = 60.0` and `heading / context / content = 2.0 / 1.0 / 1.0`. They are deliberately left alone unless you have measured otherwise — see [eval.md](./eval.md) for `kb-mcp tune`, which reports how much (if at all) these knobs move retrieval quality on *your* KB.
 
 This stage is what `kb-mcp eval` measures by default: any improvement here lifts the floor for the entire pipeline.
 

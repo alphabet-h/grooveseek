@@ -158,11 +158,14 @@ CLI フラグが config より優先。受理されるフラグ: `--golden`, `--
 **直前の compatible run** から `regression_threshold` (既定 0.05、`kb-mcp.toml`
 の `[eval].regression_threshold` で調整) を超えて退化していた場合、exit code 1
 で終了する。"compatible" = 直前 run の fingerprint (`model` / `reranker` /
-`limit` / `k_values` / golden YAML の content hash、および v0.7.0+ では
-実効 `[search.mmr]` / `[search.parent_retriever]` 設定) が一致していること。
-MMR / parent retriever の on/off を切り替えると fingerprint も変わるので
-比較対象外となり、誤検知にはならない (MMR の有無で recall@k を比較するのは
-意図的に apples-to-oranges)。golden YAML を更新した直後の run も同じ理由で
+`limit` / `k_values` / golden YAML の content hash / metric 実装 version、
+および v0.7.0+ では実効 `[search.mmr]` / `[search.parent_retriever]` 設定、
+v0.13.0 以降はさらに既定値と異なる `[search.fusion]`) が一致していること。
+MMR / parent retriever の on/off を切り替えても、fusion パラメータを
+ビルトイン既定値から動かしても fingerprint は変わるので比較対象外となり、
+誤検知にはならない (MMR の有無で recall@k を比較するのは意図的に
+apples-to-oranges)。fusion が既定値のままの実行は、v0.13.0 より前に記録した
+baseline とそのまま比較できる。golden YAML を更新した直後の run も同じ理由で
 比較対象外となる。
 
 履歴は exit より前に書き出されるので、今回の run は次回比較用に保存される。

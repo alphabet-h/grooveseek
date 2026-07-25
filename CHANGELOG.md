@@ -4,6 +4,18 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- **`[search.fusion]` config section** — the RRF constant (`rrf_k`, default
+  `60.0`) and the three FTS5 bm25 column weights (`bm25_heading_weight` /
+  `bm25_context_weight` / `bm25_content_weight`, defaults `2.0 / 1.0 / 1.0`)
+  are now configurable instead of compile-time constants. **Defaults are
+  unchanged and the section is optional**, so existing installs behave
+  bit-for-bit identically. Values are range-checked at config load
+  (`rrf_k >= 1.0`, weights finite and `>= 0.0`, not all three zero); a
+  non-default section is recorded in the eval `ConfigFingerprint` so tuned
+  runs are never compared against untuned baselines.
+
 ### Fixed
 
 - **`ndcg_at_k` could exceed 1.0 when multiple expected entries matched the

@@ -167,10 +167,13 @@ Exit with code 1 if any aggregate metric (`recall@k` for any k, `MRR`, or
 than `regression_threshold` (default 0.05; tune via `[eval].regression_threshold`
 in `kb-mcp.toml`). "Compatible" means the previous run had the same
 fingerprint — `model`, `reranker`, `limit`, `k_values`, the golden YAML's
-content hash, and (v0.7.0+) the effective `[search.mmr]` and
-`[search.parent_retriever]` settings. Toggling MMR or parent retriever
-therefore breaks fingerprint compatibility (intentionally — comparing
-`recall@k` with the diversity stage on vs off is apples-to-oranges).
+content hash, the metric implementation version, and (v0.7.0+) the effective
+`[search.mmr]` / `[search.parent_retriever]` settings plus (v0.13.0+) a
+non-default `[search.fusion]`. Toggling MMR or parent retriever, or moving
+the fusion parameters off their built-in defaults, therefore breaks
+fingerprint compatibility (intentionally — comparing `recall@k` with the
+diversity stage on vs off is apples-to-oranges). Runs at the built-in fusion
+defaults keep comparing cleanly against baselines recorded before v0.13.0.
 Updating the golden file likewise does **not** trigger a false regression
 on the next run; it just means the comparison is skipped.
 
