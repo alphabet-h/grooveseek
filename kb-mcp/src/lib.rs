@@ -24,6 +24,7 @@ pub mod schema;
 pub mod server;
 pub mod service;
 pub mod transport;
+pub mod tune;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};
