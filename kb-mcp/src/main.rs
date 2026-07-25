@@ -502,8 +502,9 @@ fn resolve_tune_k_and_limit(
 ) -> (Vec<usize>, u32) {
     let raw = cli_k.or(cfg_k).unwrap_or_else(|| vec![1, 5, 10]);
     let k_values = kb_mcp::tune::normalize_k_values(&raw);
-    let max_k = *k_values.iter().max().unwrap_or(&10) as u32;
-    let limit = cli_limit.unwrap_or(max_k).max(max_k);
+    // clamp と u32 saturate は tune::effective_limit に集約 (codex P2 round 2/3
+    // on PR #79)。--limit 未指定は 0 を渡せば max(k) に解決される。
+    let limit = kb_mcp::tune::effective_limit(&k_values, cli_limit.unwrap_or(0));
     (k_values, limit)
 }
 

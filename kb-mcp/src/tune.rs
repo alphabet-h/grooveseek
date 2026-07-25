@@ -932,7 +932,11 @@ pub fn normalize_k_values(k_values: &[usize]) -> Vec<usize> {
 /// CLI resolver (`main.rs`) と同じ不変条件を public API 側でも保証する
 /// (codex P2 round 2 on PR #79)。
 pub fn effective_limit(k_values: &[usize], limit: u32) -> u32 {
-    limit.max(*k_values.iter().max().unwrap_or(&PRIMARY_K) as u32)
+    let max_k = *k_values.iter().max().unwrap_or(&PRIMARY_K);
+    // u32::MAX 超の k は as cast だと wrap して limit 0 になり得る (64-bit の
+    // --k 4294967296 等、codex P2 round 3 on PR #79)。saturate して clamp の
+    // 向きを保つ。
+    limit.max(u32::try_from(max_k).unwrap_or(u32::MAX))
 }
 
 pub struct TuneReport {
@@ -2229,6 +2233,9 @@ mod tests {
         assert_eq!(effective_limit(&[1, 5, 10], 1), 10);
         assert_eq!(effective_limit(&[1, 5], 100), 100);
         assert_eq!(effective_limit(&[PRIMARY_K], 3), PRIMARY_K as u32);
+        // codex P2 round 3 on PR #79: u32::MAX 超の k を as cast すると wrap して
+        // effective limit 0 になり得る。saturate して invariant の向きを保つ。
+        assert_eq!(effective_limit(&[usize::MAX], 1), u32::MAX);
     }
 
     #[test]
