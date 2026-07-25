@@ -926,6 +926,15 @@ pub fn normalize_k_values(k_values: &[usize]) -> Vec<usize> {
     out
 }
 
+/// `run` が実際に使う取得件数。limit が max(k) 未満だと fused ranking が
+/// limit 件に切り詰められ、recall@k / nDCG@k がラベルより浅い候補から計算
+/// されてしまうため、正規化後の k リスト最大値を下限として clamp する。
+/// CLI resolver (`main.rs`) と同じ不変条件を public API 側でも保証する
+/// (codex P2 round 2 on PR #79)。
+pub fn effective_limit(k_values: &[usize], limit: u32) -> u32 {
+    limit.max(*k_values.iter().max().unwrap_or(&PRIMARY_K) as u32)
+}
+
 pub struct TuneReport {
     pub kb_path: PathBuf,
     pub golden_path: PathBuf,
@@ -996,6 +1005,10 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     // CLI 以外の呼び出しでもこの不変条件をここで保証する (CLI 側は limit の
     // 既定値導出のために同じ正規化を先出しで呼ぶ)。
     let k_values = normalize_k_values(&opts.k_values);
+    // limit も同じ理由で public API 側で clamp する (codex P2 round 2 on PR #79):
+    // limit < max(k) だと fused ranking が limit 件に切り詰められ、recall@k /
+    // nDCG@k がラベルより浅い候補から計算されてしまう。
+    let limit = effective_limit(&k_values, opts.limit);
 
     // query embedding をループ外で 1 回だけ (D-10-1)。現行 eval は query ごとに
     // `embed_single` を呼んでおりキャッシュも無いので、ここが tune の主な
@@ -1010,7 +1023,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
 
     let mut meta: HashMap<i64, HitMeta> = HashMap::new();
     eprintln!("kb-mcp tune: pre-flight (measuring FTS candidates per query)...");
-    let mut pre = preflight_from_embeddings(&db, &golden, &embeddings, opts.limit, &mut meta)?;
+    let mut pre = preflight_from_embeddings(&db, &golden, &embeddings, limit, &mut meta)?;
 
     let diagnostics: Vec<(String, QueryDiagnostics)> = pre
         .queries
@@ -1059,7 +1072,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
         "kb-mcp tune: sweeping {WEIGHT_CONDITIONS} bm25 weight conditions x {} rrf_k values...",
         RRF_K_GRID.len()
     );
-    let table = build_metric_table(&db, &mut pre, &mut meta, &k_values, opts.limit)?;
+    let table = build_metric_table(&db, &mut pre, &mut meta, &k_values, limit)?;
 
     // 診断値は build_metric_table で後埋めされるので取り直す。
     let diagnostics: Vec<(String, QueryDiagnostics)> = pre
@@ -1104,7 +1117,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
         kb_path: opts.kb_path.clone(),
         golden_path: opts.golden_path.clone(),
         model: opts.model_choice.model_id().to_string(),
-        limit: opts.limit,
+        limit,
         pool_size: pre.pool_size,
         k_values,
         chunk_total: pre.chunk_total,
@@ -2204,6 +2217,18 @@ mod tests {
         assert_eq!(normalize_k_values(&[0, 3]), vec![3, PRIMARY_K]);
         // 既に正規形ならそのまま
         assert_eq!(normalize_k_values(&[1, 5, 10]), vec![1, 5, 10]);
+    }
+
+    /// Regression (codex P2 round 2 on PR #79): public API (`tune::run`) 経由でも
+    /// limit は max(k) 未満に縮まない。CLI resolver だけで clamp すると、library
+    /// caller が `TuneOpts { k_values: vec![10], limit: 1 }` を渡した時に fused
+    /// ranking が 1 件に切り詰められ、nDCG@5/@10 がラベルより浅い候補から
+    /// 計算される切り詰めバグが再現する。
+    #[test]
+    fn test_effective_limit_clamps_to_max_k() {
+        assert_eq!(effective_limit(&[1, 5, 10], 1), 10);
+        assert_eq!(effective_limit(&[1, 5], 100), 100);
+        assert_eq!(effective_limit(&[PRIMARY_K], 3), PRIMARY_K as u32);
     }
 
     #[test]
