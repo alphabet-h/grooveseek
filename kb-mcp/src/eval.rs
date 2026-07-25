@@ -130,19 +130,28 @@ pub fn reciprocal_rank(expected: &[ExpectedHit], top: &[HitRecord]) -> f64 {
 /// DCG  = Σ_{e ∈ expected} 1 / log2(first_hit_rank(e) + 1)  (rank ≤ k に制限、無ければ寄与 0)
 /// IDCG = Σ_{i=1..=min(|expected|, k)} 1 / log2(i + 1)
 ///
-/// expected ごとに「最初に hit した rank」を 1 回だけ gain として積む実装。
-/// 同一 path の複数 chunk が top-k に並んでも DCG が IDCG を超えないことが保証される
-/// (heading None の expected で path-only 一致する chunk が複数並ぶケースでも上限 1.0)。
+/// hit を rank 順に走査し、未消費の expected と 1:1 で貪欲マッチして gain を積む実装。
+/// 1 hit = 最大 1 gain なので、同一 path の複数 chunk が top-k に並ぶケースに加え、
+/// expected 側に同一 path が重複するケースや path-only expected と heading 指定
+/// expected が同一 hit にマッチするケースでも DCG ≤ IDCG が保たれる
+/// (i 番目にマッチした hit の rank は i 以上のため、gain は ideal の第 i 項を超えない)。
+/// 同一 hit に複数 expected がマッチする場合は heading 指定側を優先消費し、
+/// path-only expected を後続 hit に譲る (同順位内は expected の記載順)。
 pub fn ndcg_at_k(expected: &[ExpectedHit], top: &[HitRecord], k: usize) -> f64 {
     if expected.is_empty() || top.is_empty() || k == 0 {
         return 0.0;
     }
-    let window: Vec<&HitRecord> = top.iter().take(k).collect();
-    let dcg: f64 = expected
-        .iter()
-        .filter_map(|e| window.iter().find(|h| is_hit(e, h)).copied())
-        .map(|h| 1.0 / ((h.rank as f64 + 1.0).log2()))
-        .sum();
+    let mut consumed = vec![false; expected.len()];
+    let mut dcg = 0.0;
+    for h in top.iter().take(k) {
+        let candidate = (0..expected.len())
+            .filter(|&i| !consumed[i] && is_hit(&expected[i], h))
+            .min_by_key(|&i| (expected[i].heading.is_none(), i));
+        if let Some(i) = candidate {
+            consumed[i] = true;
+            dcg += 1.0 / ((h.rank as f64 + 1.0).log2());
+        }
+    }
     let ideal_count = expected.len().min(k);
     let idcg: f64 = (1..=ideal_count)
         .map(|i| 1.0 / ((i as f64 + 1.0).log2()))
@@ -212,6 +221,14 @@ pub struct EvalRun {
     pub aggregate: AggregateMetrics,
 }
 
+/// 現行の metric 実装 version。recall / MRR / nDCG の計算式を修正するたびに
+/// +1 する。[`ConfigFingerprint::metric_version`] を参照。
+pub const METRIC_VERSION: u32 = 2;
+
+fn legacy_metric_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigFingerprint {
     pub model: String,
@@ -219,6 +236,17 @@ pub struct ConfigFingerprint {
     pub limit: u32,
     pub k_values: Vec<usize>,
     pub golden_hash: String,
+
+    /// Metric 実装の version。計算式の fix (例: v2 = nDCG の expected 重複
+    /// 多重計上 fix) 前後で同じ検索結果から異なる数値が出得るため、旧 history
+    /// JSON (field なし = serde default で 1) とは PartialEq 不一致になり
+    /// [`History::previous_compatible`] の比較対象から自動的に外れる
+    /// (= 意図的な式修正を `--fail-on-regression` が retrieval regression と
+    /// 誤検出しない)。
+    /// - v1: 初版〜v0.12.0 (expected ごとに first-hit gain を加算)
+    /// - v2: hit 主導の 1:1 貪欲マッチ (expected 側重複の多重計上 fix)
+    #[serde(default = "legacy_metric_version")]
+    pub metric_version: u32,
 
     /// MMR が有効な場合のみ Some。off (default) なら None で旧 history JSON
     /// と互換維持。enabled=true でのみ lambda + same_doc_penalty を fingerprint
@@ -286,6 +314,7 @@ impl ConfigFingerprint {
             limit,
             k_values,
             golden_hash,
+            metric_version: METRIC_VERSION,
             mmr,
             parent_retriever,
         }
@@ -478,8 +507,10 @@ pub fn format_json(run: &EvalRun, previous: Option<&EvalRun>) -> serde_json::Val
     let prev_val = previous
         .and_then(|p| serde_json::to_value(p).ok())
         .unwrap_or(serde_json::Value::Null);
+    // 表示 diff も full fingerprint 互換でのみ有効化する (golden_hash 単独だと
+    // metric_version / model 等が違う旧 run との apple-to-orange 差分を出してしまう)。
     let diff_val = match previous {
-        Some(p) if p.fingerprint.golden_hash == run.fingerprint.golden_hash => {
+        Some(p) if p.fingerprint == run.fingerprint => {
             let mut recall_diff = serde_json::Map::new();
             for (k, v) in &run.aggregate.recall_at_k {
                 let prev_v = p.aggregate.recall_at_k.get(k).copied().unwrap_or(0.0);
@@ -528,9 +559,10 @@ pub fn format_text(
     .unwrap();
     writeln!(s).unwrap();
 
-    // Fingerprint mismatch は diff を無効化
+    // Fingerprint mismatch は diff を無効化 (golden_hash 単独ではなく full 比較。
+    // metric_version / model 等が違う旧 run との表示 diff も apple-to-orange)
     let diff_enabled = match previous {
-        Some(p) => p.fingerprint.golden_hash == run.fingerprint.golden_hash,
+        Some(p) => p.fingerprint == run.fingerprint,
         None => false,
     };
 
@@ -538,8 +570,16 @@ pub fn format_text(
         Some(p) if diff_enabled => {
             writeln!(s, "Aggregate (previous run: {})", p.timestamp.to_rfc3339()).unwrap();
         }
-        Some(_) => {
+        Some(p) if p.fingerprint.golden_hash != run.fingerprint.golden_hash => {
             writeln!(s, "⚠️ golden changed since last run, diff disabled").unwrap();
+            writeln!(s, "Aggregate").unwrap();
+        }
+        Some(_) => {
+            writeln!(
+                s,
+                "⚠️ config or metric version changed since last run, diff disabled"
+            )
+            .unwrap();
             writeln!(s, "Aggregate").unwrap();
         }
         None => {
@@ -817,6 +857,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             limit: opts.limit,
             k_values: opts.k_values.clone(),
             golden_hash,
+            metric_version: METRIC_VERSION,
             mmr: mmr_fp,
             parent_retriever: parent_fp,
         },
@@ -1088,6 +1129,49 @@ mod tests {
         assert!(score <= 1.0 + 1e-9, "nDCG must not exceed 1.0, got {score}");
     }
 
+    /// Regression: expected 側に同一 path が重複していても、1 つの hit は
+    /// 最大 1 回しか gain にならない (DCG ≤ IDCG)。golden yml に同じ path を
+    /// 二重記載したケース + prop_ndcg_at_k_in_unit_range の flaky 要因。
+    #[test]
+    fn test_ndcg_duplicate_expected_entries_capped_at_one() {
+        let expected = vec![exp("a.md", None), exp("a.md", None)];
+        let top = vec![hit(1, "a.md", None)];
+        let score = ndcg_at_k(&expected, &top, 5);
+        assert!(score <= 1.0 + 1e-9, "nDCG must not exceed 1.0, got {score}");
+        // 1:1 マッチでは gain は rank 1 の 1 回分のみ: 1.0 / (1/log2(2) + 1/log2(3))
+        let idcg = 1.0 / 2f64.log2() + 1.0 / 3f64.log2();
+        assert!(
+            (score - 1.0 / idcg).abs() < 1e-9,
+            "expected {}, got {score}",
+            1.0 / idcg
+        );
+    }
+
+    /// Regression: path-only expected と同 path の heading 指定 expected が
+    /// 同一 hit にマッチし得るケース。1 hit = 1 gain の 1:1 マッチで上限 1.0 を守る。
+    #[test]
+    fn test_ndcg_path_only_and_heading_expected_share_single_hit() {
+        let expected = vec![exp("a.md", None), exp("a.md", Some("X"))];
+        let top = vec![hit(1, "a.md", Some("X"))];
+        let score = ndcg_at_k(&expected, &top, 5);
+        assert!(score <= 1.0 + 1e-9, "nDCG must not exceed 1.0, got {score}");
+    }
+
+    /// 1:1 マッチの割当品質: heading 指定 expected を優先消費することで、
+    /// path-only expected が後続 hit に回り、両 expected が credit を得る。
+    #[test]
+    fn test_ndcg_heading_expected_preferred_over_path_only() {
+        let expected = vec![exp("a.md", None), exp("a.md", Some("X"))];
+        let top = vec![hit(1, "a.md", Some("X")), hit(2, "a.md", Some("Y"))];
+        // rank 1 は heading 指定の exp("a.md","X") が消費し、path-only は rank 2 で hit
+        // → DCG = 1/log2(2) + 1/log2(3) = IDCG → nDCG = 1.0
+        let score = ndcg_at_k(&expected, &top, 5);
+        assert!(
+            (score - 1.0).abs() < 1e-9,
+            "expected exactly 1.0, got {score}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // F-37: f64 invariant property tests
     // recall_at_k / ndcg_at_k は binary relevance metric なので、入力に
@@ -1235,6 +1319,7 @@ mod tests {
                 limit: 10,
                 k_values: vec![1, 5, 10],
                 golden_hash: "deadbeef".into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1301,6 +1386,7 @@ mod tests {
                 limit: 10,
                 k_values: vec![1, 5],
                 golden_hash: "h".into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1325,6 +1411,7 @@ mod tests {
             limit: 10,
             k_values: vec![5],
             golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
         };
@@ -1362,6 +1449,7 @@ mod tests {
             limit: 10,
             k_values: vec![5],
             golden_hash: "AAA".into(),
+            metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
         };
@@ -1404,6 +1492,7 @@ mod tests {
                 limit: 10,
                 k_values: vec![1, 5],
                 golden_hash: "abc".into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1430,6 +1519,7 @@ mod tests {
             limit: 10,
             k_values: vec![5],
             golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
         };
@@ -1449,6 +1539,93 @@ mod tests {
         assert!(!v["previous"].is_null());
         let diff5 = v["diff"]["recall_at_k"]["5"].as_f64().unwrap();
         assert!((diff5 - 0.2).abs() < 1e-9);
+    }
+
+    /// Metric version 違いの previous とは表示 diff も無効化する (codex P2 round 2
+    /// on PR #76)。--fail-on-regression 側は除外済みでも、表示側が golden_hash
+    /// のみで gate すると旧式との赤 delta が出てしまう。
+    #[test]
+    fn test_format_json_metric_version_mismatch_disables_diff() {
+        let mut a1 = AggregateMetrics::default();
+        a1.recall_at_k.insert(5, 0.6);
+        let mut a0 = AggregateMetrics::default();
+        a0.recall_at_k.insert(5, 0.8);
+        let fp_now = ConfigFingerprint {
+            model: "m".into(),
+            reranker: None,
+            limit: 10,
+            k_values: vec![5],
+            golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
+            mmr: None,
+            parent_retriever: None,
+        };
+        let fp_prev = ConfigFingerprint {
+            metric_version: 1,
+            ..fp_now.clone()
+        };
+        let now = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_now,
+            per_query: vec![],
+            aggregate: a1,
+        };
+        let prev = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_prev,
+            per_query: vec![],
+            aggregate: a0,
+        };
+        let v = format_json(&now, Some(&prev));
+        assert!(
+            v["diff"].is_null(),
+            "diff must be null across metric versions"
+        );
+    }
+
+    /// format_text も metric version 違いでは diff を無効化し、golden 変更とは
+    /// 区別されたメッセージを出す。
+    #[test]
+    fn test_format_text_metric_version_mismatch_disables_diff() {
+        let mut a1 = AggregateMetrics::default();
+        a1.recall_at_k.insert(5, 0.6);
+        a1.query_count = 1;
+        let mut a0 = AggregateMetrics::default();
+        a0.recall_at_k.insert(5, 0.8);
+        a0.query_count = 1;
+        let fp_now = ConfigFingerprint {
+            model: "m".into(),
+            reranker: None,
+            limit: 10,
+            k_values: vec![5],
+            golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
+            mmr: None,
+            parent_retriever: None,
+        };
+        let fp_prev = ConfigFingerprint {
+            metric_version: 1,
+            ..fp_now.clone()
+        };
+        let now = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_now,
+            per_query: vec![],
+            aggregate: a1,
+        };
+        let prev = EvalRun {
+            timestamp: Utc::now(),
+            fingerprint: fp_prev,
+            per_query: vec![],
+            aggregate: a0,
+        };
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("diff disabled"), "got: {out}");
+        assert!(!out.contains("golden changed"), "got: {out}");
+        assert!(
+            !out.contains("↓"),
+            "must not render downward delta, got: {out}"
+        );
     }
 
     #[test]
@@ -1493,6 +1670,7 @@ mod tests {
                 limit: 10,
                 k_values: recall.keys().copied().collect(),
                 golden_hash: golden_hash.into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1588,6 +1766,43 @@ mod tests {
         let now = synthetic_run(map_one(5, 0.5), 0.5, map_one(10, 0.5), "golden_NEW");
         h.push_front(prev, 10);
         assert!(h.previous_compatible(&now).is_none());
+    }
+
+    /// 旧 history JSON (metric_version field なし) は legacy = 1 として読まれる。
+    #[test]
+    fn test_fingerprint_metric_version_defaults_to_one_on_old_json() {
+        let json =
+            r#"{"model":"bge-m3","reranker":null,"limit":10,"k_values":[5],"golden_hash":"h"}"#;
+        let fp: ConfigFingerprint = serde_json::from_str(json).unwrap();
+        assert_eq!(fp.metric_version, 1);
+    }
+
+    /// Metric 式修正 (= METRIC_VERSION bump) 後は旧 version で記録された run と
+    /// 比較しない。旧 nDCG の数値と比べて --fail-on-regression が式修正を
+    /// retrieval regression と誤検出するのを防ぐ (codex P2 on PR #76)。
+    #[test]
+    fn test_previous_compatible_rejects_old_metric_version() {
+        let mut h = History::default();
+        let mut prev = synthetic_run(map_one(5, 0.9), 0.9, map_one(10, 0.9), "golden_xyz");
+        prev.fingerprint.metric_version = 1;
+        let now = synthetic_run(map_one(5, 0.5), 0.5, map_one(10, 0.5), "golden_xyz");
+        h.push_front(prev, 10);
+        assert!(h.previous_compatible(&now).is_none());
+    }
+
+    /// from_config は常に現行 METRIC_VERSION を書き込む。
+    #[test]
+    fn test_fingerprint_from_config_sets_current_metric_version() {
+        let cfg: crate::config::Config = toml::from_str("").unwrap();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-m3".to_string(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "deadbeef".to_string(),
+        );
+        assert_eq!(fp.metric_version, METRIC_VERSION);
     }
 
     // ------------------------------------------------------------------

@@ -4,6 +4,30 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ndcg_at_k` could exceed 1.0 when multiple expected entries matched the
+  same hit** — e.g. a golden query listing the same path twice, or a
+  path-only expected alongside a heading-specific expected for the same
+  path. The metric now walks hits in rank order and greedily consumes
+  expected entries one-to-one (preferring heading-specific entries over
+  path-only ones on the same hit), which mathematically bounds DCG ≤ IDCG
+  for arbitrary input. Well-formed golden sets with distinct expected paths
+  are unaffected — existing eval baselines remain valid. Also fixes the
+  flaky `prop_ndcg_at_k_in_unit_range` property test, which tripped over
+  this exact case when its narrow path space generated duplicates.
+  - `ConfigFingerprint` now carries a `metric_version` field (current: 2;
+    histories recorded before this release deserialize as 1). Runs recorded
+    with the old formula are automatically excluded from
+    `--fail-on-regression` comparison, so this intentional metric
+    correction can never be misreported as a retrieval regression. The
+    first `kb-mcp eval` after upgrading starts a fresh comparison baseline.
+  - Displayed comparisons (`--format text` arrows / `--format json` `diff`)
+    now also require full fingerprint compatibility instead of only a
+    matching golden hash, so cross-metric-version (or cross-model) deltas
+    are no longer rendered; a dedicated "config or metric version changed"
+    notice is shown instead.
+
 ## [0.12.0] - 2026-07-21
 
 ### Added
