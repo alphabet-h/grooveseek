@@ -221,6 +221,14 @@ pub struct EvalRun {
     pub aggregate: AggregateMetrics,
 }
 
+/// 現行の metric 実装 version。recall / MRR / nDCG の計算式を修正するたびに
+/// +1 する。[`ConfigFingerprint::metric_version`] を参照。
+pub const METRIC_VERSION: u32 = 2;
+
+fn legacy_metric_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigFingerprint {
     pub model: String,
@@ -228,6 +236,17 @@ pub struct ConfigFingerprint {
     pub limit: u32,
     pub k_values: Vec<usize>,
     pub golden_hash: String,
+
+    /// Metric 実装の version。計算式の fix (例: v2 = nDCG の expected 重複
+    /// 多重計上 fix) 前後で同じ検索結果から異なる数値が出得るため、旧 history
+    /// JSON (field なし = serde default で 1) とは PartialEq 不一致になり
+    /// [`History::previous_compatible`] の比較対象から自動的に外れる
+    /// (= 意図的な式修正を `--fail-on-regression` が retrieval regression と
+    /// 誤検出しない)。
+    /// - v1: 初版〜v0.12.0 (expected ごとに first-hit gain を加算)
+    /// - v2: hit 主導の 1:1 貪欲マッチ (expected 側重複の多重計上 fix)
+    #[serde(default = "legacy_metric_version")]
+    pub metric_version: u32,
 
     /// MMR が有効な場合のみ Some。off (default) なら None で旧 history JSON
     /// と互換維持。enabled=true でのみ lambda + same_doc_penalty を fingerprint
@@ -295,6 +314,7 @@ impl ConfigFingerprint {
             limit,
             k_values,
             golden_hash,
+            metric_version: METRIC_VERSION,
             mmr,
             parent_retriever,
         }
@@ -826,6 +846,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             limit: opts.limit,
             k_values: opts.k_values.clone(),
             golden_hash,
+            metric_version: METRIC_VERSION,
             mmr: mmr_fp,
             parent_retriever: parent_fp,
         },
@@ -1287,6 +1308,7 @@ mod tests {
                 limit: 10,
                 k_values: vec![1, 5, 10],
                 golden_hash: "deadbeef".into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1353,6 +1375,7 @@ mod tests {
                 limit: 10,
                 k_values: vec![1, 5],
                 golden_hash: "h".into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1377,6 +1400,7 @@ mod tests {
             limit: 10,
             k_values: vec![5],
             golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
         };
@@ -1414,6 +1438,7 @@ mod tests {
             limit: 10,
             k_values: vec![5],
             golden_hash: "AAA".into(),
+            metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
         };
@@ -1456,6 +1481,7 @@ mod tests {
                 limit: 10,
                 k_values: vec![1, 5],
                 golden_hash: "abc".into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1482,6 +1508,7 @@ mod tests {
             limit: 10,
             k_values: vec![5],
             golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
             mmr: None,
             parent_retriever: None,
         };
@@ -1545,6 +1572,7 @@ mod tests {
                 limit: 10,
                 k_values: recall.keys().copied().collect(),
                 golden_hash: golden_hash.into(),
+                metric_version: METRIC_VERSION,
                 mmr: None,
                 parent_retriever: None,
             },
@@ -1640,6 +1668,43 @@ mod tests {
         let now = synthetic_run(map_one(5, 0.5), 0.5, map_one(10, 0.5), "golden_NEW");
         h.push_front(prev, 10);
         assert!(h.previous_compatible(&now).is_none());
+    }
+
+    /// 旧 history JSON (metric_version field なし) は legacy = 1 として読まれる。
+    #[test]
+    fn test_fingerprint_metric_version_defaults_to_one_on_old_json() {
+        let json =
+            r#"{"model":"bge-m3","reranker":null,"limit":10,"k_values":[5],"golden_hash":"h"}"#;
+        let fp: ConfigFingerprint = serde_json::from_str(json).unwrap();
+        assert_eq!(fp.metric_version, 1);
+    }
+
+    /// Metric 式修正 (= METRIC_VERSION bump) 後は旧 version で記録された run と
+    /// 比較しない。旧 nDCG の数値と比べて --fail-on-regression が式修正を
+    /// retrieval regression と誤検出するのを防ぐ (codex P2 on PR #76)。
+    #[test]
+    fn test_previous_compatible_rejects_old_metric_version() {
+        let mut h = History::default();
+        let mut prev = synthetic_run(map_one(5, 0.9), 0.9, map_one(10, 0.9), "golden_xyz");
+        prev.fingerprint.metric_version = 1;
+        let now = synthetic_run(map_one(5, 0.5), 0.5, map_one(10, 0.5), "golden_xyz");
+        h.push_front(prev, 10);
+        assert!(h.previous_compatible(&now).is_none());
+    }
+
+    /// from_config は常に現行 METRIC_VERSION を書き込む。
+    #[test]
+    fn test_fingerprint_from_config_sets_current_metric_version() {
+        let cfg: crate::config::Config = toml::from_str("").unwrap();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-m3".to_string(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "deadbeef".to_string(),
+        );
+        assert_eq!(fp.metric_version, METRIC_VERSION);
     }
 
     // ------------------------------------------------------------------

@@ -16,6 +16,12 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   are unaffected — existing eval baselines remain valid. Also fixes the
   flaky `prop_ndcg_at_k_in_unit_range` property test, which tripped over
   this exact case when its narrow path space generated duplicates.
+  - `ConfigFingerprint` now carries a `metric_version` field (current: 2;
+    histories recorded before this release deserialize as 1). Runs recorded
+    with the old formula are automatically excluded from
+    `--fail-on-regression` comparison, so this intentional metric
+    correction can never be misreported as a retrieval regression. The
+    first `kb-mcp eval` after upgrading starts a fresh comparison baseline.
 
 ## [0.12.0] - 2026-07-21
 
