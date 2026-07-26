@@ -4,6 +4,8 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-07-26
+
 ### Fixed
 
 - **`search` accepted an unbounded `limit`, which could abort the process.**
@@ -1298,7 +1300,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.10.0...v0.11.0
