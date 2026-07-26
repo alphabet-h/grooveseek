@@ -110,8 +110,10 @@ If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS ins
 The `kb-mcp` CLI follows a **stdout = data, stderr = progress** convention:
 
 - **stdout** carries the command's *result*, in whatever format was asked for.
-  It is machine-parseable only with `--format json`; every one of these
-  defaults to human-readable text:
+  The defaults differ, so check before parsing: `search` and `graph` default to
+  `--format json`, while `eval`, `tune` and `validate` default to human-readable
+  text (`validate --format github` is machine-consumed too — it emits CI
+  annotations):
   - `kb-mcp search` results (`print_search_results`)
   - `kb-mcp eval` golden-query evaluation results
   - `kb-mcp tune` sweep results

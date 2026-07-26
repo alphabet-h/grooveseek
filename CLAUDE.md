@@ -30,7 +30,7 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 `kb-mcp` の各 subcommand は出力先を以下の規約で使い分ける:
 
-- **stdout** = そのコマンドの結果の出力先 (machine-parseable なのは `--format json` の時のみ。下記はいずれも既定が human-readable text)
+- **stdout** = そのコマンドの結果の出力先 (既定形式はコマンドごとに違う: `search` / `graph` は json、`eval` / `tune` / `validate` は text)
   - `kb-mcp search` の結果 (`print_search_results`)
   - `kb-mcp eval` の golden query 評価結果
   - `kb-mcp tune` の sweep 結果

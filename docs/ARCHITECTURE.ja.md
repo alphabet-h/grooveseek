@@ -108,8 +108,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 `kb-mcp` CLI は **stdout = データ出力 / stderr = 進捗** の規約に従う:
 
-- **stdout** = そのコマンドの *結果* を、指定された形式で出す。machine-parseable
-  なのは `--format json` の時だけで、以下はすべて既定が human-readable な text:
+- **stdout** = そのコマンドの *結果* を、指定された形式で出す。**既定形式はコマンドごとに違う**ので parse 前に確認すること: `search` / `graph` は `--format json` が既定、`eval` / `tune` / `validate` は human-readable な text が既定 (`validate --format github` も CI annotation を出す machine-consumed 形式):
   - `kb-mcp search` の結果 (`print_search_results`)
   - `kb-mcp eval` の golden query 評価結果
   - `kb-mcp tune` の sweep 結果
