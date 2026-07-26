@@ -48,7 +48,12 @@
    `/var/lib/kb-mcp/.kb-mcp.db` = ローカル・専有・他ホストが触らない場所になる。
 
    ```bash
-   sudo install -d /var/lib/kb-mcp
+   # .kb-mcp.db と WAL の sidecar が作られるのは親ディレクトリなので、
+   # kb-mcp を実行するアカウントが書ける必要がある。マウントポイント自体も
+   # 事前に作っておく — `mount` は作ってくれない。
+   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp
+   sudo install -d /var/lib/kb-mcp/knowledge-base
+
    # Linux NFSv4 の例。ここでは read-only で構わない — NAS 上にあるのは
    # KB ファイルだけで、kb-mcp はそれらを書き換えない。
    sudo mount -t nfs4 -o ro nas:/exports/kb /var/lib/kb-mcp/knowledge-base
@@ -57,14 +62,16 @@
    read-only マウントは任意だが害はなく、「このマシンは共有 KB を編集
    しない」を強制できる。KB を編集するマシンは通常どおり read-write で。
 
-2. `kb-mcp.toml.client` を `kb-mcp.toml` として discovery path に置き、
-   `kb_path = "/var/lib/kb-mcp/knowledge-base"` にする
+2. `kb-mcp.toml.client` を `/var/lib/kb-mcp/kb-mcp.toml` に置き、
+   `kb_path = "/var/lib/kb-mcp/knowledge-base"` にする。DB の隣に置いておくと
+   下のタイマーから `--config` で直接指せる — model は index 時と一致している
+   必要があり、systemd unit はシェルの作業ディレクトリを引き継がない
 
 3. インデックス構築 (初回は数分 — NFS 読みはローカルより遅く、ONNX モデルの
    初回 DL もある):
 
    ```bash
-   kb-mcp index --kb-path /var/lib/kb-mcp/knowledge-base
+   kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
    ```
 
 4. タイマーで最新に保つ。watcher は使えない: inotify も
@@ -75,12 +82,17 @@
    # /etc/systemd/system/kb-mcp-index.service
    [Service]
    Type=oneshot
-   ExecStart=/usr/local/bin/kb-mcp index --kb-path /var/lib/kb-mcp/knowledge-base
+   User=you
+   # --config は必須: unit は作業ディレクトリを引き継がないため、config 探索が
+   # 既定値に落ちて別 model で index しようとし、既存 index に弾かれる。
+   ExecStart=/usr/local/bin/kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
 
    # /etc/systemd/system/kb-mcp-index.timer
    [Timer]
    OnBootSec=2min
-   OnUnitActiveSec=5min   # 編集頻度に合わせる
+   # 編集頻度に合わせる。systemd に行末コメントは無く、値の後ろの `#` 以降も
+   # 値の一部として解釈されて設定ごと捨てられる。
+   OnUnitActiveSec=5min
 
    [Install]
    WantedBy=timers.target
@@ -95,7 +107,7 @@
 6. 確認:
 
    ```bash
-   kb-mcp status --kb-path /var/lib/kb-mcp/knowledge-base
+   kb-mcp status --config /var/lib/kb-mcp/kb-mcp.toml
    ```
 
    document 数が出れば OK。`unable to open database file` が出るなら

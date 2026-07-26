@@ -50,7 +50,12 @@ edits the same files. **The index does not.** Each machine keeps its own
    touched by another host.
 
    ```bash
-   sudo install -d /var/lib/kb-mcp
+   # The parent must be writable by the account that runs kb-mcp, because
+   # .kb-mcp.db and its WAL sidecars are created there. The mount point
+   # itself has to exist before mounting — `mount` will not create it.
+   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp
+   sudo install -d /var/lib/kb-mcp/knowledge-base
+
    # Linux NFSv4 example. Read-only is fine here: only the KB files are
    # on the NAS, and kb-mcp never writes those.
    sudo mount -t nfs4 -o ro nas:/exports/kb /var/lib/kb-mcp/knowledge-base
@@ -60,14 +65,17 @@ edits the same files. **The index does not.** Each machine keeps its own
    machine does not edit the shared KB" enforceable. Machines that *do*
    edit the KB mount it read-write as usual.
 
-2. Copy `kb-mcp.toml.client` to `kb-mcp.toml` on the discovery path and
-   set `kb_path = "/var/lib/kb-mcp/knowledge-base"`.
+2. Copy `kb-mcp.toml.client` to `/var/lib/kb-mcp/kb-mcp.toml` and set
+   `kb_path = "/var/lib/kb-mcp/knowledge-base"`. Keeping it next to the
+   database means the timer below can point `--config` straight at it — the
+   model must match what the index was built with, and a systemd unit does
+   not inherit your shell's working directory.
 
 3. Build the index (minutes on the first run — reading over NFS is
    slower than local disk, and the ONNX model downloads once):
 
    ```bash
-   kb-mcp index --kb-path /var/lib/kb-mcp/knowledge-base
+   kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
    ```
 
 4. Keep it fresh on a timer. The watcher cannot help here: neither
@@ -78,12 +86,18 @@ edits the same files. **The index does not.** Each machine keeps its own
    # /etc/systemd/system/kb-mcp-index.service
    [Service]
    Type=oneshot
-   ExecStart=/usr/local/bin/kb-mcp index --kb-path /var/lib/kb-mcp/knowledge-base
+   User=you
+   # --config is required: a unit does not inherit a working directory, so
+   # config discovery would fall back to defaults and index with the wrong
+   # model, which the existing index then rejects.
+   ExecStart=/usr/local/bin/kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
 
    # /etc/systemd/system/kb-mcp-index.timer
    [Timer]
    OnBootSec=2min
-   OnUnitActiveSec=5min   # adjust to your edit cadence
+   # Adjust to your edit cadence. systemd has no trailing comments: a `#`
+   # after the value becomes part of the value and the setting is dropped.
+   OnUnitActiveSec=5min
 
    [Install]
    WantedBy=timers.target
@@ -98,7 +112,7 @@ edits the same files. **The index does not.** Each machine keeps its own
 6. Confirm:
 
    ```bash
-   kb-mcp status --kb-path /var/lib/kb-mcp/knowledge-base
+   kb-mcp status --config /var/lib/kb-mcp/kb-mcp.toml
    ```
 
    Should report a non-zero document count. If it says `unable to open
