@@ -168,11 +168,20 @@ than `regression_threshold` (default 0.05; tune via `[eval].regression_threshold
 in `kb-mcp.toml`). "Compatible" means the previous run had the same
 fingerprint — `model`, `reranker`, `limit`, `k_values`, the golden YAML's
 content hash, the metric implementation version, and (v0.7.0+) the effective
-`[search.mmr]` / `[search.parent_retriever]` settings plus (v0.13.0+) a
-non-default `[search.fusion]`. Toggling MMR or parent retriever, or moving
+`[search.mmr]` / `[search.parent_retriever]` settings, plus (v0.13.0+) a
+non-default `[search.fusion]` and (v0.13.2+) the index's context mode when it
+was built with `[contextual].enabled = true`. Toggling MMR or parent retriever, or moving
 the fusion parameters off their built-in defaults, therefore breaks
 fingerprint compatibility (intentionally — comparing `recall@k` with the
-diversity stage on vs off is apples-to-oranges). Note that history written **before v0.13.0 is incompatible regardless of
+diversity stage on vs off is apples-to-oranges). Switching `[contextual]` therefore breaks compatibility too, as it should:
+that setting changes every chunk's embedding and FTS text and requires a
+`--force` re-index, so the runs on either side measure different indexes even
+though the model and golden file are identical. The mode recorded is the one
+the **index** carries (`index_meta.context_mode`), not what the config asked
+for. Context-off runs record nothing, so they stay comparable with every
+baseline taken before this existed.
+
+Note that history written **before v0.13.0 is incompatible regardless of
 fusion settings**: `metric_version` went 1 → 2 when the metric implementation
 was corrected, and the fingerprint is compared as a whole. Those runs are
 skipped rather than compared, which is the intended behaviour — the older
