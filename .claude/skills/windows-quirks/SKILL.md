@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Nine field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), or diagnosing "works on Linux, fails on Windows" failures
+description: Ten field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -108,6 +108,34 @@ Your shell might be rewriting URL paths as filesystem paths.
 **正しいやり方**: endpoint の**先頭スラッシュを落とす** (`gh api repos/{owner}/{repo}/...`)。`gh` は相対形式を受け付ける。どうしても先頭スラッシュが必要な引数では `MSYS_NO_PATHCONV=1` を前置する。PowerShell 側では発生しない。
 
 出典: 2026-07-26 AU-09 session / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 7)
+
+## 10. Python の text mode で書き戻すとファイル全体が LF → CRLF に反転する
+
+**症状**: `python - <<'PY' ... open(p,'w').write(s) ... PY` で数行だけ書き換えたつもりが、`git diff --stat` が **ファイル全体の書き換え**になる (例: 350 行のファイルが `350 +++ 350 ---`)。`cargo fmt` / `clippy` / `cargo test` は全て通るので、diffstat を見るまで気付かない。
+
+**原因**: このリポジトリは全ファイル **LF** (`core.autocrlf=false`、`.gitattributes` に `text` 指定なし)。Python の text mode は読み込みで universal newlines により `\r\n` / `\n` を `\n` に統一し、**書き込みで `os.linesep` (Windows では `\r\n`) に変換する**。したがって LF のファイルを text mode で round-trip させるだけで CRLF になる。`rustfmt` の `newline_style` は既定 `Auto` = ファイルの現行スタイルを踏襲するので、`cargo fmt` を後から走らせても**元に戻らない**。
+
+**検出のしかた** (`grep -c $'\r'` は当てにならない。od の出力行を数えるのも誤り):
+```bash
+python -c "b=open('path','rb').read(); print('CRLF=', b.count(b'\r\n'), 'LF=', b.count(b'\n')-b.count(b'\r\n'))"
+```
+コミット前なら `git diff --stat --ignore-all-space` と素の `--stat` を比べる。数字が大きく食い違えば改行が原因。
+
+**正しいやり方**: 3 つのいずれか。
+
+1. **Edit / Write ツールを使う** (改行を保つ)。まずこれを検討する
+2. Python を使うなら **binary mode**: `open(p,'rb').read()` / `open(p,'wb').write(...)`、または `open(p,'w',newline='')`
+3. `sed -i` (Git Bash) は LF を保つので、1 行の機械的置換には安全
+
+既に反転させてしまったら、commit 前に一括で戻す:
+```bash
+python -c "
+b=open('path','rb').read()
+open('path','wb').write(b.replace(b'\r\n', b'\n'))
+"
+```
+
+出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
