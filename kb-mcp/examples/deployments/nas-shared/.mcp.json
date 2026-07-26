@@ -1,5 +1,5 @@
 {
-  "_comment_nas_shared": "NAS-shared deployment, client side. stdio + the locally-mounted NAS path. The kb_path arg here is redundant with kb-mcp.toml; either keep both (explicit beats config) or drop the args and rely on the toml. Mount the share read-write (SQLite WAL needs to create sidecar files next to .kb-mcp.db); this machine stays search-only by rule, never by mount flags — see README.md / README.ja.md.",
+  "_comment_nas_shared": "KB-on-NAS deployment, client side. stdio + the local mount point of the shared KB. The kb_path arg here is redundant with kb-mcp.toml; either keep both (explicit beats config) or drop the args and rely on the toml. Mount the share so its PARENT is on local disk — .kb-mcp.db is created next to kb_path and must stay off the network filesystem. See README.md / README.ja.md.",
   "_comment_alwaysLoad": "alwaysLoad: true is a Claude Code v2.1.121+ option that ensures kb-mcp's tools are present at initial load (skips tool-search lookup latency). Other MCP clients (Cursor, etc.) ignore the field. Drop it if first-startup model download cost outweighs the latency win.",
   "mcpServers": {
     "ai-knowledge": {
@@ -7,7 +7,7 @@
       "command": "kb-mcp",
       "args": [
         "serve",
-        "--kb-path", "/mnt/nas/knowledge-base"
+        "--kb-path", "/var/lib/kb-mcp/knowledge-base"
       ],
       "alwaysLoad": true
     }

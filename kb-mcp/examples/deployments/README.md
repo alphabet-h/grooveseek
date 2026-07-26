@@ -10,7 +10,7 @@ machine, and adjust paths.
 | Scenario | Best for | Transport | Indexer machines |
 | --- | --- | --- | --- |
 | [`personal/`](./personal/) | Single user, single Claude Code session at a time | stdio | 1 (this machine) |
-| [`nas-shared/`](./nas-shared/) | KB on a NAS, multiple machines reading | stdio (each client) | 1 dedicated indexer |
+| [`nas-shared/`](./nas-shared/) | KB files on a NAS, each machine indexing them locally | stdio (each machine) | every machine |
 | [`intranet-http/`](./intranet-http/) | Team server, multiple users at once | Streamable HTTP | 1 (the server) |
 
 For **single-user personal-http** (= 1 machine, 1 user, 1 daemon, loopback only — multiple parallel Claude Code sessions on the same host), the prior `personal-http/` recipe was removed in v0.8.0. Use the built-in service installer instead:
@@ -38,7 +38,8 @@ Are you the only person using this KB?
         │   └── Yes → intranet-http/  (one server, many clients)
         │
         └── Clients want stdio simplicity (no kb-mcp serve process to manage)?
-            └── nas-shared/  (mount the KB; SQLite caveats apply)
+            └── nas-shared/  (share the KB files; each machine keeps its
+                             own index — SQLite WAL cannot span hosts)
 ```
 
 ## Common notes

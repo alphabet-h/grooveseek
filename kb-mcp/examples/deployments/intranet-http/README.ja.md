@@ -144,14 +144,25 @@ Web UI (`/ui`) と admin API (`/api/admin/*`) は **他マシンから到達で�
 **peer アドレスが loopback でなければ 403** になる。使う時は公開するのではなく
 SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
 
+> **同一ホスト上の reverse proxy はこの check を無効化する。** proxy 経由だと
+> kb-mcp から見た peer は proxy の loopback アドレスになり、素の
+> `proxy_pass http://127.0.0.1:3100` は `Host: 127.0.0.1:3100` を送る — admin
+> の allow-list は「loopback の別名 + bind アドレス」なのでこれも通る。結果、
+> 両方の gate を抜けて proxy に到達できる相手に admin UI が出る。**proxy で
+> map するのは `/mcp` と `/healthz` だけ**にし、`/ui` と `/api/admin/` は
+> map しない (or 403 を返す)。意図的に公開するなら、index 再構築や daemon
+> status の前に立つのは proxy 自身の認証だけになる。
+
 現時点で認証が必要なら標準レシピは:
 
 ```
 [インターネット / VPN] → nginx (TLS + basic auth) → 127.0.0.1:3100 → kb-mcp
 ```
 
-`kb-mcp.toml` で `127.0.0.1:3100` に bind し、nginx で `/mcp` と `/healthz`
-を `proxy_set_header Host $host` 等とともに proxy。
+`kb-mcp.toml` で `127.0.0.1:3100` に bind し、nginx では **`/mcp` と
+`/healthz` だけ** を proxy する — `/ui` と `/api/admin/` は proxy しない
+(上の警告を参照)。クライアントの Host を転送し (`proxy_set_header Host $host;`)、
+その名前を `[transport.http].allowed_hosts` に列挙する。
 
 ### `alwaysLoad: true` (クライアント側)
 

@@ -7,14 +7,20 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 ### Documentation
 
 - **Deployment recipes that could not work as written** (AU-34, AU-35,
-  AU-37, AU-38, AU-39, AU-45). The NAS recipe told read-only clients to mount
-  the share read-only, which stops kb-mcp before it prints anything: the
-  database is opened read-write and a WAL database cannot even be read
-  without creating its `-shm` / `-wal` sidecars, so `kb-mcp status` fails
-  with `Error code 14: unable to open database file` (measured with the
-  directory made non-writable). Clients now mount read-write and stay
-  search-only by rule — never run `index` off the indexer host, watcher off,
-  which is what the shipped client config already does. The intranet recipe
+  AU-37, AU-38, AU-39, AU-45). The NAS recipe put `.kb-mcp.db` on the share
+  and had every machine open it, which SQLite documents as unsupported:
+  "All processes using a database must be on the same host computer; WAL does
+  not work over a network filesystem." That is not a writer-only restriction —
+  readers take part in the same shared-memory protocol — so no mount flag or
+  single-writer rule could make it safe. The recipe now keeps the KB files on
+  the NAS and gives **each machine its own index on local disk**, which falls
+  out of mounting the share at a path whose parent is local (`.kb-mcp.db` is
+  created beside `kb_path`). If you want one shared index, that is what the
+  intranet-http recipe is for. The old advice to mount read-only was doubly
+  wrong: kb-mcp opens the database read-write, and a WAL database cannot even
+  be read without creating its `-shm` / `-wal` sidecars — measured with the
+  directory made non-writable, `kb-mcp status` fails with `Error code 14:
+  unable to open database file`. The intranet recipe
   never mentioned `[transport.http].allowed_hosts`, whose default is loopback
   only, so every LAN client following it was answered with 403 no matter what
   `bind` said; the config and both READMEs now cover it, including behind a
@@ -28,7 +34,9 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   case-insensitive matching. Also documented: the intranet recipe uses a
   system unit deliberately rather than `kb-mcp service install` (user-level),
   and `/ui` plus `/api/admin/*` refuse non-loopback peers, so they cannot be
-  reached from the LAN at all.
+  reached from the LAN directly — but a reverse proxy on the same host
+  presents a loopback peer and an allow-listed Host, so it has to map `/mcp`
+  and `/healthz` only.
 
 ### Fixed
 

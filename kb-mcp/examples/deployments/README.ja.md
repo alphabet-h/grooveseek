@@ -9,7 +9,7 @@ kb-mcp の代表的な 3 パターンの運用例。各サブディレクトリ�
 | シナリオ | 想定 | トランスポート | indexer マシン数 |
 | --- | --- | --- | --- |
 | [`personal/`](./personal/) | 単一ユーザ / 1 セッション / ローカル KB | stdio | 1 (このマシン) |
-| [`nas-shared/`](./nas-shared/) | KB は NAS、複数マシンから読む | stdio (クライアント側) | 1 (専属 indexer) |
+| [`nas-shared/`](./nas-shared/) | KB ファイルは NAS、index は各マシンがローカルに持つ | stdio (各マシン) | 全マシン |
 | [`intranet-http/`](./intranet-http/) | 社内サーバ、複数ユーザ同時利用 | Streamable HTTP | 1 (サーバ機) |
 
 **単一ユーザ / 複数 Claude Code セッション並行** (= 1 マシンで複数プロジェクト並行で開きたい場合)、旧 `personal-http/` レシピは v0.8.0 で廃止。代わりに同梱の service installer を使う:
@@ -37,7 +37,8 @@ KB の利用者は自分だけ？
         │   └── はい → intranet-http/  (1 サーバ : 多クライアント)
         │
         └── クライアントは stdio で済ませたい (各自で kb-mcp serve を持つのが面倒)?
-            └── nas-shared/  (KB をマウント、SQLite 制約に注意)
+            └── nas-shared/  (KB ファイルを共有し、index は各マシンが
+                             ローカルに持つ — SQLite WAL はホストを跨げない)
 ```
 
 ## 共通の注意点

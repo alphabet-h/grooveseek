@@ -154,14 +154,26 @@ peer address to be loopback, so a LAN client gets 403 there even when its Host
 header is allow-listed. Use them by SSH-forwarding a port to the server
 (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) rather than by opening them up.
 
+> **A reverse proxy on the same host defeats that check.** kb-mcp then sees
+> the proxy's loopback address as the peer, and a plain `proxy_pass
+> http://127.0.0.1:3100` also sends `Host: 127.0.0.1:3100` — which is in the
+> admin allow-list, since that list is the loopback aliases plus the bind
+> address. Both gates pass and the admin UI is served to whoever reached the
+> proxy. **Map only `/mcp` and `/healthz` in the proxy**, and leave `/ui` and
+> `/api/admin/` unmapped (or return 403 for them). If you expose them on
+> purpose, the proxy's own authentication is then the only thing standing in
+> front of index rebuilds and daemon status.
+
 If you need authentication today, the canonical recipe is:
 
 ```
 [Internet / VPN] → nginx (TLS + basic auth) → 127.0.0.1:3100 → kb-mcp
 ```
 
-Bind kb-mcp to `127.0.0.1:3100` in `kb-mcp.toml`, configure nginx to
-proxy `/mcp` and `/healthz` with `proxy_set_header Host $host` etc.
+Bind kb-mcp to `127.0.0.1:3100` in `kb-mcp.toml`, and configure nginx to
+proxy **`/mcp` and `/healthz` only** — not `/ui`, not `/api/admin/` (see the
+warning above). Forward the client's Host (`proxy_set_header Host $host;`)
+and list that name in `[transport.http].allowed_hosts`.
 
 ### `alwaysLoad: true` (client-side)
 
