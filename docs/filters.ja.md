@@ -17,6 +17,8 @@
 | `tags_all` | string[] | `["draft"]` | AND — 全 tag が一致 |
 | `date_from` | string | `"2026-01-01"` | hit.date >= from (lex 比較) |
 | `date_to` | string | `"2026-12-31"` | hit.date <= to (lex 比較) |
+| `min_quality` | number | `0.5` | quality filter の閾値 (`[quality_filter].threshold`) をこの呼び出しだけ上書き |
+| `include_low_quality` | bool | `true` | この呼び出しでは quality filter を無効化 (`min_quality: 0.0` と等価、意図が明示的) |
 | `min_confidence_ratio` | number | `1.5` | `low_confidence` フラグの閾値 |
 
 ## `path_globs`
@@ -77,10 +79,11 @@ score が他と比べて **目立って高くない** ときに `true` になる
 ```
 low_confidence ⇔ (results.len() >= 2)
                  AND (mean(scores) > 0.0)
-                 AND (top1.score / mean(scores) < min_confidence_ratio)
+                 AND (max(scores) / mean(scores) < min_confidence_ratio)
 ```
 
-- 既定値 `min_confidence_ratio = 1.5` (top1 は平均の 1.5 倍以上必要)
+- 分子は `max(scores)` であって **`results[0].score` ではない**。返却順が score 降順でない場合に両者は食い違う — MMR は多様性のために並べ替えるので、まさにそのケース
+- 既定値 `min_confidence_ratio = 1.5` (最高 score が平均の 1.5 倍以上必要)
 - `0.0` で判定を完全無効化
 - リクエスト単位で `min_confidence_ratio` パラメータで上書き可、グローバル
   既定は `kb-mcp.toml`:

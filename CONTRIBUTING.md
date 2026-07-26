@@ -8,7 +8,7 @@ Thanks for considering a contribution! This document covers the essentials of wo
 
 - Rust stable (edition 2024)
 - Git
-- ~3 GB of disk space for ONNX model caches when running ignored tests
+- ~4.7 GB of disk space for ONNX model caches when running ignored tests (BGE-small ~130 MB + BGE-M3 ~2.3 GB + BGE-reranker-v2-m3 ~2.3 GB)
 
 ## First-time setup
 
@@ -27,6 +27,8 @@ cargo build --release      # Release binary at target/release/kb-mcp(.exe)
 cargo check --all-targets  # Quick type check
 cargo test                 # Unit + integration tests (no model download)
 cargo test -- --ignored    # Includes embedding / reranker tests that download models
+cargo test -p kb-mcp --lib <name>  # One test by name (the workspace has several crates,
+                                  # and `--lib` skips the integration-test binaries)
 ```
 
 `cargo test -- --ignored` downloads ONNX models on first run (BGE-small ~130 MB, BGE-M3 ~2.3 GB, BGE-reranker-v2-m3 ~2.3 GB). The models are cached per OS conventions — see the README's "Working around HuggingFace TLS failures" section if your network blocks the download.
@@ -39,19 +41,26 @@ cargo test -- --ignored    # Includes embedding / reranker tests that download m
 
 ## Repository layout
 
-- `src/parser/` — `Parser` trait + `Registry` (one impl per file format)
-- `src/indexer.rs` — `walkdir` → parse → embed → store pipeline
-- `src/db.rs` — SQLite + sqlite-vec + FTS5 storage, `search_hybrid` (RRF, k=60)
-- `src/embedder.rs` — `fastembed-rs` wrapper (embeddings + cross-encoder rerankers)
-- `src/mmr.rs` — MMR diversity re-rank (`mmr_select`, v0.7.0+)
-- `src/parent.rs` — Parent retriever content expansion (`apply_parent_retriever`, v0.7.0+)
-- `src/server.rs` — `rmcp::ServerHandler` with six MCP tools
-- `src/transport/` — stdio and Streamable HTTP transports
-- `src/watcher.rs` — `notify-debouncer-full`-based incremental reindex
-- `src/schema.rs` — frontmatter schema validation
-- `src/quality.rs` / `src/graph.rs` — quality filter + BFS connection graph
-- `src/eval.rs` — optional retrieval-quality evaluation for `kb-mcp eval`
-- `src/config.rs` — `kb-mcp.toml` 4-tier discovery / merge with CLI overrides
+- `kb-mcp/src/parser/` — `Parser` trait + `Registry` (one impl per file format)
+- `kb-mcp/src/indexer.rs` — `walkdir` → parse → embed → store pipeline
+- `kb-mcp/src/db.rs` — SQLite + sqlite-vec + FTS5 storage, `search_hybrid` (RRF, k=60)
+- `kb-mcp/src/embedder.rs` — `fastembed-rs` wrapper (embeddings + cross-encoder rerankers)
+- `kb-mcp/src/mmr.rs` — MMR diversity re-rank (`mmr_select`, v0.7.0+)
+- `kb-mcp/src/parent.rs` — Parent retriever content expansion (`apply_parent_retriever`, v0.7.0+)
+- `kb-mcp/src/server.rs` — `rmcp::ServerHandler` with six MCP tools
+- `kb-mcp/src/transport/` — stdio and Streamable HTTP transports
+- `kb-mcp/src/watcher.rs` — `notify-debouncer-full`-based incremental reindex
+- `kb-mcp/src/schema.rs` — frontmatter schema validation
+- `kb-mcp/src/quality.rs` / `kb-mcp/src/graph.rs` — quality filter + BFS connection graph
+- `kb-mcp/src/eval.rs` — optional retrieval-quality evaluation for `kb-mcp eval`
+- `kb-mcp/src/config.rs` — `kb-mcp.toml` 4-tier discovery / merge with CLI overrides
+- `kb-mcp/src/markdown.rs` — backward-compatible shim re-exporting `parser::markdown`
+- `kb-mcp/src/indexer/progress.rs` — per-file progress output for `kb-mcp index` (`--quiet` / `--progress`)
+- `kb-mcp/src/service/` — `kb-mcp service install/uninstall/status` (systemd-user / LaunchAgent / Task Scheduler)
+- `kb-mcp/src/tune.rs` — `kb-mcp tune` fusion-parameter sweep
+- `crates/kb-mcp-tray/` — Windows system-tray monitor (`kb-mcp-tray.exe`, v0.9.0+)
+- `crates/kb-mcp-svc/` — Windows hidden-console launcher started by the scheduled task (v0.9.1+)
+- `kb-mcp/tests/` — integration tests; `kb-mcp/benches/` — criterion benchmarks
 
 See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.
 
