@@ -17,6 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    # 既定は 360 分 = ハングした job が runner を 6 時間占有する。直近 40 run の
+    # 実測 worst case は windows の 6.5 分なので、cold cache (rust-cache miss +
+    # BGE-small ~130 MB の DL) を見込んでも 30 分あれば余裕がある。
+    timeout-minutes: 30
     env:
       # Force a uniform, cacheable model-cache path on all 3 OSes
       # (resolve_cache_dir honors FASTEMBED_CACHE_DIR first).
@@ -25,11 +29,30 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # key に Cargo.lock のハッシュを含めるのは、`actions/cache` が
+      # **既存 key を上書き保存しない**ため (実機ログ: `Cache hit occurred on
+      # the primary key ..., not saving cache.`)。key が content 非依存だと、
+      # 一度保存された archive が以後ずっと復元され続け、fastembed / ort を
+      # bump してモデルの版が変わっても古い tree が居座る。job は green の
+      # まま古いモデルで検査することになるので、Cargo.lock を混ぜて自然に
+      # 回転させる。`-v1-` は、中身の構成を変えた時に手で回すための版数。
+      #
+      # prefix は nightly.yml (`fastembed-v4-...`) と **意図的に分けてある**。
+      # nightly は BGE-M3 と reranker を含む ~2.7 GB を保存するので、同じ key に
+      # すると先に終わった側が key を取った時点でもう一方は保存できなくなる
+      # (nightly.yml の coverage job のコメント参照)。
+      #
+      # `restore-keys` は **意図的に付けない**。prefix fallback を許すと、部分
+      # hit した run が古い中身をそのまま新しい key で保存し直すため、上で
+      # 入れた回転が骨抜きになる。ここで要るのは BGE-small (~130 MB) だけで、
+      # miss した日に素直に DL させても割に合う。nightly が restore-keys を
+      # 持つのは 2.7 GB の再取得が現実的でないからで、事情が違う。
       - name: Cache embedding models (fastembed)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .fastembed_cache
-          key: fastembed-bge-small-${{ runner.os }}
+          key: fastembed-bge-small-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: cargo check
         run: cargo check --all-targets
       - name: Pre-warm embedding model cache (serial)
@@ -50,6 +73,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    # 実測 worst case は windows の 3.3 分。cold compile を見込んで 20 分。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -61,6 +86,8 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    # 実測 0.2 分。toolchain の導入がほぼ全てなので 10 分で十分。
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
