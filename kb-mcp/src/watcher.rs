@@ -308,10 +308,19 @@ fn handle_events(state: &WatcherState, events: &[DebouncedEvent]) {
                 else {
                     continue;
                 };
-                if !should_process(&new_rel, to, state) && !should_process(&old_rel, from, state) {
-                    continue;
+                // 両端の可否で 3 分岐する (codex P2 on PR #81)。以前は
+                // 「どちらかが通れば rename」だったため、index 済みファイルを
+                // `.git/` や `node_modules/` へ rename すると
+                // `rename_single_file` が **denylist 配下の新パスへ DB を
+                // 書き換えて残す**。除外したはずのファイルが index に居座る。
+                let old_ok = should_process(&old_rel, from, state);
+                let new_ok = should_process(&new_rel, to, state);
+                match rename_action(old_ok, new_ok) {
+                    RenameAction::Rename => dispatch_rename(state, &old_rel, &new_rel),
+                    RenameAction::Deindex => dispatch_deindex(state, &old_rel),
+                    RenameAction::Reindex => dispatch_reindex(state, &new_rel),
+                    RenameAction::Skip => continue,
                 }
-                dispatch_rename(state, &old_rel, &new_rel);
             }
             Classified::Reindex(paths) => {
                 for p in paths {
@@ -336,10 +345,58 @@ fn handle_events(state: &WatcherState, events: &[DebouncedEvent]) {
     }
 }
 
-/// 対象ファイルの拡張子が `registry` にあり、`exclude_dirs` 配下でないこと。
+/// rename event の両端が処理対象かどうかから、取るべき動作を決める。
+#[derive(Debug, PartialEq, Eq)]
+enum RenameAction {
+    /// 両端とも対象 = DB のパスを付け替える。
+    Rename,
+    /// 対象領域から除外領域へ出て行った = 追跡をやめる。
+    Deindex,
+    /// 除外領域から対象領域へ入ってきた = 新規として取り込む。
+    Reindex,
+    /// 両端とも対象外 = 何もしない。
+    Skip,
+}
+
+/// [`RenameAction`] の決定。純関数として切り出してあるのは、以前ここが
+/// 「どちらか一方が対象なら `dispatch_rename`」だったため、index 済み
+/// ファイルを `.git/` や `node_modules/` へ rename すると **denylist 配下の
+/// 新パスへ DB を書き換えて残していた** から (codex P2 on PR #81)。
+fn rename_action(old_ok: bool, new_ok: bool) -> RenameAction {
+    match (old_ok, new_ok) {
+        (true, true) => RenameAction::Rename,
+        (true, false) => RenameAction::Deindex,
+        (false, true) => RenameAction::Reindex,
+        (false, false) => RenameAction::Skip,
+    }
+}
+
+/// 対象ファイルの拡張子が `registry` にあり、除外対象でないこと。
+///
+/// `WatcherState` のうち `registry` / `exclude_dirs` しか見ないので、判定本体は
+/// [`should_process_parts`] に切り出してある (test から `Database` / `Embedder`
+/// のダミー構築なしに **本番と同一のロジック** を叩けるようにするため)。
 fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
+    should_process_parts(rel, full, &state.registry, &state.exclude_dirs)
+}
+
+/// [`should_process`] の判定本体。
+fn should_process_parts(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    exclude_dirs: &[String],
+) -> bool {
     // 除外ディレクトリ配下は無視 (rebuild_index と同じ扱い)
-    if is_under_excluded_dir(rel, &state.exclude_dirs) {
+    if is_under_excluded_dir(rel, exclude_dirs) {
+        return false;
+    }
+    // ユーザ設定に関わらず常に skip する denylist (`.git` / `node_modules` 等)。
+    // full-audit 2026-07-26 AU-03: `collect_source_files` (indexer) と
+    // `validate_collect_md_files` (main) は適用済みだったが watcher だけ
+    // 抜けており、`exclude_dirs` を絞った設定では **live watcher だけが**
+    // `.git/` や `node_modules/` を index していた (`npm install` で KB 汚染)。
+    if rel.split('/').any(indexer::is_hardcoded_excluded) {
         return false;
     }
     // `.kb-mcp.db*` は kb_path の外にあるので通常ヒットしないが念のため
@@ -354,8 +411,7 @@ fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
         return false;
     }
     let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-    state
-        .registry
+    registry
         .extensions()
         .iter()
         .any(|e| e.eq_ignore_ascii_case(ext))
@@ -508,31 +564,66 @@ mod tests {
     /// `exclude_dirs` しか見ないので、test 用にその 3 つだけ差し込んだ
     /// 軽量判定ヘルパを用意する (`Database` / `Embedder` のダミー構築を
     /// 避けるため)。
+    ///
+    /// full-audit 2026-07-26 (H-1): 以前はここに本番 `should_process` の
+    /// 逐語コピーが置かれており、**テストがコピーだけを検証していて本番の
+    /// skip ルールを変えても全部 green のまま**だった。判定本体を
+    /// `should_process_parts` に切り出し、ここは委譲だけにすることで、
+    /// 既存 assert を 1 文字も変えずにテストが本番経路を踏むようにした。
     fn should_process_lite(
         rel: &str,
         full: &Path,
         registry: &Registry,
         exclude_dirs: &[String],
     ) -> bool {
-        if is_under_excluded_dir(rel, exclude_dirs) {
-            return false;
-        }
-        if rel.ends_with(".kb-mcp.db") || rel.ends_with(".kb-mcp.db-journal") {
-            return false;
-        }
-        let name = full.file_name().unwrap_or_default().to_string_lossy();
-        if indexer::is_office_lock_file(name.as_ref()) {
-            return false;
-        }
-        let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-        registry
-            .extensions()
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(ext))
+        should_process_parts(rel, full, registry, exclude_dirs)
     }
 
     fn default_exclude_dirs() -> Vec<String> {
         vec![".obsidian".to_string()]
+    }
+
+    /// Regression (codex P2 on PR #81): rename の両端で可否が食い違うとき、
+    /// 以前は「どちらか一方が対象なら rename」だったため、index 済み
+    /// ファイルを `.git/` や `node_modules/` へ rename すると
+    /// `rename_single_file` が denylist 配下の新パスへ DB を書き換えて残した。
+    /// 除外したはずのファイルが index に居座る。
+    #[test]
+    fn test_rename_action_covers_both_endpoints() {
+        assert_eq!(rename_action(true, true), RenameAction::Rename);
+        // 対象 → 除外領域: 追跡をやめる (以前はここが Rename だった)
+        assert_eq!(rename_action(true, false), RenameAction::Deindex);
+        // 除外領域 → 対象: 新規として取り込む (以前はここも Rename)
+        assert_eq!(rename_action(false, true), RenameAction::Reindex);
+        assert_eq!(rename_action(false, false), RenameAction::Skip);
+    }
+
+    /// Regression (full-audit 2026-07-26 AU-03): `HARDCODED_EXCLUDE_DIRS` は
+    /// ユーザ設定に関わらず常に効く denylist だが、`collect_source_files`
+    /// (indexer) と `validate_collect_md_files` (main) だけが適用しており
+    /// **watcher は素通し**だった。`exclude_dirs` を空にした設定では、フル
+    /// index が skip する `.git/` `node_modules/` を live watcher だけが
+    /// 拾ってしまう (`npm install` 一発で KB が汚染される)。
+    #[test]
+    fn test_should_process_applies_hardcoded_excludes_even_with_empty_config() {
+        let reg = Registry::defaults();
+        let empty: Vec<String> = Vec::new();
+        // HARDCODED_EXCLUDE_DIRS = [".git", ".svn", "node_modules"]。
+        for rel in [
+            "node_modules/pkg/README.md",
+            ".git/COMMIT_EDITMSG.md",
+            ".svn/entries.md",
+            "sub/node_modules/deep/x.md",
+        ] {
+            let full = Path::new("/tmp/kb").join(rel);
+            assert!(
+                !should_process_lite(rel, &full, &reg, &empty),
+                "{rel} must be skipped by the hardcoded denylist regardless of exclude_dirs"
+            );
+        }
+        // denylist に無い通常ファイルは従来どおり通す。
+        let ok = Path::new("/tmp/kb/notes/a.md");
+        assert!(should_process_lite("notes/a.md", ok, &reg, &empty));
     }
 
     #[test]

@@ -9,6 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
+/// sqlite-vec の KNN query が受理する `k` の固定上限。これを超えると
+/// `k value in knn query too large, provided N and the limit is 4096` の
+/// SQL error になるため、`fetch_k` は必ずこの値以下に clamp する。
+/// (full-audit 2026-07-26: `FILTER_OVERFETCH_CAP` がこの上限を超えており、
+/// 既定 quality filter 有効時に `--limit 82` 以上が全滅していた)
+const VEC_KNN_MAX_K: u32 = 4096;
+
 /// Fusion (RRF + FTS5 bm25 column weight) の実行時パラメータ。
 ///
 /// feature-47 以前はすべてコンパイル時定数だった。`[search.fusion]` から
@@ -1582,7 +1589,14 @@ impl Database {
                 .min(FILTER_OVERFETCH_CAP)
         } else {
             limit
-        };
+        }
+        // sqlite-vec の KNN は `k` に固定上限 (4096) を持ち、超えると
+        // "k value in knn query too large" の SQL error になる。
+        // full-audit 2026-07-26 で発覚: 既定の min_quality=0.3 は
+        // `has_any()` を true にするので over-fetch が効き、`--limit 82` 以上の
+        // 検索が released v0.13.0 でも常にこのエラーで失敗していた
+        // (82*5*10 = 4100 > 4096)。候補が減るだけの degrade に倒す。
+        .min(VEC_KNN_MAX_K);
         let embedding_json = serde_json::to_string(query_embedding)?;
         let sql = "
             SELECT v.chunk_id, v.distance,
@@ -1615,7 +1629,13 @@ impl Database {
             ))
         })?;
 
-        let mut out = Vec::with_capacity(limit as usize);
+        // 事前確保は **SQL に渡した `fetch_k`** を基準にする。`limit` は
+        // 呼び出し側で cap されない値が来うるため、これを直接使うと
+        // `Vec::with_capacity(u32::MAX)` = allocation abort になる
+        // (full-audit 2026-07-26 AU-01: 実機で 927 GB 確保を試みて即死)。
+        // `fetch_k` は上の `FILTER_OVERFETCH_CAP` clamp を通っており、
+        // filter 無しの経路でも `FILTER_OVERFETCH_CAP` を上限として扱う。
+        let mut out = Vec::with_capacity(fetch_k.min(FILTER_OVERFETCH_CAP) as usize);
         for row in rows {
             let (
                 chunk_id,
@@ -5459,6 +5479,42 @@ mod tests {
             h[0].1.path, c[0].1.path,
             "heading-heavy and content-heavy weights must pick different top hits"
         );
+    }
+
+    /// Regression (full-audit 2026-07-26): over-fetch 後の `fetch_k` は
+    /// sqlite-vec の KNN 上限 (4096) を超えてはならない。超えると
+    /// "k value in knn query too large" の SQL error になる。
+    /// 既定の `min_quality = 0.3` は `has_any()` を true にするため、
+    /// released v0.13.0 では **`--limit 82` 以上の検索が全て失敗**していた
+    /// (82 * FILTER_OVERFETCH_FACTOR(10) * 5 = 4100 > 4096)。
+    #[test]
+    fn test_vec_candidates_clamp_fetch_k_to_sqlite_vec_limit() {
+        let db = db_with_384();
+        let doc = db
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc,
+            0,
+            None,
+            None,
+            "hello",
+            None,
+            &dummy_embedding(0.1),
+            1.0,
+        )
+        .unwrap();
+
+        // filter あり (min_quality > 0.0) で over-fetch を発動させ、
+        // FILTER_OVERFETCH_CAP (10_000) まで膨らむ limit を渡す。
+        let filters = SearchFilters {
+            min_quality: 0.5,
+            ..Default::default()
+        };
+        let hits = db
+            .search_vec_candidates(&dummy_embedding(0.1), 100_000, &filters)
+            .expect("fetch_k must be clamped below the sqlite-vec KNN limit");
+        assert!(hits.len() <= VEC_KNN_MAX_K as usize);
     }
 
     #[test]

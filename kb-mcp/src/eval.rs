@@ -746,6 +746,32 @@ pub fn default_history_path(kb_path: &Path) -> PathBuf {
     kb_path.join(".kb-mcp-eval-history.json")
 }
 
+/// eval が実際に使う `limit` と報告する `k` のリストを、検索経路の実効値に
+/// 揃える。
+///
+/// `run_search_pipeline` は `limit` を [`crate::server::SEARCH_LIMIT_MAX`] に
+/// clamp するので、eval のメタデータだけ生の値を持つと (codex P2 on PR #81)
+/// `--limit 1001` と `--limit 2000` が同一 retrieval なのに fingerprint 違いで
+/// history 比較から外れ、上限超えの `k` は「`@k` と表示されているが実際は
+/// 上限件数から計算した」metric として無警告で出る。
+///
+/// ただし `k` は **グローバル上限に対してのみ** 丸める。要求 `limit` で丸めては
+/// いけない — `max_k` は「要求された k が limit より大きければ取得深度を
+/// 引き上げる」設計なので `--limit 5 --k 10` は 10 件取得して @10 を報告するのが
+/// 正しい (codex P2 round 3 で一度この退行を入れた)。
+///
+/// 丸めで重複した k は sort + dedup する。`[1001, 2000]` が `[1000, 1000]` の
+/// まま fingerprint に残ると、同一結果になる `[1000]` の run と history 互換に
+/// ならないため。
+pub fn normalize_eval_limit_and_k(limit: u32, k_values: &[usize]) -> (u32, Vec<usize>) {
+    let cap = crate::server::SEARCH_LIMIT_MAX as usize;
+    let limit = crate::server::clamp_search_limit(limit);
+    let mut k_values: Vec<usize> = k_values.iter().map(|k| (*k).min(cap)).collect();
+    k_values.sort_unstable();
+    k_values.dedup();
+    (limit, k_values)
+}
+
 /// Golden を読み、search_hybrid で評価し、EvalRun を返す。履歴書き込みは呼び出し側責務。
 pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     let golden_bytes = std::fs::read(&opts.golden_path)
@@ -778,13 +804,19 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         None
     };
 
-    let max_k = opts
-        .k_values
+    let (limit, k_values) = normalize_eval_limit_and_k(opts.limit, &opts.k_values);
+    if limit != opts.limit {
+        eprintln!(
+            "kb-mcp eval: note — limit {} exceeds the retrieval cap; using {limit}",
+            opts.limit
+        );
+    }
+    let max_k = k_values
         .iter()
         .copied()
         .max()
         .unwrap_or(10)
-        .max(opts.limit as usize);
+        .max(limit as usize);
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
         let qid =
@@ -837,7 +869,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
                 score: h.score,
             })
             .collect();
-        let metrics = compute_query_metrics(&q.expected, &top_k, &opts.k_values);
+        let metrics = compute_query_metrics(&q.expected, &top_k, &k_values);
         per_query.push(QueryResult {
             id: qid,
             query: q.query.clone(),
@@ -847,7 +879,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         });
     }
 
-    let aggregate = aggregate_metrics(&per_query, &opts.k_values);
+    let aggregate = aggregate_metrics(&per_query, &k_values);
 
     // ConfigFingerprint.{mmr,parent_retriever} are built from the **effective**
     // resolved config (toml + per-call overrides), not just the toml. This
@@ -894,8 +926,8 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             } else {
                 None
             },
-            limit: opts.limit,
-            k_values: opts.k_values.clone(),
+            limit,
+            k_values: k_values.clone(),
             golden_hash,
             metric_version: METRIC_VERSION,
             mmr: mmr_fp,
@@ -1795,6 +1827,58 @@ mod tests {
         let prev = synthetic_run(map_one(5, f64::NAN), 0.6, map_one(10, 0.5), "h");
         let now = synthetic_run(map_one(5, 0.0), 0.6, map_one(10, 0.5), "h");
         assert!(!is_regression(&now, &prev, 0.05));
+    }
+
+    /// Regression (codex P2 on PR #81): eval のメタデータは検索経路の実効値に
+    /// 揃える。揃えないと `--limit 1001` と `--limit 2000` が同じ retrieval なのに
+    /// fingerprint 違いで history 比較から外れ、上限超えの `k` は「@k と表示
+    /// されているが実際は上限件数から計算した」metric になる。
+    #[test]
+    fn test_normalize_eval_limit_and_k_matches_the_retrieval_cap() {
+        let cap = crate::server::SEARCH_LIMIT_MAX;
+        // 上限超えの limit と k は cap に丸まる = 1001 と 2000 が同一値になる。
+        let (l1, k1) = normalize_eval_limit_and_k(1001, &[1, 5, 2000]);
+        let (l2, k2) = normalize_eval_limit_and_k(2000, &[1, 5, 5000]);
+        assert_eq!(l1, cap);
+        assert_eq!(l1, l2, "equivalent runs must share the effective limit");
+        assert_eq!(k1, vec![1, 5, cap as usize]);
+        assert_eq!(k1, k2, "equivalent runs must share the effective k list");
+        // 上限内はそのまま素通し。
+        let (l3, k3) = normalize_eval_limit_and_k(10, &[1, 5, 10]);
+        assert_eq!(l3, 10);
+        assert_eq!(k3, vec![1, 5, 10]);
+    }
+
+    /// Regression (codex P2 round 3 on PR #81): `k` を要求 `limit` に対して
+    /// 丸めてはいけない。`max_k` は「k > limit なら取得深度を引き上げる」設計
+    /// なので、`--limit 5 --k 10` は 10 件取得して @10 を報告するのが正しい。
+    #[test]
+    fn test_normalize_eval_keeps_k_above_the_requested_limit() {
+        let (limit, k) = normalize_eval_limit_and_k(5, &[10]);
+        assert_eq!(limit, 5);
+        assert_eq!(
+            k,
+            vec![10],
+            "k must not be clamped down to the requested limit"
+        );
+    }
+
+    /// Regression (codex P2 round 3 on PR #81): 上限で丸めた結果できる重複は
+    /// 潰す。`[1001, 2000]` が `[1000, 1000]` のまま fingerprint に残ると、
+    /// 同一結果の `[1000]` run と history 互換にならない。
+    #[test]
+    fn test_normalize_eval_dedups_k_collapsed_by_the_cap() {
+        let cap = crate::server::SEARCH_LIMIT_MAX as usize;
+        let (_, collapsed) = normalize_eval_limit_and_k(10, &[1001, 2000]);
+        let (_, plain) = normalize_eval_limit_and_k(10, &[cap]);
+        assert_eq!(collapsed, vec![cap]);
+        assert_eq!(
+            collapsed, plain,
+            "equivalent k lists must normalize identically"
+        );
+        // 順序も正規化する (同じ集合なら同じ fingerprint になるように)。
+        let (_, unsorted) = normalize_eval_limit_and_k(10, &[10, 1, 5, 5]);
+        assert_eq!(unsorted, vec![1, 5, 10]);
     }
 
     /// History::previous_compatible: fingerprint 一致 → Some。

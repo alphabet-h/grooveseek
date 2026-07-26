@@ -68,9 +68,19 @@ impl Registry {
         self.parsers.iter().map(|p| p.extension()).collect()
     }
 
-    /// True if `ext` (without leading dot, lowercase recommended) is registered.
+    /// True if `ext` (without leading dot) is registered. Case-insensitive,
+    /// matching [`Registry::by_extension`] and the indexer's walker.
+    ///
+    /// full-audit 2026-07-26 AU-02: this used to compare with `==`, while
+    /// every other extension check in the codebase uses
+    /// `eq_ignore_ascii_case`. Because `validate_get_document_path`
+    /// (`server.rs`) gates on this function, `Report.PDF` was indexed by the
+    /// walker but then rejected by `get_document` — a hit users could find
+    /// in search results yet never open.
     pub fn has_extension(&self, ext: &str) -> bool {
-        self.parsers.iter().any(|p| p.extension() == ext)
+        self.parsers
+            .iter()
+            .any(|p| p.extension().eq_ignore_ascii_case(ext))
     }
 
     /// `is_binary()` が true な parser の拡張子だけを返す。indexer の size-skip
@@ -170,5 +180,26 @@ mod tests {
         let mut binary_exts = r.binary_extensions();
         binary_exts.sort_unstable();
         assert_eq!(binary_exts, vec!["docx", "pptx", "xls", "xlsx"]);
+    }
+
+    /// Regression (full-audit 2026-07-26 AU-02): `has_extension` だけが
+    /// case-sensitive で、他の拡張子照合 (`by_extension`、indexer の walker) は
+    /// すべて `eq_ignore_ascii_case`。この非対称のせいで `Report.PDF` は
+    /// **index されるのに `get_document` が拒否する** (server.rs の
+    /// `validate_get_document_path` が `has_extension` を使うため)。
+    /// 大文字拡張子は Windows のメールクライアントやスキャナ出力で日常的に出る。
+    #[test]
+    fn test_has_extension_is_case_insensitive_like_by_extension() {
+        let ids = ["md", "pdf"].map(String::from);
+        let r = Registry::from_enabled(&ids).unwrap();
+        for ext in ["pdf", "PDF", "Pdf", "md", "MD"] {
+            assert!(
+                r.has_extension(ext),
+                "has_extension({ext:?}) must match by_extension's case-insensitive rule"
+            );
+            assert!(r.by_extension(ext).is_some(), "by_extension({ext:?})");
+        }
+        assert!(!r.has_extension("exe"));
+        assert!(!r.has_extension(""));
     }
 }

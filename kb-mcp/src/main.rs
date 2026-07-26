@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "kb-mcp")]
+// full-audit 2026-07-26 AU-59: CONTRIBUTING asks bug reporters to run
+// `kb-mcp --version`, but the flag did not exist and clap answered with
+// `error: unexpected argument '--version' found` (exit 2) — the very first
+// command in the report template failed for everyone.
+#[command(version)]
 #[command(
     about = "MCP server for semantic search over a knowledge base of Markdown and plain-text files",
     long_about = "MCP server for semantic search over a knowledge base of Markdown\n\
@@ -758,6 +763,11 @@ fn main() -> anyhow::Result<()> {
                 mmr_same_doc_penalty: _,
                 parent_retriever: _,
             } = args;
+
+            // AU-01 の clamp は `run_search_pipeline` 内 (= MCP / CLI search /
+            // CLI eval が必ず通る唯一の choke point) に集約してある。ここでは
+            // echo 用の値も実際に使われる値と揃えたいので同じ helper を通す。
+            let limit = kb_mcp::server::clamp_search_limit(limit);
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();

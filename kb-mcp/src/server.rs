@@ -297,7 +297,9 @@ impl KbServer {
         description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query terms."
     )]
     pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
-        let limit = params.limit.unwrap_or(5);
+        // AU-01: 上限なしの `limit` は候補プール → `Vec::with_capacity` へ
+        // 生で流れて allocation abort を起こす。MCP boundary で clamp する。
+        let limit = clamp_search_limit(params.limit.unwrap_or(5));
 
         // feature-28 Task 2.7: per-call MMR override の範囲チェック。
         // 1.5 / -0.1 等の outside-range は MCP boundary で early reject し、
@@ -856,6 +858,14 @@ pub fn run_search_pipeline(
         anyhow::bail!("mmr_same_doc_penalty out of range: {p} (must be 0.0..=1.0)");
     }
 
+    // AU-01: `limit` の clamp は **この関数**で行う。呼び出し側 (MCP search /
+    // CLI search / CLI eval) の各境界で clamp する形にすると、追加した caller が
+    // 漏れる — 実際 codex P1 (PR #81) が「eval だけ生の値を渡していて、
+    // reranker on + MMR off のとき `compute_reranker_input_limit` がそれを
+    // そのまま返し `rerank_candidates_with_ids` の `Vec::with_capacity` で
+    // 落ちる」経路を検出した。3 caller が必ず通る唯一の choke point で閉じる。
+    let limit = clamp_search_limit(limit);
+
     let resolved = overrides.resolve(toml_search);
     // fusion は per-call override を持たない (MMR と違い resolve 機構を
     // 通さない、feature-47 D-6)。toml をそのまま db 層へ渡す。
@@ -1156,6 +1166,26 @@ fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> bool {
 /// truncate するが、上流で reject した方がレスポンスが予測可能になり、
 /// `compute_match_spans` の O(N×M) を query 側からも抑制できる。F-35。
 pub(crate) const SEARCH_QUERY_MAX_BYTES: usize = 1024;
+
+/// `search` が受理する `limit` の上限。
+///
+/// full-audit 2026-07-26 AU-01 (Critical): `limit` は候補プール算出
+/// (`limit * 5`) を経て `Vec::with_capacity` まで生で流れるため、上限が無いと
+/// `{"query":"a","limit":4294967295}` の 1 リクエストで allocation abort
+/// (= panic ではなく catch 不能なプロセス即死) を起こせる。HTTP transport では
+/// 全接続が落ちる。`tune` 側は `MAX_TUNE_K` で同じ罠を塞いである
+/// (feature-47 codex P2 round 4) が、より古い search 経路に残っていた。
+///
+/// 値は「実用上のページング上限」として 1000。KB 全件走査のような用途は
+/// `limit` ではなく `kb-mcp search` の繰り返しか MMR pool 側で扱う。
+pub const SEARCH_LIMIT_MAX: u32 = 1000;
+
+/// `limit` を [`SEARCH_LIMIT_MAX`] に丸める。エラーにせず clamp するのは、
+/// 「多めに要求すると落ちる」より「多めに要求すると上限で返る」方が
+/// MCP client (LLM) にとって回復しやすいため。
+pub fn clamp_search_limit(limit: u32) -> u32 {
+    limit.min(SEARCH_LIMIT_MAX)
+}
 
 /// `validate_get_document_path` の結果。各 fail variant に既存の
 /// `ErrorResponse` を内蔵することで、caller (`get_document` /
@@ -2662,5 +2692,83 @@ mod tests {
             k60[0].1.score,
             k5[0].1.score
         );
+    }
+
+    /// Regression (full-audit 2026-07-26 AU-01, Critical): `limit` は
+    /// `Vec::with_capacity(limit as usize)` (`db.rs`) まで生で流れるため、
+    /// 上限が無いと MCP の `{"query":"a","limit":4294967295}` 1 発で
+    /// allocation abort (= panic ではなく catch 不能な即死) を起こせる。
+    /// 実機再現: `memory allocation of 927712935720 bytes failed`。
+    /// tune 側は `MAX_TUNE_K` で同じ罠を塞いである (feature-47 codex P2 round 4)。
+    #[test]
+    fn test_clamp_search_limit_bounds_absurd_values() {
+        assert_eq!(clamp_search_limit(u32::MAX), SEARCH_LIMIT_MAX);
+        assert_eq!(clamp_search_limit(SEARCH_LIMIT_MAX + 1), SEARCH_LIMIT_MAX);
+        // 上限ちょうどと通常値は素通し。
+        assert_eq!(clamp_search_limit(SEARCH_LIMIT_MAX), SEARCH_LIMIT_MAX);
+        assert_eq!(clamp_search_limit(5), 5);
+        assert_eq!(clamp_search_limit(0), 0);
+    }
+
+    /// 巨大 limit を実際に pipeline へ通しても abort せず、結果件数が
+    /// 上限に収まること (helper だけでなく経路自体を踏む — codex P2 round 4 で
+    /// 「helper しか触っていない」と指摘されたのと同じ穴を作らないため)。
+    #[test]
+    fn test_run_search_pipeline_survives_absurd_limit() {
+        let db = crate::db::Database::open_in_memory().expect("in-memory db");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("verify_embedding_meta");
+        let emb = |v: f32| vec![v; 384];
+        let doc = db
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .unwrap();
+        db.insert_chunk(
+            doc,
+            0,
+            Some("zebrafish"),
+            None,
+            "zebrafish",
+            None,
+            &emb(0.2),
+            1.0,
+        )
+        .unwrap();
+
+        let overrides = crate::config::SearchOverrides::default();
+        let toml = crate::config::SearchConfig::default();
+        let filters = crate::db::SearchFilters::default();
+        // clamp 済みの値ではなく **生の u32::MAX** を渡す。境界の clamp
+        // (`clamp_search_limit`) が外れても db 層の `VEC_KNN_MAX_K` が
+        // 効くこと = 多層防御が成立していることまで含めて固定する。
+        let hits = run_search_pipeline(
+            &db,
+            None,
+            "zebrafish",
+            &emb(0.2),
+            u32::MAX,
+            &filters,
+            &overrides,
+            &toml,
+        )
+        .expect("pipeline must not abort on an absurd limit");
+        assert!(hits.len() <= SEARCH_LIMIT_MAX as usize);
+    }
+
+    /// Regression (codex P1 on PR #81): reranker on + MMR off のとき
+    /// `compute_reranker_input_limit` は `limit` をそのまま返し、それが
+    /// `rerank_candidates_with_ids` の `Vec::with_capacity` に届く。
+    /// clamp を各呼び出し境界ではなく `run_search_pipeline` 内に置くことで、
+    /// この分岐に生の値が入らないことを型ではなく値で固定する。
+    /// (実 reranker はモデル DL が要るため、helper の値だけを直接検証する)
+    #[test]
+    fn test_reranker_input_limit_is_bounded_for_clamped_limit() {
+        let clamped = clamp_search_limit(u32::MAX);
+        // MMR off = `limit` 素通し経路。clamp 済みなので上限以下でなければならない。
+        assert_eq!(
+            compute_reranker_input_limit(false, 50, clamped),
+            SEARCH_LIMIT_MAX
+        );
+        // MMR on 側は pool_size 由来 (feature-28 P1 fix) なので元から有界。
+        assert_eq!(compute_reranker_input_limit(true, 50, clamped), 50);
     }
 }

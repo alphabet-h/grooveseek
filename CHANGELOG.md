@@ -4,6 +4,43 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **`search` accepted an unbounded `limit`, which could abort the process.**
+  The value flowed through the candidate-pool calculation into
+  `Vec::with_capacity`, so a single request — `kb-mcp search --limit
+  4294967295`, or the equivalent MCP call — attempted a ~927 GB allocation
+  and died. Allocation failure aborts rather than panics, so it could not
+  be caught; over the HTTP transport the whole daemon went down with every
+  open connection. `limit` is now clamped to 1000 at both the MCP and CLI
+  boundaries, and the pre-allocation is derived from the already-capped
+  fetch size.
+- **Filtered searches with `limit >= 82` failed outright.** The filter
+  over-fetch cap (10,000) exceeded sqlite-vec's fixed KNN ceiling of 4096,
+  so any search that engaged a filter — including the default
+  `min_quality = 0.3` — errored with "k value in knn query too large". The
+  fetch size is now clamped to the sqlite-vec limit, degrading to fewer
+  candidates instead of failing.
+- **`get_document` rejected files with uppercase extensions.**
+  `Registry::has_extension` matched case-sensitively while the indexer's
+  walker did not, so `Report.PDF` was indexed and returned by search but
+  could not be opened.
+- **The file watcher ignored the built-in exclude list.** `.git`,
+  `.svn`, and `node_modules` are skipped regardless of configuration
+  during a full index, but the watcher only consulted the user's
+  `exclude_dirs`; a narrowed configuration let live edits under those
+  directories reach the index.
+- **`kb-mcp --version` now works.** It previously failed with
+  `error: unexpected argument '--version' found`, despite CONTRIBUTING
+  asking bug reporters to run it first.
+
+### Changed
+
+- Updated `crossbeam-epoch` (0.9.18 → 0.9.20) and `quinn-proto`
+  (0.11.14 → 0.11.16) to clear RUSTSEC-2026-0204 and RUSTSEC-2026-0185.
+- CHANGELOG: added the compare links for every release from 0.7.5 to
+  0.13.0, which had been missing since 0.7.4.
+
 ## [0.13.0] - 2026-07-26
 
 ### Added
@@ -1261,7 +1298,22 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.9.2...v0.10.0
+[0.9.2]: https://github.com/alphabet-h/kb-mcp/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/alphabet-h/kb-mcp/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.8.3...v0.9.0
+[0.8.3]: https://github.com/alphabet-h/kb-mcp/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/alphabet-h/kb-mcp/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/alphabet-h/kb-mcp/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.8...v0.8.0
+[0.7.8]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.7...v0.7.8
+[0.7.7]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/alphabet-h/kb-mcp/compare/v0.7.1...v0.7.2
