@@ -25,6 +25,12 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   processes — so any model initialised after that point resolves to the OS
   default directory instead. BGE-M3 and the reranker load late enough to
   land outside the cached directory. The job now caches both locations.
+- **The nightly coverage job failed intermittently on the same download
+  race.** It had neither a model cache nor a pre-warm step, so every run
+  downloaded BGE-small from cold with several test binaries competing for
+  the lock. It now restores the cache the `ignored-tests` job saves — read
+  only, so it cannot win the key and lock that job's much larger archive
+  out of storage — and pre-warms serially for the days the cache misses.
 
 ### Changed
 

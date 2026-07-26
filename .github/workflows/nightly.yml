@@ -162,6 +162,30 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.8
 
+      # 本 job は cache も pre-warm も持たず、毎回 cold から複数 test binary が
+      # 並列にモデルを DL していたため、ignored-tests job と同じ blob lock 競合で
+      # 断続的に落ちていた (2026-07-26 の dry-run run 30190003925 で再現)。
+      #
+      # **restore 専用** にしてあるのが要点: save も行うと ignored-tests job と
+      # 同じ key を奪い合い、先に終わった本 job (BGE-small だけ ≒ 74 MB) が
+      # key を取ってしまうと、ignored-tests 側の 2.7 GB は
+      # 「既存 key は上書きしない」規則で永久に保存されなくなる。
+      # 本 job は非 ignored テストしか走らせず BGE-small しか要らないので、
+      # ignored-tests job が保存した cache に相乗りするだけでよい。
+      - name: Restore fastembed models (shared with ignored-tests)
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .fastembed_cache
+            ~/.cache/fastembed
+          key: fastembed-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            fastembed-v3-${{ runner.os }}-
+
+      # cache miss の日でも lock 競合で落ちないよう、1 プロセスで先に温める。
+      - name: Pre-warm embedding model cache (serial)
+        run: cargo test --test index_progress_cli -- --test-threads=1
+
       # `cargo test` の non-ignored セット (= unit + integration test、
       # `#[ignore]` 除外) で coverage を取る (~5-10 min)。
       # `--include-ignored` (model DL ~5 GB) は別 job (= ignored-tests)
