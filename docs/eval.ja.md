@@ -164,9 +164,11 @@ v0.13.0 以降はさらに既定値と異なる `[search.fusion]`) が一致し�
 MMR / parent retriever の on/off を切り替えても、fusion パラメータを
 ビルトイン既定値から動かしても fingerprint は変わるので比較対象外となり、
 誤検知にはならない (MMR の有無で recall@k を比較するのは意図的に
-apples-to-oranges)。fusion が既定値のままの実行は、v0.13.0 より前に記録した
-baseline とそのまま比較できる。golden YAML を更新した直後の run も同じ理由で
-比較対象外となる。
+apples-to-oranges)。なお **v0.13.0 より前に記録した history は fusion 設定に関わらず非互換**:
+metric 実装の修正で `metric_version` が 1 → 2 になっており、fingerprint は
+構造体全体で比較されるため。それらの run は比較されず skip されるが、これは
+意図した挙動 (古い数値は別の式で計算されている)。golden YAML を更新した直後の
+run も同じ理由で比較対象外となる。
 
 履歴は exit より前に書き出されるので、今回の run は次回比較用に保存される。
 
@@ -186,14 +188,24 @@ CI 例:
 |---|---|---|
 | `no golden file at ...` | golden YAML が無い | `.kb-mcp-eval.yml` を作成するか `--golden <path>` を渡す |
 | `No index found at ...` | 未 index | `kb-mcp index --kb-path <kb>` を先に走らせる |
-| per-query の `expected path not in index` | `expected` の path が index 内に存在しない | 綴り確認 or 再 index |
+| per-query の `✗ <id>  recall@N: 0.00` | そのクエリの検索結果が `expected` のどのパスにも一致しなかった (typo / 未 index / 本当に取りこぼした、のいずれか) | パスの綴りを確認し、その文書の **中身** にある語句で検索して hit の `path` を見る (パス文字列で検索しても確認にはならない: FTS が張るのは `heading` / `context` / `content` で、embedding にもパスは入らない)。本当の miss なら設定ミスではなく検索結果として扱う |
 | `golden changed since last run, diff disabled` | golden を編集した | 意図通り。次回以降は新 golden で diff される |
 | Model mismatch エラー | `--model` が index 作成時と違う | index 時と同じモデル or 再 index |
 
 ## 非スコープ (意図的)
 
-- **Graded relevance (0 / 1 / 2)**: parse は寛容だが現状は無視
-- **Sweep / Matrix**: モデル比較は別 DB を 2 つ作って 2 回走らせる運用
+- **Graded relevance (0 / 1 / 2)**: 非対応。しかも **黙って無視はしない** — golden の各構造体は `deny_unknown_fields` なので、`relevance:` を書くと評価が始まる前に落ちる:
+
+  ```
+  Error: failed to parse golden file: golden.yaml
+
+  Caused by:
+      unknown field `relevance`, expected `path` or `heading`
+  ```
+- **モデルの Sweep / Matrix**: embedding モデルの比較は別々に index した DB を
+  2 つ作って 2 回走らせる — 1 回の `eval` が測るのは 1 つの index だけ。
+  (**fusion パラメータ**の sweep は 1 つの index に対して可能で、それが次節の
+  `kb-mcp tune`)
 - **必須化**: `eval` は `index` / `serve` / `search` の挙動を 1 バイトも変えない
 
 ## `kb-mcp tune` — fusion パラメータを測る (v0.13.0+)
@@ -221,6 +233,18 @@ tokenizer に投げるため、**クエリが本文に逐語で出現すると�
 - 実効 N が 0 なら診断を stderr に出して grid を実行せず **exit 2** する
 - 実効 N が 50 未満なら「IR 慣行の下限未満であり、結果は示唆であって結論ではない」
   と警告する
+
+もう 1 つの警告は、KB を `[contextual]` off で index した場合に出る (上の実効 N
+チェックの **後** なので、grid に到達した run に限る): 全 chunk の `context` 列が
+空なので、`bm25_context_weight` を 0.5〜4.0 で振ってもスコアは 1 ミリも動かない。
+`[contextual]` は既定 off なので大半の run で出るが、これはパラメータではなく
+index についての説明:
+
+```
+kb-mcp tune: WARNING — every chunk has an empty context column, so the
+bm25_context_weight axis is a no-op on this KB (contextual retrieval is off).
+Its rows below mean "not measured", not "has no effect".
+```
 
 測定可能な golden にするには逐語クエリ (固有名詞・API 名・コマンド名・エラーコード等)
 を含めること。3 文字未満のクエリ (trigram 下限) と `heading:foo` のような column

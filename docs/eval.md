@@ -172,8 +172,11 @@ content hash, the metric implementation version, and (v0.7.0+) the effective
 non-default `[search.fusion]`. Toggling MMR or parent retriever, or moving
 the fusion parameters off their built-in defaults, therefore breaks
 fingerprint compatibility (intentionally — comparing `recall@k` with the
-diversity stage on vs off is apples-to-oranges). Runs at the built-in fusion
-defaults keep comparing cleanly against baselines recorded before v0.13.0.
+diversity stage on vs off is apples-to-oranges). Note that history written **before v0.13.0 is incompatible regardless of
+fusion settings**: `metric_version` went 1 → 2 when the metric implementation
+was corrected, and the fingerprint is compared as a whole. Those runs are
+skipped rather than compared, which is the intended behaviour — the older
+numbers were computed by a different formula.
 Updating the golden file likewise does **not** trigger a false regression
 on the next run; it just means the comparison is skipped.
 
@@ -197,15 +200,24 @@ when the previous run's fingerprint differs.
 |---|---|---|
 | `no golden file at ...` | Missing golden YAML | Create `.kb-mcp-eval.yml` or pass `--golden <path>` |
 | `No index found at ...` | KB not indexed | Run `kb-mcp index --kb-path <kb>` first |
-| `expected path not in index` (per-query) | The path in `expected` does not exist in the index | Check spelling / re-index |
+| `✗ <id>  recall@N: 0.00` (per-query) | Nothing the query retrieved matched this entry's `expected` paths — often a typo, a path that was never indexed, or a genuinely missed document | Check the path spelling, then search for a phrase you know is *inside* that document and look at the `path` of the hits (searching for the path itself proves nothing: FTS indexes `heading` / `context` / `content`, and the embeddings do not include the path either). A real miss is a retrieval result, not a config error |
 | `golden changed since last run, diff disabled` | Golden file edited | Expected; the next run will diff normally |
 | Model mismatch error | `--model` does not match the indexed model | Pass the model used for indexing, or re-index |
 
 ## Non-goals (intentional)
 
-- **Graded relevance (0 / 1 / 2)**: parsed tolerantly but ignored today
-- **Sweeps / matrices**: to compare models, run `eval` twice against two
-  different indexed databases
+- **Graded relevance (0 / 1 / 2)**: not supported, and **not** silently ignored — every golden struct is `deny_unknown_fields`, so a `relevance:` key aborts the run before anything is evaluated:
+
+  ```
+  Error: failed to parse golden file: golden.yaml
+
+  Caused by:
+      unknown field `relevance`, expected `path` or `heading`
+  ```
+- **Sweeps / matrices over models**: to compare embedding models, run `eval`
+  twice against two separately indexed databases — one `eval` run measures one
+  index. (Sweeping the *fusion* parameters against a single index is supported:
+  that is `kb-mcp tune`, described in the next section.)
 - **Mandatory adoption**: running `eval` does not change anything about
   `index` / `serve` / `search`. It is a purely auxiliary tool
 
@@ -237,6 +249,19 @@ there is nothing to measure. `tune` therefore starts with a pre-flight pass:
   without running the grid
 - if the effective N is below 50 it warns that this is under the IR convention
   and the numbers are suggestive rather than conclusive
+
+A second warning fires — **after** the effective-N check above, so only on
+runs that actually reach the grid — whenever the KB was indexed with
+`[contextual]` off: every chunk's `context` column is then empty, so sweeping
+`bm25_context_weight` from 0.5 to 4.0 cannot change any score. Since
+`[contextual]` is off by default, most runs see it, and it is a statement
+about the index rather than about the parameter:
+
+```
+kb-mcp tune: WARNING — every chunk has an empty context column, so the
+bm25_context_weight axis is a no-op on this KB (contextual retrieval is off).
+Its rows below mean "not measured", not "has no effect".
+```
 
 To get a measurable golden set, include verbatim queries: proper nouns, API
 names, command names, error codes. Avoid queries under 3 characters (the

@@ -53,7 +53,7 @@ match_spans  → top-`limit` SearchHit を
 
 ## Stage 1 — Hybrid 候補生成 (常時 on)
 
-`vec_chunks` (sqlite-vec、L2 距離 — sqlite-vec 既定のメトリック) と `fts_chunks` (FTS5 trigram + bm25、既定では見出しに 2 倍重み) からそれぞれ top-N を取り、Rust 側で Reciprocal Rank Fusion (既定 `k = 60`、RRF の標準定数) でマージする。クライアントに返す `score` は RRF スコア (大きいほど良い) で距離ではない。
+`vec_chunks` (sqlite-vec、L2 距離 — sqlite-vec 既定のメトリック) と `fts_chunks` (v0.12.0 以降は `heading` / `context` / `content` の 3 列に対する FTS5 trigram を bm25 でスコアリング、既定では見出しに 2 倍重み) からそれぞれ top-N を取り、Rust 側で Reciprocal Rank Fusion (既定 `k = 60`、RRF の標準定数) でマージする。クライアントに返す `score` は RRF スコア (大きいほど良い) で距離ではない。
 
 RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `kb-mcp.toml` の `[search.fusion]` で設定できる (ビルトイン既定値は `rrf_k = 60.0`、`heading / context / content = 2.0 / 1.0 / 1.0`)。実測の裏付けが無い限り触らないこと — この 2 つのつまみが自分の KB で検索品質をどれだけ (あるいは全く) 動かさないかは `kb-mcp tune` が報告する。詳細は [eval.ja.md](./eval.ja.md) を参照。
 

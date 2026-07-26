@@ -25,7 +25,7 @@ Download the archive for your platform from the [latest GitHub release](https://
 
 Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running.
 
-ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. Embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](#working-around-huggingface-tls-failures) if your network blocks that.
+ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. Embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](#working-around-huggingface-tls-failures-on-first-download) if your network blocks that.
 
 ### Build from source
 
@@ -333,7 +333,7 @@ On next logon the tray icon appears with a colored status dot:
 - **red** — daemon has been unreachable for >= 1 minute (= 12 consecutive failed polls at 5s interval)
 - **gray** — pre-first-poll (= within the first 5 seconds of startup)
 
-Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. Start/Stop/Restart drive the daemon through PowerShell `Start/Stop-ScheduledTask` cmdlets.
+Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. **Start** runs the scheduled task; **Stop** terminates the daemon process by the pid it reports at `/api/admin/status` (v0.13.2+), then confirms it is gone by binding the daemon's address — `Stop-ScheduledTask` only ever stopped the launcher, which exits immediately, so it silently did nothing.
 
 Tray logs live at `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (daily rotation). Set `KB_MCP_TRAY_LOG=debug` for verbose output. Pass `--debug` to attach a console for live stdout/stderr.
 
@@ -703,6 +703,50 @@ Security notes:
 - For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `kb-mcp.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; kb-mcp emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics) — operator-acknowledged opt-out, not recommended for public deployments.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
+### Web UI and admin API (HTTP transport only)
+
+Running `serve` with `--transport http` mounts three more routes beside `/mcp`
+and `/healthz`. Nothing enables them — they exist whenever the HTTP transport
+does — and all three are **loopback-only**: the middleware rejects any request
+whose peer address is not loopback, then checks the `Host` header against the
+loopback aliases (`127.0.0.1`, `::1`, `localhost`) — plus the bind address, but
+only when that is itself loopback. Bind to `0.0.0.0` and `Host: 0.0.0.0` is
+rejected too, deliberately: a LAN browser must not reach these routes through
+the bind address. A machine elsewhere on the network gets 403 even if you
+allow-listed its Host for `/mcp`.
+
+| Route | What it is |
+| --- | --- |
+| `/ui` | A minimal search page (MVP placeholder, to be redesigned): a query box that posts to `/api/search` and lists the hits. It does **not** show daemon status. |
+| `/api/search` | JSON search for the page above — the same hybrid search the MCP `search` tool runs. |
+| `/api/admin/status` | Daemon / indexing / watcher / KB status as JSON. This is what the Windows tray polls every 5 seconds. |
+
+```bash
+curl http://127.0.0.1:3100/api/admin/status
+```
+
+```json
+{
+  "daemon":   { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "2026-07-26T09:12:03Z" },
+  "indexing": { "active": false, "started_at": null, "progress": null },
+  "watcher":  { "active": true, "debounce_ms": 500 },
+  "kb":       { "path": "/srv/kb-mcp/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
+  "config_source": "Cwd"
+}
+```
+
+`/ui` is what the Windows tray's **Open Web UI** menu item opens, but it is not
+Windows-specific. On Linux or macOS, browse to it on the machine running the
+daemon, or forward the port:
+
+```bash
+ssh -L 3100:127.0.0.1:3100 kb-server.lan   # then open http://127.0.0.1:3100/ui
+```
+
+Do **not** map these routes in a reverse proxy: the proxy is itself a loopback
+peer and its default `Host` is allow-listed, so proxying `/ui` hands the page to
+whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
+
 ### Live-sync via file watcher
 `kb-mcp serve` runs a `notify`-based file watcher by default. Any change under `--kb-path` (create / modify / delete / rename) is detected, debounced, and only the affected file is re-indexed. This covers manual editor saves, `git pull`, and external scripts — cases the PostToolUse hook cannot intercept.
 
@@ -780,7 +824,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **Embedding dimensions**: Depends on `--model`. BGE-small-en-v1.5 = 384, BGE-M3 = 1024. The chosen dim is declared on the `vec_chunks` virtual table and recorded in the `index_meta` table; a mismatch at runtime is detected and rejected.
 - **Incremental indexing**: Files are tracked by SHA-256 content hash. Only changed files are re-embedded on subsequent `index` runs (unless `--force` is passed). Moving / renaming a file without modifying its content is detected via hash match and handled as a `documents.path` UPDATE — the existing chunks, embeddings, and FTS rows are reused instead of being rebuilt. The rebuild summary reports the number of renames as `renamed` next to `updated` / `deleted`.
 - **Resilient to unreadable / non-UTF-8 files**: a file that fails to read, exceeds the size cap, or fails to parse is skipped with a warning instead of aborting the whole `index` run — a stray binary file mixed into `--kb-path` no longer breaks indexing for the rest of the knowledge base.
-- **Hybrid search (FTS5 + vector)**: The `search` tool combines SQLite FTS5 full-text search (trigram tokenizer, works for Japanese/CJK too; `heading` column is weighted 2× `content` in bm25) with the vector search via Reciprocal Rank Fusion (k=60). The returned `score` is the RRF score (higher = better), not a distance. Queries shorter than 3 characters fall back to vector-only (below the trigram minimum).
+- **Hybrid search (FTS5 + vector)**: The `search` tool combines SQLite FTS5 full-text search (trigram tokenizer, works for Japanese/CJK too; three columns since v0.12.0 — `heading`, `context`, `content` — with `heading` weighted 2× in bm25 by default) with the vector search via Reciprocal Rank Fusion (`k = 60` by default). Both the weights and `k` are configurable under `[search.fusion]` since v0.13.0, and `kb-mcp tune` measures whether moving them helps on your KB. The returned `score` is the RRF score (higher = better), not a distance. Queries shorter than 3 characters fall back to vector-only (below the trigram minimum).
 - **Optional reranking**: With `--reranker <model>` the top candidates are re-scored by a cross-encoder before being returned. When rerank is applied, `score` is the cross-encoder raw score instead of the RRF value. Reranking is index-independent — you can toggle it at server start without re-indexing.
 - **Connection graph**: `get_connection_graph` / `kb-mcp graph` do BFS over the vector index starting from a document. No extra index is built; every hop runs a fresh sqlite-vec KNN. Bounded by `depth ≤ 3` / `fan_out ≤ 20` with client-side clamping, so worst-case is ~21 KNN queries per request. Scores are cosine similarity approximated from L2 distance (`1 - d²/2`, clamped to `[0,1]`) assuming unit-normalized embeddings (BGE-small / BGE-M3 are normalized internally).
 - **Heading exclusion**: Sections whose heading text contains any of `exclude_headings` are dropped during chunking. The default is an empty list (keep every section); populate `exclude_headings` in `kb-mcp.toml` to opt in. Matching is substring-based (`heading.contains(pattern)`), so short patterns catch suffixed variants (`"参考リンク"` would also match `"## 参考リンク (旧)"`).

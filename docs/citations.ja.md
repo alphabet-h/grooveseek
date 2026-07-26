@@ -29,7 +29,7 @@
 
 | 値 | 意味 |
 |---|---|
-| `null` (key 省略) | 計算していない (現状: query に non-ASCII を含む場合のフォールバック) |
+| `null` (key 省略) | 計算していない。3 ケース: query に non-ASCII を含む / query が空 (whitespace のみを含む) / chunk の `content` が 256 KiB 超 (`MATCH_SPAN_CONTENT_MAX_BYTES`、異常入力での O(N×M) 走査を防ぐガード) |
 | `[]` (空配列) | 計算したが一致箇所なし |
 | `[{...}, ...]` | 計算済み、1 件以上マッチあり |
 
@@ -67,7 +67,7 @@ let snippet = content.get(span.start..span.end).unwrap_or("");
 1. query を whitespace で分割し term の配列にする
 2. query / content を ASCII-fold case-insensitive で小文字化
 3. 各 term を `content` 内で substring 検索 (case-insensitive)
-4. 全マッチ位置を start byte 順にソート + 重複除去
+4. マッチ位置を start byte 順にソート + 重複除去。**1 chunk あたり 100 件で打ち切る** (`MATCH_SPAN_MAX_COUNT`) ので、1 文字 term × 巨大 chunk でレスポンスが膨れない
 
 ## non-ASCII query の扱い
 
