@@ -108,7 +108,8 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 `kb-mcp` CLI は **stdout = データ出力 / stderr = 進捗** の規約に従う:
 
-- **stdout** は machine-parseable な data 出力のみ:
+- **stdout** = そのコマンドの *結果* を、指定された形式で出す。machine-parseable
+  なのは `--format json` の時だけで、以下はすべて既定が human-readable な text:
   - `kb-mcp search` の結果 (`print_search_results`)
   - `kb-mcp eval` の golden query 評価結果
   - `kb-mcp tune` の sweep 結果
@@ -121,7 +122,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
   - `kb-mcp service install/uninstall/status/list` の全 message は stderr (= status / progress / 診断、規約準拠)。stdout は空。
   - すべての `tracing` / `eprintln!` 系診断メッセージ
 
-新規 subprocess test を書く場合は、`kb-mcp/src/main.rs` の対応する `Commands::*` block を grep して、その subcommand が stdout / stderr のどちらに書くかを必ず先に確認する。**arm 自身ではなく helper (`print_search_results` / `print_graph` / `print_validate_report`) が出力している場合がある**点に注意。stdout に書くのは上記 5 つだけで、`index` / `status` / `serve` / `service` は stderr のみ。
+新規 subprocess test を書く場合は、`kb-mcp/src/main.rs` の対応する `Commands::*` block を grep して、その subcommand が stdout / stderr のどちらに書くかを必ず先に確認する。**arm 自身ではなく helper (`print_search_results` / `print_graph` / `print_validate_report`) が出力している場合がある**点に注意。stdout に *CLI の結果* を書くのは上記 5 つだけで、`index` / `status` / `service` は stderr のみ。`serve` は別枠: CLI 出力は無いが、既定の stdio transport では **MCP プロトコル自体** が stdout を占有する (subprocess harness が drain し続けねばならないのはこのため)。grep は `println!` だけでなく **`print!` も** 対象にすること — `eval` / `tune` の text 分岐はそちらを使っている。
 
 ## 主要な依存
 

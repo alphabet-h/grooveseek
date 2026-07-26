@@ -109,7 +109,9 @@ If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS ins
 
 The `kb-mcp` CLI follows a **stdout = data, stderr = progress** convention:
 
-- **stdout** is reserved for machine-parseable data output:
+- **stdout** carries the command's *result*, in whatever format was asked for.
+  It is machine-parseable only with `--format json`; every one of these
+  defaults to human-readable text:
   - `kb-mcp search` results (`print_search_results`)
   - `kb-mcp eval` golden-query evaluation results
   - `kb-mcp tune` sweep results
@@ -122,7 +124,7 @@ The `kb-mcp` CLI follows a **stdout = data, stderr = progress** convention:
   - `kb-mcp service install/uninstall/status/list` write all messages to stderr (= status / progress / diagnostics, per convention). stdout is empty.
   - All `tracing` / `eprintln!` diagnostics
 
-When writing subprocess tests, grep `kb-mcp/src/main.rs` for the corresponding `Commands::*` block to confirm which channel each subcommand uses before asserting on the captured output — and remember the arm may delegate its printing to a helper (`print_search_results` / `print_graph` / `print_validate_report`). The five listed above are the only ones that write to stdout; `index`, `status`, `serve`, and `service` are stderr-only.
+When writing subprocess tests, grep `kb-mcp/src/main.rs` for the corresponding `Commands::*` block to confirm which channel each subcommand uses before asserting on the captured output — and remember the arm may delegate its printing to a helper (`print_search_results` / `print_graph` / `print_validate_report`). The five listed above are the only ones whose *CLI result* goes to stdout; `index`, `status`, and `service` print only to stderr. `serve` is a special case: it writes nothing as CLI output, but over the default stdio transport the **MCP protocol itself** occupies stdout, which is why a subprocess harness must keep draining it. Grep for `print!` as well as `println!` — the text branches of `eval` and `tune` use it.
 
 ## Key dependencies
 
