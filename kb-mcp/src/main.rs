@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "kb-mcp")]
+// full-audit 2026-07-26 AU-59: CONTRIBUTING asks bug reporters to run
+// `kb-mcp --version`, but the flag did not exist and clap answered with
+// `error: unexpected argument '--version' found` (exit 2) — the very first
+// command in the report template failed for everyone.
+#[command(version)]
 #[command(
     about = "MCP server for semantic search over a knowledge base of Markdown and plain-text files",
     long_about = "MCP server for semantic search over a knowledge base of Markdown\n\

@@ -544,7 +544,7 @@ effective N of 0 and exit 2. See [docs/eval.md](./docs/eval.md).
 
 ## Connecting to Claude Code / Cursor
 
-> **Looking for full deployment recipes?** See [`kb-mcp/examples/deployments/`](./kb-mcp/examples/deployments/) for ready-to-adapt configs covering four patterns: personal stdio, personal-http (one local daemon for multiple parallel Claude Code sessions), NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). The snippets below are the canonical stdio entry point you'll find in those recipes.
+> **Looking for full deployment recipes?** See [`kb-mcp/examples/deployments/`](./kb-mcp/examples/deployments/) for ready-to-adapt configs covering three patterns: personal stdio, NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). For a single-machine loopback daemon shared by several parallel Claude Code sessions, use `kb-mcp service install` — it replaced the former `personal-http` recipe in v0.8.0. The snippets below are the canonical stdio entry point you'll find in those recipes.
 
 Add the following to `.mcp.json` in your project root (or the equivalent MCP config for your client):
 
