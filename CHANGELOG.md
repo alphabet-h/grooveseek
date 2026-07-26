@@ -6,6 +6,27 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **One malformed Office document could abort an entire `kb-mcp index` run**
+  (AU-21). The indexer already skips a file whose parser returns `Err`, but a
+  **panic** unwinds straight past that `match`, and indexing is sequential, so
+  the run dies at the offending file — files after it are never indexed. Only
+  the PDF parser was protected; `docx` / `xlsx` / `pptx` were not. This is not
+  hypothetical: a spreadsheet declaring `<dimension ref="B2:A1"/>` makes
+  calamine compute `end - start` on unsigned values, which panics in any build
+  with debug assertions. On a two-file knowledge base the old binary exited
+  101 without indexing anything; it now logs `Skipping evil.xlsx: parse
+  failed: … xlsx parser panicked: attempt to subtract with overflow` and
+  finishes normally.
+
+  Rather than repeat a `catch_unwind` in three parsers, the trait entry point
+  `Parser::parse_bytes` now wraps `parse_bytes_inner` (the new override point)
+  for **every** parser, present and future — the isolation belongs to the
+  boundary where untrusted files meet third-party crates (calamine, zip,
+  quick-xml, oxidize-pdf), not to individual formats, since we cannot enumerate
+  the panic sites inside them. The panic payload is carried into the error
+  message, so suppressing the backtrace does not cost the diagnosis. The
+  PDF-only guard is gone, replaced by the shared one.
+
 - **The tray's Stop and Restart could not stop the daemon, and said they
   had** (AU-65, a v0.9.1 regression). Both called `Stop-ScheduledTask`, which
   terminates only the process the scheduler itself launched. Since v0.9.1 that

@@ -22,7 +22,7 @@ impl Parser for XlsxParser {
         single_text_chunk(raw, path_hint)
     }
 
-    fn parse_bytes(
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,
@@ -45,7 +45,7 @@ impl Parser for XlsParser {
         single_text_chunk(raw, path_hint)
     }
 
-    fn parse_bytes(
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,

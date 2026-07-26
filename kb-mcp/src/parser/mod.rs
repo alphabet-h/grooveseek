@@ -15,6 +15,7 @@ use serde::Deserialize;
 pub mod docx;
 pub mod markdown;
 pub mod ooxml;
+mod panic_guard;
 pub mod pdf;
 pub mod pptx;
 pub mod registry;
@@ -184,13 +185,16 @@ pub trait Parser: Send + Sync {
     ///   見出し概念のない形式は無視してよい
     fn parse(&self, raw: &str, path_hint: &str, exclude_headings: &[&str]) -> ParsedDocument;
 
-    /// バイト列から parse する。**全 call site (indexer / server) はこちらに統一する。**
+    /// バイト列から parse する **実装点**。形式固有の抽出はここに書く。
     ///
     /// default impl = UTF-8 検証して `parse` に委譲する (md/txt は override 不要で動く)。
     /// バイナリ parser (Pdf/Docx/Xlsx/Xls/Pptx) はこれを override して形式固有の
     /// チャンクを直接生成する。`Err` の意味 = 「このファイルは index 不能」で、
     /// 呼び出し側が skip + warn を行う。
-    fn parse_bytes(
+    ///
+    /// **呼び出し側はこれを直接呼ばず [`Parser::parse_bytes`] を使うこと。**
+    /// panic の隔離 (下記) が効かなくなる。
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,
@@ -199,6 +203,29 @@ pub trait Parser: Send + Sync {
         let s =
             std::str::from_utf8(bytes).with_context(|| format!("{path_hint}: not valid UTF-8"))?;
         Ok(self.parse(s, path_hint, exclude_headings))
+    }
+
+    /// バイト列から parse する。**全 call site (indexer / server) はこちらに統一する。**
+    ///
+    /// [`Parser::parse_bytes_inner`] に委譲しつつ、その中で起きた **panic を
+    /// `Err` に正規化する** (full-audit 2026-07-26 AU-21)。parser は信頼できない
+    /// 外部入力を calamine / zip / quick-xml / oxidize-pdf に食わせるため、
+    /// 依存 crate 由来の panic を完全には排除できない。`indexer.rs` は `Err` を
+    /// per-file skip するが panic はその `match` を巻き戻して通り抜けるので、
+    /// ここで catch しないと壊れた 1 ファイルが `index` 実行全体を落とす。
+    /// 詳細は [`panic_guard`] のモジュール doc を参照。
+    ///
+    /// **この method は override しないこと** (Rust に `final` は無いため規約で
+    /// 縛る)。形式固有の処理は `parse_bytes_inner` 側に書く。
+    fn parse_bytes(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        panic_guard::catch_parser_panic(path_hint, self.id(), || {
+            self.parse_bytes_inner(bytes, path_hint, exclude_headings)
+        })
     }
 
     /// バイナリ形式 parser は `true` を返す (default `false`)。
@@ -349,5 +376,73 @@ mod tests {
         assert_eq!(ctx.chars().count(), 200);
         // panic せず valid UTF-8 であること
         assert!(ctx.chars().all(|c| c == 'あ'));
+    }
+
+    // -----------------------------------------------------------------------
+    // panic isolation (full-audit 2026-07-26 AU-21)
+    // -----------------------------------------------------------------------
+
+    /// `parse_bytes_inner` が必ず panic する fake parser。
+    ///
+    /// 実在の壊れたファイルに頼らず panic 隔離を検証するために使う。実 crate
+    /// (calamine / zip / quick-xml) 由来の panic を狙う fixture は、crate の
+    /// bug fix や整数 overflow チェックの有無 (debug/release) で「panic しなく
+    /// なる」ため回帰テストの土台にできない。
+    struct PanickingParser;
+
+    impl Parser for PanickingParser {
+        fn extension(&self) -> &'static str {
+            "boom"
+        }
+
+        fn parse(&self, raw: &str, path_hint: &str, _exclude_headings: &[&str]) -> ParsedDocument {
+            single_text_chunk(raw, path_hint)
+        }
+
+        fn parse_bytes_inner(
+            &self,
+            _bytes: &[u8],
+            _path_hint: &str,
+            _exclude_headings: &[&str],
+        ) -> Result<ParsedDocument> {
+            panic!("simulated dependency panic");
+        }
+    }
+
+    #[test]
+    fn test_parse_bytes_isolates_parser_panic_as_err() {
+        // AU-21: parser 内の panic が呼び出し側 (indexer / server) に伝播すると、
+        // 壊れた 1 ファイルで `kb-mcp index` 実行全体が落ちる。trait の入口で
+        // Err に正規化されることを保証する。
+        let err = PanickingParser
+            .parse_bytes(b"whatever", "docs/broken.boom", &[])
+            .expect_err("a panicking parser must surface as Err, not unwind to the caller");
+        let msg = err.to_string();
+        assert!(msg.contains("docs/broken.boom"), "got: {msg}");
+        assert!(msg.contains("boom parser panicked"), "got: {msg}");
+        assert!(
+            msg.contains("simulated dependency panic"),
+            "the panic payload must survive into the error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_isolation_works_through_trait_object() {
+        // Registry は `Box<dyn Parser>` で保持する = 実運用の call site は
+        // 動的ディスパッチ。default method 経由でも隔離が効くことを確認する。
+        let parser: Box<dyn Parser> = Box::new(PanickingParser);
+        assert!(
+            parser.parse_bytes(b"x", "docs/broken.boom", &[]).is_err(),
+            "panic isolation must also hold through `dyn Parser`"
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_still_returns_ok_for_healthy_parser() {
+        // 隔離層が正常系の戻り値を変えないこと (回帰確認)。
+        let doc = MarkdownParser
+            .parse_bytes(b"## H\n\nbody enough body enough body enough", "x.md", &[])
+            .expect("healthy parser must still return Ok through the panic guard");
+        assert_eq!(doc.chunks.len(), 1);
     }
 }
