@@ -6,6 +6,48 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **The tray's Stop and Restart could not stop the daemon, and said they
+  had** (AU-65, a v0.9.1 regression). Both called `Stop-ScheduledTask`, which
+  terminates only the process the scheduler itself launched. Since v0.9.1 that
+  process is `kb-mcp-svc.exe`, the console-hiding launcher, which detach-spawns
+  the daemon and exits immediately — so the task reads as finished and the
+  cmdlet has nothing left to stop. It still returns success, so the tray
+  reported the stop as done while the daemon kept serving. Measured on a probe
+  task: stopping a task whose own process was still running killed that process
+  and left its child alive, so the scheduler's reach does not extend to
+  descendants and keeping the launcher alive would not have helped either.
+  `/api/admin/status` now reports the daemon's `pid`, and the tray terminates
+  that process through the Win32 API — one `OpenProcess`, then the image-name
+  check and the termination both on that handle, so the pid is resolved exactly
+  once and a recycled pid cannot be hit. This also covers pre-v0.9.1 installs,
+  where the daemon is the task's own process; `Stop-ScheduledTask` is kept only
+  as a fallback. Most importantly the stop no longer trusts the mechanism: it
+  confirms the daemon is gone by **binding its configured address**, and only
+  then reports success. That is what makes `restart` safe, and it makes the
+  whole family of silent failures impossible to reproduce rather than fixed
+  case by case. Binding is what settles it because probing does not: an HTTP
+  client never classified a refusal as one, a raw TCP connect times out instead
+  of being refused wherever the firewall drops packets to closed ports, and
+  probing loopback misses a daemon holding the wildcard address entirely —
+  Windows lets a specific address bind alongside a wildcard listener.
+
+  Known limitation: a daemon from v0.9.1 up to this release does not report a
+  pid, so the first stop after upgrading the tray still cannot reach it and
+  says so instead of claiming success. Stop that daemon once by hand; every
+  later one reports its pid.
+
+  The first implementation generated a PowerShell `Stop-Process` script, and
+  five review rounds found five defects in it — none in the logic, all in
+  PowerShell's error and exit-code semantics (`-ErrorAction SilentlyContinue`
+  still exits 1, `try`/`catch` does not change that, both `Stop-Process -Id`
+  and `-InputObject` re-resolve the pid because `Process.Kill()` reopens by
+  number, and a denied handle was indistinguishable from a missing process).
+  Each fix opened the next hole, so the approach was replaced rather than
+  patched further. The behaviour is now covered by tests that spawn real
+  processes and assert they do or do not get terminated, plus an end-to-end
+  test against an actual daemon — which caught one more defect the unit tests
+  could not have.
+
 - **Tool schemas advertised constructs that break strict tool-calling
   runtimes** ([#75](https://github.com/alphabet-h/kb-mcp/issues/75)). Every
   optional parameter was published as a union type — `{"type": ["string",
