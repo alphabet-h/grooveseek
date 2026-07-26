@@ -22,10 +22,19 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   once and a recycled pid cannot be hit. This also covers pre-v0.9.1 installs,
   where the daemon is the task's own process; `Stop-ScheduledTask` is kept only
   as a fallback. Most importantly the stop no longer trusts the mechanism: it
-  confirms against the daemon itself that the endpoint has stopped answering,
-  and only then reports success. That is what makes `restart` safe, and it
-  makes the whole family of silent failures impossible to reproduce rather than
-  fixed case by case.
+  confirms the daemon is gone by **binding its configured address**, and only
+  then reports success. That is what makes `restart` safe, and it makes the
+  whole family of silent failures impossible to reproduce rather than fixed
+  case by case. Binding is what settles it because probing does not: an HTTP
+  client never classified a refusal as one, a raw TCP connect times out instead
+  of being refused wherever the firewall drops packets to closed ports, and
+  probing loopback misses a daemon holding the wildcard address entirely —
+  Windows lets a specific address bind alongside a wildcard listener.
+
+  Known limitation: a daemon from v0.9.1 up to this release does not report a
+  pid, so the first stop after upgrading the tray still cannot reach it and
+  says so instead of claiming success. Stop that daemon once by hand; every
+  later one reports its pid.
 
   The first implementation generated a PowerShell `Stop-Process` script, and
   five review rounds found five defects in it — none in the logic, all in
