@@ -64,13 +64,24 @@ pub async fn start(service_name: &str) -> Result<()> {
 /// would be terminated in the replacement's place (codex P2 rounds 2 and 3).
 /// Windows will not reuse a pid while a handle to that process is open, so
 /// pinning one first means whatever gets validated is what gets killed.
-/// `.Handle` is inside the `try` because it throws if the process is already
-/// gone, and the catch clears `$p` so the guard then skips.
+///
+/// Opening the handle can fail for two very different reasons, and only one of
+/// them is benign. If the process is simply gone the stop has already happened
+/// and the script falls through to `exit 0`; if it is still running — the tray
+/// unelevated against an elevated daemon, or any other access restriction —
+/// swallowing that would report a successful stop while the daemon keeps
+/// serving, which is the exact silent success this whole function exists to
+/// eliminate (codex P2 round 4). So the catch re-probes and rethrows whenever
+/// the process is still there. Re-resolving the pid is safe here because the
+/// result only chooses between failing loudly and doing nothing; nothing is
+/// ever terminated through it.
 pub fn stop_by_pid_script(pid: u32) -> String {
     format!(
         "$p = $null; \
-         try {{ $p = Get-Process -Id {pid} -ErrorAction Stop; $null = $p.Handle }} \
-         catch {{ $p = $null }}; \
+         try {{ $p = Get-Process -Id {pid} -ErrorAction Stop }} catch {{ }}; \
+         if ($p) \
+         {{ try {{ $null = $p.Handle }} \
+         catch {{ if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw }}; $p = $null }} }}; \
          if ($p -and $p.ProcessName -eq 'kb-mcp') \
          {{ try {{ $p | Stop-Process -Force -ErrorAction Stop }} \
          catch {{ if (-not $p.HasExited) {{ throw }} }} }}; \
@@ -216,31 +227,44 @@ mod tests {
         );
     }
 
-    /// Everything after the lookup goes through `$p`, so the pid literal is
-    /// only ever used to resolve the process once. On its own this does not
-    /// establish the identity invariant — that is what the pinned handle is
-    /// for — but re-introducing a second `-Id` would be a regression.
+    /// Nothing may ever be terminated through a raw pid. The pid resolves the
+    /// process and later re-probes whether it is still alive, but every kill
+    /// goes through the object whose handle was pinned — `Stop-Process -Id`
+    /// would reopen by number and could hit a replacement.
     #[test]
-    fn stop_by_pid_script_resolves_the_pid_only_once() {
+    fn stop_by_pid_script_never_kills_through_a_raw_pid() {
         let script = stop_by_pid_script(4242);
-        assert_eq!(
-            script.matches("4242").count(),
-            1,
-            "the pid must appear only in the initial lookup: {script}"
+        assert!(
+            !script.contains("Stop-Process -Id"),
+            "the kill must go through the pinned object, not the number: {script}"
         );
+        assert!(script.contains("$p | Stop-Process -Force"));
     }
 
-    /// If the process is already gone the lookup (or the handle open) throws,
-    /// and the catch has to clear `$p` so the guard skips instead of running
-    /// against a half-initialised object.
+    /// A handle that cannot be opened while the process is still running is a
+    /// real failure — the tray unelevated against an elevated daemon, say.
+    /// Swallowing it would report a successful stop while the daemon keeps
+    /// serving, which is the silent success this function exists to remove
+    /// (codex P2 round 4 on PR #89). Only a process that has actually gone away
+    /// may become a no-op. Verified by forcing the handle open to fail: exit 1
+    /// with the process left running, exit 0 once it was gone.
     #[test]
-    fn stop_by_pid_script_clears_the_process_when_the_lookup_fails() {
+    fn stop_by_pid_script_rethrows_a_handle_failure_on_a_live_process() {
         let script = stop_by_pid_script(4242);
         let handle = script.find("$p.Handle").expect("handle pinned");
         let guard = script.find("ProcessName").expect("guard present");
+        let between = &script[handle..guard];
         assert!(
-            script[handle..guard].contains("catch { $p = $null }"),
-            "a failed lookup or handle open must reset $p: {script}"
+            between.contains("throw"),
+            "a handle failure on a live process must rethrow: {script}"
+        );
+        assert!(
+            between.contains("Get-Process -Id 4242"),
+            "the rethrow must be gated on the process still existing: {script}"
+        );
+        assert!(
+            between.contains("$p = $null"),
+            "a process that is gone must clear $p so the guard skips: {script}"
         );
     }
 
@@ -315,7 +339,7 @@ mod tests {
     fn stop_by_pid_script_matches_the_empirically_verified_text() {
         assert_eq!(
             stop_by_pid_script(4242),
-            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop; $null = $p.Handle } catch { $p = $null }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } } }; exit 0"
+            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop } catch { }; if ($p) { try { $null = $p.Handle } catch { if (Get-Process -Id 4242 -ErrorAction SilentlyContinue) { throw }; $p = $null } }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } } }; exit 0"
         );
     }
 
