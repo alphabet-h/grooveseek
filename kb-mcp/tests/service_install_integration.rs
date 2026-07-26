@@ -90,20 +90,22 @@ fn macos_plist_template_renders_correctly() {
 /// registration without admin elevation (= spec § Q4 promise).
 /// Cleans up via `Unregister-ScheduledTask` regardless of outcome.
 ///
-/// **Must be run from an interactive logon session** (= the user's own
-/// `powershell.exe` / Windows Terminal, NOT a network logon / service-style
-/// session). The Task Scheduler COM API needs an interactive token to
-/// register tasks for the current user — calls from NTLM / service logon
-/// sessions (cargo-spawned shells inside CI runners, SSH sessions, WSL-
-/// bridged shells) hit "Access is denied" even though the user is the same.
+/// **Logon-session sensitive.** The Task Scheduler COM API needs a
+/// sufficiently privileged token to register a task for the current user;
+/// calls from NTLM / service-style logon sessions (SSH sessions, WSL-bridged
+/// shells, some CI agents) hit "Access is denied" even though the user is
+/// the same. The user's own `powershell.exe` / Windows Terminal works.
 ///
 /// Run manually from an interactive shell:
 /// ```text
 /// cargo test --test service_install_integration windows_register_scheduledtask_smoke_test -- --ignored
 /// ```
 ///
-/// This smoke test is opt-in (= no CI coverage by design). Compile-time
-/// shape correctness is covered by `cargo check` of the production helper.
+/// Since AU-09 this also runs on the nightly `windows-latest` leg, and it
+/// passes there: GitHub-hosted Windows runners execute jobs as an
+/// administrator with UAC disabled, so the registration succeeds. It stays
+/// `#[ignore]` because it mutates the Task Scheduler and must not run in a
+/// plain `cargo test`.
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "mutates Windows Task Scheduler — run manually for end-to-end verify"]
