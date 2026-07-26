@@ -16,13 +16,28 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   task: stopping a task whose own process was still running killed that process
   and left its child alive, so the scheduler's reach does not extend to
   descendants and keeping the launcher alive would not have helped either.
-  `/api/admin/status` now reports the daemon's `pid`, and the tray stops that
-  process directly, guarded on the process still being `kb-mcp` so a recycled
-  pid cannot be hit. This also covers pre-v0.9.1 installs, where the daemon is
-  the task's own process; `Stop-ScheduledTask` is kept only as the fallback for
-  when the pid cannot be read at all. The stop is idempotent: an
-  already-stopped daemon succeeds, which matters because `restart` propagates a
-  failed stop and would otherwise never reach the start.
+  `/api/admin/status` now reports the daemon's `pid`, and the tray terminates
+  that process through the Win32 API — one `OpenProcess`, then the image-name
+  check and the termination both on that handle, so the pid is resolved exactly
+  once and a recycled pid cannot be hit. This also covers pre-v0.9.1 installs,
+  where the daemon is the task's own process; `Stop-ScheduledTask` is kept only
+  as a fallback. Most importantly the stop no longer trusts the mechanism: it
+  confirms against the daemon itself that the endpoint has stopped answering,
+  and only then reports success. That is what makes `restart` safe, and it
+  makes the whole family of silent failures impossible to reproduce rather than
+  fixed case by case.
+
+  The first implementation generated a PowerShell `Stop-Process` script, and
+  five review rounds found five defects in it — none in the logic, all in
+  PowerShell's error and exit-code semantics (`-ErrorAction SilentlyContinue`
+  still exits 1, `try`/`catch` does not change that, both `Stop-Process -Id`
+  and `-InputObject` re-resolve the pid because `Process.Kill()` reopens by
+  number, and a denied handle was indistinguishable from a missing process).
+  Each fix opened the next hole, so the approach was replaced rather than
+  patched further. The behaviour is now covered by tests that spawn real
+  processes and assert they do or do not get terminated, plus an end-to-end
+  test against an actual daemon — which caught one more defect the unit tests
+  could not have.
 
 - **Tool schemas advertised constructs that break strict tool-calling
   runtimes** ([#75](https://github.com/alphabet-h/kb-mcp/issues/75)). Every

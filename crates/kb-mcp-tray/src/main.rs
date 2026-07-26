@@ -11,6 +11,8 @@ mod logger;
 #[cfg(target_os = "windows")]
 mod poll;
 #[cfg(target_os = "windows")]
+mod process;
+#[cfg(target_os = "windows")]
 mod state;
 #[cfg(target_os = "windows")]
 mod tray;
