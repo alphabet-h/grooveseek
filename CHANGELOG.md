@@ -6,6 +6,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **The tray's Stop and Restart could not stop the daemon, and said they
+  had** (AU-65, a v0.9.1 regression). Both called `Stop-ScheduledTask`, which
+  terminates only the process the scheduler itself launched. Since v0.9.1 that
+  process is `kb-mcp-svc.exe`, the console-hiding launcher, which detach-spawns
+  the daemon and exits immediately — so the task reads as finished and the
+  cmdlet has nothing left to stop. It still returns success, so the tray
+  reported the stop as done while the daemon kept serving. Measured on a probe
+  task: stopping a task whose own process was still running killed that process
+  and left its child alive, so the scheduler's reach does not extend to
+  descendants and keeping the launcher alive would not have helped either.
+  `/api/admin/status` now reports the daemon's `pid`, and the tray stops that
+  process directly, guarded on the process still being `kb-mcp` so a recycled
+  pid cannot be hit. This also covers pre-v0.9.1 installs, where the daemon is
+  the task's own process; `Stop-ScheduledTask` is kept only as the fallback for
+  when the pid cannot be read at all. The stop is idempotent: an
+  already-stopped daemon succeeds, which matters because `restart` propagates a
+  failed stop and would otherwise never reach the start.
+
 - **Tool schemas advertised constructs that break strict tool-calling
   runtimes** ([#75](https://github.com/alphabet-h/kb-mcp/issues/75)). Every
   optional parameter was published as a union type — `{"type": ["string",

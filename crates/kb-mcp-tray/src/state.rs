@@ -19,7 +19,20 @@ pub enum StatusDot {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AdminStatus {
     #[serde(default)]
+    pub daemon: DaemonState,
+    #[serde(default)]
     pub indexing: IndexingState,
+}
+
+/// Daemon identity from `/api/admin/status`. Only the pid is read — the tray
+/// uses it to stop the daemon, because `Stop-ScheduledTask` cannot reach a
+/// process the scheduler does not own (see `daemon::stop`).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DaemonState {
+    /// `None` when the daemon predates the release that started reporting it.
+    /// The tray then falls back to `Stop-ScheduledTask` alone.
+    #[serde(default)]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -102,6 +115,7 @@ mod tests {
     fn ok(active: bool) -> AdminStatus {
         AdminStatus {
             indexing: IndexingState { active },
+            ..Default::default()
         }
     }
 
@@ -182,6 +196,30 @@ mod tests {
     #[test]
     fn admin_status_parses_empty_json_with_defaults() {
         let s: AdminStatus = serde_json::from_str("{}").unwrap();
+        assert!(!s.indexing.active);
+    }
+
+    /// The pid is what makes stopping the daemon possible at all, so it has to
+    /// survive deserialization alongside the fields the tray already read.
+    #[test]
+    fn admin_status_parses_daemon_pid() {
+        let json = r#"{"daemon":{"version":"0.13.1","pid":22880,"uptime_secs":9,
+                        "started_at":"2026-07-26T12:26:45Z"},
+                       "indexing":{"active":false}}"#;
+        let s: AdminStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(s.daemon.pid, Some(22880));
+    }
+
+    /// A daemon older than the release that added `pid` still answers, and the
+    /// tray must keep polling it rather than erroring out — `stop` degrades to
+    /// `Stop-ScheduledTask` alone in that case.
+    #[test]
+    fn admin_status_tolerates_daemon_without_pid() {
+        let json = r#"{"daemon":{"version":"0.9.2","uptime_secs":120231,
+                        "started_at":"2026-07-25T02:42:04Z"},
+                       "indexing":{"active":false}}"#;
+        let s: AdminStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(s.daemon.pid, None);
         assert!(!s.indexing.active);
     }
 }

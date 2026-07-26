@@ -155,15 +155,17 @@ fn handle_menu(
             });
         }
         "stop" => {
+            let status_url = cfg.status_url.clone();
             runtime.spawn(async move {
-                if let Err(e) = daemon::stop(&service).await {
+                if let Err(e) = daemon::stop(&service, &status_url).await {
                     tracing::warn!("daemon stop failed: {e}");
                 }
             });
         }
         "restart" => {
+            let status_url = cfg.status_url.clone();
             runtime.spawn(async move {
-                if let Err(e) = daemon::restart(&service).await {
+                if let Err(e) = daemon::restart(&service, &status_url).await {
                     tracing::warn!("daemon restart failed: {e}");
                 }
             });

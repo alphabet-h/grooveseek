@@ -43,6 +43,21 @@ pub struct AdminStatus {
 #[derive(serde::Serialize)]
 pub struct DaemonInfo {
     pub version: String,
+    /// OS process id of the daemon answering this request.
+    ///
+    /// The tray needs it to stop the daemon at all. `Stop-ScheduledTask`
+    /// terminates only the task's *own* process, and since v0.9.1 the Windows
+    /// Action points at `kb-mcp-svc.exe`, which detach-spawns this process and
+    /// exits immediately — so the scheduler considers the task finished and has
+    /// nothing left to stop. Measured 2026-07-26: with a task whose action was
+    /// still running, stopping it killed the parent and the child survived, so
+    /// the task's reach does not extend to descendants either way.
+    ///
+    /// Only ever served from `/api/admin/status`, which `admin_host_check`
+    /// restricts to loopback unless the operator explicitly allows their bind
+    /// address. It is an identifier, not an action — stopping still requires
+    /// local privileges to signal the process.
+    pub pid: u32,
     pub uptime_secs: u64,
     pub started_at: String,
 }
@@ -543,6 +558,7 @@ async fn api_admin_status(
     Ok(axum::Json(AdminStatus {
         daemon: DaemonInfo {
             version: env!("CARGO_PKG_VERSION").into(),
+            pid: std::process::id(),
             uptime_secs: shared.started_instant.elapsed().as_secs(),
             started_at: format_iso(shared.started_at),
         },
