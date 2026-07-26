@@ -1,5 +1,5 @@
 {
-  "_comment_nas_shared": "KB-on-NAS deployment, client side. stdio + the local mount point of the shared KB. The kb_path arg here is redundant with kb-mcp.toml; either keep both (explicit beats config) or drop the args and rely on the toml. Mount the share so its PARENT is on local disk — .kb-mcp.db is created next to kb_path and must stay off the network filesystem. See README.md / README.ja.md.",
+  "_comment_nas_shared": "KB-on-NAS deployment, client side. --config is required, not optional: an MCP client launches this from your project directory, so config discovery would never find /var/lib/kb-mcp/kb-mcp.toml and the server would start with default settings — including bge-small-en-v1.5 against an index built with bge-m3, which fails the model check at startup. Mount the share so its PARENT is on local disk: .kb-mcp.db is created next to kb_path and must stay off the network filesystem. See README.md / README.ja.md.",
   "_comment_alwaysLoad": "alwaysLoad: true is a Claude Code v2.1.121+ option that ensures kb-mcp's tools are present at initial load (skips tool-search lookup latency). Other MCP clients (Cursor, etc.) ignore the field. Drop it if first-startup model download cost outweighs the latency win.",
   "mcpServers": {
     "ai-knowledge": {
@@ -7,7 +7,7 @@
       "command": "kb-mcp",
       "args": [
         "serve",
-        "--kb-path", "/var/lib/kb-mcp/knowledge-base"
+        "--config", "/var/lib/kb-mcp/kb-mcp.toml"
       ],
       "alwaysLoad": true
     }

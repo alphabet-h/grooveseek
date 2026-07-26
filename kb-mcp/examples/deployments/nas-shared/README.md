@@ -39,7 +39,7 @@ edits the same files. **The index does not.** Each machine keeps its own
 | --- | --- |
 | [`kb-mcp.toml.client`](./kb-mcp.toml.client) | The per-machine config. Watcher off (network filesystems do not deliver inotify / ReadDirectoryChangesW events), index driven by a timer. |
 | [`kb-mcp.toml.indexer`](./kb-mcp.toml.indexer) | Same thing with the watcher discussion spelled out, for a machine that also edits the KB locally. |
-| [`.mcp.json`](./.mcp.json) | Client-side: stdio + the local `kb_path`. |
+| [`.mcp.json`](./.mcp.json) | Client-side: stdio, pinned to this machine's config with `--config`. |
 
 ## Setup (repeat on every machine)
 
@@ -107,7 +107,10 @@ edits the same files. **The index does not.** Each machine keeps its own
    finds nothing new costs a directory walk and a hash per file.
 
 5. Drop `.mcp.json` into the project root (or wherever your MCP client
-   reads it) and point `kb_path` at the same local mount.
+   reads it). It passes `--config /var/lib/kb-mcp/kb-mcp.toml` for the same
+   reason the timer does: the client launches kb-mcp from *your project*
+   directory, where discovery would never find that file, and the server
+   would start with the default model against a `bge-m3` index.
 
 6. Confirm:
 

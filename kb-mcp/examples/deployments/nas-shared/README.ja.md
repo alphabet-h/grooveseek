@@ -38,7 +38,7 @@
 | --- | --- |
 | [`kb-mcp.toml.client`](./kb-mcp.toml.client) | 各マシン用の設定。watcher off (ネットワーク FS は inotify / ReadDirectoryChangesW を配送しない)、index はタイマー駆動 |
 | [`kb-mcp.toml.indexer`](./kb-mcp.toml.indexer) | KB をローカルでも編集するマシン向けに watcher の判断材料を書き足した版 |
-| [`.mcp.json`](./.mcp.json) | クライアント側: stdio + ローカルの `kb_path` |
+| [`.mcp.json`](./.mcp.json) | クライアント側: stdio。`--config` でこのマシンの設定に固定 |
 
 ## セットアップ (全マシンで実施)
 
@@ -101,8 +101,11 @@
    再 index は増分 (SHA-256 の content diff) なので、変更が無ければ
    ディレクトリ走査 + ファイルごとの hash だけで済む。
 
-5. `.mcp.json` をプロジェクトルート (or MCP クライアントが読む場所) に置き、
-   `kb_path` を同じローカルマウントに向ける
+5. `.mcp.json` をプロジェクトルート (or MCP クライアントが読む場所) に置く。
+   タイマーと同じ理由で `--config /var/lib/kb-mcp/kb-mcp.toml` を渡している:
+   クライアントは kb-mcp を **自分のプロジェクト** ディレクトリから起動するので
+   探索ではそのファイルに辿り着けず、`bge-m3` の index に対して既定 model で
+   起動してしまう
 
 6. 確認:
 
