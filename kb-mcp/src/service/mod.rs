@@ -39,6 +39,11 @@ pub struct InstallContext {
 /// service の現在状態。2-tier resolve (= spec § 2 status info source):
 /// 1. OS native (= systemctl / launchctl / schtasks) で running / stopped / not-found 判定
 /// 2. running 時のみ `/api/admin/status` で dynamic info (uptime / model) を取得
+///
+/// `Debug` / `PartialEq` は `status::enrich_from_toml_str` のテストが結果を
+/// そのまま突き合わせるために derive してある (どのフィールドが toml から
+/// 埋まったかを、表示文字列を経由せずに検査したい)。
+#[derive(Debug, PartialEq)]
 pub enum ServiceState {
     Running {
         uptime_secs: u64,
