@@ -29,13 +29,12 @@ pub fn pick_free_port() -> u16 {
 /// Poll `<url>` until 200 or `deadline` expires.
 ///
 /// **TODO (feature-34 / F-55, Windows compatibility)**: `curl -o /dev/null`
-/// uses the POSIX null-device path. Windows `curl` (Win10+) treats unknown
-/// device paths as regular files, which **may** still work because curl
-/// opens it with O_WRONLY and writes the body away — but the formal cross-
-/// platform spelling is `-o nul`. The existing mmr/parent integration tests
-/// are all `#[ignore]` and run on Linux CI only, so the issue is latent.
-/// Cross-platform fix is deferred to F-58 (CI 3-OS matrix) when this code
-/// path will actually be exercised on Windows / macOS runners.
+/// uses the POSIX null-device path; the formal cross-platform spelling is
+/// `-o nul`. Windows `curl` (Win10+) treats unknown device paths as regular
+/// files, so it still works — it opens the path with O_WRONLY and writes the
+/// body away. Since AU-09 these `#[ignore]` tests do run on the nightly
+/// `windows-latest` leg and pass, which confirms the behaviour empirically
+/// rather than leaving it latent. The cosmetic `-o nul` fix is still open.
 pub fn wait_http_200(url: &str, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
