@@ -158,16 +158,21 @@ fn handle_menu(
         }
         "stop" => {
             let status_url = cfg.status_url.clone();
+            // The raw configured bind, not the loopback-normalised admin URL:
+            // confirmation binds this address, and a daemon holding `0.0.0.0`
+            // does not stop us binding `127.0.0.1` (measured).
+            let bind = cfg.bind.clone();
             runtime.spawn(async move {
-                if let Err(e) = daemon::stop(&service, &status_url).await {
+                if let Err(e) = daemon::stop(&service, &status_url, &bind).await {
                     tracing::warn!("daemon stop failed: {e}");
                 }
             });
         }
         "restart" => {
             let status_url = cfg.status_url.clone();
+            let bind = cfg.bind.clone();
             runtime.spawn(async move {
-                if let Err(e) = daemon::restart(&service, &status_url).await {
+                if let Err(e) = daemon::restart(&service, &status_url, &bind).await {
                     tracing::warn!("daemon restart failed: {e}");
                 }
             });

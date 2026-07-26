@@ -62,7 +62,7 @@ enum DaemonProbe {
 /// Whatever path runs, the outcome is confirmed against the daemon itself
 /// before returning — see [`confirm_stopped`]. The pid is read first, because
 /// the status endpoint dies with the daemon.
-pub async fn stop(service_name: &str, status_url: &str) -> Result<()> {
+pub async fn stop(service_name: &str, status_url: &str, bind: &str) -> Result<()> {
     // Nothing here decides success. Each mechanism is attempted, and
     // `confirm_stopped` is the only authority on whether the daemon is gone —
     // including when a mechanism errors. Letting the fallback's error
@@ -102,7 +102,7 @@ pub async fn stop(service_name: &str, status_url: &str) -> Result<()> {
             }
         }
     }
-    confirm_stopped(status_url)
+    confirm_stopped(bind)
         .await
         .map_err(|e| match fallback_error {
             Some(fe) => e.context(format!("Stop-ScheduledTask also failed: {fe}")),
@@ -117,8 +117,8 @@ pub async fn stop(service_name: &str, status_url: &str) -> Result<()> {
 /// A failed stop propagates, which is the point: starting a second instance
 /// while the first still holds the port produces a daemon that dies on bind and
 /// a tray that reports it as started.
-pub async fn restart(service_name: &str, status_url: &str) -> Result<()> {
-    stop(service_name, status_url).await?;
+pub async fn restart(service_name: &str, status_url: &str, bind: &str) -> Result<()> {
+    stop(service_name, status_url, bind).await?;
     tokio::time::sleep(Duration::from_millis(800)).await;
     start(service_name).await
 }
@@ -146,13 +146,12 @@ async fn stop_scheduled_task(service_name: &str) -> Result<()> {
 /// why this polls rather than checking once. Failing to establish the stop is
 /// an error: the caller must not be told the daemon is down when that could not
 /// be shown.
-async fn confirm_stopped(status_url: &str) -> Result<()> {
+async fn confirm_stopped(bind: &str) -> Result<()> {
     /// Enough that a lone blip cannot be mistaken for a stop.
     const REQUIRED_CONSECUTIVE_FREE_PROBES: u32 = 3;
     const ATTEMPTS: u32 = 12;
 
-    let authority = authority_of(status_url)
-        .with_context(|| format!("cannot read host:port out of status url {status_url}"))?;
+    let authority = bind;
     let mut free_probes = 0;
     let mut last = Liveness::Inconclusive;
     for _ in 0..ATTEMPTS {
@@ -234,18 +233,6 @@ enum Liveness {
     Inconclusive,
 }
 
-/// `host:port` of a status URL, e.g. `http://127.0.0.1:3100/api/admin/status`
-/// → `127.0.0.1:3100`. The tray builds these itself (`config::resolve`), so a
-/// scheme and an explicit port are always present.
-fn authority_of(status_url: &str) -> Option<&str> {
-    let rest = status_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(status_url);
-    let authority = rest.split(['/', '?', '#']).next()?;
-    (!authority.is_empty() && authority.contains(':')).then_some(authority)
-}
-
 fn probe_liveness(authority: &str) -> Liveness {
     // Binding and immediately dropping. Windows does not set SO_REUSEADDR on
     // listeners, so a port another socket is listening on genuinely refuses the
@@ -307,23 +294,6 @@ mod tests {
         assert_eq!(DAEMON_IMAGE, "kb-mcp.exe");
     }
 
-    #[test]
-    fn authority_of_extracts_host_and_port() {
-        assert_eq!(
-            authority_of("http://127.0.0.1:3100/api/admin/status"),
-            Some("127.0.0.1:3100")
-        );
-        assert_eq!(
-            authority_of("http://localhost:8080/"),
-            Some("localhost:8080")
-        );
-        assert_eq!(authority_of("127.0.0.1:3100/x"), Some("127.0.0.1:3100"));
-        // No port means nothing to connect to deliberately; the tray always
-        // builds these with one, so this is a bug rather than a default.
-        assert_eq!(authority_of("http://example.com/status"), None);
-        assert_eq!(authority_of(""), None);
-    }
-
     /// A socket that is bound but never answers must never be read as a stop.
     /// This is the shape a busy daemon has, and the confirmation timing out
     /// against it used to be reported as success — after which `restart` would
@@ -343,12 +313,39 @@ mod tests {
             }
         });
 
-        let err = confirm_stopped(&format!("http://{addr}/api/admin/status"))
+        let err = confirm_stopped(&addr.to_string())
             .await
-            .expect_err("a hanging endpoint must not be reported as stopped");
+            .expect_err("a bound port must not be reported as stopped");
         assert!(
             err.to_string().contains("still in use"),
             "unexpected message: {err}"
+        );
+    }
+
+    /// The reason [`stop`] confirms against the **configured** bind rather than
+    /// the tray's loopback-normalised admin URL.
+    ///
+    /// Measured on Windows: with a listener on `0.0.0.0:P`, binding
+    /// `127.0.0.1:P` **succeeds** — the kernel does not treat a wildcard
+    /// listener as a conflict for a specific address unless the listener asked
+    /// for exclusivity, which Rust's does not. Probing loopback would therefore
+    /// report a wildcard-bound daemon as stopped, and a wildcard bind is a
+    /// documented configuration. Binding the same address it was configured
+    /// with is what makes the answer right (codex P2 round 8 on PR #89).
+    #[test]
+    fn probing_loopback_misses_a_wildcard_listener_but_the_bind_address_sees_it() {
+        let daemon = std::net::TcpListener::bind("0.0.0.0:0").expect("wildcard bind");
+        let port = daemon.local_addr().expect("addr").port();
+
+        assert_eq!(
+            probe_liveness(&format!("127.0.0.1:{port}")),
+            Liveness::Gone,
+            "loopback looks free even though the wildcard listener owns the port"
+        );
+        assert_eq!(
+            probe_liveness(&format!("0.0.0.0:{port}")),
+            Liveness::Occupied,
+            "the configured bind address is what reveals the listener"
         );
     }
 
@@ -360,7 +357,7 @@ mod tests {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             probe.local_addr().expect("addr")
         };
-        confirm_stopped(&format!("http://{addr}/api/admin/status"))
+        confirm_stopped(&addr.to_string())
             .await
             .expect("a free port confirms the stop");
     }
@@ -427,20 +424,20 @@ mod tests {
             "the daemon must report its own pid"
         );
 
-        stop("kb-mcp-e2e-no-such-task", &status_url)
+        stop("kb-mcp-e2e-no-such-task", &status_url, bind)
             .await
             .expect("stop must succeed and confirm the daemon is gone");
 
         assert_eq!(
-            probe_liveness(authority_of(&status_url).expect("authority")),
+            probe_liveness(bind),
             Liveness::Gone,
-            "the port must be refusing connections once stop returned Ok"
+            "the port must be free once stop returned Ok"
         );
         child.wait().expect("reap");
 
         // Stopping again is a no-op, which is what lets `restart` recover from
         // an already-stopped daemon.
-        stop("kb-mcp-e2e-no-such-task", &status_url)
+        stop("kb-mcp-e2e-no-such-task", &status_url, bind)
             .await
             .expect("stopping an already-stopped daemon must succeed");
 
