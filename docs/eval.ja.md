@@ -160,11 +160,20 @@ CLI フラグが config より優先。受理されるフラグ: `--golden`, `--
 で終了する。"compatible" = 直前 run の fingerprint (`model` / `reranker` /
 `limit` / `k_values` / golden YAML の content hash / metric 実装 version、
 および v0.7.0+ では実効 `[search.mmr]` / `[search.parent_retriever]` 設定、
-v0.13.0 以降はさらに既定値と異なる `[search.fusion]`) が一致していること。
+v0.13.0 以降はさらに既定値と異なる `[search.fusion]`、v0.13.2 以降は
+`[contextual].enabled = true` で構築された index の context mode) が一致
+していること。
 MMR / parent retriever の on/off を切り替えても、fusion パラメータを
 ビルトイン既定値から動かしても fingerprint は変わるので比較対象外となり、
 誤検知にはならない (MMR の有無で recall@k を比較するのは意図的に
-apples-to-oranges)。なお **v0.13.0 より前に記録した history は fusion 設定に関わらず非互換**:
+apples-to-oranges)。`[contextual]` の切り替えも同様に互換性を壊す — それが正しい。この設定は
+全 chunk の embedding と FTS テキストを変え `--force` 再 index を要求するので、
+model も golden も同じでも前後の run は **別の index** を測っている。記録
+されるのは config の意図ではなく **index が持つ mode** (`index_meta.context_mode`)。
+context off の run は何も記録しないので、この機能が無かった頃の baseline とも
+そのまま比較できる。
+
+なお **v0.13.0 より前に記録した history は fusion 設定に関わらず非互換**:
 metric 実装の修正で `metric_version` が 1 → 2 になっており、fingerprint は
 構造体全体で比較されるため。それらの run は比較されず skip されるが、これは
 意図した挙動 (古い数値は別の式で計算されている)。golden YAML を更新した直後の

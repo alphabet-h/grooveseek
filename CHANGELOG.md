@@ -72,6 +72,21 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **`kb-mcp eval` compared runs from either side of a `[contextual]` switch as
+  if they were the same experiment** (AU-61). Turning contextual retrieval on or
+  off changes every chunk's embedding and FTS text and requires a `--force`
+  re-index, but the run fingerprint recorded only the model, reranker, limit,
+  k values, golden hash, metric version and the MMR / parent-retriever / fusion
+  settings — so `--fail-on-regression` happily diffed a context-on run against a
+  context-off baseline and could fail the build over a difference that is not a
+  regression. The fingerprint now carries the index's context mode, read from
+  `index_meta.context_mode` rather than from the config, since it is the index
+  that determines what was measured. Context-off runs record nothing and stay
+  comparable with every baseline taken before this existed; a baseline recorded
+  with context on becomes incomparable once, the same way the metric-version
+  bump worked.
+
+
 - **A crafted `.xlsx` could make indexing decompress far more than the 50 MiB
   cap by lying about its size** (AU-20). The preflight that runs before
   calamine summed each entry's *declared* uncompressed size, and the ZIP

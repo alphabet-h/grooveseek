@@ -267,6 +267,22 @@ pub struct ConfigFingerprint {
     /// (mmr / parent_retriever と同じ論理、feature-47 D-7 / E-10)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fusion: Option<FusionFingerprint>,
+
+    /// index が context 付きで構築されている場合のみ Some (full-audit
+    /// 2026-07-26 AU-61)。
+    ///
+    /// `[contextual].enabled` は chunk の embedding・FTS の格納内容・reranker
+    /// 入力をすべて変える (切り替えには `--force` 再 index が要る) ので、
+    /// 前後の run を比較するのは model を変えたのと同じくらい無意味。それでも
+    /// model も golden_hash も同じままなので、この field が無いと
+    /// [`History::previous_compatible`] が「互換」と判定し
+    /// `--fail-on-regression` が両者を突き合わせてしまう。
+    ///
+    /// off (既定) と、mode を記録していない legacy DB は `None`。これにより
+    /// **context を使っていない大多数の既存 history JSON とは PartialEq が
+    /// 保たれる** (mmr / parent_retriever / fusion と同じ論理)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextFingerprint>,
 }
 
 /// `[search.mmr]` の effective config を fingerprint に含めるための snapshot。
@@ -295,6 +311,14 @@ pub struct FusionFingerprint {
     pub bm25_heading_weight: f32,
     pub bm25_context_weight: f32,
     pub bm25_content_weight: f32,
+}
+
+/// `index_meta.context_mode` の snapshot。context を使って index された場合のみ
+/// [`ConfigFingerprint::context`] に Some で入る。値は
+/// [`crate::db::ContextMode::as_str`] と同じ文字列 (`"static"`)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContextFingerprint {
+    pub mode: String,
 }
 
 impl ConfigFingerprint {
@@ -336,6 +360,16 @@ impl ConfigFingerprint {
                 bm25_context_weight: s.fusion.bm25_context_weight,
                 bm25_content_weight: s.fusion.bm25_content_weight,
             });
+        // `[contextual].enabled` は index 時の設定なので、DB を持たないこの
+        // 構築経路では toml の意図をそのまま写す。実際に index された mode を
+        // 知っている `run()` は `index_meta.context_mode` を使う。
+        let context = cfg
+            .contextual
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|_| ContextFingerprint {
+                mode: crate::db::ContextMode::Static.as_str().to_string(),
+            });
         Self {
             model,
             reranker,
@@ -346,6 +380,7 @@ impl ConfigFingerprint {
             mmr,
             parent_retriever,
             fusion,
+            context,
         }
     }
 }
@@ -905,6 +940,14 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     } else {
         None
     };
+    // context は index 時に確定する性質なので、toml の意図ではなく **DB に
+    // 記録された実際の mode** を見る (AU-61)。off / 未記録 (legacy DB) は None。
+    let context_fp = match db.read_context_mode()? {
+        Some(crate::db::ContextMode::Static) => Some(ContextFingerprint {
+            mode: crate::db::ContextMode::Static.as_str().to_string(),
+        }),
+        Some(crate::db::ContextMode::Off) | None => None,
+    };
     // fusion は per-call override を持たない (D-6) ので toml をそのまま見る。
     let fusion_fp = if opts.search_config.fusion.is_builtin_default() {
         None
@@ -933,6 +976,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             mmr: mmr_fp,
             parent_retriever: parent_fp,
             fusion: fusion_fp,
+            context: context_fp,
         },
         per_query,
         aggregate,
@@ -1396,6 +1440,7 @@ mod tests {
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
+                context: None,
             },
             per_query: vec![],
             aggregate: agg,
@@ -1464,6 +1509,7 @@ mod tests {
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
+                context: None,
             },
             per_query: vec![],
             aggregate: agg,
@@ -1490,6 +1536,7 @@ mod tests {
             mmr: None,
             parent_retriever: None,
             fusion: None,
+            context: None,
         };
         let mut a_now = AggregateMetrics::default();
         a_now.recall_at_k.insert(5, 0.8);
@@ -1529,6 +1576,7 @@ mod tests {
             mmr: None,
             parent_retriever: None,
             fusion: None,
+            context: None,
         };
         let fp_prev = ConfigFingerprint {
             golden_hash: "BBB".into(),
@@ -1573,6 +1621,7 @@ mod tests {
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
+                context: None,
             },
             per_query: vec![],
             aggregate: agg,
@@ -1601,6 +1650,7 @@ mod tests {
             mmr: None,
             parent_retriever: None,
             fusion: None,
+            context: None,
         };
         let now = EvalRun {
             timestamp: Utc::now(),
@@ -1639,6 +1689,7 @@ mod tests {
             mmr: None,
             parent_retriever: None,
             fusion: None,
+            context: None,
         };
         let fp_prev = ConfigFingerprint {
             metric_version: 1,
@@ -1683,6 +1734,7 @@ mod tests {
             mmr: None,
             parent_retriever: None,
             fusion: None,
+            context: None,
         };
         let fp_prev = ConfigFingerprint {
             metric_version: 1,
@@ -1755,6 +1807,7 @@ mod tests {
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
+                context: None,
             },
             per_query: vec![],
             aggregate: AggregateMetrics {
@@ -2113,6 +2166,137 @@ max_expanded_tokens = 1500
     }
 
     #[test]
+    fn test_fingerprint_context_is_none_when_contextual_is_off() {
+        // AU-61: 既定 (contextual off) なら None = feature-46 以前の history
+        // JSON / 凍結 baseline と PartialEq 互換のまま。
+        let cfg = crate::config::Config::default();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        assert!(
+            fp.context.is_none(),
+            "contextual off must not be recorded, so old baselines stay comparable"
+        );
+
+        let toml = "[contextual]
+enabled = false
+";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let fp = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        assert!(fp.context.is_none(), "explicit off is still off");
+    }
+
+    #[test]
+    fn test_fingerprint_context_on_is_incompatible_with_context_off() {
+        // AU-61 の核: `[contextual].enabled` は embedding / FTS / reranker 入力を
+        // すべて変える (= `--force` 再 index が要る) のに、model も golden_hash も
+        // 変わらない。fingerprint に入っていないと `previous_compatible` が
+        // 「比較可能」と判定し、`--fail-on-regression` が別物どうしを突き合わせる。
+        let toml = "[contextual]
+enabled = true
+";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let with_context = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        let ctx = with_context
+            .context
+            .as_ref()
+            .expect("contextual on must be recorded");
+        assert_eq!(ctx.mode, "static");
+
+        let without_context = ConfigFingerprint::from_config(
+            &crate::config::Config::default(),
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "hash".into(),
+        );
+        assert_ne!(
+            with_context, without_context,
+            "runs on either side of a context-mode switch must not compare as compatible"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_without_context_field_deserializes() {
+        // 旧 history JSON (context field なし) が読めて、かつ context off の
+        // 現行 fingerprint と PartialEq 互換であること = serde(default)。
+        let json = r#"{
+            "model": "bge-small-en-v1.5",
+            "reranker": null,
+            "limit": 10,
+            "k_values": [1, 5, 10],
+            "golden_hash": "abc",
+            "metric_version": 2
+        }"#;
+        let fp: ConfigFingerprint = serde_json::from_str(json).unwrap();
+        assert!(fp.context.is_none());
+
+        let now = ConfigFingerprint::from_config(
+            &crate::config::Config::default(),
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "abc".into(),
+        );
+        assert_eq!(
+            fp, now,
+            "a context-off run must stay comparable with pre-feature-46 history"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_context_serializes_only_when_present() {
+        // skip_serializing_if: off の run が書き出す JSON に key を足さない
+        // (= 既存 baseline ファイルとの diff / PartialEq を壊さない)。
+        let off = ConfigFingerprint::from_config(
+            &crate::config::Config::default(),
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "abc".into(),
+        );
+        let v = serde_json::to_value(&off).unwrap();
+        assert!(v.get("context").is_none(), "off must not serialize the key");
+
+        let toml = "[contextual]
+enabled = true
+";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        let on = ConfigFingerprint::from_config(
+            &cfg,
+            "bge-small-en-v1.5".into(),
+            None,
+            10,
+            vec![1, 5, 10],
+            "abc".into(),
+        );
+        let v = serde_json::to_value(&on).unwrap();
+        assert_eq!(v["context"]["mode"], "static");
+    }
+
+    #[test]
     fn test_fingerprint_without_fusion_field_deserializes() {
         // 旧 history JSON (fusion field なし) が読めること = serde(default)。
         let json = r#"{
@@ -2137,6 +2321,7 @@ max_expanded_tokens = 1500
             mmr: None,
             parent_retriever: None,
             fusion: None,
+            context: None,
         };
         assert_eq!(fp, now);
     }
