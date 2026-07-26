@@ -759,6 +759,11 @@ fn main() -> anyhow::Result<()> {
                 parent_retriever: _,
             } = args;
 
+            // AU-01: MCP boundary と同じ上限を CLI にも適用する (`--limit
+            // 4294967295` は候補プール経由で `Vec::with_capacity` へ届き
+            // allocation abort を起こしていた)。
+            let limit = kb_mcp::server::clamp_search_limit(limit);
+
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
             let reranker_choice = reranker.or(cfg.reranker).unwrap_or_default();
