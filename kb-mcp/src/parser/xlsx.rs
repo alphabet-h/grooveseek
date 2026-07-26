@@ -175,8 +175,8 @@ fn parse_xlsx_bytes_capped(
 /// cols]` を eager allocate する)。sparse な sheet (例: A1 と
 /// XFD1048576 のみ populate) では、ファイル自体は小さいのに rows × cols
 /// 個の `Data::Empty` を allocate しようとして OOM し得る。解凍 preflight
-/// (`.xml`/`.bin`/`.rels` の申告 size 合計) では防げない — ファイルの
-/// 実バイト数は小さいまま dimension だけが巨大なため。
+/// (展開量の累計検査) では防げない — 展開されるバイト数は小さいまま
+/// dimension だけが巨大なため。
 ///
 /// `Xlsx::worksheet_cells_reader` (XML イベント駆動の streaming reader、
 /// dense Range を作らない) に切り替え、実際に XML 上に `<c>` として存在
@@ -315,9 +315,8 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
     preflight_xlsx_decompression_budget_capped(bytes, path_hint, super::MAX_RAW_BINARY_BYTES)
 }
 
-/// アーカイブ内の全 entry のうち name が `.xml` / `.bin` / `.rels` の
-/// いずれか (大小文字を区別しない) で終わるものについて、展開後サイズの
-/// 累計が `cap` を超えていれば calamine を呼ぶ前に `Err` にする。
+/// アーカイブ内の **全 entry** について展開後サイズを累計し、`cap` を超えて
+/// いれば calamine を呼ぶ前に `Err` にする。
 ///
 /// 検査は 2 層 (full-audit 2026-07-26 AU-20):
 ///
@@ -346,25 +345,34 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 /// `zip v8.6.0` を共有、feature unification 済) なので、「我々が展開でき
 /// ない圧縮方式を calamine だけが展開できる」という抜け道は無い。
 ///
-/// codex P1 (PR #70 round 4): 旧実装は `xl/worksheets/*.xml` +
-/// `xl/sharedStrings.xml` + `xl/styles.xml` という固定パスのみを検査して
-/// いたため、`_rels/.rels` の officeDocument relationship で workbook 本体
-/// を `xl/` 以外の任意ディレクトリに配置した crafted xlsx では対象 0 件に
-/// なり budget を丸ごと素通りしていた (calamine は rels から xl_path を
-/// 導出して開けるため、layout が非標準でも普通に読める)。rels を解決して
-/// 正しい xl_path を突き止めるより単純で保守的な方式として、**「name が
-/// 対象拡張子で終わる全 entry」という layout 非依存の superset** に対象を
-/// 広げることでこの抜け道を塞ぐ。xlsx の payload (worksheets /
-/// sharedStrings / styles / vbaProject.bin 等) は置き場所によらず必ず
-/// これらの拡張子のいずれかであり、media (画像等、`.png`/`.jpeg` 等) は
-/// 対象外のままなので、正規の画像入り xlsx を誤って弾くことはない。
+/// **なぜ「全 entry」なのか — 対象を name で絞る方式は 3 回破られた**:
 ///
-/// codex P1 (PR #70 round 5): `.xml`/`.bin` だけでは `_rels/.rels` /
-/// `xl/_rels/workbook.xml.rels` 等の `.rels` 拡張子が対象から漏れていた。
-/// calamine は workbook open 時に rels も読むため、巨大圧縮 `.rels` は
-/// budget を素通りし得る。`.rels` も対象に加え、かつ拡張子比較を
-/// case-insensitive にした (zip の entry name フィールドは大文字小文字を
-/// 保証しないため `.XML` 等も保守的に拾う)。
+/// - PR #70 round 4 (codex P1): `xl/worksheets/*.xml`, `xl/sharedStrings.xml`,
+///   `xl/styles.xml` という **固定パス**のみ検査していた → `_rels/.rels` の
+///   officeDocument relationship で workbook 本体を `xl/` 以外に置くと対象
+///   0 件で素通り (calamine は rels から xl_path を導出するので非標準 layout
+///   でも普通に読める)。
+/// - PR #70 round 5 (codex P1): `.xml`/`.bin` だけでは `_rels/.rels` /
+///   `xl/_rels/workbook.xml.rels` が漏れる → `.rels` を追加、比較も
+///   case-insensitive 化。
+/// - PR #93 round 1 (codex P1): **拡張子そのものが当てにならない**。calamine
+///   は worksheet を rels の `Target` で解決しており、entry name の拡張子を
+///   一切見ない。`xl/worksheets/payload` のような拡張子なしパートも普通に
+///   読まれる (`test_xlsx_preflight_covers_parts_without_a_known_suffix` が
+///   実際に parse できることを確認している) ため、suffix allow-list は
+///   そこに置かれた bomb を見逃す。
+///
+/// 「calamine が読むパートの集合」を name から言い当てようとするたびに穴が
+/// 開いたので、**言い当てるのをやめて全 entry を数える**。「archive 全体の
+/// 展開量が `cap` 以内」という、言い切れる不変条件にする。
+///
+/// トレードオフ: `xl/media/*` の画像など calamine が読まないパートも budget
+/// に乗るため、「展開後の合計が cap を超える画像だらけの xlsx」は skip される。
+/// raw 入力自体が既に `MAX_RAW_BINARY_BYTES` で頭打ちで、画像は圧縮済み
+/// (= 展開してもほぼ 1:1) なので、該当するのは raw cap 付近かつ中身の大半が
+/// 画像という稀なファイルに限られる。名前ベースの穴を残すより、この誤検知を
+/// 受け入れる方を選ぶ (skip は理由付きの warn として出るので silent failure
+/// ではない)。
 ///
 /// zip として開けない場合 (xls = BIFF、非 zip container) は対象外として
 /// `Ok(())` を返す — xls はこの経路の攻撃面ではない (calamine の BIFF
@@ -381,27 +389,23 @@ fn preflight_xlsx_decompression_budget_capped(
     let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         return Ok(());
     };
-    // 対象 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
+    // 全 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
     let mut total: u64 = 0;
     for i in 0..zip.len() {
-        // 対象判定と申告 size は metadata だけで取れる (`by_index_raw` は
-        // 圧縮データをそのまま返す reader = 展開しない)。
+        // 申告 size は metadata だけで取れる (`by_index_raw` は圧縮データを
+        // そのまま返す reader = 展開しない)。
         let (name, declared) = {
             let Ok(entry) = zip.by_index_raw(i) else {
                 continue;
             };
-            (entry.name().to_ascii_lowercase(), entry.size())
+            (entry.name().to_string(), entry.size())
         };
-        let is_target = name.ends_with(".xml") || name.ends_with(".bin") || name.ends_with(".rels");
-        if !is_target {
-            continue;
-        }
 
         // 層 1: 申告値だけで既に budget 超過 = 展開を試みるまでもなく拒否。
         let remaining = cap.saturating_sub(total);
         if declared > remaining {
             anyhow::bail!(
-                "{path_hint}: declared .xml/.bin/.rels entry size exceeds {cap} bytes cap \
+                "{path_hint}: declared entry size exceeds {cap} bytes cap \
                  (zip-bomb guard; entry {name:?} declares {declared} bytes with \
                  {remaining} bytes of budget left)"
             );
@@ -418,9 +422,9 @@ fn preflight_xlsx_decompression_budget_capped(
         total = total.saturating_add(actual);
         if total > cap {
             anyhow::bail!(
-                "{path_hint}: actual decompressed size of .xml/.bin/.rels entries exceeds \
-                 {cap} bytes cap (zip-bomb guard; entry {name:?} declared {declared} bytes \
-                 but expands past the remaining budget)"
+                "{path_hint}: actual decompressed size of the archive exceeds {cap} bytes cap \
+                 (zip-bomb guard; entry {name:?} declared {declared} bytes but expands past \
+                 the remaining budget)"
             );
         }
     }
@@ -779,6 +783,72 @@ mod tests {
         // 実体は 32 KiB × 2 = 64 KiB。cap を 48 KiB にすると 2 個目で超える。
         let err = preflight_xlsx_decompression_budget_capped(&data, "bomb.xlsx", 48 * 1024)
             .expect_err("cumulative actual size over the cap must be Err");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    /// worksheet パートの **zip 内 name を呼び出し側が決められる** 最小 xlsx。
+    /// rels の Target も同じ名前を指すので、calamine は拡張子に関係なく
+    /// この entry を worksheet として読む。
+    fn make_xlsx_with_worksheet_part(part_name: &str, sheet_body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("[Content_Types].xml", opt).unwrap();
+            zip.write_all(format!(
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/{part_name}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#
+            ).as_bytes()).unwrap();
+            zip.start_file("_rels/.rels", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#).unwrap();
+            zip.start_file("xl/workbook.xml", opt).unwrap();
+            zip.write_all(br#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>"#).unwrap();
+            zip.start_file("xl/_rels/workbook.xml.rels", opt).unwrap();
+            zip.write_all(format!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{part_name}"/></Relationships>"#
+            ).as_bytes()).unwrap();
+            zip.start_file(format!("xl/{part_name}"), opt).unwrap();
+            zip.write_all(sheet_body).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_xlsx_preflight_covers_parts_without_a_known_suffix() {
+        // codex P1 (PR #93 round 1): pre-flight は name の拡張子
+        // (`.xml`/`.bin`/`.rels`) で対象を選んでいたが、**calamine は rels の
+        // Target で worksheet を解決するので name の拡張子を見ない**。
+        // したがって `xl/worksheets/payload` のような拡張子なしのパートは
+        // 「calamine は読むが pre-flight は数えない」= zip-bomb の抜け道になる。
+        const SHEET: &[u8] = br#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>hello</t></is></c></row></sheetData></worksheet>"#;
+
+        // 前提の確認: 拡張子なしのパートでも calamine は普通に読む。
+        let legit = make_xlsx_with_worksheet_part("worksheets/payload", SHEET);
+        let doc = XlsxParser
+            .parse_bytes(&legit, "odd-name.xlsx", &[])
+            .expect("calamine resolves the worksheet through rels, not by file name");
+        assert_eq!(
+            doc.chunks.len(),
+            1,
+            "the suffix-less part must really be parsed (this is what makes the gap exploitable)"
+        );
+
+        // よって、そこに置かれた zip-bomb も pre-flight が捕まえねばならない。
+        // cap は boilerplate (Content_Types / rels / workbook.xml で合計 1.3 KB
+        // 程度) を確実に上回り、かつ bomb の実体 64 KiB は下回る値にする —
+        // さもないと boilerplate の合計超過で Err になり、**穴を突けていない
+        // のにテストが通ってしまう** (最初の版がこれで false pass した)。
+        const REAL: u32 = 64 * 1024;
+        const CAP: u64 = 8 * 1024;
+        let bomb = make_xlsx_with_worksheet_part("worksheets/payload", &vec![0u8; REAL as usize]);
+        let forged = forge_declared_uncompressed_size(&bomb, REAL, 1);
+        preflight_xlsx_decompression_budget_capped(&legit, "legit.xlsx", CAP)
+            .expect("the cap must be loose enough that the boilerplate parts alone pass");
+        let err = preflight_xlsx_decompression_budget_capped(&forged, "bomb.xlsx", CAP)
+            .expect_err("a bomb in a suffix-less part must be rejected too");
         assert!(
             err.to_string().contains("zip-bomb guard"),
             "error message should mention zip-bomb guard, got: {err}"
