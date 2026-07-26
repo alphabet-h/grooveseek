@@ -21,6 +21,7 @@ pub mod parent;
 pub mod parser;
 pub mod quality;
 pub mod schema;
+pub mod schema_compat;
 pub mod server;
 pub mod service;
 pub mod transport;
