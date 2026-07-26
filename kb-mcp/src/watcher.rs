@@ -336,10 +336,35 @@ fn handle_events(state: &WatcherState, events: &[DebouncedEvent]) {
     }
 }
 
-/// 対象ファイルの拡張子が `registry` にあり、`exclude_dirs` 配下でないこと。
+/// 対象ファイルの拡張子が `registry` にあり、除外対象でないこと。
+///
+/// `WatcherState` のうち `registry` / `exclude_dirs` しか見ないので、判定本体は
+/// [`should_process_parts`] に切り出してある (test から `Database` / `Embedder`
+/// のダミー構築なしに **本番と同一のロジック** を叩けるようにするため)。
 fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
+    should_process_parts(rel, full, &state.registry, &state.exclude_dirs)
+}
+
+/// [`should_process`] の判定本体。
+fn should_process_parts(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    exclude_dirs: &[String],
+) -> bool {
     // 除外ディレクトリ配下は無視 (rebuild_index と同じ扱い)
-    if is_under_excluded_dir(rel, &state.exclude_dirs) {
+    if is_under_excluded_dir(rel, exclude_dirs) {
+        return false;
+    }
+    // ユーザ設定に関わらず常に skip する denylist (`.git` / `node_modules` 等)。
+    // full-audit 2026-07-26 AU-03: `collect_source_files` (indexer) と
+    // `validate_collect_md_files` (main) は適用済みだったが watcher だけ
+    // 抜けており、`exclude_dirs` を絞った設定では **live watcher だけが**
+    // `.git/` や `node_modules/` を index していた (`npm install` で KB 汚染)。
+    if rel
+        .split('/')
+        .any(|component| indexer::is_hardcoded_excluded(component))
+    {
         return false;
     }
     // `.kb-mcp.db*` は kb_path の外にあるので通常ヒットしないが念のため
@@ -354,8 +379,7 @@ fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
         return false;
     }
     let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-    state
-        .registry
+    registry
         .extensions()
         .iter()
         .any(|e| e.eq_ignore_ascii_case(ext))
@@ -508,31 +532,51 @@ mod tests {
     /// `exclude_dirs` しか見ないので、test 用にその 3 つだけ差し込んだ
     /// 軽量判定ヘルパを用意する (`Database` / `Embedder` のダミー構築を
     /// 避けるため)。
+    ///
+    /// full-audit 2026-07-26 (H-1): 以前はここに本番 `should_process` の
+    /// 逐語コピーが置かれており、**テストがコピーだけを検証していて本番の
+    /// skip ルールを変えても全部 green のまま**だった。判定本体を
+    /// `should_process_parts` に切り出し、ここは委譲だけにすることで、
+    /// 既存 assert を 1 文字も変えずにテストが本番経路を踏むようにした。
     fn should_process_lite(
         rel: &str,
         full: &Path,
         registry: &Registry,
         exclude_dirs: &[String],
     ) -> bool {
-        if is_under_excluded_dir(rel, exclude_dirs) {
-            return false;
-        }
-        if rel.ends_with(".kb-mcp.db") || rel.ends_with(".kb-mcp.db-journal") {
-            return false;
-        }
-        let name = full.file_name().unwrap_or_default().to_string_lossy();
-        if indexer::is_office_lock_file(name.as_ref()) {
-            return false;
-        }
-        let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-        registry
-            .extensions()
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(ext))
+        should_process_parts(rel, full, registry, exclude_dirs)
     }
 
     fn default_exclude_dirs() -> Vec<String> {
         vec![".obsidian".to_string()]
+    }
+
+    /// Regression (full-audit 2026-07-26 AU-03): `HARDCODED_EXCLUDE_DIRS` は
+    /// ユーザ設定に関わらず常に効く denylist だが、`collect_source_files`
+    /// (indexer) と `validate_collect_md_files` (main) だけが適用しており
+    /// **watcher は素通し**だった。`exclude_dirs` を空にした設定では、フル
+    /// index が skip する `.git/` `node_modules/` を live watcher だけが
+    /// 拾ってしまう (`npm install` 一発で KB が汚染される)。
+    #[test]
+    fn test_should_process_applies_hardcoded_excludes_even_with_empty_config() {
+        let reg = Registry::defaults();
+        let empty: Vec<String> = Vec::new();
+        // HARDCODED_EXCLUDE_DIRS = [".git", ".svn", "node_modules"]。
+        for rel in [
+            "node_modules/pkg/README.md",
+            ".git/COMMIT_EDITMSG.md",
+            ".svn/entries.md",
+            "sub/node_modules/deep/x.md",
+        ] {
+            let full = Path::new("/tmp/kb").join(rel);
+            assert!(
+                !should_process_lite(rel, &full, &reg, &empty),
+                "{rel} must be skipped by the hardcoded denylist regardless of exclude_dirs"
+            );
+        }
+        // denylist に無い通常ファイルは従来どおり通す。
+        let ok = Path::new("/tmp/kb/notes/a.md");
+        assert!(should_process_lite("notes/a.md", ok, &reg, &empty));
     }
 
     #[test]
