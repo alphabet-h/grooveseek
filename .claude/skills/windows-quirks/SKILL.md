@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Seven field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration, subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), or diagnosing "works on Linux, fails on Windows" failures
+description: Eight field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration, subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -80,6 +80,18 @@ CI runner / subagent の SSH・NTLM logon session からは `Register-ScheduledT
 **正しいやり方**: `"` を含む複数行文字列を native コマンドに渡す場合は PowerShell を使わず **Bash tool + heredoc + `git commit -F -`** (stdin 経由) にする。PowerShell で完結させたい場合はメッセージ内の二重引用符を単一引用符に置き換えるか、一時ファイル + `-F <path>` を使う。
 
 出典: 2026-07-25 session (PR #76 の commit 時に実地で発火)
+
+## 8. PowerShell で `2>$null` を付けると cargo の診断が丸ごと消える (検証が空振りする)
+
+**症状**: `cargo clippy --all-targets 2>$null | Select-String "^warning|^error"` が何も出さないので「clean」と判断したが、実際には `redundant closure` で `-D warnings` が fail していた。review で指摘されるまで気付けなかった。
+
+**原因**: cargo / rustc の診断は **stdout ではなく stderr** に出る。`2>$null` はそれを丸ごと捨てるため、grep 対象が空になって常に「警告なし」に見える。`Select-String` の結果が空 = 成功、と読んでしまうのが罠。さらに `-D warnings` を付けていなければ warning は exit code にも出ない。
+
+**正しいやり方**: 検証コマンドでは **stderr を捨てない**。Bash tool 側で `cargo clippy --all-targets -- -D warnings 2>&1 | tail -5` として exit code を見るか、PowerShell なら `2>$null` を外して `$LASTEXITCODE` を確認する。「grep がヒット 0 件」を成功条件にしない — **exit code を成功条件にする**。
+
+**補足**: これは「検証コマンドが壊れていても成功に見える」class の罠。同 session では codex polling script を `run_in_background` ではなく shell の `&` で起動して harness の追跡外に置く失敗も 2 回起こしており (詳細は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 38)、**1 度 note に書いただけでは再発を防げなかった**。検証系のコマンドは「exit code を見る」形に統一するのが唯一効く対策。
+
+出典: 2026-07-26 full-audit hot-fix session (review agent の Must-fix で発覚)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
