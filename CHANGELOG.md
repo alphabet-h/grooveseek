@@ -6,6 +6,27 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A `bind` value in `kb-mcp.toml` could run a command when the tray opened
+  the web UI** (AU-12). The tray split `bind` at its last colon and carried
+  both halves into its URLs as strings, so anything written there ended up in
+  `ui_url` — which was handed to `cmd /c start`, and `cmd.exe` parses what
+  follows `/c` as a command line. Rust's `Command` only quotes arguments that
+  contain whitespace, so an `&` passed straight through: measured, `cmd /c echo
+  <url>&ver` ran `ver`. A `bind` of `127.0.0.1:3100&ver&` was enough. The same
+  string-splicing let `127.0.0.1:3100@evil.example` through, where the part
+  before the `@` becomes *userinfo* and the real host is `evil.example` — the
+  tray's status polling would have gone there on its own, without anyone
+  clicking anything.
+
+  `bind` is now parsed as `<ipv4>:<port>`, `[<ipv6>]:<port>` or
+  `localhost:<port>`, and the tray rebuilds its authority from the host class
+  and the numeric port, so no byte of the config string reaches a URL. An
+  unparseable `bind` stops the tray at startup with an error naming the
+  setting. Opening the UI now goes through `ShellExecuteW`, which treats its
+  argument as a shell object rather than a command line; since that API will
+  also launch an executable it is given, the URL is checked to be `http://` or
+  `https://` first.
+
 - **A path containing `&` or `<` produced a plist that launchd cannot read**
   (AU-10). `render_plist` interpolated the binary path, the config directory
   and the service name straight into `<string>` elements. All three of `&`,

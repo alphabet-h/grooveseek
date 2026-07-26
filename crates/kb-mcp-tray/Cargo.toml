@@ -44,11 +44,15 @@ dirs = "6"
 anyhow = "1"
 toml = "0.8"
 # Stopping the daemon goes through OpenProcess / QueryFullProcessImageNameW /
-# TerminateProcess (see src/process.rs). Already in the tree transitively via
+# TerminateProcess (see src/process.rs). Opening the web UI goes through
+# ShellExecuteW (see src/ui.rs) — AU-12 replaced `cmd /c start`, which parsed
+# the URL as a command line. Already in the tree transitively via
 # tao/tray-icon; declared directly because we call it ourselves.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # NOTE (codex P1 round 1 on PR #61): keep `winresource` as an unconditional
