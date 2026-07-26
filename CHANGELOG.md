@@ -18,14 +18,16 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   failed: … xlsx parser panicked: attempt to subtract with overflow` and
   finishes normally.
 
-  Rather than repeat a `catch_unwind` in three parsers, the trait entry point
-  `Parser::parse_bytes` now wraps `parse_bytes_inner` (the new override point)
-  for **every** parser, present and future — the isolation belongs to the
-  boundary where untrusted files meet third-party crates (calamine, zip,
-  quick-xml, oxidize-pdf), not to individual formats, since we cannot enumerate
-  the panic sites inside them. The panic payload is carried into the error
-  message, so suppressing the backtrace does not cost the diagnosis. The
-  PDF-only guard is gone, replaced by the shared one.
+  Rather than repeat a `catch_unwind` in three parsers, the entry point
+  `parse_bytes` now wraps `parse_bytes_inner` (the new override point) for
+  **every** parser, present and future — the isolation belongs to the boundary
+  where untrusted files meet third-party crates (calamine, zip, quick-xml,
+  oxidize-pdf), not to individual formats, since we cannot enumerate the panic
+  sites inside them. It sits on a `ParserExt` extension trait with a blanket
+  impl rather than being a default method on `Parser`, so no parser can
+  override it and quietly opt out of the guard. The panic payload is carried
+  into the error message, so suppressing the backtrace does not cost the
+  diagnosis. The PDF-only guard is gone, replaced by the shared one.
 
 - **The tray's Stop and Restart could not stop the daemon, and said they
   had** (AU-65, a v0.9.1 regression). Both called `Stop-ScheduledTask`, which

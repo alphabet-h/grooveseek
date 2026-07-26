@@ -490,6 +490,10 @@ fn decode_text(t: &quick_xml::events::BytesText) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // AU-21: `parse_bytes` は `Parser` ではなく blanket impl の
+    // `ParserExt` 側にある (実装から override させないため)。テスト本体は
+    // 従来どおり `parse_bytes` を呼ぶので、trait を scope に入れるだけ。
+    use crate::parser::ParserExt;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 

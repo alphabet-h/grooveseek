@@ -23,7 +23,7 @@
 
 use std::io::Write;
 
-use kb_mcp::parser::{DocxParser, Parser, PdfParser, PptxParser, XlsParser, XlsxParser};
+use kb_mcp::parser::{DocxParser, Parser, ParserExt, PdfParser, PptxParser, XlsParser, XlsxParser};
 use zip::write::SimpleFileOptions;
 
 /// Build a zip from `(name, contents)` pairs. Used to assemble deliberately

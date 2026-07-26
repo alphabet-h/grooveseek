@@ -334,6 +334,10 @@ mod tests {
     // 移設したが、テストは移動せずそのまま維持する (import だけ足す)。
     use crate::parser::panic_guard::{SUPPRESS_PANIC_OUTPUT, SuppressPanicOutputGuard};
     use std::cell::Cell;
+    // AU-21: `parse_bytes` は `Parser` ではなく blanket impl の `ParserExt`
+    // 側にある (実装から override させないため)。テスト本体は従来どおり
+    // `parse_bytes` を呼ぶので、trait を scope に入れるだけ。
+    use crate::parser::ParserExt;
 
     // Task 2.7 で正式化 (生成手順の doc 化含む) する最小 2 ページ PDF。
     // ページ 1="Hello World"、ページ 2="Second Page"。xref オフセット込みで

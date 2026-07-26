@@ -7,7 +7,7 @@ use walkdir::WalkDir;
 
 use crate::db::Database;
 use crate::embedder::Embedder;
-use crate::parser::Registry;
+use crate::parser::{ParserExt, Registry};
 use crate::quality;
 
 pub mod progress;
