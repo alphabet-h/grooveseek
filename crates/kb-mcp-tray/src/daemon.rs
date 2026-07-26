@@ -53,16 +53,23 @@ pub async fn start(service_name: &str) -> Result<()> {
 /// count as a failure even when it disappears *between* the lookup and the
 /// kill: `handle_menu` spawns an independent task per click, so two overlapping
 /// Stop/Restart clicks can both clear the lookup while only the first
-/// terminates anything (codex P2 on PR #89). The catch therefore re-checks —
-/// still there means a real failure and rethrows, gone means the stop already
-/// happened and falls through to `exit 0`.
+/// terminates anything (codex P2 round 1 on PR #89). The catch therefore
+/// re-checks and only rethrows if the process is still running.
+///
+/// Both the kill and that re-check go through the `$p` object rather than the
+/// number, so the pid is resolved exactly once. Re-resolving it after the guard
+/// would reintroduce the very race the guard exists to prevent: if the pid were
+/// recycled in between, `Stop-Process -Id` would terminate the replacement
+/// without ever checking its name, and the catch would see the replacement as
+/// "still running" (codex P2 round 2). `$p.HasExited` asks about the identity
+/// that was actually validated.
 pub fn stop_by_pid_script(pid: u32) -> String {
     format!(
         "$p = $null; \
          try {{ $p = Get-Process -Id {pid} -ErrorAction Stop }} catch {{ }}; \
          if ($p -and $p.ProcessName -eq 'kb-mcp') \
-         {{ try {{ Stop-Process -Id {pid} -Force -ErrorAction Stop }} \
-         catch {{ if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw }} }} }}; \
+         {{ try {{ $p | Stop-Process -Force -ErrorAction Stop }} \
+         catch {{ if (-not $p.HasExited) {{ throw }} }} }}; \
          exit 0"
     )
 }
@@ -184,8 +191,22 @@ mod tests {
     fn stop_by_pid_script_guards_on_process_name() {
         let script = stop_by_pid_script(4242);
         assert!(script.contains("Get-Process -Id 4242"));
-        assert!(script.contains("Stop-Process -Id 4242 -Force"));
+        assert!(script.contains("$p | Stop-Process -Force"));
         assert!(script.contains("$p.ProcessName -eq 'kb-mcp'"));
+    }
+
+    /// The pid must be resolved exactly once. Everything after the guard goes
+    /// through `$p`, because re-resolving the number would let a recycled pid
+    /// slip past the name check and be terminated in the replacement's place
+    /// (codex P2 round 2 on PR #89).
+    #[test]
+    fn stop_by_pid_script_resolves_the_pid_only_once() {
+        let script = stop_by_pid_script(4242);
+        assert_eq!(
+            script.matches("4242").count(),
+            1,
+            "the pid must appear only in the initial lookup: {script}"
+        );
     }
 
     /// Stopping an already-stopped daemon has to succeed. Measured
@@ -222,8 +243,9 @@ mod tests {
         let kill = script.find("Stop-Process").expect("kill present");
         let tail = &script[kill..];
         assert!(
-            tail.contains("catch") && tail.contains("Get-Process -Id 4242"),
-            "the kill must be wrapped in a catch that re-checks the process: {script}"
+            tail.contains("catch") && tail.contains("$p.HasExited"),
+            "the kill must be wrapped in a catch that re-checks the validated \
+             process object: {script}"
         );
     }
 
@@ -258,7 +280,7 @@ mod tests {
     fn stop_by_pid_script_matches_the_empirically_verified_text() {
         assert_eq!(
             stop_by_pid_script(4242),
-            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop } catch { }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { Stop-Process -Id 4242 -Force -ErrorAction Stop } catch { if (Get-Process -Id 4242 -ErrorAction SilentlyContinue) { throw } } }; exit 0"
+            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop } catch { }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } } }; exit 0"
         );
     }
 
