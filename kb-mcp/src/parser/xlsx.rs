@@ -316,9 +316,35 @@ fn preflight_xlsx_decompression_budget(bytes: &[u8], path_hint: &str) -> Result<
 }
 
 /// アーカイブ内の全 entry のうち name が `.xml` / `.bin` / `.rels` の
-/// いずれか (大小文字を区別しない) で終わるもの全ての申告 uncompressed
-/// size (zip local file header 由来、展開はしない) を合計し、`cap` を
-/// 超えていれば calamine を呼ぶ前に `Err` にする。
+/// いずれか (大小文字を区別しない) で終わるものについて、展開後サイズの
+/// 累計が `cap` を超えていれば calamine を呼ぶ前に `Err` にする。
+///
+/// 検査は 2 層 (full-audit 2026-07-26 AU-20):
+///
+/// 1. **申告値** (`ZipFile::size()`) が残り budget を超えていれば、展開を
+///    試みるまでもなく拒否する。正直な巨大アーカイブはここで即断できる。
+/// 2. **実際に展開して数える**。zip 仕様は申告 uncompressed size を強制せず、
+///    CRC 検証は全展開後にしか行われない。zip 8.6 の deflate 経路も
+///    `DeflateDecoder::new(reader)` を申告値で bound しておらず
+///    (`uncompressed_size` は lzma / legacy 方式にしか渡らない)、実測でも
+///    **申告 10 バイトのエントリから 100 MB が読み出せた**。したがって層 1
+///    だけでは「申告を小さく偽装した zip-bomb」を通してしまう (実測: 101 KB
+///    の crafted xlsx が pre-flight を素通りし、calamine が 13 秒かけて
+///    100 MB を展開した)。展開結果は [`std::io::sink`] 相当に捨てながら
+///    **残り budget + 1 バイトで打ち切る**ので、preflight 自体のメモリは
+///    固定バッファ分、CPU は最大でも cap + 1 バイトの展開に収まる。
+///
+/// 代償として正規の xlsx でも XML パートを 1 回余分に展開する (calamine が
+/// 後でもう一度展開する)。実測 (release、この機の場合): calamine が読まない
+/// 11.8 MB の XML パートを持つ xlsx で `parse_bytes` が 12 µs → **5.08 ms**
+/// (≈ 2.3 GB/s、この 5 ms が pre-flight のほぼ純粋なコスト)。16 MB の
+/// worksheet を持つ実用サイズの xlsx では 29.6 ms → 37.4 ms。cap いっぱい
+/// (50 MiB) まで展開させられた最悪ケースでも 20 ms 台で、同じ文書の
+/// embedding (数百 ms 〜) に比べれば無視できる。
+///
+/// `zip` crate は calamine と **同一インスタンス** (`cargo tree` で
+/// `zip v8.6.0` を共有、feature unification 済) なので、「我々が展開でき
+/// ない圧縮方式を calamine だけが展開できる」という抜け道は無い。
 ///
 /// codex P1 (PR #70 round 4): 旧実装は `xl/worksheets/*.xml` +
 /// `xl/sharedStrings.xml` + `xl/styles.xml` という固定パスのみを検査して
@@ -355,24 +381,72 @@ fn preflight_xlsx_decompression_budget_capped(
     let Ok(mut zip) = zip::ZipArchive::new(Cursor::new(bytes)) else {
         return Ok(());
     };
+    // 対象 entry の **実展開バイト数** の累計。申告値ではない (層 2 参照)。
     let mut total: u64 = 0;
     for i in 0..zip.len() {
-        let Ok(entry) = zip.by_index_raw(i) else {
+        // 対象判定と申告 size は metadata だけで取れる (`by_index_raw` は
+        // 圧縮データをそのまま返す reader = 展開しない)。
+        let (name, declared) = {
+            let Ok(entry) = zip.by_index_raw(i) else {
+                continue;
+            };
+            (entry.name().to_ascii_lowercase(), entry.size())
+        };
+        let is_target = name.ends_with(".xml") || name.ends_with(".bin") || name.ends_with(".rels");
+        if !is_target {
+            continue;
+        }
+
+        // 層 1: 申告値だけで既に budget 超過 = 展開を試みるまでもなく拒否。
+        let remaining = cap.saturating_sub(total);
+        if declared > remaining {
+            anyhow::bail!(
+                "{path_hint}: declared .xml/.bin/.rels entry size exceeds {cap} bytes cap \
+                 (zip-bomb guard; entry {name:?} declares {declared} bytes with \
+                 {remaining} bytes of budget left)"
+            );
+        }
+
+        // 層 2: 申告値は信用できないので実際に展開して数える。残り budget を
+        // 1 バイトでも超えたら打ち切れるよう `remaining + 1` で bound する。
+        let Ok(mut entry) = zip.by_index(i) else {
+            // 展開できない entry (暗号化 / 未対応の圧縮方式) は calamine でも
+            // 読めないため、budget には数えず次へ進む。
             continue;
         };
-        let name = entry.name().to_ascii_lowercase();
-        let is_target = name.ends_with(".xml") || name.ends_with(".bin") || name.ends_with(".rels");
-        if is_target {
-            total = total.saturating_add(entry.size());
+        let actual = count_decompressed_bytes(&mut entry, remaining.saturating_add(1));
+        total = total.saturating_add(actual);
+        if total > cap {
+            anyhow::bail!(
+                "{path_hint}: actual decompressed size of .xml/.bin/.rels entries exceeds \
+                 {cap} bytes cap (zip-bomb guard; entry {name:?} declared {declared} bytes \
+                 but expands past the remaining budget)"
+            );
         }
     }
-    if total > cap {
-        anyhow::bail!(
-            "{path_hint}: declared .xml/.bin/.rels entry size total ({total} bytes) exceeds \
-             {cap} bytes cap (zip-bomb guard)"
-        );
-    }
     Ok(())
+}
+
+/// `reader` を最大 `limit` バイトまで読み進め、読めたバイト数を返す。中身は
+/// 保持しない (固定バッファに読んでは捨てる) ので、メモリは `limit` に依らず
+/// 一定。
+///
+/// 読み出しエラー (壊れた deflate stream、CRC 不一致等) は `Err` にせず、
+/// **そこまでに読めたバイト数**を返して打ち切る: pre-flight の役目は
+/// 「展開量が cap を超えないこと」の確認だけで、壊れたファイル自体は後段の
+/// calamine が `Err` にする (= 既存の per-file skip 経路に乗る)。
+fn count_decompressed_bytes(reader: &mut impl std::io::Read, limit: u64) -> u64 {
+    let mut buf = [0u8; 8 * 1024];
+    let mut total: u64 = 0;
+    while total < limit {
+        let want = std::cmp::min(buf.len() as u64, limit - total) as usize;
+        match reader.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => total += n as u64,
+            Err(_) => break,
+        }
+    }
+    total
 }
 
 fn xlsx_frontmatter(bytes: &[u8], path_hint: &str) -> super::Frontmatter {
@@ -565,6 +639,146 @@ mod tests {
         let err = preflight_xlsx_decompression_budget_capped(&buf, "x.xlsx", 5).expect_err(
             "declared size over the injected 5-byte cap must be Err for uppercase .XML too",
         );
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    /// zip の申告 uncompressed size を書き換えて「申告より実体が大きい」
+    /// アーカイブを作る (AU-20 の攻撃者モデルそのもの)。
+    ///
+    /// `ZipWriter` は常に正しい size を書くため、生成後にバイト列を直接
+    /// patch するしかない。書き換える 2 箇所は zip の仕様どおり:
+    /// local file header (`PK\x03\x04`) の +22、central directory header
+    /// (`PK\x01\x02`) の +24 が、いずれも uncompressed size (u32 LE)。
+    /// CRC は元のまま (= 正しい) にしておく — zip 仕様では CRC 検証は全展開
+    /// **後** なので、展開を始める前の pre-flight は CRC を当てにできない、
+    /// という前提もこの fixture が体現している。
+    fn forge_declared_uncompressed_size(zip_bytes: &[u8], real: u32, fake: u32) -> Vec<u8> {
+        let mut data = zip_bytes.to_vec();
+        let mut patched = 0;
+        for (magic, offset) in [(b"PK\x03\x04", 22usize), (b"PK\x01\x02", 24usize)] {
+            let mut i = 0;
+            while i + offset + 4 <= data.len() {
+                if &data[i..i + 4] == magic
+                    && u32::from_le_bytes(data[i + offset..i + offset + 4].try_into().unwrap())
+                        == real
+                {
+                    data[i + offset..i + offset + 4].copy_from_slice(&fake.to_le_bytes());
+                    patched += 1;
+                }
+                i += 1;
+            }
+        }
+        assert_eq!(
+            patched, 2,
+            "expected to patch the local + central header size fields"
+        );
+        data
+    }
+
+    #[test]
+    fn test_xlsx_preflight_rejects_entry_whose_declared_size_is_forged() {
+        // AU-20: 旧 pre-flight は申告 uncompressed size の合計しか見ていな
+        // かった。zip 仕様は申告値を強制せず、zip 8.6 の deflate 展開も申告値
+        // で bound していない (実測: 申告 10 バイトのエントリから 100 MB が
+        // 読み出せた)。したがって「申告を極小に偽装した高圧縮エントリ」は
+        // pre-flight を素通りし、calamine が実際に展開してしまう。
+        //
+        // ここでは 64 KiB のゼロ (= 高圧縮) を書いてから申告値を 1 バイトに
+        // 偽装し、cap を 1 KiB に注入する。層 1 (申告値) では 1 <= 1024 なので
+        // 通ってしまい、層 2 (実展開) だけが検出できる。
+        const REAL: u32 = 64 * 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
+
+        // 前提の確認: 偽装後も申告値は 1 バイトに見える (= 層 1 は通過する)。
+        let mut archive = zip::ZipArchive::new(Cursor::new(forged.as_slice())).unwrap();
+        assert_eq!(
+            archive.by_index_raw(0).unwrap().size(),
+            1,
+            "the forged archive must still declare 1 byte"
+        );
+
+        let err = preflight_xlsx_decompression_budget_capped(&forged, "bomb.xlsx", 1024)
+            .expect_err("an entry that expands past the cap must be Err despite its declaration");
+        assert!(
+            err.to_string().contains("zip-bomb guard"),
+            "error message should mention zip-bomb guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_xlsx_preflight_counts_actual_bytes_not_declared_ones() {
+        // 層 2 の会計が「実展開バイト数」であることの確認: 実体 64 KiB を
+        // 1 バイトと偽装したエントリでも、cap が実体を上回っていれば通る
+        // (= 偽装の検出ではなく、あくまで展開量で判断している)。
+        const REAL: u32 = 64 * 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zip.start_file("xl/worksheets/sheet1.xml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            zip.finish().unwrap();
+        }
+        let forged = forge_declared_uncompressed_size(&buf, REAL, 1);
+        preflight_xlsx_decompression_budget_capped(&forged, "ok.xlsx", REAL as u64)
+            .expect("actual size within the cap must be Ok even when the declaration is a lie");
+    }
+
+    #[test]
+    fn test_xlsx_preflight_rejects_cumulative_actual_size_over_cap() {
+        // 1 エントリずつは cap 未満でも、複数の偽装エントリを積算すると
+        // 超える (ooxml.rs::read_zip_entry_capped の累積 budget と同じ論点を
+        // 実展開ベースの会計でも押さえる)。
+        const REAL: u32 = 32 * 1024;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            for name in ["xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(&vec![0u8; REAL as usize]).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        // 2 エントリ分 (= local 2 + central 2) を patch するので個別に呼ぶ。
+        let mut data = buf;
+        for _ in 0..2 {
+            data = {
+                let mut once = data.clone();
+                let mut patched = 0;
+                for (magic, offset) in [(b"PK\x03\x04", 22usize), (b"PK\x01\x02", 24usize)] {
+                    let mut i = 0;
+                    while i + offset + 4 <= once.len() {
+                        if &once[i..i + 4] == magic
+                            && u32::from_le_bytes(
+                                once[i + offset..i + offset + 4].try_into().unwrap(),
+                            ) == REAL
+                        {
+                            once[i + offset..i + offset + 4].copy_from_slice(&1u32.to_le_bytes());
+                            patched += 1;
+                            break; // 1 回の pass で 1 フィールドだけ書き換える
+                        }
+                        i += 1;
+                    }
+                }
+                assert_eq!(patched, 2, "one local + one central field per pass");
+                once
+            };
+        }
+
+        // 実体は 32 KiB × 2 = 64 KiB。cap を 48 KiB にすると 2 個目で超える。
+        let err = preflight_xlsx_decompression_budget_capped(&data, "bomb.xlsx", 48 * 1024)
+            .expect_err("cumulative actual size over the cap must be Err");
         assert!(
             err.to_string().contains("zip-bomb guard"),
             "error message should mention zip-bomb guard, got: {err}"

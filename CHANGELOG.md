@@ -6,6 +6,23 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A crafted `.xlsx` could make indexing decompress far more than the 50 MiB
+  cap by lying about its size** (AU-20). The preflight that runs before
+  calamine summed each entry's *declared* uncompressed size, and the ZIP
+  format does not enforce that number — the CRC is only checked after the
+  whole entry has been decompressed, and zip 8.6 does not bound deflate output
+  by the declaration either. Measured: a 101 KB workbook declaring 10 bytes
+  for its worksheet expanded to 100 MB, sailed through the preflight, and kept
+  calamine busy for 13 seconds; the ratio scales linearly, so a file still
+  under the 50 MiB input cap could demand tens of gigabytes. The preflight now
+  also decompresses each `.xml` / `.bin` / `.rels` entry for real, discarding
+  the output and stopping one byte past the remaining budget, so both the
+  memory and the work it can be made to do stay bounded regardless of what the
+  archive claims. The same file is now rejected in 0.7 s with a `zip-bomb
+  guard` error, and the run continues with the other files. Legitimate
+  workbooks pay one extra decompression pass: measured at ~5 ms for 11.8 MB of
+  XML, against embedding costs in the hundreds of milliseconds.
+
 - **One malformed Office document could abort an entire `kb-mcp index` run**
   (AU-21). The indexer already skips a file whose parser returns `Err`, but a
   **panic** unwinds straight past that `match`, and indexing is sequential, so
