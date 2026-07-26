@@ -24,6 +24,31 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+/// Build the argv handed to the child `kb-mcp.exe`.
+///
+/// `serve` is prepended **unconditionally** — which is precisely why the Task
+/// Scheduler Action must not pass `serve` itself. The other half of that
+/// invariant lives in `kb-mcp/src/service/windows.rs::resolve_action_target`,
+/// which leaves the `-Argument` clause empty whenever the Action points at this
+/// binary. If both sides supplied `serve` the child would launch as
+/// `kb-mcp.exe serve serve` and die with "unknown subcommand"; if neither did,
+/// `kb-mcp.exe` would start with no subcommand at all. Either way the breakage
+/// surfaces only at the *next logon*, long after `kb-mcp service install`
+/// reported success — so both halves are unit-tested.
+///
+/// Extra args are forwarded after `serve`, so a future Action revision can pass
+/// flags without changing this binary.
+///
+/// Compiled on every platform (not just Windows) so the invariant test runs on
+/// the Linux and macOS CI legs too; only the Windows `main` actually calls it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn child_args(extra: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(extra.len() + 1);
+    args.push("serve".to_string());
+    args.extend_from_slice(extra);
+    args
+}
+
 #[cfg(target_os = "windows")]
 fn main() -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
@@ -61,18 +86,13 @@ fn main() -> std::io::Result<()> {
 
     // Forward any args we received to the child (= Task Scheduler may pass
     // extra flags in future revisions). The first arg of std::env::args()
-    // is our own exe path; skip it.
-    //
-    // INVARIANT: the Task Scheduler Action MUST NOT pass `serve` as an
-    // Argument. kb-mcp-svc unconditionally adds `serve` below, so doubling it
-    // would produce `kb-mcp.exe serve serve` which fails with
-    // "unknown subcommand: serve". `register_via_powershell` enforces this
-    // by leaving `argument_clause` empty when it points at the svc binary.
+    // is our own exe path; skip it. `child_args` supplies the `serve`
+    // subcommand — see its doc-comment for the invariant it shares with the
+    // installer.
     let extra_args: Vec<String> = std::env::args().skip(1).collect();
 
     Command::new(&kb_mcp_exe)
-        .arg("serve")
-        .args(&extra_args)
+        .args(child_args(&extra_args))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -90,4 +110,43 @@ fn main() {
          or LaunchAgent, where this hidden-console workaround is unnecessary."
     );
     std::process::exit(1);
+}
+
+/// This crate's half of the "exactly one `serve`" invariant. The installer's
+/// half is asserted in
+/// `kb-mcp/tests/service_install_integration.rs::windows_register_script_*`.
+#[cfg(test)]
+mod tests {
+    use super::child_args;
+
+    /// The production Action passes **no** arguments when it points at this
+    /// binary, so the empty-`extra` case is the one that actually runs at
+    /// logon. Exactly one `serve` must reach the child.
+    #[test]
+    fn child_args_supplies_exactly_one_serve_for_the_no_argument_action() {
+        let args = child_args(&[]);
+        assert_eq!(args, ["serve"]);
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "serve").count(),
+            1,
+            "svc must add serve exactly once; the Task Scheduler Action leaves -Argument empty"
+        );
+    }
+
+    /// Extras land *after* the subcommand — `kb-mcp --bind x serve` would be
+    /// rejected by clap, so ordering is part of the contract.
+    #[test]
+    fn child_args_forwards_extras_after_serve() {
+        let extra = vec!["--bind".to_string(), "127.0.0.1:3100".to_string()];
+        assert_eq!(child_args(&extra), ["serve", "--bind", "127.0.0.1:3100"]);
+    }
+
+    /// If a future Action revision ever did pass `serve`, this documents what
+    /// the child would receive: the doubled form that fails with "unknown
+    /// subcommand". The guard against it is the installer leaving
+    /// `argument_clause` empty, not any filtering here.
+    #[test]
+    fn child_args_does_not_deduplicate_a_caller_supplied_serve() {
+        assert_eq!(child_args(&["serve".to_string()]), ["serve", "serve"]);
+    }
 }
