@@ -2729,12 +2729,15 @@ mod tests {
         let overrides = crate::config::SearchOverrides::default();
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
+        // clamp 済みの値ではなく **生の u32::MAX** を渡す。境界の clamp
+        // (`clamp_search_limit`) が外れても db 層の `VEC_KNN_MAX_K` が
+        // 効くこと = 多層防御が成立していることまで含めて固定する。
         let hits = run_search_pipeline(
             &db,
             None,
             "zebrafish",
             &emb(0.2),
-            clamp_search_limit(u32::MAX),
+            u32::MAX,
             &filters,
             &overrides,
             &toml,

@@ -361,10 +361,7 @@ fn should_process_parts(
     // `validate_collect_md_files` (main) は適用済みだったが watcher だけ
     // 抜けており、`exclude_dirs` を絞った設定では **live watcher だけが**
     // `.git/` や `node_modules/` を index していた (`npm install` で KB 汚染)。
-    if rel
-        .split('/')
-        .any(|component| indexer::is_hardcoded_excluded(component))
-    {
+    if rel.split('/').any(indexer::is_hardcoded_excluded) {
         return false;
     }
     // `.kb-mcp.db*` は kb_path の外にあるので通常ヒットしないが念のため
