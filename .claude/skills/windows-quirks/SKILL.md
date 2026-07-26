@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Eight field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration, subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, or diagnosing "works on Linux, fails on Windows" failures
+description: Nine field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -17,9 +17,11 @@ kb-mcp を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **正しいやり方**: XML 経路は捨てて `Register-ScheduledTask -Action -Trigger -Settings` (current logon identity から Principal を auto-build) を使う。実装は `kb-mcp/src/service/windows.rs` の `register_via_powershell()` を正とする。要点: ① Action/Trigger/Settings parameter set を使う (Principal が current logon identity から auto-build される)、② PowerShell 単一引用符リテラル内の path は `replace('\'', "''")` で escape、③ `$ErrorActionPreference='Stop'` で cmdlet 失敗を exit code に伝播、④ Action は `kb-mcp-svc.exe` に向け `serve` 引数を渡さない (svc 側が無条件付加、罠 2 参照)。
 
-CI runner / subagent の SSH・NTLM logon session からは `Register-ScheduledTask` 自体が呼べない (COM API が interactive logon token を要求) ので、統合テストは `#[ignore]` + interactive shell からの手動実行にする。
+**logon session 依存だが「CI では常に不可」ではない** (2026-07-26 訂正): SSH / NTLM logon session や subagent の実行環境からは `Register-ScheduledTask` が "Access is denied" になる。一方 **GitHub-hosted の windows-latest runner では成功する** — [公式仕様](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)どおり管理者権限 + UAC 無効でジョブが走るため。AU-09 (PR #83) の nightly windows leg で `windows_register_scheduledtask_smoke_test ... ok` を実測済み。
 
-出典: `.dev/knowledge/windows-task-scheduler-pitfalls.md` (罠 W-1〜W-6) / `.dev/knowledge/feature-43-summary.md`
+したがって統合テストは **`#[ignore]` のまま** (Task Scheduler を変更するので通常の `cargo test` では走らせない) だが、nightly の `--include-ignored` では CI カバレッジが得られる。「CI では動かないから」を理由に skip リストへ入れる前に、**その CI がどの logon 環境かを確認して実測する**こと。
+
+出典: `.dev/knowledge/windows-task-scheduler-pitfalls.md` (罠 W-1〜W-6) / `.dev/knowledge/feature-43-summary.md` / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 5)
 
 ## 2. コンソール subsystem binary から subprocess を spawn すると黒窓が出る
 
@@ -92,6 +94,20 @@ CI runner / subagent の SSH・NTLM logon session からは `Register-ScheduledT
 **補足**: これは「検証コマンドが壊れていても成功に見える」class の罠。同 session では codex polling script を `run_in_background` ではなく shell の `&` で起動して harness の追跡外に置く失敗も 2 回起こしており (詳細は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 38)、**1 度 note に書いただけでは再発を防げなかった**。検証系のコマンドは「exit code を見る」形に統一するのが唯一効く対策。
 
 出典: 2026-07-26 full-audit hot-fix session (review agent の Must-fix で発覚)
+
+## 9. Git Bash が `gh api` の先頭スラッシュを filesystem path に書き換える
+
+**症状**: `gh api /repos/{owner}/{repo}/actions/cache/usage` が下記で失敗する。
+```
+invalid API endpoint: "C:/Program Files/Git/repos/{owner}/{repo}/actions/cache/usage".
+Your shell might be rewriting URL paths as filesystem paths.
+```
+
+**原因**: MSYS2 / Git Bash は native な Windows 実行ファイルへ引数を渡す時、`/foo/bar` の形をした引数を POSIX path とみなして Windows path (`C:/Program Files/foo/bar`) へ自動変換する。`gh` は変換後の文字列を endpoint として受け取るため壊れる。
+
+**正しいやり方**: endpoint の**先頭スラッシュを落とす** (`gh api repos/{owner}/{repo}/...`)。`gh` は相対形式を受け付ける。どうしても先頭スラッシュが必要な引数では `MSYS_NO_PATHCONV=1` を前置する。PowerShell 側では発生しない。
+
+出典: 2026-07-26 AU-09 session / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 7)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
