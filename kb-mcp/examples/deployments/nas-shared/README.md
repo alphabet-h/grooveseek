@@ -51,9 +51,11 @@ edits the same files. **The index does not.** Each machine keeps its own
 
    ```bash
    # The parent must be writable by the account that runs kb-mcp, because
-   # .kb-mcp.db and its WAL sidecars are created there. The mount point
-   # itself has to exist before mounting — `mount` will not create it.
+   # .kb-mcp.db and its WAL sidecars are created there, and the ONNX model
+   # cache lands beside them. The mount point itself has to exist before
+   # mounting — `mount` will not create it.
    sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp
+   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp/fastembed
    sudo install -d /var/lib/kb-mcp/knowledge-base
 
    # Linux NFSv4 example. Read-only is fine here: only the KB files are

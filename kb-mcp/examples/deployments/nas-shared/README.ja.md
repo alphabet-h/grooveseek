@@ -49,9 +49,10 @@
 
    ```bash
    # .kb-mcp.db と WAL の sidecar が作られるのは親ディレクトリなので、
-   # kb-mcp を実行するアカウントが書ける必要がある。マウントポイント自体も
-   # 事前に作っておく — `mount` は作ってくれない。
+   # kb-mcp を実行するアカウントが書ける必要がある。ONNX モデルキャッシュも
+   # その隣に置く。マウントポイント自体も事前に作る — `mount` は作らない。
    sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp
+   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp/fastembed
    sudo install -d /var/lib/kb-mcp/knowledge-base
 
    # Linux NFSv4 の例。ここでは read-only で構わない — NAS 上にあるのは

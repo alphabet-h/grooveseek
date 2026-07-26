@@ -14,8 +14,11 @@ model = "bge-m3"
 reranker = "bge-v2-m3"
 rerank_by_default = false
 
-# Keep the model cache on local disk (fast); never point this at the NAS.
-fastembed_cache_dir = "/var/cache/fastembed"
+# Model cache: local disk, and writable by the account that runs kb-mcp.
+# Kept inside the same user-owned tree as the database so setup creates it
+# once. Omit the key entirely to use the OS cache dir (~/.cache/fastembed on
+# Linux) — but not if home directories are themselves on the NAS.
+fastembed_cache_dir = "/var/lib/kb-mcp/fastembed"
 
 [parsers]
 enabled = ["md"]
