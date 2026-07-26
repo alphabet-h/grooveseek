@@ -56,17 +56,21 @@ pub async fn start(service_name: &str) -> Result<()> {
 /// terminates anything (codex P2 round 1 on PR #89). The catch therefore
 /// re-checks and only rethrows if the process is still running.
 ///
-/// Both the kill and that re-check go through the `$p` object rather than the
-/// number, so the pid is resolved exactly once. Re-resolving it after the guard
-/// would reintroduce the very race the guard exists to prevent: if the pid were
-/// recycled in between, `Stop-Process -Id` would terminate the replacement
-/// without ever checking its name, and the catch would see the replacement as
-/// "still running" (codex P2 round 2). `$p.HasExited` asks about the identity
-/// that was actually validated.
+/// Touching `$p.Handle` right after the lookup is what actually makes the name
+/// guard binding. `Get-Process` hands back a `System.Diagnostics.Process` that
+/// holds no OS handle, and reading `ProcessName` does not open one, so both
+/// `Stop-Process -Id` and `Stop-Process -InputObject` end up re-opening the
+/// process by its stored pid at kill time — a pid recycled after the guard
+/// would be terminated in the replacement's place (codex P2 rounds 2 and 3).
+/// Windows will not reuse a pid while a handle to that process is open, so
+/// pinning one first means whatever gets validated is what gets killed.
+/// `.Handle` is inside the `try` because it throws if the process is already
+/// gone, and the catch clears `$p` so the guard then skips.
 pub fn stop_by_pid_script(pid: u32) -> String {
     format!(
         "$p = $null; \
-         try {{ $p = Get-Process -Id {pid} -ErrorAction Stop }} catch {{ }}; \
+         try {{ $p = Get-Process -Id {pid} -ErrorAction Stop; $null = $p.Handle }} \
+         catch {{ $p = $null }}; \
          if ($p -and $p.ProcessName -eq 'kb-mcp') \
          {{ try {{ $p | Stop-Process -Force -ErrorAction Stop }} \
          catch {{ if (-not $p.HasExited) {{ throw }} }} }}; \
@@ -195,10 +199,27 @@ mod tests {
         assert!(script.contains("$p.ProcessName -eq 'kb-mcp'"));
     }
 
-    /// The pid must be resolved exactly once. Everything after the guard goes
-    /// through `$p`, because re-resolving the number would let a recycled pid
-    /// slip past the name check and be terminated in the replacement's place
-    /// (codex P2 round 2 on PR #89).
+    /// An OS handle must be pinned before the name is checked. Without it the
+    /// guard proves nothing: `Get-Process` retains no handle and reading
+    /// `ProcessName` does not open one, so the kill re-opens the process by pid
+    /// and a recycled pid would be terminated in the replacement's place (codex
+    /// P2 rounds 2 and 3 on PR #89). Holding a handle is what stops Windows
+    /// from reusing the pid at all.
+    #[test]
+    fn stop_by_pid_script_pins_a_handle_before_validating() {
+        let script = stop_by_pid_script(4242);
+        let handle = script.find("$p.Handle").expect("handle pinned");
+        let guard = script.find("ProcessName").expect("guard present");
+        assert!(
+            handle < guard,
+            "the handle must be opened before the name is checked: {script}"
+        );
+    }
+
+    /// Everything after the lookup goes through `$p`, so the pid literal is
+    /// only ever used to resolve the process once. On its own this does not
+    /// establish the identity invariant — that is what the pinned handle is
+    /// for — but re-introducing a second `-Id` would be a regression.
     #[test]
     fn stop_by_pid_script_resolves_the_pid_only_once() {
         let script = stop_by_pid_script(4242);
@@ -206,6 +227,20 @@ mod tests {
             script.matches("4242").count(),
             1,
             "the pid must appear only in the initial lookup: {script}"
+        );
+    }
+
+    /// If the process is already gone the lookup (or the handle open) throws,
+    /// and the catch has to clear `$p` so the guard skips instead of running
+    /// against a half-initialised object.
+    #[test]
+    fn stop_by_pid_script_clears_the_process_when_the_lookup_fails() {
+        let script = stop_by_pid_script(4242);
+        let handle = script.find("$p.Handle").expect("handle pinned");
+        let guard = script.find("ProcessName").expect("guard present");
+        assert!(
+            script[handle..guard].contains("catch { $p = $null }"),
+            "a failed lookup or handle open must reset $p: {script}"
         );
     }
 
@@ -280,7 +315,7 @@ mod tests {
     fn stop_by_pid_script_matches_the_empirically_verified_text() {
         assert_eq!(
             stop_by_pid_script(4242),
-            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop } catch { }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } } }; exit 0"
+            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop; $null = $p.Handle } catch { $p = $null }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { $p | Stop-Process -Force -ErrorAction Stop } catch { if (-not $p.HasExited) { throw } } }; exit 0"
         );
     }
 
