@@ -67,6 +67,7 @@ pub struct KbServer {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[schemars(transform = crate::schema_compat::ClientCompat)]
 struct SearchParams {
     /// The search query text
     query: String,
@@ -153,12 +154,14 @@ impl From<&SearchParams> for crate::config::SearchOverrides {
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetDocumentParams {
     /// Relative path to the document within knowledge-base/ (e.g. "deep-dive/mcp/overview.md")
     path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetBestPracticeParams {
     /// Target name (e.g. "claude-code")
     target: String,
@@ -167,12 +170,14 @@ struct GetBestPracticeParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[schemars(transform = crate::schema_compat::ClientCompat)]
 struct RebuildIndexParams {
     /// Force full re-index ignoring existing hashes
     force: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
+#[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetConnectionGraphParams {
     /// Relative path of the starting document within knowledge-base/
     /// (e.g. "deep-dive/mcp/overview.md"). Must be already indexed.
@@ -2770,5 +2775,63 @@ mod tests {
         );
         // MMR on 側は pool_size 由来 (feature-28 P1 fix) なので元から有界。
         assert_eq!(compute_reranker_input_limit(true, 50, clamped), 50);
+    }
+
+    /// Every tool parameter schema kb-mcp advertises must stay inside the
+    /// conservative subset described in `crate::schema_compat`: no `null` unions
+    /// and no Rust-width `format` values. Runtimes that compile the schema into a
+    /// decoding grammar break on both, and the model then emits its raw tool-call
+    /// template as text that never reaches the server (issue #75).
+    ///
+    /// This asserts on the schema `rmcp` actually serves, so a parameter struct
+    /// added later without `#[schemars(transform = ...)]` fails here.
+    #[test]
+    fn test_advertised_tool_schemas_avoid_client_hostile_constructs() {
+        fn assert_clean(tool: &str, node: &serde_json::Value, path: &str) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Array(types)) = map.get("type") {
+                        assert!(
+                            !types.iter().any(|t| t.as_str() == Some("null")),
+                            "{tool}: {path}/type advertises the null union {types:?} -- optionality belongs in `required`, not in the type array"
+                        );
+                    }
+                    if let Some(serde_json::Value::String(format)) = map.get("format") {
+                        assert!(
+                            !crate::schema_compat::NONSTANDARD_FORMATS.contains(&format.as_str()),
+                            "{tool}: {path}/format is the non-standard value {format:?} -- numeric bounds belong in `minimum` / `maximum`"
+                        );
+                    }
+                    for (key, value) in map {
+                        assert_clean(tool, value, &format!("{path}/{key}"));
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, value) in items.iter().enumerate() {
+                        assert_clean(tool, value, &format!("{path}/{i}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        use rmcp::handler::server::common::schema_for_type;
+        let schemas = [
+            ("search", schema_for_type::<SearchParams>()),
+            ("get_document", schema_for_type::<GetDocumentParams>()),
+            (
+                "get_best_practice",
+                schema_for_type::<GetBestPracticeParams>(),
+            ),
+            ("rebuild_index", schema_for_type::<RebuildIndexParams>()),
+            (
+                "get_connection_graph",
+                schema_for_type::<GetConnectionGraphParams>(),
+            ),
+        ];
+        for (tool, schema) in schemas {
+            let value = serde_json::Value::Object((*schema).clone());
+            assert_clean(tool, &value, "");
+        }
     }
 }

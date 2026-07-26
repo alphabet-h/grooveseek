@@ -6,6 +6,27 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **Tool schemas advertised constructs that break strict tool-calling
+  runtimes** ([#75](https://github.com/alphabet-h/kb-mcp/issues/75)). Every
+  optional parameter was published as a union type — `{"type": ["string",
+  "null"]}`, 26 of them — alongside Rust-width `format` values such as
+  `uint32` and `float`. All of it is valid JSON Schema 2020-12 and clients
+  built on the official SDKs handle it, but OpenAI-style function calling
+  rejects `null` inside a union, and runtimes that compile the schema into a
+  decoding grammar (llama.cpp, Ollama, vLLM) have long-standing bugs with
+  union types; the workaround published for them is exactly to strip `null`
+  out of the type array. When a runtime cannot build a call, the model tends
+  to emit its raw tool-call template as plain text, which never reaches the
+  server. kb-mcp now advertises plain single types, and replaces each width
+  `format` with the explicit `minimum` / `maximum` it stood for. Nothing the
+  server accepts changes: optionality was already carried by the field's
+  absence from `required`, and an explicit `null` still deserialises to
+  `None`. Writing the integer bounds out matters because `schemars` emits
+  `minimum: 0` for unsigned types but never a `maximum`, so removing the
+  format alone would have advertised a domain *wider* than the server
+  accepts — a client would be told `4294967296` is a valid `u32`, and serde
+  would reject it before any handler saw it.
+
 - **The nightly `--include-ignored` run raced itself whenever the model
   cache was cold.** Several integration-test binaries each spawn `kb-mcp`
   as a subprocess, so on a cold cache they all reach for the same
