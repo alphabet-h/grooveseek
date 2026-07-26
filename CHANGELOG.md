@@ -16,6 +16,21 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   the failure was waiting for the first night after an eviction. The
   nightly job now pre-warms the cache single-threaded before running the
   full suite.
+- **The nightly Linux leg re-downloaded 4.6 GB of models every run.** The
+  job stayed green, so the only visible symptom was its saved cache
+  shrinking from 2.6 GB to 74 MB. Setting `FASTEMBED_CACHE_DIR` does not
+  put every model in one place: a unit test tears down by calling
+  `remove_var("FASTEMBED_CACHE_DIR")`, which clears the variable for the
+  whole process — `cargo test` runs its tests as threads, not as separate
+  processes — so any model initialised after that point resolves to the OS
+  default directory instead. BGE-M3 and the reranker load late enough to
+  land outside the cached directory. The job now caches both locations.
+- **The nightly coverage job failed intermittently on the same download
+  race.** It had neither a model cache nor a pre-warm step, so every run
+  downloaded BGE-small from cold with several test binaries competing for
+  the lock. It now restores the cache the `ignored-tests` job saves — read
+  only, so it cannot win the key and lock that job's much larger archive
+  out of storage — and pre-warms serially for the days the cache misses.
 
 ### Changed
 
@@ -29,12 +44,13 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   cross-encoder reranker) are skipped on the Windows leg: both assert
   OS-independent properties that the Linux leg already covers,
   `windows-latest` ships only 14 GB of free disk, and the Actions cache is
-  capped at 10 GB per repository. The model cache location is now pinned
-  to a workspace-relative directory through `FASTEMBED_CACHE_DIR` on both
-  legs (the scheme `ci.yml` already used), and the cache key prefix moved
-  to `fastembed-v2-` so the previous archives — which carry absolute
-  `~/.cache/fastembed` paths — are not restored to a location the new
-  configuration never reads. Source code unchanged.
+  capped at 10 GB per repository. The job caches both directories models
+  can land in — the workspace-relative one that `FASTEMBED_CACHE_DIR`
+  selects, and the OS default that `resolve_cache_dir` falls back to — and
+  the cache key prefix moved to `fastembed-v3-` so neither the pre-existing
+  archives (which carry absolute `~/.cache/fastembed` paths) nor an
+  intermediate single-directory archive is restored in place of the new
+  layout. Source code unchanged.
 
 ## [0.13.1] - 2026-07-26
 
