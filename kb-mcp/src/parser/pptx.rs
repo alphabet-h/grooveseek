@@ -68,7 +68,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
     // 連番 (= 実際のファイル番号ではない) とする。読めない/非標準な zip
     // では file 番号ソートにフォールバックする (index 全体を諦めさせない)。
     let ordered_file_nums =
-        resolve_visible_slide_order(&mut zip, &mut budget)?.unwrap_or(slide_nums);
+        resolve_visible_slide_order(&mut zip, &mut budget, path_hint)?.unwrap_or(slide_nums);
 
     let mut chunks = Vec::new();
     for (display_idx, file_n) in ordered_file_nums.into_iter().enumerate() {
@@ -81,7 +81,11 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             Some(b) => b,
             None => continue,
         };
-        let (title_opt, body) = parse_slide_xml(&slide_xml);
+        let (title_opt, body) = parse_slide_xml(
+            &slide_xml,
+            path_hint,
+            &format!("ppt/slides/slide{file_n}.xml"),
+        );
         let mut content = body;
         // notes: `ppt/slides/_rels/slide{file_n}.xml.rels` の notesSlide
         // relationship を解決する (dry-run (Task 3.7) で同番号 heuristic の
@@ -94,11 +98,17 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
             &format!("ppt/slides/_rels/slide{file_n}.xml.rels"),
             &mut budget,
         )?
-        .and_then(|rels_xml| resolve_notes_path(&rels_xml));
+        .and_then(|rels_xml| {
+            resolve_notes_path(
+                &rels_xml,
+                path_hint,
+                &format!("ppt/slides/_rels/slide{file_n}.xml.rels"),
+            )
+        });
         if let Some(path) = notes_path
             && let Some(notes_xml) = super::ooxml::read_zip_entry(&mut zip, &path, &mut budget)?
         {
-            let notes_text = collect_a_t(&notes_xml);
+            let notes_text = collect_a_t(&notes_xml, path_hint, &path);
             if !notes_text.trim().is_empty() {
                 content.push_str("\n\n[notes]\n");
                 content.push_str(notes_text.trim());
@@ -144,7 +154,12 @@ fn slide_number(name: &str, prefix: &str, suffix: &str) -> Option<usize> {
 /// (notes 解決) と `ppt/_rels/presentation.xml.rels` (可視順解決) の両方が
 /// 同じ rels XML 構造を読むため、この parser を共通化する (重複実装を避ける)。
 /// いずれかの属性が欠けている `<Relationship>` はスキップする。
-fn parse_relationships(rels_xml: &[u8]) -> Vec<(String, String, String)> {
+fn parse_relationships(
+    rels_xml: &[u8],
+    path_hint: &str,
+    part: &str,
+) -> Vec<(String, String, String)> {
+    super::ooxml::warn_if_truncated(path_hint, part, rels_xml);
     let mut reader = Reader::from_reader(rels_xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -175,6 +190,7 @@ fn parse_relationships(rels_xml: &[u8]) -> Vec<(String, String, String)> {
                 }
             }
             Ok(Event::Eof) => break,
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
             Err(_) => break,
             _ => {}
         }
@@ -188,8 +204,8 @@ fn parse_relationships(rels_xml: &[u8]) -> Vec<(String, String, String)> {
 /// `Target` を解決し、zip 内の絶対パス (例: `ppt/notesSlides/notesSlide1.xml`)
 /// を返す。該当する relationship が無ければ None (= 呼び出し側は notes なし
 /// として扱う。同番号 heuristic へのフォールバックはしない)。
-fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
-    parse_relationships(rels_xml)
+fn resolve_notes_path(rels_xml: &[u8], path_hint: &str, part: &str) -> Option<String> {
+    parse_relationships(rels_xml, path_hint, part)
         .into_iter()
         .find(|(_, rel_type, _)| rel_type.ends_with("/notesSlide"))
         .map(|(_, _, target)| resolve_relative_target("ppt/slides", &target))
@@ -211,12 +227,13 @@ fn resolve_notes_path(rels_xml: &[u8]) -> Option<String> {
 fn resolve_visible_slide_order(
     zip: &mut zip::ZipArchive<Cursor<&[u8]>>,
     budget: &mut u64,
+    path_hint: &str,
 ) -> Result<Option<Vec<usize>>> {
     let Some(presentation_xml) = super::ooxml::read_zip_entry(zip, "ppt/presentation.xml", budget)?
     else {
         return Ok(None);
     };
-    let rids = parse_sld_id_list(&presentation_xml);
+    let rids = parse_sld_id_list(&presentation_xml, path_hint);
     if rids.is_empty() {
         return Ok(None);
     }
@@ -226,10 +243,11 @@ fn resolve_visible_slide_order(
     else {
         return Ok(None);
     };
-    let rid_to_path: HashMap<String, String> = parse_relationships(&rels_xml)
-        .into_iter()
-        .map(|(id, _, target)| (id, resolve_relative_target("ppt", &target)))
-        .collect();
+    let rid_to_path: HashMap<String, String> =
+        parse_relationships(&rels_xml, path_hint, "ppt/_rels/presentation.xml.rels")
+            .into_iter()
+            .map(|(id, _, target)| (id, resolve_relative_target("ppt", &target)))
+            .collect();
 
     let order: Vec<usize> = rids
         .iter()
@@ -241,7 +259,8 @@ fn resolve_visible_slide_order(
 
 /// `ppt/presentation.xml` の `<p:sldIdLst>` 内 `<p:sldId r:id="rIdX" .../>` から
 /// `r:id` の値を出現順 (= 可視順) に集める。
-fn parse_sld_id_list(xml: &[u8]) -> Vec<String> {
+fn parse_sld_id_list(xml: &[u8], path_hint: &str) -> Vec<String> {
+    super::ooxml::warn_if_truncated(path_hint, "ppt/presentation.xml", xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -272,6 +291,7 @@ fn parse_sld_id_list(xml: &[u8]) -> Vec<String> {
                 }
             }
             Ok(Event::Eof) => break,
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
             Err(_) => break,
             _ => {}
         }
@@ -349,7 +369,8 @@ fn resolve_relative_target(base_dir: &str, target: &str) -> String {
 ///   sp の外側にある表のテキストが「次の sp の Start で握り潰される」/
 ///   「最後の sp の後ろだと一度も flush されない」のいずれかで silent drop
 ///   されるバグがあった。`<a:p>` 単位の flush に変えることで解消している。)
-fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
+fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, String) {
+    super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -421,6 +442,7 @@ fn parse_slide_xml(xml: &[u8]) -> (Option<String>, String) {
                 _ => {}
             },
             Ok(Event::Eof) => break,
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
             Err(_) => break,
             _ => {}
         }
@@ -440,7 +462,8 @@ fn ph_type_is_title(e: &quick_xml::events::BytesStart) -> bool {
 }
 
 /// XML から全 `a:t` テキストを連結する (notes 用の簡易版。要素間はスペース区切り)。
-fn collect_a_t(xml: &[u8]) -> String {
+fn collect_a_t(xml: &[u8], path_hint: &str, part: &str) -> String {
+    super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -465,6 +488,7 @@ fn collect_a_t(xml: &[u8]) -> String {
                 out.push(' ');
             }
             Ok(Event::Eof) => break,
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
             Err(_) => break,
             _ => {}
         }
