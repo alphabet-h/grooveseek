@@ -66,6 +66,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Changed
 
+- **AU-07 / AU-08**: The Windows service installer's PowerShell script is now
+  built by a pure function, so the two hot-fixes baked into it have regression
+  tests. `register_via_powershell` previously assembled the script and spawned
+  the process in one body, which left both untested: the v0.8.3 fix (use
+  `Register-ScheduledTask`'s Action/Trigger/Settings parameter set — `-Xml`
+  fails user-level registration with HRESULT 0x80070005) and the v0.9.1 fix
+  (an Action pointing at `kb-mcp-svc.exe` must pass no `-Argument`, because
+  that launcher prepends `serve` itself). The second was an invariant split
+  across two crates, documented with a comment on each side and asserted by
+  neither, and both failure modes appear only at the *next logon* — well after
+  `kb-mcp service install` reports success. The filesystem probe now lives in
+  `resolve_action_target` and the rendering in `build_register_script`,
+  matching how the Linux and macOS backends already expose `render_unit` /
+  `render_plist`. `kb-mcp-svc` gained the corresponding `child_args`, compiled
+  on every platform so its half of the invariant is checked on the Linux and
+  macOS CI legs too. The rendered script is byte-identical; no behaviour
+  changes.
+
 - **AU-09**: The nightly `ignored-tests` job now runs on `windows-latest`
   in addition to `ubuntu-latest`. The Windows-only `#[ignore]` tests —
   Task Scheduler registration (`tests/service_install_integration.rs`) and
