@@ -30,15 +30,18 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 `kb-mcp` の各 subcommand は出力先を以下の規約で使い分ける:
 
-- **stdout** = data output 専用 (= machine-parseable な結果の出力先)
-  - `kb-mcp search` の JSON 結果
+- **stdout** = そのコマンドの結果の出力先 (既定形式はコマンドごとに違う: `search` / `graph` は json、`eval` / `tune` / `validate` は text)
+  - `kb-mcp search` の結果 (`print_search_results`)
   - `kb-mcp eval` の golden query 評価結果
+  - `kb-mcp tune` の sweep 結果
+  - `kb-mcp validate` のレポート (`print_validate_report`)
+  - `kb-mcp graph` の connection graph (`print_graph`)
 - **stderr** = status / progress / 診断 (= 人間向けの進捗 / warning / error)
   - `kb-mcp index` の `Indexing ...` / `Done in ...` 進捗
   - `kb-mcp status` の `Documents: N` / `Chunks: N` 統計
   - すべての warning / info / error メッセージ (`tracing` / `eprintln!`)
 
-**新規 subprocess test を書く時の注意**: subcommand の出力先を `src/main.rs` の `Commands::*` block で `println!` (stdout) か `eprintln!` (stderr) かを必ず先に grep 確認すること。`Commands::Search` 以外は基本 stderr に出る (= F-67 で `kb-mcp status` を stdout から読もうとして fail した過去あり)。
+**新規 subprocess test を書く時の注意**: subcommand の出力先を `kb-mcp/src/main.rs` の `Commands::*` block で必ず先に grep 確認すること。その際 **`println!` だけでなく `print!` も** 対象にする (`eval` / `tune` の text 分岐は `print!`)。また **arm が直接書かず helper (`print_search_results` / `print_graph` / `print_validate_report`) に委譲している場合がある**。stdout に CLI 結果を書くのは上記 5 subcommand だけで、`index` / `status` / `service` は stderr のみ (= F-67 で `kb-mcp status` を stdout から読もうとして fail した過去あり)。`serve` は CLI 出力を持たないが、stdio transport では **MCP プロトコルが stdout を使う**点に注意。
 
 ## 運用の細則
 
