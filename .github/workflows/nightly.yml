@@ -79,35 +79,38 @@ jobs:
       # Cargo.lock のハッシュを key に含めると ort/fastembed の major bump 時に
       # cache が自然に invalidate される。
       #
-      # **2 箇所 cache するのは必須**。`FASTEMBED_CACHE_DIR` を job に設定しても
-      # モデルの落ち先は 1 箇所に揃わない: lib test binary の
-      # `config::tests::test_apply_cache_dir_env_respects_existing_env` が
-      # 後始末で `remove_var("FASTEMBED_CACHE_DIR")` を呼び、**プロセス全体**の
-      # env を消してしまう (`cargo test` は同一プロセス内の並列スレッドで走る
-      # ので "single-threaded" 前提のコメントは成り立たない)。その後に初期化
-      # される BGE-M3 / reranker は `resolve_cache_dir()` の fallback #2
-      # (= `dirs::cache_dir()`) に落ちる。
-      #   - `.fastembed_cache`      … kb-mcp subprocess が使う (env が効く)
-      #   - `<default_model_dir>`   … lib test が env 消失後に使う
-      # 片方だけ cache すると job は green のまま毎晩 4.6 GB を再 DL する
-      # (2026-07-26 実測: Linux の cache が 2.6 GB → 74 MB に縮んで発覚)。
+      # `FASTEMBED_CACHE_DIR` が効くので、モデルは基本的に `.fastembed_cache` に
+      # 落ちる。OS 既定ディレクトリも併せて cache するのは保険:
+      # `resolve_cache_dir()` は env が無ければ `dirs::cache_dir()` に落ちるため、
+      # env を継承しない経路が 1 つでもあると、そこだけ cache 対象外になる。
+      #   - `.fastembed_cache`     … env が効いている全プロセス
+      #   - `<default_model_dir>`  … env を見ずに解決した場合の落ち先
+      # かつて lib test が `remove_var("FASTEMBED_CACHE_DIR")` でプロセス全体の
+      # env を消しており、実際に BGE-M3 / reranker がここへ逸れていた。その
+      # 根本原因は AU-63 で解消済みだが、同種の再発を黙って劣化させないために
+      # 両方を cache し続ける (片方だけだと job は green のまま毎晩 4.6 GB を
+      # 再 DL する。2026-07-26 に Linux cache が 2.6 GB → 74 MB に縮んで発覚)。
       #
-      # key の版数 (`-v3-`) は **path や中身の構成を変えたら必ず上げる**:
+      # key の版数は **path・中身の構成・モデルの落ち先が変わったら必ず上げる**:
       # (a) 旧 `fastembed-<os>-<hash>` の tar は `~/.cache/fastembed` を絶対
       #     パスで抱えており、`path` だけ変えて同じ key を再利用すると
       #     「cache hit したのに参照先には何も無い」状態が永続する
-      # (b) `actions/cache` は **既存 key を上書き保存しない**。`-v2-` のまま
-      #     path を増やしても、74 MB の v2 が hit する限り新しい中身は
-      #     永久に保存されない
+      # (b) `actions/cache` は **既存 key を上書き保存しない**。実機ログでも
+      #     `Cache hit occurred on the primary key ..., not saving cache.` と
+      #     出る。したがって key を据え置くと、古い配置の archive が
+      #     Cargo.lock が変わるまで凍結される
+      # `-v4-` は (b) が理由: AU-63 で env が消えなくなり、モデルの落ち先が
+      # `.fastembed_cache` に一本化されたので、v3 の archive (= 大物が
+      # `<default_model_dir>` 側に入っている) を作り直す必要がある。
       - name: Cache fastembed models
         uses: actions/cache@v5
         with:
           path: |
             .fastembed_cache
             ${{ matrix.default_model_dir }}
-          key: fastembed-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: fastembed-v4-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            fastembed-v3-${{ runner.os }}-
+            fastembed-v4-${{ runner.os }}-
 
       # cold cache のとき、複数の integration test binary が **別プロセス** と
       # して同時に kb-mcp を spawn し、HuggingFace hub の同一 blob lock を
@@ -118,8 +121,31 @@ jobs:
       #
       # BGE-M3 / reranker は lib test binary の中 (= 単一プロセス、別 blob) から
       # しか触られないので、ここで温めるのは BGE-small だけでよい。
+      #
+      # retry する理由: 上流 (HuggingFace CDN) の一時障害で nightly が赤くなるのを
+      # 防ぐため。2026-07-26 の実測では cold cache の run を短時間に繰り返したところ
+      # model.onnx の取得が 503 を返した (run 30190347439)。厄介なのは、失敗すると
+      # 罠 3 (= cache は job 成功時のみ保存) により翌日も cold のままで、
+      # **自然回復しない**こと。
+      #
+      # 本 step の目的は cache を温めることで、その合否は品質シグナルではない
+      # (本体スイートは後段で別に走る)。したがってここでの retry は flaky test の
+      # 隠蔽にはあたらない。
       - name: Pre-warm embedding model cache (serial)
-        run: cargo test --test index_progress_cli -- --test-threads=1
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test --test index_progress_cli -- --test-threads=1; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
 
       - name: cargo test -- --include-ignored
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では
@@ -178,13 +204,27 @@ jobs:
           path: |
             .fastembed_cache
             ~/.cache/fastembed
-          key: fastembed-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: fastembed-v4-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            fastembed-v3-${{ runner.os }}-
+            fastembed-v4-${{ runner.os }}-
 
       # cache miss の日でも lock 競合で落ちないよう、1 プロセスで先に温める。
+      # retry の理由は ignored-tests job 側の同名 step のコメントを参照。
       - name: Pre-warm embedding model cache (serial)
-        run: cargo test --test index_progress_cli -- --test-threads=1
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test --test index_progress_cli -- --test-threads=1; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
 
       # `cargo test` の non-ignored セット (= unit + integration test、
       # `#[ignore]` 除外) で coverage を取る (~5-10 min)。

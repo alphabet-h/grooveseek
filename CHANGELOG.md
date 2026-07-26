@@ -45,7 +45,18 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   whole process — `cargo test` runs its tests as threads, not as separate
   processes — so any model initialised after that point resolves to the OS
   default directory instead. BGE-M3 and the reranker load late enough to
-  land outside the cached directory. The job now caches both locations.
+  land outside the cached directory. The job now caches both locations, and
+  the root cause is gone too: the decision that test covers is now a plain
+  function taking the environment state as an argument, so the test asserts
+  on it without touching process-wide state at all.
+- **A failed model download left the nightly run permanently broken.** A
+  transient 503 from the HuggingFace CDN — observed while repeatedly
+  exercising a cold cache — failed the run, and because a cache is only
+  saved when the job succeeds, the next night started cold as well and had
+  the same chance of failing. The pre-warm step now retries up to three
+  times with a growing backoff. Retrying is safe here specifically because
+  the step exists to populate the cache, not to report on the code: the
+  suite that carries the actual signal runs afterwards, unretried.
 - **The nightly coverage job failed intermittently on the same download
   race.** It had neither a model cache nor a pre-warm step, so every run
   downloaded BGE-small from cold with several test binaries competing for
@@ -68,10 +79,12 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   capped at 10 GB per repository. The job caches both directories models
   can land in — the workspace-relative one that `FASTEMBED_CACHE_DIR`
   selects, and the OS default that `resolve_cache_dir` falls back to — and
-  the cache key prefix moved to `fastembed-v3-` so neither the pre-existing
-  archives (which carry absolute `~/.cache/fastembed` paths) nor an
-  intermediate single-directory archive is restored in place of the new
-  layout. Source code unchanged.
+  the cache key prefix moved to `fastembed-v4-` so that none of the earlier
+  archives — which carry a different directory layout — is restored in place
+  of the current one. The prefix has to move whenever the layout does:
+  `actions/cache` refuses to overwrite an existing key, so a stale archive
+  would otherwise stay frozen until `Cargo.lock` changed. Source code
+  unchanged.
 
 ## [0.13.1] - 2026-07-26
 
