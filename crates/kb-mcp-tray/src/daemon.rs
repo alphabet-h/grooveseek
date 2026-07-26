@@ -46,15 +46,23 @@ pub async fn start(service_name: &str) -> Result<()> {
 /// Both forms made `stop` fail whenever the daemon was already down, and since
 /// [`restart`] propagates that with `?`, pressing Restart on a stopped daemon
 /// would have aborted without ever starting it. Closing with an explicit
-/// `exit 0` fixes the no-op paths, while `-ErrorAction Stop` on the kill keeps
-/// a genuine failure terminating — it aborts the script before `exit 0` is
-/// reached, so the caller still sees it.
+/// `exit 0` fixes the no-op paths.
+///
+/// The kill keeps `-ErrorAction Stop` so a genuine failure stays terminating
+/// and aborts before `exit 0` is reached. But "the process is gone" must not
+/// count as a failure even when it disappears *between* the lookup and the
+/// kill: `handle_menu` spawns an independent task per click, so two overlapping
+/// Stop/Restart clicks can both clear the lookup while only the first
+/// terminates anything (codex P2 on PR #89). The catch therefore re-checks —
+/// still there means a real failure and rethrows, gone means the stop already
+/// happened and falls through to `exit 0`.
 pub fn stop_by_pid_script(pid: u32) -> String {
     format!(
         "$p = $null; \
          try {{ $p = Get-Process -Id {pid} -ErrorAction Stop }} catch {{ }}; \
          if ($p -and $p.ProcessName -eq 'kb-mcp') \
-         {{ Stop-Process -Id {pid} -Force -ErrorAction Stop }}; \
+         {{ try {{ Stop-Process -Id {pid} -Force -ErrorAction Stop }} \
+         catch {{ if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw }} }} }}; \
          exit 0"
     )
 }
@@ -194,37 +202,63 @@ mod tests {
             script.trim_end().ends_with("exit 0"),
             "script must close with an explicit exit 0: {script}"
         );
+        let lookup = script.find("Get-Process").expect("lookup present");
+        let guard = script.find("ProcessName").expect("guard present");
         assert!(
-            !script.contains("SilentlyContinue"),
-            "SilentlyContinue still exits 1 on a dead pid; use try/catch + exit 0: {script}"
+            script[lookup..guard].contains("-ErrorAction Stop"),
+            "the lookup must be terminating and caught; SilentlyContinue there \
+             still exits 1 on a dead pid: {script}"
         );
     }
 
-    /// Pin the exact text. The four behaviours above were verified by running
-    /// this literal string through `powershell.exe -NoProfile -NonInteractive
-    /// -Command` on 2026-07-26 (live kb-mcp → stopped, exit 0; dead pid →
-    /// exit 0; foreign live pid → untouched, exit 0). Substring assertions
-    /// alone would not catch a spacing change from a `\`-continued literal
-    /// swallowing the wrong run of whitespace, so the expected value is written
-    /// on one line deliberately.
+    /// Two overlapping Stop/Restart clicks can both clear the lookup while only
+    /// the first terminates anything. The second must treat the process being
+    /// gone as an already-successful stop, or it fails and `restart` returns
+    /// before ever calling `start` (codex P2 on PR #89). Verified by running
+    /// the catch branch against an exited pid: exit 0.
     #[test]
-    fn stop_by_pid_script_matches_the_empirically_verified_text() {
-        assert_eq!(
-            stop_by_pid_script(4242),
-            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop } catch { }; if ($p -and $p.ProcessName -eq 'kb-mcp') { Stop-Process -Id 4242 -Force -ErrorAction Stop }; exit 0"
+    fn stop_by_pid_script_tolerates_the_process_vanishing_mid_kill() {
+        let script = stop_by_pid_script(4242);
+        let kill = script.find("Stop-Process").expect("kill present");
+        let tail = &script[kill..];
+        assert!(
+            tail.contains("catch") && tail.contains("Get-Process -Id 4242"),
+            "the kill must be wrapped in a catch that re-checks the process: {script}"
         );
     }
 
-    /// A kill that genuinely fails must still surface. `-ErrorAction Stop`
-    /// makes it terminating, so the script aborts before reaching `exit 0`.
+    /// A kill that genuinely fails must still surface: the re-check finds the
+    /// process still running and rethrows, which aborts before `exit 0`.
+    /// Verified by driving the catch branch with a live process: exit 1.
     #[test]
     fn stop_by_pid_script_keeps_a_real_kill_failure_fatal() {
         let script = stop_by_pid_script(4242);
         let kill = script.find("Stop-Process").expect("kill present");
         let exit = script.find("exit 0").expect("exit present");
+        let between = &script[kill..exit];
         assert!(
-            script[kill..exit].contains("-ErrorAction Stop"),
-            "the kill must be terminating so exit 0 is not reached on failure: {script}"
+            between.contains("-ErrorAction Stop"),
+            "the kill must be terminating: {script}"
+        );
+        assert!(
+            between.contains("throw"),
+            "a still-running process after a failed kill must rethrow: {script}"
+        );
+    }
+
+    /// Pin the exact text. Every behaviour above was verified by running this
+    /// literal string through `powershell.exe -NoProfile -NonInteractive
+    /// -Command` on 2026-07-26 — live kb-mcp stopped (exit 0), pid already
+    /// exited (exit 0), pid vanished mid-kill (exit 0), kill failed with the
+    /// process still present (exit 1), foreign live pid untouched (exit 0).
+    /// Substring assertions alone would not catch a spacing change from a
+    /// `\`-continued literal swallowing the wrong run of whitespace, so the
+    /// expected value is written on one line deliberately.
+    #[test]
+    fn stop_by_pid_script_matches_the_empirically_verified_text() {
+        assert_eq!(
+            stop_by_pid_script(4242),
+            "$p = $null; try { $p = Get-Process -Id 4242 -ErrorAction Stop } catch { }; if ($p -and $p.ProcessName -eq 'kb-mcp') { try { Stop-Process -Id 4242 -Force -ErrorAction Stop } catch { if (Get-Process -Id 4242 -ErrorAction SilentlyContinue) { throw } } }; exit 0"
         );
     }
 
