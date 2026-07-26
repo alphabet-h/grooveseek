@@ -6,6 +6,34 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A crafted `.xlsx` could make indexing decompress far more than the 50 MiB
+  cap by lying about its size** (AU-20). The preflight that runs before
+  calamine summed each entry's *declared* uncompressed size, and the ZIP
+  format does not enforce that number — the CRC is only checked after the
+  whole entry has been decompressed, and zip 8.6 does not bound deflate output
+  by the declaration either. Measured: a 101 KB workbook declaring 10 bytes
+  for its worksheet expanded to 100 MB, sailed through the preflight, and kept
+  calamine busy for 13 seconds; the ratio scales linearly, so a file still
+  under the 50 MiB input cap could demand tens of gigabytes. The preflight now
+  decompresses each entry for real, discarding the output and stopping one byte
+  past the remaining budget, so both the memory and the work it can be made to
+  do stay bounded regardless of what the archive claims. The same file is now
+  rejected in 0.7 s with a `zip-bomb guard` error, and the run continues with
+  the other files. Legitimate workbooks pay one extra decompression pass:
+  measured at ~5 ms for 11.8 MB of XML, against embedding costs in the hundreds
+  of milliseconds.
+
+  It also no longer picks which entries to check by filename suffix. calamine
+  resolves a worksheet through its relationship `Target` and never looks at the
+  suffix, so a part named `xl/worksheets/payload` is read normally while a
+  suffix-based check skips it — the third bypass of the same kind, after fixed
+  paths and missing `.rels` in v0.11.0. Every entry now counts, which makes the
+  guarantee statable without reference to naming: **an archive may decompress
+  to at most the cap, in total**. The cost is that images under `xl/media/`
+  count too, so a workbook whose entire decompressed content exceeds 50 MiB is
+  skipped — with the raw input already capped at 50 MiB and images inflating
+  about 1:1, that means a file near the cap that is mostly pictures.
+
 - **One malformed Office document could abort an entire `kb-mcp index` run**
   (AU-21). The indexer already skips a file whose parser returns `Err`, but a
   **panic** unwinds straight past that `match`, and indexing is sequential, so
