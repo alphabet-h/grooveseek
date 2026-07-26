@@ -79,10 +79,12 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   capped at 10 GB per repository. The job caches both directories models
   can land in — the workspace-relative one that `FASTEMBED_CACHE_DIR`
   selects, and the OS default that `resolve_cache_dir` falls back to — and
-  the cache key prefix moved to `fastembed-v3-` so neither the pre-existing
-  archives (which carry absolute `~/.cache/fastembed` paths) nor an
-  intermediate single-directory archive is restored in place of the new
-  layout. Source code unchanged.
+  the cache key prefix moved to `fastembed-v4-` so that none of the earlier
+  archives — which carry a different directory layout — is restored in place
+  of the current one. The prefix has to move whenever the layout does:
+  `actions/cache` refuses to overwrite an existing key, so a stale archive
+  would otherwise stay frozen until `Cargo.lock` changed. Source code
+  unchanged.
 
 ## [0.13.1] - 2026-07-26
 
