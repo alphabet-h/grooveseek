@@ -4,6 +4,32 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Documentation
+
+- **Deployment recipes that could not work as written** (AU-34, AU-35,
+  AU-37, AU-38, AU-39, AU-45). The NAS recipe told read-only clients to mount
+  the share read-only, which stops kb-mcp before it prints anything: the
+  database is opened read-write and a WAL database cannot even be read
+  without creating its `-shm` / `-wal` sidecars, so `kb-mcp status` fails
+  with `Error code 14: unable to open database file` (measured with the
+  directory made non-writable). Clients now mount read-write and stay
+  search-only by rule — never run `index` off the indexer host, watcher off,
+  which is what the shipped client config already does. The intranet recipe
+  never mentioned `[transport.http].allowed_hosts`, whose default is loopback
+  only, so every LAN client following it was answered with 403 no matter what
+  `bind` said; the config and both READMEs now cover it, including behind a
+  reverse proxy. The personal recipe told you to `cargo install --path .`,
+  which fails on the workspace root (`--path kb-mcp`), linked one directory
+  too high after the workspace split, and described the reranker as loaded
+  when the key is commented out — in that state `rerank: true` is a silent
+  no-op, which is now stated where the claim used to be. The hook sample only
+  rebuilt for `.md`, so a KB with Office or PDF files silently went stale; it
+  now takes a `KB_EXTENSIONS` list defaulting to every supported format, with
+  case-insensitive matching. Also documented: the intranet recipe uses a
+  system unit deliberately rather than `kb-mcp service install` (user-level),
+  and `/ui` plus `/api/admin/*` refuse non-loopback peers, so they cannot be
+  reached from the LAN at all.
+
 ### Fixed
 
 - **A crafted `.xlsx` could make indexing decompress far more than the 50 MiB

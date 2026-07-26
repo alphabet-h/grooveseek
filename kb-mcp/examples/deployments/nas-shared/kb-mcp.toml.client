@@ -1,9 +1,12 @@
-# NAS-shared deployment — READ-ONLY CLIENT config (kb-mcp.toml)
+# NAS-shared deployment — SEARCH-ONLY CLIENT config (kb-mcp.toml)
 #
-# Use this on every machine *except* the indexer host. The NAS share must
-# be mounted read-only on these machines. See README.md / README.ja.md.
+# Use this on every machine *except* the indexer host. Mount the share
+# read-write: SQLite must be able to create the WAL sidecar files next to
+# .kb-mcp.db, so a read-only mount fails to open the index at all. These
+# machines stay search-only by rule (never run `kb-mcp index` here, watcher
+# off below). See README.md / README.ja.md.
 
-# Mounted NAS path. Same path on every client. Reads-only on this machine.
+# Mounted NAS path. Same path on every client. This machine only searches.
 kb_path = "/mnt/nas/knowledge-base"
 
 # Match the indexer host's model — mismatches are rejected at startup

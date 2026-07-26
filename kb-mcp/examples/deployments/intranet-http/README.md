@@ -46,6 +46,23 @@ machines on the same intranet over Streamable HTTP.
 3. Drop `kb-mcp.toml` from this directory at `/srv/kb-mcp/kb-mcp.toml`
    (CWD discovery — the systemd unit sets `WorkingDirectory=/srv/kb-mcp`).
    Edit `kb_path`, `model`, and `[transport.http].bind` to taste.
+
+   **If clients connect from other machines, set
+   `[transport.http].allowed_hosts` as well.** It defaults to loopback only
+   (`localhost`, `127.0.0.1`, `::1`) as a DNS-rebinding defence, so a LAN
+   client requesting `http://kb-server.lan:3100/mcp` is answered with 403 no
+   matter what `bind` says. List every hostname / address clients put in
+   their URL:
+
+   ```toml
+   [transport.http]
+   bind = "0.0.0.0:3100"
+   allowed_hosts = ["kb-server.lan", "192.168.1.10"]
+   ```
+
+   kb-mcp warns at startup when it binds off-loopback with this key still
+   absent. Behind a reverse proxy, list the name clients use for the proxy
+   and make the proxy forward it (`proxy_set_header Host $host;`).
 4. Create the ONNX cache directory (the systemd unit only declares
    `ReadWritePaths=`, it does not create or chown the dir):
 
@@ -67,6 +84,15 @@ machines on the same intranet over Streamable HTTP.
    sudo systemctl daemon-reload
    sudo systemctl enable --now kb-mcp.service
    ```
+
+   > `kb-mcp service install` (v0.8.0+) is **not** what this recipe uses.
+   > That command registers a *user-level* unit
+   > (`~/.config/systemd/user/`), which starts with your login session and
+   > runs as you. A shared server wants the opposite: a system unit that
+   > boots without anyone logged in, runs as a dedicated `kbmcp` account,
+   > and carries the sandboxing directives in `kb-mcp.service`. Use
+   > `kb-mcp service install` for a personal always-on daemon on your own
+   > workstation.
 7. Health check:
 
    ```bash
@@ -120,7 +146,13 @@ binding to `0.0.0.0` is opt-in and your responsibility.
 | Casual local-network sniff (HTTP unencrypted) | Front kb-mcp with nginx/Caddy doing TLS termination, bind kb-mcp to loopback only |
 | Unauthorized clients on the LAN | Reverse proxy with HTTP basic auth or mTLS; or run kb-mcp on a per-team subnet that's already access-controlled |
 | Malicious request floods (DoS) | Rate limiting on the proxy. kb-mcp itself has no rate limiter. |
-| DNS rebinding from a browser | rmcp validates the Host header (loopback only by default); tightening for non-loopback binds is on the roadmap |
+| DNS rebinding from a browser | The Host header is validated against `[transport.http].allowed_hosts` — loopback only unless you list your own hostnames (v0.5.0+). `/healthz` is exempt by default; set `healthz_public = false` (v0.8.0+) to put it behind the same check. |
+
+The web UI (`/ui`) and the admin API (`/api/admin/*`) are **not** reachable
+from other machines: they sit behind a separate check that also requires the
+peer address to be loopback, so a LAN client gets 403 there even when its Host
+header is allow-listed. Use them by SSH-forwarding a port to the server
+(`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) rather than by opening them up.
 
 If you need authentication today, the canonical recipe is:
 

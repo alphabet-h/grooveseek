@@ -24,9 +24,9 @@ stdio.
 
 ## Setup
 
-1. **Install kb-mcp**. Either grab a [prebuilt binary](https://github.com/alphabet-h/kb-mcp/releases/latest) and place it on `PATH`, or `cargo install --path .` from a clone.
+1. **Install kb-mcp**. Either grab a [prebuilt binary](https://github.com/alphabet-h/kb-mcp/releases/latest) and place it on `PATH`, or `cargo install --path kb-mcp` from a clone (the repository root is a workspace manifest, so `--path .` fails).
 2. **Decide where the KB lives**. For example `~/notes/` (personal notes) or `~/projects/<repo>/docs/` (project-scoped).
-3. **Pick a config location**. Two natural options — see [Config file discovery](../../../README.md#config-file-discovery):
+3. **Pick a config location**. Two natural options — see [Config file discovery](../../../../README.md#config-file-discovery):
    - **Project-scoped**: drop both `kb-mcp.toml` and `.mcp.json` next to your project (commit them — `kb-mcp.toml` is meant to be shared).
    - **Global**: place `kb-mcp.toml` next to the binary (`~/.local/bin/kb-mcp.toml` or `%USERPROFILE%\bin\kb-mcp.toml`) so every project sees the same defaults.
 4. **Edit `kb-mcp.toml`**: set `kb_path` to the absolute path of your KB. Adjust the model and reranker if the defaults don't match your language.
@@ -43,7 +43,7 @@ stdio.
 
 - **Watcher** is on by default. Edits to your `.md` files (manual save / `git pull` / external scripts) are detected and re-indexed automatically within ~500 ms.
 - **PostToolUse hook** is optional and complementary — see [`examples/hooks/`](../../hooks/). The watcher already covers manual edits; the hook is mainly useful when you want zero-latency rebuild after Claude itself writes files.
-- **Reranker** is loaded but off by default. Enable per-query with `rerank: true` in the MCP `search` call when you need it; the latency cost (~300-700 ms on CPU) is not worth paying for every search.
+- **Reranker** is not configured in this recipe — the `reranker` key in `kb-mcp.toml` is commented out so the first run does not pull a ~2.3 GB model. Until you uncomment it, `rerank: true` on a `search` call is a **silent no-op** (the server only reranks when a reranker was loaded at startup). Once it is enabled, keep `rerank_by_default = false` and opt in per query: the latency cost (~300-700 ms on CPU) is not worth paying for every search.
 - **Single client per server**. stdio only supports one MCP client at a time — fine for solo use; for multiple clients see [`intranet-http/`](../intranet-http/).
 - **`alwaysLoad: true`** in the example `.mcp.json` is a Claude Code v2.1.121+ option that forces kb-mcp's tools to be present at initial load instead of going through the tool-search shortlist. Recommended for RAG use ("I want to search anytime"). Drop it if first-startup latency (model download / index open) outweighs the win, or if your client predates v2.1.121. Other MCP clients ignore the field.
 

@@ -3,8 +3,10 @@
 > **English version**: [README.md](./README.md)
 
 KB と SQLite インデックスを NAS (NFS / SMB / CIFS) 上に置く構成。1 台が
-**専属 indexer (書き込み権限あり)**、他のマシンは同じ共有を read-only で
-マウントしてローカル kb-mcp serve をマウント済パスに向ける。
+**専属 indexer (書き込み権限あり)**、他のマシンは同じ共有をマウントして
+ローカル kb-mcp serve を向け、**検索だけ**を行う。「検索専用」はマウント
+オプションではなく運用ルールで守る — マウント自体は read-write が必要
+(クライアント設定を参照)。
 
 > **⚠️ 最初に読むこと.** ネットワークファイルシステム上の SQLite は
 > 細心の注意が必要。SQLite WAL が依存する `fcntl` byte-range lock は SMB
@@ -18,7 +20,7 @@ KB と SQLite インデックスを NAS (NFS / SMB / CIFS) 上に置く構成。
 - 1 台のワークステーション (= "indexer host") が書き込みを独占: `kb-mcp index`
   (または watcher) を動かし、`.kb-mcp.db` への書き込みは必ずこのマシンから
 - 他のワークステーションは同じ共有をマウントして、ローカル `kb-mcp serve` で
-  **read-only 検索**
+  **検索専用** (index は打たない)
 - 全機が同一 LAN 内 (レイテンシが効く。WAN 越し NFS で SQLite は地獄)
 
 ## このディレクトリの中身
@@ -70,34 +72,51 @@ KB と SQLite インデックスを NAS (NFS / SMB / CIFS) 上に置く構成。
    - timer の `kb-mcp index` のみ、`serve` 自体動かさない
    - `serve` を `--no-watch` で動かし、timer に再構築を任せる
 
-### read-only クライアント (他のマシン全部)
+### 検索専用クライアント (他のマシン全部)
 
-1. 同じ NAS 共有を **read-only** でマウント:
+1. 同じ NAS 共有をマウントする。**`.kb-mcp.db` があるディレクトリはクライアント
+   から書き込み可能である必要がある**ので read-write でマウントする:
 
    ```bash
    # Linux NFSv4 の例
-   sudo mount -t nfs4 -o ro,noac nas:/exports/kb /mnt/nas/knowledge-base
+   sudo mount -t nfs4 -o noac nas:/exports/kb /mnt/nas/knowledge-base
    ```
 
-   **read-only マウントが重要** — クライアントマシンで誤って `kb-mcp index`
-   を打っても indexer の DB を壊さない
+   read-only マウントは (魅力的に見えるが) 動かない。kb-mcp は DB を
+   read-write で開き、起動のたびに `PRAGMA journal_mode = WAL` と
+   `CREATE TABLE IF NOT EXISTS` を実行する。そもそも WAL の DB は
+   `-shm` / `-wal` を隣に作れないと **読むことすらできない**。ディレクトリの
+   書き込み権限を落として実測すると、`kb-mcp status` は何も表示せずに失敗する:
+
+   ```
+   Error: unable to open database file
+   Caused by:
+       Error code 14: unable to open database file
+   ```
+
+   したがってクライアントが index を壊さない担保はマウントオプションではなく
+   **下記の運用規約**にある: `kb-mcp index` は indexer host 以外で絶対に叩かない、
+   watcher は全クライアントで off (`kb-mcp.toml.client` は
+   `[watch].enabled = false` で出荷している)。検索は行を書かないし、kb-mcp が
+   ここで行う書き込みは schema レベルの冪等な操作だけ。
 2. `kb-mcp.toml.client` を `kb-mcp.toml` として discovery path に置き、`kb_path`
    をマウント先に
 3. `.mcp.json` をプロジェクトルート (or Claude Code が読む場所) に配置
-4. read-only 動作確認:
+4. クライアントから index が読めることを確認:
 
    ```bash
    kb-mcp status --kb-path /mnt/nas/knowledge-base
    ```
 
-   document 数が表示されれば OK (何も書かずに済む)
+   document 数が表示されれば OK。`unable to open database file` が出るなら
+   マウントが read-only になっている (手順 1 参照)
 
 ## 運用上の注意
 
 - **DB も NAS 上**。`.kb-mcp.db` は `/mnt/nas/.kb-mcp.db` (kb_path の親) に
-  作られる。全 reader が同じファイルを見る。1 ホストからの書き込みが無い間
-  SQLite は read-only で開けるので並行検索は安全だが、複数ホストからの
-  並行書き込みは安全ではない
+  作られる。全ホストが同じファイルを見て、それぞれ read-write で開く (WAL は
+  読むだけでもそれが要る — クライアント設定参照)。検索は行を書かないので
+  並行検索は安全だが、複数ホストからの並行 **index** は安全ではない
 - **クライアントの watcher は OFF**。Linux の inotify / Windows の
   ReadDirectoryChangesW はネットワーク FS では伝播しない。watcher は静かに
   イベントを取りこぼす。indexer 側の timer に任せる
