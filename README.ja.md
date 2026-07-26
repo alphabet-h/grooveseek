@@ -25,7 +25,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 
 各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。
 
-ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](#huggingface-の-tls-失敗への対処) を参照。
+ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](#huggingface-の-tls-失敗への対処-初回-dl-時) を参照。
 
 ### ソースからビルド
 
@@ -333,7 +333,7 @@ kb-mcp service install --kb-path C:\path\to\kb --with-tray
 - **赤** — daemon 1 分以上応答なし (= 5sec interval で 12 連続失敗)
 - **灰** — 初回 polling 待ち (= 起動直後 5 秒)
 
-right-click で 6 menu items: **Status** (read-only) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**。Start/Stop/Restart は PowerShell `Start/Stop-ScheduledTask` cmdlet 経由で daemon を駆動。
+right-click で 6 menu items: **Status** (read-only) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**。**Start** は scheduled task を実行、**Stop** は `/api/admin/status` が報告する pid のプロセスを終了させ (v0.13.2+)、daemon の bind アドレスを bind できることで停止を確認する — `Stop-ScheduledTask` が止めていたのは即座に終了する launcher だけで、実質何もしていなかった。
 
 Tray log は `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (= 日次 rotation)。verbose 出力には `KB_MCP_TRAY_LOG=debug` を設定、`--debug` flag で console attach して stdout/stderr を直接見る。
 
@@ -702,6 +702,41 @@ kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
 - LAN / イントラ公開時は `kb-mcp.toml` の `[transport.http].allowed_hosts` に公開ホスト名 / IP を明示する (例: `["kb.example.lan", "192.168.1.10"]`)。loopback only の default のまま 0.0.0.0 で bind すると外部リクエストは Host 検証で 403 になる — operator のミス確定なので、kb-mcp は起動時に `tracing::warn` を出して気付かせる。`allowed_hosts = []` (空配列) を渡すと Host 検証が完全に無効化される (rmcp の `disable_allowed_hosts` 相当、operator 自己責任の opt-out。public 公開には推奨されない)
 - サーバ内部の Mutex ベース直列化により、HTTP の並列リクエストでも embedder / DB 層では逐次処理される (`search` で目安 10 qps 程度)。本格的な並列化は将来の拡張
 
+### Web UI と admin API (HTTP transport のみ)
+
+`serve` を `--transport http` で動かすと、ステータスページ `/ui` と JSON
+エンドポイント `/api/admin/status` も同時に生える。有効化の設定は無く HTTP
+transport があれば常に存在するが、**loopback 限定**: middleware が peer
+アドレスが loopback でないリクエストを拒否し、その後 `Host` ヘッダを
+loopback の別名 + bind アドレスと照合する。`/mcp` 用に Host を allow-list
+していても、ネットワーク上の別マシンからは 403 になる。
+
+```bash
+curl http://127.0.0.1:3100/api/admin/status
+```
+
+```json
+{
+  "daemon":  { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "..." },
+  "indexing": { "active": false, "started_at": null, "progress": null },
+  "watcher": { "active": true },
+  "kb":      { "documents": 596, "chunks": 8878 },
+  "config_source": "Cwd"
+}
+```
+
+`/ui` は同じ内容を描画するページで、Windows tray の **Open Web UI** が開くのも
+これ。ただし Windows 専用ではない。Linux / macOS では daemon が動いているマシン
+上でブラウザから開くか、ポートを forward する:
+
+```bash
+ssh -L 3100:127.0.0.1:3100 kb-server.lan   # → http://127.0.0.1:3100/ui
+```
+
+これらの route を reverse proxy に **map しないこと**: proxy 自身が loopback
+peer で、既定の `Host` も allow-list に載るため、`/ui` を proxy すると proxy に
+到達できる相手全員にページが渡る。転送するのは `/mcp` と `/healthz` だけにする。
+
 ### ライブ同期 (file watcher)
 `kb-mcp serve` は既定で `notify` ベースのファイルウォッチャを走らせる。`--kb-path` 配下の任意の変更 (create / modify / delete / rename) が検知され、debounce ののち該当ファイルのみが再インデックスされる。手動の editor save・`git pull`・外部スクリプトといった、PostToolUse hook では捕まえられないケースをカバーする。
 
@@ -779,7 +814,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **埋め込み次元**: `--model` で決まる。BGE-small-en-v1.5 = 384、BGE-M3 = 1024。選択した次元は `vec_chunks` 仮想テーブルに宣言され `index_meta` に記録される。実行時の不一致は検出して拒否
 - **増分インデックス**: ファイルは SHA-256 content hash で追跡。以降の `index` 実行では変更されたファイルのみ再 embedding される (`--force` を渡さない限り)。内容を変えずに移動 / リネームすると hash 一致で検知され `documents.path` の UPDATE として処理 — 既存の chunk / embedding / FTS 行は再利用される。再構築サマリでは `updated` / `deleted` の隣に `renamed` としてカウントされる
 - **read 不能 / 非 UTF-8 ファイルへの耐性**: read 失敗・size cap 超過・parse 失敗のファイルは warning を出して skip されるだけで `index` 実行全体は abort しない — `--kb-path` にバイナリファイルが混ざっていても、それ以外の knowledge base のインデックスは壊れない
-- **ハイブリッド検索 (FTS5 + ベクトル)**: `search` ツールは SQLite FTS5 全文検索 (trigram tokenizer、日本語 / CJK も動く。bm25 では `heading` 列を `content` の 2 倍重み) をベクトル検索と Reciprocal Rank Fusion (k=60) でマージする。返される `score` は RRF スコア (大きいほど良い) で距離ではない。3 文字未満のクエリは trigram の最小値を下回るためベクトルのみにフォールバック
+- **ハイブリッド検索 (FTS5 + ベクトル)**: `search` ツールは SQLite FTS5 全文検索 (trigram tokenizer、日本語 / CJK も動く。v0.12.0 以降は `heading` / `context` / `content` の 3 列で、bm25 では既定で `heading` を 2 倍重み) をベクトル検索と Reciprocal Rank Fusion (既定 `k = 60`) でマージする。重みと `k` は v0.13.0 以降 `[search.fusion]` で設定でき、自分の KB で動かす価値があるかは `kb-mcp tune` が測る。返される `score` は RRF スコア (大きいほど良い) で距離ではない。3 文字未満のクエリは trigram の最小値を下回るためベクトルのみにフォールバック
 - **任意の再ランク**: `--reranker <model>` を付けると上位候補が cross-encoder で再スコアされてから返る。再ランク適用時は `score` が RRF 値ではなく cross-encoder の生スコアになる。再ランクは index 非依存 — サーバ起動時に再インデックスなしでトグル可能
 - **Connection graph**: `get_connection_graph` / `kb-mcp graph` はドキュメント起点でベクトルインデックス上を BFS する。追加インデックスは作らず、ホップ毎に sqlite-vec KNN を新規発行する。`depth ≤ 3` / `fan_out ≤ 20` で client-side クランプされるため、最悪でも 1 リクエストあたり約 21 KNN クエリ。スコアは L2 距離からの近似コサイン類似度 (`1 - d²/2` を `[0,1]` にクランプ、unit normalized embedding を前提 — BGE-small / BGE-M3 は内部で正規化済み)
 - **見出し除外**: 見出しテキストが `exclude_headings` のいずれかを含むセクションは、チャンキング時に落とされる。既定は空リスト (全セクション残す)。`kb-mcp.toml` の `exclude_headings` に substring を列挙するとオプトインになる。マッチは部分文字列 (`heading.contains(pattern)`) で、短いパターンは `"参考リンク"` → `"## 参考リンク (旧)"` のような変種も拾う

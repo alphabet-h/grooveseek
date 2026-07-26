@@ -4,6 +4,39 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Documentation
+
+- **`docs/` subpages that described behaviour the code does not have** (AU-46,
+  AU-47, AU-48, AU-49). `eval.md` listed graded relevance as "parsed tolerantly
+  but ignored"; every golden struct is `deny_unknown_fields`, so a `relevance:`
+  key aborts the run — `unknown field 'relevance', expected 'path' or
+  'heading'`, exit 1, before anything is evaluated. Its troubleshooting table
+  listed an error string (`expected path not in index`) that appears nowhere in
+  the source; the real symptom is a per-query `✗ <id>  recall@N: 0.00` line. It
+  also claimed runs at default fusion settings stay comparable with
+  pre-v0.13.0 baselines, but `metric_version` went 1 → 2 and the fingerprint is
+  compared whole, so those runs are skipped — as the same file said two
+  paragraphs earlier. `filters.md` was missing `min_quality` /
+  `include_low_quality`, and gave the `low_confidence` formula as
+  `top1.score / mean` when the implementation uses `max(scores) / mean` — they
+  differ exactly when MMR has re-ordered the results. `citations.md` gave one
+  condition for a null `match_spans` (there are three: non-ASCII query, empty
+  query, content over 256 KiB) and promised "all match positions" where 100 per
+  chunk is the cap. `retrieval-pipeline.md` still described a 2-column FTS
+  index. The `tune` section now also documents the context-axis warning that
+  fires on every default-configured KB.
+
+- **The web UI and admin API were absent from the README** (AU-60). `/ui` and
+  `/api/admin/status` have shipped since v0.8.0, but the only mentions were in
+  the architecture doc and the Windows tray section — so anyone not running the
+  tray had no way to learn they exist. Documented with the response shape, the
+  loopback-peer restriction, the SSH-forward recipe for remote hosts, and why a
+  reverse proxy must not map those routes. Also fixed the dead TLS-section
+  anchor in both READMEs (AU-62), refreshed the hybrid-search description
+  (three FTS columns, configurable `k` and weights), corrected the tray
+  Start/Stop description to match v0.13.2, and brought `CLAUDE.md`'s format and
+  subcommand lists up to date.
+
 ### Fixed
 
 - **A crafted `.xlsx` could make indexing decompress far more than the 50 MiB

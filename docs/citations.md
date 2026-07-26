@@ -29,7 +29,7 @@ quote source text accurately and reduces hallucination.
 
 | Value | Meaning |
 |---|---|
-| `null` (key omitted) | Match spans not computed (current scope: query contains non-ASCII) |
+| `null` (key omitted) | Match spans not computed. Three cases: the query contains any non-ASCII character, the query is empty / whitespace-only, or the chunk's `content` exceeds 256 KiB (`MATCH_SPAN_CONTENT_MAX_BYTES`, a guard against O(N×M) scanning on abnormal input) |
 | `[]` (empty array) | Computed, but no match was found |
 | `[{...}, ...]` | Computed; one or more matches |
 
@@ -67,7 +67,7 @@ If you ever observe a span that breaks codepoint boundaries, please file a bug.
 1. Splitting the query on whitespace into terms.
 2. Lower-casing both query and content (ASCII fold only).
 3. Searching for each term as a substring (case-insensitive) in `content`.
-4. Reporting all match positions, sorted by start byte, deduped.
+4. Reporting match positions, sorted by start byte, deduped — capped at 100 spans per chunk (`MATCH_SPAN_MAX_COUNT`), so a one-character term against a large chunk cannot inflate the response.
 
 ## Non-ASCII queries
 

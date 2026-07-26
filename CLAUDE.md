@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## プロジェクト概要
 
-Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP (Model Context Protocol) サーバ。YAML frontmatter 付きの Markdown (および opt-in で `.txt`) を見出し単位でチャンク化し、選択可能な埋め込みモデル (BGE-small-en-v1.5 / BGE-M3) でベクトル化。sqlite-vec のベクトル検索と FTS5 全文検索を Reciprocal Rank Fusion で融合し、任意で cross-encoder reranker を適用する。stdio または Streamable HTTP トランスポートで Claude Code / Cursor 等の MCP クライアントに接続する。
+Markdown / プレーンテキスト / PDF / Office 文書のナレッジベースに対するセマンティック検索を提供する MCP (Model Context Protocol) サーバ。YAML frontmatter 付きの Markdown (および opt-in で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.xls` / `.pptx`) を見出し (シート / スライド / ページ) 単位でチャンク化し、選択可能な埋め込みモデル (BGE-small-en-v1.5 / BGE-M3) でベクトル化。sqlite-vec のベクトル検索と FTS5 全文検索を Reciprocal Rank Fusion で融合し、任意で cross-encoder reranker を適用する。stdio または Streamable HTTP トランスポートで Claude Code / Cursor 等の MCP クライアントに接続する。
 
 詳細:
 - ユーザ向けドキュメント: [README.md](./README.md) (English) / [README.ja.md](./README.ja.md) (日本語)
@@ -24,7 +24,7 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 ## 主要サブコマンド
 
-`index` / `status` / `serve` / `search` / `graph` / `validate` / `eval` / `tune`。フラグの詳細、`kb-mcp.toml` 設定、`.mcp.json` 接続例は README を参照。
+`index` / `status` / `serve` / `search` / `graph` / `validate` / `eval` / `tune` / `service`。フラグの詳細、`kb-mcp.toml` 設定、`.mcp.json` 接続例は README を参照。
 
 ## CLI 出力規約 (= stdout/stderr の責務分離)
 

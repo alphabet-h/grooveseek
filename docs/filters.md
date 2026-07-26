@@ -17,6 +17,8 @@ with **AND** semantics — all conditions must match for a chunk to appear in
 | `tags_all` | string[] | `["draft"]` | AND — all tags must match |
 | `date_from` | string | `"2026-01-01"` | hit.date >= from (lex compare) |
 | `date_to` | string | `"2026-12-31"` | hit.date <= to (lex compare) |
+| `min_quality` | number | `0.5` | Per-call override of the quality-filter threshold (`[quality_filter].threshold`) |
+| `include_low_quality` | bool | `true` | Disable the quality filter for this call (equivalent to `min_quality: 0.0`, but explicit) |
 | `min_confidence_ratio` | number | `1.5` | Threshold for `low_confidence` flag |
 
 ## `path_globs`
@@ -77,10 +79,11 @@ result set:
 ```
 low_confidence ⇔ (results.len() >= 2)
                  AND (mean(scores) > 0.0)
-                 AND (top1.score / mean(scores) < min_confidence_ratio)
+                 AND (max(scores) / mean(scores) < min_confidence_ratio)
 ```
 
-- Default `min_confidence_ratio = 1.5` (top1 must be at least 1.5× the mean)
+- The numerator is `max(scores)`, **not** `results[0].score`. They differ whenever the returned order is not score-descending — which is exactly what MMR does, since it re-orders for diversity.
+- Default `min_confidence_ratio = 1.5` (the best score must be at least 1.5× the mean)
 - Set to `0.0` to disable the judgment entirely
 - Override per-call via the `min_confidence_ratio` param, or globally via
   `kb-mcp.toml`:
