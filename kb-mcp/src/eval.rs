@@ -747,6 +747,22 @@ pub fn default_history_path(kb_path: &Path) -> PathBuf {
 }
 
 /// Golden を読み、search_hybrid で評価し、EvalRun を返す。履歴書き込みは呼び出し側責務。
+/// eval が実際に使う `limit` と報告する `k` のリストを、検索経路の実効値に
+/// 揃える。
+///
+/// `run_search_pipeline` は `limit` を [`crate::server::SEARCH_LIMIT_MAX`] に
+/// clamp するので、eval のメタデータだけ生の値を持つと (codex P2 on PR #81):
+///
+/// - `--limit 1001` と `--limit 2000` は同一の retrieval なのに fingerprint が
+///   異なり、history の比較対象から外れる
+/// - 上限を超える `k` について「`@k` と表示されているが実際は上限件数から
+///   計算した」metric が無警告で出る
+pub fn normalize_eval_limit_and_k(limit: u32, k_values: &[usize]) -> (u32, Vec<usize>) {
+    let limit = crate::server::clamp_search_limit(limit);
+    let k_values = k_values.iter().map(|k| (*k).min(limit as usize)).collect();
+    (limit, k_values)
+}
+
 pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     let golden_bytes = std::fs::read(&opts.golden_path)
         .with_context(|| format!("failed to read golden file: {}", opts.golden_path.display()))?;
@@ -778,13 +794,19 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         None
     };
 
-    let max_k = opts
-        .k_values
+    let (limit, k_values) = normalize_eval_limit_and_k(opts.limit, &opts.k_values);
+    if limit != opts.limit {
+        eprintln!(
+            "kb-mcp eval: note — limit {} exceeds the retrieval cap; using {limit}",
+            opts.limit
+        );
+    }
+    let max_k = k_values
         .iter()
         .copied()
         .max()
         .unwrap_or(10)
-        .max(opts.limit as usize);
+        .max(limit as usize);
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
         let qid =
@@ -837,7 +859,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
                 score: h.score,
             })
             .collect();
-        let metrics = compute_query_metrics(&q.expected, &top_k, &opts.k_values);
+        let metrics = compute_query_metrics(&q.expected, &top_k, &k_values);
         per_query.push(QueryResult {
             id: qid,
             query: q.query.clone(),
@@ -847,7 +869,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         });
     }
 
-    let aggregate = aggregate_metrics(&per_query, &opts.k_values);
+    let aggregate = aggregate_metrics(&per_query, &k_values);
 
     // ConfigFingerprint.{mmr,parent_retriever} are built from the **effective**
     // resolved config (toml + per-call overrides), not just the toml. This
@@ -894,8 +916,8 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             } else {
                 None
             },
-            limit: opts.limit,
-            k_values: opts.k_values.clone(),
+            limit,
+            k_values: k_values.clone(),
             golden_hash,
             metric_version: METRIC_VERSION,
             mmr: mmr_fp,
@@ -1795,6 +1817,26 @@ mod tests {
         let prev = synthetic_run(map_one(5, f64::NAN), 0.6, map_one(10, 0.5), "h");
         let now = synthetic_run(map_one(5, 0.0), 0.6, map_one(10, 0.5), "h");
         assert!(!is_regression(&now, &prev, 0.05));
+    }
+
+    /// Regression (codex P2 on PR #81): eval のメタデータは検索経路の実効値に
+    /// 揃える。揃えないと `--limit 1001` と `--limit 2000` が同じ retrieval なのに
+    /// fingerprint 違いで history 比較から外れ、上限超えの `k` は「@k と表示
+    /// されているが実際は上限件数から計算した」metric になる。
+    #[test]
+    fn test_normalize_eval_limit_and_k_matches_the_retrieval_cap() {
+        let cap = crate::server::SEARCH_LIMIT_MAX;
+        // 上限超えの limit と k は cap に丸まる = 1001 と 2000 が同一値になる。
+        let (l1, k1) = normalize_eval_limit_and_k(1001, &[1, 5, 2000]);
+        let (l2, k2) = normalize_eval_limit_and_k(2000, &[1, 5, 5000]);
+        assert_eq!(l1, cap);
+        assert_eq!(l1, l2, "equivalent runs must share the effective limit");
+        assert_eq!(k1, vec![1, 5, cap as usize]);
+        assert_eq!(k1, k2, "equivalent runs must share the effective k list");
+        // 上限内はそのまま素通し。
+        let (l3, k3) = normalize_eval_limit_and_k(10, &[1, 5, 10]);
+        assert_eq!(l3, 10);
+        assert_eq!(k3, vec![1, 5, 10]);
     }
 
     /// History::previous_compatible: fingerprint 一致 → Some。

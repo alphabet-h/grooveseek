@@ -308,10 +308,19 @@ fn handle_events(state: &WatcherState, events: &[DebouncedEvent]) {
                 else {
                     continue;
                 };
-                if !should_process(&new_rel, to, state) && !should_process(&old_rel, from, state) {
-                    continue;
+                // 両端の可否で 3 分岐する (codex P2 on PR #81)。以前は
+                // 「どちらかが通れば rename」だったため、index 済みファイルを
+                // `.git/` や `node_modules/` へ rename すると
+                // `rename_single_file` が **denylist 配下の新パスへ DB を
+                // 書き換えて残す**。除外したはずのファイルが index に居座る。
+                let old_ok = should_process(&old_rel, from, state);
+                let new_ok = should_process(&new_rel, to, state);
+                match rename_action(old_ok, new_ok) {
+                    RenameAction::Rename => dispatch_rename(state, &old_rel, &new_rel),
+                    RenameAction::Deindex => dispatch_deindex(state, &old_rel),
+                    RenameAction::Reindex => dispatch_reindex(state, &new_rel),
+                    RenameAction::Skip => continue,
                 }
-                dispatch_rename(state, &old_rel, &new_rel);
             }
             Classified::Reindex(paths) => {
                 for p in paths {
@@ -333,6 +342,32 @@ fn handle_events(state: &WatcherState, events: &[DebouncedEvent]) {
             }
             Classified::Ignore => {}
         }
+    }
+}
+
+/// rename event の両端が処理対象かどうかから、取るべき動作を決める。
+#[derive(Debug, PartialEq, Eq)]
+enum RenameAction {
+    /// 両端とも対象 = DB のパスを付け替える。
+    Rename,
+    /// 対象領域から除外領域へ出て行った = 追跡をやめる。
+    Deindex,
+    /// 除外領域から対象領域へ入ってきた = 新規として取り込む。
+    Reindex,
+    /// 両端とも対象外 = 何もしない。
+    Skip,
+}
+
+/// [`RenameAction`] の決定。純関数として切り出してあるのは、以前ここが
+/// 「どちらか一方が対象なら `dispatch_rename`」だったため、index 済み
+/// ファイルを `.git/` や `node_modules/` へ rename すると **denylist 配下の
+/// 新パスへ DB を書き換えて残していた** から (codex P2 on PR #81)。
+fn rename_action(old_ok: bool, new_ok: bool) -> RenameAction {
+    match (old_ok, new_ok) {
+        (true, true) => RenameAction::Rename,
+        (true, false) => RenameAction::Deindex,
+        (false, true) => RenameAction::Reindex,
+        (false, false) => RenameAction::Skip,
     }
 }
 
@@ -546,6 +581,21 @@ mod tests {
 
     fn default_exclude_dirs() -> Vec<String> {
         vec![".obsidian".to_string()]
+    }
+
+    /// Regression (codex P2 on PR #81): rename の両端で可否が食い違うとき、
+    /// 以前は「どちらか一方が対象なら rename」だったため、index 済み
+    /// ファイルを `.git/` や `node_modules/` へ rename すると
+    /// `rename_single_file` が denylist 配下の新パスへ DB を書き換えて残した。
+    /// 除外したはずのファイルが index に居座る。
+    #[test]
+    fn test_rename_action_covers_both_endpoints() {
+        assert_eq!(rename_action(true, true), RenameAction::Rename);
+        // 対象 → 除外領域: 追跡をやめる (以前はここが Rename だった)
+        assert_eq!(rename_action(true, false), RenameAction::Deindex);
+        // 除外領域 → 対象: 新規として取り込む (以前はここも Rename)
+        assert_eq!(rename_action(false, true), RenameAction::Reindex);
+        assert_eq!(rename_action(false, false), RenameAction::Skip);
     }
 
     /// Regression (full-audit 2026-07-26 AU-03): `HARDCODED_EXCLUDE_DIRS` は
