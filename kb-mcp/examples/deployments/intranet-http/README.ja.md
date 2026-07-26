@@ -147,10 +147,12 @@ SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
 > **同一ホスト上の reverse proxy はこの check を無効化する。** proxy 経由だと
 > kb-mcp から見た peer は proxy の loopback アドレスになり、素の
 > `proxy_pass http://127.0.0.1:3100` は `Host: 127.0.0.1:3100` を送る — admin
-> の allow-list は「loopback の別名 + bind アドレス」なのでこれも通る。結果、
-> 両方の gate を抜けて proxy に到達できる相手に admin UI が出る。**proxy で
-> map するのは `/mcp` と `/healthz` だけ**にし、`/ui` と `/api/admin/` は
-> map しない (or 403 を返す)。意図的に公開するなら、index 再構築や daemon
+> の allow-list は「loopback の別名 + (bind 自体が loopback の場合のみ) bind
+> アドレス」なのでこれも通る。結果、両方の gate を抜けて proxy に到達できる
+> 相手にこれらの route が出る。**allow-list 方式にすること**: map するのは
+> `/mcp` と `/healthz` だけ。block-list は形が悪い — `/api/search` も `/ui` /
+> `/api/admin/*` と同じ router にあり KB の内容を返すので、**塞ぎ忘れたものが
+> そのまま露出する**。意図的に公開するなら、KB 本体・index 再構築・daemon
 > status の前に立つのは proxy 自身の認証だけになる。
 
 現時点で認証が必要なら標準レシピは:
@@ -160,8 +162,9 @@ SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
 ```
 
 `kb-mcp.toml` で `127.0.0.1:3100` に bind し、nginx では **`/mcp` と
-`/healthz` だけ** を proxy する — `/ui` と `/api/admin/` は proxy しない
-(上の警告を参照)。クライアントの Host を転送し (`proxy_set_header Host $host;`)、
+`/healthz` だけ** を allow-list として proxy する — 他の route (`/ui` /
+`/api/search` / `/api/admin/*`) はすべて loopback gate 付きで、同一ホストの
+proxy はその gate を無効化する (上の警告を参照)。クライアントの Host を転送し (`proxy_set_header Host $host;`)、
 その名前を `[transport.http].allowed_hosts` に列挙する。
 
 ### `alwaysLoad: true` (クライアント側)

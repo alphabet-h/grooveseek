@@ -157,12 +157,14 @@ header is allow-listed. Use them by SSH-forwarding a port to the server
 > **A reverse proxy on the same host defeats that check.** kb-mcp then sees
 > the proxy's loopback address as the peer, and a plain `proxy_pass
 > http://127.0.0.1:3100` also sends `Host: 127.0.0.1:3100` — which is in the
-> admin allow-list, since that list is the loopback aliases plus the bind
-> address. Both gates pass and the admin UI is served to whoever reached the
-> proxy. **Map only `/mcp` and `/healthz` in the proxy**, and leave `/ui` and
-> `/api/admin/` unmapped (or return 403 for them). If you expose them on
-> purpose, the proxy's own authentication is then the only thing standing in
-> front of index rebuilds and daemon status.
+> admin allow-list (that list is the loopback aliases, plus the bind address
+> when the bind is itself loopback). Both gates pass and those routes are
+> served to whoever reached the proxy. Use an **allow-list**: map `/mcp` and
+> `/healthz`, nothing else. A block-list is the wrong shape here — `/api/search`
+> sits in the same router as `/ui` and `/api/admin/*` and returns knowledge-base
+> content, so anything you forget to deny stays exposed. If you publish these
+> routes deliberately, the proxy's own authentication becomes the only thing in
+> front of your KB, its index rebuilds, and daemon status.
 
 If you need authentication today, the canonical recipe is:
 
@@ -171,8 +173,9 @@ If you need authentication today, the canonical recipe is:
 ```
 
 Bind kb-mcp to `127.0.0.1:3100` in `kb-mcp.toml`, and configure nginx to
-proxy **`/mcp` and `/healthz` only** — not `/ui`, not `/api/admin/` (see the
-warning above). Forward the client's Host (`proxy_set_header Host $host;`)
+proxy **`/mcp` and `/healthz` only**, as an allow-list — every other route
+(`/ui`, `/api/search`, `/api/admin/*`) is loopback-gated and a same-host proxy
+would defeat that gate (see the warning above). Forward the client's Host (`proxy_set_header Host $host;`)
 and list that name in `[transport.http].allowed_hosts`.
 
 ### `alwaysLoad: true` (client-side)
