@@ -136,13 +136,29 @@ async fn stop_scheduled_task(service_name: &str) -> Result<()> {
 /// swallowed PowerShell error, a pid that could not be read. Confirming the
 /// outcome settles all of them at once, and it is what makes [`restart`] safe.
 ///
-/// `TerminateProcess` is asynchronous and the listening socket takes a moment
-/// to be released, so this retries briefly before declaring failure.
+/// A single failed request is **not** proof. The endpoint can time out or
+/// error while the daemon is very much alive, and taking that as success would
+/// let [`restart`] launch a second instance against an occupied port (codex P1
+/// round 6 on PR #89). So this requires several consecutive silences, and any
+/// response at all resets the count.
+///
+/// The listening socket also takes a moment to be released after the process
+/// exits, which is why this polls rather than checking once.
 async fn confirm_stopped(status_url: &str) -> Result<()> {
-    let client = status_client()?;
-    for _ in 0..10 {
-        if !daemon_answers(&client, status_url).await {
-            return Ok(());
+    /// Enough that a lone timeout or blip cannot be mistaken for a stop.
+    const REQUIRED_CONSECUTIVE_SILENCES: u32 = 3;
+    const ATTEMPTS: u32 = 12;
+
+    let client = confirmation_client()?;
+    let mut silences = 0;
+    for _ in 0..ATTEMPTS {
+        if daemon_answers(&client, status_url).await {
+            silences = 0;
+        } else {
+            silences += 1;
+            if silences >= REQUIRED_CONSECUTIVE_SILENCES {
+                return Ok(());
+            }
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -178,8 +194,13 @@ async fn probe_daemon(status_url: &str) -> DaemonProbe {
     }
 }
 
+/// Whether *anything* is still serving that URL.
+///
+/// Deliberately not `is_success()`: a 4xx or 5xx is still an HTTP response, so
+/// something is listening and the daemon has not stopped. Only a transport
+/// failure counts as silence.
 async fn daemon_answers(client: &reqwest::Client, status_url: &str) -> bool {
-    matches!(client.get(status_url).send().await, Ok(r) if r.status().is_success())
+    client.get(status_url).send().await.is_ok()
 }
 
 fn status_client() -> Result<reqwest::Client> {
@@ -187,6 +208,16 @@ fn status_client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(3))
         .build()
         .context("build status http client")
+}
+
+/// Shorter timeout than [`status_client`]: confirmation makes several attempts
+/// in a row behind a tray click, so a hung endpoint must not stall it for
+/// three seconds per attempt.
+fn confirmation_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .context("build confirmation http client")
 }
 
 async fn run_powershell(script: &str) -> Result<()> {

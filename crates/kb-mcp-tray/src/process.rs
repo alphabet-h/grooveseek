@@ -33,23 +33,30 @@
 //!
 //! [handles]: https://learn.microsoft.com/en-us/windows/win32/procthread/process-handles-and-identifiers
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use std::time::Duration;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject,
 };
 
 /// `GetExitCodeProcess` reports this while the process is still running.
 /// Defined here rather than imported so the meaning is visible at the use site.
 const STILL_RUNNING_EXIT_CODE: u32 = 259;
 
+/// How long to wait for a terminated process to actually go away. Termination
+/// is asynchronous and cannot complete until pending I/O is cancelled, so this
+/// is generous; exceeding it means something is genuinely wrong.
+const EXIT_WAIT: Duration = Duration::from_secs(10);
+
 /// What a stop attempt actually did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
-    /// Termination was requested on the verified process.
+    /// The verified process was terminated **and observed to exit**.
     Terminated,
     /// Nothing to stop: the pid does not resolve, or the process it referred
     /// to had already exited.
@@ -97,7 +104,7 @@ pub fn stop_process_if_image_matches(pid: u32, expected_file_name: &str) -> Resu
     // handle.
     let handle = unsafe {
         OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
             false,
             pid,
         )
@@ -132,7 +139,15 @@ pub fn stop_process_if_image_matches(pid: u32, expected_file_name: &str) -> Resu
     // SAFETY: `handle` was opened with PROCESS_TERMINATE above and is still
     // owned by this scope.
     match unsafe { TerminateProcess(handle.0, 1) } {
-        Ok(()) => Ok(StopOutcome::Terminated),
+        Ok(()) => {
+            // Termination is asynchronous: it "initiates termination and
+            // returns immediately". Returning here would mean `Terminated`
+            // only ever promised that a request was made, and the caller would
+            // have to guess when it took effect. Waiting on the handle turns it
+            // into an observation.
+            wait_for_exit(&handle)?;
+            Ok(StopOutcome::Terminated)
+        }
         Err(e) => {
             // Microsoft documents that terminating an already-exited process
             // fails with ERROR_ACCESS_DENIED through a still-open handle — the
@@ -144,6 +159,25 @@ pub fn stop_process_if_image_matches(pid: u32, expected_file_name: &str) -> Resu
             Err(e).with_context(|| format!("TerminateProcess failed for pid {pid}"))
         }
     }
+}
+
+/// Block until the process behind `handle` exits.
+///
+/// This is what lets the caller trust `Terminated` without polling an HTTP
+/// endpoint and guessing (codex P1 round 6 on PR #89: a single failed status
+/// request is not proof a daemon stopped, but a signalled process handle is).
+fn wait_for_exit(handle: &OwnedHandle) -> Result<()> {
+    // SAFETY: `handle` carries PROCESS_SYNCHRONIZE, which is what the wait
+    // functions require.
+    let waited = unsafe { WaitForSingleObject(handle.0, EXIT_WAIT.as_millis() as u32) };
+    if waited != WAIT_OBJECT_0 {
+        bail!(
+            "process did not exit within {:?} after termination (wait returned {:?})",
+            EXIT_WAIT,
+            waited
+        );
+    }
+    Ok(())
 }
 
 /// Full path of the executable backing `handle`.
@@ -243,6 +277,29 @@ mod tests {
             !status.success(),
             "terminated process must not exit cleanly"
         );
+    }
+
+    /// `Terminated` must mean the process has actually exited, not merely that
+    /// termination was requested. The caller relies on that instead of polling
+    /// an HTTP endpoint and guessing — a failed request is not proof a daemon
+    /// stopped, but a signalled process handle is. Asserted with no sleep in
+    /// between, so only the wait inside can make it pass.
+    #[test]
+    fn terminated_means_the_process_has_already_exited() {
+        let mut victim = spawn_victim();
+        let pid = victim.id();
+
+        assert_eq!(
+            stop_process_if_image_matches(pid, "ping.exe").expect("no error"),
+            StopOutcome::Terminated
+        );
+        assert_eq!(
+            stop_process_if_image_matches(pid, "ping.exe").expect("no error"),
+            StopOutcome::NotRunning,
+            "the process must be gone the moment Terminated is returned"
+        );
+
+        let _ = victim.wait();
     }
 
     /// Stopping again after the process is gone reports NotRunning instead of
