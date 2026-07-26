@@ -6,6 +6,25 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A path containing `&` or `<` produced a plist that launchd cannot read**
+  (AU-10). `render_plist` interpolated the binary path, the config directory
+  and the service name straight into `<string>` elements. All three of `&`,
+  `<` and `>` are legal in a macOS filename, so installing from
+  `/Users/a&b/bin/kb-mcp` wrote a plist that is not well-formed XML — and the
+  failure surfaces at `launchctl load`, after `kb-mcp service install` has
+  already reported success. Every interpolated value is now XML-escaped.
+  On the systemd side, a path containing a newline is refused with a message
+  naming the offending field instead of being written into a unit file, where
+  everything after the newline would be read as a further directive; and the
+  binary path in `ExecStart=` is quoted when it contains spaces, which
+  previously turned `/home/john doe/bin/kb-mcp` into the command
+  `/home/john` with `doe/bin/kb-mcp` as its first argument. A literal `%` in
+  that path is doubled, since specifiers are expanded before unquoting.
+  `WorkingDirectory=` is deliberately left verbatim: systemd.syntax(7)
+  describes quoting only "for settings where quoting is allowed" without
+  enumerating them, and emitting quotes a setting does not interpret would
+  break paths that work today.
+
 - **A `--force` reindex that failed partway through destroyed the index it was
   replacing** (AU-11). `reset_for_model` performed five writes with no
   transaction around them: three `DELETE`s, a drop-and-recreate of the
@@ -25,6 +44,17 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   rows.
 
 ### Internal
+
+- **The unit and plist templates now live in one always-compiled module**
+  (`src/service/render.rs`, part of AU-10). They previously sat inside
+  `service::linux` and `service::macos`, which are gated on `target_os`, so the
+  plist template was compiled only on macOS runners and the unit template only
+  on Linux ones — a typo in either was invisible everywhere else, including
+  locally. Both are pure functions over `InstallContext`, so they and their
+  escaping helpers now build and are tested on all three CI legs;
+  `service::linux::render_unit` and `service::macos::render_plist` remain as
+  re-exports, so nothing that called them had to change. This is the same move
+  AU-07/08 made for `child_args`.
 
 - **`kb-mcp service status` / `list` had no tests at all** (AU-14). Everything
   the two subcommands print goes through three functions in

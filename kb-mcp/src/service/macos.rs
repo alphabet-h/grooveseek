@@ -10,51 +10,10 @@ use std::process::Command;
 
 pub(crate) struct LaunchAgent;
 
-pub fn render_plist(ctx: &InstallContext) -> String {
-    // codex P2 round 5 on PR #56: honor `--no-auto-start` by emitting
-    // `<false/>` for `RunAtLoad` and `KeepAlive` when auto_start is false.
-    // Otherwise launchd would still start (and keep alive) the agent at the
-    // next login as soon as it's loaded — `--no-auto-start` becomes a no-op
-    // for the LaunchAgent backend.
-    let bool_val = if ctx.auto_start {
-        "<true/>"
-    } else {
-        "<false/>"
-    };
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.kb-mcp.{name}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{bin}</string>
-        <string>serve</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{home}</string>
-    <key>RunAtLoad</key>
-    {bool_val}
-    <key>KeepAlive</key>
-    {bool_val}
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{home}/kb-mcp.out</string>
-    <key>StandardErrorPath</key>
-    <string>{home}/kb-mcp.err</string>
-</dict>
-</plist>
-"#,
-        name = ctx.service_name,
-        bin = ctx.binary_path.display(),
-        home = ctx.config_home.display(),
-    )
-}
+/// テンプレート本体は `service::render` にある (全 OS で compile + テストする
+/// ため)。ここは既存の呼び出し経路 `service::macos::render_plist` を保つための
+/// re-export。
+pub use super::render::render_plist;
 
 fn plist_path(service_name: &str) -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("HOME 解決失敗"))?;

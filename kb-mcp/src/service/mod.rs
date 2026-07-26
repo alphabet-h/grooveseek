@@ -15,6 +15,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 pub mod install;
+pub mod render;
 pub mod status;
 pub mod uninstall;
 
