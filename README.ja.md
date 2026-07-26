@@ -707,7 +707,10 @@ kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
 `serve` を `--transport http` で動かすと、`/mcp` と `/healthz` に加えて 3 つの
 route が生える。有効化の設定は無く HTTP transport があれば常に存在し、3 つとも
 **loopback 限定**: middleware が peer アドレスが loopback でないリクエストを
-拒否し、その後 `Host` ヘッダを loopback の別名 + bind アドレスと照合する。
+拒否し、その後 `Host` ヘッダを loopback の別名 (`127.0.0.1` / `::1` /
+`localhost`) と照合する。bind アドレスが追加されるのは **それ自体が loopback の
+場合だけ** で、`0.0.0.0` に bind した時の `Host: 0.0.0.0` は意図的に拒否される
+(LAN のブラウザが bind アドレス経由でこれらの route に到達しないため)。
 `/mcp` 用に Host を allow-list していても、ネットワーク上の別マシンからは 403。
 
 | Route | 中身 |

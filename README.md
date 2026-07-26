@@ -709,8 +709,11 @@ Running `serve` with `--transport http` mounts three more routes beside `/mcp`
 and `/healthz`. Nothing enables them — they exist whenever the HTTP transport
 does — and all three are **loopback-only**: the middleware rejects any request
 whose peer address is not loopback, then checks the `Host` header against the
-loopback aliases plus the bind address. A machine elsewhere on the network gets
-403 even if you allow-listed its Host for `/mcp`.
+loopback aliases (`127.0.0.1`, `::1`, `localhost`) — plus the bind address, but
+only when that is itself loopback. Bind to `0.0.0.0` and `Host: 0.0.0.0` is
+rejected too, deliberately: a LAN browser must not reach these routes through
+the bind address. A machine elsewhere on the network gets 403 even if you
+allow-listed its Host for `/mcp`.
 
 | Route | What it is |
 | --- | --- |
