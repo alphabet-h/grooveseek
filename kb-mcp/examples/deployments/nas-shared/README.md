@@ -82,17 +82,20 @@ edits the same files. **The index does not.** Each machine keeps its own
    inotify nor ReadDirectoryChangesW propagates over a network
    filesystem, so it would silently miss every remote edit.
 
+   These are **user** units, so they run as you with no `User=` line to
+   substitute and no root needed — matching the directory you created in
+   step 1:
+
    ```ini
-   # /etc/systemd/system/kb-mcp-index.service
+   # ~/.config/systemd/user/kb-mcp-index.service
    [Service]
    Type=oneshot
-   User=you
    # --config is required: a unit does not inherit a working directory, so
    # config discovery would fall back to defaults and index with the wrong
    # model, which the existing index then rejects.
    ExecStart=/usr/local/bin/kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
 
-   # /etc/systemd/system/kb-mcp-index.timer
+   # ~/.config/systemd/user/kb-mcp-index.timer
    [Timer]
    OnBootSec=2min
    # Adjust to your edit cadence. systemd has no trailing comments: a `#`
@@ -101,6 +104,13 @@ edits the same files. **The index does not.** Each machine keeps its own
 
    [Install]
    WantedBy=timers.target
+   ```
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable --now kb-mcp-index.timer
+   # Optional: keep the timer running while you are logged out
+   sudo loginctl enable-linger "$(id -un)"
    ```
 
    Re-indexing is incremental (SHA-256 content diff), so a timer that

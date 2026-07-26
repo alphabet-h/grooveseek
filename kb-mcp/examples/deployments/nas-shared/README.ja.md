@@ -78,16 +78,18 @@
    ReadDirectoryChangesW もネットワーク FS 越しには伝播せず、リモート編集を
    **無言で取りこぼす**。
 
+   **user unit** にするので `User=` の置換も root も要らず、手順 1 で作った
+   ディレクトリの所有者と自然に一致する:
+
    ```ini
-   # /etc/systemd/system/kb-mcp-index.service
+   # ~/.config/systemd/user/kb-mcp-index.service
    [Service]
    Type=oneshot
-   User=you
    # --config は必須: unit は作業ディレクトリを引き継がないため、config 探索が
    # 既定値に落ちて別 model で index しようとし、既存 index に弾かれる。
    ExecStart=/usr/local/bin/kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
 
-   # /etc/systemd/system/kb-mcp-index.timer
+   # ~/.config/systemd/user/kb-mcp-index.timer
    [Timer]
    OnBootSec=2min
    # 編集頻度に合わせる。systemd に行末コメントは無く、値の後ろの `#` 以降も
@@ -96,6 +98,13 @@
 
    [Install]
    WantedBy=timers.target
+   ```
+
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable --now kb-mcp-index.timer
+   # ログアウト中もタイマーを動かしたい場合のみ:
+   sudo loginctl enable-linger "$(id -un)"
    ```
 
    再 index は増分 (SHA-256 の content diff) なので、変更が無ければ
