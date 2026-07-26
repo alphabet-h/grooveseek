@@ -200,7 +200,7 @@ when the previous run's fingerprint differs.
 |---|---|---|
 | `no golden file at ...` | Missing golden YAML | Create `.kb-mcp-eval.yml` or pass `--golden <path>` |
 | `No index found at ...` | KB not indexed | Run `kb-mcp index --kb-path <kb>` first |
-| `✗ <id>  recall@N: 0.00` (per-query) | Nothing the query retrieved matched this entry's `expected` paths — often a typo, a path that was never indexed, or a genuinely missed document | Check the path spelling, confirm it is in the index (`kb-mcp search` for it), then treat a real miss as a retrieval result rather than a config error |
+| `✗ <id>  recall@N: 0.00` (per-query) | Nothing the query retrieved matched this entry's `expected` paths — often a typo, a path that was never indexed, or a genuinely missed document | Check the path spelling, then search for a phrase you know is *inside* that document and look at the `path` of the hits (searching for the path itself proves nothing: FTS indexes `heading` / `context` / `content`, and the embeddings do not include the path either). A real miss is a retrieval result, not a config error |
 | `golden changed since last run, diff disabled` | Golden file edited | Expected; the next run will diff normally |
 | Model mismatch error | `--model` does not match the indexed model | Pass the model used for indexing, or re-index |
 

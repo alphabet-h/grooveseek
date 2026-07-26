@@ -23,8 +23,9 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   condition for a null `match_spans` (there are three: non-ASCII query, empty
   query, content over 256 KiB) and promised "all match positions" where 100 per
   chunk is the cap. `retrieval-pipeline.md` still described a 2-column FTS
-  index. The `tune` section now also documents the context-axis warning that
-  fires on every default-configured KB.
+  index. The `tune` section now also documents the context-axis warning, which fires
+  on default-configured KBs that reach the grid (a golden set with no effective
+  FTS queries exits earlier).
 
 - **The web UI and admin API were absent from the README** (AU-60). `/ui` and
   `/api/admin/status` have shipped since v0.8.0, but the only mentions were in

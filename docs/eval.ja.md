@@ -188,7 +188,7 @@ CI 例:
 |---|---|---|
 | `no golden file at ...` | golden YAML が無い | `.kb-mcp-eval.yml` を作成するか `--golden <path>` を渡す |
 | `No index found at ...` | 未 index | `kb-mcp index --kb-path <kb>` を先に走らせる |
-| per-query の `✗ <id>  recall@N: 0.00` | そのクエリの検索結果が `expected` のどのパスにも一致しなかった (typo / 未 index / 本当に取りこぼした、のいずれか) | パスの綴りを確認し、`kb-mcp search` で index にあるか確かめる。本当の miss なら設定ミスではなく検索結果として扱う |
+| per-query の `✗ <id>  recall@N: 0.00` | そのクエリの検索結果が `expected` のどのパスにも一致しなかった (typo / 未 index / 本当に取りこぼした、のいずれか) | パスの綴りを確認し、その文書の **中身** にある語句で検索して hit の `path` を見る (パス文字列で検索しても確認にはならない: FTS が張るのは `heading` / `context` / `content` で、embedding にもパスは入らない)。本当の miss なら設定ミスではなく検索結果として扱う |
 | `golden changed since last run, diff disabled` | golden を編集した | 意図通り。次回以降は新 golden で diff される |
 | Model mismatch エラー | `--model` が index 作成時と違う | index 時と同じモデル or 再 index |
 
