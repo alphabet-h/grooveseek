@@ -705,13 +705,18 @@ Security notes:
 
 ### Web UI and admin API (HTTP transport only)
 
-When `serve` runs with `--transport http` it also mounts a small status page at
-`/ui` and a JSON endpoint at `/api/admin/status`. There is nothing to enable —
-they exist whenever the HTTP transport does — but they are **loopback-only**:
-the middleware rejects any request whose peer address is not loopback, and then
-checks the `Host` header against the loopback aliases plus the bind address. A
-machine elsewhere on the network gets 403 even if you allow-listed its Host for
-`/mcp`.
+Running `serve` with `--transport http` mounts three more routes beside `/mcp`
+and `/healthz`. Nothing enables them — they exist whenever the HTTP transport
+does — and all three are **loopback-only**: the middleware rejects any request
+whose peer address is not loopback, then checks the `Host` header against the
+loopback aliases plus the bind address. A machine elsewhere on the network gets
+403 even if you allow-listed its Host for `/mcp`.
+
+| Route | What it is |
+| --- | --- |
+| `/ui` | A minimal search page (MVP placeholder, to be redesigned): a query box that posts to `/api/search` and lists the hits. It does **not** show daemon status. |
+| `/api/search` | JSON search for the page above — the same hybrid search the MCP `search` tool runs. |
+| `/api/admin/status` | Daemon / indexing / watcher / KB status as JSON. This is what the Windows tray polls every 5 seconds. |
 
 ```bash
 curl http://127.0.0.1:3100/api/admin/status
@@ -719,17 +724,17 @@ curl http://127.0.0.1:3100/api/admin/status
 
 ```json
 {
-  "daemon":  { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "..." },
+  "daemon":   { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "2026-07-26T09:12:03Z" },
   "indexing": { "active": false, "started_at": null, "progress": null },
-  "watcher": { "active": true },
-  "kb":      { "documents": 596, "chunks": 8878 },
+  "watcher":  { "active": true, "debounce_ms": 500 },
+  "kb":       { "path": "/srv/kb-mcp/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
   "config_source": "Cwd"
 }
 ```
 
-The page at `/ui` renders the same data and is what the Windows tray's **Open
-Web UI** menu item opens — but it is not Windows-specific. On Linux or macOS,
-browse to it on the machine running the daemon, or forward the port:
+`/ui` is what the Windows tray's **Open Web UI** menu item opens, but it is not
+Windows-specific. On Linux or macOS, browse to it on the machine running the
+daemon, or forward the port:
 
 ```bash
 ssh -L 3100:127.0.0.1:3100 kb-server.lan   # then open http://127.0.0.1:3100/ui

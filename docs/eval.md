@@ -250,10 +250,11 @@ there is nothing to measure. `tune` therefore starts with a pre-flight pass:
 - if the effective N is below 50 it warns that this is under the IR convention
   and the numbers are suggestive rather than conclusive
 
-A second warning fires whenever the KB was indexed with `[contextual]` off:
-every chunk's `context` column is then empty, so sweeping
-`bm25_context_weight` from 0.5 to 4.0 cannot change any score. With the
-default configuration this warning always appears, and it is a statement
+A second warning fires — **after** the effective-N check above, so only on
+runs that actually reach the grid — whenever the KB was indexed with
+`[contextual]` off: every chunk's `context` column is then empty, so sweeping
+`bm25_context_weight` from 0.5 to 4.0 cannot change any score. Since
+`[contextual]` is off by default, most runs see it, and it is a statement
 about the index rather than about the parameter:
 
 ```

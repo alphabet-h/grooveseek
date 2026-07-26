@@ -234,10 +234,11 @@ tokenizer に投げるため、**クエリが本文に逐語で出現すると�
 - 実効 N が 50 未満なら「IR 慣行の下限未満であり、結果は示唆であって結論ではない」
   と警告する
 
-もう 1 つの警告は、KB を `[contextual]` off で index した場合に必ず出る: 全 chunk の
-`context` 列が空なので、`bm25_context_weight` を 0.5〜4.0 で振ってもスコアは 1 ミリも
-動かない。**既定設定ではこの警告が常に出る**が、これはパラメータではなく index に
-ついての説明:
+もう 1 つの警告は、KB を `[contextual]` off で index した場合に出る (上の実効 N
+チェックの **後** なので、grid に到達した run に限る): 全 chunk の `context` 列が
+空なので、`bm25_context_weight` を 0.5〜4.0 で振ってもスコアは 1 ミリも動かない。
+`[contextual]` は既定 off なので大半の run で出るが、これはパラメータではなく
+index についての説明:
 
 ```
 kb-mcp tune: WARNING — every chunk has an empty context column, so the

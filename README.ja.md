@@ -704,12 +704,17 @@ kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
 
 ### Web UI と admin API (HTTP transport のみ)
 
-`serve` を `--transport http` で動かすと、ステータスページ `/ui` と JSON
-エンドポイント `/api/admin/status` も同時に生える。有効化の設定は無く HTTP
-transport があれば常に存在するが、**loopback 限定**: middleware が peer
-アドレスが loopback でないリクエストを拒否し、その後 `Host` ヘッダを
-loopback の別名 + bind アドレスと照合する。`/mcp` 用に Host を allow-list
-していても、ネットワーク上の別マシンからは 403 になる。
+`serve` を `--transport http` で動かすと、`/mcp` と `/healthz` に加えて 3 つの
+route が生える。有効化の設定は無く HTTP transport があれば常に存在し、3 つとも
+**loopback 限定**: middleware が peer アドレスが loopback でないリクエストを
+拒否し、その後 `Host` ヘッダを loopback の別名 + bind アドレスと照合する。
+`/mcp` 用に Host を allow-list していても、ネットワーク上の別マシンからは 403。
+
+| Route | 中身 |
+| --- | --- |
+| `/ui` | 最小限の**検索ページ** (MVP placeholder、Phase 3+ で再設計予定)。クエリ入力欄が `/api/search` に post して結果を並べるだけで、daemon の状態は **表示しない** |
+| `/api/search` | 上のページ用の JSON 検索。MCP の `search` ツールと同じハイブリッド検索 |
+| `/api/admin/status` | daemon / indexing / watcher / KB の状態を JSON で返す。Windows tray が 5 秒間隔で polling しているのはこれ |
 
 ```bash
 curl http://127.0.0.1:3100/api/admin/status
@@ -717,17 +722,17 @@ curl http://127.0.0.1:3100/api/admin/status
 
 ```json
 {
-  "daemon":  { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "..." },
+  "daemon":   { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "2026-07-26T09:12:03Z" },
   "indexing": { "active": false, "started_at": null, "progress": null },
-  "watcher": { "active": true },
-  "kb":      { "documents": 596, "chunks": 8878 },
+  "watcher":  { "active": true, "debounce_ms": 500 },
+  "kb":       { "path": "/srv/kb-mcp/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
   "config_source": "Cwd"
 }
 ```
 
-`/ui` は同じ内容を描画するページで、Windows tray の **Open Web UI** が開くのも
-これ。ただし Windows 専用ではない。Linux / macOS では daemon が動いているマシン
-上でブラウザから開くか、ポートを forward する:
+`/ui` は Windows tray の **Open Web UI** が開くページだが、Windows 専用ではない。
+Linux / macOS では daemon が動いているマシン上でブラウザから開くか、ポートを
+forward する:
 
 ```bash
 ssh -L 3100:127.0.0.1:3100 kb-server.lan   # → http://127.0.0.1:3100/ui
