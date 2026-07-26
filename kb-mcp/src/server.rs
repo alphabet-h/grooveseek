@@ -858,6 +858,14 @@ pub fn run_search_pipeline(
         anyhow::bail!("mmr_same_doc_penalty out of range: {p} (must be 0.0..=1.0)");
     }
 
+    // AU-01: `limit` の clamp は **この関数**で行う。呼び出し側 (MCP search /
+    // CLI search / CLI eval) の各境界で clamp する形にすると、追加した caller が
+    // 漏れる — 実際 codex P1 (PR #81) が「eval だけ生の値を渡していて、
+    // reranker on + MMR off のとき `compute_reranker_input_limit` がそれを
+    // そのまま返し `rerank_candidates_with_ids` の `Vec::with_capacity` で
+    // 落ちる」経路を検出した。3 caller が必ず通る唯一の choke point で閉じる。
+    let limit = clamp_search_limit(limit);
+
     let resolved = overrides.resolve(toml_search);
     // fusion は per-call override を持たない (MMR と違い resolve 機構を
     // 通さない、feature-47 D-6)。toml をそのまま db 層へ渡す。
@@ -2744,5 +2752,23 @@ mod tests {
         )
         .expect("pipeline must not abort on an absurd limit");
         assert!(hits.len() <= SEARCH_LIMIT_MAX as usize);
+    }
+
+    /// Regression (codex P1 on PR #81): reranker on + MMR off のとき
+    /// `compute_reranker_input_limit` は `limit` をそのまま返し、それが
+    /// `rerank_candidates_with_ids` の `Vec::with_capacity` に届く。
+    /// clamp を各呼び出し境界ではなく `run_search_pipeline` 内に置くことで、
+    /// この分岐に生の値が入らないことを型ではなく値で固定する。
+    /// (実 reranker はモデル DL が要るため、helper の値だけを直接検証する)
+    #[test]
+    fn test_reranker_input_limit_is_bounded_for_clamped_limit() {
+        let clamped = clamp_search_limit(u32::MAX);
+        // MMR off = `limit` 素通し経路。clamp 済みなので上限以下でなければならない。
+        assert_eq!(
+            compute_reranker_input_limit(false, 50, clamped),
+            SEARCH_LIMIT_MAX
+        );
+        // MMR on 側は pool_size 由来 (feature-28 P1 fix) なので元から有界。
+        assert_eq!(compute_reranker_input_limit(true, 50, clamped), 50);
     }
 }

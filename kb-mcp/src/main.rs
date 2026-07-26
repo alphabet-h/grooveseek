@@ -764,9 +764,9 @@ fn main() -> anyhow::Result<()> {
                 parent_retriever: _,
             } = args;
 
-            // AU-01: MCP boundary と同じ上限を CLI にも適用する (`--limit
-            // 4294967295` は候補プール経由で `Vec::with_capacity` へ届き
-            // allocation abort を起こしていた)。
+            // AU-01 の clamp は `run_search_pipeline` 内 (= MCP / CLI search /
+            // CLI eval が必ず通る唯一の choke point) に集約してある。ここでは
+            // echo 用の値も実際に使われる値と揃えたいので同じ helper を通す。
             let limit = kb_mcp::server::clamp_search_limit(limit);
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
