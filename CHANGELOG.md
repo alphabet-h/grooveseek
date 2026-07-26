@@ -17,11 +17,15 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   union types; the workaround published for them is exactly to strip `null`
   out of the type array. When a runtime cannot build a call, the model tends
   to emit its raw tool-call template as plain text, which never reaches the
-  server. kb-mcp now advertises plain single types and drops the width
-  `format` annotations. Nothing the server accepts changes: optionality was
-  already carried by the field's absence from `required`, an explicit `null`
-  still deserialises to `None`, and numeric bounds still travel in
-  `minimum` / `maximum`.
+  server. kb-mcp now advertises plain single types, and replaces each width
+  `format` with the explicit `minimum` / `maximum` it stood for. Nothing the
+  server accepts changes: optionality was already carried by the field's
+  absence from `required`, and an explicit `null` still deserialises to
+  `None`. Writing the integer bounds out matters because `schemars` emits
+  `minimum: 0` for unsigned types but never a `maximum`, so removing the
+  format alone would have advertised a domain *wider* than the server
+  accepts — a client would be told `4294967296` is a valid `u32`, and serde
+  would reject it before any handler saw it.
 
 - **The nightly `--include-ignored` run raced itself whenever the model
   cache was cold.** Several integration-test binaries each spawn `kb-mcp`

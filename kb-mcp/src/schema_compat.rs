@@ -18,8 +18,13 @@
 //!
 //! Dropping `null` does not narrow what the server accepts. Optionality is already
 //! carried by the field's absence from `required`, and serde still deserialises an
-//! explicit `null` into `None`. Dropping the width `format` loses nothing either:
-//! the actual bound travels in `minimum` / `maximum`, which are preserved.
+//! explicit `null` into `None`.
+//!
+//! Dropping a width `format` is not free, though: it is the only place the upper
+//! bound of a Rust integer type is stated, since `schemars` emits `minimum: 0` for
+//! unsigned types but never a `maximum`. So the range is written out as explicit
+//! `minimum` / `maximum` before the keyword is removed — otherwise the advertised
+//! schema would be *wider* than what the server accepts.
 //!
 //! The MCP specification's own examples use plain single types, so this brings the
 //! advertised schema closer to the shape clients are most likely to expect.
@@ -52,7 +57,7 @@ impl Transform for ClientCompat {
     fn transform(&mut self, schema: &mut Schema) {
         if let Some(obj) = schema.as_object_mut() {
             collapse_nullable_type(obj);
-            drop_nonstandard_format(obj);
+            normalize_format(obj);
         }
         transform_subschemas(self, schema);
     }
@@ -89,14 +94,52 @@ fn collapse_nullable_type(obj: &mut Map<String, Value>) {
 
 /// Removes Rust-width `format` annotations, keeping standard ones (`date-time`,
 /// `uri`, ...) untouched.
-fn drop_nonstandard_format(obj: &mut Map<String, Value>) {
-    let is_nonstandard = matches!(
-        obj.get("format"),
-        Some(Value::String(format)) if NONSTANDARD_FORMATS.contains(&format.as_str())
-    );
-    if is_nonstandard {
-        obj.remove("format");
+///
+/// For integer widths the range the format implied is written out explicitly
+/// first. `schemars` emits `minimum: 0` for unsigned types but never a
+/// `maximum`, so dropping the keyword on its own would advertise a *wider*
+/// domain than the server accepts: a client would be told `4294967296` is a
+/// valid `u32`, and serde would then reject it during deserialisation, before
+/// any handler could clamp it. Bounds already present win — an explicit
+/// constraint from the type is more specific than the width default.
+fn normalize_format(obj: &mut Map<String, Value>) {
+    let format = match obj.get("format") {
+        Some(Value::String(format)) if NONSTANDARD_FORMATS.contains(&format.as_str()) => {
+            format.clone()
+        }
+        _ => return,
+    };
+    obj.remove("format");
+
+    if let Some((minimum, maximum)) = integer_bounds(&format) {
+        obj.entry("minimum").or_insert(minimum);
+        obj.entry("maximum").or_insert(maximum);
     }
+}
+
+/// The inclusive range a Rust integer-width `format` stands for.
+///
+/// `float` / `double` deliberately return `None`. Their Rust ranges (±3.4e38 for
+/// `f32`) are not a meaningful thing to advertise to a caller, and every float
+/// parameter kb-mcp exposes already carries its real, much narrower range in the
+/// description and in server-side validation.
+///
+/// `uint` is what `schemars` emits for `usize`, whose width is platform
+/// dependent; the 64-bit bound is used, which is the permissive choice on a
+/// 32-bit target and therefore no worse than advertising no bound at all.
+fn integer_bounds(format: &str) -> Option<(Value, Value)> {
+    let bounds = match format {
+        "uint8" => (Value::from(0), Value::from(u8::MAX)),
+        "uint16" => (Value::from(0), Value::from(u16::MAX)),
+        "uint32" => (Value::from(0), Value::from(u32::MAX)),
+        "uint" | "uint64" => (Value::from(0), Value::from(u64::MAX)),
+        "int8" => (Value::from(i8::MIN), Value::from(i8::MAX)),
+        "int16" => (Value::from(i16::MIN), Value::from(i16::MAX)),
+        "int32" => (Value::from(i32::MIN), Value::from(i32::MAX)),
+        "int64" => (Value::from(i64::MIN), Value::from(i64::MAX)),
+        _ => return None,
+    };
+    Some(bounds)
 }
 
 #[cfg(test)]
@@ -143,12 +186,50 @@ mod tests {
 
     #[test]
     fn test_nonstandard_format_is_dropped_but_bounds_survive() {
+        // The width format is the only statement of the upper bound, so it has
+        // to become an explicit `maximum` rather than just disappearing.
         let out = transformed(serde_json::json!({
             "type": ["integer", "null"],
             "format": "uint32",
             "minimum": 0
         }));
-        assert_eq!(out, serde_json::json!({"type": "integer", "minimum": 0}));
+        assert_eq!(
+            out,
+            serde_json::json!({"type": "integer", "minimum": 0, "maximum": 4294967295u32})
+        );
+    }
+
+    #[test]
+    fn test_signed_width_format_becomes_both_bounds() {
+        let out = transformed(serde_json::json!({"type": "integer", "format": "int8"}));
+        assert_eq!(
+            out,
+            serde_json::json!({"type": "integer", "minimum": -128, "maximum": 127})
+        );
+    }
+
+    #[test]
+    fn test_existing_bounds_win_over_width_defaults() {
+        // A bound that came from the type itself is more specific than the
+        // width default and must not be widened.
+        let out = transformed(serde_json::json!({
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1,
+            "maximum": 100
+        }));
+        assert_eq!(
+            out,
+            serde_json::json!({"type": "integer", "minimum": 1, "maximum": 100})
+        );
+    }
+
+    #[test]
+    fn test_float_format_is_dropped_without_inventing_bounds() {
+        // f32's ±3.4e38 range is not useful to advertise; the real range lives
+        // in the description and in server-side validation.
+        let out = transformed(serde_json::json!({"type": ["number", "null"], "format": "float"}));
+        assert_eq!(out, serde_json::json!({"type": "number"}));
     }
 
     #[test]
@@ -177,7 +258,7 @@ mod tests {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer"},
+                    "limit": {"type": "integer", "minimum": 0, "maximum": 4294967295u32},
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"}
