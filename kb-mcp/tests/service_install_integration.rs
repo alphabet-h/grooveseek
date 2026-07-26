@@ -55,7 +55,7 @@ fn linux_unit_template_renders_correctly() {
         auto_start: true,
         force: false,
     };
-    let unit = kb_mcp::service::linux::render_unit(&ctx);
+    let unit = kb_mcp::service::linux::render_unit(&ctx).unwrap();
     assert!(unit.contains("[Unit]"));
     assert!(unit.contains("ExecStart=/home/u/.cargo/bin/kb-mcp serve"));
     assert!(unit.contains("WorkingDirectory=/home/u/.config/kb-mcp/kb-mcp"));

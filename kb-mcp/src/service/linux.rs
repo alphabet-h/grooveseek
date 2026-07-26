@@ -10,29 +10,10 @@ use std::process::Command;
 
 pub(crate) struct SystemdUser;
 
-pub fn render_unit(ctx: &InstallContext) -> String {
-    format!(
-        "[Unit]\n\
-         Description=kb-mcp loopback HTTP MCP server ({name})\n\
-         After=default.target\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         WorkingDirectory={home}\n\
-         ExecStart={bin} serve\n\
-         Restart=on-failure\n\
-         RestartSec=5s\n\
-         Environment=RUST_LOG=info\n\
-         StandardOutput=journal\n\
-         StandardError=journal\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        name = ctx.service_name,
-        home = ctx.config_home.display(),
-        bin = ctx.binary_path.display(),
-    )
-}
+/// テンプレート本体は `service::render` にある (全 OS で compile + テストする
+/// ため)。ここは既存の呼び出し経路 `service::linux::render_unit` を保つための
+/// re-export。
+pub use super::render::render_unit;
 
 fn unit_path(service_name: &str) -> Result<PathBuf> {
     let dir = dirs::config_dir()
@@ -67,7 +48,7 @@ impl ServiceBackend for SystemdUser {
                 path.display()
             ));
         }
-        std::fs::write(&path, render_unit(ctx))?;
+        std::fs::write(&path, render_unit(ctx)?)?;
         run_systemctl(&["daemon-reload"])?;
         if ctx.auto_start {
             let name = format!("kb-mcp-{}.service", ctx.service_name);
