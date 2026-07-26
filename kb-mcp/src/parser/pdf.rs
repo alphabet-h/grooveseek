@@ -40,6 +40,24 @@ const PDF_PAGE_TEXT_MAX_BYTES: usize = 1024 * 1024;
 /// 同じ `MAX_RAW_BINARY_BYTES` を文書単位の budget として使う。
 const PDF_DOC_TEXT_MAX_BYTES: usize = super::MAX_RAW_BINARY_BYTES as usize;
 
+/// 1 文書の抽出にかけてよい実時間の上限 (AU-05、codex P1)。
+///
+/// テキスト量の budget は **メモリ** を縛るが、**展開バイト数** は縛らない。
+/// 「テキストをほとんど出さない演算子に展開されるストリーム」を大量に持つ
+/// PDF は、カウンタをゼロ近傍に保ったまま全ストリームを展開させられる。
+/// crate 側に累積展開量の会計は無く (`MAX_DECOMPRESSED_SIZE` は stream 単位)、
+/// `StackSafeContext` の timeout は抽出経路から使われていないので、
+/// ここで実時間を見るしかない。
+///
+/// 残余の大きさは有界ではある: 入力は `MAX_RAW_BINARY_BYTES` (50 MB) で、
+/// DEFLATE の理論最大比が ~1032:1 なので累積展開量は高々 ~51 GB、
+/// 300 MB/s 程度の実効速度で ~170 秒。この上限はそれを 120 秒に切り下げる。
+///
+/// 値は crate 自身の `PARSING_TIMEOUT_SECS` (= 120、"Timeout for long-running
+/// parsing operations") に合わせた。正規の PDF は 50 MB でも数秒で終わるので、
+/// 遅いマシンでの false positive 余裕は十分ある。
+const PDF_DOC_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
 ///
 /// 戻り値: `(非空ページ数, 非空ページの平均文字数)`。非空ページが 1 つも
@@ -179,6 +197,7 @@ fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
         path_hint,
         PDF_PAGE_TEXT_MAX_BYTES,
         PDF_DOC_TEXT_MAX_BYTES,
+        PDF_DOC_EXTRACT_TIMEOUT,
     )
 }
 
@@ -190,6 +209,7 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     path_hint: &str,
     page_cap: usize,
     doc_cap: usize,
+    timeout: std::time::Duration,
 ) -> Result<Vec<String>> {
     use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
 
@@ -204,7 +224,19 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     // 申告値から確保しない原則)。
     let mut pages: Vec<String> = Vec::new();
     let mut budget: usize = 0;
+    let started = std::time::Instant::now();
     for index in 0..page_count {
+        // 展開バイト数そのものは数えられないので、それに比例する実時間で縛る。
+        // ページ境界でしか見ないため 1 ページ内の暴走は止められないが、
+        // codex P1 の想定 (「個別には許容されるストリームを数百個」) は
+        // 複数ページに跨るので、ここで頭打ちになる。
+        if started.elapsed() > timeout {
+            return Err(anyhow!(
+                "{path_hint}: PDF text extraction exceeded {} s after {} page(s)                  (decompression-bomb guard)",
+                timeout.as_secs_f64(),
+                index
+            ));
+        }
         let extracted = extractor.extract_from_page(document, index).map_err(|e| {
             anyhow!(
                 "{path_hint}: PDF text extraction failed on page {} \
@@ -483,9 +515,14 @@ mod tests {
             .sum();
         assert!(full > 0, "fixture should extract some text");
 
-        let err =
-            extract_pages_within_budget_capped(&doc, "bomb.pdf", PDF_PAGE_TEXT_MAX_BYTES, full - 1)
-                .expect_err("cumulative budget should have refused this");
+        let err = extract_pages_within_budget_capped(
+            &doc,
+            "bomb.pdf",
+            PDF_PAGE_TEXT_MAX_BYTES,
+            full - 1,
+            PDF_DOC_EXTRACT_TIMEOUT,
+        )
+        .expect_err("cumulative budget should have refused this");
         let msg = err.to_string();
         assert!(msg.contains("bomb.pdf"), "should name the file: {msg}");
         assert!(
@@ -495,8 +532,39 @@ mod tests {
 
         // ちょうど上限なら通る (off-by-one で正規ファイルを落とさない)。
         assert!(
-            extract_pages_within_budget_capped(&doc, "ok.pdf", PDF_PAGE_TEXT_MAX_BYTES, full)
-                .is_ok()
+            extract_pages_within_budget_capped(
+                &doc,
+                "ok.pdf",
+                PDF_PAGE_TEXT_MAX_BYTES,
+                full,
+                PDF_DOC_EXTRACT_TIMEOUT,
+            )
+            .is_ok()
+        );
+    }
+
+    /// AU-05 (codex P1): テキスト量の budget は **メモリ** しか縛らない。
+    /// テキストをほとんど出さない演算子に展開されるストリームを大量に持つ
+    /// PDF は、カウンタをゼロ近傍に保ったまま全ストリームを展開させられる。
+    /// 実時間でも縛っていることを確かめる。
+    #[test]
+    fn the_time_budget_stops_extraction_independently_of_text_volume() {
+        let doc = open_fixture(MINIMAL_PDF);
+        // 0 秒 = 最初のページ境界で必ず超過。テキスト量の budget は上限
+        // いっぱいに開けてあるので、止めたのが時間側だと確定できる。
+        let err = extract_pages_within_budget_capped(
+            &doc,
+            "slow.pdf",
+            PDF_PAGE_TEXT_MAX_BYTES,
+            PDF_DOC_TEXT_MAX_BYTES,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a zero time budget should have refused this");
+        let msg = err.to_string();
+        assert!(msg.contains("slow.pdf"), "should name the file: {msg}");
+        assert!(
+            msg.contains("exceeded") && msg.contains("decompression-bomb guard"),
+            "should say why: {msg}"
         );
     }
 

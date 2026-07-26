@@ -22,7 +22,14 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   quietly losing text. Output for well-formed PDFs is unchanged — a test
   asserts the new path returns exactly what the crate's own `extract_text`
   does, and the extractor is reused across pages so its cross-page font cache
-  still applies.
+  still applies. A text budget bounds memory but not decompression: a file
+  whose streams expand into operators emitting almost no text would keep that
+  counter near zero while still being fully decompressed, so extraction also
+  stops after 120 seconds — the crate exposes no cumulative decompression
+  accounting, and the timeout it does define is not wired into the extraction
+  path. That residual was bounded to begin with, since input is capped at
+  50 MB and DEFLATE tops out near 1032:1, but the ceiling was measured in
+  minutes rather than seconds.
 
 - **A damaged docx or pptx was indexed silently, with part of its text
   missing** (AU-13). Every OOXML reader ended its event loop with
