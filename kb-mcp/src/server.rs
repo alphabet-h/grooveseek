@@ -342,6 +342,23 @@ impl KbServer {
             .unwrap_or_default();
         }
 
+        // AU-17: list 型 filter の件数・要素長の上限。`query` にだけ cap が
+        // あって、同じリクエストに載る list は無制限という非対称を埋める。
+        // 3 つの上限をここで並べて読めるようにしてある (`path_globs` は
+        // `compile_path_globs` の内側でも検査され、そちらが CLI を守る)。
+        for (name, items) in [
+            ("path_globs", params.path_globs.as_deref().unwrap_or(&[])),
+            ("tags_any", params.tags_any.as_deref().unwrap_or(&[])),
+            ("tags_all", params.tags_all.as_deref().unwrap_or(&[])),
+        ] {
+            if let Err(e) = validate_filter_list(name, items) {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default();
+            }
+        }
+
         // path_globs を事前 compile。エラー時は ErrorResponse を返却。
         let cpg = match params.path_globs.as_ref() {
             Some(globs) => match compile_path_globs(globs) {
@@ -1011,6 +1028,10 @@ pub fn compile_path_globs(patterns: &[String]) -> anyhow::Result<crate::db::Comp
             "path_globs cannot be empty. Use null to disable, or [\"**\", \"!a/**\"] for exclude-only."
         );
     }
+    // AU-17: 件数・要素長の上限。ここに置くと CLI (`src/main.rs`) を含む
+    // 全 caller が同じ上限を得る。MCP の入口でも同じ検査をしているが、
+    // そちらは 3 つの list を 1 箇所で読めるようにするためのもの。
+    validate_filter_list("path_globs", patterns)?;
     let mut include_b = globset::GlobSetBuilder::new();
     let mut exclude_b = globset::GlobSetBuilder::new();
     let mut has_include = false;
@@ -1171,6 +1192,59 @@ fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> bool {
 /// truncate するが、上流で reject した方がレスポンスが予測可能になり、
 /// `compute_match_spans` の O(N×M) を query 側からも抑制できる。F-35。
 pub(crate) const SEARCH_QUERY_MAX_BYTES: usize = 1024;
+
+/// `search` の list 型 filter (`path_globs` / `tags_any` / `tags_all`) が
+/// 受理する要素数の上限。
+///
+/// full-audit 2026-07-26 AU-17: `query` だけ 1 KiB cap が入っていて、同じ
+/// リクエストに載る list 型 filter は件数も長さも無制限だった。HTTP transport
+/// には body size 上限も設定していないので、1 リクエストで CPU を焼ける。
+/// debug build での実測:
+///
+/// | 入力 | コスト |
+/// |---|---|
+/// | `path_globs` 64 本 | 2.8 ms |
+/// | `path_globs` 100,000 本 | 1.65 s |
+/// | 100,000 文字の glob 1 本 | 0.50 s |
+/// | `tags_any` 100,000 件 × 候補 1,000 | 8.2 s |
+/// | `tags_any` 1,000,000 件 × 候補 1,000 | **85 s** |
+///
+/// `tags_*` が最も悪い。SQL ではなく候補ごとの線形照合
+/// (`db::matches_tags_any`) なので、コストは 件数 × 候補数 で伸びる。
+/// `limit` は [`SEARCH_LIMIT_MAX`] で抑えてあるが、候補数はその数倍になる。
+///
+/// 64 は「実用上ありえる指定数」より十分大きく、かつ compile コストが
+/// 数 ms に収まる点として選んだ。
+pub(crate) const FILTER_LIST_MAX_ITEMS: usize = 64;
+
+/// list 型 filter の各要素のバイト数上限。`query` と同じ 1 KiB。
+///
+/// 件数だけ絞っても、1 本の巨大な glob で同じことができる (上表の
+/// 「100,000 文字の glob 1 本」)。globset は 1,000,000 文字でようやく自前で
+/// エラーにするが、そこに至るまで 2.8 s かかる。
+pub(crate) const FILTER_ITEM_MAX_BYTES: usize = SEARCH_QUERY_MAX_BYTES;
+
+/// list 型 filter の件数・要素長を検証する (AU-17)。
+///
+/// `compile_path_globs` の内側と MCP の入口の両方から呼ぶ。前者は CLI を
+/// 含む全経路を、後者は `tags_*` を含めて 3 つの上限を 1 箇所で読めるように
+/// するため。
+pub fn validate_filter_list(name: &str, items: &[String]) -> anyhow::Result<()> {
+    if items.len() > FILTER_LIST_MAX_ITEMS {
+        anyhow::bail!(
+            "{name} has too many entries: {} (max {FILTER_LIST_MAX_ITEMS}). \
+             Narrow the filter, or issue several calls.",
+            items.len()
+        );
+    }
+    if let Some(too_long) = items.iter().find(|s| s.len() > FILTER_ITEM_MAX_BYTES) {
+        anyhow::bail!(
+            "{name} has an entry that is too large: {} bytes (max {FILTER_ITEM_MAX_BYTES} bytes).",
+            too_long.len()
+        );
+    }
+    Ok(())
+}
 
 /// `search` が受理する `limit` の上限。
 ///
@@ -2112,6 +2186,62 @@ mod tests {
     fn test_compile_path_globs_empty_array_is_error() {
         let err = compile_path_globs(&[]).unwrap_err();
         assert!(err.to_string().contains("path_globs cannot be empty"));
+    }
+
+    // ---- AU-17: list 型 filter の上限 ----
+
+    #[test]
+    fn a_filter_list_at_the_limit_is_accepted() {
+        let items: Vec<String> = (0..FILTER_LIST_MAX_ITEMS)
+            .map(|i| format!("docs/d{i}/**"))
+            .collect();
+        assert!(validate_filter_list("path_globs", &items).is_ok());
+        assert!(compile_path_globs(&items).is_ok());
+    }
+
+    #[test]
+    fn a_filter_list_over_the_limit_is_refused() {
+        let items: Vec<String> = (0..FILTER_LIST_MAX_ITEMS + 1)
+            .map(|i| format!("docs/d{i}/**"))
+            .collect();
+        let err = validate_filter_list("tags_any", &items).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tags_any"),
+            "message should name the field: {msg}"
+        );
+        assert!(
+            msg.contains("too many entries"),
+            "message should say what is wrong: {msg}"
+        );
+        // path_globs は compile 側でも同じ上限に当たる (= CLI もここで守られる)。
+        assert!(compile_path_globs(&items).is_err());
+    }
+
+    #[test]
+    fn a_single_oversized_entry_is_refused() {
+        // 件数だけ絞っても、巨大な glob 1 本で同じだけ CPU を焼ける。
+        let huge = format!("a{}b", "*?".repeat(FILTER_ITEM_MAX_BYTES));
+        let err = validate_filter_list("path_globs", std::slice::from_ref(&huge)).unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected message: {err}"
+        );
+        assert!(compile_path_globs(&[huge]).is_err());
+    }
+
+    #[test]
+    fn an_entry_exactly_at_the_byte_limit_is_accepted() {
+        let at_limit = "a".repeat(FILTER_ITEM_MAX_BYTES);
+        assert_eq!(at_limit.len(), FILTER_ITEM_MAX_BYTES);
+        assert!(validate_filter_list("tags_all", &[at_limit]).is_ok());
+    }
+
+    #[test]
+    fn an_empty_filter_list_passes_validation() {
+        // 「filter 無効」を表す空配列は、上限の観点では常に OK。
+        // (`path_globs` の空配列は compile_path_globs 側で別途エラーになる)
+        assert!(validate_filter_list("tags_any", &[]).is_ok());
     }
 
     #[test]
