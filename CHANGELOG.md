@@ -6,6 +6,21 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **One `search` request could occupy the server for minutes** (AU-17). The
+  `query` string has been capped at 1 KiB since v0.7, but the list filters
+  travelling in the same request — `path_globs`, `tags_any`, `tags_all` — had
+  no limit on how many entries they carried or how long each one was, and the
+  HTTP transport sets no body-size limit either. `tags_any` is the sharp edge:
+  it is not a SQL predicate but a linear scan run against every candidate, so
+  its cost grows with entries × candidates. Measured on a debug build, a
+  request carrying 1,000,000 tags against 1,000 candidates spent 85 seconds;
+  100,000 spent 8.2. Patterns behave similarly through glob compilation —
+  100,000 of them take 1.65 s, and a single 100,000-character glob takes 0.5 s
+  (globset only rejects one on its own at around a million characters, after
+  2.8 s). Each list is now limited to 64 entries of at most 1 KiB, checked at
+  the MCP boundary and again inside `compile_path_globs` so the CLI is covered
+  by the same rule.
+
 - **A `bind` value in `kb-mcp.toml` could run a command when the tray opened
   the web UI** (AU-12). The tray split `bind` at its last colon and carried
   both halves into its URLs as strings, so anything written there ended up in

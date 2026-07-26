@@ -793,11 +793,15 @@ fn main() -> anyhow::Result<()> {
             );
 
             // path_globs を compile (空 Vec は filter 無効、`[]` 入力をエラーにしないのは CLI 仕様)
+            // 件数・要素長の上限は compile_path_globs の内側で検査される (AU-17)。
             let cpg = if path_globs.is_empty() {
                 None
             } else {
                 Some(kb_mcp::server::compile_path_globs(&path_globs)?)
             };
+            // AU-17: `tags_*` は glob と違って compile を通らないので、ここで検査する。
+            kb_mcp::server::validate_filter_list("tags_any", &tags_any)?;
+            kb_mcp::server::validate_filter_list("tags_all", &tags_all)?;
 
             let filters = kb_mcp::db::SearchFilters {
                 category: category.as_deref(),
