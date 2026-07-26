@@ -2044,7 +2044,25 @@ impl Database {
     /// `--force` 時の破壊的再初期化: `documents` / `chunks` / `vec_chunks`
     /// を全消ししてから新しい `(model, dim)` を記録する。`indexer::rebuild_index`
     /// が直後にすべての文書を再インデックスすることを前提とする。
+    ///
+    /// 5 つの書き込み (DELETE ×3 / vec_chunks 再生成 / index_meta 更新) は
+    /// **1 つの transaction にまとめる**。途中で失敗ないし中断すると、
+    /// 「documents は残っているのに chunks が空」「`vec_chunks` が新しい次元
+    /// なのに `index_meta` は旧 model」といった、どの再実行経路でも自動修復
+    /// されない状態が残るため。最悪なのは `recreate_vec_chunks` で DROP が
+    /// 通って CREATE が落ちる場合で、`vec_chunks` が消えたまま何も代わりが
+    /// 無くなる (dim が vec0 の上限 8192 を超えると実際に起きる)。
+    ///
+    /// 呼び出し側が既に transaction を張っている場合は自分では張らず、
+    /// 親 transaction にそのまま参加する。SQLite は真のネスト transaction を
+    /// 持たないため (`db-transaction-composition-pattern.md` 罠 1、
+    /// `upsert_document` と同じ形)。
     pub fn reset_for_model(&self, model: &str, dim: u32) -> Result<()> {
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         self.conn.execute_batch(
             "DELETE FROM fts_chunks; \
              DELETE FROM chunks; \
@@ -2052,6 +2070,10 @@ impl Database {
         )?;
         self.recreate_vec_chunks(dim)?;
         self.write_embedding_meta(model, dim)?;
+        // `?` で早期 return した場合は `local_tx` の Drop が ROLLBACK する。
+        if let Some(tx) = local_tx {
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -3920,6 +3942,118 @@ mod tests {
         db.insert_chunk(doc_id2, 0, None, None, "hi2", None, &emb, 1.0)
             .unwrap();
         assert_eq!(db.chunk_count().unwrap(), 1);
+
+        // 自分で張った transaction は commit まで済んでいること (= 開いたまま
+        // 残していない)。commit 忘れは Drop で黙って ROLLBACK される。
+        assert!(db.conn.is_autocommit());
+    }
+
+    /// AU-11 の regression: 途中で落ちた `reset_for_model` が index を壊さないこと。
+    ///
+    /// `dim` が vec0 の上限 8192 を超えると `CREATE VIRTUAL TABLE` が
+    /// "Dimension on vector column too large" で失敗する。transaction が
+    /// 無いと、その手前の DELETE 3 文と `DROP TABLE vec_chunks` は既に
+    /// 適用済みなので、documents も chunks も vec_chunks も消えた DB が残る。
+    #[test]
+    fn a_failed_reset_for_model_leaves_the_index_exactly_as_it_was() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            None,
+            None,
+            "hi",
+            None,
+            &dummy_embedding(0.1),
+            1.0,
+        )
+        .unwrap();
+        let vec_rows_before: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_rows_before, 1);
+
+        let err = db
+            .reset_for_model("impossible", 100_000)
+            .expect_err("vec0 rejects dimensions above 8192");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected failure mode: {err}"
+        );
+
+        assert_eq!(db.document_count().unwrap(), 1);
+        assert_eq!(db.chunk_count().unwrap(), 1);
+        assert_eq!(db.current_vec_dim().unwrap(), Some(384));
+        assert_eq!(
+            db.conn
+                .query_row::<i64, _, _>("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.read_embedding_meta().unwrap(),
+            Some(("bge-small-en-v1.5".to_string(), 384))
+        );
+
+        // 残骸ではなく使える index であること。
+        let doc_id2 = db
+            .upsert_document("b.md", Some("b"), None, None, None, &[], None, "h2")
+            .unwrap();
+        db.insert_chunk(
+            doc_id2,
+            0,
+            None,
+            None,
+            "hi2",
+            None,
+            &dummy_embedding(0.2),
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(db.chunk_count().unwrap(), 2);
+    }
+
+    /// 呼び出し側が transaction を張っていれば、`reset_for_model` は自分では
+    /// 張らずに親へ参加する (SQLite に真のネスト transaction が無いため)。
+    /// 親を rollback すると reset ごと巻き戻ることで確かめる。
+    #[test]
+    fn reset_for_model_joins_the_callers_transaction() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(
+            doc_id,
+            0,
+            None,
+            None,
+            "hi",
+            None,
+            &dummy_embedding(0.1),
+            1.0,
+        )
+        .unwrap();
+
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            db.reset_for_model("bge-m3", 1024).unwrap();
+            // reset は成功しているので、この時点では新しい姿になっている。
+            assert_eq!(db.document_count().unwrap(), 0);
+            assert_eq!(db.current_vec_dim().unwrap(), Some(1024));
+            drop(tx); // commit しない = ROLLBACK
+        }
+
+        assert_eq!(db.document_count().unwrap(), 1);
+        assert_eq!(db.chunk_count().unwrap(), 1);
+        assert_eq!(db.current_vec_dim().unwrap(), Some(384));
+        assert_eq!(
+            db.read_embedding_meta().unwrap(),
+            Some(("bge-small-en-v1.5".to_string(), 384))
+        );
     }
 
     #[test]

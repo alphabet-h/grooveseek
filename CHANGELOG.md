@@ -4,6 +4,26 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `--force` reindex that failed partway through destroyed the index it was
+  replacing** (AU-11). `reset_for_model` performed five writes with no
+  transaction around them: three `DELETE`s, a drop-and-recreate of the
+  `vec_chunks` vector table, and the `index_meta` update recording the new
+  model. Anything that stopped it in the middle left a state no later run
+  repairs on its own — documents present but chunks gone, or a `vec_chunks`
+  built for the new dimension while `index_meta` still named the old model.
+  The worst case is not hypothetical: `recreate_vec_chunks` drops the table
+  before creating its replacement, and `CREATE VIRTUAL TABLE ... USING vec0`
+  rejects a dimension above 8192, so a request for a larger one left the
+  database with no `vec_chunks` at all. The five writes are now one
+  transaction, and it steps aside when a caller has already opened one, since
+  SQLite has no nested transactions. Verified that virtual-table DDL does take
+  part in a rollback — the documentation does not promise it, so it was
+  measured: dropping and recreating `vec_chunks` at a different dimension
+  inside a transaction, then rolling back, restores the original table and its
+  rows.
+
 ### Internal
 
 - **`kb-mcp service status` / `list` had no tests at all** (AU-14). Everything
