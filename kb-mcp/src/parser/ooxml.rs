@@ -91,7 +91,10 @@ pub(crate) fn core_xml_frontmatter(
     budget: &mut u64,
 ) -> Result<Frontmatter> {
     match read_zip_entry(zip, "docProps/core.xml", budget)? {
-        Some(bytes) => Ok(parse_core_xml(&bytes, path_hint)),
+        Some(bytes) => {
+            warn_if_truncated(path_hint, "docProps/core.xml", &bytes);
+            Ok(parse_core_xml(&bytes, path_hint))
+        }
         None => Ok(Frontmatter {
             title: super::txt::derive_title_pub(path_hint),
             ..Frontmatter::default()
@@ -99,15 +102,6 @@ pub(crate) fn core_xml_frontmatter(
     }
 }
 
-/// core.xml バイト列を parse する (名前空間 prefix を無視し local name で判定)。
-///
-/// codex P2 (PR #70 round 2): 旧実装は `Event::Text` を都度直接代入していた
-/// ため、entity 参照 (quick-xml 0.38+ で `Event::Text` に含まれず
-/// `Event::GeneralRef` として別 event で届く) を挟む値
-/// (`<dc:title>R&amp;D</dc:title>` 等) が最後の Text fragment だけで
-/// 上書きされ、それより前の部分 ("R&") が失われていた。docx/pptx 本文と
-/// 同じく要素単位で Text + GeneralRef をバッファに蓄積してから `End` で
-/// 確定する方式に変更する。
 /// OOXML の XML 読み取りが途中で失敗したときの警告 (AU-13)。
 ///
 /// quick-xml のイベントループは `Err` を受けたら打ち切るしかないが、**黙って
@@ -119,12 +113,79 @@ pub(crate) fn core_xml_frontmatter(
 /// `part` は zip 内のエントリ名 (例 `word/document.xml`)。どのファイルの
 /// どの部分かが分からないと、複数ドキュメントを一括 index したときに
 /// 追跡できない。
-pub(crate) fn warn_truncated_xml(path_hint: &str, part: &str, err: &impl std::fmt::Display) {
+fn warn_truncated_xml(path_hint: &str, part: &str, err: &impl std::fmt::Display) {
     eprintln!(
         "warning: {path_hint}: {part}: XML parse error, extracted text is truncated here: {err}"
     );
 }
 
+/// EOF 時点で閉じていない要素が残っていれば警告する (AU-13、codex P1)。
+///
+/// quick-xml は **完全なトークンの直後で入力が尽きた場合、エラーではなく
+/// `Event::Eof` を返す**。実測:
+///
+/// | 切れ方 | quick-xml |
+/// |---|---|
+/// | タグの途中で終わる | `Err` (tag not closed) |
+/// | 閉じタグが無いまま終わる | **`Ok(Event::Eof)`** |
+///
+/// つまり `Err` 側だけ警告すると、**最も普通の切れ方 (完全なトークンの後で
+/// ファイルが途切れる) を取りこぼす**。開いたままの要素数を数えておき、
+/// EOF でゼロでなければ同じように警告する。
+fn warn_if_unclosed_at_eof(path_hint: &str, part: &str, open_elements: i64) {
+    if open_elements > 0 {
+        eprintln!(
+            "warning: {path_hint}: {part}: document ended with {open_elements} element(s) still open; extracted text is truncated here"
+        );
+    }
+}
+
+/// XML パートを 1 度走査し、途中で切れていれば警告する (AU-13)。
+///
+/// **2 通りの切れ方があり、片方しか `Err` にならない** (実測):
+///
+/// | 切れ方 | quick-xml |
+/// |---|---|
+/// | タグの途中で終わる | `Err` (tag not closed) |
+/// | 閉じタグが無いまま終わる | **`Ok(Event::Eof)`** |
+///
+/// 後者が最も普通の切れ方 (完全なトークンの後でファイルが途切れる) なので、
+/// `Err` だけを見ていると取りこぼす。開いたままの要素を数えて EOF で判定する。
+///
+/// **抽出ループとは別に 1 パス走らせる**。抽出側の 6 つのループは形が揃って
+/// おらず (`Start | Empty` の結合アーム、`if` ガード付きアーム、`End` アーム
+/// 自体が無いもの)、それぞれに深さカウントを差し込むと壊しやすい。ここに
+/// 集約すれば全パートで同じ判定になる。追加コストは XML 1 走査で、indexing
+/// 全体では embedding が支配的なので無視できる。
+pub(crate) fn warn_if_truncated(path_hint: &str, part: &str, xml: &[u8]) {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut open_elements: i64 = 0;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(_)) => open_elements += 1,
+            Ok(Event::End(_)) => open_elements -= 1,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                warn_truncated_xml(path_hint, part, &e);
+                return;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    warn_if_unclosed_at_eof(path_hint, part, open_elements);
+}
+
+/// core.xml バイト列を parse する (名前空間 prefix を無視し local name で判定)。
+///
+/// codex P2 (PR #70 round 2): 旧実装は `Event::Text` を都度直接代入していた
+/// ため、entity 参照 (quick-xml 0.38+ で `Event::Text` に含まれず
+/// `Event::GeneralRef` として別 event で届く) を挟む値
+/// (`<dc:title>R&amp;D</dc:title>` 等) が最後の Text fragment だけで
+/// 上書きされ、それより前の部分 ("R&") が失われていた。docx/pptx 本文と
+/// 同じく要素単位で Text + GeneralRef をバッファに蓄積してから `End` で
+/// 確定する方式に変更する。
 fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -185,10 +246,8 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
                 text_buf.clear();
             }
             Ok(Event::Eof) => break,
-            Err(e) => {
-                warn_truncated_xml(path_hint, "docProps/core.xml", &e);
-                break;
-            }
+            // 切れている場合の警告は `warn_if_truncated` (呼び出し側の 1 パス) が出す。
+            Err(_) => break,
             _ => {}
         }
         buf.clear();

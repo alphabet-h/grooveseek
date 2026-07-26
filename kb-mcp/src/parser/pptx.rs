@@ -159,6 +159,7 @@ fn parse_relationships(
     path_hint: &str,
     part: &str,
 ) -> Vec<(String, String, String)> {
+    super::ooxml::warn_if_truncated(path_hint, part, rels_xml);
     let mut reader = Reader::from_reader(rels_xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -189,10 +190,8 @@ fn parse_relationships(
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => {
-                super::ooxml::warn_truncated_xml(path_hint, part, &e);
-                break;
-            }
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
+            Err(_) => break,
             _ => {}
         }
         buf.clear();
@@ -261,6 +260,7 @@ fn resolve_visible_slide_order(
 /// `ppt/presentation.xml` の `<p:sldIdLst>` 内 `<p:sldId r:id="rIdX" .../>` から
 /// `r:id` の値を出現順 (= 可視順) に集める。
 fn parse_sld_id_list(xml: &[u8], path_hint: &str) -> Vec<String> {
+    super::ooxml::warn_if_truncated(path_hint, "ppt/presentation.xml", xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -291,10 +291,8 @@ fn parse_sld_id_list(xml: &[u8], path_hint: &str) -> Vec<String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => {
-                super::ooxml::warn_truncated_xml(path_hint, "ppt/presentation.xml", &e);
-                break;
-            }
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
+            Err(_) => break,
             _ => {}
         }
         buf.clear();
@@ -372,6 +370,7 @@ fn resolve_relative_target(base_dir: &str, target: &str) -> String {
 ///   「最後の sp の後ろだと一度も flush されない」のいずれかで silent drop
 ///   されるバグがあった。`<a:p>` 単位の flush に変えることで解消している。)
 fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, String) {
+    super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -443,10 +442,8 @@ fn parse_slide_xml(xml: &[u8], path_hint: &str, part: &str) -> (Option<String>, 
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(e) => {
-                super::ooxml::warn_truncated_xml(path_hint, part, &e);
-                break;
-            }
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
+            Err(_) => break,
             _ => {}
         }
         buf.clear();
@@ -466,6 +463,7 @@ fn ph_type_is_title(e: &quick_xml::events::BytesStart) -> bool {
 
 /// XML から全 `a:t` テキストを連結する (notes 用の簡易版。要素間はスペース区切り)。
 fn collect_a_t(xml: &[u8], path_hint: &str, part: &str) -> String {
+    super::ooxml::warn_if_truncated(path_hint, part, xml);
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -490,10 +488,8 @@ fn collect_a_t(xml: &[u8], path_hint: &str, part: &str) -> String {
                 out.push(' ');
             }
             Ok(Event::Eof) => break,
-            Err(e) => {
-                super::ooxml::warn_truncated_xml(path_hint, part, &e);
-                break;
-            }
+            // 切れている場合の警告は `warn_if_truncated` (関数冒頭の 1 パス) が出す。
+            Err(_) => break,
             _ => {}
         }
         buf.clear();

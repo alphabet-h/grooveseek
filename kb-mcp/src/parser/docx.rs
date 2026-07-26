@@ -40,12 +40,8 @@ impl Parser for DocxParser {
             .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
         // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
         let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
-        let chunks = parse_document_xml(
-            &doc_xml,
-            path_hint,
-            exclude_headings,
-            frontmatter.title.as_deref(),
-        );
+        super::ooxml::warn_if_truncated(path_hint, "word/document.xml", &doc_xml);
+        let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
         let raw_content = chunks
             .iter()
             .map(|c| c.content.as_str())
@@ -86,12 +82,7 @@ fn push_intra_paragraph_separator(local_name: &[u8], para_text: &mut String) {
 /// 表 (`w:tbl`) 内のテキストも専用ハンドリングはしない: OOXML 上は
 /// `w:tbl > w:tr > w:tc > w:p > w:r > w:t` と入れ子になっているだけなので、
 /// 通常の `<w:p>` 境界処理だけで現在のセクション本文に自然に取り込まれる。
-fn parse_document_xml(
-    xml: &[u8],
-    path_hint: &str,
-    excludes: &[&str],
-    title: Option<&str>,
-) -> Vec<Chunk> {
+fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec<Chunk> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -203,10 +194,8 @@ fn parse_document_xml(
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(e) => {
-                super::ooxml::warn_truncated_xml(path_hint, "word/document.xml", &e);
-                break;
-            }
+            // 切れている場合の警告は `warn_if_truncated` (parse_bytes_inner の 1 パス) が出す。
+            Err(_) => break,
             _ => {}
         }
         buf.clear();
@@ -332,10 +321,7 @@ mod tests {
     /// `tests/binary_formats_cli.rs` の subprocess テスト側)。
     #[test]
     fn test_docx_truncated_xml_keeps_what_was_read_before_the_error() {
-        // 途中で切れたタグにする。実測 (probe) では
-        //   - タグの途中で終わる      → "tag not closed" で **エラー**
-        //   - 閉じタグが無いまま EOF  → エラーにならず `Event::Eof`
-        // なので、単に閉じ忘れた XML ではこの経路を踏めない。
+        // タグの途中で切れる形。quick-xml はこれを `Err` にする。
         let bytes = docx_with_raw_document_xml(concat!(
             r#"<?xml version="1.0"?>"#,
             r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
@@ -349,6 +335,49 @@ mod tests {
             "text read before the error should survive: {:?}",
             doc.raw_content
         );
+    }
+
+    /// AU-13 (codex P1): **閉じタグが無いまま終わる**切れ方は quick-xml が
+    /// `Err` ではなく `Event::Eof` を返すため、`Err` だけ見ていると
+    /// 取りこぼす。実際にはこちらの方が普通の切れ方 (完全なトークンの直後で
+    /// ファイルが途切れる)。`warn_if_truncated` は開いたままの要素を数えて
+    /// これを検知する。
+    #[test]
+    fn test_docx_unclosed_root_at_eof_is_detected_as_truncation() {
+        let xml = concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body>"#,
+            r#"<w:p><w:r><w:t>kept</w:t></w:r></w:p>"#,
+            // `</w:body></w:document>` が無いまま終わる = quick-xml は Eof を返す
+        );
+        // まず quick-xml がこれをエラーにしないことを確かめる (前提の固定)。
+        let mut reader = quick_xml::reader::Reader::from_reader(xml.as_bytes());
+        let mut buf = Vec::new();
+        let mut errored = false;
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Eof) => break,
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+        assert!(
+            !errored,
+            "quick-xml treats an unclosed root as Eof, not Err — that is why the \
+             Err arm alone is not enough"
+        );
+
+        // 本文は読めているので、返り値としては成功のまま。
+        let bytes = docx_with_raw_document_xml(xml);
+        let doc = DocxParser
+            .parse_bytes(&bytes, "unclosed.docx", &[])
+            .unwrap();
+        assert!(doc.raw_content.contains("kept"));
     }
 
     /// AU-13: `<w:br/>` / `<w:tab/>` は `<w:t>` の外側に兄弟として現れる。
