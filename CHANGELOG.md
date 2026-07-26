@@ -4,6 +4,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Internal
+
+- **`kb-mcp service status` / `list` had no tests at all** (AU-14). Everything
+  the two subcommands print goes through three functions in
+  `src/service/status.rs`, and not one of them was covered: the toml fallback
+  that fills in `bind` and `kb_path` when the OS cannot report them, and the
+  two formatters. The fallback is now split so its decision — which field wins
+  when both the OS and `kb-mcp.toml` have an answer — is a plain function over
+  an already-read config string, following the same shape as
+  `build_register_script` and the AU-63 fix. That matters here because the
+  alternative, driving it through `KB_MCP_CONFIG_HOME`, would have put a second
+  process-wide environment mutation into a suite that runs its tests as threads
+  — exactly what AU-63 removed. Seventeen tests now cover all three
+  `ServiceState` arms, each field falling back independently, an absent,
+  malformed, or irrelevant config, and both output formats. One of them pins
+  something no eye-check reliably catches: that the columns `format_row` emits
+  line up with the header `run_list` prints above them. Behaviour is unchanged.
+
 ### Documentation
 
 - **`docs/` subpages that described behaviour the code does not have** (AU-46,
