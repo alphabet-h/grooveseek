@@ -23,13 +23,22 @@
 #
 # Set KB_PATH (absolute) before running, or hard-code it below. The script
 # exits 0 silently when the edited file is not under $KB_PATH, which keeps
-# unrelated edits from triggering a rebuild.
+# unrelated edits from triggering a rebuild. KB_EXTENSIONS controls which
+# file types count as knowledge-base content — set it to match
+# `[parsers].enabled` in your kb-mcp.toml.
 
 set -euo pipefail
 
 # --- configure ---------------------------------------------------------------
 KB_PATH="${KB_PATH:-}"               # e.g. /repo/knowledge-base
 KB_MCP_BIN="${KB_MCP_BIN:-kb-mcp}"   # override if not on PATH
+
+# Extensions that count as knowledge-base content, space separated and without
+# the dot. Keep this in sync with `[parsers].enabled` in your kb-mcp.toml:
+# listing more than you index only costs a no-op rebuild, listing fewer means
+# edits to those files are silently not re-indexed. Defaults to every format
+# kb-mcp can parse.
+KB_EXTENSIONS="${KB_EXTENSIONS:-md txt pdf docx xlsx xls pptx}"
 # -----------------------------------------------------------------------------
 
 if [[ -z "$KB_PATH" ]]; then
@@ -64,10 +73,17 @@ else
       /*) abs="$f" ;;
       *)  abs="$PWD/$f" ;;
     esac
-    if [[ "$abs" == "$KB_PATH"* && "$abs" == *.md ]]; then
-      should_rebuild=true
-      break
-    fi
+    [[ "$abs" == "$KB_PATH"* ]] || continue
+    # Extension match, case-insensitively (scanners and mail clients happily
+    # produce `Report.PDF`, and kb-mcp indexes those too).
+    ext="${abs##*.}"
+    ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+    for known in $KB_EXTENSIONS; do
+      if [[ "$ext" == "$known" ]]; then
+        should_rebuild=true
+        break 2
+      fi
+    done
   done <<< "$files"
 fi
 

@@ -12,9 +12,10 @@ kb_path = "/absolute/path/to/your/knowledge-base"
 # (slower / larger first download, but markedly better recall on non-English text).
 model = "bge-small-en-v1.5"
 
-# Cross-encoder reranker. Loaded but off by default — clients opt in per-query
-# via the MCP search parameter `rerank: true`. Comment out if you don't want
-# to pay the ~2.3 GB first-download cost.
+# Cross-encoder reranker. Left commented out so the first run does not pull a
+# ~2.3 GB model. While this key is absent the server loads no reranker, and
+# the MCP search parameter `rerank: true` is a silent no-op. Uncomment both
+# lines to load it at startup and let clients opt in per query.
 # reranker = "bge-v2-m3"
 # rerank_by_default = false
 

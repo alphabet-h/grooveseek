@@ -46,6 +46,23 @@ machines on the same intranet over Streamable HTTP.
 3. Drop `kb-mcp.toml` from this directory at `/srv/kb-mcp/kb-mcp.toml`
    (CWD discovery — the systemd unit sets `WorkingDirectory=/srv/kb-mcp`).
    Edit `kb_path`, `model`, and `[transport.http].bind` to taste.
+
+   **If clients connect from other machines, set
+   `[transport.http].allowed_hosts` as well.** It defaults to loopback only
+   (`localhost`, `127.0.0.1`, `::1`) as a DNS-rebinding defence, so a LAN
+   client requesting `http://kb-server.lan:3100/mcp` is answered with 403 no
+   matter what `bind` says. List every hostname / address clients put in
+   their URL:
+
+   ```toml
+   [transport.http]
+   bind = "0.0.0.0:3100"
+   allowed_hosts = ["kb-server.lan", "192.168.1.10"]
+   ```
+
+   kb-mcp warns at startup when it binds off-loopback with this key still
+   absent. Behind a reverse proxy, list the name clients use for the proxy
+   and make the proxy forward it (`proxy_set_header Host $host;`).
 4. Create the ONNX cache directory (the systemd unit only declares
    `ReadWritePaths=`, it does not create or chown the dir):
 
@@ -67,6 +84,15 @@ machines on the same intranet over Streamable HTTP.
    sudo systemctl daemon-reload
    sudo systemctl enable --now kb-mcp.service
    ```
+
+   > `kb-mcp service install` (v0.8.0+) is **not** what this recipe uses.
+   > That command registers a *user-level* unit
+   > (`~/.config/systemd/user/`), which starts with your login session and
+   > runs as you. A shared server wants the opposite: a system unit that
+   > boots without anyone logged in, runs as a dedicated `kbmcp` account,
+   > and carries the sandboxing directives in `kb-mcp.service`. Use
+   > `kb-mcp service install` for a personal always-on daemon on your own
+   > workstation.
 7. Health check:
 
    ```bash
@@ -120,7 +146,25 @@ binding to `0.0.0.0` is opt-in and your responsibility.
 | Casual local-network sniff (HTTP unencrypted) | Front kb-mcp with nginx/Caddy doing TLS termination, bind kb-mcp to loopback only |
 | Unauthorized clients on the LAN | Reverse proxy with HTTP basic auth or mTLS; or run kb-mcp on a per-team subnet that's already access-controlled |
 | Malicious request floods (DoS) | Rate limiting on the proxy. kb-mcp itself has no rate limiter. |
-| DNS rebinding from a browser | rmcp validates the Host header (loopback only by default); tightening for non-loopback binds is on the roadmap |
+| DNS rebinding from a browser | The Host header is validated against `[transport.http].allowed_hosts` — loopback only unless you list your own hostnames (v0.5.0+). `/healthz` is exempt by default; set `healthz_public = false` (v0.8.0+) to put it behind the same check. |
+
+The web UI (`/ui`) and the admin API (`/api/admin/*`) are **not** reachable
+from other machines: they sit behind a separate check that also requires the
+peer address to be loopback, so a LAN client gets 403 there even when its Host
+header is allow-listed. Use them by SSH-forwarding a port to the server
+(`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) rather than by opening them up.
+
+> **A reverse proxy on the same host defeats that check.** kb-mcp then sees
+> the proxy's loopback address as the peer, and a plain `proxy_pass
+> http://127.0.0.1:3100` also sends `Host: 127.0.0.1:3100` — which is in the
+> admin allow-list (that list is the loopback aliases, plus the bind address
+> when the bind is itself loopback). Both gates pass and those routes are
+> served to whoever reached the proxy. Use an **allow-list**: map `/mcp` and
+> `/healthz`, nothing else. A block-list is the wrong shape here — `/api/search`
+> sits in the same router as `/ui` and `/api/admin/*` and returns knowledge-base
+> content, so anything you forget to deny stays exposed. If you publish these
+> routes deliberately, the proxy's own authentication becomes the only thing in
+> front of your KB, its index rebuilds, and daemon status.
 
 If you need authentication today, the canonical recipe is:
 
@@ -128,8 +172,11 @@ If you need authentication today, the canonical recipe is:
 [Internet / VPN] → nginx (TLS + basic auth) → 127.0.0.1:3100 → kb-mcp
 ```
 
-Bind kb-mcp to `127.0.0.1:3100` in `kb-mcp.toml`, configure nginx to
-proxy `/mcp` and `/healthz` with `proxy_set_header Host $host` etc.
+Bind kb-mcp to `127.0.0.1:3100` in `kb-mcp.toml`, and configure nginx to
+proxy **`/mcp` and `/healthz` only**, as an allow-list — every other route
+(`/ui`, `/api/search`, `/api/admin/*`) is loopback-gated and a same-host proxy
+would defeat that gate (see the warning above). Forward the client's Host (`proxy_set_header Host $host;`)
+and list that name in `[transport.http].allowed_hosts`.
 
 ### `alwaysLoad: true` (client-side)
 

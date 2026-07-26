@@ -21,9 +21,9 @@ Claude Code は stdio 経由で kb-mcp を起動する。
 
 ## セットアップ
 
-1. **kb-mcp をインストール**。[ビルド済バイナリ](https://github.com/alphabet-h/kb-mcp/releases/latest) を `PATH` の通った場所に置くか、clone から `cargo install --path .`
+1. **kb-mcp をインストール**。[ビルド済バイナリ](https://github.com/alphabet-h/kb-mcp/releases/latest) を `PATH` の通った場所に置くか、clone から `cargo install --path kb-mcp` (リポジトリ root は workspace manifest なので `--path .` は失敗する)
 2. **KB の置き場所を決める**。例: `~/notes/` (個人ノート) や `~/projects/<repo>/docs/` (プロジェクト単位)
-3. **設定ファイルの置き場所**。自然な選択肢は 2 つ — [Config file discovery](../../../README.ja.md#設定ファイルの探索順) を参照:
+3. **設定ファイルの置き場所**。自然な選択肢は 2 つ — [Config file discovery](../../../../README.ja.md#設定ファイルの探索順) を参照:
    - **プロジェクト単位**: `kb-mcp.toml` と `.mcp.json` を一緒にプロジェクトリポジトリに置いて commit (toml は共有前提に作られている)
    - **グローバル**: `kb-mcp.toml` をバイナリの隣 (`~/.local/bin/kb-mcp.toml` や `%USERPROFILE%\bin\kb-mcp.toml`) に置けば全プロジェクトで同じ設定を共有
 4. **`kb-mcp.toml` を編集**: `kb_path` を KB の絶対パスに。言語が合わなければ model と reranker を調整
@@ -40,7 +40,7 @@ Claude Code は stdio 経由で kb-mcp を起動する。
 
 - **Watcher** は既定で有効。`.md` の保存 / `git pull` / 外部スクリプトによる変更も ~500 ms 以内に自動再インデックス
 - **PostToolUse hook** はオプション、watcher と相補的 — [`examples/hooks/`](../../hooks/) 参照。watcher が手動編集をカバーするので、hook の価値は「Claude 自身がファイルを書いた直後にゼロレイテンシで再構築したい」場合に限られる
-- **Reranker** はロードのみで既定 off。MCP の `search` 呼び出しに `rerank: true` を渡して per-query で有効化する想定 (CPU で ~300-700 ms のレイテンシ税は毎回払うほどでない)
+- **Reranker** は本レシピでは **未設定** — 初回実行で ~2.3 GB のモデルを引かせないため `kb-mcp.toml` の `reranker` キーをコメントアウトしてある。コメントを外すまで `search` の `rerank: true` は **silent no-op** (サーバは起動時に reranker をロードしていた場合のみ rerank する)。有効化したら `rerank_by_default = false` のまま per-query で opt-in する運用にする (CPU で ~300-700 ms のレイテンシ税は毎回払うほどでない)
 - **1 サーバ : 1 クライアント**。stdio は 1 接続のみ — 個人用途なら十分。複数クライアントが必要なら [`intranet-http/`](../intranet-http/) へ
 - **`alwaysLoad: true`** はサンプル `.mcp.json` に入れている Claude Code v2.1.121+ のオプション。tool-search ショートリストを介さず initial load で kb-mcp のツールを必ず含めるようにする。RAG 用途 (「いつでも検索したい」) では推奨。初回起動コスト (モデル DL / index open) を抑えたい / クライアントが v2.1.121 未満なら削除可。他 MCP クライアントは未知フィールドとして無視
 

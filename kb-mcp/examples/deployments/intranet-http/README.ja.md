@@ -45,6 +45,22 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
 3. このディレクトリの `kb-mcp.toml` を `/srv/kb-mcp/kb-mcp.toml` に置く
    (CWD 探索 — systemd unit が `WorkingDirectory=/srv/kb-mcp` を設定する)。
    `kb_path` / `model` / `[transport.http].bind` を環境に合わせる
+
+   **他マシンから接続させるなら `[transport.http].allowed_hosts` も設定する。**
+   既定は DNS rebinding 対策として loopback のみ (`localhost` / `127.0.0.1` /
+   `::1`) なので、`http://kb-server.lan:3100/mcp` を叩く LAN クライアントは
+   **`bind` を何にしても 403 になる**。クライアントが URL に書くホスト名 /
+   アドレスをすべて列挙する:
+
+   ```toml
+   [transport.http]
+   bind = "0.0.0.0:3100"
+   allowed_hosts = ["kb-server.lan", "192.168.1.10"]
+   ```
+
+   このキーが無いまま非 loopback に bind すると kb-mcp は起動時に warn を出す。
+   reverse proxy 経由ならクライアントが proxy に使う名前を列挙し、proxy 側で
+   その Host を転送する (`proxy_set_header Host $host;`)。
 4. ONNX キャッシュディレクトリを作成 (systemd unit は `ReadWritePaths=` を
    宣言するだけで作成 / chown はしない):
 
@@ -66,6 +82,13 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
    sudo systemctl daemon-reload
    sudo systemctl enable --now kb-mcp.service
    ```
+
+   > 本レシピは `kb-mcp service install` (v0.8.0+) を **使わない**。あちらが
+   > 登録するのは *user-level* unit (`~/.config/systemd/user/`) で、ログイン
+   > セッションと共に起動し実行ユーザは自分自身になる。共有サーバに欲しいのは
+   > 逆で、誰もログインしていなくても boot 時に起動し、専用 `kbmcp` アカウント
+   > で動き、`kb-mcp.service` の sandbox 指定を持つ system unit。
+   > `kb-mcp service install` は個人ワークステーションの常駐 daemon 向け。
 7. ヘルスチェック:
 
    ```bash
@@ -114,7 +137,23 @@ opt-in、そして運用責任は利用者にある。
 | LAN 上での平文盗聴 (HTTP 暗号化なし) | nginx / Caddy で TLS termination、kb-mcp は loopback bind のみ |
 | LAN 内の不正クライアント | reverse proxy で HTTP basic auth or mTLS、またはアクセス制御済 subnet 内に隔離 |
 | 悪意ある大量リクエスト (DoS) | proxy 側のレート制限。kb-mcp 本体にレート制限機能なし |
-| ブラウザからの DNS rebinding | rmcp は Host ヘッダを検証 (loopback bind 限定で既定有効)。非 loopback bind での厳格化はロードマップ上 |
+| ブラウザからの DNS rebinding | Host ヘッダを `[transport.http].allowed_hosts` と照合する (v0.5.0+)。自分のホスト名を列挙するまでは loopback のみ許可。`/healthz` は既定で対象外だが、`healthz_public = false` (v0.8.0+) で同じ検証下に置ける |
+
+Web UI (`/ui`) と admin API (`/api/admin/*`) は **他マシンから到達できない**。
+これらは別の check の背後にあり、Host ヘッダが allow-list に載っていても
+**peer アドレスが loopback でなければ 403** になる。使う時は公開するのではなく
+SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
+
+> **同一ホスト上の reverse proxy はこの check を無効化する。** proxy 経由だと
+> kb-mcp から見た peer は proxy の loopback アドレスになり、素の
+> `proxy_pass http://127.0.0.1:3100` は `Host: 127.0.0.1:3100` を送る — admin
+> の allow-list は「loopback の別名 + (bind 自体が loopback の場合のみ) bind
+> アドレス」なのでこれも通る。結果、両方の gate を抜けて proxy に到達できる
+> 相手にこれらの route が出る。**allow-list 方式にすること**: map するのは
+> `/mcp` と `/healthz` だけ。block-list は形が悪い — `/api/search` も `/ui` /
+> `/api/admin/*` と同じ router にあり KB の内容を返すので、**塞ぎ忘れたものが
+> そのまま露出する**。意図的に公開するなら、KB 本体・index 再構築・daemon
+> status の前に立つのは proxy 自身の認証だけになる。
 
 現時点で認証が必要なら標準レシピは:
 
@@ -122,8 +161,11 @@ opt-in、そして運用責任は利用者にある。
 [インターネット / VPN] → nginx (TLS + basic auth) → 127.0.0.1:3100 → kb-mcp
 ```
 
-`kb-mcp.toml` で `127.0.0.1:3100` に bind し、nginx で `/mcp` と `/healthz`
-を `proxy_set_header Host $host` 等とともに proxy。
+`kb-mcp.toml` で `127.0.0.1:3100` に bind し、nginx では **`/mcp` と
+`/healthz` だけ** を allow-list として proxy する — 他の route (`/ui` /
+`/api/search` / `/api/admin/*`) はすべて loopback gate 付きで、同一ホストの
+proxy はその gate を無効化する (上の警告を参照)。クライアントの Host を転送し (`proxy_set_header Host $host;`)、
+その名前を `[transport.http].allowed_hosts` に列挙する。
 
 ### `alwaysLoad: true` (クライアント側)
 

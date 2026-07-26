@@ -76,9 +76,19 @@ base, so the hook stays silent for unrelated edits.
 
 The script reads the hook payload from stdin, extracts the edited file path
 (via `jq` if available), and only invokes `kb-mcp index` when the edit
-targets a `.md` file under `$KB_PATH`. `Skill` invocations have no file
+targets an indexable file under `$KB_PATH`. `Skill` invocations have no file
 path in the payload, so they fall through to an unconditional rebuild (cheap
 thanks to diffing).
+
+Which extensions count is `KB_EXTENSIONS`, defaulting to every format kb-mcp
+can parse (`md txt pdf docx xlsx xls pptx`, matched case-insensitively so
+`Report.PDF` counts too). **Keep it in line with `[parsers].enabled` in your
+`kb-mcp.toml`**: naming more formats than you index only costs a no-op
+rebuild, but naming fewer means edits to those files never trigger one.
+
+```json
+"command": "KB_PATH=/abs/path/to/knowledge-base KB_EXTENSIONS='md txt' /abs/path/to/rebuild-on-edit.sh"
+```
 
 ## Notes
 

@@ -1,139 +1,184 @@
-# Deployment recipe — NAS-shared knowledge base
+# Deployment recipe — knowledge base on a NAS
 
 > **日本語版**: [README.ja.md](./README.ja.md)
 
-The KB and the SQLite index live on a NAS (NFS / SMB / CIFS). One machine
-acts as the **authoritative indexer**; other machines mount the share
-read-only and run kb-mcp serve locally pointing at the mounted path.
+The knowledge base itself lives on a NAS (NFS / SMB / CIFS) so everyone
+edits the same files. **The index does not.** Each machine keeps its own
+`.kb-mcp.db` on local disk and indexes the shared files itself.
 
-> **⚠️ Read this first.** SQLite over a network filesystem is supported
-> only with extreme care. The lock primitives that SQLite WAL relies on
-> (`fcntl` byte-range locks) are unreliable on SMB and unimplementable
-> on most NFS configurations. The recipe below works around this by
-> designating one machine the sole writer; **multi-host concurrent
-> writes to the same `.kb-mcp.db` will corrupt the index**.
+> **⚠️ Why the index stays local.** SQLite's WAL mode is explicit about
+> this ([SQLite docs, WAL](https://www.sqlite.org/wal.html)):
+>
+> > All processes using a database must be on the same host computer; WAL
+> > does not work over a network filesystem. This is because WAL requires
+> > all processes to share a small amount of memory and processes on
+> > separate host machines obviously cannot share memory with each other.
+>
+> kb-mcp runs every connection in WAL mode, so putting `.kb-mcp.db` on
+> the share and opening it from several machines is not a configuration
+> that can be made safe with mount flags or an "only one writer" rule —
+> even readers participate in the shared-memory protocol. Earlier
+> versions of this recipe did exactly that; it is corrected here.
+>
+> If you want **one** index rather than one per machine, that is what
+> [`intranet-http/`](../intranet-http/) is for: a single host owns the
+> database on its own disk and answers searches over HTTP.
 
 ## Target environment
 
-- KB lives on a NAS exported to multiple workstations.
-- One workstation (the "indexer host") owns the write path: it runs
-  `kb-mcp index` (or has the watcher), and it is the only one that
-  touches `.kb-mcp.db` for writes.
-- Other workstations mount the same share and run `kb-mcp serve`
-  locally for **read-only search** against the indexer-produced DB.
-- Everyone is on the same LAN (latency matters; cross-WAN NFS will be
-  miserable for SQLite).
+- The KB is a directory on a NAS, exported to several workstations.
+- Each workstation searches its own local index of those files, so
+  embedding cost and disk are paid per machine (a few hundred MB for a
+  typical KB, plus the ONNX model cache).
+- Everyone is on the same LAN. Cross-WAN mounts make indexing slow, but
+  correctness no longer depends on the network filesystem's locking.
 
 ## What's in this directory
 
 | File | Purpose |
 | --- | --- |
-| [`kb-mcp.toml.indexer`](./kb-mcp.toml.indexer) | Used **only** on the indexer host. Watcher off (NFS/SMB inotify is unreliable); index runs on a cron / systemd timer. |
-| [`kb-mcp.toml.client`](./kb-mcp.toml.client) | Used on every other workstation. Watcher off (no writes), reranker / quality filter to taste. |
-| [`.mcp.json`](./.mcp.json) | Client-side: stdio + the shared kb_path. |
+| [`kb-mcp.toml.client`](./kb-mcp.toml.client) | The per-machine config. Watcher off (network filesystems do not deliver inotify / ReadDirectoryChangesW events), index driven by a timer. |
+| [`kb-mcp.toml.indexer`](./kb-mcp.toml.indexer) | Same thing with the watcher discussion spelled out, for a machine that also edits the KB locally. |
+| [`.mcp.json`](./.mcp.json) | Client-side: stdio, pinned to this machine's config with `--config`. |
 
-## Setup
+## Setup (repeat on every machine)
 
-### Indexer host (one machine)
-
-1. Mount the NAS share with **read+write** for the user that runs kb-mcp.
-   Pick the most reliable protocol you have available:
-   - NFSv4 with `noac` is generally the safest for SQLite.
-   - SMB with `cache=strict,actimeo=0` works on Linux clients but is
-     fragile under heavy concurrency.
-2. Copy `kb-mcp.toml.indexer` to `kb-mcp.toml` somewhere on the discovery
-   path. Edit `kb_path` to the mounted directory.
-3. Run an initial full index (this can take minutes — embedding generation
-   over an NFS read can be slower than local disk):
+1. **Mount the share so that its parent directory is on local disk.**
+   This is the whole trick: `.kb-mcp.db` is created in the *parent* of
+   `kb_path`, so mounting at `/var/lib/kb-mcp/knowledge-base` puts the
+   database at `/var/lib/kb-mcp/.kb-mcp.db` — local, private, and never
+   touched by another host.
 
    ```bash
-   kb-mcp index --kb-path /mnt/nas/knowledge-base --force
+   # The parent must be writable by the account that runs kb-mcp, because
+   # .kb-mcp.db and its WAL sidecars are created there, and the ONNX model
+   # cache lands beside them. The mount point itself has to exist before
+   # mounting — `mount` will not create it.
+   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp
+   sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/kb-mcp/fastembed
+   sudo install -d /var/lib/kb-mcp/knowledge-base
+
+   # Linux NFSv4 example. Read-only is fine here: only the KB files are
+   # on the NAS, and kb-mcp never writes those.
+   sudo mount -t nfs4 -o ro nas:/exports/kb /var/lib/kb-mcp/knowledge-base
    ```
 
-4. Schedule incremental rebuilds on a timer (cron / systemd). Example
-   systemd timer fragment:
+   **Make it persistent**, or the timer below will one day run against an
+   empty directory and the indexer will prune every document out of the local
+   database — the files "disappeared" as far as it can tell:
+
+   ```
+   # /etc/fstab
+   nas:/exports/kb  /var/lib/kb-mcp/knowledge-base  nfs4  ro,_netdev  0  0
+   ```
+
+   Mounting read-only is optional but harmless, and it makes "this
+   machine does not edit the shared KB" enforceable. Machines that *do*
+   edit the KB mount it read-write as usual.
+
+2. Copy `kb-mcp.toml.client` to `/var/lib/kb-mcp/kb-mcp.toml` and set
+   `kb_path = "/var/lib/kb-mcp/knowledge-base"`. Keeping it next to the
+   database means the timer below can point `--config` straight at it — the
+   model must match what the index was built with, and a systemd unit does
+   not inherit your shell's working directory.
+
+3. Build the index (minutes on the first run — reading over NFS is
+   slower than local disk, and the ONNX model downloads once):
+
+   ```bash
+   kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
+   ```
+
+4. Keep it fresh on a timer. The watcher cannot help here: neither
+   inotify nor ReadDirectoryChangesW propagates over a network
+   filesystem, so it would silently miss every remote edit.
+
+   These are **user** units, so they run as you with no `User=` line to
+   substitute and no root needed — matching the directory you created in
+   step 1:
 
    ```ini
-   # /etc/systemd/system/kb-mcp-index.service
+   # ~/.config/systemd/user/kb-mcp-index.service
+   [Unit]
+   # Belt and braces for the same failure mode: if the share is not mounted
+   # (NAS down, network not up yet), skip this run instead of indexing an
+   # empty directory and pruning the database.
+   ConditionPathIsMountPoint=/var/lib/kb-mcp/knowledge-base
+
    [Service]
    Type=oneshot
-   ExecStart=/usr/local/bin/kb-mcp index --kb-path /mnt/nas/knowledge-base
-   User=kbmcp
+   # --config is required: a unit does not inherit a working directory, so
+   # config discovery would fall back to defaults and index with the wrong
+   # model, which the existing index then rejects.
+   ExecStart=/usr/local/bin/kb-mcp index --config /var/lib/kb-mcp/kb-mcp.toml
 
-   # /etc/systemd/system/kb-mcp-index.timer
+   # ~/.config/systemd/user/kb-mcp-index.timer
    [Timer]
    OnBootSec=2min
-   OnUnitActiveSec=5min  # adjust to your edit cadence
-   Unit=kb-mcp-index.service
+   # Adjust to your edit cadence. systemd has no trailing comments: a `#`
+   # after the value becomes part of the value and the setting is dropped.
+   OnUnitActiveSec=5min
 
    [Install]
    WantedBy=timers.target
    ```
 
-5. **Do not** run `kb-mcp serve` on the indexer host with the watcher
-   enabled if other machines are reading the DB. The watcher's
-   incremental writes can race with reader connections opening the WAL
-   on another host. Either:
-   - Run only the timer-driven `kb-mcp index`, no serve.
-   - Or run `serve` with `--no-watch` and rely on the timer.
-
-### Read-only clients (every other machine)
-
-1. Mount the same NAS share read-only:
-
    ```bash
-   # Linux NFSv4 example
-   sudo mount -t nfs4 -o ro,noac nas:/exports/kb /mnt/nas/knowledge-base
+   systemctl --user daemon-reload
+   systemctl --user enable --now kb-mcp-index.timer
+   # Optional: keep the timer running while you are logged out
+   sudo loginctl enable-linger "$(id -un)"
    ```
 
-   **Read-only mount is important** — it prevents an accidental local
-   `kb-mcp index` from corrupting the indexer's DB.
-2. Copy `kb-mcp.toml.client` to `kb-mcp.toml` on the discovery path,
-   edit `kb_path` to the mounted directory.
-3. Drop `.mcp.json` into the project root (or wherever Claude Code
-   reads it).
-4. Confirm read-only behavior:
+   Re-indexing is incremental (SHA-256 content diff), so a timer that
+   finds nothing new costs a directory walk and a hash per file.
+
+5. Drop `.mcp.json` into the project root (or wherever your MCP client
+   reads it). It passes `--config /var/lib/kb-mcp/kb-mcp.toml` for the same
+   reason the timer does: the client launches kb-mcp from *your project*
+   directory, where discovery would never find that file, and the server
+   would start with the default model against a `bge-m3` index.
+
+6. Confirm:
 
    ```bash
-   kb-mcp status --kb-path /mnt/nas/knowledge-base
+   kb-mcp status --config /var/lib/kb-mcp/kb-mcp.toml
    ```
 
-   Should report a non-zero document count without touching anything.
+   Should report a non-zero document count. If it says `unable to open
+   database file`, the *parent* of `kb_path` is not writable — that is
+   where the database and its WAL sidecars have to live.
 
 ## Operational notes
 
-- **The DB lives on the NAS too**. `.kb-mcp.db` lands at
-  `/mnt/nas/.kb-mcp.db` (parent of `kb_path`). All readers see the same
-  file. SQLite opens it read-only when no writes are issued from that
-  host, so concurrent searches are safe; concurrent writes from multiple
-  hosts are not.
-- **Watcher is OFF for clients**. inotify (Linux) and ReadDirectoryChangesW
-  (Windows) do not propagate over network filesystems. The watcher would
-  silently miss events anyway. Trust the indexer's timer.
-- **Watcher on the indexer is also OFF** in the recipe above — change
-  detection runs on a timer because incremental writes mid-search from
-  remote readers is a stress case the SQLite WAL is not designed for
-  over network FS. If your edit volume is low and your NAS is fast,
-  you can experiment with `[watch].enabled = true` on the indexer
-  alone — quiesce remote readers when re-indexing.
-- **First-run model download** still happens on every machine
-  independently. Set `FASTEMBED_CACHE_DIR` to a shared path **only**
-  if it lives on local disk for that machine; pointing it at the NAS
-  produces extremely slow first-load and serializes embedder loads
-  across hosts.
+- **Every machine embeds the same content.** That is the price of not
+  sharing a database over the network. A KB of a few thousand documents
+  costs minutes of CPU per machine on the first run and seconds per
+  timer tick afterwards. If that is too much, run
+  [`intranet-http/`](../intranet-http/) instead and pay it once.
+- **The index can lag behind the files** by up to one timer interval,
+  and different machines can be at different points in that window.
+  Nothing breaks — search just returns slightly older content.
+- **Model caches are per machine too.** Set `FASTEMBED_CACHE_DIR` only
+  to a *local* path; pointing it at the NAS makes model loading slow and
+  serializes it across hosts.
+- **Config mismatches are caught, not silently tolerated.** If one
+  machine indexes with `bge-small-en-v1.5` and another opens that
+  database expecting `bge-m3`, the `index_meta` check rejects it at
+  startup. Since each machine now owns its database this only matters if
+  you copy one around.
 - **`alwaysLoad: true`** in the example `.mcp.json` is a Claude Code
   v2.1.121+ option that forces kb-mcp's tools to be present at initial
-  load. Useful for RAG ("search anytime"). With NAS-mounted KBs the
-  first-startup cost can be larger than personal (slow disk + initial
-  model download), so consider dropping it if startup latency matters
-  more than tool-availability. Other MCP clients ignore the field.
+  load. Useful for RAG ("search anytime"). First-startup cost here can
+  be larger than the personal recipe (NFS reads + initial model
+  download), so drop it if startup latency matters more. Other MCP
+  clients ignore the field.
 
 ## When to step up to another recipe
 
-- The "one writer, many readers" assumption breaks (everyone wants to
-  edit and reindex on demand) → [`intranet-http/`](../intranet-http/),
-  where one HTTP server holds the only writer connection and clients
-  query over the network.
-- You see `database is locked` / `database disk image is malformed`
-  errors → the network FS lock semantics have failed. Move to
-  [`intranet-http/`](../intranet-http/) before you lose data.
+- You do not want to pay embedding cost on every machine, or you want
+  one index everyone agrees on → [`intranet-http/`](../intranet-http/).
+- You are tempted to put `.kb-mcp.db` back on the share → read the
+  SQLite quote at the top again, then go to
+  [`intranet-http/`](../intranet-http/).
+- Only one machine uses the KB after all → [`personal/`](../personal/).

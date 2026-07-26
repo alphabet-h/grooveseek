@@ -44,3 +44,19 @@ kind = "http"
 # without a proxy, or to the LAN-internal IP (e.g. 192.168.1.10:3100) to
 # expose only on a specific interface.
 bind = "127.0.0.1:3100"
+
+# Host header allow-list (DNS-rebinding defence). Omitted, it defaults to
+# loopback only — ["localhost", "127.0.0.1", "::1"] — which means every LAN
+# client is answered with 403, because their Host header carries the server's
+# name or IP. Changing `bind` alone is NOT enough: list here every hostname
+# and address clients actually put in their URL, matching the `.mcp.json` in
+# this directory. kb-mcp warns at startup when it binds off-loopback while
+# this key is still absent.
+#
+# Uncomment together with a LAN `bind`:
+# allowed_hosts = ["kb-server.lan", "192.168.1.10"]
+#
+# Behind a reverse proxy, list the name clients use to reach the proxy (the
+# proxy must forward it, e.g. nginx `proxy_set_header Host $host;`).
+# An empty list disables the check entirely — do not do that on a network you
+# do not fully trust.

@@ -62,7 +62,13 @@ Claude Code の [PostToolUse hook](https://docs.claude.com/en/docs/claude-code/h
 }
 ```
 
-スクリプトは stdin から hook payload を読み、(`jq` が利用可能なら) 編集されたファイルパスを抽出し、編集対象が `$KB_PATH` 配下の `.md` ファイルのときのみ `kb-mcp index` を呼ぶ。`Skill` 呼び出しは payload にファイルパスが無いため、無条件再構築にフォールスルーする (差分検出があるので安価)。
+スクリプトは stdin から hook payload を読み、(`jq` が利用可能なら) 編集されたファイルパスを抽出し、編集対象が `$KB_PATH` 配下の **index 対象ファイル**のときのみ `kb-mcp index` を呼ぶ。`Skill` 呼び出しは payload にファイルパスが無いため、無条件再構築にフォールスルーする (差分検出があるので安価)。
+
+対象拡張子は `KB_EXTENSIONS` で決まり、既定は kb-mcp が parse できる全形式 (`md txt pdf docx xlsx xls pptx`、大小文字は無視するので `Report.PDF` も対象)。**`kb-mcp.toml` の `[parsers].enabled` と揃えること**: 多めに書いても no-op rebuild のコストだけだが、少なく書くとその形式の編集で rebuild が **走らない**。
+
+```json
+"command": "KB_PATH=/abs/path/to/knowledge-base KB_EXTENSIONS='md txt' /abs/path/to/rebuild-on-edit.sh"
+```
 
 ## 補足
 

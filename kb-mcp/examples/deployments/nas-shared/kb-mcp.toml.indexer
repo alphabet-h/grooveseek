@@ -1,31 +1,34 @@
-# NAS-shared deployment — INDEXER host config (kb-mcp.toml)
+# KB-on-NAS deployment — config for a machine that also EDITS the KB
 #
-# Use this on the single machine that owns writes to the shared .kb-mcp.db.
-# Other machines use kb-mcp.toml.client. See README.md / README.ja.md.
+# Same shape as kb-mcp.toml.client; the difference is the watcher
+# discussion below. Every machine still keeps its own index on local disk.
+# See README.md / README.ja.md.
 
-# Mounted NAS path with read+write for the user that runs kb-mcp.
-# .kb-mcp.db will land at <kb_path>/../.kb-mcp.db on the NAS.
-kb_path = "/mnt/nas/knowledge-base"
+# Mount point for the NAS share, mounted read-write on this machine since
+# it edits the KB. The parent must be on LOCAL disk: .kb-mcp.db is created
+# at <kb_path>/../.kb-mcp.db and must not live on the share.
+kb_path = "/var/lib/kb-mcp/knowledge-base"
 
-# Multilingual model (BGE-M3) is usually the right choice for shared KBs
-# that mix English / Japanese / project notes. Switch back to bge-small-en-v1.5
-# if your KB is English-only and you want a 6× smaller download.
 model = "bge-m3"
 
-# Reranker is heavy; leave loaded for opt-in per-query, off by default.
 reranker = "bge-v2-m3"
 rerank_by_default = false
 
-# Keep the model cache on local disk (fast); never point this at the NAS.
-fastembed_cache_dir = "/var/cache/fastembed"
+# Model cache: local disk, and writable by the account that runs kb-mcp.
+# Kept inside the same user-owned tree as the database so setup creates it
+# once. Omit the key entirely to use the OS cache dir (~/.cache/fastembed on
+# Linux) — but not if home directories are themselves on the NAS.
+fastembed_cache_dir = "/var/lib/kb-mcp/fastembed"
 
 [parsers]
 enabled = ["md"]
 
-# Watcher OFF on the indexer host — let the systemd timer drive
-# `kb-mcp index` instead. inotify is unreliable across network FS, and
-# watcher writes interleaving with remote reader connections is a
-# known-bad pattern for SQLite WAL on NFS/SMB.
+# Watcher: OFF by default here too, because a network mount does not
+# deliver filesystem events. If this machine edits the KB through the
+# mount, its own writes are also invisible to the watcher — the events
+# would have to come from the NAS, not from the local kernel. The timer is
+# what keeps the index fresh; set this to true only if you have a local
+# copy of the files rather than a mount.
 [watch]
 enabled = false
 
