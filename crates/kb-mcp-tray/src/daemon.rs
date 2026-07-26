@@ -136,36 +136,47 @@ async fn stop_scheduled_task(service_name: &str) -> Result<()> {
 /// swallowed PowerShell error, a pid that could not be read. Confirming the
 /// outcome settles all of them at once, and it is what makes [`restart`] safe.
 ///
-/// A single failed request is **not** proof. The endpoint can time out or
-/// error while the daemon is very much alive, and taking that as success would
-/// let [`restart`] launch a second instance against an occupied port (codex P1
-/// round 6 on PR #89). So this requires several consecutive silences, and any
-/// response at all resets the count.
+/// Only [`Liveness::Gone`] — the port being free — counts, and it has to hold
+/// several times running so a momentary blip cannot pass for a stop. Anything
+/// else resets the run: an inconclusive probe is not progress towards proof
+/// (codex P1 rounds 6 and 7 on PR #89, where a single failed request, and then
+/// a run of timeouts, were each treated as evidence).
 ///
-/// The listening socket also takes a moment to be released after the process
-/// exits, which is why this polls rather than checking once.
+/// The socket takes a moment to be released after the process exits, which is
+/// why this polls rather than checking once. Failing to establish the stop is
+/// an error: the caller must not be told the daemon is down when that could not
+/// be shown.
 async fn confirm_stopped(status_url: &str) -> Result<()> {
-    /// Enough that a lone timeout or blip cannot be mistaken for a stop.
-    const REQUIRED_CONSECUTIVE_SILENCES: u32 = 3;
+    /// Enough that a lone blip cannot be mistaken for a stop.
+    const REQUIRED_CONSECUTIVE_FREE_PROBES: u32 = 3;
     const ATTEMPTS: u32 = 12;
 
-    let client = confirmation_client()?;
-    let mut silences = 0;
+    let authority = authority_of(status_url)
+        .with_context(|| format!("cannot read host:port out of status url {status_url}"))?;
+    let mut free_probes = 0;
+    let mut last = Liveness::Inconclusive;
     for _ in 0..ATTEMPTS {
-        if daemon_answers(&client, status_url).await {
-            silences = 0;
-        } else {
-            silences += 1;
-            if silences >= REQUIRED_CONSECUTIVE_SILENCES {
-                return Ok(());
+        last = probe_liveness(authority);
+        match last {
+            Liveness::Gone => {
+                free_probes += 1;
+                if free_probes >= REQUIRED_CONSECUTIVE_FREE_PROBES {
+                    return Ok(());
+                }
             }
+            _ => free_probes = 0,
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    bail!(
-        "the daemon at {status_url} is still responding after the stop attempt; \
-         it was not stopped"
-    )
+    match last {
+        Liveness::Occupied => {
+            bail!("{authority} is still in use after the stop attempt; the daemon was not stopped")
+        }
+        _ => bail!(
+            "could not confirm the daemon on {authority} stopped: the port could be \
+             neither bound nor shown to be in use, so it may still be running"
+        ),
+    }
 }
 
 /// Read the daemon's pid, distinguishing "answered without a pid" from "did not
@@ -194,13 +205,56 @@ async fn probe_daemon(status_url: &str) -> DaemonProbe {
     }
 }
 
-/// Whether *anything* is still serving that URL.
+/// What a single probe of the daemon's port proves.
 ///
-/// Deliberately not `is_success()`: a 4xx or 5xx is still an HTTP response, so
-/// something is listening and the daemon has not stopped. Only a transport
-/// failure counts as silence.
-async fn daemon_answers(client: &reqwest::Client, status_url: &str) -> bool {
-    client.get(status_url).send().await.is_ok()
+/// Established by **binding** the port rather than connecting to it. Two
+/// earlier attempts were measured and rejected:
+///
+/// - an HTTP request, classifying refusals with `reqwest::Error::is_connect()`
+///   — no refusal was ever classified that way, so a stopped daemon could never
+///   be confirmed;
+/// - a TCP connect, treating `ConnectionRefused` as the stop signal — on a host
+///   whose firewall drops packets to closed ports instead of sending a reset,
+///   every probe times out and, again, nothing can be confirmed. Measured
+///   exactly that on the development machine.
+///
+/// Binding has neither problem. It is a local operation the network stack
+/// answers definitively, and "can something else bind this port" is precisely
+/// what [`restart`] needs to know before starting a new instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// The port is taken: something still owns it.
+    Occupied,
+    /// The port is free, so nothing is serving on it. The only result that is
+    /// evidence of a stop.
+    Gone,
+    /// Neither could be established — a permission problem, an address that is
+    /// not local. Not evidence of anything, and in particular not of a stop
+    /// (codex P1 rounds 6 and 7 on PR #89).
+    Inconclusive,
+}
+
+/// `host:port` of a status URL, e.g. `http://127.0.0.1:3100/api/admin/status`
+/// → `127.0.0.1:3100`. The tray builds these itself (`config::resolve`), so a
+/// scheme and an explicit port are always present.
+fn authority_of(status_url: &str) -> Option<&str> {
+    let rest = status_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(status_url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    (!authority.is_empty() && authority.contains(':')).then_some(authority)
+}
+
+fn probe_liveness(authority: &str) -> Liveness {
+    // Binding and immediately dropping. Windows does not set SO_REUSEADDR on
+    // listeners, so a port another socket is listening on genuinely refuses the
+    // bind rather than quietly sharing it.
+    match std::net::TcpListener::bind(authority) {
+        Ok(_) => Liveness::Gone,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Liveness::Occupied,
+        Err(_) => Liveness::Inconclusive,
+    }
 }
 
 fn status_client() -> Result<reqwest::Client> {
@@ -208,16 +262,6 @@ fn status_client() -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(3))
         .build()
         .context("build status http client")
-}
-
-/// Shorter timeout than [`status_client`]: confirmation makes several attempts
-/// in a row behind a tray click, so a hung endpoint must not stall it for
-/// three seconds per attempt.
-fn confirmation_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .context("build confirmation http client")
 }
 
 async fn run_powershell(script: &str) -> Result<()> {
@@ -263,6 +307,64 @@ mod tests {
         assert_eq!(DAEMON_IMAGE, "kb-mcp.exe");
     }
 
+    #[test]
+    fn authority_of_extracts_host_and_port() {
+        assert_eq!(
+            authority_of("http://127.0.0.1:3100/api/admin/status"),
+            Some("127.0.0.1:3100")
+        );
+        assert_eq!(
+            authority_of("http://localhost:8080/"),
+            Some("localhost:8080")
+        );
+        assert_eq!(authority_of("127.0.0.1:3100/x"), Some("127.0.0.1:3100"));
+        // No port means nothing to connect to deliberately; the tray always
+        // builds these with one, so this is a bug rather than a default.
+        assert_eq!(authority_of("http://example.com/status"), None);
+        assert_eq!(authority_of(""), None);
+    }
+
+    /// A socket that is bound but never answers must never be read as a stop.
+    /// This is the shape a busy daemon has, and the confirmation timing out
+    /// against it used to be reported as success — after which `restart` would
+    /// start a second instance against the still-occupied port.
+    #[tokio::test]
+    async fn confirm_stopped_refuses_a_port_that_is_still_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Accept and hold connections open without ever writing a response.
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => held.push(s),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let err = confirm_stopped(&format!("http://{addr}/api/admin/status"))
+            .await
+            .expect_err("a hanging endpoint must not be reported as stopped");
+        assert!(
+            err.to_string().contains("still in use"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// A free port is the one case that does establish a stop.
+    #[tokio::test]
+    async fn confirm_stopped_accepts_a_free_port() {
+        // Bind to grab a free port, then drop it so connections are refused.
+        let addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            probe.local_addr().expect("addr")
+        };
+        confirm_stopped(&format!("http://{addr}/api/admin/status"))
+            .await
+            .expect("a free port confirms the stop");
+    }
+
     /// End-to-end: a real daemon, stopped through the real `stop` path — pid
     /// read over HTTP, terminated through the Win32 handle, outcome confirmed
     /// against the endpoint.
@@ -304,9 +406,12 @@ mod tests {
 
         let status_url = format!("http://{bind}/api/admin/status");
         let client = status_client().expect("client");
+        // Readiness is an HTTP question — the socket is bound before the server
+        // can answer — so this waits for a real response rather than a
+        // connectable port.
         let mut ready = false;
         for _ in 0..200 {
-            if daemon_answers(&client, &status_url).await {
+            if matches!(client.get(&status_url).send().await, Ok(r) if r.status().is_success()) {
                 ready = true;
                 break;
             }
@@ -326,9 +431,10 @@ mod tests {
             .await
             .expect("stop must succeed and confirm the daemon is gone");
 
-        assert!(
-            !daemon_answers(&client, &status_url).await,
-            "the endpoint must be gone once stop returned Ok"
+        assert_eq!(
+            probe_liveness(authority_of(&status_url).expect("authority")),
+            Liveness::Gone,
+            "the port must be refusing connections once stop returned Ok"
         );
         child.wait().expect("reap");
 
