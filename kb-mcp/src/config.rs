@@ -638,16 +638,37 @@ impl Config {
     /// `FASTEMBED_CACHE_DIR` が未設定なら、プロセス環境に適用する。
     /// `Embedder::with_model` が `resolve_cache_dir()` で拾う前に呼ぶこと。
     pub fn apply_cache_dir_env(&self) {
-        if std::env::var_os("FASTEMBED_CACHE_DIR").is_some() {
-            return; // env を優先
-        }
-        if let Some(dir) = &self.fastembed_cache_dir {
-            // SAFETY: プロセス単一スレッド (main 起動直後) でのみ呼ぶ想定。
-            unsafe {
-                std::env::set_var("FASTEMBED_CACHE_DIR", dir);
-            }
+        let env_already_set = std::env::var_os("FASTEMBED_CACHE_DIR").is_some();
+        let Some(dir) =
+            cache_dir_env_override(env_already_set, self.fastembed_cache_dir.as_deref())
+        else {
+            return;
+        };
+        // SAFETY: プロセス単一スレッド (main 起動直後) でのみ呼ぶ想定。
+        unsafe {
+            std::env::set_var("FASTEMBED_CACHE_DIR", dir);
         }
     }
+}
+
+/// `apply_cache_dir_env` の判断部分だけを取り出したもの。返り値が `Some` の
+/// ときだけ env に書き込む。
+///
+/// env の読み書きから切り離してあるのはテストの都合ではなく、**テストが env を
+/// 触ること自体が危険**だから。`cargo test` はテストを別プロセスではなく同一
+/// プロセスの並列スレッドで走らせるため、1 つのテストが `set_var` /
+/// `remove_var` を呼ぶと同時に走っている他のテスト全部に影響する。
+///
+/// 実際に踏んだ: この判断を env 経由で検証していた頃、テストの後始末である
+/// `remove_var("FASTEMBED_CACHE_DIR")` が、並走していた embedder のモデル DL 先を
+/// OS 既定ディレクトリへ逸らしていた。CI が指定した cache ディレクトリの外に
+/// モデルが落ちるので、nightly が緑のまま毎晩 4.6 GB を再 DL する状態になっていた
+/// (AU-63 / PR #85)。
+fn cache_dir_env_override(env_already_set: bool, configured: Option<&Path>) -> Option<&Path> {
+    if env_already_set {
+        return None; // env を優先
+    }
+    configured
 }
 
 /// `kb-mcp.toml` がどのソースから読まれたかを表す。`tracing` ログと
@@ -1432,20 +1453,28 @@ lambda = 0.5
     #[test]
     fn test_apply_cache_dir_env_respects_existing_env() {
         // 既に env が設定されていれば config 値は適用しない。
-        let key = "FASTEMBED_CACHE_DIR";
-        // SAFETY: single-threaded test process.
-        unsafe {
-            std::env::set_var(key, "/pre-existing");
-        }
-        let cfg = Config {
-            fastembed_cache_dir: Some(PathBuf::from("/from-config")),
-            ..Default::default()
-        };
-        cfg.apply_cache_dir_env();
-        assert_eq!(std::env::var(key).unwrap(), "/pre-existing");
-        unsafe {
-            std::env::remove_var(key);
-        }
+        //
+        // 判断部分だけを検証する。以前はここで実際に `set_var` / `remove_var` を
+        // 呼んでいたが、`cargo test` は同一プロセスの並列スレッドでテストを走らせる
+        // ので、後始末の `remove_var` が並走する他テストのモデル DL 先まで
+        // 変えてしまっていた (`cache_dir_env_override` の doc comment 参照)。
+        assert_eq!(
+            cache_dir_env_override(true, Some(Path::new("/from-config"))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_apply_cache_dir_env_uses_config_when_env_unset() {
+        assert_eq!(
+            cache_dir_env_override(false, Some(Path::new("/from-config"))),
+            Some(Path::new("/from-config"))
+        );
+    }
+
+    #[test]
+    fn test_apply_cache_dir_env_is_noop_when_neither_is_set() {
+        assert_eq!(cache_dir_env_override(false, None), None);
     }
 
     /// Helper: 一意名の一時ファイルを作って `File` を返す。tempfile crate に

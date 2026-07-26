@@ -118,8 +118,31 @@ jobs:
       #
       # BGE-M3 / reranker は lib test binary の中 (= 単一プロセス、別 blob) から
       # しか触られないので、ここで温めるのは BGE-small だけでよい。
+      #
+      # retry する理由: 上流 (HuggingFace CDN) の一時障害で nightly が赤くなるのを
+      # 防ぐため。2026-07-26 の実測では cold cache の run を短時間に繰り返したところ
+      # model.onnx の取得が 503 を返した (run 30190347439)。厄介なのは、失敗すると
+      # 罠 3 (= cache は job 成功時のみ保存) により翌日も cold のままで、
+      # **自然回復しない**こと。
+      #
+      # 本 step の目的は cache を温めることで、その合否は品質シグナルではない
+      # (本体スイートは後段で別に走る)。したがってここでの retry は flaky test の
+      # 隠蔽にはあたらない。
       - name: Pre-warm embedding model cache (serial)
-        run: cargo test --test index_progress_cli -- --test-threads=1
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test --test index_progress_cli -- --test-threads=1; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
 
       - name: cargo test -- --include-ignored
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では
@@ -183,8 +206,22 @@ jobs:
             fastembed-v3-${{ runner.os }}-
 
       # cache miss の日でも lock 競合で落ちないよう、1 プロセスで先に温める。
+      # retry の理由は ignored-tests job 側の同名 step のコメントを参照。
       - name: Pre-warm embedding model cache (serial)
-        run: cargo test --test index_progress_cli -- --test-threads=1
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo test --test index_progress_cli -- --test-threads=1; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              backoff=$((attempt * 60))
+              echo "::warning::pre-warm attempt ${attempt} failed; retrying in ${backoff}s" >&2
+              sleep "${backoff}"
+            fi
+          done
+          echo "::error::pre-warm failed after 3 attempts" >&2
+          exit 1
 
       # `cargo test` の non-ignored セット (= unit + integration test、
       # `#[ignore]` 除外) で coverage を取る (~5-10 min)。
