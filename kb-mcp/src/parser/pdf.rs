@@ -1,10 +1,11 @@
 //! PDF (`.pdf`) parser. ページ単位チャンク + metadata frontmatter。
 //! 抽出は oxidize-pdf (純 Rust, ParseResult ベース)。念のため malformed PDF の
-//! panic は catch_unwind で per-file skip に正規化する (§4.5 / spec §3 #14)。
+//! panic は per-file skip に正規化する (§4.5 / spec §3 #14) — その機構は
+//! full-audit 2026-07-26 AU-21 で docx/xlsx/pptx と共有するため
+//! `parser::panic_guard` + `Parser::parse_bytes` へ移設した。このモジュールは
+//! 個別の `catch_unwind` を持たない。
 
-use std::cell::Cell;
 use std::io::Cursor;
-use std::sync::Once;
 
 use anyhow::{Result, anyhow};
 use oxidize_pdf::parser::{PdfDocument, PdfReader};
@@ -13,67 +14,6 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 
 /// スキャン PDF 判定閾値: 平均 chars/page がこれ未満なら text layer 無し扱い。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
-
-thread_local! {
-    /// PDF 抽出中 (= `extract_pdf` の `catch_unwind` 内) は true。process-global
-    /// な panic hook が「この panic はこのスレッドの PDF 抽出由来だから
-    /// backtrace 出力を抑制すべきか」を判定するために読む。詳細は
-    /// `install_panic_hook_once` / `SuppressPanicOutputGuard` を参照。
-    static SUPPRESS_PANIC_OUTPUT: Cell<bool> = const { Cell::new(false) };
-}
-
-/// panic hook を once-install するためのフラグ。
-static INSTALL_PANIC_HOOK: Once = Once::new();
-
-/// panic hook を **一度だけ** インストールする。
-///
-/// 旧実装は `extract_pdf` の呼び出し毎に `take_hook`/`set_hook` で
-/// process-global な hook を no-op ↔ 元の hook に swap していた。これは
-/// 並行 (例: HTTP `get_document` からの複数リクエスト、embedder/DB の
-/// Mutex 外) に複数スレッドが PDF を抽出すると race する (codex P2, PR #69
-/// round 2): (1) 片方の抽出が終わって `set_hook(prev_hook)` で「元の
-/// hook」として復元する値が、実は他方の抽出が仕込んだ no-op hook だった
-/// 場合、以後プロセス全体で panic 報告が恒久的に無効化される。(2) 抽出中
-/// (no-op hook が刺さっている間) は PDF 抽出と無関係な他スレッドの panic
-/// まで一緒に隠れてしまう。
-///
-/// 新方式: wrapper hook を最初の PDF 抽出時に一度だけ install し、以後は
-/// **二度と入れ替えない**。wrapper は `SUPPRESS_PANIC_OUTPUT`
-/// (thread-local) を見て、抽出中の **その panic を起こしたスレッド自身**
-/// の出力だけを抑制し、他スレッドの panic は常に元の hook (`prev`) に
-/// そのまま委譲する。これにより複数スレッドが同時に PDF を抽出しても
-/// race せず、他スレッドの panic 報告も常に生きたままになる。
-fn install_panic_hook_once() {
-    INSTALL_PANIC_HOOK.call_once(|| {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let suppress = SUPPRESS_PANIC_OUTPUT.with(Cell::get);
-            if !suppress {
-                prev(info);
-            }
-        }));
-    });
-}
-
-/// `SUPPRESS_PANIC_OUTPUT` (thread-local) を true にする RAII guard。
-/// Drop で必ず false に戻す — `catch_unwind` 内で実際に panic して unwind
-/// される場合も Drop は呼ばれるため、"panic した後ずっと抑制されたまま"
-/// になることはない (`test_suppress_panic_output_guard_resets_flag_even_on_panic`
-/// で保証)。
-struct SuppressPanicOutputGuard;
-
-impl SuppressPanicOutputGuard {
-    fn new() -> Self {
-        SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(true));
-        Self
-    }
-}
-
-impl Drop for SuppressPanicOutputGuard {
-    fn drop(&mut self) {
-        SUPPRESS_PANIC_OUTPUT.with(|flag| flag.set(false));
-    }
-}
 
 /// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
 ///
@@ -110,7 +50,7 @@ impl Parser for PdfParser {
         single_text_chunk(raw, path_hint)
     }
 
-    fn parse_bytes(
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,
@@ -167,49 +107,31 @@ impl Parser for PdfParser {
 /// oxidize-pdf でページ本文 (`Vec<String>`, 1 要素 = 1 ページ) + metadata frontmatter
 /// を抽出する。
 ///
-/// `PdfReader::new(Cursor)` + `PdfDocument::extract_text` + `metadata` の一連を
-/// `catch_unwind` でラップし、malformed PDF の panic を per-file Err に正規化する
-/// (spec §3 #14: dry-run の 4 標本では panic しなかったが、未知 PDF / 依存 crate
-/// 由来の panic に対する保険として catch_unwind + hook 抑止を維持する)。default
-/// panic hook の生 backtrace 出力は `install_panic_hook_once` が一度だけ
-/// install する wrapper hook + `SuppressPanicOutputGuard` (thread-local flag)
-/// で抑止する。process-global な hook を毎回 swap していた旧実装は並行
-/// PDF 抽出で race したため撤廃した (codex P2, PR #69 round 2。詳細は
-/// `install_panic_hook_once` のコメント参照) — 抽出処理自体は逐次でも
-/// 並行でも安全に動く。
+/// `PdfReader::new(Cursor)` + `PdfDocument::extract_text` + `metadata` の一連。
+///
+/// malformed PDF / 依存 crate 由来の panic は per-file の `Err` に正規化される
+/// (spec §3 #14: dry-run の 4 標本では panic しなかったが、未知 PDF に対する
+/// 保険)。ただし **その catch_unwind + panic 出力抑止はこの関数ではなく
+/// `Parser::parse_bytes` (`parser::panic_guard`) が行う**: 同じ防御が
+/// docx/xlsx/pptx にも要る (full-audit 2026-07-26 AU-21) ため、PDF 専用だった
+/// 機構を trait の入口へ引き上げた。二重に包むと guard が入れ子になるだけで
+/// 得るものが無いので、ここでは素直に `?` で伝播させる。
 ///
 /// oxidize-pdf は `ParseResult` ベースのエラー設計なので、open / extract 失敗 (暗号化
 /// PDF 等) は panic ではなく `Err` として返る (dry-run で確認、docs.rs 4.1.1)。
 fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatter)> {
-    install_panic_hook_once();
-    let suppress_guard = SuppressPanicOutputGuard::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-        || -> Result<(Vec<String>, Frontmatter)> {
-            // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
-            // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs 4.1.1 で確認)。
-            let reader = PdfReader::new(Cursor::new(bytes)).map_err(|e| {
-                anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}")
-            })?;
-            let document = PdfDocument::new(reader);
-            // extract_text() -> ParseResult<Vec<ExtractedText>>、各 .text がページ本文。
-            let extracted = document.extract_text().map_err(|e| {
-                anyhow!(
-                    "{path_hint}: PDF text extraction failed (possibly encrypted or unreadable): {e}"
-                )
-            })?;
-            let pages: Vec<String> = extracted.into_iter().map(|t| t.text).collect();
-            let frontmatter = pdf_metadata_frontmatter(&document, path_hint);
-            Ok((pages, frontmatter))
-        },
-    ));
-    drop(suppress_guard); // 抽出終了 (成功/panic 問わず) 後は即座に抑制解除
-
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err(anyhow!(
-            "{path_hint}: PDF extraction panicked (malformed PDF)"
-        )),
-    }
+    // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
+    // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs 4.1.1 で確認)。
+    let reader = PdfReader::new(Cursor::new(bytes))
+        .map_err(|e| anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}"))?;
+    let document = PdfDocument::new(reader);
+    // extract_text() -> ParseResult<Vec<ExtractedText>>、各 .text がページ本文。
+    let extracted = document.extract_text().map_err(|e| {
+        anyhow!("{path_hint}: PDF text extraction failed (possibly encrypted or unreadable): {e}")
+    })?;
+    let pages: Vec<String> = extracted.into_iter().map(|t| t.text).collect();
+    let frontmatter = pdf_metadata_frontmatter(&document, path_hint);
+    Ok((pages, frontmatter))
 }
 
 /// oxidize-pdf の `DocumentMetadata` (docs.rs 4.1.1 で確認: `title` / `creation_date`
@@ -406,6 +328,16 @@ fn post_process(page: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // panic 抑止 guard の RAII 不変条件を検証するテスト
+    // (`test_suppress_panic_output_guard_*`) は、この機構が PDF 専用だった
+    // 頃からここに置かれている。実装は AU-21 で `parser::panic_guard` へ
+    // 移設したが、テストは移動せずそのまま維持する (import だけ足す)。
+    use crate::parser::panic_guard::{SUPPRESS_PANIC_OUTPUT, SuppressPanicOutputGuard};
+    use std::cell::Cell;
+    // AU-21: `parse_bytes` は `Parser` ではなく blanket impl の `ParserExt`
+    // 側にある (実装から override させないため)。テスト本体は従来どおり
+    // `parse_bytes` を呼ぶので、trait を scope に入れるだけ。
+    use crate::parser::ParserExt;
 
     // Task 2.7 で正式化 (生成手順の doc 化含む) する最小 2 ページ PDF。
     // ページ 1="Hello World"、ページ 2="Second Page"。xref オフセット込みで

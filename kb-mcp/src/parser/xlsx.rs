@@ -22,7 +22,7 @@ impl Parser for XlsxParser {
         single_text_chunk(raw, path_hint)
     }
 
-    fn parse_bytes(
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,
@@ -45,7 +45,7 @@ impl Parser for XlsParser {
         single_text_chunk(raw, path_hint)
     }
 
-    fn parse_bytes(
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,
@@ -399,6 +399,10 @@ fn xlsx_frontmatter(bytes: &[u8], path_hint: &str) -> super::Frontmatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // AU-21: `parse_bytes` は `Parser` ではなく blanket impl の
+    // `ParserExt` 側にある (実装から override させないため)。テスト本体は
+    // 従来どおり `parse_bytes` を呼ぶので、trait を scope に入れるだけ。
+    use crate::parser::ParserExt;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 

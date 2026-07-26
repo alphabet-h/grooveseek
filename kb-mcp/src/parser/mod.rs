@@ -15,6 +15,7 @@ use serde::Deserialize;
 pub mod docx;
 pub mod markdown;
 pub mod ooxml;
+mod panic_guard;
 pub mod pdf;
 pub mod pptx;
 pub mod registry;
@@ -184,13 +185,16 @@ pub trait Parser: Send + Sync {
     ///   見出し概念のない形式は無視してよい
     fn parse(&self, raw: &str, path_hint: &str, exclude_headings: &[&str]) -> ParsedDocument;
 
-    /// バイト列から parse する。**全 call site (indexer / server) はこちらに統一する。**
+    /// バイト列から parse する **実装点**。形式固有の抽出はここに書く。
     ///
     /// default impl = UTF-8 検証して `parse` に委譲する (md/txt は override 不要で動く)。
     /// バイナリ parser (Pdf/Docx/Xlsx/Xls/Pptx) はこれを override して形式固有の
     /// チャンクを直接生成する。`Err` の意味 = 「このファイルは index 不能」で、
     /// 呼び出し側が skip + warn を行う。
-    fn parse_bytes(
+    ///
+    /// **呼び出し側はこれを直接呼ばず [`ParserExt::parse_bytes`] を使うこと。**
+    /// panic の隔離が効かなくなる。
+    fn parse_bytes_inner(
         &self,
         bytes: &[u8],
         path_hint: &str,
@@ -205,6 +209,46 @@ pub trait Parser: Send + Sync {
     /// get_document の cap 分類 (§4.4) と quality filter 免除 (§4.8) の判定に使う。
     fn is_binary(&self) -> bool {
         false
+    }
+}
+
+/// 全 call site (indexer / server) が使う parse 入口。**`Parser` の実装側から
+/// 差し替えられない** (blanket impl のため) のがこの trait の存在理由。
+///
+/// [`Parser::parse_bytes_inner`] に委譲しつつ、その中で起きた **panic を `Err` に
+/// 正規化する** (full-audit 2026-07-26 AU-21)。parser は信頼できない外部入力を
+/// calamine / zip / quick-xml / oxidize-pdf に食わせるため、依存 crate 由来の
+/// panic を完全には排除できない。`indexer.rs` は `Err` を per-file skip するが
+/// panic はその `match` を巻き戻して通り抜けるので、catch しないと壊れた 1
+/// ファイルが `index` 実行全体を落とす。詳細は [`panic_guard`] のモジュール doc。
+///
+/// **なぜ `Parser` の default method ではないのか** (codex P2, PR #92 round 1):
+/// default method は実装側が override でき、Rust に `final` は無い。override
+/// された瞬間 (あるいは旧 API に合わせて書かれた古い実装が残っていた場合)
+/// `indexer.rs` / `server.rs` の動的ディスパッチはその override を呼び、panic
+/// 隔離を丸ごと素通りする — しかも通常のテストでは気付けない。blanket impl
+/// (`impl<T: Parser + ?Sized> ParserExt for T`) にすると **実装側は定義を
+/// 持てない** ので、隔離が doc コメントの約束ではなく型で保証される。
+pub trait ParserExt {
+    /// バイト列から parse し、panic を per-file `Err` に正規化する。
+    fn parse_bytes(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument>;
+}
+
+impl<T: Parser + ?Sized> ParserExt for T {
+    fn parse_bytes(
+        &self,
+        bytes: &[u8],
+        path_hint: &str,
+        exclude_headings: &[&str],
+    ) -> Result<ParsedDocument> {
+        panic_guard::catch_parser_panic(path_hint, self.id(), || {
+            self.parse_bytes_inner(bytes, path_hint, exclude_headings)
+        })
     }
 }
 
@@ -349,5 +393,80 @@ mod tests {
         assert_eq!(ctx.chars().count(), 200);
         // panic せず valid UTF-8 であること
         assert!(ctx.chars().all(|c| c == 'あ'));
+    }
+
+    // -----------------------------------------------------------------------
+    // panic isolation (full-audit 2026-07-26 AU-21)
+    // -----------------------------------------------------------------------
+
+    /// `parse_bytes_inner` が必ず panic する fake parser。
+    ///
+    /// 実在の壊れたファイルに頼らず panic 隔離を検証するために使う。実 crate
+    /// (calamine / zip / quick-xml) 由来の panic を狙う fixture は、crate の
+    /// bug fix や整数 overflow チェックの有無 (debug/release) で「panic しなく
+    /// なる」ため回帰テストの土台にできない。
+    ///
+    /// なお「`parse_bytes` を override して隔離を迂回する parser」は書けない —
+    /// `parse_bytes` は `ParserExt` の blanket impl 側にあり、`Parser` の
+    /// 実装者が定義を持てないため (この性質はコンパイル時に保証されるので
+    /// テストで突く対象にならない)。
+    struct PanickingParser;
+
+    impl Parser for PanickingParser {
+        fn extension(&self) -> &'static str {
+            "boom"
+        }
+
+        fn parse(&self, raw: &str, path_hint: &str, _exclude_headings: &[&str]) -> ParsedDocument {
+            single_text_chunk(raw, path_hint)
+        }
+
+        fn parse_bytes_inner(
+            &self,
+            _bytes: &[u8],
+            _path_hint: &str,
+            _exclude_headings: &[&str],
+        ) -> Result<ParsedDocument> {
+            panic!("simulated dependency panic");
+        }
+    }
+
+    #[test]
+    fn test_parse_bytes_isolates_parser_panic_as_err() {
+        // AU-21: parser 内の panic が呼び出し側 (indexer / server) に伝播すると、
+        // 壊れた 1 ファイルで `kb-mcp index` 実行全体が落ちる。trait の入口で
+        // Err に正規化されることを保証する。
+        let err = PanickingParser
+            .parse_bytes(b"whatever", "docs/broken.boom", &[])
+            .expect_err("a panicking parser must surface as Err, not unwind to the caller");
+        let msg = err.to_string();
+        assert!(msg.contains("docs/broken.boom"), "got: {msg}");
+        assert!(msg.contains("boom parser panicked"), "got: {msg}");
+        assert!(
+            msg.contains("simulated dependency panic"),
+            "the panic payload must survive into the error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_isolation_works_through_trait_object() {
+        // Registry は `Box<dyn Parser>` で保持する = 実運用の call site は
+        // 動的ディスパッチ。`ParserExt` の blanket impl は `T: Parser + ?Sized`
+        // なので `dyn Parser` にも効くことを確認する (ここが効かないと
+        // indexer / server の呼び出しだけ隔離から漏れる)。
+        let parser: Box<dyn Parser> = Box::new(PanickingParser);
+        assert!(
+            parser.parse_bytes(b"x", "docs/broken.boom", &[]).is_err(),
+            "panic isolation must also hold through `dyn Parser`"
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_still_returns_ok_for_healthy_parser() {
+        // 隔離層が正常系の戻り値を変えないこと (回帰確認)。
+        let doc = MarkdownParser
+            .parse_bytes(b"## H\n\nbody enough body enough body enough", "x.md", &[])
+            .expect("healthy parser must still return Ok through the panic guard");
+        assert_eq!(doc.chunks.len(), 1);
     }
 }

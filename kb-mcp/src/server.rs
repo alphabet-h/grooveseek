@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::{Database, SearchHit};
 use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
-use crate::parser::Registry;
+use crate::parser::{ParserExt, Registry};
 use crate::{indexer, markdown};
 
 // ---------------------------------------------------------------------------

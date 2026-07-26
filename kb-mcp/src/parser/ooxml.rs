@@ -187,10 +187,13 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
 /// 旧実装の `d[..10]` は byte 境界チェック無しの panic-prone slice で、
 /// `dcterms:created` / `modified` に multibyte 文字が混入し (例:
 /// `"2026-07-1é..."`) byte offset 10 がその文字の内側に来ると
-/// "byte index 10 is not a char boundary" で panic していた。docx/xlsx/pptx
-/// parser は (PDF と違い) `catch_unwind` の外で呼ばれるため、この panic は
-/// per-file skip に隔離されず `index` 実行全体を落とす — PR-1 で確立した
-/// per-file 隔離原則への違反になる。`pdf.rs::normalize_pdf_date` の
+/// "byte index 10 is not a char boundary" で panic していた。当時の
+/// docx/xlsx/pptx parser は (PDF と違い) `catch_unwind` の外で呼ばれていた
+/// ため、この panic は per-file skip に隔離されず `index` 実行全体を落とした
+/// — PR-1 で確立した per-file 隔離原則への違反になる (この構造的な穴自体は
+/// full-audit 2026-07-26 AU-21 で塞いだ: `Parser::parse_bytes` が全 parser の
+/// panic を `Err` に正規化する。ただし panic させないに越したことはないので
+/// 本 fix はそのまま維持する)。`pdf.rs::normalize_pdf_date` の
 /// ISO 分岐 (PR #69 round 3 の codex fix) と同じパターンで `d.get(..10)`
 /// による境界安全化 + ASCII digit/`-` 検証に変更する。
 fn iso_date_prefix(s: &str) -> Option<String> {
