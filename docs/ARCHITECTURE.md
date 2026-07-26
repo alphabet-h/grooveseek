@@ -118,7 +118,7 @@ The `kb-mcp` CLI follows a **stdout = data, stderr = progress** convention:
   - `kb-mcp eval` golden-query evaluation results
   - `kb-mcp tune` sweep results
   - `kb-mcp validate` report (`print_validate_report`, including the
-    `::error file=…` lines the `--github` format emits for CI annotations)
+    `::error file=…` lines that `--format github` emits for CI annotations)
   - `kb-mcp graph` connection graph (`print_graph`)
 - **stderr** carries human-readable progress, status, warnings, and errors:
   - `kb-mcp index` progress lines (`Indexing ...`, `Done in ...`, per-file `  indexed:` / `  renamed:` / `  deleted:`). Use `--quiet` to suppress per-file output (start / found / done summary only) or `--progress` to switch to an `indicatif` bar (TTY) / periodic `Progress: N/M (P%)` lines (non-TTY). The two flags are mutually exclusive and default-off (added v0.7.8).

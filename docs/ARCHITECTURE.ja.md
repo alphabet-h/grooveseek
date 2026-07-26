@@ -112,7 +112,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
   - `kb-mcp search` の結果 (`print_search_results`)
   - `kb-mcp eval` の golden query 評価結果
   - `kb-mcp tune` の sweep 結果
-  - `kb-mcp validate` のレポート (`print_validate_report`。`--github` 形式が
+  - `kb-mcp validate` のレポート (`print_validate_report`。`--format github` が
     CI annotation 用に出す `::error file=…` 行も含む)
   - `kb-mcp graph` の connection graph (`print_graph`)
 - **stderr** は人間向けの進捗 / 統計 / warning / error:
