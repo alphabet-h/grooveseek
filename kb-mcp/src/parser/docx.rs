@@ -40,7 +40,12 @@ impl Parser for DocxParser {
             .ok_or_else(|| anyhow!("{path_hint}: word/document.xml missing"))?;
         // frontmatter を先に取得し、context の title に使う (取得順を入れ替え)。
         let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
-        let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
+        let chunks = parse_document_xml(
+            &doc_xml,
+            path_hint,
+            exclude_headings,
+            frontmatter.title.as_deref(),
+        );
         let raw_content = chunks
             .iter()
             .map(|c| c.content.as_str())
@@ -58,13 +63,35 @@ impl Parser for DocxParser {
 // word/document.xml → heading-hierarchy chunks
 // ---------------------------------------------------------------------------
 
+/// 段落内の区切り要素 (`<w:br/>` / `<w:cr/>` / `<w:tab/>`) を空白文字として
+/// 積む (AU-13)。
+///
+/// これらは `<w:t>` の外側に兄弟として現れるので、無視すると前後の
+/// `<w:t>` が直結して語が繋がる: `<w:t>行1</w:t><w:br/><w:t>行2</w:t>` が
+/// `行1行2` になり、"行1" でも "行2" でも引っかからない造語ができる。
+///
+/// `<w:br/>` / `<w:cr/>` は改行、`<w:tab/>` はタブ。段落の確定時に
+/// `trim()` されるので、先頭・末尾に付いても本文には残らない。
+fn push_intra_paragraph_separator(local_name: &[u8], para_text: &mut String) {
+    match local_name {
+        b"br" | b"cr" => para_text.push('\n'),
+        b"tab" => para_text.push('\t'),
+        _ => {}
+    }
+}
+
 /// `word/document.xml` を段落 (`<w:p>`) 単位で読み、`<w:pStyle w:val="HeadingN">`
 /// を見出し境界として Markdown 同様の階層チャンクに変換する。
 ///
 /// 表 (`w:tbl`) 内のテキストも専用ハンドリングはしない: OOXML 上は
 /// `w:tbl > w:tr > w:tc > w:p > w:r > w:t` と入れ子になっているだけなので、
 /// 通常の `<w:p>` 境界処理だけで現在のセクション本文に自然に取り込まれる。
-fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec<Chunk> {
+fn parse_document_xml(
+    xml: &[u8],
+    path_hint: &str,
+    excludes: &[&str],
+    title: Option<&str>,
+) -> Vec<Chunk> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -104,12 +131,18 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec
                 }
                 b"pStyle" => para_style = heading_level_from_attr(&e),
                 b"t" => in_text = true,
-                _ => {}
+                // `<w:br></w:br>` の形で来ることもある。Empty 版と同じ扱い。
+                name => push_intra_paragraph_separator(name, &mut para_text),
             },
             Ok(Event::Empty(e)) => {
+                // `e.name()` は一時値なので、`as_ref()` の借用元を束縛しておく。
+                let qname = e.name();
+                let name = super::ooxml_local(qname.as_ref());
                 // `<w:pStyle w:val="Heading1"/>` は自己終端タグで来ることが多い。
-                if super::ooxml_local(e.name().as_ref()) == b"pStyle" {
+                if name == b"pStyle" {
                     para_style = heading_level_from_attr(&e);
+                } else {
+                    push_intra_paragraph_separator(name, &mut para_text);
                 }
             }
             Ok(Event::Text(t)) if in_text => {
@@ -170,7 +203,10 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                super::ooxml::warn_truncated_xml(path_hint, "word/document.xml", &e);
+                break;
+            }
             _ => {}
         }
         buf.clear();
@@ -274,6 +310,70 @@ mod tests {
             zip.finish().unwrap();
         }
         buf
+    }
+
+    /// `word/document.xml` の中身をそのまま指定して zip を組む
+    /// (壊れた XML を入れるテスト用。`wrap_document_xml` は必ず整形式に
+    /// なるので、パースエラー経路を踏ませられない)。
+    fn docx_with_raw_document_xml(doc_xml: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opt = SimpleFileOptions::default();
+            zip.start_file("word/document.xml", opt).unwrap();
+            zip.write_all(doc_xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    /// AU-13: XML が途中で壊れていても、そこまでに読めた本文は返す。
+    /// 打ち切り自体は `warn_truncated_xml` が stderr に出す (文言の確認は
+    /// `tests/binary_formats_cli.rs` の subprocess テスト側)。
+    #[test]
+    fn test_docx_truncated_xml_keeps_what_was_read_before_the_error() {
+        // 途中で切れたタグにする。実測 (probe) では
+        //   - タグの途中で終わる      → "tag not closed" で **エラー**
+        //   - 閉じタグが無いまま EOF  → エラーにならず `Event::Eof`
+        // なので、単に閉じ忘れた XML ではこの経路を踏めない。
+        let bytes = docx_with_raw_document_xml(concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body>"#,
+            r#"<w:p><w:r><w:t>kept before the break</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t"#,
+        ));
+        let doc = DocxParser.parse_bytes(&bytes, "broken.docx", &[]).unwrap();
+        assert!(
+            doc.raw_content.contains("kept before the break"),
+            "text read before the error should survive: {:?}",
+            doc.raw_content
+        );
+    }
+
+    /// AU-13: `<w:br/>` / `<w:tab/>` は `<w:t>` の外側に兄弟として現れる。
+    /// 無視すると前後の `<w:t>` が直結し、どちらの語でも引っかからない
+    /// 造語ができる。
+    #[test]
+    fn test_docx_line_break_and_tab_do_not_glue_words_together() {
+        let bytes = wrap_document_xml(concat!(
+            "<w:p><w:r>",
+            "<w:t>alpha</w:t><w:br/><w:t>beta</w:t><w:tab/><w:t>gamma</w:t>",
+            "</w:r></w:p>",
+        ));
+        let doc = DocxParser.parse_bytes(&bytes, "breaks.docx", &[]).unwrap();
+        assert!(
+            !doc.raw_content.contains("alphabeta"),
+            "a line break must not glue the words: {:?}",
+            doc.raw_content
+        );
+        assert!(
+            !doc.raw_content.contains("betagamma"),
+            "a tab must not glue the words: {:?}",
+            doc.raw_content
+        );
+        assert!(doc.raw_content.contains("alpha\nbeta"));
+        assert!(doc.raw_content.contains("beta\tgamma"));
     }
 
     #[test]

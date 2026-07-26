@@ -108,6 +108,23 @@ pub(crate) fn core_xml_frontmatter(
 /// 上書きされ、それより前の部分 ("R&") が失われていた。docx/pptx 本文と
 /// 同じく要素単位で Text + GeneralRef をバッファに蓄積してから `End` で
 /// 確定する方式に変更する。
+/// OOXML の XML 読み取りが途中で失敗したときの警告 (AU-13)。
+///
+/// quick-xml のイベントループは `Err` を受けたら打ち切るしかないが、**黙って
+/// break すると「途中までの本文」が成功として返る**。壊れた docx / pptx を
+/// index すると、欠けたまま検索対象になり、しかも何も言われないので気付けない。
+/// 中断を Err に変えて丸ごと捨てるより、取れた分は活かして「切れている」と
+/// 伝える方が実用的なので、警告に留める。
+///
+/// `part` は zip 内のエントリ名 (例 `word/document.xml`)。どのファイルの
+/// どの部分かが分からないと、複数ドキュメントを一括 index したときに
+/// 追跡できない。
+pub(crate) fn warn_truncated_xml(path_hint: &str, part: &str, err: &impl std::fmt::Display) {
+    eprintln!(
+        "warning: {path_hint}: {part}: XML parse error, extracted text is truncated here: {err}"
+    );
+}
+
 fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -168,7 +185,10 @@ fn parse_core_xml(xml: &[u8], path_hint: &str) -> Frontmatter {
                 text_buf.clear();
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                warn_truncated_xml(path_hint, "docProps/core.xml", &e);
+                break;
+            }
             _ => {}
         }
         buf.clear();

@@ -6,6 +6,22 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A damaged docx or pptx was indexed silently, with part of its text
+  missing** (AU-13). Every OOXML reader ended its event loop with
+  `Err(_) => break`, so a file whose XML stops partway — a truncated copy, a
+  bad transfer — returned whatever had been read so far as a complete,
+  successful parse. It then sat in the index with content missing and nothing
+  said about it. All six XML loops (`word/document.xml`, four in the pptx
+  reader, and `docProps/core.xml`) now name the file and the part they were
+  reading and say the text is truncated there. The partial text is still
+  kept: for a damaged file, some of it beats none of it, and per-file skipping
+  on hard errors already exists from AU-21.
+
+  In the same pass, docx now treats `<w:br/>`, `<w:cr/>` and `<w:tab/>` as the
+  separators they are. They appear as siblings of `<w:t>`, so ignoring them
+  ran the surrounding words together — a paragraph reading "line one" then
+  "line two" was indexed as `line oneline two`, which matches neither phrase.
+
 - **One `search` request could occupy the server for minutes** (AU-17). The
   `query` string has been capped at 1 KiB since v0.7, but the list filters
   travelling in the same request — `path_globs`, `tags_any`, `tags_all` — had
