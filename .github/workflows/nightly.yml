@@ -43,6 +43,9 @@ jobs:
           - os: ubuntu-latest
             # Linux leg は全 40 本を走らせる (巨大モデル 2 本を含む)。
             skip_args: ''
+            # resolve_cache_dir() の fallback #2 (dirs::cache_dir()) の実体。
+            # なぜこれも cache するかは下の "Cache fastembed models" 参照。
+            default_model_dir: ~/.cache/fastembed
           - os: windows-latest
             # Windows leg は「巨大モデルを要求する 2 本」だけ除外する:
             #   - test_bge_m3_produces_1024_dim       (BGE-M3 ~2.3 GB)
@@ -58,6 +61,7 @@ jobs:
             # 上で実行する経路自体は BGE-small を使う他テストが踏むため、
             # 除外しても Windows 固有の死角は生まれない。
             skip_args: '--skip test_bge_m3_produces_1024_dim --skip test_bge_reranker_v2_m3_reorders_ja'
+            default_model_dir: ~/AppData/Local/fastembed
     # 初回は 5 GB 弱の DL があり得るので thoroughly 余裕を持つ。
     timeout-minutes: 60
     env:
@@ -75,18 +79,35 @@ jobs:
       # Cargo.lock のハッシュを key に含めると ort/fastembed の major bump 時に
       # cache が自然に invalidate される。
       #
-      # key の `-v2-` は **必須**: 旧 key (`fastembed-<os>-<hash>`) の tar は
-      # `~/.cache/fastembed` を絶対パスで抱えており、`path` だけ変えて同じ key
-      # を再利用すると「cache hit したのに FASTEMBED_CACHE_DIR の位置には何も
-      # 無い」状態になり、毎晩 5 GB を再 DL し続ける。path を変える時は必ず
-      # prefix も上げること。
+      # **2 箇所 cache するのは必須**。`FASTEMBED_CACHE_DIR` を job に設定しても
+      # モデルの落ち先は 1 箇所に揃わない: lib test binary の
+      # `config::tests::test_apply_cache_dir_env_respects_existing_env` が
+      # 後始末で `remove_var("FASTEMBED_CACHE_DIR")` を呼び、**プロセス全体**の
+      # env を消してしまう (`cargo test` は同一プロセス内の並列スレッドで走る
+      # ので "single-threaded" 前提のコメントは成り立たない)。その後に初期化
+      # される BGE-M3 / reranker は `resolve_cache_dir()` の fallback #2
+      # (= `dirs::cache_dir()`) に落ちる。
+      #   - `.fastembed_cache`      … kb-mcp subprocess が使う (env が効く)
+      #   - `<default_model_dir>`   … lib test が env 消失後に使う
+      # 片方だけ cache すると job は green のまま毎晩 4.6 GB を再 DL する
+      # (2026-07-26 実測: Linux の cache が 2.6 GB → 74 MB に縮んで発覚)。
+      #
+      # key の版数 (`-v3-`) は **path や中身の構成を変えたら必ず上げる**:
+      # (a) 旧 `fastembed-<os>-<hash>` の tar は `~/.cache/fastembed` を絶対
+      #     パスで抱えており、`path` だけ変えて同じ key を再利用すると
+      #     「cache hit したのに参照先には何も無い」状態が永続する
+      # (b) `actions/cache` は **既存 key を上書き保存しない**。`-v2-` のまま
+      #     path を増やしても、74 MB の v2 が hit する限り新しい中身は
+      #     永久に保存されない
       - name: Cache fastembed models
         uses: actions/cache@v5
         with:
-          path: .fastembed_cache
-          key: fastembed-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          path: |
+            .fastembed_cache
+            ${{ matrix.default_model_dir }}
+          key: fastembed-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            fastembed-v2-${{ runner.os }}-
+            fastembed-v3-${{ runner.os }}-
 
       # cold cache のとき、複数の integration test binary が **別プロセス** と
       # して同時に kb-mcp を spawn し、HuggingFace hub の同一 blob lock を
