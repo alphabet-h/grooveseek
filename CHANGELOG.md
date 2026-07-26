@@ -4,6 +4,38 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The nightly `--include-ignored` run raced itself whenever the model
+  cache was cold.** Several integration-test binaries each spawn `kb-mcp`
+  as a subprocess, so on a cold cache they all reach for the same
+  HuggingFace blob lock at once and every one but the winner dies with
+  "Lock acquisition failed". `ci.yml` gained a serial pre-warm step for
+  this in #71, but `nightly.yml` never did — and the nightly model cache
+  is precisely what the 10 GB per-repository cache limit evicts first, so
+  the failure was waiting for the first night after an eviction. The
+  nightly job now pre-warms the cache single-threaded before running the
+  full suite.
+
+### Changed
+
+- **AU-09**: The nightly `ignored-tests` job now runs on `windows-latest`
+  in addition to `ubuntu-latest`. The Windows-only `#[ignore]` tests —
+  Task Scheduler registration (`tests/service_install_integration.rs`) and
+  tray `.lnk` install/uninstall
+  (`crates/kb-mcp-tray/tests/install_integration.rs`) — had no CI coverage
+  at all, because the only job passing `--include-ignored` ran on Linux.
+  The two tests that each pull a ~2.3 GB model (BGE-M3 and the
+  cross-encoder reranker) are skipped on the Windows leg: both assert
+  OS-independent properties that the Linux leg already covers,
+  `windows-latest` ships only 14 GB of free disk, and the Actions cache is
+  capped at 10 GB per repository. The model cache location is now pinned
+  to a workspace-relative directory through `FASTEMBED_CACHE_DIR` on both
+  legs (the scheme `ci.yml` already used), and the cache key prefix moved
+  to `fastembed-v2-` so the previous archives — which carry absolute
+  `~/.cache/fastembed` paths — are not restored to a location the new
+  configuration never reads. Source code unchanged.
+
 ## [0.13.1] - 2026-07-26
 
 ### Fixed

@@ -88,6 +88,18 @@ jobs:
           restore-keys: |
             fastembed-v2-${{ runner.os }}-
 
+      # cold cache のとき、複数の integration test binary が **別プロセス** と
+      # して同時に kb-mcp を spawn し、HuggingFace hub の同一 blob lock を
+      # 奪い合って "Lock acquisition failed" で落ちる。ci.yml には PR #71 で
+      # 同じ pre-warm が入ったが nightly には無く、model cache が 10 GB LRU で
+      # 追い出された夜に顕在化する (2026-07-26 の dry-run で ubuntu / windows
+      # 双方とも再現)。1 プロセスだけに DL させてから本体を warm cache で回す。
+      #
+      # BGE-M3 / reranker は lib test binary の中 (= 単一プロセス、別 blob) から
+      # しか触られないので、ここで温めるのは BGE-small だけでよい。
+      - name: Pre-warm embedding model cache (serial)
+        run: cargo test --test index_progress_cli -- --test-threads=1
+
       - name: cargo test -- --include-ignored
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では
         # 通常の `cargo test` も合わせて走らせて、ignored だけ落ちる
