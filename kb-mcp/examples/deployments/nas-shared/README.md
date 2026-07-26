@@ -63,6 +63,15 @@ edits the same files. **The index does not.** Each machine keeps its own
    sudo mount -t nfs4 -o ro nas:/exports/kb /var/lib/kb-mcp/knowledge-base
    ```
 
+   **Make it persistent**, or the timer below will one day run against an
+   empty directory and the indexer will prune every document out of the local
+   database — the files "disappeared" as far as it can tell:
+
+   ```
+   # /etc/fstab
+   nas:/exports/kb  /var/lib/kb-mcp/knowledge-base  nfs4  ro,_netdev  0  0
+   ```
+
    Mounting read-only is optional but harmless, and it makes "this
    machine does not edit the shared KB" enforceable. Machines that *do*
    edit the KB mount it read-write as usual.
@@ -90,6 +99,12 @@ edits the same files. **The index does not.** Each machine keeps its own
 
    ```ini
    # ~/.config/systemd/user/kb-mcp-index.service
+   [Unit]
+   # Belt and braces for the same failure mode: if the share is not mounted
+   # (NAS down, network not up yet), skip this run instead of indexing an
+   # empty directory and pruning the database.
+   ConditionPathIsMountPoint=/var/lib/kb-mcp/knowledge-base
+
    [Service]
    Type=oneshot
    # --config is required: a unit does not inherit a working directory, so

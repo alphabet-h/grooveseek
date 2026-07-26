@@ -60,6 +60,15 @@
    sudo mount -t nfs4 -o ro nas:/exports/kb /var/lib/kb-mcp/knowledge-base
    ```
 
+   **永続化すること**。しないと、いつかタイマーが空ディレクトリに対して走り、
+   indexer から見れば「ファイルが全部消えた」ので **ローカル DB の全 document が
+   prune される**:
+
+   ```
+   # /etc/fstab
+   nas:/exports/kb  /var/lib/kb-mcp/knowledge-base  nfs4  ro,_netdev  0  0
+   ```
+
    read-only マウントは任意だが害はなく、「このマシンは共有 KB を編集
    しない」を強制できる。KB を編集するマシンは通常どおり read-write で。
 
@@ -84,6 +93,12 @@
 
    ```ini
    # ~/.config/systemd/user/kb-mcp-index.service
+   [Unit]
+   # 同じ事故への二重の備え: 共有が mount されていなければ (NAS 停止 /
+   # ネットワーク未起動) この run を skip する。空ディレクトリを index して
+   # DB を prune させない。
+   ConditionPathIsMountPoint=/var/lib/kb-mcp/knowledge-base
+
    [Service]
    Type=oneshot
    # --config は必須: unit は作業ディレクトリを引き継がないため、config 探索が
