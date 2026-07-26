@@ -19,7 +19,12 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   (globset only rejects one on its own at around a million characters, after
   2.8 s). Each list is now limited to 64 entries of at most 1 KiB, checked at
   the MCP boundary and again inside `compile_path_globs` so the CLI is covered
-  by the same rule.
+  by the same rule. Because those checks can only run once the request has been
+  deserialized, the HTTP transport also caps request bodies at 1 MiB, which it
+  had not done at all — otherwise a body carrying a million tags would still be
+  buffered and parsed in full before anything could reject it. The stdio
+  transport is deliberately left unbounded: its client is a local process with
+  the user's own privileges, so there is nothing there to protect.
 
 - **A `bind` value in `kb-mcp.toml` could run a command when the tray opened
   the web UI** (AU-12). The tray split `bind` at its last colon and carried

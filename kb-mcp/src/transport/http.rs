@@ -27,6 +27,29 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::server::{KbServer, KbServerShared};
 
+/// HTTP transport が受理するリクエスト body の上限 (1 MiB)。
+///
+/// AU-17 の codex P1 指摘: `search` の filter 件数・要素長の検査は、rmcp が
+/// body を全部 buffer して `SearchParams` に deserialize した **後** にしか
+/// 走らない。100 万件の tags を載せた body は、はじかれる時点で既に
+/// メモリと parse 時間を使い切っている。上限は body 自体にかける必要がある。
+///
+/// `axum::extract::DefaultBodyLimit` ではなく
+/// `tower_http::limit::RequestBodyLimitLayer` を使うのは、前者が
+/// 「extractor が上限 extension を読む」前提の仕組みで、`nest_service` した
+/// rmcp の `StreamableHttpService` (自前で body を読む) には効かないため。
+/// 後者は body を包むので、誰が読むかに依存しない。
+///
+/// 値の根拠: 正当な MCP リクエストで最大のものは `search` で、
+/// filter 3 本が上限いっぱいでも 64 × 1 KiB × 3 = 192 KiB、query が 1 KiB。
+/// 1 MiB はその 5 倍で、JSON-RPC の枠や session header を足しても十分余裕がある。
+///
+/// **stdio transport には同じ上限が無い**。こちらの client は同じユーザ権限で
+/// 動くローカルプロセスであり、そもそもユーザにできることは何でもできるので、
+/// body を絞っても守る対象が無い。守るべきは「ネットワーク越しに到達しうる」
+/// HTTP 側だけ。
+pub(crate) const REQUEST_BODY_MAX_BYTES: usize = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // (feature-43 PR-2) Admin endpoint response types + small ISO timestamp helper.
 // ---------------------------------------------------------------------------
@@ -419,7 +442,10 @@ pub async fn run_http(
 
     let app = healthz_router
         .merge(admin_router)
-        .nest_service("/mcp", mcp_service);
+        .nest_service("/mcp", mcp_service)
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            REQUEST_BODY_MAX_BYTES,
+        ));
 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
@@ -1519,6 +1545,103 @@ mod tests {
             body.as_ref(),
             b"Bad Request: Invalid Host header encoding".as_slice(),
             "body should be byte-identical to rmcp"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AU-17 (codex P1 on PR #104): request body の上限。
+    //
+    // `search` の filter 上限は、rmcp が body を buffer して `SearchParams` に
+    // deserialize した後にしか効かない。100 万件の tags を載せた body は
+    // はじかれる時点で既にメモリと parse 時間を使っている。body 自体に
+    // 上限をかけないと availability の問題は残る。
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `/mcp` は `nest_service` で rmcp の service を載せている。上限が
+    /// **nest した service にも効く**ことが要点なので、mount の形だけ同じに
+    /// して body を読む dummy service を挟む (rmcp 本体は組み立てない)。
+    fn router_with_body_limit(reached: Arc<AtomicBool>) -> Router {
+        let inner = axum::routing::any(move |body: axum::body::Bytes| {
+            let reached = Arc::clone(&reached);
+            async move {
+                reached.store(true, Ordering::SeqCst);
+                format!("read {} bytes", body.len())
+            }
+        });
+        Router::new().nest_service("/mcp", inner).layer(
+            tower_http::limit::RequestBodyLimitLayer::new(REQUEST_BODY_MAX_BYTES),
+        )
+    }
+
+    /// Content-Length が上限を超えていれば、body を 1 バイトも読まずに 413。
+    #[tokio::test]
+    async fn an_oversized_declared_body_is_rejected_before_the_service_reads_it() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = router_with_body_limit(Arc::clone(&reached));
+        let oversized = REQUEST_BODY_MAX_BYTES + 1;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(vec![b'x'; oversized]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !reached.load(Ordering::SeqCst),
+            "the nested service must not see an oversized body"
+        );
+    }
+
+    /// Content-Length を名乗らない (= chunked 相当) 場合も、読み進めた時点で
+    /// 打ち切られる。ここで大事なのは status そのものより
+    /// 「service まで到達しない」こと。
+    #[tokio::test]
+    async fn an_oversized_undeclared_body_is_cut_off_mid_read() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = router_with_body_limit(Arc::clone(&reached));
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .body(Body::from(vec![b'x'; REQUEST_BODY_MAX_BYTES + 1]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(
+            !reached.load(Ordering::SeqCst),
+            "the nested service must not receive the full body"
+        );
+    }
+
+    /// 上限内の body は素通りする (上限が正常系を壊していないこと)。
+    #[tokio::test]
+    async fn a_request_body_under_the_limit_still_goes_through() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = router_with_body_limit(Arc::clone(&reached));
+        let size = REQUEST_BODY_MAX_BYTES / 2;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-length", size.to_string())
+            .body(Body::from(vec![b'x'; size]))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// 上限は `search` の filter 上限より十分大きいこと。片方だけ動かすと
+    /// 「上限内の正当なリクエストが transport で落ちる」状態になりうる。
+    #[test]
+    fn the_body_limit_leaves_room_for_a_fully_loaded_search_request() {
+        let filters = crate::server::FILTER_LIST_MAX_ITEMS * crate::server::FILTER_ITEM_MAX_BYTES;
+        let worst_case = filters * 3 + crate::server::SEARCH_QUERY_MAX_BYTES;
+        assert!(
+            worst_case * 2 < REQUEST_BODY_MAX_BYTES,
+            "body limit {REQUEST_BODY_MAX_BYTES} leaves too little room for a \
+             maximal search request ({worst_case} bytes of filters and query)"
         );
     }
 }

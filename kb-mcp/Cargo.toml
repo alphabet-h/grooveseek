@@ -19,6 +19,12 @@ categories = ["command-line-utilities", "database", "text-processing"]
 rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# AU-17 codex P1: `search` の filter 上限は rmcp が body を全部 buffer して
+# `SearchParams` に deserialize した **後** にしか効かない。body 自体を
+# 包んで上限をかけられる layer が要る (axum の `DefaultBodyLimit` は
+# extractor 側の協力が前提で、nest した rmcp service には効かない)。
+# axum 0.8 の transitive で既に tree にある (v0.6.8)。
+tower-http = { version = "0.6", features = ["limit"] }
 # [D-11 / feature-39] /healthz Host validation を `http::uri::Authority::try_from`
 # 委譲に refactor するため direct dep 宣言。axum 0.8 transitive で既に v1.4.0 が
 # 入っているので追加コストなし。
