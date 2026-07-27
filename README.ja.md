@@ -820,7 +820,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   既知の制限:
   - **legacy バイナリ形式は非対応**: 2007 年以前の `.doc` (Word) / `.ppt` (PowerPoint) / `.xls` (Excel) は非対応 — 対応するのは上記の OOXML 形式 (`.docx` / `.pptx` / `.xlsx`) のみ
 
-    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.14.0 で取り下げた。calamine は workbook を開く時点で、kb-mcp に制御が戻る前に全シート分の密なセル格子を確保する。BIFF が縛るのは**シート 1 枚** (65,536 × 256 = セル 512 MB 相当) であって **workbook ではない**: 対角 2 セルのレコードだけでシートを最大矩形にできるので、小さな細工ファイルで十分な数のシートを宣言すればメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと、起動時にこの理由付きで拒否される。`.xlsx` に変換すれば streaming で読める
+    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.14.0 で取り下げた: calamine は workbook を開く時点で全体を密に確保し、BIFF が縛るのは**シート 1 枚**であって **workbook ではない**ため、小さな細工ファイルでメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと起動時にこの理由付きで拒否される — `.xlsx` に変換すれば streaming で読める。**原本は残すこと**: 変換でセルのテキストは引き継がれるが一般に無損失ではない (VBA マクロは `.xlsm` が必要、その他のレガシー固有機能も失われうる)。詳しい理由: [ADR-0001](docs/decisions/0001-withdraw-xls-legacy-biff-support.ja.md)
   - **OpenDocument 形式は非対応**: `.odt` / `.ods` / `.odp` は非対応
   - **パスワード保護ファイルは復号ではなく skip**: 暗号化された Office ファイルは (zip / BIFF コンテナが開けないことで) 検出され、実行全体を失敗させず warning 付きで skip される — パスワード対応なし
   - **表構造は plain text 化される**: `.docx` / `.pptx` の表セルは通常のテキストとして読み取られる (行/列構造はチャンク内に保持されない)。`.xlsx` の行は 1 行ごとにタブ区切りで連結される。下流の検索が見るのはグリッドではなく地の文
@@ -838,3 +838,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **ディレクトリ除外**: `walkdir` は basename が `exclude_dirs` のいずれかと一致するディレクトリ (とその subtree) をスキップする。既定は `[".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"]`。ユーザ指定リストは既定を完全に置き換える (merge ではない)。`exclude_dirs = []` を明示すると `.git/` 等も含めて全走査する
 - **`get_best_practice` path templates**: opt-in 機能で、使うには `kb-mcp.toml` の `[best_practice].path_templates` を設定する必要がある。各テンプレートは `{target}` をプレースホルダとして使える (例: `"best-practices/{target}/PERFECT.md"`、`"docs/{target}.md"`)。サーバはリスト順に試して `kb_path` 配下に最初に存在したファイルを返す (path traversal は拒否)。セクション省略 or `path_templates = []` の場合はツール自体は登録されるが "not configured" エラーを返すため、意図しない呼び出しは明示的に失敗する
 - **チャンク単位品質フィルタ** (**既定有効** 閾値 `0.3`): インデックス時に各チャンクに対し 3 つのシグナル — 長さ (30 文字未満 → -0.6)、定型語のみ (TBD / TODO / 詳細は後述 等 → -0.5)、弱い構造 (80 文字未満の 1 行 → -0.3) — から `quality_score` を計算。閾値未満のチャンクは `search` / `kb-mcp search` / `get_connection_graph` で非表示。`get_connection_graph` の seed チャンクは免除。フィルタ無効化は `kb-mcp.toml` の `[quality_filter] enabled = false`、per-query は CLI `--include-low-quality` / MCP `include_low_quality: true`。閾値上書きは `--min-quality 0.5` / `min_quality: 0.5`。既存 index のアップグレード: 次の `kb-mcp index` 実行時に `quality_score` 列が透過的に追加され (ALTER TABLE)、1 度だけ backfill される (冪等)
+
+## 設計判断の記録
+
+アーキテクチャを形づくった決定 — 何を選び、どの選択肢を却下し、その代償は何だったか — は [Architecture Decision Record](docs/decisions/) として `docs/decisions/` に残している。まず [ADR-0000](docs/decisions/0000-record-decisions-as-adrs.ja.md) を読むと、何を ADR に書き、何は CHANGELOG で足りるのかが分かる。日本語版は同じディレクトリに `*.ja.md` で並べてある。
