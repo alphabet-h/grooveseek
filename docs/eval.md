@@ -302,8 +302,11 @@ recommended when **all** of the following hold:
 >
 > Simulated against a known data-generating process, the reported SE came out at
 > **0.53–0.60** of the real one in the three settings where the selection varied
-> (64–83 distinct conditions chosen across 300 replications), and at **1.03** in
-> the one where it did not vary at all (a single condition every time).
+> (114–184 distinct conditions chosen across 300 replications), and at **1.03**
+> in the one where it did not vary at all — a single condition across all 7,800
+> fold selections. The count is of the *fold* selections that generate each
+> difference, not of the refit chosen from all N rows; the two diverge (114 vs
+> 64 in the first setting), so the refit would have understated the variation.
 >
 > **What that costs is measured directly rather than converted into a sigma
 > level** — the reported SE varies per run and can correlate with the observed

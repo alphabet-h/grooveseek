@@ -597,20 +597,24 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// golden set の抽出をまたいで実質固定されている**場合であって、fold 内一致とは
 /// 別の条件である。
 ///
-/// そこで**測った**: 下表の「選ばれた条件の種類数」は 300 replication 全体で
-/// refit がいくつの異なる条件になったか。**静かな設定は 1 種類 = 実質固定**で、
-/// そこだけ比が 1.027。騒がしい 3 設定は 64〜83 種類に散っており、選択そのものが
-/// ばらつく入力になっている。
+/// そこで**測った**。測る対象は `refit` ではなく **fold の選択** — `refit` は全 N 行
+/// から選ばれるが、各 `d_j` を生むのは `fold_selections[j]` (その fold の N−1 行から
+/// 選ばれたもの) なので、refit が全 replication で同一でも fold 側は割れ得る。
+/// 実際に両方数えると乖離がある (114 対 64 など)。
+///
+/// **静かな設定は fold 選択が 1 種類** — 300 replication × 26 fold = 7,800 回の選択が
+/// すべて同一条件、つまり実質固定であり、そこだけ比が 1.027。騒がしい 3 設定は
+/// 114〜184 種類に散っており、選択そのものがばらつく入力になっている。
 ///
 /// 既知の golden set を多数生成して「報告される SE」と「mean delta の真の
 /// ばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
-/// 300 反復 × 4 設定。**選択条件の種類数**は右端):
+/// 300 反復 × 4 設定):
 ///
-/// | N | 真の優位幅 | セル分散 | 全 rep | stability gate 通過分 | 選択条件の種類 |
+/// | N | 真の優位幅 | セル分散 | 全 rep | stability gate 通過分 | fold 選択の種類 |
 /// |---|---|---|---|---|---|
-/// | 26 | 0.04 | 0.08 | 0.533 | 0.619 (265/300) | 64 |
-/// | 26 | 0.00 | 0.08 | 0.547 | 0.644 (239/300) | 83 |
-/// | 12 | 0.04 | 0.08 | 0.601 | 0.733 (192/300) | 73 |
+/// | 26 | 0.04 | 0.08 | 0.533 | 0.619 (265/300) | 114 |
+/// | 26 | 0.00 | 0.08 | 0.547 | 0.644 (239/300) | 184 |
+/// | 12 | 0.04 | 0.08 | 0.601 | 0.733 (192/300) | 152 |
 /// | 26 | 0.04 | 0.03 | **1.027** | 1.027 (300/300) | **1** |
 ///
 /// 比は **replication 群に対する量** (mean delta のばらつきが要る) なので単一 run
@@ -625,7 +629,7 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 ///   gate を通った replication でも SE はなお 1.4〜1.6 倍過小
 /// - **稀な隅ではない**。300 rep 中 192〜300 が gate を通っている
 /// - **測った 4 設定のうち、比が 1 付近だったのは最終行の 1 つだけ**で、そこは
-///   fold 内一致に加えて **replication をまたいでも選択が 1 種類**だった。
+///   fold 内一致に加えて **replication をまたいでも fold 選択が 1 種類**だった。
 ///   「選択のばらつきが相関の源」という機構と整合はするが、**4 設定・実質固定は
 ///   1 つ**なので、これは連関の
 ///   観測であって「一致した時に限り較正される」ことの証明ではない。部分的にしか
@@ -2361,6 +2365,14 @@ mod tests {
             // effectively fixed *across* sampled golden sets — which is a
             // separate thing, and was being asserted rather than recorded
             // (codex P2 round 6). Recording it.
+            // Record the *fold* selections, not `refit` (codex P2 round 7).
+            // `refit` is chosen from all N rows; every `d_j` is generated from
+            // `fold_selections[j]`, chosen from that fold's N-1 rows. A setting
+            // can have one identical refit across all replications while the
+            // fold selections still vary, so `refit` cannot answer whether the
+            // selection generating the differences was fixed.
+            let mut fold_picks: std::collections::HashSet<Condition> =
+                std::collections::HashSet::new();
             let mut refits: std::collections::HashSet<Condition> = std::collections::HashSet::new();
             for _ in 0..REPS {
                 let rows: Vec<Vec<f64>> = (0..n)
@@ -2384,6 +2396,9 @@ mod tests {
                     adopted += 1;
                 }
                 refits.insert(out.refit);
+                for c in &out.fold_selections {
+                    fold_picks.insert(*c);
+                }
                 mean_deltas.push(m);
                 reported_ses.push(se);
                 stabilities.push(out.stability);
@@ -2429,12 +2444,13 @@ mod tests {
                 "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
                  all reps: {:<14} passing the stability gate: {:<14} mean stability={:.2}\n      \
                  fired: `m > 2*se` {:>5.1}%   full decide() Adopt {:>5.1}%   \
-                 distinct refits across reps: {}",
+                 distinct fold selections: {}  (refits: {})",
                 fmt(all),
                 fmt(gated),
                 mean(&stabilities),
                 100.0 * se_gate_fired as f64 / REPS as f64,
                 100.0 * adopted as f64 / REPS as f64,
+                fold_picks.len(),
                 refits.len(),
             );
             let true_se = sample_sd(&mean_deltas);
