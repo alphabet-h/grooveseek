@@ -65,7 +65,7 @@ enabled = true
 threshold = 0.3
 
 # index 対象拡張子。セクション省略で デフォルト挙動
-# (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .xls / .pptx に
+# (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .pptx に
 # オプトイン。空配列 [] は「何もインデックスされない」事故を防ぐため拒否
 # される。現在サポート id: "md" / "txt" / "pdf" (v0.10.0+) / "docx" /
 # "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.13.2 で取り下げ、下記参照)

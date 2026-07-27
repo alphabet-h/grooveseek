@@ -65,7 +65,7 @@ enabled = true
 threshold = 0.3
 
 # Indexing extensions. Omit the section to keep the previous default
-# behavior (.md only). Opt-in to .txt / .pdf / .docx / .xlsx / .xls / .pptx
+# behavior (.md only). Opt-in to .txt / .pdf / .docx / .xlsx / .pptx
 # via an explicit list. An empty array is rejected to prevent silent
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
