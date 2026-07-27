@@ -12,18 +12,31 @@
 #![cfg(target_os = "windows")]
 
 use kb_mcp_tray::install::{build_install_script, build_uninstall_script};
+use kb_mcp_tray::powershell::{decode_diagnostic, decode_value, with_utf8_output};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Mirrors `install::run_ps`, including the UTF-8 output prelude.
+///
+/// Without the prelude this harness reproduces the very bug the production
+/// helper was fixed for: the `.lnk` path comes back in the active code page,
+/// `Path::new(&lnk_path).exists()` is then false, and the install test fails on
+/// exactly the accounts it most needs to cover — those whose profile directory
+/// contains non-ASCII characters.
 fn run_ps(script: &str) -> (i32, String, String) {
     let out = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &with_utf8_output(script),
+        ])
         .output()
         .expect("spawn powershell");
     (
         out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
+        decode_value(&out.stdout, "powershell stdout").expect("stdout must decode as UTF-8"),
+        decode_diagnostic(&out.stderr),
     )
 }
 
