@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Eleven field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), backslashes being eaten by nested shell/Python layers so a string continuation silently becomes a `\n` escape, or diagnosing "works on Linux, fails on Windows" failures
+description: Eleven field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), inline-delivered scripts losing a backslash level so a string continuation silently becomes a `\n` escape, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -137,33 +137,45 @@ open('path','wb').write(b.replace(b'\r\n', b'\n'))
 
 出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)
 
-## 11. bash heredoc → Python → ソースの多段で backslash が 1 段余計に食われる
+## 11. インラインで渡したスクリプトは backslash を 1 段失う (継続が `\n` エスケープに化ける)
 
 **症状**: Rust の文字列継続 (`"...text \` + 改行) を Python の置換で書き込んだのに、ファイルには `\` + 文字 `n` (= `5c 6e`) が入り、**改行エスケープ**になっていた。`cargo check` は通ってしまう (どちらも合法な文字列) ので、**出力を実際に見るまで気付かない** — メッセージ中に改行と 13 個の空白が埋まっていた。
 
 同じ session で、`python -c "... b'\\\\' ..."` が `SyntaxError: unexpected character after line continuation character` になる形でも踏んだ。
 
-**原因**: `Bash` ツール → Git Bash → heredoc / `-c` の引用 → Python の文字列リテラル、と **backslash を解釈する層が複数重なる**。各層が 1 回ずつ食うので、ソースに 1 個残すために何個書けばよいかが状況依存になる。`<<'PY'` で引用しても、`python -c "..."` の二重引用側では効かない。
+**原因は「インラインで渡したこと」であって Python でも heredoc でもない** (2026-07-27 実測)。同一の Python bytes literal `b'A \\<改行> B'` を 2 通りで実行して比較した:
+
+| 届け方 | ファイルに入ったバイト |
+|---|---|
+| `Write` ツールで `.py` に書いて `python foo.py` | `41 20 5c 0a 20 42` = **継続が残る** |
+| `python - <<'PY' ... PY` (**引用付き** heredoc) | `41 20 5c 6e 20 42` = **1 段消えた** |
+
+引用付き heredoc の shell 意味論は body を literal に渡すので、**消しているのは shell ではなく、コマンド文字列をインラインで渡す経路そのもの**。`python -c "..."` はさらに二重引用が乗るので当然同じか悪い。「何個 backslash を書けば通るか」を数えて合わせにいくのは、経路依存なので**必ず破綻する**。
 
 **正しいやり方**:
 
-1. **Edit / Write ツールで直接書く**。backslash を含むソース片を扱う時はこれ一択
-2. どうしても Python で検査したいなら、**backslash を書かずに済ませる**:
+1. **ソースの編集は `Edit` / `Write` ツールで直接行う**。backslash を含む断片ではこれ一択
+2. スクリプトを書く必要があるなら、**`Write` で `.py` に落としてから実行する**。上表のとおりこの経路なら backslash は保たれる
+3. インラインで済ませたいなら、**backslash を 1 文字も書かない**。`chr(92)` で構築すればどの経路でも安全:
    ```bash
    python - <<'PY'
    BS = chr(92).encode()   # backslash を literal として書かない
    LF = chr(10).encode()
-   b = open("src/x.rs","rb").read()
+   b = open("src/x.rs", "rb").read()
+   i = b.index(b"marker")
+   seg = b[i:b.index(b'",', i)]          # 検査したい範囲を必ず先に切り出す
    assert BS not in seg and LF not in seg
+   print(seg.decode())
    PY
    ```
-3. そもそも**文字列継続を使わない**。1 行の長い literal は rustfmt が折らないので、メッセージは 1 行で書けば継続自体が不要
+4. そもそも**文字列継続を使わない**。rustfmt は長い literal を折らないので、メッセージを 1 行で書けば継続自体が不要になる
 
-**検証は「コンパイルが通った」で止めない**。生成される文字列そのものをバイトで見る:
+**検証は「コンパイルが通った」で止めない**。継続もエスケープも合法な文字列なので、コンパイラは両者を区別しない。生成されたバイトを見る:
 ```bash
 python - <<'PY'
-b = open("src/x.rs","rb").read(); i = b.index(b"marker")
-print(" ".join(f"{c:02x}" for c in b[i:i+30]))
+b = open("src/x.rs", "rb").read()
+i = b.index(b"marker")
+print(" ".join(f"{c:02x}" for c in b[i:i + 30]))
 PY
 ```
 `5c 0a` なら継続 (改行と次行先頭の空白を食う)、`5c 6e` なら `\n` エスケープ = **別物**。
