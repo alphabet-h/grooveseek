@@ -593,26 +593,32 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// の真のばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
 /// 300 反復 × 4 設定):
 ///
-/// | N | 真の優位幅 | セル分散 | reported/true | 平均 stability |
+/// | N | 真の優位幅 | セル分散 | 全 rep | **stability gate 通過分のみ** |
 /// |---|---|---|---|---|
-/// | 26 | 0.04 | 0.08 | 0.533 | 0.84 |
-/// | 26 | 0.00 | 0.08 | 0.547 | 0.75 |
-/// | 12 | 0.04 | 0.08 | 0.601 | 0.67 |
-/// | 26 | 0.04 | 0.03 | **1.027** | **1.00** |
+/// | 26 | 0.04 | 0.08 | 0.533 | 0.619 (265/300) |
+/// | 26 | 0.00 | 0.08 | 0.547 | 0.644 (239/300) |
+/// | 12 | 0.04 | 0.08 | 0.601 | 0.733 (192/300) |
+/// | 26 | 0.04 | 0.03 | 1.027 | 1.027 (300/300) |
 ///
-/// **過小評価の度合いは selection stability に連動する**。fold ごとに選ぶ条件が
-/// ばらつくことが相関の源なので、全 fold が一致する設定 (stability 1.00) では
-/// 比が 1.03 まで戻る。逆に言えば、**stability が 1 未満なら常に過小評価**する。
+/// 比は **replication 群に対する量** (mean delta のばらつきが要る) なので単一 run
+/// では出せない。したがって「平均 stability が 0.84 だから gate を通る run でも
+/// 1.9 倍過小」とは**言えない** — 平均 stability と比は同じ集合に対する別々の
+/// 集計にすぎない。上表右列は `stability > STABILITY_MIN` を満たす replication
+/// **だけ**で比を取り直したもので、`decide` が採用し得るのはこの部分集合だけ。
 ///
-/// 帰結: `decide` の `mean_delta > 2 * se` は **公称 2 sigma だが実効は
-/// おおよそ 1.1 sigma** で、意図より緩い。係数を上げるかは採用挙動の変更なので
-/// ここでは行っていない。
+/// 読み取れること:
 ///
-/// **`STABILITY_MIN` (= 0.5) はこれをほとんど補償しない**: 上表の stability 0.84
-/// の行でも比は 0.533 で、gate を余裕で通りながら SE は約 1.9 倍過小のままである。
-/// 実際に効いている他の gate は `ADOPT_MIN_MEAN_DELTA` (絶対量の下限)、
-/// `STABILITY_MIN`、`non_degradation` の 3 つ。**sign test は `TuneReport` に
-/// 出るだけで `decide` は参照しない**ので、緩和材料として数えてはならない。
+/// - **stability gate は緩和するが埋めない**。0.533 → 0.619 のように上がるが、
+///   gate を通った replication でも SE はなお 1.4〜1.6 倍過小
+/// - **稀な隅ではない**。300 rep 中 192〜300 が gate を通っている
+/// - 比が 1 に戻るのは**全 fold が一致する設定だけ** (最終行)。fold が選択を
+///   違えることが相関の源なので、これは機構と整合する
+///
+/// 帰結: `decide` の `mean_delta > 2 * se` は **公称 2 sigma だが実効はより緩い**。
+/// 係数を上げるかは採用挙動の変更なのでここでは行っていない。実際に効いている
+/// 他の gate は `ADOPT_MIN_MEAN_DELTA` (絶対量の下限)、`STABILITY_MIN`、
+/// `non_degradation` の 3 つ。**sign test は `TuneReport` に出るだけで `decide`
+/// は参照しない**ので、緩和材料として数えてはならない。
 pub fn paired_se(diffs: &[f64]) -> f64 {
     if diffs.len() < 2 {
         return f64::INFINITY;
@@ -2321,19 +2327,51 @@ mod tests {
                 stabilities.push(out.stability);
             }
 
-            let true_se = sample_sd(&mean_deltas);
-            let avg_reported = mean(&reported_ses);
-            // Selection stability is printed alongside because the understatement
-            // is expected to track it: the correlation between folds comes from
-            // them selecting *differently*, so a run where every fold agrees
-            // should not suffer from it. Printed rather than asserted.
-            let avg_stability = mean(&stabilities);
+            // The ratio is an ensemble quantity: it needs a spread of mean
+            // deltas across replications, so it cannot be computed for a single
+            // run. Reporting it next to `mean(stabilities)` therefore says
+            // nothing about whether the replications *responsible* for the
+            // understatement clear `decide`'s stability gate — the two numbers
+            // are separate aggregates over the same set (codex P2 round 2).
+            //
+            // So stratify: recompute the ratio within the replications that
+            // pass `stability > STABILITY_MIN`, which is the only subset
+            // `decide` can ever adopt from.
+            let ratio_over = |keep: &dyn Fn(usize) -> bool| -> Option<(usize, f64)> {
+                let d: Vec<f64> = mean_deltas
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| keep(*i))
+                    .map(|(_, v)| *v)
+                    .collect();
+                let s: Vec<f64> = reported_ses
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| keep(*i))
+                    .map(|(_, v)| *v)
+                    .collect();
+                if d.len() < 2 {
+                    return None;
+                }
+                let sd = sample_sd(&d);
+                (sd > 0.0).then(|| (d.len(), mean(&s) / sd))
+            };
+
+            let all = ratio_over(&|_| true);
+            let gated = ratio_over(&|i| stabilities[i] > STABILITY_MIN);
+            let fmt = |r: Option<(usize, f64)>| match r {
+                Some((k, v)) => format!("{v:.3} (n={k})"),
+                None => "n/a".to_string(),
+            };
             eprintln!(
                 "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
-                 true SE={true_se:.6}  reported={avg_reported:.6}  ratio={:.3}  \
-                 mean stability={avg_stability:.2}",
-                avg_reported / true_se
+                 all reps: {:<14} passing the stability gate: {:<14} mean stability={:.2}",
+                fmt(all),
+                fmt(gated),
+                mean(&stabilities)
             );
+            let true_se = sample_sd(&mean_deltas);
+            let avg_reported = mean(&reported_ses);
             assert!(true_se > 0.0, "degenerate simulation: no spread to measure");
             assert!(avg_reported.is_finite(), "reported SE must be finite");
         }

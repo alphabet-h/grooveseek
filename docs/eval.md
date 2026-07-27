@@ -295,13 +295,22 @@ recommended when **all** of the following hold:
 > selections each share N−2 queries, so they are positively correlated and the
 > formula underestimates the true spread. Simulated against a known
 > data-generating process, the reported SE came out at **0.53–0.60** of the real
-> one whenever the folds disagreed at all, making criterion 3 behave closer to a
-> 1.1 sigma test than a 2 sigma one. It recovers (ratio 1.03) only when every
-> fold selects the same condition — and criterion 4 does not rescue it, since a
-> run with 84% of folds agreeing clears that bar while still understating the SE
-> by about 1.9x. The multiplier has deliberately not been raised, because that
-> would change what the tool recommends. Criteria 1, 2, 4 and 5 are unaffected.
-> The simulation lives in `tune.rs` as
+> one, making criterion 3 behave closer to a 1.1 sigma test than a 2 sigma one.
+> It reaches 1.03 in the one setting where every fold selected the same
+> condition, which fits the mechanism: the correlation comes from the folds
+> disagreeing.
+>
+> **Criterion 4 narrows the gap without closing it.** Restricting to just the
+> replications that pass `stability > 0.5` — the only ones that can be adopted —
+> the ratio rises to **0.62–0.73**, so those runs still understate the SE by
+> roughly 1.4–1.6x. That is not a rare corner either: 192–300 of 300
+> replications passed. (The ratio is a property of a set of replications, not of
+> one run, so it has to be recomputed within that subset rather than read off
+> alongside an average stability.)
+>
+> The multiplier has deliberately not been raised, because that would change
+> what the tool recommends. Criteria 1, 2, 4 and 5 are unaffected. The
+> simulation lives in `tune.rs` as
 > `au16_paired_se_versus_the_true_standard_error`.
 
 Otherwise the verdict is "keep the built-in defaults", which is a normal and
