@@ -1716,6 +1716,27 @@ pub async fn run_server(
     // 「DB に記録された mode に追従する」設計を変えない (呼ぶのはここ 1 回だけ)。
     indexer::resolve_context_mode(&db, context_mode_desired, false)?;
 
+    // AU-06 (codex P2): `[parsers].enabled` を狭めた後、その拡張子の行は DB に
+    // 残る。`kb-mcp index` なら prune されるが `serve` は index しないので、
+    // serve しか使わない運用では残り続け、**search には出るのに
+    // `get_document` が拒否する** hit になる (AU-02 と同じ「見つかるのに
+    // 開けない」)。`.xls` の取り下げでこの経路に入る人が実際に出るので、
+    // 起動時に一度だけ数えて知らせる。**消しはしない** — 狭めた設定は一時的な
+    // こともあり、起動のたびに黙って行を消す方が危ない。
+    if let Ok(all_paths) = db.all_document_paths() {
+        let stale = indexer::paths_with_unregistered_extension(&all_paths, &parser_registry);
+        if !stale.is_empty() {
+            let sample: Vec<&str> = stale.iter().take(3).map(String::as_str).collect();
+            tracing::warn!(
+                "{} indexed document(s) have an extension that [parsers].enabled no longer \
+                 covers (e.g. {}). They still appear in search results but get_document \
+                 rejects them. Run `kb-mcp index` to remove them from the index.",
+                stale.len(),
+                sample.join(", ")
+            );
+        }
+    }
+
     let embedder = Embedder::with_model(model)?;
     let reranker = Reranker::try_new(reranker_choice)?;
 

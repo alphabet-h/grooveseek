@@ -38,7 +38,7 @@ KB_MCP_BIN="${KB_MCP_BIN:-kb-mcp}"   # override if not on PATH
 # listing more than you index only costs a no-op rebuild, listing fewer means
 # edits to those files are silently not re-indexed. Defaults to every format
 # kb-mcp can parse.
-KB_EXTENSIONS="${KB_EXTENSIONS:-md txt pdf docx xlsx xls pptx}"
+KB_EXTENSIONS="${KB_EXTENSIONS:-md txt pdf docx xlsx pptx}"
 # -----------------------------------------------------------------------------
 
 if [[ -z "$KB_PATH" ]]; then

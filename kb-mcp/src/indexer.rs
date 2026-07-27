@@ -215,6 +215,35 @@ fn detect_renames(
     pairs
 }
 
+/// 現在の registry に載っていない拡張子を持つ document path を返す (AU-06)。
+///
+/// `[parsers].enabled` を狭めた後 (`.xls` の取り下げのように、狭めざるを得なく
+/// なった場合を含む)、その拡張子の行は DB に残る。`kb-mcp index` を 1 度回せば
+/// `documents_to_delete` が prune するが、`serve` は起動時に index しないので、
+/// `serve` しか使わない運用では残り続ける。
+///
+/// 残ると **search には出るのに `get_document` が拒否する** hit になる
+/// (`validate_get_document_path` が `registry.has_extension` で門番をするため)。
+/// AU-02 で直したのと同じ「見つかるのに開けない」症状。
+///
+/// **削除はしない**。狭めた設定は一時的なこともあり、起動のたびに黙って行を
+/// 消すのは破壊的すぎる。呼び出し側は件数を warn して `kb-mcp index` を促す。
+pub fn paths_with_unregistered_extension(
+    all_db_paths: &[String],
+    registry: &crate::parser::Registry,
+) -> Vec<String> {
+    all_db_paths
+        .iter()
+        .filter(|p| {
+            std::path::Path::new(p.as_str())
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_none_or(|ext| !registry.has_extension(ext))
+        })
+        .cloned()
+        .collect()
+}
+
 /// prune 対象 (= disk から消えた document path) を決める純粋関数。
 ///
 /// 「visited (今回 index した) でも skipped (read 失敗 / size skip で保持) でもない」
@@ -1139,6 +1168,34 @@ mod tests {
             vec!["c.md".to_string()],
             "skipped path must be retained"
         );
+    }
+
+    /// AU-06 (codex P2): `[parsers].enabled` を狭めた後に残る行を数えられること。
+    /// `.xls` を取り下げたので、旧 index を持ったまま upgrade した人がこの状態に入る。
+    #[test]
+    fn unregistered_extensions_are_reported_but_not_deleted() {
+        let registry =
+            crate::parser::Registry::from_enabled(&["md".to_string(), "xlsx".to_string()]).unwrap();
+        let all_db: Vec<String> = [
+            "notes/a.md",
+            "book.xlsx",
+            "legacy/old.xls", // registry から外れた拡張子
+            "REPORT.XLSX",    // 大文字でも registered (AU-02: 照合は case-insensitive)
+            "no_extension",   // 拡張子なしも「載っていない」扱い
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let stale = paths_with_unregistered_extension(&all_db, &registry);
+        assert_eq!(
+            stale,
+            vec!["legacy/old.xls".to_string(), "no_extension".to_string()],
+            "only paths the registry cannot serve should be reported"
+        );
+
+        // 「報告するだけ」であること: 入力は変えない (呼び出し側が warn するのみ)。
+        assert_eq!(all_db.len(), 5, "the caller's list must not be mutated");
     }
 
     #[test]

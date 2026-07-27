@@ -4,6 +4,44 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Removed
+
+- **`.xls` (legacy BIFF) is no longer indexed** (AU-06). Listing `"xls"` in
+  `[parsers].enabled` now fails at startup with an explanation instead of
+  registering the parser. calamine builds one dense cell grid per sheet while
+  opening a workbook, before kb-mcp regains control, and BIFF bounds a *sheet*
+  at 65,536 × 256 — 512 MB of cells — but places no bound on a *workbook*. Two
+  cell records at opposite corners make a sheet maximal, so a small crafted
+  file can declare enough sheets to exhaust memory; an allocation failure
+  aborts the process rather than skipping the file, so neither the per-file
+  skip nor the panic guard helps. Bounding it means reading BOUNDSHEET and
+  DIMENSIONS out of the CFB container before calamine opens the file, which is
+  a new dependency and a BIFF record walker — deferred until someone asks for
+  `.xls`. Convert affected workbooks to `.xlsx`, which is read as a stream.
+  The earlier claim in the source that BIFF's sheet limit made a dense grid
+  safe was wrong: it bounds a sheet, not a workbook.
+
+  `kb-mcp index` now validates `[parsers].enabled` before it touches anything
+  at all. The check used to run after the database was opened, after the
+  embedding model was loaded, and — with `--force` — after the reset, so a
+  config carrying an id this build rejects (which `"xls"` now is, and which an
+  upgraded installation may still hold) emptied the database and then exited
+  with an error, leaving no index. Even without `--force` it created the
+  database and ran schema migrations for a run that could not succeed.
+  Deciding whether an id is valid needs only the config string, so it now
+  happens first: a rejected config leaves no database behind and downloads
+  no model.
+
+  `kb-mcp serve` now says so when the index still holds documents whose
+  extension `[parsers].enabled` no longer covers. Those rows are pruned by
+  the next `kb-mcp index`, but `serve` does not index, so an installation
+  that only ever runs the server keeps them — and they surface as hits that
+  search returns and `get_document` then refuses, the same "findable but not
+  openable" shape as AU-02. The warning names the count and an example and
+  points at `kb-mcp index`; it does not delete anything, because a narrowed
+  `enabled` list is often temporary and silently dropping rows at every
+  startup would be worse than the confusion it prevents.
+
 ### Fixed
 
 - **PDF text extraction had no ceiling on how much it would produce**

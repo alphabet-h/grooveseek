@@ -71,14 +71,17 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 #   - 明示的な空配列           … エラー (silent failure 防止)
 #   - 独自リスト                … そのリストに含まれる拡張子だけを対象に
 # 現状のバイナリで対応する id: "md" / "txt" / "pdf" (v0.10.0+) /
-# "docx" / "xlsx" / "xls" / "pptx" (v0.11.0+)
+# "docx" / "xlsx" / "pptx" (v0.11.0+)
 # ("rst" / "adoc" 等は将来追加予定、現在指定するとエラー)
+# "xls" は v0.13.2 で取り下げ。指定すると理由付きで起動時エラーになる
+# (BIFF はシート 1 枚しか縛らないため、シートを多数宣言した小さなファイルで
+#  メモリを使い切れる)。`.xlsx` に変換すれば streaming で読める
 # 下記は .txt も index したい場合の例 ("md" のみ既定なら [parsers] ごと削除)。
 [parsers]
 enabled = ["md", "txt"]
-# 全形式を index する例: enabled = ["md", "txt", "pdf", "docx", "xlsx", "xls", "pptx"]
+# 全形式を index する例: enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
 # 既知の制限 (PDF: OCR 非対応 / 多段組の reading order 乱れ。Office 共通:
-# legacy .doc/.ppt 非対応 / OpenDocument 非対応 / パスワード保護は検出して
+# legacy .doc/.ppt/.xls 非対応 / OpenDocument 非対応 / パスワード保護は検出して
 # skip / 表構造は plain text 化) は README.md / README.ja.md 参照。
 
 # ファイルウォッチャー。`kb-mcp serve` 中のみ有効。
