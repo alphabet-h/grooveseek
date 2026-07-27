@@ -1318,12 +1318,7 @@ lambda = 0.5
         // load_from 内部の「parent → resolve_relative」経路を実際に通す e2e。
         // tempfile helper は Drop でファイルを消してしまうので、ここではテスト
         // 終了時に削除する `DirGuard` でファイル書込から load_from まで 1 本化する。
-        let pid = std::process::id();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("kb-mcp-test-relpath-{pid}-{nonce}"));
+        let dir = crate::test_support::unique_temp_path("kb-mcp-test-relpath");
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_path = dir.join("kb-mcp.toml");
         std::fs::write(
@@ -1522,13 +1517,12 @@ lambda = 0.5
     /// Helper: 一意名の一時ファイルを作って `File` を返す。tempfile crate に
     /// 依存しないように素朴に作る。
     fn tempfile(prefix: &str) -> NamedTempFile {
+        // Suffix before the extension: `.toml` has to stay last.
         let mut path = std::env::temp_dir();
-        let pid = std::process::id();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        path.push(format!("{prefix}-{pid}-{nonce}.toml"));
+        path.push(format!(
+            "{prefix}-{}.toml",
+            crate::test_support::unique_suffix()
+        ));
         NamedTempFile {
             file: std::fs::File::create(&path).unwrap(),
             path,
@@ -1867,12 +1861,7 @@ lambda = 0.5
     }
     impl TempDir {
         fn new(prefix: &str) -> Self {
-            let pid = std::process::id();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}"));
+            let path = crate::test_support::unique_temp_path(prefix);
             std::fs::create_dir_all(&path).unwrap();
             Self { path }
         }

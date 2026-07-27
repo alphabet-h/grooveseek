@@ -5,3 +5,6 @@
 
 pub mod install;
 pub mod powershell;
+/// Test-only. Declared by `main.rs` as well — see the module doc.
+#[cfg(test)]
+pub mod test_support;

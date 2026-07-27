@@ -326,14 +326,7 @@ mod tests {
     /// without needing the daemon itself (no model download, no port).
     #[test]
     fn stops_a_process_running_under_the_daemon_file_name() {
-        let dir = std::env::temp_dir().join(format!(
-            "kb-mcp-tray-stop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = crate::test_support::unique_temp_path("kb-mcp-tray-stop");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
         let stand_in = std::path::Path::new(&system_root).join("System32\\ping.exe");

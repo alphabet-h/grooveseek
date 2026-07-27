@@ -2243,12 +2243,7 @@ mod tests {
     struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new(prefix: &str) -> Self {
-            let pid = std::process::id();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let p = std::env::temp_dir().join(format!("kb-mcp-dbtest-{prefix}-{pid}-{nonce}"));
+            let p = crate::test_support::unique_temp_path(&format!("kb-mcp-dbtest-{prefix}"));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
         }
@@ -2873,13 +2868,7 @@ mod tests {
             }
         }
 
-        let pid = std::process::id();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_dir =
-            std::env::temp_dir().join(format!("kb-mcp-test-immediate-lock-{pid}-{nonce}"));
+        let tmp_dir = crate::test_support::unique_temp_path("kb-mcp-test-immediate-lock");
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let _guard = TmpDir(tmp_dir.clone());
 
@@ -4733,12 +4722,7 @@ mod tests {
     }
 
     fn tempdir_for_test() -> TempPath {
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!("kb-mcp-test-{pid}-{nanos}"));
+        let p = crate::test_support::unique_temp_path("kb-mcp-test");
         std::fs::create_dir_all(&p).unwrap();
         TempPath { path: p }
     }
@@ -5161,12 +5145,7 @@ mod tests {
 
     impl F63TempDir {
         fn new(prefix: &str) -> Self {
-            let pid = std::process::id();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}"));
+            let path = crate::test_support::unique_temp_path(prefix);
             std::fs::create_dir_all(&path).expect("create temp dir");
             Self { path }
         }

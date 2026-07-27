@@ -456,14 +456,7 @@ mod tests {
     }
 
     fn scratch_dir(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ))
+        crate::test_support::unique_temp_path(prefix)
     }
 
     /// `kb-mcp` lives in a sibling package, so `CARGO_BIN_EXE_` is unavailable.

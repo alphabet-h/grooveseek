@@ -205,14 +205,7 @@ mod tests {
     use std::io::Write;
 
     fn write_temp_toml(body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kb-mcp-tray-cfg-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let dir = crate::test_support::unique_temp_path("kb-mcp-tray-cfg");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("kb-mcp.toml");
         let mut f = std::fs::File::create(&path).unwrap();
