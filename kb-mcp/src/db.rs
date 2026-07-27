@@ -16,6 +16,24 @@ const FILTER_OVERFETCH_CAP: u32 = 10_000;
 /// 既定 quality filter 有効時に `--limit 82` 以上が全滅していた)
 const VEC_KNN_MAX_K: u32 = 4096;
 
+// Calls to `Database::search_fts_candidates` on the current thread.
+//
+// Thread-local rather than a process-wide atomic on purpose: `cargo test` runs
+// tests on parallel threads and several of them search, so a shared counter
+// would be polluted by whatever happens to run alongside. The sweep in
+// `tune::build_metric_table` calls the function synchronously from the caller's
+// thread, so a thread-local sees exactly its own round trips.
+//
+// Reset it before the call being measured; nothing clears it for you.
+//
+// (A doc comment cannot be used here — `thread_local!` is a macro, and rustc
+// warns that the comment would document nothing.)
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FTS_CANDIDATE_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Fusion (RRF + FTS5 bm25 column weight) の実行時パラメータ。
 ///
 /// feature-47 以前はすべてコンパイル時定数だった。`[search.fusion]` から
@@ -1322,6 +1340,11 @@ impl Database {
     /// いる場合は `FILTER_OVERFETCH_FACTOR` 倍を取りに行き、Rust 側で絞り込む。
     ///
     /// `fusion` の bm25 列重みが `bm25()` の第 2〜4 引数として渡る (feature-47)。
+    ///
+    /// **`fusion.rrf_k` はここでは読まない。** `tune::build_metric_table` はその
+    /// 前提で、同じ重み組の 6 つの `rrf_k` 条件に対して 1 回しか本関数を呼ばず、
+    /// 384 条件を 64 往復で埋める。読むようになれば掃引結果は静かに誤りになる
+    /// ので、`tune` 側に不変条件そのものを述べる回帰テストがある (AU-22)。
     pub(crate) fn search_fts_candidates(
         &self,
         query_text: &str,
@@ -1329,6 +1352,8 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        #[cfg(test)]
+        FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
         let Some(fts_query) = sanitize_fts_query(query_text) else {
             return Ok(Vec::new());
         };
