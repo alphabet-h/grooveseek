@@ -1752,6 +1752,58 @@ mod tests {
         table_from_primary(vec![vec![value; TOTAL_CONDITIONS]; n_queries])
     }
 
+    /// `decide` が `Verdict::Adopt` を返す表。
+    ///
+    /// `test_decide_adopts_a_large_consistent_gain` と同じ形。fold 完全一致 +
+    /// 全指標非悪化にするため、勝者列だけを大きく上げ、SE > 0 を保つだけの
+    /// 分散を入れる。
+    fn adopting_table() -> (MetricTable, Condition, Vec<usize>) {
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 12];
+        for (i, r) in rows.iter_mut().enumerate() {
+            r[winner.index()] = 0.50 + (i % 3) as f64 * 0.01;
+        }
+        (table_from_primary(rows), winner, (0..12).collect())
+    }
+
+    /// 主指標だけが上がり、**二次指標が baseline を下回る**表。
+    ///
+    /// `table_from_primary` は nDCG / recall / MRR に同じ値を書くので、この
+    /// 食い違いを表現できない。`non_degradation` が見ているのは recall と MRR
+    /// なので、それを主指標と独立に置けないと違反 branch に到達しない。
+    fn table_with_secondary_drop(cand: Condition, secondary: f64) -> (MetricTable, Vec<usize>) {
+        let mut rows = vec![vec![0.20_f64; TOTAL_CONDITIONS]; 12];
+        for (i, r) in rows.iter_mut().enumerate() {
+            r[cand.index()] = 0.50 + (i % 3) as f64 * 0.01;
+        }
+        let built = rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let mut m = crate::eval::QueryMetrics::default();
+                        m.ndcg_at_k.insert(PRIMARY_K, v);
+                        // 勝者列だけ二次指標を落とす。他列は主指標と同じ。
+                        let s = if i == cand.index() { secondary } else { v };
+                        m.recall_at_k.insert(PRIMARY_K, s);
+                        m.reciprocal_rank = s;
+                        m
+                    })
+                    .collect()
+            })
+            .collect();
+        (
+            MetricTable::from_rows(built, vec![PRIMARY_K]),
+            (0..12).collect(),
+        )
+    }
+
     #[test]
     fn test_metric_table_reads_primary_metric() {
         let mut rows = vec![vec![0.1_f64; TOTAL_CONDITIONS]; 2];
@@ -2154,9 +2206,16 @@ mod tests {
     }
 
     /// DB を使わずに TuneReport を組む (formatter だけをテストするため)。
+    ///
+    /// 平坦な表を渡すので verdict は必ず `KeepDefault` になる。**Adopt 側の
+    /// 出力経路はこれでは踏めない**ので、表を差し替えられる
+    /// [`synthetic_report_from`] を使う。
     fn synthetic_report() -> TuneReport {
-        let table = flat_table(3, 0.4);
-        let idx = vec![0_usize, 1, 2];
+        synthetic_report_from(flat_table(3, 0.4), vec![0_usize, 1, 2])
+    }
+
+    /// [`synthetic_report`] の表と対象 query を差し替えられる版。
+    fn synthetic_report_from(table: MetricTable, idx: Vec<usize>) -> TuneReport {
         let outcome = nested_loo(&table, &idx);
         let verdict = decide(&table, &outcome, &idx);
         let impact = per_query_impact(&table, outcome.refit, &idx);
@@ -2170,7 +2229,10 @@ mod tests {
             k_values: vec![PRIMARY_K],
             chunk_total: 100,
             context_axis_noop: false,
-            query_count: 3,
+            // Derived rather than fixed, so a caller passing a different table
+            // does not get a report that contradicts itself. Unchanged for
+            // `synthetic_report`, whose idx is still the same three queries.
+            query_count: idx.len(),
             effective: idx.clone(),
             diagnostics: vec![
                 (
@@ -2216,6 +2278,108 @@ mod tests {
             violations,
             outcome,
             verdict,
+        }
+    }
+
+    /// Every formatter test built its report from a flat table, so `format_text`
+    /// only ever ran its `KeepDefault` arm — the recommendation line and the
+    /// TOML snippet, which are the whole point of a run that adopts, were never
+    /// produced by any test.
+    #[test]
+    fn test_format_text_emits_the_recommendation_and_snippet_when_adopting() {
+        let (table, winner, idx) = adopting_table();
+        let report = synthetic_report_from(table, idx);
+        assert!(
+            matches!(report.verdict, Verdict::Adopt(c) if c == winner),
+            "fixture must adopt, got {:?}",
+            report.verdict
+        );
+        let out = format_text(&report, false);
+        assert!(out.contains("Recommendation:"), "{out}");
+        assert!(out.contains(&winner.label()), "{out}");
+        // The snippet must be the *adopted* one, not merely a well-formed
+        // `[search.fusion]` block: emitting the built-in default here while
+        // recommending `winner` would have the user paste parameters that
+        // contradict the recommendation, and a header-and-key check would not
+        // notice (codex P2 round 1).
+        assert!(
+            out.contains(&toml_snippet(winner)),
+            "text output must embed the snippet for the adopted condition\n\
+             --- expected ---\n{}\n--- got ---\n{out}",
+            toml_snippet(winner)
+        );
+        // And it must still be the advice to re-verify with the full pipeline.
+        assert!(out.contains("kb-mcp eval"), "{out}");
+    }
+
+    /// Same gap on the JSON side: `"decision": "adopt"` and its `toml_snippet`
+    /// had no coverage, so a consumer parsing the machine-readable output could
+    /// have broken without any test noticing.
+    #[test]
+    fn test_format_json_reports_adopt_with_a_pasteable_snippet() {
+        let (table, winner, idx) = adopting_table();
+        let report = synthetic_report_from(table, idx);
+        let v = format_json(&report);
+        assert_eq!(v["verdict"]["decision"], "adopt", "{v}");
+        // Assert the *values*, not just that a `condition` object exists: a
+        // machine consumer reads this field, so serialising the wrong
+        // condition here would hand it incorrect tuning parameters while the
+        // separately generated snippet still looked right (codex P2 round 1).
+        let p = winner.to_params();
+        let cond = &v["verdict"]["condition"];
+        assert_eq!(cond["rrf_k"], p.rrf_k, "{v}");
+        assert_eq!(cond["bm25_heading_weight"], p.bm25_heading_weight, "{v}");
+        assert_eq!(cond["bm25_context_weight"], p.bm25_context_weight, "{v}");
+        assert_eq!(cond["bm25_content_weight"], p.bm25_content_weight, "{v}");
+        let snippet = v["verdict"]["toml_snippet"]
+            .as_str()
+            .expect("adopt must carry a snippet");
+        assert!(snippet.contains("[search.fusion]"), "{snippet}");
+        // The snippet is only useful if it round-trips into a valid config.
+        let cfg: crate::config::Config =
+            toml::from_str(snippet).expect("snippet must be valid toml");
+        assert!(cfg.validate().is_ok(), "snippet must pass validate()");
+        assert_eq!(
+            crate::db::FusionParams::from(&cfg.search.unwrap().fusion),
+            winner.to_params()
+        );
+    }
+
+    /// `non_degradation`'s violation branch: a candidate can win on the primary
+    /// metric while a secondary one falls below baseline, and that must block
+    /// adoption. No test reached this — `"secondary metrics degraded"` appeared
+    /// only in the source.
+    #[test]
+    fn test_decide_keeps_default_when_a_secondary_metric_degrades() {
+        let cand = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        // Primary rises to ~0.50 against a 0.20 baseline; recall and MRR drop
+        // under it. Adoption on the primary alone would be the bug.
+        let (table, idx) = table_with_secondary_drop(cand, 0.05);
+        let (ok, violations) = non_degradation(&table, cand, &idx);
+        assert!(!ok, "a secondary drop must count as a violation");
+        assert!(
+            violations.iter().any(|v| v.starts_with("recall@")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.starts_with("MRR")),
+            "{violations:?}"
+        );
+
+        let outcome = nested_loo(&table, &idx);
+        match decide(&table, &outcome, &idx) {
+            Verdict::KeepDefault { reasons } => assert!(
+                reasons
+                    .iter()
+                    .any(|r| r.contains("secondary metrics degraded")),
+                "{reasons:?}"
+            ),
+            other => panic!("a secondary degradation must block adoption, got {other:?}"),
         }
     }
 
