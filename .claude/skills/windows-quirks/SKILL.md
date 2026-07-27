@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Ten field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), or diagnosing "works on Linux, fails on Windows" failures
+description: Eleven field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), backslashes being eaten by nested shell/Python layers so a string continuation silently becomes a `\n` escape, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -136,6 +136,39 @@ open('path','wb').write(b.replace(b'\r\n', b'\n'))
 ```
 
 出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)
+
+## 11. bash heredoc → Python → ソースの多段で backslash が 1 段余計に食われる
+
+**症状**: Rust の文字列継続 (`"...text \` + 改行) を Python の置換で書き込んだのに、ファイルには `\` + 文字 `n` (= `5c 6e`) が入り、**改行エスケープ**になっていた。`cargo check` は通ってしまう (どちらも合法な文字列) ので、**出力を実際に見るまで気付かない** — メッセージ中に改行と 13 個の空白が埋まっていた。
+
+同じ session で、`python -c "... b'\\\\' ..."` が `SyntaxError: unexpected character after line continuation character` になる形でも踏んだ。
+
+**原因**: `Bash` ツール → Git Bash → heredoc / `-c` の引用 → Python の文字列リテラル、と **backslash を解釈する層が複数重なる**。各層が 1 回ずつ食うので、ソースに 1 個残すために何個書けばよいかが状況依存になる。`<<'PY'` で引用しても、`python -c "..."` の二重引用側では効かない。
+
+**正しいやり方**:
+
+1. **Edit / Write ツールで直接書く**。backslash を含むソース片を扱う時はこれ一択
+2. どうしても Python で検査したいなら、**backslash を書かずに済ませる**:
+   ```bash
+   python - <<'PY'
+   BS = chr(92).encode()   # backslash を literal として書かない
+   LF = chr(10).encode()
+   b = open("src/x.rs","rb").read()
+   assert BS not in seg and LF not in seg
+   PY
+   ```
+3. そもそも**文字列継続を使わない**。1 行の長い literal は rustfmt が折らないので、メッセージは 1 行で書けば継続自体が不要
+
+**検証は「コンパイルが通った」で止めない**。生成される文字列そのものをバイトで見る:
+```bash
+python - <<'PY'
+b = open("src/x.rs","rb").read(); i = b.index(b"marker")
+print(" ".join(f"{c:02x}" for c in b[i:i+30]))
+PY
+```
+`5c 0a` なら継続 (改行と次行先頭の空白を食う)、`5c 6e` なら `\n` エスケープ = **別物**。
+
+出典: 2026-07-27 v0.14.0 release session (`install.rs` の案内文言を 2 crate で書き換えた際)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
