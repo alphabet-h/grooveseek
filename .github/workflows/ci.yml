@@ -82,6 +82,17 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      # Nothing else in CI ever enables these features, so everything behind
+      # them — `KbServerShared::for_test`, the admin-endpoint tests in
+      # tests/webui_integration.rs, the reranker benches — was never compiled
+      # by any job and could rot unnoticed. Measured: breaking the gated module
+      # leaves the run above green and fails this one.
+      #
+      # Both runs are needed. The one above is the only thing covering the
+      # `#[cfg(not(feature = "heavy-bench"))]` branches in benches/, which this
+      # one compiles out. Enabling `heavy-bench` only compiles the reranker
+      # benches; running them (a ~2.3 GB download) still takes `cargo bench`.
+      - run: cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 
   fmt:
     name: rustfmt
