@@ -2,7 +2,7 @@
 
 Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP サーバ。
 
-YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.xls` / `.pptx`) をパースし、見出し単位でチャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
+YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) をパースし、見出し単位でチャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
 
 ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`kb-mcp validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。
 
@@ -68,9 +68,10 @@ threshold = 0.3
 # (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .xls / .pptx に
 # オプトイン。空配列 [] は「何もインデックスされない」事故を防ぐため拒否
 # される。現在サポート id: "md" / "txt" / "pdf" (v0.10.0+) / "docx" /
-# "xlsx" / "xls" / "pptx" (v0.11.0+)。全部入り例:
+# "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.13.2 で取り下げ、下記参照)
+# 全部入り例:
 [parsers]
-enabled = ["md", "txt", "pdf", "docx", "xlsx", "xls", "pptx"]
+enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
 
 # ライブ同期ファイルウォッチャ。`kb-mcp serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
@@ -793,7 +794,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   2. OS キャッシュ + `fastembed` (Linux: `~/.cache/fastembed`、macOS: `~/Library/Caches/fastembed`、Windows: `%LOCALAPPDATA%\fastembed`)
   3. CWD 直下の `.fastembed_cache` (最終フォールバック)
 - **インデックス保存先**: SQLite DB は `--kb-path` の**親ディレクトリ**に `.kb-mcp.db` として保存される (例: `--kb-path ./knowledge-base` ならリポジトリルート)
-- **Parser registry**: `[parsers].enabled` に列挙された拡張子のみインデックス対象。既定は `["md"]` (従来デフォルト)、`["md", "txt"]` で `.txt` にオプトイン (タイトルはファイル名派生)、`["md", "pdf"]` (v0.10.0+) で `.pdf` にオプトイン (詳細は下記 PDF インデックスの補足)、`["md", "docx", "xlsx", "xls", "pptx"]` (v0.11.0+) で Office ドキュメントにオプトイン (詳細は下記 Office ドキュメントインデックスの補足)。未知 id (例: `"rst"` / `"adoc"`) は起動時に拒否、空配列も「何もインデックスされない」事故防止のため拒否
+- **Parser registry**: `[parsers].enabled` に列挙された拡張子のみインデックス対象。既定は `["md"]` (従来デフォルト)、`["md", "txt"]` で `.txt` にオプトイン (タイトルはファイル名派生)、`["md", "pdf"]` (v0.10.0+) で `.pdf` にオプトイン (詳細は下記 PDF インデックスの補足)、`["md", "docx", "xlsx", "pptx"]` (v0.11.0+) で Office ドキュメントにオプトイン (詳細は下記 Office ドキュメントインデックスの補足)。未知 id (例: `"rst"` / `"adoc"`) は起動時に拒否、空配列も「何もインデックスされない」事故防止のため拒否
 - **PDF インデックス (v0.10.0+)**: `[parsers].enabled = ["md", "pdf"]` でオプトイン。[oxidize-pdf](https://crates.io/crates/oxidize-pdf) (純 Rust) でページ単位にテキストを抽出し、空でない各ページが見出し `p.N` の 1 チャンクになる。PDF の `Title` / `CreationDate` メタデータがあれば frontmatter に反映、`Title` が無ければファイル名派生タイトルに fallback する。暗号化 PDF は warning 付きで skip (パスワード対応なし)。他のバイナリ形式と同様、`.pdf` にも 50 MiB の生バイト上限が適用され、超過分は実行全体を abort せず warning 付き skip になる。既知の制限:
   - **OCR 非対応**: スキャン / 画像のみの PDF (text layer なし。抽出文字数の平均が 50 chars/page 未満で判定) は warning 付きで skip され、一切インデックスされない
   - **多段組レイアウトの reading order 乱れ**: 抽出順は PDF 内部のテキスト描画順に従うため、複雑な多段組レイアウト (スライド資料等) では列が入り交じることがある。単一段組の文書は影響を受けない
@@ -801,20 +802,21 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   - **ハイフン結合は保守的なヒューリスティック**: 行末の `-\n` は、`-` の直前と `\n` の直後がともに ASCII 小文字の場合のみ結合する (型番・日付・CJK に隣接するハイフンを誤って壊さないため)。この結果、本来結合すべき単語分断が結合されない、あるいは偶然の小文字-小文字の並びを誤って結合してしまうケースが稀にある
 
   実際の日本語 PDF での dogfood (2026-07-19) で発見した `oxidize-pdf` の癖には対処済み: `/Title` が PDF 仕様の UTF-16BE 文字列形式 (非 ASCII タイトルで一般的) の場合、この依存クレートは byte-order-mark を検出できず 1 byte ずつ mis-decode して文字化けを生む。kb-mcp はこの mis-decode パターンを検知して元のタイトルに復元する。復元できない (あるいは復元結果もなお不自然な) 場合は文字化けをそのまま出さず filename fallback に倒す。抽出されたページ本文 (`content`) はそもそもこの問題の影響を受けていない — 化けるのは `title` フィールドのみだった
-- **Office ドキュメントインデックス (v0.11.0+)**: `[parsers].enabled = [..., "docx", "xlsx", "xls", "pptx"]` でオプトイン。各形式とも自前実装 (LibreOffice / MS Office への依存なし):
+- **Office ドキュメントインデックス (v0.11.0+)**: `[parsers].enabled = [..., "docx", "xlsx", "pptx"]` でオプトイン。各形式とも自前実装 (LibreOffice / MS Office への依存なし):
 
   | 拡張子 | ライブラリ | チャンク粒度 | frontmatter 由来 |
   |---|---|---|---|
   | `.docx` | zip + [quick-xml](https://crates.io/crates/quick-xml) | Markdown と同じ規則の見出し階層セクション (`Heading1`〜`Heading6` 段落スタイルがセクション境界) | `docProps/core.xml` (Dublin Core: title / created / keywords) |
   | `.xlsx` | [calamine](https://crates.io/crates/calamine) | 空でないシートごとに 1 チャンク (見出し `Sheet: <name>`)、シートあたり 1 MiB で truncate (行単位境界 — cap 超過を招いた行はそのまま保持してから打ち切り) | `docProps/core.xml` |
-  | `.xls` (legacy BIFF) | calamine | `.xlsx` と同じ | なし — OOXML 以前の `.xls` には `docProps/core.xml` が存在しないため、タイトルは常にファイル名派生 |
   | `.pptx` | zip + quick-xml | スライドごとに 1 チャンク (見出し `Slide N: <title>`、title placeholder が無ければ `Slide N`)、発表者ノートは末尾 `[notes]` セクションとしてスライドの `.rels` 関係を解決して付加 (同番号ファイルの推測はしない = notes の誤帰属を避ける) | `docProps/core.xml` |
 
   既知の制限:
-  - **legacy バイナリ形式は非対応**: 2007 年以前の `.doc` (Word) / `.ppt` (PowerPoint) は非対応 — 対応するのは上記の OOXML 形式 (`.docx` / `.pptx`) と OOXML/BIFF 形式 (`.xlsx` / `.xls`) のみ
+  - **legacy バイナリ形式は非対応**: 2007 年以前の `.doc` (Word) / `.ppt` (PowerPoint) / `.xls` (Excel) は非対応 — 対応するのは上記の OOXML 形式 (`.docx` / `.pptx` / `.xlsx`) のみ
+
+    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.13.2 で取り下げた。calamine は workbook を開く時点で、kb-mcp に制御が戻る前に全シート分の密なセル格子を確保する。BIFF が縛るのは**シート 1 枚** (65,536 × 256 = セル 512 MB 相当) であって **workbook ではない**: 対角 2 セルのレコードだけでシートを最大矩形にできるので、小さな細工ファイルで十分な数のシートを宣言すればメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと、起動時にこの理由付きで拒否される。`.xlsx` に変換すれば streaming で読める
   - **OpenDocument 形式は非対応**: `.odt` / `.ods` / `.odp` は非対応
   - **パスワード保護ファイルは復号ではなく skip**: 暗号化された Office ファイルは (zip / BIFF コンテナが開けないことで) 検出され、実行全体を失敗させず warning 付きで skip される — パスワード対応なし
-  - **表構造は plain text 化される**: `.docx` / `.pptx` の表セルは通常のテキストとして読み取られる (行/列構造はチャンク内に保持されない)。`.xlsx` / `.xls` の行は 1 行ごとにタブ区切りで連結される。下流の検索が見るのはグリッドではなく地の文
+  - **表構造は plain text 化される**: `.docx` / `.pptx` の表セルは通常のテキストとして読み取られる (行/列構造はチャンク内に保持されない)。`.xlsx` の行は 1 行ごとにタブ区切りで連結される。下流の検索が見るのはグリッドではなく地の文
 
   `.pdf` と同様、この 4 形式も 50 MiB の生バイト上限 (`MAX_RAW_BINARY_BYTES`) を indexer の size-skip guard と `get_document` の両方で共有する。
 - **ライブ同期ウォッチャ**: `kb-mcp serve` は `notify` ベースの watcher を既定 spawn (`[watch].enabled = true`、500ms debounce)。手動 save / `git pull` / 外部スクリプトを MCP ツールと同じ Mutex 付きリソース上で増分再インデックスするため、同時トリガは直列化される。`--no-watch` / `[watch].enabled = false` で無効化

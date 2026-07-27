@@ -4,6 +4,23 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Removed
+
+- **`.xls` (legacy BIFF) is no longer indexed** (AU-06). Listing `"xls"` in
+  `[parsers].enabled` now fails at startup with an explanation instead of
+  registering the parser. calamine builds one dense cell grid per sheet while
+  opening a workbook, before kb-mcp regains control, and BIFF bounds a *sheet*
+  at 65,536 × 256 — 512 MB of cells — but places no bound on a *workbook*. Two
+  cell records at opposite corners make a sheet maximal, so a small crafted
+  file can declare enough sheets to exhaust memory; an allocation failure
+  aborts the process rather than skipping the file, so neither the per-file
+  skip nor the panic guard helps. Bounding it means reading BOUNDSHEET and
+  DIMENSIONS out of the CFB container before calamine opens the file, which is
+  a new dependency and a BIFF record walker — deferred until someone asks for
+  `.xls`. Convert affected workbooks to `.xlsx`, which is read as a stream.
+  The earlier claim in the source that BIFF's sheet limit made a dense grid
+  safe was wrong: it bounds a sheet, not a workbook.
+
 ### Fixed
 
 - **PDF text extraction had no ceiling on how much it would produce**

@@ -2,7 +2,7 @@
 
 MCP server for semantic search over a Markdown / plain-text knowledge base.
 
-Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.xls` / `.pptx`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
+Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
 A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `kb-mcp validate`.
 
@@ -69,9 +69,10 @@ threshold = 0.3
 # via an explicit list. An empty array is rejected to prevent silent
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
-# "xls", "pptx" (v0.11.0+). Example enabling everything:
+# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.13.2 — see below.)
+# Example enabling everything:
 [parsers]
-enabled = ["md", "txt", "pdf", "docx", "xlsx", "xls", "pptx"]
+enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
 
 # Live-sync file watcher. When `kb-mcp serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally
@@ -795,7 +796,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   2. OS cache dir joined with `fastembed` (Linux: `~/.cache/fastembed`, macOS: `~/Library/Caches/fastembed`, Windows: `%LOCALAPPDATA%\fastembed`).
   3. `.fastembed_cache` under the current working directory (final fallback).
 - **Index storage**: The SQLite database is stored as `.kb-mcp.db` in the **parent** directory of the `--kb-path` (i.e. the repository root when `--kb-path` points to `knowledge-base/`).
-- **Parser registry**: only file extensions listed in `[parsers].enabled` are indexed. The section defaults to `["md"]` (the default behavior); `["md", "txt"]` opts into `.txt` where the title is derived from the filename, `["md", "pdf"]` (v0.10.0+) opts into `.pdf` (see the PDF indexing note below), and `["md", "docx", "xlsx", "xls", "pptx"]` (v0.11.0+) opts into Office documents (see the Office document indexing note below). Unknown ids (e.g. `"rst"` / `"adoc"`) are rejected at startup; an empty array is also rejected to avoid silent "nothing is indexed" failures.
+- **Parser registry**: only file extensions listed in `[parsers].enabled` are indexed. The section defaults to `["md"]` (the default behavior); `["md", "txt"]` opts into `.txt` where the title is derived from the filename, `["md", "pdf"]` (v0.10.0+) opts into `.pdf` (see the PDF indexing note below), and `["md", "docx", "xlsx", "pptx"]` (v0.11.0+) opts into Office documents (see the Office document indexing note below). Unknown ids (e.g. `"rst"` / `"adoc"`) are rejected at startup; an empty array is also rejected to avoid silent "nothing is indexed" failures.
 - **PDF indexing (v0.10.0+)**: opt-in via `[parsers].enabled = ["md", "pdf"]`. Text is extracted page-by-page with [oxidize-pdf](https://crates.io/crates/oxidize-pdf) (pure Rust); each non-empty page becomes one chunk with heading `p.N`. `Title` / `CreationDate` PDF metadata become frontmatter when present, falling back to a filename-derived title when the PDF has no `Title`. Encrypted PDFs are skipped with a warning (no password support). Like other binary formats, `.pdf` files are subject to the 50 MiB raw-byte size cap — larger files are skipped with a warning instead of aborting the run. Known limitations:
   - **No OCR**: scanned / image-only PDFs (no text layer) are detected — average extracted text below 50 chars/page — and skipped with a warning; they are never indexed.
   - **Reading order on multi-column layouts**: extraction follows the PDF's internal text-drawing order, which can interleave columns on complex multi-column layouts (e.g. slide decks). Single-column documents are unaffected.
@@ -803,20 +804,21 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   - **Hyphenation join is a conservative heuristic**: a line-end `-\n` is joined only when the character before `-` and the character after `\n` are both ASCII lowercase letters (to avoid corrupting hyphenated model numbers, dates, or CJK-adjacent hyphens). This occasionally leaves a genuine word break unjoined, or joins a coincidental lowercase-lowercase pair that wasn't actually a hyphenation.
 
   kb-mcp also works around a `oxidize-pdf` quirk found while dogfooding a real Japanese PDF (2026-07-19): when a PDF's `/Title` uses the PDF spec's UTF-16BE string form (common for non-ASCII titles), the dependency doesn't detect the byte-order-mark and mis-decodes the string one byte at a time, producing mojibake. kb-mcp detects this specific mis-decode pattern and reverses it to recover the original title; if recovery isn't possible (or the recovered text still looks like garbage) the filename fallback kicks in instead of surfacing mojibake. Extracted page `content` was never affected by this — only the `title` field.
-- **Office document indexing (v0.11.0+)**: opt-in via `[parsers].enabled = [..., "docx", "xlsx", "xls", "pptx"]`. Each format is parsed in-tree (no LibreOffice / MS Office dependency):
+- **Office document indexing (v0.11.0+)**: opt-in via `[parsers].enabled = [..., "docx", "xlsx", "pptx"]`. Each format is parsed in-tree (no LibreOffice / MS Office dependency):
 
   | Extension | Library | Chunk granularity | Frontmatter source |
   |---|---|---|---|
   | `.docx` | zip + [quick-xml](https://crates.io/crates/quick-xml) | Heading-hierarchy sections, same rule as Markdown (`Heading1`–`Heading6` paragraph styles are section boundaries) | `docProps/core.xml` (Dublin Core: title / created / keywords) |
   | `.xlsx` | [calamine](https://crates.io/crates/calamine) | 1 chunk per non-empty sheet (heading `Sheet: <name>`), truncated at 1 MiB per sheet (row-aligned — a row that pushes the sheet past the cap is kept whole, then extraction stops) | `docProps/core.xml` |
-  | `.xls` (legacy BIFF) | calamine | Same as `.xlsx` | none — pre-OOXML `.xls` predates `docProps/core.xml`, so the title always falls back to the filename |
   | `.pptx` | zip + quick-xml | 1 chunk per slide (heading `Slide N: <title>`, or `Slide N` when the slide has no title placeholder), with speaker notes appended as a trailing `[notes]` section resolved via the slide's `.rels` relationship (no same-numbered-file guessing, to avoid misattributing notes to the wrong slide) | `docProps/core.xml` |
 
   Known limitations:
-  - **No legacy binary formats**: pre-2007 `.doc` (Word) and `.ppt` (PowerPoint) are not supported — only the OOXML forms (`.docx` / `.pptx`) and the OOXML/BIFF forms (`.xlsx` / `.xls`) above.
+  - **No legacy binary formats**: pre-2007 `.doc` (Word), `.ppt` (PowerPoint) and `.xls` (Excel) are not supported — only the OOXML forms (`.docx` / `.pptx` / `.xlsx`) above.
+
+    `.xls` was indexed between v0.11.0 and v0.13.1 and was withdrawn in v0.13.2. calamine materialises one dense cell grid per sheet while opening a workbook, before kb-mcp regains control. BIFF bounds a *sheet* at 65,536 x 256 (512 MB worth of cells), but it does not bound a *workbook*: two cell records at opposite corners make a sheet maximal, so a small crafted file can declare enough sheets to exhaust memory — and an allocation failure aborts the process rather than skipping the file. Listing `"xls"` in `[parsers].enabled` is now rejected at startup with that explanation. Convert the workbook to `.xlsx`, which is read as a stream.
   - **No OpenDocument formats**: `.odt` / `.ods` / `.odp` are not supported.
   - **Password-protected files are skipped, not decrypted**: an encrypted Office file is detected (the zip / BIFF container fails to open) and skipped with a warning instead of failing the whole `index` run — there is no password support.
-  - **Tables are flattened to plain text**: `.docx` and `.pptx` table cells are read as ordinary text runs (no row/column structure preserved in the chunk); `.xlsx` / `.xls` rows are tab-joined per line. Downstream retrieval sees prose, not a grid.
+  - **Tables are flattened to plain text**: `.docx` and `.pptx` table cells are read as ordinary text runs (no row/column structure preserved in the chunk); `.xlsx` rows are tab-joined per line. Downstream retrieval sees prose, not a grid.
 
   Like `.pdf`, all four formats share the 50 MiB raw-byte size cap (`MAX_RAW_BINARY_BYTES`) with the indexer's size-skip guard and `get_document`.
 - **Live-sync file watcher**: `kb-mcp serve` spawns a `notify`-based watcher by default (`[watch].enabled = true`, 500 ms debounce). Manual saves, `git pull`, and external scripts are re-indexed incrementally on the same Mutex-guarded resources used by MCP tools, so concurrent triggers are serialized. Disable with `--no-watch` or `[watch].enabled = false`.

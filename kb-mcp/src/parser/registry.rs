@@ -3,9 +3,9 @@
 
 use anyhow::Result;
 
-use super::{
-    DocxParser, MarkdownParser, Parser, PdfParser, PptxParser, TxtParser, XlsParser, XlsxParser,
-};
+// `XlsParser` はここでは import しない: AU-06 で registry から外したため
+// (型そのものは `parser::XlsParser` として残っており、その unit test も残る)。
+use super::{DocxParser, MarkdownParser, Parser, PdfParser, PptxParser, TxtParser, XlsxParser};
 
 pub struct Registry {
     parsers: Vec<Box<dyn Parser>>,
@@ -31,12 +31,22 @@ impl Registry {
                 "txt" => Box::new(TxtParser),
                 "pdf" => Box::new(PdfParser),
                 "xlsx" => Box::new(XlsxParser),
-                "xls" => Box::new(XlsParser),
+                // AU-06: `.xls` は無効。`XlsParser` 自体は残してあるが、
+                // ここで registry に載せない = indexing から到達しない。
+                "xls" => anyhow::bail!(
+                    "[parsers].enabled contains \"xls\", which this build does not index. \
+                     Reading a .xls workbook makes calamine materialise one dense cell grid \
+                     per sheet before kb-mcp regains control, and the BIFF format bounds a \
+                     sheet (65536 x 256 = 512 MB) but not a workbook — a small crafted file \
+                     can declare enough sheets to exhaust memory, and an allocation failure \
+                     aborts the process rather than skipping the file. Convert the workbook \
+                     to .xlsx, which is read as a stream."
+                ),
                 "docx" => Box::new(DocxParser),
                 "pptx" => Box::new(PptxParser),
                 other => anyhow::bail!(
                     "[parsers].enabled contains unknown id {:?} — \
-                     supported in this build: md, txt, pdf, docx, xlsx, xls, pptx",
+                     supported in this build: md, txt, pdf, docx, xlsx, pptx",
                     other
                 ),
             };
@@ -134,6 +144,44 @@ mod tests {
         assert!(r.by_extension("TXT").is_some());
     }
 
+    /// AU-06: `.xls` は registry に載せない。既に `enabled` に書いていた人が
+    /// 黙って無視されるのではなく、理由と代替 (xlsx への変換) を読めること。
+    #[test]
+    fn from_enabled_refuses_xls_with_a_reason() {
+        let err = Registry::from_enabled(&["md".into(), "xls".into()])
+            .expect_err("xls must not be indexable in this build");
+        let msg = err.to_string();
+        assert!(msg.contains("xls"), "should name the id: {msg}");
+        assert!(
+            msg.contains(".xlsx"),
+            "should point at the supported alternative: {msg}"
+        );
+    }
+
+    /// `xls` は「未知の id」ではないので、未知 id の一覧にも載らない。
+    #[test]
+    fn the_supported_id_list_no_longer_advertises_xls() {
+        let err = Registry::from_enabled(&["rst".into()]).expect_err("unknown id must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown id"), "unexpected message: {msg}");
+        // `contains("xls")` は "xlsx" にも一致するので、id を単体の語として見る。
+        let listed: Vec<&str> = msg
+            .rsplit_once("supported in this build: ")
+            .expect("message should list the supported ids")
+            .1
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert!(
+            !listed.contains(&"xls"),
+            "supported list should not advertise xls: {listed:?}"
+        );
+        assert!(
+            listed.contains(&"xlsx"),
+            "xlsx is still supported: {listed:?}"
+        );
+    }
+
     #[test]
     fn test_from_enabled_rejects_empty() {
         let err = Registry::from_enabled(&[]).expect_err("empty must fail");
@@ -171,15 +219,20 @@ mod tests {
 
     #[test]
     fn test_from_enabled_registers_office_formats_as_binary() {
-        // feature-45 PR-3: xlsx/xls/docx/pptx は全て is_binary=true。
-        let ids = ["xlsx", "xls", "docx", "pptx"].map(String::from);
+        // feature-45 PR-3: xlsx/docx/pptx は全て is_binary=true。
+        //
+        // AU-06 (2026-07-27) で `xls` を registry から外したため、本 test の
+        // 入力と期待値から `xls` を除いた。テストの意図 (Office 系は
+        // is_binary=true として登録される) は変えていない。`xls` が拒否される
+        // ことは `from_enabled_refuses_xls_with_a_reason` が別途固定する。
+        let ids = ["xlsx", "docx", "pptx"].map(String::from);
         let r = Registry::from_enabled(&ids).unwrap();
-        for ext in ["xlsx", "xls", "docx", "pptx"] {
+        for ext in ["xlsx", "docx", "pptx"] {
             assert!(r.by_extension(ext).is_some(), "{ext} must be registered");
         }
         let mut binary_exts = r.binary_extensions();
         binary_exts.sort_unstable();
-        assert_eq!(binary_exts, vec!["docx", "pptx", "xls", "xlsx"]);
+        assert_eq!(binary_exts, vec!["docx", "pptx", "xlsx"]);
     }
 
     /// Regression (full-audit 2026-07-26 AU-02): `has_extension` だけが

@@ -241,11 +241,44 @@ fn flush_xlsx_row(text: &mut String, row_cells: &[String]) {
 
 /// xls (BIFF、非 zip container) の抽出本体。
 ///
-/// codex P1 (PR #70 round 6): xls には streaming cell reader が無く (calamine
-/// は open 時に workbook 全体を eager parse する)、BIFF フォーマット自体が
-/// 65536 行 × 256 列 (Excel 97-2003 の仕様上限) に有界なため、dense Range
-/// を作っても xlsx のような無制限 OOM のリスクが無い。よって xlsx のみ
-/// streaming 化し、xls は従来通り `worksheet_range()` (dense Range) を使う。
+/// **この経路は現在 registry から到達しない** (AU-06)。`Registry::from_enabled`
+/// が `"xls"` を拒否するので、`.xls` は index されない。型とテストは
+/// pre-check を実装したときに戻せるよう残してある。
+///
+/// # なぜ無効にしたか
+///
+/// 旧コメントはこう書いていた:
+///
+/// > BIFF フォーマット自体が 65536 行 × 256 列 (Excel 97-2003 の仕様上限) に
+/// > 有界なため、dense Range を作っても xlsx のような無制限 OOM のリスクが無い
+///
+/// **これは誤り**。BIFF が縛るのは **シート 1 枚**であって workbook ではない。
+/// calamine の `Xls` は `sheets: BTreeMap<String, SheetData>` に全シートを
+/// 同時に保持し、`Xls::new()` の中で各シートについて `Range::from_sparse()` を
+/// 呼ぶ。`from_sparse` は実セル位置の bounding rectangle を求めて
+/// `vec![Data::default(); rows * cols]` を **密に**確保する。
+///
+/// 実測 (2026-07-27):
+///
+/// | 項目 | 値 |
+/// |---|---|
+/// | `size_of::<calamine::Data>()` | 32 B |
+/// | シート 1 枚の上限 (65536 × 256) | 16,777,216 セル = **512 MB** |
+/// | `worksheet_range()` は既存 Range を clone | ピーク **1 GB** / シート |
+/// | workbook の上限 | **無し** (シート数 × 512 MB) |
+///
+/// 対角 2 セル分のレコード (数十バイト) で 1 シートを最大矩形にできるので、
+/// 小さなファイルで数十万シートを宣言でき、割り当ては RAM を超える。
+/// **割り当て失敗は catch できずプロセスが落ちる** (AU-01 と同じ性質) ので、
+/// per-file skip (AU-21) でも救えない。
+///
+/// # なぜ pre-check を入れなかったか
+///
+/// 密な確保は `Xls::new()` の内側で完了しており、`worksheet_range()` に
+/// 到達した時点では既に払い終わっている。手前で測るには `Xls::new()` の
+/// **前に** 自前で CFB (OLE2) を辿り BOUNDSHEET / DIMENSIONS を読む必要があり、
+/// 新規依存 (`cfb`) と BIFF レコード走査の実装を伴う。`.xls` はレガシー形式で
+/// 要望も出ていないため、要望が出た時点で実装する判断にした (2026-07-27)。
 fn parse_xls_bytes_capped(
     bytes: &[u8],
     path_hint: &str,
