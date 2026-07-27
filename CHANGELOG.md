@@ -32,6 +32,16 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   happens first: a rejected config leaves no database behind and downloads
   no model.
 
+  `kb-mcp serve` now says so when the index still holds documents whose
+  extension `[parsers].enabled` no longer covers. Those rows are pruned by
+  the next `kb-mcp index`, but `serve` does not index, so an installation
+  that only ever runs the server keeps them — and they surface as hits that
+  search returns and `get_document` then refuses, the same "findable but not
+  openable" shape as AU-02. The warning names the count and an example and
+  points at `kb-mcp index`; it does not delete anything, because a narrowed
+  `enabled` list is often temporary and silently dropping rows at every
+  startup would be worse than the confusion it prevents.
+
 ### Fixed
 
 - **PDF text extraction had no ceiling on how much it would produce**
