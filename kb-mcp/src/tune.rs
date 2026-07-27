@@ -13,7 +13,8 @@
 //! - grid は「query embedding 一括 → vec 候補 query あたり 1 回 → FTS 候補
 //!   bm25 条件ごと 1 回 → rrf_k はメモリ内」の 4 層に因数分解される
 //! - 小 golden set の argmax は overfit するので、nested leave-one-query-out
-//!   CV + paired SE + sign test + selection stability で採否を判定する
+//!   CV + paired SE + selection stability + 副指標の非悪化で採否を判定する
+//!   (sign test も算出して report に載せるが、`decide` は参照しない)
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -578,9 +579,87 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// paired per-query 差分から求める標準誤差 `SD({d_j}) / sqrt(N)` (D-11-2)。
 ///
 /// **fold 平均の分散を SE と呼んではならない** — fold 平均は d_j のアフィン
-/// 変換なので SD が 1/(N−1) に縮み、有意判定が壊れる。fold が query を共有
-/// するため厳密には i.i.d. でない近似値だが、保守側 (過小評価しない) に働く。
+/// 変換なので SD が 1/(N−1) に縮み、有意判定が壊れる。
 /// N < 2 は判定不能として無限大を返し、採用条件を必ず落とす。
+///
+/// ## この SE は保守側ではない (2026-07-27 実測、AU-16)
+///
+/// 以前ここには「fold が query を共有するため厳密には i.i.d. でないが、
+/// **保守側 (過小評価しない)** に働く」と書いてあった。**逆だった**。
+///
+/// `SD/sqrt(N)` は d_j の独立を仮定する。LOO の N 個の選択は互いに N−2 個の
+/// query を共有するので **fold ごとに違う条件を選び得る**が、これは相関を
+/// 可能にするだけで**保証はしない**。
+///
+/// ただし「fold が一致すれば独立」も**言い過ぎ**。一致していても、その条件の
+/// **正体は共有された訓練行から選ばれた確率変数**なので、全 d_j がそれを通じて
+/// 結びつく。d_j が各自の held-out 行だけに依存すると言えるのは、**選択条件が
+/// golden set の抽出をまたいで実質固定されている**場合であって、fold 内一致とは
+/// 別の条件である。
+///
+/// そこで**測った**。測る対象は `refit` ではなく **fold の選択** — `refit` は全 N 行
+/// から選ばれるが、各 `d_j` を生むのは `fold_selections[j]` (その fold の N−1 行から
+/// 選ばれたもの) なので、refit が全 replication で同一でも fold 側は割れ得る。
+/// 実際に両方数えると乖離がある (114 対 64 など)。
+///
+/// **静かな設定は fold 選択が 1 種類** — 300 replication × 26 fold = 7,800 回の選択が
+/// すべて同一条件、つまり実質固定であり、そこだけ比が 1.027。騒がしい 3 設定は
+/// 114〜184 種類に散っており、選択そのものがばらつく入力になっている。
+///
+/// 既知の golden set を多数生成して「報告される SE」と「mean delta の真の
+/// ばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
+/// 300 反復 × 4 設定):
+///
+/// | N | 真の優位幅 | セル分散 | 全 rep | stability gate 通過分 | fold 選択の種類 |
+/// |---|---|---|---|---|---|
+/// | 26 | 0.04 | 0.08 | 0.533 | 0.619 (265/300) | 114 |
+/// | 26 | 0.00 | 0.08 | 0.547 | 0.644 (239/300) | 184 |
+/// | 12 | 0.04 | 0.08 | 0.601 | 0.733 (192/300) | 152 |
+/// | 26 | 0.04 | 0.03 | **1.027** | 1.027 (300/300) | **1** |
+///
+/// 比は **replication 群に対する量** (mean delta のばらつきが要る) なので単一 run
+/// では出せない。したがって「平均 stability が 0.84 だから gate を通る run でも
+/// 1.9 倍過小」とは**言えない** — 平均 stability と比は同じ集合に対する別々の
+/// 集計にすぎない。上表右列は `stability > STABILITY_MIN` を満たす replication
+/// **だけ**で比を取り直したもので、`decide` が採用し得るのはこの部分集合だけ。
+///
+/// 読み取れること:
+///
+/// - **stability gate は緩和するが埋めない**。0.533 → 0.619 のように上がるが、
+///   gate を通った replication でも SE はなお 1.4〜1.6 倍過小
+/// - **稀な隅ではない**。300 rep 中 192〜300 が gate を通っている
+/// - **測った 4 設定のうち、比が 1 付近だったのは最終行の 1 つだけ**で、そこは
+///   fold 内一致に加えて **replication をまたいでも fold 選択が 1 種類**だった。
+///   「選択のばらつきが相関の源」という機構と整合はするが、**4 設定・実質固定は
+///   1 つ**なので、これは連関の
+///   観測であって「一致した時に限り較正される」ことの証明ではない。部分的にしか
+///   一致しない設定でも比が 1 に近づく可能性は未検証
+///
+/// ### 帰結は sigma 換算ではなく棄却率で測る
+///
+/// 「SE が 0.55 倍なので実効 1.1 sigma」と書くのは**誤り**だった。`se` は
+/// replication ごとに変動し `mean_delta` と相関し得るので、平均の比から gate の
+/// 発火確率は決まらない。検定の水準は**棄却率そのもの**で測る:
+///
+/// | 設定 | `m > 2*se` 発火 | `decide` が Adopt |
+/// |---|---|---|
+/// | N=26 edge=0.04 sd=0.08 | 35.0% | 35.0% |
+/// | **N=26 edge=0.00 sd=0.08 (null)** | **12.7%** | **12.7%** |
+/// | N=12 edge=0.04 sd=0.08 | 20.3% | 20.0% |
+/// | N=26 edge=0.04 sd=0.03 | 99.7% | 99.0% |
+///
+/// **真の優位差が無いのに 12.7% で採用が出る**。較正された片側 2 sigma なら
+/// 約 2.3% なので、およそ 5.5 倍の誤採用率にあたる。係数を上げるかは採用挙動の
+/// 変更なのでここでは行っていない。
+///
+/// 上表では `decide` の Adopt 率が SE gate の発火率とほぼ一致しており、この
+/// **シミュレーション上では**他の gate がほとんど追加で効いていない。ただし
+/// `table_from_primary` は nDCG / recall / MRR に同じ値を書くため
+/// `non_degradation` が緩くなる等、合成データ側の性質でもある。実データで他の
+/// gate がどれだけ効くかは、これでは分からない。
+///
+/// **sign test は `TuneReport` に出るだけで `decide` は参照しない**ので、
+/// 緩和材料として数えてはならない。
 pub fn paired_se(diffs: &[f64]) -> f64 {
     if diffs.len() < 2 {
         return f64::INFINITY;
@@ -2191,6 +2270,198 @@ mod tests {
         // 不偏 SD (分母 n-1): [1,2,3] -> sqrt(1.0) == 1.0
         assert!((sample_sd(&[1.0, 2.0, 3.0]) - 1.0).abs() < 1e-12);
         assert_eq!(sample_sd(&[5.0]), 0.0);
+    }
+
+    /// Deterministic LCG + Box-Muller, so the simulation below is reproducible
+    /// and needs no new dependency (the project does not pull `rand` in).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            // Numerical Recipes constants.
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+        fn unit(&mut self) -> f64 {
+            // (0, 1], avoiding 0 so ln() stays finite.
+            ((self.next_u64() >> 11) as f64 + 1.0) / ((1u64 << 53) as f64)
+        }
+        fn normal(&mut self) -> f64 {
+            let (u1, u2) = (self.unit(), self.unit());
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    /// Does `paired_se` over-state or under-state the true standard error of
+    /// the LOO mean delta? (AU-16)
+    ///
+    /// The doc comment on `paired_se` used to assert the estimate "errs
+    /// conservatively (does not underestimate)" despite the folds sharing
+    /// queries. That is an empirical claim about this estimator, so it is
+    /// measured rather than argued: draw many independent golden sets from a
+    /// known process, and compare
+    ///
+    /// - the **reported** SE, averaged over replications, with
+    /// - the **true** SE, i.e. the spread of the mean delta across those
+    ///   replications.
+    ///
+    /// A ratio below 1 means the reported SE is smaller than the real one, so
+    /// the adoption gate `mean_delta > ADOPT_SE_MULTIPLIER * se` fires more
+    /// easily than intended — the opposite of conservative.
+    ///
+    /// `#[ignore]`: a few hundred replications of a 26-query nested LOO over
+    /// the full condition grid is far too slow for the default suite.
+    #[test]
+    #[ignore = "simulation; run with: cargo test --lib au16 -- --ignored --nocapture"]
+    fn au16_paired_se_versus_the_true_standard_error() {
+        const REPS: usize = 300;
+
+        // Several settings, so the direction is not an artifact of one choice
+        // of sizes, effect size or noise level.
+        let settings: [(usize, f64, f64, f64, u64); 4] = [
+            //  N,  true edge, per-query sd, per-cell sd, seed
+            (26, 0.04, 0.05, 0.08, 0x5EED_0001),
+            (26, 0.00, 0.05, 0.08, 0x5EED_0002), // no real winner at all
+            (12, 0.04, 0.05, 0.08, 0x5EED_0003),
+            (26, 0.04, 0.05, 0.03, 0x5EED_0004), // quieter cells
+        ];
+
+        // `k` must be the built-in value (codex P2 round 1). `select_condition`
+        // runs in two phases: phase W scans the weight tuples with `k` pinned to
+        // the default, and only then does phase K sweep `k` for the tuple it
+        // chose. A winner at some other `k` is therefore invisible while the
+        // weights are being picked, so the edge would only ever be reached in
+        // the replications where noise happened to select that tuple anyway —
+        // which quietly turns every "true edge" setting back into the null one.
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        eprintln!("AU-16 simulation ({REPS} replications per setting)");
+        for (n, edge, q_sd, cell_sd, seed) in settings {
+            let mut rng = Lcg(seed);
+            let mut means = vec![0.40_f64; TOTAL_CONDITIONS];
+            means[winner.index()] = 0.40 + edge;
+
+            let mut mean_deltas = Vec::with_capacity(REPS);
+            let mut reported_ses = Vec::with_capacity(REPS);
+            let mut stabilities: Vec<f64> = Vec::with_capacity(REPS);
+            // How often each gate actually fires. A ratio of averages does not
+            // determine this: `se` varies per replication and can correlate
+            // with the observed `mean_delta`, so "the SE is 0.55x too small"
+            // cannot be turned into a sigma level by arithmetic (codex P2
+            // round 4). The rejection rate is the thing itself.
+            let mut se_gate_fired = 0usize;
+            let mut adopted = 0usize;
+            // Which condition the refit picked, per replication. Fold agreement
+            // *within* a replication does not by itself make the d_j
+            // independent: the agreed condition is still chosen from the shared
+            // training rows, so it is a random input every difference depends
+            // on. What would remove that coupling is the selection being
+            // effectively fixed *across* sampled golden sets — which is a
+            // separate thing, and was being asserted rather than recorded
+            // (codex P2 round 6). Recording it.
+            // Record the *fold* selections, not `refit` (codex P2 round 7).
+            // `refit` is chosen from all N rows; every `d_j` is generated from
+            // `fold_selections[j]`, chosen from that fold's N-1 rows. A setting
+            // can have one identical refit across all replications while the
+            // fold selections still vary, so `refit` cannot answer whether the
+            // selection generating the differences was fixed.
+            let mut fold_picks: std::collections::HashSet<Condition> =
+                std::collections::HashSet::new();
+            let mut refits: std::collections::HashSet<Condition> = std::collections::HashSet::new();
+            for _ in 0..REPS {
+                let rows: Vec<Vec<f64>> = (0..n)
+                    .map(|_| {
+                        let per_query = q_sd * rng.normal(); // query difficulty
+                        means
+                            .iter()
+                            .map(|m| m + per_query + cell_sd * rng.normal())
+                            .collect()
+                    })
+                    .collect();
+                let table = table_from_primary(rows);
+                let idx: Vec<usize> = (0..n).collect();
+                let out = nested_loo(&table, &idx);
+                let m = mean(&out.diffs);
+                let se = paired_se(&out.diffs);
+                if m > 2.0 * se {
+                    se_gate_fired += 1;
+                }
+                if matches!(decide(&table, &out, &idx), Verdict::Adopt(_)) {
+                    adopted += 1;
+                }
+                refits.insert(out.refit);
+                for c in &out.fold_selections {
+                    fold_picks.insert(*c);
+                }
+                mean_deltas.push(m);
+                reported_ses.push(se);
+                stabilities.push(out.stability);
+            }
+
+            // The ratio is an ensemble quantity: it needs a spread of mean
+            // deltas across replications, so it cannot be computed for a single
+            // run. Reporting it next to `mean(stabilities)` therefore says
+            // nothing about whether the replications *responsible* for the
+            // understatement clear `decide`'s stability gate — the two numbers
+            // are separate aggregates over the same set (codex P2 round 2).
+            //
+            // So stratify: recompute the ratio within the replications that
+            // pass `stability > STABILITY_MIN`, which is the only subset
+            // `decide` can ever adopt from.
+            let ratio_over = |keep: &dyn Fn(usize) -> bool| -> Option<(usize, f64)> {
+                let d: Vec<f64> = mean_deltas
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| keep(*i))
+                    .map(|(_, v)| *v)
+                    .collect();
+                let s: Vec<f64> = reported_ses
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| keep(*i))
+                    .map(|(_, v)| *v)
+                    .collect();
+                if d.len() < 2 {
+                    return None;
+                }
+                let sd = sample_sd(&d);
+                (sd > 0.0).then(|| (d.len(), mean(&s) / sd))
+            };
+
+            let all = ratio_over(&|_| true);
+            let gated = ratio_over(&|i| stabilities[i] > STABILITY_MIN);
+            let fmt = |r: Option<(usize, f64)>| match r {
+                Some((k, v)) => format!("{v:.3} (n={k})"),
+                None => "n/a".to_string(),
+            };
+            eprintln!(
+                "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
+                 all reps: {:<14} passing the stability gate: {:<14} mean stability={:.2}\n      \
+                 fired: `m > 2*se` {:>5.1}%   full decide() Adopt {:>5.1}%   \
+                 distinct fold selections: {}  (refits: {})",
+                fmt(all),
+                fmt(gated),
+                mean(&stabilities),
+                100.0 * se_gate_fired as f64 / REPS as f64,
+                100.0 * adopted as f64 / REPS as f64,
+                fold_picks.len(),
+                refits.len(),
+            );
+            let true_se = sample_sd(&mean_deltas);
+            let avg_reported = mean(&reported_ses);
+            assert!(true_se > 0.0, "degenerate simulation: no spread to measure");
+            assert!(avg_reported.is_finite(), "reported SE must be finite");
+        }
+
+        // No threshold assertion: the point of this test is the numbers it
+        // prints, and pinning a ratio would turn a measurement into a brittle
+        // expectation.
     }
 
     #[test]

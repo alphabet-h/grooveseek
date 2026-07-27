@@ -290,6 +290,50 @@ recommended when **all** of the following hold:
    signal there is)
 5. no secondary metric (recall@k for any k, MRR) regressed against the defaults
 
+> **Criterion 3 can be much weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)`
+> assumes the per-fold differences are independent. The N leave-one-out
+> selections each share N−2 queries, which lets the folds pick *different*
+> conditions — though sharing training data only makes correlation possible
+> rather than creating it. Nor is fold agreement alone enough to restore
+> independence: even when the folds agree, *which* condition they agreed on was
+> itself chosen from the shared rows, so every difference still depends on it.
+> What would decouple them is the selection being effectively fixed across
+> sampled golden sets, which is a different property.
+>
+> Simulated against a known data-generating process, the reported SE came out at
+> **0.53–0.60** of the real one in the three settings where the selection varied
+> (114–184 distinct conditions chosen across 300 replications), and at **1.03**
+> in the one where it did not vary at all — a single condition across all 7,800
+> fold selections. The count is of the *fold* selections that generate each
+> difference, not of the refit chosen from all N rows; the two diverge (114 vs
+> 64 in the first setting), so the refit would have understated the variation.
+>
+> **What that costs is measured directly rather than converted into a sigma
+> level** — the reported SE varies per run and can correlate with the observed
+> mean delta, so a ratio of averages does not determine how often the gate
+> fires. Running the simulation with **no true winner at all**:
+>
+> | | rate under the null |
+> |---|---|
+> | `mean ΔnDCG@5 > 2 × paired SE` fires | **12.7%** |
+> | the full five-criterion verdict is "adopt" | **12.7%** |
+> | a calibrated one-sided 2 sigma test would be | ~2.3% |
+>
+> So a golden set with nothing to find yields an adoption recommendation about
+> one run in eight. Restricting to replications that pass criterion 4 lifts the
+> SE ratio to 0.62–0.73 — the stability gate narrows the gap without closing it,
+> and 192–300 of 300 replications passed it, so this is not a corner case.
+>
+> In this simulation the full verdict rate tracks the SE gate almost exactly,
+> meaning the other criteria rarely bind. That is partly an artifact of the
+> synthetic data (the fixture writes the same value into nDCG, recall and MRR,
+> which makes criterion 5 easy to satisfy), so it does not establish how much
+> they bind on real golden sets.
+>
+> The multiplier has deliberately not been raised, because that would change
+> what the tool recommends. The simulation lives in `tune.rs` as
+> `au16_paired_se_versus_the_true_standard_error`.
+
 Otherwise the verdict is "keep the built-in defaults", which is a normal and
 expected outcome: the RRF paper measured only ~0.4% relative MAP movement
 across k ∈ [30, 100], and Elasticsearch documents RRF as requiring no tuning.
