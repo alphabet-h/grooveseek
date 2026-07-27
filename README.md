@@ -23,6 +23,13 @@ Download the archive for your platform from the [latest GitHub release](https://
 
 > **Intel Mac (`x86_64-apple-darwin`)** is not shipped as a prebuilt: the upstream ONNX Runtime crate (`ort-sys`) does not provide a binary for that target. Build from source as described below.
 
+> **Windows: two more archives, if you will run kb-mcp as a service.** They are separate downloads (v0.14.0+), and both belong in the same directory as `kb-mcp.exe`:
+>
+> | Archive | Why |
+> | --- | --- |
+> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` points the logon task at `kb-mcp-svc.exe` when it sits next to `kb-mcp.exe`, and **silently falls back to a console-visible launcher when it does not** — which means a console window flashes at every login. Nothing reports the fallback, so extract this one before running `service install`. |
+> | `kb-mcp-tray-x86_64-pc-windows-msvc.zip` | Optional. The system tray monitor; needed only for `service install --with-tray`. |
+
 Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running.
 
 ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. Embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](#working-around-huggingface-tls-failures-on-first-download) if your network blocks that.

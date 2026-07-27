@@ -23,6 +23,13 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 
 > **Intel Mac (`x86_64-apple-darwin`)** はビルド済バイナリを配布していない: 上流 ONNX Runtime crate (`ort-sys`) がこのターゲット用 prebuilt を提供しないため。下記「ソースからビルド」を参照。
 
+> **Windows で service として動かすなら、archive がもう 2 つ要る。** どちらも別ダウンロード (v0.14.0 以降) で、`kb-mcp.exe` と**同じディレクトリ**に展開する:
+>
+> | Archive | 理由 |
+> | --- | --- |
+> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` は `kb-mcp-svc.exe` が `kb-mcp.exe` の隣にあればそれを logon task の起動対象にし、**無ければ console 可視の launcher に黙って fallback する** — 毎回のログオンでコンソール窓が一瞬出る。fallback したことは何も報告されないので、`service install` の**前に**展開しておくこと。 |
+> | `kb-mcp-tray-x86_64-pc-windows-msvc.zip` | 任意。system tray 監視 binary で、`service install --with-tray` を使う場合のみ必要。 |
+
 各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。
 
 ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](#huggingface-の-tls-失敗への対処-初回-dl-時) を参照。
