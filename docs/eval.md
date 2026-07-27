@@ -290,11 +290,16 @@ recommended when **all** of the following hold:
    signal there is)
 5. no secondary metric (recall@k for any k, MRR) regressed against the defaults
 
-> **Criterion 3 is weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)` assumes
-> the per-fold differences are independent, but the N leave-one-out selections
-> each share N−2 queries, so they are positively correlated and the formula
-> underestimates the true spread. Simulated against a known data-generating
-> process, the reported SE came out at **0.53–0.60** of the real one.
+> **Criterion 3 can be much weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)`
+> assumes the per-fold differences are independent. The N leave-one-out
+> selections each share N−2 queries, which lets the folds pick *different*
+> conditions — but sharing training data only makes correlation possible, it
+> does not create it: when every fold picks the same condition, each `d_j`
+> depends only on its own held-out row and the assumption holds.
+>
+> Simulated against a known data-generating process, the reported SE came out at
+> **0.53–0.60** of the real one in the three settings where the folds disagreed,
+> and at **1.03** in the one where they never did.
 >
 > **What that costs is measured directly rather than converted into a sigma
 > level** — the reported SE varies per run and can correlate with the observed

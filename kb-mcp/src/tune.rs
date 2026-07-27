@@ -587,10 +587,14 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// 以前ここには「fold が query を共有するため厳密には i.i.d. でないが、
 /// **保守側 (過小評価しない)** に働く」と書いてあった。**逆だった**。
 ///
-/// `SD/sqrt(N)` は d_j の独立を仮定するが、LOO の N 個の選択は互いに N−2 個の
-/// query を共有するので d_j は正に相関し、`Var(mean)` は `sigma^2/N` より
-/// 大きくなる。既知の golden set を多数生成して「報告される SE」と「mean delta
-/// の真のばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
+/// `SD/sqrt(N)` は d_j の独立を仮定する。LOO の N 個の選択は互いに N−2 個の
+/// query を共有するので **fold ごとに違う条件を選び得る**が、これは相関を
+/// 可能にするだけで**保証はしない** — 全 fold が同じ条件を選べば d_j は各自の
+/// held-out 行だけに依存し、独立に戻る。実際、下表の最終行 (全 replication で
+/// fold 完全一致) は比 1.027 で過小評価が起きていない。
+///
+/// 既知の golden set を多数生成して「報告される SE」と「mean delta の真の
+/// ばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
 /// 300 反復 × 4 設定):
 ///
 /// | N | 真の優位幅 | セル分散 | 全 rep | **stability gate 通過分のみ** |
