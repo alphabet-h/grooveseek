@@ -617,11 +617,31 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 ///   観測であって「一致した時に限り較正される」ことの証明ではない。部分的にしか
 ///   一致しない設定でも比が 1 に近づく可能性は未検証
 ///
-/// 帰結: `decide` の `mean_delta > 2 * se` は **公称 2 sigma だが実効はより緩い**。
-/// 係数を上げるかは採用挙動の変更なのでここでは行っていない。実際に効いている
-/// 他の gate は `ADOPT_MIN_MEAN_DELTA` (絶対量の下限)、`STABILITY_MIN`、
-/// `non_degradation` の 3 つ。**sign test は `TuneReport` に出るだけで `decide`
-/// は参照しない**ので、緩和材料として数えてはならない。
+/// ### 帰結は sigma 換算ではなく棄却率で測る
+///
+/// 「SE が 0.55 倍なので実効 1.1 sigma」と書くのは**誤り**だった。`se` は
+/// replication ごとに変動し `mean_delta` と相関し得るので、平均の比から gate の
+/// 発火確率は決まらない。検定の水準は**棄却率そのもの**で測る:
+///
+/// | 設定 | `m > 2*se` 発火 | `decide` が Adopt |
+/// |---|---|---|
+/// | N=26 edge=0.04 sd=0.08 | 35.0% | 35.0% |
+/// | **N=26 edge=0.00 sd=0.08 (null)** | **12.7%** | **12.7%** |
+/// | N=12 edge=0.04 sd=0.08 | 20.3% | 20.0% |
+/// | N=26 edge=0.04 sd=0.03 | 99.7% | 99.0% |
+///
+/// **真の優位差が無いのに 12.7% で採用が出る**。較正された片側 2 sigma なら
+/// 約 2.3% なので、およそ 5.5 倍の誤採用率にあたる。係数を上げるかは採用挙動の
+/// 変更なのでここでは行っていない。
+///
+/// 上表では `decide` の Adopt 率が SE gate の発火率とほぼ一致しており、この
+/// **シミュレーション上では**他の gate がほとんど追加で効いていない。ただし
+/// `table_from_primary` は nDCG / recall / MRR に同じ値を書くため
+/// `non_degradation` が緩くなる等、合成データ側の性質でもある。実データで他の
+/// gate がどれだけ効くかは、これでは分からない。
+///
+/// **sign test は `TuneReport` に出るだけで `decide` は参照しない**ので、
+/// 緩和材料として数えてはならない。
 pub fn paired_se(diffs: &[f64]) -> f64 {
     if diffs.len() < 2 {
         return f64::INFINITY;
@@ -2312,6 +2332,13 @@ mod tests {
             let mut mean_deltas = Vec::with_capacity(REPS);
             let mut reported_ses = Vec::with_capacity(REPS);
             let mut stabilities: Vec<f64> = Vec::with_capacity(REPS);
+            // How often each gate actually fires. A ratio of averages does not
+            // determine this: `se` varies per replication and can correlate
+            // with the observed `mean_delta`, so "the SE is 0.55x too small"
+            // cannot be turned into a sigma level by arithmetic (codex P2
+            // round 4). The rejection rate is the thing itself.
+            let mut se_gate_fired = 0usize;
+            let mut adopted = 0usize;
             for _ in 0..REPS {
                 let rows: Vec<Vec<f64>> = (0..n)
                     .map(|_| {
@@ -2325,8 +2352,16 @@ mod tests {
                 let table = table_from_primary(rows);
                 let idx: Vec<usize> = (0..n).collect();
                 let out = nested_loo(&table, &idx);
-                mean_deltas.push(mean(&out.diffs));
-                reported_ses.push(paired_se(&out.diffs));
+                let m = mean(&out.diffs);
+                let se = paired_se(&out.diffs);
+                if m > 2.0 * se {
+                    se_gate_fired += 1;
+                }
+                if matches!(decide(&table, &out, &idx), Verdict::Adopt(_)) {
+                    adopted += 1;
+                }
+                mean_deltas.push(m);
+                reported_ses.push(se);
                 stabilities.push(out.stability);
             }
 
@@ -2368,10 +2403,13 @@ mod tests {
             };
             eprintln!(
                 "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
-                 all reps: {:<14} passing the stability gate: {:<14} mean stability={:.2}",
+                 all reps: {:<14} passing the stability gate: {:<14} mean stability={:.2}\n      \
+                 fired: `m > 2*se` {:>5.1}%   full decide() Adopt {:>5.1}%",
                 fmt(all),
                 fmt(gated),
-                mean(&stabilities)
+                mean(&stabilities),
+                100.0 * se_gate_fired as f64 / REPS as f64,
+                100.0 * adopted as f64 / REPS as f64,
             );
             let true_se = sample_sd(&mean_deltas);
             let avg_reported = mean(&reported_ses);

@@ -290,29 +290,36 @@ recommended when **all** of the following hold:
    signal there is)
 5. no secondary metric (recall@k for any k, MRR) regressed against the defaults
 
-> **Criterion 3 is weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)`
-> assumes the per-fold differences are independent, but the N leave-one-out
-> selections each share N−2 queries, so they are positively correlated and the
-> formula underestimates the true spread. Simulated against a known
-> data-generating process, the reported SE came out at **0.53–0.60** of the real
-> one, making criterion 3 behave closer to a 1.1 sigma test than a 2 sigma one.
-> Of the four settings measured, the one that came out at 1.03 was the one
-> where every fold selected the same condition in every replication. That fits
-> the mechanism — the correlation comes from the folds disagreeing — but with a
-> single fully stable setting it is an observed association, not evidence that
-> agreement is what calibrates the estimate.
+> **Criterion 3 is weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)` assumes
+> the per-fold differences are independent, but the N leave-one-out selections
+> each share N−2 queries, so they are positively correlated and the formula
+> underestimates the true spread. Simulated against a known data-generating
+> process, the reported SE came out at **0.53–0.60** of the real one.
 >
-> **Criterion 4 narrows the gap without closing it.** Restricting to just the
-> replications that pass `stability > 0.5` — the only ones that can be adopted —
-> the ratio rises to **0.62–0.73**, so those runs still understate the SE by
-> roughly 1.4–1.6x. That is not a rare corner either: 192–300 of 300
-> replications passed. (The ratio is a property of a set of replications, not of
-> one run, so it has to be recomputed within that subset rather than read off
-> alongside an average stability.)
+> **What that costs is measured directly rather than converted into a sigma
+> level** — the reported SE varies per run and can correlate with the observed
+> mean delta, so a ratio of averages does not determine how often the gate
+> fires. Running the simulation with **no true winner at all**:
+>
+> | | rate under the null |
+> |---|---|
+> | `mean ΔnDCG@5 > 2 × paired SE` fires | **12.7%** |
+> | the full five-criterion verdict is "adopt" | **12.7%** |
+> | a calibrated one-sided 2 sigma test would be | ~2.3% |
+>
+> So a golden set with nothing to find yields an adoption recommendation about
+> one run in eight. Restricting to replications that pass criterion 4 lifts the
+> SE ratio to 0.62–0.73 — the stability gate narrows the gap without closing it,
+> and 192–300 of 300 replications passed it, so this is not a corner case.
+>
+> In this simulation the full verdict rate tracks the SE gate almost exactly,
+> meaning the other criteria rarely bind. That is partly an artifact of the
+> synthetic data (the fixture writes the same value into nDCG, recall and MRR,
+> which makes criterion 5 easy to satisfy), so it does not establish how much
+> they bind on real golden sets.
 >
 > The multiplier has deliberately not been raised, because that would change
-> what the tool recommends. Criteria 1, 2, 4 and 5 are unaffected. The
-> simulation lives in `tune.rs` as
+> what the tool recommends. The simulation lives in `tune.rs` as
 > `au16_paired_se_versus_the_true_standard_error`.
 
 Otherwise the verdict is "keep the built-in defaults", which is a normal and
