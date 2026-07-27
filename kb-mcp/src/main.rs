@@ -660,6 +660,23 @@ fn main() -> anyhow::Result<()> {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
 
+            // `[parsers].enabled` の検証を **何より先** に置く (AU-06 codex P2)。
+            //
+            // 受け付けられない id が 1 つ入っているだけで実行は必ず失敗するが、
+            // その判定は設定文字列だけで完結し、ファイルも DB も要らない。
+            // 後ろに置くほど「失敗すると分かっている実行が、先に何かを壊す」
+            // 窓が広がる:
+            //
+            // - `Database::open` より後 → DB / WAL を作り、schema 移行まで走る
+            //   (`ensure_fts_context_column` は FTS を DROP + CREATE + repopulate する)
+            // - `Embedder::with_model` より後 → 失敗すると分かっている実行のために
+            //   モデルを DL する (BGE-M3 なら ~2.3 GB)
+            // - `reset_for_model` より後 → **index を空にしてからエラー終了**
+            //
+            // `.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当だった設定の
+            // まま upgrade した人がこの経路に入る。
+            let registry = cfg.build_parser_registry()?;
+
             let db_path = kb_mcp::resolve_db_path(&kb_path);
             let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
             // モデル DL (BGE-M3 なら ~2.3 GB) の前に meta 整合性を先に確認する。
@@ -668,14 +685,6 @@ fn main() -> anyhow::Result<()> {
             if !force {
                 db.verify_embedding_meta(model.model_id(), dim)?;
             }
-            // `[parsers].enabled` の検証は **モデル DL と `--force` の破壊的
-            // reset より前** に置く (AU-06 codex P2)。ここが後ろにあると、
-            // 設定に受け付けられない id が 1 つ入っているだけで
-            // 「index を空にしてからエラー終了」になり、ユーザは元の index を
-            // 失う。`.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当
-            // だった設定のまま upgrade した人がこの経路に入る。id の妥当性は
-            // ファイルも DB も触らずに判定できるので、一番手前に置くのが正しい。
-            let registry = cfg.build_parser_registry()?;
             let mut embedder = kb_mcp::embedder::Embedder::with_model(model)?;
             if force {
                 db.reset_for_model(embedder.model_id(), dim)?;
