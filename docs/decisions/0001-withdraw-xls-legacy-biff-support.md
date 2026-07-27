@@ -40,8 +40,11 @@ directory could take down the server.
 - Reading a knowledge base must not let one input file terminate the process.
 - The guards that make the other binary formats safe are structurally unable
   to help here, because the failure is an abort, not an error or a panic.
-- `.xls` is a pre-2007 format with a lossless conversion path (`.xlsx`), and
-  no user had asked for it.
+- `.xls` is a pre-2007 format that no user had asked for, and the content
+  kb-mcp indexes — cell text — survives conversion to `.xlsx`. Note that the
+  conversion is *not* lossless in general: VBA macros require `.xlsm`, and
+  other legacy-only features may be dropped or altered. Users should keep the
+  original rather than replace it.
 
 ## Considered Options
 

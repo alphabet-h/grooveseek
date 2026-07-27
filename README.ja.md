@@ -820,7 +820,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   既知の制限:
   - **legacy バイナリ形式は非対応**: 2007 年以前の `.doc` (Word) / `.ppt` (PowerPoint) / `.xls` (Excel) は非対応 — 対応するのは上記の OOXML 形式 (`.docx` / `.pptx` / `.xlsx`) のみ
 
-    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.14.0 で取り下げた: calamine は workbook を開く時点で全体を密に確保し、BIFF が縛るのは**シート 1 枚**であって **workbook ではない**ため、小さな細工ファイルでメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと起動時にこの理由付きで拒否される — `.xlsx` に変換すれば streaming で読める。詳しい理由: [ADR-0001](docs/decisions/0001-withdraw-xls-legacy-biff-support.ja.md)
+    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.14.0 で取り下げた: calamine は workbook を開く時点で全体を密に確保し、BIFF が縛るのは**シート 1 枚**であって **workbook ではない**ため、小さな細工ファイルでメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと起動時にこの理由付きで拒否される — `.xlsx` に変換すれば streaming で読める。**原本は残すこと**: 変換でセルのテキストは引き継がれるが一般に無損失ではない (VBA マクロは `.xlsm` が必要、その他のレガシー固有機能も失われうる)。詳しい理由: [ADR-0001](docs/decisions/0001-withdraw-xls-legacy-biff-support.ja.md)
   - **OpenDocument 形式は非対応**: `.odt` / `.ods` / `.odp` は非対応
   - **パスワード保護ファイルは復号ではなく skip**: 暗号化された Office ファイルは (zip / BIFF コンテナが開けないことで) 検出され、実行全体を失敗させず warning 付きで skip される — パスワード対応なし
   - **表構造は plain text 化される**: `.docx` / `.pptx` の表セルは通常のテキストとして読み取られる (行/列構造はチャンク内に保持されない)。`.xlsx` の行は 1 行ごとにタブ区切りで連結される。下流の検索が見るのはグリッドではなく地の文
