@@ -226,17 +226,6 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     let mut budget: usize = 0;
     let started = std::time::Instant::now();
     for index in 0..page_count {
-        // 展開バイト数そのものは数えられないので、それに比例する実時間で縛る。
-        // ページ境界でしか見ないため 1 ページ内の暴走は止められないが、
-        // codex P1 の想定 (「個別には許容されるストリームを数百個」) は
-        // 複数ページに跨るので、ここで頭打ちになる。
-        if started.elapsed() > timeout {
-            return Err(anyhow!(
-                "{path_hint}: PDF text extraction exceeded {} s after {} page(s)                  (decompression-bomb guard)",
-                timeout.as_secs_f64(),
-                index
-            ));
-        }
         let extracted = extractor.extract_from_page(document, index).map_err(|e| {
             anyhow!(
                 "{path_hint}: PDF text extraction failed on page {} \
@@ -244,6 +233,24 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
                 index + 1
             )
         })?;
+        // 展開バイト数そのものは数えられないので、それに比例する実時間で縛る。
+        //
+        // ページを読んだ **後** に見る (codex P2)。前だけで見ると最終ページの
+        // 超過を拾えず、budget を超えた文書がそのまま metadata 抽出・chunk 化・
+        // index まで進んでしまう。後で見れば「開始前に既に超過」も前ページの
+        // 判定で捕まるので、こちら 1 箇所で足りる。
+        //
+        // 粒度はページ境界なので、1 ページが単独で暴走する場合は止められない。
+        // codex P1 の想定 (「個別には許容されるストリームを数百個」) は複数
+        // ページに跨るため、ここで頭打ちになる。
+        if started.elapsed() > timeout {
+            return Err(anyhow!(
+                "{path_hint}: PDF text extraction exceeded {} s after {} page(s) \
+                 (decompression-bomb guard)",
+                timeout.as_secs_f64(),
+                index + 1
+            ));
+        }
         if extracted.truncated {
             // 黙って落とさない (AU-13 と同じ方針)。
             eprintln!(
