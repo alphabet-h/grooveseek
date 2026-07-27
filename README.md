@@ -69,7 +69,7 @@ threshold = 0.3
 # via an explicit list. An empty array is rejected to prevent silent
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
-# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.13.2 — see below.)
+# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.14.0 — see below.)
 # Example enabling everything:
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
@@ -334,7 +334,7 @@ On next logon the tray icon appears with a colored status dot:
 - **red** — daemon has been unreachable for >= 1 minute (= 12 consecutive failed polls at 5s interval)
 - **gray** — pre-first-poll (= within the first 5 seconds of startup)
 
-Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. **Start** runs the scheduled task; **Stop** terminates the daemon process by the pid it reports at `/api/admin/status` (v0.13.2+), then confirms it is gone by binding the daemon's address — `Stop-ScheduledTask` only ever stopped the launcher, which exits immediately, so it silently did nothing.
+Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. **Start** runs the scheduled task; **Stop** terminates the daemon process by the pid it reports at `/api/admin/status` (v0.14.0+), then confirms it is gone by binding the daemon's address — `Stop-ScheduledTask` only ever stopped the launcher, which exits immediately, so it silently did nothing.
 
 Tray logs live at `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (daily rotation). Set `KB_MCP_TRAY_LOG=debug` for verbose output. Pass `--debug` to attach a console for live stdout/stderr.
 
@@ -815,7 +815,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   Known limitations:
   - **No legacy binary formats**: pre-2007 `.doc` (Word), `.ppt` (PowerPoint) and `.xls` (Excel) are not supported — only the OOXML forms (`.docx` / `.pptx` / `.xlsx`) above.
 
-    `.xls` was indexed between v0.11.0 and v0.13.1 and was withdrawn in v0.13.2. calamine materialises one dense cell grid per sheet while opening a workbook, before kb-mcp regains control. BIFF bounds a *sheet* at 65,536 x 256 (512 MB worth of cells), but it does not bound a *workbook*: two cell records at opposite corners make a sheet maximal, so a small crafted file can declare enough sheets to exhaust memory — and an allocation failure aborts the process rather than skipping the file. Listing `"xls"` in `[parsers].enabled` is now rejected at startup with that explanation. Convert the workbook to `.xlsx`, which is read as a stream.
+    `.xls` was indexed between v0.11.0 and v0.13.1 and was withdrawn in v0.14.0. calamine materialises one dense cell grid per sheet while opening a workbook, before kb-mcp regains control. BIFF bounds a *sheet* at 65,536 x 256 (512 MB worth of cells), but it does not bound a *workbook*: two cell records at opposite corners make a sheet maximal, so a small crafted file can declare enough sheets to exhaust memory — and an allocation failure aborts the process rather than skipping the file. Listing `"xls"` in `[parsers].enabled` is now rejected at startup with that explanation. Convert the workbook to `.xlsx`, which is read as a stream.
   - **No OpenDocument formats**: `.odt` / `.ods` / `.odp` are not supported.
   - **Password-protected files are skipped, not decrypted**: an encrypted Office file is detected (the zip / BIFF container fails to open) and skipped with a warning instead of failing the whole `index` run — there is no password support.
   - **Tables are flattened to plain text**: `.docx` and `.pptx` table cells are read as ordinary text runs (no row/column structure preserved in the chunk); `.xlsx` rows are tab-joined per line. Downstream retrieval sees prose, not a grid.

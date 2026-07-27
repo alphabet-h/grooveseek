@@ -68,7 +68,7 @@ threshold = 0.3
 # (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .pptx に
 # オプトイン。空配列 [] は「何もインデックスされない」事故を防ぐため拒否
 # される。現在サポート id: "md" / "txt" / "pdf" (v0.10.0+) / "docx" /
-# "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.13.2 で取り下げ、下記参照)
+# "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.14.0 で取り下げ、下記参照)
 # 全部入り例:
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
@@ -334,7 +334,7 @@ kb-mcp service install --kb-path C:\path\to\kb --with-tray
 - **赤** — daemon 1 分以上応答なし (= 5sec interval で 12 連続失敗)
 - **灰** — 初回 polling 待ち (= 起動直後 5 秒)
 
-right-click で 6 menu items: **Status** (read-only) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**。**Start** は scheduled task を実行、**Stop** は `/api/admin/status` が報告する pid のプロセスを終了させ (v0.13.2+)、daemon の bind アドレスを bind できることで停止を確認する — `Stop-ScheduledTask` が止めていたのは即座に終了する launcher だけで、実質何もしていなかった。
+right-click で 6 menu items: **Status** (read-only) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**。**Start** は scheduled task を実行、**Stop** は `/api/admin/status` が報告する pid のプロセスを終了させ (v0.14.0+)、daemon の bind アドレスを bind できることで停止を確認する — `Stop-ScheduledTask` が止めていたのは即座に終了する launcher だけで、実質何もしていなかった。
 
 Tray log は `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (= 日次 rotation)。verbose 出力には `KB_MCP_TRAY_LOG=debug` を設定、`--debug` flag で console attach して stdout/stderr を直接見る。
 
@@ -813,7 +813,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   既知の制限:
   - **legacy バイナリ形式は非対応**: 2007 年以前の `.doc` (Word) / `.ppt` (PowerPoint) / `.xls` (Excel) は非対応 — 対応するのは上記の OOXML 形式 (`.docx` / `.pptx` / `.xlsx`) のみ
 
-    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.13.2 で取り下げた。calamine は workbook を開く時点で、kb-mcp に制御が戻る前に全シート分の密なセル格子を確保する。BIFF が縛るのは**シート 1 枚** (65,536 × 256 = セル 512 MB 相当) であって **workbook ではない**: 対角 2 セルのレコードだけでシートを最大矩形にできるので、小さな細工ファイルで十分な数のシートを宣言すればメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと、起動時にこの理由付きで拒否される。`.xlsx` に変換すれば streaming で読める
+    `.xls` は v0.11.0〜v0.13.1 でインデックス対象だったが v0.14.0 で取り下げた。calamine は workbook を開く時点で、kb-mcp に制御が戻る前に全シート分の密なセル格子を確保する。BIFF が縛るのは**シート 1 枚** (65,536 × 256 = セル 512 MB 相当) であって **workbook ではない**: 対角 2 セルのレコードだけでシートを最大矩形にできるので、小さな細工ファイルで十分な数のシートを宣言すればメモリを使い切れる。しかも割り当て失敗はファイルの skip ではなくプロセスの異常終了になる。`[parsers].enabled` に `"xls"` を書くと、起動時にこの理由付きで拒否される。`.xlsx` に変換すれば streaming で読める
   - **OpenDocument 形式は非対応**: `.odt` / `.ods` / `.odp` は非対応
   - **パスワード保護ファイルは復号ではなく skip**: 暗号化された Office ファイルは (zip / BIFF コンテナが開けないことで) 検出され、実行全体を失敗させず warning 付きで skip される — パスワード対応なし
   - **表構造は plain text 化される**: `.docx` / `.pptx` の表セルは通常のテキストとして読み取られる (行/列構造はチャンク内に保持されない)。`.xlsx` の行は 1 行ごとにタブ区切りで連結される。下流の検索が見るのはグリッドではなく地の文
