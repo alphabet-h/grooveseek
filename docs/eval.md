@@ -296,9 +296,11 @@ recommended when **all** of the following hold:
 > formula underestimates the true spread. Simulated against a known
 > data-generating process, the reported SE came out at **0.53–0.60** of the real
 > one, making criterion 3 behave closer to a 1.1 sigma test than a 2 sigma one.
-> It reaches 1.03 in the one setting where every fold selected the same
-> condition, which fits the mechanism: the correlation comes from the folds
-> disagreeing.
+> Of the four settings measured, the one that came out at 1.03 was the one
+> where every fold selected the same condition in every replication. That fits
+> the mechanism — the correlation comes from the folds disagreeing — but with a
+> single fully stable setting it is an observed association, not evidence that
+> agreement is what calibrates the estimate.
 >
 > **Criterion 4 narrows the gap without closing it.** Restricting to just the
 > replications that pass `stability > 0.5` — the only ones that can be adopted —
