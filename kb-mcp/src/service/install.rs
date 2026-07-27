@@ -159,7 +159,7 @@ pub fn run_tray_install(service_name: &str, force: bool) -> Result<()> {
     let tray_exe = bin_dir.join("kb-mcp-tray.exe");
     if !tray_exe.exists() {
         return Err(anyhow!(
-            "{} not found. Install kb-mcp-tray.exe from the v0.9.0 release zip into the same directory as kb-mcp.exe.",
+            "{} not found. Install kb-mcp-tray.exe from the kb-mcp-tray-x86_64-pc-windows-msvc.zip archive of the matching release, into the same directory as kb-mcp.exe.",
             tray_exe.display()
         ));
     }

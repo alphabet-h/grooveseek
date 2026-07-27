@@ -90,7 +90,7 @@ fn ps_quote(s: &str) -> String {
 pub fn preflight_check(service_name: &str, tray_exe_path: &Path, force: bool) -> Result<()> {
     if !tray_exe_path.exists() {
         return Err(anyhow!(
-            "{} not found. Install kb-mcp-tray.exe from the v0.9.0 release zip into the same directory as kb-mcp.exe.",
+            "{} not found. Install kb-mcp-tray.exe from the kb-mcp-tray-x86_64-pc-windows-msvc.zip archive of the matching release, into the same directory as kb-mcp.exe.",
             tray_exe_path.display()
         ));
     }

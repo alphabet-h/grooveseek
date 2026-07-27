@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp-svc"
-version = "0.9.1"
+version = "0.14.0"
 edition = "2024"
 description = "Windows hidden-console launcher for kb-mcp.exe serve (v0.9.1 hot-fix for visible terminal window via Task Scheduler)"
 authors = ["koshian"]
@@ -16,6 +16,7 @@ publish = false
 # Linux / macOS build path is a fail-fast stub (`fn main()` exits 1) so the
 # crate compiles cleanly on all hosts but only ships in the Windows zip.
 [package.metadata.dist]
+dist = true
 targets = ["x86_64-pc-windows-msvc"]
 
 [[bin]]

@@ -6,6 +6,32 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [0.14.0] - 2026-07-27
 
+### Added
+
+- **`kb-mcp-tray.exe` and `kb-mcp-svc.exe` are attached to the release.** They
+  never had been. Both crates set `publish = false`, and cargo-dist skips a
+  `publish = false` package unless `[package.metadata.dist] dist = true` says
+  otherwise — so from v0.9.0 onward the release workflow built and announced
+  `kb-mcp` alone, while the READMEs told Windows users to take the tray out of
+  a release archive that did not contain it. Two changes were needed, and
+  either one alone changes nothing: `dist = true` on both packages, and their
+  versions moved to 0.14.0, because an unqualified `vX.Y.Z` tag announces only
+  the dist-able packages carrying that exact version. Verified with
+  `dist plan --tag=v0.14.0` against the pinned cargo-dist 0.31.0, and by
+  building both with the release `dist` profile for `x86_64-pc-windows-msvc`.
+
+  Each is its own archive — `kb-mcp-tray-x86_64-pc-windows-msvc.zip` and
+  `kb-mcp-svc-x86_64-pc-windows-msvc.zip` — not extra files inside the `kb-mcp`
+  archive, which is what the READMEs had claimed. Extract the tray next to
+  `kb-mcp.exe`, where `kb-mcp service install --with-tray` looks for it.
+
+  Practical consequence beyond the tray: `kb-mcp service install` prefers
+  `kb-mcp-svc.exe` for the logon Action and silently falls back to a
+  console-visible one when the sibling is missing. Since the launcher was
+  never shipped, every installation from a release archive took the fallback,
+  and the v0.9.1 "no console flash at logon" fix has not reached anyone until
+  now.
+
 ### Removed
 
 - **`.xls` (legacy BIFF) is no longer indexed** (AU-06). Listing `"xls"` in

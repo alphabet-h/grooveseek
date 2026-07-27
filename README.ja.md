@@ -319,7 +319,7 @@ Installer は config home を `<dirs::config_dir()>/kb-mcp/<service-name>/` に�
 
 ### Tray monitor (Windows only、v0.9.0+)
 
-`kb-mcp-tray.exe` は Windows system tray に常駐する daemon 監視 binary。Windows release zip に `kb-mcp.exe` と並んで同梱。
+`kb-mcp-tray.exe` は Windows system tray に常駐する daemon 監視 binary。v0.14.0 以降は専用 archive `kb-mcp-tray-x86_64-pc-windows-msvc.zip` として配布される (`kb-mcp` の archive の中ではない)。`kb-mcp.exe` と同じディレクトリに展開すること — `kb-mcp service install --with-tray` はそこを探す。(v0.14.0 より前のリリースには**そもそも含まれていなかった**: Windows 用の companion binary 2 本はビルドされていたが release に添付されていなかった。v0.14.0 以降を使うこと)
 
 daemon と一緒に install:
 

@@ -319,7 +319,7 @@ Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mc
 
 ### Tray monitor (Windows only, v0.9.0+)
 
-`kb-mcp-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. Shipped in the Windows release zip alongside `kb-mcp.exe`.
+`kb-mcp-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. It ships from v0.14.0 in its own archive, `kb-mcp-tray-x86_64-pc-windows-msvc.zip` — not inside the `kb-mcp` archive. Extract it next to `kb-mcp.exe`; `kb-mcp service install --with-tray` looks for it there. (Releases before v0.14.0 did not contain it at all: the two Windows companion binaries were built but never attached, so use v0.14.0 or later.)
 
 Install alongside the daemon:
 
