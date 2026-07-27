@@ -37,7 +37,7 @@ kb-mcp のソース構造とデータフロー。コードを拡張・修正す�
 | `kb-mcp/src/quality.rs` | チャンク単位の品質スコアリング (長さ / 定型語 / 構造シグナル) |
 | `kb-mcp/src/graph.rs` | ベクトルインデックス上での Connection Graph BFS。`get_connection_graph` MCP ツールと `kb-mcp graph` CLI から利用 |
 | `kb-mcp/src/eval.rs` | `kb-mcp eval` CLI 用のリトリーバル品質評価 (opt-in)。Golden YAML を parse し、各クエリを `db.search_hybrid` で実行、recall@k / MRR / nDCG@k を計算。`<kb_path>/.kb-mcp-eval-history.json` を読み書きして前回との差分を表示。`ConfigFingerprint` (v0.7.0+) は `mmr` / `parent_retriever` / `fusion` (v0.13.0+) を optional に保持し、設定違いの eval 実行を別 history entry として区別する。いずれもビルトイン既定値と異なるときだけ記録するため、旧 baseline との比較は維持される。`serve` / `search` / `index` の挙動は一切変えない |
-| `kb-mcp/src/tune.rs` | (v0.13.0+) `kb-mcp tune` CLI 用の測定ツール (opt-in)。RRF 定数と FTS5 bm25 列重みの固定グリッドを golden query セット上で掃引し、nested leave-one-query-out CV (paired SE / sign test / selection stability / 副指標の非悪化) で結果をガードした上で、貼り付け可能な `[search.fusion]` スニペットか「既定値維持」の結論のどちらかを出力する。自動では何も適用せず、reranker も一切使わない。`eval` の `GoldenSet` / `compute_query_metrics` と `db::fuse_rrf_ids` を再利用する |
+| `kb-mcp/src/tune.rs` | (v0.13.0+) `kb-mcp tune` CLI 用の測定ツール (opt-in)。RRF 定数と FTS5 bm25 列重みの固定グリッドを golden query セット上で掃引し、nested leave-one-query-out CV (paired SE / selection stability / 副指標の非悪化。sign test も算出して report に載せるが `decide` は参照しない) で結果をガードした上で、貼り付け可能な `[search.fusion]` スニペットか「既定値維持」の結論のどちらかを出力する。自動では何も適用せず、reranker も一切使わない。`eval` の `GoldenSet` / `compute_query_metrics` と `db::fuse_rrf_ids` を再利用する |
 
 ## データフロー
 

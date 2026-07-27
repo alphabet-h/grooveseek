@@ -294,11 +294,14 @@ recommended when **all** of the following hold:
 > assumes the per-fold differences are independent, but the N leave-one-out
 > selections each share N−2 queries, so they are positively correlated and the
 > formula underestimates the true spread. Simulated against a known
-> data-generating process, the reported SE came out at 0.55–0.66 of the real
-> one, which makes criterion 3 behave closer to a 1.1 sigma test than a 2 sigma
-> one. The multiplier has deliberately not been raised — that would change what
-> the tool recommends — and criteria 1, 2, 4 and 5 are unaffected. The
-> simulation lives in `tune.rs` as
+> data-generating process, the reported SE came out at **0.53–0.60** of the real
+> one whenever the folds disagreed at all, making criterion 3 behave closer to a
+> 1.1 sigma test than a 2 sigma one. It recovers (ratio 1.03) only when every
+> fold selects the same condition — and criterion 4 does not rescue it, since a
+> run with 84% of folds agreeing clears that bar while still understating the SE
+> by about 1.9x. The multiplier has deliberately not been raised, because that
+> would change what the tool recommends. Criteria 1, 2, 4 and 5 are unaffected.
+> The simulation lives in `tune.rs` as
 > `au16_paired_se_versus_the_true_standard_error`.
 
 Otherwise the verdict is "keep the built-in defaults", which is a normal and

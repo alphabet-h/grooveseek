@@ -13,7 +13,8 @@
 //! - grid は「query embedding 一括 → vec 候補 query あたり 1 回 → FTS 候補
 //!   bm25 条件ごと 1 回 → rrf_k はメモリ内」の 4 層に因数分解される
 //! - 小 golden set の argmax は overfit するので、nested leave-one-query-out
-//!   CV + paired SE + sign test + selection stability で採否を判定する
+//!   CV + paired SE + selection stability + 副指標の非悪化で採否を判定する
+//!   (sign test も算出して report に載せるが、`decide` は参照しない)
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -589,15 +590,29 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// `SD/sqrt(N)` は d_j の独立を仮定するが、LOO の N 個の選択は互いに N−2 個の
 /// query を共有するので d_j は正に相関し、`Var(mean)` は `sigma^2/N` より
 /// 大きくなる。既知の golden set を多数生成して「報告される SE」と「mean delta
-/// の真のばらつき」を比べたところ、**報告値は真の SE の 0.55〜0.66 倍**だった
-/// (`au16_paired_se_versus_the_true_standard_error`、4 設定 × 300 反復。真の
-/// 優位条件が存在しない設定でも同じ向き)。
+/// の真のばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
+/// 300 反復 × 4 設定):
+///
+/// | N | 真の優位幅 | セル分散 | reported/true | 平均 stability |
+/// |---|---|---|---|---|
+/// | 26 | 0.04 | 0.08 | 0.533 | 0.84 |
+/// | 26 | 0.00 | 0.08 | 0.547 | 0.75 |
+/// | 12 | 0.04 | 0.08 | 0.601 | 0.67 |
+/// | 26 | 0.04 | 0.03 | **1.027** | **1.00** |
+///
+/// **過小評価の度合いは selection stability に連動する**。fold ごとに選ぶ条件が
+/// ばらつくことが相関の源なので、全 fold が一致する設定 (stability 1.00) では
+/// 比が 1.03 まで戻る。逆に言えば、**stability が 1 未満なら常に過小評価**する。
 ///
 /// 帰結: `decide` の `mean_delta > 2 * se` は **公称 2 sigma だが実効は
 /// おおよそ 1.1 sigma** で、意図より緩い。係数を上げるかは採用挙動の変更なので
-/// ここでは行っていない。緩和を部分的に補っているもの: `ADOPT_MIN_MEAN_DELTA`
-/// (絶対量の下限)、`STABILITY_MIN` (fold 間で選択が一致すること)、sign test、
-/// `non_degradation` — SE ゲートは 5 つのうちの 1 つでしかない。
+/// ここでは行っていない。
+///
+/// **`STABILITY_MIN` (= 0.5) はこれをほとんど補償しない**: 上表の stability 0.84
+/// の行でも比は 0.533 で、gate を余裕で通りながら SE は約 1.9 倍過小のままである。
+/// 実際に効いている他の gate は `ADOPT_MIN_MEAN_DELTA` (絶対量の下限)、
+/// `STABILITY_MIN`、`non_degradation` の 3 つ。**sign test は `TuneReport` に
+/// 出るだけで `decide` は参照しない**ので、緩和材料として数えてはならない。
 pub fn paired_se(diffs: &[f64]) -> f64 {
     if diffs.len() < 2 {
         return f64::INFINITY;
@@ -2266,11 +2281,18 @@ mod tests {
             (26, 0.04, 0.05, 0.03, 0x5EED_0004), // quieter cells
         ];
 
+        // `k` must be the built-in value (codex P2 round 1). `select_condition`
+        // runs in two phases: phase W scans the weight tuples with `k` pinned to
+        // the default, and only then does phase K sweep `k` for the tuple it
+        // chose. A winner at some other `k` is therefore invisible while the
+        // weights are being picked, so the edge would only ever be reached in
+        // the replications where noise happened to select that tuple anyway —
+        // which quietly turns every "true edge" setting back into the null one.
         let winner = Condition {
             h: 3,
             ctx: 1,
             content: 1,
-            k: 2,
+            k: Condition::builtin_default().k,
         };
         eprintln!("AU-16 simulation ({REPS} replications per setting)");
         for (n, edge, q_sd, cell_sd, seed) in settings {
@@ -2280,6 +2302,7 @@ mod tests {
 
             let mut mean_deltas = Vec::with_capacity(REPS);
             let mut reported_ses = Vec::with_capacity(REPS);
+            let mut stabilities: Vec<f64> = Vec::with_capacity(REPS);
             for _ in 0..REPS {
                 let rows: Vec<Vec<f64>> = (0..n)
                     .map(|_| {
@@ -2295,13 +2318,20 @@ mod tests {
                 let out = nested_loo(&table, &idx);
                 mean_deltas.push(mean(&out.diffs));
                 reported_ses.push(paired_se(&out.diffs));
+                stabilities.push(out.stability);
             }
 
             let true_se = sample_sd(&mean_deltas);
             let avg_reported = mean(&reported_ses);
+            // Selection stability is printed alongside because the understatement
+            // is expected to track it: the correlation between folds comes from
+            // them selecting *differently*, so a run where every fold agrees
+            // should not suffer from it. Printed rather than asserted.
+            let avg_stability = mean(&stabilities);
             eprintln!(
                 "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
-                 true SE={true_se:.6}  reported={avg_reported:.6}  ratio={:.3}",
+                 true SE={true_se:.6}  reported={avg_reported:.6}  ratio={:.3}  \
+                 mean stability={avg_stability:.2}",
                 avg_reported / true_se
             );
             assert!(true_se > 0.0, "degenerate simulation: no spread to measure");
