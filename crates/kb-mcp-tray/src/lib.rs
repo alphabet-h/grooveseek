@@ -4,3 +4,4 @@
 #![cfg(target_os = "windows")]
 
 pub mod install;
+pub mod powershell;

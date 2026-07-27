@@ -3,6 +3,8 @@
 //! established by feature-43 (kb-mcp/src/service/windows.rs), so no new
 //! dependency is required.
 
+use crate::powershell::{decode_diagnostic, decode_value, with_utf8_output};
+
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
@@ -146,18 +148,30 @@ pub fn uninstall_autostart(service_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The one place this module starts `powershell.exe`.
+///
+/// Concentrating the spawn here is what keeps [`with_utf8_output`] from being
+/// forgotten: a new script reaches PowerShell only through this function, and
+/// this function always applies it. Without the prelude the returned string is
+/// the active code page decoded as if it were UTF-8, which for the caller of
+/// [`install_autostart`] means a `.lnk` path full of U+FFFD.
 fn run_ps(script: &str) -> Result<String> {
     let out = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &with_utf8_output(script),
+        ])
         .output()
         .context("spawn powershell")?;
     if !out.status.success() {
-        anyhow::bail!(
-            "powershell failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        // Diagnostic decode: the failure message must survive even if the
+        // prelude did not, so this must not itself fail on bad bytes.
+        anyhow::bail!("powershell failed: {}", decode_diagnostic(&out.stderr));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    // Value decode: this becomes a `PathBuf` (or JSON) in the caller.
+    decode_value(&out.stdout, "powershell stdout")
 }
 
 #[cfg(test)]
@@ -209,6 +223,24 @@ mod tests {
         assert!(s.contains("Test-Path"));
         assert!(s.contains("Remove-Item"));
         assert!(s.contains("kb-mcp-tray-work.lnk"));
+    }
+
+    /// End-to-end evidence that the prelude changes what `run_ps` actually
+    /// returns, taken at the site where a corrupted value did the damage: this
+    /// string is what [`install_autostart`] hands to `PathBuf::from`.
+    ///
+    /// The path is assembled from codepoints inside PowerShell so that nothing
+    /// between this file and the child re-encodes it on the way in, leaving the
+    /// pipe as the only thing under test. The assertion is locale-independent:
+    /// with the prelude the answer is UTF-8 on any code page, while without it
+    /// a ja-JP host emits CP932 (rejected by `decode_value`) and a host on a
+    /// Latin code page emits best-fit `??` (decodes cleanly but compares
+    /// unequal). Either way the fix is what makes this pass.
+    #[test]
+    fn run_ps_round_trips_a_non_ascii_path() {
+        let script = r"Write-Output ('C:\Users\' + [char]::ConvertFromUtf32(0x5C71) + [char]::ConvertFromUtf32(0x7530) + '\x.lnk')";
+        let out = run_ps(script).expect("powershell must run");
+        assert_eq!(out.trim(), r"C:\Users\山田\x.lnk");
     }
 
     #[test]

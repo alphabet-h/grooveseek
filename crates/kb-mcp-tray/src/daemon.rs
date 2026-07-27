@@ -1,5 +1,6 @@
 use crate::process::{StopOutcome, stop_process_if_image_matches};
 use anyhow::{Context, Result, bail};
+use kb_mcp_tray::powershell::{decode_diagnostic, with_utf8_output};
 use std::time::Duration;
 
 /// File name of the daemon executable. Every stop is gated on the target
@@ -251,17 +252,27 @@ fn status_client() -> Result<reqwest::Client> {
         .context("build status http client")
 }
 
+/// The one place this module starts `powershell.exe`.
+///
+/// The prelude is applied here rather than by each caller so that a script
+/// added later cannot miss it. Only stderr is read back, and only to report a
+/// failure — but that failure message is a localized cmdlet error on a
+/// non-English host, which is precisely what decodes to U+FFFD without it.
 async fn run_powershell(script: &str) -> Result<()> {
     let out = tokio::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &with_utf8_output(script),
+        ])
         .output()
         .await
         .context("spawn powershell")?;
     if !out.status.success() {
-        anyhow::bail!(
-            "powershell failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        // Diagnostic decode: reporting *why* the task control failed matters
+        // more than rejecting bytes the prelude should have prevented.
+        anyhow::bail!("powershell failed: {}", decode_diagnostic(&out.stderr));
     }
     Ok(())
 }

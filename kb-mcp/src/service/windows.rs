@@ -22,6 +22,7 @@
 //!    — cmdlet auto-builds the Principal from the current logon identity, so
 //!    user-level registration just works.
 
+use super::powershell::{decode_diagnostic, with_utf8_output};
 use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
@@ -161,6 +162,27 @@ pub fn build_register_script(
     )
 }
 
+/// The one place this backend starts `powershell.exe`.
+///
+/// Concentrating the spawn here is what keeps the UTF-8 output prelude from
+/// being forgotten: a new script reaches PowerShell only through this function,
+/// and this function always applies [`with_utf8_output`]. Without it every
+/// message below is decoded from the active code page as if it were UTF-8 — see
+/// [`super::powershell`] for the measurements.
+fn run_powershell_capture(script: &str, what: &str) -> Result<std::process::Output> {
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &with_utf8_output(script),
+        ])
+        .output()
+        .with_context(|| format!("powershell {what} invocation failed"))
+}
+
 /// Register the scheduled task: resolve the Action target, render the script,
 /// hand it to PowerShell.
 fn register_via_powershell(
@@ -172,20 +194,13 @@ fn register_via_powershell(
 ) -> Result<()> {
     let target = resolve_action_target(binary_path);
     let script = build_register_script(service_name, &target, config_home, auto_start, force);
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .output()
-        .context("powershell Register-ScheduledTask invocation failed")?;
+    let out = run_powershell_capture(&script, "Register-ScheduledTask")?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Diagnostic decode: a failed registration must still report why it
+        // failed, so an undecodable byte must not turn into a second error that
+        // replaces the first.
+        let stderr = decode_diagnostic(&out.stderr);
+        let stdout = decode_diagnostic(&out.stdout);
         return Err(anyhow!(
             "PowerShell Register-ScheduledTask failed (status: {})\nstderr: {}\nstdout: {}",
             out.status,
@@ -229,6 +244,14 @@ impl ServiceBackend for TaskScheduler {
         if !out.status.success() {
             return Ok(ServiceState::NotFound);
         }
+        // `schtasks` is not PowerShell, so the UTF-8 prelude cannot reach it and
+        // this CSV really is active-code-page encoded. Lossy decoding is
+        // nonetheless safe *for this parse*: the only fields read are the task
+        // name and the literal `Running`, both ASCII, and no CP932 trail byte is
+        // `,` or `"` (the trail ranges are 0x40-0x7E and 0x80-0xFC), so field
+        // splitting cannot be thrown off by a Japanese task name elsewhere in
+        // the row. The status parse below is wrong for other reasons — see
+        // `list`.
         let stdout = String::from_utf8_lossy(&out.stdout);
         Ok(if stdout.contains("Running") {
             ServiceState::Running {
@@ -249,6 +272,14 @@ impl ServiceBackend for TaskScheduler {
             .args(["/Query", "/FO", "CSV", "/NH"])
             .output()
             .context("schtasks /Query 全体 実行失敗")?;
+        // Same as `status`: `schtasks` output is code-page encoded and out of
+        // reach of the PowerShell prelude, but only the ASCII `kb-mcp-` prefix
+        // is matched here. A separate defect does live on this path — a service
+        // literally named `Running` would report Running forever, because the
+        // status check greps the whole CSV row rather than the state column.
+        // Moving both calls to `Get-ScheduledTask`, whose `TaskState` is a typed
+        // value rather than a localized CSV, retires the encoding question and
+        // that defect together.
         let stdout = String::from_utf8_lossy(&out.stdout);
         let mut result = Vec::new();
         for line in stdout.lines() {
@@ -264,5 +295,36 @@ impl ServiceBackend for TaskScheduler {
     }
     fn stop(&self, service_name: &str) -> Result<()> {
         run_schtasks(&["/End", "/TN", &task_name(service_name)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::powershell::decode_value;
+
+    /// End-to-end evidence that the prelude changes what actually comes back
+    /// through the pipe. Asserting that the script string contains the prelude
+    /// would only restate the code; this spawns a real `powershell.exe`.
+    ///
+    /// The text is built from codepoints inside PowerShell so that nothing
+    /// between this file and the child re-encodes it on the way in, leaving the
+    /// pipe as the only thing under test. The assertion is locale-independent:
+    /// with the prelude the answer is UTF-8 on any code page, while without it a
+    /// ja-JP host emits CP932 (rejected by `decode_value`) and a host on a
+    /// Latin code page emits best-fit `??` (decodes cleanly but compares
+    /// unequal). Either way the fix is what makes this pass.
+    #[test]
+    fn powershell_output_round_trips_non_ascii() {
+        let script =
+            "Write-Output ([char]::ConvertFromUtf32(0x65E5) + [char]::ConvertFromUtf32(0x672C))";
+        let out = run_powershell_capture(script, "encoding self-test").expect("spawn powershell");
+        assert!(
+            out.status.success(),
+            "powershell failed: {}",
+            decode_diagnostic(&out.stderr)
+        );
+        let stdout = decode_value(&out.stdout, "stdout").expect("stdout must decode as UTF-8");
+        assert_eq!(stdout.trim(), "日本");
     }
 }
