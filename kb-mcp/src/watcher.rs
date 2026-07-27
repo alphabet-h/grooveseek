@@ -549,7 +549,10 @@ mod tests {
 
     #[test]
     fn test_to_rel_basic() {
-        let kb = std::env::temp_dir().join("kb-mcp-watcher-torel");
+        // Was a fixed name, so every concurrent run and every rerun shared one
+        // directory — and the `remove_dir_all` below deleted it out from under
+        // whoever else was mid-test.
+        let kb = crate::test_support::unique_temp_path("kb-mcp-watcher-torel");
         std::fs::create_dir_all(&kb).unwrap();
         let kb = kb.canonicalize().unwrap();
         let full = kb.join("notes").join("a.md");

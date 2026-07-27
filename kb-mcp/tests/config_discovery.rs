@@ -33,12 +33,17 @@ struct TempDir {
 }
 impl TempDir {
     fn new(prefix: &str) -> Self {
+        // PID + nanos alone is not unique: this binary's tests run on parallel
+        // threads of one process, so two can read the same nanosecond, build
+        // the same path, and delete each other's files on Drop.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}-{seq}"));
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
@@ -254,12 +259,16 @@ fn test_explicit_with_tilde_expands() {
     };
     let home = std::path::PathBuf::from(home);
     let stamp = format!(
-        "kb-mcp-disc-tilde-{}-{}",
+        "kb-mcp-disc-tilde-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        }
     );
     let toml_in_home = home.join(format!("{stamp}.toml"));
     let kb_in_home = home.join(format!("{stamp}-kb"));

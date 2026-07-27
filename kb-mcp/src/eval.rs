@@ -999,12 +999,11 @@ mod tests {
     }
 
     fn write_yaml(name: &str, content: &str) -> PathBuf {
-        let pid = std::process::id();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("{name}-{pid}-{nonce}.yml"));
+        // Suffix goes before the extension: `.yml` has to stay last.
+        let path = std::env::temp_dir().join(format!(
+            "{name}-{}.yml",
+            crate::test_support::unique_suffix()
+        ));
         std::fs::write(&path, content).unwrap();
         path
     }
@@ -1457,8 +1456,12 @@ mod tests {
 
     #[test]
     fn test_history_load_corrupt_returns_empty_with_warn() {
-        let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!("kb-mcp-hist-corrupt-{pid}.json"));
+        // PID alone does not separate two tests in the same process, and both
+        // this and the round-trip test below write history JSON to temp.
+        let path = std::env::temp_dir().join(format!(
+            "kb-mcp-hist-corrupt-{}.json",
+            crate::test_support::unique_suffix()
+        ));
         std::fs::write(&path, "{not json").unwrap();
         let h = History::load(&path).unwrap();
         assert!(h.runs.is_empty());
@@ -1467,8 +1470,10 @@ mod tests {
 
     #[test]
     fn test_history_save_and_reload_round_trip() {
-        let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!("kb-mcp-hist-rt-{pid}.json"));
+        let path = std::env::temp_dir().join(format!(
+            "kb-mcp-hist-rt-{}.json",
+            crate::test_support::unique_suffix()
+        ));
         let _ = std::fs::remove_file(&path);
         let mut h = History::default();
         h.push_front(sample_run(100, 0.5), 10);

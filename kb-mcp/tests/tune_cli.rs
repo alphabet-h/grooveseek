@@ -21,12 +21,16 @@ struct TempKb {
 
 impl TempKb {
     fn new(prefix: &str) -> Self {
+        // PID + nanos alone is not unique within one test binary: its tests run
+        // on parallel threads of a single process.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}"));
+        let root = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}-{seq}"));
         let kb = root.join("kb");
         std::fs::create_dir_all(&kb).unwrap();
         Self { root, kb }

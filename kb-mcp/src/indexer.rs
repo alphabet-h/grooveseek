@@ -1285,12 +1285,7 @@ mod tests {
     }
 
     fn mk_tmp(prefix: &str) -> TmpDir {
-        let pid = std::process::id();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!("kb-mcp-idxtest-{prefix}-{pid}-{nonce}"));
+        let p = crate::test_support::unique_temp_path(&format!("kb-mcp-idxtest-{prefix}"));
         std::fs::create_dir_all(&p).unwrap();
         TmpDir(p)
     }

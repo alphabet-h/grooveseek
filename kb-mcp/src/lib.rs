@@ -24,6 +24,10 @@ pub mod schema;
 pub mod schema_compat;
 pub mod server;
 pub mod service;
+/// Shared helpers for the unit tests in `src/**`. Test-only, so it does not
+/// widen the library surface.
+#[cfg(test)]
+pub mod test_support;
 pub mod transport;
 pub mod tune;
 pub mod watcher;

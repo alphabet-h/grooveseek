@@ -1848,12 +1848,7 @@ mod tests {
     }
     impl TempKb {
         fn new(prefix: &str) -> Self {
-            let pid = std::process::id();
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!("kb-mcp-srvtest-{prefix}-{pid}-{nonce}"));
+            let path = crate::test_support::unique_temp_path(&format!("kb-mcp-srvtest-{prefix}"));
             fs::create_dir_all(&path).unwrap();
             let canon = path.canonicalize().unwrap();
             Self { path: canon }
@@ -1924,12 +1919,8 @@ mod tests {
         let kb = TempKb::new("bp3");
         // kb_path の外側にファイルを作る (親ディレクトリに)
         let outside = kb.path.parent().unwrap().join(format!(
-            "kb-mcp-srvtest-outside-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            "kb-mcp-srvtest-outside-{}.md",
+            crate::test_support::unique_suffix()
         ));
         fs::write(&outside, "secret").unwrap();
 
@@ -2075,12 +2066,8 @@ mod tests {
         // (canonicalize 成功 → starts_with 失敗 branch、Windows でも portable)
         let kb = TempKb::new("bp-trav");
         let outside = kb.path.parent().unwrap().join(format!(
-            "kb-mcp-srvtest-bp-outside-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            "kb-mcp-srvtest-bp-outside-{}.md",
+            crate::test_support::unique_suffix()
         ));
         fs::write(&outside, "secret").unwrap();
         let target_rel = format!("../{}", outside.file_name().unwrap().to_string_lossy());
@@ -2532,12 +2519,8 @@ mod tests {
         let kb = TempKb::new("gd-trav");
         // kb_path 外側にファイル作成
         let outside = kb.path.parent().unwrap().join(format!(
-            "kb-mcp-srvtest-outside-gd-{}-{}.md",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            "kb-mcp-srvtest-outside-gd-{}.md",
+            crate::test_support::unique_suffix()
         ));
         fs::write(&outside, "secret").unwrap();
         let rel = format!("../{}", outside.file_name().unwrap().to_string_lossy());

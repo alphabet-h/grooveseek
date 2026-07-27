@@ -14,6 +14,10 @@ mod poll;
 mod process;
 #[cfg(target_os = "windows")]
 mod state;
+/// Test-only. The same source file is declared by `lib.rs`; `daemon.rs` and
+/// `process.rs` live in this target, `install.rs` in the other.
+#[cfg(all(test, target_os = "windows"))]
+mod test_support;
 #[cfg(target_os = "windows")]
 mod tray;
 #[cfg(target_os = "windows")]
