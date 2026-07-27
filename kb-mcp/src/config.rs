@@ -1385,6 +1385,48 @@ lambda = 0.5
         assert_eq!(resolve_relative(base, verbatim.clone()), verbatim);
     }
 
+    /// AU-06 (codex P2): example が勧める `[parsers].enabled` が、実際に
+    /// Registry を組めること。コメント行で示している例も含めて全部見る。
+    ///
+    /// [`test_toml_example_parses_with_all_keys_uncommented`] は example が
+    /// **TOML として `Config` に入るか**しか見ていない。id が registry に
+    /// 載るかは別の検査で、そこが空いていたため `.xls` を registry から
+    /// 外したときに「全形式を index する例」が起動時エラーになる状態を
+    /// 見逃した。parser を増減させたら必ずここで気付く。
+    #[test]
+    fn every_enabled_list_in_the_example_builds_a_registry() {
+        let example_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("kb-mcp.toml.example");
+        let raw = std::fs::read_to_string(&example_path).expect("example must exist");
+
+        let mut checked = 0usize;
+        for line in raw.lines() {
+            let Some(idx) = line.find("enabled = [") else {
+                continue;
+            };
+            let arr = &line[idx + "enabled = ".len()..];
+            let end = arr
+                .find(']')
+                .unwrap_or_else(|| panic!("enabled array should close on one line: {line}"));
+            let ids: Vec<String> = arr[1..end]
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert!(!ids.is_empty(), "could not read ids from: {line}");
+            crate::parser::Registry::from_enabled(&ids).unwrap_or_else(|e| {
+                panic!(
+                    "kb-mcp.toml.example suggests a [parsers].enabled that this build \
+                     rejects:\n  {line}\n  {e}"
+                )
+            });
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected at least the active list and the all-formats example, found {checked}"
+        );
+    }
+
     #[test]
     fn test_toml_example_parses_with_all_keys_uncommented() {
         // kb-mcp.toml.example のすべてのキーが Config で受け入れられるかを検証。
