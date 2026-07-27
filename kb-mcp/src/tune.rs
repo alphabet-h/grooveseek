@@ -1579,6 +1579,215 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // AU-22: guards for the sweep optimisation in `build_metric_table`.
+    //
+    // The sweep fills TOTAL_CONDITIONS (384) cells with WEIGHT_CONDITIONS (64)
+    // SQL round trips per query, by reusing one FTS candidate list across the
+    // six `rrf_k` values that share a weight triple. That is only sound while
+    // `search_fts_candidates` ignores `rrf_k`. Nothing asserted any of it.
+    // -----------------------------------------------------------------------
+
+    /// A corpus on which the bm25 column weights demonstrably change the
+    /// ranking, which is what makes the guards below able to fail.
+    ///
+    /// Measured while writing them: a three-document corpus is **not** enough.
+    /// Every trigram then appears in nearly every row, IDF collapses to ~0, and
+    /// bm25 returns ~1e-6 whatever the weights are — so a test built on it
+    /// passes even when the weights are wired wrong. This shape does discriminate:
+    ///
+    /// | heading weight | first hit |
+    /// |---|---|
+    /// | 0.5 | the content-only document |
+    /// | 4.0 | the heading-only document |
+    fn weight_sensitive_docs(db: &crate::db::Database) {
+        // term only in the heading
+        add_doc(
+            db,
+            "h.md",
+            "zebrafish",
+            "unrelated filler prose about widgets",
+            0.1,
+        );
+        // term only in the content
+        add_doc(
+            db,
+            "c.md",
+            "widgets",
+            "a study of zebrafish in the laboratory",
+            0.2,
+        );
+        // filler, so the term is rare enough to carry IDF
+        for i in 0..14 {
+            add_doc(
+                db,
+                &format!("f{i}.md"),
+                "widgets",
+                "assorted filler prose about widgets and gears",
+                0.3,
+            );
+        }
+    }
+
+    /// The corpus above plus a hand-built `Preflight`, so the sweep can run
+    /// without an embedder: `vec_ids` is supplied directly rather than
+    /// retrieved, which is the only part of the real pre-flight that embeds.
+    fn sweep_fixture() -> (crate::db::Database, Preflight) {
+        let db = tune_db();
+        weight_sensitive_docs(&db);
+
+        let mk = |id: &str, q: &str, expected: Vec<&str>, vec_ids: Vec<i64>| PreparedQuery {
+            id: id.to_string(),
+            query: q.to_string(),
+            expected: expected
+                .into_iter()
+                .map(|p| crate::eval::ExpectedHit {
+                    path: p.to_string(),
+                    heading: None,
+                })
+                .collect(),
+            vec_ids,
+            diag: QueryDiagnostics::default(),
+        };
+        // Overlapping vec lists so RRF actually mixes the two rankings; with no
+        // overlap every score collapses to 1/(k+r+1) and the rrf_k axis becomes
+        // unmeasurable (see QueryDiagnostics::vec_fts_overlap).
+        let pre = Preflight {
+            queries: vec![
+                mk("q0", "zebrafish", vec!["h.md", "c.md"], vec![1, 2, 3]),
+                mk("q1", "widgets", vec!["c.md"], vec![3, 1, 2]),
+            ],
+            effective: vec![0, 1],
+            chunk_total: 16,
+            pool_size: 10,
+        };
+        (db, pre)
+    }
+
+    /// The invariant the optimisation rests on, stated directly: the FTS
+    /// candidate list must not depend on `rrf_k`. If it ever did, sharing one
+    /// list across the six `rrf_k` conditions would silently produce a wrong
+    /// sweep — and no existing test looked at it.
+    #[test]
+    fn test_fts_candidates_do_not_depend_on_rrf_k() {
+        let db = tune_db();
+        weight_sensitive_docs(&db);
+        let filters = crate::db::SearchFilters::default();
+        let base = Condition::builtin_default().to_params();
+        let probe = |p: crate::db::FusionParams| {
+            db.search_fts_candidates("zebrafish", 10, &filters, p)
+                .unwrap()
+                .iter()
+                .map(|(id, sr)| (*id, sr.score))
+                .collect::<Vec<_>>()
+        };
+
+        let reference = probe(base);
+        assert!(!reference.is_empty(), "fixture must produce FTS candidates");
+
+        // Sanity check on the fixture itself: this corpus *does* respond to the
+        // weights, so "nothing changed" below is evidence rather than an
+        // artifact of an insensitive corpus. Without this the whole test passes
+        // on a corpus where bm25 returns ~0 regardless.
+        let heavier = probe(crate::db::FusionParams {
+            bm25_heading_weight: 4.0,
+            ..base
+        });
+        let lighter = probe(crate::db::FusionParams {
+            bm25_heading_weight: 0.5,
+            ..base
+        });
+        assert_ne!(
+            heavier, lighter,
+            "fixture is insensitive to the bm25 weights, so it cannot detect \
+             a weight-dependent regression"
+        );
+
+        for &rrf_k in RRF_K_GRID.iter() {
+            let got = probe(crate::db::FusionParams { rrf_k, ..base });
+            assert_eq!(
+                got, reference,
+                "rrf_k={rrf_k} changed the FTS candidate list; \
+                 build_metric_table shares one list across the whole rrf_k axis"
+            );
+        }
+    }
+
+    /// The sweep must cost one round trip per *weight* condition, not per
+    /// condition. Losing the `c.k != 0` skip would still produce a correct
+    /// table — six times more slowly — so correctness tests cannot catch it.
+    #[test]
+    fn test_sweep_makes_one_round_trip_per_weight_condition() {
+        let (db, mut pre) = sweep_fixture();
+        let n_queries = pre.queries.len();
+        let mut meta = HashMap::new();
+
+        crate::db::FTS_CANDIDATE_CALLS.with(|c| c.set(0));
+        let table = build_metric_table(&db, &mut pre, &mut meta, &[PRIMARY_K], 10).unwrap();
+        let calls = crate::db::FTS_CANDIDATE_CALLS.with(|c| c.get());
+
+        assert_eq!(
+            calls,
+            WEIGHT_CONDITIONS * n_queries,
+            "expected {WEIGHT_CONDITIONS} round trips per query over {n_queries} queries"
+        );
+        // And it really did fill every cell, rather than making fewer calls by
+        // doing less work.
+        assert_eq!(table.query_count(), n_queries);
+    }
+
+    /// Equivalence with the naive sweep: one `search_fts_candidates` per
+    /// condition, all 384 of them. This is what says the reuse is not merely
+    /// cheap but right.
+    #[test]
+    fn test_optimised_sweep_matches_the_naive_one() {
+        let (db, mut pre) = sweep_fixture();
+        let k_values = [PRIMARY_K];
+        let limit = 10_u32;
+        let mut meta = HashMap::new();
+        let optimised = build_metric_table(&db, &mut pre, &mut meta, &k_values, limit).unwrap();
+
+        // Naive: no sharing at all — re-query for every condition, including
+        // each rrf_k.
+        let filters = crate::db::SearchFilters::default();
+        let mut naive_meta = HashMap::new();
+        let mut naive_rows = Vec::new();
+        for pq in &pre.queries {
+            let mut row = vec![crate::eval::QueryMetrics::default(); TOTAL_CONDITIONS];
+            for c in Condition::all() {
+                let params = c.to_params();
+                let fts_hits = db
+                    .search_fts_candidates(&pq.query, pre.pool_size, &filters, params)
+                    .unwrap();
+                let mut fts_ids = Vec::with_capacity(fts_hits.len());
+                for (id, sr) in &fts_hits {
+                    naive_meta.entry(*id).or_insert_with(|| HitMeta {
+                        path: sr.path.clone(),
+                        heading: sr.heading.clone(),
+                    });
+                    fts_ids.push(*id);
+                }
+                let ranked =
+                    crate::db::fuse_rrf_ids(&pq.vec_ids, &fts_ids, params.rrf_k, Some(limit));
+                let top = to_hit_records(&ranked, &naive_meta);
+                row[c.index()] = crate::eval::compute_query_metrics(&pq.expected, &top, &k_values);
+            }
+            naive_rows.push(row);
+        }
+        let naive = MetricTable::from_rows(naive_rows, k_values.to_vec());
+
+        for c in Condition::all() {
+            for q in 0..pre.queries.len() {
+                assert_eq!(
+                    optimised.primary(c, q),
+                    naive.primary(c, q),
+                    "condition {c:?} query {q} diverged between the shared-FTS sweep \
+                     and the naive one"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_count_fts_matches_counts_phrase_hits() {
         // D-11-6 の phrase doc-freq 診断の土台。
