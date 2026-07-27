@@ -2297,10 +2297,17 @@ mod tests {
         let out = format_text(&report, false);
         assert!(out.contains("Recommendation:"), "{out}");
         assert!(out.contains(&winner.label()), "{out}");
-        // The snippet is what a user pastes; emitting the verdict without it
-        // would leave them nothing to act on.
-        assert!(out.contains("[search.fusion]"), "{out}");
-        assert!(out.contains("rrf_k"), "{out}");
+        // The snippet must be the *adopted* one, not merely a well-formed
+        // `[search.fusion]` block: emitting the built-in default here while
+        // recommending `winner` would have the user paste parameters that
+        // contradict the recommendation, and a header-and-key check would not
+        // notice (codex P2 round 1).
+        assert!(
+            out.contains(&toml_snippet(winner)),
+            "text output must embed the snippet for the adopted condition\n\
+             --- expected ---\n{}\n--- got ---\n{out}",
+            toml_snippet(winner)
+        );
         // And it must still be the advice to re-verify with the full pipeline.
         assert!(out.contains("kb-mcp eval"), "{out}");
     }
@@ -2314,7 +2321,16 @@ mod tests {
         let report = synthetic_report_from(table, idx);
         let v = format_json(&report);
         assert_eq!(v["verdict"]["decision"], "adopt", "{v}");
-        assert!(v["verdict"]["condition"].is_object(), "{v}");
+        // Assert the *values*, not just that a `condition` object exists: a
+        // machine consumer reads this field, so serialising the wrong
+        // condition here would hand it incorrect tuning parameters while the
+        // separately generated snippet still looked right (codex P2 round 1).
+        let p = winner.to_params();
+        let cond = &v["verdict"]["condition"];
+        assert_eq!(cond["rrf_k"], p.rrf_k, "{v}");
+        assert_eq!(cond["bm25_heading_weight"], p.bm25_heading_weight, "{v}");
+        assert_eq!(cond["bm25_context_weight"], p.bm25_context_weight, "{v}");
+        assert_eq!(cond["bm25_content_weight"], p.bm25_content_weight, "{v}");
         let snippet = v["verdict"]["toml_snippet"]
             .as_str()
             .expect("adopt must carry a snippet");
