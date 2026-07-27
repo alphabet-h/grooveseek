@@ -4,6 +4,34 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-27
+
+### Added
+
+- **`kb-mcp-tray.exe` and `kb-mcp-svc.exe` are attached to the release.** They
+  never had been. Both crates set `publish = false`, and cargo-dist skips a
+  `publish = false` package unless `[package.metadata.dist] dist = true` says
+  otherwise — so from v0.9.0 onward the release workflow built and announced
+  `kb-mcp` alone, while the READMEs told Windows users to take the tray out of
+  a release archive that did not contain it. Two changes were needed, and
+  either one alone changes nothing: `dist = true` on both packages, and their
+  versions moved to 0.14.0, because an unqualified `vX.Y.Z` tag announces only
+  the dist-able packages carrying that exact version. Verified with
+  `dist plan --tag=v0.14.0` against the pinned cargo-dist 0.31.0, and by
+  building both with the release `dist` profile for `x86_64-pc-windows-msvc`.
+
+  Each is its own archive — `kb-mcp-tray-x86_64-pc-windows-msvc.zip` and
+  `kb-mcp-svc-x86_64-pc-windows-msvc.zip` — not extra files inside the `kb-mcp`
+  archive, which is what the READMEs had claimed. Extract the tray next to
+  `kb-mcp.exe`, where `kb-mcp service install --with-tray` looks for it.
+
+  Practical consequence beyond the tray: `kb-mcp service install` prefers
+  `kb-mcp-svc.exe` for the logon Action and silently falls back to a
+  console-visible one when the sibling is missing. Since the launcher was
+  never shipped, every installation from a release archive took the fallback,
+  and the v0.9.1 "no console flash at logon" fix has not reached anyone until
+  now.
+
 ### Removed
 
 - **`.xls` (legacy BIFF) is no longer indexed** (AU-06). Listing `"xls"` in
@@ -181,102 +209,6 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   inside a transaction, then rolling back, restores the original table and its
   rows.
 
-### Internal
-
-- **The unit and plist templates now live in one always-compiled module**
-  (`src/service/render.rs`, part of AU-10). They previously sat inside
-  `service::linux` and `service::macos`, which are gated on `target_os`, so the
-  plist template was compiled only on macOS runners and the unit template only
-  on Linux ones — a typo in either was invisible everywhere else, including
-  locally. Both are pure functions over `InstallContext`, so they and their
-  escaping helpers now build and are tested on all three CI legs;
-  `service::linux::render_unit` and `service::macos::render_plist` remain as
-  re-exports, so nothing that called them had to change. This is the same move
-  AU-07/08 made for `child_args`.
-
-- **`kb-mcp service status` / `list` had no tests at all** (AU-14). Everything
-  the two subcommands print goes through three functions in
-  `src/service/status.rs`, and not one of them was covered: the toml fallback
-  that fills in `bind` and `kb_path` when the OS cannot report them, and the
-  two formatters. The fallback is now split so its decision — which field wins
-  when both the OS and `kb-mcp.toml` have an answer — is a plain function over
-  an already-read config string, following the same shape as
-  `build_register_script` and the AU-63 fix. That matters here because the
-  alternative, driving it through `KB_MCP_CONFIG_HOME`, would have put a second
-  process-wide environment mutation into a suite that runs its tests as threads
-  — exactly what AU-63 removed. Seventeen tests now cover all three
-  `ServiceState` arms, each field falling back independently, an absent,
-  malformed, or irrelevant config, and both output formats. One of them pins
-  something no eye-check reliably catches: that the columns `format_row` emits
-  line up with the header `run_list` prints above them. Behaviour is unchanged.
-
-### Documentation
-
-- **`docs/` subpages that described behaviour the code does not have** (AU-46,
-  AU-47, AU-48, AU-49). `eval.md` listed graded relevance as "parsed tolerantly
-  but ignored"; every golden struct is `deny_unknown_fields`, so a `relevance:`
-  key aborts the run — `unknown field 'relevance', expected 'path' or
-  'heading'`, exit 1, before anything is evaluated. Its troubleshooting table
-  listed an error string (`expected path not in index`) that appears nowhere in
-  the source; the real symptom is a per-query `✗ <id>  recall@N: 0.00` line. It
-  also claimed runs at default fusion settings stay comparable with
-  pre-v0.13.0 baselines, but `metric_version` went 1 → 2 and the fingerprint is
-  compared whole, so those runs are skipped — as the same file said two
-  paragraphs earlier. `filters.md` was missing `min_quality` /
-  `include_low_quality`, and gave the `low_confidence` formula as
-  `top1.score / mean` when the implementation uses `max(scores) / mean` — they
-  differ exactly when MMR has re-ordered the results. `citations.md` gave one
-  condition for a null `match_spans` (there are three: non-ASCII query, empty
-  query, content over 256 KiB) and promised "all match positions" where 100 per
-  chunk is the cap. `retrieval-pipeline.md` still described a 2-column FTS
-  index. The `tune` section now also documents the context-axis warning, which fires
-  on default-configured KBs that reach the grid (a golden set with no effective
-  FTS queries exits earlier).
-
-- **The web UI and admin API were absent from the README** (AU-60). `/ui` and
-  `/api/admin/status` have shipped since v0.8.0, but the only mentions were in
-  the architecture doc and the Windows tray section — so anyone not running the
-  tray had no way to learn they exist. Documented with the response shape, the
-  loopback-peer restriction, the SSH-forward recipe for remote hosts, and why a
-  reverse proxy must not map those routes. Also fixed the dead TLS-section
-  anchor in both READMEs (AU-62), refreshed the hybrid-search description
-  (three FTS columns, configurable `k` and weights), corrected the tray
-  Start/Stop description to match v0.13.2, and brought `CLAUDE.md`'s format and
-  subcommand lists up to date.
-
-- **Deployment recipes that could not work as written** (AU-34, AU-35,
-  AU-37, AU-38, AU-39, AU-45). The NAS recipe put `.kb-mcp.db` on the share
-  and had every machine open it, which SQLite documents as unsupported:
-  "All processes using a database must be on the same host computer; WAL does
-  not work over a network filesystem." That is not a writer-only restriction —
-  readers take part in the same shared-memory protocol — so no mount flag or
-  single-writer rule could make it safe. The recipe now keeps the KB files on
-  the NAS and gives **each machine its own index on local disk**, which falls
-  out of mounting the share at a path whose parent is local (`.kb-mcp.db` is
-  created beside `kb_path`). If you want one shared index, that is what the
-  intranet-http recipe is for. The old advice to mount read-only was doubly
-  wrong: kb-mcp opens the database read-write, and a WAL database cannot even
-  be read without creating its `-shm` / `-wal` sidecars — measured with the
-  directory made non-writable, `kb-mcp status` fails with `Error code 14:
-  unable to open database file`. The intranet recipe
-  never mentioned `[transport.http].allowed_hosts`, whose default is loopback
-  only, so every LAN client following it was answered with 403 no matter what
-  `bind` said; the config and both READMEs now cover it, including behind a
-  reverse proxy. The personal recipe told you to `cargo install --path .`,
-  which fails on the workspace root (`--path kb-mcp`), linked one directory
-  too high after the workspace split, and described the reranker as loaded
-  when the key is commented out — in that state `rerank: true` is a silent
-  no-op, which is now stated where the claim used to be. The hook sample only
-  rebuilt for `.md`, so a KB with Office or PDF files silently went stale; it
-  now takes a `KB_EXTENSIONS` list defaulting to every supported format, with
-  case-insensitive matching. Also documented: the intranet recipe uses a
-  system unit deliberately rather than `kb-mcp service install` (user-level),
-  and `/ui` plus `/api/admin/*` refuse non-loopback peers, so they cannot be
-  reached from the LAN directly — but a reverse proxy on the same host
-  presents a loopback peer and an allow-listed Host, so it has to map `/mcp`
-  and `/healthz` only.
-
-### Fixed
 
 - **`kb-mcp eval` compared runs from either side of a `[contextual]` switch as
   if they were the same experiment** (AU-61). Turning contextual retrieval on or
@@ -457,6 +389,101 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   run re-save the old contents under the new key, which is the same freeze
   reached by a different route, and the archive here holds only BGE-small
   (~130 MB), so a genuine miss costs one download.
+
+### Internal
+
+- **The unit and plist templates now live in one always-compiled module**
+  (`src/service/render.rs`, part of AU-10). They previously sat inside
+  `service::linux` and `service::macos`, which are gated on `target_os`, so the
+  plist template was compiled only on macOS runners and the unit template only
+  on Linux ones — a typo in either was invisible everywhere else, including
+  locally. Both are pure functions over `InstallContext`, so they and their
+  escaping helpers now build and are tested on all three CI legs;
+  `service::linux::render_unit` and `service::macos::render_plist` remain as
+  re-exports, so nothing that called them had to change. This is the same move
+  AU-07/08 made for `child_args`.
+
+- **`kb-mcp service status` / `list` had no tests at all** (AU-14). Everything
+  the two subcommands print goes through three functions in
+  `src/service/status.rs`, and not one of them was covered: the toml fallback
+  that fills in `bind` and `kb_path` when the OS cannot report them, and the
+  two formatters. The fallback is now split so its decision — which field wins
+  when both the OS and `kb-mcp.toml` have an answer — is a plain function over
+  an already-read config string, following the same shape as
+  `build_register_script` and the AU-63 fix. That matters here because the
+  alternative, driving it through `KB_MCP_CONFIG_HOME`, would have put a second
+  process-wide environment mutation into a suite that runs its tests as threads
+  — exactly what AU-63 removed. Seventeen tests now cover all three
+  `ServiceState` arms, each field falling back independently, an absent,
+  malformed, or irrelevant config, and both output formats. One of them pins
+  something no eye-check reliably catches: that the columns `format_row` emits
+  line up with the header `run_list` prints above them. Behaviour is unchanged.
+
+### Documentation
+
+- **`docs/` subpages that described behaviour the code does not have** (AU-46,
+  AU-47, AU-48, AU-49). `eval.md` listed graded relevance as "parsed tolerantly
+  but ignored"; every golden struct is `deny_unknown_fields`, so a `relevance:`
+  key aborts the run — `unknown field 'relevance', expected 'path' or
+  'heading'`, exit 1, before anything is evaluated. Its troubleshooting table
+  listed an error string (`expected path not in index`) that appears nowhere in
+  the source; the real symptom is a per-query `✗ <id>  recall@N: 0.00` line. It
+  also claimed runs at default fusion settings stay comparable with
+  pre-v0.13.0 baselines, but `metric_version` went 1 → 2 and the fingerprint is
+  compared whole, so those runs are skipped — as the same file said two
+  paragraphs earlier. `filters.md` was missing `min_quality` /
+  `include_low_quality`, and gave the `low_confidence` formula as
+  `top1.score / mean` when the implementation uses `max(scores) / mean` — they
+  differ exactly when MMR has re-ordered the results. `citations.md` gave one
+  condition for a null `match_spans` (there are three: non-ASCII query, empty
+  query, content over 256 KiB) and promised "all match positions" where 100 per
+  chunk is the cap. `retrieval-pipeline.md` still described a 2-column FTS
+  index. The `tune` section now also documents the context-axis warning, which fires
+  on default-configured KBs that reach the grid (a golden set with no effective
+  FTS queries exits earlier).
+
+- **The web UI and admin API were absent from the README** (AU-60). `/ui` and
+  `/api/admin/status` have shipped since v0.8.0, but the only mentions were in
+  the architecture doc and the Windows tray section — so anyone not running the
+  tray had no way to learn they exist. Documented with the response shape, the
+  loopback-peer restriction, the SSH-forward recipe for remote hosts, and why a
+  reverse proxy must not map those routes. Also fixed the dead TLS-section
+  anchor in both READMEs (AU-62), refreshed the hybrid-search description
+  (three FTS columns, configurable `k` and weights), corrected the tray
+  Start/Stop description to match v0.14.0, and brought `CLAUDE.md`'s format and
+  subcommand lists up to date.
+
+- **Deployment recipes that could not work as written** (AU-34, AU-35,
+  AU-37, AU-38, AU-39, AU-45). The NAS recipe put `.kb-mcp.db` on the share
+  and had every machine open it, which SQLite documents as unsupported:
+  "All processes using a database must be on the same host computer; WAL does
+  not work over a network filesystem." That is not a writer-only restriction —
+  readers take part in the same shared-memory protocol — so no mount flag or
+  single-writer rule could make it safe. The recipe now keeps the KB files on
+  the NAS and gives **each machine its own index on local disk**, which falls
+  out of mounting the share at a path whose parent is local (`.kb-mcp.db` is
+  created beside `kb_path`). If you want one shared index, that is what the
+  intranet-http recipe is for. The old advice to mount read-only was doubly
+  wrong: kb-mcp opens the database read-write, and a WAL database cannot even
+  be read without creating its `-shm` / `-wal` sidecars — measured with the
+  directory made non-writable, `kb-mcp status` fails with `Error code 14:
+  unable to open database file`. The intranet recipe
+  never mentioned `[transport.http].allowed_hosts`, whose default is loopback
+  only, so every LAN client following it was answered with 403 no matter what
+  `bind` said; the config and both READMEs now cover it, including behind a
+  reverse proxy. The personal recipe told you to `cargo install --path .`,
+  which fails on the workspace root (`--path kb-mcp`), linked one directory
+  too high after the workspace split, and described the reranker as loaded
+  when the key is commented out — in that state `rerank: true` is a silent
+  no-op, which is now stated where the claim used to be. The hook sample only
+  rebuilt for `.md`, so a KB with Office or PDF files silently went stale; it
+  now takes a `KB_EXTENSIONS` list defaulting to every supported format, with
+  case-insensitive matching. Also documented: the intranet recipe uses a
+  system unit deliberately rather than `kb-mcp service install` (user-level),
+  and `/ui` plus `/api/admin/*` refuse non-loopback peers, so they cannot be
+  reached from the LAN directly — but a reverse proxy on the same host
+  presents a loopback peer and an allow-listed Host, so it has to map `/mcp`
+  and `/healthz` only.
 
 ### Changed
 
@@ -1809,7 +1836,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/alphabet-h/kb-mcp/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.11.0...v0.12.0

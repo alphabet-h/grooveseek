@@ -23,6 +23,13 @@ Download the archive for your platform from the [latest GitHub release](https://
 
 > **Intel Mac (`x86_64-apple-darwin`)** is not shipped as a prebuilt: the upstream ONNX Runtime crate (`ort-sys`) does not provide a binary for that target. Build from source as described below.
 
+> **Windows: two more archives, if you will run kb-mcp as a service.** They are separate downloads (v0.14.0+), and both belong in the same directory as `kb-mcp.exe`:
+>
+> | Archive | Why |
+> | --- | --- |
+> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` points the logon task at `kb-mcp-svc.exe` when it sits next to `kb-mcp.exe`, and **silently falls back to a console-visible launcher when it does not** — which means a console window flashes at every login. Nothing reports the fallback, so extract this one before running `service install`. |
+> | `kb-mcp-tray-x86_64-pc-windows-msvc.zip` | Optional. The system tray monitor; needed only for `service install --with-tray`. |
+
 Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running.
 
 ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. Embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](#working-around-huggingface-tls-failures-on-first-download) if your network blocks that.
@@ -69,7 +76,7 @@ threshold = 0.3
 # via an explicit list. An empty array is rejected to prevent silent
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
-# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.13.2 — see below.)
+# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.14.0 — see below.)
 # Example enabling everything:
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
@@ -319,7 +326,7 @@ Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mc
 
 ### Tray monitor (Windows only, v0.9.0+)
 
-`kb-mcp-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. Shipped in the Windows release zip alongside `kb-mcp.exe`.
+`kb-mcp-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. It ships from v0.14.0 in its own archive, `kb-mcp-tray-x86_64-pc-windows-msvc.zip` — not inside the `kb-mcp` archive. Extract it next to `kb-mcp.exe`; `kb-mcp service install --with-tray` looks for it there. (Releases before v0.14.0 did not contain it at all: the two Windows companion binaries were built but never attached, so use v0.14.0 or later.)
 
 Install alongside the daemon:
 
@@ -334,7 +341,7 @@ On next logon the tray icon appears with a colored status dot:
 - **red** — daemon has been unreachable for >= 1 minute (= 12 consecutive failed polls at 5s interval)
 - **gray** — pre-first-poll (= within the first 5 seconds of startup)
 
-Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. **Start** runs the scheduled task; **Stop** terminates the daemon process by the pid it reports at `/api/admin/status` (v0.13.2+), then confirms it is gone by binding the daemon's address — `Stop-ScheduledTask` only ever stopped the launcher, which exits immediately, so it silently did nothing.
+Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. **Start** runs the scheduled task; **Stop** terminates the daemon process by the pid it reports at `/api/admin/status` (v0.14.0+), then confirms it is gone by binding the daemon's address — `Stop-ScheduledTask` only ever stopped the launcher, which exits immediately, so it silently did nothing.
 
 Tray logs live at `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (daily rotation). Set `KB_MCP_TRAY_LOG=debug` for verbose output. Pass `--debug` to attach a console for live stdout/stderr.
 
@@ -815,7 +822,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
   Known limitations:
   - **No legacy binary formats**: pre-2007 `.doc` (Word), `.ppt` (PowerPoint) and `.xls` (Excel) are not supported — only the OOXML forms (`.docx` / `.pptx` / `.xlsx`) above.
 
-    `.xls` was indexed between v0.11.0 and v0.13.1 and was withdrawn in v0.13.2. calamine materialises one dense cell grid per sheet while opening a workbook, before kb-mcp regains control. BIFF bounds a *sheet* at 65,536 x 256 (512 MB worth of cells), but it does not bound a *workbook*: two cell records at opposite corners make a sheet maximal, so a small crafted file can declare enough sheets to exhaust memory — and an allocation failure aborts the process rather than skipping the file. Listing `"xls"` in `[parsers].enabled` is now rejected at startup with that explanation. Convert the workbook to `.xlsx`, which is read as a stream.
+    `.xls` was indexed between v0.11.0 and v0.13.1 and was withdrawn in v0.14.0. calamine materialises one dense cell grid per sheet while opening a workbook, before kb-mcp regains control. BIFF bounds a *sheet* at 65,536 x 256 (512 MB worth of cells), but it does not bound a *workbook*: two cell records at opposite corners make a sheet maximal, so a small crafted file can declare enough sheets to exhaust memory — and an allocation failure aborts the process rather than skipping the file. Listing `"xls"` in `[parsers].enabled` is now rejected at startup with that explanation. Convert the workbook to `.xlsx`, which is read as a stream.
   - **No OpenDocument formats**: `.odt` / `.ods` / `.odp` are not supported.
   - **Password-protected files are skipped, not decrypted**: an encrypted Office file is detected (the zip / BIFF container fails to open) and skipped with a warning instead of failing the whole `index` run — there is no password support.
   - **Tables are flattened to plain text**: `.docx` and `.pptx` table cells are read as ordinary text runs (no row/column structure preserved in the chunk); `.xlsx` rows are tab-joined per line. Downstream retrieval sees prose, not a grid.

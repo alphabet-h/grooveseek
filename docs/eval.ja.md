@@ -160,7 +160,7 @@ CLI フラグが config より優先。受理されるフラグ: `--golden`, `--
 で終了する。"compatible" = 直前 run の fingerprint (`model` / `reranker` /
 `limit` / `k_values` / golden YAML の content hash / metric 実装 version、
 および v0.7.0+ では実効 `[search.mmr]` / `[search.parent_retriever]` 設定、
-v0.13.0 以降はさらに既定値と異なる `[search.fusion]`、v0.13.2 以降は
+v0.13.0 以降はさらに既定値と異なる `[search.fusion]`、v0.14.0 以降は
 `[contextual].enabled = true` で構築された index の context mode) が一致
 していること。
 MMR / parent retriever の on/off を切り替えても、fusion パラメータを
