@@ -245,20 +245,15 @@ fn flush_xlsx_row(text: &mut String, row_cells: &[String]) {
 /// が `"xls"` を拒否するので、`.xls` は index されない。型とテストは
 /// pre-check を実装したときに戻せるよう残してある。
 ///
-/// # なぜ無効にしたか
+/// # なぜ無効にしたか (要約)
 ///
-/// 旧コメントはこう書いていた:
+/// 決定の全文 — 検討した 4 案とそれぞれの却下理由、再対応の条件 — は
+/// `docs/decisions/0001-withdraw-xls-legacy-biff-support.md` (ADR-0001)。
+/// ここには、この経路を再び有効化しようとする人がその場で要る実測値だけ残す。
 ///
-/// > BIFF フォーマット自体が 65536 行 × 256 列 (Excel 97-2003 の仕様上限) に
-/// > 有界なため、dense Range を作っても xlsx のような無制限 OOM のリスクが無い
-///
-/// **これは誤り**。BIFF が縛るのは **シート 1 枚**であって workbook ではない。
-/// calamine の `Xls` は `sheets: BTreeMap<String, SheetData>` に全シートを
-/// 同時に保持し、`Xls::new()` の中で各シートについて `Range::from_sparse()` を
-/// 呼ぶ。`from_sparse` は実セル位置の bounding rectangle を求めて
-/// `vec![Data::default(); rows * cols]` を **密に**確保する。
-///
-/// 実測 (2026-07-27):
+/// `Xls::new()` は全シートを `BTreeMap` に保持し、各シートについて
+/// `Range::from_sparse()` を呼んで bounding rectangle を **密に**確保する。
+/// BIFF が縛るのは **シート 1 枚**であって workbook ではない (実測 2026-07-27):
 ///
 /// | 項目 | 値 |
 /// |---|---|
@@ -267,18 +262,11 @@ fn flush_xlsx_row(text: &mut String, row_cells: &[String]) {
 /// | `worksheet_range()` は既存 Range を clone | ピーク **1 GB** / シート |
 /// | workbook の上限 | **無し** (シート数 × 512 MB) |
 ///
-/// 対角 2 セル分のレコード (数十バイト) で 1 シートを最大矩形にできるので、
-/// 小さなファイルで数十万シートを宣言でき、割り当ては RAM を超える。
-/// **割り当て失敗は catch できずプロセスが落ちる** (AU-01 と同じ性質) ので、
-/// per-file skip (AU-21) でも救えない。
+/// **割り当て失敗は catch できずプロセスが落ちる** (AU-01 と同じ性質) ため、
+/// per-file skip (AU-21) でも panic guard でも救えない。
 ///
-/// # なぜ pre-check を入れなかったか
-///
-/// 密な確保は `Xls::new()` の内側で完了しており、`worksheet_range()` に
-/// 到達した時点では既に払い終わっている。手前で測るには `Xls::new()` の
-/// **前に** 自前で CFB (OLE2) を辿り BOUNDSHEET / DIMENSIONS を読む必要があり、
-/// 新規依存 (`cfb`) と BIFF レコード走査の実装を伴う。`.xls` はレガシー形式で
-/// 要望も出ていないため、要望が出た時点で実装する判断にした (2026-07-27)。
+/// pre-check は **`Xls::new()` より前**にしか置けない: この関数に到達した時点で
+/// 確保は完了しており、`Xls` は `ReaderRef` 未実装なので clone も避けられない。
 fn parse_xls_bytes_capped(
     bytes: &[u8],
     path_hint: &str,

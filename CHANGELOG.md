@@ -4,6 +4,23 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- **Architecture Decision Records under [`docs/decisions/`](docs/decisions/).**
+  Decisions that compared real alternatives, are expensive to reverse, and
+  affect structure, dependencies, interfaces, or non-functional
+  characteristics now get one canonical record —
+  [MADR](https://adr.github.io/madr/) format, English and Japanese pairs,
+  superseded rather than edited.
+  [ADR-0000](docs/decisions/0000-record-decisions-as-adrs.md) states the
+  process and the threshold; [ADR-0001](docs/decisions/0001-withdraw-xls-legacy-biff-support.md)
+  covers the v0.14.0 `.xls` withdrawal.
+
+  This is a consolidation, not an addition: the reasoning behind the `.xls`
+  withdrawal had been duplicated across this changelog, both READMEs, and a
+  source comment, none of which recorded the options that were rejected. Those
+  three now carry a summary and a link.
+
 ### Internal
 
 - **Retrieval quality of the binary formats is now measured** (AU-24).
@@ -61,18 +78,15 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 - **`.xls` (legacy BIFF) is no longer indexed** (AU-06). Listing `"xls"` in
   `[parsers].enabled` now fails at startup with an explanation instead of
-  registering the parser. calamine builds one dense cell grid per sheet while
-  opening a workbook, before kb-mcp regains control, and BIFF bounds a *sheet*
-  at 65,536 × 256 — 512 MB of cells — but places no bound on a *workbook*. Two
-  cell records at opposite corners make a sheet maximal, so a small crafted
-  file can declare enough sheets to exhaust memory; an allocation failure
-  aborts the process rather than skipping the file, so neither the per-file
-  skip nor the panic guard helps. Bounding it means reading BOUNDSHEET and
-  DIMENSIONS out of the CFB container before calamine opens the file, which is
-  a new dependency and a BIFF record walker — deferred until someone asks for
-  `.xls`. Convert affected workbooks to `.xlsx`, which is read as a stream.
-  The earlier claim in the source that BIFF's sheet limit made a dense grid
-  safe was wrong: it bounds a sheet, not a workbook.
+  registering the parser. calamine materialises every sheet of a workbook
+  densely while opening it, before kb-mcp regains control, and BIFF bounds a
+  *sheet* but places no bound on a *workbook* — so a small crafted file can
+  exhaust memory, and an allocation failure aborts the process rather than
+  skipping the file. Convert affected workbooks to `.xlsx`, which is read as a
+  stream. The measurements, the options that were rejected, and the conditions
+  under which `.xls` could return are recorded in
+  [ADR-0001](docs/decisions/0001-withdraw-xls-legacy-biff-support.md)
+  ([日本語](docs/decisions/0001-withdraw-xls-legacy-biff-support.ja.md)).
 
   `kb-mcp index` now validates `[parsers].enabled` before it touches anything
   at all. The check used to run after the database was opened, after the
