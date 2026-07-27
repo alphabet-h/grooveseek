@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Eleven field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), inline-delivered scripts losing a backslash level so a string continuation silently becomes a `\n` escape, or diagnosing "works on Linux, fails on Windows" failures
+description: Twelve field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), inline-delivered scripts losing a backslash level so a string continuation silently becomes a `\n` escape, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (kb-mcp 蓄積罠集)
@@ -181,6 +181,39 @@ PY
 `5c 0a` なら継続 (改行と次行先頭の空白を食う)、`5c 6e` なら `\n` エスケープ = **別物**。
 
 出典: 2026-07-27 v0.14.0 release session (`install.rs` の案内文言を 2 crate で書き換えた際)
+
+## 12. `powershell.exe` のリダイレクト出力は既定で ACP (CP932)。`from_utf8_lossy` は全滅する
+
+**症状**: 日本語環境で、PowerShell 由来のエラーメッセージが `????` になる。**それだけなら表示の問題だが、出力を「値」として使っている箇所では黙って壊れる** — `install.rs::run_ps` は作成した `.lnk` の**パスそのもの**を返し、呼び出し側が `PathBuf::from` するので、`C:\Users\山田\...` のようなアカウントでは**誤ったパスが保存される**。`from_utf8_lossy` は `Ok` を返すので下流の誰も検出できない。
+
+**実測** (日本語 Windows 11 / Windows PowerShell 5.1、`日` = U+65E5):
+
+| script | stdout のバイト |
+|---|---|
+| `Write-Output ...` | `93 fa` = **CP932** |
+| `[Console]::OutputEncoding=[Text.Encoding]::UTF8; Write-Output ...` | `e6 97 a5` = **UTF-8** |
+
+CP932 は valid UTF-8 ではない (`0x93` は継続バイト域、`0xfa` は不正な開始バイト) ので、lossy decode は連続した U+FFFD に潰す。
+
+**「たぶん大丈夫」で通すと fix ごと壊れる 3 点。全部測ってある**:
+
+- **stderr にも効く**。ただし `throw` の error record は前置なしでも UTF-8 で出るのに、**ローカライズされた cmdlet error (`Get-Item 'Z:\no-such'` 等) は CP932**。本番で流れるのは後者なので、`throw` で測ると逆の結論になる
+- **BOM は出ない**。`[Text.Encoding]::UTF8` は BOM 付き encoding だが、.NET は Console writer を作り直す時に preamble を外す。もし出ていたら `.lnk` パスの先頭が壊れ、mojibake と同じ結果だった (= `UTF8Encoding $false` を書く必要は無い)
+- **console が無くても投げない**。`#![windows_subsystem = "windows"]` の親から `CREATE_NO_WINDOW` 付きで spawn しても成功する (= release の tray の形)。`Console.OutputEncoding` の setter は stdout が redirect 済みなら `SetConsoleOutputCP` を呼ばない
+
+したがって **`encoding_rs` の新規依存は要らない**。
+
+**採るべき形** (`kb-mcp/src/service/powershell.rs` / `crates/kb-mcp-tray/src/powershell.rs`):
+
+1. 前置は **spawn 点 1 箇所**に適用する。script builder 側ではない — パイプのエンコーディングは「子をどう読むか」の性質であって script の内容ではないし、spawn 点が 1 つなら後から script を足しても漏れない
+2. decode を **2 種類に分ける**。ここが肝:
+   - **値になるもの** (path / JSON) は **strict** (`str::from_utf8`)。lossy は `Ok` を返して壊れた値を通す
+   - **診断メッセージ**は lenient のまま。エラー経路で「元のエラーを失う second error」を出さないため。ただし置換が起きたら注記を足し、mojibake が自分で理由を語るようにする
+3. **`schtasks` には効かない**。PowerShell ではないので前置が届かない。`service/windows.rs` の 2 箇所がこれで、読むのが ASCII フィールドだけなので lossy のまま実害が無いことを個別に確認してある (CP932 の trail byte 域は `0x40-0x7E` / `0x80-0xFC` なので `,` も `"` も現れず、CSV 分割はずれない)
+
+**テストは文字列 assert で止めない**。「script に前置が含まれる」の assert はコードの言い換えにしかならない。**実際に `powershell.exe` を起動して非 ASCII が往復すること**を見る。文字列は PowerShell 側で codepoint から作れば、途中の層が再エンコードしない。この形なら locale 非依存でもある: 前置が無いと ja-JP では CP932 (strict decode が弾く)、Latin code page では best-fit の `??` (decode は通るが不一致) になり、どちらでも落ちる。
+
+出典: 2026-07-27 AU-04 (PR #108)。測定の詳細は `.dev/knowledge/powershell-output-encoding-measurement.md`
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
