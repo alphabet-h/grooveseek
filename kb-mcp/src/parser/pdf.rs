@@ -15,6 +15,49 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// スキャン PDF 判定閾値: 平均 chars/page がこれ未満なら text layer 無し扱い。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 
+/// 1 ページから取り出す text の上限 (AU-05)。
+///
+/// oxidize-pdf 4.1.1 は `ExtractionOptions::max_extracted_bytes` として
+/// **この上限を持っているが既定は `None` (無制限)** で、kb-mcp は使って
+/// いなかった。crate 側の doc より:
+///
+/// > The limit is enforced *during* accumulation, not by truncating the
+/// > finished string, so a single page with a huge or adversarially inflated
+/// > content stream cannot materialise an unbounded `String`.
+///
+/// 値を大きめに取るのは crate の truncation 単位が「デコード済み run」
+/// だからで、budget より大きい run が 1 本あるページは `text == ""` +
+/// `truncated == true` で返る (部分文字列にはならない)。切り詰めが正規の
+/// ページを丸ごと空にしないよう、実データ (密なページで数 KB) の 2 桁上を取る。
+const PDF_PAGE_TEXT_MAX_BYTES: usize = 1024 * 1024;
+
+/// 1 文書から取り出す text の累積上限 (AU-05)。
+///
+/// crate のガードは **すべてストリーム / ページ単位**で、文書全体の累積は
+/// 見ていない (`MAX_DECOMPRESSED_SIZE` 256 MB / stream、`MAX_PAGES` 100,000)。
+/// per-page 上限だけでは 100,000 ページ × 1 MiB まで積める。OOXML 側で
+/// PR #70 round 2 が塞いだ「per-entry はあるが累積が無い」穴と同じ形なので、
+/// 同じ `MAX_RAW_BINARY_BYTES` を文書単位の budget として使う。
+const PDF_DOC_TEXT_MAX_BYTES: usize = super::MAX_RAW_BINARY_BYTES as usize;
+
+/// 1 文書の抽出にかけてよい実時間の上限 (AU-05、codex P1)。
+///
+/// テキスト量の budget は **メモリ** を縛るが、**展開バイト数** は縛らない。
+/// 「テキストをほとんど出さない演算子に展開されるストリーム」を大量に持つ
+/// PDF は、カウンタをゼロ近傍に保ったまま全ストリームを展開させられる。
+/// crate 側に累積展開量の会計は無く (`MAX_DECOMPRESSED_SIZE` は stream 単位)、
+/// `StackSafeContext` の timeout は抽出経路から使われていないので、
+/// ここで実時間を見るしかない。
+///
+/// 残余の大きさは有界ではある: 入力は `MAX_RAW_BINARY_BYTES` (50 MB) で、
+/// DEFLATE の理論最大比が ~1032:1 なので累積展開量は高々 ~51 GB、
+/// 300 MB/s 程度の実効速度で ~170 秒。この上限はそれを 120 秒に切り下げる。
+///
+/// 値は crate 自身の `PARSING_TIMEOUT_SECS` (= 120、"Timeout for long-running
+/// parsing operations") に合わせた。正規の PDF は 50 MB でも数秒で終わるので、
+/// 遅いマシンでの false positive 余裕は十分ある。
+const PDF_DOC_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// スキャン PDF 判定用の「非空ページ限定」統計を計算する。
 ///
 /// 戻り値: `(非空ページ数, 非空ページの平均文字数)`。非空ページが 1 つも
@@ -125,13 +168,108 @@ fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatte
     let reader = PdfReader::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}"))?;
     let document = PdfDocument::new(reader);
-    // extract_text() -> ParseResult<Vec<ExtractedText>>、各 .text がページ本文。
-    let extracted = document.extract_text().map_err(|e| {
-        anyhow!("{path_hint}: PDF text extraction failed (possibly encrypted or unreadable): {e}")
-    })?;
-    let pages: Vec<String> = extracted.into_iter().map(|t| t.text).collect();
+    let pages = extract_pages_within_budget(&document, path_hint)?;
     let frontmatter = pdf_metadata_frontmatter(&document, path_hint);
     Ok((pages, frontmatter))
+}
+
+/// ページ本文を per-page 上限 + 文書累積 budget 付きで取り出す (AU-05)。
+///
+/// `document.extract_text()` は中身が `page_count()` + `extract_from_page` の
+/// 単純ループ (crate source 4.1.1 で確認) なので、ここで同じループを自分で
+/// 書いても **正規の PDF に対する出力は変わらない**。違うのは 2 点だけ:
+///
+/// 1. `ExtractionOptions::max_extracted_bytes` を渡す (crate が持っているのに
+///    既定 `None` で未使用だった per-page 上限)
+/// 2. ページごとに累積バイト数を見て、文書全体の budget を超えたら `Err`
+///
+/// **`TextExtractor` は 1 つを使い回す**。`extract_text_from_page_with_options`
+/// は呼び出しごとに extractor を作り直すため、ページ間で共有される
+/// `font_object_cache` ("avoids re-parsing the same font object across pages")
+/// が毎ページ捨てられて遅くなる。crate 内部の `extract_from_document` と同じく
+/// extractor を保持して回す。
+fn extract_pages_within_budget<R: std::io::Read + std::io::Seek>(
+    document: &PdfDocument<R>,
+    path_hint: &str,
+) -> Result<Vec<String>> {
+    extract_pages_within_budget_capped(
+        document,
+        path_hint,
+        PDF_PAGE_TEXT_MAX_BYTES,
+        PDF_DOC_TEXT_MAX_BYTES,
+        PDF_DOC_EXTRACT_TIMEOUT,
+    )
+}
+
+/// [`extract_pages_within_budget`] の cap 注入版。unit test が小さい cap で
+/// budget 分岐を踏むために分離する (`ooxml::read_zip_entry_capped` と同じ形)。
+/// 50 MB を実際に展開する fixture を用意せずに済む。
+fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
+    document: &PdfDocument<R>,
+    path_hint: &str,
+    page_cap: usize,
+    doc_cap: usize,
+    timeout: std::time::Duration,
+) -> Result<Vec<String>> {
+    use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
+
+    let page_count = document
+        .page_count()
+        .map_err(|e| anyhow!("{path_hint}: cannot read PDF page count: {e}"))?;
+    let mut extractor = TextExtractor::with_options(ExtractionOptions {
+        max_extracted_bytes: Some(page_cap),
+        ..Default::default()
+    });
+    // page_count は文書申告値なので `with_capacity` には使わない (AU-01 と同じ、
+    // 申告値から確保しない原則)。
+    let mut pages: Vec<String> = Vec::new();
+    let mut budget: usize = 0;
+    let started = std::time::Instant::now();
+    for index in 0..page_count {
+        let extracted = extractor.extract_from_page(document, index).map_err(|e| {
+            anyhow!(
+                "{path_hint}: PDF text extraction failed on page {} \
+                 (possibly encrypted or unreadable): {e}",
+                index + 1
+            )
+        })?;
+        // 展開バイト数そのものは数えられないので、それに比例する実時間で縛る。
+        //
+        // ページを読んだ **後** に見る (codex P2)。前だけで見ると最終ページの
+        // 超過を拾えず、budget を超えた文書がそのまま metadata 抽出・chunk 化・
+        // index まで進んでしまう。後で見れば「開始前に既に超過」も前ページの
+        // 判定で捕まるので、こちら 1 箇所で足りる。
+        //
+        // 粒度はページ境界なので、1 ページが単独で暴走する場合は止められない。
+        // codex P1 の想定 (「個別には許容されるストリームを数百個」) は複数
+        // ページに跨るため、ここで頭打ちになる。
+        if started.elapsed() > timeout {
+            return Err(anyhow!(
+                "{path_hint}: PDF text extraction exceeded {} s after {} page(s) \
+                 (decompression-bomb guard)",
+                timeout.as_secs_f64(),
+                index + 1
+            ));
+        }
+        if extracted.truncated {
+            // 黙って落とさない (AU-13 と同じ方針)。
+            eprintln!(
+                "warning: {path_hint}: page {} exceeded the {page_cap}-byte per-page text \
+                 limit; its text is truncated",
+                index + 1
+            );
+        }
+        budget = budget.saturating_add(extracted.text.len());
+        if budget > doc_cap {
+            return Err(anyhow!(
+                "{path_hint}: extracted text exceeds {doc_cap} bytes across \
+                 {} page(s) (decompression-bomb guard)",
+                index + 1
+            ));
+        }
+        pages.push(extracted.text);
+    }
+    Ok(pages)
 }
 
 /// oxidize-pdf の `DocumentMetadata` (docs.rs 4.1.1 で確認: `title` / `creation_date`
@@ -343,6 +481,123 @@ mod tests {
     // ページ 1="Hello World"、ページ 2="Second Page"。xref オフセット込みで
     // 手組みした最小構成 (Info dict に Title/CreationDate も含む)。
     const MINIMAL_PDF: &[u8] = include_bytes!("../../tests/fixtures/binary/minimal.pdf");
+
+    // ---- AU-05: 展開 budget ----
+
+    fn open_fixture(bytes: &'static [u8]) -> PdfDocument<Cursor<&'static [u8]>> {
+        PdfDocument::new(PdfReader::new(Cursor::new(bytes)).unwrap())
+    }
+
+    /// 上限を入れても正規 PDF の抽出結果は変わらないこと。
+    ///
+    /// crate の `extract_text()` は `page_count()` + `extract_from_page` の
+    /// 素のループなので (source 4.1.1 で確認)、自前ループの出力と
+    /// **バイト単位で一致する**はず。これが崩れたら「budget を足しただけ」
+    /// という前提が壊れている。
+    #[test]
+    fn budgeted_extraction_matches_the_crate_for_a_normal_pdf() {
+        for fixture in [MINIMAL_PDF, UNTITLED_PDF, MOSTLY_BLANK_PDF] {
+            let doc = open_fixture(fixture);
+            let expected: Vec<String> = doc
+                .extract_text()
+                .unwrap()
+                .into_iter()
+                .map(|t| t.text)
+                .collect();
+            let actual = extract_pages_within_budget(&doc, "fixture.pdf").unwrap();
+            assert_eq!(actual, expected, "budgeting changed the extracted text");
+        }
+    }
+
+    /// 文書累積 budget を超えたら `Err`。crate 側のガードはすべて
+    /// ストリーム / ページ単位で、累積は見ていない。
+    #[test]
+    fn the_document_budget_stops_extraction() {
+        let doc = open_fixture(MINIMAL_PDF);
+        // 正規の抽出量を測ってから、その 1 バイト下を cap にする。
+        let full: usize = extract_pages_within_budget(&doc, "fixture.pdf")
+            .unwrap()
+            .iter()
+            .map(String::len)
+            .sum();
+        assert!(full > 0, "fixture should extract some text");
+
+        let err = extract_pages_within_budget_capped(
+            &doc,
+            "bomb.pdf",
+            PDF_PAGE_TEXT_MAX_BYTES,
+            full - 1,
+            PDF_DOC_EXTRACT_TIMEOUT,
+        )
+        .expect_err("cumulative budget should have refused this");
+        let msg = err.to_string();
+        assert!(msg.contains("bomb.pdf"), "should name the file: {msg}");
+        assert!(
+            msg.contains("decompression-bomb guard"),
+            "should say why: {msg}"
+        );
+
+        // ちょうど上限なら通る (off-by-one で正規ファイルを落とさない)。
+        assert!(
+            extract_pages_within_budget_capped(
+                &doc,
+                "ok.pdf",
+                PDF_PAGE_TEXT_MAX_BYTES,
+                full,
+                PDF_DOC_EXTRACT_TIMEOUT,
+            )
+            .is_ok()
+        );
+    }
+
+    /// AU-05 (codex P1): テキスト量の budget は **メモリ** しか縛らない。
+    /// テキストをほとんど出さない演算子に展開されるストリームを大量に持つ
+    /// PDF は、カウンタをゼロ近傍に保ったまま全ストリームを展開させられる。
+    /// 実時間でも縛っていることを確かめる。
+    #[test]
+    fn the_time_budget_stops_extraction_independently_of_text_volume() {
+        let doc = open_fixture(MINIMAL_PDF);
+        // 0 秒 = 最初のページ境界で必ず超過。テキスト量の budget は上限
+        // いっぱいに開けてあるので、止めたのが時間側だと確定できる。
+        let err = extract_pages_within_budget_capped(
+            &doc,
+            "slow.pdf",
+            PDF_PAGE_TEXT_MAX_BYTES,
+            PDF_DOC_TEXT_MAX_BYTES,
+            std::time::Duration::ZERO,
+        )
+        .expect_err("a zero time budget should have refused this");
+        let msg = err.to_string();
+        assert!(msg.contains("slow.pdf"), "should name the file: {msg}");
+        assert!(
+            msg.contains("exceeded") && msg.contains("decompression-bomb guard"),
+            "should say why: {msg}"
+        );
+    }
+
+    /// per-page 上限は crate が持っていた (`max_extracted_bytes`) が既定 `None`
+    /// で未使用だった。渡していることを、極小 cap で `truncated` が立つことで
+    /// 確かめる。
+    #[test]
+    fn the_per_page_limit_is_actually_passed_to_the_crate() {
+        use oxidize_pdf::text::{ExtractionOptions, TextExtractor};
+        let doc = open_fixture(MINIMAL_PDF);
+        let mut extractor = TextExtractor::with_options(ExtractionOptions {
+            max_extracted_bytes: Some(1),
+            ..Default::default()
+        });
+        let extracted = extractor.extract_from_page(&doc, 0).unwrap();
+        assert!(
+            extracted.truncated,
+            "a 1-byte cap should have truncated this page"
+        );
+        // 上限内に収まる cap では truncated が立たないこと (対称の確認)。
+        let mut extractor = TextExtractor::with_options(ExtractionOptions {
+            max_extracted_bytes: Some(PDF_PAGE_TEXT_MAX_BYTES),
+            ..Default::default()
+        });
+        assert!(!extractor.extract_from_page(&doc, 0).unwrap().truncated);
+    }
 
     // filename title fallback 専用の 1 ページ PDF。minimal.pdf と同じ手組み手法
     // (xref オフセット込み) で生成、Info dict は CreationDate のみで /Title を

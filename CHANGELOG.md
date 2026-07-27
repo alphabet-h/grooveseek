@@ -6,6 +6,31 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **PDF text extraction had no ceiling on how much it would produce**
+  (AU-05). The audit filed this as "no decompression budget", but the crate
+  turned out to have several: reading its source at the pinned 4.1.1 shows a
+  256 MB cap per decompressed stream, enforced incrementally, a compression
+  ratio guard, and a 100,000-page limit. Two real gaps sat above those. The
+  per-page text limit the crate offers — `ExtractionOptions::max_extracted_bytes`,
+  which bounds accumulation rather than truncating a finished string — defaults
+  to `None`, and kb-mcp never set it. And every one of the crate's guards is
+  per stream or per page; nothing watches the total, so pages could be summed
+  without limit. That is the same shape as the per-entry-but-not-cumulative
+  hole closed for OOXML in v0.11.0. Extraction now runs page by page with the
+  per-page limit set and a running total capped at the same 50 MB used for
+  binary input, and a page that hits the per-page limit says so instead of
+  quietly losing text. Output for well-formed PDFs is unchanged — a test
+  asserts the new path returns exactly what the crate's own `extract_text`
+  does, and the extractor is reused across pages so its cross-page font cache
+  still applies. A text budget bounds memory but not decompression: a file
+  whose streams expand into operators emitting almost no text would keep that
+  counter near zero while still being fully decompressed, so extraction also
+  stops after 120 seconds — the crate exposes no cumulative decompression
+  accounting, and the timeout it does define is not wired into the extraction
+  path. That residual was bounded to begin with, since input is capped at
+  50 MB and DEFLATE tops out near 1032:1, but the ceiling was measured in
+  minutes rather than seconds.
+
 - **A damaged docx or pptx was indexed silently, with part of its text
   missing** (AU-13). Every OOXML reader ended its event loop with
   `Err(_) => break`, so a file whose XML stops partway — a truncated copy, a
