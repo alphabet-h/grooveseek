@@ -4,6 +4,31 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Internal
+
+- **Retrieval quality of the binary formats is now measured** (AU-24).
+  `.pdf` (v0.10.0) and `.docx` / `.xlsx` / `.pptx` (v0.11.0) had parser tests
+  and an indexing end-to-end test, but nothing asked whether a query about a
+  binary document's contents actually retrieves it — the golden set the
+  project tracks is 26 queries over 49 documents, every one of them `.md`, so
+  every recall / MRR / nDCG figure ever reported was blind to those four
+  formats. `tests/eval_binary_formats.rs` runs `kb-mcp eval` over a corpus
+  mixing all five, one query per format.
+
+  The assertion is that each format's document ranks **first** for its own
+  query. `recall@5` would have been vacuous: a five-document corpus returns
+  everything within the first five hits no matter how badly extraction
+  behaves. Eight Markdown distractors plus a rank-1 assertion make the claim
+  falsifiable, which was verified by mutation — replacing the `.docx` body
+  with off-topic text drops it to rank 8, still inside `top_k` and still
+  scoring `recall@10 = 1.0`.
+
+  Topical vocabulary appears only in document bodies; filenames and headings
+  are deliberately generic, because a chunk heading carries an FTS weight of
+  2.0 and these formats fall back to a filename-derived title, so either would
+  let a document rank first with its body extraction broken — the shape AU-13
+  had.
+
 ## [0.14.0] - 2026-07-27
 
 ### Added
