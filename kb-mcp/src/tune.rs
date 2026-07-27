@@ -342,6 +342,18 @@ impl MetricTable {
         self.rows.len()
     }
 
+    /// Test-only: the whole metric record behind one cell.
+    ///
+    /// [`Self::primary`] exposes nDCG@`PRIMARY_K` alone, but `recall_at_k` and
+    /// `reciprocal_rank` travel on to [`Self::aggregate_for`] and from there to
+    /// `non_degradation`, which decides adoption. An equivalence check reading
+    /// only `primary` passes on a divergence confined to deeper ranks —
+    /// measured, not assumed (codex P2 round 1 on PR #114).
+    #[cfg(test)]
+    pub(crate) fn cell(&self, c: Condition, q: usize) -> &crate::eval::QueryMetrics {
+        &self.rows[q][c.index()]
+    }
+
     pub fn k_values(&self) -> &[usize] {
         &self.k_values
     }
@@ -1655,7 +1667,15 @@ mod tests {
         let pre = Preflight {
             queries: vec![
                 mk("q0", "zebrafish", vec!["h.md", "c.md"], vec![1, 2, 3]),
-                mk("q1", "widgets", vec!["c.md"], vec![3, 1, 2]),
+                // `f6` / `f7` sit at ranks 9-10 of this query's fused list
+                // (measured), so a divergence past rank 5 actually moves a
+                // metric instead of landing on documents nobody expects.
+                mk(
+                    "q1",
+                    "widgets",
+                    vec!["c.md", "f6.md", "f7.md"],
+                    vec![3, 1, 2],
+                ),
             ],
             effective: vec![0, 1],
             chunk_total: 16,
@@ -1742,7 +1762,10 @@ mod tests {
     #[test]
     fn test_optimised_sweep_matches_the_naive_one() {
         let (db, mut pre) = sweep_fixture();
-        let k_values = [PRIMARY_K];
+        // More than one k on purpose: with only PRIMARY_K the comparison below
+        // sees a single depth, and a divergence confined to ranks past 5 shows
+        // up nowhere.
+        let k_values = [1_usize, PRIMARY_K, 10];
         let limit = 10_u32;
         let mut meta = HashMap::new();
         let optimised = build_metric_table(&db, &mut pre, &mut meta, &k_values, limit).unwrap();
@@ -1778,11 +1801,20 @@ mod tests {
 
         for c in Condition::all() {
             for q in 0..pre.queries.len() {
+                // The whole record, not just nDCG@PRIMARY_K: recall and MRR flow
+                // into `aggregate_for` and then `non_degradation`, so a
+                // divergence that leaves the primary metric intact would still
+                // change what gets adopted (codex P2 round 1).
+                let (o, n) = (optimised.cell(c, q), naive.cell(c, q));
+                let at = format!("condition {c:?} query {q}");
+                assert_eq!(o.ndcg_at_k, n.ndcg_at_k, "{at}: nDCG diverged");
                 assert_eq!(
-                    optimised.primary(c, q),
-                    naive.primary(c, q),
-                    "condition {c:?} query {q} diverged between the shared-FTS sweep \
-                     and the naive one"
+                    o.recall_at_k, n.recall_at_k,
+                    "{at}: recall diverged - this feeds non_degradation"
+                );
+                assert_eq!(
+                    o.reciprocal_rank, n.reciprocal_rank,
+                    "{at}: MRR diverged - this feeds non_degradation"
                 );
             }
         }
