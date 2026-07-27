@@ -293,13 +293,17 @@ recommended when **all** of the following hold:
 > **Criterion 3 can be much weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)`
 > assumes the per-fold differences are independent. The N leave-one-out
 > selections each share N−2 queries, which lets the folds pick *different*
-> conditions — but sharing training data only makes correlation possible, it
-> does not create it: when every fold picks the same condition, each `d_j`
-> depends only on its own held-out row and the assumption holds.
+> conditions — though sharing training data only makes correlation possible
+> rather than creating it. Nor is fold agreement alone enough to restore
+> independence: even when the folds agree, *which* condition they agreed on was
+> itself chosen from the shared rows, so every difference still depends on it.
+> What would decouple them is the selection being effectively fixed across
+> sampled golden sets, which is a different property.
 >
 > Simulated against a known data-generating process, the reported SE came out at
-> **0.53–0.60** of the real one in the three settings where the folds disagreed,
-> and at **1.03** in the one where they never did.
+> **0.53–0.60** of the real one in the three settings where the selection varied
+> (64–83 distinct conditions chosen across 300 replications), and at **1.03** in
+> the one where it did not vary at all (a single condition every time).
 >
 > **What that costs is measured directly rather than converted into a sigma
 > level** — the reported SE varies per run and can correlate with the observed

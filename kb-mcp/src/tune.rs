@@ -589,20 +589,29 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 ///
 /// `SD/sqrt(N)` は d_j の独立を仮定する。LOO の N 個の選択は互いに N−2 個の
 /// query を共有するので **fold ごとに違う条件を選び得る**が、これは相関を
-/// 可能にするだけで**保証はしない** — 全 fold が同じ条件を選べば d_j は各自の
-/// held-out 行だけに依存し、独立に戻る。実際、下表の最終行 (全 replication で
-/// fold 完全一致) は比 1.027 で過小評価が起きていない。
+/// 可能にするだけで**保証はしない**。
+///
+/// ただし「fold が一致すれば独立」も**言い過ぎ**。一致していても、その条件の
+/// **正体は共有された訓練行から選ばれた確率変数**なので、全 d_j がそれを通じて
+/// 結びつく。d_j が各自の held-out 行だけに依存すると言えるのは、**選択条件が
+/// golden set の抽出をまたいで実質固定されている**場合であって、fold 内一致とは
+/// 別の条件である。
+///
+/// そこで**測った**: 下表の「選ばれた条件の種類数」は 300 replication 全体で
+/// refit がいくつの異なる条件になったか。**静かな設定は 1 種類 = 実質固定**で、
+/// そこだけ比が 1.027。騒がしい 3 設定は 64〜83 種類に散っており、選択そのものが
+/// ばらつく入力になっている。
 ///
 /// 既知の golden set を多数生成して「報告される SE」と「mean delta の真の
 /// ばらつき」を比べた実測 (`au16_paired_se_versus_the_true_standard_error`、
-/// 300 反復 × 4 設定):
+/// 300 反復 × 4 設定。**選択条件の種類数**は右端):
 ///
-/// | N | 真の優位幅 | セル分散 | 全 rep | **stability gate 通過分のみ** |
-/// |---|---|---|---|---|
-/// | 26 | 0.04 | 0.08 | 0.533 | 0.619 (265/300) |
-/// | 26 | 0.00 | 0.08 | 0.547 | 0.644 (239/300) |
-/// | 12 | 0.04 | 0.08 | 0.601 | 0.733 (192/300) |
-/// | 26 | 0.04 | 0.03 | 1.027 | 1.027 (300/300) |
+/// | N | 真の優位幅 | セル分散 | 全 rep | stability gate 通過分 | 選択条件の種類 |
+/// |---|---|---|---|---|---|
+/// | 26 | 0.04 | 0.08 | 0.533 | 0.619 (265/300) | 64 |
+/// | 26 | 0.00 | 0.08 | 0.547 | 0.644 (239/300) | 83 |
+/// | 12 | 0.04 | 0.08 | 0.601 | 0.733 (192/300) | 73 |
+/// | 26 | 0.04 | 0.03 | **1.027** | 1.027 (300/300) | **1** |
 ///
 /// 比は **replication 群に対する量** (mean delta のばらつきが要る) なので単一 run
 /// では出せない。したがって「平均 stability が 0.84 だから gate を通る run でも
@@ -616,8 +625,9 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 ///   gate を通った replication でも SE はなお 1.4〜1.6 倍過小
 /// - **稀な隅ではない**。300 rep 中 192〜300 が gate を通っている
 /// - **測った 4 設定のうち、比が 1 付近だったのは最終行の 1 つだけ**で、そこは
-///   全 replication で fold が完全一致していた。「fold が選択を違えることが相関の
-///   源」という機構と整合はするが、**4 設定・完全安定は 1 つ**なので、これは連関の
+///   fold 内一致に加えて **replication をまたいでも選択が 1 種類**だった。
+///   「選択のばらつきが相関の源」という機構と整合はするが、**4 設定・実質固定は
+///   1 つ**なので、これは連関の
 ///   観測であって「一致した時に限り較正される」ことの証明ではない。部分的にしか
 ///   一致しない設定でも比が 1 に近づく可能性は未検証
 ///
@@ -2343,6 +2353,15 @@ mod tests {
             // round 4). The rejection rate is the thing itself.
             let mut se_gate_fired = 0usize;
             let mut adopted = 0usize;
+            // Which condition the refit picked, per replication. Fold agreement
+            // *within* a replication does not by itself make the d_j
+            // independent: the agreed condition is still chosen from the shared
+            // training rows, so it is a random input every difference depends
+            // on. What would remove that coupling is the selection being
+            // effectively fixed *across* sampled golden sets — which is a
+            // separate thing, and was being asserted rather than recorded
+            // (codex P2 round 6). Recording it.
+            let mut refits: std::collections::HashSet<Condition> = std::collections::HashSet::new();
             for _ in 0..REPS {
                 let rows: Vec<Vec<f64>> = (0..n)
                     .map(|_| {
@@ -2364,6 +2383,7 @@ mod tests {
                 if matches!(decide(&table, &out, &idx), Verdict::Adopt(_)) {
                     adopted += 1;
                 }
+                refits.insert(out.refit);
                 mean_deltas.push(m);
                 reported_ses.push(se);
                 stabilities.push(out.stability);
@@ -2408,12 +2428,14 @@ mod tests {
             eprintln!(
                 "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
                  all reps: {:<14} passing the stability gate: {:<14} mean stability={:.2}\n      \
-                 fired: `m > 2*se` {:>5.1}%   full decide() Adopt {:>5.1}%",
+                 fired: `m > 2*se` {:>5.1}%   full decide() Adopt {:>5.1}%   \
+                 distinct refits across reps: {}",
                 fmt(all),
                 fmt(gated),
                 mean(&stabilities),
                 100.0 * se_gate_fired as f64 / REPS as f64,
                 100.0 * adopted as f64 / REPS as f64,
+                refits.len(),
             );
             let true_se = sample_sd(&mean_deltas);
             let avg_reported = mean(&reported_ses);
