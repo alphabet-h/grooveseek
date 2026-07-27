@@ -9,6 +9,7 @@ Markdown / プレーンテキスト / PDF / Office 文書のナレッジベー�
 詳細:
 - ユーザ向けドキュメント: [README.md](./README.md) (English) / [README.ja.md](./README.ja.md) (日本語)
 - ソース構造: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) (English) / [docs/ARCHITECTURE.ja.md](./docs/ARCHITECTURE.ja.md) (日本語)
+- 設計判断の記録 (ADR): [docs/decisions/](./docs/decisions/)。運用ルールと判定基準は [ADR-0000](./docs/decisions/0000-record-decisions-as-adrs.ja.md)
 
 ## ビルド・テスト
 
@@ -49,6 +50,7 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 - **`.kb-mcp.db` はクライアントプロジェクト側の責務**。本リポジトリでは生成しない
 - **テストは 2 層構造**: 通常 `cargo test` では `#[ignore]` の embedding 実行テストはスキップされる。CI 等で検証したければ `-- --ignored` を付ける
 - **staging 禁止ファイル**: `.mcp.json` (ローカルパス)、`kb-mcp.toml` (ユーザ設定) は `.gitignore` 済み。テンプレートは `.mcp.json.example` / `kb-mcp.toml.example`
+- **設計判断は ADR に残す**: ① 実際に選択肢を比較した ② 覆すのが高くつく ③ structure / 依存 / interface / 非機能特性に影響する — **3 つすべて**を満たす時だけ `docs/decisions/` に英日ペアで追加する。満たさないなら `CHANGELOG` で足りる。ADR を足したら、同じ理由を言い直している `CHANGELOG` / `README` / ソースコメントを要約 + リンクに削る。決定を覆す時は**編集せず**新 ADR を追加し、旧 ADR の status を `superseded by ADR-NNNN` にする。詳細は [ADR-0000](./docs/decisions/0000-record-decisions-as-adrs.ja.md)
 
 ## Embedding モデルのキャッシュ
 
@@ -68,6 +70,7 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 本プロジェクトは**英語プライマリの日英バイリンガル**運用:
 - `README.md` (English, primary) / `README.ja.md` (日本語)
 - `docs/ARCHITECTURE.md` (English) / `docs/ARCHITECTURE.ja.md` (日本語)
+- `docs/decisions/NNNN-*.md` (English) / `docs/decisions/NNNN-*.ja.md` (日本語)
 - `CLAUDE.md` (本ファイル、日本語): Claude Code 向け開発ガイダンス
 
 コード内のコメント・テスト名は英語基調。ただし日本語 KB 処理に関する箇所 (日本語 trigram、CJK 正規化等) では日本語コメントも可。外部コントリビュータへの説明は英語、内部議論 (issue / PR 含む) は日本語でも可。
