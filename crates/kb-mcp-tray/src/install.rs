@@ -231,11 +231,18 @@ mod tests {
     ///
     /// The path is assembled from codepoints inside PowerShell so that nothing
     /// between this file and the child re-encodes it on the way in, leaving the
-    /// pipe as the only thing under test. The assertion is locale-independent:
-    /// with the prelude the answer is UTF-8 on any code page, while without it
-    /// a ja-JP host emits CP932 (rejected by `decode_value`) and a host on a
-    /// Latin code page emits best-fit `??` (decodes cleanly but compares
-    /// unequal). Either way the fix is what makes this pass.
+    /// pipe as the only thing under test. With the prelude the answer is UTF-8
+    /// on any code page; without it a ja-JP host emits CP932 (rejected by
+    /// `decode_value`) and a host on a Latin code page emits best-fit `??`
+    /// (decodes cleanly but compares unequal), so on either the fix is what
+    /// makes this pass.
+    ///
+    /// It does **not** guard the prelude everywhere. A host whose active code
+    /// page is already UTF-8 (CP65001, which Windows 11's "Beta: Use Unicode
+    /// UTF-8" option turns on) emits UTF-8 with or without it, and there this
+    /// passes either way. That still covers exactly the hosts the fix exists
+    /// for — but if the Windows CI runner ever moves to a UTF-8 code page, this
+    /// stops being a regression guard without saying so.
     #[test]
     fn run_ps_round_trips_a_non_ascii_path() {
         let script = r"Write-Output ('C:\Users\' + [char]::ConvertFromUtf32(0x5C71) + [char]::ConvertFromUtf32(0x7530) + '\x.lnk')";

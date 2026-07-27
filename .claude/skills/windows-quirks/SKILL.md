@@ -137,26 +137,29 @@ open('path','wb').write(b.replace(b'\r\n', b'\n'))
 
 出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)
 
-## 11. インラインで渡したスクリプトは backslash を 1 段失う (継続が `\n` エスケープに化ける)
+## 11. スクリプト経由でソースに書いた backslash は、数え間違えても**コンパイルが通る**
 
-**症状**: Rust の文字列継続 (`"...text \` + 改行) を Python の置換で書き込んだのに、ファイルには `\` + 文字 `n` (= `5c 6e`) が入り、**改行エスケープ**になっていた。`cargo check` は通ってしまう (どちらも合法な文字列) ので、**出力を実際に見るまで気付かない** — メッセージ中に改行と 13 個の空白が埋まっていた。
+**症状**: Rust の文字列継続 (`"...text \` + 改行) を Python の置換で書き込んだのに、ファイルには `\` + 文字 `n` (= `5c 6e`) が入り、**改行エスケープ**になっていた。継続もエスケープも合法な文字列なので `cargo check` も `cargo fmt` も通り、**メッセージを実際に表示するまで気付かない** — 文中に改行と 13 個の空白が埋まっていた。同じ session で `python -c "..."` が `SyntaxError: unexpected character after line continuation character` になる形でも踏んだ。
 
-同じ session で、`python -c "... b'\\\\' ..."` が `SyntaxError: unexpected character after line continuation character` になる形でも踏んだ。
+**原因は経路ではなく、自分の escape の数え間違い** (2026-07-27、下記の切り分けで確定)。当初これを「インライン経路が backslash を 1 段食う」と書いたが、**それは誤り**だった:
 
-**原因は「インラインで渡したこと」であって Python でも heredoc でもない** (2026-07-27 実測)。同一の Python bytes literal `b'A \\<改行> B'` を 2 通りで実行して比較した:
+```bash
+cat <<'EOF' > probe.txt      # Python を挟まず、素の `\` + 改行だけを通す
+A \
+ B
+EOF
+# → 41 20 5c 0a 20 42 0a  = バイトは無傷で届く
+```
 
-| 届け方 | ファイルに入ったバイト |
-|---|---|
-| `Write` ツールで `.py` に書いて `python foo.py` | `41 20 5c 0a 20 42` = **継続が残る** |
-| `python - <<'PY' ... PY` (**引用付き** heredoc) | `41 20 5c 6e 20 42` = **1 段消えた** |
+引用付き heredoc は POSIX どおり body を verbatim に渡す。最初にこれを疑ったのは、**「配送経路」と「Python の bytes literal の有無」を同時に変えた交絡実験**で比較したせい。片方ずつ動かせば経路は無罪と分かる。
 
-引用付き heredoc の shell 意味論は body を literal に渡すので、**消しているのは shell ではなく、コマンド文字列をインラインで渡す経路そのもの**。`python -c "..."` はさらに二重引用が乗るので当然同じか悪い。「何個 backslash を書けば通るか」を数えて合わせにいくのは、経路依存なので**必ず破綻する**。
+**したがって「何個書けば通るか」を数え合わせにいくのが敗因**。Python の bytes literal の中で `\\` は 1 個の backslash、`\n` は改行 — この 2 つを跨いで数えるのは、**間違えても誰も教えてくれない**ので必ず事故る。
 
 **正しいやり方**:
 
-1. **ソースの編集は `Edit` / `Write` ツールで直接行う**。backslash を含む断片ではこれ一択
-2. スクリプトを書く必要があるなら、**`Write` で `.py` に落としてから実行する**。上表のとおりこの経路なら backslash は保たれる
-3. インラインで済ませたいなら、**backslash を 1 文字も書かない**。`chr(92)` で構築すればどの経路でも安全:
+1. **ソースの編集は `Edit` / `Write` ツールで直接行う**。backslash を含む断片ではこれ一択。escape の段数を数える作業自体が発生しない
+2. スクリプトが必要なら **`Write` で `.py` に落としてから実行する**。ソースが目に見える形で残るので、数え間違いを読んで見つけられる
+3. インラインで済ませたいなら、**backslash を 1 文字も書かない**。`chr(92)` で構築すれば数える対象が消える:
    ```bash
    python - <<'PY'
    BS = chr(92).encode()   # backslash を literal として書かない
@@ -211,7 +214,9 @@ CP932 は valid UTF-8 ではない (`0x93` は継続バイト域、`0xfa` は不
    - **診断メッセージ**は lenient のまま。エラー経路で「元のエラーを失う second error」を出さないため。ただし置換が起きたら注記を足し、mojibake が自分で理由を語るようにする
 3. **`schtasks` には効かない**。PowerShell ではないので前置が届かない。`service/windows.rs` の 2 箇所がこれで、読むのが ASCII フィールドだけなので lossy のまま実害が無いことを個別に確認してある (CP932 の trail byte 域は `0x40-0x7E` / `0x80-0xFC` なので `,` も `"` も現れず、CSV 分割はずれない)
 
-**テストは文字列 assert で止めない**。「script に前置が含まれる」の assert はコードの言い換えにしかならない。**実際に `powershell.exe` を起動して非 ASCII が往復すること**を見る。文字列は PowerShell 側で codepoint から作れば、途中の層が再エンコードしない。この形なら locale 非依存でもある: 前置が無いと ja-JP では CP932 (strict decode が弾く)、Latin code page では best-fit の `??` (decode は通るが不一致) になり、どちらでも落ちる。
+**テストは文字列 assert で止めない**。「script に前置が含まれる」の assert はコードの言い換えにしかならない。**実際に `powershell.exe` を起動して非 ASCII が往復すること**を見る。文字列は PowerShell 側で codepoint から作れば、途中の層が再エンコードしない。前置が無いと ja-JP では CP932 (strict decode が弾く)、Latin code page では best-fit の `??` (decode は通るが不一致) になり、どちらでも落ちる。
+
+**ただしこのテストは「あらゆる環境で前置の適用を証明する」ものではない**。ACP が既に UTF-8 (CP65001 — Windows 11 の「ベータ: ワールドワイド言語サポートで Unicode UTF-8 を使用」で有効になる) のホストでは、**前置が無くても PowerShell は UTF-8 を出す**ので、前置を外してもテストは通ってしまう。守れているのは「非 UTF-8 ACP のホスト」= まさにこの fix が存在する理由の環境であって、それで十分ではあるが、**CI が UTF-8 ACP の runner だけになると回帰ガードとして無音になる**。「locale 非依存」と書くのは言い過ぎ。
 
 出典: 2026-07-27 AU-04 (PR #108)。測定の詳細は `.dev/knowledge/powershell-output-encoding-measurement.md`
 
