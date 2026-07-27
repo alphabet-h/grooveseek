@@ -44,6 +44,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A Windows shortcut path or service error came back garbled on a
+  non-English system** (AU-04). A redirected `powershell.exe` writes in the
+  active code page, not UTF-8, and every call site decoded it with
+  `String::from_utf8_lossy` — so on a Japanese host CP932 became a run of
+  U+FFFD. For `kb-mcp service install` and the tray's Start / Stop / Restart
+  that lost the text of the failure being reported. For the tray's autostart
+  installer it was not a display problem at all: the helper returns the path
+  of the `.lnk` it created and the caller turns that string into a `PathBuf`,
+  so an account whose profile directory contains non-ASCII characters had the
+  wrong shortcut path stored. PowerShell is now asked for UTF-8 rather than
+  guessed at, at the single point where each backend spawns it, and output
+  that becomes a value is decoded strictly — a lossy decode returns success
+  with a corrupted path, which nothing downstream can detect. Output that
+  only feeds a diagnostic message still decodes leniently, since an error
+  path must not lose the error it was reporting, but now says when characters
+  were replaced. The two `schtasks` calls are unaffected: `schtasks` is not
+  PowerShell, and only ASCII fields are read from its output.
+
 - **PDF text extraction had no ceiling on how much it would produce**
   (AU-05). The audit filed this as "no decompression budget", but the crate
   turned out to have several: reading its source at the pinned 4.1.1 shows a
