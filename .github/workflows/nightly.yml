@@ -151,7 +151,12 @@ jobs:
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では
         # 通常の `cargo test` も合わせて走らせて、ignored だけ落ちる
         # (model DL だけ壊れている) ケースを切り分けやすくする。
-        run: cargo test -- --include-ignored ${{ matrix.skip_args }}
+        #
+        # `--features test-helpers` はここでしか効かない。gate の向こうにある
+        # admin endpoint テスト 2 本は `#[ignore]` でもあるので、PR CI が
+        # feature 付きで compile しても**走らない** — 実行まで届くのは
+        # `--include-ignored` を渡すこの job だけ。
+        run: cargo test --features test-helpers -- --include-ignored ${{ matrix.skip_args }}
 
   cargo-audit:
     name: cargo audit
