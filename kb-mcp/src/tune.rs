@@ -578,9 +578,26 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// paired per-query 差分から求める標準誤差 `SD({d_j}) / sqrt(N)` (D-11-2)。
 ///
 /// **fold 平均の分散を SE と呼んではならない** — fold 平均は d_j のアフィン
-/// 変換なので SD が 1/(N−1) に縮み、有意判定が壊れる。fold が query を共有
-/// するため厳密には i.i.d. でない近似値だが、保守側 (過小評価しない) に働く。
+/// 変換なので SD が 1/(N−1) に縮み、有意判定が壊れる。
 /// N < 2 は判定不能として無限大を返し、採用条件を必ず落とす。
+///
+/// ## この SE は保守側ではない (2026-07-27 実測、AU-16)
+///
+/// 以前ここには「fold が query を共有するため厳密には i.i.d. でないが、
+/// **保守側 (過小評価しない)** に働く」と書いてあった。**逆だった**。
+///
+/// `SD/sqrt(N)` は d_j の独立を仮定するが、LOO の N 個の選択は互いに N−2 個の
+/// query を共有するので d_j は正に相関し、`Var(mean)` は `sigma^2/N` より
+/// 大きくなる。既知の golden set を多数生成して「報告される SE」と「mean delta
+/// の真のばらつき」を比べたところ、**報告値は真の SE の 0.55〜0.66 倍**だった
+/// (`au16_paired_se_versus_the_true_standard_error`、4 設定 × 300 反復。真の
+/// 優位条件が存在しない設定でも同じ向き)。
+///
+/// 帰結: `decide` の `mean_delta > 2 * se` は **公称 2 sigma だが実効は
+/// おおよそ 1.1 sigma** で、意図より緩い。係数を上げるかは採用挙動の変更なので
+/// ここでは行っていない。緩和を部分的に補っているもの: `ADOPT_MIN_MEAN_DELTA`
+/// (絶対量の下限)、`STABILITY_MIN` (fold 間で選択が一致すること)、sign test、
+/// `non_degradation` — SE ゲートは 5 つのうちの 1 つでしかない。
 pub fn paired_se(diffs: &[f64]) -> f64 {
     if diffs.len() < 2 {
         return f64::INFINITY;
@@ -2191,6 +2208,109 @@ mod tests {
         // 不偏 SD (分母 n-1): [1,2,3] -> sqrt(1.0) == 1.0
         assert!((sample_sd(&[1.0, 2.0, 3.0]) - 1.0).abs() < 1e-12);
         assert_eq!(sample_sd(&[5.0]), 0.0);
+    }
+
+    /// Deterministic LCG + Box-Muller, so the simulation below is reproducible
+    /// and needs no new dependency (the project does not pull `rand` in).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            // Numerical Recipes constants.
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+        fn unit(&mut self) -> f64 {
+            // (0, 1], avoiding 0 so ln() stays finite.
+            ((self.next_u64() >> 11) as f64 + 1.0) / ((1u64 << 53) as f64)
+        }
+        fn normal(&mut self) -> f64 {
+            let (u1, u2) = (self.unit(), self.unit());
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    /// Does `paired_se` over-state or under-state the true standard error of
+    /// the LOO mean delta? (AU-16)
+    ///
+    /// The doc comment on `paired_se` used to assert the estimate "errs
+    /// conservatively (does not underestimate)" despite the folds sharing
+    /// queries. That is an empirical claim about this estimator, so it is
+    /// measured rather than argued: draw many independent golden sets from a
+    /// known process, and compare
+    ///
+    /// - the **reported** SE, averaged over replications, with
+    /// - the **true** SE, i.e. the spread of the mean delta across those
+    ///   replications.
+    ///
+    /// A ratio below 1 means the reported SE is smaller than the real one, so
+    /// the adoption gate `mean_delta > ADOPT_SE_MULTIPLIER * se` fires more
+    /// easily than intended — the opposite of conservative.
+    ///
+    /// `#[ignore]`: a few hundred replications of a 26-query nested LOO over
+    /// the full condition grid is far too slow for the default suite.
+    #[test]
+    #[ignore = "simulation; run with: cargo test --lib au16 -- --ignored --nocapture"]
+    fn au16_paired_se_versus_the_true_standard_error() {
+        const REPS: usize = 300;
+
+        // Several settings, so the direction is not an artifact of one choice
+        // of sizes, effect size or noise level.
+        let settings: [(usize, f64, f64, f64, u64); 4] = [
+            //  N,  true edge, per-query sd, per-cell sd, seed
+            (26, 0.04, 0.05, 0.08, 0x5EED_0001),
+            (26, 0.00, 0.05, 0.08, 0x5EED_0002), // no real winner at all
+            (12, 0.04, 0.05, 0.08, 0x5EED_0003),
+            (26, 0.04, 0.05, 0.03, 0x5EED_0004), // quieter cells
+        ];
+
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: 2,
+        };
+        eprintln!("AU-16 simulation ({REPS} replications per setting)");
+        for (n, edge, q_sd, cell_sd, seed) in settings {
+            let mut rng = Lcg(seed);
+            let mut means = vec![0.40_f64; TOTAL_CONDITIONS];
+            means[winner.index()] = 0.40 + edge;
+
+            let mut mean_deltas = Vec::with_capacity(REPS);
+            let mut reported_ses = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let rows: Vec<Vec<f64>> = (0..n)
+                    .map(|_| {
+                        let per_query = q_sd * rng.normal(); // query difficulty
+                        means
+                            .iter()
+                            .map(|m| m + per_query + cell_sd * rng.normal())
+                            .collect()
+                    })
+                    .collect();
+                let table = table_from_primary(rows);
+                let idx: Vec<usize> = (0..n).collect();
+                let out = nested_loo(&table, &idx);
+                mean_deltas.push(mean(&out.diffs));
+                reported_ses.push(paired_se(&out.diffs));
+            }
+
+            let true_se = sample_sd(&mean_deltas);
+            let avg_reported = mean(&reported_ses);
+            eprintln!(
+                "  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5} | \
+                 true SE={true_se:.6}  reported={avg_reported:.6}  ratio={:.3}",
+                avg_reported / true_se
+            );
+            assert!(true_se > 0.0, "degenerate simulation: no spread to measure");
+            assert!(avg_reported.is_finite(), "reported SE must be finite");
+        }
+
+        // No threshold assertion: the point of this test is the numbers it
+        // prints, and pinning a ratio would turn a measurement into a brittle
+        // expectation.
     }
 
     #[test]

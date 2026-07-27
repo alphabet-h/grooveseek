@@ -290,6 +290,17 @@ recommended when **all** of the following hold:
    signal there is)
 5. no secondary metric (recall@k for any k, MRR) regressed against the defaults
 
+> **Criterion 3 is weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)`
+> assumes the per-fold differences are independent, but the N leave-one-out
+> selections each share N−2 queries, so they are positively correlated and the
+> formula underestimates the true spread. Simulated against a known
+> data-generating process, the reported SE came out at 0.55–0.66 of the real
+> one, which makes criterion 3 behave closer to a 1.1 sigma test than a 2 sigma
+> one. The multiplier has deliberately not been raised — that would change what
+> the tool recommends — and criteria 1, 2, 4 and 5 are unaffected. The
+> simulation lives in `tune.rs` as
+> `au16_paired_se_versus_the_true_standard_error`.
+
 Otherwise the verdict is "keep the built-in defaults", which is a normal and
 expected outcome: the RRF paper measured only ~0.4% relative MAP movement
 across k ∈ [30, 100], and Elasticsearch documents RRF as requiring no tuning.
