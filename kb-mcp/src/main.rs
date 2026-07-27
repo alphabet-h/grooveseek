@@ -668,11 +668,18 @@ fn main() -> anyhow::Result<()> {
             if !force {
                 db.verify_embedding_meta(model.model_id(), dim)?;
             }
+            // `[parsers].enabled` の検証は **モデル DL と `--force` の破壊的
+            // reset より前** に置く (AU-06 codex P2)。ここが後ろにあると、
+            // 設定に受け付けられない id が 1 つ入っているだけで
+            // 「index を空にしてからエラー終了」になり、ユーザは元の index を
+            // 失う。`.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当
+            // だった設定のまま upgrade した人がこの経路に入る。id の妥当性は
+            // ファイルも DB も触らずに判定できるので、一番手前に置くのが正しい。
+            let registry = cfg.build_parser_registry()?;
             let mut embedder = kb_mcp::embedder::Embedder::with_model(model)?;
             if force {
                 db.reset_for_model(embedder.model_id(), dim)?;
             }
-            let registry = cfg.build_parser_registry()?;
             eprintln!("Indexing {}...", kb_path.display());
             let exclude_dirs = cfg.resolve_exclude_dirs();
             let progress_reporter =

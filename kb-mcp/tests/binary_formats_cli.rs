@@ -450,3 +450,71 @@ fn test_index_office_formats_and_ignores_lock_file() {
         "expected extracted pptx slide text, got: {pptx_resp}"
     );
 }
+
+/// AU-06 (codex P2): a config that was valid in an earlier release must not
+/// cost the user their index.
+///
+/// `.xls` was a legal `[parsers].enabled` id up to v0.13.1. Upgrading without
+/// editing `kb-mcp.toml` and then running `index --force` used to empty the
+/// database first and reject the config afterwards, because
+/// `build_parser_registry()` ran after `reset_for_model()`. Validating the
+/// registry first costs nothing — it touches neither the filesystem nor the
+/// database.
+///
+/// Not `#[ignore]`d: with the ordering correct the run fails before the
+/// embedding model is ever loaded, so this needs no model download. If the
+/// ordering regresses the test still fails, just more slowly.
+#[test]
+fn a_withdrawn_parser_id_does_not_cost_the_user_their_index() {
+    let layout = TempKbLayout::new("kb-mcp-xls-migration");
+    layout.write("a.md", "# A\n\nbody enough body enough body enough");
+    let cfg_path = layout.root().join("kb-mcp.toml");
+    // v0.13.1 までは妥当だった設定。
+    std::fs::write(
+        &cfg_path,
+        "model = \"bge-small-en-v1.5\"\n[parsers]\nenabled = [\"md\", \"xls\"]\n",
+    )
+    .unwrap();
+
+    // 既存 index を用意する (embedding model を使わずに lib API で直接置く)。
+    let db_path = kb_mcp::resolve_db_path(layout.kb());
+    {
+        let db = kb_mcp::db::Database::open(&db_path.to_string_lossy()).unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let doc_id = db
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "h")
+            .unwrap();
+        db.insert_chunk(doc_id, 0, None, None, "body", None, &vec![0.1f32; 384], 1.0)
+            .unwrap();
+        assert_eq!(db.document_count().unwrap(), 1);
+    }
+
+    let out = Command::new(kb_mcp_bin())
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "index",
+            "--kb-path",
+            &layout.kb().display().to_string(),
+            "--force",
+        ])
+        .output()
+        .expect("kb-mcp index --force");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unusable [parsers].enabled must fail the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("xls"),
+        "the error should name the offending id:\n{stderr}"
+    );
+
+    // 肝心なのはここ: 落ちる前に index を消していないこと。
+    let db = kb_mcp::db::Database::open(&db_path.to_string_lossy()).unwrap();
+    assert_eq!(
+        db.document_count().unwrap(),
+        1,
+        "the existing index must survive a rejected config:\n{stderr}"
+    );
+}

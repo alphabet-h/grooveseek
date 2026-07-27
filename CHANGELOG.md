@@ -21,6 +21,13 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   The earlier claim in the source that BIFF's sheet limit made a dense grid
   safe was wrong: it bounds a sheet, not a workbook.
 
+  `kb-mcp index --force` now validates `[parsers].enabled` before it resets
+  anything. It used to build the registry *after* the reset, so a config
+  carrying an id this build rejects — which `"xls"` now is, and which an
+  upgraded installation may still hold — emptied the database and then exited
+  with an error, leaving no index at all. Checking ids first costs nothing:
+  it touches neither the filesystem nor the database.
+
 ### Fixed
 
 - **PDF text extraction had no ceiling on how much it would produce**
