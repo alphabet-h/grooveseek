@@ -22,7 +22,7 @@
 //!    — cmdlet auto-builds the Principal from the current logon identity, so
 //!    user-level registration just works.
 
-use super::powershell::{decode_diagnostic, with_utf8_output};
+use super::powershell::{decode_diagnostic, decode_value, with_utf8_output};
 use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
@@ -180,6 +180,50 @@ pub fn build_register_script(
 /// and this function always applies [`with_utf8_output`]. Without it every
 /// message below is decoded from the active code page as if it were UTF-8 — see
 /// [`super::powershell`] for the measurements.
+/// (AU-19) Ask Task Scheduler for one task's state, as a bare word.
+///
+/// Replaces `schtasks /Query /FO CSV /NH`, whose output was grepped for the
+/// substring `Running` across the **whole row** — and the first column of that
+/// row is the task name. A service installed as `--service-name Running`
+/// therefore reported Running forever, whatever the task was doing.
+///
+/// `TaskState` is a typed value rather than a column of localized CSV, so the
+/// name can no longer reach the state parse. `service_name` is upstream-
+/// validated to `[a-zA-Z0-9_-]+`, so it cannot close the quote.
+///
+/// A missing task makes `Get-ScheduledTask` write to stderr and exit non-zero,
+/// which the caller reads as `NotFound`.
+fn build_status_script(task: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         (Get-ScheduledTask -TaskName '{task}').State"
+    )
+}
+
+/// Map the `TaskState` word to a [`ServiceState`].
+///
+/// **This reports the state of the scheduled task, not of the daemon.** With
+/// the `kb-mcp-svc.exe` launcher the task detach-spawns the daemon and exits
+/// immediately, so a perfectly healthy daemon leaves the task `Ready`. That was
+/// equally true of the `schtasks` version this replaces — the fix here is the
+/// name collision, not the meaning. Knowing whether the daemon is up is an HTTP
+/// question (`/api/admin/status`), which is the route the tray takes (AU-65).
+fn parse_task_state(state: &str) -> ServiceState {
+    if state.trim().eq_ignore_ascii_case("Running") {
+        ServiceState::Running {
+            uptime_secs: 0,
+            bind: None,
+            kb_path: None,
+            model: None,
+        }
+    } else {
+        ServiceState::Stopped {
+            bind: None,
+            kb_path: None,
+        }
+    }
+}
+
 fn run_powershell_capture(script: &str, what: &str) -> Result<std::process::Output> {
     Command::new("powershell")
         .args([
@@ -295,35 +339,16 @@ impl ServiceBackend for TaskScheduler {
     }
     fn status(&self, service_name: &str) -> Result<ServiceState> {
         let task = task_name(service_name);
-        let out = Command::new("schtasks")
-            .args(["/Query", "/TN", &task, "/FO", "CSV", "/NH"])
-            .output()
-            .context("schtasks /Query 実行失敗")?;
+        let out = run_powershell_capture(&build_status_script(&task), "Get-ScheduledTask")?;
         if !out.status.success() {
+            // The script writes nothing and exits non-zero when the task does
+            // not exist, which is the same answer `schtasks /Query` gave.
             return Ok(ServiceState::NotFound);
         }
-        // `schtasks` is not PowerShell, so the UTF-8 prelude cannot reach it and
-        // this CSV really is active-code-page encoded. Lossy decoding is
-        // nonetheless safe *for this parse*: the only fields read are the task
-        // name and the literal `Running`, both ASCII, and no CP932 trail byte is
-        // `,` or `"` (the trail ranges are 0x40-0x7E and 0x80-0xFC), so field
-        // splitting cannot be thrown off by a Japanese task name elsewhere in
-        // the row. The status parse below is wrong for other reasons — see
-        // `list`.
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        Ok(if stdout.contains("Running") {
-            ServiceState::Running {
-                uptime_secs: 0,
-                bind: None,
-                kb_path: None,
-                model: None,
-            }
-        } else {
-            ServiceState::Stopped {
-                bind: None,
-                kb_path: None,
-            }
-        })
+        Ok(parse_task_state(&decode_value(
+            &out.stdout,
+            "Get-ScheduledTask stdout",
+        )?))
     }
     fn list(&self) -> Result<Vec<(String, ServiceState)>> {
         let out = Command::new("schtasks")
@@ -360,6 +385,54 @@ impl ServiceBackend for TaskScheduler {
 mod tests {
     use super::*;
     use crate::service::powershell::decode_value;
+
+    /// AU-19. The bug was that the state check grepped the whole `schtasks`
+    /// CSV row, whose first column is the task name — so a service installed
+    /// as `--service-name Running` reported Running forever.
+    ///
+    /// The name now cannot reach the state parse at all: the script asks for
+    /// `.State` and the parser sees only that word. Pinning it here means the
+    /// two halves cannot drift back together.
+    #[test]
+    fn a_service_named_running_is_not_reported_running() {
+        // What Task Scheduler returns for a task that is not running, for a
+        // task that happens to be *called* Running.
+        assert!(matches!(
+            parse_task_state("Ready"),
+            ServiceState::Stopped { .. }
+        ));
+
+        let script = build_status_script(&task_name("Running"));
+        assert!(
+            script.contains("(Get-ScheduledTask -TaskName 'kb-mcp-Running').State"),
+            "the script must read the State property, not the whole row: {script}"
+        );
+        assert!(
+            !script.contains("schtasks"),
+            "the CSV path is what carried the defect: {script}"
+        );
+    }
+
+    #[test]
+    fn task_state_words_map_to_service_state() {
+        assert!(matches!(
+            parse_task_state("Running"),
+            ServiceState::Running { .. }
+        ));
+        // Task Scheduler's other states are all "not running" for our purposes.
+        for word in ["Ready", "Disabled", "Queued", "Unknown", ""] {
+            assert!(
+                matches!(parse_task_state(word), ServiceState::Stopped { .. }),
+                "{word:?} must not read as Running"
+            );
+        }
+        // PowerShell prints the enum name; tolerate whitespace and casing
+        // rather than depending on how it formats.
+        assert!(matches!(
+            parse_task_state(" running \r\n"),
+            ServiceState::Running { .. }
+        ));
+    }
 
     /// AU-67. The point of the warning is that a user can act on it, which
     /// means naming the archive to download — a message saying only "svc not

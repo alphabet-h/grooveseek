@@ -72,6 +72,39 @@ pub(crate) fn run_with_backend(
         );
     }
 
+    let binary_path = std::env::current_exe().context("std::env::current_exe() 解決失敗")?;
+
+    // (AU-30) The tray preflight runs before anything is written.
+    //
+    // It used to sit further down, after `kb-mcp.toml` had been created. A
+    // preflight rejection there left the file behind, and the next attempt hit
+    // "kb-mcp.toml が既存 (--force で上書き)" — so the run that changed nothing
+    // still made the retry look like a second install, and the user had to pass
+    // --force to recover from an error that was supposed to mean "nothing
+    // happened".
+    //
+    // Nothing in the check depends on the toml: it needs the service name, the
+    // directory holding kb-mcp.exe, and `force`.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    let preflight_tray_exe: Option<PathBuf> = if params.with_tray {
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err(anyhow!("--with-tray is only supported on Windows"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let bin_dir = binary_path
+                .parent()
+                .ok_or_else(|| anyhow!("no parent directory for the current kb-mcp.exe"))?
+                .to_path_buf();
+            let tray_exe = bin_dir.join("kb-mcp-tray.exe");
+            kb_mcp_tray::install::preflight_check(&name, &tray_exe, params.force)?;
+            Some(tray_exe)
+        }
+    } else {
+        None
+    };
+
     std::fs::create_dir_all(config_home)?;
     #[cfg(unix)]
     {
@@ -115,36 +148,9 @@ pub(crate) fn run_with_backend(
         kb_path,
         bind: params.bind,
         config_home: config_home.to_path_buf(),
-        binary_path: std::env::current_exe().context("std::env::current_exe() 解決失敗")?,
+        binary_path,
         auto_start: params.auto_start,
         force: params.force,
-    };
-
-    // (codex P2 round 1 on PR #63): preflight the tray side BEFORE
-    // registering the daemon so a tray failure does not leave a
-    // half-installed service. Catches: non-Windows host, missing
-    // kb-mcp-tray.exe sibling, pre-existing autostart entry without
-    // --force. The actual `install_autostart` call below runs only if
-    // preflight passed.
-    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
-    let preflight_tray_exe: Option<PathBuf> = if params.with_tray {
-        #[cfg(not(target_os = "windows"))]
-        {
-            return Err(anyhow!("--with-tray is only supported on Windows"));
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let bin_dir = ctx
-                .binary_path
-                .parent()
-                .ok_or_else(|| anyhow!("no parent directory for the current kb-mcp.exe"))?
-                .to_path_buf();
-            let tray_exe = bin_dir.join("kb-mcp-tray.exe");
-            kb_mcp_tray::install::preflight_check(&name, &tray_exe, params.force)?;
-            Some(tray_exe)
-        }
-    } else {
-        None
     };
 
     be.install(&ctx)?;
@@ -488,5 +494,133 @@ mod tests {
         // Existing (invalid) file must not have been overwritten.
         let body = std::fs::read_to_string(&toml_path).unwrap();
         assert_eq!(body, "this = is = not = valid = toml");
+    }
+}
+
+#[cfg(test)]
+mod au30_tests {
+    use super::*;
+    use crate::service::{ServiceBackend, ServiceState};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A private copy rather than `mod tests`'s: reaching into a sibling test
+    /// module would mean widening something there, and this project treats the
+    /// existing tests as fixed. Same construction — no `tempfile` crate, and a
+    /// counter alongside pid + nanos because a test binary runs its tests on
+    /// parallel threads of one process (AU-54).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("kb-mcp-{tag}-{}-{nanos}-{seq}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Records whether the backend was reached. `install` is the only method
+    /// these tests exercise.
+    struct SpyBackend(Cell<bool>);
+
+    impl ServiceBackend for SpyBackend {
+        fn install(&self, _ctx: &InstallContext) -> Result<()> {
+            self.0.set(true);
+            Ok(())
+        }
+        fn uninstall(&self, _service_name: &str) -> Result<()> {
+            Ok(())
+        }
+        fn status(&self, _service_name: &str) -> Result<ServiceState> {
+            Ok(ServiceState::NotFound)
+        }
+        fn list(&self) -> Result<Vec<(String, ServiceState)>> {
+            Ok(Vec::new())
+        }
+        fn stop(&self, _service_name: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn params(kb: &std::path::Path, with_tray: bool) -> InstallParams {
+        InstallParams {
+            service_name: "au30".into(),
+            kb_path: Some(kb.to_path_buf()),
+            bind: "127.0.0.1:3100".into(),
+            auto_start: true,
+            force: false,
+            i_know_non_loopback: false,
+            with_tray,
+        }
+    }
+
+    /// AU-30. A rejected `--with-tray` preflight must leave nothing behind.
+    ///
+    /// It used to run *after* `kb-mcp.toml` was written, so a rejection left the
+    /// file on disk and the next attempt failed with "kb-mcp.toml が既存
+    /// (--force で上書き)" — a run that changed nothing still forced the user to
+    /// pass --force to recover.
+    ///
+    /// On Windows the preflight rejects because `kb-mcp-tray.exe` is not next
+    /// to the test binary; on other platforms because --with-tray is
+    /// unsupported. Either way it must fail before the write.
+    #[test]
+    fn a_rejected_tray_preflight_leaves_no_toml_behind() {
+        let home = TempDir::new("au30-tray");
+        let kb = TempDir::new("au30-kb");
+        let be = SpyBackend(Cell::new(false));
+
+        let err = run_with_backend(&be, home.path(), params(kb.path(), true))
+            .expect_err("--with-tray must be rejected in a test environment");
+
+        // Pin *why* it was rejected. On Windows the test binary lives in
+        // `target/debug/deps/`, so the `kb-mcp-tray.exe` sibling is one
+        // directory up and the preflight reports it missing; elsewhere the
+        // whole flag is unsupported. Without this, the test would keep passing
+        // if the rejection moved to some unrelated cause.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kb-mcp-tray.exe") || msg.contains("only supported on Windows"),
+            "the failure must come from the tray preflight, not elsewhere: {msg}"
+        );
+        assert!(
+            !home.path().join("kb-mcp.toml").exists(),
+            "a failed preflight must not leave kb-mcp.toml behind: {err}"
+        );
+        assert!(
+            !be.0.get(),
+            "the backend must not be reached after a preflight rejection"
+        );
+    }
+
+    /// The same call without `--with-tray` does write the toml and does reach
+    /// the backend — otherwise the test above would pass for a service that is
+    /// simply broken.
+    #[test]
+    fn without_tray_the_install_writes_the_toml_and_reaches_the_backend() {
+        let home = TempDir::new("au30-plain");
+        let kb = TempDir::new("au30-kb2");
+        let be = SpyBackend(Cell::new(false));
+
+        run_with_backend(&be, home.path(), params(kb.path(), false)).expect("install should run");
+
+        assert!(home.path().join("kb-mcp.toml").exists());
+        assert!(be.0.get(), "the backend must be reached");
     }
 }
