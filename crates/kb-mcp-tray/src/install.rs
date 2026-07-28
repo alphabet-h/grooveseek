@@ -3,7 +3,7 @@
 //! established by feature-43 (kb-mcp/src/service/windows.rs), so no new
 //! dependency is required.
 
-use crate::powershell::{decode_diagnostic, decode_value, with_utf8_output};
+use crate::powershell::{CREATE_NO_WINDOW, decode_diagnostic, decode_value, with_utf8_output};
 
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
@@ -156,6 +156,8 @@ pub fn uninstall_autostart(service_name: &str) -> Result<()> {
 /// the active code page decoded as if it were UTF-8, which for the caller of
 /// [`install_autostart`] means a `.lnk` path full of U+FFFD.
 fn run_ps(script: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt as _;
+
     let out = std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -163,6 +165,9 @@ fn run_ps(script: &str) -> Result<String> {
             "-Command",
             &with_utf8_output(script),
         ])
+        // Without this the GUI-subsystem tray gets a console window flashed on
+        // screen for the duration of the call; see [`CREATE_NO_WINDOW`].
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("spawn powershell")?;
     if !out.status.success() {

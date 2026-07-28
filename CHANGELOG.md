@@ -4,6 +4,31 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The tray no longer flashes a console window** on every Start / Stop /
+  Restart and on `--with-tray` autostart install (AU-66). `kb-mcp-tray.exe` is
+  a GUI-subsystem binary and so owns no console; `powershell.exe` is a
+  console-subsystem program, so Windows was **allocating a fresh console for
+  it** on each call. Redirecting stdout and stderr does not prevent that —
+  only the `CREATE_NO_WINDOW` creation flag does. Measured from a
+  GUI-subsystem parent with every handle piped, the child's own
+  `GetConsoleWindow()` returns non-zero by default and `0` with the flag.
+
+  The same fix already existed on the logon path, where v0.9.1 introduced the
+  GUI-subsystem `kb-mcp-svc.exe` to detach-spawn the daemon; the tray's own
+  PowerShell calls were never given it.
+
+- **`kb-mcp service install` now says when it could not use the svc launcher**
+  (AU-67). It prefers `kb-mcp-svc.exe` for the logon task and falls back to a
+  console-visible Action when the sibling is missing — previously without a
+  word. `kb-mcp-svc.exe` was not attached to a release at all until v0.14.0,
+  so **every** installation from a release archive between v0.9.0 and v0.13.1
+  took the fallback: users saw a console window at each logon while the v0.9.1
+  fix meant to prevent it appeared to be in place, and nothing pointed at the
+  cause. The warning now names the archive to extract and how to redo the
+  install.
+
 ### Added
 
 - **Architecture Decision Records under [`docs/decisions/`](docs/decisions/).**
