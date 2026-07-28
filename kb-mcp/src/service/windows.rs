@@ -30,6 +30,17 @@ use std::process::Command;
 
 pub(crate) struct TaskScheduler;
 
+/// The scheduled-task name for a service.
+///
+/// (AU-33) `kb-mcp-tray` carries an identical copy in `daemon.rs`, and it
+/// cannot be shared: that module belongs to the tray's **bin** target, while
+/// this crate can only import its **lib**. The same one-way dependency forced
+/// the duplicated PowerShell helpers in AU-04.
+///
+/// A divergence would not fail to compile — the tray would simply control a
+/// task nobody registered, silently, which is the shape AU-65 already had once.
+/// So both sides pin the literal in a test instead, as AU-04 did for the UTF-8
+/// prelude.
 fn task_name(service_name: &str) -> String {
     format!("kb-mcp-{}", service_name)
 }
@@ -425,6 +436,20 @@ mod tests {
     /// [`parse_task_state`] would read the pair as "not Running". The
     /// `schtasks /TN` call this replaced was an exact root lookup; the path
     /// restriction is what keeps that property.
+    /// (AU-33) The tray computes the same name from its own copy, in a module
+    /// this crate cannot import. A divergence compiles fine and shows up only
+    /// as a tray that controls a task nobody registered — so both sides pin
+    /// the literal. The counterpart is `task_name_uses_kb_mcp_prefix` in
+    /// `crates/kb-mcp-tray/src/daemon.rs`; the two must agree.
+    #[test]
+    fn task_name_matches_the_tray_copy() {
+        assert_eq!(task_name("personal"), "kb-mcp-personal");
+        assert!(
+            !task_name("personal").starts_with('\\'),
+            "a leading backslash makes the cmdlet look for a path that does not exist"
+        );
+    }
+
     #[test]
     fn status_lookup_is_pinned_to_the_root_task_folder() {
         let script = build_status_script(&task_name("svc"));
