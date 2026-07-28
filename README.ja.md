@@ -27,7 +27,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 >
 > | Archive | 理由 |
 > | --- | --- |
-> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` は `kb-mcp-svc.exe` が `kb-mcp.exe` の隣にあればそれを logon task の起動対象にし、**無ければ console 可視の launcher に黙って fallback する** — 毎回のログオンでコンソール窓が一瞬出る。fallback したことは何も報告されないので、`service install` の**前に**展開しておくこと。 |
+> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` は `kb-mcp-svc.exe` が `kb-mcp.exe` の隣にあればそれを logon task の起動対象にし、**無ければ console 可視の launcher に fallback する** — 毎回のログオンでコンソール窓が一瞬出る。fallback したことは warning で報告されるが、`service install` の**前に**展開しておけば入れ直さずに済む。 |
 > | `kb-mcp-tray-x86_64-pc-windows-msvc.zip` | 任意。system tray 監視 binary で、`service install --with-tray` を使う場合のみ必要。 |
 
 各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。

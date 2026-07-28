@@ -27,7 +27,7 @@ Download the archive for your platform from the [latest GitHub release](https://
 >
 > | Archive | Why |
 > | --- | --- |
-> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` points the logon task at `kb-mcp-svc.exe` when it sits next to `kb-mcp.exe`, and **silently falls back to a console-visible launcher when it does not** — which means a console window flashes at every login. Nothing reports the fallback, so extract this one before running `service install`. |
+> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` points the logon task at `kb-mcp-svc.exe` when it sits next to `kb-mcp.exe`, and **falls back to a console-visible launcher when it does not** — which means a console window flashes at every login. The fallback is reported as a warning, but extracting this archive before running `service install` saves you the second install. |
 > | `kb-mcp-tray-x86_64-pc-windows-msvc.zip` | Optional. The system tray monitor; needed only for `service install --with-tray`. |
 
 Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running.
