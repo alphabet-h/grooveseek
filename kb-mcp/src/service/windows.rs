@@ -229,9 +229,6 @@ fn register_via_powershell(
     force: bool,
 ) -> Result<()> {
     let target = resolve_action_target(binary_path);
-    if !target.used_svc_launcher {
-        eprintln!("{}", svc_fallback_warning(binary_path));
-    }
     let script = build_register_script(service_name, &target, config_home, auto_start, force);
     let out = run_powershell_capture(&script, "Register-ScheduledTask")?;
     if !out.status.success() {
@@ -246,6 +243,16 @@ fn register_via_powershell(
             stderr.trim(),
             stdout.trim(),
         ));
+    }
+    // AU-67, after the success check: the warning is worded in the past tense
+    // ("Registered the logon task ..."), which is only true once the cmdlet has
+    // actually run. Printed before it, a registration that then fails — the
+    // reproducible case being an existing task without `--force` — would emit
+    // "Registered ..." immediately followed by "Register-ScheduledTask failed",
+    // and nothing would have been registered at all. A failed install has one
+    // actionable message, and it is not this one.
+    if !target.used_svc_launcher {
+        eprintln!("{}", svc_fallback_warning(binary_path));
     }
     Ok(())
 }
