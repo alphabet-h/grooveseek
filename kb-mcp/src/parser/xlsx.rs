@@ -4,7 +4,7 @@ use std::io::Cursor;
 use anyhow::{Result, anyhow};
 use calamine::{Data, Reader};
 
-use super::{Chunk, ParsedDocument, Parser, single_text_chunk};
+use super::{ParsedDocument, Parser, single_text_chunk};
 
 pub struct XlsxParser;
 pub struct XlsParser;
@@ -141,22 +141,10 @@ fn parse_xlsx_bytes_capped(
         if text.trim().is_empty() {
             continue; // 空シートは chunk を作らない
         }
-        let heading = format!("Sheet: {name}");
-        let context = super::build_context(&[title, &heading]);
-        chunks.push(Chunk {
-            index: chunks.len(),
-            heading: Some(heading),
-            level: Some(2),
-            content: text.trim_end().to_string(),
-            context,
-        });
+        chunks.push(super::sheet_chunk(chunks.len(), title, &name, &text));
     }
 
-    let raw_content = chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let raw_content = super::join_chunk_bodies(&chunks);
     Ok(ParsedDocument {
         frontmatter,
         chunks,
@@ -307,22 +295,10 @@ fn parse_xls_bytes_capped(
         if text.trim().is_empty() {
             continue;
         }
-        let heading = format!("Sheet: {name}");
-        let context = super::build_context(&[title, &heading]);
-        chunks.push(Chunk {
-            index: chunks.len(),
-            heading: Some(heading),
-            level: Some(2),
-            content: text.trim_end().to_string(),
-            context,
-        });
+        chunks.push(super::sheet_chunk(chunks.len(), title, &name, &text));
     }
 
-    let raw_content = chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let raw_content = super::join_chunk_bodies(&chunks);
     Ok(ParsedDocument {
         frontmatter,
         chunks,

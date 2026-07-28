@@ -85,6 +85,42 @@ pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 /// と get_document の raw cap (server) で共有する。テキスト形式には適用しない。
 pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
 
+/// (AU-33) `ParsedDocument::raw_content` — the chunk bodies rejoined.
+///
+/// Four parsers built this identically (`docx`, `pdf`, `pptx`, `xlsx`), which
+/// matters more than the line count: `raw_content` is what `get_document`
+/// returns, so a parser that joined differently would serve a document whose
+/// text does not match the chunks that were indexed from it. Sharing the join
+/// is what keeps that impossible rather than merely unlikely.
+///
+/// The separator is a blank line, matching how Markdown documents read back.
+pub(crate) fn join_chunk_bodies(chunks: &[Chunk]) -> String {
+    chunks
+        .iter()
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// (AU-33) One spreadsheet sheet as a chunk.
+///
+/// Both workbook readers built this the same way. Keeping it in one place
+/// keeps the `Sheet: <name>` heading, the level, and the trailing-whitespace
+/// trim from drifting apart between the two — the heading in particular is
+/// weighted in FTS, so a difference there would change retrieval for one
+/// format and not the other.
+pub(crate) fn sheet_chunk(index: usize, title: &str, name: &str, text: &str) -> Chunk {
+    let heading = format!("Sheet: {name}");
+    let context = build_context(&[title, &heading]);
+    Chunk {
+        index,
+        heading: Some(heading),
+        level: Some(2),
+        content: text.trim_end().to_string(),
+        context,
+    }
+}
+
 /// パンくず合成 (feature-46)。空要素 skip + 連続重複 skip + `" > "` join + 200 chars
 /// cap (char boundary 安全)。全要素が空なら `None`。
 ///

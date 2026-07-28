@@ -133,11 +133,7 @@ impl Parser for PdfParser {
         }
 
         // frontmatter は extract_pdf が同じ PdfDocument から抽出済み (§4.5)。
-        let raw_content = chunks
-            .iter()
-            .map(|c| c.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let raw_content = super::join_chunk_bodies(&chunks);
 
         Ok(ParsedDocument {
             frontmatter,

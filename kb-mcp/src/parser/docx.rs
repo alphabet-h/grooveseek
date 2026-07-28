@@ -42,11 +42,7 @@ impl Parser for DocxParser {
         let frontmatter = super::ooxml::core_xml_frontmatter(&mut zip, path_hint, &mut budget)?;
         super::ooxml::warn_if_truncated(path_hint, "word/document.xml", &doc_xml);
         let chunks = parse_document_xml(&doc_xml, exclude_headings, frontmatter.title.as_deref());
-        let raw_content = chunks
-            .iter()
-            .map(|c| c.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let raw_content = super::join_chunk_bodies(&chunks);
         Ok(ParsedDocument {
             frontmatter,
             chunks,
