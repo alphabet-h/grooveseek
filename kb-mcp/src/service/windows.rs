@@ -208,11 +208,21 @@ fn run_powershell_capture(script: &str, what: &str) -> Result<std::process::Outp
 ///
 /// Kept separate from the printing so the wording — specifically the archive
 /// name a user has to go find — is pinned by a test.
-fn svc_fallback_warning(binary_path: &Path) -> String {
+///
+/// `auto_start` decides when the console actually appears. `--no-auto-start`
+/// registers the task with `$trigger.Enabled = $false`, so it does not run at
+/// logon at all; promising a window "at every logon" there would describe a
+/// symptom the user will never see and make the rest of the advice look wrong.
+fn svc_fallback_warning(binary_path: &Path, auto_start: bool) -> String {
+    let when = if auto_start {
+        "at every logon"
+    } else {
+        "each time the task is started"
+    };
     format!(
         "warning: kb-mcp-svc.exe was not found next to {}.\n         \
-         Registered the logon task to run kb-mcp.exe directly, which shows a\n         \
-         console window at every logon. To avoid it, extract\n         \
+         Registered the task to run kb-mcp.exe directly, which shows a\n         \
+         console window {when}. To avoid it, extract\n         \
          kb-mcp-svc-x86_64-pc-windows-msvc.zip from the release next to\n         \
          kb-mcp.exe and run `kb-mcp service install --force` again.",
         binary_path.display()
@@ -252,7 +262,7 @@ fn register_via_powershell(
     // and nothing would have been registered at all. A failed install has one
     // actionable message, and it is not this one.
     if !target.used_svc_launcher {
-        eprintln!("{}", svc_fallback_warning(binary_path));
+        eprintln!("{}", svc_fallback_warning(binary_path, auto_start));
     }
     Ok(())
 }
@@ -354,7 +364,7 @@ mod tests {
     /// found" would leave them exactly where the silent fallback did.
     #[test]
     fn svc_fallback_warning_tells_the_user_what_to_do() {
-        let msg = svc_fallback_warning(Path::new("C:\\bin\\kb-mcp.exe"));
+        let msg = svc_fallback_warning(Path::new("C:\\bin\\kb-mcp.exe"), true);
 
         assert!(
             msg.contains("kb-mcp-svc-x86_64-pc-windows-msvc.zip"),
@@ -377,9 +387,40 @@ mod tests {
     /// The message is one literal split across source lines with `\` joins,
     /// which silently eat the newline *and* the following indentation — a
     /// miscount still compiles and produces ragged output. Pin the shape.
+    /// `--no-auto-start` registers the task with `$trigger.Enabled = $false`,
+    /// so it never fires at logon. Promising a window "at every logon" there
+    /// describes a symptom the user will never see, which makes the rest of the
+    /// advice look wrong too.
+    #[test]
+    fn svc_fallback_warning_matches_when_the_task_actually_runs() {
+        let path = Path::new("C:\\bin\\kb-mcp.exe");
+
+        let at_logon = svc_fallback_warning(path, true);
+        assert!(
+            at_logon.contains("at every logon"),
+            "an auto-start install does flash on each logon: {at_logon}"
+        );
+
+        let on_demand = svc_fallback_warning(path, false);
+        assert!(
+            !on_demand.contains("logon"),
+            "--no-auto-start never fires at logon, so the message must not say so: {on_demand}"
+        );
+        assert!(
+            on_demand.contains("each time the task is started"),
+            "it must still say when the window appears: {on_demand}"
+        );
+
+        // The actionable half is identical either way.
+        for msg in [&at_logon, &on_demand] {
+            assert!(msg.contains("kb-mcp-svc-x86_64-pc-windows-msvc.zip"));
+            assert!(msg.contains("--force"));
+        }
+    }
+
     #[test]
     fn svc_fallback_warning_lines_are_aligned() {
-        let msg = svc_fallback_warning(Path::new("C:\\bin\\kb-mcp.exe"));
+        let msg = svc_fallback_warning(Path::new("C:\\bin\\kb-mcp.exe"), true);
         let mut lines = msg.lines();
 
         assert!(
