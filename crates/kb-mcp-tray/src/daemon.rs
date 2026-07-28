@@ -1,6 +1,6 @@
 use crate::process::{StopOutcome, stop_process_if_image_matches};
 use anyhow::{Context, Result, bail};
-use kb_mcp_tray::powershell::{decode_diagnostic, with_utf8_output};
+use kb_mcp_tray::powershell::{CREATE_NO_WINDOW, decode_diagnostic, with_utf8_output};
 use std::time::Duration;
 
 /// File name of the daemon executable. Every stop is gated on the target
@@ -266,6 +266,9 @@ async fn run_powershell(script: &str) -> Result<()> {
             "-Command",
             &with_utf8_output(script),
         ])
+        // Without this every Start / Stop / Restart from the tray menu flashes
+        // a console window on screen; see [`CREATE_NO_WINDOW`].
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .await
         .context("spawn powershell")?;

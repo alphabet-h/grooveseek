@@ -44,6 +44,31 @@ pub fn with_utf8_output(script: &str) -> String {
     format!("{UTF8_OUTPUT_PRELUDE}\n{script}")
 }
 
+/// Creation flag every `powershell.exe` spawn in this crate must carry, so that
+/// Windows does not give the child a console of its own.
+///
+/// The tray is built as a GUI-subsystem binary and therefore owns no console.
+/// `powershell.exe` is a console-subsystem program, so when it is started
+/// without this flag Windows **allocates a fresh console for it** — a window
+/// that flashes on screen for the lifetime of the call. Measured from a
+/// `windows_subsystem = "windows"` parent with every stdio handle piped, the
+/// child reporting its own `GetConsoleWindow()`:
+///
+/// | Creation flags | `GetConsoleWindow()` in the child |
+/// |---|---|
+/// | (none) | non-zero — it has a window |
+/// | `CREATE_NO_WINDOW` | `0` |
+///
+/// Redirecting stdout / stderr does not prevent the allocation; only the flag
+/// does. The same fix already sits on the logon path, where v0.9.1 introduced
+/// the GUI-subsystem `kb-mcp-svc.exe` to detach-spawn the daemon without a
+/// console — the tray's own PowerShell calls were simply never given the same
+/// treatment.
+///
+/// Taken from the Win32 constant rather than written as a literal so it cannot
+/// drift; pinned by a test below.
+pub const CREATE_NO_WINDOW: u32 = windows::Win32::System::Threading::CREATE_NO_WINDOW.0;
+
 /// Decode output that the caller turns into a **value** — here, the `.lnk` path
 /// and the duplicate-check JSON.
 ///
@@ -92,6 +117,50 @@ mod tests {
         assert_eq!(
             UTF8_OUTPUT_PRELUDE,
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        );
+    }
+
+    /// `CREATE_NO_WINDOW` is documented as `0x0800_0000`. Taking it from the
+    /// `windows` crate keeps it honest, but a wrong-but-plausible value would
+    /// still compile and would silently restore the flashing window, so the
+    /// number is pinned here as well.
+    #[test]
+    fn create_no_window_is_the_documented_flag() {
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+    }
+
+    /// The flag changes how the child is created, so it could plausibly break
+    /// the pipes this module reads back — which would turn a cosmetic fix into
+    /// a functional regression. Spawning for real is the only way to know.
+    ///
+    /// Windows-only by construction (the whole crate is), and cheap: one
+    /// `powershell.exe` that echoes a non-ASCII string, so it also re-checks
+    /// that the flag and the UTF-8 prelude coexist.
+    #[test]
+    fn output_is_still_captured_with_the_flag_applied() {
+        use std::os::windows::process::CommandExt as _;
+
+        let out = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &with_utf8_output("Write-Output '日本'"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("spawn powershell");
+
+        assert!(
+            out.status.success(),
+            "powershell failed: {}",
+            decode_diagnostic(&out.stderr)
+        );
+        let stdout = decode_value(&out.stdout, "stdout").expect("stdout must still be UTF-8");
+        assert_eq!(
+            stdout.trim(),
+            "日本",
+            "CREATE_NO_WINDOW must not disturb the captured pipe"
         );
     }
 

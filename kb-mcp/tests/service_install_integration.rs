@@ -101,6 +101,7 @@ fn svc_action_target() -> kb_mcp::service::windows::ActionTarget {
     kb_mcp::service::windows::ActionTarget {
         execute_path: PathBuf::from("C:\\bin\\kb-mcp-svc.exe"),
         argument_clause: String::new(),
+        used_svc_launcher: true,
     }
 }
 
@@ -109,6 +110,7 @@ fn console_action_target() -> kb_mcp::service::windows::ActionTarget {
     kb_mcp::service::windows::ActionTarget {
         execute_path: PathBuf::from("C:\\bin\\kb-mcp.exe"),
         argument_clause: " -Argument 'serve'".to_string(),
+        used_svc_launcher: false,
     }
 }
 
@@ -208,6 +210,7 @@ fn windows_register_script_escapes_single_quotes_in_paths() {
     let target = ActionTarget {
         execute_path: PathBuf::from("C:\\Users\\O'Brien\\bin\\kb-mcp-svc.exe"),
         argument_clause: String::new(),
+        used_svc_launcher: true,
     };
     let script = build_register_script(
         "kb-mcp",

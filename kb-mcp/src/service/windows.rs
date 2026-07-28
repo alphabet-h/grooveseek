@@ -68,6 +68,15 @@ pub struct ActionTarget {
     /// Empty when `execute_path` is the svc launcher (it adds `serve` itself),
     /// otherwise `" -Argument 'serve'"`.
     pub argument_clause: String,
+    /// `false` when the svc launcher was missing and the console-visible
+    /// fallback was taken.
+    ///
+    /// Carried in the return value rather than reported from inside
+    /// [`resolve_action_target`] so that function stays pure — which is what
+    /// makes it testable without a real install layout (AU-07 / AU-08). The
+    /// caller is responsible for telling the user; leaving the fallback silent
+    /// is what AU-67 was about.
+    pub used_svc_launcher: bool,
 }
 
 /// (v0.9.1 hot-fix) Decide what the AtLogOn Action should execute.
@@ -91,6 +100,7 @@ pub fn resolve_action_target(binary_path: &Path) -> ActionTarget {
     let legacy = || ActionTarget {
         execute_path: binary_path.to_path_buf(),
         argument_clause: LEGACY_SERVE_ARGUMENT.to_string(),
+        used_svc_launcher: false,
     };
     match binary_path.parent() {
         Some(dir) => {
@@ -99,6 +109,7 @@ pub fn resolve_action_target(binary_path: &Path) -> ActionTarget {
                 ActionTarget {
                     execute_path: svc,
                     argument_clause: String::new(),
+                    used_svc_launcher: true,
                 }
             } else {
                 legacy()
@@ -183,6 +194,31 @@ fn run_powershell_capture(script: &str, what: &str) -> Result<std::process::Outp
         .with_context(|| format!("powershell {what} invocation failed"))
 }
 
+/// (AU-67) What to print when the svc launcher is missing and the
+/// console-visible Action was registered instead.
+///
+/// The fallback produces a working install, so this is a warning and not an
+/// error — but it must not stay silent. `kb-mcp-svc.exe` was not attached to a
+/// release at all until v0.14.0, so **every** installation from a release
+/// archive between v0.9.0 and v0.13.1 took this branch: users saw a console
+/// window at each logon while the v0.9.1 fix meant to prevent it appeared to be
+/// in place. Nothing reported the substitution, and the distribution bug stayed
+/// invisible for eight releases. Silence about an "optional optimisation" not
+/// applying is what made a detectable defect undetectable.
+///
+/// Kept separate from the printing so the wording — specifically the archive
+/// name a user has to go find — is pinned by a test.
+fn svc_fallback_warning(binary_path: &Path) -> String {
+    format!(
+        "warning: kb-mcp-svc.exe was not found next to {}.\n         \
+         Registered the logon task to run kb-mcp.exe directly, which shows a\n         \
+         console window at every logon. To avoid it, extract\n         \
+         kb-mcp-svc-x86_64-pc-windows-msvc.zip from the release next to\n         \
+         kb-mcp.exe and run `kb-mcp service install --force` again.",
+        binary_path.display()
+    )
+}
+
 /// Register the scheduled task: resolve the Action target, render the script,
 /// hand it to PowerShell.
 fn register_via_powershell(
@@ -193,6 +229,9 @@ fn register_via_powershell(
     force: bool,
 ) -> Result<()> {
     let target = resolve_action_target(binary_path);
+    if !target.used_svc_launcher {
+        eprintln!("{}", svc_fallback_warning(binary_path));
+    }
     let script = build_register_script(service_name, &target, config_home, auto_start, force);
     let out = run_powershell_capture(&script, "Register-ScheduledTask")?;
     if !out.status.success() {
@@ -302,6 +341,65 @@ impl ServiceBackend for TaskScheduler {
 mod tests {
     use super::*;
     use crate::service::powershell::decode_value;
+
+    /// AU-67. The point of the warning is that a user can act on it, which
+    /// means naming the archive to download — a message saying only "svc not
+    /// found" would leave them exactly where the silent fallback did.
+    #[test]
+    fn svc_fallback_warning_tells_the_user_what_to_do() {
+        let msg = svc_fallback_warning(Path::new("C:\\bin\\kb-mcp.exe"));
+
+        assert!(
+            msg.contains("kb-mcp-svc-x86_64-pc-windows-msvc.zip"),
+            "must name the archive to extract: {msg}"
+        );
+        assert!(
+            msg.contains("console window"),
+            "must name the symptom the user will otherwise see: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "must say how to redo the install: {msg}"
+        );
+        assert!(
+            msg.contains("C:\\bin\\kb-mcp.exe"),
+            "must say where it looked: {msg}"
+        );
+    }
+
+    /// The message is one literal split across source lines with `\` joins,
+    /// which silently eat the newline *and* the following indentation — a
+    /// miscount still compiles and produces ragged output. Pin the shape.
+    #[test]
+    fn svc_fallback_warning_lines_are_aligned() {
+        let msg = svc_fallback_warning(Path::new("C:\\bin\\kb-mcp.exe"));
+        let mut lines = msg.lines();
+
+        assert!(
+            lines.next().is_some_and(|l| l.starts_with("warning: ")),
+            "first line carries the prefix: {msg}"
+        );
+        for line in lines {
+            assert!(
+                line.starts_with("         ") && !line.starts_with("          "),
+                "continuation lines are indented to exactly 9 columns: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_action_target_reports_which_branch_it_took() {
+        // No `kb-mcp-svc.exe` can exist next to a path under a directory that
+        // does not exist, so this exercises the fallback without a fixture.
+        let missing = Path::new("C:\\kb-mcp-au67-no-such-dir\\kb-mcp.exe");
+        let target = resolve_action_target(missing);
+        assert!(
+            !target.used_svc_launcher,
+            "fallback must be reported, not silent"
+        );
+        assert_eq!(target.execute_path, missing);
+        assert_eq!(target.argument_clause, LEGACY_SERVE_ARGUMENT);
+    }
 
     /// End-to-end evidence that the prelude changes what actually comes back
     /// through the pipe. Asserting that the script string contains the prelude
