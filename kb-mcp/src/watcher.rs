@@ -216,6 +216,22 @@ pub async fn run_watch_loop(state: WatcherState) -> Result<()> {
                 }
                 // 成功: backoff をリセット
                 backoff = Duration::from_secs(1);
+                // (AU-55) The only point at which the watcher is actually
+                // armed. `wait_http_200` returning says the *server* is up,
+                // which happens before this thread finishes building the
+                // debouncer, so a test that starts editing files at that
+                // moment can lose the event with no way to notice — the
+                // debouncer either saw it or it did not.
+                //
+                // Emitting it here rather than before `watch()` matters: a
+                // failed `watch()` retries in the branch above, and a signal
+                // printed ahead of that would claim readiness the retry
+                // contradicts.
+                eprintln!(
+                    "watcher: watching {} (debounce {}ms)",
+                    kb_watch_path.display(),
+                    debounce.as_millis()
+                );
                 // periodic liveness probe: 30 秒ごとに kb_path の
                 // 存在確認をして、ディレクトリが消えていたら debouncer を
                 // drop して再構築する。inotify は親ディレクトリ削除時に

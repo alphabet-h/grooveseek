@@ -129,11 +129,48 @@ pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (Serve
         .expect("spawn kb-mcp serve (with watcher)");
 
     let base = format!("http://127.0.0.1:{port}");
-    let guard = ServerGuard { child: Some(child) };
+    let mut guard = ServerGuard { child: Some(child) };
 
     if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
         panic!("kb-mcp serve (with watcher) did not become ready on {base}/healthz within 60s");
     }
+
+    // (AU-55) `/healthz` says the *server* is up. The watcher is armed later,
+    // on its own thread, and a test that starts editing files in between can
+    // lose the event outright — the debouncer either saw it or it did not, and
+    // no amount of polling afterwards recovers it. That is why the wait here
+    // used to be a flat `sleep(2000)`: there was no signal to wait for.
+    //
+    // There is one now, printed the moment `debouncer.watch()` succeeds.
+    //
+    // The reader thread is not optional. Both pipes are captured but nothing
+    // drained stderr, so a long-running server could block on a full pipe; this
+    // keeps it emptied for the life of the process.
+    let stderr = guard
+        .child
+        .as_mut()
+        .expect("child is present")
+        .stderr
+        .take()
+        .expect("stderr was piped");
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        let mut armed = false;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if !armed && line.contains("watcher: watching ") {
+                armed = true;
+                let _ = tx.send(());
+            }
+        }
+    });
+    if rx.recv_timeout(Duration::from_secs(30)).is_err() {
+        panic!("watcher did not report itself armed within 30s (looking for 'watcher: watching ')");
+    }
+
     (guard, base)
 }
 
