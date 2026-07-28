@@ -34,16 +34,16 @@ tray-icon = "0.24"
 tao = "0.35"
 image = "0.25"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-dirs = "6"
-anyhow = "1"
-toml = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
 # Stopping the daemon goes through OpenProcess / QueryFullProcessImageNameW /
 # TerminateProcess (see src/process.rs). Opening the web UI goes through
 # ShellExecuteW (see src/ui.rs) — AU-12 replaced `cmd /c start`, which parsed

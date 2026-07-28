@@ -2,6 +2,32 @@
 members = ["kb-mcp", "crates/kb-mcp-tray", "crates/kb-mcp-svc"]
 resolver = "2"
 
+# Dependencies declared by more than one member, so a version bump happens in
+# one place instead of two that can silently drift apart (AU-26).
+#
+# Only the shared ones live here. A crate used by a single member stays in that
+# member's manifest, where it is easier to see who actually needs it.
+#
+# This does **not** deduplicate what ends up in `Cargo.lock`. The duplicate
+# entries there — reqwest 0.12 and 0.13, toml 0.8 / 0.9 / 1.1 — are pulled
+# transitively by hf-hub, oxidize-pdf, and winresource respectively, and no
+# workspace setting can unify a version we do not declare. Fixing those means
+# upstream updates or different dependencies, not this table.
+#
+# `features` are the union of what the members asked for individually, except
+# where a member needs extras: it adds them alongside `workspace = true`, and
+# Cargo merges the two lists.
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # The profile that 'dist' will build with (moved from kb-mcp/Cargo.toml during
 # feature-44 PR-1 workspace split; profiles must live at the workspace root).
 [profile.dist]
