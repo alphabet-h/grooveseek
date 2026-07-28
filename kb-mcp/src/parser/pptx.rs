@@ -131,11 +131,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         });
     }
 
-    let raw_content = chunks
-        .iter()
-        .map(|c| c.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let raw_content = super::join_chunk_bodies(&chunks);
     Ok(ParsedDocument {
         frontmatter,
         chunks,
