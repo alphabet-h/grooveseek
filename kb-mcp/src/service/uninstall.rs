@@ -11,8 +11,14 @@ pub struct UninstallParams {
 
 pub fn run(params: UninstallParams) -> Result<()> {
     let name = validate_service_name(&params.service_name).map_err(|e| anyhow!(e))?;
-    let config_home = resolve_config_home(&name)?;
-    run_with_backend(backend().as_ref(), &config_home, params)
+    // `Option`, not `?`. Removing a scheduled task or a unit file needs only
+    // the service name, and the original code reflected that: it reached for
+    // the config home lazily, and on the non-purge path with `if let Ok(..)`,
+    // so a machine where neither KB_MCP_CONFIG_HOME nor `dirs::config_dir()`
+    // resolves could still uninstall. Making resolution unconditional here
+    // would have turned that into a hard failure.
+    let config_home = resolve_config_home(&name).ok();
+    run_with_backend(backend().as_ref(), config_home.as_deref(), params)
 }
 
 /// `run` with its two ambient dependencies passed in (AU-28).
@@ -23,9 +29,13 @@ pub fn run(params: UninstallParams) -> Result<()> {
 /// `KB_MCP_CONFIG_HOME` somewhere safe — mutates process-wide state, and
 /// `cargo test` runs tests on parallel threads of one process, which is the
 /// unsoundness AU-63 was about.
+///
+/// `config_home` is optional because it is only *required* by `--purge`, which
+/// cannot decide what to delete without it. Everything else treats it as
+/// informational.
 pub(crate) fn run_with_backend(
     be: &dyn ServiceBackend,
-    config_home: &Path,
+    config_home: Option<&Path>,
     params: UninstallParams,
 ) -> Result<()> {
     let name = validate_service_name(&params.service_name).map_err(|e| anyhow!(e))?;
@@ -52,7 +62,15 @@ pub(crate) fn run_with_backend(
     }
 
     if params.purge {
-        let home = config_home.to_path_buf();
+        let home = config_home
+            .ok_or_else(|| {
+                anyhow!(
+                    "--purge needs the config home, but neither KB_MCP_CONFIG_HOME nor the OS \
+                     config directory could be resolved. The service unit has been removed; \
+                     delete kb-mcp.toml and .kb-mcp.db by hand."
+                )
+            })?
+            .to_path_buf();
         // `.kb-mcp.db` lives next to the user's KB (= `resolve_db_path(kb_path)`),
         // NOT inside config_home. Read the configured `kb_path` from the
         // install-generated toml before deleting config_home so that the
@@ -88,10 +106,12 @@ pub(crate) fn run_with_backend(
                 home.display()
             );
         }
-    } else if config_home.exists() {
+    } else if let Some(home) = config_home
+        && home.exists()
+    {
         eprintln!(
             "Kept config home: {} (use --purge --yes to remove)",
-            config_home.display()
+            home.display()
         );
     }
     Ok(())
@@ -210,10 +230,22 @@ mod tests {
     #[test]
     fn purge_removes_the_config_home_and_the_database_it_names() {
         let home = TempHome::new();
-        let kb = home.path().join("kb");
+        // The KB gets its own root, *outside* the config home, because that is
+        // where a real one lives: `.kb-mcp.db` sits next to the user's KB, not
+        // inside `~/.config/kb-mcp/<name>/`. Nesting it under `home` would make
+        // the `remove_dir_all(home)` at the end of purge delete the database as
+        // a side effect, and the assertion below would hold even with the
+        // explicit database removal deleted — the test would pass for the
+        // wrong reason (codex P2).
+        let kb_root = TempHome::new();
+        let kb = kb_root.path().join("kb");
         std::fs::create_dir_all(&kb).unwrap();
         let db = crate::resolve_db_path(&kb);
         std::fs::write(&db, b"not really a database").unwrap();
+        assert!(
+            !db.starts_with(home.path()),
+            "the database must sit outside the config home for this test to mean anything"
+        );
         std::fs::write(
             home.path().join("kb-mcp.toml"),
             format!("kb_path = '{}'\n", kb.display()),
@@ -221,7 +253,7 @@ mod tests {
         .unwrap();
 
         let be = FakeBackend::ok();
-        run_with_backend(&be, home.path(), params(true, true)).expect("purge should succeed");
+        run_with_backend(&be, Some(home.path()), params(true, true)).expect("purge should succeed");
 
         assert_eq!(be.uninstalled.take().as_deref(), Some("au28"));
         assert!(!db.exists(), "the index database must be deleted");
@@ -242,7 +274,7 @@ mod tests {
         std::fs::write(&toml, "kb_path = '/nowhere'\n").unwrap();
 
         let be = FakeBackend::failing();
-        let err = run_with_backend(&be, home.path(), params(true, true))
+        let err = run_with_backend(&be, Some(home.path()), params(true, true))
             .expect_err("a failing backend must propagate");
 
         assert!(
@@ -265,7 +297,8 @@ mod tests {
         std::fs::write(&toml, "kb_path = '/nowhere'\n").unwrap();
 
         let be = FakeBackend::ok();
-        run_with_backend(&be, home.path(), params(false, false)).expect("uninstall should succeed");
+        run_with_backend(&be, Some(home.path()), params(false, false))
+            .expect("uninstall should succeed");
 
         assert_eq!(be.uninstalled.take().as_deref(), Some("au28"));
         assert!(toml.exists(), "kb-mcp.toml must be kept without --purge");
@@ -281,7 +314,8 @@ mod tests {
         std::fs::write(&toml, "kb_path = '/nowhere'\n").unwrap();
 
         let be = FakeBackend::ok();
-        let err = run_with_backend(&be, home.path(), params(true, false)).expect_err("must refuse");
+        let err =
+            run_with_backend(&be, Some(home.path()), params(true, false)).expect_err("must refuse");
 
         assert!(err.to_string().contains("--yes"), "{err}");
         assert!(
