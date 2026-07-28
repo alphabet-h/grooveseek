@@ -71,12 +71,12 @@ fn test_watcher_picks_up_new_file() {
     let (_guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
     let session = mcp_initialize(&base);
 
-    // Give the watcher's bridge thread + tokio recv setup ample time
-    // to settle. Empirically the debouncer is ready well within ~500ms
-    // after `wait_http_200` returns, but we have no deterministic sync
-    // signal exposed today (a stderr-scan for "watcher started" is a
-    // future refinement).
-    sleep(Duration::from_millis(2000));
+    // (AU-55) No sleep here any more. `spawn_mcp_server_with_watch` now returns
+    // only once the watcher has printed that it is armed, which is the one
+    // moment this test actually depends on. The old fixed 2 s wait was the only
+    // timing construct in the suite that could not recover: if the debouncer
+    // was not ready when the file landed, the event was gone and the 8 s poll
+    // loop below had nothing left to find.
 
     // *** Drop a brand-new file into the watched directory ***.
     layout.write(

@@ -224,6 +224,40 @@ pub struct FusionConfig {
     pub bm25_content_weight: f32,
 }
 
+/// (AU-32) Upper bound on `[search.fusion].rrf_k`.
+///
+/// RRF scores each hit as `1.0 / (rrf_k + rank + 1.0)` in **f32**. Once
+/// `rrf_k` is large enough that adding the rank no longer changes the float,
+/// every hit scores identically and the fusion ranking collapses to whatever
+/// the tie-break happens to be — silently, with no error and no warning.
+///
+/// Measured, on the exact expression the code evaluates:
+///
+/// | `rrf_k` | rank 0 vs 1 | rank 0 vs 9 |
+/// |---|---|---|
+/// | `60` (default) | distinct | distinct |
+/// | `1e6` | distinct | distinct |
+/// | `1.6e7` | **tied** | distinct |
+/// | `1e9` | **tied** | **tied** |
+///
+/// The audit item that prompted this predicted `inf` / `NaN`; that is not what
+/// happens. Nothing overflows — the ranking just stops ordering anything.
+///
+/// `1e6` sits an order of magnitude below the first observed tie and is already
+/// four orders above any published rank_constant, so no real configuration
+/// reaches it.
+const MAX_RRF_K: f32 = 1e6;
+
+/// (AU-32) Upper bound on each `[search.fusion].bm25_*_weight`.
+///
+/// These are passed to SQLite's `bm25()` as column weights and the result is
+/// stored in an `f32` score. Unlike `rrf_k` there is no clean cliff — the point
+/// at which a weight overflows depends on the corpus, since bm25's magnitude
+/// grows with term rarity — so this bound is chosen for being far outside any
+/// legitimate use rather than for marking a specific failure. Defaults are
+/// 1.0-2.0.
+const MAX_BM25_WEIGHT: f32 = 1e6;
+
 fn default_rrf_k() -> f32 {
     60.0
 }
@@ -601,10 +635,11 @@ impl Config {
             // feature-47 D-2: db 層の bind parameter 経路は NaN / inf を
             // silent に通すため、ここが唯一のゲートである。
             let f = &s.fusion;
-            if !f.rrf_k.is_finite() || f.rrf_k < 1.0 {
+            if !f.rrf_k.is_finite() || f.rrf_k < 1.0 || f.rrf_k > MAX_RRF_K {
                 anyhow::bail!(
-                    "[search.fusion].rrf_k must be a finite value >= 1.0 (Elasticsearch \
-                     rank_constant convention), got {}",
+                    "[search.fusion].rrf_k must be a finite value in [1.0, {MAX_RRF_K:e}] \
+                     (Elasticsearch rank_constant convention; the upper bound keeps ranks \
+                     distinguishable in f32), got {}",
                     f.rrf_k
                 );
             }
@@ -613,11 +648,12 @@ impl Config {
                 ("bm25_context_weight", f.bm25_context_weight),
                 ("bm25_content_weight", f.bm25_content_weight),
             ] {
-                if !w.is_finite() || w < 0.0 {
+                if !w.is_finite() || !(0.0..=MAX_BM25_WEIGHT).contains(&w) {
                     anyhow::bail!(
-                        "[search.fusion].{key} must be a finite value >= 0.0 (a negative weight \
-                         puts a pole in the BM25 denominator and silently inverts the ranking), \
-                         got {w}"
+                        "[search.fusion].{key} must be a finite value in [0.0, \
+                         {MAX_BM25_WEIGHT:e}] (a negative weight puts a pole in the BM25 \
+                         denominator and silently inverts the ranking; only the ratio between \
+                         the three weights affects ordering, so a huge one buys nothing), got {w}"
                     );
                 }
             }
@@ -1818,6 +1854,66 @@ lambda = 0.5
         let toml = "[search.fusion]\nrrf_k = inf\n";
         let cfg: crate::config::Config = toml::from_str(toml).unwrap();
         assert!(cfg.validate().is_err(), "inf rrf_k must be rejected");
+    }
+
+    /// (AU-32) The reason `MAX_RRF_K` is where it is, kept next to the bound so
+    /// it can be re-checked rather than taken on trust.
+    ///
+    /// RRF scores as `1.0 / (rrf_k + rank + 1.0)` in f32. Past a certain
+    /// magnitude the rank stops changing the float and every hit ties — the
+    /// ranking silently stops ordering. This asserts both halves: the bound is
+    /// below where that starts, and above where it starts the collapse is real.
+    #[test]
+    fn max_rrf_k_sits_below_the_f32_rank_collapse() {
+        let score = |k: f32, rank: u32| 1.0f32 / (k + rank as f32 + 1.0);
+
+        assert!(
+            score(MAX_RRF_K, 0) != score(MAX_RRF_K, 1),
+            "at the bound, adjacent ranks must still be distinguishable"
+        );
+
+        // Where it actually breaks. If a future refactor moves the formula to
+        // f64 these become false and this test says so, instead of the bound
+        // quietly staying stricter than it needs to be.
+        assert_eq!(
+            score(1.6e7, 0),
+            score(1.6e7, 1),
+            "adjacent ranks tie by 1.6e7 — the measurement the bound is based on"
+        );
+        assert_eq!(
+            score(1e9, 0),
+            score(1e9, 9),
+            "by 1e9 even ranks ten apart tie: total collapse"
+        );
+    }
+
+    /// The bounds must actually be enforced, not merely defined.
+    #[test]
+    fn fusion_rejects_values_past_the_upper_bounds() {
+        let toml = format!("[search.fusion]\nrrf_k = {}\n", MAX_RRF_K * 10.0);
+        let cfg: crate::config::Config = toml::from_str(&toml).unwrap();
+        assert!(
+            cfg.validate().is_err(),
+            "rrf_k past the bound must be rejected"
+        );
+
+        let toml = format!(
+            "[search.fusion]\nbm25_content_weight = {}\n",
+            MAX_BM25_WEIGHT * 10.0
+        );
+        let cfg: crate::config::Config = toml::from_str(&toml).unwrap();
+        assert!(
+            cfg.validate().is_err(),
+            "a bm25 weight past the bound must be rejected"
+        );
+
+        // The bounds themselves stay legal — an off-by-one here would reject
+        // the documented maximum.
+        let toml = format!(
+            "[search.fusion]\nrrf_k = {MAX_RRF_K}\nbm25_content_weight = {MAX_BM25_WEIGHT}\n"
+        );
+        let cfg: crate::config::Config = toml::from_str(&toml).unwrap();
+        assert!(cfg.validate().is_ok(), "the bounds must be inclusive");
     }
 
     #[test]

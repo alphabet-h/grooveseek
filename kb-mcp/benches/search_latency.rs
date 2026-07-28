@@ -30,9 +30,51 @@ fn fixture_kb_path() -> String {
     std::env::var("KBMCP_BENCH_KB").unwrap_or_else(|_| "tests/fixtures/kb-bench".into())
 }
 
+/// (AU-56) Make sure the KB is indexed, and prove it, before timing anything.
+///
+/// The fixture's `.kb-mcp.db` is gitignored — it is a build artefact, not
+/// checked-in data — so on a fresh clone every `search` here ran against an
+/// index that did not exist. That returns zero hits and exits 0, so the
+/// `status.success()` assertion in each bench passed and criterion happily
+/// reported numbers: the cost of starting the binary and finding nothing.
+///
+/// Indexing is idempotent and the fixture is three small Markdown files, so
+/// doing it unconditionally costs a moment on the first run and nothing after.
+/// The search that follows is the part that matters: a bench measuring an empty
+/// result set is worse than no bench, because it still produces a graph.
+fn ensure_indexed(bin: &str, kb: &str) {
+    eprintln!("bench setup: indexing {kb} (idempotent)");
+    let out = Command::new(bin)
+        .args(["index", "--kb-path", kb])
+        .output()
+        .expect("kb-mcp index failed to spawn");
+    assert!(
+        out.status.success(),
+        "kb-mcp index failed for the bench fixture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin)
+        .args(["search", "--kb-path", kb, "--limit", "10", "rust"])
+        .output()
+        .expect("kb-mcp search failed to spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let hits = serde_json::from_str::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|v| v.get("results").and_then(|r| r.as_array()).map(Vec::len))
+        .unwrap_or(0);
+    assert!(
+        hits > 0,
+        "the bench query returned {hits} results — the numbers below would be \
+         the cost of starting the binary and finding nothing.\nstdout: {stdout}"
+    );
+    eprintln!("bench setup: {hits} hits, the fixture is searchable");
+}
+
 fn bench_search_mmr_off(c: &mut Criterion) {
     let bin = kb_mcp_binary();
     let kb = fixture_kb_path();
+    ensure_indexed(&bin, &kb);
     c.bench_function("search / MMR off / parent off / reranker off", |b| {
         b.iter(|| {
             let out = Command::new(black_box(&bin))
@@ -53,6 +95,7 @@ fn bench_search_mmr_off(c: &mut Criterion) {
 fn bench_search_mmr_on(c: &mut Criterion) {
     let bin = kb_mcp_binary();
     let kb = fixture_kb_path();
+    ensure_indexed(&bin, &kb);
     c.bench_function("search / MMR on / parent off / reranker off", |b| {
         b.iter(|| {
             let out = Command::new(black_box(&bin))
@@ -85,6 +128,7 @@ fn bench_search_mmr_on(c: &mut Criterion) {
 fn bench_search_with_reranker(c: &mut Criterion) {
     let bin = kb_mcp_binary();
     let kb = fixture_kb_path();
+    ensure_indexed(&bin, &kb);
     c.bench_function("search / MMR on / reranker on (heavy)", |b| {
         b.iter(|| {
             let out = Command::new(black_box(&bin))
