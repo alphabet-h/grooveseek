@@ -224,7 +224,9 @@ fn svc_fallback_warning(binary_path: &Path, auto_start: bool) -> String {
          Registered the task to run kb-mcp.exe directly, which shows a\n         \
          console window {when}. To avoid it, extract\n         \
          kb-mcp-svc-x86_64-pc-windows-msvc.zip from the release next to\n         \
-         kb-mcp.exe and run `kb-mcp service install --force` again.",
+         kb-mcp.exe, then re-run the same `kb-mcp service install` command\n         \
+         you used before with `--force` added. A bare `service install`\n         \
+         would reset the service name, auto-start and bind to their defaults.",
         binary_path.display()
     )
 }
@@ -377,6 +379,19 @@ mod tests {
         assert!(
             msg.contains("--force"),
             "must say how to redo the install: {msg}"
+        );
+        // A bare `kb-mcp service install --force` restores the *default*
+        // service name, auto-start and bind. Handing that to someone who
+        // installed with `--service-name` / `--no-auto-start` / `--bind` would
+        // point them at the wrong service, or silently reset the one they
+        // meant. The recovery step has to be *their* command plus `--force`.
+        assert!(
+            msg.contains("the same `kb-mcp service install` command"),
+            "must tell the user to repeat their own invocation: {msg}"
+        );
+        assert!(
+            msg.contains("reset the service name, auto-start and bind"),
+            "must say what a bare re-install would clobber: {msg}"
         );
         assert!(
             msg.contains("C:\\bin\\kb-mcp.exe"),
