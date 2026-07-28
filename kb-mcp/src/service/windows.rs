@@ -191,12 +191,19 @@ pub fn build_register_script(
 /// name can no longer reach the state parse. `service_name` is upstream-
 /// validated to `[a-zA-Z0-9_-]+`, so it cannot close the quote.
 ///
+/// `-TaskPath '\'` is not decoration. `-TaskName` on its own matches across the
+/// **whole** Task Scheduler namespace, so a same-named task in any subfolder
+/// would come back too and `.State` would print one word per match — several
+/// lines, which [`parse_task_state`] cannot read, turning a running root task
+/// into `Stopped`. The `schtasks /Query /TN <name>` call this replaces was an
+/// exact root lookup, and pinning the path is what preserves that.
+///
 /// A missing task makes `Get-ScheduledTask` write to stderr and exit non-zero,
 /// which the caller reads as `NotFound`.
 fn build_status_script(task: &str) -> String {
     format!(
         "$ErrorActionPreference='Stop'; \
-         (Get-ScheduledTask -TaskName '{task}').State"
+         (Get-ScheduledTask -TaskPath '\\' -TaskName '{task}').State"
     )
 }
 
@@ -404,12 +411,35 @@ mod tests {
 
         let script = build_status_script(&task_name("Running"));
         assert!(
-            script.contains("(Get-ScheduledTask -TaskName 'kb-mcp-Running').State"),
+            script.contains("-TaskName 'kb-mcp-Running').State"),
             "the script must read the State property, not the whole row: {script}"
         );
         assert!(
             !script.contains("schtasks"),
             "the CSV path is what carried the defect: {script}"
+        );
+    }
+
+    /// `-TaskName` alone searches the entire Task Scheduler namespace, so a
+    /// same-named task in a subfolder would add a second line to `.State` and
+    /// [`parse_task_state`] would read the pair as "not Running". The
+    /// `schtasks /TN` call this replaced was an exact root lookup; the path
+    /// restriction is what keeps that property.
+    #[test]
+    fn status_lookup_is_pinned_to_the_root_task_folder() {
+        let script = build_status_script(&task_name("svc"));
+        assert!(
+            script.contains(r"-TaskPath '\'"),
+            "the lookup must be restricted to the root folder: {script}"
+        );
+
+        // The shape the restriction protects against: two matches, two words.
+        assert!(
+            matches!(
+                parse_task_state("Running\r\nReady"),
+                ServiceState::Stopped { .. }
+            ),
+            "multiple matches cannot be parsed, which is why they must not happen"
         );
     }
 
