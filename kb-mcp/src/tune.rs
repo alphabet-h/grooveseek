@@ -1830,11 +1830,13 @@ mod tests {
     ///   count is reported in parentheses alongside the raw one.
     ///
     /// That the sweep measures the *deployed* rule rather than a paraphrase of
-    /// it is checked two ways. Per replication, the shipping cell is asserted
-    /// equal to what `decide` itself returns. And because the seeds and the
-    /// first four settings match the AU-16 test, dropping `REPS` to 300
-    /// reproduces that test's published column exactly — 35.0 / 12.7 / 20.0 /
-    /// 99.0, the figures quoted in `docs/eval.md`. `REPS` is higher here
+    /// it is checked per replication: whichever cell holds the shipping
+    /// thresholds is asserted equal to what `decide` itself returns.
+    ///
+    /// The seeds and the first four settings also match the AU-16 test, so
+    /// with `REPS` at 300 the `mult=2.0` column comes out at 35.0 / 12.7 /
+    /// 20.0 / 99.0 — the adoption rates that shipped before AU-68, and the
+    /// figures `docs/eval.md` quotes for the old gate. `REPS` is higher here
     /// because a rate near 3% cannot be resolved from 300 draws.
     ///
     /// `#[ignore]`: same cost as its AU-16 sibling, times the grid.
@@ -1845,10 +1847,19 @@ mod tests {
         const MULTIPLIERS: [f64; 6] = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0];
         const MIN_DELTAS: [f64; 3] = [0.02, 0.03, 0.04];
 
-        // The first cell of the grid has to be what ships, or "the current
-        // rate" has no anchor in the table.
-        assert_eq!(MULTIPLIERS[0], ADOPT_SE_MULTIPLIER);
-        assert_eq!(MIN_DELTAS[0], ADOPT_MIN_MEAN_DELTA);
+        // Find the shipping thresholds in the grid instead of assuming where
+        // they sit. Pinning them to index 0 made this test fail the moment
+        // AU-68 moved the very constant it exists to justify — and because it
+        // is `#[ignore]`d, a green `cargo test --workspace` said nothing about
+        // it.
+        let anchor_i = MULTIPLIERS
+            .iter()
+            .position(|m| *m == ADOPT_SE_MULTIPLIER)
+            .expect("the swept grid must contain the shipping SE multiplier");
+        let anchor_j = MIN_DELTAS
+            .iter()
+            .position(|d| *d == ADOPT_MIN_MEAN_DELTA)
+            .expect("the swept grid must contain the shipping mean-delta floor");
 
         // The four AU-16 settings with their seeds, plus a second null
         // landscape at the smaller N — the rate being tuned should not be
@@ -1899,7 +1910,7 @@ mod tests {
                 for (i, mult) in MULTIPLIERS.iter().enumerate() {
                     for (j, delta) in MIN_DELTAS.iter().enumerate() {
                         let verdict = decide_with(&table, &out, &idx, *mult, *delta);
-                        if i == 0 && j == 0 {
+                        if i == anchor_i && j == anchor_j {
                             assert_eq!(
                                 verdict,
                                 decide(&table, &out, &idx),
