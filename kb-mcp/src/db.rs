@@ -4159,4 +4159,34 @@ mod tests {
             b.corpus_snapshot().unwrap().2
         );
     }
+
+    /// A missing heading and an empty heading are different indexed states, and
+    /// the digest must not collapse them.
+    ///
+    /// They are also observably different downstream: `eval::is_hit` scores
+    /// `(Some(_), None)` as a miss but `(Some(""), Some(""))` as a hit, so a
+    /// golden entry with an empty heading changes recall across this edit while
+    /// counts, content and context all hold. Collapsing the two with
+    /// `unwrap_or("")` would leave `corpus_changed` false for a change that
+    /// moved the numbers.
+    #[test]
+    fn test_corpus_snapshot_distinguishes_a_missing_heading_from_an_empty_one() {
+        let a = db_with_384();
+        let id_a = a
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        a.insert_chunk(id_a, 0, None, Some(1), "body", None, &[0.0; 384], 1.0)
+            .unwrap();
+
+        let b = db_with_384();
+        let id_b = b
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        b.insert_chunk(id_b, 0, Some(""), Some(1), "body", None, &[0.0; 384], 1.0)
+            .unwrap();
+
+        let (sa, sb) = (a.corpus_snapshot().unwrap(), b.corpus_snapshot().unwrap());
+        assert_eq!((sa.0, sa.1), (sb.0, sb.1), "counts are identical by design");
+        assert_ne!(sa.2, sb.2, "the digest must still tell them apart");
+    }
 }

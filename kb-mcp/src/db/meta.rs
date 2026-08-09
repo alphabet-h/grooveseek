@@ -458,20 +458,36 @@ impl Database {
             let heading: Option<String> = row.get(2)?;
             let content: String = row.get(3)?;
             let context: Option<String> = row.get(4)?;
-            // 各 field を**長さ前置**で流す。区切り文字方式は、その文字が
-            // データ側に現れた瞬間に境界が曖昧になる。NUL も妥当な UTF-8 文字
-            // なので、`(heading="a", content="\0b")` と
-            // `(heading="a\0", content="b")` が同じバイト列になってしまう
-            // (codex P3)。長さ前置なら区切りに使える文字を仮定しない。
+            // 各 field を **NULL 判別子 + 長さ前置**で流す。
+            //
+            // 区切り文字方式にしないのは、その文字がデータ側に現れた瞬間に
+            // 境界が曖昧になるため。NUL も妥当な UTF-8 文字なので、
+            // `(heading="a", content="\0b")` と `(heading="a\0", content="b")` が
+            // 同じバイト列になってしまう (codex P3 round 2)。
+            //
+            // `None` を `""` に潰さないのは、それが**索引状態の実際の差**だから。
+            // docx の空段落が Heading style と通常 style の間で変わると、
+            // parser は `Some("")` と `None` を出し分ける。しかも
+            // `eval::is_hit` は `(Some(_), None)` を false、
+            // `(Some(""), Some(""))` を true にするので、**recall に出る差**
+            // でありながら digest が動かない、という状態になっていた
+            // (codex P3 round 3)。
+            let index_str = index.to_string();
             for field in [
-                path.as_str(),
-                &index.to_string(),
-                heading.as_deref().unwrap_or(""),
-                content.as_str(),
-                context.as_deref().unwrap_or(""),
+                Some(path.as_str()),
+                Some(index_str.as_str()),
+                heading.as_deref(),
+                Some(content.as_str()),
+                context.as_deref(),
             ] {
-                hasher.update((field.len() as u64).to_le_bytes());
-                hasher.update(field.as_bytes());
+                match field {
+                    None => hasher.update([0u8]),
+                    Some(s) => {
+                        hasher.update([1u8]);
+                        hasher.update((s.len() as u64).to_le_bytes());
+                        hasher.update(s.as_bytes());
+                    }
+                }
             }
         }
         let digest = format!("{:x}", hasher.finalize());
