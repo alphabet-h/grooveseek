@@ -616,10 +616,32 @@ pub enum Verdict {
 ///
 /// 1. refit が既定条件と異なる
 /// 2. `mean(d) > ADOPT_MIN_MEAN_DELTA`
-/// 3. `mean(d) > 2 * paired_se(d)`
+/// 3. `mean(d) > ADOPT_SE_MULTIPLIER * paired_se(d)`
 /// 4. selection stability > `STABILITY_MIN` (過半数の fold が refit に一致)
 /// 5. 全指標 (recall@k 各 k / MRR) が baseline を下回らない
 pub fn decide(table: &MetricTable, outcome: &LooOutcome, all: &[usize]) -> Verdict {
+    decide_with(
+        table,
+        outcome,
+        all,
+        ADOPT_SE_MULTIPLIER,
+        ADOPT_MIN_MEAN_DELTA,
+    )
+}
+
+/// `decide` の 2 つの数値閾値だけを差し替えられるようにしたもの。
+///
+/// 存在理由は AU-68 の測定にある: 「係数をいくつにすると誤採用率が何 % に
+/// なるか」は、`decide` と**同じ判定順序・同じ比較の向き**で測らないと意味が
+/// ないため、テスト側に判定を書き写すのではなくここを共有する。`decide` は
+/// 既定値を渡すだけの薄い wrapper なので、両者が食い違うことはない。
+pub fn decide_with(
+    table: &MetricTable,
+    outcome: &LooOutcome,
+    all: &[usize],
+    se_multiplier: f64,
+    min_mean_delta: f64,
+) -> Verdict {
     let mut reasons = Vec::new();
     let m = mean(&outcome.diffs);
     let se = paired_se(&outcome.diffs);
@@ -627,18 +649,18 @@ pub fn decide(table: &MetricTable, outcome: &LooOutcome, all: &[usize]) -> Verdi
     if outcome.refit == Condition::builtin_default() {
         reasons.push("refit selected the built-in defaults".to_string());
     }
-    if m <= ADOPT_MIN_MEAN_DELTA {
+    if m <= min_mean_delta {
         reasons.push(format!(
-            "held-out mean delta {m:+.4} <= threshold {ADOPT_MIN_MEAN_DELTA:.4}"
+            "held-out mean delta {m:+.4} <= threshold {min_mean_delta:.4}"
         ));
     }
-    // `m > 2*se` の否定を `m <= 2*se` と書いてはならない: se は N<2 で
+    // `m > mult*se` の否定を `m <= mult*se` と書いてはならない: se は N<2 で
     // INFINITY、m は退化入力で NaN になり得るため、比較不能なケースを
     // 「採用しない」側 (= reason を積む) へ倒す必要がある。
-    let two_se = 2.0 * se;
-    if !matches!(m.partial_cmp(&two_se), Some(std::cmp::Ordering::Greater)) {
+    let scaled_se = se_multiplier * se;
+    if !matches!(m.partial_cmp(&scaled_se), Some(std::cmp::Ordering::Greater)) {
         reasons.push(format!(
-            "held-out mean delta {m:+.4} <= 2 x paired SE {two_se:.4}"
+            "held-out mean delta {m:+.4} <= {se_multiplier:.1} x paired SE {scaled_se:.4}"
         ));
     }
     if outcome.stability <= STABILITY_MIN {
@@ -1788,6 +1810,175 @@ mod tests {
         // expectation.
     }
 
+    /// What do the two numeric adoption thresholds actually buy? (AU-68)
+    ///
+    /// `au16_paired_se_versus_the_true_standard_error` established *that* the
+    /// null adoption rate is 12.7% where a calibrated one-sided 2 sigma would
+    /// be about 2.3%. It deliberately stopped there: moving a threshold
+    /// changes what `kb-mcp tune` recommends to its users, which is a decision
+    /// and not a doc fix. This test supplies the numbers that decision needs,
+    /// by sweeping `ADOPT_SE_MULTIPLIER` against `ADOPT_MIN_MEAN_DELTA` and
+    /// reporting the adoption rate in each cell.
+    ///
+    /// The same rate means different things per row:
+    ///
+    /// - `edge = 0.00` — no condition is genuinely better, so **every**
+    ///   adoption is a false one. This is the number AU-68 wants lowered.
+    /// - `edge > 0.00` — adoption is power, but only when the adopted
+    ///   condition is the one that is genuinely better. Adopting some *other*
+    ///   condition on a real-edge landscape is not a success, so the strict
+    ///   count is reported in parentheses alongside the raw one.
+    ///
+    /// That the sweep measures the *deployed* rule rather than a paraphrase of
+    /// it is checked per replication: whichever cell holds the shipping
+    /// thresholds is asserted equal to what `decide` itself returns.
+    ///
+    /// The seeds and the first four settings also match the AU-16 test, so
+    /// with `REPS` at 300 the `mult=2.0` column comes out at 35.0 / 12.7 /
+    /// 20.0 / 99.0 — the adoption rates that shipped before AU-68, and the
+    /// figures `docs/eval.md` quotes for the old gate. `REPS` is higher here
+    /// because a rate near 3% cannot be resolved from 300 draws.
+    ///
+    /// `#[ignore]`: same cost as its AU-16 sibling, times the grid.
+    #[test]
+    #[ignore = "simulation; run with: cargo test --lib au68 -- --ignored --nocapture"]
+    fn au68_adoption_rate_across_the_two_thresholds() {
+        const REPS: usize = 2000;
+        const MULTIPLIERS: [f64; 6] = [2.0, 2.5, 3.0, 3.5, 4.0, 5.0];
+        const MIN_DELTAS: [f64; 3] = [0.02, 0.03, 0.04];
+
+        // Find the shipping thresholds in the grid instead of assuming where
+        // they sit. Pinning them to index 0 made this test fail the moment
+        // AU-68 moved the very constant it exists to justify — and because it
+        // is `#[ignore]`d, a green `cargo test --workspace` said nothing about
+        // it.
+        let anchor_i = MULTIPLIERS
+            .iter()
+            .position(|m| *m == ADOPT_SE_MULTIPLIER)
+            .expect("the swept grid must contain the shipping SE multiplier");
+        let anchor_j = MIN_DELTAS
+            .iter()
+            .position(|d| *d == ADOPT_MIN_MEAN_DELTA)
+            .expect("the swept grid must contain the shipping mean-delta floor");
+
+        // The four AU-16 settings with their seeds, plus a second null
+        // landscape at the smaller N — the rate being tuned should not be
+        // read off a single sample size.
+        let settings: [(usize, f64, f64, f64, u64); 5] = [
+            //  N,  true edge, per-query sd, per-cell sd, seed
+            (26, 0.04, 0.05, 0.08, 0x5EED_0001),
+            (26, 0.00, 0.05, 0.08, 0x5EED_0002), // no real winner at all
+            (12, 0.04, 0.05, 0.08, 0x5EED_0003),
+            (26, 0.04, 0.05, 0.03, 0x5EED_0004), // quieter cells
+            (12, 0.00, 0.05, 0.08, 0x5EED_0005), // null, smaller N
+        ];
+
+        // Pinned to the built-in `k` for the reason spelled out in the AU-16
+        // test: phase W picks the weights with `k` held at the default, so a
+        // winner at any other `k` is invisible while the weights are chosen
+        // and every "true edge" setting would quietly collapse to the null.
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+
+        eprintln!("AU-68 threshold sweep ({REPS} replications per setting)");
+        for (n, edge, q_sd, cell_sd, seed) in settings {
+            let mut rng = Lcg(seed);
+            let mut means = vec![0.40_f64; TOTAL_CONDITIONS];
+            means[winner.index()] = 0.40 + edge;
+
+            let mut adopted = [[0usize; MIN_DELTAS.len()]; MULTIPLIERS.len()];
+            let mut adopted_winner = [[0usize; MIN_DELTAS.len()]; MULTIPLIERS.len()];
+
+            for _ in 0..REPS {
+                let rows: Vec<Vec<f64>> = (0..n)
+                    .map(|_| {
+                        let per_query = q_sd * rng.normal(); // query difficulty
+                        means
+                            .iter()
+                            .map(|m| m + per_query + cell_sd * rng.normal())
+                            .collect()
+                    })
+                    .collect();
+                let table = table_from_primary(rows);
+                let idx: Vec<usize> = (0..n).collect();
+                let out = nested_loo(&table, &idx);
+
+                for (i, mult) in MULTIPLIERS.iter().enumerate() {
+                    for (j, delta) in MIN_DELTAS.iter().enumerate() {
+                        let verdict = decide_with(&table, &out, &idx, *mult, *delta);
+                        if i == anchor_i && j == anchor_j {
+                            assert_eq!(
+                                verdict,
+                                decide(&table, &out, &idx),
+                                "the shipping cell must be `decide` itself"
+                            );
+                        }
+                        if let Verdict::Adopt(c) = verdict {
+                            adopted[i][j] += 1;
+                            if c == winner {
+                                adopted_winner[i][j] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let pct = |c: usize| 100.0 * c as f64 / REPS as f64;
+            let kind = if edge == 0.0 {
+                "null: every adoption below is a false one"
+            } else {
+                "real edge: parenthesised = adopted the true winner"
+            };
+            eprintln!("\n  N={n:<3} edge={edge:<5} cell_sd={cell_sd:<5}  [{kind}]");
+            eprint!("    se_mult \\ min_delta ");
+            for d in MIN_DELTAS {
+                eprint!("|  {d:.3}          ");
+            }
+            eprintln!();
+            for (i, mult) in MULTIPLIERS.iter().enumerate() {
+                eprint!("    {mult:>19.1} ");
+                for j in 0..MIN_DELTAS.len() {
+                    eprint!(
+                        "| {:>5.1}% ({:>5.1}%) ",
+                        pct(adopted[i][j]),
+                        pct(adopted_winner[i][j])
+                    );
+                }
+                eprintln!();
+            }
+
+            // Raising either threshold can only ever remove adoptions, so the
+            // grid must be non-increasing along both axes. This is the check
+            // that the sweep is a real family of decision rules: a flipped
+            // comparison anywhere would still print a plausible-looking table,
+            // and every number in it would be meaningless.
+            for i in 0..MULTIPLIERS.len() {
+                for j in 0..MIN_DELTAS.len() {
+                    if i > 0 {
+                        assert!(
+                            adopted[i][j] <= adopted[i - 1][j],
+                            "raising the SE multiplier to {} added adoptions at min_delta {}",
+                            MULTIPLIERS[i],
+                            MIN_DELTAS[j]
+                        );
+                    }
+                    if j > 0 {
+                        assert!(
+                            adopted[i][j] <= adopted[i][j - 1],
+                            "raising min_delta to {} added adoptions at multiplier {}",
+                            MIN_DELTAS[j],
+                            MULTIPLIERS[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_paired_se_is_sd_over_sqrt_n() {
         // D-11-2: SE は paired per-query 差分の SD/sqrt(N)。
@@ -2019,6 +2210,76 @@ mod tests {
         let idx: Vec<usize> = (0..12).collect();
         let out = nested_loo(&t, &idx);
         assert_eq!(decide(&t, &out, &idx), Verdict::Adopt(winner));
+    }
+
+    /// A gain that clears 2 x paired SE but not 3 x is rejected (AU-68).
+    ///
+    /// Nothing else in the suite pins `ADOPT_SE_MULTIPLIER`: every other
+    /// `decide` fixture either misses the mean-delta floor or clears the SE
+    /// gate by a wide margin, so the constant could be set to anything — or
+    /// criterion 3 deleted outright — with all tests still green. AU-68 chose
+    /// 3.0 by measuring the false-adoption rate it produces, and that choice
+    /// needs something holding it in place.
+    ///
+    /// The fixture is placed deliberately *between* the two multipliers, and
+    /// asserts from both sides: rejected at the shipping value, adopted at the
+    /// old one. Landing outside the gap fails the second assertion, so the test
+    /// cannot quietly decay into "some gate fired".
+    #[test]
+    fn test_decide_rejects_a_gain_between_two_and_three_paired_se() {
+        let winner = Condition {
+            h: 3,
+            ctx: 1,
+            content: 1,
+            k: Condition::builtin_default().k,
+        };
+        // Per-query deltas of -0.02 / +0.05 / +0.12, four queries each:
+        // mean 0.0500, sample SD 0.0606, so paired SE = 0.0202 over N=12 and
+        // the mean sits at 2.47 x SE. Above the 0.02 floor, above 2 x SE,
+        // below 3 x SE. Every fold still picks the winner (dropping any one
+        // query leaves the training mean positive while all other conditions
+        // stay flat), so stability is 1.0 and criterion 3 is the only one that
+        // can bite.
+        const DELTAS: [f64; 3] = [-0.02, 0.05, 0.12];
+        let mut rows = vec![vec![0.30_f64; TOTAL_CONDITIONS]; 12];
+        for (i, r) in rows.iter_mut().enumerate() {
+            r[winner.index()] = 0.30 + DELTAS[i % DELTAS.len()];
+        }
+        let t = table_from_primary(rows);
+        let idx: Vec<usize> = (0..12).collect();
+        let out = nested_loo(&t, &idx);
+
+        // Sanity: the fixture is where the comment says it is.
+        let m = mean(&out.diffs);
+        let se = paired_se(&out.diffs);
+        assert!(
+            m > 2.0 * se && m < 3.0 * se,
+            "fixture must sit between 2x and 3x SE: mean {m:.4}, SE {se:.4}"
+        );
+
+        match decide(&t, &out, &idx) {
+            Verdict::KeepDefault { reasons } => {
+                assert!(
+                    reasons.iter().any(|r| r.contains("paired SE")),
+                    "criterion 3 must be the one that rejected it: {reasons:?}"
+                );
+                // If the mean-delta floor also fired, the fixture is testing
+                // criterion 2 by accident and says nothing about the SE gate.
+                assert!(
+                    !reasons.iter().any(|r| r.contains("threshold")),
+                    "the mean-delta floor must not be involved: {reasons:?}"
+                );
+            }
+            Verdict::Adopt(c) => panic!("adopted a gain below 3 x paired SE: {c:?}"),
+        }
+
+        // ...and the same fixture was adopted at the multiplier AU-68 replaced,
+        // which is what makes this a guard on the value and not just on the
+        // gate's existence.
+        assert_eq!(
+            decide_with(&t, &out, &idx, 2.0, ADOPT_MIN_MEAN_DELTA),
+            Verdict::Adopt(winner)
+        );
     }
 
     #[test]

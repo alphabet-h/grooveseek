@@ -148,8 +148,8 @@ pub fn format_text(report: &TuneReport, use_color: bool) -> String {
     .unwrap();
     writeln!(
         s,
-        "  paired SE (SD/sqrt(N)): {se:.4}   2 x SE: {:.4}",
-        2.0 * se
+        "  paired SE (SD/sqrt(N)): {se:.4}   {ADOPT_SE_MULTIPLIER:.1} x SE: {:.4}",
+        ADOPT_SE_MULTIPLIER * se
     )
     .unwrap();
     writeln!(

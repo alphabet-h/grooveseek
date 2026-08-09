@@ -284,14 +284,14 @@ recommended when **all** of the following hold:
 
 1. the refit condition differs from the built-in defaults
 2. held-out mean ΔnDCG@5 > 0.02
-3. held-out mean ΔnDCG@5 > 2 × paired SE (`SD({d_j}) / sqrt(N)`)
+3. held-out mean ΔnDCG@5 > 3 × paired SE (`SD({d_j}) / sqrt(N)`)
 4. selection stability > 0.5 — more than half of the leave-one-query-out folds
    picked the same condition (folds disagreeing is the most direct overfitting
    signal there is)
 5. no secondary metric (recall@k for any k, MRR) regressed against the defaults
 
-> **Criterion 3 can be much weaker than "2 sigma" sounds.** `SD({d_j}) / sqrt(N)`
-> assumes the per-fold differences are independent. The N leave-one-out
+> **Why the multiplier is 3 rather than the 2 that "2 sigma" would suggest.**
+> `SD({d_j}) / sqrt(N)` assumes the per-fold differences are independent. The N leave-one-out
 > selections each share N−2 queries, which lets the folds pick *different*
 > conditions — though sharing training data only makes correlation possible
 > rather than creating it. Nor is fold agreement alone enough to restore
@@ -311,28 +311,38 @@ recommended when **all** of the following hold:
 > **What that costs is measured directly rather than converted into a sigma
 > level** — the reported SE varies per run and can correlate with the observed
 > mean delta, so a ratio of averages does not determine how often the gate
-> fires. Running the simulation with **no true winner at all**:
+> fires. Run with **no true winner at all**, a multiplier of 2 fired in
+> **12.7%** of replications and carried the full five-criterion verdict to
+> "adopt" just as often — where a calibrated one-sided 2 sigma test would be
+> ~2.3%. A golden set with nothing to find yielded a recommendation about one
+> run in eight.
 >
-> | | rate under the null |
-> |---|---|
-> | `mean ΔnDCG@5 > 2 × paired SE` fires | **12.7%** |
-> | the full five-criterion verdict is "adopt" | **12.7%** |
-> | a calibrated one-sided 2 sigma test would be | ~2.3% |
+> The multiplier was therefore swept against that rate directly (2,000
+> replications per setting):
 >
-> So a golden set with nothing to find yields an adoption recommendation about
-> one run in eight. Restricting to replications that pass criterion 4 lifts the
-> SE ratio to 0.62–0.73 — the stability gate narrows the gap without closing it,
-> and 192–300 of 300 replications passed it, so this is not a corner case.
+> | multiplier | adopts under the null (N=26 / N=12) | detects a findable edge |
+> |---|---|---|
+> | 2 (previous) | 12.7% / 9.7% | 99.0% |
+> | **3 (current)** | **3.4% / 3.1%** | **95.2%** |
+> | 4 | 0.5% / 0.8% | 79.4% |
 >
-> In this simulation the full verdict rate tracks the SE gate almost exactly,
-> meaning the other criteria rarely bind. That is partly an artifact of the
-> synthetic data (the fixture writes the same value into nDCG, recall and MRR,
-> which makes criterion 5 easy to satisfy), so it does not establish how much
-> they bind on real golden sets.
+> 3 buys a 3.7x cut in false adoptions for 3.8 points of power, which is why it
+> ships. **Tightening criterion 2 instead does not work**: taking the 0.02 floor
+> to 0.04 moves the null rate only 12.7% → 12.1%, while dropping that same power
+> from 99.0% to 51.9%. Restricting to replications that pass criterion 4 lifts
+> the SE ratio to 0.62–0.73 — the stability gate narrows the gap without closing
+> it, and 192–300 of 300 replications passed it, so this is not a corner case.
 >
-> The multiplier has deliberately not been raised, because that would change
-> what the tool recommends. The simulation lives in `tune.rs` as
-> `au16_paired_se_versus_the_true_standard_error`.
+> Two caveats on those rates. The synthetic fixture writes the same value into
+> nDCG, recall and MRR, which makes criterion 5 easy to satisfy, so they do not
+> establish how much the secondary-metric guard binds on real golden sets. And
+> the null rate is only part of the error budget: on a landscape that does have
+> a real winner but is noisy, a sizable share of adoptions pick the *wrong*
+> condition — at N=12, roughly half of them.
+>
+> The simulations live in `tune.rs` as
+> `au16_paired_se_versus_the_true_standard_error` and
+> `au68_adoption_rate_across_the_two_thresholds`.
 
 Otherwise the verdict is "keep the built-in defaults", which is a normal and
 expected outcome: the RRF paper measured only ~0.4% relative MAP movement
