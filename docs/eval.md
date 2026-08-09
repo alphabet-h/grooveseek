@@ -141,6 +141,45 @@ diff is disabled:
 
 The current numbers still print. The next run will diff against this one.
 
+### Corpus changed between runs
+
+Every run records the index it measured, and the header repeats it:
+
+```
+  corpus: 646 docs / 11215 chunks
+```
+
+When that differs from the compared run, the change is named and the numbers
+below are qualified:
+
+```
+  corpus: 646 docs / 11215 chunks
+    ⚠️ corpus changed since last run (642 -> 646 documents, 11090 -> 11215 chunks)
+       a delta below may reflect that, not retrieval
+```
+
+A document rewritten in place moves nothing but its content hash, so counts
+alone would call that "unchanged". They are compared too:
+
+```
+    ⚠️ corpus changed since last run (same document and chunk counts, different contents)
+```
+
+**Unlike a golden change, this does not disable the diff.** That is deliberate.
+A knowledge base is normally growing, so treating every added document as a
+reason to stop comparing would make `--fail-on-regression` inert exactly when it
+is wanted. The corpus is therefore reported but kept out of the compatibility
+test: runs stay comparable, and a drop can be read with the knowledge that the
+competition changed.
+
+The consequence is worth stating plainly: **a reported regression may be caused
+by the corpus rather than by retrieval**, and only this line tells you which to
+suspect. `--format json` carries `corpus` and a `corpus_changed` boolean, which
+is `null` when there is nothing to compare against — distinct from `false`.
+
+Runs recorded before this existed carry no corpus, and are never reported as
+changed; the first run after that writes one, and the next run compares normally.
+
 ## Configuration
 
 All knobs are optional in `kb-mcp.toml`:

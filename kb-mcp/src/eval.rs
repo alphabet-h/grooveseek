@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 // ---------- Golden ----------
@@ -217,8 +217,105 @@ pub fn aggregate_metrics(per_query: &[QueryResult], k_values: &[usize]) -> Aggre
 pub struct EvalRun {
     pub timestamp: DateTime<Utc>,
     pub fingerprint: ConfigFingerprint,
+
+    /// この run が測った index の状態 (AU-71)。
+    ///
+    /// **意図的に [`ConfigFingerprint`] の外に置いている。** fingerprint は
+    /// [`History::previous_compatible`] の `PartialEq` に使われるので、corpus を
+    /// そこに入れると **KB に文書を 1 つ足すたびに diff が無効化される**。
+    /// この KB は自動 agent が毎日文書を足すため、それでは
+    /// `--fail-on-regression` が恒久的に無力化される — 直そうとしたバグより悪い。
+    /// `EvalRun` は `PartialEq` を derive していないので、ここに置けば
+    /// **比較可能性はそのままで、変化を報告だけできる**。
+    ///
+    /// これが無いと何が起きるか: `golden_hash` は golden YAML のバイト列の
+    /// hash **だけ**なので、文書を足しても fingerprint は不変。
+    /// `previous_compatible` は「互換」と判定し、競合が増えて順位が動いただけの
+    /// 差を `--fail-on-regression` が **retrieval regression として報告する**。
+    /// AU-61 が `[contextual].enabled` について塞いだのと同じ穴の、corpus 版。
+    ///
+    /// この field を持たない旧 history JSON では `None`。`serde(default)` は
+    /// 必須で、無いと [`History::load`] が deserialize 失敗を握り潰して
+    /// **保存済みの baseline を全部捨てる**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus: Option<CorpusSnapshot>,
+
     pub per_query: Vec<QueryResult>,
     pub aggregate: AggregateMetrics,
+}
+
+/// run 時点の index の状態 (AU-71)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CorpusSnapshot {
+    pub documents: u32,
+    pub chunks: u32,
+    /// 全 document の `path` + `content_hash` を path 順に並べた sha256。
+    ///
+    /// 件数だけでは足りない: この KB では agent が既存ファイルを**書き換える**
+    /// ので、**件数が変わらないまま中身が変わる**のが普通に起きる。
+    /// 件数だけを見ていると、その run に対して「corpus は変わっていない」と
+    /// 嘘をつくことになる。
+    ///
+    /// 逆に digest だけでも足りない: `content_hash` は**ファイルのバイト列**の
+    /// hash なので、chunk 分割の設定が変わっても動かない。その場合に動くのは
+    /// `chunks` の方。だから変化の判定は 3 field 全体の `PartialEq` で行う。
+    ///
+    /// 保証ではなく best-effort である点に注意: `indexer.rs` には frontmatter
+    /// のみの更新で `content_hash` を意図的に据え置く経路があり、そこでは
+    /// 変化を取りこぼす。
+    pub digest: String,
+}
+
+/// corpus の変化を 1 つの句で説明する。変化が無い / 判定できないなら `None`。
+///
+/// `None` が意味するのは 3 通り — 比較対象が無い、比較対象がこの field を持たない
+/// 旧 run、実際に同一。**2 番目を「変わった」に丸めてはならない**: 丸めると、
+/// baseline が 1 世代入れ替わるまでこの機能の出す信号が全部偽陽性になる。
+///
+/// `format_text` と `main.rs` の両方から呼ぶ。この条件分岐を 2 箇所に書き写すと
+/// 必ず片方だけ直されて食い違う。
+pub fn describe_corpus_change(
+    now: Option<&CorpusSnapshot>,
+    prev: Option<&CorpusSnapshot>,
+) -> Option<String> {
+    let (now, prev) = (now?, prev?);
+    if now == prev {
+        return None;
+    }
+    if now.documents == prev.documents && now.chunks == prev.chunks {
+        return Some("same document and chunk counts, different contents".to_string());
+    }
+    Some(format!(
+        "{} -> {} documents, {} -> {} chunks",
+        prev.documents, now.documents, prev.chunks, now.chunks
+    ))
+}
+
+/// [`CorpusSnapshot::digest`] を計算する。
+///
+/// `Database::all_path_hashes` は `HashMap` を返し、その反復順は
+/// **プロセスごとに変わる**。そのまま hash すると、同一 corpus に対する 2 回の
+/// run が別の digest を出して「毎回 corpus が変わった」と報告してしまう。
+/// path で整列してから hash すること。
+///
+/// `&HashMap` を取るのは、index を用意しなくても直接テストできるようにするため。
+pub fn corpus_digest(path_hashes: &HashMap<String, String>) -> String {
+    // pair 全体で整列する。path 単独でも `documents.path` が UNIQUE なので全順序に
+    // なるはずだが、hash の決定性を schema の invariant に依存させない。
+    let mut entries: Vec<(&str, &str)> = path_hashes
+        .iter()
+        .map(|(p, h)| (p.as_str(), h.as_str()))
+        .collect();
+    entries.sort_unstable();
+    let mut buf = String::new();
+    for (path, hash) in entries {
+        // NUL 区切り: path に空白やタブが含まれても境界が曖昧にならない。
+        buf.push_str(path);
+        buf.push('\0');
+        buf.push_str(hash);
+        buf.push('\n');
+    }
+    GoldenSet::hash_bytes(buf.as_bytes())
 }
 
 /// 現行の metric 実装 version。recall / MRR / nDCG の計算式を修正するたびに
@@ -593,9 +690,19 @@ pub fn format_json(run: &EvalRun, previous: Option<&EvalRun>) -> serde_json::Val
         }
         _ => serde_json::Value::Null,
     };
+    // `corpus` は `run` / `previous` の中に載って出るが、両者を突き合わせるのを
+    // 消費側に強いると「見落とす」= AU-71 で直したかった状態に戻る。判定済みの
+    // bool を 1 つ出す。比較対象が無い (初回 run / 旧 history) 場合は null で、
+    // false (= 変わっていない) と区別する。
+    let corpus_changed = match (&run.corpus, previous.and_then(|p| p.corpus.as_ref())) {
+        (Some(now), Some(prev)) => serde_json::json!(now != prev),
+        _ => serde_json::Value::Null,
+    };
     serde_json::json!({
         "timestamp": run.timestamp,
         "fingerprint": run.fingerprint,
+        "corpus": run.corpus,
+        "corpus_changed": corpus_changed,
         "aggregate": run.aggregate,
         "per_query": run.per_query,
         "previous": prev_val,
@@ -621,6 +728,21 @@ pub fn format_text(
         run.fingerprint.model, rr, run.fingerprint.limit, run.aggregate.query_count
     )
     .unwrap();
+    // corpus は banner に出す (AU-71)。**下の `match previous` の中に入れては
+    // ならない** — あの match は「diff を無効化した理由」を 1 つだけ選ぶ構造で、
+    // corpus は diff が有効なままでも報告する必要がある。むしろ diff が有効な
+    // ときこそ「その低下は文書が増えたせいかもしれない」と伝える相手がいる。
+    if let Some(c) = &run.corpus {
+        writeln!(s, "  corpus: {} docs / {} chunks", c.documents, c.chunks).unwrap();
+        if let Some(change) =
+            describe_corpus_change(Some(c), previous.and_then(|p| p.corpus.as_ref()))
+        {
+            // 変化した側を `prev -> now` で明示する。括弧に数字だけを置くと
+            // 「それが現在値」と読まれる。
+            writeln!(s, "    ⚠️ corpus changed since last run ({change})").unwrap();
+            writeln!(s, "       a delta below may reflect that, not retrieval").unwrap();
+        }
+    }
     writeln!(s).unwrap();
 
     // Fingerprint mismatch は diff を無効化 (golden_hash 単独ではなく full 比較。
@@ -960,6 +1082,15 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         })
     };
 
+    // corpus も context と同じく **index に記録された事実**を見る (AU-71)。
+    // `document_count` / `chunk_count` は `kb-mcp status` が出しているのと同じ
+    // 2 つで、`all_path_hashes` は rename 検出が既に使っている。新しい SQL は無い。
+    let corpus = Some(CorpusSnapshot {
+        documents: db.document_count()?,
+        chunks: db.chunk_count()?,
+        digest: corpus_digest(&db.all_path_hashes()?),
+    });
+
     Ok(EvalRun {
         timestamp: Utc::now(),
         fingerprint: ConfigFingerprint {
@@ -978,6 +1109,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             fusion: fusion_fp,
             context: context_fp,
         },
+        corpus,
         per_query,
         aggregate,
     })
@@ -1428,6 +1560,7 @@ mod tests {
         agg.recall_at_k.insert(10, recall10);
         agg.query_count = 1;
         EvalRun {
+            corpus: None,
             timestamp: Utc.timestamp_opt(ts_secs, 0).unwrap(),
             fingerprint: ConfigFingerprint {
                 model: "bge-m3".into(),
@@ -1503,6 +1636,7 @@ mod tests {
         agg.mrr = 0.6;
         agg.query_count = 2;
         let run = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
                 model: "bge-m3".into(),
@@ -1552,12 +1686,14 @@ mod tests {
         a_prev.ndcg_at_k.insert(5, 0.7);
         a_prev.query_count = 1;
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp.clone(),
             per_query: vec![],
             aggregate: a_now,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp,
             per_query: vec![],
@@ -1591,12 +1727,14 @@ mod tests {
         agg.recall_at_k.insert(5, 0.8);
         agg.query_count = 1;
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
             per_query: vec![],
             aggregate: agg.clone(),
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
             per_query: vec![],
@@ -1615,6 +1753,7 @@ mod tests {
         agg.ndcg_at_k.insert(5, 0.7);
         agg.query_count = 2;
         let run = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
                 model: "bge-m3".into(),
@@ -1658,12 +1797,14 @@ mod tests {
             context: None,
         };
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp.clone(),
             per_query: vec![],
             aggregate: a1,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp,
             per_query: vec![],
@@ -1701,12 +1842,14 @@ mod tests {
             ..fp_now.clone()
         };
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
             per_query: vec![],
             aggregate: a1,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
             per_query: vec![],
@@ -1746,12 +1889,14 @@ mod tests {
             ..fp_now.clone()
         };
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
             per_query: vec![],
             aggregate: a1,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
             per_query: vec![],
@@ -1801,6 +1946,7 @@ mod tests {
         golden_hash: &str,
     ) -> EvalRun {
         EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
                 model: "bge-small-en-v1.5".into(),
@@ -2329,5 +2475,253 @@ enabled = true
             context: None,
         };
         assert_eq!(fp, now);
+    }
+
+    // -----------------------------------------------------------------------
+    // AU-71: the corpus is recorded and reported, but never gates comparability
+    // -----------------------------------------------------------------------
+
+    fn corpus(documents: u32, chunks: u32, digest: &str) -> CorpusSnapshot {
+        CorpusSnapshot {
+            documents,
+            chunks,
+            digest: digest.into(),
+        }
+    }
+
+    /// A corpus change must NOT make two runs incomparable.
+    ///
+    /// This is the whole design decision in one assertion. Moving `corpus` into
+    /// `ConfigFingerprint` — the obvious place for it — would make every KB
+    /// edit disable the diff, and this knowledge base grows daily, so
+    /// `--fail-on-regression` would never evaluate anything again. That failure
+    /// is invisible: the gate just silently stops gating.
+    #[test]
+    fn test_corpus_change_does_not_disable_the_diff() {
+        let mut now = sample_run(200, 0.50);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+
+        let mut h = History::default();
+        h.push_front(prev.clone(), 10);
+        assert!(
+            h.previous_compatible(&now).is_some(),
+            "a corpus change must leave the runs comparable"
+        );
+
+        // ...and the rendered diff must still be live, not just the predicate.
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(
+            !out.contains("diff disabled"),
+            "corpus change must not disable the diff: {out}"
+        );
+        assert!(
+            out.contains("↓"),
+            "the 0.90 -> 0.50 drop must still be shown: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_text_names_a_corpus_size_change() {
+        let mut now = sample_run(200, 0.90);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("646 docs / 11215 chunks"), "{out}");
+        assert!(out.contains("corpus changed since last run"), "{out}");
+        // Both sides must appear, in prev -> now order, or the reader cannot
+        // tell which way it moved.
+        assert!(out.contains("642 -> 646 documents"), "{out}");
+        assert!(out.contains("11090 -> 11215 chunks"), "{out}");
+    }
+
+    /// Equal counts with different contents must still be reported.
+    ///
+    /// This is the case counts alone hide, and it is the common one here:
+    /// research agents rewrite existing files in place, so the document count
+    /// stays put while what the corpus *contains* changes underneath.
+    #[test]
+    fn test_format_text_names_a_content_only_corpus_change() {
+        let mut now = sample_run(200, 0.90);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(642, 11_090, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("corpus changed since last run"), "{out}");
+        assert!(out.contains("different contents"), "{out}");
+    }
+
+    #[test]
+    fn test_format_text_is_silent_when_the_corpus_is_unchanged() {
+        let mut now = sample_run(200, 0.90);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(642, 11_090, "same"));
+        prev.corpus = Some(corpus(642, 11_090, "same"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("642 docs / 11090 chunks"), "{out}");
+        assert!(
+            !out.contains("corpus changed"),
+            "an unchanged corpus must not be announced as changed: {out}"
+        );
+    }
+
+    /// The digest must not depend on `HashMap` iteration order.
+    ///
+    /// `Database::all_path_hashes` returns a `HashMap`, and its order varies
+    /// per process. Hashing it as it comes would make two runs over an
+    /// identical corpus disagree, i.e. report "the corpus changed" on every
+    /// single run — which reads as noise and gets ignored, defeating the point.
+    #[test]
+    fn test_corpus_digest_is_independent_of_map_order() {
+        // 64 件にするのは意図的。2〜4 件だと、整列を外した実装でも 2 つの
+        // HashMap がたまたま同じ順で回って通ってしまう確率が無視できない。
+        let pairs: Vec<(String, String)> = (0..64)
+            .map(|i| (format!("dir{i:02}/note.md"), format!("hash{i:02}")))
+            .collect();
+        let forward: HashMap<String, String> = pairs.iter().cloned().collect();
+        let reverse: HashMap<String, String> = pairs.iter().rev().cloned().collect();
+        assert_eq!(corpus_digest(&forward), corpus_digest(&reverse));
+
+        // ...and it must still notice an actual change, or order-independence
+        // could be achieved by returning a constant.
+        let mut edited = forward.clone();
+        edited.insert("dir00/note.md".into(), "edited".into());
+        assert_ne!(corpus_digest(&forward), corpus_digest(&edited));
+    }
+
+    /// The digest must move when a document's content changes but the path set
+    /// does not — the case the counts cannot see.
+    #[test]
+    fn test_corpus_digest_notices_an_edit_that_leaves_the_path_set_alone() {
+        let before: HashMap<String, String> = [("a.md".to_string(), "h1".to_string())]
+            .into_iter()
+            .collect();
+        let after: HashMap<String, String> = [("a.md".to_string(), "h2".to_string())]
+            .into_iter()
+            .collect();
+        assert_ne!(corpus_digest(&before), corpus_digest(&after));
+    }
+
+    #[test]
+    fn test_describe_corpus_change_distinguishes_counts_from_contents() {
+        let now = corpus(646, 11_215, "aaa");
+
+        // counts moved -> both sides named, in prev -> now order
+        let d = describe_corpus_change(Some(&now), Some(&corpus(642, 11_090, "bbb")))
+            .expect("a count change must be described");
+        assert!(d.contains("642 -> 646 documents"), "{d}");
+        assert!(d.contains("11090 -> 11215 chunks"), "{d}");
+
+        // counts held, contents moved
+        let d = describe_corpus_change(Some(&now), Some(&corpus(646, 11_215, "bbb")))
+            .expect("a content-only change must be described");
+        assert!(d.contains("different contents"), "{d}");
+
+        // identical -> nothing to say
+        assert!(describe_corpus_change(Some(&now), Some(&now.clone())).is_none());
+
+        // Nothing to compare against must never read as "changed": rounding
+        // "unknown" up to "changed" makes every message a false positive for a
+        // whole baseline generation.
+        assert!(describe_corpus_change(Some(&now), None).is_none());
+        assert!(describe_corpus_change(None, Some(&now)).is_none());
+    }
+
+    /// A corpus change must not suppress the regression signal either.
+    #[test]
+    fn test_is_regression_still_fires_when_the_corpus_changed() {
+        let mut now = sample_run(200, 0.60);
+        let mut prev = sample_run(100, 0.80);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+        assert!(
+            is_regression(&now, &prev, 0.05),
+            "the corpus explains a drop; it must not excuse one"
+        );
+    }
+
+    #[test]
+    fn test_format_text_does_not_claim_a_change_against_a_baseline_without_corpus() {
+        let mut now = sample_run(200, 0.90);
+        let prev = sample_run(100, 0.90); // corpus: None, i.e. recorded before AU-71
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("646 docs / 11215 chunks"), "{out}");
+        assert!(
+            !out.contains("corpus changed"),
+            "an unknown baseline must not be reported as a change: {out}"
+        );
+    }
+
+    /// A path and a hash must not be able to trade characters across the join.
+    #[test]
+    fn test_corpus_digest_separates_path_from_hash() {
+        let a: HashMap<String, String> = [("ab".to_string(), "cd".to_string())].into();
+        let b: HashMap<String, String> = [("a".to_string(), "bcd".to_string())].into();
+        assert_ne!(corpus_digest(&a), corpus_digest(&b));
+    }
+
+    #[test]
+    fn test_history_load_handles_old_json_without_corpus_field() {
+        // 旧 history JSON (corpus field なし) が読めること = serde(default)。
+        // これが無いと History::load が deserialize 失敗を握り潰して
+        // **保存済みの baseline を全部捨てる** (失敗が warn 1 行にしか出ない)。
+        let json = r#"{
+            "runs": [{
+                "timestamp": "2026-07-28T00:00:00Z",
+                "fingerprint": {
+                    "model": "bge-small-en-v1.5",
+                    "reranker": null,
+                    "limit": 10,
+                    "k_values": [1, 5, 10],
+                    "golden_hash": "abc",
+                    "metric_version": 2
+                },
+                "per_query": [],
+                "aggregate": {
+                    "recall_at_k": {},
+                    "ndcg_at_k": {},
+                    "mrr": 0.0,
+                    "query_count": 0
+                }
+            }]
+        }"#;
+        let h: History = serde_json::from_str(json).expect("old history JSON must still load");
+        let prev = h.previous().expect("the run must survive the load");
+        assert!(prev.corpus.is_none());
+
+        // そして旧 run は今の run と「互換」のままでなければならない。
+        let mut now = sample_run(200, 0.9);
+        now.fingerprint = prev.fingerprint.clone();
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        assert!(
+            h.previous_compatible(&now).is_some(),
+            "a run recorded before this field existed must still be comparable"
+        );
+    }
+
+    #[test]
+    fn test_format_json_reports_corpus_changed() {
+        let mut now = sample_run(200, 0.9);
+        let mut prev = sample_run(100, 0.9);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+        let v = format_json(&now, Some(&prev));
+        assert_eq!(v["corpus_changed"], serde_json::json!(true));
+        assert_eq!(v["corpus"]["documents"], serde_json::json!(646));
+
+        prev.corpus = now.corpus.clone();
+        let v = format_json(&now, Some(&prev));
+        assert_eq!(v["corpus_changed"], serde_json::json!(false));
+
+        // 比較対象が無いときは null。false (= 変わっていない) と混同させない。
+        let v = format_json(&now, None);
+        assert_eq!(v["corpus_changed"], serde_json::Value::Null);
     }
 }

@@ -6,6 +6,37 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A growing knowledge base was reported as a retrieval regression** (AU-71).
+  `kb-mcp eval` decides whether two runs may be compared by comparing
+  `ConfigFingerprint`, which describes configuration and nothing else —
+  `golden_hash` is a hash of the golden YAML bytes alone. Adding documents to
+  the knowledge base therefore left the fingerprint identical: the runs were
+  judged compatible, the diff stayed on, and `--fail-on-regression` compared
+  them. Rankings shift when the competition grows, and that arrived as a
+  retrieval regression with nothing in the output mentioning the corpus at all.
+  AU-61 closed the same hole for `[contextual].enabled`; the corpus was the
+  remaining uncovered input.
+
+  Each run now records the index it measured — document count, chunk count, and
+  a digest over every document's content hash — and the header reports it,
+  naming the change when there is one. A document rewritten in place moves
+  neither count, so the digest is what keeps "unchanged" honest.
+
+  **This deliberately does not disable the diff.** Putting the corpus into the
+  compatibility test would have been the tidier fix and the wrong one: a
+  knowledge base normally grows, so every added document would stop the
+  comparison, leaving `--fail-on-regression` inert exactly when it is wanted.
+  The runs stay comparable and the output says what moved, so a drop can be
+  read correctly. When a regression is reported and the corpus also changed,
+  the failure message says so, because that is the first thing to suspect.
+
+  `--format json` gains `corpus` and `corpus_changed`; the latter is `null`
+  when there is nothing to compare against, kept distinct from `false`. History
+  written before this release carries no corpus and is never reported as
+  changed. The `--fail-on-regression` help text, which had listed compatibility
+  as "model / reranker / k_values / golden_hash" since before `metric_version`,
+  `mmr`, `parent_retriever`, `fusion` and `contextual` joined it, is corrected.
+
 - **A PDF that could not be decoded was reported as a scanned image, sending
   users after OCR they do not need.** The under-50-chars-per-page check
   announced "PDF appears to have no text layer (scanned image PDF) — skipping
