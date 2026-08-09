@@ -4090,4 +4090,73 @@ mod tests {
             b.corpus_snapshot().unwrap().2
         );
     }
+
+    /// ...including when the indexed text itself contains the byte a
+    /// separator-based framing would have used.
+    ///
+    /// NUL is a valid UTF-8 character, so a delimiter scheme stops being
+    /// unambiguous the moment it appears in the data: with `\0` separators,
+    /// `(heading "x", content "\0b")` and `(heading "x\0", content "b")` feed
+    /// the hasher identical bytes, and two corpora holding different
+    /// searchable text would report as unchanged. Length prefixes assume
+    /// nothing about which bytes the data can hold.
+    #[test]
+    fn test_corpus_snapshot_frames_fields_even_when_text_contains_nul() {
+        let nul = '\u{0}';
+        let a = db_with_384();
+        let id_a = a
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        a.insert_chunk(
+            id_a,
+            0,
+            Some("x"),
+            Some(1),
+            &format!("{nul}b"),
+            None,
+            &[0.0; 384],
+            1.0,
+        )
+        .unwrap();
+
+        let b = db_with_384();
+        let id_b = b
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        b.insert_chunk(
+            id_b,
+            0,
+            Some(&format!("x{nul}")),
+            Some(1),
+            "b",
+            None,
+            &[0.0; 384],
+            1.0,
+        )
+        .unwrap();
+
+        // Guard the guard: if SQLite had truncated at the NUL, both rows would
+        // be identical and the real assertion would pass for the wrong reason.
+        let read = |db: &Database| -> String {
+            db.conn
+                .query_row("SELECT heading, content FROM chunks", [], |r| {
+                    Ok(format!(
+                        "{:?}|{:?}",
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?
+                    ))
+                })
+                .unwrap()
+        };
+        assert_ne!(
+            read(&a),
+            read(&b),
+            "the DB must have kept both NUL placements for this test to mean anything"
+        );
+
+        assert_ne!(
+            a.corpus_snapshot().unwrap().2,
+            b.corpus_snapshot().unwrap().2
+        );
+    }
 }
