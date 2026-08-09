@@ -947,6 +947,21 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         .max()
         .unwrap_or(10)
         .max(limit as usize);
+    // ここから corpus を読み終えるまでを **1 つの read スナップショット**に固定
+    // する (AU-71 review round 4)。WAL では文ごとにスナップショットが変わるので、
+    // これが無いと `serve` の watcher が横で commit したとき、**検索は index の
+    // 版 A と B を測り、記録には版 C が載る**。記録が「この数値を出した index」を
+    // 指さなくなり、corpus 変化の注記が偽になったり出なくなったりする。
+    //
+    // DEFERRED なので実際のスナップショットは最初の read (= 最初の検索) で確定
+    // する。`verify_embedding_meta` は index_meta に書き得るため、**その後**に
+    // 開くこと。読み取り専用なので Drop の rollback で閉じてよい。
+    //
+    // 代償: eval の間 WAL の checkpoint が進まない。golden 数十件の run なら
+    // 数秒〜数分で、その間に watcher が書いた分だけ WAL が伸びる。
+    // 「数値がどの index のものか」を確定させる対価としては安い。
+    let snapshot_tx = db.begin_transaction()?;
+
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
         let qid =
@@ -1065,6 +1080,8 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         chunks,
         digest,
     });
+    // 固定はここまで。read-only なので rollback は「何も書いていない」の宣言。
+    snapshot_tx.rollback()?;
 
     Ok(EvalRun {
         timestamp: Utc::now(),

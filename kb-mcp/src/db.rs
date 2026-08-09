@@ -4189,4 +4189,37 @@ mod tests {
         assert_eq!((sa.0, sa.1), (sb.0, sb.1), "counts are identical by design");
         assert_ne!(sa.2, sb.2, "the digest must still tell them apart");
     }
+
+    /// `corpus_snapshot` must join a caller-held transaction rather than open
+    /// its own.
+    ///
+    /// `eval::run` pins the whole evaluation — every search plus this read — to
+    /// one snapshot, so that the numbers and the index they are recorded
+    /// against cannot come from different commits while a watcher indexes
+    /// alongside. SQLite has no true nested transaction, so a `corpus_snapshot`
+    /// that always opened one would either error or silently end the caller's,
+    /// releasing the very snapshot being held.
+    #[test]
+    fn test_corpus_snapshot_joins_a_caller_held_transaction() {
+        let db = db_with_384();
+        doc_with_chunk(&db, "a.md", "h", "body");
+
+        let tx = db.begin_transaction().unwrap();
+        assert!(!db.conn.is_autocommit(), "the caller's tx must be open");
+
+        let snapshot = db.corpus_snapshot().unwrap();
+        assert_eq!(snapshot.0, 1);
+
+        // Still inside the caller's transaction: the snapshot the caller is
+        // holding must survive the call.
+        assert!(
+            !db.conn.is_autocommit(),
+            "corpus_snapshot must not end the caller's transaction"
+        );
+        tx.rollback().unwrap();
+        assert!(db.conn.is_autocommit());
+
+        // ...and it still works standalone, where it opens its own.
+        assert_eq!(db.corpus_snapshot().unwrap(), snapshot);
+    }
 }

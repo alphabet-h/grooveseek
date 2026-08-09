@@ -436,7 +436,16 @@ impl Database {
     pub fn corpus_snapshot(&self) -> Result<(u32, u32, String)> {
         use sha2::{Digest, Sha256};
 
-        let tx = self.conn.unchecked_transaction()?;
+        // 呼び出し側が既に read tx を開いているなら**それに乗る**。SQLite に
+        // 真のネストトランザクションは無いので、ここで無条件に開くと
+        // 「eval 全体を 1 スナップショットに固定する」呼び出し側の意図を壊す。
+        // `storage.rs` の書き込み系と同じ `is_autocommit()` gate。
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let tx = &self.conn;
         let documents: u32 = tx.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
         let chunks: u32 = tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
 
@@ -493,9 +502,12 @@ impl Database {
         let digest = format!("{:x}", hasher.finalize());
         drop(rows);
         drop(stmt);
-        // 読み取り専用なので commit も rollback も等価。Drop の rollback に任せず
-        // 明示して「書いていない」ことを読み手に示す。
-        tx.rollback()?;
+        // 自分で開いた tx だけを畳む。呼び出し側の tx をここで閉じてはならない。
+        // 読み取り専用なので commit も rollback も等価だが、明示して
+        // 「書いていない」ことを読み手に示す。
+        if let Some(tx) = local_tx {
+            tx.rollback()?;
+        }
         Ok((documents, chunks, digest))
     }
 
