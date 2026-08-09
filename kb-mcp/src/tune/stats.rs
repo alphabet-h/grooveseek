@@ -2,8 +2,8 @@
 //!
 //! Worth keeping apart because this is where `kb-mcp tune` is easiest to be
 //! wrong in a way nobody notices: AU-16 measured the paired SE at 0.53-0.60x
-//! the true one, which is why the null adoption rate is ~5.5x its nominal
-//! value (AU-68, still open).
+//! the true one, which left the null adoption rate at ~5.5x its nominal value
+//! until AU-68 raised `ADOPT_SE_MULTIPLIER` from 2.0 to 3.0.
 //!
 //! Split out of `tune.rs` in AU-31. Contents are byte-identical.
 //!
@@ -19,6 +19,22 @@
 /// RRF 原論文の実測 (k∈[30,100] で MAP 相対 0.4%) を踏まえ、
 /// この程度の差が出なければ measurement noise と見なす。
 pub const ADOPT_MIN_MEAN_DELTA: f64 = 0.02;
+
+/// 採用に要求する held-out 平均改善の、paired SE に対する倍率。
+///
+/// 名目の片側 2 sigma (= 誤採用率 2.3% 相当) をそのまま係数にすると、
+/// `paired_se` が真の SE を 0.53〜0.60 倍に過小評価するぶん gate が緩み、
+/// **真の優位差が 1 つも無い golden set でも 12.7% で採用が出る** (AU-16)。
+///
+/// 3.0 は AU-68 で誤採用率を直接掃引して選んだ値 —
+/// `au68_adoption_rate_across_the_two_thresholds` を参照。null での採用が
+/// 12.7% → 3.4% (N=26) / 9.7% → 3.1% (N=12) に落ち、代償は「見つかる優位差」の
+/// 検出力が 99.0% → 95.2% になることだけ。
+///
+/// **`ADOPT_MIN_MEAN_DELTA` 側は上げても代わりにならない**: 0.02 → 0.04 では
+/// null 誤採用が 12.7% → 12.1% しか動かないのに、同じ検出力が 99.0% → 51.9%
+/// まで落ちる。同じ掃引で測ってある。
+pub const ADOPT_SE_MULTIPLIER: f64 = 3.0;
 
 /// 採用に要求する selection stability の下限 (過半数)。
 /// fold 間で勝者が割れるのは過学習の最も直接的な兆候。
@@ -111,22 +127,24 @@ pub fn sample_sd(xs: &[f64]) -> f64 {
 /// replication ごとに変動し `mean_delta` と相関し得るので、平均の比から gate の
 /// 発火確率は決まらない。検定の水準は**棄却率そのもの**で測る:
 ///
-/// | 設定 | `m > 2*se` 発火 | `decide` が Adopt |
+/// | 設定 | `m > 2*se` 発火 | `decide` が Adopt (係数 3.0) |
 /// |---|---|---|
-/// | N=26 edge=0.04 sd=0.08 | 35.0% | 35.0% |
-/// | **N=26 edge=0.00 sd=0.08 (null)** | **12.7%** | **12.7%** |
-/// | N=12 edge=0.04 sd=0.08 | 20.3% | 20.0% |
-/// | N=26 edge=0.04 sd=0.03 | 99.7% | 99.0% |
+/// | N=26 edge=0.04 sd=0.08 | 35.0% | 17.7% |
+/// | **N=26 edge=0.00 sd=0.08 (null)** | **12.7%** | **3.7%** |
+/// | N=12 edge=0.04 sd=0.08 | 20.3% | 7.3% |
+/// | N=26 edge=0.04 sd=0.03 | 99.7% | 97.0% |
 ///
-/// **真の優位差が無いのに 12.7% で採用が出る**。較正された片側 2 sigma なら
-/// 約 2.3% なので、およそ 5.5 倍の誤採用率にあたる。係数を上げるかは採用挙動の
-/// 変更なのでここでは行っていない。
+/// 左列が**名目 2 sigma の gate が実際にはどれだけ緩いか**で、真の優位差が
+/// 1 つも無い null でも 12.7% 発火する — 較正されていれば約 2.3% のはずの
+/// ところ、およそ 5.5 倍。`ADOPT_SE_MULTIPLIER` が 2.0 だった頃は右列も
+/// これとほぼ同値 (12.7%) で、**他の 4 条件はこのシミュレーション上では
+/// ほとんど追加で効いていない**。したがって両列の差は実質的に、AU-68 で
+/// 係数を 3.0 に上げた効果そのものである。
 ///
-/// 上表では `decide` の Adopt 率が SE gate の発火率とほぼ一致しており、この
-/// **シミュレーション上では**他の gate がほとんど追加で効いていない。ただし
+/// 「他の条件が効かない」のは合成データ側の性質でもある点に注意:
 /// `table_from_primary` は nDCG / recall / MRR に同じ値を書くため
-/// `non_degradation` が緩くなる等、合成データ側の性質でもある。実データで他の
-/// gate がどれだけ効くかは、これでは分からない。
+/// `non_degradation` が実データより通りやすい。実データで他の gate がどれだけ
+/// 効くかは、これでは分からない。
 ///
 /// **sign test は `TuneReport` に出るだけで `decide` は参照しない**ので、
 /// 緩和材料として数えてはならない。

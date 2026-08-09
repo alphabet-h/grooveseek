@@ -46,6 +46,32 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   source comment, none of which recorded the options that were rejected. Those
   three now carry a summary and a link.
 
+### Changed
+
+- **`kb-mcp tune` recommends a change less readily: criterion 3 now requires
+  the held-out mean gain to exceed 3 x the paired SE, not 2 x** (AU-68). The
+  criterion was written to be a one-sided 2 sigma test, which would fire on
+  about 2.3% of golden sets that contain nothing to find. It did not: AU-16
+  measured `SD({d_j}) / sqrt(N)` at 0.53-0.60 of the true standard error,
+  because the leave-one-out folds share training rows, and the resulting gate
+  produced an "adopt" verdict on **12.7%** of null golden sets — roughly one
+  run in eight, on data with no real winner at all.
+
+  The replacement was picked by sweeping the multiplier against that rate
+  rather than by argument. At 3 the null adoption rate falls to 3.4% (N=26)
+  and 3.1% (N=12), while the power to detect an edge that is genuinely there
+  goes from 99.0% to 95.2% — a 3.7x cut in false adoptions for 3.8 points of
+  power. Raising criterion 2 instead was measured and rejected: taking the
+  mean-delta floor from 0.02 to 0.04 moves the null rate only to 12.1% while
+  halving that same power to 51.9%.
+
+  In practice a `tune` run that previously ended in "adopt" may now end in
+  "keep the built-in defaults". That outcome was always the expected one — the
+  RRF paper measured ~0.4% relative MAP movement across k in [30, 100] — and
+  the verdict now carries closer to the confidence it claims. The sweep is
+  `au68_adoption_rate_across_the_two_thresholds` in `tune.rs`; both the
+  English and Japanese `docs/eval` pages carry the numbers.
+
 ### Internal
 
 - **Retrieval quality of the binary formats is now measured** (AU-24).
