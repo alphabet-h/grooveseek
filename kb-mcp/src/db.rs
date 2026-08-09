@@ -4017,4 +4017,209 @@ mod tests {
             "fts_chunks column order is load-bearing for the bm25 weight positions"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // AU-71: corpus_snapshot
+    // -----------------------------------------------------------------------
+
+    /// Insert one document with one chunk. Returns the document id.
+    fn doc_with_chunk(db: &Database, path: &str, content_hash: &str, chunk: &str) -> i64 {
+        let id = db
+            .upsert_document(path, Some("t"), None, None, None, &[], None, content_hash)
+            .unwrap();
+        db.insert_chunk(id, 0, Some("H"), Some(1), chunk, None, &[0.0; 384], 1.0)
+            .unwrap();
+        id
+    }
+
+    /// The digest must be stable across repeated reads of one unchanged index.
+    ///
+    /// If it were not, every run would report "the corpus changed", which reads
+    /// as noise and gets ignored — defeating the point of recording it. The
+    /// row order therefore comes from SQL `ORDER BY`, not from whatever the
+    /// query plan happens to produce.
+    #[test]
+    fn test_corpus_snapshot_is_stable_for_an_unchanged_index() {
+        let db = db_with_384();
+        doc_with_chunk(&db, "b.md", "hb", "beta text");
+        doc_with_chunk(&db, "a.md", "ha", "alpha text");
+
+        let first = db.corpus_snapshot().unwrap();
+        let second = db.corpus_snapshot().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.0, 2, "documents");
+        assert_eq!(first.1, 2, "chunks");
+    }
+
+    /// The digest must follow the *indexed chunk*, not the source file hash.
+    ///
+    /// `documents.content_hash` hashes file bytes, so it cannot see a rebuild
+    /// that parsed the same bytes differently (a changed `exclude_headings`,
+    /// say). If the chunk count happens to match as well, a source-hash digest
+    /// would call that "unchanged" while every chunk being searched had been
+    /// replaced.
+    #[test]
+    fn test_corpus_snapshot_notices_chunk_text_changing_under_an_identical_source_hash() {
+        let db = db_with_384();
+        doc_with_chunk(&db, "a.md", "same-source-hash", "original chunk body");
+        let before = db.corpus_snapshot().unwrap();
+
+        // Same path, same content_hash, same chunk count — only the indexed
+        // text differs, exactly as a re-parse under new settings would leave it.
+        let db2 = db_with_384();
+        doc_with_chunk(&db2, "a.md", "same-source-hash", "replaced chunk body");
+        let after = db2.corpus_snapshot().unwrap();
+
+        assert_eq!(
+            (before.0, before.1),
+            (after.0, after.1),
+            "counts must match"
+        );
+        assert_ne!(before.2, after.2, "the digest must still notice");
+    }
+
+    /// Adjacent fields must not be able to trade characters across the join.
+    #[test]
+    fn test_corpus_snapshot_separates_adjacent_fields() {
+        let a = db_with_384();
+        doc_with_chunk(&a, "ab.md", "h", "cd");
+        let b = db_with_384();
+        doc_with_chunk(&b, "a.md", "h", "bcd");
+        assert_ne!(
+            a.corpus_snapshot().unwrap().2,
+            b.corpus_snapshot().unwrap().2
+        );
+    }
+
+    /// ...including when the indexed text itself contains the byte a
+    /// separator-based framing would have used.
+    ///
+    /// NUL is a valid UTF-8 character, so a delimiter scheme stops being
+    /// unambiguous the moment it appears in the data: with `\0` separators,
+    /// `(heading "x", content "\0b")` and `(heading "x\0", content "b")` feed
+    /// the hasher identical bytes, and two corpora holding different
+    /// searchable text would report as unchanged. Length prefixes assume
+    /// nothing about which bytes the data can hold.
+    #[test]
+    fn test_corpus_snapshot_frames_fields_even_when_text_contains_nul() {
+        let nul = '\u{0}';
+        let a = db_with_384();
+        let id_a = a
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        a.insert_chunk(
+            id_a,
+            0,
+            Some("x"),
+            Some(1),
+            &format!("{nul}b"),
+            None,
+            &[0.0; 384],
+            1.0,
+        )
+        .unwrap();
+
+        let b = db_with_384();
+        let id_b = b
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        b.insert_chunk(
+            id_b,
+            0,
+            Some(&format!("x{nul}")),
+            Some(1),
+            "b",
+            None,
+            &[0.0; 384],
+            1.0,
+        )
+        .unwrap();
+
+        // Guard the guard: if SQLite had truncated at the NUL, both rows would
+        // be identical and the real assertion would pass for the wrong reason.
+        let read = |db: &Database| -> String {
+            db.conn
+                .query_row("SELECT heading, content FROM chunks", [], |r| {
+                    Ok(format!(
+                        "{:?}|{:?}",
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?
+                    ))
+                })
+                .unwrap()
+        };
+        assert_ne!(
+            read(&a),
+            read(&b),
+            "the DB must have kept both NUL placements for this test to mean anything"
+        );
+
+        assert_ne!(
+            a.corpus_snapshot().unwrap().2,
+            b.corpus_snapshot().unwrap().2
+        );
+    }
+
+    /// A missing heading and an empty heading are different indexed states, and
+    /// the digest must not collapse them.
+    ///
+    /// They are also observably different downstream: `eval::is_hit` scores
+    /// `(Some(_), None)` as a miss but `(Some(""), Some(""))` as a hit, so a
+    /// golden entry with an empty heading changes recall across this edit while
+    /// counts, content and context all hold. Collapsing the two with
+    /// `unwrap_or("")` would leave `corpus_changed` false for a change that
+    /// moved the numbers.
+    #[test]
+    fn test_corpus_snapshot_distinguishes_a_missing_heading_from_an_empty_one() {
+        let a = db_with_384();
+        let id_a = a
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        a.insert_chunk(id_a, 0, None, Some(1), "body", None, &[0.0; 384], 1.0)
+            .unwrap();
+
+        let b = db_with_384();
+        let id_b = b
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .unwrap();
+        b.insert_chunk(id_b, 0, Some(""), Some(1), "body", None, &[0.0; 384], 1.0)
+            .unwrap();
+
+        let (sa, sb) = (a.corpus_snapshot().unwrap(), b.corpus_snapshot().unwrap());
+        assert_eq!((sa.0, sa.1), (sb.0, sb.1), "counts are identical by design");
+        assert_ne!(sa.2, sb.2, "the digest must still tell them apart");
+    }
+
+    /// `corpus_snapshot` must join a caller-held transaction rather than open
+    /// its own.
+    ///
+    /// `eval::run` pins the whole evaluation — every search plus this read — to
+    /// one snapshot, so that the numbers and the index they are recorded
+    /// against cannot come from different commits while a watcher indexes
+    /// alongside. SQLite has no true nested transaction, so a `corpus_snapshot`
+    /// that always opened one would either error or silently end the caller's,
+    /// releasing the very snapshot being held.
+    #[test]
+    fn test_corpus_snapshot_joins_a_caller_held_transaction() {
+        let db = db_with_384();
+        doc_with_chunk(&db, "a.md", "h", "body");
+
+        let tx = db.begin_transaction().unwrap();
+        assert!(!db.conn.is_autocommit(), "the caller's tx must be open");
+
+        let snapshot = db.corpus_snapshot().unwrap();
+        assert_eq!(snapshot.0, 1);
+
+        // Still inside the caller's transaction: the snapshot the caller is
+        // holding must survive the call.
+        assert!(
+            !db.conn.is_autocommit(),
+            "corpus_snapshot must not end the caller's transaction"
+        );
+        tx.rollback().unwrap();
+        assert!(db.conn.is_autocommit());
+
+        // ...and it still works standalone, where it opens its own.
+        assert_eq!(db.corpus_snapshot().unwrap(), snapshot);
+    }
 }

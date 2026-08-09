@@ -405,6 +405,112 @@ impl Database {
         Ok(out)
     }
 
+    /// index の状態を **1 回の読み取りとして** 取る (AU-71)。
+    ///
+    /// 返すのは `(documents, chunks, digest)`。
+    ///
+    /// ## なぜ 1 トランザクションなのか
+    ///
+    /// WAL では autocommit の文が**それぞれ別のスナップショット**を見る。
+    /// `serve` の watcher が横で index している間に個別の COUNT を 3 回撃つと、
+    /// documents は commit A、chunks は commit B の値を混ぜた
+    /// **どの時点にも存在しなかった index** を記録し得る。
+    /// DEFERRED tx で全部を同じスナップショットに揃える。
+    ///
+    /// ## なぜ chunk 本文を hash するのか
+    ///
+    /// `documents.content_hash` は**ファイルのバイト列**の hash なので、
+    /// 「ソースは同じだが取り込まれ方が変わった」を捉えられない。
+    /// 例: `exclude_headings` を別の見出しに変えて `--force` で貼り直すと、
+    /// 索引される chunk は入れ替わるのに content_hash は全件不変で、
+    /// chunk 数まで偶然一致すれば「変化なし」と報告してしまう。
+    /// **検索されているのは source ではなく chunk** なので、chunk 側を測る。
+    ///
+    /// 完全ではない: frontmatter だけの変更は (off モードでは) chunk 本文に
+    /// 出ないので digest が動かない。保証ではなく best-effort。
+    ///
+    /// **この digest の作り方を将来変えるなら、値に version を付けること。**
+    /// 付けずに変えると、旧方式で記録された history と必ず食い違い、
+    /// 実際には何も変わっていない run が 1 回だけ「corpus が変わった」と
+    /// 報告される。今は初出なので比較対象が `None` しか無く問題にならない。
+    pub fn corpus_snapshot(&self) -> Result<(u32, u32, String)> {
+        use sha2::{Digest, Sha256};
+
+        // 呼び出し側が既に read tx を開いているなら**それに乗る**。SQLite に
+        // 真のネストトランザクションは無いので、ここで無条件に開くと
+        // 「eval 全体を 1 スナップショットに固定する」呼び出し側の意図を壊す。
+        // `storage.rs` の書き込み系と同じ `is_autocommit()` gate。
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let tx = &self.conn;
+        let documents: u32 = tx.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
+        let chunks: u32 = tx.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+
+        // ORDER BY を SQL 側に持たせる。ここで整列しないと行順が実行計画依存に
+        // なり、同一 index に対して run ごとに違う digest が出る。
+        let mut stmt = tx.prepare(
+            "SELECT d.path, c.chunk_index, c.heading, c.content, c.context_text
+             FROM chunks c
+             JOIN documents d ON d.id = c.document_id
+             ORDER BY d.path, c.chunk_index",
+        )?;
+        let mut rows = stmt.query([])?;
+        // 逐次 update する。コーパス全体の本文を 1 本の String に積むと
+        // 数十 MB を無駄に確保することになる。
+        let mut hasher = Sha256::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let index: i64 = row.get(1)?;
+            let heading: Option<String> = row.get(2)?;
+            let content: String = row.get(3)?;
+            let context: Option<String> = row.get(4)?;
+            // 各 field を **NULL 判別子 + 長さ前置**で流す。
+            //
+            // 区切り文字方式にしないのは、その文字がデータ側に現れた瞬間に
+            // 境界が曖昧になるため。NUL も妥当な UTF-8 文字なので、
+            // `(heading="a", content="\0b")` と `(heading="a\0", content="b")` が
+            // 同じバイト列になってしまう (codex P3 round 2)。
+            //
+            // `None` を `""` に潰さないのは、それが**索引状態の実際の差**だから。
+            // docx の空段落が Heading style と通常 style の間で変わると、
+            // parser は `Some("")` と `None` を出し分ける。しかも
+            // `eval::is_hit` は `(Some(_), None)` を false、
+            // `(Some(""), Some(""))` を true にするので、**recall に出る差**
+            // でありながら digest が動かない、という状態になっていた
+            // (codex P3 round 3)。
+            let index_str = index.to_string();
+            for field in [
+                Some(path.as_str()),
+                Some(index_str.as_str()),
+                heading.as_deref(),
+                Some(content.as_str()),
+                context.as_deref(),
+            ] {
+                match field {
+                    None => hasher.update([0u8]),
+                    Some(s) => {
+                        hasher.update([1u8]);
+                        hasher.update((s.len() as u64).to_le_bytes());
+                        hasher.update(s.as_bytes());
+                    }
+                }
+            }
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        drop(rows);
+        drop(stmt);
+        // 自分で開いた tx だけを畳む。呼び出し側の tx をここで閉じてはならない。
+        // 読み取り専用なので commit も rollback も等価だが、明示して
+        // 「書いていない」ことを読み手に示す。
+        if let Some(tx) = local_tx {
+            tx.rollback()?;
+        }
+        Ok((documents, chunks, digest))
+    }
+
     /// 既存ドキュメントのパスを書き換える。
     /// `chunks` / `vec_chunks` / `fts_chunks` は `document_id` 経由で紐付いて
     /// いるため、`documents.path` のみを UPDATE すれば embedding の再計算は

@@ -133,6 +133,46 @@ per-query セクションには **劣化 (↓)** と **ミス (現在の recall@
 
 今回の数値は出力される。次回以降は新しい golden に対して diff される。
 
+### 実行間に corpus が変わった場合
+
+各 run は測定対象の index を記録し、ヘッダに出す:
+
+```
+  corpus: 646 docs / 11215 chunks
+```
+
+比較対象の run と違っていれば、変化の内容を名指しし、下に並ぶ数値に注釈を付ける:
+
+```
+  corpus: 646 docs / 11215 chunks
+    ⚠️ corpus changed since last run (642 -> 646 documents, 11090 -> 11215 chunks)
+       a delta below may reflect that, not retrieval
+```
+
+digest が対象にするのは**索引された chunk** であってソースファイルではない。
+検索が読んでいるのは chunk なので、ソースが同一のまま取り込まれ方だけが変わった
+再構築 (`exclude_headings` の変更など) も、ファイル hash が全件不変でも検知できる。
+既存ファイルの書き換えは件数を動かさないので、件数だけを見ると
+「変わっていない」と判定してしまう:
+
+```
+    ⚠️ corpus changed since last run (same document and chunk counts, different contents)
+```
+
+**golden の変更と違い、これは diff を無効化しない。** これは意図的である。
+ナレッジベースは普通は増え続けるので、文書が 1 つ増えるたびに比較を止めていては、
+`--fail-on-regression` が最も必要な場面で働かなくなる。したがって corpus は
+**報告はするが互換性判定には入れない** — run は比較可能なまま保たれ、低下を
+「競合が変わったせいかもしれない」と読める状態になる。
+
+はっきり書いておくと、**報告された regression の原因が retrieval ではなく corpus
+である可能性がある**。どちらを疑うべきかを教えるのはこの行だけである。
+`--format json` には `corpus` と `corpus_changed` (bool) が載る。比較対象が無い
+ときは `null` で、`false` (= 変わっていない) と区別される。
+
+この記録が入る前の run は corpus を持たず、「変わった」とは決して報告されない。
+最初の 1 回で corpus が書かれ、次の run から通常どおり比較される。
+
 ## 設定
 
 `kb-mcp.toml` の `[eval]` セクション (すべて省略可能):

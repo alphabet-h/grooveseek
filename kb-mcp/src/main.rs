@@ -418,9 +418,13 @@ pub(crate) struct EvalCliArgs {
     pub(crate) no_color: bool,
     /// Exit with code 1 if any aggregate metric (recall@k / MRR /
     /// nDCG@k) regressed from the previous compatible run by more
-    /// than `regression_threshold` (default 0.05). Compatible =
-    /// same fingerprint (model / reranker / k_values / golden_hash).
-    /// History is still written before exit. Useful for CI gates.
+    /// than `regression_threshold` (default 0.05). Compatible = every
+    /// fingerprint field equal: model, reranker, limit, k_values,
+    /// golden_hash, metric_version, and the mmr / parent_retriever /
+    /// fusion / contextual settings. The indexed corpus is NOT part of
+    /// that test, so two compatible runs can still have been measured
+    /// over different documents; when they were, the failure message
+    /// says so. History is still written before exit. Useful for CI gates.
     #[arg(long = "fail-on-regression", default_value_t = false)]
     pub(crate) fail_on_regression: bool,
     /// Enable MMR re-ranking (overrides kb-mcp.toml [search.mmr].enabled).
@@ -1060,16 +1064,40 @@ fn main() -> anyhow::Result<()> {
             //   3. 判定結果に応じて exit
             // previous_compatible で fingerprint 不一致 (golden_hash 変更等)
             // のときは判定対象外 = false (CI を fail させない)。
-            let regression_detected = if fail_on_regression {
+            // AU-71: corpus は fingerprint に入っていない (入れると KB が育つ
+            // たびに比較が止まる) ので、**互換と判定された run どうしでも
+            // corpus は違い得る**。文書が増えれば競合が増えて順位は動くから、
+            // regression と corpus 変化が同時に起きたなら、それが第一の容疑者。
+            // `run` は下の `push_front` で move されるので、ここで文字列にしておく。
+            let (regression_detected, corpus_note) = if fail_on_regression {
                 let prev_compat = if no_history {
                     None
                 } else {
                     history.previous_compatible(&run)
                 };
-                prev_compat
-                    .is_some_and(|p| kb_mcp::eval::is_regression(&run, p, regression_threshold))
+                let detected = prev_compat
+                    .is_some_and(|p| kb_mcp::eval::is_regression(&run, p, regression_threshold));
+                // 文言は `describe_corpus_change` に集約する。同じ条件分岐を
+                // format_text 側と 2 箇所に書くと、必ず片方だけ直されて食い違う。
+                // stderr は CP932 コンソールに出るので ASCII の `->` を使う
+                // (stdout の text formatter は `→` / `⚠️` を使っている)。
+                let note = detected
+                    .then(|| {
+                        kb_mcp::eval::describe_corpus_change(
+                            run.corpus.as_ref(),
+                            prev_compat.and_then(|p| p.corpus.as_ref()),
+                        )
+                    })
+                    .flatten()
+                    .map(|c| {
+                        format!(
+                            " The indexed corpus also changed since the compared run ({c}), \
+                             which shifts rankings on its own."
+                        )
+                    });
+                (detected, note)
             } else {
-                false
+                (false, None)
             };
 
             if !no_history {
@@ -1081,8 +1109,9 @@ fn main() -> anyhow::Result<()> {
             if regression_detected {
                 eprintln!(
                     "kb-mcp eval: retrieval-quality regression detected (delta > {regression_threshold:.3} \
-                     on at least one of recall@k / MRR / nDCG@k). Exiting with code 1 because \
-                     --fail-on-regression was set."
+                     on at least one of recall@k / MRR / nDCG@k).{} Exiting with code 1 because \
+                     --fail-on-regression was set.",
+                    corpus_note.as_deref().unwrap_or("")
                 );
                 std::process::exit(1);
             }

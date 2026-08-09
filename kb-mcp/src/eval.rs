@@ -217,8 +217,78 @@ pub fn aggregate_metrics(per_query: &[QueryResult], k_values: &[usize]) -> Aggre
 pub struct EvalRun {
     pub timestamp: DateTime<Utc>,
     pub fingerprint: ConfigFingerprint,
+
+    /// この run が測った index の状態 (AU-71)。
+    ///
+    /// **意図的に [`ConfigFingerprint`] の外に置いている。** fingerprint は
+    /// [`History::previous_compatible`] の `PartialEq` に使われるので、corpus を
+    /// そこに入れると **KB に文書を 1 つ足すたびに diff が無効化される**。
+    /// この KB は自動 agent が毎日文書を足すため、それでは
+    /// `--fail-on-regression` が恒久的に無力化される — 直そうとしたバグより悪い。
+    /// `EvalRun` は `PartialEq` を derive していないので、ここに置けば
+    /// **比較可能性はそのままで、変化を報告だけできる**。
+    ///
+    /// これが無いと何が起きるか: `golden_hash` は golden YAML のバイト列の
+    /// hash **だけ**なので、文書を足しても fingerprint は不変。
+    /// `previous_compatible` は「互換」と判定し、競合が増えて順位が動いただけの
+    /// 差を `--fail-on-regression` が **retrieval regression として報告する**。
+    /// AU-61 が `[contextual].enabled` について塞いだのと同じ穴の、corpus 版。
+    ///
+    /// この field を持たない旧 history JSON では `None`。`serde(default)` は
+    /// 必須で、無いと [`History::load`] が deserialize 失敗を握り潰して
+    /// **保存済みの baseline を全部捨てる**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corpus: Option<CorpusSnapshot>,
+
     pub per_query: Vec<QueryResult>,
     pub aggregate: AggregateMetrics,
+}
+
+/// run 時点の index の状態 (AU-71)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CorpusSnapshot {
+    pub documents: u32,
+    pub chunks: u32,
+    /// 全 document の `path` + `content_hash` を path 順に並べた sha256。
+    ///
+    /// 件数だけでは足りない: この KB では agent が既存ファイルを**書き換える**
+    /// ので、**件数が変わらないまま中身が変わる**のが普通に起きる。
+    /// 件数だけを見ていると、その run に対して「corpus は変わっていない」と
+    /// 嘘をつくことになる。
+    ///
+    /// 逆に digest だけでも足りない: `content_hash` は**ファイルのバイト列**の
+    /// hash なので、chunk 分割の設定が変わっても動かない。その場合に動くのは
+    /// `chunks` の方。だから変化の判定は 3 field 全体の `PartialEq` で行う。
+    ///
+    /// 保証ではなく best-effort である点に注意: `indexer.rs` には frontmatter
+    /// のみの更新で `content_hash` を意図的に据え置く経路があり、そこでは
+    /// 変化を取りこぼす。
+    pub digest: String,
+}
+
+/// corpus の変化を 1 つの句で説明する。変化が無い / 判定できないなら `None`。
+///
+/// `None` が意味するのは 3 通り — 比較対象が無い、比較対象がこの field を持たない
+/// 旧 run、実際に同一。**2 番目を「変わった」に丸めてはならない**: 丸めると、
+/// baseline が 1 世代入れ替わるまでこの機能の出す信号が全部偽陽性になる。
+///
+/// `format_text` と `main.rs` の両方から呼ぶ。この条件分岐を 2 箇所に書き写すと
+/// 必ず片方だけ直されて食い違う。
+pub fn describe_corpus_change(
+    now: Option<&CorpusSnapshot>,
+    prev: Option<&CorpusSnapshot>,
+) -> Option<String> {
+    let (now, prev) = (now?, prev?);
+    if now == prev {
+        return None;
+    }
+    if now.documents == prev.documents && now.chunks == prev.chunks {
+        return Some("same document and chunk counts, different contents".to_string());
+    }
+    Some(format!(
+        "{} -> {} documents, {} -> {} chunks",
+        prev.documents, now.documents, prev.chunks, now.chunks
+    ))
 }
 
 /// 現行の metric 実装 version。recall / MRR / nDCG の計算式を修正するたびに
@@ -593,9 +663,19 @@ pub fn format_json(run: &EvalRun, previous: Option<&EvalRun>) -> serde_json::Val
         }
         _ => serde_json::Value::Null,
     };
+    // `corpus` は `run` / `previous` の中に載って出るが、両者を突き合わせるのを
+    // 消費側に強いると「見落とす」= AU-71 で直したかった状態に戻る。判定済みの
+    // bool を 1 つ出す。比較対象が無い (初回 run / 旧 history) 場合は null で、
+    // false (= 変わっていない) と区別する。
+    let corpus_changed = match (&run.corpus, previous.and_then(|p| p.corpus.as_ref())) {
+        (Some(now), Some(prev)) => serde_json::json!(now != prev),
+        _ => serde_json::Value::Null,
+    };
     serde_json::json!({
         "timestamp": run.timestamp,
         "fingerprint": run.fingerprint,
+        "corpus": run.corpus,
+        "corpus_changed": corpus_changed,
         "aggregate": run.aggregate,
         "per_query": run.per_query,
         "previous": prev_val,
@@ -621,6 +701,21 @@ pub fn format_text(
         run.fingerprint.model, rr, run.fingerprint.limit, run.aggregate.query_count
     )
     .unwrap();
+    // corpus は banner に出す (AU-71)。**下の `match previous` の中に入れては
+    // ならない** — あの match は「diff を無効化した理由」を 1 つだけ選ぶ構造で、
+    // corpus は diff が有効なままでも報告する必要がある。むしろ diff が有効な
+    // ときこそ「その低下は文書が増えたせいかもしれない」と伝える相手がいる。
+    if let Some(c) = &run.corpus {
+        writeln!(s, "  corpus: {} docs / {} chunks", c.documents, c.chunks).unwrap();
+        if let Some(change) =
+            describe_corpus_change(Some(c), previous.and_then(|p| p.corpus.as_ref()))
+        {
+            // 変化した側を `prev -> now` で明示する。括弧に数字だけを置くと
+            // 「それが現在値」と読まれる。
+            writeln!(s, "    ⚠️ corpus changed since last run ({change})").unwrap();
+            writeln!(s, "       a delta below may reflect that, not retrieval").unwrap();
+        }
+    }
     writeln!(s).unwrap();
 
     // Fingerprint mismatch は diff を無効化 (golden_hash 単独ではなく full 比較。
@@ -852,6 +947,21 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         .max()
         .unwrap_or(10)
         .max(limit as usize);
+    // ここから corpus を読み終えるまでを **1 つの read スナップショット**に固定
+    // する (AU-71 review round 4)。WAL では文ごとにスナップショットが変わるので、
+    // これが無いと `serve` の watcher が横で commit したとき、**検索は index の
+    // 版 A と B を測り、記録には版 C が載る**。記録が「この数値を出した index」を
+    // 指さなくなり、corpus 変化の注記が偽になったり出なくなったりする。
+    //
+    // DEFERRED なので実際のスナップショットは最初の read (= 最初の検索) で確定
+    // する。`verify_embedding_meta` は index_meta に書き得るため、**その後**に
+    // 開くこと。読み取り専用なので Drop の rollback で閉じてよい。
+    //
+    // 代償: eval の間 WAL の checkpoint が進まない。golden 数十件の run なら
+    // 数秒〜数分で、その間に watcher が書いた分だけ WAL が伸びる。
+    // 「数値がどの index のものか」を確定させる対価としては安い。
+    let snapshot_tx = db.begin_transaction()?;
+
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
         let qid =
@@ -960,6 +1070,19 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         })
     };
 
+    // corpus も context と同じく **index に記録された事実**を見る (AU-71)。
+    // 3 値を個別に取らないのは、WAL では文ごとにスナップショットが変わり、
+    // watcher が横で書いていると「どの時点にも存在しなかった index」を
+    // 記録し得るため (`corpus_snapshot` の doc を参照)。
+    let (documents, chunks, digest) = db.corpus_snapshot()?;
+    let corpus = Some(CorpusSnapshot {
+        documents,
+        chunks,
+        digest,
+    });
+    // 固定はここまで。read-only なので rollback は「何も書いていない」の宣言。
+    snapshot_tx.rollback()?;
+
     Ok(EvalRun {
         timestamp: Utc::now(),
         fingerprint: ConfigFingerprint {
@@ -978,6 +1101,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             fusion: fusion_fp,
             context: context_fp,
         },
+        corpus,
         per_query,
         aggregate,
     })
@@ -1428,6 +1552,7 @@ mod tests {
         agg.recall_at_k.insert(10, recall10);
         agg.query_count = 1;
         EvalRun {
+            corpus: None,
             timestamp: Utc.timestamp_opt(ts_secs, 0).unwrap(),
             fingerprint: ConfigFingerprint {
                 model: "bge-m3".into(),
@@ -1503,6 +1628,7 @@ mod tests {
         agg.mrr = 0.6;
         agg.query_count = 2;
         let run = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
                 model: "bge-m3".into(),
@@ -1552,12 +1678,14 @@ mod tests {
         a_prev.ndcg_at_k.insert(5, 0.7);
         a_prev.query_count = 1;
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp.clone(),
             per_query: vec![],
             aggregate: a_now,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp,
             per_query: vec![],
@@ -1591,12 +1719,14 @@ mod tests {
         agg.recall_at_k.insert(5, 0.8);
         agg.query_count = 1;
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
             per_query: vec![],
             aggregate: agg.clone(),
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
             per_query: vec![],
@@ -1615,6 +1745,7 @@ mod tests {
         agg.ndcg_at_k.insert(5, 0.7);
         agg.query_count = 2;
         let run = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
                 model: "bge-m3".into(),
@@ -1658,12 +1789,14 @@ mod tests {
             context: None,
         };
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp.clone(),
             per_query: vec![],
             aggregate: a1,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp,
             per_query: vec![],
@@ -1701,12 +1834,14 @@ mod tests {
             ..fp_now.clone()
         };
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
             per_query: vec![],
             aggregate: a1,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
             per_query: vec![],
@@ -1746,12 +1881,14 @@ mod tests {
             ..fp_now.clone()
         };
         let now = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
             per_query: vec![],
             aggregate: a1,
         };
         let prev = EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
             per_query: vec![],
@@ -1801,6 +1938,7 @@ mod tests {
         golden_hash: &str,
     ) -> EvalRun {
         EvalRun {
+            corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
                 model: "bge-small-en-v1.5".into(),
@@ -2329,5 +2467,156 @@ enabled = true
             context: None,
         };
         assert_eq!(fp, now);
+    }
+
+    // -----------------------------------------------------------------------
+    // AU-71: the corpus is recorded and reported, but never gates comparability
+    // -----------------------------------------------------------------------
+
+    fn corpus(documents: u32, chunks: u32, digest: &str) -> CorpusSnapshot {
+        CorpusSnapshot {
+            documents,
+            chunks,
+            digest: digest.into(),
+        }
+    }
+
+    /// A corpus change must NOT make two runs incomparable.
+    ///
+    /// This is the whole design decision in one assertion. Moving `corpus` into
+    /// `ConfigFingerprint` — the obvious place for it — would make every KB
+    /// edit disable the diff, and this knowledge base grows daily, so
+    /// `--fail-on-regression` would never evaluate anything again. That failure
+    /// is invisible: the gate just silently stops gating.
+    #[test]
+    fn test_corpus_change_does_not_disable_the_diff() {
+        let mut now = sample_run(200, 0.50);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+
+        let mut h = History::default();
+        h.push_front(prev.clone(), 10);
+        assert!(
+            h.previous_compatible(&now).is_some(),
+            "a corpus change must leave the runs comparable"
+        );
+
+        // ...and the rendered diff must still be live, not just the predicate.
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(
+            !out.contains("diff disabled"),
+            "corpus change must not disable the diff: {out}"
+        );
+        assert!(
+            out.contains("↓"),
+            "the 0.90 -> 0.50 drop must still be shown: {out}"
+        );
+    }
+
+    #[test]
+    fn test_format_text_names_a_corpus_size_change() {
+        let mut now = sample_run(200, 0.90);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("646 docs / 11215 chunks"), "{out}");
+        assert!(out.contains("corpus changed since last run"), "{out}");
+        // Both sides must appear, in prev -> now order, or the reader cannot
+        // tell which way it moved.
+        assert!(out.contains("642 -> 646 documents"), "{out}");
+        assert!(out.contains("11090 -> 11215 chunks"), "{out}");
+    }
+
+    /// Equal counts with different contents must still be reported.
+    ///
+    /// This is the case counts alone hide, and it is the common one here:
+    /// research agents rewrite existing files in place, so the document count
+    /// stays put while what the corpus *contains* changes underneath.
+    #[test]
+    fn test_format_text_names_a_content_only_corpus_change() {
+        let mut now = sample_run(200, 0.90);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(642, 11_090, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("corpus changed since last run"), "{out}");
+        assert!(out.contains("different contents"), "{out}");
+    }
+
+    #[test]
+    fn test_format_text_is_silent_when_the_corpus_is_unchanged() {
+        let mut now = sample_run(200, 0.90);
+        let mut prev = sample_run(100, 0.90);
+        now.corpus = Some(corpus(642, 11_090, "same"));
+        prev.corpus = Some(corpus(642, 11_090, "same"));
+
+        let out = format_text(&now, Some(&prev), false, 0.05);
+        assert!(out.contains("642 docs / 11090 chunks"), "{out}");
+        assert!(
+            !out.contains("corpus changed"),
+            "an unchanged corpus must not be announced as changed: {out}"
+        );
+    }
+
+    #[test]
+    fn test_history_load_handles_old_json_without_corpus_field() {
+        // 旧 history JSON (corpus field なし) が読めること = serde(default)。
+        // これが無いと History::load が deserialize 失敗を握り潰して
+        // **保存済みの baseline を全部捨てる** (失敗が warn 1 行にしか出ない)。
+        let json = r#"{
+            "runs": [{
+                "timestamp": "2026-07-28T00:00:00Z",
+                "fingerprint": {
+                    "model": "bge-small-en-v1.5",
+                    "reranker": null,
+                    "limit": 10,
+                    "k_values": [1, 5, 10],
+                    "golden_hash": "abc",
+                    "metric_version": 2
+                },
+                "per_query": [],
+                "aggregate": {
+                    "recall_at_k": {},
+                    "ndcg_at_k": {},
+                    "mrr": 0.0,
+                    "query_count": 0
+                }
+            }]
+        }"#;
+        let h: History = serde_json::from_str(json).expect("old history JSON must still load");
+        let prev = h.previous().expect("the run must survive the load");
+        assert!(prev.corpus.is_none());
+
+        // そして旧 run は今の run と「互換」のままでなければならない。
+        let mut now = sample_run(200, 0.9);
+        now.fingerprint = prev.fingerprint.clone();
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        assert!(
+            h.previous_compatible(&now).is_some(),
+            "a run recorded before this field existed must still be comparable"
+        );
+    }
+
+    #[test]
+    fn test_format_json_reports_corpus_changed() {
+        let mut now = sample_run(200, 0.9);
+        let mut prev = sample_run(100, 0.9);
+        now.corpus = Some(corpus(646, 11_215, "aaa"));
+        prev.corpus = Some(corpus(642, 11_090, "bbb"));
+        let v = format_json(&now, Some(&prev));
+        assert_eq!(v["corpus_changed"], serde_json::json!(true));
+        assert_eq!(v["corpus"]["documents"], serde_json::json!(646));
+
+        prev.corpus = now.corpus.clone();
+        let v = format_json(&now, Some(&prev));
+        assert_eq!(v["corpus_changed"], serde_json::json!(false));
+
+        // 比較対象が無いときは null。false (= 変わっていない) と混同させない。
+        let v = format_json(&now, None);
+        assert_eq!(v["corpus_changed"], serde_json::Value::Null);
     }
 }
