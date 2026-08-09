@@ -12,7 +12,21 @@ use oxidize_pdf::parser::{PdfDocument, PdfReader};
 
 use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 
-/// スキャン PDF 判定閾値: 平均 chars/page がこれ未満なら text layer 無し扱い。
+/// これ未満の平均 chars/page なら「索引する価値のあるテキストが取れなかった」
+/// として文書ごと落とす閾値。
+///
+/// **原因を 1 つに決めつけないこと。** ここに落ちる PDF には少なくとも 2 種類
+/// ある:
+///
+/// 1. 本当にテキスト層が無いスキャン画像 PDF (OCR 未対応なので落として正しい)
+/// 2. **テキスト層はあるのにデコードできなかった PDF**。日本語 PDF で実測
+///    (2026-07-28): CID-keyed でも TrueType 埋め込みでも、pdfminer.six は
+///    完全に読めるのに oxidize-pdf 4.1.1 はほぼ何も取り出せず、TrueType 版は
+///    45 chars/page でこの閾値に掛かった
+///
+/// かつて診断文言は 1 を断定し「OCR not supported」と続けていた。2 の場合、
+/// **必要なのは OCR ではなく CMap / ToUnicode のデコーダ**なので、ユーザを
+/// 正反対の方向へ送っていた。文言は両方を挙げるだけに留める。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
@@ -101,16 +115,22 @@ impl Parser for PdfParser {
     ) -> Result<ParsedDocument> {
         let (pages, frontmatter) = extract_pdf(bytes, path_hint)?;
 
-        // スキャン PDF 判定: 非空ページの平均 chars/page < 50 なら text layer
-        // 無しとみなす (codex P2, PR #69 round 1: 空白/セパレータページの
-        // 多い実務 PDF で本文ページの密度が薄まり誤判定される問題の修正 —
-        // 分母を「全ページ数」ではなく「trim 後に非空だったページ数」にする)。
+        // 取り出せたテキストが薄すぎる文書を落とす。分母は「全ページ数」では
+        // なく「trim 後に非空だったページ数」— 空白 / セパレータページの多い
+        // 実務 PDF で本文ページの密度が薄まる (codex P2, PR #69 round 1)。
+        //
+        // 報告するのは**測った事実だけ**にする。原因の断定は
+        // `SCANNED_PDF_MIN_CHARS_PER_PAGE` の doc の通り 2 通りあり得る。
         let (non_empty_pages, avg_chars) = non_empty_page_stats(&pages);
         if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
             return Err(anyhow!(
-                "{path_hint}: PDF appears to have no text layer (scanned image PDF); \
-                 average {avg_chars} chars/page across {non_empty_pages} non-empty page(s) \
-                 < {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping (OCR not supported)"
+                "{path_hint}: too little text extracted to index: average {avg_chars} \
+                 chars/page across {non_empty_pages} non-empty page(s) < \
+                 {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Either the PDF has \
+                 no text layer (a scanned image; OCR is not supported), or it has one this \
+                 build could not decode. Japanese and other CJK PDFs are known to hit the \
+                 second case, so a PDF whose text you can select in a viewer can still land \
+                 here"
             ));
         }
 

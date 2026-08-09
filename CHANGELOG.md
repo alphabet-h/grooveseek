@@ -6,6 +6,24 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A PDF that could not be decoded was reported as a scanned image, sending
+  users after OCR they do not need.** The under-50-chars-per-page check
+  announced "PDF appears to have no text layer (scanned image PDF) — skipping
+  (OCR not supported)", asserting a cause it had not established. Measured
+  2026-07-28 against oxidize-pdf 4.1.1: a Japanese PDF embedding a TrueType
+  subset — what Word, LibreOffice and Google Docs export — extracts about 45
+  chars/page and lands in exactly that branch, while `pdfminer.six` reads the
+  same file perfectly. The text layer is present and conformant; what is
+  missing is the decoding. Anyone following the message would have gone
+  looking for OCR when the problem is a CMap.
+
+  The diagnostic now reports the measurement and names both possible causes
+  without picking one. **The underlying CJK extraction gap is not fixed** and
+  is now stated plainly in both READMEs and both architecture documents: a
+  CID-keyed Japanese PDF indexes as mojibake and can never be matched, and a
+  TrueType-embedding one is dropped. Japanese PDFs should be considered
+  unusable for now.
+
 - **The tray no longer flashes a console window** on every Start / Stop /
   Restart and on `--with-tray` autostart install (AU-66). `kb-mcp-tray.exe` is
   a GUI-subsystem binary and so owns no console; `powershell.exe` is a
