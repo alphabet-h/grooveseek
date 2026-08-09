@@ -18,10 +18,9 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// **原因を決めつけないこと。** ここに落ちる PDF には少なくとも 3 種類ある:
 ///
 /// 1. 本当にテキスト層が無いスキャン画像 PDF (OCR 未対応なので落として正しい)
-/// 2. **テキスト層はあるのにデコードできなかった PDF**。日本語 PDF で実測
-///    (2026-07-28): CID-keyed でも TrueType 埋め込みでも、pdfminer.six は
-///    完全に読めるのに oxidize-pdf 4.1.1 はほぼ何も取り出せず、TrueType 版は
-///    45 chars/page でこの閾値に掛かった
+/// 2. **テキスト層はあるのにデコードできなかった PDF**。ただし文字化けを伴う
+///    復号失敗は [`MISDECODED_C1_RATIO`] が先に捕まえるので、ここへ来るのは
+///    「化けずに、ほとんど何も出なかった」場合に限られる
 /// 3. **正しくデコードできていて、本当に 1 ページあたりの文字が少ない PDF**。
 ///    表紙・ラベル・レシート・図版主体の資料がこれにあたる
 ///
@@ -30,7 +29,41 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// 正反対の方向へ送っていた。修正時に「1 か 2 のいずれか」と書き直したが、
 /// それも 3 を排除する閉じた列挙で同じ誤りだった (PR #130 round 1)。
 /// **列挙は開いた形にすること** — 測った値を出し、代表的な原因を挙げるに留める。
+///
+/// **値 50 は下げられない** (AU-70、2026-08-10 実測)。スキャン画像にページ番号や
+/// 「CONFIDENTIAL」等のスタンプだけを電子的に載せた PDF — この閾値が本来狙う
+/// 相手 — が **39 chars/page** を出す。閾値を跨いで下げると、それを索引に入れる
+/// ことになる。文字数だけでは「価値のない定型文」と「密度の低い本文」を
+/// 分離できない、というのが測って分かったことで、値の調整では解けない。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
+
+/// 抽出テキストのうち C1 制御文字 (U+0080..=U+009F) がこの比率以上を占めたら、
+/// 「復号に失敗して文字化けした」と判定して文書ごと落とす閾値。
+///
+/// **なぜ C1 なのか。** UTF-16BE のバイト列を 1 バイトずつ Latin-1 として読むと、
+/// 日本語の上位バイト (U+3040〜U+9FFF の上位 8 bit) がそのまま C1 領域に落ちる。
+/// 正常に抽出できたテキストにはこの領域の文字が現れない — WinAnsi は 0x80..0x9F
+/// を印字可能文字 (€ … ™ 等) に写像するので、C1 が生で残ること自体が
+/// 「どの符号化としても解釈されなかった」ことの証拠になる。
+///
+/// **実測 (AU-70、oxidize-pdf 4.2.2、10 サンプル)** — 完全に分離した:
+///
+/// | 抽出結果 | C1 比率 |
+/// |---|---|
+/// | ASCII / TrueType 埋め込み日本語 / スキャン+スタンプ / CID (修正版) | **0.00%** |
+/// | CID 予約 CMap で文字化けした 4 件 | **3.61% 〜 15.59%** |
+///
+/// 0% と 3.61% の間なら何を採っても分かれるが、実データに稀な C1 が 1 文字
+/// 紛れ込んでも落とさないよう 1% を採る。
+///
+/// **なぜ捨てるのか (警告して索引に入れない理由)。** 文字化けしたテキストは
+/// どのクエリにも一致しない一方、embedding の計算コストと corpus 統計は
+/// 消費する。しかも化けると 1 文字が 2 文字に増えるため
+/// [`SCANNED_PDF_MIN_CHARS_PER_PAGE`] を**すり抜ける** (実測: 文字化け 1052
+/// chars/page が通り、正しく抽出できた 29 chars/page が落ちていた)。
+/// 復元は試みない — `sanitize_extracted_text` が NUL を空白へ潰した後なので
+/// 元のバイト列は再構成できない。
+const MISDECODED_C1_RATIO: f64 = 0.01;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
 ///
@@ -93,6 +126,79 @@ fn non_empty_page_stats(pages: &[String]) -> (usize, usize) {
     (non_empty.len(), total_chars / non_empty.len())
 }
 
+/// 抽出テキスト全体に占める C1 制御文字 (U+0080..=U+009F) の比率。
+///
+/// 判定の根拠と閾値は [`MISDECODED_C1_RATIO`] を参照。文字が 1 つも無ければ
+/// `0.0` (0 除算回避 — 空文書は「薄すぎる」側の判定で落ちる)。
+///
+/// 分母を全文字数にするのは、化けたページと正常なページが混在する文書
+/// (先頭だけ別フォント等) で、正常側の量に応じて判定が緩むようにするため。
+fn c1_control_ratio(pages: &[String]) -> f64 {
+    let mut total = 0usize;
+    let mut c1 = 0usize;
+    for page in pages {
+        for ch in page.chars() {
+            total += 1;
+            if matches!(ch as u32, 0x80..=0x9F) {
+                c1 += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    c1 as f64 / total as f64
+}
+
+/// 抽出済みページを索引に入れてよいか判定する。入れてはいけないなら、
+/// **何を測ってそう判断したか**を含む `Err` を返す。
+///
+/// `parse_bytes_inner` から切り出してあるのは、2 つの門と**その順序**を
+/// PDF fixture 無しでテストするため (`extract_pages_within_budget_capped` を
+/// cap 注入版に割ったのと同じ形)。順序は仕様であって好みではない — 下の
+/// コメントを参照。
+fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
+    // **薄さの判定より先に**文字化けを見る。UTF-16BE を 1 バイトずつ読むと
+    // 1 文字が 2 文字に増えるので、後に置くと `SCANNED_PDF_MIN_CHARS_PER_PAGE`
+    // を余裕で通過し、化けたまま索引に入る (AU-70 実測: 化けた文書が 1052
+    // chars/page で通り、正しく抽出できた 29 chars/page が落ちていた)。
+    // 逆順にすると、薄い化け文書に「文字が少ない」という的外れな診断も出す。
+    let c1_ratio = c1_control_ratio(pages);
+    if c1_ratio >= MISDECODED_C1_RATIO {
+        return Err(anyhow!(
+            "{path_hint}: the text layer decoded to mojibake, not text: \
+             {:.1}% of the extracted characters are C1 control codes \
+             (U+0080-U+009F), which correctly decoded text does not contain — \
+             skipping rather than indexing text that no query can match. This \
+             build could not decode the font encoding this PDF uses; the text \
+             is present and a viewer will show it correctly. Known trigger: a \
+             CID-keyed font with a predefined CMap and no /ToUnicode",
+            c1_ratio * 100.0
+        ));
+    }
+
+    // 取り出せたテキストが薄すぎる文書を落とす。分母は「全ページ数」では
+    // なく「trim 後に非空だったページ数」— 空白 / セパレータページの多い
+    // 実務 PDF で本文ページの密度が薄まる (codex P2, PR #69 round 1)。
+    //
+    // 報告するのは**測った事実だけ**にする。原因の断定は
+    // `SCANNED_PDF_MIN_CHARS_PER_PAGE` の doc の通り 3 通りあり得る。
+    let (non_empty_pages, avg_chars) = non_empty_page_stats(pages);
+    if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
+        return Err(anyhow!(
+            "{path_hint}: too little text extracted to index: average {avg_chars} \
+             chars/page across {non_empty_pages} non-empty page(s) < \
+             {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Common causes \
+             include a scanned image with no text layer (OCR is not supported), a text \
+             layer this build could not decode into anything (a PDF whose text you can \
+             select in a viewer can still land here), and a document that genuinely \
+             carries little text per page, such as slides or a figure-heavy report"
+        ));
+    }
+
+    Ok(())
+}
+
 pub struct PdfParser;
 
 impl Parser for PdfParser {
@@ -117,25 +223,7 @@ impl Parser for PdfParser {
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
         let (pages, frontmatter) = extract_pdf(bytes, path_hint)?;
-
-        // 取り出せたテキストが薄すぎる文書を落とす。分母は「全ページ数」では
-        // なく「trim 後に非空だったページ数」— 空白 / セパレータページの多い
-        // 実務 PDF で本文ページの密度が薄まる (codex P2, PR #69 round 1)。
-        //
-        // 報告するのは**測った事実だけ**にする。原因の断定は
-        // `SCANNED_PDF_MIN_CHARS_PER_PAGE` の doc の通り 2 通りあり得る。
-        let (non_empty_pages, avg_chars) = non_empty_page_stats(&pages);
-        if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
-            return Err(anyhow!(
-                "{path_hint}: too little text extracted to index: average {avg_chars} \
-                 chars/page across {non_empty_pages} non-empty page(s) < \
-                 {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Common causes \
-                 include a scanned image with no text layer (OCR is not supported), a text \
-                 layer this build could not decode (Japanese and other CJK PDFs are known \
-                 to hit this, so a PDF whose text you can select in a viewer can still land \
-                 here), and a document that genuinely carries little text per page"
-            ));
-        }
+        reject_unindexable_pages(&pages, path_hint)?;
 
         let title = frontmatter.title.as_deref().unwrap_or("");
         let mut chunks = Vec::new();
@@ -897,6 +985,118 @@ mod tests {
     fn test_non_empty_page_stats_no_pages_returns_zero() {
         let pages: Vec<String> = vec![];
         assert_eq!(non_empty_page_stats(&pages), (0, 0));
+    }
+
+    // AU-70 (2026-08-10): 復号に失敗した PDF を「文字が少ない」ではなく
+    // 「文字化けした」と診断し、索引に入れずに落とす経路の TDD。
+
+    /// UTF-16BE のバイト列を 1 バイトずつ Latin-1 として読んだ列を作る。
+    /// これは推測した形ではなく、CID 予約 CMap の日本語 PDF に対して
+    /// oxidize-pdf が実際に返す形 (実測で bytes 単位に一致することを確認済)。
+    fn misdecoded_utf16be(text: &str) -> String {
+        text.encode_utf16()
+            .flat_map(|unit| unit.to_be_bytes())
+            .map(|byte| byte as char)
+            .collect()
+    }
+
+    #[test]
+    fn test_c1_control_ratio_is_zero_for_correctly_decoded_text() {
+        // 実測で 0.00% だった 3 系統: ASCII / TrueType 埋め込み日本語 /
+        // スキャン画像に載せた ASCII スタンプ。
+        let pages = vec![
+            "This note describes the GRIMWALD_RETRY_BUDGET setting.".to_string(),
+            "第1章 概要\n本書は GRIMWALD_RETRY_BUDGET の設定手順を述べる。".to_string(),
+            "- 1 -\nCONFIDENTIAL / Scanned 2026-08-10".to_string(),
+        ];
+        assert_eq!(c1_control_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_c1_control_ratio_flags_utf16be_read_as_latin1() {
+        let pages = vec![misdecoded_utf16be("第1章 概要 手順を述べる")];
+        let ratio = c1_control_ratio(&pages);
+        assert!(
+            ratio >= MISDECODED_C1_RATIO,
+            "mis-decoded Japanese must exceed the threshold, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_c1_control_ratio_no_text_does_not_divide_by_zero() {
+        assert_eq!(c1_control_ratio(&[]), 0.0);
+        assert_eq!(c1_control_ratio(&[String::new()]), 0.0);
+    }
+
+    #[test]
+    fn test_mojibake_is_rejected_even_when_it_clears_the_density_threshold() {
+        // 化けると 1 文字が 2 文字に増えるため、密度の門は素通りする。
+        // C1 の門を外すとこの文書が索引に入る = この test が赤になる。
+        // (**順序**の証拠にはならない。逆順でも密度の門を通り抜けて同じ Err に
+        //  着くため — それは `..._sparse_mojibake_...` が受け持つ。実際に
+        //  swap して確認済み: 赤くなるのは sparse 側だけだった)
+        let pages = vec![misdecoded_utf16be(
+            &"再ランキングの評価について述べる。".repeat(20),
+        )];
+        let (_, avg_chars) = non_empty_page_stats(&pages);
+        assert!(
+            avg_chars >= SCANNED_PDF_MIN_CHARS_PER_PAGE,
+            "precondition: the mojibake must be dense enough to pass the density gate, \
+             got {avg_chars}"
+        );
+
+        let err = reject_unindexable_pages(&pages, "docs/cid.pdf")
+            .expect_err("mis-decoded text must not be indexed");
+        let message = err.to_string();
+        assert!(
+            message.contains("mojibake"),
+            "must name the real cause, got: {message}"
+        );
+        assert!(
+            !message.contains("too little text"),
+            "must not blame density for a decode failure, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sparse_mojibake_is_diagnosed_as_mojibake_not_as_thin_text() {
+        // **順序を捕まえるのはこの test**。密な化け文書は順序を逆にしても
+        // 密度の門を通り抜けて同じ Err に着くので、順序の証拠にならない。
+        // 薄い化け文書だけが、逆順にすると "too little text" に化ける
+        // (実測: desc_direct.pdf = 27 chars/page の文字化け)。
+        let pages = vec![misdecoded_utf16be("第1章 概要")];
+        let (_, avg_chars) = non_empty_page_stats(&pages);
+        assert!(
+            avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE,
+            "precondition: this sample must be below the density gate, got {avg_chars}"
+        );
+
+        let err = reject_unindexable_pages(&pages, "docs/sparse_cid.pdf")
+            .expect_err("mis-decoded text must not be indexed");
+        let message = err.to_string();
+        assert!(
+            message.contains("mojibake"),
+            "the decode failure must win over the density gate, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_correctly_decoded_japanese_above_the_threshold_is_accepted() {
+        let pages = vec!["再ランキングの評価について述べる。".repeat(4)];
+        reject_unindexable_pages(&pages, "docs/ja.pdf")
+            .expect("dense correctly-decoded Japanese must be indexed");
+    }
+
+    #[test]
+    fn test_sparse_pages_still_report_density_not_mojibake() {
+        // 正しく抽出できているが薄い文書は、これまで通り密度の門で落ちる。
+        // 文言が入れ替わっていないことを確認する。
+        let pages = vec!["表紙".to_string(), "図 1".to_string()];
+        let err = reject_unindexable_pages(&pages, "docs/cover.pdf")
+            .expect_err("sparse document must still be rejected");
+        let message = err.to_string();
+        assert!(message.contains("too little text"), "got: {message}");
+        assert!(!message.contains("mojibake"), "got: {message}");
     }
 
     // codex P2 follow-up (PR #69 round 2): panic hook を process-global に
