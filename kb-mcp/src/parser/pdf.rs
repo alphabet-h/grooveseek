@@ -15,18 +15,21 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// これ未満の平均 chars/page なら「索引する価値のあるテキストが取れなかった」
 /// として文書ごと落とす閾値。
 ///
-/// **原因を 1 つに決めつけないこと。** ここに落ちる PDF には少なくとも 2 種類
-/// ある:
+/// **原因を決めつけないこと。** ここに落ちる PDF には少なくとも 3 種類ある:
 ///
 /// 1. 本当にテキスト層が無いスキャン画像 PDF (OCR 未対応なので落として正しい)
 /// 2. **テキスト層はあるのにデコードできなかった PDF**。日本語 PDF で実測
 ///    (2026-07-28): CID-keyed でも TrueType 埋め込みでも、pdfminer.six は
 ///    完全に読めるのに oxidize-pdf 4.1.1 はほぼ何も取り出せず、TrueType 版は
 ///    45 chars/page でこの閾値に掛かった
+/// 3. **正しくデコードできていて、本当に 1 ページあたりの文字が少ない PDF**。
+///    表紙・ラベル・レシート・図版主体の資料がこれにあたる
 ///
-/// かつて診断文言は 1 を断定し「OCR not supported」と続けていた。2 の場合、
+/// 診断文言は当初 1 を断定し「OCR not supported」と続けていた。2 の場合
 /// **必要なのは OCR ではなく CMap / ToUnicode のデコーダ**なので、ユーザを
-/// 正反対の方向へ送っていた。文言は両方を挙げるだけに留める。
+/// 正反対の方向へ送っていた。修正時に「1 か 2 のいずれか」と書き直したが、
+/// それも 3 を排除する閉じた列挙で同じ誤りだった (PR #130 round 1)。
+/// **列挙は開いた形にすること** — 測った値を出し、代表的な原因を挙げるに留める。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
@@ -126,11 +129,11 @@ impl Parser for PdfParser {
             return Err(anyhow!(
                 "{path_hint}: too little text extracted to index: average {avg_chars} \
                  chars/page across {non_empty_pages} non-empty page(s) < \
-                 {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Either the PDF has \
-                 no text layer (a scanned image; OCR is not supported), or it has one this \
-                 build could not decode. Japanese and other CJK PDFs are known to hit the \
-                 second case, so a PDF whose text you can select in a viewer can still land \
-                 here"
+                 {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Common causes \
+                 include a scanned image with no text layer (OCR is not supported), a text \
+                 layer this build could not decode (Japanese and other CJK PDFs are known \
+                 to hit this, so a PDF whose text you can select in a viewer can still land \
+                 here), and a document that genuinely carries little text per page"
             ));
         }
 

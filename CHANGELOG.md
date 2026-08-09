@@ -17,8 +17,11 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   missing is the decoding. Anyone following the message would have gone
   looking for OCR when the problem is a CMap.
 
-  The diagnostic now reports the measurement and names both possible causes
-  without picking one. **The underlying CJK extraction gap is not fixed** and
+  The diagnostic now reports what it measured and offers common causes as an
+  open list — a PDF that decodes correctly but genuinely carries little text
+  per page, such as a cover sheet or a label, reaches this branch too, so any
+  closed enumeration would be wrong in the same way the original assertion
+  was. **The underlying CJK extraction gap is not fixed** and
   is now stated plainly in both READMEs and both architecture documents: a
   CID-keyed Japanese PDF indexes as mojibake and can never be matched, and a
   TrueType-embedding one is dropped. Japanese PDFs should be considered
