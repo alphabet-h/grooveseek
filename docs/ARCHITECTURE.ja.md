@@ -32,12 +32,19 @@ kb-mcp のソース構造とデータフロー。コードを拡張・修正す�
 | `kb-mcp/src/schema.rs` | Frontmatter スキーマ検証。`kb_path` 直下の `kb-mcp-schema.toml` を読み、`required` / `type` / `pattern` / `enum` / `min_length` / `max_length` / `allow_empty` を検証。`kb-mcp validate` CLI から呼ばれ、text / JSON / GitHub annotation 形式で報告 |
 | `kb-mcp/src/embedder.rs` | `fastembed-rs` の薄いラッパ。`ModelChoice` で embedding モデル (BGE-small-en-v1.5 / BGE-M3) を選択。`RerankerChoice` + `Reranker` で optional な cross-encoder 再ランク |
 | `kb-mcp/src/db.rs` | `rusqlite` + `sqlite-vec` + FTS5 (trigram)。`chunks` / `vec_chunks` / `fts_chunks` スキーマと CRUD を管理。`search_hybrid` (Reciprocal Rank Fusion。定数 k と bm25 列重みは v0.13.0 以降 `[search.fusion]` で設定可能、既定は `k = 60` と `2.0 / 1.0 / 1.0`) と v0.7.0 で追加した unbounded variant (MMR / parent retriever 用) を提供。`SearchFilters` 構造体でフィルタ引数 (path glob / tags / date range / min_quality) を集約、`MatchSpan` でバイトオフセット引用を表現 (v0.3.0 追加)。`chunks.level` (v0.7.0 追加) で h2 / h3 を区別 |
+| `kb-mcp/src/db/schema.rs` | (v0.15.0+) スキーマ作成と前方マイグレーション。全コンストラクタが呼ぶ `Database::init` から実行されるので、**DB を開くことが更新すること**にあたる。 |
+| `kb-mcp/src/db/search.rs` | (v0.15.0+) 検索: ベクトル KNN、FTS5 候補、両者を融合する RRF。**挙動が数値として観測できる**側の半分。 |
+| `kb-mcp/src/db/storage.rs` | (v0.15.0+) ドキュメントとチャンク。1 文書の書き込みは `documents` / `chunks` / `fts_chunks` / `vec_chunks` を整合させる複数テーブル操作なので、呼び出し側が tx を持っていない時だけ自分で開く (`is_autocommit()`)。 |
+| `kb-mcp/src/db/meta.rs` | (v0.15.0+) index 単位のメタデータ・統計・全体メンテナンス: `index_meta` (埋め込みモデル / 次元 / context mode)、document / chunk 件数、rename 検出用の path→hash 表、および (AU-71) `corpus_snapshot` — 件数と索引済み chunk の digest を **1 トランザクション内で**読む。 |
 | `kb-mcp/src/mmr.rs` | (v0.7.0+) Maximal Marginal Relevance の貪欲再ランク + 類似度キャッシュ。`mmr_select` は post-rerank の候補プールに対して動き、`[search.mmr]` 設定または per-call `mmr` パラメータで gating される |
 | `kb-mcp/src/parent.rs` | (v0.7.0+) 表示時 parent retriever。`apply_parent_retriever` がヒットチャンクを `expand_adjacent` (level 整合な隣接 sibling マージ) または `expand_whole_document` (`whole_doc_threshold_tokens` 未満チャンクの全文 fallback) で拡張する。score / rank / `match_spans` は元のヒットを保ち、`content` と新フィールド `expanded_from` のみが変わる |
 | `kb-mcp/src/quality.rs` | チャンク単位の品質スコアリング (長さ / 定型語 / 構造シグナル) |
 | `kb-mcp/src/graph.rs` | ベクトルインデックス上での Connection Graph BFS。`get_connection_graph` MCP ツールと `kb-mcp graph` CLI から利用 |
 | `kb-mcp/src/eval.rs` | `kb-mcp eval` CLI 用のリトリーバル品質評価 (opt-in)。Golden YAML を parse し、各クエリを `db.search_hybrid` で実行、recall@k / MRR / nDCG@k を計算。`<kb_path>/.kb-mcp-eval-history.json` を読み書きして前回との差分を表示。`ConfigFingerprint` (v0.7.0+) は `mmr` / `parent_retriever` / `fusion` (v0.13.0+) を optional に保持し、設定違いの eval 実行を別 history entry として区別する。いずれもビルトイン既定値と異なるときだけ記録するため、旧 baseline との比較は維持される。`serve` / `search` / `index` の挙動は一切変えない |
 | `kb-mcp/src/tune.rs` | (v0.13.0+) `kb-mcp tune` CLI 用の測定ツール (opt-in)。RRF 定数と FTS5 bm25 列重みの固定グリッドを golden query セット上で掃引し、nested leave-one-query-out CV (paired SE / selection stability / 副指標の非悪化。sign test も算出して report に載せるが `decide` は参照しない) で結果をガードした上で、貼り付け可能な `[search.fusion]` スニペットか「既定値維持」の結論のどちらかを出力する。自動では何も適用せず、reranker も一切使わない。`eval` の `GoldenSet` / `compute_query_metrics` と `db::fuse_rrf_ids` を再利用する |
+| `kb-mcp/src/tune/grid.rs` | (v0.15.0+) `kb-mcp tune` が掃引するパラメータ空間と、掃引中に持ち回る per-query 状態。 |
+| `kb-mcp/src/tune/stats.rs` | (v0.15.0+) 採否判定の統計 — 平均・標本 SD・paired SE・sign test と、採用閾値 `ADOPT_MIN_MEAN_DELTA` / `ADOPT_SE_MULTIPLIER` / `STABILITY_MIN`。 |
+| `kb-mcp/src/tune/report.rs` | (v0.15.0+) 掃引結果の stdout 向け整形 (text は `print!`、JSON 形式も)。 |
 
 ## データフロー
 

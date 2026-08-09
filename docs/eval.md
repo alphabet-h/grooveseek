@@ -141,7 +141,7 @@ diff is disabled:
 
 The current numbers still print. The next run will diff against this one.
 
-### Corpus changed between runs
+### Corpus changed between runs (v0.15.0+)
 
 Every run records the index it measured, and the header repeats it:
 
