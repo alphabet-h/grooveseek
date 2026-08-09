@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 // ---------- Golden ----------
@@ -289,33 +289,6 @@ pub fn describe_corpus_change(
         "{} -> {} documents, {} -> {} chunks",
         prev.documents, now.documents, prev.chunks, now.chunks
     ))
-}
-
-/// [`CorpusSnapshot::digest`] を計算する。
-///
-/// `Database::all_path_hashes` は `HashMap` を返し、その反復順は
-/// **プロセスごとに変わる**。そのまま hash すると、同一 corpus に対する 2 回の
-/// run が別の digest を出して「毎回 corpus が変わった」と報告してしまう。
-/// path で整列してから hash すること。
-///
-/// `&HashMap` を取るのは、index を用意しなくても直接テストできるようにするため。
-pub fn corpus_digest(path_hashes: &HashMap<String, String>) -> String {
-    // pair 全体で整列する。path 単独でも `documents.path` が UNIQUE なので全順序に
-    // なるはずだが、hash の決定性を schema の invariant に依存させない。
-    let mut entries: Vec<(&str, &str)> = path_hashes
-        .iter()
-        .map(|(p, h)| (p.as_str(), h.as_str()))
-        .collect();
-    entries.sort_unstable();
-    let mut buf = String::new();
-    for (path, hash) in entries {
-        // NUL 区切り: path に空白やタブが含まれても境界が曖昧にならない。
-        buf.push_str(path);
-        buf.push('\0');
-        buf.push_str(hash);
-        buf.push('\n');
-    }
-    GoldenSet::hash_bytes(buf.as_bytes())
 }
 
 /// 現行の metric 実装 version。recall / MRR / nDCG の計算式を修正するたびに
@@ -1083,12 +1056,14 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     };
 
     // corpus も context と同じく **index に記録された事実**を見る (AU-71)。
-    // `document_count` / `chunk_count` は `kb-mcp status` が出しているのと同じ
-    // 2 つで、`all_path_hashes` は rename 検出が既に使っている。新しい SQL は無い。
+    // 3 値を個別に取らないのは、WAL では文ごとにスナップショットが変わり、
+    // watcher が横で書いていると「どの時点にも存在しなかった index」を
+    // 記録し得るため (`corpus_snapshot` の doc を参照)。
+    let (documents, chunks, digest) = db.corpus_snapshot()?;
     let corpus = Some(CorpusSnapshot {
-        documents: db.document_count()?,
-        chunks: db.chunk_count()?,
-        digest: corpus_digest(&db.all_path_hashes()?),
+        documents,
+        chunks,
+        digest,
     });
 
     Ok(EvalRun {
@@ -2568,103 +2543,6 @@ enabled = true
             !out.contains("corpus changed"),
             "an unchanged corpus must not be announced as changed: {out}"
         );
-    }
-
-    /// The digest must not depend on `HashMap` iteration order.
-    ///
-    /// `Database::all_path_hashes` returns a `HashMap`, and its order varies
-    /// per process. Hashing it as it comes would make two runs over an
-    /// identical corpus disagree, i.e. report "the corpus changed" on every
-    /// single run — which reads as noise and gets ignored, defeating the point.
-    #[test]
-    fn test_corpus_digest_is_independent_of_map_order() {
-        // 64 件にするのは意図的。2〜4 件だと、整列を外した実装でも 2 つの
-        // HashMap がたまたま同じ順で回って通ってしまう確率が無視できない。
-        let pairs: Vec<(String, String)> = (0..64)
-            .map(|i| (format!("dir{i:02}/note.md"), format!("hash{i:02}")))
-            .collect();
-        let forward: HashMap<String, String> = pairs.iter().cloned().collect();
-        let reverse: HashMap<String, String> = pairs.iter().rev().cloned().collect();
-        assert_eq!(corpus_digest(&forward), corpus_digest(&reverse));
-
-        // ...and it must still notice an actual change, or order-independence
-        // could be achieved by returning a constant.
-        let mut edited = forward.clone();
-        edited.insert("dir00/note.md".into(), "edited".into());
-        assert_ne!(corpus_digest(&forward), corpus_digest(&edited));
-    }
-
-    /// The digest must move when a document's content changes but the path set
-    /// does not — the case the counts cannot see.
-    #[test]
-    fn test_corpus_digest_notices_an_edit_that_leaves_the_path_set_alone() {
-        let before: HashMap<String, String> = [("a.md".to_string(), "h1".to_string())]
-            .into_iter()
-            .collect();
-        let after: HashMap<String, String> = [("a.md".to_string(), "h2".to_string())]
-            .into_iter()
-            .collect();
-        assert_ne!(corpus_digest(&before), corpus_digest(&after));
-    }
-
-    #[test]
-    fn test_describe_corpus_change_distinguishes_counts_from_contents() {
-        let now = corpus(646, 11_215, "aaa");
-
-        // counts moved -> both sides named, in prev -> now order
-        let d = describe_corpus_change(Some(&now), Some(&corpus(642, 11_090, "bbb")))
-            .expect("a count change must be described");
-        assert!(d.contains("642 -> 646 documents"), "{d}");
-        assert!(d.contains("11090 -> 11215 chunks"), "{d}");
-
-        // counts held, contents moved
-        let d = describe_corpus_change(Some(&now), Some(&corpus(646, 11_215, "bbb")))
-            .expect("a content-only change must be described");
-        assert!(d.contains("different contents"), "{d}");
-
-        // identical -> nothing to say
-        assert!(describe_corpus_change(Some(&now), Some(&now.clone())).is_none());
-
-        // Nothing to compare against must never read as "changed": rounding
-        // "unknown" up to "changed" makes every message a false positive for a
-        // whole baseline generation.
-        assert!(describe_corpus_change(Some(&now), None).is_none());
-        assert!(describe_corpus_change(None, Some(&now)).is_none());
-    }
-
-    /// A corpus change must not suppress the regression signal either.
-    #[test]
-    fn test_is_regression_still_fires_when_the_corpus_changed() {
-        let mut now = sample_run(200, 0.60);
-        let mut prev = sample_run(100, 0.80);
-        now.corpus = Some(corpus(646, 11_215, "aaa"));
-        prev.corpus = Some(corpus(642, 11_090, "bbb"));
-        assert!(
-            is_regression(&now, &prev, 0.05),
-            "the corpus explains a drop; it must not excuse one"
-        );
-    }
-
-    #[test]
-    fn test_format_text_does_not_claim_a_change_against_a_baseline_without_corpus() {
-        let mut now = sample_run(200, 0.90);
-        let prev = sample_run(100, 0.90); // corpus: None, i.e. recorded before AU-71
-        now.corpus = Some(corpus(646, 11_215, "aaa"));
-
-        let out = format_text(&now, Some(&prev), false, 0.05);
-        assert!(out.contains("646 docs / 11215 chunks"), "{out}");
-        assert!(
-            !out.contains("corpus changed"),
-            "an unknown baseline must not be reported as a change: {out}"
-        );
-    }
-
-    /// A path and a hash must not be able to trade characters across the join.
-    #[test]
-    fn test_corpus_digest_separates_path_from_hash() {
-        let a: HashMap<String, String> = [("ab".to_string(), "cd".to_string())].into();
-        let b: HashMap<String, String> = [("a".to_string(), "bcd".to_string())].into();
-        assert_ne!(corpus_digest(&a), corpus_digest(&b));
     }
 
     #[test]

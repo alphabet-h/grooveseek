@@ -4017,4 +4017,77 @@ mod tests {
             "fts_chunks column order is load-bearing for the bm25 weight positions"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // AU-71: corpus_snapshot
+    // -----------------------------------------------------------------------
+
+    /// Insert one document with one chunk. Returns the document id.
+    fn doc_with_chunk(db: &Database, path: &str, content_hash: &str, chunk: &str) -> i64 {
+        let id = db
+            .upsert_document(path, Some("t"), None, None, None, &[], None, content_hash)
+            .unwrap();
+        db.insert_chunk(id, 0, Some("H"), Some(1), chunk, None, &[0.0; 384], 1.0)
+            .unwrap();
+        id
+    }
+
+    /// The digest must be stable across repeated reads of one unchanged index.
+    ///
+    /// If it were not, every run would report "the corpus changed", which reads
+    /// as noise and gets ignored — defeating the point of recording it. The
+    /// row order therefore comes from SQL `ORDER BY`, not from whatever the
+    /// query plan happens to produce.
+    #[test]
+    fn test_corpus_snapshot_is_stable_for_an_unchanged_index() {
+        let db = db_with_384();
+        doc_with_chunk(&db, "b.md", "hb", "beta text");
+        doc_with_chunk(&db, "a.md", "ha", "alpha text");
+
+        let first = db.corpus_snapshot().unwrap();
+        let second = db.corpus_snapshot().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.0, 2, "documents");
+        assert_eq!(first.1, 2, "chunks");
+    }
+
+    /// The digest must follow the *indexed chunk*, not the source file hash.
+    ///
+    /// `documents.content_hash` hashes file bytes, so it cannot see a rebuild
+    /// that parsed the same bytes differently (a changed `exclude_headings`,
+    /// say). If the chunk count happens to match as well, a source-hash digest
+    /// would call that "unchanged" while every chunk being searched had been
+    /// replaced.
+    #[test]
+    fn test_corpus_snapshot_notices_chunk_text_changing_under_an_identical_source_hash() {
+        let db = db_with_384();
+        doc_with_chunk(&db, "a.md", "same-source-hash", "original chunk body");
+        let before = db.corpus_snapshot().unwrap();
+
+        // Same path, same content_hash, same chunk count — only the indexed
+        // text differs, exactly as a re-parse under new settings would leave it.
+        let db2 = db_with_384();
+        doc_with_chunk(&db2, "a.md", "same-source-hash", "replaced chunk body");
+        let after = db2.corpus_snapshot().unwrap();
+
+        assert_eq!(
+            (before.0, before.1),
+            (after.0, after.1),
+            "counts must match"
+        );
+        assert_ne!(before.2, after.2, "the digest must still notice");
+    }
+
+    /// Adjacent fields must not be able to trade characters across the join.
+    #[test]
+    fn test_corpus_snapshot_separates_adjacent_fields() {
+        let a = db_with_384();
+        doc_with_chunk(&a, "ab.md", "h", "cd");
+        let b = db_with_384();
+        doc_with_chunk(&b, "a.md", "h", "bcd");
+        assert_ne!(
+            a.corpus_snapshot().unwrap().2,
+            b.corpus_snapshot().unwrap().2
+        );
+    }
 }

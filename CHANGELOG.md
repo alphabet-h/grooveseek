@@ -18,9 +18,15 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   remaining uncovered input.
 
   Each run now records the index it measured — document count, chunk count, and
-  a digest over every document's content hash — and the header reports it,
+  a digest over the indexed chunks themselves — and the header reports it,
   naming the change when there is one. A document rewritten in place moves
-  neither count, so the digest is what keeps "unchanged" honest.
+  neither count, so the digest is what keeps "unchanged" honest. The digest
+  covers the chunks rather than the source files deliberately: chunks are what
+  the search actually reads, so a rebuild that parses unchanged files
+  differently — a changed `exclude_headings`, say — is caught even though every
+  file hash held. The three reads share one transaction, because in WAL mode
+  separate statements see separate snapshots and a `serve` watcher indexing
+  alongside could otherwise produce a record of an index that never existed.
 
   **This deliberately does not disable the diff.** Putting the corpus into the
   compatibility test would have been the tidier fix and the wrong one: a

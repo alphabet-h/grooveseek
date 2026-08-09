@@ -149,8 +149,11 @@ per-query セクションには **劣化 (↓)** と **ミス (現在の recall@
        a delta below may reflect that, not retrieval
 ```
 
-既存ファイルの書き換えは content hash しか動かさないので、件数だけを見ると
-「変わっていない」と判定してしまう。そこで中身も比較する:
+digest が対象にするのは**索引された chunk** であってソースファイルではない。
+検索が読んでいるのは chunk なので、ソースが同一のまま取り込まれ方だけが変わった
+再構築 (`exclude_headings` の変更など) も、ファイル hash が全件不変でも検知できる。
+既存ファイルの書き換えは件数を動かさないので、件数だけを見ると
+「変わっていない」と判定してしまう:
 
 ```
     ⚠️ corpus changed since last run (same document and chunk counts, different contents)

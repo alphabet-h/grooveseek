@@ -158,8 +158,10 @@ below are qualified:
        a delta below may reflect that, not retrieval
 ```
 
-A document rewritten in place moves nothing but its content hash, so counts
-alone would call that "unchanged". They are compared too:
+The digest covers the **indexed chunks**, not the source files — chunks are
+what the search reads, so a rebuild that parses unchanged files differently is
+caught even though every file hash held. A document rewritten in place moves
+neither count, so counts alone would call that "unchanged":
 
 ```
     ⚠️ corpus changed since last run (same document and chunk counts, different contents)
