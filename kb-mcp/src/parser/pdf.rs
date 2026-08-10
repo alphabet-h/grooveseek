@@ -1029,6 +1029,34 @@ mod tests {
     }
 
     #[test]
+    fn test_c1_control_ratio_counts_exactly_the_c1_range() {
+        // 境界値そのもの (codex #131 後の外部 review、finding #19)。機能テストは
+        // 現実的な混合サンプルなので、範囲の off-by-one (例: 0x81..=0x9F) が
+        // 起きても比率がほとんど動かず 1% を越えたまま = 静かに regress し得る。
+        // 両端の内外 1 文字ずつを単独で数える。
+        assert_eq!(
+            c1_control_ratio(&["\u{7F}".to_string()]),
+            0.0,
+            "U+007F is C0, not C1"
+        );
+        assert_eq!(
+            c1_control_ratio(&["\u{80}".to_string()]),
+            1.0,
+            "U+0080 is the C1 floor"
+        );
+        assert_eq!(
+            c1_control_ratio(&["\u{9F}".to_string()]),
+            1.0,
+            "U+009F is the C1 ceiling"
+        );
+        assert_eq!(
+            c1_control_ratio(&["\u{A0}".to_string()]),
+            0.0,
+            "U+00A0 (NBSP) is not C1"
+        );
+    }
+
+    #[test]
     fn test_mojibake_is_rejected_even_when_it_clears_the_density_threshold() {
         // 化けると 1 文字が 2 文字に増えるため、密度の門は素通りする。
         // C1 の門を外すとこの文書が索引に入る = この test が赤になる。
