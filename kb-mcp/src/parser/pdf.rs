@@ -1083,7 +1083,7 @@ mod tests {
     // AU-70 の実 PDF fixture。3 本とも手書き・非圧縮で、`/DescendantFonts` の
     // 書き方以外は同一 (README.md 参照)。
 
-    /// `/DescendantFonts [ 7 0 R ]` — CIDFont を間接参照で書いた版。
+    /// `/DescendantFonts [ 6 0 R ]` — CIDFont を間接参照で書いた版。
     const CID_INDIRECT_PDF: &[u8] =
         include_bytes!("../../tests/fixtures/binary/cid_descendant_indirect.pdf");
 

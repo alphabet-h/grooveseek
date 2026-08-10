@@ -17,9 +17,9 @@ fixtures.
 | `encrypted.pdf`    | 2047 B    | `minimal.pdf`, re-saved by `pikepdf` under AES-256 (`R=6`) encryption with a **non-empty** user password | `test_pdf_encrypted_real_fixture_is_err` (real encrypted PDF must be `Err` without calling `unlock()`) |
 | `utf16_title.pdf`  | 761 B     | 1 page (padded past the scanned-PDF threshold) with `/Title` as a **literal PDF string** (`(...)`, raw bytes) encoding UTF-16BE `"日本語"` with a BOM (`0xFEFF`) | `test_pdf_recovers_utf16be_title_from_real_pdf_encoding` (Task 2.9 follow-up: `oxidize-pdf` mis-decodes this byte-by-byte through a CP1252/WinAnsi-style table instead of detecting the BOM; kb-mcp must recover the correct title) |
 | `mostly_blank.pdf` | 2920 B    | 10 pages: 9 with an empty `/Contents` stream (same technique as `empty_text.pdf`) and exactly 1 (page 5) with a real 221-char text layer | `test_pdf_mostly_blank_pages_not_misclassified_as_scanned` (codex P2, PR #69 round 1: the scanned-PDF heuristic must average over *non-empty* pages only — `221 / 10 = 22 < 50` wrongly rejected the whole PDF under the old total-page-count denominator, while `221 / 1 = 221` correctly does not) |
-| `cid_descendant_indirect.pdf` | 907 B | 1 page of Japanese in a Type0 font, `/Encoding /UniJIS-UCS2-H`, **no `/ToUnicode`**, with the CIDFont written as an indirect reference (`/DescendantFonts [ 7 0 R ]`) | `test_cid_font_with_indirect_descendant_extracts_japanese` (AU-70: this form decodes correctly today and must keep doing so — the test is a regression guard on oxidize-pdf's CID path) |
-| `cid_descendant_direct.pdf` | 1050 B | Byte-for-byte the same document with the CIDFont written as a **direct dictionary** (`/DescendantFonts [ << … >> ]`) | not referenced by a test; kept as the minimal witness of the upstream defect and the control half of the A/B pair |
-| `cid_descendant_direct_dense.pdf` | 3675 B | The direct-dictionary form with 25 lines of Japanese, so it measures 1179 chars/page **while mis-decoded** | `test_cid_font_with_direct_descendant_never_reaches_the_index_as_mojibake` (AU-70: mis-decoding doubles the character count, so the garbage clears the 50 chars/page gate — this fixture is what proves the C1 gate is load-bearing) |
+| `cid_descendant_indirect.pdf` | 1107 B | 1 page of Japanese in a Type0 font, `/Encoding /UniJIS-UCS2-H`, **no `/ToUnicode`**, with the CIDFont written as an indirect reference (`/DescendantFonts [ 6 0 R ]`) | `test_cid_font_with_indirect_descendant_extracts_japanese` (AU-70: this form decodes correctly today and must keep doing so — the test is a regression guard on oxidize-pdf's CID path) |
+| `cid_descendant_direct.pdf` | 1273 B | The same document with the CIDFont written as a **direct dictionary** (`/DescendantFonts [ << … >> ]`) — the only differing object is 5 (the Type 0 font) | not referenced by a test; kept as the minimal witness of the upstream defect and the control half of the A/B pair |
+| `cid_descendant_direct_dense.pdf` | 3897 B | The direct-dictionary form with 25 lines of Japanese, so it measures 1179 chars/page **while mis-decoded** | `test_cid_font_with_direct_descendant_never_reaches_the_index_as_mojibake` (AU-70: mis-decoding doubles the character count, so the garbage clears the 50 chars/page gate — this fixture is what proves the C1 gate is load-bearing) |
 
 `minimal.pdf` intentionally keeps `/Title` so it stays valid for the Task 2.3
 happy-path test; the filename-fallback case needed a *separate* fixture
@@ -181,21 +181,38 @@ points *are* the UTF-16BE values — that is what `/Encoding /UniJIS-UCS2-H`
 means, so no font file is embedded and the whole file stays ASCII apart from
 the binary marker.
 
+Object layout, contiguous `1..7` in every variant: `1` Catalog, `2` Pages,
+`3` Page, `4` Contents, `5` the Type 0 font, `6` the CIDFont, `7` the
+FontDescriptor. Object 6 is written in every file whether or not anything
+references it, and the FontDescriptor is an indirect reference from the CIDFont
+on purpose — ISO 32000-1 Table 117 marks it *(Required; shall be an indirect
+reference)*, and `pdfminer.six` reads all three files warning-free, which
+keeps "a conformant PDF is mishandled" defensible when citing these fixtures
+upstream. The first cut of these files omitted the descriptor and pdfminer
+flagged it; that is exactly the kind of nit an upstream maintainer would
+reject a repro over.
+
 `cid_descendant_indirect.pdf` and `cid_descendant_direct.pdf` differ in
-**exactly one respect**: whether the CIDFont inside `/DescendantFonts` is an
-indirect reference or a direct dictionary. Content stream, text bytes,
-`/Encoding` and `/CIDSystemInfo` are identical. Against oxidize-pdf 4.2.2:
+**exactly one object** (5, the Type 0 font): whether the CIDFont inside
+`/DescendantFonts` is an indirect reference or a direct dictionary. Content
+stream, text bytes, `/Encoding`, `/CIDSystemInfo` and the object set are
+identical. Against oxidize-pdf 4.2.2:
 
 | `/DescendantFonts` | extracted text |
 | --- | --- |
-| `[ 7 0 R ]` | `第1章 概要 GRIMWALD` |
+| `[ 6 0 R ]` | `第1章 概要 GRIMWALD` |
 | `[ << /Subtype /CIDFontType0 … >> ]` | `{, 1zà i\u{82}\u{89}\u{81} G R I M W A L D` |
 
 (`第` is U+7B2C, whose UTF-16BE bytes `7B 2C` are the leading `{,`.) ISO 32000-1
-§9.7.4 permits both forms; `extraction_cmap.rs` reads only the reference, which
-leaves `descendant_font` empty and skips the branch that already resolves
-`UniJIS-UCS2-H` correctly. Keeping both files is the point — a single fixture
-would show mojibake without establishing *what* causes it.
+Table 121 types `DescendantFonts` as an array with no reference requirement,
+and §7.3.7 lets any dictionary value be direct or indirect;
+`extraction_cmap.rs` reads only the reference, which leaves `descendant_font`
+empty and skips the branch that already resolves `UniJIS-UCS2-H` correctly.
+Keeping both files is the point — a single fixture would show mojibake without
+establishing *what* causes it. (A third spelling, the `/DescendantFonts` value
+itself as an indirect reference to the array, mis-decodes identically — it is
+kept as scratch evidence for the upstream report rather than committed here,
+because the C1 gate the committed fixtures exercise is spelling-agnostic.)
 
 `cid_descendant_direct_dense.pdf` exists because the minimal direct-dictionary
 file is only 27 chars/page, so it would be rejected by the density gate whether
@@ -204,11 +221,11 @@ makes the C1 check the only thing standing between mis-decoded text and the
 index. Verified by raising `MISDECODED_C1_RATIO` above 1.0 and confirming the
 test fails with the mojibake in the assertion output.
 
-To regenerate: use the `build_pdf` recipe above with objects `1` = Catalog,
-`2` = Pages, `3` = Page, `4` = Contents, `6` = the Type0 font, `7` = the
-CIDFont, and emit the body as `<hex> Tj` where `hex` is
+To regenerate: use the `build_pdf` recipe above with the object layout listed
+here, emitting the body as `<hex> Tj` where `hex` is
 `text.encode("utf-16-be").hex()`. Then re-run
-`cargo test --lib parser::pdf` and confirm both AU-70 tests pass.
+`cargo test --lib parser::pdf` and confirm both AU-70 tests pass, and run
+pdfminer.six over all three files expecting warning-free, correct Japanese.
 
 ## `encrypted.pdf` — real encrypted fixture
 
