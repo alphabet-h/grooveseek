@@ -91,7 +91,8 @@ const MISDECODED_C1_RATIO: f64 = 0.01;
 ///
 /// **判定条件** (run = 空白区切り、全文字 < U+0100)。run の長さで 2 経路:
 ///
-/// - **8 文字以上**: run 単体でパリティ判定 —
+/// - **8 文字以上**: まず run 単体でパリティ判定し、**発火しなければ pool へ**
+///   (round 5: 判定不能と無罪を混同しない) —
 ///   `min(偶数位置の文字種, 奇数位置の文字種) <= 2` かつ `max(...) >= 4`。
 ///   片側 2 種以下 = 上位バイトの集中、逆側 4 種以上 = 実データの多様性。
 /// - **2〜7 文字** (per-run 判定が発火可能になる 8 文字未満):
@@ -214,13 +215,14 @@ fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
     // 実測 148 chars/page・C1 0.00% で両方の門を通過)。
     let mut suspect = 0usize;
     let mut total = 0usize;
-    // 短 run の集約バッファ: 先頭要素 (= 上位バイト位置) の頻度、後続要素の
-    // 種類、ペアに入った文字数、由来 run の文字数合計。
-    let mut short_first_freq: std::collections::BTreeMap<char, usize> =
+    // pool の集約バッファ: 先頭要素 (= 上位バイト位置) の頻度、後続要素の
+    // 種類、ペアに入った文字数、由来 run の文字数合計。短 run に加え、
+    // per-run 判定が発火しなかった長い run の証拠もここへ落ちる (round 5)。
+    let mut pool_first_freq: std::collections::BTreeMap<char, usize> =
         std::collections::BTreeMap::new();
-    let mut short_seconds = std::collections::BTreeSet::new();
-    let mut short_pairs = 0usize;
-    let mut short_run_chars = 0usize;
+    let mut pool_seconds = std::collections::BTreeSet::new();
+    let mut pool_pairs = 0usize;
+    let mut pooled_chars = 0usize;
     for page in pages {
         for run in page.split_whitespace() {
             let chars: Vec<char> = run.chars().collect();
@@ -229,9 +231,8 @@ fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
                 continue;
             }
             // per-run 判定は**発火可能な長さ**から (codex P1 round 4)。
-            // `odd.len() >= 4` には奇数位置が 4 つ = 8 文字必要で、6〜7 文字を
-            // ここに送ると「原理的に発火しない判定」に吸われて pool にも
-            // 入らない死角になる (3 かな語のラベルは化けて 6 文字ちょうど)。
+            // `odd.len() >= 4` には奇数位置が 4 つ = 8 文字必要。
+            let mut fired = false;
             if chars.len() >= 8 {
                 let mut even = std::collections::BTreeSet::new();
                 let mut odd = std::collections::BTreeSet::new();
@@ -250,28 +251,36 @@ fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
                 // (下) がペア先頭だけを数えるのと同じ方向規則。
                 if even.len() <= 2 && odd.len() >= 4 {
                     suspect += chars.len();
+                    fired = true;
                 }
-            } else {
-                short_run_chars += chars.len();
+            }
+            // 発火しなかった run の証拠は捨てずに pool へ落とす (codex P1
+            // round 5)。語内の低バイトが 2 種しかない反復ラベル
+            // (`あかあか` → `0B0K0B0K`) は per-run では `odd >= 4` を満たせ
+            // ないが、語をまたげば低バイトは多様になる — 「判定不能」と
+            // 「無罪」を混同しないための routing。発火した run を pool にも
+            // 入れないのは二重計上を避けるため。
+            if !fired {
+                pooled_chars += chars.len();
                 for pair in chars.chunks_exact(2) {
-                    *short_first_freq.entry(pair[0]).or_insert(0) += 1;
-                    short_seconds.insert(pair[1]);
-                    short_pairs += 1;
+                    *pool_first_freq.entry(pair[0]).or_insert(0) += 1;
+                    pool_seconds.insert(pair[1]);
+                    pool_pairs += 1;
                 }
             }
         }
     }
-    // 短 run プールの一括判定。UTF-16BE を 1 バイトずつ読んだ列は、ペアの
+    // pool の一括判定。UTF-16BE を 1 バイトずつ読んだ列は、ペアの
     // 先頭 (上位バイト) が 1〜2 種に集中し、後続だけが多様になる。閾値:
     // - ペア 12 組 (24 文字) 未満は証拠不足 (散文中の数トークンで誤検出しない)
     // - 先頭上位 2 種で 90% 以上 (English の短語プールは先頭が多様なので落ちる)
     // - 後続 6 種以上 (`1010…` や `0-0-0` のような両側単調な列を外す)
-    if short_pairs >= 12 && short_seconds.len() >= 6 {
-        let mut counts: Vec<usize> = short_first_freq.values().copied().collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
+    if pool_pairs >= 12 && pool_seconds.len() >= 6 {
+        let mut counts: Vec<usize> = pool_first_freq.values().copied().collect();
+        counts.sort_unstable_by(|a: &usize, b: &usize| b.cmp(a));
         let top2: usize = counts.iter().take(2).sum();
-        if top2 as f64 / short_pairs as f64 >= 0.9 {
-            suspect += short_run_chars;
+        if top2 as f64 / pool_pairs as f64 >= 0.9 {
+            suspect += pooled_chars;
         }
     }
     if total == 0 {
@@ -1421,6 +1430,31 @@ mod tests {
         assert!(
             ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
             "six-char label mojibake must exceed the threshold, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_unfired_long_runs_still_contribute_their_pairs() {
+        // codex P1 round 5 (#1): 語内の低バイトが 2 種しかない反復 4 かな語
+        // (`あかあか` → `0B0K0B0K`) は 8 文字 run として per-run 判定に入るが
+        // `odd >= 4` が満たせない。発火しなかった run の証拠を捨てると、
+        // このラベル紙が丸ごと素通りする。不発 run のペアは pool へ落とす —
+        // 語間では低バイトが多様なので、集約すれば signature が浮かぶ。
+        let words = [
+            "あかあか",
+            "いしいし",
+            "うみうみ",
+            "えきえき",
+            "おかおか",
+            "かちかち",
+        ];
+        let tokens: Vec<String> = words.iter().map(|w| misdecoded_utf16be(w)).collect();
+        let pages = vec![tokens.join(" ")];
+        assert_eq!(c1_control_ratio(&pages), 0.0, "precondition: no C1");
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "repeated-label mojibake must exceed the threshold, got {ratio}"
         );
     }
 
