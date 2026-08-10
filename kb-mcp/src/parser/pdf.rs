@@ -1080,6 +1080,69 @@ mod tests {
         );
     }
 
+    // AU-70 の実 PDF fixture。3 本とも手書き・非圧縮で、`/DescendantFonts` の
+    // 書き方以外は同一 (README.md 参照)。
+
+    /// `/DescendantFonts [ 7 0 R ]` — CIDFont を間接参照で書いた版。
+    const CID_INDIRECT_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_indirect.pdf");
+
+    /// `/DescendantFonts [ << … >> ]` — 直接辞書で書いた版。**これだけが化ける**。
+    const CID_DIRECT_DENSE_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_direct_dense.pdf");
+
+    #[test]
+    fn test_cid_font_with_indirect_descendant_extracts_japanese() {
+        // 予約 CMap (`UniJIS-UCS2-H`) + `/ToUnicode` 無しでも、descendant が
+        // 間接参照なら現状でも正しく復号できる。**これは恒久的に真であるべき**
+        // 主張なので、oxidize-pdf 側が CID 経路を壊したらここで捕まる。
+        let (pages, _) = extract_pdf(CID_INDIRECT_PDF, "docs/cid_indirect.pdf")
+            .expect("a CID font with an indirect descendant must extract");
+        assert!(
+            pages[0].contains("第1章 概要"),
+            "Japanese must survive extraction, got: {:?}",
+            pages[0]
+        );
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "correctly decoded text carries no C1 controls"
+        );
+    }
+
+    #[test]
+    fn test_cid_font_with_direct_descendant_never_reaches_the_index_as_mojibake() {
+        // この fixture は**化けた状態で 1179 chars/page** になり、密度の門を
+        // 悠々と通過する。C1 の門が無ければ文字化けが索引に入る。
+        //
+        // **どちらの分岐も本物の主張をしている**。upstream (oxidize-pdf の
+        // `/DescendantFonts` が間接参照しか読まない件) が直れば Ok 側に移るが、
+        // そのときも「化けたものが索引に入らない」という不変条件は変わらない。
+        match PdfParser.parse_bytes(CID_DIRECT_DENSE_PDF, "docs/cid_direct.pdf", &[]) {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("mojibake"),
+                    "the decode failure must be named, not blamed on density: {message}"
+                );
+            }
+            Ok(doc) => {
+                // upstream 修正後の姿。正しい日本語が入っていること。
+                assert!(
+                    doc.chunks[0].content.contains("第1章 概要"),
+                    "if it indexes at all it must be the real text, got: {:?}",
+                    doc.chunks[0].content
+                );
+                let pages: Vec<String> = doc.chunks.iter().map(|c| c.content.clone()).collect();
+                assert_eq!(
+                    c1_control_ratio(&pages),
+                    0.0,
+                    "indexed content must never contain C1 controls"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_correctly_decoded_japanese_above_the_threshold_is_accepted() {
         let pages = vec!["再ランキングの評価について述べる。".repeat(4)];
