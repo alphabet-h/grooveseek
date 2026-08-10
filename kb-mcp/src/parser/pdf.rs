@@ -18,10 +18,9 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// **原因を決めつけないこと。** ここに落ちる PDF には少なくとも 3 種類ある:
 ///
 /// 1. 本当にテキスト層が無いスキャン画像 PDF (OCR 未対応なので落として正しい)
-/// 2. **テキスト層はあるのにデコードできなかった PDF**。日本語 PDF で実測
-///    (2026-07-28): CID-keyed でも TrueType 埋め込みでも、pdfminer.six は
-///    完全に読めるのに oxidize-pdf 4.1.1 はほぼ何も取り出せず、TrueType 版は
-///    45 chars/page でこの閾値に掛かった
+/// 2. **テキスト層はあるのにデコードできなかった PDF**。ただし文字化けを伴う
+///    復号失敗は [`MISDECODED_C1_RATIO`] が先に捕まえるので、ここへ来るのは
+///    「化けずに、ほとんど何も出なかった」場合に限られる
 /// 3. **正しくデコードできていて、本当に 1 ページあたりの文字が少ない PDF**。
 ///    表紙・ラベル・レシート・図版主体の資料がこれにあたる
 ///
@@ -30,7 +29,92 @@ use super::{Frontmatter, ParsedDocument, Parser, single_text_chunk};
 /// 正反対の方向へ送っていた。修正時に「1 か 2 のいずれか」と書き直したが、
 /// それも 3 を排除する閉じた列挙で同じ誤りだった (PR #130 round 1)。
 /// **列挙は開いた形にすること** — 測った値を出し、代表的な原因を挙げるに留める。
+///
+/// **値 50 は下げられない** (AU-70、2026-08-10 実測)。スキャン画像にページ番号や
+/// 「CONFIDENTIAL」等のスタンプだけを電子的に載せた PDF — この閾値が本来狙う
+/// 相手 — が **39 chars/page** を出す。閾値を跨いで下げると、それを索引に入れる
+/// ことになる。文字数だけでは「価値のない定型文」と「密度の低い本文」を
+/// 分離できない、というのが測って分かったことで、値の調整では解けない。
 const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
+
+/// 抽出テキストのうち C1 制御文字 (U+0080..=U+009F) がこの比率以上を占めたら、
+/// 「復号に失敗して文字化けした」と判定して文書ごと落とす閾値。
+///
+/// **なぜ C1 なのか。** UTF-16BE のバイト列を 1 バイトずつ Latin-1 として読むと、
+/// **U+8000〜U+9FFF** (漢字ブロックの後半) の上位バイトがそのまま C1 領域に
+/// 落ちる。加えて濁点かな・「ん」等 (U+3080〜U+309F) は**下位**バイトが C1 に
+/// 落ちる (現実的なかな文で実測 7.94%)。正常に抽出できたテキストには
+/// この領域の文字が現れない — WinAnsi は 0x80..0x9F を印字可能文字 (€ … ™ 等)
+/// に写像するので、C1 が生で残ること自体が「どの符号化としても解釈されなかった」
+/// ことの証拠になる。
+///
+/// **C1 が出ない持ち場がある** (PR #132 codex P1、実測で確認): 上位バイトが
+/// 0x30 で下位バイトも 0x80 未満に収まる**清音かなだけの文書**は、化けても
+/// C1 を 1 つも出さない (`あいうえお…` → `0B0D0F0H0J…`、C1 = 0.00%、
+/// 407 chars/page で密度も通過)。そちらは [`BYTEWISE_PAIR_SIGNATURE_RATIO`]
+/// が受け持つ。
+///
+/// **実測 (AU-70、oxidize-pdf 4.2.2、10 サンプル)** — 完全に分離した:
+///
+/// | 抽出結果 | C1 比率 |
+/// |---|---|
+/// | ASCII / TrueType 埋め込み日本語 / スキャン+スタンプ / CID (修正版) | **0.00%** |
+/// | CID 予約 CMap で文字化けした 4 件 | **3.61% 〜 15.59%** |
+///
+/// 0% と 3.61% の間なら何を採っても分かれるが、実データに稀な C1 が 1 文字
+/// 紛れ込んでも落とさないよう 1% を採る。
+///
+/// **なぜ捨てるのか (警告して索引に入れない理由)。** 文字化けしたテキストは
+/// どのクエリにも一致しない一方、embedding の計算コストと corpus 統計は
+/// 消費する。しかも化けると 1 文字が 2 文字に増えるため
+/// [`SCANNED_PDF_MIN_CHARS_PER_PAGE`] を**すり抜ける** (実測: 文字化け 1052
+/// chars/page が通り、正しく抽出できた 29 chars/page が落ちていた)。
+/// 復元は試みない — `sanitize_extracted_text` が NUL を空白へ潰した後なので
+/// 元のバイト列は再構成できない。
+const MISDECODED_C1_RATIO: f64 = 0.01;
+
+/// byte-wise UTF-16BE の**第 2 シグナル**: 非空白 run のうち「片側パリティの
+/// 文字種が極端に少なく、逆側は多様」なものが全非空白文字のこの比率以上を
+/// 占めたら文字化けとして落とす。
+///
+/// **機構。** UTF-16BE を 1 バイトずつ読むと、偶数位置は元テキストの**上位
+/// バイト列**になる。実文書の文字は少数の Unicode ブロックに集中するため、
+/// 上位バイト位置は 1〜2 種の値の繰り返しになり、下位バイト位置だけが多様に
+/// なる (`あいうえお…` → `0B0D0F0H0J…` の '0' 交互)。自然なテキストの単語に
+/// この構造は現れない (`GRIMWALD` は両パリティとも多様)。
+///
+/// **なぜ要るのか** (PR #132 codex P1、oxidize-pdf 4.1.1 実測): 清音かなの
+/// 上位バイトは 0x30、下位バイトも 0x80 未満なので [`MISDECODED_C1_RATIO`] を
+/// 完全にすり抜ける (C1 = 0.00%、407 chars/page で密度も通過 = index される)。
+/// なお 4.2.3 は crate 側のヒューリスティックで同じ入力を救済するが、
+/// **版の偶然に防御を依存させない**。
+///
+/// **判定条件** (run = 空白区切り、全文字 < U+0100)。run の長さで 2 経路:
+///
+/// - **8 文字以上**: run 単体でパリティ判定 —
+///   `min(偶数位置の文字種, 奇数位置の文字種) <= 2` かつ `max(...) >= 4`。
+///   片側 2 種以下 = 上位バイトの集中、逆側 4 種以上 = 実データの多様性。
+/// - **2〜7 文字** (per-run 判定が発火可能になる 8 文字未満):
+///   単体では統計にならないので**文書全体でペアを集約**し、
+///   「ペア 12 組以上 + 先頭上位 2 種で 90% 以上 + 後続 6 種以上」で
+///   プールごと suspect にする (codex P1 round 2: ラベル / 単語リストは
+///   run が 2〜4 文字に割れ、per-run 判定だけでは素通りした —
+///   実 PDF で 148 chars/page・C1 0.00% を実測)。
+///
+/// `1010…` や `0-0-0-…` のような両側単調な列は多様性条件で外れ、
+/// 正しくデコードされた CJK は「全文字 < U+0100」で外れる。
+///
+/// **方向規則** (codex P1 round 3): 集中は**先頭パリティ側に限る**。UTF-16BE
+/// の byte-wise 読みは上位バイト = 先頭側だけが集中し、逆向き (`1A2A3A…` の
+/// ような交互識別子 = 後続側の集中) はこの機構では生成されない。対称に見ると
+/// 型番表・在庫表を誤って落とすだけで検出は 1 つも増えない。
+///
+/// **実測**: 清音かな evasion (長 run) = 1.00、ラベル配置 (短 run) ≈ 0.80、
+/// English 散文 / 正常日本語 / スキャン+スタンプ / 交互識別子表 = 0.00。
+/// 余裕を見て 0.3。残余 FP (`$5 $9 $12…` や `A1 A2 A3…` のような
+/// 「先頭が定数 + 後続が多様」の短トークンだけで文書の 3 割を占める場合 —
+/// 機構上 U+41xx 圏のテキストと区別できない) は `.dev/known-issues.md` に記録。
+const BYTEWISE_PAIR_SIGNATURE_RATIO: f64 = 0.3;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
 ///
@@ -93,6 +177,176 @@ fn non_empty_page_stats(pages: &[String]) -> (usize, usize) {
     (non_empty.len(), total_chars / non_empty.len())
 }
 
+/// 抽出テキスト全体に占める C1 制御文字 (U+0080..=U+009F) の比率。
+///
+/// 判定の根拠と閾値は [`MISDECODED_C1_RATIO`] を参照。文字が 1 つも無ければ
+/// `0.0` (0 除算回避 — 空文書は「薄すぎる」側の判定で落ちる)。
+///
+/// 分母を全文字数にするのは、化けたページと正常なページが混在する文書
+/// (先頭だけ別フォント等) で、正常側の量に応じて判定が緩むようにするため。
+fn c1_control_ratio(pages: &[String]) -> f64 {
+    let mut total = 0usize;
+    let mut c1 = 0usize;
+    for page in pages {
+        for ch in page.chars() {
+            total += 1;
+            if matches!(ch as u32, 0x80..=0x9F) {
+                c1 += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    c1 as f64 / total as f64
+}
+
+/// byte-wise UTF-16BE の交互パターン (第 2 シグナル) に一致する文字の比率。
+///
+/// 判定の根拠・条件・閾値は [`BYTEWISE_PAIR_SIGNATURE_RATIO`] を参照。
+/// 分母は**全非空白文字** (CJK 含む) — 正しくデコードされた日本語文書では
+/// CJK が分母を占めて比率が 0 に寄る。文字が 1 つも無ければ `0.0`。
+fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
+    // 長い run (6 文字以上) は run 単体でパリティ判定できる。短い run は
+    // 単体では統計にならないので、**文書全体でペアを集約**して判定する
+    // (codex P1 round 2: ラベル / 単語リストは 1 run が 2〜4 文字になり、
+    // per-run 判定だけでは全部捨てられて ratio が 0 のまま index された —
+    // 実測 148 chars/page・C1 0.00% で両方の門を通過)。
+    let mut suspect = 0usize;
+    let mut total = 0usize;
+    // 短 run の集約バッファ: 先頭要素 (= 上位バイト位置) の頻度、後続要素の
+    // 種類、ペアに入った文字数、由来 run の文字数合計。
+    let mut short_first_freq: std::collections::BTreeMap<char, usize> =
+        std::collections::BTreeMap::new();
+    let mut short_seconds = std::collections::BTreeSet::new();
+    let mut short_pairs = 0usize;
+    let mut short_run_chars = 0usize;
+    for page in pages {
+        for run in page.split_whitespace() {
+            let chars: Vec<char> = run.chars().collect();
+            total += chars.len();
+            if chars.len() < 2 || chars.iter().any(|c| (*c as u32) >= 0x100) {
+                continue;
+            }
+            // per-run 判定は**発火可能な長さ**から (codex P1 round 4)。
+            // `odd.len() >= 4` には奇数位置が 4 つ = 8 文字必要で、6〜7 文字を
+            // ここに送ると「原理的に発火しない判定」に吸われて pool にも
+            // 入らない死角になる (3 かな語のラベルは化けて 6 文字ちょうど)。
+            if chars.len() >= 8 {
+                let mut even = std::collections::BTreeSet::new();
+                let mut odd = std::collections::BTreeSet::new();
+                for (i, c) in chars.iter().enumerate() {
+                    if i % 2 == 0 {
+                        even.insert(*c);
+                    } else {
+                        odd.insert(*c);
+                    }
+                }
+                // 集中側は**先頭 (偶数) パリティに限る** (codex P1 round 3)。
+                // UTF-16BE を 1 バイトずつ読んだ run は上位バイト = 先頭側が
+                // 集中する。逆向き (`1A2A3A…` のような交互識別子 = 奇数側が
+                // 集中) はこの機構では生成されないので、対称に見ると型番表・
+                // 在庫表を誤って落とすだけで検出は 1 つも増えない。短 run 集約
+                // (下) がペア先頭だけを数えるのと同じ方向規則。
+                if even.len() <= 2 && odd.len() >= 4 {
+                    suspect += chars.len();
+                }
+            } else {
+                short_run_chars += chars.len();
+                for pair in chars.chunks_exact(2) {
+                    *short_first_freq.entry(pair[0]).or_insert(0) += 1;
+                    short_seconds.insert(pair[1]);
+                    short_pairs += 1;
+                }
+            }
+        }
+    }
+    // 短 run プールの一括判定。UTF-16BE を 1 バイトずつ読んだ列は、ペアの
+    // 先頭 (上位バイト) が 1〜2 種に集中し、後続だけが多様になる。閾値:
+    // - ペア 12 組 (24 文字) 未満は証拠不足 (散文中の数トークンで誤検出しない)
+    // - 先頭上位 2 種で 90% 以上 (English の短語プールは先頭が多様なので落ちる)
+    // - 後続 6 種以上 (`1010…` や `0-0-0` のような両側単調な列を外す)
+    if short_pairs >= 12 && short_seconds.len() >= 6 {
+        let mut counts: Vec<usize> = short_first_freq.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let top2: usize = counts.iter().take(2).sum();
+        if top2 as f64 / short_pairs as f64 >= 0.9 {
+            suspect += short_run_chars;
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    suspect as f64 / total as f64
+}
+
+/// 抽出済みページを索引に入れてよいか判定する。入れてはいけないなら、
+/// **何を測ってそう判断したか**を含む `Err` を返す。
+///
+/// `parse_bytes_inner` から切り出してあるのは、2 つの門と**その順序**を
+/// PDF fixture 無しでテストするため (`extract_pages_within_budget_capped` を
+/// cap 注入版に割ったのと同じ形)。順序は仕様であって好みではない — 下の
+/// コメントを参照。
+fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
+    // **薄さの判定より先に**文字化けを見る。UTF-16BE を 1 バイトずつ読むと
+    // 1 文字が 2 文字に増えるので、後に置くと `SCANNED_PDF_MIN_CHARS_PER_PAGE`
+    // を余裕で通過し、化けたまま索引に入る (AU-70 実測: 化けた文書が 1052
+    // chars/page で通り、正しく抽出できた 29 chars/page が落ちていた)。
+    // 逆順にすると、薄い化け文書に「文字が少ない」という的外れな診断も出す。
+    //
+    // シグナルは 2 つで持ち場が違う: C1 は漢字・濁点かなを含む文書を捕まえ、
+    // 交互パターンは C1 を出さない清音かな主体の文書を捕まえる (codex P1)。
+    let c1_ratio = c1_control_ratio(pages);
+    if c1_ratio >= MISDECODED_C1_RATIO {
+        return Err(anyhow!(
+            "{path_hint}: the text layer decoded to mojibake, not text: \
+             {:.1}% of the extracted characters are C1 control codes \
+             (U+0080-U+009F), which correctly decoded text does not contain — \
+             skipping rather than indexing text that no query can match. This \
+             build could not decode the font encoding this PDF uses; the text \
+             is present and a viewer will show it correctly. Known trigger: a \
+             CID-keyed font with a predefined CMap and no /ToUnicode",
+            c1_ratio * 100.0
+        ));
+    }
+    let pair_ratio = bytewise_pair_signature_ratio(pages);
+    if pair_ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO {
+        return Err(anyhow!(
+            "{path_hint}: the text layer decoded to mojibake, not text: \
+             {:.0}% of the extracted characters alternate a near-constant \
+             character with varied ones — the signature of UTF-16BE text read \
+             one byte at a time (kana comes out as ASCII, e.g. あ becomes \
+             \"0B\") — skipping rather than indexing text that no query can \
+             match. This build could not decode the font encoding this PDF \
+             uses; the text is present and a viewer will show it correctly. \
+             Known trigger: a CID-keyed font with a predefined CMap and no \
+             /ToUnicode",
+            pair_ratio * 100.0
+        ));
+    }
+
+    // 取り出せたテキストが薄すぎる文書を落とす。分母は「全ページ数」では
+    // なく「trim 後に非空だったページ数」— 空白 / セパレータページの多い
+    // 実務 PDF で本文ページの密度が薄まる (codex P2, PR #69 round 1)。
+    //
+    // 報告するのは**測った事実だけ**にする。原因の断定は
+    // `SCANNED_PDF_MIN_CHARS_PER_PAGE` の doc の通り 3 通りあり得る。
+    let (non_empty_pages, avg_chars) = non_empty_page_stats(pages);
+    if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
+        return Err(anyhow!(
+            "{path_hint}: too little text extracted to index: average {avg_chars} \
+             chars/page across {non_empty_pages} non-empty page(s) < \
+             {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Common causes \
+             include a scanned image with no text layer (OCR is not supported), a text \
+             layer this build could not decode into anything (a PDF whose text you can \
+             select in a viewer can still land here), and a document that genuinely \
+             carries little text per page, such as slides or a figure-heavy report"
+        ));
+    }
+
+    Ok(())
+}
+
 pub struct PdfParser;
 
 impl Parser for PdfParser {
@@ -117,25 +371,7 @@ impl Parser for PdfParser {
         _exclude_headings: &[&str],
     ) -> Result<ParsedDocument> {
         let (pages, frontmatter) = extract_pdf(bytes, path_hint)?;
-
-        // 取り出せたテキストが薄すぎる文書を落とす。分母は「全ページ数」では
-        // なく「trim 後に非空だったページ数」— 空白 / セパレータページの多い
-        // 実務 PDF で本文ページの密度が薄まる (codex P2, PR #69 round 1)。
-        //
-        // 報告するのは**測った事実だけ**にする。原因の断定は
-        // `SCANNED_PDF_MIN_CHARS_PER_PAGE` の doc の通り 2 通りあり得る。
-        let (non_empty_pages, avg_chars) = non_empty_page_stats(&pages);
-        if non_empty_pages == 0 || avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE {
-            return Err(anyhow!(
-                "{path_hint}: too little text extracted to index: average {avg_chars} \
-                 chars/page across {non_empty_pages} non-empty page(s) < \
-                 {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Common causes \
-                 include a scanned image with no text layer (OCR is not supported), a text \
-                 layer this build could not decode (Japanese and other CJK PDFs are known \
-                 to hit this, so a PDF whose text you can select in a viewer can still land \
-                 here), and a document that genuinely carries little text per page"
-            ));
-        }
+        reject_unindexable_pages(&pages, path_hint)?;
 
         let title = frontmatter.title.as_deref().unwrap_or("");
         let mut chunks = Vec::new();
@@ -897,6 +1133,410 @@ mod tests {
     fn test_non_empty_page_stats_no_pages_returns_zero() {
         let pages: Vec<String> = vec![];
         assert_eq!(non_empty_page_stats(&pages), (0, 0));
+    }
+
+    // AU-70 (2026-08-10): 復号に失敗した PDF を「文字が少ない」ではなく
+    // 「文字化けした」と診断し、索引に入れずに落とす経路の TDD。
+
+    /// UTF-16BE のバイト列を 1 バイトずつ Latin-1 として読んだ列を作る。
+    /// これは推測した形ではなく、CID 予約 CMap の日本語 PDF に対して
+    /// oxidize-pdf が実際に返す形 (実測で bytes 単位に一致することを確認済)。
+    fn misdecoded_utf16be(text: &str) -> String {
+        text.encode_utf16()
+            .flat_map(|unit| unit.to_be_bytes())
+            .map(|byte| byte as char)
+            .collect()
+    }
+
+    #[test]
+    fn test_c1_control_ratio_is_zero_for_correctly_decoded_text() {
+        // 実測で 0.00% だった 3 系統: ASCII / TrueType 埋め込み日本語 /
+        // スキャン画像に載せた ASCII スタンプ。
+        let pages = vec![
+            "This note describes the GRIMWALD_RETRY_BUDGET setting.".to_string(),
+            "第1章 概要\n本書は GRIMWALD_RETRY_BUDGET の設定手順を述べる。".to_string(),
+            "- 1 -\nCONFIDENTIAL / Scanned 2026-08-10".to_string(),
+        ];
+        assert_eq!(c1_control_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_c1_control_ratio_flags_utf16be_read_as_latin1() {
+        let pages = vec![misdecoded_utf16be("第1章 概要 手順を述べる")];
+        let ratio = c1_control_ratio(&pages);
+        assert!(
+            ratio >= MISDECODED_C1_RATIO,
+            "mis-decoded Japanese must exceed the threshold, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_c1_control_ratio_no_text_does_not_divide_by_zero() {
+        assert_eq!(c1_control_ratio(&[]), 0.0);
+        assert_eq!(c1_control_ratio(&[String::new()]), 0.0);
+    }
+
+    #[test]
+    fn test_c1_control_ratio_counts_exactly_the_c1_range() {
+        // 境界値そのもの (codex #131 後の外部 review、finding #19)。機能テストは
+        // 現実的な混合サンプルなので、範囲の off-by-one (例: 0x81..=0x9F) が
+        // 起きても比率がほとんど動かず 1% を越えたまま = 静かに regress し得る。
+        // 両端の内外 1 文字ずつを単独で数える。
+        assert_eq!(
+            c1_control_ratio(&["\u{7F}".to_string()]),
+            0.0,
+            "U+007F is C0, not C1"
+        );
+        assert_eq!(
+            c1_control_ratio(&["\u{80}".to_string()]),
+            1.0,
+            "U+0080 is the C1 floor"
+        );
+        assert_eq!(
+            c1_control_ratio(&["\u{9F}".to_string()]),
+            1.0,
+            "U+009F is the C1 ceiling"
+        );
+        assert_eq!(
+            c1_control_ratio(&["\u{A0}".to_string()]),
+            0.0,
+            "U+00A0 (NBSP) is not C1"
+        );
+    }
+
+    #[test]
+    fn test_mojibake_is_rejected_even_when_it_clears_the_density_threshold() {
+        // 化けると 1 文字が 2 文字に増えるため、密度の門は素通りする。
+        // C1 の門を外すとこの文書が索引に入る = この test が赤になる。
+        // (**順序**の証拠にはならない。逆順でも密度の門を通り抜けて同じ Err に
+        //  着くため — それは `..._sparse_mojibake_...` が受け持つ。実際に
+        //  swap して確認済み: 赤くなるのは sparse 側だけだった)
+        let pages = vec![misdecoded_utf16be(
+            &"再ランキングの評価について述べる。".repeat(20),
+        )];
+        let (_, avg_chars) = non_empty_page_stats(&pages);
+        assert!(
+            avg_chars >= SCANNED_PDF_MIN_CHARS_PER_PAGE,
+            "precondition: the mojibake must be dense enough to pass the density gate, \
+             got {avg_chars}"
+        );
+
+        let err = reject_unindexable_pages(&pages, "docs/cid.pdf")
+            .expect_err("mis-decoded text must not be indexed");
+        let message = err.to_string();
+        assert!(
+            message.contains("mojibake"),
+            "must name the real cause, got: {message}"
+        );
+        assert!(
+            !message.contains("too little text"),
+            "must not blame density for a decode failure, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_sparse_mojibake_is_diagnosed_as_mojibake_not_as_thin_text() {
+        // **順序を捕まえるのはこの test**。密な化け文書は順序を逆にしても
+        // 密度の門を通り抜けて同じ Err に着くので、順序の証拠にならない。
+        // 薄い化け文書だけが、逆順にすると "too little text" に化ける
+        // (実測: desc_direct.pdf = 27 chars/page の文字化け)。
+        let pages = vec![misdecoded_utf16be("第1章 概要")];
+        let (_, avg_chars) = non_empty_page_stats(&pages);
+        assert!(
+            avg_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE,
+            "precondition: this sample must be below the density gate, got {avg_chars}"
+        );
+
+        let err = reject_unindexable_pages(&pages, "docs/sparse_cid.pdf")
+            .expect_err("mis-decoded text must not be indexed");
+        let message = err.to_string();
+        assert!(
+            message.contains("mojibake"),
+            "the decode failure must win over the density gate, got: {message}"
+        );
+    }
+
+    // AU-70 の実 PDF fixture。3 本とも手書き・非圧縮で、`/DescendantFonts` の
+    // 書き方以外は同一 (README.md 参照)。
+
+    /// `/DescendantFonts [ 6 0 R ]` — CIDFont を間接参照で書いた版。
+    const CID_INDIRECT_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_indirect.pdf");
+
+    /// `/DescendantFonts [ << … >> ]` — 直接辞書で書いた版。**これだけが化ける**。
+    const CID_DIRECT_DENSE_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_direct_dense.pdf");
+
+    #[test]
+    fn test_cid_font_with_indirect_descendant_extracts_japanese() {
+        // 予約 CMap (`UniJIS-UCS2-H`) + `/ToUnicode` 無しでも、descendant が
+        // 間接参照なら現状でも正しく復号できる。**これは恒久的に真であるべき**
+        // 主張なので、oxidize-pdf 側が CID 経路を壊したらここで捕まる。
+        let (pages, _) = extract_pdf(CID_INDIRECT_PDF, "docs/cid_indirect.pdf")
+            .expect("a CID font with an indirect descendant must extract");
+        assert!(
+            pages[0].contains("第1章 概要"),
+            "Japanese must survive extraction, got: {:?}",
+            pages[0]
+        );
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "correctly decoded text carries no C1 controls"
+        );
+    }
+
+    #[test]
+    fn test_cid_font_with_direct_descendant_never_reaches_the_index_as_mojibake() {
+        // この fixture は**化けた状態で 1179 chars/page** になり、密度の門を
+        // 悠々と通過する。C1 の門が無ければ文字化けが索引に入る。
+        //
+        // **どちらの分岐も本物の主張をしている**。upstream (oxidize-pdf の
+        // `/DescendantFonts` が間接参照しか読まない件) が直れば Ok 側に移るが、
+        // そのときも「化けたものが索引に入らない」という不変条件は変わらない。
+        match PdfParser.parse_bytes(CID_DIRECT_DENSE_PDF, "docs/cid_direct.pdf", &[]) {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("mojibake"),
+                    "the decode failure must be named, not blamed on density: {message}"
+                );
+            }
+            Ok(doc) => {
+                // upstream 修正後の姿。正しい日本語が入っていること。
+                assert!(
+                    doc.chunks[0].content.contains("第1章 概要"),
+                    "if it indexes at all it must be the real text, got: {:?}",
+                    doc.chunks[0].content
+                );
+                let pages: Vec<String> = doc.chunks.iter().map(|c| c.content.clone()).collect();
+                assert_eq!(
+                    c1_control_ratio(&pages),
+                    0.0,
+                    "indexed content must never contain C1 controls"
+                );
+            }
+        }
+    }
+
+    // PR #132 codex P1: 清音かなだけの文書は化けても C1 を出さない
+    // (`あ` U+3042 → `0B`)。第 2 シグナル (交互パターン) の TDD。
+
+    #[test]
+    fn test_pair_signature_flags_kana_only_bytewise_utf16() {
+        // 実測 (oxidize-pdf 4.1.1) と同じ形: C1 = 0 のまま化ける唯一の持ち場。
+        let pages = vec![misdecoded_utf16be(
+            &"あいうえおかきくけこさしすせそ".repeat(5),
+        )];
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "precondition: this evasion carries no C1"
+        );
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "kana-only bytewise UTF-16BE must exceed the threshold, got {ratio}"
+        );
+
+        let err = reject_unindexable_pages(&pages, "docs/kana.pdf")
+            .expect_err("kana-only mojibake must not be indexed");
+        assert!(err.to_string().contains("mojibake"), "got: {err}");
+    }
+
+    #[test]
+    fn test_pair_signature_is_zero_for_natural_text() {
+        // 正しくデコードされたかな (>= U+0100 で run ごと除外)、English 散文、
+        // スキャン+スタンプの ASCII。実測どおり全て 0。
+        let pages = vec![
+            "あいうえおかきくけこさしすせそ".repeat(5),
+            "This note describes the retry budget setting in detail.".to_string(),
+            "- 1 -\nCONFIDENTIAL / Scanned 2026-08-10\nGRIMWALD_RETRY_BUDGET".to_string(),
+        ];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_pair_signature_needs_a_diverse_side() {
+        // 両パリティとも単調な列は交互パターンではない (`max >= 4` 側の根拠)。
+        let pages = vec!["1010101010 0-0-0-0-0-0".to_string()];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_a_handful_of_short_fragments_is_not_enough_evidence() {
+        // 6 ペア (12 文字) は短 run 集約の証拠下限 (12 ペア) に届かない。
+        // 散文に紛れた数トークンで文書を落とさないための下限。
+        let pages = vec!["0B0D 0F0H 0J0K".to_string()];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_pair_signature_aggregates_short_label_runs() {
+        // codex P1 round 2 (実測 148 chars/page で再現): ラベル / 単語リストは
+        // 1 run が 2〜4 文字になり、per-run 判定では全部捨てられていた。
+        // 短 run のペアを文書全体で集約すれば、先頭要素の集中 (上位バイト =
+        // ほぼ '0') と後続の多様性が浮かび上がる。
+        let words = [
+            "あか", "いし", "うみ", "えき", "おか", "かい", "きし", "くち", "けさ", "こい", "さか",
+            "しお", "すし", "せき", "そこ", "たか", "ちか", "つち", "てつ", "とし",
+        ];
+        let tokens: Vec<String> = words.iter().map(|w| misdecoded_utf16be(w)).collect();
+        let pages = vec![tokens.join(" ")];
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "precondition: no C1 in this evasion"
+        );
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "aggregated short-run mojibake must exceed the threshold, got {ratio}"
+        );
+        let err = reject_unindexable_pages(&pages, "docs/labels.pdf")
+            .expect_err("label-sheet mojibake must not be indexed");
+        assert!(err.to_string().contains("mojibake"), "got: {err}");
+    }
+
+    #[test]
+    fn test_six_char_label_runs_are_pooled_not_orphaned() {
+        // codex P1 round 4: 3 かな語のラベルは化けて **6 文字ちょうど**になる。
+        // per-run 判定に送ると奇数位置が 3 つしかなく `odd >= 4` が原理的に
+        // 満たせず、pool にも入らない死角だった。per-run 判定は「発火可能な
+        // 長さ」(奇数位置 4 つ = 8 文字) からにし、6〜7 文字は pool へ送る。
+        let words = [
+            "あかい",
+            "いしき",
+            "うみへ",
+            "えきか",
+            "おかし",
+            "かいし",
+            "きしお",
+            "くちこ",
+        ];
+        let tokens: Vec<String> = words.iter().map(|w| misdecoded_utf16be(w)).collect();
+        let pages = vec![tokens.join(" ")];
+        assert_eq!(c1_control_ratio(&pages), 0.0, "precondition: no C1");
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "six-char label mojibake must exceed the threshold, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_short_english_words_do_not_aggregate_into_a_signature() {
+        // 英語散文の短語プールはペア先頭が多様 (share < 0.9) なので集約しても
+        // signature にならない。12 ペアの証拠下限を大きく超える量で確認する。
+        let pages = vec![
+            "an of to it we he is at on by up as in so no go do my me two \
+             ten one six own old new not now far few for the and but was"
+                .to_string(),
+        ];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_one_hyphen_spelled_token_does_not_reject_a_document() {
+        // `a-b-c-d-e` 型の run は**奇数側**が集中する鏡像なので、方向規則
+        // (集中は先頭パリティに限る、codex P1 round 3) により suspect に
+        // すらならない。UTF-16BE を 1 バイトずつ読んだ列は先頭側が集中する。
+        let mut text = "The quick brown fox jumps over the lazy dog again and again. ".repeat(3);
+        text.push_str("s-a-g-a-s-h-i-r-o");
+        let pages = vec![text];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+        reject_unindexable_pages(&pages, "docs/prose.pdf")
+            .expect("prose with one hyphen-spelled token must be indexed");
+    }
+
+    #[test]
+    fn test_alternating_identifier_sheets_are_not_mojibake() {
+        // codex P1 round 3: `1A2A3A4A5A` 型の交互識別子は奇数位置だけが
+        // 集中する。UTF-16BE の byte-wise 読みでは生成されない鏡像なので、
+        // これが文書の大半を占めても (型番表・在庫表) 落としてはいけない。
+        let token = "1A2A3A4A5A";
+        let pages = vec![vec![token; 40].join(" ")];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+        reject_unindexable_pages(&pages, "docs/inventory.pdf")
+            .expect("an identifier sheet must be indexed");
+    }
+
+    /// 清音かなだけの実 PDF fixture。kb-mcp が pin する oxidize-pdf 4.1.1 では
+    /// byte-wise に化け (C1 = 0 のまま)、4.2.3 の crate ヒューリスティックは
+    /// 救済する — どちらのレジームでも「化けたものは索引に入らない」を主張する。
+    const CID_KANA_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_kana.pdf");
+
+    /// 同じ evasion のラベル配置版 (Tj ごとに Td 移動 → 抽出 run が 2 かな =
+    /// 化けて 4 文字)。長 run パリティ判定が届かない形の実 PDF (codex P1
+    /// round 2)。
+    const CID_KANA_LABELS_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_kana_labels.pdf");
+
+    #[test]
+    fn test_kana_label_sheet_mojibake_never_reaches_the_index() {
+        match PdfParser.parse_bytes(CID_KANA_LABELS_PDF, "docs/kana_labels.pdf", &[]) {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("mojibake"),
+                    "the decode failure must be named: {message}"
+                );
+            }
+            Ok(doc) => {
+                assert!(
+                    doc.chunks[0].content.contains("あか"),
+                    "if it indexes at all it must be the real text, got: {:?}",
+                    doc.chunks[0].content
+                );
+                let pages: Vec<String> = doc.chunks.iter().map(|c| c.content.clone()).collect();
+                assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+                assert_eq!(c1_control_ratio(&pages), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_kana_only_cid_mojibake_never_reaches_the_index() {
+        match PdfParser.parse_bytes(CID_KANA_PDF, "docs/kana.pdf", &[]) {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("mojibake"),
+                    "the decode failure must be named: {message}"
+                );
+            }
+            Ok(doc) => {
+                // 依存クレートが救済するレジーム: 本物のかなが入っていること。
+                assert!(
+                    doc.chunks[0].content.contains("あいうえお"),
+                    "if it indexes at all it must be the real text, got: {:?}",
+                    doc.chunks[0].content
+                );
+                let pages: Vec<String> = doc.chunks.iter().map(|c| c.content.clone()).collect();
+                assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+                assert_eq!(c1_control_ratio(&pages), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_correctly_decoded_japanese_above_the_threshold_is_accepted() {
+        let pages = vec!["再ランキングの評価について述べる。".repeat(4)];
+        reject_unindexable_pages(&pages, "docs/ja.pdf")
+            .expect("dense correctly-decoded Japanese must be indexed");
+    }
+
+    #[test]
+    fn test_sparse_pages_still_report_density_not_mojibake() {
+        // 正しく抽出できているが薄い文書は、これまで通り密度の門で落ちる。
+        // 文言が入れ替わっていないことを確認する。
+        let pages = vec!["表紙".to_string(), "図 1".to_string()];
+        let err = reject_unindexable_pages(&pages, "docs/cover.pdf")
+            .expect_err("sparse document must still be rejected");
+        let message = err.to_string();
+        assert!(message.contains("too little text"), "got: {message}");
+        assert!(!message.contains("mojibake"), "got: {message}");
     }
 
     // codex P2 follow-up (PR #69 round 2): panic hook を process-global に

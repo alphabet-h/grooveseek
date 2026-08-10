@@ -4,6 +4,62 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A PDF that decoded to mojibake was indexed silently** (AU-70). A Japanese
+  PDF whose CID-keyed font uses a predefined CMap with no `/ToUnicode` came out
+  of extraction as its UTF-16BE bytes read one at a time — `第1章 概要` became
+  `{, 1zà i…`. Nothing warned: the document was indexed, matched no query it
+  should have matched, and consumed embedding time and corpus statistics
+  regardless. Worse, mis-decoding turns one character into two, so the garbage
+  *cleared* the 50 chars/page density gate (measured 1052 chars/page) while a
+  correctly extracted Japanese slide deck (29 chars/page) was dropped — the
+  gate was admitting the unusable and rejecting the usable.
+
+  Such text is now detected and the document is skipped with a diagnosis that
+  names the decode failure instead of blaming page density. Two complementary
+  signals: C1 control codes (U+0080–U+009F) reaching 1% of the extracted
+  characters — correctly decoded text never contains them, measured 0.00%
+  across six correctly-extracted samples against 3.61–15.59% across four
+  mis-decoded ones — and, for the one shape that emits no C1 at all, the
+  alternating byte-pair signature of UTF-16BE read one byte at a time.
+  Unvoiced-kana-only text has 0x30 for every high byte and low bytes under
+  0x80, so it mis-decodes to pure ASCII (`あいうえお…` → `0B0D0F…`, 0.00% C1
+  at 407 chars/page, measured on the pinned oxidize-pdf 4.1.1) and would sail
+  through the C1 gate; its runs alternate a near-constant **leading** character with
+  varied ones — natural words never do, and the mirror orientation
+  (alternating identifiers like `1A2A3A`) is not flagged because bytewise
+  decoding cannot produce it, and ≥30% of such characters
+  rejects the document. Runs too short to judge alone — a label sheet or
+  word list splits into 4-char tokens (measured 148 chars/page) — are
+  aggregated document-wide and judged as a pool, so fragmentation does not
+  reopen the hole. Recovery is not attempted — the crate has already
+  collapsed NUL bytes to spaces by then, so the original bytes cannot be
+  reconstructed. The gates now live in one function with the ordering as its
+  documented contract, since running them the other way round is what produced
+  both failures.
+
+  The root cause is upstream in `oxidize-pdf` (4.1.1 through 4.2.2, and `main`):
+  `/DescendantFonts` is read only when the CIDFont is written as an indirect
+  reference, so a producer that writes it as a direct dictionary — ReportLab
+  does, and ISO 32000-1 permits it — leaves `descendant_font` empty, which skips
+  the `cid_encoding` branch that already resolves `UniJIS-UCS2-H` correctly.
+  Verified by A/B: two PDFs differing only in that one respect decode to
+  mojibake and to correct Japanese respectively.
+
+### Changed
+
+- **The PDF limitation notes were corrected against measurement.** README and
+  ARCHITECTURE (both languages) said Japanese and other CJK PDFs "largely do not
+  work", and that a TrueType-subset Japanese PDF "extracts so little" it trips
+  the density threshold. Re-measured 2026-08-10: that form — what Word,
+  LibreOffice and Google Docs export — extracts **correctly**, 569 chars/page on
+  a dense Japanese report. The earlier figure of 45 chars/page came from a
+  two-line test page and was the correct count for it, not evidence of loss.
+  The density threshold stays at 50: a scan carrying only digitally-added page
+  numbers and a "CONFIDENTIAL" stamp measures 39 chars/page, so lowering it
+  would admit exactly what it exists to reject.
+
 ## [0.15.0] - 2026-08-09
 
 ### Fixed
