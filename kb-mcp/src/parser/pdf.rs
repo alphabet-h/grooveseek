@@ -91,10 +91,11 @@ const MISDECODED_C1_RATIO: f64 = 0.01;
 ///
 /// **判定条件** (run = 空白区切り、全文字 < U+0100)。run の長さで 2 経路:
 ///
-/// - **6 文字以上**: run 単体でパリティ判定 —
+/// - **8 文字以上**: run 単体でパリティ判定 —
 ///   `min(偶数位置の文字種, 奇数位置の文字種) <= 2` かつ `max(...) >= 4`。
 ///   片側 2 種以下 = 上位バイトの集中、逆側 4 種以上 = 実データの多様性。
-/// - **2〜5 文字**: 単体では統計にならないので**文書全体でペアを集約**し、
+/// - **2〜7 文字** (per-run 判定が発火可能になる 8 文字未満):
+///   単体では統計にならないので**文書全体でペアを集約**し、
 ///   「ペア 12 組以上 + 先頭上位 2 種で 90% 以上 + 後続 6 種以上」で
 ///   プールごと suspect にする (codex P1 round 2: ラベル / 単語リストは
 ///   run が 2〜4 文字に割れ、per-run 判定だけでは素通りした —
@@ -227,7 +228,11 @@ fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
             if chars.len() < 2 || chars.iter().any(|c| (*c as u32) >= 0x100) {
                 continue;
             }
-            if chars.len() >= 6 {
+            // per-run 判定は**発火可能な長さ**から (codex P1 round 4)。
+            // `odd.len() >= 4` には奇数位置が 4 つ = 8 文字必要で、6〜7 文字を
+            // ここに送ると「原理的に発火しない判定」に吸われて pool にも
+            // 入らない死角になる (3 かな語のラベルは化けて 6 文字ちょうど)。
+            if chars.len() >= 8 {
                 let mut even = std::collections::BTreeSet::new();
                 let mut odd = std::collections::BTreeSet::new();
                 for (i, c) in chars.iter().enumerate() {
@@ -1391,6 +1396,32 @@ mod tests {
         let err = reject_unindexable_pages(&pages, "docs/labels.pdf")
             .expect_err("label-sheet mojibake must not be indexed");
         assert!(err.to_string().contains("mojibake"), "got: {err}");
+    }
+
+    #[test]
+    fn test_six_char_label_runs_are_pooled_not_orphaned() {
+        // codex P1 round 4: 3 かな語のラベルは化けて **6 文字ちょうど**になる。
+        // per-run 判定に送ると奇数位置が 3 つしかなく `odd >= 4` が原理的に
+        // 満たせず、pool にも入らない死角だった。per-run 判定は「発火可能な
+        // 長さ」(奇数位置 4 つ = 8 文字) からにし、6〜7 文字は pool へ送る。
+        let words = [
+            "あかい",
+            "いしき",
+            "うみへ",
+            "えきか",
+            "おかし",
+            "かいし",
+            "きしお",
+            "くちこ",
+        ];
+        let tokens: Vec<String> = words.iter().map(|w| misdecoded_utf16be(w)).collect();
+        let pages = vec![tokens.join(" ")];
+        assert_eq!(c1_control_ratio(&pages), 0.0, "precondition: no C1");
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "six-char label mojibake must exceed the threshold, got {ratio}"
+        );
     }
 
     #[test]
