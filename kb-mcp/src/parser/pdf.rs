@@ -41,10 +41,18 @@ const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 /// 「復号に失敗して文字化けした」と判定して文書ごと落とす閾値。
 ///
 /// **なぜ C1 なのか。** UTF-16BE のバイト列を 1 バイトずつ Latin-1 として読むと、
-/// 日本語の上位バイト (U+3040〜U+9FFF の上位 8 bit) がそのまま C1 領域に落ちる。
-/// 正常に抽出できたテキストにはこの領域の文字が現れない — WinAnsi は 0x80..0x9F
-/// を印字可能文字 (€ … ™ 等) に写像するので、C1 が生で残ること自体が
-/// 「どの符号化としても解釈されなかった」ことの証拠になる。
+/// **U+8000〜U+9FFF** (漢字ブロックの後半) の上位バイトがそのまま C1 領域に
+/// 落ちる。加えて濁点かな・「ん」等 (U+3080〜U+309F) は**下位**バイトが C1 に
+/// 落ちる (現実的なかな文で実測 7.94%)。正常に抽出できたテキストには
+/// この領域の文字が現れない — WinAnsi は 0x80..0x9F を印字可能文字 (€ … ™ 等)
+/// に写像するので、C1 が生で残ること自体が「どの符号化としても解釈されなかった」
+/// ことの証拠になる。
+///
+/// **C1 が出ない持ち場がある** (PR #132 codex P1、実測で確認): 上位バイトが
+/// 0x30 で下位バイトも 0x80 未満に収まる**清音かなだけの文書**は、化けても
+/// C1 を 1 つも出さない (`あいうえお…` → `0B0D0F0H0J…`、C1 = 0.00%、
+/// 407 chars/page で密度も通過)。そちらは [`BYTEWISE_PAIR_SIGNATURE_RATIO`]
+/// が受け持つ。
 ///
 /// **実測 (AU-70、oxidize-pdf 4.2.2、10 サンプル)** — 完全に分離した:
 ///
@@ -64,6 +72,33 @@ const SCANNED_PDF_MIN_CHARS_PER_PAGE: usize = 50;
 /// 復元は試みない — `sanitize_extracted_text` が NUL を空白へ潰した後なので
 /// 元のバイト列は再構成できない。
 const MISDECODED_C1_RATIO: f64 = 0.01;
+
+/// byte-wise UTF-16BE の**第 2 シグナル**: 非空白 run のうち「片側パリティの
+/// 文字種が極端に少なく、逆側は多様」なものが全非空白文字のこの比率以上を
+/// 占めたら文字化けとして落とす。
+///
+/// **機構。** UTF-16BE を 1 バイトずつ読むと、偶数位置は元テキストの**上位
+/// バイト列**になる。実文書の文字は少数の Unicode ブロックに集中するため、
+/// 上位バイト位置は 1〜2 種の値の繰り返しになり、下位バイト位置だけが多様に
+/// なる (`あいうえお…` → `0B0D0F0H0J…` の '0' 交互)。自然なテキストの単語に
+/// この構造は現れない (`GRIMWALD` は両パリティとも多様)。
+///
+/// **なぜ要るのか** (PR #132 codex P1、oxidize-pdf 4.1.1 実測): 清音かなの
+/// 上位バイトは 0x30、下位バイトも 0x80 未満なので [`MISDECODED_C1_RATIO`] を
+/// 完全にすり抜ける (C1 = 0.00%、407 chars/page で密度も通過 = index される)。
+/// なお 4.2.3 は crate 側のヒューリスティックで同じ入力を救済するが、
+/// **版の偶然に防御を依存させない**。
+///
+/// **判定条件** (run = 空白区切り、6 文字以上、全文字 < U+0100):
+/// `min(偶数位置の文字種, 奇数位置の文字種) <= 2` かつ `max(...) >= 4`。
+/// 片側 2 種以下 = 上位バイトの集中、逆側 4 種以上 = 実データの多様性。
+/// `1010…` のような両側単調な列や `0-0-0-…` は max < 4 で外れ、
+/// 正しくデコードされた CJK は「全文字 < U+0100」で外れる。
+///
+/// **実測**: 清音かな evasion = 1.00、English 散文 / 正常日本語 /
+/// スキャン+スタンプ = 0.00。余裕を見て 0.3。残余 FP (ハイフン綴り
+/// `a-b-c-d-e` だけで埋まった文書等) は `.dev/known-issues.md` に記録。
+const BYTEWISE_PAIR_SIGNATURE_RATIO: f64 = 0.3;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
 ///
@@ -150,6 +185,43 @@ fn c1_control_ratio(pages: &[String]) -> f64 {
     c1 as f64 / total as f64
 }
 
+/// byte-wise UTF-16BE の交互パターン (第 2 シグナル) に一致する文字の比率。
+///
+/// 判定の根拠・条件・閾値は [`BYTEWISE_PAIR_SIGNATURE_RATIO`] を参照。
+/// 分母は**全非空白文字** (CJK 含む) — 正しくデコードされた日本語文書では
+/// CJK が分母を占めて比率が 0 に寄る。文字が 1 つも無ければ `0.0`。
+fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
+    let mut suspect = 0usize;
+    let mut total = 0usize;
+    for page in pages {
+        for run in page.split_whitespace() {
+            let chars: Vec<char> = run.chars().collect();
+            total += chars.len();
+            if chars.len() < 6 || chars.iter().any(|c| (*c as u32) >= 0x100) {
+                continue;
+            }
+            let mut even = std::collections::BTreeSet::new();
+            let mut odd = std::collections::BTreeSet::new();
+            for (i, c) in chars.iter().enumerate() {
+                if i % 2 == 0 {
+                    even.insert(*c);
+                } else {
+                    odd.insert(*c);
+                }
+            }
+            let lo = even.len().min(odd.len());
+            let hi = even.len().max(odd.len());
+            if lo <= 2 && hi >= 4 {
+                suspect += chars.len();
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    suspect as f64 / total as f64
+}
+
 /// 抽出済みページを索引に入れてよいか判定する。入れてはいけないなら、
 /// **何を測ってそう判断したか**を含む `Err` を返す。
 ///
@@ -163,6 +235,9 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
     // を余裕で通過し、化けたまま索引に入る (AU-70 実測: 化けた文書が 1052
     // chars/page で通り、正しく抽出できた 29 chars/page が落ちていた)。
     // 逆順にすると、薄い化け文書に「文字が少ない」という的外れな診断も出す。
+    //
+    // シグナルは 2 つで持ち場が違う: C1 は漢字・濁点かなを含む文書を捕まえ、
+    // 交互パターンは C1 を出さない清音かな主体の文書を捕まえる (codex P1)。
     let c1_ratio = c1_control_ratio(pages);
     if c1_ratio >= MISDECODED_C1_RATIO {
         return Err(anyhow!(
@@ -174,6 +249,21 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
              is present and a viewer will show it correctly. Known trigger: a \
              CID-keyed font with a predefined CMap and no /ToUnicode",
             c1_ratio * 100.0
+        ));
+    }
+    let pair_ratio = bytewise_pair_signature_ratio(pages);
+    if pair_ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO {
+        return Err(anyhow!(
+            "{path_hint}: the text layer decoded to mojibake, not text: \
+             {:.0}% of the extracted characters alternate a near-constant \
+             character with varied ones — the signature of UTF-16BE text read \
+             one byte at a time (kana comes out as ASCII, e.g. あ becomes \
+             \"0B\") — skipping rather than indexing text that no query can \
+             match. This build could not decode the font encoding this PDF \
+             uses; the text is present and a viewer will show it correctly. \
+             Known trigger: a CID-keyed font with a predefined CMap and no \
+             /ToUnicode",
+            pair_ratio * 100.0
         ));
     }
 
@@ -1167,6 +1257,102 @@ mod tests {
                     0.0,
                     "indexed content must never contain C1 controls"
                 );
+            }
+        }
+    }
+
+    // PR #132 codex P1: 清音かなだけの文書は化けても C1 を出さない
+    // (`あ` U+3042 → `0B`)。第 2 シグナル (交互パターン) の TDD。
+
+    #[test]
+    fn test_pair_signature_flags_kana_only_bytewise_utf16() {
+        // 実測 (oxidize-pdf 4.1.1) と同じ形: C1 = 0 のまま化ける唯一の持ち場。
+        let pages = vec![misdecoded_utf16be(
+            &"あいうえおかきくけこさしすせそ".repeat(5),
+        )];
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "precondition: this evasion carries no C1"
+        );
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "kana-only bytewise UTF-16BE must exceed the threshold, got {ratio}"
+        );
+
+        let err = reject_unindexable_pages(&pages, "docs/kana.pdf")
+            .expect_err("kana-only mojibake must not be indexed");
+        assert!(err.to_string().contains("mojibake"), "got: {err}");
+    }
+
+    #[test]
+    fn test_pair_signature_is_zero_for_natural_text() {
+        // 正しくデコードされたかな (>= U+0100 で run ごと除外)、English 散文、
+        // スキャン+スタンプの ASCII。実測どおり全て 0。
+        let pages = vec![
+            "あいうえおかきくけこさしすせそ".repeat(5),
+            "This note describes the retry budget setting in detail.".to_string(),
+            "- 1 -\nCONFIDENTIAL / Scanned 2026-08-10\nGRIMWALD_RETRY_BUDGET".to_string(),
+        ];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_pair_signature_needs_a_diverse_side() {
+        // 両パリティとも単調な列は交互パターンではない (`max >= 4` 側の根拠)。
+        let pages = vec!["1010101010 0-0-0-0-0-0".to_string()];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_pair_signature_ignores_runs_shorter_than_six() {
+        // `0B0D` 単体は判定に足りない (短い断片での誤検出防止)。
+        let pages = vec!["0B0D 0F0H 0J0K".to_string()];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_one_hyphen_spelled_token_does_not_reject_a_document() {
+        // `a-b-c-d-e` 型の run は suspect になるが、文書比率 (0.3) には届かない。
+        let mut text = "The quick brown fox jumps over the lazy dog again and again. ".repeat(3);
+        text.push_str("s-a-g-a-s-h-i-r-o");
+        let pages = vec![text];
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio > 0.0 && ratio < BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "a lone spelled-out token must stay under the document threshold, got {ratio}"
+        );
+        reject_unindexable_pages(&pages, "docs/prose.pdf")
+            .expect("prose with one hyphen-spelled token must be indexed");
+    }
+
+    /// 清音かなだけの実 PDF fixture。kb-mcp が pin する oxidize-pdf 4.1.1 では
+    /// byte-wise に化け (C1 = 0 のまま)、4.2.3 の crate ヒューリスティックは
+    /// 救済する — どちらのレジームでも「化けたものは索引に入らない」を主張する。
+    const CID_KANA_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_kana.pdf");
+
+    #[test]
+    fn test_kana_only_cid_mojibake_never_reaches_the_index() {
+        match PdfParser.parse_bytes(CID_KANA_PDF, "docs/kana.pdf", &[]) {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("mojibake"),
+                    "the decode failure must be named: {message}"
+                );
+            }
+            Ok(doc) => {
+                // 依存クレートが救済するレジーム: 本物のかなが入っていること。
+                assert!(
+                    doc.chunks[0].content.contains("あいうえお"),
+                    "if it indexes at all it must be the real text, got: {:?}",
+                    doc.chunks[0].content
+                );
+                let pages: Vec<String> = doc.chunks.iter().map(|c| c.content.clone()).collect();
+                assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+                assert_eq!(c1_control_ratio(&pages), 0.0);
             }
         }
     }

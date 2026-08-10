@@ -17,14 +17,22 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   gate was admitting the unusable and rejecting the usable.
 
   Such text is now detected and the document is skipped with a diagnosis that
-  names the decode failure instead of blaming page density. The signal is C1
-  control codes (U+0080–U+009F) reaching 1% of the extracted characters:
-  correctly decoded text never contains them, measured 0.00% across six
-  correctly-extracted samples against 3.61–15.59% across four mis-decoded ones.
-  Recovery is not attempted — the crate has already collapsed NUL bytes to
-  spaces by then, so the original bytes cannot be reconstructed. The two gates
-  now live in one function with the ordering as its documented contract, since
-  running them the other way round is what produced both failures.
+  names the decode failure instead of blaming page density. Two complementary
+  signals: C1 control codes (U+0080–U+009F) reaching 1% of the extracted
+  characters — correctly decoded text never contains them, measured 0.00%
+  across six correctly-extracted samples against 3.61–15.59% across four
+  mis-decoded ones — and, for the one shape that emits no C1 at all, the
+  alternating byte-pair signature of UTF-16BE read one byte at a time.
+  Unvoiced-kana-only text has 0x30 for every high byte and low bytes under
+  0x80, so it mis-decodes to pure ASCII (`あいうえお…` → `0B0D0F…`, 0.00% C1
+  at 407 chars/page, measured on the pinned oxidize-pdf 4.1.1) and would sail
+  through the C1 gate; its runs alternate a near-constant character with
+  varied ones, which natural words never do, and ≥30% of such characters
+  rejects the document. Recovery is not attempted — the crate has already
+  collapsed NUL bytes to spaces by then, so the original bytes cannot be
+  reconstructed. The gates now live in one function with the ordering as its
+  documented contract, since running them the other way round is what produced
+  both failures.
 
   The root cause is upstream in `oxidize-pdf` (4.1.1 through 4.2.2, and `main`):
   `/DescendantFonts` is read only when the CIDFont is written as an indirect
