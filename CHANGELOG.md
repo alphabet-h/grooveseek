@@ -28,7 +28,10 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   at 407 chars/page, measured on the pinned oxidize-pdf 4.1.1) and would sail
   through the C1 gate; its runs alternate a near-constant character with
   varied ones, which natural words never do, and ≥30% of such characters
-  rejects the document. Recovery is not attempted — the crate has already
+  rejects the document. Runs too short to judge alone — a label sheet or
+  word list splits into 4-char tokens (measured 148 chars/page) — are
+  aggregated document-wide and judged as a pool, so fragmentation does not
+  reopen the hole. Recovery is not attempted — the crate has already
   collapsed NUL bytes to spaces by then, so the original bytes cannot be
   reconstructed. The gates now live in one function with the ordering as its
   documented contract, since running them the other way round is what produced

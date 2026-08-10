@@ -89,15 +89,24 @@ const MISDECODED_C1_RATIO: f64 = 0.01;
 /// なお 4.2.3 は crate 側のヒューリスティックで同じ入力を救済するが、
 /// **版の偶然に防御を依存させない**。
 ///
-/// **判定条件** (run = 空白区切り、6 文字以上、全文字 < U+0100):
-/// `min(偶数位置の文字種, 奇数位置の文字種) <= 2` かつ `max(...) >= 4`。
-/// 片側 2 種以下 = 上位バイトの集中、逆側 4 種以上 = 実データの多様性。
-/// `1010…` のような両側単調な列や `0-0-0-…` は max < 4 で外れ、
+/// **判定条件** (run = 空白区切り、全文字 < U+0100)。run の長さで 2 経路:
+///
+/// - **6 文字以上**: run 単体でパリティ判定 —
+///   `min(偶数位置の文字種, 奇数位置の文字種) <= 2` かつ `max(...) >= 4`。
+///   片側 2 種以下 = 上位バイトの集中、逆側 4 種以上 = 実データの多様性。
+/// - **2〜5 文字**: 単体では統計にならないので**文書全体でペアを集約**し、
+///   「ペア 12 組以上 + 先頭上位 2 種で 90% 以上 + 後続 6 種以上」で
+///   プールごと suspect にする (codex P1 round 2: ラベル / 単語リストは
+///   run が 2〜4 文字に割れ、per-run 判定だけでは素通りした —
+///   実 PDF で 148 chars/page・C1 0.00% を実測)。
+///
+/// `1010…` や `0-0-0-…` のような両側単調な列は多様性条件で外れ、
 /// 正しくデコードされた CJK は「全文字 < U+0100」で外れる。
 ///
-/// **実測**: 清音かな evasion = 1.00、English 散文 / 正常日本語 /
-/// スキャン+スタンプ = 0.00。余裕を見て 0.3。残余 FP (ハイフン綴り
-/// `a-b-c-d-e` だけで埋まった文書等) は `.dev/known-issues.md` に記録。
+/// **実測**: 清音かな evasion (長 run) = 1.00、ラベル配置 (短 run) ≈ 0.80、
+/// English 散文 / 正常日本語 / スキャン+スタンプ = 0.00。余裕を見て 0.3。
+/// 残余 FP (ハイフン綴りや `$5 $9 $12…` のような「定数 + 多様」短トークンが
+/// 文書の 3 割を占める場合) は `.dev/known-issues.md` に記録。
 const BYTEWISE_PAIR_SIGNATURE_RATIO: f64 = 0.3;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
@@ -191,29 +200,63 @@ fn c1_control_ratio(pages: &[String]) -> f64 {
 /// 分母は**全非空白文字** (CJK 含む) — 正しくデコードされた日本語文書では
 /// CJK が分母を占めて比率が 0 に寄る。文字が 1 つも無ければ `0.0`。
 fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
+    // 長い run (6 文字以上) は run 単体でパリティ判定できる。短い run は
+    // 単体では統計にならないので、**文書全体でペアを集約**して判定する
+    // (codex P1 round 2: ラベル / 単語リストは 1 run が 2〜4 文字になり、
+    // per-run 判定だけでは全部捨てられて ratio が 0 のまま index された —
+    // 実測 148 chars/page・C1 0.00% で両方の門を通過)。
     let mut suspect = 0usize;
     let mut total = 0usize;
+    // 短 run の集約バッファ: 先頭要素 (= 上位バイト位置) の頻度、後続要素の
+    // 種類、ペアに入った文字数、由来 run の文字数合計。
+    let mut short_first_freq: std::collections::BTreeMap<char, usize> =
+        std::collections::BTreeMap::new();
+    let mut short_seconds = std::collections::BTreeSet::new();
+    let mut short_pairs = 0usize;
+    let mut short_run_chars = 0usize;
     for page in pages {
         for run in page.split_whitespace() {
             let chars: Vec<char> = run.chars().collect();
             total += chars.len();
-            if chars.len() < 6 || chars.iter().any(|c| (*c as u32) >= 0x100) {
+            if chars.len() < 2 || chars.iter().any(|c| (*c as u32) >= 0x100) {
                 continue;
             }
-            let mut even = std::collections::BTreeSet::new();
-            let mut odd = std::collections::BTreeSet::new();
-            for (i, c) in chars.iter().enumerate() {
-                if i % 2 == 0 {
-                    even.insert(*c);
-                } else {
-                    odd.insert(*c);
+            if chars.len() >= 6 {
+                let mut even = std::collections::BTreeSet::new();
+                let mut odd = std::collections::BTreeSet::new();
+                for (i, c) in chars.iter().enumerate() {
+                    if i % 2 == 0 {
+                        even.insert(*c);
+                    } else {
+                        odd.insert(*c);
+                    }
+                }
+                let lo = even.len().min(odd.len());
+                let hi = even.len().max(odd.len());
+                if lo <= 2 && hi >= 4 {
+                    suspect += chars.len();
+                }
+            } else {
+                short_run_chars += chars.len();
+                for pair in chars.chunks_exact(2) {
+                    *short_first_freq.entry(pair[0]).or_insert(0) += 1;
+                    short_seconds.insert(pair[1]);
+                    short_pairs += 1;
                 }
             }
-            let lo = even.len().min(odd.len());
-            let hi = even.len().max(odd.len());
-            if lo <= 2 && hi >= 4 {
-                suspect += chars.len();
-            }
+        }
+    }
+    // 短 run プールの一括判定。UTF-16BE を 1 バイトずつ読んだ列は、ペアの
+    // 先頭 (上位バイト) が 1〜2 種に集中し、後続だけが多様になる。閾値:
+    // - ペア 12 組 (24 文字) 未満は証拠不足 (散文中の数トークンで誤検出しない)
+    // - 先頭上位 2 種で 90% 以上 (English の短語プールは先頭が多様なので落ちる)
+    // - 後続 6 種以上 (`1010…` や `0-0-0` のような両側単調な列を外す)
+    if short_pairs >= 12 && short_seconds.len() >= 6 {
+        let mut counts: Vec<usize> = short_first_freq.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let top2: usize = counts.iter().take(2).sum();
+        if top2 as f64 / short_pairs as f64 >= 0.9 {
+            suspect += short_run_chars;
         }
     }
     if total == 0 {
@@ -1306,9 +1349,49 @@ mod tests {
     }
 
     #[test]
-    fn test_pair_signature_ignores_runs_shorter_than_six() {
-        // `0B0D` 単体は判定に足りない (短い断片での誤検出防止)。
+    fn test_a_handful_of_short_fragments_is_not_enough_evidence() {
+        // 6 ペア (12 文字) は短 run 集約の証拠下限 (12 ペア) に届かない。
+        // 散文に紛れた数トークンで文書を落とさないための下限。
         let pages = vec!["0B0D 0F0H 0J0K".to_string()];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
+    #[test]
+    fn test_pair_signature_aggregates_short_label_runs() {
+        // codex P1 round 2 (実測 148 chars/page で再現): ラベル / 単語リストは
+        // 1 run が 2〜4 文字になり、per-run 判定では全部捨てられていた。
+        // 短 run のペアを文書全体で集約すれば、先頭要素の集中 (上位バイト =
+        // ほぼ '0') と後続の多様性が浮かび上がる。
+        let words = [
+            "あか", "いし", "うみ", "えき", "おか", "かい", "きし", "くち", "けさ", "こい", "さか",
+            "しお", "すし", "せき", "そこ", "たか", "ちか", "つち", "てつ", "とし",
+        ];
+        let tokens: Vec<String> = words.iter().map(|w| misdecoded_utf16be(w)).collect();
+        let pages = vec![tokens.join(" ")];
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "precondition: no C1 in this evasion"
+        );
+        let ratio = bytewise_pair_signature_ratio(&pages);
+        assert!(
+            ratio >= BYTEWISE_PAIR_SIGNATURE_RATIO,
+            "aggregated short-run mojibake must exceed the threshold, got {ratio}"
+        );
+        let err = reject_unindexable_pages(&pages, "docs/labels.pdf")
+            .expect_err("label-sheet mojibake must not be indexed");
+        assert!(err.to_string().contains("mojibake"), "got: {err}");
+    }
+
+    #[test]
+    fn test_short_english_words_do_not_aggregate_into_a_signature() {
+        // 英語散文の短語プールはペア先頭が多様 (share < 0.9) なので集約しても
+        // signature にならない。12 ペアの証拠下限を大きく超える量で確認する。
+        let pages = vec![
+            "an of to it we he is at on by up as in so no go do my me two \
+             ten one six own old new not now far few for the and but was"
+                .to_string(),
+        ];
         assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
     }
 
@@ -1332,6 +1415,35 @@ mod tests {
     /// 救済する — どちらのレジームでも「化けたものは索引に入らない」を主張する。
     const CID_KANA_PDF: &[u8] =
         include_bytes!("../../tests/fixtures/binary/cid_descendant_kana.pdf");
+
+    /// 同じ evasion のラベル配置版 (Tj ごとに Td 移動 → 抽出 run が 2 かな =
+    /// 化けて 4 文字)。長 run パリティ判定が届かない形の実 PDF (codex P1
+    /// round 2)。
+    const CID_KANA_LABELS_PDF: &[u8] =
+        include_bytes!("../../tests/fixtures/binary/cid_descendant_kana_labels.pdf");
+
+    #[test]
+    fn test_kana_label_sheet_mojibake_never_reaches_the_index() {
+        match PdfParser.parse_bytes(CID_KANA_LABELS_PDF, "docs/kana_labels.pdf", &[]) {
+            Err(err) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("mojibake"),
+                    "the decode failure must be named: {message}"
+                );
+            }
+            Ok(doc) => {
+                assert!(
+                    doc.chunks[0].content.contains("あか"),
+                    "if it indexes at all it must be the real text, got: {:?}",
+                    doc.chunks[0].content
+                );
+                let pages: Vec<String> = doc.chunks.iter().map(|c| c.content.clone()).collect();
+                assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+                assert_eq!(c1_control_ratio(&pages), 0.0);
+            }
+        }
+    }
 
     #[test]
     fn test_kana_only_cid_mojibake_never_reaches_the_index() {
