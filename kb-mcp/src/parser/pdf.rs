@@ -103,10 +103,16 @@ const MISDECODED_C1_RATIO: f64 = 0.01;
 /// `1010…` や `0-0-0-…` のような両側単調な列は多様性条件で外れ、
 /// 正しくデコードされた CJK は「全文字 < U+0100」で外れる。
 ///
+/// **方向規則** (codex P1 round 3): 集中は**先頭パリティ側に限る**。UTF-16BE
+/// の byte-wise 読みは上位バイト = 先頭側だけが集中し、逆向き (`1A2A3A…` の
+/// ような交互識別子 = 後続側の集中) はこの機構では生成されない。対称に見ると
+/// 型番表・在庫表を誤って落とすだけで検出は 1 つも増えない。
+///
 /// **実測**: 清音かな evasion (長 run) = 1.00、ラベル配置 (短 run) ≈ 0.80、
-/// English 散文 / 正常日本語 / スキャン+スタンプ = 0.00。余裕を見て 0.3。
-/// 残余 FP (ハイフン綴りや `$5 $9 $12…` のような「定数 + 多様」短トークンが
-/// 文書の 3 割を占める場合) は `.dev/known-issues.md` に記録。
+/// English 散文 / 正常日本語 / スキャン+スタンプ / 交互識別子表 = 0.00。
+/// 余裕を見て 0.3。残余 FP (`$5 $9 $12…` や `A1 A2 A3…` のような
+/// 「先頭が定数 + 後続が多様」の短トークンだけで文書の 3 割を占める場合 —
+/// 機構上 U+41xx 圏のテキストと区別できない) は `.dev/known-issues.md` に記録。
 const BYTEWISE_PAIR_SIGNATURE_RATIO: f64 = 0.3;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
@@ -231,9 +237,13 @@ fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
                         odd.insert(*c);
                     }
                 }
-                let lo = even.len().min(odd.len());
-                let hi = even.len().max(odd.len());
-                if lo <= 2 && hi >= 4 {
+                // 集中側は**先頭 (偶数) パリティに限る** (codex P1 round 3)。
+                // UTF-16BE を 1 バイトずつ読んだ run は上位バイト = 先頭側が
+                // 集中する。逆向き (`1A2A3A…` のような交互識別子 = 奇数側が
+                // 集中) はこの機構では生成されないので、対称に見ると型番表・
+                // 在庫表を誤って落とすだけで検出は 1 つも増えない。短 run 集約
+                // (下) がペア先頭だけを数えるのと同じ方向規則。
+                if even.len() <= 2 && odd.len() >= 4 {
                     suspect += chars.len();
                 }
             } else {
@@ -1397,17 +1407,27 @@ mod tests {
 
     #[test]
     fn test_one_hyphen_spelled_token_does_not_reject_a_document() {
-        // `a-b-c-d-e` 型の run は suspect になるが、文書比率 (0.3) には届かない。
+        // `a-b-c-d-e` 型の run は**奇数側**が集中する鏡像なので、方向規則
+        // (集中は先頭パリティに限る、codex P1 round 3) により suspect に
+        // すらならない。UTF-16BE を 1 バイトずつ読んだ列は先頭側が集中する。
         let mut text = "The quick brown fox jumps over the lazy dog again and again. ".repeat(3);
         text.push_str("s-a-g-a-s-h-i-r-o");
         let pages = vec![text];
-        let ratio = bytewise_pair_signature_ratio(&pages);
-        assert!(
-            ratio > 0.0 && ratio < BYTEWISE_PAIR_SIGNATURE_RATIO,
-            "a lone spelled-out token must stay under the document threshold, got {ratio}"
-        );
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
         reject_unindexable_pages(&pages, "docs/prose.pdf")
             .expect("prose with one hyphen-spelled token must be indexed");
+    }
+
+    #[test]
+    fn test_alternating_identifier_sheets_are_not_mojibake() {
+        // codex P1 round 3: `1A2A3A4A5A` 型の交互識別子は奇数位置だけが
+        // 集中する。UTF-16BE の byte-wise 読みでは生成されない鏡像なので、
+        // これが文書の大半を占めても (型番表・在庫表) 落としてはいけない。
+        let token = "1A2A3A4A5A";
+        let pages = vec![vec![token; 40].join(" ")];
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+        reject_unindexable_pages(&pages, "docs/inventory.pdf")
+            .expect("an identifier sheet must be indexed");
     }
 
     /// 清音かなだけの実 PDF fixture。kb-mcp が pin する oxidize-pdf 4.1.1 では

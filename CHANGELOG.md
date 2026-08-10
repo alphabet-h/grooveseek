@@ -26,8 +26,10 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   Unvoiced-kana-only text has 0x30 for every high byte and low bytes under
   0x80, so it mis-decodes to pure ASCII (`あいうえお…` → `0B0D0F…`, 0.00% C1
   at 407 chars/page, measured on the pinned oxidize-pdf 4.1.1) and would sail
-  through the C1 gate; its runs alternate a near-constant character with
-  varied ones, which natural words never do, and ≥30% of such characters
+  through the C1 gate; its runs alternate a near-constant **leading** character with
+  varied ones — natural words never do, and the mirror orientation
+  (alternating identifiers like `1A2A3A`) is not flagged because bytewise
+  decoding cannot produce it, and ≥30% of such characters
   rejects the document. Runs too short to judge alone — a label sheet or
   word list splits into 4-char tokens (measured 148 chars/page) — are
   aggregated document-wide and judged as a pool, so fragmentation does not
