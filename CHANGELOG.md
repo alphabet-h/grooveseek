@@ -20,6 +20,18 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **The hybrid search now has a test that fails when the full-text half stops
+  contributing** (BU-04). Every existing fusion test gave the FTS-matching
+  chunk the same embedding as the query, so the vector half alone put it first
+  and the assertion held whether or not FTS returned anything. Measured: with
+  `build_fts_query` stubbed to return `None` for *every* query,
+  `test_search_hybrid_japanese_trigram` still passes. That is why the defect
+  fixed in 0.16.0 survived fifteen releases.
+
+  The new test inverts the layout — the FTS-matching chunk is the *farther* one
+  and a decoy sits exactly on the query vector — so the top rank flips the
+  moment the full-text half goes quiet.
+
 - **Text files are now size-capped at index time** (BU-02). The 50 MiB raw-byte
   guard applied only to binary formats; `binary_size_exceeded` returned "fine"
   for anything else without even calling `stat`. A single oversized `.md` under
