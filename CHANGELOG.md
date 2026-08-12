@@ -59,6 +59,20 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **A query that exceeds the phrase cap now says so** (BU-31). Past 32 distinct
+  phrases the trailing ones are dropped, so the search still succeeds and
+  simply looks for less than was asked — a silent recall loss, logged at
+  `debug` where nobody would see it. It is a `warn` now, naming how many
+  phrases were dropped.
+
+  The cap itself stays at 32. Measured across 37 golden queries, the largest
+  produced 9 phrases, so the cap does not bind on real queries; halving it
+  would halve the worst-case full-text cost (BU-03) and equally halve the query
+  length at which genuine truncation begins. Given the choice between a visible
+  bounded cost and a silent quality loss, the cost was kept. A test pins that
+  realistic queries retain at least 2× headroom, so a future change that makes
+  ordinary queries approach the cap fails rather than quietly truncating.
+
 - **The hybrid search now has a test that fails when the full-text half stops
   contributing** (BU-04). Every existing fusion test gave the FTS-matching
   chunk the same embedding as the query, so the vector half alone put it first

@@ -17,7 +17,7 @@
 //! | 1. quote セグメント化 | [`split_quotes`] |
 //! | 2. whitespace 分割 + 3. 文字種 run 分割 | [`split_groups`] + [`split_runs`] |
 //! | 4. 短 run の隣接結合と独立 emit | [`emit_group`] |
-//! | 5. dedup / 上限 | [`dedup_and_cap`] ([`query_phrases`] の末尾) |
+//! | 5. dedup / 上限 | [`dedup_and_cap_counted`] ([`query_phrases_counted`] の末尾) |
 //! | 5. phrase 化 + 6. fallback | [`build_fts_query`] + [`fallback_whole_query`] |
 //!
 //! [`query_phrases`] が式に組み立てる**前**の phrase 内容を返すのは、
@@ -281,29 +281,36 @@ fn concat(rs: &[Run<'_>]) -> String {
     rs.iter().map(|r| r.text).collect()
 }
 
-/// 重複除去 (初出保持) と上限の適用 (spec 手順 5)。
+/// 重複除去 (初出保持) と上限の適用 (spec 手順 5)。落とした **distinct** phrase 数を
+/// 第 2 要素で返す。
 ///
 /// 重複を先に落としてから上限で切る。逆順にすると重複が枠を食って情報量が減る。
-fn dedup_and_cap(phrases: Vec<String>) -> Vec<String> {
+/// 重複は「落とした」に**数えない** — 数えると、上限に当たっていないクエリで警告が
+/// 出て信用されなくなる。
+///
+/// 副作用を持たないのは意図的で、警告を出すかどうかの判断をログ収集なしでテスト
+/// できるようにするため (`.dev` の罠 W-7 と同じ理由 — script 生成と subprocess 起動を
+/// 混ぜると assert する手段が実行しかなくなる、という前例)。実際の warn は
+/// [`build_fts_query`] にある。
+fn dedup_and_cap_counted(phrases: Vec<String>) -> (Vec<String>, usize) {
     let mut seen = std::collections::HashSet::new();
     let mut kept: Vec<String> = Vec::new();
-    let mut truncated = false;
+    let mut dropped: usize = 0;
 
     for p in phrases {
         if !seen.insert(p.clone()) {
             continue;
         }
+        // 上限に達しても走査は続ける。落とした数を報告するためで、入力はクエリ長で
+        // bound されているので追加コストは無視できる。
         if kept.len() == MAX_PHRASES {
-            truncated = true;
-            break;
+            dropped += 1;
+            continue;
         }
         kept.push(p);
     }
 
-    if truncated {
-        tracing::debug!(max = MAX_PHRASES, "fts_query: truncating to the phrase cap");
-    }
-    kept
+    (kept, dropped)
 }
 
 /// token 化で phrase が 1 つも作れなかったときの逃げ道 (spec 手順 6)。
@@ -323,11 +330,42 @@ fn fallback_whole_query(raw: &str) -> Option<String> {
     Some(format!("\"{}\"", trimmed.replace('"', "\"\"")))
 }
 
+/// 切り詰め警告の発火点。テストが「1 検索につき 1 回」を数えられるよう関数にしてある。
+fn emit_truncation_warning(dropped: usize) {
+    #[cfg(test)]
+    TRUNCATION_WARNINGS.with(|c| c.set(c.get() + 1));
+    tracing::warn!(
+        max = MAX_PHRASES,
+        dropped,
+        "fts_query: query exceeded the phrase cap; trailing phrases were dropped, \
+         so the full-text half searched for less than the query asked for"
+    );
+}
+
+// 切り詰め警告の発火回数 (テスト専用)。`compute_match_spans` がヒットごとに
+// `query_phrases` を呼ぶため、そこで警告すると 1 検索で N+1 回出てしまう。
+#[cfg(test)]
+thread_local! {
+    static TRUNCATION_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// クエリ文字列を FTS5 の MATCH 式にコンパイルする。
 ///
 /// `None` は「FTS 側に投げるものが無い」= 呼び出し側は vector 単独で検索する、の意味。
+///
+/// 切り詰めの警告 (BU-31) は**ここだけ**で出す。1 検索につき 1 回しか呼ばれない唯一の
+/// 経路だからで、理由は [`query_phrases_counted`] の doc を参照。上限に当たると落ちるのは
+/// クエリ**末尾**の phrase なので、検索は成功したまま recall だけが静かに下がる —
+/// 気付けない類の劣化である。dogfood の golden 37 件では phrase 数の最大が 9 で、
+/// この上限は**実クエリに当たっていない**と実測できている。したがって発火自体が稀であり、
+/// 発火したらそれ自体が「そんなに長いクエリが来ている」という見る価値のある信号になる。
+/// (上限を下げれば最悪コストは下がるが、静かな切り詰めが始まる長さも下がるため、
+/// 値ではなく可視性の側を直した。計測値は台帳 BU-31 と ADR-0002 を参照)
 pub(super) fn build_fts_query(raw: &str) -> Option<String> {
-    let phrases = query_phrases(raw);
+    let (phrases, dropped) = query_phrases_counted(raw);
+    if dropped > 0 {
+        emit_truncation_warning(dropped);
+    }
     if phrases.is_empty() {
         return fallback_whole_query(raw);
     }
@@ -350,6 +388,17 @@ pub(super) fn build_fts_query(raw: &str) -> Option<String> {
 /// 空 `Vec` は「token 化では phrase を作れなかった」= 呼び出し側が全体 fallback を
 /// 判断する、の意味。
 pub(crate) fn query_phrases(raw: &str) -> Vec<String> {
+    query_phrases_counted(raw).0
+}
+
+/// [`query_phrases`] に「上限で落とした distinct phrase 数」を添えた版。
+///
+/// 切り詰めの警告を出してよいのは **1 検索あたり 1 回**、すなわち
+/// [`build_fts_query`] だけである。[`query_phrases`] は
+/// `server::compute_match_spans` が**ヒットごとに**呼ぶので、そちらで警告すると
+/// N 件ヒットしたクエリが同じ警告を N+1 回出す (codex review P2、PR #138)。
+/// 稀にしか出ないことが信号としての価値を作っているので、それを潰さない。
+fn query_phrases_counted(raw: &str) -> (Vec<String>, usize) {
     let mut phrases = Vec::new();
 
     for seg in split_quotes(raw) {
@@ -373,7 +422,7 @@ pub(crate) fn query_phrases(raw: &str) -> Vec<String> {
         }
     }
 
-    dedup_and_cap(phrases)
+    dedup_and_cap_counted(phrases)
 }
 
 #[cfg(test)]
@@ -517,7 +566,7 @@ mod tests {
             input.push(format!("w{i:02}"));
         }
         // 重複が枠を食うなら distinct は 31 個で止まる。
-        assert_eq!(dedup_and_cap(input).len(), MAX_PHRASES);
+        assert_eq!(dedup_and_cap_counted(input).0.len(), MAX_PHRASES);
     }
 
     /// `compute_match_spans` はこの関数の結果を term として使う。式に組み立てる前の
@@ -644,10 +693,99 @@ mod tests {
         assert_eq!(phrases[MAX_PHRASES - 1], "\"w31\"");
         assert!(!out.contains("w32"));
 
-        // 重複が 1 つ混ざっても distinct が 32 個あるなら 32 個残る。
+        // 重複が 1 つ混ざっても distinct が上限個あるなら上限個残る。
         let mut with_dup = vec!["w00".to_string()];
-        with_dup.extend((0..32).map(|i| format!("w{i:02}")));
-        assert_eq!(q(&with_dup.join(" ")).unwrap().split(" OR ").count(), 32);
+        with_dup.extend((0..MAX_PHRASES).map(|i| format!("w{i:02}")));
+        assert_eq!(
+            q(&with_dup.join(" ")).unwrap().split(" OR ").count(),
+            MAX_PHRASES
+        );
+    }
+
+    /// (BU-31) 切り詰めが起きたかどうかを、ログを捕まえずに固定する。
+    ///
+    /// 警告を出す条件そのものをテストしておかないと、`dropped > 0` の分岐が壊れても
+    /// 誰も気付かない — まさに「上限に当たったのに静かなまま」という、この変更が
+    /// 潰そうとしている状態に戻る。
+    #[test]
+    fn the_cap_reports_how_many_distinct_phrases_it_dropped() {
+        let over: Vec<String> = (0..MAX_PHRASES + 5).map(|i| format!("w{i:02}")).collect();
+        let (kept, dropped) = dedup_and_cap_counted(over);
+        assert_eq!(kept.len(), MAX_PHRASES);
+        assert_eq!(dropped, 5, "distinct phrases past the cap are counted");
+
+        let exact: Vec<String> = (0..MAX_PHRASES).map(|i| format!("w{i:02}")).collect();
+        assert_eq!(
+            dedup_and_cap_counted(exact).1,
+            0,
+            "exactly at the cap is not truncation"
+        );
+
+        // 重複は「落とした」に数えない。数えてしまうと、上限に当たっていないクエリで
+        // 警告が出る (= 警告が信用されなくなる)。
+        let dupes = vec!["a".to_string(), "a".to_string(), "b".to_string()];
+        let (kept, dropped) = dedup_and_cap_counted(dupes);
+        assert_eq!(kept, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(dropped, 0);
+    }
+
+    /// (BU-31、codex review P2 on PR #138) 切り詰め警告は **1 検索につき 1 回**。
+    ///
+    /// `server::compute_match_spans` は citation の offset を求めるために
+    /// **ヒットごとに** [`query_phrases`] を呼ぶ。警告を分割側に置くと、N 件返した
+    /// クエリが同じ警告を N+1 回出し、「稀だから見る価値がある」という性質が消える。
+    /// 発火点を [`build_fts_query`] (1 検索 1 回) に限ることを、発火回数で固定する。
+    #[test]
+    fn the_truncation_warning_fires_once_per_search_not_once_per_hit() {
+        let over: Vec<String> = (0..MAX_PHRASES + 5).map(|i| format!("w{i:02}")).collect();
+        let capped = over.join(" ");
+
+        TRUNCATION_WARNINGS.with(|c| c.set(0));
+        // span 用の分割を 5 ヒットぶん呼んでも警告は出ない。
+        for _ in 0..5 {
+            let _ = query_phrases(&capped);
+        }
+        assert_eq!(
+            TRUNCATION_WARNINGS.with(|c| c.get()),
+            0,
+            "the per-hit span path must stay silent"
+        );
+
+        let _ = build_fts_query(&capped);
+        assert_eq!(
+            TRUNCATION_WARNINGS.with(|c| c.get()),
+            1,
+            "compiling the query is the one place that should warn"
+        );
+    }
+
+    /// (BU-31) 現実的な長さのクエリは上限に**当たらない**。
+    ///
+    /// 上限に当たるとクエリ末尾の phrase が黙って落ち、検索は成功したまま recall だけ
+    /// 下がる。dogfood の golden 37 件を実測したところ phrase 数の最大は **9** で、
+    /// 上限 32 には遠かった。ここではその余裕を固定する — 上限を下げる変更や、
+    /// 1 語からより多くの phrase を出す変更 (独立 emit の拡張など) が余裕を食い潰したら
+    /// このテストが落ちる。
+    ///
+    /// クエリは実 golden の**転記ではなく**、同等の長さと構成 (日本語の自然文 /
+    /// 日英混在 + 製品名 / 英語キーワード列) で書いた合成物。
+    #[test]
+    fn realistic_queries_stay_well_under_the_phrase_cap() {
+        let realistic = [
+            "ハイブリッド検索の再ランキングをどう評価するか",
+            "Foundry Local と ONNX Runtime の互換 API 設定手順",
+            "context window compaction strategies for long agent sessions",
+            "MCP サーバをトランスポート別に整理した比較表はどこか",
+        ];
+        for raw in realistic {
+            let n = query_phrases(raw).len();
+            assert!(
+                n * 2 <= MAX_PHRASES,
+                "a realistic query should leave at least 2x headroom under the cap, \
+                 otherwise ordinary queries are one edit away from silent truncation; \
+                 {n} phrases from {raw:?} against a cap of {MAX_PHRASES}"
+            );
+        }
     }
 
     #[test]
