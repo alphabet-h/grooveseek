@@ -63,7 +63,7 @@ match_spans  → top-`limit` SearchHit を
 - 3 文字に届かない群は連結相手がいない (連結は Separator を跨がない) ので **落ちる** = 式に入らない: `AI について` は `"について"` だけを、`ML pipelines` は `"pipelines"` だけを検索する。短い語だけを quote しても救えない — 3 文字未満の quoted phrase は同じ下限で落ちるため。`"AI について"` のように下限を超える広さで区間ごと quote すれば残せるが、その区間は逐語検索になる。下限そのものは避けられない — trigram tokenizer では 3 文字未満の phrase は何にもマッチしない
 - phrase 列は重複除去し、32 個で打ち切り、` OR ` で結合する
 
-つまり `再ランキングの評価について` は `"再ランキング" OR "ランキング" OR "の評価" OR "について"` に、`"Foundry Local" の設定` は `"Foundry Local" OR "の設定"` になる。v0.16.0 より前はクエリ全体を 1 個の phrase にしていたが、trigram tokenizer の上ではこれは逐語の部分文字列検索であり、日本語の自然文クエリでは FTS 候補が 0 件だった — hybrid の FTS 半身が実質死んでおり、ベクトル側だけが動いていた。
+つまり `再ランキングの評価について` は `"再ランキング" OR "ランキング" OR "の評価" OR "について"` に、`"Foundry Local" の設定` は `"Foundry Local" OR "の設定"` になる。v0.16.0 より前はクエリ全体を 1 個の phrase にしていたが、trigram tokenizer の上ではこれは逐語の部分文字列検索であり、日本語の自然文クエリでは FTS 候補が 0 件だった — hybrid の FTS 半身が実質死んでおり、ベクトル側だけが動いていた。形態素解析ではなく字種境界を選んだ理由と、この変更が検索品質に与えた影響は [ADR-0002](./decisions/0002-compile-queries-into-per-token-fts-phrases.ja.md) にある。
 
 トークン化で phrase が 1 つも作れなかった場合 — `AI と ML` のように全断片が下限未満のケース — は、trim 後のクエリ全体が旧来の 1 phrase 形式に fallback するので、この形のクエリが後退することはない。FTS を完全に飛ばしてベクトル単独になるのは、trim 後に 3 文字未満のクエリだけである。クエリ全体を quote すれば旧来の逐語検索をそのまま再現できる。これは query 側だけの変更で、index も schema も tokenizer も変えていない = **再 index は不要**。
 
