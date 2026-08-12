@@ -6,10 +6,12 @@
 //! 「default 維持を推奨」という結論のどちらかである。
 //!
 //! 設計の要点 (spec feature-47 D-8〜D-11):
-//! - FTS は `sanitize_fts_query` がクエリ全体を単一 phrase 化するため実質
-//!   verbatim 部分文字列検索であり、**query が逐語で 2 件以上の chunk に
-//!   出現する場合にしか fusion パラメータは効かない**。効く query 数を
-//!   「実効 N」として先に測り、0 なら掃引せず exit 2 で終わる
+//! - fusion パラメータが効くのは **FTS が 2 件以上の候補を返す query だけ**である。
+//!   効く query 数を「実効 N」として先に測り、0 なら掃引せず exit 2 で終わる。
+//!   v0.15.x までは `sanitize_fts_query` がクエリ全体を単一 phrase 化していたため
+//!   これは「query が逐語で出現する場合だけ」を意味したが、feature-48 (v0.16.0) で
+//!   `db::fts_query::build_fts_query` が文字種 token の OR 式にコンパイルするように
+//!   なったので、自然文 query でも実効になり得る
 //! - grid は「query embedding 一括 → vec 候補 query あたり 1 回 → FTS 候補
 //!   bm25 条件ごと 1 回 → rrf_k はメモリ内」の 4 層に因数分解される
 //! - 小 golden set の argmax は overfit するので、nested leave-one-query-out
@@ -1247,7 +1249,8 @@ mod tests {
 
     #[test]
     fn test_count_fts_matches_counts_phrase_hits() {
-        // D-11-6 の phrase doc-freq 診断の土台。
+        // D-11-6 の doc-freq 診断の土台。feature-48 (v0.16.0) 以降、これは
+        // 「単一 phrase の doc-freq」ではなく **OR 集合の和集合の大きさ** を数える。
         let db = tune_db();
         add_doc(&db, "a.md", "Zebrafish", "zebrafish larvae in assays", 0.1);
         add_doc(&db, "b.md", "More", "the zebrafish larvae grow fast", 0.2);
@@ -1256,7 +1259,12 @@ mod tests {
         assert_eq!(db.count_fts_matches("zebrafish larvae").unwrap(), 2);
         assert_eq!(db.count_fts_matches("unrelated prose").unwrap(), 1);
         assert_eq!(db.count_fts_matches("nonexistent phrase xyz").unwrap(), 0);
-        // sanitize_fts_query の trigram 下限 (3 文字未満) は Ok(0) で早期 return
+        // クエリ全体は 1 件にも逐語で出現しないが、token に割れば
+        // zebrafish が 2 件、prose が 1 件に当たる。旧実装ならここは 0 だった =
+        // クエリのコンパイル規則が差し替わったことを DB 越しに判別する assert。
+        assert_eq!(db.count_fts_matches("zebrafish prose").unwrap(), 3);
+        // 有効 phrase が 1 つも作れないクエリは Ok(0)。「3 文字未満なら」ではない
+        // (fallback があるので `ab` は落ちるが `AI と ML` は落ちない)。
         assert_eq!(db.count_fts_matches("ab").unwrap(), 0);
         assert_eq!(db.count_fts_matches("  ").unwrap(), 0);
     }

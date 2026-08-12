@@ -380,6 +380,8 @@ kb-mcp search "クエリ最適化" --reranker bge-v2-m3        # 呼び出し単
 
 `--format` は `json` (既定、後述「検索フィルタと引用」の通り `{ results, low_confidence, filter_applied }` ラッパ) か `text` (`---` 区切りの LLM フレンドリなブロック)。他のフラグは `serve` と同じ: `--kb-path` / `--model` / `--reranker` / `--category` / `--topic` / `--limit`。品質フィルタは既定有効 — 単発クエリで フィルタ無効状態に戻すには `--include-low-quality` または `--min-quality 0` を渡す。`kb-mcp.toml` の既定値は `serve` / `index` と同じく適用される。
 
+**クエリがどうマッチするか** (v0.16.0+): ハイブリッドの FTS 側はクエリを逐語で探すわけではない。クエリを Separator と文字種境界 (漢字 / ひらがな / カタカナ / それ以外の語構成文字) で割り、trigram 下限の 3 文字に満たない断片は隣接断片と連結し、そうしてできた phrase 群を `OR` で結んで検索する — つまり `再ランキングの評価について` は `再ランキング` / `ランキング` / `の評価` / `について` を探すので、自然文の質問がそのままの形で出現していなくてもマッチする。1 個の逐語 phrase として固めたい部分は `"..."` で囲む (`kb-mcp search '"Foundry Local" の設定'`)。クエリ全体を囲めば v0.16.0 以前の部分文字列検索がそのまま再現される。`search` MCP ツールも同じコードパスを通るので挙動は変わらない。この変更に再 index は不要。詳細は [docs/retrieval-pipeline.ja.md](./docs/retrieval-pipeline.ja.md) を参照。
+
 典型的な skill-bin 用途: Claude Code の skill が `bin/` に `kb-mcp.exe` + `kb-mcp.toml` を同梱し、`kb-mcp search "{{user_query}}" --format text --limit 3` のようなコマンドで LLM が引用するための参照抜粋を返す。
 
 ### 検索フィルタと引用 (v0.3.0+)
@@ -545,9 +547,9 @@ kb-mcp tune --kb-path knowledge-base
 
 golden query セットに対して固定グリッドを掃引し、leave-one-query-out 交差検証で
 結果をガードした上で、貼り付け可能なスニペットか「既定値を維持すべき」という結論
-を出力する。tune 自身は何も適用しない。なお、このパラメータが動かせるのは文書に
-**逐語で** 出現するクエリだけなので、自然文の質問だけの golden セットでは実効 N が
-0 と報告され exit 2 で終わる。詳細は [docs/eval.ja.md](./docs/eval.ja.md) を参照。
+を出力する。tune 自身は何も適用しない。なお、このパラメータが動かせるのは
+**そもそも bm25 段に到達する** クエリだけなので、tune はまず pre-flight で実効 N
+を報告し、0 なら exit 2 で終わる。詳細は [docs/eval.ja.md](./docs/eval.ja.md) を参照。
 
 ## Claude Code / Cursor への接続
 
@@ -833,7 +835,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **埋め込み次元**: `--model` で決まる。BGE-small-en-v1.5 = 384、BGE-M3 = 1024。選択した次元は `vec_chunks` 仮想テーブルに宣言され `index_meta` に記録される。実行時の不一致は検出して拒否
 - **増分インデックス**: ファイルは SHA-256 content hash で追跡。以降の `index` 実行では変更されたファイルのみ再 embedding される (`--force` を渡さない限り)。内容を変えずに移動 / リネームすると hash 一致で検知され `documents.path` の UPDATE として処理 — 既存の chunk / embedding / FTS 行は再利用される。再構築サマリでは `updated` / `deleted` の隣に `renamed` としてカウントされる
 - **read 不能 / 非 UTF-8 ファイルへの耐性**: read 失敗・size cap 超過・parse 失敗のファイルは warning を出して skip されるだけで `index` 実行全体は abort しない — `--kb-path` にバイナリファイルが混ざっていても、それ以外の knowledge base のインデックスは壊れない
-- **ハイブリッド検索 (FTS5 + ベクトル)**: `search` ツールは SQLite FTS5 全文検索 (trigram tokenizer、日本語 / CJK も動く。v0.12.0 以降は `heading` / `context` / `content` の 3 列で、bm25 では既定で `heading` を 2 倍重み) をベクトル検索と Reciprocal Rank Fusion (既定 `k = 60`) でマージする。重みと `k` は v0.13.0 以降 `[search.fusion]` で設定でき、自分の KB で動かす価値があるかは `kb-mcp tune` が測る。返される `score` は RRF スコア (大きいほど良い) で距離ではない。3 文字未満のクエリは trigram の最小値を下回るためベクトルのみにフォールバック
+- **ハイブリッド検索 (FTS5 + ベクトル)**: `search` ツールは SQLite FTS5 全文検索 (trigram tokenizer、日本語 / CJK も動く。v0.12.0 以降は `heading` / `context` / `content` の 3 列で、bm25 では既定で `heading` を 2 倍重み) をベクトル検索と Reciprocal Rank Fusion (既定 `k = 60`) でマージする。重みと `k` は v0.13.0 以降 `[search.fusion]` で設定でき、自分の KB で動かす価値があるかは `kb-mcp tune` が測る。返される `score` は RRF スコア (大きいほど良い) で距離ではない。v0.16.0 以降、クエリは逐語で検索されるのではなく token 単位の phrase にコンパイルされて `OR` で結合される (上の「コマンドラインからの一発検索」を参照)。有効な phrase が 1 つも作れないクエリはベクトルのみにフォールバックするが、断片がすべて短いクエリはその前にクエリ全体の逐語 phrase へ fallback するので、ベクトルのみになるのは trim 後 3 文字未満 (trigram の最小値を下回る) のときだけ
 - **任意の再ランク**: `--reranker <model>` を付けると上位候補が cross-encoder で再スコアされてから返る。再ランク適用時は `score` が RRF 値ではなく cross-encoder の生スコアになる。再ランクは index 非依存 — サーバ起動時に再インデックスなしでトグル可能
 - **Connection graph**: `get_connection_graph` / `kb-mcp graph` はドキュメント起点でベクトルインデックス上を BFS する。追加インデックスは作らず、ホップ毎に sqlite-vec KNN を新規発行する。`depth ≤ 3` / `fan_out ≤ 20` で client-side クランプされるため、最悪でも 1 リクエストあたり約 21 KNN クエリ。スコアは L2 距離からの近似コサイン類似度 (`1 - d²/2` を `[0,1]` にクランプ、unit normalized embedding を前提 — BGE-small / BGE-M3 は内部で正規化済み)
 - **見出し除外**: 見出しテキストが `exclude_headings` のいずれかを含むセクションは、チャンキング時に落とされる。既定は空リスト (全セクション残す)。`kb-mcp.toml` の `exclude_headings` に substring を列挙するとオプトインになる。マッチは部分文字列 (`heading.contains(pattern)`) で、短いパターンは `"参考リンク"` → `"## 参考リンク (旧)"` のような変種も拾う

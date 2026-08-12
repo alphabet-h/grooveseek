@@ -210,8 +210,9 @@ in `kb-mcp.toml`). "Compatible" means the previous run had the same
 fingerprint — `model`, `reranker`, `limit`, `k_values`, the golden YAML's
 content hash, the metric implementation version, and (v0.7.0+) the effective
 `[search.mmr]` / `[search.parent_retriever]` settings, plus (v0.13.0+) a
-non-default `[search.fusion]` and (v0.14.0+) the index's context mode when it
-was built with `[contextual].enabled = true`. Toggling MMR or parent retriever, or moving
+non-default `[search.fusion]`, (v0.14.0+) the index's context mode when it
+was built with `[contextual].enabled = true`, and (v0.16.0+) the FTS query
+compilation version (`fts_query_version`). Toggling MMR or parent retriever, or moving
 the fusion parameters off their built-in defaults, therefore breaks
 fingerprint compatibility (intentionally — comparing `recall@k` with the
 diversity stage on vs off is apples-to-oranges). Switching `[contextual]` therefore breaks compatibility too, as it should:
@@ -227,6 +228,12 @@ fusion settings**: `metric_version` went 1 → 2 when the metric implementation
 was corrected, and the fingerprint is compared as a whole. Those runs are
 skipped rather than compared, which is the intended behaviour — the older
 numbers were computed by a different formula.
+The same holds for history written **before v0.16.0**: `fts_query_version`
+went 1 → 2 when the query-to-`MATCH` compilation changed (see
+[retrieval-pipeline.md](./retrieval-pipeline.md)), so those runs — including a
+frozen baseline — drop out of the comparison. That is intentional as well: the
+two versions send different expressions to FTS5, so they measure different
+retrieval even with the same model, index, and golden file.
 Updating the golden file likewise does **not** trigger a false regression
 on the next run; it just means the comparison is skipped.
 
@@ -286,11 +293,13 @@ kb-mcp tune --kb-path knowledge-base --format json > tune.json
 
 ### What it needs from your golden set
 
-kb-mcp's FTS wraps the entire query in a single quoted phrase over a trigram
-tokenizer, so **a query only reaches the bm25 stage when it occurs verbatim in
-the text**. A golden set made only of natural-language questions produces zero
-FTS candidates for every query, every grid point returns the same ranking, and
-there is nothing to measure. `tune` therefore starts with a pre-flight pass:
+Since v0.16.0 kb-mcp compiles a query into per-token phrases joined with `OR`
+(see [retrieval-pipeline.md](./retrieval-pipeline.md)), so **a query no longer
+has to occur verbatim in the text to reach the bm25 stage** — each of its
+fragments can match on its own, which is what makes a natural-language golden
+set measurable at all. What still leaves nothing to measure is a query from
+which no phrase survives, or whose phrases match nothing: every grid point then
+returns the same ranking. `tune` therefore starts with a pre-flight pass:
 
 - it counts FTS candidates per query and reports the **effective N** (queries
   with at least 2 candidates — 0 candidates falls back to vector-only, 1
@@ -313,10 +322,13 @@ bm25_context_weight axis is a no-op on this KB (contextual retrieval is off).
 Its rows below mean "not measured", not "has no effect".
 ```
 
-To get a measurable golden set, include verbatim queries: proper nouns, API
-names, command names, error codes. Avoid queries under 3 characters (the
-trigram floor) and column-filter syntax such as `heading:foo` (it is neutralized
-by query sanitization, so it never acts as a filter).
+To get a measurable golden set, include queries carrying distinctive terms:
+proper nouns, API names, command names, error codes. Those compile to phrases
+rare enough that bm25 can tell documents apart, whereas a query made only of
+common fragments matches everywhere and the weights have little to separate.
+Avoid queries under 3 characters (the trigram floor leaves nothing to send to
+FTS) and column-filter syntax such as `heading:foo` (the `:` is a separator, so
+the two halves become ordinary phrases and it never acts as a filter).
 
 ### How the recommendation is guarded
 

@@ -10,11 +10,14 @@
 //! `pub` / `pub(crate)` does not depend on which module its `impl` block sits
 //! in, so no call site outside this crate's `db` module changed.
 //!
-//! What stayed behind in `db.rs`, and why: `sanitize_fts_query` (six callers
-//! outside this file), `VEC_KNN_MAX_K` (also used by the storage half), and
-//! `FTS_CANDIDATE_CALLS` — that one is named by path from `tune.rs`
-//! (`crate::db::FTS_CANDIDATE_CALLS`), so moving it would break the AU-22
-//! round-trip guard that counts FTS calls during a sweep.
+//! What stayed behind in `db.rs`, and why: `VEC_KNN_MAX_K` (also used by the
+//! storage half) and `FTS_CANDIDATE_CALLS` — that one is named by path from
+//! `tune.rs` (`crate::db::FTS_CANDIDATE_CALLS`), so moving it would break the
+//! AU-22 round-trip guard that counts FTS calls during a sweep.
+//!
+//! Compiling a user query into an FTS5 MATCH expression lives in the sibling
+//! module `fts_query` (feature-48, v0.16.0). It reaches here through `db.rs`'s
+//! `use fts_query::build_fts_query;` plus the `use super::*;` below.
 
 // The parent module is what this file was carved out of, so it keeps seeing
 // exactly what it saw before. A hand-written list would be a second thing to
@@ -101,7 +104,7 @@ impl Database {
     ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
-        let Some(fts_query) = sanitize_fts_query(query_text) else {
+        let Some(fts_query) = build_fts_query(query_text) else {
             return Ok(Vec::new());
         };
 
@@ -321,11 +324,19 @@ impl Database {
         Ok((vec_hits, fts_hits))
     }
 
-    /// FTS5 phrase 全体にマッチする chunk 数 (LIMIT / filter なし)。
-    /// `kb-mcp tune` の phrase doc-freq 診断専用 (feature-47 D-11-6)。
-    /// sanitize 後のクエリが trigram 下限未満なら `Ok(0)`。
+    /// クエリの phrase のいずれかにマッチする chunk 数 (LIMIT / filter なし)。
+    /// `kb-mcp tune` の FTS 識別力診断専用 (feature-47 D-11-6 / feature-48)。
+    ///
+    /// **v0.16.0 で意味が変わった**: 旧実装はクエリ全体を 1 phrase にしていたので
+    /// これは「その phrase の doc-freq」= FTS5 の IDF クランプ条件そのものだったが、
+    /// 現在は [`build_fts_query`] が生む複数 phrase の**和集合**の大きさであり、
+    /// 個々の phrase の doc-freq の**上界**でしかない
+    /// (`tune::grid::QueryDiagnostics::idf_clamped` の注記を参照)。
+    ///
+    /// 有効な phrase が 1 つも作れないクエリは `Ok(0)`。**「3 文字未満なら」ではない** —
+    /// `ab` は落ちるが `AI と ML` は全体 fallback で phrase になる。
     pub(crate) fn count_fts_matches(&self, query_text: &str) -> Result<i64> {
-        let Some(fts_query) = sanitize_fts_query(query_text) else {
+        let Some(fts_query) = build_fts_query(query_text) else {
             return Ok(0);
         };
         let n: i64 = self.conn.query_row(

@@ -55,6 +55,17 @@ Every optional stage is a no-op when its config is off, so a v0.6.x configuratio
 
 `vec_chunks` (sqlite-vec, L2 distance — its default metric) and `fts_chunks` (FTS5 trigram over three columns since v0.12.0 — `heading`, `context`, `content` — scored with bm25 at a 2× heading weight by default) each return their own top-N. Reciprocal Rank Fusion combines them on the Rust side with `k = 60` by default (the standard RRF constant). The score returned to clients is the RRF score (higher = better), not a distance.
 
+**How the query reaches FTS5** (v0.16.0+): the query string is not sent as-is. `build_fts_query` compiles it into a set of quoted phrases joined with ` OR `:
+
+- A region you wrap in `"..."` is kept as a **verbatim phrase**, under FTS5's own doubled-quote convention (`""` inside a phrase is a literal `"`). A quoted phrase holding fewer than 3 characters is dropped.
+- Outside quotes, the query is cut into groups at separators (whitespace, punctuation, symbols), and each group is cut further at **script boundaries** — kanji / hiragana / katakana / other word characters. `再ランキングの評価について` yields the runs `再` / `ランキング` / `の` / `評価` / `について`.
+- A run shorter than 3 characters (the trigram floor, below which a phrase matches nothing at all) is joined to its neighbours **within the same group** until it reaches 3. When that join extends a span that already stood on its own, the pre-extension span is emitted as a phrase too: `再ランキング` also emits `ランキング`, and `システム化` also emits `システム`.
+- The phrases are deduplicated, capped at 32, and joined with ` OR `.
+
+So `再ランキングの評価について` becomes `"再ランキング" OR "ランキング" OR "の評価" OR "について"`, and `"Foundry Local" の設定` becomes `"Foundry Local" OR "の設定"`. Before v0.16.0 the whole query was wrapped in one phrase, which over a trigram tokenizer is a verbatim substring search — a natural-language Japanese query produced zero FTS candidates, so the FTS half of the hybrid was effectively dead and only the vector half ran.
+
+If tokenizing produces no phrase at all — every fragment is under the floor, as in `AI と ML` — the whole trimmed query falls back to that single-phrase form, so this shape of query does not regress. Only a query that is itself under 3 characters after trimming skips FTS entirely and searches vector-only. Quoting the entire query reproduces the old verbatim behaviour on demand. This is a query-side change only: the index, the schema, and the tokenizer are untouched, so **no re-index is needed**.
+
 Both the RRF constant and the three bm25 column weights are configurable via `[search.fusion]` in `kb-mcp.toml` (v0.13.0+); the built-in defaults are `rrf_k = 60.0` and `heading / context / content = 2.0 / 1.0 / 1.0`. They are deliberately left alone unless you have measured otherwise — see [eval.md](./eval.md) for `kb-mcp tune`, which reports how much (if at all) these knobs move retrieval quality on *your* KB.
 
 This stage is what `kb-mcp eval` measures by default: any improvement here lifts the floor for the entire pipeline.

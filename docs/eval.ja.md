@@ -201,7 +201,8 @@ CLI フラグが config より優先。受理されるフラグ: `--golden`, `--
 `limit` / `k_values` / golden YAML の content hash / metric 実装 version、
 および v0.7.0+ では実効 `[search.mmr]` / `[search.parent_retriever]` 設定、
 v0.13.0 以降はさらに既定値と異なる `[search.fusion]`、v0.14.0 以降は
-`[contextual].enabled = true` で構築された index の context mode) が一致
+`[contextual].enabled = true` で構築された index の context mode、v0.16.0
+以降は FTS クエリのコンパイル version (`fts_query_version`)) が一致
 していること。
 MMR / parent retriever の on/off を切り替えても、fusion パラメータを
 ビルトイン既定値から動かしても fingerprint は変わるので比較対象外となり、
@@ -216,8 +217,13 @@ context off の run は何も記録しないので、この機能が無かった
 なお **v0.13.0 より前に記録した history は fusion 設定に関わらず非互換**:
 metric 実装の修正で `metric_version` が 1 → 2 になっており、fingerprint は
 構造体全体で比較されるため。それらの run は比較されず skip されるが、これは
-意図した挙動 (古い数値は別の式で計算されている)。golden YAML を更新した直後の
-run も同じ理由で比較対象外となる。
+意図した挙動 (古い数値は別の式で計算されている)。
+**v0.16.0 より前の history** も同様: クエリから `MATCH` 式を作る規則が変わった
+ときに `fts_query_version` が 1 → 2 になっているため
+([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照)、凍結した baseline
+を含めて比較対象から外れる。これも意図的で、両者は FTS5 に別の式を投げている
+以上、model も index も golden も同じでも測っているものが違う。
+golden YAML を更新した直後の run も同じ理由で比較対象外となる。
 
 履歴は exit より前に書き出されるので、今回の run は次回比較用に保存される。
 
@@ -271,11 +277,13 @@ kb-mcp tune --kb-path knowledge-base --format json > tune.json
 
 ### golden セットに求められる条件
 
-kb-mcp の FTS はクエリ全体を 1 つのクォート済みフレーズとして trigram
-tokenizer に投げるため、**クエリが本文に逐語で出現するときにしか bm25 段に
-到達しない**。自然文の質問だけで構成された golden セットでは全 query の FTS
-候補が 0 件になり、grid のどの点でも同じ順位が返るので測るものが無い。
-そこで tune は pre-flight を先に走らせる:
+v0.16.0 以降、kb-mcp はクエリを token 単位の phrase にコンパイルして `OR` で
+結合するため ([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照)、
+**クエリが本文に逐語で出現しなくても bm25 段に到達する** — 断片ごとに単独で
+マッチできるので、自然文の golden セットもそもそも測定対象になる。それでも測る
+ものが無くなるのは、phrase が 1 つも残らない query か、phrase がどこにもマッチ
+しない query の場合で、grid のどの点でも同じ順位が返る。そこで tune は
+pre-flight を先に走らせる:
 
 - query ごとの FTS 候補数を数え、**実効 N** (候補 2 件以上の query 数。0 件は
   vector-only にフォールバックし、1 件は rank が固定なので重みに不感) を報告する
@@ -295,9 +303,12 @@ bm25_context_weight axis is a no-op on this KB (contextual retrieval is off).
 Its rows below mean "not measured", not "has no effect".
 ```
 
-測定可能な golden にするには逐語クエリ (固有名詞・API 名・コマンド名・エラーコード等)
-を含めること。3 文字未満のクエリ (trigram 下限) と `heading:foo` のような column
-filter 構文は避ける (後者はクエリのサニタイズで無効化されるため filter として働かない)。
+測定可能な golden にするには識別力のある語を含むクエリ (固有名詞・API 名・
+コマンド名・エラーコード等) を入れること。これらがコンパイルされる phrase は
+bm25 が文書を区別できる程度に希少だが、ありふれた断片だけのクエリはどこにでも
+マッチするので重みで分けるものが無い。3 文字未満のクエリ (trigram 下限を割り、
+FTS に投げるものが残らない) と `heading:foo` のような column filter 構文は避ける
+(後者は `:` が Separator なので両側がただの phrase になり、filter として働かない)。
 
 ### 推奨がどうガードされるか
 

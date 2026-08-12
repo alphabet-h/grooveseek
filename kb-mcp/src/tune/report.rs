@@ -103,11 +103,13 @@ pub fn format_text(report: &TuneReport, use_color: bool) -> String {
     }
     writeln!(
         s,
-        "{dim}  fts = FTS candidates in pool; docfreq = chunks matching the whole phrase;\n  \
+        "{dim}  fts = FTS candidates in pool; docfreq = chunks matching ANY of the query's\n  \
+         phrases (the query is compiled into per-token phrases joined by OR since v0.16.0);\n  \
          overlap = chunks present in BOTH the vec pool and the FTS list (0 means rrf_k cannot\n  \
          change the ranking for that query); bm25? = ranking moved between the grid's\n  \
-         heading-heavy and content-heavy extremes; idf = CLMP means the phrase occurs in >= half\n  \
-         of all chunks, so FTS5 clamps its IDF to 1e-6 and no weight can revive it;\n  \
+         heading-heavy and content-heavy extremes; idf = CLMP means that union covers >= half\n  \
+         of all chunks — FTS5 clamps IDF per phrase, so this is an upper bound: CLMP flags a\n  \
+         query worth inspecting, not a proof that every phrase is clamped;\n  \
          ties = adjacent equal f32 RRF scores at the default condition (informational).{reset}"
     )
     .unwrap();

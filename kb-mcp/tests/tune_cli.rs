@@ -75,7 +75,13 @@ fn index(bin: &Path, kb_path: &Path) {
 #[ignore]
 fn tune_exits_2_when_no_query_is_fts_effective() {
     // spec D-8 の pre-flight ゲート: 全 query が FTS 不感なら grid を実行せず
-    // exit 2。golden の query が KB に逐語出現しないよう作る。
+    // exit 2。
+    //
+    // feature-48 (v0.16.0) でクエリは token 単位の OR 式にコンパイルされるように
+    // なったので、「クエリ全体が逐語出現しない」だけでは FTS 不感にならない
+    // (旧 fixture の `how does the first document ...` は `document` が両方の
+    // chunk に当たって実効になってしまう)。**どの token も KB に出現しない**
+    // query に差し替えてゲートの意図を保つ。assert は 1 つも変えていない。
     let kb = TempKb::new("kb-mcp-tune-it-preflight");
     kb.write(
         "alpha.md",
@@ -89,17 +95,17 @@ fn tune_exits_2_when_no_query_is_fts_effective() {
     let bin = kb_mcp_bin();
     index(&bin, kb.kb());
 
-    // どちらの query も本文に逐語では現れない (単一 phrase 化されるため
-    // FTS は 0 件になる)。
+    // どの token も本文・見出しに部分文字列として現れないので、token 化しても
+    // 全体 fallback でも FTS 候補は 0 件になる。
     let golden = kb.kb().join(".kb-mcp-eval.yml");
     let golden_yml = concat!(
         "queries:\n",
         "  - id: q-alpha\n",
-        "    query: \"how does the first document explain optimisation methods\"\n",
+        "    query: \"quokka husbandry ledger\"\n",
         "    expected:\n",
         "      - path: \"alpha.md\"\n",
         "  - id: q-beta\n",
-        "    query: \"what merges two ranked candidate lists together\"\n",
+        "    query: \"zebrafish telemetry dossier\"\n",
         "    expected:\n",
         "      - path: \"beta.md\"\n",
     );
