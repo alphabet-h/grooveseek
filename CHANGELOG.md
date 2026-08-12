@@ -4,6 +4,26 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Changed
+
+- **Japanese CID-keyed PDFs now extract correctly** (AU-70, final act). The
+  `oxidize-pdf` pin moves from `=4.1.1` to `=4.3.0`, which carries the fix this
+  project reported and authored upstream
+  ([bzsanti/oxidizePdf#469](https://github.com/bzsanti/oxidizePdf/issues/469),
+  merged as PR #470): `/DescendantFonts` is now read in all four legal
+  spellings, so a CID-keyed font with a predefined CMap and no `/ToUnicode` —
+  what ReportLab emits — decodes to real text instead of byte-wise mojibake.
+  Verified end-to-end: the fixture that v0.15.1 could only *refuse to index*
+  now indexes as correct Japanese and is found by search. No kb-mcp test
+  changed — the v0.15.1 fixture tests were written as dual-regime assertions
+  ("if it is rejected, the rejection must name the decode failure; if it
+  indexes, it must be the real text") and moved to the second regime on their
+  own. The mojibake gates stay in place as defense-in-depth against decode
+  failures from other causes. 4.3.0 also brings upstream extraction
+  improvements (Tc/Tw/Ts applied to extraction, a space at TJ-operator
+  boundaries, opt-in reading-order reordering — all off by default or
+  non-breaking for kb-mcp's extraction path).
+
 ## [0.15.1] - 2026-08-10
 
 ### Fixed

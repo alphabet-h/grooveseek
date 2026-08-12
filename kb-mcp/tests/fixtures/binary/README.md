@@ -20,7 +20,7 @@ fixtures.
 | `cid_descendant_indirect.pdf` | 1107 B | 1 page of Japanese in a Type0 font, `/Encoding /UniJIS-UCS2-H`, **no `/ToUnicode`**, with the CIDFont written as an indirect reference (`/DescendantFonts [ 6 0 R ]`) | `test_cid_font_with_indirect_descendant_extracts_japanese` (AU-70: this form decodes correctly today and must keep doing so — the test is a regression guard on oxidize-pdf's CID path) |
 | `cid_descendant_direct.pdf` | 1273 B | The same document with the CIDFont written as a **direct dictionary** (`/DescendantFonts [ << … >> ]`) — the only differing object is 5 (the Type 0 font) | not referenced by a test; kept as the minimal witness of the upstream defect and the control half of the A/B pair |
 | `cid_descendant_direct_dense.pdf` | 3897 B | The direct-dictionary form with 25 lines of Japanese, so it measures 1179 chars/page **while mis-decoded** | `test_cid_font_with_direct_descendant_never_reaches_the_index_as_mojibake` (AU-70: mis-decoding doubles the character count, so the garbage clears the 50 chars/page gate — this fixture is what proves the C1 gate is load-bearing) |
-| `cid_descendant_kana.pdf` | 2083 B | The direct-dictionary form whose body is **unvoiced kana only** (`あいうえお…`, 8 lines). Bytewise mis-decoding turns it into pure ASCII (`0B0D0F…`) with **zero** C1 controls at 407 chars/page | `test_kana_only_cid_mojibake_never_reaches_the_index` (PR #132 codex P1: the one shape that evades both the C1 gate and the density gate — this fixture is what proves the byte-pair-signature gate is load-bearing. oxidize-pdf 4.1.1, the pinned version, mis-decodes it; 4.2.3's own heuristics rescue it, so the test asserts across both regimes) |
+| `cid_descendant_kana.pdf` | 2083 B | The direct-dictionary form whose body is **unvoiced kana only** (`あいうえお…`, 8 lines). Bytewise mis-decoding turns it into pure ASCII (`0B0D0F…`) with **zero** C1 controls at 407 chars/page | `test_kana_only_cid_mojibake_never_reaches_the_index` (PR #132 codex P1: the one shape that evades both the C1 gate and the density gate — this fixture is what proves the byte-pair-signature gate is load-bearing. oxidize-pdf 4.1.1, the pin at the time, mis-decoded it; 4.3.0 — the pin since v0.15.2, carrying our upstream fix #470 — extracts it correctly, so the test asserts across both regimes) |
 | `cid_descendant_kana_labels.pdf` | 2407 B | The same unvoiced-kana evasion laid out as a **label sheet**: thirty 2-kana words, each its own positioned `BT … Td … Tj ET` run, so extraction yields 4-char tokens (`0B0K 0D0W …`, measured 148 chars/page, 0.00% C1) | `test_kana_label_sheet_mojibake_never_reaches_the_index` (PR #132 codex P1 round 2: per-run parity judgment cannot see runs this short — this fixture is what proves the short-run pair aggregation is load-bearing; same dual-regime contract as the fixture above) |
 
 `minimal.pdf` intentionally keeps `/Title` so it stays valid for the Task 2.3
@@ -198,7 +198,8 @@ reject a repro over.
 **exactly one object** (5, the Type 0 font): whether the CIDFont inside
 `/DescendantFonts` is an indirect reference or a direct dictionary. Content
 stream, text bytes, `/Encoding`, `/CIDSystemInfo` and the object set are
-identical. Against oxidize-pdf 4.2.2:
+identical. Against oxidize-pdf 4.2.2 (the behavior fixed in 4.3.0 by our
+upstream PR bzsanti/oxidizePdf#470 — both files extract identically since):
 
 | `/DescendantFonts` | extracted text |
 | --- | --- |
@@ -208,8 +209,9 @@ identical. Against oxidize-pdf 4.2.2:
 (`第` is U+7B2C, whose UTF-16BE bytes `7B 2C` are the leading `{,`.) ISO 32000-1
 Table 121 types `DescendantFonts` as an array with no reference requirement,
 and §7.3.7 lets any dictionary value be direct or indirect;
-`extraction_cmap.rs` reads only the reference, which leaves `descendant_font`
-empty and skips the branch that already resolves `UniJIS-UCS2-H` correctly.
+`extraction_cmap.rs` (through 4.2.3) read only the reference, which left
+`descendant_font` empty and skipped the branch that already resolved
+`UniJIS-UCS2-H` correctly; 4.3.0 reads all four legal spellings.
 Keeping both files is the point — a single fixture would show mojibake without
 establishing *what* causes it. (A third spelling, the `/DescendantFonts` value
 itself as an indirect reference to the array, mis-decodes identically — it is
