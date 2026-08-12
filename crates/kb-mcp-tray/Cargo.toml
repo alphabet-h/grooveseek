@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp-tray"
-version = "0.15.2"
+version = "0.16.0"
 edition = "2024"
 description = "Windows system tray monitor for kb-mcp daemon (Phase 2 of F-6/H-9)"
 authors = ["koshian"]
