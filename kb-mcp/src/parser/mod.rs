@@ -82,8 +82,20 @@ pub struct ParsedDocument {
 pub const DEFAULT_EXCLUDED_HEADINGS: &[&str] = &[];
 
 /// バイナリ形式ファイルの生バイト上限 (50 MiB)。index 時の size skip (indexer)
-/// と get_document の raw cap (server) で共有する。テキスト形式には適用しない。
+/// と get_document の raw cap (server) で共有する。テキスト形式には
+/// [`MAX_RAW_TEXT_BYTES`] を使う。
 pub const MAX_RAW_BINARY_BYTES: u64 = 50 * 1024 * 1024;
+
+/// (BU-02) テキスト形式ファイルの生バイト上限 (50 MiB)。
+///
+/// もともとテキストには index 時の上限が無く、`fs::read` が丸ごとメモリに
+/// 載せていた。`rebuild_index` は MCP ツールとしてクライアントから叩けるので、
+/// KB に巨大な `.md` を 1 つ置くだけで任意のタイミングで OOM を誘発できた。
+///
+/// 値をバイナリ側と揃えてあるのは、**どちらもファイル 1 本を丸ごとメモリに
+/// 載せる**という同じ制約から来ているため。50 MiB の Markdown は
+/// 2,000 万文字級で、正当な知識ベースの文書としては現実的でない。
+pub const MAX_RAW_TEXT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// (AU-33) `ParsedDocument::raw_content` — the chunk bodies rejoined.
 ///

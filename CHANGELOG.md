@@ -20,6 +20,16 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Fixed
 
+- **Text files are now size-capped at index time** (BU-02). The 50 MiB raw-byte
+  guard applied only to binary formats; `binary_size_exceeded` returned "fine"
+  for anything else without even calling `stat`. A single oversized `.md` under
+  `--kb-path` was therefore read into memory in full — and `rebuild_index` is
+  an MCP tool, so any client could trigger that read on demand. Text now has
+  its own cap (`MAX_RAW_TEXT_BYTES`, same 50 MiB, since the constraint is
+  identical: one whole file in memory), enforced on all three paths that used
+  the binary guard (full rebuild, watcher re-index, watcher rename). The skip
+  message names which limit applied.
+
 - **The most exposed HTTP configuration no longer starts silently** (BU-01).
   The startup warning for a non-loopback bind fired only when
   `[transport.http].allowed_hosts` was absent. Setting `allowed_hosts = []`
