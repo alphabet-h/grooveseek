@@ -4,6 +4,25 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- **The cost of the full-text half is now documented and guarded** (BU-03).
+  `ORDER BY bm25(...)` scores every matching row before `LIMIT` applies, so the
+  cost tracks how many rows the expression matches, not how many you asked for.
+  Measured: linear in the matching population (3.3 ms / 15.5 ms / 29.4 ms at
+  5k / 20k / 40k rows), with the 32-phrase `OR` costing about 2× a
+  single-phrase query over the same population — a multiple that does not grow
+  with the corpus.
+
+  Two things follow, both now in `docs/retrieval-pipeline`. Lowering a limit
+  does **not** reduce this cost: the same query takes the same time at
+  `LIMIT 1` and `LIMIT 100`. And matching every row was always one common
+  substring away (`"について"` does it with a single phrase), so per-token
+  compilation did not raise the ceiling — only the chance of an ordinary query
+  reaching it. The regression guard pins the *multiple* rather than an absolute
+  timing, alongside a always-on test that the `OR` stays a union evaluated by
+  one statement rather than one statement per phrase.
+
 ### Changed (breaking)
 
 - **`kb-mcp serve --bind <non-loopback>` now requires `--i-know`** (BU-01).

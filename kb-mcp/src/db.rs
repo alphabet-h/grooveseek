@@ -2411,6 +2411,223 @@ mod tests {
         );
     }
 
+    /// 32 個の一般的な断片からなるクエリを組み立てる (BU-03 の想定攻撃形)。
+    /// 空白区切りなので 1 語 = 1 群 = 1 phrase になり、`MAX_PHRASES` (32) 上限
+    /// ちょうどの OR 式ができる。
+    fn pathological_or_query() -> String {
+        [
+            "について",
+            "における",
+            "によって",
+            "したがって",
+            "ただし",
+            "および",
+            "または",
+            "ならびに",
+            "もしくは",
+            "さらに",
+            "しかし",
+            "つまり",
+            "すなわち",
+            "たとえば",
+            "ところで",
+            "ちなみに",
+            "おそらく",
+            "たしかに",
+            "とりわけ",
+            "まったく",
+            "ほとんど",
+            "すべて",
+            "いくつか",
+            "それぞれ",
+            "これら",
+            "それら",
+            "ただちに",
+            "あるいは",
+            "ゆえに",
+            "むしろ",
+            "とはいえ",
+            "しかも",
+        ]
+        .join(" ")
+    }
+
+    /// (BU-03) OR 展開は候補集合の **和** であって積ではなく、phrase 数に
+    /// 関わらず FTS への問い合わせは **1 文**である。
+    ///
+    /// 監査は「32 個の OR で照合母集団が爆発する」ことを懸念していた。実測
+    /// (下の `#[ignore]` ガードのコメント参照) では母集団の上限は corpus 全体で、
+    /// これは **feature-48 以前から 1 個の一般的な部分文字列で到達できた**。
+    /// ここではその構造 — 和集合であること、1 クエリ 1 文であること — を固定する。
+    /// これが崩れる (phrase ごとに 1 文発行する等) と初めて次数が変わる。
+    #[test]
+    fn fts_or_expansion_is_one_statement_over_the_union_of_its_phrases() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("u.md", Some("u"), None, None, None, &[], None, "h")
+            .unwrap();
+        for i in 0..20 {
+            db.insert_chunk(
+                doc_id,
+                i,
+                None,
+                None,
+                &format!("この文書について記録した第 {i} 節"),
+                None,
+                &dummy_embedding(0.5),
+                1.0,
+            )
+            .unwrap();
+        }
+
+        let one = db.count_fts_matches("について").unwrap();
+        let many = db.count_fts_matches(&pathological_or_query()).unwrap();
+        assert_eq!(one, 20, "the single common phrase should match everything");
+        assert_eq!(
+            many, one,
+            "OR must be a union: adding 31 phrases that match nothing must not \
+             change the candidate population"
+        );
+
+        FTS_CANDIDATE_CALLS.with(|c| c.set(0));
+        let _ = db
+            .search_fts_candidates(
+                &pathological_or_query(),
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            FTS_CANDIDATE_CALLS.with(|c| c.get()),
+            1,
+            "32 phrases must still cost one MATCH statement, not one per phrase"
+        );
+    }
+
+    /// (BU-03 measurement + guard) 病的クエリの実コストを測り、上限で縛る。
+    /// `cargo test --release --lib bu03 -- --ignored --nocapture`
+    ///
+    /// **2026-08-13 の実測** (release、この機械、`BU03_N` で corpus を振った):
+    ///
+    /// | corpus | 1 phrase / 全行マッチ | 32 phrase / 全行マッチ | 倍率 |
+    /// |---|---|---|---|
+    /// | 5,000 | 3.33 ms | 7.80 ms | 2.34x |
+    /// | 20,000 | 15.47 ms | 27.90 ms | 1.80x |
+    /// | 40,000 | 29.45 ms | 57.54 ms | 1.95x |
+    ///
+    /// 読み取れること:
+    ///
+    /// 1. コストは **照合行数に線形**で、corpus に対して超線形ではない
+    /// 2. 32 phrase の OR は同じ母集団に対し **~2 倍の定数倍**で、倍率は
+    ///    corpus が増えても増えない
+    /// 3. 母集団の上限 (= 全行) は **1 phrase でも到達できる** (`"について"`
+    ///    単独で 5,000/5,000)。feature-48 は新しい上限を作ったのではなく、
+    ///    普通のクエリでそこに届きやすくした
+    /// 4. **`LIMIT` を下げてもコストは変わらない** (limit=1 で 8.49ms、
+    ///    limit=100 で 8.46ms)。`ORDER BY bm25(...)` が全マッチ行を評価して
+    ///    から `LIMIT` を適用するため。監査が挙げた「`fetch_limit` の 10,000 を
+    ///    下げる」は**この支配項には効かない** — 効くのは返却行の実体化だけ
+    ///    (limit=10,000 で 15.8ms)
+    ///
+    /// ガードは絶対時間ではなく **倍率**で書く。絶対値は機械と SQLite 版で動くが、
+    /// 「OR 展開が単一 phrase の何倍か」は次数が変わらない限り安定する。
+    #[test]
+    #[ignore = "timing-based; run on the nightly leg or by hand"]
+    fn bu03_or_expansion_stays_within_a_small_multiple_of_a_single_phrase() {
+        use std::time::Instant;
+        let n: i32 = std::env::var("BU03_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        println!("corpus = {n} chunks");
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h")
+            .unwrap();
+        for i in 0..n {
+            db.insert_chunk(
+                doc_id,
+                i,
+                None,
+                None,
+                &format!("この文書について、における評価を記録した第 {i} 節の本文"),
+                None,
+                &dummy_embedding(0.5),
+                1.0,
+            )
+            .unwrap();
+        }
+
+        let pathological = pathological_or_query();
+        let mut timing = std::collections::HashMap::new();
+
+        // 対照 3 本:
+        //  - selective  : ほぼ当たらない (= 通常のクエリの下限コスト)
+        //  - one_common : **1 個**の共通 phrase で全行マッチ (= 母集団は同じ、式は最小)
+        //  - pathological: 32 phrase で全行マッチ
+        // one_common と pathological の差が「phrase 数そのもののコスト」、
+        // selective と one_common の差が「母集団のコスト」。
+        for (label, q) in [
+            ("selective", "ゐゑをんヴヷ"),
+            ("one_common", "について"),
+            ("pathological", pathological.as_str()),
+        ] {
+            let phrases = crate::db::query_phrases(q).len();
+            let matches = db.count_fts_matches(q).unwrap();
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let _ = db
+                    .search_fts_candidates(
+                        q,
+                        10,
+                        &SearchFilters::default(),
+                        FusionParams::default(),
+                    )
+                    .unwrap();
+                best = best.min(t.elapsed());
+            }
+            println!("{label:>13}: phrases={phrases:2} matches={matches:5} best_of_5={best:?}");
+            timing.insert(label, best);
+        }
+
+        // LIMIT を変えてもコストが変わらない = ORDER BY bm25 が全マッチ行を
+        // 評価している、という主張の直接確認。
+        for limit in [1u32, 10, 100, 10_000] {
+            let t = Instant::now();
+            let hits = db
+                .search_fts_candidates(
+                    &pathological,
+                    limit,
+                    &SearchFilters::default(),
+                    FusionParams::default(),
+                )
+                .unwrap();
+            println!(
+                "  limit={limit:6} returned={:5} elapsed={:?}",
+                hits.len(),
+                t.elapsed()
+            );
+        }
+
+        // --- ガード ---
+        // 同じ母集団に対する 32 phrase / 1 phrase の倍率。実測 1.8-2.3 倍なので
+        // 6 倍を上限にする。ここを超えるのは「phrase 数が乗算的に効き始めた」
+        // = 次数が変わった時で、絶対時間の機械差では起きない幅を取ってある。
+        let one = timing["one_common"].as_secs_f64();
+        let many = timing["pathological"].as_secs_f64();
+        let ratio = many / one;
+        println!("ratio pathological/one_common = {ratio:.2}x (bound: 6x)");
+        assert!(
+            ratio < 6.0,
+            "the 32-phrase OR now costs {ratio:.2}x a single-phrase query over the \
+             same {n}-row population; measured 1.8-2.3x when this guard was written. \
+             A jump here means phrase count started multiplying the work instead of \
+             widening a single scan."
+        );
+    }
+
     #[test]
     fn test_backfill_fts_hydrates_preexisting_db() {
         let db = db_with_384();
