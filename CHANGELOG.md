@@ -15,8 +15,11 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
   The gate covers the `--bind` flag only. A non-loopback address coming from
   `[transport.http].bind` in `kb-mcp.toml` still starts, because the published
-  `intranet-http` recipe runs `kb-mcp serve` with no arguments; that case is
-  covered by the startup warning below.
+  `intranet-http` recipe runs `kb-mcp serve` with no arguments. Note that such
+  a bind is not universally warned about either: the startup warning fires only
+  when the Host allow-list is missing or empty, so the documented intranet
+  shape — a non-loopback bind plus an explicit `allowed_hosts` — remains silent
+  by design, on the grounds that writing that list states the intent.
 
 ### Fixed
 

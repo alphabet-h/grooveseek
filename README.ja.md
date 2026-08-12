@@ -707,7 +707,7 @@ kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
 ```
 
 セキュリティ注意:
-- 既定 bind は `127.0.0.1:3100` (loopback)。**kb-mcp は認証機構を内蔵していない**ので bind アドレスが実質唯一のアクセス制御 — `--bind 0.0.0.0:3100` は信頼できるネットワークでのみ使用する。v0.17.0 以降、非 loopback の `--bind` は `--i-know` を付けないと拒否される (`kb-mcp service install` と同じ規約)。`kb-mcp.toml` の `[transport.http].bind` 由来の非 loopback bind は既存のサービス構成を壊さないよう起動を許すが、警告を出す
+- 既定 bind は `127.0.0.1:3100` (loopback)。**kb-mcp は認証機構を内蔵していない**ので bind アドレスが実質唯一のアクセス制御 — `--bind 0.0.0.0:3100` は信頼できるネットワークでのみ使用する。v0.17.0 以降、非 loopback の `--bind` は `--i-know` を付けないと拒否される (`kb-mcp service install` と同じ規約)。`kb-mcp.toml` の `[transport.http].bind` 由来の非 loopback bind は既存のサービス構成を壊さないよう **gate しない**。起動時の警告が出るのは Host allow-list が未設定または空のときだけで (次の 2 項目を参照)、`allowed_hosts` を明示してある構成は「意図的な公開」とみなして黙る
 - rmcp の Streamable HTTP 層は Host ヘッダ検証を強制 (既定で loopback のみ) し、DNS rebinding 攻撃を防ぐ。ただし **Host 検証は認証ではない** — ポートに到達できる相手は `Host: localhost` を自由に付けられる。ブラウザ側の防御と考え、到達性はネットワーク層で絞ること
 - LAN / イントラ公開時は `kb-mcp.toml` の `[transport.http].allowed_hosts` に公開ホスト名 / IP を明示する (例: `["kb.example.lan", "192.168.1.10"]`)。loopback only の default のまま 0.0.0.0 で bind すると外部リクエストは Host 検証で 403 になる — operator のミス確定なので、kb-mcp は起動時に `tracing::warn` を出して気付かせる。`allowed_hosts = []` (空配列) を渡すと Host 検証が完全に無効化され (rmcp の `disable_allowed_hosts` 相当)、非 loopback bind と組み合わせるとポートに到達できる全員に `/mcp` が開く — この組合せも起動時に警告するようにした
 - サーバ内部の Mutex ベース直列化により、HTTP の並列リクエストでも embedder / DB 層では逐次処理される (`search` で目安 10 qps 程度)。本格的な並列化は将来の拡張

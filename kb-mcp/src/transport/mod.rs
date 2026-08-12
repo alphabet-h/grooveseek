@@ -177,8 +177,10 @@ fn resolve_http_addr(
 /// **gate するのは CLI の `--bind` 由来の非 loopback bind だけ**。
 /// `kb-mcp.toml` の `[transport.http].bind` は既存デプロイ
 /// (`examples/deployments/intranet-http` の systemd unit は引数なしの
-/// `kb-mcp serve` で、bind は toml から来る) が依存しているため拒否せず、
-/// [`http::run_http`] の起動時 warning に任せる。
+/// `kb-mcp serve` で、bind は toml から来る) が依存しているため拒否しない。
+/// なお toml 由来の bind が必ず警告されるわけでもない — [`http::run_http`] の
+/// warning は allow-list が未設定 / 空のときだけ出るので、`allowed_hosts` を
+/// 明示した intranet 構成は無言で起動する (明示自体を意図表明とみなす)。
 ///
 /// stdio に解決された `--bind` をここで拒否しないのは、**`main.rs` が既に
 /// 「`--bind` / `--port` があるのに実効 transport が stdio なら reject」を
@@ -450,8 +452,10 @@ mod tests {
     /// The gate is deliberately scoped to the CLI flag: a non-loopback bind
     /// that came from `[transport.http].bind` keeps starting, because the
     /// published `intranet-http` recipe runs `kb-mcp serve` with no arguments
-    /// and would otherwise break. Such a bind is covered by the startup
-    /// warning in `transport::http` instead.
+    /// and would otherwise break. It is not silently equivalent to a gate:
+    /// `transport::http` warns about such a bind only when the Host allow-list
+    /// is missing or empty, so a config with an explicit `allowed_hosts` gets
+    /// neither the gate nor the warning.
     #[test]
     fn test_config_derived_non_loopback_bind_is_not_gated() {
         check_cli_bind_ack(&http_at("0.0.0.0:3100"), None, false)
