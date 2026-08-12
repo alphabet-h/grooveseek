@@ -118,9 +118,10 @@ const BYTEWISE_PAIR_SIGNATURE_RATIO: f64 = 0.3;
 
 /// 1 ページから取り出す text の上限 (AU-05)。
 ///
-/// oxidize-pdf 4.1.1 は `ExtractionOptions::max_extracted_bytes` として
+/// oxidize-pdf は `ExtractionOptions::max_extracted_bytes` として
 /// **この上限を持っているが既定は `None` (無制限)** で、kb-mcp は使って
-/// いなかった。crate 側の doc より:
+/// いなかった (4.1.1 で確認、4.3.0 でも既定 `None` のまま — source 再確認済)。
+/// crate 側の doc より:
 ///
 /// > The limit is enforced *during* accumulation, not by truncating the
 /// > finished string, so a single page with a huge or adversarially inflated
@@ -416,10 +417,11 @@ impl Parser for PdfParser {
 /// 得るものが無いので、ここでは素直に `?` で伝播させる。
 ///
 /// oxidize-pdf は `ParseResult` ベースのエラー設計なので、open / extract 失敗 (暗号化
-/// PDF 等) は panic ではなく `Err` として返る (dry-run で確認、docs.rs 4.1.1)。
+/// PDF 等) は panic ではなく `Err` として返る (4.1.1 dry-run で確認、4.3.0 も同様 —
+/// encrypted fixture テストが担保)。
 fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatter)> {
     // Cursor<&[u8]> は Read + Seek を満たす = in-memory 読み
-    // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs 4.1.1 で確認)。
+    // (PdfReader::new(reader: R) where R: Read + Seek、docs.rs で確認)。
     let reader = PdfReader::new(Cursor::new(bytes))
         .map_err(|e| anyhow!("{path_hint}: cannot open PDF (encrypted or unreadable): {e}"))?;
     let document = PdfDocument::new(reader);
@@ -431,7 +433,8 @@ fn extract_pdf(bytes: &[u8], path_hint: &str) -> Result<(Vec<String>, Frontmatte
 /// ページ本文を per-page 上限 + 文書累積 budget 付きで取り出す (AU-05)。
 ///
 /// `document.extract_text()` は中身が `page_count()` + `extract_from_page` の
-/// 単純ループ (crate source 4.1.1 で確認) なので、ここで同じループを自分で
+/// 単純ループ (crate source 4.1.1 / 4.3.0 の両方で確認。4.3.0 の reading-order
+/// 機能は opt-in で既定経路を変えない) なので、ここで同じループを自分で
 /// 書いても **正規の PDF に対する出力は変わらない**。違うのは 2 点だけ:
 ///
 /// 1. `ExtractionOptions::max_extracted_bytes` を渡す (crate が持っているのに
@@ -527,7 +530,7 @@ fn extract_pages_within_budget_capped<R: std::io::Read + std::io::Seek>(
     Ok(pages)
 }
 
-/// oxidize-pdf の `DocumentMetadata` (docs.rs 4.1.1 で確認: `title` / `creation_date`
+/// oxidize-pdf の `DocumentMetadata` (docs.rs で確認: `title` / `creation_date`
 /// はいずれも `Option<String>`) から Title / CreationDate を map する。metadata が
 /// 取れない / title が空なら filename fallback。どのエラーでも parse は失敗させない。
 /// spec §4.5: PDF は Title と CreationDate のみ取り、他フィールドは取らない。
@@ -553,9 +556,10 @@ fn pdf_metadata_frontmatter<R: std::io::Read + std::io::Seek>(
 /// 出し元の filename fallback に委ねる。**化けた raw text をそのまま
 /// title にはしない**) を返す。
 ///
-/// 2026-07-19 dogfood (実 Japanese PDF) で発見: `oxidize-pdf 4.1.1` は PDF
+/// 2026-07-19 dogfood (実 Japanese PDF) で発見: oxidize-pdf は PDF
 /// Info dict 文字列の UTF-16BE BOM (`0xFE 0xFF`) を検出せず、CP1252/WinAnsi
-/// 風の 1 byte = 1 codepoint 変換にフォールスルーする。詳細は
+/// 風の 1 byte = 1 codepoint 変換にフォールスルーする (4.1.1 で発見、4.3.0 も
+/// 同様 — fixture テストが担保。本文 CID 抽出の根治とは別経路)。詳細は
 /// `.dev/knowledge/feature-45-pdf-crate-dryrun.md` (git 非追跡)。
 fn decode_pdf_title(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -1263,7 +1267,8 @@ mod tests {
     const CID_INDIRECT_PDF: &[u8] =
         include_bytes!("../../tests/fixtures/binary/cid_descendant_indirect.pdf");
 
-    /// `/DescendantFonts [ << … >> ]` — 直接辞書で書いた版。**これだけが化ける**。
+    /// `/DescendantFonts [ << … >> ]` — 直接辞書で書いた版。**旧 pin 4.1.1 では
+    /// これだけが化けた** (現 pin 4.3.0 は upstream #470 = 当方の修正で正抽出)。
     const CID_DIRECT_DENSE_PDF: &[u8] =
         include_bytes!("../../tests/fixtures/binary/cid_descendant_direct_dense.pdf");
 
@@ -1294,6 +1299,8 @@ mod tests {
         // **どちらの分岐も本物の主張をしている**。upstream (oxidize-pdf の
         // `/DescendantFonts` が間接参照しか読まない件) が直れば Ok 側に移るが、
         // そのときも「化けたものが索引に入らない」という不変条件は変わらない。
+        // (4.3.0 = upstream #470 の取り込みで実際に Ok 側へ移った。E2E でも
+        // index → search ヒットを実測済 2026-08-12)
         match PdfParser.parse_bytes(CID_DIRECT_DENSE_PDF, "docs/cid_direct.pdf", &[]) {
             Err(err) => {
                 let message = err.to_string();
@@ -1461,9 +1468,9 @@ mod tests {
             .expect("an identifier sheet must be indexed");
     }
 
-    /// 清音かなだけの実 PDF fixture。kb-mcp が pin する oxidize-pdf 4.1.1 では
-    /// byte-wise に化け (C1 = 0 のまま)、4.2.3 の crate ヒューリスティックは
-    /// 救済する — どちらのレジームでも「化けたものは索引に入らない」を主張する。
+    /// 清音かなだけの実 PDF fixture。旧 pin 4.1.1 では byte-wise に化け
+    /// (C1 = 0 のまま)、現 pin 4.3.0 は根治済み (upstream #470) で正抽出する —
+    /// どちらのレジームでも「化けたものは索引に入らない」を主張する。
     const CID_KANA_PDF: &[u8] =
         include_bytes!("../../tests/fixtures/binary/cid_descendant_kana.pdf");
 
