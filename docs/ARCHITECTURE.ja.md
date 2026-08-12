@@ -34,6 +34,7 @@ kb-mcp のソース構造とデータフロー。コードを拡張・修正す�
 | `kb-mcp/src/db.rs` | `rusqlite` + `sqlite-vec` + FTS5 (trigram)。`chunks` / `vec_chunks` / `fts_chunks` スキーマと CRUD を管理。`search_hybrid` (Reciprocal Rank Fusion。定数 k と bm25 列重みは v0.13.0 以降 `[search.fusion]` で設定可能、既定は `k = 60` と `2.0 / 1.0 / 1.0`) と v0.7.0 で追加した unbounded variant (MMR / parent retriever 用) を提供。`SearchFilters` 構造体でフィルタ引数 (path glob / tags / date range / min_quality) を集約、`MatchSpan` でバイトオフセット引用を表現 (v0.3.0 追加)。`chunks.level` (v0.7.0 追加) で h2 / h3 を区別 |
 | `kb-mcp/src/db/schema.rs` | (v0.15.0+) スキーマ作成と前方マイグレーション。全コンストラクタが呼ぶ `Database::init` から実行されるので、**DB を開くことが更新すること**にあたる。 |
 | `kb-mcp/src/db/search.rs` | (v0.15.0+) 検索: ベクトル KNN、FTS5 候補、両者を融合する RRF。**挙動が数値として観測できる**側の半分。 |
+| `kb-mcp/src/db/fts_query.rs` | (v0.16.0+) クエリ文字列を `db/search.rs` が投げる FTS5 の `MATCH` 式にコンパイルする。`build_fts_query` は `"..."` の区間を逐語で温存し (FTS5 自身の doubled-quote 規約)、残りを Separator で、さらに文字種境界 (漢字 / ひらがな / カタカナ / それ以外の語構成文字) で割り、3 文字の trigram 下限に満たない run は**同じ群の中で**隣接 run に連結し、できた phrase を ` OR ` で結合する (重複除去、上限 32 個)。出力される phrase は必ず入力の連続部分文字列 — trigram tokenizer は部分文字列しか照合できないので、そうでない phrase は原理的に何にもマッチしない。phrase が 1 つも作れないクエリは、3 文字以上なら v0.16.0 以前の形式 (trim 後のクエリ全体を 1 phrase) に fallback し、それ未満ならベクトル単独になる。query 側だけの変更で schema も tokenizer も不変 = 再 index は不要 |
 | `kb-mcp/src/db/storage.rs` | (v0.15.0+) ドキュメントとチャンク。1 文書の書き込みは `documents` / `chunks` / `fts_chunks` / `vec_chunks` を整合させる複数テーブル操作なので、呼び出し側が tx を持っていない時だけ自分で開く (`is_autocommit()`)。 |
 | `kb-mcp/src/db/meta.rs` | (v0.15.0+) index 単位のメタデータ・統計・全体メンテナンス: `index_meta` (埋め込みモデル / 次元 / context mode)、document / chunk 件数、rename 検出用の path→hash 表、および (AU-71) `corpus_snapshot` — 件数と索引済み chunk の digest を **1 トランザクション内で**読む。 |
 | `kb-mcp/src/mmr.rs` | (v0.7.0+) Maximal Marginal Relevance の貪欲再ランク + 類似度キャッシュ。`mmr_select` は post-rerank の候補プールに対して動き、`[search.mmr]` 設定または per-call `mmr` パラメータで gating される |
@@ -70,7 +71,7 @@ db.rs: chunks (メタデータ) + vec_chunks (embedding)
 検索時、`search` ツールはハイブリッド検索を実行する:
 
 - query → embedder → `vec_chunks MATCH` (top-N)
-- query → sanitize → `fts_chunks MATCH` + bm25 (top-N) — 既定では見出しに 2 倍の重み (`[search.fusion].bm25_heading_weight`、v0.13.0+)
+- query → `build_fts_query` → `fts_chunks MATCH` + bm25 (top-N) — 既定では見出しに 2 倍の重み (`[search.fusion].bm25_heading_weight`、v0.13.0+)
 - Rust 側で Reciprocal Rank Fusion (既定 `k = 60`、`[search.fusion].rrf_k`) → top-`limit` を返却
 - (任意) cross-encoder reranker が上位候補を再スコアリングして返却
 - (任意, v0.7.0+) MMR 多様性再ランクが大きめの候補プールから貪欲に `limit` 個を選択し、関連度と新規性のバランス (`lambda`)、同一 doc の penalty (`same_doc_penalty`) を効かせる

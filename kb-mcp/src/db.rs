@@ -2,10 +2,18 @@
 // methods. Schema creation and the forward migrations are cut out first
 // because they are the group that talks mostly to itself: every one of them is
 // reached through `init`, and only six are called from anywhere else.
+mod fts_query;
 mod meta;
 mod schema;
 mod search;
 mod storage;
+
+// feature-48. The FTS half of the hybrid search compiles a user query into an
+// FTS5 MATCH expression; that compilation is a self-contained string-to-string
+// problem with no database access, so it lives in its own module with its own
+// tests. Imported here (not `#[cfg(test)]`, unlike `parse_dim_from_create_sql`
+// below) because `search.rs` reaches it through `use super::*`.
+use fts_query::build_fts_query;
 
 // `parse_dim_from_create_sql` moved with the rest of the schema code, but its
 // unit test did not: `mod tests` below is one module, and splitting it would
@@ -292,20 +300,11 @@ pub struct TopicInfo {
     pub titles: Vec<String>,
 }
 
-/// FTS5 クエリ用にユーザ入力をサニタイズする。
-///
-/// - trim 後に空、または 3 文字未満 (trigram の下限未満) なら `None` を返し
-///   呼び出し側で vector-only にフォールバックさせる
-/// - ダブルクォートを 2 連化してフレーズ全体をクォートで囲み、`AND` / `OR` /
-///   `NOT` / `NEAR` / `*` / `:` 等の予約構文を中立化する
-fn sanitize_fts_query(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().count() < 3 {
-        return None;
-    }
-    let escaped = trimmed.replace('"', "\"\"");
-    Some(format!("\"{escaped}\""))
-}
+// feature-48: `sanitize_fts_query` はここにあったが、クエリ全体を単一 phrase 化する
+// その規則こそが「自然文クエリで FTS 候補が 0 件になる」原因だったので、
+// `db/fts_query.rs` の `build_fts_query` に置き換えた。旧規則自体は
+// `fallback_whole_query` として同モジュールに残っている (token 化で phrase が
+// 1 つも作れなかったときの逃げ道)。
 
 // ---------------------------------------------------------------------------
 // Extension loading (once per process)
@@ -1644,21 +1643,180 @@ mod tests {
         assert_eq!(name, "fts_chunks");
     }
 
+    // feature-48: `test_sanitize_fts_query` はここにあった。旧 FTS クエリ加工契約
+    // (クエリ全体を単一 phrase 化) を pin するテストであり、その契約の変更自体が
+    // feature-48 の目的なので、同等以上の網羅を新契約で行う分割表テストを
+    // `db/fts_query.rs` に置いた上で削除した。旧テストの 6 ケースのうち挙動が
+    // 変わらない 3 つ (空 / 空白のみ / `エラー`) は
+    // `old_contract_cases_that_must_not_change` が、残り 3 つ (`E0382` /
+    // `foo "bar" AND` / `ab`) は分割表テストが引き継いでいる。
+
+    // ---------------------------------------------------------------------
+    // feature-48: クエリの token 化が DB 経路で効いていることの確認。
+    // fts_query.rs の unit test は文字列しか見ないので、生成した式が実際に
+    // SQLite に受理され、意図した chunk を引くことはここでしか確かめられない。
+    // ---------------------------------------------------------------------
+
+    /// feature-48 用の 1 doc 1 chunk ヘルパ (`tune.rs` の `add_doc` と同型)。
+    fn add_fts_doc(db: &Database, path: &str, heading: &str, content: &str, e: f32) {
+        let doc = db
+            .upsert_document(path, Some(path), None, None, None, &[], None, path)
+            .unwrap();
+        db.insert_chunk(
+            doc,
+            0,
+            Some(heading),
+            None,
+            content,
+            None,
+            &vec![e; 384],
+            1.0,
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn test_sanitize_fts_query() {
-        assert_eq!(sanitize_fts_query("E0382"), Some("\"E0382\"".to_string()));
-        assert_eq!(
-            sanitize_fts_query("foo \"bar\" AND"),
-            Some("\"foo \"\"bar\"\" AND\"".to_string())
+    fn a_japanese_natural_language_query_now_reaches_fts() {
+        let db = db_with_384();
+        add_fts_doc(
+            &db,
+            "a.md",
+            "再ランキング",
+            "再ランキングの評価をやり直す手順をここにまとめる。",
+            0.1,
         );
-        assert_eq!(sanitize_fts_query(""), None);
-        assert_eq!(sanitize_fts_query("   "), None);
-        assert_eq!(sanitize_fts_query("ab"), None, "trigram 3 文字未満は None");
-        assert_eq!(
-            sanitize_fts_query("エラー"),
-            Some("\"エラー\"".to_string()),
-            "日本語 3 文字は通る"
+        add_fts_doc(&db, "b.md", "無関係", "quokka husbandry notes", 0.2);
+
+        // クエリ全体は 1 件にも逐語で出現しない。旧実装ではここが 0 件だった。
+        let hits = db
+            .search_fts_candidates(
+                "再ランキングの評価について",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "token 化した FTS が本文を引けること");
+        assert_eq!(hits[0].1.path, "a.md");
+
+        // 同じ fixture でも、全体を quote すれば旧挙動 (逐語) に戻る = 逃げ道が効く。
+        let verbatim = db
+            .search_fts_candidates(
+                "\"再ランキングの評価について\"",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert!(
+            verbatim.is_empty(),
+            "quote で囲めば逐語検索のまま = 旧挙動を再現できる"
         );
+    }
+
+    #[test]
+    fn fts_candidates_union_the_tokens_rather_than_intersecting_them() {
+        let db = db_with_384();
+        add_fts_doc(&db, "a.md", "A", "zebrafish larvae in assays", 0.1);
+        add_fts_doc(&db, "b.md", "B", "completely unrelated prose here", 0.2);
+
+        // どちらの chunk も両方の語は持たない。AND なら 0 件になる。
+        let hits = db
+            .search_fts_candidates(
+                "zebrafish prose",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2, "token は OR で結ばれる (AND なら 0 件)");
+    }
+
+    #[test]
+    fn fts_call_is_counted_even_when_the_query_compiles_to_nothing() {
+        // AU-22 の往復会計は「呼んだ回数」で数える。`build_fts_query` が None を
+        // 返すクエリも 1 往復として数える現行の並び順を pin する。
+        let db = db_with_384();
+        add_fts_doc(&db, "a.md", "A", "anything", 0.1);
+        FTS_CANDIDATE_CALLS.with(|c| c.set(0));
+        let _ = db
+            .search_fts_candidates("ab", 10, &SearchFilters::default(), FusionParams::default())
+            .unwrap();
+        assert_eq!(FTS_CANDIDATE_CALLS.with(|c| c.get()), 1);
+    }
+
+    #[test]
+    fn every_generated_expression_is_accepted_by_fts5() {
+        // 文字列比較テストは「生成式が SQLite に受理されるか」を 1 度も見ていない。
+        // escape 崩れ / NUL / 制御文字はここでしか捕まらない。
+        let db = db_with_384();
+        let inputs = [
+            "再ランキングの評価について",
+            "retry budget の設定",
+            "\"Foundry Local\" の設定",
+            "\"再ランキングの評価について\"",
+            "E0382",
+            "暗号化",
+            "評価は",
+            "システム化",
+            "\"ab\" テスト",
+            "ab",
+            "",
+            "   ",
+            "エラー",
+            "foo \"bar\" AND",
+            "\"say \"\"hi\"\"\"",
+            "\"ab\"\"cd\"",
+            "\"\"\"\"",
+            "abc \"def",
+            "\"\" テスト",
+            "abc abc def",
+            "ランキング 再ランキング",
+            "!!! ??? 、。",
+            "sqlite-vec",
+            "kb_mcp",
+            "ＡＢＣ検索",
+            "한국어 Привет",
+            "評価・分析",
+            "クロス・エンコーダ",
+            "再ランキング化",
+            "の評価は",
+            "abcｶﾀｶﾅ",
+            "サーバー",
+            "代々木",
+            "あ亜ア",
+            "再 ランキング",
+            "AI と ML",
+            "heading:foo",
+            "foo OR bar",
+            "再\"ランキング\"",
+            "\"ランキング\"化",
+            "sagashiro-embed-r4 の",
+            "の再ランキング",
+            "\"ランキング\"",
+            "---",
+            "評価\u{FF65}分析",
+            "\"a\0bc\"",
+            "NEAR(a b) * ^x",
+            "emoji 🦀 query",
+            // proptest が縮小して見つけた形。NUL を挟んだ 2 群 + `¹` (U+00B9、
+            // Unicode カテゴリ No なので `is_alphanumeric()` が true = 語構成文字)。
+            // 明示的な入力として残しておく。
+            "A0\u{00B9}\0Aa\u{00B9}",
+        ];
+        for raw in inputs {
+            let hits = db.search_fts_candidates(
+                raw,
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            );
+            assert!(
+                hits.is_ok(),
+                "FTS5 rejected the expression built from {raw:?}: {:?}",
+                hits.err()
+            );
+        }
     }
 
     #[test]

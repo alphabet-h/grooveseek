@@ -1179,10 +1179,12 @@ fn main() -> anyhow::Result<()> {
                          grid was not run."
                     );
                     eprintln!(
-                        "  kb-mcp's FTS wraps the whole query in a single quoted phrase over a \
-                         trigram tokenizer, so a query only reaches FTS when it appears verbatim \
-                         in the text. Add verbatim queries (proper nouns, API names, command \
-                         names) to the golden set and re-run."
+                        "  kb-mcp splits each query into per-token phrases joined by OR over a \
+                         trigram tokenizer, so a query reaches FTS when any of its tokens occurs \
+                         in the text. Queries whose tokens are all shorter than three characters \
+                         fall back to matching the query verbatim. Add queries with distinctive \
+                         terms (proper nouns, API names, command names) to the golden set and \
+                         re-run."
                     );
                     for (id, d) in &diagnostics {
                         eprintln!("  {id}: FTS candidates = {}", d.fts_candidates);

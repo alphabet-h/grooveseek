@@ -55,6 +55,17 @@ match_spans  → top-`limit` SearchHit を
 
 `vec_chunks` (sqlite-vec、L2 距離 — sqlite-vec 既定のメトリック) と `fts_chunks` (v0.12.0 以降は `heading` / `context` / `content` の 3 列に対する FTS5 trigram を bm25 でスコアリング、既定では見出しに 2 倍重み) からそれぞれ top-N を取り、Rust 側で Reciprocal Rank Fusion (既定 `k = 60`、RRF の標準定数) でマージする。クライアントに返す `score` は RRF スコア (大きいほど良い) で距離ではない。
 
+**クエリが FTS5 に届くまで** (v0.16.0+): クエリ文字列はそのまま投げられるわけではない。`build_fts_query` がクエリを quoted phrase の集合にコンパイルし、` OR ` で結合する:
+
+- `"..."` で囲んだ区間は **逐語 phrase** として温存される。規約は FTS5 自身の doubled-quote 規約と同じ (phrase 内の `""` は literal な `"` 1 文字)。内容が 3 文字未満の quoted phrase は落とす
+- quote の外は、まず Separator (空白・句読点・記号) で群に割り、さらに群の中を **文字種境界** (漢字 / ひらがな / カタカナ / それ以外の語構成文字) で割る。`再ランキングの評価について` は `再` / `ランキング` / `の` / `評価` / `について` の run になる
+- 3 文字未満の run (trigram の下限。これ未満の phrase は何にもマッチしない) は、**同じ群の中で** 隣接 run と連結して 3 文字以上にする。その連結が「単独で成立していた区間」を拡張した場合は、拡張前の区間も phrase として併せて出す: `再ランキング` は `ランキング` も、`システム化` は `システム` も出す
+- phrase 列は重複除去し、32 個で打ち切り、` OR ` で結合する
+
+つまり `再ランキングの評価について` は `"再ランキング" OR "ランキング" OR "の評価" OR "について"` に、`"Foundry Local" の設定` は `"Foundry Local" OR "の設定"` になる。v0.16.0 より前はクエリ全体を 1 個の phrase にしていたが、trigram tokenizer の上ではこれは逐語の部分文字列検索であり、日本語の自然文クエリでは FTS 候補が 0 件だった — hybrid の FTS 半身が実質死んでおり、ベクトル側だけが動いていた。
+
+トークン化で phrase が 1 つも作れなかった場合 — `AI と ML` のように全断片が下限未満のケース — は、trim 後のクエリ全体が旧来の 1 phrase 形式に fallback するので、この形のクエリが後退することはない。FTS を完全に飛ばしてベクトル単独になるのは、trim 後に 3 文字未満のクエリだけである。クエリ全体を quote すれば旧来の逐語検索をそのまま再現できる。これは query 側だけの変更で、index も schema も tokenizer も変えていない = **再 index は不要**。
+
 RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `kb-mcp.toml` の `[search.fusion]` で設定できる (ビルトイン既定値は `rrf_k = 60.0`、`heading / context / content = 2.0 / 1.0 / 1.0`)。実測の裏付けが無い限り触らないこと — この 2 つのつまみが自分の KB で検索品質をどれだけ (あるいは全く) 動かさないかは `kb-mcp tune` が報告する。詳細は [eval.ja.md](./eval.ja.md) を参照。
 
 `kb-mcp eval` が既定で測定するのはこの段。ここを底上げするとパイプライン全体の floor が上がる。

@@ -299,6 +299,18 @@ fn legacy_metric_version() -> u32 {
     1
 }
 
+/// 現行の FTS クエリコンパイル規則の version。クエリ文字列から FTS5 の MATCH 式を
+/// 作る規則 (`db::fts_query::build_fts_query`) の**出力が変わる**変更のたびに +1 する。
+/// [`ConfigFingerprint::fts_query_version`] を参照。
+///
+/// [`METRIC_VERSION`] とは責務が違う。あちらは recall / MRR / nDCG の**計算式**専用で
+/// 「同じ検索結果から違う数値が出る」ケース、こちらは**検索結果そのもの**が変わるケース。
+pub const FTS_QUERY_VERSION: u32 = 2;
+
+fn legacy_fts_query_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigFingerprint {
     pub model: String,
@@ -317,6 +329,21 @@ pub struct ConfigFingerprint {
     /// - v2: hit 主導の 1:1 貪欲マッチ (expected 側重複の多重計上 fix)
     #[serde(default = "legacy_metric_version")]
     pub metric_version: u32,
+
+    /// FTS クエリのコンパイル規則の version (feature-48)。
+    ///
+    /// クエリ文字列を FTS5 の MATCH 式に変換する規則が変わると、**同じ index・同じ
+    /// golden・同じ設定でも検索結果そのものが変わる**。旧 history JSON (field なし =
+    /// serde default で 1) とは `PartialEq` 不一致になり
+    /// [`History::previous_compatible`] の比較対象から自動的に外れるので、
+    /// 規則変更が `--fail-on-regression` で retrieval regression として誤検出されない。
+    ///
+    /// mmr / parent_retriever / fusion / context が `Option` なのは「既定なら旧 baseline と
+    /// 比較可能」を表すためだが、この規則には off の状態が無いので versioned int にしている。
+    /// - v1: 初版〜v0.15.x (クエリ全体を単一 quoted phrase = 実質 verbatim 部分文字列検索)
+    /// - v2: v0.16.0〜 (文字種 run に分割して OR 結合、全断片が短い場合は v1 の式へ fallback)
+    #[serde(default = "legacy_fts_query_version")]
+    pub fts_query_version: u32,
 
     /// MMR が有効な場合のみ Some。off (default) なら None で旧 history JSON
     /// と互換維持。enabled=true でのみ lambda + same_doc_penalty を fingerprint
@@ -447,6 +474,7 @@ impl ConfigFingerprint {
             k_values,
             golden_hash,
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr,
             parent_retriever,
             fusion,
@@ -1096,6 +1124,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
             k_values: k_values.clone(),
             golden_hash,
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr: mmr_fp,
             parent_retriever: parent_fp,
             fusion: fusion_fp,
@@ -1561,6 +1590,7 @@ mod tests {
                 k_values: vec![1, 5, 10],
                 golden_hash: "deadbeef".into(),
                 metric_version: METRIC_VERSION,
+                fts_query_version: FTS_QUERY_VERSION,
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
@@ -1637,6 +1667,7 @@ mod tests {
                 k_values: vec![1, 5],
                 golden_hash: "h".into(),
                 metric_version: METRIC_VERSION,
+                fts_query_version: FTS_QUERY_VERSION,
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
@@ -1664,6 +1695,7 @@ mod tests {
             k_values: vec![5],
             golden_hash: "h".into(),
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr: None,
             parent_retriever: None,
             fusion: None,
@@ -1706,6 +1738,7 @@ mod tests {
             k_values: vec![5],
             golden_hash: "AAA".into(),
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr: None,
             parent_retriever: None,
             fusion: None,
@@ -1754,6 +1787,7 @@ mod tests {
                 k_values: vec![1, 5],
                 golden_hash: "abc".into(),
                 metric_version: METRIC_VERSION,
+                fts_query_version: FTS_QUERY_VERSION,
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
@@ -1783,6 +1817,7 @@ mod tests {
             k_values: vec![5],
             golden_hash: "h".into(),
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr: None,
             parent_retriever: None,
             fusion: None,
@@ -1824,6 +1859,7 @@ mod tests {
             k_values: vec![5],
             golden_hash: "h".into(),
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr: None,
             parent_retriever: None,
             fusion: None,
@@ -1871,6 +1907,7 @@ mod tests {
             k_values: vec![5],
             golden_hash: "h".into(),
             metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
             mmr: None,
             parent_retriever: None,
             fusion: None,
@@ -1947,6 +1984,7 @@ mod tests {
                 k_values: recall.keys().copied().collect(),
                 golden_hash: golden_hash.into(),
                 metric_version: METRIC_VERSION,
+                fts_query_version: FTS_QUERY_VERSION,
                 mmr: None,
                 parent_retriever: None,
                 fusion: None,
@@ -2394,7 +2432,7 @@ enabled = true
         let fp: ConfigFingerprint = serde_json::from_str(json).unwrap();
         assert!(fp.context.is_none());
 
-        let now = ConfigFingerprint::from_config(
+        let mut now = ConfigFingerprint::from_config(
             &crate::config::Config::default(),
             "bge-small-en-v1.5".into(),
             None,
@@ -2402,6 +2440,11 @@ enabled = true
             vec![1, 5, 10],
             "abc".into(),
         );
+        // feature-48: pre-feature-46 の history は fts_query_version も持たない (= v1)。
+        // ここで見たいのは context の serde(default) なので、世代マーカーだけ揃えて
+        // 比較する。世代が違えば非互換になること自体は
+        // `test_fingerprint_without_fts_query_version_is_read_as_v1` が別に pin している。
+        now.fts_query_version = 1;
         assert_eq!(
             fp, now,
             "a context-off run must stay comparable with pre-feature-46 history"
@@ -2461,12 +2504,58 @@ enabled = true
             k_values: vec![1, 5, 10],
             golden_hash: "abc".into(),
             metric_version: 2,
+            // JSON 側にも field が無い = serde default の 1。この test が見ているのは
+            // fusion の default 互換なので、両辺を同じ世代に揃える。
+            fts_query_version: 1,
             mmr: None,
             parent_retriever: None,
             fusion: None,
             context: None,
         };
         assert_eq!(fp, now);
+    }
+
+    #[test]
+    fn test_fingerprint_without_fts_query_version_is_read_as_v1() {
+        // feature-48 より前に書かれた history JSON は field を持たない。
+        let json = r#"{
+            "model": "bge-small-en-v1.5",
+            "reranker": null,
+            "limit": 10,
+            "k_values": [1, 5, 10],
+            "golden_hash": "abc",
+            "metric_version": 2
+        }"#;
+        let old: ConfigFingerprint = serde_json::from_str(json).unwrap();
+        assert_eq!(old.fts_query_version, 1);
+
+        // v2 の run とは非互換 = 旧 baseline が比較対象から外れる。クエリの
+        // コンパイル規則が変われば検索結果そのものが変わるので、これは
+        // retrieval regression ではなく「世代が違う」として扱われなければならない。
+        let mut now = old.clone();
+        now.fts_query_version = FTS_QUERY_VERSION;
+        assert_ne!(old, now);
+    }
+
+    #[test]
+    fn test_fingerprint_always_serializes_fts_query_version() {
+        // skip_serializing_if を付けていないので、新しい run は必ず値を書く。
+        // 書かないと次回の run が「旧世代 = v1」と読んで誤って互換判定してしまう。
+        let fp = ConfigFingerprint {
+            model: "m".into(),
+            reranker: None,
+            limit: 10,
+            k_values: vec![5],
+            golden_hash: "h".into(),
+            metric_version: METRIC_VERSION,
+            fts_query_version: FTS_QUERY_VERSION,
+            mmr: None,
+            parent_retriever: None,
+            fusion: None,
+            context: None,
+        };
+        let v = serde_json::to_value(&fp).unwrap();
+        assert_eq!(v["fts_query_version"], serde_json::json!(FTS_QUERY_VERSION));
     }
 
     // -----------------------------------------------------------------------

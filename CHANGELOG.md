@@ -4,6 +4,62 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Changed
+
+- **The FTS half of the hybrid search now works on natural-language queries**
+  (feature-48). Until now `sanitize_fts_query` wrapped the entire query in one
+  quoted phrase; over a trigram tokenizer that is a verbatim substring search,
+  so a Japanese sentence-shaped query matched nothing at all. Measured on the
+  dogfood knowledge base, **all ten natural-language golden queries returned
+  zero FTS candidates** — the hybrid search was quietly running on vectors
+  alone, and the RRF fusion had only one side to fuse.
+
+  Queries are now compiled into per-token phrases joined by `OR`. Tokens come
+  from script boundaries (kanji / hiragana / katakana / other word characters)
+  inside runs that carry no separator, so `再ランキングの評価について` becomes
+  `"再ランキング" OR "ランキング" OR "の評価" OR "について"`. Runs shorter than the
+  trigram floor are merged with their neighbours rather than dropped, and when
+  a merge swallows a term that stood on its own, that term is kept as its own
+  phrase too — so a document holding only `ランキング` is still reachable.
+
+  **This changes search results for every user, which is why it is a minor
+  release.** Two things keep it from taking anything away. A `"quoted section"`
+  is preserved verbatim, so quoting the whole query reproduces the old
+  behaviour exactly. And when tokenization yields no usable phrase — a query
+  made entirely of short fragments such as `AI と ML` — the old whole-query
+  phrase is used as a fallback. The set of documents FTS can reach is
+  therefore a superset of what it reached before; only the ranking moves,
+  which is the point.
+
+  **No re-indexing is required**: the index, the schema and the tokenizer are
+  untouched. Only the query side changed.
+
+  Measured on a 650-document / 9,419-chunk knowledge base (bge-m3, no
+  reranker), comparing the same index before and after: every one of the ten
+  natural-language queries that FTS could not answer at all now returns
+  candidates, taking the golden set from 16 of 26 queries where fusion can act
+  to 26 of 26. MRR rose from 0.955 to 0.962 on the main golden and from 0.939
+  to 0.955 on the binary-format one; recall@10 rose from 0.954 to 0.965.
+  recall@5 fell from 0.926 to 0.906, and nDCG@5 from 0.894 to 0.876: on two of
+  the twenty-six queries a second expected document slid from rank five to rank
+  eight, displaced by other documents on the same topic. In both cases the
+  first hit was as good or better than before — under the old behaviour those
+  slots were held by repeated chunks of a document already ranked first.
+
+- **`kb-mcp eval` records `fts_query_version` in its config fingerprint.**
+  Query compilation decides what search returns, so a change to it makes older
+  runs incomparable in the same way a model or reranker change does. Runs
+  recorded before this release read as version 1 and are dropped from the
+  comparison instead of being reported as a retrieval regression by
+  `--fail-on-regression`. Existing history files stay readable.
+
+- **`kb-mcp tune` diagnostics changed meaning, not thresholds.** The `docfreq`
+  column now counts chunks matching *any* of the query's phrases, so it is an
+  upper bound on the document frequency of each individual phrase rather than
+  the frequency of one phrase. `CLMP` therefore flags a query worth inspecting
+  rather than proving that FTS5 has clamped every phrase's IDF. The report
+  legend and the `exit 2` guidance were rewritten to say so.
+
 ## [0.15.2] - 2026-08-12
 
 ### Changed

@@ -133,7 +133,13 @@ pub struct QueryDiagnostics {
     pub vec_fts_overlap: usize,
     /// grid 端の重み (heading 偏重 vs content 偏重) で FTS 順位が変わったか。
     pub bm25_sensitive: bool,
-    /// phrase doc-freq が chunk 総数の半分以上 = IDF が 1e-6 に潰れている。
+    /// クエリがマッチする chunk が総数の半分以上 = FTS5 の IDF クランプ域。
+    ///
+    /// feature-48 以降、この値は **OR 集合の和集合**の大きさから決まる。FTS5 は
+    /// IDF を phrase ごとに計算してクランプするので、これは個々の phrase の
+    /// doc-freq の**上界**でしかない: `false` なら「どの phrase もクランプされて
+    /// いない」の健全な証拠だが、`true` は「互いに素な希少 phrase が積み上がって
+    /// 和集合が半分を超えた」だけの場合もある (どれもクランプされておらず重みは効く)。
     pub idf_clamped: bool,
     /// 参考出力: 既定条件の融合結果に現れた f32 同点の隣接ペア数 (E-7)。
     pub rrf_ties: usize,
