@@ -4,6 +4,32 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Added
+
+- **The cost of the full-text half is now measured, documented and guarded**
+  (BU-03). `ORDER BY bm25(...)` scores every matching row before `LIMIT`
+  applies, so the cost tracks how many rows the expression matches, not how
+  many you asked for. Measured in the worst case (every phrase matching every
+  row): a single-phrase query costs 4.3 / 16.0 / 32.8 ms at 5k / 20k / 40k
+  rows, the 32-phrase `OR` costs 46.9 / 171 / 329 ms. Both are linear in the
+  matching population; the **~10×** multiple between them is flat across corpus
+  sizes, and cost grows roughly linearly with phrase count.
+
+  Three things follow, all now in `docs/retrieval-pipeline`. Lowering a limit
+  does **not** reduce this cost (339 ms at `LIMIT 1` vs 329 ms at `LIMIT 100`
+  on 40k rows), so the over-fetch cap is left alone. Matching every row was
+  always one common substring away (`"について"` does it with a single phrase),
+  so per-token compilation did not raise the ceiling on rows touched — but it
+  did raise the ceiling on cost by roughly 10×. And the knob that would bound
+  the worst case is the phrase cap, not any limit; it stays where feature-48's
+  retrieval evaluation measured it until the recall cost of lowering it has
+  been measured too.
+
+  The regression guard pins the *multiple* rather than an absolute timing,
+  alongside an always-on test that the `OR` stays a union executed as one
+  statement — that one counts statements traced out of SQLite, not calls into
+  the Rust method that issues them.
+
 ### Changed (breaking)
 
 - **`kb-mcp serve --bind <non-loopback>` now requires `--i-know`** (BU-01).

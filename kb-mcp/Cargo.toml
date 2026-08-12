@@ -116,6 +116,12 @@ tower = { version = "0.5", features = ["util"] }
 # trading ~30s of compile time per first build for (no HTML; we already use
 # the JSON output for trend tracking).
 criterion = { version = "0.5", default-features = false }
+# (BU-03) `Connection::trace` — lets a test count the SQL statements a search
+# actually executes, instead of counting calls to the Rust method that issues
+# them. The feature is declared **only here**, so a plain `cargo build` links
+# rusqlite without it and the shipped binary is unaffected; Cargo unifies the
+# feature into the same rusqlite when it builds the test targets.
+rusqlite = { version = "0.39", features = ["trace"] }
 
 # Each `[[bench]]` entry below MUST set `harness = false` because criterion
 # brings its own harness. `name` matches the file under `benches/`.
