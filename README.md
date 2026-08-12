@@ -258,7 +258,7 @@ kb-mcp serve --kb-path ... --transport http --port 3100         # HTTP, multi-cl
 kb-mcp serve --kb-path ... --no-watch                           # disable live-sync
 ```
 
-Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](#http-transport-for-multiple-simultaneous-clients) section.
+Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](#http-transport-for-multiple-simultaneous-clients) section. A `--bind` outside loopback additionally requires `--i-know`, because kb-mcp ships no authentication.
 
 The server exposes 6 tools (see below) and keeps the index in-process for low-latency queries. `--model` must match the model that built the current index, otherwise the server refuses to start with an actionable error message. A file watcher (enabled by default) re-indexes affected files when the contents under `--kb-path` change — see [Live-sync via file watcher](#live-sync-via-file-watcher).
 
@@ -691,7 +691,7 @@ By default `kb-mcp serve` speaks MCP over stdio — one client per server proces
 
 ```bash
 kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
-# or: --bind 0.0.0.0:3100
+# or, to accept connections from outside this machine: --bind 0.0.0.0:3100 --i-know
 ```
 
 The server mounts the MCP endpoint at `/mcp` and exposes `/healthz` for probes. `.mcp.json` for an HTTP-capable client:
@@ -708,9 +708,9 @@ The server mounts the MCP endpoint at `/mcp` and exposes `/healthz` for probes. 
 ```
 
 Security notes:
-- Default bind is `127.0.0.1:3100` (loopback). Use `--bind 0.0.0.0:3100` only on trusted networks — **kb-mcp has no built-in authentication yet**.
-- rmcp's Streamable HTTP layer enforces Host header validation (loopback only by default) to prevent DNS rebinding attacks.
-- For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `kb-mcp.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; kb-mcp emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics) — operator-acknowledged opt-out, not recommended for public deployments.
+- Default bind is `127.0.0.1:3100` (loopback). **kb-mcp has no built-in authentication**, so the bind address is the only access control — use `--bind 0.0.0.0:3100` on trusted networks only. Since v0.17.0 a non-loopback `--bind` is refused unless you add `--i-know`, matching `kb-mcp service install`. A non-loopback address coming from `[transport.http].bind` in `kb-mcp.toml` is **not** gated — existing service deployments keep working — and it warns at startup only when the Host allow-list is missing or empty (see the next two bullets). Writing an explicit `allowed_hosts` list is taken as a statement of intent, so that combination is silent by design.
+- rmcp's Streamable HTTP layer enforces Host header validation (loopback only by default) to prevent DNS rebinding attacks. **Host validation is not authentication** — any peer that can reach the port may send `Host: localhost`. Treat it as a browser-side defence, and restrict reachability at the network layer.
+- For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `kb-mcp.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; kb-mcp emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics), which combined with a non-loopback bind leaves `/mcp` open to every peer that can reach the port — that combination now warns at startup too.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
 ### Web UI and admin API (HTTP transport only)
@@ -837,6 +837,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **Embedding dimensions**: Depends on `--model`. BGE-small-en-v1.5 = 384, BGE-M3 = 1024. The chosen dim is declared on the `vec_chunks` virtual table and recorded in the `index_meta` table; a mismatch at runtime is detected and rejected.
 - **Incremental indexing**: Files are tracked by SHA-256 content hash. Only changed files are re-embedded on subsequent `index` runs (unless `--force` is passed). Moving / renaming a file without modifying its content is detected via hash match and handled as a `documents.path` UPDATE — the existing chunks, embeddings, and FTS rows are reused instead of being rebuilt. The rebuild summary reports the number of renames as `renamed` next to `updated` / `deleted`.
 - **Resilient to unreadable / non-UTF-8 files**: a file that fails to read, exceeds the size cap, or fails to parse is skipped with a warning instead of aborting the whole `index` run — a stray binary file mixed into `--kb-path` no longer breaks indexing for the rest of the knowledge base.
+- **Size caps**: 50 MiB of raw bytes per file, checked with `stat` before the file is read, for text (`MAX_RAW_TEXT_BYTES`, v0.17.0+) as well as binary formats (`MAX_RAW_BINARY_BYTES`). Text used to be uncapped, which let a single oversized `.md` pull its whole content into memory — reachable from any client, since `rebuild_index` is an MCP tool. Files over the cap are skipped with a warning naming which limit applied.
 - **Hybrid search (FTS5 + vector)**: The `search` tool combines SQLite FTS5 full-text search (trigram tokenizer, works for Japanese/CJK too; three columns since v0.12.0 — `heading`, `context`, `content` — with `heading` weighted 2× in bm25 by default) with the vector search via Reciprocal Rank Fusion (`k = 60` by default). Both the weights and `k` are configurable under `[search.fusion]` since v0.13.0, and `kb-mcp tune` measures whether moving them helps on your KB. The returned `score` is the RRF score (higher = better), not a distance. Since v0.16.0 the query is compiled into per-token phrases joined with `OR` rather than searched verbatim (see "One-shot search from the command line" above). A query that yields no usable phrase falls back to vector-only — but a query whose fragments are all short falls back to one whole-query verbatim phrase first, so vector-only happens exactly when the query is under 3 characters after trimming (below the trigram minimum).
 - **Optional reranking**: With `--reranker <model>` the top candidates are re-scored by a cross-encoder before being returned. When rerank is applied, `score` is the cross-encoder raw score instead of the RRF value. Reranking is index-independent — you can toggle it at server start without re-indexing.
 - **Connection graph**: `get_connection_graph` / `kb-mcp graph` do BFS over the vector index starting from a document. No extra index is built; every hop runs a fresh sqlite-vec KNN. Bounded by `depth ≤ 3` / `fan_out ≤ 20` with client-side clamping, so worst-case is ~21 KNN queries per request. Scores are cosine similarity approximated from L2 distance (`1 - d²/2`, clamped to `[0,1]`) assuming unit-normalized embeddings (BGE-small / BGE-M3 are normalized internally).

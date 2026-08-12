@@ -2348,6 +2348,69 @@ mod tests {
         );
     }
 
+    /// (BU-04) 融合後の順位で FTS 側の寄与を見る。
+    ///
+    /// 既存の hybrid テストは、FTS が当たる chunk に**クエリ埋め込みと同じ
+    /// ベクトル**を持たせていた。つまり FTS が完全に死んでいてもベクトル
+    /// だけで 1 位になり、緑のまま通る。feature-48 が直した「日本語自然文で
+    /// FTS 候補が 0 件」という欠陥が 15 リリース生き延びたのはこれが理由。
+    ///
+    /// ここでは配置を逆にする: **FTS が当たる側をベクトル的に遠く**し、
+    /// 当たらない decoy をクエリ埋め込みと完全一致させる。ベクトルだけなら
+    /// decoy が 1 位 (RRF で 1/61)。FTS が生きていれば target は
+    /// 1/62 + 1/61 で decoy を上回る。**FTS の寄与が消えた瞬間に順位が入れ替わる。**
+    #[test]
+    fn fts_decides_the_top_rank_when_the_vector_leg_prefers_another_chunk() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("ja.md", Some("ja"), None, None, None, &[], None, "h")
+            .unwrap();
+        // FTS で当たる側。ベクトルはクエリから遠い。
+        db.insert_chunk(
+            doc_id,
+            0,
+            None,
+            None,
+            "再ランキングの評価について測定した記録",
+            None,
+            &dummy_embedding(0.9),
+            1.0,
+        )
+        .unwrap();
+        // FTS では当たらない側。ベクトルはクエリと完全一致 = 単独なら 1 位。
+        // クエリが生む phrase (再ランキング / ランキング / の評価 / について)
+        // と trigram を共有しない語を選んでいる。
+        db.insert_chunk(
+            doc_id,
+            1,
+            None,
+            None,
+            "犬と猫が公園を走った",
+            None,
+            &dummy_embedding(0.5),
+            1.0,
+        )
+        .unwrap();
+
+        let hits = db
+            .search_hybrid(
+                "再ランキングの評価について",
+                &dummy_embedding(0.5),
+                5,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 2, "both chunks should survive fusion");
+        assert!(
+            hits[0].content.contains("再ランキング"),
+            "the FTS-matching chunk must outrank the vector-nearest decoy, \
+             otherwise the full-text half is contributing nothing: got {:?}",
+            hits.iter().map(|h| h.content.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_backfill_fts_hydrates_preexisting_db() {
         let db = db_with_384();

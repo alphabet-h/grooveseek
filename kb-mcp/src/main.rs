@@ -124,6 +124,13 @@ enum Commands {
         /// `127.0.0.1`. Default: 3100. Ignored if `--bind` is given.
         #[arg(long)]
         port: Option<u16>,
+        /// Acknowledge that `--bind` points at a non-loopback address.
+        ///
+        /// kb-mcp has no authentication, so the bind address is the only
+        /// access control. Without this flag a non-loopback `--bind` is
+        /// refused, matching `kb-mcp service install`.
+        #[arg(long = "i-know", default_value_t = false)]
+        i_know_non_loopback: bool,
     },
     /// Build or rebuild the search index
     Index {
@@ -564,6 +571,7 @@ fn main() -> anyhow::Result<()> {
             transport: cli_transport,
             bind,
             port,
+            i_know_non_loopback,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
@@ -599,6 +607,9 @@ fn main() -> anyhow::Result<()> {
                 port,
                 cfg.transport.as_ref(),
             )?;
+            // (BU-01) `--bind <non-loopback>` は `--i-know` で追認させる。
+            // toml 由来の bind は gate しない (理由は check_cli_bind_ack の doc)。
+            kb_mcp::transport::check_cli_bind_ack(&resolved_transport, bind, i_know_non_loopback)?;
 
             // [search].min_confidence_ratio: 省略時 1.5、0.0 は判定無効。
             // CLI override (`--min-confidence-ratio`) は Task 8 で追加。

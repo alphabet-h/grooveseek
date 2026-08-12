@@ -76,38 +76,49 @@ struct DiskScan {
 /// round 2: watcher 経路が `scan_disk_entries` の size-cap 保護をバイパス
 /// して 50 MiB 超ファイルを全量 read/hash してしまう問題の修正)。
 ///
-/// - `is_binary_ext` が `false` (テキスト形式) なら常に `Ok(None)` (size cap 対象外)
-/// - 超過していれば `Ok(Some(actual_len))`、cap 内なら `Ok(None)`
+/// - 適用する cap は拡張子で決まる (`is_binary_ext` なら `max_binary`、
+///   そうでなければ `max_text`)。**(BU-02) テキストにも cap がある** —
+///   以前はテキストを無条件に `Ok(None)` で通しており、巨大な `.md` 1 本で
+///   `fs::read` が OOM を起こせた (`rebuild_index` は MCP から叩ける)
+/// - 超過していれば `Ok(Some((actual_len, applied_cap)))`、cap 内なら `Ok(None)`。
+///   cap を返すのは、呼び出し側の警告文が「何 byte 制限を超えたか」を
+///   自前で再計算しなくて済むようにするため
 /// - `fs::metadata` 自体の失敗は `Err` としてそのまま伝播する。size cap の
 ///   判定とは別関心事なので、呼び出し側が既存の stat/read エラー処理に委ねる
-fn binary_size_exceeded(
+fn size_cap_exceeded(
     path: &Path,
     is_binary_ext: bool,
-    max: u64,
-) -> std::io::Result<Option<u64>> {
-    if !is_binary_ext {
-        return Ok(None);
-    }
+    max_binary: u64,
+    max_text: u64,
+) -> std::io::Result<Option<(u64, u64)>> {
+    let cap = if is_binary_ext { max_binary } else { max_text };
     let meta = std::fs::metadata(path)?;
-    Ok(if meta.len() > max {
-        Some(meta.len())
+    Ok(if meta.len() > cap {
+        Some((meta.len(), cap))
     } else {
         None
     })
+}
+
+/// 超過警告に使う「binary」/「text」の語。cap が拡張子で決まるので、
+/// 警告文も同じ分岐で選ぶ (どちらの上限に当たったか読み手に分かるように)。
+fn size_cap_kind(is_binary_ext: bool) -> &'static str {
+    if is_binary_ext { "binary" } else { "text" }
 }
 
 /// disk 側の全 source file を走査し、raw バイト読み + バイト hash を計算する。
 ///
 /// - **エラー隔離**: `read` 失敗や size 超過は per-file skip し、rel path を `skipped`
 ///   に積んで走査を続行する (旧 `.collect::<Result<Vec>>()?` の全体 abort を修正)。
-/// - **size skip**: `is_binary()` な拡張子は `max_binary_bytes` 超で read 前に skip
-///   ([`binary_size_exceeded`] の `fs::metadata` 判定でメモリ読込自体を回避)。
-///   テキスト形式は上限なし。
+/// - **size skip**: 拡張子ごとの cap (`max_binary_bytes` / `max_text_bytes`) を
+///   超えるファイルは read 前に skip する ([`size_cap_exceeded`] の
+///   `fs::metadata` 判定でメモリ読込自体を回避)。
 fn scan_disk_entries(
     source_files: &[std::path::PathBuf],
     kb_path: &Path,
     registry: &Registry,
     max_binary_bytes: u64,
+    max_text_bytes: u64,
 ) -> DiskScan {
     let binary_exts = registry.binary_extensions();
     let mut entries = Vec::with_capacity(source_files.len());
@@ -122,11 +133,10 @@ fn scan_disk_entries(
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
 
-        match binary_size_exceeded(p, is_binary, max_binary_bytes) {
-            Ok(Some(len)) => {
-                eprintln!(
-                    "Skipping {rel}: binary file too large ({len} bytes > {max_binary_bytes} limit)"
-                );
+        match size_cap_exceeded(p, is_binary, max_binary_bytes, max_text_bytes) {
+            Ok(Some((len, cap))) => {
+                let kind = size_cap_kind(is_binary);
+                eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
                 skipped.push(rel);
                 continue;
             }
@@ -368,6 +378,7 @@ pub fn rebuild_index(
         &kb_path,
         registry,
         crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
     );
     let disk_entries = scan.entries;
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
@@ -715,15 +726,16 @@ pub fn reindex_single_file(
         .binary_extensions()
         .iter()
         .any(|e| e.eq_ignore_ascii_case(ext));
-    if let Ok(Some(len)) =
-        binary_size_exceeded(&full, is_binary_ext, crate::parser::MAX_RAW_BINARY_BYTES)
-    {
-        eprintln!(
-            "Skipping {rel}: binary file too large ({len} bytes > {} limit)",
-            crate::parser::MAX_RAW_BINARY_BYTES
-        );
+    if let Ok(Some((len, cap))) = size_cap_exceeded(
+        &full,
+        is_binary_ext,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    ) {
+        let kind = size_cap_kind(is_binary_ext);
+        eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
         return Ok(SingleResult::Skipped {
-            reason: "binary file too large",
+            reason: "file too large",
         });
     }
 
@@ -818,13 +830,14 @@ pub fn rename_single_file(
         .binary_extensions()
         .iter()
         .any(|e| e.eq_ignore_ascii_case(ext));
-    if let Ok(Some(len)) =
-        binary_size_exceeded(&full, is_binary_ext, crate::parser::MAX_RAW_BINARY_BYTES)
-    {
-        eprintln!(
-            "Skipping {new_rel}: binary file too large ({len} bytes > {} limit)",
-            crate::parser::MAX_RAW_BINARY_BYTES
-        );
+    if let Ok(Some((len, cap))) = size_cap_exceeded(
+        &full,
+        is_binary_ext,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    ) {
+        let kind = size_cap_kind(is_binary_ext);
+        eprintln!("Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit)");
         return Ok(RenameOutcome::RenamedSizeCapped);
     }
 
@@ -1523,7 +1536,13 @@ mod tests {
         let missing = tmp.0.join("gone.md");
         let reg = Registry::defaults();
         let source = vec![tmp.0.join("ok.md"), missing];
-        let scan = scan_disk_entries(&source, &tmp.0, &reg, crate::parser::MAX_RAW_BINARY_BYTES);
+        let scan = scan_disk_entries(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
         let entry_rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
         assert_eq!(entry_rels, vec!["ok.md"]);
         assert_eq!(scan.skipped, vec!["gone.md".to_string()]);
@@ -1538,8 +1557,14 @@ mod tests {
         // 別途 binary 拡張子は PR-2 で結合テストする。cap の効果は次の assert で。
         write_file(&tmp.0, "small.md", "# tiny");
         let reg = Registry::defaults();
-        // md は is_binary=false なので size cap の対象外 = cap を 1 にしても通る。
-        let scan = scan_disk_entries(&[tmp.0.join("small.md")], &tmp.0, &reg, 1);
+        // md は is_binary=false なので **binary** cap の対象外 = 1 にしても通る。
+        let scan = scan_disk_entries(
+            &[tmp.0.join("small.md")],
+            &tmp.0,
+            &reg,
+            1,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
         assert_eq!(
             scan.entries.len(),
             1,
@@ -1548,25 +1573,57 @@ mod tests {
         assert!(scan.skipped.is_empty());
     }
 
+    /// (BU-02) テキストにも cap がある。上の test と対になっていて、
+    /// 「binary cap は効かないが text cap は効く」を両側から挟む。
+    #[test]
+    fn test_scan_disk_entries_text_over_its_own_cap_goes_to_skipped() {
+        let tmp = mk_tmp("scansizetext");
+        write_file(&tmp.0, "big.md", "0123456789"); // 10 bytes
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[tmp.0.join("big.md")],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            5,
+        );
+        assert!(
+            scan.entries.is_empty(),
+            "a text file over the text cap must not be read"
+        );
+        assert_eq!(scan.skipped, vec!["big.md".to_string()]);
+    }
+
     // -----------------------------------------------------------------------
-    // binary_size_exceeded
+    // size_cap_exceeded
     // -----------------------------------------------------------------------
 
+    /// (BU-02、**旧 `test_binary_size_exceeded_none_for_text_ext` を差し替え**)
+    /// テキストは binary cap を無視するが、自分の cap は無視しない。
+    ///
+    /// 旧テストは `is_binary_ext=false` なら実サイズに関わらず `None` を返す
+    /// ことを固定していた = 「テキストに上限なし」を契約として守っていた。
+    /// これが BU-02 の欠陥そのもの (巨大な `.md` 1 本で `fs::read` が OOM。
+    /// `rebuild_index` は MCP 経由でクライアントから叩ける) なので反転する。
     #[test]
-    fn test_binary_size_exceeded_none_for_text_ext() {
-        // is_binary_ext=false ならファイル実サイズに関わらず常に None
-        // (テキスト形式は size cap 対象外)。
+    fn test_text_ext_uses_the_text_cap_not_the_binary_one() {
         let tmp = mk_tmp("sizecap-text");
-        write_file(&tmp.0, "big.md", "0123456789");
-        let result = binary_size_exceeded(&tmp.0.join("big.md"), false, 1).unwrap();
-        assert_eq!(result, None);
+        write_file(&tmp.0, "big.md", "0123456789"); // 10 bytes
+        let path = tmp.0.join("big.md");
+        // binary cap = 1 でも text なので当たらない。
+        assert_eq!(size_cap_exceeded(&path, false, 1, 1024).unwrap(), None);
+        // text cap = 5 なら当たる。返る cap は「適用された方」。
+        assert_eq!(
+            size_cap_exceeded(&path, false, 1024, 5).unwrap(),
+            Some((10, 5))
+        );
     }
 
     #[test]
     fn test_binary_size_exceeded_none_when_within_cap() {
         let tmp = mk_tmp("sizecap-ok");
         write_file(&tmp.0, "small.pdf", "tiny");
-        let result = binary_size_exceeded(&tmp.0.join("small.pdf"), true, 1024).unwrap();
+        let result = size_cap_exceeded(&tmp.0.join("small.pdf"), true, 1024, 1024).unwrap();
         assert_eq!(result, None);
     }
 
@@ -1574,15 +1631,22 @@ mod tests {
     fn test_binary_size_exceeded_some_when_over_cap() {
         let tmp = mk_tmp("sizecap-over");
         write_file(&tmp.0, "big.pdf", "0123456789"); // 10 bytes
-        let result = binary_size_exceeded(&tmp.0.join("big.pdf"), true, 5).unwrap();
-        assert_eq!(result, Some(10));
+        let result = size_cap_exceeded(&tmp.0.join("big.pdf"), true, 5, 1024).unwrap();
+        assert_eq!(result, Some((10, 5)));
     }
 
     #[test]
     fn test_binary_size_exceeded_err_when_metadata_fails() {
         let tmp = mk_tmp("sizecap-missing");
         let missing = tmp.0.join("gone.pdf");
-        assert!(binary_size_exceeded(&missing, true, 1024).is_err());
+        assert!(size_cap_exceeded(&missing, true, 1024, 1024).is_err());
+    }
+
+    /// 警告文が「どちらの上限に当たったか」を言い分ける。
+    #[test]
+    fn test_size_cap_kind_names_the_applied_limit() {
+        assert_eq!(size_cap_kind(true), "binary");
+        assert_eq!(size_cap_kind(false), "text");
     }
 
     // -----------------------------------------------------------------------

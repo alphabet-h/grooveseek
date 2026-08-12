@@ -4,6 +4,60 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **`kb-mcp serve --bind <non-loopback>` now requires `--i-know`** (BU-01).
+  `kb-mcp service install` has always refused a non-loopback bind without that
+  flag, but `serve` accepted one with a single warning line — so the same
+  exposure was one typo away on the command line. kb-mcp ships no
+  authentication, which makes the bind address the only access control, so the
+  two commands now agree.
+
+  The gate covers the `--bind` flag only. A non-loopback address coming from
+  `[transport.http].bind` in `kb-mcp.toml` still starts, because the published
+  `intranet-http` recipe runs `kb-mcp serve` with no arguments. Note that such
+  a bind is not universally warned about either: the startup warning fires only
+  when the Host allow-list is missing or empty, so the documented intranet
+  shape — a non-loopback bind plus an explicit `allowed_hosts` — remains silent
+  by design, on the grounds that writing that list states the intent.
+
+### Fixed
+
+- **The hybrid search now has a test that fails when the full-text half stops
+  contributing** (BU-04). Every existing fusion test gave the FTS-matching
+  chunk the same embedding as the query, so the vector half alone put it first
+  and the assertion held whether or not FTS returned anything. Measured: with
+  `build_fts_query` stubbed to return `None` for *every* query,
+  `test_search_hybrid_japanese_trigram` still passes. That is why the defect
+  fixed in 0.16.0 survived fifteen releases.
+
+  The new test inverts the layout — the FTS-matching chunk is the *farther* one
+  and a decoy sits exactly on the query vector — so the top rank flips the
+  moment the full-text half goes quiet.
+
+- **Text files are now size-capped at index time** (BU-02). The 50 MiB raw-byte
+  guard applied only to binary formats; `binary_size_exceeded` returned "fine"
+  for anything else without even calling `stat`. A single oversized `.md` under
+  `--kb-path` was therefore read into memory in full — and `rebuild_index` is
+  an MCP tool, so any client could trigger that read on demand. Text now has
+  its own cap (`MAX_RAW_TEXT_BYTES`, same 50 MiB, since the constraint is
+  identical: one whole file in memory), enforced on all three paths that used
+  the binary guard (full rebuild, watcher re-index, watcher rename). The skip
+  message names which limit applied.
+
+- **The most exposed HTTP configuration no longer starts silently** (BU-01).
+  The startup warning for a non-loopback bind fired only when
+  `[transport.http].allowed_hosts` was absent. Setting `allowed_hosts = []`
+  suppressed it — yet an empty list makes rmcp accept *every* `Host` header
+  (`host_is_allowed` returns early on an empty list), so `0.0.0.0` plus an
+  empty list was both the widest-open shape and the only silent one. It now
+  warns, with a message naming what is actually disabled.
+
+  The warning also no longer implies that Host validation is a form of access
+  control: any peer that can reach the port can send `Host: localhost`. It is a
+  DNS-rebinding defence for browsers, not authentication. `README` says the
+  same in both languages.
+
 ## [0.16.0] - 2026-08-12
 
 ### Changed
