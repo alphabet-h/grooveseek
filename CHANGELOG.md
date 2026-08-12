@@ -4,6 +4,35 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A busy MCP tool call no longer takes the whole HTTP server down with it**
+  (BU-06). Every tool handler was an `async fn` that then did its work
+  synchronously — embedding inference, SQLite queries, a full index rebuild —
+  on a tokio worker thread. Since the runtime has one worker per core, that
+  many concurrent calls left nothing to serve anything else: `/healthz`,
+  `/api/admin/status` and every other request simply waited. Measured on a
+  16-core box, 16 concurrent blocking calls stalled `/healthz` for 602 ms; on a
+  single-worker runtime one call stalled it for 651 ms, versus 0.9 ms once the
+  work moved off. Handler bodies now run on tokio's blocking pool, and the
+  server state they need lives in a new internal `KbCore`.
+
+  Worth recording because the obvious remedy does not work: a request timeout
+  cannot fire against a handler that owns its thread. `tower`'s `Timeout` polls
+  the inner future first and the deadline only afterwards, so while the inner
+  future never yields the deadline is never checked — a 200 ms deadline over an
+  800 ms thread-blocking body returns success at 800 ms. The same deadline over
+  an offloaded body elapses at 208 ms. Offloading is the change that makes
+  timeouts, concurrency limits and load shedding possible at all; those remain
+  unimplemented.
+
+  A panic inside a tool body is now reported to the caller as the usual error
+  JSON instead of unwinding through the request task.
+
+  Session count is still unbounded. rmcp 1.4's `StreamableHttpServerConfig` and
+  `LocalSessionManager` expose no cap, so bounding it needs a custom session
+  manager — tracked separately.
+
 ## [0.17.0] - 2026-08-12
 
 ### Added
