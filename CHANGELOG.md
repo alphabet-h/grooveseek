@@ -6,6 +6,16 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ### Added
 
+- **[ADR-0002](docs/decisions/0002-compile-queries-into-per-token-fts-phrases.md)
+  records why queries are compiled into per-token `OR` phrases**
+  ([日本語](docs/decisions/0002-compile-queries-into-per-token-fts-phrases.ja.md)).
+  The v0.16.0 change met all three conditions in ADR-0000: alternatives were
+  compared (a morphological analyser was weighed and deferred), reversing it is
+  expensive (`fts_query_version` makes evaluation history incomparable across
+  the boundary), and it altered an interface — `"..."` in a query now means
+  something. The rationale it absorbs has been trimmed from the CHANGELOG entry
+  and the `fts_query` module documentation, which now summarise and link.
+
 - **The cost of the full-text half is now measured, documented and guarded**
   (BU-03). `ORDER BY bm25(...)` scores every matching row before `LIMIT`
   applies, so the cost tracks how many rows the expression matches, not how
@@ -89,54 +99,37 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 ### Changed
 
 - **The FTS half of the hybrid search now works on natural-language queries**
-  (feature-48). Until now `sanitize_fts_query` wrapped the entire query in one
-  quoted phrase; over a trigram tokenizer that is a verbatim substring search,
-  so a Japanese sentence-shaped query matched nothing at all. Measured on the
-  dogfood knowledge base, **all ten natural-language golden queries returned
-  zero FTS candidates** — the hybrid search was quietly running on vectors
-  alone, and the RRF fusion had only one side to fuse.
-
-  Queries are now compiled into per-token phrases joined by `OR`. Tokens come
-  from script boundaries (kanji / hiragana / katakana / other word characters)
-  inside runs that carry no separator, so `再ランキングの評価について` becomes
-  `"再ランキング" OR "ランキング" OR "の評価" OR "について"`. A run shorter than the
-  trigram floor is merged with a neighbour **within the same separator-free
-  group**, and when a merge swallows a term that stood on its own, that term is
-  kept as its own phrase too — so a document holding only `ランキング` is still
-  reachable. A short run with no neighbour to merge with is dropped: in
-  `AI について` the `AI` has a space on one side and nothing on the other, so
-  the full-text half searches only for `について`. Quote it (`"AI" について`)
-  to keep it — though below three characters a phrase matches nothing under a
-  trigram tokenizer, which is why the floor exists.
+  (feature-48). The whole query used to be wrapped in one quoted phrase, which
+  over a trigram tokenizer is a verbatim substring search, so a sentence-shaped
+  Japanese query matched nothing and the hybrid ran on vectors alone. Queries
+  are now compiled into per-token phrases joined by `OR`, cut at script
+  boundaries: `再ランキングの評価について` becomes
+  `"再ランキング" OR "ランキング" OR "の評価" OR "について"`. Why this design and not
+  a morphological analyser is recorded in
+  [ADR-0002](docs/decisions/0002-compile-queries-into-per-token-fts-phrases.md).
 
   **This changes search results for every user, which is why it is a minor
-  release.** Two things keep it from taking anything away. A `"quoted section"`
-  is preserved verbatim, so quoting the whole query reproduces the old
-  behaviour exactly. And when tokenization yields no usable phrase — a query
-  made entirely of short fragments such as `AI と ML` — the old whole-query
-  phrase is used as a fallback. For any query that does not use the quoting
-  syntax, the set of documents FTS can reach is therefore a superset of what
-  it reached before, and only the ranking moves — which is the point. A query
-  that *does* use quotes now means what the quotes say rather than being
-  searched with the quote characters included, so a query like `"a""b"` looks
-  for `a"b` where it used to look for the literal `"a""b"`. That is the
-  intended effect of making the syntax meaningful, but it is a behaviour
-  change rather than a pure addition.
+  release.** What that means in practice:
 
-  **No re-indexing is required**: the index, the schema and the tokenizer are
-  untouched. Only the query side changed.
+  - A `"quoted section"` is kept verbatim, so quoting the whole query
+    reproduces the old behaviour on demand. The flip side is that quotes now
+    mean what they say: `"a""b"` looks for `a"b` where it used to look for the
+    literal `"a""b"`.
+  - A fragment shorter than three characters (the trigram floor) is joined to a
+    neighbour **within the same separator-free group**; one with no neighbour
+    is dropped, so `AI について` searches only for `について`. Quoting a wide
+    enough region rescues it; quoting the short word alone does not.
+  - A query whose fragments are *all* too short, such as `AI と ML`, falls back
+    to the old whole-query phrase, so no query class regresses.
+  - **No re-indexing is required.** The index, schema and tokenizer are
+    untouched.
 
-  Measured on a 650-document / 9,419-chunk knowledge base (bge-m3, no
-  reranker), comparing the same index before and after: every one of the ten
-  natural-language queries that FTS could not answer at all now returns
-  candidates, taking the golden set from 16 of 26 queries where fusion can act
-  to 26 of 26. MRR rose from 0.955 to 0.962 on the main golden and from 0.939
-  to 0.955 on the binary-format one; recall@10 rose from 0.954 to 0.965.
-  recall@5 fell from 0.926 to 0.906, and nDCG@5 from 0.894 to 0.876: on two of
-  the twenty-six queries a second expected document slid from rank five to rank
-  eight, displaced by other documents on the same topic. In both cases the
-  first hit was as good or better than before — under the old behaviour those
-  slots were held by repeated chunks of a document already ranked first.
+  Measured on a 650-document / 9,419-chunk knowledge base (bge-m3, no reranker,
+  same index before and after): the golden set went from 16 of 26 queries where
+  fusion can act to 26 of 26. MRR 0.955 → 0.962 (main golden) and 0.939 → 0.955
+  (binary); recall@10 0.954 → 0.965. recall@5 fell 0.926 → 0.906 and nDCG@5
+  0.894 → 0.876, from two queries where a second expected document slid from
+  rank five to rank eight; the first hit was as good or better in both.
 
 - **`kb-mcp eval` records `fts_query_version` in its config fingerprint.**
   Query compilation decides what search returns, so a change to it makes older

@@ -1,12 +1,12 @@
 //! ユーザのクエリ文字列を FTS5 の MATCH 式にコンパイルする (feature-48 / A-10)。
 //!
-//! v0.15.x までは「クエリ全体を 1 個の quoted phrase にする」だけだった。tokenizer が
-//! trigram なので、これは実質 **verbatim 部分文字列検索**であり、日本語の自然文クエリでは
-//! FTS 候補が 1 件も返らなかった (dogfood golden 10 query が全滅、feature-47 spec review M-1)。
-//! つまり hybrid search の FTS 半身が死んでおり、実際には vector 単独で動いていた。
-//!
-//! ここではクエリを**文字種の境界**で token に割り、OR で結んだ式にコンパイルする。
+//! クエリを**文字種の境界**で token に割り、OR で結んだ式にコンパイルする。
 //! **query-side だけの変更で、index も schema も tokenizer も変えていない** (再 index 不要)。
+//!
+//! なぜこの設計なのか (旧挙動が何を壊していたか / 形態素解析を見送った理由 / `OR` を
+//! 選んだ理由 / 実測値) は **ADR-0002** に集約してある:
+//! `docs/decisions/0002-compile-queries-into-per-token-fts-phrases.md`。
+//! ここには、その行を読む人が必要とする事実 (不変条件・境界・計測値) だけを置く。
 //!
 //! # spec の手順との対応
 //!
