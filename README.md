@@ -258,7 +258,7 @@ kb-mcp serve --kb-path ... --transport http --port 3100         # HTTP, multi-cl
 kb-mcp serve --kb-path ... --no-watch                           # disable live-sync
 ```
 
-Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](#http-transport-for-multiple-simultaneous-clients) section.
+Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](#http-transport-for-multiple-simultaneous-clients) section. A `--bind` outside loopback additionally requires `--i-know`, because kb-mcp ships no authentication.
 
 The server exposes 6 tools (see below) and keeps the index in-process for low-latency queries. `--model` must match the model that built the current index, otherwise the server refuses to start with an actionable error message. A file watcher (enabled by default) re-indexes affected files when the contents under `--kb-path` change — see [Live-sync via file watcher](#live-sync-via-file-watcher).
 
@@ -691,7 +691,7 @@ By default `kb-mcp serve` speaks MCP over stdio — one client per server proces
 
 ```bash
 kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
-# or: --bind 0.0.0.0:3100
+# or, to accept connections from outside this machine: --bind 0.0.0.0:3100 --i-know
 ```
 
 The server mounts the MCP endpoint at `/mcp` and exposes `/healthz` for probes. `.mcp.json` for an HTTP-capable client:
@@ -708,9 +708,9 @@ The server mounts the MCP endpoint at `/mcp` and exposes `/healthz` for probes. 
 ```
 
 Security notes:
-- Default bind is `127.0.0.1:3100` (loopback). Use `--bind 0.0.0.0:3100` only on trusted networks — **kb-mcp has no built-in authentication yet**.
-- rmcp's Streamable HTTP layer enforces Host header validation (loopback only by default) to prevent DNS rebinding attacks.
-- For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `kb-mcp.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; kb-mcp emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics) — operator-acknowledged opt-out, not recommended for public deployments.
+- Default bind is `127.0.0.1:3100` (loopback). **kb-mcp has no built-in authentication**, so the bind address is the only access control — use `--bind 0.0.0.0:3100` on trusted networks only. Since v0.17.0 a non-loopback `--bind` is refused unless you add `--i-know`, matching `kb-mcp service install`. A non-loopback address coming from `[transport.http].bind` in `kb-mcp.toml` still starts (so existing service deployments keep working) but logs a warning.
+- rmcp's Streamable HTTP layer enforces Host header validation (loopback only by default) to prevent DNS rebinding attacks. **Host validation is not authentication** — any peer that can reach the port may send `Host: localhost`. Treat it as a browser-side defence, and restrict reachability at the network layer.
+- For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `kb-mcp.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; kb-mcp emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics), which combined with a non-loopback bind leaves `/mcp` open to every peer that can reach the port — that combination now warns at startup too.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
 ### Web UI and admin API (HTTP transport only)

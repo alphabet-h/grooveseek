@@ -381,10 +381,11 @@ pub async fn run_http(
     if should_warn_non_loopback_bind(&addr, allowed_hosts.as_deref()) {
         tracing::warn!(
             bind = %addr,
-            "non-loopback bind with default allowed_hosts (loopback-only). \
-             Inbound requests with a non-loopback Host header will be rejected. \
-             Set [transport.http].allowed_hosts explicitly in kb-mcp.toml \
-             (e.g. allowed_hosts = [\"kb.example.lan\", \"192.168.1.10\"])."
+            "{} kb-mcp has no authentication, and Host header validation is not a \
+             substitute for it (any peer can send `Host: localhost`), so the bind \
+             address is the only access control. Restrict reachability at the \
+             network layer.",
+            non_loopback_bind_symptom(allowed_hosts.as_deref()),
         );
     }
 
@@ -519,17 +520,47 @@ async fn healthz_host_check(
 }
 
 /// `addr` が非 loopback (0.0.0.0、unspecified、または LAN IP 等) で、かつ
-/// operator が `allowed_hosts` を toml で明示していない場合に true。
+/// `allowed_hosts` が「意味のある allow-list」になっていない場合に true。
 ///
-/// loopback only の default allow-list で外部 bind すると、外部クライアント
-/// からは Host header validation で必ず弾かれて 403 になるが、エラー文言
-/// だけでは原因が分かりにくい。起動時に警告してオペレータの設定漏れを
-/// 早期に気付かせる。
+/// 警告対象は 2 種類あり、どちらも operator の意図とずれている:
+///
+/// - `None` (= loopback only の default allow-list) — 外部クライアントは
+///   Host header validation で必ず 403 になる。公開したいのに届かない。
+/// - `Some([])` — rmcp の `host_is_allowed` は**空リストを「全 Host 許可」
+///   として扱う** (rmcp 1.4.0 `streamable_http_server/tower.rs`: 空なら
+///   即 `true`)。つまり Host 検証が丸ごと無効で、非 loopback bind と
+///   組み合わせると LAN 全体に無認証で開く。
+///
+/// (BU-01) 後者はもともと「operator が明示的に無効化した自己責任」として
+/// 警告対象外だった (F-33)。だが **いちばん危険な構成がいちばん静か**に
+/// なるので反転させた。そもそも Host header は攻撃者が自由に付けられるので、
+/// allow-list は DNS rebinding 対策であって認証ではない。
 fn should_warn_non_loopback_bind(addr: &SocketAddr, allowed_hosts: Option<&[String]>) -> bool {
-    let ip = addr.ip();
-    let is_external = !ip.is_loopback();
-    let no_explicit_hosts = allowed_hosts.is_none();
-    is_external && no_explicit_hosts
+    if addr.ip().is_loopback() {
+        return false;
+    }
+    match allowed_hosts {
+        None => true,
+        Some(hosts) => hosts.is_empty(),
+    }
+}
+
+/// 警告の前半 = その構成で実際に起きること。後半 (「Host 検証は認証の
+/// 代わりにならない」) は両方に共通なので呼び出し側が付ける。
+fn non_loopback_bind_symptom(allowed_hosts: Option<&[String]>) -> &'static str {
+    match allowed_hosts {
+        Some([]) => {
+            "non-loopback bind with `allowed_hosts = []`: Host validation is disabled \
+             entirely, so every peer that can reach this port can call /mcp (search, \
+             get_document, rebuild_index)."
+        }
+        _ => {
+            "non-loopback bind with the default allowed_hosts (loopback-only): inbound \
+             requests carrying a non-loopback Host header are rejected. Set \
+             [transport.http].allowed_hosts explicitly in kb-mcp.toml (e.g. \
+             allowed_hosts = [\"kb.example.lan\", \"192.168.1.10\"])."
+        }
+    }
 }
 
 /// Health check endpoint. Always returns 200 with body "ok".
@@ -758,14 +789,44 @@ mod tests {
         assert!(!should_warn_non_loopback_bind(&addr, Some(&hosts)));
     }
 
-    /// F-33: 0.0.0.0 + 空 allowed_hosts → warn 不要
-    /// (operator が `allowed_hosts = []` で明示的に Host 検証を無効化
-    /// した = 警告対象外。disable_allowed_hosts() 相当の自己責任設定)。
+    /// BU-01 (**F-33 の判断を差し替え**): 0.0.0.0 + 空 allowed_hosts → warn する。
+    ///
+    /// F-33 では「operator が `allowed_hosts = []` で明示的に Host 検証を
+    /// 無効化した = 自己責任だから黙る」としていた。しかし rmcp の
+    /// `host_is_allowed` は空リストを**全 Host 許可**として扱うため、これは
+    /// 「非 loopback bind + 検証なし + 認証なし」= 最も開いた構成であり、
+    /// **唯一警告が出ない構成でもあった**。危険なほど静かになる並びを反転する。
     #[test]
-    fn test_no_warn_on_unspecified_bind_with_empty_allowed_hosts() {
+    fn test_warn_on_unspecified_bind_with_empty_allowed_hosts() {
         let addr: SocketAddr = "0.0.0.0:3100".parse().unwrap();
         let hosts: [String; 0] = [];
+        assert!(should_warn_non_loopback_bind(&addr, Some(&hosts)));
+    }
+
+    /// 空 allow-list でも loopback bind なら警告しない (= 反転させたのは
+    /// 「非 loopback」との組合せだけで、loopback 判定は据え置き)。
+    #[test]
+    fn test_no_warn_on_loopback_bind_with_empty_allowed_hosts() {
+        let addr: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        let hosts: [String; 0] = [];
         assert!(!should_warn_non_loopback_bind(&addr, Some(&hosts)));
+    }
+
+    /// 2 つの警告理由 (検証無効 / 届かない) は別の文面で出す。
+    #[test]
+    fn test_symptom_text_distinguishes_disabled_validation_from_unreachable() {
+        let empty: [String; 0] = [];
+        let disabled = non_loopback_bind_symptom(Some(&empty));
+        let unreachable = non_loopback_bind_symptom(None);
+        assert!(
+            disabled.contains("allowed_hosts = []"),
+            "empty-list case must name the setting: {disabled}"
+        );
+        assert!(
+            unreachable.contains("rejected"),
+            "default case must explain the 403: {unreachable}"
+        );
+        assert_ne!(disabled, unreachable);
     }
 
     /// F-33: LAN IP (192.168.x.x) + default → warn が立つ。

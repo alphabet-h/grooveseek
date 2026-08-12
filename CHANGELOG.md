@@ -4,6 +4,35 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **`kb-mcp serve --bind <non-loopback>` now requires `--i-know`** (BU-01).
+  `kb-mcp service install` has always refused a non-loopback bind without that
+  flag, but `serve` accepted one with a single warning line — so the same
+  exposure was one typo away on the command line. kb-mcp ships no
+  authentication, which makes the bind address the only access control, so the
+  two commands now agree.
+
+  The gate covers the `--bind` flag only. A non-loopback address coming from
+  `[transport.http].bind` in `kb-mcp.toml` still starts, because the published
+  `intranet-http` recipe runs `kb-mcp serve` with no arguments; that case is
+  covered by the startup warning below.
+
+### Fixed
+
+- **The most exposed HTTP configuration no longer starts silently** (BU-01).
+  The startup warning for a non-loopback bind fired only when
+  `[transport.http].allowed_hosts` was absent. Setting `allowed_hosts = []`
+  suppressed it — yet an empty list makes rmcp accept *every* `Host` header
+  (`host_is_allowed` returns early on an empty list), so `0.0.0.0` plus an
+  empty list was both the widest-open shape and the only silent one. It now
+  warns, with a message naming what is actually disabled.
+
+  The warning also no longer implies that Host validation is a form of access
+  control: any peer that can reach the port can send `Host: localhost`. It is a
+  DNS-rebinding defence for browsers, not authentication. `README` says the
+  same in both languages.
+
 ## [0.16.0] - 2026-08-12
 
 ### Changed

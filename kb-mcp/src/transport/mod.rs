@@ -167,6 +167,44 @@ fn resolve_http_addr(
     Ok(SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)))
 }
 
+/// (BU-01) `--bind` に非 loopback を明示した `serve` を `--i-know` で追認させる。
+///
+/// `kb-mcp service install` は同じ形の gate を持つ (`service/install.rs`) のに
+/// `serve` 側は起動時 warning 1 行だけで、CLI から誤って LAN 公開できてしまう
+/// 非対称があった。kb-mcp は認証を持たないので、bind アドレスが実質唯一の
+/// アクセス制御になる。
+///
+/// **gate するのは CLI の `--bind` 由来の非 loopback bind だけ**。
+/// `kb-mcp.toml` の `[transport.http].bind` は既存デプロイ
+/// (`examples/deployments/intranet-http` の systemd unit は引数なしの
+/// `kb-mcp serve` で、bind は toml から来る) が依存しているため拒否せず、
+/// [`http::run_http`] の起動時 warning に任せる。
+///
+/// stdio に解決された `--bind` をここで拒否しないのは、**`main.rs` が既に
+/// 「`--bind` / `--port` があるのに実効 transport が stdio なら reject」を
+/// 実装しているから** (silent ignore は footgun という別の判断)。そちらの
+/// 方が原因を的確に言えるので、同じ入力に 2 つのエラー経路を作らない。
+/// つまり Stdio 分岐は防御的なもので、CLI 経由では到達しない。
+pub fn check_cli_bind_ack(
+    transport: &Transport,
+    cli_bind: Option<SocketAddr>,
+    i_know_non_loopback: bool,
+) -> Result<()> {
+    if i_know_non_loopback || !matches!(transport, Transport::Http { .. }) {
+        return Ok(());
+    }
+    let Some(bind) = cli_bind else {
+        return Ok(());
+    };
+    if bind.ip().is_loopback() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "--bind {bind} は non-loopback です。kb-mcp は auth を持ちません — \
+         untrusted network での公開は危険。確認して進める場合は --i-know を付けて再実行してください。"
+    )
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -354,5 +392,81 @@ mod tests {
         };
         let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
         assert_eq!(t, Transport::Stdio);
+    }
+
+    // -----------------------------------------------------------------------
+    // BU-01: `serve --bind <non-loopback>` requires `--i-know`.
+    // -----------------------------------------------------------------------
+
+    /// Build an HTTP transport whose address came from the CLI `--bind` flag.
+    fn http_at(addr: &str) -> Transport {
+        Transport::Http {
+            addr: addr.parse().unwrap(),
+            allowed_hosts: None,
+            healthz_public: true,
+        }
+    }
+
+    #[test]
+    fn test_cli_bind_to_all_interfaces_is_rejected_without_ack() {
+        let bind: SocketAddr = "0.0.0.0:3100".parse().unwrap();
+        let err = check_cli_bind_ack(&http_at("0.0.0.0:3100"), Some(bind), false)
+            .expect_err("non-loopback --bind must be refused without --i-know");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--i-know"),
+            "must name the escape hatch: {msg}"
+        );
+        assert!(msg.contains("0.0.0.0:3100"), "must name the bind: {msg}");
+    }
+
+    #[test]
+    fn test_cli_bind_to_lan_ip_is_rejected_without_ack() {
+        let bind: SocketAddr = "192.168.1.10:3100".parse().unwrap();
+        check_cli_bind_ack(&http_at("192.168.1.10:3100"), Some(bind), false)
+            .expect_err("a LAN address is just as exposed as 0.0.0.0");
+    }
+
+    #[test]
+    fn test_cli_bind_to_non_loopback_is_allowed_once_acknowledged() {
+        let bind: SocketAddr = "0.0.0.0:3100".parse().unwrap();
+        check_cli_bind_ack(&http_at("0.0.0.0:3100"), Some(bind), true)
+            .expect("--i-know is the documented escape hatch");
+    }
+
+    #[test]
+    fn test_cli_bind_to_loopback_needs_no_ack() {
+        let bind: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        check_cli_bind_ack(&http_at("127.0.0.1:3100"), Some(bind), false)
+            .expect("the default deployment must not need a flag");
+    }
+
+    #[test]
+    fn test_cli_bind_to_ipv6_loopback_needs_no_ack() {
+        let bind: SocketAddr = "[::1]:3100".parse().unwrap();
+        check_cli_bind_ack(&http_at("[::1]:3100"), Some(bind), false).expect("::1 is loopback too");
+    }
+
+    /// The gate is deliberately scoped to the CLI flag: a non-loopback bind
+    /// that came from `[transport.http].bind` keeps starting, because the
+    /// published `intranet-http` recipe runs `kb-mcp serve` with no arguments
+    /// and would otherwise break. Such a bind is covered by the startup
+    /// warning in `transport::http` instead.
+    #[test]
+    fn test_config_derived_non_loopback_bind_is_not_gated() {
+        check_cli_bind_ack(&http_at("0.0.0.0:3100"), None, false)
+            .expect("toml-derived binds must keep working");
+    }
+
+    /// Defensive branch, not a reachable CLI state: `main.rs` already rejects
+    /// `--bind` / `--port` when the effective transport is stdio, with a
+    /// message that names the real problem. This test pins that we leave that
+    /// case to it rather than reporting a security error for an input that
+    /// exposes nothing.
+    #[test]
+    fn test_stdio_is_left_to_the_transport_mismatch_error() {
+        let bind: SocketAddr = "0.0.0.0:3100".parse().unwrap();
+        check_cli_bind_ack(&Transport::Stdio, Some(bind), false)
+            .expect("stdio listens on no port, so there is nothing to acknowledge");
     }
 }
