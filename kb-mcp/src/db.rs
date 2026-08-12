@@ -634,6 +634,22 @@ mod tests {
         db
     }
 
+    thread_local! {
+        /// SQL statements traced off a connection while a test has tracing on.
+        /// Lets a test count what SQLite actually executed rather than how many
+        /// times a Rust wrapper was called (BU-03).
+        static TRACED_SQL: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// `trace_v2` takes a plain `fn` pointer, so the sink has to be a static
+    /// thread-local rather than a captured closure.
+    fn record_traced_sql(evt: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = evt {
+            TRACED_SQL.with(|v| v.borrow_mut().push(sql.to_string()));
+        }
+    }
+
     #[test]
     fn test_schema_creation() {
         let db = Database::open_in_memory().expect("open_in_memory");
@@ -2415,6 +2431,10 @@ mod tests {
     /// 空白区切りなので 1 語 = 1 群 = 1 phrase になり、`MAX_PHRASES` (32) 上限
     /// ちょうどの OR 式ができる。
     fn pathological_or_query() -> String {
+        pathological_fragments().join(" ")
+    }
+
+    fn pathological_fragments() -> [&'static str; 32] {
         [
             "について",
             "における",
@@ -2449,7 +2469,6 @@ mod tests {
             "とはいえ",
             "しかも",
         ]
-        .join(" ")
     }
 
     /// (BU-03) OR 展開は候補集合の **和** であって積ではなく、phrase 数に
@@ -2466,13 +2485,20 @@ mod tests {
         let doc_id = db
             .upsert_document("u.md", Some("u"), None, None, None, &[], None, "h")
             .unwrap();
+        // 前半 10 行だけが「について」、後半 10 行だけが「における」を持つ =
+        // 2 つの phrase の集合は交わらない。OR が和なら 20、積なら 0 になる。
         for i in 0..20 {
+            let body = if i < 10 {
+                format!("この文書について記した第 {i} 節")
+            } else {
+                format!("この文書における記述の第 {i} 節")
+            };
             db.insert_chunk(
                 doc_id,
                 i,
                 None,
                 None,
-                &format!("この文書について記録した第 {i} 節"),
+                &body,
                 None,
                 &dummy_embedding(0.5),
                 1.0,
@@ -2480,16 +2506,25 @@ mod tests {
             .unwrap();
         }
 
-        let one = db.count_fts_matches("について").unwrap();
-        let many = db.count_fts_matches(&pathological_or_query()).unwrap();
-        assert_eq!(one, 20, "the single common phrase should match everything");
+        assert_eq!(db.count_fts_matches("について").unwrap(), 10);
+        assert_eq!(db.count_fts_matches("における").unwrap(), 10);
         assert_eq!(
-            many, one,
-            "OR must be a union: adding 31 phrases that match nothing must not \
-             change the candidate population"
+            db.count_fts_matches("について における").unwrap(),
+            20,
+            "OR must be a union of the per-phrase candidate sets, not an \
+             intersection: the two halves share no row"
         );
 
-        FTS_CANDIDATE_CALLS.with(|c| c.set(0));
+        // 実際に発行された SQL を数える。`FTS_CANDIDATE_CALLS` は
+        // `search_fts_candidates` の**入口**で 1 増えるだけなので、中で phrase ごとに
+        // 1 文発行するようになっても 1 のままになる = この不変条件は測れない
+        // (codex review P2、PR #136)。rusqlite の `trace` を dev-dependency 側だけで
+        // 有効にして、MATCH を含む文の数を直接数える。
+        TRACED_SQL.with(|v| v.borrow_mut().clear());
+        db.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
         let _ = db
             .search_fts_candidates(
                 &pathological_or_query(),
@@ -2498,37 +2533,63 @@ mod tests {
                 FusionParams::default(),
             )
             .unwrap();
+        db.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        // SQLite は FTS5 の内部副問い合わせも trace に出すが、それらは `--` 前置
+        // (subprogram 表記) で MATCH を含まないので、MATCH を含む文を数えれば
+        // 呼び出し側が発行した本数と一致する。診断出力も同じ絞り込みを使う
+        // (絞らないと内部副問い合わせが数百行出て読めない)。
+        let match_statements: Vec<String> = TRACED_SQL.with(|v| {
+            v.borrow()
+                .iter()
+                .filter(|sql| sql.contains("MATCH"))
+                .cloned()
+                .collect()
+        });
         assert_eq!(
-            FTS_CANDIDATE_CALLS.with(|c| c.get()),
+            match_statements.len(),
             1,
-            "32 phrases must still cost one MATCH statement, not one per phrase"
+            "32 phrases must be one MATCH statement, not one per phrase; traced: {match_statements:#?}"
         );
     }
 
     /// (BU-03 measurement + guard) 病的クエリの実コストを測り、上限で縛る。
     /// `cargo test --release --lib bu03 -- --ignored --nocapture`
     ///
-    /// **2026-08-13 の実測** (release、この機械、`BU03_N` で corpus を振った):
+    /// **2026-08-13 の実測** (release、この機械、`BU03_N` で corpus を振った。
+    /// 全 32 断片が全行に載っている = すべての arm が満杯の posting list を持つ
+    /// 真の最悪形):
     ///
     /// | corpus | 1 phrase / 全行マッチ | 32 phrase / 全行マッチ | 倍率 |
     /// |---|---|---|---|
-    /// | 5,000 | 3.33 ms | 7.80 ms | 2.34x |
-    /// | 20,000 | 15.47 ms | 27.90 ms | 1.80x |
-    /// | 40,000 | 29.45 ms | 57.54 ms | 1.95x |
+    /// | 5,000 | 4.25 ms | 46.9 ms | 11.0x |
+    /// | 20,000 | 16.0 ms | 171 ms | 10.7x |
+    /// | 40,000 | 32.8 ms | 329 ms | 10.1x |
+    ///
+    /// arm 数に対する伸び (20,000 行、arm 1/2/4/8/16/32):
+    /// 17.6 / 22.9 / 34.4 / 44.0 / 81.5 / 172 ms = **arm 数にほぼ線形**。
     ///
     /// 読み取れること:
     ///
-    /// 1. コストは **照合行数に線形**で、corpus に対して超線形ではない
-    /// 2. 32 phrase の OR は同じ母集団に対し **~2 倍の定数倍**で、倍率は
-    ///    corpus が増えても増えない
-    /// 3. 母集団の上限 (= 全行) は **1 phrase でも到達できる** (`"について"`
-    ///    単独で 5,000/5,000)。feature-48 は新しい上限を作ったのではなく、
-    ///    普通のクエリでそこに届きやすくした
-    /// 4. **`LIMIT` を下げてもコストは変わらない** (limit=1 で 8.49ms、
-    ///    limit=100 で 8.46ms)。`ORDER BY bm25(...)` が全マッチ行を評価して
-    ///    から `LIMIT` を適用するため。監査が挙げた「`fetch_limit` の 10,000 を
-    ///    下げる」は**この支配項には効かない** — 効くのは返却行の実体化だけ
-    ///    (limit=10,000 で 15.8ms)
+    /// 1. コストは照合行数にも arm 数にも **線形**で、超線形ではない
+    /// 2. 倍率 ~10x は corpus が増えても増えない (10.1-11.0x)
+    /// 3. 母集団の上限 (= 全行) は **1 phrase でも到達できる**。feature-48 は
+    ///    新しい上限を作ったのではなく、普通のクエリでそこに届きやすくした。
+    ///    ただし**コストの上限は約 10 倍に上がった**
+    /// 4. **`LIMIT` を下げてもコストは変わらない** (40,000 行で limit=1 が
+    ///    339ms、limit=100 が 329ms)。`ORDER BY bm25(...)` が全マッチ行を
+    ///    評価してから `LIMIT` を適用するため。監査が挙げた「`fetch_limit` の
+    ///    10,000 を下げる」は**この支配項に効かない** — 効くのは返却行の
+    ///    実体化だけ (limit=10,000 で +42ms)
+    /// 5. 効く lever は **`MAX_PHRASES`** (arm 数に線形なので、半分にすれば
+    ///    最悪コストもほぼ半分)。ただし長いクエリの recall とのトレードオフで、
+    ///    その測定は済んでいない — 変更は別 item (台帳 BU-31)
+    ///
+    /// 最初の測定は corpus に 32 断片のうち 2 つしか入れておらず、残り 30 arm が
+    /// 空の posting list で即棄却されていたため **~2x と 5 倍過小に出ていた**
+    /// (codex review P2、PR #136)。「最悪形を測っているつもりで、実は安い形を
+    /// 測っていた」典型なので、arm を増やす測定では**全 arm が実際に効いているか**
+    /// を先に確認すること。
     ///
     /// ガードは絶対時間ではなく **倍率**で書く。絶対値は機械と SQLite 版で動くが、
     /// 「OR 展開が単一 phrase の何倍か」は次数が変わらない限り安定する。
@@ -2545,13 +2606,18 @@ mod tests {
         let doc_id = db
             .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h")
             .unwrap();
+        // codex review P2 (PR #136): 本文が 32 断片のうち 2 つしか含まないと、
+        // 残り 30 arm は posting list が空で即棄却され、測っているのは
+        // 「32 arm のうち 2 本だけが広い式」になる。**全 32 断片を全行に**入れて、
+        // すべての arm が全行分の posting list を持つ真の最悪形にする。
+        let body_prefix = pathological_fragments().join("");
         for i in 0..n {
             db.insert_chunk(
                 doc_id,
                 i,
                 None,
                 None,
-                &format!("この文書について、における評価を記録した第 {i} 節の本文"),
+                &format!("{body_prefix} 評価を記録した第 {i} 節の本文"),
                 None,
                 &dummy_embedding(0.5),
                 1.0,
@@ -2611,20 +2677,41 @@ mod tests {
             );
         }
 
+        // arm 数に対する伸び。`MAX_PHRASES` を下げることが有効な対策なのかは
+        // ここでしか分からない (線形なら効く、頭打ちなら効かない)。
+        for arms in [1usize, 2, 4, 8, 16, 32] {
+            let q = pathological_fragments()[..arms].join(" ");
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..3 {
+                let t = Instant::now();
+                let _ = db
+                    .search_fts_candidates(
+                        &q,
+                        10,
+                        &SearchFilters::default(),
+                        FusionParams::default(),
+                    )
+                    .unwrap();
+                best = best.min(t.elapsed());
+            }
+            println!("  arms={arms:3} best_of_3={best:?}");
+        }
+
         // --- ガード ---
-        // 同じ母集団に対する 32 phrase / 1 phrase の倍率。実測 1.8-2.3 倍なので
-        // 6 倍を上限にする。ここを超えるのは「phrase 数が乗算的に効き始めた」
-        // = 次数が変わった時で、絶対時間の機械差では起きない幅を取ってある。
+        // 同じ母集団に対する 32 phrase / 1 phrase の倍率。実測 10.1-11.0 倍
+        // (arm 数に線形) なので 20 倍を上限にする。arm 数に線形である限り
+        // 倍率は corpus に依らず一定なので、ここを超えるのは次数が変わった時
+        // (例: arm 数に二次) で、機械差では届かない幅を取ってある。
         let one = timing["one_common"].as_secs_f64();
         let many = timing["pathological"].as_secs_f64();
         let ratio = many / one;
-        println!("ratio pathological/one_common = {ratio:.2}x (bound: 6x)");
+        println!("ratio pathological/one_common = {ratio:.2}x (bound: 20x)");
         assert!(
-            ratio < 6.0,
+            ratio < 20.0,
             "the 32-phrase OR now costs {ratio:.2}x a single-phrase query over the \
-             same {n}-row population; measured 1.8-2.3x when this guard was written. \
-             A jump here means phrase count started multiplying the work instead of \
-             widening a single scan."
+             same {n}-row population; measured 10.1-11.0x when this guard was \
+             written, growing linearly with arm count. A jump here means arm count \
+             started costing more than linearly."
         );
     }
 
