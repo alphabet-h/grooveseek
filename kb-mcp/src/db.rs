@@ -1821,6 +1821,46 @@ mod tests {
         }
     }
 
+    /// full-audit 2026-08-12 テスト軸 C-1: 上の `every_generated_expression_is_accepted_by_fts5`
+    /// は 50 件の固定入力で、その中の `A0¹\0Aa¹` は「proptest が縮小して見つけた形を
+    /// 凍結したもの」= generator は開発中に使って捨てられていた。
+    ///
+    /// `fts_query.rs` の property 3 本は Rust 側の不変条件しか見ないので、
+    /// **生成した式が SQLite に受理されるか**は誰も生成器で試していない。escape 規約や
+    /// 文字クラスを将来いじった時、固定リストに無い形が syntax error を起こすと
+    /// `search_fts_candidates` が `Err` になり、**検索全体が落ちる**。
+    /// in-memory DB なのでモデル DL は不要 = 既定の `cargo test` に載る。
+    #[test]
+    fn generated_expressions_stay_valid_fts5_for_arbitrary_queries() {
+        let db = db_with_384();
+        add_fts_doc(&db, "a.md", "A", "anything at all", 0.1);
+
+        let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
+            cases: 256,
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        });
+        runner
+            .run(
+                &proptest::string::string_regex(".{0,120}").unwrap(),
+                |raw| {
+                    let hits = db.search_fts_candidates(
+                        &raw,
+                        10,
+                        &SearchFilters::default(),
+                        FusionParams::default(),
+                    );
+                    proptest::prop_assert!(
+                        hits.is_ok(),
+                        "FTS5 rejected the expression built from {raw:?}: {:?}",
+                        hits.err()
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn test_parse_dim_from_create_sql() {
         let sql = "CREATE VIRTUAL TABLE vec_chunks USING vec0(\

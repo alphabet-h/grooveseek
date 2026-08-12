@@ -299,7 +299,7 @@ struct SearchFilterEcho {
 impl KbServer {
     #[tool(
         name = "search",
-        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query terms."
+        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them)."
     )]
     pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         // AU-01: 上限なしの `limit` は候補プール → `Vec::with_capacity` へ

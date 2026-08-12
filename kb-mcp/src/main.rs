@@ -420,7 +420,7 @@ pub(crate) struct EvalCliArgs {
     /// nDCG@k) regressed from the previous compatible run by more
     /// than `regression_threshold` (default 0.05). Compatible = every
     /// fingerprint field equal: model, reranker, limit, k_values,
-    /// golden_hash, metric_version, and the mmr / parent_retriever /
+    /// golden_hash, metric_version, fts_query_version, and the mmr / parent_retriever /
     /// fusion / contextual settings. The indexed corpus is NOT part of
     /// that test, so two compatible runs can still have been measured
     /// over different documents; when they were, the failure message

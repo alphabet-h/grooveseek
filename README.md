@@ -348,7 +348,7 @@ Tray logs live at `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (daily rotation).
 Uninstalling the daemon also removes the tray shortcut:
 
 ```bash
-kb-mcp service uninstall --service-name kb-mcp
+kb-mcp service uninstall kb-mcp
 ```
 
 To manage the tray shortcut independently of the daemon registration:
@@ -396,7 +396,7 @@ Starting in v0.3.0 the `search` MCP tool returns a wrapper object instead of a r
 }
 ```
 
-`results[].match_spans` are byte offsets into `content` for ASCII queries, so MCP clients can quote the source text accurately. `low_confidence` is a rank-based flag (`top1.score / mean(top-N.score) < min_confidence_ratio`); the threshold defaults to `1.5` and can be tuned via `[search].min_confidence_ratio` in `kb-mcp.toml` or `--min-confidence-ratio` per query.
+`results[].match_spans` are byte offsets into `content`, returned when every term the query splits into is ASCII, so MCP clients can quote the source text accurately. `low_confidence` is a rank-based flag (`top1.score / mean(top-N.score) < min_confidence_ratio`); the threshold defaults to `1.5` and can be tuned via `[search].min_confidence_ratio` in `kb-mcp.toml` or `--min-confidence-ratio` per query.
 
 Input bounds (defensive, v0.6.0+): `query` is capped at 1 KiB; longer inputs are rejected with an `ErrorResponse`. `match_spans` is computed only for chunks under 256 KiB and capped at 100 spans per chunk. These exist to bound abuse, not legitimate use — typical chunks are well under the ceilings.
 

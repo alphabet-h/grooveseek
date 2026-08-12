@@ -2158,6 +2158,33 @@ mod tests {
         assert!(h.previous_compatible(&now).is_none());
     }
 
+    /// full-audit 2026-08-12 テスト軸 H-6: `fts_query_version` の doc は
+    /// 「`previous_compatible` の比較対象から自動的に外れる」と主張するが、
+    /// feature-48 が足したのは `assert_ne!(fingerprint)` と serde 出力だけで、
+    /// **互換判定そのものを通っていなかった** (`metric_version` には
+    /// `test_previous_compatible_rejects_old_metric_version` がある = 非対称)。
+    /// `previous_compatible` に短絡が入れば regression の誤検出が復活する。
+    #[test]
+    fn test_previous_compatible_rejects_old_fts_query_version() {
+        let mut h = History::default();
+        let mut prev = synthetic_run(map_one(5, 0.9), 0.9, map_one(10, 0.9), "golden_xyz");
+        prev.fingerprint.fts_query_version = 1;
+        let now = synthetic_run(map_one(5, 0.5), 0.5, map_one(10, 0.5), "golden_xyz");
+        h.push_front(prev, 10);
+        assert!(h.previous_compatible(&now).is_none());
+    }
+
+    /// 同じ世代どうしなら比較できること (上の test が「常に None」で通って
+    /// しまわないことの対) 。
+    #[test]
+    fn test_previous_compatible_accepts_the_same_fts_query_version() {
+        let mut h = History::default();
+        let prev = synthetic_run(map_one(5, 0.9), 0.9, map_one(10, 0.9), "golden_xyz");
+        let now = synthetic_run(map_one(5, 0.5), 0.5, map_one(10, 0.5), "golden_xyz");
+        h.push_front(prev, 10);
+        assert!(h.previous_compatible(&now).is_some());
+    }
+
     /// from_config は常に現行 METRIC_VERSION を書き込む。
     #[test]
     fn test_fingerprint_from_config_sets_current_metric_version() {

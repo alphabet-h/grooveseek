@@ -1503,6 +1503,48 @@ mod tests {
         }
     }
 
+    /// full-audit 2026-08-12 テスト軸 C-2: v0.15.2 は「日本語 CID PDF が正しく
+    /// 抽出できるようになった」を売りにしたが、それを守るテストが 1 本も無かった。
+    ///
+    /// AU-70 の fixture テストは `match` の **両分岐に assert を持つ dual-regime**
+    /// で、4.1.1 では `Err` 側、4.3.0 では `Ok` 側に落ちてどちらでも緑になる。
+    /// 「化けたものが索引に入らない」を測る設計としては正しいが、その代償として
+    /// **将来の bump で CID 抽出が化ける側に戻っても CI は緑のまま**になる。
+    /// bump の commit が "No test changed" と書けたのはそのためで、上流に出した
+    /// 修正 (bzsanti/oxidizePdf#470) を守る回帰テストは存在しなかった。
+    ///
+    /// ここでは pin している crate 版に対して**無条件に**「正しい日本語が出る」を
+    /// 主張する。crate を化ける版に戻すとこのテストだけが赤くなる。
+    #[test]
+    fn test_cid_direct_descendant_extracts_real_japanese_on_the_pinned_crate() {
+        let (pages, _) = extract_pdf(CID_DIRECT_DENSE_PDF, "docs/cid_direct.pdf")
+            .expect("the pinned oxidize-pdf must extract a direct-dictionary CIDFont");
+        assert!(
+            pages[0].contains("第1章 概要"),
+            "the pinned crate must decode the CID text, got: {:?}",
+            pages[0]
+        );
+        assert_eq!(
+            c1_control_ratio(&pages),
+            0.0,
+            "correctly decoded text carries no C1 controls"
+        );
+    }
+
+    /// 同じ主張を清音かな (C1 を 1 つも出さない唯一の形) でも固定する。
+    /// こちらが化けても C1 比率では気付けないので、本文一致で見るしかない。
+    #[test]
+    fn test_cid_kana_extracts_real_kana_on_the_pinned_crate() {
+        let (pages, _) = extract_pdf(CID_KANA_PDF, "docs/cid_kana.pdf")
+            .expect("the pinned oxidize-pdf must extract the kana fixture");
+        assert!(
+            pages[0].contains("あいうえお"),
+            "the pinned crate must decode the kana text, got: {:?}",
+            pages[0]
+        );
+        assert_eq!(bytewise_pair_signature_ratio(&pages), 0.0);
+    }
+
     #[test]
     fn test_kana_only_cid_mojibake_never_reaches_the_index() {
         match PdfParser.parse_bytes(CID_KANA_PDF, "docs/kana.pdf", &[]) {

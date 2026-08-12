@@ -738,6 +738,28 @@ mod tests {
             }
         }
 
+
+        /// full-audit 2026-08-12 テスト軸 H-5: 上の property は式を ` OR ` で
+        /// split して phrase を復元するが、fallback が返す「クエリ全体 1 phrase」に
+        /// ` OR ` が含まれると誤って割れる (`AI OR ML` が 2 個に見える)。
+        /// `query_phrases` は式に組み立てる前の `Vec<String>` を返すので、
+        /// パースを介さずに不変条件そのものを検証できる。
+        #[test]
+        fn query_phrases_are_substrings_without_parsing_the_expression(raw in "[^\"]{0,120}") {
+            for phrase in query_phrases(&raw) {
+                proptest::prop_assert!(
+                    raw.contains(&phrase),
+                    "phrase {phrase:?} is not a substring of {raw:?}"
+                );
+            }
+        }
+
+        /// 上限は式の見た目ではなく phrase 列そのもので担保されていること。
+        #[test]
+        fn query_phrases_never_exceed_the_cap(raw in "[^\"]{0,400}") {
+            proptest::prop_assert!(query_phrases(&raw).len() <= MAX_PHRASES);
+        }
+
         /// byte index が常に char 境界であること。quote / 制御文字 / 絵文字を含む任意入力。
         #[test]
         fn build_fts_query_never_panics_on_arbitrary_text(raw in ".{0,200}") {

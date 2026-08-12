@@ -17,19 +17,29 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   Queries are now compiled into per-token phrases joined by `OR`. Tokens come
   from script boundaries (kanji / hiragana / katakana / other word characters)
   inside runs that carry no separator, so `再ランキングの評価について` becomes
-  `"再ランキング" OR "ランキング" OR "の評価" OR "について"`. Runs shorter than the
-  trigram floor are merged with their neighbours rather than dropped, and when
-  a merge swallows a term that stood on its own, that term is kept as its own
-  phrase too — so a document holding only `ランキング` is still reachable.
+  `"再ランキング" OR "ランキング" OR "の評価" OR "について"`. A run shorter than the
+  trigram floor is merged with a neighbour **within the same separator-free
+  group**, and when a merge swallows a term that stood on its own, that term is
+  kept as its own phrase too — so a document holding only `ランキング` is still
+  reachable. A short run with no neighbour to merge with is dropped: in
+  `AI について` the `AI` has a space on one side and nothing on the other, so
+  the full-text half searches only for `について`. Quote it (`"AI" について`)
+  to keep it — though below three characters a phrase matches nothing under a
+  trigram tokenizer, which is why the floor exists.
 
   **This changes search results for every user, which is why it is a minor
   release.** Two things keep it from taking anything away. A `"quoted section"`
   is preserved verbatim, so quoting the whole query reproduces the old
   behaviour exactly. And when tokenization yields no usable phrase — a query
   made entirely of short fragments such as `AI と ML` — the old whole-query
-  phrase is used as a fallback. The set of documents FTS can reach is
-  therefore a superset of what it reached before; only the ranking moves,
-  which is the point.
+  phrase is used as a fallback. For any query that does not use the quoting
+  syntax, the set of documents FTS can reach is therefore a superset of what
+  it reached before, and only the ranking moves — which is the point. A query
+  that *does* use quotes now means what the quotes say rather than being
+  searched with the quote characters included, so a query like `"a""b"` looks
+  for `a"b` where it used to look for the literal `"a""b"`. That is the
+  intended effect of making the syntax meaningful, but it is a behaviour
+  change rather than a pure addition.
 
   **No re-indexing is required**: the index, the schema and the tokenizer are
   untouched. Only the query side changed.
@@ -52,6 +62,16 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   recorded before this release read as version 1 and are dropped from the
   comparison instead of being reported as a retrieval regression by
   `--fail-on-regression`. Existing history files stay readable.
+
+- **`match_spans` follows the same splitting as the search itself.** The
+  citation offsets returned with each hit used to come from splitting the raw
+  query on whitespace. That disagreed with the new quoting syntax — for
+  `"Foundry Local"` it looked for the literal terms `"Foundry` and `Local"`,
+  found neither, and returned an empty span list while the search itself
+  matched correctly. Both sides now use one splitting rule. Two consequences:
+  a quoted region highlights as a single span rather than word by word, and
+  fragments below the trigram floor no longer highlight on their own, because
+  they are not what the full-text half searched for either.
 
 - **`kb-mcp tune` diagnostics changed meaning, not thresholds.** The `docfreq`
   column now counts chunks matching *any* of the query's phrases, so it is an

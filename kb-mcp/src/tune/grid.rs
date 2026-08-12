@@ -126,7 +126,12 @@ pub struct HitMeta {
 pub struct QueryDiagnostics {
     /// 既定重みでの FTS 候補数 (pool 内)。実効 query の判定に使う。
     pub fts_candidates: usize,
-    /// phrase 全体の doc-freq (LIMIT なし)。IDF クランプ診断に使う。
+    /// クエリの phrase のいずれかにマッチする chunk 数 (LIMIT なし)。IDF クランプ
+    /// 診断 (`idf_clamped`) の入力。
+    ///
+    /// feature-48 以前は「クエリ全体という単一 phrase の doc-freq」だったが、現在は
+    /// `build_fts_query` が生む **OR 集合の和集合**の大きさであり、個々の phrase の
+    /// doc-freq の**上界**でしかない (下の `idf_clamped` の注記を参照)。
     pub fts_total_matches: i64,
     /// vec pool と FTS list の重複 chunk 数。**0 なら全スコアが単項
     /// `1/(k+r+1)` になり順位が rrf_k 不変** = rrf_k 軸が測定不能。

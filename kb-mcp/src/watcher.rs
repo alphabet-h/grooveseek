@@ -419,6 +419,22 @@ fn should_process_parts(
     if rel.ends_with(".kb-mcp.db") || rel.ends_with(".kb-mcp.db-journal") {
         return false;
     }
+    // symlink は index しない。full re-index 側は `collect_source_files` が
+    // `follow_links(false)` + `is_file()` で落としており (indexer.rs)、
+    // `get_document` も `validate_get_document_path` で明示的に拒否している。
+    // **live watcher だけが同じ制御を持っていなかった** (AU-03 と同型の再発、
+    // full-audit 2026-08-12 セキュリティ軸 H-1)。KB に書ける者が
+    // `notes.md -> ~/.ssh/id_rsa` を張ると、`fs::read` が link を辿るので
+    // 中身が chunk 化・embed され `search` から平文で読めてしまう。
+    //
+    // `symlink_metadata` が失敗した場合は**通す**。削除イベントではファイルが
+    // 既に無く、ここで弾くと deindex が動かなくなるため (この関数は
+    // Reindex / Deindex の両方を gate している)。
+    if let Ok(meta) = std::fs::symlink_metadata(full)
+        && meta.file_type().is_symlink()
+    {
+        return false;
+    }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
     // (フル re-index) と同じ判定で skip する。放置すると Office ファイルを
     // 開くたびに create イベント → parse 失敗 warn がスパムする。
@@ -596,6 +612,82 @@ mod tests {
         exclude_dirs: &[String],
     ) -> bool {
         should_process_parts(rel, full, registry, exclude_dirs)
+    }
+
+    /// Regression (full-audit 2026-08-12、セキュリティ軸 H-1): full re-index は
+    /// `collect_source_files` が `follow_links(false)` + `is_file()` で symlink を
+    /// 落とし、`get_document` も `validate_get_document_path` で明示的に拒否する。
+    /// **live watcher だけが同じ制御を持っていなかった**ので、KB に書ける者が
+    /// `notes.md -> <KB 外の秘密>` を張ると watcher がリンク先を読んで index し、
+    /// `search` から中身が平文で返っていた (full rebuild すると消えるので痕跡も残らない)。
+    ///
+    /// Windows では symlink 作成に開発者モードか管理者権限が要るので、作れなかった
+    /// 場合は skip する (Linux CI では必ず実行される)。
+    #[test]
+    fn test_symlink_is_not_indexed_by_the_watcher() {
+        let kb = crate::test_support::unique_temp_path("kb-mcp-watcher-symlink");
+        std::fs::create_dir_all(&kb).unwrap();
+        let secret = kb.join("outside-secret.txt");
+        std::fs::write(&secret, "ssh-rsa AAAA...").unwrap();
+        let link = kb.join("notes.md");
+
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&secret, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&secret, &link).is_ok();
+
+        let registry = Registry::defaults();
+
+        if made {
+            assert!(
+                !should_process_lite("notes.md", &link, &registry, &default_exclude_dirs()),
+                "a symlink must not be indexed by the watcher"
+            );
+        } else {
+            // Windows は symlink 作成に開発者モードか管理者権限が要る (WinError 1314)。
+            // **黙って return すると「通ったのに何も検証していない」テストになる**ので、
+            // skip したことを出力に残す。Linux CI では必ず上の assert が走る。
+            eprintln!(
+                "test_symlink_is_not_indexed_by_the_watcher: symlink 作成不可のため \
+                 symlink 分岐を skip (Windows の特権不足)。以下の分岐だけ検証する。"
+            );
+        }
+
+        // 素のファイルは従来どおり通る (guard が広すぎないことの確認)。
+        let plain = kb.join("real.md");
+        std::fs::write(&plain, "# Real\n").unwrap();
+        assert!(should_process_lite(
+            "real.md",
+            &plain,
+            &registry,
+            &default_exclude_dirs()
+        ));
+
+        // 削除イベントではファイルが既に無い。ここで弾くと deindex が
+        // 動かなくなるので、metadata が取れないパスは通す。
+        let gone = kb.join("deleted.md");
+        assert!(should_process_lite(
+            "deleted.md",
+            &gone,
+            &registry,
+            &default_exclude_dirs()
+        ));
+
+        // hardlink は **Windows でも特権不要**なので、symlink を作れない環境でも
+        // 「リンクの向こう側を読ませない」意図の一部をここで踏める。
+        // 現 guard は symlink しか見ないため hardlink は通る = 既知の残存リスク
+        // (full-audit 2026-08-12 H-1 の後半)。ここでは現契約を pin する:
+        // guard を symlink 判定から `metadata` ベースに書き換えると、この assert が
+        // 「意図せず広げた」ことを教えてくれる。
+        let hard = kb.join("hardlink.md");
+        if std::fs::hard_link(&secret, &hard).is_ok() {
+            assert!(
+                should_process_lite("hardlink.md", &hard, &registry, &default_exclude_dirs()),
+                "hardlink は現 guard の対象外 (既知の残存リスク)。塞ぐなら known-issues も更新すること"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&kb);
     }
 
     fn default_exclude_dirs() -> Vec<String> {
