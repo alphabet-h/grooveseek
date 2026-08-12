@@ -18,7 +18,24 @@ use crate::{indexer, markdown};
 // Server struct
 // ---------------------------------------------------------------------------
 
-pub struct KbServer {
+/// Request-independent server state.
+///
+/// (BU-06) Split out of [`KbServer`] so a tool handler can hand the whole
+/// thing to `spawn_blocking` with a single `Arc::clone`. Every handler body
+/// is synchronous and unbounded — embedding inference, SQLite queries, a
+/// full index rebuild — and running that directly on a tokio worker thread
+/// starves the runtime: with one such call in flight on a single-worker
+/// runtime `/healthz` took 651 ms, versus 0.9 ms once the same work ran on
+/// the blocking pool. Saturating all workers (16 concurrent calls on a
+/// 16-core box) stalled `/healthz` for 602 ms.
+///
+/// Note that a request timeout cannot substitute for this. `tower`'s
+/// `Timeout` polls the inner future first and the deadline `Sleep` only
+/// afterwards, so while the inner future owns its thread the `Sleep` is
+/// never polled: a 200 ms deadline over an 800 ms thread-blocking body
+/// returns `Ok` at 800 ms. The same deadline over an offloaded body elapses
+/// at 208 ms. Offloading is what makes every other mitigation possible.
+pub(crate) struct KbCore {
     /// watcher と共有するため `Arc<Mutex<_>>` で保持。
     db: Arc<Mutex<Database>>,
     embedder: Arc<Mutex<Embedder>>,
@@ -58,6 +75,17 @@ pub struct KbServer {
     /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
     /// in-process index operation (codex P2 round 1 on PR #57).
     indexing_state: Arc<Mutex<Option<IndexingState>>>,
+}
+
+/// The rmcp tool surface. Holds nothing but an `Arc` to the state, so the
+/// per-session clones the HTTP service factory makes stay cheap and a
+/// handler can move a reference to [`KbCore`] onto the blocking pool.
+pub struct KbServer {
+    core: Arc<KbCore>,
+    /// Unused by rmcp 1.4 — `#[tool_handler]` expands to
+    /// `Self::tool_router().call(..)`, i.e. it calls the generated *static*
+    /// fn and never reads this field. Kept so the struct still records that
+    /// a router belongs to it.
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -295,13 +323,13 @@ struct SearchFilterEcho {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
-#[tool_router(server_handler)]
-impl KbServer {
-    #[tool(
-        name = "search",
-        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them)."
-    )]
-    pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
+/// The synchronous bodies behind the tool surface.
+///
+/// (BU-06) Every method here blocks its thread — that is the point. They are
+/// only ever reached through the `spawn_blocking` wrappers in
+/// `impl KbServer` below, which is what keeps the tokio workers free.
+impl KbCore {
+    fn search_blocking(&self, params: SearchParams) -> String {
         // AU-01: 上限なしの `limit` は候補プール → `Vec::with_capacity` へ
         // 生で流れて allocation abort を起こす。MCP boundary で clamp する。
         let limit = clamp_search_limit(params.limit.unwrap_or(5));
@@ -508,11 +536,7 @@ impl KbServer {
         serde_json::to_string_pretty(&resp).unwrap_or_default()
     }
 
-    #[tool(
-        name = "list_topics",
-        description = "List all indexed topics and categories with document counts."
-    )]
-    async fn list_topics(&self) -> String {
+    fn list_topics_blocking(&self) -> String {
         let db = self.db.lock().unwrap();
         match db.list_topics() {
             Ok(topics) => {
@@ -535,11 +559,7 @@ impl KbServer {
         }
     }
 
-    #[tool(
-        name = "get_document",
-        description = "Get the full content and metadata of a document by its relative path within knowledge-base/."
-    )]
-    async fn get_document(&self, Parameters(params): Parameters<GetDocumentParams>) -> String {
+    fn get_document_blocking(&self, params: GetDocumentParams) -> String {
         // cap 分類は canonicalize 前の拡張子から (§4.4)。registry に無い拡張子は
         // text 扱い (1 MiB) で validate に流し、extension membership check で弾く。
         let req_ext = std::path::Path::new(&params.path)
@@ -588,14 +608,7 @@ impl KbServer {
         }
     }
 
-    #[tool(
-        name = "get_best_practice",
-        description = "Get a best-practices document for the given target, optionally extracting a specific h2 section by category name. Opt-in: requires `[best_practice].path_templates` to be configured in kb-mcp.toml (e.g. `path_templates = [\"best-practices/{target}/PERFECT.md\"]`); returns a 'not configured' error otherwise."
-    )]
-    async fn get_best_practice(
-        &self,
-        Parameters(params): Parameters<GetBestPracticeParams>,
-    ) -> String {
+    fn get_best_practice_blocking(&self, params: GetBestPracticeParams) -> String {
         if self.best_practice_templates.is_empty() {
             return serde_json::to_string_pretty(&ErrorResponse {
                 error: "get_best_practice is not configured. Add `[best_practice].path_templates` to kb-mcp.toml (for example: `path_templates = [\"best-practices/{target}/PERFECT.md\"]`) to enable this tool.".to_string(),
@@ -677,11 +690,7 @@ impl KbServer {
         }
     }
 
-    #[tool(
-        name = "rebuild_index",
-        description = "Rebuild the search index by scanning all source files in the knowledge base (Markdown plus any other extensions enabled via `[parsers].enabled` in kb-mcp.toml)."
-    )]
-    async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
+    fn rebuild_index_blocking(&self, params: RebuildIndexParams) -> String {
         let force = params.force.unwrap_or(false);
 
         // codex P2 round 1 + P2 round 4 on PR #57: flip `indexing_state` to
@@ -751,17 +760,7 @@ impl KbServer {
         }
     }
 
-    #[tool(
-        name = "get_connection_graph",
-        description = "BFS-expand semantically related chunks starting from a \
-                       document path. Returns a flat list of nodes with \
-                       parent_id / depth / score, useful for chained context \
-                       discovery by an LLM agent."
-    )]
-    async fn get_connection_graph(
-        &self,
-        Parameters(params): Parameters<GetConnectionGraphParams>,
-    ) -> String {
+    fn get_connection_graph_blocking(&self, params: GetConnectionGraphParams) -> String {
         // パラメータ検証 + 上限クランプ
         let depth = params
             .depth
@@ -808,6 +807,111 @@ impl KbServer {
             })
             .unwrap_or_default(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool surface — thin async wrappers over the blocking bodies (BU-06)
+// ---------------------------------------------------------------------------
+
+/// (BU-06) Run one tool body on tokio's blocking pool and render a `JoinError`
+/// as the same `ErrorResponse` JSON every other failure path uses.
+///
+/// A `JoinError` here means the body panicked (the handle is never aborted;
+/// `spawn_blocking` work is not cancellable anyway). Before the split a panic
+/// unwound through the rmcp request task; now it is caught and reported, so a
+/// single bad request no longer tears down the caller's session.
+async fn run_blocking<F>(tool: &'static str, f: F) -> String
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(tool, error = %e, "tool body panicked on the blocking pool");
+            serde_json::to_string_pretty(&ErrorResponse {
+                error: format!("{tool} failed: the request panicked ({e})"),
+            })
+            .unwrap_or_default()
+        }
+    }
+}
+
+/// The MCP tool surface.
+///
+/// (BU-06) Each handler does nothing but move its arguments onto the blocking
+/// pool. Keep it that way: a handler that touches `db` / `embedder` /
+/// `reranker` directly re-introduces the runtime starvation described on
+/// [`KbCore`], and `tool_handlers_do_not_block_the_runtime` will fail.
+#[tool_router(server_handler)]
+impl KbServer {
+    #[tool(
+        name = "search",
+        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them)."
+    )]
+    pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
+        let core = Arc::clone(&self.core);
+        run_blocking("search", move || core.search_blocking(params)).await
+    }
+
+    #[tool(
+        name = "list_topics",
+        description = "List all indexed topics and categories with document counts."
+    )]
+    async fn list_topics(&self) -> String {
+        let core = Arc::clone(&self.core);
+        run_blocking("list_topics", move || core.list_topics_blocking()).await
+    }
+
+    #[tool(
+        name = "get_document",
+        description = "Get the full content and metadata of a document by its relative path within knowledge-base/."
+    )]
+    async fn get_document(&self, Parameters(params): Parameters<GetDocumentParams>) -> String {
+        let core = Arc::clone(&self.core);
+        run_blocking("get_document", move || core.get_document_blocking(params)).await
+    }
+
+    #[tool(
+        name = "get_best_practice",
+        description = "Get a best-practices document for the given target, optionally extracting a specific h2 section by category name. Opt-in: requires `[best_practice].path_templates` to be configured in kb-mcp.toml (e.g. `path_templates = [\"best-practices/{target}/PERFECT.md\"]`); returns a 'not configured' error otherwise."
+    )]
+    async fn get_best_practice(
+        &self,
+        Parameters(params): Parameters<GetBestPracticeParams>,
+    ) -> String {
+        let core = Arc::clone(&self.core);
+        run_blocking("get_best_practice", move || {
+            core.get_best_practice_blocking(params)
+        })
+        .await
+    }
+
+    #[tool(
+        name = "rebuild_index",
+        description = "Rebuild the search index by scanning all source files in the knowledge base (Markdown plus any other extensions enabled via `[parsers].enabled` in kb-mcp.toml)."
+    )]
+    async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
+        let core = Arc::clone(&self.core);
+        run_blocking("rebuild_index", move || core.rebuild_index_blocking(params)).await
+    }
+
+    #[tool(
+        name = "get_connection_graph",
+        description = "BFS-expand semantically related chunks starting from a \
+                       document path. Returns a flat list of nodes with \
+                       parent_id / depth / score, useful for chained context \
+                       discovery by an LLM agent."
+    )]
+    async fn get_connection_graph(
+        &self,
+        Parameters(params): Parameters<GetConnectionGraphParams>,
+    ) -> String {
+        let core = Arc::clone(&self.core);
+        run_blocking("get_connection_graph", move || {
+            core.get_connection_graph_blocking(params)
+        })
+        .await
     }
 }
 
@@ -1572,20 +1676,22 @@ impl KbServer {
     /// Arc::clone で軽量、embedder / reranker モデルの重複ロードは起きない。
     pub fn from_shared(shared: &KbServerShared) -> Self {
         Self {
-            db: Arc::clone(&shared.db),
-            embedder: Arc::clone(&shared.embedder),
-            reranker: Arc::clone(&shared.reranker),
-            rerank_by_default: shared.rerank_by_default,
-            kb_path: shared.kb_path.clone(),
-            exclude_headings: shared.exclude_headings.clone(),
-            exclude_dirs: shared.exclude_dirs.clone(),
-            quality_threshold: shared.quality_threshold,
-            best_practice_templates: shared.best_practice_templates.clone(),
-            parser_registry: Arc::clone(&shared.parser_registry),
-            min_confidence_ratio: shared.min_confidence_ratio,
-            search_config: shared.search_config.clone(),
-            context_mode_desired: shared.context_mode_desired,
-            indexing_state: Arc::clone(&shared.indexing_state),
+            core: Arc::new(KbCore {
+                db: Arc::clone(&shared.db),
+                embedder: Arc::clone(&shared.embedder),
+                reranker: Arc::clone(&shared.reranker),
+                rerank_by_default: shared.rerank_by_default,
+                kb_path: shared.kb_path.clone(),
+                exclude_headings: shared.exclude_headings.clone(),
+                exclude_dirs: shared.exclude_dirs.clone(),
+                quality_threshold: shared.quality_threshold,
+                best_practice_templates: shared.best_practice_templates.clone(),
+                parser_registry: Arc::clone(&shared.parser_registry),
+                min_confidence_ratio: shared.min_confidence_ratio,
+                search_config: shared.search_config.clone(),
+                context_mode_desired: shared.context_mode_desired,
+                indexing_state: Arc::clone(&shared.indexing_state),
+            }),
             tool_router: KbServer::tool_router(),
         }
     }
@@ -2999,5 +3105,145 @@ mod tests {
             let value = serde_json::Value::Object((*schema).clone());
             assert_clean(tool, &value, "");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BU-06: tool bodies must not run on the async worker threads
+    // -----------------------------------------------------------------------
+
+    /// Time how long a second task waits to be polled while a first task is
+    /// busy for `BUSY` — on a runtime with exactly **one** worker thread.
+    ///
+    /// One worker makes the result a fact about scheduling rather than about
+    /// timing luck: if the busy task owns the worker, the second task cannot
+    /// be polled at all until it lets go.
+    #[cfg(test)]
+    fn latency_behind_busy_task(offload: bool) -> std::time::Duration {
+        const BUSY: std::time::Duration = std::time::Duration::from_millis(400);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let started = std::time::Instant::now();
+            let busy = tokio::spawn(async move {
+                if offload {
+                    run_blocking("test", move || {
+                        std::thread::sleep(BUSY);
+                        String::new()
+                    })
+                    .await
+                } else {
+                    // The shape every tool handler had before BU-06.
+                    std::thread::sleep(BUSY);
+                    String::new()
+                }
+            });
+            let second = tokio::spawn(async move { started.elapsed() });
+            let (_, waited) = tokio::join!(busy, second);
+            waited.unwrap()
+        })
+    }
+
+    /// A tool body running through [`run_blocking`] must leave the async
+    /// workers free to serve `/healthz`, `/api/admin/status` and every other
+    /// request.
+    ///
+    /// The inline arm is asserted too, and that is the point: it is the shape
+    /// the handlers had before BU-06, and it shows this test can fail. Without
+    /// it the offloaded assertion would also pass on a runtime with spare
+    /// workers, i.e. for the wrong reason.
+    #[test]
+    fn run_blocking_leaves_the_async_workers_free() {
+        let inline = latency_behind_busy_task(false);
+        let offloaded = latency_behind_busy_task(true);
+
+        assert!(
+            inline >= std::time::Duration::from_millis(300),
+            "control arm did not reproduce the stall: a task queued behind an \
+             inline 400ms body was polled after only {inline:?}. Either the \
+             runtime got a second worker or the measurement is broken — the \
+             offloaded assertion below would then prove nothing."
+        );
+        assert!(
+            offloaded < std::time::Duration::from_millis(100),
+            "run_blocking did not free the worker: a task queued behind an \
+             offloaded 400ms body waited {offloaded:?} (inline arm: {inline:?}). \
+             Tool bodies are starving the async runtime again (BU-06)."
+        );
+    }
+
+    /// Every `#[tool]` handler must delegate to [`run_blocking`] and do no
+    /// work of its own.
+    ///
+    /// `run_blocking_leaves_the_async_workers_free` proves the mechanism; this
+    /// proves the mechanism is actually *used*, including by handlers added
+    /// after BU-06. A handler that locks `db` / `embedder` inline compiles and
+    /// passes every behavioural test in this file, because none of them run on
+    /// a saturated runtime.
+    #[test]
+    fn tool_handlers_do_not_block_the_runtime() {
+        // Normalise line endings first: a checkout with `core.autocrlf=true`
+        // would otherwise break every `\n`-anchored marker below and the
+        // extraction would silently yield an empty block.
+        let src = include_str!("server.rs").replace("\r\n", "\n");
+
+        const MARKER: &str = "#[tool_router(server_handler)]\nimpl KbServer {";
+        let start = src.find(MARKER).expect(
+            "the `#[tool_router(server_handler)] impl KbServer` block moved or was renamed",
+        );
+        let rest = &src[start + MARKER.len()..];
+        // The impl block ends at the first `}` in column 0; everything nested
+        // inside it is indented.
+        let end = rest
+            .find("\n}\n")
+            .expect("could not find the end of the tool-surface impl block");
+        let block = &rest[..end];
+
+        let handlers: Vec<&str> = block.split("#[tool(").skip(1).collect();
+        assert_eq!(
+            handlers.len(),
+            6,
+            "expected 6 `#[tool]` handlers in the tool-surface block, found {}. \
+             If a tool was added or removed on purpose, update this count; if it \
+             is 0 the block extraction above broke and this test is vacuous.",
+            handlers.len()
+        );
+
+        for handler in &handlers {
+            let name = handler
+                .split_once("name = \"")
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(n, _)| n)
+                .unwrap_or("<unnamed>");
+            assert!(
+                handler.contains("run_blocking("),
+                "tool `{name}` does not delegate to run_blocking(). Its body \
+                 runs on a tokio worker thread, which starves the runtime for \
+                 every other request (BU-06). Move the work into a \
+                 `*_blocking` method on KbCore."
+            );
+            assert!(
+                !handler.contains(".lock()"),
+                "tool `{name}` takes a mutex on the async worker thread (BU-06). \
+                 Lock inside the `*_blocking` body on KbCore instead."
+            );
+        }
+
+        // Anti-vacuity: the work really did move, rather than the scan looking
+        // at a block that no longer contains anything.
+        let core_start = src
+            .find("\nimpl KbCore {")
+            .expect("the `impl KbCore` block moved or was renamed");
+        let core_block = &src[core_start..];
+        let core_end = core_block[1..]
+            .find("\n}\n")
+            .expect("could not find the end of the KbCore impl block");
+        assert!(
+            core_block[..core_end].matches(".lock()").count() >= 4,
+            "the blocking bodies no longer take any locks — either they moved \
+             somewhere this test cannot see, or the extraction is broken."
+        );
     }
 }
