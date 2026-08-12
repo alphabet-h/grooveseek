@@ -14,6 +14,8 @@ mod storage;
 // tests. Imported here (not `#[cfg(test)]`, unlike `parse_dim_from_create_sql`
 // below) because `search.rs` reaches it through `use super::*`.
 use fts_query::build_fts_query;
+// `server::compute_match_spans` が citation の offset を求めるのに同じ分割規則を使う。
+pub(crate) use fts_query::query_phrases;
 
 // `parse_dim_from_create_sql` moved with the rest of the schema code, but its
 // unit test did not: `mod tests` below is one module, and splitting it would

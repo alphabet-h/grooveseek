@@ -1117,7 +1117,17 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
     if trimmed.is_empty() {
         return None;
     }
-    let terms: Vec<&str> = trimmed.split_whitespace().collect();
+    // feature-48: FTS へ投げる phrase と同じ分割を使う。独自に whitespace 分割すると
+    // `"Foundry Local"` のような quote 付きクエリで `"Foundry` / `Local"` を探しに行き、
+    // FTS は当たっているのに span だけ空になる (codex review P2、PR #134)。
+    // token 化で phrase を作れないクエリ (`ab` 等) は FTS 自体が使われないので、
+    // ハイライトのためだけに従来どおり whitespace 分割へ落とす。
+    let phrases = crate::db::query_phrases(trimmed);
+    let terms: Vec<&str> = if phrases.is_empty() {
+        trimmed.split_whitespace().collect()
+    } else {
+        phrases.iter().map(String::as_str).collect()
+    };
     if terms.is_empty() {
         return None;
     }
@@ -2272,6 +2282,28 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(&"use tokio::spawn for async"[s[0].start..s[0].end], "tokio");
         assert_eq!(&"use tokio::spawn for async"[s[1].start..s[1].end], "spawn");
+    }
+
+    /// feature-48 (codex review P2, PR #134): quote 構文は FTS 側では逐語 phrase に
+    /// なるので、span 側も同じ 1 語として探さなければならない。生クエリを whitespace で
+    /// 割ると `"Foundry` / `Local"` を探して 0 件になり、FTS は当たっているのに citation の
+    /// offset だけが消える。
+    #[test]
+    fn test_compute_match_spans_follows_the_quote_syntax() {
+        let content = "Foundry Local runs models on device";
+        let spans = compute_match_spans("\"Foundry Local\"", content).expect("ASCII query -> Some");
+        assert_eq!(spans.len(), 1, "quoted region is one phrase, not two terms");
+        assert_eq!(&content[spans[0].start..spans[0].end], "Foundry Local");
+    }
+
+    /// quote を使わないクエリの span は従来どおり語ごと。
+    #[test]
+    fn test_compute_match_spans_still_splits_an_unquoted_query() {
+        let content = "Foundry Local runs models on device";
+        let spans = compute_match_spans("Foundry Local", content).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&content[spans[0].start..spans[0].end], "Foundry");
+        assert_eq!(&content[spans[1].start..spans[1].end], "Local");
     }
 
     #[test]

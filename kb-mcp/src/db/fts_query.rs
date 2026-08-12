@@ -17,7 +17,13 @@
 //! | 1. quote セグメント化 | [`split_quotes`] |
 //! | 2. whitespace 分割 + 3. 文字種 run 分割 | [`split_groups`] + [`split_runs`] |
 //! | 4. 短 run の隣接結合と独立 emit | [`emit_group`] |
-//! | 5. phrase 化 / dedup / 上限 + 6. fallback | [`finish_phrases`] + [`fallback_whole_query`] |
+//! | 5. dedup / 上限 | [`dedup_and_cap`] ([`query_phrases`] の末尾) |
+//! | 5. phrase 化 + 6. fallback | [`build_fts_query`] + [`fallback_whole_query`] |
+//!
+//! [`query_phrases`] が式に組み立てる**前**の phrase 内容を返すのは、
+//! `server::compute_match_spans` が citation の offset を求めるのに同じ分割を要るため。
+//! 分割規則を 2 か所に持つと、quote 付きクエリで「FTS は当たるのにハイライトだけ消える」
+//! ずれ方をする (codex review P2、PR #134)。
 //!
 //! 手順 2 の whitespace 分割が [`split_groups`] に吸収されているのは、whitespace が
 //! `char::is_alphanumeric()` で false = [`CharClass::Separator`] に落ちるためで、
@@ -275,10 +281,10 @@ fn concat(rs: &[Run<'_>]) -> String {
     rs.iter().map(|r| r.text).collect()
 }
 
-/// phrase 列を FTS5 の MATCH 式へ (spec 手順 5)。
+/// 重複除去 (初出保持) と上限の適用 (spec 手順 5)。
 ///
 /// 重複を先に落としてから上限で切る。逆順にすると重複が枠を食って情報量が減る。
-fn finish_phrases(phrases: Vec<String>) -> Option<String> {
+fn dedup_and_cap(phrases: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut kept: Vec<String> = Vec::new();
     let mut truncated = false;
@@ -297,16 +303,7 @@ fn finish_phrases(phrases: Vec<String>) -> Option<String> {
     if truncated {
         tracing::debug!(max = MAX_PHRASES, "fts_query: truncating to the phrase cap");
     }
-    if kept.is_empty() {
-        return None;
-    }
-
-    Some(
-        kept.iter()
-            .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    )
+    kept
 }
 
 /// token 化で phrase が 1 つも作れなかったときの逃げ道 (spec 手順 6)。
@@ -330,6 +327,29 @@ fn fallback_whole_query(raw: &str) -> Option<String> {
 ///
 /// `None` は「FTS 側に投げるものが無い」= 呼び出し側は vector 単独で検索する、の意味。
 pub(super) fn build_fts_query(raw: &str) -> Option<String> {
+    let phrases = query_phrases(raw);
+    if phrases.is_empty() {
+        return fallback_whole_query(raw);
+    }
+    Some(
+        phrases
+            .iter()
+            .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// FTS へ投げる phrase の**中身**を、式に組み立てる前の形で返す (手順 1〜5)。
+///
+/// `build_fts_query` の途中結果だが、`server::compute_match_spans` も同じ分割を
+/// 必要とする。あちらが独自に whitespace 分割していると、`"Foundry Local"` のような
+/// quote 付きクエリで `"Foundry` / `Local"` を探しにいって citation の offset が
+/// 空になる (FTS は当たっているのにハイライトだけ消える)。**分割規則は 1 か所に置く。**
+///
+/// 空 `Vec` は「token 化では phrase を作れなかった」= 呼び出し側が全体 fallback を
+/// 判断する、の意味。
+pub(crate) fn query_phrases(raw: &str) -> Vec<String> {
     let mut phrases = Vec::new();
 
     for seg in split_quotes(raw) {
@@ -353,7 +373,7 @@ pub(super) fn build_fts_query(raw: &str) -> Option<String> {
         }
     }
 
-    finish_phrases(phrases).or_else(|| fallback_whole_query(raw))
+    dedup_and_cap(phrases)
 }
 
 #[cfg(test)]
@@ -497,8 +517,24 @@ mod tests {
             input.push(format!("w{i:02}"));
         }
         // 重複が枠を食うなら distinct は 31 個で止まる。
-        let out = finish_phrases(input).unwrap();
-        assert_eq!(out.split(" OR ").count(), MAX_PHRASES);
+        assert_eq!(dedup_and_cap(input).len(), MAX_PHRASES);
+    }
+
+    /// `compute_match_spans` はこの関数の結果を term として使う。式に組み立てる前の
+    /// 中身が、quote を剥がした素の文字列であることを pin する (citation の offset は
+    /// content 側をこの文字列で探して求めるので、`\"` が混ざると必ず 0 件になる)。
+    #[test]
+    fn query_phrases_returns_unquoted_contents_for_span_lookup() {
+        assert_eq!(
+            query_phrases("\"Foundry Local\""),
+            vec!["Foundry Local".to_string()]
+        );
+        assert_eq!(
+            query_phrases("retry budget"),
+            vec!["retry".to_string(), "budget".to_string()]
+        );
+        // token 化で作れないときは空 = 呼び出し側が全体 fallback を判断する。
+        assert!(query_phrases("ab").is_empty());
     }
 
     // ---------------------------------------------------------------------
