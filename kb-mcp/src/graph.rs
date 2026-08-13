@@ -145,7 +145,7 @@ impl Default for GraphOptions {
 /// 上げる。**`centroid` は対処にならない** — 上限は読み取りに掛かるので平均
 /// されるのは同じ前半だけ) と「探索の先端が切れた」(対処: `max_nodes` を上げる /
 /// `depth` を下げる / `min_similarity` を上げる。ここでは `centroid` が有効で、
-/// シードが 1 個になって予算が connection に回る) を区別できない。
+/// シードノードが 1 個になり、その 1 個を除く予算が connection に回る) を区別できない。
 /// **対処法は理由と一緒に運ぶ**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,12 +210,16 @@ pub struct GraphStats {
     pub max_depth_reached: u32,
     pub knn_queries: u32,
     pub duration_ms: u64,
-    /// 実際に**探索の起点になった**起点ドキュメントのチャンク数 (BU-33)。
+    /// シードとして**採用された**起点ドキュメントのチャンク数 (BU-33)。
     ///
     /// 読み込んだ数ではない。`max_seed_chunks` と `max_nodes` は**どちらも**
     /// これを削りうる (`max_nodes = 8` に 32 チャンクなら 8、`max_nodes = 0` なら
     /// 0)。`seed_strategy = "centroid"` ではシードノードは 1 個だが、その 1 個に
     /// 畳み込まれたチャンク数を報告する。
+    ///
+    /// **「展開された数」ではない** — `fan_out = 0` や `depth = 0` では採用された
+    /// シードが 1 つも展開されず `knn_queries = 0` になる。展開回数を見たいなら
+    /// `knn_queries` を読むこと。
     pub seeds_used: u32,
 }
 
@@ -394,9 +398,10 @@ pub fn build_connection_graph(
             SeedStrategy::AllChunks => format!(
                 "the start document has more than {seed_cap} chunks; only its first {seed_cap} \
                  were read, so only those were eligible as BFS seeds (stats.seeds_used reports \
-                 how many were actually expanded). Raise max_seed_chunks to cover more of it -- \
-                 seed_strategy \"centroid\" frees the node budget for connections but averages \
-                 the same capped prefix, so it does not recover the chunks dropped here."
+                 how many were admitted). Raise max_seed_chunks to cover more of it -- \
+                 seed_strategy \"centroid\" leaves all but one node of the budget for \
+                 connections but averages the same capped prefix, so it does not recover the \
+                 chunks dropped here."
             ),
             SeedStrategy::Centroid => format!(
                 "the start document has more than {seed_cap} chunks; the centroid is the average \
@@ -1196,9 +1201,11 @@ mod tests {
         );
     }
 
-    /// `seeds_used` counts the chunks that actually seeded the walk, not the
-    /// chunks that were read. The node budget can cut the seed phase short, and
-    /// reporting the fetched count there would overstate the walk.
+    /// `seeds_used` counts the chunks admitted as seeds, not the chunks read
+    /// and not the seeds expanded. The node budget can cut the seed phase
+    /// short, so the fetched count would overstate it; `fan_out = 0` admits
+    /// seeds that are never expanded, so the expansion count would understate
+    /// it.
     #[test]
     fn seeds_used_counts_admitted_seeds_not_fetched_ones() {
         let db = setup_db();
@@ -1225,6 +1232,24 @@ mod tests {
             g.nodes.iter().filter(|n| n.depth == 0).count(),
             g.stats.seeds_used as usize,
             "seeds_used must equal the number of depth-0 nodes for all_chunks"
+        );
+
+        // Admitted, not expanded: fan_out = 0 short-circuits before any KNN,
+        // so the two counts come apart and only "admitted" stays true.
+        let g = build_connection_graph(
+            &db,
+            "big.md",
+            &GraphOptions {
+                fan_out: 0,
+                max_seed_chunks: 4,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(g.stats.knn_queries, 0, "fan_out = 0 expands nothing");
+        assert_eq!(
+            g.stats.seeds_used, 4,
+            "4 chunks were admitted as seeds even though none was expanded"
         );
     }
 

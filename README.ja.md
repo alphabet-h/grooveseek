@@ -498,7 +498,7 @@ kb-mcp graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
 - `--depth` (既定 2、最大 3 にクランプ) — BFS のホップ数
 - `--fan-out` (既定 5、最大 20 にクランプ) — ホップあたりのノード隣接数。`0` なら seed のみ返却
 - `--min-similarity` (既定 0.3) — コサイン類似度カットオフ。`0.0..=1.0`
-- `--seed-strategy` — `all-chunks` (既定) はシードになった各チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の仮想 seed を使い node 予算を全部 connection に回す。**どちらも見えるのは `--max-seed-chunks` 個までの前半だけ** (MCP ツール側の綴りは `all_chunks` / `centroid`)
+- `--seed-strategy` — `all-chunks` (既定) はシードになった各チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の seed ノードにまとめ、`--max-nodes` のうちその 1 個を除く全部を connection に回す。**どちらも見えるのは `--max-seed-chunks` 個までの前半だけ** (MCP ツール側の綴りは `all_chunks` / `centroid`)
 - `--max-nodes` (既定 100、最大 2000 にクランプ) — 総ノード数。KNN 実行回数もこれで縛られる
 - `--max-seed-chunks` (既定 32、`1..=1000` にクランプ) — シードに使う起点文書のチャンク数
 - `--exclude` — 結果から除外するカンマ区切りパス。起点パス自身は常に除外される
@@ -875,7 +875,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 
   上限が発火した時に呼び出し側が見るもの: 応答のルートに `truncated: true`、加えて `truncation` 配列に `reason` (`seed_chunks` / `node_budget`)・発火した `limit`・**その理由に対応する**対処が入る。`truncated` の意味は「**何かが失われた**」であって「カウンタが上限に達した」ではない — 予算をちょうど使い切ってフロンティアも尽きた探索は `false` を返す。`stats.seeds_used` は実際にシードになったチャンク数。CLI の text 出力も stats 行と理由ごとの `!` 行で同じ情報を出す。
 
-  BFS は幅優先なので、予算は浅い層から先に使われる。長い文書では既定の予算が depth 1 の展開で埋まるため、**`depth` だけ上げても結果は変わらない**。予算を幅でなく深さに使いたいなら `--seed-strategy centroid` (シードノードが 1 個になり予算が全部 connection に回る。同じ文書で depth 2 のグラフが 24 ノード / 約 0.4 s) か、`--max-seed-chunks` / `--fan-out` を下げる。ただし `max_seed_chunks` は**読み取り**に掛かるので、`centroid` が平均するのも同じ前半だけ — 予算を空けるだけで、seed 上限が落としたチャンクは戻らない。
+  BFS は幅優先なので、予算は浅い層から先に使われる。長い文書では既定の予算が depth 1 の展開で埋まるため、**`depth` だけ上げても結果は変わらない**。予算を幅でなく深さに使いたいなら `--seed-strategy centroid` (シードノードが 1 個になり、その 1 個を除く予算が connection に回る。同じ文書で depth 2 のグラフが 24 ノード / 約 0.4 s) か、`--max-seed-chunks` / `--fan-out` を下げる。ただし `max_seed_chunks` は**読み取り**に掛かるので、`centroid` が平均するのも同じ前半だけ — 予算を空けるだけで、seed 上限が落としたチャンクは戻らない。
 
   実行中は DB ロックを保持するので、graph リクエストは走っている間ずっと並行検索を待たせる。上限はその時間を有限かつ予測可能にするが、単位は秒ではなくノード数である点に注意 — 上記の KB では KNN 1 回が約 72 ms で、これは KB のチャンク数と埋め込み次元に比例する。`exclude_paths` は `search` の `path_globs` / `tags_any` / `tags_all` と同じく **64 件・各 1 KiB まで**。
 
