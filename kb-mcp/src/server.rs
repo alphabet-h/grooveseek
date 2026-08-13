@@ -217,8 +217,10 @@ struct GetConnectionGraphParams {
     /// Minimum cosine similarity (0.0-1.0) for a neighbor to be included
     /// (default: 0.3). Lower = looser chain.
     min_similarity: Option<f32>,
-    /// Seed strategy: "all_chunks" (default, expand from every chunk of
-    /// the start doc) or "centroid" (average the start doc's embeddings).
+    /// Seed strategy: "all_chunks" (default, expand from each seeded chunk of
+    /// the start doc) or "centroid" (average their embeddings into one seed,
+    /// leaving the whole node budget for connections). Both operate on the
+    /// first max_seed_chunks chunks only.
     seed_strategy: Option<String>,
     /// Filter by category (applied to all discovered nodes)
     category: Option<String>,
@@ -3707,6 +3709,33 @@ mod tests {
         assert!(
             nodes_desc.contains("KNN"),
             "max_nodes bounds the query count too, and a caller cannot infer that: {nodes_desc}"
+        );
+
+        // The seed cap makes "every chunk of the start document" false for
+        // both strategies. Four separate surfaces carried that claim and each
+        // was corrected one review round after the last, so the whole schema
+        // is swept rather than the one property that was wrong most recently.
+        let all: Vec<String> = value["properties"]
+            .as_object()
+            .expect("properties")
+            .iter()
+            .filter_map(|(k, v)| {
+                v["description"]
+                    .as_str()
+                    .map(|d| format!("{k}: {}", d.replace('\n', " ")))
+            })
+            .collect();
+        for d in &all {
+            let lower = d.to_lowercase();
+            assert!(
+                !lower.contains("every chunk") && !lower.contains("all chunks of"),
+                "the seed cap means no strategy sees every chunk: {d}"
+            );
+        }
+        assert!(
+            all.iter()
+                .any(|d| d.starts_with("seed_strategy") && d.contains("max_seed_chunks")),
+            "seed_strategy must say the cap applies to it: {all:?}"
         );
     }
 

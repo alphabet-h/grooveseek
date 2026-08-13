@@ -15,11 +15,17 @@ use crate::db::{Database, SearchResult};
 // Public types
 // ---------------------------------------------------------------------------
 
-/// BFS の探索ポリシー。`all_chunks` は起点ドキュメント内の全チャンクをシード
-/// として BFS を開始し、各々から KNN を広げる。`centroid` はチャンク埋め込みの
-/// 平均ベクトルを L2 再正規化してから 1 つの擬似シードとして扱う (BGE 系の
-/// embedding が単位ベクトルであるため、平均後も再正規化しないと
-/// `distance_to_cos_sim` の前提が崩れる)。
+/// BFS の探索ポリシー。
+///
+/// `all_chunks` は起点ドキュメントのチャンクを 1 つずつシードにして BFS を開始し、
+/// 各々から KNN を広げる。`centroid` はチャンク埋め込みの平均ベクトルを L2
+/// 再正規化してから 1 つの擬似シードとして扱う (BGE 系の embedding が単位
+/// ベクトルであるため、平均後も再正規化しないと `distance_to_cos_sim` の前提が
+/// 崩れる)。
+///
+/// **どちらも対象は `max_seed_chunks` で切られた前半だけ** (BU-33)。上限は
+/// 読み取りに掛かるので、`centroid` に切り替えても平均される範囲は広がらない —
+/// 変わるのはシード**ノード**が 1 個になり node 予算が connection に回ること。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedStrategy {
@@ -135,9 +141,12 @@ impl Default for GraphOptions {
 
 /// なぜグラフが打ち切られたか (BU-33)。
 ///
-/// 1 つの bool では「起点ドキュメントが削られた」(対処: 上限を上げる /
-/// `centroid` を使う) と「探索の先端が切れた」(対処: `depth` を下げる /
-/// `min_similarity` を上げる) を区別できない。**対処法は理由と一緒に運ぶ**。
+/// 1 つの bool では「起点ドキュメントが削られた」(対処: `max_seed_chunks` を
+/// 上げる。**`centroid` は対処にならない** — 上限は読み取りに掛かるので平均
+/// されるのは同じ前半だけ) と「探索の先端が切れた」(対処: `max_nodes` を上げる /
+/// `depth` を下げる / `min_similarity` を上げる。ここでは `centroid` が有効で、
+/// シードが 1 個になって予算が connection に回る) を区別できない。
+/// **対処法は理由と一緒に運ぶ**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TruncationReason {
@@ -1483,8 +1492,8 @@ mod tests {
         }
     }
 
-    /// `centroid` folds the document into one seed, so the node budget has no
-    /// grip on the seed read -- the cap is the only thing bounding it, and the
+    /// `centroid` folds its seeds into one node, so the node budget has no grip
+    /// on the seed read -- the cap is the only thing bounding it, and the
     /// changed meaning ("average of the first N chunks") has to be reported.
     #[test]
     fn the_centroid_reports_that_it_averaged_only_a_prefix() {

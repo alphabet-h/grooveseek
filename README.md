@@ -500,7 +500,7 @@ Flags:
 - `--depth` (default 2, clamped to max 3) — BFS hops.
 - `--fan-out` (default 5, clamped to max 20) — neighbors per node per hop. `0` returns only the seed.
 - `--min-similarity` (default 0.3) — cosine similarity cut-off. `0.0..=1.0`.
-- `--seed-strategy` — `all-chunks` (default) expands from every chunk of the start doc; `centroid` averages them (L2-renormalized) into one virtual seed. (The MCP tool spells these `all_chunks` / `centroid`.)
+- `--seed-strategy` — `all-chunks` (default) expands from each seeded chunk of the start doc; `centroid` averages them (L2-renormalized) into one virtual seed, leaving the whole node budget for connections. Both see only the first `--max-seed-chunks` chunks. (The MCP tool spells these `all_chunks` / `centroid`.)
 - `--max-nodes` (default 100, clamped to max 2000) — total nodes; also caps the number of KNN queries.
 - `--max-seed-chunks` (default 32, clamped to `1..=1000`) — chunks of the start document used as seeds.
 - `--exclude` — comma-separated paths to drop from results. The start path itself is always excluded.

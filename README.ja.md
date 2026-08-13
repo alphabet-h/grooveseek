@@ -498,7 +498,7 @@ kb-mcp graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
 - `--depth` (既定 2、最大 3 にクランプ) — BFS のホップ数
 - `--fan-out` (既定 5、最大 20 にクランプ) — ホップあたりのノード隣接数。`0` なら seed のみ返却
 - `--min-similarity` (既定 0.3) — コサイン類似度カットオフ。`0.0..=1.0`
-- `--seed-strategy` — `all-chunks` (既定) は起点文書の全チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の仮想 seed を使う (MCP ツール側の綴りは `all_chunks` / `centroid`)
+- `--seed-strategy` — `all-chunks` (既定) はシードになった各チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の仮想 seed を使い node 予算を全部 connection に回す。**どちらも見えるのは `--max-seed-chunks` 個までの前半だけ** (MCP ツール側の綴りは `all_chunks` / `centroid`)
 - `--max-nodes` (既定 100、最大 2000 にクランプ) — 総ノード数。KNN 実行回数もこれで縛られる
 - `--max-seed-chunks` (既定 32、`1..=1000` にクランプ) — シードに使う起点文書のチャンク数
 - `--exclude` — 結果から除外するカンマ区切りパス。起点パス自身は常に除外される
