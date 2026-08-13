@@ -51,8 +51,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   clock.
 
   Both bounds are needed. A node budget alone degenerates: BFS emits every seed
-  before any neighbour, so on that 160-chunk document any budget below 160
-  returned a connection graph with **zero connections**.
+  before any neighbour, so on that 160-chunk document any budget of 160 or less
+  returned a connection graph with **zero connections** (at exactly 160 the
+  seeds fit and the first neighbour is the one refused).
 
   Truncation is reported in band — `truncated: bool` at the root of the
   response plus a `truncation` array carrying `reason` (`seed_chunks` /
@@ -65,13 +66,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
   Defaults come from measurement: ~72 ms per KNN, ~4 ms per node, ~665 B of
   JSON per node, and a chunks-per-document distribution of median 13 / p90 26 /
-  p99 43 / max 160. So 32 seeds trims 4.0% of documents, and 100 nodes is
-  ~7.2 s / 65 KiB worst case.
+  p99 43 / max 160. So 32 seeds trims 4.0% of documents, and 100 nodes bounds a
+  request at `100 × 72 ms + 100 × 4 ms` = ~7.6 s / ~65 KiB. The measured runs
+  land well under that bound (1.1 s) because the budget fills partway through
+  the seed expansion, at 14 KNN rather than 100.
 
   **Callers who want the old behaviour** can ask for it:
   `--max-seed-chunks 1000 --max-nodes 2000` reproduces the depth-1 and depth-2
-  rows exactly, with `truncated: false`, for any document of 1000 chunks or
-  fewer. Two things are no longer reachable by anyone: exhaustive seeding of
+  rows exactly, with `truncated: false`. That holds for any walk that stayed
+  within both ceilings — a document of at most 1000 chunks whose graph came to
+  at most 2000 nodes; larger walks are truncated, and say so. Two things are no longer reachable by anyone: exhaustive seeding of
   documents larger than 1000 chunks, and results larger than 2000 nodes — the
   depth-3 row above is 3,682 nodes, so at the ceiling it returns 2,000 nodes in
   ~59 s with `truncated: true`.

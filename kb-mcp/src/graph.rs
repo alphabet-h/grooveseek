@@ -91,9 +91,14 @@ pub const MAX_SEED_CHUNKS_CEILING: u32 = 1000;
 /// したがってこの 1 つの上限が**応答サイズと KNN 実行回数の両方**を縛る。
 ///
 /// 既定 100 の根拠 (同じ実 KB での実測): 1 KNN ≈ 72 ms、1 ノード ≈ 4 ms、
-/// JSON は 1 ノード ≈ 665 バイト。よって最悪 100 × 76 ms ≈ **7.2 秒 /
-/// 65 KiB (≒ 16.6k token)**。上限なしの既定 depth=2 は最大の文書で実測
-/// 1,997 ノード / 86.7 秒だったので、約 12 倍の短縮になる。
+/// JSON は 1 ノード ≈ 665 バイト。`knn_queries <= total_nodes` なので最悪は
+/// `100 × 72 + 100 × 4 = ` **7.6 秒 / 65 KiB (≒ 17k token)**。
+///
+/// 比較対象は 2 つあり、混同しないこと: 上限なしの既定 depth=2 は最大の文書で
+/// **実測 1,997 ノード / 86.7 秒**だったので、**最悪値どうしで約 11 倍**、
+/// 同じリクエストの**実測どうしでは 1.1 秒 = 約 79 倍**の短縮になる
+/// (実測が最悪値よりずっと速いのは、予算が seed 展開の途中で埋まって
+/// KNN が 14 回で止まるため)。
 ///
 /// 天井 2000 は既定 depth=2 の実測最悪 (1,997 ノード) のすぐ上に置いた。
 /// `kb-mcp graph --max-nodes 2000 --max-seed-chunks 1000` は、**2,000 ノード
@@ -332,9 +337,18 @@ fn push_truncation(
 /// **深く行きたい場合の正解は予算増ではなく、シードを減らすこと** (`centroid` /
 /// 低い `max_seed_chunks` / 低い `fan_out`)。
 fn node_budget_detail(limit: u32) -> String {
+    // 上限に達している時に「max_nodes を上げろ」とだけ言うと、クライアントは
+    // 通らない再試行をする。天井を併記して、そこが行き止まりだと分かるようにする。
+    let raise = if limit >= MAX_NODES_CEILING {
+        format!(
+            "max_nodes is already at its ceiling of {MAX_NODES_CEILING}, so a larger graph is not available"
+        )
+    } else {
+        format!("raise max_nodes (ceiling {MAX_NODES_CEILING})")
+    };
     format!(
         "the graph hit its node budget of {limit}; the walk stopped before the frontier was \
-         exhausted. To get more nodes, raise max_nodes. To spend the budget on depth instead of \
+         exhausted. To get more nodes, {raise}. To spend the budget on depth instead of \
          breadth, use seed_strategy \"centroid\" or lower max_seed_chunks / fan_out. To get \
          fewer but more relevant nodes, raise min_similarity, set dedup_by_path, or use the \
          category / topic / exclude_paths filters."
@@ -1311,8 +1325,13 @@ mod tests {
     /// neighbour -- so a node budget *alone* spends itself entirely on the
     /// start document's own chunks and returns a "connection graph" with zero
     /// connections. The seed cap is what keeps room for connections.
+    ///
+    /// The defaults make that hold (cap 32 < budget 100), but it is not a
+    /// property of the code: a caller who sets `max_seed_chunks` at or above
+    /// `max_nodes` gets the degenerate graph back, and gets told so by the
+    /// `node_budget` entry.
     #[test]
-    fn the_budget_never_spends_itself_entirely_on_seeds() {
+    fn the_seed_cap_keeps_room_for_connections() {
         // 24 chunks spread far apart, each with one close neighbour document,
         // so every seed has a genuine connection to find. (Packing the chunks
         // together instead would fill each KNN with same-document siblings,
@@ -1352,6 +1371,27 @@ mod tests {
             0,
             "precondition: an uncapped seed phase is what starves the frontier"
         );
+
+        // The boundary the docs state: a budget *equal* to the seed count is
+        // still degenerate, because the seeds fit and the first neighbour is
+        // the one refused. "below the seed count" would be off by one.
+        let exact = build_connection_graph(
+            &db,
+            "big.md",
+            &GraphOptions {
+                max_seed_chunks: 1000,
+                max_nodes: 24,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(exact.stats.seeds_used, 24);
+        assert_eq!(
+            exact.nodes.iter().filter(|n| n.depth > 0).count(),
+            0,
+            "budget == seed count is still a graph with no connections"
+        );
+        assert!(exact.truncated);
 
         // The seed cap is what leaves room for connections.
         let capped = build_connection_graph(
@@ -1433,6 +1473,23 @@ mod tests {
             "the detail must name the knob that lifts the bound: {}",
             g.truncation[0].detail
         );
+    }
+
+    /// At the ceiling there is no larger graph to ask for, so telling the
+    /// client to "raise max_nodes" would send it into a retry that cannot
+    /// succeed. The remedy has to know when it has run out.
+    #[test]
+    fn the_remedy_stops_promising_a_bigger_graph_at_the_ceiling() {
+        let under = node_budget_detail(100);
+        assert!(under.contains("raise max_nodes"), "{under}");
+        assert!(under.contains(&MAX_NODES_CEILING.to_string()), "{under}");
+
+        let at = node_budget_detail(MAX_NODES_CEILING);
+        assert!(
+            !at.contains("raise max_nodes"),
+            "at the ceiling this is advice that cannot work: {at}"
+        );
+        assert!(at.contains("already at its ceiling"), "{at}");
     }
 
     /// Once the budget is full no further node can ever be added, so the walk
