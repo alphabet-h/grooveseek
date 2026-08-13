@@ -588,9 +588,25 @@ impl Config {
         // `resolve_cache_dir` は `dirs::cache_dir()` に落ち、それも取れない環境では
         // **CWD 相対の `./.fastembed_cache`** — 攻撃者のディレクトリ — に行き着く。
         // キーの有無は「警告を出すかどうか」だけを決める。
-        let safe_cache = dirs::cache_dir()
-            .map(|d| d.join("fastembed"))
-            .unwrap_or_else(|| std::env::temp_dir().join("kb-mcp-fastembed"));
+        //
+        // 代替先が決まらない場合は**続行しない**。共有 temp 配下の固定パス
+        // (`/tmp/kb-mcp-fastembed` 等) を発明するのは、まさにここで潰そうと
+        // している問題の再発 — マルチユーザ host では別ユーザが先に作って
+        // キャッシュ構造を仕込める。「安全な場所を名指しできないなら止まる」
+        // 方が、保証できないものを保証したふりをするより良い。
+        // `dirs::cache_dir()` が `None` になるのは HOME / LOCALAPPDATA が
+        // 無い環境だけで、そこは `--config` で明示すれば通る。
+        let Some(safe_cache) = dirs::cache_dir().map(|d| d.join("fastembed")) else {
+            anyhow::bail!(
+                "cannot determine a cache directory for embedding models, so the model \
+                 directory named by {} cannot be safely replaced.\n\
+                 This config was found by kb-mcp itself (not named with --config), so its \
+                 directory is treated as untrusted. Pass --config {} to accept it, or set \
+                 FASTEMBED_CACHE_DIR.",
+                shown.display(),
+                shown.display(),
+            );
+        };
         if let Some(dir) = self.fastembed_cache_dir.replace(safe_cache.clone()) {
             tracing::warn!(
                 config = %shown.display(),

@@ -219,7 +219,11 @@ paths that can be written without knowing anything about your machine —
 
 To accept a config in full, name it: `kb-mcp serve --config ./kb-mcp.toml`.
 Installed services are unaffected — `kb-mcp service install` writes its config
-to a config home, which is a trusted location.
+to a config home, which is a trusted location. One exception: if you set
+`KB_MCP_CONFIG_HOME` only for the `service install` command, that value is not
+in the daemon's environment later, so its config is classified untrusted and
+the restrictions above apply. Set the variable for the service too, or start it
+with `--config`.
 
 **What this does not cover**: if a repository ships its own `.mcp.json`, it
 controls the whole command line, not just the config file. No rule inside
