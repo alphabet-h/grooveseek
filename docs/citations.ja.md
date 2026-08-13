@@ -68,7 +68,21 @@ let snippet = content.get(span.start..span.end).unwrap_or("");
 2. 上の分割で phrase が 1 つも作れなかった場合に**限り**、trim 後の query を whitespace 分割へ落とす (`ab cd` のように全断片が trigram の下限未満のケース)。この形の query は FTS 側でも phrase 経由では届いていない
 3. term / content を ASCII-fold case-insensitive で小文字化
 4. 各 term を `content` 内で substring 検索 (case-insensitive)
-5. マッチ位置を start byte 順にソート + 重複除去。**1 chunk あたり 100 件で打ち切る** (`MATCH_SPAN_MAX_COUNT`) ので、1 文字 term × 巨大 chunk でレスポンスが膨れない
+5. 各 term に 100 span の予算を分配し (`floor(100 ÷ term 数)`、最低 1)、その件数だけ出現順に取る
+6. 集めた位置を**昇順・非重複**の span 列に畳む。重なった一致は和集合として 1 つの span になり、隣接しているだけのものは分かれたまま
+
+返る配列は毎回、以下を満たす (v0.18.0+):
+
+| 保証 | 意味 |
+| --- | --- |
+| 昇順かつ disjoint | `spans[i].end <= spans[i+1].start`。どの span も他と重ならない |
+| 非空 | すべての span が `start < end` |
+| 上限 | 100 span 以下 (`MATCH_SPAN_MAX_COUNT`) |
+| 語順非依存 | クエリの語順を入れ替えても同一の配列が返る |
+| カバレッジ | term が k 個 (k ≤ 100) あって各々が 1 回以上出現するなら、**すべての term** が最低 1 つの span に覆われる |
+| 冪等 | 返ってきた配列に同じ畳み込みをもう一度掛けても変わらない |
+
+このうち 2 つは v0.18.0 で新しく、それ以前に書いたクライアントがあるなら知っておく価値がある。以前は、引用符付き phrase とその内側の語を両方含むクエリ (`"Foundry Local" Foundry`) が**同じテキストに対して重なった** span `(0,7)` と `(0,13)` を返しており、ハイライト側がその意味を決めるしかなかった。また 100 span の予算は phrase 順に消費されたため、数百回一致する term が全部使い切ると、併せて指定した稀な term はどこにもハイライトされなかった。予算の分け合いはクエリが広いとき数 span を失う: 32 term なら各 `floor(100/32) = 3` で合計 96 (100 ではない)。**余りは意図的に再配分していない** — term 順に配ると、語順依存が戻ってしまうため。
 
 FTS と分割を共有していることの、観測できる帰結が 3 つある:
 

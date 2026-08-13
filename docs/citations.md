@@ -68,7 +68,21 @@ If you ever observe a span that breaks codepoint boundaries, please file a bug.
 2. Falling back to a whitespace split of the trimmed query when — and only when — that split yields no phrase at all, as in `ab cd` where every fragment is under the trigram floor. Such a query does not reach FTS through phrases either.
 3. Lower-casing both the terms and the content (ASCII fold only).
 4. Searching for each term as a substring (case-insensitive) in `content`.
-5. Reporting match positions, sorted by start byte, deduped — capped at 100 spans per chunk (`MATCH_SPAN_MAX_COUNT`), so a one-character term against a large chunk cannot inflate the response.
+5. Giving each term a share of the 100-span budget — `floor(100 / number of terms)`, at least one each — and taking that many of its occurrences in document order.
+6. Folding the collected positions into **sorted, non-overlapping** spans: overlapping matches become one span covering their union, while merely adjacent ones stay separate.
+
+The result satisfies, for every response (v0.18.0+):
+
+| Guarantee | Meaning |
+| --- | --- |
+| Sorted and disjoint | `spans[i].end <= spans[i+1].start`. No span overlaps another. |
+| Non-empty | Every span has `start < end`. |
+| Bounded | At most 100 spans (`MATCH_SPAN_MAX_COUNT`). |
+| Order-independent | Reordering the words of your query returns the identical array. |
+| Covering | If your query has *k* terms (k ≤ 100) and each occurs at least once, **every one of them** is covered by some span. |
+| Idempotent | Folding the same rule over the returned array changes nothing. |
+
+Two of these are new in v0.18.0 and worth knowing if you wrote a client against an earlier version. Before it, a query containing both a quoted phrase and a word inside that phrase — `"Foundry Local" Foundry` — returned overlapping spans `(0,7)` and `(0,13)` for the same text, and a highlighter had to decide what that meant. And the 100-span budget was spent in phrase order, so a term matching hundreds of times consumed all of it and the rare term you also asked about was highlighted nowhere. Sharing the budget costs a few spans when the query is wide: with 32 terms the budget is `floor(100/32) = 3` each, so 96 rather than 100. The leftover is deliberately **not** redistributed, because handing it out in term order would make the answer depend on word order again.
 
 Sharing the split with FTS has three visible consequences:
 

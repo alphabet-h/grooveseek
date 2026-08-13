@@ -1204,15 +1204,54 @@ pub(crate) const MATCH_SPAN_CONTENT_MAX_BYTES: usize = 256 * 1024;
 /// term × 大き目 content) で span 配列が肥大するのを抑える。F-35。
 pub(crate) const MATCH_SPAN_MAX_COUNT: usize = 100;
 
-/// query を whitespace で分割し、全 term が ASCII の場合のみ chunk 内で
-/// case-insensitive な substring 検索を行う。byte offset (UTF-8 char boundary 保証) を返す。
+/// (BU-10) span 計算で見る term の最大数。
+///
+/// `query_phrases` は 32 で cap 済みなので、これが効くのは phrase を作れない
+/// クエリが落ちる whitespace fallback 側だけ。そこは今まで無制限で、5000 語の
+/// クエリなら 5000 term を全部走査していた。
+pub(crate) const MATCH_SPAN_MAX_TERMS: usize = 100;
+
+/// 全 term が ASCII の場合のみ chunk 内で case-insensitive な substring 検索を
+/// 行い、byte offset (UTF-8 char boundary 保証) を返す。
 ///
 /// 戻り値:
 /// - `None` — query 全体に non-ASCII を 1 つでも含む / 空 query / content
 ///   が `MATCH_SPAN_CONTENT_MAX_BYTES` を超える (= 計算しない)
 /// - `Some(vec![])` — 計算したが一致なし
-/// - `Some(spans)` — 計算済みでマッチあり (start byte 順にソート + 重複除去、
-///   `MATCH_SPAN_MAX_COUNT` 件で打ち切り)
+/// - `Some(spans)` — 下記の契約を満たす span 列
+///
+/// # 契約 (BU-09 / BU-10)
+///
+/// 1. **disjoint かつ昇順**: `spans[i].end <= spans[i+1].start`。重なった一致は
+///    和集合に畳む (`next.start < cur.end` のときだけ結合 = **strict**)。
+///    隣接 (`next.start == cur.end`) は結合しない
+/// 2. **非空**: すべての span が `start < end`
+/// 3. **冪等**: 出力にもう一度同じ畳み込みを掛けても変わらない
+/// 4. **件数上限**: `MATCH_SPAN_MAX_COUNT` (100) 件以下
+/// 5. **語順非依存**: 同じ term 集合なら、クエリ内の語順を入れ替えても
+///    バイト単位で同じ配列を返す
+/// 6. **カバレッジ**: term が k 個 (k ≤ 100) あって各々が 1 回以上出現するなら、
+///    **すべての term** が最低 1 つの span に覆われる
+///
+/// 5 と 6 は各 term に `MAX_COUNT / k` 件 (最低 1) の予算を与え、その範囲で
+/// 出現順に取ることで出す。余った予算は**再配分しない** — 配分すると「どの
+/// term が追加分を得るか」が term 順に依存し、6 が消しにいった順序依存が縁に
+/// 戻るため。k=32 なら 96 件で止まる (100 件に届かない) が、それが代償。
+///
+/// ## なぜこの形か (実測)
+///
+/// feature-48 以前は term = whitespace 分割で、`break 'outer` が 100 件目で
+/// 全体を打ち切っていた。feature-48 で term が `query_phrases` 由来 (最大 32、
+/// 入れ子あり) になった結果:
+/// - `"Foundry Local" Foundry` が `(0,7)` と `(0,13)` の**重なった** span を返す
+/// - 先頭 phrase が 100 件出すと後続 phrase は 1 件も載らず、しかもその順序は
+///   コンパイラ内部の生成順
+///
+/// 検討した代替案「全出現を集めてから出現順位で上位 100 を選ぶ」は、実測で
+/// **100〜450 倍**遅く (密な 32 phrase × 256 KiB で 157 µs → 33.1 ms、
+/// `limit` 最大 1000 なら 1 検索 33 秒)、かつ正しさが早期終了条件に依存して
+/// **テストで固定できない**ため退けた。本方式は現実的なチャンク (4〜16 KiB)
+/// で 1.0〜1.2 倍、256 KiB × 32 phrase の病的入力でも約 2〜3 倍 (≈120 µs)。
 ///
 /// `pub` (lib crate API) で CLI (`src/main.rs`) / benches からも再利用できるようにしておく。
 pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::MatchSpan>> {
@@ -1244,14 +1283,25 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
         return None;
     }
 
+    // (BU-10) term 数を切る。`query_phrases` 側は 32 で cap 済みなので、
+    // 効くのは whitespace fallback だけ。
+    let terms: Vec<&str> = terms.into_iter().take(MATCH_SPAN_MAX_TERMS).collect();
+
     let content_lower = content.to_ascii_lowercase();
+    // (BU-10) 1 term あたりの予算。floor なので合計は必ず cap 以下になる
+    // (ceil だと k=32 で 4×32=128 になり、公開済みの「100 件以下」を破る)。
+    let term_count = terms.iter().filter(|t| !t.is_empty()).count().max(1);
+    let budget = (MATCH_SPAN_MAX_COUNT / term_count).max(1);
+
     let mut spans: Vec<crate::db::MatchSpan> = Vec::new();
-    'outer: for term in &terms {
+    for term in &terms {
         let term_lower = term.to_ascii_lowercase();
         if term_lower.is_empty() {
             continue;
         }
-        for (start, _) in content_lower.match_indices(&term_lower) {
+        // `take(budget)` は遅延なので、予算に達した時点でその term の走査も
+        // 止まる。全一致を数え上げてから選ぶ方式にしないのはこのため。
+        for (start, _) in content_lower.match_indices(&term_lower).take(budget) {
             let end = start + term_lower.len();
             // ASCII-only term + ASCII lowercasing なので byte 長は変わらず、
             // content 側の byte offset も自動的に char boundary に揃う。
@@ -1262,17 +1312,28 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
                 "ASCII-only invariant broke: span ({start}, {end}) not on char boundary in content"
             );
             spans.push(crate::db::MatchSpan { start, end });
-            // F-35: span 数の上限。dedup 前にカウントする (小さい cap=100 に
-            // 対して dedup 後でも 100 を保つには push 段階で抑制で十分、
-            // dedup によって減ることはあっても増えない)。
-            if spans.len() >= MATCH_SPAN_MAX_COUNT {
-                break 'outer;
-            }
         }
     }
+    Some(merge_disjoint_spans(spans))
+}
+
+/// (BU-09) 重なった span を和集合に畳んで、昇順・disjoint・非空の列にする。
+///
+/// 結合条件は **strict** な `next.start < cur.end`。`<=` にすると隣接しただけの
+/// span まで繋がり、`test_compute_match_spans_count_capped` の入力
+/// (`"a"` × 500 に対する 100 個の 1 byte span) が 1 個に潰れる。それでも
+/// `len() <= 100` は通るのでテストは緑のまま、cap の検査だけが無意味になる —
+/// 実測で確認した (非 strict → 1 span、strict → 100 span)。
+fn merge_disjoint_spans(mut spans: Vec<crate::db::MatchSpan>) -> Vec<crate::db::MatchSpan> {
     spans.sort_by_key(|s| (s.start, s.end));
-    spans.dedup_by(|a, b| a.start == b.start && a.end == b.end);
-    Some(spans)
+    let mut merged: Vec<crate::db::MatchSpan> = Vec::with_capacity(spans.len());
+    for s in spans {
+        match merged.last_mut() {
+            Some(last) if s.start < last.end => last.end = last.end.max(s.end),
+            _ => merged.push(s),
+        }
+    }
+    merged
 }
 
 /// `get_document` ツール用に、拡張子に対応する Parser で
@@ -2538,6 +2599,250 @@ mod tests {
             "spans.len()={} should be <= cap={}",
             spans.len(),
             MATCH_SPAN_MAX_COUNT
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BU-09 / BU-10: the match-span contract
+    // -----------------------------------------------------------------------
+
+    /// `MatchSpan` intentionally has no `PartialEq` (it is a serde wire type),
+    /// so tests compare tuples.
+    fn tuples(spans: &[crate::db::MatchSpan]) -> Vec<(usize, usize)> {
+        spans.iter().map(|s| (s.start, s.end)).collect()
+    }
+
+    /// Assert the whole structural contract at once, so every case below gets
+    /// all of it rather than whichever clause the author remembered.
+    fn assert_span_contract(query: &str, content: &str) -> Vec<crate::db::MatchSpan> {
+        let spans = match compute_match_spans(query, content) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        for w in spans.windows(2) {
+            assert!(
+                w[0].end <= w[1].start,
+                "spans must be sorted and disjoint, got {:?} then {:?} for query {query:?}",
+                w[0],
+                w[1]
+            );
+        }
+        for s in &spans {
+            assert!(s.start < s.end, "empty span {s:?} for query {query:?}");
+            assert!(
+                content.is_char_boundary(s.start) && content.is_char_boundary(s.end),
+                "span {s:?} is not on a char boundary for query {query:?}"
+            );
+        }
+        assert!(
+            spans.len() <= MATCH_SPAN_MAX_COUNT,
+            "spans.len()={} exceeds the published cap {MATCH_SPAN_MAX_COUNT} for query {query:?}",
+            spans.len()
+        );
+        spans
+    }
+
+    /// (BU-09) Overlapping matches are folded into their union.
+    ///
+    /// feature-48 made the term list come from `query_phrases`, which emits
+    /// nested phrases — a quoted phrase and a bare word that is a prefix of it
+    /// both end up as terms. The old `dedup_by` only removed byte-identical
+    /// spans, so a client received `(0,7)` and `(0,13)` for the same text and
+    /// had to guess what to do with them.
+    #[test]
+    fn overlapping_matches_are_merged_into_disjoint_spans() {
+        /// `(query, content, expected spans)`.
+        type OverlapCase = (&'static str, &'static str, &'static [(usize, usize)]);
+        let cases: &[OverlapCase] = &[
+            // the audit's example: quoted phrase + the bare word inside it
+            (
+                "\"Foundry Local\" Foundry",
+                "Foundry Local runs the Foundry stack",
+                &[(0, 13), (23, 30)],
+            ),
+            // one term is a prefix of another
+            (
+                "index indexing",
+                "indexing rebuilds the index",
+                &[(0, 8), (22, 27)],
+            ),
+            // partial overlap, neither contained in the other
+            ("kb-mcp mcp-server", "see kb-mcp-server here", &[(4, 17)]),
+            // three nested terms at the same start
+            ("abc abcd abcde", "abcde", &[(0, 5)]),
+            // the whitespace-fallback path (no phrase reaches MIN_PHRASE_CHARS)
+            ("a ab", "ab", &[(0, 2)]),
+        ];
+        for (query, content, expected) in cases {
+            let spans = assert_span_contract(query, content);
+            let got: Vec<(usize, usize)> = spans.iter().map(|s| (s.start, s.end)).collect();
+            assert_eq!(got, *expected, "query {query:?} over {content:?}");
+        }
+    }
+
+    /// The merge predicate is STRICT (`next.start < cur.end`), so spans that
+    /// merely touch stay separate.
+    ///
+    /// This is load-bearing rather than stylistic. With `<=`, the 100 adjacent
+    /// one-byte spans of `test_compute_match_spans_count_capped` collapse into
+    /// a single span. That test asserts only `len() <= cap`, so it would still
+    /// pass — the cap check would silently stop checking anything.
+    #[test]
+    fn adjacent_spans_are_not_merged() {
+        let spans = assert_span_contract("a", &"a".repeat(500));
+        assert_eq!(
+            spans.len(),
+            MATCH_SPAN_MAX_COUNT,
+            "100 adjacent single-byte matches must stay 100 separate spans; \
+             collapsing them would make the cap test vacuous"
+        );
+        assert!(spans.iter().all(|s| s.end - s.start == 1));
+    }
+
+    /// Folding the contract over its own output changes nothing.
+    #[test]
+    fn the_span_contract_is_idempotent() {
+        for (query, content) in [
+            (
+                "\"Foundry Local\" Foundry",
+                "Foundry Local runs the Foundry stack",
+            ),
+            ("abc abcd abcde", "abcde abcd abc"),
+            ("a", &"a".repeat(500)[..]),
+        ] {
+            let once = assert_span_contract(query, content);
+            let twice = merge_disjoint_spans(once.clone());
+            assert_eq!(
+                tuples(&once),
+                tuples(&twice),
+                "query {query:?} is not idempotent"
+            );
+        }
+    }
+
+    /// (BU-10) Reordering the words of a query does not change the answer.
+    ///
+    /// The old `break 'outer` stopped the whole scan at 100 spans, so whichever
+    /// phrase the compiler happened to emit first could consume the entire
+    /// budget. Which spans survived was therefore a function of an internal
+    /// ordering that feature-48 had just changed.
+    #[test]
+    fn span_selection_does_not_depend_on_term_order() {
+        let content = format!("{}{}", "xyz ".repeat(300), "alpha beta gamma delta epsil");
+        let orders = [
+            "xyz alpha beta gamma delta epsil",
+            "epsil delta gamma beta alpha xyz",
+            "gamma xyz epsil alpha delta beta",
+        ];
+        let first = assert_span_contract(orders[0], &content);
+        for q in &orders[1..] {
+            let other = assert_span_contract(q, &content);
+            assert_eq!(
+                tuples(&first),
+                tuples(&other),
+                "permuting the query changed the spans: {:?} vs {q:?}",
+                orders[0]
+            );
+        }
+    }
+
+    /// (BU-10) Every searched phrase that occurs gets at least one span.
+    ///
+    /// Before, one dense term could eat the whole 100-span budget and the five
+    /// rare terms the user also asked about were highlighted nowhere.
+    #[test]
+    fn every_matching_term_is_covered_by_some_span() {
+        let content = format!("{}{}", "xyz ".repeat(300), "alpha beta gamma delta epsil");
+        let terms = ["xyz", "alpha", "beta", "gamma", "delta", "epsil"];
+        let spans = assert_span_contract(&terms.join(" "), &content);
+        for t in terms {
+            let covered = content
+                .match_indices(t)
+                .any(|(at, _)| spans.iter().any(|s| s.start <= at && at < s.end));
+            assert!(
+                covered,
+                "term {t:?} occurs in the content but no span covers any of its \
+                 occurrences; the budget was not shared across terms"
+            );
+        }
+    }
+
+    /// The published cap holds when every term is dense.
+    ///
+    /// The per-term budget must be `floor(cap / k)`, not `ceil`: with 32
+    /// phrases `ceil(100/32) = 4` and `4 * 32 = 128` spans, breaking the "at
+    /// most 100" promise in README and docs/citations.md. That is a real
+    /// mistake made while writing this — the first draft used `div_ceil` and
+    /// produced 128 spans on this exact shape. None of the other tests here
+    /// reach the cap, so without this one the error ships.
+    #[test]
+    fn the_cap_holds_when_every_term_is_dense() {
+        // 32 distinct 3-char phrases, each occurring ~1000 times. 32 is the
+        // `MAX_PHRASES` ceiling in fts_query, so this is the widest term list
+        // the phrase path can produce.
+        let words: Vec<String> = (0..32).map(|i| format!("w{i:02}")).collect();
+        let query = words.join(" ");
+        let content = words.join(" ").repeat(1000);
+        let spans = assert_span_contract(&query, &content);
+        assert!(
+            spans.len() > MATCH_SPAN_MAX_COUNT / 2,
+            "the budget should still be mostly spent, got {} spans",
+            spans.len()
+        );
+    }
+
+    /// The cap holds on the whitespace-fallback path, which has no term limit
+    /// of its own.
+    ///
+    /// `query_phrases` caps phrases at 32, but it does **not** apply
+    /// `fallback_whole_query` — that is `build_fts_query`'s job — so a query
+    /// whose fragments are all below the trigram floor yields no phrases at
+    /// all and `compute_match_spans` falls back to `split_whitespace`, which
+    /// is unbounded. With a per-term budget of at least one span, 150 terms
+    /// would mean 150 spans unless the term list is clamped. Without
+    /// `MATCH_SPAN_MAX_TERMS` this test is the only thing between a long
+    /// query and a broken cap.
+    #[test]
+    fn the_cap_holds_on_the_unbounded_whitespace_fallback() {
+        let words: Vec<String> = (0..150)
+            .map(|i| {
+                format!(
+                    "{}{}",
+                    (b'a' + (i / 26) as u8) as char,
+                    (b'a' + (i % 26) as u8) as char
+                )
+            })
+            .collect();
+        let query = words.join(" ");
+        // Anti-vacuity: this must actually take the fallback path. If
+        // `query_phrases` ever starts returning phrases here, the test is
+        // exercising something else and should be rewritten, not deleted.
+        assert!(
+            crate::db::query_phrases(&query).is_empty(),
+            "precondition: every fragment is below the trigram floor, so no \
+             phrase should be produced and the whitespace fallback should run"
+        );
+        let content = words.join(" ");
+        let spans = assert_span_contract(&query, &content);
+        assert!(
+            !spans.is_empty(),
+            "the terms all occur in the content, so something must be highlighted"
+        );
+    }
+
+    /// A term that matches everywhere must not turn the whole chunk into one
+    /// span. Highlighting 100% of a chunk tells the caller nothing, and the
+    /// CLI renders span slices verbatim.
+    #[test]
+    fn merging_does_not_swallow_the_whole_chunk() {
+        let content = "ab".repeat(4096);
+        let spans = assert_span_contract("ab ba", &content);
+        let highlighted: usize = spans.iter().map(|s| s.end - s.start).sum();
+        assert!(
+            highlighted * 4 < content.len(),
+            "spans cover {highlighted} of {} bytes; merging must not approximate \
+             \"highlight everything\"",
+            content.len()
         );
     }
 
