@@ -159,8 +159,8 @@ edits the same files. **The index does not.** Each machine keeps its own
 - **The index can lag behind the files** by up to one timer interval,
   and different machines can be at different points in that window.
   Nothing breaks — search just returns slightly older content.
-- **Model caches are per machine too.** Set `FASTEMBED_CACHE_DIR` only
-  to a *local* path; pointing it at the NAS makes model loading slow and
+- **Model caches are per machine too.** Point `fastembed_cache_dir` only
+  at a *local* path; aiming it at the NAS makes model loading slow and
   serializes it across hosts.
 - **Config mismatches are caught, not silently tolerated.** If one
   machine indexes with `bge-small-en-v1.5` and another opens that

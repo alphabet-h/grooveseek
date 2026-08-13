@@ -1406,9 +1406,17 @@ pub(crate) enum ValidatePathOutcome {
 /// 防御の順序:
 /// 1. **symlink reject** — `canonicalize` の前に拾う必要がある
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
-/// 3. **extension membership** — indexer と同じ拡張子セットに限定
-///    (`.git/config` や excluded_dirs 配下の bypass を遮断)
+/// 3. **extension membership** — indexer と同じ拡張子セットに限定。
+///    `.git/config` のように registry に無い拡張子のファイルは読めない
 /// 4. **size cap** — RAM-OOM を防ぐ
+///
+/// (BU-08) **`exclude_dirs` はここに効かない**。この fn は `exclude_dirs` を
+/// 引数に取っておらず、`.obsidian/note.md` のように「除外ディレクトリ配下だが
+/// 拡張子は registry にある」ファイルは `get_document` から読める。
+/// `exclude_dirs` の契約は「**索引しない**」であって「読ませない」ではない
+/// — 検索には出ないがパスを知っていれば取得できる。kb_path 配下に置いた時点で
+/// 読める前提の設計なので、読ませたくないものは kb_path の外に置くこと。
+/// `document_in_excluded_dir_is_still_readable` が現契約として pin している。
 pub(crate) fn validate_get_document_path(
     kb_path: &std::path::Path,
     rel_path: &str,
@@ -2611,6 +2619,32 @@ mod tests {
         assert!(
             matches!(r, ValidatePathOutcome::Found(_)),
             "normal .md should pass: {r:?}"
+        );
+    }
+
+    /// (BU-08) `exclude_dirs` means "not indexed", not "not readable".
+    ///
+    /// A `.md` file under a default-excluded directory never shows up in search
+    /// results, but `get_document` still returns it to a caller who knows the
+    /// path — `validate_get_document_path` does not take `exclude_dirs` at all.
+    /// That is the intended contract (anything under `kb_path` is readable);
+    /// this pins it so the doc comment above and the code cannot drift apart
+    /// again, and so a future change to the contract has to be deliberate.
+    #[test]
+    fn document_in_excluded_dir_is_still_readable() {
+        let kb = TempKb::new("gd-excluded");
+        // `.obsidian` is in HARDCODED_EXCLUDE_DIRS, so the indexer skips it.
+        kb.write(".obsidian/workspace-notes.md", "# Private\nnot indexed\n");
+        let r = validate_get_document_path(
+            &kb.path,
+            ".obsidian/workspace-notes.md",
+            &md_only_registry(),
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "a .md under an excluded dir is still readable via get_document — \
+             exclude_dirs bounds indexing, not access: {r:?}"
         );
     }
 

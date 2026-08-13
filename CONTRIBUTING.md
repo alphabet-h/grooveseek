@@ -26,24 +26,30 @@ This activates `.githooks/pre-push`, which runs `cargo fmt --all -- --check` bef
 cargo build --release      # Release binary at target/release/kb-mcp(.exe)
 cargo check --all-targets  # Quick type check
 cargo test                 # Unit + integration tests (no model download)
-cargo test -- --ignored    # Includes embedding / reranker tests that download models
 cargo test -p kb-mcp --lib <name>  # One test by name (the workspace has several crates,
                                   # and `--lib` skips the integration-test binaries)
 ```
 
-`cargo test -- --ignored` downloads ONNX models on first run (BGE-small ~130 MB, BGE-M3 ~2.3 GB, BGE-reranker-v2-m3 ~2.3 GB). The models are cached per OS conventions — see the README's "Working around HuggingFace TLS failures" section if your network blocks the download.
+To reproduce what CI runs, all four of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails:
 
-## Code style
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo test
+cargo test --test index_progress_cli -- --test-threads=1   # must not run in parallel
+```
 
-- `cargo fmt --all` before committing (enforced in CI)
-- `cargo clippy --all-targets` must produce no warnings (enforced in CI)
+> **`cargo test -- --ignored` changes your machine.** Read the next section before running it.
+
+- `cargo fmt --all` before committing (also enforced by the pre-push hook and in CI)
 - Japanese comments are welcome for Japanese-KB-specific logic (CJK tokenization, date formats, etc.); English otherwise
 
 ## Repository layout
 
 - `kb-mcp/src/parser/` — `Parser` trait + `Registry` (one impl per file format)
 - `kb-mcp/src/indexer.rs` — `walkdir` → parse → embed → store pipeline
-- `kb-mcp/src/db.rs` — SQLite + sqlite-vec + FTS5 storage, `search_hybrid` (RRF, k=60)
+- `kb-mcp/src/db.rs` + `kb-mcp/src/db/` — SQLite + sqlite-vec + FTS5 storage. Split in v0.15.0 into `schema.rs` (creation + forward migrations), `storage.rs` (CRUD), `search.rs` (vector KNN, FTS candidates, RRF fusion — `search_hybrid`, k=60 by default), `meta.rs` (`index_meta` key/value), and `fts_query.rs` (compiling a query into per-token FTS phrases, v0.16.0+)
 - `kb-mcp/src/embedder.rs` — `fastembed-rs` wrapper (embeddings + cross-encoder rerankers)
 - `kb-mcp/src/mmr.rs` — MMR diversity re-rank (`mmr_select`, v0.7.0+)
 - `kb-mcp/src/parent.rs` — Parent retriever content expansion (`apply_parent_retriever`, v0.7.0+)
@@ -57,7 +63,8 @@ cargo test -p kb-mcp --lib <name>  # One test by name (the workspace has several
 - `kb-mcp/src/markdown.rs` — backward-compatible shim re-exporting `parser::markdown`
 - `kb-mcp/src/indexer/progress.rs` — per-file progress output for `kb-mcp index` (`--quiet` / `--progress`)
 - `kb-mcp/src/service/` — `kb-mcp service install/uninstall/status` (systemd-user / LaunchAgent / Task Scheduler)
-- `kb-mcp/src/tune.rs` — `kb-mcp tune` fusion-parameter sweep
+- `kb-mcp/src/tune.rs` + `kb-mcp/src/tune/` — `kb-mcp tune` fusion-parameter sweep: `grid.rs` (sweep grid), `stats.rs` (aggregation), `report.rs` (rendering)
+- `kb-mcp/src/test_support.rs` — shared test helpers, notably `unique_temp_path` (this repo deliberately does not use the `tempfile` crate; see the comment there)
 - `crates/kb-mcp-tray/` — Windows system-tray monitor (`kb-mcp-tray.exe`, v0.9.0+)
 - `crates/kb-mcp-svc/` — Windows hidden-console launcher started by the scheduled task (v0.9.1+)
 - `kb-mcp/tests/` — integration tests; `kb-mcp/benches/` — criterion benchmarks
@@ -66,10 +73,14 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.
 
 ## Test layering
 
-- **Light tests**: default `cargo test`. No network, no model download, runs in seconds.
-- **Ignored tests** (`#[ignore]`): require network + disk for model downloads. Opt in via `cargo test -- --ignored` or run in CI with a separate job.
+- **Light tests**: default `cargo test`. No network, no model download, runs in seconds. This is the only layer CI runs.
+- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Two different kinds of cost hide behind that one flag:
+  - **Model downloads** — ONNX models on first run (BGE-small ~130 MB, BGE-M3 ~2.3 GB, BGE-reranker-v2-m3 ~2.3 GB), cached per OS convention afterwards. See the README's "Working around HuggingFace TLS failures" section if your network blocks the download.
+  - **Real changes to your machine** — a few tests register and unregister actual OS services. `kb-mcp/tests/service_install_integration.rs` calls `Register-ScheduledTask` on Windows, and `crates/kb-mcp-tray/tests/install_integration.rs` writes a shortcut into `%APPDATA%\…\Start Menu\Programs\Startup\`. They use a per-PID service name and clean up after themselves, but a killed run can leave a scheduled task or a startup shortcut behind. Check with `Get-ScheduledTask -TaskName 'kb-mcp*'` if a run dies partway.
 
-When adding behavior that needs the embedder or reranker, mark the test `#[ignore]` and add a comment explaining what it exercises.
+  Run `cargo test -- --ignored` deliberately, not as a habit. To take only the download cost, target the suite you actually want: `cargo test --test <name> -- --ignored`.
+
+When adding behavior that needs the embedder or reranker, mark the test `#[ignore]` and add a comment explaining what it exercises. When a test touches the OS (services, autostart, the registry), say so in the `#[ignore = "…"]` reason itself so the cost is visible at the call site.
 
 ## Submitting changes
 

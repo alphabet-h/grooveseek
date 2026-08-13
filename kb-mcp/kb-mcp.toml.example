@@ -1,192 +1,210 @@
-# kb-mcp 設定ファイルのサンプル。
+# Example kb-mcp configuration.
 #
-# このファイルをバイナリ (kb-mcp / kb-mcp.exe) と**同じディレクトリ**に
-# `kb-mcp.toml` という名前でコピーして使う。
-# CLI 引数で明示指定した項目が常に優先されるため、ここでは運用時の既定値を
-# 書いておく想定。すべてのキーは optional (省略すればビルトイン既定値)。
+# Copy this file to `kb-mcp.toml` and edit. Every key is optional: omitting one
+# keeps the built-in default, and an explicit CLI argument always wins over the
+# file. Unknown keys are rejected at startup so typos surface immediately.
+#
+# Placement — `kb-mcp` looks for `kb-mcp.toml` in this order and stops at the
+# first hit:
+#
+#   1. `--config <PATH>` (any subcommand; errors out if the file is missing)
+#   2. the current working directory
+#   3. the nearest `.git` ancestor of the working directory (up to 20 levels)
+#   4. the directory holding the `kb-mcp` binary
+#
+# The project root (2) and next to the binary (4) are the common choices. See
+# "Config file discovery" in README.md for the full rules.
+#
+# NOTHING HERE CHANGES BEHAVIOUR AS SHIPPED. Every value left uncommented below
+# is already the built-in default, and everything that would alter how kb-mcp
+# behaves is commented out — so a fresh copy is inert, and what you turn on is
+# what you meant to turn on.
 
-# 対象 knowledge-base ディレクトリの絶対パス。
-# 指定すると `--kb-path` を省略できる。
+# Absolute path to the knowledge-base directory. Set it to stop passing
+# `--kb-path` on every invocation.
 #kb_path = "/path/to/knowledge-base"
 
-# 既定の埋め込みモデル。
-#   bge-small-en-v1.5 … 英語特化、384 次元、~130 MB (既定)
-#   bge-m3            … 多言語 (日本語 OK)、1024 次元、~2.3 GB
+# Default embedding model.
+#   bge-small-en-v1.5 … English-focused, 384 dim, ~130 MB (the default)
+#   bge-m3            … multilingual (incl. Japanese), 1024 dim, ~2.3 GB
+# Changing this requires `kb-mcp index --force`: the index stores vectors of one
+# model's dimensionality, and `serve` refuses to start on a mismatch.
 #model = "bge-m3"
 
-# 既定の cross-encoder reranker。
-#   none       … 無効 (既定)
-#   bge-v2-m3  … BAAI/bge-reranker-v2-m3 (多言語、~2.3 GB、日本語推奨)
-#   jina-v2-ml … jinaai/jina-reranker-v2-base-multilingual (~1.2 GB、軽量多言語)
-#   bge-base   … BAAI/bge-reranker-base (英/中、~280 MB)
+# Default cross-encoder reranker.
+#   none       … disabled (the default)
+#   bge-v2-m3  … BAAI/bge-reranker-v2-m3 (multilingual, ~2.3 GB; recommended for Japanese)
+#   jina-v2-ml … jinaai/jina-reranker-v2-base-multilingual (~1.2 GB, lighter multilingual)
+#   bge-base   … BAAI/bge-reranker-base (English/Chinese, ~280 MB)
+# Index-independent: switching rerankers does not require re-indexing.
 #reranker = "bge-v2-m3"
 
-# reranker が有効なとき、各 `search` 呼び出しで自動的に rerank を適用するか。
-# MCP ツール `search` の `rerank` パラメータで個別上書き可能。
+# Whether every `search` call reranks automatically once a reranker is
+# configured. Takes a boolean rather than being a bare flag, so the CLI form is
+# `--rerank-by-default=false`. The MCP tool's `rerank` parameter overrides it
+# per call.
 #rerank_by_default = true
 
-# fastembed のモデルキャッシュディレクトリ。
-# 既に環境変数 `FASTEMBED_CACHE_DIR` が設定されていれば env が優先される。
-# `hf download` で事前 DL した HF Hub キャッシュ (~/.cache/huggingface/hub)
-# を指しておくと、fastembed の TLS で DL 失敗する環境でも流用できる。
-#fastembed_cache_dir = "/home/yabushita/.cache/huggingface/hub"
+# fastembed model cache directory. The environment variable
+# `FASTEMBED_CACHE_DIR`, when set, wins over this key — note the spelling
+# difference: the file key is lower-case, and the upper-case name works only in
+# a real environment. Point it at a HuggingFace Hub cache you populated with
+# `hf download` to work around environments where fastembed's own TLS download
+# fails.
+#fastembed_cache_dir = "/path/to/.cache/huggingface/hub"
 
-# Markdown チャンク化時に除外する見出しの substring リスト。
-# 省略すると除外なし (全見出しをチャンク化)。リストを指定すると、
-# そのいずれかを substring として含む見出しのセクションが落とされる。
-# 例: 「参考リンク」と「次の深堀り候補」を落としたい場合:
-#exclude_headings = ["参考リンク", "次の深堀り候補"]
+# Heading substrings to exclude when chunking Markdown. Omitted, nothing is
+# excluded. A heading containing any of these substrings loses its whole
+# section, but descendants keep their correct ancestry breadcrumb.
+#exclude_headings = ["Further reading", "参考リンク"]
 
-# インデックス走査時にスキップするディレクトリ basename のリスト。
-# basename 完全一致 (substring や glob ではない)。省略時の既定は
-# [".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"]。
-# 指定すると既定を**置き換える** (merge ではない)。`[]` を明示すると
-# 何も除外せず全ディレクトリを走査する。
-# 例: 既定 + Next.js ビルド出力を足したい場合:
+# Directory basenames skipped while indexing. Whole-name match, not substring
+# or glob. Omitted, the default is
+# [".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"].
+# A list here REPLACES that default rather than adding to it, and an empty list
+# traverses everything.
 #exclude_dirs = [".obsidian", ".git", "node_modules", "target", ".vscode", ".idea", "dist", ".next"]
-# 例: 除外を全部外して全ディレクトリを走査したい場合:
-#exclude_dirs = []
 
-# 検索時のチャンク品質フィルタ。
-# enabled を false にすると MCP search / CLI search / get_connection_graph
-# すべてでフィルタが無効になり、従来の全件返却動作に戻る。
-# threshold は 0.0 から 1.0 の範囲で、未満のスコアのチャンクを除外する。
-# 既定はフィルタ有効 + threshold 0.3。
+# --- [quality_filter] — per-chunk quality filter --------------------------
+# On by default with threshold 0.3, which is what the two lines below spell
+# out. Chunks scoring below the threshold are dropped from MCP search, CLI
+# search and get_connection_graph. Turn the filter off to return every chunk
+# regardless of score.
 [quality_filter]
 enabled = true
 threshold = 0.3
 
-# `get_best_practice` MCP ツール (opt-in)。`[best_practice]` セクションを
-# 省略、あるいは `path_templates = []` を明示すると、ツールは "not configured"
-# エラーを返し機能しない。利用するにはテンプレートを 1 つ以上列挙する。
-# 先頭から順に `{target}` を置換して kb_path 相対で探し、最初に見つかった
-# ファイルを返す。`target` 引数は canonicalize + kb_path 配下のチェックあり。
-# opt-out したい場合はこのセクションを丸ごと削除する。
+# --- [best_practice] — the `get_best_practice` MCP tool (opt-in) ----------
+# The tool stays DISABLED until this section lists at least one template:
+# without one it answers with a "not configured" error, which is the shipped
+# state. Templates are tried in order, `{target}` substituted, resolved
+# relative to kb_path; the first existing file wins. The `target` argument is
+# canonicalized and confined to kb_path.
 [best_practice]
-path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
+#path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 
-# Indexing 対象の拡張子レジストリ。
-# 3 状態セマンティクス:
-#   - セクション自体なし        … ["md"] のみ (デフォルト)
-#   - 明示的な空配列           … エラー (silent failure 防止)
-#   - 独自リスト                … そのリストに含まれる拡張子だけを対象に
-# 現状のバイナリで対応する id: "md" / "txt" / "pdf" (v0.10.0+) /
-# "docx" / "xlsx" / "pptx" (v0.11.0+)
-# ("rst" / "adoc" 等は将来追加予定、現在指定するとエラー)
-# "xls" は v0.14.0 で取り下げ。指定すると理由付きで起動時エラーになる
-# (BIFF はシート 1 枚しか縛らないため、シートを多数宣言した小さなファイルで
-#  メモリを使い切れる)。`.xlsx` に変換すれば streaming で読める
-# 下記は .txt も index したい場合の例 ("md" のみ既定なら [parsers] ごと削除)。
+# --- [parsers] — which file extensions get indexed ------------------------
+# Three-state semantics:
+#   - section absent      … Markdown only, same as the line below
+#   - explicit empty list … rejected at startup, so that "nothing is indexed"
+#                           cannot happen silently
+#   - explicit list       … exactly those extensions
+# Supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx", "pptx"
+# (v0.11.0+). Unknown ids such as "rst" or "adoc" are rejected at startup.
+# "xls" was withdrawn in v0.14.0 and is rejected with an explanation: BIFF
+# bounds a sheet but not a workbook, so a small file declaring many sheets can
+# exhaust memory. Convert such a workbook to `.xlsx`, which is read as a stream.
+# Known limitations (PDF: no OCR, multi-column reading order; Office: no legacy
+# .doc/.ppt/.xls, no OpenDocument, password-protected files are detected and
+# skipped, tables are flattened to plain text) are described in README.md.
 [parsers]
-enabled = ["md", "txt"]
-# 全形式を index する例: enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
-# 既知の制限 (PDF: OCR 非対応 / 多段組の reading order 乱れ。Office 共通:
-# legacy .doc/.ppt/.xls 非対応 / OpenDocument 非対応 / パスワード保護は検出して
-# skip / 表構造は plain text 化) は README.md / README.ja.md 参照。
+enabled = ["md"]
+# (everything this build supports: enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"])
 
-# ファイルウォッチャー。`kb-mcp serve` 中のみ有効。
-# 有効時は kb_path 配下の変更 / 追加 / 削除 / rename を検知して
-# 該当ファイルだけを増分再インデックスする (PostToolUse hook が拾えない
-# 手動編集・git pull・外部スクリプト経由の更新もカバー)。
-# CLI `--no-watch` / `--debounce-ms <ms>` で per-run override 可能。
-# セクション自体を省略した場合も enabled=true / 500ms が既定。
+# --- [watch] — live-sync file watcher ------------------------------------
+# Active during `kb-mcp serve` only. Detects changes, additions, deletions and
+# renames under kb_path and re-indexes just the affected files, which covers
+# manual edits, `git pull` and external scripts. The two lines below are the
+# defaults; `--no-watch` and `--debounce-ms <ms>` override them per run.
 [watch]
 enabled = true
 debounce_ms = 500
 
-# トランスポート設定。`kb-mcp serve` が listen する方式を選ぶ。
-# kind は "stdio" (1 クライアント限定、既定) か "http"
-# (Streamable HTTP、複数クライアント同時接続可)。省略 (セクション自体なし)
-# なら stdio。[transport.http] だけ書けば kind 省略でも http 扱い (糖衣)。
-# HTTP 時の mount path は /mcp 固定、/healthz が 200 を返す。CLI
-# `--transport http --port 3100` / `--bind 0.0.0.0:3100` で per-run override。
-# 既定 bind は 127.0.0.1:3100 (loopback)。0.0.0.0 は opt-in、本番公開する場合は
-# 認証層 (nginx + basic auth 等の前段リバースプロキシ) を必ず挟むこと。
+# --- [transport] — how `kb-mcp serve` listens ----------------------------
+# "stdio" (the default, below) serves one client at a time over the process's
+# own stdin/stdout. "http" serves many simultaneous clients over Streamable
+# HTTP, mounted at /mcp, with /healthz answering 200 for probes.
+#
+# CHANGING THE LINE BELOW TO "http" OPENS A LISTENING SOCKET. So does deleting
+# the `kind` line while leaving the [transport.http] section in place — an
+# explicit [transport.http] means http on its own. `--transport http --port
+# 3100` and `--bind 0.0.0.0:3100` override per run.
 [transport]
-kind = "http"
+kind = "stdio"
 
 [transport.http]
+# Ignored while kind stays "stdio". The default is loopback, which is what the
+# line below repeats. Note the asymmetry once you do switch to http: a
+# non-loopback `--bind` on the COMMAND LINE is refused unless you add
+# `--i-know`, whereas a non-loopback address set HERE is not gated, because a
+# config file is taken as a deliberate deployment decision. kb-mcp ships NO
+# authentication of its own, so before exposing it to anything untrusted, set
+# `allowed_hosts` below and put a reverse proxy that does authenticate in front
+# of it.
 bind = "127.0.0.1:3100"
 
-# 受理する Host ヘッダの allow-list (DNS rebinding 防御、v0.5.0+)。
-# 省略時 (このキー自体を書かない) は rmcp の default
-# `["localhost", "127.0.0.1", "::1"]` (loopback only) が使われる。
-# LAN / イントラ公開時は **必ず明示する** (loopback only のまま 0.0.0.0
-# で bind すると外部 Host の inbound は Host header validation で 403。
-# これは通常 operator のミスなので、起動時に warn が出る)。
-# 空配列を渡すと **全 Host 許可** になる (rmcp の disable_allowed_hosts
-# 相当、public 公開時は推奨されない)。
-# IPv6 entries: bracketed form `"[::1]"` is recommended for clarity.
-# The unbracketed form `"::1"` is also accepted for backward compatibility.
+# Allow-list of accepted Host headers (DNS-rebinding defence, v0.5.0+).
+# Omitted, rmcp's default of localhost / 127.0.0.1 / ::1 (loopback only)
+# applies. ALWAYS set this explicitly when exposing the server on a LAN:
+# binding 0.0.0.0 while the allow-list stays loopback-only means every external
+# request is rejected with 403 by Host validation, which is almost always an
+# operator mistake, so startup warns about it. An empty list allows EVERY Host,
+# equivalent to disabling the check, and warns for the same reason.
+# IPv6 entries: the bracketed form "[::1]" is clearer, and the bare "::1" is
+# also accepted for backward compatibility.
 #allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100"]
 
-# F-64 (v0.7.5+): /healthz endpoint も allowed_hosts allow-list 配下に置くか。
-# 既定は true (= public、現行挙動、Host check なし)。false にすると
-# /healthz も Host header 検証され、non-allowlisted host から 403。
-# kb-mcp の存在 fingerprinting を防ぎたい時に opt-in。
+# Whether /healthz sits outside the allow-list (v0.7.5+). The default is public,
+# with no Host check. Turn it off to have /healthz validated like every other
+# endpoint, so a non-allowlisted host gets 403 — opt in when you would rather
+# not let an unknown caller fingerprint kb-mcp's presence.
 #healthz_public = false
 
-# --- eval (retrieval quality evaluation, optional power-user feature) ---
-# 詳細は docs/eval.md / docs/eval.ja.md を参照。省略時は全デフォルトで動作する。
-# セクション自体を丸ごと削除してよい。残す場合、各フィールドはすべて optional
-# (以下の値はビルトイン既定値と同じ)。
+# --- [eval] — retrieval quality evaluation (power-user, optional) ---------
+# Only needed if you run `kb-mcp eval`. See docs/eval.md. The commented values
+# are the built-in defaults.
 [eval]
-#golden = ".kb-mcp-eval.yml"            # Golden YAML パス (default: <kb_path>/.kb-mcp-eval.yml)
-#history_size = 10                      # 履歴保持件数 (default: 10)
-#k_values = [1, 5, 10]                  # 報告する k (default: [1, 5, 10])
-#regression_threshold = 0.05            # diff 色付けの閾値 (default: 0.05)
+#golden = ".kb-mcp-eval.yml"    # default: <kb_path>/.kb-mcp-eval.yml
+#history_size = 10              # default: 10
+#k_values = [1, 5, 10]          # default: [1, 5, 10]
+#regression_threshold = 0.05    # diff highlighting threshold (default: 0.05)
 
-# --- search (search ツール追加設定、v0.3.0+) ---
-# rank-based low_confidence 判定の閾値。top1.score / mean(top-N.score) <
-# ratio で flag が立つ。0.0 で判定無効。CLI `--min-confidence-ratio` /
-# MCP param `min_confidence_ratio` で per-query 上書き可。省略時は 1.5。
-# セクション自体を丸ごと削除してよい (既定値で動作する)。
+# --- [search] — search tool tuning (v0.3.0+) -----------------------------
+# Rank-based low-confidence flag: it trips when the top hit's score divided by
+# the mean of the top-N scores falls below the ratio. Zero disables the flag.
+# CLI `--min-confidence-ratio` and the MCP `min_confidence_ratio` parameter
+# override per query.
 [search]
-#min_confidence_ratio = 1.5             # default: 1.5
+#min_confidence_ratio = 1.5     # default: 1.5
 
-# [search.mmr] (optional, v0.7.0+).
-# Maximal Marginal Relevance: post-rerank diversity correction.
-# Defaults below show the built-in values (kept commented). Leaving
-# the section as-is opts into the default behavior with MMR off.
-# Uncomment specific keys to override. See docs/retrieval-pipeline.md.
+# Maximal Marginal Relevance: post-rerank diversity correction, applied AFTER
+# the reranker and BEFORE the parent retriever. Off by default. See
+# docs/retrieval-pipeline.md.
 [search.mmr]
 #enabled = false
-#lambda = 0.7              # 1.0 means no diversity (MMR off equivalent); < 0.5 leans exploration
-#same_doc_penalty = 0.0    # > 0 deduplicates same-document chunks; 0 means pure MMR
+#lambda = 0.7              # 1.0 means no diversity (equivalent to off); below 0.5 leans exploration
+#same_doc_penalty = 0.0    # above 0 deduplicates same-document chunks; 0 is pure MMR
 
-# [search.fusion] (optional, v0.13.0+).
-# RRF constant and FTS5 bm25 column weights. The commented values below are
-# the built-in defaults — leaving the section as-is changes nothing. Only
-# touch these after measuring with `kb-mcp tune` on your own KB; the defaults
-# are the industry convention and RRF is documented as requiring no tuning.
+# RRF constant and FTS5 bm25 column weights. The commented values are the
+# built-in defaults, so leaving this section alone changes nothing. Only touch
+# them after measuring with `kb-mcp tune` on your own KB — the defaults are the
+# industry convention and RRF is documented as needing no tuning.
 [search.fusion]
-#rrf_k = 60.0                  # >= 1.0. Lower favors a single retriever's top hit over consensus
-#bm25_heading_weight = 2.0     # >= 0.0. bm25 column weight for the chunk heading
-#bm25_context_weight = 1.0     # >= 0.0. bm25 column weight for the static context prefix
-#bm25_content_weight = 1.0     # >= 0.0. bm25 column weight for the chunk body
+#rrf_k = 60.0                  # at least 1.0. Lower favours one retriever's top hit over consensus
+#bm25_heading_weight = 2.0     # bm25 column weight for the chunk heading
+#bm25_context_weight = 1.0     # bm25 column weight for the static context prefix
+#bm25_content_weight = 1.0     # bm25 column weight for the chunk body
 
-# [search.parent_retriever] (optional, v0.7.0+).
-# Display-time content expansion for hit chunks. Defaults below are the
-# built-in values (kept commented). Leaving the section as-is opts into
-# the default behavior with parent retriever off. When enabled, short
-# hits are expanded to adjacent siblings or the whole document so the
-# LLM gets enough context. Score / rank / match_spans of the original
-# hit are preserved (only `content` and the new `expanded_from` field
-# change). See docs/retrieval-pipeline.md.
+# Display-time content expansion for hit chunks (v0.7.0+). Off by default. When
+# enabled, a short hit is expanded to adjacent siblings or the whole document so
+# the LLM gets enough context. Score, rank and match_spans of the original hit
+# are preserved; only the content and the new expanded_from field change. See
+# docs/retrieval-pipeline.md.
 [search.parent_retriever]
 #enabled = false
-#whole_doc_threshold_tokens = 100     # token_count below this -> whole document fallback
-#max_expanded_tokens = 2000           # cap for adjacent merge / whole-doc (BGE-M3 supports up to 8192)
+#whole_doc_threshold_tokens = 100   # token_count below this falls back to the whole document
+#max_expanded_tokens = 2000         # cap for adjacent merge and whole-doc (BGE-M3 supports up to 8192)
 
-# [contextual] (optional, feature-46+).
-# 静的 Contextual Retrieval: parser 生成の静的 context breadcrumb (doc title +
-# 見出しパンくず) を embedding / FTS / reranker に注入する。省略時は無効
-# (デフォルト off)。dogfood KB (574 docs) での A/B 計測で、kb-mcp の素の
-# default 構成 (reranker なし) では recall@5 / MRR がむしろ悪化することが
-# 分かったため opt-in とした。reranker (bge-v2-m3 等) を併用する場合は
-# 全指標で最良 (recall@5 +0.047 / MRR +0.102) になるため、reranker 併用時に
-# 限り有効化を推奨する (詳細: README の Contextual Retrieval 節)。
-# 既存 DB へ適用するには `index --force` が必要 (index_meta.context_mode に
-# よる versioning で、--force なしの mismatch は警告のみで現状維持)。
+# --- [contextual] — static Contextual Retrieval (v0.12.0+) ---------------
+# Injects the parser-generated context breadcrumb (document title plus heading
+# path) into the embedding, FTS and reranker inputs. Off by default, and that
+# default is measured rather than conservative: on a 574-document dogfood KB,
+# turning it on WITHOUT a reranker made recall@5 and MRR worse. Combined with a
+# reranker such as bge-v2-m3 it was best on every metric (recall@5 +0.047,
+# MRR +0.102), so enable it only when a reranker is configured too. Details are
+# in the "Contextual Retrieval" section of README.md.
+# Applying it to an existing index needs `kb-mcp index --force`: the built mode
+# is recorded in index_meta.context_mode, and without --force a mismatch only
+# warns and keeps the DB's current mode.
 # [contextual]
-# enabled = true   # reranker 併用時に opt-in 推奨。無指定/false は従来通り content のみ (feature-46, default false)
+# enabled = true

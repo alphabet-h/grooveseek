@@ -44,7 +44,9 @@ The binary is produced at `target/release/kb-mcp` (or `kb-mcp.exe` on Windows).
 
 ## Optional config file
 
-Any CLI option below can be given a default via a `kb-mcp.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy `kb-mcp.toml.example` to `kb-mcp.toml` and edit:
+Any CLI option below can be given a default via a `kb-mcp.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`kb-mcp/kb-mcp.toml.example`](kb-mcp/kb-mcp.toml.example) to `kb-mcp.toml` and edit.
+
+That template ships with **every line commented out**, so a fresh copy changes nothing until you opt in. The block below instead shows the keys filled in, to illustrate what each one does — read it as a menu, not as a file to paste wholesale:
 
 ```toml
 # kb-mcp.toml (placed in the project root, the .git ancestor, or next to kb-mcp)
@@ -70,6 +72,13 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 [quality_filter]
 enabled = true
 threshold = 0.3
+
+# The `get_best_practice` MCP tool is opt-in: without this section (or with an
+# empty list) it answers with a "not configured" error. Templates are tried in
+# order with `{target}` substituted, resolved relative to kb_path; the first
+# existing file wins.
+[best_practice]
+path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 
 # Indexing extensions. Omit the section to keep the previous default
 # behavior (.md only). Opt-in to .txt / .pdf / .docx / .xlsx / .pptx
@@ -100,6 +109,10 @@ kind = "http"
 [transport.http]
 bind = "127.0.0.1:3100"
 # allowed_hosts = ["kb.example.lan", "192.168.1.10"]  # opt-in for LAN exposure (v0.5.0+)
+# Whether /healthz sits outside the allowed_hosts check. Default true (public,
+# no Host check). Set false to have /healthz validated like every other
+# endpoint, so an unknown caller cannot fingerprint kb-mcp's presence (v0.7.5+).
+# healthz_public = false
 
 # Optional: `kb-mcp eval` (retrieval quality evaluation, power-user feature).
 # You only need this section if you run `kb-mcp eval` for tuning or
@@ -269,7 +282,7 @@ The server exposes 6 tools (see below) and keeps the index in-process for low-la
 - `jina-v2-ml` — jinaai/jina-reranker-v2-base-multilingual (multilingual, ~1.2 GB). Lighter alternative.
 - `bge-base` — BAAI/bge-reranker-base (English/Chinese only, ~280 MB). Not recommended for Japanese.
 
-Latency cost of rerank is roughly 300–700 ms per query on CPU with `bge-v2-m3` over 50 candidates. `--rerank-by-default` (on by default when `--reranker` is set) controls whether every `search` call uses rerank; the MCP tool takes `rerank: Option<bool>` to override per-query. Switching the reranker does **not** require re-indexing (it is index-independent).
+Latency cost of rerank is roughly 300–700 ms per query on CPU with `bge-v2-m3` over 50 candidates. `--rerank-by-default <BOOL>` (on by default when `--reranker` is set) controls whether every `search` call uses rerank. It takes a value rather than being a bare flag, so turning it off is `--rerank-by-default=false`; the MCP tool takes `rerank: Option<bool>` to override per query. Switching the reranker does **not** require re-indexing (it is index-independent).
 
 #### When to enable reranking
 
@@ -366,7 +379,7 @@ The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound 
 kb-mcp status --kb-path /path/to/knowledge-base
 ```
 
-Prints document and chunk counts from the existing index.
+Reports on the existing index, **on stderr** (`status` writes nothing to stdout, so do not pipe it): document and chunk counts, how many documents had unparseable `tags` frontmatter, the context mode the index was built in (`static` / `off`), and how many chunks pass the quality filter at its current threshold.
 
 ### One-shot search from the command line
 
