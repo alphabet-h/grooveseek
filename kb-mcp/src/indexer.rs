@@ -30,8 +30,17 @@ pub const HARDCODED_EXCLUDE_DIRS: &[&str] = &[".git", ".svn", "node_modules"];
 /// paths agree. `pub` because the bin target accesses it via the lib
 /// (`kb_mcp::indexer::is_hardcoded_excluded`); the library API is
 /// intentionally unstable per `src/lib.rs:4-6`.
+/// (BU-19) Matched case-insensitively, like the extension checks a few lines
+/// down. Windows and macOS resolve `.GIT` and `.git` to the same directory, so
+/// an exact-match denylist there is a denylist with a trivial bypass — and the
+/// fail-safe it is meant to be would silently index a repository's metadata.
+/// The cost on Linux, where the two really are different directories, is that
+/// a directory literally named `.GIT` is skipped as well; that is the safer
+/// side to err on for a hardcoded VCS denylist.
 pub fn is_hardcoded_excluded(basename: &str) -> bool {
-    HARDCODED_EXCLUDE_DIRS.contains(&basename)
+    HARDCODED_EXCLUDE_DIRS
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(basename))
 }
 
 /// MS Office (`~$doc.docx`) / LibreOffice (`.~lock.doc.docx#`) のロック・owner
@@ -911,7 +920,14 @@ fn collect_source_files(
             if is_hardcoded_excluded(name.as_ref()) {
                 return false;
             }
-            !exclude_dirs.iter().any(|d| d.as_str() == name.as_ref())
+            // (BU-19) Case-insensitive for the same reason as
+            // `is_hardcoded_excluded`: on Windows / macOS `Node_Modules` and
+            // `node_modules` are one directory, so an exact match lets the
+            // configured exclusion be bypassed by however the directory
+            // happens to be capitalised on disk.
+            !exclude_dirs
+                .iter()
+                .any(|d| d.as_str().eq_ignore_ascii_case(name.as_ref()))
         })
     {
         let entry = entry.context("walkdir error")?;
@@ -1417,6 +1433,53 @@ mod tests {
     // F-62: hardcoded denylist (.git / .svn / node_modules) is always applied
     // as a fail-safe alongside user `exclude_dirs` (union semantics).
     // -----------------------------------------------------------------------
+
+    /// (BU-19) Directory exclusion matches case-insensitively.
+    ///
+    /// On Windows and macOS `.GIT` and `.git` name the same directory, so an
+    /// exact-match denylist is one a repository can walk straight past — and
+    /// the hardcoded list exists precisely as a fail-safe. The user list has
+    /// the same problem in the other direction: `exclude_dirs = ["build"]`
+    /// missed a directory that happened to be created as `Build`.
+    ///
+    /// The case is checked here rather than via the filesystem so the test
+    /// means the same thing on Linux, where the two directories really are
+    /// distinct and the exclusion is a deliberate widening.
+    #[test]
+    fn dir_exclusion_ignores_case() {
+        for name in [".GIT", ".Git", "NODE_MODULES", "Node_Modules", ".SVN"] {
+            assert!(
+                is_hardcoded_excluded(name),
+                "{name} must hit the hardcoded denylist — on a case-insensitive \
+                 filesystem it is the very directory the list names"
+            );
+        }
+        for name in [".gitignore", "git", "node_modules_old", "svn"] {
+            assert!(
+                !is_hardcoded_excluded(name),
+                "{name} is a different directory and must not be excluded"
+            );
+        }
+
+        let tmp = mk_tmp("excludecase");
+        write_file(&tmp.0, "Build/inside.md", "# inside");
+        write_file(&tmp.0, "normal.md", "# normal");
+        let reg = Registry::defaults();
+        let files = collect_source_files(&tmp.0, &reg, &["build".to_string()]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"normal.md".to_string()),
+            "normal.md must be kept, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "inside.md"),
+            "`exclude_dirs = [\"build\"]` must also skip a directory spelled \
+             `Build`, got: {names:?}"
+        );
+    }
 
     /// `exclude_dirs = []` (= "walk everything") でも `.git/` 配下は skip。
     #[test]

@@ -1375,7 +1375,12 @@ fn validate_collect_md_files(kb_path: &Path, exclude_dirs: &[String]) -> Result<
             if kb_mcp::indexer::is_hardcoded_excluded(name.as_ref()) {
                 return false;
             }
-            !exclude_dirs.iter().any(|d| d.as_str() == name.as_ref())
+            // (BU-19) Case-insensitive, matching `collect_source_files`. The
+            // two walkers have to agree or `validate` reports on files the
+            // indexer never sees.
+            !exclude_dirs
+                .iter()
+                .any(|d| d.as_str().eq_ignore_ascii_case(name.as_ref()))
         })
     {
         let entry = entry.context("walkdir error during validate")?;

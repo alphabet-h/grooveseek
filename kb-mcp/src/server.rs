@@ -560,27 +560,15 @@ impl KbCore {
     }
 
     fn get_document_blocking(&self, params: GetDocumentParams) -> String {
-        // cap 分類は canonicalize 前の拡張子から (§4.4)。registry に無い拡張子は
-        // text 扱い (1 MiB) で validate に流し、extension membership check で弾く。
-        let req_ext = std::path::Path::new(&params.path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let is_binary = self
-            .parser_registry
-            .by_extension(req_ext)
-            .map(|p| p.is_binary())
-            .unwrap_or(false);
-        let max_bytes = if is_binary {
-            crate::parser::MAX_RAW_BINARY_BYTES
-        } else {
-            GET_DOCUMENT_MAX_BYTES
-        };
+        // (BU-22) Both caps go in; `validate_get_document_path` picks between
+        // them from the canonical extension, which is the same one its
+        // registry-membership check uses.
         let canonical = match validate_get_document_path(
             &self.kb_path,
             &params.path,
             &self.parser_registry,
-            max_bytes,
+            GET_DOCUMENT_MAX_BYTES,
+            crate::parser::MAX_RAW_BINARY_BYTES,
         ) {
             ValidatePathOutcome::Found(p) => p,
             ValidatePathOutcome::NotFound(e) => {
@@ -624,12 +612,20 @@ impl KbCore {
         ) {
             ResolveOutcome::Found(p) => p,
             ResolveOutcome::NotFound(tried) => {
+                // (BU-23) The candidate paths are built from
+                // `[best_practice].path_templates`, so echoing them back hands
+                // an unauthenticated caller the server's configured layout —
+                // directory names it may not otherwise know exist. The count
+                // is enough for the caller to tell "no template matched" from
+                // "the tool is not configured"; the operator gets the paths
+                // themselves on stderr.
+                tracing::debug!(
+                    target = %params.target,
+                    tried = ?tried,
+                    "get_best_practice found no matching template"
+                );
                 return serde_json::to_string_pretty(&ErrorResponse {
-                    error: format!(
-                        "Best-practices document for target '{}' not found. Tried: [{}]",
-                        params.target,
-                        tried.join(", ")
-                    ),
+                    error: best_practice_not_found_message(&params.target, &tried),
                 })
                 .unwrap_or_default();
             }
@@ -786,6 +782,9 @@ impl KbCore {
                 .unwrap_or_default();
             }
         };
+
+        // (BU-05) `exclude_paths` is bounded inside `build_connection_graph`
+        // rather than here, so `kb-mcp graph --exclude` gets the same limit.
 
         let opts = GraphOptions {
             depth,
@@ -1400,6 +1399,25 @@ pub(crate) enum ValidatePathOutcome {
     Denied(ErrorResponse),
 }
 
+/// (BU-23) `get_best_practice` の「見つからなかった」応答。
+///
+/// **`tried` の中身をクライアントへ返さないこと**が本 fn の存在理由。候補パスは
+/// `[best_practice].path_templates` から作られるので、そのまま返すと未認証の
+/// 呼び出し元にサーバの設定した配置 (存在すら知らないはずのディレクトリ名を含む)
+/// を渡すことになる。件数だけあれば「どのテンプレートにも当たらなかった」と
+/// 「そもそも未設定」は呼び出し元にも区別できる。実際のパスは operator が
+/// `RUST_LOG=kb_mcp=debug` で stderr から見る。
+fn best_practice_not_found_message(target: &str, tried: &[String]) -> String {
+    format!(
+        "Best-practices document for target '{}' not found ({} template{} tried). \
+         Check `[best_practice].path_templates` in kb-mcp.toml, or run the server \
+         with `RUST_LOG=kb_mcp=debug` to see which paths were probed.",
+        target,
+        tried.len(),
+        if tried.len() == 1 { "" } else { "s" }
+    )
+}
+
 /// `get_document` のパス検証 + size cap。成功時は canonical な絶対パスを返す。
 /// 拒否時は `ErrorResponse` を返し、呼び出し側が JSON 化する。
 ///
@@ -1408,7 +1426,16 @@ pub(crate) enum ValidatePathOutcome {
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
 /// 3. **extension membership** — indexer と同じ拡張子セットに限定。
 ///    `.git/config` のように registry に無い拡張子のファイルは読めない
-/// 4. **size cap** — RAM-OOM を防ぐ
+/// 4. **size cap** — RAM-OOM を防ぐ。**どちらの上限を使うかは canonical
+///    パスの拡張子から決める** (BU-08 と同じく、3 と同じ情報源を使う)
+///
+/// (BU-22) 以前は cap の選択だけ呼び出し側が **canonicalize 前のリクエスト
+/// パス**の拡張子から行い、membership check は canonical 側を見ていた。両者が
+/// 食い違うと上限が入れ替わる。Windows の 8.3 短縮名がまさにそれで、
+/// `presentation-deck.pptx` は `PRESEN~1.PPT` になる (この開発機で実測)。
+/// 拡張子は 3 文字に切られるので `.pptx`/`.xlsx`/`.docx` はいずれも registry に
+/// 無い legacy 拡張子に化け、text 上限 (1 MiB) が binary 上限 (50 MiB) の代わりに
+/// 適用される。1 MiB 超の Office 文書が短縮名経由で「File too large」になっていた。
 ///
 /// (BU-08) **`exclude_dirs` はここに効かない**。この fn は `exclude_dirs` を
 /// 引数に取っておらず、`.obsidian/note.md` のように「除外ディレクトリ配下だが
@@ -1421,7 +1448,8 @@ pub(crate) fn validate_get_document_path(
     kb_path: &std::path::Path,
     rel_path: &str,
     registry: &Registry,
-    max_bytes: u64,
+    text_max_bytes: u64,
+    binary_max_bytes: u64,
 ) -> ValidatePathOutcome {
     let file_path = kb_path.join(rel_path);
 
@@ -1470,7 +1498,17 @@ pub(crate) fn validate_get_document_path(
         });
     }
 
-    // 4. Size cap
+    // 4. Size cap — chosen from the same `ext` that step 3 just accepted, so
+    // the two cannot disagree (BU-22).
+    let max_bytes = if registry
+        .by_extension(ext)
+        .map(|p| p.is_binary())
+        .unwrap_or(false)
+    {
+        binary_max_bytes
+    } else {
+        text_max_bytes
+    };
     match std::fs::metadata(&canonical) {
         Ok(meta) if meta.len() > max_bytes => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
@@ -1562,7 +1600,9 @@ fn resolve_best_practice_path(
     for tmpl in templates {
         let rel = tmpl.replace("{target}", target);
         tried.push(rel.clone());
-        match validate_get_document_path(kb_path, &rel, registry, max_bytes) {
+        // Best-practice templates resolve to prose documents; pass the same cap
+        // for both classes so this path keeps the single limit it always had.
+        match validate_get_document_path(kb_path, &rel, registry, max_bytes, max_bytes) {
             ValidatePathOutcome::Found(p) => return ResolveOutcome::Found(p),
             ValidatePathOutcome::NotFound(_) => continue,
             ValidatePathOutcome::Denied(err) => return ResolveOutcome::Denied(err),
@@ -2615,10 +2655,76 @@ mod tests {
     fn test_validate_get_document_path_normal_md_passes() {
         let kb = TempKb::new("gd-ok");
         kb.write("docs/a.md", "# A\nbody\n");
-        let r = validate_get_document_path(&kb.path, "docs/a.md", &md_only_registry(), 1024 * 1024);
+        let r = validate_get_document_path(
+            &kb.path,
+            "docs/a.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
         assert!(
             matches!(r, ValidatePathOutcome::Found(_)),
             "normal .md should pass: {r:?}"
+        );
+    }
+
+    /// (BU-22) The size cap follows the canonical extension, not the one the
+    /// caller typed.
+    ///
+    /// The two used to be decided in different places from different strings.
+    /// Windows 8.3 aliasing makes them disagree for every Office format —
+    /// `presentation-deck.pptx` is also reachable as `PRESEN~1.PPT`, and
+    /// `.ppt` is not a registered extension, so the text cap was applied to a
+    /// file the registry classifies as binary. This asserts the property
+    /// without needing 8.3: a binary-class file between the two caps is
+    /// accepted, which is only true if the binary cap won.
+    #[test]
+    fn the_size_cap_follows_the_canonical_extension() {
+        let kb = TempKb::new("gd-cap-class");
+        let registry =
+            crate::parser::Registry::from_enabled(&["md".to_string(), "pdf".to_string()])
+                .expect("md + pdf is a valid registry");
+        // Contents are irrelevant: validation only stats the file.
+        kb.write("big.pdf", &"x".repeat(4096));
+
+        let r = validate_get_document_path(&kb.path, "big.pdf", &registry, 1024, 8192);
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "a .pdf of 4096 bytes sits above the 1024-byte text cap and below the \
+             8192-byte binary cap, so it must be accepted — applying the text cap \
+             to a binary-class file is BU-22: {r:?}"
+        );
+
+        // ...and the binary cap is a real cap, not an escape hatch.
+        let over = validate_get_document_path(&kb.path, "big.pdf", &registry, 1024, 2048);
+        assert!(
+            matches!(over, ValidatePathOutcome::NotFound(_)),
+            "4096 bytes must still be rejected once the binary cap is 2048: {over:?}"
+        );
+    }
+
+    /// (BU-23) The "not found" answer must not echo the configured templates.
+    #[test]
+    fn best_practice_miss_does_not_leak_the_configured_paths() {
+        let tried = vec![
+            "best-practices/rust/PERFECT.md".to_string(),
+            "internal/team-only/rust.md".to_string(),
+        ];
+        let msg = best_practice_not_found_message("rust", &tried);
+
+        for path in &tried {
+            assert!(
+                !msg.contains(path.as_str()),
+                "the reply leaks a configured template path ({path}): {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("team-only") && !msg.contains('/'),
+            "the reply must not carry any fragment of the configured layout: {msg}"
+        );
+        assert!(
+            msg.contains("2 templates tried"),
+            "the caller still needs to tell 'no template matched' from 'not configured': {msg}"
         );
     }
 
@@ -2640,6 +2746,7 @@ mod tests {
             ".obsidian/workspace-notes.md",
             &md_only_registry(),
             1024 * 1024,
+            1024 * 1024,
         );
         assert!(
             matches!(r, ValidatePathOutcome::Found(_)),
@@ -2658,6 +2765,7 @@ mod tests {
             ".git/config",
             &md_only_registry(),
             1024 * 1024,
+            1024 * 1024,
         ) {
             ValidatePathOutcome::NotFound(e) => e,
             other => panic!("expected NotFound, got {other:?}"),
@@ -2675,10 +2783,11 @@ mod tests {
         // max を 1 KiB にして 2 KiB のファイルで超過させる
         let big = "a".repeat(2 * 1024);
         kb.write("big.md", &big);
-        let err = match validate_get_document_path(&kb.path, "big.md", &md_only_registry(), 1024) {
-            ValidatePathOutcome::NotFound(e) => e,
-            other => panic!("expected NotFound, got {other:?}"),
-        };
+        let err =
+            match validate_get_document_path(&kb.path, "big.md", &md_only_registry(), 1024, 1024) {
+                ValidatePathOutcome::NotFound(e) => e,
+                other => panic!("expected NotFound, got {other:?}"),
+            };
         assert!(
             err.error.contains("File too large"),
             "expected size reject, got: {}",
@@ -2696,8 +2805,13 @@ mod tests {
         ));
         fs::write(&outside, "secret").unwrap();
         let rel = format!("../{}", outside.file_name().unwrap().to_string_lossy());
-        let err = match validate_get_document_path(&kb.path, &rel, &md_only_registry(), 1024 * 1024)
-        {
+        let err = match validate_get_document_path(
+            &kb.path,
+            &rel,
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        ) {
             ValidatePathOutcome::NotFound(e) => e,
             other => panic!("expected NotFound, got {other:?}"),
         };
@@ -2719,12 +2833,16 @@ mod tests {
         let target = kb.write("target.md", "# target\n");
         let link = kb.path.join("link.md");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let err =
-            match validate_get_document_path(&kb.path, "link.md", &md_only_registry(), 1024 * 1024)
-            {
-                ValidatePathOutcome::Denied(e) => e,
-                other => panic!("expected Denied, got {other:?}"),
-            };
+        let err = match validate_get_document_path(
+            &kb.path,
+            "link.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        ) {
+            ValidatePathOutcome::Denied(e) => e,
+            other => panic!("expected Denied, got {other:?}"),
+        };
         assert!(
             err.error.contains("symlinks are not allowed"),
             "expected symlink reject, got: {}",
