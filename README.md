@@ -382,7 +382,7 @@ The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound 
 kb-mcp status --kb-path /path/to/knowledge-base
 ```
 
-Reports on the existing index, **on stderr** (`status` writes nothing to stdout, so do not pipe it): document and chunk counts, how many documents had unparseable `tags` frontmatter, the context mode the index was built in (`static` / `off`), and how many chunks pass the quality filter at its current threshold.
+Reports on the existing index, **on stderr** (`status` writes nothing to stdout, so do not pipe it): document and chunk counts, how many documents had unparseable `tags` frontmatter, and the context mode the index was built in (`static` / `off`). A fourth line reports how many chunks pass the quality filter — only when the effective threshold is above zero, so it is absent under `[quality_filter] enabled = false` or `threshold = 0.0`.
 
 ### One-shot search from the command line
 

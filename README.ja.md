@@ -380,7 +380,7 @@ tray は `127.0.0.1:<port>/api/admin/status` を polling するので、daemon �
 kb-mcp status --kb-path /path/to/knowledge-base
 ```
 
-既存 index の状態を **stderr に** 表示する (`status` は stdout に何も書かないのでパイプで受けないこと): document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)、現在の閾値で品質フィルタを通過するチャンク数。
+既存 index の状態を **stderr に** 表示する (`status` は stdout に何も書かないのでパイプで受けないこと): document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
 
 ### コマンドラインからの一発検索
 
