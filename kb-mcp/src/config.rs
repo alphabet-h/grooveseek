@@ -596,25 +596,41 @@ impl Config {
         // 方が、保証できないものを保証したふりをするより良い。
         // `dirs::cache_dir()` が `None` になるのは HOME / LOCALAPPDATA が
         // 無い環境だけで、そこは `--config` で明示すれば通る。
-        let Some(safe_cache) = dirs::cache_dir().map(|d| d.join("fastembed")) else {
-            anyhow::bail!(
-                "cannot determine a cache directory for embedding models, so the model \
-                 directory named by {} cannot be safely replaced.\n\
-                 This config was found by kb-mcp itself (not named with --config), so its \
-                 directory is treated as untrusted. Pass --config {} to accept it, or set \
-                 FASTEMBED_CACHE_DIR.",
-                shown.display(),
-                shown.display(),
-            );
-        };
-        if let Some(dir) = self.fastembed_cache_dir.replace(safe_cache.clone()) {
-            tracing::warn!(
-                config = %shown.display(),
-                requested = %dir.display(),
-                using = %safe_cache.display(),
-                "ignoring fastembed_cache_dir from a config found in an untrusted location \
-                 (it selects which model file is loaded); pass --config to accept it"
-            );
+        if roots.cache_env_set {
+            // `FASTEMBED_CACHE_DIR` が既にあるなら、config の値は
+            // `cache_dir_env_override` の時点で捨てられる = そもそも効かない。
+            // 差し替え先を探す必要は無いので、落とすだけにする。ここで
+            // OS 標準キャッシュを要求すると、**エラー文が案内している
+            // `FASTEMBED_CACHE_DIR` を設定しても直らない**という矛盾になる。
+            if let Some(dir) = self.fastembed_cache_dir.take() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    requested = %dir.display(),
+                    "ignoring fastembed_cache_dir from a config found in an untrusted location \
+                     (FASTEMBED_CACHE_DIR is already set and takes precedence anyway)"
+                );
+            }
+        } else {
+            let Some(safe_cache) = roots.cache_dir.as_ref().map(|d| d.join("fastembed")) else {
+                anyhow::bail!(
+                    "cannot determine a cache directory for embedding models, so the model \
+                     directory named by {} cannot be safely replaced.\n\
+                     This config was found by kb-mcp itself (not named with --config), so its \
+                     directory is treated as untrusted. Set FASTEMBED_CACHE_DIR to a directory \
+                     you control, or pass --config {} to accept the config as written.",
+                    shown.display(),
+                    shown.display(),
+                );
+            };
+            if let Some(dir) = self.fastembed_cache_dir.replace(safe_cache.clone()) {
+                tracing::warn!(
+                    config = %shown.display(),
+                    requested = %dir.display(),
+                    using = %safe_cache.display(),
+                    "ignoring fastembed_cache_dir from a config found in an untrusted location \
+                     (it selects which model file is loaded); pass --config to accept it"
+                );
+            }
         }
 
         // R2: 到達範囲。BU-01 は CLI `--bind` の非 loopback だけを gate し、
@@ -922,14 +938,23 @@ pub enum ConfigTrust {
     Untrusted,
 }
 
-/// 「ここにある config は運用者のもの」と見なすディレクトリ群 (BU-07)。
+/// 信頼判定と制限に要る**環境の事実**をまとめて注入するための型 (BU-07)。
 ///
-/// env を読むのは [`Self::from_env`] だけ。テストは値を注入する。
+/// env と `dirs::*` を読むのは [`Self::from_env`] だけ。テストは値を注入する
+/// (`cargo test` は同一プロセスの並列スレッドなので、env を触るテストは並走する
+/// 全テストに影響する — 経緯は [`cache_dir_env_override`] の doc)。
 #[derive(Debug, Clone, Default)]
 pub struct TrustRoots {
+    /// 「ここにある config は運用者のもの」と見なすディレクトリ群。
     roots: Vec<PathBuf>,
     /// 判定に使うホームディレクトリ (`kb_path` の境界チェック用)。
     home: Option<PathBuf>,
+    /// OS 標準のキャッシュディレクトリ (`fastembed_cache_dir` の差し替え先)。
+    cache_dir: Option<PathBuf>,
+    /// `FASTEMBED_CACHE_DIR` が既に環境にあるか。**あるなら config の
+    /// `fastembed_cache_dir` はそもそも効かない** (`cache_dir_env_override` は
+    /// env が既設なら `None` を返す) ので、差し替え先を探す必要すら無い。
+    cache_env_set: bool,
 }
 
 impl TrustRoots {
@@ -947,6 +972,8 @@ impl TrustRoots {
             std::env::var_os("KB_MCP_CONFIG_HOME").map(PathBuf::from),
             dirs::config_dir(),
             dirs::home_dir(),
+            dirs::cache_dir(),
+            std::env::var_os("FASTEMBED_CACHE_DIR").is_some(),
         )
     }
 
@@ -956,6 +983,8 @@ impl TrustRoots {
         config_home_override: Option<PathBuf>,
         config_dir: Option<PathBuf>,
         home: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+        cache_env_set: bool,
     ) -> Self {
         // **どちらの base にも `kb-mcp` を足す。**
         // `service::resolve_config_home` が `base.join("kb-mcp").join(service)` を
@@ -967,13 +996,40 @@ impl TrustRoots {
             .flatten()
             .map(|b| b.join("kb-mcp"))
             .collect();
-        Self { roots, home }
+        Self {
+            roots,
+            home,
+            cache_dir,
+            cache_env_set,
+        }
     }
 
     /// テスト用のコンストラクタ。
     #[cfg(test)]
     pub(crate) fn new(roots: Vec<PathBuf>, home: Option<PathBuf>) -> Self {
-        Self { roots, home }
+        Self {
+            roots,
+            home,
+            // テストは OS 標準キャッシュを持つ前提でよい。env 既設の分岐は
+            // `new_with_cache` で明示的に作る。
+            cache_dir: Some(std::env::temp_dir().join("kb-mcp-test-cache")),
+            cache_env_set: false,
+        }
+    }
+
+    /// キャッシュ側の環境事実だけ差し替えるテスト用コンストラクタ。
+    #[cfg(test)]
+    pub(crate) fn new_with_cache(
+        home: Option<PathBuf>,
+        cache_dir: Option<PathBuf>,
+        cache_env_set: bool,
+    ) -> Self {
+        Self {
+            roots: Vec::new(),
+            home,
+            cache_dir,
+            cache_env_set,
+        }
     }
 
     fn contains(&self, dir: &Path) -> bool {
@@ -2605,6 +2661,38 @@ lambda = 0.5
         );
     }
 
+    /// The remedy an error names has to be one that works. When no OS cache
+    /// directory can be determined, the error tells the user to set
+    /// `FASTEMBED_CACHE_DIR` — so following that advice must actually get them
+    /// past it, rather than hitting the same abort because the check ran before
+    /// the variable was ever consulted.
+    #[test]
+    fn the_cache_rule_honours_an_existing_env_override_before_demanding_a_cache_dir() {
+        let dir = TempDir::new("kb-mcp-untrusted-cache-env");
+        std::fs::write(dir.path().join("kb-mcp.toml"), planted_toml("kb")).unwrap();
+
+        // No OS cache directory and no override: we cannot name a safe
+        // location, so we stop instead of inventing a shared-temp path.
+        let no_cache = TrustRoots::new_with_cache(None, None, false);
+        let err = Config::discover_in(None, dir.path(), None, &no_cache)
+            .expect_err("no safe cache directory can be named");
+        assert!(
+            err.to_string().contains("FASTEMBED_CACHE_DIR"),
+            "the error must name the remedy: {err}"
+        );
+
+        // Following that advice works: with the variable set, the config's own
+        // value cannot take effect anyway, so it is simply dropped.
+        let with_env = TrustRoots::new_with_cache(None, None, true);
+        let d = Config::discover_in(None, dir.path(), None, &with_env)
+            .expect("setting FASTEMBED_CACHE_DIR must actually get past this");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config.fastembed_cache_dir.is_none(),
+            "the planted value is dropped; the environment already wins"
+        );
+    }
+
     /// `service::resolve_config_home` appends `kb-mcp/<service>` to whatever
     /// base it resolves — including the `KB_MCP_CONFIG_HOME` override. Taking
     /// the override itself as a trust root would make
@@ -2613,7 +2701,8 @@ lambda = 0.5
     #[test]
     fn the_trust_root_is_the_kb_mcp_subdirectory_of_each_base() {
         let base = TempDir::new("kb-mcp-trust-root-base");
-        let roots = TrustRoots::from_bases(Some(base.path().to_path_buf()), None, None);
+        let roots =
+            TrustRoots::from_bases(Some(base.path().to_path_buf()), None, None, None, false);
 
         let inside = base.path().join("kb-mcp").join("svc").join("kb-mcp.toml");
         assert_eq!(
