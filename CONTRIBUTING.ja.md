@@ -26,24 +26,32 @@ git config core.hooksPath .githooks
 cargo build --release      # release バイナリ: target/release/kb-mcp(.exe)
 cargo check --all-targets  # 型検査のみ (高速)
 cargo test                 # ユニット + integration テスト (モデル DL 不要)
-cargo test -- --ignored    # 実モデル DL 込みの embedding / reranker テスト
 cargo test -p kb-mcp --lib <name>  # 名前指定で 1 本だけ実行 (workspace に複数 crate が
                                   # あるため -p が要る。--lib で integration test binary を除外)
 ```
 
-`cargo test -- --ignored` は初回に ONNX モデルを DL する (BGE-small ~130 MB、BGE-M3 ~2.3 GB、BGE-reranker-v2-m3 ~2.3 GB)。OS 標準キャッシュディレクトリに保存される。ネットワーク都合で DL が失敗する場合は、README の「HuggingFace の TLS 失敗への対処」節を参照。
+CI と同じ検証をローカルで再現するには、次のすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる:
 
-## コードスタイル
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
+cargo test
+```
 
-- コミット前に `cargo fmt --all` (CI で強制)
-- `cargo clippy --all-targets` が警告を出さないこと (CI で強制)
+最後の 2 つは**順序が意味を持つ** (モデルキャッシュが cold の場合)。CI も同じ順で回している。`index_progress_cli` は BGE-small を必要とする `kb-mcp` サブプロセスを複数起動するので、並列で走らせると HuggingFace の download lock を奪い合って `Lock acquisition failed` で落ちる。この target を先にシングルスレッドで回せば DL するプロセスがちょうど 1 つになり、後続のフルスイートは warm cache に対して走る。
+
+> **`cargo test -- --ignored` は実際にマシンの状態を変える。** 実行前に次節を読むこと。
+
+- コミット前に `cargo fmt --all` (pre-push hook と CI の両方で強制)
 - 日本語 KB 固有のロジック (CJK トークナイズ、日付書式等) に関する日本語コメントは歓迎、それ以外は英語推奨
 
 ## リポジトリ構成
 
 - `kb-mcp/src/parser/` — `Parser` trait + `Registry` (形式ごとに impl 1 個)
 - `kb-mcp/src/indexer.rs` — `walkdir` → パース → 埋め込み → 格納のパイプライン
-- `kb-mcp/src/db.rs` — SQLite + sqlite-vec + FTS5、`search_hybrid` (RRF、k=60)
+- `kb-mcp/src/db.rs` + `kb-mcp/src/db/` — SQLite + sqlite-vec + FTS5。v0.15.0 で分割: `schema.rs` (スキーマ作成 + 前方マイグレーション) / `storage.rs` (CRUD) / `search.rs` (ベクトル KNN・FTS 候補・RRF 融合 = `search_hybrid`、既定 k=60) / `meta.rs` (`index_meta` の key/value) / `fts_query.rs` (クエリを per-token FTS phrase にコンパイル、v0.16.0+)
 - `kb-mcp/src/embedder.rs` — `fastembed-rs` ラッパ (embedding + cross-encoder reranker)
 - `kb-mcp/src/mmr.rs` — MMR 多様性再ランク (`mmr_select`、v0.7.0+)
 - `kb-mcp/src/parent.rs` — Parent retriever 表示時 content 展開 (`apply_parent_retriever`、v0.7.0+)
@@ -57,7 +65,8 @@ cargo test -p kb-mcp --lib <name>  # 名前指定で 1 本だけ実行 (workspac
 - `kb-mcp/src/markdown.rs` — `parser::markdown` を再公開する後方互換 shim
 - `kb-mcp/src/indexer/progress.rs` — `kb-mcp index` の per-file 進捗出力 (`--quiet` / `--progress`)
 - `kb-mcp/src/service/` — `kb-mcp service install/uninstall/status` (systemd-user / LaunchAgent / Task Scheduler)
-- `kb-mcp/src/tune.rs` — `kb-mcp tune` の fusion パラメータ sweep
+- `kb-mcp/src/tune.rs` + `kb-mcp/src/tune/` — `kb-mcp tune` の fusion パラメータ sweep: `grid.rs` (sweep グリッド) / `stats.rs` (集計) / `report.rs` (描画)
+- `kb-mcp/src/test_support.rs` — テスト共有ヘルパ。特に `unique_temp_path` (本リポジトリは意図的に `tempfile` crate を使わない。理由は同ファイルのコメント参照)
 - `crates/kb-mcp-tray/` — Windows system tray モニタ (`kb-mcp-tray.exe`、v0.9.0+)
 - `crates/kb-mcp-svc/` — scheduled task が起動する Windows hidden-console launcher (v0.9.1+)
 - `kb-mcp/tests/` — 統合テスト、`kb-mcp/benches/` — criterion ベンチ
@@ -66,10 +75,14 @@ cargo test -p kb-mcp --lib <name>  # 名前指定で 1 本だけ実行 (workspac
 
 ## テストの 2 層構造
 
-- **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了
-- **ignored テスト** (`#[ignore]`): ネットワーク + ディスクが必要 (モデル DL)。`cargo test -- --ignored` で opt-in、CI では別ジョブに分けるのが望ましい
+- **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**PR を gate するのはこの層だけ** (`ci.yml` はこれしか回さない)
+- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest と windows-latest の両方で `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows leg は ~2.3 GB のモデルを要する 2 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
+  - **モデル DL** — 初回に ONNX モデルを取得する (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker-v2-m3 ~2.3 GB)。以降は OS 標準キャッシュに残る。ネットワーク都合で DL が失敗する場合は README の「HuggingFace の TLS 失敗への対処」節を参照
+  - **マシンの状態を実際に変える** — 一部のテストは OS のサービスを本当に登録・解除する。`kb-mcp/tests/service_install_integration.rs` は Windows で `Register-ScheduledTask` を呼び、`crates/kb-mcp-tray/tests/install_integration.rs` は `%APPDATA%\…\Start Menu\Programs\Startup\` にショートカットを書く。PID ごとに固有のサービス名を使い後始末もするが、**途中で kill すると scheduled task や startup ショートカットが残る**。途中で落ちたら `Get-ScheduledTask -TaskName 'kb-mcp*'` で確認すること
 
-embedder / reranker が必要なテストを追加するときは `#[ignore]` を付け、何を検証するかコメントで記述する。
+  `cargo test -- --ignored` は習慣ではなく**意図して**実行する。DL コストだけ払いたいなら対象を絞る: `cargo test --test <name> -- --ignored`
+
+embedder / reranker が必要なテストを追加するときは `#[ignore]` を付け、何を検証するかコメントで記述する。OS に触れるテスト (サービス、自動起動、レジストリ) の場合は、コストが呼び出し側から見えるよう `#[ignore = "…"]` の理由文字列にその旨を書くこと。
 
 ## 変更の提出
 

@@ -43,12 +43,12 @@ KB の利用者は自分だけ？
 
 ## 共通の注意点
 
-- **Embedding モデルキャッシュ**: 初回実行時に ONNX モデル (BGE-small ~130 MB / BGE-M3 ~2.3 GB) をマシンごとに DL する。`kb-mcp.toml` の `FASTEMBED_CACHE_DIR` を設定するとそのマシン上の全 kb-mcp 呼び出しでキャッシュ共有できる — 各シナリオの `kb-mcp.toml` を参照。
+- **Embedding モデルキャッシュ**: 初回実行時に ONNX モデル (BGE-small ~130 MB / BGE-M3 ~2.3 GB) をマシンごとに DL する。`kb-mcp.toml` の `fastembed_cache_dir` キーを設定するとそのマシン上の全 kb-mcp 呼び出しでキャッシュ共有できる。キー名は小文字で、未知のキーは起動時に拒否されるため、環境変数の綴り `FASTEMBED_CACHE_DIR` をファイルに書いても効かない (環境変数**として**は正しく、ファイルの値を上書きする)。各シナリオの設定は `personal/kb-mcp.toml` / `intranet-http/kb-mcp.toml`、nas-shared は `kb-mcp.toml.client` と `kb-mcp.toml.indexer` の 2 種類を参照。
 - **インデックス配置**: `.kb-mcp.db` は **`kb_path` の親ディレクトリ** に必ず作られる (例: `kb_path = /srv/kb/notes` → DB は `/srv/kb/.kb-mcp.db`)。CLI で配置先を変更するフラグは無い。ディスクレイアウトはこれを織り込む必要がある。
 - **バックアップ方針**: DB は `kb-mcp index --force --kb-path <kb_path>` でいつでも再構築可能。ソースファイルが authoritative、DB は派生物として扱うこと。
 
 ## ここで扱わないこと
 
 - **公開インターネット運用** — kb-mcp は認証機構を持たない。社内 LAN を超える場合は前段に認証 + TLS の reverse proxy が必須。
-- **コンテナ / Kubernetes manifest** — 静的リンクバイナリで容易に container 化可能 (~10 MB) だが、現時点で同梱していない。`intranet-http/` レシピを container 内で再利用する形で十分。
+- **コンテナ / Kubernetes manifest** — 可能だが現時点で同梱していない。`intranet-http/` レシピを container 内で再利用する形で十分。サイズ見積もりは**ダウンロードサイズではなくリリース資材から**行うこと: 配布 tarball は圧縮後 ~9–11 MB だが、image layer が実際に運ぶ展開後のバイナリはその数倍ある (ONNX runtime を静的リンクしているため)。ONNX モデルキャッシュは実行時 DL でさらに大きい (BGE-small ~130 MB / BGE-M3 ~2.3 GB) ので、image に焼かず volume でマウントすること。
 - **HA (高可用構成)** — kb-mcp はシングルプロセス。インデックス更新は 1 つの `Mutex<Database>` でシリアライズされるので、1 index につき 1 インスタンスで運用する。

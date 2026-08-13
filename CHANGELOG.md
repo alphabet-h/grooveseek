@@ -2,9 +2,68 @@
 
 All notable changes to kb-mcp are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer's timezone (JST). Verify with `TZ=Asia/Tokyo git for-each-ref --format='%(taggerdate:format-local:%Y-%m-%d)' refs/tags/vX.Y.Z` — `format-local` renders in *your* timezone, so the `TZ` prefix is what makes the answer JST rather than wherever you happen to be. Writing the date before tagging is the other way the two drift apart.
+
 ## [Unreleased]
 
 ### Fixed
+
+- **The bundled `kb-mcp.toml.example` no longer changes behaviour just by being
+  copied** (BU-13, BU-14). It shipped with `[transport] kind = "http"`,
+  `[parsers].enabled`, `[best_practice].path_templates` and others *active*, so
+  copying the template to `kb-mcp.toml` silently switched the server from stdio
+  to a listening socket, changed which extensions get indexed, and enabled an
+  opt-in MCP tool. Every value the file now leaves active is already the
+  built-in default, and anything that would alter behaviour is commented out,
+  so a fresh copy is inert until you opt in. `the_example_as_shipped_changes_no_behaviour`
+  parses the file exactly as shipped and asserts that, because the difference
+  is invisible when reading it — the file looks like documentation either way.
+  The file is also in English now (it was Japanese-only,
+  against the English-primary policy), no longer contains a personal path or an
+  internal issue id, and describes all four config-discovery tiers rather than
+  just the last one. README gained the two keys it never mentioned —
+  `[best_practice].path_templates` and `[transport.http].healthz_public` — and
+  now says plainly that its config block is an illustration, not a file to
+  paste.
+
+- **Deployment recipes named config keys that do not exist** (BU-15). Four
+  places told you to set `FASTEMBED_CACHE_DIR` "in `kb-mcp.toml`". The key is
+  `fastembed_cache_dir`; because unknown keys are rejected, following the
+  documentation produced a startup error. (`FASTEMBED_CACHE_DIR` is still
+  correct as a real environment variable, which overrides the file.) The same
+  page also pointed at "each scenario's `kb-mcp.toml`" when nas-shared ships
+  `.client` / `.indexer` variants instead, and estimated a container image at
+  "~10 MB" — that is the compressed tarball; the extracted binary an image
+  layer actually carries is several times larger.
+
+- **`CONTRIBUTING` understated both what CI runs and what `--ignored` costs**
+  (BU-16). CI runs clippy **twice** — the second time with
+  `--features test-helpers,heavy-bench` — and runs `index_progress_cli` with
+  `--test-threads=1`, so the documented local command could pass while CI
+  failed. And `#[ignore]` was described as "needs a model download" when some
+  ignored tests register a real Windows scheduled task and write into the
+  Startup folder; that cost is now spelled out, along with what to check if a
+  run is killed partway. The repository layout also still listed `db.rs` and
+  `tune.rs` as single files after the v0.15.0 split, and omitted
+  `test_support.rs`.
+
+- **Documentation that described the code inaccurately** (BU-08, BU-12, BU-29,
+  BU-30). `validate_get_document_path` claimed to block "bypass into
+  excluded_dirs", but it never receives `exclude_dirs`: a `.md` file under an
+  excluded directory is not indexed yet remains readable through
+  `get_document`. That is the intended contract — anything under `kb_path` is
+  readable — and `document_in_excluded_dir_is_still_readable` now pins it.
+  `docs/ARCHITECTURE` prose still pointed at `db.rs` for code that moved to
+  `db/schema.rs` and `db/search.rs` in v0.15.0. `README` described
+  `--rerank-by-default` as a bare flag when it takes a boolean, and summarised
+  `kb-mcp status` as "document and chunk counts" when it prints five things, on
+  stderr.
+
+  CHANGELOG dates had drifted from their tags in **seven** entries, not the two
+  the audit found. The convention turned out to be the tag date in the
+  maintainer's local timezone (31 of 38 entries), not UTC as previously
+  believed — a belief that had itself introduced one of the seven. All seven
+  are corrected and the rule is now stated at the top of this file.
 
 - **A busy MCP tool call no longer takes the whole HTTP server down with it**
   (BU-06). Every tool handler was an `async fn` that then did its work
@@ -33,7 +92,7 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   `LocalSessionManager` expose no cap, so bounding it needs a custom session
   manager — tracked separately.
 
-## [0.17.0] - 2026-08-12
+## [0.17.0] - 2026-08-13
 
 ### Added
 
@@ -280,7 +339,7 @@ All notable changes to kb-mcp are documented here. The format is based on [Keep 
   numbers and a "CONFIDENTIAL" stamp measures 39 chars/page, so lowering it
   would admit exactly what it exists to reject.
 
-## [0.15.0] - 2026-08-09
+## [0.15.0] - 2026-08-10
 
 ### Fixed
 
@@ -1432,7 +1491,7 @@ window. To pick up the hidden-launcher Action, drop in the new
   guides users on disabling any pre-existing manually installed units before
   re-installing via the new subcommand.
 
-## [0.7.8] - 2026-05-05
+## [0.7.8] - 2026-05-06
 
 ### Added
 
@@ -1501,7 +1560,7 @@ window. To pick up the hidden-launcher Action, drop in the new
 - `http` crate を Cargo.toml に direct dependency として追加
   (= axum 0.8 transitive と同 v1.4.0、resolution 操作のみ、新規 download なし)。
 
-## [0.7.5] - 2026-05-04
+## [0.7.5] - 2026-05-05
 
 ### Added
 
@@ -1607,7 +1666,7 @@ window. To pick up the hidden-launcher Action, drop in the new
   `0.0`). Exercised via `cargo test --release` (CI integration deferred
   to F-58 / F-59 CI infra bundle).
 
-## [0.7.3] - 2026-05-04
+## [0.7.3] - 2026-05-03
 
 ### Security
 
@@ -1624,7 +1683,7 @@ window. To pick up the hidden-launcher Action, drop in the new
   so existing `get_document` callers and 5 unit tests are
   byte-identical in behaviour. closes the audit-todos mid-term section.
 
-## [0.7.2] - 2026-05-04
+## [0.7.2] - 2026-05-03
 
 ### Performance
 - **MMR `cosine_similarity` SIMD kernel (F-42 reattempt, #43)**: replaced
@@ -1884,7 +1943,7 @@ window. To pick up the hidden-launcher Action, drop in the new
   `examples/deployments/README{,.ja}.md` updated 3 patterns →
   4 patterns; main README en+ja updated to match.
 
-## [0.6.1] - 2026-05-01
+## [0.6.1] - 2026-05-02
 
 ### Internal
 - Bumped GitHub Actions to Node.js 24-runtime versions ahead

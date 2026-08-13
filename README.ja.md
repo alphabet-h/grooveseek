@@ -44,7 +44,9 @@ cargo build --release
 
 ## 設定ファイル (任意)
 
-以下の CLI オプションはすべて `kb-mcp.toml` で既定値を与えられる。CLI 引数は常に優先され、設定ファイルは単に同じデプロイでの記述の繰り返しを減らすためのもの。配置場所の探索順は [設定ファイルの探索順](#設定ファイルの探索順) を参照 — 最も一般的なのはプロジェクトルート (CWD) かバイナリの隣。`kb-mcp.toml.example` を `kb-mcp.toml` にコピーして編集する:
+以下の CLI オプションはすべて `kb-mcp.toml` で既定値を与えられる。CLI 引数は常に優先され、設定ファイルは単に同じデプロイでの記述の繰り返しを減らすためのもの。配置場所の探索順は [設定ファイルの探索順](#設定ファイルの探索順) を参照 — 最も一般的なのはプロジェクトルート (CWD) かバイナリの隣。[`kb-mcp/kb-mcp.toml.example`](kb-mcp/kb-mcp.toml.example) を `kb-mcp.toml` にコピーして編集する。
+
+**このテンプレートはコピーしても何も変わらない。** 空ではなく、ファイルの形が見えるように一部のセクション (`[quality_filter]` / `[parsers]` / `[watch]` / `[transport]` / `[transport.http]`) は有効なまま残してあるが、**有効な値はすべて既定値そのもの**なので、コピーは「既定値を明示的に固定する」だけで挙動を変えない。挙動が変わる項目はすべてコメントアウトしてある。一方、下のブロックは別物で、各キーが何をするかを示すために値を入れた**説明用の例** — 既定値でない値もあれば、既定値をそのまま書いているものもある。**丸ごと貼るためのものではなく、メニューとして**読むこと:
 
 ```toml
 # kb-mcp.toml (プロジェクトルート / .git 祖先 / kb-mcp の隣 のいずれかに置く)
@@ -70,6 +72,12 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 [quality_filter]
 enabled = true
 threshold = 0.3
+
+# `get_best_practice` MCP ツールは opt-in。このセクションが無い (または空
+# リスト) 場合、ツールは "not configured" エラーを返す。テンプレートは先頭から
+# 順に `{target}` を置換して kb_path 相対で探し、最初に見つかったものを返す。
+[best_practice]
+path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 
 # index 対象拡張子。セクション省略で デフォルト挙動
 # (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .pptx に
@@ -101,6 +109,12 @@ kind = "http"
 [transport.http]
 bind = "127.0.0.1:3100"
 # allowed_hosts = ["kb.example.lan", "192.168.1.10"]  # LAN 公開時に明示 (v0.5.0+)
+# /healthz を allowed_hosts の検査対象外に置くか。既定は true (= public、Host
+# check なし)。false にすると /healthz も他のエンドポイントと同様に検証され、
+# allow-list に無い Host ヘッダのリクエストは 200 ではなく 403 になる (v0.7.5+)。
+# **認証ではない**: Host ヘッダは呼び出し元が自由に付けられるので、ポートに
+# 到達できて許可値を送れば 200 が返る。偶発的な探索の敷居を上げるだけ。
+# healthz_public = false
 
 # 任意: `kb-mcp eval` (retrieval 品質評価、パワーユーザ機能)。
 # モデル比較や回帰追跡のために `kb-mcp eval` を使うときだけ必要。
@@ -269,7 +283,7 @@ kb-mcp serve --kb-path ... --no-watch                           # ライブ同�
 - `jina-v2-ml` — jinaai/jina-reranker-v2-base-multilingual (多言語、約 1.2 GB)。軽量版
 - `bge-base` — BAAI/bge-reranker-base (英語 / 中国語のみ、約 280 MB)。日本語では非推奨
 
-再ランクのレイテンシコストは、CPU で `bge-v2-m3` を 50 候補に適用した場合 1 クエリあたり約 300–700 ms。`--rerank-by-default` (`--reranker` 指定時は既定 on) はすべての `search` 呼び出しで再ランクするかを制御し、MCP ツール側は `rerank: Option<bool>` で per-query 上書き可能。reranker の切替に**再インデックスは不要** (index 非依存)。
+再ランクのレイテンシコストは、CPU で `bge-v2-m3` を 50 候補に適用した場合 1 クエリあたり約 300–700 ms。`--rerank-by-default <BOOL>` (`--reranker` 指定時は既定 on) はすべての `search` 呼び出しで再ランクするかを制御する。**値を取るフラグ**なので、無効化は `--rerank-by-default=false` と書く。MCP ツール側は `rerank: Option<bool>` で per-query 上書き可能。reranker の切替に**再インデックスは不要** (index 非依存)。
 
 #### 再ランクを有効にすべきケース
 
@@ -366,7 +380,7 @@ tray は `127.0.0.1:<port>/api/admin/status` を polling するので、daemon �
 kb-mcp status --kb-path /path/to/knowledge-base
 ```
 
-既存 index から document / chunk 数を表示する。
+既存 index の状態を **stderr に** 表示する (`status` は stdout に何も書かないのでパイプで受けないこと): document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
 
 ### コマンドラインからの一発検索
 

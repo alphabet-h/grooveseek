@@ -40,7 +40,7 @@ RestrictRealtime=true
 
 # Read-write paths kb-mcp legitimately needs:
 #   - /srv/kb-mcp/    : kb_path itself + .kb-mcp.db (the parent of kb_path)
-#   - /var/cache/fastembed : ONNX model cache (matches FASTEMBED_CACHE_DIR in kb-mcp.toml)
+#   - /var/cache/fastembed : ONNX model cache (matches `fastembed_cache_dir` in kb-mcp.toml)
 ReadWritePaths=/srv/kb-mcp /var/cache/fastembed
 
 # RUST_LOG controls verbosity. info gives the "loaded config source=..." startup

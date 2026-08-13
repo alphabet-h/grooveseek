@@ -1458,6 +1458,75 @@ lambda = 0.5
         );
     }
 
+    /// (BU-13) Copying `kb-mcp.toml.example` to `kb-mcp.toml` must change
+    /// nothing.
+    ///
+    /// It used to change three things. `[transport] kind = "http"` shipped
+    /// uncommented, so copying the template swapped stdio for a listening
+    /// socket; `[parsers].enabled` shipped as `["md", "txt"]`, so it also
+    /// changed what got indexed; and `[best_practice].path_templates` shipped
+    /// populated, which switched on an opt-in MCP tool. None of that is
+    /// visible by reading the file — it reads like documentation — so this
+    /// asserts the property directly: parse the file exactly as shipped and
+    /// require every resolved value to equal the built-in default.
+    ///
+    /// `test_toml_example_parses_with_all_keys_uncommented` is the complement:
+    /// it uncomments everything to prove the keys are still spelled right.
+    /// This one proves the file is inert until a human uncomments something.
+    #[test]
+    fn the_example_as_shipped_changes_no_behaviour() {
+        let example_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("kb-mcp.toml.example");
+        let raw = std::fs::read_to_string(&example_path).expect("example must exist");
+        let cfg: Config = toml::from_str(&raw)
+            .unwrap_or_else(|e| panic!("kb-mcp.toml.example must parse exactly as shipped: {e}"));
+
+        let transport =
+            crate::transport::Transport::resolve(None, None, None, cfg.transport.as_ref())
+                .expect("the shipped example must resolve to a transport");
+        assert!(
+            matches!(transport, crate::transport::Transport::Stdio),
+            "copying kb-mcp.toml.example must NOT open a listening socket, but it \
+             resolved to {transport:?}. Comment out `kind` / `[transport.http]`, or \
+             leave `kind = \"stdio\"` in place."
+        );
+
+        assert!(
+            cfg.best_practice
+                .as_ref()
+                .is_none_or(|bp| bp.path_templates.is_empty()),
+            "copying the example must leave `get_best_practice` unconfigured — it is \
+             an opt-in tool, so shipping populated `path_templates` turns it on for \
+             everyone who copies the file"
+        );
+
+        let parsers = cfg
+            .parsers
+            .as_ref()
+            .map(|p| p.enabled.clone())
+            .unwrap_or_else(|| vec!["md".to_string()]);
+        assert_eq!(
+            parsers,
+            vec!["md".to_string()],
+            "copying the example must not change which extensions are indexed; \
+             anything beyond .md belongs in a commented-out line"
+        );
+
+        if let Some(qf) = cfg.quality_filter.as_ref() {
+            assert_eq!(
+                *qf,
+                QualityFilterConfig::default(),
+                "the [quality_filter] values in the example must equal the defaults"
+            );
+        }
+        if let Some(w) = cfg.watch.as_ref() {
+            assert_eq!(
+                *w,
+                WatchConfig::default(),
+                "the [watch] values in the example must equal the defaults"
+            );
+        }
+    }
+
     #[test]
     fn test_toml_example_parses_with_all_keys_uncommented() {
         // kb-mcp.toml.example のすべてのキーが Config で受け入れられるかを検証。

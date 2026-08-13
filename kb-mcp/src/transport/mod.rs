@@ -50,11 +50,16 @@ pub struct HttpTransportConfig {
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
 
-    /// `/healthz` を `allowed_hosts` allow-list 配下に置くか (= F-64
-    /// fingerprinting hardening)。`None` (省略) or `Some(true)` =
-    /// 現行挙動 (`/healthz` は public、Host check なし)。`Some(false)`
-    /// = `/healthz` も `allowed_hosts` で gate、non-allowlisted host
-    /// から 403。default = true で backward compat 維持。
+    /// `/healthz` を `allowed_hosts` allow-list 配下に置くか (F-64)。
+    /// `None` (省略) or `Some(true)` = 現行挙動 (`/healthz` は public、
+    /// Host check なし)。`Some(false)` = `/healthz` も `allowed_hosts` で
+    /// gate、non-allowlisted host から 403。default = true で backward
+    /// compat 維持。
+    ///
+    /// **認証ではない**。ここで検査するのは呼び出し元が自由に付けられる
+    /// Host header なので、ポートに到達できて許可値を送れば 200 が返る。
+    /// 偶発的な探索と DNS rebinding の敷居を上げるだけで、「未知の相手に
+    /// 存在を知られない」とは言えない (かつてそう書いていた)。
     #[serde(default)]
     pub healthz_public: Option<bool>,
 }

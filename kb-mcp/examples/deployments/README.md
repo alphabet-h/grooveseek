@@ -44,12 +44,12 @@ Are you the only person using this KB?
 
 ## Common notes
 
-- **Embedding model cache**: First run downloads the ONNX model (BGE-small ~130 MB or BGE-M3 ~2.3 GB) per machine. Set `FASTEMBED_CACHE_DIR` in `kb-mcp.toml` to share it across all kb-mcp invocations on a given machine — see each scenario's `kb-mcp.toml`.
+- **Embedding model cache**: First run downloads the ONNX model (BGE-small ~130 MB or BGE-M3 ~2.3 GB) per machine. Set the `fastembed_cache_dir` key in `kb-mcp.toml` to share it across all kb-mcp invocations on a given machine — the key is lower-case, and unknown keys are rejected at startup, so the environment-variable spelling `FASTEMBED_CACHE_DIR` will not work in the file. (That spelling *is* correct as a real environment variable, which overrides the file.) See each scenario's config: `personal/kb-mcp.toml`, `intranet-http/kb-mcp.toml`, and for nas-shared the two variants `nas-shared/kb-mcp.toml.client` / `nas-shared/kb-mcp.toml.indexer`.
 - **Index location**: `.kb-mcp.db` is always created in the **parent of `kb_path`** (e.g. `kb_path = /srv/kb/notes` → DB at `/srv/kb/.kb-mcp.db`). There is no CLI flag to relocate the DB. Plan disk layout with this in mind.
 - **Backup policy**: The DB can be rebuilt at any time via `kb-mcp index --force --kb-path <kb_path>`. Treat the source files as authoritative; the DB is a derived artifact.
 
 ## What's not here
 
 - **Public-internet hosting** — kb-mcp has no built-in authentication. Anything beyond an intranet needs a reverse proxy with auth + TLS terminator in front.
-- **Container / Kubernetes manifests** — feasible (statically linked binary, ~10 MB image surface) but not yet packaged. Reuse the `intranet-http/` recipe inside a container.
+- **Container / Kubernetes manifests** — feasible but not yet packaged. Reuse the `intranet-http/` recipe inside a container. Size it from the release assets rather than from the download: the published tarballs are ~9–11 MB compressed, while the extracted binary — what an image layer actually carries — is several times that, because the ONNX runtime is linked in statically. The ONNX model cache is downloaded at runtime and is larger still (~130 MB for BGE-small, ~2.3 GB for BGE-M3), so mount it as a volume rather than baking it into the image.
 - **High availability** — kb-mcp is single-process; index updates serialize through one `Mutex<Database>`. Run a single instance per index.
