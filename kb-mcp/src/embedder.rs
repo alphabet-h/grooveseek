@@ -137,10 +137,25 @@ impl Embedder {
 }
 
 fn resolve_cache_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
+    cache_dir_from(std::env::var_os("FASTEMBED_CACHE_DIR"), dirs::cache_dir())
+}
+
+/// [`resolve_cache_dir`] の純粋部分。env を読む場所から切り離してあるのは、
+/// テストが `set_var` を呼ばずに済ませるため (`cargo test` は同一プロセスの
+/// 並列スレッドで走るので、env を触るテストは並走する全テストに影響する)。
+///
+/// **空の `FASTEMBED_CACHE_DIR` は「未設定」として扱う** (BU-07)。
+/// `PathBuf::from("")` は相対パスなので、そのまま返すとモデルの読み込み先が
+/// **プロセスの CWD** になる。信頼していないディレクトリで実行された場合、
+/// そこに置かれたキャッシュ構造がそのまま使われてしまう。空文字はディレクトリの
+/// 指定ではないので、指定が無かったものとして次の候補へ落とす。
+fn cache_dir_from(env: Option<std::ffi::OsString>, os_cache: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = env
+        && !dir.is_empty()
+    {
         return PathBuf::from(dir);
     }
-    if let Some(base) = dirs::cache_dir() {
+    if let Some(base) = os_cache {
         return base.join("fastembed");
     }
     PathBuf::from(".fastembed_cache")
@@ -300,6 +315,32 @@ impl Reranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes
+    /// the model directory the process's working directory — which is the
+    /// directory a planted config is trying to get models loaded from. An
+    /// empty variable is not a directory, so it falls through as if unset.
+    #[test]
+    fn an_empty_cache_dir_variable_is_treated_as_unset() {
+        let os_cache = PathBuf::from("/os/cache");
+
+        assert_eq!(
+            cache_dir_from(Some(std::ffi::OsString::from("")), Some(os_cache.clone())),
+            os_cache.join("fastembed"),
+            "an empty variable must not become a cwd-relative model directory"
+        );
+        // With no OS cache either, the last resort stays fastembed's own
+        // default rather than the empty path.
+        assert_eq!(
+            cache_dir_from(Some(std::ffi::OsString::from("")), None),
+            PathBuf::from(".fastembed_cache")
+        );
+        // A real value still wins over the OS cache.
+        assert_eq!(
+            cache_dir_from(Some(std::ffi::OsString::from("/models")), Some(os_cache)),
+            PathBuf::from("/models")
+        );
+    }
 
     #[test]
     #[ignore] // requires model download (~23 MB)

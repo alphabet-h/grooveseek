@@ -857,7 +857,11 @@ impl Config {
     /// `FASTEMBED_CACHE_DIR` が未設定なら、プロセス環境に適用する。
     /// `Embedder::with_model` が `resolve_cache_dir()` で拾う前に呼ぶこと。
     pub fn apply_cache_dir_env(&self) {
-        let env_already_set = std::env::var_os("FASTEMBED_CACHE_DIR").is_some();
+        // 空文字は「設定済み」に数えない (BU-07)。数えてしまうと config の値が
+        // 捨てられ、`resolve_cache_dir` は空文字を**相対パス**として扱って
+        // CWD をモデルの読み込み先にする。判定は `embedder::cache_dir_from` と
+        // 揃える必要がある — 片方だけ直しても、もう片方が CWD に落とす。
+        let env_already_set = env_cache_dir_is_usable();
         let Some(dir) =
             cache_dir_env_override(env_already_set, self.fastembed_cache_dir.as_deref())
         else {
@@ -973,7 +977,7 @@ impl TrustRoots {
             dirs::config_dir(),
             dirs::home_dir(),
             dirs::cache_dir(),
-            std::env::var_os("FASTEMBED_CACHE_DIR").is_some(),
+            env_cache_dir_is_usable(),
         )
     }
 
@@ -1074,6 +1078,14 @@ pub(crate) fn classify_trust(
 /// `SocketAddr` の IP が loopback でないか。
 fn is_non_loopback(addr: &std::net::SocketAddr) -> bool {
     !addr.ip().is_loopback()
+}
+
+/// `FASTEMBED_CACHE_DIR` が**モデルの置き場所として使える値**か (BU-07)。
+///
+/// 空文字は「設定されている」に数えない。`embedder::cache_dir_from` と同じ規則で、
+/// 両者がずれると片方が CWD をモデルディレクトリにしてしまう。
+pub(crate) fn env_cache_dir_is_usable() -> bool {
+    std::env::var_os("FASTEMBED_CACHE_DIR").is_some_and(|v| !v.is_empty())
 }
 
 /// 信頼できない config が `kb_path` に指定してはいけない場所か。
