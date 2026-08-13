@@ -581,18 +581,24 @@ impl Config {
         // `None` に落とすだけでは不十分: `resolve_cache_dir` の最終 fallback は
         // **CWD 相対の `./.fastembed_cache`** で、いま信頼しないと決めた
         // ディレクトリの中にある。絶対パスの既定値で**置き換える**。
-        if let Some(dir) = self.fastembed_cache_dir.take() {
-            let safe = dirs::cache_dir()
-                .map(|d| d.join("fastembed"))
-                .unwrap_or_else(|| std::env::temp_dir().join("kb-mcp-fastembed"));
+        //
+        // **キーの有無に関わらず必ず設定する。** 「書いてあったら差し替える」
+        // だけでは、キーを**省いた** planted config が素通りする:
+        // `fastembed_cache_dir` が `None` なら env も設定されず、
+        // `resolve_cache_dir` は `dirs::cache_dir()` に落ち、それも取れない環境では
+        // **CWD 相対の `./.fastembed_cache`** — 攻撃者のディレクトリ — に行き着く。
+        // キーの有無は「警告を出すかどうか」だけを決める。
+        let safe_cache = dirs::cache_dir()
+            .map(|d| d.join("fastembed"))
+            .unwrap_or_else(|| std::env::temp_dir().join("kb-mcp-fastembed"));
+        if let Some(dir) = self.fastembed_cache_dir.replace(safe_cache.clone()) {
             tracing::warn!(
                 config = %shown.display(),
                 requested = %dir.display(),
-                using = %safe.display(),
+                using = %safe_cache.display(),
                 "ignoring fastembed_cache_dir from a config found in an untrusted location \
                  (it selects which model file is loaded); pass --config to accept it"
             );
-            self.fastembed_cache_dir = Some(safe);
         }
 
         // R2: 到達範囲。BU-01 は CLI `--bind` の非 loopback だけを gate し、
@@ -921,17 +927,31 @@ impl TrustRoots {
     ///   の階層で見るのは、`<config_dir>/kb-mcp/<service>/` 配下すべてを
     ///   1 本で拾うため。
     pub fn from_env() -> Self {
-        let mut roots = Vec::new();
-        if let Some(v) = std::env::var_os("KB_MCP_CONFIG_HOME") {
-            roots.push(PathBuf::from(v));
-        }
-        if let Some(d) = dirs::config_dir() {
-            roots.push(d.join("kb-mcp"));
-        }
-        Self {
-            roots,
-            home: dirs::home_dir(),
-        }
+        Self::from_bases(
+            std::env::var_os("KB_MCP_CONFIG_HOME").map(PathBuf::from),
+            dirs::config_dir(),
+            dirs::home_dir(),
+        )
+    }
+
+    /// [`Self::from_env`] の純粋な中身。env を読む場所を 1 箇所に閉じ込めたまま
+    /// 「どのディレクトリを根にするか」をテストできるようにするための分離。
+    pub(crate) fn from_bases(
+        config_home_override: Option<PathBuf>,
+        config_dir: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        // **どちらの base にも `kb-mcp` を足す。**
+        // `service::resolve_config_home` が `base.join("kb-mcp").join(service)` を
+        // 返すため、base そのものを根にすると根が広くなりすぎる —
+        // `KB_MCP_CONFIG_HOME=$HOME` なら home 配下の全リポジトリが信頼されて
+        // しまい、この feature 全体が無効化される。
+        let roots = [config_home_override, config_dir]
+            .into_iter()
+            .flatten()
+            .map(|b| b.join("kb-mcp"))
+            .collect();
+        Self { roots, home }
     }
 
     /// テスト用のコンストラクタ。
@@ -2541,6 +2561,56 @@ lambda = 0.5
             used.is_absolute(),
             "the substitute must be absolute, got {}",
             used.display()
+        );
+    }
+
+    /// Omitting the key is an attack, not an absence. With
+    /// `fastembed_cache_dir` unset, `FASTEMBED_CACHE_DIR` unset, and
+    /// `dirs::cache_dir()` unavailable, `resolve_cache_dir` ends at the
+    /// **cwd-relative** `./.fastembed_cache` — inside the very directory we
+    /// decided not to trust. So the safe path is set for every untrusted
+    /// config; the key's presence only decides whether to warn.
+    #[test]
+    fn an_untrusted_config_gets_a_safe_cache_dir_even_when_it_names_none() {
+        let dir = TempDir::new("kb-mcp-untrusted-no-cache-key");
+        std::fs::write(dir.path().join("kb-mcp.toml"), "kb_path = \"kb\"\n").unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let used = d
+            .config
+            .fastembed_cache_dir
+            .expect("an untrusted config always gets an explicit cache dir");
+        assert!(
+            used.is_absolute() && !used.starts_with(dir.path()),
+            "the model directory must never resolve inside the untrusted directory: {}",
+            used.display()
+        );
+    }
+
+    /// `service::resolve_config_home` appends `kb-mcp/<service>` to whatever
+    /// base it resolves — including the `KB_MCP_CONFIG_HOME` override. Taking
+    /// the override itself as a trust root would make
+    /// `KB_MCP_CONFIG_HOME=$HOME` trust every repository under the home
+    /// directory, which disables this whole feature.
+    #[test]
+    fn the_trust_root_is_the_kb_mcp_subdirectory_of_each_base() {
+        let base = TempDir::new("kb-mcp-trust-root-base");
+        let roots = TrustRoots::from_bases(Some(base.path().to_path_buf()), None, None);
+
+        let inside = base.path().join("kb-mcp").join("svc").join("kb-mcp.toml");
+        assert_eq!(
+            classify_trust(ConfigSource::Cwd, Some(&inside), &roots),
+            ConfigTrust::Trusted,
+            "where `service install` actually writes must stay trusted"
+        );
+
+        let sibling = base.path().join("some-repo").join("kb-mcp.toml");
+        assert_eq!(
+            classify_trust(ConfigSource::Cwd, Some(&sibling), &roots),
+            ConfigTrust::Untrusted,
+            "a repository merely sharing the base directory is not the operator's config"
         );
     }
 
