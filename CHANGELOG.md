@@ -40,7 +40,9 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
   search behaviour, not highlighting, and it is out of scope here. The
   100-term limit on the whitespace-fallback path had the same problem and is
   fixed: that list is sorted and deduplicated before it is truncated, so the
-  cutoff no longer follows word order.
+  cutoff no longer follows word order. Deduplication applies the same ASCII
+  case fold that matching does, so `Rust rust` is one term rather than two
+  splitting a budget between identical searches.
 
   The alternative — collect every occurrence, then keep the 100 best by
   occurrence rank — was measured and rejected: **100–450× slower** (157 µs →

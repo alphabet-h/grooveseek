@@ -1301,7 +1301,13 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
     //
     // ソートは cutoff にしか影響しない: 各 term は独立に予算を持ち、span は
     // 最後にまとめて畳むので、走査順は出力を変えない。
-    let mut terms: Vec<&str> = terms;
+    //
+    // **照合と同じ ASCII fold をかけてから** dedup する (codex P2、PR #142)。
+    // 大文字小文字だけ違う term は同じ位置に同じ span を出すので、別 term と
+    // して数えると予算が二重取りされて無駄になる (`Rust rust` なら各 50 件 →
+    // 畳んで 50 件、使えるはずの 100 件に届かない)。fallback 側では case 違いが
+    // 100 term の枠を食って、本当に別の term を締め出す。
+    let mut terms: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
     terms.sort_unstable();
     terms.dedup();
     terms.truncate(MATCH_SPAN_MAX_TERMS);
@@ -1313,14 +1319,16 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
     let budget = (MATCH_SPAN_MAX_COUNT / term_count).max(1);
 
     let mut spans: Vec<crate::db::MatchSpan> = Vec::new();
-    for term in &terms {
-        let term_lower = term.to_ascii_lowercase();
+    for term_lower in &terms {
         if term_lower.is_empty() {
             continue;
         }
         // `take(budget)` は遅延なので、予算に達した時点でその term の走査も
         // 止まる。全一致を数え上げてから選ぶ方式にしないのはこのため。
-        for (start, _) in content_lower.match_indices(&term_lower).take(budget) {
+        for (start, _) in content_lower
+            .match_indices(term_lower.as_str())
+            .take(budget)
+        {
             let end = start + term_lower.len();
             // ASCII-only term + ASCII lowercasing なので byte 長は変わらず、
             // content 側の byte offset も自動的に char boundary に揃う。
@@ -2807,6 +2815,34 @@ mod tests {
             spans.len() > MATCH_SPAN_MAX_COUNT / 2,
             "the budget should still be mostly spent, got {} spans",
             spans.len()
+        );
+    }
+
+    /// (codex P2 on PR #142) Terms that differ only in case share one budget
+    /// slot.
+    ///
+    /// Matching lowercases both sides, so `Rust` and `rust` find exactly the
+    /// same positions. Counting them as two terms halves each one's budget and
+    /// then merges the duplicate spans away, so the caller receives 50 spans
+    /// where 100 were available. On the fallback path the case variants also
+    /// eat slots in the 100-term cutoff, excluding terms that are genuinely
+    /// different.
+    #[test]
+    fn terms_differing_only_in_case_share_a_budget() {
+        let content = "rust ".repeat(400);
+        let one = assert_span_contract("rust", &content);
+        let two = assert_span_contract("Rust rust", &content);
+        assert_eq!(
+            tuples(&one),
+            tuples(&two),
+            "`Rust rust` must behave exactly like `rust`; counting the case \
+             variants separately wastes half the span budget"
+        );
+        assert_eq!(
+            one.len(),
+            MATCH_SPAN_MAX_COUNT,
+            "the single-term case should spend the whole budget, or this test \
+             is not measuring what it claims"
         );
     }
 
