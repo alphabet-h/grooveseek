@@ -75,8 +75,8 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.
 
 ## Test layering
 
-- **Light tests**: default `cargo test`. No network, no model download, runs in seconds. This is the only layer CI runs.
-- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Two different kinds of cost hide behind that one flag:
+- **Light tests**: default `cargo test`. No network, no model download, runs in seconds. This is the layer that gates pull requests — `ci.yml` runs nothing else.
+- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Not PR-gating, but not manual-only either: `nightly.yml` runs `cargo test --features test-helpers -- --include-ignored` daily on both ubuntu-latest and windows-latest, so these do get exercised — a day later, and the Windows leg skips the two tests that need the ~2.3 GB models. Two different kinds of cost hide behind that one flag:
   - **Model downloads** — ONNX models on first run (BGE-small ~130 MB, BGE-M3 ~2.3 GB, BGE-reranker-v2-m3 ~2.3 GB), cached per OS convention afterwards. See the README's "Working around HuggingFace TLS failures" section if your network blocks the download.
   - **Real changes to your machine** — a few tests register and unregister actual OS services. `kb-mcp/tests/service_install_integration.rs` calls `Register-ScheduledTask` on Windows, and `crates/kb-mcp-tray/tests/install_integration.rs` writes a shortcut into `%APPDATA%\…\Start Menu\Programs\Startup\`. They use a per-PID service name and clean up after themselves, but a killed run can leave a scheduled task or a startup shortcut behind. Check with `Get-ScheduledTask -TaskName 'kb-mcp*'` if a run dies partway.
 

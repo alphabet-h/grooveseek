@@ -75,8 +75,8 @@ cargo test
 
 ## テストの 2 層構造
 
-- **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**CI が回すのはこの層だけ**
-- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
+- **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**PR を gate するのはこの層だけ** (`ci.yml` はこれしか回さない)
+- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest と windows-latest の両方で `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows leg は ~2.3 GB のモデルを要する 2 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
   - **モデル DL** — 初回に ONNX モデルを取得する (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker-v2-m3 ~2.3 GB)。以降は OS 標準キャッシュに残る。ネットワーク都合で DL が失敗する場合は README の「HuggingFace の TLS 失敗への対処」節を参照
   - **マシンの状態を実際に変える** — 一部のテストは OS のサービスを本当に登録・解除する。`kb-mcp/tests/service_install_integration.rs` は Windows で `Register-ScheduledTask` を呼び、`crates/kb-mcp-tray/tests/install_integration.rs` は `%APPDATA%\…\Start Menu\Programs\Startup\` にショートカットを書く。PID ごとに固有のサービス名を使い後始末もするが、**途中で kill すると scheduled task や startup ショートカットが残る**。途中で落ちたら `Get-ScheduledTask -TaskName 'kb-mcp*'` で確認すること
 
