@@ -12,6 +12,64 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **A `kb-mcp.toml` that kb-mcp found by itself is no longer trusted in full**
+  (BU-07). Discovery honours `./kb-mcp.toml` and a `kb-mcp.toml` at the `.git`
+  root, walking up to 20 directories — files the user never named. Whoever
+  controls that directory (a cloned repository, a shared drive, an extracted
+  archive) controlled them, and the only record was one log line naming the
+  `ConfigSource` variant.
+
+  Reproduced against the release binary before fixing:
+
+  - `fastembed_cache_dir = "evil-cache"` plus a two-file HuggingFace cache
+    layout made `kb-mcp index` hand the planted bytes to ONNX Runtime
+    (`Load model from ...\evil-cache\...\model.onnx failed: Protobuf parsing
+    failed`) — no download and no verification, because hf-hub returns a cached
+    blob whenever the file exists and neither it nor fastembed checks a hash or
+    signature. A valid model would have loaded and run.
+  - `kb_path` pointed at another tree made `kb-mcp validate` scan it; `index`
+    and `serve` follow the same field, which is what reaches an LLM client.
+  - `[transport.http].bind` could open a network listener: the non-loopback
+    gate added in BU-01 covers CLI `--bind` but deliberately exempts
+    config-file binds, on the reasoning that a config file states the
+    operator's intent — which does not hold for a file found in someone else's
+    directory.
+
+  Trust is now decided **by location only**, never by the file's contents:
+  `--config`, the binary's directory, a `kb-mcp service install` config home,
+  and "no file" are trusted; anything else found under the cwd or a `.git`
+  ancestor is not. An untrusted config still loads, and everything that shapes
+  how a knowledge base is presented (`[search]`, `[quality_filter]`,
+  `exclude_dirs`, `[parsers]`, `[watch]`, `[contextual]`) is honoured
+  unchanged. Three fields are restricted:
+
+  | Field | From an untrusted config |
+  | --- | --- |
+  | `fastembed_cache_dir` | ignored with a warning, standard cache used |
+  | `[transport.http]` | non-loopback bind keeps its port and moves to `127.0.0.1`; `allowed_hosts` / `healthz_public` dropped |
+  | `kb_path` | **start-up error** for filesystem roots, the home directory, its ancestors, and ancestors of the config's own directory |
+
+  The `kb_path` rule bounds rather than confines — `./docs` and
+  `/srv/kb/knowledge-base` still work, so the shipped `personal` recipe (a
+  project-root toml naming an absolute path) is untouched. Only `kb_path` is
+  fatal: refusing on the other two would kill the Windows daemon with no output
+  at all, since `kb-mcp-svc` spawns it with stdio set to null.
+
+  **Compatibility.** Installed services are unaffected: all three backends set
+  their working directory to a config home and start `serve` without
+  `--config`, so config homes are trust roots — verified against a live
+  installation, which reports `trust=Trusted` with no warnings. To accept a
+  discovered config in full, name it with `--config`.
+
+  **Not covered**: a repository that ships its own `.mcp.json` controls the
+  whole command line, not just the config file. No rule inside kb-mcp can help
+  there.
+
+  The config log line now also carries the resolved path and the trust
+  decision; `source=Cwd` alone could not tell you which file had won.
+
 ### Changed
 
 - **`get_connection_graph` / `kb-mcp graph` are now bounded, and say so when a

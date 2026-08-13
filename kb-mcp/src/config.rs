@@ -2446,18 +2446,28 @@ lambda = 0.5
         } else {
             PathBuf::from("/")
         };
-        for (path, what) in [
-            (root, "filesystem root"),
-            (home.path().to_path_buf(), "the home directory"),
+        // Assert the *reason*, not just that something was refused. The four
+        // rules overlap by construction — a filesystem root is also an ancestor
+        // of home, and the home directory is also an ancestor of itself — so a
+        // bare `is_some()` lets any one rule be deleted while its neighbour
+        // keeps the test green. (Verified: removing three of the four rules
+        // left an `is_some()` version of this test passing.)
+        for (path, expected) in [
+            (root, "it is a filesystem root"),
+            (home.path().to_path_buf(), "it is the home directory"),
             (
                 home.path().parent().unwrap().to_path_buf(),
-                "an ancestor of home",
+                "it is an ancestor of the home directory",
             ),
-            (repo.path().to_path_buf(), "an ancestor of the config dir"),
+            (
+                repo.path().to_path_buf(),
+                "it is an ancestor of the directory holding the config file",
+            ),
         ] {
-            assert!(
-                forbidden_kb_path(&path, Some(&cfg_dir), &roots).is_some(),
-                "{what} ({}) must be refused",
+            assert_eq!(
+                forbidden_kb_path(&path, Some(&cfg_dir), &roots),
+                Some(expected),
+                "{} must be refused for exactly this reason",
                 path.display()
             );
         }
@@ -2473,6 +2483,38 @@ lambda = 0.5
                 path.display()
             );
         }
+    }
+
+    /// A symlink committed to a repository (`kb -> /`, mode 120000) is
+    /// materialized by `git clone` on POSIX, so the check has to judge the
+    /// target rather than the name. Unix-only because creating a symlink on
+    /// Windows needs Developer Mode or elevation, which CI runners may lack —
+    /// the ubuntu and macOS legs cover it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_kb_path_is_judged_by_its_target() {
+        let repo = TempDir::new("kb-mcp-kbpath-symlink");
+        let home = TempDir::new("kb-mcp-kbpath-symlink-home");
+        let cfg_dir = repo.path().join("project");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let roots = roots_for(None, Some(home.path()));
+
+        // Resolvable, and its target is home.
+        let link = cfg_dir.join("kb");
+        std::os::unix::fs::symlink(home.path(), &link).unwrap();
+        assert_eq!(
+            forbidden_kb_path(&link, Some(&cfg_dir), &roots),
+            Some("it is the home directory"),
+            "a symlink must be judged by what it points at, not by where it sits"
+        );
+
+        // Dangling: the target cannot be inspected, so it cannot be cleared.
+        let dangling = cfg_dir.join("dangling");
+        std::os::unix::fs::symlink(repo.path().join("nowhere"), &dangling).unwrap();
+        assert_eq!(
+            forbidden_kb_path(&dangling, Some(&cfg_dir), &roots),
+            Some("it is a symlink that cannot be resolved"),
+        );
     }
 
     #[test]

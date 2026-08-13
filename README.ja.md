@@ -180,8 +180,44 @@ bind = "127.0.0.1:3100"
 `--config` に渡した `~` は全プラットフォームで home に展開する (`~` を展開
 しない Windows `cmd.exe` でも動く)。
 
-起動時に stderr へ `kb_mcp::config: loaded config source=...` が出るので、
-どの toml が実際に効いているかはログで確認できる。
+起動時に stderr へ `kb_mcp::config: loaded config source=... path=... trust=...`
+が出るので、**どの toml が効いているか**と**どこまで信用したか**をログで確認できる。
+
+##### 信頼する置き場所 / しない置き場所
+
+優先度 2 と 3 は**ユーザが名前を挙げていないファイル**を拾う。他人が書いた
+リポジトリに `cd` した場合や、MCP クライアントがそこを cwd にしてサーバを起動した
+場合、そのファイルがそのまま効いてしまう。そこで kb-mcp は**置き場所だけから**
+(ファイルの中身は一切見ずに) 運用者のものかどうかを判定する:
+
+- **信頼する**: `--config` (自分で名指しした)、`<binary-dir>` (書き込みには
+  インストール先への権限が要る)、`kb-mcp service install` が使う config home、
+  そしてファイルが無い場合
+- **信頼しない**: それ以外の、CWD / `.git` 祖先で見つかったもの
+
+信頼しない config も**読み込みはする**。KB の見せ方を決めるだけのもの
+(`[search]` / `[quality_filter]` / `exclude_dirs` / `[parsers]` / `[watch]` /
+`[contextual]`) はそのまま効く。制限するのは 3 つだけで、これらは「どのバイナリを
+実行するか」「何が外に出るか」「誰から届くか」を決めるため:
+
+| フィールド | 信頼しない config の場合 |
+| --- | --- |
+| `fastembed_cache_dir` | 警告して無視し、標準のキャッシュディレクトリを使う。どの `.onnx` を読むかを決める値であり、キャッシュに既にあるモデルは検証されないため |
+| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` と `healthz_public` は破棄し、loopback 限定の `Host` チェックに戻す。`kind` は尊重する |
+| `kb_path` | **起動エラー**。ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指している場合 |
+
+`kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
+`kb_path = "/srv/kb/knowledge-base"` も通る (project-local な `kb-mcp.toml` に
+絶対パスを書く使い方はそのまま)。塞ぐのは**環境を知らなくても書ける**指定 —
+`../..` / `/` / `C:\Users` と、それらを指す symlink。
+
+全部効かせたいなら名指しする: `kb-mcp serve --config ./kb-mcp.toml`。
+インストール済みサービスは影響を受けない (`kb-mcp service install` は config home
+に書き、そこは信頼する場所)。
+
+**カバーしない範囲**: リポジトリが `.mcp.json` ごと同梱している場合、相手は
+config ファイルではなくコマンドライン全体を握っている。kb-mcp 側の規則では
+どうにもならず、そこは MCP クライアントの承認プロンプトの領分。
 
 #### 例: プロジェクトに同梱する per-project KB
 

@@ -182,9 +182,48 @@ and stops at the first hit:
 `~` in `--config` is expanded to the home directory on all platforms
 (including Windows `cmd.exe` where the shell does not expand it).
 
-The chosen source is logged to stderr at startup as
-`kb_mcp::config: loaded config source=...` so you can confirm which file is
-in effect.
+The chosen file is logged to stderr at startup as
+`kb_mcp::config: loaded config source=... path=... trust=...`, so you can see
+which file is in effect and how far it was trusted.
+
+##### Trusted and untrusted config locations
+
+Priorities 2 and 3 find a file you did not name. If you `cd` into a repository
+someone else wrote — or an MCP client launches the server with that directory
+as its cwd — that file would otherwise be honoured in full. So kb-mcp decides
+**from the location alone** (never from the file's contents) whether to treat
+it as yours:
+
+- **Trusted**: `--config` (you named it), `<binary-dir>` (writing there needs
+  install-directory access), a config home used by `kb-mcp service install`,
+  and "no file at all".
+- **Untrusted**: anything else found under the cwd or a `.git` ancestor.
+
+An untrusted config still loads, and everything that shapes *how* a knowledge
+base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
+`[parsers]`, `[watch]`, `[contextual]` — is honoured unchanged. Three fields
+are restricted, because they decide which binary runs, what leaves the machine,
+and who can reach it:
+
+| Field | From an untrusted config |
+| --- | --- |
+| `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. |
+| `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts` and `healthz_public` are dropped, restoring the loopback-only `Host` check. `kind` is honoured. |
+| `kb_path` | **Start-up error** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. |
+
+The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
+`kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local
+`kb-mcp.toml` naming an absolute path keeps working. What it refuses are the
+paths that can be written without knowing anything about your machine —
+`../..`, `/`, `C:\Users` — and symlinks pointing at them.
+
+To accept a config in full, name it: `kb-mcp serve --config ./kb-mcp.toml`.
+Installed services are unaffected — `kb-mcp service install` writes its config
+to a config home, which is a trusted location.
+
+**What this does not cover**: if a repository ships its own `.mcp.json`, it
+controls the whole command line, not just the config file. No rule inside
+kb-mcp can help there; that is what your MCP client's approval prompt is for.
 
 #### Example: per-project KB packaged in a repository
 
