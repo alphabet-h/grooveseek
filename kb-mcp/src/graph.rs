@@ -183,6 +183,14 @@ pub fn build_connection_graph(
 ) -> Result<ConnectionGraph> {
     let started = Instant::now();
 
+    // 0. (BU-05) `exclude_paths` was the one caller-supplied list that AU-17's
+    // 64-entries × 1 KiB bound never covered: `search` validates all three of
+    // its lists, while this one went straight into a `HashSet` the BFS
+    // consults on every visit. Checked here rather than in the MCP handler so
+    // that `kb-mcp graph --exclude` is bounded by the same rule, and before
+    // the seed lookup so an oversized request costs nothing.
+    crate::server::validate_filter_list("exclude_paths", &opts.exclude_paths)?;
+
     // 1. 起点シードを取得。存在しなければ明確にエラー。
     let seeds = db.chunks_for_path(start_path)?;
     if seeds.is_empty() {
@@ -636,6 +644,60 @@ mod tests {
         );
         assert_eq!(g.stats.knn_queries, 0);
         assert_eq!(g.stats.max_depth_reached, 0);
+    }
+
+    /// (BU-05) `exclude_paths` is subject to the same bound as `search`'s
+    /// filter lists.
+    ///
+    /// It was the one caller-supplied list AU-17 never covered: `search`
+    /// checks `path_globs` / `tags_any` / `tags_all` against 64 entries × 1
+    /// KiB, while this one went straight into the `HashSet` the BFS consults
+    /// on every visit. The start document exists here, so an error can only
+    /// come from the bound — not from a missing seed.
+    #[test]
+    fn exclude_paths_is_bounded_like_the_search_filter_lists() {
+        let db = setup_db();
+        insert_doc_with_chunk(&db, "s.md", "S", "seed", 0.1);
+
+        let over = GraphOptions {
+            depth: 0,
+            fan_out: 0,
+            exclude_paths: (0..65).map(|i| format!("junk{i}.md")).collect(),
+            ..Default::default()
+        };
+        let err = build_connection_graph(&db, "s.md", &over)
+            .expect_err("65 exclude_paths must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exclude_paths") && msg.contains("too many entries"),
+            "the error must name the offending list and why: {msg}"
+        );
+
+        // Control: at the limit it still works, so the bound is a bound and
+        // not an accidental "any exclude_paths fails".
+        let at_limit = GraphOptions {
+            depth: 0,
+            fan_out: 0,
+            exclude_paths: (0..64).map(|i| format!("junk{i}.md")).collect(),
+            ..Default::default()
+        };
+        build_connection_graph(&db, "s.md", &at_limit)
+            .expect("64 exclude_paths is within the limit and must still work");
+
+        // A single oversized entry is rejected too — 64 short strings and one
+        // 1 MiB string are not the same request.
+        let long = GraphOptions {
+            depth: 0,
+            fan_out: 0,
+            exclude_paths: vec!["x".repeat(2048)],
+            ..Default::default()
+        };
+        let err = build_connection_graph(&db, "s.md", &long)
+            .expect_err("an oversized exclude_paths entry must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "per-entry size must be bounded as well: {err}"
+        );
     }
 
     #[test]

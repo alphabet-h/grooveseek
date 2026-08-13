@@ -535,6 +535,30 @@ async fn healthz_host_check(
 /// 警告対象外だった (F-33)。だが **いちばん危険な構成がいちばん静か**に
 /// なるので反転させた。そもそも Host header は攻撃者が自由に付けられるので、
 /// allow-list は DNS rebinding 対策であって認証ではない。
+/// Is this peer address the local machine?
+///
+/// (BU-21) `IpAddr::is_loopback` answers "no" for `::ffff:127.0.0.1`, because
+/// `Ipv6Addr::is_loopback` recognises only `::1`. That form is exactly what a
+/// dual-stack listener (`bind = "[::]:3100"`) reports for a client connecting
+/// over IPv4 — including the tray, which polls `/api/admin/status`. The admin
+/// router would answer 403 to a process on the same machine.
+///
+/// So unwrap the IPv4-mapped form before asking. This does not widen what
+/// counts as local: `to_ipv4_mapped` returns `Some` only for the
+/// `::ffff:0:0/96` block, whose low 32 bits are a real IPv4 address, and the
+/// answer for it is whatever `Ipv4Addr::is_loopback` says (`127.0.0.0/8`).
+/// Deprecated IPv4-compatible addresses (`::a.b.c.d`) are deliberately not
+/// unwrapped.
+fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+    }
+}
+
 fn should_warn_non_loopback_bind(addr: &SocketAddr, allowed_hosts: Option<&[String]>) -> bool {
     if addr.ip().is_loopback() {
         return false;
@@ -686,7 +710,7 @@ async fn admin_host_check(
     if let Some(axum::extract::ConnectInfo(peer)) = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        && !peer.ip().is_loopback()
+        && !is_loopback_peer(peer.ip())
     {
         return Err((
             StatusCode::FORBIDDEN,
@@ -755,6 +779,36 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (BU-21) A dual-stack listener reports an IPv4 client as
+    /// `::ffff:a.b.c.d`, and `Ipv6Addr::is_loopback` only knows `::1`.
+    ///
+    /// So with `bind = "[::]:3100"` the admin router answered 403 to the tray
+    /// running on the same machine — fail-closed, but the wrong answer. The
+    /// mapped form has to be unwrapped before the question is asked, and only
+    /// that form: a mapped address outside `127.0.0.0/8` stays non-loopback.
+    #[test]
+    fn ipv4_mapped_loopback_counts_as_loopback() {
+        use std::net::IpAddr;
+        let cases: &[(&str, bool)] = &[
+            ("127.0.0.1", true),
+            ("127.1.2.3", true),
+            ("::1", true),
+            // What a dual-stack socket reports for an IPv4 loopback client.
+            ("::ffff:127.0.0.1", true),
+            ("192.168.1.10", false),
+            ("::ffff:192.168.1.10", false),
+            ("2001:db8::1", false),
+        ];
+        for (raw, expected) in cases {
+            let ip: IpAddr = raw.parse().expect("test address must parse");
+            assert_eq!(
+                is_loopback_peer(ip),
+                *expected,
+                "is_loopback_peer({raw}) should be {expected}"
+            );
+        }
+    }
 
     /// F-33: 0.0.0.0 + default allowed_hosts → warn が立つ
     /// (loopback-only allow-list で外部 bind は即 403 確定なので確実に

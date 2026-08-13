@@ -1375,7 +1375,7 @@ fn validate_collect_md_files(kb_path: &Path, exclude_dirs: &[String]) -> Result<
             if kb_mcp::indexer::is_hardcoded_excluded(name.as_ref()) {
                 return false;
             }
-            !exclude_dirs.iter().any(|d| d.as_str() == name.as_ref())
+            !kb_mcp::indexer::is_user_excluded_dir(name.as_ref(), exclude_dirs)
         })
     {
         let entry = entry.context("walkdir error during validate")?;

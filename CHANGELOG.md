@@ -8,6 +8,67 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
 
 ### Fixed
 
+- **`get_connection_graph`'s `exclude_paths` is now bounded like every other
+  caller-supplied list** (BU-05). AU-17 limited `search`'s `path_globs` /
+  `tags_any` / `tags_all` to 64 entries of at most 1 KiB; `exclude_paths` was
+  missed and went straight into the `HashSet` the BFS consults on every visit.
+  The check lives in `build_connection_graph` rather than the MCP handler, so
+  `kb-mcp graph --exclude` is bounded by the same rule, and it runs before the
+  seed lookup so an oversized request costs nothing.
+
+  Measuring this turned up something the ledger had only hypothesised. The
+  graph expands from **every chunk** of the start document, and on the
+  650-document dogfood knowledge base the largest document (160 chunks) takes
+  **59 s at the default `depth = 2`** and **148 s at `depth = 3`** — holding
+  the database lock throughout. That cost is now documented in the README
+  alongside the caps; bounding it is tracked separately.
+
+- **Directory exclusion is case-insensitive, in all three places that decide
+  it** (BU-19). `exclude_dirs` and the hardcoded `.git` / `.svn` /
+  `node_modules` fail-safe both compared basenames exactly. On Windows and
+  macOS `Build` and `build` are one directory, so the exclusion could be
+  bypassed by however the directory happened to be capitalised — and the
+  fail-safe would index a `.GIT` directory. On Linux the two really are
+  distinct, and skipping both is the safer side to err on for a denylist.
+
+  The decision now lives in one function, `indexer::is_user_excluded_dir`,
+  used by the index walk, the `validate` walk and the live watcher. Those
+  three have drifted apart before — AU-03 found the watcher missing the
+  hardcoded denylist the other two applied — and they drifted again inside
+  this change: the first version switched only the two walkers, which left the
+  watcher incrementally indexing a `Build/` that the full index skipped, a
+  state worse than before the fix.
+
+  While documenting this, the README's claim that `exclude_dirs = []` "walks
+  everything, including `.git/`" turned out to be false: the hardcoded denylist
+  has applied regardless since v0.7.5 (F-62).
+
+- **A dual-stack bind no longer locks the tray out of the admin endpoints**
+  (BU-21). `Ipv6Addr::is_loopback` recognises only `::1`, but a listener on
+  `[::]:3100` reports an IPv4 loopback client as `::ffff:127.0.0.1`, so the
+  admin router answered 403 to a process on the same machine. The IPv4-mapped
+  form is now unwrapped before the question is asked — and only that form, so
+  a mapped address outside `127.0.0.0/8` still counts as remote.
+
+- **`get_document`'s size cap follows the canonical extension** (BU-22). The
+  cap class was chosen by the caller from the path as typed, while the
+  registry-membership check used the canonicalized path — two decisions from
+  two different strings. Windows 8.3 aliasing makes them disagree for every
+  Office format: `presentation-deck.pptx` is also reachable as
+  `PRESEN~1.PPT` (measured on a development machine), and since `.ppt` is not
+  a registered extension the 1 MiB text cap was applied to a file the registry
+  classifies as binary, rejecting Office documents over 1 MiB as "too large".
+  Both caps are now passed in and the choice is made where the extension is
+  already known.
+
+- **`get_best_practice` no longer returns the configured template paths**
+  (BU-23). A total miss echoed every candidate path back to the caller, which
+  is the server's `[best_practice].path_templates` rendered out — directory
+  names an unauthenticated MCP client has no other way to learn. The reply now
+  carries the number of templates tried, which is still enough to tell "no
+  template matched" from "the tool is not configured"; the paths themselves go
+  to the operator's log at `RUST_LOG=kb_mcp=debug`.
+
 - **The bundled `kb-mcp.toml.example` no longer changes behaviour just by being
   copied** (BU-13, BU-14). It shipped with `[transport] kind = "http"`,
   `[parsers].enabled`, `[best_practice].path_templates` and others *active*, so

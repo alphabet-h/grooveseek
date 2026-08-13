@@ -30,8 +30,66 @@ pub const HARDCODED_EXCLUDE_DIRS: &[&str] = &[".git", ".svn", "node_modules"];
 /// paths agree. `pub` because the bin target accesses it via the lib
 /// (`kb_mcp::indexer::is_hardcoded_excluded`); the library API is
 /// intentionally unstable per `src/lib.rs:4-6`.
+/// (BU-19) Matched case-insensitively, like the extension checks a few lines
+/// down. Windows and macOS resolve `.GIT` and `.git` to the same directory, so
+/// an exact-match denylist there is a denylist with a trivial bypass — and the
+/// fail-safe it is meant to be would silently index a repository's metadata.
+/// The cost on Linux, where the two really are different directories, is that
+/// a directory literally named `.GIT` is skipped as well; that is the safer
+/// side to err on for a hardcoded VCS denylist.
+///
+/// ASCII folding is complete here because [`HARDCODED_EXCLUDE_DIRS`] is ASCII
+/// by construction. [`is_user_excluded_dir`], which compares arbitrary
+/// configured names, needs the Unicode-aware form instead.
 pub fn is_hardcoded_excluded(basename: &str) -> bool {
-    HARDCODED_EXCLUDE_DIRS.contains(&basename)
+    HARDCODED_EXCLUDE_DIRS
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(basename))
+}
+
+/// (BU-19) Does a single path component match a user `exclude_dirs` entry?
+///
+/// The one place that decides it, because there are three callers — the index
+/// walk, the `validate` walk, and the live watcher — and they have drifted
+/// apart before: AU-03 found the watcher missing the hardcoded denylist that
+/// the other two applied, and BU-19 landed with two of the three switched to
+/// case-insensitive matching, so the watcher would have incrementally indexed
+/// a `Build/` that the index walk skipped. Route every such decision through
+/// here.
+///
+/// Case-insensitive for the same reason as [`is_hardcoded_excluded`], but
+/// unlike that function — whose entries are ASCII by construction — this one
+/// compares arbitrary user input, so ASCII folding is not enough:
+/// `exclude_dirs = ["résumé"]` has to match a directory stored as `RÉSUMÉ`
+/// (codex P2 on PR #141).
+///
+/// **Exactly what this does**, because the obvious phrasing overstates it:
+/// lowercase mapping via `str::to_lowercase`, then Greek final sigma folded to
+/// medial sigma. That second step is needed because `to_lowercase` is
+/// context-dependent there — measured: `"ΟΣ"` lowercases to `"ος"` while
+/// `"οσ"` stays `"οσ"`, so without it a configured `οσ` misses a directory
+/// named `ΟΣ` (codex P2, round 3).
+///
+/// **What it is not**: full Unicode case folding. Also measured, `"straße"`
+/// and `"STRASSE"` stay distinct — `ß` lowercases to itself, and only case
+/// *folding* maps it to `ss`. Getting that would mean taking on a
+/// case-folding dependency for a case a knowledge-base directory name is not
+/// going to hit; the limit is written down here instead of papered over.
+///
+/// It does **not** normalize either. A name written with combining marks
+/// (`e` + U+0301) still differs from the precomposed `é`. Filesystems
+/// generally hand back one consistent form, so that matters only if the
+/// configured string and the directory on disk were typed on different
+/// systems.
+pub fn is_user_excluded_dir(name: &str, exclude_dirs: &[String]) -> bool {
+    /// U+03C2 GREEK SMALL LETTER FINAL SIGMA → U+03C3 GREEK SMALL LETTER SIGMA.
+    fn fold(s: &str) -> String {
+        s.to_lowercase().replace('\u{03c2}', "\u{03c3}")
+    }
+    exclude_dirs.iter().any(|d| {
+        // Fast path: identical bytes, which is what almost every call is.
+        d.as_str() == name || fold(d) == fold(name)
+    })
 }
 
 /// MS Office (`~$doc.docx`) / LibreOffice (`.~lock.doc.docx#`) のロック・owner
@@ -911,7 +969,7 @@ fn collect_source_files(
             if is_hardcoded_excluded(name.as_ref()) {
                 return false;
             }
-            !exclude_dirs.iter().any(|d| d.as_str() == name.as_ref())
+            !is_user_excluded_dir(name.as_ref(), exclude_dirs)
         })
     {
         let entry = entry.context("walkdir error")?;
@@ -1417,6 +1475,95 @@ mod tests {
     // F-62: hardcoded denylist (.git / .svn / node_modules) is always applied
     // as a fail-safe alongside user `exclude_dirs` (union semantics).
     // -----------------------------------------------------------------------
+
+    /// (BU-19) Directory exclusion matches case-insensitively.
+    ///
+    /// On Windows and macOS `.GIT` and `.git` name the same directory, so an
+    /// exact-match denylist is one a repository can walk straight past — and
+    /// the hardcoded list exists precisely as a fail-safe. The user list has
+    /// the same problem in the other direction: `exclude_dirs = ["build"]`
+    /// missed a directory that happened to be created as `Build`.
+    ///
+    /// The case is checked here rather than via the filesystem so the test
+    /// means the same thing on Linux, where the two directories really are
+    /// distinct and the exclusion is a deliberate widening.
+    #[test]
+    fn dir_exclusion_ignores_case() {
+        for name in [".GIT", ".Git", "NODE_MODULES", "Node_Modules", ".SVN"] {
+            assert!(
+                is_hardcoded_excluded(name),
+                "{name} must hit the hardcoded denylist — on a case-insensitive \
+                 filesystem it is the very directory the list names"
+            );
+        }
+        for name in [".gitignore", "git", "node_modules_old", "svn"] {
+            assert!(
+                !is_hardcoded_excluded(name),
+                "{name} is a different directory and must not be excluded"
+            );
+        }
+
+        // Configured names are arbitrary user input, so folding has to cover
+        // more than ASCII (codex P2 on PR #141). Normalization is explicitly
+        // out of scope: the precomposed and decomposed spellings of `é` are
+        // different strings and stay that way.
+        let unicode = vec!["résumé".to_string(), "Ünterlagen".to_string()];
+        for name in ["RÉSUMÉ", "Résumé", "résumé", "ÜNTERLAGEN", "ünterlagen"] {
+            assert!(
+                is_user_excluded_dir(name, &unicode),
+                "{name} must match a configured non-ASCII exclusion"
+            );
+        }
+        assert!(
+            !is_user_excluded_dir("resume", &unicode),
+            "an unaccented name is a different directory, not a case variant"
+        );
+
+        // Greek final sigma: `to_lowercase` is context-dependent, so `ΟΣ`
+        // lowercases to `ος` while a configured `οσ` stays `οσ`. Folding the
+        // final form closes that (codex P2, round 3).
+        let greek = vec!["οσ".to_string()];
+        for name in ["ΟΣ", "Οσ", "οΣ", "ος"] {
+            assert!(
+                is_user_excluded_dir(name, &greek),
+                "{name} is a case variant of the configured οσ and must match"
+            );
+        }
+
+        // And the limit this stops at, asserted so it is a decision rather
+        // than a surprise: lowercase mapping is not full case folding, so `ß`
+        // and `SS` remain different directories.
+        let sharp_s = vec!["straße".to_string()];
+        assert!(
+            !is_user_excluded_dir("STRASSE", &sharp_s),
+            "documented limit: `ß` lowercases to itself, so only full Unicode \
+             case folding would match STRASSE — if this ever starts passing, \
+             the doc comment on is_user_excluded_dir needs updating too"
+        );
+        assert!(
+            is_user_excluded_dir("STRASSE", &["strasse".to_string()]),
+            "the plain-ASCII spelling still folds normally"
+        );
+
+        let tmp = mk_tmp("excludecase");
+        write_file(&tmp.0, "Build/inside.md", "# inside");
+        write_file(&tmp.0, "normal.md", "# normal");
+        let reg = Registry::defaults();
+        let files = collect_source_files(&tmp.0, &reg, &["build".to_string()]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"normal.md".to_string()),
+            "normal.md must be kept, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "inside.md"),
+            "`exclude_dirs = [\"build\"]` must also skip a directory spelled \
+             `Build`, got: {names:?}"
+        );
+    }
 
     /// `exclude_dirs = []` (= "walk everything") でも `.git/` 配下は skip。
     #[test]

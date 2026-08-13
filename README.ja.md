@@ -852,9 +852,22 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **サイズ上限**: ファイル 1 本あたり生バイト 50 MiB を、read する前に `stat` で判定する。バイナリ形式 (`MAX_RAW_BINARY_BYTES`) だけでなく **テキスト形式 (`MAX_RAW_TEXT_BYTES`、v0.17.0 以降)** にも適用される。以前テキストは無制限で、巨大な `.md` 1 本で内容が丸ごとメモリに載った — `rebuild_index` は MCP ツールなのでクライアントから誘発できた。上限超過のファイルは、どちらの上限に当たったかを明示した warning とともに skip される
 - **ハイブリッド検索 (FTS5 + ベクトル)**: `search` ツールは SQLite FTS5 全文検索 (trigram tokenizer、日本語 / CJK も動く。v0.12.0 以降は `heading` / `context` / `content` の 3 列で、bm25 では既定で `heading` を 2 倍重み) をベクトル検索と Reciprocal Rank Fusion (既定 `k = 60`) でマージする。重みと `k` は v0.13.0 以降 `[search.fusion]` で設定でき、自分の KB で動かす価値があるかは `kb-mcp tune` が測る。返される `score` は RRF スコア (大きいほど良い) で距離ではない。v0.16.0 以降、クエリは逐語で検索されるのではなく token 単位の phrase にコンパイルされて `OR` で結合される (上の「コマンドラインからの一発検索」を参照)。有効な phrase が 1 つも作れないクエリはベクトルのみにフォールバックするが、断片がすべて短いクエリはその前にクエリ全体の逐語 phrase へ fallback するので、ベクトルのみになるのは trim 後 3 文字未満 (trigram の最小値を下回る) のときだけ
 - **任意の再ランク**: `--reranker <model>` を付けると上位候補が cross-encoder で再スコアされてから返る。再ランク適用時は `score` が RRF 値ではなく cross-encoder の生スコアになる。再ランクは index 非依存 — サーバ起動時に再インデックスなしでトグル可能
-- **Connection graph**: `get_connection_graph` / `kb-mcp graph` はドキュメント起点でベクトルインデックス上を BFS する。追加インデックスは作らず、ホップ毎に sqlite-vec KNN を新規発行する。`depth ≤ 3` / `fan_out ≤ 20` で client-side クランプされるため、最悪でも 1 リクエストあたり約 21 KNN クエリ。スコアは L2 距離からの近似コサイン類似度 (`1 - d²/2` を `[0,1]` にクランプ、unit normalized embedding を前提 — BGE-small / BGE-M3 は内部で正規化済み)
+- **Connection graph**: `get_connection_graph` / `kb-mcp graph` はドキュメント起点でベクトルインデックス上を BFS する。追加インデックスは作らず、**展開されたノードごとに** sqlite-vec KNN を新規発行する。最大深度のノードは返却されるが展開されないので、クエリ数は `depth` **未満**の深度にあるノード数 — つまり 1 段浅いリクエストが返すノード数と一致する (下表で確認できる)。`depth` は 3、`fan_out` は 20 にクランプされるが、**それだけではリクエストのコストを縛れない** — BFS は起点文書の**全チャンク**を種にし、そのチャンク数に上限が無いため。コストは起点文書のチャンク数と `fan_out^depth` の両方に比例して増える。650 文書の KB で最大の文書 (160 チャンク) に対し release バイナリで実測:
+
+  | `depth` | KNN クエリ数 | 返却ノード数 | 実時間 |
+  | --- | --- | --- | --- |
+  | 0 | 0 | 160 | 約 0.2 s |
+  | 1 | 160 | 767 | 約 12 s |
+  | 2 (既定) | 767 | 1997 | 約 60 s |
+  | 3 (最大) | 1997 | 3682 | 約 150 s |
+
+  クエリ数とノード数は実測の確定値、実時間は概数 (同一マシンでも実行ごとに 7% 程度ぶれた)。
+
+  この間 DB ロックを保持するため、長い文書への graph リクエストは並行する検索を待たせる。大きいと分かっている文書には小さい `depth` を使うこと。`exclude_paths` は `search` の `path_globs` / `tags_any` / `tags_all` と同じく **64 件・各 1 KiB まで**。
+
+  スコアは L2 距離からの近似コサイン類似度 (`1 - d²/2` を `[0,1]` にクランプ、unit normalized embedding を前提 — BGE-small / BGE-M3 は内部で正規化済み)
 - **見出し除外**: 見出しテキストが `exclude_headings` のいずれかを含むセクションは、チャンキング時に落とされる。既定は空リスト (全セクション残す)。`kb-mcp.toml` の `exclude_headings` に substring を列挙するとオプトインになる。マッチは部分文字列 (`heading.contains(pattern)`) で、短いパターンは `"参考リンク"` → `"## 参考リンク (旧)"` のような変種も拾う
-- **ディレクトリ除外**: `walkdir` は basename が `exclude_dirs` のいずれかと一致するディレクトリ (とその subtree) をスキップする。既定は `[".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"]`。ユーザ指定リストは既定を完全に置き換える (merge ではない)。`exclude_dirs = []` を明示すると `.git/` 等も含めて全走査する
+- **ディレクトリ除外**: `walkdir` は basename が `exclude_dirs` のいずれかと一致するディレクトリ (とその subtree) をスキップする。照合は名前全体、かつ**大文字小文字を区別しない**: Unicode の小文字マッピング + ギリシャ語 final sigma の畳み込みで比較するので、`["résumé"]` は `RÉSUMÉ` に、`["οσ"]` は `ΟΣ` に一致する。full Unicode case folding ではない (`straße` と `STRASSE` は別物のまま)、また正規化もしない (結合文字で書かれた名前と合成済みの名前は別物のまま)。したがって `exclude_dirs = ["build"]` は `Build` というディレクトリも除外する — Windows / macOS ではこの 2 つは同一ディレクトリなので、完全一致にするとディスク上の綴り次第で除外設定を素通りできてしまうため。この規則は full index walk・`kb-mcp validate`・live watcher の 3 つすべてに等しく適用される。既定は `[".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"]`。ユーザ指定リストは既定を完全に置き換える (merge ではない)。`exclude_dirs = []` を明示しても `.git` / `.svn` / `node_modules` は fail-safe として除外され続ける
 - **`get_best_practice` path templates**: opt-in 機能で、使うには `kb-mcp.toml` の `[best_practice].path_templates` を設定する必要がある。各テンプレートは `{target}` をプレースホルダとして使える (例: `"best-practices/{target}/PERFECT.md"`、`"docs/{target}.md"`)。サーバはリスト順に試して `kb_path` 配下に最初に存在したファイルを返す (path traversal は拒否)。セクション省略 or `path_templates = []` の場合はツール自体は登録されるが "not configured" エラーを返すため、意図しない呼び出しは明示的に失敗する
 - **チャンク単位品質フィルタ** (**既定有効** 閾値 `0.3`): インデックス時に各チャンクに対し 3 つのシグナル — 長さ (30 文字未満 → -0.6)、定型語のみ (TBD / TODO / 詳細は後述 等 → -0.5)、弱い構造 (80 文字未満の 1 行 → -0.3) — から `quality_score` を計算。閾値未満のチャンクは `search` / `kb-mcp search` / `get_connection_graph` で非表示。`get_connection_graph` の seed チャンクは免除。フィルタ無効化は `kb-mcp.toml` の `[quality_filter] enabled = false`、per-query は CLI `--include-low-quality` / MCP `include_low_quality: true`。閾値上書きは `--min-quality 0.5` / `min_quality: 0.5`。既存 index のアップグレード: 次の `kb-mcp index` 実行時に `quality_score` 列が透過的に追加され (ALTER TABLE)、1 度だけ backfill される (冪等)
 
