@@ -13,6 +13,10 @@
 
 use super::*;
 
+/// 1 チャンクを「BFS のシード」として扱う時の形: `(chunk_id, embedding, 中身)`。
+/// `chunks_for_path*` の戻り値の要素型。
+pub type SeedChunk = (i64, Vec<f32>, SearchResult);
+
 impl Database {
     /// Insert or update a document row. On update the old chunks (and their
     /// vec_chunks entries) are deleted so the caller can re-insert fresh ones.
@@ -298,8 +302,22 @@ impl Database {
     /// (BU-33: 1 文書のチャンク数に上限が無く、160 チャンクの文書が 160 個の
     /// シードになって BFS のコストを決めていた)。本メソッドは既存呼び出し互換の
     /// ために残した薄い委譲。
-    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, Vec<f32>, SearchResult)>> {
+    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<SeedChunk>> {
         self.chunks_for_path_limited(path, u32::MAX)
+    }
+
+    /// 起点チャンクを **最大 `cap` 件**返し、「まだ続きがあるか」を第 2 要素で返す
+    /// (BU-33)。
+    ///
+    /// `cap + 1` 件を SQL に要求して 1 件多く返ってきたかで判定する。呼び出し側で
+    /// `+1` を書かせないのは、そこが「上限を SQL に降ろす」唯一の接点だからで、
+    /// 引数を素通しにすると *cap を無視した読み取り* が結果を変えずに書けてしまう
+    /// (= テストで検出できない退行になる)。
+    pub fn chunks_for_path_capped(&self, path: &str, cap: u32) -> Result<(Vec<SeedChunk>, bool)> {
+        let mut rows = self.chunks_for_path_limited(path, cap.saturating_add(1))?;
+        let has_more = rows.len() > cap as usize;
+        rows.truncate(cap as usize);
+        Ok((rows, has_more))
     }
 
     /// [`Self::chunks_for_path`] に SQL 側の `LIMIT` を付けたもの。
@@ -309,17 +327,10 @@ impl Database {
     /// チャンク本文ごと materialize されてから捨てられる = BU-33 が名指しした
     /// 「上限の無い読み取り」がそのまま残る)。
     ///
-    /// 呼び出し側が「まだ続きがあるか」を判定できるよう、**欲しい件数 + 1** を
-    /// 渡す運用を想定している (返り値が `limit` 未満なら全件)。
-    ///
     /// `embedding` は `vec_to_json` で JSON 文字列として取り出し、serde_json で
     /// `Vec<f32>` に復元する。`SearchResult.score` はシード node 用に 1.0 を入れる
     /// (BFS 結果のスコアと同じ意味 = cos sim 換算値の上限)。
-    pub fn chunks_for_path_limited(
-        &self,
-        path: &str,
-        limit: u32,
-    ) -> Result<Vec<(i64, Vec<f32>, SearchResult)>> {
+    fn chunks_for_path_limited(&self, path: &str, limit: u32) -> Result<Vec<SeedChunk>> {
         let sql = "
             SELECT c.id, vec_to_json(v.embedding),
                    c.content, c.heading, c.document_id,

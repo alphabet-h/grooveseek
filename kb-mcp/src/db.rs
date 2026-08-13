@@ -1388,6 +1388,53 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// (BU-33) The seed read is bounded in SQL, and the caller learns whether
+    /// anything was left behind without issuing a second query.
+    #[test]
+    fn the_capped_seed_read_reports_whether_more_chunks_exist() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("big.md", None, None, None, None, &[], None, "h1")
+            .unwrap();
+        for i in 0..10 {
+            db.insert_chunk(
+                doc_id,
+                i,
+                Some(&format!("h{i}")),
+                None,
+                "body",
+                None,
+                &dummy_embedding(0.1 + 0.01 * i as f32),
+                1.0,
+            )
+            .unwrap();
+        }
+
+        let (rows, more) = db.chunks_for_path_capped("big.md", 4).unwrap();
+        assert_eq!(rows.len(), 4, "the cap must bound the rows that come back");
+        assert!(more, "6 chunks were left behind");
+        // The cap keeps chunk_index order, so it is the document's prefix.
+        assert_eq!(rows[0].2.heading.as_deref(), Some("h0"));
+        assert_eq!(rows[3].2.heading.as_deref(), Some("h3"));
+
+        // cap == chunk count: everything fits, nothing is left behind.
+        let (rows, more) = db.chunks_for_path_capped("big.md", 10).unwrap();
+        assert_eq!(rows.len(), 10);
+        assert!(
+            !more,
+            "a cap equal to the chunk count leaves nothing behind"
+        );
+
+        // cap above the chunk count behaves the same way.
+        let (rows, more) = db.chunks_for_path_capped("big.md", 50).unwrap();
+        assert_eq!(rows.len(), 10);
+        assert!(!more);
+
+        let (rows, more) = db.chunks_for_path_capped("does/not/exist.md", 4).unwrap();
+        assert!(rows.is_empty());
+        assert!(!more);
+    }
+
     #[test]
     fn test_get_chunk_embedding_roundtrip() {
         let db = db_with_384();

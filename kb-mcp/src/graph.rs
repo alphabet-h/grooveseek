@@ -333,18 +333,16 @@ pub fn build_connection_graph(
 
     // 1. 起点シードを取得。存在しなければ明確にエラー。
     //
-    // (BU-33) 上限は SQL の LIMIT に降ろす。`max_seed_chunks + 1` 件取るのは、
-    // 「まだ続きがあるか」を追加クエリなしで判定するため。
+    // (BU-33) 上限は SQL の LIMIT に降ろす (`chunks_for_path_capped`)。
     let seed_cap = clamp_max_seed_chunks(opts.max_seed_chunks);
-    let mut seeds = db.chunks_for_path_limited(start_path, seed_cap.saturating_add(1))?;
+    let (seeds, more_chunks) = db.chunks_for_path_capped(start_path, seed_cap)?;
     if seeds.is_empty() {
         anyhow::bail!(
             "document not found (no chunks for path): {start_path}. \
              Run `kb-mcp index` to (re)index the knowledge base."
         );
     }
-    if seeds.len() > seed_cap as usize {
-        seeds.truncate(seed_cap as usize);
+    if more_chunks {
         let detail = match opts.seed_strategy {
             SeedStrategy::AllChunks => format!(
                 "the start document has more than {seed_cap} chunks; only its first {seed_cap} \
@@ -1105,7 +1103,10 @@ mod tests {
         };
         let g = build_connection_graph(&db, "big.md", &opts).unwrap();
 
-        assert_eq!(g.stats.seeds_used, 5, "only the capped prefix may be seeded");
+        assert_eq!(
+            g.stats.seeds_used, 5,
+            "only the capped prefix may be seeded"
+        );
         assert_eq!(
             g.nodes.iter().filter(|n| n.depth == 0).count(),
             5,
