@@ -59,19 +59,36 @@ pub fn is_hardcoded_excluded(basename: &str) -> bool {
 ///
 /// Case-insensitive for the same reason as [`is_hardcoded_excluded`], but
 /// unlike that function — whose entries are ASCII by construction — this one
-/// compares arbitrary user input, so it folds case over the whole of Unicode
-/// via `str::to_lowercase`: `exclude_dirs = ["résumé"]` has to match a
-/// directory stored as `RÉSUMÉ` (codex P2 on PR #141).
+/// compares arbitrary user input, so ASCII folding is not enough:
+/// `exclude_dirs = ["résumé"]` has to match a directory stored as `RÉSUMÉ`
+/// (codex P2 on PR #141).
 ///
-/// It does **not** normalize. A name written with combining marks
-/// (`e` + U+0301) still differs from the precomposed `é`, in either case.
-/// Filesystems generally hand back one consistent form, so this matters only
-/// if the configured string and the directory on disk were typed on different
-/// systems; there is no attempt to paper over that here.
+/// **Exactly what this does**, because the obvious phrasing overstates it:
+/// lowercase mapping via `str::to_lowercase`, then Greek final sigma folded to
+/// medial sigma. That second step is needed because `to_lowercase` is
+/// context-dependent there — measured: `"ΟΣ"` lowercases to `"ος"` while
+/// `"οσ"` stays `"οσ"`, so without it a configured `οσ` misses a directory
+/// named `ΟΣ` (codex P2, round 3).
+///
+/// **What it is not**: full Unicode case folding. Also measured, `"straße"`
+/// and `"STRASSE"` stay distinct — `ß` lowercases to itself, and only case
+/// *folding* maps it to `ss`. Getting that would mean taking on a
+/// case-folding dependency for a case a knowledge-base directory name is not
+/// going to hit; the limit is written down here instead of papered over.
+///
+/// It does **not** normalize either. A name written with combining marks
+/// (`e` + U+0301) still differs from the precomposed `é`. Filesystems
+/// generally hand back one consistent form, so that matters only if the
+/// configured string and the directory on disk were typed on different
+/// systems.
 pub fn is_user_excluded_dir(name: &str, exclude_dirs: &[String]) -> bool {
+    /// U+03C2 GREEK SMALL LETTER FINAL SIGMA → U+03C3 GREEK SMALL LETTER SIGMA.
+    fn fold(s: &str) -> String {
+        s.to_lowercase().replace('\u{03c2}', "\u{03c3}")
+    }
     exclude_dirs.iter().any(|d| {
         // Fast path: identical bytes, which is what almost every call is.
-        d.as_str() == name || d.to_lowercase() == name.to_lowercase()
+        d.as_str() == name || fold(d) == fold(name)
     })
 }
 
@@ -1500,6 +1517,32 @@ mod tests {
         assert!(
             !is_user_excluded_dir("resume", &unicode),
             "an unaccented name is a different directory, not a case variant"
+        );
+
+        // Greek final sigma: `to_lowercase` is context-dependent, so `ΟΣ`
+        // lowercases to `ος` while a configured `οσ` stays `οσ`. Folding the
+        // final form closes that (codex P2, round 3).
+        let greek = vec!["οσ".to_string()];
+        for name in ["ΟΣ", "Οσ", "οΣ", "ος"] {
+            assert!(
+                is_user_excluded_dir(name, &greek),
+                "{name} is a case variant of the configured οσ and must match"
+            );
+        }
+
+        // And the limit this stops at, asserted so it is a decision rather
+        // than a surprise: lowercase mapping is not full case folding, so `ß`
+        // and `SS` remain different directories.
+        let sharp_s = vec!["straße".to_string()];
+        assert!(
+            !is_user_excluded_dir("STRASSE", &sharp_s),
+            "documented limit: `ß` lowercases to itself, so only full Unicode \
+             case folding would match STRASSE — if this ever starts passing, \
+             the doc comment on is_user_excluded_dir needs updating too"
+        );
+        assert!(
+            is_user_excluded_dir("STRASSE", &["strasse".to_string()]),
+            "the plain-ASCII spelling still folds normally"
         );
 
         let tmp = mk_tmp("excludecase");
