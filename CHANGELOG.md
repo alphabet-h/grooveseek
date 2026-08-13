@@ -12,6 +12,68 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **`get_connection_graph` / `kb-mcp graph` are now bounded, and say so when a
+  bound bites** (BU-33). The walk had no upper limit on its cost: it seeded
+  from *every* chunk of the start document, so clamping `depth` to 3 and
+  `fan_out` to 20 never bounded a request. On a 650-document knowledge base
+  (9,419 chunks, BGE-M3) the largest document — 160 chunks — measured, with the
+  release binary:
+
+  | `depth` | before | after (defaults) |
+  | --- | --- | --- |
+  | 1 | 160 KNN / 767 nodes / ~19 s | 14 KNN / 100 nodes / ~1.1 s |
+  | 2 (default) | 767 KNN / 1997 nodes / ~87 s | 14 KNN / 100 nodes / ~1.1 s |
+  | 3 | 1997 KNN / 3682 nodes / ~200 s | 14 KNN / 100 nodes / ~1.1 s |
+
+  The call holds the database mutex throughout, so those runs delayed every
+  concurrent search; a 1997-node result was also unusable as LLM context. Nor
+  was this only about outsized documents — the *median* document (13 chunks)
+  returned 331 nodes in 7.3 s at the default depth.
+
+  Two bounds, both deterministic, exposed on the MCP tool and the CLI:
+  `max_seed_chunks` (default 32, ceiling 1000) applied as a SQL `LIMIT` so the
+  rows past the cap are never read, and `max_nodes` (default 100, ceiling
+  2000), which caps the response size and the query count together because
+  each node is queued once and expands at most once
+  (`knn_queries <= total_nodes <= max_nodes`). Over-large values are clamped,
+  not rejected — the same doctrine as `depth` / `fan_out` / `limit`.
+
+  Both bounds are needed. A node budget alone degenerates: BFS emits every seed
+  before any neighbour, so on that 160-chunk document any budget below 160
+  returned a connection graph with **zero connections**.
+
+  Truncation is reported in band — `truncated: bool` at the root of the
+  response plus a `truncation` array carrying `reason` (`seed_chunks` /
+  `node_budget`), the `limit` that fired, and the remedy for that specific
+  reason, since MCP offers no cursor with which to ask for the rest.
+  `truncated` means *something was lost*, not *a counter reached its cap*: a
+  walk that exhausts the graph while exactly filling the budget reports
+  `false`. `stats` gains `seeds_used`, and the CLI text output gains the same
+  fields plus one `!` line per reason.
+
+  Defaults come from measurement: ~72 ms per KNN, ~4 ms per node, ~665 B of
+  JSON per node, and a chunks-per-document distribution of median 13 / p90 26 /
+  p99 43 / max 160. So 32 seeds trims 4.0% of documents, and 100 nodes is
+  ~7.2 s / 65 KiB worst case.
+
+  **Callers who want the old behaviour** can ask for it:
+  `--max-seed-chunks 1000 --max-nodes 2000` reproduces the "before" column
+  exactly, with `truncated: false`, for any document of 1000 chunks or fewer.
+  Exhaustive seeding of documents larger than that is no longer available to
+  anyone. Because BFS spends the budget breadth-first, raising `depth` alone no
+  longer changes the result for a long start document; `seed_strategy:
+  "centroid"` is the way to spend the budget on depth (a complete depth-2 graph
+  of the same document: 24 nodes in ~0.4 s).
+
+### Fixed
+
+- `kb-mcp graph --seed-strategy`'s help text advertised `all_chunks`, but clap
+  derives kebab-case values, so only `all-chunks` was accepted and copying the
+  help text produced `error: invalid value`. The help now matches what the flag
+  takes, and notes that the MCP tool spells it `all_chunks`.
+
 ## [0.18.0] - 2026-08-13
 
 ### Added

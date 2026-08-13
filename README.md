@@ -500,7 +500,9 @@ Flags:
 - `--depth` (default 2, clamped to max 3) — BFS hops.
 - `--fan-out` (default 5, clamped to max 20) — neighbors per node per hop. `0` returns only the seed.
 - `--min-similarity` (default 0.3) — cosine similarity cut-off. `0.0..=1.0`.
-- `--seed-strategy` — `all-chunks` (default) expands from every chunk of the start doc; `centroid` averages them (L2-renormalized) into one virtual seed.
+- `--seed-strategy` — `all-chunks` (default) expands from every chunk of the start doc; `centroid` averages them (L2-renormalized) into one virtual seed. (The MCP tool spells these `all_chunks` / `centroid`.)
+- `--max-nodes` (default 100, clamped to max 2000) — total nodes; also caps the number of KNN queries.
+- `--max-seed-chunks` (default 32, clamped to `1..=1000`) — chunks of the start document used as seeds.
 - `--exclude` — comma-separated paths to drop from results. The start path itself is always excluded.
 - `--dedup-by-path` — collapse same-path hits so each document appears at most once.
 - `--category` / `--topic` — apply category / topic filters to every hop.
@@ -812,7 +814,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `get_document` | Get the full content and metadata of a document by its relative path. | `path` (e.g. `"deep-dive/mcp/overview.md"`) |
 | `get_best_practice` | Opt-in: when `[best_practice].path_templates` is configured in `kb-mcp.toml`, fetch a best-practices document for the given target and optionally extract an h2 section. Without configuration the tool returns a "not configured" error. | `target` (e.g. `"claude-code"`), `category` (optional) |
 | `rebuild_index` | Rebuild the search index by scanning all source files (Markdown plus any other extensions enabled via `[parsers].enabled`). | `force` (optional, default false) |
-| `get_connection_graph` | BFS-expand semantically related chunks starting from a document path. Returns a flat list of nodes with `parent_id` / `depth` / `score` / `snippet` so the caller can chain context discovery. | `path` (required), `depth` (default 2, max 3), `fan_out` (default 5, max 20), `min_similarity` (default 0.3), `seed_strategy` (`all_chunks` / `centroid`), `dedup_by_path`, `category`, `topic`, `exclude_paths` |
+| `get_connection_graph` | BFS-expand semantically related chunks starting from a document path. Returns a flat list of nodes with `parent_id` / `depth` / `score` / `snippet` so the caller can chain context discovery, plus `truncated` / `truncation[]` when a bound cut the walk short. | `path` (required), `depth` (default 2, max 3), `fan_out` (default 5, max 20), `min_similarity` (default 0.3), `seed_strategy` (`all_chunks` / `centroid`), `dedup_by_path`, `category`, `topic`, `exclude_paths`, `max_nodes` (default 100, max 2000), `max_seed_chunks` (default 32, max 1000) |
 
 ## Notes
 
@@ -856,18 +858,30 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **Size caps**: 50 MiB of raw bytes per file, checked with `stat` before the file is read, for text (`MAX_RAW_TEXT_BYTES`, v0.17.0+) as well as binary formats (`MAX_RAW_BINARY_BYTES`). Text used to be uncapped, which let a single oversized `.md` pull its whole content into memory — reachable from any client, since `rebuild_index` is an MCP tool. Files over the cap are skipped with a warning naming which limit applied.
 - **Hybrid search (FTS5 + vector)**: The `search` tool combines SQLite FTS5 full-text search (trigram tokenizer, works for Japanese/CJK too; three columns since v0.12.0 — `heading`, `context`, `content` — with `heading` weighted 2× in bm25 by default) with the vector search via Reciprocal Rank Fusion (`k = 60` by default). Both the weights and `k` are configurable under `[search.fusion]` since v0.13.0, and `kb-mcp tune` measures whether moving them helps on your KB. The returned `score` is the RRF score (higher = better), not a distance. Since v0.16.0 the query is compiled into per-token phrases joined with `OR` rather than searched verbatim (see "One-shot search from the command line" above). A query that yields no usable phrase falls back to vector-only — but a query whose fragments are all short falls back to one whole-query verbatim phrase first, so vector-only happens exactly when the query is under 3 characters after trimming (below the trigram minimum).
 - **Optional reranking**: With `--reranker <model>` the top candidates are re-scored by a cross-encoder before being returned. When rerank is applied, `score` is the cross-encoder raw score instead of the RRF value. Reranking is index-independent — you can toggle it at server start without re-indexing.
-- **Connection graph**: `get_connection_graph` / `kb-mcp graph` do BFS over the vector index starting from a document. No extra index is built; **each node that gets expanded runs one fresh sqlite-vec KNN**. Nodes at the maximum depth are returned but never expanded, so the query count is the number of nodes at depth *below* `depth` — which is exactly the node count a request one level shallower returns, as the table below shows. `depth` is clamped to 3 and `fan_out` to 20, but those do not bound the request on their own, because the walk seeds from **every chunk of the start document** and that count is uncapped. The cost therefore scales with the start document's chunk count as well as with `fan_out^depth`. Measured on a 650-document knowledge base, against its largest document (160 chunks), with the release binary:
+- **Connection graph**: `get_connection_graph` / `kb-mcp graph` do BFS over the vector index starting from a document. No extra index is built; **each node that gets expanded runs one fresh sqlite-vec KNN**, and there is no ANN index, so one KNN scans every vector in the knowledge base.
 
-  | `depth` | KNN queries | nodes returned | wall clock |
+  Two bounds keep a request finite, and **both report themselves when they bite**:
+
+  | bound | default | ceiling | what it bounds |
   | --- | --- | --- | --- |
-  | 0 | 0 | 160 | ~0.2 s |
-  | 1 | 160 | 767 | ~12 s |
-  | 2 (default) | 767 | 1997 | ~60 s |
-  | 3 (max) | 1997 | 3682 | ~150 s |
+  | `max_seed_chunks` | 32 | 1000 | chunks of the start document used as seeds. Applied as a SQL `LIMIT`, so the rows past the cap are never read. |
+  | `max_nodes` | 100 | 2000 | nodes in the result. Each node is queued once and expands at most once, so `knn_queries <= total_nodes <= max_nodes` — this one bound caps the response size *and* the query count. |
 
-  Query and node counts are exact; wall clock is approximate and varied by around 7% between runs on the same machine.
+  `depth` (max 3) and `fan_out` (max 20) shape the walk but do **not** bound it: before these caps existed, the walk seeded from every chunk of the start document, and that count was uncapped. Measured on a 650-document knowledge base (9,419 chunks, BGE-M3) against its largest document, 160 chunks, with the release binary:
 
-  The database lock is held throughout, so a graph request on a long document delays concurrent searches. Prefer a smaller `depth` for documents you know are large. `exclude_paths` — like `search`'s `path_globs` / `tags_any` / `tags_all` — is limited to 64 entries of at most 1 KiB each.
+  | `depth` | before: KNN / nodes / wall | after (defaults): KNN / nodes / wall |
+  | --- | --- | --- |
+  | 1 | 160 / 767 / ~19 s | 14 / 100 / ~1.1 s |
+  | 2 (default) | 767 / 1997 / ~87 s | 14 / 100 / ~1.1 s |
+  | 3 (max) | 1997 / 3682 / ~200 s | 14 / 100 / ~1.1 s |
+
+  Raising both bounds to their ceilings (`--max-seed-chunks 1000 --max-nodes 2000`) reproduces the "before" column exactly, with `truncated: false` — the bounds limit the walk, they do not change what it finds.
+
+  What the caller sees when a bound bites: `truncated: true` at the root of the response, plus a `truncation` array whose entries carry `reason` (`seed_chunks` / `node_budget`), the `limit` that fired, and the remedy for that specific reason. `truncated` means *something was lost*, not *a counter reached its cap*: a walk that exhausts the graph while exactly filling the budget reports `false`. `stats.seeds_used` reports how many chunks actually seeded the walk. The CLI text renderer prints the same information on its stats line and one `!` line per reason.
+
+  Because BFS is breadth-first, the budget is spent on the shallowest layer first — on a long document the default budget fills during the depth-1 expansion, so raising `depth` alone changes nothing. To spend the budget on depth instead of breadth, use `--seed-strategy centroid` (one seed for the whole document; the same document above returns a complete depth-2 graph of 24 nodes in ~0.4 s) or lower `--max-seed-chunks` / `--fan-out`.
+
+  The database lock is held throughout, so a graph request still delays concurrent searches for as long as it runs. The bounds make that duration finite and predictable, but they are expressed in nodes, not seconds: one KNN costs about 72 ms on the knowledge base measured above, and scales with its chunk count and embedding dimension. `exclude_paths` — like `search`'s `path_globs` / `tags_any` / `tags_all` — is limited to 64 entries of at most 1 KiB each.
 
   Scores are cosine similarity approximated from L2 distance (`1 - d²/2`, clamped to `[0,1]`) assuming unit-normalized embeddings (BGE-small / BGE-M3 are normalized internally).
 - **Heading exclusion**: Sections whose heading text contains any of `exclude_headings` are dropped during chunking. The default is an empty list (keep every section); populate `exclude_headings` in `kb-mcp.toml` to opt in. Matching is substring-based (`heading.contains(pattern)`), so short patterns catch suffixed variants (`"参考リンク"` would also match `"## 参考リンク (旧)"`).

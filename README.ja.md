@@ -498,7 +498,9 @@ kb-mcp graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
 - `--depth` (既定 2、最大 3 にクランプ) — BFS のホップ数
 - `--fan-out` (既定 5、最大 20 にクランプ) — ホップあたりのノード隣接数。`0` なら seed のみ返却
 - `--min-similarity` (既定 0.3) — コサイン類似度カットオフ。`0.0..=1.0`
-- `--seed-strategy` — `all-chunks` (既定) は起点文書の全チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の仮想 seed を使う
+- `--seed-strategy` — `all-chunks` (既定) は起点文書の全チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の仮想 seed を使う (MCP ツール側の綴りは `all_chunks` / `centroid`)
+- `--max-nodes` (既定 100、最大 2000 にクランプ) — 総ノード数。KNN 実行回数もこれで縛られる
+- `--max-seed-chunks` (既定 32、`1..=1000` にクランプ) — シードに使う起点文書のチャンク数
 - `--exclude` — 結果から除外するカンマ区切りパス。起点パス自身は常に除外される
 - `--dedup-by-path` — 同一パスのヒットをまとめて各ドキュメント最大 1 回に
 - `--category` / `--topic` — 各ホップにカテゴリ / トピックフィルタを適用
@@ -808,7 +810,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `get_document` | 相対パスから文書の全文 + メタデータを取得 | `path` (例: `"deep-dive/mcp/overview.md"`) |
 | `get_best_practice` | opt-in: `kb-mcp.toml` の `[best_practice].path_templates` を設定しているときのみ機能する。対象向けの best practice 文書を取得し、任意で特定 h2 セクションを抽出。未設定時は "not configured" エラーを返す | `target` (例: `"claude-code"`)、`category` (任意) |
 | `rebuild_index` | すべてのソースファイル (Markdown + `[parsers].enabled` で有効化された拡張子) を走査してインデックス再構築 | `force` (任意、既定 false) |
-| `get_connection_graph` | ドキュメントパスを起点に意味的に関連するチャンクを BFS 展開。`parent_id` / `depth` / `score` / `snippet` 付きのノード配列を返し、呼び出し側でコンテキスト発見を連鎖させられる | `path` (必須)、`depth` (既定 2、最大 3)、`fan_out` (既定 5、最大 20)、`min_similarity` (既定 0.3)、`seed_strategy` (`all_chunks` / `centroid`)、`dedup_by_path`、`category`、`topic`、`exclude_paths` |
+| `get_connection_graph` | ドキュメントパスを起点に意味的に関連するチャンクを BFS 展開。`parent_id` / `depth` / `score` / `snippet` 付きのノード配列を返し、呼び出し側でコンテキスト発見を連鎖させられる。上限で探索が切られた場合は `truncated` / `truncation[]` が付く | `path` (必須)、`depth` (既定 2、最大 3)、`fan_out` (既定 5、最大 20)、`min_similarity` (既定 0.3)、`seed_strategy` (`all_chunks` / `centroid`)、`dedup_by_path`、`category`、`topic`、`exclude_paths`、`max_nodes` (既定 100、最大 2000)、`max_seed_chunks` (既定 32、最大 1000) |
 
 ## 補足
 
@@ -852,18 +854,30 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 - **サイズ上限**: ファイル 1 本あたり生バイト 50 MiB を、read する前に `stat` で判定する。バイナリ形式 (`MAX_RAW_BINARY_BYTES`) だけでなく **テキスト形式 (`MAX_RAW_TEXT_BYTES`、v0.17.0 以降)** にも適用される。以前テキストは無制限で、巨大な `.md` 1 本で内容が丸ごとメモリに載った — `rebuild_index` は MCP ツールなのでクライアントから誘発できた。上限超過のファイルは、どちらの上限に当たったかを明示した warning とともに skip される
 - **ハイブリッド検索 (FTS5 + ベクトル)**: `search` ツールは SQLite FTS5 全文検索 (trigram tokenizer、日本語 / CJK も動く。v0.12.0 以降は `heading` / `context` / `content` の 3 列で、bm25 では既定で `heading` を 2 倍重み) をベクトル検索と Reciprocal Rank Fusion (既定 `k = 60`) でマージする。重みと `k` は v0.13.0 以降 `[search.fusion]` で設定でき、自分の KB で動かす価値があるかは `kb-mcp tune` が測る。返される `score` は RRF スコア (大きいほど良い) で距離ではない。v0.16.0 以降、クエリは逐語で検索されるのではなく token 単位の phrase にコンパイルされて `OR` で結合される (上の「コマンドラインからの一発検索」を参照)。有効な phrase が 1 つも作れないクエリはベクトルのみにフォールバックするが、断片がすべて短いクエリはその前にクエリ全体の逐語 phrase へ fallback するので、ベクトルのみになるのは trim 後 3 文字未満 (trigram の最小値を下回る) のときだけ
 - **任意の再ランク**: `--reranker <model>` を付けると上位候補が cross-encoder で再スコアされてから返る。再ランク適用時は `score` が RRF 値ではなく cross-encoder の生スコアになる。再ランクは index 非依存 — サーバ起動時に再インデックスなしでトグル可能
-- **Connection graph**: `get_connection_graph` / `kb-mcp graph` はドキュメント起点でベクトルインデックス上を BFS する。追加インデックスは作らず、**展開されたノードごとに** sqlite-vec KNN を新規発行する。最大深度のノードは返却されるが展開されないので、クエリ数は `depth` **未満**の深度にあるノード数 — つまり 1 段浅いリクエストが返すノード数と一致する (下表で確認できる)。`depth` は 3、`fan_out` は 20 にクランプされるが、**それだけではリクエストのコストを縛れない** — BFS は起点文書の**全チャンク**を種にし、そのチャンク数に上限が無いため。コストは起点文書のチャンク数と `fan_out^depth` の両方に比例して増える。650 文書の KB で最大の文書 (160 チャンク) に対し release バイナリで実測:
+- **Connection graph**: `get_connection_graph` / `kb-mcp graph` はドキュメント起点でベクトルインデックス上を BFS する。追加インデックスは作らず、**展開されたノードごとに** sqlite-vec KNN を新規発行する。ANN 索引は無いので、KNN 1 回で KB の全ベクトルを走査する。
 
-  | `depth` | KNN クエリ数 | 返却ノード数 | 実時間 |
+  リクエストを有限に保つ上限が 2 つあり、**どちらも発火したら自己申告する**:
+
+  | 上限 | 既定 | 天井 | 何を縛るか |
   | --- | --- | --- | --- |
-  | 0 | 0 | 160 | 約 0.2 s |
-  | 1 | 160 | 767 | 約 12 s |
-  | 2 (既定) | 767 | 1997 | 約 60 s |
-  | 3 (最大) | 1997 | 3682 | 約 150 s |
+  | `max_seed_chunks` | 32 | 1000 | シードに使う起点文書のチャンク数。SQL の `LIMIT` として効くので、上限を超えた行は読まれもしない |
+  | `max_nodes` | 100 | 2000 | 結果のノード数。各ノードは 1 度しか queue に入らず高々 1 度しか展開されないので `knn_queries <= total_nodes <= max_nodes`。この 1 つで**応答サイズと KNN 実行回数の両方**が縛られる |
 
-  クエリ数とノード数は実測の確定値、実時間は概数 (同一マシンでも実行ごとに 7% 程度ぶれた)。
+  `depth` (最大 3) と `fan_out` (最大 20) は探索の**形**を決めるだけで、コストは縛らない。この上限が入る前は、BFS が起点文書の**全チャンク**を種にし、その数に上限が無かった。650 文書の KB (9,419 チャンク / BGE-M3) で最大の文書 (160 チャンク) に対し release バイナリで実測:
 
-  この間 DB ロックを保持するため、長い文書への graph リクエストは並行する検索を待たせる。大きいと分かっている文書には小さい `depth` を使うこと。`exclude_paths` は `search` の `path_globs` / `tags_any` / `tags_all` と同じく **64 件・各 1 KiB まで**。
+  | `depth` | 修正前: KNN / ノード / 実時間 | 修正後 (既定): KNN / ノード / 実時間 |
+  | --- | --- | --- |
+  | 1 | 160 / 767 / 約 19 s | 14 / 100 / 約 1.1 s |
+  | 2 (既定) | 767 / 1997 / 約 87 s | 14 / 100 / 約 1.1 s |
+  | 3 (最大) | 1997 / 3682 / 約 200 s | 14 / 100 / 約 1.1 s |
+
+  両方を天井まで開けると (`--max-seed-chunks 1000 --max-nodes 2000`)、「修正前」列が `truncated: false` で**完全に再現する** — 上限は探索を縛るだけで、探索が見つけるものを変えない。
+
+  上限が発火した時に呼び出し側が見るもの: 応答のルートに `truncated: true`、加えて `truncation` 配列に `reason` (`seed_chunks` / `node_budget`)・発火した `limit`・**その理由に対応する**対処が入る。`truncated` の意味は「**何かが失われた**」であって「カウンタが上限に達した」ではない — 予算をちょうど使い切ってフロンティアも尽きた探索は `false` を返す。`stats.seeds_used` は実際にシードになったチャンク数。CLI の text 出力も stats 行と理由ごとの `!` 行で同じ情報を出す。
+
+  BFS は幅優先なので、予算は浅い層から先に使われる。長い文書では既定の予算が depth 1 の展開で埋まるため、**`depth` だけ上げても結果は変わらない**。予算を幅でなく深さに使いたいなら `--seed-strategy centroid` (文書全体を 1 シードに畳む。上と同じ文書で depth 2 の完全なグラフが 24 ノード / 約 0.4 s) か、`--max-seed-chunks` / `--fan-out` を下げる。
+
+  実行中は DB ロックを保持するので、graph リクエストは走っている間ずっと並行検索を待たせる。上限はその時間を有限かつ予測可能にするが、単位は秒ではなくノード数である点に注意 — 上記の KB では KNN 1 回が約 72 ms で、これは KB のチャンク数と埋め込み次元に比例する。`exclude_paths` は `search` の `path_globs` / `tags_any` / `tags_all` と同じく **64 件・各 1 KiB まで**。
 
   スコアは L2 距離からの近似コサイン類似度 (`1 - d²/2` を `[0,1]` にクランプ、unit normalized embedding を前提 — BGE-small / BGE-M3 は内部で正規化済み)
 - **見出し除外**: 見出しテキストが `exclude_headings` のいずれかを含むセクションは、チャンキング時に落とされる。既定は空リスト (全セクション残す)。`kb-mcp.toml` の `exclude_headings` に substring を列挙するとオプトインになる。マッチは部分文字列 (`heading.contains(pattern)`) で、短いパターンは `"参考リンク"` → `"## 参考リンク (旧)"` のような変種も拾う

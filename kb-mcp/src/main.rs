@@ -1520,8 +1520,10 @@ fn print_graph(g: kb_mcp::graph::ConnectionGraph, format: SearchFormat) {
             // (BU-33) 打ち切りの理由と対処は text 出力でも見えるようにする。
             // ここを落とすと、CLI だけが上限の見えない経路になる。
             for t in &g.truncation {
+                // `Display`、not `Debug`: the JSON spells these `seed_chunks` /
+                // `node_budget` and the two surfaces must not disagree.
                 println!(
-                    "! truncated ({:?}, limit={}): {}",
+                    "! truncated ({}, limit={}): {}",
                     t.reason, t.limit, t.detail
                 );
             }

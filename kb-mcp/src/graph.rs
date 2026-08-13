@@ -143,6 +143,23 @@ pub enum TruncationReason {
     NodeBudget,
 }
 
+impl TruncationReason {
+    /// JSON に出るのと**同じ**綴り。CLI の text 出力が `Debug` を使うと
+    /// `NodeBudget` と `node_budget` の 2 通りが世に出てしまう。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SeedChunks => "seed_chunks",
+            Self::NodeBudget => "node_budget",
+        }
+    }
+}
+
+impl std::fmt::Display for TruncationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 発火した上限 1 件。`limit` はその理由自身の単位 (チャンク数 / ノード数)。
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphTruncation {
@@ -288,11 +305,19 @@ fn push_truncation(
 }
 
 /// node 予算が発火した時の説明文。理由と対処を一緒に運ぶ。
+///
+/// 対処を「予算を上げる」だけにしないのが要点。BFS は幅優先なので、予算は先に
+/// 浅い層で使い切られる — 実測でも、160 チャンクの文書は既定予算だと depth 1 の
+/// 展開だけで埋まり、`depth` を 2 にも 3 にしても結果が変わらなかった。
+/// **深く行きたい場合の正解は予算増ではなく、シードを減らすこと** (`centroid` /
+/// 低い `max_seed_chunks` / 低い `fan_out`)。
 fn node_budget_detail(limit: u32) -> String {
     format!(
         "the graph hit its node budget of {limit}; the walk stopped before the frontier was \
-         exhausted. Raise max_nodes, or narrow the walk with a lower depth / fan_out, a higher \
-         min_similarity, dedup_by_path, or the category / topic / exclude_paths filters."
+         exhausted. To get more nodes, raise max_nodes. To spend the budget on depth instead of \
+         breadth, use seed_strategy \"centroid\" or lower max_seed_chunks / fan_out. To get \
+         fewer but more relevant nodes, raise min_similarity, set dedup_by_path, or use the \
+         category / topic / exclude_paths filters."
     )
 }
 
@@ -1494,5 +1519,23 @@ mod tests {
         assert_eq!(v["truncated"], serde_json::json!(false));
         assert_eq!(v["truncation"], serde_json::json!([]));
         assert!(v["stats"]["seeds_used"].is_number());
+    }
+
+    /// The CLI text renderer prints the reason through `Display`, so the two
+    /// surfaces must agree on the spelling — `Debug` would emit `NodeBudget`
+    /// next to the JSON's `node_budget`.
+    #[test]
+    fn the_reason_reads_the_same_in_json_and_in_text() {
+        for r in [TruncationReason::SeedChunks, TruncationReason::NodeBudget] {
+            let json = serde_json::to_value(r).unwrap();
+            assert_eq!(
+                json.as_str().unwrap(),
+                r.to_string(),
+                "Display must match the serde spelling"
+            );
+            assert_eq!(r.as_str(), r.to_string());
+        }
+        assert_eq!(TruncationReason::SeedChunks.as_str(), "seed_chunks");
+        assert_eq!(TruncationReason::NodeBudget.as_str(), "node_budget");
     }
 }
