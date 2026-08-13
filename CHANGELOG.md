@@ -12,6 +12,89 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **`get_connection_graph` / `kb-mcp graph` are now bounded, and say so when a
+  bound bites** (BU-33). The walk had no upper limit on its cost: it seeded
+  from *every* chunk of the start document, so clamping `depth` to 3 and
+  `fan_out` to 20 never bounded a request. On a 650-document knowledge base
+  (9,419 chunks, BGE-M3) the largest document — 160 chunks — measured, with the
+  release binary:
+
+  | `depth` | before | after (defaults) |
+  | --- | --- | --- |
+  | 1 | 160 KNN / 767 nodes / ~19 s | 14 KNN / 100 nodes / ~1.1 s |
+  | 2 (default) | 767 KNN / 1997 nodes / ~87 s | 14 KNN / 100 nodes / ~1.1 s |
+  | 3 | 1997 KNN / 3682 nodes / ~200 s | 14 KNN / 100 nodes / ~1.1 s |
+
+  The call holds the database mutex throughout, so those runs delayed every
+  concurrent search; a 1997-node result was also unusable as LLM context. Nor
+  was this only about outsized documents — the *median* document (13 chunks)
+  returned 331 nodes in 7.3 s at the default depth.
+
+  Two bounds, both deterministic, exposed on the MCP tool and the CLI:
+  `max_seed_chunks` (default 32, ceiling 1000) applied as a SQL `LIMIT` so rows
+  past the cap are not read — bar one probe row, which is how truncation is
+  detected without a second query — and `max_nodes` (default 100, ceiling
+  2000), which caps the response size and the query count together because
+  each node is queued once and expands at most once
+  (`knn_queries <= total_nodes <= max_nodes`). Over-large values are clamped,
+  not rejected — the same doctrine as `depth` / `fan_out` / `limit`.
+
+  A `LIMIT` alone would not have bounded the database's work: without an index
+  on `(document_id, chunk_index)`, SQLite scanned every chunk and sorted the
+  matches before returning the first `cap + 1` rows (`EXPLAIN QUERY PLAN`:
+  `SCAN c` + `USE TEMP B-TREE FOR ORDER BY`). The index is now created on open,
+  idempotently, for new and existing databases alike — 17 ms to build on a
+  9,419-chunk index, no measurable size change, and the seed read drops from
+  8.00 ms to 0.22 ms while becoming proportional to the cap rather than to the
+  size of the knowledge base. A test asserts the query plan rather than the
+  clock.
+
+  Both bounds are needed. A node budget alone degenerates: BFS emits every seed
+  before any neighbour, so on that 160-chunk document any budget of 160 or less
+  returned a connection graph with **zero connections** (at exactly 160 the
+  seeds fit and the first neighbour is the one refused).
+
+  Truncation is reported in band — `truncated: bool` at the root of the
+  response plus a `truncation` array carrying `reason` (`seed_chunks` /
+  `node_budget`), the `limit` that fired, and the remedy for that specific
+  reason, since MCP offers no cursor with which to ask for the rest.
+  `truncated` means *something was lost*, not *a counter reached its cap*: a
+  walk that exhausts the graph while exactly filling the budget reports
+  `false`. `stats` gains `seeds_used`, and the CLI text output gains the same
+  fields plus one `!` line per reason.
+
+  Defaults come from measurement: ~72 ms per KNN, ~4 ms per node, ~665 B of
+  JSON per node, and a chunks-per-document distribution of median 13 / p90 26 /
+  p99 43 / max 160. So 32 seeds trims 4.0% of documents, and 100 nodes bounds a
+  request at `100 × 72 ms + 100 × 4 ms` = ~7.6 s / ~65 KiB. The measured runs
+  land well under that bound (1.1 s) because the budget fills partway through
+  the seed expansion, at 14 KNN rather than 100.
+
+  **Callers who want the old behaviour** can ask for it:
+  `--max-seed-chunks 1000 --max-nodes 2000` reproduces the depth-1 and depth-2
+  rows exactly, with `truncated: false`. That holds for any walk that stayed
+  within both ceilings — a document of at most 1000 chunks whose graph came to
+  at most 2000 nodes; larger walks are truncated, and say so. Two things are no longer reachable by anyone: exhaustive seeding of
+  documents larger than 1000 chunks, and results larger than 2000 nodes — the
+  depth-3 row above is 3,682 nodes, so at the ceiling it returns 2,000 nodes in
+  ~59 s with `truncated: true`.
+
+  Because BFS spends the budget breadth-first, raising `depth` alone no longer
+  changes the result for a long start document; `seed_strategy: "centroid"` is
+  the way to spend the budget on depth (a depth-2 graph of the same document:
+  24 nodes in ~0.4 s). Note that `max_seed_chunks` bounds the *read*, so
+  `centroid` averages the same capped prefix — it frees the node budget, it
+  does not recover chunks the seed cap dropped.
+
+### Fixed
+
+- `kb-mcp graph --seed-strategy`'s help text advertised `all_chunks`, but clap
+  derives kebab-case values, so only `all-chunks` was accepted and copying the
+  help text produced `error: invalid value`. The help now matches what the flag
+  takes, and notes that the MCP tool spells it `all_chunks`.
+
 ## [0.18.0] - 2026-08-13
 
 ### Added

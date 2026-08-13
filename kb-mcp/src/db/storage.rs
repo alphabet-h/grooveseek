@@ -13,6 +13,10 @@
 
 use super::*;
 
+/// 1 チャンクを「BFS のシード」として扱う時の形: `(chunk_id, embedding, 中身)`。
+/// `chunks_for_path*` の戻り値の要素型。
+pub type SeedChunk = (i64, Vec<f32>, SearchResult);
+
 impl Database {
     /// Insert or update a document row. On update the old chunks (and their
     /// vec_chunks entries) are deleted so the caller can re-insert fresh ones.
@@ -294,10 +298,45 @@ impl Database {
     /// 指定 `path` に属するチャンクを (chunk_id, embedding, SearchResult) で返す。
     /// Connection Graph の起点シード取得用。存在しなければ empty Vec。
     ///
+    /// 上限なし。**新規の呼び出しは [`Self::chunks_for_path_limited`] を使うこと**
+    /// (BU-33: 1 文書のチャンク数に上限が無く、160 チャンクの文書が 160 個の
+    /// シードになって BFS のコストを決めていた)。本メソッドは既存呼び出し互換の
+    /// ために残した薄い委譲。
+    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<SeedChunk>> {
+        self.chunks_for_path_limited(path, u32::MAX)
+    }
+
+    /// 起点チャンクを **最大 `cap` 件**返し、「まだ続きがあるか」を第 2 要素で返す
+    /// (BU-33)。
+    ///
+    /// `cap + 1` 件を SQL に要求して 1 件多く返ってきたかで判定する。呼び出し側で
+    /// `+1` を書かせないのは、そこが「上限を SQL に降ろす」唯一の接点だからで、
+    /// 引数を素通しにすると *cap を無視した読み取り* が結果を変えずに書けてしまう
+    /// (= テストで検出できない退行になる)。
+    ///
+    /// **代償はプローブ行 1 行**: 打ち切りが起きている時、`cap + 1` 行目は
+    /// embedding を JSON 経由で `Vec<f32>` に復元し本文も複製してから捨てられる
+    /// (1024 次元で約 4 KB)。「上限を超えた行は読まない」は**厳密には 1 行ぶん
+    /// 嘘**なので、docs でもそう書いている。追加クエリ 1 本 (`COUNT(*)`) との
+    /// 交換で、1 行の無駄読みの方が安いと判断した。
+    pub fn chunks_for_path_capped(&self, path: &str, cap: u32) -> Result<(Vec<SeedChunk>, bool)> {
+        let mut rows = self.chunks_for_path_limited(path, cap.saturating_add(1))?;
+        let has_more = rows.len() > cap as usize;
+        rows.truncate(cap as usize);
+        Ok((rows, has_more))
+    }
+
+    /// [`Self::chunks_for_path`] に SQL 側の `LIMIT` を付けたもの。
+    ///
+    /// 打ち切りを **SQL に降ろす**のが要点で、Rust 側の `.take(n)` では意味が無い
+    /// (行はすべて `vec_to_json` でテキスト化され、`Vec<f32>` に parse され、
+    /// チャンク本文ごと materialize されてから捨てられる = BU-33 が名指しした
+    /// 「上限の無い読み取り」がそのまま残る)。
+    ///
     /// `embedding` は `vec_to_json` で JSON 文字列として取り出し、serde_json で
     /// `Vec<f32>` に復元する。`SearchResult.score` はシード node 用に 1.0 を入れる
     /// (BFS 結果のスコアと同じ意味 = cos sim 換算値の上限)。
-    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, Vec<f32>, SearchResult)>> {
+    fn chunks_for_path_limited(&self, path: &str, limit: u32) -> Result<Vec<SeedChunk>> {
         let sql = "
             SELECT c.id, vec_to_json(v.embedding),
                    c.content, c.heading, c.document_id,
@@ -307,9 +346,10 @@ impl Database {
             JOIN vec_chunks v ON v.chunk_id = c.id
             WHERE d.path = ?1
             ORDER BY c.chunk_index
+            LIMIT ?2
         ";
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![path], |row| {
+        let rows = stmt.query_map(params![path, limit as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
