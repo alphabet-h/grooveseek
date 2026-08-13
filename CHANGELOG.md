@@ -2,9 +2,17 @@
 
 All notable changes to kb-mcp are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer's timezone (JST). Verify with `TZ=Asia/Tokyo git for-each-ref --format='%(taggerdate:format-local:%Y-%m-%d)' refs/tags/vX.Y.Z` — `format-local` renders in *your* timezone, so the `TZ` prefix is what makes the answer JST rather than wherever you happen to be. Writing the date before tagging is the other way the two drift apart.
+Each heading's date is the date its `vX.Y.Z` tag was created, **in the timezone of whoever created it** — that offset is stored in the tag object, so no conversion is involved. Verify with:
+
+```
+git for-each-ref --format='%(taggerdate:short)' refs/tags/vX.Y.Z
+```
+
+Do not reach for `format-local` here: it renders in the *reader's* timezone, so it answers a different question and gives a different day for tags made near midnight. Writing the date before tagging is the other way the two drift apart.
 
 ## [Unreleased]
+
+## [0.18.0] - 2026-08-13
 
 ### Added
 
@@ -2477,6 +2485,7 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
 [Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.17.0...HEAD
+[0.18.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.15.2...v0.16.0
 [0.15.2]: https://github.com/alphabet-h/kb-mcp/compare/v0.15.1...v0.15.2
