@@ -6,6 +6,35 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
 
 ## [Unreleased]
 
+### Added
+
+- **The query tokenizer's accepted roughness and its trigram floor are now
+  pinned by tests** (BU-27, BU-28). No behaviour changes; both were documented
+  only in prose, which meant a future change could alter either one and nothing
+  would say whether the new behaviour was intended.
+
+  `fts_query`'s module doc lists four places where the character-class split is
+  knowingly coarse — CJK beyond the basic ranges, no Unicode normalization, the
+  asymmetry between the full-width and half-width middle dot, and punctuation-
+  only runs becoming phrases. Four `accepted_roughness_*` tests now record the
+  current answers, so a change there shows up as a decision rather than a
+  surprise. Each was confirmed to fail against a one-range edit to `classify`.
+
+  Writing them corrected the documentation twice. `𠮷野家` does split into two
+  runs as documented, but the short-run merge puts it back together, so the
+  phrase output is unchanged — the split only becomes visible when both sides
+  are long enough, as in `𠮷野家具店` → `["𠮷野家具店", "野家具店"]`. The doc now
+  says which is which.
+
+  `MIN_PHRASE_CHARS = 3` is now justified against SQLite rather than against
+  itself: a test inserts into a real FTS5 trigram table and checks that a
+  two-character phrase matches nothing while a three-character one matches.
+  Every other test in that module assumes the floor is 3, so all of them would
+  keep passing if the tokenizer were swapped for one with a different floor —
+  they would agree with each other while silently disagreeing with SQLite.
+  Swapping `trigram` for `unicode61` in the schema kills the new test and
+  nothing else.
+
 ### Changed
 
 - **`match_spans` now has a contract, and it changes what clients receive**
