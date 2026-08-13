@@ -40,8 +40,15 @@
 //!
 //! # 許容している粗さ (A-11 = 形態素解析を検討するときの材料)
 //!
+//! **(BU-27) 以下はすべて `accepted_roughness_*` テストで固定してある。** 挙動を変えたら
+//! そこが落ちるので、「意図した変更」と「事故」を区別できる。テストが落ちたときは
+//! テストとこの一覧を**両方**直すこと。
+//!
 //! - CJK 拡張 B 以降 (U+20000..) は [`CharClass::Kanji`] に入れていないので、`𠮷野家` は
-//!   run が割れる。同様に U+3007 (〇) も `Nl` カテゴリなので `OtherWord` に落ちる
+//!   **run が割れる** (`["𠮷", "野家"]`)。ただし短 run の連結が繋ぎ直すため phrase は
+//!   `["𠮷野家"]` のままで、分割は見えない。見えるのは両側が十分長いとき —
+//!   `𠮷野家具店` は `["𠮷野家具店", "野家具店"]` になる。同様に U+3007 (〇) も `Nl`
+//!   カテゴリなので `OtherWord` に落ち、`東京〇丁目` の漢字 run を 2 つに割る
 //! - Unicode 正規化を一切しない。NFD の `バ` は `ハ` + 結合濁点 (U+3099、Hiragana 範囲) なので
 //!   run 境界が入力の正規化形に依存する。連結は連続部分文字列を保つので検索は壊れないが、
 //!   phrase の切れ目は変わる
@@ -54,6 +61,11 @@
 ///
 /// これ未満の phrase は FTS5 でエラーにならず**恒久的に 0 件**を返す
 /// (SQLite fts5.html#the_trigram_tokenizer)。無効な節を送っても損しかしないので式から落とす。
+///
+/// (BU-28) この根拠自体は `db::tests::the_trigram_tokenizer_is_why_short_phrases_are_dropped`
+/// が**実際の FTS5 テーブルに問い合わせて**固定している。本モジュールのテストは全部この
+/// 3 という値を前提に書かれているので、tokenizer を差し替えると**全部緑のまま意味だけが
+/// 消える** — 値ではなく理由を検査するテストが別に要る、というのがその 1 本の存在理由。
 const MIN_PHRASE_CHARS: usize = 3;
 
 /// OR で並べる phrase 数の上限 (DoS / 式肥大ガード。AU-17 の list 上限の前例に倣う)。
@@ -476,6 +488,133 @@ mod tests {
         for c in [' ', '\u{3000}', ':', '"', '。', '\0'] {
             assert_eq!(classify(c), CharClass::Separator, "{c:?}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // (BU-27) The roughness this tokenizer accepts.
+    //
+    // The module doc lists four places where the character-class split is
+    // knowingly coarse. Until now that list lived only in prose, so a future
+    // change could quietly alter any of them and nothing would say whether the
+    // new behaviour was the intent or an accident. These tests pin the
+    // *current* answers — they are not asserting that the behaviour is good.
+    // A failure here means "you changed an accepted roughness"; decide
+    // deliberately, then update both the test and the module doc.
+    //
+    // Every expectation below was observed by running, not derived from the
+    // prose, so the prose is checked too.
+    // -----------------------------------------------------------------------
+
+    /// CJK Extension B and U+3007 fall outside `Kanji`, so they break runs.
+    ///
+    /// The run split is the roughness; whether it is *visible* in the phrase
+    /// output depends on the lengths involved, because short runs are merged
+    /// back together afterwards. Both cases are pinned, since the difference
+    /// between them is the kind of thing a reader gets wrong — the first draft
+    /// of this test asserted `𠮷野家` yields `野家`, and it does not.
+    #[test]
+    fn accepted_roughness_cjk_beyond_the_basic_ranges_splits_runs() {
+        // U+20BB7 (𠮷) is Extension B: not in any range `classify` calls Kanji,
+        // so it lands in OtherWord and splits away from the kanji beside it.
+        assert_eq!(classify('\u{20BB7}'), CharClass::OtherWord);
+        assert_eq!(classify('野'), CharClass::Kanji);
+        assert_eq!(
+            split_runs("\u{20BB7}野家")
+                .iter()
+                .map(|r| r.text)
+                .collect::<Vec<_>>(),
+            vec!["\u{20BB7}", "野家"],
+            "the run boundary is the accepted roughness"
+        );
+
+        // Short enough, and the merge puts it back together: the split leaves
+        // no trace in the phrases.
+        assert_eq!(
+            query_phrases("\u{20BB7}野家"),
+            vec!["\u{20BB7}野家".to_string()]
+        );
+        // Long enough, and it shows: the independent emit yields the kanji tail
+        // on its own, which a document containing only 野家具店 will match.
+        assert_eq!(
+            query_phrases("\u{20BB7}野家具店"),
+            vec!["\u{20BB7}野家具店".to_string(), "野家具店".to_string()]
+        );
+
+        // U+3007 (〇) is Nl, so `is_alphanumeric` claims it and it becomes
+        // OtherWord rather than Kanji — despite reading as a kanji numeral. It
+        // therefore splits a kanji run in two.
+        assert_eq!(classify('\u{3007}'), CharClass::OtherWord);
+        assert_eq!(
+            split_runs("東京\u{3007}丁目")
+                .iter()
+                .map(|r| r.text)
+                .collect::<Vec<_>>(),
+            vec!["東京", "\u{3007}", "丁目"]
+        );
+        assert_eq!(
+            classify('々'),
+            CharClass::Kanji,
+            "U+3005 IS treated as kanji"
+        );
+        assert_eq!(
+            classify('〆'),
+            CharClass::Kanji,
+            "U+3006 IS treated as kanji"
+        );
+    }
+
+    /// No Unicode normalization, so the decomposed form splits differently.
+    #[test]
+    fn accepted_roughness_normalization_changes_where_runs_break() {
+        // NFC: one Katakana character.
+        let composed = "\u{30D0}\u{30C3}\u{30C6}\u{30EA}"; // バッテリ
+        // NFD: ハ + combining voiced mark, and U+3099 sits inside the Hiragana
+        // range, so the run breaks in the middle of what reads as one word.
+        let decomposed = "\u{30CF}\u{3099}\u{30C3}\u{30C6}\u{30EA}";
+        assert_eq!(classify('\u{3099}'), CharClass::Hiragana);
+        assert_ne!(
+            query_phrases(composed),
+            query_phrases(decomposed),
+            "the composed and decomposed spellings of the same word must be \
+             observed to split differently — if they ever agree, normalization \
+             was added and the module doc needs updating"
+        );
+    }
+
+    /// The full-width middle dot joins a run; the half-width one does not.
+    #[test]
+    fn accepted_roughness_the_two_middle_dots_are_asymmetric() {
+        assert_eq!(
+            classify('\u{30FB}'),
+            CharClass::Katakana,
+            "full-width ・ is inside the Katakana range, so it does not split"
+        );
+        assert_eq!(
+            classify('\u{FF65}'),
+            CharClass::Separator,
+            "half-width ･ is just below the half-width Katakana range, so it does"
+        );
+        assert_eq!(
+            query_phrases("クロス\u{30FB}エンコーダ"),
+            vec!["クロス・エンコーダ".to_string()],
+            "full-width: one phrase"
+        );
+        assert_eq!(
+            query_phrases("クロス\u{FF65}エンコーダ"),
+            vec!["クロス".to_string(), "エンコーダ".to_string()],
+            "half-width: two phrases"
+        );
+    }
+
+    /// A run of pure punctuation still becomes a phrase.
+    #[test]
+    fn accepted_roughness_punctuation_only_runs_become_phrases() {
+        // '-' and '_' are explicitly OtherWord so identifiers stay whole, which
+        // also means a Markdown horizontal rule is a legal phrase.
+        assert_eq!(query_phrases("---"), vec!["---".to_string()]);
+        assert_eq!(query_phrases("___"), vec!["___".to_string()]);
+        // Below the trigram floor, the usual rule still applies.
+        assert!(query_phrases("--").is_empty());
     }
 
     #[test]

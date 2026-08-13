@@ -1919,6 +1919,63 @@ mod tests {
         assert!(err.to_string().contains("float[384]"));
     }
 
+    /// (BU-28) The reason `MIN_PHRASE_CHARS` is 3, asserted against the
+    /// tokenizer rather than against the constant.
+    ///
+    /// `fts_query.rs` drops phrases shorter than three characters because the
+    /// trigram tokenizer cannot match them — such a phrase is not an error, it
+    /// simply returns nothing, forever. Every test in that module encodes that
+    /// floor, and all of them would keep passing if the tokenizer were swapped
+    /// for one with a different floor: they would agree with each other while
+    /// silently disagreeing with SQLite.
+    ///
+    /// So this asks the tokenizer directly. If it ever starts matching a
+    /// two-character phrase, this fails and `MIN_PHRASE_CHARS` is the thing to
+    /// revisit — not this test.
+    #[test]
+    fn the_trigram_tokenizer_is_why_short_phrases_are_dropped() {
+        let db = db_with_384();
+        db.conn
+            .execute(
+                "INSERT INTO fts_chunks(rowid, heading, context, content) VALUES (1, '', '', ?1)",
+                ["alpha beta gamma"],
+            )
+            .unwrap();
+
+        let matches = |phrase: &str| -> u32 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH ?1",
+                    [format!("\"{phrase}\"")],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("MATCH {phrase:?} failed: {e}"))
+        };
+
+        // Three characters and up: the tokenizer can see them.
+        for phrase in ["alp", "alph", "alpha", "eta gam"] {
+            assert_eq!(
+                matches(phrase),
+                1,
+                "{phrase:?} is at least 3 characters and occurs in the content, \
+                 so the trigram tokenizer must match it"
+            );
+        }
+
+        // Below three: silently empty. Not an error — which is exactly why the
+        // query compiler has to drop these itself.
+        for phrase in ["a", "al", "ph"] {
+            assert_eq!(
+                matches(phrase),
+                0,
+                "{phrase:?} is below the trigram floor, so it must match nothing \
+                 even though it is a substring of the content. If this now \
+                 returns 1, the tokenizer changed and MIN_PHRASE_CHARS in \
+                 fts_query.rs no longer has a reason to be 3"
+            );
+        }
+    }
+
     /// Helper: FTS row count (contentless でも COUNT は通る)
     fn fts_count(db: &Database) -> u32 {
         db.conn
