@@ -207,7 +207,7 @@ and who can reach it:
 
 | Field | From an untrusted config |
 | --- | --- |
-| `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. |
+| `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. (Related: `FASTEMBED_CACHE_DIR` must be an absolute path, and the model directory is never resolved relative to the working directory.) |
 | `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts` and `healthz_public` are dropped, restoring the loopback-only `Host` check. `kind` is honoured. |
 | `kb_path` | **Ignored with a warning** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. `--kb-path` still applies, so you can override it; with neither, the command stops with the usual "`--kb-path` is required". |
 

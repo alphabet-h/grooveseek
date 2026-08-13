@@ -151,6 +151,9 @@ fn resolve_cache_dir() -> Result<PathBuf> {
 ///
 /// - 空の `FASTEMBED_CACHE_DIR` は**未設定として扱う**。`PathBuf::from("")` は
 ///   相対パスであり、そのまま返すと読み込み先が CWD になる
+/// - **相対パスの `FASTEMBED_CACHE_DIR` は拒否する**。空文字だけを弾いても
+///   `FASTEMBED_CACHE_DIR=.fastembed_cache` のような値が同じ結果 (CWD 起点) を
+///   生むので、「CWD 相対にはならない」という保証が嘘になる
 /// - どちらの候補も無い場合は**エラー**。以前はここで fastembed 既定の
 ///   `.fastembed_cache` (CWD 相対) に落ちていた。共有 temp の固定パスを
 ///   発明するのも同じ穴を別の形で開けるだけなので、**安全な場所を名指し
@@ -159,7 +162,16 @@ fn cache_dir_from(env: Option<std::ffi::OsString>, os_cache: Option<PathBuf>) ->
     if let Some(dir) = env
         && !dir.is_empty()
     {
-        return Ok(PathBuf::from(dir));
+        let dir = PathBuf::from(dir);
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "FASTEMBED_CACHE_DIR must be an absolute path, got {}.\n\
+             A relative value resolves against the working directory, which may be a \
+             directory you do not control; model files are loaded from it without \
+             verification.",
+            dir.display()
+        );
+        return Ok(dir);
     }
     if let Some(base) = os_cache {
         return Ok(base.join("fastembed"));
@@ -328,13 +340,25 @@ impl Reranker {
 mod tests {
     use super::*;
 
+    /// An absolute path for the current platform. `/models` is NOT absolute on
+    /// Windows — it is drive-relative, so it still depends on process state —
+    /// which is exactly why the check uses `is_absolute()` rather than
+    /// `has_root()`.
+    fn abs(tail: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from("C:\\").join(tail)
+        } else {
+            PathBuf::from("/").join(tail)
+        }
+    }
+
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes
     /// the model directory the process's working directory — which is the
     /// directory a planted config is trying to get models loaded from. An
     /// empty variable is not a directory, so it falls through as if unset.
     #[test]
     fn an_empty_cache_dir_variable_is_treated_as_unset() {
-        let os_cache = PathBuf::from("/os/cache");
+        let os_cache = abs("os/cache");
 
         assert_eq!(
             cache_dir_from(Some(std::ffi::OsString::from("")), Some(os_cache.clone())).unwrap(),
@@ -349,11 +373,32 @@ mod tests {
             err.to_string().contains("FASTEMBED_CACHE_DIR"),
             "the error must name the remedy: {err}"
         );
-        // A real value still wins over the OS cache.
+        // A real absolute value still wins over the OS cache.
+        let models = abs("models");
         assert_eq!(
-            cache_dir_from(Some(std::ffi::OsString::from("/models")), Some(os_cache)).unwrap(),
-            PathBuf::from("/models")
+            cache_dir_from(
+                Some(std::ffi::OsString::from(models.as_os_str())),
+                Some(os_cache)
+            )
+            .unwrap(),
+            models
         );
+    }
+
+    /// Emptiness was only half the rule. A non-empty *relative* override —
+    /// `FASTEMBED_CACHE_DIR=.fastembed_cache` is the natural one to write —
+    /// resolves against the working directory just the same, which would make
+    /// the guarantee above false.
+    #[test]
+    fn a_relative_cache_dir_override_is_rejected() {
+        for value in [".fastembed_cache", "models", "../shared-cache"] {
+            let err = cache_dir_from(Some(std::ffi::OsString::from(value)), Some(abs("os/cache")))
+                .expect_err("a relative override resolves against the working directory");
+            assert!(
+                err.to_string().contains("absolute"),
+                "the error must say what is wrong with {value:?}: {err}"
+            );
+        }
     }
 
     #[test]

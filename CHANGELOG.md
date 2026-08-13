@@ -64,8 +64,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Separately, the model directory is now never working-directory-relative:
   `resolve_cache_dir`'s last fallback used to be `./.fastembed_cache`, so a
   checkout with a planted cache could supply model bytes even with no config
-  file at all. An empty `FASTEMBED_CACHE_DIR` no longer counts as set, for the
-  same reason. Where no absolute directory can be determined, embedding
+  file at all. `FASTEMBED_CACHE_DIR` must now be a non-empty **absolute** path
+  for the same reason — an empty value and a relative one both resolve against
+  the working directory. Where no absolute directory can be determined, embedding
   commands stop with a message naming the variable; commands that load no model
   are unaffected.
 
