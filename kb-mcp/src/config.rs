@@ -611,22 +611,21 @@ impl Config {
                 );
             }
         } else {
-            let Some(safe_cache) = roots.cache_dir.as_ref().map(|d| d.join("fastembed")) else {
-                anyhow::bail!(
-                    "cannot determine a cache directory for embedding models, so the model \
-                     directory named by {} cannot be safely replaced.\n\
-                     This config was found by kb-mcp itself (not named with --config), so its \
-                     directory is treated as untrusted. Set FASTEMBED_CACHE_DIR to a directory \
-                     you control, or pass --config {} to accept the config as written.",
-                    shown.display(),
-                    shown.display(),
-                );
+            // 差し替え先が決まらない場合は**落とすだけ**にして、ここでは止めない。
+            // 止めてしまうと、モデルを一切使わない `validate` のようなコマンドまで
+            // 「近くに config があった」だけで動かなくなる。落としておけば、
+            // 実際にモデルを読むコマンドが `embedder::cache_dir_from` の側で
+            // 明確なエラーになる — そこは CWD 相対に落ちない契約になっている。
+            let safe_cache = roots.cache_dir.as_ref().map(|d| d.join("fastembed"));
+            let previous = match safe_cache.clone() {
+                Some(safe) => self.fastembed_cache_dir.replace(safe),
+                None => self.fastembed_cache_dir.take(),
             };
-            if let Some(dir) = self.fastembed_cache_dir.replace(safe_cache.clone()) {
+            if let Some(dir) = previous {
                 tracing::warn!(
                     config = %shown.display(),
                     requested = %dir.display(),
-                    using = %safe_cache.display(),
+                    using = safe_cache.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none -- set FASTEMBED_CACHE_DIR)".into()),
                     "ignoring fastembed_cache_dir from a config found in an untrusted location \
                      (it selects which model file is loaded); pass --config to accept it"
                 );
@@ -671,18 +670,24 @@ impl Config {
         // 「閉じ込める」のではなく「境界を弾く」— `<home>/Documents` のような
         // 具体的な指定は通す。塞ぐのはユーザ名を知らなくても書ける昇格
         // (`../..` / `/` / `C:\Users` / `/home` と、それらへの symlink)。
+        //
+        // **落とすだけで、ここでは止めない。** CLI の `--kb-path` は config より
+        // 優先される (documented) ので、`kb-mcp validate --kb-path /safe` が
+        // 「使われもしない config の値」のせいで失敗するのは筋が通らない。
+        // 落とした結果 CLI にも指定が無ければ、`require_kb_path` が
+        // 「--kb-path is required」で止める — 危険な値が使われないことは
+        // 変わらず、正当な上書きだけが通るようになる。
         if let Some(kb) = self.kb_path.as_deref()
             && let Some(reason) = forbidden_kb_path(kb, config_dir, roots)
         {
-            anyhow::bail!(
-                "refusing kb_path {} from {}: {reason}.\n\
-                 This config was found by kb-mcp itself (not named with --config), so its \
-                 directory is treated as untrusted. Pass --config {} to accept it, or point \
-                 kb_path at a specific directory.",
-                kb.display(),
-                shown.display(),
-                shown.display(),
+            tracing::warn!(
+                config = %shown.display(),
+                requested = %kb.display(),
+                reason,
+                "ignoring kb_path from a config found in an untrusted location; \
+                 pass --kb-path, or --config to accept the config as written"
             );
+            self.kb_path = None;
         }
 
         Ok(())
@@ -2679,18 +2684,22 @@ lambda = 0.5
     /// past it, rather than hitting the same abort because the check ran before
     /// the variable was ever consulted.
     #[test]
-    fn the_cache_rule_honours_an_existing_env_override_before_demanding_a_cache_dir() {
+    fn the_cache_rule_never_leaves_a_planted_value_in_place() {
         let dir = TempDir::new("kb-mcp-untrusted-cache-env");
         std::fs::write(dir.path().join("kb-mcp.toml"), planted_toml("kb")).unwrap();
 
-        // No OS cache directory and no override: we cannot name a safe
-        // location, so we stop instead of inventing a shared-temp path.
+        // No OS cache directory and no override: no safe substitute can be
+        // named, so the planted value is dropped rather than replaced.
+        // Discovery still succeeds — a command that never loads a model
+        // (`validate`) must not fail because a config happened to be nearby.
+        // The ones that do load a model stop inside `embedder::cache_dir_from`,
+        // which never resolves to a working-directory-relative path.
         let no_cache = TrustRoots::new_with_cache(None, None, false);
-        let err = Config::discover_in(None, dir.path(), None, &no_cache)
-            .expect_err("no safe cache directory can be named");
+        let d = Config::discover_in(None, dir.path(), None, &no_cache)
+            .expect("a command that needs no model must still run");
         assert!(
-            err.to_string().contains("FASTEMBED_CACHE_DIR"),
-            "the error must name the remedy: {err}"
+            d.config.fastembed_cache_dir.is_none(),
+            "the planted value must not survive"
         );
 
         // Following that advice works: with the variable set, the config's own
@@ -2764,8 +2773,13 @@ lambda = 0.5
         );
     }
 
+    /// The planted value must not be used — but dropping it, rather than
+    /// aborting, is what lets `--kb-path /safe` still work. CLI over config is
+    /// documented precedence, and a value that is never used should not fail a
+    /// command that does not need it. With nothing on the command line either,
+    /// `require_kb_path` stops the run with its own message.
     #[test]
-    fn an_untrusted_config_pointing_at_home_is_refused_outright() {
+    fn an_untrusted_config_pointing_at_home_loses_its_kb_path() {
         let dir = TempDir::new("kb-mcp-untrusted-kbpath");
         let home = TempDir::new("kb-mcp-untrusted-home");
         // An absolute kb_path at the home directory: the vector that hands the
@@ -2774,13 +2788,11 @@ lambda = 0.5
         std::fs::write(dir.path().join("kb-mcp.toml"), planted_toml(&kb)).unwrap();
         let roots = roots_for(None, Some(home.path()));
 
-        let err = Config::discover_in(None, dir.path(), None, &roots)
-            .expect_err("kb_path is the one fatal rule");
-        let msg = err.to_string();
-        assert!(msg.contains("refusing kb_path"), "{msg}");
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discovery continues");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
         assert!(
-            msg.contains("--config"),
-            "the error must name the way to accept it: {msg}"
+            d.config.kb_path.is_none(),
+            "the refused path must not survive into the effective config"
         );
     }
 

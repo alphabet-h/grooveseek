@@ -49,13 +49,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   | --- | --- |
   | `fastembed_cache_dir` | ignored with a warning, standard cache used |
   | `[transport.http]` | non-loopback bind keeps its port and moves to `127.0.0.1`; `allowed_hosts` / `healthz_public` dropped |
-  | `kb_path` | **start-up error** for filesystem roots, the home directory, its ancestors, and ancestors of the config's own directory |
+  | `kb_path` | **ignored with a warning** for filesystem roots, the home directory, its ancestors, and ancestors of the config's own directory — `--kb-path` still overrides, and with neither the command stops as usual |
 
   The `kb_path` rule bounds rather than confines — `./docs` and
   `/srv/kb/knowledge-base` still work, so the shipped `personal` recipe (a
-  project-root toml naming an absolute path) is untouched. Only `kb_path` is
-  fatal: refusing on the other two would kill the Windows daemon with no output
-  at all, since `kb-mcp-svc` spawns it with stdio set to null.
+  project-root toml naming an absolute path) is untouched.
+
+  No rule aborts start-up. A refusal would kill the Windows daemon with no
+  output at all (`kb-mcp-svc` spawns it with stdio set to null), and would let
+  an unused config value fail a command that never needed it — `kb-mcp validate
+  --kb-path /safe` should not care what a nearby config says. Dropping the
+  value keeps the dangerous input out either way.
+
+  Separately, the model directory is now never working-directory-relative:
+  `resolve_cache_dir`'s last fallback used to be `./.fastembed_cache`, so a
+  checkout with a planted cache could supply model bytes even with no config
+  file at all. An empty `FASTEMBED_CACHE_DIR` no longer counts as set, for the
+  same reason. Where no absolute directory can be determined, embedding
+  commands stop with a message naming the variable; commands that load no model
+  are unaffected.
 
   **Compatibility.** Installed services are unaffected: all three backends set
   their working directory to a config home and start `serve` without

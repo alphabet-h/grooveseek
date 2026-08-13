@@ -204,7 +204,7 @@ bind = "127.0.0.1:3100"
 | --- | --- |
 | `fastembed_cache_dir` | 警告して無視し、標準のキャッシュディレクトリを使う。どの `.onnx` を読むかを決める値であり、キャッシュに既にあるモデルは検証されないため |
 | `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` と `healthz_public` は破棄し、loopback 限定の `Host` チェックに戻す。`kind` は尊重する |
-| `kb_path` | **起動エラー**。ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指している場合 |
+| `kb_path` | ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指していれば**警告して無視**。`--kb-path` は従来どおり効くので上書きでき、どちらも無ければ通常どおり「`--kb-path` is required」で停止する |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
 `kb_path = "/srv/kb/knowledge-base"` も通る (project-local な `kb-mcp.toml` に

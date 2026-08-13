@@ -209,7 +209,7 @@ and who can reach it:
 | --- | --- |
 | `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. |
 | `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts` and `healthz_public` are dropped, restoring the loopback-only `Host` check. `kind` is honoured. |
-| `kb_path` | **Start-up error** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. |
+| `kb_path` | **Ignored with a warning** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. `--kb-path` still applies, so you can override it; with neither, the command stops with the usual "`--kb-path` is required". |
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
 `kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local

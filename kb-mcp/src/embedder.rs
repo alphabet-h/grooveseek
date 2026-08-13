@@ -104,7 +104,7 @@ impl Embedder {
         );
         let model = TextEmbedding::try_new(
             InitOptions::new(choice.fastembed_model())
-                .with_cache_dir(resolve_cache_dir())
+                .with_cache_dir(resolve_cache_dir()?)
                 .with_show_download_progress(true),
         )?;
         Ok(Self { model, choice })
@@ -136,7 +136,7 @@ impl Embedder {
     }
 }
 
-fn resolve_cache_dir() -> PathBuf {
+fn resolve_cache_dir() -> Result<PathBuf> {
     cache_dir_from(std::env::var_os("FASTEMBED_CACHE_DIR"), dirs::cache_dir())
 }
 
@@ -144,21 +144,33 @@ fn resolve_cache_dir() -> PathBuf {
 /// テストが `set_var` を呼ばずに済ませるため (`cargo test` は同一プロセスの
 /// 並列スレッドで走るので、env を触るテストは並走する全テストに影響する)。
 ///
-/// **空の `FASTEMBED_CACHE_DIR` は「未設定」として扱う** (BU-07)。
-/// `PathBuf::from("")` は相対パスなので、そのまま返すとモデルの読み込み先が
-/// **プロセスの CWD** になる。信頼していないディレクトリで実行された場合、
-/// そこに置かれたキャッシュ構造がそのまま使われてしまう。空文字はディレクトリの
-/// 指定ではないので、指定が無かったものとして次の候補へ落とす。
-fn cache_dir_from(env: Option<std::ffi::OsString>, os_cache: Option<PathBuf>) -> PathBuf {
+/// **モデルの読み込み先が CWD 相対になることは無い** (BU-07)。ここは
+/// 「どの `.onnx` を ONNX Runtime に渡すか」を決める場所で、hf-hub は
+/// キャッシュに在るファイルを検証せずに使う。CWD は信頼できない
+/// ディレクトリでありうる (clone したリポジトリ等) ので:
+///
+/// - 空の `FASTEMBED_CACHE_DIR` は**未設定として扱う**。`PathBuf::from("")` は
+///   相対パスであり、そのまま返すと読み込み先が CWD になる
+/// - どちらの候補も無い場合は**エラー**。以前はここで fastembed 既定の
+///   `.fastembed_cache` (CWD 相対) に落ちていた。共有 temp の固定パスを
+///   発明するのも同じ穴を別の形で開けるだけなので、**安全な場所を名指し
+///   できないなら止まる**
+fn cache_dir_from(env: Option<std::ffi::OsString>, os_cache: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(dir) = env
         && !dir.is_empty()
     {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
     }
     if let Some(base) = os_cache {
-        return base.join("fastembed");
+        return Ok(base.join("fastembed"));
     }
-    PathBuf::from(".fastembed_cache")
+    anyhow::bail!(
+        "cannot determine a directory for embedding models: no usable FASTEMBED_CACHE_DIR and \
+         no OS cache directory (HOME / XDG_CACHE_HOME / LOCALAPPDATA are all unset).\n\
+         Set FASTEMBED_CACHE_DIR to a directory you control. It is not defaulted to a \
+         working-directory-relative path, because model files are loaded from it without \
+         verification."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +267,7 @@ impl Reranker {
         );
         let model = TextRerank::try_new(
             RerankInitOptions::new(fm)
-                .with_cache_dir(resolve_cache_dir())
+                .with_cache_dir(resolve_cache_dir()?)
                 .with_show_download_progress(true),
         )?;
         Ok(Some(Self { model, choice }))
@@ -325,19 +337,21 @@ mod tests {
         let os_cache = PathBuf::from("/os/cache");
 
         assert_eq!(
-            cache_dir_from(Some(std::ffi::OsString::from("")), Some(os_cache.clone())),
+            cache_dir_from(Some(std::ffi::OsString::from("")), Some(os_cache.clone())).unwrap(),
             os_cache.join("fastembed"),
             "an empty variable must not become a cwd-relative model directory"
         );
-        // With no OS cache either, the last resort stays fastembed's own
-        // default rather than the empty path.
-        assert_eq!(
-            cache_dir_from(Some(std::ffi::OsString::from("")), None),
-            PathBuf::from(".fastembed_cache")
+        // With no OS cache either there is nothing safe left to name, so this
+        // stops instead of falling back to the cwd-relative `.fastembed_cache`.
+        let err = cache_dir_from(Some(std::ffi::OsString::from("")), None)
+            .expect_err("no safe model directory can be named");
+        assert!(
+            err.to_string().contains("FASTEMBED_CACHE_DIR"),
+            "the error must name the remedy: {err}"
         );
         // A real value still wins over the OS cache.
         assert_eq!(
-            cache_dir_from(Some(std::ffi::OsString::from("/models")), Some(os_cache)),
+            cache_dir_from(Some(std::ffi::OsString::from("/models")), Some(os_cache)).unwrap(),
             PathBuf::from("/models")
         );
     }
