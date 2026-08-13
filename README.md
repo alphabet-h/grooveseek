@@ -864,7 +864,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 
   | bound | default | ceiling | what it bounds |
   | --- | --- | --- | --- |
-  | `max_seed_chunks` | 32 | 1000 | chunks of the start document used as seeds. Applied as a SQL `LIMIT`, so the rows past the cap are never read. |
+  | `max_seed_chunks` | 32 | 1000 | chunks of the start document used as seeds. Applied as a SQL `LIMIT`, so rows past the cap are not read — except one probe row, which is what detects truncation without a second query. |
   | `max_nodes` | 100 | 2000 | nodes in the result. Each node is queued once and expands at most once, so `knn_queries <= total_nodes <= max_nodes` — this one bound caps the response size *and* the query count. |
 
   `depth` (max 3) and `fan_out` (max 20) shape the walk but do **not** bound it: before these caps existed, the walk seeded from every chunk of the start document, and that count was uncapped. Measured on a 650-document knowledge base (9,419 chunks, BGE-M3) against its largest document, 160 chunks, with the release binary:

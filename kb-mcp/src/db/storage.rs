@@ -313,6 +313,12 @@ impl Database {
     /// `+1` を書かせないのは、そこが「上限を SQL に降ろす」唯一の接点だからで、
     /// 引数を素通しにすると *cap を無視した読み取り* が結果を変えずに書けてしまう
     /// (= テストで検出できない退行になる)。
+    ///
+    /// **代償はプローブ行 1 行**: 打ち切りが起きている時、`cap + 1` 行目は
+    /// embedding を JSON 経由で `Vec<f32>` に復元し本文も複製してから捨てられる
+    /// (1024 次元で約 4 KB)。「上限を超えた行は読まない」は**厳密には 1 行ぶん
+    /// 嘘**なので、docs でもそう書いている。追加クエリ 1 本 (`COUNT(*)`) との
+    /// 交換で、1 行の無駄読みの方が安いと判断した。
     pub fn chunks_for_path_capped(&self, path: &str, cap: u32) -> Result<(Vec<SeedChunk>, bool)> {
         let mut rows = self.chunks_for_path_limited(path, cap.saturating_add(1))?;
         let has_more = rows.len() > cap as usize;

@@ -33,8 +33,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   returned 331 nodes in 7.3 s at the default depth.
 
   Two bounds, both deterministic, exposed on the MCP tool and the CLI:
-  `max_seed_chunks` (default 32, ceiling 1000) applied as a SQL `LIMIT` so the
-  rows past the cap are never read, and `max_nodes` (default 100, ceiling
+  `max_seed_chunks` (default 32, ceiling 1000) applied as a SQL `LIMIT` so rows
+  past the cap are not read — bar one probe row, which is how truncation is
+  detected without a second query — and `max_nodes` (default 100, ceiling
   2000), which caps the response size and the query count together because
   each node is queued once and expands at most once
   (`knn_queries <= total_nodes <= max_nodes`). Over-large values are clamped,
