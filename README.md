@@ -46,7 +46,7 @@ The binary is produced at `target/release/kb-mcp` (or `kb-mcp.exe` on Windows).
 
 Any CLI option below can be given a default via a `kb-mcp.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`kb-mcp/kb-mcp.toml.example`](kb-mcp/kb-mcp.toml.example) to `kb-mcp.toml` and edit.
 
-That template ships with **every line commented out**, so a fresh copy changes nothing until you opt in. The block below instead shows the keys filled in, to illustrate what each one does — read it as a menu, not as a file to paste wholesale:
+**A fresh copy of that template changes nothing.** It is not blank — a few sections (`[quality_filter]`, `[parsers]`, `[watch]`, `[transport]`, `[transport.http]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behaviour is commented out. The block below instead shows keys filled in with non-default values, to illustrate what each one does — read it as a menu, not as a file to paste wholesale:
 
 ```toml
 # kb-mcp.toml (placed in the project root, the .git ancestor, or next to kb-mcp)

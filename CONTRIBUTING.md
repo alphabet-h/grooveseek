@@ -30,15 +30,17 @@ cargo test -p kb-mcp --lib <name>  # One test by name (the workspace has several
                                   # and `--lib` skips the integration-test binaries)
 ```
 
-To reproduce what CI runs, all four of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails:
+To reproduce what CI runs, all of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
-cargo test --test index_progress_cli -- --test-threads=1   # must not run in parallel
 ```
+
+The order of the last two matters on a cold model cache, which is why CI runs them that way too. `index_progress_cli` spawns `kb-mcp` subprocesses that each need BGE-small; run in parallel they race on the HuggingFace download lock and fail with "Lock acquisition failed". Running that target single-threaded first lets exactly one process do the download, and the full suite then runs against a warm cache.
 
 > **`cargo test -- --ignored` changes your machine.** Read the next section before running it.
 

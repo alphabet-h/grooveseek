@@ -30,15 +30,17 @@ cargo test -p kb-mcp --lib <name>  # 名前指定で 1 本だけ実行 (workspac
                                   # あるため -p が要る。--lib で integration test binary を除外)
 ```
 
-CI と同じ検証をローカルで再現するには、次の 4 つすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる:
+CI と同じ検証をローカルで再現するには、次のすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
-cargo test --test index_progress_cli -- --test-threads=1   # 並列実行してはいけない
 ```
+
+最後の 2 つは**順序が意味を持つ** (モデルキャッシュが cold の場合)。CI も同じ順で回している。`index_progress_cli` は BGE-small を必要とする `kb-mcp` サブプロセスを複数起動するので、並列で走らせると HuggingFace の download lock を奪い合って `Lock acquisition failed` で落ちる。この target を先にシングルスレッドで回せば DL するプロセスがちょうど 1 つになり、後続のフルスイートは warm cache に対して走る。
 
 > **`cargo test -- --ignored` は実際にマシンの状態を変える。** 実行前に次節を読むこと。
 
