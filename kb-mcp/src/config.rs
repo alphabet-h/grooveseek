@@ -978,7 +978,7 @@ impl TrustRoots {
     ///   1 本で拾うため。
     pub fn from_env() -> Self {
         Self::from_bases(
-            std::env::var_os("KB_MCP_CONFIG_HOME").map(PathBuf::from),
+            env_dir("KB_MCP_CONFIG_HOME"),
             dirs::config_dir(),
             dirs::home_dir(),
             dirs::cache_dir(),
@@ -1085,12 +1085,23 @@ fn is_non_loopback(addr: &std::net::SocketAddr) -> bool {
     !addr.ip().is_loopback()
 }
 
+/// ディレクトリを指す環境変数を読む。**空文字は未設定として扱う** (BU-07)。
+///
+/// 空文字を通すと `PathBuf::from("")` になり、`join` した結果が**相対パス**に
+/// なる = 実質 CWD 起点になる。ディレクトリを指すはずの変数で CWD に落ちるのは、
+/// どの変数でも同じ形の穴なので 1 箇所にまとめてある。
+pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 /// `FASTEMBED_CACHE_DIR` が**モデルの置き場所として使える値**か (BU-07)。
 ///
 /// 空文字は「設定されている」に数えない。`embedder::cache_dir_from` と同じ規則で、
 /// 両者がずれると片方が CWD をモデルディレクトリにしてしまう。
 pub(crate) fn env_cache_dir_is_usable() -> bool {
-    std::env::var_os("FASTEMBED_CACHE_DIR").is_some_and(|v| !v.is_empty())
+    env_dir("FASTEMBED_CACHE_DIR").is_some()
 }
 
 /// 信頼できない config が `kb_path` に指定してはいけない場所か。
@@ -2711,6 +2722,32 @@ lambda = 0.5
         assert!(
             d.config.fastembed_cache_dir.is_none(),
             "the planted value is dropped; the environment already wins"
+        );
+    }
+
+    /// An empty directory variable makes every path built from it relative,
+    /// which means the working directory — the thing this whole feature exists
+    /// to stop trusting. One predicate covers every such variable so the rule
+    /// cannot drift between them, which is exactly how the cache variable and
+    /// its two callers came apart.
+    #[test]
+    fn an_empty_directory_variable_is_not_a_directory() {
+        // Behavioural consequence, stated where it bites: an empty override
+        // must not become a trust root, because `PathBuf::from("").join(..)`
+        // is relative and would resolve against the cwd.
+        let empty_override =
+            TrustRoots::from_bases(Some(PathBuf::from("")), None, None, None, false);
+        let anywhere = PathBuf::from("some-repo").join("kb-mcp.toml");
+        assert_eq!(
+            classify_trust(ConfigSource::Cwd, Some(&anywhere), &empty_override),
+            ConfigTrust::Untrusted,
+            "an empty base must not turn a relative path into a trust root"
+        );
+
+        // And the shared predicate itself.
+        assert!(
+            PathBuf::from("").as_os_str().is_empty(),
+            "precondition for the rule below"
         );
     }
 
