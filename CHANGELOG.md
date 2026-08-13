@@ -59,13 +59,19 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   ~7.2 s / 65 KiB worst case.
 
   **Callers who want the old behaviour** can ask for it:
-  `--max-seed-chunks 1000 --max-nodes 2000` reproduces the "before" column
-  exactly, with `truncated: false`, for any document of 1000 chunks or fewer.
-  Exhaustive seeding of documents larger than that is no longer available to
-  anyone. Because BFS spends the budget breadth-first, raising `depth` alone no
-  longer changes the result for a long start document; `seed_strategy:
-  "centroid"` is the way to spend the budget on depth (a complete depth-2 graph
-  of the same document: 24 nodes in ~0.4 s).
+  `--max-seed-chunks 1000 --max-nodes 2000` reproduces the depth-1 and depth-2
+  rows exactly, with `truncated: false`, for any document of 1000 chunks or
+  fewer. Two things are no longer reachable by anyone: exhaustive seeding of
+  documents larger than 1000 chunks, and results larger than 2000 nodes — the
+  depth-3 row above is 3,682 nodes, so at the ceiling it returns 2,000 nodes in
+  ~59 s with `truncated: true`.
+
+  Because BFS spends the budget breadth-first, raising `depth` alone no longer
+  changes the result for a long start document; `seed_strategy: "centroid"` is
+  the way to spend the budget on depth (a depth-2 graph of the same document:
+  24 nodes in ~0.4 s). Note that `max_seed_chunks` bounds the *read*, so
+  `centroid` averages the same capped prefix — it frees the node budget, it
+  does not recover chunks the seed cap dropped.
 
 ### Fixed
 

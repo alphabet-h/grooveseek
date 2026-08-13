@@ -196,10 +196,12 @@ pub struct GraphStats {
     pub max_depth_reached: u32,
     pub knn_queries: u32,
     pub duration_ms: u64,
-    /// 実際にシードとして使った起点ドキュメントのチャンク数 (BU-33)。
-    /// `max_seed_chunks` が効いたかどうかを外から観測できるようにするための値。
-    /// `seed_strategy = "centroid"` では平均を取った元のチャンク数 (返る seed
-    /// ノードは 1 個)。
+    /// 実際に**探索の起点になった**起点ドキュメントのチャンク数 (BU-33)。
+    ///
+    /// 読み込んだ数ではない。`max_seed_chunks` と `max_nodes` は**どちらも**
+    /// これを削りうる (`max_nodes = 8` に 32 チャンクなら 8、`max_nodes = 0` なら
+    /// 0)。`seed_strategy = "centroid"` ではシードノードは 1 個だが、その 1 個に
+    /// 畳み込まれたチャンク数を報告する。
     pub seeds_used: u32,
 }
 
@@ -368,11 +370,16 @@ pub fn build_connection_graph(
         );
     }
     if more_chunks {
+        // 対処に `centroid` を挙げないのが要点。上限は**読み取り**に掛かるので、
+        // centroid に切り替えても平均されるのは同じ前半だけで、落ちたチャンクは
+        // 戻ってこない (`max_nodes` の方の対処とは違う)。
         let detail = match opts.seed_strategy {
             SeedStrategy::AllChunks => format!(
                 "the start document has more than {seed_cap} chunks; only its first {seed_cap} \
-                 were expanded as BFS seeds. Raise max_seed_chunks, or use seed_strategy \
-                 \"centroid\" to fold the whole document into a single seed."
+                 were read, and only those were expanded as BFS seeds. Raise max_seed_chunks to \
+                 cover more of it -- seed_strategy \"centroid\" frees the node budget for \
+                 connections but averages the same capped prefix, so it does not recover the \
+                 chunks dropped here."
             ),
             SeedStrategy::Centroid => format!(
                 "the start document has more than {seed_cap} chunks; the centroid is the average \
@@ -387,7 +394,7 @@ pub fn build_connection_graph(
             detail,
         );
     }
-    let seeds_used = seeds.len() as u32;
+    let seeds_fetched = seeds.len() as u32;
 
     let mut visited: HashSet<i64> = HashSet::new();
     // 起点 path と exclude_paths、dedup_by_path=true の場合の「既出 path」を
@@ -406,6 +413,10 @@ pub fn build_connection_graph(
     // 要求では起こりうる。
     let max_nodes = clamp_max_nodes(opts.max_nodes) as usize;
 
+    // 実際に探索の起点になったチャンク数。読み込んだ数 (`seeds_fetched`) ではない
+    // — node 予算が seed 段で効くと両者はずれる。
+    let mut seeds_used: u32 = 0;
+
     // 2. seed_strategy に応じてシードを追加。
     match opts.seed_strategy {
         SeedStrategy::AllChunks => {
@@ -423,6 +434,7 @@ pub fn build_connection_graph(
                 nodes.push(make_node(node_id, None, 0, chunk_id, 1.0, &r));
                 visited.insert(chunk_id);
                 queue.push_back((node_id, embedding, 0));
+                seeds_used += 1;
             }
         }
         SeedStrategy::Centroid => {
@@ -448,6 +460,7 @@ pub fn build_connection_graph(
             }
             if nodes.is_empty() && max_nodes == 0 {
                 // `max_nodes = 0` は literal に「空グラフ」。centroid でも同じ。
+                // シードノードが出ない以上、探索の起点になったチャンクは 0 個。
                 push_truncation(
                     &mut truncation,
                     TruncationReason::NodeBudget,
@@ -459,6 +472,9 @@ pub fn build_connection_graph(
                 let node_id = nodes.len();
                 nodes.push(make_node(node_id, None, 0, *chunk_id, 1.0, rep));
                 queue.push_back((node_id, sum, 0));
+                // centroid はノード 1 個だが、その 1 個に畳み込まれたチャンク数を
+                // 報告する (= 何チャンク分が探索の起点になったか)。
+                seeds_used = seeds_fetched;
             }
         }
     }
@@ -1145,6 +1161,46 @@ mod tests {
             "the detail must name the knob that lifts the bound: {}",
             g.truncation[0].detail
         );
+        // The cap is on the *read*, so switching to centroid averages the same
+        // capped prefix. Offering it as the way to recover the dropped chunks
+        // would be advice that cannot work.
+        assert!(
+            g.truncation[0].detail.contains("does not recover"),
+            "the remedy must not promise centroid recovers the dropped chunks: {}",
+            g.truncation[0].detail
+        );
+    }
+
+    /// `seeds_used` counts the chunks that actually seeded the walk, not the
+    /// chunks that were read. The node budget can cut the seed phase short, and
+    /// reporting the fetched count there would overstate the walk.
+    #[test]
+    fn seeds_used_counts_admitted_seeds_not_fetched_ones() {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "big.md", 20, 0.10, 0.0001);
+        insert_doc_with_chunk(&db, "n1.md", "n1", "n1 body", 0.20);
+
+        // seed cap 16 would allow 16 seeds, but the node budget stops at 6.
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 2,
+            min_similarity: 0.0,
+            max_seed_chunks: 16,
+            max_nodes: 6,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "big.md", &opts).unwrap();
+
+        assert_eq!(g.stats.total_nodes, 6);
+        assert_eq!(
+            g.stats.seeds_used, 6,
+            "6 of the 16 fetched chunks actually seeded the walk"
+        );
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.depth == 0).count(),
+            g.stats.seeds_used as usize,
+            "seeds_used must equal the number of depth-0 nodes for all_chunks"
+        );
     }
 
     #[test]
@@ -1413,6 +1469,10 @@ mod tests {
             let g = build_connection_graph(&db, "s.md", &opts).unwrap();
             assert_eq!(g.nodes.len(), 0, "{strategy:?} must honour max_nodes = 0");
             assert_eq!(g.stats.knn_queries, 0, "{strategy:?} must not query");
+            assert_eq!(
+                g.stats.seeds_used, 0,
+                "{strategy:?}: nothing seeded a walk that never started"
+            );
             assert!(g.truncated, "{strategy:?} must explain the empty result");
             assert_eq!(reasons(&g), vec![TruncationReason::NodeBudget]);
         }
