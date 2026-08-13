@@ -1,3 +1,20 @@
+# Normalize every text file to LF, in the repository AND in the working tree.
+#
+# `text=auto` lets git decide what is text; `eol=lf` then pins the working-tree
+# form, so a Windows checkout does not hand LF-committed files back as CRLF and
+# a later scripted edit cannot flip a whole file. This repository has paid for
+# that twice: once as `chore: restore LF line endings`, and again in PR #143,
+# where a test-only change carried a CRLF -> LF conversion of the whole of
+# `db/fts_query.rs` and inflated a 134-line diff to over 1900.
+#
+# All 96 tracked .rs files were already LF when this was added, so it is a
+# guard against recurrence rather than a migration.
+* text=auto eol=lf
+
+# The binary declarations below must stay AFTER the line above: gitattributes
+# resolves per pattern with the last match winning, so these re-exempt the
+# fixture formats from any text handling.
+
 # Binary test fixtures (feature-45: binary document formats).
 # Mark explicitly so git never attempts CRLF normalization or textual diffing
 # on these formats, regardless of a contributor's core.autocrlf setting.

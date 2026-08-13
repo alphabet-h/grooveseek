@@ -8,6 +8,18 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
 
 ### Added
 
+- **Line endings are pinned to LF by `.gitattributes`** (`* text=auto eol=lf`).
+  Committed content was already LF everywhere — all 96 tracked `.rs` files —
+  but nothing kept a Windows checkout, or a scripted edit that rewrites a whole
+  file, from handing back CRLF. This repository has paid for that twice: once
+  as `chore: restore LF line endings`, and again while preparing this release,
+  where a test-only change to `db/fts_query.rs` silently carried a CRLF → LF
+  conversion of the entire file and turned a 134-line diff into one of over
+  1900. Adding the rule changes no existing file (`git add --renormalize .`
+  touches nothing), so it is purely a guard against recurrence; the binary
+  fixture declarations that follow it still override it, since gitattributes
+  resolves with the last matching pattern.
+
 - **The query tokenizer's accepted roughness and its trigram floor are now
   pinned by tests** (BU-27, BU-28). No behaviour changes; both were documented
   only in prose, which meant a future change could alter either one and nothing
