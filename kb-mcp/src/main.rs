@@ -560,10 +560,19 @@ fn main() -> anyhow::Result<()> {
         return run_service(action);
     }
 
-    let (cfg, source) = Config::discover(cli.config.as_deref())?;
+    let discovered = Config::discover(cli.config.as_deref())?;
+    let (cfg, source) = (discovered.config, discovered.source);
+    // (BU-07) `source` の variant 名だけでは「どのファイルが勝ったのか」も
+    // 「その中身をどこまで信用したのか」も分からない。両方を 1 行に載せる。
     tracing::info!(
         target: "kb_mcp::config",
         source = ?source,
+        path = %discovered
+            .path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(built-in defaults)".into()),
+        trust = ?discovered.trust,
         "loaded config"
     );
     cfg.apply_cache_dir_env();

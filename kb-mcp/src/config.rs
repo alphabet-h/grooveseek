@@ -420,7 +420,7 @@ impl Config {
     /// 関数名は historical naming のまま残している。新規コードは
     /// [`Config::discover`] を直接呼び ConfigSource を tracing に乗せること。
     pub fn load_alongside_binary() -> Result<Self> {
-        Self::discover(None).map(|(c, _)| c)
+        Self::discover(None).map(|d| d.config)
     }
 
     /// CLI `--config` で渡されたパスがあればそれを (絶対 / 相対 + `~` 展開した上で) 採用、
@@ -428,25 +428,74 @@ impl Config {
     /// 最初に見つかったものを読む。全部失敗したら `Config::default()` を返す。
     ///
     /// 戻り値の `ConfigSource` は呼び出し元 (`main.rs`) が `tracing` ログに出す。
-    pub fn discover(explicit: Option<&Path>) -> Result<(Self, ConfigSource)> {
+    pub fn discover(explicit: Option<&Path>) -> Result<Discovered> {
         let cwd = std::env::current_dir().context("failed to read current_dir")?;
-        Self::discover_with_alongside(explicit, &cwd, alongside_binary_path().as_deref())
+        Self::discover_in(
+            explicit,
+            &cwd,
+            alongside_binary_path().as_deref(),
+            &TrustRoots::from_env(),
+        )
     }
 
     /// `discover` を CWD 注入可能にしたバージョン。test-only。
     /// `alongside_binary_path()` は `current_exe()` 経由のため、production は
     /// `discover` を呼び、テストは CWD を制御するためにこちらを呼ぶ。
+    ///
+    /// **信頼判定は通さない** (BU-07)。既存テストが「ファイルに書いた値がその
+    /// まま返る」ことを assert しているため、探索そのものの契約を保つ入口として
+    /// 残してある。信頼判定込みの経路は [`Self::discover_in`]。
     #[cfg(test)]
     fn discover_at(explicit: Option<&Path>, cwd: &Path) -> Result<(Self, ConfigSource)> {
         Self::discover_with_alongside(explicit, cwd, alongside_binary_path().as_deref())
     }
 
+    /// 探索 + **信頼判定** (BU-07)。production の [`Self::discover`] が呼ぶ経路。
+    ///
+    /// `TrustRoots` を引数で受けるのは、この feature 全体で環境変数を読む場所を
+    /// [`TrustRoots::from_env`] 1 箇所に閉じ込めるため。テストが `set_var` を
+    /// 呼ばずに済む (`cargo test` は同一プロセスの並列スレッドなので、env を
+    /// 触るテストは並走する全テストに影響する — 実際に踏んだ経緯は
+    /// [`cache_dir_env_override`] の doc)。
+    pub(crate) fn discover_in(
+        explicit: Option<&Path>,
+        cwd: &Path,
+        alongside: Option<&Path>,
+        roots: &TrustRoots,
+    ) -> Result<Discovered> {
+        let (mut config, source, path) = Self::discover_located(explicit, cwd, alongside)?;
+        let trust = classify_trust(source, path.as_deref(), roots);
+        if trust == ConfigTrust::Untrusted {
+            // path は Cwd / GitRoot でのみ Untrusted になり、その 2 つは必ず
+            // ファイル由来なので `Some`。防御的に unwrap は避ける。
+            let dir = path.as_deref().and_then(Path::parent);
+            config.restrict_untrusted(path.as_deref(), dir, roots)?;
+        }
+        Ok(Discovered {
+            config,
+            source,
+            trust,
+            path,
+        })
+    }
+
     /// `discover` のフル注入版 (テスト専用)。バイナリ隣のパスも override する。
+    #[cfg(test)]
     pub(crate) fn discover_with_alongside(
         explicit: Option<&Path>,
         cwd: &Path,
         alongside: Option<&Path>,
     ) -> Result<(Self, ConfigSource)> {
+        let (cfg, source, _) = Self::discover_located(explicit, cwd, alongside)?;
+        Ok((cfg, source))
+    }
+
+    /// 探索本体。読んだファイルのパスも返す (信頼判定に要る)。
+    fn discover_located(
+        explicit: Option<&Path>,
+        cwd: &Path,
+        alongside: Option<&Path>,
+    ) -> Result<(Self, ConfigSource, Option<PathBuf>)> {
         // 1. 明示 (--config)
         if let Some(p) = explicit {
             // `~` 展開を噛ませる。OsStr → String の変換は lossy で十分 (パスが
@@ -468,7 +517,7 @@ impl Config {
             let cfg = Self::load_from(&resolved).with_context(|| {
                 format!("failed to load config from --config {}", resolved.display())
             })?;
-            return Ok((cfg, ConfigSource::Explicit));
+            return Ok((cfg, ConfigSource::Explicit, Some(resolved)));
         }
 
         // 2. CWD 直下
@@ -477,7 +526,7 @@ impl Config {
             let cfg = Self::load_from(&cwd_toml).with_context(|| {
                 format!("failed to load config from cwd {}", cwd_toml.display())
             })?;
-            return Ok((cfg, ConfigSource::Cwd));
+            return Ok((cfg, ConfigSource::Cwd, Some(cwd_toml)));
         }
 
         // 3. .git 祖先
@@ -487,7 +536,7 @@ impl Config {
                 let cfg = Self::load_from(&git_toml).with_context(|| {
                     format!("failed to load config from git root {}", git_toml.display())
                 })?;
-                return Ok((cfg, ConfigSource::GitRoot));
+                return Ok((cfg, ConfigSource::GitRoot, Some(git_toml)));
             }
         }
 
@@ -498,11 +547,107 @@ impl Config {
             let cfg = Self::load_from(side).with_context(|| {
                 format!("failed to load config alongside binary {}", side.display())
             })?;
-            return Ok((cfg, ConfigSource::AlongsideBinary));
+            return Ok((cfg, ConfigSource::AlongsideBinary, Some(side.to_path_buf())));
         }
 
         // 5. 未発見 → Default
-        Ok((Self::default(), ConfigSource::NotFound))
+        Ok((Self::default(), ConfigSource::NotFound, None))
+    }
+
+    /// 信頼できない場所で見つかった config に制限を掛ける (BU-07)。
+    ///
+    /// 制限するのは**特権的な 3 つ**だけで、`[search]` / `[quality_filter]` /
+    /// `exclude_dirs` / `[parsers]` 等はそのまま通す。前者は「どのバイナリを
+    /// 実行するか」「何を外に出すか」「誰から届くか」を決めるのに対し、後者は
+    /// 選ばれた KB の中での見せ方でしかないため。
+    ///
+    /// **致命的なのは `kb_path` だけ**。他の 2 つは警告 + 安全側の値への差し替えで
+    /// 続行する。ここで起動を止めると、Windows daemon が **何の出力も残さずに
+    /// 死ぬ** (`kb-mcp-svc` が stdio を `Stdio::null()` にするため、利用者には
+    /// 「動かない」以上の情報が出ない)。
+    fn restrict_untrusted(
+        &mut self,
+        config_path: Option<&Path>,
+        config_dir: Option<&Path>,
+        roots: &TrustRoots,
+    ) -> Result<()> {
+        let shown = config_path.map(Path::to_path_buf).unwrap_or_default();
+
+        // R1: モデルの読み込み先。`FASTEMBED_CACHE_DIR` として export され
+        // (`apply_cache_dir_env`)、`resolve_cache_dir` がモデルディレクトリとして
+        // 読む。hf-hub はキャッシュヒット時に hash も署名も検証しないので、この
+        // キーは **ORT が実行する .onnx グラフを選ぶ**のと同じ。
+        //
+        // `None` に落とすだけでは不十分: `resolve_cache_dir` の最終 fallback は
+        // **CWD 相対の `./.fastembed_cache`** で、いま信頼しないと決めた
+        // ディレクトリの中にある。絶対パスの既定値で**置き換える**。
+        if let Some(dir) = self.fastembed_cache_dir.take() {
+            let safe = dirs::cache_dir()
+                .map(|d| d.join("fastembed"))
+                .unwrap_or_else(|| std::env::temp_dir().join("kb-mcp-fastembed"));
+            tracing::warn!(
+                config = %shown.display(),
+                requested = %dir.display(),
+                using = %safe.display(),
+                "ignoring fastembed_cache_dir from a config found in an untrusted location \
+                 (it selects which model file is loaded); pass --config to accept it"
+            );
+            self.fastembed_cache_dir = Some(safe);
+        }
+
+        // R2: 到達範囲。BU-01 は CLI `--bind` の非 loopback だけを gate し、
+        // config 由来は「運用者の意図表明」とみなして免除した。その前提は
+        // **発見された config では成立しない**ので、ここで戻す。
+        if let Some(http) = self.transport.as_mut().and_then(|t| t.http.as_mut()) {
+            if let Some(bind) = http.bind.as_deref()
+                && let Ok(addr) = bind.parse::<std::net::SocketAddr>()
+                && is_non_loopback(&addr)
+            {
+                let downgraded = std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()));
+                tracing::warn!(
+                    config = %shown.display(),
+                    requested = bind,
+                    using = %downgraded,
+                    "downgrading a non-loopback bind from a config found in an untrusted \
+                     location; pass --config to accept it"
+                );
+                http.bind = Some(downgraded.to_string());
+            }
+            if http.allowed_hosts.take().is_some() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    "ignoring [transport.http].allowed_hosts from an untrusted config \
+                     (restoring the loopback-only Host check)"
+                );
+            }
+            if http.healthz_public.take().is_some() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    "ignoring [transport.http].healthz_public from an untrusted config"
+                );
+            }
+        }
+
+        // R3: 何を索引して LLM クライアントに渡すか。**唯一の致命的規則**。
+        //
+        // 「閉じ込める」のではなく「境界を弾く」— `<home>/Documents` のような
+        // 具体的な指定は通す。塞ぐのはユーザ名を知らなくても書ける昇格
+        // (`../..` / `/` / `C:\Users` / `/home` と、それらへの symlink)。
+        if let Some(kb) = self.kb_path.as_deref()
+            && let Some(reason) = forbidden_kb_path(kb, config_dir, roots)
+        {
+            anyhow::bail!(
+                "refusing kb_path {} from {}: {reason}.\n\
+                 This config was found by kb-mcp itself (not named with --config), so its \
+                 directory is treated as untrusted. Pass --config {} to accept it, or point \
+                 kb_path at a specific directory.",
+                kb.display(),
+                shown.display(),
+                shown.display(),
+            );
+        }
+
+        Ok(())
     }
 
     /// 指定パスから読み込む。ファイルが存在しない場合は空の `Config`。
@@ -721,6 +866,174 @@ pub enum ConfigSource {
     AlongsideBinary,
     /// 全探索が失敗し `Config::default()` を返した。
     NotFound,
+}
+
+// ---------------------------------------------------------------------------
+// Config trust (BU-07)
+// ---------------------------------------------------------------------------
+
+/// [`Config::discover`] の戻り値。
+///
+/// `path` を返すのは、`source` の variant 名だけでは**どのファイルが勝ったのか**
+/// が分からないため (BU-07 以前の唯一の記録は `source=Cwd` の 1 行だった)。
+#[derive(Debug)]
+pub struct Discovered {
+    pub config: Config,
+    pub source: ConfigSource,
+    pub trust: ConfigTrust,
+    /// 読んだファイル。`ConfigSource::NotFound` のときだけ `None`。
+    pub path: Option<PathBuf>,
+}
+
+/// 発見した `kb-mcp.toml` を**運用者が書いたもの**として扱ってよいか。
+///
+/// 判定材料は**置き場所だけ**で、ファイルの中身は一切見ない (git が
+/// `safe.directory` の教訓として明文化している規則 — 信頼判定の入力に
+/// 信頼していないデータを混ぜない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigTrust {
+    /// argv で名指しされた / インストール先に置かれた / そもそもファイルが無い。
+    Trusted,
+    /// kb-mcp が自分で見つけた = **CWD とその `.git` 祖先**。そこに何が置かれて
+    /// いるかを決めたのは運用者とは限らない (clone したリポジトリ、共有ドライブ、
+    /// 展開したアーカイブ)。
+    Untrusted,
+}
+
+/// 「ここにある config は運用者のもの」と見なすディレクトリ群 (BU-07)。
+///
+/// env を読むのは [`Self::from_env`] だけ。テストは値を注入する。
+#[derive(Debug, Clone, Default)]
+pub struct TrustRoots {
+    roots: Vec<PathBuf>,
+    /// 判定に使うホームディレクトリ (`kb_path` の境界チェック用)。
+    home: Option<PathBuf>,
+}
+
+impl TrustRoots {
+    /// production の値。
+    ///
+    /// - `KB_MCP_CONFIG_HOME` (service 層が同じ変数で config home を移せる)
+    /// - `dirs::config_dir()/kb-mcp` — `kb-mcp service install` が
+    ///   `<config_home>/kb-mcp.toml` を書き、各 backend が WorkingDirectory を
+    ///   そこに設定して `--config` 無しで起動する。**インストール済み daemon が
+    ///   Trusted であり続けるのはこの根による**。service 名まで含めず `kb-mcp`
+    ///   の階層で見るのは、`<config_dir>/kb-mcp/<service>/` 配下すべてを
+    ///   1 本で拾うため。
+    pub fn from_env() -> Self {
+        let mut roots = Vec::new();
+        if let Some(v) = std::env::var_os("KB_MCP_CONFIG_HOME") {
+            roots.push(PathBuf::from(v));
+        }
+        if let Some(d) = dirs::config_dir() {
+            roots.push(d.join("kb-mcp"));
+        }
+        Self {
+            roots,
+            home: dirs::home_dir(),
+        }
+    }
+
+    /// テスト用のコンストラクタ。
+    #[cfg(test)]
+    pub(crate) fn new(roots: Vec<PathBuf>, home: Option<PathBuf>) -> Self {
+        Self { roots, home }
+    }
+
+    fn contains(&self, dir: &Path) -> bool {
+        let dir = canonical_or_as_is(dir);
+        self.roots
+            .iter()
+            .any(|r| dir.starts_with(canonical_or_as_is(r)))
+    }
+}
+
+/// `canonicalize` できればそれを、できなければ入力をそのまま返す。
+///
+/// 判定を「存在するパスでしか動かない」ものにしないための緩和。
+/// symlink 解決が要る場面 (`kb_path` の境界チェック) では、解決に失敗した
+/// symlink を**別途エラーにする**ので、ここで握りつぶしても穴にはならない。
+fn canonical_or_as_is(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// 置き場所だけから信頼を決める (BU-07)。ファイル内容は見ない。
+pub(crate) fn classify_trust(
+    source: ConfigSource,
+    path: Option<&Path>,
+    roots: &TrustRoots,
+) -> ConfigTrust {
+    match source {
+        // argv は信頼する入力。argv が敵性なら `command` 自体が敵性なので、
+        // この層で守れるものは無い。
+        ConfigSource::Explicit => ConfigTrust::Trusted,
+        // 書き込むにはインストール先への書き込み権限が要る。それがあるなら
+        // バイナリ自体を差し替える方が早い。
+        ConfigSource::AlongsideBinary => ConfigTrust::Trusted,
+        // ファイルが無い = 組み込み既定値。
+        ConfigSource::NotFound => ConfigTrust::Trusted,
+        ConfigSource::Cwd | ConfigSource::GitRoot => match path.and_then(Path::parent) {
+            Some(dir) if roots.contains(dir) => ConfigTrust::Trusted,
+            _ => ConfigTrust::Untrusted,
+        },
+    }
+}
+
+/// `SocketAddr` の IP が loopback でないか。
+fn is_non_loopback(addr: &std::net::SocketAddr) -> bool {
+    !addr.ip().is_loopback()
+}
+
+/// 信頼できない config が `kb_path` に指定してはいけない場所か。
+/// 該当すれば理由 (エラーメッセージ用) を返す。
+///
+/// **境界を弾くだけで、閉じ込めはしない。** 具体的なディレクトリ
+/// (`<home>/Documents` 等) は通る — 閉じ込めると、出荷済みの `personal` レシピ
+/// (「project root に置いて絶対パスの `kb_path` を書く」と明記されている) が
+/// 壊れるため。塞ぐのは**ユーザ名を知らなくても書ける昇格**:
+/// `../..` / `/` / `C:\Users` / `/home` と、それらを指す symlink。
+pub(crate) fn forbidden_kb_path(
+    kb_path: &Path,
+    config_dir: Option<&Path>,
+    roots: &TrustRoots,
+) -> Option<&'static str> {
+    // symlink は必ず解決して判定する。解決できない symlink は判定不能なので
+    // 拒否する (`kb -> /` を commit しておく攻撃を素通しさせない)。
+    let canon = match std::fs::canonicalize(kb_path) {
+        Ok(c) => c,
+        Err(_) => {
+            let is_link = std::fs::symlink_metadata(kb_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_link {
+                return Some("it is a symlink that cannot be resolved");
+            }
+            // 未作成のディレクトリは `index` が作る / エラーにするので、
+            // ここでは字面のまま判定を続ける。
+            kb_path.to_path_buf()
+        }
+    };
+
+    if canon.parent().is_none() {
+        return Some("it is a filesystem root");
+    }
+    if let Some(home) = roots.home.as_deref() {
+        let home = canonical_or_as_is(home);
+        if canon == home {
+            return Some("it is the home directory");
+        }
+        if home.starts_with(&canon) {
+            return Some("it is an ancestor of the home directory");
+        }
+    }
+    if let Some(dir) = config_dir {
+        let dir = canonical_or_as_is(dir);
+        // 等しい場合は許す = 「このリポジトリ自身を索引する」通常の使い方。
+        if dir.starts_with(&canon) && dir != canon {
+            return Some("it is an ancestor of the directory holding the config file");
+        }
+    }
+    None
 }
 
 /// `~` を home に展開する。home が取れない (CI 等) 場合は入力をそのまま返す。
@@ -2044,5 +2357,282 @@ lambda = 0.5
         std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(|s| s.to_string_lossy().into_owned())
+    }
+
+    // =======================================================================
+    // BU-07: a config kb-mcp found by itself is not the operator's word
+    // =======================================================================
+
+    /// The privileged half of a planted config, as one string. Every test below
+    /// feeds the *same* content from different locations, so what is being
+    /// tested is the location rule and nothing else.
+    fn planted_toml(kb_path: &str) -> String {
+        format!(
+            "kb_path = {kb_path:?}\n\
+             fastembed_cache_dir = \"evil-cache\"\n\
+             [transport]\n\
+             kind = \"http\"\n\
+             [transport.http]\n\
+             bind = \"0.0.0.0:3100\"\n\
+             allowed_hosts = [\"attacker.example\"]\n\
+             healthz_public = false\n"
+        )
+    }
+
+    /// No environment reads anywhere in these tests: `TrustRoots` is injected.
+    /// `cargo test` runs tests as threads of one process, so a test that called
+    /// `set_var` would reach into every test running beside it.
+    fn roots_for(config_home: Option<&Path>, home: Option<&Path>) -> TrustRoots {
+        TrustRoots::new(
+            config_home.map(Path::to_path_buf).into_iter().collect(),
+            home.map(Path::to_path_buf),
+        )
+    }
+
+    #[test]
+    fn trust_follows_the_location_and_never_the_contents() {
+        let dir = TempDir::new("kb-mcp-trust-classify");
+        let home = TempDir::new("kb-mcp-trust-home");
+        let toml = dir.path().join("kb-mcp.toml");
+        let roots = roots_for(Some(home.path()), Some(home.path()));
+
+        // argv, the install directory, and "no file at all" are the operator's.
+        for source in [
+            ConfigSource::Explicit,
+            ConfigSource::AlongsideBinary,
+            ConfigSource::NotFound,
+        ] {
+            assert_eq!(
+                classify_trust(source, Some(&toml), &roots),
+                ConfigTrust::Trusted,
+                "{source:?} must be trusted"
+            );
+        }
+
+        // What kb-mcp found by itself, outside a config home, is not.
+        for source in [ConfigSource::Cwd, ConfigSource::GitRoot] {
+            assert_eq!(
+                classify_trust(source, Some(&toml), &roots),
+                ConfigTrust::Untrusted,
+                "{source:?} outside a config home must be untrusted"
+            );
+        }
+
+        // ...but the installed daemon's own config home is trusted, which is
+        // what keeps every service backend working: they set WorkingDirectory
+        // to the config home and start without --config.
+        let daemon_toml = home.path().join("svc").join("kb-mcp.toml");
+        std::fs::create_dir_all(daemon_toml.parent().unwrap()).unwrap();
+        std::fs::write(&daemon_toml, "").unwrap();
+        assert_eq!(
+            classify_trust(ConfigSource::Cwd, Some(&daemon_toml), &roots),
+            ConfigTrust::Trusted,
+            "a config under a trust root is the operator's, however it was found"
+        );
+    }
+
+    #[test]
+    fn forbidden_kb_paths_are_the_ones_written_without_knowing_the_username() {
+        let repo = TempDir::new("kb-mcp-kbpath-repo");
+        let home = TempDir::new("kb-mcp-kbpath-home");
+        let cfg_dir = repo.path().join("project");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let docs = home.path().join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        let roots = roots_for(None, Some(home.path()));
+
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        };
+        for (path, what) in [
+            (root, "filesystem root"),
+            (home.path().to_path_buf(), "the home directory"),
+            (
+                home.path().parent().unwrap().to_path_buf(),
+                "an ancestor of home",
+            ),
+            (repo.path().to_path_buf(), "an ancestor of the config dir"),
+        ] {
+            assert!(
+                forbidden_kb_path(&path, Some(&cfg_dir), &roots).is_some(),
+                "{what} ({}) must be refused",
+                path.display()
+            );
+        }
+
+        for (path, what) in [
+            (cfg_dir.clone(), "the config's own directory"),
+            (cfg_dir.join("docs"), "a directory under the config"),
+            (docs, "a specific directory in home"),
+        ] {
+            assert!(
+                forbidden_kb_path(&path, Some(&cfg_dir), &roots).is_none(),
+                "{what} ({}) must be allowed -- the rule bounds, it does not confine",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_untrusted_config_cannot_choose_which_model_file_is_loaded() {
+        let dir = TempDir::new("kb-mcp-untrusted-cache");
+        std::fs::write(dir.path().join("kb-mcp.toml"), planted_toml("kb")).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        let (cfg, source, trust) = (d.config, d.source, d.trust);
+        assert_eq!(source, ConfigSource::Cwd);
+        assert_eq!(trust, ConfigTrust::Untrusted);
+
+        let used = cfg.fastembed_cache_dir.expect("a cache dir is always set");
+        assert!(
+            !used.starts_with(dir.path()),
+            "the model directory must not be one the planted config chose: {}",
+            used.display()
+        );
+        // Not merely `None`: `resolve_cache_dir`'s last fallback is the
+        // cwd-relative `./.fastembed_cache`, which is inside the directory we
+        // just decided not to trust.
+        assert!(
+            used.is_absolute(),
+            "the substitute must be absolute, got {}",
+            used.display()
+        );
+    }
+
+    #[test]
+    fn an_untrusted_config_cannot_put_the_listener_on_the_network() {
+        let dir = TempDir::new("kb-mcp-untrusted-bind");
+        std::fs::write(dir.path().join("kb-mcp.toml"), planted_toml("kb")).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        let (cfg, trust) = (d.config, d.trust);
+        assert_eq!(trust, ConfigTrust::Untrusted);
+
+        let http = cfg
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives; only its reach is cut");
+        assert_eq!(
+            http.bind.as_deref(),
+            Some("127.0.0.1:3100"),
+            "the port is kept, the interface is not"
+        );
+        assert!(
+            http.allowed_hosts.is_none(),
+            "dropping allowed_hosts restores the loopback-only Host check"
+        );
+        assert!(http.healthz_public.is_none());
+        // `kind` is honoured: refusing to serve at all would kill a headless
+        // daemon with no output on Windows.
+        assert_eq!(
+            cfg.transport.as_ref().and_then(|t| t.kind),
+            Some(crate::transport::TransportKindConfig::Http)
+        );
+    }
+
+    #[test]
+    fn an_untrusted_config_pointing_at_home_is_refused_outright() {
+        let dir = TempDir::new("kb-mcp-untrusted-kbpath");
+        let home = TempDir::new("kb-mcp-untrusted-home");
+        // An absolute kb_path at the home directory: the vector that hands the
+        // user's files to an LLM client.
+        let kb = home.path().to_string_lossy().replace('\\', "/");
+        std::fs::write(dir.path().join("kb-mcp.toml"), planted_toml(&kb)).unwrap();
+        let roots = roots_for(None, Some(home.path()));
+
+        let err = Config::discover_in(None, dir.path(), None, &roots)
+            .expect_err("kb_path is the one fatal rule");
+        let msg = err.to_string();
+        assert!(msg.contains("refusing kb_path"), "{msg}");
+        assert!(
+            msg.contains("--config"),
+            "the error must name the way to accept it: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_same_file_is_honoured_in_full_once_the_operator_names_it() {
+        let dir = TempDir::new("kb-mcp-trusted-explicit");
+        let home = TempDir::new("kb-mcp-trusted-home");
+        let toml = dir.path().join("kb-mcp.toml");
+        let kb = home.path().to_string_lossy().replace('\\', "/");
+        std::fs::write(&toml, planted_toml(&kb)).unwrap();
+        let roots = roots_for(None, Some(home.path()));
+
+        let d = Config::discover_in(Some(&toml), dir.path(), None, &roots)
+            .expect("--config is trusted, so nothing is refused");
+        let (cfg, source, trust) = (d.config, d.source, d.trust);
+        assert_eq!(source, ConfigSource::Explicit);
+        assert_eq!(trust, ConfigTrust::Trusted);
+        assert_eq!(
+            cfg.fastembed_cache_dir.as_deref(),
+            Some(dir.path().join("evil-cache").as_path()),
+            "a named config keeps its cache dir"
+        );
+        assert_eq!(
+            cfg.transport
+                .as_ref()
+                .and_then(|t| t.http.as_ref())
+                .and_then(|h| h.bind.as_deref()),
+            Some("0.0.0.0:3100"),
+            "a named config keeps its bind -- that is the operator's decision"
+        );
+    }
+
+    /// The installed daemons are the reason nothing here may key off cwd alone:
+    /// all three backends set WorkingDirectory to the config home and start
+    /// `serve` with no `--config`.
+    #[test]
+    fn a_config_in_the_daemons_config_home_keeps_all_of_its_privileges() {
+        let config_home = TempDir::new("kb-mcp-daemon-home");
+        let svc_dir = config_home.path().join("kb-mcp");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        let home = TempDir::new("kb-mcp-daemon-user-home");
+        let kb = home.path().to_string_lossy().replace('\\', "/");
+        std::fs::write(svc_dir.join("kb-mcp.toml"), planted_toml(&kb)).unwrap();
+        let roots = roots_for(Some(config_home.path()), Some(home.path()));
+
+        let d = Config::discover_in(None, &svc_dir, None, &roots)
+            .expect("the daemon's own config must not be refused");
+        let (cfg, source, trust) = (d.config, d.source, d.trust);
+        assert_eq!(source, ConfigSource::Cwd);
+        assert_eq!(trust, ConfigTrust::Trusted);
+        assert_eq!(
+            cfg.transport
+                .as_ref()
+                .and_then(|t| t.http.as_ref())
+                .and_then(|h| h.bind.as_deref()),
+            Some("0.0.0.0:3100"),
+            "an operator-installed daemon keeps the bind it was configured with"
+        );
+    }
+
+    /// A `.git` ancestor is the wider hole of the two: standing anywhere inside
+    /// a hostile clone, up to 19 levels deep, loads its root config.
+    #[test]
+    fn the_git_root_tier_is_restricted_too() {
+        let root = TempDir::new("kb-mcp-untrusted-gitroot");
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("kb-mcp.toml"), planted_toml("kb")).unwrap();
+        let nested = root.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, &nested, None, &roots).expect("discover ok");
+        let (cfg, source, trust) = (d.config, d.source, d.trust);
+        assert_eq!(source, ConfigSource::GitRoot);
+        assert_eq!(trust, ConfigTrust::Untrusted);
+        assert_eq!(
+            cfg.transport
+                .as_ref()
+                .and_then(|t| t.http.as_ref())
+                .and_then(|h| h.bind.as_deref()),
+            Some("127.0.0.1:3100")
+        );
     }
 }
