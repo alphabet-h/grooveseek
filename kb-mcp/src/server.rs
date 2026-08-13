@@ -233,10 +233,11 @@ struct GetConnectionGraphParams {
     /// runs (default: 100, max: 2000). When it bites, the response carries
     /// `truncated: true` and a `truncation` entry with reason `node_budget`.
     max_nodes: Option<u32>,
-    /// Max chunks of the start document used to seed the walk (default: 32,
-    /// max: 1000). Raise it for a long start document you want seeded more
-    /// fully, or set seed_strategy to "centroid" to fold the whole document
-    /// into a single seed.
+    /// Max chunks of the start document read and used to seed the walk
+    /// (default: 32, max: 1000). Raise it to cover more of a long start
+    /// document. It bounds the read, so seed_strategy "centroid" averages the
+    /// same capped prefix -- centroid frees the node budget for connections
+    /// but does not recover chunks this cap dropped.
     max_seed_chunks: Option<u32>,
 }
 
@@ -3669,6 +3670,44 @@ mod tests {
             let value = serde_json::Value::Object((*schema).clone());
             assert_clean(tool, &value, "");
         }
+    }
+
+    /// (BU-33) The advertised schema is the only description an LLM client
+    /// ever reads, so a remedy that is wrong here is wrong where it matters
+    /// most — and it is the surface easiest to forget, because fixing the same
+    /// claim in the response, the README and the changelog leaves it untouched
+    /// (which is exactly what happened in review).
+    ///
+    /// `max_seed_chunks` bounds the **read**, so `centroid` averages the same
+    /// capped prefix. Advertising it as "folds the whole document" tells an
+    /// agent to make a call that cannot do what the schema promises.
+    #[test]
+    fn the_graph_schema_does_not_promise_centroid_covers_the_whole_document() {
+        use rmcp::handler::server::common::schema_for_type;
+        let schema = schema_for_type::<GetConnectionGraphParams>();
+        let value = serde_json::Value::Object((*schema).clone());
+        let desc = value["properties"]["max_seed_chunks"]["description"]
+            .as_str()
+            .expect("max_seed_chunks must carry a description");
+
+        assert!(
+            !desc.contains("whole document"),
+            "the cap is on the read; centroid cannot cover the whole document: {desc}"
+        );
+        assert!(
+            desc.contains("does not recover"),
+            "the schema must state centroid's limitation, not just omit the claim: {desc}"
+        );
+
+        // The node budget's own description must stay accurate about what it
+        // bounds — it caps the query count as well as the response size.
+        let nodes_desc = value["properties"]["max_nodes"]["description"]
+            .as_str()
+            .expect("max_nodes must carry a description");
+        assert!(
+            nodes_desc.contains("KNN"),
+            "max_nodes bounds the query count too, and a caller cannot infer that: {nodes_desc}"
+        );
     }
 
     // -----------------------------------------------------------------------

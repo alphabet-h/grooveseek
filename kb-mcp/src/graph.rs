@@ -89,9 +89,14 @@ pub const MAX_SEED_CHUNKS_CEILING: u32 = 1000;
 /// 65 KiB (≒ 16.6k token)**。上限なしの既定 depth=2 は最大の文書で実測
 /// 1,997 ノード / 86.7 秒だったので、約 12 倍の短縮になる。
 ///
-/// 天井 2000 は実測の depth 3 最悪 (1,997 ノード) のすぐ上に置いた。
-/// `kb-mcp graph --max-nodes 2000 --max-seed-chunks 1000` は 1000 チャンク
-/// 以下の文書について**従来と同じ結果**を再現する。
+/// 天井 2000 は既定 depth=2 の実測最悪 (1,997 ノード) のすぐ上に置いた。
+/// `kb-mcp graph --max-nodes 2000 --max-seed-chunks 1000` は、**2,000 ノード
+/// 以下に収まる探索**については従来と同じ結果を `truncated: false` で再現する
+/// (実測: depth 1 の 767 ノードと depth 2 の 1,997 ノードは完全一致)。
+/// depth 3 は実測 3,682 ノードでこの天井を超えるので再現できない
+/// — 天井での実行は 2,000 ノード / 約 59 秒 / `truncated: true` になる。
+/// **2,000 ノードを超える結果は誰にも取得できない**、が意図した capability の
+/// 縮小。
 pub const DEFAULT_MAX_NODES: u32 = 100;
 pub const MAX_NODES_CEILING: u32 = 2000;
 
