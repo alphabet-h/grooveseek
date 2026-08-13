@@ -34,6 +34,14 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
   independent of term order, and covering every term that occurs. All six are
   asserted, and each was confirmed to fail against a reverted fix.
 
+  Order-independence has one documented boundary. `query_phrases` caps the
+  phrase list at 32 *in query order*, so reordering a query that exceeds the
+  cap changes which fragments the full-text search looks for at all — that is
+  search behaviour, not highlighting, and it is out of scope here. The
+  100-term limit on the whitespace-fallback path had the same problem and is
+  fixed: that list is sorted and deduplicated before it is truncated, so the
+  cutoff no longer follows word order.
+
   The alternative — collect every occurrence, then keep the 100 best by
   occurrence rank — was measured and rejected: **100–450× slower** (157 µs →
   33.1 ms for 32 dense phrases over a 256 KiB chunk; with `limit` up to 1000

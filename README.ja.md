@@ -410,7 +410,7 @@ v0.3.0 から `search` MCP ツールの戻り値が単なるヒット配列で�
 }
 ```
 
-`results[].match_spans` はクエリを分割した term がすべて ASCII の場合に `content` 内のバイトオフセットを返すため、MCP クライアント側で原文の正確な引用を作れる。span は昇順かつ**互いに重ならない**。100 span の予算は検索した term 間で分け合うので、ある term が数百回一致しても 1 回しか出ない term はハイライトされる。クエリの語順を入れ替えても同じ配列が返る (v0.18.0+、完全な契約は [docs/citations.ja.md](docs/citations.ja.md))。`low_confidence` は順位ベースの flag (`top1.score / mean(top-N.score) < min_confidence_ratio`) で、閾値の既定は `1.5`。`kb-mcp.toml` の `[search].min_confidence_ratio` で全体調整、`--min-confidence-ratio` で per-query 上書き可能。
+`results[].match_spans` はクエリを分割した term がすべて ASCII の場合に `content` 内のバイトオフセットを返すため、MCP クライアント側で原文の正確な引用を作れる。span は昇順かつ**互いに重ならない**。100 span の予算は検索した term 間で分け合うので、ある term が数百回一致しても 1 回しか出ない term はハイライトされる。32 phrase 上限に当たらない限り、クエリの語順を入れ替えても同じ配列が返る (v0.18.0+、完全な契約とこの但し書きは [docs/citations.ja.md](docs/citations.ja.md))。`low_confidence` は順位ベースの flag (`top1.score / mean(top-N.score) < min_confidence_ratio`) で、閾値の既定は `1.5`。`kb-mcp.toml` の `[search].min_confidence_ratio` で全体調整、`--min-confidence-ratio` で per-query 上書き可能。
 
 入力境界 (防御的、v0.6.0+): `query` は 1 KiB 上限、超過時は `ErrorResponse` で reject。`match_spans` は 256 KiB 以下の chunk にのみ計算、上限 100 span/chunk。乱用防止が目的で正常用途には影響しない — 通常 chunk は十分上限以下。
 

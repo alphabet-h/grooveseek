@@ -1228,8 +1228,11 @@ pub(crate) const MATCH_SPAN_MAX_TERMS: usize = 100;
 /// 2. **非空**: すべての span が `start < end`
 /// 3. **冪等**: 出力にもう一度同じ畳み込みを掛けても変わらない
 /// 4. **件数上限**: `MATCH_SPAN_MAX_COUNT` (100) 件以下
-/// 5. **語順非依存**: 同じ term 集合なら、クエリ内の語順を入れ替えても
-///    バイト単位で同じ配列を返す
+/// 5. **語順非依存**: クエリ内の語順を入れ替えてもバイト単位で同じ配列を返す。
+///    **ただし `query_phrases` の 32 phrase 上限に当たっていない場合に限る** —
+///    上限に当たると `dedup_and_cap_counted` が「クエリ順で先頭 32 個」を残すので、
+///    語順を変えると **FTS が検索する phrase 集合そのもの**が変わる。これは
+///    ハイライトではなく検索の挙動なので、ここでは直せない (codex P2、PR #142)
 /// 6. **カバレッジ**: term が k 個 (k ≤ 100) あって各々が 1 回以上出現するなら、
 ///    **すべての term** が最低 1 つの span に覆われる
 ///
@@ -1237,6 +1240,10 @@ pub(crate) const MATCH_SPAN_MAX_TERMS: usize = 100;
 /// 出現順に取ることで出す。余った予算は**再配分しない** — 配分すると「どの
 /// term が追加分を得るか」が term 順に依存し、6 が消しにいった順序依存が縁に
 /// 戻るため。k=32 なら 96 件で止まる (100 件に届かない) が、それが代償。
+///
+/// `MATCH_SPAN_MAX_TERMS` で切る前に term 列を dedup + ソートするのも 5 のため。
+/// 素朴に先頭 100 個を取ると、101 個以上の token を並べたクエリで語順が cutoff に
+/// 効いてしまう。
 ///
 /// ## なぜこの形か (実測)
 ///
@@ -1285,7 +1292,19 @@ pub fn compute_match_spans(query: &str, content: &str) -> Option<Vec<crate::db::
 
     // (BU-10) term 数を切る。`query_phrases` 側は 32 で cap 済みなので、
     // 効くのは whitespace fallback だけ。
-    let terms: Vec<&str> = terms.into_iter().take(MATCH_SPAN_MAX_TERMS).collect();
+    //
+    // **切る前に正規化する** (codex P2、PR #142)。素朴に `take(100)` すると
+    // 「クエリ内で先に書いた 100 個」が残るので、101 個以上の短い token を
+    // 並べたクエリ (2 byte token なら 1 KiB 上限に十分収まる) では語順を
+    // 入れ替えるだけで残る term が変わり、語順非依存の保証が破れる。
+    // dedup + ソートで cutoff を語順から切り離す。
+    //
+    // ソートは cutoff にしか影響しない: 各 term は独立に予算を持ち、span は
+    // 最後にまとめて畳むので、走査順は出力を変えない。
+    let mut terms: Vec<&str> = terms;
+    terms.sort_unstable();
+    terms.dedup();
+    terms.truncate(MATCH_SPAN_MAX_TERMS);
 
     let content_lower = content.to_ascii_lowercase();
     // (BU-10) 1 term あたりの予算。floor なので合計は必ず cap 以下になる
@@ -2788,6 +2807,41 @@ mod tests {
             spans.len() > MATCH_SPAN_MAX_COUNT / 2,
             "the budget should still be mostly spent, got {} spans",
             spans.len()
+        );
+    }
+
+    /// (codex P2 on PR #142) The term cutoff itself must not depend on word
+    /// order.
+    ///
+    /// `span_selection_does_not_depend_on_term_order` uses six terms, so it
+    /// never reaches `MATCH_SPAN_MAX_TERMS` and cannot see this. With more
+    /// terms than the clamp allows, a naive `take(100)` keeps whichever were
+    /// typed first: reorder the query and a term crosses the cutoff, losing
+    /// its highlight. Sorting before truncating is what makes the guarantee
+    /// hold at the boundary too.
+    #[test]
+    fn the_term_cutoff_does_not_depend_on_word_order() {
+        let words: Vec<String> = (0..150)
+            .map(|i| {
+                format!(
+                    "{}{}",
+                    (b'a' + (i / 26) as u8) as char,
+                    (b'a' + (i % 26) as u8) as char
+                )
+            })
+            .collect();
+        let content = words.join(" ");
+        let forward = words.join(" ");
+        let reversed = words.iter().rev().cloned().collect::<Vec<_>>().join(" ");
+        assert!(
+            crate::db::query_phrases(&forward).is_empty(),
+            "precondition: this must exercise the whitespace fallback"
+        );
+        assert_eq!(
+            tuples(&assert_span_contract(&forward, &content)),
+            tuples(&assert_span_contract(&reversed, &content)),
+            "reversing a query with more terms than MATCH_SPAN_MAX_TERMS changed \
+             the spans; the cutoff is following word order"
         );
     }
 

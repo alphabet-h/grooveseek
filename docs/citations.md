@@ -78,7 +78,7 @@ The result satisfies, for every response (v0.18.0+):
 | Sorted and disjoint | `spans[i].end <= spans[i+1].start`. No span overlaps another. |
 | Non-empty | Every span has `start < end`. |
 | Bounded | At most 100 spans (`MATCH_SPAN_MAX_COUNT`). |
-| Order-independent | Reordering the words of your query returns the identical array. |
+| Order-independent | Reordering the words of your query returns the identical array — **provided the query stays under the 32-phrase cap** (see below). |
 | Covering | If your query has *k* terms (k ≤ 100) and each occurs at least once, **every one of them** is covered by some span. |
 | Idempotent | Folding the same rule over the returned array changes nothing. |
 
@@ -88,7 +88,7 @@ Sharing the split with FTS has three visible consequences:
 
 - A region you wrap in `"..."` is **one term**, so it yields **one span** per occurrence: `"Foundry Local"` highlights `Foundry Local` whole and never breaks into a span per word.
 - A fragment shorter than 3 characters is not a phrase on its own, so it is not highlighted on its own: in `ML pipelines` only `pipelines` is highlighted. (The whitespace fallback of step 2 is the exception — there no phrase existed to begin with.)
-- The phrase list is deduplicated and capped at 32, so a very long query highlights only its first 32 distinct fragments — on top of the 100-span cap of step 5.
+- The phrase list is deduplicated and capped at 32, so a very long query highlights only its first 32 distinct fragments — on top of the 100-span cap of step 5. **This is the one place term order still matters**: the cap keeps the first 32 *in query order*, so reordering a query that exceeds it changes which fragments survive. That is a property of what the full-text search looks for, not of highlighting, so the order-independence guarantee above is scoped to queries below the cap. (The 100-term limit on the whitespace-fallback path does not have this problem — that list is sorted before it is truncated.)
 
 ## Non-ASCII queries
 
