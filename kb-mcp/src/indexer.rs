@@ -37,6 +37,10 @@ pub const HARDCODED_EXCLUDE_DIRS: &[&str] = &[".git", ".svn", "node_modules"];
 /// The cost on Linux, where the two really are different directories, is that
 /// a directory literally named `.GIT` is skipped as well; that is the safer
 /// side to err on for a hardcoded VCS denylist.
+///
+/// ASCII folding is complete here because [`HARDCODED_EXCLUDE_DIRS`] is ASCII
+/// by construction. [`is_user_excluded_dir`], which compares arbitrary
+/// configured names, needs the Unicode-aware form instead.
 pub fn is_hardcoded_excluded(basename: &str) -> bool {
     HARDCODED_EXCLUDE_DIRS
         .iter()
@@ -53,9 +57,22 @@ pub fn is_hardcoded_excluded(basename: &str) -> bool {
 /// a `Build/` that the index walk skipped. Route every such decision through
 /// here.
 ///
-/// Case-insensitive for the same reason as [`is_hardcoded_excluded`].
+/// Case-insensitive for the same reason as [`is_hardcoded_excluded`], but
+/// unlike that function — whose entries are ASCII by construction — this one
+/// compares arbitrary user input, so it folds case over the whole of Unicode
+/// via `str::to_lowercase`: `exclude_dirs = ["résumé"]` has to match a
+/// directory stored as `RÉSUMÉ` (codex P2 on PR #141).
+///
+/// It does **not** normalize. A name written with combining marks
+/// (`e` + U+0301) still differs from the precomposed `é`, in either case.
+/// Filesystems generally hand back one consistent form, so this matters only
+/// if the configured string and the directory on disk were typed on different
+/// systems; there is no attempt to paper over that here.
 pub fn is_user_excluded_dir(name: &str, exclude_dirs: &[String]) -> bool {
-    exclude_dirs.iter().any(|d| d.eq_ignore_ascii_case(name))
+    exclude_dirs.iter().any(|d| {
+        // Fast path: identical bytes, which is what almost every call is.
+        d.as_str() == name || d.to_lowercase() == name.to_lowercase()
+    })
 }
 
 /// MS Office (`~$doc.docx`) / LibreOffice (`.~lock.doc.docx#`) のロック・owner
@@ -1468,6 +1485,22 @@ mod tests {
                 "{name} is a different directory and must not be excluded"
             );
         }
+
+        // Configured names are arbitrary user input, so folding has to cover
+        // more than ASCII (codex P2 on PR #141). Normalization is explicitly
+        // out of scope: the precomposed and decomposed spellings of `é` are
+        // different strings and stay that way.
+        let unicode = vec!["résumé".to_string(), "Ünterlagen".to_string()];
+        for name in ["RÉSUMÉ", "Résumé", "résumé", "ÜNTERLAGEN", "ünterlagen"] {
+            assert!(
+                is_user_excluded_dir(name, &unicode),
+                "{name} must match a configured non-ASCII exclusion"
+            );
+        }
+        assert!(
+            !is_user_excluded_dir("resume", &unicode),
+            "an unaccented name is a different directory, not a case variant"
+        );
 
         let tmp = mk_tmp("excludecase");
         write_file(&tmp.0, "Build/inside.md", "# inside");
