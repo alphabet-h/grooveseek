@@ -120,6 +120,10 @@ impl Database {
         // 追加する (DEFAULT 1.0 で既存行は全件「通過」扱い)。
         self.ensure_quality_score_column()?;
 
+        // (BU-33) 起点ドキュメントのチャンクを chunk_index 順に読む索引。
+        // 既存 DB でも open のたびに張られる (IF NOT EXISTS)。
+        self.ensure_chunk_order_index()?;
+
         // legacy DB 互換: chunks.level 列が無ければ ALTER で追加する
         // (NULL のまま — 値は再 index 時に埋まる)。
         self.ensure_chunk_level_column()?;
@@ -169,6 +173,28 @@ impl Database {
         // 将来の「低品質チャンクだけ一覧」クエリ用の副次インデックス。
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chunks_quality ON chunks(quality_score);",
+        )?;
+        Ok(())
+    }
+
+    /// `chunks(document_id, chunk_index)` の複合インデックスを張る (idempotent、
+    /// BU-33)。
+    ///
+    /// これが無いと `chunks_for_path_capped` の `LIMIT` が**データベースの仕事を
+    /// 縛れない**。`EXPLAIN QUERY PLAN` が `SCAN c` + `USE TEMP B-TREE FOR
+    /// ORDER BY` を返す = SQLite は chunks を全走査して全一致行を整列してから
+    /// 先頭 `cap + 1` 行を返す。つまり `LIMIT` が減らせるのは「返した行の
+    /// materialize」(embedding の `vec_to_json` → JSON parse、本文の複製) だけで、
+    /// 走査自体は KB 全体に比例したままだった。
+    ///
+    /// 実測 (9,419 チャンク、160 チャンクの文書を `cap = 32` で読む、30 回の中央値):
+    /// **8.00 ms → 0.22 ms**。索引後の plan は `SEARCH c USING INDEX` で TEMP
+    /// B-TREE も消える。索引の構築は 17 ms、DB サイズへの影響は測定誤差内。
+    /// 効くのは絶対値より**次数**で、索引後の読み取りは KB の大きさではなく
+    /// `cap` に比例する。
+    fn ensure_chunk_order_index(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_doc_order ON chunks(document_id, chunk_index);",
         )?;
         Ok(())
     }

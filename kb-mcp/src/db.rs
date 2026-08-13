@@ -1435,6 +1435,65 @@ mod tests {
         assert!(!more);
     }
 
+    /// (BU-33) A `LIMIT` only bounds the *returned* rows. Without an index on
+    /// `(document_id, chunk_index)` SQLite still scans every chunk and sorts
+    /// the matches before taking the first `cap + 1`, so the seed read stays
+    /// proportional to the whole knowledge base — measured at 8.00 ms vs
+    /// 0.22 ms on 9,419 chunks. Assert the plan, not the clock: the clock is
+    /// machine-dependent, the plan is the property that makes the bound real.
+    #[test]
+    fn the_capped_seed_read_is_index_backed_not_a_table_scan() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("d.md", None, None, None, None, &[], None, "h1")
+            .unwrap();
+        for i in 0..5 {
+            db.insert_chunk(
+                doc_id,
+                i,
+                None,
+                None,
+                "body",
+                None,
+                &dummy_embedding(0.1),
+                1.0,
+            )
+            .unwrap();
+        }
+
+        let plan: Vec<String> = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT c.id, c.content, c.heading, c.document_id,
+                        d.path, d.title, d.topic, d.date, d.tags
+                 FROM chunks c
+                 JOIN documents d ON d.id = c.document_id
+                 WHERE d.path = ?1
+                 ORDER BY c.chunk_index
+                 LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params!["d.md", 4i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        let plan = plan.join(" | ");
+
+        assert!(
+            plan.contains("idx_chunks_doc_order"),
+            "the seed read must be index-backed, got: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN c"),
+            "a full scan of chunks makes the cap cost-free only in appearance: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "sorting every match before the LIMIT is the work the cap should avoid: {plan}"
+        );
+    }
+
     #[test]
     fn test_get_chunk_embedding_roundtrip() {
         let db = db_with_384();

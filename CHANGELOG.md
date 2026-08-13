@@ -40,6 +40,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (`knn_queries <= total_nodes <= max_nodes`). Over-large values are clamped,
   not rejected — the same doctrine as `depth` / `fan_out` / `limit`.
 
+  A `LIMIT` alone would not have bounded the database's work: without an index
+  on `(document_id, chunk_index)`, SQLite scanned every chunk and sorted the
+  matches before returning the first `cap + 1` rows (`EXPLAIN QUERY PLAN`:
+  `SCAN c` + `USE TEMP B-TREE FOR ORDER BY`). The index is now created on open,
+  idempotently, for new and existing databases alike — 17 ms to build on a
+  9,419-chunk index, no measurable size change, and the seed read drops from
+  8.00 ms to 0.22 ms while becoming proportional to the cap rather than to the
+  size of the knowledge base. A test asserts the query plan rather than the
+  clock.
+
   Both bounds are needed. A node budget alone degenerates: BFS emits every seed
   before any neighbour, so on that 160-chunk document any budget below 160
   returned a connection graph with **zero connections**.

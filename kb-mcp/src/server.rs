@@ -218,9 +218,9 @@ struct GetConnectionGraphParams {
     /// (default: 0.3). Lower = looser chain.
     min_similarity: Option<f32>,
     /// Seed strategy: "all_chunks" (default, expand from each seeded chunk of
-    /// the start doc) or "centroid" (average their embeddings into one seed,
-    /// leaving the whole node budget for connections). Both operate on the
-    /// first max_seed_chunks chunks only.
+    /// the start doc) or "centroid" (average their embeddings into a single
+    /// seed node, so all of max_nodes except that one node is left for
+    /// connections). Both read the first max_seed_chunks chunks only.
     seed_strategy: Option<String>,
     /// Filter by category (applied to all discovered nodes)
     category: Option<String>,

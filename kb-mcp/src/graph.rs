@@ -388,12 +388,15 @@ pub fn build_connection_graph(
         // centroid に切り替えても平均されるのは同じ前半だけで、落ちたチャンクは
         // 戻ってこない (`max_nodes` の方の対処とは違う)。
         let detail = match opts.seed_strategy {
+            // 「読んだ」までしか言わない。実際に展開された数は node 予算次第で
+            // さらに減り、それは `node_budget` の entry と `stats.seeds_used` が
+            // 受け持つ。ここで「展開した」と書くと、両方が効いた時に嘘になる。
             SeedStrategy::AllChunks => format!(
                 "the start document has more than {seed_cap} chunks; only its first {seed_cap} \
-                 were read, and only those were expanded as BFS seeds. Raise max_seed_chunks to \
-                 cover more of it -- seed_strategy \"centroid\" frees the node budget for \
-                 connections but averages the same capped prefix, so it does not recover the \
-                 chunks dropped here."
+                 were read, so only those were eligible as BFS seeds (stats.seeds_used reports \
+                 how many were actually expanded). Raise max_seed_chunks to cover more of it -- \
+                 seed_strategy \"centroid\" frees the node budget for connections but averages \
+                 the same capped prefix, so it does not recover the chunks dropped here."
             ),
             SeedStrategy::Centroid => format!(
                 "the start document has more than {seed_cap} chunks; the centroid is the average \
@@ -1181,6 +1184,14 @@ mod tests {
         assert!(
             g.truncation[0].detail.contains("does not recover"),
             "the remedy must not promise centroid recovers the dropped chunks: {}",
+            g.truncation[0].detail
+        );
+        // This entry speaks for the read only. How many of those chunks were
+        // actually expanded also depends on the node budget, so claiming they
+        // were expanded here would be false whenever both bounds fire.
+        assert!(
+            !g.truncation[0].detail.contains("were expanded"),
+            "the seed entry must not claim what the node budget decides: {}",
             g.truncation[0].detail
         );
     }
