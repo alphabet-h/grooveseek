@@ -23,15 +23,25 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
   the database lock throughout. That cost is now documented in the README
   alongside the caps; bounding it is tracked separately.
 
-- **Directory exclusion is case-insensitive** (BU-19). `exclude_dirs` and the
-  hardcoded `.git` / `.svn` / `node_modules` fail-safe both compared basenames
-  exactly. On Windows and macOS `Build` and `build` are one directory, so the
-  exclusion could be bypassed by however the directory happened to be
-  capitalised — and the fail-safe would index a `.GIT` directory. On Linux the
-  two really are distinct, and skipping both is the safer side to err on for a
-  denylist. While documenting this, the README's claim that `exclude_dirs = []`
-  "walks everything, including `.git/`" turned out to be false: the hardcoded
-  denylist has applied regardless since v0.7.5 (F-62).
+- **Directory exclusion is case-insensitive, in all three places that decide
+  it** (BU-19). `exclude_dirs` and the hardcoded `.git` / `.svn` /
+  `node_modules` fail-safe both compared basenames exactly. On Windows and
+  macOS `Build` and `build` are one directory, so the exclusion could be
+  bypassed by however the directory happened to be capitalised — and the
+  fail-safe would index a `.GIT` directory. On Linux the two really are
+  distinct, and skipping both is the safer side to err on for a denylist.
+
+  The decision now lives in one function, `indexer::is_user_excluded_dir`,
+  used by the index walk, the `validate` walk and the live watcher. Those
+  three have drifted apart before — AU-03 found the watcher missing the
+  hardcoded denylist the other two applied — and they drifted again inside
+  this change: the first version switched only the two walkers, which left the
+  watcher incrementally indexing a `Build/` that the full index skipped, a
+  state worse than before the fix.
+
+  While documenting this, the README's claim that `exclude_dirs = []` "walks
+  everything, including `.git/`" turned out to be false: the hardcoded denylist
+  has applied regardless since v0.7.5 (F-62).
 
 - **A dual-stack bind no longer locks the tray out of the admin endpoints**
   (BU-21). `Ipv6Addr::is_loopback` recognises only `::1`, but a listener on

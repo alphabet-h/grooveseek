@@ -43,6 +43,21 @@ pub fn is_hardcoded_excluded(basename: &str) -> bool {
         .any(|d| d.eq_ignore_ascii_case(basename))
 }
 
+/// (BU-19) Does a single path component match a user `exclude_dirs` entry?
+///
+/// The one place that decides it, because there are three callers — the index
+/// walk, the `validate` walk, and the live watcher — and they have drifted
+/// apart before: AU-03 found the watcher missing the hardcoded denylist that
+/// the other two applied, and BU-19 landed with two of the three switched to
+/// case-insensitive matching, so the watcher would have incrementally indexed
+/// a `Build/` that the index walk skipped. Route every such decision through
+/// here.
+///
+/// Case-insensitive for the same reason as [`is_hardcoded_excluded`].
+pub fn is_user_excluded_dir(name: &str, exclude_dirs: &[String]) -> bool {
+    exclude_dirs.iter().any(|d| d.eq_ignore_ascii_case(name))
+}
+
 /// MS Office (`~$doc.docx`) / LibreOffice (`.~lock.doc.docx#`) のロック・owner
 /// ファイルを拡張子に関わらず skip する。`~$` 版は拡張子が `docx` のまま走査に
 /// 乗るため明示フィルタ必須。`.~lock.*#` 版は拡張子が `docx#` になり既存の
@@ -920,14 +935,7 @@ fn collect_source_files(
             if is_hardcoded_excluded(name.as_ref()) {
                 return false;
             }
-            // (BU-19) Case-insensitive for the same reason as
-            // `is_hardcoded_excluded`: on Windows / macOS `Node_Modules` and
-            // `node_modules` are one directory, so an exact match lets the
-            // configured exclusion be bypassed by however the directory
-            // happens to be capitalised on disk.
-            !exclude_dirs
-                .iter()
-                .any(|d| d.as_str().eq_ignore_ascii_case(name.as_ref()))
+            !is_user_excluded_dir(name.as_ref(), exclude_dirs)
         })
     {
         let entry = entry.context("walkdir error")?;

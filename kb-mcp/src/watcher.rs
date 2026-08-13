@@ -98,14 +98,28 @@ pub struct WatcherState {
 }
 
 /// `rel` (forward-slash 相対パス) が `exclude_dirs` のいずれかの配下に
-/// あるかを判定する。basename 完全一致を `/` 境界で判定するため、
+/// あるかを判定する。basename を `/` 境界で判定するため、
 /// 例えば `["node_modules"]` に対して `"node_modules/"` 開始や
 /// `"sub/node_modules/"` 含みはヒットするが、`"node_modules-bak/"` は
 /// ヒットしない。
+///
+/// (BU-19) 判定そのものは [`indexer::is_user_excluded_dir`] に委譲する。
+/// index walk 側だけ大文字小文字を無視するようにすると、`exclude_dirs =
+/// ["build"]` + ディスク上 `Build/` で **full index は skip するのに watcher が
+/// 増分 index する**という食い違いが生まれる (= AU-03 で watcher だけ
+/// hardcoded denylist を持っていなかったのと同型)。
 fn is_under_excluded_dir(rel: &str, exclude_dirs: &[String]) -> bool {
-    exclude_dirs
-        .iter()
-        .any(|d| rel == d || rel.starts_with(&format!("{d}/")) || rel.contains(&format!("/{d}/")))
+    // 最後の要素はイベント対象そのもの。`rel` が除外ディレクトリ名と完全一致
+    // する場合 (= ディレクトリ自体のイベント) だけそこも見る、という旧実装
+    // (`rel == d || starts_with("{d}/") || contains("/{d}/")`) と同じ範囲。
+    let comps: Vec<&str> = rel.split('/').collect();
+    let dirs = if comps.len() == 1 {
+        &comps[..]
+    } else {
+        &comps[..comps.len() - 1]
+    };
+    dirs.iter()
+        .any(|c| indexer::is_user_excluded_dir(c, exclude_dirs))
 }
 
 /// Watcher タスク本体。notify の裏スレッドから tokio channel 越しにイベントを
@@ -735,6 +749,48 @@ mod tests {
         // denylist に無い通常ファイルは従来どおり通す。
         let ok = Path::new("/tmp/kb/notes/a.md");
         assert!(should_process_lite("notes/a.md", ok, &reg, &empty));
+    }
+
+    /// (BU-19, codex P1 on PR #141) The watcher applies `exclude_dirs` with
+    /// the same case rules as the index walk.
+    ///
+    /// This is AU-03's shape a second time. BU-19 made
+    /// `collect_source_files` and `validate` match case-insensitively so a
+    /// directory on disk called `Build` could not walk past
+    /// `exclude_dirs = ["build"]`. The watcher kept its own exact comparison,
+    /// which is worse than before the fix: the full index skips the directory
+    /// while the live watcher incrementally indexes everything written into
+    /// it. Both now go through `indexer::is_user_excluded_dir`.
+    #[test]
+    fn watcher_applies_exclude_dirs_with_the_same_case_rules_as_the_index_walk() {
+        let reg = Registry::defaults();
+        let excludes = vec!["build".to_string(), "Cache".to_string()];
+
+        for rel in [
+            "build/out.md",
+            "Build/out.md",
+            "BUILD/out.md",
+            "sub/Build/deep/out.md",
+            "cache/x.md",
+            "CACHE/x.md",
+        ] {
+            let full = Path::new("/tmp/kb").join(rel);
+            assert!(
+                !should_process_lite(rel, &full, &reg, &excludes),
+                "{rel} is under a configured exclusion however it is capitalised, \
+                 so the watcher must ignore it — otherwise it indexes what the \
+                 full index walk skips"
+            );
+        }
+
+        // The bound is still a bound: a different directory is not excluded.
+        for rel in ["build-output/x.md", "notes/rebuild/x.md", "cached/x.md"] {
+            let full = Path::new("/tmp/kb").join(rel);
+            assert!(
+                should_process_lite(rel, &full, &reg, &excludes),
+                "{rel} names a different directory and must still be watched"
+            );
+        }
     }
 
     #[test]
