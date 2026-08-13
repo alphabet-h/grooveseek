@@ -146,8 +146,10 @@ bind = "127.0.0.1:3100"
 
 # Whether /healthz sits outside the allow-list (v0.7.5+). The default is public,
 # with no Host check. Turn it off to have /healthz validated like every other
-# endpoint, so a non-allowlisted host gets 403 — opt in when you would rather
-# not let an unknown caller fingerprint kb-mcp's presence.
+# endpoint, so a request whose Host header is not on the allow-list gets 403
+# instead of 200. This is NOT authentication: the Host header is chosen by the
+# caller, so anyone who reaches the port and sends an allowed value still gets a
+# 200. It raises the bar for incidental probes, nothing more.
 #healthz_public = false
 
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------

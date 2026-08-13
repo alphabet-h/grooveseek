@@ -2,7 +2,7 @@
 
 All notable changes to kb-mcp are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer's local timezone (JST). Verify with `git for-each-ref --format='%(taggerdate:format-local:%Y-%m-%d)' refs/tags/vX.Y.Z`; writing the date before tagging is how the two drift apart.
+Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer's timezone (JST). Verify with `TZ=Asia/Tokyo git for-each-ref --format='%(taggerdate:format-local:%Y-%m-%d)' refs/tags/vX.Y.Z` — `format-local` renders in *your* timezone, so the `TZ` prefix is what makes the answer JST rather than wherever you happen to be. Writing the date before tagging is the other way the two drift apart.
 
 ## [Unreleased]
 

@@ -46,7 +46,7 @@ The binary is produced at `target/release/kb-mcp` (or `kb-mcp.exe` on Windows).
 
 Any CLI option below can be given a default via a `kb-mcp.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`kb-mcp/kb-mcp.toml.example`](kb-mcp/kb-mcp.toml.example) to `kb-mcp.toml` and edit.
 
-**A fresh copy of that template changes nothing.** It is not blank — a few sections (`[quality_filter]`, `[parsers]`, `[watch]`, `[transport]`, `[transport.http]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behaviour is commented out. The block below instead shows keys filled in with non-default values, to illustrate what each one does — read it as a menu, not as a file to paste wholesale:
+**A fresh copy of that template changes nothing.** It is not blank — a few sections (`[quality_filter]`, `[parsers]`, `[watch]`, `[transport]`, `[transport.http]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behaviour is commented out. The block below is a different thing: an illustration of what each key does, with values filled in — some of them non-default, some of them just the default spelled out. Read it as a menu, not as a file to paste wholesale:
 
 ```toml
 # kb-mcp.toml (placed in the project root, the .git ancestor, or next to kb-mcp)
@@ -111,7 +111,10 @@ bind = "127.0.0.1:3100"
 # allowed_hosts = ["kb.example.lan", "192.168.1.10"]  # opt-in for LAN exposure (v0.5.0+)
 # Whether /healthz sits outside the allowed_hosts check. Default true (public,
 # no Host check). Set false to have /healthz validated like every other
-# endpoint, so an unknown caller cannot fingerprint kb-mcp's presence (v0.7.5+).
+# endpoint, so a request whose Host header is not on the allow-list gets 403
+# instead of 200 (v0.7.5+). Not authentication: the Host header is chosen by
+# the caller, so anyone who can reach the port and sends an allowed value still
+# gets a 200. It raises the bar for incidental probes, nothing more.
 # healthz_public = false
 
 # Optional: `kb-mcp eval` (retrieval quality evaluation, power-user feature).
