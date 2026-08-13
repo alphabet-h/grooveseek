@@ -294,10 +294,32 @@ impl Database {
     /// 指定 `path` に属するチャンクを (chunk_id, embedding, SearchResult) で返す。
     /// Connection Graph の起点シード取得用。存在しなければ empty Vec。
     ///
+    /// 上限なし。**新規の呼び出しは [`Self::chunks_for_path_limited`] を使うこと**
+    /// (BU-33: 1 文書のチャンク数に上限が無く、160 チャンクの文書が 160 個の
+    /// シードになって BFS のコストを決めていた)。本メソッドは既存呼び出し互換の
+    /// ために残した薄い委譲。
+    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, Vec<f32>, SearchResult)>> {
+        self.chunks_for_path_limited(path, u32::MAX)
+    }
+
+    /// [`Self::chunks_for_path`] に SQL 側の `LIMIT` を付けたもの。
+    ///
+    /// 打ち切りを **SQL に降ろす**のが要点で、Rust 側の `.take(n)` では意味が無い
+    /// (行はすべて `vec_to_json` でテキスト化され、`Vec<f32>` に parse され、
+    /// チャンク本文ごと materialize されてから捨てられる = BU-33 が名指しした
+    /// 「上限の無い読み取り」がそのまま残る)。
+    ///
+    /// 呼び出し側が「まだ続きがあるか」を判定できるよう、**欲しい件数 + 1** を
+    /// 渡す運用を想定している (返り値が `limit` 未満なら全件)。
+    ///
     /// `embedding` は `vec_to_json` で JSON 文字列として取り出し、serde_json で
     /// `Vec<f32>` に復元する。`SearchResult.score` はシード node 用に 1.0 を入れる
     /// (BFS 結果のスコアと同じ意味 = cos sim 換算値の上限)。
-    pub fn chunks_for_path(&self, path: &str) -> Result<Vec<(i64, Vec<f32>, SearchResult)>> {
+    pub fn chunks_for_path_limited(
+        &self,
+        path: &str,
+        limit: u32,
+    ) -> Result<Vec<(i64, Vec<f32>, SearchResult)>> {
         let sql = "
             SELECT c.id, vec_to_json(v.embedding),
                    c.content, c.heading, c.document_id,
@@ -307,9 +329,10 @@ impl Database {
             JOIN vec_chunks v ON v.chunk_id = c.id
             WHERE d.path = ?1
             ORDER BY c.chunk_index
+            LIMIT ?2
         ";
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![path], |row| {
+        let rows = stmt.query_map(params![path, limit as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,

@@ -229,6 +229,15 @@ struct GetConnectionGraphParams {
     /// If true, collapse same-path hits so each document appears at most once.
     /// Default: false (allow multiple chunks from the same doc).
     dedup_by_path: Option<bool>,
+    /// Max nodes in the returned graph; also caps how many KNN queries the walk
+    /// runs (default: 100, max: 2000). When it bites, the response carries
+    /// `truncated: true` and a `truncation` entry with reason `node_budget`.
+    max_nodes: Option<u32>,
+    /// Max chunks of the start document used to seed the walk (default: 32,
+    /// max: 1000). Raise it for a long start document you want seeded more
+    /// fully, or set seed_strategy to "centroid" to fold the whole document
+    /// into a single seed.
+    max_seed_chunks: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +805,14 @@ impl KbCore {
             exclude_paths: params.exclude_paths.unwrap_or_default(),
             dedup_by_path: params.dedup_by_path.unwrap_or(false),
             min_quality: self.quality_threshold,
+            // (BU-33) 上限は拒否せずクランプする。`depth` / `fan_out` /
+            // `min_similarity` と同じ流儀 (`clamp_search_limit` の doc も参照)。
+            max_nodes: graph::clamp_max_nodes(params.max_nodes.unwrap_or(graph::DEFAULT_MAX_NODES)),
+            max_seed_chunks: graph::clamp_max_seed_chunks(
+                params
+                    .max_seed_chunks
+                    .unwrap_or(graph::DEFAULT_MAX_SEED_CHUNKS),
+            ),
         };
 
         let db = self.db.lock().unwrap();

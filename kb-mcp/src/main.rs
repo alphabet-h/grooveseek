@@ -180,9 +180,17 @@ enum Commands {
         /// Minimum cosine similarity 0.0-1.0 (default 0.3)
         #[arg(long = "min-similarity", default_value_t = kb_mcp::graph::DEFAULT_MIN_SIMILARITY)]
         min_similarity: f32,
-        /// Seed strategy (all_chunks | centroid)
+        /// Seed strategy (all-chunks | centroid)
         #[arg(long = "seed-strategy", value_enum, default_value_t = CliSeedStrategy::AllChunks)]
         seed_strategy: CliSeedStrategy,
+        /// Max nodes in the graph; also caps the number of KNN queries
+        /// (default 100, clamped to max 2000)
+        #[arg(long = "max-nodes", default_value_t = kb_mcp::graph::DEFAULT_MAX_NODES)]
+        max_nodes: u32,
+        /// Max chunks of the start document used to seed the walk
+        /// (default 32, clamped to 1..=1000)
+        #[arg(long = "max-seed-chunks", default_value_t = kb_mcp::graph::DEFAULT_MAX_SEED_CHUNKS)]
+        max_seed_chunks: u32,
         /// Filter by category
         #[arg(long)]
         category: Option<String>,
@@ -921,6 +929,8 @@ fn main() -> anyhow::Result<()> {
             topic,
             exclude,
             dedup_by_path,
+            max_nodes,
+            max_seed_chunks,
             format,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
@@ -952,6 +962,8 @@ fn main() -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_default()
                     .effective_threshold(),
+                max_nodes: kb_mcp::graph::clamp_max_nodes(max_nodes),
+                max_seed_chunks: kb_mcp::graph::clamp_max_seed_chunks(max_seed_chunks),
             };
             let g = kb_mcp::graph::build_connection_graph(&db, &start, &opts)?;
             print_graph(g, format);
@@ -1497,12 +1509,19 @@ fn print_graph(g: kb_mcp::graph::ConnectionGraph, format: SearchFormat) {
         SearchFormat::Text => {
             println!("# Connection graph from: {}", g.start_path);
             println!(
-                "nodes={} max_depth={} knn_queries={} duration_ms={}",
+                "nodes={} max_depth={} knn_queries={} duration_ms={} seeds_used={} truncated={}",
                 g.stats.total_nodes,
                 g.stats.max_depth_reached,
                 g.stats.knn_queries,
-                g.stats.duration_ms
+                g.stats.duration_ms,
+                g.stats.seeds_used,
+                g.truncated
             );
+            // (BU-33) 打ち切りの理由と対処は text 出力でも見えるようにする。
+            // ここを落とすと、CLI だけが上限の見えない経路になる。
+            for t in &g.truncation {
+                println!("! truncated ({:?}, limit={}): {}", t.reason, t.limit, t.detail);
+            }
             for n in &g.nodes {
                 println!();
                 let parent = n

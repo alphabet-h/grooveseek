@@ -50,6 +50,12 @@ pub struct GraphOptions {
     /// 0.0 ならフィルタ無効。seed ノードには適用しない (ユーザが明示指定した
     /// 起点なので低品質でも残す)。
     pub min_quality: f32,
+    /// 起点ドキュメントから何チャンクをシードに使うか (BU-33)。
+    /// `0` は 1 にクランプされる ([`clamp_max_seed_chunks`])。
+    pub max_seed_chunks: u32,
+    /// グラフ全体のノード数の上限 (BU-33)。KNN 実行回数もこれで縛られる。
+    /// `0` はそのまま「空グラフを返せ」として扱う (`fan_out = 0` と同じ流儀)。
+    pub max_nodes: u32,
 }
 
 /// 上限 (MCP スキーマでバリデーション) — サーバ側でも再度強制する。
@@ -59,6 +65,50 @@ pub const MAX_FAN_OUT: u32 = 20;
 pub const DEFAULT_DEPTH: u32 = 2;
 pub const DEFAULT_FAN_OUT: u32 = 5;
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.3;
+
+/// シードに使う起点チャンク数の既定と天井 (BU-33)。
+///
+/// `depth` / `fan_out` の天井は 1 リクエストのコストを縛れていなかった。BFS の
+/// シードは起点ドキュメントの**全チャンク**で、その数に上限が無かったためで、
+/// 実測 (650 文書 / 9,419 チャンク / 1024 次元の実 KB) では最大の文書が 160
+/// チャンク = depth 1 でも 160 回の KNN になっていた。
+///
+/// 既定 32 は実測分布から選んだ: チャンク数は median 13 / p90 26 / p99 43 /
+/// max 160 で、32 を超える文書は **650 中 26 件 (4.0%)**。つまり打ち切りは
+/// 少数の長大な文書でだけ起き、そこでは `truncated` が立つ。
+pub const DEFAULT_MAX_SEED_CHUNKS: u32 = 32;
+pub const MAX_SEED_CHUNKS_CEILING: u32 = 1000;
+
+/// グラフのノード数の既定と天井 (BU-33)。
+///
+/// 各ノードは高々 1 回しか展開されないので `knn_queries <= total_nodes`。
+/// したがってこの 1 つの上限が**応答サイズと KNN 実行回数の両方**を縛る。
+///
+/// 既定 100 の根拠 (同じ実 KB での実測): 1 KNN ≈ 72 ms、1 ノード ≈ 4 ms、
+/// JSON は 1 ノード ≈ 665 バイト。よって最悪 100 × 76 ms ≈ **7.2 秒 /
+/// 65 KiB (≒ 16.6k token)**。上限なしの既定 depth=2 は最大の文書で実測
+/// 1,997 ノード / 86.7 秒だったので、約 12 倍の短縮になる。
+///
+/// 天井 2000 は実測の depth 3 最悪 (1,997 ノード) のすぐ上に置いた。
+/// `kb-mcp graph --max-nodes 2000 --max-seed-chunks 1000` は 1000 チャンク
+/// 以下の文書について**従来と同じ結果**を再現する。
+pub const DEFAULT_MAX_NODES: u32 = 100;
+pub const MAX_NODES_CEILING: u32 = 2000;
+
+/// `max_nodes` を天井へクランプする。`0` は「空グラフ」として尊重する。
+pub fn clamp_max_nodes(n: u32) -> u32 {
+    n.min(MAX_NODES_CEILING)
+}
+
+/// `max_seed_chunks` を `1..=MAX_SEED_CHUNKS_CEILING` にクランプする。
+///
+/// `max_nodes` と違って `0` を literal に扱わないのは、シード 0 件のグラフが
+/// 「ドキュメントが見つからない」(`build_connection_graph` の bail) と区別
+/// できない応答になるため。`max_nodes` は結果の大きさを縛るので「何も返すな」
+/// は筋の通った要求だが、`max_seed_chunks` は問い合わせの主語を縛る。
+pub fn clamp_max_seed_chunks(n: u32) -> u32 {
+    n.clamp(1, MAX_SEED_CHUNKS_CEILING)
+}
 
 impl Default for GraphOptions {
     fn default() -> Self {
@@ -72,8 +122,35 @@ impl Default for GraphOptions {
             exclude_paths: Vec::new(),
             dedup_by_path: false,
             min_quality: crate::quality::DEFAULT_QUALITY_THRESHOLD,
+            max_seed_chunks: DEFAULT_MAX_SEED_CHUNKS,
+            max_nodes: DEFAULT_MAX_NODES,
         }
     }
+}
+
+/// なぜグラフが打ち切られたか (BU-33)。
+///
+/// 1 つの bool では「起点ドキュメントが削られた」(対処: 上限を上げる /
+/// `centroid` を使う) と「探索の先端が切れた」(対処: `depth` を下げる /
+/// `min_similarity` を上げる) を区別できない。**対処法は理由と一緒に運ぶ**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationReason {
+    /// 起点ドキュメントのチャンク数が `max_seed_chunks` を超えた。
+    SeedChunks,
+    /// ノード数が `max_nodes` に達し、採用できる候補を捨てた / 未展開の
+    /// フロンティアを残した。
+    NodeBudget,
+}
+
+/// 発火した上限 1 件。`limit` はその理由自身の単位 (チャンク数 / ノード数)。
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphTruncation {
+    pub reason: TruncationReason,
+    pub limit: u32,
+    /// 何が失われ、どうすれば取り戻せるかを 1 文で。MCP には「続きを取る」
+    /// カーソルが無いので、次に打つ手を応答自身が名指しする必要がある。
+    pub detail: String,
 }
 
 /// 1 つのグラフノード。フラット配列 + `parent_id` で親子関係を表現する。
@@ -102,11 +179,27 @@ pub struct GraphStats {
     pub max_depth_reached: u32,
     pub knn_queries: u32,
     pub duration_ms: u64,
+    /// 実際にシードとして使った起点ドキュメントのチャンク数 (BU-33)。
+    /// `max_seed_chunks` が効いたかどうかを外から観測できるようにするための値。
+    /// `seed_strategy = "centroid"` では平均を取った元のチャンク数 (返る seed
+    /// ノードは 1 個)。
+    pub seeds_used: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionGraph {
     pub start_path: String,
+    /// いずれかの上限が発火し、**何かが失われた**か (BU-33)。
+    /// `truncation` が空でないことと同値。
+    ///
+    /// `node_budget` については安全側に倒している: 未展開のフロンティアを残して
+    /// 打ち切った場合、その先に新規ノードが無かったとしても `true` になる。
+    /// 「無かった」と確かめるには、上限が避けようとしているその KNN を
+    /// 実行するしかないため。
+    pub truncated: bool,
+    /// 発火した上限の内訳。空 = 完全な探索。
+    /// 同じ理由が 2 度入ることはない。
+    pub truncation: Vec<GraphTruncation>,
     pub nodes: Vec<GraphNode>,
     pub stats: GraphStats,
 }
@@ -175,7 +268,52 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+/// 打ち切り理由を 1 件記録する。**同じ理由は 1 度だけ**。
+///
+/// node 予算は 2 箇所 (候補の採用時と、未展開のフロンティアを残して抜ける時) で
+/// 検出しうるので、素直に push すると「2 回起きた」と読める応答になる。
+fn push_truncation(
+    out: &mut Vec<GraphTruncation>,
+    reason: TruncationReason,
+    limit: u32,
+    detail: String,
+) {
+    if !out.iter().any(|t| t.reason == reason) {
+        out.push(GraphTruncation {
+            reason,
+            limit,
+            detail,
+        });
+    }
+}
+
+/// node 予算が発火した時の説明文。理由と対処を一緒に運ぶ。
+fn node_budget_detail(limit: u32) -> String {
+    format!(
+        "the graph hit its node budget of {limit}; the walk stopped before the frontier was \
+         exhausted. Raise max_nodes, or narrow the walk with a lower depth / fan_out, a higher \
+         min_similarity, dedup_by_path, or the category / topic / exclude_paths filters."
+    )
+}
+
 /// 起点 `start_path` から BFS で Connection Graph を構築する。
+///
+/// # 上限 (BU-33)
+///
+/// 2 つの上限がコストを縛る。どちらも決定的 (壁時計に依存しない):
+///
+/// - `max_seed_chunks` — 起点ドキュメントから読むチャンク数。**SQL の `LIMIT`**
+///   なので、読まれなかった行は materialize もされない。
+/// - `max_nodes` — グラフ全体のノード数。各ノードは高々 1 回しか queue に入らず、
+///   queue から出た時に高々 1 回 KNN を撃つので
+///   **`knn_queries <= total_nodes <= max_nodes`** が成り立つ。この 1 つの上限が
+///   応答サイズと KNN 実行回数の両方を縛る。
+///
+/// 縛れて**いない**もの: 1 回の KNN 自体のコスト。`vec0` に ANN 索引は無く
+/// 総当たりなので、KNN 1 回は KB のチャンク数 × 次元に比例する。つまりこの上限が
+/// 保証するのは「1 回の graph 呼び出しは検索 `max_nodes` 回分の仕事で収まる」
+/// という**相対的な**上界であって、絶対的な秒数ではない。実測値は
+/// [`DEFAULT_MAX_NODES`] の doc を参照。
 pub fn build_connection_graph(
     db: &Database,
     start_path: &str,
@@ -191,14 +329,42 @@ pub fn build_connection_graph(
     // the seed lookup so an oversized request costs nothing.
     crate::server::validate_filter_list("exclude_paths", &opts.exclude_paths)?;
 
+    let mut truncation: Vec<GraphTruncation> = Vec::new();
+
     // 1. 起点シードを取得。存在しなければ明確にエラー。
-    let seeds = db.chunks_for_path(start_path)?;
+    //
+    // (BU-33) 上限は SQL の LIMIT に降ろす。`max_seed_chunks + 1` 件取るのは、
+    // 「まだ続きがあるか」を追加クエリなしで判定するため。
+    let seed_cap = clamp_max_seed_chunks(opts.max_seed_chunks);
+    let mut seeds = db.chunks_for_path_limited(start_path, seed_cap.saturating_add(1))?;
     if seeds.is_empty() {
         anyhow::bail!(
             "document not found (no chunks for path): {start_path}. \
              Run `kb-mcp index` to (re)index the knowledge base."
         );
     }
+    if seeds.len() > seed_cap as usize {
+        seeds.truncate(seed_cap as usize);
+        let detail = match opts.seed_strategy {
+            SeedStrategy::AllChunks => format!(
+                "the start document has more than {seed_cap} chunks; only its first {seed_cap} \
+                 were expanded as BFS seeds. Raise max_seed_chunks, or use seed_strategy \
+                 \"centroid\" to fold the whole document into a single seed."
+            ),
+            SeedStrategy::Centroid => format!(
+                "the start document has more than {seed_cap} chunks; the centroid is the average \
+                 of its first {seed_cap} chunks, not of the whole document. \
+                 Raise max_seed_chunks for a centroid over more of it."
+            ),
+        };
+        push_truncation(
+            &mut truncation,
+            TruncationReason::SeedChunks,
+            seed_cap,
+            detail,
+        );
+    }
+    let seeds_used = seeds.len() as u32;
 
     let mut visited: HashSet<i64> = HashSet::new();
     // 起点 path と exclude_paths、dedup_by_path=true の場合の「既出 path」を
@@ -212,10 +378,24 @@ pub fn build_connection_graph(
     // BFS queue: 各エントリは (親 node_id, 展開用 embedding, current_depth)
     let mut queue: VecDeque<(usize, Vec<f32>, u32)> = VecDeque::new();
 
+    // (BU-33) シードもノード予算の対象。既定では seed 上限 (32) < node 予算 (100)
+    // なので seed が予算を食い尽くすことは無いが、`--max-nodes 8` のような明示的な
+    // 要求では起こりうる。
+    let max_nodes = clamp_max_nodes(opts.max_nodes) as usize;
+
     // 2. seed_strategy に応じてシードを追加。
     match opts.seed_strategy {
         SeedStrategy::AllChunks => {
             for (chunk_id, embedding, r) in seeds {
+                if nodes.len() >= max_nodes {
+                    push_truncation(
+                        &mut truncation,
+                        TruncationReason::NodeBudget,
+                        max_nodes as u32,
+                        node_budget_detail(max_nodes as u32),
+                    );
+                    break;
+                }
                 let node_id = nodes.len();
                 nodes.push(make_node(node_id, None, 0, chunk_id, 1.0, &r));
                 visited.insert(chunk_id);
@@ -240,13 +420,23 @@ pub fn build_connection_graph(
             // KNN に使わないと `distance_to_cos_sim` の前提 (両辺 unit norm) が
             // 崩れて score 値が誤解を招く。
             l2_normalize(&mut sum);
-            let (chunk_id, _, rep) = &seeds[0];
-            let node_id = nodes.len();
-            nodes.push(make_node(node_id, None, 0, *chunk_id, 1.0, rep));
             for (cid, _, _) in &seeds {
                 visited.insert(*cid);
             }
-            queue.push_back((node_id, sum, 0));
+            if nodes.is_empty() && max_nodes == 0 {
+                // `max_nodes = 0` は literal に「空グラフ」。centroid でも同じ。
+                push_truncation(
+                    &mut truncation,
+                    TruncationReason::NodeBudget,
+                    0,
+                    node_budget_detail(0),
+                );
+            } else {
+                let (chunk_id, _, rep) = &seeds[0];
+                let node_id = nodes.len();
+                nodes.push(make_node(node_id, None, 0, *chunk_id, 1.0, rep));
+                queue.push_back((node_id, sum, 0));
+            }
         }
     }
 
@@ -259,11 +449,14 @@ pub fn build_connection_graph(
     if opts.fan_out == 0 {
         return Ok(ConnectionGraph {
             start_path: start_path.to_string(),
+            truncated: !truncation.is_empty(),
+            truncation,
             stats: GraphStats {
                 total_nodes: nodes.len(),
                 max_depth_reached,
                 knn_queries,
                 duration_ms: started.elapsed().as_millis() as u64,
+                seeds_used,
             },
             nodes,
         });
@@ -271,6 +464,21 @@ pub fn build_connection_graph(
 
     while let Some((parent_id, embedding, current_depth)) = queue.pop_front() {
         if current_depth >= opts.depth {
+            continue;
+        }
+
+        // (BU-33) ここが「予算切れ」の判定点。深さ判定より **後** に置くのが要点で、
+        // どうせ展開されないエントリで `truncated` を立てると偽陽性になる。
+        //
+        // `break` せず走査を続けるのは、残りの queue に展開対象が 1 つも無い
+        // (= 何も失われていない) 場合を区別するため。KNN は撃たないので安い。
+        if nodes.len() >= max_nodes {
+            push_truncation(
+                &mut truncation,
+                TruncationReason::NodeBudget,
+                max_nodes as u32,
+                node_budget_detail(max_nodes as u32),
+            );
             continue;
         }
 
@@ -306,6 +514,20 @@ pub fn build_connection_graph(
                 continue;
             }
 
+            // (BU-33) ここまで来た候補は全フィルタを通っている = 予算が無ければ
+            // 必ず採用されていた。したがってこの分岐は**確実な損失**であり、
+            // `truncated` は保守的でなく厳密。`get_chunk_embedding` の手前に置くのは
+            // 捨てる行のために SQL を撃たないため。
+            if nodes.len() >= max_nodes {
+                push_truncation(
+                    &mut truncation,
+                    TruncationReason::NodeBudget,
+                    max_nodes as u32,
+                    node_budget_detail(max_nodes as u32),
+                );
+                break;
+            }
+
             visited.insert(chunk_id);
             if opts.dedup_by_path {
                 visited_paths.insert(r.path.clone());
@@ -331,13 +553,27 @@ pub fn build_connection_graph(
     }
 
     let duration_ms = started.elapsed().as_millis() as u64;
+    if let Some(t) = truncation.first() {
+        // BU-31 と同じ流儀で、サーバ側にも 1 行だけ痕跡を残す (1 呼び出し 1 行)。
+        // stderr は CLI 出力規約どおり診断の置き場。
+        tracing::warn!(
+            start_path,
+            reason = ?t.reason,
+            limit = t.limit,
+            total_nodes = nodes.len(),
+            "connection graph truncated"
+        );
+    }
     Ok(ConnectionGraph {
         start_path: start_path.to_string(),
+        truncated: !truncation.is_empty(),
+        truncation,
         stats: GraphStats {
             total_nodes: nodes.len(),
             max_depth_reached,
             knn_queries,
             duration_ms,
+            seeds_used,
         },
         nodes,
     })
@@ -783,5 +1019,479 @@ mod tests {
         assert!(orth.abs() < 1e-6, "got {orth}");
         // 超過は 0 にクランプ
         assert_eq!(distance_to_cos_sim(100.0), 0.0);
+    }
+
+    // =======================================================================
+    // BU-33: the walk has to be bounded, and the bound has to be visible
+    // =======================================================================
+
+    /// Insert one document carrying `n` chunks, spaced `step` apart in
+    /// embedding space so the neighbour ranking is deterministic.
+    fn insert_doc_with_n_chunks(db: &Database, path: &str, n: usize, base: f32, step: f32) {
+        let doc_id = db
+            .upsert_document(
+                path,
+                Some(path),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                &format!("h-{path}"),
+            )
+            .unwrap();
+        for i in 0..n {
+            db.insert_chunk(
+                doc_id,
+                i as i32,
+                Some(&format!("h{i}")),
+                None,
+                &format!("chunk {i} of {path}"),
+                None,
+                &dummy_embedding(base + step * i as f32),
+                1.0,
+            )
+            .unwrap();
+        }
+    }
+
+    fn reasons(g: &ConnectionGraph) -> Vec<TruncationReason> {
+        g.truncation.iter().map(|t| t.reason).collect()
+    }
+
+    /// The two invariants the whole design rests on, asserted together because
+    /// either one alone can hold while the walk is still unbounded:
+    /// `knn_queries <= total_nodes <= max_nodes`.
+    fn assert_budget_invariants(g: &ConnectionGraph, max_nodes: u32) {
+        assert!(
+            g.stats.total_nodes <= max_nodes as usize,
+            "total_nodes {} exceeded max_nodes {max_nodes}",
+            g.stats.total_nodes
+        );
+        assert!(
+            g.stats.knn_queries as usize <= g.stats.total_nodes,
+            "knn_queries {} exceeded total_nodes {} -- a node was expanded more than once",
+            g.stats.knn_queries,
+            g.stats.total_nodes
+        );
+    }
+
+    #[test]
+    fn clamping_keeps_the_budgets_inside_their_ceilings() {
+        assert_eq!(clamp_max_nodes(u32::MAX), MAX_NODES_CEILING);
+        assert_eq!(clamp_max_nodes(7), 7);
+        // 0 is honoured literally: "return nothing" is a coherent request.
+        assert_eq!(clamp_max_nodes(0), 0);
+
+        assert_eq!(clamp_max_seed_chunks(u32::MAX), MAX_SEED_CHUNKS_CEILING);
+        assert_eq!(clamp_max_seed_chunks(7), 7);
+        // 0 is NOT honoured: a seedless graph is indistinguishable from the
+        // "document not found" bail.
+        assert_eq!(clamp_max_seed_chunks(0), 1);
+    }
+
+    #[test]
+    fn the_seed_cap_bounds_the_seed_phase_and_says_so() {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "big.md", 20, 0.10, 0.0001);
+        insert_doc_with_chunk(&db, "n1.md", "n1", "n1 body", 0.20);
+
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 2,
+            min_similarity: 0.0,
+            max_seed_chunks: 5,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "big.md", &opts).unwrap();
+
+        assert_eq!(g.stats.seeds_used, 5, "only the capped prefix may be seeded");
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.depth == 0).count(),
+            5,
+            "seed nodes must match seeds_used"
+        );
+        assert!(g.truncated);
+        assert_eq!(reasons(&g), vec![TruncationReason::SeedChunks]);
+        assert_eq!(g.truncation[0].limit, 5);
+        assert!(
+            g.truncation[0].detail.contains("max_seed_chunks"),
+            "the detail must name the knob that lifts the bound: {}",
+            g.truncation[0].detail
+        );
+    }
+
+    #[test]
+    fn a_document_under_the_seed_cap_is_not_reported_as_truncated() {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "small.md", 3, 0.10, 0.0001);
+        insert_doc_with_chunk(&db, "n1.md", "n1", "n1 body", 0.20);
+
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 2,
+            min_similarity: 0.0,
+            max_seed_chunks: 32,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "small.md", &opts).unwrap();
+
+        assert_eq!(g.stats.seeds_used, 3);
+        assert!(!g.truncated, "nothing was lost: {:?}", g.truncation);
+        assert!(g.truncation.is_empty());
+    }
+
+    fn seed_cap_boundary(chunks: usize, cap: u32) -> ConnectionGraph {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "d.md", chunks, 0.10, 0.0001);
+        insert_doc_with_chunk(&db, "n1.md", "n1", "n1 body", 0.20);
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 2,
+            min_similarity: 0.0,
+            max_seed_chunks: cap,
+            ..Default::default()
+        };
+        build_connection_graph(&db, "d.md", &opts).unwrap()
+    }
+
+    /// A seed cap equal to the chunk count must not report truncation. This is
+    /// the off-by-one a `>=` would introduce, and it is why the seed read asks
+    /// for `cap + 1` rows.
+    #[test]
+    fn the_seed_cap_fires_only_when_a_chunk_was_actually_dropped() {
+        let exact = seed_cap_boundary(8, 8);
+        assert_eq!(exact.stats.seeds_used, 8);
+        assert!(
+            !exact.truncated,
+            "cap == chunk count drops nothing: {:?}",
+            exact.truncation
+        );
+
+        let over = seed_cap_boundary(9, 8);
+        assert_eq!(over.stats.seeds_used, 8);
+        assert!(over.truncated, "one chunk past the cap is a real loss");
+        assert_eq!(reasons(&over), vec![TruncationReason::SeedChunks]);
+    }
+
+    /// The regression this whole ticket turns on. Measured on the real KB: the
+    /// largest document has 160 chunks, and BFS emits every seed before any
+    /// neighbour -- so a node budget *alone* spends itself entirely on the
+    /// start document's own chunks and returns a "connection graph" with zero
+    /// connections. The seed cap is what keeps room for connections.
+    #[test]
+    fn the_budget_never_spends_itself_entirely_on_seeds() {
+        // 24 chunks spread far apart, each with one close neighbour document,
+        // so every seed has a genuine connection to find. (Packing the chunks
+        // together instead would fill each KNN with same-document siblings,
+        // which the walk skips -- a different failure that would mask this one.)
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "big.md", 24, 0.0, 1.0);
+        for i in 0..24 {
+            insert_doc_with_chunk(
+                &db,
+                &format!("n{i}.md"),
+                "n",
+                "neighbour body",
+                i as f32 + 0.001,
+            );
+        }
+
+        let base = GraphOptions {
+            depth: 1,
+            fan_out: 5,
+            min_similarity: 0.0,
+            max_nodes: 20,
+            ..Default::default()
+        };
+
+        // Without a seed cap the 24 seeds consume the whole 20-node budget.
+        let uncapped = build_connection_graph(
+            &db,
+            "big.md",
+            &GraphOptions {
+                max_seed_chunks: 1000,
+                ..base.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            uncapped.nodes.iter().filter(|n| n.depth > 0).count(),
+            0,
+            "precondition: an uncapped seed phase is what starves the frontier"
+        );
+
+        // The seed cap is what leaves room for connections.
+        let capped = build_connection_graph(
+            &db,
+            "big.md",
+            &GraphOptions {
+                max_seed_chunks: 8,
+                ..base
+            },
+        )
+        .unwrap();
+        assert_budget_invariants(&capped, 20);
+        let neighbours = capped.nodes.iter().filter(|n| n.depth > 0).count();
+        assert!(
+            neighbours > 0,
+            "a connection graph with no connections is useless; got {} seeds and {neighbours} \
+             neighbours out of a 20 node budget",
+            capped.nodes.iter().filter(|n| n.depth == 0).count()
+        );
+    }
+
+    #[test]
+    fn the_node_budget_bounds_the_result_and_the_knn_count() {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "s.md", 4, 0.10, 0.0001);
+        for i in 0..30 {
+            insert_doc_with_chunk(
+                &db,
+                &format!("n{i}.md"),
+                "n",
+                "neighbour body",
+                0.20 + 0.001 * i as f32,
+            );
+        }
+
+        for budget in [1u32, 3, 7, 12] {
+            let opts = GraphOptions {
+                depth: 3,
+                fan_out: 20,
+                min_similarity: 0.0,
+                max_nodes: budget,
+                max_seed_chunks: 4,
+                ..Default::default()
+            };
+            let g = build_connection_graph(&db, "s.md", &opts).unwrap();
+            assert_budget_invariants(&g, budget);
+        }
+    }
+
+    #[test]
+    fn the_node_budget_is_reported_with_a_remedy() {
+        let db = setup_db();
+        insert_doc_with_chunk(&db, "s.md", "s", "s body", 0.10);
+        for i in 0..10 {
+            insert_doc_with_chunk(
+                &db,
+                &format!("n{i}.md"),
+                "n",
+                "neighbour body",
+                0.11 + 0.001 * i as f32,
+            );
+        }
+
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 10,
+            min_similarity: 0.0,
+            max_nodes: 4,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "s.md", &opts).unwrap();
+
+        assert_eq!(g.stats.total_nodes, 4);
+        assert!(g.truncated);
+        assert_eq!(reasons(&g), vec![TruncationReason::NodeBudget]);
+        assert_eq!(g.truncation[0].limit, 4);
+        assert!(
+            g.truncation[0].detail.contains("max_nodes"),
+            "the detail must name the knob that lifts the bound: {}",
+            g.truncation[0].detail
+        );
+    }
+
+    /// Once the budget is full no further node can ever be added, so the walk
+    /// must stop issuing KNN queries — the expensive half of the cost model.
+    /// Without the check at the top of the loop the remaining frontier is still
+    /// queried, one full vector scan per queued node, all of it discarded.
+    #[test]
+    fn a_full_budget_stops_the_queries_instead_of_scanning_for_nothing() {
+        let db = setup_db();
+        insert_doc_with_chunk(&db, "s.md", "s", "s body", 0.10);
+        for i in 0..10 {
+            insert_doc_with_chunk(
+                &db,
+                &format!("n{i}.md"),
+                "n",
+                "neighbour body",
+                0.11 + 0.001 * i as f32,
+            );
+        }
+
+        // depth 2 means the depth-1 neighbours are expandable, so the only
+        // thing that can stop them being queried is the budget check.
+        let opts = GraphOptions {
+            depth: 2,
+            fan_out: 10,
+            min_similarity: 0.0,
+            max_nodes: 4,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "s.md", &opts).unwrap();
+
+        assert_eq!(g.stats.total_nodes, 4);
+        assert_eq!(
+            g.stats.knn_queries, 1,
+            "the seed's KNN filled the budget; the 3 queued neighbours must not be queried"
+        );
+        assert!(g.truncated);
+    }
+
+    /// `truncated` must mean "something was lost", not "a counter reached its
+    /// cap". A walk that exhausts the graph while exactly filling the budget
+    /// has lost nothing, and must say so.
+    #[test]
+    fn filling_the_budget_exactly_is_not_truncation() {
+        let db = setup_db();
+        insert_doc_with_chunk(&db, "s.md", "s", "s body", 0.10);
+        insert_doc_with_chunk(&db, "n0.md", "n", "n body", 0.11);
+        insert_doc_with_chunk(&db, "n1.md", "n", "n body", 0.12);
+
+        // 1 seed + 2 neighbours == 3 == the budget, and depth 1 means the
+        // neighbours are never expanded, so the frontier is genuinely empty.
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 5,
+            min_similarity: 0.0,
+            max_nodes: 3,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "s.md", &opts).unwrap();
+
+        assert_eq!(g.stats.total_nodes, 3);
+        assert!(
+            !g.truncated,
+            "the budget was filled but nothing was refused: {:?}",
+            g.truncation
+        );
+    }
+
+    #[test]
+    fn a_zero_node_budget_returns_an_empty_graph_and_explains_why() {
+        let db = setup_db();
+        insert_doc_with_chunk(&db, "s.md", "s", "s body", 0.10);
+        insert_doc_with_chunk(&db, "n0.md", "n", "n body", 0.11);
+
+        for strategy in [SeedStrategy::AllChunks, SeedStrategy::Centroid] {
+            let opts = GraphOptions {
+                depth: 1,
+                fan_out: 5,
+                min_similarity: 0.0,
+                max_nodes: 0,
+                seed_strategy: strategy,
+                ..Default::default()
+            };
+            let g = build_connection_graph(&db, "s.md", &opts).unwrap();
+            assert_eq!(g.nodes.len(), 0, "{strategy:?} must honour max_nodes = 0");
+            assert_eq!(g.stats.knn_queries, 0, "{strategy:?} must not query");
+            assert!(g.truncated, "{strategy:?} must explain the empty result");
+            assert_eq!(reasons(&g), vec![TruncationReason::NodeBudget]);
+        }
+    }
+
+    /// `centroid` folds the document into one seed, so the node budget has no
+    /// grip on the seed read -- the cap is the only thing bounding it, and the
+    /// changed meaning ("average of the first N chunks") has to be reported.
+    #[test]
+    fn the_centroid_reports_that_it_averaged_only_a_prefix() {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "big.md", 20, 0.10, 0.0001);
+        insert_doc_with_chunk(&db, "n1.md", "n1", "n1 body", 0.20);
+
+        let opts = GraphOptions {
+            depth: 1,
+            fan_out: 2,
+            min_similarity: 0.0,
+            seed_strategy: SeedStrategy::Centroid,
+            max_seed_chunks: 6,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "big.md", &opts).unwrap();
+
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.depth == 0).count(),
+            1,
+            "centroid still emits exactly one seed node"
+        );
+        assert_eq!(
+            g.stats.seeds_used, 6,
+            "seeds_used reports the averaging input, not the node count"
+        );
+        assert!(g.truncated);
+        assert_eq!(reasons(&g), vec![TruncationReason::SeedChunks]);
+        assert!(
+            g.truncation[0].detail.contains("centroid"),
+            "the centroid remedy differs from the all_chunks one: {}",
+            g.truncation[0].detail
+        );
+    }
+
+    /// Both bounds can fire in one call, and each must appear exactly once —
+    /// the node budget is detected at two separate enforcement points.
+    #[test]
+    fn each_reason_is_reported_at_most_once() {
+        let db = setup_db();
+        insert_doc_with_n_chunks(&db, "big.md", 20, 0.10, 0.0001);
+        for i in 0..20 {
+            insert_doc_with_chunk(
+                &db,
+                &format!("n{i}.md"),
+                "n",
+                "neighbour body",
+                0.20 + 0.001 * i as f32,
+            );
+        }
+
+        let opts = GraphOptions {
+            depth: 3,
+            fan_out: 20,
+            min_similarity: 0.0,
+            max_nodes: 6,
+            max_seed_chunks: 4,
+            ..Default::default()
+        };
+        let g = build_connection_graph(&db, "big.md", &opts).unwrap();
+
+        assert!(g.truncated);
+        let mut seen = reasons(&g);
+        let before = seen.len();
+        seen.sort_by_key(|r| format!("{r:?}"));
+        seen.dedup();
+        assert_eq!(before, seen.len(), "a reason was reported twice");
+        assert!(
+            seen.contains(&TruncationReason::SeedChunks)
+                && seen.contains(&TruncationReason::NodeBudget),
+            "both bounds fired here, got {seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_defaults_are_the_measured_ones() {
+        // These numbers are load-bearing: they were derived from the real KB
+        // (median 13 / p90 26 / p99 43 / max 160 chunks per document,
+        // ~72 ms per KNN, ~665 B of JSON per node). Changing one without
+        // redoing that measurement is the thing this test exists to catch.
+        assert_eq!(DEFAULT_MAX_SEED_CHUNKS, 32);
+        assert_eq!(DEFAULT_MAX_NODES, 100);
+        let d = GraphOptions::default();
+        assert_eq!(d.max_seed_chunks, DEFAULT_MAX_SEED_CHUNKS);
+        assert_eq!(d.max_nodes, DEFAULT_MAX_NODES);
+    }
+
+    #[test]
+    fn the_truncation_fields_are_always_present_in_json() {
+        let db = setup_db();
+        insert_doc_with_chunk(&db, "s.md", "s", "s body", 0.10);
+        let g = build_connection_graph(&db, "s.md", &GraphOptions::default()).unwrap();
+        let v: serde_json::Value = serde_json::to_value(&g).unwrap();
+
+        // A flag that vanishes when false forces a reader to tell "false"
+        // apart from "old server".
+        assert_eq!(v["truncated"], serde_json::json!(false));
+        assert_eq!(v["truncation"], serde_json::json!([]));
+        assert!(v["stats"]["seeds_used"].is_number());
     }
 }
