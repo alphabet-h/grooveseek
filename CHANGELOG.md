@@ -6,6 +6,59 @@ Each heading's date is the date its `vX.Y.Z` tag was created, in the maintainer'
 
 ## [Unreleased]
 
+### Changed
+
+- **`match_spans` now has a contract, and it changes what clients receive**
+  (BU-09, BU-10). Two things feature-48 left undefined are now decided and
+  pinned by tests.
+
+  *Overlaps are folded away.* Since v0.16.0 the terms come from `query_phrases`,
+  which emits nested phrases, so `"Foundry Local" Foundry` returned `(0,7)` and
+  `(0,13)` — two spans over the same text, and a highlighter had to guess. They
+  are now merged into their union. The merge predicate is strict, so spans that
+  merely touch stay separate; making it non-strict collapses the 100 adjacent
+  spans of the existing cap test into one while `len() <= 100` still passes,
+  which would leave that test green and meaningless.
+
+  *The span budget is shared across terms.* It used to be spent in
+  phrase-generation order, so a term matching hundreds of times consumed all
+  100 and a rare term you also searched for was highlighted nowhere — and which
+  terms won depended on an internal ordering feature-48 had just changed. Each
+  term now gets `floor(100 / k)` spans (at least one) taken in document order.
+  Reordering the words of a query now returns the identical array. The leftover
+  budget is deliberately not redistributed, because handing it out in term
+  order would reintroduce the order dependence; with 32 terms that means 96
+  spans rather than 100.
+
+  Every response now satisfies: sorted, disjoint, non-empty, at most 100 spans,
+  independent of term order, and covering every term that occurs. All six are
+  asserted, and each was confirmed to fail against a reverted fix.
+
+  Order-independence has one documented boundary. `query_phrases` caps the
+  phrase list at 32 *in query order*, so reordering a query that exceeds the
+  cap changes which fragments the full-text search looks for at all — that is
+  search behaviour, not highlighting, and it is out of scope here. The
+  100-term limit on the whitespace-fallback path had the same problem and is
+  fixed: that list is sorted and deduplicated before it is truncated, so the
+  cutoff no longer follows word order. Deduplication applies the same ASCII
+  case fold that matching does, so `Rust rust` is one term rather than two
+  splitting a budget between identical searches.
+
+  The alternative — collect every occurrence, then keep the 100 best by
+  occurrence rank — was measured and rejected: **100–450× slower** (157 µs →
+  33.1 ms for 32 dense phrases over a 256 KiB chunk; with `limit` up to 1000
+  that is 33 s per search), and its correctness rests on an early-exit
+  condition that a deliberately off-by-one version survived 24,000 randomized
+  cases undetected. The shipped approach measures 1.0–1.2× on realistic 4–16
+  KiB chunks and ~2–3× on that pathological input.
+
+  A term clamp (`MATCH_SPAN_MAX_TERMS = 100`) was added for the
+  whitespace-fallback path. `query_phrases` caps phrases at 32 but does not
+  apply the whole-query fallback — that belongs to `build_fts_query` — so a
+  query whose fragments are all below the trigram floor produced an unbounded
+  term list. With a per-term budget of at least one, 150 terms meant 150 spans;
+  the clamp is what keeps the published cap true there.
+
 ### Fixed
 
 - **`get_connection_graph`'s `exclude_paths` is now bounded like every other
