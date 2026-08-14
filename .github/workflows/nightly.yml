@@ -8,6 +8,9 @@ name: Nightly
 #   Linux だけを回していると永久に検証されないため (AU-09)。
 #   モデルは actions/cache で挟むので、2 回目以降は HuggingFace からの再 DL は
 #   不要 (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker ~2.3 GB)。
+# - cargo test --bench: criterion の test mode で bench を 1 回ずつ実行する
+#   (BU-25)。**計測ではなく生存確認**で、compile が通るだけの bench が
+#   「何も測っていない」状態に腐るのを止めるのが目的 (詳細は当該 step の注)。
 # - cargo audit: 依存ツリーを RustSec advisory DB と突合。新しい advisory
 #   が出た時に nightly が fail することで notification として機能する。
 #
@@ -160,6 +163,43 @@ jobs:
         # feature 付きで compile しても**走らない** — 実行まで届くのは
         # `--include-ignored` を渡すこの job だけ。
         run: cargo test --features test-helpers -- --include-ignored ${{ matrix.skip_args }}
+
+      # BU-25: the benches under `benches/` were compiled by every PR
+      # (`cargo clippy --all-targets`, twice, so the `heavy-bench` halves are
+      # covered too) but had never been **executed** by CI. Compiling is the
+      # weaker check: AU-56 found `search_latency` timing an unindexed fixture,
+      # where every iteration measured the cost of starting the binary and
+      # finding nothing — it built cleanly and produced graphs the whole time.
+      #
+      # criterion's test mode (cargo passes `--test` to a `harness = false`
+      # bench target) runs each benchmark body **once** and reports pass/fail
+      # without measuring. That is deliberate: this step is a **liveness check,
+      # not a performance gate**. Wall-clock on a shared runner is too noisy to
+      # threshold at any sample size we can afford, and criterion exits 0 even
+      # when `--baseline` reports a regression, so gating would need an external
+      # script over `target/criterion/**/estimates.json` (out of scope here).
+      # Thresholded performance guards live in the test suite instead — e.g.
+      # `bu03_or_expansion_stays_within_a_small_multiple_of_a_single_phrase`,
+      # which runs in the step above and bounds feature-48's FTS cost.
+      #
+      # `--features test-helpers` matches the step above so the bench targets
+      # link against artefacts that are already built; a different feature set
+      # would rebuild the lib and the binary from scratch.
+      #
+      # The targets are named one by one rather than with `--benches`, which
+      # would also re-run every unit test (lib and bin targets default to
+      # `bench = true`). `tests/bench_targets_run_in_ci.rs` fails if the two
+      # lists drift apart, in either direction.
+      #
+      # `heavy-bench` stays off: running those bodies needs the ~2.3 GB reranker
+      # that the Windows leg deliberately does not download (see `skip_args`).
+      - name: cargo test --bench (criterion test mode, no measurement)
+        run: >
+          cargo test --features test-helpers
+          --bench index_throughput
+          --bench mmr_perf
+          --bench search_latency
+          --bench string_ops
 
   cargo-audit:
     name: cargo audit

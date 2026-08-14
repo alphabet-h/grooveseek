@@ -204,6 +204,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   still represented. A renamed fixture surfaces there by name instead of a day
   later as an unexplained recall drop.
 
+- **The benches are now executed by CI, not only compiled** (BU-25).
+  `cargo clippy --all-targets` builds them on every PR — twice, so the
+  `heavy-bench` halves are covered too — but nothing had ever run one.
+  Compiling is the weaker check: AU-56 found `search_latency` timing a fixture
+  that was never indexed, so every iteration measured the cost of starting the
+  binary and finding zero hits, and criterion reported that as a benchmark
+  result for as long as it went unnoticed.
+
+  The nightly job now runs each bench target once through criterion's test
+  mode, on both OS legs. It is a liveness check, not a performance gate:
+  wall-clock on a shared runner is too noisy to threshold at a sample size
+  worth paying for, and criterion exits 0 even when `--baseline` reports a
+  regression, so gating would take an external script over its
+  `estimates.json`. Thresholded performance guards stay in the test suite,
+  where `bu03_or_expansion_stays_within_a_small_multiple_of_a_single_phrase`
+  already bounds feature-48's FTS cost at 20× a single-phrase query and has
+  been running nightly on both legs since it was added.
+
+  The targets are named one by one, since `--benches` would also re-run the
+  entire unit-test suite; `tests/bench_targets_run_in_ci.rs` fails if that list
+  and the `[[bench]]` entries drift apart in either direction. `heavy-bench`
+  bodies remain compile-only — running them needs the ~2.3 GB reranker the
+  Windows leg deliberately does not download.
+
 ### Changed
 
 - **rmcp 1.4.0 → 3.1.2, which brings MCP 2026-07-28 support**. Two majors of
