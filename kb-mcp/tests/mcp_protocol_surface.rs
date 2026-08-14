@@ -88,7 +88,16 @@ fn meta() -> serde_json::Value {
 /// The layout is returned, not dropped: it owns the temp directory the server
 /// is still reading from, so the caller has to hold it for the length of the
 /// test. Leaking it instead would leave a directory behind on every run.
-fn start() -> (common::mcp::ServerGuard, String, TempKbLayout) {
+///
+/// **The layout comes first in the tuple, and that ordering is load-bearing.**
+/// Destructuring `let (a, b, c) = …` declares three locals left to right, and
+/// locals drop in reverse declaration order — so whatever is last in the tuple
+/// is destroyed first. The layout's `Drop` calls `remove_dir_all` on a
+/// directory the server still has a SQLite database open under; if it runs
+/// before the guard kills the child, the removal fails, the error is discarded,
+/// and the test leaves a temp directory behind on every Windows run. Returning
+/// the layout first makes it drop last (codex P2, round 1 on PR #160).
+fn start() -> (TempKbLayout, common::mcp::ServerGuard, String) {
     let layout = TempKbLayout::new("kb-mcp-protocol-surface");
     layout.write(
         "note.md",
@@ -97,14 +106,14 @@ fn start() -> (common::mcp::ServerGuard, String, TempKbLayout) {
     let cfg = layout.root().join("kb-mcp.toml");
     std::fs::write(&cfg, "[watch]\nenabled = false\n").expect("write kb-mcp.toml");
     let (guard, base) = spawn_mcp_server(layout.kb(), &cfg);
-    (guard, base, layout)
+    (layout, guard, base)
 }
 
 /// The one every client reads. Both halves have been wrong: the name and
 /// version came from rmcp's build environment rather than this crate's.
 #[test]
 fn the_server_identifies_itself_as_kb_mcp() {
-    let (_guard, base, _kb) = start();
+    let (_kb, _guard, base) = start();
 
     let init = rpc(
         &base,
@@ -137,7 +146,7 @@ fn the_server_identifies_itself_as_kb_mcp() {
 /// the point is that it has to be changed on purpose.
 #[test]
 fn the_advertised_capabilities_are_tools_only_on_both_discovery_surfaces() {
-    let (_guard, base, _kb) = start();
+    let (_kb, _guard, base) = start();
 
     let init = rpc(
         &base,
@@ -179,7 +188,7 @@ fn the_advertised_capabilities_are_tools_only_on_both_discovery_surfaces() {
 /// requires on any result carrying `resultType: "complete"`.
 #[test]
 fn the_tool_list_is_six_tools_with_the_caching_hints_the_spec_requires() {
-    let (_guard, base, _kb) = start();
+    let (_kb, _guard, base) = start();
 
     let resp = rpc(&base, "tools/list", serde_json::json!({"_meta": meta()}));
     let result = &resp["result"];
