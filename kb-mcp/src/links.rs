@@ -22,15 +22,26 @@
 //! legitimately hard-linked KB (deduplicated notes, one file shared between two
 //! knowledge bases) does not look like it vanished for no reason.
 //!
-//! ## What this does not do (codex P1 round 2 on PR #155)
+//! ## What this does not do (codex P1, rounds 2 and 4 on PR #155)
 //!
-//! A link count is a property of *now*, not of provenance. Someone who can both
-//! link the file in **and remove its original name** — which needs write access
-//! to the directory holding it, not read access to the file — leaves the KB path
-//! as the only name, count 1, indistinguishable from a file that was always
-//! there. Log rotation does the same thing by accident.
+//! This is a check on a **name**, at a **moment**. It is not provenance, and it
+//! is not bound to the bytes anyone later reads from that name. Two consequences,
+//! neither of which is closed by counting harder:
 //!
-//! Remembering inodes seen at count > 1 would not close it either: link and
+//! 1. **Link, then unlink.** Someone who can link the file in *and* remove its
+//!    original name — write access to the directory holding it, not read access
+//!    to the file — leaves the KB path as the only name, count 1,
+//!    indistinguishable from a file that was always there. Log rotation reaches
+//!    the same state by accident.
+//! 2. **Replace after the check.** The walk collects paths and the parser opens
+//!    them afterwards. A KB writer who can time a rebuild can let the check see
+//!    an ordinary file and then rename a hard link over that path before it is
+//!    opened. This one needs no power over the original at all. Closing it means
+//!    binding the count to the same handle the content is read from, which the
+//!    parser API — paths in, text out, with the PDF and Office parsers opening
+//!    the file themselves — does not currently allow.
+//!
+//! Remembering inodes seen at count > 1 would not close (1) either: link and
 //! unlink can both happen between two index runs, so there may be no moment at
 //! which kb-mcp observes the second name at all. The only check that would close
 //! it is ownership — refuse files not owned by the user running kb-mcp — and

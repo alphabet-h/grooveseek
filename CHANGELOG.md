@@ -408,15 +408,20 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `WIN32_FIND_DATAW` — carries no link count at all.
 
   **This raises the bar rather than drawing a boundary**, and the distinction
-  matters: a link count describes the present, not provenance. Whoever can link
-  a file in *and* remove its original name — write access to the directory
-  holding it, not read access to the file — leaves the knowledge base path as
-  the only name, count 1, indistinguishable from a file that was always there.
-  Remembering inodes seen above 1 would not close that either, since both steps
-  can happen between two index runs. The check that would close it is ownership,
-  and refusing files not owned by the user running kb-mcp would break a knowledge
-  base shared between accounts. So the rule stands: anything that must not be
-  readable by kb-mcp belongs outside `kb_path`, on a path its user cannot read.
+  matters: the check looks at a name, at a moment, and is not bound to the bytes
+  later read from that name. Whoever can link a file in *and* remove its original
+  name — write access to the directory holding it, not read access to the file —
+  leaves the knowledge base path as the only name, count 1, indistinguishable
+  from a file that was always there. Separately, a knowledge base writer who can
+  time a rebuild can let the check see an ordinary file and put a hard link in
+  its place before the parser opens it. Remembering inodes seen above 1 closes
+  neither, since both steps of the first can happen between two index runs; the
+  second needs the count bound to the same handle the content is read from, which
+  the parser interface does not currently allow. The check that would close them
+  is ownership, and refusing files not owned by the user running kb-mcp would
+  break a knowledge base shared between accounts. So the rule stands: anything
+  that must not be readable by kb-mcp belongs outside `kb_path`, on a path its
+  user cannot read.
 
 - **A single panic no longer disables search for the life of the process**
   (BU-18). Every mutex in the server was taken with `.lock().unwrap()`. A
