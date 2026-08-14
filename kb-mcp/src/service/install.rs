@@ -112,7 +112,9 @@ pub(crate) fn run_with_backend(
         std::fs::set_permissions(config_home, std::fs::Permissions::from_mode(0o700))?;
     }
 
-    let toml_path = config_home.join("kb-mcp.toml");
+    // The same constant the three launch lines name in `--config` (BU-07), so
+    // the file this writes and the file the daemon is told to read cannot drift.
+    let toml_path = config_home.join(crate::service::render::SERVICE_CONFIG_FILE);
     if toml_path.exists() && !params.force {
         return Err(anyhow!(
             "kb-mcp.toml が既存: {} (--force で上書き)",

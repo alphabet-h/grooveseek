@@ -20,6 +20,35 @@ use anyhow::Result;
 pub(crate) const LAUNCHD_STDOUT_LOG: &str = "kb-mcp.out";
 pub(crate) const LAUNCHD_STDERR_LOG: &str = "kb-mcp.err";
 
+/// `service install` が config home に書く設定ファイル名。
+///
+/// 書く側 (`install::run_with_backend`) と、それを `--config` で名指しする
+/// 3 つの launch line が同じ定数を見る。片方だけ変えると daemon が
+/// **起動時に「そんなファイルは無い」で落ちる**ので、drift を型で防ぐ
+/// ([`LAUNCHD_STDOUT_LOG`] と同じ理由)。
+pub(crate) const SERVICE_CONFIG_FILE: &str = "kb-mcp.toml";
+
+/// launch line が名指しする config ファイルの絶対パス。
+///
+/// **なぜ相対パスにしないのか** (BU-07 の残穴): 3 backend とも
+/// WorkingDirectory を config home にしているので `--config kb-mcp.toml` でも
+/// 届くし、quoting の問題も丸ごと消える。それでも絶対パスにするのは、
+/// 相対形の失敗モードが**信頼側に倒れる**ため — WorkingDirectory が効かない
+/// 環境では、CWD にたまたま在る `kb-mcp.toml` を `ConfigSource::Explicit` =
+/// Trusted として読んでしまう。絶対パスの失敗モードは「ファイルが無い」で、
+/// 起動しないだけで済む。可用性の失敗は診断できるが、信頼の失敗はできない。
+///
+/// **`Path::join` を使わず `/` で繋ぐ**理由: unit と plist は Linux / macOS
+/// 専用の成果物だが、このモジュールは全 OS で compile + テストされる (それが
+/// このモジュールの存在理由)。`join` を使うと Windows ホストで走らせた時だけ
+/// 区切りが `\` になり、テストの期待値が host 依存になる。plist の
+/// `StandardOutPath` が既に同じ理由で `{home}/{out_log}` と書いている。
+/// Windows の launch line は `windows::build_register_script` が native な
+/// `join` で組む。
+fn posix_config_path(config_home: &str) -> String {
+    format!("{config_home}/{SERVICE_CONFIG_FILE}")
+}
+
 /// XML の element content として安全になるようエスケープする。
 ///
 /// [XML 1.0 §2.4](https://www.w3.org/TR/xml/#syntax) より:
@@ -105,12 +134,15 @@ pub(crate) fn systemd_exec_word(raw: &str) -> String {
 /// systemd user unit を組み立てる。
 ///
 /// パスに改行が含まれる場合は **unit を書かずに失敗する** (AU-10)。
-/// `ExecStart=` に入るバイナリパスだけは quote と `%%` で保護する。
+/// `ExecStart=` に入るバイナリパスと config パスは quote と `%%` で保護する。
 /// `WorkingDirectory=` を同じように扱わない理由は
 /// [`ensure_unit_value_representable`] の doc を参照。
+///
+/// `--config` を付ける理由は [`posix_config_path`] の doc を参照 (BU-07)。
 pub fn render_unit(ctx: &InstallContext) -> Result<String> {
     let home = ctx.config_home.display().to_string();
     let bin = ctx.binary_path.display().to_string();
+    let cfg = posix_config_path(&home);
     ensure_unit_value_representable("config_home", &home)?;
     ensure_unit_value_representable("binary_path", &bin)?;
     ensure_unit_value_representable("service_name", &ctx.service_name)?;
@@ -122,7 +154,7 @@ pub fn render_unit(ctx: &InstallContext) -> Result<String> {
          [Service]\n\
          Type=simple\n\
          WorkingDirectory={home}\n\
-         ExecStart={exec} serve\n\
+         ExecStart={exec} serve --config {cfg}\n\
          Restart=on-failure\n\
          RestartSec=5s\n\
          Environment=RUST_LOG=info\n\
@@ -134,6 +166,7 @@ pub fn render_unit(ctx: &InstallContext) -> Result<String> {
         name = ctx.service_name,
         home = home,
         exec = systemd_exec_word(&bin),
+        cfg = systemd_exec_word(&cfg),
     ))
 }
 
@@ -182,6 +215,8 @@ pub fn render_plist(ctx: &InstallContext) -> String {
     <array>
         <string>{bin}</string>
         <string>serve</string>
+        <string>--config</string>
+        <string>{config_file}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>{home}</string>
@@ -205,6 +240,7 @@ pub fn render_plist(ctx: &InstallContext) -> String {
 "#,
         name = escape_xml_text(&ctx.service_name),
         bin = escape_xml_text(&ctx.binary_path.display().to_string()),
+        config_file = escape_xml_text(&posix_config_path(&ctx.config_home.display().to_string())),
         home = escape_xml_text(&ctx.config_home.display().to_string()),
         out_log = LAUNCHD_STDOUT_LOG,
         err_log = LAUNCHD_STDERR_LOG,
@@ -438,6 +474,77 @@ mod tests {
                 && plist.contains("<string>/Users/me/cfg/kb-mcp.err</string>"),
             "the log paths must stay the ones macos::tighten_existing_logs \
              re-chmods: {plist}"
+        );
+    }
+
+    // ---- --config on the launch line (BU-07) ----
+
+    /// The daemon starts with its working directory set to the config home, so
+    /// it *finds* `kb-mcp.toml` either way. Naming it is what makes the source
+    /// `Explicit` — and therefore Trusted — no matter what `KB_MCP_CONFIG_HOME`
+    /// was set to at install time and no longer is at run time.
+    #[test]
+    fn both_unit_and_plist_name_the_config_file_the_installer_wrote() {
+        let ctx = ctx_with("/home/u/.cargo/bin/kb-mcp", "/home/u/.config/kb-mcp/kb-mcp");
+
+        let unit = render_unit(&ctx).unwrap();
+        assert!(
+            unit.contains(
+                "ExecStart=/home/u/.cargo/bin/kb-mcp serve \
+                 --config /home/u/.config/kb-mcp/kb-mcp/kb-mcp.toml"
+            ),
+            "the unit must name the config file: {unit}"
+        );
+
+        let plist = render_plist(&ctx);
+        assert!(
+            plist.contains(
+                "<string>--config</string>\n        \
+                 <string>/home/u/.config/kb-mcp/kb-mcp/kb-mcp.toml</string>"
+            ),
+            "the flag and its value are separate array elements, or launchd \
+             passes one argument containing a space: {plist}"
+        );
+
+        // Whatever the installer writes and whatever the launch line reads must
+        // be the same name — see SERVICE_CONFIG_FILE.
+        assert!(unit.contains(SERVICE_CONFIG_FILE) && plist.contains(SERVICE_CONFIG_FILE));
+    }
+
+    /// `ExecStart` is split on whitespace and `%` is a systemd specifier, so the
+    /// config path needs exactly the treatment the binary path already gets.
+    /// Without it a home directory with a space silently truncates the value.
+    #[test]
+    fn the_config_argument_is_quoted_and_percent_escaped_like_the_binary() {
+        let unit = render_unit(&ctx_with(
+            "/home/john doe/bin/kb-mcp",
+            "/home/john doe/.config/kb-mcp/kb-mcp",
+        ))
+        .unwrap();
+        assert!(
+            unit.contains("--config \"/home/john doe/.config/kb-mcp/kb-mcp/kb-mcp.toml\""),
+            "a space in the config path must not split the argument: {unit}"
+        );
+
+        let unit = render_unit(&ctx_with("/opt/kb-mcp", "/srv/100%/cfg")).unwrap();
+        assert!(
+            unit.contains("--config /srv/100%%/cfg/kb-mcp.toml"),
+            "specifier expansion runs before unquoting, so `%` must be doubled: {unit}"
+        );
+    }
+
+    /// The plist embeds the path in XML, where `&` is fatal and legal in a
+    /// macOS path — the same reason the binary path is escaped.
+    #[test]
+    fn xml_metacharacters_in_the_config_path_are_escaped_too() {
+        let plist = render_plist(&ctx_with("/Users/me/bin/kb-mcp", "/Users/a&b/cfg"));
+        assert!(
+            plist.contains("<string>/Users/a&amp;b/cfg/kb-mcp.toml</string>"),
+            "config path was not escaped: {plist}"
+        );
+        assert!(
+            !plist.contains("a&b"),
+            "a raw ampersand survived into the plist: {plist}"
         );
     }
 

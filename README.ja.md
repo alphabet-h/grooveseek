@@ -218,11 +218,19 @@ bind = "127.0.0.1:3100"
 `../..` / `/` / `C:\Users` と、それらを指す symlink。
 
 全部効かせたいなら名指しする: `kb-mcp serve --config ./kb-mcp.toml`。
-インストール済みサービスは影響を受けない (`kb-mcp service install` は config home
-に書き、そこは信頼する場所)。ただし 1 点例外があり、**`KB_MCP_CONFIG_HOME` を
-`service install` の時だけ設定した場合**、その値は daemon 実行時の環境には無いため
-config が「信頼しない」に分類され、上記の制限が掛かる。サービス側にも同じ変数を
-設定するか、`--config` を付けて起動すること。
+
+インストール済みサービスは影響を受けない。v0.20.0 以降、`kb-mcp service install` は
+登録する unit / plist / scheduled task に `--config <config home>/kb-mcp.toml` を
+書き込む。daemon は config を「探す」のではなく「名指しされる」ので、起動時の環境が
+どうであっても信頼される。これで唯一の例外だったケース —
+**`KB_MCP_CONFIG_HOME` を `service install` の時だけ設定した場合**、その値は daemon
+実行時の環境には無いため信頼されなかった — が塞がる。
+
+旧版で登録したサービスは launch line が古いままになる。更新するには**自分が使った**
+`kb-mcp service install` コマンドに `--force` を足して再実行すること (素の
+`service install` は service 名 / auto-start / bind を既定値に戻してしまう)。
+新しい launch line が効くのは次にサービスが起動した時で、再登録しても
+起動中の daemon は再起動しない。
 
 **カバーしない範囲**: リポジトリが `.mcp.json` ごと同梱している場合、相手は
 config ファイルではなくコマンドライン全体を握っている。kb-mcp 側の規則では
@@ -372,7 +380,7 @@ OS 別バックエンド:
 - **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`)。daemon の出力は launchd が config home の `kb-mcp.out` / `kb-mcp.err` に書く。plist は `Umask` に `0077` を指定するので、agent が作るもの (ログ、インデックス DB) はすべて自分のアカウントからしか読めない。
 - **Windows**: Task Scheduler AT_LOGON (= admin 不要、`\kb-mcp-<name>` task)。
 
-Installer は config home を `<dirs::config_dir()>/kb-mcp/<service-name>/` に作成し、`kb-mcp.toml` (`kb_path` / `bind` 含む) を配置。base directory は `KB_MCP_CONFIG_HOME` env var で override 可能。
+Installer は config home を `<dirs::config_dir()>/kb-mcp/<service-name>/` に作成し、`kb-mcp.toml` (`kb_path` / `bind` 含む) を配置。base directory は `KB_MCP_CONFIG_HOME` env var で override 可能。登録される launch line はこのファイルを `--config` で名指しする (v0.20.0+) ので、daemon は working directory から探し当てたものではなく installer が書いた config を読む。詳細は [信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。
 
 非 loopback の bind (例: `0.0.0.0:3100`) は kb-mcp が認証機構を持たないため `--i-know` 明示が必要。
 

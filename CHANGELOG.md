@@ -12,6 +12,45 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **An installed service now names its own config file, so it is trusted
+  whatever the environment looks like when it starts** (BU-07 residual).
+
+  `kb-mcp service install` writes `<config home>/kb-mcp.toml` and registers a
+  service whose working directory is that config home, so the daemon used to
+  *discover* its config rather than being handed it — arriving as
+  `ConfigSource::Cwd`, which is only trusted when the directory sits under a
+  known root. `TrustRoots` builds those roots from `KB_MCP_CONFIG_HOME` and
+  `dirs::config_dir()`, **read at start-up**. Set `KB_MCP_CONFIG_HOME` for the
+  install command alone and the daemon could no longer see it, so it classified
+  its own config as untrusted: warnings on every start, `allowed_hosts` /
+  `healthz_public` / `max_sessions` dropped, and a non-loopback `bind` demoted
+  to loopback.
+
+  The unit, plist and scheduled task now carry
+  `--config <config home>/kb-mcp.toml`, which makes the source `Explicit` and
+  the trust unconditional. Two quoting layers had to be got right for that, and
+  both are pinned by tests: `ExecStart` is whitespace-split and `%` is a systemd
+  specifier, so the path goes through the same `systemd_exec_word` the binary
+  path already used; and Task Scheduler's `-Argument` value becomes the child's
+  raw command line, so the path is double-quoted for `CommandLineToArgvW`
+  *inside* the PowerShell single-quoted string — a profile directory such as
+  `C:\Users\John Doe` would otherwise have split `--config` from its value at
+  the next logon, with the daemon's stdio nulled by `kb-mcp-svc`.
+
+  **A service registered by an earlier version keeps its old launch line.**
+  Re-run your own `kb-mcp service install` command with `--force` added; the new
+  line takes effect the next time the service starts, and re-registering does
+  not restart a daemon that is already running. Default installs were never
+  affected — `dirs::config_dir()` is available at start-up too.
+
+  `ActionTarget::argument_clause` became `serve_argument` as part of this:
+  Task Scheduler accepts exactly one `-Argument`, so the clause is assembled in
+  `build_register_script` (which knows the config home) instead of being carried
+  whole. The invariant it exists for is unchanged — exactly one side supplies
+  `serve`, and `kb-mcp-svc.exe` is still the side that does when it is present.
+
 ## [0.19.0] - 2026-08-14
 
 ### Security

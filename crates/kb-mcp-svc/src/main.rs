@@ -29,15 +29,17 @@
 /// `serve` is prepended **unconditionally** — which is precisely why the Task
 /// Scheduler Action must not pass `serve` itself. The other half of that
 /// invariant lives in `kb-mcp/src/service/windows.rs::resolve_action_target`,
-/// which leaves the `-Argument` clause empty whenever the Action points at this
+/// which leaves `serve_argument` empty whenever the Action points at this
 /// binary. If both sides supplied `serve` the child would launch as
 /// `kb-mcp.exe serve serve` and die with "unknown subcommand"; if neither did,
 /// `kb-mcp.exe` would start with no subcommand at all. Either way the breakage
 /// surfaces only at the *next logon*, long after `kb-mcp service install`
 /// reported success — so both halves are unit-tested.
 ///
-/// Extra args are forwarded after `serve`, so a future Action revision can pass
-/// flags without changing this binary.
+/// Extra args are forwarded after `serve`. Since BU-07 the Action does use
+/// that: it passes `--config <config_home>\kb-mcp.toml`, which reaches
+/// `kb-mcp.exe serve --config <path>` — valid because `--config` is a global
+/// clap argument and so may follow the subcommand.
 ///
 /// Compiled on every platform (not just Windows) so the invariant test runs on
 /// the Linux and macOS CI legs too; only the Windows `main` actually calls it.
@@ -119,9 +121,11 @@ fn main() {
 mod tests {
     use super::child_args;
 
-    /// The production Action passes **no** arguments when it points at this
-    /// binary, so the empty-`extra` case is the one that actually runs at
-    /// logon. Exactly one `serve` must reach the child.
+    /// The degenerate case: whatever the Action passes, exactly one `serve`
+    /// must reach the child. This was the shape that actually ran at logon
+    /// until BU-07 gave the Action a `--config` argument to carry; see
+    /// `child_args_supplies_exactly_one_serve_for_the_production_action` for
+    /// the shape that runs now.
     #[test]
     fn child_args_supplies_exactly_one_serve_for_the_no_argument_action() {
         let args = child_args(&[]);
@@ -129,7 +133,33 @@ mod tests {
         assert_eq!(
             args.iter().filter(|a| a.as_str() == "serve").count(),
             1,
-            "svc must add serve exactly once; the Task Scheduler Action leaves -Argument empty"
+            "svc must add serve exactly once; the Task Scheduler Action supplies no subcommand"
+        );
+    }
+
+    /// (BU-07) The production Action carries `--config <config_home>\kb-mcp.toml`
+    /// and still no subcommand, so this is the argv that reaches `kb-mcp.exe`
+    /// at logon. `--config` after `serve` parses because it is a global clap
+    /// argument; the ordering is the contract `child_args` exists to keep.
+    #[test]
+    fn child_args_supplies_exactly_one_serve_for_the_production_action() {
+        let extra = vec![
+            "--config".to_string(),
+            "C:\\Users\\me\\AppData\\Roaming\\kb-mcp\\kb-mcp\\kb-mcp.toml".to_string(),
+        ];
+        let args = child_args(&extra);
+        assert_eq!(
+            args,
+            [
+                "serve",
+                "--config",
+                "C:\\Users\\me\\AppData\\Roaming\\kb-mcp\\kb-mcp\\kb-mcp.toml"
+            ]
+        );
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "serve").count(),
+            1,
+            "svc must add serve exactly once; the Task Scheduler Action supplies no subcommand"
         );
     }
 
