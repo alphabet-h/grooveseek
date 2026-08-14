@@ -76,13 +76,19 @@ cargo test
 ## テストの 2 層構造
 
 - **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**PR を gate するのはこの層だけ** (`ci.yml` はこれしか回さない)
-- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest と windows-latest の両方で `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows leg は ~2.3 GB のモデルを要する 2 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
+- **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest と windows-latest の両方で `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows leg は ~2.3 GB のモデルを要する 3 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
   - **モデル DL** — 初回に ONNX モデルを取得する (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker-v2-m3 ~2.3 GB)。以降は OS 標準キャッシュに残る。ネットワーク都合で DL が失敗する場合は README の「HuggingFace の TLS 失敗への対処」節を参照
   - **マシンの状態を実際に変える** — 一部のテストは OS のサービスを本当に登録・解除する。`kb-mcp/tests/service_install_integration.rs` は Windows で `Register-ScheduledTask` を呼び、`crates/kb-mcp-tray/tests/install_integration.rs` は `%APPDATA%\…\Start Menu\Programs\Startup\` にショートカットを書く。PID ごとに固有のサービス名を使い後始末もするが、**途中で kill すると scheduled task や startup ショートカットが残る**。途中で落ちたら `Get-ScheduledTask -TaskName 'kb-mcp*'` で確認すること
 
   `cargo test -- --ignored` は習慣ではなく**意図して**実行する。DL コストだけ払いたいなら対象を絞る: `cargo test --test <name> -- --ignored`
 
 embedder / reranker が必要なテストを追加するときは `#[ignore]` を付け、何を検証するかコメントで記述する。OS に触れるテスト (サービス、自動起動、レジストリ) の場合は、コストが呼び出し側から見えるよう `#[ignore = "…"]` の理由文字列にその旨を書くこと。
+
+### retrieval 品質ゲート
+
+`kb-mcp/tests/eval_corpus_quality.rs` は、変更が検索を**壊した**かではなく**悪くした**かを測る唯一のテスト。`tests/fixtures/kb-eval/` (commit 済みの日英 20 文書) を index し、`tests/fixtures/kb-eval-golden.yml` の golden を `kb-mcp eval` に通して、集計 recall@1 / MRR が実測由来の下限を割ったら fail する。BGE-small 版が感度の高い方で nightly の両 leg で走り、BGE-M3 版は日本語の意味検索経路を守る Linux 専用。
+
+retrieval に触れる変更 (クエリのコンパイル、fusion、chunk 分割、parser、MMR) はこのゲートを動かす。閾値を触る前に必ず失敗出力を読むこと — rank 1 を落としたクエリ、期待していた文書、代わりに 1 位になった文書がすべて出る。**下限を下げるのは「検索が悪くなるのを受け入れる」という判断**なので、新しい実測値と併せて PR の説明に書く。現在の baseline と測り方はモジュール doc に記録してある。
 
 ## 変更の提出
 

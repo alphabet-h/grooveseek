@@ -76,13 +76,19 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.
 ## Test layering
 
 - **Light tests**: default `cargo test`. No network, no model download, runs in seconds. This is the layer that gates pull requests — `ci.yml` runs nothing else.
-- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Not PR-gating, but not manual-only either: `nightly.yml` runs `cargo test --features test-helpers -- --include-ignored` daily on both ubuntu-latest and windows-latest, so these do get exercised — a day later, and the Windows leg skips the two tests that need the ~2.3 GB models. Two different kinds of cost hide behind that one flag:
+- **Ignored tests** (`#[ignore]`): opt in via `cargo test -- --ignored`. Not PR-gating, but not manual-only either: `nightly.yml` runs `cargo test --features test-helpers -- --include-ignored` daily on both ubuntu-latest and windows-latest, so these do get exercised — a day later, and the Windows leg skips the three tests that need the ~2.3 GB models. Two different kinds of cost hide behind that one flag:
   - **Model downloads** — ONNX models on first run (BGE-small ~130 MB, BGE-M3 ~2.3 GB, BGE-reranker-v2-m3 ~2.3 GB), cached per OS convention afterwards. See the README's "Working around HuggingFace TLS failures" section if your network blocks the download.
   - **Real changes to your machine** — a few tests register and unregister actual OS services. `kb-mcp/tests/service_install_integration.rs` calls `Register-ScheduledTask` on Windows, and `crates/kb-mcp-tray/tests/install_integration.rs` writes a shortcut into `%APPDATA%\…\Start Menu\Programs\Startup\`. They use a per-PID service name and clean up after themselves, but a killed run can leave a scheduled task or a startup shortcut behind. Check with `Get-ScheduledTask -TaskName 'kb-mcp*'` if a run dies partway.
 
   Run `cargo test -- --ignored` deliberately, not as a habit. To take only the download cost, target the suite you actually want: `cargo test --test <name> -- --ignored`.
 
 When adding behavior that needs the embedder or reranker, mark the test `#[ignore]` and add a comment explaining what it exercises. When a test touches the OS (services, autostart, the registry), say so in the `#[ignore = "…"]` reason itself so the cost is visible at the call site.
+
+### Retrieval quality gate
+
+`kb-mcp/tests/eval_corpus_quality.rs` is the one test that measures whether a change made search *worse* rather than broken. It indexes `tests/fixtures/kb-eval/` — 20 committed Japanese/English documents — runs the committed golden set in `tests/fixtures/kb-eval-golden.yml` through `kb-mcp eval`, and fails when aggregate recall@1 or MRR drops below a measured floor. The BGE-small run is the sensitive one and executes on both nightly legs; the BGE-M3 run guards the Japanese semantic path and is Linux-only.
+
+If you change retrieval — query compilation, fusion, chunking, the parser, MMR — expect this gate to move, and read the failure output before adjusting a threshold: it names every query that lost rank 1, what it expected, and what won instead. Lowering a floor is a decision to accept worse search, so it belongs in the pull request description together with the new measurement. The module docs record the current baseline and how it was taken.
 
 ## Submitting changes
 

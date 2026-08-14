@@ -83,6 +83,56 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   The config log line now also carries the resolved path and the trust
   decision; `source=Cwd` alone could not tell you which file had won.
 
+### Added
+
+- **CI now measures retrieval quality, not just correctness** (BU-11). Nothing
+  told us when a change made search *worse*: the recall drop feature-48
+  introduced was found by hand, on a private knowledge base, after release.
+  `tests/fixtures/kb-eval/` adds 20 committed documents (9 Japanese, 11
+  English, 60 chunks) and `tests/fixtures/kb-eval-golden.yml` 25 golden
+  queries, run through `kb-mcp eval` by `tests/eval_corpus_quality.rs` on the
+  nightly leg.
+
+  The queries are paraphrases that avoid each document's own headings and
+  distinctive nouns, so a golden built from verbatim substrings cannot pass on
+  keyword overlap alone. Five deliberately lexical queries (an error number, a
+  header name, a path, a literal prefix, a clock time) sit alongside them.
+
+  Thresholds come from measurement, including of the failure the gate exists to
+  catch — `build_fts_query` forced to return `None` in a scratch build:
+
+  | | recall@1 | recall@5 | MRR |
+  | --- | --- | --- | --- |
+  | BGE-small, as shipped | 0.92 | 0.96 | 0.940 |
+  | BGE-small, FTS leg silent | 0.80 | 0.88 | 0.835 |
+  | BGE-M3, as shipped | 1.00 | 1.00 | 1.000 |
+  | BGE-M3, FTS leg silent | 1.00 | 1.00 | 1.000 |
+
+  That last row is the reason there are two gates rather than one. BGE-M3
+  answers every query with the keyword half of the hybrid search removed
+  entirely — 20 semantically distinct documents are separable by the vector leg
+  alone — so it cannot detect an FTS regression at this corpus size, and its
+  gate guards the Japanese semantic path instead. The BGE-small gate is the
+  sensitive one: with the FTS leg silent, four queries degrade, three of them
+  Japanese natural-language ones, which is the feature-48 class exactly. It
+  needs only the ~130 MB model and runs on both nightly legs; the BGE-M3 gate
+  joins the two existing Windows skips.
+
+  Floors allow two queries of drift and trip on the third (BGE-small recall@1
+  ≥ 0.84 / MRR ≥ 0.88; BGE-M3 ≥ 0.92 / ≥ 0.95) — enough slack for `f32` fusion
+  ties to resolve differently on another architecture, while still sitting
+  above the broken state. recall@5 is reported but not asserted: healthy and
+  FTS-dead are only two queries apart there, so no threshold separates them.
+  A failure names every query that lost rank 1, what it expected, and what won
+  instead, so a nightly failure is diagnosable from the log without re-running
+  a 2.3 GB model.
+
+  A third test needs no model and runs in the PR gate: it checks that the
+  corpus, its manifest, and the golden still describe the same documents, that
+  every document is some query's expected answer, and that both languages are
+  still represented. A renamed fixture surfaces there by name instead of a day
+  later as an unexplained recall drop.
+
 ### Changed
 
 - **`get_connection_graph` / `kb-mcp graph` are now bounded, and say so when a

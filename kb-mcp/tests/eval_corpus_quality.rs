@@ -197,13 +197,8 @@ fn setup_corpus(layout: &TempKbLayout) {
                 .unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
         }
         let src = root.join(&rel);
-        std::fs::copy(&src, &dst).unwrap_or_else(|e| {
-            panic!(
-                "copy fixture {} -> {}: {e}",
-                src.display(),
-                dst.display()
-            )
-        });
+        std::fs::copy(&src, &dst)
+            .unwrap_or_else(|e| panic!("copy fixture {} -> {}: {e}", src.display(), dst.display()));
     }
 }
 
@@ -305,7 +300,9 @@ fn ranking_report(run: &serde_json::Value) -> String {
         }
         let id = q["id"].as_str().unwrap_or("<no id>");
         let expected = q["expected"][0]["path"].as_str().unwrap_or("<none>");
-        let top1 = q["top_k"][0]["path"].as_str().unwrap_or("<nothing returned>");
+        let top1 = q["top_k"][0]["path"]
+            .as_str()
+            .unwrap_or("<nothing returned>");
         let position = if rr > 0.0 {
             format!("rank {}", (1.0 / rr).round() as i64)
         } else {
