@@ -97,9 +97,10 @@ pub(crate) fn backend() -> Box<dyn ServiceBackend> {
 /// `<config_dir>/kb-mcp/<service-name>/` を返す。
 /// 優先順: (1) `KB_MCP_CONFIG_HOME` env var、(2) `dirs::config_dir()` (= XDG_CONFIG_HOME / OS 標準)。
 pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
-    let base = std::env::var("KB_MCP_CONFIG_HOME")
-        .ok()
-        .map(PathBuf::from)
+    // 空文字は未設定として扱う (BU-07)。通してしまうと base が空になり、
+    // `base.join("kb-mcp").join(name)` が **CWD 相対**のパスになる — service の
+    // config をカレントディレクトリ配下に書き、起動のたびに違う場所を見る。
+    let base = crate::config::env_dir("KB_MCP_CONFIG_HOME")
         .or_else(dirs::config_dir)
         .ok_or_else(|| {
             anyhow::anyhow!(
