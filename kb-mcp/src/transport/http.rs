@@ -538,22 +538,18 @@ enum LiveSessionCount {
 }
 
 impl LiveSessionCount {
-    async fn get(&self) -> usize {
+    /// **await せずに**現在数を読む。取れなければ `None`。
+    ///
+    /// 同期であることが要点。予約と解放は同じ [`std::sync::Mutex`] の中で
+    /// 行うので、その中で await できてはいけない (そして await しないからこそ
+    /// `Drop` からも同じ lock を取れる)。rmcp の `sessions` は
+    /// `tokio::sync::RwLock` なので `try_read` が使える。write lock を握って
+    /// いるのは session の挿入 / 削除の一瞬だけ。
+    fn try_get(&self) -> Option<usize> {
         match self {
-            Self::Rmcp(manager) => manager.sessions.read().await.len(),
+            Self::Rmcp(manager) => manager.sessions.try_read().ok().map(|s| s.len()),
             #[cfg(test)]
-            Self::Fixed(n) => {
-                // **読んだ後に**譲る。狙いは「生きている数を読み終えた直後に
-                // 世界が動く」最悪のスケジューリングを毎回起こすこと。
-                // production は `RwLock::read().await` の 1 回だけが yield 点で、
-                // その先の in_flight 読みとの間に譲る保証は無い — つまり実機で
-                // この隙間が開くのは別コアと競った時だけで、極めて狭い。
-                // 即値を返す double だと隙間が **一度も** 開かず、
-                // 「予約と解放の直列化」を外しても全テストが緑のままだった。
-                let value = n.load(std::sync::atomic::Ordering::SeqCst);
-                tokio::task::yield_now().await;
-                value
-            }
+            Self::Fixed(n) => Some(n.load(std::sync::atomic::Ordering::SeqCst)),
         }
     }
 }
@@ -632,30 +628,39 @@ impl RefusalLog {
 ///
 /// `live` と `in_flight` を別々に読むと、その 2 つの読みの**間**に
 /// 「A が insert して席を返す」引き渡しが挟まり得る。B は A を含まない `live`
-/// と、A が抜けた後の `in_flight` を見て、どちらにも A が数えられていない状態で
-/// 通ってしまう (round 2 の P1)。
+/// と、A が抜けた後の `in_flight` を見て、**どちらにも A が数えられていない**
+/// 状態で通ってしまう (round 2 の P1)。
 ///
-/// そこで **予約と解放を同じ [`tokio::sync::Mutex`] で直列化**する。解放側も
-/// lock を取るので、B が 2 つの数を読んでいる最中に A が抜けることはない。
-/// A の insert は A の解放より**前**に起きる (rmcp は `initialize_session` まで
-/// 済ませてから応答を返し、席はその後で返る) ので、B が見るのは必ず
-/// 「`in_flight` に A がいる」か「`live` に A がいる」のどちらかになる。
+/// 読む順序を入れ替えて「insert は解放より前に起きる」で論証する案は、
+/// **実測で破れた** (上限 4 に対し 5-6 セッション)。`compare_exchange` は
+/// 「変わっていない」と「変わって戻った」を区別しないので、
+/// `1 → 0 → 1` の間に別の予約が入り、その分を数え落とす。
 ///
-/// # 打ち切られた要求
+/// # なので排他で構造的に閉じる
 ///
-/// 応答を待たずに接続が切れた場合、明示的な解放には到達しない。その時は
-/// [`AdmissionSeat`] の `Drop` が lock 無しで席を返す。この経路だけは上の
-/// 直列化から外れるが、上限を超える方向には効かない — 打ち切られた要求は
-/// 「session を作れずに終わった」(`live` は増えない) か
-/// 「作った後に切れた」(`live` が数える) かのどちらかで、
-/// どちらも二重に数えないだけだから。
+/// 「生きている数を読む」「`in_flight` を読む」「1 増やす」を
+/// **[`std::sync::Mutex`] の 1 つの臨界区間**にまとめ、席を返す側も同じ lock を
+/// 取る。これで割り込める場所が存在しなくなる — 論証ではなく形で保証する。
+///
+/// 同期 Mutex を選べるのは、臨界区間で **await しない**から
+/// ([`LiveSessionCount::try_get`] が同期)。そしてそのおかげで、
+/// 要求が打ち切られたときの `Drop` からも同じ lock が取れる
+/// (round 3 の P1: 打ち切り経路だけ lock の外に置くと、そこから同じ穴が開く)。
+///
+/// # write lock と競った場合
+///
+/// `try_get` は rmcp が session を挿入 / 削除している一瞬だけ `None` を返す。
+/// その時は lock を手放して譲り、少し待って読み直す。
+/// [`RESERVE_ATTEMPTS`] 回とも競ったら断る (= 安全側)。
 #[derive(Default)]
 struct Admissions {
-    /// 臨界区間の token。中身は持たない (数は `in_flight` 側にある) —
-    /// `Drop` から lock 無しで減らせる必要があるため。
-    gate: tokio::sync::Mutex<()>,
-    in_flight: std::sync::atomic::AtomicUsize,
+    /// 予約と解放の両方が取る。中身は `in_flight` (= 通したが `live` にまだ
+    /// 現れていない数)。
+    in_flight: std::sync::Mutex<usize>,
 }
+
+/// `try_get` が rmcp の write lock と競った時に読み直す回数。
+const RESERVE_ATTEMPTS: usize = 8;
 
 impl Admissions {
     async fn try_reserve(
@@ -663,48 +668,50 @@ impl Admissions {
         live: &LiveSessionCount,
         max_sessions: u32,
     ) -> Option<AdmissionSeat> {
-        use std::sync::atomic::Ordering;
-        let _guard = self.gate.lock().await;
-        let now_live = live.get().await;
-        let in_flight = self.in_flight.load(Ordering::Acquire);
-        if now_live + in_flight >= max_sessions as usize {
-            return None;
+        for _ in 0..RESERVE_ATTEMPTS {
+            {
+                // poison から復帰する: 数を 1 つ数え損ねるより、上限が
+                // 恒久的に壊れる方が悪い。
+                let mut in_flight = self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(now_live) = live.try_get() {
+                    if now_live + *in_flight >= max_sessions as usize {
+                        return None;
+                    }
+                    *in_flight += 1;
+                    return Some(AdmissionSeat {
+                        admissions: Arc::clone(self),
+                    });
+                }
+                // `try_get` が取れなかった。lock を手放してから譲る。
+            }
+            tokio::task::yield_now().await;
         }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        Some(AdmissionSeat {
-            admissions: Arc::clone(self),
-            released: false,
-        })
+        None
     }
 }
 
-/// 予約した 1 席。通常は [`AdmissionSeat::release`] で返し、そこに到達
-/// できなかった場合 (= 要求が打ち切られた) だけ `Drop` が肩代わりする。
+/// 予約した 1 席。`Drop` で返る。
+///
+/// 応答を返し終えた通常経路でも、要求が打ち切られた経路でも同じ `Drop` が
+/// 走るので、席の返し方は 1 通りしかない。[`Admissions`] の読み順がその前提
+/// (「insert は解放より前」) だけに依存しているので、これで足りる。
 struct AdmissionSeat {
     admissions: Arc<Admissions>,
-    released: bool,
-}
-
-impl AdmissionSeat {
-    /// 席を返す。**予約と同じ lock を取る**ことが要点で、これが無いと
-    /// 「A が抜ける」瞬間を B が 2 つの数の間で観測できてしまう。
-    async fn release(mut self) {
-        let _guard = self.admissions.gate.lock().await;
-        self.admissions
-            .in_flight
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        self.released = true;
-    }
 }
 
 impl Drop for AdmissionSeat {
     fn drop(&mut self) {
-        if !self.released {
-            // 打ち切られた要求の後始末。await できないので lock は取らない。
-            self.admissions
-                .in_flight
-                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        }
+        // **予約と同じ lock**。ここを外すと、B が 2 つの数を読んでいる最中に
+        // A が抜けられるようになり、上限が漏れる (round 3 の P1)。
+        let mut in_flight = self
+            .admissions
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
     }
 }
 
@@ -797,9 +804,9 @@ async fn mcp_session_gate(
         }
     }
 
-    // 予約を取ってから通す。席は応答を返した時点 (= rmcp が session を map に
-    // 入れ終えた後) で返す。
-    let seat = if gate.max_sessions > 0 {
+    // 予約を取ってから通す。`_seat` は応答を返し終えるまで生き、そこで Drop
+    // が席を返す (= rmcp が session を map に入れ終えた後)。
+    let _seat = if gate.max_sessions > 0 {
         match gate
             .admissions
             .try_reserve(&gate.live, gate.max_sessions)
@@ -807,7 +814,7 @@ async fn mcp_session_gate(
         {
             Some(seat) => Some(seat),
             None => {
-                let live = gate.live.get().await;
+                let live = gate.live.try_get().unwrap_or_default();
                 if let Some(suppressed) = gate.refusals.record(gate.refusals.elapsed_secs()) {
                     tracing::warn!(
                         live,
@@ -829,13 +836,8 @@ async fn mcp_session_gate(
         None
     };
 
-    let response = next
-        .run(Request::from_parts(parts, Body::from(bytes)))
-        .await;
-    if let Some(seat) = seat {
-        seat.release().await;
-    }
-    response
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 /// F-64: `/healthz` 用 axum middleware。Host header を allowed_hosts と照合し
@@ -2312,15 +2314,15 @@ mod tests {
              because rmcp has not inserted the session yet"
         );
 
-        first.unwrap().release().await;
+        drop(first);
         assert!(
             admissions.try_reserve(&live, 1).await.is_some(),
             "the seat comes back when the request that held it finishes"
         );
     }
 
-    /// 打ち切られた要求の席も返る。`release().await` に到達できない経路なので
-    /// `Drop` が肩代わりする — ここが漏れると、上限がじわじわ縮んでいく。
+    /// 打ち切られた要求の席も同じ `Drop` で返る。ここが漏れると、上限が
+    /// じわじわ縮んで最後は誰も繋げなくなる。
     #[tokio::test]
     async fn an_abandoned_request_still_returns_its_seat() {
         let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0)));
@@ -2336,18 +2338,21 @@ mod tests {
         );
     }
 
-    /// (codex review round 2 の P1) 予約と解放が直列化されていること。
+    /// (codex review round 1-3) 同時に来ても上限を超えないこと。
     ///
-    /// `live` と `in_flight` を別々に読むと、その 2 つの読みの**間**に
-    /// 「A が insert して席を返す」引き渡しが挟まり、A がどちらにも数えられて
-    /// いない瞬間を B が見る。ここでは dummy service が rmcp の insert を
-    /// 演じ (応答を返す前に `live` を 1 増やす)、`LiveSessionCount::Fixed` が
-    /// 読んだ直後に必ず譲ることで、その最悪スケジューリングを毎回起こす。
+    /// dummy service が rmcp の insert を演じる — 応答を返す**前**に `live` を
+    /// 1 増やすので、「通したがまだ `live` に現れていない」状態が実際に生じる。
     ///
     /// **検査するのは「上限を超えない」ことだけ**で、「ちょうど上限まで埋まる」
-    /// ことではない。in_flight を数える以上、解放待ちの席を空きと見なさない
-    /// 分だけ保守的に断ることがあり、それは安全な側への外れ。直列化を外すと
-    /// この test は `live` が 5 になって落ちる (上限 4)。
+    /// ことではない。`in_flight` を数える以上、解放待ちの席を空きと見なさない
+    /// 分だけ保守的に断ることがあり、それは安全な側への外れ。
+    ///
+    /// なお round 2-3 で問題になった「`live` を読んでから `in_flight` を読む
+    /// までの隙間」は、いまは [`Admissions`] が 3 つの操作を 1 つの臨界区間に
+    /// まとめているので**構造的に存在しない**。存在しない隙間は注入して
+    /// 観測することもできないので、その一点を狙って mutation で殺せる test は
+    /// 無い — 代わりに「隙間を作らない」ことを lock で保証している。
+    /// この test が殺せるのは round 1 の形 (数を読むだけで通す) の方。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_cap_is_never_exceeded_across_the_handoff_to_live() {
         const CAP: u32 = 4;
