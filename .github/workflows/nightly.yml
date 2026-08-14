@@ -283,9 +283,21 @@ jobs:
       # `--color never` で ANSI escape を抑制し GITHUB_STEP_SUMMARY の
       # code block 整合性を保つ。
       - name: Run coverage (non-ignored only)
-        run: cargo llvm-cov --summary-only --color never > coverage_summary.txt
+        # `--no-report` stops here with the profile data on disk; the two
+        # `report` invocations below re-render it without re-running anything,
+        # so the human-readable table and the threshold below share one test run.
+        run: cargo llvm-cov --no-report
 
+      - name: Render the coverage summary
+        run: cargo llvm-cov report --summary-only --color never > coverage_summary.txt
+
+      # `if: always()` matters now that a later step can fail the job: the run
+      # where the floor trips is exactly the run where you want the table
+      # (BU-26). This step still comes *before* the gate, so the ordering alone
+      # would suffice — the condition is here so that reordering cannot
+      # silently take the table away again.
       - name: Append summary to GITHUB_STEP_SUMMARY
+        if: always()
         run: |
           {
             echo "## Line coverage (cargo-llvm-cov, non-ignored tests)"
@@ -300,3 +312,63 @@ jobs:
           # 何も出ない、ここで bare `cat` により通常 log でも summary を
           # grep 可能にする。
           cat coverage_summary.txt
+
+      # BU-26: until now the number was only *observed*. A module could arrive
+      # with no tests at all and nothing would say so — the TOTAL barely moves.
+      #
+      # The floor is **per file** (`--fail-under-file-lines`, = fail if any one
+      # file is below it), deliberately not the global `--fail-under-lines`.
+      # The TOTAL here is not a quantity you can threshold honestly:
+      #   - 53.8% of the physical lines under kb-mcp/src are in-file
+      #     `#[cfg(test)] mod tests`, which is ~100% covered by construction and
+      #     pulls the number *up*;
+      #   - code reachable only from `#[ignore]` tests reads as 0% in this job,
+      #     which pulls it *down* (see the exclusions below);
+      #   - ~3,400 lines of Windows/macOS-only code are not in this leg's
+      #     denominator at all.
+      # A global threshold is also satisfiable by adding tests to a module that
+      # already has plenty, which is not the failure being guarded against.
+      #
+      # 35 is a tripwire for "arrived with no tests", not a quality target. The
+      # measured distribution on 2026-08-14 was 0.00 / 0.00 / 0.00 (the three
+      # excluded files), then main.rs 41.43, embedder.rs 58.90, server.rs 63.16,
+      # watcher.rs 65.57, and everything else ≥ 78. Raising the floor past ~40
+      # means either excluding main.rs as well or living without headroom.
+      #
+      # The exclusions are structural, not convenience: each is invisible to a
+      # non-ignored test run rather than untested.
+      #   - transport/stdio.rs   — the stdio transport is driven by subprocess
+      #                            tests that are all `#[ignore]`
+      #   - service/linux.rs     — the systemd backend is exercised only by
+      #                            `#[ignore]` tests that touch the real user
+      #                            session
+      #   - kb-mcp-tray/main.rs  — a 3-line Windows GUI entry point
+      # `report` reuses the data collected above, so this costs seconds.
+      - name: Enforce a per-file line-coverage floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLOOR=35
+          # Forward slashes: llvm-cov matches the regex against the path as the
+          # coverage data records it, which on this runner is POSIX. The same
+          # command run on Windows matches nothing (the separators are
+          # backslashes there) and reports the excluded files too.
+          IGNORE='(kb-mcp/src/transport/stdio\.rs|kb-mcp/src/service/linux\.rs|crates/kb-mcp-tray/src/main\.rs)$'
+          # cargo-llvm-cov exits 1 without naming the file that tripped the
+          # floor, so name it here — a nightly failure has to be diagnosable
+          # from the log without re-running a coverage build locally.
+          #
+          # `<=`, not `<`: the flag requires every file to be *strictly above*
+          # MIN. Measured — `--fail-under-file-lines 0` exits 1 while a file
+          # sits at exactly 0.00%, and 28 passes against a file at 28.06% while
+          # 29 fails. The two conditions have to agree, or the run that fails is
+          # the one with no annotation.
+          cargo llvm-cov report --json --summary-only \
+            --ignore-filename-regex "$IGNORE" > coverage.json
+          jq -r --argjson floor "$FLOOR" '
+            .data[0].files[]
+            | select(.summary.lines.percent <= $floor)
+            | "::error::\(.filename): line coverage \(.summary.lines.percent * 100 | floor / 100)% is below the \($floor)% floor"
+          ' coverage.json
+          cargo llvm-cov report --summary-only --color never \
+            --fail-under-file-lines "$FLOOR" --ignore-filename-regex "$IGNORE"
