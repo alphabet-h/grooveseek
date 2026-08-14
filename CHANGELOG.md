@@ -45,6 +45,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   not restart a daemon that is already running. Default installs were never
   affected — `dirs::config_dir()` is available at start-up too.
 
+  Along the way, `systemd_exec_word` now escapes `$` as `$$` — systemd expands
+  `${FOO}` in a command line **including inside quotes**, and a config home such
+  as `/srv/${TENANT}` would otherwise have sent the daemon to a path the
+  installer never wrote to. This was already true of the binary path before this
+  release; the config argument only made it easier to hit.
+
   `ActionTarget::argument_clause` became `serve_argument` as part of this:
   Task Scheduler accepts exactly one `-Argument`, so the clause is assembled in
   `build_register_script` (which knows the config home) instead of being carried

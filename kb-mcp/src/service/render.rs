@@ -105,13 +105,23 @@ pub(crate) fn ensure_unit_value_representable(label: &str, value: &str) -> Resul
 /// 設定。空白を含むパスを素で書くと最初の空白で語が切れ、`/home/a b/kb-mcp` が
 /// コマンド `/home/a` + 引数 `b/kb-mcp` になる。
 ///
-/// `%` だけは quote では守れない。specifier 展開は unquote より前に走るため、
-/// リテラルの `%` は `%%` と書く必要がある (systemd.unit(5) SPECIFIERS)。
+/// **`%` と `$` は quote では守れない。** 理由は別々:
+///
+/// - specifier 展開は unquote より前に走るので、リテラルの `%` は `%%` と書く
+///   (systemd.unit(5) SPECIFIERS)
+/// - 環境変数展開は command line に対して常に効き、systemd.service(5) COMMAND
+///   LINES は「to pass a literal dollar sign, use `$$`」と明記している。
+///   同節の「quotes are respected when splitting into words, and afterwards
+///   removed」が示すとおり **quote は展開を止めない** ので、`"..."` の中でも
+///   `$$` が要る。`/srv/${TENANT}/cfg` のような config home は
+///   `KB_MCP_CONFIG_HOME` に実際に書ける値で、放置すると daemon が
+///   **installer が書いたのとは別のパス**を読む (codex P2 round 1 on PR #156)。
 ///
 /// quote が要らない値は**素のまま返す**。生成される unit を読みやすく保ち、
 /// 既存の出力を変えないため。
 pub(crate) fn systemd_exec_word(raw: &str) -> String {
-    let expanded = raw.replace('%', "%%");
+    // 順序は無関係 (`%%` は `$` を、`$$` は `%` を生まない)。
+    let expanded = raw.replace('%', "%%").replace('$', "$$");
     let needs_quotes = expanded
         .chars()
         .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
@@ -134,7 +144,7 @@ pub(crate) fn systemd_exec_word(raw: &str) -> String {
 /// systemd user unit を組み立てる。
 ///
 /// パスに改行が含まれる場合は **unit を書かずに失敗する** (AU-10)。
-/// `ExecStart=` に入るバイナリパスと config パスは quote と `%%` で保護する。
+/// `ExecStart=` に入るバイナリパスと config パスは quote と `%%` / `$$` で保護する。
 /// `WorkingDirectory=` を同じように扱わない理由は
 /// [`ensure_unit_value_representable`] の doc を参照。
 ///
@@ -353,6 +363,40 @@ mod tests {
         assert_eq!(systemd_exec_word("/home/a\"b/kb"), "\"/home/a\\\"b/kb\"");
         assert_eq!(systemd_exec_word("/home/a\\b/kb"), "\"/home/a\\\\b/kb\"");
         assert_eq!(systemd_exec_word("/home/a'b/kb"), "\"/home/a'b/kb\"");
+    }
+
+    /// systemd expands `${FOO}` and `$FOO` inside `ExecStart` **including
+    /// within quotes**, so a literal `$` has to be written `$$`
+    /// (systemd.service(5) COMMAND LINES). `KB_MCP_CONFIG_HOME='/srv/${TENANT}'`
+    /// is a value someone can really set, and without this the daemon would be
+    /// pointed at a path the installer never wrote to.
+    #[test]
+    fn a_dollar_sign_is_doubled_so_systemd_does_not_expand_it() {
+        assert_eq!(
+            systemd_exec_word("/srv/${TENANT}/kb-mcp"),
+            "/srv/$${TENANT}/kb-mcp"
+        );
+        assert_eq!(systemd_exec_word("/srv/$HOME/kb-mcp"), "/srv/$$HOME/kb-mcp");
+        // Quoting does not stop the expansion, so the doubling has to survive
+        // into the quoted form too.
+        assert_eq!(
+            systemd_exec_word("/srv/${A B}/kb-mcp"),
+            "\"/srv/$${A B}/kb-mcp\""
+        );
+        // Both escapes at once, since a path may carry both.
+        assert_eq!(systemd_exec_word("/srv/100%/$X"), "/srv/100%%/$$X");
+    }
+
+    /// The config argument goes through the same word treatment as the binary,
+    /// so the escaping above has to reach it.
+    #[test]
+    fn the_config_argument_is_dollar_escaped_in_the_unit() {
+        let unit = render_unit(&ctx_with("/opt/kb-mcp", "/srv/${TENANT}/cfg")).unwrap();
+        assert!(
+            unit.contains("--config /srv/$${TENANT}/cfg/kb-mcp.toml"),
+            "an unescaped `$` makes systemd read a different file than the \
+             installer wrote: {unit}"
+        );
     }
 
     #[test]
