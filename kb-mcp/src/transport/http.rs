@@ -542,7 +542,18 @@ impl LiveSessionCount {
         match self {
             Self::Rmcp(manager) => manager.sessions.read().await.len(),
             #[cfg(test)]
-            Self::Fixed(n) => n.load(std::sync::atomic::Ordering::SeqCst),
+            Self::Fixed(n) => {
+                // **読んだ後に**譲る。狙いは「生きている数を読み終えた直後に
+                // 世界が動く」最悪のスケジューリングを毎回起こすこと。
+                // production は `RwLock::read().await` の 1 回だけが yield 点で、
+                // その先の in_flight 読みとの間に譲る保証は無い — つまり実機で
+                // この隙間が開くのは別コアと競った時だけで、極めて狭い。
+                // 即値を返す double だと隙間が **一度も** 開かず、
+                // 「予約と解放の直列化」を外しても全テストが緑のままだった。
+                let value = n.load(std::sync::atomic::Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                value
+            }
         }
     }
 }
@@ -2330,10 +2341,15 @@ mod tests {
     /// `live` と `in_flight` を別々に読むと、その 2 つの読みの**間**に
     /// 「A が insert して席を返す」引き渡しが挟まり、A がどちらにも数えられて
     /// いない瞬間を B が見る。ここでは dummy service が rmcp の insert を
-    /// 演じる (応答を返す前に `live` を 1 増やす) ので、上限 4 に対して
-    /// 32 本を同時にぶつけると、通ってよいのはちょうど 4 本になる。
+    /// 演じ (応答を返す前に `live` を 1 増やす)、`LiveSessionCount::Fixed` が
+    /// 読んだ直後に必ず譲ることで、その最悪スケジューリングを毎回起こす。
+    ///
+    /// **検査するのは「上限を超えない」ことだけ**で、「ちょうど上限まで埋まる」
+    /// ことではない。in_flight を数える以上、解放待ちの席を空きと見なさない
+    /// 分だけ保守的に断ることがあり、それは安全な側への外れ。直列化を外すと
+    /// この test は `live` が 5 になって落ちる (上限 4)。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_cap_holds_across_the_handoff_from_in_flight_to_live() {
+    async fn the_cap_is_never_exceeded_across_the_handoff_to_live() {
         const CAP: u32 = 4;
         let live_count = Arc::new(AtomicUsize::new(0));
         let admitted = Arc::new(AtomicUsize::new(0));
@@ -2382,13 +2398,18 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            live_count.load(Ordering::SeqCst),
-            CAP as usize,
-            "the cap must hold while sessions move from in-flight to live"
+        let live = live_count.load(Ordering::SeqCst);
+        assert!(
+            live <= CAP as usize,
+            "the cap must hold while sessions move from in-flight to live: \
+             {live} sessions exist with max_sessions = {CAP}"
         );
-        assert_eq!(ok, CAP as usize, "exactly {CAP} of 32 may be admitted");
-        assert_eq!(admitted.load(Ordering::SeqCst), CAP as usize);
+        assert_eq!(
+            ok, live,
+            "every admitted request created a session, and no refused one did"
+        );
+        assert_eq!(admitted.load(Ordering::SeqCst), ok);
+        assert!(ok > 0, "the gate must not refuse everything");
     }
 
     /// 上限は「生きている数 + 通したがまだ確定していない数」に掛かる。
