@@ -262,3 +262,57 @@ fn test_validate_strict_flag_accepted_as_noop() {
     );
     assert_eq!(code, 0, "--strict must be accepted (no schema → exit 0)");
 }
+
+/// (feature-49) `validate` is the third exclusion surface, and the one that is
+/// easiest to leave behind: `validate_collect_md_files` lives in the **binary**
+/// target and reaches the shared decision through the library's public API, so
+/// a change made in `src/` compiles without it. AU-03 and BU-19 were both a
+/// surface that stopped agreeing with the others.
+///
+/// Run through the real binary, because that is the only way to reach that
+/// function at all. No embedding model is involved, so this stays off
+/// `#[ignore]`.
+#[test]
+fn validate_honours_kb_mcpignore() {
+    let Some(bin) = kb_mcp_bin() else {
+        eprintln!("kb-mcp binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-ignore");
+    let front = "---\ntitle: X\n---\n# body\n";
+    kb.write("good.md", front);
+    kb.write("notes/a.md", front);
+    kb.write("drafts/wip.md", front);
+    kb.write("notes/b.tmp.md", front);
+    kb.write(
+        "kb-mcp-schema.toml",
+        "[fields.title]\nrequired = true\ntype = \"string\"\n",
+    );
+
+    let args = [
+        "validate",
+        "--kb-path",
+        kb.path.to_str().unwrap(),
+        "--format",
+        "json",
+    ];
+
+    let (code, out, err) = run(&bin, &args);
+    assert_eq!(code, 0, "fixture should be clean: stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON output");
+    assert_eq!(
+        v["scanned"], 4,
+        "baseline: every .md is scanned before an ignore file exists"
+    );
+
+    kb.write(".kb-mcpignore", "drafts/\n*.tmp.md\n");
+
+    let (code, out, err) = run(&bin, &args);
+    assert_eq!(code, 0, "still clean after the ignore file: stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON output");
+    assert_eq!(
+        v["scanned"], 2,
+        "validate must skip what the index walk skips — a directory pattern and a \
+         file pattern, leaving good.md and notes/a.md"
+    );
+}

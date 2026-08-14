@@ -92,36 +92,14 @@ pub struct WatcherState {
     pub embedder: Arc<Mutex<Embedder>>,
     pub registry: Arc<Registry>,
     pub exclude_headings: Option<Vec<String>>,
-    pub exclude_dirs: Vec<String>,
+    /// (feature-49) 除外の 3 層をまとめた判定器。`exclude_dirs` の生リストを
+    /// 持っていた頃と違い、`.kb-mcpignore` の中身も含む = **可変**。
+    /// ignore ファイルが書き換わったら [`handle_events`] が差し替える。
+    pub rules: crate::exclusion::ExclusionRules,
     pub config: WatchConfig,
     /// Set to `true` for the duration of the watch loop (feature-43 PR-2).
     /// Shared with `KbServerShared` so `/api/admin/status` can report it.
     pub watcher_active: Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// `rel` (forward-slash 相対パス) が `exclude_dirs` のいずれかの配下に
-/// あるかを判定する。basename を `/` 境界で判定するため、
-/// 例えば `["node_modules"]` に対して `"node_modules/"` 開始や
-/// `"sub/node_modules/"` 含みはヒットするが、`"node_modules-bak/"` は
-/// ヒットしない。
-///
-/// (BU-19) 判定そのものは [`indexer::is_user_excluded_dir`] に委譲する。
-/// index walk 側だけ大文字小文字を無視するようにすると、`exclude_dirs =
-/// ["build"]` + ディスク上 `Build/` で **full index は skip するのに watcher が
-/// 増分 index する**という食い違いが生まれる (= AU-03 で watcher だけ
-/// hardcoded denylist を持っていなかったのと同型)。
-fn is_under_excluded_dir(rel: &str, exclude_dirs: &[String]) -> bool {
-    // 最後の要素はイベント対象そのもの。`rel` が除外ディレクトリ名と完全一致
-    // する場合 (= ディレクトリ自体のイベント) だけそこも見る、という旧実装
-    // (`rel == d || starts_with("{d}/") || contains("/{d}/")`) と同じ範囲。
-    let comps: Vec<&str> = rel.split('/').collect();
-    let dirs = if comps.len() == 1 {
-        &comps[..]
-    } else {
-        &comps[..comps.len() - 1]
-    };
-    dirs.iter()
-        .any(|c| indexer::is_user_excluded_dir(c, exclude_dirs))
 }
 
 /// Watcher タスク本体。notify の裏スレッドから tokio channel 越しにイベントを
@@ -131,7 +109,7 @@ fn is_under_excluded_dir(rel: &str, exclude_dirs: &[String]) -> bool {
 /// タスク内部での処理エラーはログに流して次のイベントへ進む (silent drop 禁止)。
 /// tokio task が panic しないよう各イベント処理は `catch_unwind` 相当の防衛線を
 /// 張らない代わりに、error 経路は `eprintln!` で可視化する。
-pub async fn run_watch_loop(state: WatcherState) -> Result<()> {
+pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
     if !state.config.enabled {
         return Ok(());
     }
@@ -275,7 +253,7 @@ pub async fn run_watch_loop(state: WatcherState) -> Result<()> {
     );
 
     while let Some(events) = rx_async.recv().await {
-        handle_events(&state, &events);
+        handle_events(&mut state, &events);
     }
 
     Ok(())
@@ -330,8 +308,54 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
     }
 }
 
+/// (feature-49) `.kb-mcpignore` が書き換わったら判定器を組み直す。
+///
+/// `&mut` で済むのは `WatcherState` を所有しているのが [`run_watch_loop`] 1 本
+/// だけだから。ロックを足さずに済むこの形が一番強い排他で、BU-32 の
+/// 「並行の不変条件は論証でなく排他で閉じる」をコストゼロで満たす。
+///
+/// **効くのはこれ以降のイベントだけ**。すでに index に入っている文書は次の
+/// full index (`kb-mcp index` / MCP `rebuild_index`) まで残る — walk から消えた
+/// path を DB から落とすのは削除 pass の仕事で、watcher は個々のイベントしか
+/// 見ないため。ログでそう言う。
+/// Is this event path the knowledge base's own `.kb-mcpignore`?
+///
+/// The root's, and only the root's: a `sub/.kb-mcpignore` is not read, so a
+/// write to one must not silently reload anything either. Routed through
+/// [`to_rel`] so it answers the same way the rest of the watcher relativizes.
+fn is_ignore_file(kb_path: &Path, p: &Path) -> bool {
+    to_rel(kb_path, p).as_deref() == Some(crate::exclusion::IGNORE_FILE_NAME)
+}
+
+fn reload_rules(state: &mut WatcherState) {
+    let exclude_dirs = state.rules.exclude_dirs().to_vec();
+    state.rules = crate::exclusion::ExclusionRules::load(&state.kb_path, exclude_dirs);
+    let name = crate::exclusion::IGNORE_FILE_NAME;
+    match state.rules.ignore_file_patterns() {
+        Some(n) => eprintln!(
+            "watcher: reloaded {name} ({n} pattern{}). New events follow the new rules; \
+             documents already indexed stay until the next full index run.",
+            if n == 1 { "" } else { "s" }
+        ),
+        None => eprintln!(
+            "watcher: {name} is gone or could not be read; only exclude_dirs applies now."
+        ),
+    }
+}
+
 /// debounced event batch を分類して indexer に流す。
-fn handle_events(state: &WatcherState, events: &[DebouncedEvent]) {
+fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
+    // (feature-49) ignore ファイルの変更を分類より **先** に処理する。
+    // `.kb-mcpignore` は registry にある拡張子を持たないので、通常の経路に
+    // 流すと `should_process` に弾かれ、変更に気づく機会ごと消える。
+    if events
+        .iter()
+        .any(|evt| evt.paths.iter().any(|p| is_ignore_file(&state.kb_path, p)))
+    {
+        reload_rules(state);
+    }
+
+    let state = &*state;
     for evt in events {
         match classify(evt) {
             Classified::Rename { from, to } => {
@@ -405,11 +429,11 @@ fn rename_action(old_ok: bool, new_ok: bool) -> RenameAction {
 
 /// 対象ファイルの拡張子が `registry` にあり、除外対象でないこと。
 ///
-/// `WatcherState` のうち `registry` / `exclude_dirs` しか見ないので、判定本体は
+/// `WatcherState` のうち `registry` / `rules` しか見ないので、判定本体は
 /// [`should_process_parts`] に切り出してある (test から `Database` / `Embedder`
 /// のダミー構築なしに **本番と同一のロジック** を叩けるようにするため)。
 fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
-    should_process_parts(rel, full, &state.registry, &state.exclude_dirs)
+    should_process_parts(rel, full, &state.registry, &state.rules)
 }
 
 /// [`should_process`] の判定本体。
@@ -417,18 +441,27 @@ fn should_process_parts(
     rel: &str,
     full: &Path,
     registry: &Registry,
-    exclude_dirs: &[String],
+    rules: &crate::exclusion::ExclusionRules,
 ) -> bool {
-    // 除外ディレクトリ配下は無視 (rebuild_index と同じ扱い)
-    if is_under_excluded_dir(rel, exclude_dirs) {
-        return false;
-    }
-    // ユーザ設定に関わらず常に skip する denylist (`.git` / `node_modules` 等)。
-    // full-audit 2026-07-26 AU-03: `collect_source_files` (indexer) と
-    // `validate_collect_md_files` (main) は適用済みだったが watcher だけ
-    // 抜けており、`exclude_dirs` を絞った設定では **live watcher だけが**
-    // `.git/` や `node_modules/` を index していた (`npm install` で KB 汚染)。
-    if rel.split('/').any(indexer::is_hardcoded_excluded) {
+    // 1 回の stat を 2 つの判定で使い回す: ディレクトリかどうか (末尾スラッシュ
+    // の `.kb-mcpignore` パターンの効き方が変わる) と、symlink かどうか。
+    // `symlink_metadata` が失敗するのは対象が既に無い時 = 削除イベントで、
+    // 下の 2 つはどちらもその場合 **通す** (この関数は deindex も gate する)。
+    let meta = std::fs::symlink_metadata(full).ok();
+    let is_dir = meta.as_ref().is_some_and(|m| m.file_type().is_dir());
+
+    // (feature-49) 除外の 3 層 — hardcoded denylist (`.git` / `node_modules`) /
+    // user `exclude_dirs` / `.kb-mcpignore` — をここで 1 回だけ判定する。
+    //
+    // AU-03 は watcher だけ denylist を持っておらず、`exclude_dirs` を絞った
+    // 設定で **live watcher だけが** `.git/` や `node_modules/` を index して
+    // いた件 (`npm install` で KB 汚染)。BU-19 は index walk 側だけ大文字小文字を
+    // 無視するようにして、`exclude_dirs = ["build"]` + ディスク上 `Build/` で
+    // **full index は skip するのに watcher が増分 index する**食い違いを作った件。
+    // どちらも同じ判断が 2 実装に分かれていたのが原因なので、3 層目を足すに
+    // あたって判定そのものを [`crate::exclusion::ExclusionRules`] の 1 メソッドに
+    // 集約した。index walk と `validate` walk も同じものを呼ぶ。
+    if rules.is_excluded(rel, is_dir) {
         return false;
     }
     // `.kb-mcp.db*` は kb_path の外にあるので通常ヒットしないが念のため
@@ -445,10 +478,8 @@ fn should_process_parts(
     //
     // `symlink_metadata` が失敗した場合は**通す**。削除イベントではファイルが
     // 既に無く、ここで弾くと deindex が動かなくなるため (この関数は
-    // Reindex / Deindex の両方を gate している)。
-    if let Ok(meta) = std::fs::symlink_metadata(full)
-        && meta.file_type().is_symlink()
-    {
+    // Reindex / Deindex の両方を gate している)。上で取った 1 回ぶんを使う。
+    if meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
         return false;
     }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
@@ -643,13 +674,19 @@ mod tests {
     /// skip ルールを変えても全部 green のまま**だった。判定本体を
     /// `should_process_parts` に切り出し、ここは委譲だけにすることで、
     /// 既存 assert を 1 文字も変えずにテストが本番経路を踏むようにした。
+    ///
+    /// (feature-49) `exclude_dirs` を受け取る形はそのまま残してある。
+    /// `ExclusionRules` を組み立てるのはここの仕事で、既存の呼び出し側 20 箇所は
+    /// 1 文字も変わらない。`.kb-mcpignore` を絡める新しいテストは
+    /// [`rules_with_ignore_file`] を使う。
     fn should_process_lite(
         rel: &str,
         full: &Path,
         registry: &Registry,
         exclude_dirs: &[String],
     ) -> bool {
-        should_process_parts(rel, full, registry, exclude_dirs)
+        let rules = crate::exclusion::ExclusionRules::from_exclude_dirs(exclude_dirs.to_vec());
+        should_process_parts(rel, full, registry, &rules)
     }
 
     /// Regression (full-audit 2026-08-12、セキュリティ軸 H-1): full re-index は
@@ -850,6 +887,137 @@ mod tests {
                 "{rel} names a different directory and must still be watched"
             );
         }
+    }
+
+    /// (feature-49) The same shape as the test above, for the third exclusion
+    /// layer — and this time both surfaces are run, rather than one being
+    /// trusted to follow the other.
+    ///
+    /// AU-03 and BU-19 were both "the walk and the watcher answered
+    /// differently", and both were found after they shipped, because each side
+    /// had a test that only ever asked its own side. Here one `.kb-mcpignore`
+    /// is written to one directory, and every path is put through
+    /// `collect_source_files` (the full index walk) **and**
+    /// `should_process_parts` (the live watcher); the assertion is that they
+    /// agree, whatever the answer is.
+    #[test]
+    fn the_index_walk_and_the_watcher_agree_about_a_kb_mcpignore() {
+        let kb = crate::test_support::unique_temp_path("kb-watch-ignore-agree");
+        std::fs::create_dir_all(&kb).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+
+        // Every case the two implementations could disagree about: a plain
+        // pattern, a directory pattern, an anchored one, a `**` one, a
+        // negation, and a negation under an ignored parent.
+        std::fs::write(
+            kb.join(crate::exclusion::IGNORE_FILE_NAME),
+            "*.tmp.md\ndrafts/\n/root-only.md\narchive/**\nnotes/*.md\n!notes/keep.md\n\
+             logs/\n!logs/important.md\n",
+        )
+        .unwrap();
+
+        let cases = [
+            "keep.md",
+            "a.tmp.md",
+            "deep/b.tmp.md",
+            "drafts/x.md",
+            "drafts/deep/x.md",
+            "root-only.md",
+            "sub/root-only.md",
+            "archive/x.md",
+            "archive/deep/x.md",
+            "notes/drop.md",
+            "notes/keep.md",
+            "logs/important.md",
+            // The other side of each boundary.
+            "draftsy/x.md",
+            "notes/deep/x.md",
+            "a.tmp",
+        ];
+        for rel in cases {
+            let full = kb.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "# x\n").unwrap();
+        }
+
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        assert_eq!(
+            rules.ignore_file_patterns(),
+            Some(8),
+            "the fixture's patterns must all have compiled, or this proves nothing"
+        );
+
+        let collected = crate::indexer::collect_source_files(&kb, &reg, &rules).unwrap();
+        let walked: std::collections::HashSet<String> = collected
+            .iter()
+            .map(|p| crate::exclusion::rel_key(&kb, p))
+            .collect();
+
+        for rel in cases {
+            if !rel.ends_with(".md") {
+                continue; // the extension filter, not the exclusion, decides these
+            }
+            let full = kb.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let watcher_takes_it = should_process_parts(rel, &full, &reg, &rules);
+            let walk_takes_it = walked.contains(rel);
+            assert_eq!(
+                walk_takes_it, watcher_takes_it,
+                "the index walk and the watcher disagree about {rel}: walk={walk_takes_it}, \
+                 watcher={watcher_takes_it}. One of them is indexing what the other skips, \
+                 which is exactly AU-03 and BU-19"
+            );
+        }
+
+        // And the answers themselves, so "they agree" cannot become "they are
+        // both wrong in the same way".
+        assert!(walked.contains("keep.md"));
+        assert!(
+            walked.contains("notes/keep.md"),
+            "a negation must re-include"
+        );
+        assert!(walked.contains("sub/root-only.md"), "a leading / anchors");
+        assert!(!walked.contains("a.tmp.md"));
+        assert!(!walked.contains("drafts/deep/x.md"));
+        assert!(!walked.contains("root-only.md"));
+        assert!(!walked.contains("archive/deep/x.md"));
+        assert!(!walked.contains("notes/drop.md"));
+        assert!(
+            !walked.contains("logs/important.md"),
+            "an ignored parent cannot be undone by a ! line for a file inside it"
+        );
+        assert!(walked.contains("draftsy/x.md"));
+        assert!(
+            walked.contains("notes/deep/x.md"),
+            "`notes/*.md` must not reach a deeper level"
+        );
+    }
+
+    /// Only the knowledge base's own ignore file triggers a reload.
+    #[test]
+    fn only_the_root_ignore_file_is_a_reload_trigger() {
+        let kb = Path::new("/tmp/kb");
+        assert!(is_ignore_file(
+            kb,
+            &kb.join(crate::exclusion::IGNORE_FILE_NAME)
+        ));
+        assert!(!is_ignore_file(
+            kb,
+            &kb.join("sub").join(crate::exclusion::IGNORE_FILE_NAME)
+        ));
+        assert!(!is_ignore_file(kb, &kb.join("notes.md")));
+        assert!(!is_ignore_file(
+            kb,
+            Path::new("/tmp/other")
+                .join(crate::exclusion::IGNORE_FILE_NAME)
+                .as_path()
+        ));
     }
 
     #[test]

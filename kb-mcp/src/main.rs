@@ -989,15 +989,10 @@ fn main() -> anyhow::Result<()> {
             // canonicalize は使わない: walkdir は相対パスでも動作し、strip_prefix
             // も同形のパスで一致する。Windows の UNC (\\?\) prefix 漏れを避ける。
             let schema_path = schema.unwrap_or_else(|| kb_path.join("kb-mcp-schema.toml"));
-            let exclude_dirs = cfg.resolve_exclude_dirs();
-            let exit = run_validate(
-                &kb_path,
-                &schema_path,
-                format,
-                no_color,
-                fail_fast,
-                &exclude_dirs,
-            )?;
+            // (feature-49) `validate` も index walk と同じ除外規則で歩く。
+            let rules =
+                kb_mcp::exclusion::ExclusionRules::load(&kb_path, cfg.resolve_exclude_dirs());
+            let exit = run_validate(&kb_path, &schema_path, format, no_color, fail_fast, &rules)?;
             std::process::exit(exit);
         }
         Commands::Eval(args) => {
@@ -1309,7 +1304,7 @@ fn run_validate(
     format: ValidateFormat,
     no_color: bool,
     fail_fast: bool,
-    exclude_dirs: &[String],
+    rules: &kb_mcp::exclusion::ExclusionRules,
 ) -> Result<i32> {
     // スキーマ読み込み: 存在しなければ legacy 挙動 (exit 0)
     let schema_obj = match kb_mcp::schema::Schema::load_optional(schema_path) {
@@ -1330,7 +1325,7 @@ fn run_validate(
     // parser registry は `[parsers].enabled` 準拠で .md ファイル列挙に再利用
     // (.txt は frontmatter 概念なしで対象外)。
     let md_parser = kb_mcp::parser::MarkdownParser;
-    let files = validate_collect_md_files(kb_path, exclude_dirs)?;
+    let files = validate_collect_md_files(kb_path, rules)?;
 
     let mut reports: Vec<FileReport> = Vec::new();
     let mut scanned: u32 = 0;
@@ -1378,25 +1373,24 @@ fn run_validate(
     Ok(if has_violation { 1 } else { 0 })
 }
 
-/// validate 専用の `.md` ファイル列挙。除外ディレクトリスキップと
-/// deterministic ordering は indexer の collect_source_files と同じ方針。
-fn validate_collect_md_files(kb_path: &Path, exclude_dirs: &[String]) -> Result<Vec<PathBuf>> {
+/// validate 専用の `.md` ファイル列挙。除外判定と deterministic ordering は
+/// indexer の collect_source_files と同じ方針。
+///
+/// (feature-49) 判定は [`kb_mcp::exclusion::ExclusionRules`] に一本化した。
+/// この関数は bin target 側にいるので lib の `pub` を跨いで呼ぶ形になり、
+/// **3 caller のうちここだけ取り残される**のが AU-03 と BU-19 の形だった。
+fn validate_collect_md_files(
+    kb_path: &Path,
+    rules: &kb_mcp::exclusion::ExclusionRules,
+) -> Result<Vec<PathBuf>> {
     use walkdir::WalkDir;
     let mut out = Vec::new();
     for entry in WalkDir::new(kb_path)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
-            if !e.file_type().is_dir() {
-                return true;
-            }
-            let name = e.file_name().to_string_lossy();
-            // F-62: same hardcoded denylist as indexer::collect_source_files,
-            // applied as a fail-safe alongside user exclude_dirs (union).
-            if kb_mcp::indexer::is_hardcoded_excluded(name.as_ref()) {
-                return false;
-            }
-            !kb_mcp::indexer::is_user_excluded_dir(name.as_ref(), exclude_dirs)
+            let rel = kb_mcp::exclusion::rel_key(kb_path, e.path());
+            !rules.is_excluded(&rel, e.file_type().is_dir())
         })
     {
         let entry = entry.context("walkdir error during validate")?;

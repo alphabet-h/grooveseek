@@ -12,6 +12,70 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **`.kb-mcpignore`** (C-7). A file of that name in the **root of the knowledge
+  base** excludes paths in [gitignore syntax](https://git-scm.com/docs/gitignore)
+  — globs, `**`, a trailing `/` for directories only, a leading `/` to anchor,
+  and `!` to re-include. `exclude_dirs` could only ever name whole directories;
+  this can name files and patterns:
+
+  ```
+  drafts/
+  *.tmp.md
+  archive/**
+  notes/*.md
+  !notes/keep.md
+  ```
+
+  The layers are a union — the built-in `.git` / `.svn` / `node_modules`
+  fail-safe, then `exclude_dirs`, then this file — so `!` can only undo an
+  earlier line of `.kb-mcpignore` itself. Matching is case-insensitive on every
+  platform, as `exclude_dirs` already was, so one file behaves the same way on
+  all three. Only the root's file is read: no subdirectory files, nothing above
+  `kb_path`, and **not `.gitignore`**, since a knowledge base kept in git often
+  ignores exactly the large files you want indexed.
+
+  **It bounds indexing, not access.** An excluded file is never indexed, so it
+  can never appear in `search` or `get_connection_graph` — both read from the
+  database and never touch the filesystem — but it stays readable through
+  `get_document` by a caller that knows its path, exactly as a file under
+  `exclude_dirs` always has. Whoever can write into the knowledge base can also
+  delete the ignore file, so a rule living inside the tree is not what guards
+  the tree; keep anything that must not be readable outside `kb_path`. The
+  reasoning, and the implementation choices below, are recorded in
+  [ADR-0003](docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md).
+
+  The full index walk, `kb-mcp validate` and the live watcher all apply it, and
+  they now share one decision rather than three implementations of it — AU-03
+  and BU-19 were both a surface that had quietly stopped agreeing with the
+  others, and both were found after release. One test runs the index walk and
+  the watcher over the same fixture and asserts they answer alike.
+
+  Editing the file while the server runs takes effect for subsequent file
+  events; documents already indexed stay until the next `kb-mcp index` or MCP
+  `rebuild_index`, which re-reads it and drops what it now excludes. An ignore
+  file that exists but cannot be read — a hard link, a symlink, a directory,
+  over 64 KiB, or past 1000 patterns — warns and is left out (or truncated)
+  rather than stopping the run. It is read through the same handle-bound guard
+  as any note (v0.20.0), and a leading UTF-8 BOM is stripped, since otherwise it
+  becomes part of the first pattern and that line silently matches nothing.
+
+  For a knowledge base with no `.kb-mcpignore` the only change is internal:
+  `walkdir`'s `filter_entry` now consults the exclusion rules for files as well
+  as directories, because `exclude_dirs` only ever named directories.
+
+  New dependency: `ignore` (used as a matcher only — `walkdir` still does the
+  walking, for the reasons in the ADR). All eleven of its transitive
+  dependencies were already present, so the addition is one crate, plus
+  `regex-automata` moving 0.4.14 → 0.4.18.
+
+### Fixed
+
+- `HARDCODED_EXCLUDE_DIRS`'s documentation called the configuration key
+  `[indexer].exclude_dirs`. It is top-level `exclude_dirs`; there is no
+  `[indexer]` section.
+
 ## [0.20.0] - 2026-08-15
 
 ### Security

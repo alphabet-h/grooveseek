@@ -13,6 +13,7 @@ pub mod config;
 pub mod db;
 pub mod embedder;
 pub mod eval;
+pub mod exclusion;
 pub mod graph;
 pub mod indexer;
 /// Hard-link detection for the index / watcher / `get_document` guards (BU-20).
