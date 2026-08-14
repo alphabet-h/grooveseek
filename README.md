@@ -886,6 +886,21 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `rebuild_index` | Rebuild the search index by scanning all source files (Markdown plus any other extensions enabled via `[parsers].enabled`). | `force` (optional, default false) |
 | `get_connection_graph` | BFS-expand semantically related chunks starting from a document path. Returns a flat list of nodes with `parent_id` / `depth` / `score` / `snippet` so the caller can chain context discovery, plus `truncated` / `truncation[]` when a bound cut the walk short. | `path` (required), `depth` (default 2, max 3), `fan_out` (default 5, max 20), `min_similarity` (default 0.3), `seed_strategy` (`all_chunks` / `centroid`), `dedup_by_path`, `category`, `topic`, `exclude_paths`, `max_nodes` (default 100, max 2000), `max_seed_chunks` (default 32, max 1000) |
 
+## Prompts
+
+(v0.22.0+) Four prompts ship with the server. A client surfaces them as commands the **user** picks — Claude Code renders them as `/mcp__kb-mcp__<name>` — and each one exists because the tools alone do not say how to combine them: `search` does not tell a caller to follow it with `get_connection_graph`, or that a `low_confidence` flag means the answer should say so.
+
+| Prompt | Arguments | What it asks for |
+|---|---|---|
+| `summarize_topic` | `topic` (required) | Confirm the topic exists with `list_topics`, gather it with `search`, read the documents that carry weight with `get_document`, then summarize — including what the knowledge base does *not* cover. |
+| `deep_dive` | `question` (required) | Do not answer from the first search: expand the strongest hits with `get_connection_graph` at depth 2, read whole documents, and search again with the vocabulary that turns up. |
+| `whats_new` | `since` (optional ISO date) | Survey documents dated since then. The prompt says outright that `date_from` filters the frontmatter `date` — what an author typed — not when a file changed, so this is an approximation and should be presented as one. |
+| `find_gaps` | `topic` (optional) | Look for what is missing: questions that come back with `low_confidence`, and stubs that only appear with `include_low_quality: true`. Reports absences, does not propose content. |
+
+All four are plain text and share one set of citation rules: cite the `path` of every document used, surface `low_confidence` rather than answering through it, and say when the knowledge base is silent instead of filling the gap from general knowledge.
+
+They are fixed at compile time rather than configurable. Prompt text goes to the model, and `kb-mcp.toml` is *discovered* — from the working directory or a `.git` ancestor — so a configurable prompt set would need the same restriction that already applies to `kb_path` under an untrusted config. The MCP specification offers no help here: unlike tool annotations, it gives clients no guidance to distrust prompt content.
+
 ## Notes
 
 - **Embedding model**: On first run, the selected ONNX model is downloaded to an OS-standard cache directory. Subsequent runs reuse the cached model. Resolution order:

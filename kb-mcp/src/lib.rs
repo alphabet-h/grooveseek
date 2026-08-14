@@ -26,6 +26,8 @@ pub mod parser;
 /// integration tests have no reason to reach for it, and every call site is a
 /// lock this crate owns.
 pub(crate) mod poison;
+/// The MCP `prompts` surface (B-3): a fixed set of named recipes over the tools.
+pub mod prompts;
 pub mod quality;
 pub mod schema;
 pub mod schema_compat;

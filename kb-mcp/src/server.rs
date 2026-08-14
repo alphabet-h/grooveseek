@@ -6,7 +6,7 @@ use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Database, SearchHit};
@@ -1011,6 +1011,7 @@ impl KbServer {
 /// here"), so only the paths that set them are conforming. The tool macro does.
 /// The trait defaults do not.
 #[tool_handler]
+#[prompt_handler]
 impl ServerHandler for KbServer {
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo` and `Implementation` are `#[non_exhaustive]`, so a
@@ -1022,7 +1023,10 @@ impl ServerHandler for KbServer {
 
         let mut info = ServerInfo::default();
         info.protocol_version = ProtocolVersion::LATEST;
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .build();
         info.server_info = me;
         info
     }

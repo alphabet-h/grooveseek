@@ -1,4 +1,4 @@
-//! (feature-50 PR 1) What the server tells a client about itself.
+//! (feature-50) What the server tells a client about itself.
 //!
 //! Before this file there was no test anywhere in the repo asserting the
 //! advertised capability set, the tool list as it appears on the wire, or the
@@ -37,6 +37,24 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 /// is exactly how `resources/read` looked like it returned nothing while it was
 /// really answering. Accept both framings.
 fn rpc(base: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+    rpc_named(base, method, None, params)
+}
+
+/// As [`rpc`], with the `Mcp-Name` header some methods require.
+///
+/// Measured: the Streamable HTTP transport rejects `prompts/get` and
+/// `resources/read` outright with `-32020 missing required Mcp-Name header`
+/// before the handler runs, while `tools/list`, `prompts/list` and
+/// `resources/list` do not need it. The pattern is that operations naming a
+/// single primitive must name it in a header too — and the rejection arrives as
+/// a plain JSON body rather than SSE, so a reader that only strips `data: `
+/// turns it into silence.
+fn rpc_named(
+    base: &str,
+    method: &str,
+    name: Option<&str>,
+    params: serde_json::Value,
+) -> serde_json::Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -45,23 +63,29 @@ fn rpc(base: &str, method: &str, params: serde_json::Value) -> serde_json::Value
     })
     .to_string();
 
+    let mut args: Vec<String> = vec![
+        "-s".into(),
+        "-X".into(),
+        "POST".into(),
+        format!("{base}/mcp"),
+        "-H".into(),
+        "Content-Type: application/json".into(),
+        "-H".into(),
+        "Accept: application/json, text/event-stream".into(),
+        "-H".into(),
+        format!("MCP-Protocol-Version: {PROTOCOL_VERSION}"),
+        "-H".into(),
+        format!("Mcp-Method: {method}"),
+    ];
+    if let Some(name) = name {
+        args.push("-H".into());
+        args.push(format!("Mcp-Name: {name}"));
+    }
+    args.push("-d".into());
+    args.push(body.clone());
+
     let out = Command::new("curl")
-        .args([
-            "-s",
-            "-X",
-            "POST",
-            &format!("{base}/mcp"),
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "Accept: application/json, text/event-stream",
-            "-H",
-            &format!("MCP-Protocol-Version: {PROTOCOL_VERSION}"),
-            "-H",
-            &format!("Mcp-Method: {method}"),
-            "-d",
-            &body,
-        ])
+        .args(&args)
         .output()
         .expect("curl spawn");
     let text = String::from_utf8_lossy(&out.stdout);
@@ -139,13 +163,14 @@ fn the_server_identifies_itself_as_kb_mcp() {
 
 /// The capability set, on both discovery surfaces.
 ///
-/// Pinned at "tools only" deliberately: `prompts/list` and `resources/list`
-/// already answer with empty arrays whether or not anything is declared, so
-/// declaring a capability with nothing behind it only invites round-trips that
-/// return nothing. When B-2 / B-3 land, this assertion changes with them — and
-/// the point is that it has to be changed on purpose.
+/// Each entry here is a promise with something behind it. `prompts/list` and
+/// `resources/list` answer with empty arrays whether or not anything is
+/// declared, so declaring a capability with nothing behind it only invites
+/// round-trips that return nothing — which is why `resources` is still absent
+/// while `prompts` has joined `tools`. Changing this list is how a capability
+/// gets added: on purpose, in the commit that gives it content.
 #[test]
-fn the_advertised_capabilities_are_tools_only_on_both_discovery_surfaces() {
+fn the_advertised_capabilities_are_exactly_what_is_implemented() {
     let (_kb, _guard, base) = start();
 
     let init = rpc(
@@ -159,11 +184,13 @@ fn the_advertised_capabilities_are_tools_only_on_both_discovery_surfaces() {
         }),
     );
     let from_initialize = &init["result"]["capabilities"];
-    assert!(
-        from_initialize.get("tools").is_some(),
-        "tools must be advertised: {init}"
-    );
-    for absent in ["prompts", "resources", "completions", "logging"] {
+    for present in ["tools", "prompts"] {
+        assert!(
+            from_initialize.get(present).is_some(),
+            "{present} is implemented and must be advertised: {init}"
+        );
+    }
+    for absent in ["resources", "completions", "logging"] {
         assert!(
             from_initialize.get(absent).is_none(),
             "{absent} is not implemented and must not be advertised: {init}"
@@ -181,6 +208,108 @@ fn the_advertised_capabilities_are_tools_only_on_both_discovery_surfaces() {
         "the two discovery surfaces must advertise the same capabilities; \
          asserting only against `initialize` tests the dialect 2026-07-28 \
          moved on from: discover={discover}"
+    );
+}
+
+/// (feature-50 PR 2) The prompt list as a client sees it — the names it renders
+/// as commands, and the caching hints the spec requires.
+///
+/// Measured rather than assumed: the `#[prompt_handler]` macro does set `ttlMs`
+/// and `cacheScope`, the way the tool macro does and the trait defaults do not.
+/// Asserting it here is what keeps that true if the macro changes.
+#[test]
+fn the_prompt_list_is_the_four_prompts_with_the_caching_hints_the_spec_requires() {
+    let (_kb, _guard, base) = start();
+
+    let resp = rpc(&base, "prompts/list", serde_json::json!({"_meta": meta()}));
+    let result = &resp["result"];
+
+    let mut names: Vec<String> = result["prompts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no prompts array: {resp}"))
+        .iter()
+        .map(|p| p["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["deep_dive", "find_gaps", "summarize_topic", "whats_new"],
+        "the prompt surface changed; if that was deliberate, update this list"
+    );
+
+    assert_eq!(result["resultType"], "complete", "{resp}");
+    assert!(
+        result.get("ttlMs").is_some() && result.get("cacheScope").is_some(),
+        "the spec requires caching hints on a complete result: {resp}"
+    );
+}
+
+/// A prompt has to come back with a message when asked for, and say something
+/// useful when asked for one that does not exist.
+#[test]
+fn a_prompt_returns_a_user_message_and_an_unknown_one_names_the_alternatives() {
+    let (_kb, _guard, base) = start();
+
+    let resp = rpc_named(
+        &base,
+        "prompts/get",
+        Some("summarize_topic"),
+        serde_json::json!({
+            "name": "summarize_topic",
+            "arguments": {"topic": "zqxw-distinct-topic"},
+            "_meta": meta(),
+        }),
+    );
+    let messages = resp["result"]["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no messages: {resp}"));
+    assert_eq!(messages.len(), 1, "{resp}");
+    assert_eq!(messages[0]["role"], "user", "{resp}");
+    let text = messages[0]["content"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content: {resp}"));
+    assert!(
+        text.contains("zqxw-distinct-topic"),
+        "the argument never reached the message: {text}"
+    );
+
+    let missing = rpc_named(
+        &base,
+        "prompts/get",
+        Some("no_such_prompt"),
+        serde_json::json!({"name": "no_such_prompt", "_meta": meta()}),
+    );
+    assert!(
+        missing["error"].is_object(),
+        "an unknown prompt must be an error, not an empty success: {missing}"
+    );
+    let detail = missing["error"].to_string();
+    assert!(
+        detail.contains("summarize_topic"),
+        "the error should tell the caller what does exist: {detail}"
+    );
+}
+
+/// The header requirement itself, pinned because it is transport-level and
+/// invisible from the Rust API: nothing in `ServerHandler` mentions it, so the
+/// first integration test written without it fails in a way that looks like a
+/// broken handler.
+#[test]
+fn prompts_get_is_rejected_without_the_mcp_name_header() {
+    let (_kb, _guard, base) = start();
+
+    let resp = rpc(
+        &base,
+        "prompts/get",
+        serde_json::json!({
+            "name": "summarize_topic",
+            "arguments": {"topic": "mcp"},
+            "_meta": meta(),
+        }),
+    );
+    assert_eq!(
+        resp["error"]["code"], -32020,
+        "expected the transport to reject a nameless prompts/get: {resp}"
     );
 }
 
