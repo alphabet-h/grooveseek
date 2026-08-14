@@ -2095,10 +2095,18 @@ pub async fn run_server(
             addr,
             allowed_hosts,
             healthz_public,
+            max_sessions,
         } => {
             // move shared to http runner (no clone needed — stdio branch
             // consumes it only by reference and is mutually exclusive).
-            crate::transport::http::run_http(addr, allowed_hosts, healthz_public, shared).await
+            crate::transport::http::run_http(
+                addr,
+                allowed_hosts,
+                healthz_public,
+                max_sessions,
+                shared,
+            )
+            .await
         }
     };
     watcher_handle.abort();

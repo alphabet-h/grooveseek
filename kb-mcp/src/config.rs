@@ -663,6 +663,18 @@ impl Config {
                     "ignoring [transport.http].healthz_public from an untrusted config"
                 );
             }
+            // (BU-32) `max_sessions` は上の 2 つと逆向きに見えるが、扱いは同じで
+            // よい。落とすと built-in の既定 (256) に戻る = **保護は残る**。
+            // 一方これを尊重すると `max_sessions = 1` を植えるだけで、最初の
+            // クライアントが繋いだ後は誰も session を張れない状態を他人に
+            // 作らせることになる (自分で自分を止める設定を、自分は書いていない)。
+            if http.max_sessions.take().is_some() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    "ignoring [transport.http].max_sessions from an untrusted config \
+                     (using the built-in default)"
+                );
+            }
         }
 
         // R3: 何を索引して LLM クライアントに渡すか。**唯一の致命的規則**。
@@ -2808,6 +2820,48 @@ lambda = 0.5
             cfg.transport.as_ref().and_then(|t| t.kind),
             Some(crate::transport::TransportKindConfig::Http)
         );
+    }
+
+    /// (BU-32) A planted `max_sessions` is dropped like the other two
+    /// `[transport.http]` keys, and for a reason that is worth stating: unlike
+    /// `allowed_hosts`, this one is a *limit*, so ignoring it restores the
+    /// built-in default rather than removing a protection. Honouring it would
+    /// let whoever owns the directory write `max_sessions = 1` and leave the
+    /// server unable to accept a second client — a denial of service the
+    /// operator never configured.
+    #[test]
+    fn an_untrusted_config_cannot_shrink_the_session_limit() {
+        let dir = TempDir::new("kb-mcp-untrusted-sessions");
+        let planted = format!("{}max_sessions = 1\n", planted_toml("kb"));
+        std::fs::write(dir.path().join("kb-mcp.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+
+        let http = d
+            .config
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives");
+        assert!(
+            http.max_sessions.is_none(),
+            "a planted max_sessions must not be honoured; the built-in default applies"
+        );
+
+        // And the value that actually reaches the runtime is the default, not 1.
+        let resolved =
+            crate::transport::Transport::resolve(None, None, None, d.config.transport.as_ref())
+                .expect("resolve ok");
+        match resolved {
+            crate::transport::Transport::Http { max_sessions, .. } => assert_eq!(
+                max_sessions,
+                crate::transport::http::DEFAULT_MAX_SESSIONS,
+                "the planted limit must not reach the server"
+            ),
+            other => panic!("expected an HTTP transport, got {other:?}"),
+        }
     }
 
     /// The planted value must not be used — but dropping it, rather than

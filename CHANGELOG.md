@@ -14,6 +14,57 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **An unauthenticated client could exhaust the HTTP server's memory in
+  seconds, and MCP sessions are now bounded** (BU-32).
+
+  rmcp 1.4.0's `handle_post` calls `create_session()` — which inserts into the
+  session map and spawns a worker — **before** checking that the body is an
+  `initialize` request. The `422` that follows never calls `close_session`; the
+  task that owns cleanup is spawned after that early return. The abandoned
+  worker then parks on its pre-initialize `recv()`, which has neither the
+  keep-alive timer nor the cancellation arm that the post-initialize loop has,
+  so nothing ever reclaims it.
+
+  Measured against the release binary over **one** keep-alive connection: 2000
+  session-less, non-`initialize` POSTs raised private bytes from 157 MiB to
+  274 MiB — about **58 KB per rejected request, none of it returned** — in one
+  second, i.e. ~117 MiB/s. No session, no `initialize`, no credentials. On a
+  loopback bind that is any local process; with the `intranet-http` recipe it is
+  anything on the network.
+
+  Two changes, in this order, because the order is what makes them safe:
+
+  1. A request that would create a session is now checked **before** it reaches
+     rmcp: a POST with no `Mcp-Session-Id` whose body is not a single
+     `initialize` request is answered with the same `422` and the same wording
+     rmcp uses, and never creates a session. The same probe now moves memory by
+     0.1 MiB.
+  2. Live sessions are capped, `[transport.http].max_sessions`, default **256**
+     (~25 MB; a live session measured at ~100 KB). While the cap is full, a
+     request that would open a *new* session gets `429` with `Retry-After`;
+     **established sessions are untouched**. `0` disables the limit.
+
+  A cap alone would have made things worse rather than better: leaked entries
+  never expire, so an attacker could fill it and leave the server permanently
+  unable to accept a legitimate client. Fixing the leak first is what turns the
+  cap into a bound instead of a lock-out.
+
+  Only the `initialize` predicate is replicated — that is the MCP specification,
+  not an rmcp implementation detail. `Host`, `Accept`, and `Content-Type`
+  validation stay delegated to rmcp (the same call made for `Host` in v0.7.6): a
+  request rmcp would reject for one of those reasons never reaches
+  `create_session` either. A body that is not JSON is likewise passed through,
+  since rmcp rejects it before the session branch.
+
+  From an untrusted config `max_sessions` is dropped like `allowed_hosts` and
+  `healthz_public`, which for a *limit* means falling back to the built-in
+  default: honouring it would let a planted `max_sessions = 1` leave the server
+  unable to accept a second client.
+
+  The refusal is logged at most once a minute, with a count of what it stands
+  for. Logging every refusal produced 1744 lines from that one-second probe, and
+  the daemon sends stderr to a file.
+
 - **A `kb-mcp.toml` that kb-mcp found by itself is no longer trusted in full**
   (BU-07). Discovery honours `./kb-mcp.toml` and a `kb-mcp.toml` at the `.git`
   root, walking up to 20 directories — files the user never named. Whoever
