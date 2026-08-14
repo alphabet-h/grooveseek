@@ -12,6 +12,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-15
+
 ### Security
 
 - **The link check and the bytes now come from the same open handle** (BU-20
@@ -3054,7 +3056,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.16.0...v0.17.0
