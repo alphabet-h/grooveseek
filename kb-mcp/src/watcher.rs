@@ -516,6 +516,11 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             eprintln!("watcher: reindexed {rel} ({chunks} chunks)");
         }
         Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
+        // (BU-20) The reason is already on stderr from the read; this says what
+        // happened to the document, which the reason does not.
+        Ok(indexer::SingleResult::Refused) => {
+            eprintln!("watcher: {rel} refused, index left as it was");
+        }
         Ok(indexer::SingleResult::Skipped { reason }) => {
             eprintln!("watcher: skipped {rel} ({reason})");
         }
