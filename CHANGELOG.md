@@ -56,7 +56,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `rename_single_file` gained a `RenamedButRefused` outcome, following the
   `RenamedSizeCapped` precedent: `rename_document` has already committed by the
   time the new path is read, so a refusal there is neither a failure nor a
-  successful reindex and must not be logged as either.
+  successful reindex and must not be logged as either. `SingleResult` gained a
+  `Refused` variant to carry it — the rename path reads the file twice (once to
+  hash, once to index), and the premise of this whole guard is that a path can
+  change between two reads, so a refusal on the second one has to survive rather
+  than fall into a catch-all that reports a successful rename.
 
 ### Fixed
 

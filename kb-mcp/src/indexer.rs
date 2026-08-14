@@ -391,6 +391,16 @@ pub enum SingleResult {
     Updated { chunks: u32 },
     /// 処理対象外 (空本文など)。reason は human-readable。
     Skipped { reason: &'static str },
+    /// (BU-20) 開いた handle が「集めた時のファイルではない」と答えた
+    /// (hardlink / symlink / 非通常ファイル / handle 側 size 超過)。
+    ///
+    /// **`Skipped` と別 variant にする理由** (codex P2 round 1 on PR #157):
+    /// `rename_single_file` は hash 用に 1 回読んだ後 `index_single_disk_entry`
+    /// が**もう一度**読む。2 回目で refusal が起きた時に `Skipped` を返すと、
+    /// 呼び出し側の catch-all が `RenameOutcome::Renamed` に潰し、**DB には旧
+    /// content が新 path のまま残るのに watcher は「rename 成功」と報告する**。
+    /// 型で分けておけば、その分岐を書き忘れることができない。
+    Refused,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +545,9 @@ pub fn rebuild_index(
                 updated += 1;
                 progress.report_indexed(&entry.rel, chunks);
             }
-            SingleResult::Skipped { .. } => {
+            // A refusal counts as a skip here for the same reason a size cap
+            // does: the file is not indexed and the reason is already on stderr.
+            SingleResult::Skipped { .. } | SingleResult::Refused => {
                 skipped_count += 1;
                 progress.report_unchanged(&entry.rel);
             }
@@ -641,9 +653,7 @@ fn index_single_disk_entry(
     let bytes = match read_for_index(&entry.full, &entry.rel, cap) {
         Ok(Some(b)) => b,
         Ok(None) => {
-            return Ok(SingleResult::Skipped {
-                reason: "refused: not the plain, single-named file that was collected",
-            });
+            return Ok(SingleResult::Refused);
         }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
@@ -856,9 +866,7 @@ pub fn reindex_single_file(
     let Some(bytes) = read_for_index(&full, rel, cap)
         .with_context(|| format!("failed to read {}", full.display()))?
     else {
-        return Ok(SingleResult::Skipped {
-            reason: "refused: not the plain, single-named file the watcher saw",
-        });
+        return Ok(SingleResult::Refused);
     };
     let hash = sha256_hex_bytes(&bytes);
     let entry = DiskEntry {
@@ -1019,7 +1027,15 @@ pub fn rename_single_file(
         context_mode,
     )? {
         SingleResult::Updated { chunks } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
-        _ => Ok(RenameOutcome::Renamed),
+        // (codex P2 round 1 on PR #157) `index_single_disk_entry` reads the file
+        // a **second** time, and the whole premise of this guard is that a path
+        // can change between two reads. Letting that refusal fall into the
+        // catch-all below would report a successful rename while the database
+        // kept the old content under the new path.
+        SingleResult::Refused => Ok(RenameOutcome::RenamedButRefused),
+        // Spelled out rather than `_`: a catch-all is what swallowed the
+        // refusal in the first place, and it would swallow the next variant too.
+        SingleResult::Unchanged | SingleResult::Skipped { .. } => Ok(RenameOutcome::Renamed),
     }
 }
 
