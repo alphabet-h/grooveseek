@@ -12,6 +12,54 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **MCP prompts** (B-3). Four of them, surfaced by clients as commands the user
+  picks — Claude Code renders them as `/mcp__kb-mcp__<name>`:
+
+  | Prompt | Arguments |
+  |---|---|
+  | `summarize_topic` | `topic` (required) |
+  | `deep_dive` | `question` (required) |
+  | `whats_new` | `since` (optional ISO date) |
+  | `find_gaps` | `topic` (optional) |
+
+  Each exists because the tools alone do not say how to combine them: `search`
+  never tells a caller to expand its best hits with `get_connection_graph`, or
+  that a `low_confidence` flag means the answer should say so. All four are
+  plain text and share one set of citation rules — cite the `path` of every
+  document used, surface `low_confidence` rather than answering through it, and
+  say when the knowledge base is silent instead of filling the gap.
+
+  `whats_new` states its own limitation rather than implying otherwise:
+  `date_from` filters the frontmatter `date`, which is what an author typed, not
+  when a file was modified or indexed. kb-mcp has no query for "recently
+  changed", so the prompt describes itself as an approximation.
+
+  Fixed at compile time rather than configurable. Prompt text reaches the model
+  and `kb-mcp.toml` is *discovered* — from the working directory or a `.git`
+  ancestor — so a `[prompts]` section would sit in the same privileged category
+  as `kb_path` under `restrict_untrusted`. The specification offers no cover
+  here: unlike tool annotations, it gives clients no guidance to distrust prompt
+  content.
+
+- **The server now identifies itself.** `initialize` answered
+  `serverInfo {"name":"rmcp","version":"3.1.2"}` — the SDK's build environment,
+  because the whole `ServerHandler` impl was macro-generated and nothing
+  supplied a `get_info`. Clients display that name. It is now `kb-mcp` and this
+  crate's version. Splitting the generated impl was also the prerequisite for
+  declaring any new capability, since a generated impl cannot be extended;
+  measured before and after, `tools/list` is byte-identical.
+
+- **The first protocol-level assertions in the repo**
+  (`tests/mcp_protocol_surface.rs`): the advertised capability set, the tool and
+  prompt lists as they appear on the wire, the server's own name, and the
+  caching hints the specification requires on a complete result. They read
+  **both** discovery surfaces — `initialize` and `server/discover` — because a
+  test that reads only the former is checking the dialect 2026-07-28 moved on
+  from. Nothing asserted any of this before, which is how the wrong server name
+  survived fifteen releases.
+
 ## [0.21.0] - 2026-08-15
 
 ### Added
