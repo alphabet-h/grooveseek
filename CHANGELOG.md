@@ -310,6 +310,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **A single panic no longer disables search for the life of the process**
+  (BU-18). Every mutex in the server was taken with `.lock().unwrap()`. A
+  `std::sync::Mutex` is *poisoned* when a thread panics while holding it, and
+  every later `lock()` returns `Err` — so one panic under any of them turned
+  every subsequent `search`, `list_topics`, `rebuild_index` and
+  `get_connection_graph` into a panic of its own. The daemon stays up and
+  answers "internal error" indefinitely, with the panic that caused it long
+  gone from the log.
+
+  Locks now recover the state the panic left behind, and what that means
+  depends on the payload:
+
+  - **Plain data** (the indexing state) is taken as is. The guard used to
+    *skip* its decrement on a poisoned lock, which pins `/api/admin/status` at
+    `indexing.active=true` for good.
+  - **The database** is checked first. Unwinding past an open transaction
+    normally runs the `Drop` that rolls it back; what is left is the case where
+    that rollback *failed*, which rusqlite swallows. Then the transaction is
+    still open, every later write joins it silently, and nobody commits it. The
+    recovery asks the connection and rolls back explicitly, saying so in the
+    log.
+  - **The embedder and reranker** are recovered as a stated bet: neither
+    fastembed nor ONNX Runtime offers a way to ask a session whether it is
+    still consistent, so "it is fine" cannot be proven from here. Inference
+    does not mutate the session, and the alternative — dropping it and
+    reloading 130 MB–2.3 GB of model — is a large cost on a path that has never
+    fired. The reasoning is written down at the recovery, not implied by it.
+
+  The watcher took the same locks and *skipped* the reindex on poison; it now
+  follows the same rule. `kb_info`'s `try_lock` no longer reads a poisoned lock
+  as contention, which had admin status reporting `documents: null` forever and
+  looking like a busy rebuild.
+
+  The first recovery in a process logs a warning naming the mutex; later ones
+  are debug. Poisoning is sticky, so a warning per recovery would repeat on
+  every request for the rest of the process's life.
+
+  Reachability is low today — the code under those locks propagates with `?`
+  and has no `unwrap` — which is the point. This is about the panic someone
+  adds later.
+
 - `kb-mcp graph --seed-strategy`'s help text advertised `all_chunks`, but clap
   derives kebab-case values, so only `all-chunks` was accepted and copying the
   help text produced `error: invalid value`. The help now matches what the flag

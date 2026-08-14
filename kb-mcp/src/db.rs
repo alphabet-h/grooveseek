@@ -522,6 +522,29 @@ impl Database {
         Ok(self.conn.unchecked_transaction()?)
     }
 
+    /// 開いたまま残った transaction を巻き戻す (BU-18)。
+    ///
+    /// 通常、unwind は `Transaction` の Drop を走らせるので ROLLBACK は自動で
+    /// 発行される。**残るのはそれが失敗した時**で、rusqlite は Drop 中の
+    /// エラーを握り潰すため、呼び出し側からは成功と区別がつかない
+    /// (`mem::forget` 等でハンドルごと落とした場合も同じ状態になる)。
+    ///
+    /// mutex 越しに共有された `Database` はスレッドが panic しても drop され
+    /// ないので、開きっぱなしの transaction はプロセスが終わるまで残る。
+    /// `&self` API は autocommit-aware で「開いていれば参加する」設計なので、
+    /// 以後の書き込みは全部そこに吸い込まれ、誰も commit しないまま消える。
+    ///
+    /// `true` = 実際に巻き戻した。**poison から復帰した直後にだけ呼ぶ**想定
+    /// (`crate::poison::recover_db`)。呼び出し側が保持中の transaction を
+    /// 誤って潰さないよう、通常経路からは呼ばないこと。
+    pub fn rollback_if_transaction_open(&self) -> Result<bool> {
+        if self.conn.is_autocommit() {
+            return Ok(false);
+        }
+        self.conn.execute_batch("ROLLBACK")?;
+        Ok(true)
+    }
+
     /// IMMEDIATE (RESERVED lock) トランザクションを開始する (feature-46)。
     /// FTS 3 列 migration の double-checked locking (§4.4) で書き手を単一化する
     /// ために使う (`ensure_fts_context_column` が消費)。`&self` で呼べるよう
@@ -4932,6 +4955,66 @@ mod tests {
     /// alongside. SQLite has no true nested transaction, so a `corpus_snapshot`
     /// that always opened one would either error or silently end the caller's,
     /// releasing the very snapshot being held.
+    /// (BU-18) The repair itself. `mem::forget` reproduces the state a failed
+    /// `Drop`-time `ROLLBACK` leaves: the handle is gone, the transaction is
+    /// not. Every `&self` write from here on would join it, and nobody would
+    /// ever commit it.
+    #[test]
+    fn a_transaction_left_open_is_rolled_back_and_the_check_is_idempotent() {
+        let db = db_with_384();
+        assert!(
+            !db.rollback_if_transaction_open().unwrap(),
+            "a healthy connection has nothing to roll back"
+        );
+
+        std::mem::forget(db.begin_transaction().unwrap());
+        assert!(
+            !db.conn.is_autocommit(),
+            "precondition: the transaction outlived its handle"
+        );
+
+        assert!(
+            db.rollback_if_transaction_open().unwrap(),
+            "the open transaction must be reported as rolled back"
+        );
+        assert!(
+            db.conn.is_autocommit(),
+            "the connection must be usable again"
+        );
+        assert!(
+            !db.rollback_if_transaction_open().unwrap(),
+            "calling it twice must not report a second rollback"
+        );
+    }
+
+    /// (BU-18) The repair through the path production takes: a thread panics
+    /// while holding the lock, and the next lock acquisition has to give back a
+    /// connection that is not stuck inside someone else's transaction.
+    #[test]
+    fn recovering_a_poisoned_db_lock_also_closes_the_transaction() {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(db_with_384()));
+
+        let handle = {
+            let shared = std::sync::Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let db = shared.lock().unwrap();
+                // The transaction survives the unwind here for the same reason
+                // a failed Drop-time ROLLBACK would leave it open.
+                std::mem::forget(db.begin_transaction().unwrap());
+                panic!("panicking with a transaction open");
+            })
+        };
+        assert!(handle.join().is_err(), "the thread was supposed to panic");
+        assert!(shared.is_poisoned());
+
+        let db = crate::poison::recover_db(shared.lock());
+        assert!(
+            db.conn.is_autocommit(),
+            "recovering the lock must not hand back a connection whose next \
+             write disappears into an abandoned transaction"
+        );
+    }
+
     #[test]
     fn test_corpus_snapshot_joins_a_caller_held_transaction() {
         let db = db_with_384();
