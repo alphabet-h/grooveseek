@@ -299,14 +299,29 @@ fn ranking_report(run: &serde_json::Value) -> String {
             continue;
         }
         let id = q["id"].as_str().unwrap_or("<no id>");
-        let expected = q["expected"][0]["path"].as_str().unwrap_or("<none>");
+        // Every expected path, not just the first: `reciprocal_rank` is the
+        // rank of the *earliest* expected hit, so naming one of several would
+        // leave the reader guessing which one the rank refers to.
+        let expected: Vec<&str> = q["expected"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["path"].as_str())
+            .collect();
+        let expected = if expected.is_empty() {
+            "<none>".to_string()
+        } else {
+            expected.join(", ")
+        };
         let top1 = q["top_k"][0]["path"]
             .as_str()
             .unwrap_or("<nothing returned>");
         let position = if rr > 0.0 {
+            // `reciprocal_rank` is 1/rank of the first expected hit inside the
+            // retrieved window; 0.0 means no expected hit was retrieved at all.
             format!("rank {}", (1.0 / rr).round() as i64)
         } else {
-            "outside the top 10".to_string()
+            "outside the retrieved window".to_string()
         };
         report.push_str(&format!(
             "  {id}: expected {expected} at {position}; top-1 was {top1}\n"
