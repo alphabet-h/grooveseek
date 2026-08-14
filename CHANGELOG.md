@@ -54,8 +54,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   errored out *and* left launchd holding the old `ProgramArguments`. The macOS
   backend now boots the job out first (best-effort, as `uninstall` already did),
   and the Linux backend uses `systemctl restart` where `start` was a no-op over a
-  running unit. Windows still leaves the running daemon alone; sign out and back
-  in, or stop it first.
+  running unit — plus `try-restart` for a `--no-auto-start` unit, which restarts
+  it only if it is actually running, since `--no-auto-start` must not start
+  anything that was not already up. Two cases still need a manual restart:
+  Windows, where the task is re-registered but the detached daemon is not
+  stopped, and an already-loaded `--no-auto-start` LaunchAgent, which the
+  installer deliberately does not touch.
 
   Along the way, `systemd_exec_word` now escapes `$` as `$$` — systemd expands
   `${FOO}` in a command line **including inside quotes**, and a config home such

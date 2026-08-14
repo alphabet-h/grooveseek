@@ -237,8 +237,11 @@ bind = "127.0.0.1:3100"
 対象になっている人に当てはまる注意点。
 
 Linux / macOS では再インストール時にサービスを再起動するので、新しい launch line は
-即座に効く。Windows は scheduled task を再登録するだけで起動中の daemon は止めない —
-サインアウト / サインインするか、先に停止すること。
+即座に効く。Linux は `--no-auto-start` で入れたサービスを手動起動している場合も対象
+(起動中の時だけ再起動する)。手動での再起動が要るのは 2 ケース —
+**Windows** (scheduled task は再登録するが detach 済みの daemon は止めない) と、
+**macOS で `--no-auto-start` かつ既に load 済みの LaunchAgent** (installer が
+意図的に触らない)。サインアウト / サインインするか、自分で停止・起動すること。
 
 **カバーしない範囲**: リポジトリが `.mcp.json` ごと同梱している場合、相手は
 config ファイルではなくコマンドライン全体を握っている。kb-mcp 側の規則では

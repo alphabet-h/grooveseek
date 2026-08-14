@@ -245,8 +245,12 @@ environment it is run in, so without the variable the re-install writes a
 real settings unused. This applies to precisely the people the fix is for.
 
 On Linux and macOS the re-install restarts the service, so the new launch line
-takes effect immediately. On Windows the scheduled task is re-registered but the
-running daemon is not stopped — sign out and back in, or stop it first.
+takes effect immediately — on Linux that holds for a `--no-auto-start` service
+someone started by hand too, which is restarted only if it is actually running.
+Two cases still need a manual restart: **Windows**, where the scheduled task is
+re-registered but the detached daemon is not stopped, and **a `--no-auto-start`
+LaunchAgent that is already loaded on macOS**, which the installer deliberately
+does not touch. Sign out and back in, or stop and start the service yourself.
 
 **What this does not cover**: if a repository ships its own `.mcp.json`, it
 controls the whole command line, not just the config file. No rule inside

@@ -50,8 +50,8 @@ impl ServiceBackend for SystemdUser {
         }
         std::fs::write(&path, render_unit(ctx)?)?;
         run_systemctl(&["daemon-reload"])?;
+        let name = format!("kb-mcp-{}.service", ctx.service_name);
         if ctx.auto_start {
-            let name = format!("kb-mcp-{}.service", ctx.service_name);
             run_systemctl(&["enable", &name])?;
             // `restart`, not `start`: on a fresh install the two are the same,
             // but over an already-running unit `start` is a no-op and the daemon
@@ -60,6 +60,15 @@ impl ServiceBackend for SystemdUser {
             // the way an existing service picks it up (same reason as the
             // `bootout` in the macOS backend, codex P2 round 2 on PR #156).
             run_systemctl(&["restart", &name])?;
+        } else {
+            // (codex P2 round 3 on PR #156) `--no-auto-start` must not start
+            // anything — but a unit someone started by hand is still holding the
+            // previous `ExecStart`, and `restart` here would *start* a service
+            // the user asked not to run. `try-restart` is exactly the missing
+            // verb: restart if and only if it is currently running. Best-effort,
+            // because a unit that is not running makes this a no-op and that is
+            // the expected case.
+            let _ = run_systemctl(&["try-restart", &name]);
         }
         eprintln!(
             "Note: run 'sudo loginctl enable-linger $USER' to keep the service running after logout."
