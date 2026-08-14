@@ -265,9 +265,13 @@ fn find_gaps_body(args: FindGapsArgs) -> Vec<PromptMessage> {
              or two documents is a candidate, but a small topic is not \
              automatically a gap — some subjects need one page.\n\
              2. Ask questions a reader of {scope} would expect answered, one \
-             `search` each. A question that comes back with `low_confidence` \
-             set, or whose best hits are only loosely related, is the signal \
-             worth reporting.\n\
+             `search` each. Three things count as a signal, in this order:\n\
+             - **An empty `results` array.** This is the clearest absence there \
+             is, and it is the one case the flags will not tell you about: \
+             `low_confidence` needs at least two scores to compare, so with no \
+             hits at all it stays `false`. Do not read that as coverage.\n\
+             - `low_confidence` set on a response that did return hits.\n\
+             - Hits that came back but are only loosely related.\n\
              3. Pass `include_low_quality: true` on a few of those searches. \
              Chunks below the quality threshold are hidden by default, and a \
              stub or a TODO that exists is a different finding from nothing at \
@@ -526,6 +530,24 @@ mod tests {
         assert!(
             !unscoped.contains("Pass `topic:"),
             "with no topic there is nothing to filter by: {unscoped}"
+        );
+    }
+
+    /// (codex P2, round 5 on PR #161) An empty result set is the clearest gap
+    /// there is, and it is the one the flags stay silent about:
+    /// `compute_low_confidence` (`server.rs:1303`) returns `false` when there
+    /// are fewer than two scores to compare, so no hits at all reads as
+    /// confident coverage.
+    #[test]
+    fn find_gaps_treats_an_empty_result_set_as_the_strongest_signal() {
+        let text = text_of(&find_gaps_body(FindGapsArgs { topic: None }));
+        assert!(
+            text.contains("empty `results` array"),
+            "the emptiest case must be named explicitly: {text}"
+        );
+        assert!(
+            text.contains("at least two scores"),
+            "the prompt must say why the flag does not fire there: {text}"
         );
     }
 
