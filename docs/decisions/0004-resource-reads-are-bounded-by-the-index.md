@@ -68,10 +68,15 @@ there is "anything under `kb_path` is readable, so keep secrets outside it".
 Serving a URI that was never on offer is not the same operation, and bounding it
 by the offer is the natural contract rather than a restriction bolted on.
 
-It also makes `resources/list` honest. The listing is built from
-`all_document_paths()` and a read is checked against the same query, so a URI
-the client was given cannot fail membership when it reads it back — the property
-a listing has to have to be a promise.
+It also makes `resources/list` honest — but only if the listing is built from
+what a read will actually accept, which is not the raw index. Narrowing
+`[parsers].enabled` without reindexing deliberately *keeps* the rows for the
+dropped extensions, and the extension check inside the shared guard then refuses
+them. A listing built on index membership alone would therefore hand out
+`kb://doc/…` links that the very next call rejects. So both the listing and the
+read go through one query, `servable_document_paths()` — the indexed paths minus
+those the active registry cannot open. "The listing offers what a read accepts"
+is a property of a single list or of neither.
 
 ### Consequences
 
@@ -92,5 +97,10 @@ a listing has to have to be a promise.
   for Markdown, `text/plain` for anything delivered as extracted text. A PDF
   comes back as the text kb-mcp extracted from it, so calling it
   `application/pdf` would misdescribe the bytes the client is holding.
+- A row whose extension the parser registry no longer covers stays indexed —
+  narrowing `[parsers].enabled` does not delete it — but is **not offered**: it
+  is absent from `resources/list`, unreadable through `resources/read`, and its
+  `search` hit carries no `uri` key. The hit itself stays, so the document
+  remains findable; it simply carries no link to a read that would refuse it.
 - Topic-group resources (`kb://topic/<prefix>`) list documents rather than
   serving them, so they expose nothing a `resources/list` did not already.

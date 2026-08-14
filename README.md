@@ -910,7 +910,7 @@ They are fixed at compile time rather than configurable. Prompt text goes to the
 | `kb://topic/<prefix>` | A **topic group** — the first one or two path segments, the same derivation the indexer uses for `category` and `topic`. Reading one returns a Markdown list of the documents under it, with their URIs. `kb://topic/` is the root group. |
 | `kb://doc/<path>` | One indexed document, by its knowledge-base-relative path. Advertised as a template rather than enumerated. |
 
-`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on every `search` hit — the specification permits handing back links to documents a listing never enumerated.
+`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on `search` hits — the specification permits handing back links to documents a listing never enumerated. Both the listing and that field are filtered by the active parser registry: if you narrow `[parsers].enabled` without reindexing, the rows for the dropped extensions stay in the index and stay in search results, but they are no longer offered as resources, because a read would refuse them.
 
 Separators stay as forward slashes; everything else is percent-encoded, so a path with spaces or non-ASCII characters produces a valid ASCII URI.
 

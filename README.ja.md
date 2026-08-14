@@ -900,7 +900,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `kb://topic/<prefix>` | **topic group** = パスの先頭 1〜2 セグメント。indexer が `category` / `topic` を導出するのと同じ規則。read するとその配下の文書一覧 (URI 付き) が Markdown で返る。`kb://topic/` は root group |
 | `kb://doc/<path>` | 索引済みの文書 1 件。列挙はせず**テンプレートとして公開**する |
 
-`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` の各 hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。
+`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。listing もこの `uri` も**現在の parser registry で絞る**: `[parsers].enabled` を狭めて再 index しないと、外した拡張子の行は索引にも検索結果にも残るが、read が拒否する以上 resource としては提示しない。
 
 区切りは forward slash のまま、それ以外は percent-encode するので、空白や非 ASCII を含むパスでも正しい ASCII URI になる。
 

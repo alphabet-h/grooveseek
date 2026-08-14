@@ -61,9 +61,14 @@ v0.22.0 で kb-mcp に MCP の `resources` capability が入った。クライ�
 **このサーバが渡した URI** を持っている呼び出し元である。提示していない URI を
 提供するのは別の操作であり、**提示物で縛るのは後付けの制限ではなく自然な契約**。
 
-これは `resources/list` を正直にもする。listing は `all_document_paths()` から作り、
-read も同じクエリに対して照合するので、**渡した URI が読み返しで membership に
-落ちることがない** — listing が約束であるために必要な性質。
+これは `resources/list` を正直にもする — ただし listing を**読みが実際に受け付ける
+集合**から作った場合に限る。生の索引ではそうならない: `[parsers].enabled` を狭めて
+再 index しないと、外した拡張子の行は**意図的に残り**、共有 guard の拡張子検査が
+それを拒否する。索引 membership だけで listing を作ると、**次の呼び出しが拒否する
+`kb://doc/…` を渡してしまう**。そこで listing も read も
+`servable_document_paths()` という 1 つのクエリ (= 索引のパスから、現在の registry
+で開けないものを除いたもの) を通す。「listing が出すものは read が受け付ける」は
+**1 つのリストの性質か、どちらのものでもないか**のどちらかしかない。
 
 ### 帰結
 
@@ -82,5 +87,10 @@ read も同じクエリに対して照合するので、**渡した URI が読�
   `text/markdown`、抽出テキストとして出すものは `text/plain`。PDF は
   kb-mcp が抽出したテキストとして返るので、`application/pdf` と名乗るのは
   クライアントが手にしているバイト列について嘘をつくことになる
+- 現在の parser registry が扱わない拡張子の行は、索引には残る (`[parsers].enabled`
+  を狭めても削除しない) が**提示はしない**: `resources/list` に出ず、
+  `resources/read` でも読めず、`search` hit にも `uri` キーが付かない。
+  **hit 自体は残る**ので文書は見つかり続ける — 拒否される read への link を
+  持たないだけ
 - topic group の resource (`kb://topic/<prefix>`) は文書を列挙するだけで提供はしないので、
   `resources/list` が既に出している以上のものは露出しない

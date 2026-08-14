@@ -43,7 +43,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
   `search`'s result gains one field and changes shape in no other way: the MCP
   result is still a single text content block carrying the same JSON, so
-  existing clients are unaffected.
+  existing clients are unaffected. The field is omitted for a hit whose
+  extension the active parser registry no longer covers — such a row stays
+  indexed and stays in the results, but no read would open it, so the honest
+  answer is no link rather than a broken one. The same filter decides what
+  `resources/list` offers.
 
   Not implemented: `resources/subscribe` and
   `notifications/resources/list_changed`.

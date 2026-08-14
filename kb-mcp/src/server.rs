@@ -323,16 +323,23 @@ struct SearchResponse {
 /// The specification permits handing back links to documents that
 /// `resources/list` never enumerated, which is what makes the topic-group
 /// listing and per-document addressing coexist.
+///
+/// The key is **omitted** for a hit whose extension the active parser registry
+/// no longer covers. Such a row stays in the index on purpose (AU-06) and stays
+/// in the search results, but neither `get_document` nor `resources/read` will
+/// open it — so the honest answer is no link, not a broken one.
 #[derive(Serialize)]
 struct HitWithUri {
     #[serde(flatten)]
     hit: crate::db::SearchHit,
-    uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
 }
 
-impl From<crate::db::SearchHit> for HitWithUri {
-    fn from(hit: crate::db::SearchHit) -> Self {
-        let uri = crate::resources::doc_uri(&hit.path);
+impl HitWithUri {
+    fn new(hit: crate::db::SearchHit, registry: &Registry) -> Self {
+        let uri = crate::indexer::extension_is_registered(&hit.path, registry)
+            .then(|| crate::resources::doc_uri(&hit.path));
         Self { hit, uri }
     }
 }
@@ -569,7 +576,10 @@ impl KbCore {
         };
 
         let resp = SearchResponse {
-            results: hits.into_iter().map(HitWithUri::from).collect(),
+            results: hits
+                .into_iter()
+                .map(|h| HitWithUri::new(h, &self.parser_registry))
+                .collect(),
             low_confidence,
             filter_applied: echo,
         };
@@ -599,16 +609,37 @@ impl KbCore {
         }
     }
 
+    /// The indexed documents this server can actually hand over.
+    ///
+    /// Not the same set as `all_document_paths`. Narrowing `[parsers].enabled`
+    /// without reindexing deliberately **keeps** those rows — `run_server` warns
+    /// about them instead of deleting them, because a narrowed setting is often
+    /// temporary — and `load_document_blocking` then refuses their extension.
+    /// Advertising them would be offering a link the very next call rejects.
+    ///
+    /// So the filter lives on the one query the whole resource surface asks,
+    /// rather than at each of the three places that emit a URI. That is the
+    /// same reason `load_document_blocking` exists at all.
+    fn servable_document_paths(&self) -> Result<Vec<String>, String> {
+        let paths = {
+            let db = recover_db(self.db.lock());
+            db.all_document_paths()
+                .map_err(|e| format!("failed to list indexed documents: {e}"))?
+        };
+        Ok(paths
+            .into_iter()
+            .filter(|p| crate::indexer::extension_is_registered(p, &self.parser_registry))
+            .collect())
+    }
+
     /// The topic groups `resources/list` answers from.
     ///
-    /// Built from the indexed paths, which is the same list a read is checked
+    /// Built from the servable paths, which is the same list a read is checked
     /// against — so a URI this listing offers cannot fail membership when the
     /// client reads it back.
     fn topic_groups_blocking(&self) -> Result<Vec<crate::resources::TopicGroup>, String> {
-        let db = recover_db(self.db.lock());
-        db.all_document_paths()
+        self.servable_document_paths()
             .map(|paths| crate::resources::topic_groups(&paths))
-            .map_err(|e| format!("failed to list indexed documents: {e}"))
     }
 
     /// What a `resources/read` of a document produces: its text, and the media
@@ -632,11 +663,7 @@ impl KbCore {
         parsed: &crate::resources::ResourceUri,
         uri: &str,
     ) -> Result<(String, &'static str), String> {
-        let paths = {
-            let db = recover_db(self.db.lock());
-            db.all_document_paths()
-                .map_err(|e| format!("failed to list indexed documents: {e}"))?
-        };
+        let paths = self.servable_document_paths()?;
 
         match parsed {
             crate::resources::ResourceUri::Topic(prefix) => {
@@ -4328,6 +4355,49 @@ mod tests {
             core_block[..core_end].matches(".lock()").count() >= 4,
             "the blocking bodies no longer take any locks — either they moved \
              somewhere this test cannot see, or the extraction is broken."
+        );
+    }
+
+    /// `all_document_paths` is the raw index, and the raw index is not what this
+    /// server can serve: narrowing `[parsers].enabled` without reindexing keeps
+    /// those rows on purpose (AU-06) while `load_document_blocking` refuses
+    /// their extension. Everything the resource surface advertises therefore has
+    /// to come through `servable_document_paths`. A second, direct call is
+    /// exactly how `resources/list` came to offer a `kb://doc/...` that
+    /// `resources/read` then rejected.
+    #[test]
+    fn the_resource_surface_reads_the_index_through_the_registry_filter() {
+        let src = include_str!("server.rs").replace("\r\n", "\n");
+
+        let core_start = src
+            .find("\nimpl KbCore {")
+            .expect("the `impl KbCore` block moved or was renamed");
+        let core_block = &src[core_start..];
+        let core_end = core_block[1..]
+            .find("\n}\n")
+            .expect("could not find the end of the KbCore impl block");
+        let core = &core_block[..core_end];
+
+        // Anti-vacuity: this really is the block that holds both the filter and
+        // the bodies that must not go around it.
+        for needed in [
+            "fn servable_document_paths",
+            "fn topic_groups_blocking",
+            "fn read_resource_blocking",
+        ] {
+            assert!(
+                core.contains(needed),
+                "`{needed}` is not in the block this test scanned — the \
+                 extraction broke and the assertion below is vacuous."
+            );
+        }
+
+        assert_eq!(
+            core.matches("all_document_paths()").count(),
+            1,
+            "the raw index query must appear exactly once inside `impl KbCore`, \
+             in `servable_document_paths`. Any other call site skips the parser \
+             registry filter and advertises a URI a read will refuse."
         );
     }
 }
