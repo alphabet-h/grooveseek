@@ -214,7 +214,13 @@ fn whats_new_body(args: WhatsNewArgs) -> Vec<PromptMessage> {
              the survey silently omits them and can come back empty while \
              matching documents exist.\n\
              3. Group what you find by `topic` and `category`.\n\
-             4. Read the ones that look substantial with `get_document`.\n\
+             4. Call `get_document` on **every** document that will appear in \
+             the survey, stubs and one-line notes included — not only the ones \
+             that look substantial. The citation rules below forbid citing a \
+             document you did not open, so anything left unopened has to be \
+             dropped from the answer, which would put back exactly the omission \
+             step 2 exists to prevent. A stub is a legitimate finding; report it \
+             as a stub.\n\
              \n\
              **State this limitation in your answer rather than hiding it.** \
              The date being filtered on is the `date` field in each document's \
@@ -455,6 +461,15 @@ mod tests {
             text.contains("include_low_quality"),
             "the survey must include one low-quality pass or it silently omits \
              short new notes: {text}"
+        );
+        // (codex P2, round 3 on PR #161) Recovering the stubs is undone if the
+        // model is then told to open only what looks substantial: the citation
+        // rules forbid citing an unopened document, so an unopened stub has to
+        // be dropped from the answer.
+        assert!(
+            text.contains("every"),
+            "the survey must open everything it reports, or the low-quality pass \
+             recovers documents the citation rules then force it to omit: {text}"
         );
     }
 
