@@ -56,7 +56,18 @@ static POISON_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Returns whether this was the first report in the process (= the loud one).
 fn report(label: &str) -> bool {
-    if POISON_REPORTED.swap(true, Ordering::Relaxed) {
+    report_into(&POISON_REPORTED, label)
+}
+
+/// [`report`] against an explicit flag.
+///
+/// Split out so its test can pass a local `AtomicBool` instead of resetting the
+/// process-global one: `cargo test` runs this module's tests on parallel
+/// threads, and the other tests here call `recover`, so a test that reset the
+/// static could have its own first report stolen between the reset and the
+/// assertion (codex P2 round 1 on PR #154).
+fn report_into(reported: &AtomicBool, label: &str) -> bool {
+    if reported.swap(true, Ordering::Relaxed) {
         tracing::debug!(mutex = label, "recovered from a poisoned mutex again");
         false
     } else {
@@ -216,14 +227,20 @@ mod tests {
 
     /// Loud once, quiet after. Poisoning is sticky, so a per-recovery `warn!`
     /// would print on every request for the rest of the process's life.
+    ///
+    /// Uses its own flag rather than resetting the process-global one, which
+    /// the other tests in this module race against through `recover`.
     #[test]
     fn only_the_first_report_is_the_loud_one() {
-        POISON_REPORTED.store(false, Ordering::Relaxed);
-        assert!(report("first"), "the first poisoned lock must be loud");
+        let reported = AtomicBool::new(false);
         assert!(
-            !report("second"),
+            report_into(&reported, "first"),
+            "the first poisoned lock must be loud"
+        );
+        assert!(
+            !report_into(&reported, "second"),
             "a sticky condition must not keep writing warn lines"
         );
-        assert!(!report("third"));
+        assert!(!report_into(&reported, "third"));
     }
 }
