@@ -607,20 +607,42 @@ impl RefusalLog {
     }
 }
 
-/// 上限内に席を 1 つ予約する (BU-32、codex review round 1 の P1)。
+/// 上限内に席を 1 つ予約する (BU-32、codex review round 1-2 の P1)。
 ///
-/// 「生きている数を読む → 上限未満なら通す」を 2 段でやると **TOCTOU** になる。
-/// 同時に来た initialize 要求はどれも rmcp が map に入れる**前**に数を読むので、
-/// 全部が同じ「まだ空いている」を見て通ってしまい、上限を burst の幅だけ
-/// 超える (`max_sessions = 1` でも 1000 本同時なら 1000 session できる)。
+/// # 数える対象が 2 つに割れている
 ///
-/// そこで「まだ map に反映されていないが通した数」= `in_flight` を持ち、
-/// **`live + in_flight` に対して CAS で 1 席を確保**する。席は
-/// [`AdmissionSeat`] が持ち、応答を返し終えた時点 (= rmcp が
-/// `initialize_session` まで済ませた後) に Drop で返る。rmcp が Host 検証等で
-/// 断って session ができなかった場合も同じ Drop で返るので、席は漏れない。
+/// 通した要求は、**rmcp が map に入れ終えるまで** `live` に現れない。だから
+/// 上限は「生きている数」だけでは測れず、「通したがまだ確定していない数」
+/// (= `in_flight`) を足す必要がある。`live` だけを読んで通していた初版は、
+/// 同時に来た要求が全部同じ「まだ空いている」を見て通ってしまい、
+/// **`max_sessions = 1` でも 16 本同時なら 16 本とも通った** (round 1 の P1)。
+///
+/// # 2 つの数を足すだけでも足りない
+///
+/// `live` と `in_flight` を別々に読むと、その 2 つの読みの**間**に
+/// 「A が insert して席を返す」引き渡しが挟まり得る。B は A を含まない `live`
+/// と、A が抜けた後の `in_flight` を見て、どちらにも A が数えられていない状態で
+/// 通ってしまう (round 2 の P1)。
+///
+/// そこで **予約と解放を同じ [`tokio::sync::Mutex`] で直列化**する。解放側も
+/// lock を取るので、B が 2 つの数を読んでいる最中に A が抜けることはない。
+/// A の insert は A の解放より**前**に起きる (rmcp は `initialize_session` まで
+/// 済ませてから応答を返し、席はその後で返る) ので、B が見るのは必ず
+/// 「`in_flight` に A がいる」か「`live` に A がいる」のどちらかになる。
+///
+/// # 打ち切られた要求
+///
+/// 応答を待たずに接続が切れた場合、明示的な解放には到達しない。その時は
+/// [`AdmissionSeat`] の `Drop` が lock 無しで席を返す。この経路だけは上の
+/// 直列化から外れるが、上限を超える方向には効かない — 打ち切られた要求は
+/// 「session を作れずに終わった」(`live` は増えない) か
+/// 「作った後に切れた」(`live` が数える) かのどちらかで、
+/// どちらも二重に数えないだけだから。
 #[derive(Default)]
 struct Admissions {
+    /// 臨界区間の token。中身は持たない (数は `in_flight` 側にある) —
+    /// `Drop` から lock 無しで減らせる必要があるため。
+    gate: tokio::sync::Mutex<()>,
     in_flight: std::sync::atomic::AtomicUsize,
 }
 
@@ -631,42 +653,47 @@ impl Admissions {
         max_sessions: u32,
     ) -> Option<AdmissionSeat> {
         use std::sync::atomic::Ordering;
-        loop {
-            // `live` は毎周読み直す。ループの外で 1 度だけ読むと、その間に
-            // 確定した session を数え落として上限を 1 席ぶん超える。
-            let now_live = live.get().await;
-            let in_flight = self.in_flight.load(Ordering::Acquire);
-            if now_live + in_flight >= max_sessions as usize {
-                return None;
-            }
-            if self
-                .in_flight
-                .compare_exchange_weak(
-                    in_flight,
-                    in_flight + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(AdmissionSeat {
-                    admissions: Arc::clone(self),
-                });
-            }
+        let _guard = self.gate.lock().await;
+        let now_live = live.get().await;
+        let in_flight = self.in_flight.load(Ordering::Acquire);
+        if now_live + in_flight >= max_sessions as usize {
+            return None;
         }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        Some(AdmissionSeat {
+            admissions: Arc::clone(self),
+            released: false,
+        })
     }
 }
 
-/// 予約した 1 席。Drop で返す。
+/// 予約した 1 席。通常は [`AdmissionSeat::release`] で返し、そこに到達
+/// できなかった場合 (= 要求が打ち切られた) だけ `Drop` が肩代わりする。
 struct AdmissionSeat {
     admissions: Arc<Admissions>,
+    released: bool,
+}
+
+impl AdmissionSeat {
+    /// 席を返す。**予約と同じ lock を取る**ことが要点で、これが無いと
+    /// 「A が抜ける」瞬間を B が 2 つの数の間で観測できてしまう。
+    async fn release(mut self) {
+        let _guard = self.admissions.gate.lock().await;
+        self.admissions
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.released = true;
+    }
 }
 
 impl Drop for AdmissionSeat {
     fn drop(&mut self) {
-        self.admissions
-            .in_flight
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if !self.released {
+            // 打ち切られた要求の後始末。await できないので lock は取らない。
+            self.admissions
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 }
 
@@ -759,9 +786,9 @@ async fn mcp_session_gate(
         }
     }
 
-    // 予約を取ってから通す。`_seat` が生きている間だけ席は押さえられており、
-    // 応答を返した時点 (= rmcp が session を map に入れ終えた後) で解放される。
-    let _seat = if gate.max_sessions > 0 {
+    // 予約を取ってから通す。席は応答を返した時点 (= rmcp が session を map に
+    // 入れ終えた後) で返す。
+    let seat = if gate.max_sessions > 0 {
         match gate
             .admissions
             .try_reserve(&gate.live, gate.max_sessions)
@@ -791,8 +818,13 @@ async fn mcp_session_gate(
         None
     };
 
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    if let Some(seat) = seat {
+        seat.release().await;
+    }
+    response
 }
 
 /// F-64: `/healthz` 用 axum middleware。Host header を allowed_hosts と照合し
@@ -2269,11 +2301,94 @@ mod tests {
              because rmcp has not inserted the session yet"
         );
 
-        drop(first);
+        first.unwrap().release().await;
         assert!(
             admissions.try_reserve(&live, 1).await.is_some(),
             "the seat comes back when the request that held it finishes"
         );
+    }
+
+    /// 打ち切られた要求の席も返る。`release().await` に到達できない経路なので
+    /// `Drop` が肩代わりする — ここが漏れると、上限がじわじわ縮んでいく。
+    #[tokio::test]
+    async fn an_abandoned_request_still_returns_its_seat() {
+        let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0)));
+        let admissions = Arc::new(Admissions::default());
+
+        let seat = admissions.try_reserve(&live, 1).await;
+        assert!(seat.is_some());
+        drop(seat); // = 応答を待たずに接続が切れた
+
+        assert!(
+            admissions.try_reserve(&live, 1).await.is_some(),
+            "a seat whose request was dropped must not stay taken"
+        );
+    }
+
+    /// (codex review round 2 の P1) 予約と解放が直列化されていること。
+    ///
+    /// `live` と `in_flight` を別々に読むと、その 2 つの読みの**間**に
+    /// 「A が insert して席を返す」引き渡しが挟まり、A がどちらにも数えられて
+    /// いない瞬間を B が見る。ここでは dummy service が rmcp の insert を
+    /// 演じる (応答を返す前に `live` を 1 増やす) ので、上限 4 に対して
+    /// 32 本を同時にぶつけると、通ってよいのはちょうど 4 本になる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cap_holds_across_the_handoff_from_in_flight_to_live() {
+        const CAP: u32 = 4;
+        let live_count = Arc::new(AtomicUsize::new(0));
+        let admitted = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let live_count = Arc::clone(&live_count);
+            let admitted = Arc::clone(&admitted);
+            axum::routing::any(move |_body: axum::body::Bytes| {
+                let live_count = Arc::clone(&live_count);
+                let admitted = Arc::clone(&admitted);
+                async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    // rmcp が session を map に入れるのに相当。応答を返す前に
+                    // 起きる = 席が返るより前。
+                    tokio::task::yield_now().await;
+                    live_count.fetch_add(1, Ordering::SeqCst);
+                    "forwarded"
+                }
+            })
+        };
+        let gate = McpSessionGate {
+            live: LiveSessionCount::Fixed(Arc::clone(&live_count)),
+            max_sessions: CAP,
+            admissions: Arc::new(Admissions::default()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let mcp: Router = Router::new()
+            .fallback_service(inner)
+            .layer(middleware::from_fn_with_state(gate, mcp_session_gate));
+        let app: Router = Router::new().nest_service("/mcp", mcp);
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                app.oneshot(mcp_post(INITIALIZE_BODY))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        let mut ok = 0;
+        for h in handles {
+            if h.await.unwrap() == StatusCode::OK {
+                ok += 1;
+            }
+        }
+
+        assert_eq!(
+            live_count.load(Ordering::SeqCst),
+            CAP as usize,
+            "the cap must hold while sessions move from in-flight to live"
+        );
+        assert_eq!(ok, CAP as usize, "exactly {CAP} of 32 may be admitted");
+        assert_eq!(admitted.load(Ordering::SeqCst), CAP as usize);
     }
 
     /// 上限は「生きている数 + 通したがまだ確定していない数」に掛かる。
