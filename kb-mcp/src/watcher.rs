@@ -27,6 +27,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::poison::{recover, recover_db};
+
 use anyhow::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::notify::event::{EventKind, ModifyKind, RenameMode};
@@ -480,14 +482,8 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
 }
 
 fn dispatch_reindex(state: &WatcherState, rel: &str) {
-    let Ok(mut embedder) = state.embedder.lock() else {
-        eprintln!("watcher: embedder mutex poisoned");
-        return;
-    };
-    let Ok(db) = state.db.lock() else {
-        eprintln!("watcher: db mutex poisoned");
-        return;
-    };
+    let mut embedder = recover(state.embedder.lock(), "embedder");
+    let db = recover_db(state.db.lock());
     match indexer::reindex_single_file(
         &db,
         &mut embedder,
@@ -510,10 +506,7 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
 }
 
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
-    let Ok(db) = state.db.lock() else {
-        eprintln!("watcher: db mutex poisoned");
-        return;
-    };
+    let db = recover_db(state.db.lock());
     match indexer::deindex_single_file(&db, rel) {
         Ok(true) => eprintln!("watcher: deindexed {rel}"),
         Ok(false) => { /* no-op: not in DB */ }
@@ -522,14 +515,8 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
 }
 
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
-    let Ok(mut embedder) = state.embedder.lock() else {
-        eprintln!("watcher: embedder mutex poisoned");
-        return;
-    };
-    let Ok(db) = state.db.lock() else {
-        eprintln!("watcher: db mutex poisoned");
-        return;
-    };
+    let mut embedder = recover(state.embedder.lock(), "embedder");
+    let db = recover_db(state.db.lock());
     match indexer::rename_single_file(
         &db,
         &mut embedder,

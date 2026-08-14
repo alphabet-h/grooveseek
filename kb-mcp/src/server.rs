@@ -12,6 +12,7 @@ use crate::db::{Database, SearchHit};
 use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
 use crate::parser::{ParserExt, Registry};
+use crate::poison::{recover, recover_db, recover_db_try, recover_try};
 use crate::{indexer, markdown};
 
 // ---------------------------------------------------------------------------
@@ -415,7 +416,7 @@ impl KbCore {
 
         // query embedding
         let query_embedding = {
-            let mut embedder = self.embedder.lock().unwrap();
+            let mut embedder = recover(self.embedder.lock(), "embedder");
             match embedder.embed_single(&params.query) {
                 Ok(emb) => emb,
                 Err(e) => {
@@ -427,7 +428,7 @@ impl KbCore {
             }
         };
 
-        let mut reranker_guard = self.reranker.lock().unwrap();
+        let mut reranker_guard = recover(self.reranker.lock(), "reranker");
         let use_rerank =
             params.rerank.unwrap_or(self.rerank_by_default) && reranker_guard.is_some();
 
@@ -457,7 +458,7 @@ impl KbCore {
         // run_search_pipeline 側でも belt-and-suspenders で再検証される。
         let overrides: crate::config::SearchOverrides = (&params).into();
 
-        let db = self.db.lock().unwrap();
+        let db = recover_db(self.db.lock());
         let reranker_arg: Option<&mut Reranker> = if use_rerank {
             Some(
                 reranker_guard
@@ -549,7 +550,7 @@ impl KbCore {
     }
 
     fn list_topics_blocking(&self) -> String {
-        let db = self.db.lock().unwrap();
+        let db = recover_db(self.db.lock());
         match db.list_topics() {
             Ok(topics) => {
                 let entries: Vec<TopicEntry> = topics
@@ -707,12 +708,17 @@ impl KbCore {
         // rebuild_index calls don't clear each other's state — first caller
         // sets Some(count=1), subsequent callers ++count; on Drop, --count
         // and clear the slot to None only when reaching 0.
+        //
+        // (BU-18) Both halves recover from a poisoned lock rather than skipping.
+        // Skipping the decrement is the worse failure: the slot keeps a count
+        // no rebuild owns, so `/api/admin/status` reports `indexing.active=true`
+        // for the rest of the process's life. The payload is plain data, so
+        // there is nothing to repair before using it.
         struct IndexingGuard(Arc<Mutex<Option<IndexingState>>>);
         impl Drop for IndexingGuard {
             fn drop(&mut self) {
-                if let Ok(mut guard) = self.0.lock()
-                    && let Some(s) = guard.as_mut()
-                {
+                let mut guard = recover(self.0.lock(), "indexing_state");
+                if let Some(s) = guard.as_mut() {
                     s.active_count = s.active_count.saturating_sub(1);
                     if s.active_count == 0 {
                         *guard = None;
@@ -720,7 +726,8 @@ impl KbCore {
                 }
             }
         }
-        if let Ok(mut guard) = self.indexing_state.lock() {
+        {
+            let mut guard = recover(self.indexing_state.lock(), "indexing_state");
             match guard.as_mut() {
                 Some(s) => s.active_count += 1,
                 None => {
@@ -735,8 +742,8 @@ impl KbCore {
         let _indexing_guard = IndexingGuard(Arc::clone(&self.indexing_state));
 
         // Lock order: embedder first, then db (consistent with search)
-        let mut embedder = self.embedder.lock().unwrap();
-        let db = self.db.lock().unwrap();
+        let mut embedder = recover(self.embedder.lock(), "embedder");
+        let db = recover_db(self.db.lock());
 
         match indexer::rebuild_index(
             &db,
@@ -818,7 +825,7 @@ impl KbCore {
             ),
         };
 
-        let db = self.db.lock().unwrap();
+        let db = recover_db(self.db.lock());
         match graph::build_connection_graph(&db, &params.path, &opts) {
             Ok(g) => serde_json::to_string_pretty(&g).unwrap_or_default(),
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
@@ -1871,20 +1878,22 @@ impl KbServerShared {
     /// (feature-43 PR-2) Best-effort snapshot of KB stats. Uses `try_lock`
     /// on `db` / `embedder` so a long-running `rebuild_index` does not stall
     /// the admin status response — busy locks yield `None` instead of waiting.
+    ///
+    /// (BU-18) A poisoned lock is *not* the same as a busy one, and `.ok()`
+    /// treated them alike: after any panic under these mutexes, admin status
+    /// would report `documents: null` forever and read as "a rebuild is
+    /// running". `recover_*_try` keeps `None` meaning busy.
     pub fn kb_info(&self) -> Result<KbInfo> {
-        let (documents, chunks) = match self.db.try_lock() {
-            Ok(db) => {
+        let (documents, chunks) = match recover_db_try(self.db.try_lock()) {
+            Some(db) => {
                 let docs = db.document_count().ok().map(|n| n as u64);
                 let chks = db.chunk_count().ok().map(|n| n as u64);
                 (docs, chks)
             }
-            Err(_) => (None, None),
+            None => (None, None),
         };
-        let model = self
-            .embedder
-            .try_lock()
-            .ok()
-            .map(|e| e.model_id().to_string());
+        let model =
+            recover_try(self.embedder.try_lock(), "embedder").map(|e| e.model_id().to_string());
         Ok(KbInfo {
             path: self.kb_path.display().to_string(),
             documents,

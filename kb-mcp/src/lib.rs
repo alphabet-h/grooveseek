@@ -19,6 +19,10 @@ pub mod markdown;
 pub mod mmr;
 pub mod parent;
 pub mod parser;
+/// Recovering from a poisoned mutex (BU-18). Internal: the binary and the
+/// integration tests have no reason to reach for it, and every call site is a
+/// lock this crate owns.
+pub(crate) mod poison;
 pub mod quality;
 pub mod schema;
 pub mod schema_compat;

@@ -958,12 +958,12 @@ async fn api_admin_status(
     // `rebuild_index` is holding the db / embedder locks. `kb_info()` itself
     // uses `try_lock` and yields `None` counts on contention.
     let indexing_info = {
-        let guard = shared.indexing_state.lock().map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "indexing_state mutex poisoned".to_string(),
-            )
-        })?;
+        // (BU-18, codex P2 round 1 on PR #154) A poisoned lock used to be a 500
+        // here, permanently: poisoning is sticky, so the one endpoint an
+        // operator reaches for after a panic was the one that stopped
+        // answering. The payload is plain data — recovering it is the whole
+        // point of the change.
+        let guard = crate::poison::recover(shared.indexing_state.lock(), "indexing_state");
         match guard.as_ref() {
             Some(s) => IndexingInfo {
                 active: true,
