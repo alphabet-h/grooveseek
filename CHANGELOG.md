@@ -154,6 +154,26 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   The config log line now also carries the resolved path and the trust
   decision; `source=Cwd` alone could not tell you which file had won.
 
+- **The macOS LaunchAgent's logs are no longer world-readable** (BU-24). The
+  plist named `kb-mcp.out` / `kb-mcp.err` but set no `Umask`, and launchd —
+  which creates those files itself, before `exec`, so the daemon's own umask
+  comes too late — fell back to the user domain's 022 and made them 0644.
+  `<key>Umask</key><string>0077</string>` fixes that at the source; the value is
+  a string because launchd.plist(5) reads an `<integer>` as **decimal**, so
+  `0077` there would mean 77.
+
+  What was exposed was modest, which is why this is defense in depth rather
+  than a fix for a leak: `kb-mcp.out` is always empty (nothing in `serve`
+  writes to stdout), `kb-mcp.err` carries paths, the bind address and
+  re-indexing lines but no queries, documents or results, and the install has
+  chmodded the enclosing config home to 0700 since the backend shipped in
+  v0.10.0, so another account could not reach the files anyway.
+
+  `Umask` applies to the whole job, so the index database the agent creates
+  becomes 0600 too. And because it only applies at creation, `service install
+  --force` now also tightens `kb-mcp.out` / `kb-mcp.err` if they already exist
+  — upgrading an agent installed before this release does not re-create them.
+
 ### Added
 
 - **CI now measures retrieval quality, not just correctness** (BU-11). Nothing

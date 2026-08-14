@@ -376,7 +376,7 @@ kb-mcp service uninstall personal --purge --yes    # also remove config + DB
 
 OS-specific backends:
 - **Linux**: systemd-user (`~/.config/systemd/user/kb-mcp-<name>.service`). Run `sudo loginctl enable-linger $USER` to keep the daemon running after logout.
-- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`).
+- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`). launchd writes the daemon's output to `kb-mcp.out` / `kb-mcp.err` in the config home; the plist sets `Umask` to `0077`, so everything the agent creates — those logs, the index database — is readable only by your account.
 - **Windows**: Task Scheduler AT_LOGON (= no admin required, `\kb-mcp-<name>` task).
 
 The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name>/` containing `kb-mcp.toml` (with `kb_path` and `bind`). Override the base directory via `KB_MCP_CONFIG_HOME` env var.
