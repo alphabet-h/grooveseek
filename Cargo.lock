@@ -2635,6 +2635,7 @@ dependencies = [
  "http",
  "indicatif 0.18.4",
  "kb-mcp-tray",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "oxidize-pdf",

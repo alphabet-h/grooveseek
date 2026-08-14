@@ -592,8 +592,18 @@ impl KbCore {
             }
         };
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
-        match std::fs::read(&canonical) {
-            Ok(bytes) => {
+        // (BU-20) The validation above checked a path; this checks the handle
+        // the bytes actually come from, so nothing renamed over that path in
+        // between is read. The cap comes from the shared chooser rather than
+        // being recomputed, so the two steps cannot enforce different limits.
+        let cap = max_bytes_for(
+            &self.parser_registry,
+            ext,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            GET_DOCUMENT_MAX_BYTES,
+        );
+        match crate::links::read_checked(&canonical, cap) {
+            Ok(crate::links::Content::Bytes(bytes)) => {
                 match build_document_response(&self.parser_registry, &params.path, ext, &bytes) {
                     Ok(resp) => serde_json::to_string_pretty(&resp).unwrap_or_default(),
                     Err(e) => serde_json::to_string_pretty(&ErrorResponse {
@@ -601,6 +611,13 @@ impl KbCore {
                     })
                     .unwrap_or_default(),
                 }
+            }
+            Ok(crate::links::Content::Refused(refused)) => {
+                tracing::warn!("{}", refused.log_line(&canonical));
+                serde_json::to_string_pretty(&ErrorResponse {
+                    error: refused.client_message().to_string(),
+                })
+                .unwrap_or_default()
             }
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
                 error: format!("Failed to read file: {e}"),
@@ -647,7 +664,28 @@ impl KbCore {
             }
         };
 
-        match std::fs::read_to_string(&canonical) {
+        // (BU-20) Same handle-checked read as `get_document`; the templates
+        // resolve to a path, and a path is what can be swapped. The cap is the
+        // one `resolve_best_practice_path` already applied to this file.
+        let content = match crate::links::read_checked(&canonical, GET_DOCUMENT_MAX_BYTES) {
+            Ok(crate::links::Content::Bytes(bytes)) => match String::from_utf8(bytes) {
+                Ok(s) => Ok(s),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                )),
+            },
+            Ok(crate::links::Content::Refused(refused)) => {
+                tracing::warn!("{}", refused.log_line(&canonical));
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: refused.client_message().to_string(),
+                })
+                .unwrap_or_default();
+            }
+            Err(e) => Err(e),
+        };
+
+        match content {
             Ok(content) => {
                 if let Some(ref cat) = params.category {
                     // Extract a specific h2 section
@@ -1559,6 +1597,29 @@ fn best_practice_not_found_message(target: &str, tried: &[String]) -> String {
 /// — 検索には出ないがパスを知っていれば取得できる。kb_path 配下に置いた時点で
 /// 読める前提の設計なので、読ませたくないものは kb_path の外に置くこと。
 /// `document_in_excluded_dir_is_still_readable` が現契約として pin している。
+/// Which of the two caps applies to `ext` (BU-22).
+///
+/// (BU-20) Shared, because the number is now needed twice: once by
+/// [`validate_get_document_path`], which stats the path, and once by the read
+/// that follows it, which enforces the same limit on the handle it reads from.
+/// Recomputing it at the second site is how the two would come to disagree.
+pub(crate) fn max_bytes_for(
+    registry: &Registry,
+    ext: &str,
+    binary_max_bytes: u64,
+    text_max_bytes: u64,
+) -> u64 {
+    if registry
+        .by_extension(ext)
+        .map(|p| p.is_binary())
+        .unwrap_or(false)
+    {
+        binary_max_bytes
+    } else {
+        text_max_bytes
+    }
+}
+
 pub(crate) fn validate_get_document_path(
     kb_path: &std::path::Path,
     rel_path: &str,
@@ -1583,8 +1644,9 @@ pub(crate) fn validate_get_document_path(
         Ok(_) if crate::links::is_multiply_linked(&file_path) => {
             tracing::warn!("{}", crate::links::refusal_reason(&file_path));
             return ValidatePathOutcome::Denied(ErrorResponse {
-                error: "Access denied: files with more than one name (hard links) are not allowed."
-                    .to_string(),
+                // One literal for both moments a hard link can be refused —
+                // here and at the read that follows (BU-20).
+                error: crate::links::HARD_LINK_DENIED.to_string(),
             });
         }
         Ok(_) => {}
@@ -1627,15 +1689,7 @@ pub(crate) fn validate_get_document_path(
 
     // 4. Size cap — chosen from the same `ext` that step 3 just accepted, so
     // the two cannot disagree (BU-22).
-    let max_bytes = if registry
-        .by_extension(ext)
-        .map(|p| p.is_binary())
-        .unwrap_or(false)
-    {
-        binary_max_bytes
-    } else {
-        text_max_bytes
-    };
+    let max_bytes = max_bytes_for(registry, ext, binary_max_bytes, text_max_bytes);
     match std::fs::metadata(&canonical) {
         Ok(meta) if meta.len() > max_bytes => {
             return ValidatePathOutcome::NotFound(ErrorResponse {

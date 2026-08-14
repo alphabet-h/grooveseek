@@ -560,6 +560,13 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
             );
         }
+        // (BU-20) The reason is already on stderr from `read_for_index`; this
+        // line says what happened to the document, which the reason does not.
+        Ok(indexer::RenameOutcome::RenamedButRefused) => {
+            eprintln!(
+                "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
+            );
+        }
         Err(e) => eprintln!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
     }
 }
