@@ -159,6 +159,10 @@ bind = "127.0.0.1:3100"
 # when a client disconnects, and otherwise after rmcp's 5-minute idle timeout,
 # so a client that reconnects in a loop can hold slots for a while. Set 0 to
 # disable the limit entirely.
+#
+# This only concerns clients speaking MCP 2025-11-25 or older. The 2026-07-28
+# protocol has no sessions at all (SEP-2567): those requests are served
+# statelessly, hold nothing, and are never refused by this limit.
 #max_sessions = 256
 
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------

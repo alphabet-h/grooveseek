@@ -16,7 +16,7 @@ keywords = ["mcp", "rag", "search", "embedding", "sqlite-vec"]
 categories = ["command-line-utilities", "database", "text-processing"]
 
 [dependencies]
-rmcp = { version = "1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 tokio = { workspace = true, features = ["full"] }
 axum = "0.8"
 # AU-17 codex P1: `search` の filter 上限は rmcp が body を全部 buffer して

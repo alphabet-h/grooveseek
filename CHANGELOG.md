@@ -25,36 +25,32 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   keep-alive timer nor the cancellation arm that the post-initialize loop has,
   so nothing ever reclaims it.
 
-  **Upstream fixed this in rmcp 2.0.0**, which kb-mcp does not yet use: reported
-  against 1.4.0 as
-  [modelcontextprotocol/rust-sdk#808](https://github.com/modelcontextprotocol/rust-sdk/issues/808),
-  fixed by
-  [modelcontextprotocol/rust-sdk#934](https://github.com/modelcontextprotocol/rust-sdk/pull/934)
-  — "only creates a session after those checks pass" — and 2.0.0 also added a
-  `SessionConfig::init_timeout` defaulting to 60 seconds. Verified against the
-  published crates: 1.4.0 through 1.8.0 create the session first, 2.0.0 onward
-  do not. The gate below still earns its place after an upgrade: it becomes a
-  second line of defence for that path, and **no rmcp release bounds the number
-  of sessions**, 3.1.2 included.
-
   Measured against the release binary over **one** keep-alive connection: 2000
   session-less, non-`initialize` POSTs raised private bytes from 157 MiB to
   274 MiB — about **58 KB per rejected request, none of it returned** — in one
   second, i.e. ~117 MiB/s. No session, no `initialize`, no credentials. On a
   loopback bind that is any local process; with the `intranet-http` recipe it is
-  anything on the network.
+  anything on the network. Every release up to and including v0.18.0 shipped
+  rmcp 1.4.0 and is affected.
 
-  Two changes, in this order, because the order is what makes them safe:
+  Two changes:
 
-  1. A request that would create a session is now checked **before** it reaches
-     rmcp: a POST with no `Mcp-Session-Id` whose body is not a single
-     `initialize` request is answered with the same `422` and the same wording
-     rmcp uses, and never creates a session. The same probe now moves memory by
-     0.1 MiB.
+  1. **rmcp is upgraded to 3.1.2**, which fixes the leak at the source. It was
+     reported against 1.4.0 as
+     [modelcontextprotocol/rust-sdk#808](https://github.com/modelcontextprotocol/rust-sdk/issues/808)
+     and fixed by
+     [modelcontextprotocol/rust-sdk#934](https://github.com/modelcontextprotocol/rust-sdk/pull/934)
+     — "only creates a session after those checks pass" — released in 2.0.0,
+     which also added a `SessionConfig::init_timeout` defaulting to 60 seconds.
+     Verified against the published crates: 1.4.0 through 1.8.0 create the
+     session first, 2.0.0 onward do not. The same probe now moves memory by
+     0.1 MiB. See "Changed" below for what else the upgrade brings.
   2. Live sessions are capped, `[transport.http].max_sessions`, default **256**
      (~25 MB; a live session measured at ~100 KB). While the cap is full, a
      request that would open a *new* session gets `429` with `Retry-After`;
-     **established sessions are untouched**. `0` disables the limit.
+     **established sessions are untouched**. `0` disables the limit. **No rmcp
+     release bounds the number of sessions**, 3.1.2 included, so this stays
+     kb-mcp's own.
 
   The cap counts live sessions *and* admissions still in flight, and reads both
   plus the increment inside one critical section that releasing a seat also
@@ -66,17 +62,19 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   a compare-exchange cannot tell "unchanged" from "changed and changed back",
   and that version measured 5 and 6 live sessions against a cap of 4.
 
-  A cap alone would have made things worse rather than better: leaked entries
-  never expire, so an attacker could fill it and leave the server permanently
-  unable to accept a legitimate client. Fixing the leak first is what turns the
-  cap into a bound instead of a lock-out.
+  On rmcp 1.4.0 a cap alone would have made things worse rather than better:
+  leaked entries never expire, so an attacker could fill it and leave the server
+  permanently unable to accept a legitimate client. That is why the leak had to
+  go first — and why it is fixed by the upgrade rather than by a workaround in
+  front of it.
 
-  Only the `initialize` predicate is replicated — that is the MCP specification,
-  not an rmcp implementation detail. `Host`, `Accept`, and `Content-Type`
-  validation stay delegated to rmcp (the same call made for `Host` in v0.7.6): a
-  request rmcp would reject for one of those reasons never reaches
-  `create_session` either. A body that is not JSON is likewise passed through,
-  since rmcp rejects it before the session branch.
+  The cap looks at one thing: whether the body is a single `initialize` request.
+  That is the MCP specification, not an rmcp implementation detail, and after
+  SEP-2567 it is exactly the request that creates a session — the 2026-07-28
+  protocol removed both sessions and `initialize`, so a modern request holds
+  nothing and is never inspected further or refused. `Host`, `Accept` and
+  `Content-Type` validation stay delegated to rmcp, the same call made for
+  `Host` in v0.7.6.
 
   From an untrusted config `max_sessions` is dropped like `allowed_hosts` and
   `healthz_public`, which for a *limit* means falling back to the built-in
@@ -207,6 +205,34 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   later as an unexplained recall drop.
 
 ### Changed
+
+- **rmcp 1.4.0 → 3.1.2, which brings MCP 2026-07-28 support**. Two majors of
+  upstream work, including the session-leak fix described under Security and
+  OAuth hardening. kb-mcp's own surface is small — the `#[tool]` macros,
+  `Parameters`, `ToolRouter`, `serve_server`, stdio, and the Streamable HTTP
+  service — and none of it needed changing to compile.
+
+  What did need changing is a consequence of the protocol, not the API.
+  **MCP 2026-07-28 removes sessions entirely (SEP-2567)**: there is no
+  `Mcp-Session-Id`, no `initialize`, no standalone GET stream and no
+  DELETE-based termination. Each request carries the negotiated version and the
+  client's capabilities in `_meta`, and rmcp serves it with a fresh handler.
+  rmcp's `stateful_mode` is renamed `legacy_session_mode` and now governs only
+  older protocol versions.
+
+  For kb-mcp that means a 2026-07-28 client POSTs `tools/call` to `/mcp`
+  **without a session**, which the BU-32 gate — written when a session-less POST
+  could only legitimately be an `initialize` — answered with `422`. Measured
+  against 3.1.2 before fixing: the same request with the gate bypassed returns a
+  complete `tools/list` result, so the gate was the only thing in the way. It
+  now inspects a request only to decide whether the session cap applies, and
+  passes everything else through untouched. A regression test drives a
+  2026-07-28-shaped request through the mount, because the whole suite is
+  otherwise a legacy handshake and it stayed green through the breakage.
+
+  Nothing changes for existing clients: the legacy lifecycle still works, and
+  the shipped defaults (`legacy_session_mode` on, Origin validation off) match
+  the previous behaviour.
 
 - **`get_connection_graph` / `kb-mcp graph` are now bounded, and say so when a
   bound bites** (BU-33). The walk had no upper limit on its cost: it seeded
