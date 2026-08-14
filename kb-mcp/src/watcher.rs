@@ -560,6 +560,11 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         Ok(indexer::RenameOutcome::OldPathMissing) => {
             eprintln!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
         }
+        // (BU-20) Not "indexed": no row was created. Saying otherwise sends
+        // whoever reads this log looking for a document that is not there.
+        Ok(indexer::RenameOutcome::OldPathMissingAndRefused) => {
+            eprintln!("watcher: rename target {old_rel} not in DB, and {new_rel} was refused");
+        }
         Ok(indexer::RenameOutcome::RenamedSizeCapped) => {
             eprintln!(
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
