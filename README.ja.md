@@ -884,7 +884,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 |---|---|---|
 | `summarize_topic` | `topic` (必須) | `list_topics` でトピックの存在を確認 → `search` で集める → 重要な文書は `get_document` で全文を読む → 要約する。**カバーされていないこと**も書かせる |
 | `deep_dive` | `question` (必須) | 最初の検索だけで答えない。上位ヒットを `get_connection_graph` の depth 2 で広げ、全文を読み、そこで得た語彙で再検索する |
-| `whats_new` | `since` (任意、ISO 日付) | その日付以降の文書を概観する。**`date_from` が絞るのは frontmatter の `date` = 著者が書いた値であって、ファイルの更新時刻ではない**ことを prompt 自身に明記させ、近似であると断らせる |
+| `whats_new` | `since` (任意、`YYYY-MM-DD`。省略時は 30 日前) | その日付以降の文書を概観する。**`date_from` が絞るのは frontmatter の `date` = 著者が書いた値であって、ファイルの更新時刻ではない**ことを prompt 自身に明記させ、近似であると断らせる。加えて **`date_from` は文字列として比較される**ので、`YYYY-MM-DD` 以外を渡すとエラーにならず全文書が落ちることも警告する |
 | `find_gaps` | `topic` (任意) | 欠落を探す。`low_confidence` が立つ問い、`include_low_quality: true` でしか出てこない stub。**欠けているものを報告させ、内容の提案はさせない** |
 
 4 つとも text のみで、引用規則を共有する: 使った文書の `path` を必ず引用する / `low_confidence` を握り潰さず表に出す / ナレッジベースが沈黙している時は一般知識で埋めずにそう言う。

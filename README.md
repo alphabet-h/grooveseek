@@ -894,7 +894,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 |---|---|---|
 | `summarize_topic` | `topic` (required) | Confirm the topic exists with `list_topics`, gather it with `search`, read the documents that carry weight with `get_document`, then summarize — including what the knowledge base does *not* cover. |
 | `deep_dive` | `question` (required) | Do not answer from the first search: expand the strongest hits with `get_connection_graph` at depth 2, read whole documents, and search again with the vocabulary that turns up. |
-| `whats_new` | `since` (optional ISO date) | Survey documents dated since then. The prompt says outright that `date_from` filters the frontmatter `date` — what an author typed — not when a file changed, so this is an approximation and should be presented as one. |
+| `whats_new` | `since` (optional `YYYY-MM-DD`; defaults to 30 days ago) | Survey documents dated since then. The prompt says outright that `date_from` filters the frontmatter `date` — what an author typed — not when a file changed, so this is an approximation and should be presented as one. It also warns that `date_from` is compared as a plain string: a value that is not `YYYY-MM-DD` filters out every document rather than erroring. |
 | `find_gaps` | `topic` (optional) | Look for what is missing: questions that come back with `low_confidence`, and stubs that only appear with `include_low_quality: true`. Reports absences, does not propose content. |
 
 All four are plain text and share one set of citation rules: cite the `path` of every document used, surface `low_confidence` rather than answering through it, and say when the knowledge base is silent instead of filling the gap from general knowledge.

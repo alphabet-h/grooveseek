@@ -173,18 +173,40 @@ fn deep_dive_body(args: DeepDiveArgs) -> Vec<PromptMessage> {
     ))
 }
 
+/// How far back `whats_new` looks when the caller does not say.
+const DEFAULT_WHATS_NEW_DAYS: i64 = 30;
+
+/// `days` before `today`, as an ISO date.
+///
+/// The default has to be a real date rather than a phrase. `date_from` reaches
+/// `matches_date_range`, which compares the **raw strings** lexicographically
+/// (`db/search.rs:50`) — so "about a month ago" sorts above every `2026-…`
+/// document date, filters the whole corpus out, and the survey comes back empty
+/// instead of failing (codex P2, round 1 on PR #161).
+///
+/// Split from the clock so the arithmetic can be pinned to a fixed day.
+fn iso_days_before(today: chrono::NaiveDate, days: i64) -> String {
+    (today - chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
 /// Survey recently dated documents.
 fn whats_new_body(args: WhatsNewArgs) -> Vec<PromptMessage> {
-    let since = args
-        .since
-        .unwrap_or_else(|| "about a month ago".to_string());
+    let since = args.since.unwrap_or_else(|| {
+        iso_days_before(chrono::Utc::now().date_naive(), DEFAULT_WHATS_NEW_DAYS)
+    });
     one_user_message(format!(
         "Survey what has been added to this knowledge base since {since}.\n\
              \n\
-             1. Call `search` with `date_from` set to that date and a broad \
-             query, with a high `limit`. Repeat with a few different queries: \
-             the date filter narrows the candidates, but the ranking is still \
-             driven by the query, so one query will not surface everything.\n\
+             1. Call `search` with `date_from: \"{since}\"` and a broad query, \
+             with a high `limit`. Repeat with a few different queries: the date \
+             filter narrows the candidates, but the ranking is still driven by \
+             the query, so one query will not surface everything.\n\
+             **`date_from` is compared as a plain string, not parsed as a \
+             date.** It must be `YYYY-MM-DD`. If the value above is anything \
+             else, convert it to that form first — passing prose filters out \
+             every document instead of erroring.\n\
              2. Group what you find by `topic` and `category`.\n\
              3. Read the ones that look substantial with `get_document`.\n\
              \n\
@@ -202,13 +224,26 @@ fn whats_new_body(args: WhatsNewArgs) -> Vec<PromptMessage> {
 
 /// Look for what the knowledge base is missing.
 fn find_gaps_body(args: FindGapsArgs) -> Vec<PromptMessage> {
-    let scope = match args.topic {
-        Some(topic) => format!("the topic `{topic}`"),
-        None => "this knowledge base".to_string(),
+    let (scope, filter) = match args.topic {
+        // The filter clause is not decoration. Without `topic:` on every call, a
+        // broad question can be answered strongly by a document in an unrelated
+        // topic — `low_confidence` stays false and the gap in the topic that was
+        // actually asked about is masked (codex P2, round 1 on PR #161).
+        Some(topic) => (
+            format!("the topic `{topic}`"),
+            format!(
+                "**Pass `topic: \"{topic}\"` on every one of these searches**, \
+                 including the `include_low_quality` ones. Without it a strong \
+                 answer from a different topic keeps `low_confidence` false and \
+                 hides the gap you were asked to find.\n"
+            ),
+        ),
+        None => ("this knowledge base".to_string(), String::new()),
     };
     one_user_message(format!(
         "Find what {scope} does not cover, or covers thinly.\n\
              \n\
+             {filter}\
              1. Call `list_topics` for the shape of the corpus. A topic with one \
              or two documents is a candidate, but a small topic is not \
              automatically a gap — some subjects need one page.\n\
@@ -350,15 +385,9 @@ mod tests {
         );
     }
 
-    /// An omitted optional argument must produce a sentence, not a hole.
+    /// An omitted optional argument must produce something usable, not a hole.
     #[test]
     fn omitted_optional_arguments_still_read_as_english() {
-        let text = text_of(&whats_new_body(WhatsNewArgs { since: None }));
-        assert!(
-            text.contains("about a month ago"),
-            "an omitted `since` must become a phrase: {text}"
-        );
-
         let scoped = text_of(&find_gaps_body(FindGapsArgs {
             topic: Some("mcp".to_string()),
         }));
@@ -367,6 +396,79 @@ mod tests {
         assert!(
             unscoped.contains("this knowledge base") && !unscoped.contains("the topic ``"),
             "an omitted `topic` must widen the scope rather than leave an empty name: {unscoped}"
+        );
+    }
+
+    /// (codex P2, round 1 on PR #161) The default cutoff must be a date the
+    /// search can actually use.
+    ///
+    /// `date_from` is compared as a raw string by `matches_date_range`, so a
+    /// phrase like "about a month ago" sorts above every `2026-…` document date
+    /// and filters the whole corpus out — an empty survey rather than an error.
+    #[test]
+    fn the_default_cutoff_is_an_iso_date_not_a_phrase() {
+        let text = text_of(&whats_new_body(WhatsNewArgs { since: None }));
+
+        let iso = text
+            .split(|c: char| !(c.is_ascii_digit() || c == '-'))
+            .find(|token| {
+                token.len() == 10
+                    && token.as_bytes()[4] == b'-'
+                    && token.as_bytes()[7] == b'-'
+                    && token.chars().filter(char::is_ascii_digit).count() == 8
+            })
+            .unwrap_or_else(|| panic!("no YYYY-MM-DD anywhere in the body: {text}"));
+
+        // The property that matters: whatever the clock says, the emitted value
+        // must sort *below* a document date from the same era, or the filter
+        // excludes everything.
+        assert!(
+            iso < "9999-12-31",
+            "the cutoff must compare as a date against ISO document dates: {iso}"
+        );
+        assert!(
+            !text.contains("about a month ago"),
+            "the prose placeholder must be gone: {text}"
+        );
+        assert!(
+            text.contains("compared as a plain string"),
+            "the prompt must warn that date_from is not parsed: {text}"
+        );
+    }
+
+    /// The arithmetic, with the clock pinned — the part `the_default_cutoff…`
+    /// cannot check because it does not know what day it is.
+    #[test]
+    fn the_default_cutoff_is_thirty_days_back() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 15).unwrap();
+        assert_eq!(iso_days_before(today, DEFAULT_WHATS_NEW_DAYS), "2026-07-16");
+        // Across a year boundary, which is where hand-rolled arithmetic breaks.
+        let jan = chrono::NaiveDate::from_ymd_opt(2026, 1, 10).unwrap();
+        assert_eq!(iso_days_before(jan, 30), "2025-12-11");
+    }
+
+    /// (codex P2, round 1 on PR #161) A requested topic has to reach the
+    /// searches, not just the prose. Without the filter, a strong answer from
+    /// an unrelated topic keeps `low_confidence` false and masks the gap.
+    #[test]
+    fn find_gaps_tells_the_model_to_filter_by_the_requested_topic() {
+        let scoped = text_of(&find_gaps_body(FindGapsArgs {
+            topic: Some("zqxw-topic".to_string()),
+        }));
+        assert!(
+            scoped.contains("topic: \\\"zqxw-topic\\\"")
+                || scoped.contains("topic: \"zqxw-topic\""),
+            "the topic must be passed to search, not only named in prose: {scoped}"
+        );
+        assert!(
+            scoped.contains("include_low_quality"),
+            "the filter instruction must cover the low-quality pass too: {scoped}"
+        );
+
+        let unscoped = text_of(&find_gaps_body(FindGapsArgs { topic: None }));
+        assert!(
+            !unscoped.contains("Pass `topic:"),
+            "with no topic there is nothing to filter by: {unscoped}"
         );
     }
 
