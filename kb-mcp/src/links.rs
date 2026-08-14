@@ -22,6 +22,27 @@
 //! legitimately hard-linked KB (deduplicated notes, one file shared between two
 //! knowledge bases) does not look like it vanished for no reason.
 //!
+//! ## What this does not do (codex P1 round 2 on PR #155)
+//!
+//! A link count is a property of *now*, not of provenance. Someone who can both
+//! link the file in **and remove its original name** — which needs write access
+//! to the directory holding it, not read access to the file — leaves the KB path
+//! as the only name, count 1, indistinguishable from a file that was always
+//! there. Log rotation does the same thing by accident.
+//!
+//! Remembering inodes seen at count > 1 would not close it either: link and
+//! unlink can both happen between two index runs, so there may be no moment at
+//! which kb-mcp observes the second name at all. The only check that would close
+//! it is ownership — refuse files not owned by the user running kb-mcp — and
+//! that breaks a knowledge base shared between accounts, which is a product
+//! decision well outside this guard.
+//!
+//! So: this raises the bar for the common case (the attacker cannot delete the
+//! original — `/etc/shadow`, another account's files), and **the knowledge base
+//! directory is still not a security boundary**. Anything that must not be
+//! readable by kb-mcp belongs outside `kb_path`, on a path kb-mcp's user cannot
+//! read.
+//!
 //! **Fail-open on error.** A file that cannot be examined is allowed through.
 //! Deletion events arrive after the file is gone, and `should_process_parts`
 //! gates deindexing as well as indexing: refusing what we cannot stat would
