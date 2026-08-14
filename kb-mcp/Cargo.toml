@@ -60,6 +60,11 @@ notify = "8"
 notify-debouncer-full = "0.6"
 # [feature 26] path_globs filter 用
 globset = "0.4"
+# [feature-49 / C-7] `.kb-mcpignore`。gitignore 構文のマッチャとしてのみ使い、
+# `WalkBuilder` には乗り換えない (理由は src/exclusion.rs の module doc と
+# docs/decisions/0003-*.md)。依存 11 crate はすべて既に lock 済みで、
+# 純増はこの 1 crate。
+ignore = "0.4"
 # [feature 27] config discovery: cross-platform `~` 展開
 shellexpand = "3"
 # [feature-31] f32x8 SIMD kernel for mmr::cosine_similarity (pure-rust, ~50 KB)。

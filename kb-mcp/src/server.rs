@@ -1597,6 +1597,12 @@ fn best_practice_not_found_message(target: &str, tried: &[String]) -> String {
 /// — 検索には出ないがパスを知っていれば取得できる。kb_path 配下に置いた時点で
 /// 読める前提の設計なので、読ませたくないものは kb_path の外に置くこと。
 /// `document_in_excluded_dir_is_still_readable` が現契約として pin している。
+///
+/// (feature-49) **`.kb-mcpignore` も同じくここには効かない**。同じ契約を意図的に
+/// 踏襲している: KB に書ける者は `.kb-mcpignore` を消すこともできるので、
+/// 木の中に置いたルールがその木を守る境界にはなり得ない。`.kb-mcpignore` に
+/// 書いたパスは索引されず `search` にも `get_connection_graph` にも出ないが、
+/// パスを知っていれば `get_document` で読める。
 /// Which of the two caps applies to `ext` (BU-22).
 ///
 /// (BU-20) Shared, because the number is now needed twice: once by
@@ -2154,7 +2160,10 @@ pub async fn run_server(
         embedder: Arc::clone(&shared.embedder),
         registry: Arc::clone(&shared.parser_registry),
         exclude_headings: shared.exclude_headings.clone(),
-        exclude_dirs: shared.exclude_dirs.clone(),
+        // (feature-49) `.kb-mcpignore` を起動時に 1 度読む。以後、ファイル自体が
+        // 書き換わったら watcher が組み直す。`rebuild_index` 側は毎回読み直すので
+        // ここの値は共有しない。
+        rules: crate::exclusion::ExclusionRules::load(&kb_path, shared.exclude_dirs.clone()),
         config: watch_config,
         watcher_active: Arc::clone(&watcher_active),
     };

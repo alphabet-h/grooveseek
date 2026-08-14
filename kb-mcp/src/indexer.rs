@@ -18,7 +18,7 @@ pub mod progress;
 
 /// Hardcoded directory basenames to *always* skip during indexing /
 /// validation walks, regardless of user `exclude_dirs` config. Acts as
-/// a fail-safe so that `[indexer].exclude_dirs = ["custom"]` (= default
+/// a fail-safe so that `exclude_dirs = ["custom"]` (= default
 /// override forgetting VCS metadata) or `exclude_dirs = []` (= explicit
 /// "walk everything") does not index `.git/` / `.svn/` / `node_modules/`.
 /// User `exclude_dirs` is *additionally* applied (union semantics).
@@ -460,9 +460,22 @@ pub fn rebuild_index(
         force,
     )?;
 
+    // (feature-49) `.kb-mcpignore` は **毎回ここで読み直す**。CLI `index` と MCP
+    // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
+    // 起動時に 1 度解決して焼き込むと、daemon 側だけ古い規則で走り続ける。
+    let rules = crate::exclusion::ExclusionRules::load(&kb_path, exclude_dirs.to_vec());
+    if let Some(patterns) = rules.ignore_file_patterns() {
+        eprintln!(
+            "Applying {} from {} ({patterns} pattern{})",
+            crate::exclusion::IGNORE_FILE_NAME,
+            kb_path.display(),
+            if patterns == 1 { "" } else { "s" }
+        );
+    }
+
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
-    let source_files = collect_source_files(&kb_path, registry, exclude_dirs)?;
+    let source_files = collect_source_files(&kb_path, registry, &rules)?;
     eprintln!(
         "Found {} source files (extensions: {:?})",
         source_files.len(),
@@ -1055,13 +1068,22 @@ pub fn rename_single_file(
 }
 
 /// Collect all files under `kb_path` whose extension is registered in
-/// `registry`. Directories whose basename matches any entry in
-/// `exclude_dirs` are skipped (along with their subtree). Sort for
-/// deterministic ordering.
-fn collect_source_files(
+/// `registry`. Anything `rules` excludes is skipped — a directory along with
+/// its whole subtree. Sort for deterministic ordering.
+///
+/// (feature-49) The decision moved into [`ExclusionRules`] so that this walk,
+/// the `validate` walk and the live watcher cannot answer it differently; the
+/// three had already drifted twice (AU-03, BU-19). The visible change here is
+/// that **files are filtered too**: `exclude_dirs` only ever named directories,
+/// but `.kb-mcpignore` can name a file, so `filter_entry` no longer waves every
+/// non-directory through.
+/// `pub(crate)` only so `watcher.rs` can put this walk and `should_process` side
+/// by side in one test and assert they answer the same way. Keeping them in
+/// separate test modules is how they drifted apart in the first place.
+pub(crate) fn collect_source_files(
     kb_path: &Path,
     registry: &Registry,
-    exclude_dirs: &[String],
+    rules: &crate::exclusion::ExclusionRules,
 ) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     let extensions = registry.extensions();
@@ -1070,17 +1092,11 @@ fn collect_source_files(
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
-            if !e.file_type().is_dir() {
-                return true;
-            }
-            let name = e.file_name().to_string_lossy();
-            // F-62: hardcoded denylist (.git / .svn / node_modules) is always
-            // applied as a fail-safe, then user exclude_dirs is layered on top
-            // (union semantics). See HARDCODED_EXCLUDE_DIRS doc.
-            if is_hardcoded_excluded(name.as_ref()) {
-                return false;
-            }
-            !is_user_excluded_dir(name.as_ref(), exclude_dirs)
+            // `kb_path` itself relativizes to the empty string, which is never
+            // excluded — otherwise a pattern like `*` would prune the root and
+            // the walk would produce nothing.
+            let rel = crate::exclusion::rel_key(kb_path, e.path());
+            !rules.is_excluded(&rel, e.file_type().is_dir())
         })
     {
         let entry = entry.context("walkdir error")?;
@@ -1494,6 +1510,14 @@ mod tests {
         std::fs::write(full, content).unwrap();
     }
 
+    /// (feature-49) The exclusion argument `collect_source_files` now takes.
+    /// Built with `load`, so these tests go through the production path; none
+    /// of these scratch directories has a `.kb-mcpignore`, so what comes out is
+    /// the `exclude_dirs`-only rule set they were passing before.
+    fn excl(dir: &std::path::Path, dirs: &[&str]) -> crate::exclusion::ExclusionRules {
+        crate::exclusion::ExclusionRules::load(dir, dirs.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
     fn test_collect_source_files_md_only_by_default() {
         let tmp = mk_tmp("mdonly");
@@ -1503,7 +1527,7 @@ mod tests {
         write_file(&tmp.0, "ignore.rst", "rst");
 
         let reg = Registry::defaults(); // md only
-        let files = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
         let rels: Vec<String> = files
             .iter()
             .map(|p| {
@@ -1527,7 +1551,7 @@ mod tests {
         write_file(&tmp.0, "ignore.rst", "rst");
 
         let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
-        let files = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
         let rels: Vec<String> = files
             .iter()
             .map(|p| {
@@ -1550,7 +1574,7 @@ mod tests {
         write_file(&tmp.0, ".obsidian/nested/evil.md", "# skip too");
 
         let reg = Registry::defaults();
-        let files = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
         let rels: Vec<String> = files
             .iter()
             .map(|p| {
@@ -1571,7 +1595,7 @@ mod tests {
         write_file(&tmp.0, "note.TXT", "txt");
 
         let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
-        let files = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
         assert_eq!(files.len(), 3, "should match regardless of case: {files:?}");
     }
 
@@ -1583,8 +1607,8 @@ mod tests {
         write_file(&tmp.0, "mmm.md", "m");
 
         let reg = Registry::defaults();
-        let f1 = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
-        let f2 = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let f1 = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
+        let f2 = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
         assert_eq!(f1, f2);
         // First one should be aaa
         assert!(
@@ -1674,7 +1698,7 @@ mod tests {
         write_file(&tmp.0, "Build/inside.md", "# inside");
         write_file(&tmp.0, "normal.md", "# normal");
         let reg = Registry::defaults();
-        let files = collect_source_files(&tmp.0, &reg, &["build".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &["build"])).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -1704,7 +1728,7 @@ mod tests {
             .expect("hard links need no privilege");
 
         let reg = Registry::defaults();
-        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -1727,7 +1751,7 @@ mod tests {
         write_file(&tmp.0, "normal.md", "# normal");
 
         let reg = Registry::defaults();
-        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -1753,7 +1777,7 @@ mod tests {
         let reg = Registry::defaults();
         // User overrides DEFAULT_EXCLUDE_DIRS with their own list, forgetting
         // to re-list `.git`. Hardcoded denylist still skips `.git/inside.md`.
-        let files = collect_source_files(&tmp.0, &reg, &["custom".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &["custom"])).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -1776,7 +1800,7 @@ mod tests {
         let reg = Registry::defaults();
         // User explicitly excludes `.obsidian`. Hardcoded denylist also
         // skips `.git`. Both must be skipped (union).
-        let files = collect_source_files(&tmp.0, &reg, &[".obsidian".to_string()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[".obsidian"])).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -1793,6 +1817,66 @@ mod tests {
             !names.iter().any(|n| n == "note.md"),
             "user .obsidian skip failed: {names:?}"
         );
+    }
+
+    /// (feature-49) `.kb-mcpignore` を後から足したファイルは **walk から消える**。
+    ///
+    /// これが index からの退場そのものになる: 削除 pass は「集められなかった =
+    /// 消えた」と扱うので、次の full index で DB の行も落ちる。hardlink refusal
+    /// (BU-20、`test_collect_source_files_skips_hard_links`) と同じ経路で、
+    /// **逆に** `scan_disk_entries` の refusal は `skipped` に入れて既存行を
+    /// 守る — 除外は「もう KB の一部ではない」、refusal は「今回は読めなかった」
+    /// なので、扱いが違うのは意図的。
+    #[test]
+    fn test_collect_source_files_drops_newly_ignored_files() {
+        let tmp = mk_tmp("newlyignored");
+        write_file(&tmp.0, "keep.md", "# keep");
+        write_file(&tmp.0, "drafts/wip.md", "# wip");
+        let reg = Registry::defaults();
+
+        let before = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "both files start out collected: {before:?}"
+        );
+
+        write_file(&tmp.0, ".kb-mcpignore", "drafts/\n");
+        let after = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        let names: Vec<String> = after
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["keep.md".to_string()],
+            "a newly ignored file must leave the walk, which is what removes it \
+             from the index on the next run, got: {names:?}"
+        );
+
+        std::fs::remove_file(tmp.0.join(".kb-mcpignore")).unwrap();
+        let restored = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        assert_eq!(
+            restored.len(),
+            2,
+            "and removing the ignore file brings it back: {restored:?}"
+        );
+    }
+
+    /// The ignore file is not itself a document: it has no registered
+    /// extension, so it never reaches the index whether or not it names itself.
+    #[test]
+    fn test_collect_source_files_never_collects_the_ignore_file() {
+        let tmp = mk_tmp("ignorefileitself");
+        write_file(&tmp.0, "a.md", "# a");
+        write_file(&tmp.0, ".kb-mcpignore", "*.tmp.md\n");
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.md".to_string()], "got: {names:?}");
     }
 
     #[test]
@@ -1812,7 +1896,7 @@ mod tests {
         write_file(&tmp.0, "~$a.md", "owner file"); // ~$ prefix, md 拡張子
         write_file(&tmp.0, ".~lock.a.md#", "lo lock");
         let reg = Registry::defaults();
-        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let files = collect_source_files(&tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
