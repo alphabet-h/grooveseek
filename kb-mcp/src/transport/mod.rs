@@ -62,6 +62,14 @@ pub struct HttpTransportConfig {
     /// 存在を知られない」とは言えない (かつてそう書いていた)。
     #[serde(default)]
     pub healthz_public: Option<bool>,
+
+    /// 同時に生きていられる MCP session の上限 (BU-32)。
+    /// `None` (省略) = 既定の
+    /// [`DEFAULT_MAX_SESSIONS`](crate::transport::http::DEFAULT_MAX_SESSIONS)、
+    /// `0` = 無制限。上限に達している間、新規 session の要求は 429 で断られる
+    /// (既存 session は影響を受けない)。
+    #[serde(default)]
+    pub max_sessions: Option<u32>,
 }
 
 /// `[transport]` config section.
@@ -92,6 +100,8 @@ pub enum Transport {
         /// `true` (default) = 現行挙動 (Host check なし、public)。
         /// `false` = `/healthz` も Host check (= non-allowlisted から 403)。
         healthz_public: bool,
+        /// BU-32: 同時に生きていられる MCP session の上限。`0` = 無制限。
+        max_sessions: u32,
     },
 }
 
@@ -140,10 +150,15 @@ impl Transport {
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.healthz_public)
                     .unwrap_or(true);
+                let max_sessions = cfg
+                    .and_then(|c| c.http.as_ref())
+                    .and_then(|h| h.max_sessions)
+                    .unwrap_or(crate::transport::http::DEFAULT_MAX_SESSIONS);
                 Ok(Transport::Http {
                     addr,
                     allowed_hosts,
                     healthz_public,
+                    max_sessions,
                 })
             }
         }
@@ -235,6 +250,7 @@ mod tests {
                 addr: "127.0.0.1:3100".parse().unwrap(),
                 allowed_hosts: None,
                 healthz_public: true,
+                max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
         );
     }
@@ -248,6 +264,7 @@ mod tests {
                 addr: "127.0.0.1:4000".parse().unwrap(),
                 allowed_hosts: None,
                 healthz_public: true,
+                max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
         );
     }
@@ -267,6 +284,7 @@ mod tests {
                 addr: "0.0.0.0:9000".parse().unwrap(),
                 allowed_hosts: None,
                 healthz_public: true,
+                max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
         );
     }
@@ -300,6 +318,7 @@ mod tests {
                 addr: "127.0.0.1:5555".parse().unwrap(),
                 allowed_hosts: None,
                 healthz_public: true,
+                max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
         );
     }
@@ -339,6 +358,7 @@ mod tests {
                 addr,
                 allowed_hosts,
                 healthz_public: _,
+                max_sessions: _,
             } => {
                 assert_eq!(addr, "0.0.0.0:3100".parse().unwrap());
                 assert_eq!(
@@ -411,6 +431,7 @@ mod tests {
             addr: addr.parse().unwrap(),
             allowed_hosts: None,
             healthz_public: true,
+            max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
         }
     }
 

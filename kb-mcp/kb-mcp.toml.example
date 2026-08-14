@@ -152,6 +152,15 @@ bind = "127.0.0.1:3100"
 # 200. It raises the bar for incidental probes, nothing more.
 #healthz_public = false
 
+# How many MCP sessions may be alive at once (v0.19.0+). The default is 256,
+# which is roughly 25 MB: a live session costs about 100 KB. While the limit is
+# full, a request that would open a NEW session is answered with 429 and a
+# Retry-After header; established sessions keep working. Sessions are released
+# when a client disconnects, and otherwise after rmcp's 5-minute idle timeout,
+# so a client that reconnects in a loop can hold slots for a while. Set 0 to
+# disable the limit entirely.
+#max_sessions = 256
+
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------
 # Only needed if you run `kb-mcp eval`. See docs/eval.md. The commented values
 # are the built-in defaults.

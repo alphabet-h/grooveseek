@@ -116,6 +116,11 @@ bind = "127.0.0.1:3100"
 # the caller, so anyone who can reach the port and sends an allowed value still
 # gets a 200. It raises the bar for incidental probes, nothing more.
 # healthz_public = false
+# How many MCP sessions may be alive at once. Default 256 (~25 MB; a live
+# session costs about 100 KB). While it is full, a request that would open a
+# NEW session gets 429 with a Retry-After header, and established sessions
+# keep working. 0 disables the limit (v0.19.0+).
+# max_sessions = 256
 
 # Optional: `kb-mcp eval` (retrieval quality evaluation, power-user feature).
 # You only need this section if you run `kb-mcp eval` for tuning or
@@ -208,7 +213,7 @@ and who can reach it:
 | Field | From an untrusted config |
 | --- | --- |
 | `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. (Related: `FASTEMBED_CACHE_DIR` must be an absolute path, and the model directory is never resolved relative to the working directory.) |
-| `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts` and `healthz_public` are dropped, restoring the loopback-only `Host` check. `kind` is honoured. |
+| `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts`, `healthz_public`, and `max_sessions` are dropped — the first two restore the loopback-only `Host` check, and the third falls back to the built-in limit, so that a planted `max_sessions = 1` cannot leave the server unable to accept a second client. `kind` is honoured. |
 | `kb_path` | **Ignored with a warning** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. `--kb-path` still applies, so you can override it; with neither, the command stops with the usual "`--kb-path` is required". |
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and

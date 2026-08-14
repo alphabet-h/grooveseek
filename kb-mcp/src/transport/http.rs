@@ -18,7 +18,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rmcp::transport::streamable_http_server::{
@@ -49,6 +49,38 @@ use crate::server::{KbServer, KbServerShared};
 /// body を絞っても守る対象が無い。守るべきは「ネットワーク越しに到達しうる」
 /// HTTP 側だけ。
 pub(crate) const REQUEST_BODY_MAX_BYTES: usize = 1024 * 1024;
+
+/// 同時に生きていられる MCP session の既定上限 (BU-32)。
+///
+/// rmcp 1.4 は session 数の knob を持たない (`StreamableHttpServerConfig` にも
+/// `LocalSessionManager` にも無く、あるのは per-session の `channel_capacity`
+/// と、1 session 内の shadow stream 数を縛る `MAX_SHADOW_STREAMS = 32` だけ)。
+///
+/// 値の根拠は実測 (2026-08-14、release binary、1 本の keep-alive 接続):
+/// **生きた session 1 つあたり約 100 KB**。256 なら約 25 MB で、
+/// エディタ複数 + tray + CI から同時に繋いでも届かない余裕がある。
+/// `[transport.http].max_sessions` で変更でき、`0` は無制限。
+pub(crate) const DEFAULT_MAX_SESSIONS: u32 = 256;
+
+// 既定値の意図を定義の隣で固定する。下限を割ると「複数クライアントの通常運用が
+// 断られる」、上限を超えると「暴走したクライアントが数百 MB を確保できる」。
+// どちらも既定値として選んだ理由に反するので、動かすなら根拠を測り直すこと。
+const _: () = assert!(
+    DEFAULT_MAX_SESSIONS >= 64,
+    "a default this small would refuse ordinary multi-client use"
+);
+const _: () = assert!(
+    DEFAULT_MAX_SESSIONS <= 1024,
+    "at ~100 KB per live session, a default this large stops bounding anything"
+);
+
+/// 上限に達した時に `Retry-After` で返す秒数。
+///
+/// **見込みであって保証ではない**。空きが出るのは他のクライアントが切れた時か、
+/// rmcp の per-session idle timeout (`SessionConfig::keep_alive`、既定 300 秒)
+/// が発火した時で、どちらもこちらからは分からない。30 秒は「待たずに叩き続けるな」
+/// を伝えるための値。
+const SESSION_RETRY_AFTER_SECS: u32 = 30;
 
 // ---------------------------------------------------------------------------
 // (feature-43 PR-2) Admin endpoint response types + small ISO timestamp helper.
@@ -375,6 +407,7 @@ pub async fn run_http(
     addr: SocketAddr,
     allowed_hosts: Option<Vec<String>>,
     healthz_public: bool,
+    max_sessions: u32,
     shared: KbServerShared,
 ) -> Result<()> {
     // bind 範囲と allow-list の組合せが噛み合っていない時に warn を出す。
@@ -410,7 +443,23 @@ pub async fn run_http(
         Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
         None => StreamableHttpServerConfig::default(),
     };
-    let mcp_service = StreamableHttpService::new(factory, session_manager, mcp_config);
+    let mcp_service = StreamableHttpService::new(factory, Arc::clone(&session_manager), mcp_config);
+
+    // (BU-32) `/mcp` だけを門番の配下に置く。`.layer()` を merge 後の app に
+    // 掛けると `/healthz` も `/ui` も `/api/*` も巻き込むので、nest する側で
+    // 閉じておく。
+    let mcp_router: Router =
+        Router::new()
+            .fallback_service(mcp_service)
+            .layer(middleware::from_fn_with_state(
+                McpSessionGate {
+                    live: LiveSessionCount::Rmcp(session_manager),
+                    max_sessions,
+                    admissions: Arc::new(Admissions::default()),
+                    refusals: Arc::new(RefusalLog::new()),
+                },
+                mcp_session_gate,
+            ));
 
     // F-64: `/healthz` を `allowed_hosts` 検証配下に置く opt-in。
     // healthz_public = true (default) の場合は従来通り Host check なしで public。
@@ -443,7 +492,7 @@ pub async fn run_http(
 
     let app = healthz_router
         .merge(admin_router)
-        .nest_service("/mcp", mcp_service)
+        .nest_service("/mcp", mcp_router)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             REQUEST_BODY_MAX_BYTES,
         ));
@@ -474,6 +523,321 @@ pub async fn run_http(
     .await
     .context("axum::serve failed")?;
     Ok(())
+}
+
+/// 生きている MCP session を数える手段。
+///
+/// production では rmcp の `LocalSessionManager` を直接見る (`sessions` は
+/// `pub` な `RwLock<HashMap<..>>` なので、独自 `SessionManager` を実装しなくても
+/// 現在数が読める)。テストからは固定値を差し込む。
+#[derive(Clone)]
+enum LiveSessionCount {
+    Rmcp(Arc<LocalSessionManager>),
+    #[cfg(test)]
+    Fixed(Arc<std::sync::atomic::AtomicUsize>),
+}
+
+impl LiveSessionCount {
+    /// **await せずに**現在数を読む。取れなければ `None`。
+    ///
+    /// 同期であることが要点。予約と解放は同じ [`std::sync::Mutex`] の中で
+    /// 行うので、その中で await できてはいけない (そして await しないからこそ
+    /// `Drop` からも同じ lock を取れる)。rmcp の `sessions` は
+    /// `tokio::sync::RwLock` なので `try_read` が使える。write lock を握って
+    /// いるのは session の挿入 / 削除の一瞬だけ。
+    fn try_get(&self) -> Option<usize> {
+        match self {
+            Self::Rmcp(manager) => manager.sessions.try_read().ok().map(|s| s.len()),
+            #[cfg(test)]
+            Self::Fixed(n) => Some(n.load(std::sync::atomic::Ordering::SeqCst)),
+        }
+    }
+}
+
+/// 上限に達している間の拒否ログを間引く (BU-32)。
+///
+/// 満杯の間は**リクエストごとに**拒否が起きる。実測では 1 秒で 1744 件断り、
+/// そのまま書くと 1744 行出た。daemon は stderr をログファイルに落とすので、
+/// **ログ自体が第 2 の資源枯渇**になる。最初の 1 件は必ず出し、以後は
+/// [`REFUSAL_LOG_EVERY_SECS`] に 1 行へ落として「その間に何件断ったか」を添える。
+struct RefusalLog {
+    started: std::time::Instant,
+    /// 最後に出力した時刻 (started からの秒)。`u64::MAX` = まだ 1 度も出していない。
+    last_logged_secs: std::sync::atomic::AtomicU64,
+    /// 出力を見送った件数。
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+const REFUSAL_LOG_EVERY_SECS: u64 = 60;
+
+impl RefusalLog {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            last_logged_secs: std::sync::atomic::AtomicU64::new(u64::MAX),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 拒否を 1 件記録し、**今ログを出すべきなら**「前回出力してから見送った
+    /// 件数」を返す。ログ出力そのものは呼び出し側が行う (= ここは純粋に
+    /// 判定なので、時刻を注入すればテストできる)。
+    fn record(&self, now_secs: u64) -> Option<u64> {
+        let last = self
+            .last_logged_secs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let due = last == u64::MAX || now_secs.saturating_sub(last) >= REFUSAL_LOG_EVERY_SECS;
+        if due
+            && self
+                .last_logged_secs
+                .compare_exchange(
+                    last,
+                    now_secs,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            // 勝った 1 本だけが出力する。負けた側は下で件数に積む。
+            return Some(
+                self.suppressed
+                    .swap(0, std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+        self.suppressed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+
+    fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
+/// 上限内に席を 1 つ予約する (BU-32、codex review round 1-2 の P1)。
+///
+/// # 数える対象が 2 つに割れている
+///
+/// 通した要求は、**rmcp が map に入れ終えるまで** `live` に現れない。だから
+/// 上限は「生きている数」だけでは測れず、「通したがまだ確定していない数」
+/// (= `in_flight`) を足す必要がある。`live` だけを読んで通していた初版は、
+/// 同時に来た要求が全部同じ「まだ空いている」を見て通ってしまい、
+/// **`max_sessions = 1` でも 16 本同時なら 16 本とも通った** (round 1 の P1)。
+///
+/// # 2 つの数を足すだけでも足りない
+///
+/// `live` と `in_flight` を別々に読むと、その 2 つの読みの**間**に
+/// 「A が insert して席を返す」引き渡しが挟まり得る。B は A を含まない `live`
+/// と、A が抜けた後の `in_flight` を見て、**どちらにも A が数えられていない**
+/// 状態で通ってしまう (round 2 の P1)。
+///
+/// 読む順序を入れ替えて「insert は解放より前に起きる」で論証する案は、
+/// **実測で破れた** (上限 4 に対し 5-6 セッション)。`compare_exchange` は
+/// 「変わっていない」と「変わって戻った」を区別しないので、
+/// `1 → 0 → 1` の間に別の予約が入り、その分を数え落とす。
+///
+/// # なので排他で構造的に閉じる
+///
+/// 「生きている数を読む」「`in_flight` を読む」「1 増やす」を
+/// **[`std::sync::Mutex`] の 1 つの臨界区間**にまとめ、席を返す側も同じ lock を
+/// 取る。これで割り込める場所が存在しなくなる — 論証ではなく形で保証する。
+///
+/// 同期 Mutex を選べるのは、臨界区間で **await しない**から
+/// ([`LiveSessionCount::try_get`] が同期)。そしてそのおかげで、
+/// 要求が打ち切られたときの `Drop` からも同じ lock が取れる
+/// (round 3 の P1: 打ち切り経路だけ lock の外に置くと、そこから同じ穴が開く)。
+///
+/// # write lock と競った場合
+///
+/// `try_get` は rmcp が session を挿入 / 削除している一瞬だけ `None` を返す。
+/// その時は lock を手放して譲り、少し待って読み直す。
+/// [`RESERVE_ATTEMPTS`] 回とも競ったら断る (= 安全側)。
+#[derive(Default)]
+struct Admissions {
+    /// 予約と解放の両方が取る。中身は `in_flight` (= 通したが `live` にまだ
+    /// 現れていない数)。
+    in_flight: std::sync::Mutex<usize>,
+}
+
+/// `try_get` が rmcp の write lock と競った時に読み直す回数。
+const RESERVE_ATTEMPTS: usize = 8;
+
+impl Admissions {
+    async fn try_reserve(
+        self: &Arc<Self>,
+        live: &LiveSessionCount,
+        max_sessions: u32,
+    ) -> Option<AdmissionSeat> {
+        for _ in 0..RESERVE_ATTEMPTS {
+            {
+                // poison から復帰する: 数を 1 つ数え損ねるより、上限が
+                // 恒久的に壊れる方が悪い。
+                let mut in_flight = self
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(now_live) = live.try_get() {
+                    if now_live + *in_flight >= max_sessions as usize {
+                        return None;
+                    }
+                    *in_flight += 1;
+                    return Some(AdmissionSeat {
+                        admissions: Arc::clone(self),
+                    });
+                }
+                // `try_get` が取れなかった。lock を手放してから譲る。
+            }
+            tokio::task::yield_now().await;
+        }
+        None
+    }
+}
+
+/// 予約した 1 席。`Drop` で返る。
+///
+/// 応答を返し終えた通常経路でも、要求が打ち切られた経路でも同じ `Drop` が
+/// 走るので、席の返し方は 1 通りしかない。[`Admissions`] の読み順がその前提
+/// (「insert は解放より前」) だけに依存しているので、これで足りる。
+struct AdmissionSeat {
+    admissions: Arc<Admissions>,
+}
+
+impl Drop for AdmissionSeat {
+    fn drop(&mut self) {
+        // **予約と同じ lock**。ここを外すと、B が 2 つの数を読んでいる最中に
+        // A が抜けられるようになり、上限が漏れる (round 3 の P1)。
+        let mut in_flight = self
+            .admissions
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+    }
+}
+
+/// `/mcp` の前段に入る門番の state (BU-32)。
+#[derive(Clone)]
+struct McpSessionGate {
+    live: LiveSessionCount,
+    /// `0` = 無制限。
+    max_sessions: u32,
+    admissions: Arc<Admissions>,
+    refusals: Arc<RefusalLog>,
+}
+
+/// `/mcp` の前段 middleware。**session を作りに来たリクエストだけ**を見て、
+/// (1) initialize でないものを rmcp に渡さず、(2) 上限に達していれば 429 を返す。
+///
+/// # なぜ rmcp より手前で initialize を弾くのか
+///
+/// rmcp 1.4.0 の `handle_post` は **`create_session()` を「initialize 要求か」の
+/// 検証より先に**呼ぶ。session は既に map へ入っており、続く
+/// `return Err(unexpected_message_response("initialize request"))` (422) は
+/// `close_session` を呼ばない — 後始末を持つ `tokio::spawn` はその後ろにある。
+/// しかも取り残された worker は initialize 前の `recv()` で park し、そこには
+/// keep-alive も cancellation token の arm も無いので**永久に残る**
+/// (rmcp-1.4.0 `streamable_http_server/tower.rs:632-646` と
+/// `session/local.rs:922-928`)。
+///
+/// 実測 (2026-08-14、release binary、**1 本の** keep-alive 接続): セッション無しの
+/// 非 initialize POST を 2000 回で private bytes が 157 → 274 MiB、**1 件あたり
+/// 約 58 KB が解放されない**。所要 1 秒 = 約 117 MiB/秒。認証もセッションも
+/// initialize も要らない。
+///
+/// **上限だけを足すと、これは「無制限のメモリ増加」から「永久に新規 session を
+/// 拒否する DoS」に変わる** — 取り残されたエントリは期限切れにならないので、
+/// 上限を埋められた時点で正規クライアントは二度と繋がらない。だから順序が
+/// 逆にできない: **先に漏れを止め、その上で数える**。
+///
+/// # 何を複製し、何を複製しないか
+///
+/// 判定は「セッション無しの POST の body が、単一の JSON-RPC initialize 要求か」
+/// だけ。これは **MCP 仕様**であって rmcp の実装詳細ではない。
+/// Host / Accept / Content-Type の検証は**複製しない** (F-64 で host 検証を
+/// mirror せず委譲に倒した判断と同じ)。その結果、Accept や Content-Type も
+/// 同時に誤っている非 initialize 要求は、rmcp の 406 / 415 ではなく本 middleware の
+/// 422 を受け取る。どちらも 4xx で、状態は動かず、情報も増えない。
+/// **Host が許可されないリクエストはそもそも rmcp が session を作らない**ので、
+/// 素通しにしても漏れない。
+///
+/// body が JSON として壊れている場合も素通しする。rmcp は
+/// `expect_json` で session 分岐**より前**に落とすので漏れない (実測で確認済み)。
+async fn mcp_session_gate(
+    State(gate): State<McpSessionGate>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // session を作りに来ないリクエストは一切触らない。
+    // 新しい session ができるのは「POST かつ Mcp-Session-Id ヘッダ無し」の時だけ
+    // (rmcp tower.rs:562-568 で header 有りは既存 session 分岐へ行く)。
+    if req.method() != axum::http::Method::POST || req.headers().contains_key("mcp-session-id") {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    // 外側の RequestBodyLimitLayer が既に長さを縛っているので、ここで詰むのは
+    // 壊れた stream の時だけ。
+    let bytes = match axum::body::to_bytes(body, REQUEST_BODY_MAX_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return bad_request_typed("could not read request body"),
+    };
+
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        // JSON として読める。単一の initialize 要求でなければ、rmcp に渡さず
+        // ここで終わらせる (= session が作られないので漏れない)。
+        Ok(value) => {
+            if value.get("method").and_then(|m| m.as_str()) != Some("initialize") {
+                // 文言は rmcp の `unexpected_message_response("initialize request")`
+                // と同一にしてある。クライアントから見て応答が変わらないように。
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "Unexpected message, expect initialize request",
+                )
+                    .into_response();
+            }
+        }
+        // JSON にならない body は rmcp が session 分岐の手前で落とす。
+        Err(_) => {
+            return next
+                .run(Request::from_parts(parts, Body::from(bytes)))
+                .await;
+        }
+    }
+
+    // 予約を取ってから通す。`_seat` は応答を返し終えるまで生き、そこで Drop
+    // が席を返す (= rmcp が session を map に入れ終えた後)。
+    let _seat = if gate.max_sessions > 0 {
+        match gate
+            .admissions
+            .try_reserve(&gate.live, gate.max_sessions)
+            .await
+        {
+            Some(seat) => Some(seat),
+            None => {
+                let live = gate.live.try_get().unwrap_or_default();
+                if let Some(suppressed) = gate.refusals.record(gate.refusals.elapsed_secs()) {
+                    tracing::warn!(
+                        live,
+                        max_sessions = gate.max_sessions,
+                        also_refused_since_the_last_line = suppressed,
+                        "refusing a new MCP session: the concurrent-session limit is full \
+                         (raise [transport.http].max_sessions, or set it to 0 for no limit)"
+                    );
+                }
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", SESSION_RETRY_AFTER_SECS.to_string())],
+                    "Too Many Requests: the concurrent MCP session limit is full",
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 /// F-64: `/healthz` 用 axum middleware。Host header を allowed_hosts と照合し
@@ -1758,5 +2122,436 @@ mod tests {
             "body limit {REQUEST_BODY_MAX_BYTES} leaves too little room for a \
              maximal search request ({worst_case} bytes of filters and query)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BU-32: the `/mcp` session gate.
+    //
+    // `build_router_for_test` は admin sub-router しか組まないので、この門番は
+    // そこからは踏めない。body limit のテストと同じやり方で、**mount の形だけ**
+    // 同じにして rmcp の代わりに dummy service を挟む。門番が守るべき性質は
+    // 2 つで、どちらも「rmcp まで届いたかどうか」で観測する:
+    //   1. session を作らないリクエストには触れないこと
+    //   2. session を作りに来たリクエストのうち、initialize でないものと
+    //      上限超えのものは **rmcp に届かない**こと
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    const OTHER_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+    /// `/mcp` の mount 形状 + 門番。`live` は「今生きている session 数」の
+    /// 代わり、`reached` は dummy service に到達したかどうか。
+    fn gated_mcp_router(live: usize, max_sessions: u32, reached: Arc<AtomicBool>) -> Router {
+        let inner = axum::routing::any(move |_body: axum::body::Bytes| {
+            let reached = Arc::clone(&reached);
+            async move {
+                reached.store(true, Ordering::SeqCst);
+                "forwarded"
+            }
+        });
+        let gate = McpSessionGate {
+            live: LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(live))),
+            max_sessions,
+            admissions: Arc::new(Admissions::default()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let mcp: Router = Router::new()
+            .fallback_service(inner)
+            .layer(middleware::from_fn_with_state(gate, mcp_session_gate));
+        Router::new().nest_service("/mcp", mcp)
+    }
+
+    fn mcp_post(body: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// 漏れを止めている本体。rmcp 1.4 は `create_session()` を「initialize か」の
+    /// 検証より先に呼び、422 で返る経路が `close_session` を呼ばないので、
+    /// **rmcp に届かせないこと**が唯一の防ぎ方になる。
+    #[tokio::test]
+    async fn a_sessionless_post_that_is_not_initialize_never_reaches_the_service() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(0, 256, Arc::clone(&reached));
+
+        let resp = app.oneshot(mcp_post(OTHER_BODY)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            !reached.load(Ordering::SeqCst),
+            "a non-initialize sessionless POST must not reach rmcp: reaching it \
+             creates a session that is never closed"
+        );
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "Unexpected message, expect initialize request",
+            "the wording matches rmcp's own 422 so clients see no change"
+        );
+    }
+
+    /// 正常系: 空きがあれば initialize はそのまま通る。
+    #[tokio::test]
+    async fn an_initialize_post_goes_through_when_there_is_room() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(0, 256, Arc::clone(&reached));
+
+        let resp = app.oneshot(mcp_post(INITIALIZE_BODY)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// 既存 session への後続リクエストは body を見ない。ここを取り違えると
+    /// 「initialize 以外は全部 422」になり、session が張れても何も呼べなくなる。
+    #[tokio::test]
+    async fn a_post_carrying_a_session_id_is_not_inspected() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(0, 256, Arc::clone(&reached));
+
+        let mut req = mcp_post(OTHER_BODY);
+        req.headers_mut()
+            .insert("mcp-session-id", "abc".parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// GET (= SSE stream) と DELETE は session を作らないので素通し。
+    #[tokio::test]
+    async fn a_non_post_request_is_not_inspected() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(0, 256, Arc::clone(&reached));
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// JSON にならない body は rmcp に任せる。rmcp は `expect_json` で
+    /// session 分岐**より前**に落とすので、ここで先回りする必要が無い。
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_left_to_rmcp() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(0, 256, Arc::clone(&reached));
+
+        let resp = app.oneshot(mcp_post("not json at all")).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "rmcp answers malformed bodies itself, and does so without creating \
+             a session"
+        );
+    }
+
+    /// 上限に達している間、新規 session は 429 + Retry-After で断る。
+    #[tokio::test]
+    async fn a_full_session_limit_refuses_a_new_session_with_429() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(4, 4, Arc::clone(&reached));
+
+        let resp = app.oneshot(mcp_post(INITIALIZE_BODY)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some(SESSION_RETRY_AFTER_SECS.to_string().as_str()),
+            "a refusal without Retry-After invites an immediate retry loop"
+        );
+        assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    /// **上限は既存 session を壊さない。** 満杯でも、確立済みの session への
+    /// リクエストは通る。ここが逆になっていると、上限は可用性の改善ではなく
+    /// 全クライアントの切断になる。
+    #[tokio::test]
+    async fn a_full_session_limit_still_serves_established_sessions() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(4, 4, Arc::clone(&reached));
+
+        let mut req = mcp_post(OTHER_BODY);
+        req.headers_mut()
+            .insert("mcp-session-id", "abc".parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// (codex review round 1 の P1) 席の確保は「数を読む」と「1 つ増やす」を
+    /// **1 手**で行うこと。分けると、同時に来た要求がどれも rmcp が map に
+    /// 入れる前の同じ数を読み、全部が通ってしまう。
+    #[tokio::test]
+    async fn a_seat_is_reserved_in_one_step() {
+        let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0)));
+        let admissions = Arc::new(Admissions::default());
+
+        let first = admissions.try_reserve(&live, 1).await;
+        assert!(first.is_some(), "the first request takes the only seat");
+
+        // 生きている数はまだ 0。rmcp が map に入れるのは、通した要求が
+        // 処理を終えた後だから。それでも 2 本目は通ってはいけない。
+        assert!(
+            admissions.try_reserve(&live, 1).await.is_none(),
+            "a concurrent request must not see the seat as still free just \
+             because rmcp has not inserted the session yet"
+        );
+
+        drop(first);
+        assert!(
+            admissions.try_reserve(&live, 1).await.is_some(),
+            "the seat comes back when the request that held it finishes"
+        );
+    }
+
+    /// 打ち切られた要求の席も同じ `Drop` で返る。ここが漏れると、上限が
+    /// じわじわ縮んで最後は誰も繋げなくなる。
+    #[tokio::test]
+    async fn an_abandoned_request_still_returns_its_seat() {
+        let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0)));
+        let admissions = Arc::new(Admissions::default());
+
+        let seat = admissions.try_reserve(&live, 1).await;
+        assert!(seat.is_some());
+        drop(seat); // = 応答を待たずに接続が切れた
+
+        assert!(
+            admissions.try_reserve(&live, 1).await.is_some(),
+            "a seat whose request was dropped must not stay taken"
+        );
+    }
+
+    /// (codex review round 1-3) 同時に来ても上限を超えないこと。
+    ///
+    /// dummy service が rmcp の insert を演じる — 応答を返す**前**に `live` を
+    /// 1 増やすので、「通したがまだ `live` に現れていない」状態が実際に生じる。
+    ///
+    /// **検査するのは「上限を超えない」ことだけ**で、「ちょうど上限まで埋まる」
+    /// ことではない。`in_flight` を数える以上、解放待ちの席を空きと見なさない
+    /// 分だけ保守的に断ることがあり、それは安全な側への外れ。
+    ///
+    /// なお round 2-3 で問題になった「`live` を読んでから `in_flight` を読む
+    /// までの隙間」は、いまは [`Admissions`] が 3 つの操作を 1 つの臨界区間に
+    /// まとめているので**構造的に存在しない**。存在しない隙間は注入して
+    /// 観測することもできないので、その一点を狙って mutation で殺せる test は
+    /// 無い — 代わりに「隙間を作らない」ことを lock で保証している。
+    /// この test が殺せるのは round 1 の形 (数を読むだけで通す) の方。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cap_is_never_exceeded_across_the_handoff_to_live() {
+        const CAP: u32 = 4;
+        let live_count = Arc::new(AtomicUsize::new(0));
+        let admitted = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let live_count = Arc::clone(&live_count);
+            let admitted = Arc::clone(&admitted);
+            axum::routing::any(move |_body: axum::body::Bytes| {
+                let live_count = Arc::clone(&live_count);
+                let admitted = Arc::clone(&admitted);
+                async move {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    // rmcp が session を map に入れるのに相当。応答を返す前に
+                    // 起きる = 席が返るより前。
+                    tokio::task::yield_now().await;
+                    live_count.fetch_add(1, Ordering::SeqCst);
+                    "forwarded"
+                }
+            })
+        };
+        let gate = McpSessionGate {
+            live: LiveSessionCount::Fixed(Arc::clone(&live_count)),
+            max_sessions: CAP,
+            admissions: Arc::new(Admissions::default()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let mcp: Router = Router::new()
+            .fallback_service(inner)
+            .layer(middleware::from_fn_with_state(gate, mcp_session_gate));
+        let app: Router = Router::new().nest_service("/mcp", mcp);
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                app.oneshot(mcp_post(INITIALIZE_BODY))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        let mut ok = 0;
+        for h in handles {
+            if h.await.unwrap() == StatusCode::OK {
+                ok += 1;
+            }
+        }
+
+        let live = live_count.load(Ordering::SeqCst);
+        assert!(
+            live <= CAP as usize,
+            "the cap must hold while sessions move from in-flight to live: \
+             {live} sessions exist with max_sessions = {CAP}"
+        );
+        assert_eq!(
+            ok, live,
+            "every admitted request created a session, and no refused one did"
+        );
+        assert_eq!(admitted.load(Ordering::SeqCst), ok);
+        assert!(ok > 0, "the gate must not refuse everything");
+    }
+
+    /// 上限は「生きている数 + 通したがまだ確定していない数」に掛かる。
+    #[tokio::test]
+    async fn live_sessions_and_in_flight_admissions_share_the_cap() {
+        let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(3)));
+        let admissions = Arc::new(Admissions::default());
+
+        let seat = admissions.try_reserve(&live, 4).await;
+        assert!(seat.is_some(), "3 live + 0 in flight is under a cap of 4");
+        assert!(
+            admissions.try_reserve(&live, 4).await.is_none(),
+            "3 live + 1 in flight already fills a cap of 4"
+        );
+    }
+
+    /// 同じことを HTTP 側から。門番を抜けた要求は dummy service で待たされる
+    /// ので、**全員が門番の中にいる状態**が作れる。予約が無ければ 16 本とも
+    /// 通り、`entered` が 16 になる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_initialize_requests_cannot_overshoot_the_cap() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let inner = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            axum::routing::any(move |_body: axum::body::Bytes| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    "forwarded"
+                }
+            })
+        };
+        let gate = McpSessionGate {
+            live: LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0))),
+            max_sessions: 1,
+            admissions: Arc::new(Admissions::default()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let mcp: Router = Router::new()
+            .fallback_service(inner)
+            .layer(middleware::from_fn_with_state(gate, mcp_session_gate));
+        let app: Router = Router::new().nest_service("/mcp", mcp);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                app.oneshot(mcp_post(INITIALIZE_BODY))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+
+        // 通った 1 本は dummy の中で止まり、断られた 15 本は即座に返る。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "a cap of 1 must admit exactly one of 16 simultaneous requests"
+        );
+
+        release.notify_waiters();
+        let mut ok = 0;
+        let mut refused = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::TOO_MANY_REQUESTS => refused += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert_eq!((ok, refused), (1, 15));
+    }
+
+    /// 拒否ログの間引き。満杯の間は毎リクエスト拒否が起きるので、そのまま
+    /// 書くと**ログが第 2 の資源枯渇**になる (実測: 1 秒で 1744 行)。
+    /// 時刻は注入するので、テストは待たない。
+    #[test]
+    fn refusal_logging_is_thinned_but_never_silent() {
+        let log = RefusalLog::new();
+
+        // 最初の 1 件は必ず出す。見送りはまだ 0 件。
+        assert_eq!(log.record(0), Some(0), "the first refusal must be visible");
+
+        // 同じ窓の中は出さない。
+        for t in 1..REFUSAL_LOG_EVERY_SECS {
+            assert_eq!(log.record(t), None, "second line inside the same window");
+        }
+
+        // 窓を跨いだら 1 行出し、その間に見送った件数を添える。
+        assert_eq!(
+            log.record(REFUSAL_LOG_EVERY_SECS),
+            Some(REFUSAL_LOG_EVERY_SECS - 1),
+            "the next line reports how many refusals it stands for"
+        );
+
+        // カウンタは持ち越さない。
+        assert_eq!(log.record(REFUSAL_LOG_EVERY_SECS + 1), None);
+        assert_eq!(log.record(REFUSAL_LOG_EVERY_SECS * 2), Some(1));
+    }
+
+    /// `max_sessions = 0` は無制限。数を数えている経路そのものを止める。
+    #[tokio::test]
+    async fn a_zero_limit_means_no_limit() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(100_000, 0, Arc::clone(&reached));
+
+        let resp = app.oneshot(mcp_post(INITIALIZE_BODY)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// 上限**未満**なら通る = 境界の向きが `>=` であること。`>` だと
+    /// `max_sessions` 個目の次に 1 つ余分に張れる。
+    #[tokio::test]
+    async fn the_limit_admits_up_to_but_not_including_the_cap() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(3, 4, Arc::clone(&reached));
+        let resp = app.oneshot(mcp_post(INITIALIZE_BODY)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "3 live with a cap of 4 fits");
+        assert!(reached.load(Ordering::SeqCst));
+
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(4, 4, Arc::clone(&reached));
+        let resp = app.oneshot(mcp_post(INITIALIZE_BODY)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 5th session with a cap of 4 is refused"
+        );
+        assert!(!reached.load(Ordering::SeqCst));
     }
 }

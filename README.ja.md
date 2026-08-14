@@ -115,6 +115,11 @@ bind = "127.0.0.1:3100"
 # **認証ではない**: Host ヘッダは呼び出し元が自由に付けられるので、ポートに
 # 到達できて許可値を送れば 200 が返る。偶発的な探索の敷居を上げるだけ。
 # healthz_public = false
+# 同時に生きていられる MCP session の数。既定 256 (= 約 25 MB。生きた session
+# 1 つが約 100 KB)。満杯の間、**新規** session を開こうとするリクエストは
+# Retry-After 付きの 429 になり、確立済みの session はそのまま使える。
+# 0 で無制限 (v0.19.0+)。
+# max_sessions = 256
 
 # 任意: `kb-mcp eval` (retrieval 品質評価、パワーユーザ機能)。
 # モデル比較や回帰追跡のために `kb-mcp eval` を使うときだけ必要。
@@ -203,7 +208,7 @@ bind = "127.0.0.1:3100"
 | フィールド | 信頼しない config の場合 |
 | --- | --- |
 | `fastembed_cache_dir` | 警告して無視し、標準のキャッシュディレクトリを使う。どの `.onnx` を読むかを決める値であり、キャッシュに既にあるモデルは検証されないため (関連: `FASTEMBED_CACHE_DIR` は絶対パス必須で、モデルディレクトリが CWD 相対に解決されることは無い) |
-| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` と `healthz_public` は破棄し、loopback 限定の `Host` チェックに戻す。`kind` は尊重する |
+| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `healthz_public` / `max_sessions` は破棄する — 前 2 つは loopback 限定の `Host` チェックに戻し、3 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`kind` は尊重する |
 | `kb_path` | ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指していれば**警告して無視**。`--kb-path` は従来どおり効くので上書きでき、どちらも無ければ通常どおり「`--kb-path` is required」で停止する |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
