@@ -29,6 +29,8 @@ pub(crate) mod poison;
 /// The MCP `prompts` surface (B-3): a fixed set of named recipes over the tools.
 pub mod prompts;
 pub mod quality;
+/// The MCP `resources` surface (B-2): `kb://` URIs over the indexed corpus.
+pub mod resources;
 pub mod schema;
 pub mod schema_compat;
 pub mod server;

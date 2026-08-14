@@ -184,13 +184,13 @@ fn the_advertised_capabilities_are_exactly_what_is_implemented() {
         }),
     );
     let from_initialize = &init["result"]["capabilities"];
-    for present in ["tools", "prompts"] {
+    for present in ["tools", "prompts", "resources"] {
         assert!(
             from_initialize.get(present).is_some(),
             "{present} is implemented and must be advertised: {init}"
         );
     }
-    for absent in ["resources", "completions", "logging"] {
+    for absent in ["completions", "logging"] {
         assert!(
             from_initialize.get(absent).is_none(),
             "{absent} is not implemented and must not be advertised: {init}"

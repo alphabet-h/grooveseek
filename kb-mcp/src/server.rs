@@ -573,6 +573,60 @@ impl KbCore {
         }
     }
 
+    /// The topic groups `resources/list` answers from.
+    ///
+    /// Built from the indexed paths, which is the same list a read is checked
+    /// against — so a URI this listing offers cannot fail membership when the
+    /// client reads it back.
+    fn topic_groups_blocking(&self) -> Result<Vec<crate::resources::TopicGroup>, String> {
+        let db = recover_db(self.db.lock());
+        db.all_document_paths()
+            .map(|paths| crate::resources::topic_groups(&paths))
+            .map_err(|e| format!("failed to list indexed documents: {e}"))
+    }
+
+    /// Serve one `kb://` URI, or say why not.
+    fn read_resource_blocking(
+        &self,
+        parsed: &crate::resources::ResourceUri,
+        uri: &str,
+    ) -> Result<String, String> {
+        let paths = {
+            let db = recover_db(self.db.lock());
+            db.all_document_paths()
+                .map_err(|e| format!("failed to list indexed documents: {e}"))?
+        };
+
+        match parsed {
+            crate::resources::ResourceUri::Topic(prefix) => {
+                let group = crate::resources::topic_groups(&paths)
+                    .into_iter()
+                    .find(|g| &g.prefix == prefix)
+                    .ok_or_else(|| format!("no such topic group: {uri}"))?;
+                let mut out = format!("# {}\n\n{}\n\n", group.display_name(), group.description());
+                for p in &group.paths {
+                    out.push_str(&format!("- `{p}` — {}\n", crate::resources::doc_uri(p)));
+                }
+                Ok(out)
+            }
+            crate::resources::ResourceUri::Doc(rel) => {
+                // Membership first. A document that is not indexed was never
+                // offered, and `resources/read` is for what was offered — this
+                // is strictly narrower than `get_document`, so it cannot widen
+                // what is reachable.
+                if !paths.iter().any(|p| p == rel) {
+                    return Err(format!("not an indexed document: {uri}"));
+                }
+                // Then exactly the guards `get_document` applies, by calling it:
+                // symlink and hard-link refusal, traversal, extension
+                // membership, size cap, and a handle-bound read. Reusing the
+                // body rather than re-deriving it is the point — a second
+                // extraction path is how the two would come to disagree.
+                Ok(self.get_document_blocking(GetDocumentParams { path: rel.clone() }))
+            }
+        }
+    }
+
     fn get_document_blocking(&self, params: GetDocumentParams) -> String {
         // (BU-22) Both caps go in; `validate_get_document_path` picks between
         // them from the canonical extension, which is the same one its
@@ -1026,10 +1080,160 @@ impl ServerHandler for KbServer {
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
+            .enable_resources()
             .build();
         info.server_info = me;
         info
     }
+
+    /// One resource per topic group, never one per document.
+    ///
+    /// The reasoning is in [`crate::resources`] and ADR-0004; the short version
+    /// is that a listing is a promise the client pays for on every connect, and
+    /// a knowledge base has hundreds of documents but tens of groups. Individual
+    /// documents are reachable through the `kb://doc/{path}` template and the
+    /// `uri` on every `search` hit, which the specification permits explicitly.
+    ///
+    /// Single page. `nextCursor` is omitted, which is a conforming single-page
+    /// implementation and sidesteps the client-side pagination bugs the survey
+    /// turned up.
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        let core = Arc::clone(&self.core);
+        // Two layers: the outer one is "did the blocking task survive", the
+        // inner one is "did the query succeed".
+        let groups = run_blocking_typed("list_resources", move || core.topic_groups_blocking())
+            .await
+            .map_err(internal_error)?
+            .map_err(internal_error)?;
+
+        let resources = groups
+            .into_iter()
+            .map(|g| {
+                let mut r = rmcp::model::Resource::new(g.uri(), g.display_name());
+                r.description = Some(g.description());
+                r.mime_type = Some("text/markdown".to_string());
+                r
+            })
+            .collect();
+        Ok(with_cache_hints(
+            rmcp::model::ListResourcesResult::with_all_items(resources),
+        ))
+    }
+
+    /// The one template: every indexed document, by its relative path.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, rmcp::ErrorData> {
+        let mut t = rmcp::model::ResourceTemplate::new(
+            crate::resources::doc_uri_template(),
+            "Indexed document",
+        );
+        t.description = Some(
+            "One indexed document, addressed by its path relative to the knowledge base. \
+             Every `search` hit carries the matching `uri`."
+                .to_string(),
+        );
+        t.mime_type = Some("text/markdown".to_string());
+        Ok(with_cache_hints(
+            rmcp::model::ListResourceTemplatesResult::with_all_items(vec![t]),
+        ))
+    }
+
+    /// Read one `kb://` URI.
+    ///
+    /// A document is served only if it is **in the index** and then only through
+    /// the same four checks `get_document` applies. That is deliberately
+    /// narrower than `get_document`, and the reasoning is not the one ADR-0003
+    /// rejected: this does not trust a file inside the knowledge base to police
+    /// the knowledge base, it trusts kb-mcp's own database. A resource is
+    /// something the server offered; reading a URI that was never on offer is a
+    /// different operation from fetching a path the caller already knew.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        let uri = request.uri.clone();
+        let parsed = crate::resources::parse(&uri).ok_or_else(|| {
+            rmcp::ErrorData::resource_not_found(
+                format!("not a resource this server serves: {uri}"),
+                None,
+            )
+        })?;
+
+        let core = Arc::clone(&self.core);
+        let uri_for_body = uri.clone();
+        let text = run_blocking_typed("read_resource", move || {
+            core.read_resource_blocking(&parsed, &uri_for_body)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(|e| rmcp::ErrorData::resource_not_found(e, None))?;
+
+        let contents = vec![rmcp::model::ResourceContents::text(text, uri)];
+        Ok(rmcp::model::ReadResourceResult::new(contents).into())
+    }
+}
+
+/// The caching hints the specification requires on any result carrying
+/// `resultType: "complete"`.
+///
+/// rmcp models them as `Option` and leaves them `None` — its own doc says
+/// "Required by spec version 2026-07-28, but optional here" — so only the paths
+/// that set them conform. The tool and prompt macros do; a hand-written handler
+/// has to. `0` means "treat as stale immediately", which is the honest answer
+/// for a listing backed by an index a watcher keeps changing.
+fn with_cache_hints<T: CacheHinted>(result: T) -> T {
+    result
+        .with_ttl_ms(0)
+        .with_cache_scope(rmcp::model::CacheScope::Public)
+}
+
+/// The two setters every paginated list result carries, so [`with_cache_hints`]
+/// can be written once.
+trait CacheHinted: Sized {
+    fn with_ttl_ms(self, ttl_ms: u64) -> Self;
+    fn with_cache_scope(self, scope: rmcp::model::CacheScope) -> Self;
+}
+
+macro_rules! impl_cache_hinted {
+    ($($t:ty),+ $(,)?) => {$(
+        impl CacheHinted for $t {
+            fn with_ttl_ms(self, ttl_ms: u64) -> Self { <$t>::with_ttl_ms(self, ttl_ms) }
+            fn with_cache_scope(self, scope: rmcp::model::CacheScope) -> Self {
+                <$t>::with_cache_scope(self, scope)
+            }
+        }
+    )+};
+}
+impl_cache_hinted!(
+    rmcp::model::ListResourcesResult,
+    rmcp::model::ListResourceTemplatesResult,
+);
+
+fn internal_error(e: String) -> rmcp::ErrorData {
+    rmcp::ErrorData::internal_error(e, None)
+}
+
+/// [`run_blocking`] for handlers that return something other than a JSON string.
+///
+/// Same obligation as every tool handler (BU-06): the body does its work on the
+/// blocking pool, never on an async worker.
+async fn run_blocking_typed<T, F>(what: &'static str, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        tracing::error!(handler = what, error = %e, "handler body panicked on the blocking pool");
+        format!("{what} failed: the request panicked ({e})")
+    })
 }
 
 // ---------------------------------------------------------------------------
