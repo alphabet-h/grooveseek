@@ -236,9 +236,17 @@ environment when the service later runs.
 
 A service registered by an earlier version keeps its old launch line. To update
 it, re-run **your own** `kb-mcp service install` command with `--force` added —
-a bare `service install` would reset the service name, auto-start and bind. The
-new line takes effect the next time the service starts; re-registering does not
-restart a daemon that is already running.
+a bare `service install` would reset the service name, auto-start and bind.
+
+**Set `KB_MCP_CONFIG_HOME` again if you set it the first time.** It is not
+remembered anywhere: `service install` resolves the config home from the
+environment it is run in, so without the variable the re-install writes a
+*different*, minimal config and points the service at that one, leaving your
+real settings unused. This applies to precisely the people the fix is for.
+
+On Linux and macOS the re-install restarts the service, so the new launch line
+takes effect immediately. On Windows the scheduled task is re-registered but the
+running daemon is not stopped — sign out and back in, or stop it first.
 
 **What this does not cover**: if a repository ships its own `.mcp.json`, it
 controls the whole command line, not just the config file. No rule inside

@@ -40,10 +40,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the next logon, with the daemon's stdio nulled by `kb-mcp-svc`.
 
   **A service registered by an earlier version keeps its old launch line.**
-  Re-run your own `kb-mcp service install` command with `--force` added; the new
-  line takes effect the next time the service starts, and re-registering does
-  not restart a daemon that is already running. Default installs were never
-  affected — `dirs::config_dir()` is available at start-up too.
+  Re-run your own `kb-mcp service install` command with `--force` added — and set
+  `KB_MCP_CONFIG_HOME` again if you set it the first time, since the config home
+  is resolved from the environment of the install command and is not remembered
+  anywhere. Without it the re-install writes a different, minimal config and
+  points the service at that, which would hit exactly the people this fix is for.
+  Default installs were never affected — `dirs::config_dir()` is available at
+  start-up too.
+
+  Re-installing now also restarts the service on Linux and macOS, so the new
+  launch line takes effect immediately. It had to: `launchctl bootstrap` does not
+  replace an already-loaded job — it fails — so `--force` over a running agent
+  errored out *and* left launchd holding the old `ProgramArguments`. The macOS
+  backend now boots the job out first (best-effort, as `uninstall` already did),
+  and the Linux backend uses `systemctl restart` where `start` was a no-op over a
+  running unit. Windows still leaves the running daemon alone; sign out and back
+  in, or stop it first.
 
   Along the way, `systemd_exec_word` now escapes `$` as `$$` — systemd expands
   `${FOO}` in a command line **including inside quotes**, and a config home such

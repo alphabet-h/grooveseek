@@ -53,7 +53,13 @@ impl ServiceBackend for SystemdUser {
         if ctx.auto_start {
             let name = format!("kb-mcp-{}.service", ctx.service_name);
             run_systemctl(&["enable", &name])?;
-            run_systemctl(&["start", &name])?;
+            // `restart`, not `start`: on a fresh install the two are the same,
+            // but over an already-running unit `start` is a no-op and the daemon
+            // keeps running with the previous `ExecStart`. That matters now that
+            // the launch line carries `--config` — `install --force` has to be
+            // the way an existing service picks it up (same reason as the
+            // `bootout` in the macOS backend, codex P2 round 2 on PR #156).
+            run_systemctl(&["restart", &name])?;
         }
         eprintln!(
             "Note: run 'sudo loginctl enable-linger $USER' to keep the service running after logout."
