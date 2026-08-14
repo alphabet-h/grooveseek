@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
-use rmcp::{tool, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Database, SearchHit};
@@ -907,7 +908,7 @@ where
 /// pool. Keep it that way: a handler that touches `db` / `embedder` /
 /// `reranker` directly re-introduces the runtime starvation described on
 /// [`KbCore`], and `tool_handlers_do_not_block_the_runtime` will fail.
-#[tool_router(server_handler)]
+#[tool_router]
 impl KbServer {
     #[tool(
         name = "search",
@@ -976,6 +977,54 @@ impl KbServer {
             core.get_connection_graph_blocking(params)
         })
         .await
+    }
+}
+
+/// What the server says about itself, and which capabilities it declares.
+///
+/// Written out rather than macro-generated. `#[tool_router(server_handler)]`
+/// generates the whole `impl ServerHandler`, and a generated impl cannot be
+/// extended — so the `get_info` it supplies is whatever rmcp's default is, and
+/// there is nowhere to add a second capability later. That default was
+/// visible on the wire: `initialize` answered
+/// `serverInfo {"name":"rmcp","version":"3.1.2"}`, because the macro fills it
+/// from **rmcp's** build environment. Clients display that.
+///
+/// Splitting it into `#[tool_router]` (which still generates the router) plus a
+/// hand-written `#[tool_handler] impl` changes nothing else: measured before
+/// and after the split, `tools/list` is byte-identical — all six tools, their
+/// schemas, and the `ttlMs` / `cacheScope` hints the macro already sets — and
+/// `initialize` differs only in the two `serverInfo` fields this fixes.
+///
+/// **Adding a capability here is adding an obligation, not a method.** Measured
+/// on this same build: `prompts/list`, `resources/list` and
+/// `resources/templates/list` already answer successfully with empty arrays
+/// even though nothing is declared, because `ServerHandler`'s defaults return
+/// `Ok(default())`. Declaring a capability does not make a method appear; it
+/// makes clients start asking. Declaring one whose list stays empty is strictly
+/// worse than not declaring it — round-trips that return nothing.
+///
+/// A hand-written list handler must also set the caching hints itself. The spec
+/// requires `ttlMs` and `cacheScope` on any result carrying
+/// `resultType: "complete"`; rmcp models them as `Option` and leaves them
+/// `None` (its own doc says "Required by spec version 2026-07-28, but optional
+/// here"), so only the paths that set them are conforming. The tool macro does.
+/// The trait defaults do not.
+#[tool_handler]
+impl ServerHandler for KbServer {
+    fn get_info(&self) -> ServerInfo {
+        // `ServerInfo` and `Implementation` are `#[non_exhaustive]`, so a
+        // struct literal will not compile against them from this crate: build
+        // from `Default` and assign.
+        let mut me = Implementation::default();
+        me.name = env!("CARGO_PKG_NAME").to_string();
+        me.version = env!("CARGO_PKG_VERSION").to_string();
+
+        let mut info = ServerInfo::default();
+        info.protocol_version = ProtocolVersion::LATEST;
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info = me;
+        info
     }
 }
 
@@ -3953,10 +4002,10 @@ mod tests {
         // extraction would silently yield an empty block.
         let src = include_str!("server.rs").replace("\r\n", "\n");
 
-        const MARKER: &str = "#[tool_router(server_handler)]\nimpl KbServer {";
-        let start = src.find(MARKER).expect(
-            "the `#[tool_router(server_handler)] impl KbServer` block moved or was renamed",
-        );
+        const MARKER: &str = "#[tool_router]\nimpl KbServer {";
+        let start = src
+            .find(MARKER)
+            .expect("the `#[tool_router] impl KbServer` block moved or was renamed");
         let rest = &src[start + MARKER.len()..];
         // The impl block ends at the first `}` in column 0; everything nested
         // inside it is indented.
