@@ -149,13 +149,40 @@ fn size_cap_exceeded(
     max_binary: u64,
     max_text: u64,
 ) -> std::io::Result<Option<(u64, u64)>> {
-    let cap = if is_binary_ext { max_binary } else { max_text };
+    let cap = applicable_cap(is_binary_ext, max_binary, max_text);
     let meta = std::fs::metadata(path)?;
     Ok(if meta.len() > cap {
         Some((meta.len(), cap))
     } else {
         None
     })
+}
+
+/// Which of the two caps applies to an extension.
+///
+/// (BU-20) Split out because the same number is now needed twice: once by
+/// [`size_cap_exceeded`], which stats the **path** before deciding whether to
+/// open it at all, and once by `links::read_checked`, which enforces it on the
+/// **handle** the bytes come from. The path form is the cheap pre-check; the
+/// handle form is the one that cannot be swapped past. They must agree on the
+/// limit, so neither computes it itself.
+fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
+    if is_binary_ext { max_binary } else { max_text }
+}
+
+/// Read a file for indexing through a handle whose identity has been checked
+/// (BU-20), turning a refusal into the per-file skip every caller already does.
+///
+/// `Ok(None)` means "skip this file, and say why on stderr"; `Err` keeps
+/// `std::fs::read`'s meaning so existing read-error handling is unchanged.
+fn read_for_index(full: &Path, rel: &str, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    match crate::links::read_checked(full, cap)? {
+        crate::links::Content::Bytes(bytes) => Ok(Some(bytes)),
+        crate::links::Content::Refused(refused) => {
+            eprintln!("Skipping {rel}: {}", refused.log_line(full));
+            Ok(None)
+        }
+    }
 }
 
 /// 超過警告に使う「binary」/「text」の語。cap が拡張子で決まるので、
@@ -206,14 +233,25 @@ fn scan_disk_entries(
             }
         }
 
-        match std::fs::read(p) {
-            Ok(bytes) => {
+        // (BU-20) The walk already refused hard links; this catches one that
+        // arrived between the walk and now. A refusal joins `skipped`, like
+        // every other reason this loop declines a file: the *new* bytes are
+        // what is being refused, the row already in the database came from
+        // bytes that were legitimate when they were read, and the next full
+        // run's walk-time check is what evicts it — which is where that
+        // decision belongs (§4.2, skip preserves).
+        let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
+        match read_for_index(p, &rel, cap) {
+            Ok(Some(bytes)) => {
                 let hash = sha256_hex_bytes(&bytes);
                 entries.push(DiskEntry {
                     rel,
                     hash,
                     full: p.clone(),
                 });
+            }
+            Ok(None) => {
+                skipped.push(rel);
             }
             Err(e) => {
                 eprintln!("Skipping {rel}: failed to read: {e}");
@@ -592,8 +630,21 @@ fn index_single_disk_entry(
             reason: "no parser for extension",
         });
     };
-    let bytes = match std::fs::read(&entry.full) {
-        Ok(b) => b,
+    // (BU-20) The bytes that become chunks come from a handle whose link count,
+    // file type and size were all read off that same handle — this is the read
+    // a swapped-in hard link has to get past, and cannot.
+    let cap = applicable_cap(
+        parser.is_binary(),
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    );
+    let bytes = match read_for_index(&entry.full, &entry.rel, cap) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return Ok(SingleResult::Skipped {
+                reason: "refused: not the plain, single-named file that was collected",
+            });
+        }
         Err(e) => {
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
@@ -797,8 +848,18 @@ pub fn reindex_single_file(
         });
     }
 
-    let bytes =
-        std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
+    let cap = applicable_cap(
+        is_binary_ext,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    );
+    let Some(bytes) = read_for_index(&full, rel, cap)
+        .with_context(|| format!("failed to read {}", full.display()))?
+    else {
+        return Ok(SingleResult::Skipped {
+            reason: "refused: not the plain, single-named file the watcher saw",
+        });
+    };
     let hash = sha256_hex_bytes(&bytes);
     let entry = DiskEntry {
         rel: rel.to_string(),
@@ -843,6 +904,17 @@ pub enum RenameOutcome {
     /// content_hash は旧内容のまま据え置き、次回 full rebuild の
     /// `scan_disk_entries` の size-cap 判定に委ねる (§4.2 skip 統一原則)。
     RenamedSizeCapped,
+    /// (BU-20) path は UPDATE 済だが、新 path を開いた handle が
+    /// 「集めた時のファイルではない」と答えた (hardlink / symlink / 非通常
+    /// ファイル / handle 側の size 超過) ため hash 再計算 / reindex はスキップした。
+    ///
+    /// **`RenamedSizeCapped` と同じ形が要る理由**: `rename_document` は既に
+    /// commit 済みなので、ここで `Err` を返すと「旧 content が新 path に付いた
+    /// まま、ログ上は I/O 失敗と区別できない」状態になる。専用の variant に
+    /// することで、呼び出し側と読み手の両方に「rename は成立、内容は据え置き、
+    /// 理由は refusal」と伝わる。DB の content_hash は旧内容のままで、
+    /// 次回 full rebuild の walk-time check が row ごと取り除く。
+    RenamedButRefused,
 }
 
 /// 単一ファイルの rename を処理する。
@@ -899,8 +971,16 @@ pub fn rename_single_file(
         return Ok(RenameOutcome::RenamedSizeCapped);
     }
 
-    let new_bytes =
-        std::fs::read(&full).with_context(|| format!("failed to read {}", full.display()))?;
+    let cap = applicable_cap(
+        is_binary_ext,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    );
+    let Some(new_bytes) = read_for_index(&full, new_rel, cap)
+        .with_context(|| format!("failed to read {}", full.display()))?
+    else {
+        return Ok(RenameOutcome::RenamedButRefused);
+    };
     let new_hash = sha256_hex_bytes(&new_bytes);
 
     // codex P2 round 2 (finding A): watcher は config-desired を持たないので
@@ -1736,6 +1816,58 @@ mod tests {
         let entry_rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
         assert_eq!(entry_rels, vec!["ok.md"]);
         assert_eq!(scan.skipped, vec!["gone.md".to_string()]);
+    }
+
+    /// (BU-20) The walk refuses hard links, but it hands `scan_disk_entries` a
+    /// list of *paths* and the bytes are read here — so a file that became a
+    /// hard link in between has to be caught at the read. Passing the link in
+    /// `source_files` is exactly that situation: the collect step accepted it.
+    ///
+    /// It joins `skipped`, not the silently-dropped set: the row already in the
+    /// database was indexed from bytes that were legitimate when they were
+    /// read, and evicting it is the walk's job on the next full run.
+    #[test]
+    fn test_scan_disk_entries_refuses_a_hard_link_that_appeared_after_the_walk() {
+        let tmp = mk_tmp("scanhardlink");
+        write_file(&tmp.0, "ok.md", "# ok");
+        write_file(&tmp.0, "secret.txt", "ssh-rsa AAAA...");
+        let linked = tmp.0.join("notes.md");
+        std::fs::hard_link(tmp.0.join("secret.txt"), &linked)
+            .expect("hard links need no privilege");
+
+        let reg = Registry::defaults();
+        let source = vec![tmp.0.join("ok.md"), linked];
+        let scan = scan_disk_entries(
+            &source,
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        );
+
+        let entry_rels: Vec<&str> = scan.entries.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(
+            entry_rels,
+            vec!["ok.md"],
+            "the hard link's bytes must never reach an entry"
+        );
+        assert_eq!(scan.skipped, vec!["notes.md".to_string()]);
+    }
+
+    /// The other half of the same wiring: a plain file still reads, so the test
+    /// above is not passing because the read is broken for everything.
+    #[test]
+    fn test_read_for_index_returns_bytes_for_an_ordinary_file() {
+        let tmp = mk_tmp("readforindex");
+        write_file(&tmp.0, "a.md", "# A");
+        let bytes = read_for_index(
+            &tmp.0.join("a.md"),
+            "a.md",
+            crate::parser::MAX_RAW_TEXT_BYTES,
+        )
+        .expect("an ordinary file must not error")
+        .expect("an ordinary file must not be refused");
+        assert_eq!(bytes, b"# A");
     }
 
     #[test]
