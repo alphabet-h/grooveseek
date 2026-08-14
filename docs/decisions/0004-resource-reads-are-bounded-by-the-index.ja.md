@@ -87,6 +87,11 @@ v0.22.0 で kb-mcp に MCP の `resources` capability が入った。クライ�
   `text/markdown`、抽出テキストとして出すものは `text/plain`。PDF は
   kb-mcp が抽出したテキストとして返るので、`application/pdf` と名乗るのは
   クライアントが手にしているバイト列について嘘をつくことになる
+- **保証しないこと**: 提示した URI が必ず読めること。この filter が外すのは
+  「設定として安定して分かっている不一致」だけで、残りは**その瞬間の条件**
+  (index 後に消された / hard link が rename で被せられた / size cap を超えた) であり、
+  listing のたびに corpus 全体を stat しない限り答えられない。これらは read 時の
+  拒否として現れる — `get_document` と同じ答え方
 - 現在の parser registry が扱わない拡張子の行は、索引には残る (`[parsers].enabled`
   を狭めても削除しない) が**提示はしない**: `resources/list` に出ず、
   `resources/read` でも読めず、`search` hit にも `uri` キーが付かない。

@@ -97,6 +97,13 @@ is a property of a single list or of neither.
   for Markdown, `text/plain` for anything delivered as extracted text. A PDF
   comes back as the text kb-mcp extracted from it, so calling it
   `application/pdf` would misdescribe the bytes the client is holding.
+- What this does **not** promise: that every offered URI reads successfully. The
+  filter removes the one mismatch that is a stable property of the
+  configuration; the rest are conditions of the moment — the file was deleted
+  since it was indexed, a hard link was renamed over it, it grew past the size
+  cap — and a listing cannot answer those without stat-ing the whole corpus on
+  every call. Those surface as a refusal on read, which is the same answer
+  `get_document` gives.
 - A row whose extension the parser registry no longer covers stays indexed —
   narrowing `[parsers].enabled` does not delete it — but is **not offered**: it
   is absent from `resources/list`, unreadable through `resources/read`, and its
