@@ -978,6 +978,15 @@ fn collect_source_files(
             if is_office_lock_file(name.as_ref()) {
                 continue;
             }
+            // (BU-20) A hard link is a second name for a file that may live
+            // outside the KB, and unlike a symlink nothing in the walk shows
+            // it: `follow_links(false)` has nothing to follow. Skipping here
+            // also removes an already-indexed document that gains a second
+            // name, since the deletion pass treats "not collected" as gone.
+            if crate::links::is_multiply_linked(entry.path()) {
+                tracing::warn!("{}", crate::links::refusal_reason(entry.path()));
+                continue;
+            }
             if let Some(ext) = entry.path().extension()
                 && let Some(ext_str) = ext.to_str()
                 && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
@@ -1562,6 +1571,35 @@ mod tests {
             !names.iter().any(|n| n == "inside.md"),
             "`exclude_dirs = [\"build\"]` must also skip a directory spelled \
              `Build`, got: {names:?}"
+        );
+    }
+
+    /// (BU-20) hardlink は symlink と同じ脅威なのに、walk からは見えない
+    /// (`follow_links(false)` に辿るべき link が無い)。full index からも
+    /// 落ちることを pin する。**既に index 済みの文書が 2 つ目の名前を得た
+    /// 場合も落ちる** = 削除 pass が「集められなかった = 消えた」と扱うので、
+    /// index から取り除かれる。これは承認済みの代償 (log で説明される)。
+    #[test]
+    fn test_collect_source_files_skips_hard_links() {
+        let tmp = mk_tmp("hardlink");
+        write_file(&tmp.0, "normal.md", "# normal");
+        write_file(&tmp.0, "secret.md", "# secret\nssh-rsa AAAA...");
+        std::fs::hard_link(tmp.0.join("secret.md"), tmp.0.join("notes.md"))
+            .expect("hard links need no privilege");
+
+        let reg = Registry::defaults();
+        let files = collect_source_files(&tmp.0, &reg, &[]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.contains(&"normal.md".to_string()),
+            "a file with one name must still be indexed, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "notes.md" || n == "secret.md"),
+            "both names of a hard-linked file must be skipped, got: {names:?}"
         );
     }
 

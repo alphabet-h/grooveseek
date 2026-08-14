@@ -451,6 +451,14 @@ fn should_process_parts(
     {
         return false;
     }
+    // (BU-20) A hard link is the same attack with no symlink to see: a second
+    // name for a file that may live outside the KB, creatable without read
+    // access to it and without any privilege on Windows. Same fail-open rule as
+    // above — a vanished file has no link count, so deletion still deindexes.
+    if crate::links::is_multiply_linked(full) {
+        eprintln!("watcher: {}", crate::links::refusal_reason(full));
+        return false;
+    }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
     // (フル re-index) と同じ判定で skip する。放置すると Office ファイルを
     // 開くたびに create イベント → parse 失敗 warn がスパムする。
@@ -675,17 +683,42 @@ mod tests {
         ));
 
         // hardlink は **Windows でも特権不要**なので、symlink を作れない環境でも
-        // 「リンクの向こう側を読ませない」意図の一部をここで踏める。
-        // 現 guard は symlink しか見ないため hardlink は通る = 既知の残存リスク
-        // (full-audit 2026-08-12 H-1 の後半)。ここでは現契約を pin する:
-        // guard を symlink 判定から `metadata` ベースに書き換えると、この assert が
-        // 「意図せず広げた」ことを教えてくれる。
+        // 「リンクの向こう側を読ませない」意図をここで踏める。
+        //
+        // **契約変更 (BU-20、2026-08-14、user 承認済み)**: 以前ここは
+        // 「hardlink は通る」= 既知の残存リスクを pin していた。symlink と同じ
+        // 脅威 (KB に書ける者が、読めないファイルを kb-mcp の権限で読ませる) を
+        // 同じ扱いに揃えたので、assert を反転させた。代償は「hardlink で dedup /
+        // 共有している KB のファイルが index されなくなる」ことで、これは
+        // `links::refusal_reason` のログで説明される。
+        //
+        // なお、この hardlink の相手 `outside-secret.txt` は名前に反して **KB 内**に
+        // ある。guard は「リンクが 2 本以上ある」ことしか見ない (相手がどこに
+        // いるかは portable に分からない) ので、それでも弾かれるのが正しい。
         let hard = kb.join("hardlink.md");
         if std::fs::hard_link(&secret, &hard).is_ok() {
             assert!(
-                should_process_lite("hardlink.md", &hard, &registry, &default_exclude_dirs()),
-                "hardlink は現 guard の対象外 (既知の残存リスク)。塞ぐなら known-issues も更新すること"
+                !should_process_lite("hardlink.md", &hard, &registry, &default_exclude_dirs()),
+                "hardlink も watcher が index してはいけない (BU-20)"
             );
+            // 元のファイル側も同じ inode なので同様に弾かれる。
+            assert!(
+                !should_process_lite(
+                    "outside-secret.txt",
+                    &secret,
+                    &registry,
+                    &default_exclude_dirs()
+                ),
+                "リンクは対称: 相手側も 2 つ名前を持っている"
+            );
+            std::fs::remove_file(&hard).unwrap();
+            // リンクを外せば元に戻る = guard が「hardlink である間だけ」効く。
+            assert!(should_process_lite(
+                "real.md",
+                &plain,
+                &registry,
+                &default_exclude_dirs()
+            ));
         }
 
         let _ = std::fs::remove_dir_all(&kb);

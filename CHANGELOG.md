@@ -383,6 +383,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **A hard link can no longer smuggle a file into the index** (BU-20). kb-mcp
+  refuses symlinks everywhere a file enters the index or leaves it as content —
+  the full index, the watcher, `get_document` — because whoever can write into
+  the knowledge base should not be able to make kb-mcp read a file *they* cannot
+  read and hand it back through `search`. A hard link does exactly that while
+  passing every one of those checks: it is not a symlink, it is a regular file,
+  and it canonicalizes to a path inside the knowledge base, because a hard link
+  has no target to follow. Creating one needs no read access to the file, and on
+  Windows no privilege at all — measured on Windows 11 as a non-administrator,
+  the link was created, indexed, and its content came back in a search hit.
+
+  A file with **more than one name** is now refused in all three places, with a
+  log line naming it and saying why. The check is deliberately blunt: nothing
+  portable can say whether the other name is inside the knowledge base or
+  outside it, so a legitimately hard-linked note — deduplicated, or shared
+  between two knowledge bases — is skipped as well, from either of its names.
+  Replace it with a copy if it belongs in the index. A file whose link count
+  cannot be read (it was just deleted, say) is allowed through, so deletions
+  still reach the index.
+
+  On Windows the count comes from `GetFileInformationByHandle`, because
+  `MetadataExt::number_of_links` is still unstable and `walkdir`'s metadata —
+  `WIN32_FIND_DATAW` — carries no link count at all.
+
 - **A single panic no longer disables search for the life of the process**
   (BU-18). Every mutex in the server was taken with `.lock().unwrap()`. A
   `std::sync::Mutex` is *poisoned* when a thread panics while holding it, and

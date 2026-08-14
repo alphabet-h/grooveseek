@@ -88,6 +88,12 @@ quick-xml = "0.41"
 # `kb-mcp-tray.exe` binary is shipped separately via cargo-dist.
 [target.'cfg(windows)'.dependencies]
 kb-mcp-tray = { path = "../crates/kb-mcp-tray" }
+# (BU-20) `GetFileInformationByHandle` for the hard-link count. The stable
+# alternative does not exist: `MetadataExt::number_of_links` is still unstable,
+# and walkdir's metadata comes from `WIN32_FIND_DATAW`, which carries no link
+# count at all. Already in the dependency tree at this version (via the tray and
+# several transitive deps), so this adds no new build.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
 # Reranker (~2.3 GB) を要求する bench を default 起動から除外する gate。

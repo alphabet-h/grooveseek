@@ -2659,6 +2659,7 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "wide",
+ "windows-sys 0.59.0",
  "zip",
 ]
 
