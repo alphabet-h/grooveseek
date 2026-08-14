@@ -225,12 +225,32 @@ paths that can be written without knowing anything about your machine —
 `../..`, `/`, `C:\Users` — and symlinks pointing at them.
 
 To accept a config in full, name it: `kb-mcp serve --config ./kb-mcp.toml`.
-Installed services are unaffected — `kb-mcp service install` writes its config
-to a config home, which is a trusted location. One exception: if you set
-`KB_MCP_CONFIG_HOME` only for the `service install` command, that value is not
-in the daemon's environment later, so its config is classified untrusted and
-the restrictions above apply. Set the variable for the service too, or start it
-with `--config`.
+
+Installed services are unaffected. Since v0.20.0 `kb-mcp service install` puts
+`--config <config home>/kb-mcp.toml` into the unit, plist or scheduled task it
+registers, so the daemon names its own config rather than discovering it — and
+is therefore trusted whatever the environment looks like at start-up. That
+closes the one case where it was not: setting `KB_MCP_CONFIG_HOME` for the
+`service install` command alone, since the variable is no longer in the
+environment when the service later runs.
+
+A service registered by an earlier version keeps its old launch line. To update
+it, re-run **your own** `kb-mcp service install` command with `--force` added —
+a bare `service install` would reset the service name, auto-start and bind.
+
+**Set `KB_MCP_CONFIG_HOME` again if you set it the first time.** It is not
+remembered anywhere: `service install` resolves the config home from the
+environment it is run in, so without the variable the re-install writes a
+*different*, minimal config and points the service at that one, leaving your
+real settings unused. This applies to precisely the people the fix is for.
+
+On Linux and macOS the re-install restarts the service, so the new launch line
+takes effect immediately — on Linux that holds for a `--no-auto-start` service
+someone started by hand too, which is restarted only if it is actually running.
+Two cases still need a manual restart: **Windows**, where the scheduled task is
+re-registered but the detached daemon is not stopped, and **a `--no-auto-start`
+LaunchAgent that is already loaded on macOS**, which the installer deliberately
+does not touch. Sign out and back in, or stop and start the service yourself.
 
 **What this does not cover**: if a repository ships its own `.mcp.json`, it
 controls the whole command line, not just the config file. No rule inside
@@ -379,7 +399,7 @@ OS-specific backends:
 - **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`). launchd writes the daemon's output to `kb-mcp.out` / `kb-mcp.err` in the config home; the plist sets `Umask` to `0077`, so everything the agent creates — those logs, the index database — is readable only by your account.
 - **Windows**: Task Scheduler AT_LOGON (= no admin required, `\kb-mcp-<name>` task).
 
-The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name>/` containing `kb-mcp.toml` (with `kb_path` and `bind`). Override the base directory via `KB_MCP_CONFIG_HOME` env var.
+The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name>/` containing `kb-mcp.toml` (with `kb_path` and `bind`). Override the base directory via `KB_MCP_CONFIG_HOME` env var. The registered launch line names that file with `--config` (v0.20.0+), so the daemon reads the config the installer wrote rather than whatever it discovers from its working directory — see [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations).
 
 Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mcp has no authentication.
 

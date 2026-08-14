@@ -85,6 +85,18 @@ impl ServiceBackend for LaunchAgent {
         tighten_existing_logs(&ctx.config_home);
         if ctx.auto_start {
             let uid = current_uid()?;
+            // (codex P2 round 2 on PR #156) `bootstrap` does **not** replace an
+            // already-loaded job — it fails. So `service install --force` over a
+            // running agent used to error out *and* leave launchd holding the
+            // old in-memory `ProgramArguments`, which is exactly the upgrade
+            // path that has to work now that the launch line carries `--config`.
+            // Unload first, best-effort: on a fresh install there is nothing to
+            // unload and `bootout` exits non-zero, which is not a failure.
+            // `uninstall` already treats it the same way.
+            let _ = run_launchctl(&[
+                "bootout",
+                &format!("gui/{}/com.kb-mcp.{}", uid, ctx.service_name),
+            ]);
             run_launchctl(&["bootstrap", &format!("gui/{}", uid), path.to_str().unwrap()])?;
         }
         Ok(())

@@ -100,7 +100,7 @@ fn macos_plist_template_renders_correctly() {
 fn svc_action_target() -> kb_mcp::service::windows::ActionTarget {
     kb_mcp::service::windows::ActionTarget {
         execute_path: PathBuf::from("C:\\bin\\kb-mcp-svc.exe"),
-        argument_clause: String::new(),
+        serve_argument: String::new(),
         used_svc_launcher: true,
     }
 }
@@ -109,7 +109,7 @@ fn svc_action_target() -> kb_mcp::service::windows::ActionTarget {
 fn console_action_target() -> kb_mcp::service::windows::ActionTarget {
     kb_mcp::service::windows::ActionTarget {
         execute_path: PathBuf::from("C:\\bin\\kb-mcp.exe"),
-        argument_clause: " -Argument 'serve'".to_string(),
+        serve_argument: "serve".to_string(),
         used_svc_launcher: false,
     }
 }
@@ -161,8 +161,14 @@ fn windows_register_script_omits_serve_argument_for_the_svc_launcher() {
         false,
     );
     assert!(script.contains("-Execute 'C:\\bin\\kb-mcp-svc.exe'"));
+    // (BU-07) The Action now also carries `--config`, and Task Scheduler takes
+    // exactly one `-Argument`, so the predicate narrows from "no -Argument at
+    // all" to "the -Argument carries no `serve`" — which is what the message
+    // below has always been about. `contains("serve")` alone would not do:
+    // the `-Description` clause says "MCP server".
+    assert!(script.contains("-Argument '--config"));
     assert!(
-        !script.contains("-Argument"),
+        !script.contains("-Argument 'serve"),
         "kb-mcp-svc adds `serve` itself; passing it here yields `kb-mcp.exe serve serve`\n{script}"
     );
 }
@@ -181,7 +187,11 @@ fn windows_register_script_passes_serve_to_the_console_binary() {
         true,
         false,
     );
-    assert!(script.contains("-Execute 'C:\\bin\\kb-mcp.exe' -Argument 'serve'"));
+    // (BU-07) `--config` joins the same clause; the fixture's config_home is
+    // `C:\cfg`, so the child's argv is fully determined here.
+    assert!(script.contains(
+        "-Execute 'C:\\bin\\kb-mcp.exe' -Argument 'serve --config \"C:\\cfg\\kb-mcp.toml\"'"
+    ));
 }
 
 /// `--no-auto-start` is honored at the OS layer (the LogonTrigger is
@@ -209,7 +219,7 @@ fn windows_register_script_escapes_single_quotes_in_paths() {
     use kb_mcp::service::windows::{ActionTarget, build_register_script};
     let target = ActionTarget {
         execute_path: PathBuf::from("C:\\Users\\O'Brien\\bin\\kb-mcp-svc.exe"),
-        argument_clause: String::new(),
+        serve_argument: String::new(),
         used_svc_launcher: true,
     };
     let script = build_register_script(
@@ -221,6 +231,10 @@ fn windows_register_script_escapes_single_quotes_in_paths() {
     );
     assert!(script.contains("-Execute 'C:\\Users\\O''Brien\\bin\\kb-mcp-svc.exe'"));
     assert!(script.contains("-WorkingDirectory 'C:\\Users\\O''Brien\\cfg'"));
+    // (BU-07) The apostrophe now also has to survive inside `-Argument`, which
+    // carries the config path. `windows.rs` reconstructs the child's argv from
+    // this to prove the quoting is not merely present but correct.
+    assert!(script.contains("-Argument '--config \"C:\\Users\\O''Brien\\cfg\\kb-mcp.toml\"'"));
 }
 
 /// v0.9.1: prefer the windows-subsystem sibling so the AtLogOn trigger causes
@@ -234,7 +248,7 @@ fn windows_resolve_action_target_prefers_the_svc_sibling_when_present() {
     let target = resolve_action_target(&tmp.path().join("kb-mcp.exe"));
     assert_eq!(target.execute_path, tmp.path().join("kb-mcp-svc.exe"));
     assert_eq!(
-        target.argument_clause, "",
+        target.serve_argument, "",
         "the svc launcher supplies `serve` itself"
     );
 }
@@ -248,7 +262,7 @@ fn windows_resolve_action_target_falls_back_when_sibling_is_absent() {
     let bin = tmp.path().join("kb-mcp.exe");
     let target = resolve_action_target(&bin);
     assert_eq!(target.execute_path, bin);
-    assert_eq!(target.argument_clause, " -Argument 'serve'");
+    assert_eq!(target.serve_argument, "serve");
 }
 
 /// A parent-less path (a drive root) cannot host a sibling probe; it must take
@@ -259,7 +273,7 @@ fn windows_resolve_action_target_falls_back_for_a_parentless_path() {
     use kb_mcp::service::windows::resolve_action_target;
     let target = resolve_action_target(std::path::Path::new("C:\\"));
     assert_eq!(target.execute_path, PathBuf::from("C:\\"));
-    assert_eq!(target.argument_clause, " -Argument 'serve'");
+    assert_eq!(target.serve_argument, "serve");
 }
 
 /// v0.8.3 hot-fix smoke test: invokes `Register-ScheduledTask` via PowerShell

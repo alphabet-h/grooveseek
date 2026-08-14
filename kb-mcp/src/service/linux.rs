@@ -50,10 +50,27 @@ impl ServiceBackend for SystemdUser {
         }
         std::fs::write(&path, render_unit(ctx)?)?;
         run_systemctl(&["daemon-reload"])?;
+        let name = format!("kb-mcp-{}.service", ctx.service_name);
         if ctx.auto_start {
-            let name = format!("kb-mcp-{}.service", ctx.service_name);
             run_systemctl(&["enable", &name])?;
-            run_systemctl(&["start", &name])?;
+            // `restart`, not `start`: on a fresh install the two are the same,
+            // but over an already-running unit `start` is a no-op and the daemon
+            // keeps running with the previous `ExecStart`. That matters now that
+            // the launch line carries `--config` — `install --force` has to be
+            // the way an existing service picks it up (same reason as the
+            // `bootout` in the macOS backend, codex P2 round 2 on PR #156).
+            run_systemctl(&["restart", &name])?;
+        } else {
+            // (codex P2 round 3 on PR #156) `--no-auto-start` must not start
+            // anything — but a unit someone started by hand is still holding the
+            // previous `ExecStart`, and `restart` here would *start* a service
+            // the user asked not to run. `try-restart` is exactly the missing
+            // verb; systemctl(1): "Stop and then start one or more units ... if
+            // the units are running. This does nothing if units are not
+            // running." So the ordinary case already succeeds, and the error is
+            // propagated (round 4): swallowing it would report a successful
+            // install while the old daemon kept serving without `--config`.
+            run_systemctl(&["try-restart", &name])?;
         }
         eprintln!(
             "Note: run 'sudo loginctl enable-linger $USER' to keep the service running after logout."

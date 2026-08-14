@@ -60,25 +60,32 @@ fn run_schtasks(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The `-Argument` clause a console-binary Action has to carry.
+/// The subcommand word a console-binary Action has to supply itself.
 ///
 /// **Invariant, enforced jointly with `crates/kb-mcp-svc/src/main.rs`:** exactly
 /// one side supplies `serve`. `kb-mcp-svc.exe` prepends it unconditionally, so
-/// an Action aimed at the svc launcher must pass **no** argument, while an
-/// Action aimed at `kb-mcp.exe` must pass this clause. Breaking either half
-/// produces `kb-mcp.exe serve serve` (or a bare `kb-mcp.exe` with no
-/// subcommand) — and only at the *next logon*, long after the install command
-/// reported success. Both halves are unit-tested for that reason.
-const LEGACY_SERVE_ARGUMENT: &str = " -Argument 'serve'";
+/// an Action aimed at the svc launcher must leave this empty, while an Action
+/// aimed at `kb-mcp.exe` must supply it. Breaking either half produces
+/// `kb-mcp.exe serve serve` (or a bare `kb-mcp.exe` with no subcommand) — and
+/// only at the *next logon*, long after the install command reported success.
+/// Both halves are unit-tested for that reason.
+const SERVE_SUBCOMMAND: &str = "serve";
 
-/// Which binary the AtLogOn Action executes, plus the `-Argument` clause that
-/// must accompany it.
+/// Which binary the AtLogOn Action executes, plus the subcommand word that must
+/// accompany it.
+///
+/// **This is not the whole `-Argument` clause** (it was, until BU-07). Task
+/// Scheduler accepts exactly one `-Argument`, and the Action now also carries
+/// `--config`, so the clause has to be assembled in one place —
+/// [`build_register_script`], which is the only function that knows the config
+/// home. Holding a bare word here keeps that assembly possible without string
+/// surgery on a clause that was already quoted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionTarget {
     pub execute_path: PathBuf,
-    /// Empty when `execute_path` is the svc launcher (it adds `serve` itself),
-    /// otherwise `" -Argument 'serve'"`.
-    pub argument_clause: String,
+    /// `"serve"` for the console binary, empty for the svc launcher (which adds
+    /// it itself).
+    pub serve_argument: String,
     /// `false` when the svc launcher was missing and the console-visible
     /// fallback was taken.
     ///
@@ -110,7 +117,7 @@ pub struct ActionTarget {
 pub fn resolve_action_target(binary_path: &Path) -> ActionTarget {
     let legacy = || ActionTarget {
         execute_path: binary_path.to_path_buf(),
-        argument_clause: LEGACY_SERVE_ARGUMENT.to_string(),
+        serve_argument: SERVE_SUBCOMMAND.to_string(),
         used_svc_launcher: false,
     };
     match binary_path.parent() {
@@ -119,7 +126,7 @@ pub fn resolve_action_target(binary_path: &Path) -> ActionTarget {
             if svc.exists() {
                 ActionTarget {
                     execute_path: svc,
-                    argument_clause: String::new(),
+                    serve_argument: String::new(),
                     used_svc_launcher: true,
                 }
             } else {
@@ -128,6 +135,24 @@ pub fn resolve_action_target(binary_path: &Path) -> ActionTarget {
         }
         None => legacy(),
     }
+}
+
+/// Wrap a path so the **child's** command-line parser reads it as one argument.
+///
+/// The `-Argument` value is not re-parsed by PowerShell: Task Scheduler stores
+/// it and hands it to the child as its raw command line, where
+/// `CommandLineToArgvW` splits on whitespace. So `C:\Users\John Doe\...` becomes
+/// two arguments and `--config` silently loses its value — at the next logon,
+/// with the daemon's stdio nulled by `kb-mcp-svc`, which is the least visible
+/// failure this codebase has.
+///
+/// Double quotes are safe to add unconditionally: `"` is not a legal character
+/// in a Windows path, so there is nothing inside to escape, and a file path
+/// cannot end in `\`, so the trailing-backslash rule of `CommandLineToArgvW`
+/// cannot bite either. The separate PowerShell-level quoting (`'` doubling)
+/// happens once over the assembled clause in [`build_register_script`].
+fn quote_child_argument(path: &Path) -> String {
+    format!("\"{}\"", path.display())
 }
 
 /// (v0.8.3 hot-fix) Render the PowerShell script that registers the task at the
@@ -145,6 +170,14 @@ pub fn resolve_action_target(binary_path: &Path) -> ActionTarget {
 ///
 /// Pure: no filesystem access, no process spawn. The sibling probe lives in
 /// [`resolve_action_target`].
+///
+/// The Action carries `--config <config_home>\kb-mcp.toml` (BU-07). Two levels
+/// of quoting meet here and they are not the same quoting: the inner one is for
+/// the **child's** `CommandLineToArgvW` ([`quote_child_argument`]), the outer
+/// one is for the PowerShell single-quoted string this function emits (`'` →
+/// `''`). The outer one is applied once, over the assembled clause, so a path
+/// containing an apostrophe cannot terminate the string early no matter which
+/// half it landed in.
 pub fn build_register_script(
     service_name: &str,
     target: &ActionTarget,
@@ -162,6 +195,18 @@ pub fn build_register_script(
     let auto_start_val = if auto_start { "$true" } else { "$false" };
     let force_clause = if force { " -Force" } else { "" };
 
+    // Task Scheduler takes exactly one `-Argument`, so the words are joined
+    // here rather than concatenated from two places.
+    let mut words: Vec<String> = Vec::with_capacity(3);
+    if !target.serve_argument.is_empty() {
+        words.push(target.serve_argument.clone());
+    }
+    words.push("--config".to_string());
+    words.push(quote_child_argument(
+        &config_home.join(super::render::SERVICE_CONFIG_FILE),
+    ));
+    let argument = format!(" -Argument '{}'", words.join(" ").replace('\'', "''"));
+
     // `$ErrorActionPreference='Stop'` ensures cmdlet failures propagate as
     // non-zero exit codes. `$trigger.Enabled = $false` honors --no-auto-start
     // at the OS layer (= the LogonTrigger is registered but inert). The
@@ -176,7 +221,7 @@ pub fn build_register_script(
          $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -Priority 7; \
          Register-ScheduledTask -TaskName '{name}' -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Description 'kb-mcp loopback HTTP MCP server ({name})'{force} | Out-Null",
         bin = bin_escaped,
-        argument = target.argument_clause,
+        argument = argument,
         home = home_escaped,
         auto_start = auto_start_val,
         name = task,
@@ -589,7 +634,157 @@ mod tests {
             "fallback must be reported, not silent"
         );
         assert_eq!(target.execute_path, missing);
-        assert_eq!(target.argument_clause, LEGACY_SERVE_ARGUMENT);
+        assert_eq!(target.serve_argument, SERVE_SUBCOMMAND);
+    }
+
+    /// BU-07. The Action names the config file explicitly, so the daemon's own
+    /// `kb-mcp.toml` is `ConfigSource::Explicit` = Trusted regardless of what
+    /// `KB_MCP_CONFIG_HOME` happened to be set to at install time.
+    #[test]
+    fn the_action_names_the_config_file_on_both_branches() {
+        let cfg = Path::new("C:\\cfg");
+
+        let svc = ActionTarget {
+            execute_path: PathBuf::from("C:\\bin\\kb-mcp-svc.exe"),
+            serve_argument: String::new(),
+            used_svc_launcher: true,
+        };
+        let script = build_register_script("kb-mcp", &svc, cfg, true, false);
+        assert!(
+            script.contains("-Argument '--config \"C:\\cfg\\kb-mcp.toml\"'"),
+            "the svc launcher gets the flag and no subcommand: {script}"
+        );
+
+        let console = ActionTarget {
+            execute_path: PathBuf::from("C:\\bin\\kb-mcp.exe"),
+            serve_argument: SERVE_SUBCOMMAND.to_string(),
+            used_svc_launcher: false,
+        };
+        let script = build_register_script("kb-mcp", &console, cfg, true, false);
+        assert!(
+            script.contains("-Argument 'serve --config \"C:\\cfg\\kb-mcp.toml\"'"),
+            "the console binary gets the subcommand and the flag, in that order: {script}"
+        );
+    }
+
+    /// The `-Argument` value becomes the child's raw command line, so a space in
+    /// the config home has to survive as **one** argument. Reconstructing the
+    /// child's argv is the only assertion that actually proves it — a
+    /// `contains` on the script would pass for an unquoted path too.
+    #[test]
+    fn a_space_in_the_config_home_stays_one_child_argument() {
+        let target = ActionTarget {
+            execute_path: PathBuf::from("C:\\bin\\kb-mcp.exe"),
+            serve_argument: SERVE_SUBCOMMAND.to_string(),
+            used_svc_launcher: false,
+        };
+        let script = build_register_script(
+            "kb-mcp",
+            &target,
+            Path::new("C:\\Users\\John Doe\\AppData\\Roaming\\kb-mcp\\kb-mcp"),
+            true,
+            false,
+        );
+
+        let argv = child_argv_of(&script);
+        assert_eq!(
+            argv,
+            vec![
+                "serve".to_string(),
+                "--config".to_string(),
+                "C:\\Users\\John Doe\\AppData\\Roaming\\kb-mcp\\kb-mcp\\kb-mcp.toml".to_string(),
+            ],
+            "the path must arrive as one argument, or `--config` silently loses \
+             its value at the next logon: {script}"
+        );
+    }
+
+    /// An apostrophe in the profile directory has to survive the *PowerShell*
+    /// quoting as well, and it is inside the `-Argument` string now, not only
+    /// inside `-Execute` / `-WorkingDirectory`.
+    #[test]
+    fn an_apostrophe_in_the_config_home_is_doubled_inside_the_argument_clause() {
+        let target = ActionTarget {
+            execute_path: PathBuf::from("C:\\bin\\kb-mcp-svc.exe"),
+            serve_argument: String::new(),
+            used_svc_launcher: true,
+        };
+        let script = build_register_script(
+            "kb-mcp",
+            &target,
+            Path::new("C:\\Users\\O'Brien\\cfg"),
+            true,
+            false,
+        );
+        assert!(
+            script.contains("-Argument '--config \"C:\\Users\\O''Brien\\cfg\\kb-mcp.toml\"'"),
+            "an unescaped apostrophe would close the PowerShell string early: {script}"
+        );
+        assert_eq!(
+            child_argv_of(&script),
+            vec![
+                "--config".to_string(),
+                "C:\\Users\\O'Brien\\cfg\\kb-mcp.toml".to_string(),
+            ]
+        );
+    }
+
+    /// Undo both quoting layers in the same order the real chain does —
+    /// PowerShell's single-quoted string first, then `CommandLineToArgvW` — so
+    /// the tests above assert what the child actually receives.
+    fn child_argv_of(script: &str) -> Vec<String> {
+        let after = script
+            .split_once("-Argument '")
+            .expect("the Action must carry an -Argument clause")
+            .1;
+        // The clause ends at the first apostrophe that is not doubled.
+        let mut raw = String::new();
+        let mut chars = after.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    raw.push('\'');
+                    continue;
+                }
+                break;
+            }
+            raw.push(c);
+        }
+        split_command_line(&raw)
+    }
+
+    /// `CommandLineToArgvW` for the shapes this code emits: bare words and
+    /// fully double-quoted words. Paths cannot contain `"`, and the escaping
+    /// rules for backslashes only apply immediately before one, so neither
+    /// arises here — a full implementation would assert nothing extra.
+    fn split_command_line(raw: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut in_quotes = false;
+        let mut started = false;
+        for c in raw.chars() {
+            match c {
+                '"' => {
+                    in_quotes = !in_quotes;
+                    started = true;
+                }
+                c if c.is_whitespace() && !in_quotes => {
+                    if started {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    started = true;
+                }
+            }
+        }
+        if started {
+            out.push(cur);
+        }
+        out
     }
 
     /// End-to-end evidence that the prelude changes what actually comes back
