@@ -40,6 +40,11 @@ use crate::server::KbServer;
 const CITATION_RULES: &str = "\
 Ground every claim in what you retrieved:\n\
 - Cite the `path` of each document you used. Do not cite one you did not open.\n\
+- **Call `get_document` on every document you are going to mention, before you \
+mention it — including ones you are about to dismiss.** A search result is an \
+excerpt, so a hit that looks unrelated may sit in a document that answers the \
+question outright, and reporting on an excerpt alone is both wrong and \
+uncitable under the rule above.\n\
 - If `low_confidence` is set on a search response, say the knowledge base may \
 not cover the question well, rather than answering as if it did.\n\
 - When the knowledge base does not say something, say that. Do not fill the \
@@ -268,6 +273,11 @@ fn find_gaps_body(args: FindGapsArgs) -> Vec<PromptMessage> {
              stub or a TODO that exists is a different finding from nothing at \
              all — the first says someone meant to write it.\n\
              \n\
+             4. Before calling anything a gap, `get_document` the hits you are \
+             judging. A loose-looking excerpt can come from a document that \
+             answers the question in a section the query never matched, and \
+             declaring a gap on the strength of an excerpt manufactures one.\n\
+             \n\
              Report each gap as: the question that went unanswered, what the \
              knowledge base returned instead, and whether it looks like an \
              absence or a stub. Do not propose content; say what is missing.\n\
@@ -373,6 +383,16 @@ mod tests {
             assert!(
                 text.contains("Cite the `path`"),
                 "the citation rules were dropped from a prompt body: {text}"
+            );
+            // (codex P2, rounds 3-4 on PR #161) Twice, a prompt told the model
+            // to retrieve something and then to report on it without opening
+            // it — which the rule above makes uncitable, and which turns an
+            // excerpt into a verdict. Fixing it prompt by prompt produced a
+            // second instance one round later, so the obligation lives in the
+            // shared rules and every body is checked for it here.
+            assert!(
+                text.contains("before you mention it"),
+                "the open-before-you-cite rule is missing from a prompt body: {text}"
             );
         }
     }
