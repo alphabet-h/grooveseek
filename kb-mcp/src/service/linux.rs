@@ -65,10 +65,12 @@ impl ServiceBackend for SystemdUser {
             // anything — but a unit someone started by hand is still holding the
             // previous `ExecStart`, and `restart` here would *start* a service
             // the user asked not to run. `try-restart` is exactly the missing
-            // verb: restart if and only if it is currently running. Best-effort,
-            // because a unit that is not running makes this a no-op and that is
-            // the expected case.
-            let _ = run_systemctl(&["try-restart", &name]);
+            // verb; systemctl(1): "Stop and then start one or more units ... if
+            // the units are running. This does nothing if units are not
+            // running." So the ordinary case already succeeds, and the error is
+            // propagated (round 4): swallowing it would report a successful
+            // install while the old daemon kept serving without `--config`.
+            run_systemctl(&["try-restart", &name])?;
         }
         eprintln!(
             "Note: run 'sudo loginctl enable-linger $USER' to keep the service running after logout."
