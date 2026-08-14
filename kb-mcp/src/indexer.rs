@@ -978,19 +978,24 @@ fn collect_source_files(
             if is_office_lock_file(name.as_ref()) {
                 continue;
             }
-            // (BU-20) A hard link is a second name for a file that may live
-            // outside the KB, and unlike a symlink nothing in the walk shows
-            // it: `follow_links(false)` has nothing to follow. Skipping here
-            // also removes an already-indexed document that gains a second
-            // name, since the deletion pass treats "not collected" as gone.
-            if crate::links::is_multiply_linked(entry.path()) {
-                tracing::warn!("{}", crate::links::refusal_reason(entry.path()));
-                continue;
-            }
             if let Some(ext) = entry.path().extension()
                 && let Some(ext_str) = ext.to_str()
                 && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
             {
+                // (BU-20) A hard link is a second name for a file that may live
+                // outside the KB, and unlike a symlink nothing in the walk
+                // shows it: `follow_links(false)` has nothing to follow.
+                // Skipping here also removes an already-indexed document that
+                // gains a second name, since the deletion pass treats "not
+                // collected" as gone.
+                //
+                // Checked last, after the extension filter: on Windows the link
+                // count needs the file opened, and there is no reason to open
+                // what we were never going to index.
+                if crate::links::is_multiply_linked(entry.path()) {
+                    tracing::warn!("{}", crate::links::refusal_reason(entry.path()));
+                    continue;
+                }
                 files.push(entry.into_path());
             }
         }

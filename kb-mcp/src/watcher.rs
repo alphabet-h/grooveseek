@@ -451,14 +451,6 @@ fn should_process_parts(
     {
         return false;
     }
-    // (BU-20) A hard link is the same attack with no symlink to see: a second
-    // name for a file that may live outside the KB, creatable without read
-    // access to it and without any privilege on Windows. Same fail-open rule as
-    // above — a vanished file has no link count, so deletion still deindexes.
-    if crate::links::is_multiply_linked(full) {
-        eprintln!("watcher: {}", crate::links::refusal_reason(full));
-        return false;
-    }
     // Office lock/owner file (~$*.docx / .~lock.*#) は collect_source_files
     // (フル re-index) と同じ判定で skip する。放置すると Office ファイルを
     // 開くたびに create イベント → parse 失敗 warn がスパムする。
@@ -467,10 +459,30 @@ fn should_process_parts(
         return false;
     }
     let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-    registry
+    if !registry
         .extensions()
         .iter()
         .any(|e| e.eq_ignore_ascii_case(ext))
+    {
+        return false;
+    }
+    // (BU-20) A hard link is the same attack with no symlink to see: a second
+    // name for a file that may live outside the KB, creatable without read
+    // access to it and without any privilege on Windows.
+    //
+    // Last, for two reasons. On Windows the link count needs the file opened,
+    // and there is no point opening what the extension filter already rejected.
+    // On Linux every *directory* has a link count of at least two (`.` and
+    // `..`), so checking earlier would refuse directory events on one platform
+    // and not the other.
+    //
+    // Same fail-open rule as the symlink check above: a vanished file has no
+    // link count, and this function gates deindexing as well as indexing.
+    if crate::links::is_multiply_linked(full) {
+        eprintln!("watcher: {}", crate::links::refusal_reason(full));
+        return false;
+    }
+    true
 }
 
 /// 絶対パスを kb_path 相対 (forward-slash) に変換。kb_path 外ならエラーを
@@ -701,24 +713,34 @@ mod tests {
                 !should_process_lite("hardlink.md", &hard, &registry, &default_exclude_dirs()),
                 "hardlink も watcher が index してはいけない (BU-20)"
             );
-            // 元のファイル側も同じ inode なので同様に弾かれる。
+            // リンクは**対称**なので先にあった方も弾かれる。両方 `.md` にして
+            // 確かめる: 拡張子フィルタ (この guard の直前) で落ちる組み合わせだと、
+            // assert は「hardlink を弾いた」ことを何も検証しなくなる。
+            let note_a = kb.join("note-a.md");
+            std::fs::write(&note_a, "# A\n").unwrap();
             assert!(
-                !should_process_lite(
-                    "outside-secret.txt",
-                    &secret,
-                    &registry,
-                    &default_exclude_dirs()
-                ),
-                "リンクは対称: 相手側も 2 つ名前を持っている"
+                should_process_lite("note-a.md", &note_a, &registry, &default_exclude_dirs()),
+                "名前が 1 つのうちは通る"
             );
-            std::fs::remove_file(&hard).unwrap();
-            // リンクを外せば元に戻る = guard が「hardlink である間だけ」効く。
-            assert!(should_process_lite(
-                "real.md",
-                &plain,
+            let note_b = kb.join("note-b.md");
+            std::fs::hard_link(&note_a, &note_b).unwrap();
+            assert!(
+                !should_process_lite("note-a.md", &note_a, &registry, &default_exclude_dirs()),
+                "後から 2 つ目の名前が付いた既存ノートも弾かれる (承認済みの代償)"
+            );
+            assert!(!should_process_lite(
+                "note-b.md",
+                &note_b,
                 &registry,
                 &default_exclude_dirs()
             ));
+
+            // リンクを外せば戻る = 効くのは「名前が 2 つある間」だけ。
+            std::fs::remove_file(&note_b).unwrap();
+            assert!(
+                should_process_lite("note-a.md", &note_a, &registry, &default_exclude_dirs()),
+                "2 つ目の名前が消えたら通る"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&kb);
