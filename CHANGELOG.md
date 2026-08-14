@@ -44,6 +44,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
      request that would open a *new* session gets `429` with `Retry-After`;
      **established sessions are untouched**. `0` disables the limit.
 
+  The cap counts live sessions *and* admissions still in flight, and takes the
+  seat with a compare-exchange. Reading the count and then forwarding would have
+  left the limit advisory: every request in a simultaneous burst reads the same
+  below-limit count before rmcp inserts anything, so a cap of 1 admitted all 16
+  of 16 concurrent requests in a test written to check exactly that.
+
   A cap alone would have made things worse rather than better: leaked entries
   never expire, so an attacker could fill it and leave the server permanently
   unable to accept a legitimate client. Fixing the leak first is what turns the
