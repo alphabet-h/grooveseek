@@ -455,6 +455,7 @@ pub async fn run_http(
                 McpSessionGate {
                     live: LiveSessionCount::Rmcp(session_manager),
                     max_sessions,
+                    admissions: Arc::new(Admissions::default()),
                     refusals: Arc::new(RefusalLog::new()),
                 },
                 mcp_session_gate,
@@ -606,12 +607,76 @@ impl RefusalLog {
     }
 }
 
+/// 上限内に席を 1 つ予約する (BU-32、codex review round 1 の P1)。
+///
+/// 「生きている数を読む → 上限未満なら通す」を 2 段でやると **TOCTOU** になる。
+/// 同時に来た initialize 要求はどれも rmcp が map に入れる**前**に数を読むので、
+/// 全部が同じ「まだ空いている」を見て通ってしまい、上限を burst の幅だけ
+/// 超える (`max_sessions = 1` でも 1000 本同時なら 1000 session できる)。
+///
+/// そこで「まだ map に反映されていないが通した数」= `in_flight` を持ち、
+/// **`live + in_flight` に対して CAS で 1 席を確保**する。席は
+/// [`AdmissionSeat`] が持ち、応答を返し終えた時点 (= rmcp が
+/// `initialize_session` まで済ませた後) に Drop で返る。rmcp が Host 検証等で
+/// 断って session ができなかった場合も同じ Drop で返るので、席は漏れない。
+#[derive(Default)]
+struct Admissions {
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+impl Admissions {
+    async fn try_reserve(
+        self: &Arc<Self>,
+        live: &LiveSessionCount,
+        max_sessions: u32,
+    ) -> Option<AdmissionSeat> {
+        use std::sync::atomic::Ordering;
+        loop {
+            // `live` は毎周読み直す。ループの外で 1 度だけ読むと、その間に
+            // 確定した session を数え落として上限を 1 席ぶん超える。
+            let now_live = live.get().await;
+            let in_flight = self.in_flight.load(Ordering::Acquire);
+            if now_live + in_flight >= max_sessions as usize {
+                return None;
+            }
+            if self
+                .in_flight
+                .compare_exchange_weak(
+                    in_flight,
+                    in_flight + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(AdmissionSeat {
+                    admissions: Arc::clone(self),
+                });
+            }
+        }
+    }
+}
+
+/// 予約した 1 席。Drop で返す。
+struct AdmissionSeat {
+    admissions: Arc<Admissions>,
+}
+
+impl Drop for AdmissionSeat {
+    fn drop(&mut self) {
+        self.admissions
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// `/mcp` の前段に入る門番の state (BU-32)。
 #[derive(Clone)]
 struct McpSessionGate {
     live: LiveSessionCount,
     /// `0` = 無制限。
     max_sessions: u32,
+    admissions: Arc<Admissions>,
     refusals: Arc<RefusalLog>,
 }
 
@@ -694,26 +759,37 @@ async fn mcp_session_gate(
         }
     }
 
-    if gate.max_sessions > 0 {
-        let live = gate.live.get().await;
-        if live >= gate.max_sessions as usize {
-            if let Some(suppressed) = gate.refusals.record(gate.refusals.elapsed_secs()) {
-                tracing::warn!(
-                    live,
-                    max_sessions = gate.max_sessions,
-                    also_refused_since_the_last_line = suppressed,
-                    "refusing a new MCP session: the concurrent-session limit is full \
-                     (raise [transport.http].max_sessions, or set it to 0 for no limit)"
-                );
+    // 予約を取ってから通す。`_seat` が生きている間だけ席は押さえられており、
+    // 応答を返した時点 (= rmcp が session を map に入れ終えた後) で解放される。
+    let _seat = if gate.max_sessions > 0 {
+        match gate
+            .admissions
+            .try_reserve(&gate.live, gate.max_sessions)
+            .await
+        {
+            Some(seat) => Some(seat),
+            None => {
+                let live = gate.live.get().await;
+                if let Some(suppressed) = gate.refusals.record(gate.refusals.elapsed_secs()) {
+                    tracing::warn!(
+                        live,
+                        max_sessions = gate.max_sessions,
+                        also_refused_since_the_last_line = suppressed,
+                        "refusing a new MCP session: the concurrent-session limit is full \
+                         (raise [transport.http].max_sessions, or set it to 0 for no limit)"
+                    );
+                }
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", SESSION_RETRY_AFTER_SECS.to_string())],
+                    "Too Many Requests: the concurrent MCP session limit is full",
+                )
+                    .into_response();
             }
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", SESSION_RETRY_AFTER_SECS.to_string())],
-                "Too Many Requests: the concurrent MCP session limit is full",
-            )
-                .into_response();
         }
-    }
+    } else {
+        None
+    };
 
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
@@ -2033,6 +2109,7 @@ mod tests {
         let gate = McpSessionGate {
             live: LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(live))),
             max_sessions,
+            admissions: Arc::new(Admissions::default()),
             refusals: Arc::new(RefusalLog::new()),
         };
         let mcp: Router = Router::new()
@@ -2171,6 +2248,110 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(reached.load(Ordering::SeqCst));
+    }
+
+    /// (codex review round 1 の P1) 席の確保は「数を読む」と「1 つ増やす」を
+    /// **1 手**で行うこと。分けると、同時に来た要求がどれも rmcp が map に
+    /// 入れる前の同じ数を読み、全部が通ってしまう。
+    #[tokio::test]
+    async fn a_seat_is_reserved_in_one_step() {
+        let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0)));
+        let admissions = Arc::new(Admissions::default());
+
+        let first = admissions.try_reserve(&live, 1).await;
+        assert!(first.is_some(), "the first request takes the only seat");
+
+        // 生きている数はまだ 0。rmcp が map に入れるのは、通した要求が
+        // 処理を終えた後だから。それでも 2 本目は通ってはいけない。
+        assert!(
+            admissions.try_reserve(&live, 1).await.is_none(),
+            "a concurrent request must not see the seat as still free just \
+             because rmcp has not inserted the session yet"
+        );
+
+        drop(first);
+        assert!(
+            admissions.try_reserve(&live, 1).await.is_some(),
+            "the seat comes back when the request that held it finishes"
+        );
+    }
+
+    /// 上限は「生きている数 + 通したがまだ確定していない数」に掛かる。
+    #[tokio::test]
+    async fn live_sessions_and_in_flight_admissions_share_the_cap() {
+        let live = LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(3)));
+        let admissions = Arc::new(Admissions::default());
+
+        let seat = admissions.try_reserve(&live, 4).await;
+        assert!(seat.is_some(), "3 live + 0 in flight is under a cap of 4");
+        assert!(
+            admissions.try_reserve(&live, 4).await.is_none(),
+            "3 live + 1 in flight already fills a cap of 4"
+        );
+    }
+
+    /// 同じことを HTTP 側から。門番を抜けた要求は dummy service で待たされる
+    /// ので、**全員が門番の中にいる状態**が作れる。予約が無ければ 16 本とも
+    /// 通り、`entered` が 16 になる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_initialize_requests_cannot_overshoot_the_cap() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let inner = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            axum::routing::any(move |_body: axum::body::Bytes| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    "forwarded"
+                }
+            })
+        };
+        let gate = McpSessionGate {
+            live: LiveSessionCount::Fixed(Arc::new(AtomicUsize::new(0))),
+            max_sessions: 1,
+            admissions: Arc::new(Admissions::default()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let mcp: Router = Router::new()
+            .fallback_service(inner)
+            .layer(middleware::from_fn_with_state(gate, mcp_session_gate));
+        let app: Router = Router::new().nest_service("/mcp", mcp);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                app.oneshot(mcp_post(INITIALIZE_BODY))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+
+        // 通った 1 本は dummy の中で止まり、断られた 15 本は即座に返る。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "a cap of 1 must admit exactly one of 16 simultaneous requests"
+        );
+
+        release.notify_waiters();
+        let mut ok = 0;
+        let mut refused = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::TOO_MANY_REQUESTS => refused += 1,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert_eq!((ok, refused), (1, 15));
     }
 
     /// 拒否ログの間引き。満杯の間は毎リクエスト拒否が起きるので、そのまま
