@@ -12,6 +12,14 @@
 use super::InstallContext;
 use anyhow::Result;
 
+/// LaunchAgent の stdout / stderr の落ち先 (config home からの相対名)。
+///
+/// plist を書く側 (本 module) と、既存インストールの log を締め直す側
+/// (`macos::tighten_existing_logs`) の**両方**が使う。片方だけ名前を変えると
+/// chmod が空振りするので、定数を 1 つにして drift を型で防ぐ。
+pub(crate) const LAUNCHD_STDOUT_LOG: &str = "kb-mcp.out";
+pub(crate) const LAUNCHD_STDERR_LOG: &str = "kb-mcp.err";
+
 /// XML の element content として安全になるようエスケープする。
 ///
 /// [XML 1.0 §2.4](https://www.w3.org/TR/xml/#syntax) より:
@@ -136,6 +144,23 @@ pub fn render_unit(ctx: &InstallContext) -> Result<String> {
 /// `<string>` に素で入れると plist が XML として壊れ、`launchctl load` が
 /// 読めなくなる。`service_name` は `[a-zA-Z0-9_-]+` に検証済みなので実質
 /// no-op だが、埋め込み口を 1 つでも素通しにしない方針で揃えている。
+///
+/// `Umask` は log の mode のために要る (BU-24)。log file を作るのは
+/// **kb-mcp ではなく launchd** で、launchd.plist(5) は `StandardOutPath` /
+/// `StandardErrorPath` について「存在しなければ *`Umask` キーで指定された
+/// umask(2) を反映した permission で*作成する」と定めている。キーが無いと
+/// user domain の既定 umask 022 が効いて **0644 = world-readable** になる。
+/// プロセス側で `umask()` を呼んでも遅い — launchd は exec の**前**に開く。
+///
+/// **値は `<string>` で書く**。同じ man page が「integer を渡す場合、property
+/// list は 8 進を表現できないので **10 進**でなければならない。string を渡した
+/// 場合は strtoul(3) の規則で整数に変換され、先頭に `0` を置けば 8 進を指定
+/// できる」と述べている。`<integer>0077</integer>` は 0o77 ではなく 77 (= 0o115)
+/// と解釈されるので、意図が字面に出る `<string>0077</string>` を使う。
+///
+/// umask は **job 全体**に効くので、daemon が作る `.kb-mcp.db` や WAL も 0600
+/// になる。単一ユーザの LaunchAgent なので望ましい方向の変化だが、log だけの
+/// 話ではない点は意識しておくこと。
 pub fn render_plist(ctx: &InstallContext) -> String {
     // codex P2 round 5 on PR #56: honor `--no-auto-start` by emitting
     // `<false/>` for `RunAtLoad` and `KeepAlive` when auto_start is false.
@@ -169,16 +194,20 @@ pub fn render_plist(ctx: &InstallContext) -> String {
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>
+    <key>Umask</key>
+    <string>0077</string>
     <key>StandardOutPath</key>
-    <string>{home}/kb-mcp.out</string>
+    <string>{home}/{out_log}</string>
     <key>StandardErrorPath</key>
-    <string>{home}/kb-mcp.err</string>
+    <string>{home}/{err_log}</string>
 </dict>
 </plist>
 "#,
         name = escape_xml_text(&ctx.service_name),
         bin = escape_xml_text(&ctx.binary_path.display().to_string()),
         home = escape_xml_text(&ctx.config_home.display().to_string()),
+        out_log = LAUNCHD_STDOUT_LOG,
+        err_log = LAUNCHD_STDERR_LOG,
     )
 }
 
@@ -386,6 +415,29 @@ mod tests {
         assert!(
             !plist.contains("a&b"),
             "a raw ampersand survived into the plist: {plist}"
+        );
+    }
+
+    #[test]
+    fn the_plist_makes_launchd_create_the_logs_private() {
+        let plist = render_plist(&ctx_with("/Users/me/bin/kb-mcp", "/Users/me/cfg"));
+        // launchd creates these files, before exec and with the job's umask, so
+        // this key is the only thing standing between the daemon's stderr and
+        // mode 0644. A string with a leading zero is octal per launchd.plist(5);
+        // an <integer> would be read as decimal (BU-24).
+        assert!(
+            plist.contains("<key>Umask</key>\n    <string>0077</string>"),
+            "the plist must set Umask, or launchd creates the logs world-readable: {plist}"
+        );
+        assert!(
+            !plist.contains("<key>Umask</key>\n    <integer>"),
+            "an <integer> Umask is read as decimal, not octal: {plist}"
+        );
+        assert!(
+            plist.contains("<string>/Users/me/cfg/kb-mcp.out</string>")
+                && plist.contains("<string>/Users/me/cfg/kb-mcp.err</string>"),
+            "the log paths must stay the ones macos::tighten_existing_logs \
+             re-chmods: {plist}"
         );
     }
 

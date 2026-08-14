@@ -3,9 +3,10 @@
 //! Module-level `#[cfg(target_os = "macos")]` lives on the `pub mod macos;`
 //! declaration in `src/service/mod.rs`; no inner `#![cfg]` needed.
 
+use super::render::{LAUNCHD_STDERR_LOG, LAUNCHD_STDOUT_LOG};
 use super::{InstallContext, ServiceBackend, ServiceState};
 use anyhow::{Context, Result, anyhow};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub(crate) struct LaunchAgent;
@@ -46,6 +47,30 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// 既に存在する LaunchAgent の log を 0600 に締め直す (BU-24)。
+///
+/// plist の `Umask` は launchd が log file を**作る瞬間**にしか効かないので、
+/// キーが無かった頃に作られた 0644 の file は `service install --force` で
+/// 上書きしても mode が残る。plist を書いた後にここで拾う。
+///
+/// file が無いのが通常 (新規インストール、または `--no-auto-start`)。chmod に
+/// 失敗しても install 自体は成立しているので、warn に留めて中断しない。
+fn tighten_existing_logs(config_home: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for name in [LAUNCHD_STDOUT_LOG, LAUNCHD_STDERR_LOG] {
+        let path = config_home.join(name);
+        if !path.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "warning: 既存ログの permission を 0600 にできませんでした: {} ({e})",
+                path.display()
+            );
+        }
+    }
+}
+
 impl ServiceBackend for LaunchAgent {
     fn install(&self, ctx: &InstallContext) -> Result<()> {
         let path = plist_path(&ctx.service_name)?;
@@ -57,6 +82,7 @@ impl ServiceBackend for LaunchAgent {
             ));
         }
         std::fs::write(&path, render_plist(ctx))?;
+        tighten_existing_logs(&ctx.config_home);
         if ctx.auto_start {
             let uid = current_uid()?;
             run_launchctl(&["bootstrap", &format!("gui/{}", uid), path.to_str().unwrap()])?;
@@ -134,5 +160,61 @@ impl ServiceBackend for LaunchAgent {
             "bootout",
             &format!("gui/{}/com.kb-mcp.{}", uid, service_name),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct DirGuard(PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The plist's `Umask` only applies when launchd *creates* the log, so an
+    /// agent installed before BU-24 keeps its 0644 files across an upgrade.
+    #[test]
+    fn reinstalling_tightens_logs_left_world_readable_by_an_older_agent() {
+        let dir = crate::test_support::unique_temp_path("kb-mcp-macos-logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = DirGuard(dir.clone());
+
+        let out = dir.join(LAUNCHD_STDOUT_LOG);
+        let err = dir.join(LAUNCHD_STDERR_LOG);
+        for path in [&out, &err] {
+            std::fs::write(path, b"stale log\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        tighten_existing_logs(&dir);
+
+        for path in [&out, &err] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} stayed at {mode:o} — an upgrade must not leave the daemon's \
+                 stderr readable by other accounts",
+                path.display()
+            );
+        }
+    }
+
+    /// The usual case: a fresh install, or `--no-auto-start`, where launchd has
+    /// not created anything yet. Absent files must not fail the install.
+    #[test]
+    fn tightening_is_a_no_op_when_the_logs_do_not_exist_yet() {
+        let dir = crate::test_support::unique_temp_path("kb-mcp-macos-nologs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = DirGuard(dir.clone());
+
+        tighten_existing_logs(&dir);
+
+        assert!(!dir.join(LAUNCHD_STDOUT_LOG).exists());
+        assert!(!dir.join(LAUNCHD_STDERR_LOG).exists());
     }
 }

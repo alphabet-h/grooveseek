@@ -369,7 +369,7 @@ kb-mcp service uninstall personal --purge --yes    # config + DB も削除
 
 OS 別バックエンド:
 - **Linux**: systemd-user (`~/.config/systemd/user/kb-mcp-<name>.service`)。ログアウト後も daemon を生かしたい場合は `sudo loginctl enable-linger $USER` を実行。
-- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`)。
+- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`)。daemon の出力は launchd が config home の `kb-mcp.out` / `kb-mcp.err` に書く。plist は `Umask` に `0077` を指定するので、agent が作るもの (ログ、インデックス DB) はすべて自分のアカウントからしか読めない。
 - **Windows**: Task Scheduler AT_LOGON (= admin 不要、`\kb-mcp-<name>` task)。
 
 Installer は config home を `<dirs::config_dir()>/kb-mcp/<service-name>/` に作成し、`kb-mcp.toml` (`kb_path` / `bind` 含む) を配置。base directory は `KB_MCP_CONFIG_HOME` env var で override 可能。
