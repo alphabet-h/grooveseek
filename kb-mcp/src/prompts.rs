@@ -207,8 +207,14 @@ fn whats_new_body(args: WhatsNewArgs) -> Vec<PromptMessage> {
              date.** It must be `YYYY-MM-DD`. If the value above is anything \
              else, convert it to that form first — passing prose filters out \
              every document instead of erroring.\n\
-             2. Group what you find by `topic` and `category`.\n\
-             3. Read the ones that look substantial with `get_document`.\n\
+             2. Repeat at least one of those searches with \
+             `include_low_quality: true`. The per-chunk quality filter is on by \
+             default, and it hides short notes, TODOs and stubs — which is a \
+             large part of what \"recently added\" looks like. Without this pass \
+             the survey silently omits them and can come back empty while \
+             matching documents exist.\n\
+             3. Group what you find by `topic` and `category`.\n\
+             4. Read the ones that look substantial with `get_document`.\n\
              \n\
              **State this limitation in your answer rather than hiding it.** \
              The date being filtered on is the `date` field in each document's \
@@ -433,6 +439,22 @@ mod tests {
         assert!(
             text.contains("compared as a plain string"),
             "the prompt must warn that date_from is not parsed: {text}"
+        );
+    }
+
+    /// (codex P2, round 2 on PR #161) A survey of what is new has to ask for
+    /// the chunks the default quality filter hides. Short notes, TODOs and
+    /// stubs are a large part of what "recently added" looks like, and the
+    /// filter drops them before the caller ever sees them.
+    #[test]
+    fn whats_new_asks_for_the_chunks_the_quality_filter_hides() {
+        let text = text_of(&whats_new_body(WhatsNewArgs {
+            since: Some("2026-01-01".to_string()),
+        }));
+        assert!(
+            text.contains("include_low_quality"),
+            "the survey must include one low-quality pass or it silently omits \
+             short new notes: {text}"
         );
     }
 
