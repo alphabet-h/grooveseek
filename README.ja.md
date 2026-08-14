@@ -891,6 +891,25 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 
 **設定ファイルではなくコンパイル時固定にしてある。** prompt 本文はモデルに渡るテキストで、`kb-mcp.toml` は cwd や `.git` 祖先から**発見される**ため、設定で定義できるようにすると untrusted config に対して `kb_path` と同じ制限が必要になる。MCP 仕様も助けにならない — tool annotation と違い、**クライアントに「prompt の内容を信用するな」と言う指針が無い**。
 
+## MCP リソース
+
+(v0.22.0+) ナレッジベースを `kb://` スキームの MCP resource としても公開する。Claude Code では `@` メニューに出る。
+
+| URI | 中身 |
+|---|---|
+| `kb://topic/<prefix>` | **topic group** = パスの先頭 1〜2 セグメント。indexer が `category` / `topic` を導出するのと同じ規則。read するとその配下の文書一覧 (URI 付き) が Markdown で返る。`kb://topic/` は root group |
+| `kb://doc/<path>` | 索引済みの文書 1 件。列挙はせず**テンプレートとして公開**する |
+
+`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` の各 hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。
+
+区切りは forward slash のまま、それ以外は percent-encode するので、空白や非 ASCII を含むパスでも正しい ASCII URI になる。
+
+**read は索引で縛られる。** 提供されるのは索引に入っている文書のみで、そのうえで `get_document` と同一の検査 (symlink / hardlink 拒否、path traversal、拡張子 membership、size cap、handle 束縛の read) を通す。これは `get_document` (= `kb_path` 配下で拡張子が registry にあれば返す) より**狭い**。resource は「サーバが提示したもの」なので、提示していない URI を提供するのは別の操作だから。したがって `.kb-mcpignore` された文書は resource には出ないが `get_document` からは従来どおり読める — これは [ADR-0003](docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.ja.md) の契約が不変であることの帰結。判断の正本は [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.ja.md)。
+
+内容はテキストとして返り、media type は**提供物の型**にする: Markdown は `text/markdown`、抽出テキストとして出すものは `text/plain`。PDF や表計算は **kb-mcp が抽出したテキスト**として返り、元のバイト列ではない。
+
+**未実装**: `resources/subscribe` と `notifications/resources/list_changed`。これらが無くても `"resources": {}` は準拠した宣言であり、固定の topic group は滅多に変わらない。
+
 ## 補足
 
 - **埋め込みモデル**: 初回実行時、選択した ONNX モデルが OS 標準のキャッシュディレクトリに DL される。2 回目以降は再利用。解決順:

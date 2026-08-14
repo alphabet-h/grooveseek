@@ -305,10 +305,36 @@ pub(crate) struct ErrorResponse {
 /// `search` MCP ツールの新出力 (feature-26、wrapper 形)。
 #[derive(Serialize)]
 struct SearchResponse {
-    results: Vec<crate::db::SearchHit>,
+    results: Vec<HitWithUri>,
     low_confidence: bool,
     /// 入力 filter のうち non-default のものだけ正規化後の値で echo back。
     filter_applied: SearchFilterEcho,
+}
+
+/// (feature-50) A hit, plus the `kb://doc/...` URI that names its document as a
+/// resource.
+///
+/// Flattened, so the hit's own fields keep the shape and the position they had
+/// — one new key, nothing moved. The MCP result stays a single text content
+/// block carrying this JSON, which is what keeps every existing client working:
+/// adding a `resource_link` content block instead would have changed the length
+/// of the `content` array.
+///
+/// The specification permits handing back links to documents that
+/// `resources/list` never enumerated, which is what makes the topic-group
+/// listing and per-document addressing coexist.
+#[derive(Serialize)]
+struct HitWithUri {
+    #[serde(flatten)]
+    hit: crate::db::SearchHit,
+    uri: String,
+}
+
+impl From<crate::db::SearchHit> for HitWithUri {
+    fn from(hit: crate::db::SearchHit) -> Self {
+        let uri = crate::resources::doc_uri(&hit.path);
+        Self { hit, uri }
+    }
 }
 
 /// 入力 filter のうち non-default のものだけ echo。`null`/空配列の項目は
@@ -543,7 +569,7 @@ impl KbCore {
         };
 
         let resp = SearchResponse {
-            results: hits,
+            results: hits.into_iter().map(HitWithUri::from).collect(),
             low_confidence,
             filter_applied: echo,
         };
@@ -585,12 +611,27 @@ impl KbCore {
             .map_err(|e| format!("failed to list indexed documents: {e}"))
     }
 
-    /// Serve one `kb://` URI, or say why not.
+    /// What a `resources/read` of a document produces: its text, and the media
+    /// type that text actually is.
+    ///
+    /// Not the media type of the file on disk. A PDF or a spreadsheet is served
+    /// as the text the parser extracted, because that is what an MCP client can
+    /// use, so calling it `application/pdf` would be a lie about the bytes it is
+    /// holding.
+    fn resource_mime_for(ext: &str) -> &'static str {
+        if ext.eq_ignore_ascii_case("md") {
+            "text/markdown"
+        } else {
+            "text/plain"
+        }
+    }
+
+    /// Serve one `kb://` URI, or say why not. Returns `(text, mime)`.
     fn read_resource_blocking(
         &self,
         parsed: &crate::resources::ResourceUri,
         uri: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, &'static str), String> {
         let paths = {
             let db = recover_db(self.db.lock());
             db.all_document_paths()
@@ -607,7 +648,7 @@ impl KbCore {
                 for p in &group.paths {
                     out.push_str(&format!("- `{p}` — {}\n", crate::resources::doc_uri(p)));
                 }
-                Ok(out)
+                Ok((out, "text/markdown"))
             }
             crate::resources::ResourceUri::Doc(rel) => {
                 // Membership first. A document that is not indexed was never
@@ -617,33 +658,52 @@ impl KbCore {
                 if !paths.iter().any(|p| p == rel) {
                     return Err(format!("not an indexed document: {uri}"));
                 }
-                // Then exactly the guards `get_document` applies, by calling it:
-                // symlink and hard-link refusal, traversal, extension
-                // membership, size cap, and a handle-bound read. Reusing the
-                // body rather than re-deriving it is the point — a second
-                // extraction path is how the two would come to disagree.
-                Ok(self.get_document_blocking(GetDocumentParams { path: rel.clone() }))
+                // Then the guards, by sharing the body `get_document` uses
+                // rather than re-deriving them: symlink and hard-link refusal,
+                // traversal, extension membership, size cap, handle-bound read.
+                // A second sequence is how the two would come to disagree.
+                let (doc, ext) = self
+                    .load_document_blocking(rel)
+                    .map_err(|e| format!("{}: {uri}", e.error))?;
+                Ok((doc.content, Self::resource_mime_for(&ext)))
             }
         }
     }
 
     fn get_document_blocking(&self, params: GetDocumentParams) -> String {
+        match self.load_document_blocking(&params.path) {
+            Ok((doc, _ext)) => serde_json::to_string_pretty(&doc).unwrap_or_default(),
+            Err(e) => serde_json::to_string_pretty(&e).unwrap_or_default(),
+        }
+    }
+
+    /// Every guard a document has to clear, in one place, plus the extraction.
+    ///
+    /// Shared by `get_document` — which wraps the result in its JSON envelope —
+    /// and `resources/read`, which returns the extracted text. Two call sites
+    /// with two copies of this sequence is how a guard ends up applying to one
+    /// of them; `max_bytes_for` exists for the same reason one level down.
+    ///
+    /// The extension is handed back because the caller needs it and it must be
+    /// the **canonical** one the checks used, not the one from the requested
+    /// path (BU-22: Windows 8.3 short names make those differ).
+    fn load_document_blocking(
+        &self,
+        rel: &str,
+    ) -> Result<(DocumentResponse, String), ErrorResponse> {
         // (BU-22) Both caps go in; `validate_get_document_path` picks between
         // them from the canonical extension, which is the same one its
         // registry-membership check uses.
         let canonical = match validate_get_document_path(
             &self.kb_path,
-            &params.path,
+            rel,
             &self.parser_registry,
             GET_DOCUMENT_MAX_BYTES,
             crate::parser::MAX_RAW_BINARY_BYTES,
         ) {
             ValidatePathOutcome::Found(p) => p,
-            ValidatePathOutcome::NotFound(e) => {
-                return serde_json::to_string_pretty(&e).unwrap_or_default();
-            }
-            ValidatePathOutcome::Denied(e) => {
-                return serde_json::to_string_pretty(&e).unwrap_or_default();
+            ValidatePathOutcome::NotFound(e) | ValidatePathOutcome::Denied(e) => {
+                return Err(e);
             }
         };
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -659,25 +719,22 @@ impl KbCore {
         );
         match crate::links::read_checked(&canonical, cap) {
             Ok(crate::links::Content::Bytes(bytes)) => {
-                match build_document_response(&self.parser_registry, &params.path, ext, &bytes) {
-                    Ok(resp) => serde_json::to_string_pretty(&resp).unwrap_or_default(),
-                    Err(e) => serde_json::to_string_pretty(&ErrorResponse {
+                match build_document_response(&self.parser_registry, rel, ext, &bytes) {
+                    Ok(resp) => Ok((resp, ext.to_string())),
+                    Err(e) => Err(ErrorResponse {
                         error: format!("Failed to extract document: {e}"),
-                    })
-                    .unwrap_or_default(),
+                    }),
                 }
             }
             Ok(crate::links::Content::Refused(refused)) => {
                 tracing::warn!("{}", refused.log_line(&canonical));
-                serde_json::to_string_pretty(&ErrorResponse {
+                Err(ErrorResponse {
                     error: refused.client_message().to_string(),
                 })
-                .unwrap_or_default()
             }
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
+            Err(e) => Err(ErrorResponse {
                 error: format!("Failed to read file: {e}"),
-            })
-            .unwrap_or_default(),
+            }),
         }
     }
 
@@ -1136,10 +1193,15 @@ impl ServerHandler for KbServer {
         );
         t.description = Some(
             "One indexed document, addressed by its path relative to the knowledge base. \
-             Every `search` hit carries the matching `uri`."
+             Every `search` hit carries the matching `uri`. Served as text: a PDF or a \
+             spreadsheet comes back as the text kb-mcp extracted from it, not as the \
+             original bytes."
                 .to_string(),
         );
-        t.mime_type = Some("text/markdown".to_string());
+        // No `mime_type` on the template. It varies per document — `text/markdown`
+        // for `.md`, `text/plain` for everything served as extracted text — and a
+        // single value here would be wrong for most of what the template matches.
+        // Each read states its own.
         Ok(with_cache_hints(
             rmcp::model::ListResourceTemplatesResult::with_all_items(vec![t]),
         ))
@@ -1176,8 +1238,9 @@ impl ServerHandler for KbServer {
         .map_err(internal_error)?
         .map_err(|e| rmcp::ErrorData::resource_not_found(e, None))?;
 
-        let contents = vec![rmcp::model::ResourceContents::text(text, uri)];
-        Ok(rmcp::model::ReadResourceResult::new(contents).into())
+        let (text, mime) = text;
+        let content = rmcp::model::ResourceContents::text(text, uri).with_mime_type(mime);
+        Ok(rmcp::model::ReadResourceResult::new(vec![content]).into())
     }
 }
 

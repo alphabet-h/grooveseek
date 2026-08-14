@@ -14,6 +14,40 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **MCP resources** (B-2), under the `kb://` scheme.
+
+  `resources/list` returns one entry per **topic group** — the first one or two
+  path segments, the same derivation the indexer uses for `category` and
+  `topic` — not one per document. A knowledge base has hundreds of documents but
+  tens of groups, and a listing is what a client fetches on every connect.
+  Individual documents stay reachable through the `kb://doc/{path}` template and
+  through the **`uri` field now on every `search` hit**; the specification
+  permits handing back links to documents a listing never enumerated.
+
+  **A read is bounded by the index.** A document is served only if it is
+  indexed, and then only through the same checks `get_document` applies. That is
+  *narrower* than `get_document`, which serves anything under `kb_path` with a
+  registered extension — a resource is something the server offered, so serving
+  a URI that was never on offer is a different operation. `.kb-mcpignore`d
+  documents are therefore absent from resources while remaining readable through
+  `get_document`, which leaves ADR-0003's contract exactly as it was. Reasoning
+  in [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.md).
+
+  The guard sequence now lives in one function that both `get_document` and
+  `resources/read` call, rather than being written twice.
+
+  Content comes back as text with the media type of what is served —
+  `text/markdown` for Markdown, `text/plain` for anything delivered as extracted
+  text. A PDF is served as the text kb-mcp extracted from it, so it is not
+  described as a PDF.
+
+  `search`'s result gains one field and changes shape in no other way: the MCP
+  result is still a single text content block carrying the same JSON, so
+  existing clients are unaffected.
+
+  Not implemented: `resources/subscribe` and
+  `notifications/resources/list_changed`.
+
 - **MCP prompts** (B-3). Four of them, surfaced by clients as commands the user
   picks — Claude Code renders them as `/mcp__kb-mcp__<name>`:
 

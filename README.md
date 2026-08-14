@@ -901,6 +901,25 @@ All four are plain text and share one set of citation rules: cite the `path` of 
 
 They are fixed at compile time rather than configurable. Prompt text goes to the model, and `kb-mcp.toml` is *discovered* — from the working directory or a `.git` ancestor — so a configurable prompt set would need the same restriction that already applies to `kb_path` under an untrusted config. The MCP specification offers no help here: unlike tool annotations, it gives clients no guidance to distrust prompt content.
 
+## Resources
+
+(v0.22.0+) The knowledge base is also exposed as MCP resources under the `kb://` scheme. In Claude Code these appear in the `@` menu.
+
+| URI | What it is |
+|---|---|
+| `kb://topic/<prefix>` | A **topic group** — the first one or two path segments, the same derivation the indexer uses for `category` and `topic`. Reading one returns a Markdown list of the documents under it, with their URIs. `kb://topic/` is the root group. |
+| `kb://doc/<path>` | One indexed document, by its knowledge-base-relative path. Advertised as a template rather than enumerated. |
+
+`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on every `search` hit — the specification permits handing back links to documents a listing never enumerated.
+
+Separators stay as forward slashes; everything else is percent-encoded, so a path with spaces or non-ASCII characters produces a valid ASCII URI.
+
+**A read is bounded by the index.** A document is served only if it is indexed, and then only through the same checks `get_document` applies — symlink and hard-link refusal, path traversal, extension membership, size cap, and a handle-bound read. This is *narrower* than `get_document`, which serves anything under `kb_path` with a registered extension: a resource is something the server offered, so serving a URI that was never on offer is a different operation. `.kb-mcpignore`d documents are therefore absent from resources while remaining readable through `get_document`, which is [ADR-0003](docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md)'s contract unchanged. The reasoning is in [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.md).
+
+Content comes back as text with the media type of what is served: `text/markdown` for Markdown, `text/plain` for anything delivered as extracted text. A PDF or a spreadsheet is served as the text kb-mcp extracted from it, not as the original bytes.
+
+Not implemented: `resources/subscribe` and `notifications/resources/list_changed`. `"resources": {}` is a conforming declaration without them, and a fixed set of topic groups rarely changes.
+
 ## Notes
 
 - **Embedding model**: On first run, the selected ONNX model is downloaded to an OS-standard cache directory. Subsequent runs reuse the cached model. Resolution order:
