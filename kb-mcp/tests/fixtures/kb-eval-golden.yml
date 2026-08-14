@@ -106,3 +106,32 @@ queries:
     query: "応答に入っている四桁の識別子の意味を調べたい"
     expected:
       - path: "ref/error-codes.ja.md"
+
+  # --- lexical group --------------------------------------------------------
+  # Queries whose answer is an exact token — an error number, a header name, a
+  # path, a literal prefix, a clock time. These exist to keep the FTS leg
+  # honest. Measured 2026-08-14 on this corpus: with the FTS leg forced silent,
+  # the twenty paraphrase queries above lose nothing at all under BGE-M3
+  # (1.00 → 1.00), because twenty semantically distinct documents are separable
+  # by the vector leg alone. The five below are what turns "the keyword half of
+  # the hybrid search died" into a failing assertion instead of a green run.
+  - id: lex-error-3007
+    query: "3007 が返ってきた"
+    expected:
+      - path: "ref/error-codes.ja.md"
+  - id: lex-retry-after
+    query: "Retry-After header"
+    expected:
+      - path: "ref/rate-limiting.md"
+  - id: lex-bootstrap
+    query: "scripts/bootstrap"
+    expected:
+      - path: "guide/local-setup.md"
+  - id: lex-chore-prefix
+    query: "chore prefix"
+    expected:
+      - path: "guide/branching.md"
+  - id: lex-snapshot-time
+    query: "02:00 UTC"
+    expected:
+      - path: "ops/database-backup.md"
