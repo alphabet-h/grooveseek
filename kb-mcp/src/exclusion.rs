@@ -170,16 +170,27 @@ impl ExclusionRules {
     /// denylist, which is a fail-safe and stops being one the moment a file in
     /// the tree can switch it off.
     fn matches(&self, rel: &str, is_dir: bool) -> bool {
-        let basename = rel.rsplit('/').next().unwrap_or(rel);
-        // Applied whatever `is_dir` says. Both of these compare whole names
-        // against a denylist of directory names, and the two implementations
-        // this replaces disagreed about the last component: the index walk
-        // tested directories only, the watcher tested the last component when
-        // it was the whole path. Taking the union of the two is a superset of
-        // each, so nothing that used to be excluded stops being excluded, and
-        // erring toward exclusion is what BU-19 concluded for a denylist.
-        if is_hardcoded_excluded(basename) || is_user_excluded_dir(basename, &self.exclude_dirs) {
-            return true;
+        // Directories only. Both of these compare a whole basename against a
+        // list *of directory names* — that is what `exclude_dirs` is documented
+        // to be, and the index walk has always tested `file_type().is_dir()`
+        // before consulting them.
+        //
+        // The two implementations this replaces disagreed about the last
+        // component: the walk tested directories only, while the watcher also
+        // tested it when the path had no other component. Following the watcher
+        // there looked like the safe side for a denylist, and it is not — a
+        // configured name that can also be a filename, `exclude_dirs =
+        // ["archive.md"]`, would start dropping every `notes/archive.md` from a
+        // knowledge base that has no `.kb-mcpignore` at all (codex P2, round 1
+        // on PR #159). Ancestors are passed `is_dir = true` by
+        // [`Self::is_excluded`], so the `.git/` and `node_modules/` fail-safe
+        // still reaches everything underneath them.
+        if is_dir {
+            let basename = rel.rsplit('/').next().unwrap_or(rel);
+            if is_hardcoded_excluded(basename) || is_user_excluded_dir(basename, &self.exclude_dirs)
+            {
+                return true;
+            }
         }
         self.ignore
             .as_ref()
@@ -422,6 +433,47 @@ mod tests {
         ] {
             assert!(!r.is_excluded(kept, false), "should be kept: {kept}");
         }
+    }
+
+    /// (codex P2, round 1 on PR #159) `exclude_dirs` is a list of *directory*
+    /// names, and nothing stops one of its entries from also being a plausible
+    /// filename. Applying it to files as well would quietly drop documents from
+    /// a knowledge base that never adopted `.kb-mcpignore` — a regression
+    /// introduced by the very refactor that was meant to stop the three
+    /// surfaces disagreeing.
+    #[test]
+    fn a_directory_denylist_does_not_reach_a_file_of_the_same_name() {
+        let r = ExclusionRules::from_exclude_dirs(vec!["archive.md".to_string()]);
+        assert!(
+            !r.is_excluded("notes/archive.md", false),
+            "a file is not a directory, whatever it is called"
+        );
+        assert!(!r.is_excluded("archive.md", false));
+        assert!(
+            r.is_excluded("archive.md", true),
+            "a directory of that name is still excluded"
+        );
+        assert!(r.is_excluded("archive.md/inside.md", false));
+    }
+
+    /// The same for the hardcoded fail-safe, which must keep reaching every
+    /// path under `.git/` and `node_modules/` through the ancestor pass.
+    #[test]
+    fn the_hardcoded_denylist_still_covers_everything_under_it() {
+        let r = ExclusionRules::from_exclude_dirs(vec![]);
+        for rel in [
+            "node_modules/pkg/README.md",
+            ".git/COMMIT_EDITMSG.md",
+            ".svn/entries.md",
+            "sub/node_modules/deep/x.md",
+        ] {
+            assert!(r.is_excluded(rel, false), "must stay excluded: {rel}");
+        }
+        assert!(r.is_excluded("node_modules", true));
+        assert!(
+            !r.is_excluded("node_modules.md", false),
+            "and it does not spill onto files that merely start with the name"
+        );
     }
 
     #[test]

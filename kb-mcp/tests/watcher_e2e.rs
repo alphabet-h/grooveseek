@@ -138,3 +138,113 @@ fn test_watcher_picks_up_new_file() {
          or investigate handle_events latency.",
     );
 }
+
+/// (feature-49) A `.kb-mcpignore` written while the server is running takes
+/// effect for subsequent events.
+///
+/// The reload is reachable only because `handle_events` looks for the file
+/// **before** classifying anything: `.kb-mcpignore` has no registered
+/// extension, so the ordinary path would drop the event on the same filter the
+/// file is meant to change, and the watcher would go on indexing what the next
+/// `kb-mcp index` will drop.
+///
+/// Two files are written afterwards, not one. "The ignored file never appears"
+/// passes just as well when the watcher is dead, when the debouncer never
+/// armed, or when the deadline was too short — so a second, *not* ignored file
+/// has to appear in the same window for the negative half to mean anything.
+#[test]
+#[ignore = "spawns kb-mcp serve with watcher; needs inotify (Linux primary; opt-in on macOS/Windows)"]
+fn watcher_reloads_kb_mcpignore_while_running() {
+    const IGNORED_MARKER: &str = "zqxwignoredmarker49";
+    const VISIBLE_MARKER: &str = "zqxwvisiblemarker49";
+
+    let layout = TempKbLayout::new("kb-mcp-watcher-ignore-e2e");
+    setup_initial_kb(&layout);
+    build_index(layout.kb());
+
+    let cfg_path = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg_path, "[watch]\nenabled = true\ndebounce_ms = 500\n")
+        .expect("write kb-mcp.toml");
+
+    let (_guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
+    let session = mcp_initialize(&base);
+
+    // The server started without one, so this write is the reload.
+    layout.write(".kb-mcpignore", "secret/\n");
+
+    // Let that land in its own debounce window. Sharing one with the writes
+    // below would still work — the reload runs before the batch is classified —
+    // but a note landing in an *earlier* batch than the ignore file would be
+    // indexed, and the failure would look like a broken reload rather than a
+    // racy fixture.
+    sleep(Duration::from_millis(2000));
+
+    // Both bodies have to be substantial. The per-chunk quality filter is on by
+    // default at threshold 0.3, and a one-line section under 30 characters
+    // scores below it — so a terse fixture is hidden from `search` whether or
+    // not it was indexed, which would make the negative assertion below pass
+    // for the wrong reason and the positive one fail for it.
+    let body = |marker: &str| {
+        format!(
+            concat!(
+                "---\ntitle: Watcher ignore fixture\ntags: [test]\n---\n",
+                "\n",
+                "## marker section\n",
+                "\n",
+                "Distinct content carrying the marker `{}` so the search assertions\n",
+                "can tell whether the live watcher indexed this file. Written long\n",
+                "enough to clear the default per-chunk quality filter, which drops\n",
+                "short single-line sections from search results regardless of\n",
+                "whether they reached the index.\n",
+            ),
+            marker,
+        )
+    };
+    layout.write("secret/hidden.md", &body(IGNORED_MARKER));
+    layout.write("public/shown.md", &body(VISIBLE_MARKER));
+
+    // Same budget as the test above.
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    let mut saw_visible = false;
+    loop {
+        let hits = |marker: &str| {
+            let resp = mcp_search_call(
+                &base,
+                &session,
+                serde_json::json!({ "query": marker, "limit": 5, "mmr": false }),
+            );
+            extract_path_heading_order(&resp)
+        };
+
+        let ignored = hits(IGNORED_MARKER);
+        assert!(
+            !ignored
+                .iter()
+                .any(|(path, _)| path.ends_with("hidden.md") || path.contains("secret/")),
+            "the watcher indexed a file under a directory the reloaded \
+             .kb-mcpignore excludes: {ignored:?}"
+        );
+
+        if !saw_visible
+            && hits(VISIBLE_MARKER)
+                .iter()
+                .any(|(path, _)| path.ends_with("shown.md"))
+        {
+            saw_visible = true;
+        }
+
+        if start.elapsed() >= deadline {
+            break;
+        }
+        sleep(poll_interval);
+    }
+
+    assert!(
+        saw_visible,
+        "`public/shown.md` never appeared within {deadline:?}, so the watcher \
+         was not doing anything and the assertion about the ignored file proved \
+         nothing. Investigate the watcher before trusting this test."
+    );
+}
