@@ -907,6 +907,13 @@ pub enum RenameOutcome {
     RenamedAndReindexed { chunks: u32 },
     /// 旧 path が DB に無い (新規 path として扱った方が良い)
     OldPathMissing,
+    /// (BU-20) 旧 path が DB に無く、新 path を新規として index しようとしたら
+    /// **refuse された**。
+    ///
+    /// `OldPathMissing` と分けるのは、あちらが「新 path を index した」を
+    /// 意味するため (codex P2 round 2 on PR #157)。DB に row は作られていない
+    /// のに watcher が「indexed」と報告するのは、その後の調査を狂わせる。
+    OldPathMissingAndRefused,
     /// path は UPDATE 済だが、新 path の binary size が cap 超過のため
     /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
     /// content_hash は旧内容のまま据え置き、次回 full rebuild の
@@ -945,9 +952,17 @@ pub fn rename_single_file(
 ) -> Result<RenameOutcome> {
     // 旧 path が DB に無ければ rename ではなく新規作成として扱う
     let Some(old_hash) = db.get_document_hash(old_rel)? else {
-        // 新 path を reindex しておく
-        let _ = reindex_single_file(db, embedder, kb_path, new_rel, exclude_headings, registry)?;
-        return Ok(RenameOutcome::OldPathMissing);
+        // 新 path を新規として reindex する。**結果を捨てない** — refuse された
+        // 場合に `OldPathMissing` を返すと「index した」と報告してしまう
+        // (codex P2 round 2 on PR #157)。
+        return Ok(
+            match reindex_single_file(db, embedder, kb_path, new_rel, exclude_headings, registry)? {
+                SingleResult::Refused => RenameOutcome::OldPathMissingAndRefused,
+                SingleResult::Updated { .. }
+                | SingleResult::Unchanged
+                | SingleResult::Skipped { .. } => RenameOutcome::OldPathMissing,
+            },
+        );
     };
 
     db.rename_document(old_rel, new_rel)?;
