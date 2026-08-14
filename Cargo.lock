@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "kb-mcp"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2665,11 +2665,11 @@ dependencies = [
 
 [[package]]
 name = "kb-mcp-svc"
-version = "0.18.0"
+version = "0.19.0"
 
 [[package]]
 name = "kb-mcp-tray"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "clap",

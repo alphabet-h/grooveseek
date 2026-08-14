@@ -66,6 +66,8 @@ The order of the last two matters on a cold model cache, which is why CI runs th
 - `kb-mcp/src/indexer/progress.rs` — per-file progress output for `kb-mcp index` (`--quiet` / `--progress`)
 - `kb-mcp/src/service/` — `kb-mcp service install/uninstall/status` (systemd-user / LaunchAgent / Task Scheduler)
 - `kb-mcp/src/tune.rs` + `kb-mcp/src/tune/` — `kb-mcp tune` fusion-parameter sweep: `grid.rs` (sweep grid), `stats.rs` (aggregation), `report.rs` (rendering)
+- `kb-mcp/src/links.rs` — hard-link detection shared by the index / watcher / `get_document` guards (v0.19.0+)
+- `kb-mcp/src/poison.rs` — recovering from a poisoned mutex instead of inheriting the panic (v0.19.0+)
 - `kb-mcp/src/test_support.rs` — shared test helpers, notably `unique_temp_path` (this repo deliberately does not use the `tempfile` crate; see the comment there)
 - `crates/kb-mcp-tray/` — Windows system-tray monitor (`kb-mcp-tray.exe`, v0.9.0+)
 - `crates/kb-mcp-svc/` — Windows hidden-console launcher started by the scheduled task (v0.9.1+)

@@ -1,6 +1,6 @@
 [package]
 name = "kb-mcp-svc"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 description = "Windows hidden-console launcher for kb-mcp.exe serve (v0.9.1 hot-fix for visible terminal window via Task Scheduler)"
 authors = ["koshian"]

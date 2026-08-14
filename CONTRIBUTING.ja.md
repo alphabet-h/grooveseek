@@ -66,6 +66,8 @@ cargo test
 - `kb-mcp/src/indexer/progress.rs` — `kb-mcp index` の per-file 進捗出力 (`--quiet` / `--progress`)
 - `kb-mcp/src/service/` — `kb-mcp service install/uninstall/status` (systemd-user / LaunchAgent / Task Scheduler)
 - `kb-mcp/src/tune.rs` + `kb-mcp/src/tune/` — `kb-mcp tune` の fusion パラメータ sweep: `grid.rs` (sweep グリッド) / `stats.rs` (集計) / `report.rs` (描画)
+- `kb-mcp/src/links.rs` — index / watcher / `get_document` の 3 面が共有する hardlink 検出 (v0.19.0+)
+- `kb-mcp/src/poison.rs` — poison した mutex から復帰する (panic を引き継がない、v0.19.0+)
 - `kb-mcp/src/test_support.rs` — テスト共有ヘルパ。特に `unique_temp_path` (本リポジトリは意図的に `tempfile` crate を使わない。理由は同ファイルのコメント参照)
 - `crates/kb-mcp-tray/` — Windows system tray モニタ (`kb-mcp-tray.exe`、v0.9.0+)
 - `crates/kb-mcp-svc/` — scheduled task が起動する Windows hidden-console launcher (v0.9.1+)
