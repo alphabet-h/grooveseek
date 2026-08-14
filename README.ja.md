@@ -117,8 +117,9 @@ bind = "127.0.0.1:3100"
 # healthz_public = false
 # 同時に生きていられる MCP session の数。既定 256 (= 約 25 MB。生きた session
 # 1 つが約 100 KB)。満杯の間、**新規** session を開こうとするリクエストは
-# Retry-After 付きの 429 になり、確立済みの session はそのまま使える。
-# 0 で無制限 (v0.19.0+)。
+# Retry-After 付きの 429 になり、確立済みの session はそのまま使える。0 で無制限。
+# **対象は MCP 2025-11-25 以前のクライアントだけ** — 2026-07-28 には session が
+# 無く (SEP-2567)、その要求がこの上限で断られることはない (v0.19.0+)。
 # max_sessions = 256
 
 # 任意: `kb-mcp eval` (retrieval 品質評価、パワーユーザ機能)。

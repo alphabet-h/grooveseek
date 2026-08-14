@@ -726,42 +726,36 @@ struct McpSessionGate {
 }
 
 /// `/mcp` の前段 middleware。**session を作りに来たリクエストだけ**を見て、
-/// (1) initialize でないものを rmcp に渡さず、(2) 上限に達していれば 429 を返す。
+/// 上限に達していれば 429 を返す。それ以外のリクエストには一切触らない。
 ///
-/// # なぜ rmcp より手前で initialize を弾くのか
+/// # session を作りに来た、をどう見分けるか
 ///
-/// rmcp 1.4.0 の `handle_post` は **`create_session()` を「initialize 要求か」の
-/// 検証より先に**呼ぶ。session は既に map へ入っており、続く
-/// `return Err(unexpected_message_response("initialize request"))` (422) は
-/// `close_session` を呼ばない — 後始末を持つ `tokio::spawn` はその後ろにある。
-/// しかも取り残された worker は initialize 前の `recv()` で park し、そこには
-/// keep-alive も cancellation token の arm も無いので**永久に残る**
-/// (rmcp-1.4.0 `streamable_http_server/tower.rs:632-646` と
-/// `session/local.rs:922-928`)。
+/// **`initialize` 要求であること**。3 つの条件がすべて必要:
+/// POST であること、`Mcp-Session-Id` ヘッダが無いこと (有れば既存 session 宛)、
+/// そして body が単一の JSON-RPC `initialize` 要求であること。
 ///
-/// 実測 (2026-08-14、release binary、**1 本の** keep-alive 接続): セッション無しの
-/// 非 initialize POST を 2000 回で private bytes が 157 → 274 MiB、**1 件あたり
-/// 約 58 KB が解放されない**。所要 1 秒 = 約 117 MiB/秒。認証もセッションも
-/// initialize も要らない。
+/// `initialize` を条件に使えるのは偶然ではない。**MCP 2026-07-28 (SEP-2567) は
+/// session ごと廃止し、`initialize` / `notifications/initialized` も削除した**。
+/// rmcp 3 はそのバージョンを交渉したリクエストを常に stateless で処理するので、
+/// **`initialize` が来る = 旧ライフサイクル = session が作られる**が厳密に一致する。
+/// 逆に言えば、2026-07-28 のクライアントは session 無しで `tools/call` を直接
+/// POST してくるので、**そこを弾いてはならない**。
 ///
-/// **上限だけを足すと、これは「無制限のメモリ増加」から「永久に新規 session を
-/// 拒否する DoS」に変わる** — 取り残されたエントリは期限切れにならないので、
-/// 上限を埋められた時点で正規クライアントは二度と繋がらない。だから順序が
-/// 逆にできない: **先に漏れを止め、その上で数える**。
+/// (BU-32 の初版は「session 無し POST が initialize でなければ 422」だった。
+/// rmcp 1.4.0 が `create_session()` を initialize 検証より先に呼び、続く 422 が
+/// `close_session` を呼ばずに session を取り残す漏れ — 実測 117 MiB/秒 — を
+/// 塞ぐためで、rmcp 2.0.0 が上流で直すまでは必要だった
+/// (modelcontextprotocol/rust-sdk#934)。3.x に上げた今それは不要で、しかも
+/// **残すと 2026-07-28 のクライアントが全滅する** — 実測で 422 を返していた。)
 ///
 /// # 何を複製し、何を複製しないか
 ///
-/// 判定は「セッション無しの POST の body が、単一の JSON-RPC initialize 要求か」
-/// だけ。これは **MCP 仕様**であって rmcp の実装詳細ではない。
-/// Host / Accept / Content-Type の検証は**複製しない** (F-64 で host 検証を
-/// mirror せず委譲に倒した判断と同じ)。その結果、Accept や Content-Type も
-/// 同時に誤っている非 initialize 要求は、rmcp の 406 / 415 ではなく本 middleware の
-/// 422 を受け取る。どちらも 4xx で、状態は動かず、情報も増えない。
-/// **Host が許可されないリクエストはそもそも rmcp が session を作らない**ので、
-/// 素通しにしても漏れない。
+/// 判定は「body が単一の JSON-RPC `initialize` 要求か」だけ。これは **MCP 仕様**
+/// であって rmcp の実装詳細ではない。Host / Accept / Content-Type の検証は
+/// **複製しない** (F-64 で host 検証を mirror せず委譲に倒した判断と同じ)。
+/// 弾くのは「上限が満杯のとき」だけなので、余計に巻き込む余地も小さい。
 ///
-/// body が JSON として壊れている場合も素通しする。rmcp は
-/// `expect_json` で session 分岐**より前**に落とすので漏れない (実測で確認済み)。
+/// body が JSON にならない場合も素通しする。rmcp が自分で答える。
 async fn mcp_session_gate(
     State(gate): State<McpSessionGate>,
     req: Request,
@@ -769,7 +763,7 @@ async fn mcp_session_gate(
 ) -> Response {
     // session を作りに来ないリクエストは一切触らない。
     // 新しい session ができるのは「POST かつ Mcp-Session-Id ヘッダ無し」の時だけ
-    // (rmcp tower.rs:562-568 で header 有りは既存 session 分岐へ行く)。
+    // (rmcp 3.1.2 tower.rs:1729-1736 で header 有りは既存 session 分岐へ行く)。
     if req.method() != axum::http::Method::POST || req.headers().contains_key("mcp-session-id") {
         return next.run(req).await;
     }
@@ -782,26 +776,19 @@ async fn mcp_session_gate(
         Err(_) => return bad_request_typed("could not read request body"),
     };
 
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        // JSON として読める。単一の initialize 要求でなければ、rmcp に渡さず
-        // ここで終わらせる (= session が作られないので漏れない)。
-        Ok(value) => {
-            if value.get("method").and_then(|m| m.as_str()) != Some("initialize") {
-                // 文言は rmcp の `unexpected_message_response("initialize request")`
-                // と同一にしてある。クライアントから見て応答が変わらないように。
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "Unexpected message, expect initialize request",
-                )
-                    .into_response();
-            }
-        }
-        // JSON にならない body は rmcp が session 分岐の手前で落とす。
-        Err(_) => {
-            return next
-                .run(Request::from_parts(parts, Body::from(bytes)))
-                .await;
-        }
+    // `initialize` 以外は session を作らない (stateless 経路)。素通しする。
+    let is_initialize = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("method")
+                .and_then(|m| m.as_str())
+                .map(|m| m == "initialize")
+        })
+        .unwrap_or(false);
+    if !is_initialize {
+        return next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await;
     }
 
     // 予約を取ってから通す。`_seat` は応答を返し終えるまで生き、そこで Drop
@@ -2140,6 +2127,13 @@ mod tests {
 
     const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     const OTHER_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    /// MCP 2026-07-28 のリクエスト形。session も `initialize` も無く、
+    /// 交渉に必要なものは `params._meta` に載る (SEP-2567 / SEP-2575)。
+    const MODERN_BODY: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"#,
+        r#""io.modelcontextprotocol/protocolVersion":"2026-07-28","#,
+        r#""io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+    );
 
     /// `/mcp` の mount 形状 + 門番。`live` は「今生きている session 数」の
     /// 代わり、`reached` は dummy service に到達したかどうか。
@@ -2173,28 +2167,41 @@ mod tests {
             .unwrap()
     }
 
-    /// 漏れを止めている本体。rmcp 1.4 は `create_session()` を「initialize か」の
-    /// 検証より先に呼び、422 で返る経路が `close_session` を呼ばないので、
-    /// **rmcp に届かせないこと**が唯一の防ぎ方になる。
+    /// **MCP 2026-07-28 のクライアントは session を張らずに直接リクエストを
+    /// POST する** (SEP-2567 が session と `initialize` を廃止した)。門番は
+    /// それに触ってはならない。
+    ///
+    /// これは BU-32 初版の契約の**反転**で、rmcp 3 への更新に伴う意図的な変更。
+    /// 旧契約 (session 無し POST が initialize でなければ 422) は rmcp 1.4.0 の
+    /// session 漏れを塞ぐためのもので、上流が 2.0.0 で直したため不要になり、
+    /// **残すと新プロトコルのクライアントが全滅する** — 実機で 3.1.2 に対して
+    /// 422 を返すことを確認した上で外した。
     #[tokio::test]
-    async fn a_sessionless_post_that_is_not_initialize_never_reaches_the_service() {
+    async fn a_sessionless_post_that_is_not_initialize_is_left_alone() {
         let reached = Arc::new(AtomicBool::new(false));
         let app = gated_mcp_router(0, 256, Arc::clone(&reached));
 
         let resp = app.oneshot(mcp_post(OTHER_BODY)).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            !reached.load(Ordering::SeqCst),
-            "a non-initialize sessionless POST must not reach rmcp: reaching it \
-             creates a session that is never closed"
+            reached.load(Ordering::SeqCst),
+            "a sessionless non-initialize POST is how a 2026-07-28 client calls a \
+             tool; refusing it here would break every modern client"
         );
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            "Unexpected message, expect initialize request",
-            "the wording matches rmcp's own 422 so clients see no change"
-        );
+    }
+
+    /// 上限が満杯でも、新プロトコルのリクエストは断らない。断ってよいのは
+    /// **session を消費するリクエスト**だけで、stateless な呼び出しは消費しない。
+    #[tokio::test]
+    async fn a_full_session_limit_does_not_refuse_a_stateless_request() {
+        let reached = Arc::new(AtomicBool::new(false));
+        let app = gated_mcp_router(4, 4, Arc::clone(&reached));
+
+        let resp = app.oneshot(mcp_post(MODERN_BODY)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(reached.load(Ordering::SeqCst));
     }
 
     /// 正常系: 空きがあれば initialize はそのまま通る。

@@ -119,7 +119,9 @@ bind = "127.0.0.1:3100"
 # How many MCP sessions may be alive at once. Default 256 (~25 MB; a live
 # session costs about 100 KB). While it is full, a request that would open a
 # NEW session gets 429 with a Retry-After header, and established sessions
-# keep working. 0 disables the limit (v0.19.0+).
+# keep working. 0 disables the limit. Concerns MCP 2025-11-25 and older only:
+# the 2026-07-28 protocol has no sessions, so those requests hold nothing and
+# are never refused by this limit (v0.19.0+).
 # max_sessions = 256
 
 # Optional: `kb-mcp eval` (retrieval quality evaluation, power-user feature).
