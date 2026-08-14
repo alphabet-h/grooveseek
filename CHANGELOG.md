@@ -248,6 +248,35 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   bodies remain compile-only — running them needs the ~2.3 GB reranker the
   Windows leg deliberately does not download.
 
+- **A module can no longer arrive with no tests and nobody notice** (BU-26).
+  The nightly coverage job printed a per-file table and stopped there; nothing
+  ever failed, so noticing required reading a table in a job nobody opens when
+  it is green.
+
+  The gate is a **per-file** floor (`--fail-under-file-lines 35`), not a global
+  one. The total is not a number that can be thresholded honestly here: 53.8%
+  of the physical lines under `kb-mcp/src` are in-file `#[cfg(test)] mod tests`
+  and ~100% covered by construction, which pulls it up; code reachable only
+  from `#[ignore]` tests reads as 0% in this job, which pulls it down; and
+  ~3,400 lines of Windows/macOS-only code are not in the ubuntu leg's
+  denominator at all. A global floor is also satisfiable by adding tests to a
+  module that already has plenty, which is not the failure being guarded
+  against.
+
+  35 is a tripwire for "no tests at all", not a quality target — the measured
+  distribution runs `main.rs` 41.43%, `embedder.rs` 58.90%, `server.rs` 63.16%,
+  `watcher.rs` 65.57%, everything else ≥ 78%, so a higher floor would mean
+  either more exclusions or no headroom. Three files are excluded because they
+  are structurally invisible to a non-ignored run rather than untested: the
+  stdio transport and the systemd backend are driven only by `#[ignore]` tests,
+  and the tray's `main.rs` is a three-line Windows entry point.
+
+  cargo-llvm-cov exits 1 without saying which file tripped the floor, so the
+  step names it: every file below the floor becomes a GitHub error annotation
+  carrying its percentage. The summary table also survives a failing run now,
+  and the tests are run once and reported twice (`--no-report` plus two
+  `report` calls) instead of being run again for the gate.
+
 ### Changed
 
 - **rmcp 1.4.0 → 3.1.2, which brings MCP 2026-07-28 support**. Two majors of

@@ -90,6 +90,12 @@ When adding behavior that needs the embedder or reranker, mark the test `#[ignor
 
 If you change retrieval — query compilation, fusion, chunking, the parser, MMR — expect this gate to move, and read the failure output before adjusting a threshold: it names every query that lost rank 1, what it expected, and what won instead. Lowering a floor is a decision to accept worse search, so it belongs in the pull request description together with the new measurement. The module docs record the current baseline and how it was taken.
 
+### Coverage floor
+
+`nightly.yml` also measures line coverage with `cargo-llvm-cov`, and fails if **any single file** falls below 35%. That is a tripwire for "arrived with no tests", not a target — it sits far below the ~86% total on purpose, because the total is not a number you can threshold honestly: in-file `#[cfg(test)]` modules push it up, code reachable only from `#[ignore]` tests reads as 0% and pushes it down, and Windows/macOS-only code is not in the Linux leg's denominator at all. Three files are excluded for that middle reason and each is named in the workflow.
+
+So: if you add a module, add tests with it. When the floor trips, the offending file is emitted as a GitHub error annotation with its percentage — cargo-llvm-cov itself only exits 1 — and the full per-file table is in the job summary either way.
+
 ## Submitting changes
 
 1. Fork the repo and branch from `main`
