@@ -65,6 +65,22 @@
 # traverses everything.
 #exclude_dirs = [".obsidian", ".git", "node_modules", "target", ".vscode", ".idea", "dist", ".next"]
 
+# To exclude individual files or glob patterns rather than whole directories,
+# put a `.kb-mcpignore` in the ROOT of the knowledge base. It uses gitignore
+# syntax and there is no setting for it here:
+#
+#     drafts/
+#     *.tmp.md
+#     archive/**
+#     notes/*.md
+#     !notes/keep.md
+#
+# It combines with exclude_dirs as a union, so `!` only undoes an earlier line
+# of that same file. Like exclude_dirs, it bounds what gets INDEXED — an
+# excluded file never appears in search, but get_document still returns it to a
+# caller that knows its path. Keep anything that must not be readable outside
+# kb_path. See the README section "Indexing".
+
 # --- [quality_filter] — per-chunk quality filter --------------------------
 # On by default with threshold 0.3, which is what the two lines below spell
 # out. Chunks scoring below the threshold are dropped from MCP search, CLI
