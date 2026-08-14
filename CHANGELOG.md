@@ -25,6 +25,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   keep-alive timer nor the cancellation arm that the post-initialize loop has,
   so nothing ever reclaims it.
 
+  **Upstream fixed this in rmcp 2.0.0**, which kb-mcp does not yet use: reported
+  against 1.4.0 as
+  [modelcontextprotocol/rust-sdk#808](https://github.com/modelcontextprotocol/rust-sdk/issues/808),
+  fixed by
+  [modelcontextprotocol/rust-sdk#934](https://github.com/modelcontextprotocol/rust-sdk/pull/934)
+  — "only creates a session after those checks pass" — and 2.0.0 also added a
+  `SessionConfig::init_timeout` defaulting to 60 seconds. Verified against the
+  published crates: 1.4.0 through 1.8.0 create the session first, 2.0.0 onward
+  do not. The gate below still earns its place after an upgrade: it becomes a
+  second line of defence for that path, and **no rmcp release bounds the number
+  of sessions**, 3.1.2 included.
+
   Measured against the release binary over **one** keep-alive connection: 2000
   session-less, non-`initialize` POSTs raised private bytes from 157 MiB to
   274 MiB — about **58 KB per rejected request, none of it returned** — in one
