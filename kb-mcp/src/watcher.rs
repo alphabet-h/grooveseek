@@ -459,10 +459,30 @@ fn should_process_parts(
         return false;
     }
     let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("");
-    registry
+    if !registry
         .extensions()
         .iter()
         .any(|e| e.eq_ignore_ascii_case(ext))
+    {
+        return false;
+    }
+    // (BU-20) A hard link is the same attack with no symlink to see: a second
+    // name for a file that may live outside the KB, creatable without read
+    // access to it and without any privilege on Windows.
+    //
+    // Last, for two reasons. On Windows the link count needs the file opened,
+    // and there is no point opening what the extension filter already rejected.
+    // On Linux every *directory* has a link count of at least two (`.` and
+    // `..`), so checking earlier would refuse directory events on one platform
+    // and not the other.
+    //
+    // Same fail-open rule as the symlink check above: a vanished file has no
+    // link count, and this function gates deindexing as well as indexing.
+    if crate::links::is_multiply_linked(full) {
+        eprintln!("watcher: {}", crate::links::refusal_reason(full));
+        return false;
+    }
+    true
 }
 
 /// 絶対パスを kb_path 相対 (forward-slash) に変換。kb_path 外ならエラーを
@@ -675,16 +695,51 @@ mod tests {
         ));
 
         // hardlink は **Windows でも特権不要**なので、symlink を作れない環境でも
-        // 「リンクの向こう側を読ませない」意図の一部をここで踏める。
-        // 現 guard は symlink しか見ないため hardlink は通る = 既知の残存リスク
-        // (full-audit 2026-08-12 H-1 の後半)。ここでは現契約を pin する:
-        // guard を symlink 判定から `metadata` ベースに書き換えると、この assert が
-        // 「意図せず広げた」ことを教えてくれる。
+        // 「リンクの向こう側を読ませない」意図をここで踏める。
+        //
+        // **契約変更 (BU-20、2026-08-14、user 承認済み)**: 以前ここは
+        // 「hardlink は通る」= 既知の残存リスクを pin していた。symlink と同じ
+        // 脅威 (KB に書ける者が、読めないファイルを kb-mcp の権限で読ませる) を
+        // 同じ扱いに揃えたので、assert を反転させた。代償は「hardlink で dedup /
+        // 共有している KB のファイルが index されなくなる」ことで、これは
+        // `links::refusal_reason` のログで説明される。
+        //
+        // なお、この hardlink の相手 `outside-secret.txt` は名前に反して **KB 内**に
+        // ある。guard は「リンクが 2 本以上ある」ことしか見ない (相手がどこに
+        // いるかは portable に分からない) ので、それでも弾かれるのが正しい。
         let hard = kb.join("hardlink.md");
         if std::fs::hard_link(&secret, &hard).is_ok() {
             assert!(
-                should_process_lite("hardlink.md", &hard, &registry, &default_exclude_dirs()),
-                "hardlink は現 guard の対象外 (既知の残存リスク)。塞ぐなら known-issues も更新すること"
+                !should_process_lite("hardlink.md", &hard, &registry, &default_exclude_dirs()),
+                "hardlink も watcher が index してはいけない (BU-20)"
+            );
+            // リンクは**対称**なので先にあった方も弾かれる。両方 `.md` にして
+            // 確かめる: 拡張子フィルタ (この guard の直前) で落ちる組み合わせだと、
+            // assert は「hardlink を弾いた」ことを何も検証しなくなる。
+            let note_a = kb.join("note-a.md");
+            std::fs::write(&note_a, "# A\n").unwrap();
+            assert!(
+                should_process_lite("note-a.md", &note_a, &registry, &default_exclude_dirs()),
+                "名前が 1 つのうちは通る"
+            );
+            let note_b = kb.join("note-b.md");
+            std::fs::hard_link(&note_a, &note_b).unwrap();
+            assert!(
+                !should_process_lite("note-a.md", &note_a, &registry, &default_exclude_dirs()),
+                "後から 2 つ目の名前が付いた既存ノートも弾かれる (承認済みの代償)"
+            );
+            assert!(!should_process_lite(
+                "note-b.md",
+                &note_b,
+                &registry,
+                &default_exclude_dirs()
+            ));
+
+            // リンクを外せば戻る = 効くのは「名前が 2 つある間」だけ。
+            std::fs::remove_file(&note_b).unwrap();
+            assert!(
+                should_process_lite("note-a.md", &note_a, &registry, &default_exclude_dirs()),
+                "2 つ目の名前が消えたら通る"
             );
         }
 

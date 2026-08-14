@@ -383,6 +383,46 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **Hard links are now refused wherever symlinks already were** (BU-20). kb-mcp
+  refuses symlinks everywhere a file enters the index or leaves it as content —
+  the full index, the watcher, `get_document` — because whoever can write into
+  the knowledge base should not be able to make kb-mcp read a file *they* cannot
+  read and hand it back through `search`. A hard link does exactly that while
+  passing every one of those checks: it is not a symlink, it is a regular file,
+  and it canonicalizes to a path inside the knowledge base, because a hard link
+  has no target to follow. Creating one needs no read access to the file, and on
+  Windows no privilege at all — measured on Windows 11 as a non-administrator,
+  the link was created, indexed, and its content came back in a search hit.
+
+  A file with **more than one name** is now refused in all three places, with a
+  log line naming it and saying why. The check is deliberately blunt: nothing
+  portable can say whether the other name is inside the knowledge base or
+  outside it, so a legitimately hard-linked note — deduplicated, or shared
+  between two knowledge bases — is skipped as well, from either of its names.
+  Replace it with a copy if it belongs in the index. A file whose link count
+  cannot be read (it was just deleted, say) is allowed through, so deletions
+  still reach the index.
+
+  On Windows the count comes from `GetFileInformationByHandle`, because
+  `MetadataExt::number_of_links` is still unstable and `walkdir`'s metadata —
+  `WIN32_FIND_DATAW` — carries no link count at all.
+
+  **This raises the bar rather than drawing a boundary**, and the distinction
+  matters: the check looks at a name, at a moment, and is not bound to the bytes
+  later read from that name. Whoever can link a file in *and* remove its original
+  name — write access to the directory holding it, not read access to the file —
+  leaves the knowledge base path as the only name, count 1, indistinguishable
+  from a file that was always there. Separately, a knowledge base writer who can
+  time a rebuild can let the check see an ordinary file and put a hard link in
+  its place before the parser opens it. Remembering inodes seen above 1 closes
+  neither, since both steps of the first can happen between two index runs; the
+  second needs the count bound to the same handle the content is read from, which
+  the parser interface does not currently allow. The check that would close them
+  is ownership, and refusing files not owned by the user running kb-mcp would
+  break a knowledge base shared between accounts. So the rule stands: anything
+  that must not be readable by kb-mcp belongs outside `kb_path`, on a path its
+  user cannot read.
+
 - **A single panic no longer disables search for the life of the process**
   (BU-18). Every mutex in the server was taken with `.lock().unwrap()`. A
   `std::sync::Mutex` is *poisoned* when a thread panics while holding it, and

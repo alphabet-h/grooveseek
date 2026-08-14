@@ -15,6 +15,8 @@ pub mod embedder;
 pub mod eval;
 pub mod graph;
 pub mod indexer;
+/// Hard-link detection for the index / watcher / `get_document` guards (BU-20).
+pub(crate) mod links;
 pub mod markdown;
 pub mod mmr;
 pub mod parent;

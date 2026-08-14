@@ -1575,6 +1575,18 @@ pub(crate) fn validate_get_document_path(
                 error: "Access denied: symlinks are not allowed.".to_string(),
             });
         }
+        // (BU-20) A hard link reaches the same content without being a symlink,
+        // and `canonicalize` below cannot help: a hard link has no target, so
+        // it canonicalizes to itself, inside the KB. The index refuses these
+        // too, but `get_document` is reachable by path without going through
+        // the index at all.
+        Ok(_) if crate::links::is_multiply_linked(&file_path) => {
+            tracing::warn!("{}", crate::links::refusal_reason(&file_path));
+            return ValidatePathOutcome::Denied(ErrorResponse {
+                error: "Access denied: files with more than one name (hard links) are not allowed."
+                    .to_string(),
+            });
+        }
         Ok(_) => {}
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
@@ -3184,6 +3196,46 @@ mod tests {
             matches!(r, ValidatePathOutcome::Found(_)),
             "a .md under an excluded dir is still readable via get_document — \
              exclude_dirs bounds indexing, not access: {r:?}"
+        );
+    }
+
+    /// (BU-20) A hard link is a second name for a file that may be outside the
+    /// KB, and it defeats every check `get_document` had: it is not a symlink,
+    /// it is a regular file, and it canonicalizes to itself — inside the KB.
+    /// Creating one needs no read access to the target and no privilege.
+    #[test]
+    fn a_hard_linked_document_is_refused() {
+        let kb = TempKb::new("gd-hardlink");
+        kb.write("secret-source.md", "# Secret\nssh-rsa AAAA...\n");
+        let link = kb.path.join("notes.md");
+        std::fs::hard_link(kb.path.join("secret-source.md"), &link)
+            .expect("hard links need no privilege");
+
+        let r = validate_get_document_path(
+            &kb.path,
+            "notes.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Denied(_)),
+            "a hard link must be refused the way a symlink is: {r:?}"
+        );
+
+        // And the guard is not simply refusing everything: the same file with
+        // one name is readable.
+        std::fs::remove_file(&link).unwrap();
+        let r = validate_get_document_path(
+            &kb.path,
+            "secret-source.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "an ordinary document must stay readable: {r:?}"
         );
     }
 
