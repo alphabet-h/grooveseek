@@ -383,7 +383,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
-- **A hard link can no longer smuggle a file into the index** (BU-20). kb-mcp
+- **Hard links are now refused wherever symlinks already were** (BU-20). kb-mcp
   refuses symlinks everywhere a file enters the index or leaves it as content —
   the full index, the watcher, `get_document` — because whoever can write into
   the knowledge base should not be able to make kb-mcp read a file *they* cannot
