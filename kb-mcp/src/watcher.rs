@@ -516,6 +516,11 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             eprintln!("watcher: reindexed {rel} ({chunks} chunks)");
         }
         Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
+        // (BU-20) The reason is already on stderr from the read; this says what
+        // happened to the document, which the reason does not.
+        Ok(indexer::SingleResult::Refused) => {
+            eprintln!("watcher: {rel} refused, index left as it was");
+        }
         Ok(indexer::SingleResult::Skipped { reason }) => {
             eprintln!("watcher: skipped {rel} ({reason})");
         }
@@ -555,9 +560,21 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         Ok(indexer::RenameOutcome::OldPathMissing) => {
             eprintln!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
         }
+        // (BU-20) Not "indexed": no row was created. Saying otherwise sends
+        // whoever reads this log looking for a document that is not there.
+        Ok(indexer::RenameOutcome::OldPathMissingAndRefused) => {
+            eprintln!("watcher: rename target {old_rel} not in DB, and {new_rel} was refused");
+        }
         Ok(indexer::RenameOutcome::RenamedSizeCapped) => {
             eprintln!(
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
+            );
+        }
+        // (BU-20) The reason is already on stderr from `read_for_index`; this
+        // line says what happened to the document, which the reason does not.
+        Ok(indexer::RenameOutcome::RenamedButRefused) => {
+            eprintln!(
+                "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
         Err(e) => eprintln!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),

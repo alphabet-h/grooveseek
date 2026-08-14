@@ -12,6 +12,56 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **The link check and the bytes now come from the same open handle** (BU-20
+  residual).
+
+  v0.19.0 refused a file with more than one name, but it checked a *path* and
+  read the bytes later. A knowledge-base writer who could time a rebuild could
+  show the check an ordinary file and rename a hard link over that path before
+  it was opened — needing no power over the original at all. `links::read_checked`
+  now opens the file once and takes the link count, the file type and the size
+  limit from that one `fstat`, then reads the content from the same descriptor.
+  There is no name left in the loop to substitute.
+
+  This needed no parser API change. The note that said otherwise was wrong:
+  `trait Parser` is bytes in, text out — the PDF and Office parsers wrap
+  `Cursor::new(bytes)` and never touch the filesystem — so the six `fs::read`
+  call sites were the whole surface.
+
+  Three things ride along, because the handle was already open and the metadata
+  already fetched:
+
+  - **The size cap is enforced on the handle**, not only on an earlier `stat` of
+    the path. The path-based checks still run as the cheap pre-filter; this one
+    is the limit that cannot be swapped past, which matters for exactly the
+    reason the rest of this entry exists. The read is bounded a second time as it
+    runs, so a file that grows underneath cannot outrun it either.
+  - **Non-regular files are refused.** A named pipe left in place of a note used
+    to hang `get_document` on Unix, which never had an `is_file()` check at all.
+  - **On Unix the open carries `O_NOFOLLOW` and `O_NONBLOCK`**, so a *symlink*
+    renamed over a collected path is refused rather than followed, and a FIFO
+    cannot park the index run. Windows deliberately gets neither: creating a
+    symlink there needs administrator privilege (measured), and refusing reparse
+    points would refuse every OneDrive placeholder. An intermediate directory
+    swapped for a symlink stays out of reach on both — that needs `openat2`.
+
+  Still not closed, and now written down in the module docs, both READMEs and
+  `.dev/known-issues.md`: link-then-unlink leaves a count of 1 and is
+  indistinguishable from a file that was always there; and the count is only what
+  the filesystem reports, so a knowledge base on FAT32, exFAT or a network share
+  gets nothing from this guard at all.
+
+  `rename_single_file` gained a `RenamedButRefused` outcome, following the
+  `RenamedSizeCapped` precedent: `rename_document` has already committed by the
+  time the new path is read, so a refusal there is neither a failure nor a
+  successful reindex and must not be logged as either. `SingleResult` gained a
+  `Refused` variant to carry it — the rename path reads the file twice (once to
+  hash, once to index), and the premise of this whole guard is that a path can
+  change between two reads, so a refusal on the second one has to survive rather
+  than fall into a catch-all that reports a successful rename.
+
 ### Fixed
 
 - **An installed service now names its own config file, so it is trusted

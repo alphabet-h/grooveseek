@@ -86,6 +86,16 @@ quick-xml = "0.41"
 # `kb-mcp service install --with-tray` can call into the tray's
 # shell:startup shortcut installer. Library API only — the
 # `kb-mcp-tray.exe` binary is shipped separately via cargo-dist.
+# (BU-20) `O_NOFOLLOW` / `O_NONBLOCK` for the read-time open in `src/links.rs`,
+# and `ELOOP` to tell a refused symlink from a real I/O failure. The constants
+# differ per target OS, which is exactly what this crate exists to get right —
+# hard-coding them would be the kind of "works on Linux" guess this repo avoids.
+# Already in the dependency tree (rusqlite's bundled SQLite pulls it in), so this
+# adds no build. Windows is guarded differently and needs none of it; see the
+# module docs for why.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 kb-mcp-tray = { path = "../crates/kb-mcp-tray" }
 # (BU-20) `GetFileInformationByHandle` for the hard-link count. The stable
