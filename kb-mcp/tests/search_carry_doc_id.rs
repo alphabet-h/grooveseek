@@ -29,6 +29,7 @@ fn search_result_carries_document_id() {
             &[],
             None,
             "hash123",
+            0,
         )
         .expect("upsert_document");
 

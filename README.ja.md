@@ -586,6 +586,21 @@ kb-mcp validate --kb-path ... --format github         # CI 用 ::error annotatio
 
 > `--strict` フラグは現状 no-op (将来のより厳格な検証モードへの前方互換のため受理されるだけ)。当面は通常の呼び出しで OK。
 
+### 索引そのものを検査する (v0.23.0+)
+
+`kb-mcp validate` が検査するのは**文書**。`kb-mcp doctor` が検査するのは**索引**:
+
+```bash
+kb-mcp doctor --kb-path /path/to/knowledge-base
+kb-mcp doctor --kb-path ... --format json | jq '.findings[]'
+```
+
+検索は 1 つの chunk について 3 つのテーブルが一致していることを前提にしている — 本文・embedding・全文検索行。**ずれてもエラーにはならない**: embedding の無い chunk は単にベクトル検索に出ず、全文検索行の無い chunk はキーワード検索に出ないだけ。これまでは full index を回して修復されるのを見るまで気付けなかった。`doctor` は直接それを問う。あわせて、MCP の resource 面が**どの索引済み文書を提示していないか、なぜか**も報告する — 現在の `[parsers].enabled` に無い拡張子 / resource read が返せるサイズを超える文書 / 以前のバージョンで索引されたため size が未記録の文書。
+
+終了コード: `0` (報告なし) / `1` (検出あり) / `2` (実行できない — 大抵は索引が無い)。**報告するだけで修復はしない**。各検出には直し方が併記される (構造的なものはすべて `kb-mcp index` か `kb-mcp index --force`)。
+
+> `search` / `eval` と同様、本コマンドは DB を開くので、**未適用の schema migration があれば走る**。検出結果については read-only だが、ファイルについてはそうではない。
+
 ### Golden query セットに対する retrieval 品質評価
 
 **任意のパワーユーザ機能**。`kb-mcp eval` は「想定される正解がわかっている質問」の小さなファイルを、`search` ツールと同じハイブリッド検索にかけ、**recall@k / MRR / nDCG@k** + 前回実行との差分を出す。モデル比較や `[quality_filter]` / RRF パラメータのチューニング時に便利。
@@ -900,7 +915,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `kb://topic/<prefix>` | **topic group** = パスの先頭 1〜2 セグメント。indexer が `category` / `topic` を導出するのと同じ規則。read するとその配下の文書一覧 (URI 付き) が Markdown で返る。`kb://topic/` は root group |
 | `kb://doc/<path>` | 索引済みの文書 1 件。列挙はせず**テンプレートとして公開**する |
 
-`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。listing もこの `uri` も**現在の parser registry で絞る**: `[parsers].enabled` を狭めて再 index しないと、外した拡張子の行は索引にも検索結果にも残るが、read が拒否する以上 resource としては提示しない。
+`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。listing もこの `uri` も**同一の述語**から来るので、同じ文書について両者が食い違うことはない。索引に残り検索でも見つかるまま、提示だけ外れる要因が 2 つある。1 つは**現在の parser registry**: `[parsers].enabled` を狭めて再 index しないと、外した拡張子の行は索引にも検索結果にも残るが、read が拒否する以上提示しない。もう 1 つは **size** (v0.23.0+): 1 MiB を超える Markdown / テキスト文書は `resources/read` が返す量を超えるので、これも提示しない (`search` hit は残り、`uri` だけが付かない)。同じサイズでも PDF や表計算は提示され続ける — read が拒否ではなく抽出テキストを切り詰めるため。size は index 時に記録される。以前のバージョンで索引した文書は size 未記録で、**次の `kb-mcp index` まで提示されたまま**になる (その 1 回で再 embed 無しに埋まる)。件数は `kb-mcp doctor` が報告する。根拠は [ADR-0005](docs/decisions/0005-record-document-size-in-the-index.ja.md)。
 
 区切りは forward slash のまま、それ以外は percent-encode するので、空白や非 ASCII を含むパスでも正しい ASCII URI になる。
 

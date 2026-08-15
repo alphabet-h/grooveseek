@@ -594,6 +594,21 @@ Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When
 
 > The `--strict` flag is currently a no-op (accepted for forward compatibility with future stricter checking modes). Use the regular invocation for now.
 
+### Check the index itself (v0.23.0+)
+
+`kb-mcp validate` checks your documents. `kb-mcp doctor` checks the **index**:
+
+```bash
+kb-mcp doctor --kb-path /path/to/knowledge-base
+kb-mcp doctor --kb-path ... --format json | jq '.findings[]'
+```
+
+Search reads three tables that have to agree about a chunk — its text, its embedding, and its full-text row. When they stop agreeing nothing errors: a chunk with no embedding is simply never a vector hit, and one with no full-text row is never a keyword hit. Until now the only way to find out was to run a full index and watch it repair things. `doctor` asks directly, and also reports which indexed documents the MCP resource surface is holding back and why — an extension no longer in `[parsers].enabled`, a document larger than a resource read returns, or a size not recorded yet because it was indexed by an earlier version.
+
+Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index). Findings are reported, never repaired: each one names the command that fixes it, which is `kb-mcp index` or `kb-mcp index --force` for everything structural.
+
+> Like `search` and `eval`, this opens the database, and opening it applies any pending schema migration. It is read-only about its findings, not about the file.
+
 ### Evaluate retrieval quality against a golden query set
 
 **Optional power-user feature.** `kb-mcp eval` takes a small file of questions with known answers, runs them through the same hybrid search the `search` tool uses, and reports **recall@k / MRR / nDCG@k** with diffs against the previous run. Useful when comparing models or tuning `[quality_filter]` / RRF parameters.
@@ -910,7 +925,7 @@ They are fixed at compile time rather than configurable. Prompt text goes to the
 | `kb://topic/<prefix>` | A **topic group** — the first one or two path segments, the same derivation the indexer uses for `category` and `topic`. Reading one returns a Markdown list of the documents under it, with their URIs. `kb://topic/` is the root group. |
 | `kb://doc/<path>` | One indexed document, by its knowledge-base-relative path. Advertised as a template rather than enumerated. |
 
-`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on `search` hits — the specification permits handing back links to documents a listing never enumerated. Both the listing and that field are filtered by the active parser registry: if you narrow `[parsers].enabled` without reindexing, the rows for the dropped extensions stay in the index and stay in search results, but they are no longer offered as resources, because a read would refuse them.
+`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on `search` hits — the specification permits handing back links to documents a listing never enumerated. Both the listing and that field come from one predicate, so they always agree about a document. Two things take a document off offer while leaving it indexed and findable. The first is the active parser registry: if you narrow `[parsers].enabled` without reindexing, the rows for the dropped extensions stay in the index and stay in search results, but they are no longer offered, because a read would refuse them. The second is size (v0.23.0+): a Markdown or text document over 1 MiB is more than `resources/read` will return, so it is not offered either — its `search` hit stays, without a `uri`. A PDF or spreadsheet over that size is still offered, because a read truncates its extracted text rather than refusing it. Sizes are recorded during indexing; documents indexed by an earlier version have no size recorded and stay on offer until the next `kb-mcp index`, which fills them in without re-embedding. `kb-mcp doctor` reports both counts. Reasoning: [ADR-0005](docs/decisions/0005-record-document-size-in-the-index.md).
 
 Separators stay as forward slashes; everything else is percent-encoded, so a path with spaces or non-ASCII characters produces a valid ASCII URI.
 

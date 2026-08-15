@@ -482,7 +482,7 @@ fn a_withdrawn_parser_id_does_not_cost_the_user_their_index() {
         let db = kb_mcp::db::Database::open(&db_path.to_string_lossy()).unwrap();
         db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
         let doc_id = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(doc_id, 0, None, None, "body", None, &vec![0.1f32; 384], 1.0)
             .unwrap();

@@ -281,6 +281,203 @@ impl Database {
         Ok(count)
     }
 
+    /// 既存 `documents` 行の `size_bytes` を**上書き**する (feature-51)。
+    ///
+    /// 走査したパスについて **kb-mcp が最後に測った実サイズ**を書く。条件付きの
+    /// 「NULL のときだけ埋める」版があったが、それでは *古い記録* を直せず、
+    /// 「cap を超えて成長した」「元に戻って cap 内になった」の**どちらの向きにも**
+    /// stale な行が残った (codex P2 round 4-5)。この列は「read がこのファイルを
+    /// 返せるか」を答えるためにあるので、真は常に**最後の実測値**。
+    ///
+    /// **これが無いと新列は事実上埋まらない**点も引き継ぐ: `rebuild_index` は
+    /// content hash が一致する文書を `SingleResult::Unchanged` で返し、
+    /// `upsert_document` も `update_document_meta` も通らないので、既存 KB の
+    /// 大多数は列が追加されたことに気付かないまま NULL で残る。
+    ///
+    /// 行が無い path は何も更新しない (未索引ファイル / 初回登録の前段)。
+    pub fn record_document_sizes(&self, sizes: &[(&str, u64)]) -> Result<u32> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE documents SET size_bytes = ?2 WHERE path = ?1")?;
+        let mut count = 0u32;
+        for (path, size) in sizes {
+            count += stmt.execute(params![path, *size as i64])? as u32;
+        }
+        Ok(count)
+    }
+
+    /// 記録済み `size_bytes` が `min_bytes` を **超える** document を
+    /// `(path, size_bytes)` で返す (feature-51)。
+    ///
+    /// 呼び出し側は「read cap のうち最小のもの」を渡し、返ってきた短いリストに
+    /// 拡張子ごとの cap を当てる。cap の分岐は SQL では表現できない一方、
+    /// **cap を超え得る文書だけを Rust に上げれば済む**ので、全行を読む必要はない。
+    /// 実測では参照 KB 666 件中 0 件が該当する。
+    ///
+    /// `size_bytes` が NULL の行は `>` が真にならないので**返らない** = 未記録の
+    /// 文書は「大きすぎる」と判定されない。これは意図した fail open で、
+    /// 移行直後に KB 全体が提示から消えるのを防ぐ。
+    pub fn documents_larger_than(&self, min_bytes: u64) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size_bytes FROM documents WHERE size_bytes > ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![min_bytes as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        rows.into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// `size_bytes` が未記録 (NULL) の document 数 (feature-51)。
+    /// `kb-mcp doctor` が「1 回 index すれば埋まる」件数として報告する。
+    pub fn documents_without_recorded_size(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE size_bytes IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    // -- feature-51: `kb-mcp doctor` の整合性検査 -----------------------------
+    //
+    // 索引は 3 つのテーブルが 1 つの chunk について一致していることを前提に
+    // 検索する: `chunks` が本文、`vec_chunks` が embedding、`fts_chunks` が
+    // 全文検索行。**ずれても検索はエラーにならず、静かに取りこぼすだけ**なので、
+    // 問える手段が要る。`backfill_fts` が存在すること自体が「fts 行の欠損は
+    // 実際に起きる」の証拠で、これまでは full index を回すまで気付けなかった。
+
+    /// 指定名のテーブル (仮想テーブルを含む) が存在するか。
+    /// `vec_chunks` は embedding meta が書かれるまで作られないので、
+    /// 検査の前に必ず確認する。
+    fn has_table(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 1 本の検査 SQL を「全件数」と「先頭 `sample_limit` 件のラベル」で答える。
+    ///
+    /// `label_sql` は **本モジュール内のリテラルのみ**を渡す (呼び出し側の入力を
+    /// 混ぜない) ので、`format!` による組み立てに injection の面は無い。
+    fn scan(&self, label_sql: &str, sample_limit: usize) -> Result<IntegrityScan> {
+        // rusqlite has no `FromSql for u64`; SQLite counts are i64 and never
+        // negative, so the cast is the narrowing one it looks like.
+        let count: i64 =
+            self.conn
+                .query_row(&format!("SELECT COUNT(*) FROM ({label_sql})"), [], |row| {
+                    row.get(0)
+                })?;
+        let count = count as u64;
+        if count == 0 {
+            return Ok(IntegrityScan::default());
+        }
+        let mut stmt = self.conn.prepare(&format!("{label_sql} LIMIT ?1"))?;
+        let samples = stmt
+            .query_map(params![sample_limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(IntegrityScan { count, samples })
+    }
+
+    /// `vec_chunks` テーブル自体が無いのに chunk が存在するか (feature-51)。
+    ///
+    /// この状態では**ベクトル検索が 1 件も返せない**が、下の 2 つの scan は
+    /// 「走査対象が無い」= clean を返すしかない。テーブル欠損を独立した所見に
+    /// しないと、FTS 行が揃っていれば `doctor` が "No issues found" と言って
+    /// しまう (codex P1 round 1)。
+    pub fn vector_table_missing_with_chunks(&self) -> Result<Option<u32>> {
+        if self.has_table("vec_chunks")? {
+            return Ok(None);
+        }
+        let chunks = self.chunk_count()?;
+        Ok((chunks > 0).then_some(chunks))
+    }
+
+    /// 本文はあるが embedding が無い chunk。ベクトル検索から抜け落ちる。
+    ///
+    /// テーブルごと無い場合は 0 件を返す (走査できないため)。その状態は
+    /// [`Self::vector_table_missing_with_chunks`] が別の所見として報告する。
+    pub fn chunks_without_embedding(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        if !self.has_table("vec_chunks")? {
+            return Ok(IntegrityScan::default());
+        }
+        self.scan(
+            "SELECT d.path || ' #' || c.chunk_index
+             FROM chunks c JOIN documents d ON d.id = c.document_id
+             WHERE c.id NOT IN (SELECT chunk_id FROM vec_chunks)
+             ORDER BY d.path, c.chunk_index",
+            sample_limit,
+        )
+    }
+
+    /// 対応する chunk が消えたのに残っている embedding。KNN が実体の無い
+    /// chunk_id を返し、JOIN で落ちるので検索結果が黙って減る。
+    pub fn embeddings_without_chunk(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        if !self.has_table("vec_chunks")? {
+            return Ok(IntegrityScan::default());
+        }
+        self.scan(
+            "SELECT 'vec_chunks chunk_id ' || chunk_id FROM vec_chunks
+             WHERE chunk_id NOT IN (SELECT id FROM chunks)
+             ORDER BY chunk_id",
+            sample_limit,
+        )
+    }
+
+    /// FTS 行が無い chunk。全文検索側からだけ見えなくなる
+    /// (`backfill_fts` が次の index で補充する)。
+    pub fn chunks_without_fts(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT d.path || ' #' || c.chunk_index
+             FROM chunks c JOIN documents d ON d.id = c.document_id
+             WHERE c.id NOT IN (SELECT rowid FROM fts_chunks)
+             ORDER BY d.path, c.chunk_index",
+            sample_limit,
+        )
+    }
+
+    /// 対応する chunk が消えたのに残っている FTS 行。
+    pub fn fts_without_chunk(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT 'fts_chunks rowid ' || rowid FROM fts_chunks
+             WHERE rowid NOT IN (SELECT id FROM chunks)
+             ORDER BY rowid",
+            sample_limit,
+        )
+    }
+
+    /// `document_id` に対応する `documents` 行が無い chunk (codex P2 round 6)。
+    ///
+    /// 外部キーは宣言してあるが、`PRAGMA foreign_keys` を切った別接続や破損で
+    /// 実際に起き得る。**他のどの検査にも映らない**のが問題で、chunk 側の 2 つは
+    /// `documents` を INNER JOIN するので、この chunk は走査対象から落ちる —
+    /// vec / FTS 行が揃っていれば `doctor` は「異常なし」と言い、検索は
+    /// document join で毎回この chunk を落とす。
+    /// [`Self::documents_without_chunks`] のちょうど裏返し。
+    pub fn chunks_without_document(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT 'chunk ' || c.id || ' (document_id ' || c.document_id || ')'
+             FROM chunks c
+             WHERE c.document_id NOT IN (SELECT id FROM documents)
+             ORDER BY c.id",
+            sample_limit,
+        )
+    }
+
+    /// chunk を 1 つも持たない document。検索には決して出ない。
+    pub fn documents_without_chunks(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT path FROM documents
+             WHERE id NOT IN (SELECT DISTINCT document_id FROM chunks)
+             ORDER BY path",
+            sample_limit,
+        )
+    }
+
     /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
     /// チャンクを検出し、[`quality::chunk_quality_score`] で再計算して UPDATE する (冪等)。
     ///

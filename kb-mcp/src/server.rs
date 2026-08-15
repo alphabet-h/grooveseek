@@ -342,10 +342,12 @@ pub(crate) enum LoadFailure {
 /// `resources/list` never enumerated, which is what makes the topic-group
 /// listing and per-document addressing coexist.
 ///
-/// The key is **omitted** for a hit whose extension the active parser registry
-/// no longer covers. Such a row stays in the index on purpose (AU-06) and stays
-/// in the search results, but neither `get_document` nor `resources/read` will
-/// open it — so the honest answer is no link, not a broken one.
+/// The key is **omitted** for a hit [`ServableRules`] would not hand over —
+/// an extension the active parser registry no longer covers, or a document
+/// past the size a read is allowed to return. Such a row stays in the index on
+/// purpose (AU-06) and stays in the search results, but neither `get_document`
+/// nor `resources/read` will open it — so the honest answer is no link, not a
+/// broken one.
 #[derive(Serialize)]
 struct HitWithUri {
     #[serde(flatten)]
@@ -355,10 +357,95 @@ struct HitWithUri {
 }
 
 impl HitWithUri {
-    fn new(hit: crate::db::SearchHit, registry: &Registry) -> Self {
-        let uri = crate::indexer::extension_is_registered(&hit.path, registry)
+    fn new(hit: crate::db::SearchHit, rules: &ServableRules<'_>) -> Self {
+        let uri = rules
+            .allows(&hit.path)
             .then(|| crate::resources::doc_uri(&hit.path));
         Self { hit, uri }
+    }
+}
+
+/// The single decision about whether an indexed document can be handed over.
+///
+/// Two surfaces ask it — `resources/list` through
+/// [`KbCore::servable_document_paths`], and the `uri` on every `search` hit —
+/// and each used to call [`crate::indexer::extension_is_registered`] itself.
+/// That was harmless only for as long as the two predicates were the same one
+/// call: adding the size condition to the listing alone is precisely what
+/// makes a `search` hand out a `kb://doc/...` that `resources/read` then
+/// refuses, which is the shape of the finding this closes.
+///
+/// Loading it costs one query that normally returns nothing: only rows past
+/// the *smallest* read cap can be excluded, and a knowledge base with no
+/// document over 1 MiB has none.
+pub(crate) struct ServableRules<'a> {
+    registry: &'a Registry,
+    oversized: std::collections::HashSet<String>,
+    /// False when the recorded sizes could not be read at all. An empty
+    /// `oversized` then means "found none", which is the opposite of what the
+    /// caller knows, so the two states must not share a representation
+    /// (codex P2 round 1).
+    sizes_known: bool,
+}
+
+impl<'a> ServableRules<'a> {
+    /// `rows` は `documents_larger_than(GET_DOCUMENT_MAX_BYTES)` の結果。
+    /// 拡張子ごとの本当の cap は [`max_bytes_for`] で当てる —
+    /// `load_document_blocking` が `read_checked` に渡すのと**同じ chooser** なので、
+    /// 提示側と read 側が別々の上限を持つことが構造的に起こらない。
+    pub(crate) fn new(registry: &'a Registry, rows: Vec<(String, u64)>) -> Self {
+        let oversized = rows
+            .into_iter()
+            .filter(|(path, size)| {
+                let ext = std::path::Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                *size
+                    > max_bytes_for(
+                        registry,
+                        ext,
+                        crate::parser::MAX_RAW_BINARY_BYTES,
+                        GET_DOCUMENT_MAX_BYTES,
+                    )
+            })
+            .map(|(path, _)| path)
+            .collect();
+        Self {
+            registry,
+            oversized,
+            sizes_known: true,
+        }
+    }
+
+    /// The rules to use when the sizes could not be read.
+    ///
+    /// Offers nothing. A URI a client cannot follow is worse than no URI, and
+    /// an empty oversized set would claim the opposite of what is known.
+    pub(crate) fn sizes_unavailable(registry: &'a Registry) -> Self {
+        Self {
+            registry,
+            oversized: std::collections::HashSet::new(),
+            sizes_known: false,
+        }
+    }
+
+    pub(crate) fn allows(&self, path: &str) -> bool {
+        self.sizes_known
+            && crate::indexer::extension_is_registered(path, self.registry)
+            && !self.oversized.contains(path)
+    }
+
+    /// The documents held back for their size, sorted so a report is stable.
+    ///
+    /// `kb-mcp doctor` explains what the resource surface is withholding, and
+    /// it has to explain *this* predicate rather than recompute an equivalent
+    /// one — a doctor that answers a slightly different question than the
+    /// server is worse than no doctor.
+    pub(crate) fn oversized_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.oversized.iter().cloned().collect();
+        v.sort();
+        v
     }
 }
 
@@ -593,10 +680,24 @@ impl KbCore {
             min_confidence_ratio: params.min_confidence_ratio,
         };
 
+        // The `uri` on a hit and the URIs `resources/list` offers have to be the
+        // same set, so both go through `ServableRules` rather than each testing
+        // the registry on its own. The lock is still held from the search above.
+        let rules = match db.documents_larger_than(GET_DOCUMENT_MAX_BYTES) {
+            Ok(oversized) => ServableRules::new(&self.parser_registry, oversized),
+            Err(e) => {
+                // A hit without a `uri` is a hit a client cannot follow, which
+                // is a smaller loss than failing the search outright — and a
+                // smaller one than a link a read refuses.
+                tracing::warn!("could not read document sizes; search hits lose their uri: {e}");
+                ServableRules::sizes_unavailable(&self.parser_registry)
+            }
+        };
+
         let resp = SearchResponse {
             results: hits
                 .into_iter()
-                .map(|h| HitWithUri::new(h, &self.parser_registry))
+                .map(|h| HitWithUri::new(h, &rules))
                 .collect(),
             low_confidence,
             filter_applied: echo,
@@ -639,15 +740,18 @@ impl KbCore {
     /// rather than at each of the three places that emit a URI. That is the
     /// same reason `load_document_blocking` exists at all.
     fn servable_document_paths(&self) -> Result<Vec<String>, String> {
-        let paths = {
+        let (paths, oversized) = {
             let db = recover_db(self.db.lock());
-            db.all_document_paths()
-                .map_err(|e| format!("failed to list indexed documents: {e}"))?
+            let paths = db
+                .all_document_paths()
+                .map_err(|e| format!("failed to list indexed documents: {e}"))?;
+            let oversized = db
+                .documents_larger_than(GET_DOCUMENT_MAX_BYTES)
+                .map_err(|e| format!("failed to read indexed document sizes: {e}"))?;
+            (paths, oversized)
         };
-        Ok(paths
-            .into_iter()
-            .filter(|p| crate::indexer::extension_is_registered(p, &self.parser_registry))
-            .collect())
+        let rules = ServableRules::new(&self.parser_registry, oversized);
+        Ok(paths.into_iter().filter(|p| rules.allows(p)).collect())
     }
 
     /// The topic groups `resources/list` answers from.
@@ -703,14 +807,22 @@ impl KbCore {
                 Ok((out, "text/markdown"))
             }
             crate::resources::ResourceUri::Doc(rel) => {
-                // Membership first. A document that is not indexed was never
-                // offered, and `resources/read` is for what was offered — this
-                // is strictly narrower than `get_document`, so it cannot widen
+                // Membership first. `resources/read` is for what was offered —
+                // strictly narrower than `get_document`, so it cannot widen
                 // what is reachable.
+                //
+                // The message says "offers", not "indexed", because those
+                // stopped being the same thing: a document can be indexed and
+                // still be held back, by an extension the registry dropped or a
+                // size past what a read returns. Naming the index would send
+                // someone looking for a document `kb-mcp status` counts.
                 if !paths.iter().any(|p| p == rel) {
                     return Err((
                         LoadFailure::NotServed,
-                        format!("not an indexed document: {uri}"),
+                        format!(
+                            "not a document this server offers: {uri} \
+                             (if it is indexed, `kb-mcp doctor` says why it is held back)"
+                        ),
                     ));
                 }
                 // Then the guards, by sharing the body `get_document` uses
@@ -4114,7 +4226,7 @@ mod tests {
         let emb = |v: f32| vec![v; 384];
 
         let doc = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha", 0)
             .unwrap();
         db.insert_chunk(
             doc,
@@ -4192,7 +4304,7 @@ mod tests {
             .expect("verify_embedding_meta");
         let emb = |v: f32| vec![v; 384];
         let doc = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha", 0)
             .unwrap();
         db.insert_chunk(
             doc,
@@ -4652,6 +4764,179 @@ mod tests {
             "the raw index query must appear exactly once inside `impl KbCore`, \
              in `servable_document_paths`. Any other call site skips the parser \
              registry filter and advertises a URI a read will refuse."
+        );
+    }
+
+    // -- feature-51: size is part of what "servable" means -------------------
+
+    /// The companion to the scan above, for the half it could not see.
+    ///
+    /// `HitWithUri::new` lives outside `impl KbCore`, so the listing test never
+    /// covered it — and it called `extension_is_registered` directly, which is
+    /// how `search` and `resources/list` could come to disagree the moment one
+    /// of them grew a second condition. Both now go through `ServableRules`,
+    /// and the way to keep it that way is for the raw predicate to have exactly
+    /// one call site in this file.
+    #[test]
+    fn only_one_place_in_this_file_decides_what_is_servable() {
+        let src = include_str!("server.rs").replace("\r\n", "\n");
+        // Scan production code only: this test's own search string is a match
+        // for itself, and counting it made the assertion fail for a reason that
+        // had nothing to do with the invariant.
+        let tests_start = src
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("the test module header moved or was renamed");
+        let prod = &src[..tests_start];
+        assert!(
+            prod.contains("impl<'a> ServableRules<'a>"),
+            "the extraction broke: the predicate is not in the scanned region, \
+             so the count below would be vacuous."
+        );
+        // Doc comments name the function too; count the calls, not the mentions.
+        let calls = prod.matches("extension_is_registered(").count();
+        assert_eq!(
+            calls, 1,
+            "`extension_is_registered` must be called only from \
+             `ServableRules::allows`. A second call site is a second definition \
+             of \"servable\", and the size condition would apply to one of them."
+        );
+    }
+
+    fn md_and_pdf_registry() -> Registry {
+        Registry::from_enabled(&["md".to_string(), "pdf".to_string()]).expect("md + pdf registry")
+    }
+
+    #[test]
+    fn a_text_document_past_the_read_cap_is_not_offered() {
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(
+            &registry,
+            vec![
+                ("big.md".to_string(), GET_DOCUMENT_MAX_BYTES + 1),
+                ("exact.md".to_string(), GET_DOCUMENT_MAX_BYTES),
+            ],
+        );
+        assert!(
+            !rules.allows("big.md"),
+            "a read of this would be refused, so offering it is a broken link"
+        );
+        // The boundary belongs to the side that is served: `read_checked`
+        // refuses what is *over* the cap, so a document exactly at it is fine.
+        assert!(rules.allows("exact.md"));
+        // Not in the oversized set at all: the common case.
+        assert!(rules.allows("small.md"));
+    }
+
+    #[test]
+    fn a_large_binary_document_is_still_offered_because_a_read_truncates_it() {
+        let registry = md_and_pdf_registry();
+        // Same byte count as the refused Markdown above. The difference is the
+        // cap that applies: a PDF is read under the binary limit and its
+        // extracted text is truncated with a notice, never refused.
+        let rules = ServableRules::new(
+            &registry,
+            vec![("big.pdf".to_string(), GET_DOCUMENT_MAX_BYTES + 1)],
+        );
+        assert!(
+            rules.allows("big.pdf"),
+            "a binary document over the *text* cap is still readable"
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_size_is_not_read_as_too_large() {
+        let registry = md_and_pdf_registry();
+        // `documents_larger_than` cannot return a NULL row, so an index written
+        // before feature-51 produces an empty list and every document stays on
+        // offer. Upgrading must not empty `resources/list`.
+        let rules = ServableRules::new(&registry, Vec::new());
+        assert!(rules.allows("legacy.md"));
+    }
+
+    /// codex P2 round 1: an empty oversized set means "there are none", which
+    /// is the opposite of what a failed query knows. Sharing one representation
+    /// let a size-read failure hand out every URI, including the ones a read
+    /// refuses — the exact defect this feature exists to close.
+    #[test]
+    fn a_failed_size_lookup_withholds_uris_rather_than_handing_out_all_of_them() {
+        let registry = md_and_pdf_registry();
+        let unknown = ServableRules::sizes_unavailable(&registry);
+        assert!(!unknown.allows("notes/a.md"));
+        assert!(!unknown.allows("notes/huge.md"));
+
+        // Same empty vector, but as an answer rather than a failure.
+        let known = ServableRules::new(&registry, Vec::new());
+        assert!(known.allows("notes/a.md"));
+    }
+
+    #[test]
+    fn an_extension_the_registry_dropped_is_still_not_offered() {
+        // The feature-50 rule has to survive the new one being added next to it.
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        assert!(!rules.allows("legacy/old.xls"));
+        assert!(!rules.allows("no_extension"));
+    }
+
+    /// The three surfaces have to answer alike about the same document.
+    ///
+    /// `resources/list` builds its topic bodies from `servable_document_paths`,
+    /// `search` stamps a `uri` per hit, and `resources/read` decides whether to
+    /// serve. A document this test puts past the cap must be absent from all
+    /// three, and its neighbour just under the cap present in all three.
+    #[test]
+    fn the_listing_the_search_uri_and_the_read_agree_about_one_document() {
+        let registry = md_and_pdf_registry();
+        let rows = vec![
+            ("notes/huge.md".to_string(), GET_DOCUMENT_MAX_BYTES + 1),
+            ("notes/fine.md".to_string(), GET_DOCUMENT_MAX_BYTES),
+        ];
+        let rules = ServableRules::new(&registry, rows);
+
+        // 1. What a listing would enumerate.
+        let all = [
+            "notes/huge.md".to_string(),
+            "notes/fine.md".to_string(),
+            "notes/small.md".to_string(),
+        ];
+        let listed: Vec<&String> = all.iter().filter(|p| rules.allows(p)).collect();
+        assert_eq!(
+            listed,
+            vec!["notes/fine.md", "notes/small.md"],
+            "the listing drops only the document a read would refuse"
+        );
+
+        // 2. What `search` stamps on a hit — the same rules value, so the two
+        //    cannot drift without this test failing.
+        let hit = |path: &str| {
+            let mut h = crate::db::SearchHit {
+                score: 1.0,
+                path: path.to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: String::new(),
+                match_spans: None,
+                expanded_from: None,
+            };
+            h.content = "x".to_string();
+            HitWithUri::new(h, &rules).uri
+        };
+        assert_eq!(hit("notes/huge.md"), None, "no link a read would reject");
+        assert_eq!(
+            hit("notes/fine.md"),
+            Some("kb://doc/notes/fine.md".to_string())
+        );
+
+        // 3. `read_resource_blocking` checks membership against the very list
+        //    from step 1, so the refusal follows from the same predicate rather
+        //    than from a second copy of the rule.
+        assert!(
+            !listed.iter().any(|p| *p == "notes/huge.md"),
+            "a read is bounded by the listing, so dropping it there is what \
+             makes the read refuse"
         );
     }
 }

@@ -41,6 +41,14 @@ enum SearchFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DoctorFormat {
+    /// Human-readable (default).
+    Text,
+    /// JSON object for scripts / CI.
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ValidateFormat {
     /// Human-readable (default). Uses ANSI color when stdout is a TTY.
     Text,
@@ -207,6 +215,29 @@ enum Commands {
         /// Output format
         #[arg(long, value_enum, default_value_t = SearchFormat::Json)]
         format: SearchFormat,
+    },
+    /// Check the index for inconsistencies and report them.
+    ///
+    /// Answers two kinds of question. Whether the three tables search reads —
+    /// chunks, their embeddings, their full-text rows — still agree, since when
+    /// they stop agreeing nothing errors and results are simply lost. And which
+    /// indexed documents the MCP resource surface is holding back, and why.
+    ///
+    /// Reports only; it never modifies the index. Each finding names the
+    /// command that fixes it.
+    ///
+    /// Exit code: 0 (nothing to report), 1 (findings), 2 (could not run).
+    ///
+    /// Note: like `search` and `eval`, this opens the database, and opening it
+    /// applies any pending schema migration. It is read-only about its
+    /// findings, not about the file.
+    Doctor {
+        /// Path to the knowledge-base directory
+        #[arg(long)]
+        kb_path: Option<PathBuf>,
+        /// Output format: text (human), json (machine)
+        #[arg(long, value_enum, default_value_t = DoctorFormat::Text)]
+        format: DoctorFormat,
     },
     /// Validate frontmatter against a TOML schema file.
     ///
@@ -560,7 +591,20 @@ fn main() -> anyhow::Result<()> {
         return run_service(action);
     }
 
-    let discovered = Config::discover(cli.config.as_deref())?;
+    let discovered = match Config::discover(cli.config.as_deref()) {
+        Ok(d) => d,
+        // `doctor` promises exit 2 for "could not run", and a configuration it
+        // cannot load means the inspection never happened. Carrying this out
+        // with `?` would exit 1 — the code reserved for an inspection that
+        // completed and found something (codex P2 round 3). Same shape as the
+        // service arm above: which command was asked for changes what a
+        // discovery failure means.
+        Err(e) if matches!(cli.command, Commands::Doctor { .. }) => {
+            eprintln!("kb-mcp doctor: could not load configuration: {e:#}");
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e),
+    };
     let (cfg, source) = (discovered.config, discovered.source);
     // (BU-07) `source` の variant 名だけでは「どのファイルが勝ったのか」も
     // 「その中身をどこまで信用したのか」も分からない。両方を 1 行に載せる。
@@ -977,6 +1021,21 @@ fn main() -> anyhow::Result<()> {
             let g = kb_mcp::graph::build_connection_graph(&db, &start, &opts)?;
             print_graph(g, format);
         }
+        Commands::Doctor { kb_path, format } => {
+            // `require_kb_path` inside the mapping, not before it (codex P2
+            // round 2): a missing --kb-path is the most ordinary way for this
+            // command to fail to run, and letting `?` carry it to `main` would
+            // exit 1 — the code the contract reserves for a completed
+            // inspection that found something.
+            let exit = match require_kb_path(kb_path, cfg.kb_path.clone()) {
+                Ok(kb_path) => run_doctor(&kb_path, &cfg, format)?,
+                Err(e) => {
+                    eprintln!("kb-mcp doctor: {e:#}");
+                    2
+                }
+            };
+            std::process::exit(exit);
+        }
         Commands::Validate {
             kb_path,
             schema,
@@ -1295,6 +1354,72 @@ fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// doctor サブコマンド本体。exit code (0/1/2) を返す。
+///
+/// 出力は **stdout** (= コマンドの結果)。進捗や診断は stderr、という
+/// CLAUDE.md の CLI 出力規約に従い、`validate` / `search` と同じ側に置く。
+fn run_doctor(kb_path: &Path, cfg: &kb_mcp::config::Config, format: DoctorFormat) -> Result<i32> {
+    let db_path = kb_mcp::resolve_db_path(kb_path);
+    if !db_path.exists() {
+        // 索引が無いのは「問題を検出した」ではなく「検査できない」。
+        eprintln!(
+            "No index found. Run `kb-mcp index --kb-path {}` first.",
+            kb_path.display()
+        );
+        return Ok(2);
+    }
+    // Every failure below is "could not look", which the documented contract
+    // gives exit 2. Propagating them with `?` would let `main`'s Termination
+    // exit 1 — the same code a successful run that found problems uses, so a CI
+    // gate could not tell a corrupt database from a finding (codex P2 round 1).
+    let looked = (|| -> Result<kb_mcp::doctor::Report> {
+        let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
+        let registry = cfg.build_parser_registry()?;
+        kb_mcp::doctor::run(&db, &registry)
+    })();
+    let report = match looked {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("kb-mcp doctor: could not inspect the index: {e:#}");
+            return Ok(2);
+        }
+    };
+    print_doctor_report(&report, format);
+    Ok(i32::from(!report.is_clean()))
+}
+
+fn print_doctor_report(report: &kb_mcp::doctor::Report, format: DoctorFormat) {
+    match format {
+        DoctorFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        DoctorFormat::Text => {
+            println!(
+                "kb-mcp doctor — {} document(s), {} chunk(s)",
+                report.documents, report.chunks
+            );
+            if report.is_clean() {
+                println!("No issues found.");
+                return;
+            }
+            for f in &report.findings {
+                println!();
+                println!("[{}] {}: {}", f.severity.as_str(), f.check, f.summary);
+                for s in &f.samples {
+                    println!("    {s}");
+                }
+                if f.count as usize > f.samples.len() && !f.samples.is_empty() {
+                    println!("    ... and {} more", f.count as usize - f.samples.len());
+                }
+                println!("  fix: {}", f.remedy);
+            }
+        }
+    }
 }
 
 /// validate サブコマンド本体。exit code (0/1/2) を返す。

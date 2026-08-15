@@ -117,6 +117,10 @@ struct DiskEntry {
     hash: String,
     /// 実ファイルの絶対パス。embed/upsert 段階で再 `fs::read` する。
     full: std::path::PathBuf,
+    /// 走査時に読んだバイト数。hash を取るために全バイトを読んでいるので
+    /// 追加 I/O はゼロ。`documents.size_bytes` に記録され、`resources` が
+    /// 「read が拒むサイズの文書を提示しない」判定に使う (feature-51)。
+    size: u64,
 }
 
 /// [`scan_disk_entries`] の結果。`entries` = hash 計算済みの index 候補、
@@ -125,6 +129,13 @@ struct DiskEntry {
 struct DiskScan {
     entries: Vec<DiskEntry>,
     skipped: Vec<String>,
+    /// size cap で撥ねたファイルの **実測サイズ** (rel path, bytes)。
+    ///
+    /// 行は §4.2 で保持されるが、記録済みの `size_bytes` は「最後に索引できた
+    /// 時」の小さい値のまま = 提示され続け、read は現在のファイルを見て拒む。
+    /// ここで測った値を持ち帰って上書きする (codex P2 round 4)。**索引後に
+    /// 消えたファイル等と違い、これは知り得る** — たった今 stat したのだから。
+    oversize: Vec<(String, u64)>,
 }
 
 /// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
@@ -173,14 +184,32 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// Read a file for indexing through a handle whose identity has been checked
 /// (BU-20), turning a refusal into the per-file skip every caller already does.
 ///
-/// `Ok(None)` means "skip this file, and say why on stderr"; `Err` keeps
+/// `Ok((None, _))` means "skip this file, and say why on stderr"; `Err` keeps
 /// `std::fs::read`'s meaning so existing read-error handling is unchanged.
-fn read_for_index(full: &Path, rel: &str, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+///
+/// The second element is the length **when the refusal was about size**
+/// (codex P2 round 5). `size_cap_exceeded` stats the path and this reads the
+/// handle, so a file can cross the cap *between* the two — and then this check
+/// is the one that catches it. A wrapper that dropped the length existed for
+/// one round; it turned out every caller wanted it, because a row that says a
+/// file is small enough to serve when the read has just proved otherwise is
+/// what makes the resource surface offer something unreadable.
+fn read_for_index(
+    full: &Path,
+    rel: &str,
+    cap: u64,
+) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
     match crate::links::read_checked(full, cap)? {
-        crate::links::Content::Bytes(bytes) => Ok(Some(bytes)),
+        crate::links::Content::Bytes(bytes) => Ok((Some(bytes), None)),
         crate::links::Content::Refused(refused) => {
             eprintln!("Skipping {rel}: {}", refused.log_line(full));
-            Ok(None)
+            let measured = match refused {
+                crate::links::Refused::TooLarge { len, .. } => Some(len),
+                // The other refusals say nothing about size, so there is
+                // nothing to record and the row keeps what it had.
+                _ => None,
+            };
+            Ok((None, measured))
         }
     }
 }
@@ -208,6 +237,7 @@ fn scan_disk_entries(
     let binary_exts = registry.binary_extensions();
     let mut entries = Vec::with_capacity(source_files.len());
     let mut skipped = Vec::new();
+    let mut oversize = Vec::new();
 
     for p in source_files {
         let rel = p
@@ -222,6 +252,7 @@ fn scan_disk_entries(
             Ok(Some((len, cap))) => {
                 let kind = size_cap_kind(is_binary);
                 eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+                oversize.push((rel.clone(), len));
                 skipped.push(rel);
                 continue;
             }
@@ -242,15 +273,23 @@ fn scan_disk_entries(
         // decision belongs (§4.2, skip preserves).
         let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
         match read_for_index(p, &rel, cap) {
-            Ok(Some(bytes)) => {
+            Ok((Some(bytes), _)) => {
                 let hash = sha256_hex_bytes(&bytes);
                 entries.push(DiskEntry {
                     rel,
                     hash,
                     full: p.clone(),
+                    size: bytes.len() as u64,
                 });
             }
-            Ok(None) => {
+            Ok((None, measured)) => {
+                // (codex P2 round 5) The file can cross the cap between the
+                // stat above and this read, and then it is *this* check that
+                // catches it — so the length has to come from here too, or the
+                // row keeps a size the read has just disproved.
+                if let Some(len) = measured {
+                    oversize.push((rel.clone(), len));
+                }
                 skipped.push(rel);
             }
             Err(e) => {
@@ -260,7 +299,11 @@ fn scan_disk_entries(
         }
     }
 
-    DiskScan { entries, skipped }
+    DiskScan {
+        entries,
+        skipped,
+        oversize,
+    }
 }
 
 /// disk と DB の (path, hash) から「移動ペア」を決定する純粋関数。
@@ -508,6 +551,8 @@ pub fn rebuild_index(
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
     let disk_entries = scan.entries;
+    let scan_oversize = scan.oversize;
+
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
     let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
@@ -540,6 +585,43 @@ pub fn rebuild_index(
         }
         pairs.len() as u32
     };
+
+    // (feature-51) `documents.size_bytes` の欠損補充。`backfill_fts` と同じ思想で、embedding には触れない。
+    //
+    // **この 1 行が無いと新列は事実上埋まらない**: 下の loop は content hash が
+    // 一致する文書を `SingleResult::Unchanged` で返し、書き込み経路
+    // (`upsert_document` / `update_document_meta`) をどちらも通らないので、
+    // 既存 KB の大多数は列が追加されたことに気付かないまま NULL で残る。
+    // ここは走査で size が分かっている全 entry を対象にし、UPDATE 側の
+    // `WHERE size_bytes IS NULL` が記録済みの行を守る。
+    //
+    // **rename 適用の後**に走らせる (codex P2 round 1)。走査 entry の key は
+    // *新しい* path で、rename 前の DB 行はまだ古い path を持っている。先に
+    // 走らせると、移行と同じ run で rename された文書だけ 1 行も一致せず、
+    // その後 same-hash fast path が document 行を書かないので size は NULL の
+    // まま次の full index まで残る (= その間 oversized なら提示され続ける)。
+    // **走査したパスは 1 本の規則で書く** (codex P2 round 5)。当初は
+    // 「NULL のときだけ埋める」だったが、それだと *古い記録* を直せない。
+    // round 4 で「cap を超えたファイルは上書き」を足したところ、**逆向きが
+    // 抜けた**: cap 超えだったファイルが元の内容に戻されると、scan は小さい
+    // size を測るのに hash 一致で `Unchanged` になり書き手が居ないので、
+    // 「read は受け付けるのに提示されない」が永久に残る。
+    //
+    // 直し方は分岐を増やすことではなく減らすこと: **scan が測ったものが真**。
+    // 索引された文書は下の loop がパース済みバイトの長さで上書きするので、
+    // ここが古い値を残すことはない。
+    let scanned_sizes: Vec<(&str, u64)> = disk_entries
+        .iter()
+        .map(|e| (e.rel.as_str(), e.size))
+        .chain(scan_oversize.iter().map(|(rel, len)| (rel.as_str(), *len)))
+        .collect();
+    match db.record_document_sizes(&scanned_sizes) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("recorded the current size of {n} document(s)"),
+        // 記録に失敗しても index 自体は続ける。ずれた分は次回の index か
+        // `kb-mcp doctor` が拾う。
+        Err(e) => tracing::warn!("failed to record document sizes: {e}"),
+    }
 
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
@@ -672,8 +754,16 @@ fn index_single_disk_entry(
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
     let bytes = match read_for_index(&entry.full, &entry.rel, cap) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
+        Ok((Some(b), _)) => b,
+        Ok((None, measured)) => {
+            // (codex P2 round 5) Same window as the scan: if the handle check
+            // is what refused it, that length is the only current measurement
+            // there is, and the row would otherwise keep a stale, servable one.
+            if let Some(len) = measured
+                && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
+            {
+                tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
+            }
             return Ok(SingleResult::Refused);
         }
         Err(e) => {
@@ -683,6 +773,13 @@ fn index_single_disk_entry(
             });
         }
     };
+    // (feature-51, codex P2 round 1) Record the size of **these** bytes, not the
+    // scan's. The scan read the file to hash it; this is a second read, and a
+    // file that grew past the read cap in between would otherwise be stored with
+    // the old, servable size beside chunks built from the new content — the
+    // resource surface would then advertise a URI the filesystem read refuses.
+    // The size and the chunks now come from one buffer.
+    let size_bytes = bytes.len() as u64;
     let excludes: Vec<&str> = match exclude_headings {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => crate::parser::DEFAULT_EXCLUDED_HEADINGS.to_vec(),
@@ -761,6 +858,7 @@ fn index_single_disk_entry(
             &parsed.frontmatter.tags,
             parsed.frontmatter.date.as_deref(),
             &entry.hash,
+            size_bytes,
         )?;
         if updated {
             return Ok(SingleResult::Updated {
@@ -798,6 +896,7 @@ fn index_single_disk_entry(
         &parsed.frontmatter.tags,
         parsed.frontmatter.date.as_deref(),
         &entry.hash,
+        size_bytes,
     )?;
 
     for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
@@ -874,6 +973,14 @@ pub fn reindex_single_file(
     ) {
         let kind = size_cap_kind(is_binary_ext);
         eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        // (codex P2 round 4) Same as the full scan: the row stays, so without
+        // this its recorded size is the last one small enough to index and the
+        // resource surface keeps offering a file a read now refuses. Doing it
+        // here as well is what keeps the watcher and the full run agreeing —
+        // leaving it to the next full index is how the two come apart.
+        if let Err(e) = db.record_document_sizes(&[(rel, len)]) {
+            tracing::warn!("failed to record the grown size of {rel}: {e}");
+        }
         return Ok(SingleResult::Skipped {
             reason: "file too large",
         });
@@ -884,16 +991,32 @@ pub fn reindex_single_file(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let Some(bytes) = read_for_index(&full, rel, cap)
-        .with_context(|| format!("failed to read {}", full.display()))?
-    else {
+    let (maybe_bytes, measured) = read_for_index(&full, rel, cap)
+        .with_context(|| format!("failed to read {}", full.display()))?;
+    let Some(bytes) = maybe_bytes else {
+        // (codex P2 round 5) The watcher has the same stat-then-read window.
+        if let Some(len) = measured
+            && let Err(e) = db.record_document_sizes(&[(rel, len)])
+        {
+            tracing::warn!("failed to record the grown size of {rel}: {e}");
+        }
         return Ok(SingleResult::Refused);
     };
     let hash = sha256_hex_bytes(&bytes);
+    let size = bytes.len() as u64;
+    // (codex P2 round 6) **測った側が記録する**。`index_single_disk_entry` は
+    // hash 一致で `Unchanged` を返し、その経路は何も書かない — full index なら
+    // 走査の一括記録が拾うが、watcher にはそれが無い。cap 超えだった文書が
+    // 元の内容に戻された時、ここで書かないと「read は受け付けるのに提示され
+    // ない」が次の full index まで残る。
+    if let Err(e) = db.record_document_sizes(&[(rel, size)]) {
+        tracing::warn!("failed to record the size of {rel}: {e}");
+    }
     let entry = DiskEntry {
         rel: rel.to_string(),
         hash,
         full,
+        size,
     };
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
@@ -1012,6 +1135,14 @@ pub fn rename_single_file(
     ) {
         let kind = size_cap_kind(is_binary_ext);
         eprintln!("Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        // (codex P2 round 7) The rename has already been applied, so the row is
+        // under `new_rel` with the size it had when it was small enough to
+        // index. Measuring the file and returning without writing leaves it
+        // listed and linked while a read refuses it — the same hole the reindex
+        // guard closes, in the one place still missing it.
+        if let Err(e) = db.record_document_sizes(&[(new_rel, len)]) {
+            tracing::warn!("failed to record the grown size of {new_rel}: {e}");
+        }
         return Ok(RenameOutcome::RenamedSizeCapped);
     }
 
@@ -1020,12 +1151,24 @@ pub fn rename_single_file(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let Some(new_bytes) = read_for_index(&full, new_rel, cap)
-        .with_context(|| format!("failed to read {}", full.display()))?
-    else {
+    let (maybe_bytes, measured) = read_for_index(&full, new_rel, cap)
+        .with_context(|| format!("failed to read {}", full.display()))?;
+    let Some(new_bytes) = maybe_bytes else {
+        // (codex P2 round 6) The rename target has the same stat-then-read
+        // window as every other reader, and this was the last caller still
+        // dropping the length the refusal measured.
+        if let Some(len) = measured
+            && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
+        {
+            tracing::warn!("failed to record the grown size of {new_rel}: {e}");
+        }
         return Ok(RenameOutcome::RenamedButRefused);
     };
     let new_hash = sha256_hex_bytes(&new_bytes);
+    // 測った側が記録する (上の reindex と同じ理由)。
+    if let Err(e) = db.record_document_sizes(&[(new_rel, new_bytes.len() as u64)]) {
+        tracing::warn!("failed to record the size of {new_rel}: {e}");
+    }
 
     // codex P2 round 2 (finding A): watcher は config-desired を持たないので
     // DB 側モードに従う (`reindex_single_file` と同じ E-11 の規則)。
@@ -1049,6 +1192,7 @@ pub fn rename_single_file(
         rel: new_rel.to_string(),
         hash: new_hash,
         full,
+        size: new_bytes.len() as u64,
     };
     // same_hash (= Static-mode-forced) の場合のみ force=true で
     // hash 一致 fast path をバイパスする。内容が変わっている場合は
@@ -1288,6 +1432,7 @@ mod tests {
             rel: rel.to_string(),
             hash: hash.to_string(),
             full: std::path::PathBuf::from(rel),
+            size: 0,
         }
     }
 
@@ -2012,6 +2157,7 @@ mod tests {
             crate::parser::MAX_RAW_TEXT_BYTES,
         )
         .expect("an ordinary file must not error")
+        .0
         .expect("an ordinary file must not be refused");
         assert_eq!(bytes, b"# A");
     }
@@ -2060,6 +2206,35 @@ mod tests {
             "a text file over the text cap must not be read"
         );
         assert_eq!(scan.skipped, vec!["big.md".to_string()]);
+    }
+
+    /// codex P2 round 4. Refusing the file is only half of it: the row stays in
+    /// the index (§4.2 skip preserves), so the size recorded there is the last
+    /// one small enough to read while the file on disk is now one a read
+    /// refuses — and the resource surface would go on offering it. The scan
+    /// already measured the new length; it has to carry it out.
+    ///
+    /// This is why that refusal is *not* in the class of "the file changed
+    /// after it was indexed, and a listing cannot know": here kb-mcp did know,
+    /// a moment ago, and threw the answer away.
+    #[test]
+    fn test_scan_disk_entries_reports_the_measured_size_of_what_it_refused() {
+        let tmp = mk_tmp("scanoversize");
+        write_file(&tmp.0, "big.md", "0123456789"); // 10 bytes, over the cap
+        write_file(&tmp.0, "ok.md", "# h"); // 3 bytes, under it
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[tmp.0.join("big.md"), tmp.0.join("ok.md")],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            5,
+        );
+        assert_eq!(
+            scan.oversize,
+            vec![("big.md".to_string(), 10)],
+            "the refused file's real length must come back, and only that file's"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2146,6 +2321,7 @@ mod tests {
             &[],
             None,
             "hash1",
+            0,
         )
         .unwrap();
         assert!(db.get_document_hash("notes/a.md").unwrap().is_some());
@@ -2168,6 +2344,7 @@ mod tests {
             &[],
             None,
             "old_hash",
+            0,
         )
         .unwrap();
         // update_document_meta は content_hash を差し替えて meta を更新
@@ -2181,6 +2358,7 @@ mod tests {
                 &["tag1".to_string()],
                 Some("2026-04-19"),
                 "new_hash",
+                0,
             )
             .unwrap();
         assert!(updated);
@@ -2194,7 +2372,17 @@ mod tests {
     fn test_update_document_meta_missing_path_returns_false() {
         let db = test_db();
         let updated = db
-            .update_document_meta("never-existed.md", None, None, None, None, &[], None, "h")
+            .update_document_meta(
+                "never-existed.md",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .unwrap();
         assert!(!updated);
     }
@@ -2224,6 +2412,7 @@ mod tests {
                 &[],
                 None,
                 "hash1",
+                0,
             )
             .unwrap();
         let emb = vec![0.0f32; 384];
@@ -2256,6 +2445,7 @@ mod tests {
                 &[],
                 None,
                 "hash2",
+                0,
             )
             .unwrap();
         assert!(updated);
@@ -2331,7 +2521,7 @@ mod tests {
         let db = test_db();
         // chunk を 1 件入れて legacy (key 不在 + chunk > 0) を作る
         let doc_id = db
-            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2357,7 +2547,7 @@ mod tests {
         // この test の前提を「chunk が実在する non-empty index」に機械的に
         // 更新する (assert! 文言 / 期待値は不変、fixture のみ追加)。
         let doc_id = db
-            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2437,7 +2627,17 @@ mod tests {
         let db = test_db();
         db.write_context_mode(ContextMode::Off).unwrap();
         let doc_id = db
-            .upsert_document("stale.md", Some("Stale"), None, None, None, &[], None, "h")
+            .upsert_document(
+                "stale.md",
+                Some("Stale"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2483,7 +2683,7 @@ mod tests {
         let db = test_db();
         db.write_context_mode(ContextMode::Off).unwrap();
         let doc_id = db
-            .upsert_document("kept.md", Some("Kept"), None, None, None, &[], None, "h")
+            .upsert_document("kept.md", Some("Kept"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
