@@ -121,6 +121,14 @@ change nothing.
   rule does not have, since both the finding and the threshold are per document.
   The cost is a genuine quote sitting in another section of a document that
   answers the same query, which goes unreported.
+- **A match explained by another match is not independent evidence.** When one
+  golden query contains another (`cross-encoder reranking` and `how does
+  cross-encoder reranking work?`), a single quotation of the longer one matches
+  both, so counting matching needles would let one quotation clear a two-quote
+  threshold. A match whose text is a substring of another match in the same
+  document is dropped. Without occurrence positions this also drops the case
+  where the shorter query really was quoted somewhere else — erring toward
+  under-counting, which is the same trade the threshold itself makes.
 - Golden entries whose queries **normalize to the same text are folded into one**
   before counting. The golden loader does not reject duplicate query text, and
   counting near-duplicates separately would let a single quotation satisfy the

@@ -670,8 +670,37 @@ pub fn detect_quoted_queries(
 ) -> Vec<QuoteFinding> {
     let mut findings = Vec::new();
     for (path, quoted_indices) in scan {
+        // **別の一致で説明が付く一致は、独立した証拠として数えない。**
+        // golden に `cross-encoder reranking` と
+        // `how does cross-encoder reranking work?` の両方があると、長い方を
+        // 1 回引用しただけの文書が両方に一致し、**1 回の引用で 2 件閾値を
+        // 満たす** — 正規化同値の重複で塞いだのと同じ穴が、文面が違うまま
+        // 開いている (codex review round 5)。他の一致の部分文字列になっている
+        // 一致を落とす。
+        //
+        // 出現位置を持たない以上、「長い方とは別の場所で短い方も引用されて
+        // いる」場合を取りこぼす。**取りこぼす側に倒すのはこの検査の一貫した
+        // 選択**で、2 件閾値そのものが同じ理由で存在している。
+        // 正規化後に同一の文面は [`quote_needles`] が既に 1 件に畳んでいるので、
+        // ここで比べる文面は互いに異なる = 「部分文字列」は真部分文字列。
+        let independent: Vec<usize> = quoted_indices
+            .iter()
+            .copied()
+            .filter(|&ni| {
+                let Some(n) = needles.get(ni) else {
+                    return false;
+                };
+                !quoted_indices.iter().any(|&other| {
+                    other != ni
+                        && needles
+                            .get(other)
+                            .is_some_and(|o| o.text.contains(n.text.as_str()))
+                })
+            })
+            .collect();
+
         let mut quoted = Vec::new();
-        for &ni in quoted_indices {
+        for ni in independent {
             let Some(needle) = needles.get(ni) else {
                 continue;
             };
@@ -1533,6 +1562,39 @@ mod tests {
             detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
             "one quotation of one wording must not satisfy a two-query threshold"
         );
+    }
+
+    /// 片方が他方の部分文字列になっている query は、長い方を 1 回引用すると
+    /// 両方に一致する。正規化同値の重複 (round 4) と同じ穴が、文面が違うまま
+    /// 開いていた形 (codex review round 5)。
+    #[test]
+    fn test_detect_quoted_queries_ignores_matches_explained_by_a_longer_match() {
+        let golden = vec![
+            golden_q("short", "cross-encoder reranking", &[]),
+            golden_q("long", "how does cross-encoder reranking work?", &[]),
+            golden_q("other", "torch.compile guide", &[]),
+        ];
+        let needles = quote_needles(&golden);
+        assert_eq!(needles.len(), 3, "文面が違うので畳まれはしない");
+
+        // 長い方を 1 回引用しただけ = 短い方も機械的に一致する。
+        let scan = vec![("notes/topic.md".to_string(), vec![0, 1])];
+        assert!(
+            detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
+            "one quotation cannot be two pieces of evidence just because one \
+             golden query contains another"
+        );
+
+        // 独立した 2 件目 (包含関係にない query) があれば従来どおり報告する。
+        let scan = vec![("notes/topic.md".to_string(), vec![0, 1, 2])];
+        let findings = detect_quoted_queries(&golden, &needles, &scan, &[]);
+        assert_eq!(findings.len(), 1);
+        let ids: Vec<&str> = findings[0]
+            .quoted
+            .iter()
+            .map(|q| q.query_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["long", "other"], "説明の付かない一致だけが残る");
     }
 
     /// 1 件しか含まない文書は報告しない。golden query の多くは `cross-encoder`
