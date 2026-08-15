@@ -794,9 +794,8 @@ pub fn format_findings_warning(findings: &[QuoteFinding]) -> Option<String> {
     let mut s = String::new();
     writeln!(
         s,
-        "kb-mcp eval: {} document(s) quote {} or more golden queries verbatim ({}).",
+        "kb-mcp eval: {} document(s) quote 2 or more golden queries verbatim ({}).",
         findings.len(),
-        MIN_DISTINCT_QUERIES,
         CHECK_GOLDEN_QUERIES_QUOTED
     )
     .unwrap();
