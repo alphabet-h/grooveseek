@@ -178,6 +178,19 @@ pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
         "kb-mcp index --force",
     ));
 
+    let scan = db.chunks_without_document(SAMPLE_LIMIT)?;
+    findings.extend(finding(
+        "chunk-without-document",
+        Severity::Error,
+        format!(
+            "{} chunk(s) belong to a document that no longer exists, so every search drops them \
+             at the join",
+            scan.count
+        ),
+        scan,
+        "kb-mcp index --force",
+    ));
+
     let scan = db.documents_without_chunks(SAMPLE_LIMIT)?;
     findings.extend(finding(
         "document-without-chunks",
@@ -476,6 +489,43 @@ mod tests {
         assert!(
             run(&db, &registry_md()).expect("run").is_clean(),
             "a database with nothing in it has nothing wrong with it"
+        );
+    }
+
+    /// codex P2 round 6: a chunk whose document row is gone is invisible to
+    /// every other check, because the two chunk-level scans inner-join
+    /// `documents` — so with its vector and FTS rows intact, an index that
+    /// silently drops that chunk from every search reported nothing at all.
+    #[test]
+    fn a_chunk_whose_document_vanished_is_reported() {
+        let db = db_with_one_chunk();
+        // Foreign keys are on for this connection, so delete the way a broken
+        // one would: through a connection that has them off.
+        db.execute_for_test(
+            "PRAGMA foreign_keys = OFF;
+             DELETE FROM documents;
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("orphan the chunk");
+
+        let report = run(&db, &registry_md()).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "chunk-without-document")
+            .expect("an orphaned chunk must be reported");
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.count, 1);
+        // The point of the finding: nothing else sees it.
+        let others: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.check)
+            .filter(|c| *c != "chunk-without-document")
+            .collect();
+        assert!(
+            !others.contains(&"missing-embedding") && !others.contains(&"missing-fts-row"),
+            "the chunk-level scans join documents, so they cannot see this one: {others:?}"
         );
     }
 

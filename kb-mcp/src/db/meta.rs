@@ -450,6 +450,24 @@ impl Database {
         )
     }
 
+    /// `document_id` に対応する `documents` 行が無い chunk (codex P2 round 6)。
+    ///
+    /// 外部キーは宣言してあるが、`PRAGMA foreign_keys` を切った別接続や破損で
+    /// 実際に起き得る。**他のどの検査にも映らない**のが問題で、chunk 側の 2 つは
+    /// `documents` を INNER JOIN するので、この chunk は走査対象から落ちる —
+    /// vec / FTS 行が揃っていれば `doctor` は「異常なし」と言い、検索は
+    /// document join で毎回この chunk を落とす。
+    /// [`Self::documents_without_chunks`] のちょうど裏返し。
+    pub fn chunks_without_document(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT 'chunk ' || c.id || ' (document_id ' || c.document_id || ')'
+             FROM chunks c
+             WHERE c.document_id NOT IN (SELECT id FROM documents)
+             ORDER BY c.id",
+            sample_limit,
+        )
+    }
+
     /// chunk を 1 つも持たない document。検索には決して出ない。
     pub fn documents_without_chunks(&self, sample_limit: usize) -> Result<IntegrityScan> {
         self.scan(

@@ -184,21 +184,17 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// Read a file for indexing through a handle whose identity has been checked
 /// (BU-20), turning a refusal into the per-file skip every caller already does.
 ///
-/// `Ok(None)` means "skip this file, and say why on stderr"; `Err` keeps
+/// `Ok((None, _))` means "skip this file, and say why on stderr"; `Err` keeps
 /// `std::fs::read`'s meaning so existing read-error handling is unchanged.
-fn read_for_index(full: &Path, rel: &str, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
-    Ok(read_for_index_measured(full, rel, cap)?.0)
-}
-
-/// [`read_for_index`], plus the length when the refusal was about size
-/// (codex P2 round 5).
 ///
-/// `size_cap_exceeded` stats the path and this reads the handle, so a file can
-/// cross the cap **between** the two. When that happens the handle check is
-/// what catches it, and collapsing its answer to `None` throws away the one
-/// measurement that would keep the recorded size honest — leaving a row that
-/// says the file is small enough to serve when the read just proved otherwise.
-fn read_for_index_measured(
+/// The second element is the length **when the refusal was about size**
+/// (codex P2 round 5). `size_cap_exceeded` stats the path and this reads the
+/// handle, so a file can cross the cap *between* the two — and then this check
+/// is the one that catches it. A wrapper that dropped the length existed for
+/// one round; it turned out every caller wanted it, because a row that says a
+/// file is small enough to serve when the read has just proved otherwise is
+/// what makes the resource surface offer something unreadable.
+fn read_for_index(
     full: &Path,
     rel: &str,
     cap: u64,
@@ -276,7 +272,7 @@ fn scan_disk_entries(
         // run's walk-time check is what evicts it — which is where that
         // decision belongs (§4.2, skip preserves).
         let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
-        match read_for_index_measured(p, &rel, cap) {
+        match read_for_index(p, &rel, cap) {
             Ok((Some(bytes), _)) => {
                 let hash = sha256_hex_bytes(&bytes);
                 entries.push(DiskEntry {
@@ -757,7 +753,7 @@ fn index_single_disk_entry(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let bytes = match read_for_index_measured(&entry.full, &entry.rel, cap) {
+    let bytes = match read_for_index(&entry.full, &entry.rel, cap) {
         Ok((Some(b), _)) => b,
         Ok((None, measured)) => {
             // (codex P2 round 5) Same window as the scan: if the handle check
@@ -995,7 +991,7 @@ pub fn reindex_single_file(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let (maybe_bytes, measured) = read_for_index_measured(&full, rel, cap)
+    let (maybe_bytes, measured) = read_for_index(&full, rel, cap)
         .with_context(|| format!("failed to read {}", full.display()))?;
     let Some(bytes) = maybe_bytes else {
         // (codex P2 round 5) The watcher has the same stat-then-read window.
@@ -1008,6 +1004,14 @@ pub fn reindex_single_file(
     };
     let hash = sha256_hex_bytes(&bytes);
     let size = bytes.len() as u64;
+    // (codex P2 round 6) **測った側が記録する**。`index_single_disk_entry` は
+    // hash 一致で `Unchanged` を返し、その経路は何も書かない — full index なら
+    // 走査の一括記録が拾うが、watcher にはそれが無い。cap 超えだった文書が
+    // 元の内容に戻された時、ここで書かないと「read は受け付けるのに提示され
+    // ない」が次の full index まで残る。
+    if let Err(e) = db.record_document_sizes(&[(rel, size)]) {
+        tracing::warn!("failed to record the size of {rel}: {e}");
+    }
     let entry = DiskEntry {
         rel: rel.to_string(),
         hash,
@@ -1139,12 +1143,24 @@ pub fn rename_single_file(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let Some(new_bytes) = read_for_index(&full, new_rel, cap)
-        .with_context(|| format!("failed to read {}", full.display()))?
-    else {
+    let (maybe_bytes, measured) = read_for_index(&full, new_rel, cap)
+        .with_context(|| format!("failed to read {}", full.display()))?;
+    let Some(new_bytes) = maybe_bytes else {
+        // (codex P2 round 6) The rename target has the same stat-then-read
+        // window as every other reader, and this was the last caller still
+        // dropping the length the refusal measured.
+        if let Some(len) = measured
+            && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
+        {
+            tracing::warn!("failed to record the grown size of {new_rel}: {e}");
+        }
         return Ok(RenameOutcome::RenamedButRefused);
     };
     let new_hash = sha256_hex_bytes(&new_bytes);
+    // 測った側が記録する (上の reindex と同じ理由)。
+    if let Err(e) = db.record_document_sizes(&[(new_rel, new_bytes.len() as u64)]) {
+        tracing::warn!("failed to record the size of {new_rel}: {e}");
+    }
 
     // codex P2 round 2 (finding A): watcher は config-desired を持たないので
     // DB 側モードに従う (`reindex_single_file` と同じ E-11 の規則)。
@@ -2133,6 +2149,7 @@ mod tests {
             crate::parser::MAX_RAW_TEXT_BYTES,
         )
         .expect("an ordinary file must not error")
+        .0
         .expect("an ordinary file must not be refused");
         assert_eq!(bytes, b"# A");
     }
