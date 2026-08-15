@@ -327,6 +327,27 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// 既存 `documents` 行の `size_bytes` を**上書き**する (feature-51)。
+    ///
+    /// [`Self::backfill_document_sizes`] との違いは `WHERE size_bytes IS NULL` が
+    /// 無いこと。用途は 1 つ: **size cap で skip したファイル**。§4.2 の
+    /// 「skip は保持」により行は残るが、記録済みの size は「最後に索引できた時」の
+    /// 小さい値のままで、現在のファイルは read が拒むほど大きい。
+    /// この列は「read がこのファイルを返せるか」を答えるためにあるので、
+    /// **kb-mcp が最後に測った実サイズ**を持つのが正しい (codex P2 round 4)。
+    ///
+    /// 行が無い path は何も更新しない (未索引ファイルが skip された場合)。
+    pub fn record_document_sizes(&self, sizes: &[(&str, u64)]) -> Result<u32> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE documents SET size_bytes = ?2 WHERE path = ?1")?;
+        let mut count = 0u32;
+        for (path, size) in sizes {
+            count += stmt.execute(params![path, *size as i64])? as u32;
+        }
+        Ok(count)
+    }
+
     /// `size_bytes` が未記録 (NULL) の document 数 (feature-51)。
     /// `kb-mcp doctor` が「1 回 index すれば埋まる」件数として報告する。
     pub fn documents_without_recorded_size(&self) -> Result<u32> {

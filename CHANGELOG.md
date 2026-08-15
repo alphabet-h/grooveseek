@@ -70,6 +70,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   being fixed. The hit itself is unaffected either way — an unservable document
   stays findable and simply carries no link.
 
+  A file that **grows past the index cap** after being indexed is refused and
+  its new size recorded, by the full run and the watcher alike. A refusal
+  preserves the row, so otherwise the recorded size would stay the last one
+  small enough to index while the file became one no read can return. This is
+  knowable — kb-mcp stat'd the file in order to refuse it — unlike a file
+  deleted or replaced after indexing, which a listing still cannot answer for.
+
   **Existing indexes**: the column is added on open with every row NULL, which
   means "not recorded" and is treated as servable, so nothing disappears from a
   listing after an upgrade. One `kb-mcp index` fills it in **without

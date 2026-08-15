@@ -129,6 +129,13 @@ struct DiskEntry {
 struct DiskScan {
     entries: Vec<DiskEntry>,
     skipped: Vec<String>,
+    /// size cap で撥ねたファイルの **実測サイズ** (rel path, bytes)。
+    ///
+    /// 行は §4.2 で保持されるが、記録済みの `size_bytes` は「最後に索引できた
+    /// 時」の小さい値のまま = 提示され続け、read は現在のファイルを見て拒む。
+    /// ここで測った値を持ち帰って上書きする (codex P2 round 4)。**索引後に
+    /// 消えたファイル等と違い、これは知り得る** — たった今 stat したのだから。
+    oversize: Vec<(String, u64)>,
 }
 
 /// バイナリ拡張子ファイルが `max` bytes を超えているかを、内容を読まずに
@@ -212,6 +219,7 @@ fn scan_disk_entries(
     let binary_exts = registry.binary_extensions();
     let mut entries = Vec::with_capacity(source_files.len());
     let mut skipped = Vec::new();
+    let mut oversize = Vec::new();
 
     for p in source_files {
         let rel = p
@@ -226,6 +234,7 @@ fn scan_disk_entries(
             Ok(Some((len, cap))) => {
                 let kind = size_cap_kind(is_binary);
                 eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+                oversize.push((rel.clone(), len));
                 skipped.push(rel);
                 continue;
             }
@@ -265,7 +274,11 @@ fn scan_disk_entries(
         }
     }
 
-    DiskScan { entries, skipped }
+    DiskScan {
+        entries,
+        skipped,
+        oversize,
+    }
 }
 
 /// disk と DB の (path, hash) から「移動ペア」を決定する純粋関数。
@@ -513,6 +526,7 @@ pub fn rebuild_index(
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
     let disk_entries = scan.entries;
+    let scan_oversize = scan.oversize;
 
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
@@ -573,6 +587,26 @@ pub fn rebuild_index(
         // 補充に失敗しても index 自体は続ける。埋まらなかった分は次回の index か
         // `kb-mcp doctor` が拾う。
         Err(e) => tracing::warn!("failed to backfill document sizes: {e}"),
+    }
+
+    // (codex P2 round 4) size cap で撥ねたファイルは §4.2 で行が保持されるので、
+    // 記録済みの size は「最後に索引できた時」の小さい値のまま残る = 提示され
+    // 続け、read は現在のファイルを見て拒む。走査で実測した値で**上書き**する
+    // (backfill と違い `IS NULL` 条件は付けない — 古い値こそ直す対象)。
+    // これは「索引後にファイルが消えた」類と違い、**その場で測れている**。
+    let oversize_now: Vec<(&str, u64)> = scan_oversize
+        .iter()
+        .map(|(rel, len)| (rel.as_str(), *len))
+        .collect();
+    if !oversize_now.is_empty() {
+        match db.record_document_sizes(&oversize_now) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                "{n} indexed document(s) have grown past the size cap; \
+                 recorded their current size so they are no longer offered"
+            ),
+            Err(e) => tracing::warn!("failed to record sizes for size-capped files: {e}"),
+        }
     }
 
     // Track paths we visit so we can detect deletions later.
@@ -917,6 +951,14 @@ pub fn reindex_single_file(
     ) {
         let kind = size_cap_kind(is_binary_ext);
         eprintln!("Skipping {rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        // (codex P2 round 4) Same as the full scan: the row stays, so without
+        // this its recorded size is the last one small enough to index and the
+        // resource surface keeps offering a file a read now refuses. Doing it
+        // here as well is what keeps the watcher and the full run agreeing —
+        // leaving it to the next full index is how the two come apart.
+        if let Err(e) = db.record_document_sizes(&[(rel, len)]) {
+            tracing::warn!("failed to record the grown size of {rel}: {e}");
+        }
         return Ok(SingleResult::Skipped {
             reason: "file too large",
         });
@@ -2107,6 +2149,35 @@ mod tests {
             "a text file over the text cap must not be read"
         );
         assert_eq!(scan.skipped, vec!["big.md".to_string()]);
+    }
+
+    /// codex P2 round 4. Refusing the file is only half of it: the row stays in
+    /// the index (§4.2 skip preserves), so the size recorded there is the last
+    /// one small enough to read while the file on disk is now one a read
+    /// refuses — and the resource surface would go on offering it. The scan
+    /// already measured the new length; it has to carry it out.
+    ///
+    /// This is why that refusal is *not* in the class of "the file changed
+    /// after it was indexed, and a listing cannot know": here kb-mcp did know,
+    /// a moment ago, and threw the answer away.
+    #[test]
+    fn test_scan_disk_entries_reports_the_measured_size_of_what_it_refused() {
+        let tmp = mk_tmp("scanoversize");
+        write_file(&tmp.0, "big.md", "0123456789"); // 10 bytes, over the cap
+        write_file(&tmp.0, "ok.md", "# h"); // 3 bytes, under it
+        let reg = Registry::defaults();
+        let scan = scan_disk_entries(
+            &[tmp.0.join("big.md"), tmp.0.join("ok.md")],
+            &tmp.0,
+            &reg,
+            crate::parser::MAX_RAW_BINARY_BYTES,
+            5,
+        );
+        assert_eq!(
+            scan.oversize,
+            vec![("big.md".to_string(), 10)],
+            "the refused file's real length must come back, and only that file's"
+        );
     }
 
     // -----------------------------------------------------------------------

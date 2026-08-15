@@ -4291,6 +4291,48 @@ mod tests {
         );
     }
 
+    /// codex P2 round 4: a file that grows past the index cap is *skipped*, and
+    /// §4.2 keeps its row — so the recorded size stays the last one small
+    /// enough to index while the file on disk is now one a read refuses. The
+    /// backfill cannot fix that (the row is not NULL), so the size-cap path
+    /// needs a write that overwrites.
+    #[test]
+    fn test_record_document_sizes_overwrites_a_stale_recorded_size() {
+        let db = db_with_384();
+        db.upsert_document("grown.md", None, None, None, None, &[], None, "h", 900)
+            .unwrap();
+        let size_of = |p: &str| -> Option<i64> {
+            db.conn
+                .query_row(
+                    "SELECT size_bytes FROM documents WHERE path = ?1",
+                    params![p],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(size_of("grown.md"), Some(900));
+
+        // The backfill deliberately will not touch it — the value is not NULL.
+        assert_eq!(
+            db.backfill_document_sizes(&[("grown.md", 60_000_000)])
+                .unwrap(),
+            0
+        );
+        assert_eq!(size_of("grown.md"), Some(900));
+
+        // This one is for exactly that case.
+        assert_eq!(
+            db.record_document_sizes(&[("grown.md", 60_000_000)])
+                .unwrap(),
+            1
+        );
+        assert_eq!(size_of("grown.md"), Some(60_000_000));
+
+        // A path with no row is not an error: the file may never have been
+        // indexed at all.
+        assert_eq!(db.record_document_sizes(&[("absent.md", 1)]).unwrap(), 0);
+    }
+
     #[test]
     fn test_backfill_document_sizes_ignores_paths_it_does_not_know() {
         let db = db_with_384();

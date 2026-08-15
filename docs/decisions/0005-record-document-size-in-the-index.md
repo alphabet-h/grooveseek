@@ -105,10 +105,20 @@ adding a second condition to one of them is exactly what would have made a
 - A binary document past the *text* cap is still offered, because a read
   truncates it rather than refusing. The per-extension cap is what distinguishes
   the two, and it comes from the same function the read uses.
+- **A file that grows past the index cap is refused *and* its new size is
+  recorded.** Such a file is skipped, and a skip deliberately preserves the row
+  — so without this the recorded size would stay the last one small enough to
+  index while the file on disk became one no read can return. This belongs on
+  the knowable side of the line rather than the unknowable one for a precise
+  reason: kb-mcp stat'd the file a moment earlier in order to refuse it. It had
+  the answer and was throwing it away. The full index run and the watcher both
+  write it, because leaving one of them to be corrected by the other is the
+  drift this whole feature is about.
 - What this still does not promise is unchanged from ADR-0004: refusals that are
   conditions of the moment — the file was deleted since it was indexed, a hard
-  link was renamed over it — remain unknowable to a listing. This closes the one
-  gap that was knowable.
+  link was renamed over it, it grew between a listing and the read that followed
+  — remain unknowable to a listing. The distinction that decides which side a
+  case falls on is whether kb-mcp measured it.
 - `kb-mcp doctor` reports both the documents past the cap and the ones whose
   size is not recorded yet, so the state this migration creates is visible
   rather than silent.
