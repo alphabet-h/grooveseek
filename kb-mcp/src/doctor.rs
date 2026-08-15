@@ -113,6 +113,23 @@ fn finding(
 pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
     let mut findings = Vec::new();
 
+    // Before the per-chunk comparisons, because those cannot see it: with the
+    // table gone there is nothing to scan, so every one of them answers clean
+    // while vector search returns nothing at all.
+    if let Some(chunks) = db.vector_table_missing_with_chunks()? {
+        findings.push(Finding {
+            check: "vector-table-missing",
+            severity: Severity::Error,
+            summary: format!(
+                "the vector table is gone while {chunks} chunk(s) remain, so vector search \
+                 cannot return anything"
+            ),
+            count: u64::from(chunks),
+            samples: Vec::new(),
+            remedy: "kb-mcp index --force",
+        });
+    }
+
     let scan = db.chunks_without_embedding(SAMPLE_LIMIT)?;
     findings.extend(finding(
         "missing-embedding",
@@ -203,7 +220,11 @@ pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
             oversized.len()
         ),
         truncated(oversized),
-        "split the document, or read it with get_document instead",
+        // Not "use get_document instead": it applies the same per-extension cap
+        // through the same `max_bytes_for`, so it refuses the identical file.
+        // Naming it would send someone to a remedy that cannot work
+        // (codex P2 round 1).
+        "split the document into parts under the read cap",
     ));
 
     let unrecorded = db.documents_without_recorded_size()?;
@@ -347,6 +368,63 @@ mod tests {
             .expect("the oversized document must be explained");
         assert_eq!(f.severity, Severity::Warning);
         assert_eq!(f.samples, vec!["notes/a.md".to_string()]);
+    }
+
+    /// codex P1 round 1. With `vec_chunks` gone, the two scans that compare
+    /// against it have nothing to scan and answer clean — so without a finding
+    /// of its own, an index whose vector search returns *nothing* passes.
+    #[test]
+    fn losing_the_vector_table_entirely_is_not_a_clean_bill() {
+        let db = db_with_one_chunk();
+        db.execute_for_test("DROP TABLE vec_chunks").expect("drop");
+
+        let report = run(&db, &registry_md()).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "vector-table-missing")
+            .expect("a missing vector table must be reported");
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.count, 1, "it names how many chunks are stranded");
+        assert!(
+            !report.is_clean(),
+            "an index whose vector search returns nothing is not clean"
+        );
+    }
+
+    /// The companion: an index with no chunks *and* no vector table is a fresh
+    /// one, not a broken one.
+    #[test]
+    fn an_empty_index_without_a_vector_table_is_not_a_finding() {
+        let db = Database::open_in_memory().expect("open");
+        assert!(
+            run(&db, &registry_md()).expect("run").is_clean(),
+            "a database with nothing in it has nothing wrong with it"
+        );
+    }
+
+    /// codex P2 round 1: `get_document` applies the same cap through the same
+    /// chooser, so offering it as the alternative sends the reader nowhere.
+    #[test]
+    fn the_oversize_remedy_does_not_name_a_call_that_refuses_the_same_file() {
+        let db = db_with_one_chunk();
+        db.execute_for_test(&format!(
+            "UPDATE documents SET size_bytes = {} WHERE path = 'notes/a.md'",
+            crate::server::GET_DOCUMENT_MAX_BYTES + 1
+        ))
+        .expect("update");
+
+        let report = run(&db, &registry_md()).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "larger-than-a-read-returns")
+            .expect("finding");
+        assert!(
+            !f.remedy.contains("get_document"),
+            "remedy must not point at a call with the same cap: {}",
+            f.remedy
+        );
     }
 
     #[test]

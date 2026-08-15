@@ -102,3 +102,42 @@ fn an_index_run_records_sizes_and_fills_them_in_for_documents_it_skips() {
         "an index run over unchanged files must still record their sizes"
     );
 }
+
+/// codex P2 round 1: the backfill keys on the path the **scan** saw, which is
+/// the new one, while the row still carries the old path until rename detection
+/// applies. Run before that and a file renamed in the same run as the migration
+/// matches nothing — and then takes the same-hash fast path, which writes no
+/// document row either, so its size stays NULL until some later full index.
+#[test]
+#[ignore = "requires embedding model download"]
+fn a_file_renamed_in_the_migrating_run_still_gets_its_size_recorded() {
+    let layout = TempKbLayout::new("kb-mcp-size-rename");
+    layout.write("a.md", NOTE_A);
+    layout.write("b.md", NOTE_B);
+    let bin = kb_mcp_bin();
+    let db_path = kb_mcp::resolve_db_path(layout.kb());
+
+    run_index(&bin, layout.kb());
+
+    // Back to the pre-feature-51 state.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        conn.execute_batch("UPDATE documents SET size_bytes = NULL")
+            .expect("blank the sizes");
+    }
+
+    // Move one of them. The content is untouched, so this is a rename: the row
+    // is relabelled rather than re-embedded.
+    std::fs::rename(layout.kb().join("a.md"), layout.kb().join("renamed.md")).expect("rename");
+
+    run_index(&bin, layout.kb());
+
+    assert_eq!(
+        sizes(&db_path),
+        vec![
+            ("b.md".to_string(), Some(NOTE_B.len() as i64)),
+            ("renamed.md".to_string(), Some(NOTE_A.len() as i64)),
+        ],
+        "the renamed document must be backfilled in the same run that renamed it"
+    );
+}

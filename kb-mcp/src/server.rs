@@ -381,6 +381,11 @@ impl HitWithUri {
 pub(crate) struct ServableRules<'a> {
     registry: &'a Registry,
     oversized: std::collections::HashSet<String>,
+    /// False when the recorded sizes could not be read at all. An empty
+    /// `oversized` then means "found none", which is the opposite of what the
+    /// caller knows, so the two states must not share a representation
+    /// (codex P2 round 1).
+    sizes_known: bool,
 }
 
 impl<'a> ServableRules<'a> {
@@ -409,11 +414,25 @@ impl<'a> ServableRules<'a> {
         Self {
             registry,
             oversized,
+            sizes_known: true,
+        }
+    }
+
+    /// The rules to use when the sizes could not be read.
+    ///
+    /// Offers nothing. A URI a client cannot follow is worse than no URI, and
+    /// an empty oversized set would claim the opposite of what is known.
+    pub(crate) fn sizes_unavailable(registry: &'a Registry) -> Self {
+        Self {
+            registry,
+            oversized: std::collections::HashSet::new(),
+            sizes_known: false,
         }
     }
 
     pub(crate) fn allows(&self, path: &str) -> bool {
-        crate::indexer::extension_is_registered(path, self.registry)
+        self.sizes_known
+            && crate::indexer::extension_is_registered(path, self.registry)
             && !self.oversized.contains(path)
     }
 
@@ -664,15 +683,16 @@ impl KbCore {
         // The `uri` on a hit and the URIs `resources/list` offers have to be the
         // same set, so both go through `ServableRules` rather than each testing
         // the registry on its own. The lock is still held from the search above.
-        let oversized = db
-            .documents_larger_than(GET_DOCUMENT_MAX_BYTES)
-            .unwrap_or_else(|e| {
+        let rules = match db.documents_larger_than(GET_DOCUMENT_MAX_BYTES) {
+            Ok(oversized) => ServableRules::new(&self.parser_registry, oversized),
+            Err(e) => {
                 // A hit without a `uri` is a hit a client cannot follow, which
-                // is a smaller loss than failing the search outright.
+                // is a smaller loss than failing the search outright — and a
+                // smaller one than a link a read refuses.
                 tracing::warn!("could not read document sizes; search hits lose their uri: {e}");
-                Vec::new()
-            });
-        let rules = ServableRules::new(&self.parser_registry, oversized);
+                ServableRules::sizes_unavailable(&self.parser_registry)
+            }
+        };
 
         let resp = SearchResponse {
             results: hits
@@ -4831,6 +4851,22 @@ mod tests {
         // offer. Upgrading must not empty `resources/list`.
         let rules = ServableRules::new(&registry, Vec::new());
         assert!(rules.allows("legacy.md"));
+    }
+
+    /// codex P2 round 1: an empty oversized set means "there are none", which
+    /// is the opposite of what a failed query knows. Sharing one representation
+    /// let a size-read failure hand out every URI, including the ones a read
+    /// refuses — the exact defect this feature exists to close.
+    #[test]
+    fn a_failed_size_lookup_withholds_uris_rather_than_handing_out_all_of_them() {
+        let registry = md_and_pdf_registry();
+        let unknown = ServableRules::sizes_unavailable(&registry);
+        assert!(!unknown.allows("notes/a.md"));
+        assert!(!unknown.allows("notes/huge.md"));
+
+        // Same empty vector, but as an answer rather than a failure.
+        let known = ServableRules::new(&registry, Vec::new());
+        assert!(known.allows("notes/a.md"));
     }
 
     #[test]

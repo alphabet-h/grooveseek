@@ -381,7 +381,24 @@ impl Database {
         Ok(IntegrityScan { count, samples })
     }
 
+    /// `vec_chunks` テーブル自体が無いのに chunk が存在するか (feature-51)。
+    ///
+    /// この状態では**ベクトル検索が 1 件も返せない**が、下の 2 つの scan は
+    /// 「走査対象が無い」= clean を返すしかない。テーブル欠損を独立した所見に
+    /// しないと、FTS 行が揃っていれば `doctor` が "No issues found" と言って
+    /// しまう (codex P1 round 1)。
+    pub fn vector_table_missing_with_chunks(&self) -> Result<Option<u32>> {
+        if self.has_table("vec_chunks")? {
+            return Ok(None);
+        }
+        let chunks = self.chunk_count()?;
+        Ok((chunks > 0).then_some(chunks))
+    }
+
     /// 本文はあるが embedding が無い chunk。ベクトル検索から抜け落ちる。
+    ///
+    /// テーブルごと無い場合は 0 件を返す (走査できないため)。その状態は
+    /// [`Self::vector_table_missing_with_chunks`] が別の所見として報告する。
     pub fn chunks_without_embedding(&self, sample_limit: usize) -> Result<IntegrityScan> {
         if !self.has_table("vec_chunks")? {
             return Ok(IntegrityScan::default());

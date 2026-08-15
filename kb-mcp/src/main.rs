@@ -1347,9 +1347,22 @@ fn run_doctor(kb_path: &Path, cfg: &kb_mcp::config::Config, format: DoctorFormat
         );
         return Ok(2);
     }
-    let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
-    let registry = cfg.build_parser_registry()?;
-    let report = kb_mcp::doctor::run(&db, &registry)?;
+    // Every failure below is "could not look", which the documented contract
+    // gives exit 2. Propagating them with `?` would let `main`'s Termination
+    // exit 1 — the same code a successful run that found problems uses, so a CI
+    // gate could not tell a corrupt database from a finding (codex P2 round 1).
+    let looked = (|| -> Result<kb_mcp::doctor::Report> {
+        let db = kb_mcp::db::Database::open(&db_path.to_string_lossy())?;
+        let registry = cfg.build_parser_registry()?;
+        kb_mcp::doctor::run(&db, &registry)
+    })();
+    let report = match looked {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("kb-mcp doctor: could not inspect the index: {e:#}");
+            return Ok(2);
+        }
+    };
     print_doctor_report(&report, format);
     Ok(i32::from(!report.is_clean()))
 }

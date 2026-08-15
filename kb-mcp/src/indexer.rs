@@ -514,29 +514,6 @@ pub fn rebuild_index(
     );
     let disk_entries = scan.entries;
 
-    // (feature-51) `documents.size_bytes` の欠損補充。`backfill_fts` と同じ位置・
-    // 同じ思想で、embedding には触れない。
-    //
-    // **この 1 行が無いと新列は事実上埋まらない**: 下の loop は content hash が
-    // 一致する文書を `SingleResult::Unchanged` で返し、書き込み経路
-    // (`upsert_document` / `update_document_meta`) をどちらも通らないので、
-    // 既存 KB の大多数は列が追加されたことに気付かないまま NULL で残る。
-    // ここは走査で size が分かっている全 entry を対象にし、UPDATE 側の
-    // `WHERE size_bytes IS NULL` が記録済みの行を守る。
-    let scanned_sizes: Vec<(&str, u64)> = disk_entries
-        .iter()
-        .map(|e| (e.rel.as_str(), e.size))
-        .collect();
-    match db.backfill_document_sizes(&scanned_sizes) {
-        Ok(0) => {}
-        Ok(n) => {
-            tracing::info!("recorded the size of {n} document(s) indexed before sizes were kept")
-        }
-        // 補充に失敗しても index 自体は続ける。埋まらなかった分は次回の index か
-        // `kb-mcp doctor` が拾う。
-        Err(e) => tracing::warn!("failed to backfill document sizes: {e}"),
-    }
-
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
     let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
@@ -569,6 +546,34 @@ pub fn rebuild_index(
         }
         pairs.len() as u32
     };
+
+    // (feature-51) `documents.size_bytes` の欠損補充。`backfill_fts` と同じ思想で、embedding には触れない。
+    //
+    // **この 1 行が無いと新列は事実上埋まらない**: 下の loop は content hash が
+    // 一致する文書を `SingleResult::Unchanged` で返し、書き込み経路
+    // (`upsert_document` / `update_document_meta`) をどちらも通らないので、
+    // 既存 KB の大多数は列が追加されたことに気付かないまま NULL で残る。
+    // ここは走査で size が分かっている全 entry を対象にし、UPDATE 側の
+    // `WHERE size_bytes IS NULL` が記録済みの行を守る。
+    //
+    // **rename 適用の後**に走らせる (codex P2 round 1)。走査 entry の key は
+    // *新しい* path で、rename 前の DB 行はまだ古い path を持っている。先に
+    // 走らせると、移行と同じ run で rename された文書だけ 1 行も一致せず、
+    // その後 same-hash fast path が document 行を書かないので size は NULL の
+    // まま次の full index まで残る (= その間 oversized なら提示され続ける)。
+    let scanned_sizes: Vec<(&str, u64)> = disk_entries
+        .iter()
+        .map(|e| (e.rel.as_str(), e.size))
+        .collect();
+    match db.backfill_document_sizes(&scanned_sizes) {
+        Ok(0) => {}
+        Ok(n) => {
+            tracing::info!("recorded the size of {n} document(s) indexed before sizes were kept")
+        }
+        // 補充に失敗しても index 自体は続ける。埋まらなかった分は次回の index か
+        // `kb-mcp doctor` が拾う。
+        Err(e) => tracing::warn!("failed to backfill document sizes: {e}"),
+    }
 
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
@@ -712,6 +717,13 @@ fn index_single_disk_entry(
             });
         }
     };
+    // (feature-51, codex P2 round 1) Record the size of **these** bytes, not the
+    // scan's. The scan read the file to hash it; this is a second read, and a
+    // file that grew past the read cap in between would otherwise be stored with
+    // the old, servable size beside chunks built from the new content — the
+    // resource surface would then advertise a URI the filesystem read refuses.
+    // The size and the chunks now come from one buffer.
+    let size_bytes = bytes.len() as u64;
     let excludes: Vec<&str> = match exclude_headings {
         Some(list) => list.iter().map(String::as_str).collect(),
         None => crate::parser::DEFAULT_EXCLUDED_HEADINGS.to_vec(),
@@ -790,7 +802,7 @@ fn index_single_disk_entry(
             &parsed.frontmatter.tags,
             parsed.frontmatter.date.as_deref(),
             &entry.hash,
-            entry.size,
+            size_bytes,
         )?;
         if updated {
             return Ok(SingleResult::Updated {
@@ -828,7 +840,7 @@ fn index_single_disk_entry(
         &parsed.frontmatter.tags,
         parsed.frontmatter.date.as_deref(),
         &entry.hash,
-        entry.size,
+        size_bytes,
     )?;
 
     for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
