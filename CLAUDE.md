@@ -7,6 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Markdown / プレーンテキスト / PDF / Office 文書のナレッジベースに対するセマンティック検索を提供する MCP (Model Context Protocol) サーバ。YAML frontmatter 付きの Markdown (および opt-in で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) を見出し (シート / スライド / ページ) 単位でチャンク化し、選択可能な埋め込みモデル (BGE-small-en-v1.5 / BGE-M3) でベクトル化。sqlite-vec のベクトル検索と FTS5 全文検索を Reciprocal Rank Fusion で融合し、任意で cross-encoder reranker を適用する。stdio または Streamable HTTP トランスポートで Claude Code / Cursor 等の MCP クライアントに接続する。
 
 詳細:
+- **レビューで見る不変条件**: [AGENTS.md](./AGENTS.md) の `## Code Review Rules` (英語)。
+  codex code review が読む公式の場所で、**規約の書き方が「書く時の手順」ではなく
+  「レビュアーが確認する不変条件」**なのが本ファイルとの違い。本ファイルは手順側を持つ
 - ユーザ向けドキュメント: [README.md](./README.md) (English) / [README.ja.md](./README.ja.md) (日本語)
 - ソース構造: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) (English) / [docs/ARCHITECTURE.ja.md](./docs/ARCHITECTURE.ja.md) (日本語)
 - 設計判断の記録 (ADR): [docs/decisions/](./docs/decisions/)。運用ルールと判定基準は [ADR-0000](./docs/decisions/0000-record-decisions-as-adrs.ja.md)
@@ -28,6 +31,10 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 `index` / `status` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service`。フラグの詳細、`kb-mcp.toml` 設定、`.mcp.json` 接続例は README を参照。
 
 ## CLI 出力規約 (= stdout/stderr の責務分離)
+
+規約そのもの (なぜ分けるか / stderr が ASCII 限定である理由) は
+[AGENTS.md](./AGENTS.md) の "Results go to stdout, diagnostics to stderr" に
+置いた。**ここに残すのは「どこに何があるか」の索引と、実際に踏んだ罠**:
 
 `kb-mcp` の各 subcommand は出力先を以下の規約で使い分ける:
 
