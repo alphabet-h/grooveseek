@@ -311,6 +311,24 @@ struct SearchResponse {
     filter_applied: SearchFilterEcho,
 }
 
+/// Whether a failed load says something about the **document** or about the
+/// **server**.
+///
+/// `get_document` does not need the distinction — it answers with one JSON
+/// error envelope either way. `resources/read` does: MCP gives it two codes,
+/// and a client that cannot tell "there is no such resource" from "the index is
+/// unreadable" will retry the wrong one, or stop retrying the one it should.
+/// `list_resources` already reported a failed index query as an internal error,
+/// so collapsing everything here also made the two disagree about the same
+/// failure (codex P2 round 3 on PR #162).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadFailure {
+    /// Nothing here to hand over: absent, or outside what this server serves.
+    NotServed,
+    /// The server could not answer. Not a claim about the document.
+    Internal,
+}
+
 /// (feature-50) A hit, plus the `kb://doc/...` URI that names its document as a
 /// resource.
 ///
@@ -662,15 +680,22 @@ impl KbCore {
         &self,
         parsed: &crate::resources::ResourceUri,
         uri: &str,
-    ) -> Result<(String, &'static str), String> {
-        let paths = self.servable_document_paths()?;
+    ) -> Result<(String, &'static str), (LoadFailure, String)> {
+        let paths = self
+            .servable_document_paths()
+            .map_err(|e| (LoadFailure::Internal, e))?;
 
         match parsed {
             crate::resources::ResourceUri::Topic(prefix) => {
                 let group = crate::resources::topic_groups(&paths)
                     .into_iter()
                     .find(|g| &g.prefix == prefix)
-                    .ok_or_else(|| format!("no such topic group: {uri}"))?;
+                    .ok_or_else(|| {
+                        (
+                            LoadFailure::NotServed,
+                            format!("no such topic group: {uri}"),
+                        )
+                    })?;
                 let mut out = format!("# {}\n\n{}\n\n", group.display_name(), group.description());
                 for p in &group.paths {
                     out.push_str(&format!("- `{p}` — {}\n", crate::resources::doc_uri(p)));
@@ -683,7 +708,10 @@ impl KbCore {
                 // is strictly narrower than `get_document`, so it cannot widen
                 // what is reachable.
                 if !paths.iter().any(|p| p == rel) {
-                    return Err(format!("not an indexed document: {uri}"));
+                    return Err((
+                        LoadFailure::NotServed,
+                        format!("not an indexed document: {uri}"),
+                    ));
                 }
                 // Then the guards, by sharing the body `get_document` uses
                 // rather than re-deriving them: symlink and hard-link refusal,
@@ -691,7 +719,7 @@ impl KbCore {
                 // A second sequence is how the two would come to disagree.
                 let (doc, ext) = self
                     .load_document_blocking(rel)
-                    .map_err(|e| format!("{}: {uri}", e.error))?;
+                    .map_err(|(kind, e)| (kind, format!("{}: {uri}", e.error)))?;
                 Ok((doc.content, Self::resource_mime_for(&ext)))
             }
         }
@@ -700,7 +728,10 @@ impl KbCore {
     fn get_document_blocking(&self, params: GetDocumentParams) -> String {
         match self.load_document_blocking(&params.path) {
             Ok((doc, _ext)) => serde_json::to_string_pretty(&doc).unwrap_or_default(),
-            Err(e) => serde_json::to_string_pretty(&e).unwrap_or_default(),
+            // The category is for `resources/read`, which has two codes to
+            // choose between. This tool has one envelope either way, so its
+            // output is unchanged by carrying it.
+            Err((_kind, e)) => serde_json::to_string_pretty(&e).unwrap_or_default(),
         }
     }
 
@@ -717,7 +748,7 @@ impl KbCore {
     fn load_document_blocking(
         &self,
         rel: &str,
-    ) -> Result<(DocumentResponse, String), ErrorResponse> {
+    ) -> Result<(DocumentResponse, String), (LoadFailure, ErrorResponse)> {
         // (BU-22) Both caps go in; `validate_get_document_path` picks between
         // them from the canonical extension, which is the same one its
         // registry-membership check uses.
@@ -729,8 +760,10 @@ impl KbCore {
             crate::parser::MAX_RAW_BINARY_BYTES,
         ) {
             ValidatePathOutcome::Found(p) => p,
+            // Both say something about the path: it is absent, or it is not
+            // something this server hands over. Neither says the server failed.
             ValidatePathOutcome::NotFound(e) | ValidatePathOutcome::Denied(e) => {
-                return Err(e);
+                return Err((LoadFailure::NotServed, e));
             }
         };
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -748,20 +781,31 @@ impl KbCore {
             Ok(crate::links::Content::Bytes(bytes)) => {
                 match build_document_response(&self.parser_registry, rel, ext, &bytes) {
                     Ok(resp) => Ok((resp, ext.to_string())),
-                    Err(e) => Err(ErrorResponse {
-                        error: format!("Failed to extract document: {e}"),
-                    }),
+                    // The document is there; producing text from it failed.
+                    // That is the server's problem, not a missing resource.
+                    Err(e) => Err((
+                        LoadFailure::Internal,
+                        ErrorResponse {
+                            error: format!("Failed to extract document: {e}"),
+                        },
+                    )),
                 }
             }
             Ok(crate::links::Content::Refused(refused)) => {
                 tracing::warn!("{}", refused.log_line(&canonical));
-                Err(ErrorResponse {
-                    error: refused.client_message().to_string(),
-                })
+                Err((
+                    LoadFailure::NotServed,
+                    ErrorResponse {
+                        error: refused.client_message().to_string(),
+                    },
+                ))
             }
-            Err(e) => Err(ErrorResponse {
-                error: format!("Failed to read file: {e}"),
-            }),
+            Err(e) => Err((
+                LoadFailure::Internal,
+                ErrorResponse {
+                    error: format!("Failed to read file: {e}"),
+                },
+            )),
         }
     }
 
@@ -1263,7 +1307,7 @@ impl ServerHandler for KbServer {
         })
         .await
         .map_err(internal_error)?
-        .map_err(|e| rmcp::ErrorData::resource_not_found(e, None))?;
+        .map_err(|(kind, message)| resource_error(kind, message))?;
 
         let (text, mime) = text;
         let content = rmcp::model::ResourceContents::text(text, uri).with_mime_type(mime);
@@ -1309,6 +1353,20 @@ impl_cache_hinted!(
 
 fn internal_error(e: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(e, None)
+}
+
+/// Turn a [`LoadFailure`] into the JSON-RPC error that says the same thing.
+///
+/// Only a statement about the resource gets the not-found code; a failure of
+/// the server's own stays an internal error, which is what `list_resources`
+/// already reports for the identical unreadable index. Written as a function so
+/// the mapping can be asserted directly — the two codes mean different things
+/// to a retrying client, and nothing else would notice them being collapsed.
+fn resource_error(kind: LoadFailure, message: String) -> rmcp::ErrorData {
+    match kind {
+        LoadFailure::NotServed => rmcp::ErrorData::resource_not_found(message, None),
+        LoadFailure::Internal => internal_error(message),
+    }
 }
 
 /// [`run_blocking`] for handlers that return something other than a JSON string.
@@ -4355,6 +4413,31 @@ mod tests {
             core_block[..core_end].matches(".lock()").count() >= 4,
             "the blocking bodies no longer take any locks — either they moved \
              somewhere this test cannot see, or the extraction is broken."
+        );
+    }
+
+    /// "There is no such resource" and "this server is broken" are different
+    /// answers, and a client acts on them differently: the first is final, the
+    /// second is worth retrying. `read_resource` collapsed both into
+    /// `resource_not_found`, which also made it disagree with `list_resources`
+    /// about the identical unreadable index (codex P2 round 3 on PR #162).
+    #[test]
+    fn a_broken_server_and_a_missing_resource_do_not_share_a_code() {
+        let missing = resource_error(LoadFailure::NotServed, "no such topic group".to_string());
+        let broken = resource_error(
+            LoadFailure::Internal,
+            "failed to list documents".to_string(),
+        );
+
+        assert_eq!(missing.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+        assert_eq!(broken.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_ne!(
+            missing.code, broken.code,
+            "a failure of the server must not be reported as an absent resource"
+        );
+        assert_eq!(
+            missing.message, "no such topic group",
+            "the message must survive the mapping"
         );
     }
 
