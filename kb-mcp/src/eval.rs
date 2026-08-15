@@ -650,6 +650,15 @@ pub fn detect_quoted_queries(
             let Some(q) = golden.get(gi) else { continue };
             // その query の正解として挙がっている文書が query 語を含むのは
             // 当たり前で、混入ではない。数えると全 golden が所見になる。
+            //
+            // **免除は文書単位で、`expected` が heading を指していても変えない。**
+            // 章単位に狭めると「正解の文書の *別の章* にトピック名が出ている」が
+            // 数えられるようになるが、それは 1 件規則が実測 8 件の偽陽性を出した
+            // 母集団そのもの (トピック名はその解説文書のあちこちに出る)。
+            // 所見も 2 件閾値も文書単位である以上、免除だけ章単位にすると
+            // 規則の粒度が揃わない。取りこぼす形は
+            // 「heading 指定された正解文書の別章に、その query が引用されている」
+            // で、これは承知の上の代償。
             if q.expected.iter().any(|e| &e.path == path) {
                 continue;
             }
@@ -1488,6 +1497,34 @@ mod tests {
         // 2 件含んでいるが、片方は自分の正解なので 1 件ぶんしか数えない。
         let scan = vec![("notes/both.md".to_string(), vec![0, 1])];
         assert!(detect_quoted_queries(&golden, &scan, &[]).is_empty());
+    }
+
+    /// 免除は **`expected` が heading を指していても文書単位**。狭める案は
+    /// codex review round 3 で提案されたが採らなかった (理由は
+    /// `detect_quoted_queries` の該当箇所)。**意図的な選択なのでここで固定する。**
+    #[test]
+    fn test_detect_quoted_queries_exempts_the_whole_document_even_with_a_pinned_heading() {
+        let golden = vec![
+            GoldenQuery {
+                id: Some("a".to_string()),
+                query: "cross-encoder reranking".to_string(),
+                expected: vec![ExpectedHit {
+                    path: "notes/topic.md".to_string(),
+                    heading: Some("Overview".to_string()),
+                }],
+                tags: None,
+            },
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        // その文書は query a の正解 (章まで指定) で、query b も引用している。
+        // 章単位の免除にすると a も数えて 2 件 = 所見になるが、
+        // 「正解の文書の別の章にトピック名が出ている」は混入の証拠ではない。
+        let scan = vec![("notes/topic.md".to_string(), vec![0, 1])];
+        assert!(
+            detect_quoted_queries(&golden, &scan, &[]).is_empty(),
+            "a document that answers the query is not evidence of a leak, \
+             whichever section of it was labelled"
+        );
     }
 
     /// 順位の注記は `top_k` から引く。`None` は「コーパスには居るが、この run では

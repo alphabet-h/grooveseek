@@ -113,7 +113,14 @@ change nothing.
   of a seam read as a single quote, and the cost of not joining — a quote split
   across a seam is not seen — is the cheaper mistake.
 - A document listed in a query's `expected` is not counted for that query. It
-  contains the wording because it is the answer.
+  contains the wording because it is the answer. The exemption covers the
+  **whole document even when the entry pins a heading**. Narrowing it to the
+  labelled section would begin counting "a topic name appears in another section
+  of the document about that topic" — the population that made the single-quote
+  rule useless — and it would give the exemption a granularity the rest of the
+  rule does not have, since both the finding and the threshold are per document.
+  The cost is a genuine quote sitting in another section of a document that
+  answers the same query, which goes unreported.
 - There is no way to silence an intentional quote. With the report costing
   nothing but a line on stderr, an allow-list would mostly be a way to make a
   real leak permanent. It can be added later without breaking anything if the
