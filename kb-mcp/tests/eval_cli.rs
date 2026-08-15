@@ -268,10 +268,20 @@ fn eval_reports_documents_that_quote_several_golden_queries() {
 
     // 2) Add the note that quotes both queries verbatim — the shape of the
     //    real incident, where a note *about* the evaluation joined the corpus.
+    //
+    //    One query is quoted **only in a heading** and the other **only in the
+    //    body**, so the finding requires both fields to be scanned. The
+    //    Markdown parser strips the heading line out of the chunk body and
+    //    stores it separately, while FTS weights headings above body text — a
+    //    content-only scan misses the most natural way to document a test.
     kb.write(
         "about-the-eval.md",
-        "# Notes on the eval\n\nThe golden set asks `What is Reciprocal Rank Fusion?`\n\
-         and `How are chunks deduplicated?`, so both wordings live here too.\n",
+        "# Notes on the eval\n\n\
+         The second golden entry uses the wording `How are chunks deduplicated?`,\n\
+         which is quoted here so the labelling decision is on the record.\n\n\
+         ## What is Reciprocal Rank Fusion?\n\n\
+         That heading is the first golden query verbatim. This paragraph exists\n\
+         so the section stays above the chunk merge threshold.\n",
     );
     index(&bin);
     let (v, stderr) = eval_json(&bin);

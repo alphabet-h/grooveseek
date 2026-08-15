@@ -244,9 +244,14 @@ Two consequences worth knowing:
   matched at all. Short queries occur in too many documents by chance. The same
   measurement brackets this value: 8 and 12 give identical results, and 16 loses
   the true finding.
-- Matching happens **within a chunk**, so a quote split across a chunk boundary
-  is not seen. Joining a document's chunks first would let unrelated text on
-  either side of a seam read as one quote, which is the worse failure.
+- Matching happens **within one indexed text field** — a chunk's body and its
+  heading are scanned separately, and so is each chunk. Headings count because
+  the Markdown parser strips the heading line out of the body and full-text
+  search weights headings *above* body text: a note that lists golden queries as
+  `##` headings is the most natural way to document a test, and a body-only scan
+  would not see it at all. Nothing is concatenated first, so a quote split across
+  a seam is not seen — that is deliberate, since joining would let unrelated text
+  on either side of the seam read as one quote.
 
 The scan is one pass over the indexed chunk bodies, inside the same read
 snapshot as the searches, so it reports on exactly the index the metrics came

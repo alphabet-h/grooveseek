@@ -608,8 +608,9 @@ pub fn quote_needles(golden: &[GoldenQuery]) -> Vec<(usize, String)> {
 /// コーパス全体を 1 パス走査し、各文書が逐語で含んでいた needle を
 /// **golden 内の index** で返す。1 つも含まない文書は返さない。
 ///
-/// 照合は chunk 単位、集約は文書単位 ([`crate::db::Database::for_each_chunk_body`]
-/// の doc comment を参照)。
+/// 照合は索引された**テキストフィールド単位** (chunk 本文と見出しをそれぞれ
+/// 別に見る)、集約は文書単位。理由は
+/// [`crate::db::Database::for_each_indexed_text`] の doc comment を参照。
 pub fn scan_quoted_documents(
     db: &crate::db::Database,
     needles: &[(usize, String)],
@@ -619,8 +620,8 @@ pub fn scan_quoted_documents(
     }
     let mut found: std::collections::BTreeMap<String, std::collections::BTreeSet<usize>> =
         std::collections::BTreeMap::new();
-    db.for_each_chunk_body(|path, content| {
-        let hay = normalize_for_quote(content);
+    db.for_each_indexed_text(|path, text| {
+        let hay = normalize_for_quote(text);
         for (gi, needle) in needles {
             if hay.contains(needle.as_str()) {
                 found.entry(path.to_string()).or_default().insert(*gi);

@@ -708,7 +708,7 @@ impl Database {
         Ok((documents, chunks, digest))
     }
 
-    /// 索引済みの全 chunk 本文を `(path, content)` で 1 パス流す (feature-52)。
+    /// 索引済みの検索対象テキストを `(path, text)` で 1 パス流す (feature-52)。
     ///
     /// `kb-mcp eval` の golden query 混入検出が、コーパス全体に対して逐語一致を
     /// 探すために使う。**照合規則そのものはここに持たない** — 何を「含む」と
@@ -716,18 +716,29 @@ impl Database {
     /// この関数は行を渡すだけにする。規則が db と eval に分かれると、query 側と
     /// 本文側で別々に育って静かに食い違う。
     ///
+    /// **chunk ごとに 1 回ではなく、検索対象フィールドごとに 1 回呼ぶ。**
+    /// Markdown parser は見出し行を content から取り除いて `heading` に入れる
+    /// (`parser/markdown.rs`) 一方、FTS は heading を**本文より重い列**として
+    /// 索引する。content だけを流すと、golden query を `##` 見出しに並べた
+    /// ノート — テストについて書くときの最も自然な形 — が丸ごと見えない。
+    /// 連結せずフィールドごとに渡すのは、見出しの末尾と本文の先頭が隣接した
+    /// 1 つの文字列に見えるのを避けるため (chunk をまたがない理由と同じ)。
+    ///
+    /// `context_text` は流さない。あれは同じ文書の祖先見出しから作られる
+    /// パンくずなので、heading を流している以上その文書は既に見つかる。
+    ///
     /// 行順は `(path, chunk_index)` で固定する。呼び出し側は集約するので順序に
     /// 依存しないが、実行計画依存の順序で流すと**再現しないバグを作れる**ように
     /// なるだけで、得るものが無い。
     ///
     /// 呼び出し側が read transaction を開いていればその上で流れる
     /// (`eval::run` は run 全体を 1 スナップショットに固定している)。
-    pub fn for_each_chunk_body<F>(&self, mut f: F) -> Result<()>
+    pub fn for_each_indexed_text<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(&str, &str),
     {
         let mut stmt = self.conn.prepare(
-            "SELECT d.path, c.content
+            "SELECT d.path, c.heading, c.content
              FROM chunks c
              JOIN documents d ON d.id = c.document_id
              ORDER BY d.path, c.chunk_index",
@@ -735,7 +746,11 @@ impl Database {
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;
-            let content: String = row.get(1)?;
+            let heading: Option<String> = row.get(1)?;
+            let content: String = row.get(2)?;
+            if let Some(h) = heading.as_deref().filter(|h| !h.is_empty()) {
+                f(&path, h);
+            }
             f(&path, &content);
         }
         Ok(())

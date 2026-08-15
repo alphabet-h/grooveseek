@@ -4303,12 +4303,17 @@ mod tests {
     }
 
     /// feature-52: the eval leakage scan matches each needle against **one
-    /// chunk body at a time**, so the reader hands out chunk bodies rather than
-    /// a per-document concatenation. Joining them here would let a needle
-    /// straddle the seam between two chunks and be reported as quoted when its
-    /// two halves sit nowhere near each other in the document.
+    /// indexed text field at a time**, so the reader hands out fields rather
+    /// than any concatenation. Joining them here would let a needle straddle a
+    /// seam — between two chunks, or between a heading and the body under it —
+    /// and be reported as quoted when its halves sit nowhere near each other.
+    ///
+    /// Headings are their own field for a reason that matters to the caller:
+    /// the Markdown parser strips the heading line out of `content`, and FTS
+    /// indexes headings *more* heavily than body text, so a note that lists
+    /// golden queries as `##` headings is invisible to a content-only scan.
     #[test]
-    fn test_for_each_chunk_body_yields_one_row_per_chunk_in_path_order() {
+    fn test_for_each_indexed_text_yields_heading_and_body_separately() {
         let db = db_with_384();
         // Inserted out of path order on purpose: the ordering below has to come
         // from the SQL, not from the insertion sequence.
@@ -4343,8 +4348,8 @@ mod tests {
         db.insert_chunk(
             first,
             0,
-            None,
-            None,
+            Some("A heading that is a question?"),
+            Some(2),
             "the first half of a sentence",
             None,
             &dummy_embedding(0.3),
@@ -4353,14 +4358,19 @@ mod tests {
         .unwrap();
 
         let mut seen: Vec<(String, String)> = Vec::new();
-        db.for_each_chunk_body(|path, content| {
-            seen.push((path.to_string(), content.to_string()));
+        db.for_each_indexed_text(|path, text| {
+            seen.push((path.to_string(), text.to_string()));
         })
         .unwrap();
 
         assert_eq!(
             seen,
             vec![
+                // The heading comes out on its own, never glued to the body.
+                (
+                    "a.md".to_string(),
+                    "A heading that is a question?".to_string()
+                ),
                 (
                     "a.md".to_string(),
                     "the first half of a sentence".to_string()
