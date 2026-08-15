@@ -591,7 +591,20 @@ fn main() -> anyhow::Result<()> {
         return run_service(action);
     }
 
-    let discovered = Config::discover(cli.config.as_deref())?;
+    let discovered = match Config::discover(cli.config.as_deref()) {
+        Ok(d) => d,
+        // `doctor` promises exit 2 for "could not run", and a configuration it
+        // cannot load means the inspection never happened. Carrying this out
+        // with `?` would exit 1 — the code reserved for an inspection that
+        // completed and found something (codex P2 round 3). Same shape as the
+        // service arm above: which command was asked for changes what a
+        // discovery failure means.
+        Err(e) if matches!(cli.command, Commands::Doctor { .. }) => {
+            eprintln!("kb-mcp doctor: could not load configuration: {e:#}");
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e),
+    };
     let (cfg, source) = (discovered.config, discovered.source);
     // (BU-07) `source` の variant 名だけでは「どのファイルが勝ったのか」も
     // 「その中身をどこまで信用したのか」も分からない。両方を 1 行に載せる。

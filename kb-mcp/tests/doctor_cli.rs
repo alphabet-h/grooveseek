@@ -131,6 +131,34 @@ fn no_kb_path_at_all_exits_two_rather_than_looking_like_a_finding() {
     );
 }
 
+/// codex P2 round 3: config discovery runs before the subcommand arm, so a
+/// configuration that will not parse used to exit 1 — again the code that
+/// means "inspected it, found something", for a run that never inspected
+/// anything.
+#[test]
+fn a_configuration_that_will_not_load_exits_two() {
+    let layout = TempKbLayout::new("kb-mcp-doctor-badcfg");
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, "model = \"bge-small-en-v1.5\"\nthis is not toml\n")
+        .expect("write config");
+
+    let out = Command::new(kb_mcp_bin())
+        .args([
+            "--config",
+            &cfg.to_string_lossy(),
+            "doctor",
+            "--kb-path",
+            &layout.kb().display().to_string(),
+        ])
+        .output()
+        .expect("kb-mcp doctor");
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        2,
+        "a config that will not parse is a failure to run"
+    );
+}
+
 #[test]
 fn a_missing_index_exits_two_rather_than_reporting_a_clean_bill() {
     // "I could not look" and "I looked and found nothing" are different
