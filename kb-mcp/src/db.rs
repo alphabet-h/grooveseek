@@ -4302,6 +4302,75 @@ mod tests {
         assert_eq!(db.record_document_sizes(&[("absent.md", 1)]).unwrap(), 0);
     }
 
+    /// feature-52: the eval leakage scan matches each needle against **one
+    /// chunk body at a time**, so the reader hands out chunk bodies rather than
+    /// a per-document concatenation. Joining them here would let a needle
+    /// straddle the seam between two chunks and be reported as quoted when its
+    /// two halves sit nowhere near each other in the document.
+    #[test]
+    fn test_for_each_chunk_body_yields_one_row_per_chunk_in_path_order() {
+        let db = db_with_384();
+        // Inserted out of path order on purpose: the ordering below has to come
+        // from the SQL, not from the insertion sequence.
+        let second = db
+            .upsert_document("b.md", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let first = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "ha", 0)
+            .unwrap();
+        db.insert_chunk(
+            second,
+            0,
+            None,
+            None,
+            "the tail of a quote",
+            None,
+            &dummy_embedding(0.1),
+            1.0,
+        )
+        .unwrap();
+        db.insert_chunk(
+            first,
+            1,
+            None,
+            None,
+            "and its second half",
+            None,
+            &dummy_embedding(0.2),
+            1.0,
+        )
+        .unwrap();
+        db.insert_chunk(
+            first,
+            0,
+            None,
+            None,
+            "the first half of a sentence",
+            None,
+            &dummy_embedding(0.3),
+            1.0,
+        )
+        .unwrap();
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        db.for_each_chunk_body(|path, content| {
+            seen.push((path.to_string(), content.to_string()));
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "a.md".to_string(),
+                    "the first half of a sentence".to_string()
+                ),
+                ("a.md".to_string(), "and its second half".to_string()),
+                ("b.md".to_string(), "the tail of a quote".to_string()),
+            ]
+        );
+    }
+
     /// Companion to the above: passing `None` for `level` stores SQL NULL
     /// (this is the path used by .txt and frontmatter-only / pre-heading
     /// chunks, and also by every test fixture site that doesn't care).

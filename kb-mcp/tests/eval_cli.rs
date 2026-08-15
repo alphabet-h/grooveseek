@@ -181,6 +181,124 @@ fn eval_runs_end_to_end_and_writes_history() {
     );
 }
 
+/// feature-52: a note that quotes the golden queries verbatim is reported, and
+/// the same corpus without that note reports nothing.
+///
+/// **Both halves matter.** The rule this pins is "two or more distinct golden
+/// queries in one document"; the reason it is not "one" is that golden queries
+/// are often topic names (`cross-encoder`), which appear verbatim in the very
+/// documents that explain them — measured at 8 false positives on a healthy
+/// 662-document corpus. A test that only checks the positive case would still
+/// pass with that noisy rule restored.
+#[test]
+#[ignore]
+fn eval_reports_documents_that_quote_several_golden_queries() {
+    let kb = TempKb::new("kb-mcp-eval-it-quoted");
+    kb.write(
+        "rrf.md",
+        "# RRF\n\nRRF is Reciprocal Rank Fusion with constant k=60.\n",
+    );
+    kb.write(
+        "chunks.md",
+        "# Chunks\n\nChunks are deduplicated by SHA-256 of content.\n",
+    );
+
+    let bin = kb_mcp_bin();
+    let kb_path = kb.kb();
+
+    let golden = kb_path.join(".kb-mcp-eval.yml");
+    let golden_yml = concat!(
+        "queries:\n",
+        "  - id: rrf-q\n",
+        "    query: \"What is Reciprocal Rank Fusion?\"\n",
+        "    expected:\n",
+        "      - path: \"rrf.md\"\n",
+        "  - id: chunks-q\n",
+        "    query: \"How are chunks deduplicated?\"\n",
+        "    expected:\n",
+        "      - path: \"chunks.md\"\n",
+    );
+    std::fs::write(&golden, golden_yml).unwrap();
+
+    let index = |bin: &PathBuf| {
+        let status = Command::new(bin)
+            .arg("index")
+            .arg("--kb-path")
+            .arg(kb_path)
+            .arg("--model")
+            .arg("bge-small-en-v1.5")
+            .status()
+            .expect("spawn kb-mcp index");
+        assert!(status.success(), "index failed");
+    };
+    let eval_json = |bin: &PathBuf| {
+        let out = Command::new(bin)
+            .arg("eval")
+            .arg("--kb-path")
+            .arg(kb_path)
+            .arg("--model")
+            .arg("bge-small-en-v1.5")
+            .arg("--no-history")
+            .arg("--format")
+            .arg("json")
+            .output()
+            .expect("spawn kb-mcp eval");
+        assert!(
+            out.status.success(),
+            "eval must still exit 0 when it reports a finding: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("valid JSON from `eval --format json`");
+        (v, String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // 1) Clean corpus: each document contains only its own query's wording.
+    index(&bin);
+    let (v, stderr) = eval_json(&bin);
+    assert_eq!(
+        v["findings"],
+        serde_json::json!([]),
+        "a corpus with nothing quoted must report an empty array, not a missing key: {v}"
+    );
+    assert!(
+        !stderr.contains("golden-queries-quoted"),
+        "a clean corpus must not warn: {stderr}"
+    );
+
+    // 2) Add the note that quotes both queries verbatim — the shape of the
+    //    real incident, where a note *about* the evaluation joined the corpus.
+    kb.write(
+        "about-the-eval.md",
+        "# Notes on the eval\n\nThe golden set asks `What is Reciprocal Rank Fusion?`\n\
+         and `How are chunks deduplicated?`, so both wordings live here too.\n",
+    );
+    index(&bin);
+    let (v, stderr) = eval_json(&bin);
+
+    let findings = v["findings"].as_array().expect("findings must be an array");
+    assert_eq!(findings.len(), 1, "expected exactly one finding: {v}");
+    assert_eq!(findings[0]["check"], "golden-queries-quoted");
+    assert_eq!(findings[0]["path"], "about-the-eval.md");
+    let ids: Vec<&str> = findings[0]["quoted"]
+        .as_array()
+        .expect("quoted must be an array")
+        .iter()
+        .map(|q| q["query_id"].as_str().expect("query_id is a string"))
+        .collect();
+    assert_eq!(ids, vec!["rrf-q", "chunks-q"]);
+
+    assert!(
+        stderr.contains("golden-queries-quoted") && stderr.contains("about-the-eval.md"),
+        "the warning belongs on stderr: {stderr}"
+    );
+    // The result itself stays on stdout; the diagnostic must not leak into it.
+    assert!(
+        v["aggregate"]["query_count"].as_u64().unwrap_or(0) >= 1,
+        "the report itself must still be intact: {v}"
+    );
+}
+
 #[test]
 #[ignore]
 fn eval_errors_when_golden_missing() {

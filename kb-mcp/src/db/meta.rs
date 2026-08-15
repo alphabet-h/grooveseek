@@ -708,6 +708,39 @@ impl Database {
         Ok((documents, chunks, digest))
     }
 
+    /// 索引済みの全 chunk 本文を `(path, content)` で 1 パス流す (feature-52)。
+    ///
+    /// `kb-mcp eval` の golden query 混入検出が、コーパス全体に対して逐語一致を
+    /// 探すために使う。**照合規則そのものはここに持たない** — 何を「含む」と
+    /// みなすか (正規化・最小長・件数の閾値) は `eval` 側の純粋関数が全部持ち、
+    /// この関数は行を渡すだけにする。規則が db と eval に分かれると、query 側と
+    /// 本文側で別々に育って静かに食い違う。
+    ///
+    /// 行順は `(path, chunk_index)` で固定する。呼び出し側は集約するので順序に
+    /// 依存しないが、実行計画依存の順序で流すと**再現しないバグを作れる**ように
+    /// なるだけで、得るものが無い。
+    ///
+    /// 呼び出し側が read transaction を開いていればその上で流れる
+    /// (`eval::run` は run 全体を 1 スナップショットに固定している)。
+    pub fn for_each_chunk_body<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str, &str),
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.path, c.content
+             FROM chunks c
+             JOIN documents d ON d.id = c.document_id
+             ORDER BY d.path, c.chunk_index",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            f(&path, &content);
+        }
+        Ok(())
+    }
+
     /// 既存ドキュメントのパスを書き換える。
     /// `chunks` / `vec_chunks` / `fts_chunks` は `document_id` 経由で紐付いて
     /// いるため、`documents.path` のみを UPDATE すれば embedding の再計算は

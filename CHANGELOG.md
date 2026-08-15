@@ -12,6 +12,32 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **`kb-mcp eval` reports a corpus that quotes its own golden set** (D-12).
+
+  If you keep notes about the evaluation inside the knowledge base being
+  evaluated, a note that quotes a golden query verbatim becomes the strongest
+  match for that query — it takes the top slot and pushes the labelled answer
+  down. **The more you write about the evaluation, the harder it is to pass**,
+  and until now nothing said so; the one case found on the reference corpus was
+  noticed only because someone happened to read the per-query rows.
+
+  Each run now scans the indexed corpus once and reports documents that quote
+  **two or more distinct golden queries** verbatim, on stderr and in
+  `--format json` under `findings`. **The exit code is unchanged** — a quote is
+  either a note that leaked in or the source the query was written from, in
+  which case the document belongs in that query's `expected`, and only the
+  author of the golden set can tell which.
+
+  Requiring two quotes rather than one is the whole design, and it is measured:
+  golden queries are often topic names (`cross-encoder`, `torch.compile`), which
+  appear verbatim in the documents explaining them, so reporting single matches
+  produced **8 findings, all false positives**, on a healthy 662-document
+  corpus — where the rule as shipped produced exactly one, and it was the note
+  that was in fact documenting the golden set. Reasoning:
+  [ADR-0006](docs/decisions/0006-report-a-corpus-that-quotes-the-golden-set.md).
+
 ## [0.23.0] - 2026-08-15
 
 ### Added

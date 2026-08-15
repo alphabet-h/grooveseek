@@ -1141,6 +1141,15 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // 混入検出の所見 (feature-52) は **診断なので stderr**。結果そのもの
+            // (stdout) には `--format json` の `findings` として既に載っている。
+            // 出力形式に関係なく出すのは、text で回している人にこそ届く必要が
+            // あるため。exit code は動かさない — 混入かどうかは golden を書いた
+            // 人しか判定できず、CI を落とす根拠にはならない。
+            if let Some(warning) = kb_mcp::eval::format_findings_warning(&run.findings) {
+                eprint!("{warning}");
+            }
+
             // F-40: --fail-on-regression は履歴保存より後に判定したいが、
             // run を h.push_front で move する前に regression check を済ませる
             // 必要がある。以下の手順:

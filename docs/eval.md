@@ -182,6 +182,76 @@ is `null` when there is nothing to compare against — distinct from `false`.
 Runs recorded before this existed carry no corpus, and are never reported as
 changed; the first run after that writes one, and the next run compares normally.
 
+### When the corpus quotes the golden set (v0.24.0+)
+
+If you keep notes about your evaluation *inside the knowledge base you are
+evaluating*, those notes become search results. A note that quotes a golden
+query verbatim is the strongest possible match for that query, so it takes the
+top slot and pushes the real answer down — the golden set gets harder to pass
+the more you write about it.
+
+Every run scans the indexed corpus for this and reports what it finds on
+**stderr**, leaving the exit code alone:
+
+```
+kb-mcp eval: 1 document(s) quote 2 or more golden queries verbatim (golden-queries-quoted).
+  engineering/deep-dive/rag/evaluation.md
+    torch-compile (not in top_k)
+    cross-encoder-reranker (rank 8)
+  Either these notes leaked into the corpus, or the queries came from them
+  and the documents belong in `expected`. kb-mcp eval changes neither.
+```
+
+The same findings are in `--format json` under `findings`, as an array that is
+present (and empty) even when nothing was found, so a consumer can tell "checked,
+nothing" from "an older version that never checked":
+
+```json
+"findings": [
+  {
+    "check": "golden-queries-quoted",
+    "path": "engineering/deep-dive/rag/evaluation.md",
+    "quoted": [
+      { "query_id": "torch-compile", "rank_in_top_k": null },
+      { "query_id": "cross-encoder-reranker", "rank_in_top_k": 8 }
+    ]
+  }
+]
+```
+
+`rank_in_top_k` is `null` when the document quotes the query but did not reach
+that query's `top_k` — it is in the corpus but has not taken a slot yet.
+
+**The report does not say which of the two causes it is**, because it cannot: a
+document that quotes a query is either a note *about* the test, or the source
+the query was written from — in which case it belongs in that query's `expected`
+and the golden file is what needs fixing. Only the person who wrote the golden
+set knows. `eval` reports and changes nothing.
+
+**Why "two or more" queries, and not one.** A single verbatim match is not
+evidence of anything: golden queries are often topic names (`cross-encoder`,
+`torch.compile`), which naturally appear in the documents that explain them.
+Measured on a healthy 662-document corpus with 26 golden queries, reporting
+every single match produced **8 findings, all false positives**, while requiring
+two distinct queries in one document produced **exactly one — the note that was
+in fact documenting the golden set**. A document quoting several golden queries
+is what "a note about the test" looks like; one quoting a single query is what
+"a document about that topic" looks like.
+
+Two consequences worth knowing:
+
+- Queries shorter than **12 characters** after whitespace normalization are not
+  matched at all. Short queries occur in too many documents by chance. The same
+  measurement brackets this value: 8 and 12 give identical results, and 16 loses
+  the true finding.
+- Matching happens **within a chunk**, so a quote split across a chunk boundary
+  is not seen. Joining a document's chunks first would let unrelated text on
+  either side of a seam read as one quote, which is the worse failure.
+
+The scan is one pass over the indexed chunk bodies, inside the same read
+snapshot as the searches, so it reports on exactly the index the metrics came
+from.
+
 ## Configuration
 
 All knobs are optional in `kb-mcp.toml`:
