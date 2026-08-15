@@ -87,6 +87,13 @@ v0.22.0 で kb-mcp に MCP の `resources` capability が入った。クライ�
   `text/markdown`、抽出テキストとして出すものは `text/plain`。PDF は
   kb-mcp が抽出したテキストとして返るので、`application/pdf` と名乗るのは
   クライアントが手にしているバイト列について嘘をつくことになる
+- **エンベロープが無い以上、そこに載っていた情報は本文で言うしかない**。
+  抽出テキストが 1 MiB を超えると truncate され、`get_document` は
+  `truncated` フィールドで報告する。resource の read は代わりに
+  **区切り付きの注記を末尾に足す**。prefix をそのまま返すのは
+  「文書の一部を全部として提示する」ことであり、これは BU-31 が phrase cap で
+  切られた query に対して閉じたのと同じ silent loss の形。答えも同じ —
+  **あるものを渡し、それがあるものだと言う**
 - **保証しないこと**: 提示した URI が必ず読めること。一部は**その瞬間の条件**
   (index 後に消された / hard link が rename で被せられた) で、listing には
   そもそも答えられない。1 つだけ性質が違うのが **size cap**: index は 50 MiB まで

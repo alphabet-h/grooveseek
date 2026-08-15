@@ -97,6 +97,12 @@ is a property of a single list or of neither.
   for Markdown, `text/plain` for anything delivered as extracted text. A PDF
   comes back as the text kb-mcp extracted from it, so calling it
   `application/pdf` would misdescribe the bytes the client is holding.
+- Because the envelope is gone, anything it used to carry has to be said in the
+  text or not at all. Extraction above 1 MiB is truncated, and `get_document`
+  reports that in a `truncated` field; a resource read appends a marked notice
+  instead. Serving the prefix bare would present part of a document as all of
+  it — the same silent-loss shape BU-31 closed for a query cut at the phrase
+  cap, and the same answer: hand over what there is, and say that is what it is.
 - What this does **not** promise: that every offered URI reads successfully.
   Some refusals are conditions of the moment — the file was deleted since it was
   indexed, a hard link was renamed over it — and a listing cannot answer those

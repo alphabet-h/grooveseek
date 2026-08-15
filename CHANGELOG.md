@@ -39,7 +39,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Content comes back as text with the media type of what is served —
   `text/markdown` for Markdown, `text/plain` for anything delivered as extracted
   text. A PDF is served as the text kb-mcp extracted from it, so it is not
-  described as a PDF.
+  described as a PDF. Extraction above 1 MiB is truncated, as it already was for
+  `get_document`; since a resource read has no envelope to put a `truncated`
+  field in, it appends a marked notice rather than presenting a prefix as the
+  whole document.
 
   `search`'s result gains one field and changes shape in no other way: the MCP
   result is still a single text content block carrying the same JSON, so

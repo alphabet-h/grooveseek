@@ -720,7 +720,16 @@ impl KbCore {
                 let (doc, ext) = self
                     .load_document_blocking(rel)
                     .map_err(|(kind, e)| (kind, format!("{}: {uri}", e.error)))?;
-                Ok((doc.content, Self::resource_mime_for(&ext)))
+                if doc.truncated {
+                    tracing::warn!(
+                        "resources/read: {rel} extracted more than {EXTRACTED_TEXT_MAX_BYTES} \
+                         bytes of text; the resource carries the prefix and says so"
+                    );
+                }
+                Ok((
+                    resource_text(doc.content, doc.truncated),
+                    Self::resource_mime_for(&ext),
+                ))
             }
         }
     }
@@ -1353,6 +1362,30 @@ impl_cache_hinted!(
 
 fn internal_error(e: String) -> rmcp::ErrorData {
     rmcp::ErrorData::internal_error(e, None)
+}
+
+/// What a resource read appends when the text it is handing over is a prefix.
+///
+/// One blank line and a fenced-off sentence, so it reads as an annotation in
+/// both media types this server serves and cannot be mistaken for the
+/// document's own last paragraph.
+const TRUNCATION_NOTICE: &str = "\n\n---\n\n*[kb-mcp] Truncated: the extracted text exceeded 1 MiB. \
+     What is above is the beginning of the document, not all of it.*\n";
+
+/// The text a resource read hands over, with truncation stated in the body.
+///
+/// `get_document` returns a JSON envelope with a `truncated` field; a resource
+/// read returns bare text, and dropping the flag there presented a prefix as
+/// the whole document (codex P2 round 5 on PR #162). The prefix is still worth
+/// serving — refusing it would lose text a client can use — so the answer is
+/// the same one BU-31 reached for a query cut at the phrase cap: hand over what
+/// there is, and say that is what it is.
+fn resource_text(content: String, truncated: bool) -> String {
+    if truncated {
+        content + TRUNCATION_NOTICE
+    } else {
+        content
+    }
 }
 
 /// Turn a [`LoadFailure`] into the JSON-RPC error that says the same thing.
@@ -4413,6 +4446,33 @@ mod tests {
             core_block[..core_end].matches(".lock()").count() >= 4,
             "the blocking bodies no longer take any locks — either they moved \
              somewhere this test cannot see, or the extraction is broken."
+        );
+    }
+
+    /// `get_document` reports truncation in a field; a resource read has only
+    /// the text, and returning the prefix bare presented it as the whole
+    /// document. A client reading a large PDF got its first megabyte with
+    /// nothing to say the rest existed (codex P2 round 5 on PR #162).
+    #[test]
+    fn a_truncated_resource_says_so_in_the_text_it_hands_over() {
+        let whole = resource_text("all of it".to_string(), false);
+        assert_eq!(whole, "all of it", "an untruncated read must be untouched");
+
+        let part = resource_text("the first megabyte".to_string(), true);
+        assert!(
+            part.starts_with("the first megabyte"),
+            "the text served must still come first: {part}"
+        );
+        assert!(
+            part.contains("Truncated"),
+            "the notice must be in the body, the only place a resource read has: {part}"
+        );
+        // The literal is written with a `\` line continuation, which eats the
+        // newline *and* the indentation that follows it — miscount and the
+        // sentence runs two words together while still compiling.
+        assert!(
+            part.contains("1 MiB. What is above"),
+            "the continued literal must join with exactly one space: {part}"
         );
     }
 
