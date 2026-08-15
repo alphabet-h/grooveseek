@@ -174,23 +174,23 @@ fn is_safe_relative(p: &str) -> bool {
     !p.split('/').any(|seg| seg == "..")
 }
 
-/// Whether `p` opens with a Windows drive designator — `C:` — in a form that
-/// escapes the knowledge base.
+/// Whether `p` opens with a Windows drive designator — `C:` — which escapes the
+/// knowledge base. Every form of it does, the drive-*relative* `C:notes.md`
+/// included, since that resolves against that drive's own current directory.
 ///
-/// On Windows every such form does, including the drive-*relative* `C:notes.md`,
-/// which resolves against that drive's own current directory.
-///
-/// Elsewhere `:` is an ordinary filename byte and `a:b.md` is a legal name this
-/// very module encodes a URI for, so refusing it outright would have made the
-/// server unable to read a URI it had just handed out. Only `C:/…` stays
-/// refused there: it is the one spelling that also reads as absolute in URI
-/// syntax, and a directory literally named `C:` is not worth the ambiguity.
+/// **Windows only.** A drive designator is Windows path syntax, so applying the
+/// rule anywhere else refuses legal names for a danger that does not exist
+/// there: `a:b.md` and `C:/note.md` (a directory literally named `C:`) are both
+/// ordinary relative paths on Unix, and this module hands out URIs for them.
+/// Nothing is lost by the narrowing — the colon reaches here percent-decoded,
+/// the leading-slash check above already refuses Unix absolute paths, and the
+/// caller resolves what survives against the index rather than the filesystem.
 fn starts_with_drive_designator(p: &str) -> bool {
-    let b = p.as_bytes();
-    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+    if !cfg!(windows) {
         return false;
     }
-    cfg!(windows) || b.get(2) == Some(&b'/')
+    let b = p.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 /// Percent-encode everything outside the unreserved set, leaving `/` as the
@@ -246,11 +246,15 @@ mod tests {
             "emoji-🦀/x.md",
         ]
         .into_iter()
-        // `:` is a filename byte on Unix and forbidden on Windows, so this one
-        // is only round-trippable where such a file can exist. See
-        // `a_colon_is_a_name_where_the_platform_allows_one`.
-        .chain(cfg!(not(windows)).then_some("a:b.md"))
-        {
+        // `:` is a filename byte on Unix and a drive designator on Windows, so
+        // these are only round-trippable where such a file can exist. See
+        // `a_drive_designator_is_refused_only_where_drives_exist`.
+        .chain(
+            cfg!(not(windows))
+                .then_some(["a:b.md", "C:/note.md"])
+                .into_iter()
+                .flatten(),
+        ) {
             let uri = doc_uri(rel);
             assert_eq!(
                 parse(&uri),
@@ -304,7 +308,6 @@ mod tests {
             "kb://doc/%2E%2E/secret.md",
             "kb://topic/../..",
             "kb://doc//etc/passwd",
-            "kb://doc/C:/Windows/System32/x.md",
             "kb://doc/notes%5C..%5Csecret.md",
             "kb://doc/nul%00.md",
         ] {
@@ -326,35 +329,51 @@ mod tests {
         }
     }
 
-    /// The encoder emits `%3A` on every platform, but what a colon *means* in a
-    /// path does not travel: `a:b.md` is an ordinary Unix filename and an
-    /// impossible Windows one. Refusing it everywhere — which is what a blanket
-    /// "second byte is `:`" check did — left the server unable to read a URI it
-    /// had just handed out.
+    /// A drive designator is Windows path syntax, and the refusal of it belongs
+    /// to that platform alone. `a:b.md` and `C:/note.md` are ordinary relative
+    /// names on Unix — the second is a directory called `C:` — and this module
+    /// hands out URIs for both, so refusing them everywhere left the server
+    /// unable to read a URI it had just built. Note which half of this test the
+    /// development platform exercises: on Windows the old behaviour and the new
+    /// one agree, so only the Unix runners can see the difference.
+    ///
+    /// `C:/Windows/System32/x.md` moved here out of
+    /// `traversal_is_refused_however_it_is_spelled`, deliberately: on Unix it is
+    /// not traversal, and asserting a refusal there was asserting something
+    /// false about the platform. What keeps it harmless is not this check —
+    /// a read resolves against the index, and a path that is not in the index is
+    /// refused whatever it is spelled like.
     #[test]
-    fn a_colon_is_a_name_where_the_platform_allows_one() {
-        assert_eq!(
-            parse("kb://doc/C:/Windows/System32/x.md"),
-            None,
-            "the drive-absolute spelling is refused everywhere: it also reads as absolute"
-        );
-
-        let uri = doc_uri("a:b.md");
-        assert!(uri.contains("%3A"), "the colon must be encoded: {uri}");
-
-        if cfg!(windows) {
-            assert_eq!(
-                parse(&uri),
-                None,
-                "`a:` is drive-relative on Windows, and no file there can be named this"
+    fn a_drive_designator_is_refused_only_where_drives_exist() {
+        let cases = [("a:b.md", "%3A"), ("C:/note.md", "C%3A/")];
+        for (rel, must_encode) in cases {
+            let uri = doc_uri(rel);
+            assert!(
+                uri.contains(must_encode),
+                "the colon must be encoded: {uri}"
             );
-        } else {
-            assert_eq!(
-                parse(&uri),
-                Some(ResourceUri::Doc("a:b.md".to_string())),
-                "a legal filename must survive the URI this module just built for it"
-            );
+
+            if cfg!(windows) {
+                assert_eq!(
+                    parse(&uri),
+                    None,
+                    "`{rel}` names a drive on Windows, and no file there can be called that"
+                );
+            } else {
+                assert_eq!(
+                    parse(&uri),
+                    Some(ResourceUri::Doc(rel.to_string())),
+                    "a legal filename must survive the URI this module just built for it"
+                );
+            }
         }
+
+        // Raw, unencoded — the spelling a hand-written client would use.
+        assert_eq!(
+            parse("kb://doc/C:/Windows/System32/x.md").is_none(),
+            cfg!(windows),
+            "the raw spelling follows the same platform rule as the encoded one"
+        );
     }
 
     #[test]
@@ -416,9 +435,11 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         // `cfg!` rather than `#[cfg]`, so the vector is mutated on every
-        // platform and this stays one test rather than two.
+        // platform and this stays one test rather than two. `C:/e.md` puts a
+        // colon in a *group prefix* as well as in a document path.
         if cfg!(not(windows)) {
             paths.push("a:b.md".to_string());
+            paths.push("C:/e.md".to_string());
         }
 
         for g in topic_groups(&paths) {
