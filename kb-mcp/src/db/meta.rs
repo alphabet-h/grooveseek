@@ -338,6 +338,109 @@ impl Database {
         Ok(count)
     }
 
+    // -- feature-51: `kb-mcp doctor` の整合性検査 -----------------------------
+    //
+    // 索引は 3 つのテーブルが 1 つの chunk について一致していることを前提に
+    // 検索する: `chunks` が本文、`vec_chunks` が embedding、`fts_chunks` が
+    // 全文検索行。**ずれても検索はエラーにならず、静かに取りこぼすだけ**なので、
+    // 問える手段が要る。`backfill_fts` が存在すること自体が「fts 行の欠損は
+    // 実際に起きる」の証拠で、これまでは full index を回すまで気付けなかった。
+
+    /// 指定名のテーブル (仮想テーブルを含む) が存在するか。
+    /// `vec_chunks` は embedding meta が書かれるまで作られないので、
+    /// 検査の前に必ず確認する。
+    fn has_table(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 1 本の検査 SQL を「全件数」と「先頭 `sample_limit` 件のラベル」で答える。
+    ///
+    /// `label_sql` は **本モジュール内のリテラルのみ**を渡す (呼び出し側の入力を
+    /// 混ぜない) ので、`format!` による組み立てに injection の面は無い。
+    fn scan(&self, label_sql: &str, sample_limit: usize) -> Result<IntegrityScan> {
+        // rusqlite has no `FromSql for u64`; SQLite counts are i64 and never
+        // negative, so the cast is the narrowing one it looks like.
+        let count: i64 =
+            self.conn
+                .query_row(&format!("SELECT COUNT(*) FROM ({label_sql})"), [], |row| {
+                    row.get(0)
+                })?;
+        let count = count as u64;
+        if count == 0 {
+            return Ok(IntegrityScan::default());
+        }
+        let mut stmt = self.conn.prepare(&format!("{label_sql} LIMIT ?1"))?;
+        let samples = stmt
+            .query_map(params![sample_limit as i64], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(IntegrityScan { count, samples })
+    }
+
+    /// 本文はあるが embedding が無い chunk。ベクトル検索から抜け落ちる。
+    pub fn chunks_without_embedding(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        if !self.has_table("vec_chunks")? {
+            return Ok(IntegrityScan::default());
+        }
+        self.scan(
+            "SELECT d.path || ' #' || c.chunk_index
+             FROM chunks c JOIN documents d ON d.id = c.document_id
+             WHERE c.id NOT IN (SELECT chunk_id FROM vec_chunks)
+             ORDER BY d.path, c.chunk_index",
+            sample_limit,
+        )
+    }
+
+    /// 対応する chunk が消えたのに残っている embedding。KNN が実体の無い
+    /// chunk_id を返し、JOIN で落ちるので検索結果が黙って減る。
+    pub fn embeddings_without_chunk(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        if !self.has_table("vec_chunks")? {
+            return Ok(IntegrityScan::default());
+        }
+        self.scan(
+            "SELECT 'vec_chunks chunk_id ' || chunk_id FROM vec_chunks
+             WHERE chunk_id NOT IN (SELECT id FROM chunks)
+             ORDER BY chunk_id",
+            sample_limit,
+        )
+    }
+
+    /// FTS 行が無い chunk。全文検索側からだけ見えなくなる
+    /// (`backfill_fts` が次の index で補充する)。
+    pub fn chunks_without_fts(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT d.path || ' #' || c.chunk_index
+             FROM chunks c JOIN documents d ON d.id = c.document_id
+             WHERE c.id NOT IN (SELECT rowid FROM fts_chunks)
+             ORDER BY d.path, c.chunk_index",
+            sample_limit,
+        )
+    }
+
+    /// 対応する chunk が消えたのに残っている FTS 行。
+    pub fn fts_without_chunk(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT 'fts_chunks rowid ' || rowid FROM fts_chunks
+             WHERE rowid NOT IN (SELECT id FROM chunks)
+             ORDER BY rowid",
+            sample_limit,
+        )
+    }
+
+    /// chunk を 1 つも持たない document。検索には決して出ない。
+    pub fn documents_without_chunks(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            "SELECT path FROM documents
+             WHERE id NOT IN (SELECT DISTINCT document_id FROM chunks)
+             ORDER BY path",
+            sample_limit,
+        )
+    }
+
     /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
     /// チャンクを検出し、[`quality::chunk_quality_score`] で再計算して UPDATE する (冪等)。
     ///

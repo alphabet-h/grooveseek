@@ -586,6 +586,21 @@ kb-mcp validate --kb-path ... --format github         # CI 用 ::error annotatio
 
 > `--strict` フラグは現状 no-op (将来のより厳格な検証モードへの前方互換のため受理されるだけ)。当面は通常の呼び出しで OK。
 
+### 索引そのものを検査する (v0.23.0+)
+
+`kb-mcp validate` が検査するのは**文書**。`kb-mcp doctor` が検査するのは**索引**:
+
+```bash
+kb-mcp doctor --kb-path /path/to/knowledge-base
+kb-mcp doctor --kb-path ... --format json | jq '.findings[]'
+```
+
+検索は 1 つの chunk について 3 つのテーブルが一致していることを前提にしている — 本文・embedding・全文検索行。**ずれてもエラーにはならない**: embedding の無い chunk は単にベクトル検索に出ず、全文検索行の無い chunk はキーワード検索に出ないだけ。これまでは full index を回して修復されるのを見るまで気付けなかった。`doctor` は直接それを問う。あわせて、MCP の resource 面が**どの索引済み文書を提示していないか、なぜか**も報告する — 現在の `[parsers].enabled` に無い拡張子 / resource read が返せるサイズを超える文書 / 以前のバージョンで索引されたため size が未記録の文書。
+
+終了コード: `0` (報告なし) / `1` (検出あり) / `2` (実行できない — 大抵は索引が無い)。**報告するだけで修復はしない**。各検出には直し方が併記される (構造的なものはすべて `kb-mcp index` か `kb-mcp index --force`)。
+
+> `search` / `eval` と同様、本コマンドは DB を開くので、**未適用の schema migration があれば走る**。検出結果については read-only だが、ファイルについてはそうではない。
+
 ### Golden query セットに対する retrieval 品質評価
 
 **任意のパワーユーザ機能**。`kb-mcp eval` は「想定される正解がわかっている質問」の小さなファイルを、`search` ツールと同じハイブリッド検索にかけ、**recall@k / MRR / nDCG@k** + 前回実行との差分を出す。モデル比較や `[quality_filter]` / RRF パラメータのチューニング時に便利。

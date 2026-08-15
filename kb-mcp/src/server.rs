@@ -388,7 +388,7 @@ impl<'a> ServableRules<'a> {
     /// 拡張子ごとの本当の cap は [`max_bytes_for`] で当てる —
     /// `load_document_blocking` が `read_checked` に渡すのと**同じ chooser** なので、
     /// 提示側と read 側が別々の上限を持つことが構造的に起こらない。
-    fn new(registry: &'a Registry, rows: Vec<(String, u64)>) -> Self {
+    pub(crate) fn new(registry: &'a Registry, rows: Vec<(String, u64)>) -> Self {
         let oversized = rows
             .into_iter()
             .filter(|(path, size)| {
@@ -415,6 +415,18 @@ impl<'a> ServableRules<'a> {
     pub(crate) fn allows(&self, path: &str) -> bool {
         crate::indexer::extension_is_registered(path, self.registry)
             && !self.oversized.contains(path)
+    }
+
+    /// The documents held back for their size, sorted so a report is stable.
+    ///
+    /// `kb-mcp doctor` explains what the resource surface is withholding, and
+    /// it has to explain *this* predicate rather than recompute an equivalent
+    /// one — a doctor that answers a slightly different question than the
+    /// server is worse than no doctor.
+    pub(crate) fn oversized_paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.oversized.iter().cloned().collect();
+        v.sort();
+        v
     }
 }
 

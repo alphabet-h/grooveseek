@@ -292,6 +292,38 @@ impl CompiledPathGlobs {
     }
 }
 
+impl Database {
+    /// Run one statement directly, for tests that need to put the index into a
+    /// state no code path produces on purpose.
+    ///
+    /// `doctor`'s whole job is noticing that `chunks`, `vec_chunks` and
+    /// `fts_chunks` have stopped agreeing, and every write path in this module
+    /// exists to keep them agreeing — so the only way to test the detection is
+    /// to break the invariant deliberately. Test-only, like
+    /// `KbServerShared::for_test`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn execute_for_test(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+}
+
+/// The answer to one of `kb-mcp doctor`'s integrity questions (feature-51).
+///
+/// `count` is every row that matched; `samples` is the first few, so a report
+/// can name something concrete without printing an unbounded list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegrityScan {
+    pub count: u64,
+    pub samples: Vec<String>,
+}
+
+impl IntegrityScan {
+    pub fn is_clean(&self) -> bool {
+        self.count == 0
+    }
+}
+
 /// Topic/category grouping returned by [`Database::list_topics`].
 #[derive(Debug, Clone)]
 pub struct TopicInfo {
@@ -4220,6 +4252,43 @@ mod tests {
             0
         );
         assert_eq!(size_of("legacy.md"), Some(123));
+    }
+
+    /// `kb-mcp doctor` compares the three tables that must agree about a chunk,
+    /// which needs an unconstrained scan of each. `fts_chunks` is already known
+    /// to allow one (`backfill_fts` reads `SELECT rowid FROM fts_chunks`), but
+    /// `vec_chunks` is a `vec0` virtual table, and some vector extensions only
+    /// answer queries that carry a KNN or rowid constraint. Measured here
+    /// rather than assumed, and kept so an upgrade that takes the capability
+    /// away is a failing test rather than a broken subcommand.
+    #[test]
+    fn test_vec_chunks_answers_an_unconstrained_scan() {
+        let db = db_with_384();
+        let doc = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk(doc, 0, None, None, "body", None, &vec![0.1; 384], 1.0)
+            .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .expect("vec_chunks must answer COUNT(*)");
+        assert_eq!(count, 1);
+
+        let ids: Vec<i64> = db
+            .conn
+            .prepare("SELECT chunk_id FROM vec_chunks")
+            .expect("vec_chunks must answer an unconstrained SELECT")
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "the scan must return the row, not just count it"
+        );
     }
 
     #[test]

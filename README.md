@@ -594,6 +594,21 @@ Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When
 
 > The `--strict` flag is currently a no-op (accepted for forward compatibility with future stricter checking modes). Use the regular invocation for now.
 
+### Check the index itself (v0.23.0+)
+
+`kb-mcp validate` checks your documents. `kb-mcp doctor` checks the **index**:
+
+```bash
+kb-mcp doctor --kb-path /path/to/knowledge-base
+kb-mcp doctor --kb-path ... --format json | jq '.findings[]'
+```
+
+Search reads three tables that have to agree about a chunk — its text, its embedding, and its full-text row. When they stop agreeing nothing errors: a chunk with no embedding is simply never a vector hit, and one with no full-text row is never a keyword hit. Until now the only way to find out was to run a full index and watch it repair things. `doctor` asks directly, and also reports which indexed documents the MCP resource surface is holding back and why — an extension no longer in `[parsers].enabled`, a document larger than a resource read returns, or a size not recorded yet because it was indexed by an earlier version.
+
+Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index). Findings are reported, never repaired: each one names the command that fixes it, which is `kb-mcp index` or `kb-mcp index --force` for everything structural.
+
+> Like `search` and `eval`, this opens the database, and opening it applies any pending schema migration. It is read-only about its findings, not about the file.
+
 ### Evaluate retrieval quality against a golden query set
 
 **Optional power-user feature.** `kb-mcp eval` takes a small file of questions with known answers, runs them through the same hybrid search the `search` tool uses, and reports **recall@k / MRR / nDCG@k** with diffs against the previous run. Useful when comparing models or tuning `[quality_filter]` / RRF parameters.
