@@ -761,20 +761,14 @@ impl KbCore {
         // (BU-22) Both caps go in; `validate_get_document_path` picks between
         // them from the canonical extension, which is the same one its
         // registry-membership check uses.
-        let canonical = match validate_get_document_path(
+        let canonical = validate_get_document_path(
             &self.kb_path,
             rel,
             &self.parser_registry,
             GET_DOCUMENT_MAX_BYTES,
             crate::parser::MAX_RAW_BINARY_BYTES,
-        ) {
-            ValidatePathOutcome::Found(p) => p,
-            // Both say something about the path: it is absent, or it is not
-            // something this server hands over. Neither says the server failed.
-            ValidatePathOutcome::NotFound(e) | ValidatePathOutcome::Denied(e) => {
-                return Err((LoadFailure::NotServed, e));
-            }
-        };
+        )
+        .into_result()?;
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
         // (BU-20) The validation above checked a path; this checks the handle
         // the bytes actually come from, so nothing renamed over that path in
@@ -1988,6 +1982,38 @@ pub(crate) enum ValidatePathOutcome {
     Found(PathBuf),
     NotFound(ErrorResponse),
     Denied(ErrorResponse),
+    /// The path could not be **examined** — a permission error, a device error.
+    /// Distinct from `NotFound`, which says the path is not there: this says
+    /// the server could not look, and answering "no such document" would send
+    /// the caller hunting for a typo that does not exist.
+    Unavailable(ErrorResponse),
+}
+
+impl ValidatePathOutcome {
+    /// The canonical path, or the failure and how it should be reported.
+    ///
+    /// The mapping lives here rather than at the call site so there is one of
+    /// it: `resources/read` picks a JSON-RPC code from the [`LoadFailure`], and
+    /// a second copy is how the code and the outcome would come to disagree.
+    fn into_result(self) -> Result<PathBuf, (LoadFailure, ErrorResponse)> {
+        match self {
+            Self::Found(p) => Ok(p),
+            // Both say something about the path: it is absent, or it is not
+            // something this server hands over. Neither says the server failed.
+            Self::NotFound(e) | Self::Denied(e) => Err((LoadFailure::NotServed, e)),
+            Self::Unavailable(e) => Err((LoadFailure::Internal, e)),
+        }
+    }
+}
+
+/// Whether an I/O error while examining a path means the server could not look,
+/// rather than that the path is not there.
+///
+/// `ErrorKind::NotFound` is the only kind that says something about the path.
+/// A permission error, a device error, a name the filesystem rejects — those
+/// say the examination failed (codex P2 round 6 on PR #162).
+fn path_probe_failed(e: &std::io::Error) -> bool {
+    e.kind() != std::io::ErrorKind::NotFound
 }
 
 /// (BU-23) `get_best_practice` の「見つからなかった」応答。
@@ -2094,6 +2120,11 @@ pub(crate) fn validate_get_document_path(
             });
         }
         Ok(_) => {}
+        Err(e) if path_probe_failed(&e) => {
+            return ValidatePathOutcome::Unavailable(ErrorResponse {
+                error: format!("Failed to examine {rel_path}: {e}"),
+            });
+        }
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!(
@@ -2106,6 +2137,11 @@ pub(crate) fn validate_get_document_path(
     // 2. Path traversal prevention
     let canonical = match file_path.canonicalize() {
         Ok(p) => p,
+        Err(e) if path_probe_failed(&e) => {
+            return ValidatePathOutcome::Unavailable(ErrorResponse {
+                error: format!("Failed to resolve {rel_path}: {e}"),
+            });
+        }
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!(
@@ -2145,6 +2181,14 @@ pub(crate) fn validate_get_document_path(
             });
         }
         Ok(_) => {}
+        // Steps 1 and 2 already saw this file, so a failure here is almost
+        // always the server's: a permission change, an I/O error. Only a
+        // genuine `NotFound` — deleted in between — is the path's own answer.
+        Err(e) if path_probe_failed(&e) => {
+            return ValidatePathOutcome::Unavailable(ErrorResponse {
+                error: format!("Failed to stat file: {e}"),
+            });
+        }
         Err(e) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!("Failed to stat file: {e}"),
@@ -2229,7 +2273,11 @@ fn resolve_best_practice_path(
         // for both classes so this path keeps the single limit it always had.
         match validate_get_document_path(kb_path, &rel, registry, max_bytes, max_bytes) {
             ValidatePathOutcome::Found(p) => return ResolveOutcome::Found(p),
-            ValidatePathOutcome::NotFound(_) => continue,
+            // One unexaminable candidate must not end the search: the next
+            // template may well resolve. This tool answers with a JSON
+            // envelope rather than a JSON-RPC code, so the two failures are
+            // not distinguishable in its reply anyway.
+            ValidatePathOutcome::NotFound(_) | ValidatePathOutcome::Unavailable(_) => continue,
             ValidatePathOutcome::Denied(err) => return ResolveOutcome::Denied(err),
         }
     }
@@ -4447,6 +4495,57 @@ mod tests {
             "the blocking bodies no longer take any locks — either they moved \
              somewhere this test cannot see, or the extraction is broken."
         );
+    }
+
+    /// "Absent" and "I could not look" are different answers, and only the
+    /// first is about the path. A permission error reported as `NotFound` sends
+    /// the caller hunting for a typo that does not exist — and, through
+    /// `into_result`, reaches the client as `RESOURCE_NOT_FOUND` rather than an
+    /// internal error (codex P2 round 6 on PR #162).
+    ///
+    /// All three of `validate_get_document_path`'s I/O probes go through this,
+    /// so fixing one and leaving the others is not possible by accident.
+    #[test]
+    fn only_a_missing_path_reads_as_missing() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(
+            !path_probe_failed(&Error::from(ErrorKind::NotFound)),
+            "an absent path is the one case that is about the path"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                path_probe_failed(&Error::from(kind)),
+                "{kind:?} says the probe failed, not that the path is absent"
+            );
+        }
+
+        // And the outcome it produces has to reach the client as the server's
+        // failure, not the document's.
+        let unavailable = ValidatePathOutcome::Unavailable(ErrorResponse {
+            error: "permission denied".to_string(),
+        });
+        assert!(
+            matches!(unavailable.into_result(), Err((LoadFailure::Internal, _))),
+            "an unexaminable path is an internal failure"
+        );
+        for absent in [
+            ValidatePathOutcome::NotFound(ErrorResponse {
+                error: "gone".to_string(),
+            }),
+            ValidatePathOutcome::Denied(ErrorResponse {
+                error: "refused".to_string(),
+            }),
+        ] {
+            assert!(
+                matches!(absent.into_result(), Err((LoadFailure::NotServed, _))),
+                "absence and refusal are both statements about the document"
+            );
+        }
     }
 
     /// `get_document` reports truncation in a field; a resource read has only
