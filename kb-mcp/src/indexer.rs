@@ -1135,6 +1135,14 @@ pub fn rename_single_file(
     ) {
         let kind = size_cap_kind(is_binary_ext);
         eprintln!("Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        // (codex P2 round 7) The rename has already been applied, so the row is
+        // under `new_rel` with the size it had when it was small enough to
+        // index. Measuring the file and returning without writing leaves it
+        // listed and linked while a read refuses it — the same hole the reindex
+        // guard closes, in the one place still missing it.
+        if let Err(e) = db.record_document_sizes(&[(new_rel, len)]) {
+            tracing::warn!("failed to record the grown size of {new_rel}: {e}");
+        }
         return Ok(RenameOutcome::RenamedSizeCapped);
     }
 
