@@ -263,7 +263,7 @@ impl Database {
     /// `CREATE TABLE` 時点で列があるので no-op。race 条件は duplicate column を吸収。
     ///
     /// 既存行は **NULL のまま**で、値は次の index 実行時に埋まる
-    /// (`backfill_document_sizes`)。NULL を「読めない」と解釈すると、新 binary で
+    /// (`record_document_sizes`)。NULL を「読めない」と解釈すると、新 binary で
     /// 開いた瞬間に KB 全体が `resources` から消えるので、**NULL は提示を許す側**に
     /// 倒す。未記録が何件あるかは `kb-mcp doctor` が報告する。
     pub(super) fn ensure_document_size_column(&self) -> Result<()> {

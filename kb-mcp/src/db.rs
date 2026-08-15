@@ -4215,45 +4215,6 @@ mod tests {
         assert_eq!(read(&db), Some(77));
     }
 
-    #[test]
-    fn test_backfill_document_sizes_fills_only_unrecorded_rows() {
-        let db = db_with_384();
-        db.upsert_document("recorded.md", None, None, None, None, &[], None, "h", 500)
-            .unwrap();
-        db.upsert_document("legacy.md", None, None, None, None, &[], None, "h", 0)
-            .unwrap();
-        // Simulate the legacy row: written before the column existed.
-        db.conn
-            .execute_batch("UPDATE documents SET size_bytes = NULL WHERE path = 'legacy.md'")
-            .unwrap();
-
-        let filled = db
-            .backfill_document_sizes(&[("legacy.md", 123), ("recorded.md", 999)])
-            .unwrap();
-        assert_eq!(filled, 1, "only the unrecorded row counts as filled");
-
-        let size_of = |p: &str| -> Option<i64> {
-            db.conn
-                .query_row(
-                    "SELECT size_bytes FROM documents WHERE path = ?1",
-                    params![p],
-                    |r| r.get(0),
-                )
-                .unwrap()
-        };
-        assert_eq!(size_of("legacy.md"), Some(123));
-        // A recorded size was written by the path that actually read those
-        // bytes; the backfill must not talk over it.
-        assert_eq!(size_of("recorded.md"), Some(500));
-
-        // 2 回目は 1 行も該当しない (index のたびに走るので no-op であること)。
-        assert_eq!(
-            db.backfill_document_sizes(&[("legacy.md", 456)]).unwrap(),
-            0
-        );
-        assert_eq!(size_of("legacy.md"), Some(123));
-    }
-
     /// `kb-mcp doctor` compares the three tables that must agree about a chunk,
     /// which needs an unconstrained scan of each. `fts_chunks` is already known
     /// to allow one (`backfill_fts` reads `SELECT rowid FROM fts_chunks`), but
@@ -4312,15 +4273,8 @@ mod tests {
         };
         assert_eq!(size_of("grown.md"), Some(900));
 
-        // The backfill deliberately will not touch it — the value is not NULL.
-        assert_eq!(
-            db.backfill_document_sizes(&[("grown.md", 60_000_000)])
-                .unwrap(),
-            0
-        );
-        assert_eq!(size_of("grown.md"), Some(900));
-
-        // This one is for exactly that case.
+        // Overwriting is the whole point: a conditional write that only filled
+        // unrecorded rows would skip exactly the row that is wrong.
         assert_eq!(
             db.record_document_sizes(&[("grown.md", 60_000_000)])
                 .unwrap(),
@@ -4328,22 +4282,24 @@ mod tests {
         );
         assert_eq!(size_of("grown.md"), Some(60_000_000));
 
+        // And back the other way, which is the case round 5 found missing: a
+        // file restored to what it was must stop being withheld.
+        assert_eq!(db.record_document_sizes(&[("grown.md", 900)]).unwrap(), 1);
+        assert_eq!(size_of("grown.md"), Some(900));
+
+        // An unrecorded row is filled by the same call, so the migration needs
+        // no separate conditional writer.
+        db.upsert_document("legacy.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.conn
+            .execute_batch("UPDATE documents SET size_bytes = NULL WHERE path = 'legacy.md'")
+            .unwrap();
+        assert_eq!(db.record_document_sizes(&[("legacy.md", 42)]).unwrap(), 1);
+        assert_eq!(size_of("legacy.md"), Some(42));
+
         // A path with no row is not an error: the file may never have been
         // indexed at all.
         assert_eq!(db.record_document_sizes(&[("absent.md", 1)]).unwrap(), 0);
-    }
-
-    #[test]
-    fn test_backfill_document_sizes_ignores_paths_it_does_not_know() {
-        let db = db_with_384();
-        // The disk scan reports every file it read, including ones this index
-        // run is about to add for the first time. A path with no row is not an
-        // error; it simply updates nothing.
-        assert_eq!(
-            db.backfill_document_sizes(&[("never-indexed.md", 10)])
-                .unwrap(),
-            0
-        );
     }
 
     /// Companion to the above: passing `None` for `level` stores SQL NULL

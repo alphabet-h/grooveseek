@@ -8,7 +8,8 @@
 //! `SingleResult::Unchanged` for each of those files and never reaches
 //! `upsert_document` or `update_document_meta`, so **a migration that only
 //! writes from those two paths never happens at all**. Only
-//! `backfill_document_sizes` closes that, and this test is what says so.
+//! `record_document_sizes`, called for every path the scan measured, closes
+//! that, and this test is what says so.
 //!
 //! `#[ignore]` because `kb-mcp index` loads the BGE-small embedding model
 //! (~130 MB on a cold cache) — same policy as `tests/binary_formats_cli.rs`.

@@ -187,11 +187,33 @@ fn applicable_cap(is_binary_ext: bool, max_binary: u64, max_text: u64) -> u64 {
 /// `Ok(None)` means "skip this file, and say why on stderr"; `Err` keeps
 /// `std::fs::read`'s meaning so existing read-error handling is unchanged.
 fn read_for_index(full: &Path, rel: &str, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    Ok(read_for_index_measured(full, rel, cap)?.0)
+}
+
+/// [`read_for_index`], plus the length when the refusal was about size
+/// (codex P2 round 5).
+///
+/// `size_cap_exceeded` stats the path and this reads the handle, so a file can
+/// cross the cap **between** the two. When that happens the handle check is
+/// what catches it, and collapsing its answer to `None` throws away the one
+/// measurement that would keep the recorded size honest — leaving a row that
+/// says the file is small enough to serve when the read just proved otherwise.
+fn read_for_index_measured(
+    full: &Path,
+    rel: &str,
+    cap: u64,
+) -> std::io::Result<(Option<Vec<u8>>, Option<u64>)> {
     match crate::links::read_checked(full, cap)? {
-        crate::links::Content::Bytes(bytes) => Ok(Some(bytes)),
+        crate::links::Content::Bytes(bytes) => Ok((Some(bytes), None)),
         crate::links::Content::Refused(refused) => {
             eprintln!("Skipping {rel}: {}", refused.log_line(full));
-            Ok(None)
+            let measured = match refused {
+                crate::links::Refused::TooLarge { len, .. } => Some(len),
+                // The other refusals say nothing about size, so there is
+                // nothing to record and the row keeps what it had.
+                _ => None,
+            };
+            Ok((None, measured))
         }
     }
 }
@@ -254,8 +276,8 @@ fn scan_disk_entries(
         // run's walk-time check is what evicts it — which is where that
         // decision belongs (§4.2, skip preserves).
         let cap = applicable_cap(is_binary, max_binary_bytes, max_text_bytes);
-        match read_for_index(p, &rel, cap) {
-            Ok(Some(bytes)) => {
+        match read_for_index_measured(p, &rel, cap) {
+            Ok((Some(bytes), _)) => {
                 let hash = sha256_hex_bytes(&bytes);
                 entries.push(DiskEntry {
                     rel,
@@ -264,7 +286,14 @@ fn scan_disk_entries(
                     size: bytes.len() as u64,
                 });
             }
-            Ok(None) => {
+            Ok((None, measured)) => {
+                // (codex P2 round 5) The file can cross the cap between the
+                // stat above and this read, and then it is *this* check that
+                // catches it — so the length has to come from here too, or the
+                // row keeps a size the read has just disproved.
+                if let Some(len) = measured {
+                    oversize.push((rel.clone(), len));
+                }
                 skipped.push(rel);
             }
             Err(e) => {
@@ -575,38 +604,27 @@ pub fn rebuild_index(
     // 走らせると、移行と同じ run で rename された文書だけ 1 行も一致せず、
     // その後 same-hash fast path が document 行を書かないので size は NULL の
     // まま次の full index まで残る (= その間 oversized なら提示され続ける)。
+    // **走査したパスは 1 本の規則で書く** (codex P2 round 5)。当初は
+    // 「NULL のときだけ埋める」だったが、それだと *古い記録* を直せない。
+    // round 4 で「cap を超えたファイルは上書き」を足したところ、**逆向きが
+    // 抜けた**: cap 超えだったファイルが元の内容に戻されると、scan は小さい
+    // size を測るのに hash 一致で `Unchanged` になり書き手が居ないので、
+    // 「read は受け付けるのに提示されない」が永久に残る。
+    //
+    // 直し方は分岐を増やすことではなく減らすこと: **scan が測ったものが真**。
+    // 索引された文書は下の loop がパース済みバイトの長さで上書きするので、
+    // ここが古い値を残すことはない。
     let scanned_sizes: Vec<(&str, u64)> = disk_entries
         .iter()
         .map(|e| (e.rel.as_str(), e.size))
+        .chain(scan_oversize.iter().map(|(rel, len)| (rel.as_str(), *len)))
         .collect();
-    match db.backfill_document_sizes(&scanned_sizes) {
+    match db.record_document_sizes(&scanned_sizes) {
         Ok(0) => {}
-        Ok(n) => {
-            tracing::info!("recorded the size of {n} document(s) indexed before sizes were kept")
-        }
-        // 補充に失敗しても index 自体は続ける。埋まらなかった分は次回の index か
+        Ok(n) => tracing::info!("recorded the current size of {n} document(s)"),
+        // 記録に失敗しても index 自体は続ける。ずれた分は次回の index か
         // `kb-mcp doctor` が拾う。
-        Err(e) => tracing::warn!("failed to backfill document sizes: {e}"),
-    }
-
-    // (codex P2 round 4) size cap で撥ねたファイルは §4.2 で行が保持されるので、
-    // 記録済みの size は「最後に索引できた時」の小さい値のまま残る = 提示され
-    // 続け、read は現在のファイルを見て拒む。走査で実測した値で**上書き**する
-    // (backfill と違い `IS NULL` 条件は付けない — 古い値こそ直す対象)。
-    // これは「索引後にファイルが消えた」類と違い、**その場で測れている**。
-    let oversize_now: Vec<(&str, u64)> = scan_oversize
-        .iter()
-        .map(|(rel, len)| (rel.as_str(), *len))
-        .collect();
-    if !oversize_now.is_empty() {
-        match db.record_document_sizes(&oversize_now) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                "{n} indexed document(s) have grown past the size cap; \
-                 recorded their current size so they are no longer offered"
-            ),
-            Err(e) => tracing::warn!("failed to record sizes for size-capped files: {e}"),
-        }
+        Err(e) => tracing::warn!("failed to record document sizes: {e}"),
     }
 
     // Track paths we visit so we can detect deletions later.
@@ -739,9 +757,17 @@ fn index_single_disk_entry(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let bytes = match read_for_index(&entry.full, &entry.rel, cap) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
+    let bytes = match read_for_index_measured(&entry.full, &entry.rel, cap) {
+        Ok((Some(b), _)) => b,
+        Ok((None, measured)) => {
+            // (codex P2 round 5) Same window as the scan: if the handle check
+            // is what refused it, that length is the only current measurement
+            // there is, and the row would otherwise keep a stale, servable one.
+            if let Some(len) = measured
+                && let Err(e) = db.record_document_sizes(&[(entry.rel.as_str(), len)])
+            {
+                tracing::warn!("failed to record the grown size of {}: {e}", entry.rel);
+            }
             return Ok(SingleResult::Refused);
         }
         Err(e) => {
@@ -969,9 +995,15 @@ pub fn reindex_single_file(
         crate::parser::MAX_RAW_BINARY_BYTES,
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
-    let Some(bytes) = read_for_index(&full, rel, cap)
-        .with_context(|| format!("failed to read {}", full.display()))?
-    else {
+    let (maybe_bytes, measured) = read_for_index_measured(&full, rel, cap)
+        .with_context(|| format!("failed to read {}", full.display()))?;
+    let Some(bytes) = maybe_bytes else {
+        // (codex P2 round 5) The watcher has the same stat-then-read window.
+        if let Some(len) = measured
+            && let Err(e) = db.record_document_sizes(&[(rel, len)])
+        {
+            tracing::warn!("failed to record the grown size of {rel}: {e}");
+        }
         return Ok(SingleResult::Refused);
     };
     let hash = sha256_hex_bytes(&bytes);

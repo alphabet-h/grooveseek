@@ -281,22 +281,24 @@ impl Database {
         Ok(count)
     }
 
-    /// `size_bytes` が未記録 (NULL) の `documents` 行に、disk 走査で分かっている
-    /// サイズを埋める (feature-51)。返り値は実際に埋めた行数。
+    /// 既存 `documents` 行の `size_bytes` を**上書き**する (feature-51)。
     ///
-    /// **これが無いと新列は永久に埋まらない**。`rebuild_index` は content hash が
-    /// 一致する文書を `SingleResult::Unchanged` で返し、`upsert_document` も
-    /// `update_document_meta` も通らないので、既存 KB の大多数は「変更なし」経路
-    /// しか踏まない。列を足して書き込み経路に代入するだけでは、**移行がまるごと
-    /// 素通りされる**。
+    /// 走査したパスについて **kb-mcp が最後に測った実サイズ**を書く。条件付きの
+    /// 「NULL のときだけ埋める」版があったが、それでは *古い記録* を直せず、
+    /// 「cap を超えて成長した」「元に戻って cap 内になった」の**どちらの向きにも**
+    /// stale な行が残った (codex P2 round 4-5)。この列は「read がこのファイルを
+    /// 返せるか」を答えるためにあるので、真は常に**最後の実測値**。
     ///
-    /// `WHERE size_bytes IS NULL` があるので、記録済みの行は上書きしない
-    /// (記録済みの値は、その size を実際に読んだ経路が書いたもの)。2 回目以降の
-    /// index では 1 行も該当せず no-op になる。
-    pub fn backfill_document_sizes(&self, sizes: &[(&str, u64)]) -> Result<u32> {
-        let mut stmt = self.conn.prepare(
-            "UPDATE documents SET size_bytes = ?2 WHERE path = ?1 AND size_bytes IS NULL",
-        )?;
+    /// **これが無いと新列は事実上埋まらない**点も引き継ぐ: `rebuild_index` は
+    /// content hash が一致する文書を `SingleResult::Unchanged` で返し、
+    /// `upsert_document` も `update_document_meta` も通らないので、既存 KB の
+    /// 大多数は列が追加されたことに気付かないまま NULL で残る。
+    ///
+    /// 行が無い path は何も更新しない (未索引ファイル / 初回登録の前段)。
+    pub fn record_document_sizes(&self, sizes: &[(&str, u64)]) -> Result<u32> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE documents SET size_bytes = ?2 WHERE path = ?1")?;
         let mut count = 0u32;
         for (path, size) in sizes {
             count += stmt.execute(params![path, *size as i64])? as u32;
@@ -325,27 +327,6 @@ impl Database {
         rows.into_iter()
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
-    }
-
-    /// 既存 `documents` 行の `size_bytes` を**上書き**する (feature-51)。
-    ///
-    /// [`Self::backfill_document_sizes`] との違いは `WHERE size_bytes IS NULL` が
-    /// 無いこと。用途は 1 つ: **size cap で skip したファイル**。§4.2 の
-    /// 「skip は保持」により行は残るが、記録済みの size は「最後に索引できた時」の
-    /// 小さい値のままで、現在のファイルは read が拒むほど大きい。
-    /// この列は「read がこのファイルを返せるか」を答えるためにあるので、
-    /// **kb-mcp が最後に測った実サイズ**を持つのが正しい (codex P2 round 4)。
-    ///
-    /// 行が無い path は何も更新しない (未索引ファイルが skip された場合)。
-    pub fn record_document_sizes(&self, sizes: &[(&str, u64)]) -> Result<u32> {
-        let mut stmt = self
-            .conn
-            .prepare("UPDATE documents SET size_bytes = ?2 WHERE path = ?1")?;
-        let mut count = 0u32;
-        for (path, size) in sizes {
-            count += stmt.execute(params![path, *size as i64])? as u32;
-        }
-        Ok(count)
     }
 
     /// `size_bytes` が未記録 (NULL) の document 数 (feature-51)。
