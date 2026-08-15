@@ -101,6 +101,20 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   from. Nothing asserted any of this before, which is how the wrong server name
   survived fifteen releases.
 
+### Fixed
+
+- **A path that could not be examined no longer reports as a path that is not
+  there.** `validate_get_document_path` probes the filesystem three times, and
+  all three put every I/O failure into "File not found" — so a permission error
+  on an indexed document sent the caller hunting for a typo that did not exist.
+  Each probe now separates the two: `NotFound` and `NotADirectory` say the path
+  cannot be there; everything else says the server could not look.
+
+  `get_document` gains a more accurate message in that case ("Failed to
+  examine …" rather than "File not found: …"), and `resources/read` reports it
+  as an internal error rather than `RESOURCE_NOT_FOUND` — the difference
+  between a client retrying and a client giving up.
+
 ## [0.21.0] - 2026-08-15
 
 ### Added
