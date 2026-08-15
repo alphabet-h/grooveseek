@@ -50,7 +50,12 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 29 (id-only set diff が edit を miss) | NEW_INLINE の set diff を `(id, updated_at)` compound key で取り、codex が既存 inline (= 同 id) の body を update して P-badge を追加 / 昇格しても捕捉する |
 | 罠 30 (P2-only round で controller が判断材料を取れない) | Step 5 整形に `=== Inline P2 (controller-judgment items, current round only) ===` section を追加し、P2 inline の path + body を必ず出力する (= P0/P1 = 0 + P2 > 0 の round で convergence indeterminate になる時、controller が「取り込み or skip」判断するために具体内容を必ず提示) |
 | 罠 31 (gh api --paginate --jq で multi-page が単一 array にならない) | snapshot helpers は `?per_page=100` で page 数最小化 + 内部 `--jq "[.[] \| select(...) \| {...}]"` で per-page 配列化 + 外部 `jq -s "add // [] \| sort_by(.id)"` で merge して single array 化 (= --paginate と --jq は per-page 別々に走るため、外部 slurp なしでは multi-page で multiple JSON document concatenation になり、downstream `--argjson prev` 等が壊れる) |
-| 罠 32 (initial delta で convergence 判定 = codex multi-write を miss) | Phase A (initial activity detection) → Phase B (`QUIET_WINDOW_SEC=30s` の quiet window 確認) の 2 phase polling で round complete を待つ。codex は review submission の後に inline comment を秒〜数十秒遅れで post するため、初回 delta で convergence 判定すると stale state で false-converge する |
+| 罠 32 (initial delta で convergence 判定 = codex multi-write を miss) | Phase A (initial activity detection) → Phase B (`QUIET_WINDOW_SEC=180s` の quiet window 確認) の 2 phase polling で round complete を待つ。codex は review submission の後に inline comment を秒〜数十秒遅れで post するため、初回 delta で convergence 判定すると stale state で false-converge する |
+| 罠 34 (quiet window 30 秒では足りない) | 同一 commit への 2 本目の review submission を **2 分 24 秒後**に観測 (PR #118)。`QUIET_WINDOW_SEC` は観測値 144 秒 + 安全率で **180**。窓幅を 1 回の観測から決めると、その観測が下限だった場合に**静かに取りこぼす** |
+| 罠 44 (push が既存 inline の `line` を貼り直す) | Phase A の判定は snapshot の**生 JSON ではなく `(id, updated_at)` の射影**で行う。新しい commit を push すると GitHub が既存 inline の `line` を新 diff に貼り直すので、codex が何も書いていなくても生 JSON は変わる (PR #162 round 4 で「収束・指摘 0 件」を誤報告) |
+| 罠 46 (reaction の種類を見ずに数える) | `eyes` = 「受け取った / 着手した」、`+1` = 「レビュー済み・指摘なし」。**種類で判定する**。`[.[] \| select(.user.login==BOT)] \| length` では着手の合図が合格に見える |
+| 罠 47 (`@codex review` が届かないことがある) | 実測 **8 回中 2 回** (PR #162 round 4 / 8)。trigger comment に **reaction が 1 つも付かない**のが「届いていない」の signal。この場合は再 trigger で復帰する。**`exit 3` で stale connector と診断する前に必ず reaction を見る** |
+| 罠 48 (transient API failure が差分に見える) | 罠 43 の再発。差分を検知したら **10 秒後にもう一度取り、同じ差分が再現した時だけ**信じる。射影 (罠 44) は「変化の原因が観測対象でない」に効くが「**観測自体の失敗**」には効かない — 別の防御が要る |
 | 罠 33 (sentinel / terminal-error が PR 全 history で評価される) | `LATEST_ISSUE_BODY` を `NEW_ISSUES = $CUR_ISSUES − $PREV_ISSUES` (= current round で post された issue comment のみ) から derive する。罠 27 (P-badge round-scoping) と同じ pattern を sentinel + terminal-error チェック側にも適用、prior round の sentinel "Didn't find any major issues" が後続 round に漏れて false-converge する race を排除 |
 
 ## 実行フロー
@@ -101,7 +106,11 @@ PREV_ISSUES=$(snapshot_issues)
 ### Step 2 — post @codex review trigger
 
 ```bash
-gh pr comment <PR#> --body "@codex review"
+# 罠 47: comment id を捕まえておく。reaction を見るのに要る —
+# 「reaction 無し = 届いていない」が、無応答を stale connector と
+# 誤診しないための唯一の signal。
+TRIGGER_COMMENT_ID=$(gh pr comment <PR#> --body "@codex review" | sed 's/.*issuecomment-//')
+echo "trigger comment id=${TRIGGER_COMMENT_ID}"
 ```
 
 mention は **冒頭 1 回のみ**、本文に追加 context を書く場合 `@codex` 文字列を bare word として使わない (= 罠 15)。
@@ -113,26 +122,53 @@ snapshot per round で 3 endpoint を `(id, updated_at)` set として取得。S
 ```bash
 ROUND_START=$(date +%s)
 PER_ROUND_TIMEOUT=600   # 罠 9 wall-clock timeout
-QUIET_WINDOW_SEC=30     # 罠 32: codex multi-write が落ち着くまで wait
+QUIET_WINDOW_SEC=180    # 罠 34: 同一 commit への 2 本目を 144 秒後に観測、+ 安全率
+
+# 罠 44: Phase A の判定は **生 JSON ではなく (id, updated_at) の射影**で行う。
+# push すると GitHub が既存 inline の `line` を新しい diff に貼り直すので、
+# codex が何も書いていなくても生 JSON は変わる。表示に要るフィールド (罠 24) は
+# snapshot に残したまま、比較のときだけ落とす。
+key_inline() { snapshot_inline | jq -c '[.[] | {id, updated_at}]'; }
+key_issues() { snapshot_issues | jq -c '[.[] | {id, updated_at}]'; }
+key_reviews() { snapshot_reviews | jq -c '[.[] | {id, submitted_at}]'; }
+
+# 罠 46: `eyes` は「受け取った」、`+1` が「レビュー済み・指摘なし」。種類で見る。
+reaction() {   # $1 = "+1" | "eyes"
+  gh api "repos/${OWNER_REPO}/issues/comments/${TRIGGER_COMMENT_ID}/reactions" \
+    --jq "[.[] | select(.user.login==\"${BOT}\" and .content==\"$1\")] | length" 2>/dev/null || echo 0
+}
+
+PREV_KI=$(key_inline); PREV_KS=$(key_issues); PREV_KR=$(key_reviews)
 
 # Phase A: wait for first activity
 while true; do
   ELAPSED=$(( $(date +%s) - ROUND_START ))
   if [ "$ELAPSED" -gt "$PER_ROUND_TIMEOUT" ]; then
-    echo "WARN: codex no response in ${PER_ROUND_TIMEOUT}s. Suspect stale connector (= 罠 9)."
+    # 罠 47: reaction が 1 つも無い = **trigger が届いていない** (実測 8 回中 2 回)。
+    # stale connector ではないので、再 trigger すれば復帰する。
+    if [ "$(reaction eyes)" = "0" ] && [ "$(reaction +1)" = "0" ]; then
+      echo "WARN: trigger comment has no reaction — codex never received it (= 罠 47)."
+      echo "Action: 同じ commit に対して再 trigger する (1 回だけ自動、それでも駄目なら user へ)"
+      exit 5
+    fi
+    echo "WARN: codex acknowledged but did not answer in ${PER_ROUND_TIMEOUT}s (= 罠 9)."
     echo "Action: user に escalate、disconnect/reconnect connector を提案"
     exit 3
   fi
 
-  CUR_INLINE=$(snapshot_inline)
-  CUR_REVIEWS=$(snapshot_reviews)
-  CUR_ISSUES=$(snapshot_issues)
+  CUR_KI=$(key_inline); CUR_KS=$(key_issues); CUR_KR=$(key_reviews)
 
-  if [ "$CUR_INLINE" != "$PREV_INLINE" ] || \
-     [ "$CUR_REVIEWS" != "$PREV_REVIEWS" ] || \
-     [ "$CUR_ISSUES" != "$PREV_ISSUES" ]; then
-    echo "=== codex initial activity detected after ${ELAPSED}s ==="
-    break
+  if [ "$CUR_KI" != "$PREV_KI" ] || [ "$CUR_KS" != "$PREV_KS" ] || [ "$CUR_KR" != "$PREV_KR" ]; then
+    # 罠 48: transient API failure は短いリストを返し、差分に見える。
+    # 10 秒後に取り直して **同じ差分が再現した時だけ** 信じる。
+    sleep 10
+    if [ "$(key_inline)" = "$CUR_KI" ] && [ "$(key_issues)" = "$CUR_KS" ] \
+       && [ "$(key_reviews)" = "$CUR_KR" ]; then
+      echo "=== codex initial activity detected after ${ELAPSED}s (confirmed twice) ==="
+      CUR_INLINE=$(snapshot_inline); CUR_REVIEWS=$(snapshot_reviews); CUR_ISSUES=$(snapshot_issues)
+      break
+    fi
+    echo "  (差分が再現しない = transient な API 結果、無視して継続)"
   fi
   sleep 30
 done
@@ -143,9 +179,11 @@ done
 # state で false-converge する (= 後続の P0/P1 が見えない)。`QUIET_WINDOW_SEC`
 # 秒間 snapshot が不変な状態を確認してから Step 4 へ進む。
 QUIET_START=$(date +%s)
-LAST_INLINE=$CUR_INLINE
-LAST_REVIEWS=$CUR_REVIEWS
-LAST_ISSUES=$CUR_ISSUES
+# Phase A と**同じ鍵**で比べる (罠 44)。ここだけ生 JSON にすると、push で
+# `line` が貼り直された瞬間に quiet window が永遠にリセットされ続ける。
+LAST_INLINE=$(key_inline)
+LAST_REVIEWS=$(key_reviews)
+LAST_ISSUES=$(key_issues)
 while true; do
   WALL_ELAPSED=$(( $(date +%s) - ROUND_START ))
   if [ "$WALL_ELAPSED" -gt "$PER_ROUND_TIMEOUT" ]; then
@@ -154,9 +192,9 @@ while true; do
   fi
 
   sleep 15
-  CHECK_INLINE=$(snapshot_inline)
-  CHECK_REVIEWS=$(snapshot_reviews)
-  CHECK_ISSUES=$(snapshot_issues)
+  CHECK_INLINE=$(key_inline)
+  CHECK_REVIEWS=$(key_reviews)
+  CHECK_ISSUES=$(key_issues)
 
   if [ "$CHECK_INLINE" = "$LAST_INLINE" ] && \
      [ "$CHECK_REVIEWS" = "$LAST_REVIEWS" ] && \
@@ -307,7 +345,8 @@ snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 | `CONVERGED=true` | **収束**、merge / tag に進む |
 | `P0_P1_TAGS_PRESENT > 0` | controller が指摘内容を理解 → fix 実装 → push → goto Step 1 (= 新 baseline 取得 + re-trigger)。**ただし** `current_round >= max_rounds` (= default 3) なら user 報告 |
 | `STATE_OK=false` でも `P0/P1` も sentinel もなし (= indeterminate) | controller が manual review (= human 判断)、必要なら `@codex review` 再 trigger |
-| `exit 3` (= 罠 9 wall-clock timeout) | user に escalate (= "codex no response, suspect stale connector") |
+| `exit 3` (= 罠 9 wall-clock timeout、**reaction はある**) | codex は受け取ったが答えなかった。user に escalate (= "codex acknowledged but did not answer, suspect stale connector") |
+| `exit 5` (= 罠 47 trigger が届いていない、**reaction が 1 つも無い**) | **round を消費せず同じ commit に再 trigger する** (自動、1 回だけ)。実測でこれは 8 回中 2 回起き、再 trigger でどちらも即復帰した。2 回目も届かなければ user に escalate |
 | `exit 4` (= 罠 10 terminal error) | user に escalate (= "codex returned terminal failure, retry will not help") |
 
 ### Step 7 — re-review trigger (= round 2 以降)
@@ -321,13 +360,16 @@ PREV_REVIEWS=$(snapshot_reviews)
 PREV_ISSUES=$(snapshot_issues)
 
 # 罠 15 + 罠 18: @codex review 冒頭 1 回、本文中で codex を bare word でも mention しない、verb は review のみ
-gh pr comment <PR#> --body "@codex review
+TRIGGER_COMMENT_ID=$(gh pr comment <PR#> --body "@codex review
 
 Round ${N} fix (commit \`<SHA>\`):
 - <fix 1 line>
 - <fix 2 line>
-"
+" | sed 's/.*issuecomment-//')
 ```
+
+**round ごとに `TRIGGER_COMMENT_ID` を取り直す** (= 罠 47)。前 round の comment の
+reaction を見ていると、届いていない round を「届いた」と読む。
 
 戻って Step 3 から polling 再開。
 
