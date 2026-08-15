@@ -12,6 +12,42 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A document the resource surface offered could be one a read refuses.**
+  Indexing accepts 50 MiB of text; `resources/read` returns at most 1 MiB. A
+  Markdown or plain-text document in between was indexed, listed under its topic
+  group, given a `uri` on its `search` hits — and refused when a client followed
+  that link. v0.22.0 recorded this as a known limitation because the only way to
+  know a file's size was to stat every indexed file on every listing, which
+  would have made an offer a live filesystem probe rather than a property of the
+  index.
+
+  The index now knows the size. `documents` gains a nullable `size_bytes`,
+  written wherever a document row is written, and the predicate that decides
+  what is offered applies the **same** per-extension cap a read applies —
+  `max_bytes_for`, the chooser `load_document_blocking` already passes to
+  `read_checked` — so the listing and the read cannot enforce different limits.
+  A binary document over the text cap is still offered, because a read truncates
+  its extracted text rather than refusing it. Reasoning:
+  [ADR-0005](docs/decisions/0005-record-document-size-in-the-index.md); the
+  principle it preserves is
+  [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.md)'s.
+
+  `resources/list` and the `uri` on a `search` hit are now one predicate rather
+  than two calls that happened to agree. They each tested the parser registry
+  separately, which was harmless only while that was the whole rule; adding the
+  size condition to one of them is exactly what would have produced the defect
+  being fixed. The hit itself is unaffected either way — an unservable document
+  stays findable and simply carries no link.
+
+  **Existing indexes**: the column is added on open with every row NULL, which
+  means "not recorded" and is treated as servable, so nothing disappears from a
+  listing after an upgrade. One `kb-mcp index` fills it in **without
+  re-embedding**: the sizes come from the disk scan, so documents whose content
+  hash is unchanged — which is all of them, on a knowledge base that was just
+  upgraded — are backfilled even though that path writes no document row.
+
 ## [0.22.0] - 2026-08-15
 
 ### Added

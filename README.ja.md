@@ -900,7 +900,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `kb://topic/<prefix>` | **topic group** = パスの先頭 1〜2 セグメント。indexer が `category` / `topic` を導出するのと同じ規則。read するとその配下の文書一覧 (URI 付き) が Markdown で返る。`kb://topic/` は root group |
 | `kb://doc/<path>` | 索引済みの文書 1 件。列挙はせず**テンプレートとして公開**する |
 
-`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。listing もこの `uri` も**現在の parser registry で絞る**: `[parsers].enabled` を狭めて再 index しないと、外した拡張子の行は索引にも検索結果にも残るが、read が拒否する以上 resource としては提示しない。
+`resources/list` が返すのは topic group であって、**文書 1 件ごとではない**。ナレッジベースの文書は数百でもグループは数十であり、listing は接続のたびにクライアントが取りに来るもの。個々の文書はテンプレートと、**`search` hit に付くようになった `uri`** から辿れる — spec は「listing に出ていない文書へのリンクを tool が返すこと」を明示的に許している。listing もこの `uri` も**同一の述語**から来るので、同じ文書について両者が食い違うことはない。索引に残り検索でも見つかるまま、提示だけ外れる要因が 2 つある。1 つは**現在の parser registry**: `[parsers].enabled` を狭めて再 index しないと、外した拡張子の行は索引にも検索結果にも残るが、read が拒否する以上提示しない。もう 1 つは **size** (v0.23.0+): 1 MiB を超える Markdown / テキスト文書は `resources/read` が返す量を超えるので、これも提示しない (`search` hit は残り、`uri` だけが付かない)。同じサイズでも PDF や表計算は提示され続ける — read が拒否ではなく抽出テキストを切り詰めるため。size は index 時に記録される。以前のバージョンで索引した文書は size 未記録で、**次の `kb-mcp index` まで提示されたまま**になる (その 1 回で再 embed 無しに埋まる)。件数は `kb-mcp doctor` が報告する。根拠は [ADR-0005](docs/decisions/0005-record-document-size-in-the-index.ja.md)。
 
 区切りは forward slash のまま、それ以外は percent-encode するので、空白や非 ASCII を含むパスでも正しい ASCII URI になる。
 

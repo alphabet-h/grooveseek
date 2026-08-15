@@ -304,6 +304,40 @@ impl Database {
         Ok(count)
     }
 
+    /// 記録済み `size_bytes` が `min_bytes` を **超える** document を
+    /// `(path, size_bytes)` で返す (feature-51)。
+    ///
+    /// 呼び出し側は「read cap のうち最小のもの」を渡し、返ってきた短いリストに
+    /// 拡張子ごとの cap を当てる。cap の分岐は SQL では表現できない一方、
+    /// **cap を超え得る文書だけを Rust に上げれば済む**ので、全行を読む必要はない。
+    /// 実測では参照 KB 666 件中 0 件が該当する。
+    ///
+    /// `size_bytes` が NULL の行は `>` が真にならないので**返らない** = 未記録の
+    /// 文書は「大きすぎる」と判定されない。これは意図した fail open で、
+    /// 移行直後に KB 全体が提示から消えるのを防ぐ。
+    pub fn documents_larger_than(&self, min_bytes: u64) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size_bytes FROM documents WHERE size_bytes > ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![min_bytes as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        rows.into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// `size_bytes` が未記録 (NULL) の document 数 (feature-51)。
+    /// `kb-mcp doctor` が「1 回 index すれば埋まる」件数として報告する。
+    pub fn documents_without_recorded_size(&self) -> Result<u32> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM documents WHERE size_bytes IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
     /// チャンクを検出し、[`quality::chunk_quality_score`] で再計算して UPDATE する (冪等)。
     ///
