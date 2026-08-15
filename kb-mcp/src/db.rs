@@ -4308,12 +4308,13 @@ mod tests {
     /// seam — between two chunks, or between a heading and the body under it —
     /// and be reported as quoted when its halves sit nowhere near each other.
     ///
-    /// Headings are their own field for a reason that matters to the caller:
-    /// the Markdown parser strips the heading line out of `content`, and FTS
-    /// indexes headings *more* heavily than body text, so a note that lists
-    /// golden queries as `##` headings is invisible to a content-only scan.
+    /// The three fields are the three `fts_chunks` columns, and each carries
+    /// text the other two do not: the Markdown parser strips the heading line
+    /// out of `content` (and FTS weights headings *above* body text), while the
+    /// breadcrumb in `context_text` begins with the document title, which is
+    /// frontmatter or the filename — neither a heading nor body text.
     #[test]
-    fn test_for_each_indexed_text_yields_heading_and_body_separately() {
+    fn test_for_each_indexed_text_yields_heading_context_and_body_separately() {
         let db = db_with_384();
         // Inserted out of path order on purpose: the ordering below has to come
         // from the SQL, not from the insertion sequence.
@@ -4351,7 +4352,9 @@ mod tests {
             Some("A heading that is a question?"),
             Some(2),
             "the first half of a sentence",
-            None,
+            // The breadcrumb starts with the document title, which appears in
+            // no other field.
+            Some("A title that is also a question? > A heading that is a question?"),
             &dummy_embedding(0.3),
             1.0,
         )
@@ -4366,10 +4369,14 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                // The heading comes out on its own, never glued to the body.
+                // Each field comes out on its own, never glued to another.
                 (
                     "a.md".to_string(),
                     "A heading that is a question?".to_string()
+                ),
+                (
+                    "a.md".to_string(),
+                    "A title that is also a question? > A heading that is a question?".to_string()
                 ),
                 (
                     "a.md".to_string(),

@@ -244,14 +244,18 @@ Two consequences worth knowing:
   matched at all. Short queries occur in too many documents by chance. The same
   measurement brackets this value: 8 and 12 give identical results, and 16 loses
   the true finding.
-- Matching happens **within one indexed text field** — a chunk's body and its
-  heading are scanned separately, and so is each chunk. Headings count because
-  the Markdown parser strips the heading line out of the body and full-text
-  search weights headings *above* body text: a note that lists golden queries as
-  `##` headings is the most natural way to document a test, and a body-only scan
-  would not see it at all. Nothing is concatenated first, so a quote split across
-  a seam is not seen — that is deliberate, since joining would let unrelated text
-  on either side of the seam read as one quote.
+- Matching happens **within one indexed text field**, and the fields scanned are
+  exactly the ones full-text search indexes: each chunk's heading, its
+  breadcrumb, and its body. That match is the whole selection rule — the scan is
+  looking for text that can displace the labelled answer, so it has to cover
+  precisely the text that has the power to. Headings matter because the Markdown
+  parser strips the heading line out of the body and search weights headings
+  *above* body text; the breadcrumb matters because it begins with the document
+  title, which is frontmatter or the filename and appears in neither of the
+  other two. (The breadcrumb is empty unless contextual indexing was enabled at
+  index time, in which case scanning it costs nothing.) Nothing is concatenated
+  first, so a quote split across a seam is not seen — deliberately, since joining
+  would let unrelated text on either side of the seam read as one quote.
 
 The scan is one pass over the indexed chunk bodies, inside the same read
 snapshot as the searches, so it reports on exactly the index the metrics came

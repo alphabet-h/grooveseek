@@ -717,15 +717,25 @@ impl Database {
     /// 本文側で別々に育って静かに食い違う。
     ///
     /// **chunk ごとに 1 回ではなく、検索対象フィールドごとに 1 回呼ぶ。**
-    /// Markdown parser は見出し行を content から取り除いて `heading` に入れる
-    /// (`parser/markdown.rs`) 一方、FTS は heading を**本文より重い列**として
-    /// 索引する。content だけを流すと、golden query を `##` 見出しに並べた
-    /// ノート — テストについて書くときの最も自然な形 — が丸ごと見えない。
+    /// 流すのは `fts_chunks` が索引している 3 列 (`heading` / `context` /
+    /// `content`) と同じもので、**この一致が唯一の選定規則**である。
+    /// 探しているのは「検索で正解を押しのけ得るテキスト」なので、
+    /// 押しのける力を持つ列と走査する列がずれた時点で嘘になる。
+    ///
+    /// 3 列がそれぞれ別に要る理由は、どれも他の 2 つに現れないテキストを持つから:
+    ///
+    /// - `heading` — Markdown parser は見出し行を content から**取り除いて**
+    ///   ここに入れる (`parser/markdown.rs`)。しかも FTS は heading を本文より
+    ///   重く索引する。content だけを見ると、golden query を `##` 見出しに
+    ///   並べたノート (テストを記録する最も自然な形) が丸ごと見えない
+    /// - `context` — パンくずの先頭は **frontmatter の title、無ければ
+    ///   ファイル名**である (`markdown.rs` の `[title, ...ancestry, heading]`)。
+    ///   title は heading でも content でもないので、ここを飛ばすと
+    ///   「title にだけ query が入っている文書」が見えない。contextual indexing
+    ///   が off の索引では空なので、その場合は自動的に何も増えない
+    ///
     /// 連結せずフィールドごとに渡すのは、見出しの末尾と本文の先頭が隣接した
     /// 1 つの文字列に見えるのを避けるため (chunk をまたがない理由と同じ)。
-    ///
-    /// `context_text` は流さない。あれは同じ文書の祖先見出しから作られる
-    /// パンくずなので、heading を流している以上その文書は既に見つかる。
     ///
     /// 行順は `(path, chunk_index)` で固定する。呼び出し側は集約するので順序に
     /// 依存しないが、実行計画依存の順序で流すと**再現しないバグを作れる**ように
@@ -738,7 +748,7 @@ impl Database {
         F: FnMut(&str, &str),
     {
         let mut stmt = self.conn.prepare(
-            "SELECT d.path, c.heading, c.content
+            "SELECT d.path, c.heading, c.context_text, c.content
              FROM chunks c
              JOIN documents d ON d.id = c.document_id
              ORDER BY d.path, c.chunk_index",
@@ -747,9 +757,14 @@ impl Database {
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;
             let heading: Option<String> = row.get(1)?;
-            let content: String = row.get(2)?;
-            if let Some(h) = heading.as_deref().filter(|h| !h.is_empty()) {
-                f(&path, h);
+            let context: Option<String> = row.get(2)?;
+            let content: String = row.get(3)?;
+            for text in [heading.as_deref(), context.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter(|t| !t.is_empty())
+            {
+                f(&path, text);
             }
             f(&path, &content);
         }

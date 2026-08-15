@@ -101,17 +101,17 @@ change nothing.
   the count the rule depends on. The measurement brackets the value from both
   sides: 8 and 12 give identical results on the reference corpus, and 16 loses
   the true finding, because golden queries skew short.
-- Matching is **within one indexed text field**: each chunk's body and each
-  chunk's heading, separately. Headings are included because the Markdown parser
-  removes the heading line from the body while full-text search indexes headings
-  at a *higher* weight than body text — so a note that lists golden queries as
-  `##` headings, which is the most natural way to document a test, would be
-  invisible to a body-only scan while actively competing with the labelled
-  answers. Nothing is concatenated: joining fields or chunks would let unrelated
-  text on either side of a seam read as a single quote, and the cost of not
-  joining — a quote split across a seam is not seen — is the cheaper mistake.
-  `context_text` is not scanned; it is built from the same document's ancestor
-  headings, so scanning headings already finds that document.
+- Matching is **within one indexed text field**, and the set of fields scanned is
+  **exactly the columns full-text search indexes** — heading, breadcrumb, body.
+  That equality is the selection rule, and it is the only one that stays true as
+  the schema moves: the scan looks for text able to displace a labelled answer,
+  so it must cover the text that has that power, no more and no less. Each of
+  the three carries text the other two do not — the parser moves the heading line
+  out of the body (and search weights headings above it), and the breadcrumb
+  opens with the document title, which is frontmatter or the filename. Nothing is
+  concatenated: joining fields or chunks would let unrelated text on either side
+  of a seam read as a single quote, and the cost of not joining — a quote split
+  across a seam is not seen — is the cheaper mistake.
 - A document listed in a query's `expected` is not counted for that query. It
   contains the wording because it is the answer.
 - There is no way to silence an intentional quote. With the report costing
