@@ -787,14 +787,22 @@ impl KbCore {
                 Ok((out, "text/markdown"))
             }
             crate::resources::ResourceUri::Doc(rel) => {
-                // Membership first. A document that is not indexed was never
-                // offered, and `resources/read` is for what was offered — this
-                // is strictly narrower than `get_document`, so it cannot widen
+                // Membership first. `resources/read` is for what was offered —
+                // strictly narrower than `get_document`, so it cannot widen
                 // what is reachable.
+                //
+                // The message says "offers", not "indexed", because those
+                // stopped being the same thing: a document can be indexed and
+                // still be held back, by an extension the registry dropped or a
+                // size past what a read returns. Naming the index would send
+                // someone looking for a document `kb-mcp status` counts.
                 if !paths.iter().any(|p| p == rel) {
                     return Err((
                         LoadFailure::NotServed,
-                        format!("not an indexed document: {uri}"),
+                        format!(
+                            "not a document this server offers: {uri} \
+                             (if it is indexed, `kb-mcp doctor` says why it is held back)"
+                        ),
                     ));
                 }
                 // Then the guards, by sharing the body `get_document` uses

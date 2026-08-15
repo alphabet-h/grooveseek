@@ -529,7 +529,9 @@ pub fn rebuild_index(
         .collect();
     match db.backfill_document_sizes(&scanned_sizes) {
         Ok(0) => {}
-        Ok(n) => tracing::info!("recorded the size of {n} document(s) indexed before it was kept"),
+        Ok(n) => {
+            tracing::info!("recorded the size of {n} document(s) indexed before sizes were kept")
+        }
         // 補充に失敗しても index 自体は続ける。埋まらなかった分は次回の index か
         // `kb-mcp doctor` が拾う。
         Err(e) => tracing::warn!("failed to backfill document sizes: {e}"),
