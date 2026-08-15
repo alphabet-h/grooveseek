@@ -15,8 +15,11 @@
 //! records for the rmcp 1 → 3 upgrade, where "compiles and every test passes"
 //! was the weakest possible evidence because what changed was the protocol.
 //!
-//! No embedding model is downloaded (`serve` loads the default one from cache
-//! and never indexes here), so this stays off `#[ignore]`.
+//! Everything here runs without building an index, so it stays off
+//! `#[ignore]` — with one exception at the end. `resources/list` is built from
+//! what is indexed and `resources/read` refuses what is not, so the half of the
+//! resource surface that has documents behind it needs a real index, and that
+//! one test is `#[ignore]`d for the model load it implies.
 
 mod common;
 use common::mcp::spawn_mcp_server;
@@ -166,9 +169,9 @@ fn the_server_identifies_itself_as_kb_mcp() {
 /// Each entry here is a promise with something behind it. `prompts/list` and
 /// `resources/list` answer with empty arrays whether or not anything is
 /// declared, so declaring a capability with nothing behind it only invites
-/// round-trips that return nothing — which is why `resources` is still absent
-/// while `prompts` has joined `tools`. Changing this list is how a capability
-/// gets added: on purpose, in the commit that gives it content.
+/// round-trips that return nothing. That is why this list grew one entry at a
+/// time — `prompts`, then `resources` — each in the commit that gave it
+/// content, and why `completions` and `logging` are still absent.
 #[test]
 fn the_advertised_capabilities_are_exactly_what_is_implemented() {
     let (_kb, _guard, base) = start();
@@ -184,13 +187,13 @@ fn the_advertised_capabilities_are_exactly_what_is_implemented() {
         }),
     );
     let from_initialize = &init["result"]["capabilities"];
-    for present in ["tools", "prompts"] {
+    for present in ["tools", "prompts", "resources"] {
         assert!(
             from_initialize.get(present).is_some(),
             "{present} is implemented and must be advertised: {init}"
         );
     }
-    for absent in ["resources", "completions", "logging"] {
+    for absent in ["completions", "logging"] {
         assert!(
             from_initialize.get(absent).is_none(),
             "{absent} is not implemented and must not be advertised: {init}"
@@ -313,6 +316,92 @@ fn prompts_get_is_rejected_without_the_mcp_name_header() {
     );
 }
 
+/// (feature-50 PR 3) The resource surface's shape, without needing an index.
+///
+/// `resources/list` is empty here — nothing has been indexed — and that is
+/// still worth asserting: the result must be well-formed and carry the caching
+/// hints, which is the part a hand-written handler has to supply itself.
+#[test]
+fn the_resource_lists_are_well_formed_and_carry_the_caching_hints() {
+    let (_kb, _guard, base) = start();
+
+    for method in ["resources/list", "resources/templates/list"] {
+        let resp = rpc(&base, method, serde_json::json!({"_meta": meta()}));
+        let result = &resp["result"];
+        assert_eq!(result["resultType"], "complete", "{method}: {resp}");
+        assert!(
+            result.get("ttlMs").is_some() && result.get("cacheScope").is_some(),
+            "{method} must carry caching hints on a complete result: {resp}"
+        );
+    }
+
+    let templates = rpc(
+        &base,
+        "resources/templates/list",
+        serde_json::json!({"_meta": meta()}),
+    );
+    let list = templates["result"]["resourceTemplates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no template array: {templates}"));
+    assert_eq!(list.len(), 1, "{templates}");
+    assert_eq!(
+        list[0]["uriTemplate"], "kb://doc/{path}",
+        "the per-document template is how a client reaches what the listing \
+         deliberately does not enumerate: {templates}"
+    );
+    assert!(
+        list[0].get("mimeType").is_none(),
+        "the template covers documents of several media types, so it must not \
+         claim one: {templates}"
+    );
+}
+
+/// A URI that never came from this server is refused, however it is spelled.
+///
+/// The traversal check runs after percent-decoding, so the encoded form has to
+/// be refused too — a check that ran first would not see `%2e%2e%2f` as `../`.
+#[test]
+fn resource_reads_refuse_anything_that_was_not_offered() {
+    let (_kb, _guard, base) = start();
+
+    for uri in [
+        "kb://doc/../secret.md",
+        "kb://doc/%2e%2e%2fsecret.md",
+        "kb://doc/note.md", // real file, but nothing is indexed here
+        "file:///etc/passwd",
+        "kb://nonsense/x",
+    ] {
+        let resp = rpc_named(
+            &base,
+            "resources/read",
+            Some(uri),
+            serde_json::json!({"uri": uri, "_meta": meta()}),
+        );
+        assert!(
+            resp["error"].is_object(),
+            "must be refused: {uri} -> {resp}"
+        );
+    }
+}
+
+/// The transport requirement, pinned for the same reason as `prompts/get`:
+/// nothing in the Rust API mentions it, so the first test written without it
+/// fails in a way that looks like a broken handler.
+#[test]
+fn resources_read_is_rejected_without_the_mcp_name_header() {
+    let (_kb, _guard, base) = start();
+
+    let resp = rpc(
+        &base,
+        "resources/read",
+        serde_json::json!({"uri": "kb://doc/note.md", "_meta": meta()}),
+    );
+    assert_eq!(
+        resp["error"]["code"], -32020,
+        "expected the transport to reject a nameless resources/read: {resp}"
+    );
+}
+
 /// The tool list as a client sees it, including the caching hints the spec
 /// requires on any result carrying `resultType: "complete"`.
 #[test]
@@ -350,5 +439,122 @@ fn the_tool_list_is_six_tools_with_the_caching_hints_the_spec_requires() {
     assert!(
         result.get("cacheScope").is_some(),
         "the spec requires a cache scope on a complete result: {resp}"
+    );
+}
+
+/// (feature-50 PR 3) The resource surface with an index behind it — the half
+/// the tests above cannot reach, because `resources/list` is built from what is
+/// indexed and `resources/read` refuses anything that is not.
+///
+/// `#[ignore]` because it builds an index, which loads the embedding model.
+#[test]
+#[ignore = "builds an index; downloads BGE-small on first run"]
+fn resources_list_and_read_agree_with_the_index() {
+    let layout = TempKbLayout::new("kb-mcp-resources-e2e");
+    let body = |marker: &str| {
+        format!(
+            "---\ntitle: Resource fixture\n---\n\n## body\n\nContent carrying {marker}, long \
+             enough to be a real chunk rather than something the quality filter hides.\n"
+        )
+    };
+    layout.write("root-note.md", &body("zqxwroot"));
+    layout.write("deep-dive/mcp/overview.md", &body("zqxwmcp"));
+    layout.write("ai-news/today.md", &body("zqxwnews"));
+    common::mcp::build_index(layout.kb());
+
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, "[watch]\nenabled = false\n").expect("write kb-mcp.toml");
+    let (_guard, base) = spawn_mcp_server(layout.kb(), &cfg);
+
+    // Groups, not documents: three files fall into three groups here, but the
+    // rule is the first one or two path segments, not one entry per file.
+    let listed = rpc(
+        &base,
+        "resources/list",
+        serde_json::json!({"_meta": meta()}),
+    );
+    let mut uris: Vec<String> = listed["result"]["resources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no resources: {listed}"))
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap_or_default().to_string())
+        .collect();
+    uris.sort();
+    assert_eq!(
+        uris,
+        vec![
+            "kb://topic/",
+            "kb://topic/ai-news",
+            "kb://topic/deep-dive/mcp"
+        ],
+        "listing must group by path prefix: {listed}"
+    );
+
+    // Everything offered must be readable — that is what makes a listing a
+    // promise rather than a guess.
+    for uri in &uris {
+        let resp = rpc_named(
+            &base,
+            "resources/read",
+            Some(uri),
+            serde_json::json!({"uri": uri, "_meta": meta()}),
+        );
+        assert!(
+            resp["result"]["contents"][0]["text"].is_string(),
+            "a listed resource must be readable: {uri} -> {resp}"
+        );
+        // A read is a complete result like the two listings, and owes the same
+        // hints. rmcp's constructor leaves them unset, so only the handlers
+        // that add them conform — and this one is hand-written.
+        assert!(
+            resp["result"].get("ttlMs").is_some() && resp["result"].get("cacheScope").is_some(),
+            "resources/read must carry caching hints on a complete result: {resp}"
+        );
+    }
+
+    // A document, by the template's URI, with the media type of what is served.
+    let doc = "kb://doc/deep-dive/mcp/overview.md";
+    let resp = rpc_named(
+        &base,
+        "resources/read",
+        Some(doc),
+        serde_json::json!({"uri": doc, "_meta": meta()}),
+    );
+    let content = &resp["result"]["contents"][0];
+    assert_eq!(content["mimeType"], "text/markdown", "{resp}");
+    assert!(
+        content["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("zqxwmcp"),
+        "the document's own text must come back, not an envelope: {resp}"
+    );
+
+    // A file that exists on disk but is not in the index was never offered.
+    layout.write("unindexed.md", &body("zqxwunindexed"));
+    let sneaky = "kb://doc/unindexed.md";
+    let refused = rpc_named(
+        &base,
+        "resources/read",
+        Some(sneaky),
+        serde_json::json!({"uri": sneaky, "_meta": meta()}),
+    );
+    assert!(
+        refused["error"].is_object(),
+        "membership in the index is the gate, not presence on disk: {refused}"
+    );
+
+    // And `search` hands back the URI for every hit, so a document nobody
+    // enumerated is still addressable.
+    let session = common::mcp::mcp_initialize(&base);
+    let hits = common::mcp::mcp_search_call(
+        &base,
+        &session,
+        serde_json::json!({"query": "zqxwmcp", "limit": 3, "mmr": false}),
+    );
+    let first = &hits["results"][0];
+    assert_eq!(
+        first["uri"], "kb://doc/deep-dive/mcp/overview.md",
+        "every search hit must carry the resource URI for its document: {hits}"
     );
 }

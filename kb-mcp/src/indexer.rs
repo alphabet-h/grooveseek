@@ -321,6 +321,19 @@ fn detect_renames(
     pairs
 }
 
+/// この document path を現在の registry で開けるか。
+///
+/// 「どの行を提供できるか」と「どの行が registry から外れたか」(AU-06) を
+/// 1 つの述語で表す。2 箇所で書くと、`resources/list` が出す URI と
+/// `validate_get_document_path` の門番が食い違う — feature-50 で実際に
+/// 起きた形 (listing が `.pdf` の `kb://doc/...` を出し、読み返しが拒否する)。
+pub fn extension_is_registered(path: &str, registry: &crate::parser::Registry) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| registry.has_extension(ext))
+}
+
 /// 現在の registry に載っていない拡張子を持つ document path を返す (AU-06)。
 ///
 /// `[parsers].enabled` を狭めた後 (`.xls` の取り下げのように、狭めざるを得なく
@@ -340,12 +353,7 @@ pub fn paths_with_unregistered_extension(
 ) -> Vec<String> {
     all_db_paths
         .iter()
-        .filter(|p| {
-            std::path::Path::new(p.as_str())
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_none_or(|ext| !registry.has_extension(ext))
-        })
+        .filter(|p| !extension_is_registered(p, registry))
         .cloned()
         .collect()
 }
@@ -1408,6 +1416,29 @@ mod tests {
 
         // 「報告するだけ」であること: 入力は変えない (呼び出し側が warn するのみ)。
         assert_eq!(all_db.len(), 5, "the caller's list must not be mutated");
+
+        // feature-50: resource surface が advertise してよい path は、この報告の
+        // ちょうど補集合でなければならない。ずれると `resources/list` が出した
+        // `kb://doc/...` を `resources/read` が拒否する (= codex P2 で見つかった形)。
+        let servable: Vec<String> = all_db
+            .iter()
+            .filter(|p| extension_is_registered(p, &registry))
+            .cloned()
+            .collect();
+        assert_eq!(
+            servable,
+            vec![
+                "notes/a.md".to_string(),
+                "book.xlsx".to_string(),
+                "REPORT.XLSX".to_string()
+            ],
+            "servable must be exactly what was not reported as unregistered"
+        );
+        assert_eq!(
+            servable.len() + stale.len(),
+            all_db.len(),
+            "the two views must partition the index, with nothing in both or neither"
+        );
     }
 
     #[test]

@@ -305,10 +305,61 @@ pub(crate) struct ErrorResponse {
 /// `search` MCP ツールの新出力 (feature-26、wrapper 形)。
 #[derive(Serialize)]
 struct SearchResponse {
-    results: Vec<crate::db::SearchHit>,
+    results: Vec<HitWithUri>,
     low_confidence: bool,
     /// 入力 filter のうち non-default のものだけ正規化後の値で echo back。
     filter_applied: SearchFilterEcho,
+}
+
+/// Whether a failed load says something about the **document** or about the
+/// **server**.
+///
+/// `get_document` does not need the distinction — it answers with one JSON
+/// error envelope either way. `resources/read` does: MCP gives it two codes,
+/// and a client that cannot tell "there is no such resource" from "the index is
+/// unreadable" will retry the wrong one, or stop retrying the one it should.
+/// `list_resources` already reported a failed index query as an internal error,
+/// so collapsing everything here also made the two disagree about the same
+/// failure (codex P2 round 3 on PR #162).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadFailure {
+    /// Nothing here to hand over: absent, or outside what this server serves.
+    NotServed,
+    /// The server could not answer. Not a claim about the document.
+    Internal,
+}
+
+/// (feature-50) A hit, plus the `kb://doc/...` URI that names its document as a
+/// resource.
+///
+/// Flattened, so the hit's own fields keep the shape and the position they had
+/// — one new key, nothing moved. The MCP result stays a single text content
+/// block carrying this JSON, which is what keeps every existing client working:
+/// adding a `resource_link` content block instead would have changed the length
+/// of the `content` array.
+///
+/// The specification permits handing back links to documents that
+/// `resources/list` never enumerated, which is what makes the topic-group
+/// listing and per-document addressing coexist.
+///
+/// The key is **omitted** for a hit whose extension the active parser registry
+/// no longer covers. Such a row stays in the index on purpose (AU-06) and stays
+/// in the search results, but neither `get_document` nor `resources/read` will
+/// open it — so the honest answer is no link, not a broken one.
+#[derive(Serialize)]
+struct HitWithUri {
+    #[serde(flatten)]
+    hit: crate::db::SearchHit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
+}
+
+impl HitWithUri {
+    fn new(hit: crate::db::SearchHit, registry: &Registry) -> Self {
+        let uri = crate::indexer::extension_is_registered(&hit.path, registry)
+            .then(|| crate::resources::doc_uri(&hit.path));
+        Self { hit, uri }
+    }
 }
 
 /// 入力 filter のうち non-default のものだけ echo。`null`/空配列の項目は
@@ -543,7 +594,10 @@ impl KbCore {
         };
 
         let resp = SearchResponse {
-            results: hits,
+            results: hits
+                .into_iter()
+                .map(|h| HitWithUri::new(h, &self.parser_registry))
+                .collect(),
             low_confidence,
             filter_applied: echo,
         };
@@ -573,25 +627,148 @@ impl KbCore {
         }
     }
 
+    /// The indexed documents this server can actually hand over.
+    ///
+    /// Not the same set as `all_document_paths`. Narrowing `[parsers].enabled`
+    /// without reindexing deliberately **keeps** those rows — `run_server` warns
+    /// about them instead of deleting them, because a narrowed setting is often
+    /// temporary — and `load_document_blocking` then refuses their extension.
+    /// Advertising them would be offering a link the very next call rejects.
+    ///
+    /// So the filter lives on the one query the whole resource surface asks,
+    /// rather than at each of the three places that emit a URI. That is the
+    /// same reason `load_document_blocking` exists at all.
+    fn servable_document_paths(&self) -> Result<Vec<String>, String> {
+        let paths = {
+            let db = recover_db(self.db.lock());
+            db.all_document_paths()
+                .map_err(|e| format!("failed to list indexed documents: {e}"))?
+        };
+        Ok(paths
+            .into_iter()
+            .filter(|p| crate::indexer::extension_is_registered(p, &self.parser_registry))
+            .collect())
+    }
+
+    /// The topic groups `resources/list` answers from.
+    ///
+    /// Built from the servable paths, which is the same list a read is checked
+    /// against — so a URI this listing offers cannot fail membership when the
+    /// client reads it back.
+    fn topic_groups_blocking(&self) -> Result<Vec<crate::resources::TopicGroup>, String> {
+        self.servable_document_paths()
+            .map(|paths| crate::resources::topic_groups(&paths))
+    }
+
+    /// What a `resources/read` of a document produces: its text, and the media
+    /// type that text actually is.
+    ///
+    /// Not the media type of the file on disk. A PDF or a spreadsheet is served
+    /// as the text the parser extracted, because that is what an MCP client can
+    /// use, so calling it `application/pdf` would be a lie about the bytes it is
+    /// holding.
+    fn resource_mime_for(ext: &str) -> &'static str {
+        if ext.eq_ignore_ascii_case("md") {
+            "text/markdown"
+        } else {
+            "text/plain"
+        }
+    }
+
+    /// Serve one `kb://` URI, or say why not. Returns `(text, mime)`.
+    fn read_resource_blocking(
+        &self,
+        parsed: &crate::resources::ResourceUri,
+        uri: &str,
+    ) -> Result<(String, &'static str), (LoadFailure, String)> {
+        let paths = self
+            .servable_document_paths()
+            .map_err(|e| (LoadFailure::Internal, e))?;
+
+        match parsed {
+            crate::resources::ResourceUri::Topic(prefix) => {
+                let group = crate::resources::topic_groups(&paths)
+                    .into_iter()
+                    .find(|g| &g.prefix == prefix)
+                    .ok_or_else(|| {
+                        (
+                            LoadFailure::NotServed,
+                            format!("no such topic group: {uri}"),
+                        )
+                    })?;
+                let mut out = format!("# {}\n\n{}\n\n", group.display_name(), group.description());
+                for p in &group.paths {
+                    out.push_str(&format!("- `{p}` — {}\n", crate::resources::doc_uri(p)));
+                }
+                Ok((out, "text/markdown"))
+            }
+            crate::resources::ResourceUri::Doc(rel) => {
+                // Membership first. A document that is not indexed was never
+                // offered, and `resources/read` is for what was offered — this
+                // is strictly narrower than `get_document`, so it cannot widen
+                // what is reachable.
+                if !paths.iter().any(|p| p == rel) {
+                    return Err((
+                        LoadFailure::NotServed,
+                        format!("not an indexed document: {uri}"),
+                    ));
+                }
+                // Then the guards, by sharing the body `get_document` uses
+                // rather than re-deriving them: symlink and hard-link refusal,
+                // traversal, extension membership, size cap, handle-bound read.
+                // A second sequence is how the two would come to disagree.
+                let (doc, ext) = self
+                    .load_document_blocking(rel)
+                    .map_err(|(kind, e)| (kind, format!("{}: {uri}", e.error)))?;
+                if doc.truncated {
+                    tracing::warn!(
+                        "resources/read: {rel} extracted more than {EXTRACTED_TEXT_MAX_BYTES} \
+                         bytes of text; the resource carries the prefix and says so"
+                    );
+                }
+                Ok((
+                    resource_text(doc.content, doc.truncated),
+                    Self::resource_mime_for(&ext),
+                ))
+            }
+        }
+    }
+
     fn get_document_blocking(&self, params: GetDocumentParams) -> String {
+        match self.load_document_blocking(&params.path) {
+            Ok((doc, _ext)) => serde_json::to_string_pretty(&doc).unwrap_or_default(),
+            // The category is for `resources/read`, which has two codes to
+            // choose between. This tool has one envelope either way, so its
+            // output is unchanged by carrying it.
+            Err((_kind, e)) => serde_json::to_string_pretty(&e).unwrap_or_default(),
+        }
+    }
+
+    /// Every guard a document has to clear, in one place, plus the extraction.
+    ///
+    /// Shared by `get_document` — which wraps the result in its JSON envelope —
+    /// and `resources/read`, which returns the extracted text. Two call sites
+    /// with two copies of this sequence is how a guard ends up applying to one
+    /// of them; `max_bytes_for` exists for the same reason one level down.
+    ///
+    /// The extension is handed back because the caller needs it and it must be
+    /// the **canonical** one the checks used, not the one from the requested
+    /// path (BU-22: Windows 8.3 short names make those differ).
+    fn load_document_blocking(
+        &self,
+        rel: &str,
+    ) -> Result<(DocumentResponse, String), (LoadFailure, ErrorResponse)> {
         // (BU-22) Both caps go in; `validate_get_document_path` picks between
         // them from the canonical extension, which is the same one its
         // registry-membership check uses.
-        let canonical = match validate_get_document_path(
+        let canonical = validate_get_document_path(
             &self.kb_path,
-            &params.path,
+            rel,
             &self.parser_registry,
             GET_DOCUMENT_MAX_BYTES,
             crate::parser::MAX_RAW_BINARY_BYTES,
-        ) {
-            ValidatePathOutcome::Found(p) => p,
-            ValidatePathOutcome::NotFound(e) => {
-                return serde_json::to_string_pretty(&e).unwrap_or_default();
-            }
-            ValidatePathOutcome::Denied(e) => {
-                return serde_json::to_string_pretty(&e).unwrap_or_default();
-            }
-        };
+        )
+        .into_result()?;
         let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
         // (BU-20) The validation above checked a path; this checks the handle
         // the bytes actually come from, so nothing renamed over that path in
@@ -605,25 +782,33 @@ impl KbCore {
         );
         match crate::links::read_checked(&canonical, cap) {
             Ok(crate::links::Content::Bytes(bytes)) => {
-                match build_document_response(&self.parser_registry, &params.path, ext, &bytes) {
-                    Ok(resp) => serde_json::to_string_pretty(&resp).unwrap_or_default(),
-                    Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                        error: format!("Failed to extract document: {e}"),
-                    })
-                    .unwrap_or_default(),
+                match build_document_response(&self.parser_registry, rel, ext, &bytes) {
+                    Ok(resp) => Ok((resp, ext.to_string())),
+                    // The document is there; producing text from it failed.
+                    // That is the server's problem, not a missing resource.
+                    Err(e) => Err((
+                        LoadFailure::Internal,
+                        ErrorResponse {
+                            error: format!("Failed to extract document: {e}"),
+                        },
+                    )),
                 }
             }
             Ok(crate::links::Content::Refused(refused)) => {
                 tracing::warn!("{}", refused.log_line(&canonical));
-                serde_json::to_string_pretty(&ErrorResponse {
-                    error: refused.client_message().to_string(),
-                })
-                .unwrap_or_default()
+                Err((
+                    LoadFailure::NotServed,
+                    ErrorResponse {
+                        error: refused.client_message().to_string(),
+                    },
+                ))
             }
-            Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Failed to read file: {e}"),
-            })
-            .unwrap_or_default(),
+            Err(e) => Err((
+                LoadFailure::Internal,
+                ErrorResponse {
+                    error: format!("Failed to read file: {e}"),
+                },
+            )),
         }
     }
 
@@ -1026,10 +1211,208 @@ impl ServerHandler for KbServer {
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_prompts()
+            .enable_resources()
             .build();
         info.server_info = me;
         info
     }
+
+    /// One resource per topic group, never one per document.
+    ///
+    /// The reasoning is in [`crate::resources`] and ADR-0004; the short version
+    /// is that a listing is a promise the client pays for on every connect, and
+    /// a knowledge base has hundreds of documents but tens of groups. Individual
+    /// documents are reachable through the `kb://doc/{path}` template and the
+    /// `uri` on every `search` hit, which the specification permits explicitly.
+    ///
+    /// Single page. `nextCursor` is omitted, which is a conforming single-page
+    /// implementation and sidesteps the client-side pagination bugs the survey
+    /// turned up.
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        let core = Arc::clone(&self.core);
+        // Two layers: the outer one is "did the blocking task survive", the
+        // inner one is "did the query succeed".
+        let groups = run_blocking_typed("list_resources", move || core.topic_groups_blocking())
+            .await
+            .map_err(internal_error)?
+            .map_err(internal_error)?;
+
+        let resources = groups
+            .into_iter()
+            .map(|g| {
+                let mut r = rmcp::model::Resource::new(g.uri(), g.display_name());
+                r.description = Some(g.description());
+                r.mime_type = Some("text/markdown".to_string());
+                r
+            })
+            .collect();
+        Ok(with_cache_hints(
+            rmcp::model::ListResourcesResult::with_all_items(resources),
+        ))
+    }
+
+    /// The one template: every indexed document, by its relative path.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, rmcp::ErrorData> {
+        let mut t = rmcp::model::ResourceTemplate::new(
+            crate::resources::doc_uri_template(),
+            "Indexed document",
+        );
+        t.description = Some(
+            "One indexed document, addressed by its path relative to the knowledge base. \
+             Every `search` hit carries the matching `uri`. Served as text: a PDF or a \
+             spreadsheet comes back as the text kb-mcp extracted from it, not as the \
+             original bytes."
+                .to_string(),
+        );
+        // No `mime_type` on the template. It varies per document — `text/markdown`
+        // for `.md`, `text/plain` for everything served as extracted text — and a
+        // single value here would be wrong for most of what the template matches.
+        // Each read states its own.
+        Ok(with_cache_hints(
+            rmcp::model::ListResourceTemplatesResult::with_all_items(vec![t]),
+        ))
+    }
+
+    /// Read one `kb://` URI.
+    ///
+    /// A document is served only if it is **in the index** and then only through
+    /// the same four checks `get_document` applies. That is deliberately
+    /// narrower than `get_document`, and the reasoning is not the one ADR-0003
+    /// rejected: this does not trust a file inside the knowledge base to police
+    /// the knowledge base, it trusts kb-mcp's own database. A resource is
+    /// something the server offered; reading a URI that was never on offer is a
+    /// different operation from fetching a path the caller already knew.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        let uri = request.uri.clone();
+        let parsed = crate::resources::parse(&uri).ok_or_else(|| {
+            rmcp::ErrorData::resource_not_found(
+                format!("not a resource this server serves: {uri}"),
+                None,
+            )
+        })?;
+
+        let core = Arc::clone(&self.core);
+        let uri_for_body = uri.clone();
+        let text = run_blocking_typed("read_resource", move || {
+            core.read_resource_blocking(&parsed, &uri_for_body)
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(|(kind, message)| resource_error(kind, message))?;
+
+        let (text, mime) = text;
+        let content = rmcp::model::ResourceContents::text(text, uri).with_mime_type(mime);
+        // A read is a complete result too, so it owes the same hints the two
+        // listings give. rmcp's constructor leaves them `None`; a hand-written
+        // handler has to set them, and this one is hand-written.
+        Ok(with_cache_hints(rmcp::model::ReadResourceResult::new(vec![content])).into())
+    }
+}
+
+/// The caching hints the specification requires on any result carrying
+/// `resultType: "complete"`.
+///
+/// rmcp models them as `Option` and leaves them `None` — its own doc says
+/// "Required by spec version 2026-07-28, but optional here" — so only the paths
+/// that set them conform. The tool and prompt macros do; a hand-written handler
+/// has to. `0` means "treat as stale immediately", which is the honest answer
+/// for a listing backed by an index a watcher keeps changing.
+fn with_cache_hints<T: CacheHinted>(result: T) -> T {
+    result
+        .with_ttl_ms(0)
+        .with_cache_scope(rmcp::model::CacheScope::Public)
+}
+
+/// The two setters every paginated list result carries, so [`with_cache_hints`]
+/// can be written once.
+trait CacheHinted: Sized {
+    fn with_ttl_ms(self, ttl_ms: u64) -> Self;
+    fn with_cache_scope(self, scope: rmcp::model::CacheScope) -> Self;
+}
+
+macro_rules! impl_cache_hinted {
+    ($($t:ty),+ $(,)?) => {$(
+        impl CacheHinted for $t {
+            fn with_ttl_ms(self, ttl_ms: u64) -> Self { <$t>::with_ttl_ms(self, ttl_ms) }
+            fn with_cache_scope(self, scope: rmcp::model::CacheScope) -> Self {
+                <$t>::with_cache_scope(self, scope)
+            }
+        }
+    )+};
+}
+impl_cache_hinted!(
+    rmcp::model::ListResourcesResult,
+    rmcp::model::ListResourceTemplatesResult,
+    rmcp::model::ReadResourceResult,
+);
+
+fn internal_error(e: String) -> rmcp::ErrorData {
+    rmcp::ErrorData::internal_error(e, None)
+}
+
+/// What a resource read appends when the text it is handing over is a prefix.
+///
+/// One blank line and a fenced-off sentence, so it reads as an annotation in
+/// both media types this server serves and cannot be mistaken for the
+/// document's own last paragraph.
+const TRUNCATION_NOTICE: &str = "\n\n---\n\n*[kb-mcp] Truncated: the extracted text exceeded 1 MiB. \
+     What is above is the beginning of the document, not all of it.*\n";
+
+/// The text a resource read hands over, with truncation stated in the body.
+///
+/// `get_document` returns a JSON envelope with a `truncated` field; a resource
+/// read returns bare text, and dropping the flag there presented a prefix as
+/// the whole document (codex P2 round 5 on PR #162). The prefix is still worth
+/// serving — refusing it would lose text a client can use — so the answer is
+/// the same one BU-31 reached for a query cut at the phrase cap: hand over what
+/// there is, and say that is what it is.
+fn resource_text(content: String, truncated: bool) -> String {
+    if truncated {
+        content + TRUNCATION_NOTICE
+    } else {
+        content
+    }
+}
+
+/// Turn a [`LoadFailure`] into the JSON-RPC error that says the same thing.
+///
+/// Only a statement about the resource gets the not-found code; a failure of
+/// the server's own stays an internal error, which is what `list_resources`
+/// already reports for the identical unreadable index. Written as a function so
+/// the mapping can be asserted directly — the two codes mean different things
+/// to a retrying client, and nothing else would notice them being collapsed.
+fn resource_error(kind: LoadFailure, message: String) -> rmcp::ErrorData {
+    match kind {
+        LoadFailure::NotServed => rmcp::ErrorData::resource_not_found(message, None),
+        LoadFailure::Internal => internal_error(message),
+    }
+}
+
+/// [`run_blocking`] for handlers that return something other than a JSON string.
+///
+/// Same obligation as every tool handler (BU-06): the body does its work on the
+/// blocking pool, never on an async worker.
+async fn run_blocking_typed<T, F>(what: &'static str, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        tracing::error!(handler = what, error = %e, "handler body panicked on the blocking pool");
+        format!("{what} failed: the request panicked ({e})")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,6 +1986,44 @@ pub(crate) enum ValidatePathOutcome {
     Found(PathBuf),
     NotFound(ErrorResponse),
     Denied(ErrorResponse),
+    /// The path could not be **examined** — a permission error, a device error.
+    /// Distinct from `NotFound`, which says the path is not there: this says
+    /// the server could not look, and answering "no such document" would send
+    /// the caller hunting for a typo that does not exist.
+    Unavailable(ErrorResponse),
+}
+
+impl ValidatePathOutcome {
+    /// The canonical path, or the failure and how it should be reported.
+    ///
+    /// The mapping lives here rather than at the call site so there is one of
+    /// it: `resources/read` picks a JSON-RPC code from the [`LoadFailure`], and
+    /// a second copy is how the code and the outcome would come to disagree.
+    fn into_result(self) -> Result<PathBuf, (LoadFailure, ErrorResponse)> {
+        match self {
+            Self::Found(p) => Ok(p),
+            // Both say something about the path: it is absent, or it is not
+            // something this server hands over. Neither says the server failed.
+            Self::NotFound(e) | Self::Denied(e) => Err((LoadFailure::NotServed, e)),
+            Self::Unavailable(e) => Err((LoadFailure::Internal, e)),
+        }
+    }
+}
+
+/// Whether an I/O error while examining a path means the server could not look,
+/// rather than that the path is not there.
+///
+/// Two kinds say the path is not there. `NotFound` is the obvious one.
+/// `NotADirectory` is the same statement about an interior component — on Unix,
+/// an indexed `dir/note.md` whose `dir` has since been replaced by a regular
+/// file reports that, and the path cannot exist while it holds (codex P2 round
+/// 7 on PR #162). Everything else — a permission error, a device error — says
+/// the examination failed and tells the caller nothing about the path.
+fn path_probe_failed(e: &std::io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// (BU-23) `get_best_practice` の「見つからなかった」応答。
@@ -1709,6 +2130,11 @@ pub(crate) fn validate_get_document_path(
             });
         }
         Ok(_) => {}
+        Err(e) if path_probe_failed(&e) => {
+            return ValidatePathOutcome::Unavailable(ErrorResponse {
+                error: format!("Failed to examine {rel_path}: {e}"),
+            });
+        }
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!(
@@ -1721,6 +2147,11 @@ pub(crate) fn validate_get_document_path(
     // 2. Path traversal prevention
     let canonical = match file_path.canonicalize() {
         Ok(p) => p,
+        Err(e) if path_probe_failed(&e) => {
+            return ValidatePathOutcome::Unavailable(ErrorResponse {
+                error: format!("Failed to resolve {rel_path}: {e}"),
+            });
+        }
         Err(_) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!(
@@ -1760,6 +2191,14 @@ pub(crate) fn validate_get_document_path(
             });
         }
         Ok(_) => {}
+        // Steps 1 and 2 already saw this file, so a failure here is almost
+        // always the server's: a permission change, an I/O error. Only a
+        // genuine `NotFound` — deleted in between — is the path's own answer.
+        Err(e) if path_probe_failed(&e) => {
+            return ValidatePathOutcome::Unavailable(ErrorResponse {
+                error: format!("Failed to stat file: {e}"),
+            });
+        }
         Err(e) => {
             return ValidatePathOutcome::NotFound(ErrorResponse {
                 error: format!("Failed to stat file: {e}"),
@@ -1844,7 +2283,11 @@ fn resolve_best_practice_path(
         // for both classes so this path keeps the single limit it always had.
         match validate_get_document_path(kb_path, &rel, registry, max_bytes, max_bytes) {
             ValidatePathOutcome::Found(p) => return ResolveOutcome::Found(p),
-            ValidatePathOutcome::NotFound(_) => continue,
+            // One unexaminable candidate must not end the search: the next
+            // template may well resolve. This tool answers with a JSON
+            // envelope rather than a JSON-RPC code, so the two failures are
+            // not distinguishable in its reply anyway.
+            ValidatePathOutcome::NotFound(_) | ValidatePathOutcome::Unavailable(_) => continue,
             ValidatePathOutcome::Denied(err) => return ResolveOutcome::Denied(err),
         }
     }
@@ -4061,6 +4504,154 @@ mod tests {
             core_block[..core_end].matches(".lock()").count() >= 4,
             "the blocking bodies no longer take any locks — either they moved \
              somewhere this test cannot see, or the extraction is broken."
+        );
+    }
+
+    /// "Absent" and "I could not look" are different answers, and only the
+    /// first is about the path. A permission error reported as `NotFound` sends
+    /// the caller hunting for a typo that does not exist — and, through
+    /// `into_result`, reaches the client as `RESOURCE_NOT_FOUND` rather than an
+    /// internal error (codex P2 round 6 on PR #162).
+    ///
+    /// All three of `validate_get_document_path`'s I/O probes go through this,
+    /// so fixing one and leaving the others is not possible by accident.
+    #[test]
+    fn only_a_missing_path_reads_as_missing() {
+        use std::io::{Error, ErrorKind};
+
+        for absent in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
+            assert!(
+                !path_probe_failed(&Error::from(absent)),
+                "{absent:?} says the path cannot be there, which is about the path"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                path_probe_failed(&Error::from(kind)),
+                "{kind:?} says the probe failed, not that the path is absent"
+            );
+        }
+
+        // And the outcome it produces has to reach the client as the server's
+        // failure, not the document's.
+        let unavailable = ValidatePathOutcome::Unavailable(ErrorResponse {
+            error: "permission denied".to_string(),
+        });
+        assert!(
+            matches!(unavailable.into_result(), Err((LoadFailure::Internal, _))),
+            "an unexaminable path is an internal failure"
+        );
+        for absent in [
+            ValidatePathOutcome::NotFound(ErrorResponse {
+                error: "gone".to_string(),
+            }),
+            ValidatePathOutcome::Denied(ErrorResponse {
+                error: "refused".to_string(),
+            }),
+        ] {
+            assert!(
+                matches!(absent.into_result(), Err((LoadFailure::NotServed, _))),
+                "absence and refusal are both statements about the document"
+            );
+        }
+    }
+
+    /// `get_document` reports truncation in a field; a resource read has only
+    /// the text, and returning the prefix bare presented it as the whole
+    /// document. A client reading a large PDF got its first megabyte with
+    /// nothing to say the rest existed (codex P2 round 5 on PR #162).
+    #[test]
+    fn a_truncated_resource_says_so_in_the_text_it_hands_over() {
+        let whole = resource_text("all of it".to_string(), false);
+        assert_eq!(whole, "all of it", "an untruncated read must be untouched");
+
+        let part = resource_text("the first megabyte".to_string(), true);
+        assert!(
+            part.starts_with("the first megabyte"),
+            "the text served must still come first: {part}"
+        );
+        assert!(
+            part.contains("Truncated"),
+            "the notice must be in the body, the only place a resource read has: {part}"
+        );
+        // The literal is written with a `\` line continuation, which eats the
+        // newline *and* the indentation that follows it — miscount and the
+        // sentence runs two words together while still compiling.
+        assert!(
+            part.contains("1 MiB. What is above"),
+            "the continued literal must join with exactly one space: {part}"
+        );
+    }
+
+    /// "There is no such resource" and "this server is broken" are different
+    /// answers, and a client acts on them differently: the first is final, the
+    /// second is worth retrying. `read_resource` collapsed both into
+    /// `resource_not_found`, which also made it disagree with `list_resources`
+    /// about the identical unreadable index (codex P2 round 3 on PR #162).
+    #[test]
+    fn a_broken_server_and_a_missing_resource_do_not_share_a_code() {
+        let missing = resource_error(LoadFailure::NotServed, "no such topic group".to_string());
+        let broken = resource_error(
+            LoadFailure::Internal,
+            "failed to list documents".to_string(),
+        );
+
+        assert_eq!(missing.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND);
+        assert_eq!(broken.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_ne!(
+            missing.code, broken.code,
+            "a failure of the server must not be reported as an absent resource"
+        );
+        assert_eq!(
+            missing.message, "no such topic group",
+            "the message must survive the mapping"
+        );
+    }
+
+    /// `all_document_paths` is the raw index, and the raw index is not what this
+    /// server can serve: narrowing `[parsers].enabled` without reindexing keeps
+    /// those rows on purpose (AU-06) while `load_document_blocking` refuses
+    /// their extension. Everything the resource surface advertises therefore has
+    /// to come through `servable_document_paths`. A second, direct call is
+    /// exactly how `resources/list` came to offer a `kb://doc/...` that
+    /// `resources/read` then rejected.
+    #[test]
+    fn the_resource_surface_reads_the_index_through_the_registry_filter() {
+        let src = include_str!("server.rs").replace("\r\n", "\n");
+
+        let core_start = src
+            .find("\nimpl KbCore {")
+            .expect("the `impl KbCore` block moved or was renamed");
+        let core_block = &src[core_start..];
+        let core_end = core_block[1..]
+            .find("\n}\n")
+            .expect("could not find the end of the KbCore impl block");
+        let core = &core_block[..core_end];
+
+        // Anti-vacuity: this really is the block that holds both the filter and
+        // the bodies that must not go around it.
+        for needed in [
+            "fn servable_document_paths",
+            "fn topic_groups_blocking",
+            "fn read_resource_blocking",
+        ] {
+            assert!(
+                core.contains(needed),
+                "`{needed}` is not in the block this test scanned — the \
+                 extraction broke and the assertion below is vacuous."
+            );
+        }
+
+        assert_eq!(
+            core.matches("all_document_paths()").count(),
+            1,
+            "the raw index query must appear exactly once inside `impl KbCore`, \
+             in `servable_document_paths`. Any other call site skips the parser \
+             registry filter and advertises a URI a read will refuse."
         );
     }
 }

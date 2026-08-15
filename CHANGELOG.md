@@ -14,6 +14,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **MCP resources** (B-2), under the `kb://` scheme.
+
+  `resources/list` returns one entry per **topic group** — the first one or two
+  path segments, the same derivation the indexer uses for `category` and
+  `topic` — not one per document. A knowledge base has hundreds of documents but
+  tens of groups, and a listing is what a client fetches on every connect.
+  Individual documents stay reachable through the `kb://doc/{path}` template and
+  through the **`uri` field now on every `search` hit**; the specification
+  permits handing back links to documents a listing never enumerated.
+
+  **A read is bounded by the index.** A document is served only if it is
+  indexed, and then only through the same checks `get_document` applies. That is
+  *narrower* than `get_document`, which serves anything under `kb_path` with a
+  registered extension — a resource is something the server offered, so serving
+  a URI that was never on offer is a different operation. `.kb-mcpignore`d
+  documents are therefore absent from resources while remaining readable through
+  `get_document`, which leaves ADR-0003's contract exactly as it was. Reasoning
+  in [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.md).
+
+  The guard sequence now lives in one function that both `get_document` and
+  `resources/read` call, rather than being written twice.
+
+  Content comes back as text with the media type of what is served —
+  `text/markdown` for Markdown, `text/plain` for anything delivered as extracted
+  text. A PDF is served as the text kb-mcp extracted from it, so it is not
+  described as a PDF. Extraction above 1 MiB is truncated, as it already was for
+  `get_document`; since a resource read has no envelope to put a `truncated`
+  field in, it appends a marked notice rather than presenting a prefix as the
+  whole document.
+
+  `search`'s result gains one field and changes shape in no other way: the MCP
+  result is still a single text content block carrying the same JSON, so
+  existing clients are unaffected. The field is omitted for a hit whose
+  extension the active parser registry no longer covers — such a row stays
+  indexed and stays in the results, but no read would open it, so the honest
+  answer is no link rather than a broken one. The same filter decides what
+  `resources/list` offers.
+
+  Not implemented: `resources/subscribe` and
+  `notifications/resources/list_changed`.
+
 - **MCP prompts** (B-3). Four of them, surfaced by clients as commands the user
   picks — Claude Code renders them as `/mcp__kb-mcp__<name>`:
 
@@ -59,6 +100,20 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   test that reads only the former is checking the dialect 2026-07-28 moved on
   from. Nothing asserted any of this before, which is how the wrong server name
   survived fifteen releases.
+
+### Fixed
+
+- **A path that could not be examined no longer reports as a path that is not
+  there.** `validate_get_document_path` probes the filesystem three times, and
+  all three put every I/O failure into "File not found" — so a permission error
+  on an indexed document sent the caller hunting for a typo that did not exist.
+  Each probe now separates the two: `NotFound` and `NotADirectory` say the path
+  cannot be there; everything else says the server could not look.
+
+  `get_document` gains a more accurate message in that case ("Failed to
+  examine …" rather than "File not found: …"), and `resources/read` reports it
+  as an internal error rather than `RESOURCE_NOT_FOUND` — the difference
+  between a client retrying and a client giving up.
 
 ## [0.21.0] - 2026-08-15
 
