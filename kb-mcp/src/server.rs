@@ -4114,7 +4114,7 @@ mod tests {
         let emb = |v: f32| vec![v; 384];
 
         let doc = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha", 0)
             .unwrap();
         db.insert_chunk(
             doc,
@@ -4192,7 +4192,7 @@ mod tests {
             .expect("verify_embedding_meta");
         let emb = |v: f32| vec![v; 384];
         let doc = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha", 0)
             .unwrap();
         db.insert_chunk(
             doc,

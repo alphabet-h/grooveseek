@@ -281,6 +281,29 @@ impl Database {
         Ok(count)
     }
 
+    /// `size_bytes` が未記録 (NULL) の `documents` 行に、disk 走査で分かっている
+    /// サイズを埋める (feature-51)。返り値は実際に埋めた行数。
+    ///
+    /// **これが無いと新列は永久に埋まらない**。`rebuild_index` は content hash が
+    /// 一致する文書を `SingleResult::Unchanged` で返し、`upsert_document` も
+    /// `update_document_meta` も通らないので、既存 KB の大多数は「変更なし」経路
+    /// しか踏まない。列を足して書き込み経路に代入するだけでは、**移行がまるごと
+    /// 素通りされる**。
+    ///
+    /// `WHERE size_bytes IS NULL` があるので、記録済みの行は上書きしない
+    /// (記録済みの値は、その size を実際に読んだ経路が書いたもの)。2 回目以降の
+    /// index では 1 行も該当せず no-op になる。
+    pub fn backfill_document_sizes(&self, sizes: &[(&str, u64)]) -> Result<u32> {
+        let mut stmt = self.conn.prepare(
+            "UPDATE documents SET size_bytes = ?2 WHERE path = ?1 AND size_bytes IS NULL",
+        )?;
+        let mut count = 0u32;
+        for (path, size) in sizes {
+            count += stmt.execute(params![path, *size as i64])? as u32;
+        }
+        Ok(count)
+    }
+
     /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
     /// チャンクを検出し、[`quality::chunk_quality_score`] で再計算して UPDATE する (冪等)。
     ///

@@ -117,6 +117,10 @@ struct DiskEntry {
     hash: String,
     /// 実ファイルの絶対パス。embed/upsert 段階で再 `fs::read` する。
     full: std::path::PathBuf,
+    /// 走査時に読んだバイト数。hash を取るために全バイトを読んでいるので
+    /// 追加 I/O はゼロ。`documents.size_bytes` に記録され、`resources` が
+    /// 「read が拒むサイズの文書を提示しない」判定に使う (feature-51)。
+    size: u64,
 }
 
 /// [`scan_disk_entries`] の結果。`entries` = hash 計算済みの index 候補、
@@ -248,6 +252,7 @@ fn scan_disk_entries(
                     rel,
                     hash,
                     full: p.clone(),
+                    size: bytes.len() as u64,
                 });
             }
             Ok(None) => {
@@ -508,6 +513,28 @@ pub fn rebuild_index(
         crate::parser::MAX_RAW_TEXT_BYTES,
     );
     let disk_entries = scan.entries;
+
+    // (feature-51) `documents.size_bytes` の欠損補充。`backfill_fts` と同じ位置・
+    // 同じ思想で、embedding には触れない。
+    //
+    // **この 1 行が無いと新列は事実上埋まらない**: 下の loop は content hash が
+    // 一致する文書を `SingleResult::Unchanged` で返し、書き込み経路
+    // (`upsert_document` / `update_document_meta`) をどちらも通らないので、
+    // 既存 KB の大多数は列が追加されたことに気付かないまま NULL で残る。
+    // ここは走査で size が分かっている全 entry を対象にし、UPDATE 側の
+    // `WHERE size_bytes IS NULL` が記録済みの行を守る。
+    let scanned_sizes: Vec<(&str, u64)> = disk_entries
+        .iter()
+        .map(|e| (e.rel.as_str(), e.size))
+        .collect();
+    match db.backfill_document_sizes(&scanned_sizes) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("recorded the size of {n} document(s) indexed before it was kept"),
+        // 補充に失敗しても index 自体は続ける。埋まらなかった分は次回の index か
+        // `kb-mcp doctor` が拾う。
+        Err(e) => tracing::warn!("failed to backfill document sizes: {e}"),
+    }
+
     // read 失敗 / size skip の rel path 集合。prune 判定 (§4.2 統一原則) で
     // visited_paths と union し、transient lock / size 成長での誤削除を防ぐ。
     let skipped_paths: std::collections::HashSet<String> = scan.skipped.into_iter().collect();
@@ -761,6 +788,7 @@ fn index_single_disk_entry(
             &parsed.frontmatter.tags,
             parsed.frontmatter.date.as_deref(),
             &entry.hash,
+            entry.size,
         )?;
         if updated {
             return Ok(SingleResult::Updated {
@@ -798,6 +826,7 @@ fn index_single_disk_entry(
         &parsed.frontmatter.tags,
         parsed.frontmatter.date.as_deref(),
         &entry.hash,
+        entry.size,
     )?;
 
     for (chunk, embedding) in parsed.chunks.iter().zip(embeddings.iter()) {
@@ -890,10 +919,12 @@ pub fn reindex_single_file(
         return Ok(SingleResult::Refused);
     };
     let hash = sha256_hex_bytes(&bytes);
+    let size = bytes.len() as u64;
     let entry = DiskEntry {
         rel: rel.to_string(),
         hash,
         full,
+        size,
     };
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
@@ -1049,6 +1080,7 @@ pub fn rename_single_file(
         rel: new_rel.to_string(),
         hash: new_hash,
         full,
+        size: new_bytes.len() as u64,
     };
     // same_hash (= Static-mode-forced) の場合のみ force=true で
     // hash 一致 fast path をバイパスする。内容が変わっている場合は
@@ -1288,6 +1320,7 @@ mod tests {
             rel: rel.to_string(),
             hash: hash.to_string(),
             full: std::path::PathBuf::from(rel),
+            size: 0,
         }
     }
 
@@ -2146,6 +2179,7 @@ mod tests {
             &[],
             None,
             "hash1",
+            0,
         )
         .unwrap();
         assert!(db.get_document_hash("notes/a.md").unwrap().is_some());
@@ -2168,6 +2202,7 @@ mod tests {
             &[],
             None,
             "old_hash",
+            0,
         )
         .unwrap();
         // update_document_meta は content_hash を差し替えて meta を更新
@@ -2181,6 +2216,7 @@ mod tests {
                 &["tag1".to_string()],
                 Some("2026-04-19"),
                 "new_hash",
+                0,
             )
             .unwrap();
         assert!(updated);
@@ -2194,7 +2230,17 @@ mod tests {
     fn test_update_document_meta_missing_path_returns_false() {
         let db = test_db();
         let updated = db
-            .update_document_meta("never-existed.md", None, None, None, None, &[], None, "h")
+            .update_document_meta(
+                "never-existed.md",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .unwrap();
         assert!(!updated);
     }
@@ -2224,6 +2270,7 @@ mod tests {
                 &[],
                 None,
                 "hash1",
+                0,
             )
             .unwrap();
         let emb = vec![0.0f32; 384];
@@ -2256,6 +2303,7 @@ mod tests {
                 &[],
                 None,
                 "hash2",
+                0,
             )
             .unwrap();
         assert!(updated);
@@ -2331,7 +2379,7 @@ mod tests {
         let db = test_db();
         // chunk を 1 件入れて legacy (key 不在 + chunk > 0) を作る
         let doc_id = db
-            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2357,7 +2405,7 @@ mod tests {
         // この test の前提を「chunk が実在する non-empty index」に機械的に
         // 更新する (assert! 文言 / 期待値は不変、fixture のみ追加)。
         let doc_id = db
-            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2437,7 +2485,17 @@ mod tests {
         let db = test_db();
         db.write_context_mode(ContextMode::Off).unwrap();
         let doc_id = db
-            .upsert_document("stale.md", Some("Stale"), None, None, None, &[], None, "h")
+            .upsert_document(
+                "stale.md",
+                Some("Stale"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2483,7 +2541,7 @@ mod tests {
         let db = test_db();
         db.write_context_mode(ContextMode::Off).unwrap();
         let doc_id = db
-            .upsert_document("kept.md", Some("Kept"), None, None, None, &[], None, "h")
+            .upsert_document("kept.md", Some("Kept"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,

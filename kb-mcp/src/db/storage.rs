@@ -41,9 +41,14 @@ impl Database {
         tags: &[String],
         date: Option<&str>,
         content_hash: &str,
+        size_bytes: u64,
     ) -> Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
         let tags_json = serde_json::to_string(tags)?;
+        // SQLite has no unsigned integer type. A file large enough to overflow
+        // i64 cannot exist, and both size caps refuse long before that, so the
+        // cast is lossless for everything that reaches here.
+        let size = size_bytes as i64;
 
         // Open a local tx only if we are in autocommit (no caller-managed tx).
         // Drop guard rolls back automatically; we commit at the end on success.
@@ -84,7 +89,7 @@ impl Database {
             self.conn.execute(
                 "UPDATE documents SET title = ?1, topic = ?2, category = ?3,
                  depth = ?4, tags = ?5, date = ?6, content_hash = ?7,
-                 last_indexed = ?8 WHERE id = ?9",
+                 last_indexed = ?8, size_bytes = ?9 WHERE id = ?10",
                 params![
                     title,
                     topic,
@@ -94,15 +99,16 @@ impl Database {
                     date,
                     content_hash,
                     now,
+                    size,
                     doc_id
                 ],
             )?;
             doc_id
         } else {
             self.conn.execute(
-                "INSERT INTO documents (path, title, topic, category, depth, tags, date, content_hash, last_indexed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![path, title, topic, category, depth, tags_json, date, content_hash, now],
+                "INSERT INTO documents (path, title, topic, category, depth, tags, date, content_hash, last_indexed, size_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![path, title, topic, category, depth, tags_json, date, content_hash, now, size],
             )?;
             self.conn.last_insert_rowid()
         };
@@ -266,9 +272,15 @@ impl Database {
         tags: &[String],
         date: Option<&str>,
         content_hash: &str,
+        size_bytes: u64,
     ) -> Result<bool> {
         let tags_json = serde_json::to_string(tags)?;
         let updated_at = chrono::Utc::now().to_rfc3339();
+        // This path is taken when the bytes changed but the chunks did not, so
+        // the size can have changed too: writing everything else the new bytes
+        // imply and leaving `size_bytes` behind would make the recorded size
+        // disagree with the recorded hash.
+        let size = size_bytes as i64;
         let n = self.conn.execute(
             "UPDATE documents
                 SET title = ?1,
@@ -278,8 +290,9 @@ impl Database {
                     tags = ?5,
                     date = ?6,
                     content_hash = ?7,
-                    last_indexed = ?8
-              WHERE path = ?9",
+                    last_indexed = ?8,
+                    size_bytes = ?9
+              WHERE path = ?10",
             params![
                 title,
                 topic,
@@ -289,6 +302,7 @@ impl Database {
                 date,
                 content_hash,
                 updated_at,
+                size,
                 path
             ],
         )?;

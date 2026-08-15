@@ -696,6 +696,7 @@ mod tests {
                 &["mcp".into(), "protocol".into()],
                 Some("2026-04-16"),
                 "hash_aaa",
+                0,
             )
             .unwrap();
         println!("insert returned id={id1}");
@@ -726,6 +727,7 @@ mod tests {
                 &["mcp".into()],
                 Some("2026-04-16"),
                 "hash_bbb",
+                0,
             )
             .unwrap();
         println!("upsert returned id={id2} (should equal {id1})");
@@ -756,6 +758,7 @@ mod tests {
             &[],
             Some("2026-04-16"),
             "hash_xyz",
+            0,
         )
         .unwrap();
 
@@ -782,6 +785,7 @@ mod tests {
                 &["anthropic".into()],
                 Some("2026-04-16"),
                 "hash_del",
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -823,6 +827,7 @@ mod tests {
                 &[],
                 Some("2026-04-16"),
                 "h1",
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -885,7 +890,7 @@ mod tests {
     fn test_quality_filter_excludes_low_scored_chunks() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("q.md", Some("Q"), None, None, None, &[], None, "h")
+            .upsert_document("q.md", Some("Q"), None, None, None, &[], None, "h", 0)
             .unwrap();
         // 高品質チャンク (1.0) と低品質チャンク (0.1)
         db.insert_chunk(
@@ -953,7 +958,7 @@ mod tests {
         // backfill_quality が再評価するか、2 回目は no-op かを検証。
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("b.md", None, None, None, None, &[], None, "h")
+            .upsert_document("b.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
         // 本当はスタブ (短い定型) だが quality_score=1.0 で insert
         db.insert_chunk(
@@ -1000,6 +1005,7 @@ mod tests {
                 &[],
                 None,
                 "h",
+                0,
             )
             .unwrap();
         let emb = vec![0.0f32; 384];
@@ -1039,6 +1045,7 @@ mod tests {
                 &[],
                 None,
                 "h",
+                0,
             )
             .unwrap();
         let emb = vec![0.0f32; 384];
@@ -1065,6 +1072,7 @@ mod tests {
                 &[],
                 None,
                 "hash_same",
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -1110,9 +1118,9 @@ mod tests {
     fn test_rename_documents_atomic_rolls_back_on_failure() {
         // File rename: 途中で失敗したら rollback し、先行の rename も戻ること
         let db = db_with_384();
-        db.upsert_document("a.md", None, None, None, None, &[], None, "h_a")
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h_a", 0)
             .unwrap();
-        db.upsert_document("b.md", None, None, None, None, &[], None, "h_b")
+        db.upsert_document("b.md", None, None, None, None, &[], None, "h_b", 0)
             .unwrap();
 
         // 1 件目: a.md -> a2.md (成功するはず)
@@ -1135,9 +1143,9 @@ mod tests {
     #[test]
     fn test_rename_documents_atomic_commits_on_success() {
         let db = db_with_384();
-        db.upsert_document("a.md", None, None, None, None, &[], None, "h_a")
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h_a", 0)
             .unwrap();
-        db.upsert_document("b.md", None, None, None, None, &[], None, "h_b")
+        db.upsert_document("b.md", None, None, None, None, &[], None, "h_b", 0)
             .unwrap();
         let pairs = vec![
             ("a.md".to_string(), "a2.md".to_string()),
@@ -1165,7 +1173,17 @@ mod tests {
     fn test_begin_transaction_rolls_back_partial_writes_on_drop() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h_initial")
+            .upsert_document(
+                "a.md",
+                Some("a"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h_initial",
+                0,
+            )
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -1186,7 +1204,7 @@ mod tests {
             // UPDATE branch on existing path "a.md" — wipes old chunks/vec/fts
             // and stages a new content_hash. Without commit, all of this must
             // disappear when the tx is dropped.
-            db.upsert_document("a.md", Some("a"), None, None, None, &[], None, "h_NEW")
+            db.upsert_document("a.md", Some("a"), None, None, None, &[], None, "h_NEW", 0)
                 .unwrap();
             db.insert_chunk(
                 doc_id,
@@ -1219,7 +1237,17 @@ mod tests {
     fn test_begin_transaction_commits_on_explicit_commit() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h_initial")
+            .upsert_document(
+                "a.md",
+                Some("a"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h_initial",
+                0,
+            )
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -1235,7 +1263,7 @@ mod tests {
 
         {
             let tx = db.begin_transaction().unwrap();
-            db.upsert_document("a.md", Some("a"), None, None, None, &[], None, "h_NEW")
+            db.upsert_document("a.md", Some("a"), None, None, None, &[], None, "h_NEW", 0)
                 .unwrap();
             db.insert_chunk(
                 doc_id,
@@ -1327,9 +1355,9 @@ mod tests {
     #[test]
     fn test_all_path_hashes_returns_all_rows() {
         let db = db_with_384();
-        db.upsert_document("a.md", None, None, None, None, &[], None, "h_a")
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h_a", 0)
             .unwrap();
-        db.upsert_document("b.md", None, None, None, None, &[], None, "h_b")
+        db.upsert_document("b.md", None, None, None, None, &[], None, "h_b", 0)
             .unwrap();
         let map = db.all_path_hashes().unwrap();
         assert_eq!(map.len(), 2);
@@ -1341,7 +1369,7 @@ mod tests {
     fn test_chunk_count_by_quality_splits_correctly() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("c.md", None, None, None, None, &[], None, "h")
+            .upsert_document("c.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(doc_id, 0, None, None, "x", None, &dummy_embedding(0.1), 0.9)
             .unwrap();
@@ -1365,6 +1393,7 @@ mod tests {
                 &[],
                 Some("2026-04-16"),
                 "h1",
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -1417,7 +1446,7 @@ mod tests {
     fn the_capped_seed_read_reports_whether_more_chunks_exist() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("big.md", None, None, None, None, &[], None, "h1")
+            .upsert_document("big.md", None, None, None, None, &[], None, "h1", 0)
             .unwrap();
         for i in 0..10 {
             db.insert_chunk(
@@ -1468,7 +1497,7 @@ mod tests {
     fn the_capped_seed_read_is_index_backed_not_a_table_scan() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("d.md", None, None, None, None, &[], None, "h1")
+            .upsert_document("d.md", None, None, None, None, &[], None, "h1", 0)
             .unwrap();
         for i in 0..5 {
             db.insert_chunk(
@@ -1521,7 +1550,7 @@ mod tests {
     fn test_get_chunk_embedding_roundtrip() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", None, None, None, None, &[], None, "h1")
+            .upsert_document("a.md", None, None, None, None, &[], None, "h1", 0)
             .unwrap();
         db.insert_chunk(doc_id, 0, None, None, "x", None, &dummy_embedding(0.3), 1.0)
             .unwrap();
@@ -1550,7 +1579,7 @@ mod tests {
     fn test_fetch_embeddings_by_chunk_ids_returns_hashmap() {
         let db = db_with_384();
         let doc1 = db
-            .upsert_document("a.md", None, None, None, None, &[], None, "h_a")
+            .upsert_document("a.md", None, None, None, None, &[], None, "h_a", 0)
             .unwrap();
         let c1 = db
             .insert_chunk(
@@ -1577,7 +1606,7 @@ mod tests {
             )
             .unwrap();
         let doc2 = db
-            .upsert_document("b.md", None, None, None, None, &[], None, "h_b")
+            .upsert_document("b.md", None, None, None, None, &[], None, "h_b", 0)
             .unwrap();
         let c3 = db
             .insert_chunk(
@@ -1614,7 +1643,7 @@ mod tests {
     fn test_fetch_embeddings_by_chunk_ids_skips_missing() {
         let db = db_with_384();
         let doc1 = db
-            .upsert_document("a.md", None, None, None, None, &[], None, "h_a")
+            .upsert_document("a.md", None, None, None, None, &[], None, "h_a", 0)
             .unwrap();
         let c1 = db
             .insert_chunk(
@@ -1658,6 +1687,7 @@ mod tests {
                 &[],
                 None,
                 "h",
+                0,
             )
             .expect("upsert");
         let n = 600;
@@ -1713,6 +1743,7 @@ mod tests {
                     &[],
                     None,
                     "h",
+                    0,
                 )
                 .expect("upsert");
             let mut ids = Vec::with_capacity(n);
@@ -1751,7 +1782,7 @@ mod tests {
         fn prop_fetch_embeddings_by_chunk_ids_round_trip(n in 0_usize..=200) {
             let db = db_with_384();
             let doc_id = db
-                .upsert_document("/big.md", Some("big"), Some("topic"), None, None, &[], None, "h")
+                .upsert_document("/big.md", Some("big"), Some("topic"), None, None, &[], None, "h", 0)
                 .expect("upsert");
             let mut ids = Vec::with_capacity(n);
             for i in 0..n {
@@ -1807,7 +1838,7 @@ mod tests {
     /// feature-48 用の 1 doc 1 chunk ヘルパ (`tune.rs` の `add_doc` と同型)。
     fn add_fts_doc(db: &Database, path: &str, heading: &str, content: &str, e: f32) {
         let doc = db
-            .upsert_document(path, Some(path), None, None, None, &[], None, path)
+            .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)
             .unwrap();
         db.insert_chunk(
             doc,
@@ -2032,7 +2063,7 @@ mod tests {
 
         // 1024-dim embedding を insert できることを確認
         let doc_id = db
-            .upsert_document("x.md", Some("x"), None, None, None, &[], None, "h")
+            .upsert_document("x.md", Some("x"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let emb: Vec<f32> = vec![0.1; 1024];
         db.insert_chunk(doc_id, 0, None, None, "hi", None, &emb, 1.0)
@@ -2116,7 +2147,7 @@ mod tests {
     fn test_insert_chunk_populates_fts() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let chunk_id = db
             .insert_chunk(
@@ -2144,7 +2175,7 @@ mod tests {
     fn test_delete_document_cascades_to_fts() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2167,7 +2198,7 @@ mod tests {
     fn test_upsert_document_purges_old_fts() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h1")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h1", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2183,7 +2214,7 @@ mod tests {
         assert_eq!(fts_count(&db), 1);
 
         // 同一 path を異なる content_hash で再 upsert → 旧 chunk/FTS は消える
-        db.upsert_document("a.md", Some("a"), None, None, None, &[], None, "h2")
+        db.upsert_document("a.md", Some("a"), None, None, None, &[], None, "h2", 0)
             .unwrap();
         assert_eq!(fts_count(&db), 0);
     }
@@ -2192,7 +2223,7 @@ mod tests {
     fn test_search_hybrid_fts_exact_match_ranks_higher() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("doc.md", Some("doc"), None, None, None, &[], None, "h")
+            .upsert_document("doc.md", Some("doc"), None, None, None, &[], None, "h", 0)
             .unwrap();
         // chunk A: 完全一致語 E0382 を含む。埋め込みはクエリから等距離
         let a_id = db
@@ -2244,7 +2275,7 @@ mod tests {
     fn test_search_hybrid_falls_back_when_fts_query_empty() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2276,7 +2307,7 @@ mod tests {
     fn test_search_hybrid_candidates_returns_chunk_ids() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let c1 = db
             .insert_chunk(
@@ -2338,6 +2369,7 @@ mod tests {
                     &[],
                     None,
                     &format!("h_{i}"),
+                    0,
                 )
                 .unwrap();
             // chunk 1: keyword を含む (FTS hit)
@@ -2416,7 +2448,7 @@ mod tests {
     fn test_fts_bm25_heading_weighted_higher() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         // chunk A: content に keyword。heading には無し
         let a_id = db
@@ -2474,7 +2506,7 @@ mod tests {
             let path = format!("noise/doc_{i}.md");
             let cat = if i == 0 { "target" } else { "noise" };
             let doc_id = db
-                .upsert_document(&path, Some("x"), None, Some(cat), None, &[], None, "h")
+                .upsert_document(&path, Some("x"), None, Some(cat), None, &[], None, "h", 0)
                 .unwrap();
             db.insert_chunk(
                 doc_id,
@@ -2508,7 +2540,7 @@ mod tests {
     fn test_search_hybrid_japanese_trigram() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("ja.md", Some("ja"), None, None, None, &[], None, "h")
+            .upsert_document("ja.md", Some("ja"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2565,7 +2597,7 @@ mod tests {
     fn fts_decides_the_top_rank_when_the_vector_leg_prefers_another_chunk() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("ja.md", Some("ja"), None, None, None, &[], None, "h")
+            .upsert_document("ja.md", Some("ja"), None, None, None, &[], None, "h", 0)
             .unwrap();
         // FTS で当たる側。ベクトルはクエリから遠い。
         db.insert_chunk(
@@ -2669,7 +2701,7 @@ mod tests {
     fn fts_or_expansion_is_one_statement_over_the_union_of_its_phrases() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("u.md", Some("u"), None, None, None, &[], None, "h")
+            .upsert_document("u.md", Some("u"), None, None, None, &[], None, "h", 0)
             .unwrap();
         // 前半 10 行だけが「について」、後半 10 行だけが「における」を持つ =
         // 2 つの phrase の集合は交わらない。OR が和なら 20、積なら 0 になる。
@@ -2793,7 +2825,7 @@ mod tests {
         println!("corpus = {n} chunks");
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h")
+            .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h", 0)
             .unwrap();
         // codex review P2 (PR #136): 本文が 32 断片のうち 2 つしか含まないと、
         // 残り 30 arm は posting list が空で即棄却され、測っているのは
@@ -2908,7 +2940,7 @@ mod tests {
     fn test_backfill_fts_hydrates_preexisting_db() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -2951,7 +2983,7 @@ mod tests {
     fn test_fts_context_column_is_searchable_via_insert_chunk() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("n/a.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("n/a.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let emb = dummy_embedding(0.1);
         // content には無いが context にだけある語彙 "パイプライン設計"
@@ -2982,7 +3014,7 @@ mod tests {
         // FTS から 1 行消して backfill が context 込みで再 index することを確認
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("n/b.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("n/b.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let emb = dummy_embedding(0.1);
         db.insert_chunk(
@@ -3014,7 +3046,7 @@ mod tests {
     fn test_reset_for_model_switches_dim_and_wipes_data() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -3042,7 +3074,7 @@ mod tests {
 
         // 1024-dim insert が通る
         let doc_id2 = db
-            .upsert_document("b.md", Some("b"), None, None, None, &[], None, "h")
+            .upsert_document("b.md", Some("b"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let emb: Vec<f32> = vec![0.2; 1024];
         db.insert_chunk(doc_id2, 0, None, None, "hi2", None, &emb, 1.0)
@@ -3064,7 +3096,7 @@ mod tests {
     fn a_failed_reset_for_model_leaves_the_index_exactly_as_it_was() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -3107,7 +3139,7 @@ mod tests {
 
         // 残骸ではなく使える index であること。
         let doc_id2 = db
-            .upsert_document("b.md", Some("b"), None, None, None, &[], None, "h2")
+            .upsert_document("b.md", Some("b"), None, None, None, &[], None, "h2", 0)
             .unwrap();
         db.insert_chunk(
             doc_id2,
@@ -3130,7 +3162,7 @@ mod tests {
     fn reset_for_model_joins_the_callers_transaction() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("a"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -3190,6 +3222,7 @@ mod tests {
                 &[],
                 Some("2026-04-16"),
                 "h",
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -3273,8 +3306,18 @@ mod tests {
     #[test]
     fn test_get_document_title() {
         let db = db_with_384();
-        db.upsert_document("n/a.md", Some("My Title"), None, None, None, &[], None, "h")
-            .unwrap();
+        db.upsert_document(
+            "n/a.md",
+            Some("My Title"),
+            None,
+            None,
+            None,
+            &[],
+            None,
+            "h",
+            0,
+        )
+        .unwrap();
         assert_eq!(
             db.get_document_title("n/a.md").unwrap().as_deref(),
             Some("My Title")
@@ -3296,6 +3339,7 @@ mod tests {
             &[],
             Some("2026-04-15"),
             "h1",
+            0,
         )
         .unwrap();
         db.upsert_document(
@@ -3307,6 +3351,7 @@ mod tests {
             &[],
             Some("2026-04-16"),
             "h2",
+            0,
         )
         .unwrap();
         db.upsert_document(
@@ -3318,6 +3363,7 @@ mod tests {
             &[],
             Some("2026-04-16"),
             "h3",
+            0,
         )
         .unwrap();
 
@@ -3361,6 +3407,7 @@ mod tests {
             &[],
             Some("2026-04-29"),
             "h1",
+            0,
         )
         .unwrap();
         db.upsert_document(
@@ -3372,6 +3419,7 @@ mod tests {
             &[],
             Some("2026-04-29"),
             "h2",
+            0,
         )
         .unwrap();
 
@@ -3408,6 +3456,7 @@ mod tests {
                 &["rust".into(), "async".into()],
                 None,
                 "h1",
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -3434,7 +3483,17 @@ mod tests {
         let db = db_with_384();
         for (i, p) in ["docs/a.md", "docs/b.md", "notes/c.md"].iter().enumerate() {
             let id = db
-                .upsert_document(p, Some("t"), None, None, None, &[], None, &format!("h{i}"))
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
                 .unwrap();
             db.insert_chunk(
                 id,
@@ -3477,7 +3536,17 @@ mod tests {
             .enumerate()
         {
             let id = db
-                .upsert_document(p, Some("t"), None, None, None, &[], None, &format!("h{i}"))
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
                 .unwrap();
             db.insert_chunk(
                 id,
@@ -3537,6 +3606,7 @@ mod tests {
                     &tags_owned,
                     None,
                     &format!("h{i}"),
+                    0,
                 )
                 .unwrap();
             db.insert_chunk(
@@ -3579,7 +3649,7 @@ mod tests {
         ];
         for (i, (p, d)) in dates.iter().enumerate() {
             let id = db
-                .upsert_document(p, Some("t"), None, None, None, &[], *d, &format!("h{i}"))
+                .upsert_document(p, Some("t"), None, None, None, &[], *d, &format!("h{i}"), 0)
                 .unwrap();
             db.insert_chunk(
                 id,
@@ -3636,6 +3706,7 @@ mod tests {
                     &[],
                     None,
                     &format!("h{i}"),
+                    0,
                 )
                 .unwrap();
             db.insert_chunk(
@@ -3684,7 +3755,17 @@ mod tests {
             .enumerate()
         {
             let id = db
-                .upsert_document(p, Some("t"), None, None, None, &[], None, &format!("h{i}"))
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
                 .unwrap();
             // FTS にヒットさせる固有のキーワードを各 chunk に含める
             db.insert_chunk(
@@ -3749,6 +3830,7 @@ mod tests {
                     &tags_owned,
                     None,
                     &format!("h{i}"),
+                    0,
                 )
                 .unwrap();
             db.insert_chunk(
@@ -3899,6 +3981,7 @@ mod tests {
                     &[],
                     None,
                     "hash_level",
+                    0,
                 )
                 .expect("upsert document");
             db.insert_chunk(
@@ -3939,6 +4022,7 @@ mod tests {
                 &[],
                 None,
                 "h",
+                0,
             )
             .unwrap();
         let emb = dummy_embedding(0.1);
@@ -3968,7 +4052,7 @@ mod tests {
     fn test_insert_chunk_context_none_stores_null() {
         let db = db_with_384();
         let doc_id = db
-            .upsert_document("n/b.md", Some("T"), None, None, None, &[], None, "h")
+            .upsert_document("n/b.md", Some("T"), None, None, None, &[], None, "h", 0)
             .unwrap();
         let emb = dummy_embedding(0.2);
         db.insert_chunk(doc_id, 0, Some("H"), Some(2), "body", None, &emb, 1.0)
@@ -4018,6 +4102,139 @@ mod tests {
         db.ensure_context_text_column().unwrap();
     }
 
+    // -- feature-51: documents.size_bytes ------------------------------------
+
+    #[test]
+    fn test_ensure_document_size_column_migrates_legacy_documents() {
+        // legacy DB (size_bytes 列なし) を模して、列を落としてから ensure を呼ぶ。
+        let db = db_with_384();
+        db.conn
+            .execute_batch(
+                "DROP TABLE fts_chunks; DROP TABLE vec_chunks; DROP TABLE chunks; \
+                 DROP TABLE documents;",
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TABLE documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,
+                    title TEXT, topic TEXT, category TEXT, depth TEXT, tags TEXT,
+                    date TEXT, content_hash TEXT NOT NULL, last_indexed TEXT NOT NULL
+                );
+                 INSERT INTO documents (path, content_hash, last_indexed)
+                 VALUES ('legacy.md', 'h', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+
+        db.ensure_document_size_column().unwrap();
+        let has: bool = db
+            .conn
+            .prepare("PRAGMA table_info(documents)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|n| n == "size_bytes");
+        assert!(has, "size_bytes column must be added by migration");
+
+        // The row that predates the column keeps NULL — "not recorded", which is
+        // what the backfill and `doctor` both key off. Filling it with 0 here
+        // would claim an empty file.
+        let stored: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT size_bytes FROM documents WHERE path = 'legacy.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored.is_none(), "a pre-existing row must stay unrecorded");
+
+        // 冪等: 2 回目は no-op
+        db.ensure_document_size_column().unwrap();
+    }
+
+    #[test]
+    fn test_upsert_document_records_the_size_it_was_given() {
+        let db = db_with_384();
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h1", 4096)
+            .unwrap();
+        let read = |db: &Database| -> Option<i64> {
+            db.conn
+                .query_row(
+                    "SELECT size_bytes FROM documents WHERE path = 'a.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(read(&db), Some(4096));
+
+        // The UPDATE branch has to carry it too, or an edit that shrinks a file
+        // would leave the old size recorded next to the new hash.
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h2", 10)
+            .unwrap();
+        assert_eq!(read(&db), Some(10));
+
+        // So does the frontmatter-only path, which is reached when the bytes
+        // changed but the chunks did not.
+        db.update_document_meta("a.md", None, None, None, None, &[], None, "h3", 77)
+            .unwrap();
+        assert_eq!(read(&db), Some(77));
+    }
+
+    #[test]
+    fn test_backfill_document_sizes_fills_only_unrecorded_rows() {
+        let db = db_with_384();
+        db.upsert_document("recorded.md", None, None, None, None, &[], None, "h", 500)
+            .unwrap();
+        db.upsert_document("legacy.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        // Simulate the legacy row: written before the column existed.
+        db.conn
+            .execute_batch("UPDATE documents SET size_bytes = NULL WHERE path = 'legacy.md'")
+            .unwrap();
+
+        let filled = db
+            .backfill_document_sizes(&[("legacy.md", 123), ("recorded.md", 999)])
+            .unwrap();
+        assert_eq!(filled, 1, "only the unrecorded row counts as filled");
+
+        let size_of = |p: &str| -> Option<i64> {
+            db.conn
+                .query_row(
+                    "SELECT size_bytes FROM documents WHERE path = ?1",
+                    params![p],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(size_of("legacy.md"), Some(123));
+        // A recorded size was written by the path that actually read those
+        // bytes; the backfill must not talk over it.
+        assert_eq!(size_of("recorded.md"), Some(500));
+
+        // 2 回目は 1 行も該当しない (index のたびに走るので no-op であること)。
+        assert_eq!(
+            db.backfill_document_sizes(&[("legacy.md", 456)]).unwrap(),
+            0
+        );
+        assert_eq!(size_of("legacy.md"), Some(123));
+    }
+
+    #[test]
+    fn test_backfill_document_sizes_ignores_paths_it_does_not_know() {
+        let db = db_with_384();
+        // The disk scan reports every file it read, including ones this index
+        // run is about to add for the first time. A path with no row is not an
+        // error; it simply updates nothing.
+        assert_eq!(
+            db.backfill_document_sizes(&[("never-indexed.md", 10)])
+                .unwrap(),
+            0
+        );
+    }
+
     /// Companion to the above: passing `None` for `level` stores SQL NULL
     /// (this is the path used by .txt and frontmatter-only / pre-heading
     /// chunks, and also by every test fixture site that doesn't care).
@@ -4041,6 +4258,7 @@ mod tests {
                     &[],
                     None,
                     "hash_level_none",
+                    0,
                 )
                 .expect("upsert document");
             db.insert_chunk(
@@ -4658,7 +4876,7 @@ mod tests {
         // にだけ置いた doc を作り、heading 重みを振ると順位が入れ替わる。
         let db = db_with_384();
         let doc_a = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "ha", 0)
             .unwrap();
         db.insert_chunk(
             doc_a,
@@ -4672,7 +4890,7 @@ mod tests {
         )
         .unwrap();
         let doc_b = db
-            .upsert_document("b.md", Some("B"), None, None, None, &[], None, "hb")
+            .upsert_document("b.md", Some("B"), None, None, None, &[], None, "hb", 0)
             .unwrap();
         db.insert_chunk(
             doc_b,
@@ -4721,7 +4939,7 @@ mod tests {
     fn test_vec_candidates_clamp_fetch_k_to_sqlite_vec_limit() {
         let db = db_with_384();
         let doc = db
-            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("A"), None, None, None, &[], None, "h", 0)
             .unwrap();
         db.insert_chunk(
             doc,
@@ -4781,7 +4999,17 @@ mod tests {
     /// Insert one document with one chunk. Returns the document id.
     fn doc_with_chunk(db: &Database, path: &str, content_hash: &str, chunk: &str) -> i64 {
         let id = db
-            .upsert_document(path, Some("t"), None, None, None, &[], None, content_hash)
+            .upsert_document(
+                path,
+                Some("t"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                content_hash,
+                0,
+            )
             .unwrap();
         db.insert_chunk(id, 0, Some("H"), Some(1), chunk, None, &[0.0; 384], 1.0)
             .unwrap();
@@ -4861,7 +5089,7 @@ mod tests {
         let nul = '\u{0}';
         let a = db_with_384();
         let id_a = a
-            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h", 0)
             .unwrap();
         a.insert_chunk(
             id_a,
@@ -4877,7 +5105,7 @@ mod tests {
 
         let b = db_with_384();
         let id_b = b
-            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h", 0)
             .unwrap();
         b.insert_chunk(
             id_b,
@@ -4929,14 +5157,14 @@ mod tests {
     fn test_corpus_snapshot_distinguishes_a_missing_heading_from_an_empty_one() {
         let a = db_with_384();
         let id_a = a
-            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h", 0)
             .unwrap();
         a.insert_chunk(id_a, 0, None, Some(1), "body", None, &[0.0; 384], 1.0)
             .unwrap();
 
         let b = db_with_384();
         let id_b = b
-            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h")
+            .upsert_document("a.md", Some("t"), None, None, None, &[], None, "h", 0)
             .unwrap();
         b.insert_chunk(id_b, 0, Some(""), Some(1), "body", None, &[0.0; 384], 1.0)
             .unwrap();

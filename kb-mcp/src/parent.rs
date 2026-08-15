@@ -298,7 +298,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // 各 chunk content を ~900 byte (= token_count ~225) にして adjacent
         // 経路に確実に乗せる。"alpha" / "beta" / "gamma" を marker として残す。
@@ -368,7 +378,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         let alpha_body = format!("alpha {}", "body content body content ".repeat(40));
         let beta_body = format!("beta {}", "body content body content ".repeat(40));
@@ -419,7 +439,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
 
         // chunk_index=0 が small (token_count=30 < 100), c1 / c2 は普通サイズ
@@ -484,7 +514,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // c1 (hit chunk) は normal quality、c0 と c2 は超低 quality (0.05)
         let _c0 = db
@@ -550,7 +590,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // 各 chunk content を ~20000 byte (= token_count ~5000) にする。
         let big_body = format!("big {}", "body content body content ".repeat(800));
@@ -618,7 +668,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // 全 chunk で level = None (= NULL) を明示的に渡す
         let body = format!("body {}", "content body content body ".repeat(40));
@@ -683,7 +743,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // 日本語 + マルチバイト UTF-8 (絵文字、半角全角混在)
         let jp_body = format!("日本語の本文 {}", "テキストてきすと ".repeat(40));
@@ -745,7 +815,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // 各 chunk content を ~20000 byte (= estimated tokens ~5000) に。
         // legacy NULL token_count を simulate するため、insert 後に直接 SQL で
@@ -838,7 +918,17 @@ mod tests {
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
             .expect("vec_chunks");
         let doc_id = db
-            .upsert_document("/doc.md", Some("d"), Some("t"), None, None, &[], None, "h")
+            .upsert_document(
+                "/doc.md",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
             .expect("upsert");
         // c_prev (idx=0) と c_next (idx=2) のみ insert (idx=1 は gap)。各 ~20000 byte
         // (= token_count ~5000) で 2 chunks 合計 = 10000 > cap=2000 を満たす。

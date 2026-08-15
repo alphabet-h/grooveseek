@@ -75,7 +75,12 @@ impl Database {
                 tags         TEXT,
                 date         TEXT,
                 content_hash TEXT NOT NULL,
-                last_indexed TEXT NOT NULL
+                last_indexed TEXT NOT NULL,
+                -- Bytes on disk when the row was written. NULL means it was
+                -- never recorded, which is the state of every row in a
+                -- database written before feature-51 until the next index
+                -- run backfills it.
+                size_bytes   INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS chunks (
@@ -131,6 +136,10 @@ impl Database {
         // legacy DB 互換: chunks.context_text 列が無ければ ALTER で追加する
         // (feature-46。NULL のまま — 値は PR-2 の context_mode 導入後、再 index で埋まる)。
         self.ensure_context_text_column()?;
+
+        // legacy DB 互換: documents.size_bytes 列が無ければ ALTER で追加する
+        // (feature-51。NULL のまま — 値は次の index 実行時に backfill される)。
+        self.ensure_document_size_column()?;
 
         // legacy DB 互換: fts_chunks が旧 2 列 schema なら 3 列へ rebuild migration
         // する (feature-46)。context_text 列の存在を前提に repopulate するため、
@@ -240,6 +249,34 @@ impl Database {
             match self
                 .conn
                 .execute_batch("ALTER TABLE chunks ADD COLUMN context_text TEXT;")
+            {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column") => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// `documents.size_bytes` 列が存在しなければ追加する (idempotent、feature-51)。
+    /// legacy DB を開いても失敗しないよう init 経路から呼ぶ。新規 DB では
+    /// `CREATE TABLE` 時点で列があるので no-op。race 条件は duplicate column を吸収。
+    ///
+    /// 既存行は **NULL のまま**で、値は次の index 実行時に埋まる
+    /// (`backfill_document_sizes`)。NULL を「読めない」と解釈すると、新 binary で
+    /// 開いた瞬間に KB 全体が `resources` から消えるので、**NULL は提示を許す側**に
+    /// 倒す。未記録が何件あるかは `kb-mcp doctor` が報告する。
+    pub(super) fn ensure_document_size_column(&self) -> Result<()> {
+        let has_col: bool = self
+            .conn
+            .prepare("PRAGMA table_info(documents)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(std::result::Result::ok)
+            .any(|name| name == "size_bytes");
+        if !has_col {
+            match self
+                .conn
+                .execute_batch("ALTER TABLE documents ADD COLUMN size_bytes INTEGER;")
             {
                 Ok(()) => {}
                 Err(e) if e.to_string().contains("duplicate column") => {}

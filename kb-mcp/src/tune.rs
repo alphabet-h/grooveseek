@@ -991,7 +991,7 @@ mod tests {
     /// `path` / `heading` / `content` の 1 doc 1 chunk を足す。
     fn add_doc(db: &crate::db::Database, path: &str, heading: &str, content: &str, e: f32) {
         let doc = db
-            .upsert_document(path, Some(path), None, None, None, &[], None, path)
+            .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)
             .unwrap();
         db.insert_chunk(doc, 0, Some(heading), None, content, None, &emb(e), 1.0)
             .unwrap();
@@ -2635,7 +2635,7 @@ mod tests {
 
         // context を持つ chunk が 1 件でもあれば軸は生きている
         let doc = db
-            .upsert_document("b.md", Some("B"), None, None, None, &[], None, "hb")
+            .upsert_document("b.md", Some("B"), None, None, None, &[], None, "hb", 0)
             .unwrap();
         db.insert_chunk(
             doc,

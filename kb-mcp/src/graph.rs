@@ -687,6 +687,7 @@ mod tests {
                 &[],
                 None,
                 &format!("h-{path}"),
+                0,
             )
             .unwrap();
         db.insert_chunk(
@@ -887,7 +888,7 @@ mod tests {
         let db = setup_db();
         // 1 ドキュメントに 2 チャンク (centroid テスト用)
         let doc_id = db
-            .upsert_document("s.md", Some("T"), None, None, None, &[], None, "hs")
+            .upsert_document("s.md", Some("T"), None, None, None, &[], None, "hs", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -1018,7 +1019,7 @@ mod tests {
         insert_doc_with_chunk(&db, "s.md", "s", "s body", 0.0);
         // same-path で 2 チャンクを持つ近傍ドキュメント
         let doc_id = db
-            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "ha")
+            .upsert_document("a.md", Some("T"), None, None, None, &[], None, "ha", 0)
             .unwrap();
         db.insert_chunk(
             doc_id,
@@ -1113,6 +1114,7 @@ mod tests {
                 &[],
                 None,
                 &format!("h-{path}"),
+                0,
             )
             .unwrap();
         for i in 0..n {
