@@ -12,6 +12,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-15
+
 ### Added
 
 - **`kb-mcp eval` reports a corpus that quotes its own golden set** (D-12).
@@ -3327,7 +3329,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.20.0...v0.21.0
