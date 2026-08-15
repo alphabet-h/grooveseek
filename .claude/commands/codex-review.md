@@ -56,7 +56,7 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 46 (reaction の種類を見ずに数える) | `eyes` = 「受け取った / 着手した」、`+1` = 「レビュー済み・指摘なし」。**種類で判定する**。`[.[] \| select(.user.login==BOT)] \| length` では着手の合図が合格に見える |
 | 罠 47 (`@codex review` が届かないことがある) | 実測 **8 回中 2 回** (PR #162 round 4 / 8)。trigger comment に **reaction が 1 つも付かない**のが「届いていない」の signal。この場合は再 trigger で復帰する。**`exit 3` で stale connector と診断する前に必ず reaction を見る** |
 | 罠 48 (transient API failure が差分に見える) | 罠 43 の再発。差分を検知したら **10 秒後にもう一度取り、同じ差分が再現した時だけ**信じる。射影 (罠 44) は「変化の原因が観測対象でない」に効くが「**観測自体の失敗**」には効かない — 別の防御が要る |
-| 罠 49 (指摘が review 本文に入る) | P-badge の計数を **inline + review 本文**の両方で行う。実測 (PR #164 round 7): 新 review が HEAD に対して出て inline 0 件、しかし本文に P2 が 1 件 (permalink 形式)。inline だけ数えると Layer 1 (state=COMMENTED) と Layer 3 (sentinel 無し) も収束側に倒れるので **3 layer 全部を通り抜ける**。罠 12 で endpoint を足したが、**その endpoint のどのフィールドに指摘が入り得るか**を数えていなかった |
+| 罠 49 (指摘が review 本文に入る) | P-badge の計数を **inline + review 本文**の両方で行う。実測 (PR #164 round 7): 新 review が HEAD に対して出て inline 0 件、しかし本文に P2 が 1 件 (permalink 形式)。inline だけ数えると Layer 1 (state=COMMENTED) と Layer 3 (sentinel 無し) も収束側に倒れるので **3 layer 全部を通り抜ける**。罠 12 で endpoint を足したが、**その endpoint のどのフィールドに指摘が入り得るか**を数えていなかった。**さらに body も round scope する** — 罠 21 のとおり re-review で新 submission が出ない round があり、`LATEST_REVIEW` が前 round のままだと修正済みの指摘を数え続けて収束しない (罠 27 / 33 と同型) |
 | 罠 33 (sentinel / terminal-error が PR 全 history で評価される) | `LATEST_ISSUE_BODY` を `NEW_ISSUES = $CUR_ISSUES − $PREV_ISSUES` (= current round で post された issue comment のみ) から derive する。罠 27 (P-badge round-scoping) と同じ pattern を sentinel + terminal-error チェック側にも適用、prior round の sentinel "Didn't find any major issues" が後続 round に漏れて false-converge する race を排除 |
 
 ## 実行フロー
@@ -283,7 +283,15 @@ NEW_INLINE=$(jq -n --argjson prev "$PREV_INLINE" --argjson cur "$CUR_INLINE_FRES
 # 「activity あり / inline 0」が「レビュー済み・指摘なし」と見分けられず、
 # Layer 1 (state=COMMENTED) と Layer 3 (sentinel 無し) も収束側に倒れるので
 # **3 layer 全部を通り抜ける**。両方を数える。
-REVIEW_BODY=$(echo "$LATEST_REVIEW" | jq -r '.body // ""')
+# ...and **round-scoped**, like NEW_INLINE (罠 27) and NEW_ISSUES (罠 33).
+# 罠 21 のとおり codex は re-review で新しい review submission を出さないことが
+# あり、その round では `LATEST_REVIEW` は**前 round のもの**。そこから数えると
+# 修正済みの指摘を毎 round 数え続け、収束しなくなる (codex P2 round 8 on PR #164)。
+NEW_REVIEWS=$(jq -n --argjson prev "$PREV_REVIEWS" --argjson cur "$(snapshot_reviews)" '
+  ($prev | map({key: (.id|tostring), value: .submitted_at}) | from_entries) as $p |
+  $cur | map(select(.id as $i | ($p[$i|tostring] // null) != .submitted_at))
+')
+REVIEW_BODY=$(echo "$NEW_REVIEWS" | jq -r '.[-1].body // ""')
 body_badges() { printf '%s' "$REVIEW_BODY" | grep -o "$1" | wc -l | tr -d ' '; }
 P0_P1_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P0 Badge") or contains("![P1 Badge"))] | length') \
   + $(body_badges '!\[P0 Badge') + $(body_badges '!\[P1 Badge') ))
@@ -322,11 +330,12 @@ fi
 ### Step 5 — 結果 fetch + 整形
 
 ```bash
-echo "=== Top-level summary (review body) ==="
+echo "=== Top-level summary (review body, this round) ==="
 # 罠 49: the body is not only a summary — a finding can live here, as a
 # permalink instead of an inline anchor. Step 4 counts it, so this prints it;
-# the two must stay in lockstep for the same reason as 罠 25.
-echo "$LATEST_REVIEW" | jq -r '.body // "(no review body)"'
+# the two must stay in lockstep for the same reason as 罠 25 — **including the
+# round scoping**, or the counter and the display disagree about which review.
+echo "$NEW_REVIEWS" | jq -r '.[-1].body // "(no new review body this round)"'
 echo ""
 echo "=== Inline P0/P1 (review-blocking issues, current round only) ==="
 # 罠 25 (codex P1 on PR #54): codex emits image markdown badges like
