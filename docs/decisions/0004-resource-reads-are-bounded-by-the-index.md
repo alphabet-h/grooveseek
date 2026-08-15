@@ -97,13 +97,18 @@ is a property of a single list or of neither.
   for Markdown, `text/plain` for anything delivered as extracted text. A PDF
   comes back as the text kb-mcp extracted from it, so calling it
   `application/pdf` would misdescribe the bytes the client is holding.
-- What this does **not** promise: that every offered URI reads successfully. The
-  filter removes the one mismatch that is a stable property of the
-  configuration; the rest are conditions of the moment — the file was deleted
-  since it was indexed, a hard link was renamed over it, it grew past the size
-  cap — and a listing cannot answer those without stat-ing the whole corpus on
-  every call. Those surface as a refusal on read, which is the same answer
-  `get_document` gives.
+- What this does **not** promise: that every offered URI reads successfully.
+  Some refusals are conditions of the moment — the file was deleted since it was
+  indexed, a hard link was renamed over it — and a listing cannot answer those
+  at all. One is not: a document above `GET_DOCUMENT_MAX_BYTES` (1 MiB of text)
+  is indexed, because indexing accepts 50 MiB, and then refused on read. That
+  one is *knowable*, but only by stat-ing every indexed file on every listing,
+  which would make the offer a live filesystem probe rather than a property of
+  the index — and still would not close the gap, since a file can cross the cap
+  between the listing and the read. The durable fix is to record the size at
+  index time or to reconcile the two caps; until then this is a known
+  limitation, not a claim. Measured on the reference corpus: 0 of 666 documents
+  are within reach of the cap, the largest being 231 KiB.
 - A row whose extension the parser registry no longer covers stays indexed —
   narrowing `[parsers].enabled` does not delete it — but is **not offered**: it
   is absent from `resources/list`, unreadable through `resources/read`, and its

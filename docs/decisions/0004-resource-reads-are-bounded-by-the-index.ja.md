@@ -87,11 +87,16 @@ v0.22.0 で kb-mcp に MCP の `resources` capability が入った。クライ�
   `text/markdown`、抽出テキストとして出すものは `text/plain`。PDF は
   kb-mcp が抽出したテキストとして返るので、`application/pdf` と名乗るのは
   クライアントが手にしているバイト列について嘘をつくことになる
-- **保証しないこと**: 提示した URI が必ず読めること。この filter が外すのは
-  「設定として安定して分かっている不一致」だけで、残りは**その瞬間の条件**
-  (index 後に消された / hard link が rename で被せられた / size cap を超えた) であり、
-  listing のたびに corpus 全体を stat しない限り答えられない。これらは read 時の
-  拒否として現れる — `get_document` と同じ答え方
+- **保証しないこと**: 提示した URI が必ず読めること。一部は**その瞬間の条件**
+  (index 後に消された / hard link が rename で被せられた) で、listing には
+  そもそも答えられない。1 つだけ性質が違うのが **size cap**: index は 50 MiB まで
+  受け入れるので、`GET_DOCUMENT_MAX_BYTES` (テキスト 1 MiB) を超える文書は
+  索引に入り、read で拒否される。これは**知り得る**が、知るには listing のたびに
+  索引済みファイルを全部 stat する必要があり、「提示物は索引の性質」を
+  「提示物は生の filesystem 探査」に変えてしまう — しかも listing と read の間に
+  cap を跨げば結局塞がらない。恒久対策は **index 時に size を記録する**か
+  **2 つの cap を揃える**かで、それまでは**既知の制限**であって主張ではない。
+  実測: 参照 corpus では 666 件中 0 件が cap に届いておらず、最大でも 231 KiB
 - 現在の parser registry が扱わない拡張子の行は、索引には残る (`[parsers].enabled`
   を狭めても削除しない) が**提示はしない**: `resources/list` に出ず、
   `resources/read` でも読めず、`search` hit にも `uri` キーが付かない。
