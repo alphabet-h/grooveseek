@@ -1314,7 +1314,10 @@ impl ServerHandler for KbServer {
 
         let (text, mime) = text;
         let content = rmcp::model::ResourceContents::text(text, uri).with_mime_type(mime);
-        Ok(rmcp::model::ReadResourceResult::new(vec![content]).into())
+        // A read is a complete result too, so it owes the same hints the two
+        // listings give. rmcp's constructor leaves them `None`; a hand-written
+        // handler has to set them, and this one is hand-written.
+        Ok(with_cache_hints(rmcp::model::ReadResourceResult::new(vec![content])).into())
     }
 }
 
@@ -1352,6 +1355,7 @@ macro_rules! impl_cache_hinted {
 impl_cache_hinted!(
     rmcp::model::ListResourcesResult,
     rmcp::model::ListResourceTemplatesResult,
+    rmcp::model::ReadResourceResult,
 );
 
 fn internal_error(e: String) -> rmcp::ErrorData {
@@ -2009,11 +2013,17 @@ impl ValidatePathOutcome {
 /// Whether an I/O error while examining a path means the server could not look,
 /// rather than that the path is not there.
 ///
-/// `ErrorKind::NotFound` is the only kind that says something about the path.
-/// A permission error, a device error, a name the filesystem rejects — those
-/// say the examination failed (codex P2 round 6 on PR #162).
+/// Two kinds say the path is not there. `NotFound` is the obvious one.
+/// `NotADirectory` is the same statement about an interior component — on Unix,
+/// an indexed `dir/note.md` whose `dir` has since been replaced by a regular
+/// file reports that, and the path cannot exist while it holds (codex P2 round
+/// 7 on PR #162). Everything else — a permission error, a device error — says
+/// the examination failed and tells the caller nothing about the path.
 fn path_probe_failed(e: &std::io::Error) -> bool {
-    e.kind() != std::io::ErrorKind::NotFound
+    !matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// (BU-23) `get_best_practice` の「見つからなかった」応答。
@@ -4509,10 +4519,12 @@ mod tests {
     fn only_a_missing_path_reads_as_missing() {
         use std::io::{Error, ErrorKind};
 
-        assert!(
-            !path_probe_failed(&Error::from(ErrorKind::NotFound)),
-            "an absent path is the one case that is about the path"
-        );
+        for absent in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
+            assert!(
+                !path_probe_failed(&Error::from(absent)),
+                "{absent:?} says the path cannot be there, which is about the path"
+            );
+        }
         for kind in [
             ErrorKind::PermissionDenied,
             ErrorKind::InvalidInput,

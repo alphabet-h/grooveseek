@@ -503,6 +503,13 @@ fn resources_list_and_read_agree_with_the_index() {
             resp["result"]["contents"][0]["text"].is_string(),
             "a listed resource must be readable: {uri} -> {resp}"
         );
+        // A read is a complete result like the two listings, and owes the same
+        // hints. rmcp's constructor leaves them unset, so only the handlers
+        // that add them conform — and this one is hand-written.
+        assert!(
+            resp["result"].get("ttlMs").is_some() && resp["result"].get("cacheScope").is_some(),
+            "resources/read must carry caching hints on a complete result: {resp}"
+        );
     }
 
     // A document, by the template's URI, with the media type of what is served.
