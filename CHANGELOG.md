@@ -12,6 +12,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-15
+
 ### Added
 
 - **MCP resources** (B-2), under the `kb://` scheme.
@@ -3225,7 +3227,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.18.0...v0.19.0
