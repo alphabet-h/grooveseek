@@ -4302,6 +4302,92 @@ mod tests {
         assert_eq!(db.record_document_sizes(&[("absent.md", 1)]).unwrap(), 0);
     }
 
+    /// feature-52: the eval leakage scan matches each needle against **one
+    /// indexed text field at a time**, so the reader hands out fields rather
+    /// than any concatenation. Joining them here would let a needle straddle a
+    /// seam — between two chunks, or between a heading and the body under it —
+    /// and be reported as quoted when its halves sit nowhere near each other.
+    ///
+    /// The three fields are the three `fts_chunks` columns, and each carries
+    /// text the other two do not: the Markdown parser strips the heading line
+    /// out of `content` (and FTS weights headings *above* body text), while the
+    /// breadcrumb in `context_text` begins with the document title, which is
+    /// frontmatter or the filename — neither a heading nor body text.
+    #[test]
+    fn test_for_each_indexed_text_yields_heading_context_and_body_separately() {
+        let db = db_with_384();
+        // Inserted out of path order on purpose: the ordering below has to come
+        // from the SQL, not from the insertion sequence.
+        let second = db
+            .upsert_document("b.md", None, None, None, None, &[], None, "hb", 0)
+            .unwrap();
+        let first = db
+            .upsert_document("a.md", None, None, None, None, &[], None, "ha", 0)
+            .unwrap();
+        db.insert_chunk(
+            second,
+            0,
+            None,
+            None,
+            "the tail of a quote",
+            None,
+            &dummy_embedding(0.1),
+            1.0,
+        )
+        .unwrap();
+        db.insert_chunk(
+            first,
+            1,
+            None,
+            None,
+            "and its second half",
+            None,
+            &dummy_embedding(0.2),
+            1.0,
+        )
+        .unwrap();
+        db.insert_chunk(
+            first,
+            0,
+            Some("A heading that is a question?"),
+            Some(2),
+            "the first half of a sentence",
+            // The breadcrumb starts with the document title, which appears in
+            // no other field.
+            Some("A title that is also a question? > A heading that is a question?"),
+            &dummy_embedding(0.3),
+            1.0,
+        )
+        .unwrap();
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        db.for_each_indexed_text(|path, text| {
+            seen.push((path.to_string(), text.to_string()));
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                // Each field comes out on its own, never glued to another.
+                (
+                    "a.md".to_string(),
+                    "A heading that is a question?".to_string()
+                ),
+                (
+                    "a.md".to_string(),
+                    "A title that is also a question? > A heading that is a question?".to_string()
+                ),
+                (
+                    "a.md".to_string(),
+                    "the first half of a sentence".to_string()
+                ),
+                ("a.md".to_string(), "and its second half".to_string()),
+                ("b.md".to_string(), "the tail of a quote".to_string()),
+            ]
+        );
+    }
+
     /// Companion to the above: passing `None` for `level` stores SQL NULL
     /// (this is the path used by .txt and frontmatter-only / pre-heading
     /// chunks, and also by every test fixture site that doesn't care).

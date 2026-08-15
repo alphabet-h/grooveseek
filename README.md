@@ -634,6 +634,8 @@ kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3
 
 Output: aggregate metrics + per-query rows for regressions / misses only. JSON (`--format json`) exposes the full per-query detail. History lives at `<kb_path>/.kb-mcp-eval-history.json` and keeps the last 10 runs for diff display.
 
+If you keep notes about the evaluation inside the knowledge base being evaluated, those notes compete with the real answers. From v0.24.0 every run scans the corpus and warns on stderr when a document quotes **two or more** golden queries verbatim (`findings` in `--format json`) — the shape of a note written *about* the golden set. It reports only; the exit code is unchanged. Details, including why one match is not enough to report: [docs/eval.md](./docs/eval.md).
+
 For CI: pass `--fail-on-regression` (v0.6.0+) to exit with code 1 when any aggregate metric (`recall@k` / `MRR` / `ndcg@k`) regressed from the previous **fingerprint-compatible** run by more than `regression_threshold` (default 0.05). Updating the golden YAML changes the hash, so the next run skips the comparison rather than triggering a false positive. Details: [docs/eval.md](./docs/eval.md).
 
 See [docs/eval.md](docs/eval.md) for the golden YAML reference, metric definitions, diff output guide, and troubleshooting.

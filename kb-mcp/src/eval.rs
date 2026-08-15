@@ -242,6 +242,19 @@ pub struct EvalRun {
 
     pub per_query: Vec<QueryResult>,
     pub aggregate: AggregateMetrics,
+
+    /// golden query の混入検出の所見 (feature-52)。通常は空。
+    ///
+    /// **意図的に [`ConfigFingerprint`] の外に置いている** — `corpus` と同じ理由
+    /// (上記) で、所見が増減しただけで `previous_compatible` が「非互換」に
+    /// 倒れると、`--fail-on-regression` の比較対象が消える。報告はするが
+    /// 比較可能性は動かさない。
+    ///
+    /// この field を持たない旧 history JSON では空になる。**`serde(default)` は
+    /// 必須** — 無いと [`History::load`] が deserialize 失敗を握り潰して
+    /// **保存済みの baseline を全部捨てる**。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<QuoteFinding>,
 }
 
 /// run 時点の index の状態 (AU-71)。
@@ -517,6 +530,300 @@ pub struct AggregateMetrics {
     pub query_count: usize,
 }
 
+// ---------- Golden query の混入検出 (feature-52 / D-12) ----------
+//
+// 評価対象の KB と、評価について書き残す場所が同じコーパスだと、golden query の
+// 文面を逐語で引用したノートが **そのクエリの上位を奪い、本来の正解を押し下げる**。
+// 実測で発見した事故 (2026-07-26) だが、気付いたのは人間が結果を眺めていて偶然で、
+// 問える手段が無かった。
+//
+// **なぜ「2 件以上」なのか** (実装前に 662 文書 / 26 golden で実測した):
+//
+// | 案 | 健全な KB での発火 |
+// |---|---|
+// | query と embedding 高類似 かつ expected でない | 上位 hit は定義上すべて高類似 = 閾値が引けない |
+// | 逐語含有が 1 件でも報告 | **8 件、全部偽陽性** |
+// | top_k の hit だけを見る + 2 件以上 | **0 件** (下記) |
+// | コーパス全体 + 2 件以上 | **1 件、真陽性のみ** |
+//
+// 偽陽性の正体は、golden query の多くが `cross-encoder` のような **トピック名
+// そのもの**で、その解説文書に逐語で出るのが当たり前だということ。1 件で報告する
+// 規則に戻すと、健全な KB で 8 件鳴り続けて誰も読まなくなる。
+//
+// top_k に絞ると発火しないのは、2 件目の query の上位が 1 文書の chunk で
+// 埋まってしまい、引用ノートがそもそも top_k に入らないため (実測: ある query では
+// 9 位に入り、別の query では 1-10 位すべて別文書の chunk だった)。
+// **実害が出ている範囲より広く探さないと、実害の原因を指させない。**
+
+/// 照合対象にする query の最小長 (正規化後の **char 数**、byte 数ではない)。
+///
+/// これ未満の query は `MCP とは` のように多数の文書へ偶然含まれるので、
+/// 「2 件以上」規則の分母を汚す。実測では **8 でも 12 でも報告は同じ 1 件**で、
+/// **16 にすると真陽性が消える** (golden が短いキーワード主体のため)。
+/// 両側から挟めているので設定キーにはせず、この 1 箇所に固定する。
+pub const MIN_QUERY_CHARS: usize = 12;
+
+/// 1 文書を所見にするのに必要な distinct な golden query の数。
+pub const MIN_DISTINCT_QUERIES: usize = 2;
+
+/// 所見の名前。**観測した事実**で名付けている: この検査が言えるのは
+/// 「この文書は golden query を複数、逐語で含む」までで、それが混入なのか
+/// golden の `expected` 漏れなのかは判定していない。
+pub const CHECK_GOLDEN_QUERIES_QUOTED: &str = "golden-queries-quoted";
+
+/// 逐語照合用の正規化: 連続する空白 (改行・タブ・全角空白を含む) を 1 つに
+/// 畳んで前後を落とし、小文字化する。
+///
+/// **query 側と本文側の両方に同じ関数を当てる。** 別々に正規化すると、
+/// 折り返しやインデントの違いだけで一致しなくなる。
+fn normalize_for_quote(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// レポートに出す query の識別子。`id` が無い golden では文面の先頭を使う。
+///
+/// [`run`] の per-query ループと所見の両方がこれを呼ぶ。2 箇所で別々に組み立てると
+/// 同じ query が違う名前で出る。
+fn query_id(q: &GoldenQuery) -> String {
+    q.id.clone()
+        .unwrap_or_else(|| q.query.chars().take(32).collect())
+}
+
+/// 走査対象になる query を `(golden 内の index, 正規化済み文面)` で返す。
+/// 短すぎる query はここで落ちる。
+///
+/// **正規化後に同じ文面になる golden entry は 1 件にまとめる。** golden loader は
+/// query 文の重複を弾かないので、大文字小文字や空白だけが違う 2 件をそのまま
+/// 別々に数えると、**1 回の引用が 2 件に見えて 2 件閾値を自分で満たす** —
+/// この閾値が防ぐために存在している偽陽性が、閾値の数え方から生まれる。
+pub fn quote_needles(golden: &[GoldenQuery]) -> Vec<QuoteNeedle> {
+    let mut needles: Vec<QuoteNeedle> = Vec::new();
+    for (i, q) in golden.iter().enumerate() {
+        let text = normalize_for_quote(&q.query);
+        if text.chars().count() < MIN_QUERY_CHARS {
+            continue;
+        }
+        match needles.iter_mut().find(|n| n.text == text) {
+            Some(existing) => existing.golden.push(i),
+            None => needles.push(QuoteNeedle {
+                text,
+                golden: vec![i],
+            }),
+        }
+    }
+    needles
+}
+
+/// 走査対象の query 1 件ぶん。正規化後の文面が同じ golden entry は
+/// ここで 1 件に畳まれている ([`quote_needles`])。
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuoteNeedle {
+    /// 正規化済みの文面。
+    pub text: String,
+    /// この文面を持つ golden entry の index。先頭が報告に使う代表。
+    /// 空にはならない。
+    pub golden: Vec<usize>,
+}
+
+/// コーパス全体を 1 パス走査し、各文書が逐語で含んでいた needle を
+/// **`needles` 内の index** で返す。1 つも含まない文書は返さない。
+///
+/// 照合は索引された**テキストフィールド単位** (chunk 本文・見出し・パンくずを
+/// それぞれ別に見る)、集約は文書単位。理由は
+/// [`crate::db::Database::for_each_indexed_text`] の doc comment を参照。
+pub fn scan_quoted_documents(
+    db: &crate::db::Database,
+    needles: &[QuoteNeedle],
+) -> Result<Vec<(String, Vec<usize>)>> {
+    if needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found: std::collections::BTreeMap<String, std::collections::BTreeSet<usize>> =
+        std::collections::BTreeMap::new();
+    db.for_each_indexed_text(|path, text| {
+        let hay = normalize_for_quote(text);
+        for (ni, needle) in needles.iter().enumerate() {
+            if hay.contains(needle.text.as_str()) {
+                found.entry(path.to_string()).or_default().insert(ni);
+            }
+        }
+    })?;
+    Ok(found
+        .into_iter()
+        .map(|(path, set)| (path, set.into_iter().collect()))
+        .collect())
+}
+
+/// 走査結果に規則を当てて所見にする。DB を触らない純粋関数。
+///
+/// `scan` が持つのは `needles` 内の index。`per_query` は `golden` と **同じ順**
+/// であることを前提にする ([`run`] のループがそう作る)。順位の注記にしか
+/// 使わないので、欠けていても所見は出る。
+pub fn detect_quoted_queries(
+    golden: &[GoldenQuery],
+    needles: &[QuoteNeedle],
+    scan: &[(String, Vec<usize>)],
+    per_query: &[QueryResult],
+) -> Vec<QuoteFinding> {
+    let mut findings = Vec::new();
+    for (path, quoted_indices) in scan {
+        // **別の一致で説明が付く一致は、独立した証拠として数えない。**
+        // golden に `cross-encoder reranking` と
+        // `how does cross-encoder reranking work?` の両方があると、長い方を
+        // 1 回引用しただけの文書が両方に一致し、**1 回の引用で 2 件閾値を
+        // 満たす** — 正規化同値の重複で塞いだのと同じ穴が、文面が違うまま
+        // 開いている (codex review round 5)。他の一致の部分文字列になっている
+        // 一致を落とす。
+        //
+        // 出現位置を持たない以上、「長い方とは別の場所で短い方も引用されて
+        // いる」場合を取りこぼす。**取りこぼす側に倒すのはこの検査の一貫した
+        // 選択**で、2 件閾値そのものが同じ理由で存在している。
+        // 正規化後に同一の文面は [`quote_needles`] が既に 1 件に畳んでいるので、
+        // ここで比べる文面は互いに異なる = 「部分文字列」は真部分文字列。
+        let independent: Vec<usize> = quoted_indices
+            .iter()
+            .copied()
+            .filter(|&ni| {
+                let Some(n) = needles.get(ni) else {
+                    return false;
+                };
+                !quoted_indices.iter().any(|&other| {
+                    other != ni
+                        && needles
+                            .get(other)
+                            .is_some_and(|o| o.text.contains(n.text.as_str()))
+                })
+            })
+            .collect();
+
+        let mut quoted = Vec::new();
+        for ni in independent {
+            let Some(needle) = needles.get(ni) else {
+                continue;
+            };
+            // その query の正解として挙がっている文書が query 語を含むのは
+            // 当たり前で、混入ではない。数えると全 golden が所見になる。
+            //
+            // **免除は文書単位で、`expected` が heading を指していても変えない。**
+            // 章単位に狭めると「正解の文書の *別の章* にトピック名が出ている」が
+            // 数えられるようになるが、それは 1 件規則が実測 8 件の偽陽性を出した
+            // 母集団そのもの (トピック名はその解説文書のあちこちに出る)。
+            // 所見も 2 件閾値も文書単位である以上、免除だけ章単位にすると
+            // 規則の粒度が揃わない。取りこぼす形は
+            // 「heading 指定された正解文書の別章に、その query が引用されている」
+            // で、これは承知の上の代償。
+            //
+            // 同じ文面の golden entry が複数あるときは、**どれか 1 つでもこの
+            // 文書を正解にしていれば免除する**。文面が同じなら「この文書は
+            // この言い回しの正解である」は等しく成り立つ。
+            let exempt = needle.golden.iter().any(|&gi| {
+                golden
+                    .get(gi)
+                    .is_some_and(|q| q.expected.iter().any(|e| &e.path == path))
+            });
+            if exempt {
+                continue;
+            }
+            // 報告は代表 entry の名前と順位で行う。
+            let Some(&gi) = needle.golden.first() else {
+                continue;
+            };
+            let Some(q) = golden.get(gi) else { continue };
+            let rank_in_top_k = per_query
+                .get(gi)
+                .and_then(|r| r.top_k.iter().find(|h| &h.path == path))
+                .map(|h| h.rank);
+            quoted.push(QuotedQuery {
+                query_id: query_id(q),
+                rank_in_top_k,
+            });
+        }
+        if quoted.len() >= MIN_DISTINCT_QUERIES {
+            findings.push(QuoteFinding {
+                check: CHECK_GOLDEN_QUERIES_QUOTED.to_string(),
+                path: path.clone(),
+                quoted,
+            });
+        }
+    }
+    findings
+}
+
+/// 「この文書は golden query を複数、逐語で含む」という所見。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuoteFinding {
+    /// 何を検査したか ([`CHECK_GOLDEN_QUERIES_QUOTED`])。将来別の検査が
+    /// 同じ配列に入っても、消費側が種類で振り分けられるようにしている。
+    pub check: String,
+    pub path: String,
+    pub quoted: Vec<QuotedQuery>,
+}
+
+/// 所見 1 件が含んでいた golden query 1 つぶんの内訳。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotedQuery {
+    pub query_id: String,
+    /// その query の `top_k` に実際に出ていれば順位。`None` は「コーパスには
+    /// 居るが、この run では上位に出ていない」= **まだ候補枠を奪っていない**。
+    ///
+    /// `None` でも key を落とさない (`skip_serializing_if` を付けない): これは
+    /// 欠測ではなく**測った上での事実**で、`findings` を 0 件でも出すのと同じ
+    /// 理由。key の不在で表すと、消費側が「この版は順位を見ていない」と
+    /// 区別できなくなる。`serde(default)` は旧 JSON を読むためだけに要る。
+    #[serde(default)]
+    pub rank_in_top_k: Option<usize>,
+}
+
+/// 所見を人間向けの警告文にする。0 件なら `None`。
+///
+/// 文字列を返して **main.rs が stderr に出す**: 結果は stdout、診断は stderr
+/// という CLI 出力規約に従いつつ、stderr を捕まえずに unit test できる。
+///
+/// **ASCII だけで書く。** これは stderr に出る = 日本語 Windows では CP932 の
+/// コンソールに出るので、`⚠️` や `→` は化ける。stdout 側の [`format_text`] が
+/// それらを使っているのは、あちらがリダイレクト前提の結果出力だから
+/// (同じ判断が `main.rs` の `--fail-on-regression` の文言にもある)。
+pub fn format_findings_warning(findings: &[QuoteFinding]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+    use std::fmt::Write;
+    let mut s = String::new();
+    writeln!(
+        s,
+        "kb-mcp eval: {} document(s) quote {} or more golden queries verbatim ({}).",
+        findings.len(),
+        MIN_DISTINCT_QUERIES,
+        CHECK_GOLDEN_QUERIES_QUOTED
+    )
+    .unwrap();
+    for f in findings {
+        writeln!(s, "  {}", f.path).unwrap();
+        for q in &f.quoted {
+            let seen = match q.rank_in_top_k {
+                Some(r) => format!("rank {r}"),
+                None => "not in top_k".to_string(),
+            };
+            writeln!(s, "    {} ({})", q.query_id, seen).unwrap();
+        }
+    }
+    // 原因を 1 つに決めつけない。どちらなのかは golden を書いた人しか知らない。
+    writeln!(
+        s,
+        "  Either these notes leaked into the corpus, or the queries came from them"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "  and the documents belong in `expected`. kb-mcp eval changes neither."
+    )
+    .unwrap();
+    Some(s)
+}
+
 // ---------- History ----------
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -706,6 +1013,9 @@ pub fn format_json(run: &EvalRun, previous: Option<&EvalRun>) -> serde_json::Val
         "corpus_changed": corpus_changed,
         "aggregate": run.aggregate,
         "per_query": run.per_query,
+        // 混入検出の所見 (feature-52)。0 件でも key は出す — 「検査していない」と
+        // 「検査して 0 件だった」を消費側が区別できなくなるため。
+        "findings": run.findings,
         "previous": prev_val,
         "diff": diff_val,
     })
@@ -992,9 +1302,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
 
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
-        let qid =
-            q.id.clone()
-                .unwrap_or_else(|| q.query.chars().take(32).collect());
+        let qid = query_id(q);
         let qe = embedder.embed_single(&q.query)?;
         // Eval shares the MMR-aware pipeline with MCP / CLI search so the
         // golden YAML reflects the actual production retrieval (e.g. when
@@ -1108,6 +1416,14 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         chunks,
         digest,
     });
+    // 混入検出 (feature-52) も同じスナップショットの中で走らせる。**per-query
+    // ループの外**なのは、「1 文書が golden query を 2 件以上含む」という規則が
+    // 文書単位の集約を要求するため。検索と同じ index の版を見ていないと、
+    // 「その run が測ったコーパス」ではないものを報告することになる。
+    let needles = quote_needles(&gs.queries);
+    let scan = scan_quoted_documents(&db, &needles)?;
+    let findings = detect_quoted_queries(&gs.queries, &needles, &scan, &per_query);
+
     // 固定はここまで。read-only なので rollback は「何も書いていない」の宣言。
     snapshot_tx.rollback()?;
 
@@ -1133,6 +1449,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         corpus,
         per_query,
         aggregate,
+        findings,
     })
 }
 
@@ -1141,6 +1458,265 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    // ---------- 混入検出 (feature-52) ----------
+
+    fn golden_q(id: &str, query: &str, expected: &[&str]) -> GoldenQuery {
+        GoldenQuery {
+            id: Some(id.to_string()),
+            query: query.to_string(),
+            expected: expected
+                .iter()
+                .map(|p| ExpectedHit {
+                    path: (*p).to_string(),
+                    heading: None,
+                })
+                .collect(),
+            tags: None,
+        }
+    }
+
+    /// `top_k` に path を並べただけの結果 (順位の注記だけに使う)。
+    fn result_with_hits(id: &str, paths: &[&str]) -> QueryResult {
+        QueryResult {
+            id: id.to_string(),
+            query: String::new(),
+            expected: Vec::new(),
+            top_k: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| HitRecord {
+                    rank: i + 1,
+                    path: (*p).to_string(),
+                    heading: None,
+                    score: 1.0,
+                })
+                .collect(),
+            metrics: QueryMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn test_normalize_for_quote_collapses_whitespace_and_case() {
+        // 引用は折り返されたりインデントされたりする。query 側と本文側に同じ
+        // 正規化を当てるので、両者が一致する形に畳めていることを確かめる。
+        assert_eq!(
+            normalize_for_quote("  Claude Code\n   の\tcontext 管理  "),
+            "claude code の context 管理"
+        );
+        // 全角空白も空白として畳む (日本語の散文で普通に出てくる)。
+        assert_eq!(normalize_for_quote("A\u{3000}B"), "a b");
+    }
+
+    /// 最小長は **char 数**で数える。`.len()` (byte 数) で書くと、日本語 4 文字で
+    /// 12 byte に達してしまい、短くて危険な query がそのまま照合対象になる。
+    #[test]
+    fn test_quote_needles_measures_the_minimum_in_chars_not_bytes() {
+        let golden = vec![
+            golden_q("short-ascii", "MCP とは", &[]),
+            // 6 文字 / 18 byte。byte で数えると通ってしまう。
+            golden_q("short-japanese", "日本語クエリ", &[]),
+            // 13 文字。
+            golden_q("long-japanese", "レコードユーザーの権限設計", &[]),
+            golden_q("long-ascii", "cross-encoder reranking", &[]),
+        ];
+        assert!(
+            "日本語クエリ".len() >= MIN_QUERY_CHARS,
+            "前提: byte 数では通る"
+        );
+
+        let needles = quote_needles(&golden);
+        let ids: Vec<Vec<usize>> = needles.iter().map(|n| n.golden.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![vec![2], vec![3]],
+            "短い 2 件が落ちて長い 2 件だけが残る"
+        );
+        assert_eq!(needles[1].text, "cross-encoder reranking", "正規化して渡す");
+    }
+
+    /// 正規化後に同じ文面になる golden entry は 1 件に畳む。畳まないと、
+    /// **1 回の引用が 2 件に数えられて 2 件閾値を自分で満たす** — この閾値が
+    /// 防ぐために存在している偽陽性が、閾値の数え方から生まれる
+    /// (codex review round 4)。golden loader は query 文の重複を弾かない。
+    #[test]
+    fn test_quote_needles_folds_queries_that_normalize_to_the_same_text() {
+        let golden = vec![
+            golden_q("a", "cross-encoder reranking", &[]),
+            // 大文字小文字と空白だけが違う = 正規化すると同一。
+            golden_q("a-dup", "Cross-Encoder   Reranking", &[]),
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        let needles = quote_needles(&golden);
+        assert_eq!(needles.len(), 2, "3 entry が 2 needle に畳まれる");
+        assert_eq!(
+            needles[0].golden,
+            vec![0, 1],
+            "重複は 1 つの needle に集まる"
+        );
+        assert_eq!(needles[1].golden, vec![2]);
+
+        // その 1 文面を 1 回引用しただけの文書は所見にならない。
+        let scan = vec![("notes/topic.md".to_string(), vec![0])];
+        assert!(
+            detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
+            "one quotation of one wording must not satisfy a two-query threshold"
+        );
+    }
+
+    /// 片方が他方の部分文字列になっている query は、長い方を 1 回引用すると
+    /// 両方に一致する。正規化同値の重複 (round 4) と同じ穴が、文面が違うまま
+    /// 開いていた形 (codex review round 5)。
+    #[test]
+    fn test_detect_quoted_queries_ignores_matches_explained_by_a_longer_match() {
+        let golden = vec![
+            golden_q("short", "cross-encoder reranking", &[]),
+            golden_q("long", "how does cross-encoder reranking work?", &[]),
+            golden_q("other", "torch.compile guide", &[]),
+        ];
+        let needles = quote_needles(&golden);
+        assert_eq!(needles.len(), 3, "文面が違うので畳まれはしない");
+
+        // 長い方を 1 回引用しただけ = 短い方も機械的に一致する。
+        let scan = vec![("notes/topic.md".to_string(), vec![0, 1])];
+        assert!(
+            detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
+            "one quotation cannot be two pieces of evidence just because one \
+             golden query contains another"
+        );
+
+        // 独立した 2 件目 (包含関係にない query) があれば従来どおり報告する。
+        let scan = vec![("notes/topic.md".to_string(), vec![0, 1, 2])];
+        let findings = detect_quoted_queries(&golden, &needles, &scan, &[]);
+        assert_eq!(findings.len(), 1);
+        let ids: Vec<&str> = findings[0]
+            .quoted
+            .iter()
+            .map(|q| q.query_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["long", "other"], "説明の付かない一致だけが残る");
+    }
+
+    /// 1 件しか含まない文書は報告しない。golden query の多くは `cross-encoder`
+    /// のようなトピック名そのもので、その解説文書に逐語で出るのは当たり前。
+    /// 1 件で報告する規則は実測で 8 件の偽陽性を出した。
+    #[test]
+    fn test_detect_quoted_queries_needs_more_than_one_query() {
+        let golden = vec![
+            golden_q("a", "cross-encoder reranking", &[]),
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        let needles = quote_needles(&golden);
+        let one = vec![("notes/topic.md".to_string(), vec![0])];
+        assert!(detect_quoted_queries(&golden, &needles, &one, &[]).is_empty());
+
+        let two = vec![("notes/about-the-eval.md".to_string(), vec![0, 1])];
+        let findings = detect_quoted_queries(&golden, &needles, &two, &[]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, CHECK_GOLDEN_QUERIES_QUOTED);
+        assert_eq!(findings[0].path, "notes/about-the-eval.md");
+        let ids: Vec<&str> = findings[0]
+            .quoted
+            .iter()
+            .map(|q| q.query_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    /// 正解として挙がっている文書がその query 語を含むのは当たり前で、混入では
+    /// ない。数えてしまうと、逐語一致を狙って書いた golden がまるごと所見になる。
+    #[test]
+    fn test_detect_quoted_queries_ignores_the_documents_a_query_expects() {
+        let golden = vec![
+            golden_q("a", "cross-encoder reranking", &["notes/both.md"]),
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        // 2 件含んでいるが、片方は自分の正解なので 1 件ぶんしか数えない。
+        let needles = quote_needles(&golden);
+        let scan = vec![("notes/both.md".to_string(), vec![0, 1])];
+        assert!(detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty());
+    }
+
+    /// 免除は **`expected` が heading を指していても文書単位**。狭める案は
+    /// codex review round 3 で提案されたが採らなかった (理由は
+    /// `detect_quoted_queries` の該当箇所)。**意図的な選択なのでここで固定する。**
+    #[test]
+    fn test_detect_quoted_queries_exempts_the_whole_document_even_with_a_pinned_heading() {
+        let golden = vec![
+            GoldenQuery {
+                id: Some("a".to_string()),
+                query: "cross-encoder reranking".to_string(),
+                expected: vec![ExpectedHit {
+                    path: "notes/topic.md".to_string(),
+                    heading: Some("Overview".to_string()),
+                }],
+                tags: None,
+            },
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        // その文書は query a の正解 (章まで指定) で、query b も引用している。
+        // 章単位の免除にすると a も数えて 2 件 = 所見になるが、
+        // 「正解の文書の別の章にトピック名が出ている」は混入の証拠ではない。
+        let needles = quote_needles(&golden);
+        let scan = vec![("notes/topic.md".to_string(), vec![0, 1])];
+        assert!(
+            detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
+            "a document that answers the query is not evidence of a leak, \
+             whichever section of it was labelled"
+        );
+    }
+
+    /// 順位の注記は `top_k` から引く。`None` は「コーパスには居るが、この run では
+    /// 上位に出ていない」= まだ候補枠を奪っていない、を意味する。
+    #[test]
+    fn test_detect_quoted_queries_annotates_the_rank_only_when_it_reached_top_k() {
+        let golden = vec![
+            golden_q("a", "cross-encoder reranking", &[]),
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        let per_query = vec![
+            result_with_hits("a", &["other.md", "notes/leak.md"]),
+            result_with_hits("b", &["other.md"]),
+        ];
+        let needles = quote_needles(&golden);
+        let scan = vec![("notes/leak.md".to_string(), vec![0, 1])];
+        let findings = detect_quoted_queries(&golden, &needles, &scan, &per_query);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].quoted[0].rank_in_top_k, Some(2));
+        assert_eq!(findings[0].quoted[1].rank_in_top_k, None);
+    }
+
+    #[test]
+    fn test_format_findings_warning_is_none_when_there_is_nothing_to_report() {
+        assert!(format_findings_warning(&[]).is_none());
+
+        let text = format_findings_warning(&[QuoteFinding {
+            check: CHECK_GOLDEN_QUERIES_QUOTED.to_string(),
+            path: "notes/leak.md".to_string(),
+            quoted: vec![
+                QuotedQuery {
+                    query_id: "a".to_string(),
+                    rank_in_top_k: Some(9),
+                },
+                QuotedQuery {
+                    query_id: "b".to_string(),
+                    rank_in_top_k: None,
+                },
+            ],
+        }])
+        .expect("one finding reports");
+        assert!(text.contains("notes/leak.md"));
+        assert!(text.contains("rank 9"));
+        assert!(text.contains("not in top_k"));
+        // 原因を 1 つに決めつけない (混入か expected 漏れかは判定していない)。
+        assert!(text.contains("expected"));
+        // stderr に出る = 日本語 Windows では CP932 のコンソールに出るので、
+        // 非 ASCII を混ぜると化ける。
+        assert!(
+            text.is_ascii(),
+            "the stderr warning must stay ASCII: {text}"
+        );
+    }
 
     #[test]
     fn test_types_compile() {
@@ -1581,6 +2157,7 @@ mod tests {
         agg.recall_at_k.insert(10, recall10);
         agg.query_count = 1;
         EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc.timestamp_opt(ts_secs, 0).unwrap(),
             fingerprint: ConfigFingerprint {
@@ -1658,6 +2235,7 @@ mod tests {
         agg.mrr = 0.6;
         agg.query_count = 2;
         let run = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
@@ -1710,6 +2288,7 @@ mod tests {
         a_prev.ndcg_at_k.insert(5, 0.7);
         a_prev.query_count = 1;
         let now = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp.clone(),
@@ -1717,6 +2296,7 @@ mod tests {
             aggregate: a_now,
         };
         let prev = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp,
@@ -1752,6 +2332,7 @@ mod tests {
         agg.recall_at_k.insert(5, 0.8);
         agg.query_count = 1;
         let now = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
@@ -1759,6 +2340,7 @@ mod tests {
             aggregate: agg.clone(),
         };
         let prev = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
@@ -1778,6 +2360,7 @@ mod tests {
         agg.ndcg_at_k.insert(5, 0.7);
         agg.query_count = 2;
         let run = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
@@ -1824,6 +2407,7 @@ mod tests {
             context: None,
         };
         let now = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp.clone(),
@@ -1831,6 +2415,7 @@ mod tests {
             aggregate: a1,
         };
         let prev = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp,
@@ -1870,6 +2455,7 @@ mod tests {
             ..fp_now.clone()
         };
         let now = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
@@ -1877,6 +2463,7 @@ mod tests {
             aggregate: a1,
         };
         let prev = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
@@ -1918,6 +2505,7 @@ mod tests {
             ..fp_now.clone()
         };
         let now = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_now,
@@ -1925,6 +2513,7 @@ mod tests {
             aggregate: a1,
         };
         let prev = EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: fp_prev,
@@ -1975,6 +2564,7 @@ mod tests {
         golden_hash: &str,
     ) -> EvalRun {
         EvalRun {
+            findings: Vec::new(),
             corpus: None,
             timestamp: Utc::now(),
             fingerprint: ConfigFingerprint {
@@ -2714,6 +3304,106 @@ enabled = true
         assert!(
             h.previous_compatible(&now).is_some(),
             "a run recorded before this field existed must still be comparable"
+        );
+    }
+
+    /// feature-52 の `findings` にも `corpus` と同じ 2 つの性質が要る:
+    /// ① field を持たない旧 history が読めること (無いと baseline を全部捨てる)
+    /// ② 所見の有無が `previous_compatible` を左右しないこと (左右すると、
+    ///    混入を報告した run だけ `--fail-on-regression` の比較対象を失う)。
+    #[test]
+    fn test_history_load_handles_old_json_without_findings_field() {
+        let json = r#"{
+            "runs": [{
+                "timestamp": "2026-07-28T00:00:00Z",
+                "fingerprint": {
+                    "model": "bge-small-en-v1.5",
+                    "reranker": null,
+                    "limit": 10,
+                    "k_values": [1, 5, 10],
+                    "golden_hash": "abc",
+                    "metric_version": 2
+                },
+                "per_query": [],
+                "aggregate": {
+                    "recall_at_k": {},
+                    "ndcg_at_k": {},
+                    "mrr": 0.0,
+                    "query_count": 0
+                }
+            }]
+        }"#;
+        let h: History = serde_json::from_str(json).expect("old history JSON must still load");
+        let prev = h.previous().expect("the run must survive the load");
+        assert!(prev.findings.is_empty());
+
+        let mut now = sample_run(200, 0.9);
+        now.fingerprint = prev.fingerprint.clone();
+        now.findings = vec![QuoteFinding {
+            check: CHECK_GOLDEN_QUERIES_QUOTED.to_string(),
+            path: "notes/leak.md".to_string(),
+            quoted: vec![
+                QuotedQuery {
+                    query_id: "a".to_string(),
+                    rank_in_top_k: Some(1),
+                },
+                QuotedQuery {
+                    query_id: "b".to_string(),
+                    rank_in_top_k: None,
+                },
+            ],
+        }];
+        assert!(
+            h.previous_compatible(&now).is_some(),
+            "reporting a finding must not cost the run its baseline"
+        );
+    }
+
+    /// 0 件でも key を出す。key の不在で表すと、消費側は「検査していない古い
+    /// 出力」と「検査して 0 件だった」を区別できない。
+    #[test]
+    fn test_format_json_always_carries_the_findings_key() {
+        let run = sample_run(100, 0.9);
+        let v = format_json(&run, None);
+        assert_eq!(v["findings"], serde_json::json!([]));
+
+        let mut with_finding = sample_run(200, 0.9);
+        with_finding.findings = vec![QuoteFinding {
+            check: CHECK_GOLDEN_QUERIES_QUOTED.to_string(),
+            path: "notes/leak.md".to_string(),
+            quoted: vec![
+                QuotedQuery {
+                    query_id: "a".to_string(),
+                    rank_in_top_k: Some(9),
+                },
+                QuotedQuery {
+                    query_id: "b".to_string(),
+                    rank_in_top_k: None,
+                },
+            ],
+        }];
+        let v = format_json(&with_finding, None);
+        assert_eq!(
+            v["findings"][0]["check"],
+            serde_json::json!("golden-queries-quoted")
+        );
+        assert_eq!(v["findings"][0]["path"], serde_json::json!("notes/leak.md"));
+        assert_eq!(
+            v["findings"][0]["quoted"][0]["rank_in_top_k"],
+            serde_json::json!(9)
+        );
+        // 「top_k に居ない」は欠測ではなく測った結果なので、key を落とさず
+        // null で出す (key の不在だと「順位を見ていない版」と区別できない)。
+        assert_eq!(
+            v["findings"][0]["quoted"][1]["rank_in_top_k"],
+            serde_json::Value::Null
+        );
+        assert!(
+            v["findings"][0]["quoted"][1]
+                .as_object()
+                .expect("quoted entry is an object")
+                .contains_key("rank_in_top_k"),
+            "the key itself must be present: {v}"
         );
     }
 

@@ -626,6 +626,8 @@ kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3
 
 出力: 集計指標 + 劣化 / ミスのあるクエリ行のみ。`--format json` で全クエリの詳細を取得可能。履歴は `<kb_path>/.kb-mcp-eval-history.json` に保存され、直近 10 件を diff 表示用に保持する。
 
+評価対象のナレッジベースの中に評価についてのノートを置いていると、そのノートが本来の正解と競合する。v0.24.0 からは各 run がコーパスを走査し、**2 件以上**の golden query を逐語で含む文書 (= golden セット *について* 書いたノートの形) を stderr に警告する (`--format json` では `findings`)。**報告のみで exit code は不変**。1 件では報告しない理由を含めた詳細は [docs/eval.ja.md](./docs/eval.ja.md)。
+
 CI 用途には `--fail-on-regression` (v0.6.0+) を渡す。直前の **fingerprint-compatible** run から `recall@k` / `MRR` / `ndcg@k` のいずれかが `regression_threshold` (既定 0.05) を超えて退化していたら exit code 1 を返す。golden YAML を更新すると hash が変わるので次回 run は比較対象外 = false positive にならない。
 
 Golden YAML のリファレンス、指標の詳細説明、diff 出力の読み方、トラブルシューティングは [docs/eval.ja.md](docs/eval.ja.md) 参照。

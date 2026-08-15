@@ -173,6 +173,77 @@ digest が対象にするのは**索引された chunk** であってソース�
 この記録が入る前の run は corpus を持たず、「変わった」とは決して報告されない。
 最初の 1 回で corpus が書かれ、次の run から通常どおり比較される。
 
+### コーパスが golden セットを引用している場合 (v0.24.0+)
+
+評価対象のナレッジベース**そのものの中**に評価についてのノートを置くと、その
+ノートが検索結果になる。golden query の文面を逐語で引用したノートは、その
+クエリに対する最強の一致になるので上位を占め、本来の正解を押し下げる。
+**golden について書くほど golden が通りにくくなる。**
+
+各 run はこれをコーパス全体から探し、**stderr** に報告する。exit code は動かさない:
+
+```
+kb-mcp eval: 1 document(s) quote 2 or more golden queries verbatim (golden-queries-quoted).
+  engineering/deep-dive/rag/evaluation.md
+    torch-compile (not in top_k)
+    cross-encoder-reranker (rank 8)
+  Either these notes leaked into the corpus, or the queries came from them
+  and the documents belong in `expected`. kb-mcp eval changes neither.
+```
+
+同じ内容は `--format json` の `findings` にも載る。**何も無くても空配列として
+必ず出す** — 「検査して 0 件」と「検査していない古い版」を消費側が区別できるようにする:
+
+```json
+"findings": [
+  {
+    "check": "golden-queries-quoted",
+    "path": "engineering/deep-dive/rag/evaluation.md",
+    "quoted": [
+      { "query_id": "torch-compile", "rank_in_top_k": null },
+      { "query_id": "cross-encoder-reranker", "rank_in_top_k": 8 }
+    ]
+  }
+]
+```
+
+`rank_in_top_k` が `null` なのは、引用しているがその query の `top_k` には
+出ていない場合 = コーパスには居るが、まだ枠を奪ってはいない、という意味。
+
+**どちらの原因なのかは報告しない。** 判定できないからである。query を逐語で含む
+文書は、テストについて書いたノートか、そうでなければ **query の出典**であり、
+後者ならその文書はその query の `expected` に入るべきで、直すのは golden の方に
+なる。どちらかを知っているのは golden を書いた人だけで、`eval` はどちらも変更しない。
+
+**なぜ「2 件以上」で、1 件ではないのか。** 1 件の逐語一致は何の証拠にもならない。
+golden query の多くは `cross-encoder` / `torch.compile` のような**トピック名**で、
+それを解説する文書に出てくるのは当たり前だからである。662 文書 / 26 golden の
+健全なコーパスで実測したところ、**1 件でも報告する規則では 8 件が挙がり全部が
+偽陽性**だったのに対し、**1 文書に distinct な query が 2 件以上を要求すると
+ちょうど 1 件** — 実際に golden の中身を書いていたノートだけが挙がった。
+複数の golden query を引用している文書は「テストについてのノート」の形をしており、
+1 件しか含まない文書は「そのトピックについての文書」の形をしている。
+
+知っておくとよい帰結が 2 つある:
+
+- 空白正規化後 **12 文字**未満の query は照合対象にしない。短い query は偶然
+  多数の文書に含まれる。この値は同じ実測で両側から挟めている: 8 でも 12 でも
+  結果は同じで、16 にすると真陽性が消える。
+- 照合は**索引されたテキストフィールド 1 つの中**で行い、走査する対象は
+  **全文検索が索引している列とちょうど同じ** — chunk の見出し・パンくず・本文の
+  3 つである。この一致が選定規則そのもので、探しているのは「正解を押しのけ得る
+  テキスト」なのだから、押しのける力を持つ列を過不足なく覆う必要がある。
+  見出しが要るのは、Markdown parser が見出し行を本文から取り除き、かつ検索が
+  見出しを**本文より重く**索引するため。パンくずが要るのは、その先頭が
+  **frontmatter か無ければファイル名**由来の title であり、他の 2 つのどちらにも
+  現れないため (索引時に contextual indexing が無効ならパンくずは空なので、
+  その場合は走査しても何も増えない)。何も連結しないので継ぎ目をまたぐ引用は
+  見つからないが、これは意図的な選択である — 連結すると継ぎ目の両側にある
+  無関係な文が 1 つの引用に見えてしまう。
+
+走査は索引済み chunk 本文の 1 パスで、検索と**同じ read スナップショット**の中で
+走る。したがって指標を出したのとまったく同じ index について報告する。
+
 ## 設定
 
 `kb-mcp.toml` の `[eval]` セクション (すべて省略可能):

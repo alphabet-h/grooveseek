@@ -708,6 +708,69 @@ impl Database {
         Ok((documents, chunks, digest))
     }
 
+    /// 索引済みの検索対象テキストを `(path, text)` で 1 パス流す (feature-52)。
+    ///
+    /// `kb-mcp eval` の golden query 混入検出が、コーパス全体に対して逐語一致を
+    /// 探すために使う。**照合規則そのものはここに持たない** — 何を「含む」と
+    /// みなすか (正規化・最小長・件数の閾値) は `eval` 側の純粋関数が全部持ち、
+    /// この関数は行を渡すだけにする。規則が db と eval に分かれると、query 側と
+    /// 本文側で別々に育って静かに食い違う。
+    ///
+    /// **chunk ごとに 1 回ではなく、検索対象フィールドごとに 1 回呼ぶ。**
+    /// 流すのは `fts_chunks` が索引している 3 列 (`heading` / `context` /
+    /// `content`) と同じもので、**この一致が唯一の選定規則**である。
+    /// 探しているのは「検索で正解を押しのけ得るテキスト」なので、
+    /// 押しのける力を持つ列と走査する列がずれた時点で嘘になる。
+    ///
+    /// 3 列がそれぞれ別に要る理由は、どれも他の 2 つに現れないテキストを持つから:
+    ///
+    /// - `heading` — Markdown parser は見出し行を content から**取り除いて**
+    ///   ここに入れる (`parser/markdown.rs`)。しかも FTS は heading を本文より
+    ///   重く索引する。content だけを見ると、golden query を `##` 見出しに
+    ///   並べたノート (テストを記録する最も自然な形) が丸ごと見えない
+    /// - `context` — パンくずの先頭は **frontmatter の title、無ければ
+    ///   ファイル名**である (`markdown.rs` の `[title, ...ancestry, heading]`)。
+    ///   title は heading でも content でもないので、ここを飛ばすと
+    ///   「title にだけ query が入っている文書」が見えない。contextual indexing
+    ///   が off の索引では空なので、その場合は自動的に何も増えない
+    ///
+    /// 連結せずフィールドごとに渡すのは、見出しの末尾と本文の先頭が隣接した
+    /// 1 つの文字列に見えるのを避けるため (chunk をまたがない理由と同じ)。
+    ///
+    /// 行順は `(path, chunk_index)` で固定する。呼び出し側は集約するので順序に
+    /// 依存しないが、実行計画依存の順序で流すと**再現しないバグを作れる**ように
+    /// なるだけで、得るものが無い。
+    ///
+    /// 呼び出し側が read transaction を開いていればその上で流れる
+    /// (`eval::run` は run 全体を 1 スナップショットに固定している)。
+    pub fn for_each_indexed_text<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&str, &str),
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.path, c.heading, c.context_text, c.content
+             FROM chunks c
+             JOIN documents d ON d.id = c.document_id
+             ORDER BY d.path, c.chunk_index",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let heading: Option<String> = row.get(1)?;
+            let context: Option<String> = row.get(2)?;
+            let content: String = row.get(3)?;
+            for text in [heading.as_deref(), context.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter(|t| !t.is_empty())
+            {
+                f(&path, text);
+            }
+            f(&path, &content);
+        }
+        Ok(())
+    }
+
     /// 既存ドキュメントのパスを書き換える。
     /// `chunks` / `vec_chunks` / `fts_chunks` は `document_id` 経由で紐付いて
     /// いるため、`documents.path` のみを UPDATE すれば embedding の再計算は
