@@ -594,26 +594,49 @@ fn query_id(q: &GoldenQuery) -> String {
 
 /// 走査対象になる query を `(golden 内の index, 正規化済み文面)` で返す。
 /// 短すぎる query はここで落ちる。
-pub fn quote_needles(golden: &[GoldenQuery]) -> Vec<(usize, String)> {
-    golden
-        .iter()
-        .enumerate()
-        .filter_map(|(i, q)| {
-            let n = normalize_for_quote(&q.query);
-            (n.chars().count() >= MIN_QUERY_CHARS).then_some((i, n))
-        })
-        .collect()
+///
+/// **正規化後に同じ文面になる golden entry は 1 件にまとめる。** golden loader は
+/// query 文の重複を弾かないので、大文字小文字や空白だけが違う 2 件をそのまま
+/// 別々に数えると、**1 回の引用が 2 件に見えて 2 件閾値を自分で満たす** —
+/// この閾値が防ぐために存在している偽陽性が、閾値の数え方から生まれる。
+pub fn quote_needles(golden: &[GoldenQuery]) -> Vec<QuoteNeedle> {
+    let mut needles: Vec<QuoteNeedle> = Vec::new();
+    for (i, q) in golden.iter().enumerate() {
+        let text = normalize_for_quote(&q.query);
+        if text.chars().count() < MIN_QUERY_CHARS {
+            continue;
+        }
+        match needles.iter_mut().find(|n| n.text == text) {
+            Some(existing) => existing.golden.push(i),
+            None => needles.push(QuoteNeedle {
+                text,
+                golden: vec![i],
+            }),
+        }
+    }
+    needles
+}
+
+/// 走査対象の query 1 件ぶん。正規化後の文面が同じ golden entry は
+/// ここで 1 件に畳まれている ([`quote_needles`])。
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuoteNeedle {
+    /// 正規化済みの文面。
+    pub text: String,
+    /// この文面を持つ golden entry の index。先頭が報告に使う代表。
+    /// 空にはならない。
+    pub golden: Vec<usize>,
 }
 
 /// コーパス全体を 1 パス走査し、各文書が逐語で含んでいた needle を
-/// **golden 内の index** で返す。1 つも含まない文書は返さない。
+/// **`needles` 内の index** で返す。1 つも含まない文書は返さない。
 ///
-/// 照合は索引された**テキストフィールド単位** (chunk 本文と見出しをそれぞれ
-/// 別に見る)、集約は文書単位。理由は
+/// 照合は索引された**テキストフィールド単位** (chunk 本文・見出し・パンくずを
+/// それぞれ別に見る)、集約は文書単位。理由は
 /// [`crate::db::Database::for_each_indexed_text`] の doc comment を参照。
 pub fn scan_quoted_documents(
     db: &crate::db::Database,
-    needles: &[(usize, String)],
+    needles: &[QuoteNeedle],
 ) -> Result<Vec<(String, Vec<usize>)>> {
     if needles.is_empty() {
         return Ok(Vec::new());
@@ -622,9 +645,9 @@ pub fn scan_quoted_documents(
         std::collections::BTreeMap::new();
     db.for_each_indexed_text(|path, text| {
         let hay = normalize_for_quote(text);
-        for (gi, needle) in needles {
-            if hay.contains(needle.as_str()) {
-                found.entry(path.to_string()).or_default().insert(*gi);
+        for (ni, needle) in needles.iter().enumerate() {
+            if hay.contains(needle.text.as_str()) {
+                found.entry(path.to_string()).or_default().insert(ni);
             }
         }
     })?;
@@ -636,18 +659,22 @@ pub fn scan_quoted_documents(
 
 /// 走査結果に規則を当てて所見にする。DB を触らない純粋関数。
 ///
-/// `per_query` は `golden` と **同じ順**であることを前提にする ([`run`] の
-/// ループがそう作る)。順位の注記にしか使わないので、欠けていても所見は出る。
+/// `scan` が持つのは `needles` 内の index。`per_query` は `golden` と **同じ順**
+/// であることを前提にする ([`run`] のループがそう作る)。順位の注記にしか
+/// 使わないので、欠けていても所見は出る。
 pub fn detect_quoted_queries(
     golden: &[GoldenQuery],
+    needles: &[QuoteNeedle],
     scan: &[(String, Vec<usize>)],
     per_query: &[QueryResult],
 ) -> Vec<QuoteFinding> {
     let mut findings = Vec::new();
     for (path, quoted_indices) in scan {
         let mut quoted = Vec::new();
-        for &gi in quoted_indices {
-            let Some(q) = golden.get(gi) else { continue };
+        for &ni in quoted_indices {
+            let Some(needle) = needles.get(ni) else {
+                continue;
+            };
             // その query の正解として挙がっている文書が query 語を含むのは
             // 当たり前で、混入ではない。数えると全 golden が所見になる。
             //
@@ -659,9 +686,23 @@ pub fn detect_quoted_queries(
             // 規則の粒度が揃わない。取りこぼす形は
             // 「heading 指定された正解文書の別章に、その query が引用されている」
             // で、これは承知の上の代償。
-            if q.expected.iter().any(|e| &e.path == path) {
+            //
+            // 同じ文面の golden entry が複数あるときは、**どれか 1 つでもこの
+            // 文書を正解にしていれば免除する**。文面が同じなら「この文書は
+            // この言い回しの正解である」は等しく成り立つ。
+            let exempt = needle.golden.iter().any(|&gi| {
+                golden
+                    .get(gi)
+                    .is_some_and(|q| q.expected.iter().any(|e| &e.path == path))
+            });
+            if exempt {
                 continue;
             }
+            // 報告は代表 entry の名前と順位で行う。
+            let Some(&gi) = needle.golden.first() else {
+                continue;
+            };
+            let Some(q) = golden.get(gi) else { continue };
             let rank_in_top_k = per_query
                 .get(gi)
                 .and_then(|r| r.top_k.iter().find(|h| &h.path == path))
@@ -1352,7 +1393,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     // 「その run が測ったコーパス」ではないものを報告することになる。
     let needles = quote_needles(&gs.queries);
     let scan = scan_quoted_documents(&db, &needles)?;
-    let findings = detect_quoted_queries(&gs.queries, &scan, &per_query);
+    let findings = detect_quoted_queries(&gs.queries, &needles, &scan, &per_query);
 
     // 固定はここまで。read-only なので rollback は「何も書いていない」の宣言。
     snapshot_tx.rollback()?;
@@ -1456,9 +1497,42 @@ mod tests {
         );
 
         let needles = quote_needles(&golden);
-        let ids: Vec<usize> = needles.iter().map(|(i, _)| *i).collect();
-        assert_eq!(ids, vec![2, 3], "短い 2 件が落ちて長い 2 件だけが残る");
-        assert_eq!(needles[1].1, "cross-encoder reranking", "正規化して渡す");
+        let ids: Vec<Vec<usize>> = needles.iter().map(|n| n.golden.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![vec![2], vec![3]],
+            "短い 2 件が落ちて長い 2 件だけが残る"
+        );
+        assert_eq!(needles[1].text, "cross-encoder reranking", "正規化して渡す");
+    }
+
+    /// 正規化後に同じ文面になる golden entry は 1 件に畳む。畳まないと、
+    /// **1 回の引用が 2 件に数えられて 2 件閾値を自分で満たす** — この閾値が
+    /// 防ぐために存在している偽陽性が、閾値の数え方から生まれる
+    /// (codex review round 4)。golden loader は query 文の重複を弾かない。
+    #[test]
+    fn test_quote_needles_folds_queries_that_normalize_to_the_same_text() {
+        let golden = vec![
+            golden_q("a", "cross-encoder reranking", &[]),
+            // 大文字小文字と空白だけが違う = 正規化すると同一。
+            golden_q("a-dup", "Cross-Encoder   Reranking", &[]),
+            golden_q("b", "torch.compile guide", &[]),
+        ];
+        let needles = quote_needles(&golden);
+        assert_eq!(needles.len(), 2, "3 entry が 2 needle に畳まれる");
+        assert_eq!(
+            needles[0].golden,
+            vec![0, 1],
+            "重複は 1 つの needle に集まる"
+        );
+        assert_eq!(needles[1].golden, vec![2]);
+
+        // その 1 文面を 1 回引用しただけの文書は所見にならない。
+        let scan = vec![("notes/topic.md".to_string(), vec![0])];
+        assert!(
+            detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
+            "one quotation of one wording must not satisfy a two-query threshold"
+        );
     }
 
     /// 1 件しか含まない文書は報告しない。golden query の多くは `cross-encoder`
@@ -1470,11 +1544,12 @@ mod tests {
             golden_q("a", "cross-encoder reranking", &[]),
             golden_q("b", "torch.compile guide", &[]),
         ];
+        let needles = quote_needles(&golden);
         let one = vec![("notes/topic.md".to_string(), vec![0])];
-        assert!(detect_quoted_queries(&golden, &one, &[]).is_empty());
+        assert!(detect_quoted_queries(&golden, &needles, &one, &[]).is_empty());
 
         let two = vec![("notes/about-the-eval.md".to_string(), vec![0, 1])];
-        let findings = detect_quoted_queries(&golden, &two, &[]);
+        let findings = detect_quoted_queries(&golden, &needles, &two, &[]);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].check, CHECK_GOLDEN_QUERIES_QUOTED);
         assert_eq!(findings[0].path, "notes/about-the-eval.md");
@@ -1495,8 +1570,9 @@ mod tests {
             golden_q("b", "torch.compile guide", &[]),
         ];
         // 2 件含んでいるが、片方は自分の正解なので 1 件ぶんしか数えない。
+        let needles = quote_needles(&golden);
         let scan = vec![("notes/both.md".to_string(), vec![0, 1])];
-        assert!(detect_quoted_queries(&golden, &scan, &[]).is_empty());
+        assert!(detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty());
     }
 
     /// 免除は **`expected` が heading を指していても文書単位**。狭める案は
@@ -1519,9 +1595,10 @@ mod tests {
         // その文書は query a の正解 (章まで指定) で、query b も引用している。
         // 章単位の免除にすると a も数えて 2 件 = 所見になるが、
         // 「正解の文書の別の章にトピック名が出ている」は混入の証拠ではない。
+        let needles = quote_needles(&golden);
         let scan = vec![("notes/topic.md".to_string(), vec![0, 1])];
         assert!(
-            detect_quoted_queries(&golden, &scan, &[]).is_empty(),
+            detect_quoted_queries(&golden, &needles, &scan, &[]).is_empty(),
             "a document that answers the query is not evidence of a leak, \
              whichever section of it was labelled"
         );
@@ -1539,8 +1616,9 @@ mod tests {
             result_with_hits("a", &["other.md", "notes/leak.md"]),
             result_with_hits("b", &["other.md"]),
         ];
+        let needles = quote_needles(&golden);
         let scan = vec![("notes/leak.md".to_string(), vec![0, 1])];
-        let findings = detect_quoted_queries(&golden, &scan, &per_query);
+        let findings = detect_quoted_queries(&golden, &needles, &scan, &per_query);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].quoted[0].rank_in_top_k, Some(2));
         assert_eq!(findings[0].quoted[1].rank_in_top_k, None);

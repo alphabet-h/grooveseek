@@ -121,6 +121,13 @@ change nothing.
   rule does not have, since both the finding and the threshold are per document.
   The cost is a genuine quote sitting in another section of a document that
   answers the same query, which goes unreported.
+- Golden entries whose queries **normalize to the same text are folded into one**
+  before counting. The golden loader does not reject duplicate query text, and
+  counting near-duplicates separately would let a single quotation satisfy the
+  two-query threshold on its own — manufacturing exactly the false positive the
+  threshold exists to prevent. A folded query is exempt for a document if *any*
+  of the entries sharing that wording expects it: if the wording is the same,
+  "this document is a labelled answer for this wording" is equally true.
 - There is no way to silence an intentional quote. With the report costing
   nothing but a line on stderr, an allow-list would mostly be a way to make a
   real leak permanent. It can be added later without breaking anything if the
