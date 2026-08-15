@@ -265,6 +265,47 @@ mod tests {
         Registry::from_enabled(&["md".to_string()]).expect("md registry")
     }
 
+    /// A directory that outlives one `Database` so a test can **close and
+    /// reopen** the file. Reopening is the whole point for the vector-table
+    /// checks: `Database::open` runs the forward migrations, and what those do
+    /// to a damaged database is exactly what is under test.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let p = crate::test_support::unique_temp_path(&format!("kb-mcp-doctor-{prefix}"));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+        fn db(&self) -> String {
+            self.0.join("t.db").to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seed(db: &Database) {
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("meta");
+        let doc = db
+            .upsert_document(
+                "notes/a.md",
+                Some("A"),
+                None,
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                12,
+            )
+            .expect("upsert");
+        db.insert_chunk(doc, 0, Some("H"), None, "body", None, &vec![0.1; 384], 1.0)
+            .expect("chunk");
+    }
+
     fn db_with_one_chunk() -> Database {
         let db = Database::open_in_memory().expect("open");
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
@@ -370,26 +411,61 @@ mod tests {
         assert_eq!(f.samples, vec!["notes/a.md".to_string()]);
     }
 
-    /// codex P1 round 1. With `vec_chunks` gone, the two scans that compare
-    /// against it have nothing to scan and answer clean — so without a finding
-    /// of its own, an index whose vector search returns *nothing* passes.
+    /// codex P1 round 1 + P2 round 2. Two ways to lose the vector table, and
+    /// they do **not** produce the same report — because `Database::open` runs
+    /// the migrations, and one of them puts the table back.
+    ///
+    /// The first version of this test dropped the table on an already-open
+    /// database, which no caller does: the CLI opens the file it was handed.
+    /// It passed while the finding was unreachable through the actual command.
     #[test]
-    fn losing_the_vector_table_entirely_is_not_a_clean_bill() {
-        let db = db_with_one_chunk();
-        db.execute_for_test("DROP TABLE vec_chunks").expect("drop");
+    fn losing_the_vector_table_is_reported_by_whichever_check_can_see_it() {
+        let dir = TempDir::new("vec-loss");
+        {
+            let db = Database::open(&dir.db()).expect("open");
+            seed(&db);
+            db.execute_for_test("DROP TABLE vec_chunks").expect("drop");
+        }
 
+        // (a) The embedding metadata survived, so opening the file **recreates**
+        //     the table, empty. `vector-table-missing` cannot fire — and does
+        //     not need to, because every chunk now reads as missing its
+        //     embedding, which is just as loud.
+        {
+            let db = Database::open(&dir.db()).expect("reopen");
+            let report = run(&db, &registry_md()).expect("run");
+            let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
+            assert!(
+                !checks.contains(&"vector-table-missing"),
+                "the migration put the table back, so this is not what is wrong: {checks:?}"
+            );
+            let f = report
+                .findings
+                .iter()
+                .find(|f| f.check == "missing-embedding")
+                .expect("every chunk lost its embedding and must be reported");
+            assert_eq!(f.count, 1);
+            db.execute_for_test(
+                "DROP TABLE vec_chunks;
+                 DELETE FROM index_meta WHERE key IN ('embedding_model', 'embedding_dim')",
+            )
+            .expect("drop table and meta");
+        }
+
+        // (b) Metadata gone too, so nothing recreates it. Now both per-chunk
+        //     scans have nothing to scan and answer clean — the case that would
+        //     otherwise report a healthy index while vector search returns
+        //     nothing at all.
+        let db = Database::open(&dir.db()).expect("reopen");
         let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
             .find(|f| f.check == "vector-table-missing")
-            .expect("a missing vector table must be reported");
+            .expect("a vector table that stays missing must be reported");
         assert_eq!(f.severity, Severity::Error);
         assert_eq!(f.count, 1, "it names how many chunks are stranded");
-        assert!(
-            !report.is_clean(),
-            "an index whose vector search returns nothing is not clean"
-        );
+        assert!(!report.is_clean());
     }
 
     /// The companion: an index with no chunks *and* no vector table is a fresh

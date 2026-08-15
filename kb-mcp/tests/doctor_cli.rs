@@ -104,6 +104,33 @@ fn a_broken_index_exits_one_and_names_the_check() {
     );
 }
 
+/// codex P2 round 2: `require_kb_path` used to run before the exit-code
+/// mapping, so the most ordinary setup mistake — no `--kb-path` anywhere —
+/// exited 1, the code reserved for "inspected it, found something".
+#[test]
+fn no_kb_path_at_all_exits_two_rather_than_looking_like_a_finding() {
+    let layout = TempKbLayout::new("kb-mcp-doctor-nokbpath");
+    // An explicit config with no `kb_path`, so the result does not depend on
+    // whether the machine running the test happens to have one discoverable.
+    let cfg = layout.root().join("kb-mcp.toml");
+    std::fs::write(&cfg, "model = \"bge-small-en-v1.5\"\n").expect("write config");
+
+    let out = Command::new(kb_mcp_bin())
+        .args(["--config", &cfg.to_string_lossy(), "doctor"])
+        .output()
+        .expect("kb-mcp doctor");
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        2,
+        "a missing --kb-path is a failure to run, not a finding"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--kb-path is required"),
+        "the reason belongs on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn a_missing_index_exits_two_rather_than_reporting_a_clean_bill() {
     // "I could not look" and "I looked and found nothing" are different

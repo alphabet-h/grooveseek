@@ -1009,8 +1009,18 @@ fn main() -> anyhow::Result<()> {
             print_graph(g, format);
         }
         Commands::Doctor { kb_path, format } => {
-            let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let exit = run_doctor(&kb_path, &cfg, format)?;
+            // `require_kb_path` inside the mapping, not before it (codex P2
+            // round 2): a missing --kb-path is the most ordinary way for this
+            // command to fail to run, and letting `?` carry it to `main` would
+            // exit 1 — the code the contract reserves for a completed
+            // inspection that found something.
+            let exit = match require_kb_path(kb_path, cfg.kb_path.clone()) {
+                Ok(kb_path) => run_doctor(&kb_path, &cfg, format)?,
+                Err(e) => {
+                    eprintln!("kb-mcp doctor: {e:#}");
+                    2
+                }
+            };
             std::process::exit(exit);
         }
         Commands::Validate {
