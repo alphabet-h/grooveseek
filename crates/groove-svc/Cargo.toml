@@ -1,0 +1,24 @@
+[package]
+name = "groove-svc"
+version = "0.25.0"
+edition = "2024"
+description = "Windows hidden-console launcher for groove.exe serve (v0.9.1 hot-fix for visible terminal window via Task Scheduler)"
+authors = ["koshian"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alphabet-h/grooveseek"
+homepage = "https://github.com/alphabet-h/grooveseek"
+# Internal crate (= used only as a child binary in the Windows Task Scheduler
+# Action). publish = false avoids the crates.io readme/metadata validation.
+publish = false
+
+# cargo-dist per-crate target gating: groove-svc.exe is Windows-only because its
+# entire purpose is to side-step Windows' console subsystem allocation. The
+# Linux / macOS build path is a fail-fast stub (`fn main()` exits 1) so the
+# crate compiles cleanly on all hosts but only ships in the Windows zip.
+[package.metadata.dist]
+dist = true
+targets = ["x86_64-pc-windows-msvc"]
+
+[[bin]]
+name = "groove-svc"
+path = "src/main.rs"

@@ -2,7 +2,7 @@
 
 > **English**: [retrieval-pipeline.md](./retrieval-pipeline.md)
 
-`kb-mcp` がクエリ実行時に走らせる完全なパイプラインを解説する。v0.7.0+ で追加された MMR 多様性再ランクと parent retriever 展開のチューニング指針も含む。
+`groove` がクエリ実行時に走らせる完全なパイプラインを解説する。v0.7.0+ で追加された MMR 多様性再ランクと parent retriever 展開のチューニング指針も含む。
 
 ## 全景
 
@@ -73,13 +73,13 @@ match_spans  → top-`limit` SearchHit を
 
 回帰ガードは絶対時間ではなく**倍率**を固定しているので、機械や SQLite 版が変わっても意味を保つ (`bu03_or_expansion_stays_within_a_small_multiple_of_a_single_phrase`)。
 
-RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `kb-mcp.toml` の `[search.fusion]` で設定できる (ビルトイン既定値は `rrf_k = 60.0`、`heading / context / content = 2.0 / 1.0 / 1.0`)。実測の裏付けが無い限り触らないこと — この 2 つのつまみが自分の KB で検索品質をどれだけ (あるいは全く) 動かさないかは `kb-mcp tune` が報告する。詳細は [eval.ja.md](./eval.ja.md) を参照。
+RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `groove.toml` の `[search.fusion]` で設定できる (ビルトイン既定値は `rrf_k = 60.0`、`heading / context / content = 2.0 / 1.0 / 1.0`)。実測の裏付けが無い限り触らないこと — この 2 つのつまみが自分の KB で検索品質をどれだけ (あるいは全く) 動かさないかは `groove tune` が報告する。詳細は [eval.ja.md](./eval.ja.md) を参照。
 
-`kb-mcp eval` が既定で測定するのはこの段。ここを底上げするとパイプライン全体の floor が上がる。
+`groove eval` が既定で測定するのはこの段。ここを底上げするとパイプライン全体の floor が上がる。
 
 ## Stage 2 — Reranker (任意, v0.1.0+)
 
-`--reranker` (または `kb-mcp.toml` の `[reranker]`) を設定すると、上位 RRF 候補を cross-encoder で再スコアして返す。`score` 列は RRF から reranker raw score に切り替わる。
+`--reranker` (または `groove.toml` の `[reranker]`) を設定すると、上位 RRF 候補を cross-encoder で再スコアして返す。`score` 列は RRF から reranker raw score に切り替わる。
 
 **MMR が enabled なとき**は reranker に **より大きい候補プール** (`limit × 5`、最小 50) を流して多様性再ランクの操作余地を確保する。MMR off のときは reranker への入力 limit が `limit` (または reranker のみ on の場合は `limit × 5`、これは v0.7.0 以前の reranker overfetch を保つ) になる。Parent retriever は **プールを拡大しない** — 既に選択されたヒットに対する content-only 段なので、`--parent-retriever` 単独 on のとき reranker 負荷は変わらない。
 
@@ -106,12 +106,12 @@ RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `kb-mcp.toml` �
 | `lambda` | `0.7` | off-topic な結果が混じると言われたとき (関連度寄り) | 範囲を広く取りたい (top-1 関連度を犠牲にしてでも) とき |
 | `same_doc_penalty` | `0.0` | 長い章持ちの 1 doc が top-k を支配する KB | 0 のままで OK (similarity 項が大半の重複削減を担当する) |
 
-**Eval signal**: MMR を on にして `kb-mcp eval` を再走させる。期待される動き:
+**Eval signal**: MMR を on にして `groove eval` を再走させる。期待される動き:
 - `recall@1` 軽く ↓ (MMR は厳密な top-1 を多様性のために手放しうる)
 - 1 query に複数 expected doc がある golden set では `recall@5` / `recall@10` が ↑ (多様性項によって異なる doc が top-k に入りやすくなる)
 - `nDCG@10` は混合 — golden ファイルが多様性を重視するか集中した関連度を重視するかに依存
 
-**アンチパターン**: MMR enabled + `lambda = 1.0` は MMR off と等価だが少しだけ遅い (類似度キャッシュは動く)。その場合は MMR を off にすべき — kb-mcp はこの footgun を検知すると warn を出す (実効 MMR off だが lambda override が指定されている)
+**アンチパターン**: MMR enabled + `lambda = 1.0` は MMR off と等価だが少しだけ遅い (類似度キャッシュは動く)。その場合は MMR を off にすべき — groove はこの footgun を検知すると warn を出す (実効 MMR off だが lambda override が指定されている)
 
 ## Stage 4 — Parent retriever (任意, v0.7.0+)
 
@@ -134,7 +134,7 @@ RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `kb-mcp.toml` �
 
 **`token_count` が NULL の行**: v0.7.0 以前の index では `chunks.token_count` が NULL。Parent retriever はこれらの行に `len(content) / 4` フォールバックを使う (indexer 側の estimator と整合)。これがないと cap が silent に bypass される (元の codex が見つけたバグ。`tests/search_parent_integration.rs` で固定済み)
 
-**Eval signal**: Parent retriever は recall/MRR/nDCG を**変えない** — これらの metric は `content` を見ない。ユーザに見える content quality だけが変わる。`kb-mcp eval` の数値ではなく、LLM answer 品質を before / after で比較する (手動 or LLM-judge ハーネス)
+**Eval signal**: Parent retriever は recall/MRR/nDCG を**変えない** — これらの metric は `content` を見ない。ユーザに見える content quality だけが変わる。`groove eval` の数値ではなく、LLM answer 品質を before / after で比較する (手動 or LLM-judge ハーネス)
 
 ## 構成 & 順序の根拠
 
@@ -158,10 +158,10 @@ RRF の定数と bm25 の 3 つの列重みは、v0.13.0 以降 `kb-mcp.toml` �
 
 ## Eval を踏まえたチューニング ワークフロー
 
-1. 両方 off で baseline を取る (`kb-mcp eval`)
+1. 両方 off で baseline を取る (`groove eval`)
 2. MMR を on にして再走、recall@k / nDCG@k を比較。あなたの golden set にとって多様性のトレードオフが妥当か判断
 3. 独立に parent retriever を on (MMR は off) にして再走。recall/nDCG はほぼ変わらないはず。変わったら bug 報告 — parent retriever は設計上 content-only 段
 4. 両方 on にして v0.7.0 のリファレンス eval を実行
-5. `<kb>/.kb-mcp-eval-history.json` に記録される `ConfigFingerprint` でこれら 4 種を区別できるので、フラグを倒すだけでいつでも再走できる
+5. `<kb>/.groove-eval-history.json` に記録される `ConfigFingerprint` でこれら 4 種を区別できるので、フラグを倒すだけでいつでも再走できる
 
 具体的な eval-baseline ノートのテンプレは repo 内の `.dev/knowledge/eval-baseline-2026-04-27.md` を参照 (private notes、format は `CLAUDE.local.md` に記載)。

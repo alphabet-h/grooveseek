@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ai-knowledge": {
+      "type": "stdio",
+      "command": "C:/absolute/path/to/groove.exe",
+      "args": ["serve", "--kb-path", "C:/absolute/path/to/knowledge-base"]
+    }
+  }
+}

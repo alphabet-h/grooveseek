@@ -1,0 +1,46 @@
+# Personal local deployment — groove.toml
+#
+# Place this file either next to your groove binary (priority 4 — global)
+# or in your project root (priority 2 — per-project, commit alongside .mcp.json).
+# See README.md / README.ja.md in this directory for the full setup steps.
+
+# Absolute path to your knowledge base directory.
+# .groove.db will land at <kb_path>/../.groove.db automatically.
+kb_path = "/absolute/path/to/your/knowledge-base"
+
+# Embedding model. Switch to "bge-m3" for Japanese / multilingual KBs
+# (slower / larger first download, but markedly better recall on non-English text).
+model = "bge-small-en-v1.5"
+
+# Cross-encoder reranker. Left commented out so the first run does not pull a
+# ~2.3 GB model. While this key is absent the server loads no reranker, and
+# the MCP search parameter `rerank: true` is a silent no-op. Uncomment both
+# lines to load it at startup and let clients opt in per query.
+# reranker = "bge-v2-m3"
+# rerank_by_default = false
+
+# Share the ONNX model cache across groove invocations on this machine.
+# Defaults to your OS cache dir (e.g. ~/.cache/fastembed on Linux); set
+# explicitly here if you want a project-local cache or to share with other
+# tools that already cache HF models in HF hub layout.
+# fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
+
+# Indexing extensions. ["md"] is the default. Add "txt" if your KB also
+# contains plain-text notes (each .txt becomes a single chunk titled from
+# the filename).
+[parsers]
+enabled = ["md"]
+
+# File watcher (auto re-index on edits). Default 500 ms debounce is fine
+# for typing; bump to 1000-2000 ms if you do lots of `git pull`-style
+# bursts and want to coalesce them.
+[watch]
+enabled = true
+debounce_ms = 500
+
+# Quality filter — drops boilerplate / heading-only stubs from search
+# results. Disable only if you have a reason (e.g. you're tagging stubs
+# intentionally as TODO markers).
+[quality_filter]
+enabled = true
+threshold = 0.3

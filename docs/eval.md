@@ -1,4 +1,4 @@
-# `kb-mcp eval` — Retrieval quality evaluation
+# `groove eval` — Retrieval quality evaluation
 
 > **日本語版**: [eval.ja.md](./eval.ja.md)
 
@@ -7,14 +7,14 @@
 You only need this subcommand if you want to **compare retrieval quality across
 model/config changes** or **guard against regressions when tuning**.
 
-Regular users running `kb-mcp index` + `kb-mcp serve` **never need to touch this**.
+Regular users running `groove index` + `groove serve` **never need to touch this**.
 `eval` is an independent, opt-in subcommand. Without a golden file, it does
 nothing but print an error with a hint.
 
 ## What it does
 
 Given a small file of "questions with known answers" (*golden queries*),
-`kb-mcp eval` runs each question through the same hybrid search used by the
+`groove eval` runs each question through the same hybrid search used by the
 MCP `search` tool, then computes how well the returned chunks match what you
 expected. On the second run onwards it diffs against the previous run, so you
 can see whether a config change improved or regressed quality.
@@ -23,7 +23,7 @@ can see whether a config change improved or regressed quality.
 
 ### 1. Write a golden file
 
-Place it at `<kb>/.kb-mcp-eval.yml`:
+Place it at `<kb>/.groove-eval.yml`:
 
 ```yaml
 queries:
@@ -42,13 +42,13 @@ queries:
 ### 2. Run
 
 ```bash
-kb-mcp eval --kb-path ./knowledge-base
+groove eval --kb-path ./knowledge-base
 ```
 
 Output:
 
 ```
-kb-mcp eval — 2026-04-24T14:32:01+09:00
+groove eval — 2026-04-24T14:32:01+09:00
   model: bge-m3    reranker: none    limit: 10    queries: 2
 
 Aggregate
@@ -194,12 +194,12 @@ Every run scans the indexed corpus for this and reports what it finds on
 **stderr**, leaving the exit code alone:
 
 ```
-kb-mcp eval: 1 document(s) quote 2 or more golden queries verbatim (golden-queries-quoted).
+groove eval: 1 document(s) quote 2 or more golden queries verbatim (golden-queries-quoted).
   engineering/deep-dive/rag/evaluation.md
     torch-compile (not in top_k)
     cross-encoder-reranker (rank 8)
   Either these notes leaked into the corpus, or the queries came from them
-  and the documents belong in `expected`. kb-mcp eval changes neither.
+  and the documents belong in `expected`. groove eval changes neither.
 ```
 
 The same findings are in `--format json` under `findings`, as an array that is
@@ -263,11 +263,11 @@ from.
 
 ## Configuration
 
-All knobs are optional in `kb-mcp.toml`:
+All knobs are optional in `groove.toml`:
 
 ```toml
 [eval]
-golden = ".kb-mcp-eval.yml"    # default: <kb_path>/.kb-mcp-eval.yml
+golden = ".groove-eval.yml"    # default: <kb_path>/.groove-eval.yml
 history_size = 10              # default: 10
 k_values = [1, 5, 10]          # default: [1, 5, 10]
 regression_threshold = 0.05    # default: 0.05
@@ -277,7 +277,7 @@ CLI flags override config values. Recognized flags: `--golden`, `--k 1,5,10`,
 `--model`, `--reranker`, `--limit`, `--format text|json`, `--no-history`,
 `--no-diff`, `--no-color`, `--fail-on-regression`. Pipeline flags (v0.7.0+):
 `--mmr <bool>` / `--mmr-lambda <0..1>` / `--mmr-same-doc-penalty <0..1>` /
-`--parent-retriever <bool>` — exact same semantics as on `kb-mcp search`,
+`--parent-retriever <bool>` — exact same semantics as on `groove search`,
 see [retrieval-pipeline.md](./retrieval-pipeline.md) for what each knob does.
 
 ### `--fail-on-regression` (CI gate)
@@ -285,7 +285,7 @@ see [retrieval-pipeline.md](./retrieval-pipeline.md) for what each knob does.
 Exit with code 1 if any aggregate metric (`recall@k` for any k, `MRR`, or
 `ndcg@k` for any k) regressed from the previous **compatible** run by more
 than `regression_threshold` (default 0.05; tune via `[eval].regression_threshold`
-in `kb-mcp.toml`). "Compatible" means the previous run had the same
+in `groove.toml`). "Compatible" means the previous run had the same
 fingerprint — `model`, `reranker`, `limit`, `k_values`, the golden YAML's
 content hash, the metric implementation version, and (v0.7.0+) the effective
 `[search.mmr]` / `[search.parent_retriever]` settings, plus (v0.13.0+) a
@@ -322,8 +322,8 @@ recorded for the next comparison.
 Typical CI shape:
 
 ```yaml
-- name: kb-mcp eval gate
-  run: kb-mcp eval --kb-path knowledge-base --fail-on-regression
+- name: groove eval gate
+  run: groove eval --kb-path knowledge-base --fail-on-regression
 ```
 
 The flag is a no-op when there is no previous run yet, when `--no-history`
@@ -334,8 +334,8 @@ when the previous run's fingerprint differs.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `no golden file at ...` | Missing golden YAML | Create `.kb-mcp-eval.yml` or pass `--golden <path>` |
-| `No index found at ...` | KB not indexed | Run `kb-mcp index --kb-path <kb>` first |
+| `no golden file at ...` | Missing golden YAML | Create `.groove-eval.yml` or pass `--golden <path>` |
+| `No index found at ...` | KB not indexed | Run `groove index --kb-path <kb>` first |
 | `✗ <id>  recall@N: 0.00` (per-query) | Nothing the query retrieved matched this entry's `expected` paths — often a typo, a path that was never indexed, or a genuinely missed document | Check the path spelling, then search for a phrase you know is *inside* that document and look at the `path` of the hits (searching for the path itself proves nothing: FTS indexes `heading` / `context` / `content`, and the embeddings do not include the path either). A real miss is a retrieval result, not a config error |
 | `golden changed since last run, diff disabled` | Golden file edited | Expected; the next run will diff normally |
 | Model mismatch error | `--model` does not match the indexed model | Pass the model used for indexing, or re-index |
@@ -353,26 +353,26 @@ when the previous run's fingerprint differs.
 - **Sweeps / matrices over models**: to compare embedding models, run `eval`
   twice against two separately indexed databases — one `eval` run measures one
   index. (Sweeping the *fusion* parameters against a single index is supported:
-  that is `kb-mcp tune`, described in the next section.)
+  that is `groove tune`, described in the next section.)
 - **Mandatory adoption**: running `eval` does not change anything about
   `index` / `serve` / `search`. It is a purely auxiliary tool
 
-## `kb-mcp tune` — measuring the fusion parameters (v0.13.0+)
+## `groove tune` — measuring the fusion parameters (v0.13.0+)
 
-`kb-mcp eval` tells you how good retrieval is. `kb-mcp tune` tells you whether
+`groove eval` tells you how good retrieval is. `groove tune` tells you whether
 the two fusion knobs (`rrf_k` and the three bm25 column weights) can move that
 number **on your KB at all**. It applies nothing — the output is either a
 paste-ready `[search.fusion]` snippet or the conclusion that the built-in
 defaults should stay.
 
 ```bash
-kb-mcp tune --kb-path knowledge-base
-kb-mcp tune --kb-path knowledge-base --format json > tune.json
+groove tune --kb-path knowledge-base
+groove tune --kb-path knowledge-base --format json > tune.json
 ```
 
 ### What it needs from your golden set
 
-Since v0.16.0 kb-mcp compiles a query into per-token phrases joined with `OR`
+Since v0.16.0 groove compiles a query into per-token phrases joined with `OR`
 (see [retrieval-pipeline.md](./retrieval-pipeline.md)), so **a query no longer
 has to occur verbatim in the text to reach the bm25 stage** — each of its
 fragments can match on its own, which is what makes a natural-language golden
@@ -396,7 +396,7 @@ runs that actually reach the grid — whenever the KB was indexed with
 about the index rather than about the parameter:
 
 ```
-kb-mcp tune: WARNING — every chunk has an empty context column, so the
+groove tune: WARNING — every chunk has an empty context column, so the
 bm25_context_weight axis is a no-op on this KB (contextual retrieval is off).
 Its rows below mean "not measured", not "has no effect".
 ```
@@ -488,11 +488,11 @@ average gain.
 
 `tune` always measures the plain RRF stage with **no reranker**, so a gain it
 finds has not been shown to survive the full pipeline. If you get an `adopt`
-verdict, paste the snippet into `kb-mcp.toml` and re-run `eval` with your real
+verdict, paste the snippet into `groove.toml` and re-run `eval` with your real
 configuration before keeping it:
 
 ```bash
-kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3 --no-history
+groove eval --kb-path knowledge-base --reranker bge-v2-m3 --no-history
 ```
 
 Compare against the same command run with `[search.fusion]` removed. If the

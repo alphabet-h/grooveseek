@@ -1,6 +1,8 @@
 # Changelog
 
-All notable changes to kb-mcp are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to GrooveSeek are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+**This project was named `kb-mcp` through v0.25.0.** Entries for those versions are left as they were written, and their release assets are still published under that name, so `kb-mcp`, `kb-mcp.toml` and `.kb-mcp.db` below all refer to this project before the rename. See [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md).
 
 Each heading's date is the date its `vX.Y.Z` tag was created, **in the timezone of whoever created it** — that offset is stored in the tag object, so no conversion is involved. Verify with:
 
@@ -12,11 +14,48 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — the project is now GrooveSeek, and the command is `groove`.**
+  The old name collided inside its own category (`github.com/moikas-code/kb-mcp`
+  is also a knowledge-base MCP server) and bound the product to one of the two
+  ways it is read — a browser opening `/ui` is the other. The rename lands now
+  because the name is written into your filesystem, and after 1.0.0 changing it
+  would mean carrying a "look for the old name too" layer for all of 1.x.
+  Reasoning and the candidates that were measured and rejected:
+  [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md).
+
+  **There is no automatic migration, and no aliases.** A 0.26.0 binary does not
+  see anything left by 0.25.0. To carry an install over:
+
+  | Old | New |
+  |---|---|
+  | `kb-mcp` (command) | `groove` |
+  | `kb-mcp.toml` | `groove.toml` |
+  | `.kb-mcp.db` | `.groove.db` |
+  | `.kb-mcpignore` | `.grooveignore` |
+  | `.kb-mcp-eval-history.json` | `.groove-eval-history.json` |
+  | `.kb-mcp-eval.yml` | `.groove-eval.yml` |
+  | `KB_MCP_CONFIG_HOME` | `GROOVE_CONFIG_HOME` |
+  | `KB_MCP_TRAY_LOG` | `GROOVE_TRAY_LOG` |
+  | `KB_MCP_BIN` | `GROOVE_BIN` |
+  | `KBMCP_BENCH_KB` | `GROOVE_BENCH_KB` |
+  | `kb-mcp-svc` / `kb-mcp-tray` | `groove-svc` / `groove-tray` |
+  | `<config_dir>/kb-mcp/<service>/` | `<config_dir>/groove/<service>/` |
+
+  Renaming the files is enough — the formats did not change, so the index does
+  not need rebuilding. A service registered by `kb-mcp service install` must be
+  uninstalled with the **old** binary before `groove service install` is run;
+  the new binary does not know the old registration exists.
+
+  `.mcp.json` entries need their `"command"` updated to `groove`. The MCP server
+  now identifies itself as `grooveseek` in `serverInfo.name`.
+
 ### Fixed
 
 - **The watcher missed every file inside a directory that was newly created
   under the knowledge base — on Linux.** Copy a folder of notes into a watched
-  KB and its contents stayed unindexed until the next full `kb-mcp index`; the
+  KB and its contents stayed unindexed until the next full `groove index`; the
   directory event arrived, the files' did not.
 
   This is not a debounce or a deadline: the events are **unobservable**. inotify
@@ -33,7 +72,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   failure.
 
   What gets indexed is decided by the **full index walk's** filter, now reachable
-  for a subtree, so a directory drop and a later `kb-mcp index` agree. The count
+  for a subtree, so a directory drop and a later `groove index` agree. The count
   is logged: a directory drop is never a silent bulk index.
 
 ## [0.25.0] - 2026-08-16

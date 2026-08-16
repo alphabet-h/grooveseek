@@ -13,19 +13,19 @@ CLAUDE.local.md
 .playwright-mcp/
 .mcp.json
 
-# Runtime config placed next to the binary (user-local). Template is kb-mcp.toml.example.
-kb-mcp.toml
+# Runtime config placed next to the binary (user-local). Template is groove.toml.example.
+groove.toml
 
 # Generated SQLite DB files (one per kb_path.parent()). Bench fixtures under
-# tests/fixtures/kb-bench/ generate `.kb-mcp.db` next to them when indexed.
-**/.kb-mcp.db
+# tests/fixtures/kb-bench/ generate `.groove.db` next to them when indexed.
+**/.groove.db
 
-# Deployment recipe templates under kb-mcp/examples/deployments/ are meant to be
+# Deployment recipe templates under grooveseek/examples/deployments/ are meant to be
 # committed (they are example artifacts, not user-local runtime files).
 # (feature-44 PR-1 / codex P3 round 3 on PR #61): updated path after workspace
-# split moved examples/ to kb-mcp/examples/.
-!kb-mcp/examples/deployments/**/.mcp.json
-!kb-mcp/examples/deployments/**/kb-mcp.toml
+# split moved examples/ to grooveseek/examples/.
+!grooveseek/examples/deployments/**/.mcp.json
+!grooveseek/examples/deployments/**/groove.toml
 
 # /codex-review skill working directory (= per-round baseline JSON snapshots)
 .codex-review-tmp/

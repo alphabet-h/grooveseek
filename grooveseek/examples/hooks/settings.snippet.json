@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "groove index"
+          }
+        ]
+      }
+    ]
+  }
+}

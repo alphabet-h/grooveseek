@@ -17,18 +17,18 @@ Markdown / プレーンテキスト / PDF / Office 文書のナレッジベー�
 ## ビルド・テスト
 
 ```bash
-cargo build --release                    # release バイナリ: target/release/kb-mcp(.exe)
+cargo build --release                    # release バイナリ: target/release/groove(.exe)
 cargo check                              # 型検査のみ (高速)
 cargo test                               # 軽量テスト (embedding DL 不要なもののみ)
 cargo test -- --ignored                  # 実モデル DL を伴う embedding / reranker テスト
                                          # (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker-v2-m3 ~2.3 GB)
 ```
 
-Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リンクされるため**追加の DLL は不要**。SQLite も `rusqlite` の `bundled` feature で同梱。
+Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リンクされるため**追加の DLL は不要**。SQLite も `rusqlite` の `bundled` feature で同梱。
 
 ## 主要サブコマンド
 
-`index` / `status` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service`。フラグの詳細、`kb-mcp.toml` 設定、`.mcp.json` 接続例は README を参照。
+`index` / `status` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service`。フラグの詳細、`groove.toml` 設定、`.mcp.json` 接続例は README を参照。
 
 ## CLI 出力規約 (= stdout/stderr の責務分離)
 
@@ -36,28 +36,28 @@ Windows では `kb-mcp.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 [AGENTS.md](./AGENTS.md) の "Results go to stdout, diagnostics to stderr" に
 置いた。**ここに残すのは「どこに何があるか」の索引と、実際に踏んだ罠**:
 
-`kb-mcp` の各 subcommand は出力先を以下の規約で使い分ける:
+`groove` の各 subcommand は出力先を以下の規約で使い分ける:
 
 - **stdout** = そのコマンドの結果の出力先 (既定形式はコマンドごとに違う: `search` / `graph` は json、`eval` / `tune` / `validate` / `doctor` は text)
-  - `kb-mcp search` の結果 (`print_search_results`)
-  - `kb-mcp eval` の golden query 評価結果
-  - `kb-mcp tune` の sweep 結果
-  - `kb-mcp validate` のレポート (`print_validate_report`)
-  - `kb-mcp doctor` のレポート (`print_doctor_report`)
-  - `kb-mcp graph` の connection graph (`print_graph`)
+  - `groove search` の結果 (`print_search_results`)
+  - `groove eval` の golden query 評価結果
+  - `groove tune` の sweep 結果
+  - `groove validate` のレポート (`print_validate_report`)
+  - `groove doctor` のレポート (`print_doctor_report`)
+  - `groove graph` の connection graph (`print_graph`)
 - **stderr** = status / progress / 診断 (= 人間向けの進捗 / warning / error)
-  - `kb-mcp index` の `Indexing ...` / `Done in ...` 進捗
-  - `kb-mcp status` の `Documents: N` / `Chunks: N` 統計
+  - `groove index` の `Indexing ...` / `Done in ...` 進捗
+  - `groove status` の `Documents: N` / `Chunks: N` 統計
   - すべての warning / info / error メッセージ (`tracing` / `eprintln!`)
 
-**新規 subprocess test を書く時の注意**: subcommand の出力先を `kb-mcp/src/main.rs` の `Commands::*` block で必ず先に grep 確認すること。その際 **`println!` だけでなく `print!` も** 対象にする (`eval` / `tune` の text 分岐は `print!`)。また **arm が直接書かず helper (`print_search_results` / `print_graph` / `print_validate_report` / `print_doctor_report`) に委譲している場合がある**。stdout に CLI 結果を書くのは上記 6 subcommand だけで、`index` / `status` / `service` は stderr のみ (= F-67 で `kb-mcp status` を stdout から読もうとして fail した過去あり)。`serve` は CLI 出力を持たないが、stdio transport では **MCP プロトコルが stdout を使う**点に注意。
+**新規 subprocess test を書く時の注意**: subcommand の出力先を `grooveseek/src/main.rs` の `Commands::*` block で必ず先に grep 確認すること。その際 **`println!` だけでなく `print!` も** 対象にする (`eval` / `tune` の text 分岐は `print!`)。また **arm が直接書かず helper (`print_search_results` / `print_graph` / `print_validate_report` / `print_doctor_report`) に委譲している場合がある**。stdout に CLI 結果を書くのは上記 6 subcommand だけで、`index` / `status` / `service` は stderr のみ (= F-67 で `groove status` を stdout から読もうとして fail した過去あり)。`serve` は CLI 出力を持たないが、stdio transport では **MCP プロトコルが stdout を使う**点に注意。
 
 ## 運用の細則
 
 - **`Cargo.lock` はコミットする** (binary crate)
-- **`.kb-mcp.db` はクライアントプロジェクト側の責務**。本リポジトリでは生成しない
+- **`.groove.db` はクライアントプロジェクト側の責務**。本リポジトリでは生成しない
 - **テストは 2 層構造**: 通常 `cargo test` では `#[ignore]` の embedding 実行テストはスキップされる。CI 等で検証したければ `-- --ignored` を付ける
-- **staging 禁止ファイル**: `.mcp.json` (ローカルパス)、`kb-mcp.toml` (ユーザ設定) は `.gitignore` 済み。テンプレートは `.mcp.json.example` / `kb-mcp.toml.example`
+- **staging 禁止ファイル**: `.mcp.json` (ローカルパス)、`groove.toml` (ユーザ設定) は `.gitignore` 済み。テンプレートは `.mcp.json.example` / `groove.toml.example`
 - **設計判断は ADR に残す**: ① 実際に選択肢を比較した ② 覆すのが高くつく ③ structure / 依存 / interface / 非機能特性に影響する — **3 つすべて**を満たす時だけ `docs/decisions/` に英日ペアで追加する。満たさないなら `CHANGELOG` で足りる。ADR を足したら、同じ理由を言い直している `CHANGELOG` / `README` / ソースコメントを要約 + リンクに削る。決定を覆す時は**編集せず**新 ADR を追加し、旧 ADR の status を `superseded by ADR-NNNN` にする。詳細は [ADR-0000](./docs/decisions/0000-record-decisions-as-adrs.ja.md)
 
 ## Embedding モデルのキャッシュ

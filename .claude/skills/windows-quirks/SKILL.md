@@ -1,11 +1,11 @@
 ---
 name: windows-quirks
-description: Twelve field-verified Windows pitfalls from kb-mcp release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
+description: Twelve field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
-# Windows Quirks (kb-mcp 蓄積罠集)
+# Windows Quirks (groove 蓄積罠集)
 
-kb-mcp を Windows (特に日本語 locale) 向けに開発する中で、公式 docs や codex review では検出できず**実機 dogfood で初めて発覚した**罠集。Windows 固有のコードパス (`kb-mcp/src/service/windows.rs`、`crates/kb-mcp-svc/`、subprocess 起動、CI/subagent の実行環境等) に触れる前に必ず目を通すこと。
+groove を Windows (特に日本語 locale) 向けに開発する中で、公式 docs や codex review では検出できず**実機 dogfood で初めて発覚した**罠集。Windows 固有のコードパス (`grooveseek/src/service/windows.rs`、`crates/groove-svc/`、subprocess 起動、CI/subagent の実行環境等) に触れる前に必ず目を通すこと。
 
 詳細な出典 note は `.dev/knowledge/` 配下 (**ローカル専用、git untracked のためリポジトリ外部からは参照不可**)。
 
@@ -15,7 +15,7 @@ kb-mcp を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **原因**: (a) 日本語 locale の schtasks は XML 宣言に関わらず UTF-16 LE BOM を要求 (docs は UTF-8/UTF-16 両対応と明記するが実機は乖離)、(b) schtasks CLI は root path (`\<name>`) への新規 `/Create` に admin elevation を要求 (docs に明示なし)、(c) `Register-ScheduledTask -Xml` parameter set は XML 内 `<Principal><UserId>` を auto-build しないため user-level では admin にフォールバックする。
 
-**正しいやり方**: XML 経路は捨てて `Register-ScheduledTask -Action -Trigger -Settings` (current logon identity から Principal を auto-build) を使う。実装は `kb-mcp/src/service/windows.rs` の `register_via_powershell()` を正とする。要点: ① Action/Trigger/Settings parameter set を使う (Principal が current logon identity から auto-build される)、② PowerShell 単一引用符リテラル内の path は `replace('\'', "''")` で escape、③ `$ErrorActionPreference='Stop'` で cmdlet 失敗を exit code に伝播、④ Action は `kb-mcp-svc.exe` に向け `serve` 引数を渡さない (svc 側が無条件付加、罠 2 参照)。
+**正しいやり方**: XML 経路は捨てて `Register-ScheduledTask -Action -Trigger -Settings` (current logon identity から Principal を auto-build) を使う。実装は `grooveseek/src/service/windows.rs` の `register_via_powershell()` を正とする。要点: ① Action/Trigger/Settings parameter set を使う (Principal が current logon identity から auto-build される)、② PowerShell 単一引用符リテラル内の path は `replace('\'', "''")` で escape、③ `$ErrorActionPreference='Stop'` で cmdlet 失敗を exit code に伝播、④ Action は `groove-svc.exe` に向け `serve` 引数を渡さない (svc 側が無条件付加、罠 2 参照)。
 
 **logon session 依存だが「CI では常に不可」ではない** (2026-07-26 訂正): SSH / NTLM logon session や subagent の実行環境からは `Register-ScheduledTask` が "Access is denied" になる。一方 **GitHub-hosted の windows-latest runner では成功する** — [公式仕様](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)どおり管理者権限 + UAC 無効でジョブが走るため。AU-09 (PR #83) の nightly windows leg で `windows_register_scheduledtask_smoke_test ... ok` を実測済み。
 
@@ -25,17 +25,17 @@ kb-mcp を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 ## 2. コンソール subsystem binary から subprocess を spawn すると黒窓が出る
 
-**症状**: `kb-mcp.exe serve` を Task Scheduler の AtLogOn trigger で起動すると、空の console window が常時表示される。`-WindowStyle Hidden` / `FreeConsole()` / `ShowWindow(SW_HIDE)` を試しても 1 秒程度のフラッシュが残る (microsoft/terminal#249、2018 年から未 fix の既知問題)。
+**症状**: `groove.exe serve` を Task Scheduler の AtLogOn trigger で起動すると、空の console window が常時表示される。`-WindowStyle Hidden` / `FreeConsole()` / `ShowWindow(SW_HIDE)` を試しても 1 秒程度のフラッシュが残る (microsoft/terminal#249、2018 年から未 fix の既知問題)。
 
-**原因**: `kb-mcp.exe` は console subsystem (cargo default) であり、Windows kernel が process 起動前に `conhost.exe` を allocate してしまう。親側から後付けで隠す手段は根本解決にならない。
+**原因**: `groove.exe` は console subsystem (cargo default) であり、Windows kernel が process 起動前に `conhost.exe` を allocate してしまう。親側から後付けで隠す手段は根本解決にならない。
 
-**正しいやり方**: `#![windows_subsystem = "windows"]` を付けた別 crate (kb-mcp では `crates/kb-mcp-svc/`) を用意し、そこから `Command::new(...).creation_flags(0x0800_0000 /* CREATE_NO_WINDOW */).spawn(...)` で本体 binary を child として起動する。GUI subsystem 化 flag を本体 crate に直接付けると CLI / MCP stdio / test との両立が崩れるため、別 crate 分離が最も clean。
+**正しいやり方**: `#![windows_subsystem = "windows"]` を付けた別 crate (groove では `crates/groove-svc/`) を用意し、そこから `Command::new(...).creation_flags(0x0800_0000 /* CREATE_NO_WINDOW */).spawn(...)` で本体 binary を child として起動する。GUI subsystem 化 flag を本体 crate に直接付けると CLI / MCP stdio / test との両立が崩れるため、別 crate 分離が最も clean。
 
 出典: `.dev/knowledge/feature-44-summary.md` 罠 11
 
 ## 3. subagent が spawn したバックグラウンドプロセスは session idle で死ぬ
 
-**症状**: subagent が `run_in_background` の Bash や、そこから起動した子プロセス (例: `kb-mcp.exe index --force` のような長時間処理) を、foreground の 10 分 tool timeout 後もバックグラウンドで生かし続けようとしても、subagent 自身の session が (他 agent からのメッセージ待ち等で) idle になった瞬間、子プロセスごと刈られる。
+**症状**: subagent が `run_in_background` の Bash や、そこから起動した子プロセス (例: `groove.exe index --force` のような長時間処理) を、foreground の 10 分 tool timeout 後もバックグラウンドで生かし続けようとしても、subagent 自身の session が (他 agent からのメッセージ待ち等で) idle になった瞬間、子プロセスごと刈られる。
 
 **原因 (推測)**: Windows 上で subagent の実行環境がプロセスジョブオブジェクト単位で子プロセスを管理しており、session idle → 実行環境の一時停止/解放のタイミングでジョブに紐づく子孫プロセスが丸ごと terminate される。controller (メイン session 寄りの立場) 側の background 実行では同種の長時間プロセスでも生存する、という明確な非対称性がある。
 
@@ -206,7 +206,7 @@ CP932 は valid UTF-8 ではない (`0x93` は継続バイト域、`0xfa` は不
 
 したがって **`encoding_rs` の新規依存は要らない**。
 
-**採るべき形** (`kb-mcp/src/service/powershell.rs` / `crates/kb-mcp-tray/src/powershell.rs`):
+**採るべき形** (`grooveseek/src/service/powershell.rs` / `crates/groove-tray/src/powershell.rs`):
 
 1. 前置は **spawn 点 1 箇所**に適用する。script builder 側ではない — パイプのエンコーディングは「子をどう読むか」の性質であって script の内容ではないし、spawn 点が 1 つなら後から script を足しても漏れない
 2. decode を **2 種類に分ける**。ここが肝:

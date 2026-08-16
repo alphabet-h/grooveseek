@@ -17,7 +17,7 @@ name: Nightly
 # workflow_dispatch も付けてあるので、依存 bump 後やリリース前に手動トリガ
 # 可能。`gh workflow run nightly.yml` で起動できる。
 #
-# F-38 (2026-04-29 audit) で導入。eval regression detection は kb-mcp eval
+# F-38 (2026-04-29 audit) で導入。eval regression detection は groove eval
 # 側に --fail-on-regression flag を入れる別 PR で追加予定。
 
 on:
@@ -127,7 +127,7 @@ jobs:
             fastembed-v4-${{ runner.os }}-
 
       # cold cache のとき、複数の integration test binary が **別プロセス** と
-      # して同時に kb-mcp を spawn し、HuggingFace hub の同一 blob lock を
+      # して同時に groove を spawn し、HuggingFace hub の同一 blob lock を
       # 奪い合って "Lock acquisition failed" で落ちる。ci.yml には PR #71 で
       # 同じ pre-warm が入ったが nightly には無く、model cache が 10 GB LRU で
       # 追い出された夜に顕在化する (2026-07-26 の dry-run で ubuntu / windows
@@ -327,7 +327,7 @@ jobs:
       # The floor is **per file** (`--fail-under-file-lines`, = fail if any one
       # file is below it), deliberately not the global `--fail-under-lines`.
       # The TOTAL here is not a quantity you can threshold honestly:
-      #   - 53.8% of the physical lines under kb-mcp/src are in-file
+      #   - 53.8% of the physical lines under grooveseek/src are in-file
       #     `#[cfg(test)] mod tests`, which is ~100% covered by construction and
       #     pulls the number *up*;
       #   - code reachable only from `#[ignore]` tests reads as 0% in this job,
@@ -350,7 +350,7 @@ jobs:
       #   - service/linux.rs     — the systemd backend is exercised only by
       #                            `#[ignore]` tests that touch the real user
       #                            session
-      #   - kb-mcp-tray/main.rs  — a 3-line Windows GUI entry point
+      #   - groove-tray/main.rs  — a 3-line Windows GUI entry point
       # `report` reuses the data collected above, so this costs seconds.
       - name: Enforce a per-file line-coverage floor
         shell: bash
@@ -361,7 +361,7 @@ jobs:
           # coverage data records it, which on this runner is POSIX. The same
           # command run on Windows matches nothing (the separators are
           # backslashes there) and reports the excluded files too.
-          IGNORE='(kb-mcp/src/transport/stdio\.rs|kb-mcp/src/service/linux\.rs|crates/kb-mcp-tray/src/main\.rs)$'
+          IGNORE='(grooveseek/src/transport/stdio\.rs|grooveseek/src/service/linux\.rs|crates/groove-tray/src/main\.rs)$'
           # cargo-llvm-cov exits 1 without naming the file that tripped the
           # floor, so name it here — a nightly failure has to be diagnosable
           # from the log without re-running a coverage build locally.

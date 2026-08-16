@@ -57,7 +57,7 @@ description: ブレスト → 仕様 → plan → 実装 → PR → codex review
 
 ### Phase 2 — Spec drafting + subagent self-review loop (内部、ユーザ非介在)
 
-spec を `.dev/specs/<feature-NN-name>.md` に起草する (kb-mcp の `CLAUDE.local.md` 規約)。
+spec を `.dev/specs/<feature-NN-name>.md` に起草する (groove の `CLAUDE.local.md` 規約)。
 
 その後 **subagent review loop** を回す:
 

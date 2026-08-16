@@ -1,4 +1,4 @@
-# `kb-mcp eval` — リトリーバル品質評価
+# `groove eval` — リトリーバル品質評価
 
 > **English**: [eval.md](./eval.md)
 
@@ -9,14 +9,14 @@
 - モデルや設定を変えたときに **retrieval の質がどう変わったか** を定量比較したい
 - チューニング中に「前より悪化していないか」を**回帰防止**として確認したい
 
-`kb-mcp index` + `kb-mcp serve` で普通に使う一般ユーザは **触る必要なし**。
+`groove index` + `groove serve` で普通に使う一般ユーザは **触る必要なし**。
 `eval` は独立した opt-in サブコマンドで、golden ファイルが無ければ hint 付きエラー
 を返すだけで他の挙動には一切影響しない。
 
 ## 何をするのか
 
 「想定される正解が分かっている質問」を並べた小さなファイル (*golden queries*)
-を用意すると、`kb-mcp eval` は MCP の `search` ツールと同じハイブリッド検索を
+を用意すると、`groove eval` は MCP の `search` ツールと同じハイブリッド検索を
 それぞれのクエリに対して実行し、上位結果が期待通りかを数値化する。2 回目以降は
 前回実行との diff を自動表示するため、設定変更の影響が可視化できる。
 
@@ -24,7 +24,7 @@
 
 ### 1. Golden ファイルを書く
 
-`<kb>/.kb-mcp-eval.yml` に配置:
+`<kb>/.groove-eval.yml` に配置:
 
 ```yaml
 queries:
@@ -43,13 +43,13 @@ queries:
 ### 2. 実行
 
 ```bash
-kb-mcp eval --kb-path ./knowledge-base
+groove eval --kb-path ./knowledge-base
 ```
 
 出力:
 
 ```
-kb-mcp eval — 2026-04-24T14:32:01+09:00
+groove eval — 2026-04-24T14:32:01+09:00
   model: bge-m3    reranker: none    limit: 10    queries: 2
 
 Aggregate
@@ -183,12 +183,12 @@ digest が対象にするのは**索引された chunk** であってソース�
 各 run はこれをコーパス全体から探し、**stderr** に報告する。exit code は動かさない:
 
 ```
-kb-mcp eval: 1 document(s) quote 2 or more golden queries verbatim (golden-queries-quoted).
+groove eval: 1 document(s) quote 2 or more golden queries verbatim (golden-queries-quoted).
   engineering/deep-dive/rag/evaluation.md
     torch-compile (not in top_k)
     cross-encoder-reranker (rank 8)
   Either these notes leaked into the corpus, or the queries came from them
-  and the documents belong in `expected`. kb-mcp eval changes neither.
+  and the documents belong in `expected`. groove eval changes neither.
 ```
 
 同じ内容は `--format json` の `findings` にも載る。**何も無くても空配列として
@@ -246,11 +246,11 @@ golden query の多くは `cross-encoder` / `torch.compile` のような**トピ
 
 ## 設定
 
-`kb-mcp.toml` の `[eval]` セクション (すべて省略可能):
+`groove.toml` の `[eval]` セクション (すべて省略可能):
 
 ```toml
 [eval]
-golden = ".kb-mcp-eval.yml"    # 既定: <kb_path>/.kb-mcp-eval.yml
+golden = ".groove-eval.yml"    # 既定: <kb_path>/.groove-eval.yml
 history_size = 10              # 既定: 10
 k_values = [1, 5, 10]          # 既定: [1, 5, 10]
 regression_threshold = 0.05    # 既定: 0.05
@@ -260,13 +260,13 @@ CLI フラグが config より優先。受理されるフラグ: `--golden`, `--
 `--model`, `--reranker`, `--limit`, `--format text|json`, `--no-history`,
 `--no-diff`, `--no-color`, `--fail-on-regression`。pipeline 系 (v0.7.0+):
 `--mmr <bool>` / `--mmr-lambda <0..1>` / `--mmr-same-doc-penalty <0..1>` /
-`--parent-retriever <bool>` — `kb-mcp search` と完全に同じ意味。各 knob の
+`--parent-retriever <bool>` — `groove search` と完全に同じ意味。各 knob の
 解説は [retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照。
 
 ### `--fail-on-regression` (CI gate)
 
 集計指標 (`recall@k` の各 k / `MRR` / `ndcg@k` の各 k) のうち少なくとも 1 つが
-**直前の compatible run** から `regression_threshold` (既定 0.05、`kb-mcp.toml`
+**直前の compatible run** から `regression_threshold` (既定 0.05、`groove.toml`
 の `[eval].regression_threshold` で調整) を超えて退化していた場合、exit code 1
 で終了する。"compatible" = 直前 run の fingerprint (`model` / `reranker` /
 `limit` / `k_values` / golden YAML の content hash / metric 実装 version、
@@ -301,8 +301,8 @@ golden YAML を更新した直後の run も同じ理由で比較対象外とな
 CI 例:
 
 ```yaml
-- name: kb-mcp eval gate
-  run: kb-mcp eval --kb-path knowledge-base --fail-on-regression
+- name: groove eval gate
+  run: groove eval --kb-path knowledge-base --fail-on-regression
 ```
 
 このフラグは「直前 run が無い」「`--no-history` を渡している」「`--no-diff`
@@ -312,8 +312,8 @@ CI 例:
 
 | 症状 | 原因 | 対処 |
 |---|---|---|
-| `no golden file at ...` | golden YAML が無い | `.kb-mcp-eval.yml` を作成するか `--golden <path>` を渡す |
-| `No index found at ...` | 未 index | `kb-mcp index --kb-path <kb>` を先に走らせる |
+| `no golden file at ...` | golden YAML が無い | `.groove-eval.yml` を作成するか `--golden <path>` を渡す |
+| `No index found at ...` | 未 index | `groove index --kb-path <kb>` を先に走らせる |
 | per-query の `✗ <id>  recall@N: 0.00` | そのクエリの検索結果が `expected` のどのパスにも一致しなかった (typo / 未 index / 本当に取りこぼした、のいずれか) | パスの綴りを確認し、その文書の **中身** にある語句で検索して hit の `path` を見る (パス文字列で検索しても確認にはならない: FTS が張るのは `heading` / `context` / `content` で、embedding にもパスは入らない)。本当の miss なら設定ミスではなく検索結果として扱う |
 | `golden changed since last run, diff disabled` | golden を編集した | 意図通り。次回以降は新 golden で diff される |
 | Model mismatch エラー | `--model` が index 作成時と違う | index 時と同じモデル or 再 index |
@@ -331,24 +331,24 @@ CI 例:
 - **モデルの Sweep / Matrix**: embedding モデルの比較は別々に index した DB を
   2 つ作って 2 回走らせる — 1 回の `eval` が測るのは 1 つの index だけ。
   (**fusion パラメータ**の sweep は 1 つの index に対して可能で、それが次節の
-  `kb-mcp tune`)
+  `groove tune`)
 - **必須化**: `eval` は `index` / `serve` / `search` の挙動を 1 バイトも変えない
 
-## `kb-mcp tune` — fusion パラメータを測る (v0.13.0+)
+## `groove tune` — fusion パラメータを測る (v0.13.0+)
 
-`kb-mcp eval` は「検索品質がどれくらい良いか」を教えてくれる。`kb-mcp tune` は
+`groove eval` は「検索品質がどれくらい良いか」を教えてくれる。`groove tune` は
 「2 つの fusion つまみ (`rrf_k` と bm25 列重み) が **そもそもその数値を動かせるのか**」
 を教えてくれる。tune は何も適用しない — 出力は貼り付け可能な `[search.fusion]`
 スニペットか、「既定値のままにすべき」という結論のどちらかである。
 
 ```bash
-kb-mcp tune --kb-path knowledge-base
-kb-mcp tune --kb-path knowledge-base --format json > tune.json
+groove tune --kb-path knowledge-base
+groove tune --kb-path knowledge-base --format json > tune.json
 ```
 
 ### golden セットに求められる条件
 
-v0.16.0 以降、kb-mcp はクエリを token 単位の phrase にコンパイルして `OR` で
+v0.16.0 以降、groove はクエリを token 単位の phrase にコンパイルして `OR` で
 結合するため ([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照)、
 **クエリが本文に逐語で出現しなくても bm25 段に到達する** — 断片ごとに単独で
 マッチできるので、自然文の golden セットもそもそも測定対象になる。それでも測る
@@ -369,7 +369,7 @@ pre-flight を先に走らせる:
 index についての説明:
 
 ```
-kb-mcp tune: WARNING — every chunk has an empty context column, so the
+groove tune: WARNING — every chunk has an empty context column, so the
 bm25_context_weight axis is a no-op on this KB (contextual retrieval is off).
 Its rows below mean "not measured", not "has no effect".
 ```
@@ -450,10 +450,10 @@ rank fusion は平均の改善の裏に per-query の劣化を隠すことが常
 
 tune は常に **reranker なし** の素の RRF 段を測る。したがって tune が見つけた改善が
 本番パイプラインでも残る保証は無い。`adopt` の判定が出たら、スニペットを
-`kb-mcp.toml` に貼った上で実構成の `eval` を回してから採用を決めること:
+`groove.toml` に貼った上で実構成の `eval` を回してから採用を決めること:
 
 ```bash
-kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3 --no-history
+groove eval --kb-path knowledge-base --reranker bge-v2-m3 --no-history
 ```
 
 `[search.fusion]` を外した状態の同じコマンドと比較する。rerank 後の数値が改善しない
