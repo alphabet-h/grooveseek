@@ -41,6 +41,26 @@ use crate::embedder::Embedder;
 use crate::indexer;
 use crate::parser::Registry;
 
+/// Print a watcher diagnostic, ASCII-escaped.
+///
+/// **Every** `watcher:` line in this file goes through here. A macro rather than
+/// a function so the call sites keep `format!` syntax, and defined this early
+/// because `macro_rules!` is textually scoped — a diagnostic added above this
+/// point would not compile, which is the cheapest possible enforcement.
+///
+/// One printer is the only way "diagnostics stay ASCII" (AGENTS.md) holds as an
+/// invariant rather than a habit. Escaping at the call sites was tried for two
+/// review rounds and kept losing: the subtree scan feeds already-existing
+/// printers, so "escape the lines this branch adds" has no stable boundary —
+/// every path that newly reaches an old `eprintln!` is a new stderr path.
+/// Asking one question in two places is also exactly how this file drifted
+/// twice before (AU-03, BU-19).
+macro_rules! wdiag {
+    ($($arg:tt)*) => {
+        eprintln!("{}", ascii_diag(&format!($($arg)*)))
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -167,7 +187,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                             match tx_clone.try_send(events) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    eprintln!(
+                                    wdiag!(
                                         "watcher: event channel full (capacity {WATCHER_CHANNEL_CAPACITY}); \
                                          dropping batch — handle_events is too slow or blocked. \
                                          Consider increasing kb-mcp resources or running rebuild_index manually."
@@ -180,7 +200,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                         }
                         Err(errs) => {
                             for e in errs {
-                                eprintln!("watcher: debouncer error: {e:?}");
+                                wdiag!("watcher: debouncer error: {e:?}");
                             }
                         }
                     },
@@ -188,7 +208,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                 let mut debouncer = match debouncer_result {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!(
+                        wdiag!(
                             "watcher: failed to create debouncer: {e} (retry in {}s)",
                             backoff.as_secs()
                         );
@@ -198,7 +218,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                     }
                 };
                 if let Err(e) = debouncer.watch(&kb_watch_path, RecursiveMode::Recursive) {
-                    eprintln!(
+                    wdiag!(
                         "watcher: failed to watch {}: {e} (retry in {}s)",
                         kb_watch_path.display(),
                         backoff.as_secs()
@@ -221,7 +241,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                 // failed `watch()` retries in the branch above, and a signal
                 // printed ahead of that would claim readiness the retry
                 // contradicts.
-                eprintln!(
+                wdiag!(
                     "watcher: watching {} (debounce {}ms)",
                     kb_watch_path.display(),
                     debounce.as_millis()
@@ -234,7 +254,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                 loop {
                     std::thread::park_timeout(probe_interval);
                     if !kb_watch_path.exists() {
-                        eprintln!(
+                        wdiag!(
                             "watcher: kb_path {} vanished, will retry",
                             kb_watch_path.display()
                         );
@@ -246,7 +266,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("failed to spawn watcher thread: {e}"))?;
 
-    eprintln!(
+    wdiag!(
         "watcher started ({:?} debounce, {:?})",
         debounce,
         state.registry.extensions()
@@ -330,11 +350,11 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
 /// messages readable; everything else becomes `\u{...}` or `\n`, which is
 /// lossless — two different paths never collapse into the same diagnostic.
 ///
-/// **This is not a sweep of the file.** Eight older watcher diagnostics still
-/// interpolate a path directly. Whether they should is a convention-wide
-/// decision about every diagnostic in the binary, not something to settle
-/// halfway inside a bug fix; what this branch owes is that the lines *it adds*
-/// obey the rule.
+/// Reached through [`wdiag!`], which every watcher diagnostic uses. Escaping at
+/// the call sites instead was tried for two review rounds and kept losing: the
+/// scan feeds already-existing printers ([`dispatch_reindex`] and friends), so
+/// "escape the lines this branch adds" has no stable boundary — every path that
+/// newly reaches an old `eprintln!` is a new stderr path. One printer, one rule.
 fn ascii_diag(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -379,14 +399,14 @@ fn reload_rules(state: &mut WatcherState) {
     state.rules = crate::exclusion::ExclusionRules::load(&state.kb_path, exclude_dirs);
     let name = crate::exclusion::IGNORE_FILE_NAME;
     match state.rules.ignore_file_patterns() {
-        Some(n) => eprintln!(
+        Some(n) => wdiag!(
             "watcher: reloaded {name} ({n} pattern{}). New events follow the new rules; \
              documents already indexed stay until the next full index run.",
             if n == 1 { "" } else { "s" }
         ),
-        None => eprintln!(
-            "watcher: {name} is gone or could not be read; only exclude_dirs applies now."
-        ),
+        None => {
+            wdiag!("watcher: {name} is gone or could not be read; only exclude_dirs applies now.")
+        }
     }
 }
 
@@ -595,7 +615,7 @@ fn should_process_parts(
     // Same fail-open rule as the symlink check above: a vanished file has no
     // link count, and this function gates deindexing as well as indexing.
     if crate::links::is_multiply_linked(full) {
-        eprintln!("watcher: {}", crate::links::refusal_reason(full));
+        wdiag!("watcher: {}", crate::links::refusal_reason(full));
         return false;
     }
     true
@@ -651,12 +671,9 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
             // Retrying inside the event loop would block it for an unbounded time
             // on a directory that may still be being written. The recoverable
             // truth is that a full index fixes it, so the message says so.
-            eprintln!(
-                "{}",
-                ascii_diag(&format!(
-                    "watcher: could not scan the new directory {rel}: {e}. \
-                     Its files stay unindexed until the next full `kb-mcp index`."
-                ))
+            wdiag!(
+                "watcher: could not scan the new directory {rel}: {e}. \
+                 Its files stay unindexed until the next full `kb-mcp index`."
             );
             return;
         }
@@ -674,7 +691,7 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
     // is still printed, the way the other watcher diagnostics do; making this
     // one call site escape differently is the "one question, two
     // implementations" shape the same file already got burned by twice.
-    eprintln!(
+    wdiag!(
         "watcher: a new directory arrived with {} indexable file{}; indexing \
          them (their own events are not delivered on Linux).",
         found.len(),
@@ -699,19 +716,19 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         &state.registry,
     ) {
         Ok(indexer::SingleResult::Updated { chunks }) => {
-            eprintln!("watcher: reindexed {rel} ({chunks} chunks)");
+            wdiag!("watcher: reindexed {rel} ({chunks} chunks)");
         }
         Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
         // (BU-20) The reason is already on stderr from the read; this says what
         // happened to the document, which the reason does not.
         Ok(indexer::SingleResult::Refused) => {
-            eprintln!("watcher: {rel} refused, index left as it was");
+            wdiag!("watcher: {rel} refused, index left as it was");
         }
         Ok(indexer::SingleResult::Skipped { reason }) => {
-            eprintln!("watcher: skipped {rel} ({reason})");
+            wdiag!("watcher: skipped {rel} ({reason})");
         }
         Err(e) => {
-            eprintln!("watcher: reindex {rel} failed: {e}");
+            wdiag!("watcher: reindex {rel} failed: {e}");
         }
     }
 }
@@ -719,9 +736,9 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
     let db = recover_db(state.db.lock());
     match indexer::deindex_single_file(&db, rel) {
-        Ok(true) => eprintln!("watcher: deindexed {rel}"),
+        Ok(true) => wdiag!("watcher: deindexed {rel}"),
         Ok(false) => { /* no-op: not in DB */ }
-        Err(e) => eprintln!("watcher: deindex {rel} failed: {e}"),
+        Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
 }
 
@@ -738,32 +755,32 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         &state.registry,
     ) {
         Ok(indexer::RenameOutcome::Renamed) => {
-            eprintln!("watcher: renamed {old_rel} -> {new_rel}");
+            wdiag!("watcher: renamed {old_rel} -> {new_rel}");
         }
         Ok(indexer::RenameOutcome::RenamedAndReindexed { chunks }) => {
-            eprintln!("watcher: renamed+reindexed {old_rel} -> {new_rel} ({chunks} chunks)");
+            wdiag!("watcher: renamed+reindexed {old_rel} -> {new_rel} ({chunks} chunks)");
         }
         Ok(indexer::RenameOutcome::OldPathMissing) => {
-            eprintln!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
+            wdiag!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
         }
         // (BU-20) Not "indexed": no row was created. Saying otherwise sends
         // whoever reads this log looking for a document that is not there.
         Ok(indexer::RenameOutcome::OldPathMissingAndRefused) => {
-            eprintln!("watcher: rename target {old_rel} not in DB, and {new_rel} was refused");
+            wdiag!("watcher: rename target {old_rel} not in DB, and {new_rel} was refused");
         }
         Ok(indexer::RenameOutcome::RenamedSizeCapped) => {
-            eprintln!(
+            wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
             );
         }
         // (BU-20) The reason is already on stderr from `read_for_index`; this
         // line says what happened to the document, which the reason does not.
         Ok(indexer::RenameOutcome::RenamedButRefused) => {
-            eprintln!(
+            wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
-        Err(e) => eprintln!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
+        Err(e) => wdiag!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
     }
 }
 
@@ -1398,6 +1415,24 @@ mod tests {
             vec![PathBuf::from("/tmp/a.md")],
         );
         assert!(matches!(classify(&evt), Classified::Ignore));
+    }
+
+    /// (codex P1 on PR #168) The escaping only holds if **every** diagnostic
+    /// goes through `wdiag!`. Nothing in the compiler notices a fresh
+    /// `eprintln!` with a `watcher:` message, and three review rounds were spent
+    /// on paths reaching stderr unescaped, so the invariant gets a guard.
+    #[test]
+    fn every_watcher_diagnostic_goes_through_the_escaping_printer() {
+        let src = include_str!("watcher.rs");
+        // Assembled at runtime: written as a literal, this needle would match
+        // its own source and the test would fail on itself (feature-51 shipped
+        // exactly that bug in a source-scanning test).
+        let needle = format!("{}{}!(\"watcher", "eprint", "ln");
+        assert!(
+            !src.contains(&needle),
+            "a watcher diagnostic bypasses wdiag!; stderr would carry unescaped \
+             text on a CP932 console"
+        );
     }
 
     /// (codex P1 on PR #168) Diagnostics stay ASCII so a CP932 console can read
