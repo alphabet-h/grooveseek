@@ -318,6 +318,24 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
 /// full index (`kb-mcp index` / MCP `rebuild_index`) まで残る — walk から消えた
 /// path を DB から落とすのは削除 pass の仕事で、watcher は個々のイベントしか
 /// 見ないため。ログでそう言う。
+/// Does this event kind mean the path **just arrived**, as opposed to changing
+/// in place?
+///
+/// Only an arrival can be hiding contents nobody has seen. `Classified::Reindex`
+/// deliberately lumps arrivals together with `Modify(Data/Metadata/Any)` because
+/// a file is re-read the same way either way — but a *directory* is not: walking
+/// one costs its whole subtree, and doing that on every metadata change would
+/// re-embed a large directory whenever its mtime moved (codex P2 on PR #168).
+///
+/// `Modify(Name(_))` counts: a rename into the knowledge base is an arrival, and
+/// its contents are as unseen as a fresh `mkdir`'s.
+fn is_arrival(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
 /// Is this event path the knowledge base's own `.kb-mcpignore`?
 ///
 /// The root's, and only the root's: a `sub/.kb-mcpignore` is not read, so a
@@ -379,6 +397,13 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 }
             }
             Classified::Reindex(paths) => {
+                // Only an event that means "this path just arrived" can be
+                // hiding contents (codex P2). `Classified::Reindex` also covers
+                // ordinary `Modify(Data/Metadata/Any)`, so scanning on all of
+                // them would walk and re-embed a large existing directory every
+                // time its mtime or permissions changed — enough work to block
+                // event handling and overflow the bounded channel, for nothing.
+                let arrived = is_arrival(&evt.event.kind);
                 for p in paths {
                     let Some(rel) = to_rel(&state.kb_path, p) else {
                         continue;
@@ -391,7 +416,11 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                     // `should_process`, and this must not be the one place that
                     // does otherwise.
                     if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()) {
-                        dispatch_new_directory(state, p, &rel);
+                        if arrived {
+                            dispatch_new_directory(state, p, &rel);
+                        }
+                        // A directory never had anything else to do here:
+                        // `should_process` rejects it on the extension filter.
                         continue;
                     }
                     if should_process(&rel, p, state) {
@@ -578,9 +607,18 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
         return;
     }
     // Say how many, so a directory drop is never a silent bulk index.
+    //
+    // The directory is deliberately **not** named here (codex P1 on PR #168):
+    // stderr is meant to stay ASCII (AGENTS.md), a knowledge base path is
+    // routinely not, and `dispatch_reindex` names every file on the very next
+    // lines — so interpolating it would buy nothing and cost mojibake on a
+    // CP932 console. Where a path is the only thing the message has to say, it
+    // is still printed, the way the other watcher diagnostics do; making this
+    // one call site escape differently is the "one question, two
+    // implementations" shape the same file already got burned by twice.
     eprintln!(
-        "watcher: {rel}/ appeared with {} indexable file{}; indexing them (their \
-         own events are not delivered on Linux).",
+        "watcher: a new directory arrived with {} indexable file{}; indexing \
+         them (their own events are not delivered on Linux).",
         found.len(),
         if found.len() == 1 { "" } else { "s" }
     );
@@ -1302,6 +1340,56 @@ mod tests {
             vec![PathBuf::from("/tmp/a.md")],
         );
         assert!(matches!(classify(&evt), Classified::Ignore));
+    }
+
+    /// (codex P2 on PR #168) A directory subtree is only walked when the
+    /// directory *arrived*. `Classified::Reindex` alone is not that signal — it
+    /// also carries `Modify(Data/Metadata/Any)`, so keying the scan off it would
+    /// re-walk and re-embed a large existing directory whenever its mtime or
+    /// permissions changed, with nothing new inside.
+    #[test]
+    fn only_arrival_events_can_be_hiding_directory_contents() {
+        for kind in [
+            EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Folder),
+            EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        ] {
+            assert!(is_arrival(&kind), "{kind:?} means the path just arrived");
+        }
+
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(
+                notify_debouncer_full::notify::event::DataChange::Any,
+            )),
+            EventKind::Modify(ModifyKind::Metadata(
+                notify_debouncer_full::notify::event::MetadataKind::Any,
+            )),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            assert!(
+                !is_arrival(&kind),
+                "{kind:?} changes a path in place; walking a subtree for it is \
+                 unbounded work for nothing"
+            );
+        }
+    }
+
+    /// The two halves have to stay related: every kind that is an arrival must
+    /// still classify as `Reindex`, or the scan is keyed off a branch that the
+    /// dispatcher never reaches and the Linux fix silently stops working.
+    #[test]
+    fn every_single_path_arrival_still_classifies_as_reindex() {
+        for kind in [
+            EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        ] {
+            let evt = mk_evt(kind, vec![PathBuf::from("/tmp/fresh")]);
+            assert!(
+                matches!(classify(&evt), Classified::Reindex(_)),
+                "{kind:?} must reach the Reindex arm"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
