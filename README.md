@@ -576,7 +576,20 @@ Flags:
 - `--exclude` — comma-separated paths to drop from results. The start path itself is always excluded.
 - `--dedup-by-path` — collapse same-path hits so each document appears at most once.
 - `--category` / `--topic` — apply category / topic filters to every hop.
-- `--format json|text` — same as `search`.
+- `--format json|text|dot|svg` — `json` (default) and `text` are the machine- and human-readable listings; `dot` and `svg` draw the walk (v0.25.0+, see below).
+
+#### Seeing the shape (`--format dot` / `--format svg`)
+
+`json` and `text` list the same nodes, but neither shows where the walk branched — which is the part worth looking at. Two drawing formats do:
+
+```bash
+kb-mcp graph --start notes/rag.md --format dot > graph.dot   # then: dot -Tsvg graph.dot
+kb-mcp graph --start notes/rag.md --format svg > graph.svg   # opens in any browser
+```
+
+`dot` is a [Graphviz](https://graphviz.org/) program: pipe it to `dot -Tsvg` / `-Tpng` / `-Tpdf`, open it in a DOT viewer, or paste it into one of the web ones. `svg` is a finished picture that needs nothing installed — kb-mcp lays it out itself, taking no drawing dependency, because the graph is a tree and a tree lays out in one pass.
+
+Both colour nodes by BFS depth, label edges with the similarity score, and **say so when a limit cut the walk short**, so a picture is never mistaken for the whole neighbourhood. For a wide graph the Graphviz route gives the more compact page; the built-in SVG stacks one row per leaf, so `--max-nodes` is the knob that keeps it readable.
 
 The output is a flat array of nodes with `parent_id` / `depth` / `score` so the consumer can reconstruct the tree if it wants. Good use cases: "give me 30 chunks of related context around this note for the LLM to read", or "walk two hops from this overview to see what topics it touches".
 

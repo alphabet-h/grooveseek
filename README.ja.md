@@ -568,7 +568,20 @@ kb-mcp graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
 - `--exclude` — 結果から除外するカンマ区切りパス。起点パス自身は常に除外される
 - `--dedup-by-path` — 同一パスのヒットをまとめて各ドキュメント最大 1 回に
 - `--category` / `--topic` — 各ホップにカテゴリ / トピックフィルタを適用
-- `--format json|text` — `search` と同じ
+- `--format json|text|dot|svg` — `json` (既定) と `text` は機械 / 人間向けの一覧、`dot` と `svg` は探索を図にする (v0.25.0+、下記)
+
+#### 形を見る (`--format dot` / `--format svg`)
+
+`json` も `text` も同じノードを並べるだけで、**どこで枝分かれしたか**を見せない。見る価値があるのはそこなので、図として出す形式を 2 つ用意した:
+
+```bash
+kb-mcp graph --start notes/rag.md --format dot > graph.dot   # dot -Tsvg graph.dot に渡す
+kb-mcp graph --start notes/rag.md --format svg > graph.svg   # ブラウザでそのまま開ける
+```
+
+`dot` は [Graphviz](https://graphviz.org/) のプログラム。`dot -Tsvg` / `-Tpng` / `-Tpdf` に渡すも、DOT ビューアで開くも、web のビューアに貼るも自由。`svg` は**何も入れていない環境でそのまま開ける**完成品で、kb-mcp が自前でレイアウトしている — **描画用の依存を取っていない**のは、このグラフが木であり、木なら 1 パスで配置できるから。
+
+どちらも BFS の深さで配色し、edge に類似度を書き、**上限で探索が打ち切られた場合はその旨を図に載せる** (図を全体像と誤解させないため)。横に広いグラフでは Graphviz 経由の方が紙面が締まる。組み込み SVG は葉 1 つにつき 1 行積むので、読める大きさに保つ調整は `--max-nodes` で行う。
 
 出力は `parent_id` / `depth` / `score` 付きのノードのフラット配列で、消費側で木を再構築できる。典型ユース: 「この note の周りの関連コンテキストを 30 チャンク LLM に読ませたい」「この overview から 2 ホップ辿ってどのトピックに触れているか見たい」。
 

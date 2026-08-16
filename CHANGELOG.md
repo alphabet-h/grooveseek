@@ -12,6 +12,34 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **`kb-mcp graph --format dot` and `--format svg`** (E-3). The walk's value is
+  its shape, and neither existing format showed it: `json` and `text` list the
+  same nodes without saying where the search branched.
+
+  `dot` emits a Graphviz program to pipe at `dot -Tsvg`, open in a DOT viewer,
+  or paste into a web one. `svg` is a finished drawing that needs **nothing
+  installed** — which is the point of having it. Nodes are coloured by BFS
+  depth, edges carry the similarity score, and both formats **state when a limit
+  cut the walk short**, so a picture is never read as the whole neighbourhood.
+
+  **No drawing dependency was added.** A general graph would need a layout
+  engine, but this one is a tree — each node carries a single `parent_id` and
+  the walk never reaches a node twice — so depth becomes the column and sibling
+  order the row, in one pass. The candidate crate was also last published 16
+  months ago; not needing it at all is the better answer.
+
+  The formats live on a `graph`-only enum. Sharing `search`'s would have grown a
+  `search --format dot` with no graph to draw.
+
+  Escaping is worth a note for anyone extending this: the DOT grammar says the
+  only escape inside a quoted string is `\"`, so a backslash is **not** an escape
+  character to the lexer — while the label renderer does read `\n` and `\l` as
+  directives. On the reference corpus 74 of 8773 headings contain a double quote
+  and 4 contain a backslash, so both paths run on the first real graph rather
+  than in theory.
+
 ## [0.24.0] - 2026-08-15
 
 ### Added
