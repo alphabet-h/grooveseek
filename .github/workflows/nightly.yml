@@ -210,10 +210,14 @@ jobs:
           --bench string_ops
 
   cargo-audit:
+    # TEMPORARY: deliberate failure to verify the report job end to end.
     name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: TEMPORARY deliberate failure
+        run: exit 1
+
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
