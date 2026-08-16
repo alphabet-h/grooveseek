@@ -380,9 +380,21 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
             }
             Classified::Reindex(paths) => {
                 for p in paths {
-                    if let Some(rel) = to_rel(&state.kb_path, p)
-                        && should_process(&rel, p, state)
-                    {
+                    let Some(rel) = to_rel(&state.kb_path, p) else {
+                        continue;
+                    };
+                    // A directory that just appeared brings its contents with
+                    // it, and on Linux those files produce no event of their
+                    // own. Look inside once. `symlink_metadata` rather than
+                    // `is_dir` so a symlink pointing at a directory is not
+                    // followed — the walk refuses symlinks and so does
+                    // `should_process`, and this must not be the one place that
+                    // does otherwise.
+                    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()) {
+                        dispatch_new_directory(state, p, &rel);
+                        continue;
+                    }
+                    if should_process(&rel, p, state) {
                         dispatch_reindex(state, &rel);
                     }
                 }
@@ -528,6 +540,53 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
                     .ok()
                     .map(|r| r.to_string_lossy().replace('\\', "/"))
             })
+        }
+    }
+}
+
+/// Index what a newly appeared directory brought in with it.
+///
+/// Measured on Ubuntu 22.04 with raw inotify: a file written into a directory
+/// created 0.79 ms earlier is already on disk when the earliest possible watch
+/// on that directory is registered (2.41 ms), and it is reported by **no**
+/// watch — not the parent's, which only names the directory, and not the new
+/// one's, which did not exist yet. The event is unobservable rather than late,
+/// so no debounce window and no retry recovers it; the only fix is to look.
+///
+/// Windows is unaffected (`ReadDirectoryChangesW` covers the subtree from one
+/// handle), which is why the gap survived until a Linux-only CI failure.
+///
+/// Filtering is [`crate::indexer::collect_source_files_under`]'s, i.e. the full
+/// index walk's, so a directory drop and a later `kb-mcp index` agree about
+/// what belongs in the index. Re-checking with [`should_process`] here would be
+/// a second implementation of the same question, which is exactly how the
+/// watcher and the walk drifted apart twice before (AU-03, BU-19).
+fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
+    let found = match crate::indexer::collect_source_files_under(
+        &state.kb_path,
+        dir,
+        &state.registry,
+        &state.rules,
+    ) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("watcher: could not scan the new directory {rel}: {e}");
+            return;
+        }
+    };
+    if found.is_empty() {
+        return;
+    }
+    // Say how many, so a directory drop is never a silent bulk index.
+    eprintln!(
+        "watcher: {rel}/ appeared with {} indexable file{}; indexing them (their \
+         own events are not delivered on Linux).",
+        found.len(),
+        if found.len() == 1 { "" } else { "s" }
+    );
+    for f in &found {
+        if let Some(frel) = to_rel(&state.kb_path, f) {
+            dispatch_reindex(state, &frel);
         }
     }
 }

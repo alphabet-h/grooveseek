@@ -1237,10 +1237,36 @@ pub(crate) fn collect_source_files(
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
 ) -> Result<Vec<std::path::PathBuf>> {
+    collect_source_files_under(kb_path, kb_path, registry, rules)
+}
+
+/// The same walk, started somewhere below `kb_path` instead of at it.
+///
+/// Exclusion still relativizes against `kb_path`, so a subtree answers exactly
+/// what the full walk would answer for the same paths — that is the whole point
+/// of routing both through one body rather than writing a second walk.
+/// `start` is filtered like any other entry, so handing in an excluded
+/// directory yields nothing.
+///
+/// The caller is the watcher. On Linux a file written into a directory that was
+/// created microseconds earlier produces **no event on any watch**: inotify
+/// watches are per-directory, and the file already exists by the time the new
+/// directory's own watch can be registered (measured on Ubuntu 22.04: file
+/// present 0.79 ms after `mkdir`, earliest possible watch 2.41 ms). Nothing
+/// inside `notify` can recover it, so whoever starts watching a new directory
+/// has to look inside it once. Windows does not have this hole —
+/// `ReadDirectoryChangesW` watches the subtree from a single handle — which is
+/// why it went unnoticed until a Linux-only CI failure.
+pub(crate) fn collect_source_files_under(
+    kb_path: &Path,
+    start: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     let extensions = registry.extensions();
 
-    for entry in WalkDir::new(kb_path)
+    for entry in WalkDir::new(start)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
@@ -1717,6 +1743,109 @@ mod tests {
         assert!(rels.contains(&"sub/c.md".to_string()));
         assert!(!rels.iter().any(|r| r.ends_with(".txt")));
         assert!(!rels.iter().any(|r| r.ends_with(".rst")));
+    }
+
+    /// KB-relative, slash-separated paths for the assertions below.
+    fn rels_under(kb: &std::path::Path, files: &[std::path::PathBuf]) -> Vec<String> {
+        files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(kb)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    /// The watcher hands in the directory that just appeared, not the KB root.
+    /// If the walk ignored `start` and swept the whole KB, every directory
+    /// event would re-embed the entire knowledge base.
+    #[test]
+    fn collect_source_files_under_returns_only_the_subtree() {
+        let tmp = mk_tmp("under-subtree");
+        write_file(&tmp.0, "root.md", "# root");
+        write_file(&tmp.0, "fresh/a.md", "# a");
+        write_file(&tmp.0, "fresh/deep/b.md", "# b");
+        write_file(&tmp.0, "other/c.md", "# c");
+
+        let reg = Registry::defaults();
+        let files =
+            collect_source_files_under(&tmp.0, &tmp.0.join("fresh"), &reg, &excl(&tmp.0, &[]))
+                .unwrap();
+
+        assert_eq!(
+            rels_under(&tmp.0, &files),
+            vec!["fresh/a.md".to_string(), "fresh/deep/b.md".to_string()],
+            "only the subtree handed in, and all of it"
+        );
+    }
+
+    /// Exclusion answers relative to the **KB root** even though the walk
+    /// starts below it. Keyed to `start` instead, a `.kb-mcpignore` line like
+    /// `fresh/skip/` would stop matching the moment the watcher rather than the
+    /// full walk was the one asking — the two would then disagree about what
+    /// belongs in the index, which is the drift AU-03 and BU-19 already caused
+    /// twice.
+    #[test]
+    fn collect_source_files_under_keeps_exclusion_keyed_to_the_kb_root() {
+        let tmp = mk_tmp("under-excl");
+        write_file(&tmp.0, "fresh/keep.md", "# keep");
+        write_file(&tmp.0, "fresh/skip/hidden.md", "# hidden");
+        // Written before the rules are loaded; `excl` reads the file.
+        std::fs::write(tmp.0.join(".kb-mcpignore"), "fresh/skip/\n").unwrap();
+
+        let reg = Registry::defaults();
+        let files =
+            collect_source_files_under(&tmp.0, &tmp.0.join("fresh"), &reg, &excl(&tmp.0, &[]))
+                .unwrap();
+
+        assert_eq!(
+            rels_under(&tmp.0, &files),
+            vec!["fresh/keep.md".to_string()],
+            "a KB-root-relative ignore pattern must still bite inside a subtree walk"
+        );
+    }
+
+    /// `start` is filtered like any other entry. A `node_modules/` that appears
+    /// under a watched KB is exactly the case AU-03 was about, and the watcher
+    /// reaches this function before any other check.
+    #[test]
+    fn collect_source_files_under_refuses_an_excluded_start() {
+        let tmp = mk_tmp("under-excluded-start");
+        write_file(&tmp.0, "node_modules/pkg/readme.md", "# nope");
+
+        let reg = Registry::defaults();
+        let files = collect_source_files_under(
+            &tmp.0,
+            &tmp.0.join("node_modules"),
+            &reg,
+            &excl(&tmp.0, &[]),
+        )
+        .unwrap();
+
+        assert!(
+            files.is_empty(),
+            "handing in an excluded directory must yield nothing, got {files:?}"
+        );
+    }
+
+    /// The full walk is the subtree walk started at the root. Pinning the
+    /// delegation keeps a future edit from growing a second walk body — the
+    /// whole reason `collect_source_files_under` exists rather than a copy.
+    #[test]
+    fn collect_source_files_is_the_subtree_walk_started_at_the_root() {
+        let tmp = mk_tmp("under-equals-full");
+        write_file(&tmp.0, "a.md", "# a");
+        write_file(&tmp.0, "sub/b.md", "# b");
+        write_file(&tmp.0, "sub/deep/c.md", "# c");
+
+        let reg = Registry::defaults();
+        let rules = excl(&tmp.0, &[]);
+        assert_eq!(
+            collect_source_files(&tmp.0, &reg, &rules).unwrap(),
+            collect_source_files_under(&tmp.0, &tmp.0, &reg, &rules).unwrap()
+        );
     }
 
     #[test]
