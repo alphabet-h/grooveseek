@@ -72,7 +72,7 @@
    read-only マウントは任意だが害はなく、「このマシンは共有 KB を編集
    しない」を強制できる。KB を編集するマシンは通常どおり read-write で。
 
-2. `groove.toml.client` を `/var/lib/grooveseek/groove.toml` に置き、
+2. `groove.toml.client` を `/var/lib/groove/groove.toml` に置き、
    `kb_path = "/var/lib/groove/knowledge-base"` にする。DB の隣に置いておくと
    下のタイマーから `--config` で直接指せる — model は index 時と一致している
    必要があり、systemd unit はシェルの作業ディレクトリを引き継がない
@@ -81,7 +81,7 @@
    初回 DL もある):
 
    ```bash
-   groove index --config /var/lib/grooveseek/groove.toml
+   groove index --config /var/lib/groove/groove.toml
    ```
 
 4. タイマーで最新に保つ。watcher は使えない: inotify も
@@ -103,7 +103,7 @@
    Type=oneshot
    # --config は必須: unit は作業ディレクトリを引き継がないため、config 探索が
    # 既定値に落ちて別 model で index しようとし、既存 index に弾かれる。
-   ExecStart=/usr/local/bin/groove index --config /var/lib/grooveseek/groove.toml
+   ExecStart=/usr/local/bin/groove index --config /var/lib/groove/groove.toml
 
    # ~/.config/systemd/user/groove-index.timer
    [Timer]
@@ -127,7 +127,7 @@
    ディレクトリ走査 + ファイルごとの hash だけで済む。
 
 5. `.mcp.json` をプロジェクトルート (or MCP クライアントが読む場所) に置く。
-   タイマーと同じ理由で `--config /var/lib/grooveseek/groove.toml` を渡している:
+   タイマーと同じ理由で `--config /var/lib/groove/groove.toml` を渡している:
    クライアントは groove を **自分のプロジェクト** ディレクトリから起動するので
    探索ではそのファイルに辿り着けず、`bge-m3` の index に対して既定 model で
    起動してしまう
@@ -135,7 +135,7 @@
 6. 確認:
 
    ```bash
-   groove status --config /var/lib/grooveseek/groove.toml
+   groove status --config /var/lib/groove/groove.toml
    ```
 
    document 数が出れば OK。`unable to open database file` が出るなら

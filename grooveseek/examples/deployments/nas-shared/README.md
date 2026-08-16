@@ -76,7 +76,7 @@ edits the same files. **The index does not.** Each machine keeps its own
    machine does not edit the shared KB" enforceable. Machines that *do*
    edit the KB mount it read-write as usual.
 
-2. Copy `groove.toml.client` to `/var/lib/grooveseek/groove.toml` and set
+2. Copy `groove.toml.client` to `/var/lib/groove/groove.toml` and set
    `kb_path = "/var/lib/groove/knowledge-base"`. Keeping it next to the
    database means the timer below can point `--config` straight at it — the
    model must match what the index was built with, and a systemd unit does
@@ -86,7 +86,7 @@ edits the same files. **The index does not.** Each machine keeps its own
    slower than local disk, and the ONNX model downloads once):
 
    ```bash
-   groove index --config /var/lib/grooveseek/groove.toml
+   groove index --config /var/lib/groove/groove.toml
    ```
 
 4. Keep it fresh on a timer. The watcher cannot help here: neither
@@ -110,7 +110,7 @@ edits the same files. **The index does not.** Each machine keeps its own
    # --config is required: a unit does not inherit a working directory, so
    # config discovery would fall back to defaults and index with the wrong
    # model, which the existing index then rejects.
-   ExecStart=/usr/local/bin/groove index --config /var/lib/grooveseek/groove.toml
+   ExecStart=/usr/local/bin/groove index --config /var/lib/groove/groove.toml
 
    # ~/.config/systemd/user/groove-index.timer
    [Timer]
@@ -134,7 +134,7 @@ edits the same files. **The index does not.** Each machine keeps its own
    finds nothing new costs a directory walk and a hash per file.
 
 5. Drop `.mcp.json` into the project root (or wherever your MCP client
-   reads it). It passes `--config /var/lib/grooveseek/groove.toml` for the same
+   reads it). It passes `--config /var/lib/groove/groove.toml` for the same
    reason the timer does: the client launches groove from *your project*
    directory, where discovery would never find that file, and the server
    would start with the default model against a `bge-m3` index.
@@ -142,7 +142,7 @@ edits the same files. **The index does not.** Each machine keeps its own
 6. Confirm:
 
    ```bash
-   groove status --config /var/lib/grooveseek/groove.toml
+   groove status --config /var/lib/groove/groove.toml
    ```
 
    Should report a non-zero document count. If it says `unable to open

@@ -24,7 +24,7 @@ stdio.
 
 ## Setup
 
-1. **Install groove**. Either grab a [prebuilt binary](https://github.com/alphabet-h/grooveseek/releases/latest) and place it on `PATH`, or `cargo install --path groove` from a clone (the repository root is a workspace manifest, so `--path .` fails).
+1. **Install groove**. Either grab a [prebuilt binary](https://github.com/alphabet-h/grooveseek/releases/latest) and place it on `PATH`, or `cargo install --path grooveseek` from a clone (the repository root is a workspace manifest, so `--path .` fails).
 2. **Decide where the KB lives**. For example `~/notes/` (personal notes) or `~/projects/<repo>/docs/` (project-scoped).
 3. **Pick a config location**. Two natural options — see [Config file discovery](../../../../README.md#config-file-discovery):
    - **Project-scoped**: drop both `groove.toml` and `.mcp.json` next to your project (commit them — `groove.toml` is meant to be shared).

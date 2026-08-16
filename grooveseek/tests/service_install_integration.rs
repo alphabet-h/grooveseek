@@ -173,7 +173,7 @@ fn windows_register_script_omits_serve_argument_for_the_svc_launcher() {
     );
 }
 
-/// The dev-install fallback (`cargo install --path groove` ships no svc
+/// The dev-install fallback (`cargo install --path grooveseek` ships no svc
 /// binary) still has to produce a working daemon, so the console Action keeps
 /// carrying `serve`.
 #[cfg(target_os = "windows")]

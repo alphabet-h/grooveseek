@@ -26,7 +26,7 @@ git config core.hooksPath .githooks
 cargo build --release      # release バイナリ: target/release/groove(.exe)
 cargo check --all-targets  # 型検査のみ (高速)
 cargo test                 # ユニット + integration テスト (モデル DL 不要)
-cargo test -p groove --lib <name>  # 名前指定で 1 本だけ実行 (workspace に複数 crate が
+cargo test -p grooveseek --lib <name>  # 名前指定で 1 本だけ実行 (workspace に複数 crate が
                                   # あるため -p が要る。--lib で integration test binary を除外)
 ```
 

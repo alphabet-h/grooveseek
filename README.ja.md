@@ -934,7 +934,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 
 区切りは forward slash のまま、それ以外は percent-encode するので、空白や非 ASCII を含むパスでも正しい ASCII URI になる。
 
-**read は索引で縛られる。** 提供されるのは索引に入っている文書のみで、そのうえで `get_document` と同一の検査 (symlink / hardlink 拒否、path traversal、拡張子 membership、size cap、handle 束縛の read) を通す。これは `get_document` (= `kb_path` 配下で拡張子が registry にあれば返す) より**狭い**。resource は「サーバが提示したもの」なので、提示していない URI を提供するのは別の操作だから。したがって `.grooveignore` された文書は resource には出ないが `get_document` からは従来どおり読める — これは [ADR-0003](docs/decisions/0003-grooveignore-bounds-indexing-not-access.ja.md) の契約が不変であることの帰結。判断の正本は [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.ja.md)。
+**read は索引で縛られる。** 提供されるのは索引に入っている文書のみで、そのうえで `get_document` と同一の検査 (symlink / hardlink 拒否、path traversal、拡張子 membership、size cap、handle 束縛の read) を通す。これは `get_document` (= `kb_path` 配下で拡張子が registry にあれば返す) より**狭い**。resource は「サーバが提示したもの」なので、提示していない URI を提供するのは別の操作だから。したがって `.grooveignore` された文書は resource には出ないが `get_document` からは従来どおり読める — これは [ADR-0003](docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.ja.md) の契約が不変であることの帰結。判断の正本は [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.ja.md)。
 
 内容はテキストとして返り、media type は**提供物の型**にする: Markdown は `text/markdown`、抽出テキストとして出すものは `text/plain`。PDF や表計算は **groove が抽出したテキスト**として返り、元のバイト列ではない。
 

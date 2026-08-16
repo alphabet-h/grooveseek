@@ -26,7 +26,7 @@ This activates `.githooks/pre-push`, which runs `cargo fmt --all -- --check` bef
 cargo build --release      # Release binary at target/release/groove(.exe)
 cargo check --all-targets  # Quick type check
 cargo test                 # Unit + integration tests (no model download)
-cargo test -p groove --lib <name>  # One test by name (the workspace has several crates,
+cargo test -p grooveseek --lib <name>  # One test by name (the workspace has several crates,
                                   # and `--lib` skips the integration-test binaries)
 ```
 
