@@ -1,12 +1,18 @@
-# groove
+# GrooveSeek
 
-MCP server for semantic search over a Markdown / plain-text knowledge base.
+MCP server for semantic search over a Markdown / plain-text knowledge base. The
+command is `groove`.
 
 Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
 A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `groove validate`.
 
 > **日本語版**: [README.ja.md](./README.ja.md)
+
+**Versioning**: releases before 1.0.0 are beta and carry no compatibility
+guarantee. From 1.0.0, what this project promises not to break — and what it
+deliberately does not promise, including the web interface and the Rust API — is
+written down in [docs/stability.md](./docs/stability.md).
 
 ## Install
 

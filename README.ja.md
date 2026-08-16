@@ -1,12 +1,17 @@
-# groove
+# GrooveSeek
 
-Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP サーバ。
+Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP サーバ。コマンド名は `groove`。
 
 YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) をパースし、見出し単位でチャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
 
 ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`groove validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。
 
 > **English version**: [README.md](./README.md)
+
+**バージョニング**: 1.0.0 より前のリリースは beta であり、互換性の保証は無い。
+1.0.0 以降、本プロジェクトが壊さないと約束するもの — および web 画面と Rust API を
+含む、**意図的に約束しないもの** — は [docs/stability.ja.md](./docs/stability.ja.md)
+に書き下してある。
 
 ## インストール
 

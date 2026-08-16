@@ -14,6 +14,39 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **A stability policy: [docs/stability.md](docs/stability.md).** It states what
+  1.0.0 will freeze and — more usefully — what it deliberately will not. Without
+  it, tagging 1.0.0 would promise that everything observable stays fixed until
+  2.0.0: 408 public Rust items across 24 modules, 138 command-line flags, 6 MCP
+  tools, 11 configuration sections, and a SQLite schema.
+
+  Stable from 1.0.0: subcommand names and documented flags, exit codes, the
+  stdout/stderr split, the JSON from `search` and `graph` (fields may be added, so
+  ignore ones you do not recognise), MCP tool and prompt names with their schemas,
+  the `kb://` resource scheme, `/mcp` and `/healthz`, configuration keys and
+  defaults, the default embedding model, and the names written into your
+  filesystem.
+
+  Explicitly **not** stable: `/ui` and `/api/*` (loopback-only admin surface, due
+  to be rebuilt), all human-readable text output, the internal database schema, log
+  wording, and the Rust API. Reasoning: [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md).
+
+### Changed
+
+- **`grooveseek` is marked `publish = false`.** The Rust API is not part of the 1.0
+  promise, and `cargo package` cannot succeed anyway while the workspace uses
+  unversioned path dependencies. `cargo publish` now refuses rather than relying on
+  a documentation note. `[package.metadata.dist] dist = true` was added in the same
+  change, without which cargo-dist would silently stop shipping the main binary.
+- **Configuration files are declared not forward compatible.** Unknown keys stay an
+  error, so a 1.0.x binary will refuse a configuration written for 1.1. The
+  alternative would let `modle = "bge-m3"` index a knowledge base with the wrong
+  model behind a single warning on a daemon's stderr.
+- The README titles now name the product (**GrooveSeek**) rather than the command
+  (`groove`).
+
 ## [0.26.0] - 2026-08-17
 
 ### Changed
