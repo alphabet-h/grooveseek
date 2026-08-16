@@ -14,6 +14,20 @@ homepage = "https://github.com/alphabet-h/grooveseek"
 readme = "../README.md"
 keywords = ["mcp", "rag", "search", "embedding", "sqlite-vec"]
 categories = ["command-line-utilities", "database", "text-processing"]
+# The Rust API is not part of the 1.0 promise (docs/stability.md, ADR-0008). The
+# public items exist because the binary and its tests are built from them, not
+# because they are offered for reuse — and `cargo package` cannot succeed anyway
+# while the workspace uses unversioned path dependencies. Marking it rather than
+# only documenting it means `cargo publish` refuses, so the exclusion cannot be
+# undone by accident. Remove this line only as part of deciding to publish.
+publish = false
+
+# (cargo-dist 罠 4) A `publish = false` package is skipped by dist unless it says
+# `dist = true` — `targets` alone does nothing. Omitting this would drop the main
+# binary from every release while CI stayed green, which is exactly how the tray
+# and svc binaries went unshipped for eight releases.
+[package.metadata.dist]
+dist = true
 
 # The package is `grooveseek` (that is the crates.io identity) but the command
 # is `groove`, so the name a user types matches the on-disk identifiers —
