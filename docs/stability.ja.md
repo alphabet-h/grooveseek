@@ -82,7 +82,7 @@ GrooveSeek は [Semantic Versioning](https://semver.org/spec/v2.0.0.html) に従
 
 | | |
 |---|---|
-| 索引 DB | `.groove.db`（`kb_path` の親の隣） |
+| 索引 DB | `.groove.db`（`kb_path` の**親ディレクトリ内**） |
 | 設定 | `groove.toml` |
 | 除外ファイル | `.grooveignore` |
 | 評価セット / 履歴 | `.groove-eval.yml` / `.groove-eval-history.json` |

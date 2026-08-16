@@ -86,7 +86,7 @@ These are the reason the project renamed itself before 1.0.0 rather than after:
 
 | | |
 |---|---|
-| index database | `.groove.db` (beside the parent of `kb_path`) |
+| index database | `.groove.db`, in the parent directory of `kb_path` |
 | configuration | `groove.toml` |
 | exclusion file | `.grooveignore` |
 | evaluation set / history | `.groove-eval.yml` / `.groove-eval-history.json` |
