@@ -48,6 +48,23 @@ enum DoctorFormat {
     Json,
 }
 
+/// Output formats for `kb-mcp graph` (E-3).
+///
+/// Separate from [`SearchFormat`], which `graph` used to share: the drawings
+/// only mean something for a graph, and putting them on the shared enum would
+/// grow a `search --format dot` that has nothing to render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum GraphFormat {
+    /// The full graph as JSON (default, machine-readable).
+    Json,
+    /// One block per node, in walk order.
+    Text,
+    /// Graphviz DOT. Pipe it to `dot -Tsvg`, or open it in a DOT viewer.
+    Dot,
+    /// A standalone SVG drawing, with nothing to install to look at it.
+    Svg,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ValidateFormat {
     /// Human-readable (default). Uses ANSI color when stdout is a TTY.
@@ -213,8 +230,8 @@ enum Commands {
         #[arg(long = "dedup-by-path", default_value_t = false)]
         dedup_by_path: bool,
         /// Output format
-        #[arg(long, value_enum, default_value_t = SearchFormat::Json)]
-        format: SearchFormat,
+        #[arg(long, value_enum, default_value_t = GraphFormat::Json)]
+        format: GraphFormat,
     },
     /// Check the index for inconsistencies and report them.
     ///
@@ -1635,15 +1652,19 @@ fn print_validate_report(
     }
 }
 
-fn print_graph(g: kb_mcp::graph::ConnectionGraph, format: SearchFormat) {
+fn print_graph(g: kb_mcp::graph::ConnectionGraph, format: GraphFormat) {
     match format {
-        SearchFormat::Json => {
+        GraphFormat::Json => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&g).unwrap_or_else(|_| "{}".into())
             );
         }
-        SearchFormat::Text => {
+        // The drawings are the command's result, so they go to stdout with the
+        // other formats — a caller redirects this into a `.dot` or `.svg`.
+        GraphFormat::Dot => print!("{}", kb_mcp::graph_render::to_dot(&g)),
+        GraphFormat::Svg => print!("{}", kb_mcp::graph_render::to_svg(&g)),
+        GraphFormat::Text => {
             println!("# Connection graph from: {}", g.start_path);
             println!(
                 "nodes={} max_depth={} knn_queries={} duration_ms={} seeds_used={} truncated={}",
