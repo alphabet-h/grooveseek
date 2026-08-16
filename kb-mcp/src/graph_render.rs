@@ -188,10 +188,8 @@ const V_GAP: f32 = 14.0;
 const MARGIN: f32 = 20.0;
 /// Room above the drawing for the caption.
 const HEADER_H: f32 = 46.0;
-/// Characters per label line at `BOX_W`, chosen so a proportional sans-serif at
-/// 11px stays inside the box for Latin text. CJK is wider and can reach the
-/// edge; that is a cosmetic overflow, not a broken picture.
-const LABEL_CHARS: usize = 38;
+/// Horizontal padding inside a node box, both sides together.
+const BOX_PAD: f32 = 16.0;
 
 /// Where every node sits, and how big the drawing came out.
 struct Layout {
@@ -299,17 +297,81 @@ fn caption_lines(g: &ConnectionGraph) -> Vec<(String, f32, f32, &'static str)> {
     lines
 }
 
-/// Rough rendered width of a string, with no font to measure against.
+/// Width of one character in em, for a generic proportional sans-serif.
 ///
-/// A proportional sans-serif averages a little over half its point size per
-/// Latin character; CJK is full width. Only used to keep text inside the
-/// canvas, so erring wide costs nothing while erring narrow clips.
+/// There is no font here to measure against, so this is a class table rather
+/// than metrics. Charging every ASCII character the same average is what makes
+/// a run of `W` or `M` overflow while `iii` wastes room, and both show up in
+/// document paths. Non-ASCII is treated as full width, which is right for the
+/// CJK this knowledge base is full of.
+fn char_em(c: char) -> f32 {
+    match c {
+        'i' | 'j' | 'l' | 'I' | 't' | 'f' | 'r' | '.' | ',' | ';' | ':' | '\'' | '!' | '|'
+        | '(' | ')' | '[' | ']' | '{' | '}' | '/' | '\\' | '-' => 0.30,
+        ' ' => 0.28,
+        'W' | 'M' | '@' | '%' | 'm' | 'w' => 0.90,
+        c if c.is_ascii_uppercase() => 0.70,
+        c if c.is_ascii() => 0.55,
+        // CJK, and anything else outside ASCII: assume full width.
+        _ => 1.0,
+    }
+}
+
+/// Headroom over the class table, because `sans-serif` is not one font.
+///
+/// Measured against the 193 labels of a real graph, comparing the estimate
+/// below with the metrics of the fonts a viewer actually resolves `sans-serif`
+/// to on Windows:
+///
+/// | font | actual / estimated, median | max |
+/// |---|---|---|
+/// | Arial | 0.97 | 1.08 |
+/// | Segoe UI | 0.97 | 0.99 |
+/// | **Meiryo** | **1.10** | **1.15** |
+///
+/// The table is accurate for Arial and Segoe UI and short for Meiryo, whose
+/// Latin glyphs are wider — and Meiryo is what a Japanese Windows install
+/// commonly resolves `sans-serif` to, which is the audience this knowledge base
+/// has. The factor is the worst ratio measured, so text sized through here fits
+/// in all three.
+const FONT_SAFETY: f32 = 1.15;
+
+/// Rough rendered width of a string.
+///
+/// Only used to keep text inside a box or a canvas, so erring wide costs a few
+/// pixels of margin while erring narrow clips or overlaps a neighbour.
 fn estimated_text_width(s: &str, font_size: f32) -> f32 {
-    let units: f32 = s
-        .chars()
-        .map(|c| if c.is_ascii() { 0.55 } else { 1.0 })
-        .sum();
-    units * font_size
+    s.chars().map(char_em).sum::<f32>() * font_size * FONT_SAFETY
+}
+
+/// Cut to what fits in `max_px`, appending an ellipsis when it cut.
+///
+/// **The same estimator that sizes the canvas decides this.** Truncating by
+/// character count instead was measurably wrong on this corpus: 38 characters
+/// of mixed Japanese runs to 276px inside a 244px box, and 6 of 193 labels in a
+/// real graph crossed their border (codex P2 round 2).
+fn truncate_to_width(s: &str, font_size: f32, max_px: f32) -> String {
+    if estimated_text_width(s, font_size) <= max_px {
+        return s.to_string();
+    }
+    // Leave room for the ellipsis `truncate_chars` will append. Widths here go
+    // through the same headroom as `estimated_text_width`, or the loop would
+    // pack in more than the check above would accept.
+    let per_char = |c: char| char_em(c) * font_size * FONT_SAFETY;
+    let budget = max_px - per_char('…');
+    let mut used = 0.0;
+    let mut fits = 0;
+    for c in s.chars() {
+        let w = per_char(c);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        fits += 1;
+    }
+    // `truncate_chars` keeps `fits` characters and adds the ellipsis, and it is
+    // the one place that slices on a character boundary.
+    truncate_chars(s, fits + 1)
 }
 
 /// Render the graph as a standalone SVG.
@@ -404,7 +466,7 @@ pub fn to_svg(g: &ConnectionGraph) -> String {
             "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#12203a\">{}</text>",
             l.x[i] + 8.0,
             l.y[i] + 18.0,
-            xml_escape(&truncate_chars(&path, LABEL_CHARS))
+            xml_escape(&truncate_to_width(&path, 11.0, BOX_W - BOX_PAD))
         )
         .unwrap();
         if let Some(h) = heading {
@@ -413,7 +475,7 @@ pub fn to_svg(g: &ConnectionGraph) -> String {
                 "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"10\" fill=\"#44557a\">{}</text>",
                 l.x[i] + 8.0,
                 l.y[i] + 33.0,
-                xml_escape(&truncate_chars(&h, LABEL_CHARS))
+                xml_escape(&truncate_to_width(&h, 10.0, BOX_W - BOX_PAD))
             )
             .unwrap();
         }
@@ -710,6 +772,45 @@ mod tests {
         // so the same character count is nearly twice as wide.
         assert!(estimated_text_width("日本語", 14.0) > estimated_text_width("abc", 14.0));
         assert_eq!(estimated_text_width("", 14.0), 0.0);
+    }
+
+    /// One average for every ASCII character is what lets a run of `W` overflow
+    /// while `iii` wastes room, and document paths contain both
+    /// (codex P2 round 2).
+    #[test]
+    fn test_estimated_text_width_separates_wide_and_narrow_glyphs() {
+        let wide = estimated_text_width("WWWW", 14.0);
+        let narrow = estimated_text_width("iiii", 14.0);
+        let mid = estimated_text_width("nnnn", 14.0);
+        assert!(wide > mid && mid > narrow, "{wide} {mid} {narrow}");
+        // The widest ASCII must not be charged less than a full-width CJK
+        // character would be, since that is the bound that keeps text inside.
+        assert!(estimated_text_width("W", 14.0) <= estimated_text_width("あ", 14.0));
+    }
+
+    /// Truncation and canvas sizing must answer "how wide is this text" the
+    /// same way. Measured before the fix: 38 characters of mixed Japanese ran
+    /// to 276px inside a 244px box, and 6 of 193 labels in a real graph crossed
+    /// their border.
+    #[test]
+    fn test_truncate_to_width_keeps_labels_inside_the_box() {
+        let max = BOX_W - BOX_PAD;
+        for s in [
+            "#ソフトバンク「だれでもAI」+ Natural AI Phone（日本）",
+            "engineering/deep-dive/native-app-e2e-testing/flaui-vs-appium.md",
+            "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+            "短い",
+        ] {
+            let cut = truncate_to_width(s, 11.0, max);
+            assert!(
+                estimated_text_width(&cut, 11.0) <= max,
+                "{cut:?} is {}px, over {max}px",
+                estimated_text_width(&cut, 11.0)
+            );
+        }
+        // Text that already fits is returned untouched, ellipsis and all.
+        assert_eq!(truncate_to_width("短い", 11.0, max), "短い");
+        assert!(truncate_to_width("あ".repeat(80).as_str(), 11.0, max).ends_with('…'));
     }
 
     #[test]
