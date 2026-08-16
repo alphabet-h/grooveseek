@@ -12,6 +12,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The watcher missed every file inside a directory that was newly created
+  under the knowledge base — on Linux.** Copy a folder of notes into a watched
+  KB and its contents stayed unindexed until the next full `kb-mcp index`; the
+  directory event arrived, the files' did not.
+
+  This is not a debounce or a deadline: the events are **unobservable**. inotify
+  watches are per-directory, so a file written into a directory that was created
+  microseconds earlier is reported by no watch at all — not the parent's, which
+  only names the directory, and not the new directory's, which is registered too
+  late. Measured on Ubuntu 22.04 with raw inotify: the file was on disk 0.79 ms
+  after `mkdir`, and the earliest a watcher could register the new watch was
+  2.41 ms. Nothing inside `notify` recovers it, so the watcher now looks inside
+  a directory once when it appears.
+
+  Windows was never affected — `ReadDirectoryChangesW` watches the subtree from
+  a single handle — which is why this survived unnoticed until a Linux-only CI
+  failure.
+
+  What gets indexed is decided by the **full index walk's** filter, now reachable
+  for a subtree, so a directory drop and a later `kb-mcp index` agree. The count
+  is logged: a directory drop is never a silent bulk index.
+
 ## [0.25.0] - 2026-08-16
 
 ### Added

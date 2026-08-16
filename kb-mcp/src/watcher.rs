@@ -41,6 +41,26 @@ use crate::embedder::Embedder;
 use crate::indexer;
 use crate::parser::Registry;
 
+/// Print a watcher diagnostic, ASCII-escaped.
+///
+/// **Every** `watcher:` line in this file goes through here. A macro rather than
+/// a function so the call sites keep `format!` syntax, and defined this early
+/// because `macro_rules!` is textually scoped — a diagnostic added above this
+/// point would not compile, which is the cheapest possible enforcement.
+///
+/// One printer is the only way "diagnostics stay ASCII" (AGENTS.md) holds as an
+/// invariant rather than a habit. Escaping at the call sites was tried for two
+/// review rounds and kept losing: the subtree scan feeds already-existing
+/// printers, so "escape the lines this branch adds" has no stable boundary —
+/// every path that newly reaches an old `eprintln!` is a new stderr path.
+/// Asking one question in two places is also exactly how this file drifted
+/// twice before (AU-03, BU-19).
+macro_rules! wdiag {
+    ($($arg:tt)*) => {
+        eprintln!("{}", ascii_diag(&format!($($arg)*)))
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -167,7 +187,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                             match tx_clone.try_send(events) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    eprintln!(
+                                    wdiag!(
                                         "watcher: event channel full (capacity {WATCHER_CHANNEL_CAPACITY}); \
                                          dropping batch — handle_events is too slow or blocked. \
                                          Consider increasing kb-mcp resources or running rebuild_index manually."
@@ -180,7 +200,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                         }
                         Err(errs) => {
                             for e in errs {
-                                eprintln!("watcher: debouncer error: {e:?}");
+                                wdiag!("watcher: debouncer error: {e:?}");
                             }
                         }
                     },
@@ -188,7 +208,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                 let mut debouncer = match debouncer_result {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!(
+                        wdiag!(
                             "watcher: failed to create debouncer: {e} (retry in {}s)",
                             backoff.as_secs()
                         );
@@ -198,7 +218,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                     }
                 };
                 if let Err(e) = debouncer.watch(&kb_watch_path, RecursiveMode::Recursive) {
-                    eprintln!(
+                    wdiag!(
                         "watcher: failed to watch {}: {e} (retry in {}s)",
                         kb_watch_path.display(),
                         backoff.as_secs()
@@ -221,7 +241,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                 // failed `watch()` retries in the branch above, and a signal
                 // printed ahead of that would claim readiness the retry
                 // contradicts.
-                eprintln!(
+                wdiag!(
                     "watcher: watching {} (debounce {}ms)",
                     kb_watch_path.display(),
                     debounce.as_millis()
@@ -234,7 +254,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                 loop {
                     std::thread::park_timeout(probe_interval);
                     if !kb_watch_path.exists() {
-                        eprintln!(
+                        wdiag!(
                             "watcher: kb_path {} vanished, will retry",
                             kb_watch_path.display()
                         );
@@ -246,7 +266,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("failed to spawn watcher thread: {e}"))?;
 
-    eprintln!(
+    wdiag!(
         "watcher started ({:?} debounce, {:?})",
         debounce,
         state.registry.extensions()
@@ -318,6 +338,53 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
 /// full index (`kb-mcp index` / MCP `rebuild_index`) まで残る — walk から消えた
 /// path を DB から落とすのは削除 pass の仕事で、watcher は個々のイベントしか
 /// 見ないため。ログでそう言う。
+/// Escape a diagnostic so it survives a non-UTF-8 console.
+///
+/// AGENTS.md asks stderr to stay ASCII: it is read on a console, and on a
+/// Japanese Windows install that console is CP932, where anything outside the
+/// code page arrives as mojibake. A knowledge base path is routinely outside it,
+/// and so is the text of an error that embeds one — so the **whole formatted
+/// message** goes through here, not just the path (codex P1 on PR #168).
+///
+/// ASCII graphics and spaces pass through unchanged, which keeps ordinary
+/// messages readable; everything else becomes `\u{...}` or `\n`, which is
+/// lossless — two different paths never collapse into the same diagnostic.
+///
+/// Reached through [`wdiag!`], which every watcher diagnostic uses. Escaping at
+/// the call sites instead was tried for two review rounds and kept losing: the
+/// scan feeds already-existing printers ([`dispatch_reindex`] and friends), so
+/// "escape the lines this branch adds" has no stable boundary — every path that
+/// newly reaches an old `eprintln!` is a new stderr path. One printer, one rule.
+fn ascii_diag(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == ' ' || c.is_ascii_graphic() {
+            out.push(c);
+        } else {
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
+/// Does this event kind mean the path **just arrived**, as opposed to changing
+/// in place?
+///
+/// Only an arrival can be hiding contents nobody has seen. `Classified::Reindex`
+/// deliberately lumps arrivals together with `Modify(Data/Metadata/Any)` because
+/// a file is re-read the same way either way — but a *directory* is not: walking
+/// one costs its whole subtree, and doing that on every metadata change would
+/// re-embed a large directory whenever its mtime moved (codex P2 on PR #168).
+///
+/// `Modify(Name(_))` counts: a rename into the knowledge base is an arrival, and
+/// its contents are as unseen as a fresh `mkdir`'s.
+fn is_arrival(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
 /// Is this event path the knowledge base's own `.kb-mcpignore`?
 ///
 /// The root's, and only the root's: a `sub/.kb-mcpignore` is not read, so a
@@ -332,14 +399,14 @@ fn reload_rules(state: &mut WatcherState) {
     state.rules = crate::exclusion::ExclusionRules::load(&state.kb_path, exclude_dirs);
     let name = crate::exclusion::IGNORE_FILE_NAME;
     match state.rules.ignore_file_patterns() {
-        Some(n) => eprintln!(
+        Some(n) => wdiag!(
             "watcher: reloaded {name} ({n} pattern{}). New events follow the new rules; \
              documents already indexed stay until the next full index run.",
             if n == 1 { "" } else { "s" }
         ),
-        None => eprintln!(
-            "watcher: {name} is gone or could not be read; only exclude_dirs applies now."
-        ),
+        None => {
+            wdiag!("watcher: {name} is gone or could not be read; only exclude_dirs applies now.")
+        }
     }
 }
 
@@ -364,6 +431,21 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 else {
                     continue;
                 };
+                // A *directory* rename is deliberately not routed into the
+                // arrival scan (codex P2 on PR #168 asked for it). Populating a
+                // directory under a temporary name and renaming it inside one
+                // debounce window does leave its files unindexed — but indexing
+                // the destination alone would be worse, not better: there is no
+                // prefix-scoped delete (`storage.rs` has `delete_document(path)`
+                // only), so the source subtree's rows survive and `search` starts
+                // returning **stale hits that cannot be opened** alongside the new
+                // ones. Today that rename is skipped entirely, so no such
+                // duplicate exists. Closing this properly means deindexing the
+                // source subtree too, which is a new database capability and a
+                // different change. Until then a full `kb-mcp index` is the
+                // recovery, exactly as it was before this branch.
+                //
+                // Tracked in `.dev/known-issues.md`.
                 // 両端の可否で 3 分岐する (codex P2 on PR #81)。以前は
                 // 「どちらかが通れば rename」だったため、index 済みファイルを
                 // `.git/` や `node_modules/` へ rename すると
@@ -379,10 +461,33 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 }
             }
             Classified::Reindex(paths) => {
+                // Only an event that means "this path just arrived" can be
+                // hiding contents (codex P2). `Classified::Reindex` also covers
+                // ordinary `Modify(Data/Metadata/Any)`, so scanning on all of
+                // them would walk and re-embed a large existing directory every
+                // time its mtime or permissions changed — enough work to block
+                // event handling and overflow the bounded channel, for nothing.
+                let arrived = is_arrival(&evt.event.kind);
                 for p in paths {
-                    if let Some(rel) = to_rel(&state.kb_path, p)
-                        && should_process(&rel, p, state)
-                    {
+                    let Some(rel) = to_rel(&state.kb_path, p) else {
+                        continue;
+                    };
+                    // A directory that just appeared brings its contents with
+                    // it, and on Linux those files produce no event of their
+                    // own. Look inside once. `symlink_metadata` rather than
+                    // `is_dir` so a symlink pointing at a directory is not
+                    // followed — the walk refuses symlinks and so does
+                    // `should_process`, and this must not be the one place that
+                    // does otherwise.
+                    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir()) {
+                        if arrived {
+                            dispatch_new_directory(state, p, &rel);
+                        }
+                        // A directory never had anything else to do here:
+                        // `should_process` rejects it on the extension filter.
+                        continue;
+                    }
+                    if should_process(&rel, p, state) {
                         dispatch_reindex(state, &rel);
                     }
                 }
@@ -510,7 +615,7 @@ fn should_process_parts(
     // Same fail-open rule as the symlink check above: a vanished file has no
     // link count, and this function gates deindexing as well as indexing.
     if crate::links::is_multiply_linked(full) {
-        eprintln!("watcher: {}", crate::links::refusal_reason(full));
+        wdiag!("watcher: {}", crate::links::refusal_reason(full));
         return false;
     }
     true
@@ -532,6 +637,73 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
     }
 }
 
+/// Index what a newly appeared directory brought in with it.
+///
+/// Measured on Ubuntu 22.04 with raw inotify: a file written into a directory
+/// created 0.79 ms earlier is already on disk when the earliest possible watch
+/// on that directory is registered (2.41 ms), and it is reported by **no**
+/// watch — not the parent's, which only names the directory, and not the new
+/// one's, which did not exist yet. The event is unobservable rather than late,
+/// so no debounce window and no retry recovers it; the only fix is to look.
+///
+/// Windows is unaffected (`ReadDirectoryChangesW` covers the subtree from one
+/// handle), which is why the gap survived until a Linux-only CI failure.
+///
+/// Filtering is [`crate::indexer::collect_source_files_under`]'s, i.e. the full
+/// index walk's, so a directory drop and a later `kb-mcp index` agree about
+/// what belongs in the index. Re-checking with [`should_process`] here would be
+/// a second implementation of the same question, which is exactly how the
+/// watcher and the walk drifted apart twice before (AU-03, BU-19).
+fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
+    let found = match crate::indexer::collect_source_files_under(
+        &state.kb_path,
+        dir,
+        &state.registry,
+        &state.rules,
+    ) {
+        Ok(found) => found,
+        Err(e) => {
+            // Not retried, and the consequence is stated rather than implied
+            // (codex P2 on PR #168 asked for a retry). `collect_source_files_under`
+            // fails the whole walk on one unreadable entry, and it is shared with
+            // the full index, where failing loudly is the right answer — returning
+            // partial results would change *that* contract to hide a broken tree.
+            // Retrying inside the event loop would block it for an unbounded time
+            // on a directory that may still be being written. The recoverable
+            // truth is that a full index fixes it, so the message says so.
+            wdiag!(
+                "watcher: could not scan the new directory {rel}: {e}. \
+                 Its files stay unindexed until the next full `kb-mcp index`."
+            );
+            return;
+        }
+    };
+    if found.is_empty() {
+        return;
+    }
+    // Say how many, so a directory drop is never a silent bulk index.
+    //
+    // The directory is deliberately **not** named here (codex P1 on PR #168):
+    // stderr is meant to stay ASCII (AGENTS.md), a knowledge base path is
+    // routinely not, and `dispatch_reindex` names every file on the very next
+    // lines — so interpolating it would buy nothing and cost mojibake on a
+    // CP932 console. Where a path is the only thing the message has to say, it
+    // is still printed, the way the other watcher diagnostics do; making this
+    // one call site escape differently is the "one question, two
+    // implementations" shape the same file already got burned by twice.
+    wdiag!(
+        "watcher: a new directory arrived with {} indexable file{}; indexing \
+         them (their own events are not delivered on Linux).",
+        found.len(),
+        if found.len() == 1 { "" } else { "s" }
+    );
+    for f in &found {
+        if let Some(frel) = to_rel(&state.kb_path, f) {
+            dispatch_reindex(state, &frel);
+        }
+    }
+}
+
 fn dispatch_reindex(state: &WatcherState, rel: &str) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
@@ -544,19 +716,19 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         &state.registry,
     ) {
         Ok(indexer::SingleResult::Updated { chunks }) => {
-            eprintln!("watcher: reindexed {rel} ({chunks} chunks)");
+            wdiag!("watcher: reindexed {rel} ({chunks} chunks)");
         }
         Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
         // (BU-20) The reason is already on stderr from the read; this says what
         // happened to the document, which the reason does not.
         Ok(indexer::SingleResult::Refused) => {
-            eprintln!("watcher: {rel} refused, index left as it was");
+            wdiag!("watcher: {rel} refused, index left as it was");
         }
         Ok(indexer::SingleResult::Skipped { reason }) => {
-            eprintln!("watcher: skipped {rel} ({reason})");
+            wdiag!("watcher: skipped {rel} ({reason})");
         }
         Err(e) => {
-            eprintln!("watcher: reindex {rel} failed: {e}");
+            wdiag!("watcher: reindex {rel} failed: {e}");
         }
     }
 }
@@ -564,9 +736,9 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
     let db = recover_db(state.db.lock());
     match indexer::deindex_single_file(&db, rel) {
-        Ok(true) => eprintln!("watcher: deindexed {rel}"),
+        Ok(true) => wdiag!("watcher: deindexed {rel}"),
         Ok(false) => { /* no-op: not in DB */ }
-        Err(e) => eprintln!("watcher: deindex {rel} failed: {e}"),
+        Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
 }
 
@@ -583,32 +755,32 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         &state.registry,
     ) {
         Ok(indexer::RenameOutcome::Renamed) => {
-            eprintln!("watcher: renamed {old_rel} -> {new_rel}");
+            wdiag!("watcher: renamed {old_rel} -> {new_rel}");
         }
         Ok(indexer::RenameOutcome::RenamedAndReindexed { chunks }) => {
-            eprintln!("watcher: renamed+reindexed {old_rel} -> {new_rel} ({chunks} chunks)");
+            wdiag!("watcher: renamed+reindexed {old_rel} -> {new_rel} ({chunks} chunks)");
         }
         Ok(indexer::RenameOutcome::OldPathMissing) => {
-            eprintln!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
+            wdiag!("watcher: rename target {old_rel} not in DB, indexed {new_rel}");
         }
         // (BU-20) Not "indexed": no row was created. Saying otherwise sends
         // whoever reads this log looking for a document that is not there.
         Ok(indexer::RenameOutcome::OldPathMissingAndRefused) => {
-            eprintln!("watcher: rename target {old_rel} not in DB, and {new_rel} was refused");
+            wdiag!("watcher: rename target {old_rel} not in DB, and {new_rel} was refused");
         }
         Ok(indexer::RenameOutcome::RenamedSizeCapped) => {
-            eprintln!(
+            wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
             );
         }
         // (BU-20) The reason is already on stderr from `read_for_index`; this
         // line says what happened to the document, which the reason does not.
         Ok(indexer::RenameOutcome::RenamedButRefused) => {
-            eprintln!(
+            wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
-        Err(e) => eprintln!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
+        Err(e) => wdiag!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
     }
 }
 
@@ -1243,6 +1415,103 @@ mod tests {
             vec![PathBuf::from("/tmp/a.md")],
         );
         assert!(matches!(classify(&evt), Classified::Ignore));
+    }
+
+    /// (codex P1 on PR #168) The escaping only holds if **every** diagnostic
+    /// goes through `wdiag!`. Nothing in the compiler notices a fresh
+    /// `eprintln!` with a `watcher:` message, and three review rounds were spent
+    /// on paths reaching stderr unescaped, so the invariant gets a guard.
+    #[test]
+    fn every_watcher_diagnostic_goes_through_the_escaping_printer() {
+        let src = include_str!("watcher.rs");
+        // Assembled at runtime: written as a literal, this needle would match
+        // its own source and the test would fail on itself (feature-51 shipped
+        // exactly that bug in a source-scanning test).
+        let needle = format!("{}{}!(\"watcher", "eprint", "ln");
+        assert!(
+            !src.contains(&needle),
+            "a watcher diagnostic bypasses wdiag!; stderr would carry unescaped \
+             text on a CP932 console"
+        );
+    }
+
+    /// (codex P1 on PR #168) Diagnostics stay ASCII so a CP932 console can read
+    /// them, and the escaping is lossless so two different paths never render as
+    /// the same line.
+    #[test]
+    fn ascii_diag_keeps_plain_text_and_escapes_everything_else() {
+        assert_eq!(
+            ascii_diag("watcher: could not scan notes/a.md: denied"),
+            "watcher: could not scan notes/a.md: denied",
+            "ASCII graphics and spaces must survive unchanged"
+        );
+
+        let escaped = ascii_diag("設計/メモ.md");
+        assert!(
+            escaped.is_ascii(),
+            "a non-ASCII path must not reach stderr: {escaped}"
+        );
+        assert_ne!(
+            escaped,
+            ascii_diag("設計/ノート.md"),
+            "escaping must stay lossless, or two paths report as one line"
+        );
+
+        assert_eq!(
+            ascii_diag("a\nb\tc"),
+            "a\\nb\\tc",
+            "control characters must not break the line into two diagnostics"
+        );
+    }
+
+    /// (codex P2 on PR #168) A directory subtree is only walked when the
+    /// directory *arrived*. `Classified::Reindex` alone is not that signal — it
+    /// also carries `Modify(Data/Metadata/Any)`, so keying the scan off it would
+    /// re-walk and re-embed a large existing directory whenever its mtime or
+    /// permissions changed, with nothing new inside.
+    #[test]
+    fn only_arrival_events_can_be_hiding_directory_contents() {
+        for kind in [
+            EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Folder),
+            EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        ] {
+            assert!(is_arrival(&kind), "{kind:?} means the path just arrived");
+        }
+
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(
+                notify_debouncer_full::notify::event::DataChange::Any,
+            )),
+            EventKind::Modify(ModifyKind::Metadata(
+                notify_debouncer_full::notify::event::MetadataKind::Any,
+            )),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            assert!(
+                !is_arrival(&kind),
+                "{kind:?} changes a path in place; walking a subtree for it is \
+                 unbounded work for nothing"
+            );
+        }
+    }
+
+    /// The two halves have to stay related: every kind that is an arrival must
+    /// still classify as `Reindex`, or the scan is keyed off a branch that the
+    /// dispatcher never reaches and the Linux fix silently stops working.
+    #[test]
+    fn every_single_path_arrival_still_classifies_as_reindex() {
+        for kind in [
+            EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        ] {
+            let evt = mk_evt(kind, vec![PathBuf::from("/tmp/fresh")]);
+            assert!(
+                matches!(classify(&evt), Classified::Reindex(_)),
+                "{kind:?} must reach the Reindex arm"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
