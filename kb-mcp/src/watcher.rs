@@ -318,6 +318,35 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
 /// full index (`kb-mcp index` / MCP `rebuild_index`) まで残る — walk から消えた
 /// path を DB から落とすのは削除 pass の仕事で、watcher は個々のイベントしか
 /// 見ないため。ログでそう言う。
+/// Escape a diagnostic so it survives a non-UTF-8 console.
+///
+/// AGENTS.md asks stderr to stay ASCII: it is read on a console, and on a
+/// Japanese Windows install that console is CP932, where anything outside the
+/// code page arrives as mojibake. A knowledge base path is routinely outside it,
+/// and so is the text of an error that embeds one — so the **whole formatted
+/// message** goes through here, not just the path (codex P1 on PR #168).
+///
+/// ASCII graphics and spaces pass through unchanged, which keeps ordinary
+/// messages readable; everything else becomes `\u{...}` or `\n`, which is
+/// lossless — two different paths never collapse into the same diagnostic.
+///
+/// **This is not a sweep of the file.** Eight older watcher diagnostics still
+/// interpolate a path directly. Whether they should is a convention-wide
+/// decision about every diagnostic in the binary, not something to settle
+/// halfway inside a bug fix; what this branch owes is that the lines *it adds*
+/// obey the rule.
+fn ascii_diag(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == ' ' || c.is_ascii_graphic() {
+            out.push(c);
+        } else {
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
 /// Does this event kind mean the path **just arrived**, as opposed to changing
 /// in place?
 ///
@@ -382,6 +411,21 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 else {
                     continue;
                 };
+                // A *directory* rename is deliberately not routed into the
+                // arrival scan (codex P2 on PR #168 asked for it). Populating a
+                // directory under a temporary name and renaming it inside one
+                // debounce window does leave its files unindexed — but indexing
+                // the destination alone would be worse, not better: there is no
+                // prefix-scoped delete (`storage.rs` has `delete_document(path)`
+                // only), so the source subtree's rows survive and `search` starts
+                // returning **stale hits that cannot be opened** alongside the new
+                // ones. Today that rename is skipped entirely, so no such
+                // duplicate exists. Closing this properly means deindexing the
+                // source subtree too, which is a new database capability and a
+                // different change. Until then a full `kb-mcp index` is the
+                // recovery, exactly as it was before this branch.
+                //
+                // Tracked in `.dev/known-issues.md`.
                 // 両端の可否で 3 分岐する (codex P2 on PR #81)。以前は
                 // 「どちらかが通れば rename」だったため、index 済みファイルを
                 // `.git/` や `node_modules/` へ rename すると
@@ -599,7 +643,21 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
     ) {
         Ok(found) => found,
         Err(e) => {
-            eprintln!("watcher: could not scan the new directory {rel}: {e}");
+            // Not retried, and the consequence is stated rather than implied
+            // (codex P2 on PR #168 asked for a retry). `collect_source_files_under`
+            // fails the whole walk on one unreadable entry, and it is shared with
+            // the full index, where failing loudly is the right answer — returning
+            // partial results would change *that* contract to hide a broken tree.
+            // Retrying inside the event loop would block it for an unbounded time
+            // on a directory that may still be being written. The recoverable
+            // truth is that a full index fixes it, so the message says so.
+            eprintln!(
+                "{}",
+                ascii_diag(&format!(
+                    "watcher: could not scan the new directory {rel}: {e}. \
+                     Its files stay unindexed until the next full `kb-mcp index`."
+                ))
+            );
             return;
         }
     };
@@ -1340,6 +1398,35 @@ mod tests {
             vec![PathBuf::from("/tmp/a.md")],
         );
         assert!(matches!(classify(&evt), Classified::Ignore));
+    }
+
+    /// (codex P1 on PR #168) Diagnostics stay ASCII so a CP932 console can read
+    /// them, and the escaping is lossless so two different paths never render as
+    /// the same line.
+    #[test]
+    fn ascii_diag_keeps_plain_text_and_escapes_everything_else() {
+        assert_eq!(
+            ascii_diag("watcher: could not scan notes/a.md: denied"),
+            "watcher: could not scan notes/a.md: denied",
+            "ASCII graphics and spaces must survive unchanged"
+        );
+
+        let escaped = ascii_diag("設計/メモ.md");
+        assert!(
+            escaped.is_ascii(),
+            "a non-ASCII path must not reach stderr: {escaped}"
+        );
+        assert_ne!(
+            escaped,
+            ascii_diag("設計/ノート.md"),
+            "escaping must stay lossless, or two paths report as one line"
+        );
+
+        assert_eq!(
+            ascii_diag("a\nb\tc"),
+            "a\\nb\\tc",
+            "control characters must not break the line into two diagnostics"
+        );
     }
 
     /// (codex P2 on PR #168) A directory subtree is only walked when the
