@@ -12,6 +12,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-16
+
 ### Added
 
 - **`kb-mcp graph --format dot` and `--format svg`** (E-3). The walk's value is
@@ -3357,7 +3359,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/kb-mcp/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/alphabet-h/kb-mcp/compare/v0.21.0...v0.22.0
