@@ -279,37 +279,80 @@ fn assign_y(idx: usize, children: &[Vec<usize>], cursor: &mut f32, y: &mut [f32]
     here
 }
 
+/// The caption lines above the drawing, as `(text, font size, baseline y, fill)`.
+///
+/// One list, used both to size the canvas and to emit the text. Sizing from a
+/// second copy is how the canvas ends up too narrow for what it draws.
+fn caption_lines(g: &ConnectionGraph) -> Vec<(String, f32, f32, &'static str)> {
+    let mut lines = vec![(
+        format!(
+            "connection graph from {} — {} nodes, depth {}",
+            g.start_path, g.stats.total_nodes, g.stats.max_depth_reached
+        ),
+        14.0,
+        28.0,
+        "#222222",
+    )];
+    if let Some(t) = truncation_line(g) {
+        lines.push((t, 11.0, 44.0, "#a04040"));
+    }
+    lines
+}
+
+/// Rough rendered width of a string, with no font to measure against.
+///
+/// A proportional sans-serif averages a little over half its point size per
+/// Latin character; CJK is full width. Only used to keep text inside the
+/// canvas, so erring wide costs nothing while erring narrow clips.
+fn estimated_text_width(s: &str, font_size: f32) -> f32 {
+    let units: f32 = s
+        .chars()
+        .map(|c| if c.is_ascii() { 0.55 } else { 1.0 })
+        .sum();
+    units * font_size
+}
+
 /// Render the graph as a standalone SVG.
 ///
 /// It references no external font, stylesheet or image, because opening it
 /// without any other tool installed is the whole reason this format exists.
+/// Canvas width: wide enough for both the node boxes and the captions.
+///
+/// The captions are part of the drawing, so the canvas has to hold them. Sizing
+/// from the boxes alone is far too narrow whenever the walk is shallow — a
+/// seed-only graph is one box wide, while its caption names a full document
+/// path — and the title of the picture then falls outside its own viewport.
+fn svg_width(g: &ConnectionGraph, l: &Layout) -> f32 {
+    let caption_w = caption_lines(g)
+        .iter()
+        .map(|(t, fs, _, _)| estimated_text_width(t, *fs))
+        .fold(0.0_f32, f32::max);
+    l.width.max(MARGIN * 2.0 + caption_w)
+}
+
 pub fn to_svg(g: &ConnectionGraph) -> String {
     let l = layout_tree(g);
+    let captions = caption_lines(g);
+    let width = svg_width(g, &l);
+
     let mut s = String::new();
     writeln!(
         s,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">",
-        l.width, l.height, l.width, l.height
+        width, l.height, width, l.height
     )
     .unwrap();
     writeln!(s, "<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>").unwrap();
 
-    writeln!(
-        s,
-        "<text x=\"{:.0}\" y=\"28\" font-family=\"sans-serif\" font-size=\"14\" fill=\"#222222\">{}</text>",
-        MARGIN,
-        xml_escape(&format!(
-            "connection graph from {} — {} nodes, depth {}",
-            g.start_path, g.stats.total_nodes, g.stats.max_depth_reached
-        ))
-    )
-    .unwrap();
-    if let Some(t) = truncation_line(g) {
+    for (text, font_size, y, fill) in &captions {
         writeln!(
             s,
-            "<text x=\"{:.0}\" y=\"44\" font-family=\"sans-serif\" font-size=\"11\" fill=\"#a04040\">{}</text>",
+            "<text x=\"{:.0}\" y=\"{:.0}\" font-family=\"sans-serif\" font-size=\"{:.0}\" fill=\"{}\">{}</text>",
             MARGIN,
-            xml_escape(&t)
+            y,
+            font_size,
+            fill,
+            xml_escape(text)
         )
         .unwrap();
     }
@@ -579,8 +622,12 @@ mod tests {
         assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
         assert!(svg.trim_end().ends_with("</svg>"));
         assert!(
-            svg.contains(&format!("viewBox=\"0 0 {:.0} {:.0}\"", l.width, l.height)),
-            "the viewBox has to match the computed extent: {svg}"
+            svg.contains(&format!("height=\"{:.0}\"", l.height)),
+            "the height has to match the computed extent: {svg}"
+        );
+        assert!(
+            svg.contains(&format!("viewBox=\"0 0 {:.0}", svg_width(&g, &l))),
+            "the viewBox has to match the canvas: {svg}"
         );
         // Opening it without anything else installed is the reason this format
         // exists, so nothing may be fetched.
@@ -606,6 +653,63 @@ mod tests {
         assert!(svg.contains("tom &amp; &quot;jerry&quot;"), "{svg}");
         // The raw forms must not survive anywhere in the text nodes.
         assert!(!svg.contains("a<b>.md"), "{svg}");
+    }
+
+    /// The picture has to be wide enough for its own title. A shallow walk is
+    /// one box across while its caption names a full document path, so sizing
+    /// from the boxes alone put the caption outside the viewport — measured at
+    /// 300px of canvas for a caption needing about 560px (codex P2 round 1).
+    #[test]
+    fn test_svg_canvas_is_wide_enough_for_the_caption() {
+        let long_start = "engineering/deep-dive/native-app-e2e-testing/flaui-vs-appium.md";
+        let mut g = graph(vec![node(0, None, 0, "a.md")]);
+        g.start_path = long_start.to_string();
+
+        let l = layout_tree(&g);
+        let width = svg_width(&g, &l);
+        assert!(
+            width > l.width,
+            "the caption is wider than one node box, so it has to widen the canvas"
+        );
+        let caption = &caption_lines(&g)[0].0;
+        assert!(
+            width >= MARGIN * 2.0 + estimated_text_width(caption, 14.0),
+            "the caption must fit inside the margins: width={width}"
+        );
+        assert!(to_svg(&g).contains(&format!("viewBox=\"0 0 {width:.0}")));
+
+        // The truncation notice is a caption too, and a long one can be the
+        // widest thing in the drawing.
+        let mut wide = graph(vec![node(0, None, 0, "a.md")]);
+        wide.truncation = vec![GraphTruncation {
+            reason: TruncationReason::SeedChunks,
+            limit: 32,
+            detail: String::new(),
+        }];
+        assert!(svg_width(&wide, &layout_tree(&wide)) >= MARGIN * 2.0);
+    }
+
+    /// `--max-nodes 0` draws nothing but still says what it is, so the canvas
+    /// cannot be sized from a node list that is empty.
+    #[test]
+    fn test_svg_canvas_holds_the_caption_when_there_are_no_nodes() {
+        let mut g = graph(Vec::new());
+        g.start_path = "engineering/ai-news/2026-04-25.md".to_string();
+        let l = layout_tree(&g);
+        let width = svg_width(&g, &l);
+        let caption = &caption_lines(&g)[0].0;
+        assert!(
+            width >= MARGIN * 2.0 + estimated_text_width(caption, 14.0),
+            "an empty graph still carries a caption: width={width}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_text_width_treats_cjk_as_full_width() {
+        // Latin averages a little over half the point size; CJK is full width,
+        // so the same character count is nearly twice as wide.
+        assert!(estimated_text_width("日本語", 14.0) > estimated_text_width("abc", 14.0));
+        assert_eq!(estimated_text_width("", 14.0), 0.0);
     }
 
     #[test]
