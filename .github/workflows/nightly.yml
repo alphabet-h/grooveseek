@@ -24,7 +24,15 @@ on:
   schedule:
     # cron は UTC。'0 4 * * *' = 毎日 UTC 04:00。
     - cron: '0 4 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: >-
+          Open/close the tracking issue as if this were the scheduled run.
+          Off by default so branch experiments stay quiet; the only way to
+          exercise the reporting path end to end.
+        type: boolean
+        default: false
 
 # 同一 ref で同時実行を抑制 (手動 + schedule が重なった場合の保険)。
 concurrency:
@@ -372,3 +380,94 @@ jobs:
           ' coverage.json
           cargo llvm-cov report --summary-only --color never \
             --fail-under-file-lines "$FLOOR" --ignore-filename-regex "$IGNORE"
+
+  # ---------------------------------------------------------------------------
+  # 失敗を「気付ける場所」に置く。
+  #
+  # 公式仕様では scheduled workflow の失敗は **workflow を作った人 (= cron を
+  # 最後に触った人)** に通知される。それでも 2026-08-15 / 08-16 の 2 夜連続の
+  # 失敗は誰にも気付かれなかった。実測すると通知受信箱には Actions 由来の項目が
+  # 1 件も無く、しかも他リポジトリの購読で埋まっていた = **届いても埋没する
+  # チャネル**だった。
+  #
+  # なので issue に落とす。この repo では issue tracker が現役 (#90 / #91)。
+  # 重い検査 (--include-ignored / cargo audit / coverage floor / golden query)
+  # は全部 nightly にあるので、赤いまま放置されるとその層が丸ごと無効になる。
+  # ---------------------------------------------------------------------------
+  report:
+    name: report nightly status
+    needs: [ignored-tests, cargo-audit, coverage]
+    # always(): 失敗した時こそ動く必要がある。scheduled 実行と、明示的に
+    # 頼まれた手動実行だけに絞り、branch での試し撃ちが issue を作らないようにする。
+    if: always() && (github.event_name == 'schedule' || inputs.notify)
+    runs-on: ubuntu-latest
+    permissions:
+      # repo の既定は read (`actions/permissions/workflow` で実測)。ここを
+      # 書き忘れると **job は緑のまま issue が作られない** = 通知の仕組み自体が
+      # 静かに壊れる、という一番まずい形になる。
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TITLE: Nightly is failing
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Find the tracking issue
+        id: find
+        run: |
+          set -euo pipefail
+          # タイトル完全一致で引く。ラベルで引かないのは、ラベルが消えたり
+          # 名前が変わったりした時に **黙って重複 issue を作り始める** ため。
+          num=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+                  --json number,title \
+                  --jq '[.[] | select(.title == env.TITLE)] | .[0].number // empty')
+          echo "number=$num" >> "$GITHUB_OUTPUT"
+          echo "tracking issue: ${num:-none}"
+
+      - name: Report failure
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        env:
+          ISSUE: ${{ steps.find.outputs.number }}
+        run: |
+          set -euo pipefail
+          # どのジョブが落ちたかは needs.*.result からは名前が取れないので実際の
+          # run に聞く。ハードコードした一覧は job を足した時に静かに古くなる。
+          jobs=$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+                   --jq '.jobs[]
+                         | select(.conclusion != "success" and .name != "report nightly status")
+                         | "- \(.name): \(.conclusion)"')
+          body=$(cat <<BODY
+          Nightly failed on \`${GITHUB_SHA:0:8}\` (\`$GITHUB_REF_NAME\`).
+
+          $jobs
+
+          Run: $RUN_URL
+
+          The heavy checks live only here - \`--include-ignored\`, \`cargo audit\`,
+          the per-file coverage floor and the golden-query retrieval gate. While
+          this is red that whole layer is off, so a green CI on a pull request is
+          saying less than it looks like it is.
+
+          This issue closes itself on the next green nightly.
+          BODY
+          )
+          if [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "$body"
+            echo "commented on #$ISSUE"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$body"
+          fi
+
+      - name: Close the tracking issue when nightly is green
+        if: >-
+          !contains(needs.*.result, 'failure') &&
+          !contains(needs.*.result, 'cancelled') &&
+          steps.find.outputs.number != ''
+        env:
+          ISSUE: ${{ steps.find.outputs.number }}
+        run: |
+          set -euo pipefail
+          # 直したのに閉じないと、開きっぱなしの issue が「常に赤い」に見えて
+          # 無視されるようになる。稀にしか出ないことがこの通知の価値なので、
+          # 緑に戻った時に自分で閉じるところまでが仕組みの一部。
+          gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --comment "Nightly is green again on \`${GITHUB_SHA:0:8}\`: $RUN_URL"
