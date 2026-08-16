@@ -107,7 +107,25 @@ Your shell might be rewriting URL paths as filesystem paths.
 
 **正しいやり方**: endpoint の**先頭スラッシュを落とす** (`gh api repos/{owner}/{repo}/...`)。`gh` は相対形式を受け付ける。どうしても先頭スラッシュが必要な引数では `MSYS_NO_PATHCONV=1` を前置する。PowerShell 側では発生しない。
 
-出典: 2026-07-26 AU-09 session / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 7)
+### ★ 変換は「引数がパスかどうか」を見ない — 検索パターンも書き換わる
+
+`gh api` の endpoint に限った話ではない。**先頭が `/` の引数はすべて対象**で、
+検索パターンや正規表現も同じように変換される。
+
+```bash
+git grep -l '/var/lib/foo' -- .              # → 0 件 (パターンが C:/Program Files/var/lib/foo になっている)
+git grep -lE '(/var/)[^ ]*foo' -- .          # → 一致する ('(' で始まるので変換されない)
+```
+
+**`gh api` より危険**。`gh` は変換後の endpoint で **404 になって気付ける**が、
+`git grep` / `grep` / `sed` は**一致 0 件を返す** = 「直すものが無い」に見える。
+**沈黙する失敗の方が高くつく。**
+
+対策は同じ 2 つ — パターンを `/` で始めない (`var/lib/foo`)、または
+`MSYS_NO_PATHCONV=1` を前置する。
+
+出典: 2026-07-26 AU-09 session / `.dev/knowledge/ci-workflow-pitfalls.md` (罠 7)。
+`git grep` 側は 2026-08-17 の GrooveSeek 改名で実測 (13 箇所を取りこぼしかけた)
 
 ## 10. Python の text mode で書き戻すとファイル全体が LF → CRLF に反転する
 
