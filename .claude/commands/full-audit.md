@@ -46,7 +46,7 @@ subagent_type: feature-dev:code-reviewer
 description: Rust コード品質レビュー
 prompt:
 
-あなたは kb-mcp というプロジェクトの Rust コード品質を **厳しめに** レビューする任務を負っています。
+あなたは groove というプロジェクトの Rust コード品質を **厳しめに** レビューする任務を負っています。
 
 # プロジェクト背景
 - リポジトリパス: {{REPO_PATH}}
@@ -82,7 +82,7 @@ subagent_type: general-purpose
 description: セキュリティ・入力検証レビュー
 prompt:
 
-あなたは kb-mcp を **セキュリティ視点** で厳しめにレビューする任務を負っています。
+あなたは groove を **セキュリティ視点** で厳しめにレビューする任務を負っています。
 
 # プロジェクト背景
 - リポジトリパス: {{REPO_PATH}}
@@ -92,7 +92,7 @@ prompt:
 - 既知の制約 (除外して OK): HTTP に認証 layer なし — CLAUDE.local.md「既知の残り課題」を先に読むこと
 
 # レビューしてほしい観点 (すべて)
-1. 入力検証 (MCP tool 引数、frontmatter YAML、kb-mcp.toml、golden YAML の信頼境界)
+1. 入力検証 (MCP tool 引数、frontmatter YAML、groove.toml、golden YAML の信頼境界)
 2. SQL injection (src/db.rs の query 組み立て、? placeholder、動的 SQL)
 3. パストラバーサル (kb_path 配下の `..` 抜け、symlink、exclude_dirs bypass、Win/POSIX 差)
 4. ファイルシステム (任意 read 境界、--config の任意ファイル、watcher の対象外監視)
@@ -122,7 +122,7 @@ subagent_type: general-purpose
 description: テスト品質・カバレッジレビュー
 prompt:
 
-あなたは kb-mcp の **テスト品質とカバレッジ** を厳しめにレビューする任務を負っています。
+あなたは groove の **テスト品質とカバレッジ** を厳しめにレビューする任務を負っています。
 
 # プロジェクト背景
 - リポジトリパス: {{REPO_PATH}}
@@ -132,7 +132,7 @@ prompt:
   - テストの削除・編集は禁止
   - cargo test (default) は embedding 実モデル DL 不要なものだけ。-- --ignored で実モデル
   - tempfile / tempdir crate は使わず std::env::temp_dir() + PID + nanos + Drop guard で自作
-  - binary crate なので cargo test --lib は空振り、cargo test --bin kb-mcp <name> で叩く
+  - binary crate なので cargo test --lib は空振り、cargo test --bin groove <name> で叩く
   - subprocess test で stderr 文字列 assert する時は ANSI 色を strip
 
 # レビューしてほしい観点 (すべて)
@@ -162,13 +162,13 @@ subagent_type: general-purpose
 description: ドキュメント整合性レビュー
 prompt:
 
-あなたは kb-mcp の **ドキュメント整合性** を厳しめにレビューする任務を負っています。
+あなたは groove の **ドキュメント整合性** を厳しめにレビューする任務を負っています。
 
 # プロジェクト背景
 - リポジトリパス: {{REPO_PATH}}
 - 現バージョン: {{VERSION}}
 - 英語プライマリの日英バイリンガル運用
-- ドキュメント: README.md / README.ja.md、docs/ARCHITECTURE.{md,ja.md}、docs/eval.{md,ja.md}、docs/citations.md、docs/filters.md、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、kb-mcp.toml.example
+- ドキュメント: README.md / README.ja.md、docs/ARCHITECTURE.{md,ja.md}、docs/eval.{md,ja.md}、docs/citations.md、docs/filters.md、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、groove.toml.example
 - リリース履歴: git tag --list で確認
 - CLAUDE.md にリリース前ドキュメント同期チェックリストあり (要参照)
 
@@ -178,7 +178,7 @@ prompt:
 3. CHANGELOG vs git tag 整合 (compare link、日付)
 4. README → 各 docs / examples へのリンク (dead link、相対パス、anchor)
 5. サブコマンドの doc (README 記述と --help 出力の整合)
-6. kb-mcp.toml.example と src/config.rs の対応
+6. groove.toml.example と src/config.rs の対応
 7. examples/deployments/ の現実装挙動と一致
 8. CONTRIBUTING.md の手順が実環境で動くか
 9. docs/ARCHITECTURE.md の source layout 表が src/*.rs の現状と合っているか
@@ -217,7 +217,7 @@ prompt:
 新規ファイル: `.dev/knowledge/review-YYYY-MM-DD-full-audit.md` (`YYYY-MM-DD` は audit 実施日 UTC)
 
 テンプレ要素 (詳細は過去版 `review-2026-04-29-full-audit.md` 参照):
-- 取得環境 (kb-mcp version / commit / 対象ブランチ / 軸)
+- 取得環境 (groove version / commit / 対象ブランチ / 軸)
 - 結論サマリ
 - 横断テーマ
 - 個別の高優先度 Issue

@@ -1895,6 +1895,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "groove-svc"
+version = "0.25.0"
+
+[[package]]
+name = "groove-tray"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "image",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tao",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tray-icon",
+ "windows",
+ "winresource",
+]
+
+[[package]]
+name = "grooveseek"
+version = "0.25.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "calamine",
+ "chrono",
+ "clap",
+ "criterion",
+ "dirs",
+ "fastembed",
+ "globset",
+ "groove-tray",
+ "http",
+ "ignore",
+ "indicatif 0.18.4",
+ "libc",
+ "notify",
+ "notify-debouncer-full",
+ "oxidize-pdf",
+ "proptest",
+ "pulldown-cmark",
+ "quick-xml",
+ "regex",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_bw",
+ "sha2 0.10.9",
+ "shellexpand",
+ "sqlite-vec",
+ "tokio",
+ "toml 0.8.2",
+ "toml_edit 0.25.11+spec-1.1.0",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "wide",
+ "windows-sys 0.59.0",
+ "zip",
+]
+
+[[package]]
 name = "gtk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2633,78 +2705,6 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "kb-mcp"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "axum",
- "calamine",
- "chrono",
- "clap",
- "criterion",
- "dirs",
- "fastembed",
- "globset",
- "http",
- "ignore",
- "indicatif 0.18.4",
- "kb-mcp-tray",
- "libc",
- "notify",
- "notify-debouncer-full",
- "oxidize-pdf",
- "proptest",
- "pulldown-cmark",
- "quick-xml",
- "regex",
- "rmcp",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml_bw",
- "sha2 0.10.9",
- "shellexpand",
- "sqlite-vec",
- "tokio",
- "toml 0.8.2",
- "toml_edit 0.25.11+spec-1.1.0",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "walkdir",
- "wide",
- "windows-sys 0.59.0",
- "zip",
-]
-
-[[package]]
-name = "kb-mcp-svc"
-version = "0.25.0"
-
-[[package]]
-name = "kb-mcp-tray"
-version = "0.25.0"
-dependencies = [
- "anyhow",
- "clap",
- "dirs",
- "image",
- "reqwest 0.13.3",
- "serde",
- "serde_json",
- "tao",
- "tokio",
- "toml 0.8.2",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tray-icon",
- "windows",
- "winresource",
 ]
 
 [[package]]

@@ -36,7 +36,7 @@
 ## byte offset
 
 `start` / `end` は chunk の `content` 文字列に対する **byte offset**。両方とも
-**UTF-8 codepoint 境界に揃う**ことを `kb-mcp` 側で保証する。クライアントは
+**UTF-8 codepoint 境界に揃う**ことを `groove` 側で保証する。クライアントは
 安全に切り取れる:
 
 > **注記 (v0.7.0+):** parent retriever (`[search.parent_retriever]`) が発火した

@@ -1,12 +1,12 @@
 # AGENTS.md
 
-kb-mcp is a Rust MCP server for semantic search over a knowledge base of
+groove is a Rust MCP server for semantic search over a knowledge base of
 Markdown, plain text, PDF and Office documents. Documents are chunked by heading
 (sheet / slide / page), embedded, and retrieved by fusing sqlite-vec KNN with
 FTS5 full-text search through Reciprocal Rank Fusion, optionally reranked by a
 cross-encoder. It serves MCP clients over stdio or Streamable HTTP.
 
-The workspace holds the `kb-mcp` binary plus two Windows satellites: a tray app
+The workspace holds the `groove` binary plus two Windows satellites: a tray app
 and a service launcher.
 
 - Development guidance in depth (Japanese): `CLAUDE.md`

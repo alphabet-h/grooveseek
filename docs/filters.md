@@ -86,7 +86,7 @@ low_confidence ⇔ (results.len() >= 2)
 - Default `min_confidence_ratio = 1.5` (the best score must be at least 1.5× the mean)
 - Set to `0.0` to disable the judgment entirely
 - Override per-call via the `min_confidence_ratio` param, or globally via
-  `kb-mcp.toml`:
+  `groove.toml`:
 
   ```toml
   [search]

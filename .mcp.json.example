@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "kb-mcp": {
+    "groove": {
       "type": "stdio",
-      "command": "/absolute/path/to/kb-mcp",
+      "command": "/absolute/path/to/groove",
       "args": ["serve", "--kb-path", "/absolute/path/to/knowledge-base"]
     }
   }

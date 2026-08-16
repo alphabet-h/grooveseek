@@ -1,10 +1,10 @@
-# kb-mcp
+# groove
 
 MCP server for semantic search over a Markdown / plain-text knowledge base.
 
 Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
-A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `kb-mcp validate`.
+A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `groove validate`.
 
 > **日本語版**: [README.ja.md](./README.ja.md)
 
@@ -12,23 +12,23 @@ A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and 
 
 ### Pre-built binaries (recommended for non-Rust users)
 
-Download the archive for your platform from the [latest GitHub release](https://github.com/alphabet-h/kb-mcp/releases/latest), extract it, and place `kb-mcp` (or `kb-mcp.exe` on Windows) somewhere on `PATH`. Available targets:
+Download the archive for your platform from the [latest GitHub release](https://github.com/alphabet-h/grooveseek/releases/latest), extract it, and place `groove` (or `groove.exe` on Windows) somewhere on `PATH`. Available targets:
 
 | Platform | Archive |
 | --- | --- |
-| Linux x86_64 (glibc 2.38+ / Ubuntu 24.04+ / Debian 13+ / RHEL 9.5+) | `kb-mcp-x86_64-unknown-linux-gnu.tar.xz` |
-| Linux aarch64 (glibc 2.38+) | `kb-mcp-aarch64-unknown-linux-gnu.tar.xz` |
-| macOS Apple Silicon | `kb-mcp-aarch64-apple-darwin.tar.xz` |
-| Windows x86_64 (Windows 10+) | `kb-mcp-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (glibc 2.38+ / Ubuntu 24.04+ / Debian 13+ / RHEL 9.5+) | `grooveseek-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux aarch64 (glibc 2.38+) | `grooveseek-aarch64-unknown-linux-gnu.tar.xz` |
+| macOS Apple Silicon | `grooveseek-aarch64-apple-darwin.tar.xz` |
+| Windows x86_64 (Windows 10+) | `grooveseek-x86_64-pc-windows-msvc.zip` |
 
 > **Intel Mac (`x86_64-apple-darwin`)** is not shipped as a prebuilt: the upstream ONNX Runtime crate (`ort-sys`) does not provide a binary for that target. Build from source as described below.
 
-> **Windows: two more archives, if you will run kb-mcp as a service.** They are separate downloads (v0.14.0+), and both belong in the same directory as `kb-mcp.exe`:
+> **Windows: two more archives, if you will run groove as a service.** They are separate downloads (v0.14.0+), and both belong in the same directory as `groove.exe`:
 >
 > | Archive | Why |
 > | --- | --- |
-> | `kb-mcp-svc-x86_64-pc-windows-msvc.zip` | `kb-mcp service install` points the logon task at `kb-mcp-svc.exe` when it sits next to `kb-mcp.exe`, and **falls back to a console-visible launcher when it does not** — which means a console window flashes at every login. The fallback is reported as a warning, but extracting this archive before running `service install` saves you the second install. |
-> | `kb-mcp-tray-x86_64-pc-windows-msvc.zip` | Optional. The system tray monitor; needed only for `service install --with-tray`. |
+> | `groove-svc-x86_64-pc-windows-msvc.zip` | `groove service install` points the logon task at `groove-svc.exe` when it sits next to `groove.exe`, and **falls back to a console-visible launcher when it does not** — which means a console window flashes at every login. The fallback is reported as a warning, but extracting this archive before running `service install` saves you the second install. |
+> | `groove-tray-x86_64-pc-windows-msvc.zip` | Optional. The system tray monitor; needed only for `service install --with-tray`. |
 
 Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running.
 
@@ -40,16 +40,16 @@ ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs 
 cargo build --release
 ```
 
-The binary is produced at `target/release/kb-mcp` (or `kb-mcp.exe` on Windows).
+The binary is produced at `target/release/groove` (or `groove.exe` on Windows).
 
 ## Optional config file
 
-Any CLI option below can be given a default via a `kb-mcp.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`kb-mcp/kb-mcp.toml.example`](kb-mcp/kb-mcp.toml.example) to `kb-mcp.toml` and edit.
+Any CLI option below can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](grooveseek/groove.toml.example) to `groove.toml` and edit.
 
 **A fresh copy of that template changes nothing.** It is not blank — a few sections (`[quality_filter]`, `[parsers]`, `[watch]`, `[transport]`, `[transport.http]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behaviour is commented out. The block below is a different thing: an illustration of what each key does, with values filled in — some of them non-default, some of them just the default spelled out. Read it as a menu, not as a file to paste wholesale:
 
 ```toml
-# kb-mcp.toml (placed in the project root, the .git ancestor, or next to kb-mcp)
+# groove.toml (placed in the project root, the .git ancestor, or next to groove)
 kb_path = "/path/to/knowledge-base"
 model = "bge-m3"
 reranker = "bge-v2-m3"
@@ -90,7 +90,7 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
 
-# Live-sync file watcher. When `kb-mcp serve` is running, changes
+# Live-sync file watcher. When `groove serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally
 # within `debounce_ms`. Complementary to the PostToolUse hook: covers manual
 # edits, `git pull`, external scripts, etc. CLI `--no-watch` / `--debounce-ms`
@@ -99,7 +99,7 @@ enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
 enabled = true
 debounce_ms = 500
 
-# Transport for `kb-mcp serve`. `kind = "stdio"` (default)
+# Transport for `groove serve`. `kind = "stdio"` (default)
 # supports one client at a time; `kind = "http"` (Streamable HTTP) allows
 # many simultaneous clients at `/mcp`. `/healthz` returns 200 for health
 # checks. CLI `--transport http --port 3100` overrides.
@@ -124,11 +124,11 @@ bind = "127.0.0.1:3100"
 # are never refused by this limit (v0.19.0+).
 # max_sessions = 256
 
-# Optional: `kb-mcp eval` (retrieval quality evaluation, power-user feature).
-# You only need this section if you run `kb-mcp eval` for tuning or
+# Optional: `groove eval` (retrieval quality evaluation, power-user feature).
+# You only need this section if you run `groove eval` for tuning or
 # regression tracking. Omit the section entirely for built-in defaults.
 # [eval]
-# golden = ".kb-mcp-eval.yml"             # default: <kb_path>/.kb-mcp-eval.yml
+# golden = ".groove-eval.yml"             # default: <kb_path>/.groove-eval.yml
 # history_size = 10                       # default: 10
 # k_values = [1, 5, 10]                   # default: [1, 5, 10]
 # regression_threshold = 0.05             # default: 0.05
@@ -157,7 +157,7 @@ bind = "127.0.0.1:3100"
 # max_expanded_tokens = 2000         # cap for adjacent merge / whole-doc (BGE-M3 <= 8192)
 
 # Optional: RRF / bm25 fusion parameters (v0.13.0+). Defaults shown.
-# Leave them alone unless `kb-mcp tune` says otherwise on your own KB.
+# Leave them alone unless `groove tune` says otherwise on your own KB.
 # [search.fusion]
 # rrf_k = 60.0                # >= 1.0; lower favors a single retriever's top hit
 # bm25_heading_weight = 2.0   # >= 0.0
@@ -171,38 +171,38 @@ bind = "127.0.0.1:3100"
 # enabled = true
 ```
 
-With the file in place `kb-mcp serve` / `index` / `status` / `graph` / `search` all work without any of those flags. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
+With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
 
 ### Config file discovery
 
-`kb-mcp` looks up `kb-mcp.toml` in the following order on every invocation
+`groove` looks up `groove.toml` in the following order on every invocation
 and stops at the first hit:
 
 | Priority | Location                                  | Notes                                        |
 | -------- | ----------------------------------------- | -------------------------------------------- |
 | 1        | `--config <PATH>` (any subcommand)        | Errors out if the file does not exist.       |
-| 2        | `./kb-mcp.toml` (current working dir)     | Most natural for project-local KBs.          |
-| 3        | `<git-root>/kb-mcp.toml` (walks up)       | Checks CWD + up to 19 ancestors (20 dirs total). |
-| 4        | `<binary-dir>/kb-mcp.toml`                | Legacy / global-install fallback.            |
+| 2        | `./groove.toml` (current working dir)     | Most natural for project-local KBs.          |
+| 3        | `<git-root>/groove.toml` (walks up)       | Checks CWD + up to 19 ancestors (20 dirs total). |
+| 4        | `<binary-dir>/groove.toml`                | Legacy / global-install fallback.            |
 | 5        | (no config — built-in defaults)           | `--kb-path` becomes mandatory on the CLI.    |
 
 `~` in `--config` is expanded to the home directory on all platforms
 (including Windows `cmd.exe` where the shell does not expand it).
 
 The chosen file is logged to stderr at startup as
-`kb_mcp::config: loaded config source=... path=... trust=...`, so you can see
+`grooveseek::config: loaded config source=... path=... trust=...`, so you can see
 which file is in effect and how far it was trusted.
 
 ##### Trusted and untrusted config locations
 
 Priorities 2 and 3 find a file you did not name. If you `cd` into a repository
 someone else wrote — or an MCP client launches the server with that directory
-as its cwd — that file would otherwise be honoured in full. So kb-mcp decides
+as its cwd — that file would otherwise be honoured in full. So groove decides
 **from the location alone** (never from the file's contents) whether to treat
 it as yours:
 
 - **Trusted**: `--config` (you named it), `<binary-dir>` (writing there needs
-  install-directory access), a config home used by `kb-mcp service install`,
+  install-directory access), a config home used by `groove service install`,
   and "no file at all".
 - **Untrusted**: anything else found under the cwd or a `.git` ancestor.
 
@@ -220,25 +220,25 @@ and who can reach it:
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
 `kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local
-`kb-mcp.toml` naming an absolute path keeps working. What it refuses are the
+`groove.toml` naming an absolute path keeps working. What it refuses are the
 paths that can be written without knowing anything about your machine —
 `../..`, `/`, `C:\Users` — and symlinks pointing at them.
 
-To accept a config in full, name it: `kb-mcp serve --config ./kb-mcp.toml`.
+To accept a config in full, name it: `groove serve --config ./groove.toml`.
 
-Installed services are unaffected. Since v0.20.0 `kb-mcp service install` puts
-`--config <config home>/kb-mcp.toml` into the unit, plist or scheduled task it
+Installed services are unaffected. Since v0.20.0 `groove service install` puts
+`--config <config home>/groove.toml` into the unit, plist or scheduled task it
 registers, so the daemon names its own config rather than discovering it — and
 is therefore trusted whatever the environment looks like at start-up. That
-closes the one case where it was not: setting `KB_MCP_CONFIG_HOME` for the
+closes the one case where it was not: setting `GROOVE_CONFIG_HOME` for the
 `service install` command alone, since the variable is no longer in the
 environment when the service later runs.
 
 A service registered by an earlier version keeps its old launch line. To update
-it, re-run **your own** `kb-mcp service install` command with `--force` added —
+it, re-run **your own** `groove service install` command with `--force` added —
 a bare `service install` would reset the service name, auto-start and bind.
 
-**Set `KB_MCP_CONFIG_HOME` again if you set it the first time.** It is not
+**Set `GROOVE_CONFIG_HOME` again if you set it the first time.** It is not
 remembered anywhere: `service install` resolves the config home from the
 environment it is run in, so without the variable the re-install writes a
 *different*, minimal config and points the service at that one, leaving your
@@ -254,7 +254,7 @@ does not touch. Sign out and back in, or stop and start the service yourself.
 
 **What this does not cover**: if a repository ships its own `.mcp.json`, it
 controls the whole command line, not just the config file. No rule inside
-kb-mcp can help there; that is what your MCP client's approval prompt is for.
+groove can help there; that is what your MCP client's approval prompt is for.
 
 #### Example: per-project KB packaged in a repository
 
@@ -262,41 +262,41 @@ kb-mcp can help there; that is what your MCP client's approval prompt is for.
 // repo-root/.mcp.json
 {
   "mcpServers": {
-    "kb": { "command": "kb-mcp", "args": ["serve"] }
+    "kb": { "command": "groove", "args": ["serve"] }
   }
 }
 ```
 
-Commit `kb-mcp.toml` next to `.mcp.json`. Opening the project in Claude Code
-launches `kb-mcp serve` from the repo root, the CWD lookup picks up
-the project's `kb-mcp.toml`, and `.mcp.json` stays minimal.
+Commit `groove.toml` next to `.mcp.json`. Opening the project in Claude Code
+launches `groove serve` from the repo root, the CWD lookup picks up
+the project's `groove.toml`, and `.mcp.json` stays minimal.
 
 #### Example: multiple KBs in the same Claude Code session
 
 ```jsonc
 {
   "mcpServers": {
-    "kb-personal": { "command": "kb-mcp", "args": ["serve", "--config", "~/kb/personal/kb-mcp.toml"] },
-    "kb-project":  { "command": "kb-mcp", "args": ["serve", "--config", "./kb-mcp.toml"] },
-    "kb-rust-docs":{ "command": "kb-mcp", "args": ["serve", "--config", "~/kb/rust-docs/kb-mcp.toml"] }
+    "kb-personal": { "command": "groove", "args": ["serve", "--config", "~/kb/personal/groove.toml"] },
+    "kb-project":  { "command": "groove", "args": ["serve", "--config", "./groove.toml"] },
+    "kb-rust-docs":{ "command": "groove", "args": ["serve", "--config", "~/kb/rust-docs/groove.toml"] }
   }
 }
 ```
 
-Each entry runs as an independent MCP server with its own `kb-mcp.toml` and
-its own `.kb-mcp.db`, so Claude can disambiguate by server name.
+Each entry runs as an independent MCP server with its own `groove.toml` and
+its own `.groove.db`, so Claude can disambiguate by server name.
 
 ## Usage
 
 ### Build / rebuild the search index
 
 ```bash
-kb-mcp index --kb-path /path/to/knowledge-base
-kb-mcp index --kb-path /path/to/knowledge-base --force   # full re-index
-kb-mcp index --kb-path /path/to/knowledge-base --model bge-m3 --force  # switch to BGE-M3 (1024 dim, multilingual)
+groove index --kb-path /path/to/knowledge-base
+groove index --kb-path /path/to/knowledge-base --force   # full re-index
+groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # switch to BGE-M3 (1024 dim, multilingual)
 ```
 
-Scans source files under the given directory, skipping the default `exclude_dirs` set (`.obsidian`, `.git`, `node_modules`, `target`, `.vscode`, `.idea` — see "Directory exclusion" below). By default only `.md` is picked up. Add `[parsers].enabled = ["md", "txt"]` to `kb-mcp.toml` to also index `.txt` files — their title is derived from the filename (`deep-dive-2026.txt` → `"deep dive 2026"`) and the whole body becomes a single chunk. Files whose content hash has not changed since the last run are skipped unless `--force` is passed.
+Scans source files under the given directory, skipping the default `exclude_dirs` set (`.obsidian`, `.git`, `node_modules`, `target`, `.vscode`, `.idea` — see "Directory exclusion" below). By default only `.md` is picked up. Add `[parsers].enabled = ["md", "txt"]` to `groove.toml` to also index `.txt` files — their title is derived from the filename (`deep-dive-2026.txt` → `"deep dive 2026"`) and the whole body becomes a single chunk. Files whose content hash has not changed since the last run are skipped unless `--force` is passed.
 
 `--model` accepts:
 - `bge-small-en-v1.5` (default) — 384 dim, English-focused, ~130 MB first download.
@@ -306,14 +306,14 @@ Switching models on an existing index requires `--force` (the DB records the mod
 
 #### Progress reporting flags (v0.7.8+)
 
-Two flags control how `kb-mcp index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
+Two flags control how `groove index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
 
 - `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang.
 - `--progress`: show progress UI. Auto-detects via `IsTerminal` on stderr — TTY gets an `indicatif` bar with elapsed / position / percent / ETA, non-TTY gets periodic `Progress: N/M (P%)` lines (~20 emits per run plus a 100 % anchor) so `tail -f indexing.log` works.
 
 ```bash
-kb-mcp index --kb-path ./big-kb --quiet         # silent except for start / done
-kb-mcp index --kb-path ./big-kb --progress      # bar in TTY, periodic lines in pipe
+groove index --kb-path ./big-kb --quiet         # silent except for start / done
+groove index --kb-path ./big-kb --progress      # bar in TTY, periodic lines in pipe
 ```
 
 #### Model selection trade-offs
@@ -329,22 +329,22 @@ kb-mcp index --kb-path ./big-kb --progress      # bar in TTY, periodic lines in 
 
 Switching cost (existing index → new model):
 
-1. `kb-mcp index --kb-path ... --model <new> --force` runs a full re-embedding (no incremental update possible; `DELETE FROM documents/chunks/vec_chunks` and start over).
-2. Every `serve` / `index` call afterwards must pass the same `--model` (or have it set in `kb-mcp.toml`). A mismatch is rejected at startup by the `index_meta` check.
+1. `groove index --kb-path ... --model <new> --force` runs a full re-embedding (no incremental update possible; `DELETE FROM documents/chunks/vec_chunks` and start over).
+2. Every `serve` / `index` call afterwards must pass the same `--model` (or have it set in `groove.toml`). A mismatch is rejected at startup by the `index_meta` check.
 
 Practical recommendation: pick the model that matches your knowledge base's **primary language** up front. Don't oscillate between models unless you have a concrete precision problem — the full re-embedding is the expensive step.
 
 ### Start the MCP server
 
 ```bash
-kb-mcp serve --kb-path /path/to/knowledge-base
-kb-mcp serve --kb-path /path/to/knowledge-base --model bge-m3   # must match the indexed model
-kb-mcp serve --kb-path ... --model bge-m3 --reranker bge-v2-m3  # + cross-encoder reranking
-kb-mcp serve --kb-path ... --transport http --port 3100         # HTTP, multi-client
-kb-mcp serve --kb-path ... --no-watch                           # disable live-sync
+groove serve --kb-path /path/to/knowledge-base
+groove serve --kb-path /path/to/knowledge-base --model bge-m3   # must match the indexed model
+groove serve --kb-path ... --model bge-m3 --reranker bge-v2-m3  # + cross-encoder reranking
+groove serve --kb-path ... --transport http --port 3100         # HTTP, multi-client
+groove serve --kb-path ... --no-watch                           # disable live-sync
 ```
 
-Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](#http-transport-for-multiple-simultaneous-clients) section. A `--bind` outside loopback additionally requires `--i-know`, because kb-mcp ships no authentication.
+Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](#http-transport-for-multiple-simultaneous-clients) section. A `--bind` outside loopback additionally requires `--i-know`, because groove ships no authentication.
 
 The server exposes 6 tools (see below) and keeps the index in-process for low-latency queries. `--model` must match the model that built the current index, otherwise the server refuses to start with an actionable error message. A file watcher (enabled by default) re-indexes affected files when the contents under `--kb-path` change — see [Live-sync via file watcher](#live-sync-via-file-watcher).
 
@@ -375,49 +375,49 @@ Symptoms that suggest you should turn rerank on:
 
 Because rerank is index-independent, you can enable it for a week, measure the quality delta, and disable it if the benefit is not visible — no re-indexing needed.
 
-### Registering kb-mcp as an OS service (v0.8.0+)
+### Registering groove as an OS service (v0.8.0+)
 
-`kb-mcp service install` registers the daemon as an OS-level user service (no admin/sudo required) and configures auto-start at login.
+`groove service install` registers the daemon as an OS-level user service (no admin/sudo required) and configures auto-start at login.
 
 ```bash
-# Default: service name 'kb-mcp', bind 127.0.0.1:3100, auto-start ON
-kb-mcp service install --kb-path /path/to/your-kb
+# Default: service name 'groove', bind 127.0.0.1:3100, auto-start ON
+groove service install --kb-path /path/to/your-kb
 
 # Multi-instance (= run multiple KBs as separate services)
-kb-mcp service install --service-name work --kb-path /path/to/work-kb --bind 127.0.0.1:3100
-kb-mcp service install --service-name personal --kb-path /path/to/personal-kb --bind 127.0.0.1:3101
+groove service install --service-name work --kb-path /path/to/work-kb --bind 127.0.0.1:3100
+groove service install --service-name personal --kb-path /path/to/personal-kb --bind 127.0.0.1:3101
 
 # Inspect / manage
-kb-mcp service status                              # default 'kb-mcp'
-kb-mcp service list                                # all instances
-kb-mcp service uninstall personal                  # remove unit, keep config + DB
-kb-mcp service uninstall personal --purge --yes    # also remove config + DB
+groove service status                              # default 'groove'
+groove service list                                # all instances
+groove service uninstall personal                  # remove unit, keep config + DB
+groove service uninstall personal --purge --yes    # also remove config + DB
 ```
 
 OS-specific backends:
-- **Linux**: systemd-user (`~/.config/systemd/user/kb-mcp-<name>.service`). Run `sudo loginctl enable-linger $USER` to keep the daemon running after logout.
-- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.kb-mcp.<name>.plist`). launchd writes the daemon's output to `kb-mcp.out` / `kb-mcp.err` in the config home; the plist sets `Umask` to `0077`, so everything the agent creates — those logs, the index database — is readable only by your account.
-- **Windows**: Task Scheduler AT_LOGON (= no admin required, `\kb-mcp-<name>` task).
+- **Linux**: systemd-user (`~/.config/systemd/user/groove-<name>.service`). Run `sudo loginctl enable-linger $USER` to keep the daemon running after logout.
+- **macOS**: launchd LaunchAgent (`~/Library/LaunchAgents/com.groove.<name>.plist`). launchd writes the daemon's output to `groove.out` / `groove.err` in the config home; the plist sets `Umask` to `0077`, so everything the agent creates — those logs, the index database — is readable only by your account.
+- **Windows**: Task Scheduler AT_LOGON (= no admin required, `\groove-<name>` task).
 
-The installer writes a config home at `<dirs::config_dir()>/kb-mcp/<service-name>/` containing `kb-mcp.toml` (with `kb_path` and `bind`). Override the base directory via `KB_MCP_CONFIG_HOME` env var. The registered launch line names that file with `--config` (v0.20.0+), so the daemon reads the config the installer wrote rather than whatever it discovers from its working directory — see [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations).
+The installer writes a config home at `<dirs::config_dir()>/groove/<service-name>/` containing `groove.toml` (with `kb_path` and `bind`). Override the base directory via `GROOVE_CONFIG_HOME` env var. The registered launch line names that file with `--config` (v0.20.0+), so the daemon reads the config the installer wrote rather than whatever it discovers from its working directory — see [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations).
 
-Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since kb-mcp has no authentication.
+Non-loopback bind addresses (e.g. `0.0.0.0:3100`) require `--i-know` since groove has no authentication.
 
-> **Migration from v0.7.x personal-http recipe**: The `kb-mcp/examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `kb-mcp service install`:
-> - Linux: `systemctl --user disable kb-mcp.service && rm ~/.config/systemd/user/kb-mcp.service`
-> - macOS: `launchctl bootout gui/<uid>/com.kb-mcp.kb-mcp && rm ~/Library/LaunchAgents/com.kb-mcp.kb-mcp.plist`
-> - Windows: `schtasks /End /TN '\kb-mcp' ; schtasks /Delete /TN '\kb-mcp' /F` (replace `\kb-mcp` with whatever name the old task used)
+> **Migration from v0.7.x personal-http recipe**: The `grooveseek/examples/deployments/personal-http/` templates were removed in v0.8.0. Disable / delete the manually installed unit before running `groove service install`:
+> - Linux: `systemctl --user disable groove.service && rm ~/.config/systemd/user/groove.service`
+> - macOS: `launchctl bootout gui/<uid>/com.groove.groove && rm ~/Library/LaunchAgents/com.groove.groove.plist`
+> - Windows: `schtasks /End /TN '\groove' ; schtasks /Delete /TN '\groove' /F` (replace `\groove` with whatever name the old task used)
 >
-> If you're carrying settings over from the old `kb-mcp.toml` (e.g. `model = "bge-m3"`, `exclude_dirs`, `best_practice`, `fastembed_cache_dir`), edit the **new** config at `<dirs::config_dir()>/kb-mcp/<service-name>/kb-mcp.toml` after install. **`kb_path` must be an absolute path** — the new daemon's `WorkingDirectory` is `config_home`, so a relative `kb_path = "./knowledge-base"` will resolve to `<config_home>/knowledge-base` and miss the real KB. Use TOML literal strings (single quotes) to avoid Windows backslash escapes: `kb_path = 'C:\Users\you\your-kb'`.
+> If you're carrying settings over from the old `groove.toml` (e.g. `model = "bge-m3"`, `exclude_dirs`, `best_practice`, `fastembed_cache_dir`), edit the **new** config at `<dirs::config_dir()>/groove/<service-name>/groove.toml` after install. **`kb_path` must be an absolute path** — the new daemon's `WorkingDirectory` is `config_home`, so a relative `kb_path = "./knowledge-base"` will resolve to `<config_home>/knowledge-base` and miss the real KB. Use TOML literal strings (single quotes) to avoid Windows backslash escapes: `kb_path = 'C:\Users\you\your-kb'`.
 
 ### Tray monitor (Windows only, v0.9.0+)
 
-`kb-mcp-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. It ships from v0.14.0 in its own archive, `kb-mcp-tray-x86_64-pc-windows-msvc.zip` — not inside the `kb-mcp` archive. Extract it next to `kb-mcp.exe`; `kb-mcp service install --with-tray` looks for it there. (Releases before v0.14.0 did not contain it at all: the two Windows companion binaries were built but never attached, so use v0.14.0 or later.)
+`groove-tray.exe` is a Windows system tray binary that visualizes daemon state and provides Start / Stop / Restart controls. It ships from v0.14.0 in its own archive, `groove-tray-x86_64-pc-windows-msvc.zip` — not inside the `groove` archive. Extract it next to `groove.exe`; `groove service install --with-tray` looks for it there. (Releases before v0.14.0 did not contain it at all: the two Windows companion binaries were built but never attached, so use v0.14.0 or later.)
 
 Install alongside the daemon:
 
 ```bash
-kb-mcp service install --kb-path C:\path\to\kb --with-tray
+groove service install --kb-path C:\path\to\kb --with-tray
 ```
 
 On next logon the tray icon appears with a colored status dot:
@@ -429,19 +429,19 @@ On next logon the tray icon appears with a colored status dot:
 
 Right-click reveals six menu items: **Status** (read-only line) / **Open Web UI** / **Start** / **Stop** / **Restart** / **Quit Tray**. **Start** runs the scheduled task; **Stop** terminates the daemon process by the pid it reports at `/api/admin/status` (v0.14.0+), then confirms it is gone by binding the daemon's address — `Stop-ScheduledTask` only ever stopped the launcher, which exits immediately, so it silently did nothing.
 
-Tray logs live at `%LOCALAPPDATA%\kb-mcp\logs\tray.YYYY-MM-DD` (daily rotation). Set `KB_MCP_TRAY_LOG=debug` for verbose output. Pass `--debug` to attach a console for live stdout/stderr.
+Tray logs live at `%LOCALAPPDATA%\groove\logs\tray.YYYY-MM-DD` (daily rotation). Set `GROOVE_TRAY_LOG=debug` for verbose output. Pass `--debug` to attach a console for live stdout/stderr.
 
 Uninstalling the daemon also removes the tray shortcut:
 
 ```bash
-kb-mcp service uninstall kb-mcp
+groove service uninstall groove
 ```
 
 To manage the tray shortcut independently of the daemon registration:
 
 ```bash
-kb-mcp service tray-install --service-name kb-mcp     # add shortcut only
-kb-mcp service tray-uninstall --service-name kb-mcp   # remove shortcut only
+groove service tray-install --service-name groove     # add shortcut only
+groove service tray-uninstall --service-name groove   # remove shortcut only
 ```
 
 The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound to either loopback (`127.0.0.1`) or a wildcard (`0.0.0.0`). A daemon bound to a specific NIC such as `192.168.1.5:3100` is not listening on loopback, and the tray logs a warning at startup so the misconfiguration is discoverable.
@@ -449,7 +449,7 @@ The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound 
 ### Show index status
 
 ```bash
-kb-mcp status --kb-path /path/to/knowledge-base
+groove status --kb-path /path/to/knowledge-base
 ```
 
 Reports on the existing index, **on stderr** (`status` writes nothing to stdout, so do not pipe it): document and chunk counts, how many documents had unparseable `tags` frontmatter, and the context mode the index was built in (`static` / `off`). A fourth line reports how many chunks pass the quality filter — only when the effective threshold is above zero, so it is absent under `[quality_filter] enabled = false` or `threshold = 0.0`.
@@ -459,16 +459,16 @@ Reports on the existing index, **on stderr** (`status` writes nothing to stdout,
 For shell scripts or skill bins that just need "search this string in the KB" without standing up an MCP connection:
 
 ```bash
-kb-mcp search "RAG server comparison" --limit 3 --format text
-kb-mcp search "E0382" --category deep-dive --format json | jq '.results[] | .path'
-kb-mcp search "クエリ最適化" --reranker bge-v2-m3        # optional per-invocation rerank
+groove search "RAG server comparison" --limit 3 --format text
+groove search "E0382" --category deep-dive --format json | jq '.results[] | .path'
+groove search "クエリ最適化" --reranker bge-v2-m3        # optional per-invocation rerank
 ```
 
-`--format` is `json` (default, a `{ results, low_confidence, filter_applied }` wrapper as documented under "Search filters and citations" below) or `text` (LLM-friendly blocks separated by `---`). All other flags mirror `serve`: `--kb-path`, `--model`, `--reranker`, `--category`, `--topic`, `--limit`. The quality filter is on by default — pass `--include-low-quality` or `--min-quality 0` to restore the previous (filter-off) behavior for a single query. The `kb-mcp.toml` defaults apply exactly as in `serve`/`index`.
+`--format` is `json` (default, a `{ results, low_confidence, filter_applied }` wrapper as documented under "Search filters and citations" below) or `text` (LLM-friendly blocks separated by `---`). All other flags mirror `serve`: `--kb-path`, `--model`, `--reranker`, `--category`, `--topic`, `--limit`. The quality filter is on by default — pass `--include-low-quality` or `--min-quality 0` to restore the previous (filter-off) behavior for a single query. The `groove.toml` defaults apply exactly as in `serve`/`index`.
 
-**How the query is matched** (v0.16.0+): the FTS half of the hybrid does not look for the query verbatim. It cuts the query at separators and at script boundaries (kanji / hiragana / katakana / other word characters), joins any fragment under the 3-character trigram floor to its neighbours, and searches for the resulting phrases joined with `OR` — so `再ランキングの評価について` looks for `再ランキング` / `ランキング` / `の評価` / `について`, and a natural-language question matches without appearing word-for-word. Wrap a substring in `"..."` to keep it together as one verbatim phrase (`kb-mcp search '"Foundry Local" の設定'`); quoting the whole query restores the pre-v0.16.0 substring search exactly. The same applies to the `search` MCP tool, which runs the same code path; none of this needs a re-index. Details: [docs/retrieval-pipeline.md](./docs/retrieval-pipeline.md).
+**How the query is matched** (v0.16.0+): the FTS half of the hybrid does not look for the query verbatim. It cuts the query at separators and at script boundaries (kanji / hiragana / katakana / other word characters), joins any fragment under the 3-character trigram floor to its neighbours, and searches for the resulting phrases joined with `OR` — so `再ランキングの評価について` looks for `再ランキング` / `ランキング` / `の評価` / `について`, and a natural-language question matches without appearing word-for-word. Wrap a substring in `"..."` to keep it together as one verbatim phrase (`groove search '"Foundry Local" の設定'`); quoting the whole query restores the pre-v0.16.0 substring search exactly. The same applies to the `search` MCP tool, which runs the same code path; none of this needs a re-index. Details: [docs/retrieval-pipeline.md](./docs/retrieval-pipeline.md).
 
-Typical skill-bin use: a Claude Code skill places `kb-mcp.exe` + `kb-mcp.toml` in its `bin/`, then a command like `kb-mcp search "{{user_query}}" --format text --limit 3` returns a focused reference excerpt for the LLM to cite.
+Typical skill-bin use: a Claude Code skill places `groove.exe` + `groove.toml` in its `bin/`, then a command like `groove search "{{user_query}}" --format text --limit 3` returns a focused reference excerpt for the LLM to cite.
 
 ### Search filters and citations (v0.3.0+)
 
@@ -482,14 +482,14 @@ Starting in v0.3.0 the `search` MCP tool returns a wrapper object instead of a r
 }
 ```
 
-`results[].match_spans` are byte offsets into `content`, returned when every term the query splits into is ASCII, so MCP clients can quote the source text accurately. They are sorted and **non-overlapping**, and the 100-span budget is shared across the terms you searched for, so a term matching once is still highlighted when another matches hundreds of times; reordering the words of a query returns the identical array as long as it stays under the 32-phrase cap (v0.18.0+ — see [docs/citations.md](docs/citations.md) for the full contract and that one caveat). `low_confidence` is a rank-based flag (`top1.score / mean(top-N.score) < min_confidence_ratio`); the threshold defaults to `1.5` and can be tuned via `[search].min_confidence_ratio` in `kb-mcp.toml` or `--min-confidence-ratio` per query.
+`results[].match_spans` are byte offsets into `content`, returned when every term the query splits into is ASCII, so MCP clients can quote the source text accurately. They are sorted and **non-overlapping**, and the 100-span budget is shared across the terms you searched for, so a term matching once is still highlighted when another matches hundreds of times; reordering the words of a query returns the identical array as long as it stays under the 32-phrase cap (v0.18.0+ — see [docs/citations.md](docs/citations.md) for the full contract and that one caveat). `low_confidence` is a rank-based flag (`top1.score / mean(top-N.score) < min_confidence_ratio`); the threshold defaults to `1.5` and can be tuned via `[search].min_confidence_ratio` in `groove.toml` or `--min-confidence-ratio` per query.
 
 Input bounds (defensive, v0.6.0+): `query` is capped at 1 KiB; longer inputs are rejected with an `ErrorResponse`. `match_spans` is computed only for chunks under 256 KiB and capped at 100 spans per chunk. These exist to bound abuse, not legitimate use — typical chunks are well under the ceilings.
 
 The `search` tool / CLI also gained these filters in v0.3.0:
 
 ```bash
-kb-mcp search "tokio spawn" \
+groove search "tokio spawn" \
   --path-glob "docs/**" --path-glob "!docs/draft/**" \
   --tag-any rust,async \
   --date-from 2026-01-01 \
@@ -502,7 +502,7 @@ kb-mcp search "tokio spawn" \
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — lex comparison; chunks with no `date` are excluded strictly when either bound is set. MCP params: `date_from` / `date_to`.
 - `--min-confidence-ratio <N>` — per-query override of the `low_confidence` threshold.
 
-CLI `kb-mcp search --format json` follows the same wrapper format. See [docs/citations.md](docs/citations.md) for `match_spans` / byte-offset details and [docs/filters.md](docs/filters.md) for the full filter reference.
+CLI `groove search --format json` follows the same wrapper format. See [docs/citations.md](docs/citations.md) for `match_spans` / byte-offset details and [docs/filters.md](docs/filters.md) for the full filter reference.
 
 ### Diversity (MMR) and parent retriever (v0.7.0+)
 
@@ -510,16 +510,16 @@ Two opt-in retrieval-quality knobs land in v0.7.0. They are independent — enab
 
 ```bash
 # MMR diversity re-rank
-kb-mcp search "tokio runtime" --mmr true --mmr-lambda 0.7
+groove search "tokio runtime" --mmr true --mmr-lambda 0.7
 
 # Parent retriever (expand short chunks to adjacent siblings or whole doc)
-kb-mcp search "k=60 in RRF" --parent-retriever true
+groove search "k=60 in RRF" --parent-retriever true
 
 # Both at once
-kb-mcp search "context management" --mmr true --parent-retriever true
+groove search "context management" --mmr true --parent-retriever true
 ```
 
-CLI flags (also accepted by `kb-mcp eval`):
+CLI flags (also accepted by `groove eval`):
 
 - `--mmr <bool>` — enable MMR diversity re-rank. Default `false`.
 - `--mmr-lambda <0..1>` — MMR balance: `1.0` is "no diversity" (= MMR off behavior), lower values lean toward exploration / less redundancy. Default `0.7`.
@@ -541,17 +541,17 @@ Enable it via:
 enabled = true
 ```
 
-**This defaults to off**, and the reason is a measured regression, not caution for its own sake: an A/B evaluation on a 574-document dogfood knowledge base (bge-m3 embeddings) showed that with kb-mcp's actual default pipeline (no reranker), enabling static context injection made retrieval *worse* — recall@5 dropped from 0.707 to 0.627 (-0.080) and MRR dropped by -0.041. The short chunk-local vector signal gets diluted by the prefixed breadcrumb text when nothing downstream re-scores the result.
+**This defaults to off**, and the reason is a measured regression, not caution for its own sake: an A/B evaluation on a 574-document dogfood knowledge base (bge-m3 embeddings) showed that with groove's actual default pipeline (no reranker), enabling static context injection made retrieval *worse* — recall@5 dropped from 0.707 to 0.627 (-0.080) and MRR dropped by -0.041. The short chunk-local vector signal gets diluted by the prefixed breadcrumb text when nothing downstream re-scores the result.
 
 **With a reranker enabled** (`--reranker bge-v2-m3`), the picture flips: context injection improved every metric except a small recall@10 dip — recall@5 went from 0.760 to 0.807, MRR from 0.848 to 0.950, and nDCG@10 from 0.814 to 0.858. The cross-encoder reranker is able to use the extra structural signal that the raw embedding/BM25 stage cannot fully exploit on its own.
 
-**Recommendation**: only turn `[contextual] enabled = true` on if you also run with a reranker (`--reranker bge-v2-m3` or similar / `reranker = "bge-v2-m3"` in `kb-mcp.toml`). Leave it off for the plain default pipeline.
+**Recommendation**: only turn `[contextual] enabled = true` on if you also run with a reranker (`--reranker bge-v2-m3` or similar / `reranker = "bge-v2-m3"` in `groove.toml`). Leave it off for the plain default pipeline.
 
 Notes:
 
 - The returned search result schema is **unchanged** — context is an internal signal for ranking only, never exposed in `search` / `get_document` output.
-- Turning this on for an **existing** database requires `kb-mcp index --force` to rebuild the embeddings and FTS index with context injected; without `--force`, a config/DB mode mismatch just prints a warning on stderr and the database keeps its current mode (no silent mid-migration mixing of embedding spaces).
-- `kb-mcp status` reports the DB's current mode as `Context mode: static` or `Context mode: off`.
+- Turning this on for an **existing** database requires `groove index --force` to rebuild the embeddings and FTS index with context injected; without `--force`, a config/DB mode mismatch just prints a warning on stderr and the database keeps its current mode (no silent mid-migration mixing of embedding spaces).
+- `groove status` reports the DB's current mode as `Context mode: static` or `Context mode: off`.
 - See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the context breadcrumb is generated and stored.
 
 ### Connection graph from a starting document
@@ -559,9 +559,9 @@ Notes:
 When you want to find not just a single document but the semantic neighborhood around it (and neighbors of those neighbors), use the `graph` subcommand:
 
 ```bash
-kb-mcp graph --start deep-dive/mcp/overview.md --depth 2 --fan-out 5
-kb-mcp graph --start notes/rag.md --dedup-by-path --format text
-kb-mcp graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
+groove graph --start deep-dive/mcp/overview.md --depth 2 --fan-out 5
+groove graph --start notes/rag.md --dedup-by-path --format text
+groove graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
 ```
 
 Flags:
@@ -583,11 +583,11 @@ Flags:
 `json` and `text` list the same nodes, but neither shows where the walk branched — which is the part worth looking at. Two drawing formats do:
 
 ```bash
-kb-mcp graph --start notes/rag.md --format dot > graph.dot   # then: dot -Tsvg graph.dot
-kb-mcp graph --start notes/rag.md --format svg > graph.svg   # opens in any browser
+groove graph --start notes/rag.md --format dot > graph.dot   # then: dot -Tsvg graph.dot
+groove graph --start notes/rag.md --format svg > graph.svg   # opens in any browser
 ```
 
-`dot` is a [Graphviz](https://graphviz.org/) program: pipe it to `dot -Tsvg` / `-Tpng` / `-Tpdf`, open it in a DOT viewer, or paste it into one of the web ones. `svg` is a finished picture that needs nothing installed — kb-mcp lays it out itself, taking no drawing dependency, because the graph is a tree and a tree lays out in one pass.
+`dot` is a [Graphviz](https://graphviz.org/) program: pipe it to `dot -Tsvg` / `-Tpng` / `-Tpdf`, open it in a DOT viewer, or paste it into one of the web ones. `svg` is a finished picture that needs nothing installed — groove lays it out itself, taking no drawing dependency, because the graph is a tree and a tree lays out in one pass.
 
 Both colour nodes by BFS depth, label edges with the similarity score, and **say so when a limit cut the walk short**, so a picture is never mistaken for the whole neighbourhood. For a wide graph the Graphviz route gives the more compact page; the built-in SVG stacks one row per leaf, so `--max-nodes` is the knob that keeps it readable.
 
@@ -595,42 +595,42 @@ The output is a flat array of nodes with `parent_id` / `depth` / `score` so the 
 
 ### Validate frontmatter against a TOML schema
 
-If your knowledge base follows a frontmatter convention, `kb-mcp validate` checks every `.md` file against a TOML schema and reports violations. See the [Frontmatter schema validation](#frontmatter-schema-validation) section below for the schema format; the command itself is:
+If your knowledge base follows a frontmatter convention, `groove validate` checks every `.md` file against a TOML schema and reports violations. See the [Frontmatter schema validation](#frontmatter-schema-validation) section below for the schema format; the command itself is:
 
 ```bash
-kb-mcp validate --kb-path /path/to/knowledge-base
-kb-mcp validate --kb-path ... --format json | jq '.files[]'
-kb-mcp validate --kb-path ... --format github         # ::error annotations for CI
+groove validate --kb-path /path/to/knowledge-base
+groove validate --kb-path ... --format json | jq '.files[]'
+groove validate --kb-path ... --format github         # ::error annotations for CI
 ```
 
-Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `kb-mcp-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `kb-mcp validate` to an existing workflow is non-disruptive until you actually write a schema.
+Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
 
 > The `--strict` flag is currently a no-op (accepted for forward compatibility with future stricter checking modes). Use the regular invocation for now.
 
 ### Check the index itself (v0.23.0+)
 
-`kb-mcp validate` checks your documents. `kb-mcp doctor` checks the **index**:
+`groove validate` checks your documents. `groove doctor` checks the **index**:
 
 ```bash
-kb-mcp doctor --kb-path /path/to/knowledge-base
-kb-mcp doctor --kb-path ... --format json | jq '.findings[]'
+groove doctor --kb-path /path/to/knowledge-base
+groove doctor --kb-path ... --format json | jq '.findings[]'
 ```
 
 Search reads three tables that have to agree about a chunk — its text, its embedding, and its full-text row. When they stop agreeing nothing errors: a chunk with no embedding is simply never a vector hit, and one with no full-text row is never a keyword hit. Until now the only way to find out was to run a full index and watch it repair things. `doctor` asks directly, and also reports which indexed documents the MCP resource surface is holding back and why — an extension no longer in `[parsers].enabled`, a document larger than a resource read returns, or a size not recorded yet because it was indexed by an earlier version.
 
-Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index). Findings are reported, never repaired: each one names the command that fixes it, which is `kb-mcp index` or `kb-mcp index --force` for everything structural.
+Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index). Findings are reported, never repaired: each one names the command that fixes it, which is `groove index` or `groove index --force` for everything structural.
 
 > Like `search` and `eval`, this opens the database, and opening it applies any pending schema migration. It is read-only about its findings, not about the file.
 
 ### Evaluate retrieval quality against a golden query set
 
-**Optional power-user feature.** `kb-mcp eval` takes a small file of questions with known answers, runs them through the same hybrid search the `search` tool uses, and reports **recall@k / MRR / nDCG@k** with diffs against the previous run. Useful when comparing models or tuning `[quality_filter]` / RRF parameters.
+**Optional power-user feature.** `groove eval` takes a small file of questions with known answers, runs them through the same hybrid search the `search` tool uses, and reports **recall@k / MRR / nDCG@k** with diffs against the previous run. Useful when comparing models or tuning `[quality_filter]` / RRF parameters.
 
-Regular users running `kb-mcp index` + `kb-mcp serve` do not need this — without a golden file, `eval` just errors with a hint and exits.
+Regular users running `groove index` + `groove serve` do not need this — without a golden file, `eval` just errors with a hint and exits.
 
 ```bash
-# 1) Write a golden YAML at <kb_path>/.kb-mcp-eval.yml
-cat > knowledge-base/.kb-mcp-eval.yml <<'EOF'
+# 1) Write a golden YAML at <kb_path>/.groove-eval.yml
+cat > knowledge-base/.groove-eval.yml <<'EOF'
 queries:
   - query: "What does the k parameter in RRF do?"
     expected:
@@ -639,13 +639,13 @@ queries:
 EOF
 
 # 2) Run against the indexed DB
-kb-mcp eval --kb-path knowledge-base
+groove eval --kb-path knowledge-base
 
 # 3) Re-run after tweaking config / model to see the diff
-kb-mcp eval --kb-path knowledge-base --reranker bge-v2-m3
+groove eval --kb-path knowledge-base --reranker bge-v2-m3
 ```
 
-Output: aggregate metrics + per-query rows for regressions / misses only. JSON (`--format json`) exposes the full per-query detail. History lives at `<kb_path>/.kb-mcp-eval-history.json` and keeps the last 10 runs for diff display.
+Output: aggregate metrics + per-query rows for regressions / misses only. JSON (`--format json`) exposes the full per-query detail. History lives at `<kb_path>/.groove-eval-history.json` and keeps the last 10 runs for diff display.
 
 If you keep notes about the evaluation inside the knowledge base being evaluated, those notes compete with the real answers. From v0.24.0 every run scans the corpus and warns on stderr when a document quotes **two or more** golden queries verbatim (`findings` in `--format json`) — the shape of a note written *about* the golden set. It reports only; the exit code is unchanged. Details, including why one match is not enough to report: [docs/eval.md](./docs/eval.md).
 
@@ -653,14 +653,14 @@ For CI: pass `--fail-on-regression` (v0.6.0+) to exit with code 1 when any aggre
 
 See [docs/eval.md](docs/eval.md) for the golden YAML reference, metric definitions, diff output guide, and troubleshooting.
 
-### Measuring the fusion parameters (`kb-mcp tune`, v0.13.0+)
+### Measuring the fusion parameters (`groove tune`, v0.13.0+)
 
 `[search.fusion]` exposes the RRF constant and the bm25 column weights, but the
 defaults are the industry convention and RRF is documented as requiring no
 tuning. If you want evidence rather than a guess for *your* KB, run:
 
 ```bash
-kb-mcp tune --kb-path knowledge-base
+groove tune --kb-path knowledge-base
 ```
 
 It sweeps a fixed grid against your golden query set, guards the result with
@@ -672,7 +672,7 @@ all**, so `tune` opens with a pre-flight that reports the effective N and exits
 
 ## Connecting to Claude Code / Cursor
 
-> **Looking for full deployment recipes?** See [`kb-mcp/examples/deployments/`](./kb-mcp/examples/deployments/) for ready-to-adapt configs covering three patterns: personal stdio, NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). For a single-machine loopback daemon shared by several parallel Claude Code sessions, use `kb-mcp service install` — it replaced the former `personal-http` recipe in v0.8.0. The snippets below are the canonical stdio entry point you'll find in those recipes.
+> **Looking for full deployment recipes?** See [`grooveseek/examples/deployments/`](./grooveseek/examples/deployments/) for ready-to-adapt configs covering three patterns: personal stdio, NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). For a single-machine loopback daemon shared by several parallel Claude Code sessions, use `groove service install` — it replaced the former `personal-http` recipe in v0.8.0. The snippets below are the canonical stdio entry point you'll find in those recipes.
 
 Add the following to `.mcp.json` in your project root (or the equivalent MCP config for your client):
 
@@ -680,7 +680,7 @@ Add the following to `.mcp.json` in your project root (or the equivalent MCP con
 {
   "mcpServers": {
     "ai-knowledge": {
-      "command": "/path/to/kb-mcp",
+      "command": "/path/to/groove",
       "args": ["serve", "--kb-path", "/path/to/knowledge-base"],
       "type": "stdio"
     }
@@ -694,7 +694,7 @@ With a multilingual model and reranker enabled:
 {
   "mcpServers": {
     "ai-knowledge": {
-      "command": "/path/to/kb-mcp",
+      "command": "/path/to/groove",
       "args": [
         "serve",
         "--kb-path", "/path/to/knowledge-base",
@@ -716,7 +716,7 @@ For agent workflows, a more conservative alternative: load the reranker but leav
 {
   "mcpServers": {
     "ai-knowledge": {
-      "command": "/path/to/kb-mcp",
+      "command": "/path/to/groove",
       "args": [
         "serve",
         "--kb-path", "/path/to/knowledge-base",
@@ -731,13 +731,13 @@ For agent workflows, a more conservative alternative: load the reranker but leav
 }
 ```
 
-Or, if you placed a `kb-mcp.toml` somewhere on the [discovery path](#config-file-discovery) with those options set, the `.mcp.json` can shrink to:
+Or, if you placed a `groove.toml` somewhere on the [discovery path](#config-file-discovery) with those options set, the `.mcp.json` can shrink to:
 
 ```json
 {
   "mcpServers": {
     "ai-knowledge": {
-      "command": "/path/to/kb-mcp",
+      "command": "/path/to/groove",
       "args": ["serve"],
       "type": "stdio"
     }
@@ -757,7 +757,7 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
       {
         "matcher": "Write|Edit|MultiEdit|Skill",
         "hooks": [
-          { "type": "command", "command": "kb-mcp index" }
+          { "type": "command", "command": "groove index" }
         ]
       }
     ]
@@ -765,16 +765,16 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 }
 ```
 
-SHA-256 diffing in `kb-mcp index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`kb-mcp/examples/hooks/`](./kb-mcp/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](./grooveseek/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
 
 ### Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:
 
 ```bash
-kb-mcp validate --kb-path /path/to/knowledge-base
+groove validate --kb-path /path/to/knowledge-base
 ```
 
-Put a `kb-mcp-schema.toml` at the root of `--kb-path` (template: `kb-mcp-schema.toml.example`):
+Put a `groove-schema.toml` at the root of `--kb-path` (template: `groove-schema.toml.example`):
 
 ```toml
 [fields.title]
@@ -805,10 +805,10 @@ min_length = 1
 - The `index` and `serve` commands are not affected — validation is opt-in only.
 
 ### HTTP transport for multiple simultaneous clients
-By default `kb-mcp serve` speaks MCP over stdio — one client per server process. To serve multiple clients simultaneously (e.g. several Claude Code sessions or an external script hitting the same index), switch to Streamable HTTP:
+By default `groove serve` speaks MCP over stdio — one client per server process. To serve multiple clients simultaneously (e.g. several Claude Code sessions or an external script hitting the same index), switch to Streamable HTTP:
 
 ```bash
-kb-mcp serve --kb-path /path/to/knowledge-base --transport http --port 3100
+groove serve --kb-path /path/to/knowledge-base --transport http --port 3100
 # or, to accept connections from outside this machine: --bind 0.0.0.0:3100 --i-know
 ```
 
@@ -826,9 +826,9 @@ The server mounts the MCP endpoint at `/mcp` and exposes `/healthz` for probes. 
 ```
 
 Security notes:
-- Default bind is `127.0.0.1:3100` (loopback). **kb-mcp has no built-in authentication**, so the bind address is the only access control — use `--bind 0.0.0.0:3100` on trusted networks only. Since v0.17.0 a non-loopback `--bind` is refused unless you add `--i-know`, matching `kb-mcp service install`. A non-loopback address coming from `[transport.http].bind` in `kb-mcp.toml` is **not** gated — existing service deployments keep working — and it warns at startup only when the Host allow-list is missing or empty (see the next two bullets). Writing an explicit `allowed_hosts` list is taken as a statement of intent, so that combination is silent by design.
+- Default bind is `127.0.0.1:3100` (loopback). **groove has no built-in authentication**, so the bind address is the only access control — use `--bind 0.0.0.0:3100` on trusted networks only. Since v0.17.0 a non-loopback `--bind` is refused unless you add `--i-know`, matching `groove service install`. A non-loopback address coming from `[transport.http].bind` in `groove.toml` is **not** gated — existing service deployments keep working — and it warns at startup only when the Host allow-list is missing or empty (see the next two bullets). Writing an explicit `allowed_hosts` list is taken as a statement of intent, so that combination is silent by design.
 - rmcp's Streamable HTTP layer enforces Host header validation (loopback only by default) to prevent DNS rebinding attacks. **Host validation is not authentication** — any peer that can reach the port may send `Host: localhost`. Treat it as a browser-side defence, and restrict reachability at the network layer.
-- For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `kb-mcp.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; kb-mcp emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics), which combined with a non-loopback bind leaves `/mcp` open to every peer that can reach the port — that combination now warns at startup too.
+- For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `groove.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; groove emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics), which combined with a non-loopback bind leaves `/mcp` open to every peer that can reach the port — that combination now warns at startup too.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
 ### Web UI and admin API (HTTP transport only)
@@ -858,7 +858,7 @@ curl http://127.0.0.1:3100/api/admin/status
   "daemon":   { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "2026-07-26T09:12:03Z" },
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
-  "kb":       { "path": "/srv/kb-mcp/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
+  "kb":       { "path": "/srv/groove/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
   "config_source": "Cwd"
 }
 ```
@@ -876,9 +876,9 @@ peer and its default `Host` is allow-listed, so proxying `/ui` hands the page to
 whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
 
 ### Live-sync via file watcher
-`kb-mcp serve` runs a `notify`-based file watcher by default. Any change under `--kb-path` (create / modify / delete / rename) is detected, debounced, and only the affected file is re-indexed. This covers manual editor saves, `git pull`, and external scripts — cases the PostToolUse hook cannot intercept.
+`groove serve` runs a `notify`-based file watcher by default. Any change under `--kb-path` (create / modify / delete / rename) is detected, debounced, and only the affected file is re-indexed. This covers manual editor saves, `git pull`, and external scripts — cases the PostToolUse hook cannot intercept.
 
-- **Default on**. `[watch].enabled = false` in `kb-mcp.toml` or `--no-watch` on the command line disables it.
+- **Default on**. `[watch].enabled = false` in `groove.toml` or `--no-watch` on the command line disables it.
 - **Debounce** is 500 ms by default. Tune with `[watch].debounce_ms` or `--debounce-ms`.
 - **Coexists with the PostToolUse hook**. Both paths lock the same `Mutex<Database>` / `Mutex<Embedder>`, so concurrent triggers are serialized at the Rust layer and are idempotent.
 - **Extension-aware**. The watcher shares the Parser registry with `rebuild_index`, so only files whose extension is enabled in `[parsers].enabled` are re-indexed; other events are dropped.
@@ -900,9 +900,9 @@ hf download BAAI/bge-m3 \
 # Pre-download BGE-reranker-v2-m3 (for `--reranker bge-v2-m3`)
 hf download BAAI/bge-reranker-v2-m3
 
-# Run kb-mcp pointing at the HF cache (HF Hub cache layout is compatible with fastembed)
+# Run groove pointing at the HF cache (HF Hub cache layout is compatible with fastembed)
 FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
-    kb-mcp index --kb-path ./knowledge-base --model bge-m3 --force
+    groove index --kb-path ./knowledge-base --model bge-m3 --force
 ```
 
 ## Tools
@@ -912,13 +912,13 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 | `search` | Hybrid search (vector + FTS5 full-text) merged via Reciprocal Rank Fusion, optionally followed by cross-encoder reranking, optional MMR diversity re-rank, and optional parent retriever content expansion. Returns a wrapper `{ results, low_confidence, filter_applied }` with chunks ranked by relevance; each result may carry `expanded_from` if parent retriever fired. See [docs/citations.md](docs/citations.md), [docs/filters.md](docs/filters.md), [docs/retrieval-pipeline.md](docs/retrieval-pipeline.md). | `query` (required), `limit`, `category`, `topic`, `rerank` (override server default), `min_quality`, `include_low_quality`, `path_globs` (glob list, `!`-prefix excludes), `tags_any` / `tags_all`, `date_from` / `date_to` (`YYYY-MM-DD`), `min_confidence_ratio`, `mmr` / `mmr_lambda` / `mmr_same_doc_penalty` (v0.7.0+), `parent_retriever` (v0.7.0+) |
 | `list_topics` | List all indexed topics and categories with document counts. | (none) |
 | `get_document` | Get the full content and metadata of a document by its relative path. | `path` (e.g. `"deep-dive/mcp/overview.md"`) |
-| `get_best_practice` | Opt-in: when `[best_practice].path_templates` is configured in `kb-mcp.toml`, fetch a best-practices document for the given target and optionally extract an h2 section. Without configuration the tool returns a "not configured" error. | `target` (e.g. `"claude-code"`), `category` (optional) |
+| `get_best_practice` | Opt-in: when `[best_practice].path_templates` is configured in `groove.toml`, fetch a best-practices document for the given target and optionally extract an h2 section. Without configuration the tool returns a "not configured" error. | `target` (e.g. `"claude-code"`), `category` (optional) |
 | `rebuild_index` | Rebuild the search index by scanning all source files (Markdown plus any other extensions enabled via `[parsers].enabled`). | `force` (optional, default false) |
 | `get_connection_graph` | BFS-expand semantically related chunks starting from a document path. Returns a flat list of nodes with `parent_id` / `depth` / `score` / `snippet` so the caller can chain context discovery, plus `truncated` / `truncation[]` when a bound cut the walk short. | `path` (required), `depth` (default 2, max 3), `fan_out` (default 5, max 20), `min_similarity` (default 0.3), `seed_strategy` (`all_chunks` / `centroid`), `dedup_by_path`, `category`, `topic`, `exclude_paths`, `max_nodes` (default 100, max 2000), `max_seed_chunks` (default 32, max 1000) |
 
 ## Prompts
 
-(v0.22.0+) Four prompts ship with the server. A client surfaces them as commands the **user** picks — Claude Code renders them as `/mcp__kb-mcp__<name>` — and each one exists because the tools alone do not say how to combine them: `search` does not tell a caller to follow it with `get_connection_graph`, or that a `low_confidence` flag means the answer should say so.
+(v0.22.0+) Four prompts ship with the server. A client surfaces them as commands the **user** picks — Claude Code renders them as `/mcp__groove__<name>` — and each one exists because the tools alone do not say how to combine them: `search` does not tell a caller to follow it with `get_connection_graph`, or that a `low_confidence` flag means the answer should say so.
 
 | Prompt | Arguments | What it asks for |
 |---|---|---|
@@ -929,7 +929,7 @@ FASTEMBED_CACHE_DIR=~/.cache/huggingface/hub \
 
 All four are plain text and share one set of citation rules: cite the `path` of every document used, surface `low_confidence` rather than answering through it, and say when the knowledge base is silent instead of filling the gap from general knowledge.
 
-They are fixed at compile time rather than configurable. Prompt text goes to the model, and `kb-mcp.toml` is *discovered* — from the working directory or a `.git` ancestor — so a configurable prompt set would need the same restriction that already applies to `kb_path` under an untrusted config. The MCP specification offers no help here: unlike tool annotations, it gives clients no guidance to distrust prompt content.
+They are fixed at compile time rather than configurable. Prompt text goes to the model, and `groove.toml` is *discovered* — from the working directory or a `.git` ancestor — so a configurable prompt set would need the same restriction that already applies to `kb_path` under an untrusted config. The MCP specification offers no help here: unlike tool annotations, it gives clients no guidance to distrust prompt content.
 
 ## Resources
 
@@ -940,13 +940,13 @@ They are fixed at compile time rather than configurable. Prompt text goes to the
 | `kb://topic/<prefix>` | A **topic group** — the first one or two path segments, the same derivation the indexer uses for `category` and `topic`. Reading one returns a Markdown list of the documents under it, with their URIs. `kb://topic/` is the root group. |
 | `kb://doc/<path>` | One indexed document, by its knowledge-base-relative path. Advertised as a template rather than enumerated. |
 
-`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on `search` hits — the specification permits handing back links to documents a listing never enumerated. Both the listing and that field come from one predicate, so they always agree about a document. Two things take a document off offer while leaving it indexed and findable. The first is the active parser registry: if you narrow `[parsers].enabled` without reindexing, the rows for the dropped extensions stay in the index and stay in search results, but they are no longer offered, because a read would refuse them. The second is size (v0.23.0+): a Markdown or text document over 1 MiB is more than `resources/read` will return, so it is not offered either — its `search` hit stays, without a `uri`. A PDF or spreadsheet over that size is still offered, because a read truncates its extracted text rather than refusing it. Sizes are recorded during indexing; documents indexed by an earlier version have no size recorded and stay on offer until the next `kb-mcp index`, which fills them in without re-embedding. `kb-mcp doctor` reports both counts. Reasoning: [ADR-0005](docs/decisions/0005-record-document-size-in-the-index.md).
+`resources/list` returns the topic groups, **not one entry per document**. A knowledge base has hundreds of documents but tens of groups, and a listing is something the client fetches on every connect. Individual documents stay reachable through the template and through the `uri` field that now appears on `search` hits — the specification permits handing back links to documents a listing never enumerated. Both the listing and that field come from one predicate, so they always agree about a document. Two things take a document off offer while leaving it indexed and findable. The first is the active parser registry: if you narrow `[parsers].enabled` without reindexing, the rows for the dropped extensions stay in the index and stay in search results, but they are no longer offered, because a read would refuse them. The second is size (v0.23.0+): a Markdown or text document over 1 MiB is more than `resources/read` will return, so it is not offered either — its `search` hit stays, without a `uri`. A PDF or spreadsheet over that size is still offered, because a read truncates its extracted text rather than refusing it. Sizes are recorded during indexing; documents indexed by an earlier version have no size recorded and stay on offer until the next `groove index`, which fills them in without re-embedding. `groove doctor` reports both counts. Reasoning: [ADR-0005](docs/decisions/0005-record-document-size-in-the-index.md).
 
 Separators stay as forward slashes; everything else is percent-encoded, so a path with spaces or non-ASCII characters produces a valid ASCII URI.
 
-**A read is bounded by the index.** A document is served only if it is indexed, and then only through the same checks `get_document` applies — symlink and hard-link refusal, path traversal, extension membership, size cap, and a handle-bound read. This is *narrower* than `get_document`, which serves anything under `kb_path` with a registered extension: a resource is something the server offered, so serving a URI that was never on offer is a different operation. `.kb-mcpignore`d documents are therefore absent from resources while remaining readable through `get_document`, which is [ADR-0003](docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md)'s contract unchanged. The reasoning is in [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.md).
+**A read is bounded by the index.** A document is served only if it is indexed, and then only through the same checks `get_document` applies — symlink and hard-link refusal, path traversal, extension membership, size cap, and a handle-bound read. This is *narrower* than `get_document`, which serves anything under `kb_path` with a registered extension: a resource is something the server offered, so serving a URI that was never on offer is a different operation. `.grooveignore`d documents are therefore absent from resources while remaining readable through `get_document`, which is [ADR-0003](docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md)'s contract unchanged. The reasoning is in [ADR-0004](docs/decisions/0004-resource-reads-are-bounded-by-the-index.md).
 
-Content comes back as text with the media type of what is served: `text/markdown` for Markdown, `text/plain` for anything delivered as extracted text. A PDF or a spreadsheet is served as the text kb-mcp extracted from it, not as the original bytes.
+Content comes back as text with the media type of what is served: `text/markdown` for Markdown, `text/plain` for anything delivered as extracted text. A PDF or a spreadsheet is served as the text groove extracted from it, not as the original bytes.
 
 Not implemented: `resources/subscribe` and `notifications/resources/list_changed`. `"resources": {}` is a conforming declaration without them, and a fixed set of topic groups rarely changes.
 
@@ -956,17 +956,17 @@ Not implemented: `resources/subscribe` and `notifications/resources/list_changed
   1. `FASTEMBED_CACHE_DIR` environment variable, if set.
   2. OS cache dir joined with `fastembed` (Linux: `~/.cache/fastembed`, macOS: `~/Library/Caches/fastembed`, Windows: `%LOCALAPPDATA%\fastembed`).
   3. `.fastembed_cache` under the current working directory (final fallback).
-- **Index storage**: The SQLite database is stored as `.kb-mcp.db` in the **parent** directory of the `--kb-path` (i.e. the repository root when `--kb-path` points to `knowledge-base/`).
+- **Index storage**: The SQLite database is stored as `.groove.db` in the **parent** directory of the `--kb-path` (i.e. the repository root when `--kb-path` points to `knowledge-base/`).
 - **Parser registry**: only file extensions listed in `[parsers].enabled` are indexed. The section defaults to `["md"]` (the default behavior); `["md", "txt"]` opts into `.txt` where the title is derived from the filename, `["md", "pdf"]` (v0.10.0+) opts into `.pdf` (see the PDF indexing note below), and `["md", "docx", "xlsx", "pptx"]` (v0.11.0+) opts into Office documents (see the Office document indexing note below). Unknown ids (e.g. `"rst"` / `"adoc"`) are rejected at startup; an empty array is also rejected to avoid silent "nothing is indexed" failures.
 - **PDF indexing (v0.10.0+)**: opt-in via `[parsers].enabled = ["md", "pdf"]`. Text is extracted page-by-page with [oxidize-pdf](https://crates.io/crates/oxidize-pdf) (pure Rust); each non-empty page becomes one chunk with heading `p.N`. `Title` / `CreationDate` PDF metadata become frontmatter when present, falling back to a filename-derived title when the PDF has no `Title`. Encrypted PDFs are skipped with a warning (no password support). Like other binary formats, `.pdf` files are subject to the 50 MiB raw-byte size cap — larger files are skipped with a warning instead of aborting the run. Known limitations:
   - **Too little text to index**: a PDF averaging under 50 chars/page of extracted text is skipped with a warning and never indexed. That covers scanned / image-only PDFs, for which there is **no OCR**, but it is not only those: a cover sheet, a label, or a sparse slide deck can land here with its text extracted perfectly. The threshold is not lowered because a scan carrying only digitally-stamped page numbers and a "CONFIDENTIAL" header — exactly what this check is for — measures 39 chars/page (2026-08-10).
   - **CJK PDFs extract correctly as of v0.15.2**, including CID-keyed fonts using a predefined CMap with no `/ToUnicode` (what ReportLab emits). Earlier versions decoded that form to mojibake — the cause was upstream in oxidize-pdf, which read `/DescendantFonts` only when the CIDFont was written as an indirect reference; this project reported and fixed it ([bzsanti/oxidizePdf#469](https://github.com/bzsanti/oxidizePdf/issues/469), fix shipped in oxidize-pdf 4.3.0, picked up in v0.15.2). Japanese PDFs embedding a TrueType subset with a `/ToUnicode` CMap — what Word, LibreOffice and Google Docs export — extracted correctly all along (measured 2026-08-10: 569 chars/page on a dense Japanese report).
-  - **A PDF whose text layer decodes to mojibake is skipped, not indexed** (v0.15.1+). This is now a defense-in-depth gate for decode failures from other causes, kept in place after the CID fix above. kb-mcp detects mis-decoded text via two signals — C1 control codes (U+0080–U+009F) reaching 1% of the extracted characters, which correctly decoded text never contains, and the alternating byte-pair signature of UTF-16BE read one byte at a time, which catches the kana-only shape that emits no C1 (`あ` comes out as `0B`) — and refuses to index text no query could match, naming the decode failure rather than blaming the page density.
+  - **A PDF whose text layer decodes to mojibake is skipped, not indexed** (v0.15.1+). This is now a defense-in-depth gate for decode failures from other causes, kept in place after the CID fix above. groove detects mis-decoded text via two signals — C1 control codes (U+0080–U+009F) reaching 1% of the extracted characters, which correctly decoded text never contains, and the alternating byte-pair signature of UTF-16BE read one byte at a time, which catches the kana-only shape that emits no C1 (`あ` comes out as `0B`) — and refuses to index text no query could match, naming the decode failure rather than blaming the page density.
   - **Reading order on multi-column layouts**: extraction follows the PDF's internal text-drawing order, which can interleave columns on complex multi-column layouts (e.g. slide decks). Single-column documents are unaffected.
   - **Garbage `Title` metadata is not filtered**: the filename fallback only triggers when the PDF's `Title` field is empty. A non-empty but meaningless auto-generated title (e.g. left over from an export pipeline) is used as-is.
   - **Hyphenation join is a conservative heuristic**: a line-end `-\n` is joined only when the character before `-` and the character after `\n` are both ASCII lowercase letters (to avoid corrupting hyphenated model numbers, dates, or CJK-adjacent hyphens). This occasionally leaves a genuine word break unjoined, or joins a coincidental lowercase-lowercase pair that wasn't actually a hyphenation.
 
-  kb-mcp also works around a `oxidize-pdf` quirk found while dogfooding a real Japanese PDF (2026-07-19): when a PDF's `/Title` uses the PDF spec's UTF-16BE string form (common for non-ASCII titles), the dependency doesn't detect the byte-order-mark and mis-decodes the string one byte at a time, producing mojibake. kb-mcp detects this specific mis-decode pattern and reverses it to recover the original title; if recovery isn't possible (or the recovered text still looks like garbage) the filename fallback kicks in instead of surfacing mojibake. Extracted page `content` was never affected by this — only the `title` field.
+  groove also works around a `oxidize-pdf` quirk found while dogfooding a real Japanese PDF (2026-07-19): when a PDF's `/Title` uses the PDF spec's UTF-16BE string form (common for non-ASCII titles), the dependency doesn't detect the byte-order-mark and mis-decodes the string one byte at a time, producing mojibake. groove detects this specific mis-decode pattern and reverses it to recover the original title; if recovery isn't possible (or the recovered text still looks like garbage) the filename fallback kicks in instead of surfacing mojibake. Extracted page `content` was never affected by this — only the `title` field.
 - **Office document indexing (v0.11.0+)**: opt-in via `[parsers].enabled = [..., "docx", "xlsx", "pptx"]`. Each format is parsed in-tree (no LibreOffice / MS Office dependency):
 
   | Extension | Library | Chunk granularity | Frontmatter source |
@@ -984,15 +984,15 @@ Not implemented: `resources/subscribe` and `notifications/resources/list_changed
   - **Tables are flattened to plain text**: `.docx` and `.pptx` table cells are read as ordinary text runs (no row/column structure preserved in the chunk); `.xlsx` rows are tab-joined per line. Downstream retrieval sees prose, not a grid.
 
   Like `.pdf`, all four formats share the 50 MiB raw-byte size cap (`MAX_RAW_BINARY_BYTES`) with the indexer's size-skip guard and `get_document`.
-- **Live-sync file watcher**: `kb-mcp serve` spawns a `notify`-based watcher by default (`[watch].enabled = true`, 500 ms debounce). Manual saves, `git pull`, and external scripts are re-indexed incrementally on the same Mutex-guarded resources used by MCP tools, so concurrent triggers are serialized. Disable with `--no-watch` or `[watch].enabled = false`.
+- **Live-sync file watcher**: `groove serve` spawns a `notify`-based watcher by default (`[watch].enabled = true`, 500 ms debounce). Manual saves, `git pull`, and external scripts are re-indexed incrementally on the same Mutex-guarded resources used by MCP tools, so concurrent triggers are serialized. Disable with `--no-watch` or `[watch].enabled = false`.
 - **HTTP transport**: `--transport http --port 3100` serves MCP over rmcp's Streamable HTTP at `/mcp`, with `/healthz` for probes and a Mutex-serialized pipeline inside. Default bind is `127.0.0.1:3100` — `0.0.0.0` is opt-in and **has no built-in authentication yet**; restrict with a reverse proxy / firewall until that arrives.
 - **Embedding dimensions**: Depends on `--model`. BGE-small-en-v1.5 = 384, BGE-M3 = 1024. The chosen dim is declared on the `vec_chunks` virtual table and recorded in the `index_meta` table; a mismatch at runtime is detected and rejected.
 - **Incremental indexing**: Files are tracked by SHA-256 content hash. Only changed files are re-embedded on subsequent `index` runs (unless `--force` is passed). Moving / renaming a file without modifying its content is detected via hash match and handled as a `documents.path` UPDATE — the existing chunks, embeddings, and FTS rows are reused instead of being rebuilt. The rebuild summary reports the number of renames as `renamed` next to `updated` / `deleted`.
 - **Resilient to unreadable / non-UTF-8 files**: a file that fails to read, exceeds the size cap, or fails to parse is skipped with a warning instead of aborting the whole `index` run — a stray binary file mixed into `--kb-path` no longer breaks indexing for the rest of the knowledge base.
 - **Size caps**: 50 MiB of raw bytes per file, checked with `stat` before the file is read, for text (`MAX_RAW_TEXT_BYTES`, v0.17.0+) as well as binary formats (`MAX_RAW_BINARY_BYTES`). Text used to be uncapped, which let a single oversized `.md` pull its whole content into memory — reachable from any client, since `rebuild_index` is an MCP tool. Files over the cap are skipped with a warning naming which limit applied.
-- **Hybrid search (FTS5 + vector)**: The `search` tool combines SQLite FTS5 full-text search (trigram tokenizer, works for Japanese/CJK too; three columns since v0.12.0 — `heading`, `context`, `content` — with `heading` weighted 2× in bm25 by default) with the vector search via Reciprocal Rank Fusion (`k = 60` by default). Both the weights and `k` are configurable under `[search.fusion]` since v0.13.0, and `kb-mcp tune` measures whether moving them helps on your KB. The returned `score` is the RRF score (higher = better), not a distance. Since v0.16.0 the query is compiled into per-token phrases joined with `OR` rather than searched verbatim (see "One-shot search from the command line" above). A query that yields no usable phrase falls back to vector-only — but a query whose fragments are all short falls back to one whole-query verbatim phrase first, so vector-only happens exactly when the query is under 3 characters after trimming (below the trigram minimum).
+- **Hybrid search (FTS5 + vector)**: The `search` tool combines SQLite FTS5 full-text search (trigram tokenizer, works for Japanese/CJK too; three columns since v0.12.0 — `heading`, `context`, `content` — with `heading` weighted 2× in bm25 by default) with the vector search via Reciprocal Rank Fusion (`k = 60` by default). Both the weights and `k` are configurable under `[search.fusion]` since v0.13.0, and `groove tune` measures whether moving them helps on your KB. The returned `score` is the RRF score (higher = better), not a distance. Since v0.16.0 the query is compiled into per-token phrases joined with `OR` rather than searched verbatim (see "One-shot search from the command line" above). A query that yields no usable phrase falls back to vector-only — but a query whose fragments are all short falls back to one whole-query verbatim phrase first, so vector-only happens exactly when the query is under 3 characters after trimming (below the trigram minimum).
 - **Optional reranking**: With `--reranker <model>` the top candidates are re-scored by a cross-encoder before being returned. When rerank is applied, `score` is the cross-encoder raw score instead of the RRF value. Reranking is index-independent — you can toggle it at server start without re-indexing.
-- **Connection graph**: `get_connection_graph` / `kb-mcp graph` do BFS over the vector index starting from a document. No extra index is built; **each node that gets expanded runs one fresh sqlite-vec KNN**, and there is no ANN index, so one KNN scans every vector in the knowledge base.
+- **Connection graph**: `get_connection_graph` / `groove graph` do BFS over the vector index starting from a document. No extra index is built; **each node that gets expanded runs one fresh sqlite-vec KNN**, and there is no ANN index, so one KNN scans every vector in the knowledge base.
 
   Two bounds keep a request finite, and **both report themselves when they bite**:
 
@@ -1018,20 +1018,20 @@ Not implemented: `resources/subscribe` and `notifications/resources/list_changed
   The database lock is held throughout, so a graph request still delays concurrent searches for as long as it runs. The bounds make that duration finite and predictable, but they are expressed in nodes, not seconds: one KNN costs about 72 ms on the knowledge base measured above, and scales with its chunk count and embedding dimension. `exclude_paths` — like `search`'s `path_globs` / `tags_any` / `tags_all` — is limited to 64 entries of at most 1 KiB each.
 
   Scores are cosine similarity approximated from L2 distance (`1 - d²/2`, clamped to `[0,1]`) assuming unit-normalized embeddings (BGE-small / BGE-M3 are normalized internally).
-- **Heading exclusion**: Sections whose heading text contains any of `exclude_headings` are dropped during chunking. The default is an empty list (keep every section); populate `exclude_headings` in `kb-mcp.toml` to opt in. Matching is substring-based (`heading.contains(pattern)`), so short patterns catch suffixed variants (`"参考リンク"` would also match `"## 参考リンク (旧)"`).
-- **Directory exclusion**: `walkdir` skips any directory whose basename matches an entry in `exclude_dirs`. Matching is on the whole name and **case-insensitive**: Unicode lowercase mapping with Greek final sigma folded, so `["résumé"]` matches `RÉSUMÉ` and `["οσ"]` matches `ΟΣ`. It is not full Unicode case folding (`straße` and `STRASSE` stay distinct) and names are not normalized (a combining-mark spelling still differs from a precomposed one). `exclude_dirs = ["build"]` therefore also skips a directory created as `Build` — on Windows and macOS those are one directory, and an exact match would let the exclusion be bypassed by however it happens to be capitalised on disk. The same rule applies to the full index walk, `kb-mcp validate`, and the live watcher. The default list is `[".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"]`. A user-specified list replaces the default entirely (no merging); `exclude_dirs = []` walks everything except `.git` / `.svn` / `node_modules`, which stay excluded as a fail-safe.
-- **`.kb-mcpignore`** (v0.21.0+): a file named `.kb-mcpignore` in the **root of the knowledge base** excludes paths using [gitignore syntax](https://git-scm.com/docs/gitignore) — `*` / `?` / `[a-z]`, `**` in its three positions, a trailing `/` for directories only, a leading `/` to anchor to the root, and `!` to re-include something an earlier line excluded. Where `exclude_dirs` can only name whole directories, this can name files and globs: `drafts/`, `*.tmp.md`, `archive/**`, `notes/*.md` with `!notes/keep.md`.
+- **Heading exclusion**: Sections whose heading text contains any of `exclude_headings` are dropped during chunking. The default is an empty list (keep every section); populate `exclude_headings` in `groove.toml` to opt in. Matching is substring-based (`heading.contains(pattern)`), so short patterns catch suffixed variants (`"参考リンク"` would also match `"## 参考リンク (旧)"`).
+- **Directory exclusion**: `walkdir` skips any directory whose basename matches an entry in `exclude_dirs`. Matching is on the whole name and **case-insensitive**: Unicode lowercase mapping with Greek final sigma folded, so `["résumé"]` matches `RÉSUMÉ` and `["οσ"]` matches `ΟΣ`. It is not full Unicode case folding (`straße` and `STRASSE` stay distinct) and names are not normalized (a combining-mark spelling still differs from a precomposed one). `exclude_dirs = ["build"]` therefore also skips a directory created as `Build` — on Windows and macOS those are one directory, and an exact match would let the exclusion be bypassed by however it happens to be capitalised on disk. The same rule applies to the full index walk, `groove validate`, and the live watcher. The default list is `[".obsidian", ".git", "node_modules", "target", ".vscode", ".idea"]`. A user-specified list replaces the default entirely (no merging); `exclude_dirs = []` walks everything except `.git` / `.svn` / `node_modules`, which stay excluded as a fail-safe.
+- **`.grooveignore`** (v0.21.0+): a file named `.grooveignore` in the **root of the knowledge base** excludes paths using [gitignore syntax](https://git-scm.com/docs/gitignore) — `*` / `?` / `[a-z]`, `**` in its three positions, a trailing `/` for directories only, a leading `/` to anchor to the root, and `!` to re-include something an earlier line excluded. Where `exclude_dirs` can only name whole directories, this can name files and globs: `drafts/`, `*.tmp.md`, `archive/**`, `notes/*.md` with `!notes/keep.md`.
 
   Only that one file is read. Subdirectory ignore files are not consulted, nothing above `kb_path` is, and `.gitignore` is not — a knowledge base kept in git often ignores exactly the large files you want indexed, so what gets indexed does not change because the repository's ignore rules did. Copy the patterns across if you want them.
 
-  The three layers are a **union**: the built-in `.git` / `.svn` / `node_modules` fail-safe, then `exclude_dirs`, then this file. Any one of them excluding a path is enough, so `!` can only undo an earlier line of `.kb-mcpignore` itself — it cannot bring back something `exclude_dirs` or the fail-safe removed. Matching is **case-insensitive**, like `exclude_dirs`, so the same file behaves the same way on Linux as on Windows and macOS. As in git, a file under an excluded directory cannot be re-included by a later `!` line, because the walk never descends into it.
+  The three layers are a **union**: the built-in `.git` / `.svn` / `node_modules` fail-safe, then `exclude_dirs`, then this file. Any one of them excluding a path is enough, so `!` can only undo an earlier line of `.grooveignore` itself — it cannot bring back something `exclude_dirs` or the fail-safe removed. Matching is **case-insensitive**, like `exclude_dirs`, so the same file behaves the same way on Linux as on Windows and macOS. As in git, a file under an excluded directory cannot be re-included by a later `!` line, because the walk never descends into it.
 
-  The same rules apply to the full index walk, `kb-mcp validate` and the live watcher. Editing the file while the server is running takes effect for **subsequent** file events; documents already in the index stay there until the next `kb-mcp index` (or MCP `rebuild_index`), which re-reads the file and drops what it now excludes. A file that exists but cannot be read — a hard link, a symlink, a directory, over 64 KiB, or past 1000 patterns — is reported as a warning and the run continues without it (or without the excess patterns) rather than refusing to start.
+  The same rules apply to the full index walk, `groove validate` and the live watcher. Editing the file while the server is running takes effect for **subsequent** file events; documents already in the index stay there until the next `groove index` (or MCP `rebuild_index`), which re-reads the file and drops what it now excludes. A file that exists but cannot be read — a hard link, a symlink, a directory, over 64 KiB, or past 1000 patterns — is reported as a warning and the run continues without it (or without the excess patterns) rather than refusing to start.
 
-  **This bounds indexing, not access.** An excluded file is never indexed, so it can never appear in `search` or `get_connection_graph`, which read from the database and never touch the filesystem. It remains readable through `get_document` by a caller that knows its path, exactly as a file under `exclude_dirs` always has been. That is deliberate rather than an oversight: whoever can write into the knowledge base can also delete `.kb-mcpignore`, so a rule living inside the tree cannot be the thing that guards it. Keep anything that must not be readable outside `kb_path`.
-- **Links are not followed, and that includes hard links**: a symlink is never indexed, never watched, and never returned by `get_document`, because whoever can write into the knowledge base should not be able to make kb-mcp read a file *they* cannot read and hand it back through `search`. A hard link does the same thing while looking like an ordinary file — it is a second name for one file, it needs no read access to create, and on Windows no privilege either — so a file with **more than one name** is refused the same way, in all three places. The refusal names the file and says why. This is deliberately blunt: nothing portable can tell whether the other name is inside the knowledge base or outside it, so a legitimately hard-linked note (deduplicated, or shared between two knowledge bases) is skipped too. Replace it with a copy if it belongs in the index. A file whose link count cannot be read at all — it was just deleted, say — is allowed through, so deletions still reach the index. Since v0.20.0 the decision and the bytes come from the **same open handle**: link count, file type and the size limit are all read off the handle the content is then read from, so a hard link renamed over a collected path *after* it was checked is refused rather than read. On Unix that open also refuses to follow a symlink put there instead, and refuses to block on a named pipe; on Windows it does neither, because creating a symlink there needs administrator privilege, and refusing reparse points would refuse every OneDrive placeholder. **This still raises the bar rather than drawing a boundary.** Whoever can link a file in *and* delete its original name leaves the knowledge base path as the only name, indistinguishable from a file that was always there — a link count is the state of a file now, not where it came from. An *intermediate directory* replaced by a symlink is out of reach on every platform. And the count is only ever what the filesystem reports: FAT32, exFAT and most network shares answer 1 whatever the truth is, so a knowledge base on a USB stick or a share gets nothing from this guard. Keep anything that must not be readable by kb-mcp outside `kb_path`, on a path kb-mcp's user cannot read.
-- **`get_best_practice` path templates**: the tool is opt-in and requires `[best_practice].path_templates` in `kb-mcp.toml`. Each template may use `{target}` as a placeholder (e.g. `"best-practices/{target}/PERFECT.md"` or `"docs/{target}.md"`). The server tries templates in order and returns the first existing file under `kb_path` (path-traversal attempts are rejected). Omitting the section — or writing `path_templates = []` — leaves the tool registered but makes it return a "not configured" error, so accidental calls fail loudly instead of silently retrieving an unrelated file.
-- **Per-chunk quality filter** (**enabled by default** with threshold `0.3`): each indexed chunk gets a `quality_score` computed from three signals — length (< 30 chars → -0.6), boilerplate-only content (TBD / TODO / 詳細は後述 / etc. → -0.5), poor structure (single line < 80 chars → -0.3). Chunks scoring below the threshold are hidden from `search`, `kb-mcp search`, and `get_connection_graph`. Seed chunks of `get_connection_graph` are exempt. Disable the filter with `[quality_filter] enabled = false` in `kb-mcp.toml`, or opt out per-query with `--include-low-quality` (CLI) / `include_low_quality: true` (MCP). Override the threshold with `--min-quality 0.5` / `min_quality: 0.5`. Upgrading an existing index: the next `kb-mcp index` run transparently adds the `quality_score` column (ALTER TABLE) and backfills scores once (idempotent).
+  **This bounds indexing, not access.** An excluded file is never indexed, so it can never appear in `search` or `get_connection_graph`, which read from the database and never touch the filesystem. It remains readable through `get_document` by a caller that knows its path, exactly as a file under `exclude_dirs` always has been. That is deliberate rather than an oversight: whoever can write into the knowledge base can also delete `.grooveignore`, so a rule living inside the tree cannot be the thing that guards it. Keep anything that must not be readable outside `kb_path`.
+- **Links are not followed, and that includes hard links**: a symlink is never indexed, never watched, and never returned by `get_document`, because whoever can write into the knowledge base should not be able to make groove read a file *they* cannot read and hand it back through `search`. A hard link does the same thing while looking like an ordinary file — it is a second name for one file, it needs no read access to create, and on Windows no privilege either — so a file with **more than one name** is refused the same way, in all three places. The refusal names the file and says why. This is deliberately blunt: nothing portable can tell whether the other name is inside the knowledge base or outside it, so a legitimately hard-linked note (deduplicated, or shared between two knowledge bases) is skipped too. Replace it with a copy if it belongs in the index. A file whose link count cannot be read at all — it was just deleted, say — is allowed through, so deletions still reach the index. Since v0.20.0 the decision and the bytes come from the **same open handle**: link count, file type and the size limit are all read off the handle the content is then read from, so a hard link renamed over a collected path *after* it was checked is refused rather than read. On Unix that open also refuses to follow a symlink put there instead, and refuses to block on a named pipe; on Windows it does neither, because creating a symlink there needs administrator privilege, and refusing reparse points would refuse every OneDrive placeholder. **This still raises the bar rather than drawing a boundary.** Whoever can link a file in *and* delete its original name leaves the knowledge base path as the only name, indistinguishable from a file that was always there — a link count is the state of a file now, not where it came from. An *intermediate directory* replaced by a symlink is out of reach on every platform. And the count is only ever what the filesystem reports: FAT32, exFAT and most network shares answer 1 whatever the truth is, so a knowledge base on a USB stick or a share gets nothing from this guard. Keep anything that must not be readable by groove outside `kb_path`, on a path groove's user cannot read.
+- **`get_best_practice` path templates**: the tool is opt-in and requires `[best_practice].path_templates` in `groove.toml`. Each template may use `{target}` as a placeholder (e.g. `"best-practices/{target}/PERFECT.md"` or `"docs/{target}.md"`). The server tries templates in order and returns the first existing file under `kb_path` (path-traversal attempts are rejected). Omitting the section — or writing `path_templates = []` — leaves the tool registered but makes it return a "not configured" error, so accidental calls fail loudly instead of silently retrieving an unrelated file.
+- **Per-chunk quality filter** (**enabled by default** with threshold `0.3`): each indexed chunk gets a `quality_score` computed from three signals — length (< 30 chars → -0.6), boilerplate-only content (TBD / TODO / 詳細は後述 / etc. → -0.5), poor structure (single line < 80 chars → -0.3). Chunks scoring below the threshold are hidden from `search`, `groove search`, and `get_connection_graph`. Seed chunks of `get_connection_graph` are exempt. Disable the filter with `[quality_filter] enabled = false` in `groove.toml`, or opt out per-query with `--include-low-quality` (CLI) / `include_low_quality: true` (MCP). Override the threshold with `--min-quality 0.5` / `min_quality: 0.5`. Upgrading an existing index: the next `groove index` run transparently adds the `quality_score` column (ALTER TABLE) and backfills scores once (idempotent).
 
 ## Design decisions
 

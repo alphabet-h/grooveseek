@@ -35,7 +35,7 @@ quote source text accurately and reduces hallucination.
 
 ## Byte offsets
 
-`start` / `end` are **byte offsets** into the chunk's `content` string. `kb-mcp`
+`start` / `end` are **byte offsets** into the chunk's `content` string. `groove`
 guarantees that both indices fall on UTF-8 codepoint boundaries, so clients can
 safely slice:
 

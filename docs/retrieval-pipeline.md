@@ -2,7 +2,7 @@
 
 > **日本語版**: [retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md)
 
-This document narrates the full pipeline that `kb-mcp` runs at query time, with tuning advice for the v0.7.0+ stages (MMR diversity re-rank, parent retriever content expansion).
+This document narrates the full pipeline that `groove` runs at query time, with tuning advice for the v0.7.0+ stages (MMR diversity re-rank, parent retriever content expansion).
 
 ## At a glance
 
@@ -73,15 +73,15 @@ Three consequences worth knowing before tuning anything. First, **lowering a lim
 
 A regression guard pins the multiple rather than any absolute timing (`bu03_or_expansion_stays_within_a_small_multiple_of_a_single_phrase`), so it stays meaningful across machines and SQLite versions.
 
-Both the RRF constant and the three bm25 column weights are configurable via `[search.fusion]` in `kb-mcp.toml` (v0.13.0+); the built-in defaults are `rrf_k = 60.0` and `heading / context / content = 2.0 / 1.0 / 1.0`. They are deliberately left alone unless you have measured otherwise — see [eval.md](./eval.md) for `kb-mcp tune`, which reports how much (if at all) these knobs move retrieval quality on *your* KB.
+Both the RRF constant and the three bm25 column weights are configurable via `[search.fusion]` in `groove.toml` (v0.13.0+); the built-in defaults are `rrf_k = 60.0` and `heading / context / content = 2.0 / 1.0 / 1.0`. They are deliberately left alone unless you have measured otherwise — see [eval.md](./eval.md) for `groove tune`, which reports how much (if at all) these knobs move retrieval quality on *your* KB.
 
-This stage is what `kb-mcp eval` measures by default: any improvement here lifts the floor for the entire pipeline.
+This stage is what `groove eval` measures by default: any improvement here lifts the floor for the entire pipeline.
 
 ## Stage 2 — Reranker (optional, v0.1.0+)
 
-When `--reranker` is set (or `[reranker]` in `kb-mcp.toml`), the top RRF candidates are re-scored by a cross-encoder before being returned. The score column switches from RRF to the reranker raw score.
+When `--reranker` is set (or `[reranker]` in `groove.toml`), the top RRF candidates are re-scored by a cross-encoder before being returned. The score column switches from RRF to the reranker raw score.
 
-When **MMR is enabled**, kb-mcp pulls a *larger candidate pool* (`limit × 5`, min 50) through the reranker so that diversity re-rank has room to operate. When MMR is off, the reranker input limit matches `limit` (or `limit × 5` when only reranking, preserving pre-v0.7.0 reranker overfetch behavior). Parent retriever does **not** enlarge the pool — it is a content-only stage that runs on the already-selected hits, so reranker workload is unchanged when only `--parent-retriever` is set.
+When **MMR is enabled**, groove pulls a *larger candidate pool* (`limit × 5`, min 50) through the reranker so that diversity re-rank has room to operate. When MMR is off, the reranker input limit matches `limit` (or `limit × 5` when only reranking, preserving pre-v0.7.0 reranker overfetch behavior). Parent retriever does **not** enlarge the pool — it is a content-only stage that runs on the already-selected hits, so reranker workload is unchanged when only `--parent-retriever` is set.
 
 **When to enable**: cross-language queries, queries where the top RRF hit is contextually close but topically wrong, or queries with multiple expected docs (the reranker re-orders rank-1 → rank-2 transitions noticeably).
 
@@ -106,12 +106,12 @@ When **MMR is enabled**, kb-mcp pulls a *larger candidate pool* (`limit × 5`, m
 | `lambda` | `0.7` | When users complain about off-topic results (lean toward relevance) | When users want broader coverage at cost of top-1 relevance |
 | `same_doc_penalty` | `0.0` | When the corpus has long single-doc chapters and one doc dominates top-k | Keep at 0 unless you have a concrete dedup goal — the similarity term already does most of the work |
 
-**Eval signal**: turn MMR on and re-run `kb-mcp eval`. Expect:
+**Eval signal**: turn MMR on and re-run `groove eval`. Expect:
 - `recall@1` slight ↓ (MMR can drop the strict-top-1 expectation in favor of diversity)
 - `recall@5` / `recall@10` typically ↑ on golden sets with multiple expected docs per query (the diversity term lets more distinct docs into top-k)
 - `nDCG@10` mixed — depends on how the golden file weights diversity vs. concentrated relevance
 
-**Anti-pattern**: setting `lambda = 1.0` with MMR enabled is equivalent to MMR off but slightly slower (the similarity cache still runs). Just turn MMR off in that case — kb-mcp emits a warn when it detects this footgun (effective MMR off but lambda override provided).
+**Anti-pattern**: setting `lambda = 1.0` with MMR enabled is equivalent to MMR off but slightly slower (the similarity cache still runs). Just turn MMR off in that case — groove emits a warn when it detects this footgun (effective MMR off but lambda override provided).
 
 ## Stage 4 — Parent retriever (optional, v0.7.0+)
 
@@ -134,7 +134,7 @@ The score, rank, path, and `match_spans` of the original hit are **preserved**. 
 
 **NULL `token_count` rows**: pre-v0.7.0 indexes have NULL in `chunks.token_count`. Parent retriever falls back to `len(content) / 4` for these rows (matches the indexer's own estimator), so the cap is enforced even on legacy databases. Without this fallback the cap could be silently bypassed (the original codex-found bug is locked in by `tests/search_parent_integration.rs`).
 
-**Eval signal**: parent retriever does **not** change recall/MRR/nDCG — those metrics ignore `content`. It only changes the user-visible content quality. Compare LLM answer quality (manually or with an LLM-judge harness) before vs after rather than relying on `kb-mcp eval` numbers.
+**Eval signal**: parent retriever does **not** change recall/MRR/nDCG — those metrics ignore `content`. It only changes the user-visible content quality. Compare LLM answer quality (manually or with an LLM-judge harness) before vs after rather than relying on `groove eval` numbers.
 
 ## Composition & order rationale
 
@@ -158,10 +158,10 @@ You can think of the pipeline as four monotone composable stages where each stag
 
 ## Eval-aware tuning workflow
 
-1. Take a baseline with both off (`kb-mcp eval`).
+1. Take a baseline with both off (`groove eval`).
 2. Turn MMR on, re-run; compare recall@k / nDCG@k. Decide whether the diversity tradeoff is worth it for your golden set.
 3. Independently, turn parent retriever on (with MMR off), re-run; recall/nDCG should be ~unchanged. If they aren't, file a bug — parent retriever is a content-only stage by design.
 4. Turn both on, run a final eval as the v0.7.0 reference.
-5. The `ConfigFingerprint` recorded in `<kb>/.kb-mcp-eval-history.json` distinguishes these runs so you can re-run any of them by flipping the flags.
+5. The `ConfigFingerprint` recorded in `<kb>/.groove-eval-history.json` distinguishes these runs so you can re-run any of them by flipping the flags.
 
 For a concrete eval-baseline note template see `.dev/knowledge/eval-baseline-2026-04-27.md` in the repo (private notes; the format is described in `CLAUDE.local.md`).

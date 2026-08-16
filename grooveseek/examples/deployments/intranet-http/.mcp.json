@@ -1,0 +1,11 @@
+{
+  "_comment_intranet_http": "Intranet HTTP deployment, CLIENT side. Replace 'kb-server.lan' with your server's hostname or IP. If you front groove with nginx for TLS/auth, switch to https:// and the proxy URL. No groove binary is required on the client — any HTTP-capable MCP client speaks Streamable HTTP.",
+  "_comment_alwaysLoad": "alwaysLoad: true is a Claude Code v2.1.121+ option that ensures groove's tools are present at initial load (skips tool-search lookup latency). Other MCP clients (Cursor, etc.) ignore the field. The startup cost is negligible here because the heavy lifting happens server-side; safe to keep enabled.",
+  "mcpServers": {
+    "ai-knowledge": {
+      "type": "http",
+      "url": "http://kb-server.lan:3100/mcp",
+      "alwaysLoad": true
+    }
+  }
+}

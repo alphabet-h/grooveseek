@@ -20,7 +20,7 @@ hosting = "github"
 # Disable static-CRT linking on Windows. The default (true) forces /defaultlib:libcmt
 # which conflicts with `ort-sys` (ONNX Runtime) — its prebuilt binary is linked against
 # the dynamic UCRT, causing LNK2001 unresolved external symbols (__imp_tolower etc.).
-# Dynamic CRT means kb-mcp.exe depends on ucrtbase.dll / vcruntime140.dll, both shipped
+# Dynamic CRT means groove.exe depends on ucrtbase.dll / vcruntime140.dll, both shipped
 # with Windows 10+ (and the VC++ Redistributable on older Windows).
 msvc-crt-static = false
 
@@ -28,7 +28,7 @@ msvc-crt-static = false
 # ubuntu-24.04 (glibc 2.39). The prebuilt ort-sys binary references __isoc23_*
 # symbols introduced in glibc 2.38, so 22.04 fails to link with "undefined symbol:
 # __isoc23_strtoull" etc. ubuntu-24.04-arm is the matching aarch64 GitHub runner.
-# Practical impact: kb-mcp Linux binaries require glibc 2.38+ on the user system
+# Practical impact: groove Linux binaries require glibc 2.38+ on the user system
 # (Ubuntu 24.04+, Debian 13+, RHEL 9.5+, Fedora 39+).
 [dist.github-custom-runners]
 x86_64-unknown-linux-gnu = "ubuntu-24.04"

@@ -86,7 +86,7 @@ low_confidence ⇔ (results.len() >= 2)
 - 既定値 `min_confidence_ratio = 1.5` (最高 score が平均の 1.5 倍以上必要)
 - `0.0` で判定を完全無効化
 - リクエスト単位で `min_confidence_ratio` パラメータで上書き可、グローバル
-  既定は `kb-mcp.toml`:
+  既定は `groove.toml`:
 
   ```toml
   [search]

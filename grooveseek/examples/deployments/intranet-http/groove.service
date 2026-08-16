@@ -1,0 +1,55 @@
+# /etc/systemd/system/groove.service
+#
+# systemd unit for the intranet HTTP deployment. See README.md / README.ja.md
+# for full setup. Enable with:
+#     sudo cp groove.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now groove.service
+
+[Unit]
+Description=groove Streamable HTTP MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=groove
+Group=groove
+
+# CWD = /srv/groove so that Config::discover() picks up
+# /srv/groove/groove.toml automatically (priority 2 — CWD).
+WorkingDirectory=/srv/groove
+
+# `serve` reads transport / kb_path / model from groove.toml — keep ExecStart minimal.
+ExecStart=/usr/local/bin/groove serve
+
+# Restart on transient failures (network blips, OOM kills, etc.).
+Restart=on-failure
+RestartSec=5s
+
+# Resource hardening. Tighten further on production hosts.
+# groove needs no privileged operations, no inbound device access.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=true
+
+# Read-write paths groove legitimately needs:
+#   - /srv/groove/    : kb_path itself + .groove.db (the parent of kb_path)
+#   - /var/cache/fastembed : ONNX model cache (matches `fastembed_cache_dir` in groove.toml)
+ReadWritePaths=/srv/groove /var/cache/fastembed
+
+# RUST_LOG controls verbosity. info gives the "loaded config source=..." startup
+# line plus warnings; bump to debug for troubleshooting.
+Environment=RUST_LOG=info
+
+# stdout/stderr go to the journal — `journalctl -u groove.service -f` to tail.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
