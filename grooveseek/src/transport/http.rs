@@ -680,7 +680,7 @@ pub async fn run_http(
              this machine can now reach /mcp cross-origin. Remove the key to \
              restore the loopback-only default."
         );
-    } else if allowed_origins.is_some() && !origins.iter().any(|o| is_loopback_origin(o)) {
+    } else if allowed_origins.is_some() && !origins.iter().any(|o| names_a_loopback_host(o)) {
         // (Phase 4 PR-2) `/ui` searches through `/mcp` now, so it is subject to
         // this list for the first time. An operator who replaced the default
         // with only their public origin will find `/ui` answering 403 to its own
@@ -712,6 +712,24 @@ pub async fn run_http(
     // and `/healthz`, and it includes the bound loopback address for the same
     // reason the Origin list does.
     let effective_hosts = effective_allowed_hosts(allowed_hosts.clone(), bound);
+    // (codex P2 round 1 on PR #174) The symmetric warning, and the one that is
+    // easier to hit: the documented LAN recipe is to set `allowed_hosts` to the
+    // public name. `/ui` still opens through localhost, because the admin router
+    // has its own allow-list — but the page's request to `/mcp` carries
+    // `Host: localhost`, which Host validation refuses *before* Origin
+    // validation is consulted. Measured: `/ui` 200, its search 403.
+    if allowed_hosts.is_some()
+        && !effective_hosts.is_empty()
+        && !effective_hosts.iter().any(|h| names_a_loopback_host(h))
+    {
+        tracing::warn!(
+            "[transport.http].allowed_hosts names no loopback alias, so /ui \
+             opened on this machine cannot search: its requests to /mcp are \
+             refused by Host validation. Add localhost and 127.0.0.1 alongside \
+             the public name if you use /ui locally. Setting the key replaces \
+             the default list rather than extending it."
+        );
+    }
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(effective_hosts.clone())
         .with_allowed_origins(origins);
@@ -1191,15 +1209,19 @@ pub(crate) fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// (Phase 4 PR-2) Does this origin name a local address?
+/// (Phase 4 PR-2) Does this entry name a local address?
 ///
-/// Used for one thing: warning an operator whose `allowed_origins` would leave
-/// `/ui` unable to search. It answers with the pieces that already exist —
-/// [`DEFAULT_LOOPBACK_HOSTS`] for the names, [`is_loopback_peer`] for the
-/// addresses, [`NormalizedAuthority`] for the parsing — rather than adding a
-/// third notion of "local" to a file that spent PR #173 collapsing them.
-fn is_loopback_origin(origin: &str) -> bool {
-    let authority = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+/// Takes either an origin (`http://127.0.0.1:3100`) or a bare allow-list host
+/// (`localhost`, `kb.example.lan`), because the scheme is optional here and
+/// both lists are asked the same question: would `/ui`, opened on this machine,
+/// be able to reach `/mcp` under this configuration?
+///
+/// It answers with the pieces that already exist — [`DEFAULT_LOOPBACK_HOSTS`]
+/// for the names, [`is_loopback_peer`] for the addresses, [`NormalizedAuthority`]
+/// for the parsing — rather than adding another notion of "local" to a file that
+/// spent PR #173 collapsing them.
+fn names_a_loopback_host(entry: &str) -> bool {
+    let authority = entry.split_once("://").map_or(entry, |(_, rest)| rest);
     let host = NormalizedAuthority::from_allowed_entry(authority).host;
     if host.is_empty() {
         return false;
@@ -1635,7 +1657,10 @@ mod tests {
             "http://localhost",      // port 80, serialized without it
             "https://127.0.0.1:8443",
         ] {
-            assert!(is_loopback_origin(origin), "{origin} names a local address");
+            assert!(
+                names_a_loopback_host(origin),
+                "{origin} names a local address"
+            );
         }
         for origin in [
             "https://kb.example.com",
@@ -1643,7 +1668,36 @@ mod tests {
             "http://evil.127.0.0.1:3100", // a name that merely contains one
             "",
         ] {
-            assert!(!is_loopback_origin(origin), "{origin:?} is not local");
+            assert!(!names_a_loopback_host(origin), "{origin:?} is not local");
+        }
+    }
+
+    /// (codex P2 round 1 on PR #174) The predicate is asked about `Host`
+    /// allow-list entries too, which carry no scheme. The documented LAN recipe
+    /// — `allowed_hosts = ["kb.example.lan"]` — is exactly the configuration
+    /// that leaves `/ui` open but unable to search, so it has to be recognised
+    /// as *not* local while bare loopback names still are.
+    #[test]
+    fn bare_allow_list_entries_are_judged_too_not_just_origins() {
+        for entry in ["localhost", "127.0.0.1", "[::1]", "::1", "127.0.0.2:3100"] {
+            assert!(names_a_loopback_host(entry), "{entry} is a local name");
+        }
+        for entry in ["kb.example.lan", "192.168.1.10", "kb.example.lan:3100"] {
+            assert!(!names_a_loopback_host(entry), "{entry} is not local");
+        }
+    }
+
+    /// Every entry the Host defaults produce must be recognised as local, for
+    /// the same reason as the origins: otherwise the warning fires against a
+    /// configuration that works.
+    #[test]
+    fn the_default_hosts_are_all_recognised_as_loopback() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        for host in effective_allowed_hosts(None, bound) {
+            assert!(
+                names_a_loopback_host(&host),
+                "{host} is a default but is not recognised as local"
+            );
         }
     }
 
@@ -1655,7 +1709,7 @@ mod tests {
         let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
         for origin in effective_allowed_origins(None, bound) {
             assert!(
-                is_loopback_origin(&origin),
+                names_a_loopback_host(&origin),
                 "{origin} is a default but is not recognised as local"
             );
         }

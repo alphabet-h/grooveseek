@@ -158,7 +158,11 @@ bind = "127.0.0.1:3100"
 # equivalent to disabling the check, and warns for the same reason.
 # IPv6 entries: the bracketed form "[::1]" is clearer, and the bare "::1" is
 # also accepted for backward compatibility.
-#allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100"]
+# If you also open /ui on the server, keep the loopback names here: /ui searches
+# by calling /mcp, Host validation runs before Origin validation, and a list of
+# only public names refuses the `Host: localhost` the page sends. The startup
+# log warns when this list would break it.
+#allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100", "localhost", "127.0.0.1"]
 
 # Allow-list of accepted browser Origin headers. This covers /mcp -- and /ui
 # searches by calling /mcp, so this key decides whether the built-in page can

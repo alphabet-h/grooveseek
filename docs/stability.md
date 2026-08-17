@@ -59,9 +59,17 @@ reach you over loopback.
 
 **It covers `/mcp`, and `/ui` searches through `/mcp`.** So this list decides
 whether the built-in page can search: replacing the default with only a public
-origin leaves `/ui` served but unable to query, and the server warns about that
-combination at startup. `/api/admin/status` has no `Origin` check of its own;
-what restricts it is the loopback peer requirement above.
+origin leaves `/ui` served but unable to query. `/api/admin/status` has no
+`Origin` check of its own; what restricts it is the loopback peer requirement
+above.
+
+`allowed_hosts` does the same thing one step earlier — Host validation runs
+before Origin validation, so a list naming only a public hostname refuses the
+`Host: localhost` that a locally opened `/ui` sends. Either key replaces its
+default rather than extending it, so keep the loopback entries alongside the
+public ones when you use `/ui` on the server. **The startup log names whichever
+of the two would break it**, which is worth reading, because the browser sees
+only a 403 and cannot tell them apart.
 
 ## Stable
 
