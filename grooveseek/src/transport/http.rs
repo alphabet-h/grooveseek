@@ -1022,7 +1022,12 @@ pub(crate) fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
 }
 
 fn should_warn_non_loopback_bind(addr: &SocketAddr, allowed_hosts: Option<&[String]>) -> bool {
-    if addr.ip().is_loopback() {
+    // (codex P2 round 4 on PR #173) Shared predicate, not `IpAddr::is_loopback`.
+    // Once `check_cli_bind_ack` accepted `[::ffff:127.0.0.1]` as loopback, this
+    // line still called it exposure and warned about a bind the CLI had just
+    // approved — the two halves of one decision contradicting each other on
+    // startup.
+    if is_loopback_peer(addr.ip()) {
         return false;
     }
     match allowed_hosts {

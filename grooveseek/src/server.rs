@@ -2721,8 +2721,12 @@ pub async fn run_server(
         // via the bind addr Host header — that contradicts the spec § 7
         // "admin is loopback-only" decision and the install-time Note that
         // promises LAN browsers see 403.
+        // (codex P2 round 4 on PR #173) Shared predicate. With
+        // `IpAddr::is_loopback` here, a `[::ffff:127.0.0.1]` bind — which the
+        // CLI now accepts as loopback — was left out of the allow-list, so the
+        // operator's own Host got 403 from the admin routes.
         if let crate::transport::Transport::Http { addr, .. } = &transport
-            && addr.ip().is_loopback()
+            && crate::transport::http::is_loopback_peer(addr.ip())
         {
             let bind_str = addr.to_string();
             let ip_str = addr.ip().to_string();

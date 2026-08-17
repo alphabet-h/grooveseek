@@ -602,6 +602,48 @@ mod tests {
         }
     }
 
+    /// (codex P2 round 4 on PR #173) Round 3 converted three call sites and
+    /// left three behind, which was worse than before: the gate said loopback
+    /// while the startup warning, the admin allow-list and the untrusted-config
+    /// downgrade said exposure. This scan is the thing that would have caught
+    /// it, so it exists now rather than after the next one.
+    ///
+    /// `is_loopback_peer`'s own body is the one legitimate `is_loopback()` —
+    /// it is the implementation — and this test's sibling asserts `std` still
+    /// disagrees about the mapped form, so both are excluded by line.
+    #[test]
+    fn no_call_site_answers_the_loopback_question_on_its_own() {
+        let sources = [
+            ("config.rs", include_str!("../config.rs")),
+            ("server.rs", include_str!("../server.rs")),
+            ("service/install.rs", include_str!("../service/install.rs")),
+            ("transport/http.rs", include_str!("http.rs")),
+        ];
+        for (name, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.trim_start();
+                // Prose may name the std method while explaining why we do not
+                // call it; the scan is about call sites.
+                if code.starts_with("//") || !line.contains(".is_loopback()") {
+                    continue;
+                }
+                // Inside `is_loopback_peer` the calls ARE the implementation.
+                let inside_the_predicate = line.contains("v4.is_loopback()")
+                    || line.contains("v6.is_loopback()")
+                    || line.contains("Some(v4) =>")
+                    || line.contains("None =>");
+                assert!(
+                    inside_the_predicate,
+                    "{name}:{} calls is_loopback() directly; use \
+                     transport::http::is_loopback_peer so every surface agrees \
+                     about ::ffff:127.0.0.1 -- line was: {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
     /// The other half of the same invariant, and the half a behavioural test
     /// cannot reach cheaply: `service install` needs a registry / launchd write
     /// to exercise, so scan its source instead. What must not exist is a second

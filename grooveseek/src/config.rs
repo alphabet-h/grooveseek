@@ -1104,8 +1104,15 @@ pub(crate) fn classify_trust(
 }
 
 /// `SocketAddr` の IP が loopback でないか。
+///
+/// (codex P2 round 4 on PR #173 で報告された 2 箇所と同じ問い。**こちらは
+/// 報告に含まれていなかった**が、残すと 1 箇所だけ答えが違う状態になる。)
+/// 判定は crate 唯一の述語に委ねる — ここだけ `IpAddr::is_loopback` のままだと、
+/// 発見された config の `[::ffff:127.0.0.1]` が「ネットワーク公開」とみなされて
+/// 127.0.0.1 に降格される一方、同じアドレスを CLI から渡せば loopback として
+/// 通る、という食い違いになる。
 fn is_non_loopback(addr: &std::net::SocketAddr) -> bool {
-    !addr.ip().is_loopback()
+    !crate::transport::http::is_loopback_peer(addr.ip())
 }
 
 /// ディレクトリを指す環境変数を読む。**空文字は未設定として扱う** (BU-07)。
