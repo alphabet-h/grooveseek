@@ -126,4 +126,4 @@ low_confidence ⇔ (results.len() >= 2)
 ## 関連
 
 - `docs/citations.ja.md` — match_spans / byte offset
-- `README.ja.md` — search ツールの詳細リファレンス
+- `docs/mcp-tools.ja.md` — search ツールの詳細リファレンス

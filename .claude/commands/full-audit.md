@@ -168,7 +168,7 @@ prompt:
 - リポジトリパス: {{REPO_PATH}}
 - 現バージョン: {{VERSION}}
 - 英語プライマリの日英バイリンガル運用
-- ドキュメント: README.md / README.ja.md、docs/ARCHITECTURE.{md,ja.md}、docs/eval.{md,ja.md}、docs/citations.md、docs/filters.md、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、groove.toml.example
+- ドキュメント: README.md / README.ja.md、docs/{configuration,usage,clients,mcp-tools,behavior}.{md,ja.md}、docs/ARCHITECTURE.{md,ja.md}、docs/{eval,citations,filters,retrieval-pipeline,stability}.{md,ja.md}、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、groove.toml.example
 - リリース履歴: git tag --list で確認
 - CLAUDE.md にリリース前ドキュメント同期チェックリストあり (要参照)
 

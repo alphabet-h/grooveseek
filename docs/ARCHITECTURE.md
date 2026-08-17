@@ -89,7 +89,7 @@ The full v0.7.0 pipeline is **`RRF → reranker → MMR → parent retriever →
 
 ## Contextual Retrieval (v0.12.0+)
 
-Static Contextual Retrieval (feature-46) prepends a document-structure breadcrumb to each chunk before it reaches the embedder / FTS index / reranker, entirely at index time and with no LLM call. Gated by `[contextual].enabled` (default **off** as of v0.12.0 — a `false`-by-default judgment gate result, see the README's "Contextual Retrieval" section for the A/B numbers that drove it).
+Static Contextual Retrieval (feature-46) prepends a document-structure breadcrumb to each chunk before it reaches the embedder / FTS index / reranker, entirely at index time and with no LLM call. Gated by `[contextual].enabled` (default **off** as of v0.12.0 — a `false`-by-default judgment gate result, see "Contextual Retrieval" in [docs/usage.md](usage.md) for the A/B numbers that drove it).
 
 - **`Chunk.context: Option<String>`** (`grooveseek/src/parser/mod.rs`) is a search-only field, never returned by `search` / `get_document`. `build_context(parts: &[&str]) -> Option<String>` joins non-empty, non-consecutive-duplicate parts with `" > "`, capped at 200 chars (char-boundary safe) to bound BGE-small's 512-token input.
 - **Two ancestry generation families**, matching the two parser shapes in the codebase:
@@ -119,7 +119,7 @@ Static Contextual Retrieval (feature-46) prepends a document-structure breadcrum
 
 First run downloads the chosen ONNX model to a HuggingFace-hub-compatible cache layout (BGE-small: ~130 MB, BGE-M3: ~2.3 GB, BGE-reranker-v2-m3: ~2.3 GB). Subsequent runs reuse the cache without re-downloading.
 
-If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS inspection), see the README's "Working around HuggingFace TLS failures" section for a `huggingface_hub` CLI workaround.
+If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS inspection), see "Working around HuggingFace TLS failures" in [docs/clients.md](clients.md) for a `huggingface_hub` CLI workaround.
 
 ## CLI output convention
 

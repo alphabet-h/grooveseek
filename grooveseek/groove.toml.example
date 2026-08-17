@@ -13,7 +13,7 @@
 #   4. the directory holding the `groove` binary
 #
 # The project root (2) and next to the binary (4) are the common choices. See
-# "Config file discovery" in README.md for the full rules.
+# "Config file discovery" in docs/configuration.md for the full rules.
 #
 # NOTHING HERE CHANGES BEHAVIOUR AS SHIPPED. Every value left uncommented below
 # is already the built-in default, and everything that would alter how groove
@@ -79,7 +79,7 @@
 # of that same file. Like exclude_dirs, it bounds what gets INDEXED — an
 # excluded file never appears in search, but get_document still returns it to a
 # caller that knows its path. Keep anything that must not be readable outside
-# kb_path. See the README section "Indexing".
+# kb_path. See ".grooveignore" in docs/behavior.md.
 
 # --- [quality_filter] — per-chunk quality filter --------------------------
 # On by default with threshold 0.3, which is what the two lines below spell
@@ -112,7 +112,7 @@ threshold = 0.3
 # exhaust memory. Convert such a workbook to `.xlsx`, which is read as a stream.
 # Known limitations (PDF: no OCR, multi-column reading order; Office: no legacy
 # .doc/.ppt/.xls, no OpenDocument, password-protected files are detected and
-# skipped, tables are flattened to plain text) are described in README.md.
+# skipped, tables are flattened to plain text) are described in docs/behavior.md.
 [parsers]
 enabled = ["md"]
 # (everything this build supports: enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"])
@@ -264,7 +264,7 @@ bind = "127.0.0.1:3100"
 # turning it on WITHOUT a reranker made recall@5 and MRR worse. Combined with a
 # reranker such as bge-v2-m3 it was best on every metric (recall@5 +0.047,
 # MRR +0.102), so enable it only when a reranker is configured too. Details are
-# in the "Contextual Retrieval" section of README.md.
+# in the "Contextual Retrieval" section of docs/usage.md.
 # Applying it to an existing index needs `groove index --force`: the built mode
 # is recorded in index_meta.context_mode, and without --force a mismatch only
 # warns and keeps the DB's current mode.

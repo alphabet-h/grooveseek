@@ -13,13 +13,35 @@ use std::path::{Path, PathBuf};
 #[command(version)]
 #[command(
     about = "MCP server for semantic search over a knowledge base of Markdown and plain-text files",
-    long_about = "MCP server for semantic search over a knowledge base of Markdown\n\
-                  (and optionally plain-text, opt-in via [parsers].enabled) files.\n\
-                  \n\
-                  Any of the options below can be provided via `groove.toml`. The file\n\
-                  is discovered in priority order: --config <PATH>, then ./groove.toml,\n\
-                  then walking up to the .git ancestor, then alongside the binary.\n\
-                  CLI arguments override the file. See README for details."
+    // The reference link is built against this binary's own version tag, not
+    // `main`: a release archive ships the binary and README.md but no `docs/`,
+    // so the reader has to follow a URL, and `main` would hand an older binary
+    // the options and defaults of a newer one. `v{CARGO_PKG_VERSION}` names a
+    // tag that exists for every released build — the version is bumped by the
+    // `chore(release)` commit the tag is then created on.
+    //
+    // One window where the link does not resolve, measured rather than
+    // assumed: the file appears in the release that carries this text, so a
+    // build from the unreleased tree before it still says v0.26.0, where
+    // `docs/configuration.md` does not exist yet. That is a source build, and
+    // a source build has `docs/` on disk.
+    //
+    // Written with `concat!` rather than `\`-continued lines: that escape eats
+    // the newline *and* the next line's indentation, so the layout below is
+    // what actually prints.
+    long_about = concat!(
+        "MCP server for semantic search over a knowledge base of Markdown\n",
+        "(and optionally plain-text, opt-in via [parsers].enabled) files.\n",
+        "\n",
+        "Any of the options below can be provided via `groove.toml`. The file\n",
+        "is discovered in priority order: --config <PATH>, then ./groove.toml,\n",
+        "then walking up to the .git ancestor, then alongside the binary.\n",
+        "CLI arguments override the file. Full reference for this version (a\n",
+        "release archive ships the binary and README.md, not docs/):\n",
+        "https://github.com/alphabet-h/grooveseek/blob/v",
+        env!("CARGO_PKG_VERSION"),
+        "/docs/configuration.md"
+    )
 )]
 struct Cli {
     /// Path to a `groove.toml` config file. Overrides discovery (CWD / .git

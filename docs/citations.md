@@ -116,4 +116,4 @@ chunk to point into). The `low_confidence` flag should be checked for the
 ## Related
 
 - `docs/filters.md` — narrowing search results
-- `README.md` — full search tool reference
+- `docs/mcp-tools.md` — full search tool reference
