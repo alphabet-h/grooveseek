@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-labelledby="t">
+  <title id="t">GrooveSeek</title>
+  <!-- Lines of a document; the diamond marks the passage a search found.
+       Colours are the muted and accent tokens shipped in /ui, dark theme.
+       (An XML comment may not contain a double hyphen, so the CSS custom
+       property names are spelled out rather than quoted.) -->
+  <g fill="#9a9a94">
+    <rect x="9" y="13" width="46" height="7" rx="3.5"/>
+    <rect x="9" y="28.5" width="12" height="7" rx="3.5"/>
+    <rect x="43" y="28.5" width="12" height="7" rx="3.5"/>
+    <rect x="9" y="44" width="30" height="7" rx="3.5"/>
+  </g>
+  <path d="M32 21 L40 32 L32 43 L24 32 Z" fill="#8ab4e8"/>
+</svg>

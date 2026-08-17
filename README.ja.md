@@ -1,6 +1,15 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-dark.svg">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-light.svg" alt="" width="56" height="56">
+</picture>
+
 # GrooveSeek
 
 Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP サーバ。コマンド名は `groove`。
+
+[![CI](https://img.shields.io/github/actions/workflow/status/alphabet-h/grooveseek/ci.yml?branch=main&label=CI)](https://github.com/alphabet-h/grooveseek/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/alphabet-h/grooveseek?label=release)](https://github.com/alphabet-h/grooveseek/releases/latest)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#ライセンス)
 
 YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) をパースし、見出し単位でチャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
 
@@ -78,6 +87,14 @@ groove search "semantic chunking" --kb-path /path/to/knowledge-base --limit 3
 を渡す。DL 量も索引も変わるので、索引を作る前に決めておく価値がある — トレードオフは
 [docs/usage.ja.md](docs/usage.ja.md) にある。
 
+`--transport http` を指定すると `/ui` も応答する。サーバが動いているマシンの
+運用者向け画面で、検索は MCP クライアントと同じ `/mcp` を通す。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/screenshot-dark.png">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/screenshot-light.png" width="880" alt="運用者向け画面: バージョン / 文書数 / チャンク数 / 埋め込みモデル / watcher の状態 / 稼働時間 / pid を並べた状態帯の下に検索ボックスがあり、各結果には関連度スコア・ファイルパス・見出し・タグが付いている。">
+</picture>
+
 ## ドキュメント
 
 | ページ | 内容 |
@@ -113,3 +130,8 @@ groove search "semantic chunking" --kb-path /path/to/knowledge-base --limit 3
 ## 設計判断の記録
 
 アーキテクチャを形づくった決定 — 何を選び、どの選択肢を却下し、その代償は何だったか — は [Architecture Decision Record](docs/decisions/) として `docs/decisions/` に残している。まず [ADR-0000](docs/decisions/0000-record-decisions-as-adrs.ja.md) を読むと、何を ADR に書き、何は CHANGELOG で足りるのかが分かる。日本語版は同じディレクトリに `*.ja.md` で並べてある。
+
+## ライセンス
+
+[MIT](./LICENSE-MIT) と [Apache-2.0](./LICENSE-APACHE) のデュアルライセンス。
+どちらを選んでもよい。
