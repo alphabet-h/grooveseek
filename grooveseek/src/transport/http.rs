@@ -74,6 +74,32 @@ const _: () = assert!(
     "at ~100 KB per live session, a default this large stops bounding anything"
 );
 
+/// `Origin` allow-list の既定値 — 指定 port の loopback origin 3 種。
+///
+/// MCP 仕様 2025-06-18 (Streamable HTTP / Security Warning) は
+/// *"Servers **MUST** validate the `Origin` header on all incoming connections
+/// to prevent DNS rebinding attacks"* と定めているが、rmcp の既定は
+/// `allowed_origins: vec![]` = **検証しない**。既定でこれを埋めることで
+/// 仕様を満たす。
+///
+/// **bind IP ではなく port だけを見る。** `--bind 0.0.0.0:3100` で起動しても、
+/// 運用者がブラウザで開くのは `http://127.0.0.1:3100/ui` だからで、bind IP を
+/// origin に混ぜても誰も送ってこない値が増えるだけになる。
+///
+/// IPv6 に角括弧を付けるのは RFC 6454 の origin シリアライズに合わせるため
+/// (`http://[::1]:3100`)。rmcp は entry に scheme を要求する。
+///
+/// `https://` を混ぜていないのは、TLS を終端するのは常に前段の proxy であり、
+/// その時ブラウザが送る origin は loopback ではなく公開ホスト名になるから。
+/// その構成では `[transport.http].allowed_origins` に公開 origin を明示する。
+pub fn default_allowed_origins(port: u16) -> Vec<String> {
+    vec![
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://[::1]:{port}"),
+    ]
+}
+
 /// 上限に達した時に `Retry-After` で返す秒数。
 ///
 /// **見込みであって保証ではない**。空きが出るのは他のクライアントが切れた時か、
@@ -406,6 +432,7 @@ fn forbidden_plain(msg: &str) -> Response {
 pub async fn run_http(
     addr: SocketAddr,
     allowed_hosts: Option<Vec<String>>,
+    allowed_origins: Option<Vec<String>>,
     healthz_public: bool,
     max_sessions: u32,
     shared: KbServerShared,
@@ -439,10 +466,31 @@ pub async fn run_http(
         move || -> Result<KbServer, std::io::Error> { Ok(KbServer::from_shared(&f)) }
     };
 
+    // (1.0 blocker 4) Origin validation. rmcp's default is an empty list, which
+    // means "do not validate" — so leaving this unset ships a server that does
+    // not meet the MCP specification's Streamable HTTP requirement. The default
+    // below is the loopback origins for the bind port; an operator publishing
+    // through a proxy names their public origin in the config instead.
+    //
+    // This is NOT authentication, and enabling it does not break existing use:
+    // per RFC 6454 and rmcp, a request that carries no `Origin` header still
+    // passes. MCP clients, the tray and curl send none. What it stops is a web
+    // page in the operator's own browser reaching this port cross-origin.
+    let origins = allowed_origins.unwrap_or_else(|| default_allowed_origins(addr.port()));
+    if origins.is_empty() {
+        tracing::warn!(
+            "[transport.http].allowed_origins is empty, which disables Origin \
+             validation. The MCP specification requires servers to validate it \
+             to prevent DNS rebinding, so any web page loaded in a browser on \
+             this machine can now reach /mcp cross-origin. Remove the key to \
+             restore the loopback-only default."
+        );
+    }
     let mcp_config = match allowed_hosts.clone() {
         Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
         None => StreamableHttpServerConfig::default(),
-    };
+    }
+    .with_allowed_origins(origins);
     let mcp_service = StreamableHttpService::new(factory, Arc::clone(&session_manager), mcp_config);
 
     // (BU-32) `/mcp` だけを門番の配下に置く。`.layer()` を merge 後の app に
@@ -1130,6 +1178,44 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (1.0 blocker 4) The default `Origin` allow-list. Three properties matter
+    /// and each has bitten somewhere before:
+    ///
+    /// - every entry carries a scheme (rmcp rejects bare hosts);
+    /// - the IPv6 entry is bracketed, per RFC 6454 origin serialisation, so it
+    ///   matches what a browser actually sends;
+    /// - the list is never empty, because empty is rmcp's encoding for "do not
+    ///   validate" and would silently undo the whole point.
+    #[test]
+    fn default_allowed_origins_are_loopback_for_the_given_port() {
+        let origins = default_allowed_origins(3100);
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:3100".to_string(),
+                "http://127.0.0.1:3100".to_string(),
+                "http://[::1]:3100".to_string(),
+            ]
+        );
+        assert!(
+            origins.iter().all(|o| o.starts_with("http://")),
+            "rmcp requires a scheme on every entry"
+        );
+        assert!(
+            !origins.is_empty(),
+            "an empty list is rmcp's encoding for 'skip Origin validation'"
+        );
+    }
+
+    /// The port is substituted, not hard-coded: a server on a non-default port
+    /// has to accept the origin its own `/ui` will send.
+    #[test]
+    fn default_allowed_origins_follow_the_bind_port() {
+        let origins = default_allowed_origins(4242);
+        assert!(origins.iter().all(|o| o.ends_with(":4242")));
+        assert!(origins.contains(&"http://[::1]:4242".to_string()));
+    }
 
     /// (BU-21) A dual-stack listener reports an IPv4 client as
     /// `::ffff:a.b.c.d`, and `Ipv6Addr::is_loopback` only knows `::1`.

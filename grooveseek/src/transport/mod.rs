@@ -50,6 +50,25 @@ pub struct HttpTransportConfig {
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
 
+    /// ブラウザが付ける `Origin` ヘッダの allow-list。
+    /// `None` (省略) = **bind した port の loopback origin**
+    /// (`http://localhost:<port>` / `http://127.0.0.1:<port>` /
+    /// `http://[::1]:<port>`) を許可する。reverse proxy や別アプリ越しに
+    /// 公開するなら、**ブラウザが実際に送る公開 origin**
+    /// (`https://kb.example.com` 等) をここに明示する。
+    ///
+    /// MCP 仕様 2025-06-18 (Streamable HTTP / Security Warning) は
+    /// *"Servers **MUST** validate the `Origin` header on all incoming
+    /// connections to prevent DNS rebinding attacks"* と定めている。
+    /// rmcp の既定は空リスト = **検証しない** なので、既定値を空にはしない。
+    /// 空 `Vec` を明示すると検証は無効になる (起動時に warn を出す)。
+    ///
+    /// **認証ではない。** `Origin` を送らない要求 (MCP クライアント / tray /
+    /// curl) は RFC 6454 と rmcp の仕様どおり素通りする。これで防げるのは
+    /// 「利用者のブラウザに載った別サイトの JS」だけである。
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
+
     /// `/healthz` を `allowed_hosts` allow-list 配下に置くか (F-64)。
     /// `None` (省略) or `Some(true)` = 現行挙動 (`/healthz` は public、
     /// Host check なし)。`Some(false)` = `/healthz` も `allowed_hosts` で
@@ -96,6 +115,11 @@ pub enum Transport {
         /// `Some(vec)` = 明示 list (空 `Vec` を渡すと rmcp 側で全 Host
         /// 許可になる)。F-33 で `groove.toml` から surface した。
         allowed_hosts: Option<Vec<String>>,
+        /// `None` = bind した port の loopback origin を既定として組み立てる
+        /// ([`http::default_allowed_origins`](crate::transport::http::default_allowed_origins))。
+        /// `Some(vec)` = 明示 list。空 `Vec` は rmcp 側で **Origin 検証無効**
+        /// になるので、既定にはしない。
+        allowed_origins: Option<Vec<String>>,
         /// F-64: `/healthz` を `allowed_hosts` 検証配下に置くか。
         /// `true` (default) = 現行挙動 (Host check なし、public)。
         /// `false` = `/healthz` も Host check (= non-allowlisted から 403)。
@@ -146,6 +170,9 @@ impl Transport {
                 let allowed_hosts = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.allowed_hosts.clone());
+                let allowed_origins = cfg
+                    .and_then(|c| c.http.as_ref())
+                    .and_then(|h| h.allowed_origins.clone());
                 let healthz_public = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.healthz_public)
@@ -157,6 +184,7 @@ impl Transport {
                 Ok(Transport::Http {
                     addr,
                     allowed_hosts,
+                    allowed_origins,
                     healthz_public,
                     max_sessions,
                 })
@@ -222,8 +250,13 @@ pub fn check_cli_bind_ack(
         return Ok(());
     }
     anyhow::bail!(
-        "--bind {bind} は non-loopback です。groove は auth を持ちません — \
-         untrusted network での公開は危険。確認して進める場合は --i-know を付けて再実行してください。"
+        "--bind {bind} は non-loopback です。groove は認証を持ちません。\
+         このポートに到達できる相手は、ナレッジベース全文を無資格で読めます \
+         (/mcp に掛かっているのは Host 検証と session 数の上限だけで、認証ではありません)。\
+         ネットワーク境界を別のもの \
+         (コンテナのネットワーク分離 / reverse proxy / ファイアウォール) が\
+         担っている場合にだけ使ってください。\
+         承知の上で進めるなら --i-know を付けて再実行してください。"
     )
 }
 
@@ -249,6 +282,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:3100".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -263,6 +297,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:4000".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -283,6 +318,7 @@ mod tests {
             Transport::Http {
                 addr: "0.0.0.0:9000".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -317,6 +353,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:5555".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -357,6 +394,7 @@ mod tests {
             Transport::Http {
                 addr,
                 allowed_hosts,
+                allowed_origins: _,
                 healthz_public: _,
                 max_sessions: _,
             } => {
@@ -369,6 +407,56 @@ mod tests {
                     ])
                 );
             }
+            _ => panic!("expected Transport::Http"),
+        }
+    }
+
+    /// (1.0 blocker 4) `[transport.http].allowed_origins` が toml で明示されたら
+    /// それがそのまま `Transport::Http` に渡る。proxy 越しに公開する構成では、
+    /// ブラウザが送るのは loopback ではなく公開 origin になるため、既定値では
+    /// 届かず、ここを通す経路が必要になる。
+    #[test]
+    fn test_resolve_config_allowed_origins_passes_through() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                allowed_origins: Some(vec!["https://kb.example.com".to_string()]),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        match t {
+            Transport::Http {
+                allowed_origins, ..
+            } => assert_eq!(
+                allowed_origins,
+                Some(vec!["https://kb.example.com".to_string()])
+            ),
+            _ => panic!("expected Transport::Http"),
+        }
+    }
+
+    /// 省略時は `None`。`run_http` がそこで **bind した port の loopback origin**
+    /// を組み立てる。`Some(vec![])` との違いが要点で、空 `Vec` は rmcp では
+    /// 「検証しない」を意味するため、省略の既定にしてはならない。
+    #[test]
+    fn test_resolve_config_omitted_allowed_origins_is_none_not_empty() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        match t {
+            Transport::Http {
+                allowed_origins, ..
+            } => assert_eq!(
+                allowed_origins, None,
+                "omission must stay None; Some(vec![]) would disable validation"
+            ),
             _ => panic!("expected Transport::Http"),
         }
     }
@@ -430,6 +518,7 @@ mod tests {
         Transport::Http {
             addr: addr.parse().unwrap(),
             allowed_hosts: None,
+            allowed_origins: None,
             healthz_public: true,
             max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
         }

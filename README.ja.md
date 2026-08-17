@@ -114,6 +114,12 @@ kind = "http"
 [transport.http]
 bind = "127.0.0.1:3100"
 # allowed_hosts = ["kb.example.lan", "192.168.1.10"]  # LAN 公開時に明示 (v0.5.0+)
+# ブラウザの Origin allow-list。allowed_hosts と違い **既定で有効**: MCP 仕様が
+# Origin 検証を要求しているので、省略すると bind した port の loopback origin を
+# 許可する。proxy 越しにブラウザから使う場合は、ブラウザが送る**公開 origin** を
+# ここに明示する。Origin を持たない要求 (MCP クライアント / tray / curl) は
+# どちらでも素通り。空リストは検証を無効化し、起動時に警告が出る。
+# allowed_origins = ["https://kb.example.com"]
 # /healthz を allowed_hosts の検査対象外に置くか。既定は true (= public、Host
 # check なし)。false にすると /healthz も他のエンドポイントと同様に検証され、
 # allow-list に無い Host ヘッダのリクエストは 200 ではなく 403 になる (v0.7.5+)。
@@ -214,7 +220,7 @@ bind = "127.0.0.1:3100"
 | フィールド | 信頼しない config の場合 |
 | --- | --- |
 | `fastembed_cache_dir` | 警告して無視し、標準のキャッシュディレクトリを使う。どの `.onnx` を読むかを決める値であり、キャッシュに既にあるモデルは検証されないため (関連: `FASTEMBED_CACHE_DIR` は絶対パス必須で、モデルディレクトリが CWD 相対に解決されることは無い) |
-| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `healthz_public` / `max_sessions` は破棄する — 前 2 つは loopback 限定の `Host` チェックに戻し、3 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`kind` は尊重する |
+| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `allowed_origins` / `healthz_public` / `max_sessions` は破棄する — 前 3 つは loopback 限定の既定に戻し、4 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`allowed_origins` の破棄は両方向に効く — 植えられたリストは攻撃者の origin を名指しできるし、**空リストは rmcp では「Origin を検証しない」の意味**になるため。`kind` は尊重する |
 | `kb_path` | ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指していれば**警告して無視**。`--kb-path` は従来どおり効くので上書きでき、どちらも無ければ通常どおり「`--kb-path` is required」で停止する |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
@@ -825,6 +831,8 @@ groove serve --kb-path /path/to/knowledge-base --transport http --port 3100
 - 既定 bind は `127.0.0.1:3100` (loopback)。**groove は認証機構を内蔵していない**ので bind アドレスが実質唯一のアクセス制御 — `--bind 0.0.0.0:3100` は信頼できるネットワークでのみ使用する。v0.17.0 以降、非 loopback の `--bind` は `--i-know` を付けないと拒否される (`groove service install` と同じ規約)。`groove.toml` の `[transport.http].bind` 由来の非 loopback bind は既存のサービス構成を壊さないよう **gate しない**。起動時の警告が出るのは Host allow-list が未設定または空のときだけで (次の 2 項目を参照)、`allowed_hosts` を明示してある構成は「意図的な公開」とみなして黙る
 - rmcp の Streamable HTTP 層は Host ヘッダ検証を強制 (既定で loopback のみ) し、DNS rebinding 攻撃を防ぐ。ただし **Host 検証は認証ではない** — ポートに到達できる相手は `Host: localhost` を自由に付けられる。ブラウザ側の防御と考え、到達性はネットワーク層で絞ること
 - LAN / イントラ公開時は `groove.toml` の `[transport.http].allowed_hosts` に公開ホスト名 / IP を明示する (例: `["kb.example.lan", "192.168.1.10"]`)。loopback only の default のまま 0.0.0.0 で bind すると外部リクエストは Host 検証で 403 になる — operator のミス確定なので、groove は起動時に `tracing::warn` を出して気付かせる。`allowed_hosts = []` (空配列) を渡すと Host 検証が完全に無効化され (rmcp の `disable_allowed_hosts` 相当)、非 loopback bind と組み合わせるとポートに到達できる全員に `/mcp` が開く — この組合せも起動時に警告するようにした
+
+- **`Origin` 検証は `allowed_hosts` と違い既定で有効**。MCP 仕様は Streamable HTTP サーバについて *"**MUST** validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"* と定めているので、`[transport.http].allowed_origins` を省略した場合は「全部許可」ではなく **bind した port の loopback origin** (`http://localhost:PORT` / `http://127.0.0.1:PORT` / `http://[::1]:PORT`) を許可する。`Origin` ヘッダを持たない要求 — MCP クライアント / tray / `curl` — は RFC 6454 のとおり素通りするので、既存の利用は壊れない。この検査が止めるのは「利用者自身のブラウザに開かれた別サイトの JS がこのポートへ到達すること」だけで、**2 つ目のアクセス制御ではない**。reverse proxy 越しではブラウザは公開 origin を送るため、それを明示する。**このキーを書くと既定リストは「追加」ではなく「置換」される**ので、同じマシンから `/ui` も開くなら loopback の分も併記する: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`。空リストは検証を無効化し、起動時に警告が出る
 - サーバ内部の Mutex ベース直列化により、HTTP の並列リクエストでも embedder / DB 層では逐次処理される (`search` で目安 10 qps 程度)。本格的な並列化は将来の拡張
 
 ### Web UI と admin API (HTTP transport のみ)

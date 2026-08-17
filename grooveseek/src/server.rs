@@ -2786,6 +2786,7 @@ pub async fn run_server(
         crate::transport::Transport::Http {
             addr,
             allowed_hosts,
+            allowed_origins,
             healthz_public,
             max_sessions,
         } => {
@@ -2794,6 +2795,7 @@ pub async fn run_server(
             crate::transport::http::run_http(
                 addr,
                 allowed_hosts,
+                allowed_origins,
                 healthz_public,
                 max_sessions,
                 shared,

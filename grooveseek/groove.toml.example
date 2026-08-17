@@ -160,6 +160,24 @@ bind = "127.0.0.1:3100"
 # also accepted for backward compatibility.
 #allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100"]
 
+# Allow-list of accepted browser Origin headers. Omitted, the loopback origins
+# for the bind port apply -- http://localhost:PORT, http://127.0.0.1:PORT and
+# http://[::1]:PORT -- which is what /ui in this server sends. The MCP
+# specification requires servers to validate Origin to prevent DNS rebinding, so
+# unlike allowed_hosts this one is NOT off by default.
+# Set it when a browser reaches the server through something else: behind a
+# reverse proxy the browser sends your PUBLIC origin, not a loopback one, and
+# the default list will not match it. Entries need a scheme, and IPv6 must be
+# bracketed, because both are compared as RFC 6454 (scheme, host, port) triples.
+# This is NOT authentication: a request with no Origin header at all -- every
+# MCP client, the tray, curl -- passes regardless. What it stops is a web page
+# open in your browser reaching this port cross-origin.
+# Setting this REPLACES the default list, it does not add to it. So if you also
+# open /ui from the machine itself, keep the loopback entries alongside your
+# public origin -- otherwise the local browser starts getting 403.
+# An empty list DISABLES validation entirely and warns at startup.
+#allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]
+
 # Whether /healthz sits outside the allow-list (v0.7.5+). The default is public,
 # with no Host check. Turn it off to have /healthz validated like every other
 # endpoint, so a request whose Host header is not on the allow-list gets 403

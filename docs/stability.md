@@ -23,6 +23,39 @@ nobody would notice.
 So the promise is narrowed on purpose, and the narrowing is written down rather than
 left to be inferred.
 
+## Where GrooveSeek is meant to run
+
+**GrooveSeek has no authentication, and none is planned.** That is a design
+position rather than a gap, so it belongs in this document instead of a roadmap.
+
+The HTTP transport is meant to be reached from the same host. Something else owns
+the network boundary — a container's network isolation, a reverse proxy, or the
+application that puts a face on the knowledge base. Whatever it is, it terminates
+the connection from outside, authenticates, and talks to GrooveSeek over loopback.
+
+Binding to a non-loopback address stays allowed, because a container has to bind
+one or published ports never reach it. But doing so means you have taken that
+boundary on yourself. `/mcp` is covered by `Host` validation and a session cap,
+and neither is authentication: **anything that can reach the port can read the
+entire knowledge base.** The startup warning says so, and means it.
+
+`/ui`, `/api/search` and `/api/admin/status` refuse every peer that is not
+loopback. That is not configurable, so a proxy has to run on the same host.
+
+### Origin validation
+
+The MCP specification requires a Streamable HTTP server to validate the `Origin`
+header against DNS rebinding. GrooveSeek does, defaulting to the loopback origins
+for whichever port it binds.
+
+Requests carrying no `Origin` at all — MCP clients, the tray, `curl` — pass, as
+RFC 6454 and the specification describe. The check exists to stop a web page open
+in your own browser from reaching the port; it is not a second access control.
+Publishing through a proxy means naming your public origin in
+`[transport.http].allowed_origins`, because the browser will send that one and
+not a loopback origin. That key *replaces* the default rather than extending it,
+so keep the loopback entries alongside it if you still open `/ui` locally.
+
 ## Stable
 
 Breaking any of these requires a major version.
@@ -104,6 +137,16 @@ release, including a patch.
 the person running the server look at their own knowledge base, they are
 loopback-only by design (GrooveSeek has no authentication), and the web interface is
 expected to be rebuilt. Treat the HTML and both JSON endpoints as internal.
+
+Two of them are also expected to **go away**. Browsing a knowledge base belongs to
+a client that speaks `/mcp` — where every tool and every search parameter is
+reachable, and where the surface is already stable — so the intention is to remove
+`/ui` and `/api/search` during 1.x, once such a client exists. `/api/admin/status`
+is not on that path: it reports operational state (version, pid, indexing
+progress) that has no place in a tool surface designed for language models.
+
+Read that as advance notice, not as a schedule. These surfaces are unstable, so
+nothing above is promised in either direction.
 
 ### Human-readable output
 
