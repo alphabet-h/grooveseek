@@ -2583,7 +2583,13 @@ impl KbServerShared {
     }
 }
 
-/// (feature-43 PR-2) Plain-JSON search entry for the WebUI `/api/search` POST.
+/// (Phase 4 PR-2) Test-only. `/api/search` was removed from the running
+/// server: `/ui` searches through `/mcp` now, and this entry only ever exposed
+/// `query` and `limit` — 2 of the 17 parameters the `search` tool takes. It is
+/// kept because `tests/runtime_starvation.rs` needs a handler that blocks on
+/// the embedder lock, and that test must not be edited.
+///
+/// Plain-JSON search entry for the former WebUI `/api/search` POST.
 ///
 /// Constructs a minimal `SearchParams` (= query + limit only) and dispatches
 /// through the same `KbServer::search` tool method the MCP clients use.
@@ -2594,6 +2600,7 @@ impl KbServerShared {
 /// the private `SearchParams` type does not need to leak to the public API
 /// of `KbServerShared`. Same-module access to `SearchParams` + `pub(crate)`
 /// `KbServer::search` keeps the MCP tool surface untouched.
+#[cfg(any(test, feature = "test-helpers"))]
 pub async fn web_search(shared: &KbServerShared, query: String, limit: Option<u32>) -> String {
     let kb_server = KbServer::from_shared(shared);
     let params = SearchParams {

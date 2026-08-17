@@ -14,6 +14,35 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Removed
+
+- **`/api/search`.** It accepted `query` and `limit` — 2 of the 17 parameters
+  the MCP `search` tool takes — so `/mcp` was already the better endpoint for
+  anything outside the process, and `/ui` uses `/mcp` now. The endpoint was
+  declared unstable in [docs/stability.md](docs/stability.md), and this removes
+  it before 1.0.0 rather than during it.
+
+  If you were calling it directly, `/mcp` answers the same query with the whole
+  parameter set and no session handshake — see the request shape in the
+  `/ui` source (`grooveseek/src/transport/webui_index.html`), which is now the
+  smallest working example of an MCP client over Streamable HTTP.
+
+### Changed
+
+- **`/ui` is the operator's view of their own server, and it searches through
+  `/mcp`.** It shows a status band — version, documents, chunks, model, watcher,
+  uptime, pid, indexing progress — over a search box, replacing a placeholder
+  that said "MVP" and "to be redesigned" in its own markup while the project was
+  preparing to call itself stable. Still one file, no external requests, and
+  every string out of the knowledge base placed with `textContent`.
+
+  Routing its search through `/mcp` rather than a private endpoint means the
+  page exercises the same surface an external client would, and **puts `/ui`
+  under `Origin` validation for the first time**. With the default list it
+  works; an `allowed_origins` that names only a public origin leaves the page
+  served but unable to query, and the server now warns about that at startup
+  rather than leaving a silent 403 on screen.
+
 ### Security
 
 - **The HTTP transport now validates the `Origin` header, which it never did.**
@@ -32,13 +61,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   none. What it stops is a web page open in the operator's own browser reaching
   `/mcp` cross-origin. It is not authentication, and groove still has none.
 
-  **It covers `/mcp` and nothing else.** `/ui`, `/api/search` and
-  `/api/admin/status` are on the admin router and have no `Origin` check;
-  measured with the default list, `Origin: https://evil.example` gets 403 from
-  `/mcp` and 200 from all three. They are restricted by requiring a loopback
-  peer, which is not configurable — so `allowed_origins` cannot break a locally
-  opened `/ui`, and it is not what keeps a local web page away from
-  `/api/search` (the browser's CORS preflight is).
+  **It covers `/mcp`, and `/ui` searches through `/mcp`** (see below), so this
+  list decides whether the built-in page can query. `/api/admin/status` has no
+  `Origin` check of its own; it is restricted by requiring a loopback peer,
+  which is not configurable.
 
 ### Added
 
@@ -112,12 +138,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `Host` validation and the session cap are not authentication. Same text in
   `groove serve` and `groove service install`.
 - **The admin web surface is now documented as scheduled to go away.**
-  `docs/stability.md` records the intent to remove `/ui` and `/api/search` during
-  1.x, once a client that speaks `/mcp` exists — browsing belongs there, where
-  every tool and every search parameter is reachable and the surface is already
-  stable. `/api/admin/status` stays: it reports operational state (version, pid,
+  `docs/stability.md` records the intent to retire `/ui` during 1.x, once a
+  client that speaks `/mcp` exists — browsing belongs there, where every tool
+  and every search parameter is reachable and the surface is already stable.
+  `/api/admin/status` stays: it reports operational state (version, pid,
   indexing progress) that does not belong in a tool surface built for language
-  models. Both endpoints remain unstable, so this is notice rather than a promise.
+  models. Both remain unstable, so this is notice rather than a promise.
 
 ## [0.26.0] - 2026-08-17
 

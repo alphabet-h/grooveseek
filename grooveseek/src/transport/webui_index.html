@@ -1,83 +1,417 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta charset="utf-8">
-    <title>groove WebUI (MVP)</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GrooveSeek</title>
+<!-- Inline so the browser stops asking for /favicon.ico, which this server has
+     no route for and would answer 404 into the operator's console on every
+     load. A data URI keeps the page self-contained: no second request, and
+     nothing to serve. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232f5f9e'/%3E%3Cpath d='M16 7l7 9-7 9-7-9z' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f7f7f5; --panel:#fff; --ink:#1c1c1a; --muted:#6b6b66;
+  --line:#e0e0da; --line-strong:#c6c6be; --accent:#2f5f9e; --accent-soft:#e8f0fa;
+  --ok:#2f7d52; --ok-soft:#e8f4ec; --warn:#a5701a; --warn-soft:#fbf1de;
+  --bad:#b3372e; --bad-soft:#fbeae8; --code:#f0f0ec;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#16161a; --panel:#1e1e23; --ink:#e8e8e4; --muted:#9a9a94;
+    --line:#2e2e36; --line-strong:#45454f; --accent:#8ab4e8; --accent-soft:#1a2331;
+    --ok:#6fc191; --ok-soft:#1c2b23; --warn:#e0b263; --warn-soft:#2e2618;
+    --bad:#e8877d; --bad-soft:#2e1d1b; --code:#26262c;
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:-apple-system,"Segoe UI","Hiragino Kaku Gothic ProN","Yu Gothic UI",Meiryo,sans-serif;
+  font-size:15px; line-height:1.6;
+}
+.wrap{max-width:920px; margin:0 auto; padding:0 20px 64px}
+.mono{font-family:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace}
+
+/* ---- status band ---- */
+header{border-bottom:1px solid var(--line); background:var(--panel)}
+.band{max-width:920px; margin:0 auto; padding:18px 20px 16px}
+.title-row{display:flex; align-items:center; gap:12px; flex-wrap:wrap}
+h1{font-size:20px; margin:0; letter-spacing:.01em; font-weight:700}
+h1 .mark{color:var(--accent)}
+.pill{
+  display:inline-flex; align-items:center; gap:7px; margin-left:auto;
+  font-size:12.5px; font-weight:600; padding:4px 12px; border-radius:20px;
+  background:var(--ok-soft); color:var(--ok); border:1px solid var(--ok);
+}
+.pill.is-working{background:var(--warn-soft); color:var(--warn); border-color:var(--warn)}
+.pill.is-down{background:var(--bad-soft); color:var(--bad); border-color:var(--bad)}
+.dot{width:8px; height:8px; border-radius:50%; background:currentColor; flex:none}
+.facts{margin-top:10px; font-size:13px; color:var(--muted); line-height:1.9}
+.facts div{overflow-wrap:anywhere}
+.facts b{color:var(--ink); font-weight:600}
+.sep{opacity:.5; margin:0 8px}
+
+/* ---- search ---- */
+form{display:flex; gap:10px; margin:24px 0 0; flex-wrap:wrap}
+#q{
+  flex:1 1 320px; min-width:0; padding:11px 14px; font-size:15px; font-family:inherit;
+  color:var(--ink); background:var(--panel);
+  border:1px solid var(--line-strong); border-radius:8px;
+}
+#q:focus{outline:2px solid var(--accent); outline-offset:-1px; border-color:var(--accent)}
+button{
+  padding:11px 22px; font-size:15px; font-family:inherit; font-weight:600;
+  color:#fff; background:var(--accent); border:1px solid var(--accent);
+  border-radius:8px; cursor:pointer;
+}
+button:disabled{opacity:.55; cursor:default}
+
+.meta{margin:18px 0 0; font-size:12.5px; color:var(--muted)}
+.notice{
+  margin:18px 0 0; padding:11px 14px; border-radius:8px; font-size:13.5px;
+  background:var(--bad-soft); border:1px solid var(--bad);
+}
+.notice.is-hint{background:var(--warn-soft); border-color:var(--warn)}
+
+/* ---- results ---- */
+ol{list-style:none; margin:14px 0 0; padding:0}
+li{
+  background:var(--panel); border:1px solid var(--line); border-radius:9px;
+  padding:14px 16px; margin-bottom:10px;
+}
+.hit-head{display:flex; gap:12px; align-items:baseline; flex-wrap:wrap}
+.score{
+  font-family:"Cascadia Mono",Consolas,monospace; font-size:12.5px; font-weight:700;
+  color:var(--accent); background:var(--accent-soft);
+  padding:2px 8px; border-radius:5px; flex:none;
+}
+.path{font-family:"Cascadia Mono",Consolas,monospace; font-size:13px; font-weight:600; overflow-wrap:anywhere}
+.heading{color:var(--muted); font-size:13px; overflow-wrap:anywhere}
+.snippet{margin:8px 0 0; font-size:13.5px; color:var(--ink); white-space:pre-wrap; overflow-wrap:anywhere}
+.tags{margin-top:9px; display:flex; gap:6px; flex-wrap:wrap}
+.tag{font-size:11.5px; color:var(--muted); border:1px solid var(--line-strong); border-radius:20px; padding:1px 9px}
+
+footer{margin-top:40px; padding-top:16px; border-top:1px solid var(--line); font-size:12.5px; color:var(--muted)}
+footer code{background:var(--code); padding:.1em .35em; border-radius:3px; font-family:"Cascadia Mono",Consolas,monospace}
+</style>
 </head>
 <body>
-    <h1>groove</h1>
-    <p style="color:#888">WebUI MVP — to be redesigned in Phase 3+</p>
-    <form id="search-form">
-        <input type="search" id="q" placeholder="Search your knowledge base..." size="60">
-        <button type="submit">Search</button>
-    </form>
-    <ul id="results"></ul>
-    <script>
-        const form = document.getElementById('search-form');
-        const results = document.getElementById('results');
 
-        // XSS-safe: textContent / createElement only, never innerHTML.
-        function renderResults(items) {
-            results.textContent = '';
-            if (!items || items.length === 0) {
-                const li = document.createElement('li');
-                li.textContent = 'No results.';
-                results.appendChild(li);
-                return;
-            }
-            for (const r of items) {
-                const li = document.createElement('li');
-                const strong = document.createElement('strong');
-                strong.textContent = r.title || '(untitled)';
-                li.appendChild(strong);
-                const meta = document.createElement('span');
-                meta.style.color = '#888';
-                const score = (typeof r.score === 'number') ? r.score.toFixed(2) : '-';
-                meta.textContent = ' — ' + (r.path || '') + ' (score ' + score + ')';
-                li.appendChild(meta);
-                const snippet = document.createElement('p');
-                snippet.textContent = r.snippet || r.content || '';
-                li.appendChild(snippet);
-                results.appendChild(li);
-            }
-        }
+<header>
+  <div class="band">
+    <div class="title-row">
+      <h1><span class="mark">&#9670;</span> GrooveSeek</h1>
+      <span class="pill" id="pill"><span class="dot"></span><span id="pill-text">connecting</span></span>
+    </div>
+    <div class="facts" id="facts"></div>
+  </div>
+</header>
 
-        function setLoading() {
-            results.textContent = '';
-            const li = document.createElement('li');
-            li.textContent = 'Searching...';
-            results.appendChild(li);
-        }
+<div class="wrap">
+  <form id="search-form">
+    <input type="search" id="q" placeholder="Search your knowledge base..." autocomplete="off" autofocus>
+    <button type="submit" id="go">Search</button>
+  </form>
 
-        function renderError(message) {
-            results.textContent = '';
-            const li = document.createElement('li');
-            li.style.color = '#c00';
-            li.textContent = 'Error: ' + message;
-            results.appendChild(li);
-        }
+  <p class="meta" id="meta"></p>
+  <div id="notice"></div>
+  <ol id="results"></ol>
 
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const q = document.getElementById('q').value;
-            setLoading();
-            try {
-                const resp = await fetch('/api/search', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: q, limit: 10 })
-                });
-                if (!resp.ok) {
-                    const text = await resp.text();
-                    renderError('HTTP ' + resp.status + ': ' + text);
-                    return;
-                }
-                const data = await resp.json();
-                renderResults(data.results || []);
-            } catch (err) {
-                renderError('network error (' + err.message + ')');
-            }
-        });
-    </script>
+  <footer>
+    Operator view: it runs on the machine that runs the server, and answers only
+    to loopback. Searching goes through <code>/mcp</code>, the same endpoint an
+    MCP client uses &mdash; so this page is also the smallest example of one.
+    Browsing a knowledge base is expected to move to MCP clients during 1.x;
+    see <code>docs/stability.md</code>.
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+// The protocol version that removes sessions (SEP-2567). Naming it lets the
+// browser call `tools/call` with no `initialize` handshake and no session id.
+const MCP_VERSION = "2026-07-28";
+
+// How much of a chunk to show per hit.
+const SNIPPET_CHARS = 320;
+
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------- rendering
+// Every node is built with createElement + textContent. Nothing here goes
+// through innerHTML, because every string below is knowledge-base content.
+
+function clear(node) { node.textContent = ""; }
+
+function show(kind, message) {
+  const box = $("notice");
+  clear(box);
+  const div = document.createElement("div");
+  div.className = kind === "hint" ? "notice is-hint" : "notice";
+  div.textContent = message;
+  box.appendChild(div);
+}
+
+function fact(parts) {
+  const div = document.createElement("div");
+  parts.forEach((part, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "sep";
+      sep.textContent = "·";
+      div.appendChild(sep);
+    }
+    if (part.strong) {
+      const b = document.createElement("b");
+      b.textContent = part.strong;
+      div.appendChild(b);
+      if (part.tail) div.appendChild(document.createTextNode(" " + part.tail));
+    } else {
+      div.appendChild(document.createTextNode(part.text));
+    }
+  });
+  return div;
+}
+
+function humanUptime(secs) {
+  if (typeof secs !== "number") return "?";
+  const d = Math.floor(secs / 86400);
+  const h = String(Math.floor((secs % 86400) / 3600)).padStart(2, "0");
+  const m = String(Math.floor((secs % 3600) / 60)).padStart(2, "0");
+  return (d > 0 ? d + "d " : "") + h + ":" + m;
+}
+
+function renderStatus(s) {
+  const pill = $("pill");
+  const indexing = s.indexing || {};
+  pill.className = "pill" + (indexing.active ? " is-working" : "");
+  $("pill-text").textContent = indexing.active ? "indexing" : "running";
+
+  const facts = $("facts");
+  clear(facts);
+  const kb = s.kb || {};
+  const daemon = s.daemon || {};
+  const watcher = s.watcher || {};
+
+  facts.appendChild(fact([
+    { text: daemon.version ? "v" + daemon.version : "version unknown" },
+    { strong: String(kb.documents ?? "?"), tail: "documents" },
+    { strong: String(kb.chunks ?? "?"), tail: "chunks" },
+    { text: kb.model || "model unknown" },
+  ]));
+
+  const second = [
+    { text: watcher.active
+        ? "watcher active (" + (watcher.debounce_ms ?? "?") + " ms debounce)"
+        : "watcher off" },
+    { text: "up " + humanUptime(daemon.uptime_secs) },
+    { text: "pid " + (daemon.pid ?? "?") },
+  ];
+  if (indexing.active && indexing.progress) {
+    second.unshift({ text: "indexing " + indexing.progress.current + "/" + indexing.progress.total });
+  }
+  facts.appendChild(fact(second));
+
+  if (kb.path) facts.appendChild(fact([{ text: kb.path }]));
+}
+
+function renderResults(payload, elapsedMs) {
+  const list = $("results");
+  clear(list);
+  const hits = payload.results || [];
+
+  const bits = [hits.length + (hits.length === 1 ? " result" : " results")];
+  bits.push(Math.round(elapsedMs) + " ms");
+  if (payload.low_confidence) bits.push("low confidence");
+  $("meta").textContent = bits.join(" · ");
+
+  if (hits.length === 0) {
+    show("hint", "No results. Try fewer or more general words.");
+    return;
+  }
+
+  for (const hit of hits) {
+    const li = document.createElement("li");
+
+    const head = document.createElement("div");
+    head.className = "hit-head";
+    const score = document.createElement("span");
+    score.className = "score";
+    score.textContent = typeof hit.score === "number" ? hit.score.toFixed(3) : "-";
+    head.appendChild(score);
+    const path = document.createElement("span");
+    path.className = "path";
+    path.textContent = hit.path || "(no path)";
+    head.appendChild(path);
+    if (hit.heading) {
+      const heading = document.createElement("span");
+      heading.className = "heading";
+      heading.textContent = "› " + hit.heading;
+      head.appendChild(heading);
+    }
+    li.appendChild(head);
+
+    const body = hit.content || hit.snippet || "";
+    if (body) {
+      const p = document.createElement("p");
+      p.className = "snippet";
+      // A chunk can be the better part of a page. Ten of them at full length
+      // is a wall, and the point of this list is to let the operator pick one.
+      p.textContent = body.length > SNIPPET_CHARS ? body.slice(0, SNIPPET_CHARS) + "…" : body;
+      li.appendChild(p);
+    }
+
+    const tags = (hit.tags || []).slice(0, 8);
+    if (hit.topic || tags.length) {
+      const row = document.createElement("div");
+      row.className = "tags";
+      if (hit.topic) {
+        const t = document.createElement("span");
+        t.className = "tag";
+        t.textContent = hit.topic;
+        row.appendChild(t);
+      }
+      for (const tag of tags) {
+        const t = document.createElement("span");
+        t.className = "tag";
+        t.textContent = tag;
+        row.appendChild(t);
+      }
+      li.appendChild(row);
+    }
+
+    list.appendChild(li);
+  }
+}
+
+// ------------------------------------------------------------------ transport
+
+// Read a Streamable HTTP response until the first JSON-RPC message carrying a
+// result or an error. rmcp answers with `text/event-stream` unless the server
+// was configured for plain JSON, so both shapes are handled.
+async function readMcpMessage(resp) {
+  const contentType = resp.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) return await resp.json();
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) buffered += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, nl).replace(/\r$/, "");
+      buffered = buffered.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;      // id: / retry: / keep-alives
+      const data = line.slice(5).trim();
+      if (!data) continue;
+      let message;
+      try { message = JSON.parse(data); } catch (e) { continue; }
+      if (message.result !== undefined || message.error !== undefined) {
+        reader.cancel();
+        return message;
+      }
+    }
+    if (done) break;
+  }
+  throw new Error("the stream ended before a result arrived");
+}
+
+// One `tools/call` with no handshake. The three headers and the `_meta` block
+// are what the stateless protocol requires; omitting any of them is answered
+// with -32020 or -32602 rather than a result.
+async function callTool(name, args) {
+  const resp = await fetch("/mcp", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      "MCP-Protocol-Version": MCP_VERSION,
+      "Mcp-Method": "tools/call",
+      "Mcp-Name": name,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: name,
+        arguments: args,
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MCP_VERSION,
+          "io.modelcontextprotocol/clientCapabilities": {},
+        },
+      },
+    }),
+  });
+
+  if (resp.status === 403) {
+    throw new Error(
+      "403 from /mcp. This page is served from " + window.location.origin +
+      ", and that origin is not in [transport.http].allowed_origins. Add it, " +
+      "or remove the key to restore the loopback default."
+    );
+  }
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error("HTTP " + resp.status + (text ? ": " + text.slice(0, 300) : ""));
+  }
+
+  const message = await readMcpMessage(resp);
+  if (message.error) {
+    throw new Error(message.error.message || "the server returned an error");
+  }
+  const content = (message.result && message.result.content) || [];
+  const text = content.length ? content[0].text : "";
+  if (message.result && message.result.isError) {
+    throw new Error(text || "the tool reported an error");
+  }
+  return JSON.parse(text);
+}
+
+// ------------------------------------------------------------------- wiring
+
+async function loadStatus() {
+  try {
+    const resp = await fetch("/api/admin/status");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    renderStatus(await resp.json());
+  } catch (err) {
+    const pill = $("pill");
+    pill.className = "pill is-down";
+    $("pill-text").textContent = "unreachable";
+    $("facts").textContent = "Could not read /api/admin/status (" + err.message + ").";
+  }
+}
+
+$("search-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const query = $("q").value.trim();
+  if (!query) return;
+
+  const button = $("go");
+  button.disabled = true;
+  clear($("notice"));
+  clear($("results"));
+  $("meta").textContent = "Searching…";
+
+  const started = performance.now();
+  try {
+    const payload = await callTool("search", { query: query, limit: 10 });
+    renderResults(payload, performance.now() - started);
+  } catch (err) {
+    $("meta").textContent = "";
+    show("error", err.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+loadStatus();
+setInterval(loadStatus, 5000);
+</script>
 </body>
 </html>

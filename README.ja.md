@@ -835,7 +835,7 @@ groove serve --kb-path /path/to/knowledge-base --transport http --port 3100
 
 - **`Origin` 検証は `allowed_hosts` と違い既定で有効**。MCP 仕様は Streamable HTTP サーバについて *"**MUST** validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"* と定めているので、`[transport.http].allowed_origins` を省略した場合は「全部許可」ではなく **bind した port の loopback origin** (`http://localhost:PORT` / `http://127.0.0.1:PORT` / `http://[::1]:PORT`) を許可する。`Origin` ヘッダを持たない要求 — 通常の MCP クライアント / tray / `curl` — は RFC 6454 のとおり素通りするので、既存の利用は壊れない。この検査が止めるのは「利用者自身のブラウザに開かれた別サイトの JS がこのポートへ到達すること」だけで、**2 つ目のアクセス制御ではない**。reverse proxy 越しではブラウザ側のクライアントが公開 origin を送るため、それを明示する。**このキーを書くと既定リストは「追加」ではなく「置換」される**ので、ブラウザ上のクライアントが loopback 経由でも来るなら loopback の分も併記する: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`。空リストは検証を無効化し、起動時に警告が出る
 
-- **`Origin` 検証が掛かるのは `/mcp` だけ**。`/ui` / `/api/search` / `/api/admin/status` は admin router 側にあり、**`Origin` 検査を一切持たない** — これは推測ではなく実測で、`allowed_origins` を既定のままにして `Origin: https://evil.example` を送ると `/mcp` は 403、admin の 3 経路はいずれも 200 を返す。これらを縛っているのは「peer が loopback であること」で、そちらは設定できない。帰結が 2 つ: **`allowed_origins` をどう変えてもローカルで開く `/ui` は壊れない**。そして **`/api/search` にローカルの web ページを近づけないのは `allowed_origins` ではなく、ブラウザ自身の CORS preflight である**
+- **`Origin` 検証が掛かるのは `/mcp`。そして `/ui` は `/mcp` 経由で検索する。** つまりこのリストが**組み込みページで検索できるかどうかを決める** — 既定を公開 origin だけで置き換えると、`/ui` は表示されるのに問い合わせが全部拒否される。**その組合せは起動時に警告する**。`/api/admin/status` は独自の `Origin` 検査を持たず、縛っているのは「peer が loopback であること」で、そちらは設定できない
 - サーバ内部の Mutex ベース直列化により、HTTP の並列リクエストでも embedder / DB 層では逐次処理される (`search` で目安 10 qps 程度)。本格的な並列化は将来の拡張
 
 ### Web UI と admin API (HTTP transport のみ)
@@ -851,9 +851,10 @@ route が生える。有効化の設定は無く HTTP transport があれば常�
 
 | Route | 中身 |
 | --- | --- |
-| `/ui` | 最小限の**検索ページ** (MVP placeholder、Phase 3+ で再設計予定)。クエリ入力欄が `/api/search` に post して結果を並べるだけで、daemon の状態は **表示しない** |
-| `/api/search` | 上のページ用の JSON 検索。MCP の `search` ツールと同じハイブリッド検索 |
-| `/api/admin/status` | daemon / indexing / watcher / KB の状態を JSON で返す。Windows tray が 5 秒間隔で polling しているのはこれ |
+| `/ui` | **運用者向けの画面**。状態帯 (version / 文書数 / チャンク数 / モデル / watcher / uptime / pid) の下に検索。検索は **`/mcp` を呼んで**行うので、このページ自体が「Streamable HTTP 上の MCP クライアントの最小の実例」になっている |
+| `/api/admin/status` | daemon / indexing / watcher / KB の状態を JSON で返す。Windows tray が 5 秒間隔で polling しているのはこれで、上の状態帯もこれを読む |
+
+> **`/api/search` は v0.27.0 で削除した。** `search` tool が取る 17 パラメータのうち 2 つしか受け取っておらず、プロセスの外から使う口としては `/mcp` の方が既に優れていたため。`/ui` も `/mcp` を使うようになった。[docs/stability.ja.md](./docs/stability.ja.md) 参照
 
 ```bash
 curl http://127.0.0.1:3100/api/admin/status

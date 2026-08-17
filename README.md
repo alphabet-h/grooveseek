@@ -846,7 +846,7 @@ Security notes:
 
 - **`Origin` validation is on by default**, unlike `allowed_hosts`. The MCP specification states that a Streamable HTTP server *"MUST validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"*, so omitting `[transport.http].allowed_origins` accepts the loopback origins for the bind port (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`) rather than accepting everything. Requests that carry no `Origin` header — every ordinary MCP client, the tray, `curl` — pass regardless, per RFC 6454; the check exists to stop a web page open in your own browser from reaching the port, and it is **not** a second access control. Behind a reverse proxy a browser-based client sends your public origin, so name it explicitly. **Setting the key replaces the default list rather than extending it**, so keep the loopback entries too if browser clients also reach you over loopback: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`. An empty list disables validation and warns at startup.
 
-- **`Origin` validation covers `/mcp` and nothing else.** `/ui`, `/api/search` and `/api/admin/status` live on the admin router, which has no `Origin` check — measured, not inferred: with `allowed_origins` at its default, `Origin: https://evil.example` gets 403 from `/mcp` and 200 from all three admin routes. What restricts those is the requirement that the peer be loopback, and that is not configurable. Two consequences worth knowing: changing `allowed_origins` cannot break a `/ui` you open locally, and `allowed_origins` is not what keeps a local web page away from `/api/search` — the browser's own CORS preflight is.
+- **`Origin` validation covers `/mcp`, and `/ui` searches through `/mcp`.** So this list decides whether the built-in page can search: replace the default with only a public origin and `/ui` is still served but every query it makes is refused. The server warns about exactly that combination at startup. `/api/admin/status` has no `Origin` check of its own — what restricts it is the requirement that the peer be loopback, which is not configurable.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
 ### Web UI and admin API (HTTP transport only)
@@ -863,9 +863,10 @@ allow-listed its Host for `/mcp`.
 
 | Route | What it is |
 | --- | --- |
-| `/ui` | A minimal search page (MVP placeholder, to be redesigned): a query box that posts to `/api/search` and lists the hits. It does **not** show daemon status. |
-| `/api/search` | JSON search for the page above — the same hybrid search the MCP `search` tool runs. |
-| `/api/admin/status` | Daemon / indexing / watcher / KB status as JSON. This is what the Windows tray polls every 5 seconds. |
+| `/ui` | The operator's view: a status band (version, documents, chunks, model, watcher, uptime, pid) over a search box. It searches by calling **`/mcp`**, which makes the page the smallest working example of an MCP client over Streamable HTTP. |
+| `/api/admin/status` | Daemon / indexing / watcher / KB status as JSON. This is what the Windows tray polls every 5 seconds, and what the band above reads. |
+
+> **`/api/search` was removed in v0.27.0.** It accepted 2 of the 17 parameters the `search` tool takes, so `/mcp` was already the better endpoint for anything outside the process; `/ui` uses `/mcp` now. See [docs/stability.md](./docs/stability.md).
 
 ```bash
 curl http://127.0.0.1:3100/api/admin/status

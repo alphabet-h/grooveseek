@@ -150,8 +150,8 @@ SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
 > の allow-list は「loopback の別名 + (bind 自体が loopback の場合のみ) bind
 > アドレス」なのでこれも通る。結果、両方の gate を抜けて proxy に到達できる
 > 相手にこれらの route が出る。**allow-list 方式にすること**: map するのは
-> `/mcp` と `/healthz` だけ。block-list は形が悪い — `/api/search` も `/ui` /
-> `/api/admin/*` と同じ router にあり KB の内容を返すので、**塞ぎ忘れたものが
+> `/mcp` と `/healthz` だけ。block-list は形が悪い — `/ui` と `/api/admin/*` は
+> 同じ router にあり KB と daemon の状態を返すので、**塞ぎ忘れたものが
 > そのまま露出する**。意図的に公開するなら、KB 本体・index 再構築・daemon
 > status の前に立つのは proxy 自身の認証だけになる。
 
@@ -163,7 +163,7 @@ SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
 
 `groove.toml` で `127.0.0.1:3100` に bind し、nginx では **`/mcp` と
 `/healthz` だけ** を allow-list として proxy する — 他の route (`/ui` /
-`/api/search` / `/api/admin/*`) はすべて loopback gate 付きで、同一ホストの
+`/api/admin/*`) はすべて loopback gate 付きで、同一ホストの
 proxy はその gate を無効化する (上の警告を参照)。クライアントの Host を転送し (`proxy_set_header Host $host;`)、
 その名前を `[transport.http].allowed_hosts` に列挙する。
 

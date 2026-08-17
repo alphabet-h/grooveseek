@@ -39,8 +39,8 @@ boundary on yourself. `/mcp` is covered by `Host` validation and a session cap,
 and neither is authentication: **anything that can reach the port can read the
 entire knowledge base.** The startup warning says so, and means it.
 
-`/ui`, `/api/search` and `/api/admin/status` refuse every peer that is not
-loopback. That is not configurable, so a proxy has to run on the same host.
+`/ui` and `/api/admin/status` refuse every peer that is not loopback. That is
+not configurable, so a proxy has to run on the same host.
 
 ### Origin validation
 
@@ -57,11 +57,11 @@ one and not a loopback origin. That key *replaces* the default rather than
 extending it, so keep the loopback entries alongside it if browser clients also
 reach you over loopback.
 
-**It covers `/mcp` and nothing else.** `/ui`, `/api/search` and
-`/api/admin/status` have no `Origin` check; what restricts them is the loopback
-peer requirement above. So `allowed_origins` cannot break a `/ui` you open
-locally, and it is not what keeps a local web page away from `/api/search` — the
-browser's own CORS preflight is.
+**It covers `/mcp`, and `/ui` searches through `/mcp`.** So this list decides
+whether the built-in page can search: replacing the default with only a public
+origin leaves `/ui` served but unable to query, and the server warns about that
+combination at startup. `/api/admin/status` has no `Origin` check of its own;
+what restricts it is the loopback peer requirement above.
 
 ## Stable
 
@@ -140,17 +140,23 @@ release, including a patch.
 
 ### The admin web surface
 
-**`/ui`, `/api/search`, and `/api/admin/status` are not stable.** They exist to let
-the person running the server look at their own knowledge base, they are
-loopback-only by design (GrooveSeek has no authentication), and the web interface is
-expected to be rebuilt. Treat the HTML and both JSON endpoints as internal.
+**`/ui` and `/api/admin/status` are not stable.** They exist to let the person
+running the server look at their own server, they are loopback-only by design
+(GrooveSeek has no authentication), and the page is expected to keep changing.
+Treat the HTML and the JSON as internal.
 
-Two of them are also expected to **go away**. Browsing a knowledge base belongs to
-a client that speaks `/mcp` — where every tool and every search parameter is
-reachable, and where the surface is already stable — so the intention is to remove
-`/ui` and `/api/search` during 1.x, once such a client exists. `/api/admin/status`
-is not on that path: it reports operational state (version, pid, indexing
-progress) that has no place in a tool surface designed for language models.
+`/api/search` **has already been removed**, before 1.0.0 rather than during it.
+It only ever accepted two of the seventeen parameters the `search` tool takes,
+so `/mcp` was the better endpoint for anything outside the process — and `/ui`
+now uses `/mcp` itself, which makes the page the smallest working example of an
+MCP client.
+
+`/ui` is expected to **go away** as well. Browsing a knowledge base belongs to a
+client that speaks `/mcp`, where every tool and every parameter is reachable and
+the surface is already stable, so the intention is to retire the built-in page
+during 1.x once such a client exists. `/api/admin/status` is not on that path:
+it reports operational state (version, pid, indexing progress) that has no place
+in a tool surface designed for language models.
 
 Read that as advance notice, not as a schedule. These surfaces are unstable, so
 nothing above is promised in either direction.
