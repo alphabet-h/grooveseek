@@ -349,18 +349,23 @@ async function callTool(name, args) {
   });
 
   if (resp.status === 403) {
-    // Two different allow-lists can produce this, and the response does not say
-    // which: Host validation runs first and refuses when allowed_hosts omits
-    // the name in the address bar, then Origin validation refuses when
-    // allowed_origins omits this page's origin. Naming only one of them sends
-    // the operator to edit a key that cannot fix their case, so name both and
-    // point at the startup log, which does know.
+    // Two allow-lists can produce this and the response does not say which:
+    // Host validation runs first and refuses when allowed_hosts omits the name
+    // in the address bar, then Origin validation refuses when allowed_origins
+    // omits this page's origin.
+    //
+    // So state what this page needs from each, rather than guessing which one
+    // failed or pointing at a startup warning that may not exist -- the server
+    // only warns when a list has no loopback entry at all, and a list holding
+    // `127.0.0.1` while the page is opened through `localhost` refuses this
+    // request silently. Both values below are correct whichever key is at fault.
     throw new Error(
       "403 from /mcp. This page is at " + window.location.origin +
-      ". Either [transport.http].allowed_hosts is missing " +
-      window.location.host + ", or allowed_origins is missing " +
-      window.location.origin + " — setting either key replaces its default " +
-      "rather than extending it. The server's startup log says which."
+      ", so searching from here needs \"" + window.location.host +
+      "\" in [transport.http].allowed_hosts and \"" + window.location.origin +
+      "\" in allowed_origins. Setting either key replaces its default rather " +
+      "than extending it, so an entry for a different local name, port or " +
+      "scheme does not cover this one."
     );
   }
   if (!resp.ok) {

@@ -686,12 +686,16 @@ pub async fn run_http(
         // with only their public origin will find `/ui` answering 403 to its own
         // requests, with nothing on screen to say why -- the page is served, and
         // only the search fails. Say it here, where the cause is still visible.
+        // Same scope as the `allowed_hosts` warning below: no loopback entry at
+        // all. A list holding one loopback origin but not the scheme, name or
+        // port this page is opened with is refused without a word here.
         tracing::warn!(
             "[transport.http].allowed_origins names no loopback origin, so /ui \
              opened on this machine cannot search: its requests to /mcp will be \
-             refused. Add http://127.0.0.1:{port} and http://localhost:{port} \
-             alongside the public origin if you use /ui locally. Setting the key \
-             replaces the default list rather than extending it.",
+             refused. Add the exact origins you browse with \
+             (http://127.0.0.1:{port}, http://localhost:{port}) alongside the \
+             public one. Setting the key replaces the default list rather than \
+             extending it, so an entry for one origin does not cover another.",
             port = bound.port(),
         );
     }
@@ -722,12 +726,19 @@ pub async fn run_http(
         && !effective_hosts.is_empty()
         && !effective_hosts.iter().any(|h| names_a_loopback_host(h))
     {
+        // (codex P2 round 2 on PR #174) This fires only when the list has NO
+        // loopback entry, which is the case where every local address fails.
+        // A list holding `127.0.0.1` while the operator opens `/ui` through
+        // `localhost` is refused too and says nothing here -- measured -- so
+        // neither this text nor the docs may promise that the log identifies
+        // every failure. The page states what it needs instead.
         tracing::warn!(
             "[transport.http].allowed_hosts names no loopback alias, so /ui \
              opened on this machine cannot search: its requests to /mcp are \
-             refused by Host validation. Add localhost and 127.0.0.1 alongside \
-             the public name if you use /ui locally. Setting the key replaces \
-             the default list rather than extending it."
+             refused by Host validation. Add the exact names you browse with \
+             (localhost, 127.0.0.1) alongside the public one. Setting the key \
+             replaces the default list rather than extending it, so an entry \
+             for one local name does not cover another."
         );
     }
     let mcp_config = StreamableHttpServerConfig::default()

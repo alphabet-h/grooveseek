@@ -66,10 +66,14 @@ above.
 `allowed_hosts` does the same thing one step earlier — Host validation runs
 before Origin validation, so a list naming only a public hostname refuses the
 `Host: localhost` that a locally opened `/ui` sends. Either key replaces its
-default rather than extending it, so keep the loopback entries alongside the
-public ones when you use `/ui` on the server. **The startup log names whichever
-of the two would break it**, which is worth reading, because the browser sees
-only a 403 and cannot tell them apart.
+default rather than extending it, so **list the exact names and origins you
+browse with**: `allowed_hosts = ["127.0.0.1"]` still refuses a page opened
+through `localhost`.
+
+The server warns at startup when either list has no loopback entry at all. It
+does not warn when a list has one that does not match the address you use, and
+the browser sees only a 403 — so `/ui` reports the host and origin it needs when
+a search is refused.
 
 ## Stable
 
