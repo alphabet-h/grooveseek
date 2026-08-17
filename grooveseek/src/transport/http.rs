@@ -418,7 +418,16 @@ fn has_explicit_port_suffix(raw: &str) -> bool {
 /// (`"[::1]"`) で保持。allow-list 側は `NormalizedAuthority::from_allowed_entry`
 /// の fallback で unbracketed (`"::1"`) も同等扱いされるため、`Authority::try_from`
 /// が parse できる bracketed 形式を一次形にすると helper 内 normalize が単純化される。
-const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+/// (codex P1 round 7 on PR #173) `pub(crate)`: this is the crate's one answer to
+/// "which local names reach this server". Three allow-lists ask it — `/healthz`
+/// Host validation, the `/mcp` Origin defaults, and the admin router's
+/// `allowed_admin_hosts` — and a copy in any of them means a new alias would be
+/// accepted by one surface and refused by another.
+///
+/// The bracketed IPv6 spelling is the primary form here;
+/// [`NormalizedAuthority::from_allowed_entry`] strips the brackets, so an entry
+/// written `"::1"` compares equal.
+pub(crate) const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
 
 /// `/healthz` 用 Host validation の pure helper (no I/O、test 容易)。
 ///

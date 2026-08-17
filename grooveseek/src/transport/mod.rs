@@ -602,6 +602,42 @@ mod tests {
         }
     }
 
+    /// (codex P1 round 7 on PR #173) The loopback **alias set** gets the same
+    /// treatment as the loopback **predicate**: one definition, no copies.
+    /// Round 6 replaced the Origin literal and left the two in `server.rs`,
+    /// which is the half-state that keeps producing findings — an alias added
+    /// to the shared set would then be honoured by `/mcp` and refused by `/ui`.
+    ///
+    /// The scan is on the literal rather than the behaviour because the copy is
+    /// what drifts; a behavioural test would still pass on the day the copy is
+    /// made, and only fail later when someone edits one of them.
+    #[test]
+    fn the_loopback_alias_set_has_no_second_definition() {
+        use crate::transport::http::DEFAULT_LOOPBACK_HOSTS;
+        assert_eq!(
+            DEFAULT_LOOPBACK_HOSTS,
+            &["localhost", "127.0.0.1", "[::1]"],
+            "if this set changes on purpose, every list below follows it"
+        );
+        let server = include_str!("../server.rs");
+        assert!(
+            server.contains("DEFAULT_LOOPBACK_HOSTS"),
+            "server.rs must build its admin allow-list from the shared set"
+        );
+        for (n, line) in server.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains("\"localhost\""),
+                "server.rs:{} spells an alias out again; build it from \
+                 DEFAULT_LOOPBACK_HOSTS instead -- line was: {}",
+                n + 1,
+                line.trim()
+            );
+        }
+    }
+
     /// (codex P2 round 4 on PR #173) Round 3 converted three call sites and
     /// left three behind, which was worse than before: the gate said loopback
     /// while the startup warning, the admin allow-list and the untrusted-config

@@ -2634,7 +2634,13 @@ impl KbServerShared {
             watcher_active: Arc::new(AtomicBool::new(false)),
             watcher_debounce_ms: 500,
             config_source_label: "TestStub".into(),
-            allowed_admin_hosts: vec!["127.0.0.1".into(), "::1".into(), "localhost".into()],
+            // (codex P1 round 7 on PR #173) Shared alias set, not a copy — a
+            // test stub that disagrees with production about which local names
+            // count is a test that passes for the wrong reason.
+            allowed_admin_hosts: crate::transport::http::DEFAULT_LOOPBACK_HOSTS
+                .iter()
+                .map(|h| (*h).to_string())
+                .collect(),
         }
     }
 }
@@ -2710,11 +2716,15 @@ pub async fn run_server(
     let watcher_active = Arc::new(AtomicBool::new(false));
     let watcher_debounce_ms = watch_config.debounce_ms;
     let allowed_admin_hosts = {
-        let mut hosts = vec![
-            "127.0.0.1".to_string(),
-            "::1".to_string(),
-            "localhost".to_string(),
-        ];
+        // (codex P1 round 7 on PR #173) The same alias set `/healthz` Host
+        // validation and the `/mcp` Origin defaults use. Round 6 replaced the
+        // Origin copy and left this one, which is the worse half-state: an alias
+        // added to the shared set would be accepted by `/mcp` and refused by
+        // `/ui` — the two surfaces disagreeing about one browser.
+        let mut hosts: Vec<String> = crate::transport::http::DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .map(|h| (*h).to_string())
+            .collect();
         // codex P1 round 4 on PR #57: only include the bind addr when it is
         // a loopback IP. Otherwise a non-loopback bind (e.g. 192.168.1.10:3100
         // or 0.0.0.0:3100) would let LAN browsers reach /ui + /api/admin/status
