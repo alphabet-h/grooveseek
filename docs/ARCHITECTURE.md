@@ -119,7 +119,7 @@ Static Contextual Retrieval (feature-46) prepends a document-structure breadcrum
 
 First run downloads the chosen ONNX model to a HuggingFace-hub-compatible cache layout (BGE-small: ~130 MB, BGE-M3: ~2.3 GB, BGE-reranker-v2-m3: ~2.3 GB). Subsequent runs reuse the cache without re-downloading.
 
-If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS inspection), see the README's "Working around HuggingFace TLS failures" section for a `huggingface_hub` CLI workaround.
+If `fastembed-rs`'s native TLS to HuggingFace fails (corporate proxies / TLS inspection), see "Working around HuggingFace TLS failures" in [docs/clients.md](clients.md) for a `huggingface_hub` CLI workaround.
 
 ## CLI output convention
 

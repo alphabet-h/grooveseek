@@ -3556,7 +3556,7 @@ mod tests {
     ///
     /// The per-term budget must be `floor(cap / k)`, not `ceil`: with 32
     /// phrases `ceil(100/32) = 4` and `4 * 32 = 128` spans, breaking the "at
-    /// most 100" promise in README and docs/citations.md. That is a real
+    /// most 100" promise in docs/usage.md and docs/citations.md. That is a real
     /// mistake made while writing this — the first draft used `div_ceil` and
     /// produced 128 spans on this exact shape. None of the other tests here
     /// reach the cap, so without this one the error ships.

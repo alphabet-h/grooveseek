@@ -114,4 +114,4 @@ FTS5 trigram tokenizer の粒度に追いつけず、混乱を招く結果にな
 ## 関連
 
 - `docs/filters.ja.md` — 検索結果の絞り込み
-- `README.ja.md` — search ツールの詳細リファレンス
+- `docs/mcp-tools.ja.md` — search ツールの詳細リファレンス

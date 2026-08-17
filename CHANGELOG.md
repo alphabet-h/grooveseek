@@ -29,6 +29,21 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **The README is an entry point again, and the reference it used to carry now
+  lives under `docs/`.** It had grown to 1,057 lines, of which 1,004 — 95% —
+  were configuration, CLI and client reference that a first-time reader has to
+  scroll past to reach "what is this and how do I install it". Those five
+  sections moved verbatim into `docs/configuration.md`, `docs/usage.md`,
+  `docs/clients.md`, `docs/mcp-tools.md` and `docs/behavior.md` (each with its
+  `.ja.md` pair), and the README is now 112 lines: what it is, how to install
+  it, a quick start, and an index of the rest.
+
+  **Links into the old sections change.** Anchors that pointed at, say,
+  `README.md#config-file-discovery` now live at
+  `docs/configuration.md#config-file-discovery`; the section names and their
+  anchors are unchanged, only the file is. Everything inside the repository
+  that referenced them was updated in the same commit.
+
 - **`/ui` is the operator's view of their own server, and it searches through
   `/mcp`.** It shows a status band — version, documents, chunks, model, watcher,
   uptime, pid, indexing progress — over a search box, replacing a placeholder

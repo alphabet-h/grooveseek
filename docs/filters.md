@@ -126,4 +126,4 @@ Filters compose with **AND**:
 ## Related
 
 - `docs/citations.md` — match_spans / byte offsets
-- `README.md` — full search tool reference
+- `docs/mcp-tools.md` — full search tool reference

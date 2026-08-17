@@ -118,7 +118,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 初回実行時、選択した ONNX モデルが HuggingFace hub 互換のキャッシュ構造で DL される (BGE-small: 約 130 MB、BGE-M3: 約 2.3 GB、BGE-reranker-v2-m3: 約 2.3 GB)。2 回目以降は再 DL されない。
 
-`fastembed-rs` の native TLS が HuggingFace への接続に失敗する場合 (企業プロキシや TLS inspection の影響) は、README の「HuggingFace の TLS 失敗への対処」節を参照して `huggingface_hub` CLI で迂回する。
+`fastembed-rs` の native TLS が HuggingFace への接続に失敗する場合 (企業プロキシや TLS inspection の影響) は、[docs/clients.ja.md](clients.ja.md) の「HuggingFace の TLS 失敗への対処」節を参照して `huggingface_hub` CLI で迂回する。
 
 ## CLI 出力規約
 

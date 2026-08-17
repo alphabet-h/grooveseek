@@ -28,7 +28,7 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 ## 主要サブコマンド
 
-`index` / `status` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service`。フラグの詳細、`groove.toml` 設定、`.mcp.json` 接続例は README を参照。
+`index` / `status` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service`。フラグの詳細は [docs/usage.ja.md](./docs/usage.ja.md)、`groove.toml` 設定は [docs/configuration.ja.md](./docs/configuration.ja.md)、`.mcp.json` 接続例は [docs/clients.ja.md](./docs/clients.ja.md) を参照。
 
 ## CLI 出力規約 (= stdout/stderr の責務分離)
 
@@ -71,13 +71,14 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
    - Windows: `%LOCALAPPDATA%\fastembed`
 3. `.fastembed_cache/` (CWD 直下、最終フォールバック)
 
-初回実行時に HuggingFace hub 互換キャッシュが作られる (BGE-small: ~130 MB、BGE-M3: ~2.3 GB、BGE-reranker-v2-m3: ~2.3 GB)。2 回目以降は再 DL されない。TLS 接続エラー時は README の "Working around HuggingFace TLS failures" 節の迂回手順を参照。
+初回実行時に HuggingFace hub 互換キャッシュが作られる (BGE-small: ~130 MB、BGE-M3: ~2.3 GB、BGE-reranker-v2-m3: ~2.3 GB)。2 回目以降は再 DL されない。TLS 接続エラー時は [docs/clients.ja.md](./docs/clients.ja.md) の「HuggingFace の TLS 失敗への対処」節の迂回手順を参照。
 
 ## 言語方針
 
 本プロジェクトは**英語プライマリの日英バイリンガル**運用:
 - `README.md` (English, primary) / `README.ja.md` (日本語)
-- `docs/ARCHITECTURE.md` (English) / `docs/ARCHITECTURE.ja.md` (日本語)
+- `docs/*.md` (English) / `docs/*.ja.md` (日本語) — `configuration` / `usage` /
+  `clients` / `mcp-tools` / `behavior` / `ARCHITECTURE` ほか、全ページが英日ペア
 - `docs/decisions/NNNN-*.md` (English) / `docs/decisions/NNNN-*.ja.md` (日本語)
 - `CLAUDE.md` (本ファイル、日本語): Claude Code 向け開発ガイダンス
 

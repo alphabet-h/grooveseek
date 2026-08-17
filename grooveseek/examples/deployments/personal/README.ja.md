@@ -23,7 +23,7 @@ Claude Code は stdio 経由で groove を起動する。
 
 1. **groove をインストール**。[ビルド済バイナリ](https://github.com/alphabet-h/grooveseek/releases/latest) を `PATH` の通った場所に置くか、clone から `cargo install --path grooveseek` (リポジトリ root は workspace manifest なので `--path .` は失敗する)
 2. **KB の置き場所を決める**。例: `~/notes/` (個人ノート) や `~/projects/<repo>/docs/` (プロジェクト単位)
-3. **設定ファイルの置き場所**。自然な選択肢は 2 つ — [Config file discovery](../../../../README.ja.md#設定ファイルの探索順) を参照:
+3. **設定ファイルの置き場所**。自然な選択肢は 2 つ — [Config file discovery](../../../../docs/configuration.ja.md#設定ファイルの探索順) を参照:
    - **プロジェクト単位**: `groove.toml` と `.mcp.json` を一緒にプロジェクトリポジトリに置いて commit (toml は共有前提に作られている)
    - **グローバル**: `groove.toml` をバイナリの隣 (`~/.local/bin/groove.toml` や `%USERPROFILE%\bin\groove.toml`) に置けば全プロジェクトで同じ設定を共有
 4. **`groove.toml` を編集**: `kb_path` を KB の絶対パスに。言語が合わなければ model と reranker を調整
