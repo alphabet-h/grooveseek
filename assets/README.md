@@ -17,8 +17,10 @@ so the PNGs are used instead: the screenshots are PNG regardless, so this makes
 the READMEs depend on one mechanism rather than two.
 
 The SVGs stay because they are the source the PNGs are rendered from, and
-because a documentation site served from this repository can reference them
-directly, same-origin, with none of the above applying.
+because a site served from this repository may be able to reference them
+directly, same-origin, with none of the above applying. "May": GitHub Pages
+publishes either the repository root or `/docs`, and only the root option puts
+this directory on the site. That choice has not been made yet.
 
 ## Regenerating the PNGs
 
