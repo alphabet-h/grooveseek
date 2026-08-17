@@ -100,6 +100,11 @@ A Japanese version of every page above sits alongside it as `*.ja.md`.
 Ready-to-adapt deployment recipes — personal stdio, NAS-shared, intranet HTTP —
 are in [`grooveseek/examples/deployments/`](./grooveseek/examples/deployments/).
 
+Those are repository paths, and a release archive contains this README but not
+`docs/`. If you installed from an archive, read them at
+<https://github.com/alphabet-h/grooveseek/tree/main/docs>, swapping `main` for
+your release tag to get the version you installed.
+
 ## MCP surface
 
 Six tools — `search`, `get_document`, `list_topics`, `get_connection_graph`,

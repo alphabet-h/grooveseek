@@ -63,7 +63,7 @@ groove serve --kb-path ... --no-watch                           # ライブ同�
 
 既定では stdio トランスポート (1 クライアント / サーバ) で MCP サーバを起動する。複数クライアントを同時接続するには `--transport http --port <PORT>` (または `--bind <SOCKETADDR>`) を渡し Streamable HTTP に切り替える — 詳細は [HTTP トランスポート (複数クライアント同時接続)](clients.ja.md#http-トランスポート-複数クライアント同時接続) 参照。loopback 外の `--bind` は、groove が認証を持たないため追加で `--i-know` が必要。
 
-サーバは 6 つの MCP ツール (後述) を公開し、インデックスをプロセス内に保持して低レイテンシでクエリに答える。`--model` が現在の index を作ったモデルと一致しない場合、実行可能なエラーメッセージで起動を拒否する。ファイルウォッチャ (既定有効) が `--kb-path` 配下のコンテンツ変更を検知して再インデックスする — [ライブ同期 (file watcher)](clients.ja.md#ライブ同期-file-watcher) 参照。
+サーバは 6 つの MCP ツール ([docs/mcp-tools.ja.md](mcp-tools.ja.md)) を公開し、インデックスをプロセス内に保持して低レイテンシでクエリに答える。`--model` が現在の index を作ったモデルと一致しない場合、実行可能なエラーメッセージで起動を拒否する。ファイルウォッチャ (既定有効) が `--kb-path` 配下のコンテンツ変更を検知して再インデックスする — [ライブ同期 (file watcher)](clients.ja.md#ライブ同期-file-watcher) 参照。
 
 `--reranker` (任意、既定 `none`) はハイブリッド検索の上位候補に cross-encoder 再ランクをかける:
 

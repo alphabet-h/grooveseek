@@ -40,8 +40,8 @@ skipped. In practice the second and subsequent invocations finish in well
 under a second on small KBs. If the binary is not on `PATH`, replace
 `groove` with an absolute path.
 
-The `kb_path` is read from `groove.toml` (see the README's *Config file
-discovery* section for the full lookup order — typically the project
+The `kb_path` is read from `groove.toml` (see [*Config file discovery*](../../../docs/configuration.md#config-file-discovery)
+for the full lookup order — typically the project
 root or alongside the binary). You can also hard-code it with
 `groove index --kb-path /abs/path/to/knowledge-base`.
 

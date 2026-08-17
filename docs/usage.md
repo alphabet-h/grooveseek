@@ -63,7 +63,7 @@ groove serve --kb-path ... --no-watch                           # disable live-s
 
 Starts the MCP server on stdio transport by default (one client at a time). Pass `--transport http --port <PORT>` (or `--bind <SOCKETADDR>`) to serve multiple clients simultaneously via Streamable HTTP — details in the [HTTP transport](clients.md#http-transport-for-multiple-simultaneous-clients) section. A `--bind` outside loopback additionally requires `--i-know`, because groove ships no authentication.
 
-The server exposes 6 tools (see below) and keeps the index in-process for low-latency queries. `--model` must match the model that built the current index, otherwise the server refuses to start with an actionable error message. A file watcher (enabled by default) re-indexes affected files when the contents under `--kb-path` change — see [Live-sync via file watcher](clients.md#live-sync-via-file-watcher).
+The server exposes 6 tools (see [docs/mcp-tools.md](mcp-tools.md)) and keeps the index in-process for low-latency queries. `--model` must match the model that built the current index, otherwise the server refuses to start with an actionable error message. A file watcher (enabled by default) re-indexes affected files when the contents under `--kb-path` change — see [Live-sync via file watcher](clients.md#live-sync-via-file-watcher).
 
 `--reranker` (optional, default `none`) enables a cross-encoder re-ranking pass over the top candidates of the hybrid search:
 

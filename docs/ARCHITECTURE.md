@@ -89,7 +89,7 @@ The full v0.7.0 pipeline is **`RRF → reranker → MMR → parent retriever →
 
 ## Contextual Retrieval (v0.12.0+)
 
-Static Contextual Retrieval (feature-46) prepends a document-structure breadcrumb to each chunk before it reaches the embedder / FTS index / reranker, entirely at index time and with no LLM call. Gated by `[contextual].enabled` (default **off** as of v0.12.0 — a `false`-by-default judgment gate result, see the README's "Contextual Retrieval" section for the A/B numbers that drove it).
+Static Contextual Retrieval (feature-46) prepends a document-structure breadcrumb to each chunk before it reaches the embedder / FTS index / reranker, entirely at index time and with no LLM call. Gated by `[contextual].enabled` (default **off** as of v0.12.0 — a `false`-by-default judgment gate result, see "Contextual Retrieval" in [docs/usage.md](usage.md) for the A/B numbers that drove it).
 
 - **`Chunk.context: Option<String>`** (`grooveseek/src/parser/mod.rs`) is a search-only field, never returned by `search` / `get_document`. `build_context(parts: &[&str]) -> Option<String>` joins non-empty, non-consecutive-duplicate parts with `" > "`, capped at 200 chars (char-boundary safe) to bound BGE-small's 512-token input.
 - **Two ancestry generation families**, matching the two parser shapes in the codebase:

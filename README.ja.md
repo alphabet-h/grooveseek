@@ -98,6 +98,11 @@ groove search "semantic chunking" --kb-path /path/to/knowledge-base --limit 3
 デプロイの完全なレシピ (個人 stdio / NAS 共有 / 社内 HTTP) は
 [`grooveseek/examples/deployments/`](./grooveseek/examples/deployments/)。
 
+これらはリポジトリ上のパスであり、リリースアーカイブにはこの README は入るが
+`docs/` は入らない。アーカイブから読んでいる場合は
+<https://github.com/alphabet-h/grooveseek/tree/main/docs> を参照する
+(`main` をインストールしたリリースの tag に差し替えるとその版になる)。
+
 ## MCP の面
 
 6 つのツール (`search` / `get_document` / `list_topics` / `get_connection_graph` /

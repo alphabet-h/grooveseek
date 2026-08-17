@@ -5,7 +5,7 @@
 
 > **English version**: [configuration.md](./configuration.md)
 
-以下の CLI オプションはすべて `groove.toml` で既定値を与えられる。CLI 引数は常に優先され、設定ファイルは単に同じデプロイでの記述の繰り返しを減らすためのもの。配置場所の探索順は [設定ファイルの探索順](#設定ファイルの探索順) を参照 — 最も一般的なのはプロジェクトルート (CWD) かバイナリの隣。[`grooveseek/groove.toml.example`](../grooveseek/groove.toml.example) を `groove.toml` にコピーして編集する。
+[docs/usage.ja.md](usage.ja.md) の CLI オプションはすべて `groove.toml` で既定値を与えられる。CLI 引数は常に優先され、設定ファイルは単に同じデプロイでの記述の繰り返しを減らすためのもの。配置場所の探索順は [設定ファイルの探索順](#設定ファイルの探索順) を参照 — 最も一般的なのはプロジェクトルート (CWD) かバイナリの隣。[`grooveseek/groove.toml.example`](../grooveseek/groove.toml.example) を `groove.toml` にコピーして編集する。
 
 **このテンプレートはコピーしても何も変わらない。** 空ではなく、ファイルの形が見えるように一部のセクション (`[quality_filter]` / `[parsers]` / `[watch]` / `[transport]` / `[transport.http]`) は有効なまま残してあるが、**有効な値はすべて既定値そのもの**なので、コピーは「既定値を明示的に固定する」だけで挙動を変えない。挙動が変わる項目はすべてコメントアウトしてある。一方、下のブロックは別物で、各キーが何をするかを示すために値を入れた**説明用の例** — 既定値でない値もあれば、既定値をそのまま書いているものもある。**丸ごと貼るためのものではなく、メニューとして**読むこと:
 
@@ -44,7 +44,7 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .pptx に
 # オプトイン。空配列 [] は「何もインデックスされない」事故を防ぐため拒否
 # される。現在サポート id: "md" / "txt" / "pdf" (v0.10.0+) / "docx" /
-# "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.14.0 で取り下げ、下記参照)
+# "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.14.0 で取り下げ、behavior.ja.md 参照)
 # 全部入り例:
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
@@ -131,7 +131,7 @@ bind = "127.0.0.1:3100"
 
 # 任意: 静的 Contextual Retrieval (v0.12.0+)。既定 off。reranker を
 # 併用しない限り悪化するため、reranker 設定時のみ有効化を推奨
-# (詳細は下の「Contextual Retrieval」節を参照)。
+# (詳細は usage.ja.md の「Contextual Retrieval」節を参照)。
 # [contextual]
 # enabled = true
 ```

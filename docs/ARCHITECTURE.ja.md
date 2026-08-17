@@ -88,7 +88,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 ## Contextual Retrieval (v0.12.0+)
 
-静的 Contextual Retrieval (feature-46) は、各チャンクが embedder / FTS index / reranker に渡る前に、ドキュメント構造由来の breadcrumb を前置する機能。すべて index 時に LLM 呼び出しなしで決定論的に生成される。`[contextual].enabled` で on/off する (v0.12.0 時点の既定は **off** ―― judgment gate の結果として false-by-default に転換した経緯は README の「Contextual Retrieval」節の A/B 数値を参照)。
+静的 Contextual Retrieval (feature-46) は、各チャンクが embedder / FTS index / reranker に渡る前に、ドキュメント構造由来の breadcrumb を前置する機能。すべて index 時に LLM 呼び出しなしで決定論的に生成される。`[contextual].enabled` で on/off する (v0.12.0 時点の既定は **off** ―― judgment gate の結果として false-by-default に転換した経緯は [docs/usage.ja.md](usage.ja.md) の「Contextual Retrieval」節の A/B 数値を参照)。
 
 - **`Chunk.context: Option<String>`** (`grooveseek/src/parser/mod.rs`) は検索用の内部フィールドで、`search` / `get_document` の返却には一切現れない。`build_context(parts: &[&str]) -> Option<String>` が空要素・連続重複要素を skip しつつ `" > "` で結合し、BGE-small の 512 token 入力制限を守るため 200 文字 (char boundary 安全) で cap する。
 - **2 系統の ancestry 生成**。コードベース内の parser 形状にそのまま対応する:

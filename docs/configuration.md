@@ -5,7 +5,7 @@ looked for, and which of those locations are trusted.
 
 > **日本語版**: [configuration.ja.md](./configuration.ja.md)
 
-Any CLI option below can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](../grooveseek/groove.toml.example) to `groove.toml` and edit.
+Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](../grooveseek/groove.toml.example) to `groove.toml` and edit.
 
 **A fresh copy of that template changes nothing.** It is not blank — a few sections (`[quality_filter]`, `[parsers]`, `[watch]`, `[transport]`, `[transport.http]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behaviour is commented out. The block below is a different thing: an illustration of what each key does, with values filled in — some of them non-default, some of them just the default spelled out. Read it as a menu, not as a file to paste wholesale:
 
@@ -46,7 +46,7 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # via an explicit list. An empty array is rejected to prevent silent
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
-# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.14.0 — see below.)
+# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.14.0 — see behavior.md.)
 # Example enabling everything:
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
@@ -135,7 +135,7 @@ bind = "127.0.0.1:3100"
 
 # Optional: static Contextual Retrieval (v0.12.0+). Off by default; strongly
 # recommended only when a reranker is also configured (see "Contextual
-# Retrieval" below for why).
+# Retrieval" in usage.md for why).
 # [contextual]
 # enabled = true
 ```
