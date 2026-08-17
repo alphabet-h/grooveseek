@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Twelve field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
+description: Thirteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -237,6 +237,37 @@ CP932 は valid UTF-8 ではない (`0x93` は継続バイト域、`0xfa` は不
 **ただしこのテストは「あらゆる環境で前置の適用を証明する」ものではない**。ACP が既に UTF-8 (CP65001 — Windows 11 の「ベータ: ワールドワイド言語サポートで Unicode UTF-8 を使用」で有効になる) のホストでは、**前置が無くても PowerShell は UTF-8 を出す**ので、前置を外してもテストは通ってしまう。守れているのは「非 UTF-8 ACP のホスト」= まさにこの fix が存在する理由の環境であって、それで十分ではあるが、**CI が UTF-8 ACP の runner だけになると回帰ガードとして無音になる**。「locale 非依存」と書くのは言い過ぎ。
 
 出典: 2026-07-27 AU-04 (PR #108)。測定の詳細は `.dev/knowledge/powershell-output-encoding-measurement.md`
+
+## 13. Python の stdout は redirect 先がファイルでも CP932。**途中で落ちて「完走したように見える」**
+
+**症状**: 検証スクリプトを `python verify.py > out.txt` で回すと、**出力が途中で終わっているのに
+それが正常な終わりに見える**。実際には em dash (`—`, U+2014) を書こうとした瞬間に
+`UnicodeEncodeError: 'cp932' codec can't encode character '—'` で死んでいる。
+本文が日本語混じりの docs を扱うと、**ほぼ確実に踏む**。
+
+罠 12 は `powershell.exe` の出力側の話で、**これは Python 自身の stdout encoding**。
+別物なので、罠 12 の対策 (`[Console]::OutputEncoding`) では直らない。
+
+**なぜ危ないか**: 落ちる前に書かれた分は残るので、**出力は「正しく短い結果」と区別が付かない**。
+実測 (2026-08-17、PR #175): 10 節を検証するスクリプトが 4 節目で死に、
+「4 節分の結果」に見えていた。気付いたのは exit code が 1 だったからだけ。
+
+**対策**:
+
+```bash
+PYTHONIOENCODING=utf-8 python verify.py > out.txt     # 書く側
+```
+
+**書いてしまった後に読む側も要注意** — 対策前に作ったファイルは CP932 で書かれているので、
+`open(f, encoding="utf-8")` は `UnicodeDecodeError` になる。`encoding="cp932"` で読むか、
+作り直す。
+
+**検証スクリプトを書く時の一般則**: **出力を truncate しない**。同じ session で
+`o[:150]` と `.{95}` 前方 context の 2 つに刺され、どちらも「差分が無い」「該当なし」に
+見えた。表示が長いのは正しさの代償。
+
+出典: 2026-08-17 PR #175 (README を docs/ へ分割)。詳細は
+`.dev/knowledge/readme-split-link-surface.md`
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
