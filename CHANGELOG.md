@@ -28,9 +28,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`).
 
   **This does not break existing clients.** Per RFC 6454 a request that carries
-  no `Origin` header passes, and MCP clients, the tray and `curl` send none. What
-  it stops is a web page open in the operator's own browser reaching the port
-  cross-origin. It is not authentication, and groove still has none.
+  no `Origin` header passes, and ordinary MCP clients, the tray and `curl` send
+  none. What it stops is a web page open in the operator's own browser reaching
+  `/mcp` cross-origin. It is not authentication, and groove still has none.
+
+  **It covers `/mcp` and nothing else.** `/ui`, `/api/search` and
+  `/api/admin/status` are on the admin router and have no `Origin` check;
+  measured with the default list, `Origin: https://evil.example` gets 403 from
+  `/mcp` and 200 from all three. They are restricted by requiring a loopback
+  peer, which is not configurable — so `allowed_origins` cannot break a locally
+  opened `/ui`, and it is not what keeps a local web page away from
+  `/api/search` (the browser's CORS preflight is).
 
 ### Added
 
@@ -41,8 +49,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   RFC 6454 `(scheme, host, port)` triples.
 
   Setting it **replaces** the default list rather than extending it, matching
-  `allowed_hosts`. Keep the loopback entries alongside your public origin if you
-  also open `/ui` on the machine itself, or the local browser starts getting 403.
+  `allowed_hosts`. Keep the loopback entries alongside your public origin if
+  browser-based clients also reach you over loopback.
 
   An empty list disables validation entirely and now warns at startup. Like
   `allowed_hosts`, `healthz_public` and `max_sessions`, the key is **ignored when

@@ -48,13 +48,20 @@ The MCP specification requires a Streamable HTTP server to validate the `Origin`
 header against DNS rebinding. GrooveSeek does, defaulting to the loopback origins
 for whichever port it binds.
 
-Requests carrying no `Origin` at all — MCP clients, the tray, `curl` — pass, as
-RFC 6454 and the specification describe. The check exists to stop a web page open
-in your own browser from reaching the port; it is not a second access control.
-Publishing through a proxy means naming your public origin in
-`[transport.http].allowed_origins`, because the browser will send that one and
-not a loopback origin. That key *replaces* the default rather than extending it,
-so keep the loopback entries alongside it if you still open `/ui` locally.
+Requests carrying no `Origin` at all — ordinary MCP clients, the tray, `curl` —
+pass, as RFC 6454 and the specification describe. The check exists to stop a web
+page open in your own browser from reaching the port; it is not a second access
+control. Publishing through a proxy means naming your public origin in
+`[transport.http].allowed_origins`, because a browser-based client will send that
+one and not a loopback origin. That key *replaces* the default rather than
+extending it, so keep the loopback entries alongside it if browser clients also
+reach you over loopback.
+
+**It covers `/mcp` and nothing else.** `/ui`, `/api/search` and
+`/api/admin/status` have no `Origin` check; what restricts them is the loopback
+peer requirement above. So `allowed_origins` cannot break a `/ui` you open
+locally, and it is not what keeps a local web page away from `/api/search` — the
+browser's own CORS preflight is.
 
 ## Stable
 

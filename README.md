@@ -115,11 +115,12 @@ kind = "http"
 [transport.http]
 bind = "127.0.0.1:3100"
 # allowed_hosts = ["kb.example.lan", "192.168.1.10"]  # opt-in for LAN exposure (v0.5.0+)
-# Browser Origin allow-list. Unlike allowed_hosts this is ON by default: the MCP
-# specification requires Origin validation, so omitting the key accepts the
-# loopback origins for the bind port. Set it when a browser reaches the server
-# through a proxy, since it then sends your public origin. Requests with no
-# Origin (MCP clients, the tray, curl) pass either way; an empty list disables
+# Browser Origin allow-list for /mcp (the admin routes have no Origin check).
+# Unlike allowed_hosts this is ON by default: the MCP specification requires
+# Origin validation, so omitting the key accepts the loopback origins for the
+# bind port. Set it when a browser-based client reaches the server through a
+# proxy, since it then sends your public origin. Requests with no Origin
+# (ordinary MCP clients, the tray, curl) pass either way; an empty list disables
 # validation and warns at startup.
 # allowed_origins = ["https://kb.example.com"]
 # Whether /healthz sits outside the allowed_hosts check. Default true (public,
@@ -843,7 +844,9 @@ Security notes:
 - rmcp's Streamable HTTP layer enforces Host header validation (loopback only by default) to prevent DNS rebinding attacks. **Host validation is not authentication** — any peer that can reach the port may send `Host: localhost`. Treat it as a browser-side defence, and restrict reachability at the network layer.
 - For LAN / intranet exposure, set `[transport.http].allowed_hosts` in `groove.toml` to your public hostnames / IPs (e.g. `["kb.example.lan", "192.168.1.10"]`). Binding to a non-loopback address with the default loopback-only allow-list means external requests are 403'd by Host validation; groove emits a `tracing::warn` at startup when this misconfiguration is detected. An empty `allowed_hosts = []` disables the check entirely (rmcp's `disable_allowed_hosts` semantics), which combined with a non-loopback bind leaves `/mcp` open to every peer that can reach the port — that combination now warns at startup too.
 
-- **`Origin` validation is on by default**, unlike `allowed_hosts`. The MCP specification states that a Streamable HTTP server *"MUST validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"*, so omitting `[transport.http].allowed_origins` accepts the loopback origins for the bind port (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`) rather than accepting everything. Requests that carry no `Origin` header — every MCP client, the tray, `curl` — pass regardless, per RFC 6454; the check exists to stop a web page open in your own browser from reaching the port, and it is **not** a second access control. Behind a reverse proxy the browser sends your public origin, so name it explicitly. **Setting the key replaces the default list rather than extending it**, so keep the loopback entries too if you also open `/ui` on the machine itself: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`. An empty list disables validation and warns at startup.
+- **`Origin` validation is on by default**, unlike `allowed_hosts`. The MCP specification states that a Streamable HTTP server *"MUST validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"*, so omitting `[transport.http].allowed_origins` accepts the loopback origins for the bind port (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`) rather than accepting everything. Requests that carry no `Origin` header — every ordinary MCP client, the tray, `curl` — pass regardless, per RFC 6454; the check exists to stop a web page open in your own browser from reaching the port, and it is **not** a second access control. Behind a reverse proxy a browser-based client sends your public origin, so name it explicitly. **Setting the key replaces the default list rather than extending it**, so keep the loopback entries too if browser clients also reach you over loopback: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`. An empty list disables validation and warns at startup.
+
+- **`Origin` validation covers `/mcp` and nothing else.** `/ui`, `/api/search` and `/api/admin/status` live on the admin router, which has no `Origin` check — measured, not inferred: with `allowed_origins` at its default, `Origin: https://evil.example` gets 403 from `/mcp` and 200 from all three admin routes. What restricts those is the requirement that the peer be loopback, and that is not configurable. Two consequences worth knowing: changing `allowed_origins` cannot break a `/ui` you open locally, and `allowed_origins` is not what keeps a local web page away from `/api/search` — the browser's own CORS preflight is.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
 ### Web UI and admin API (HTTP transport only)

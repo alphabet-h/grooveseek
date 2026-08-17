@@ -47,13 +47,19 @@ MCP 仕様は、Streamable HTTP サーバが DNS rebinding 対策として `Orig
 検証することを要求している。GrooveSeek はこれを行い、**既定値は bind した port の
 loopback origin** である。
 
-`Origin` を持たない要求 — MCP クライアント / tray / `curl` — は素通りする。
+`Origin` を持たない要求 — 通常の MCP クライアント / tray / `curl` — は素通りする。
 これは RFC 6454 と仕様のとおりで、この検査が止めるのは「利用者自身のブラウザに
 開かれた web ページがこのポートへ到達すること」だけであり、2 つ目のアクセス制御では
 ない。proxy 越しに公開するなら、`[transport.http].allowed_origins` に**公開 origin** を
-明示する必要がある。ブラウザが送るのは loopback origin ではなくそちらだからである。
-なおこのキーは既定リストを**拡張ではなく置換**するので、同じマシンから `/ui` も
-開くなら loopback の分も併記すること。
+明示する必要がある。ブラウザ上のクライアントが送るのは loopback origin ではなく
+そちらだからである。なおこのキーは既定リストを**拡張ではなく置換**するので、
+ブラウザ上のクライアントが loopback 経由でも来るなら loopback の分も併記すること。
+
+**掛かるのは `/mcp` だけである。** `/ui` / `/api/search` / `/api/admin/status` に
+`Origin` 検査は無く、これらを縛っているのは上に書いた peer loopback の要求である。
+したがって `allowed_origins` をどう変えても**ローカルで開く `/ui` は壊れない**し、
+`/api/search` にローカルの web ページを近づけないのも `allowed_origins` ではなく
+**ブラウザ自身の CORS preflight** である。
 
 ## 安定 (Stable)
 

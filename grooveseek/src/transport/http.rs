@@ -93,8 +93,13 @@ const _: () = assert!(
 /// その時ブラウザが送る origin は loopback ではなく公開ホスト名になるから。
 /// その構成では `[transport.http].allowed_origins` に公開 origin を明示する。
 pub fn default_allowed_origins(port: u16) -> Vec<String> {
-    ["localhost", "127.0.0.1", "[::1]"]
-        .into_iter()
+    // (codex P1 round 6 on PR #173) Built from `DEFAULT_LOOPBACK_HOSTS`, not a
+    // second literal with the same three entries. Both are allow-lists deciding
+    // which local browser addresses count, so if the set ever changes -- another
+    // alias, a different normalized spelling -- a copy would let Host validation
+    // and Origin validation quietly disagree about the same browser.
+    DEFAULT_LOOPBACK_HOSTS
+        .iter()
         .flat_map(|host| origins_for_host(host, port))
         .collect()
 }
@@ -1423,6 +1428,27 @@ mod tests {
             default_allowed_origins(3100),
             "a non-loopback bind must not widen the allow-list"
         );
+    }
+
+    /// (codex P1 round 6 on PR #173) Host validation and Origin validation both
+    /// decide which local browser addresses count, so they read the same alias
+    /// set. A second literal would drift the moment one of them gains an alias,
+    /// and the failure would be a browser accepted by one check and refused by
+    /// the other.
+    #[test]
+    fn origin_defaults_are_built_from_the_shared_loopback_alias_set() {
+        let origins = default_allowed_origins(3100);
+        assert_eq!(
+            origins.len(),
+            DEFAULT_LOOPBACK_HOSTS.len(),
+            "one origin per shared alias, off the default port: {origins:?}"
+        );
+        for host in DEFAULT_LOOPBACK_HOSTS {
+            assert!(
+                origins.contains(&format!("http://{host}:3100")),
+                "alias {host} is missing from the Origin defaults: {origins:?}"
+            );
+        }
     }
 
     /// (codex P2 round 5 on PR #173) RFC 6454 omits the default port when it

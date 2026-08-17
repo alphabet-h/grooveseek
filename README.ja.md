@@ -114,11 +114,12 @@ kind = "http"
 [transport.http]
 bind = "127.0.0.1:3100"
 # allowed_hosts = ["kb.example.lan", "192.168.1.10"]  # LAN 公開時に明示 (v0.5.0+)
-# ブラウザの Origin allow-list。allowed_hosts と違い **既定で有効**: MCP 仕様が
-# Origin 検証を要求しているので、省略すると bind した port の loopback origin を
-# 許可する。proxy 越しにブラウザから使う場合は、ブラウザが送る**公開 origin** を
-# ここに明示する。Origin を持たない要求 (MCP クライアント / tray / curl) は
-# どちらでも素通り。空リストは検証を無効化し、起動時に警告が出る。
+# /mcp に対するブラウザ Origin allow-list (admin 経路には Origin 検査は無い)。
+# allowed_hosts と違い **既定で有効**: MCP 仕様が Origin 検証を要求しているので、
+# 省略すると bind した port の loopback origin を許可する。proxy 越しに
+# ブラウザ上のクライアントから使う場合は、送られてくる**公開 origin** を
+# ここに明示する。Origin を持たない要求 (通常の MCP クライアント / tray / curl)
+# はどちらでも素通り。空リストは検証を無効化し、起動時に警告が出る。
 # allowed_origins = ["https://kb.example.com"]
 # /healthz を allowed_hosts の検査対象外に置くか。既定は true (= public、Host
 # check なし)。false にすると /healthz も他のエンドポイントと同様に検証され、
@@ -832,7 +833,9 @@ groove serve --kb-path /path/to/knowledge-base --transport http --port 3100
 - rmcp の Streamable HTTP 層は Host ヘッダ検証を強制 (既定で loopback のみ) し、DNS rebinding 攻撃を防ぐ。ただし **Host 検証は認証ではない** — ポートに到達できる相手は `Host: localhost` を自由に付けられる。ブラウザ側の防御と考え、到達性はネットワーク層で絞ること
 - LAN / イントラ公開時は `groove.toml` の `[transport.http].allowed_hosts` に公開ホスト名 / IP を明示する (例: `["kb.example.lan", "192.168.1.10"]`)。loopback only の default のまま 0.0.0.0 で bind すると外部リクエストは Host 検証で 403 になる — operator のミス確定なので、groove は起動時に `tracing::warn` を出して気付かせる。`allowed_hosts = []` (空配列) を渡すと Host 検証が完全に無効化され (rmcp の `disable_allowed_hosts` 相当)、非 loopback bind と組み合わせるとポートに到達できる全員に `/mcp` が開く — この組合せも起動時に警告するようにした
 
-- **`Origin` 検証は `allowed_hosts` と違い既定で有効**。MCP 仕様は Streamable HTTP サーバについて *"**MUST** validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"* と定めているので、`[transport.http].allowed_origins` を省略した場合は「全部許可」ではなく **bind した port の loopback origin** (`http://localhost:PORT` / `http://127.0.0.1:PORT` / `http://[::1]:PORT`) を許可する。`Origin` ヘッダを持たない要求 — MCP クライアント / tray / `curl` — は RFC 6454 のとおり素通りするので、既存の利用は壊れない。この検査が止めるのは「利用者自身のブラウザに開かれた別サイトの JS がこのポートへ到達すること」だけで、**2 つ目のアクセス制御ではない**。reverse proxy 越しではブラウザは公開 origin を送るため、それを明示する。**このキーを書くと既定リストは「追加」ではなく「置換」される**ので、同じマシンから `/ui` も開くなら loopback の分も併記する: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`。空リストは検証を無効化し、起動時に警告が出る
+- **`Origin` 検証は `allowed_hosts` と違い既定で有効**。MCP 仕様は Streamable HTTP サーバについて *"**MUST** validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"* と定めているので、`[transport.http].allowed_origins` を省略した場合は「全部許可」ではなく **bind した port の loopback origin** (`http://localhost:PORT` / `http://127.0.0.1:PORT` / `http://[::1]:PORT`) を許可する。`Origin` ヘッダを持たない要求 — 通常の MCP クライアント / tray / `curl` — は RFC 6454 のとおり素通りするので、既存の利用は壊れない。この検査が止めるのは「利用者自身のブラウザに開かれた別サイトの JS がこのポートへ到達すること」だけで、**2 つ目のアクセス制御ではない**。reverse proxy 越しではブラウザ側のクライアントが公開 origin を送るため、それを明示する。**このキーを書くと既定リストは「追加」ではなく「置換」される**ので、ブラウザ上のクライアントが loopback 経由でも来るなら loopback の分も併記する: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`。空リストは検証を無効化し、起動時に警告が出る
+
+- **`Origin` 検証が掛かるのは `/mcp` だけ**。`/ui` / `/api/search` / `/api/admin/status` は admin router 側にあり、**`Origin` 検査を一切持たない** — これは推測ではなく実測で、`allowed_origins` を既定のままにして `Origin: https://evil.example` を送ると `/mcp` は 403、admin の 3 経路はいずれも 200 を返す。これらを縛っているのは「peer が loopback であること」で、そちらは設定できない。帰結が 2 つ: **`allowed_origins` をどう変えてもローカルで開く `/ui` は壊れない**。そして **`/api/search` にローカルの web ページを近づけないのは `allowed_origins` ではなく、ブラウザ自身の CORS preflight である**
 - サーバ内部の Mutex ベース直列化により、HTTP の並列リクエストでも embedder / DB 層では逐次処理される (`search` で目安 10 qps 程度)。本格的な並列化は将来の拡張
 
 ### Web UI と admin API (HTTP transport のみ)
