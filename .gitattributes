@@ -26,3 +26,13 @@
 *.xlsx binary
 *.pptx binary
 *.xls binary
+
+# Raster images: the tray icons have ridden on git's binary auto-detection
+# since v0.9.0, and README screenshots joined them in the logo/badge PR.
+# Declared for the same reason as the fixtures above — the rule should not
+# depend on detection succeeding. `.svg` is deliberately absent: it is text,
+# and the `eol=lf` rule at the top is what should apply to it.
+*.png binary
+*.ico binary
+*.jpg binary
+*.webp binary

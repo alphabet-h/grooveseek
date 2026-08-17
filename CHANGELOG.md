@@ -27,7 +27,39 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `/ui` source (`grooveseek/src/transport/webui_index.html`), which is now the
   smallest working example of an MCP client over Streamable HTTP.
 
+### Added
+
+- **The README has a face: a mark, a screenshot of `/ui`, and three badges.**
+  [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md) accepted,
+  knowingly, that "GrooveSeek" says nothing about what the product does and that
+  searching for "groove" lands in music software — and concluded that this "makes
+  the first line of the README load-bearing". The mark is lines of a document
+  with the shipped `◆` marking the passage a search found, in the same accent
+  the web interface uses; light and dark variants are selected with `<picture>`.
+
+  The badges are CI, latest release, and the licence. There is deliberately no
+  crates.io or downloads badge: every crate here is `publish = false`, so both
+  would be false.
+
+  Images are referenced by absolute URL rather than repository-relative path,
+  because a release archive ships this README without `assets/` — the same
+  reason the documentation links were made absolute in the previous change.
+  They point at PNG renders rather than the SVG sources: an absolute URL
+  resolves to `raw.githubusercontent.com`, which is reported to serve `.svg` as
+  `text/plain` so an `<img>` will not render it, and the screenshots are PNG in
+  any case. `assets/README.md` records the reasoning and how to regenerate.
+
 ### Changed
+
+- **`docs/ARCHITECTURE.md` stopped calling `/ui` a disposable placeholder.** It
+  still described the file as "a disposable placeholder — a proper redesign is
+  expected in Phase 3+" after that redesign had shipped.
+
+- **`/ui` shows the knowledge-base path the way it was typed.** Windows
+  canonicalisation returns an extended-length path, so the status band read
+  `\\?\C:\notes` where the operator had passed `C:\notes`. The prefix is now
+  stripped for display only; `/api/admin/status` still returns what it returned,
+  because the tray reads that field too.
 
 - **The README is an entry point again, and the reference it used to carry now
   lives under `docs/`.** It had grown to 1,057 lines, of which 1,004 — 95% —

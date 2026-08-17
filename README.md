@@ -1,7 +1,16 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-dark.png">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-light.png" alt="" width="56" height="56">
+</picture>
+
 # GrooveSeek
 
 MCP server for semantic search over a Markdown / plain-text knowledge base. The
 command is `groove`.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/alphabet-h/grooveseek/ci.yml?branch=main&label=CI)](https://github.com/alphabet-h/grooveseek/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/alphabet-h/grooveseek?label=release)](https://github.com/alphabet-h/grooveseek/releases/latest)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) files with YAML frontmatter, splits them into heading-based chunks, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
@@ -80,6 +89,15 @@ to `index` and `serve` alike. It is a larger download and a different index, so
 it is worth choosing before you build one — the trade-off is in
 [docs/usage.md](docs/usage.md).
 
+With `--transport http`, the server also answers on `/ui`: an operator view of
+the machine it runs on, searching through the same `/mcp` endpoint an MCP client
+uses.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/screenshot-dark.png">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/screenshot-light.png" width="880" alt="The operator view: a status band showing version, document and chunk counts, the embedding model, watcher state, uptime and pid, above a search box and a list of results, each with a relevance score, a file path, a heading and its tags.">
+</picture>
+
 ## Documentation
 
 | Page | What is in it |
@@ -115,3 +133,8 @@ itself exposed as `kb://` resources. Parameters and return shapes are in
 ## Design decisions
 
 Decisions that shaped the architecture — what was chosen, which alternatives were rejected, and what it cost — are recorded as [Architecture Decision Records](docs/decisions/) in `docs/decisions/`. Start with [ADR-0000](docs/decisions/0000-record-decisions-as-adrs.md), which describes when a decision is recorded and when a changelog entry is enough. Japanese versions are alongside as `*.ja.md`.
+
+## License
+
+Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at
+your option.
