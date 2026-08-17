@@ -100,18 +100,55 @@ pub fn default_allowed_origins(port: u16) -> Vec<String> {
     ]
 }
 
-/// 設定値と **実際に bind した port** から、有効な `Origin` allow-list を決める。
+/// 設定値と **実際に bind したアドレス** から、有効な `Origin` allow-list を決める。
 ///
-/// `bound_port` を取るのが要点で、`addr.port()` を渡してはいけない。
-/// `--bind 127.0.0.1:0` は「OS に選ばせる」意味なので、要求値から既定を組むと
-/// `http://127.0.0.1:0` — **ブラウザが決して送れない origin** — だけを許可した
-/// 状態になり、実際に割り当てられた port からの要求が 403 になる
-/// (codex P2 round 1 on PR #173)。
+/// 引数が要求値 (`addr`) ではなく bind 結果 (`listener.local_addr()`) なのが要点で、
+/// 理由が 2 つある:
+///
+/// 1. **port** — `--bind 127.0.0.1:0` は「OS に選ばせる」意味なので、要求値から
+///    既定を組むと `http://127.0.0.1:0` (= ブラウザが決して送れない origin) だけを
+///    許可した状態になり、実際に割り当てられた port が 403 になる
+///    (codex P2 round 1 on PR #173)
+/// 2. **アドレス** — loopback は `127.0.0.1` だけではない。`127.0.0.0/8` は全体が
+///    loopback なので `--bind 127.0.0.2:3100` は `--i-know` 無しで通るが、そこを
+///    開いたブラウザは `Origin: http://127.0.0.2:3100` を送る。既定 3 種にそれが
+///    無いと、Origin 検証が理由で 403 になる (codex P2 round 2 on PR #173)
+///
+/// **ただし 2 は「Origin では弾かない」までしか保証しない。** 実測 (bind
+/// `127.0.0.2:3197`): `Host: 127.0.0.2:3197` は **rmcp の Host allow-list**
+/// (既定 = `localhost` / `127.0.0.1` / `::1`) で先に 403 になる。`Host` を
+/// `127.0.0.1` にすると 200 が返り、その状態で `Origin: http://127.0.0.2:3197`
+/// も通る = ここの修正は効いている。つまり 127.0.0.1 以外の loopback を
+/// **ブラウザから実際に使う**には `[transport.http].allowed_hosts` の設定も要る。
+/// それは別の面の話なので本 fn では触らない (`allowed_hosts` の既定は rmcp が
+/// 持っており、こちらで組み直すと既定値の実装が 2 つになる)。
+///
+/// 判定に [`is_loopback_peer`] を使うのは、`admin_host_check` と**同じ問い**
+/// (「このアドレスは loopback か」) だから。別実装を置くと、IPv4-mapped IPv6 の
+/// ような端の扱いが 2 箇所で食い違う。
 pub(crate) fn effective_allowed_origins(
     configured: Option<Vec<String>>,
-    bound_port: u16,
+    bound: SocketAddr,
 ) -> Vec<String> {
-    configured.unwrap_or_else(|| default_allowed_origins(bound_port))
+    // 明示された list はそのまま使う (空 `Vec` = 検証無効も含めて)。既定を混ぜると
+    // 「運用者が書いていない値」がセキュリティ設定に入り、共有ホストで
+    // 「ローカルのブラウザこそ排除したい」が表現できなくなる。
+    let Some(list) = configured else {
+        let mut origins = default_allowed_origins(bound.port());
+        if is_loopback_peer(bound.ip()) {
+            let host = match bound.ip() {
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+                // RFC 6454 の origin シリアライズに合わせて角括弧を付ける。
+                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+            };
+            let entry = format!("http://{host}:{}", bound.port());
+            if !origins.contains(&entry) {
+                origins.push(entry);
+            }
+        }
+        return origins;
+    };
+    list
 }
 
 /// 上限に達した時に `Retry-After` で返す秒数。
@@ -502,7 +539,7 @@ pub async fn run_http(
     })?;
     let bound = listener.local_addr().unwrap_or(addr);
 
-    let origins = effective_allowed_origins(allowed_origins, bound.port());
+    let origins = effective_allowed_origins(allowed_origins, bound);
     if origins.is_empty() {
         tracing::warn!(
             "[transport.http].allowed_origins is empty, which disables Origin \
@@ -1246,8 +1283,8 @@ mod tests {
     #[test]
     fn effective_origins_use_the_assigned_port_not_the_requested_one() {
         let requested_port = 0u16;
-        let assigned_port = 51234u16;
-        let origins = effective_allowed_origins(None, assigned_port);
+        let bound: SocketAddr = "127.0.0.1:51234".parse().unwrap();
+        let origins = effective_allowed_origins(None, bound);
         assert!(
             origins.iter().all(|o| o.ends_with(":51234")),
             "origins must name the assigned port, got {origins:?}"
@@ -1260,20 +1297,72 @@ mod tests {
         );
     }
 
+    /// (codex P2 round 2 on PR #173) `127.0.0.0/8` is loopback in its entirety,
+    /// so `--bind 127.0.0.2:3100` is accepted without `--i-know` — but a browser
+    /// opening that address sends `Origin: http://127.0.0.2:3100`, which the
+    /// three fixed defaults do not contain. The bound address itself has to join
+    /// the list, so that Origin validation is not the thing refusing it.
+    ///
+    /// Measured caveat, recorded so nobody reads more into this than it does:
+    /// with `--bind 127.0.0.2`, `Host: 127.0.0.2:PORT` is refused a step earlier
+    /// by rmcp's Host allow-list. Reaching such a bind from a browser also needs
+    /// `[transport.http].allowed_hosts` — a separate surface, deliberately not
+    /// changed here.
+    #[test]
+    fn effective_origins_include_a_bound_loopback_address_beyond_127_0_0_1() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        let origins = effective_allowed_origins(None, bound);
+        assert!(
+            origins.contains(&"http://127.0.0.2:3100".to_string()),
+            "the bound loopback address must be allowed, got {origins:?}"
+        );
+        // The fixed three stay, because the operator may still reach the server
+        // through localhost regardless of which loopback address it bound.
+        assert!(origins.contains(&"http://127.0.0.1:3100".to_string()));
+        assert!(origins.contains(&"http://localhost:3100".to_string()));
+    }
+
+    /// The bound address is not appended twice when it is already one of the
+    /// defaults, and a non-loopback bind adds nothing: `Origin: http://0.0.0.0`
+    /// is not something a browser sends, and putting the LAN address in would
+    /// hand out an allowance the operator never asked for.
+    #[test]
+    fn effective_origins_do_not_duplicate_or_widen_beyond_loopback() {
+        let loopback: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        let origins = effective_allowed_origins(None, loopback);
+        assert_eq!(
+            origins
+                .iter()
+                .filter(|o| *o == "http://127.0.0.1:3100")
+                .count(),
+            1,
+            "the bound address must not be appended twice: {origins:?}"
+        );
+        assert_eq!(origins, default_allowed_origins(3100));
+
+        let wildcard: SocketAddr = "0.0.0.0:3100".parse().unwrap();
+        assert_eq!(
+            effective_allowed_origins(None, wildcard),
+            default_allowed_origins(3100),
+            "a non-loopback bind must not widen the allow-list"
+        );
+    }
+
     /// A configured list is passed through untouched, including the empty list
     /// that means "do not validate" — `run_http` warns about that rather than
     /// quietly repairing it, because silently substituting a default would make
     /// the setting untrustworthy.
     #[test]
     fn effective_origins_pass_a_configured_list_through_unchanged() {
+        let bound: SocketAddr = "127.0.0.1:3100".parse().unwrap();
         let configured = vec!["https://kb.example.com".to_string()];
         assert_eq!(
-            effective_allowed_origins(Some(configured.clone()), 3100),
+            effective_allowed_origins(Some(configured.clone()), bound),
             configured,
             "a configured list replaces the default; it is not extended by it"
         );
         assert!(
-            effective_allowed_origins(Some(vec![]), 3100).is_empty(),
+            effective_allowed_origins(Some(vec![]), bound).is_empty(),
             "an explicit empty list must survive so the startup warning can fire"
         );
     }

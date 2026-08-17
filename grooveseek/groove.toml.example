@@ -162,7 +162,9 @@ bind = "127.0.0.1:3100"
 
 # Allow-list of accepted browser Origin headers. Omitted, the loopback origins
 # for the bind port apply -- http://localhost:PORT, http://127.0.0.1:PORT and
-# http://[::1]:PORT -- which is what /ui in this server sends. The MCP
+# http://[::1]:PORT -- plus the bound address itself when that is some other
+# loopback address, since all of 127.0.0.0/8 is loopback and a browser opening
+# 127.0.0.2 sends that as its Origin. This is what /ui sends. The MCP
 # specification requires servers to validate Origin to prevent DNS rebinding, so
 # unlike allowed_hosts this one is NOT off by default.
 # Set it when a browser reaches the server through something else: behind a
