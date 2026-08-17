@@ -87,6 +87,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   container, a reverse proxy, or the application that puts a face on the knowledge
   base. Non-loopback binds stay allowed — a container has to bind one or published
   ports never reach it — but they mean you have taken that boundary on yourself.
+- **"Is this address loopback?" now has one answer instead of three.** The admin
+  router unwraps IPv4-mapped IPv6 (`::ffff:127.0.0.1`) and treats it as local;
+  `groove serve` asked `IpAddr::is_loopback`, which says no; and
+  `groove service install` matched on string prefixes. So binding to a mapped
+  loopback address was refused as "network exposure" without `--i-know`, while
+  a peer arriving from that same address was being let into `/ui`. All three
+  now call one predicate, and **`--bind [::ffff:127.0.0.1]:PORT` no longer
+  demands `--i-know`** — it is a loopback address, and the rest of the server
+  already behaved as though it were. Nothing else changes: every other address
+  the old predicates already agreed on.
 - **The refusal printed for a non-loopback `--bind` now states the consequence.**
   It used to say groove "has no auth" and that exposure "is dangerous", which
   leaves the reader to work out what is actually at stake. It now says that

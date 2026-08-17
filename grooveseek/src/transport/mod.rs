@@ -272,7 +272,12 @@ pub fn check_cli_bind_ack(
     let Some(bind) = cli_bind else {
         return Ok(());
     };
-    if bind.ip().is_loopback() {
+    // (codex P2 round 3 on PR #173) The crate's one loopback predicate, not
+    // `IpAddr::is_loopback`. The difference is `::ffff:127.0.0.1`, which the
+    // admin router already treats as local (BU-21) — refusing to bind there
+    // without `--i-know` told the operator it was network exposure while the
+    // same address was being let into `/ui`.
+    if crate::transport::http::is_loopback_peer(bind.ip()) {
         return Ok(());
     }
     anyhow::bail!("{}", non_loopback_bind_refusal(bind))
@@ -563,6 +568,40 @@ mod tests {
         );
     }
 
+    /// (codex P2 round 3 on PR #173) "Is this address loopback" now has one
+    /// answer. It had three, and they disagreed on `::ffff:127.0.0.1`: the admin
+    /// router let such a peer in (BU-21) while `serve` and `service install`
+    /// both called the same address network exposure and demanded `--i-know`.
+    ///
+    /// The mapped form is the case worth pinning — every other address the two
+    /// old predicates already agreed on, so a regression would show up here
+    /// first.
+    #[test]
+    fn the_bind_gate_uses_the_same_loopback_predicate_as_the_admin_router() {
+        use crate::transport::http::is_loopback_peer;
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:3100".parse().unwrap();
+        assert!(
+            is_loopback_peer(mapped.ip()),
+            "IPv4-mapped loopback is loopback; the admin router already says so"
+        );
+        assert!(
+            !mapped.ip().is_loopback(),
+            "std disagrees, which is exactly why the shared predicate exists"
+        );
+        check_cli_bind_ack(&http_at("[::ffff:127.0.0.1]:3100"), Some(mapped), false)
+            .expect("a mapped loopback bind must not demand --i-know");
+
+        // The answers that were never in dispute stay put.
+        for addr in ["127.0.0.1:3100", "127.0.0.2:3100", "[::1]:3100"] {
+            check_cli_bind_ack(&http_at(addr), Some(addr.parse().unwrap()), false)
+                .unwrap_or_else(|e| panic!("{addr} must be accepted as loopback: {e}"));
+        }
+        for addr in ["0.0.0.0:3100", "192.168.1.10:3100"] {
+            check_cli_bind_ack(&http_at(addr), Some(addr.parse().unwrap()), false)
+                .expect_err("a non-loopback bind must still require --i-know");
+        }
+    }
+
     /// The other half of the same invariant, and the half a behavioural test
     /// cannot reach cheaply: `service install` needs a registry / launchd write
     /// to exercise, so scan its source instead. What must not exist is a second
@@ -577,6 +616,17 @@ mod tests {
         assert!(
             !install.contains("has no authentication, so"),
             "service install must not inline the wording; call the shared fn"
+        );
+        // (codex P2 round 3 on PR #173) Same reasoning for the loopback test:
+        // install used a string-prefix predicate of its own, which is why it
+        // disagreed about `::ffff:127.0.0.1`.
+        assert!(
+            install.contains("is_loopback_peer"),
+            "service install must ask the shared loopback predicate"
+        );
+        assert!(
+            !install.contains("starts_with(\"127.\")"),
+            "no private loopback predicate in install.rs; it drifts from the router"
         );
     }
 

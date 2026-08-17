@@ -1005,7 +1005,13 @@ async fn healthz_host_check(
 /// answer for it is whatever `Ipv4Addr::is_loopback` says (`127.0.0.0/8`).
 /// Deprecated IPv4-compatible addresses (`::a.b.c.d`) are deliberately not
 /// unwrapped.
-fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
+/// (codex P2 round 3 on PR #173) `pub(crate)` because this is **the** answer to
+/// "is this address loopback" for the whole crate: the admin gate, the
+/// `--bind` acknowledgement in `check_cli_bind_ack`, `service install`, and the
+/// default `Origin` list all ask it. They used to answer it three different
+/// ways, and disagreed on `::ffff:127.0.0.1` — the admin router let such a peer
+/// in while both bind gates called the same address network exposure.
+pub(crate) fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
