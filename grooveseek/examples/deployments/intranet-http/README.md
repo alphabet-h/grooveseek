@@ -160,9 +160,9 @@ header is allow-listed. Use them by SSH-forwarding a port to the server
 > admin allow-list (that list is the loopback aliases, plus the bind address
 > when the bind is itself loopback). Both gates pass and those routes are
 > served to whoever reached the proxy. Use an **allow-list**: map `/mcp` and
-> `/healthz`, nothing else. A block-list is the wrong shape here — `/api/search`
-> sits in the same router as `/ui` and `/api/admin/*` and returns knowledge-base
-> content, so anything you forget to deny stays exposed. If you publish these
+> `/healthz`, nothing else. A block-list is the wrong shape here — `/ui` and
+> `/api/admin/*` sit in the same router and report on the knowledge base and the
+> daemon, so anything you forget to deny stays exposed. If you publish these
 > routes deliberately, the proxy's own authentication becomes the only thing in
 > front of your KB, its index rebuilds, and daemon status.
 
@@ -174,7 +174,7 @@ If you need authentication today, the canonical recipe is:
 
 Bind groove to `127.0.0.1:3100` in `groove.toml`, and configure nginx to
 proxy **`/mcp` and `/healthz` only**, as an allow-list — every other route
-(`/ui`, `/api/search`, `/api/admin/*`) is loopback-gated and a same-host proxy
+(`/ui`, `/api/admin/*`) is loopback-gated and a same-host proxy
 would defeat that gate (see the warning above). Forward the client's Host (`proxy_set_header Host $host;`)
 and list that name in `[transport.http].allowed_hosts`.
 

@@ -66,17 +66,17 @@ pub(crate) fn run_with_backend(
         ));
     }
     // (codex P2 round 3 on PR #57, design clarification) Loopback-only admin
-    // is by spec § 7 — even on non-loopback bind, /ui + /api/admin/status +
-    // /api/search reject Host headers outside the loopback aliases + bind
-    // addr. Warn the user that LAN browsers will see 403 on admin paths so
-    // they expect to SSH to the host (or use http://127.0.0.1:<port>/ui) for
-    // the WebUI even when /mcp is exposed on LAN.
+    // is by spec § 7 — even on non-loopback bind, /ui and /api/admin/status
+    // refuse any peer that is not loopback. Warn the user that LAN browsers
+    // will see 403 on admin paths so they expect to SSH to the host (or use
+    // http://127.0.0.1:<port>/ui) for the web page even when /mcp is on LAN.
+    // (Phase 4 PR-2) `/api/search` no longer exists; the page uses /mcp.
     if !bind_is_loopback {
         eprintln!(
-            "Note: admin endpoints (/ui, /api/admin/status, /api/search) are \
-             loopback-only by design. Browsers on the LAN will get 403 from \
-             these paths even though /mcp accepts the same Host. Use \
-             http://127.0.0.1:<port>/ui (locally) or SSH to the host for the WebUI."
+            "Note: admin endpoints (/ui, /api/admin/status) are loopback-only by \
+             design. Browsers on the LAN will get 403 from these paths even \
+             though /mcp accepts the same Host. Use http://127.0.0.1:<port>/ui \
+             (locally) or SSH to the host for the web page."
         );
     }
 

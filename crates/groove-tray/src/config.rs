@@ -69,8 +69,8 @@ pub fn resolve(service_name: &str, kb_path_override: Option<&PathBuf>) -> Result
         toml::from_str(&body).with_context(|| format!("parse {}", toml_path.display()))?;
     let bind = raw.transport.http.bind;
 
-    // (codex P2 rounds 2-4 on PR #62): admin endpoints (/ui,
-    // /api/admin/*, /api/search) are loopback-only by spec, so the tray
+    // (codex P2 rounds 2-4 on PR #62): admin endpoints (/ui and
+    // /api/admin/*) are loopback-only by spec, so the tray
     // always targets 127.0.0.1:<port> regardless of the daemon's bind.
     // - Wildcard binds (0.0.0.0 / ::): daemon listens on loopback too,
     //   so loopback polling succeeds. No warning.

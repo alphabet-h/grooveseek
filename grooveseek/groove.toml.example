@@ -158,13 +158,19 @@ bind = "127.0.0.1:3100"
 # equivalent to disabling the check, and warns for the same reason.
 # IPv6 entries: the bracketed form "[::1]" is clearer, and the bare "::1" is
 # also accepted for backward compatibility.
-#allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100"]
+# If you also open /ui on the server, keep the loopback names here: /ui searches
+# by calling /mcp, Host validation runs before Origin validation, and a list of
+# only public names refuses the `Host: localhost` the page sends. The startup
+# log warns when this list would break it.
+#allowed_hosts = ["kb.example.lan", "192.168.1.10", "192.168.1.10:3100", "localhost", "127.0.0.1"]
 
-# Allow-list of accepted browser Origin headers. This covers /mcp -- and ONLY
-# /mcp. The admin routes (/ui, /api/search, /api/admin/status) carry no Origin
-# check at all; what restricts them is that the peer must be loopback, which is
-# not configurable. So this key matters when a BROWSER-BASED MCP CLIENT talks to
-# the server, and changing it cannot break a locally opened /ui.
+# Allow-list of accepted browser Origin headers. This covers /mcp -- and /ui
+# searches by calling /mcp, so this key decides whether the built-in page can
+# query. Replace the default with only a public origin and /ui is still served
+# while every search it makes is refused; the server warns about that
+# combination at startup. /api/admin/status carries no Origin check of its own;
+# what restricts it is that the peer must be loopback, which is not
+# configurable.
 # Omitted, the loopback origins for the bind port apply -- http://localhost:PORT,
 # http://127.0.0.1:PORT and http://[::1]:PORT -- plus the bound address itself
 # when that is some other loopback address, since all of 127.0.0.0/8 is loopback

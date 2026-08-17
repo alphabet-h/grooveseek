@@ -13,14 +13,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
+// (Phase 4 PR-2) Only the test router posts anything now: a running server
+// serves `/api/admin/status` and `/ui` with GET, and search moved to `/mcp`.
+#[cfg(any(test, feature = "test-helpers"))]
+use axum::{Json, routing::post};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -667,7 +671,7 @@ pub async fn run_http(
     })?;
     let bound = listener.local_addr().unwrap_or(addr);
 
-    let origins = effective_allowed_origins(allowed_origins, bound);
+    let origins = effective_allowed_origins(allowed_origins.clone(), bound);
     if origins.is_empty() {
         tracing::warn!(
             "[transport.http].allowed_origins is empty, which disables Origin \
@@ -675,6 +679,24 @@ pub async fn run_http(
              to prevent DNS rebinding, so any web page loaded in a browser on \
              this machine can now reach /mcp cross-origin. Remove the key to \
              restore the loopback-only default."
+        );
+    } else if allowed_origins.is_some() && !origins.iter().any(|o| names_a_loopback_host(o)) {
+        // (Phase 4 PR-2) `/ui` searches through `/mcp` now, so it is subject to
+        // this list for the first time. An operator who replaced the default
+        // with only their public origin will find `/ui` answering 403 to its own
+        // requests, with nothing on screen to say why -- the page is served, and
+        // only the search fails. Say it here, where the cause is still visible.
+        // Same scope as the `allowed_hosts` warning below: no loopback entry at
+        // all. A list holding one loopback origin but not the scheme, name or
+        // port this page is opened with is refused without a word here.
+        tracing::warn!(
+            "[transport.http].allowed_origins names no loopback origin, so /ui \
+             opened on this machine cannot search: its requests to /mcp will be \
+             refused. Add the exact origins you browse with \
+             (http://127.0.0.1:{port}, http://localhost:{port}) alongside the \
+             public one. Setting the key replaces the default list rather than \
+             extending it, so an entry for one origin does not cover another.",
+            port = bound.port(),
         );
     }
     // (codex P1 round 8 on PR #173) The `None` branch used to leave rmcp's own
@@ -694,6 +716,31 @@ pub async fn run_http(
     // and `/healthz`, and it includes the bound loopback address for the same
     // reason the Origin list does.
     let effective_hosts = effective_allowed_hosts(allowed_hosts.clone(), bound);
+    // (codex P2 round 1 on PR #174) The symmetric warning, and the one that is
+    // easier to hit: the documented LAN recipe is to set `allowed_hosts` to the
+    // public name. `/ui` still opens through localhost, because the admin router
+    // has its own allow-list — but the page's request to `/mcp` carries
+    // `Host: localhost`, which Host validation refuses *before* Origin
+    // validation is consulted. Measured: `/ui` 200, its search 403.
+    if allowed_hosts.is_some()
+        && !effective_hosts.is_empty()
+        && !effective_hosts.iter().any(|h| names_a_loopback_host(h))
+    {
+        // (codex P2 round 2 on PR #174) This fires only when the list has NO
+        // loopback entry, which is the case where every local address fails.
+        // A list holding `127.0.0.1` while the operator opens `/ui` through
+        // `localhost` is refused too and says nothing here -- measured -- so
+        // neither this text nor the docs may promise that the log identifies
+        // every failure. The page states what it needs instead.
+        tracing::warn!(
+            "[transport.http].allowed_hosts names no loopback alias, so /ui \
+             opened on this machine cannot search: its requests to /mcp are \
+             refused by Host validation. Add the exact names you browse with \
+             (localhost, 127.0.0.1) alongside the public one. Setting the key \
+             replaces the default list rather than extending it, so an entry \
+             for one local name does not cover another."
+        );
+    }
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(effective_hosts.clone())
         .with_allowed_origins(origins);
@@ -737,9 +784,15 @@ pub async fn run_http(
     // (feature-43 PR-2) Admin sub-router — loopback only via Host check
     // middleware. `/api/admin/*` lives here; the public sub-router (`/mcp`,
     // `/healthz`) is untouched, so admin gating cannot affect the MCP path.
+    // (Phase 4 PR-2) `/api/search` is gone. It only ever passed `query` and
+    // `limit` — 2 of the 17 parameters `search` takes — so `/mcp` was already
+    // the better endpoint for anything outside this process, and `/ui` uses it
+    // now.
+    // What remains here is `/api/admin/status`, which reports operational state
+    // (version, pid, indexing progress) that has no place in a tool surface
+    // built for language models, and which the tray polls.
     let admin_router = Router::new()
         .route("/api/admin/status", get(api_admin_status))
-        .route("/api/search", post(api_search))
         .route("/ui", get(ui_index))
         .with_state(Arc::clone(&factory_shared))
         .layer(middleware::from_fn_with_state(
@@ -1167,6 +1220,29 @@ pub(crate) fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// (Phase 4 PR-2) Does this entry name a local address?
+///
+/// Takes either an origin (`http://127.0.0.1:3100`) or a bare allow-list host
+/// (`localhost`, `kb.example.lan`), because the scheme is optional here and
+/// both lists are asked the same question: would `/ui`, opened on this machine,
+/// be able to reach `/mcp` under this configuration?
+///
+/// It answers with the pieces that already exist — [`DEFAULT_LOOPBACK_HOSTS`]
+/// for the names, [`is_loopback_peer`] for the addresses, [`NormalizedAuthority`]
+/// for the parsing — rather than adding another notion of "local" to a file that
+/// spent PR #173 collapsing them.
+fn names_a_loopback_host(entry: &str) -> bool {
+    let authority = entry.split_once("://").map_or(entry, |(_, rest)| rest);
+    let host = NormalizedAuthority::from_allowed_entry(authority).host;
+    if host.is_empty() {
+        return false;
+    }
+    DEFAULT_LOOPBACK_HOSTS
+        .iter()
+        .any(|alias| NormalizedAuthority::from_allowed_entry(alias).host == host)
+        || host.parse::<std::net::IpAddr>().is_ok_and(is_loopback_peer)
+}
+
 fn should_warn_non_loopback_bind(addr: &SocketAddr, allowed_hosts: Option<&[String]>) -> bool {
     // (codex P2 round 4 on PR #173) Shared predicate, not `IpAddr::is_loopback`.
     // Once `check_cli_bind_ack` accepted `[::ffff:127.0.0.1]` as loopback, this
@@ -1268,13 +1344,28 @@ async fn api_admin_status(
     }))
 }
 
-/// (feature-43 PR-2) `/ui` — serves the WebUI MVP placeholder HTML (XSS-safe
-/// via `textContent` + `createElement`, no CSS framework). Phase 3+ で本格
-/// redesign 前提の disposable placeholder。
+/// `/ui` — the operator's view of their own server: what it is doing, and a
+/// search box.
+///
+/// Single file, no external requests, and every string that came out of the
+/// knowledge base is placed with `textContent` rather than `innerHTML`.
+///
+/// (Phase 4 PR-2) Its search goes through **`/mcp`**, not a private endpoint,
+/// which makes this page the smallest example of an MCP client over Streamable
+/// HTTP — and means the browsing story it offers is the one external clients
+/// get. `docs/stability.md` records the intent to retire it during 1.x, once a
+/// real client exists.
 async fn ui_index() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("webui_index.html"))
 }
 
+/// (Phase 4 PR-2) `/api/search` no longer exists in a running server. The
+/// handler survives behind the test gate because
+/// `tests/runtime_starvation.rs` needs a route whose body blocks on the
+/// embedder lock, to prove `/healthz` keeps answering while it does. That test
+/// must not be edited, and `/mcp` cannot stand in for it here without building
+/// the whole rmcp service inside the test router.
+#[cfg(any(test, feature = "test-helpers"))]
 #[derive(serde::Deserialize)]
 struct WebSearchRequest {
     query: String,
@@ -1289,6 +1380,7 @@ struct WebSearchRequest {
 /// `web_search` returns an already pretty-printed JSON string
 /// (`SearchResponse` or `ErrorResponse`); pass it through verbatim with an
 /// explicit `Content-Type: application/json` so we do not re-serialize.
+#[cfg(any(test, feature = "test-helpers"))]
 async fn api_search(
     State(shared): State<Arc<KbServerShared>>,
     Json(req): Json<WebSearchRequest>,
@@ -1561,6 +1653,79 @@ mod tests {
     /// Origin defaults and its admin allow-list, then refuses the
     /// `Host: 127.0.0.2:3100` a browser has no choice but to send.
     ///
+    /// (Phase 4 PR-2) `/ui` searches through `/mcp` now, so an
+    /// `allowed_origins` that names no loopback origin leaves the page served
+    /// but unable to search. This predicate decides whether to warn about that,
+    /// and it recognises local by the shared alias set and the shared loopback
+    /// predicate — the two things this module already uses for the question.
+    #[test]
+    fn loopback_origins_are_recognised_by_name_and_by_address() {
+        for origin in [
+            "http://localhost:3100",
+            "http://127.0.0.1:3100",
+            "http://[::1]:3100",
+            "http://127.0.0.2:3100", // all of 127.0.0.0/8 is loopback
+            "http://localhost",      // port 80, serialized without it
+            "https://127.0.0.1:8443",
+        ] {
+            assert!(
+                names_a_loopback_host(origin),
+                "{origin} names a local address"
+            );
+        }
+        for origin in [
+            "https://kb.example.com",
+            "http://192.168.1.10:3100",
+            "http://evil.127.0.0.1:3100", // a name that merely contains one
+            "",
+        ] {
+            assert!(!names_a_loopback_host(origin), "{origin:?} is not local");
+        }
+    }
+
+    /// (codex P2 round 1 on PR #174) The predicate is asked about `Host`
+    /// allow-list entries too, which carry no scheme. The documented LAN recipe
+    /// — `allowed_hosts = ["kb.example.lan"]` — is exactly the configuration
+    /// that leaves `/ui` open but unable to search, so it has to be recognised
+    /// as *not* local while bare loopback names still are.
+    #[test]
+    fn bare_allow_list_entries_are_judged_too_not_just_origins() {
+        for entry in ["localhost", "127.0.0.1", "[::1]", "::1", "127.0.0.2:3100"] {
+            assert!(names_a_loopback_host(entry), "{entry} is a local name");
+        }
+        for entry in ["kb.example.lan", "192.168.1.10", "kb.example.lan:3100"] {
+            assert!(!names_a_loopback_host(entry), "{entry} is not local");
+        }
+    }
+
+    /// Every entry the Host defaults produce must be recognised as local, for
+    /// the same reason as the origins: otherwise the warning fires against a
+    /// configuration that works.
+    #[test]
+    fn the_default_hosts_are_all_recognised_as_loopback() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        for host in effective_allowed_hosts(None, bound) {
+            assert!(
+                names_a_loopback_host(&host),
+                "{host} is a default but is not recognised as local"
+            );
+        }
+    }
+
+    /// Every origin the defaults produce must be recognised as local, or the
+    /// warning would fire against a configuration that works. This is the pair
+    /// that would drift if either side grew an entry alone.
+    #[test]
+    fn the_default_origins_are_all_recognised_as_loopback() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        for origin in effective_allowed_origins(None, bound) {
+            assert!(
+                names_a_loopback_host(&origin),
+                "{origin} is a default but is not recognised as local"
+            );
+        }
+    }
+
     /// The round-2 reasoning for leaving this alone — that rmcp owned the
     /// default — stopped being true in round 8, when we started building it.
     #[test]
