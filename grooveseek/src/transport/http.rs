@@ -173,6 +173,44 @@ pub(crate) fn client_host_forms(ip: std::net::IpAddr) -> Vec<String> {
     }
 }
 
+/// 設定値と **実際に bind したアドレス** から、有効な `Host` allow-list を決める。
+///
+/// [`effective_allowed_origins`] と同じ形、同じ理由。**round 2 では「`allowed_hosts`
+/// の既定は rmcp が持っているので触らない」と判断したが、round 8 でこちらが
+/// 構築するようになったのでその理由は消えた** (codex P2 round 9 on PR #173)。
+///
+/// 効き所は `--bind 127.0.0.2:3100` のような **`127.0.0.1` 以外の loopback**。
+/// origin 側と admin allow-list には `127.0.0.2` が入るのに Host 側に入らないと、
+/// ブラウザが送らざるを得ない `Host: 127.0.0.2:3100` が `/mcp` で 403 になる。
+///
+/// **非 loopback の bind では何も足さない。** `--bind 192.168.1.10` で LAN の
+/// Host を黙って許可したら、運用者が書いていない許可を配ることになる。
+///
+/// 空 `Vec` は「全 Host 許可」(rmcp の `disable_allowed_hosts` 相当) なので、
+/// 明示されたら**そのまま通す** — 既定を混ぜて黙って狭めない。
+pub(crate) fn effective_allowed_hosts(
+    configured: Option<Vec<String>>,
+    bound: SocketAddr,
+) -> Vec<String> {
+    if let Some(list) = configured {
+        return list;
+    }
+    let mut hosts: Vec<String> = DEFAULT_LOOPBACK_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    if is_loopback_peer(bound.ip()) {
+        // port 付きにしないのは、allow-list 側が bare host なら **どの port でも**
+        // 一致するため (`validate_host_header` の比較 semantics)。
+        for host in client_host_forms(bound.ip()) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
 /// 設定値と **実際に bind したアドレス** から、有効な `Origin` allow-list を決める。
 ///
 /// 引数が要求値 (`addr`) ではなく bind 結果 (`listener.local_addr()`) なのが要点で、
@@ -651,12 +689,14 @@ pub async fn run_http(
     // `should_warn_non_loopback_bind` above still reads the operator's
     // `allowed_hosts`, not this: the warning is about whether they said
     // anything, and that question is unchanged.
-    let mcp_config = match allowed_hosts.clone() {
-        Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
-        None => StreamableHttpServerConfig::default()
-            .with_allowed_hosts(DEFAULT_LOOPBACK_HOSTS.iter().map(|h| h.to_string())),
-    }
-    .with_allowed_origins(origins);
+    //
+    // (codex P2 round 9 on PR #173) One effective Host list, shared by `/mcp`
+    // and `/healthz`, and it includes the bound loopback address for the same
+    // reason the Origin list does.
+    let effective_hosts = effective_allowed_hosts(allowed_hosts.clone(), bound);
+    let mcp_config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(effective_hosts.clone())
+        .with_allowed_origins(origins);
     let mcp_service = StreamableHttpService::new(factory, Arc::clone(&session_manager), mcp_config);
 
     // (BU-32) `/mcp` だけを門番の配下に置く。`.layer()` を merge 後の app に
@@ -682,7 +722,10 @@ pub async fn run_http(
     let healthz_router = if healthz_public {
         Router::new().route("/healthz", get(healthz))
     } else {
-        let allowed_state = Arc::new(allowed_hosts.clone());
+        // (codex P2 round 9 on PR #173) The same effective list `/mcp` got, not
+        // the operator's raw value — otherwise `--bind 127.0.0.2` would answer
+        // `/mcp` and refuse `/healthz` for the identical Host.
+        let allowed_state = Arc::new(Some(effective_hosts.clone()));
         Router::new()
             .route("/healthz", get(healthz))
             .layer(middleware::from_fn_with_state(
@@ -1510,6 +1553,65 @@ mod tests {
                 "alias {host} is missing from the Origin defaults: {origins:?}"
             );
         }
+    }
+
+    /// (codex P2 round 9 on PR #173) The Host list gets the bound loopback
+    /// address for the same reason the Origin list does. Without it,
+    /// `--bind 127.0.0.2:3100` produces a server that puts `127.0.0.2` in its
+    /// Origin defaults and its admin allow-list, then refuses the
+    /// `Host: 127.0.0.2:3100` a browser has no choice but to send.
+    ///
+    /// The round-2 reasoning for leaving this alone — that rmcp owned the
+    /// default — stopped being true in round 8, when we started building it.
+    #[test]
+    fn the_host_list_includes_the_bound_loopback_address() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        let hosts = effective_allowed_hosts(None, bound);
+        assert!(
+            hosts.contains(&"127.0.0.2".to_string()),
+            "the bound loopback address must be accepted as a Host: {hosts:?}"
+        );
+        for alias in DEFAULT_LOOPBACK_HOSTS {
+            assert!(
+                hosts.contains(&alias.to_string()),
+                "{alias} must survive alongside it: {hosts:?}"
+            );
+        }
+    }
+
+    /// A non-loopback bind adds nothing. Handing out `192.168.1.10` because the
+    /// server happens to listen there would be an allowance the operator never
+    /// configured — and `allowed_hosts` exists precisely so they can.
+    #[test]
+    fn the_host_list_does_not_widen_for_a_non_loopback_bind() {
+        let expected: Vec<String> = DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        for addr in ["192.168.1.10:3100", "0.0.0.0:3100"] {
+            assert_eq!(
+                effective_allowed_hosts(None, addr.parse().unwrap()),
+                expected,
+                "{addr} must not add itself to the Host allow-list"
+            );
+        }
+    }
+
+    /// An explicit list is the operator's word, including the empty list that
+    /// means "accept any Host". Mixing the defaults in would quietly narrow a
+    /// setting they wrote deliberately.
+    #[test]
+    fn a_configured_host_list_is_not_extended_by_the_defaults() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        let configured = vec!["kb.example.lan".to_string()];
+        assert_eq!(
+            effective_allowed_hosts(Some(configured.clone()), bound),
+            configured
+        );
+        assert!(
+            effective_allowed_hosts(Some(vec![]), bound).is_empty(),
+            "an empty list means accept any Host; it must survive intact"
+        );
     }
 
     /// (codex P2 round 5 on PR #173) RFC 6454 omits the default port when it
