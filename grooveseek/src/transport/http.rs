@@ -414,10 +414,20 @@ fn has_explicit_port_suffix(raw: &str) -> bool {
     false
 }
 
-/// rmcp 1.4 default loopback list の mirror。本 helper では IPv6 を **bracketed**
-/// (`"[::1]"`) で保持。allow-list 側は `NormalizedAuthority::from_allowed_entry`
-/// の fallback で unbracketed (`"::1"`) も同等扱いされるため、`Authority::try_from`
-/// が parse できる bracketed 形式を一次形にすると helper 内 normalize が単純化される。
+/// 「このサーバに届くローカルな名前」の**唯一の定義**。
+///
+/// 元は rmcp の default loopback list の *mirror* だったが、
+/// (codex P1 round 8 on PR #173) で **こちらを定義側にした** — `allowed_hosts`
+/// 省略時も `with_allowed_hosts` でこの集合を rmcp に渡すようにしたので、
+/// mirror ではなくなった。上流の既定が変わっても、こちらの 4 つのリストが
+/// 揃ってずれる / 揃わなくなる、のどちらも起きない。
+///
+/// IPv6 は **bracketed** (`"[::1]"`) を一次形にする。allow-list 側は
+/// `NormalizedAuthority::from_allowed_entry` の fallback で unbracketed
+/// (`"::1"`) も同等扱いされるため、`Authority::try_from` が parse できる
+/// bracketed 形式にすると helper 内 normalize が単純化される。
+/// **rmcp 側も同じ正規化を持つ** (本ファイルの `NormalizedAuthority` がその
+/// mirror) ため、bracketed のまま渡して問題ない — 実測で確認済み。
 /// (codex P1 round 7 on PR #173) `pub(crate)`: this is the crate's one answer to
 /// "which local names reach this server". Three allow-lists ask it — `/healthz`
 /// Host validation, the `/mcp` Origin defaults, and the admin router's
@@ -629,9 +639,22 @@ pub async fn run_http(
              restore the loopback-only default."
         );
     }
+    // (codex P1 round 8 on PR #173) The `None` branch used to leave rmcp's own
+    // default in place, which made `/mcp`'s Host check the one list not fed by
+    // `DEFAULT_LOOPBACK_HOSTS` — so the next alias added to that constant would
+    // have been honoured by `/healthz`, by Origin validation and by the admin
+    // router, and refused by `/mcp`. Passing it explicitly inverts the old
+    // relationship on purpose: the constant stops being a mirror of an upstream
+    // value and becomes the definition, which also means a change to rmcp's
+    // default can no longer move one of our four lists without the others.
+    //
+    // `should_warn_non_loopback_bind` above still reads the operator's
+    // `allowed_hosts`, not this: the warning is about whether they said
+    // anything, and that question is unchanged.
     let mcp_config = match allowed_hosts.clone() {
         Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
-        None => StreamableHttpServerConfig::default(),
+        None => StreamableHttpServerConfig::default()
+            .with_allowed_hosts(DEFAULT_LOOPBACK_HOSTS.iter().map(|h| h.to_string())),
     }
     .with_allowed_origins(origins);
     let mcp_service = StreamableHttpService::new(factory, Arc::clone(&session_manager), mcp_config);
@@ -1436,6 +1459,35 @@ mod tests {
             effective_allowed_origins(None, wildcard),
             default_allowed_origins(3100),
             "a non-loopback bind must not widen the allow-list"
+        );
+    }
+
+    /// (codex P1 round 8 on PR #173) The constant is the definition of the
+    /// `/healthz` default set, not a list that happens to look like it. Pinning
+    /// this is what makes adding an alias a one-line change: the same constant
+    /// feeds Origin defaults, the admin allow-list, and — since round 8 — the
+    /// list handed to rmcp for `/mcp`.
+    ///
+    /// rmcp's own acceptance of the bracketed spelling is covered end to end
+    /// rather than here: a server started with the shared set answers 200 to
+    /// `Host: 127.0.0.1`, `localhost` and `[::1]`, and 403 to `evil.example`.
+    #[test]
+    fn every_shared_alias_passes_the_default_host_check() {
+        for alias in DEFAULT_LOOPBACK_HOSTS {
+            assert!(
+                validate_host_header(Some(alias), None).is_ok(),
+                "{alias} is in the shared set but the default Host check rejects it"
+            );
+            // The same alias with a port, which is what a client actually sends.
+            let with_port = format!("{alias}:3100");
+            assert!(
+                validate_host_header(Some(&with_port), None).is_ok(),
+                "{with_port} must be accepted; the port is stripped before comparing"
+            );
+        }
+        assert!(
+            validate_host_header(Some("evil.example"), None).is_err(),
+            "the default set must not have grown open"
         );
     }
 
