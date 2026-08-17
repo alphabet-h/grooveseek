@@ -43,18 +43,26 @@ pub(crate) fn run_with_backend(
     // "localhost:3100" or a missing port like "127.0.0.1" passes is_loopback
     // but Transport::resolve() rejects it later — by which point the user has
     // already registered the service and would not see the error.
-    let _: std::net::SocketAddr = params.bind.parse().with_context(|| {
+    let bind_addr: std::net::SocketAddr = params.bind.parse().with_context(|| {
         format!(
             "--bind '{}' is not a valid socket address (e.g. '127.0.0.1:3100')",
             params.bind
         )
     })?;
+    // (codex P2 round 3 on PR #173) Ask the crate's one loopback predicate,
+    // parsing first, instead of matching on the string. The old prefix test
+    // disagreed with the admin router about `::ffff:127.0.0.1`, and its
+    // `starts_with("localhost")` arm was unreachable anyway -- `localhost:3100`
+    // never parses as a `SocketAddr`, so the line above rejects it first.
+    let bind_is_loopback = crate::transport::http::is_loopback_peer(bind_addr.ip());
 
-    if !is_loopback_addr(&params.bind) && !params.i_know_non_loopback {
+    if !bind_is_loopback && !params.i_know_non_loopback {
+        // (codex P1 round 1 on PR #173) Shared with `groove serve`. Both are
+        // answering "may this bind go on the network?", so the wording lives in
+        // one place -- see `transport::non_loopback_bind_refusal`.
         return Err(anyhow!(
-            "bind={} は non-loopback です。groove は auth を持ちません — \
-             untrusted network での公開は危険。確認して進める場合は --i-know を付けて再実行してください。",
-            params.bind
+            "{}",
+            crate::transport::non_loopback_bind_refusal(&params.bind)
         ));
     }
     // (codex P2 round 3 on PR #57, design clarification) Loopback-only admin
@@ -63,7 +71,7 @@ pub(crate) fn run_with_backend(
     // addr. Warn the user that LAN browsers will see 403 on admin paths so
     // they expect to SSH to the host (or use http://127.0.0.1:<port>/ui) for
     // the WebUI even when /mcp is exposed on LAN.
-    if !is_loopback_addr(&params.bind) {
+    if !bind_is_loopback {
         eprintln!(
             "Note: admin endpoints (/ui, /api/admin/status, /api/search) are \
              loopback-only by design. Browsers on the LAN will get 403 from \
@@ -198,10 +206,6 @@ pub fn run_tray_install(service_name: &str, force: bool) -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 pub fn run_tray_install(_service_name: &str, _force: bool) -> Result<()> {
     Err(anyhow!("tray-install is only supported on Windows"))
-}
-
-fn is_loopback_addr(s: &str) -> bool {
-    s.starts_with("127.") || s.starts_with("[::1]") || s.starts_with("localhost")
 }
 
 fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> Result<()> {

@@ -14,7 +14,49 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **The HTTP transport now validates the `Origin` header, which it never did.**
+  The MCP specification's Streamable HTTP section states that a server *"**MUST**
+  validate the `Origin` header on all incoming connections to prevent DNS
+  rebinding attacks"*. rmcp implements the check but defaults it to an empty
+  list, which means *do not validate*, and groove never set it — so every release
+  up to and including v0.26.0 accepted any `Origin`. Measured against a running
+  v0.26.0 daemon: `Origin: http://evil.example` was answered normally.
+
+  The default is now the loopback origins for whichever port is bound
+  (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`).
+
+  **This does not break existing clients.** Per RFC 6454 a request that carries
+  no `Origin` header passes, and ordinary MCP clients, the tray and `curl` send
+  none. What it stops is a web page open in the operator's own browser reaching
+  `/mcp` cross-origin. It is not authentication, and groove still has none.
+
+  **It covers `/mcp` and nothing else.** `/ui`, `/api/search` and
+  `/api/admin/status` are on the admin router and have no `Origin` check;
+  measured with the default list, `Origin: https://evil.example` gets 403 from
+  `/mcp` and 200 from all three. They are restricted by requiring a loopback
+  peer, which is not configurable — so `allowed_origins` cannot break a locally
+  opened `/ui`, and it is not what keeps a local web page away from
+  `/api/search` (the browser's CORS preflight is).
+
 ### Added
+
+- **`[transport.http].allowed_origins`.** Names the browser origins the server
+  accepts. Needed when a browser reaches groove through a reverse proxy, because
+  the browser then sends the *public* origin and the loopback default will not
+  match it. Entries carry a scheme and bracket IPv6, since they are compared as
+  RFC 6454 `(scheme, host, port)` triples.
+
+  Setting it **replaces** the default list rather than extending it, matching
+  `allowed_hosts`. Keep the loopback entries alongside your public origin if
+  browser-based clients also reach you over loopback.
+
+  An empty list disables validation entirely and now warns at startup. Like
+  `allowed_hosts`, `healthz_public` and `max_sessions`, the key is **ignored when
+  it comes from a config file groove discovered rather than one you passed with
+  `--config`** — otherwise whoever can write a `groove.toml` beside the binary
+  could name their own origin, or blank the list, and turn the check off.
 
 - **A stability policy: [docs/stability.md](docs/stability.md).** It states what
   1.0.0 will freeze and — more usefully — what it deliberately will not. Without
@@ -46,6 +88,36 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   model behind a single warning on a daemon's stderr.
 - The README titles now name the product (**GrooveSeek**) rather than the command
   (`groove`).
+- **[docs/stability.md](docs/stability.md) now says where GrooveSeek is meant to
+  run.** Having no authentication is a design position, not a gap awaiting work,
+  and saying so is what makes the rest of the policy coherent: the HTTP transport
+  expects to be reached from the same host, with the network boundary owned by a
+  container, a reverse proxy, or the application that puts a face on the knowledge
+  base. Non-loopback binds stay allowed — a container has to bind one or published
+  ports never reach it — but they mean you have taken that boundary on yourself.
+- **"Is this address loopback?" now has one answer instead of three.** The admin
+  router unwraps IPv4-mapped IPv6 (`::ffff:127.0.0.1`) and treats it as local;
+  `groove serve` asked `IpAddr::is_loopback`, which says no; and
+  `groove service install` matched on string prefixes. So binding to a mapped
+  loopback address was refused as "network exposure" without `--i-know`, while
+  a peer arriving from that same address was being let into `/ui`. All three
+  now call one predicate, and **`--bind [::ffff:127.0.0.1]:PORT` no longer
+  demands `--i-know`** — it is a loopback address, and the rest of the server
+  already behaved as though it were. Nothing else changes: every other address
+  the old predicates already agreed on.
+- **The refusal printed for a non-loopback `--bind` now states the consequence.**
+  It used to say groove "has no auth" and that exposure "is dangerous", which
+  leaves the reader to work out what is actually at stake. It now says that
+  anything able to reach the port can read the entire knowledge base, and that
+  `Host` validation and the session cap are not authentication. Same text in
+  `groove serve` and `groove service install`.
+- **The admin web surface is now documented as scheduled to go away.**
+  `docs/stability.md` records the intent to remove `/ui` and `/api/search` during
+  1.x, once a client that speaks `/mcp` exists — browsing belongs there, where
+  every tool and every search parameter is reachable and the surface is already
+  stable. `/api/admin/status` stays: it reports operational state (version, pid,
+  indexing progress) that does not belong in a tool surface built for language
+  models. Both endpoints remain unstable, so this is notice rather than a promise.
 
 ## [0.26.0] - 2026-08-17
 

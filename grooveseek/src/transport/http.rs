@@ -74,6 +74,192 @@ const _: () = assert!(
     "at ~100 KB per live session, a default this large stops bounding anything"
 );
 
+/// `Origin` allow-list の既定値 — 指定 port の loopback origin 3 種。
+///
+/// MCP 仕様 2025-06-18 (Streamable HTTP / Security Warning) は
+/// *"Servers **MUST** validate the `Origin` header on all incoming connections
+/// to prevent DNS rebinding attacks"* と定めているが、rmcp の既定は
+/// `allowed_origins: vec![]` = **検証しない**。既定でこれを埋めることで
+/// 仕様を満たす。
+///
+/// **bind IP ではなく port だけを見る。** `--bind 0.0.0.0:3100` で起動しても、
+/// 運用者がブラウザで開くのは `http://127.0.0.1:3100/ui` だからで、bind IP を
+/// origin に混ぜても誰も送ってこない値が増えるだけになる。
+///
+/// IPv6 に角括弧を付けるのは RFC 6454 の origin シリアライズに合わせるため
+/// (`http://[::1]:3100`)。rmcp は entry に scheme を要求する。
+///
+/// `https://` を混ぜていないのは、TLS を終端するのは常に前段の proxy であり、
+/// その時ブラウザが送る origin は loopback ではなく公開ホスト名になるから。
+/// その構成では `[transport.http].allowed_origins` に公開 origin を明示する。
+pub fn default_allowed_origins(port: u16) -> Vec<String> {
+    // (codex P1 round 6 on PR #173) Built from `DEFAULT_LOOPBACK_HOSTS`, not a
+    // second literal with the same three entries. Both are allow-lists deciding
+    // which local browser addresses count, so if the set ever changes -- another
+    // alias, a different normalized spelling -- a copy would let Host validation
+    // and Origin validation quietly disagree about the same browser.
+    DEFAULT_LOOPBACK_HOSTS
+        .iter()
+        .flat_map(|host| origins_for_host(host, port))
+        .collect()
+}
+
+/// `http` の既定ポート。RFC 6454 の origin 直列化はこれを**省く**。
+const HTTP_DEFAULT_PORT: u16 = 80;
+
+/// 1 つの host 表記に対して、クライアントが送りうる origin をすべて返す。
+///
+/// **規則は 1 つ**: 「bind したアドレスに対して相手が使いうる綴りは全部載せる」。
+/// 綴りが違うだけの同一 origin なので、許可範囲は広がらない — 広がるのは
+/// 「一致しなくて 403、しかも原因が見えない」を避けられる範囲だけ。
+///
+/// port 80 で 2 つ返すのがその適用例。RFC 6454 は既定ポートを origin から省くので、
+/// **port 80 のサーバにブラウザが送るのは `http://127.0.0.1` であって
+/// `http://127.0.0.1:80` ではない** (codex P2 round 5 on PR #173)。
+fn origins_for_host(host: &str, port: u16) -> Vec<String> {
+    if port == HTTP_DEFAULT_PORT {
+        vec![format!("http://{host}"), format!("http://{host}:{port}")]
+    } else {
+        vec![format!("http://{host}:{port}")]
+    }
+}
+
+/// bind したアドレスに対して、クライアントが `Host` / `Origin` に載せうる
+/// host 表記をすべて返す (IPv6 は bracket 付き、`:port` を連結できる形)。
+///
+/// **綴りが 1 つに決まらないため。** 実測 (2026-08-17):
+///
+/// ```text
+/// Rust の Ipv6Addr::to_string()  ::ffff:127.0.0.1   <- dotted (IPv4-mapped 特例)
+/// WHATWG URL の直列化            ::ffff:7f00:1      <- hex piece、ブラウザはこちら
+/// ```
+///
+/// どちらも同じアドレスで、どちらも誤りではない。片方に賭けると、賭けを外した側の
+/// クライアントが 403 を受け取る — しかも `Host` 側の正規化
+/// ([`NormalizedAuthority`]) は bracket 剥がしと小文字化しかせず、IPv6 を
+/// 再直列化しないので救われない。**だから両方載せる**
+/// (codex P2 round 5 on PR #173)。
+///
+/// **到達性の実測 (2026-08-17、Windows)**: `--bind [::ffff:127.0.0.1]:3196` は
+/// OS が `WSAEADDRNOTAVAIL` (os error 10049) で拒否する。つまり Windows では
+/// 「mapped アドレスに bind したサーバ」は作れない。ここを整えているのは
+/// ① 他 OS の挙動を測っていない ② `is_loopback_peer` は **peer** 側 (BU-21 =
+/// dual-stack listener が IPv4 クライアントを `::ffff:a.b.c.d` として報告する、
+/// 実在する経路) でも使う、の 2 点による。**この分岐が Windows で発火する
+/// 経路は現時点で見つかっていない**と分かった上で残している。
+///
+/// 分岐が IPv4-mapped だけなのは、綴りが割れるのがそこだけだからである。
+/// IPv4-compatible (`::a.b.c.d`) も Rust は dotted で出すが、
+/// [`is_loopback_peer`] が意図的に unwrap しないので loopback 判定に通らず、
+/// この一覧に載る経路が無い。
+pub(crate) fn client_host_forms(ip: std::net::IpAddr) -> Vec<String> {
+    match ip {
+        std::net::IpAddr::V4(v4) => vec![v4.to_string()],
+        std::net::IpAddr::V6(v6) => {
+            let mut forms = vec![format!("[{v6}]")];
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                let o = v4.octets();
+                let hex = format!(
+                    "[::ffff:{:x}:{:x}]",
+                    u16::from_be_bytes([o[0], o[1]]),
+                    u16::from_be_bytes([o[2], o[3]])
+                );
+                if !forms.contains(&hex) {
+                    forms.push(hex);
+                }
+            }
+            forms
+        }
+    }
+}
+
+/// 設定値と **実際に bind したアドレス** から、有効な `Host` allow-list を決める。
+///
+/// [`effective_allowed_origins`] と同じ形、同じ理由。**round 2 では「`allowed_hosts`
+/// の既定は rmcp が持っているので触らない」と判断したが、round 8 でこちらが
+/// 構築するようになったのでその理由は消えた** (codex P2 round 9 on PR #173)。
+///
+/// 効き所は `--bind 127.0.0.2:3100` のような **`127.0.0.1` 以外の loopback**。
+/// origin 側と admin allow-list には `127.0.0.2` が入るのに Host 側に入らないと、
+/// ブラウザが送らざるを得ない `Host: 127.0.0.2:3100` が `/mcp` で 403 になる。
+///
+/// **非 loopback の bind では何も足さない。** `--bind 192.168.1.10` で LAN の
+/// Host を黙って許可したら、運用者が書いていない許可を配ることになる。
+///
+/// 空 `Vec` は「全 Host 許可」(rmcp の `disable_allowed_hosts` 相当) なので、
+/// 明示されたら**そのまま通す** — 既定を混ぜて黙って狭めない。
+pub(crate) fn effective_allowed_hosts(
+    configured: Option<Vec<String>>,
+    bound: SocketAddr,
+) -> Vec<String> {
+    if let Some(list) = configured {
+        return list;
+    }
+    let mut hosts: Vec<String> = DEFAULT_LOOPBACK_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    if is_loopback_peer(bound.ip()) {
+        // port 付きにしないのは、allow-list 側が bare host なら **どの port でも**
+        // 一致するため (`validate_host_header` の比較 semantics)。
+        for host in client_host_forms(bound.ip()) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
+}
+
+/// 設定値と **実際に bind したアドレス** から、有効な `Origin` allow-list を決める。
+///
+/// 引数が要求値 (`addr`) ではなく bind 結果 (`listener.local_addr()`) なのが要点で、
+/// 理由が 2 つある:
+///
+/// 1. **port** — `--bind 127.0.0.1:0` は「OS に選ばせる」意味なので、要求値から
+///    既定を組むと `http://127.0.0.1:0` (= ブラウザが決して送れない origin) だけを
+///    許可した状態になり、実際に割り当てられた port が 403 になる
+///    (codex P2 round 1 on PR #173)
+/// 2. **アドレス** — loopback は `127.0.0.1` だけではない。`127.0.0.0/8` は全体が
+///    loopback なので `--bind 127.0.0.2:3100` は `--i-know` 無しで通るが、そこを
+///    開いたブラウザは `Origin: http://127.0.0.2:3100` を送る。既定 3 種にそれが
+///    無いと、Origin 検証が理由で 403 になる (codex P2 round 2 on PR #173)
+///
+/// **ただし 2 は「Origin では弾かない」までしか保証しない。** 実測 (bind
+/// `127.0.0.2:3197`): `Host: 127.0.0.2:3197` は **rmcp の Host allow-list**
+/// (既定 = `localhost` / `127.0.0.1` / `::1`) で先に 403 になる。`Host` を
+/// `127.0.0.1` にすると 200 が返り、その状態で `Origin: http://127.0.0.2:3197`
+/// も通る = ここの修正は効いている。つまり 127.0.0.1 以外の loopback を
+/// **ブラウザから実際に使う**には `[transport.http].allowed_hosts` の設定も要る。
+/// それは別の面の話なので本 fn では触らない (`allowed_hosts` の既定は rmcp が
+/// 持っており、こちらで組み直すと既定値の実装が 2 つになる)。
+///
+/// 判定に [`is_loopback_peer`] を使うのは、`admin_host_check` と**同じ問い**
+/// (「このアドレスは loopback か」) だから。別実装を置くと、IPv4-mapped IPv6 の
+/// ような端の扱いが 2 箇所で食い違う。
+pub(crate) fn effective_allowed_origins(
+    configured: Option<Vec<String>>,
+    bound: SocketAddr,
+) -> Vec<String> {
+    // 明示された list はそのまま使う (空 `Vec` = 検証無効も含めて)。既定を混ぜると
+    // 「運用者が書いていない値」がセキュリティ設定に入り、共有ホストで
+    // 「ローカルのブラウザこそ排除したい」が表現できなくなる。
+    let Some(list) = configured else {
+        let mut origins = default_allowed_origins(bound.port());
+        if is_loopback_peer(bound.ip()) {
+            for host in client_host_forms(bound.ip()) {
+                for entry in origins_for_host(&host, bound.port()) {
+                    if !origins.contains(&entry) {
+                        origins.push(entry);
+                    }
+                }
+            }
+        }
+        return origins;
+    };
+    list
+}
+
 /// 上限に達した時に `Retry-After` で返す秒数。
 ///
 /// **見込みであって保証ではない**。空きが出るのは他のクライアントが切れた時か、
@@ -266,11 +452,30 @@ fn has_explicit_port_suffix(raw: &str) -> bool {
     false
 }
 
-/// rmcp 1.4 default loopback list の mirror。本 helper では IPv6 を **bracketed**
-/// (`"[::1]"`) で保持。allow-list 側は `NormalizedAuthority::from_allowed_entry`
-/// の fallback で unbracketed (`"::1"`) も同等扱いされるため、`Authority::try_from`
-/// が parse できる bracketed 形式を一次形にすると helper 内 normalize が単純化される。
-const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
+/// 「このサーバに届くローカルな名前」の**唯一の定義**。
+///
+/// 元は rmcp の default loopback list の *mirror* だったが、
+/// (codex P1 round 8 on PR #173) で **こちらを定義側にした** — `allowed_hosts`
+/// 省略時も `with_allowed_hosts` でこの集合を rmcp に渡すようにしたので、
+/// mirror ではなくなった。上流の既定が変わっても、こちらの 4 つのリストが
+/// 揃ってずれる / 揃わなくなる、のどちらも起きない。
+///
+/// IPv6 は **bracketed** (`"[::1]"`) を一次形にする。allow-list 側は
+/// `NormalizedAuthority::from_allowed_entry` の fallback で unbracketed
+/// (`"::1"`) も同等扱いされるため、`Authority::try_from` が parse できる
+/// bracketed 形式にすると helper 内 normalize が単純化される。
+/// **rmcp 側も同じ正規化を持つ** (本ファイルの `NormalizedAuthority` がその
+/// mirror) ため、bracketed のまま渡して問題ない — 実測で確認済み。
+/// (codex P1 round 7 on PR #173) `pub(crate)`: this is the crate's one answer to
+/// "which local names reach this server". Three allow-lists ask it — `/healthz`
+/// Host validation, the `/mcp` Origin defaults, and the admin router's
+/// `allowed_admin_hosts` — and a copy in any of them means a new alias would be
+/// accepted by one surface and refused by another.
+///
+/// The bracketed IPv6 spelling is the primary form here;
+/// [`NormalizedAuthority::from_allowed_entry`] strips the brackets, so an entry
+/// written `"::1"` compares equal.
+pub(crate) const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "[::1]"];
 
 /// `/healthz` 用 Host validation の pure helper (no I/O、test 容易)。
 ///
@@ -406,6 +611,7 @@ fn forbidden_plain(msg: &str) -> Response {
 pub async fn run_http(
     addr: SocketAddr,
     allowed_hosts: Option<Vec<String>>,
+    allowed_origins: Option<Vec<String>>,
     healthz_public: bool,
     max_sessions: u32,
     shared: KbServerShared,
@@ -439,10 +645,58 @@ pub async fn run_http(
         move || -> Result<KbServer, std::io::Error> { Ok(KbServer::from_shared(&f)) }
     };
 
-    let mcp_config = match allowed_hosts.clone() {
-        Some(hosts) => StreamableHttpServerConfig::default().with_allowed_hosts(hosts),
-        None => StreamableHttpServerConfig::default(),
-    };
+    // (1.0 blocker 4) Origin validation. rmcp's default is an empty list, which
+    // means "do not validate" — so leaving this unset ships a server that does
+    // not meet the MCP specification's Streamable HTTP requirement. The default
+    // below is the loopback origins for the bind port; an operator publishing
+    // through a proxy names their public origin in the config instead.
+    //
+    // This is NOT authentication, and enabling it does not break existing use:
+    // per RFC 6454 and rmcp, a request that carries no `Origin` header still
+    // passes. MCP clients, the tray and curl send none. What it stops is a web
+    // page in the operator's own browser reaching this port cross-origin.
+    // (codex P1 round 1 on PR #173) Bind before deriving the default. The port
+    // that matters is the one the OS actually assigned: `--bind 127.0.0.1:0`
+    // asks it to choose, so a default built from `addr` would allow `:0` — an
+    // origin no browser can ever send — and answer 403 to the real one.
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "failed to bind {addr}: is another groove instance running, or the \
+                 port occupied?"
+        )
+    })?;
+    let bound = listener.local_addr().unwrap_or(addr);
+
+    let origins = effective_allowed_origins(allowed_origins, bound);
+    if origins.is_empty() {
+        tracing::warn!(
+            "[transport.http].allowed_origins is empty, which disables Origin \
+             validation. The MCP specification requires servers to validate it \
+             to prevent DNS rebinding, so any web page loaded in a browser on \
+             this machine can now reach /mcp cross-origin. Remove the key to \
+             restore the loopback-only default."
+        );
+    }
+    // (codex P1 round 8 on PR #173) The `None` branch used to leave rmcp's own
+    // default in place, which made `/mcp`'s Host check the one list not fed by
+    // `DEFAULT_LOOPBACK_HOSTS` — so the next alias added to that constant would
+    // have been honoured by `/healthz`, by Origin validation and by the admin
+    // router, and refused by `/mcp`. Passing it explicitly inverts the old
+    // relationship on purpose: the constant stops being a mirror of an upstream
+    // value and becomes the definition, which also means a change to rmcp's
+    // default can no longer move one of our four lists without the others.
+    //
+    // `should_warn_non_loopback_bind` above still reads the operator's
+    // `allowed_hosts`, not this: the warning is about whether they said
+    // anything, and that question is unchanged.
+    //
+    // (codex P2 round 9 on PR #173) One effective Host list, shared by `/mcp`
+    // and `/healthz`, and it includes the bound loopback address for the same
+    // reason the Origin list does.
+    let effective_hosts = effective_allowed_hosts(allowed_hosts.clone(), bound);
+    let mcp_config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(effective_hosts.clone())
+        .with_allowed_origins(origins);
     let mcp_service = StreamableHttpService::new(factory, Arc::clone(&session_manager), mcp_config);
 
     // (BU-32) `/mcp` だけを門番の配下に置く。`.layer()` を merge 後の app に
@@ -468,7 +722,10 @@ pub async fn run_http(
     let healthz_router = if healthz_public {
         Router::new().route("/healthz", get(healthz))
     } else {
-        let allowed_state = Arc::new(allowed_hosts.clone());
+        // (codex P2 round 9 on PR #173) The same effective list `/mcp` got, not
+        // the operator's raw value — otherwise `--bind 127.0.0.2` would answer
+        // `/mcp` and refuse `/healthz` for the identical Host.
+        let allowed_state = Arc::new(Some(effective_hosts.clone()));
         Router::new()
             .route("/healthz", get(healthz))
             .layer(middleware::from_fn_with_state(
@@ -497,12 +754,6 @@ pub async fn run_http(
             REQUEST_BODY_MAX_BYTES,
         ));
 
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
-        format!(
-            "failed to bind {addr}: is another groove instance running, or the \
-                 port occupied?"
-        )
-    })?;
     eprintln!(
         "groove server ready (http transport, listening on {})",
         listener.local_addr().unwrap_or(addr)
@@ -900,7 +1151,13 @@ async fn healthz_host_check(
 /// answer for it is whatever `Ipv4Addr::is_loopback` says (`127.0.0.0/8`).
 /// Deprecated IPv4-compatible addresses (`::a.b.c.d`) are deliberately not
 /// unwrapped.
-fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
+/// (codex P2 round 3 on PR #173) `pub(crate)` because this is **the** answer to
+/// "is this address loopback" for the whole crate: the admin gate, the
+/// `--bind` acknowledgement in `check_cli_bind_ack`, `service install`, and the
+/// default `Origin` list all ask it. They used to answer it three different
+/// ways, and disagreed on `::ffff:127.0.0.1` — the admin router let such a peer
+/// in while both bind gates called the same address network exposure.
+pub(crate) fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -911,7 +1168,12 @@ fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
 }
 
 fn should_warn_non_loopback_bind(addr: &SocketAddr, allowed_hosts: Option<&[String]>) -> bool {
-    if addr.ip().is_loopback() {
+    // (codex P2 round 4 on PR #173) Shared predicate, not `IpAddr::is_loopback`.
+    // Once `check_cli_bind_ack` accepted `[::ffff:127.0.0.1]` as loopback, this
+    // line still called it exposure and warned about a bind the CLI had just
+    // approved — the two halves of one decision contradicting each other on
+    // startup.
+    if is_loopback_peer(addr.ip()) {
         return false;
     }
     match allowed_hosts {
@@ -1130,6 +1392,307 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (1.0 blocker 4) The default `Origin` allow-list. Three properties matter
+    /// and each has bitten somewhere before:
+    ///
+    /// - every entry carries a scheme (rmcp rejects bare hosts);
+    /// - the IPv6 entry is bracketed, per RFC 6454 origin serialisation, so it
+    ///   matches what a browser actually sends;
+    /// - the list is never empty, because empty is rmcp's encoding for "do not
+    ///   validate" and would silently undo the whole point.
+    #[test]
+    fn default_allowed_origins_are_loopback_for_the_given_port() {
+        let origins = default_allowed_origins(3100);
+        assert_eq!(
+            origins,
+            vec![
+                "http://localhost:3100".to_string(),
+                "http://127.0.0.1:3100".to_string(),
+                "http://[::1]:3100".to_string(),
+            ]
+        );
+        assert!(
+            origins.iter().all(|o| o.starts_with("http://")),
+            "rmcp requires a scheme on every entry"
+        );
+        assert!(
+            !origins.is_empty(),
+            "an empty list is rmcp's encoding for 'skip Origin validation'"
+        );
+    }
+
+    /// The port is substituted, not hard-coded: a server on a non-default port
+    /// has to accept the origin its own `/ui` will send.
+    #[test]
+    fn default_allowed_origins_follow_the_bind_port() {
+        let origins = default_allowed_origins(4242);
+        assert!(origins.iter().all(|o| o.ends_with(":4242")));
+        assert!(origins.contains(&"http://[::1]:4242".to_string()));
+    }
+
+    /// (codex P2 round 1 on PR #173) The default must be built from the port
+    /// that was **bound**, not the one that was requested. `--bind 127.0.0.1:0`
+    /// hands port selection to the OS, so deriving from the request would allow
+    /// only `http://127.0.0.1:0` — which no browser can send — and 403 the real
+    /// port. `run_http` binds first and passes `listener.local_addr().port()`,
+    /// and this pins the arithmetic that would otherwise regress silently.
+    #[test]
+    fn effective_origins_use_the_assigned_port_not_the_requested_one() {
+        let requested_port = 0u16;
+        let bound: SocketAddr = "127.0.0.1:51234".parse().unwrap();
+        let origins = effective_allowed_origins(None, bound);
+        assert!(
+            origins.iter().all(|o| o.ends_with(":51234")),
+            "origins must name the assigned port, got {origins:?}"
+        );
+        assert!(
+            !origins
+                .iter()
+                .any(|o| o.ends_with(&format!(":{requested_port}"))),
+            "port 0 must never reach the allow-list: {origins:?}"
+        );
+    }
+
+    /// (codex P2 round 2 on PR #173) `127.0.0.0/8` is loopback in its entirety,
+    /// so `--bind 127.0.0.2:3100` is accepted without `--i-know` — but a browser
+    /// opening that address sends `Origin: http://127.0.0.2:3100`, which the
+    /// three fixed defaults do not contain. The bound address itself has to join
+    /// the list, so that Origin validation is not the thing refusing it.
+    ///
+    /// Measured caveat, recorded so nobody reads more into this than it does:
+    /// with `--bind 127.0.0.2`, `Host: 127.0.0.2:PORT` is refused a step earlier
+    /// by rmcp's Host allow-list. Reaching such a bind from a browser also needs
+    /// `[transport.http].allowed_hosts` — a separate surface, deliberately not
+    /// changed here.
+    #[test]
+    fn effective_origins_include_a_bound_loopback_address_beyond_127_0_0_1() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        let origins = effective_allowed_origins(None, bound);
+        assert!(
+            origins.contains(&"http://127.0.0.2:3100".to_string()),
+            "the bound loopback address must be allowed, got {origins:?}"
+        );
+        // The fixed three stay, because the operator may still reach the server
+        // through localhost regardless of which loopback address it bound.
+        assert!(origins.contains(&"http://127.0.0.1:3100".to_string()));
+        assert!(origins.contains(&"http://localhost:3100".to_string()));
+    }
+
+    /// The bound address is not appended twice when it is already one of the
+    /// defaults, and a non-loopback bind adds nothing: `Origin: http://0.0.0.0`
+    /// is not something a browser sends, and putting the LAN address in would
+    /// hand out an allowance the operator never asked for.
+    #[test]
+    fn effective_origins_do_not_duplicate_or_widen_beyond_loopback() {
+        let loopback: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        let origins = effective_allowed_origins(None, loopback);
+        assert_eq!(
+            origins
+                .iter()
+                .filter(|o| *o == "http://127.0.0.1:3100")
+                .count(),
+            1,
+            "the bound address must not be appended twice: {origins:?}"
+        );
+        assert_eq!(origins, default_allowed_origins(3100));
+
+        let wildcard: SocketAddr = "0.0.0.0:3100".parse().unwrap();
+        assert_eq!(
+            effective_allowed_origins(None, wildcard),
+            default_allowed_origins(3100),
+            "a non-loopback bind must not widen the allow-list"
+        );
+    }
+
+    /// (codex P1 round 8 on PR #173) The constant is the definition of the
+    /// `/healthz` default set, not a list that happens to look like it. Pinning
+    /// this is what makes adding an alias a one-line change: the same constant
+    /// feeds Origin defaults, the admin allow-list, and — since round 8 — the
+    /// list handed to rmcp for `/mcp`.
+    ///
+    /// rmcp's own acceptance of the bracketed spelling is covered end to end
+    /// rather than here: a server started with the shared set answers 200 to
+    /// `Host: 127.0.0.1`, `localhost` and `[::1]`, and 403 to `evil.example`.
+    #[test]
+    fn every_shared_alias_passes_the_default_host_check() {
+        for alias in DEFAULT_LOOPBACK_HOSTS {
+            assert!(
+                validate_host_header(Some(alias), None).is_ok(),
+                "{alias} is in the shared set but the default Host check rejects it"
+            );
+            // The same alias with a port, which is what a client actually sends.
+            let with_port = format!("{alias}:3100");
+            assert!(
+                validate_host_header(Some(&with_port), None).is_ok(),
+                "{with_port} must be accepted; the port is stripped before comparing"
+            );
+        }
+        assert!(
+            validate_host_header(Some("evil.example"), None).is_err(),
+            "the default set must not have grown open"
+        );
+    }
+
+    /// (codex P1 round 6 on PR #173) Host validation and Origin validation both
+    /// decide which local browser addresses count, so they read the same alias
+    /// set. A second literal would drift the moment one of them gains an alias,
+    /// and the failure would be a browser accepted by one check and refused by
+    /// the other.
+    #[test]
+    fn origin_defaults_are_built_from_the_shared_loopback_alias_set() {
+        let origins = default_allowed_origins(3100);
+        assert_eq!(
+            origins.len(),
+            DEFAULT_LOOPBACK_HOSTS.len(),
+            "one origin per shared alias, off the default port: {origins:?}"
+        );
+        for host in DEFAULT_LOOPBACK_HOSTS {
+            assert!(
+                origins.contains(&format!("http://{host}:3100")),
+                "alias {host} is missing from the Origin defaults: {origins:?}"
+            );
+        }
+    }
+
+    /// (codex P2 round 9 on PR #173) The Host list gets the bound loopback
+    /// address for the same reason the Origin list does. Without it,
+    /// `--bind 127.0.0.2:3100` produces a server that puts `127.0.0.2` in its
+    /// Origin defaults and its admin allow-list, then refuses the
+    /// `Host: 127.0.0.2:3100` a browser has no choice but to send.
+    ///
+    /// The round-2 reasoning for leaving this alone — that rmcp owned the
+    /// default — stopped being true in round 8, when we started building it.
+    #[test]
+    fn the_host_list_includes_the_bound_loopback_address() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        let hosts = effective_allowed_hosts(None, bound);
+        assert!(
+            hosts.contains(&"127.0.0.2".to_string()),
+            "the bound loopback address must be accepted as a Host: {hosts:?}"
+        );
+        for alias in DEFAULT_LOOPBACK_HOSTS {
+            assert!(
+                hosts.contains(&alias.to_string()),
+                "{alias} must survive alongside it: {hosts:?}"
+            );
+        }
+    }
+
+    /// A non-loopback bind adds nothing. Handing out `192.168.1.10` because the
+    /// server happens to listen there would be an allowance the operator never
+    /// configured — and `allowed_hosts` exists precisely so they can.
+    #[test]
+    fn the_host_list_does_not_widen_for_a_non_loopback_bind() {
+        let expected: Vec<String> = DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        for addr in ["192.168.1.10:3100", "0.0.0.0:3100"] {
+            assert_eq!(
+                effective_allowed_hosts(None, addr.parse().unwrap()),
+                expected,
+                "{addr} must not add itself to the Host allow-list"
+            );
+        }
+    }
+
+    /// An explicit list is the operator's word, including the empty list that
+    /// means "accept any Host". Mixing the defaults in would quietly narrow a
+    /// setting they wrote deliberately.
+    #[test]
+    fn a_configured_host_list_is_not_extended_by_the_defaults() {
+        let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
+        let configured = vec!["kb.example.lan".to_string()];
+        assert_eq!(
+            effective_allowed_hosts(Some(configured.clone()), bound),
+            configured
+        );
+        assert!(
+            effective_allowed_hosts(Some(vec![]), bound).is_empty(),
+            "an empty list means accept any Host; it must survive intact"
+        );
+    }
+
+    /// (codex P2 round 5 on PR #173) RFC 6454 omits the default port when it
+    /// serializes an origin, so a server on port 80 is reached by a browser
+    /// sending `http://127.0.0.1` — with no `:80` at all. Listing only the
+    /// explicit form would 403 every same-origin request the built-in page
+    /// makes. Both spellings are listed; they are the same origin.
+    #[test]
+    fn port_80_origins_include_the_form_a_browser_actually_sends() {
+        let origins = default_allowed_origins(80);
+        assert!(
+            origins.contains(&"http://127.0.0.1".to_string()),
+            "the RFC serialization drops :80, and that is what arrives: {origins:?}"
+        );
+        assert!(origins.contains(&"http://localhost".to_string()));
+        assert!(origins.contains(&"http://[::1]".to_string()));
+        // The explicit form is kept as well, for anything that sends it.
+        assert!(origins.contains(&"http://127.0.0.1:80".to_string()));
+
+        // Every other port keeps exactly one spelling -- 8080 is not special.
+        let other = default_allowed_origins(8080);
+        assert_eq!(other.len(), 3, "no extra entries off the default port");
+        assert!(other.iter().all(|o| o.ends_with(":8080")));
+    }
+
+    /// (codex P2 round 5 on PR #173) The two serializers disagree about
+    /// IPv4-mapped IPv6, and the disagreement was measured rather than assumed:
+    /// `Ipv6Addr::to_string()` gives `::ffff:127.0.0.1`, the WHATWG URL
+    /// serializer gives `::ffff:7f00:1`. Both spellings name the same address,
+    /// and `NormalizedAuthority` cannot bridge them because it only strips
+    /// brackets and lowercases — so both have to be on the list.
+    #[test]
+    fn a_mapped_loopback_bind_is_listed_in_both_spellings() {
+        let forms = client_host_forms("::ffff:127.0.0.1".parse().unwrap());
+        assert!(
+            forms.contains(&"[::ffff:127.0.0.1]".to_string()),
+            "the form Rust prints: {forms:?}"
+        );
+        assert!(
+            forms.contains(&"[::ffff:7f00:1]".to_string()),
+            "the form a browser sends: {forms:?}"
+        );
+
+        let bound: SocketAddr = "[::ffff:127.0.0.1]:3100".parse().unwrap();
+        let origins = effective_allowed_origins(None, bound);
+        assert!(origins.contains(&"http://[::ffff:127.0.0.1]:3100".to_string()));
+        assert!(origins.contains(&"http://[::ffff:7f00:1]:3100".to_string()));
+    }
+
+    /// Addresses whose spelling is not in dispute get exactly one form, so the
+    /// allow-list does not fill up with variants nobody sends.
+    #[test]
+    fn unambiguous_addresses_get_a_single_host_form() {
+        assert_eq!(
+            client_host_forms("127.0.0.1".parse().unwrap()),
+            vec!["127.0.0.1".to_string()]
+        );
+        assert_eq!(
+            client_host_forms("::1".parse().unwrap()),
+            vec!["[::1]".to_string()]
+        );
+    }
+
+    /// A configured list is passed through untouched, including the empty list
+    /// that means "do not validate" — `run_http` warns about that rather than
+    /// quietly repairing it, because silently substituting a default would make
+    /// the setting untrustworthy.
+    #[test]
+    fn effective_origins_pass_a_configured_list_through_unchanged() {
+        let bound: SocketAddr = "127.0.0.1:3100".parse().unwrap();
+        let configured = vec!["https://kb.example.com".to_string()];
+        assert_eq!(
+            effective_allowed_origins(Some(configured.clone()), bound),
+            configured,
+            "a configured list replaces the default; it is not extended by it"
+        );
+        assert!(
+            effective_allowed_origins(Some(vec![]), bound).is_empty(),
+            "an explicit empty list must survive so the startup warning can fire"
+        );
+    }
 
     /// (BU-21) A dual-stack listener reports an IPv4 client as
     /// `::ffff:a.b.c.d`, and `Ipv6Addr::is_loopback` only knows `::1`.

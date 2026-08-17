@@ -657,6 +657,17 @@ impl Config {
                      (restoring the loopback-only Host check)"
                 );
             }
+            // Same shape as `allowed_hosts`: dropping it restores the built-in
+            // loopback-only default, so the gate survives. Honouring it would
+            // let a config planted elsewhere name `https://attacker.example` --
+            // or an empty list, which turns Origin validation off entirely.
+            if http.allowed_origins.take().is_some() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    "ignoring [transport.http].allowed_origins from an untrusted config \
+                     (restoring the loopback-only Origin check)"
+                );
+            }
             if http.healthz_public.take().is_some() {
                 tracing::warn!(
                     config = %shown.display(),
@@ -1093,8 +1104,15 @@ pub(crate) fn classify_trust(
 }
 
 /// `SocketAddr` の IP が loopback でないか。
+///
+/// (codex P2 round 4 on PR #173 で報告された 2 箇所と同じ問い。**こちらは
+/// 報告に含まれていなかった**が、残すと 1 箇所だけ答えが違う状態になる。)
+/// 判定は crate 唯一の述語に委ねる — ここだけ `IpAddr::is_loopback` のままだと、
+/// 発見された config の `[::ffff:127.0.0.1]` が「ネットワーク公開」とみなされて
+/// 127.0.0.1 に降格される一方、同じアドレスを CLI から渡せば loopback として
+/// 通る、という食い違いになる。
 fn is_non_loopback(addr: &std::net::SocketAddr) -> bool {
-    !addr.ip().is_loopback()
+    !crate::transport::http::is_loopback_peer(addr.ip())
 }
 
 /// ディレクトリを指す環境変数を読む。**空文字は未設定として扱う** (BU-07)。
@@ -2862,6 +2880,76 @@ lambda = 0.5
             ),
             other => panic!("expected an HTTP transport, got {other:?}"),
         }
+    }
+
+    /// (1.0 blocker 4) A planted `allowed_origins` is dropped like
+    /// `allowed_hosts`. Two distinct attacks are shut here, which is why the
+    /// test asserts on the resolved value and not only on the parsed config:
+    /// naming an attacker origin, and — worse because it looks like a
+    /// simplification — writing `[]`, which is rmcp's encoding for "do not
+    /// validate Origin at all". Dropping the key restores the loopback default.
+    #[test]
+    fn an_untrusted_config_cannot_disable_the_origin_check() {
+        let dir = TempDir::new("groove-untrusted-origins");
+        let planted = format!(
+            "{}allowed_origins = [\"https://attacker.example\"]\n",
+            planted_toml("kb")
+        );
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+
+        let http = d
+            .config
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives");
+        assert!(
+            http.allowed_origins.is_none(),
+            "dropping allowed_origins restores the loopback-only Origin check"
+        );
+
+        // What reaches the runtime is `None`, which `run_http` turns into the
+        // loopback default -- not the planted origin.
+        let resolved =
+            crate::transport::Transport::resolve(None, None, None, d.config.transport.as_ref())
+                .expect("resolve ok");
+        match resolved {
+            crate::transport::Transport::Http {
+                allowed_origins, ..
+            } => assert!(
+                allowed_origins.is_none(),
+                "the planted origin must not reach the server"
+            ),
+            other => panic!("expected an HTTP transport, got {other:?}"),
+        }
+    }
+
+    /// An empty list is the dangerous one: it reads like "no restrictions
+    /// configured" but rmcp treats it as "skip Origin validation". It has to be
+    /// dropped for the same reason a hostile entry is.
+    #[test]
+    fn an_untrusted_config_cannot_blank_the_origin_list() {
+        let dir = TempDir::new("groove-untrusted-origins-empty");
+        let planted = format!("{}allowed_origins = []\n", planted_toml("kb"));
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let http = d
+            .config
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives");
+        assert!(
+            http.allowed_origins.is_none(),
+            "an empty planted list disables validation, so it must be dropped too"
+        );
     }
 
     /// The planted value must not be used — but dropping it, rather than

@@ -50,6 +50,25 @@ pub struct HttpTransportConfig {
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
 
+    /// ブラウザが付ける `Origin` ヘッダの allow-list。
+    /// `None` (省略) = **bind した port の loopback origin**
+    /// (`http://localhost:<port>` / `http://127.0.0.1:<port>` /
+    /// `http://[::1]:<port>`) を許可する。reverse proxy や別アプリ越しに
+    /// 公開するなら、**ブラウザが実際に送る公開 origin**
+    /// (`https://kb.example.com` 等) をここに明示する。
+    ///
+    /// MCP 仕様 2025-06-18 (Streamable HTTP / Security Warning) は
+    /// *"Servers **MUST** validate the `Origin` header on all incoming
+    /// connections to prevent DNS rebinding attacks"* と定めている。
+    /// rmcp の既定は空リスト = **検証しない** なので、既定値を空にはしない。
+    /// 空 `Vec` を明示すると検証は無効になる (起動時に warn を出す)。
+    ///
+    /// **認証ではない。** `Origin` を送らない要求 (MCP クライアント / tray /
+    /// curl) は RFC 6454 と rmcp の仕様どおり素通りする。これで防げるのは
+    /// 「利用者のブラウザに載った別サイトの JS」だけである。
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
+
     /// `/healthz` を `allowed_hosts` allow-list 配下に置くか (F-64)。
     /// `None` (省略) or `Some(true)` = 現行挙動 (`/healthz` は public、
     /// Host check なし)。`Some(false)` = `/healthz` も `allowed_hosts` で
@@ -96,6 +115,11 @@ pub enum Transport {
         /// `Some(vec)` = 明示 list (空 `Vec` を渡すと rmcp 側で全 Host
         /// 許可になる)。F-33 で `groove.toml` から surface した。
         allowed_hosts: Option<Vec<String>>,
+        /// `None` = bind した port の loopback origin を既定として組み立てる
+        /// ([`http::default_allowed_origins`](crate::transport::http::default_allowed_origins))。
+        /// `Some(vec)` = 明示 list。空 `Vec` は rmcp 側で **Origin 検証無効**
+        /// になるので、既定にはしない。
+        allowed_origins: Option<Vec<String>>,
         /// F-64: `/healthz` を `allowed_hosts` 検証配下に置くか。
         /// `true` (default) = 現行挙動 (Host check なし、public)。
         /// `false` = `/healthz` も Host check (= non-allowlisted から 403)。
@@ -146,6 +170,9 @@ impl Transport {
                 let allowed_hosts = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.allowed_hosts.clone());
+                let allowed_origins = cfg
+                    .and_then(|c| c.http.as_ref())
+                    .and_then(|h| h.allowed_origins.clone());
                 let healthz_public = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.healthz_public)
@@ -157,6 +184,7 @@ impl Transport {
                 Ok(Transport::Http {
                     addr,
                     allowed_hosts,
+                    allowed_origins,
                     healthz_public,
                     max_sessions,
                 })
@@ -207,6 +235,32 @@ fn resolve_http_addr(
 /// 実装しているから** (silent ignore は footgun という別の判断)。そちらの
 /// 方が原因を的確に言えるので、同じ入力に 2 つのエラー経路を作らない。
 /// つまり Stdio 分岐は防御的なもので、CLI 経由では到達しない。
+/// The refusal shown when a non-loopback bind is requested without `--i-know`.
+///
+/// **One implementation, two callers** (`groove serve` here and
+/// `groove service install`). They answer the same question, and the changelog
+/// promises the same text on both surfaces — a second copy would let the next
+/// wording or policy correction update only one of them, silently.
+///
+/// **ASCII only.** This is a diagnostic, so it goes to stderr, and on a Japanese
+/// Windows install that console is CP932 where non-ASCII arrives as mojibake.
+/// Writing it in Japanese would garble precisely the sentence that explains what
+/// is being exposed. (AGENTS.md, "Results go to stdout, diagnostics to stderr,
+/// and stderr stays ASCII".)
+///
+/// `bind` is `Display` rather than `SocketAddr` because `service install` holds
+/// the value as the string the user typed, and validates it separately.
+pub fn non_loopback_bind_refusal(bind: impl std::fmt::Display) -> String {
+    format!(
+        "bind {bind} is not a loopback address. groove has no authentication, so \
+         anything that can reach this port can read the entire knowledge base. \
+         (/mcp is covered by Host validation and a session cap; neither one \
+         authenticates the caller.) Use a non-loopback bind only when something \
+         else owns the network boundary -- a container's network isolation, a \
+         reverse proxy, or a firewall. Add --i-know to proceed anyway."
+    )
+}
+
 pub fn check_cli_bind_ack(
     transport: &Transport,
     cli_bind: Option<SocketAddr>,
@@ -218,13 +272,15 @@ pub fn check_cli_bind_ack(
     let Some(bind) = cli_bind else {
         return Ok(());
     };
-    if bind.ip().is_loopback() {
+    // (codex P2 round 3 on PR #173) The crate's one loopback predicate, not
+    // `IpAddr::is_loopback`. The difference is `::ffff:127.0.0.1`, which the
+    // admin router already treats as local (BU-21) — refusing to bind there
+    // without `--i-know` told the operator it was network exposure while the
+    // same address was being let into `/ui`.
+    if crate::transport::http::is_loopback_peer(bind.ip()) {
         return Ok(());
     }
-    anyhow::bail!(
-        "--bind {bind} は non-loopback です。groove は auth を持ちません — \
-         untrusted network での公開は危険。確認して進める場合は --i-know を付けて再実行してください。"
-    )
+    anyhow::bail!("{}", non_loopback_bind_refusal(bind))
 }
 
 // ===========================================================================
@@ -249,6 +305,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:3100".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -263,6 +320,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:4000".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -283,6 +341,7 @@ mod tests {
             Transport::Http {
                 addr: "0.0.0.0:9000".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -317,6 +376,7 @@ mod tests {
             Transport::Http {
                 addr: "127.0.0.1:5555".parse().unwrap(),
                 allowed_hosts: None,
+                allowed_origins: None,
                 healthz_public: true,
                 max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
             }
@@ -357,6 +417,7 @@ mod tests {
             Transport::Http {
                 addr,
                 allowed_hosts,
+                allowed_origins: _,
                 healthz_public: _,
                 max_sessions: _,
             } => {
@@ -369,6 +430,56 @@ mod tests {
                     ])
                 );
             }
+            _ => panic!("expected Transport::Http"),
+        }
+    }
+
+    /// (1.0 blocker 4) `[transport.http].allowed_origins` が toml で明示されたら
+    /// それがそのまま `Transport::Http` に渡る。proxy 越しに公開する構成では、
+    /// ブラウザが送るのは loopback ではなく公開 origin になるため、既定値では
+    /// 届かず、ここを通す経路が必要になる。
+    #[test]
+    fn test_resolve_config_allowed_origins_passes_through() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                allowed_origins: Some(vec!["https://kb.example.com".to_string()]),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        match t {
+            Transport::Http {
+                allowed_origins, ..
+            } => assert_eq!(
+                allowed_origins,
+                Some(vec!["https://kb.example.com".to_string()])
+            ),
+            _ => panic!("expected Transport::Http"),
+        }
+    }
+
+    /// 省略時は `None`。`run_http` がそこで **bind した port の loopback origin**
+    /// を組み立てる。`Some(vec![])` との違いが要点で、空 `Vec` は rmcp では
+    /// 「検証しない」を意味するため、省略の既定にしてはならない。
+    #[test]
+    fn test_resolve_config_omitted_allowed_origins_is_none_not_empty() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        match t {
+            Transport::Http {
+                allowed_origins, ..
+            } => assert_eq!(
+                allowed_origins, None,
+                "omission must stay None; Some(vec![]) would disable validation"
+            ),
             _ => panic!("expected Transport::Http"),
         }
     }
@@ -421,6 +532,182 @@ mod tests {
         assert_eq!(t, Transport::Stdio);
     }
 
+    /// (codex P1 round 1 on PR #173) The refusal is a diagnostic, so it goes to
+    /// stderr, and on a Japanese Windows console that is CP932 — non-ASCII would
+    /// arrive as mojibake and garble exactly the sentence explaining what is
+    /// exposed. AGENTS.md requires ASCII there; this pins it, because the text
+    /// is prose and prose is what drifts.
+    #[test]
+    fn the_non_loopback_refusal_is_ascii_only() {
+        let msg = non_loopback_bind_refusal("0.0.0.0:3100");
+        assert!(
+            msg.is_ascii(),
+            "stderr diagnostics must be ASCII (CP932 consoles); got: {msg}"
+        );
+        assert!(msg.contains("--i-know"), "the escape hatch must be named");
+        assert!(
+            msg.contains("read the entire knowledge base"),
+            "the refusal has to state the consequence, not just call it dangerous"
+        );
+    }
+
+    /// (codex P1 round 1 on PR #173) `groove serve` and `groove service install`
+    /// answer the same question, and the changelog promises the same text on
+    /// both. One implementation, so a later wording change cannot land on only
+    /// one surface (AGENTS.md, "One question gets one implementation").
+    #[test]
+    fn serve_and_service_install_refuse_with_the_same_text() {
+        let bind = "0.0.0.0:3100";
+        let from_serve = check_cli_bind_ack(&http_at(bind), Some(bind.parse().unwrap()), false)
+            .expect_err("non-loopback --bind must be refused without --i-know")
+            .to_string();
+        assert_eq!(
+            from_serve,
+            non_loopback_bind_refusal(bind),
+            "serve must render the shared refusal verbatim"
+        );
+    }
+
+    /// (codex P2 round 3 on PR #173) "Is this address loopback" now has one
+    /// answer. It had three, and they disagreed on `::ffff:127.0.0.1`: the admin
+    /// router let such a peer in (BU-21) while `serve` and `service install`
+    /// both called the same address network exposure and demanded `--i-know`.
+    ///
+    /// The mapped form is the case worth pinning — every other address the two
+    /// old predicates already agreed on, so a regression would show up here
+    /// first.
+    #[test]
+    fn the_bind_gate_uses_the_same_loopback_predicate_as_the_admin_router() {
+        use crate::transport::http::is_loopback_peer;
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:3100".parse().unwrap();
+        assert!(
+            is_loopback_peer(mapped.ip()),
+            "IPv4-mapped loopback is loopback; the admin router already says so"
+        );
+        assert!(
+            !mapped.ip().is_loopback(),
+            "std disagrees, which is exactly why the shared predicate exists"
+        );
+        check_cli_bind_ack(&http_at("[::ffff:127.0.0.1]:3100"), Some(mapped), false)
+            .expect("a mapped loopback bind must not demand --i-know");
+
+        // The answers that were never in dispute stay put.
+        for addr in ["127.0.0.1:3100", "127.0.0.2:3100", "[::1]:3100"] {
+            check_cli_bind_ack(&http_at(addr), Some(addr.parse().unwrap()), false)
+                .unwrap_or_else(|e| panic!("{addr} must be accepted as loopback: {e}"));
+        }
+        for addr in ["0.0.0.0:3100", "192.168.1.10:3100"] {
+            check_cli_bind_ack(&http_at(addr), Some(addr.parse().unwrap()), false)
+                .expect_err("a non-loopback bind must still require --i-know");
+        }
+    }
+
+    /// (codex P1 round 7 on PR #173) The loopback **alias set** gets the same
+    /// treatment as the loopback **predicate**: one definition, no copies.
+    /// Round 6 replaced the Origin literal and left the two in `server.rs`,
+    /// which is the half-state that keeps producing findings — an alias added
+    /// to the shared set would then be honoured by `/mcp` and refused by `/ui`.
+    ///
+    /// The scan is on the literal rather than the behaviour because the copy is
+    /// what drifts; a behavioural test would still pass on the day the copy is
+    /// made, and only fail later when someone edits one of them.
+    #[test]
+    fn the_loopback_alias_set_has_no_second_definition() {
+        use crate::transport::http::DEFAULT_LOOPBACK_HOSTS;
+        assert_eq!(
+            DEFAULT_LOOPBACK_HOSTS,
+            &["localhost", "127.0.0.1", "[::1]"],
+            "if this set changes on purpose, every list below follows it"
+        );
+        let server = include_str!("../server.rs");
+        assert!(
+            server.contains("DEFAULT_LOOPBACK_HOSTS"),
+            "server.rs must build its admin allow-list from the shared set"
+        );
+        for (n, line) in server.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains("\"localhost\""),
+                "server.rs:{} spells an alias out again; build it from \
+                 DEFAULT_LOOPBACK_HOSTS instead -- line was: {}",
+                n + 1,
+                line.trim()
+            );
+        }
+    }
+
+    /// (codex P2 round 4 on PR #173) Round 3 converted three call sites and
+    /// left three behind, which was worse than before: the gate said loopback
+    /// while the startup warning, the admin allow-list and the untrusted-config
+    /// downgrade said exposure. This scan is the thing that would have caught
+    /// it, so it exists now rather than after the next one.
+    ///
+    /// `is_loopback_peer`'s own body is the one legitimate `is_loopback()` —
+    /// it is the implementation — and this test's sibling asserts `std` still
+    /// disagrees about the mapped form, so both are excluded by line.
+    #[test]
+    fn no_call_site_answers_the_loopback_question_on_its_own() {
+        let sources = [
+            ("config.rs", include_str!("../config.rs")),
+            ("server.rs", include_str!("../server.rs")),
+            ("service/install.rs", include_str!("../service/install.rs")),
+            ("transport/http.rs", include_str!("http.rs")),
+        ];
+        for (name, src) in sources {
+            for (n, line) in src.lines().enumerate() {
+                let code = line.trim_start();
+                // Prose may name the std method while explaining why we do not
+                // call it; the scan is about call sites.
+                if code.starts_with("//") || !line.contains(".is_loopback()") {
+                    continue;
+                }
+                // Inside `is_loopback_peer` the calls ARE the implementation.
+                let inside_the_predicate = line.contains("v4.is_loopback()")
+                    || line.contains("v6.is_loopback()")
+                    || line.contains("Some(v4) =>")
+                    || line.contains("None =>");
+                assert!(
+                    inside_the_predicate,
+                    "{name}:{} calls is_loopback() directly; use \
+                     transport::http::is_loopback_peer so every surface agrees \
+                     about ::ffff:127.0.0.1 -- line was: {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// The other half of the same invariant, and the half a behavioural test
+    /// cannot reach cheaply: `service install` needs a registry / launchd write
+    /// to exercise, so scan its source instead. What must not exist is a second
+    /// copy of the prose — that is the thing that drifts.
+    #[test]
+    fn service_install_does_not_carry_its_own_copy_of_the_refusal() {
+        let install = include_str!("../service/install.rs");
+        assert!(
+            install.contains("non_loopback_bind_refusal"),
+            "service install must call the shared refusal"
+        );
+        assert!(
+            !install.contains("has no authentication, so"),
+            "service install must not inline the wording; call the shared fn"
+        );
+        // (codex P2 round 3 on PR #173) Same reasoning for the loopback test:
+        // install used a string-prefix predicate of its own, which is why it
+        // disagreed about `::ffff:127.0.0.1`.
+        assert!(
+            install.contains("is_loopback_peer"),
+            "service install must ask the shared loopback predicate"
+        );
+        assert!(
+            !install.contains("starts_with(\"127.\")"),
+            "no private loopback predicate in install.rs; it drifts from the router"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // BU-01: `serve --bind <non-loopback>` requires `--i-know`.
     // -----------------------------------------------------------------------
@@ -430,6 +717,7 @@ mod tests {
         Transport::Http {
             addr: addr.parse().unwrap(),
             allowed_hosts: None,
+            allowed_origins: None,
             healthz_public: true,
             max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
         }

@@ -2634,7 +2634,13 @@ impl KbServerShared {
             watcher_active: Arc::new(AtomicBool::new(false)),
             watcher_debounce_ms: 500,
             config_source_label: "TestStub".into(),
-            allowed_admin_hosts: vec!["127.0.0.1".into(), "::1".into(), "localhost".into()],
+            // (codex P1 round 7 on PR #173) Shared alias set, not a copy — a
+            // test stub that disagrees with production about which local names
+            // count is a test that passes for the wrong reason.
+            allowed_admin_hosts: crate::transport::http::DEFAULT_LOOPBACK_HOSTS
+                .iter()
+                .map(|h| (*h).to_string())
+                .collect(),
         }
     }
 }
@@ -2710,27 +2716,46 @@ pub async fn run_server(
     let watcher_active = Arc::new(AtomicBool::new(false));
     let watcher_debounce_ms = watch_config.debounce_ms;
     let allowed_admin_hosts = {
-        let mut hosts = vec![
-            "127.0.0.1".to_string(),
-            "::1".to_string(),
-            "localhost".to_string(),
-        ];
+        // (codex P1 round 7 on PR #173) The same alias set `/healthz` Host
+        // validation and the `/mcp` Origin defaults use. Round 6 replaced the
+        // Origin copy and left this one, which is the worse half-state: an alias
+        // added to the shared set would be accepted by `/mcp` and refused by
+        // `/ui` — the two surfaces disagreeing about one browser.
+        let mut hosts: Vec<String> = crate::transport::http::DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .map(|h| (*h).to_string())
+            .collect();
         // codex P1 round 4 on PR #57: only include the bind addr when it is
         // a loopback IP. Otherwise a non-loopback bind (e.g. 192.168.1.10:3100
         // or 0.0.0.0:3100) would let LAN browsers reach /ui + /api/admin/status
         // via the bind addr Host header — that contradicts the spec § 7
         // "admin is loopback-only" decision and the install-time Note that
         // promises LAN browsers see 403.
+        // (codex P2 round 4 on PR #173) Shared predicate. With
+        // `IpAddr::is_loopback` here, a `[::ffff:127.0.0.1]` bind — which the
+        // CLI now accepts as loopback — was left out of the allow-list, so the
+        // operator's own Host got 403 from the admin routes.
         if let crate::transport::Transport::Http { addr, .. } = &transport
-            && addr.ip().is_loopback()
+            && crate::transport::http::is_loopback_peer(addr.ip())
         {
-            let bind_str = addr.to_string();
-            let ip_str = addr.ip().to_string();
-            if !hosts.contains(&bind_str) {
-                hosts.push(bind_str);
-            }
-            if !hosts.contains(&ip_str) {
-                hosts.push(ip_str);
+            // (codex P2 round 5 on PR #173) Every spelling a client might use
+            // for this address, not just the one Rust prints. `Ipv6Addr`'s
+            // Display renders an IPv4-mapped address in the dotted form
+            // (`::ffff:127.0.0.1`) while the WHATWG URL serializer browsers use
+            // emits hex pieces (`::ffff:7f00:1`). `NormalizedAuthority` only
+            // strips brackets and lowercases, so it cannot bridge the two, and
+            // whichever one we omitted would 403.
+            for host in crate::transport::http::client_host_forms(addr.ip()) {
+                // Both `host:port` and the bare host: the allow-list is matched
+                // with the port stripped, and the fallback path in
+                // `NormalizedAuthority::from_allowed_entry` accepts an
+                // unbracketed IPv6 entry too.
+                let bare = host.trim_matches(['[', ']']).to_string();
+                for entry in [format!("{host}:{}", addr.port()), bare] {
+                    if !hosts.contains(&entry) {
+                        hosts.push(entry);
+                    }
+                }
             }
         }
         hosts
@@ -2786,6 +2811,7 @@ pub async fn run_server(
         crate::transport::Transport::Http {
             addr,
             allowed_hosts,
+            allowed_origins,
             healthz_public,
             max_sessions,
         } => {
@@ -2794,6 +2820,7 @@ pub async fn run_server(
             crate::transport::http::run_http(
                 addr,
                 allowed_hosts,
+                allowed_origins,
                 healthz_public,
                 max_sessions,
                 shared,
