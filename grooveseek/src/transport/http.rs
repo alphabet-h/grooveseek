@@ -93,11 +93,79 @@ const _: () = assert!(
 /// その時ブラウザが送る origin は loopback ではなく公開ホスト名になるから。
 /// その構成では `[transport.http].allowed_origins` に公開 origin を明示する。
 pub fn default_allowed_origins(port: u16) -> Vec<String> {
-    vec![
-        format!("http://localhost:{port}"),
-        format!("http://127.0.0.1:{port}"),
-        format!("http://[::1]:{port}"),
-    ]
+    ["localhost", "127.0.0.1", "[::1]"]
+        .into_iter()
+        .flat_map(|host| origins_for_host(host, port))
+        .collect()
+}
+
+/// `http` の既定ポート。RFC 6454 の origin 直列化はこれを**省く**。
+const HTTP_DEFAULT_PORT: u16 = 80;
+
+/// 1 つの host 表記に対して、クライアントが送りうる origin をすべて返す。
+///
+/// **規則は 1 つ**: 「bind したアドレスに対して相手が使いうる綴りは全部載せる」。
+/// 綴りが違うだけの同一 origin なので、許可範囲は広がらない — 広がるのは
+/// 「一致しなくて 403、しかも原因が見えない」を避けられる範囲だけ。
+///
+/// port 80 で 2 つ返すのがその適用例。RFC 6454 は既定ポートを origin から省くので、
+/// **port 80 のサーバにブラウザが送るのは `http://127.0.0.1` であって
+/// `http://127.0.0.1:80` ではない** (codex P2 round 5 on PR #173)。
+fn origins_for_host(host: &str, port: u16) -> Vec<String> {
+    if port == HTTP_DEFAULT_PORT {
+        vec![format!("http://{host}"), format!("http://{host}:{port}")]
+    } else {
+        vec![format!("http://{host}:{port}")]
+    }
+}
+
+/// bind したアドレスに対して、クライアントが `Host` / `Origin` に載せうる
+/// host 表記をすべて返す (IPv6 は bracket 付き、`:port` を連結できる形)。
+///
+/// **綴りが 1 つに決まらないため。** 実測 (2026-08-17):
+///
+/// ```text
+/// Rust の Ipv6Addr::to_string()  ::ffff:127.0.0.1   <- dotted (IPv4-mapped 特例)
+/// WHATWG URL の直列化            ::ffff:7f00:1      <- hex piece、ブラウザはこちら
+/// ```
+///
+/// どちらも同じアドレスで、どちらも誤りではない。片方に賭けると、賭けを外した側の
+/// クライアントが 403 を受け取る — しかも `Host` 側の正規化
+/// ([`NormalizedAuthority`]) は bracket 剥がしと小文字化しかせず、IPv6 を
+/// 再直列化しないので救われない。**だから両方載せる**
+/// (codex P2 round 5 on PR #173)。
+///
+/// **到達性の実測 (2026-08-17、Windows)**: `--bind [::ffff:127.0.0.1]:3196` は
+/// OS が `WSAEADDRNOTAVAIL` (os error 10049) で拒否する。つまり Windows では
+/// 「mapped アドレスに bind したサーバ」は作れない。ここを整えているのは
+/// ① 他 OS の挙動を測っていない ② `is_loopback_peer` は **peer** 側 (BU-21 =
+/// dual-stack listener が IPv4 クライアントを `::ffff:a.b.c.d` として報告する、
+/// 実在する経路) でも使う、の 2 点による。**この分岐が Windows で発火する
+/// 経路は現時点で見つかっていない**と分かった上で残している。
+///
+/// 分岐が IPv4-mapped だけなのは、綴りが割れるのがそこだけだからである。
+/// IPv4-compatible (`::a.b.c.d`) も Rust は dotted で出すが、
+/// [`is_loopback_peer`] が意図的に unwrap しないので loopback 判定に通らず、
+/// この一覧に載る経路が無い。
+pub(crate) fn client_host_forms(ip: std::net::IpAddr) -> Vec<String> {
+    match ip {
+        std::net::IpAddr::V4(v4) => vec![v4.to_string()],
+        std::net::IpAddr::V6(v6) => {
+            let mut forms = vec![format!("[{v6}]")];
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                let o = v4.octets();
+                let hex = format!(
+                    "[::ffff:{:x}:{:x}]",
+                    u16::from_be_bytes([o[0], o[1]]),
+                    u16::from_be_bytes([o[2], o[3]])
+                );
+                if !forms.contains(&hex) {
+                    forms.push(hex);
+                }
+            }
+            forms
+        }
+    }
 }
 
 /// 設定値と **実際に bind したアドレス** から、有効な `Origin` allow-list を決める。
@@ -136,14 +204,12 @@ pub(crate) fn effective_allowed_origins(
     let Some(list) = configured else {
         let mut origins = default_allowed_origins(bound.port());
         if is_loopback_peer(bound.ip()) {
-            let host = match bound.ip() {
-                std::net::IpAddr::V4(v4) => v4.to_string(),
-                // RFC 6454 の origin シリアライズに合わせて角括弧を付ける。
-                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-            };
-            let entry = format!("http://{host}:{}", bound.port());
-            if !origins.contains(&entry) {
-                origins.push(entry);
+            for host in client_host_forms(bound.ip()) {
+                for entry in origins_for_host(&host, bound.port()) {
+                    if !origins.contains(&entry) {
+                        origins.push(entry);
+                    }
+                }
             }
         }
         return origins;
@@ -1356,6 +1422,67 @@ mod tests {
             effective_allowed_origins(None, wildcard),
             default_allowed_origins(3100),
             "a non-loopback bind must not widen the allow-list"
+        );
+    }
+
+    /// (codex P2 round 5 on PR #173) RFC 6454 omits the default port when it
+    /// serializes an origin, so a server on port 80 is reached by a browser
+    /// sending `http://127.0.0.1` — with no `:80` at all. Listing only the
+    /// explicit form would 403 every same-origin request the built-in page
+    /// makes. Both spellings are listed; they are the same origin.
+    #[test]
+    fn port_80_origins_include_the_form_a_browser_actually_sends() {
+        let origins = default_allowed_origins(80);
+        assert!(
+            origins.contains(&"http://127.0.0.1".to_string()),
+            "the RFC serialization drops :80, and that is what arrives: {origins:?}"
+        );
+        assert!(origins.contains(&"http://localhost".to_string()));
+        assert!(origins.contains(&"http://[::1]".to_string()));
+        // The explicit form is kept as well, for anything that sends it.
+        assert!(origins.contains(&"http://127.0.0.1:80".to_string()));
+
+        // Every other port keeps exactly one spelling -- 8080 is not special.
+        let other = default_allowed_origins(8080);
+        assert_eq!(other.len(), 3, "no extra entries off the default port");
+        assert!(other.iter().all(|o| o.ends_with(":8080")));
+    }
+
+    /// (codex P2 round 5 on PR #173) The two serializers disagree about
+    /// IPv4-mapped IPv6, and the disagreement was measured rather than assumed:
+    /// `Ipv6Addr::to_string()` gives `::ffff:127.0.0.1`, the WHATWG URL
+    /// serializer gives `::ffff:7f00:1`. Both spellings name the same address,
+    /// and `NormalizedAuthority` cannot bridge them because it only strips
+    /// brackets and lowercases — so both have to be on the list.
+    #[test]
+    fn a_mapped_loopback_bind_is_listed_in_both_spellings() {
+        let forms = client_host_forms("::ffff:127.0.0.1".parse().unwrap());
+        assert!(
+            forms.contains(&"[::ffff:127.0.0.1]".to_string()),
+            "the form Rust prints: {forms:?}"
+        );
+        assert!(
+            forms.contains(&"[::ffff:7f00:1]".to_string()),
+            "the form a browser sends: {forms:?}"
+        );
+
+        let bound: SocketAddr = "[::ffff:127.0.0.1]:3100".parse().unwrap();
+        let origins = effective_allowed_origins(None, bound);
+        assert!(origins.contains(&"http://[::ffff:127.0.0.1]:3100".to_string()));
+        assert!(origins.contains(&"http://[::ffff:7f00:1]:3100".to_string()));
+    }
+
+    /// Addresses whose spelling is not in dispute get exactly one form, so the
+    /// allow-list does not fill up with variants nobody sends.
+    #[test]
+    fn unambiguous_addresses_get_a_single_host_form() {
+        assert_eq!(
+            client_host_forms("127.0.0.1".parse().unwrap()),
+            vec!["127.0.0.1".to_string()]
+        );
+        assert_eq!(
+            client_host_forms("::1".parse().unwrap()),
+            vec!["[::1]".to_string()]
         );
     }
 

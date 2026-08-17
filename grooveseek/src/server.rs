@@ -2728,13 +2728,24 @@ pub async fn run_server(
         if let crate::transport::Transport::Http { addr, .. } = &transport
             && crate::transport::http::is_loopback_peer(addr.ip())
         {
-            let bind_str = addr.to_string();
-            let ip_str = addr.ip().to_string();
-            if !hosts.contains(&bind_str) {
-                hosts.push(bind_str);
-            }
-            if !hosts.contains(&ip_str) {
-                hosts.push(ip_str);
+            // (codex P2 round 5 on PR #173) Every spelling a client might use
+            // for this address, not just the one Rust prints. `Ipv6Addr`'s
+            // Display renders an IPv4-mapped address in the dotted form
+            // (`::ffff:127.0.0.1`) while the WHATWG URL serializer browsers use
+            // emits hex pieces (`::ffff:7f00:1`). `NormalizedAuthority` only
+            // strips brackets and lowercases, so it cannot bridge the two, and
+            // whichever one we omitted would 403.
+            for host in crate::transport::http::client_host_forms(addr.ip()) {
+                // Both `host:port` and the bare host: the allow-list is matched
+                // with the port stripped, and the fallback path in
+                // `NormalizedAuthority::from_allowed_entry` accepts an
+                // unbracketed IPv6 entry too.
+                let bare = host.trim_matches(['[', ']']).to_string();
+                for entry in [format!("{host}:{}", addr.port()), bare] {
+                    if !hosts.contains(&entry) {
+                        hosts.push(entry);
+                    }
+                }
             }
         }
         hosts
