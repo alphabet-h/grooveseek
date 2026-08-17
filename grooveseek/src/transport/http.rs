@@ -100,6 +100,20 @@ pub fn default_allowed_origins(port: u16) -> Vec<String> {
     ]
 }
 
+/// 設定値と **実際に bind した port** から、有効な `Origin` allow-list を決める。
+///
+/// `bound_port` を取るのが要点で、`addr.port()` を渡してはいけない。
+/// `--bind 127.0.0.1:0` は「OS に選ばせる」意味なので、要求値から既定を組むと
+/// `http://127.0.0.1:0` — **ブラウザが決して送れない origin** — だけを許可した
+/// 状態になり、実際に割り当てられた port からの要求が 403 になる
+/// (codex P2 round 1 on PR #173)。
+pub(crate) fn effective_allowed_origins(
+    configured: Option<Vec<String>>,
+    bound_port: u16,
+) -> Vec<String> {
+    configured.unwrap_or_else(|| default_allowed_origins(bound_port))
+}
+
 /// 上限に達した時に `Retry-After` で返す秒数。
 ///
 /// **見込みであって保証ではない**。空きが出るのは他のクライアントが切れた時か、
@@ -476,7 +490,19 @@ pub async fn run_http(
     // per RFC 6454 and rmcp, a request that carries no `Origin` header still
     // passes. MCP clients, the tray and curl send none. What it stops is a web
     // page in the operator's own browser reaching this port cross-origin.
-    let origins = allowed_origins.unwrap_or_else(|| default_allowed_origins(addr.port()));
+    // (codex P1 round 1 on PR #173) Bind before deriving the default. The port
+    // that matters is the one the OS actually assigned: `--bind 127.0.0.1:0`
+    // asks it to choose, so a default built from `addr` would allow `:0` — an
+    // origin no browser can ever send — and answer 403 to the real one.
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "failed to bind {addr}: is another groove instance running, or the \
+                 port occupied?"
+        )
+    })?;
+    let bound = listener.local_addr().unwrap_or(addr);
+
+    let origins = effective_allowed_origins(allowed_origins, bound.port());
     if origins.is_empty() {
         tracing::warn!(
             "[transport.http].allowed_origins is empty, which disables Origin \
@@ -545,12 +571,6 @@ pub async fn run_http(
             REQUEST_BODY_MAX_BYTES,
         ));
 
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
-        format!(
-            "failed to bind {addr}: is another groove instance running, or the \
-                 port occupied?"
-        )
-    })?;
     eprintln!(
         "groove server ready (http transport, listening on {})",
         listener.local_addr().unwrap_or(addr)
@@ -1215,6 +1235,47 @@ mod tests {
         let origins = default_allowed_origins(4242);
         assert!(origins.iter().all(|o| o.ends_with(":4242")));
         assert!(origins.contains(&"http://[::1]:4242".to_string()));
+    }
+
+    /// (codex P2 round 1 on PR #173) The default must be built from the port
+    /// that was **bound**, not the one that was requested. `--bind 127.0.0.1:0`
+    /// hands port selection to the OS, so deriving from the request would allow
+    /// only `http://127.0.0.1:0` — which no browser can send — and 403 the real
+    /// port. `run_http` binds first and passes `listener.local_addr().port()`,
+    /// and this pins the arithmetic that would otherwise regress silently.
+    #[test]
+    fn effective_origins_use_the_assigned_port_not_the_requested_one() {
+        let requested_port = 0u16;
+        let assigned_port = 51234u16;
+        let origins = effective_allowed_origins(None, assigned_port);
+        assert!(
+            origins.iter().all(|o| o.ends_with(":51234")),
+            "origins must name the assigned port, got {origins:?}"
+        );
+        assert!(
+            !origins
+                .iter()
+                .any(|o| o.ends_with(&format!(":{requested_port}"))),
+            "port 0 must never reach the allow-list: {origins:?}"
+        );
+    }
+
+    /// A configured list is passed through untouched, including the empty list
+    /// that means "do not validate" — `run_http` warns about that rather than
+    /// quietly repairing it, because silently substituting a default would make
+    /// the setting untrustworthy.
+    #[test]
+    fn effective_origins_pass_a_configured_list_through_unchanged() {
+        let configured = vec!["https://kb.example.com".to_string()];
+        assert_eq!(
+            effective_allowed_origins(Some(configured.clone()), 3100),
+            configured,
+            "a configured list replaces the default; it is not extended by it"
+        );
+        assert!(
+            effective_allowed_origins(Some(vec![]), 3100).is_empty(),
+            "an explicit empty list must survive so the startup warning can fire"
+        );
     }
 
     /// (BU-21) A dual-stack listener reports an IPv4 client as

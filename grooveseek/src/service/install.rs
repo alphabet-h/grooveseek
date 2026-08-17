@@ -51,15 +51,12 @@ pub(crate) fn run_with_backend(
     })?;
 
     if !is_loopback_addr(&params.bind) && !params.i_know_non_loopback {
+        // (codex P1 round 1 on PR #173) Shared with `groove serve`. Both are
+        // answering "may this bind go on the network?", so the wording lives in
+        // one place -- see `transport::non_loopback_bind_refusal`.
         return Err(anyhow!(
-            "bind={} は non-loopback です。groove は認証を持ちません。\
-             このポートに到達できる相手は、ナレッジベース全文を無資格で読めます \
-             (/mcp に掛かっているのは Host 検証と session 数の上限だけで、認証ではありません)。\
-             ネットワーク境界を別のもの \
-             (コンテナのネットワーク分離 / reverse proxy / ファイアウォール) が\
-             担っている場合にだけ使ってください。\
-             承知の上で進めるなら --i-know を付けて再実行してください。",
-            params.bind
+            "{}",
+            crate::transport::non_loopback_bind_refusal(&params.bind)
         ));
     }
     // (codex P2 round 3 on PR #57, design clarification) Loopback-only admin

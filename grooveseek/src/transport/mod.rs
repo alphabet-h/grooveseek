@@ -235,6 +235,32 @@ fn resolve_http_addr(
 /// 実装しているから** (silent ignore は footgun という別の判断)。そちらの
 /// 方が原因を的確に言えるので、同じ入力に 2 つのエラー経路を作らない。
 /// つまり Stdio 分岐は防御的なもので、CLI 経由では到達しない。
+/// The refusal shown when a non-loopback bind is requested without `--i-know`.
+///
+/// **One implementation, two callers** (`groove serve` here and
+/// `groove service install`). They answer the same question, and the changelog
+/// promises the same text on both surfaces — a second copy would let the next
+/// wording or policy correction update only one of them, silently.
+///
+/// **ASCII only.** This is a diagnostic, so it goes to stderr, and on a Japanese
+/// Windows install that console is CP932 where non-ASCII arrives as mojibake.
+/// Writing it in Japanese would garble precisely the sentence that explains what
+/// is being exposed. (AGENTS.md, "Results go to stdout, diagnostics to stderr,
+/// and stderr stays ASCII".)
+///
+/// `bind` is `Display` rather than `SocketAddr` because `service install` holds
+/// the value as the string the user typed, and validates it separately.
+pub fn non_loopback_bind_refusal(bind: impl std::fmt::Display) -> String {
+    format!(
+        "bind {bind} is not a loopback address. groove has no authentication, so \
+         anything that can reach this port can read the entire knowledge base. \
+         (/mcp is covered by Host validation and a session cap; neither one \
+         authenticates the caller.) Use a non-loopback bind only when something \
+         else owns the network boundary -- a container's network isolation, a \
+         reverse proxy, or a firewall. Add --i-know to proceed anyway."
+    )
+}
+
 pub fn check_cli_bind_ack(
     transport: &Transport,
     cli_bind: Option<SocketAddr>,
@@ -249,15 +275,7 @@ pub fn check_cli_bind_ack(
     if bind.ip().is_loopback() {
         return Ok(());
     }
-    anyhow::bail!(
-        "--bind {bind} は non-loopback です。groove は認証を持ちません。\
-         このポートに到達できる相手は、ナレッジベース全文を無資格で読めます \
-         (/mcp に掛かっているのは Host 検証と session 数の上限だけで、認証ではありません)。\
-         ネットワーク境界を別のもの \
-         (コンテナのネットワーク分離 / reverse proxy / ファイアウォール) が\
-         担っている場合にだけ使ってください。\
-         承知の上で進めるなら --i-know を付けて再実行してください。"
-    )
+    anyhow::bail!("{}", non_loopback_bind_refusal(bind))
 }
 
 // ===========================================================================
@@ -507,6 +525,59 @@ mod tests {
         };
         let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
         assert_eq!(t, Transport::Stdio);
+    }
+
+    /// (codex P1 round 1 on PR #173) The refusal is a diagnostic, so it goes to
+    /// stderr, and on a Japanese Windows console that is CP932 — non-ASCII would
+    /// arrive as mojibake and garble exactly the sentence explaining what is
+    /// exposed. AGENTS.md requires ASCII there; this pins it, because the text
+    /// is prose and prose is what drifts.
+    #[test]
+    fn the_non_loopback_refusal_is_ascii_only() {
+        let msg = non_loopback_bind_refusal("0.0.0.0:3100");
+        assert!(
+            msg.is_ascii(),
+            "stderr diagnostics must be ASCII (CP932 consoles); got: {msg}"
+        );
+        assert!(msg.contains("--i-know"), "the escape hatch must be named");
+        assert!(
+            msg.contains("read the entire knowledge base"),
+            "the refusal has to state the consequence, not just call it dangerous"
+        );
+    }
+
+    /// (codex P1 round 1 on PR #173) `groove serve` and `groove service install`
+    /// answer the same question, and the changelog promises the same text on
+    /// both. One implementation, so a later wording change cannot land on only
+    /// one surface (AGENTS.md, "One question gets one implementation").
+    #[test]
+    fn serve_and_service_install_refuse_with_the_same_text() {
+        let bind = "0.0.0.0:3100";
+        let from_serve = check_cli_bind_ack(&http_at(bind), Some(bind.parse().unwrap()), false)
+            .expect_err("non-loopback --bind must be refused without --i-know")
+            .to_string();
+        assert_eq!(
+            from_serve,
+            non_loopback_bind_refusal(bind),
+            "serve must render the shared refusal verbatim"
+        );
+    }
+
+    /// The other half of the same invariant, and the half a behavioural test
+    /// cannot reach cheaply: `service install` needs a registry / launchd write
+    /// to exercise, so scan its source instead. What must not exist is a second
+    /// copy of the prose — that is the thing that drifts.
+    #[test]
+    fn service_install_does_not_carry_its_own_copy_of_the_refusal() {
+        let install = include_str!("../service/install.rs");
+        assert!(
+            install.contains("non_loopback_bind_refusal"),
+            "service install must call the shared refusal"
+        );
+        assert!(
+            !install.contains("has no authentication, so"),
+            "service install must not inline the wording; call the shared fn"
+        );
     }
 
     // -----------------------------------------------------------------------
