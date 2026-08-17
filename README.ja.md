@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-dark.svg">
-  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-light.svg" alt="" width="56" height="56">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-dark.png">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-light.png" alt="" width="56" height="56">
 </picture>
 
 # GrooveSeek

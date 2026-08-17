@@ -44,6 +44,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Images are referenced by absolute URL rather than repository-relative path,
   because a release archive ships this README without `assets/` — the same
   reason the documentation links were made absolute in the previous change.
+  They point at PNG renders rather than the SVG sources: an absolute URL
+  resolves to `raw.githubusercontent.com`, which is reported to serve `.svg` as
+  `text/plain` so an `<img>` will not render it, and the screenshots are PNG in
+  any case. `assets/README.md` records the reasoning and how to regenerate.
 
 ### Changed
 
