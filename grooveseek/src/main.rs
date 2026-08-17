@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
                   Any of the options below can be provided via `groove.toml`. The file\n\
                   is discovered in priority order: --config <PATH>, then ./groove.toml,\n\
                   then walking up to the .git ancestor, then alongside the binary.\n\
-                  CLI arguments override the file. See docs/configuration.md."
+                  CLI arguments override the file. Full reference (a release\n\
+                  archive ships the binary and README.md, not docs/):\n\
+                  https://github.com/alphabet-h/grooveseek/blob/main/docs/configuration.md"
 )]
 struct Cli {
     /// Path to a `groove.toml` config file. Overrides discovery (CWD / .git

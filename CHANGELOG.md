@@ -44,6 +44,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   anchors are unchanged, only the file is. Everything inside the repository
   that referenced them was updated in the same commit.
 
+  Two things are read outside the repository and were handled separately: a
+  release archive ships the binary and this README but no `docs/`, so the
+  Documentation section says so and gives an absolute URL, and `groove --help`
+  now names that URL rather than a path the reader may not have.
+
 - **`/ui` is the operator's view of their own server, and it searches through
   `/mcp`.** It shows a status band — version, documents, chunks, model, watcher,
   uptime, pid, indexing progress — over a search box, replacing a placeholder
