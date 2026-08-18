@@ -617,8 +617,11 @@ impl KbCore {
         };
 
         let mut reranker_guard = recover(self.reranker.lock(), "reranker");
-        let use_rerank =
-            params.rerank.unwrap_or(self.rerank_by_default) && reranker_guard.is_some();
+        let use_rerank = should_rerank(
+            params.rerank,
+            Some(self.rerank_by_default),
+            reranker_guard.is_some(),
+        );
 
         let effective_min_quality = crate::quality::resolve_effective_threshold(
             params.include_low_quality.unwrap_or(false),
@@ -1837,6 +1840,39 @@ pub fn compile_path_globs(patterns: &[String]) -> anyhow::Result<crate::db::Comp
 /// 実装は MMR off / on どちらでも同一結果を返す (NaN は std::f32 の
 /// `partial_cmp` 順守、`fold(NEG_INFINITY, f32::max)` で安定)。
 ///
+/// What `rerank_by_default` means when nobody sets it.
+///
+/// Named rather than spelled `true` at each site: `serve` resolves the standing
+/// value, [`should_rerank`] falls back to it, and the documentation states it.
+/// Three copies of a bare literal are three chances to disagree.
+pub const RERANK_BY_DEFAULT: bool = true;
+
+/// Whether one search reranks — decided here for both surfaces.
+///
+/// The two surfaces express the per-call override differently: over MCP it is
+/// the `rerank` parameter, and on the command line it is naming a model with
+/// `--reranker`, which says "for this query" the way every other CLI argument
+/// does. What they must not do is disagree about what an override *means*, or
+/// about what happens when there is none — which is exactly what had happened:
+/// the CLI reranked whenever a reranker was configured and never read
+/// `rerank_by_default` at all, so one `groove.toml` produced two answers.
+///
+/// So each caller converts its own spelling into `per_call`, and the rest of
+/// the decision is this expression.
+///
+/// - `per_call` — this query's override, or `None` to take the standing value.
+/// - `standing` — the `rerank_by_default` key, or `None` for
+///   [`RERANK_BY_DEFAULT`].
+/// - `reranker_available` — whether a reranker exists to run at all. Last,
+///   because no override can conjure one.
+pub fn should_rerank(
+    per_call: Option<bool>,
+    standing: Option<bool>,
+    reranker_available: bool,
+) -> bool {
+    per_call.unwrap_or(standing.unwrap_or(RERANK_BY_DEFAULT)) && reranker_available
+}
+
 /// `pub` (lib crate API) で CLI (`src/main.rs`) / benches からも再利用できるようにしておく。
 pub fn compute_low_confidence(scores: &[f32], min_ratio: f32) -> bool {
     if scores.len() < 2 || min_ratio == 0.0 {
@@ -3767,6 +3803,40 @@ mod tests {
              \"highlight everything\"",
             content.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // should_rerank: the one decision both search surfaces make
+    // -----------------------------------------------------------------------
+
+    /// The whole truth table, because the two surfaces reach this from
+    /// different spellings and the point of the function is that they land in
+    /// the same place. `groove search` translates "`--reranker` was named" into
+    /// `Some(true)`; the tool passes its `rerank` parameter straight through.
+    #[test]
+    fn a_per_call_override_beats_the_standing_default_either_way() {
+        assert!(should_rerank(Some(true), Some(false), true));
+        assert!(!should_rerank(Some(false), Some(true), true));
+    }
+
+    #[test]
+    fn without_an_override_the_standing_default_decides_and_absent_means_on() {
+        assert!(should_rerank(None, Some(true), true));
+        assert!(!should_rerank(None, Some(false), true));
+        // No standing value either: RERANK_BY_DEFAULT decides, and it is on.
+        assert!(should_rerank(None, None, true));
+    }
+
+    #[test]
+    fn nothing_reranks_when_no_reranker_was_loaded() {
+        for per_call in [None, Some(true), Some(false)] {
+            for standing in [None, Some(true), Some(false)] {
+                assert!(
+                    !should_rerank(per_call, standing, false),
+                    "no override may conjure a reranker: {per_call:?} / {standing:?}"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

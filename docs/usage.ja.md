@@ -74,6 +74,8 @@ groove serve --kb-path ... --no-watch                           # ライブ同�
 
 再ランクのレイテンシコストは、CPU で `bge-v2-m3` を 50 候補に適用した場合 1 クエリあたり約 300–700 ms。`--rerank-by-default <BOOL>` (`--reranker` 指定時は既定 on) はすべての `search` 呼び出しで再ランクするかを制御する。**値を取るフラグ**なので、無効化は `--rerank-by-default=false` と書く。MCP ツール側は `rerank: Option<bool>` で per-query 上書き可能。reranker の切替に**再インデックスは不要** (index 非依存)。
 
+v0.27.0 以降、`rerank_by_default` は `groove search` も読む。同じ `groove.toml` で「CLI は再ランクするがサーバはしない」という食い違いは起きない。コマンドライン側の per-query 上書きは `--reranker` そのもので、モデルを明示すればファイルが `false` でもそのクエリだけ再ランクし、`--reranker none` ならそのクエリだけ切れる (`groove eval` は意図的にこのキーを読まない — 測るのは `--reranker` が選んだパイプラインで、run fingerprint もそのモデルを記録するため、黙って別物を測ってはいけない)。
+
 ### 再ランクを有効にすべきケース
 
 再ランクは精度とレイテンシのトレードオフ。使用パターン次第:
@@ -82,7 +84,7 @@ groove serve --kb-path ... --no-watch                           # ライブ同�
 |---|---|
 | 対話的エージェントフロー (LLM が 1 ターンで 2–5 回 `search` を呼ぶ) | **切っておく**。+500 ms × N が積もって重くなる。BGE-M3 + 見出し加重 bm25 の検索品質で大抵十分 |
 | 精度重視の単発クエリ (調査・定義的回答) | **有効化**。レイテンシ税は 1 ターンに 1 回、cross-encoder が意味的に関連する候補を明確に前に出す |
-| 混在 | `rerank_by_default = false` で始め、呼び出し側が MCP ツールの `rerank: true` パラメータで個別に選べるようにする |
+| 混在 | `rerank_by_default = false` で始め、呼び出し側が個別に選べるようにする — MCP ツールの `rerank: true`、コマンドラインなら `--reranker <model>` |
 
 再ランクを入れるべきサイン:
 
@@ -219,9 +221,9 @@ groove search "tokio spawn" \
 - `--tag-any <a,b,c>` — チャンクが**いずれか**のタグを持つときのみ通過。MCP param: `tags_any`
 - `--tag-all <a,b,c>` — チャンクが**すべての**タグを持つときのみ通過。MCP param: `tags_all`
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — 辞書順比較。どちらかが指定された場合、`date` 未設定のチャンクは厳密に除外される。MCP params: `date_from` / `date_to`
-- `--min-confidence-ratio <N>` — `low_confidence` 閾値の per-query 上書き
+- `--min-confidence-ratio <N>` — `low_confidence` 閾値の per-query 上書き。**有限かつ `>= 0.0`** であること。判定を切るのは `0.0`。それ以外の値は CLI がモデル読み込みの前に弾く — 非有限値はどのスコアと比較しても false になり、**閾値をきつくしたつもりが判定そのものを黙って無効化する**ため。MCP の同名パラメータは会話の途中で値を拒めないので、**弾かずに置き換える**: 非有限値は warn してサーバ既定値に戻し、負値は `0.0` に clamp する (= 呼び出しを失敗させる代わりに判定を切る)
 
-CLI `groove search --format json` も同じラッパ形式で出力する。`match_spans` / byte offset の詳細は [docs/citations.ja.md](citations.ja.md)、フィルタの完全リファレンスは [docs/filters.ja.md](filters.ja.md) 参照。
+CLI `groove search --format json` のラッパ (`results` / `low_confidence` / `filter_applied`) は MCP と同じで、hit のフィールドも 1 点を除いて同じ: **MCP の hit はサーバが引き渡せる文書のとき `uri` を持つ**が、CLI の hit は持たない。`uri` が付く条件は [docs/mcp-tools.ja.md](mcp-tools.ja.md) 参照。`match_spans` / byte offset の詳細は [docs/citations.ja.md](citations.ja.md)、フィルタの完全リファレンスは [docs/filters.ja.md](filters.ja.md) 参照。
 
 ## 多様性 (MMR) と parent retriever (v0.7.0+)
 

@@ -258,6 +258,31 @@ const MAX_RRF_K: f32 = 1e6;
 /// 1.0-2.0.
 const MAX_BM25_WEIGHT: f32 = 1e6;
 
+/// The rule `min_confidence_ratio` is held to, stated once for both entrances.
+///
+/// It has two: the `--min-confidence-ratio` flag and the
+/// `[search].min_confidence_ratio` key. Written twice, they would be free to
+/// drift — and a range that differs between the flag and the file is the same
+/// class of defect this whole area exists to close.
+///
+/// The reason for the rule: a non-finite ratio compares false against every
+/// score, so `compute_low_confidence` answers false for every query — a value
+/// passed in order to *tighten* the check switches it off. A negative one is the
+/// same thing by a different route. `0.0` is the documented way to disable it,
+/// and stays allowed.
+///
+/// The message is short and names no value: `clap` prints the offending input
+/// itself, and the toml path adds the key and the value around this.
+pub fn check_confidence_ratio(v: f32) -> Result<(), &'static str> {
+    if !v.is_finite() {
+        return Err("must be finite");
+    }
+    if v < 0.0 {
+        return Err("must be >= 0.0 (0.0 disables the low_confidence check)");
+    }
+    Ok(())
+}
+
 fn default_rrf_k() -> f32 {
     60.0
 }
@@ -811,6 +836,15 @@ impl Config {
     /// - `[search.fusion]` の 3 重みが全て `0.0` でない
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
+            // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
+            // CLI の `--min-confidence-ratio` と共有する。toml 経路にゲートが要るのは
+            // **`serve` が読むのがこちら**だから ([search.fusion] と同じ事情)。
+            if let Some(r) = s.min_confidence_ratio
+                && let Err(why) = check_confidence_ratio(r)
+            {
+                anyhow::bail!("[search].min_confidence_ratio {why}, got {r}");
+            }
+
             // MMR レンジチェック
             if !(0.0..=1.0).contains(&s.mmr.lambda) {
                 anyhow::bail!(
@@ -2386,6 +2420,35 @@ lambda = 0.5
         let toml = "[search.fusion]\nrrf_k = inf\n";
         let cfg: crate::config::Config = toml::from_str(toml).unwrap();
         assert!(cfg.validate().is_err(), "inf rrf_k must be rejected");
+    }
+
+    /// The same gate, for the ratio the `low_confidence` flag is compared
+    /// against. A non-finite value makes every comparison in
+    /// `compute_low_confidence` false, so a file written to *tighten* the check
+    /// switches it off. The CLI flag has its own parser; this is the only thing
+    /// standing on the toml path, which is the one `serve` reads.
+    #[test]
+    fn a_non_finite_min_confidence_ratio_is_rejected() {
+        for bad in ["nan", "inf", "-inf"] {
+            let toml = format!("[search]\nmin_confidence_ratio = {bad}\n");
+            let cfg: crate::config::Config = toml::from_str(&toml).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("min_confidence_ratio"),
+                "error must name the offending key: {err}"
+            );
+        }
+
+        let toml = "[search]\nmin_confidence_ratio = -0.5\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate().is_err(), "a negative ratio can never fire");
+
+        // 0.0 is the documented off switch; 1.5 is the default.
+        for good in ["0.0", "1.5"] {
+            let toml = format!("[search]\nmin_confidence_ratio = {good}\n");
+            let cfg: crate::config::Config = toml::from_str(&toml).unwrap();
+            assert!(cfg.validate().is_ok(), "{good} must stay acceptable");
+        }
     }
 
     /// (AU-32) The reason `MAX_RRF_K` is where it is, kept next to the bound so

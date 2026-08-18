@@ -74,6 +74,8 @@ The server exposes 6 tools (see [docs/mcp-tools.md](mcp-tools.md)) and keeps the
 
 Latency cost of rerank is roughly 300–700 ms per query on CPU with `bge-v2-m3` over 50 candidates. `--rerank-by-default <BOOL>` (on by default when `--reranker` is set) controls whether every `search` call uses rerank. It takes a value rather than being a bare flag, so turning it off is `--rerank-by-default=false`; the MCP tool takes `rerank: Option<bool>` to override per query. Switching the reranker does **not** require re-indexing (it is index-independent).
 
+As of v0.27.0 the `rerank_by_default` key is read by `groove search` as well, so one `groove.toml` no longer means rerank here and no rerank there. On the command line the per-query override is `--reranker` itself: naming a model opts that query in even when the file says `false`, and `--reranker none` opts it out. (`groove eval` deliberately ignores the key — it measures whatever `--reranker` selects, and its run fingerprint records that model, so a run must not silently measure something else.)
+
 ### When to enable reranking
 
 Rerank trades latency for precision. The right choice depends on usage pattern:
@@ -82,7 +84,7 @@ Rerank trades latency for precision. The right choice depends on usage pattern:
 |---|---|
 | Interactive agent flows (the LLM calls `search` 2–5 times per turn) | **Leave off.** +500 ms × N search calls adds up fast; retrieval quality from BGE-M3 + heading-weighted bm25 is usually sufficient. |
 | One-shot, precision-critical queries (research, definitive answers) | **Enable.** The latency tax is paid once per turn, and the cross-encoder meaningfully promotes semantically relevant candidates. |
-| Mixed usage | Start with `rerank_by_default = false` and let the caller opt in per query via the MCP tool's `rerank: true` parameter. |
+| Mixed usage | Start with `rerank_by_default = false` and let the caller opt in per query — `rerank: true` on the MCP tool, or `--reranker <model>` on the command line. |
 
 Symptoms that suggest you should turn rerank on:
 
@@ -219,9 +221,9 @@ groove search "tokio spawn" \
 - `--tag-any <a,b,c>` — pass if the chunk has **any** of these tags. MCP param: `tags_any`.
 - `--tag-all <a,b,c>` — pass only if the chunk has **all** of these tags. MCP param: `tags_all`.
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — lex comparison; chunks with no `date` are excluded strictly when either bound is set. MCP params: `date_from` / `date_to`.
-- `--min-confidence-ratio <N>` — per-query override of the `low_confidence` threshold.
+- `--min-confidence-ratio <N>` — per-query override of the `low_confidence` threshold. Must be finite and `>= 0.0`; `0.0` is how the check is turned off. The CLI rejects anything else before it loads a model, because a non-finite ratio compares false against every score and would quietly disable the flag rather than tighten it. The MCP parameter of the same name cannot refuse a value mid-conversation, so it substitutes instead: a non-finite ratio is logged and replaced by the server's own value, and a negative one is clamped to `0.0` — which disables the check rather than failing the call.
 
-CLI `groove search --format json` follows the same wrapper format. See [docs/citations.md](citations.md) for `match_spans` / byte-offset details and [docs/filters.md](filters.md) for the full filter reference.
+CLI `groove search --format json` answers with the same wrapper — `results`, `low_confidence`, `filter_applied` — and the same hit fields, with one exception: an MCP hit also carries a `uri` when the document is one the server will hand over, and a CLI hit never does. [docs/mcp-tools.md](mcp-tools.md) describes when that field is present. See [docs/citations.md](citations.md) for `match_spans` / byte-offset details and [docs/filters.md](filters.md) for the full filter reference.
 
 ## Diversity (MMR) and parent retriever (v0.7.0+)
 

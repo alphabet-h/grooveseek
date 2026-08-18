@@ -14,6 +14,9 @@ Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove
 kb_path = "/path/to/knowledge-base"
 model = "bge-m3"
 reranker = "bge-v2-m3"
+# Read by `groove serve` and by `groove search` alike (v0.27.0+). For a single
+# query, override it with the MCP tool's `rerank` parameter, or by naming
+# `--reranker` on the command line — `--reranker none` opts that query out.
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 
@@ -107,7 +110,10 @@ bind = "127.0.0.1:3100"
 # # rank-based low-confidence flag: trips when
 # # top1.score / mean(top-N.score) < min_confidence_ratio.
 # # 0.0 disables the flag. CLI `--min-confidence-ratio` and the MCP
-# # param `min_confidence_ratio` override per query.
+# # param `min_confidence_ratio` override per query. Must be finite and
+# # >= 0.0 — a non-finite value compares false against every score and
+# # would disable the flag rather than tighten it, so groove refuses to
+# # start with one.
 # min_confidence_ratio = 1.5
 
 # Optional: MMR diversity re-rank (v0.7.0+). Off by default.
