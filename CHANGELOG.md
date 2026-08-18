@@ -69,6 +69,36 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **The command line and the MCP tools now use the same noun for the same
+  thing, and [docs/stability.md](docs/stability.md) says which parts of the two
+  surfaces correspond.** Both are frozen at 1.0.0, so this is the last release
+  that can move either one.
+
+  Two names were one concept called two things. `groove graph --exclude` is now
+  `--exclude-paths`, matching the tool's `exclude_paths`; and the tool's `path`
+  is now `start`, matching `groove graph --start`. The tool took the flag's word
+  rather than the other way round, because `--path` beside `--kb-path` reads as
+  the corpus, and `get_document` keeps `path` for the document it fetches.
+
+  What remains different is deliberate, and is now written down instead of being
+  inferred: a repeatable flag is singular where the array it fills is plural
+  (`--path-glob` / `path_globs`, `--tag-any` / `tags_any`), tool names and
+  subcommand names do not correspond at all (`get_connection_graph` is
+  `groove graph`), and `rerank` is a per-call boolean while `--reranker` picks a
+  model. Neither shape is unusual — `gh --label` fills the REST API's `labels`,
+  and `docker --publish` fills Compose's `ports` — so the rule is that the
+  mapping is predictable, not that the strings are equal.
+
+  *Values* are held to a stricter rule, because a name that differs costs a
+  lookup while a value that differs fails the call outright: `seed_strategy` now
+  takes `all_chunks` and `all-chunks` on both sides. Copying either spelling
+  from one surface to the other used to be rejected — by clap on one side and by
+  `unknown seed_strategy` on the other.
+
+  A test pins the pairing itself. Adding a parameter to either surface fails
+  until the table names its counterpart or records why it has none, which puts
+  the question in front of whoever adds it while the answer is still free.
+
 - **`docs/ARCHITECTURE.md` stopped calling `/ui` a disposable placeholder.** It
   still described the file as "a disposable placeholder — a proper redesign is
   expected in Phase 3+" after that redesign had shipped.

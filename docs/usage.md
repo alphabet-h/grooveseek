@@ -278,19 +278,19 @@ When you want to find not just a single document but the semantic neighborhood a
 ```bash
 groove graph --start deep-dive/mcp/overview.md --depth 2 --fan-out 5
 groove graph --start notes/rag.md --dedup-by-path --format text
-groove graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
+groove graph --start a.md --exclude-paths junk1.md,junk2.md --min-similarity 0.5
 ```
 
 Flags:
 
-- `--start PATH` — required, relative path to an indexed document.
+- `--start PATH` — required, relative path to an indexed document. MCP param: `start`.
 - `--depth` (default 2, clamped to max 3) — BFS hops.
 - `--fan-out` (default 5, clamped to max 20) — neighbors per node per hop. `0` returns only the seed.
 - `--min-similarity` (default 0.3) — cosine similarity cut-off. `0.0..=1.0`.
-- `--seed-strategy` — `all-chunks` (default) expands from each seeded chunk of the start doc; `centroid` averages them (L2-renormalized) into a single seed node, leaving all of `--max-nodes` except that one node for connections. Both see only the first `--max-seed-chunks` chunks. (The MCP tool spells these `all_chunks` / `centroid`.)
+- `--seed-strategy` — `all-chunks` (default) expands from each seeded chunk of the start doc; `centroid` averages them (L2-renormalized) into a single seed node, leaving all of `--max-nodes` except that one node for connections. Both see only the first `--max-seed-chunks` chunks. (The MCP tool spells this value `all_chunks`; **both spellings are accepted on both sides** — see [stability.md](stability.md#how-the-two-surfaces-name-the-same-thing).)
 - `--max-nodes` (default 100, clamped to max 2000) — total nodes; also caps the number of KNN queries.
 - `--max-seed-chunks` (default 32, clamped to `1..=1000`) — chunks of the start document used as seeds.
-- `--exclude` — comma-separated paths to drop from results. The start path itself is always excluded.
+- `--exclude-paths` — comma-separated paths to drop from results. The start path itself is always excluded. MCP param: `exclude_paths`.
 - `--dedup-by-path` — collapse same-path hits so each document appears at most once.
 - `--category` / `--topic` — apply category / topic filters to every hop.
 - `--format json|text|dot|svg` — `json` (default) and `text` are the machine- and human-readable listings; `dot` and `svg` draw the walk (v0.25.0+, see below).

@@ -278,19 +278,19 @@ enabled = true
 ```bash
 groove graph --start deep-dive/mcp/overview.md --depth 2 --fan-out 5
 groove graph --start notes/rag.md --dedup-by-path --format text
-groove graph --start a.md --exclude junk1.md,junk2.md --min-similarity 0.5
+groove graph --start a.md --exclude-paths junk1.md,junk2.md --min-similarity 0.5
 ```
 
 フラグ:
 
-- `--start PATH` — 必須、index 済みドキュメントの相対パス
+- `--start PATH` — 必須、index 済みドキュメントの相対パス。MCP param: `start`
 - `--depth` (既定 2、最大 3 にクランプ) — BFS のホップ数
 - `--fan-out` (既定 5、最大 20 にクランプ) — ホップあたりのノード隣接数。`0` なら seed のみ返却
 - `--min-similarity` (既定 0.3) — コサイン類似度カットオフ。`0.0..=1.0`
-- `--seed-strategy` — `all-chunks` (既定) はシードになった各チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の seed ノードにまとめ、`--max-nodes` のうちその 1 個を除く全部を connection に回す。**どちらも見えるのは `--max-seed-chunks` 個までの前半だけ** (MCP ツール側の綴りは `all_chunks` / `centroid`)
+- `--seed-strategy` — `all-chunks` (既定) はシードになった各チャンクから展開、`centroid` は平均 (L2 再正規化) した 1 個の seed ノードにまとめ、`--max-nodes` のうちその 1 個を除く全部を connection に回す。**どちらも見えるのは `--max-seed-chunks` 個までの前半だけ** (MCP ツール側の綴りは `all_chunks`。**どちらの綴りも両側で通る** — [stability.ja.md](stability.ja.md#同じものを二つの面がどう名付けるか) 参照)
 - `--max-nodes` (既定 100、最大 2000 にクランプ) — 総ノード数。KNN 実行回数もこれで縛られる
 - `--max-seed-chunks` (既定 32、`1..=1000` にクランプ) — シードに使う起点文書のチャンク数
-- `--exclude` — 結果から除外するカンマ区切りパス。起点パス自身は常に除外される
+- `--exclude-paths` — 結果から除外するカンマ区切りパス。起点パス自身は常に除外される。MCP param: `exclude_paths`
 - `--dedup-by-path` — 同一パスのヒットをまとめて各ドキュメント最大 1 回に
 - `--category` / `--topic` — 各ホップにカテゴリ / トピックフィルタを適用
 - `--format json|text|dot|svg` — `json` (既定) と `text` は機械 / 人間向けの一覧、`dot` と `svg` は探索を図にする (v0.25.0+、下記)

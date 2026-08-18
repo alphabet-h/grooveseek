@@ -384,7 +384,7 @@ pub fn build_connection_graph(
     // 64-entries × 1 KiB bound never covered: `search` validates all three of
     // its lists, while this one went straight into a `HashSet` the BFS
     // consults on every visit. Checked here rather than in the MCP handler so
-    // that `groove graph --exclude` is bounded by the same rule, and before
+    // that `groove graph --exclude-paths` is bounded by the same rule, and before
     // the seed lookup so an oversized request costs nothing.
     crate::server::validate_filter_list("exclude_paths", &opts.exclude_paths)?;
 

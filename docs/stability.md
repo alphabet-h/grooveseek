@@ -112,6 +112,35 @@ people to read. It is **not** stable; see [Unstable](#unstable).
   `kb://topic/{prefix}`, and the rule that a URI the server offered can be read
   back — see [ADR-0004](decisions/0004-resource-reads-are-bounded-by-the-index.md).
 
+### How the two surfaces name the same thing
+
+The command line and the MCP tools are **two namespaces, frozen separately**. A
+flag does not change because a parameter did, or the reverse.
+
+Where both expose the same concept they use **the same noun**, and each follows
+its own conventions for everything else. The command line is kebab-case and
+names a repeatable flag in the singular; a tool parameter is snake_case and
+names an array in the plural. So `--path-glob` and `path_globs` are the same
+filter, as are `--tag-any` / `tags_any` and `--tag-all` / `tags_all`. The
+mapping is predictable without being identical, and [usage.md](usage.md) states
+it flag by flag.
+
+Two things deliberately do not correspond:
+
+- **Tool names and subcommand names.** `get_connection_graph` is `groove graph`,
+  and `rebuild_index` is `groove index`. Each set is consistent within itself —
+  tools read as a verb on an object because that is what a model chooses
+  between, subcommands are short because that is what a person types — and no
+  caller ever has to translate one into the other.
+- **`rerank` and `--reranker`.** The tool parameter is a per-call boolean; the
+  flag picks a model. The flag that matches the parameter is
+  `groove serve --rerank-by-default`.
+
+*Values* are held to a stricter rule than names, because a name that differs
+costs a lookup while a value that differs fails the call outright. Where the two
+surfaces would spell an enum value differently, **both spellings are accepted on
+both sides**: `seed_strategy` takes `all_chunks` and `all-chunks` either way.
+
 ### HTTP
 
 - **`/mcp`** — the Streamable HTTP transport endpoint.
