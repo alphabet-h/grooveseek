@@ -74,6 +74,8 @@ grep -o '^| 罠 [0-9][0-9]*' .claude/commands/codex-review.md | sort -u | wc -l
 | 罠 52 (**診断が stdout に出る / 非 ASCII**) | 進捗・警告・abort は `diag()` 経由で **stderr へ、ASCII のみ**。AGENTS.md の "Results go to stdout, diagnostics to stderr" と同じ理由で、この script の *結果* は review の中身だけ。日本語を stderr に出すと CP932 コンソールで mojibake になる (codex P1 on PR #179) |
 | 罠 54 (**`$( )` の中の `exit` はサブシェルしか終わらせない**) | `post_trigger` は失敗時に `exit` ではなく `return 1` を返し、呼び出し側が `|| exit 6` する。`TRIGGER_COMMENT_ID=$(post_trigger ...)` は command substitution なので、中で `exit` しても親は**空の id を持ったまま polling に入り**、この helper が防ぐはずだった 600 秒待ちをそのまま再現する (codex P1 on PR #179) |
 | 罠 55 (**bot 由来の本文を stderr に流す**) | stderr を ASCII に保つ規約は wrapper の文言だけでは守れない。`LATEST_ISSUE_BODY` は codex が書いた内容 = **この実行の結果**なので stdout に出す。英語の marker に日本語が混じった瞬間に CP932 で mojibake になる (codex P1 on PR #179) |
+| 罠 56 (**quota 切れが terminal error に見えない**) | `TERMINAL_ERROR_PATTERN` に `usage limits` / `rate limit` を足す。実測 (PR #181 round 3): codex が返したのは "You have reached your Codex usage limits for code reviews." で、既存 3 パターン (`Something went wrong` / `Script exited` / `Try again later`) のどれとも語彙が重ならず**素通りした**。retry しても復帰しないので terminal 扱いが正しい |
+| 罠 57 (**Layer 1 だけ round scope が無い**) | 罠 27 / 33 / 49 で inline・issue・review body を delta にしたが、`STATE_OK` は `LATEST_REVIEW` = **PR 全 history の最後**のままだった。その round が何も生まなければ前 round の `state=COMMENTED` が残り、badge 0 と合わせて **収束と読む**。3 endpoint とも 0 件の round (`ROUND_EMPTY`) は **indeterminate** に落とす — 「指摘が無かった」ではなく「**答えが無かった**」。罠 56 と同じ round で両方踏んだ (quota 切れの round が CONVERGED を出した) |
 | 罠 53 (**同じ操作を 2 箇所に書く**) | trigger の投稿・retry・id 検証は `post_trigger()` 1 つに集約し、Step 2 と Step 7 の両方から呼ぶ。書き写すと **初回 round は守られたまま re-review round だけ壊れる**、という気付けない形になる — 実際 abort の文言が既にずれていた (codex P1 on PR #179) |
 
 ## 実行フロー
@@ -337,7 +339,10 @@ LATEST_ISSUE_BODY=$(echo "$NEW_ISSUES" | jq -r 'map(.body // "") | join("
 HEAD_SHA=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha)
 
 # 罠 10: error string detect → terminal failure、retry しない
-TERMINAL_ERROR_PATTERN="Something went wrong|Script exited|Try again later"
+# 罠 56: **quota 切れも terminal**。実測 (PR #181 round 3):
+# "You have reached your Codex usage limits for code reviews." が来た。
+# 語彙が既存 3 つと重ならないので、pattern に足さないと**素通りする**。
+TERMINAL_ERROR_PATTERN="Something went wrong|Script exited|Try again later|usage limits|rate limit"
 if echo "$LATEST_ISSUE_BODY" | grep -qE "$TERMINAL_ERROR_PATTERN"; then
   diag "ERROR: codex returned a terminal failure body (trap 10). Body follows on stdout."
   diag "Action: do not retry. Escalate; try again later or on another PR."
@@ -414,6 +419,21 @@ P2_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("!
 P3_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P3 Badge"))] | length') \
   + $(body_badges '!\[P3 Badge') ))
 
+# 罠 57: **Layer 1 だけ round scope が掛かっていなかった。** 罠 27 (inline) /
+# 罠 33 (issue) / 罠 49 (review body) で 3 つとも delta にしたのに、`STATE_OK` は
+# `LATEST_REVIEW` = **PR 全 history の最後**から取っている。その round が
+# **何も生まなかった**とき (quota 切れ・沈黙)、前 round の `state=COMMENTED` が
+# 残っているので `STATE_OK=true` + badge 0 で **収束と読む**。
+# 実測 (PR #181 round 3): 新しい commit を push して trigger した round の産物が
+# 「quota に達した」の 1 コメントだけだったのに **CONVERGED (Layer 1 + 2)** を出した。
+# **その round の産物が 3 endpoint とも 0 件なら、収束の証拠はどこにも無い。**
+ROUND_EMPTY=false
+if [ "$(echo "$NEW_INLINE" | jq 'length')" = "0" ] \
+  && [ "$(echo "$NEW_REVIEWS" | jq 'length')" = "0" ] \
+  && [ "$(echo "$NEW_ISSUES" | jq 'length')" = "0" ]; then
+  ROUND_EMPTY=true
+fi
+
 # Layer 3 (tertiary): sentinel text variations (罠 14)、broader pattern set
 SENTINEL_PATTERN="Didn't find any major issues|Hooray|Bravo|Looks good|Keep them coming|no issues found|All good|All clear|approved"
 SENTINEL_MATCH=false
@@ -435,6 +455,12 @@ elif [ "$SENTINEL_MATCH" = "true" ]; then
   [ "$P3_TAGS_PRESENT" -gt 0 ] && EXTRA+=" (Note: ${P3_TAGS_PRESENT} P3 item(s), 同上)"
   echo "✅ Converged (Layer 3 sentinel${EXTRA})"
   CONVERGED=true
+elif [ "$ROUND_EMPTY" = "true" ]; then
+  # 罠 57: この round は 3 endpoint とも 0 件。`STATE_OK` は前 round の残り香なので
+  # 収束の根拠に使えない。**「指摘が無かった」ではなく「答えが無かった」**。
+  echo "⚠️ Indeterminate (this round produced nothing on any endpoint; \
+state=${REVIEW_STATE} is left over from an earlier round, commit_fresh=${COMMIT_FRESH})"
+  CONVERGED=false
 elif [ "$STATE_OK" = "true" ] && [ "$P0_P1_TAGS_PRESENT" = "0" ] \
   && [ "$P2_TAGS_PRESENT" = "0" ] && [ "$P3_TAGS_PRESENT" = "0" ]; then
   echo "✅ Converged (Layer 1 + 2: state=${REVIEW_STATE}, no P-badges)"
@@ -495,7 +521,8 @@ snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 | `STATE_OK=false` でも `P0/P1` も sentinel もなし (= indeterminate) | controller が manual review (= human 判断)、必要なら `@codex review` 再 trigger |
 | `exit 3` (= 罠 9 wall-clock timeout、**reaction はある**) | codex は受け取ったが答えなかった。user に escalate (= "codex acknowledged but did not answer, suspect stale connector") |
 | `exit 5` (= 罠 47 trigger が届いていない、**reaction が 1 つも無い**) | **round を消費せず同じ commit に再 trigger する** (自動、1 回だけ)。実測でこれは 8 回中 2 回起き、再 trigger でどちらも即復帰した。2 回目も届かなければ user に escalate |
-| `exit 4` (= 罠 10 terminal error) | user に escalate (= "codex returned terminal failure, retry will not help") |
+| **`ROUND_EMPTY=true`** (= 罠 57、3 endpoint とも 0 件) | **収束と読まない。** codex が答えていない round なので、`STATE_OK` は前 round の残り香。quota 切れ (罠 56) / trigger 未達 (罠 47) / 沈黙 (罠 9) のどれかを切り分けて user に報告する |
+| `exit 4` (= 罠 10 terminal error、**quota 切れを含む**) | user に escalate (= "codex returned terminal failure, retry will not help")。quota なら**時間で回復する**ので、いつ回復するかを添えて報告する |
 | `exit 6` (= 罠 50 trigger の POST が 3 回とも失敗) | **待たずに abort**。GitHub 側の一時障害なので数分置いて再実行する。ここで待つと、誰も読んでいない trigger を 600 秒待って罠 9 と誤診する |
 
 ### Step 7 — re-review trigger (= round 2 以降)
