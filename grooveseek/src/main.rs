@@ -2198,10 +2198,19 @@ mod documented_flags {
         out
     }
 
-    /// The `--name` tokens appearing in a body of prose.
-    fn flag_tokens(text: &str) -> BTreeSet<String> {
-        let re = regex::Regex::new(r"--([a-z][a-z0-9-]+)").expect("a valid pattern");
-        re.captures_iter(text).map(|c| c[1].to_string()).collect()
+    /// The `--name` tokens appearing in a body of prose, as whole tokens.
+    ///
+    /// Both directions compare against this one set rather than searching for
+    /// substrings, because a flag can be a prefix of another: `--k` is inside
+    /// `--kb-path`, so `contains("--k")` would call `--k` documented on the
+    /// strength of a flag it has nothing to do with. The name may be a single
+    /// character for the same reason — `--k` is real, and a pattern demanding
+    /// two would leave the one case that needs this unprotected.
+    fn documented_flag_tokens() -> BTreeSet<String> {
+        let re = regex::Regex::new(r"--([a-z][a-z0-9-]*)").expect("a valid pattern");
+        re.captures_iter(&published_docs())
+            .map(|c| c[1].to_string())
+            .collect()
     }
 
     /// What this guarantees, and what it cannot.
@@ -2224,10 +2233,10 @@ mod documented_flags {
     /// which is what someone reading the message needs.
     #[test]
     fn every_long_flag_the_binary_accepts_is_documented() {
-        let docs = published_docs();
+        let documented = documented_flag_tokens();
         let missing: Vec<String> = own_long_flags()
             .iter()
-            .filter(|(_, flag)| !docs.contains(&format!("--{flag}")))
+            .filter(|(_, flag)| !documented.contains(flag))
             .map(|(cmd, flag)| format!("`{cmd} --{flag}`"))
             .collect();
 
@@ -2259,7 +2268,7 @@ mod documented_flags {
         // Which command owns a flag does not matter here; only whether the
         // binary has it under any name at all.
         let own: BTreeSet<String> = own_long_flags().into_iter().map(|(_, f)| f).collect();
-        let stray: Vec<String> = flag_tokens(&published_docs())
+        let stray: Vec<String> = documented_flag_tokens()
             .into_iter()
             .filter(|f| !own.contains(f))
             .filter(|f| !FOREIGN.iter().any(|(name, _)| name == f))
