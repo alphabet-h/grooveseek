@@ -24,9 +24,13 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 - リポジトリで `chatgpt-codex-connector[bot]` の GitHub App install 済
 - 本 command は **destructive 操作なし** (= GitHub API read + comment post のみ)、ローカル file system 改変なし
 
-## 設計の柱 (= 22 罠の構造的回避)
+## 設計の柱 (= 踏んだ罠の構造的回避)
 
-本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 7-19 + 21-22 + 24-33 を **構造的に回避** する設計:
+本 command は `.dev/knowledge/codex-review-loop-pitfalls.md` に記録した罠を
+**構造的に回避**する設計。回避しているものは下の表がすべてで、**表がそのまま一覧**
+(現在 31 件 — `grep -o '^| 罠 [0-9][0-9]*' .claude/commands/codex-review.md | sort -u | wc -l`。
+`[0-9]*` だと空にもマッチして表のヘッダ行を数えるので `[0-9][0-9]*` にする)。
+番号の範囲を本文に書き写さない: 罠は連番で増えないので、書き写した範囲は必ず古くなる。
 
 | 罠 | 回避手段 |
 |---|---|
@@ -58,6 +62,9 @@ GitHub PR で codex review (`chatgpt-codex-connector[bot]`) を **trigger + 3 la
 | 罠 48 (transient API failure が差分に見える) | 罠 43 の再発。差分を検知したら **10 秒後にもう一度取り、同じ差分が再現した時だけ**信じる。射影 (罠 44) は「変化の原因が観測対象でない」に効くが「**観測自体の失敗**」には効かない — 別の防御が要る |
 | 罠 49 (指摘が review 本文に入る) | P-badge の計数を **inline + review 本文**の両方で行う。実測 (PR #164 round 7): 新 review が HEAD に対して出て inline 0 件、しかし本文に P2 が 1 件 (permalink 形式)。inline だけ数えると Layer 1 (state=COMMENTED) と Layer 3 (sentinel 無し) も収束側に倒れるので **3 layer 全部を通り抜ける**。罠 12 で endpoint を足したが、**その endpoint のどのフィールドに指摘が入り得るか**を数えていなかった。**さらに body も round scope し、その round の submission を全部数える** (`.[-1]` だけでは 1 round 複数 submission (罠 34) で先の P0/P1 を落とす)。 — 罠 21 のとおり re-review で新 submission が出ない round があり、`LATEST_REVIEW` が前 round のままだと修正済みの指摘を数え続けて収束しない (罠 27 / 33 と同型) |
 | 罠 33 (sentinel / terminal-error が PR 全 history で評価される) | `LATEST_ISSUE_BODY` を `NEW_ISSUES = $CUR_ISSUES − $PREV_ISSUES` (= current round で post された issue comment のみ) から derive する。罠 27 (P-badge round-scoping) と同じ pattern を sentinel + terminal-error チェック側にも適用、prior round の sentinel "Didn't find any major issues" が後続 round に漏れて false-converge する race を排除 |
+| 罠 50 (**trigger の POST 自体が失敗する**) | Step 2 で POST を最大 3 回まで再試行し、**comment id が数字であることを確認してから待つ** (でなければ `exit 6`)。実測 (PR #176): 2 回連続 503、その間 GET は全部成功していたので「codex が答えない」(= 罠 9) に化けて 600 秒を捨てた。**待つ前に、投稿できたことを確かめる** |
+| 罠 23 の再発 (**列挙した badge の外に指摘が来る**) | P0/P1/P2 に加えて **P3 も数える** (PR #177 で P3 の指摘を `P2=0` = 「指摘なし」と読みかけた)。さらに Step 5 に **badge の有無を問わず round の inline を全部出す** section を置く — 計数は列挙に依存するが、**表示は依存させない** |
+| 罠 51 (**PR を開いた直後の round は baseline に指摘が入っている**) | codex は「Open a pull request for review」でも trigger される。Step 1 の baseline 時点で自動レビューが終わっていると、round scoping (罠 27/33/49) が正しく効いた結果その指摘が `NEW_*` から消え、`new_inline=0 + sentinel=true` = 「指摘 0 件で収束」に見える。実測 (PR #178 round 1): baseline の inline 1 件が **P1** だった。**判定は round diff のまま、差分 0 の時だけ baseline を表示する** (罠 30 と同じ「判定と表示を分ける」形) |
 
 ## 実行フロー
 
@@ -110,7 +117,22 @@ PREV_ISSUES=$(snapshot_issues)
 # 罠 47: comment id を捕まえておく。reaction を見るのに要る —
 # 「reaction 無し = 届いていない」が、無応答を stale connector と
 # 誤診しないための唯一の signal。
-TRIGGER_COMMENT_ID=$(gh pr comment <PR#> --body "@codex review" | sed 's/.*issuecomment-//')
+# 罠 50 (PR #176): POST 自体が 503 で落ちることがある。その時 `gh pr comment` は
+# URL を返さないので id が数字にならない。**投稿できたことを確認してから待つ** —
+# 確認しないと、誰も読んでいない trigger を 600 秒待って「codex が答えない」
+# (= 罠 9) と誤診する。実測で 2 回連続 503、その間 GET は全部成功していた。
+for attempt in 1 2 3; do
+  TRIGGER_URL=$(gh pr comment <PR#> --body "@codex review") && break
+  echo "  (trigger POST failed, attempt ${attempt}/3)"
+  sleep 20
+done
+TRIGGER_COMMENT_ID=$(echo "$TRIGGER_URL" | sed 's/.*issuecomment-//')
+case "$TRIGGER_COMMENT_ID" in
+  ''|*[!0-9]*)
+    echo "ABORT: trigger did not post (id='${TRIGGER_COMMENT_ID}' url='${TRIGGER_URL}')"
+    echo "Action: 待たずに abort。GitHub 側の一時障害なら数分後に再実行する"
+    exit 6;;
+esac
 echo "trigger comment id=${TRIGGER_COMMENT_ID}"
 ```
 
@@ -309,6 +331,12 @@ P0_P1_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains
   + $(body_badges '!\[P0 Badge') + $(body_badges '!\[P1 Badge') ))
 P2_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P2 Badge"))] | length') \
   + $(body_badges '!\[P2 Badge') ))
+# 罠 23 が P2 で一度広げた形が、P3 で再発した (PR #177): P0/P1/P2 だけ数えて
+# `P2=0` を「指摘なし」と読みかけたが、来ていたのは中身の正しい **P3** だった。
+# **badge の集合を列挙で決め打ちしない。** P3 も数え、Step 5 では badge の
+# 有無を問わず round の inline を全部出す (= 未知の badge も人の目に入る)。
+P3_TAGS_PRESENT=$(( $(echo "$NEW_INLINE" | jq '[.[] | .body | select(contains("![P3 Badge"))] | length') \
+  + $(body_badges '!\[P3 Badge') ))
 
 # Layer 3 (tertiary): sentinel text variations (罠 14)、broader pattern set
 SENTINEL_PATTERN="Didn't find any major issues|Hooray|Bravo|Looks good|Keep them coming|no issues found|All good|All clear|approved"
@@ -328,14 +356,33 @@ elif [ "$SENTINEL_MATCH" = "true" ]; then
   [ "$STATE_OK" = "true" ] && EXTRA+=" + Layer 1 state=${REVIEW_STATE}"
   [ "$COMMIT_FRESH" = "true" ] && EXTRA+=" + commit fresh"
   [ "$P2_TAGS_PRESENT" -gt 0 ] && EXTRA+=" (Note: ${P2_TAGS_PRESENT} P2 item(s), controller 判断で取り込み or skip)"
+  [ "$P3_TAGS_PRESENT" -gt 0 ] && EXTRA+=" (Note: ${P3_TAGS_PRESENT} P3 item(s), 同上)"
   echo "✅ Converged (Layer 3 sentinel${EXTRA})"
   CONVERGED=true
-elif [ "$STATE_OK" = "true" ] && [ "$P0_P1_TAGS_PRESENT" = "0" ] && [ "$P2_TAGS_PRESENT" = "0" ]; then
+elif [ "$STATE_OK" = "true" ] && [ "$P0_P1_TAGS_PRESENT" = "0" ] \
+  && [ "$P2_TAGS_PRESENT" = "0" ] && [ "$P3_TAGS_PRESENT" = "0" ]; then
   echo "✅ Converged (Layer 1 + 2: state=${REVIEW_STATE}, no P-badges)"
   CONVERGED=true
 else
   echo "⚠️ Indeterminate (no sentinel + no clean state) — re-trigger or user escalate"
   CONVERGED=false
+fi
+
+# 罠 51 (PR #178): **PR を開いた直後の round は baseline に指摘が入っている。**
+# codex は「Open a pull request for review」でも trigger されるので、Step 1 で
+# baseline を取る時点で自動レビューが終わっていることがある。round scoping
+# (罠 27/33/49) が正しく効いた結果、その指摘は `NEW_*` から消え、
+# `new_inline=0 + sentinel=true` = 「指摘 0 件で収束」に見える。
+# 実測 (PR #178 round 1): baseline の inline 1 件が **P1** だった。
+# **判定は round diff のまま (2 度数えると再指摘でループする)、表示だけ足す** —
+# 罠 30 が P2 でやったのと同じ「判定と表示を分ける」形。
+if [ "$(echo "$NEW_INLINE" | jq length)" = "0" ] && [ "$(echo "$NEW_REVIEWS" | jq length)" = "0" ]; then
+  echo ""
+  echo "=== NOTE: この round の差分は 0 件。baseline を出す (罠 51) ==="
+  echo "差分が 0 なのは「何も無い」ではなく「起点以降に増えていない」。"
+  echo "PR を開いた直後なら、指摘は baseline 側に入っている。"
+  echo "$PREV_INLINE" | jq -r 'if length == 0 then "(baseline inline: none)" else .[] | "[baseline] \(.path):\(.line // .original_line)\n\(.body)\n---" end'
+  echo "$PREV_REVIEWS" | jq -r 'if length == 0 then "(baseline review bodies: none)" else .[] | "[baseline] state=\(.state) commit=\(.commit_id)\n\(.body)\n---" end'
 fi
 ```
 
@@ -368,6 +415,13 @@ echo "=== Inline P2 (controller-judgment items, current round only) ==="
 # を出して controller が判断できる状態にする。
 echo "$NEW_INLINE" | jq -r '.[] | select(.body | contains("![P2 Badge")) | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---"' 2>/dev/null
 echo ""
+echo "=== Inline, this round — ALL of them, badge or not ==="
+# 罠 23 が P2 で、その再発が P3 で起きた (PR #177): **列挙した badge の外に
+# 指摘が来る**。上の 2 section は列挙に依存しているので、ここは列挙せず
+# **その round の inline を全部出す**。次に codex が P4 を作っても、
+# あるいは badge の無い指摘を書いても、人の目には入る。
+echo "$NEW_INLINE" | jq -r 'if length == 0 then "(none this round)" else .[] | "[\(.updated_at)] \(.path):\(.line // .original_line)\n\(.body)\n---" end'
+echo ""
 echo "=== Top-level issue comments by codex (full) ==="
 snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 ```
@@ -376,12 +430,14 @@ snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 
 | 状態 | アクション |
 |---|---|
+| `CONVERGED=true` **かつ差分が 0 件** | **baseline を読んでから**収束を宣言する (= 罠 51)。PR を開いた直後の round では、指摘は差分ではなく baseline 側にいる |
 | `CONVERGED=true` | **収束**、merge / tag に進む |
 | `P0_P1_TAGS_PRESENT > 0` | controller が指摘内容を理解 → fix 実装 → push → goto Step 1 (= 新 baseline 取得 + re-trigger)。**ただし** `current_round >= max_rounds` (= default 3) なら user 報告 |
 | `STATE_OK=false` でも `P0/P1` も sentinel もなし (= indeterminate) | controller が manual review (= human 判断)、必要なら `@codex review` 再 trigger |
 | `exit 3` (= 罠 9 wall-clock timeout、**reaction はある**) | codex は受け取ったが答えなかった。user に escalate (= "codex acknowledged but did not answer, suspect stale connector") |
 | `exit 5` (= 罠 47 trigger が届いていない、**reaction が 1 つも無い**) | **round を消費せず同じ commit に再 trigger する** (自動、1 回だけ)。実測でこれは 8 回中 2 回起き、再 trigger でどちらも即復帰した。2 回目も届かなければ user に escalate |
 | `exit 4` (= 罠 10 terminal error) | user に escalate (= "codex returned terminal failure, retry will not help") |
+| `exit 6` (= 罠 50 trigger の POST が 3 回とも失敗) | **待たずに abort**。GitHub 側の一時障害なので数分置いて再実行する。ここで待つと、誰も読んでいない trigger を 600 秒待って罠 9 と誤診する |
 
 ### Step 7 — re-review trigger (= round 2 以降)
 
@@ -394,16 +450,23 @@ PREV_REVIEWS=$(snapshot_reviews)
 PREV_ISSUES=$(snapshot_issues)
 
 # 罠 15 + 罠 18: @codex review 冒頭 1 回、本文中で codex を bare word でも mention しない、verb は review のみ
-TRIGGER_COMMENT_ID=$(gh pr comment <PR#> --body "@codex review
-
-Round ${N} fix (commit \`<SHA>\`):
-- <fix 1 line>
-- <fix 2 line>
-" | sed 's/.*issuecomment-//')
+# 本文は heredoc ではなく **ファイルに書いて --body-file** で渡す
+# (CLAUDE.local.md: heredoc / here-string は入れ子の引用符で壊れる)。
+for attempt in 1 2 3; do
+  TRIGGER_URL=$(gh pr comment <PR#> --body-file <path>) && break
+  echo "  (trigger POST failed, attempt ${attempt}/3)"
+  sleep 20
+done
+TRIGGER_COMMENT_ID=$(echo "$TRIGGER_URL" | sed 's/.*issuecomment-//')
+case "$TRIGGER_COMMENT_ID" in
+  ''|*[!0-9]*) echo "ABORT: trigger did not post (罠 50)"; exit 6;;
+esac
 ```
 
 **round ごとに `TRIGGER_COMMENT_ID` を取り直す** (= 罠 47)。前 round の comment の
 reaction を見ていると、届いていない round を「届いた」と読む。
+**Step 2 と同じ POST 検証をここにも置く** (= 罠 50) — round 2 以降で落ちても
+症状は同じ「600 秒待って codex が答えない」になる。
 
 戻って Step 3 から polling 再開。
 
@@ -422,7 +485,9 @@ reaction を見ていると、届いていない round を「届いた」と読�
 
 ## 関連
 
-- 動機 + 罠 7-19 + 21-23 + 24-33 の詳細解説: `.dev/knowledge/codex-review-loop-pitfalls.md`
+- 動機と、各罠がどう見つかったかの詳細: `.dev/knowledge/codex-review-loop-pitfalls.md`
+  (構造的に回避しているものは上の表が一覧。ノートはそれより広く、**表に番号の無い
+  ものも含む** — 実測で 39-43 と 45。表に無い = この command が構造で防いでいない)
 - `/feature-flow` orchestrator: `.claude/commands/feature-flow.md` (= 本 command の caller、Phase 6)
 - CLAUDE.local.md `/feature-flow` 常時 guardrail 節
 - 公式 source:
