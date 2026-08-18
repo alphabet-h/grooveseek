@@ -106,9 +106,10 @@ groove service install --service-name personal --kb-path /path/to/personal-kb --
 
 # Inspect / manage
 groove service status                              # default 'groove'
+groove service status --service-name personal      # a named instance
 groove service list                                # all instances
-groove service uninstall personal                  # remove unit, keep config + DB
-groove service uninstall personal --purge --yes    # also remove config + DB
+groove service uninstall --service-name personal               # remove unit, keep config + DB
+groove service uninstall --service-name personal --purge --yes # also remove config + DB
 ```
 
 OS-specific backends:
@@ -151,13 +152,14 @@ Tray logs live at `%LOCALAPPDATA%\groove\logs\tray.YYYY-MM-DD` (daily rotation).
 Uninstalling the daemon also removes the tray shortcut:
 
 ```bash
-groove service uninstall groove
+groove service uninstall --service-name groove
 ```
 
 To manage the tray shortcut independently of the daemon registration:
 
 ```bash
 groove service tray-install --service-name groove     # add shortcut only
+groove service tray-install --service-name groove --force   # overwrite an existing shortcut
 groove service tray-uninstall --service-name groove   # remove shortcut only
 ```
 
@@ -319,6 +321,17 @@ groove validate --kb-path /path/to/knowledge-base
 groove validate --kb-path ... --format json | jq '.files[]'
 groove validate --kb-path ... --format github         # ::error annotations for CI
 ```
+
+Flags:
+
+- `--schema <PATH>` — read the schema from somewhere other than
+  `<kb-path>/groove-schema.toml`. This is the only way to point `validate` at a
+  schema that does not sit beside the knowledge base — one shared schema for
+  several bases, or a stricter one kept in CI.
+- `--fail-fast` — exit 1 at the first violation instead of scanning the rest.
+  Useful when the answer you want is "is it clean", not "what is wrong".
+- `--no-color` — drop ANSI colour from `--format text`. Colour is already off
+  when stdout is not a TTY, so this is for the case where it is one.
 
 Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
 

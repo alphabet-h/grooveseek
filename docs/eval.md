@@ -368,7 +368,15 @@ defaults should stay.
 ```bash
 groove tune --kb-path knowledge-base
 groove tune --kb-path knowledge-base --format json > tune.json
+groove tune --kb-path knowledge-base --golden ./ci-golden.yml --limit 20
 ```
+
+It reads the same golden set as `groove eval` and takes the same flags for
+finding it: `--golden <PATH>` to use a file other than `.groove-eval.yml`,
+`--limit` to change how many hits each query fetches, `--no-color` to drop ANSI
+from the tables, and `--model` to match the index being measured. Unlike
+`eval`, it takes no `--reranker`: it measures the fusion stage, which sits
+before reranking.
 
 ### What it needs from your golden set
 

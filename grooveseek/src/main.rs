@@ -350,6 +350,7 @@ enum Commands {
 enum ServiceSubcommand {
     /// Install and register a groove service
     Install {
+        /// Name this instance, so several knowledge bases can run side by side
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
         #[arg(long)]
@@ -369,7 +370,15 @@ enum ServiceSubcommand {
     },
     /// Uninstall the groove service (use --purge --yes to also delete index DB and config)
     Uninstall {
-        #[arg(default_value = "groove")]
+        /// Which installed instance to remove
+        // Named the way `install` names it. This used to be positional, so the
+        // same thing had two spellings — `install --service-name x` against
+        // `uninstall x` — and `docs/stability.md` freezes subcommand
+        // positionals as well as long flags, so 1.0 would have kept both
+        // forever. The validator comes with it: a name `install` refuses can
+        // never have been installed, so requiring it here rejects nothing that
+        // used to work.
+        #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
         #[arg(long)]
         purge: bool,
@@ -378,7 +387,10 @@ enum ServiceSubcommand {
     },
     /// Show service status (running / stopped / not-found, bind, kb_path)
     Status {
-        #[arg(default_value = "groove")]
+        /// Which installed instance to report on
+        // Was positional for the same reason as `uninstall`'s, and stopped
+        // being so at the same time.
+        #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
     },
     /// List all installed groove service instances
@@ -386,6 +398,7 @@ enum ServiceSubcommand {
     /// (Windows-only) Install only the groove-tray.exe shell:startup shortcut
     /// without touching the daemon registration.
     TrayInstall {
+        /// Which installed instance the shortcut should start
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
         #[arg(long)]
@@ -394,6 +407,7 @@ enum ServiceSubcommand {
     /// (Windows-only) Remove only the groove-tray.exe shell:startup shortcut
     /// without touching the daemon registration.
     TrayUninstall {
+        /// Which instance's shortcut to remove
         #[arg(long, default_value = "groove", value_parser = grooveseek::service::validate_service_name)]
         service_name: String,
     },
@@ -2089,6 +2103,191 @@ mod naming_surface {
             .map(|s| s.text.to_string())
             .collect();
         assert_eq!(shown, want, "`--seed-strategy` advertises the wrong set");
+    }
+}
+
+/// `docs/stability.md` freezes "the long flags of the `groove` binary that this
+/// documentation describes", which is only a set if something decides what is in
+/// it. Left to prose, the answer is "whichever flags somebody happened to write
+/// about": `--schema` — the one way to point `validate` at a schema that is not
+/// beside the knowledge base — went unmentioned for its whole life and would
+/// have been left unfrozen by accident.
+///
+/// So the two directions are checked here instead. Every flag the binary accepts
+/// has to appear in the published documentation, and every flag-shaped token in
+/// that documentation has to be one the binary accepts or one of the few that
+/// belong to other programs. The second direction is not symmetry for its own
+/// sake: it is what found `--verbose` in the stability policy, a flag `groove`
+/// has never had.
+#[cfg(test)]
+mod documented_flags {
+    use super::*;
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// This crate lives at `<repo>/grooveseek`, and the documentation it has to
+    /// agree with is published from `<repo>`.
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate directory always has a parent")
+            .to_path_buf()
+    }
+
+    /// Everything a reader of the published documentation sees.
+    ///
+    /// `CHANGELOG.md` is left out on purpose: it records flags that *used* to
+    /// exist, and a removed flag must not stay frozen by its own obituary.
+    fn published_docs() -> String {
+        let root = repo_root();
+        let mut buf = String::new();
+        for name in ["README.md", "README.ja.md"] {
+            let p = root.join(name);
+            buf.push_str(&std::fs::read_to_string(&p).unwrap_or_else(|e| {
+                panic!(
+                    "{} must be readable to check flag coverage: {e}",
+                    p.display()
+                )
+            }));
+            buf.push('\n');
+        }
+        let docs = root.join("docs");
+        assert!(
+            docs.is_dir(),
+            "expected the documentation at {}. If the layout moved, this test \
+             moves with it rather than being deleted",
+            docs.display()
+        );
+        for entry in walkdir::WalkDir::new(&docs).into_iter().flatten() {
+            if entry.path().extension().is_some_and(|e| e == "md")
+                && let Ok(text) = std::fs::read_to_string(entry.path())
+            {
+                buf.push_str(&text);
+                buf.push('\n');
+            }
+        }
+        buf
+    }
+
+    /// Every long flag the binary accepts, as `(command path, flag)`.
+    ///
+    /// Keyed by the pair rather than by the flag: the same name lives on
+    /// several subcommands, and collapsing them would let documentation for one
+    /// vouch for another. Global flags are attributed to the root instead —
+    /// clap puts them on every subcommand, and they are documented once.
+    fn own_long_flags() -> BTreeSet<(String, String)> {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut BTreeSet<(String, String)>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    if long == "help" || long == "version" {
+                        continue; // clap generates these
+                    }
+                    let owner = if arg.is_global_set() { "groove" } else { path };
+                    out.insert((owner.to_string(), long.to_string()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                let child = format!("{path} {}", sub.get_name());
+                walk(sub, &child, out);
+            }
+        }
+        let cmd = Cli::command();
+        let mut out = BTreeSet::new();
+        walk(&cmd, "groove", &mut out);
+        out
+    }
+
+    /// The `--name` tokens appearing in a body of prose, as whole tokens.
+    ///
+    /// Both directions compare against this one set rather than searching for
+    /// substrings, because a flag can be a prefix of another: `--k` is inside
+    /// `--kb-path`, so `contains("--k")` would call `--k` documented on the
+    /// strength of a flag it has nothing to do with. The name may be a single
+    /// character for the same reason: `--k` is real, and a pattern demanding
+    /// two would leave the one case that needs this unprotected.
+    ///
+    /// The trailing boundary matters as much as the leading one. Greedy
+    /// `[a-z0-9-]*` stops at an uppercase letter or an underscore, so a
+    /// malformed `--kValue` in the prose would otherwise hand back `k` and
+    /// vouch for a flag nobody wrote about.
+    fn documented_flag_tokens() -> BTreeSet<String> {
+        let re =
+            regex::Regex::new(r"--([a-z][a-z0-9-]*)(?:[^A-Za-z0-9_]|$)").expect("a valid pattern");
+        re.captures_iter(&published_docs())
+            .map(|c| c[1].to_string())
+            .collect()
+    }
+
+    /// What this guarantees, and what it cannot.
+    ///
+    /// It guarantees that no flag ships undescribed — the thing that had gone
+    /// wrong, and the thing `docs/stability.md` needs in order to mean anything
+    /// by "documented".
+    ///
+    /// It does **not** guarantee that each command's copy of a shared name is
+    /// separately described. Checking that was implemented and measured, and it
+    /// cannot be done from prose: a section is free to mention another
+    /// command's flags, and legitimately does. The page describing
+    /// `groove doctor` says findings are fixed by `groove index --force`, so
+    /// any proximity rule counts `--force` as documented for `doctor` too.
+    /// Attaching flags to commands would need the documentation to carry
+    /// structure it does not have, and a rule that is wrong in both directions
+    /// is worse than a narrow one that is right.
+    ///
+    /// The pair is still carried through so that a failure names the command,
+    /// which is what someone reading the message needs.
+    #[test]
+    fn every_long_flag_the_binary_accepts_is_documented() {
+        let documented = documented_flag_tokens();
+        let missing: Vec<String> = own_long_flags()
+            .iter()
+            .filter(|(_, flag)| !documented.contains(flag))
+            .map(|(cmd, flag)| format!("`{cmd} --{flag}`"))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these flags appear nowhere in docs/ or the README, so \
+             docs/stability.md would not freeze them:\n  {}\n\
+             Document them where the command is documented, or remove them \
+             before 1.0. Leaving a flag undocumented is a decision, not an \
+             oversight.",
+            missing.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn the_documentation_does_not_name_flags_groove_lacks() {
+        // Flags of other programs, named in examples here. Each is the flag of
+        // a command the reader runs alongside `groove`, not of `groove`.
+        const FOREIGN: &[(&str, &str)] = &[
+            ("user", "systemctl --user, in the service migration note"),
+            ("debug", "groove-tray --debug, a separate binary"),
+            ("release", "cargo build --release, in the README"),
+            (
+                "include",
+                "huggingface-cli download --include, in clients.md",
+            ),
+        ];
+
+        // Which command owns a flag does not matter here; only whether the
+        // binary has it under any name at all.
+        let own: BTreeSet<String> = own_long_flags().into_iter().map(|(_, f)| f).collect();
+        let stray: Vec<String> = documented_flag_tokens()
+            .into_iter()
+            .filter(|f| !own.contains(f))
+            .filter(|f| !FOREIGN.iter().any(|(name, _)| name == f))
+            .collect();
+
+        assert!(
+            stray.is_empty(),
+            "the documentation names flags `groove` does not accept:\n  --{}\n\
+             Either the flag was renamed and the docs were not, or it never \
+             existed. If it belongs to another program, add it to FOREIGN with \
+             the reason.",
+            stray.join("\n  --")
+        );
     }
 }
 
