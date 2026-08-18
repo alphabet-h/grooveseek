@@ -103,6 +103,11 @@ Breaking any of these requires a major version.
   Six subcommands produce a result in that sense — `search`, `graph`, `doctor`,
   `validate`, `eval`, and `tune` — and for those six the channel is frozen.
 
+  `serve` is the seventh and the strictest. Over the default stdio transport its
+  stdout **is** the MCP connection, so nothing else may ever be written there:
+  a single stray line corrupts the session for every client. That is frozen too,
+  as a prohibition rather than a format.
+
   `index`, `status`, and `service` currently write everything they have to say
   to stderr, so **`groove status | …` receives nothing**, which is worth knowing
   before building a pipeline on it. Whether some of that is a result rather than
