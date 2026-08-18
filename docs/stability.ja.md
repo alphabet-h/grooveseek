@@ -109,7 +109,8 @@ peer loopback の要求である。
   この段落はそれを凍結しない**。stdout に移した場合、`2>&1` で受けている側は影響を受けず、
   stderr だけを捕まえている側が直す必要がある。その天秤を **1.0.0 までに**決める
   (1.0.0 が決めてしまうのではなく)。当面、`status` が最初に出す 2 つの数
-  (`documents` / `chunks`) を機械可読に取るなら `groove doctor --format json`
+  (`documents` / `chunks`) を機械可読に取る経路は `groove doctor --format json`
+  である。
 
 ### 機械可読な出力
 
@@ -205,7 +206,7 @@ snake_case で、配列は複数形。よって `--path-glob` と `path_globs` �
 | 除外ファイル | `.grooveignore` |
 | 評価セット / 履歴 | `.groove-eval.yml` / `.groove-eval-history.json` |
 | サービス成果物 | サービス名から導かれる task / unit / launch agent の名前、および config home の構成 |
-| 環境変数 | `GROOVE_CONFIG_HOME` / `GROOVE_TRAY_LOG` / `GROOVE_BIN` |
+| 環境変数 | `GROOVE_CONFIG_HOME` / `GROOVE_TRAY_LOG` (`FASTEMBED_CACHE_DIR` は fastembed の名前なので尊重はするが凍結対象にはしない。`GROOVE_BIN` は同梱サンプル hook の変数で、バイナリは読まない) |
 
 ## 非安定 (Unstable)
 

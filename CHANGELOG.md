@@ -14,19 +14,6 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
-### Removed
-
-- **`/api/search`.** It accepted `query` and `limit` — 2 of the 17 parameters
-  the MCP `search` tool takes — so `/mcp` was already the better endpoint for
-  anything outside the process, and `/ui` uses `/mcp` now. The endpoint was
-  declared unstable in [docs/stability.md](docs/stability.md), and this removes
-  it before 1.0.0 rather than during it.
-
-  If you were calling it directly, `/mcp` answers the same query with the whole
-  parameter set and no session handshake — see the request shape in the
-  `/ui` source (`grooveseek/src/transport/webui_index.html`), which is now the
-  smallest working example of an MCP client over Streamable HTTP.
-
 ### Added
 
 - **The documentation is published as a site.** `docs/` is the GitHub Pages
@@ -67,59 +54,38 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `text/plain` so an `<img>` will not render it, and the screenshots are PNG in
   any case. `assets/README.md` records the reasoning and how to regenerate.
 
-### Fixed
+- **`[transport.http].allowed_origins`.** Names the browser origins the server
+  accepts. Needed when a browser reaches groove through a reverse proxy, because
+  the browser then sends the *public* origin and the loopback default will not
+  match it. Entries carry a scheme and bracket IPv6, since they are compared as
+  RFC 6454 `(scheme, host, port)` triples.
 
-- **`groove search` ignored `rerank_by_default`.** The key decided whether
-  `serve` reranked every call; the command line did not read it at all. One
-  `groove.toml` carrying `reranker = "bge-v2-m3"` beside
-  `rerank_by_default = false` therefore reranked from the CLI and did not rerank
-  from the server — and three of the shipped deployment recipes are that exact
-  pair. The difference is not subtle: measured here on a warm cache, the same
-  query took 7 seconds without the cross-encoder and 72 with it.
+  Setting it **replaces** the default list rather than extending it, matching
+  `allowed_hosts`. Keep the loopback entries alongside your public origin if
+  browser-based clients also reach you over loopback.
 
-  **This changes behaviour.** With `rerank_by_default = false` next to a
-  `reranker`, `groove search` no longer reranks. Naming a model on the command
-  line opts a single query back in — `--reranker bge-v2-m3` — and
-  `--reranker none` opts a single query out, which is how a CLI argument has
-  always related to the file. No `--rerank` flag was added for it:
-  [docs/stability.md](docs/stability.md) freezes the MCP `rerank` parameter as
-  the per-call boolean and `--reranker` as the model picker, and a `--rerank`
-  one letter away from it, taking a different type, would be frozen beside it
-  at 1.0.0.
+  An empty list disables validation entirely and now warns at startup. Like
+  `allowed_hosts`, `healthz_public` and `max_sessions`, the key is **ignored when
+  it comes from a config file groove discovered rather than one you passed with
+  `--config`** — otherwise whoever can write a `groove.toml` beside the binary
+  could name their own origin, or blank the list, and turn the check off.
 
-  The decision now lives in one function both surfaces call. Each still spells
-  its own per-call override — a parameter on one side, naming a model on the
-  other — but what an override *means*, and what happens without one, is a
-  single expression. Writing that twice is how the two came apart to begin with.
+- **A stability policy: [docs/stability.md](docs/stability.md).** It states what
+  1.0.0 will freeze and — more usefully — what it deliberately will not. Without
+  it, tagging 1.0.0 would promise that everything observable stays fixed until
+  2.0.0: 408 public Rust items across 24 modules, 138 command-line flags, 6 MCP
+  tools, 11 configuration sections, and a SQLite schema.
 
-  `groove eval` keeps reading only `--reranker`, deliberately: its run
-  fingerprint records the model and not this key, so honouring it would let two
-  runs carry the same fingerprint while measuring different pipelines — and
-  `--fail-on-regression` picks its baseline by fingerprint equality.
+  Stable from 1.0.0: subcommand names and documented flags, exit codes, the
+  stdout/stderr split, the JSON from `search` and `graph` (fields may be added, so
+  ignore ones you do not recognise), MCP tool and prompt names with their schemas,
+  the `kb://` resource scheme, `/mcp` and `/healthz`, configuration keys and
+  defaults, the default embedding model, and the names written into your
+  filesystem.
 
-- **`--min-confidence-ratio` accepted `nan` and `inf`.** A non-finite ratio
-  compares false against every score, so a value passed in order to *tighten*
-  the low-confidence check switched it off instead. The JSON echo could not
-  report that either: serde writes a non-finite float as `null`, and the
-  null-stripping pass then drops the key, leaving output with no trace of the
-  override. The flag now requires a finite value `>= 0.0` — `0.0` is still how
-  the check is disabled — and rejects before any model is loaded.
-  `[search].min_confidence_ratio` in `groove.toml` is held to the same rule by
-  the same predicate, which matters because that is the path `serve` reads. The
-  MCP parameter is unchanged: it cannot refuse a value mid-conversation, so it
-  substitutes — a non-finite ratio is logged and replaced by the server's own,
-  and a negative one is clamped to `0.0`.
-
-- **`docs/usage.md` said the CLI and the MCP tool answer with the same JSON.**
-  The wrapper is the same — `results`, `low_confidence`, `filter_applied` — but
-  the hits are not: an MCP hit also carries a `uri` when the document is one the
-  server will hand over, and a CLI hit never does. The sentence now says which
-  part is shared and links to where the `uri` rule is written down.
-
-- **`docs/stability.md` described a flag that does not exist.** It offered
-  `--verbose` as the way to get more detail; `groove` has never had one.
-  Verbosity comes from `RUST_LOG`, which appeared nowhere in the documentation.
-  The paragraph names the real mechanism now.
+  Explicitly **not** stable: `/ui` and `/api/*` (loopback-only admin surface, due
+  to be rebuilt), all human-readable text output, the internal database schema, log
+  wording, and the Rust API. Reasoning: [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md).
 
 ### Changed
 
@@ -235,66 +201,6 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   served but unable to query, and the server now warns about that at startup
   rather than leaving a silent 403 on screen.
 
-### Security
-
-- **The HTTP transport now validates the `Origin` header, which it never did.**
-  The MCP specification's Streamable HTTP section states that a server *"**MUST**
-  validate the `Origin` header on all incoming connections to prevent DNS
-  rebinding attacks"*. rmcp implements the check but defaults it to an empty
-  list, which means *do not validate*, and groove never set it — so every release
-  up to and including v0.26.0 accepted any `Origin`. Measured against a running
-  v0.26.0 daemon: `Origin: http://evil.example` was answered normally.
-
-  The default is now the loopback origins for whichever port is bound
-  (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`).
-
-  **This does not break existing clients.** Per RFC 6454 a request that carries
-  no `Origin` header passes, and ordinary MCP clients, the tray and `curl` send
-  none. What it stops is a web page open in the operator's own browser reaching
-  `/mcp` cross-origin. It is not authentication, and groove still has none.
-
-  **It covers `/mcp`, and `/ui` searches through `/mcp`** (see below), so this
-  list decides whether the built-in page can query. `/api/admin/status` has no
-  `Origin` check of its own; it is restricted by requiring a loopback peer,
-  which is not configurable.
-
-### Added
-
-- **`[transport.http].allowed_origins`.** Names the browser origins the server
-  accepts. Needed when a browser reaches groove through a reverse proxy, because
-  the browser then sends the *public* origin and the loopback default will not
-  match it. Entries carry a scheme and bracket IPv6, since they are compared as
-  RFC 6454 `(scheme, host, port)` triples.
-
-  Setting it **replaces** the default list rather than extending it, matching
-  `allowed_hosts`. Keep the loopback entries alongside your public origin if
-  browser-based clients also reach you over loopback.
-
-  An empty list disables validation entirely and now warns at startup. Like
-  `allowed_hosts`, `healthz_public` and `max_sessions`, the key is **ignored when
-  it comes from a config file groove discovered rather than one you passed with
-  `--config`** — otherwise whoever can write a `groove.toml` beside the binary
-  could name their own origin, or blank the list, and turn the check off.
-
-- **A stability policy: [docs/stability.md](docs/stability.md).** It states what
-  1.0.0 will freeze and — more usefully — what it deliberately will not. Without
-  it, tagging 1.0.0 would promise that everything observable stays fixed until
-  2.0.0: 408 public Rust items across 24 modules, 138 command-line flags, 6 MCP
-  tools, 11 configuration sections, and a SQLite schema.
-
-  Stable from 1.0.0: subcommand names and documented flags, exit codes, the
-  stdout/stderr split, the JSON from `search` and `graph` (fields may be added, so
-  ignore ones you do not recognise), MCP tool and prompt names with their schemas,
-  the `kb://` resource scheme, `/mcp` and `/healthz`, configuration keys and
-  defaults, the default embedding model, and the names written into your
-  filesystem.
-
-  Explicitly **not** stable: `/ui` and `/api/*` (loopback-only admin surface, due
-  to be rebuilt), all human-readable text output, the internal database schema, log
-  wording, and the Rust API. Reasoning: [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md).
-
-### Changed
-
 - **`grooveseek` is marked `publish = false`.** The Rust API is not part of the 1.0
   promise, and `cargo package` cannot succeed anyway while the workspace uses
   unversioned path dependencies. `cargo publish` now refuses rather than relying on
@@ -336,6 +242,118 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `/api/admin/status` stays: it reports operational state (version, pid,
   indexing progress) that does not belong in a tool surface built for language
   models. Both remain unstable, so this is notice rather than a promise.
+
+### Fixed
+
+- **The intranet-HTTP recipe never mentioned `allowed_origins`.** That release
+  adds Origin validation and turns it on by default, and the recipe it matters
+  most for — a reverse proxy terminating TLS in front of the server — explained
+  only the `Host` half. Following it as written left every browser-based client
+  refused with no indication why. The config template, the threat table and the
+  nginx step now name the key and say that a browser behind a proxy sends the
+  *public* origin.
+
+- **`docs/behavior.md` said groove has no authentication "yet".** That reads as a
+  promise; [docs/stability.md](docs/stability.md) states the opposite — no
+  authentication, by design, with the boundary belonging to whatever runs in
+  front. A page describing behaviour and a page defining the 1.0 surface must not
+  disagree about a security posture.
+
+- **`docs/stability.md` froze an environment variable the binary does not read.**
+  `GROOVE_BIN` is a variable of the shipped example hook. The three the binary
+  actually reads are `GROOVE_CONFIG_HOME`, `GROOVE_TRAY_LOG`, and fastembed's own
+  `FASTEMBED_CACHE_DIR`, which is not ours to freeze. Same shape as the
+  `--verbose` entry below, found the same way — by checking the list against the
+  code rather than reading it.
+
+- **`groove search` ignored `rerank_by_default`.** The key decided whether
+  `serve` reranked every call; the command line did not read it at all. One
+  `groove.toml` carrying `reranker = "bge-v2-m3"` beside
+  `rerank_by_default = false` therefore reranked from the CLI and did not rerank
+  from the server — and three of the shipped deployment recipes are that exact
+  pair. The difference is not subtle: measured here on a warm cache, the same
+  query took 7 seconds without the cross-encoder and 72 with it.
+
+  **This changes behaviour.** With `rerank_by_default = false` next to a
+  `reranker`, `groove search` no longer reranks. Naming a model on the command
+  line opts a single query back in — `--reranker bge-v2-m3` — and
+  `--reranker none` opts a single query out, which is how a CLI argument has
+  always related to the file. No `--rerank` flag was added for it:
+  [docs/stability.md](docs/stability.md) freezes the MCP `rerank` parameter as
+  the per-call boolean and `--reranker` as the model picker, and a `--rerank`
+  one letter away from it, taking a different type, would be frozen beside it
+  at 1.0.0.
+
+  The decision now lives in one function both surfaces call. Each still spells
+  its own per-call override — a parameter on one side, naming a model on the
+  other — but what an override *means*, and what happens without one, is a
+  single expression. Writing that twice is how the two came apart to begin with.
+
+  `groove eval` keeps reading only `--reranker`, deliberately: its run
+  fingerprint records the model and not this key, so honouring it would let two
+  runs carry the same fingerprint while measuring different pipelines — and
+  `--fail-on-regression` picks its baseline by fingerprint equality.
+
+- **`--min-confidence-ratio` accepted `nan` and `inf`.** A non-finite ratio
+  compares false against every score, so a value passed in order to *tighten*
+  the low-confidence check switched it off instead. The JSON echo could not
+  report that either: serde writes a non-finite float as `null`, and the
+  null-stripping pass then drops the key, leaving output with no trace of the
+  override. The flag now requires a finite value `>= 0.0` — `0.0` is still how
+  the check is disabled — and rejects before any model is loaded.
+  `[search].min_confidence_ratio` in `groove.toml` is held to the same rule by
+  the same predicate, which matters because that is the path `serve` reads. The
+  MCP parameter is unchanged: it cannot refuse a value mid-conversation, so it
+  substitutes — a non-finite ratio is logged and replaced by the server's own,
+  and a negative one is clamped to `0.0`.
+
+- **`docs/usage.md` said the CLI and the MCP tool answer with the same JSON.**
+  The wrapper is the same — `results`, `low_confidence`, `filter_applied` — but
+  the hits are not: an MCP hit also carries a `uri` when the document is one the
+  server will hand over, and a CLI hit never does. The sentence now says which
+  part is shared and links to where the `uri` rule is written down.
+
+- **`docs/stability.md` described a flag that does not exist.** It offered
+  `--verbose` as the way to get more detail; `groove` has never had one.
+  Verbosity comes from `RUST_LOG`, which appeared nowhere in the documentation.
+  The paragraph names the real mechanism now.
+
+### Removed
+
+- **`/api/search`.** It accepted `query` and `limit` — 2 of the 17 parameters
+  the MCP `search` tool takes — so `/mcp` was already the better endpoint for
+  anything outside the process, and `/ui` uses `/mcp` now. The endpoint was
+  declared unstable in [docs/stability.md](docs/stability.md), and this removes
+  it before 1.0.0 rather than during it.
+
+  If you were calling it directly, `/mcp` answers the same query with the whole
+  parameter set and no session handshake — see the request shape in the
+  `/ui` source (`grooveseek/src/transport/webui_index.html`), which is now the
+  smallest working example of an MCP client over Streamable HTTP.
+
+### Security
+
+- **The HTTP transport now validates the `Origin` header, which it never did.**
+  The MCP specification's Streamable HTTP section states that a server *"**MUST**
+  validate the `Origin` header on all incoming connections to prevent DNS
+  rebinding attacks"*. rmcp implements the check but defaults it to an empty
+  list, which means *do not validate*, and groove never set it — so every release
+  up to and including v0.26.0 accepted any `Origin`. Measured against a running
+  v0.26.0 daemon: `Origin: http://evil.example` was answered normally.
+
+  The default is now the loopback origins for whichever port is bound
+  (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`).
+
+  **This does not break existing clients.** Per RFC 6454 a request that carries
+  no `Origin` header passes, and ordinary MCP clients, the tray and `curl` send
+  none. What it stops is a web page open in the operator's own browser reaching
+  `/mcp` cross-origin. It is not authentication, and groove still has none.
+
+  **It covers `/mcp`, and `/ui` searches through `/mcp`** (see below), so this
+  list decides whether the built-in page can query. `/api/admin/status` has no
+  `Origin` check of its own; it is restricted by requiring a loopback peer,
+  which is not configurable.
+
 
 ## [0.26.0] - 2026-08-17
 
@@ -3747,7 +3765,7 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v0.26.0...HEAD
 [0.26.0]: https://github.com/alphabet-h/grooveseek/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/alphabet-h/grooveseek/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/alphabet-h/grooveseek/compare/v0.23.0...v0.24.0

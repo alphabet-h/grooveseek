@@ -137,7 +137,7 @@ opt-in、そして運用責任は利用者にある。
 | LAN 上での平文盗聴 (HTTP 暗号化なし) | nginx / Caddy で TLS termination、groove は loopback bind のみ |
 | LAN 内の不正クライアント | reverse proxy で HTTP basic auth or mTLS、またはアクセス制御済 subnet 内に隔離 |
 | 悪意ある大量リクエスト (DoS) | proxy 側のレート制限。groove 本体にレート制限機能なし |
-| ブラウザからの DNS rebinding | Host ヘッダを `[transport.http].allowed_hosts` と照合する (v0.5.0+)。自分のホスト名を列挙するまでは loopback のみ許可。`/healthz` は既定で対象外だが、`healthz_public = false` (v0.8.0+) で同じ検証下に置ける |
+| ブラウザからの DNS rebinding | 検証は 2 段。まず Host ヘッダを `[transport.http].allowed_hosts` と照合する (v0.5.0+、自分のホスト名を列挙するまでは loopback のみ許可)。次に Origin ヘッダを `[transport.http].allowed_origins` と照合する (v0.27.0+、既定は bind port の loopback origin)。Origin を送らない要求 (通常の MCP クライアント / `curl`) は通過する。**proxy 越しのブラウザは公開 origin を送る**ので、そこに列挙しない限りブラウザ由来のクライアントは全て 403 になる。`/healthz` は既定で Host 検証の対象外だが、`healthz_public = false` (v0.8.0+) で同じ検証下に置ける |
 
 Web UI (`/ui`) と admin API (`/api/admin/*`) は **他マシンから到達できない**。
 これらは別の check の背後にあり、Host ヘッダが allow-list に載っていても
@@ -165,7 +165,9 @@ SSH port forward (`ssh -L 3100:127.0.0.1:3100 kb-server.lan`) 経由にする。
 `/healthz` だけ** を allow-list として proxy する — 他の route (`/ui` /
 `/api/admin/*`) はすべて loopback gate 付きで、同一ホストの
 proxy はその gate を無効化する (上の警告を参照)。クライアントの Host を転送し (`proxy_set_header Host $host;`)、
-その名前を `[transport.http].allowed_hosts` に列挙する。
+その名前を `[transport.http].allowed_hosts` に列挙する。ブラウザ由来の
+クライアントが繋ぐなら、**公開 origin を `[transport.http].allowed_origins` にも
+列挙する** — ブラウザが送るのはサーバではなく proxy の origin である。
 
 ### `alwaysLoad: true` (クライアント側)
 

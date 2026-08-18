@@ -146,7 +146,7 @@ binding to `0.0.0.0` is opt-in and your responsibility.
 | Casual local-network sniff (HTTP unencrypted) | Front groove with nginx/Caddy doing TLS termination, bind groove to loopback only |
 | Unauthorized clients on the LAN | Reverse proxy with HTTP basic auth or mTLS; or run groove on a per-team subnet that's already access-controlled |
 | Malicious request floods (DoS) | Rate limiting on the proxy. groove itself has no rate limiter. |
-| DNS rebinding from a browser | The Host header is validated against `[transport.http].allowed_hosts` — loopback only unless you list your own hostnames (v0.5.0+). `/healthz` is exempt by default; set `healthz_public = false` (v0.8.0+) to put it behind the same check. |
+| DNS rebinding from a browser | Two checks, in this order. The Host header is validated against `[transport.http].allowed_hosts` — loopback only unless you list your own hostnames (v0.5.0+). Then the Origin header against `[transport.http].allowed_origins`, which defaults to the loopback origins for the bind port (v0.27.0+). Requests with no Origin — ordinary MCP clients, `curl` — pass. **A browser reaching you through the proxy sends the public origin, so list it there or every browser-based client is refused.** `/healthz` is exempt from the Host check by default; set `healthz_public = false` (v0.8.0+) to put it behind the same check. |
 
 The web UI (`/ui`) and the admin API (`/api/admin/*`) are **not** reachable
 from other machines: they sit behind a separate check that also requires the
@@ -176,7 +176,9 @@ Bind groove to `127.0.0.1:3100` in `groove.toml`, and configure nginx to
 proxy **`/mcp` and `/healthz` only**, as an allow-list — every other route
 (`/ui`, `/api/admin/*`) is loopback-gated and a same-host proxy
 would defeat that gate (see the warning above). Forward the client's Host (`proxy_set_header Host $host;`)
-and list that name in `[transport.http].allowed_hosts`.
+and list that name in `[transport.http].allowed_hosts`. If browser-based clients
+will connect, list the public origin in `[transport.http].allowed_origins` as
+well — the browser sends the proxy's origin, not the server's.
 
 ### `alwaysLoad: true` (client-side)
 

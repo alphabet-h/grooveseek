@@ -60,3 +60,15 @@ bind = "127.0.0.1:3100"
 # proxy must forward it, e.g. nginx `proxy_set_header Host $host;`).
 # An empty list disables the check entirely — do not do that on a network you
 # do not fully trust.
+
+# Browser Origin allow-list (v0.27.0+). Unlike allowed_hosts this one is ON by
+# default — the MCP specification requires Origin validation — and omitting it
+# accepts only the loopback origins for the bind port. A browser reaching you
+# through the proxy sends the PUBLIC origin, so a browser-based client gets a
+# 403 until you name it here. Requests with no Origin header (ordinary MCP
+# clients, curl) always pass.
+#
+# Setting the key REPLACES the default, so keep the loopback entries if you
+# also browse from the server itself. Entries carry a scheme and bracket IPv6.
+#
+# allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]
