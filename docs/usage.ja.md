@@ -107,8 +107,8 @@ groove service install --service-name personal --kb-path /path/to/personal-kb --
 # 確認 / 管理
 groove service status                              # default 'groove'
 groove service list                                # 全 instance
-groove service uninstall personal                  # unit のみ削除、config + DB 残す
-groove service uninstall personal --purge --yes    # config + DB も削除
+groove service uninstall --service-name personal               # unit のみ削除、config + DB 残す
+groove service uninstall --service-name personal --purge --yes # config + DB も削除
 ```
 
 OS 別バックエンド:
@@ -151,7 +151,7 @@ Tray log は `%LOCALAPPDATA%\groove\logs\tray.YYYY-MM-DD` (= 日次 rotation)。
 daemon を uninstall すると tray shortcut も一緒に削除:
 
 ```bash
-groove service uninstall groove
+groove service uninstall --service-name groove
 ```
 
 daemon と独立に tray shortcut だけ管理する subcommand:
@@ -319,6 +319,16 @@ groove validate --kb-path /path/to/knowledge-base
 groove validate --kb-path ... --format json | jq '.files[]'
 groove validate --kb-path ... --format github         # CI 用 ::error annotation
 ```
+
+フラグ:
+
+- `--schema <PATH>` — `<kb-path>/groove-schema.toml` 以外からスキーマを読む。
+  **ナレッジベースの隣に置かないスキーマを使う唯一の手段** — 複数のベースで
+  1 つのスキーマを共有する、CI 用に厳しめのものを別に置く、といった場合
+- `--fail-fast` — 最初の違反で exit 1 して残りを走査しない。
+  「何が悪いか」ではなく「きれいかどうか」だけ知りたいときに使う
+- `--no-color` — `--format text` の ANSI 色を落とす。stdout が TTY でなければ
+  元から色は付かないので、TTY のときに落としたい場合のフラグ
 
 終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)。`--kb-path` 直下に `groove-schema.toml` が無いときは短い "no schema found" メッセージと共に exit 0 となるため、既存ワークフローへの `groove validate` 追加は実際にスキーマを書くまで非破壊。
 

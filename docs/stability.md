@@ -84,22 +84,58 @@ Breaking any of these requires a major version.
 ### Command line
 
 - **Subcommand names** and their **positional arguments**.
-- **Documented long flags** (`--kb-path`, `--config`, …). Short forms are stable
-  where they are documented.
+- **The long flags of the `groove` binary that this documentation describes**
+  (`--kb-path`, `--config`, …). Short forms are stable where they are
+  documented. Two things this deliberately excludes: flags of *other* programs
+  that appear in examples here — `systemctl --user`, `cargo --release`,
+  `huggingface-cli --include` — and the flags of `groove-tray`, which is a
+  companion binary rather than the command line this policy covers.
+
+  "Documented" is checked rather than assumed: a test walks every subcommand of
+  `groove` and fails if a long flag it accepts appears nowhere in `docs/` or the
+  README, so the frozen set cannot be decided by which flags happened to get
+  written about.
 - **Exit codes**.
-- **The split between stdout and stderr**: a command's *result* goes to stdout and
-  its *diagnostics* go to stderr. Pipelines depend on this, so it is frozen for
-  every subcommand.
+- **The split between stdout and stderr**: where a command produces a *result*,
+  the result goes to stdout and diagnostics go to stderr. Pipelines depend on
+  this, so it is frozen.
+
+  Six subcommands produce a result in that sense — `search`, `graph`, `doctor`,
+  `validate`, `eval`, and `tune`. `index`, `status`, and `service` write
+  everything they have to say to stderr, because what they emit is progress and
+  operational state rather than an answer to a query. **`groove status | …`
+  therefore receives nothing**, which is worth knowing before building a
+  pipeline on it. `groove doctor --format json` is the machine-readable route to
+  the two numbers `status` leads with, `documents` and `chunks`; the rest of
+  what `status` prints has no JSON form today.
 
 ### Machine-readable output
 
-- The **JSON** emitted by `search` and `graph`: every field documented today keeps
-  its name, type, and meaning.
+Every subcommand that takes `--format` is listed here, in one of the two groups,
+so that silence is never mistaken for a promise.
+
+**Stable** — these exist to be read by something other than a person:
+
+- The **JSON** emitted by `search`, `graph`, `doctor`, and `validate`: every
+  field documented today keeps its name, type, and meaning.
+- `validate --format github`, the GitHub Actions annotation form
+  (`::error file=…::message`). Its shape is GitHub's rather than ours; what is
+  promised here is that the flag keeps producing it.
 - **New fields may be added in a minor release.** Consumers must ignore fields they
   do not recognise — that is the mechanism by which the format can grow at all.
 
-Text output from `doctor`, `validate`, `eval`, `tune`, and `status` is written for
-people to read. It is **not** stable; see [Unstable](#unstable).
+**Not stable** — see [Unstable](#unstable):
+
+- All `--format text` output, from every subcommand, plus what `status` prints.
+  It is written for people to read, and gets reworded when a clearer wording
+  turns up.
+- `graph --format dot` and `--format svg`. They are drawings: the DOT is valid
+  DOT and the SVG is valid SVG, but the layout, the labels, and the colours are
+  presentation and will change.
+- The **JSON** emitted by `eval` and `tune`. Both are power-user measurement
+  tools whose numbers evolve with the metrics themselves — `eval` already
+  fingerprints its history with a `metric_version` for exactly that reason, and
+  freezing the shape would freeze the metrics with it.
 
 ### MCP surface
 
@@ -204,12 +240,21 @@ in a tool surface designed for language models.
 Read that as advance notice, not as a schedule. These surfaces are unstable, so
 nothing above is promised in either direction.
 
-### Human-readable output
+### Human-readable output, and the two measurement tools
 
-The text printed by `doctor`, `validate`, `eval`, `tune`, and `status` may be
-reworded, reordered, or extended at any time. **Do not parse it.** Where a stable
-machine-readable form is needed and does not exist, that is a missing feature —
-please open an issue rather than writing a screen-scraper.
+The text printed by any subcommand — including `search --format text` and
+`graph --format text` — may be reworded, reordered, or extended at any time.
+**Do not parse it.** The same goes for `graph --format dot` and `--format svg`:
+they are pictures, and how a picture is laid out is presentation.
+
+`eval --format json` and `tune --format json` are also unstable, despite being
+JSON. They report retrieval measurements, and the measurements themselves are
+expected to improve; `eval` already records a `metric_version` in its history
+file so that runs made under different definitions are not compared. Freezing
+the JSON would freeze the metrics.
+
+Where a stable machine-readable form is needed and does not exist, that is a
+missing feature — please open an issue rather than writing a screen-scraper.
 
 ### The index database
 
@@ -232,8 +277,10 @@ its own stability statement.
 
 ### Diagnostics and logs
 
-Log lines, their levels, and the wording of warnings are not stable. `--verbose`
-output in particular is a debugging aid.
+Log lines, their levels, and the wording of warnings are not stable. Verbosity is
+set through `RUST_LOG` — `RUST_LOG=grooveseek=debug` for the detail, `info` when
+it is unset — and what that detail contains is a debugging aid rather than an
+interface.
 
 ## Deprecation
 

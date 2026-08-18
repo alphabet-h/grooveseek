@@ -67,7 +67,49 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `text/plain` so an `<img>` will not render it, and the screenshots are PNG in
   any case. `assets/README.md` records the reasoning and how to regenerate.
 
+### Fixed
+
+- **`docs/stability.md` described a flag that does not exist.** It offered
+  `--verbose` as the way to get more detail; `groove` has never had one.
+  Verbosity comes from `RUST_LOG`, which appeared nowhere in the documentation.
+  The paragraph names the real mechanism now.
+
 ### Changed
+
+- **`groove service uninstall` and `service status` take `--service-name`
+  instead of a positional.** `install`, `tray-install` and `tray-uninstall`
+  already named the instance with a flag, so the same thing had two spellings —
+  `install --service-name work` against `uninstall work`.
+  [docs/stability.md](docs/stability.md) freezes subcommand positionals as well
+  as long flags, which would have kept both forever, and a positional cannot be
+  taken away afterwards at all.
+
+  The two also gained the name validation the other three already had. A name
+  `install` refuses can never have been installed, so nothing that used to work
+  stops working.
+
+- **`docs/stability.md` now says what it freezes, rather than leaving it to be
+  inferred.**
+
+  *Which flags.* The promise is scoped to the `groove` binary and to flags this
+  documentation describes — and "documented" is now checked by a test rather
+  than assumed. Two flags were undocumented and would have been left unfrozen by
+  accident: `groove validate --schema`, the only way to point validation at a
+  schema that does not sit beside the knowledge base, and `--fail-fast`. Both
+  are written up in [docs/usage.md](docs/usage.md) now.
+
+  *Which output.* Every subcommand that takes `--format` is listed in one of two
+  groups, because nine of them were in neither and silence reads as a promise.
+  The JSON of `search`, `graph`, `doctor` and `validate` is stable, as is
+  `validate --format github`. Text output is not, from any subcommand; neither
+  are `graph --format dot` and `--format svg`, which are drawings; neither is
+  the JSON of `eval` and `tune`, whose numbers are expected to improve — `eval`
+  already stamps its history with a `metric_version` for that reason.
+
+  *Which channel.* The stdout/stderr split is stated as it actually is. Six
+  subcommands produce a result on stdout; `index`, `status` and `service` write
+  everything to stderr, so `groove status | …` receives nothing. That was true
+  before and the document said otherwise.
 
 - **The command line and the MCP tools now use the same noun for the same
   thing, and [docs/stability.md](docs/stability.md) says which parts of the two
