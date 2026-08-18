@@ -79,7 +79,7 @@ This stage is what `groove eval` measures by default: any improvement here lifts
 
 ## Stage 2 — Reranker (optional, v0.1.0+)
 
-When `--reranker` is set (or `[reranker]` in `groove.toml`), the top RRF candidates are re-scored by a cross-encoder before being returned. The score column switches from RRF to the reranker raw score.
+When `--reranker` is set (or the `reranker` key in `groove.toml`), the top RRF candidates are re-scored by a cross-encoder before being returned. The score column switches from RRF to the reranker raw score. A model that came from the file is still subject to `rerank_by_default`; naming one on the command line is an unconditional choice for that query. See [Reranking](usage.md#when-to-enable-reranking).
 
 When **MMR is enabled**, groove pulls a *larger candidate pool* (`limit × 5`, min 50) through the reranker so that diversity re-rank has room to operate. When MMR is off, the reranker input limit matches `limit` (or `limit × 5` when only reranking, preserving pre-v0.7.0 reranker overfetch behavior). Parent retriever does **not** enlarge the pool — it is a content-only stage that runs on the already-selected hits, so reranker workload is unchanged when only `--parent-retriever` is set.
 

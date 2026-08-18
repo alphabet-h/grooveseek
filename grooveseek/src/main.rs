@@ -430,29 +430,29 @@ fn parse_unit_f32(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
-/// Parse the `--min-confidence-ratio` value: finite and non-negative.
+/// Parse the `--min-confidence-ratio` value.
 ///
 /// [`parse_unit_f32`] cannot serve here — it holds values to `[0.0, 1.0]`, and
-/// this one defaults to 1.5. What the two share is the reason for rejecting at
-/// the entry: a `nan` reaching [`compute_low_confidence`] makes every comparison
-/// against it false, which turns the flag off instead of tightening it, and the
-/// JSON echo cannot report what happened either (serde writes a non-finite float
-/// as `null` and `strip_null_keys` then drops the key). The caller would see a
-/// result with no `low_confidence` and no sign that the override was ignored.
+/// this one defaults to 1.5. The rule that does apply lives in
+/// [`check_confidence_ratio`], shared with the `[search].min_confidence_ratio`
+/// key so that the flag and the file cannot come to mean different things; this
+/// function only turns the text into a number and reports the reason clap will
+/// print.
 ///
-/// The MCP side of the same value stays lenient on purpose (`server.rs` warns and
-/// falls back to the server default): a tool call has no one to show an argument
-/// error to mid-conversation, while a shell does.
+/// What rejecting at the entry buys, beyond the model download it saves: the
+/// JSON echo could not report the problem afterwards. serde writes a non-finite
+/// float as `null` and `strip_null_keys` drops the key, so the caller would see
+/// a result with no `low_confidence` and no sign that the override was ignored.
 ///
-/// [`compute_low_confidence`]: grooveseek::server::compute_low_confidence
+/// The MCP parameter of the same name is deliberately not held to this — it
+/// cannot refuse a value mid-conversation, so it substitutes: a non-finite ratio
+/// is logged and replaced by the server's own, and a negative one is clamped to
+/// `0.0`, which disables the check.
+///
+/// [`check_confidence_ratio`]: grooveseek::config::check_confidence_ratio
 fn parse_confidence_ratio(s: &str) -> Result<f32, String> {
     let v: f32 = s.parse().map_err(|e| format!("not a valid f32: {e}"))?;
-    if !v.is_finite() {
-        return Err("must be finite".into());
-    }
-    if v < 0.0 {
-        return Err("must be >= 0.0 (0.0 disables the low_confidence check)".into());
-    }
+    grooveseek::config::check_confidence_ratio(v).map_err(str::to_owned)?;
     Ok(v)
 }
 
@@ -732,8 +732,10 @@ fn main() -> anyhow::Result<()> {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
             let reranker = reranker.or(cfg.reranker).unwrap_or_default();
-            // rerank_by_default の CLI 既定値は `true` (reranker 有効時のみ意味を持つ)。
-            let rerank_by_default = rerank_by_default.or(cfg.rerank_by_default).unwrap_or(true);
+            // rerank_by_default の既定は 1 か所 (reranker 有効時のみ意味を持つ)。
+            let rerank_by_default = rerank_by_default
+                .or(cfg.rerank_by_default)
+                .unwrap_or(grooveseek::server::RERANK_BY_DEFAULT);
 
             let exclude_headings = cfg.exclude_headings.clone();
             let exclude_dirs = cfg.resolve_exclude_dirs();
@@ -1803,25 +1805,24 @@ fn print_graph(g: grooveseek::graph::ConnectionGraph, format: GraphFormat) {
     }
 }
 
-/// Whether a one-shot `groove search` should actually rerank.
+/// How `groove search` spells the per-call rerank override, and nothing else.
 ///
-/// `serve` decides this at startup — `--rerank-by-default`, else the
-/// `rerank_by_default` key, else `true` — and the MCP `search` tool overrides it
-/// per call. The command line consulted neither: it built a reranker whenever one
-/// was *configured*, so a `groove.toml` carrying `reranker = "bge-v2-m3"` next to
-/// `rerank_by_default = false` reranked from the CLI and did not rerank from the
-/// server. Three of the shipped deployment recipes are that exact pair.
+/// The decision itself is [`grooveseek::server::should_rerank`], shared with the
+/// MCP tool — writing a second copy of it here is how the two surfaces drifted
+/// apart in the first place. What is genuinely local is the translation: over
+/// MCP the override is the `rerank` parameter, and here it is naming a model.
 ///
-/// The per-query override on this side is `--reranker` itself. Naming a model on
-/// the command line is a statement about this query, so it wins outright — the
-/// rule `docs/configuration.md` already states for every other option, that CLI
-/// arguments always win — and `--reranker none` turns rerank off for one query the
-/// same way. No `--rerank` flag was added for it: `docs/stability.md` freezes the
-/// MCP `rerank` parameter as the per-call boolean and `--reranker` as the model
+/// Naming one on the command line is a statement about this query, so it wins
+/// outright — the rule `docs/configuration.md` already states for every other
+/// option, that CLI arguments always win — and `--reranker none` turns rerank off
+/// for one query by the same route, since it leaves nothing to run.
+///
+/// No `--rerank` flag was added for it: `docs/stability.md` freezes the MCP
+/// `rerank` parameter as the per-call boolean and `--reranker` as the model
 /// picker, and a `--rerank` one letter away from `--reranker`, taking a different
 /// type, would be frozen beside it at 1.0.0.
 fn cli_should_rerank(explicit: bool, choice: RerankerChoice, cfg_default: Option<bool>) -> bool {
-    choice.is_enabled() && (explicit || cfg_default.unwrap_or(true))
+    grooveseek::server::should_rerank(explicit.then_some(true), cfg_default, choice.is_enabled())
 }
 
 #[allow(clippy::too_many_arguments)]

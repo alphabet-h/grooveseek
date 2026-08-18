@@ -221,7 +221,7 @@ groove search "tokio spawn" \
 - `--tag-any <a,b,c>` — チャンクが**いずれか**のタグを持つときのみ通過。MCP param: `tags_any`
 - `--tag-all <a,b,c>` — チャンクが**すべての**タグを持つときのみ通過。MCP param: `tags_all`
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — 辞書順比較。どちらかが指定された場合、`date` 未設定のチャンクは厳密に除外される。MCP params: `date_from` / `date_to`
-- `--min-confidence-ratio <N>` — `low_confidence` 閾値の per-query 上書き。**有限かつ `>= 0.0`** であること。判定を切るのは `0.0`。それ以外の値は CLI がモデル読み込みの前に弾く — 非有限値はどのスコアと比較しても false になり、**閾値をきつくしたつもりが判定そのものを黙って無効化する**ため。MCP の同名パラメータは弾かずに warn してサーバ既定値に戻す (tool call には引数エラーの見せ先が無い)
+- `--min-confidence-ratio <N>` — `low_confidence` 閾値の per-query 上書き。**有限かつ `>= 0.0`** であること。判定を切るのは `0.0`。それ以外の値は CLI がモデル読み込みの前に弾く — 非有限値はどのスコアと比較しても false になり、**閾値をきつくしたつもりが判定そのものを黙って無効化する**ため。MCP の同名パラメータは会話の途中で値を拒めないので、**弾かずに置き換える**: 非有限値は warn してサーバ既定値に戻し、負値は `0.0` に clamp する (= 呼び出しを失敗させる代わりに判定を切る)
 
 CLI `groove search --format json` のラッパ (`results` / `low_confidence` / `filter_applied`) は MCP と同じで、hit のフィールドも 1 点を除いて同じ: **MCP の hit はサーバが引き渡せる文書のとき `uri` を持つ**が、CLI の hit は持たない。`uri` が付く条件は [docs/mcp-tools.ja.md](mcp-tools.ja.md) 参照。`match_spans` / byte offset の詳細は [docs/citations.ja.md](citations.ja.md)、フィルタの完全リファレンスは [docs/filters.ja.md](filters.ja.md) 参照。
 

@@ -258,6 +258,31 @@ const MAX_RRF_K: f32 = 1e6;
 /// 1.0-2.0.
 const MAX_BM25_WEIGHT: f32 = 1e6;
 
+/// The rule `min_confidence_ratio` is held to, stated once for both entrances.
+///
+/// It has two: the `--min-confidence-ratio` flag and the
+/// `[search].min_confidence_ratio` key. Written twice, they would be free to
+/// drift — and a range that differs between the flag and the file is the same
+/// class of defect this whole area exists to close.
+///
+/// The reason for the rule: a non-finite ratio compares false against every
+/// score, so `compute_low_confidence` answers false for every query — a value
+/// passed in order to *tighten* the check switches it off. A negative one is the
+/// same thing by a different route. `0.0` is the documented way to disable it,
+/// and stays allowed.
+///
+/// The message is short and names no value: `clap` prints the offending input
+/// itself, and the toml path adds the key and the value around this.
+pub fn check_confidence_ratio(v: f32) -> Result<(), &'static str> {
+    if !v.is_finite() {
+        return Err("must be finite");
+    }
+    if v < 0.0 {
+        return Err("must be >= 0.0 (0.0 disables the low_confidence check)");
+    }
+    Ok(())
+}
+
 fn default_rrf_k() -> f32 {
     60.0
 }
@@ -811,18 +836,13 @@ impl Config {
     /// - `[search.fusion]` の 3 重みが全て `0.0` でない
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
-            // low_confidence 閾値。CLI は `parse_confidence_ratio` が入口で落とすが、
-            // toml 経路はここが唯一のゲート ([search.fusion] と同じ事情)。非有限を
-            // 通すと `compute_low_confidence` の比較が常に false になり、閾値を
-            // **きつくするつもりの指定が判定そのものを黙って無効化する**。
+            // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
+            // CLI の `--min-confidence-ratio` と共有する。toml 経路にゲートが要るのは
+            // **`serve` が読むのがこちら**だから ([search.fusion] と同じ事情)。
             if let Some(r) = s.min_confidence_ratio
-                && (!r.is_finite() || r < 0.0)
+                && let Err(why) = check_confidence_ratio(r)
             {
-                anyhow::bail!(
-                    "[search].min_confidence_ratio must be a finite value >= 0.0 \
-                     (0.0 is how the low_confidence check is turned off; a non-finite \
-                     value disables it silently instead), got {r}"
-                );
+                anyhow::bail!("[search].min_confidence_ratio {why}, got {r}");
             }
 
             // MMR レンジチェック

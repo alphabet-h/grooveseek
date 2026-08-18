@@ -87,6 +87,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   one letter away from it, taking a different type, would be frozen beside it
   at 1.0.0.
 
+  The decision now lives in one function both surfaces call. Each still spells
+  its own per-call override — a parameter on one side, naming a model on the
+  other — but what an override *means*, and what happens without one, is a
+  single expression. Writing that twice is how the two came apart to begin with.
+
   `groove eval` keeps reading only `--reranker`, deliberately: its run
   fingerprint records the model and not this key, so honouring it would let two
   runs carry the same fingerprint while measuring different pipelines — and
@@ -99,10 +104,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   null-stripping pass then drops the key, leaving output with no trace of the
   override. The flag now requires a finite value `>= 0.0` — `0.0` is still how
   the check is disabled — and rejects before any model is loaded.
-  `[search].min_confidence_ratio` in `groove.toml` is held to the same rule,
-  which is the path `serve` reads. The MCP parameter keeps warning and falling
-  back to the server's value: a tool call has nowhere to show an argument error
-  mid-conversation, while a shell does.
+  `[search].min_confidence_ratio` in `groove.toml` is held to the same rule by
+  the same predicate, which matters because that is the path `serve` reads. The
+  MCP parameter is unchanged: it cannot refuse a value mid-conversation, so it
+  substitutes — a non-finite ratio is logged and replaced by the server's own,
+  and a negative one is clamped to `0.0`.
 
 - **`docs/usage.md` said the CLI and the MCP tool answer with the same JSON.**
   The wrapper is the same — `results`, `low_confidence`, `filter_applied` — but
