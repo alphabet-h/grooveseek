@@ -13,7 +13,7 @@ GrooveSeek が接続クライアントに公開する MCP の面。
 | `get_document` | 相対パスから文書の全文 + メタデータを取得 | `path` (例: `"deep-dive/mcp/overview.md"`) |
 | `get_best_practice` | opt-in: `groove.toml` の `[best_practice].path_templates` を設定しているときのみ機能する。対象向けの best practice 文書を取得し、任意で特定 h2 セクションを抽出。未設定時は "not configured" エラーを返す | `target` (例: `"claude-code"`)、`category` (任意) |
 | `rebuild_index` | すべてのソースファイル (Markdown + `[parsers].enabled` で有効化された拡張子) を走査してインデックス再構築 | `force` (任意、既定 false) |
-| `get_connection_graph` | ドキュメントパスを起点に意味的に関連するチャンクを BFS 展開。`parent_id` / `depth` / `score` / `snippet` 付きのノード配列を返し、呼び出し側でコンテキスト発見を連鎖させられる。上限で探索が切られた場合は `truncated` / `truncation[]` が付く | `path` (必須)、`depth` (既定 2、最大 3)、`fan_out` (既定 5、最大 20)、`min_similarity` (既定 0.3)、`seed_strategy` (`all_chunks` / `centroid`)、`dedup_by_path`、`category`、`topic`、`exclude_paths`、`max_nodes` (既定 100、最大 2000)、`max_seed_chunks` (既定 32、最大 1000) |
+| `get_connection_graph` | ドキュメントパスを起点に意味的に関連するチャンクを BFS 展開。`parent_id` / `depth` / `score` / `snippet` 付きのノード配列を返し、呼び出し側でコンテキスト発見を連鎖させられる。上限で探索が切られた場合は `truncated` / `truncation[]` が付く | `start` (必須、探索の起点パス — `groove graph --start`)、`depth` (既定 2、最大 3)、`fan_out` (既定 5、最大 20)、`min_similarity` (既定 0.3)、`seed_strategy` (`all_chunks` / `centroid`。`all-chunks` も受け付ける)、`dedup_by_path`、`category`、`topic`、`exclude_paths`、`max_nodes` (既定 100、最大 2000)、`max_seed_chunks` (既定 32、最大 1000) |
 
 ## MCP プロンプト
 

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use grooveseek::config::Config;
 use grooveseek::embedder::{ModelChoice, RerankerChoice};
+use grooveseek::graph::SeedStrategy;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -114,19 +115,24 @@ enum TuneFormat {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum CliSeedStrategy {
-    AllChunks,
-    Centroid,
-}
-
-impl From<CliSeedStrategy> for grooveseek::graph::SeedStrategy {
-    fn from(c: CliSeedStrategy) -> Self {
-        match c {
-            CliSeedStrategy::AllChunks => grooveseek::graph::SeedStrategy::AllChunks,
-            CliSeedStrategy::Centroid => grooveseek::graph::SeedStrategy::Centroid,
-        }
-    }
+/// `--seed-strategy`, built from [`SeedStrategy::SPELLINGS`] rather than from a
+/// `ValueEnum` of its own.
+///
+/// A second enum here would be a second list of accepted spellings, and the two
+/// would drift the first time a strategy was added to one of them — silently,
+/// because each surface's test would still pass against its own list. Reading
+/// the shared table means `--help` and the tool cannot disagree about what is
+/// accepted, only about which spelling they advertise.
+fn seed_strategy_parser() -> impl clap::builder::TypedValueParser<Value = SeedStrategy> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    PossibleValuesParser::new(
+        SeedStrategy::SPELLINGS
+            .iter()
+            .map(|s| PossibleValue::new(s.text).hide(!s.advertised_by_cli)),
+    )
+    .map(|text| {
+        SeedStrategy::parse(&text).expect("clap only offers spellings taken from the same table")
+    })
 }
 
 #[derive(Subcommand)]
@@ -227,9 +233,15 @@ enum Commands {
         /// Minimum cosine similarity 0.0-1.0 (default 0.3)
         #[arg(long = "min-similarity", default_value_t = grooveseek::graph::DEFAULT_MIN_SIMILARITY)]
         min_similarity: f32,
-        /// Seed strategy (all-chunks | centroid)
-        #[arg(long = "seed-strategy", value_enum, default_value_t = CliSeedStrategy::AllChunks)]
-        seed_strategy: CliSeedStrategy,
+        /// Seed strategy. The MCP tool spells `all-chunks` as `all_chunks`,
+        /// and both spellings work on either surface. (The accepted values
+        /// are listed below by clap, from the same table both parsers read.)
+        #[arg(
+            long = "seed-strategy",
+            value_parser = seed_strategy_parser(),
+            default_value = SeedStrategy::DEFAULT_SPELLING,
+        )]
+        seed_strategy: SeedStrategy,
         /// Max nodes in the graph; also caps the number of KNN queries
         /// (default 100, clamped to max 2000)
         #[arg(long = "max-nodes", default_value_t = grooveseek::graph::DEFAULT_MAX_NODES)]
@@ -246,8 +258,8 @@ enum Commands {
         topic: Option<String>,
         /// Comma-separated paths to exclude from the graph (in addition to
         /// the start path which is always excluded).
-        #[arg(long, value_delimiter = ',')]
-        exclude: Vec<String>,
+        #[arg(long = "exclude-paths", value_delimiter = ',')]
+        exclude_paths: Vec<String>,
         /// Collapse same-path hits so each document appears at most once.
         #[arg(long = "dedup-by-path", default_value_t = false)]
         dedup_by_path: bool,
@@ -1024,7 +1036,7 @@ fn main() -> anyhow::Result<()> {
             seed_strategy,
             category,
             topic,
-            exclude,
+            exclude_paths,
             dedup_by_path,
             max_nodes,
             max_seed_chunks,
@@ -1049,10 +1061,10 @@ fn main() -> anyhow::Result<()> {
                 depth: depth.min(grooveseek::graph::MAX_DEPTH),
                 fan_out: fan_out.min(grooveseek::graph::MAX_FAN_OUT),
                 min_similarity: min_similarity.clamp(0.0, 1.0),
-                seed_strategy: seed_strategy.into(),
+                seed_strategy,
                 category,
                 topic,
-                exclude_paths: exclude,
+                exclude_paths,
                 dedup_by_path,
                 min_quality: cfg
                     .quality_filter
@@ -1828,6 +1840,255 @@ fn strip_null_keys(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(cleaned)
         }
         other => other,
+    }
+}
+
+/// The command line and the MCP tools are two namespaces that
+/// [`docs/stability.md`] freezes separately, and the promise made there is that
+/// where both expose the same concept they use the same noun. Nothing enforces
+/// that when a parameter is added: the two definitions live in different files,
+/// neither mentions the other, and a new flag compiles perfectly well with no
+/// counterpart at all.
+///
+/// So the pairing itself is written down here, and checked against both
+/// surfaces as they actually are — the flags out of `clap`, the parameters out
+/// of the advertised JSON schema.
+///
+/// Whether two names share a *noun* is not something a test can decide. What it
+/// can do is refuse to let either surface grow a name that this table has not
+/// accounted for, which puts the question in front of whoever adds it, while
+/// the answer is still cheap to change.
+///
+/// [`docs/stability.md`]: https://github.com/alphabet-h/grooveseek/blob/main/docs/stability.md
+#[cfg(test)]
+mod naming_surface {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `(MCP parameter, CLI long flag)` for a concept both surfaces expose.
+    /// Spelling differs by each surface's own convention — kebab-case and a
+    /// singular repeatable flag on one side, snake_case and a plural array on
+    /// the other — so these are pairs, not equalities.
+    const SEARCH_PAIRS: &[(&str, &str)] = &[
+        ("category", "category"),
+        ("date_from", "date-from"),
+        ("date_to", "date-to"),
+        ("include_low_quality", "include-low-quality"),
+        ("limit", "limit"),
+        ("min_confidence_ratio", "min-confidence-ratio"),
+        ("min_quality", "min-quality"),
+        ("mmr", "mmr"),
+        ("mmr_lambda", "mmr-lambda"),
+        ("mmr_same_doc_penalty", "mmr-same-doc-penalty"),
+        ("parent_retriever", "parent-retriever"),
+        ("path_globs", "path-glob"),
+        ("tags_all", "tag-all"),
+        ("tags_any", "tag-any"),
+        ("topic", "topic"),
+    ];
+
+    /// Reachable over MCP and not as a `groove search` flag, each with the
+    /// reason it is not an oversight.
+    const SEARCH_MCP_ONLY: &[(&str, &str)] = &[
+        ("query", "the CLI takes the query as a positional argument"),
+        (
+            "rerank",
+            "a per-call boolean; the CLI's --reranker picks a model instead, and the flag that matches this one is `groove serve --rerank-by-default`",
+        ),
+    ];
+
+    /// The reverse: `groove search` flags with no tool parameter.
+    const SEARCH_CLI_ONLY: &[(&str, &str)] = &[
+        (
+            "kb-path",
+            "the server is already pointed at a knowledge base",
+        ),
+        (
+            "model",
+            "fixed when the server starts; it must match the index",
+        ),
+        ("reranker", "picks a model; see `rerank` above"),
+        (
+            "format",
+            "a tool call always answers with one JSON text block",
+        ),
+    ];
+
+    const GRAPH_PAIRS: &[(&str, &str)] = &[
+        ("category", "category"),
+        ("dedup_by_path", "dedup-by-path"),
+        ("depth", "depth"),
+        ("exclude_paths", "exclude-paths"),
+        ("fan_out", "fan-out"),
+        ("max_nodes", "max-nodes"),
+        ("max_seed_chunks", "max-seed-chunks"),
+        ("min_similarity", "min-similarity"),
+        ("seed_strategy", "seed-strategy"),
+        ("start", "start"),
+        ("topic", "topic"),
+    ];
+
+    const GRAPH_MCP_ONLY: &[(&str, &str)] = &[];
+
+    const GRAPH_CLI_ONLY: &[(&str, &str)] = &[
+        (
+            "kb-path",
+            "the server is already pointed at a knowledge base",
+        ),
+        (
+            "model",
+            "fixed when the server starts; it must match the index",
+        ),
+        (
+            "format",
+            "text / dot / svg are renderings for a person; the tool stays JSON",
+        ),
+    ];
+
+    /// Flags every subcommand carries, which therefore say nothing about the
+    /// tool surface. `help` is generated by clap; `config` is `global = true`.
+    const GLOBAL_FLAGS: &[&str] = &["config", "help"];
+
+    fn cli_long_flags(subcommand: &str) -> Vec<String> {
+        let cmd = Cli::command();
+        let sub = cmd
+            .find_subcommand(subcommand)
+            .unwrap_or_else(|| panic!("no `{subcommand}` subcommand"));
+        let mut flags: Vec<String> = sub
+            .get_arguments()
+            .filter_map(|a| a.get_long())
+            .filter(|l| !GLOBAL_FLAGS.contains(l))
+            .map(str::to_string)
+            .collect();
+        flags.sort();
+        flags
+    }
+
+    /// The names one surface should carry: its half of every pair, plus the
+    /// names only it has. A pair is `(MCP, CLI)`; a one-sided entry is
+    /// `(name, reason)`, so its name is always the first element.
+    fn expected(pairs: &[(&str, &str)], one_sided: &[(&str, &str)], mcp_side: bool) -> Vec<String> {
+        let mut all: Vec<String> = pairs
+            .iter()
+            .map(|p| if mcp_side { p.0 } else { p.1 })
+            .chain(one_sided.iter().map(|p| p.0))
+            .map(str::to_string)
+            .collect();
+        all.sort();
+        all
+    }
+
+    fn check(
+        tool: &str,
+        subcommand: &str,
+        pairs: &[(&str, &str)],
+        mcp_only: &[(&str, &str)],
+        cli_only: &[(&str, &str)],
+    ) {
+        let advertised = grooveseek::server::advertised_param_names(tool).expect("tool must exist");
+        assert_eq!(
+            advertised,
+            expected(pairs, mcp_only, true),
+            "the `{tool}` tool's parameters no longer match the table in this module. \
+             Add the new name with the flag it pairs with on `groove {subcommand}`, \
+             or to the MCP-only list with the reason it has none."
+        );
+
+        assert_eq!(
+            cli_long_flags(subcommand),
+            expected(pairs, cli_only, false),
+            "`groove {subcommand}`'s flags no longer match the table in this module. \
+             Add the new flag with the `{tool}` parameter it pairs with, or to the \
+             CLI-only list with the reason it has none."
+        );
+    }
+
+    #[test]
+    fn search_names_stay_paired() {
+        check(
+            "search",
+            "search",
+            SEARCH_PAIRS,
+            SEARCH_MCP_ONLY,
+            SEARCH_CLI_ONLY,
+        );
+    }
+
+    #[test]
+    fn graph_names_stay_paired() {
+        check(
+            "get_connection_graph",
+            "graph",
+            GRAPH_PAIRS,
+            GRAPH_MCP_ONLY,
+            GRAPH_CLI_ONLY,
+        );
+    }
+
+    /// The stricter half of the rule: a *name* that differs between the two
+    /// surfaces costs a lookup, but a *value* that differs fails the call. So
+    /// every spelling of `seed_strategy` has to work here, whichever surface
+    /// it was copied from.
+    ///
+    /// Driven by `SeedStrategy::SPELLINGS` rather than by a list of its own —
+    /// a list here would keep passing while the tool learned a spelling the
+    /// command line had never heard of. The tool-side half is
+    /// `server::tests::every_accepted_seed_strategy_spelling_parses_in_the_tool`.
+    #[test]
+    fn every_accepted_seed_strategy_spelling_parses_on_the_command_line() {
+        for spelling in SeedStrategy::SPELLINGS {
+            let cli = Cli::try_parse_from([
+                "groove",
+                "graph",
+                "--start",
+                "a.md",
+                "--seed-strategy",
+                spelling.text,
+            ])
+            .unwrap_or_else(|e| {
+                panic!(
+                    "`groove graph --seed-strategy {}` must parse — it is in \
+                     SeedStrategy::SPELLINGS, so the tool accepts it: {e}",
+                    spelling.text
+                )
+            });
+            match cli.command {
+                Commands::Graph { seed_strategy, .. } => assert_eq!(
+                    seed_strategy, spelling.value,
+                    "{} must mean the same strategy on both surfaces",
+                    spelling.text
+                ),
+                _ => panic!("`groove graph …` must parse as the graph subcommand"),
+            }
+        }
+    }
+
+    /// `--help` advertises one spelling per strategy even though more are
+    /// accepted, so each surface still shows the name its own conventions
+    /// produce. A spelling flagged `advertised_by_cli` must be offered, and one
+    /// that is not must stay out of the list while remaining parseable — which
+    /// the test above is what proves.
+    #[test]
+    fn the_cli_advertises_only_its_own_spellings() {
+        let cmd = Cli::command();
+        let arg = cmd
+            .find_subcommand("graph")
+            .expect("no `graph` subcommand")
+            .get_arguments()
+            .find(|a| a.get_long() == Some("seed-strategy"))
+            .expect("no --seed-strategy");
+        let shown: Vec<String> = arg
+            .get_possible_values()
+            .iter()
+            .filter(|p| !p.is_hide_set())
+            .map(|p| p.get_name().to_string())
+            .collect();
+        let want: Vec<String> = SeedStrategy::SPELLINGS
+            .iter()
+            .filter(|s| s.advertised_by_cli)
+            .map(|s| s.text.to_string())
+            .collect();
+        assert_eq!(shown, want, "`--seed-strategy` advertises the wrong set");
     }
 }
 

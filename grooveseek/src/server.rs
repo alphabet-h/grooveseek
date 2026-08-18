@@ -211,7 +211,10 @@ struct RebuildIndexParams {
 struct GetConnectionGraphParams {
     /// Relative path of the starting document within knowledge-base/
     /// (e.g. "deep-dive/mcp/overview.md"). Must be already indexed.
-    path: String,
+    /// Named `start` rather than `path` because it is the seed of a walk, not
+    /// the document being fetched — `groove graph --start` calls it the same
+    /// thing, and `get_document.path` keeps `path` for the fetch.
+    start: String,
     /// BFS depth. 1 = direct neighbors only, 2 = neighbors of neighbors (default: 2, max: 3)
     depth: Option<u32>,
     /// Max neighbors fanned out per node at each hop (default: 5, max: 20)
@@ -243,6 +246,52 @@ struct GetConnectionGraphParams {
     /// same capped prefix -- centroid frees the node budget for connections
     /// but does not recover chunks this cap dropped.
     max_seed_chunks: Option<u32>,
+}
+
+/// Read `get_connection_graph`'s `seed_strategy` value.
+///
+/// The accepted spellings come from [`SeedStrategy::SPELLINGS`], which the
+/// command line's parser reads too — a value that one surface takes and the
+/// other rejects fails the call rather than costing a lookup, so there is one
+/// table and not two lists to keep in step.
+fn parse_seed_strategy(value: Option<&str>) -> Result<SeedStrategy, String> {
+    let Some(text) = value else {
+        return Ok(SeedStrategy::default());
+    };
+    SeedStrategy::parse(text).ok_or_else(|| {
+        format!(
+            "unknown seed_strategy '{text}' (expected {})",
+            SeedStrategy::accepted_spellings()
+        )
+    })
+}
+
+/// The parameter names a client actually sees for `tool`, read out of the very
+/// schema the server advertises. `None` for a name that is not a tool.
+///
+/// This exists for the binary's `cli_and_mcp_names_stay_paired` test. The CLI
+/// half of that comparison lives in `main.rs`, which cannot see the structs
+/// above, and a list copied by hand would keep passing while the two surfaces
+/// drifted apart — which is the one failure the test is there to catch.
+pub fn advertised_param_names(tool: &str) -> Option<Vec<String>> {
+    use rmcp::handler::server::common::schema_for_type;
+    let schema = match tool {
+        "search" => schema_for_type::<SearchParams>(),
+        "get_document" => schema_for_type::<GetDocumentParams>(),
+        "get_best_practice" => schema_for_type::<GetBestPracticeParams>(),
+        "rebuild_index" => schema_for_type::<RebuildIndexParams>(),
+        "get_connection_graph" => schema_for_type::<GetConnectionGraphParams>(),
+        _ => return None,
+    };
+    let value = serde_json::Value::Object((*schema).clone());
+    let mut names: Vec<String> = value
+        .get("properties")?
+        .as_object()?
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    Some(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,21 +1174,15 @@ impl KbCore {
             .min_similarity
             .unwrap_or(graph::DEFAULT_MIN_SIMILARITY)
             .clamp(0.0, 1.0);
-        let seed_strategy = match params.seed_strategy.as_deref() {
-            Some("centroid") => SeedStrategy::Centroid,
-            Some("all_chunks") | None => SeedStrategy::AllChunks,
-            Some(other) => {
-                return serde_json::to_string_pretty(&ErrorResponse {
-                    error: format!(
-                        "unknown seed_strategy '{other}' (expected 'all_chunks' or 'centroid')"
-                    ),
-                })
-                .unwrap_or_default();
+        let seed_strategy = match parse_seed_strategy(params.seed_strategy.as_deref()) {
+            Ok(s) => s,
+            Err(error) => {
+                return serde_json::to_string_pretty(&ErrorResponse { error }).unwrap_or_default();
             }
         };
 
         // (BU-05) `exclude_paths` is bounded inside `build_connection_graph`
-        // rather than here, so `groove graph --exclude` gets the same limit.
+        // rather than here, so `groove graph --exclude-paths` gets the same limit.
 
         let opts = GraphOptions {
             depth,
@@ -1162,7 +1205,7 @@ impl KbCore {
         };
 
         let db = recover_db(self.db.lock());
-        match graph::build_connection_graph(&db, &params.path, &opts) {
+        match graph::build_connection_graph(&db, &params.start, &opts) {
             Ok(g) => serde_json::to_string_pretty(&g).unwrap_or_default(),
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
                 error: format!("get_connection_graph failed: {e}"),
@@ -2847,6 +2890,38 @@ pub async fn run_server(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The half of the naming rule that values are held to: a caller who
+    /// copies a spelling from the command line into a tool call must not get
+    /// an error, because unlike a name, a value that differs fails the call.
+    ///
+    /// Driven by `SeedStrategy::SPELLINGS`, so a spelling added for one
+    /// surface is required of this one too. The command-line half is
+    /// `main.rs::naming_surface::every_accepted_seed_strategy_spelling_parses_on_the_command_line`.
+    #[test]
+    fn every_accepted_seed_strategy_spelling_parses_in_the_tool() {
+        for spelling in SeedStrategy::SPELLINGS {
+            assert_eq!(
+                parse_seed_strategy(Some(spelling.text)),
+                Ok(spelling.value),
+                "a seed_strategy of {:?} must be understood by the tool",
+                spelling.text
+            );
+        }
+        assert_eq!(parse_seed_strategy(None), Ok(SeedStrategy::default()));
+
+        // The error names everything that is accepted, not the subset one
+        // surface advertises — the caller who got here spelled it wrong and
+        // has no way to know which surface's list applies.
+        let err = parse_seed_strategy(Some("all chunks")).unwrap_err();
+        for spelling in SeedStrategy::SPELLINGS {
+            assert!(
+                err.contains(spelling.text),
+                "the error must list every accepted spelling; {:?} is missing from: {err}",
+                spelling.text
+            );
+        }
+    }
 
     /// 一意な tempdir を作って kb_path として返す。Drop で削除。
     struct TempKb {

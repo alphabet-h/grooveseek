@@ -107,6 +107,31 @@ peer loopback の要求である。
   および「サーバが提示した URI は読み返せる」という規則
   （[ADR-0004](decisions/0004-resource-reads-are-bounded-by-the-index.ja.md)）
 
+### 同じものを二つの面がどう名付けるか
+
+コマンドラインと MCP ツールは**別々に凍る 2 つの名前空間**である。パラメータが
+変わったからフラグが変わる、あるいはその逆、ということはない。
+
+両方が同じ概念を出しているところでは**同じ名詞**を使い、それ以外は各面の流儀に従う。
+コマンドラインは kebab-case で、繰り返し可能なフラグは単数形。ツールのパラメータは
+snake_case で、配列は複数形。よって `--path-glob` と `path_globs` は同じフィルタであり、
+`--tag-any` / `tags_any` と `--tag-all` / `tags_all` も同様。対応は一致してはいないが
+予測可能で、フラグごとの対応は [usage.ja.md](usage.ja.md) に書いてある。
+
+意図的に対応させていないものが 2 つある:
+
+- **tool 名とサブコマンド名**。`get_connection_graph` は `groove graph`、
+  `rebuild_index` は `groove index`。それぞれの集合は内部で一貫している——
+  モデルが選ぶ対象だからツールは「対象に対する動詞」として読め、人が打つものだから
+  サブコマンドは短い——そして、片方をもう片方に読み替えねばならない呼び出し手はいない
+- **`rerank` と `--reranker`**。ツールのパラメータは呼び出しごとの真偽値、
+  フラグはモデルの選択。パラメータに対応するフラグは
+  `groove serve --rerank-by-default` の方
+
+**値**は名前より厳しい規則に従う。名前の違いは調べ直せば済むが、値の違いは呼び出しが
+失敗するため。二面で綴りが分かれる enum 値は、**どちらの綴りも両側で受け付ける**——
+`seed_strategy` は `all_chunks` も `all-chunks` もどちらの面でも通る。
+
 ### HTTP
 
 - **`/mcp`** — Streamable HTTP transport のエンドポイント

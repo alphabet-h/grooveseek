@@ -34,6 +34,74 @@ pub enum SeedStrategy {
     Centroid,
 }
 
+/// One accepted spelling of a [`SeedStrategy`].
+///
+/// The two surfaces spell this value differently by their own conventions —
+/// the command line is kebab-case, the tool's parameters are snake_case — and
+/// both accept both, because a value that differs between them fails the call
+/// rather than costing a lookup (`docs/stability.md`).
+///
+/// That promise holds only while there is **one** table. Two parsers with
+/// their own lists drift as soon as a strategy is added to one of them, and
+/// two tests with their own lists do not notice.
+#[derive(Debug, Clone, Copy)]
+pub struct SeedSpelling {
+    /// What a user types, or a client sends.
+    pub text: &'static str,
+    pub value: SeedStrategy,
+    /// Whether `groove graph --help` lists this spelling under
+    /// `[possible values]`. Every spelling here is *accepted* by both
+    /// surfaces; this only keeps each one advertising the name its own
+    /// conventions produce.
+    pub advertised_by_cli: bool,
+}
+
+impl SeedStrategy {
+    /// Every spelling either surface accepts. Both parsers and both tests read
+    /// this and nothing else.
+    pub const SPELLINGS: &'static [SeedSpelling] = &[
+        SeedSpelling {
+            text: "all-chunks",
+            value: SeedStrategy::AllChunks,
+            advertised_by_cli: true,
+        },
+        SeedSpelling {
+            text: "all_chunks",
+            value: SeedStrategy::AllChunks,
+            advertised_by_cli: false,
+        },
+        SeedSpelling {
+            text: "centroid",
+            value: SeedStrategy::Centroid,
+            advertised_by_cli: true,
+        },
+    ];
+
+    /// The spelling `groove graph --seed-strategy` falls back to. Beside the
+    /// table so that a rename cannot leave the default naming a spelling that
+    /// no longer exists — `the_default_spelling_is_one_of_the_accepted_ones`
+    /// is what makes that true rather than intended.
+    pub const DEFAULT_SPELLING: &'static str = "all-chunks";
+
+    /// `None` for a spelling neither surface accepts.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::SPELLINGS
+            .iter()
+            .find(|s| s.text == text)
+            .map(|s| s.value)
+    }
+
+    /// The accepted spellings, quoted, for an error message that lists them
+    /// all rather than the subset one surface happens to advertise.
+    pub fn accepted_spellings() -> String {
+        Self::SPELLINGS
+            .iter()
+            .map(|s| format!("'{}'", s.text))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+}
+
 /// `build_connection_graph` の入力オプション。MCP / CLI の両方から組み立てる。
 #[derive(Debug, Clone)]
 pub struct GraphOptions {
@@ -384,7 +452,7 @@ pub fn build_connection_graph(
     // 64-entries × 1 KiB bound never covered: `search` validates all three of
     // its lists, while this one went straight into a `HashSet` the BFS
     // consults on every visit. Checked here rather than in the MCP handler so
-    // that `groove graph --exclude` is bounded by the same rule, and before
+    // that `groove graph --exclude-paths` is bounded by the same rule, and before
     // the seed lookup so an oversized request costs nothing.
     crate::server::validate_filter_list("exclude_paths", &opts.exclude_paths)?;
 
@@ -661,6 +729,32 @@ pub fn build_connection_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DEFAULT_SPELLING` is a string, so nothing but this stops it naming a
+    /// spelling the table no longer has — at which point `groove graph` would
+    /// fail to start on its own default.
+    #[test]
+    fn the_default_spelling_is_one_of_the_accepted_ones() {
+        assert_eq!(
+            SeedStrategy::parse(SeedStrategy::DEFAULT_SPELLING),
+            Some(SeedStrategy::default()),
+            "DEFAULT_SPELLING must parse, and must mean the default strategy"
+        );
+    }
+
+    /// Every strategy needs a spelling each surface can advertise, or `--help`
+    /// would silently stop offering one of them.
+    #[test]
+    fn every_strategy_has_a_spelling_the_cli_advertises() {
+        for value in [SeedStrategy::AllChunks, SeedStrategy::Centroid] {
+            assert!(
+                SeedStrategy::SPELLINGS
+                    .iter()
+                    .any(|s| s.value == value && s.advertised_by_cli),
+                "{value:?} has no spelling `groove graph --help` would list"
+            );
+        }
+    }
 
     /// 384 次元 dummy embedding。全要素を `val` で埋める。vec0 の L2 距離は
     /// 全要素同一ベクトル間で `sqrt(dim) * |a - b|` になるので、`val` を細かく
