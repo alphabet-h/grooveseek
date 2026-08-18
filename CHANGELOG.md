@@ -93,7 +93,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   lookup while a value that differs fails the call outright: `seed_strategy` now
   takes `all_chunks` and `all-chunks` on both sides. Copying either spelling
   from one surface to the other used to be rejected — by clap on one side and by
-  `unknown seed_strategy` on the other.
+  `unknown seed_strategy` on the other. There is one table of accepted
+  spellings and both parsers read it, so a strategy cannot become reachable on
+  one surface only; `--help` still advertises the one spelling the command
+  line's own conventions produce.
 
   A test pins the pairing itself. Adding a parameter to either surface fails
   until the table names its counterpart or records why it has none, which puts

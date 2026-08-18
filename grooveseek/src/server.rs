@@ -248,22 +248,22 @@ struct GetConnectionGraphParams {
     max_seed_chunks: Option<u32>,
 }
 
-/// Read `get_connection_graph`'s `seed_strategy` value, accepting the spelling
-/// each surface uses.
+/// Read `get_connection_graph`'s `seed_strategy` value.
 ///
-/// `groove graph --seed-strategy` says `all-chunks`, because clap derives
-/// kebab-case from the variant, while the tool documents `all_chunks`. Both are
-/// taken here and on the command line: a *name* that differs between the two
-/// surfaces costs a lookup, but a *value* that differs fails the call outright,
-/// so values are held to the stricter rule — see `docs/stability.md`.
+/// The accepted spellings come from [`SeedStrategy::SPELLINGS`], which the
+/// command line's parser reads too — a value that one surface takes and the
+/// other rejects fails the call rather than costing a lookup, so there is one
+/// table and not two lists to keep in step.
 fn parse_seed_strategy(value: Option<&str>) -> Result<SeedStrategy, String> {
-    match value {
-        Some("centroid") => Ok(SeedStrategy::Centroid),
-        Some("all_chunks") | Some("all-chunks") | None => Ok(SeedStrategy::AllChunks),
-        Some(other) => Err(format!(
-            "unknown seed_strategy '{other}' (expected 'all_chunks' / 'all-chunks' or 'centroid')"
-        )),
-    }
+    let Some(text) = value else {
+        return Ok(SeedStrategy::default());
+    };
+    SeedStrategy::parse(text).ok_or_else(|| {
+        format!(
+            "unknown seed_strategy '{text}' (expected {})",
+            SeedStrategy::accepted_spellings()
+        )
+    })
 }
 
 /// The parameter names a client actually sees for `tool`, read out of the very
@@ -2891,36 +2891,36 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// The half of the naming rule that values are held to. `groove graph`
-    /// spells this `all-chunks` and the tool documents `all_chunks`; a caller
-    /// who copies either one into the other surface must not get an error,
-    /// because unlike a name, a value that differs fails the call.
+    /// The half of the naming rule that values are held to: a caller who
+    /// copies a spelling from the command line into a tool call must not get
+    /// an error, because unlike a name, a value that differs fails the call.
     ///
-    /// The command-line half of this is
-    /// `main.rs::naming_surface::both_spellings_of_the_seed_strategy_are_accepted_by_the_cli`
-    /// — both have to hold for the rule to mean anything.
+    /// Driven by `SeedStrategy::SPELLINGS`, so a spelling added for one
+    /// surface is required of this one too. The command-line half is
+    /// `main.rs::naming_surface::every_accepted_seed_strategy_spelling_parses_on_the_command_line`.
     #[test]
-    fn both_spellings_of_the_seed_strategy_are_accepted_by_the_tool() {
-        for spelling in ["all_chunks", "all-chunks"] {
+    fn every_accepted_seed_strategy_spelling_parses_in_the_tool() {
+        for spelling in SeedStrategy::SPELLINGS {
             assert_eq!(
-                parse_seed_strategy(Some(spelling)),
-                Ok(SeedStrategy::AllChunks),
-                "a seed_strategy of {spelling:?} must be understood by the tool"
+                parse_seed_strategy(Some(spelling.text)),
+                Ok(spelling.value),
+                "a seed_strategy of {:?} must be understood by the tool",
+                spelling.text
             );
         }
-        assert_eq!(parse_seed_strategy(None), Ok(SeedStrategy::AllChunks));
-        assert_eq!(
-            parse_seed_strategy(Some("centroid")),
-            Ok(SeedStrategy::Centroid)
-        );
+        assert_eq!(parse_seed_strategy(None), Ok(SeedStrategy::default()));
 
-        // The error still has to name what is accepted, and now that is two
-        // spellings rather than one.
+        // The error names everything that is accepted, not the subset one
+        // surface advertises — the caller who got here spelled it wrong and
+        // has no way to know which surface's list applies.
         let err = parse_seed_strategy(Some("all chunks")).unwrap_err();
-        assert!(
-            err.contains("all_chunks") && err.contains("all-chunks"),
-            "the error must list both accepted spellings: {err}"
-        );
+        for spelling in SeedStrategy::SPELLINGS {
+            assert!(
+                err.contains(spelling.text),
+                "the error must list every accepted spelling; {:?} is missing from: {err}",
+                spelling.text
+            );
+        }
     }
 
     /// 一意な tempdir を作って kb_path として返す。Drop で削除。

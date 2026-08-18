@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use grooveseek::config::Config;
 use grooveseek::embedder::{ModelChoice, RerankerChoice};
+use grooveseek::graph::SeedStrategy;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -114,25 +115,24 @@ enum TuneFormat {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum CliSeedStrategy {
-    /// `clap` spells this `all-chunks`; the MCP tool spells the same value
-    /// `all_chunks`, because each surface follows its own separator convention
-    /// (see docs/stability.md). A name only costs a lookup when the two differ,
-    /// but a *value* costs a failed command, so both spellings are accepted on
-    /// both sides.
-    #[value(alias = "all_chunks")]
-    AllChunks,
-    Centroid,
-}
-
-impl From<CliSeedStrategy> for grooveseek::graph::SeedStrategy {
-    fn from(c: CliSeedStrategy) -> Self {
-        match c {
-            CliSeedStrategy::AllChunks => grooveseek::graph::SeedStrategy::AllChunks,
-            CliSeedStrategy::Centroid => grooveseek::graph::SeedStrategy::Centroid,
-        }
-    }
+/// `--seed-strategy`, built from [`SeedStrategy::SPELLINGS`] rather than from a
+/// `ValueEnum` of its own.
+///
+/// A second enum here would be a second list of accepted spellings, and the two
+/// would drift the first time a strategy was added to one of them — silently,
+/// because each surface's test would still pass against its own list. Reading
+/// the shared table means `--help` and the tool cannot disagree about what is
+/// accepted, only about which spelling they advertise.
+fn seed_strategy_parser() -> impl clap::builder::TypedValueParser<Value = SeedStrategy> {
+    use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
+    PossibleValuesParser::new(
+        SeedStrategy::SPELLINGS
+            .iter()
+            .map(|s| PossibleValue::new(s.text).hide(!s.advertised_by_cli)),
+    )
+    .map(|text| {
+        SeedStrategy::parse(&text).expect("clap only offers spellings taken from the same table")
+    })
 }
 
 #[derive(Subcommand)]
@@ -233,9 +233,15 @@ enum Commands {
         /// Minimum cosine similarity 0.0-1.0 (default 0.3)
         #[arg(long = "min-similarity", default_value_t = grooveseek::graph::DEFAULT_MIN_SIMILARITY)]
         min_similarity: f32,
-        /// Seed strategy (all-chunks | centroid)
-        #[arg(long = "seed-strategy", value_enum, default_value_t = CliSeedStrategy::AllChunks)]
-        seed_strategy: CliSeedStrategy,
+        /// Seed strategy. The MCP tool spells `all-chunks` as `all_chunks`,
+        /// and both spellings work on either surface. (The accepted values
+        /// are listed below by clap, from the same table both parsers read.)
+        #[arg(
+            long = "seed-strategy",
+            value_parser = seed_strategy_parser(),
+            default_value = SeedStrategy::DEFAULT_SPELLING,
+        )]
+        seed_strategy: SeedStrategy,
         /// Max nodes in the graph; also caps the number of KNN queries
         /// (default 100, clamped to max 2000)
         #[arg(long = "max-nodes", default_value_t = grooveseek::graph::DEFAULT_MAX_NODES)]
@@ -1055,7 +1061,7 @@ fn main() -> anyhow::Result<()> {
                 depth: depth.min(grooveseek::graph::MAX_DEPTH),
                 fan_out: fan_out.min(grooveseek::graph::MAX_FAN_OUT),
                 min_similarity: min_similarity.clamp(0.0, 1.0),
-                seed_strategy: seed_strategy.into(),
+                seed_strategy,
                 category,
                 topic,
                 exclude_paths,
@@ -2019,22 +2025,70 @@ mod naming_surface {
         );
     }
 
-    /// The stricter half of the rule: a *name* that differs costs a lookup, but
-    /// a *value* that differs fails the call. `seed_strategy` is the one enum
-    /// the two surfaces would spell differently — clap derives `all-chunks`
-    /// from the variant, the tool documents `all_chunks` — so both spellings
-    /// are accepted on both sides, and this is what says so.
+    /// The stricter half of the rule: a *name* that differs between the two
+    /// surfaces costs a lookup, but a *value* that differs fails the call. So
+    /// every spelling of `seed_strategy` has to work here, whichever surface
+    /// it was copied from.
+    ///
+    /// Driven by `SeedStrategy::SPELLINGS` rather than by a list of its own —
+    /// a list here would keep passing while the tool learned a spelling the
+    /// command line had never heard of. The tool-side half is
+    /// `server::tests::every_accepted_seed_strategy_spelling_parses_in_the_tool`.
     #[test]
-    fn both_spellings_of_the_seed_strategy_are_accepted_by_the_cli() {
-        use clap::ValueEnum;
-        for spelling in ["all-chunks", "all_chunks"] {
-            assert_eq!(
-                CliSeedStrategy::from_str(spelling, false).ok(),
-                Some(CliSeedStrategy::AllChunks),
-                "`groove graph --seed-strategy {spelling}` must parse: \
-                 a value copied from the MCP tool has to work here"
-            );
+    fn every_accepted_seed_strategy_spelling_parses_on_the_command_line() {
+        for spelling in SeedStrategy::SPELLINGS {
+            let cli = Cli::try_parse_from([
+                "groove",
+                "graph",
+                "--start",
+                "a.md",
+                "--seed-strategy",
+                spelling.text,
+            ])
+            .unwrap_or_else(|e| {
+                panic!(
+                    "`groove graph --seed-strategy {}` must parse — it is in \
+                     SeedStrategy::SPELLINGS, so the tool accepts it: {e}",
+                    spelling.text
+                )
+            });
+            match cli.command {
+                Commands::Graph { seed_strategy, .. } => assert_eq!(
+                    seed_strategy, spelling.value,
+                    "{} must mean the same strategy on both surfaces",
+                    spelling.text
+                ),
+                _ => panic!("`groove graph …` must parse as the graph subcommand"),
+            }
         }
+    }
+
+    /// `--help` advertises one spelling per strategy even though more are
+    /// accepted, so each surface still shows the name its own conventions
+    /// produce. A spelling flagged `advertised_by_cli` must be offered, and one
+    /// that is not must stay out of the list while remaining parseable — which
+    /// the test above is what proves.
+    #[test]
+    fn the_cli_advertises_only_its_own_spellings() {
+        let cmd = Cli::command();
+        let arg = cmd
+            .find_subcommand("graph")
+            .expect("no `graph` subcommand")
+            .get_arguments()
+            .find(|a| a.get_long() == Some("seed-strategy"))
+            .expect("no --seed-strategy");
+        let shown: Vec<String> = arg
+            .get_possible_values()
+            .iter()
+            .filter(|p| !p.is_hide_set())
+            .map(|p| p.get_name().to_string())
+            .collect();
+        let want: Vec<String> = SeedStrategy::SPELLINGS
+            .iter()
+            .filter(|s| s.advertised_by_cli)
+            .map(|s| s.text.to_string())
+            .collect();
+        assert_eq!(shown, want, "`--seed-strategy` advertises the wrong set");
     }
 }
 
