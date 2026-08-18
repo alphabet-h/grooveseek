@@ -222,7 +222,7 @@ These are the reason the project renamed itself before 1.0.0 rather than after:
 | exclusion file | `.grooveignore` |
 | evaluation set / history | `.groove-eval.yml` / `.groove-eval-history.json` |
 | service artifacts | task, unit, and launch-agent names derived from the service name, and the layout of the config home |
-| environment variables | `GROOVE_CONFIG_HOME`, `GROOVE_TRAY_LOG`, `GROOVE_BIN` |
+| environment variables | `GROOVE_CONFIG_HOME`, `GROOVE_TRAY_LOG`. (`FASTEMBED_CACHE_DIR` is fastembed's name — honoured, but not ours to freeze. `GROOVE_BIN` belongs to the shipped example hook, not to the binary.) |
 
 ## Unstable
 
