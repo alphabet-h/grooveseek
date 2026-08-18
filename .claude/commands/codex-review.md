@@ -70,7 +70,7 @@ grep -o '^| 罠 [0-9][0-9]*' .claude/commands/codex-review.md | sort -u | wc -l
 | 罠 33 (sentinel / terminal-error が PR 全 history で評価される) | `LATEST_ISSUE_BODY` を `NEW_ISSUES = $CUR_ISSUES − $PREV_ISSUES` (= current round で post された issue comment のみ) から derive する。罠 27 (P-badge round-scoping) と同じ pattern を sentinel + terminal-error チェック側にも適用、prior round の sentinel "Didn't find any major issues" が後続 round に漏れて false-converge する race を排除 |
 | 罠 50 (**trigger の POST 自体が失敗する**) | Step 2 で POST を最大 3 回まで再試行し、**comment id が数字であることを確認してから待つ** (でなければ `exit 6`)。実測 (PR #176): 2 回連続 503、その間 GET は全部成功していたので「codex が答えない」(= 罠 9) に化けて 600 秒を捨てた。**待つ前に、投稿できたことを確かめる** |
 | 罠 23 の再発 (**列挙した badge の外に指摘が来る**) | P0/P1/P2 に加えて **P3 も数える** (PR #177 で P3 の指摘を `P2=0` = 「指摘なし」と読みかけた)。さらに Step 5 に **badge の有無を問わず round の inline を全部出す** section を置く — 計数は列挙に依存するが、**表示は依存させない** |
-| 罠 51 (**PR を開いた直後の round は baseline に指摘が入っている**) | codex は「Open a pull request for review」でも trigger される。Step 1 の baseline 時点で自動レビューが終わっていると、round scoping (罠 27/33/49) が正しく効いた結果その指摘が `NEW_*` から消え、`new_inline=0 + sentinel=true` = 「指摘 0 件で収束」に見える。実測 (PR #178 round 1): baseline の inline 1 件が **P1** だった。**判定は round diff のまま、初回起動では baseline を必ず表示する** (罠 30 と同じ「判定と表示を分ける」形)。条件を「差分が 0 件のとき」にしてはいけない — explicit trigger が何か 1 つでも出した round で false になり、防ぎたかったケースがそのまま抜ける (codex P1 on PR #179)。**「初回か」を shell 変数で持ってもいけない** — `/codex-review` は round ごとに別プロセスなので毎回 1 に戻り、解決済みの指摘を毎回「未読の baseline」として出す (codex P2 on PR #179)。`@codex review` の投稿履歴から判定する |
+| 罠 51 (**PR を開いた直後の round は baseline に指摘が入っている**) | codex は「Open a pull request for review」でも trigger される。Step 1 の baseline 時点で自動レビューが終わっていると、round scoping (罠 27/33/49) が正しく効いた結果その指摘が `NEW_*` から消え、`new_inline=0 + sentinel=true` = 「指摘 0 件で収束」に見える。実測 (PR #178 round 1): baseline の inline 1 件が **P1** だった。**判定は round diff のまま、初回起動では baseline を必ず表示する** (罠 30 と同じ「判定と表示を分ける」形)。条件を「差分が 0 件のとき」にしてはいけない — explicit trigger が何か 1 つでも出した round で false になり、防ぎたかったケースがそのまま抜ける (codex P1 on PR #179)。**「初回か」を shell 変数で持ってもいけない** — `/codex-review` は round ごとに別プロセスなので毎回 1 に戻り、解決済みの指摘を毎回「未読の baseline」として出す (codex P2 on PR #179)。`@codex review` の投稿履歴から判定し、**表示は trigger を投げる前 (Step 1) に済ませる** — Step 4 に置くと、trigger 投稿後に abort した初回が baseline を出さずに終わり、次の実行は「初回ではない」と判断して永久に出さなくなる。trigger comment が記録しているのは「実行が始まったこと」であって「baseline を読んだこと」ではない (codex P1 on PR #179) |
 | 罠 52 (**診断が stdout に出る / 非 ASCII**) | 進捗・警告・abort は `diag()` 経由で **stderr へ、ASCII のみ**。AGENTS.md の "Results go to stdout, diagnostics to stderr" と同じ理由で、この script の *結果* は review の中身だけ。日本語を stderr に出すと CP932 コンソールで mojibake になる (codex P1 on PR #179) |
 | 罠 54 (**`$( )` の中の `exit` はサブシェルしか終わらせない**) | `post_trigger` は失敗時に `exit` ではなく `return 1` を返し、呼び出し側が `|| exit 6` する。`TRIGGER_COMMENT_ID=$(post_trigger ...)` は command substitution なので、中で `exit` しても親は**空の id を持ったまま polling に入り**、この helper が防ぐはずだった 600 秒待ちをそのまま再現する (codex P1 on PR #179) |
 | 罠 55 (**bot 由来の本文を stderr に流す**) | stderr を ASCII に保つ規約は wrapper の文言だけでは守れない。`LATEST_ISSUE_BODY` は codex が書いた内容 = **この実行の結果**なので stdout に出す。英語の marker に日本語が混じった瞬間に CP932 で mojibake になる (codex P1 on PR #179) |
@@ -172,6 +172,29 @@ PRIOR_TRIGGERS=$(gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?pe
   --jq '[.[] | select(.body | startswith("@codex review"))] | length' | jq -s 'add // 0')
 FIRST_INVOCATION=$([ "${PRIOR_TRIGGERS}" = "0" ] && echo true || echo false)
 diag "prior @codex review triggers on this PR: ${PRIOR_TRIGGERS} (first invocation: ${FIRST_INVOCATION})"
+
+# 罠 51 (PR #178): **PR を開いた直後は baseline に指摘が入っている。** codex は
+# 「Open a pull request for review」でも trigger されるので、ここに来た時点で
+# 自動レビューが終わっていることがある。round scoping (罠 27/33/49) が正しく
+# 効いた結果その指摘は `NEW_*` から消え、`new_inline=0 + sentinel=true` =
+# 「指摘 0 件で収束」に見える。実測 (PR #178 round 1): baseline の inline 1 件が
+# **P1** だった。
+#
+# **判定は round diff のまま** (2 度数えると修正済みを再指摘してループする)、
+# **表示だけ足す** — 罠 30 が P2 でやったのと同じ「判定と表示を分ける」形。
+#
+# 出すのは **trigger を投げる前、Step 1 のここ**。Step 4 に置くと、round 1 が
+# trigger 投稿後に abort した場合 (exit 3 / 5 / 6、terminal error、中断) に
+# baseline を出さないまま終わり、**次の実行は `PRIOR_TRIGGERS > 0` を見て
+# 「初回ではない」と判断して永久に出さなくなる** — trigger comment が記録して
+# いるのは「実行が始まったこと」であって「baseline を読んだこと」ではない
+# (codex P1 on PR #179)。ここで出せば、その後どこで落ちても表示済み。
+if [ "$FIRST_INVOCATION" = "true" ]; then
+  echo "=== Baseline before this run - the review GitHub ran when the PR opened (trap 51) ==="
+  echo "$PREV_INLINE" | jq -r 'if length == 0 then "(baseline inline: none)" else .[] | "[baseline] \(.path):\(.line // .original_line)\n\(.body)\n---" end'
+  echo "$PREV_REVIEWS" | jq -r 'if length == 0 then "(baseline review bodies: none)" else .[] | "[baseline] state=\(.state) commit=\(.commit_id)\n\(.body)\n---" end'
+  diag "NOTE: baseline shown above. An empty round diff does not mean nothing was found."
+fi
 ```
 
 ### Step 2 — post @codex review trigger
@@ -420,30 +443,6 @@ else
   echo "⚠️ Indeterminate (no sentinel + no clean state) — re-trigger or user escalate"
   CONVERGED=false
 fi
-
-# 罠 51 (PR #178): **PR を開いた直後の round は baseline に指摘が入っている。**
-# codex は「Open a pull request for review」でも trigger されるので、Step 1 で
-# baseline を取る時点で自動レビューが終わっていることがある。round scoping
-# (罠 27/33/49) が正しく効いた結果、その指摘は `NEW_*` から消え、
-# `new_inline=0 + sentinel=true` = 「指摘 0 件で収束」に見える。
-# 実測 (PR #178 round 1): baseline の inline 1 件が **P1** だった。
-#
-# **判定は round diff のまま (2 度数えると修正済みを再指摘してループする)、
-# 表示だけ足す** — 罠 30 が P2 でやったのと同じ「判定と表示を分ける」形。
-#
-# 条件は **round 番号だけ**で決める。「差分が 0 件のとき」にすると、explicit
-# trigger が新しい review や inline を 1 つでも出した round では false になり、
-# **自動レビューの P1 が controller に届かないまま収束する** —
-# この block が防ごうとしている当のケースが、そのまま抜ける
-# (codex P1 on PR #179)。round 2 以降の baseline は前 round の内容で、
-# controller は既に読んでいるので出さない。
-if [ "$FIRST_INVOCATION" = "true" ]; then
-  echo ""
-  echo "=== Baseline before this run — the review GitHub ran when the PR opened (罠 51) ==="
-  echo "$PREV_INLINE" | jq -r 'if length == 0 then "(baseline inline: none)" else .[] | "[baseline] \(.path):\(.line // .original_line)\n\(.body)\n---" end'
-  echo "$PREV_REVIEWS" | jq -r 'if length == 0 then "(baseline review bodies: none)" else .[] | "[baseline] state=\(.state) commit=\(.commit_id)\n\(.body)\n---" end'
-  diag "NOTE: round 1 baseline shown above. An empty round diff does not mean nothing was found."
-fi
 ```
 
 ### Step 5 — 結果 fetch + 整形
@@ -490,7 +489,7 @@ snapshot_issues | jq -r '.[] | "[\(.updated_at)] \(.body)"'
 
 | 状態 | アクション |
 |---|---|
-| `CONVERGED=true` **かつ `FIRST_INVOCATION=true`** | **baseline を読んでから**収束を宣言する (= 罠 51)。PR を開いた直後の round では、指摘は差分ではなく baseline 側にいる。差分が空かどうかは関係ない |
+| `CONVERGED=true` **かつ `FIRST_INVOCATION=true`** | **Step 1 が出した baseline を読んでから**収束を宣言する (= 罠 51)。PR を開いた直後の round では、指摘は差分ではなく baseline 側にいる。差分が空かどうかは関係ない |
 | `CONVERGED=true` | **収束**、merge / tag に進む |
 | `P0_P1_TAGS_PRESENT > 0` | controller が指摘内容を理解 → fix 実装 → push → goto Step 1 (= 新 baseline 取得 + re-trigger)。**ただし** `current_round >= max_rounds` (= default 3) なら user 報告 |
 | `STATE_OK=false` でも `P0/P1` も sentinel もなし (= indeterminate) | controller が manual review (= human 判断)、必要なら `@codex review` 再 trigger |
