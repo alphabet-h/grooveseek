@@ -96,12 +96,16 @@ peer loopback の要求である。
   診断は stderr。パイプラインが依存するので凍結する。
 
   その意味で結果を出すのは 6 つ — `search` / `graph` / `doctor` / `validate` /
-  `eval` / `tune`。`index` / `status` / `service` は**すべて stderr に書く**。
-  出しているのが問い合わせへの答えではなく進捗と運用状態だから。
-  したがって **`groove status | …` には何も流れない**。パイプラインを組む前に
-  知っておく価値がある。`status` が最初に出す 2 つの数 (`documents` / `chunks`) を
-  機械可読に取るなら `groove doctor --format json`。**それ以外に `status` が
-  印字するものには、今のところ JSON 形式が無い**
+  `eval` / `tune`。**この 6 つについては出力先を凍結する**。
+
+  `index` / `status` / `service` は**現状すべて stderr に書く**ので、
+  **`groove status | …` には何も流れない**。パイプラインを組む前に知っておく価値がある。
+  そのうちどこまでが進捗ではなく「結果」なのか — `status` の件数や
+  `service list` の一覧には相応の言い分がある — は**未決であり、
+  この段落はそれを凍結しない**。stdout に移した場合、`2>&1` で受けている側は影響を受けず、
+  stderr だけを捕まえている側が直す必要がある。その天秤を **1.0.0 までに**決める
+  (1.0.0 が決めてしまうのではなく)。当面、`status` が最初に出す 2 つの数
+  (`documents` / `chunks`) を機械可読に取るなら `groove doctor --format json`
 
 ### 機械可読な出力
 

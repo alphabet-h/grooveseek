@@ -106,6 +106,7 @@ groove service install --service-name personal --kb-path /path/to/personal-kb --
 
 # Inspect / manage
 groove service status                              # default 'groove'
+groove service status --service-name personal      # a named instance
 groove service list                                # all instances
 groove service uninstall --service-name personal               # remove unit, keep config + DB
 groove service uninstall --service-name personal --purge --yes # also remove config + DB
@@ -158,6 +159,7 @@ To manage the tray shortcut independently of the daemon registration:
 
 ```bash
 groove service tray-install --service-name groove     # add shortcut only
+groove service tray-install --service-name groove --force   # overwrite an existing shortcut
 groove service tray-uninstall --service-name groove   # remove shortcut only
 ```
 

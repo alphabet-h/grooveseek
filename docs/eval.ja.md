@@ -344,7 +344,13 @@ CI 例:
 ```bash
 groove tune --kb-path knowledge-base
 groove tune --kb-path knowledge-base --format json > tune.json
+groove tune --kb-path knowledge-base --golden ./ci-golden.yml --limit 20
 ```
+
+golden set は `groove eval` と同じものを読み、探し方のフラグも同じ:
+`--golden <PATH>` で `.groove-eval.yml` 以外を使い、`--limit` で 1 クエリあたりの
+取得件数を変え、`--no-color` で表の ANSI を落とし、`--model` / `--reranker` は
+測る対象の index に合わせる。
 
 ### golden セットに求められる条件
 

@@ -2123,7 +2123,7 @@ mod naming_surface {
 mod documented_flags {
     use super::*;
     use clap::CommandFactory;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
     /// This crate lives at `<repo>/grooveseek`, and the documentation it has to
@@ -2135,9 +2135,10 @@ mod documented_flags {
             .to_path_buf()
     }
 
-    /// Everything a reader of the published documentation sees. `CHANGELOG.md`
-    /// is left out on purpose: it records flags that *used* to exist, and a
-    /// removed flag must not stay frozen by its own obituary.
+    /// Everything a reader of the published documentation sees.
+    ///
+    /// `CHANGELOG.md` is left out on purpose: it records flags that *used* to
+    /// exist, and a removed flag must not stay frozen by its own obituary.
     fn published_docs() -> String {
         let root = repo_root();
         let mut buf = String::new();
@@ -2169,14 +2170,21 @@ mod documented_flags {
         buf
     }
 
-    /// Every long flag the binary accepts, mapped to the command that has it.
-    /// Walks the whole tree, so `groove service tray-install --force` counts.
-    fn own_long_flags() -> BTreeMap<String, String> {
-        fn walk(cmd: &clap::Command, path: &str, out: &mut BTreeMap<String, String>) {
+    /// Every long flag the binary accepts, as `(command path, flag)`.
+    ///
+    /// Keyed by the pair rather than by the flag: the same name lives on
+    /// several subcommands, and collapsing them would let documentation for one
+    /// vouch for another. Global flags are attributed to the root instead —
+    /// clap puts them on every subcommand, and they are documented once.
+    fn own_long_flags() -> BTreeSet<(String, String)> {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut BTreeSet<(String, String)>) {
             for arg in cmd.get_arguments() {
                 if let Some(long) = arg.get_long() {
-                    out.entry(long.to_string())
-                        .or_insert_with(|| path.to_string());
+                    if long == "help" || long == "version" {
+                        continue; // clap generates these
+                    }
+                    let owner = if arg.is_global_set() { "groove" } else { path };
+                    out.insert((owner.to_string(), long.to_string()));
                 }
             }
             for sub in cmd.get_subcommands() {
@@ -2185,11 +2193,8 @@ mod documented_flags {
             }
         }
         let cmd = Cli::command();
-        let mut out = BTreeMap::new();
+        let mut out = BTreeSet::new();
         walk(&cmd, "groove", &mut out);
-        // clap generates these; nothing documents them and nothing should.
-        out.remove("help");
-        out.remove("version");
         out
     }
 
@@ -2199,21 +2204,40 @@ mod documented_flags {
         re.captures_iter(text).map(|c| c[1].to_string()).collect()
     }
 
+    /// What this guarantees, and what it cannot.
+    ///
+    /// It guarantees that no flag ships undescribed — the thing that had gone
+    /// wrong, and the thing `docs/stability.md` needs in order to mean anything
+    /// by "documented".
+    ///
+    /// It does **not** guarantee that each command's copy of a shared name is
+    /// separately described. Checking that was implemented and measured, and it
+    /// cannot be done from prose: a section is free to mention another
+    /// command's flags, and legitimately does. The page describing
+    /// `groove doctor` says findings are fixed by `groove index --force`, so
+    /// any proximity rule counts `--force` as documented for `doctor` too.
+    /// Attaching flags to commands would need the documentation to carry
+    /// structure it does not have, and a rule that is wrong in both directions
+    /// is worse than a narrow one that is right.
+    ///
+    /// The pair is still carried through so that a failure names the command,
+    /// which is what someone reading the message needs.
     #[test]
     fn every_long_flag_the_binary_accepts_is_documented() {
         let docs = published_docs();
         let missing: Vec<String> = own_long_flags()
             .iter()
-            .filter(|(flag, _)| !docs.contains(&format!("--{flag}")))
-            .map(|(flag, cmd)| format!("--{flag} (on `{cmd}`)"))
+            .filter(|(_, flag)| !docs.contains(&format!("--{flag}")))
+            .map(|(cmd, flag)| format!("`{cmd} --{flag}`"))
             .collect();
 
         assert!(
             missing.is_empty(),
             "these flags appear nowhere in docs/ or the README, so \
              docs/stability.md would not freeze them:\n  {}\n\
-             Document them, or remove them before 1.0 — leaving a flag \
-             undocumented is a decision, not an oversight.",
+             Document them where the command is documented, or remove them \
+             before 1.0 — leaving a flag undocumented is a decision, not an \
+             oversight.",
             missing.join("\n  ")
         );
     }
@@ -2232,10 +2256,12 @@ mod documented_flags {
             ),
         ];
 
-        let own = own_long_flags();
+        // Which command owns a flag does not matter here; only whether the
+        // binary has it under any name at all.
+        let own: BTreeSet<String> = own_long_flags().into_iter().map(|(_, f)| f).collect();
         let stray: Vec<String> = flag_tokens(&published_docs())
             .into_iter()
-            .filter(|f| !own.contains_key(f))
+            .filter(|f| !own.contains(f))
             .filter(|f| !FOREIGN.iter().any(|(name, _)| name == f))
             .collect();
 

@@ -106,6 +106,7 @@ groove service install --service-name personal --kb-path /path/to/personal-kb --
 
 # 確認 / 管理
 groove service status                              # default 'groove'
+groove service status --service-name personal      # 名前付き instance
 groove service list                                # 全 instance
 groove service uninstall --service-name personal               # unit のみ削除、config + DB 残す
 groove service uninstall --service-name personal --purge --yes # config + DB も削除
@@ -158,6 +159,7 @@ daemon と独立に tray shortcut だけ管理する subcommand:
 
 ```bash
 groove service tray-install --service-name groove     # shortcut のみ追加
+groove service tray-install --service-name groove --force   # 既存 shortcut を上書き
 groove service tray-uninstall --service-name groove   # shortcut のみ削除
 ```
 

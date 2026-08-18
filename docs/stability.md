@@ -101,13 +101,18 @@ Breaking any of these requires a major version.
   this, so it is frozen.
 
   Six subcommands produce a result in that sense — `search`, `graph`, `doctor`,
-  `validate`, `eval`, and `tune`. `index`, `status`, and `service` write
-  everything they have to say to stderr, because what they emit is progress and
-  operational state rather than an answer to a query. **`groove status | …`
-  therefore receives nothing**, which is worth knowing before building a
-  pipeline on it. `groove doctor --format json` is the machine-readable route to
-  the two numbers `status` leads with, `documents` and `chunks`; the rest of
-  what `status` prints has no JSON form today.
+  `validate`, `eval`, and `tune` — and for those six the channel is frozen.
+
+  `index`, `status`, and `service` currently write everything they have to say
+  to stderr, so **`groove status | …` receives nothing**, which is worth knowing
+  before building a pipeline on it. Whether some of that is a result rather than
+  progress — `status`'s counts and `service list`'s inventory have a fair claim
+  — **is not settled, and this paragraph does not freeze it**. If those move to
+  stdout, `2>&1` consumers are unaffected and anyone capturing stderr alone
+  would need to change; that is the trade being weighed, and it will be settled
+  before 1.0.0 rather than by it. In the meantime `groove doctor --format json`
+  is the machine-readable route to the two numbers `status` leads with,
+  `documents` and `chunks`.
 
 ### Machine-readable output
 
