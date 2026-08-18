@@ -179,8 +179,10 @@ Two things deliberately do not correspond:
   between, subcommands are short because that is what a person types — and no
   caller ever has to translate one into the other.
 - **`rerank` and `--reranker`.** The tool parameter is a per-call boolean; the
-  flag picks a model. The flag that matches the parameter is
-  `groove serve --rerank-by-default`.
+  flag picks a model — and on the command line, naming one *is* the per-call
+  override, with `--reranker none` opting a single query out. The standing
+  default behind both is the `rerank_by_default` key, which `groove search` and
+  `groove serve` both read, and whose flag is `groove serve --rerank-by-default`.
 
 *Values* are held to a stricter rule than names, because a name that differs
 costs a lookup while a value that differs fails the call outright. Where the two
