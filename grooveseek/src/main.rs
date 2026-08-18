@@ -2155,7 +2155,7 @@ mod documented_flags {
         let docs = root.join("docs");
         assert!(
             docs.is_dir(),
-            "expected the documentation at {} — if the layout moved, this test \
+            "expected the documentation at {}. If the layout moved, this test \
              moves with it rather than being deleted",
             docs.display()
         );
@@ -2204,10 +2204,16 @@ mod documented_flags {
     /// substrings, because a flag can be a prefix of another: `--k` is inside
     /// `--kb-path`, so `contains("--k")` would call `--k` documented on the
     /// strength of a flag it has nothing to do with. The name may be a single
-    /// character for the same reason — `--k` is real, and a pattern demanding
+    /// character for the same reason: `--k` is real, and a pattern demanding
     /// two would leave the one case that needs this unprotected.
+    ///
+    /// The trailing boundary matters as much as the leading one. Greedy
+    /// `[a-z0-9-]*` stops at an uppercase letter or an underscore, so a
+    /// malformed `--kValue` in the prose would otherwise hand back `k` and
+    /// vouch for a flag nobody wrote about.
     fn documented_flag_tokens() -> BTreeSet<String> {
-        let re = regex::Regex::new(r"--([a-z][a-z0-9-]*)").expect("a valid pattern");
+        let re =
+            regex::Regex::new(r"--([a-z][a-z0-9-]*)(?:[^A-Za-z0-9_]|$)").expect("a valid pattern");
         re.captures_iter(&published_docs())
             .map(|c| c[1].to_string())
             .collect()
@@ -2245,7 +2251,7 @@ mod documented_flags {
             "these flags appear nowhere in docs/ or the README, so \
              docs/stability.md would not freeze them:\n  {}\n\
              Document them where the command is documented, or remove them \
-             before 1.0 — leaving a flag undocumented is a decision, not an \
+             before 1.0. Leaving a flag undocumented is a decision, not an \
              oversight.",
             missing.join("\n  ")
         );

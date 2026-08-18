@@ -349,8 +349,9 @@ groove tune --kb-path knowledge-base --golden ./ci-golden.yml --limit 20
 
 golden set は `groove eval` と同じものを読み、探し方のフラグも同じ:
 `--golden <PATH>` で `.groove-eval.yml` 以外を使い、`--limit` で 1 クエリあたりの
-取得件数を変え、`--no-color` で表の ANSI を落とし、`--model` / `--reranker` は
-測る対象の index に合わせる。
+取得件数を変え、`--no-color` で表の ANSI を落とし、`--model` は測る対象の index に
+合わせる。**`eval` と違って `--reranker` は取らない** — 測っているのは
+reranking の手前にある fusion 段だから。
 
 ### golden セットに求められる条件
 
