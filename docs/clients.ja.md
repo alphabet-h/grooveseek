@@ -5,7 +5,7 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 
 > **English version**: [clients.md](./clients.md)
 
-> **デプロイ用の完全なレシピは** [`grooveseek/examples/deployments/`](../grooveseek/examples/deployments/) **を参照**。3 パターン (個人 stdio / NAS 共有 = 1 writer + 多 read-only / 社内 HTTP サーバ = 1 サーバ + 多クライアント) で `groove.toml` / `.mcp.json` / systemd unit までセットで揃えてある。1 マシン上で複数 Claude Code を並行させる loopback daemon が要る場合は `groove service install` を使う (v0.8.0 で旧 `personal-http` レシピを置き換えた)。下のスニペットはそれらのレシピの中核を成す stdio エントリポイント。
+> **デプロイ用の完全なレシピは** [`grooveseek/examples/deployments/`](https://github.com/alphabet-h/grooveseek/tree/main/grooveseek/examples/deployments) **を参照**。3 パターン (個人 stdio / NAS 共有 = 1 writer + 多 read-only / 社内 HTTP サーバ = 1 サーバ + 多クライアント) で `groove.toml` / `.mcp.json` / systemd unit までセットで揃えてある。1 マシン上で複数 Claude Code を並行させる loopback daemon が要る場合は `groove service install` を使う (v0.8.0 で旧 `personal-http` レシピを置き換えた)。下のスニペットはそれらのレシピの中核を成す stdio エントリポイント。
 
 プロジェクトルート (またはクライアント対応の MCP 設定場所) の `.mcp.json` に以下を追加:
 
@@ -98,7 +98,7 @@ Claude Code セッション内部からナレッジベースを編集する (ま
 }
 ```
 
-`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](../grooveseek/examples/hooks/README.ja.md) 参照。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
+`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
 
 ## Frontmatter スキーマ検証
 ナレッジベースで frontmatter 規約を運用しているなら (例: `title` 必須、`date` は YYYY-MM-DD、`topic` は enum)、以下でファイル毎の違反をチェックできる:

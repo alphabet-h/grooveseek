@@ -4,6 +4,8 @@ What GrooveSeek promises not to break, and what it deliberately does not promise
 This policy takes effect at **1.0.0**. Releases before that are beta and carry no
 compatibility guarantee.
 
+> **日本語版**: [stability.ja.md](./stability.ja.md)
+
 GrooveSeek follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Within this document:
 

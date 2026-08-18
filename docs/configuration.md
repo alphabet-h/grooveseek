@@ -5,7 +5,7 @@ looked for, and which of those locations are trusted.
 
 > **日本語版**: [configuration.ja.md](./configuration.ja.md)
 
-Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](../grooveseek/groove.toml.example) to `groove.toml` and edit.
+Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) to `groove.toml` and edit.
 
 **A fresh copy of that template changes nothing.** It is not blank — a few sections (`[quality_filter]`, `[parsers]`, `[watch]`, `[transport]`, `[transport.http]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behaviour is commented out. The block below is a different thing: an illustration of what each key does, with values filled in — some of them non-default, some of them just the default spelled out. Read it as a menu, not as a file to paste wholesale:
 

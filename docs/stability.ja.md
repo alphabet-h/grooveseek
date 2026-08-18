@@ -4,6 +4,8 @@ GrooveSeek が壊さないと約束するもの、および**意図的に約束�
 本ポリシーは **1.0.0 から効力を持つ**。それ以前のリリースは beta であり、
 互換性の保証はない。
 
+> **English version**: [stability.md](./stability.md)
+
 GrooveSeek は [Semantic Versioning](https://semver.org/spec/v2.0.0.html) に従う。
 本書における意味:
 
