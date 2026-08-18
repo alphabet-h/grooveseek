@@ -99,7 +99,7 @@ groove search "semantic chunking" --kb-path /path/to/knowledge-base --limit 3
 
 | ページ | 内容 |
 | --- | --- |
-| [docs/usage.ja.md](docs/usage.ja.md) | 全コマンド: `index` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service` |
+| [docs/usage.ja.md](docs/usage.ja.md) | 全コマンド: `index` / `status` / `serve` / `search` / `graph` / `validate` / `doctor` / `eval` / `tune` / `service` |
 | [docs/configuration.ja.md](docs/configuration.ja.md) | `groove.toml` の全キー、探索順、どの置き場所を信頼するか |
 | [docs/clients.ja.md](docs/clients.ja.md) | `.mcp.json` のレシピ、HTTP トランスポート、PostToolUse hook、file watcher |
 | [docs/mcp-tools.ja.md](docs/mcp-tools.ja.md) | MCP の面 — ツール / プロンプト / `kb://` リソース |

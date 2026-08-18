@@ -102,7 +102,7 @@ uses.
 
 | Page | What is in it |
 | --- | --- |
-| [docs/usage.md](docs/usage.md) | Every command: `index`, `serve`, `search`, `graph`, `validate`, `doctor`, `eval`, `tune`, `service` |
+| [docs/usage.md](docs/usage.md) | Every command: `index`, `status`, `serve`, `search`, `graph`, `validate`, `doctor`, `eval`, `tune`, `service` |
 | [docs/configuration.md](docs/configuration.md) | Every `groove.toml` key, the discovery order, and which locations are trusted |
 | [docs/clients.md](docs/clients.md) | `.mcp.json` recipes, the HTTP transport, the PostToolUse hook, the file watcher |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | The MCP surface: tools, prompts, and `kb://` resources |

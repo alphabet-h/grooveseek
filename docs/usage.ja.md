@@ -1,7 +1,7 @@
 # 使い方
 
-`groove` コマンドのリファレンス — `index` / `serve` / `search` / `graph` /
-`validate` / `doctor` / `eval` / `tune` / `service`。
+`groove` コマンドのリファレンス — `index` / `status` / `serve` / `search` /
+`graph` / `validate` / `doctor` / `eval` / `tune` / `service`。
 
 > **English version**: [usage.md](./usage.md)
 

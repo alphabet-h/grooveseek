@@ -1,6 +1,6 @@
 # Usage
 
-Reference for the `groove` command line: `index`, `serve`, `search`,
+Reference for the `groove` command line: `index`, `status`, `serve`, `search`,
 `graph`, `validate`, `doctor`, `eval`, `tune`, and `service`.
 
 > **日本語版**: [usage.ja.md](./usage.ja.md)

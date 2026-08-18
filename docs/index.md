@@ -19,7 +19,7 @@ the top. 各ページに日本語版があり、冒頭で相互にリンクし�
 
 | | English | 日本語 |
 | --- | --- | --- |
-| Every command — `index`, `serve`, `search`, `graph`, `validate`, `doctor`, `eval`, `tune`, `service` | [usage.md](usage.md) | [usage.ja.md](usage.ja.md) |
+| Every command — `index`, `status`, `serve`, `search`, `graph`, `validate`, `doctor`, `eval`, `tune`, `service` | [usage.md](usage.md) | [usage.ja.md](usage.ja.md) |
 | Every `groove.toml` key, the discovery order, and which locations are trusted | [configuration.md](configuration.md) | [configuration.ja.md](configuration.ja.md) |
 | `.mcp.json` recipes, the HTTP transport, the PostToolUse hook, the file watcher | [clients.md](clients.md) | [clients.ja.md](clients.ja.md) |
 | The MCP surface: tools, prompts, and `kb://` resources | [mcp-tools.md](mcp-tools.md) | [mcp-tools.ja.md](mcp-tools.ja.md) |
