@@ -14,6 +14,9 @@
 kb_path = "/path/to/knowledge-base"
 model = "bge-m3"
 reranker = "bge-v2-m3"
+# `groove serve` と `groove search` の両方が読む (v0.27.0+)。1 クエリだけ変えたい
+# なら MCP ツールの `rerank` パラメータ、あるいはコマンドラインで `--reranker` を
+# 明示する (`--reranker none` でそのクエリだけ再ランクを切れる)。
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 
@@ -104,6 +107,8 @@ bind = "127.0.0.1:3100"
 # # rank-based low_confidence 判定: top1.score / mean(top-N.score) <
 # # min_confidence_ratio で flag が立つ。0.0 で判定無効。CLI
 # # `--min-confidence-ratio` / MCP param `min_confidence_ratio` で per-query 上書き可。
+# # 値は有限かつ >= 0.0。非有限値はどのスコアとの比較も false になり、
+# # 判定をきつくするどころか無効化するため、起動時に拒否する。
 # min_confidence_ratio = 1.5
 
 # 任意: MMR (Maximal Marginal Relevance) 多様性再ランク (v0.7.0+)。既定 off。

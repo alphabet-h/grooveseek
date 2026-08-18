@@ -430,6 +430,32 @@ fn parse_unit_f32(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
+/// Parse the `--min-confidence-ratio` value: finite and non-negative.
+///
+/// [`parse_unit_f32`] cannot serve here — it holds values to `[0.0, 1.0]`, and
+/// this one defaults to 1.5. What the two share is the reason for rejecting at
+/// the entry: a `nan` reaching [`compute_low_confidence`] makes every comparison
+/// against it false, which turns the flag off instead of tightening it, and the
+/// JSON echo cannot report what happened either (serde writes a non-finite float
+/// as `null` and `strip_null_keys` then drops the key). The caller would see a
+/// result with no `low_confidence` and no sign that the override was ignored.
+///
+/// The MCP side of the same value stays lenient on purpose (`server.rs` warns and
+/// falls back to the server default): a tool call has no one to show an argument
+/// error to mid-conversation, while a shell does.
+///
+/// [`compute_low_confidence`]: grooveseek::server::compute_low_confidence
+fn parse_confidence_ratio(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a valid f32: {e}"))?;
+    if !v.is_finite() {
+        return Err("must be finite".into());
+    }
+    if v < 0.0 {
+        return Err("must be >= 0.0 (0.0 disables the low_confidence check)".into());
+    }
+    Ok(v)
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct SearchCliArgs {
     /// Search query text (positional)
@@ -479,7 +505,11 @@ pub(crate) struct SearchCliArgs {
     #[arg(long = "date-to")]
     pub(crate) date_to: Option<String>,
     /// rank-based low_confidence ratio (default: 1.5、0.0 で判定無効)
-    #[arg(long = "min-confidence-ratio")]
+    #[arg(
+        long = "min-confidence-ratio",
+        value_parser = parse_confidence_ratio,
+        allow_hyphen_values = true
+    )]
     pub(crate) min_confidence_ratio: Option<f32>,
     /// Enable MMR re-ranking (overrides groove.toml [search.mmr].enabled).
     #[arg(long, value_parser = clap::value_parser!(bool))]
@@ -932,7 +962,12 @@ fn main() -> anyhow::Result<()> {
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
+            // `--reranker` given here is a choice about this query; a model that
+            // only came from groove.toml is subject to `rerank_by_default`.
+            let reranker_explicit = reranker.is_some();
             let reranker_choice = reranker.or(cfg.reranker).unwrap_or_default();
+            let rerank_now =
+                cli_should_rerank(reranker_explicit, reranker_choice, cfg.rerank_by_default);
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
@@ -979,12 +1014,11 @@ fn main() -> anyhow::Result<()> {
             // `--mmr` / `--mmr-lambda` / `--mmr-same-doc-penalty` /
             // `--parent-retriever` flags actually take effect for CLI callers.
             let toml_search = cfg.search.clone().unwrap_or_default();
-            let mut reranker_obj: Option<grooveseek::embedder::Reranker> =
-                if reranker_choice.is_enabled() {
-                    grooveseek::embedder::Reranker::try_new(reranker_choice)?
-                } else {
-                    None
-                };
+            let mut reranker_obj: Option<grooveseek::embedder::Reranker> = if rerank_now {
+                grooveseek::embedder::Reranker::try_new(reranker_choice)?
+            } else {
+                None
+            };
             let pipeline = grooveseek::server::run_search_pipeline(
                 &db,
                 reranker_obj.as_mut(),
@@ -1150,6 +1184,12 @@ fn main() -> anyhow::Result<()> {
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model_choice = model.or(cfg.model).unwrap_or_default();
+            // Deliberately not `cli_should_rerank`: `groove search` answers a
+            // question, `groove eval` measures a pipeline. The run fingerprint
+            // records `reranker` and not `rerank_by_default`, so letting that key
+            // suppress the reranker here would produce two runs that carry the
+            // same fingerprint and measured different pipelines — and
+            // `--fail-on-regression` picks its baseline by fingerprint equality.
             let reranker_choice = reranker.or(cfg.reranker).unwrap_or_default();
 
             let eval_cfg = cfg.eval.clone().unwrap_or_default();
@@ -1763,6 +1803,27 @@ fn print_graph(g: grooveseek::graph::ConnectionGraph, format: GraphFormat) {
     }
 }
 
+/// Whether a one-shot `groove search` should actually rerank.
+///
+/// `serve` decides this at startup — `--rerank-by-default`, else the
+/// `rerank_by_default` key, else `true` — and the MCP `search` tool overrides it
+/// per call. The command line consulted neither: it built a reranker whenever one
+/// was *configured*, so a `groove.toml` carrying `reranker = "bge-v2-m3"` next to
+/// `rerank_by_default = false` reranked from the CLI and did not rerank from the
+/// server. Three of the shipped deployment recipes are that exact pair.
+///
+/// The per-query override on this side is `--reranker` itself. Naming a model on
+/// the command line is a statement about this query, so it wins outright — the
+/// rule `docs/configuration.md` already states for every other option, that CLI
+/// arguments always win — and `--reranker none` turns rerank off for one query the
+/// same way. No `--rerank` flag was added for it: `docs/stability.md` freezes the
+/// MCP `rerank` parameter as the per-call boolean and `--reranker` as the model
+/// picker, and a `--rerank` one letter away from `--reranker`, taking a different
+/// type, would be frozen beside it at 1.0.0.
+fn cli_should_rerank(explicit: bool, choice: RerankerChoice, cfg_default: Option<bool>) -> bool {
+    choice.is_enabled() && (explicit || cfg_default.unwrap_or(true))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_search_results(
     hits: Vec<grooveseek::db::SearchHit>,
@@ -1907,7 +1968,7 @@ mod naming_surface {
         ("query", "the CLI takes the query as a positional argument"),
         (
             "rerank",
-            "a per-call boolean; the CLI's --reranker picks a model instead, and the flag that matches this one is `groove serve --rerank-by-default`",
+            "a per-call boolean; the CLI's --reranker picks a model instead, and naming one there is how a single `groove search` opts in or out. The standing default behind both is the `rerank_by_default` key, which each surface reads, and whose flag is `groove serve --rerank-by-default`",
         ),
     ];
 
@@ -2443,6 +2504,81 @@ mod tests {
                 assert_eq!(a.parent_retriever, Some(false));
             }
             _ => panic!("expected Eval subcommand"),
+        }
+    }
+
+    /// `groove search` used to rerank whenever a reranker was *configured*, so
+    /// `reranker = "bge-v2-m3"` beside `rerank_by_default = false` — the pair
+    /// three shipped deployment recipes carry — reranked from the command line
+    /// and not from the server reading the same file. A test that actually
+    /// reranks would need the ~2.3 GB cross-encoder, so the decision is a pure
+    /// function and these cover it directly.
+    #[test]
+    fn a_reranker_that_only_came_from_the_config_obeys_rerank_by_default() {
+        let m = RerankerChoice::BgeV2M3;
+        assert!(!cli_should_rerank(false, m, Some(false)));
+        assert!(cli_should_rerank(false, m, Some(true)));
+        // Absent key means yes — the same default `serve` resolves.
+        assert!(cli_should_rerank(false, m, None));
+    }
+
+    #[test]
+    fn naming_a_reranker_on_the_command_line_settles_that_query() {
+        // `--reranker <model>` is this query's opt-in, whatever the file says.
+        assert!(cli_should_rerank(
+            true,
+            RerankerChoice::BgeV2M3,
+            Some(false)
+        ));
+        // `--reranker none` is its opt-out, which is how it already behaved.
+        assert!(!cli_should_rerank(true, RerankerChoice::None, Some(true)));
+    }
+
+    #[test]
+    fn rerank_by_default_cannot_conjure_a_reranker_that_was_never_configured() {
+        for cfg_default in [None, Some(true), Some(false)] {
+            assert!(!cli_should_rerank(false, RerankerChoice::None, cfg_default));
+            assert!(!cli_should_rerank(true, RerankerChoice::None, cfg_default));
+        }
+    }
+
+    /// A non-finite ratio reached `compute_low_confidence`, where every
+    /// comparison against it is false: a value passed to *tighten* the check
+    /// turned it off instead. The JSON echo could not report that either — serde
+    /// writes a non-finite float as `null` and `strip_null_keys` then drops the
+    /// key, so the output carried no trace of the override at all.
+    #[test]
+    fn a_non_finite_confidence_ratio_is_refused_at_the_entry() {
+        for bad in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            assert!(
+                Cli::try_parse_from(["groove", "search", "q", "--min-confidence-ratio", bad])
+                    .is_err(),
+                "--min-confidence-ratio {bad} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_confidence_ratio_is_refused_but_zero_is_the_documented_off_switch() {
+        assert!(
+            Cli::try_parse_from(["groove", "search", "q", "--min-confidence-ratio", "-1"]).is_err(),
+            "a negative ratio never fires and is not how the check is disabled"
+        );
+        let cli = Cli::try_parse_from(["groove", "search", "q", "--min-confidence-ratio", "0"])
+            .expect("0.0 disables the low_confidence check by documented design");
+        match cli.command {
+            Commands::Search(a) => assert_eq!(a.min_confidence_ratio, Some(0.0)),
+            _ => panic!("expected Search subcommand"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_confidence_ratio_still_parses() {
+        let cli = Cli::try_parse_from(["groove", "search", "q", "--min-confidence-ratio", "1.5"])
+            .expect("the documented default value must remain acceptable");
+        match cli.command {
+            Commands::Search(a) => assert_eq!(a.min_confidence_ratio, Some(1.5)),
+            _ => panic!("expected Search subcommand"),
         }
     }
 

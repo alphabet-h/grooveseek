@@ -40,9 +40,11 @@
 #reranker = "bge-v2-m3"
 
 # Whether every `search` call reranks automatically once a reranker is
-# configured. Takes a boolean rather than being a bare flag, so the CLI form is
-# `--rerank-by-default=false`. The MCP tool's `rerank` parameter overrides it
-# per call.
+# configured. Read by `groove serve` and by `groove search` alike (v0.27.0+).
+# Takes a boolean rather than being a bare flag, so the CLI form is
+# `--rerank-by-default=false`. To override it for a single query: the MCP tool's
+# `rerank` parameter, or naming a model with `--reranker` on the command line
+# (`--reranker none` opts out for that one query).
 #rerank_by_default = true
 
 # fastembed model cache directory. The environment variable

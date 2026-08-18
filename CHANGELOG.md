@@ -69,6 +69,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **`groove search` ignored `rerank_by_default`.** The key decided whether
+  `serve` reranked every call; the command line did not read it at all. One
+  `groove.toml` carrying `reranker = "bge-v2-m3"` beside
+  `rerank_by_default = false` therefore reranked from the CLI and did not rerank
+  from the server — and three of the shipped deployment recipes are that exact
+  pair. The difference is not subtle: measured here on a warm cache, the same
+  query took 7 seconds without the cross-encoder and 72 with it.
+
+  **This changes behaviour.** With `rerank_by_default = false` next to a
+  `reranker`, `groove search` no longer reranks. Naming a model on the command
+  line opts a single query back in — `--reranker bge-v2-m3` — and
+  `--reranker none` opts a single query out, which is how a CLI argument has
+  always related to the file. No `--rerank` flag was added for it:
+  [docs/stability.md](docs/stability.md) freezes the MCP `rerank` parameter as
+  the per-call boolean and `--reranker` as the model picker, and a `--rerank`
+  one letter away from it, taking a different type, would be frozen beside it
+  at 1.0.0.
+
+  `groove eval` keeps reading only `--reranker`, deliberately: its run
+  fingerprint records the model and not this key, so honouring it would let two
+  runs carry the same fingerprint while measuring different pipelines — and
+  `--fail-on-regression` picks its baseline by fingerprint equality.
+
+- **`--min-confidence-ratio` accepted `nan` and `inf`.** A non-finite ratio
+  compares false against every score, so a value passed in order to *tighten*
+  the low-confidence check switched it off instead. The JSON echo could not
+  report that either: serde writes a non-finite float as `null`, and the
+  null-stripping pass then drops the key, leaving output with no trace of the
+  override. The flag now requires a finite value `>= 0.0` — `0.0` is still how
+  the check is disabled — and rejects before any model is loaded.
+  `[search].min_confidence_ratio` in `groove.toml` is held to the same rule,
+  which is the path `serve` reads. The MCP parameter keeps warning and falling
+  back to the server's value: a tool call has nowhere to show an argument error
+  mid-conversation, while a shell does.
+
+- **`docs/usage.md` said the CLI and the MCP tool answer with the same JSON.**
+  The wrapper is the same — `results`, `low_confidence`, `filter_applied` — but
+  the hits are not: an MCP hit also carries a `uri` when the document is one the
+  server will hand over, and a CLI hit never does. The sentence now says which
+  part is shared and links to where the `uri` rule is written down.
+
 - **`docs/stability.md` described a flag that does not exist.** It offered
   `--verbose` as the way to get more detail; `groove` has never had one.
   Verbosity comes from `RUST_LOG`, which appeared nowhere in the documentation.
