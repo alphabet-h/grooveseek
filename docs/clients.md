@@ -5,7 +5,7 @@ HTTP transport for several clients at once, and the pieces around them.
 
 > **日本語版**: [clients.ja.md](./clients.ja.md)
 
-> **Looking for full deployment recipes?** See [`grooveseek/examples/deployments/`](../grooveseek/examples/deployments/) for ready-to-adapt configs covering three patterns: personal stdio, NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). For a single-machine loopback daemon shared by several parallel Claude Code sessions, use `groove service install` — it replaced the former `personal-http` recipe in v0.8.0. The snippets below are the canonical stdio entry point you'll find in those recipes.
+> **Looking for full deployment recipes?** See [`grooveseek/examples/deployments/`](https://github.com/alphabet-h/grooveseek/tree/main/grooveseek/examples/deployments) for ready-to-adapt configs covering three patterns: personal stdio, NAS-shared (one writer + many read-only clients), and intranet HTTP server (one server + many clients). For a single-machine loopback daemon shared by several parallel Claude Code sessions, use `groove service install` — it replaced the former `personal-http` recipe in v0.8.0. The snippets below are the canonical stdio entry point you'll find in those recipes.
 
 Add the following to `.mcp.json` in your project root (or the equivalent MCP config for your client):
 
@@ -98,7 +98,7 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 }
 ```
 
-SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](../grooveseek/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
 
 ## Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:

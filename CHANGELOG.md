@@ -29,6 +29,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **The documentation is published as a site.** `docs/` is the GitHub Pages
+  publishing source, so the twenty-two reference pages and nine ADRs are
+  readable at <https://alphabet-h.github.io/grooveseek/> without cloning
+  anything. Both languages are published; every page already linked to its
+  counterpart, and `jekyll-relative-links` — on by default — resolves those
+  links, so the language switch is the one that was already in the text.
+
+  The repository root was the other possible source and was not chosen: it
+  would have published ninety-four Markdown files, thirty-two of them synthetic
+  test fixtures, plus the source tree as static files, and would have needed an
+  exclusion list maintained against a repository that is mostly not
+  documentation.
+
+  Six links inside `docs/` pointed outside it — at
+  `grooveseek/examples/` and `groove.toml.example` — and would have resolved to
+  nothing on a site whose root is `docs/`. They are absolute now, for the same
+  reason the README's images are.
+
 - **The README has a face: a mark, a screenshot of `/ui`, and three badges.**
   [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md) accepted,
   knowingly, that "GrooveSeek" says nothing about what the product does and that

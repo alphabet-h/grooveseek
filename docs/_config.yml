@@ -1,0 +1,17 @@
+# GitHub Pages configuration. This directory is the publishing source, so this
+# file is the site root's config; a `_config.yml` at the repository root would
+# be ignored. Jekyll does not publish files starting with `_`, so this file is
+# not itself served.
+#
+# No `plugins:` list. GitHub Pages enables its own set regardless, and three of
+# them are what make this site work without any other markup:
+#   jekyll-relative-links        the .md links between these pages resolve
+#   jekyll-optional-front-matter these pages carry no front matter
+#   jekyll-titles-from-headings  the first heading becomes the page title
+title: GrooveSeek
+description: Semantic search over a Markdown knowledge base, served over MCP.
+
+# One of the themes GitHub Pages supports. Minimal puts the title, description
+# and a link back to the repository in a left column, which is the closest of
+# the supported set to a documentation layout. Changing it is a one-line edit.
+theme: jekyll-theme-minimal
