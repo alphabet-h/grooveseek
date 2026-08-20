@@ -169,10 +169,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   closes both.
 
   Three spawners did it, not one: the shared helper, its watcher variant, and
-  `tests/http_transport.rs`, which carries its own copy. `--port` and
-  `pick_free_port` now appear nowhere under `tests/`. The flake is
-  intermittent, so this is not shown to have fixed it — what is shown is that
-  two known ways for these tests to interfere with each other are gone.
+  `tests/http_transport.rs`, which carried its own copy. `--port` and
+  `pick_free_port` now appear nowhere under `tests/`, and the reader that finds
+  the address is shared rather than copied — one parser, so a change to the
+  server's wording cannot be fixed in one spawner and left in another. The
+  flake is intermittent, so this is not shown to have fixed it; what is shown
+  is that two known ways for these tests to interfere with each other are gone.
 
 ## [0.27.0] - 2026-08-18
 
