@@ -1160,9 +1160,19 @@ fn is_non_loopback(addr: &std::net::SocketAddr) -> bool {
 /// なる = 実質 CWD 起点になる。ディレクトリを指すはずの変数で CWD に落ちるのは、
 /// どの変数でも同じ形の穴なので 1 箇所にまとめてある。
 pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    dir_from_env_value(std::env::var_os(name))
+}
+
+/// [`env_dir`] の判断部分。**値を引数で受ける**ので、テストが環境変数を立てずに
+/// 規則そのものを確かめられる。
+///
+/// 分けてあるのは検査のためだけではない。`env_dir` を読む側の経路 —
+/// `GROOVE_CONFIG_HOME` は `TrustRoots::from_env` が trust root として読み、
+/// `FASTEMBED_CACHE_DIR` はモデルの置き場所になる — はどれも
+/// **プロセス全体で共有**なので、テストがそこへ書くと隣で走っているテストの
+/// 判断が変わる。値を受け取る形にしておけば、その必要が最初から生じない。
+fn dir_from_env_value(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// `FASTEMBED_CACHE_DIR` が**モデルの置き場所として使える値**か (BU-07)。
@@ -2425,6 +2435,30 @@ lambda = 0.5
         let toml = "[search.fusion]\nrrf_k = inf\n";
         let cfg: crate::config::Config = toml::from_str(toml).unwrap();
         assert!(cfg.validate().is_err(), "inf rrf_k must be rejected");
+    }
+
+    /// (BU-07) An empty value for a directory variable means *unset*, not
+    /// "the current directory".
+    ///
+    /// Letting `""` through gives `PathBuf::from("")`, and every `join` onto it
+    /// is relative — so `GROOVE_CONFIG_HOME=""` would put a service's config
+    /// under whatever directory it started in, and `FASTEMBED_CACHE_DIR=""`
+    /// would download the model there. The rule is asserted on the value rather
+    /// than through a variable, because setting one would reach every test
+    /// running alongside: `TrustRoots::from_env` reads the first of those names.
+    ///
+    /// Distinct from `an_empty_directory_variable_is_not_a_directory`, which
+    /// covers the *consequence* — an empty base must not become a trust root —
+    /// and never calls the filter. This calls it.
+    #[test]
+    fn an_empty_directory_variable_counts_as_unset() {
+        use std::ffi::OsString;
+        assert_eq!(dir_from_env_value(Some(OsString::new())), None);
+        assert_eq!(dir_from_env_value(None), None);
+        assert_eq!(
+            dir_from_env_value(Some(OsString::from("/srv/kb"))),
+            Some(PathBuf::from("/srv/kb"))
+        );
     }
 
     /// The same gate, for the ratio the `low_confidence` flag is compared

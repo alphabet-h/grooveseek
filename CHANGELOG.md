@@ -176,6 +176,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   flake is intermittent, so this is not shown to have fixed it; what is shown
   is that two known ways for these tests to interfere with each other are gone.
 
+- **No test mutates the process environment any more.** One was left: it set
+  `GROOVE_CONFIG_HOME`, asserted, and put it back, with a note saying nothing
+  else mutated the environment beside it. True, and beside the point — the
+  hazard is not another writer, it is every concurrent reader.
+  `TrustRoots::from_env` reads that same variable to decide which directories
+  are trusted, so a test calling `Config::discover()` while this one held it
+  would have seen `/tmp/groove-test-override` as a trust root, and failed
+  somewhere else for a reason invisible from where it failed.
+
+  The judgement now takes its input as an argument — `resolve_config_home_in`,
+  matching `Config::discover_in`, which already had this shape. The same move
+  applies to `env_dir`'s rule that an empty value counts as *unset*: that rule
+  had no test at all, because reaching it meant setting a variable. It is
+  `dir_from_env_value` now, and deleting the filter fails a test instead of
+  none.
+
 ## [0.27.0] - 2026-08-18
 
 ### Added
