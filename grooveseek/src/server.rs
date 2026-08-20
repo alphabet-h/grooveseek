@@ -1087,27 +1087,21 @@ impl KbCore {
         }
     }
 
-    fn rebuild_index_blocking(&self, params: RebuildIndexParams) -> String {
+    /// The slot is claimed by the caller and handed over, not taken here.
+    ///
+    /// It has to be, because this body does not run when the request arrives.
+    /// `run_blocking` gives the closure to Tokio's blocking pool, and a
+    /// saturated pool queues it — a check made in here would run whenever the
+    /// closure was finally scheduled, which can be *after* the rebuild it should
+    /// have been refused for finished. The second rebuild would then be accepted
+    /// and the outage doubled, which is the thing the slot exists to prevent
+    /// (codex P2 on PR #187).
+    ///
+    /// Holding the slot for the length of this call is also what
+    /// `/api/admin/status` reads to report indexing.active=true (codex P2 rounds
+    /// 1 and 4 on PR #57).
+    fn rebuild_index_blocking(&self, params: RebuildIndexParams, _slot: RebuildSlot) -> String {
         let force = params.force.unwrap_or(false);
-
-        // One rebuild at a time. Taking the slot also flips `indexing_state` to
-        // `Some`, which is what `/api/admin/status` reads to report
-        // indexing.active=true (codex P2 rounds 1 and 4 on PR #57).
-        let _slot = match claim_rebuild_slot(&self.indexing_state) {
-            Ok(slot) => slot,
-            Err(started_at) => {
-                let secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-                return serde_json::to_string_pretty(&ErrorResponse {
-                    error: format!(
-                        "A rebuild is already running (started {secs}s ago). \
-                         Wait for it to finish and call again: each rebuild \
-                         re-embeds the whole corpus, and search is unavailable \
-                         while one runs."
-                    ),
-                })
-                .unwrap_or_default();
-            }
-        };
 
         // Lock order: embedder first, then db (consistent with search)
         let mut embedder = recover(self.embedder.lock(), "embedder");
@@ -1280,8 +1274,22 @@ impl KbServer {
         description = "Rebuild the search index by scanning all source files in the knowledge base (Markdown plus any other extensions enabled via `[parsers].enabled` in groove.toml)."
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
+        // Claimed here, in the handler, rather than inside the closure below —
+        // see `rebuild_index_blocking`. The refusal has to be decided when the
+        // request arrives, not whenever the blocking pool gets round to it.
+        //
+        // This does not violate BU-06, which says a handler must not touch
+        // `db` / `embedder` / `reranker`: `indexing_state` is a mutex over a
+        // two-field struct, held for the length of one comparison.
+        let slot = match claim_rebuild_slot(&self.core.indexing_state) {
+            Ok(slot) => slot,
+            Err(started_at) => return rebuild_already_running(started_at),
+        };
         let core = Arc::clone(&self.core);
-        run_blocking("rebuild_index", move || core.rebuild_index_blocking(params)).await
+        run_blocking("rebuild_index", move || {
+            core.rebuild_index_blocking(params, slot)
+        })
+        .await
     }
 
     #[tool(
@@ -2583,6 +2591,22 @@ impl Drop for RebuildSlot {
     }
 }
 
+/// What a caller is told when the slot is already taken.
+///
+/// The elapsed time is the useful part: "wait" without a number gives no way to
+/// tell a rebuild that is nearly done from one that just started.
+fn rebuild_already_running(started_at: std::time::SystemTime) -> String {
+    let secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    serde_json::to_string_pretty(&ErrorResponse {
+        error: format!(
+            "A rebuild is already running (started {secs}s ago). Wait for it to \
+             finish and call again: each rebuild re-embeds the whole corpus, and \
+             search is unavailable while one runs."
+        ),
+    })
+    .unwrap_or_default()
+}
+
 /// Take the rebuild slot, or report when the rebuild already holding it began.
 ///
 /// `rebuild_index` re-embeds the whole corpus while holding the embedder and
@@ -3868,6 +3892,26 @@ mod tests {
         drop(claim_rebuild_slot(&slot).expect("the slot starts free"));
 
         claim_rebuild_slot(&slot).expect("a finished rebuild must not lock the slot shut");
+    }
+
+    /// The refusal is a tool result, so it has to be the error envelope every
+    /// other failure uses — a client that can read one can read this.
+    #[test]
+    fn the_refusal_is_the_same_error_envelope_as_every_other_failure() {
+        let started = std::time::SystemTime::now() - std::time::Duration::from_secs(42);
+        let body = rebuild_already_running(started);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("the refusal must be JSON a client can read");
+        let message = parsed["error"]
+            .as_str()
+            .expect("the refusal must use the `error` envelope");
+        assert!(
+            message.contains("42s ago"),
+            "the refusal must say how long the running rebuild has been going, \
+             or the caller cannot tell one that is nearly done from one that \
+             just started: {message}"
+        );
     }
 
     /// Holding the slot is also what `/api/admin/status` reads to say an index
