@@ -217,7 +217,7 @@ groove search "tokio spawn" \
   --min-confidence-ratio 1.5
 ```
 
-- `--path-glob <PATTERN>` (繰り返し可) — パス glob によるフィルタ。`!` 始まりは exclude。MCP param: `path_globs`
+- `--path-glob <PATTERN>` (繰り返し可) — パス glob によるフィルタ。`!` 始まりは exclude。**1 パターンにつき 1 回**渡す: glob の構文自体がカンマを使う (`docs/{a,b}/**` は 2 つではなく 1 つのパターン) ので、**カンマでは区切らない**。MCP param: `path_globs`
 - `--tag-any <a,b,c>` — チャンクが**いずれか**のタグを持つときのみ通過。MCP param: `tags_any`
 - `--tag-all <a,b,c>` — チャンクが**すべての**タグを持つときのみ通過。MCP param: `tags_all`
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — 辞書順比較。どちらかが指定された場合、`date` 未設定のチャンクは厳密に除外される。MCP params: `date_from` / `date_to`
