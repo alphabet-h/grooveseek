@@ -227,12 +227,29 @@ struct PageRequest {
 
 fn request_the_page_builds(tool: &str) -> PageRequest {
     let call = fetch_call();
-    let target = literal_after(call, "\"").to_string();
-
-    let after_target = call
+    let (first_arg, after_target) = call
+        .trim_start_matches('(')
         .split_once(',')
-        .expect("fetch takes an options object as its second argument")
-        .1;
+        .expect("fetch takes an options object as its second argument");
+
+    // The target has to be **exactly** a string literal. Reading the first
+    // quoted fragment out of an expression would replay `/mcp` while
+    // `fetch("/mcp" + suffix, …)` asked the browser for something else. Same
+    // rule as option values and option keys: what is not modelled stops the
+    // test rather than being approximated.
+    let first_arg = first_arg.trim();
+    let target = first_arg
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .filter(|inner| !inner.contains('"'))
+        .unwrap_or_else(|| {
+            panic!(
+                "callTool now computes its target as {first_arg}, which this test \
+                 cannot resolve. Model the expression, or the request replayed \
+                 here goes somewhere the browser does not."
+            )
+        })
+        .to_string();
     let mut openers = Vec::new();
     let opts = object_from(balanced(after_target, b'{', b'}'), tool, &mut openers);
     let opts = opts.as_object().expect("the options are an object").clone();
