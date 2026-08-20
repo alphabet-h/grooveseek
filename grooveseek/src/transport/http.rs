@@ -16,7 +16,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -109,15 +109,21 @@ pub fn default_allowed_origins(port: u16) -> Vec<String> {
 }
 
 /// Whether one `[transport.http].allowed_origins` entry survives as far as the
-/// comparison, mirroring rmcp's `parse_origin_value`.
+/// comparison.
 ///
-/// rmcp runs the allow-list through that parser at match time and drops what it
-/// cannot read with a `filter_map` (`rmcp-3.1.2`
-/// `transport/streamable_http_server/tower.rs:781-806`). Dropping is silent and
-/// the list stays non-empty, so validation remains *switched on* with nothing
-/// left to compare against — and a non-empty list that matches nothing refuses
-/// every request carrying an `Origin`. The operator sees a server answering 403
-/// to their own browser with no warning anywhere.
+/// [`origin_is_allowed`] runs the allow-list through [`parse_origin`] at match
+/// time and drops what it cannot read with a `filter_map`. Dropping is silent
+/// and the list stays non-empty, so validation remains *switched on* with
+/// nothing left to compare against — and a non-empty list that matches nothing
+/// refuses every request carrying an `Origin`. The operator sees a server
+/// answering 403 to their own browser with no warning anywhere.
+///
+/// **(ADR-0009) This used to predict what rmcp would drop; now it decides.**
+/// The same parser answers both questions, so "would this entry be dropped?"
+/// and "how is this entry read?" cannot come apart. What the check buys is
+/// unchanged and slightly stronger: refusing at startup is better than dropping
+/// at match time either way, and by the time the matcher runs, every remaining
+/// entry is known to parse.
 ///
 /// **The check exists because this key is spelled unlike its neighbour.**
 /// `allowed_hosts` ends in a fallback that reads the whole string as a host
@@ -956,32 +962,55 @@ pub async fn run_http(
              for one local name does not cover another."
         );
     }
-    // (L-5) One list, two enforcers — the same arrangement `effective_hosts`
-    // already has. rmcp keeps `origin_is_allowed` private, so the admin router
-    // cannot call the check that guards `/mcp`; what it can do is compare
-    // against the identical list, which is what makes the agreement testable
-    // instead of hoped for.
-    let admin_origins = Arc::new(origins.clone());
+    // (ADR-0009) One list, one reader. `/mcp`, `/healthz` and the admin routes
+    // share these two `Arc`s and the single gate that compares against them, so
+    // "the surfaces agree" is a property of the code rather than of a test.
+    let shared_hosts = Arc::new(Some(effective_hosts.clone()));
+    let shared_origins = Arc::new(origins);
+
+    // **rmcp's own checks are switched off deliberately, and explicitly.**
+    // Empty means "accept every Host" (`host_is_allowed`) and "do not validate
+    // Origin" (`validate_origin_header`) upstream, which is how the library is
+    // told that the gate in front of it owns both questions.
+    //
+    // Passing them rather than omitting the calls is the whole point:
+    // `StreamableHttpServerConfig::default()` is loopback-only, so leaving them
+    // out would arm a second check with a *different* implementation — the
+    // arrangement this change exists to end.
     let mcp_config = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(effective_hosts.clone())
-        .with_allowed_origins(origins);
+        .with_allowed_hosts(Vec::<String>::new())
+        .with_allowed_origins(Vec::<String>::new());
     let mcp_service = StreamableHttpService::new(factory, Arc::clone(&session_manager), mcp_config);
 
     // (BU-32) `/mcp` だけを門番の配下に置く。`.layer()` を merge 後の app に
     // 掛けると `/healthz` も `/ui` も `/api/*` も巻き込むので、nest する側で
     // 閉じておく。
-    let mcp_router: Router =
-        Router::new()
-            .fallback_service(mcp_service)
-            .layer(middleware::from_fn_with_state(
-                McpSessionGate {
-                    live: LiveSessionCount::Rmcp(session_manager),
-                    max_sessions,
-                    admissions: Arc::new(Admissions::default()),
-                    refusals: Arc::new(RefusalLog::new()),
-                },
-                mcp_session_gate,
-            ));
+    let mcp_router: Router = Router::new()
+        .fallback_service(mcp_service)
+        .layer(middleware::from_fn_with_state(
+            McpSessionGate {
+                live: LiveSessionCount::Rmcp(session_manager),
+                max_sessions,
+                admissions: Arc::new(Admissions::default()),
+                refusals: Arc::new(RefusalLog::new()),
+            },
+            mcp_session_gate,
+        ))
+        // (ADR-0009) Outermost, so it runs **before** the session gate. rmcp
+        // validated inside its own `handle()`, which is after admission — so a
+        // refused `initialize` reserved a seat first and released it on the way
+        // out. Cheap, but it let a stream of requests with a foreign Host push
+        // legitimate clients into 429.
+        .layer(middleware::from_fn_with_state(
+            DnsRebindingGate {
+                surface: "/mcp",
+                peer_must_be_loopback: false,
+                hosts: Arc::clone(&shared_hosts),
+                origins: Arc::clone(&shared_origins),
+                refusals: Arc::new(RefusalLog::new()),
+            },
+            dns_rebinding_gate,
+        ));
 
     // F-64: `/healthz` を `allowed_hosts` 検証配下に置く opt-in。
     // healthz_public = true (default) の場合は従来通り Host check なしで public。
@@ -992,13 +1021,22 @@ pub async fn run_http(
     } else {
         // (codex P2 round 9 on PR #173) The same effective list `/mcp` got, not
         // the operator's raw value — otherwise `--bind 127.0.0.2` would answer
-        // `/mcp` and refuse `/healthz` for the identical Host.
-        let allowed_state = Arc::new(Some(effective_hosts.clone()));
+        // `/mcp` and refuse `/healthz` for the identical Host. It is now the
+        // same `Arc`, so "the same list" is no longer a thing to remember.
+        //
+        // No Origin list: `/healthz` never validated one, and this change is
+        // about who answers a question, not about asking new ones.
         Router::new()
             .route("/healthz", get(healthz))
             .layer(middleware::from_fn_with_state(
-                allowed_state,
-                healthz_host_check,
+                DnsRebindingGate {
+                    surface: "/healthz",
+                    peer_must_be_loopback: false,
+                    hosts: Arc::clone(&shared_hosts),
+                    origins: Arc::new(Vec::new()),
+                    refusals: Arc::new(RefusalLog::new()),
+                },
+                dns_rebinding_gate,
             ))
     };
 
@@ -1013,27 +1051,28 @@ pub async fn run_http(
     // (version, pid, indexing progress) that has no place in a tool surface
     // built for language models, and which the tray polls.
     //
-    // (L-5 / L-6) Three layers, and the order is the point. The last `.layer`
-    // is the outermost, so this reads bottom-up: security headers wrap
-    // everything (including both gates' refusals), then the Host check, then
-    // the Origin check, then the handler. Host before Origin is rmcp's order
-    // for `/mcp` (`validate_dns_rebinding_headers`, `tower.rs:864-879`), and
-    // `the_host_check_answers_before_the_origin_check` pins that this stays so
-    // — a request failing both gets the same reply from either surface.
-    let admin_gate = AdminGate {
-        admin_hosts: Arc::new(factory_shared.allowed_admin_hosts.clone()),
-        origins: admin_origins,
-        refusals: Arc::new(RefusalLog::new()),
-    };
+    // (L-6 / ADR-0009) Two layers now, not three: the peer, Host and Origin
+    // checks are one gate. The last `.layer` is the outermost, so this reads
+    // bottom-up — security headers wrap everything (including the gate's
+    // refusals), then the gate, then the handler.
+    //
+    // The admin routes keep their own Host list (`allowed_admin_hosts`, which
+    // is loopback plus the bind address and is not configurable) while sharing
+    // the Origin list with `/mcp`. Different lists, one comparison.
     let admin_router = Router::new()
         .route("/api/admin/status", get(api_admin_status))
         .route("/ui", get(ui_index))
         .with_state(Arc::clone(&factory_shared))
         .layer(middleware::from_fn_with_state(
-            admin_gate.clone(),
-            admin_origin_check,
+            DnsRebindingGate {
+                surface: "/ui and /api/admin",
+                peer_must_be_loopback: true,
+                hosts: Arc::new(Some(factory_shared.allowed_admin_hosts.clone())),
+                origins: Arc::clone(&shared_origins),
+                refusals: Arc::new(RefusalLog::new()),
+            },
+            dns_rebinding_gate,
         ))
-        .layer(middleware::from_fn_with_state(admin_gate, admin_host_check))
         .layer(middleware::from_fn(admin_security_headers));
 
     let app = healthz_router
@@ -1367,47 +1406,207 @@ async fn mcp_session_gate(
         .await
 }
 
-/// F-64: `/healthz` 用 axum middleware。Host header を allowed_hosts と照合し
-/// 不一致なら 400 / 403 を返す。実際の比較は pure helper `validate_host_header`
-/// に委譲、本 fn は HTTP-specific layer (= header / authority / response builder) のみ。
+// ---------------------------------------------------------------------------
+// (ADR-0009) One DNS-rebinding gate, in front of every route.
+// ---------------------------------------------------------------------------
+
+/// Why a request was turned away. Carries the offending value **for the log
+/// only** — [`Refusal::message`] never contains it, because the caller supplied
+/// it and a body is not the place to hand it back (L-7).
+#[derive(Debug)]
+enum Refusal {
+    NonLoopbackPeer(std::net::SocketAddr),
+    Host(HostRejection, String),
+    HostEncoding,
+    OriginEncoding,
+    OriginMalformed(String),
+    OriginNotAllowed(String),
+}
+
+impl Refusal {
+    /// The status and body, spelled exactly as rmcp spells them
+    /// (`tower.rs:715-719`, `:875`, `:896-911`). `/mcp` answered with those
+    /// strings before this gate existed, and answers with them after.
+    fn response(&self) -> Response {
+        match self {
+            Refusal::NonLoopbackPeer(_) => forbidden_plain("admin endpoints are loopback-only"),
+            Refusal::Host(HostRejection::MissingHost, _) => {
+                bad_request_typed("missing Host header")
+            }
+            Refusal::Host(HostRejection::MalformedHost, _) => {
+                bad_request_typed("Invalid Host header")
+            }
+            Refusal::Host(HostRejection::NotAllowed, _) => {
+                forbidden_plain("Host header is not allowed")
+            }
+            Refusal::HostEncoding => bad_request_typed("Invalid Host header encoding"),
+            Refusal::OriginEncoding => bad_request_typed("Invalid Origin header encoding"),
+            Refusal::OriginMalformed(_) => bad_request_typed("Invalid Origin header"),
+            Refusal::OriginNotAllowed(_) => forbidden_plain("Origin header is not allowed"),
+        }
+    }
+
+    /// One line, and the value that caused it.
+    ///
+    /// Every value logged here reached us through `HeaderValue::to_str`, which
+    /// yields `Ok` only for visible ASCII — so the AGENTS.md rule that stderr
+    /// stays ASCII holds by construction rather than by care. The two encoding
+    /// variants carry no value precisely because it was not ASCII.
+    fn log(&self, surface: &'static str, suppressed: u64) {
+        let also = suppressed;
+        match self {
+            Refusal::NonLoopbackPeer(peer) => tracing::warn!(
+                surface, %peer, also_refused_since_the_last_line = also,
+                "rejected a request from a non-loopback peer"
+            ),
+            Refusal::Host(HostRejection::MissingHost, _) => tracing::warn!(
+                surface,
+                also_refused_since_the_last_line = also,
+                "rejected a request with no Host header and no :authority"
+            ),
+            Refusal::Host(HostRejection::MalformedHost, host) => tracing::warn!(
+                surface,
+                host,
+                also_refused_since_the_last_line = also,
+                "rejected a malformed Host header"
+            ),
+            Refusal::Host(HostRejection::NotAllowed, host) => tracing::warn!(
+                surface,
+                host,
+                also_refused_since_the_last_line = also,
+                "rejected a disallowed Host header (possible DNS rebinding attempt)"
+            ),
+            Refusal::HostEncoding => tracing::warn!(
+                surface,
+                also_refused_since_the_last_line = also,
+                "rejected a request whose Host header is not ASCII"
+            ),
+            Refusal::OriginEncoding => tracing::warn!(
+                surface,
+                also_refused_since_the_last_line = also,
+                "rejected a request whose Origin header is not ASCII"
+            ),
+            Refusal::OriginMalformed(origin) => tracing::warn!(
+                surface,
+                origin,
+                also_refused_since_the_last_line = also,
+                "rejected a malformed Origin header"
+            ),
+            Refusal::OriginNotAllowed(origin) => tracing::warn!(
+                surface,
+                origin,
+                also_refused_since_the_last_line = also,
+                "rejected a disallowed Origin header (possible cross-origin attempt)"
+            ),
+        }
+    }
+}
+
+/// What one route group compares an incoming request against.
 ///
-/// rmcp 1.4 `tower.rs::validate_dns_rebinding_headers` と semantic parity:
-/// - missing Host → 400 "Bad Request: missing Host header"
-/// - non-UTF8 Host → 400 "Bad Request: Invalid Host header encoding"
-/// - parse 失敗 → 400 "Bad Request: Invalid Host header"
-/// - allow-list 不一致 → 403 "Forbidden: Host header is not allowed"
+/// **The two list fields do not spell "off" the same way, and that is not an
+/// oversight** — each mirrors the rmcp function it replaced:
 ///
-/// groove 拡張: HTTP/2 `:authority` fallback (= Q4=C2 で意図的に維持、
-/// rmcp の superset)。Host header 不在時に URI authority を fallback として読む。
-async fn healthz_host_check(
-    State(allowed): State<Arc<Option<Vec<String>>>>,
-    headers: HeaderMap,
+/// - `hosts`: `None` means [`DEFAULT_LOOPBACK_HOSTS`], `Some([])` means *every*
+///   Host is accepted (`host_is_allowed` returns `true` on an empty list), and
+///   a non-empty list is matched strictly.
+/// - `origins`: an empty list means **do not validate Origin at all**
+///   (`validate_origin_header` returns early), which is what
+///   `allowed_origins = []` buys and what `/healthz` is given.
+#[derive(Clone)]
+struct DnsRebindingGate {
+    /// Which routes this instance guards. Appears in the log line, so a flood
+    /// on one surface is distinguishable from a flood on another.
+    surface: &'static str,
+    /// Admin routes only. Host is caller-controlled, so on a `--bind 0.0.0.0`
+    /// daemon a LAN peer can send `Host: 127.0.0.1`; the peer address cannot be
+    /// spoofed that way (codex P1 round 6 on PR #57).
+    peer_must_be_loopback: bool,
+    hosts: Arc<Option<Vec<String>>>,
+    origins: Arc<Vec<String>>,
+    /// One line a minute per surface, carrying the count it stands for. Without
+    /// it a stream of cheap refused requests is a second resource exhaustion —
+    /// which is what rmcp did for `/mcp`, one `warn!` per refusal, unbounded.
+    refusals: Arc<RefusalLog>,
+}
+
+impl DnsRebindingGate {
+    /// The whole decision, as a function of the request. Pure but for reading
+    /// the request: no logging, no response building, nothing to await — so the
+    /// table of cases can be checked without a router.
+    fn decide(&self, req: &Request) -> Option<Refusal> {
+        // Peer, then Host, then Origin — rmcp's order for `/mcp`
+        // (`validate_dns_rebinding_headers`), with the peer check groove adds
+        // in front for the admin routes. Order is observable only when more
+        // than one is wrong, and then only in which refusal is named; keeping
+        // it uniform is what stops the surfaces from differing on that.
+        if self.peer_must_be_loopback
+            && let Some(axum::extract::ConnectInfo(peer)) =
+                req.extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            && !is_loopback_peer(peer.ip())
+        {
+            // The production listener always wraps with `connect_info`, so a
+            // missing extension means a test built the request by hand.
+            return Some(Refusal::NonLoopbackPeer(*peer));
+        }
+
+        let host_header = match req.headers().get(http::header::HOST).map(|h| h.to_str()) {
+            Some(Err(_)) => return Some(Refusal::HostEncoding),
+            Some(Ok(host)) => Some(host),
+            None => None,
+        };
+        // HTTP/2 carries the host in `:authority`, and `Router::nest` can drop
+        // the `Host` header hyper synthesizes from it. rmcp reads the fallback
+        // and so did `/healthz`; the admin gate did not, which is one of the
+        // divergences this gate removes.
+        let authority = req.uri().authority().map(|a| a.to_string());
+        let host_raw = host_header.or(authority.as_deref());
+        if let Err(why) = validate_host_header(host_raw, self.hosts.as_ref().as_deref()) {
+            return Some(Refusal::Host(why, host_raw.unwrap_or("").to_string()));
+        }
+
+        if self.origins.is_empty() {
+            return None;
+        }
+        let raw = req.headers().get(http::header::ORIGIN)?;
+        // A request carrying no `Origin` has no origin to check rather than an
+        // origin that fails the check (RFC 6454). Ordinary MCP clients, the
+        // tray and curl send none.
+        let Ok(origin_str) = raw.to_str() else {
+            return Some(Refusal::OriginEncoding);
+        };
+        let Ok(origin) = parse_origin(origin_str) else {
+            return Some(Refusal::OriginMalformed(origin_str.to_string()));
+        };
+        if !origin_is_allowed(&origin, &self.origins) {
+            return Some(Refusal::OriginNotAllowed(origin_str.to_string()));
+        }
+        None
+    }
+}
+
+/// The one gate. `/mcp`, `/healthz` and the admin routes all pass through it,
+/// differing only in the [`DnsRebindingGate`] they are handed.
+///
+/// (ADR-0009) Before this, the same two questions had four answers: rmcp's for
+/// `/mcp`, `healthz_host_check`'s, `admin_host_check`'s and
+/// `admin_origin_check`'s. They were fed one list and expected to agree.
+/// Measured, they did not — `Host: user:pw@127.0.0.1:3100`,
+/// `Host: 127.0.0.1:65536` and `Host: localhost:abc` were accepted on `/mcp`
+/// and refused next door, and the refusal bodies differed by a prefix.
+async fn dns_rebinding_gate(
+    State(gate): State<DnsRebindingGate>,
     req: Request,
     next: Next,
 ) -> Response {
-    // non-UTF8 Host header value は helper を経由せず middleware で直接 catch
-    // (= rmcp tower.rs:227-229 と同じ責務分担、helper には str しか渡さない)
-    let host_str: Option<Result<&str, _>> = headers.get("host").map(|h| h.to_str());
-    if let Some(Err(_)) = host_str {
-        return bad_request_typed("Invalid Host header encoding");
+    if let Some(refusal) = gate.decide(&req) {
+        if let Some(suppressed) = gate.refusals.record(gate.refusals.elapsed_secs()) {
+            refusal.log(gate.surface, suppressed);
+        }
+        return refusal.response();
     }
-    let host_from_header: Option<&str> = host_str.and_then(|r| r.ok());
-
-    // Host 不在時の URI authority fallback (= HTTP/2 / proxy-forwarded 互換)
-    let authority_owned: Option<String> = req.uri().authority().map(|a| a.to_string());
-    let host_raw: Option<&str> = host_from_header.or(authority_owned.as_deref());
-
-    // Arc<Option<Vec<String>>> → Option<&[String]> 変換
-    // (= `Option<Vec<String>>::as_deref()` は `Option<&[String]>` を返す。Vec の Deref<Target=[T]> による)
-    let allowed_slice: Option<&[String]> = allowed.as_ref().as_deref();
-
-    match validate_host_header(host_raw, allowed_slice) {
-        Ok(()) => next.run(req).await,
-        // 呼び出し側は prefix を含めない文字列を渡す (二重付与防止)
-        Err(HostRejection::MissingHost) => bad_request_typed("missing Host header"),
-        Err(HostRejection::MalformedHost) => bad_request_typed("Invalid Host header"),
-        Err(HostRejection::NotAllowed) => forbidden_plain("Host header is not allowed"),
-    }
+    next.run(req).await
 }
 
 /// `addr` が非 loopback (0.0.0.0、unspecified、または LAN IP 等) で、かつ
@@ -1629,204 +1828,6 @@ async fn api_search(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// What the admin gates need: the allow-lists they compare against, and one
-/// shared budget for what they are allowed to say about a refusal.
-///
-/// (codex P1 round 1 on PR #193) The budget is why this is a struct rather than
-/// two separate states. Every admin refusal used to log a line, and on a
-/// non-loopback bind the peer check refuses before anything else looks at the
-/// request — so a stream of cheap requests wrote a line each, without bound, to
-/// a `tracing-appender` file. `/mcp`'s session gate already had
-/// [`RefusalLog`] for exactly this; the admin gates were the path that did not.
-/// **Shared, not one per gate**: an attacker picks which refusal they trigger,
-/// so per-kind budgets would just be one budget times the number of kinds.
-/// It carries the two lists rather than the `KbServerShared` they come from,
-/// which is not tidiness: `KbServerShared` needs a database and an embedder, so
-/// a gate that held one could only be tested behind `#[ignore]` and a model
-/// download. Holding the lists makes both gates constructible in a unit test —
-/// which is how the refusal budget above is pinned to the middleware rather
-/// than only to itself.
-#[derive(Clone)]
-struct AdminGate {
-    admin_hosts: Arc<Vec<String>>,
-    origins: Arc<Vec<String>>,
-    refusals: Arc<RefusalLog>,
-}
-
-impl AdminGate {
-    /// `Some(n)` when this refusal may be logged, `n` being how many went
-    /// unmentioned since the last line. `None` means stay quiet.
-    fn may_log(&self) -> Option<u64> {
-        self.refusals.record(self.refusals.elapsed_secs())
-    }
-}
-
-/// (feature-43 PR-2) `admin_host_check` middleware — exact-match Host header
-/// against `shared.allowed_admin_hosts` (= loopback aliases + bind addr).
-/// Substring match is rejected since `10.0.127.0.1.evil.com` would otherwise
-/// match `127.0.0.1`. Port suffix is stripped before comparison so
-/// `127.0.0.1:3100` matches the bare `127.0.0.1` entry.
-async fn admin_host_check(
-    State(gate): State<AdminGate>,
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> Result<axum::response::Response, (StatusCode, String)> {
-    // codex P1 round 6 on PR #57: enforce loopback by **peer address** for
-    // admin routes. Host header alone is client-controlled — a remote
-    // attacker on the same LAN as a `--bind 0.0.0.0` daemon can send
-    // `Host: 127.0.0.1` and bypass the allow-list. Production code path
-    // (`run_http` -> `into_make_service_with_connect_info::<SocketAddr>()`)
-    // populates the `ConnectInfo<SocketAddr>` extension; tests via
-    // `oneshot` may leave it unset, in which case we fall through to the
-    // Host-only check (= test convenience, the production listener always
-    // wraps with connect_info so production is fail-closed).
-    if let Some(axum::extract::ConnectInfo(peer)) = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        && !is_loopback_peer(peer.ip())
-    {
-        if let Some(suppressed) = gate.may_log() {
-            tracing::warn!(
-                %peer,
-                also_refused_since_the_last_line = suppressed,
-                "admin: rejected a request from a non-loopback peer"
-            );
-        }
-        return Err((
-            StatusCode::FORBIDDEN,
-            "admin endpoints are loopback-only".to_string(),
-        ));
-    }
-
-    // codex P2 round 5+6 on PR #57: reuse `validate_host_header` so admin
-    // Host validation shares /healthz's hardened defenses (= userinfo /
-    // trailing garbage / port out-of-range rejected, NormalizedAuthority
-    // normalization for IPv6 and case).
-    let host_header = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok());
-    // (L-7) The rejected value goes to the log, not into the body. It came from
-    // the caller, and echoing caller-controlled bytes back is a habit worth not
-    // having even where the response is `text/plain` and now carries `nosniff`
-    // — the sibling gate on `/healthz` says `Host header is not allowed` and
-    // nothing more, rmcp says the same for `/mcp`, and this was the one surface
-    // that answered differently. Nothing is lost: `tracing::warn!` still names
-    // the value, on the console of the machine that can act on it.
-    //
-    // Logging it stays inside the ASCII rule AGENTS.md sets for stderr, and not
-    // by luck: `HeaderValue::to_str` yields `Ok` only for visible ASCII, so a
-    // header that could have arrived as mojibake is `None` here and reaches the
-    // `MissingHost` arm instead.
-    let host_for_log = host_header.unwrap_or("");
-    match validate_host_header(host_header, Some(gate.admin_hosts.as_slice())) {
-        Ok(()) => {}
-        Err(HostRejection::MissingHost) => {
-            return Err((StatusCode::BAD_REQUEST, "missing Host header".to_string()));
-        }
-        Err(HostRejection::MalformedHost) => {
-            if let Some(suppressed) = gate.may_log() {
-                tracing::warn!(
-                    host = host_for_log,
-                    also_refused_since_the_last_line = suppressed,
-                    "admin: rejected a malformed Host header"
-                );
-            }
-            return Err((StatusCode::BAD_REQUEST, "Invalid Host header".to_string()));
-        }
-        Err(HostRejection::NotAllowed) => {
-            if let Some(suppressed) = gate.may_log() {
-                tracing::warn!(
-                    host = host_for_log,
-                    also_refused_since_the_last_line = suppressed,
-                    "admin: rejected a Host header outside the admin allow-list \
-                     (possible DNS rebinding attempt)"
-                );
-            }
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Host header is not allowed".to_string(),
-            ));
-        }
-    }
-    Ok(next.run(req).await)
-}
-
-/// (L-5) The admin router's `Origin` check — the same question rmcp answers for
-/// `/mcp`, asked of the routes rmcp does not serve.
-///
-/// Until now `/ui` and `/api/admin/status` were reachable cross-origin by any
-/// page open in the operator's browser. Nothing leaked: the responses are
-/// GETs, and without CORS headers a foreign page cannot read what comes back.
-/// **What was missing was the guarantee that this stays true.** The first admin
-/// route with a side effect would have been callable from
-/// `https://anything.example` on the day it was added, and nothing in this file
-/// would have objected.
-///
-/// It reads the effective list `/mcp` got, not the operator's raw value, for the
-/// reason `/healthz` shares its: two lists derived from one setting drift the
-/// moment someone edits one of them. `an_origin_gets_the_same_verdict_from_both_surfaces`
-/// pins that they agree, through a running server, rather than asserting it here.
-///
-/// **What this does not close.** A request that carries no `Origin` still
-/// passes — that is RFC 6454, rmcp and the MCP specification alike, and it is
-/// what lets ordinary clients, the tray and `curl` work. So a cross-origin
-/// `<img src>` or a top-level navigation is unaffected: they send no `Origin`.
-/// This refuses `fetch` / `XMLHttpRequest`, which do. A future side-effecting
-/// admin route therefore still may not be a `GET`.
-async fn admin_origin_check(
-    State(gate): State<AdminGate>,
-    req: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> Result<axum::response::Response, (StatusCode, String)> {
-    // Empty means "do not validate", as it does upstream and as the startup
-    // warning says. An operator who switched Origin validation off for `/mcp`
-    // did not ask for it to stay on here.
-    if gate.origins.is_empty() {
-        return Ok(next.run(req).await);
-    }
-    let Some(raw) = req.headers().get(http::header::ORIGIN) else {
-        return Ok(next.run(req).await);
-    };
-    let Ok(origin_str) = raw.to_str() else {
-        // No value in the log line: it is not ASCII, which is why we are here.
-        if let Some(suppressed) = gate.may_log() {
-            tracing::warn!(
-                also_refused_since_the_last_line = suppressed,
-                "admin: rejected a request whose Origin header is not ASCII"
-            );
-        }
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid Origin header encoding".to_string(),
-        ));
-    };
-    let Ok(origin) = parse_origin(origin_str) else {
-        if let Some(suppressed) = gate.may_log() {
-            tracing::warn!(
-                origin = origin_str,
-                also_refused_since_the_last_line = suppressed,
-                "admin: rejected a malformed Origin header"
-            );
-        }
-        return Err((StatusCode::BAD_REQUEST, "Invalid Origin header".to_string()));
-    };
-    if !origin_is_allowed(&origin, &gate.origins) {
-        if let Some(suppressed) = gate.may_log() {
-            tracing::warn!(
-                origin = origin_str,
-                also_refused_since_the_last_line = suppressed,
-                "admin: rejected a disallowed Origin header (possible cross-origin attempt)"
-            );
-        }
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Origin header is not allowed".to_string(),
-        ));
-    }
-    Ok(next.run(req).await)
-}
-
 /// (L-6) The response headers `/ui` had none of.
 ///
 /// `default-src 'none'` and then back in only what this page is: its own inline
@@ -1907,13 +1908,15 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
         .route("/ui", get(ui_index))
         .with_state(Arc::clone(&shared))
         .layer(middleware::from_fn_with_state(
-            AdminGate {
-                admin_hosts: Arc::new(shared.allowed_admin_hosts.clone()),
+            DnsRebindingGate {
+                surface: "/ui and /api/admin",
+                peer_must_be_loopback: true,
+                hosts: Arc::new(Some(shared.allowed_admin_hosts.clone())),
                 // No bound port here, so no derived list — see the note above.
                 origins: Arc::new(Vec::new()),
                 refusals: Arc::new(RefusalLog::new()),
             },
-            admin_host_check,
+            dns_rebinding_gate,
         ))
         .layer(middleware::from_fn(admin_security_headers));
     axum::Router::new().merge(admin_router)
@@ -2667,12 +2670,17 @@ mod tests {
         if healthz_public {
             Router::new().route("/healthz", get(healthz))
         } else {
-            let allowed_state = Arc::new(allowed_hosts);
             Router::new()
                 .route("/healthz", get(healthz))
                 .layer(middleware::from_fn_with_state(
-                    allowed_state,
-                    healthz_host_check,
+                    DnsRebindingGate {
+                        surface: "/healthz",
+                        peer_must_be_loopback: false,
+                        hosts: Arc::new(allowed_hosts),
+                        origins: Arc::new(Vec::new()),
+                        refusals: Arc::new(RefusalLog::new()),
+                    },
+                    dns_rebinding_gate,
                 ))
         }
     }
@@ -3925,8 +3933,9 @@ mod tests {
     /// what is checked is that the decision was *asked for*, which is the wire
     /// that can be cut.
     ///
-    /// It needs no database, no embedder and no model, because [`AdminGate`]
-    /// holds the two lists rather than the `KbServerShared` they came from.
+    /// It needs no database, no embedder and no model, because
+    /// [`DnsRebindingGate`] holds the two lists rather than the
+    /// `KbServerShared` they came from.
     #[tokio::test]
     async fn every_admin_refusal_goes_through_the_shared_budget() {
         use tower::ServiceExt as _;
@@ -3936,23 +3945,21 @@ mod tests {
             ("Origin", "origin", "https://evil.example"),
         ] {
             let refusals = Arc::new(RefusalLog::new());
-            let gate = AdminGate {
-                admin_hosts: Arc::new(
+            let gate = DnsRebindingGate {
+                surface: "test",
+                peer_must_be_loopback: false,
+                hosts: Arc::new(Some(
                     DEFAULT_LOOPBACK_HOSTS
                         .iter()
                         .map(|h| (*h).to_string())
                         .collect(),
-                ),
+                )),
                 origins: Arc::new(vec!["http://127.0.0.1:3100".to_string()]),
                 refusals: Arc::clone(&refusals),
             };
             let app = Router::new()
                 .route("/probe", get(|| async { "ok" }))
-                .layer(middleware::from_fn_with_state(
-                    gate.clone(),
-                    admin_origin_check,
-                ))
-                .layer(middleware::from_fn_with_state(gate, admin_host_check));
+                .layer(middleware::from_fn_with_state(gate, dns_rebinding_gate));
 
             const REFUSALS: usize = 4;
             for _ in 0..REFUSALS {

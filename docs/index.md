@@ -58,6 +58,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 6. Report a corpus that quotes the golden set, and require more than one quote | [en](decisions/0006-report-a-corpus-that-quotes-the-golden-set.md) | [ja](decisions/0006-report-a-corpus-that-quotes-the-golden-set.ja.md) |
 | 7. Rename the project to GrooveSeek, and let the command be `groove` | [en](decisions/0007-rename-the-project-to-grooveseek.md) | [ja](decisions/0007-rename-the-project-to-grooveseek.ja.md) |
 | 8. Declare what 1.0.0 freezes, and leave the Rust API out of it | [en](decisions/0008-declare-what-1-0-freezes.md) | [ja](decisions/0008-declare-what-1-0-freezes.ja.md) |
+| 9. One DNS-rebinding gate, owned here | [en](decisions/0009-one-dns-rebinding-gate.md) | [ja](decisions/0009-one-dns-rebinding-gate.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and
