@@ -132,16 +132,106 @@ fn fetch_call() -> &'static str {
         2,
         "the page makes a request this file does not know about"
     );
-    assert!(
-        PAGE.contains("await callTool(\"search\""),
-        "the page's search no longer goes through callTool, so reading callTool \
-         describes a function nothing calls"
-    );
     let rest = body
         .split_once("await fetch")
         .expect("callTool calls fetch")
         .1;
     balanced(rest, b'(', b')')
+}
+
+/// The submit handler's body, with line comments removed.
+///
+/// Scoped and stripped because neither alone is enough: a whole-page substring
+/// is satisfied by `// await callTool("search")` sitting in a comment, or by an
+/// unreachable call somewhere else in the file, while the form no longer
+/// reaches the server at all.
+fn submit_handler() -> String {
+    let after = PAGE
+        .split_once("$(\"search-form\").addEventListener(\"submit\"")
+        .expect("the page still handles form submission")
+        .1;
+    strip_line_comments(balanced(after, b'{', b'}'))
+}
+
+/// Remove `//` comments, leaving anything inside a string literal alone —
+/// `"http://…"` is not a comment.
+fn strip_line_comments(js: &str) -> String {
+    let mut out = String::with_capacity(js.len());
+    for line in js.lines() {
+        let bytes = line.as_bytes();
+        let (mut in_string, mut cut) = (false, line.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 1,
+                b'"' | b'\'' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
+}
+
+/// Split on `sep` at brace/bracket/paren depth zero, ignoring string literals.
+fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut in_string, mut start) = (0i32, false, 0usize);
+    let mut parts = Vec::new();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => in_string = !in_string,
+            b'{' | b'[' | b'(' if !in_string => depth += 1,
+            b'}' | b']' | b')' if !in_string => depth -= 1,
+            b if b == sep && !in_string && depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The argument names the submit handler passes to `callTool("search", …)`.
+///
+/// Read rather than assumed. The live call below uses `list_topics`, which
+/// takes none — so without this, renaming the page's `query` to anything else,
+/// or emptying the object outright, would leave every check green while the
+/// shipped search reached the server without the argument it requires.
+fn search_argument_keys() -> Vec<String> {
+    let handler = submit_handler();
+    let after = handler
+        .split_once("callTool(\"search\"")
+        .expect(
+            "the page's search no longer goes through callTool, so reading \
+             callTool describes a function nothing calls",
+        )
+        .1;
+    let obj = balanced(after, b'{', b'}');
+    let inner = &obj[1..obj.len() - 1];
+    split_top_level(inner, b',')
+        .into_iter()
+        .map(|pair| {
+            pair.split_once(':')
+                .unwrap_or_else(|| panic!("cannot read {pair:?} as an argument"))
+                .0
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        })
+        .collect()
 }
 
 /// One JavaScript value from the page, as it will appear on the wire.
@@ -403,6 +493,16 @@ fn the_request_read_from_the_page_is_the_one_the_protocol_needs() {
         params.get("arguments").is_some_and(Value::is_object),
         "`arguments` is gone from `params`; the page calls `search` with a \
          required `query`, so a tool that needs one would be called without it: {body}"
+    );
+
+    // And what the page actually puts in there. The live call below is
+    // `list_topics`, which takes no arguments, so this is the only place the
+    // search invocation's own shape is checked.
+    let keys = search_argument_keys();
+    assert!(
+        keys.contains(&"query".to_string()),
+        "the page's search passes {keys:?}; the MCP search tool requires \
+         `query`, so submitting the form would be refused"
     );
     assert!(
         params.get("_meta").is_some_and(Value::is_object),
