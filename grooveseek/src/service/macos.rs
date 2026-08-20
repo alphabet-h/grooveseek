@@ -74,7 +74,14 @@ fn tighten_existing_logs(config_home: &Path) {
 impl ServiceBackend for LaunchAgent {
     fn install(&self, ctx: &InstallContext) -> Result<()> {
         let path = plist_path(&ctx.service_name)?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        // `plist_path` は必ず `~/Library/LaunchAgents/` 配下を返すので親は
+        // 存在するはずだが、`unwrap()` はその「はず」を実行時 panic で表明する。
+        // 呼び出し元は `Result` を扱えるので、そちらに載せる。
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("plist パスに親ディレクトリが無い: {}", path.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("LaunchAgents ディレクトリ作成失敗: {}", parent.display()))?;
         if path.exists() && !ctx.force {
             return Err(anyhow!(
                 "plist が既存: {} (--force で上書き)",
@@ -97,7 +104,13 @@ impl ServiceBackend for LaunchAgent {
                 "bootout",
                 &format!("gui/{}/com.groove.{}", uid, ctx.service_name),
             ]);
-            run_launchctl(&["bootstrap", &format!("gui/{}", uid), path.to_str().unwrap()])?;
+            // `launchctl` は引数を `&str` で受けるので、UTF-8 でないホーム
+            // ディレクトリではここが唯一の失敗点になる。panic ではなく
+            // 「なぜ install できないか」として返す。
+            let path_arg = path
+                .to_str()
+                .ok_or_else(|| anyhow!("plist パスが UTF-8 でない: {}", path.display()))?;
+            run_launchctl(&["bootstrap", &format!("gui/{}", uid), path_arg])?;
         }
         Ok(())
     }
