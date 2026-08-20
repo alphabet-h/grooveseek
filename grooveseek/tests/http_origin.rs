@@ -406,22 +406,81 @@ fn the_admin_router_allows_the_origin_the_page_is_served_from() {
 /// verdict, or an operator debugging a 403 learns nothing from which URL they
 /// tried.
 ///
-/// It is asked of origins on both sides of the answer, because a gate that
-/// refuses everything also "agrees" on the refused one.
+/// (codex P1 round 1 on PR #193) It is a *table*, not a pair. rmcp's matcher is
+/// private, so the admin gate necessarily holds a second implementation of one
+/// verdict — the same arrangement `validate_host_header` has had since #57 —
+/// and the failure mode is an rmcp upgrade changing semantics under one of
+/// them. Two origins would not notice: they agree on the ordinary allowed one
+/// and the ordinary foreign one no matter what either side does with case,
+/// brackets, userinfo or a port out of range. **These are the cases where an
+/// upgrade would show up first**, and this test is what turns "they might
+/// drift" into a CI failure on the day they do.
+///
+/// The expected verdicts are deliberately *not* written down. Pinning them
+/// would make this a test of rmcp, which is not ours to fix; requiring only
+/// that the two answers match leaves rmcp free to change and requires us to
+/// follow. The final assertion keeps that from degenerating into "both refuse
+/// everything, so both agree".
 #[test]
 fn an_origin_gets_the_same_verdict_from_both_surfaces() {
     let (_kb, _guard, base) = start("groove-origin-agree", NO_ORIGIN_KEYS);
+    let port = base
+        .rsplit(':')
+        .next()
+        .expect("base names a port")
+        .to_string();
 
-    for origin in [base.clone(), "https://evil.example".to_string()] {
-        let mcp = post_initialize(&base, Some(&origin));
-        let admin = get_status(&base, "/api/admin/status", Some(&origin));
+    let cases = vec![
+        // The ordinary two.
+        ("the origin this page is served from", base.clone()),
+        ("a foreign origin", "https://evil.example".to_string()),
+        // Spellings of the same allowed origin. Every one of these depends on
+        // a normalization step that lives in both implementations.
+        ("a loopback alias", format!("http://localhost:{port}")),
+        ("bracketed IPv6", format!("http://[::1]:{port}")),
+        ("an upper-case scheme", format!("HTTP://127.0.0.1:{port}")),
+        ("an upper-case host", format!("http://LOCALHOST:{port}")),
+        (
+            "userinfo before the host",
+            format!("http://u@127.0.0.1:{port}"),
+        ),
+        // Near misses: right host, wrong one component.
+        ("the wrong scheme", format!("https://127.0.0.1:{port}")),
+        ("no port at all", "http://127.0.0.1".to_string()),
+        ("a different port", "http://127.0.0.1:1".to_string()),
+        // Not tuple origins.
+        ("the opaque origin", "null".to_string()),
+        // Unparseable, where the two could differ on 400 versus 403.
+        ("no scheme", format!("127.0.0.1:{port}")),
+        ("a scheme and nothing else", "http://".to_string()),
+        ("a port out of range", "http://127.0.0.1:99999".to_string()),
+        ("not a URI at all", "banana".to_string()),
+    ];
+
+    let mut verdicts = Vec::new();
+    for (what, origin) in &cases {
+        let mcp = post_initialize(&base, Some(origin));
+        let admin = get_status(&base, "/api/admin/status", Some(origin));
         assert_eq!(
             mcp, admin,
-            "Origin {origin} got {mcp} from /mcp and {admin} from \
-             /api/admin/status. Both read [transport.http].allowed_origins, so \
-             a disagreement means one of them stopped reading it"
+            "{what} ({origin}) got {mcp} from /mcp and {admin} from \
+             /api/admin/status. rmcp guards one and this repository guards the \
+             other; they read one list and must reach one verdict"
         );
+        verdicts.push(mcp);
     }
+
+    // Without this, a gate that refused every request would pass the loop.
+    assert!(
+        verdicts.iter().any(|v| v == "200"),
+        "no case was allowed, so the agreement above is the agreement of two \
+         closed doors: {verdicts:?}"
+    );
+    assert!(
+        verdicts.iter().any(|v| v != "200"),
+        "no case was refused, so the agreement above is the agreement of two \
+         open doors: {verdicts:?}"
+    );
 }
 
 /// Host is checked before Origin, as it is in rmcp

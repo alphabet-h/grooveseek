@@ -1020,18 +1020,20 @@ pub async fn run_http(
     // for `/mcp` (`validate_dns_rebinding_headers`, `tower.rs:864-879`), and
     // `the_host_check_answers_before_the_origin_check` pins that this stays so
     // — a request failing both gets the same reply from either surface.
+    let admin_gate = AdminGate {
+        admin_hosts: Arc::new(factory_shared.allowed_admin_hosts.clone()),
+        origins: admin_origins,
+        refusals: Arc::new(RefusalLog::new()),
+    };
     let admin_router = Router::new()
         .route("/api/admin/status", get(api_admin_status))
         .route("/ui", get(ui_index))
         .with_state(Arc::clone(&factory_shared))
         .layer(middleware::from_fn_with_state(
-            admin_origins,
+            admin_gate.clone(),
             admin_origin_check,
         ))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&factory_shared),
-            admin_host_check,
-        ))
+        .layer(middleware::from_fn_with_state(admin_gate, admin_host_check))
         .layer(middleware::from_fn(admin_security_headers));
 
     let app = healthz_router
@@ -1627,13 +1629,45 @@ async fn api_search(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// What the admin gates need: the allow-lists they compare against, and one
+/// shared budget for what they are allowed to say about a refusal.
+///
+/// (codex P1 round 1 on PR #193) The budget is why this is a struct rather than
+/// two separate states. Every admin refusal used to log a line, and on a
+/// non-loopback bind the peer check refuses before anything else looks at the
+/// request — so a stream of cheap requests wrote a line each, without bound, to
+/// a `tracing-appender` file. `/mcp`'s session gate already had
+/// [`RefusalLog`] for exactly this; the admin gates were the path that did not.
+/// **Shared, not one per gate**: an attacker picks which refusal they trigger,
+/// so per-kind budgets would just be one budget times the number of kinds.
+/// It carries the two lists rather than the `KbServerShared` they come from,
+/// which is not tidiness: `KbServerShared` needs a database and an embedder, so
+/// a gate that held one could only be tested behind `#[ignore]` and a model
+/// download. Holding the lists makes both gates constructible in a unit test —
+/// which is how the refusal budget above is pinned to the middleware rather
+/// than only to itself.
+#[derive(Clone)]
+struct AdminGate {
+    admin_hosts: Arc<Vec<String>>,
+    origins: Arc<Vec<String>>,
+    refusals: Arc<RefusalLog>,
+}
+
+impl AdminGate {
+    /// `Some(n)` when this refusal may be logged, `n` being how many went
+    /// unmentioned since the last line. `None` means stay quiet.
+    fn may_log(&self) -> Option<u64> {
+        self.refusals.record(self.refusals.elapsed_secs())
+    }
+}
+
 /// (feature-43 PR-2) `admin_host_check` middleware — exact-match Host header
 /// against `shared.allowed_admin_hosts` (= loopback aliases + bind addr).
 /// Substring match is rejected since `10.0.127.0.1.evil.com` would otherwise
 /// match `127.0.0.1`. Port suffix is stripped before comparison so
 /// `127.0.0.1:3100` matches the bare `127.0.0.1` entry.
 async fn admin_host_check(
-    State(shared): State<Arc<KbServerShared>>,
+    State(gate): State<AdminGate>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -1651,7 +1685,13 @@ async fn admin_host_check(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         && !is_loopback_peer(peer.ip())
     {
-        tracing::warn!(%peer, "admin: rejected a request from a non-loopback peer");
+        if let Some(suppressed) = gate.may_log() {
+            tracing::warn!(
+                %peer,
+                also_refused_since_the_last_line = suppressed,
+                "admin: rejected a request from a non-loopback peer"
+            );
+        }
         return Err((
             StatusCode::FORBIDDEN,
             "admin endpoints are loopback-only".to_string(),
@@ -1679,24 +1719,30 @@ async fn admin_host_check(
     // header that could have arrived as mojibake is `None` here and reaches the
     // `MissingHost` arm instead.
     let host_for_log = host_header.unwrap_or("");
-    match validate_host_header(host_header, Some(shared.allowed_admin_hosts.as_slice())) {
+    match validate_host_header(host_header, Some(gate.admin_hosts.as_slice())) {
         Ok(()) => {}
         Err(HostRejection::MissingHost) => {
             return Err((StatusCode::BAD_REQUEST, "missing Host header".to_string()));
         }
         Err(HostRejection::MalformedHost) => {
-            tracing::warn!(
-                host = host_for_log,
-                "admin: rejected a malformed Host header"
-            );
+            if let Some(suppressed) = gate.may_log() {
+                tracing::warn!(
+                    host = host_for_log,
+                    also_refused_since_the_last_line = suppressed,
+                    "admin: rejected a malformed Host header"
+                );
+            }
             return Err((StatusCode::BAD_REQUEST, "Invalid Host header".to_string()));
         }
         Err(HostRejection::NotAllowed) => {
-            tracing::warn!(
-                host = host_for_log,
-                "admin: rejected a Host header outside the admin allow-list \
-                 (possible DNS rebinding attempt)"
-            );
+            if let Some(suppressed) = gate.may_log() {
+                tracing::warn!(
+                    host = host_for_log,
+                    also_refused_since_the_last_line = suppressed,
+                    "admin: rejected a Host header outside the admin allow-list \
+                     (possible DNS rebinding attempt)"
+                );
+            }
             return Err((
                 StatusCode::FORBIDDEN,
                 "Host header is not allowed".to_string(),
@@ -1729,14 +1775,14 @@ async fn admin_host_check(
 /// This refuses `fetch` / `XMLHttpRequest`, which do. A future side-effecting
 /// admin route therefore still may not be a `GET`.
 async fn admin_origin_check(
-    State(allowed): State<Arc<Vec<String>>>,
+    State(gate): State<AdminGate>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     // Empty means "do not validate", as it does upstream and as the startup
     // warning says. An operator who switched Origin validation off for `/mcp`
     // did not ask for it to stay on here.
-    if allowed.is_empty() {
+    if gate.origins.is_empty() {
         return Ok(next.run(req).await);
     }
     let Some(raw) = req.headers().get(http::header::ORIGIN) else {
@@ -1744,24 +1790,35 @@ async fn admin_origin_check(
     };
     let Ok(origin_str) = raw.to_str() else {
         // No value in the log line: it is not ASCII, which is why we are here.
-        tracing::warn!("admin: rejected a request whose Origin header is not ASCII");
+        if let Some(suppressed) = gate.may_log() {
+            tracing::warn!(
+                also_refused_since_the_last_line = suppressed,
+                "admin: rejected a request whose Origin header is not ASCII"
+            );
+        }
         return Err((
             StatusCode::BAD_REQUEST,
             "Invalid Origin header encoding".to_string(),
         ));
     };
     let Ok(origin) = parse_origin(origin_str) else {
-        tracing::warn!(
-            origin = origin_str,
-            "admin: rejected a malformed Origin header"
-        );
+        if let Some(suppressed) = gate.may_log() {
+            tracing::warn!(
+                origin = origin_str,
+                also_refused_since_the_last_line = suppressed,
+                "admin: rejected a malformed Origin header"
+            );
+        }
         return Err((StatusCode::BAD_REQUEST, "Invalid Origin header".to_string()));
     };
-    if !origin_is_allowed(&origin, &allowed) {
-        tracing::warn!(
-            origin = origin_str,
-            "admin: rejected a disallowed Origin header (possible cross-origin attempt)"
-        );
+    if !origin_is_allowed(&origin, &gate.origins) {
+        if let Some(suppressed) = gate.may_log() {
+            tracing::warn!(
+                origin = origin_str,
+                also_refused_since_the_last_line = suppressed,
+                "admin: rejected a disallowed Origin header (possible cross-origin attempt)"
+            );
+        }
         return Err((
             StatusCode::FORBIDDEN,
             "Origin header is not allowed".to_string(),
@@ -1850,7 +1907,12 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
         .route("/ui", get(ui_index))
         .with_state(Arc::clone(&shared))
         .layer(middleware::from_fn_with_state(
-            Arc::clone(&shared),
+            AdminGate {
+                admin_hosts: Arc::new(shared.allowed_admin_hosts.clone()),
+                // No bound port here, so no derived list — see the note above.
+                origins: Arc::new(Vec::new()),
+                refusals: Arc::new(RefusalLog::new()),
+            },
             admin_host_check,
         ))
         .layer(middleware::from_fn(admin_security_headers));
@@ -3850,6 +3912,81 @@ mod tests {
             }
         }
         assert_eq!((ok, refused), (1, 15));
+    }
+
+    /// (codex P1 round 1 on PR #193) The admin gates go through the same
+    /// budget — and this asks the *middleware*, not the budget.
+    ///
+    /// `refusal_logging_is_thinned_but_never_silent` below covers
+    /// [`RefusalLog`] itself and would stay green with every `may_log()` call
+    /// deleted from the two gates: the counter it exercises is one the
+    /// middleware never touched. So this drives refusals through a real router
+    /// and reads the counter afterwards. Nothing captures `tracing` output;
+    /// what is checked is that the decision was *asked for*, which is the wire
+    /// that can be cut.
+    ///
+    /// It needs no database, no embedder and no model, because [`AdminGate`]
+    /// holds the two lists rather than the `KbServerShared` they came from.
+    #[tokio::test]
+    async fn every_admin_refusal_goes_through_the_shared_budget() {
+        use tower::ServiceExt as _;
+
+        for (what, header, value) in [
+            ("Host", "host", "kb.example.lan"),
+            ("Origin", "origin", "https://evil.example"),
+        ] {
+            let refusals = Arc::new(RefusalLog::new());
+            let gate = AdminGate {
+                admin_hosts: Arc::new(
+                    DEFAULT_LOOPBACK_HOSTS
+                        .iter()
+                        .map(|h| (*h).to_string())
+                        .collect(),
+                ),
+                origins: Arc::new(vec!["http://127.0.0.1:3100".to_string()]),
+                refusals: Arc::clone(&refusals),
+            };
+            let app = Router::new()
+                .route("/probe", get(|| async { "ok" }))
+                .layer(middleware::from_fn_with_state(
+                    gate.clone(),
+                    admin_origin_check,
+                ))
+                .layer(middleware::from_fn_with_state(gate, admin_host_check));
+
+            const REFUSALS: usize = 4;
+            for _ in 0..REFUSALS {
+                // The Host is set once. `header()` appends rather than
+                // replaces, and `headers().get(HOST)` reads the first, so
+                // adding a good Host beside the bad one under test left the
+                // request passing — measured, on the first run of this test.
+                let mut builder = Request::builder().uri("/probe");
+                if header != "host" {
+                    builder = builder.header("host", "127.0.0.1:3100");
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        builder
+                            .header(header, value)
+                            .body(Body::empty())
+                            .expect("build request"),
+                    )
+                    .await
+                    .expect("router answers");
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{what} was allowed");
+            }
+
+            // One line went out; the rest were counted instead of written.
+            assert_eq!(
+                refusals
+                    .suppressed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                (REFUSALS - 1) as u64,
+                "{what} refusals did not reach the shared budget, so each one \
+                 wrote its own log line"
+            );
+        }
     }
 
     /// 拒否ログの間引き。満杯の間は毎リクエスト拒否が起きるので、そのまま
