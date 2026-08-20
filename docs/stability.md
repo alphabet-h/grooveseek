@@ -171,6 +171,63 @@ so that silence is never mistaken for a promise.
   fingerprints its history with a `metric_version` for exactly that reason, and
   freezing the shape would freeze the metrics with it.
 
+### What a search answers
+
+The clause above promises that every documented field keeps its name, type and
+meaning. This is that set, written out, for the `search` MCP tool and for
+`groove search --format json` — which return the same wrapper and differ in one
+field, noted below. A field not on this list is not part of the promise.
+
+Names are given as paths because `topic` appears twice and means something
+different each time.
+
+| field | type | present |
+|---|---|---|
+| `results` | array | always |
+| `results[].score` | number | always |
+| `results[].path` | string | always, relative to the knowledge base |
+| `results[].title` | string or `null` | always, `null` when the document has no title |
+| `results[].heading` | string or `null` | always, `null` for a chunk with no heading |
+| `results[].topic` | string or `null` | always |
+| `results[].date` | string or `null` | always |
+| `results[].tags` | array of strings | always, `[]` when there are none |
+| `results[].content` | string | always |
+| `results[].match_spans` | array | **omitted** unless computed — see below |
+| `results[].expanded_from` | object | **omitted** unless the parent retriever expanded the hit |
+| `results[].uri` | string | **omitted** unless the document is one the server will hand over, and **never present over the command line** |
+| `low_confidence` | boolean | always — **advisory**, see below |
+| `filter_applied` | object | always, `{}` when no filter was given |
+| `filter_applied.category` | string | omitted unless given |
+| `filter_applied.topic` | string | omitted unless given |
+| `filter_applied.path_globs` | array of strings | omitted unless given |
+| `filter_applied.tags_any` | array of strings | omitted unless given |
+| `filter_applied.tags_all` | array of strings | omitted unless given |
+| `filter_applied.date_from` | string | omitted unless given |
+| `filter_applied.date_to` | string | omitted unless given |
+| `filter_applied.min_confidence_ratio` | number | omitted unless given |
+
+**Omitted means absent, not `null`.** Every row above that says "omitted" leaves
+the key out of the object entirely. A consumer must not distinguish a missing
+key from an explicit `null` — read both as "not provided".
+
+**`match_spans` carries three states**, and they are not the same: absent means
+the offsets were not computed (the query contains a non-ASCII term, or the
+content is too large), `[]` means they were computed and nothing matched, and a
+non-empty array is the contract in [docs/citations.md](citations.md).
+
+**`results[].uri` is the one difference between the two surfaces.** The MCP tool
+adds it when the document is servable; `groove search` never emits it. Adding it
+to the command line later would be a minor release, by the rule above that new
+fields may be added.
+
+**`low_confidence` is frozen as a field, not as a judgement.** What is promised
+is that the key is present and boolean. **The formula behind it, its default
+threshold, and which queries trip it are explicitly not frozen** and may change
+in any release. It is a heuristic that has been measured to track how much the
+two retrieval legs overlapped rather than whether the answer is right, so treat
+it as a hint to be careful and never as a verdict — [docs/filters.md](filters.md)
+records what it does and does not detect.
+
 ### MCP surface
 
 - **Tool names**, their **input schemas** (parameter names, types, and which are

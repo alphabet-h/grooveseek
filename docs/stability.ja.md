@@ -159,6 +159,61 @@ loopback origin** である。
   power-user 向け計測ツールで、`eval` は既にその理由で履歴に `metric_version` を
   刻んでいる。**形を凍らせると指標まで凍る**
 
+### search が返すもの
+
+上の節は「**文書化されたフィールド**は名前・型・意味を保つ」と約束している。
+**その集合がこれ**である — `search` MCP tool と `groove search --format json` の
+両方について書き下す (wrapper は同一、1 フィールドだけ違う。後述)。
+**この表に無いフィールドは約束の対象ではない。**
+
+`topic` が 2 箇所に出て意味が違うので、名前はパスで書く。
+
+| フィールド | 型 | 存在 |
+|---|---|---|
+| `results` | array | 常に |
+| `results[].score` | number | 常に |
+| `results[].path` | string | 常に。KB からの相対パス |
+| `results[].title` | string または `null` | 常に。title が無い文書では `null` |
+| `results[].heading` | string または `null` | 常に。見出しの無い chunk では `null` |
+| `results[].topic` | string または `null` | 常に |
+| `results[].date` | string または `null` | 常に |
+| `results[].tags` | string の array | 常に。無ければ `[]` |
+| `results[].content` | string | 常に |
+| `results[].match_spans` | array | 計算された場合のみ**キーごと不在**。後述 |
+| `results[].expanded_from` | object | parent retriever が拡張した場合のみ。他は**不在** |
+| `results[].uri` | string | サーバが渡す文書のときのみ。**CLI では常に不在** |
+| `low_confidence` | boolean | 常に。**助言** — 後述 |
+| `filter_applied` | object | 常に。filter 未指定なら `{}` |
+| `filter_applied.category` | string | 指定時のみ |
+| `filter_applied.topic` | string | 指定時のみ |
+| `filter_applied.path_globs` | string の array | 指定時のみ |
+| `filter_applied.tags_any` | string の array | 指定時のみ |
+| `filter_applied.tags_all` | string の array | 指定時のみ |
+| `filter_applied.date_from` | string | 指定時のみ |
+| `filter_applied.date_to` | string | 指定時のみ |
+| `filter_applied.min_confidence_ratio` | number | 指定時のみ |
+
+**「不在」は `null` ではなくキーごと無いこと。** 上表で「のみ」と書いた行は、
+条件を満たさなければ**オブジェクトからキーが消える**。消費側は
+**キーの不在と明示的な `null` を区別してはならない** — どちらも「与えられていない」
+と読む。
+
+**`match_spans` は 3 状態を持ち、それぞれ意味が違う**: 不在 = 計算していない
+(query に非 ASCII term が含まれる / content が大きすぎる)、`[]` = 計算したが
+一致なし、非空 = [docs/citations.ja.md](citations.ja.md) の契約。
+
+**`results[].uri` が 2 つの面の唯一の差**。MCP tool は渡せる文書に付け、
+`groove search` は決して出さない。後から CLI 側に足すのは、上の「フィールドの追加」
+規則により minor である。
+
+**`low_confidence` は「フィールドとして」凍結する。「判定として」ではない。**
+約束するのは**キーが存在し boolean であること**だけ。**その裏の式・既定の閾値・
+どのクエリで立つかは明示的に凍結せず**、どのリリースでも変わり得る。
+これは実測で「答が正しいか」ではなく「**2 つの retrieval 脚がどれだけ重なったか**」
+を追う量であることが分かっているヒューリスティックなので、
+**注意の合図として読み、判定として読まないこと**。何を検出し何を検出しないかは
+[docs/filters.ja.md](filters.ja.md) に記録してある。
+
 ### MCP の面
 
 - **tool 名**、その**入力スキーマ**（パラメータ名・型・必須かどうか）、
