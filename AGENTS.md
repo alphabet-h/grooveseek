@@ -21,13 +21,16 @@ cargo test                                              # skips model downloads
 cargo test -- --ignored                                 # runs them (~130 MB / ~2.3 GB)
 ```
 
-**To reproduce what CI checks, all four of these have to pass.** `cargo clippy
---all-targets` alone is not one of them, so it can be clean here while CI fails:
+**To reproduce what CI checks, every one of these has to pass** — `cargo clippy
+--all-targets` alone is not the whole of it, so it can be clean here while CI
+fails. No count is written down on purpose: the list is the list, and a number
+beside it is one more thing that can go stale.
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
 ```

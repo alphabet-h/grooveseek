@@ -42,6 +42,7 @@ To reproduce what CI runs, all of these have to pass — `cargo clippy --all-tar
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
 ```
