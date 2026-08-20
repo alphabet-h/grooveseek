@@ -201,6 +201,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **`docs/stability.md` writes out what a search answers with.** It had
+  promised since v0.27.0 that "every field documented today keeps its name,
+  type, and meaning" while documenting none of them — a promise with no subject,
+  in the document that says what 1.0 freezes. All 28 fields of the `search`
+  response are now listed with their type and presence rule, for the MCP tool
+  and for `groove search --format json`, taken from the types rather than the
+  prose. Three tests hold the table to the response in both directions and hold
+  the Japanese table to the English one.
+
+  The tests found the hole on their first run: the table stopped at
+  `match_spans` and `expanded_from` without describing what is inside them, so
+  five fields sat outside the freeze while looking covered.
+
+  **`low_confidence` is frozen as a field, not as a judgement.** The key is
+  present and boolean; the formula, the default threshold, and which queries
+  trip it are explicitly outside the freeze. Measured, it tracks how much the
+  two retrieval legs overlapped rather than whether the answer is right — on a
+  corpus where all 25 golden queries were answered correctly at rank 1 it still
+  fired on 14 of them, and it does not fire at all when a reranker runs, because
+  cross-encoder logits make the mean negative. `docs/filters.md` records both
+  limits. No behaviour changed: no corpus-independent threshold exists, so
+  moving the default would have swapped one arbitrary number for another.
+
 - **Two `chunks_exact(2)` calls in the PDF parser became `as_chunks::<2>()`.**
   Rust 1.98.0 stabilised `clippy::chunks_exact_to_as_chunks`, and CI installs
   `stable` unpinned, so the lint arrived on its own and turned `-D warnings`

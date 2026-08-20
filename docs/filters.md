@@ -97,6 +97,38 @@ low_confidence ⇔ (results.len() >= 2)
 about citing them as authoritative." The actual `results` are still returned;
 the flag is purely advisory.
 
+### What it does and does not detect
+
+The flag is a heuristic and has been measured, so what it is worth is written
+down here rather than inferred from the formula. Two limits matter to anyone
+deciding how much weight to put on it.
+
+**It does not fire at all when reranking is on.** A cross-encoder scores with
+logits, and an irrelevant chunk gets a strongly negative one. Over ten results
+the mean is reliably negative, and the `mean(scores) > 0.0` condition above then
+answers false for every query. Measured over 25 queries with `bge-v2-m3`:
+`low_confidence` was `false` every time, including for queries with no answer in
+the corpus. **Treat the flag as absent whenever a reranker ran.**
+
+**Without a reranker it tracks retriever overlap rather than correctness.** The
+denominator is the mean of the whole result set, so what moves the ratio is how
+many of the returned hits both retrieval legs found — and that depends on the
+query and the corpus rather than on whether the top hit is right. Measured on a
+20-document corpus where every one of 25 queries was answered correctly at rank
+1, the flag still fired on 14 of them. The same queries on a 121-document corpus
+land in a different place entirely: queries with no answer at all scored a
+median of 1.08 against the small corpus and 1.40 against the larger one, which
+is where correctly-answered queries had scored before.
+
+It is not noise — queries with no answer do score lower than queries with one,
+on a fixed corpus. But there is **no threshold that means the same thing across
+two knowledge bases**, which is why the default has been left where it is
+instead of being tuned against any single corpus.
+
+Both limits are recorded as open work rather than as intended behaviour. The
+field itself is frozen for 1.0; the formula and the default explicitly are not
+([docs/stability.md](stability.md)).
+
 ## `category` vs `tags_any`: different filter axes
 
 These are **different fields** in the index:
