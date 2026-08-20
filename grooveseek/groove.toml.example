@@ -191,6 +191,12 @@ bind = "127.0.0.1:3100"
 # loopback entries alongside your public origin if browser clients also reach
 # you over loopback.
 # An empty list DISABLES validation entirely and warns at startup.
+# A missing scheme is refused at startup rather than ignored: an entry that
+# cannot be parsed is dropped before matching, which leaves validation on with
+# nothing to match and 403s every browser, silently. Note allowed_hosts above
+# does take a bare host:port -- the two keys differ here.
+# An entry with no port matches EVERY port on that host, so write the port
+# unless you mean the scheme's default (https://kb.example.com means 443).
 #allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]
 
 # Whether /healthz sits outside the allow-list (v0.7.5+). The default is public,

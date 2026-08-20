@@ -1685,7 +1685,10 @@ mod tests {
     #[test]
     fn a_scheme_with_no_host_is_refused() {
         for entry in ["http://", "https://"] {
-            assert!(check_origin_entry(entry).is_err(), "{entry:?} names no host");
+            assert!(
+                check_origin_entry(entry).is_err(),
+                "{entry:?} names no host"
+            );
         }
     }
 

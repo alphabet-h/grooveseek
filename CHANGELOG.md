@@ -33,6 +33,34 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **An `allowed_origins` entry without a scheme refused every browser, in
+  silence.** `[transport.http].allowed_hosts` takes a bare `host:port` — its
+  parser falls back to reading the whole string as a host — and the key beside
+  it looks identical but requires a scheme. `allowed_origins =
+  ["127.0.0.1:3100"]` was therefore dropped by rmcp before any comparison,
+  which left Origin validation switched **on** with nothing to match: every
+  request carrying an `Origin` header got 403, including `/ui`'s own search.
+  Nothing warned. The "this list names no loopback origin" check strips the
+  scheme optionally, so it read the host as `127.0.0.1` and concluded the list
+  was fine.
+
+  Such a config is now refused at startup, with a message quoting the entry and
+  naming the key that does accept that spelling. **A config that used to start
+  will now stop** — with an error you can act on, rather than a server that
+  answers 403 to everything. An empty list is still accepted: that one is the
+  documented off switch.
+
+  The same list carries a second cost, which cannot be removed. rmcp matches an
+  entry with no port against *every* port on that host — wider than RFC 6454,
+  where an omitted port means the scheme's default. Writing the port in does
+  not fix it: the browser omits the port too, so `http://127.0.0.1:80` would be
+  compared against a request that carries none and would refuse the very page
+  it exists for. At port 80 the derived default therefore has to include the
+  port-less spelling, and a page served from any other local port can reach
+  `/mcp`; the server now says so at startup. An entry you write yourself is
+  left alone, because `https://kb.example.com` is the shipped proxy recipe and
+  means 443.
+
 - **`--path-glob` split its value on commas, which no glob survives.** A glob's
   own syntax uses commas — `docs/{a,b}/**` is one pattern — and the flag cut it
   in half, leaving `docs/{a` to be rejected as an unclosed alternate group. The

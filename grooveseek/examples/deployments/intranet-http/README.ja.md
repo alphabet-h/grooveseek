@@ -169,6 +169,14 @@ proxy はその gate を無効化する (上の警告を参照)。クライア�
 クライアントが繋ぐなら、**公開 origin を `[transport.http].allowed_origins` にも
 列挙する** — ブラウザが送るのはサーバではなく proxy の origin である。
 
+Origin の entry は host の entry と**綴りが違う**。書く前に知っておく点が 2 つある。
+まず **scheme が必須**で、無い場合は無視ではなく**起動拒否**になる — 解釈できない
+entry は照合前に捨てられ、全部捨てられたリストは「検証は有効・比較対象 0 件」に
+なって、ログに何も出さないまま全ブラウザを拒むからである。もう 1 つ、**port の
+無い entry はそのホストの全 port に一致する**。scheme の既定 port を意図する場合を
+除いて port を書くこと — `https://kb.example.com` は 443 を意味し、上の TLS 終端の
+構成ではそれが正しい。
+
 ### `alwaysLoad: true` (クライアント側)
 
 サンプルの client `.mcp.json` には `"alwaysLoad": true` を入れている。これは
