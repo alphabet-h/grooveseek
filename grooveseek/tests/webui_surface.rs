@@ -52,14 +52,12 @@ fn curl(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-/// The version string the page actually pins, read out of the page.
-///
-/// Read out rather than hard-coded: a copy would let the page be changed to a
-/// version the server refuses while this file kept sending the one that works,
-/// and the test would pass for a `/ui` that cannot search.
+const PAGE: &str = include_str!("../src/transport/webui_index.html");
+
+/// The version string the page pins, read out of the page.
 ///
 /// **What that does and does not catch, measured.** Setting the page to
-/// `1999-01-01` fails the test below, so a version rmcp does not know is
+/// `1999-01-01` fails the live test below, so a version rmcp does not know is
 /// caught. Setting it to `2025-11-25` — rmcp's `LATEST`, and the wrong choice
 /// here — **passes**: rmcp accepts a handshake-free call on known older
 /// versions too. So this half only proves the page names something the server
@@ -67,46 +65,110 @@ fn curl(args: &[&str]) -> String {
 /// `src/transport/http.rs`, against `STANDARD_HEADERS`, and that assertion is
 /// the one that catches the plausible mistake.
 fn version_the_page_pins() -> &'static str {
-    const PAGE: &str = include_str!("../src/transport/webui_index.html");
-    const MARKER: &str = "const MCP_VERSION = \"";
-    let after = PAGE
-        .split_once(MARKER)
-        .expect("webui_index.html declares MCP_VERSION")
-        .1;
-    after
+    literal_after(PAGE, "const MCP_VERSION = \"")
+}
+
+/// The text between `marker` and the next `"`.
+fn literal_after<'a>(haystack: &'a str, marker: &str) -> &'a str {
+    haystack
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("webui_index.html no longer contains {marker:?}"))
+        .1
         .split_once('"')
-        .expect("the MCP_VERSION literal is closed")
+        .expect("the literal is closed")
         .0
 }
 
-/// The `tools/call` the page sends: no handshake, three headers plus the
-/// `_meta` block. `include_protocol_header` exists so a test can drop one and
-/// see the difference — without that, "the server accepted it" is equally
-/// consistent with a server that reads no headers at all.
-fn page_shaped_call(base: &str, tool: &str, include_protocol_header: bool) -> String {
-    let url = format!("{base}/mcp");
-    let version = version_the_page_pins();
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{}},"_meta":{{"io.modelcontextprotocol/protocolVersion":"{version}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
-    );
-    let mut args: Vec<String> = vec![
-        "-s".into(),
-        "-X".into(),
-        "POST".into(),
-        "-H".into(),
-        "Content-Type: application/json".into(),
-        "-H".into(),
-        "Accept: application/json, text/event-stream".into(),
-        "-H".into(),
-        "Mcp-Method: tools/call".into(),
-        "-H".into(),
-        format!("Mcp-Name: {tool}"),
-    ];
-    if include_protocol_header {
-        args.push("-H".into());
-        args.push(format!("MCP-Protocol-Version: {version}"));
+/// The `{ ... }` object literal opened by `marker`, as `(key, raw value)` pairs.
+///
+/// Deliberately small: the page is ours, its two relevant literals are one key
+/// per line, and a real JavaScript parse would be a dependency for no gain. It
+/// is written to **fail loudly** on anything it does not recognise, which is
+/// the property that matters — a shape it cannot read must not be reported as
+/// a shape that matches.
+fn object_literal(marker: &str) -> Vec<(String, String)> {
+    let body = PAGE
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("webui_index.html no longer contains {marker:?}"))
+        .1;
+    let body = body
+        .split_once("\n    },")
+        .or_else(|| body.split_once("\n        },"))
+        .unwrap_or_else(|| panic!("the object opened by {marker:?} is not closed as expected"))
+        .0;
+
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .map(|line| {
+            let (key, value) = line
+                .split_once(':')
+                .unwrap_or_else(|| panic!("cannot read {line:?} as a key/value pair"));
+            (
+                key.trim().trim_matches('"').to_string(),
+                value.trim().trim_end_matches(',').to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Resolve one JavaScript value from the page into what it will be on the wire.
+///
+/// Only the expressions the page actually uses are known. **An unfamiliar one
+/// panics rather than being skipped**: silently ignoring it is how a copied
+/// request stops matching the page it claims to describe.
+fn resolve(raw: &str, tool: &str) -> String {
+    match raw {
+        "MCP_VERSION" => version_the_page_pins().to_string(),
+        "name" => tool.to_string(),
+        "{}" => "{}".to_string(),
+        lit if lit.starts_with('"') && lit.ends_with('"') => lit.trim_matches('"').to_string(),
+        other => panic!(
+            "webui_index.html now sends {other:?}, which this test cannot resolve. \
+             Teach `resolve` what it means — do not drop it, or the request built \
+             here stops being the request the page sends."
+        ),
     }
-    args.extend(["-d".into(), body, url]);
+}
+
+/// The `tools/call` the page sends, **built from the page**: the header names
+/// and values, and the `_meta` keys, are read out of `callTool` rather than
+/// transcribed. Drop `_meta` or rename a header in the page and this changes
+/// with it; introduce an expression it cannot read and it panics.
+///
+/// What is still written here is the JSON-RPC envelope around `params`
+/// (`jsonrpc`, `id`, `method`), which `the_page_still_sends_this_envelope`
+/// checks separately.
+///
+/// `include_protocol_header` exists so a test can drop one header and see the
+/// difference — without that, "the server accepted it" is equally consistent
+/// with a server that reads no headers at all.
+fn page_shaped_call(base: &str, tool: &str, include_protocol_header: bool) -> String {
+    let meta: Vec<String> = object_literal("        _meta: {")
+        .into_iter()
+        .map(|(k, v)| {
+            let resolved = resolve(&v, tool);
+            if resolved == "{}" {
+                format!("\"{k}\":{{}}")
+            } else {
+                format!("\"{k}\":\"{resolved}\"")
+            }
+        })
+        .collect();
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{}},"_meta":{{{}}}}}}}"#,
+        meta.join(",")
+    );
+
+    let mut args: Vec<String> = vec!["-s".into(), "-X".into(), "POST".into()];
+    for (name, raw) in object_literal("    headers: {") {
+        if !include_protocol_header && name.eq_ignore_ascii_case("MCP-Protocol-Version") {
+            continue;
+        }
+        args.push("-H".into());
+        args.push(format!("{name}: {}", resolve(&raw, tool)));
+    }
+    args.extend(["-d".into(), body, format!("{base}/mcp")]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     curl(&refs)
 }
@@ -146,6 +208,26 @@ fn the_request_shape_the_page_uses_is_accepted() {
         body.contains("\"result\""),
         "expected a result for list_topics, got {body}"
     );
+}
+
+/// The part of the request `page_shaped_call` still writes out rather than
+/// reading: the JSON-RPC envelope around `params`. Nothing derives it from the
+/// page, so this is what stops it drifting — the same reason the headers and
+/// `_meta` are read instead of copied.
+#[test]
+fn the_page_still_sends_this_envelope() {
+    for fragment in [
+        "jsonrpc: \"2.0\"",
+        "method: \"tools/call\"",
+        "name: name,",
+        "arguments: args,",
+    ] {
+        assert!(
+            PAGE.contains(fragment),
+            "callTool no longer sends {fragment:?}; the request built in this \
+             file is no longer the request the page sends"
+        );
+    }
 }
 
 /// The other half, and the one that gives the test above its meaning: drop the
