@@ -153,6 +153,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   accepts a handshake-free call on known older versions — so the live test
   alone would not have caught the mistake most likely to be made.
 
+- **The tests no longer choose the port they tell the server to bind.** They
+  bound `127.0.0.1:0`, read the number, dropped the listener, and passed that
+  number on the command line — leaving a window in which anything else starting
+  a server could take it, with a dozen of them running in parallel inside one
+  test binary. The helper's own comment called the window theoretical.
+  `tests/mcp_protocol_surface.rs` flaked twice in three days.
+
+  They also captured the server's stderr and never read it, and a pipe nobody
+  empties eventually blocks the process writing to it — which fits the symptom
+  seen: a server that answered `/healthz` and then returned an empty body. The
+  watcher spawner already drained, with a comment saying why, but only after
+  `/healthz` answered, so the startup window went unread. Reading the assigned
+  address requires draining from the moment the child starts, so one change
+  closes both.
+
+  Three spawners did it, not one: the shared helper, its watcher variant, and
+  `tests/http_transport.rs`, which carried its own copy. `--port` and
+  `pick_free_port` now appear nowhere under `tests/`, and the reader that finds
+  the address is shared rather than copied — one parser, so a change to the
+  server's wording cannot be fixed in one spawner and left in another. The
+  flake is intermittent, so this is not shown to have fixed it; what is shown
+  is that two known ways for these tests to interfere with each other are gone.
+
 ## [0.27.0] - 2026-08-18
 
 ### Added

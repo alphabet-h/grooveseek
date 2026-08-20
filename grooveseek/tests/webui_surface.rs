@@ -34,7 +34,7 @@
 //! design; `webui_integration.rs` is where the rendered page is exercised.
 
 mod common;
-use common::mcp::spawn_mcp_server_ephemeral;
+use common::mcp::spawn_mcp_server;
 use common::temp::TempKbLayout;
 
 use serde_json::{Map, Value};
@@ -54,7 +54,7 @@ fn start(prefix: &str) -> (TempKbLayout, common::mcp::ServerGuard, String) {
     );
     let cfg = layout.root().join("groove.toml");
     std::fs::write(&cfg, PLAIN).expect("write groove.toml");
-    let (guard, base) = spawn_mcp_server_ephemeral(layout.kb(), &cfg);
+    let (guard, base) = spawn_mcp_server(layout.kb(), &cfg);
     (layout, guard, base)
 }
 
