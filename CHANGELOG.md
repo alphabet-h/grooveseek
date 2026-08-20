@@ -201,6 +201,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **Two `chunks_exact(2)` calls in the PDF parser became `as_chunks::<2>()`.**
+  Rust 1.98.0 stabilised `clippy::chunks_exact_to_as_chunks`, and CI installs
+  `stable` unpinned, so the lint arrived on its own and turned `-D warnings`
+  into a failure on code nobody had touched. `as_chunks::<2>().0` splits
+  identically — the trailing odd element goes to `.1` the way `chunks_exact`
+  left it in `.remainder()` — and states the pair width in the type, which is
+  what both call sites meant.
+
 - **`docs/usage.md` now documents `RUST_LOG`.** Raising the log level is the
   first step in diagnosing a wrong `groove.toml`, a `get_best_practice` that
   reports "not found", or a query that matches less than expected — and the
