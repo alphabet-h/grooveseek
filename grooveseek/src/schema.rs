@@ -459,6 +459,64 @@ mod tests {
         Schema::from_toml_str(toml).unwrap()
     }
 
+    /// The shipped template, as shipped.
+    const SHIPPED_EXAMPLE: &str = include_str!("../groove-schema.toml.example");
+
+    /// A template an operator copies has to compile. It advertised
+    /// `type = "integer"` and `type = "date"` for eight releases, both of which
+    /// this module refuses — so the first thing anyone following the comment
+    /// would meet is a schema that will not load.
+    ///
+    /// The body was always fine; the comment above it was the lie. That is why
+    /// the next test reads the comment rather than only running the body.
+    #[test]
+    fn the_shipped_schema_template_compiles() {
+        Schema::from_toml_str(SHIPPED_EXAMPLE)
+            .expect("groove-schema.toml.example must compile exactly as shipped");
+    }
+
+    /// Every spelling the template's `type` line offers must be one that
+    /// compiles. The list is read out of the comment rather than restated
+    /// here — restating it is what let the two drift apart.
+    #[test]
+    fn every_type_the_template_advertises_is_one_that_compiles() {
+        let line = SHIPPED_EXAMPLE
+            .lines()
+            .find(|l| l.trim_start().starts_with("#") && l.contains("type") && l.contains(':'))
+            .expect("the template documents its `type` values");
+        let advertised: Vec<&str> = line
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            !advertised.is_empty(),
+            "no quoted type names on {line:?}; the extraction, not the template, is wrong"
+        );
+        for ty in &advertised {
+            let src = format!("[fields.title]\nrequired = true\ntype = \"{ty}\"\n");
+            Schema::from_toml_str(&src)
+                .unwrap_or_else(|e| panic!("the template offers type = {ty:?}, which fails: {e}"));
+        }
+    }
+
+    /// The other half: the two the template stopped offering are still refused,
+    /// so the comment has a reason to keep saying so. When one of them is
+    /// implemented this fails, which is the moment to put it back on the line.
+    #[test]
+    fn the_types_the_template_warns_about_are_still_refused() {
+        for ty in ["integer", "date"] {
+            let src = format!("[fields.title]\nrequired = true\ntype = \"{ty}\"\n");
+            let err = Schema::from_toml_str(&src)
+                .expect_err("frontmatter is held as strings, so neither is implemented");
+            assert!(
+                format!("{err:#}").contains("not implemented"),
+                "the refusal has to say why, got {err:#}"
+            );
+        }
+    }
+
     fn fm() -> Frontmatter {
         Frontmatter::default()
     }

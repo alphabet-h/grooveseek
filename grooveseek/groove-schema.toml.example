@@ -1,21 +1,29 @@
-# groove frontmatter スキーマのサンプル。
+# Sample frontmatter schema for groove.
 #
-# このファイルを `<kb-path>/groove-schema.toml` にコピーして使う。
-# スキーマファイルが存在しない場合、`groove validate` は "no schema found"
-# として exit 0 で終了する (検証を有効化していない状態と同じ挙動)。
+# Copy this to `<kb-path>/groove-schema.toml` to switch validation on. With no
+# schema file present, `groove validate` reports "no schema found" and exits 0
+# — the same result as never having enabled validation.
 #
-# フィールド単位で以下の制約が書ける:
-#   required      : true なら欠落 / 空文字列 / 空配列は違反
-#   type          : "string" / "integer" / "date" / "array"
-#   pattern       : 正規表現 (string 型にのみ、Rust `regex` 互換)
-#                   single-quoted literal `'...'` が TOML で推奨
-#   enum          : 許容値リスト (string または array 要素を完全一致判定)
-#   min_length    : string なら文字数、array なら要素数の下限
-#   max_length    : string なら文字数、array なら要素数の上限
-#   allow_empty   : required=true でも空を許容する opt-in フラグ
+# Per-field constraints:
+#   required      : true means a missing value, an empty string, or an empty
+#                   array counts as a violation
+#   type          : "string" / "array"
+#   pattern       : regular expression, string-typed fields only (Rust `regex`
+#                   syntax). Write it as a TOML literal string in single quotes
+#                   so backslashes do not need doubling
+#   enum          : allowed values, compared exactly against a string field or
+#                   against every element of an array field
+#   min_length    : characters for a string, elements for an array
+#   max_length    : characters for a string, elements for an array
+#   allow_empty   : opt-in; permits an empty value even where required = true
 #
-# 検証対象は現状 `.md` のみ。`.txt` は frontmatter 概念なしで skip。
-# 未サポートキー (title/date/topic/depth/tags 以外) は reject される。
+# `type = "integer"` and `type = "date"` parse, but the schema REFUSES to
+# compile with either. Frontmatter is held as strings throughout, so neither is
+# implemented, and accepting them quietly would mean validating nothing.
+# Express a date as a string with a pattern, the way `[fields.date]` does below.
+#
+# Only `.md` files are checked; `.txt` has no frontmatter and is skipped.
+# Field names other than title / date / topic / depth / tags are refused.
 
 [fields.title]
 required = true
@@ -32,7 +40,7 @@ required = true
 type = "string"
 enum = ["mcp", "rag", "ai", "tooling", "ops"]
 
-# optional: depth が書かれている場合のみ enum を適用
+# optional: the enum applies only when depth is present
 [fields.depth]
 required = false
 type = "string"
