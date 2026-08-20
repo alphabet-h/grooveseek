@@ -1,6 +1,6 @@
 # AGENTS.md
 
-groove is a Rust MCP server for semantic search over a knowledge base of
+GrooveSeek is a Rust MCP server for semantic search over a knowledge base of
 Markdown, plain text, PDF and Office documents. Documents are chunked by heading
 (sheet / slide / page), embedded, and retrieved by fusing sqlite-vec KNN with
 FTS5 full-text search through Reciprocal Rank Fusion, optionally reranked by a
@@ -19,9 +19,24 @@ and a service launcher.
 cargo check                                             # type check only
 cargo test                                              # skips model downloads
 cargo test -- --ignored                                 # runs them (~130 MB / ~2.3 GB)
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all --check
 ```
+
+**To reproduce what CI checks, all four of these have to pass.** `cargo clippy
+--all-targets` alone is not one of them, so it can be clean here while CI fails:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
+cargo test
+```
+
+Clippy runs **twice** because the second pass is the only one that compiles the
+code behind `test-helpers` and `heavy-bench` (`.github/workflows/ci.yml`). The
+order of the last two matters on a cold model cache: `index_progress_cli` spawns
+`groove` subprocesses that each need BGE-small, and in parallel they race on the
+HuggingFace download lock. `CONTRIBUTING.md` explains both at length.
 
 Windows needs no extra DLLs: ONNX Runtime and SQLite are linked in statically.
 

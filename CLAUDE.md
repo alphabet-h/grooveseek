@@ -62,7 +62,7 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 ## Embedding モデルのキャッシュ
 
-`src/embedder.rs::resolve_cache_dir()` が以下の順でキャッシュディレクトリを決定する:
+`grooveseek/src/embedder.rs::resolve_cache_dir()` が以下の順でキャッシュディレクトリを決定する:
 
 1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先)
 2. OS 標準キャッシュディレクトリ + `fastembed`

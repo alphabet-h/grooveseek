@@ -310,7 +310,7 @@ groove graph --start notes/rag.md --format svg > graph.svg   # opens in any brow
 
 `dot` is a [Graphviz](https://graphviz.org/) program: pipe it to `dot -Tsvg` / `-Tpng` / `-Tpdf`, open it in a DOT viewer, or paste it into one of the web ones. `svg` is a finished picture that needs nothing installed — groove lays it out itself, taking no drawing dependency, because the graph is a tree and a tree lays out in one pass.
 
-Both colour nodes by BFS depth, label edges with the similarity score, and **say so when a limit cut the walk short**, so a picture is never mistaken for the whole neighbourhood. For a wide graph the Graphviz route gives the more compact page; the built-in SVG stacks one row per leaf, so `--max-nodes` is the knob that keeps it readable.
+Both color nodes by BFS depth, label edges with the similarity score, and **say so when a limit cut the walk short**, so a picture is never mistaken for the whole neighbourhood. For a wide graph the Graphviz route gives the more compact page; the built-in SVG stacks one row per leaf, so `--max-nodes` is the knob that keeps it readable.
 
 The output is a flat array of nodes with `parent_id` / `depth` / `score` so the consumer can reconstruct the tree if it wants. Good use cases: "give me 30 chunks of related context around this note for the LLM to read", or "walk two hops from this overview to see what topics it touches".
 
@@ -332,7 +332,7 @@ Flags:
   several bases, or a stricter one kept in CI.
 - `--fail-fast` — exit 1 at the first violation instead of scanning the rest.
   Useful when the answer you want is "is it clean", not "what is wrong".
-- `--no-color` — drop ANSI colour from `--format text`. Colour is already off
+- `--no-color` — drop ANSI color from `--format text`. Color is already off
   when stdout is not a TTY, so this is for the case where it is one.
 
 Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.

@@ -1,6 +1,6 @@
-# Contributing to groove
+# Contributing to GrooveSeek
 
-Thanks for considering a contribution! This document covers the essentials of working on groove.
+Thanks for considering a contribution! This document covers the essentials of working on GrooveSeek. The product is GrooveSeek; the command it installs is `groove` ([ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md)).
 
 > **日本語版**: [CONTRIBUTING.ja.md](./CONTRIBUTING.ja.md)
 
@@ -29,6 +29,12 @@ cargo test                 # Unit + integration tests (no model download)
 cargo test -p grooveseek --lib <name>  # One test by name (the workspace has several crates,
                                   # and `--lib` skips the integration-test binaries)
 ```
+
+**`--lib` also skips `main.rs`.** The binary carries three `#[cfg(test)]`
+modules of its own — the CLI surface tests among them — and none of them run
+under `--lib`. Reach those with `--bin groove`, and when you are not sure which
+target a test lives in, drop the filter and let `cargo test <name>` search all
+of them.
 
 To reproduce what CI runs, all of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails:
 

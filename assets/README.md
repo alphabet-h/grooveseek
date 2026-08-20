@@ -4,7 +4,7 @@
 | --- | --- |
 | `logo-light.svg` / `logo-dark.svg` | The mark, and the editable source of truth. Lines of a document with the `◆` that also sits beside the `/ui` heading, marking the passage a search found. Colours are the accent and muted tokens defined in `grooveseek/src/transport/webui_index.html`. |
 | `logo-light.png` / `logo-dark.png` | 112×112 renders of those SVGs, at 2× the 56px the READMEs display. **These are what the READMEs reference.** |
-| `screenshot-light.png` / `screenshot-dark.png` | The operator view at `/ui`, 980×860, one per colour scheme. |
+| `screenshot-light.png` / `screenshot-dark.png` | The operator view at `/ui`, 980×860, one per color scheme. |
 
 ## Why the READMEs point at the PNGs and not the SVGs
 
@@ -16,11 +16,12 @@ the machine this was built on — the host answered 429 for the whole session �
 so the PNGs are used instead: the screenshots are PNG regardless, so this makes
 the READMEs depend on one mechanism rather than two.
 
-The SVGs stay because they are the source the PNGs are rendered from, and
-because a site served from this repository may be able to reference them
-directly, same-origin, with none of the above applying. "May": GitHub Pages
-publishes either the repository root or `/docs`, and only the root option puts
-this directory on the site. That choice has not been made yet.
+The SVGs stay because they are the source the PNGs are rendered from.
+
+They are **not** reachable from the published site. GitHub Pages publishes
+either the repository root or `/docs`, and v0.27.0 chose `/docs` — so this
+directory is not on the site, and a page there cannot reference these files
+same-origin either. The PNGs by absolute URL are what works from everywhere.
 
 ## Regenerating the PNGs
 
