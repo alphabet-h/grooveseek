@@ -130,21 +130,117 @@ pub fn default_allowed_origins(port: u16) -> Vec<String> {
 /// `"null"` is a real origin (RFC 6454 §6.1; sandboxed frames, `file://`), and
 /// rmcp maps it to its own variant, so it is accepted here too.
 pub(crate) fn check_origin_entry(entry: &str) -> Result<(), &'static str> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return Err("an entry must not be empty");
+    match parse_origin(entry) {
+        Ok(_) => Ok(()),
+        Err(OriginRejection::Empty) => Err("an entry must not be empty"),
+        Err(OriginRejection::Unreadable) => Err("an entry must be a serialized origin"),
+        Err(OriginRejection::NoScheme) => {
+            Err("an entry must carry a scheme (\"http://\" or \"https://\")")
+        }
+        Err(OriginRejection::NoHost) => Err("an entry must name a host"),
     }
-    if entry.eq_ignore_ascii_case("null") {
-        return Ok(());
+}
+
+/// An origin in the form both sides compare: rmcp's `NormalizedOrigin`
+/// (`tower.rs:771-779`), expressed with the [`NormalizedAuthority`] this file
+/// already mirrors for `Host`.
+///
+/// The two halves line up exactly. rmcp's origin path normalizes its host with
+/// the same `normalize_host` its Host path uses, and its port rule
+/// (`a_port.is_none() || a_port == o_port`, `tower.rs:819`) is the rule
+/// [`NormalizedAuthority::matches`] already implements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedOrigin {
+    /// RFC 6454 §6.1's opaque origin, spelled `null`: sandboxed frames and
+    /// `file://` documents send it.
+    Null,
+    Tuple {
+        scheme: String,
+        authority: NormalizedAuthority,
+    },
+}
+
+/// Why an origin string did not survive parsing. rmcp keeps no such distinction
+/// — it returns `Option` and drops the entry — but [`check_origin_list`] has to
+/// tell the operator *which* rule their entry broke, so the reason is carried
+/// here and turned into words there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginRejection {
+    Empty,
+    Unreadable,
+    NoScheme,
+    NoHost,
+}
+
+/// Read an origin the way rmcp reads one, and no more strictly.
+///
+/// **Three callers ask this same question** — [`check_origin_entry`] (is this
+/// config entry usable?), [`origin_matches_any_port`] (does this entry leave the
+/// port open?) and [`origin_is_allowed`] (does this request's `Origin` match?)
+/// — so it is written once. Three copies of a parser whose whole purpose is to
+/// agree with an upstream one is how the surfaces start disagreeing about the
+/// same browser.
+///
+/// It deliberately omits the defensive rejects `validate_host_header` adds for
+/// `Host` (userinfo, port out of range). Those make groove *stricter* than rmcp,
+/// which is safe when groove is the only gate. Here it is not: `/mcp` is guarded
+/// by rmcp's copy and the admin router by this one, and a rule present in only
+/// one of them is a surface answering 403 where its neighbour answers 200.
+fn parse_origin(value: &str) -> Result<NormalizedOrigin, OriginRejection> {
+    // rmcp trims first (`tower.rs:782`), so a padded entry in `groove.toml`
+    // is honoured rather than dropped. Measured, not assumed — see
+    // `an_entry_with_padding_is_still_honoured_by_the_server`.
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(OriginRejection::Empty);
     }
-    let uri = http::Uri::try_from(entry).map_err(|_| "an entry must be a serialized origin")?;
-    if uri.scheme_str().is_none() {
-        return Err("an entry must carry a scheme (\"http://\" or \"https://\")");
+    if value.eq_ignore_ascii_case("null") {
+        return Ok(NormalizedOrigin::Null);
     }
-    if uri.authority().is_none() {
-        return Err("an entry must name a host");
+    let uri = http::Uri::try_from(value).map_err(|_| OriginRejection::Unreadable)?;
+    // The trap this ordering exists for: `http::Uri` accepts `127.0.0.1:3100`
+    // as authority-form — a scheme has to begin with a letter, so `127.0.0.1`
+    // cannot be one — and it fails only here, one line further on.
+    let scheme = uri
+        .scheme_str()
+        .ok_or(OriginRejection::NoScheme)?
+        .to_ascii_lowercase();
+    let authority = uri.authority().ok_or(OriginRejection::NoHost)?;
+    Ok(NormalizedOrigin::Tuple {
+        scheme,
+        authority: NormalizedAuthority::from_authority(authority),
+    })
+}
+
+/// Does this request's origin match the allow-list? `rmcp`'s `origin_is_allowed`
+/// (`tower.rs:799-822`), for the routes rmcp does not serve.
+///
+/// An empty list means "do not validate", exactly as it does upstream — that is
+/// what `allowed_origins = []` buys, and both surfaces have to read it the same
+/// way. Unparseable entries are dropped rather than refused, also as upstream;
+/// [`check_origin_list`] is what stops such an entry from reaching a running
+/// server in the first place.
+fn origin_is_allowed(origin: &NormalizedOrigin, allowed_origins: &[String]) -> bool {
+    if allowed_origins.is_empty() {
+        return true;
     }
-    Ok(())
+    allowed_origins
+        .iter()
+        .filter_map(|raw| parse_origin(raw).ok())
+        .any(|allowed| match (&allowed, origin) {
+            (NormalizedOrigin::Null, NormalizedOrigin::Null) => true,
+            (
+                NormalizedOrigin::Tuple {
+                    scheme: a_scheme,
+                    authority: a_authority,
+                },
+                NormalizedOrigin::Tuple {
+                    scheme: o_scheme,
+                    authority: o_authority,
+                },
+            ) => a_scheme == o_scheme && a_authority.matches(o_authority),
+            _ => false,
+        })
 }
 
 /// Refuse a whole `[transport.http].allowed_origins` list before it becomes
@@ -195,10 +291,10 @@ pub(crate) fn check_origin_list(origins: &[String]) -> anyhow::Result<()> {
 /// `Some(80)` against the request's `None` and refuse the very page it exists
 /// for. The entry has to stay; what it costs is worth a word at startup.
 fn origin_matches_any_port(entry: &str) -> bool {
-    http::Uri::try_from(entry.trim())
-        .ok()
-        .and_then(|u| u.authority().map(|a| a.port_u16().is_none()))
-        .unwrap_or(false)
+    matches!(
+        parse_origin(entry),
+        Ok(NormalizedOrigin::Tuple { ref authority, .. }) if authority.port.is_none()
+    )
 }
 
 /// Whether to say at startup that the Origin list we built is wider than the
@@ -860,6 +956,12 @@ pub async fn run_http(
              for one local name does not cover another."
         );
     }
+    // (L-5) One list, two enforcers — the same arrangement `effective_hosts`
+    // already has. rmcp keeps `origin_is_allowed` private, so the admin router
+    // cannot call the check that guards `/mcp`; what it can do is compare
+    // against the identical list, which is what makes the agreement testable
+    // instead of hoped for.
+    let admin_origins = Arc::new(origins.clone());
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(effective_hosts.clone())
         .with_allowed_origins(origins);
@@ -910,14 +1012,27 @@ pub async fn run_http(
     // What remains here is `/api/admin/status`, which reports operational state
     // (version, pid, indexing progress) that has no place in a tool surface
     // built for language models, and which the tray polls.
+    //
+    // (L-5 / L-6) Three layers, and the order is the point. The last `.layer`
+    // is the outermost, so this reads bottom-up: security headers wrap
+    // everything (including both gates' refusals), then the Host check, then
+    // the Origin check, then the handler. Host before Origin is rmcp's order
+    // for `/mcp` (`validate_dns_rebinding_headers`, `tower.rs:864-879`), and
+    // `the_host_check_answers_before_the_origin_check` pins that this stays so
+    // — a request failing both gets the same reply from either surface.
     let admin_router = Router::new()
         .route("/api/admin/status", get(api_admin_status))
         .route("/ui", get(ui_index))
         .with_state(Arc::clone(&factory_shared))
         .layer(middleware::from_fn_with_state(
+            admin_origins,
+            admin_origin_check,
+        ))
+        .layer(middleware::from_fn_with_state(
             Arc::clone(&factory_shared),
             admin_host_check,
-        ));
+        ))
+        .layer(middleware::from_fn(admin_security_headers));
 
     let app = healthz_router
         .merge(admin_router)
@@ -1536,12 +1651,10 @@ async fn admin_host_check(
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         && !is_loopback_peer(peer.ip())
     {
+        tracing::warn!(%peer, "admin: rejected a request from a non-loopback peer");
         return Err((
             StatusCode::FORBIDDEN,
-            format!(
-                "admin endpoints are loopback-only; peer {} is not loopback",
-                peer
-            ),
+            "admin endpoints are loopback-only".to_string(),
         ));
     }
 
@@ -1553,26 +1666,165 @@ async fn admin_host_check(
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok());
-    let host_for_err = host_header.unwrap_or("").to_string();
+    // (L-7) The rejected value goes to the log, not into the body. It came from
+    // the caller, and echoing caller-controlled bytes back is a habit worth not
+    // having even where the response is `text/plain` and now carries `nosniff`
+    // — the sibling gate on `/healthz` says `Host header is not allowed` and
+    // nothing more, rmcp says the same for `/mcp`, and this was the one surface
+    // that answered differently. Nothing is lost: `tracing::warn!` still names
+    // the value, on the console of the machine that can act on it.
+    //
+    // Logging it stays inside the ASCII rule AGENTS.md sets for stderr, and not
+    // by luck: `HeaderValue::to_str` yields `Ok` only for visible ASCII, so a
+    // header that could have arrived as mojibake is `None` here and reaches the
+    // `MissingHost` arm instead.
+    let host_for_log = host_header.unwrap_or("");
     match validate_host_header(host_header, Some(shared.allowed_admin_hosts.as_slice())) {
         Ok(()) => {}
         Err(HostRejection::MissingHost) => {
             return Err((StatusCode::BAD_REQUEST, "missing Host header".to_string()));
         }
         Err(HostRejection::MalformedHost) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("malformed Host header '{host_for_err}'"),
-            ));
+            tracing::warn!(
+                host = host_for_log,
+                "admin: rejected a malformed Host header"
+            );
+            return Err((StatusCode::BAD_REQUEST, "Invalid Host header".to_string()));
         }
         Err(HostRejection::NotAllowed) => {
+            tracing::warn!(
+                host = host_for_log,
+                "admin: rejected a Host header outside the admin allow-list \
+                 (possible DNS rebinding attempt)"
+            );
             return Err((
                 StatusCode::FORBIDDEN,
-                format!("Host '{host_for_err}' not in admin allow-list"),
+                "Host header is not allowed".to_string(),
             ));
         }
     }
     Ok(next.run(req).await)
+}
+
+/// (L-5) The admin router's `Origin` check — the same question rmcp answers for
+/// `/mcp`, asked of the routes rmcp does not serve.
+///
+/// Until now `/ui` and `/api/admin/status` were reachable cross-origin by any
+/// page open in the operator's browser. Nothing leaked: the responses are
+/// GETs, and without CORS headers a foreign page cannot read what comes back.
+/// **What was missing was the guarantee that this stays true.** The first admin
+/// route with a side effect would have been callable from
+/// `https://anything.example` on the day it was added, and nothing in this file
+/// would have objected.
+///
+/// It reads the effective list `/mcp` got, not the operator's raw value, for the
+/// reason `/healthz` shares its: two lists derived from one setting drift the
+/// moment someone edits one of them. `an_origin_gets_the_same_verdict_from_both_surfaces`
+/// pins that they agree, through a running server, rather than asserting it here.
+///
+/// **What this does not close.** A request that carries no `Origin` still
+/// passes — that is RFC 6454, rmcp and the MCP specification alike, and it is
+/// what lets ordinary clients, the tray and `curl` work. So a cross-origin
+/// `<img src>` or a top-level navigation is unaffected: they send no `Origin`.
+/// This refuses `fetch` / `XMLHttpRequest`, which do. A future side-effecting
+/// admin route therefore still may not be a `GET`.
+async fn admin_origin_check(
+    State(allowed): State<Arc<Vec<String>>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    // Empty means "do not validate", as it does upstream and as the startup
+    // warning says. An operator who switched Origin validation off for `/mcp`
+    // did not ask for it to stay on here.
+    if allowed.is_empty() {
+        return Ok(next.run(req).await);
+    }
+    let Some(raw) = req.headers().get(http::header::ORIGIN) else {
+        return Ok(next.run(req).await);
+    };
+    let Ok(origin_str) = raw.to_str() else {
+        // No value in the log line: it is not ASCII, which is why we are here.
+        tracing::warn!("admin: rejected a request whose Origin header is not ASCII");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid Origin header encoding".to_string(),
+        ));
+    };
+    let Ok(origin) = parse_origin(origin_str) else {
+        tracing::warn!(
+            origin = origin_str,
+            "admin: rejected a malformed Origin header"
+        );
+        return Err((StatusCode::BAD_REQUEST, "Invalid Origin header".to_string()));
+    };
+    if !origin_is_allowed(&origin, &allowed) {
+        tracing::warn!(
+            origin = origin_str,
+            "admin: rejected a disallowed Origin header (possible cross-origin attempt)"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Origin header is not allowed".to_string(),
+        ));
+    }
+    Ok(next.run(req).await)
+}
+
+/// (L-6) The response headers `/ui` had none of.
+///
+/// `default-src 'none'` and then back in only what this page is: its own inline
+/// `<style>` and `<script>`, the `data:` favicon in its `<link rel="icon">`,
+/// and same-origin `fetch` to `/mcp` and `/api/admin/status`. Nothing external
+/// loads today, so nothing external is allowed to — which is what makes this a
+/// guard rather than a description: the day someone reaches for a CDN, the page
+/// stops working here instead of silently acquiring a second origin to trust.
+///
+/// `img-src data:` is here because it was measured to be needed, not because a
+/// favicon sounded like an image. Serving the page without it, in Chrome:
+///
+/// ```text
+/// Loading the image 'data:image/svg+xml,...' violates the following Content
+/// Security Policy directive: "default-src 'none'". Note that 'img-src' was
+/// not explicitly set, so 'default-src' is used as a fallback.
+/// ```
+///
+/// `'unsafe-inline'` is not a concession, it is the only thing the page uses. A
+/// nonce would be stricter, but the page is `include_str!`'d as a constant and
+/// served unchanged; injecting a per-request nonce means rewriting it per
+/// request, for a document that puts every knowledge-base string in place with
+/// `textContent`.
+///
+/// `frame-ancestors 'none'` is why this is a header and not a `<meta>` tag —
+/// CSP3 §3.3 ignores that directive (and `report-uri`, and `sandbox`) when the
+/// policy arrives in a meta element.
+///
+/// `form-action 'none'` costs nothing while the page works: the search form
+/// calls `preventDefault()`. It matters when the script has *not* run, where it
+/// turns a stray navigation into nothing at all.
+///
+/// The policy is also sent with `/api/admin/status`, where it is inert. Scoping
+/// it to one route would mean a second place that has to be remembered when a
+/// route is added.
+const ADMIN_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; \
+     style-src 'unsafe-inline'; img-src data:; connect-src 'self'; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// Attach [`ADMIN_CSP`] and `nosniff` to everything the admin router answers.
+///
+/// Outermost of the three admin layers, so the refusals from the two gates
+/// carry them too — a 403 is a response a browser renders like any other.
+async fn admin_security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        http::header::CONTENT_SECURITY_POLICY,
+        http::HeaderValue::from_static(ADMIN_CSP),
+    );
+    resp
 }
 
 /// (feature-43 PR-2) Build the axum app router with admin endpoints only.
@@ -1582,6 +1834,14 @@ async fn admin_host_check(
 /// Gated by the `test-helpers` feature so production binaries do not carry
 /// the helper. `#[cfg(test)]` alone would not make this visible to the
 /// integration test crate (a separate compilation unit).
+///
+/// **This is not the production router, and two of the differences are
+/// deliberate.** It still registers `/api/search`, which the running server
+/// dropped in v0.27.0, because `tests/runtime_starvation.rs` needs a handler
+/// that blocks on the embedder lock. And it carries no Origin gate: the list
+/// that gate compares against is derived from the port the listener actually
+/// got, and nothing here binds one. Origin validation is exercised where it
+/// exists — through a running server, in `tests/http_origin.rs`.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
     let admin_router = axum::Router::new()
@@ -1592,7 +1852,8 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
         .layer(middleware::from_fn_with_state(
             Arc::clone(&shared),
             admin_host_check,
-        ));
+        ))
+        .layer(middleware::from_fn(admin_security_headers));
     axum::Router::new().merge(admin_router)
 }
 

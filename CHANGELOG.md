@@ -14,7 +14,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **`/ui` and `/api/admin/status` validate `Origin`.** The admin routes are
+  served by GrooveSeek rather than by rmcp, so the check that guards `/mcp`
+  never reached them: any page open in the operator's browser could call them
+  cross-origin. Nothing leaked — they are `GET`s, and a foreign page cannot read
+  a response that carries no CORS headers — but nothing kept that true either,
+  and the first admin route with a side effect would have inherited the gap.
+  They now compare against the same effective `[transport.http].allowed_origins`
+  rmcp gets, with a test that asks both surfaces about one origin and requires
+  the same answer. As on `/mcp`, a request carrying no `Origin` still passes,
+  so the tray, `curl` and the page's own status poll are unaffected.
+
+- **`/ui` is served with a Content Security Policy and `nosniff`.** The policy
+  is `default-src 'none'` plus exactly what the page uses — its inline
+  `<script>` and `<style>`, its `data:` favicon, same-origin `fetch`,
+  `frame-ancestors 'none'` — so an external script or stylesheet added to the
+  page fails there rather than loading. Both headers are attached outside the
+  two gates, so refusals carry them too.
+
+### Removed
+
+- **`kb.path` is gone from `/api/admin/status`, and from `/ui`'s status band.**
+  It held the knowledge base's absolute path, which on Windows reads
+  `C:\Users\<name>\...` — the operator's account name, in a JSON body and in
+  every screenshot of the page most likely to end up in a bug report. Nothing
+  consumed it: the Windows tray reads `daemon.pid` and `indexing.active`, and
+  the page's own comment claiming the tray needed the field was wrong. What
+  identifies a knowledge base to the person looking at it — `kb.documents`,
+  `kb.chunks`, `kb.model` — is unchanged. [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md)
+  puts this surface outside the 1.0 freeze, which is why the removal happens
+  now rather than during 1.x.
+
 ### Changed
+
+- **An admin refusal no longer repeats the header it refused.** The 403 body
+  read `Host 'kb.example.lan' not in admin allow-list`, echoing caller-supplied
+  bytes back; `/healthz` next door and rmcp on `/mcp` both say only that the
+  header was not allowed. This surface now says the same, and the rejected
+  value goes to the log instead, where the operator who can act on it will see
+  it.
 
 - **`rebuild_index` refuses a second call while one is running.** A rebuild
   re-embeds the whole corpus while holding the embedder and the database, so a

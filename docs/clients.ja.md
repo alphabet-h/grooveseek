@@ -165,19 +165,26 @@ groove serve --kb-path /path/to/knowledge-base --transport http --port 3100
 
 - **`Origin` 検証は `allowed_hosts` と違い既定で有効**。MCP 仕様は Streamable HTTP サーバについて *"**MUST** validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"* と定めているので、`[transport.http].allowed_origins` を省略した場合は「全部許可」ではなく **bind した port の loopback origin** (`http://localhost:PORT` / `http://127.0.0.1:PORT` / `http://[::1]:PORT`) を許可する。`Origin` ヘッダを持たない要求 — 通常の MCP クライアント / tray / `curl` — は RFC 6454 のとおり素通りするので、既存の利用は壊れない。この検査が止めるのは「利用者自身のブラウザに開かれた別サイトの JS がこのポートへ到達すること」だけで、**2 つ目のアクセス制御ではない**。reverse proxy 越しではブラウザ側のクライアントが公開 origin を送るため、それを明示する。**このキーを書くと既定リストは「追加」ではなく「置換」される**ので、ブラウザ上のクライアントが loopback 経由でも来るなら loopback の分も併記する: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`。空リストは検証を無効化し、起動時に警告が出る
 
-- **`Origin` 検証が掛かるのは `/mcp`。そして `/ui` は `/mcp` 経由で検索する。** つまりこのリストが**組み込みページで検索できるかどうかを決める** — 既定を公開 origin だけで置き換えると、`/ui` は表示されるのに問い合わせが全部拒否される。**`allowed_hosts` でも 1 段手前で同じことが起きる** — Host 検証が先に走るので、ドキュメントどおりの LAN 構成 (`allowed_hosts = ["kb.example.lan"]`) は、ローカルで開いた `/ui` が送る `Host: localhost` を拒否する。どちらのキーも既定を**拡張ではなく置換**するので、**実際にブラウザで使う名前と origin をそのまま列挙する** — `allowed_hosts = ["127.0.0.1"]` でも `localhost` で開いたページは拒否される。サーバが起動時に警告するのは「loopback のエントリが 1 つも無い」場合だけで、**「1 つはあるが使っているアドレスと違う」場合は警告しない**。そのため `/ui` は検索が拒否された時に**必要な host と origin を画面に出す**。`/api/admin/status` は独自の `Origin` 検査を持たず、縛っているのは「peer が loopback であること」で、そちらは設定できない
+- **`Origin` 検証が掛かるのは `/mcp`。そして `/ui` は `/mcp` 経由で検索する。** つまりこのリストが**組み込みページで検索できるかどうかを決める** — 既定を公開 origin だけで置き換えると、`/ui` は表示されるのに問い合わせが全部拒否される。**`allowed_hosts` でも 1 段手前で同じことが起きる** — Host 検証が先に走るので、ドキュメントどおりの LAN 構成 (`allowed_hosts = ["kb.example.lan"]`) は、ローカルで開いた `/ui` が送る `Host: localhost` を拒否する。どちらのキーも既定を**拡張ではなく置換**するので、**実際にブラウザで使う名前と origin をそのまま列挙する** — `allowed_hosts = ["127.0.0.1"]` でも `localhost` で開いたページは拒否される。サーバが起動時に警告するのは「loopback のエントリが 1 つも無い」場合だけで、**「1 つはあるが使っているアドレスと違う」場合は警告しない**。そのため `/ui` は検索が拒否された時に**必要な host と origin を画面に出す**。**`/ui` と `/api/admin/status` も同じリストを検証する** — これらは rmcp ではなく GrooveSeek 自身が配信しているので検査は別実装だが、**同じ判定に至ることをテストで縛っている** (同じ origin を両面に問い、答えの一致を要求する)。`Origin` を持たない要求はこちらでも素通りする — ページ自身の status polling と tray が送るのがそれである
 - サーバ内部の Mutex ベース直列化により、HTTP の並列リクエストでも embedder / DB 層では逐次処理される (`search` で目安 10 qps 程度)。本格的な並列化は将来の拡張
 
 ## Web UI と admin API (HTTP transport のみ)
 
-`serve` を `--transport http` で動かすと、`/mcp` と `/healthz` に加えて 3 つの
-route が生える。有効化の設定は無く HTTP transport があれば常に存在し、3 つとも
+`serve` を `--transport http` で動かすと、`/mcp` と `/healthz` に加えて 2 つの
+route が生える。有効化の設定は無く HTTP transport があれば常に存在し、どちらも
 **loopback 限定**: middleware が peer アドレスが loopback でないリクエストを
 拒否し、その後 `Host` ヘッダを loopback の別名 (`127.0.0.1` / `::1` /
 `localhost`) と照合する。bind アドレスが追加されるのは **それ自体が loopback の
 場合だけ** で、`0.0.0.0` に bind した時の `Host: 0.0.0.0` は意図的に拒否される
 (LAN のブラウザが bind アドレス経由でこれらの route に到達しないため)。
 `/mcp` 用に Host を allow-list していても、ネットワーク上の別マシンからは 403。
+`Origin` は `Host` の**後**に、`[transport.http].allowed_origins` と照合する。
+
+両 route は `X-Content-Type-Options: nosniff` と `Content-Security-Policy` を
+付けて応答する。ポリシーは `default-src 'none'` に**このページが実際に使うもの
+だけ**を戻した形 — 自前の inline `<script>` / `<style>`、`data:` の favicon、
+同一 origin への `fetch`。`/ui` は外部リソースを一切読まないが、それを保つのが
+このポリシーである。
 
 | Route | 中身 |
 | --- | --- |
@@ -195,10 +202,15 @@ curl http://127.0.0.1:3100/api/admin/status
   "daemon":   { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "2026-07-26T09:12:03Z" },
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
-  "kb":       { "path": "/srv/groove/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
+  "kb":       { "documents": 596, "chunks": 8878, "model": "bge-m3" },
   "config_source": "Cwd"
 }
 ```
+
+> **`kb.path` は削除した。** ナレッジベースの絶対パスを持っていたので、Windows では
+> payload も、それを表示していた状態帯も `C:\Users\<名前>\...` と読めていた。
+> 読んでいた消費者はいない (tray が読むのは `daemon.pid` と `indexing.active`)。
+> [docs/stability.ja.md](stability.ja.md) 参照
 
 `/ui` は Windows tray の **Open Web UI** が開くページだが、Windows 専用ではない。
 Linux / macOS では daemon が動いているマシン上でブラウザから開くか、ポートを

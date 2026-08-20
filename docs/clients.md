@@ -165,20 +165,27 @@ Security notes:
 
 - **`Origin` validation is on by default**, unlike `allowed_hosts`. The MCP specification states that a Streamable HTTP server *"MUST validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks"*, so omitting `[transport.http].allowed_origins` accepts the loopback origins for the bind port (`http://localhost:PORT`, `http://127.0.0.1:PORT`, `http://[::1]:PORT`) rather than accepting everything. Requests that carry no `Origin` header — every ordinary MCP client, the tray, `curl` — pass regardless, per RFC 6454; the check exists to stop a web page open in your own browser from reaching the port, and it is **not** a second access control. Behind a reverse proxy a browser-based client sends your public origin, so name it explicitly. **Setting the key replaces the default list rather than extending it**, so keep the loopback entries too if browser clients also reach you over loopback: `allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]`. An empty list disables validation and warns at startup.
 
-- **`Origin` validation covers `/mcp`, and `/ui` searches through `/mcp`.** So this list decides whether the built-in page can search: replace the default with only a public origin and `/ui` is still served but every query it makes is refused. `allowed_hosts` does the same one step earlier — Host validation runs first, so the documented LAN recipe (`allowed_hosts = ["kb.example.lan"]`) refuses the `Host: localhost` a locally opened `/ui` sends. Either key **replaces** its default rather than extending it, so list the exact names and origins you browse with — `allowed_hosts = ["127.0.0.1"]` still refuses a page opened through `localhost`. The server warns at startup when a list has no loopback entry at all, but not when it has one that does not match the address you use; `/ui` reports the host and origin it needs when a search is refused. `/api/admin/status` has no `Origin` check of its own — what restricts it is the requirement that the peer be loopback, which is not configurable.
+- **`Origin` validation covers `/mcp`, and `/ui` searches through `/mcp`.** So this list decides whether the built-in page can search: replace the default with only a public origin and `/ui` is still served but every query it makes is refused. `allowed_hosts` does the same one step earlier — Host validation runs first, so the documented LAN recipe (`allowed_hosts = ["kb.example.lan"]`) refuses the `Host: localhost` a locally opened `/ui` sends. Either key **replaces** its default rather than extending it, so list the exact names and origins you browse with — `allowed_hosts = ["127.0.0.1"]` still refuses a page opened through `localhost`. The server warns at startup when a list has no loopback entry at all, but not when it has one that does not match the address you use; `/ui` reports the host and origin it needs when a search is refused. `/ui` and `/api/admin/status` validate the *same* list — they are served by GrooveSeek rather than by rmcp, so the check is a separate one reaching the same verdict, and a test asks both surfaces about the same origin and requires the same answer. Requests carrying no `Origin` pass there too, which is what the page's own status poll and the tray send.
 - Mutex-based serialization inside the server means HTTP concurrent requests are still processed sequentially at the embedder / DB level (~10 qps expected for `search`). Heavy parallelism is a future enhancement.
 
 ## Web UI and admin API (HTTP transport only)
 
-Running `serve` with `--transport http` mounts three more routes beside `/mcp`
+Running `serve` with `--transport http` mounts two more routes beside `/mcp`
 and `/healthz`. Nothing enables them — they exist whenever the HTTP transport
-does — and all three are **loopback-only**: the middleware rejects any request
+does — and both are **loopback-only**: the middleware rejects any request
 whose peer address is not loopback, then checks the `Host` header against the
 loopback aliases (`127.0.0.1`, `::1`, `localhost`) — plus the bind address, but
 only when that is itself loopback. Bind to `0.0.0.0` and `Host: 0.0.0.0` is
 rejected too, deliberately: a LAN browser must not reach these routes through
 the bind address. A machine elsewhere on the network gets 403 even if you
-allow-listed its Host for `/mcp`.
+allow-listed its Host for `/mcp`. `Origin` is checked after the `Host`, against
+`[transport.http].allowed_origins`.
+
+Both routes answer with `X-Content-Type-Options: nosniff` and a
+`Content-Security-Policy` of `default-src 'none'` plus exactly what the page
+uses: its own inline `<script>` and `<style>`, its `data:` favicon, and
+same-origin `fetch`. Nothing external loads from `/ui`, and the policy is what
+keeps that true.
 
 | Route | What it is |
 | --- | --- |
@@ -196,10 +203,15 @@ curl http://127.0.0.1:3100/api/admin/status
   "daemon":   { "version": "0.13.1", "pid": 36400, "uptime_secs": 4210, "started_at": "2026-07-26T09:12:03Z" },
   "indexing": { "active": false, "started_at": null, "progress": null },
   "watcher":  { "active": true, "debounce_ms": 500 },
-  "kb":       { "path": "/srv/groove/knowledge-base", "documents": 596, "chunks": 8878, "model": "bge-m3" },
+  "kb":       { "documents": 596, "chunks": 8878, "model": "bge-m3" },
   "config_source": "Cwd"
 }
 ```
+
+> **`kb.path` was removed.** It carried the knowledge base's absolute path, so
+> on Windows the payload — and the status band that printed it — read
+> `C:\Users\<name>\...`. Nothing consumed it: the tray reads `daemon.pid` and
+> `indexing.active`. See [docs/stability.md](stability.md).
 
 `/ui` is what the Windows tray's **Open Web UI** menu item opens, but it is not
 Windows-specific. On Linux or macOS, browse to it on the machine running the

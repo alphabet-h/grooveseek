@@ -61,9 +61,14 @@ reach you over loopback.
 
 **It covers `/mcp`, and `/ui` searches through `/mcp`.** So this list decides
 whether the built-in page can search: replacing the default with only a public
-origin leaves `/ui` served but unable to query. `/api/admin/status` has no
-`Origin` check of its own; what restricts it is the loopback peer requirement
-above.
+origin leaves `/ui` served but unable to query.
+
+`/ui` and `/api/admin/status` validate the same list, against the same list —
+not a second one derived from the same setting. They are served by GrooveSeek
+rather than by the MCP library, so this is a separate check reaching the same
+verdict; a test asks both surfaces about the same origin and requires the same
+answer. As on `/mcp`, a request carrying no `Origin` passes, which is why the
+tray and `curl` are unaffected.
 
 `allowed_hosts` does the same thing one step earlier — Host validation runs
 before Origin validation, so a list naming only a public hostname refuses the
@@ -235,6 +240,20 @@ release, including a patch.
 running the server look at their own server, they are loopback-only by design
 (GrooveSeek has no authentication), and the page is expected to keep changing.
 Treat the HTML and the JSON as internal.
+
+`kb.path` **has already been removed** from the status payload, and the status
+band no longer prints it. It held the knowledge base's absolute path, which on
+Windows is `C:\Users\<name>\...` — an operator's account name, in a JSON body
+and in every screenshot of that page. Nothing needed it: the tray reads
+`daemon.pid` and `indexing.active`, and what identifies a knowledge base to the
+person looking at it is `kb.documents`, `kb.chunks` and `kb.model`, all still
+there. This paragraph is the notice; that the surface is unstable is why the
+removal happens before 1.0 rather than being deferred past it.
+
+Both routes are served with `Content-Security-Policy` and
+`X-Content-Type-Options: nosniff`. The policy is `default-src 'none'` with only
+what the page uses added back, so an external script or stylesheet added to
+`/ui` fails there rather than loading.
 
 `/api/search` **has already been removed**, before 1.0.0 rather than during it.
 It only ever accepted two of the seventeen parameters the `search` tool takes,

@@ -2679,7 +2679,19 @@ impl KbServer {
 /// on PR #57).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KbInfo {
-    pub path: String,
+    // (L-8) No `path`. It used to carry the knowledge base's absolute path,
+    // which on Windows is `C:\Users\<name>\...` — the operator's OS account
+    // name, in a JSON body and, because `/ui` printed it in the status band, in
+    // every screenshot of that page.
+    //
+    // Nothing needed it. The tray reads `daemon.pid` and `indexing.active` and
+    // nothing else (`crates/groove-tray/src/state.rs`), `docs/clients.md`
+    // already described the band without it, and `/ui` only displayed it. What
+    // identifies a knowledge base to the person looking at it is below:
+    // document and chunk counts, and the model.
+    //
+    // ADR-0008 puts this surface outside the 1.0 freeze, which is what makes
+    // removing the field a thing to do now rather than a thing to regret later.
     pub documents: Option<u64>,
     pub chunks: Option<u64>,
     pub model: Option<String>,
@@ -2706,7 +2718,6 @@ impl KbServerShared {
         let model =
             recover_try(self.embedder.try_lock(), "embedder").map(|e| e.model_id().to_string());
         Ok(KbInfo {
-            path: self.kb_path.display().to_string(),
             documents,
             chunks,
             model,

@@ -191,6 +191,36 @@ pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (Serve
     spawn_serve(kb_path, config_path, true)
 }
 
+/// Stand up a one-document knowledge base with the given `groove.toml`, and
+/// serve it.
+///
+/// The layout is returned **first** so it drops **last**: locals drop in
+/// reverse declaration order, and its `Drop` removes a directory the server
+/// still has a database open under (codex P2 round 1 on PR #160).
+///
+/// `config_body` is written to a file passed with `--config`, which is not the
+/// same as leaving it where discovery finds it. A discovered `groove.toml` has
+/// its transport keys stripped when the directory is untrusted — precisely so
+/// that a file beside the binary cannot turn Origin validation off — so a test
+/// of those keys has to hand the file over explicitly.
+///
+/// Shared because both files that need it need the same thing, and the copy
+/// would be the kind that agrees until one of them is taught something.
+pub fn spawn_with_config(
+    prefix: &str,
+    config_body: &str,
+) -> (super::temp::TempKbLayout, ServerGuard, String) {
+    let layout = super::temp::TempKbLayout::new(prefix);
+    layout.write(
+        "note.md",
+        "---\ntitle: Note\n---\n\n## body\n\nOne document so the knowledge base is not empty.\n",
+    );
+    let cfg = layout.root().join("groove.toml");
+    std::fs::write(&cfg, config_body).expect("write groove.toml");
+    let (guard, base) = spawn_mcp_server(layout.kb(), &cfg);
+    (layout, guard, base)
+}
+
 /// RAII handle for the spawned MCP server child. Kills + reaps on Drop so
 /// a panicking test does not orphan the server process.
 pub struct ServerGuard {
