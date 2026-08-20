@@ -22,6 +22,7 @@ mod common;
 use common::mcp::spawn_mcp_server_ephemeral;
 use common::temp::TempKbLayout;
 
+use serde_json::{Map, Value};
 use std::process::Command;
 
 /// Only `[watch]` — the Origin allow-list stays at its default.
@@ -79,50 +80,49 @@ fn literal_after<'a>(haystack: &'a str, marker: &str) -> &'a str {
         .0
 }
 
-/// The `{ ... }` object literal opened by `marker`, as `(key, raw value)` pairs.
-///
-/// Deliberately small: the page is ours, its two relevant literals are one key
-/// per line, and a real JavaScript parse would be a dependency for no gain. It
-/// is written to **fail loudly** on anything it does not recognise, which is
-/// the property that matters — a shape it cannot read must not be reported as
-/// a shape that matches.
-fn object_literal(marker: &str) -> Vec<(String, String)> {
-    let body = PAGE
+/// The balanced `{ ... }` that follows `marker`, braces included.
+fn braced_after(marker: &str) -> &'static str {
+    let rest = PAGE
         .split_once(marker)
         .unwrap_or_else(|| panic!("webui_index.html no longer contains {marker:?}"))
         .1;
-    let body = body
-        .split_once("\n    },")
-        .or_else(|| body.split_once("\n        },"))
-        .unwrap_or_else(|| panic!("the object opened by {marker:?} is not closed as expected"))
-        .0;
-
-    body.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("//"))
-        .map(|line| {
-            let (key, value) = line
-                .split_once(':')
-                .unwrap_or_else(|| panic!("cannot read {line:?} as a key/value pair"));
-            (
-                key.trim().trim_matches('"').to_string(),
-                value.trim().trim_end_matches(',').to_string(),
-            )
-        })
-        .collect()
+    let start = rest.find('{').expect("an object follows the marker");
+    let bytes = rest.as_bytes();
+    let (mut depth, mut i, mut in_string) = (0usize, start, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[start..=i];
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("the object opened after {marker:?} is never closed");
 }
 
-/// Resolve one JavaScript value from the page into what it will be on the wire.
+/// One JavaScript value from the page, as it will appear on the wire.
 ///
 /// Only the expressions the page actually uses are known. **An unfamiliar one
-/// panics rather than being skipped**: silently ignoring it is how a copied
-/// request stops matching the page it claims to describe.
-fn resolve(raw: &str, tool: &str) -> String {
+/// panics rather than being skipped**: quietly ignoring it is how a request
+/// built here stops being the request the page sends.
+fn resolve(raw: &str, tool: &str) -> Value {
     match raw {
-        "MCP_VERSION" => version_the_page_pins().to_string(),
-        "name" => tool.to_string(),
-        "{}" => "{}".to_string(),
-        lit if lit.starts_with('"') && lit.ends_with('"') => lit.trim_matches('"').to_string(),
+        "MCP_VERSION" => Value::String(version_the_page_pins().to_string()),
+        // `callTool(name, args)`; these tests call it with no arguments.
+        "name" => Value::String(tool.to_string()),
+        "args" => Value::Object(Map::new()),
+        "{}" => Value::Object(Map::new()),
+        lit if lit.starts_with('"') && lit.ends_with('"') && lit.len() >= 2 => {
+            Value::String(lit[1..lit.len() - 1].to_string())
+        }
+        num if num.parse::<i64>().is_ok() => Value::from(num.parse::<i64>().unwrap()),
         other => panic!(
             "webui_index.html now sends {other:?}, which this test cannot resolve. \
              Teach `resolve` what it means — do not drop it, or the request built \
@@ -131,42 +131,84 @@ fn resolve(raw: &str, tool: &str) -> String {
     }
 }
 
-/// The `tools/call` the page sends, **built from the page**: the header names
-/// and values, and the `_meta` keys, are read out of `callTool` rather than
-/// transcribed. Drop `_meta` or rename a header in the page and this changes
-/// with it; introduce an expression it cannot read and it panics.
+/// Read one of the page's object literals into a JSON value.
 ///
-/// What is still written here is the JSON-RPC envelope around `params`
-/// (`jsonrpc`, `id`, `method`), which `the_page_still_sends_this_envelope`
-/// checks separately.
+/// Deliberately small, and deliberately strict. The page is ours and formats
+/// these literals one key per line, so a line walk is enough; anything it does
+/// not recognise **panics**, because a shape this cannot read must never be
+/// reported as a shape that matches.
+fn object_from_page(marker: &str, tool: &str) -> Value {
+    let mut stack: Vec<(Option<String>, Map<String, Value>)> = Vec::new();
+    for raw in braced_after(marker).lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        assert!(
+            !line.starts_with("//"),
+            "a comment inside {marker:?} — teach the reader about it rather than \
+             skipping the line: {line:?}"
+        );
+        if line == "{" {
+            stack.push((None, Map::new()));
+            continue;
+        }
+        if line == "}" || line == "}," || line == "})," || line == "})" {
+            let (key, map) = stack.pop().expect("a close with nothing open");
+            let done = Value::Object(map);
+            match (key, stack.last_mut()) {
+                (Some(k), Some((_, parent))) => {
+                    parent.insert(k, done);
+                }
+                (None, None) => return done,
+                _ => panic!("unbalanced object literal in {marker:?}"),
+            }
+            continue;
+        }
+        let (k, v) = line
+            .split_once(':')
+            .unwrap_or_else(|| panic!("cannot read {line:?} as `key: value` in {marker:?}"));
+        let key = k.trim().trim_matches('"').to_string();
+        let v = v.trim().trim_end_matches(',').trim();
+        if v == "{" {
+            stack.push((Some(key), Map::new()));
+        } else {
+            let (_, top) = stack.last_mut().expect("a value outside any object");
+            top.insert(key, resolve(v, tool));
+        }
+    }
+    panic!("the object literal in {marker:?} did not close");
+}
+
+/// The `tools/call` the page sends, **read out of the page** — headers and body
+/// alike, envelope included. There is no second copy of the request here to
+/// drift from the first: rename `params`, move `_meta`, change a header, and
+/// what this sends changes with it. An expression the reader cannot resolve
+/// stops the test rather than being skipped.
+///
+/// Executing the page's JavaScript would be stricter still, but that means a
+/// JavaScript runtime as a dependency for this one call.
 ///
 /// `include_protocol_header` exists so a test can drop one header and see the
 /// difference — without that, "the server accepted it" is equally consistent
 /// with a server that reads no headers at all.
 fn page_shaped_call(base: &str, tool: &str, include_protocol_header: bool) -> String {
-    let meta: Vec<String> = object_literal("        _meta: {")
-        .into_iter()
-        .map(|(k, v)| {
-            let resolved = resolve(&v, tool);
-            if resolved == "{}" {
-                format!("\"{k}\":{{}}")
-            } else {
-                format!("\"{k}\":\"{resolved}\"")
-            }
-        })
-        .collect();
-    let body = format!(
-        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{}},"_meta":{{{}}}}}}}"#,
-        meta.join(",")
-    );
+    let body = serde_json::to_string(&object_from_page("body: JSON.stringify(", tool))
+        .expect("the page's body literal serialises");
 
     let mut args: Vec<String> = vec!["-s".into(), "-X".into(), "POST".into()];
-    for (name, raw) in object_literal("    headers: {") {
+    for (name, value) in object_from_page("headers:", tool)
+        .as_object()
+        .expect("the headers literal is an object")
+    {
         if !include_protocol_header && name.eq_ignore_ascii_case("MCP-Protocol-Version") {
             continue;
         }
+        let value = value
+            .as_str()
+            .unwrap_or_else(|| panic!("header {name} is not a string: {value}"));
         args.push("-H".into());
-        args.push(format!("{name}: {}", resolve(&raw, tool)));
+        args.push(format!("{name}: {value}"));
     }
     args.extend(["-d".into(), body, format!("{base}/mcp")]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -210,24 +252,28 @@ fn the_request_shape_the_page_uses_is_accepted() {
     );
 }
 
-/// The part of the request `page_shaped_call` still writes out rather than
-/// reading: the JSON-RPC envelope around `params`. Nothing derives it from the
-/// page, so this is what stops it drifting — the same reason the headers and
-/// `_meta` are read instead of copied.
+/// The envelope, checked on the **parsed** request rather than as fragments of
+/// the page's text. Substring checks were the previous version of this and
+/// missed the case that matters: rename `params`, or move `_meta` out of it,
+/// and every fragment is still present somewhere in the file while the request
+/// the page sends has changed shape.
 #[test]
-fn the_page_still_sends_this_envelope() {
-    for fragment in [
-        "jsonrpc: \"2.0\"",
-        "method: \"tools/call\"",
-        "name: name,",
-        "arguments: args,",
-    ] {
-        assert!(
-            PAGE.contains(fragment),
-            "callTool no longer sends {fragment:?}; the request built in this \
-             file is no longer the request the page sends"
-        );
-    }
+fn the_request_read_from_the_page_has_the_envelope_the_protocol_needs() {
+    let req = object_from_page("body: JSON.stringify(", "list_topics");
+
+    assert_eq!(req["jsonrpc"], "2.0", "not a JSON-RPC request: {req}");
+    assert_eq!(req["method"], "tools/call", "not a tools/call: {req}");
+    assert!(req["id"].is_number(), "no request id: {req}");
+
+    let params = req
+        .get("params")
+        .unwrap_or_else(|| panic!("the arguments are no longer under `params`: {req}"));
+    assert_eq!(params["name"], "list_topics", "the tool name moved: {req}");
+    assert!(
+        params.get("_meta").is_some_and(Value::is_object),
+        "`_meta` is no longer an object inside `params`, which is where the \
+         stateless protocol reads it: {req}"
+    );
 }
 
 /// The other half, and the one that gives the test above its meaning: drop the
