@@ -400,6 +400,46 @@ golden query セットに対して固定グリッドを掃引し、leave-one-que
 **そもそも bm25 段に到達する** クエリだけなので、tune はまず pre-flight で実効 N
 を報告し、0 なら exit 2 で終わる。詳細は [docs/eval.ja.md](eval.ja.md) を参照。
 
+## ログを詳しく見る
+
+詳細度を上げるフラグは無い。詳細度は環境変数 **`RUST_LOG`** で決まる。
+全サブコマンドが読み、未設定なら `info` として振る舞う。
+
+```bash
+RUST_LOG=grooveseek=debug groove serve --kb-path ./knowledge-base
+RUST_LOG=grooveseek=debug groove search "query" --kb-path ./knowledge-base
+RUST_LOG=debug groove index --kb-path ./knowledge-base   # 依存クレートも含む。かなり煩い
+```
+
+実用上の設定は `grooveseek=debug`。本プロジェクト自身の target だけを上げ、
+HTTP スタックと ONNX runtime は `info` のまま残す。これで増えるもの:
+
+- **`get_best_practice` が "not found" を返したとき**、実際に探索したパスが出る。
+  レスポンス側が「テンプレートを何本試したか」しか報告しないのは意図的で、
+  パスは `[best_practice].path_templates` 由来 = **未認証の呼び出し元にサーバの
+  ディレクトリ構成を渡すことになる**ため。operator はここで見るしかない。
+- **検索が想定より当たらないとき**、全文検索側でクエリがどう組み立てられたかが
+  出る。trigram の下限を割って捨てられた断片、破棄された引用句など。詳細は
+  [docs/retrieval-pipeline.ja.md](retrieval-pipeline.ja.md)。
+
+**`RUST_LOG` の管轄外**のものが 2 つある。**どの `groove.toml` が勝ったか**は
+`info` で出るので、そもそも上げる必要がない (`loaded config source=… path=…
+trust=…`。[docs/configuration.ja.md](configuration.ja.md) 参照)。`index` の進捗
+(`Indexing …` / `  indexed: …` / `Done in …`) は logger を通さず直接書いているので、
+**どのレベルでも出る** — 制御するのは `--quiet` / `--progress` の方。
+
+ログは全サブコマンドで stderr に出るので、レベルを上げても stdout から取っている
+出力を乱さない。とくに `serve` で効く — 既定の stdio transport では stdout が
+**MCP プロトコルそのもの**なので、ログの行き先は stderr しかない。なお**ログの
+文面は安定面ではない** ([docs/stability.ja.md](stability.ja.md))。読むためのもので
+あって parse するものではない。
+
+`groove service install` で登録した daemon の場合、レベルはシェルではなく
+**サービス定義側**で決まる。systemd unit は `Environment=RUST_LOG=info` を、
+launchd plist は同等のエントリを持つので、編集して再起動する。**Windows の
+スケジュールタスクは `RUST_LOG` を一切設定しない**ので同じ既定 `info` に落ちる。
+上げたい場合はタスクが動く環境側に変数を設定する。
+
 ## Related
 
 - `docs/configuration.ja.md` — 同じフラグに `groove.toml` で既定値を与える

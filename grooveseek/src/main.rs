@@ -2464,6 +2464,16 @@ mod documented_flags {
     ///
     /// `CHANGELOG.md` is left out on purpose: it records flags that *used* to
     /// exist, and a removed flag must not stay frozen by its own obituary.
+    ///
+    /// `docs/decisions/` is left out for the same reason and one more. An ADR
+    /// that explains why a flag was removed names it, which would fail the
+    /// reverse check — and ADRs are immutable once merged
+    /// ([ADR-0000](../../docs/decisions/0000-record-decisions-as-adrs.md)), so
+    /// that failure could not be repaired, only worked around. Excluding them
+    /// also tightens the forward check rather than loosening it: a flag
+    /// mentioned only in a decision record no longer counts as documented,
+    /// because a reader looking for how to use the tool does not read the
+    /// minutes.
     fn published_docs(corpus: Corpus) -> String {
         let root = repo_root();
         let mut buf = String::new();
@@ -2483,7 +2493,11 @@ mod documented_flags {
              moves with it rather than being deleted",
             docs.display()
         );
+        let decisions = docs.join("decisions");
         for entry in walkdir::WalkDir::new(&docs).into_iter().flatten() {
+            if entry.path().starts_with(&decisions) {
+                continue;
+            }
             if entry.path().extension().is_some_and(|e| e == "md")
                 && corpus.owns(entry.path())
                 && let Ok(text) = std::fs::read_to_string(entry.path())
