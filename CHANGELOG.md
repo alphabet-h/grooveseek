@@ -14,6 +14,36 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **One implementation now answers `Host` and `Origin` wherever they are
+  asked, `/mcp` included.** The two questions had four implementations —
+  rmcp's for `/mcp`, and GrooveSeek's own for `/healthz` and for the admin
+  routes — fed one list and expected to agree. Measured, they did not: with
+  the identical allow-list,
+  `Host: user:pw@127.0.0.1:PORT`, `@127.0.0.1:PORT`, `127.0.0.1@localhost`,
+  `127.0.0.1:65536` and `localhost:abc` were accepted on `/mcp` and refused
+  next door, and the admin refusal bodies were missing the `Forbidden: `
+  prefix the others carried.
+
+  **`/mcp` therefore refuses those five spellings now**, where it used to
+  answer 200. All are malformed Hosts that no browser or MCP client
+  constructs, and the change can only refuse more, never less: no spelling was
+  found that rmcp refused and GrooveSeek accepted. Its refusal wording is
+  unchanged. See [ADR-0009](docs/decisions/0009-one-dns-rebinding-gate.md).
+
+  **What each route is compared against has not changed**: `allowed_origins`
+  still reaches `/mcp` and the admin routes only, the admin routes still match
+  `Host` against a loopback-only list of their own, and `/healthz` still
+  validates `Host` alone and only when `healthz_public = false`.
+
+  Two consequences worth having on their own: a refused request no longer
+  reserves a session seat before being turned away (measured with
+  `max_sessions = 1`, a foreign `Host` used to get `429` and now gets `403`),
+  and refusal logging on `/mcp` is bounded — rmcp wrote one line per refusal
+  with no limit, and the gate carries the same one-line-a-minute budget the
+  session limit has used since v0.27.0.
+
 ### Security
 
 - **`/ui` and `/api/admin/status` validate `Origin`.** The admin routes are

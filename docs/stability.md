@@ -63,11 +63,22 @@ reach you over loopback.
 whether the built-in page can search: replacing the default with only a public
 origin leaves `/ui` served but unable to query.
 
-`/ui` and `/api/admin/status` validate the same list, against the same list —
-not a second one derived from the same setting. They are served by GrooveSeek
-rather than by the MCP library, so this is a separate check reaching the same
-verdict; a test asks both surfaces about the same origin and requires the same
-answer. As on `/mcp`, a request carrying no `Origin` passes, which is why the
+**One check answers this for every route it guards** — GrooveSeek performs it
+itself rather than leaving `/mcp` to the MCP library, so two surfaces can no
+longer read the same value two different ways. See
+[ADR-0009](decisions/0009-one-dns-rebinding-gate.md), which records the five
+`Host` spellings on which they used to.
+
+**What each route is compared against is not the same, and this key does not
+reach all of them:**
+
+| Route | `Host` | `Origin` |
+| --- | --- | --- |
+| `/mcp` | `allowed_hosts` | `allowed_origins` |
+| `/ui`, `/api/admin/status` | loopback plus the bind address, not configurable | `allowed_origins` |
+| `/healthz` | `allowed_hosts`, and **only when `healthz_public = false`** | never validated |
+
+A request carrying no `Origin` passes wherever the check runs, which is why the
 tray and `curl` are unaffected.
 
 `allowed_hosts` does the same thing one step earlier — Host validation runs
