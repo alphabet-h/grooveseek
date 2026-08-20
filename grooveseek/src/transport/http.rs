@@ -1819,6 +1819,30 @@ mod tests {
         );
     }
 
+    /// `/ui` calls `/mcp` with no handshake, which rmcp allows only for
+    /// requests carrying the SEP-2243 standard headers — so the version in the
+    /// page has to be `STANDARD_HEADERS`.
+    ///
+    /// **Not `LATEST`.** In rmcp 3.1.2 the two are deliberately different:
+    /// `LATEST` is `2025-11-25`, the newest version the SDK negotiates, and
+    /// `STANDARD_HEADERS` is `2026-07-28`, the first that carries the protocol
+    /// in headers. `server.rs` reports `LATEST` in `initialize` and is right to.
+    /// Reaching for that same constant here is the obvious move and it fails
+    /// today, which is the whole reason this assertion names the other one.
+    #[test]
+    fn the_page_names_the_protocol_version_that_allows_a_handshake_free_call() {
+        let page = include_str!("webui_index.html");
+        let expected = format!(
+            "const MCP_VERSION = \"{}\";",
+            rmcp::model::ProtocolVersion::STANDARD_HEADERS
+        );
+        assert!(
+            page.contains(&expected),
+            "webui_index.html must declare {expected:?}; a page pinned to a \
+             version rmcp does not accept without a handshake cannot search"
+        );
+    }
+
     /// An entry that names its port is not the wide kind, whatever the scheme.
     #[test]
     fn an_entry_that_names_its_port_matches_only_that_port() {
