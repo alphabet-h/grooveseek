@@ -163,6 +163,18 @@ fn origin_matches_any_port(entry: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to say at startup that the Origin list we built is wider than the
+/// port we bound.
+///
+/// The asymmetry is the point. An operator's own port-less entry is left alone:
+/// `https://kb.example.com` is the shipped proxy recipe and means 443 by RFC
+/// 6454, so warning on it would fire on the documented happy path. A derived
+/// entry is different — we chose it knowing the port, having just bound it, and
+/// still had to write one that ignores it.
+fn should_warn_wide_default(configured: Option<&[String]>, origins: &[String]) -> bool {
+    configured.is_none() && origins.iter().any(|o| origin_matches_any_port(o))
+}
+
 /// `http` の既定ポート。RFC 6454 の origin 直列化はこれを**省く**。
 const HTTP_DEFAULT_PORT: u16 = 80;
 
@@ -753,17 +765,11 @@ pub async fn run_http(
              extending it, so an entry for one origin does not cover another.",
             port = bound.port(),
         );
-    } else if allowed_origins.is_none() && origins.iter().any(|o| origin_matches_any_port(o)) {
+    } else if should_warn_wide_default(allowed_origins.as_deref(), &origins) {
         // Today this is port 80 and only port 80, where `origins_for_host` adds
         // the port-less spelling RFC 6454 requires. The condition asks about the
         // list rather than the port so that it keeps describing the list if that
         // function ever changes.
-        //
-        // An operator's own port-less entry is left alone on purpose:
-        // `https://kb.example.com` is the shipped proxy recipe and means 443, so
-        // warning on it would fire on the documented happy path. The difference
-        // is that here we chose the entry ourselves, knowing the port -- we had
-        // just bound it -- and still had to write one that ignores it.
         tracing::warn!(
             "bound to port {port}, where the default Origin allow-list has to \
              include the port-less spelling a browser sends (RFC 6454 omits the \
@@ -1721,6 +1727,27 @@ mod tests {
         for entry in ["https://kb.example.com", "http://localhost"] {
             assert!(origin_matches_any_port(entry), "{entry:?} names no port");
         }
+    }
+
+    /// The warning is about a list we built, not about a spelling. An operator
+    /// who writes the same port-less origin themselves gets nothing said to
+    /// them, because `https://kb.example.com` is the recipe we publish and
+    /// means 443 — this is the half most likely to be "fixed" into noise later.
+    #[test]
+    fn the_wide_default_warning_is_only_about_a_list_we_derived() {
+        let at_80 = default_allowed_origins(HTTP_DEFAULT_PORT);
+        assert!(
+            should_warn_wide_default(None, &at_80),
+            "the default at port 80 matches every local port and has to say so"
+        );
+        assert!(
+            !should_warn_wide_default(Some(&at_80), &at_80),
+            "the same list, chosen by the operator, is their decision to make"
+        );
+        assert!(
+            !should_warn_wide_default(None, &default_allowed_origins(3100)),
+            "an ordinary port needs no port-less entry, so there is nothing to say"
+        );
     }
 
     /// (codex P2 round 1 on PR #173) The default must be built from the port
