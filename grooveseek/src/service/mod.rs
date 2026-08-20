@@ -214,11 +214,16 @@ mod tests {
     /// `GROOVE_CONFIG_HOME=/tmp/probe cargo test --lib service::tests` to
     /// exercise it — reading the variable the harness was started with is not
     /// mutation, and does not reach the tests running alongside.
+    /// Compared as `Option`, not unwrapped: with the variable unset and no
+    /// resolvable home — a minimal Unix account, which the fallback test above
+    /// also allows for — both sides are `Err`, and agreeing on that is still
+    /// agreement. Unwrapping would turn the documented failure case into a
+    /// panic on machines this is meant to run on.
     #[test]
     fn the_wrapper_passes_the_environment_through() {
         assert_eq!(
-            resolve_config_home("svc").unwrap(),
-            resolve_config_home_in(crate::config::env_dir("GROOVE_CONFIG_HOME"), "svc").unwrap(),
+            resolve_config_home("svc").ok(),
+            resolve_config_home_in(crate::config::env_dir("GROOVE_CONFIG_HOME"), "svc").ok(),
         );
     }
 
