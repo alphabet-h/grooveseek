@@ -80,31 +80,40 @@ fn literal_after<'a>(haystack: &'a str, marker: &str) -> &'a str {
         .0
 }
 
-/// The balanced `{ ... }` that follows `marker`, braces included.
-fn braced_after(marker: &str) -> &'static str {
-    let rest = PAGE
-        .split_once(marker)
-        .unwrap_or_else(|| panic!("webui_index.html no longer contains {marker:?}"))
-        .1;
-    let start = rest.find('{').expect("an object follows the marker");
-    let bytes = rest.as_bytes();
+/// The balanced run of `open`/`close` that starts at the first `open` in
+/// `text`, delimiters included. String literals are skipped, so a brace or a
+/// parenthesis inside one does not count.
+fn balanced(text: &str, open: u8, close: u8) -> &str {
+    let start = text
+        .find(open as char)
+        .unwrap_or_else(|| panic!("no {:?} in {:?}", open as char, &text[..text.len().min(60)]));
+    let bytes = text.as_bytes();
     let (mut depth, mut i, mut in_string) = (0usize, start, false);
     while i < bytes.len() {
         match bytes[i] {
             b'\\' if in_string => i += 1,
             b'"' => in_string = !in_string,
-            b'{' if !in_string => depth += 1,
-            b'}' if !in_string => {
+            b if b == open && !in_string => depth += 1,
+            b if b == close && !in_string => {
                 depth -= 1;
                 if depth == 0 {
-                    return &rest[start..=i];
+                    return &text[start..=i];
                 }
             }
             _ => {}
         }
         i += 1;
     }
-    panic!("the object opened after {marker:?} is never closed");
+    panic!("unbalanced {:?} in the page", open as char)
+}
+
+/// The whole `fetch(...)` call `callTool` makes, parentheses included.
+fn fetch_call() -> &'static str {
+    let rest = PAGE
+        .split_once("await fetch")
+        .expect("callTool still calls fetch")
+        .1;
+    balanced(rest, b'(', b')')
 }
 
 /// One JavaScript value from the page, as it will appear on the wire.
@@ -115,7 +124,8 @@ fn braced_after(marker: &str) -> &'static str {
 fn resolve(raw: &str, tool: &str) -> Value {
     match raw {
         "MCP_VERSION" => Value::String(version_the_page_pins().to_string()),
-        // `callTool(name, args)`; these tests call it with no arguments.
+        // `callTool(name, args)`. These tests pass no arguments, but the key
+        // has to survive: `the_request_read_from_the_page...` asserts it.
         "name" => Value::String(tool.to_string()),
         "args" => Value::Object(Map::new()),
         "{}" => Value::Object(Map::new()),
@@ -131,29 +141,34 @@ fn resolve(raw: &str, tool: &str) -> Value {
     }
 }
 
-/// Read one of the page's object literals into a JSON value.
+/// Read a JavaScript object literal from the page into a JSON value.
 ///
 /// Deliberately small, and deliberately strict. The page is ours and formats
 /// these literals one key per line, so a line walk is enough; anything it does
 /// not recognise **panics**, because a shape this cannot read must never be
 /// reported as a shape that matches.
-fn object_from_page(marker: &str, tool: &str) -> Value {
+///
+/// `body: JSON.stringify({` opens an object like `{` does. The wrapper is not
+/// cosmetic — without it `fetch` would send `[object Object]` — so
+/// `openers_seen` records it for the caller to check rather than being
+/// silently accepted.
+fn object_from(text: &str, tool: &str, openers_seen: &mut Vec<(String, String)>) -> Value {
     let mut stack: Vec<(Option<String>, Map<String, Value>)> = Vec::new();
-    for raw in braced_after(marker).lines() {
+    for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
         assert!(
             !line.starts_with("//"),
-            "a comment inside {marker:?} — teach the reader about it rather than \
-             skipping the line: {line:?}"
+            "a comment inside a literal this reads — teach it about the line \
+             rather than skipping it: {line:?}"
         );
         if line == "{" {
             stack.push((None, Map::new()));
             continue;
         }
-        if line == "}" || line == "}," || line == "})," || line == "})" {
+        if line.starts_with('}') {
             let (key, map) = stack.pop().expect("a close with nothing open");
             let done = Value::Object(map);
             match (key, stack.last_mut()) {
@@ -161,46 +176,91 @@ fn object_from_page(marker: &str, tool: &str) -> Value {
                     parent.insert(k, done);
                 }
                 (None, None) => return done,
-                _ => panic!("unbalanced object literal in {marker:?}"),
+                _ => panic!("unbalanced object literal in the page"),
             }
             continue;
         }
         let (k, v) = line
             .split_once(':')
-            .unwrap_or_else(|| panic!("cannot read {line:?} as `key: value` in {marker:?}"));
+            .unwrap_or_else(|| panic!("cannot read {line:?} as `key: value`"));
         let key = k.trim().trim_matches('"').to_string();
         let v = v.trim().trim_end_matches(',').trim();
-        if v == "{" {
+        if v.ends_with('{') {
+            openers_seen.push((key.clone(), v.to_string()));
             stack.push((Some(key), Map::new()));
         } else {
             let (_, top) = stack.last_mut().expect("a value outside any object");
             top.insert(key, resolve(v, tool));
         }
     }
-    panic!("the object literal in {marker:?} did not close");
+    panic!("an object literal in the page did not close");
 }
 
-/// The `tools/call` the page sends, **read out of the page** — headers and body
-/// alike, envelope included. There is no second copy of the request here to
-/// drift from the first: rename `params`, move `_meta`, change a header, and
-/// what this sends changes with it. An expression the reader cannot resolve
-/// stops the test rather than being skipped.
+/// Everything about the request `callTool` issues, **read out of the page**:
+/// the target, the method, the headers, and the body with its envelope and
+/// nesting. Nothing about the request is written here a second time, so there
+/// is no copy left to drift from the page.
 ///
-/// Executing the page's JavaScript would be stricter still, but that means a
+/// Executing the page's JavaScript would be stricter still; that means a
 /// JavaScript runtime as a dependency for this one call.
+struct PageRequest {
+    target: String,
+    method: String,
+    headers: Map<String, Value>,
+    body: Value,
+}
+
+fn request_the_page_builds(tool: &str) -> PageRequest {
+    let call = fetch_call();
+    let target = literal_after(call, "\"").to_string();
+
+    let after_target = call
+        .split_once(',')
+        .expect("fetch takes an options object as its second argument")
+        .1;
+    let mut openers = Vec::new();
+    let opts = object_from(balanced(after_target, b'{', b'}'), tool, &mut openers);
+    let opts = opts.as_object().expect("the options are an object").clone();
+
+    // Without `JSON.stringify` the browser sends "[object Object]"; a reader
+    // that quietly accepted a bare `{` would serialise valid JSON here and
+    // report a page that cannot search as one that can.
+    let body_opener = openers
+        .iter()
+        .find(|(k, _)| k == "body")
+        .map(|(_, o)| o.as_str())
+        .unwrap_or_else(|| panic!("callTool no longer builds a body: {openers:?}"));
+    assert_eq!(
+        body_opener, "JSON.stringify({",
+        "the body is no longer JSON-stringified, so the browser would send it \
+         as [object Object]"
+    );
+
+    PageRequest {
+        target,
+        method: opts["method"]
+            .as_str()
+            .expect("the method is a string")
+            .to_string(),
+        headers: opts["headers"]
+            .as_object()
+            .expect("the headers are an object")
+            .clone(),
+        body: opts["body"].clone(),
+    }
+}
+
+/// Issue the page's request against a running server.
 ///
 /// `include_protocol_header` exists so a test can drop one header and see the
 /// difference — without that, "the server accepted it" is equally consistent
 /// with a server that reads no headers at all.
 fn page_shaped_call(base: &str, tool: &str, include_protocol_header: bool) -> String {
-    let body = serde_json::to_string(&object_from_page("body: JSON.stringify(", tool))
-        .expect("the page's body literal serialises");
+    let req = request_the_page_builds(tool);
+    let body = serde_json::to_string(&req.body).expect("the page's body serialises");
 
-    let mut args: Vec<String> = vec!["-s".into(), "-X".into(), "POST".into()];
-    for (name, value) in object_from_page("headers:", tool)
-        .as_object()
-        .expect("the headers literal is an object")
-    {
+    let mut args: Vec<String> = vec!["-s".into(), "-X".into(), req.method];
+    for (name, value) in &req.headers {
         if !include_protocol_header && name.eq_ignore_ascii_case("MCP-Protocol-Version") {
             continue;
         }
@@ -210,7 +270,7 @@ fn page_shaped_call(base: &str, tool: &str, include_protocol_header: bool) -> St
         args.push("-H".into());
         args.push(format!("{name}: {value}"));
     }
-    args.extend(["-d".into(), body, format!("{base}/mcp")]);
+    args.extend(["-d".into(), body, format!("{base}{}", req.target)]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     curl(&refs)
 }
@@ -252,27 +312,41 @@ fn the_request_shape_the_page_uses_is_accepted() {
     );
 }
 
-/// The envelope, checked on the **parsed** request rather than as fragments of
-/// the page's text. Substring checks were the previous version of this and
-/// missed the case that matters: rename `params`, or move `_meta` out of it,
-/// and every fragment is still present somewhere in the file while the request
-/// the page sends has changed shape.
+/// The request, checked as **parsed from the page** rather than as fragments of
+/// its text. Substring checks were an earlier version of this and missed the
+/// cases that matter: rename `params`, move `_meta` out of it, or drop
+/// `arguments`, and every fragment is still somewhere in the file while the
+/// request the page sends has changed shape.
 #[test]
-fn the_request_read_from_the_page_has_the_envelope_the_protocol_needs() {
-    let req = object_from_page("body: JSON.stringify(", "list_topics");
+fn the_request_read_from_the_page_is_the_one_the_protocol_needs() {
+    let req = request_the_page_builds("list_topics");
 
-    assert_eq!(req["jsonrpc"], "2.0", "not a JSON-RPC request: {req}");
-    assert_eq!(req["method"], "tools/call", "not a tools/call: {req}");
-    assert!(req["id"].is_number(), "no request id: {req}");
+    assert_eq!(req.target, "/mcp", "the page no longer posts to /mcp");
+    assert_eq!(req.method, "POST", "the page no longer POSTs");
+    assert!(
+        req.headers.contains_key("MCP-Protocol-Version"),
+        "the header the stateless protocol is carried in is gone: {:?}",
+        req.headers.keys().collect::<Vec<_>>()
+    );
 
-    let params = req
+    let body = &req.body;
+    assert_eq!(body["jsonrpc"], "2.0", "not a JSON-RPC request: {body}");
+    assert_eq!(body["method"], "tools/call", "not a tools/call: {body}");
+    assert!(body["id"].is_number(), "no request id: {body}");
+
+    let params = body
         .get("params")
-        .unwrap_or_else(|| panic!("the arguments are no longer under `params`: {req}"));
-    assert_eq!(params["name"], "list_topics", "the tool name moved: {req}");
+        .unwrap_or_else(|| panic!("the arguments are no longer under `params`: {body}"));
+    assert_eq!(params["name"], "list_topics", "the tool name moved: {body}");
+    assert!(
+        params.get("arguments").is_some_and(Value::is_object),
+        "`arguments` is gone from `params`; the page calls `search` with a \
+         required `query`, so a tool that needs one would be called without it: {body}"
+    );
     assert!(
         params.get("_meta").is_some_and(Value::is_object),
         "`_meta` is no longer an object inside `params`, which is where the \
-         stateless protocol reads it: {req}"
+         stateless protocol reads it: {body}"
     );
 }
 
