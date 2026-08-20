@@ -1391,6 +1391,7 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
 
     /// The half of the naming rule that values are held to: a caller who
@@ -3587,6 +3588,196 @@ mod tests {
             !listed.iter().any(|p| *p == "notes/huge.md"),
             "a read is bounded by the listing, so dropping it there is what \
              makes the read refuse"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The search response and the contract that describes it
+    // -----------------------------------------------------------------------
+
+    /// The contract lives in `docs/stability.md`, which is published from the
+    /// repository root while this crate sits one level down.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate directory always has a parent")
+            .to_path_buf()
+    }
+
+    /// Every field the response can emit, as the dotted paths the contract
+    /// uses.
+    ///
+    /// Paths rather than bare names because `topic` occurs under both a hit
+    /// and `filter_applied` and means something different in each; a flat set
+    /// would let one of them satisfy the check for the other.
+    fn walk_fields(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    out.insert(path.clone());
+                    walk_fields(v, &path, out);
+                }
+            }
+            // Every element, not just the first: `expanded_from` is a tagged
+            // enum whose two variants carry different keys, so one sample
+            // result can only ever show half of the shape.
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk_fields(item, &format!("{prefix}[]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A response with **every** optional field populated.
+    ///
+    /// The point is coverage, not realism: a field that is only ever emitted
+    /// under some condition still has to appear in the contract, so the sample
+    /// has to be the maximal shape rather than a typical one.
+    fn maximal_search_response() -> serde_json::Value {
+        let hit = |expanded: crate::db::ExpandedRange| crate::db::SearchHit {
+            score: 0.5,
+            path: "notes/a.md".to_string(),
+            title: Some("A".to_string()),
+            heading: Some("H".to_string()),
+            topic: Some("t".to_string()),
+            date: Some("2026-01-01".to_string()),
+            tags: vec!["x".to_string()],
+            content: "body".to_string(),
+            match_spans: Some(vec![crate::db::MatchSpan { start: 0, end: 1 }]),
+            expanded_from: Some(expanded),
+        };
+        // Built through the real constructor so the sample cannot claim a
+        // shape the server does not produce. An empty oversized list plus a
+        // registry that knows `.md` is what makes `uri` present.
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        // One result per `expanded_from` variant: the two carry different
+        // keys, and a contract that only saw one of them would leave the
+        // other outside the freeze.
+        let results: Vec<HitWithUri> = [
+            crate::db::ExpandedRange::Adjacent {
+                from_index: 0,
+                to_index: 1,
+            },
+            crate::db::ExpandedRange::WholeDocument { total_chunks: 3 },
+        ]
+        .into_iter()
+        .map(|e| {
+            let h = HitWithUri::new(hit(e), &rules);
+            assert!(
+                h.uri.is_some(),
+                "the sample must carry a uri, or the maximal shape is not maximal"
+            );
+            h
+        })
+        .collect();
+        let response = SearchResponse {
+            results,
+            low_confidence: true,
+            filter_applied: SearchFilterEcho {
+                category: Some("c".to_string()),
+                topic: Some("t".to_string()),
+                path_globs: Some(vec!["**".to_string()]),
+                tags_any: Some(vec!["a".to_string()]),
+                tags_all: Some(vec!["b".to_string()]),
+                date_from: Some("2026-01-01".to_string()),
+                date_to: Some("2026-12-31".to_string()),
+                min_confidence_ratio: Some(1.5),
+            },
+        };
+        serde_json::to_value(&response).expect("the response type serializes")
+    }
+
+    /// The field names the contract table claims, from its first column.
+    ///
+    /// One table is the source: a second machine-readable list beside it would
+    /// be a copy, and copies agree only until someone edits one of them.
+    fn contract_fields() -> BTreeSet<String> {
+        let path = repo_root().join("docs").join("stability.md");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        let section = text
+            .split("### What a search answers")
+            .nth(1)
+            .expect("docs/stability.md must carry the search response contract")
+            .split("\n### ")
+            .next()
+            .expect("splitting always yields a first part");
+        section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|rest| rest.split('`').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Adding a field to the response without adding it to the contract makes
+    /// the promise in `docs/stability.md` cover less than it appears to.
+    #[test]
+    fn every_field_a_search_can_answer_with_is_in_the_contract() {
+        let mut emitted = BTreeSet::new();
+        walk_fields(&maximal_search_response(), "", &mut emitted);
+        let documented = contract_fields();
+        let missing: Vec<&String> = emitted.difference(&documented).collect();
+        assert!(
+            missing.is_empty(),
+            "the search response emits fields the contract does not list: {missing:?}\n\
+             Add them to the `### What a search answers` table in docs/stability.md \
+             (and its Japanese counterpart), or the freeze silently excludes them."
+        );
+    }
+
+    /// The other direction: a field removed from the response but left in the
+    /// table turns the contract into a promise about something that no longer
+    /// exists. `documented_flags` holds the command line to the same pair of
+    /// checks for the same reason.
+    #[test]
+    fn the_contract_does_not_name_fields_a_search_cannot_answer_with() {
+        let mut emitted = BTreeSet::new();
+        walk_fields(&maximal_search_response(), "", &mut emitted);
+        let documented = contract_fields();
+        let extra: Vec<&String> = documented.difference(&emitted).collect();
+        assert!(
+            extra.is_empty(),
+            "the contract lists fields the search response cannot produce: {extra:?}\n\
+             Either the field was removed and the table was not, or the sample in \
+             `maximal_search_response` stopped covering it."
+        );
+    }
+
+    /// Both languages have to carry the same set, because a reader of either
+    /// one is reading the contract. The English page is what
+    /// `contract_fields` parses, so this is what keeps the Japanese page from
+    /// drifting away from it unnoticed.
+    #[test]
+    fn both_languages_state_the_same_contract() {
+        let ja_path = repo_root().join("docs").join("stability.ja.md");
+        let text = fs::read_to_string(&ja_path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", ja_path.display()));
+        let section = text
+            .split("### search が返すもの")
+            .nth(1)
+            .expect("docs/stability.ja.md must carry the contract too")
+            .split("\n### ")
+            .next()
+            .expect("splitting always yields a first part");
+        let ja: BTreeSet<String> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|rest| rest.split('`').next())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            ja,
+            contract_fields(),
+            "the two contract tables must name the same fields"
         );
     }
 }

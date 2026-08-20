@@ -180,7 +180,13 @@ loopback origin** である。
 | `results[].tags` | string の array | 常に。無ければ `[]` |
 | `results[].content` | string | 常に |
 | `results[].match_spans` | array | 計算された場合のみ**キーごと不在**。後述 |
+| `results[].match_spans[].start` | integer | `content` へのバイトオフセット。開始 (含む) |
+| `results[].match_spans[].end` | integer | `content` へのバイトオフセット。終了 (含まない) |
 | `results[].expanded_from` | object | parent retriever が拡張した場合のみ。他は**不在** |
+| `results[].expanded_from.kind` | string | `"adjacent"` または `"whole_document"`。**どちらかで下の 3 行の有無が決まる** |
+| `results[].expanded_from.from_index` | integer | `adjacent` のみ。merge した最初の chunk index (含む) |
+| `results[].expanded_from.to_index` | integer | `adjacent` のみ。merge した最後の chunk index (含む) |
+| `results[].expanded_from.total_chunks` | integer | `whole_document` のみ。その文書の chunk 総数 |
 | `results[].uri` | string | サーバが渡す文書のときのみ。**CLI では常に不在** |
 | `low_confidence` | boolean | 常に。**助言** — 後述 |
 | `filter_applied` | object | 常に。filter 未指定なら `{}` |

@@ -193,7 +193,13 @@ different each time.
 | `results[].tags` | array of strings | always, `[]` when there are none |
 | `results[].content` | string | always |
 | `results[].match_spans` | array | **omitted** unless computed — see below |
+| `results[].match_spans[].start` | integer | byte offset into `content`, inclusive |
+| `results[].match_spans[].end` | integer | byte offset into `content`, exclusive |
 | `results[].expanded_from` | object | **omitted** unless the parent retriever expanded the hit |
+| `results[].expanded_from.kind` | string | `"adjacent"` or `"whole_document"`, and which one decides the keys below |
+| `results[].expanded_from.from_index` | integer | `adjacent` only — first chunk index merged in, inclusive |
+| `results[].expanded_from.to_index` | integer | `adjacent` only — last chunk index merged in, inclusive |
+| `results[].expanded_from.total_chunks` | integer | `whole_document` only — how many chunks the document has |
 | `results[].uri` | string | **omitted** unless the document is one the server will hand over, and **never present over the command line** |
 | `low_confidence` | boolean | always — **advisory**, see below |
 | `filter_applied` | object | always, `{}` when no filter was given |
