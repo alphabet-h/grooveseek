@@ -108,6 +108,61 @@ pub fn default_allowed_origins(port: u16) -> Vec<String> {
         .collect()
 }
 
+/// Whether one `[transport.http].allowed_origins` entry survives as far as the
+/// comparison, mirroring rmcp's `parse_origin_value`.
+///
+/// rmcp runs the allow-list through that parser at match time and drops what it
+/// cannot read with a `filter_map` (`rmcp-3.1.2`
+/// `transport/streamable_http_server/tower.rs:781-806`). Dropping is silent and
+/// the list stays non-empty, so validation remains *switched on* with nothing
+/// left to compare against — and a non-empty list that matches nothing refuses
+/// every request carrying an `Origin`. The operator sees a server answering 403
+/// to their own browser with no warning anywhere.
+///
+/// **The check exists because this key is spelled unlike its neighbour.**
+/// `allowed_hosts` ends in a fallback that reads the whole string as a host
+/// (`parse_allowed_authority`, `tower.rs:741-752`), so no non-empty entry is
+/// ever dropped there. Origin entries must carry a scheme. `"127.0.0.1:3100"`
+/// is the trap: `http::Uri` accepts it as authority-form — a scheme has to
+/// begin with a letter, so `127.0.0.1` cannot be one — and it fails only at
+/// `scheme_str()`, one line further on.
+///
+/// `"null"` is a real origin (RFC 6454 §6.1; sandboxed frames, `file://`), and
+/// rmcp maps it to its own variant, so it is accepted here too.
+pub(crate) fn check_origin_entry(entry: &str) -> Result<(), &'static str> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err("an entry must not be empty");
+    }
+    if entry.eq_ignore_ascii_case("null") {
+        return Ok(());
+    }
+    let uri = http::Uri::try_from(entry).map_err(|_| "an entry must be a serialized origin")?;
+    if uri.scheme_str().is_none() {
+        return Err("an entry must carry a scheme (\"http://\" or \"https://\")");
+    }
+    if uri.authority().is_none() {
+        return Err("an entry must name a host");
+    }
+    Ok(())
+}
+
+/// Whether this entry leaves the port open, so that rmcp matches it against
+/// **every** port on that host (`a_port.is_none() || a_port == o_port`,
+/// `tower.rs:819`).
+///
+/// That is wider than RFC 6454, where an omitted port *means* the scheme's
+/// default port — but it cannot be narrowed from here. The browser omits the
+/// port too, so an entry respelled `http://127.0.0.1:80` would be compared
+/// `Some(80)` against the request's `None` and refuse the very page it exists
+/// for. The entry has to stay; what it costs is worth a word at startup.
+fn origin_matches_any_port(entry: &str) -> bool {
+    http::Uri::try_from(entry.trim())
+        .ok()
+        .and_then(|u| u.authority().map(|a| a.port_u16().is_none()))
+        .unwrap_or(false)
+}
+
 /// `http` の既定ポート。RFC 6454 の origin 直列化はこれを**省く**。
 const HTTP_DEFAULT_PORT: u16 = 80;
 
@@ -696,6 +751,26 @@ pub async fn run_http(
              (http://127.0.0.1:{port}, http://localhost:{port}) alongside the \
              public one. Setting the key replaces the default list rather than \
              extending it, so an entry for one origin does not cover another.",
+            port = bound.port(),
+        );
+    } else if allowed_origins.is_none() && origins.iter().any(|o| origin_matches_any_port(o)) {
+        // Today this is port 80 and only port 80, where `origins_for_host` adds
+        // the port-less spelling RFC 6454 requires. The condition asks about the
+        // list rather than the port so that it keeps describing the list if that
+        // function ever changes.
+        //
+        // An operator's own port-less entry is left alone on purpose:
+        // `https://kb.example.com` is the shipped proxy recipe and means 443, so
+        // warning on it would fire on the documented happy path. The difference
+        // is that here we chose the entry ourselves, knowing the port -- we had
+        // just bound it -- and still had to write one that ignores it.
+        tracing::warn!(
+            "bound to port {port}, where the default Origin allow-list has to \
+             include the port-less spelling a browser sends (RFC 6454 omits the \
+             default port). An allow-list entry with no port matches EVERY port \
+             on that host, so a page served from any other local port can now \
+             reach /mcp cross-origin. Name the origins you actually browse with \
+             in [transport.http].allowed_origins to close this.",
             port = bound.port(),
         );
     }
@@ -1521,6 +1596,131 @@ mod tests {
         let origins = default_allowed_origins(4242);
         assert!(origins.iter().all(|o| o.ends_with(":4242")));
         assert!(origins.contains(&"http://[::1]:4242".to_string()));
+    }
+
+    /// The list we ship must survive the parser we validate against. Port 80 is
+    /// included because it is the one port where `origins_for_host` emits a
+    /// second, port-less spelling, and that spelling has to be legal too.
+    #[test]
+    fn every_origin_we_derive_ourselves_reaches_the_comparison() {
+        for port in [80u16, 3100, 65535] {
+            for entry in default_allowed_origins(port) {
+                assert_eq!(
+                    check_origin_entry(&entry),
+                    Ok(()),
+                    "we would refuse our own default entry {entry:?} on port {port}"
+                );
+            }
+        }
+    }
+
+    /// The trap this check exists for. `allowed_hosts` takes a bare `host:port`
+    /// — its parser ends in a fallback that reads the whole string as a host —
+    /// so the spelling carries over to the neighbouring key, where rmcp drops it
+    /// without a word and refuses every request that carries an `Origin`.
+    #[test]
+    fn a_bare_host_and_port_is_refused_where_allowed_hosts_would_take_it() {
+        for entry in ["127.0.0.1:3100", "localhost:3100", "kb.example.com"] {
+            let why = check_origin_entry(entry)
+                .expect_err("a spelling with no scheme never reaches rmcp's comparison");
+            assert!(
+                why.contains("scheme"),
+                "the message has to name what is missing, got {why:?}"
+            );
+        }
+    }
+
+    /// Every spelling the documentation and the shipped recipes hand an operator.
+    #[test]
+    fn the_spellings_we_publish_are_accepted() {
+        for entry in [
+            "https://kb.example.com",
+            "http://127.0.0.1:3100",
+            "http://localhost:3100",
+            "http://[::1]:3100",
+            "http://127.0.0.1",
+        ] {
+            assert_eq!(check_origin_entry(entry), Ok(()), "{entry:?} is documented");
+        }
+    }
+
+    /// `null` is a real origin (RFC 6454 §6.1 — sandboxed frames, `file://`),
+    /// and rmcp gives it a variant of its own, so refusing it here would reject
+    /// a config that works.
+    #[test]
+    fn the_null_origin_is_an_origin() {
+        for entry in ["null", "NULL", " null "] {
+            assert_eq!(check_origin_entry(entry), Ok(()), "{entry:?} is an origin");
+        }
+    }
+
+    /// The check answers "does rmcp still have this at match time", not "is this
+    /// a well-formed origin". A trailing path is not part of a serialized origin,
+    /// but rmcp keeps only the scheme and authority and never looks at it — so
+    /// refusing it here would stop a config that works today from starting.
+    /// Being stricter than the parser we are protecting is its own defect.
+    #[test]
+    fn a_trailing_path_is_not_this_checks_business() {
+        assert_eq!(check_origin_entry("https://kb.example.com/mcp"), Ok(()));
+    }
+
+    /// Empty and whitespace-only entries: rmcp drops these too.
+    #[test]
+    fn an_entry_with_nothing_in_it_is_refused() {
+        for entry in ["", "   ", "\t"] {
+            assert!(
+                check_origin_entry(entry).is_err(),
+                "{entry:?} would be dropped by rmcp"
+            );
+        }
+    }
+
+    /// A scheme with no host behind it.
+    #[test]
+    fn a_scheme_with_no_host_is_refused() {
+        for entry in ["http://", "https://"] {
+            assert!(check_origin_entry(entry).is_err(), "{entry:?} names no host");
+        }
+    }
+
+    /// The startup warning fires on a property of the list, not on a port
+    /// number, so this pins both halves: on an ordinary port every entry we
+    /// derive names its port, and on port 80 the entries RFC 6454 obliges us to
+    /// add are the ones that widen to every port on the host.
+    #[test]
+    fn only_the_port_80_default_leaves_the_port_open() {
+        for port in [3100u16, 4242, 65535] {
+            let origins = default_allowed_origins(port);
+            assert!(
+                !origins.iter().any(|o| origin_matches_any_port(o)),
+                "port {port} needs no port-less entry, got {origins:?}"
+            );
+        }
+        let at_80 = default_allowed_origins(HTTP_DEFAULT_PORT);
+        let open: Vec<_> = at_80
+            .iter()
+            .filter(|o| origin_matches_any_port(o))
+            .collect();
+        assert_eq!(
+            open,
+            vec!["http://localhost", "http://127.0.0.1", "http://[::1]"],
+            "at port 80 the browser sends no port, so these have to be on the list"
+        );
+    }
+
+    /// An entry that names its port is not the wide kind, whatever the scheme.
+    #[test]
+    fn an_entry_that_names_its_port_matches_only_that_port() {
+        for entry in [
+            "http://127.0.0.1:3100",
+            "https://kb.example.com:8443",
+            "http://[::1]:3100",
+        ] {
+            assert!(!origin_matches_any_port(entry), "{entry:?} names a port");
+        }
+        for entry in ["https://kb.example.com", "http://localhost"] {
+            assert!(origin_matches_any_port(entry), "{entry:?} names no port");
+        }
     }
 
     /// (codex P2 round 1 on PR #173) The default must be built from the port

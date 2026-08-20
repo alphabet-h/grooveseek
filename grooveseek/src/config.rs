@@ -834,6 +834,7 @@ impl Config {
     /// - `[search.fusion].rrf_k` が有限かつ `>= 1.0`
     /// - `[search.fusion].bm25_*_weight` が有限かつ `>= 0.0`
     /// - `[search.fusion]` の 3 重みが全て `0.0` でない
+    /// - `[transport.http].allowed_origins` の各 entry が rmcp の照合まで届く
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
             // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
@@ -910,6 +911,39 @@ impl Config {
                     "[search.fusion]: all three bm25 weights are 0.0; bm25() then returns -0.0 for \
                      every row and the FTS ranking collapses. Set at least one weight > 0.0."
                 );
+            }
+        }
+
+        // `allowed_origins` の綴り。ここが唯一のゲートである事情は
+        // `[search.fusion]` と同じ — 下流に silent path があり、その先で
+        // 落ちても誰にも見えない。違うのは silent path の中身で、あちらは
+        // bind parameter が NaN を通すこと、こちらは rmcp が解釈できない
+        // entry を照合直前に捨てること (`check_origin_entry` 参照)。
+        //
+        // 空リストは合法。`[]` は「Origin 検証をしない」という文書化された
+        // 表明で、`run_http` が起動時に warn を出す。ループが回らないだけ。
+        //
+        // 発見された config も同じ扱いになる。`restrict_untrusted` が
+        // `allowed_origins` を落とすのは `load_from` の**後**なので、綴りが
+        // 壊れていればここで起動を拒む。値域チェック (`rrf_k` 等) が既に
+        // そうなっており、黙って動くより見える形で止まるほうがよい。
+        if let Some(origins) = self
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .and_then(|h| h.allowed_origins.as_ref())
+        {
+            for entry in origins {
+                if let Err(why) = crate::transport::http::check_origin_entry(entry) {
+                    anyhow::bail!(
+                        "[transport.http].allowed_origins: {why}, got {entry:?}. An entry \
+                         rmcp cannot parse is dropped before matching, which leaves Origin \
+                         validation switched on with nothing to match: every request \
+                         carrying an Origin header is then refused with 403, and nothing \
+                         says why. Note this key is stricter than allowed_hosts, which \
+                         accepts a bare host or host:port."
+                    );
+                }
             }
         }
         Ok(())
@@ -3013,6 +3047,64 @@ lambda = 0.5
             http.allowed_origins.is_none(),
             "an empty planted list disables validation, so it must be dropped too"
         );
+    }
+
+    /// The spelling `allowed_hosts` accepts, written into the key next door.
+    /// rmcp drops it at match time and says nothing, leaving Origin validation
+    /// on with nothing to match — so the server 403s every browser, including
+    /// its own `/ui`, and the log is silent. Refusing the config is the only
+    /// place this is still visible.
+    #[test]
+    fn an_origin_entry_that_never_reaches_the_comparison_stops_the_load() {
+        let toml = r#"
+[transport.http]
+allowed_origins = ["127.0.0.1:3100"]
+"#;
+        let cfg: Config = toml::from_str(toml).expect("the key parses; the value is the problem");
+        let err = cfg
+            .validate()
+            .expect_err("an entry rmcp would drop must not reach a running server");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("[transport.http].allowed_origins"),
+            "the message must name the key, got {msg:?}"
+        );
+        assert!(
+            msg.contains("127.0.0.1:3100"),
+            "the message must quote the entry, got {msg:?}"
+        );
+        assert!(
+            msg.contains("allowed_hosts"),
+            "the message must say which key does take this spelling, got {msg:?}"
+        );
+    }
+
+    /// Not every list is checked into oblivion: `[]` is the documented way to
+    /// turn Origin validation off, and `run_http` warns about it at startup.
+    /// Validation must not be the thing that refuses it.
+    #[test]
+    fn an_empty_origin_list_is_still_a_legal_config() {
+        let toml = r#"
+[transport.http]
+allowed_origins = []
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            cfg.validate().is_ok(),
+            "an empty list is documented as disabling validation, not as a typo"
+        );
+    }
+
+    /// The list the shipped proxy recipe hands an operator has to load.
+    #[test]
+    fn the_origins_the_recipes_publish_pass_validation() {
+        let toml = r#"
+[transport.http]
+allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate()
+            .expect("examples/deployments/intranet-http ships exactly this list");
     }
 
     /// The planted value must not be used — but dropping it, rather than
