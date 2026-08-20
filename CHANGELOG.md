@@ -73,6 +73,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Removed
 
+- **`groove validate --strict` is gone.** It was accepted and discarded — the
+  documentation said so, which made it a promise the binary did not keep: a CI
+  job that passed `--strict` believed it had asked for stricter checking and
+  had not. Giving it meaning after 1.0.0 would change what an accepted flag
+  does, which is a major release; removing it now costs nothing and adding it
+  back when `[options].allow_unknown_fields` exists is a minor one. Scripts
+  passing it will now fail to parse, which is the visible version of what was
+  already happening silently. See
+  [ADR-0010](docs/decisions/0010-settle-what-the-1-0-command-line-freezes.md).
+
 - **`kb.path` is gone from `/api/admin/status`, and from `/ui`'s status band.**
   It held the knowledge base's absolute path, which on Windows reads
   `C:\Users\<name>\...` — the operator's account name, in a JSON body and in

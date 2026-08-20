@@ -337,8 +337,6 @@ Flags:
 
 Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
 
-> The `--strict` flag is currently a no-op (accepted for forward compatibility with future stricter checking modes). Use the regular invocation for now.
-
 ## Check the index itself (v0.23.0+)
 
 `groove validate` checks your documents. `groove doctor` checks the **index**:

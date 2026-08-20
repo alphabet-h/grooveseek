@@ -336,8 +336,6 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 
 終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)。`--kb-path` 直下に `groove-schema.toml` が無いときは短い "no schema found" メッセージと共に exit 0 となるため、既存ワークフローへの `groove validate` 追加は実際にスキーマを書くまで非破壊。
 
-> `--strict` フラグは現状 no-op (将来のより厳格な検証モードへの前方互換のため受理されるだけ)。当面は通常の呼び出しで OK。
-
 ## 索引そのものを検査する (v0.23.0+)
 
 `groove validate` が検査するのは**文書**。`groove doctor` が検査するのは**索引**:

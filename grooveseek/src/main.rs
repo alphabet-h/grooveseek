@@ -311,12 +311,6 @@ enum Commands {
         /// Exit 1 at the first violation without scanning the rest.
         #[arg(long = "fail-fast", default_value_t = false)]
         fail_fast: bool,
-        /// Treat unknown YAML keys in frontmatter as violations.
-        /// MVP では Frontmatter が固定スキーマのため no-op (accept するが現状
-        /// 動作に影響しない)。将来の `[options].allow_unknown_fields` 実装と
-        /// 合わせて有効化する予定。CI スクリプト互換のため accept のみ。
-        #[arg(long, default_value_t = false)]
-        strict: bool,
     },
     /// One-shot search from the command line (no MCP transport).
     /// Useful for shell scripts / skill bins where invoking the binary
@@ -1154,7 +1148,6 @@ fn main() -> anyhow::Result<()> {
             format,
             no_color,
             fail_fast,
-            strict: _strict, // MVP では no-op (schema.rs 側の拡張待ち)
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             // canonicalize は使わない: walkdir は相対パスでも動作し、strip_prefix
