@@ -45,12 +45,17 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
   - `groove validate` のレポート (`print_validate_report`)
   - `groove doctor` のレポート (`print_doctor_report`)
   - `groove graph` の connection graph (`print_graph`)
-- **stderr** = status / progress / 診断 (= 人間向けの進捗 / warning / error)
-  - `groove index` の `Indexing ...` / `Done in ...` 進捗
   - `groove status` の `Documents: N` / `Chunks: N` 統計
+  - `groove service status` / `groove service list`
+- **stderr** = progress / 診断 (= 人間向けの進捗 / warning / error)
+  - `groove index` の `Indexing ...` / `Done in ...` 進捗
+  - `groove status` の `No index found` (= 答えられないことの報告。stdout は空)
+  - `groove service install` / `uninstall` / `tray-install` / `tray-uninstall` の確認
   - すべての warning / info / error メッセージ (`tracing` / `eprintln!`)
 
-**新規 subprocess test を書く時の注意**: subcommand の出力先を `grooveseek/src/main.rs` の `Commands::*` block で必ず先に grep 確認すること。その際 **`println!` だけでなく `print!` も** 対象にする (`eval` / `tune` の text 分岐は `print!`)。また **arm が直接書かず helper (`print_search_results` / `print_graph` / `print_validate_report` / `print_doctor_report`) に委譲している場合がある**。stdout に CLI 結果を書くのは上記 6 subcommand だけで、`index` / `status` / `service` は stderr のみ (= F-67 で `groove status` を stdout から読もうとして fail した過去あり)。`serve` は CLI 出力を持たないが、stdio transport では **MCP プロトコルが stdout を使う**点に注意。
+**新規 subprocess test を書く時の注意**: subcommand の出力先を `grooveseek/src/main.rs` の `Commands::*` block で必ず先に grep 確認すること。その際 **`println!` だけでなく `print!` も** 対象にする (`eval` / `tune` の text 分岐は `print!`)。また **arm が直接書かず helper (`print_search_results` / `print_graph` / `print_validate_report` / `print_doctor_report`) に委譲している場合がある**。**上のリストを読むこと。数えないこと** — 数詞はリストと別に腐る。`serve` は CLI 出力を持たないが、stdio transport では **MCP プロトコルが stdout を使う**点に注意。
+
+**2026-08-21 に `status` / `service status` / `service list` を stderr から stdout へ移した** (ADR-0010)。F-67 で「`groove status` を stdout から読もうとして fail した」のは**当時は正しい失敗**だったが、今は stdout が正しい読み先。古い罠ノートを読む時はこの日付で切ること。
 
 ## 運用の細則
 

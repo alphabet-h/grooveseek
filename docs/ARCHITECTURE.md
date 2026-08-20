@@ -104,7 +104,7 @@ Static Contextual Retrieval (feature-46) prepends a document-structure breadcrum
   - `--force`: adopt the desired mode unconditionally (the DB was just reset by `reset_for_model`) and record it.
   - No `--force`, DB already has a recorded mode that differs from desired: **stay in the DB's mode**, print a stderr warning pointing at `groove index --force`.
   - No `--force`, no recorded mode (a genuine pre-feature-46 DB, `index_meta` has no `context_mode` key): grandfather to `Off` if the DB already has chunks (an existing index that predates this feature), or adopt the desired mode if the DB is empty (a brand-new index).
-  - `groove status` prints `Context mode: static` / `Context mode: off` on stderr, sourced directly from `read_context_mode`.
+  - `groove status` prints `Context mode: static` / `Context mode: off` on stdout, sourced directly from `read_context_mode`.
 - `main.rs` computes the desired mode identically for both `serve` and `index` from `cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false)` — the `unwrap_or(false)` mirrors `ContextualConfig::default()` so an absent `[contextual]` section and an explicit `enabled = false` behave identically.
 
 ## Embedding cache resolution
@@ -128,22 +128,27 @@ The `groove` CLI follows a **stdout = data, stderr = progress** convention:
 
 - **stdout** carries the command's *result*, in whatever format was asked for.
   The defaults differ, so check before parsing: `search` and `graph` default to
-  `--format json`, while `eval`, `tune` and `validate` default to human-readable
-  text (`validate --format github` is machine-consumed too — it emits CI
-  annotations):
+  `--format json`, while `eval`, `tune`, `validate` and `doctor` default to
+  human-readable text (`validate --format github` is machine-consumed too — it
+  emits CI annotations). A result meant for a person is still a result, which is
+  why `status` is on this list and not the one below:
   - `groove search` results (`print_search_results`)
   - `groove eval` golden-query evaluation results
   - `groove tune` sweep results
   - `groove validate` report (`print_validate_report`, including the
     `::error file=…` lines that `--format github` emits for CI annotations)
+  - `groove doctor` report (`print_doctor_report`)
   - `groove graph` connection graph (`print_graph`)
-- **stderr** carries human-readable progress, status, warnings, and errors:
+  - `groove status` statistics (`Documents: N`, `Chunks: N`, …)
+  - `groove service status` and `groove service list` (`run_status` / `run_list`
+    build the text; the arm prints it)
+- **stderr** carries human-readable progress, warnings, and errors:
   - `groove index` progress lines (`Indexing ...`, `Done in ...`, per-file `  indexed:` / `  renamed:` / `  deleted:`). Use `--quiet` to suppress per-file output (start / found / done summary only) or `--progress` to switch to an `indicatif` bar (TTY) / periodic `Progress: N/M (P%)` lines (non-TTY). The two flags are mutually exclusive and default-off (added v0.7.8).
-  - `groove status` statistics (`Documents: N`, `Chunks: N`)
-  - `groove service install/uninstall/status/list` write all messages to stderr (= status / progress / diagnostics, per convention). stdout is empty.
+  - `groove status`'s "No index found" note — it reports an inability to answer, so stdout stays empty
+  - `groove service install/uninstall/tray-install/tray-uninstall` confirmations: they report on an action performed, not on a question asked
   - All `tracing` / `eprintln!` diagnostics
 
-When writing subprocess tests, grep `grooveseek/src/main.rs` for the corresponding `Commands::*` block to confirm which channel each subcommand uses before asserting on the captured output — and remember the arm may delegate its printing to a helper (`print_search_results` / `print_graph` / `print_validate_report`). The five listed above are the only ones whose *CLI result* goes to stdout; `index`, `status`, and `service` print only to stderr. `serve` is a special case: it writes nothing as CLI output, but over the default stdio transport the **MCP protocol itself** occupies stdout, which is why a subprocess harness must keep draining it. Grep for `print!` as well as `println!` — the text branches of `eval` and `tune` use it.
+When writing subprocess tests, grep `grooveseek/src/main.rs` for the corresponding `Commands::*` block to confirm which channel each subcommand uses before asserting on the captured output — and remember the arm may delegate its printing to a helper (`print_search_results` / `print_graph` / `print_validate_report` / `print_doctor_report`). Read the two lists above rather than counting them: the split is settled in [ADR-0010](decisions/0010-settle-what-the-1-0-command-line-freezes.md) and frozen by [docs/stability.md](stability.md), and a number written beside a list goes stale on its own. `serve` is a special case: it writes nothing as CLI output, but over the default stdio transport the **MCP protocol itself** occupies stdout, which is why a subprocess harness must keep draining it. Grep for `print!` as well as `println!` — the text branches of `eval` and `tune` use it.
 
 ## Key dependencies
 

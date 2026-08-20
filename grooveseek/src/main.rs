@@ -311,12 +311,6 @@ enum Commands {
         /// Exit 1 at the first violation without scanning the rest.
         #[arg(long = "fail-fast", default_value_t = false)]
         fail_fast: bool,
-        /// Treat unknown YAML keys in frontmatter as violations.
-        /// MVP では Frontmatter が固定スキーマのため no-op (accept するが現状
-        /// 動作に影響しない)。将来の `[options].allow_unknown_fields` 実装と
-        /// 合わせて有効化する予定。CI スクリプト互換のため accept のみ。
-        #[arg(long, default_value_t = false)]
-        strict: bool,
     },
     /// One-shot search from the command line (no MCP transport).
     /// Useful for shell scripts / skill bins where invoking the binary
@@ -919,17 +913,21 @@ fn main() -> anyhow::Result<()> {
             let total_docs = db.document_count()?;
             let total_chunks = db.chunk_count()?;
             let tags_failures = db.tags_parse_failure_count();
-            eprintln!("Documents: {total_docs}");
-            eprintln!("Chunks: {total_chunks}");
-            eprintln!("Tags parse failures: {tags_failures}");
+            // These lines are the answer to the question `status` was asked, so
+            // they go to stdout — the "No index found" branch above stays on
+            // stderr because it reports an inability to answer, not an answer.
+            // ADR-0010 settles the channel that ADR-0008 left open.
+            println!("Documents: {total_docs}");
+            println!("Chunks: {total_chunks}");
+            println!("Tags parse failures: {tags_failures}");
             let context_mode = db.read_context_mode()?.map(|m| m.as_str()).unwrap_or("off");
-            eprintln!("Context mode: {context_mode}");
+            println!("Context mode: {context_mode}");
             // Quality filter: 設定済みの threshold で filter される件数を表示
             let qf = cfg.quality_filter.clone().unwrap_or_default();
             let threshold = qf.effective_threshold();
             if threshold > 0.0 {
                 let (above, below) = db.chunk_count_by_quality(threshold)?;
-                eprintln!(
+                println!(
                     "Quality filter (threshold={threshold}): {above} passing, {below} below threshold"
                 );
             }
@@ -1154,7 +1152,6 @@ fn main() -> anyhow::Result<()> {
             format,
             no_color,
             fail_fast,
-            strict: _strict, // MVP では no-op (schema.rs 側の拡張待ち)
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             // canonicalize は使わない: walkdir は相対パスでも動作し、strip_prefix
@@ -1463,13 +1460,16 @@ fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
                 yes,
             })?;
         }
+        // `status` and `list` answer a question; `install` / `uninstall` /
+        // `tray-*` report on an action they performed. Only the first two put
+        // their output on stdout (ADR-0010).
         ServiceSubcommand::Status { service_name } => {
             let text = grooveseek::service::status::run_status(&service_name)?;
-            eprintln!("{}", text);
+            println!("{}", text);
         }
         ServiceSubcommand::List => {
             let text = grooveseek::service::status::run_list()?;
-            eprintln!("{}", text);
+            println!("{}", text);
         }
         ServiceSubcommand::TrayInstall {
             service_name,
@@ -2464,6 +2464,16 @@ mod documented_flags {
     ///
     /// `CHANGELOG.md` is left out on purpose: it records flags that *used* to
     /// exist, and a removed flag must not stay frozen by its own obituary.
+    ///
+    /// `docs/decisions/` is left out for the same reason and one more. An ADR
+    /// that explains why a flag was removed names it, which would fail the
+    /// reverse check — and ADRs are immutable once merged
+    /// ([ADR-0000](../../docs/decisions/0000-record-decisions-as-adrs.md)), so
+    /// that failure could not be repaired, only worked around. Excluding them
+    /// also tightens the forward check rather than loosening it: a flag
+    /// mentioned only in a decision record no longer counts as documented,
+    /// because a reader looking for how to use the tool does not read the
+    /// minutes.
     fn published_docs(corpus: Corpus) -> String {
         let root = repo_root();
         let mut buf = String::new();
@@ -2483,7 +2493,11 @@ mod documented_flags {
              moves with it rather than being deleted",
             docs.display()
         );
+        let decisions = docs.join("decisions");
         for entry in walkdir::WalkDir::new(&docs).into_iter().flatten() {
+            if entry.path().starts_with(&decisions) {
+                continue;
+            }
             if entry.path().extension().is_some_and(|e| e == "md")
                 && corpus.owns(entry.path())
                 && let Ok(text) = std::fs::read_to_string(entry.path())

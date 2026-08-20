@@ -173,7 +173,9 @@ tray は `127.0.0.1:<port>/api/admin/status` を polling するので、daemon �
 groove status --kb-path /path/to/knowledge-base
 ```
 
-既存 index の状態を **stderr に** 表示する (`status` は stdout に何も書かないのでパイプで受けないこと): document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
+既存 index の状態を **stdout に** 表示するので `groove status | …` が使える: document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
+
+索引がまだ無い場合、"No index found" の案内は **stderr** に出て stdout は空のままになる — 答えられなかったので結果を出していない、ということ。上の各行の**文面は凍結していない** ([docs/stability.ja.md](stability.ja.md))。2 つの件数を機械可読に取りたい場合は `groove doctor --format json` を使う。
 
 ## コマンドラインからの一発検索
 
@@ -336,8 +338,6 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 
 終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)。`--kb-path` 直下に `groove-schema.toml` が無いときは短い "no schema found" メッセージと共に exit 0 となるため、既存ワークフローへの `groove validate` 追加は実際にスキーマを書くまで非破壊。
 
-> `--strict` フラグは現状 no-op (将来のより厳格な検証モードへの前方互換のため受理されるだけ)。当面は通常の呼び出しで OK。
-
 ## 索引そのものを検査する (v0.23.0+)
 
 `groove validate` が検査するのは**文書**。`groove doctor` が検査するのは**索引**:
@@ -399,6 +399,46 @@ golden query セットに対して固定グリッドを掃引し、leave-one-que
 を出力する。tune 自身は何も適用しない。なお、このパラメータが動かせるのは
 **そもそも bm25 段に到達する** クエリだけなので、tune はまず pre-flight で実効 N
 を報告し、0 なら exit 2 で終わる。詳細は [docs/eval.ja.md](eval.ja.md) を参照。
+
+## ログを詳しく見る
+
+詳細度を上げるフラグは無い。詳細度は環境変数 **`RUST_LOG`** で決まる。
+全サブコマンドが読み、未設定なら `info` として振る舞う。
+
+```bash
+RUST_LOG=grooveseek=debug groove serve --kb-path ./knowledge-base
+RUST_LOG=grooveseek=debug groove search "query" --kb-path ./knowledge-base
+RUST_LOG=debug groove index --kb-path ./knowledge-base   # 依存クレートも含む。かなり煩い
+```
+
+実用上の設定は `grooveseek=debug`。本プロジェクト自身の target だけを上げ、
+HTTP スタックと ONNX runtime は `info` のまま残す。これで増えるもの:
+
+- **`get_best_practice` が "not found" を返したとき**、実際に探索したパスが出る。
+  レスポンス側が「テンプレートを何本試したか」しか報告しないのは意図的で、
+  パスは `[best_practice].path_templates` 由来 = **未認証の呼び出し元にサーバの
+  ディレクトリ構成を渡すことになる**ため。operator はここで見るしかない。
+- **検索が想定より当たらないとき**、全文検索側でクエリがどう組み立てられたかが
+  出る。trigram の下限を割って捨てられた断片、破棄された引用句など。詳細は
+  [docs/retrieval-pipeline.ja.md](retrieval-pipeline.ja.md)。
+
+**`RUST_LOG` の管轄外**のものが 2 つある。**どの `groove.toml` が勝ったか**は
+`info` で出るので、そもそも上げる必要がない (`loaded config source=… path=…
+trust=…`。[docs/configuration.ja.md](configuration.ja.md) 参照)。`index` の進捗
+(`Indexing …` / `  indexed: …` / `Done in …`) は logger を通さず直接書いているので、
+**どのレベルでも出る** — 制御するのは `--quiet` / `--progress` の方。
+
+ログは全サブコマンドで stderr に出るので、レベルを上げても stdout から取っている
+出力を乱さない。とくに `serve` で効く — 既定の stdio transport では stdout が
+**MCP プロトコルそのもの**なので、ログの行き先は stderr しかない。なお**ログの
+文面は安定面ではない** ([docs/stability.ja.md](stability.ja.md))。読むためのもので
+あって parse するものではない。
+
+`groove service install` で登録した daemon の場合、レベルはシェルではなく
+**サービス定義側**で決まる。systemd unit は `Environment=RUST_LOG=info` を、
+launchd plist は同等のエントリを持つので、編集して再起動する。**Windows の
+スケジュールタスクは `RUST_LOG` を一切設定しない**ので同じ既定 `info` に落ちる。
+上げたい場合はタスクが動く環境側に変数を設定する。
 
 ## Related
 

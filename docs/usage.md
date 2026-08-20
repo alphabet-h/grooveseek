@@ -173,7 +173,9 @@ The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound 
 groove status --kb-path /path/to/knowledge-base
 ```
 
-Reports on the existing index, **on stderr** (`status` writes nothing to stdout, so do not pipe it): document and chunk counts, how many documents had unparseable `tags` frontmatter, and the context mode the index was built in (`static` / `off`). A fourth line reports how many chunks pass the quality filter — only when the effective threshold is above zero, so it is absent under `[quality_filter] enabled = false` or `threshold = 0.0`.
+Reports on the existing index, **on stdout**, so `groove status | …` works: document and chunk counts, how many documents had unparseable `tags` frontmatter, and the context mode the index was built in (`static` / `off`). A fourth line reports how many chunks pass the quality filter — only when the effective threshold is above zero, so it is absent under `[quality_filter] enabled = false` or `threshold = 0.0`.
+
+When there is no index yet, the "No index found" note goes to **stderr** and stdout stays empty — the command could not answer, so it produced no result. The wording of the lines above is not frozen ([docs/stability.md](stability.md)); for the two counts in a machine-readable form use `groove doctor --format json`.
 
 ## One-shot search from the command line
 
@@ -337,8 +339,6 @@ Flags:
 
 Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
 
-> The `--strict` flag is currently a no-op (accepted for forward compatibility with future stricter checking modes). Use the regular invocation for now.
-
 ## Check the index itself (v0.23.0+)
 
 `groove validate` checks your documents. `groove doctor` checks the **index**:
@@ -401,6 +401,51 @@ or the conclusion that the defaults should stay. It applies nothing on its own.
 Note that the parameters can only move queries that **reach the bm25 stage at
 all**, so `tune` opens with a pre-flight that reports the effective N and exits
 2 when it is 0. See [docs/eval.md](eval.md).
+
+## Turning up the logging
+
+There is no verbosity flag. Verbosity comes from the **`RUST_LOG`** environment
+variable, which every subcommand reads; unset, it behaves as `info`.
+
+```bash
+RUST_LOG=grooveseek=debug groove serve --kb-path ./knowledge-base
+RUST_LOG=grooveseek=debug groove search "query" --kb-path ./knowledge-base
+RUST_LOG=debug groove index --kb-path ./knowledge-base   # dependencies too, very noisy
+```
+
+`grooveseek=debug` is the useful setting: it raises this project's own targets
+and leaves the HTTP stack and the ONNX runtime at `info`. What it adds:
+
+- **`get_best_practice` returning "not found"** logs the paths it actually
+  probed. The response deliberately reports only how many templates were tried,
+  because the paths come from `[best_practice].path_templates` and would hand an
+  unauthenticated caller the server's directory layout — so the operator reads
+  them here or not at all.
+- **A search matching less than expected** logs how the query was compiled for
+  the full-text half: which fragments were dropped below the trigram floor, and
+  which quoted phrases were discarded. See
+  [docs/retrieval-pipeline.md](retrieval-pipeline.md).
+
+Two things you might go looking for are not behind `RUST_LOG` at all. **Which
+`groove.toml` won** is logged at `info`, so it is already visible without
+raising anything: `loaded config source=… path=… trust=…` (see
+[docs/configuration.md](configuration.md)). And `index`'s progress — the
+`Indexing …`, `  indexed: …` and `Done in …` lines — is written directly rather
+than through the logger, so it appears at any level and is controlled by
+`--quiet` / `--progress` instead.
+
+Logs go to stderr on every subcommand, so raising the level never disturbs
+output being piped from stdout — which matters most for `serve`, where over the
+default stdio transport stdout **is** the MCP protocol and stderr is the only
+place logs can go. Log wording is explicitly *not* part of the stable surface
+([docs/stability.md](stability.md)): read it, do not parse it.
+
+For a daemon registered with `groove service install`, the level is set where
+the service is defined rather than in your shell. The systemd unit carries
+`Environment=RUST_LOG=info` and the launchd plist an equivalent entry; edit and
+restart to change them. The Windows scheduled task sets no `RUST_LOG` at all, so
+it falls back to the same `info` default — raising it there means setting the
+variable in the environment the task runs under.
 
 ## Related
 

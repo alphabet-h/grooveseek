@@ -103,7 +103,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
   - `--force`: desired モードを無条件に採用して記録する (`reset_for_model` 直後の DB は空)。
   - `--force` なし、DB に記録済みモードがあり desired と異なる: **DB のモードを維持**し、`groove index --force` を促す警告を stderr に出す。
   - `--force` なし、記録済みモードなし (`index_meta` に `context_mode` キーが無い、feature-46 以前の genuine な DB): DB に既に chunk があれば (= この機能より前からある既存 index) `Off` へ grandfather し、DB が空 (= 新規 index) なら desired モードを採用する。
-  - `groove status` は `read_context_mode` の値をそのまま `Context mode: static` / `Context mode: off` として stderr に出力する。
+  - `groove status` は `read_context_mode` の値をそのまま `Context mode: static` / `Context mode: off` として stdout に出力する。
 - `main.rs` は `serve` / `index` の両方で `cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false)` から同一ロジックで desired モードを算出する。この `unwrap_or(false)` は `ContextualConfig::default()` と一致させてあり、`[contextual]` セクション省略時と明示的な `enabled = false` が同じ挙動になる。
 
 ## Embedding キャッシュの解決
@@ -125,20 +125,24 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 `groove` CLI は **stdout = データ出力 / stderr = 進捗** の規約に従う:
 
-- **stdout** = そのコマンドの *結果* を、指定された形式で出す。**既定形式はコマンドごとに違う**ので parse 前に確認すること: `search` / `graph` は `--format json` が既定、`eval` / `tune` / `validate` は human-readable な text が既定 (`validate --format github` も CI annotation を出す machine-consumed 形式):
+- **stdout** = そのコマンドの *結果* を、指定された形式で出す。**既定形式はコマンドごとに違う**ので parse 前に確認すること: `search` / `graph` は `--format json` が既定、`eval` / `tune` / `validate` / `doctor` は human-readable な text が既定 (`validate --format github` も CI annotation を出す machine-consumed 形式)。**人間向けの結果もまた結果である** — `status` が下ではなくこちらに載っているのはそのため:
   - `groove search` の結果 (`print_search_results`)
   - `groove eval` の golden query 評価結果
   - `groove tune` の sweep 結果
   - `groove validate` のレポート (`print_validate_report`。`--format github` が
     CI annotation 用に出す `::error file=…` 行も含む)
+  - `groove doctor` のレポート (`print_doctor_report`)
   - `groove graph` の connection graph (`print_graph`)
-- **stderr** は人間向けの進捗 / 統計 / warning / error:
+  - `groove status` の統計 (`Documents: N`, `Chunks: N`, …)
+  - `groove service status` / `groove service list` (`run_status` / `run_list` が
+    文字列を組み立て、arm が印字する)
+- **stderr** は人間向けの進捗 / warning / error:
   - `groove index` の進捗行 (`Indexing ...`, `Done in ...`、各ファイル毎の `  indexed:` / `  renamed:` / `  deleted:`)。`--quiet` で per-file 出力を抑止 (start / found / done のサマリだけ残す)、`--progress` で `indicatif` バー (TTY) または定期 `Progress: N/M (P%)` 行 (非 TTY) に切替。両 flag は相互排他 + 既定 off (v0.7.8 追加)
-  - `groove status` の統計 (`Documents: N`, `Chunks: N`)
-  - `groove service install/uninstall/status/list` の全 message は stderr (= status / progress / 診断、規約準拠)。stdout は空。
+  - `groove status` の "No index found" — **答えられないこと**の報告なので stdout は空のまま
+  - `groove service install/uninstall/tray-install/tray-uninstall` の確認メッセージ。**行った動作**の報告であって、問われたことへの答えではない
   - すべての `tracing` / `eprintln!` 系診断メッセージ
 
-新規 subprocess test を書く場合は、`grooveseek/src/main.rs` の対応する `Commands::*` block を grep して、その subcommand が stdout / stderr のどちらに書くかを必ず先に確認する。**arm 自身ではなく helper (`print_search_results` / `print_graph` / `print_validate_report`) が出力している場合がある**点に注意。stdout に *CLI の結果* を書くのは上記 5 つだけで、`index` / `status` / `service` は stderr のみ。`serve` は別枠: CLI 出力は無いが、既定の stdio transport では **MCP プロトコル自体** が stdout を占有する (subprocess harness が drain し続けねばならないのはこのため)。grep は `println!` だけでなく **`print!` も** 対象にすること — `eval` / `tune` の text 分岐はそちらを使っている。
+新規 subprocess test を書く場合は、`grooveseek/src/main.rs` の対応する `Commands::*` block を grep して、その subcommand が stdout / stderr のどちらに書くかを必ず先に確認する。**arm 自身ではなく helper (`print_search_results` / `print_graph` / `print_validate_report` / `print_doctor_report`) が出力している場合がある**点に注意。**上の 2 つのリストを読むこと。数えないこと** — 責務分離は [ADR-0010](decisions/0010-settle-what-the-1-0-command-line-freezes.ja.md) が決着させ [docs/stability.ja.md](stability.ja.md) が凍結しており、**リストの横に書いた数はリストと別に腐る**。`serve` は別枠: CLI 出力は無いが、既定の stdio transport では **MCP プロトコル自体** が stdout を占有する (subprocess harness が drain し続けねばならないのはこのため)。grep は `println!` だけでなく **`print!` も** 対象にすること — `eval` / `tune` の text 分岐はそちらを使っている。
 
 ## 主要な依存
 

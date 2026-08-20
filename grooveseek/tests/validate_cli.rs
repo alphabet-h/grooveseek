@@ -241,28 +241,6 @@ min_length = 1
     assert!(out.contains("1 files OK"), "text summary: {out}");
 }
 
-#[test]
-fn test_validate_strict_flag_accepted_as_noop() {
-    // evaluator High #1: --strict は spec にあるが MVP では no-op。
-    // CI スクリプトで付けても parse エラーにならず exit 0 であること。
-    let Some(bin) = grooveseek_bin() else {
-        eprintln!("groove binary not built — skipping");
-        return;
-    };
-    let kb = TempKb::new("kb-validate-strict");
-    kb.write("a.md", "---\ntitle: X\n---\n# body\n");
-    let (code, _out, _err) = run(
-        &bin,
-        &[
-            "validate",
-            "--kb-path",
-            kb.path.to_str().unwrap(),
-            "--strict",
-        ],
-    );
-    assert_eq!(code, 0, "--strict must be accepted (no schema → exit 0)");
-}
-
 /// (feature-49) `validate` is the third exclusion surface, and the one that is
 /// easiest to leave behind: `validate_collect_md_files` lives in the **binary**
 /// target and reaches the shared decision through the library's public API, so

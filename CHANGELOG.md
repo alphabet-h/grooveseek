@@ -16,6 +16,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **`groove status`, `groove service status` and `groove service list` print
+  their results on stdout.** All three used to write everything to stderr, so
+  `groove status | grep Documents` received nothing — the pipe looked like it
+  would work and silently did not.
+  [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md) declared the
+  stdout/stderr split frozen but left these three explicitly unsettled;
+  [ADR-0010](docs/decisions/0010-settle-what-the-1-0-command-line-freezes.md)
+  settles them, because after 1.0.0 moving them would be a major release.
+
+  A caller redirecting with `2>&1` is unaffected. A caller capturing stderr
+  alone now reads nothing where it used to read the counts.
+
+  What stays on stderr is everything that is not an answer: `index`'s progress,
+  the confirmations from `service install` / `uninstall` / `tray-install` /
+  `tray-uninstall`, and `status`'s "No index found" — which reports an
+  inability to answer and leaves stdout empty. The **wording** of these lines is
+  still not stable; only the channel is. `groove doctor --format json` remains
+  the machine-readable route to `documents` and `chunks`.
+
 - **One implementation now answers `Host` and `Origin` wherever they are
   asked, `/mcp` included.** The two questions had four implementations —
   rmcp's for `/mcp`, and GrooveSeek's own for `/healthz` and for the admin
@@ -43,6 +62,28 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   and refusal logging on `/mcp` is bounded — rmcp wrote one line per refusal
   with no limit, and the gate carries the same one-line-a-minute budget the
   session limit has used since v0.27.0.
+
+- **An admin refusal no longer repeats the header it refused.** The 403 body
+  read `Host 'kb.example.lan' not in admin allow-list`, echoing caller-supplied
+  bytes back; `/healthz` next door and rmcp on `/mcp` both say only that the
+  header was not allowed. This surface now says the same, and the rejected
+  value goes to the log instead, where the operator who can act on it will see
+  it.
+
+- **`rebuild_index` refuses a second call while one is running.** A rebuild
+  re-embeds the whole corpus while holding the embedder and the database, so a
+  second call never ran beside the first — it queued behind it, with `search`,
+  `get_document` and `/ui` unavailable for the sum of the two. Nothing bounded
+  how many could queue: the session gate lets every non-`initialize` request
+  past without taking a seat, so `max_sessions` did not apply, and
+  `spawn_blocking` cannot be aborted, so closing the connection did not stop one
+  either. A few dozen bytes of request bought a full re-vectorisation, as many
+  times over as the caller liked.
+
+  The second caller now gets an error naming how long the running rebuild has
+  been going, instead of a wait with no upper bound. **The bound is on the MCP
+  tool**: `groove index` runs in its own process and still overlaps a served
+  rebuild.
 
 ### Security
 
@@ -73,6 +114,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Removed
 
+- **`groove validate --strict` is gone.** It was accepted and discarded — the
+  documentation said so, which made it a promise the binary did not keep: a CI
+  job that passed `--strict` believed it had asked for stricter checking and
+  had not. Giving it meaning after 1.0.0 would change what an accepted flag
+  does, which is a major release; removing it now costs nothing and adding it
+  back when `[options].allow_unknown_fields` exists is a minor one. Scripts
+  passing it will now fail to parse, which is the visible version of what was
+  already happening silently. See
+  [ADR-0010](docs/decisions/0010-settle-what-the-1-0-command-line-freezes.md).
+
 - **`kb.path` is gone from `/api/admin/status`, and from `/ui`'s status band.**
   It held the knowledge base's absolute path, which on Windows reads
   `C:\Users\<name>\...` — the operator's account name, in a JSON body and in
@@ -83,30 +134,6 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `kb.chunks`, `kb.model` — is unchanged. [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md)
   puts this surface outside the 1.0 freeze, which is why the removal happens
   now rather than during 1.x.
-
-### Changed
-
-- **An admin refusal no longer repeats the header it refused.** The 403 body
-  read `Host 'kb.example.lan' not in admin allow-list`, echoing caller-supplied
-  bytes back; `/healthz` next door and rmcp on `/mcp` both say only that the
-  header was not allowed. This surface now says the same, and the rejected
-  value goes to the log instead, where the operator who can act on it will see
-  it.
-
-- **`rebuild_index` refuses a second call while one is running.** A rebuild
-  re-embeds the whole corpus while holding the embedder and the database, so a
-  second call never ran beside the first — it queued behind it, with `search`,
-  `get_document` and `/ui` unavailable for the sum of the two. Nothing bounded
-  how many could queue: the session gate lets every non-`initialize` request
-  past without taking a seat, so `max_sessions` did not apply, and
-  `spawn_blocking` cannot be aborted, so closing the connection did not stop one
-  either. A few dozen bytes of request bought a full re-vectorisation, as many
-  times over as the caller liked.
-
-  The second caller now gets an error naming how long the running rebuild has
-  been going, instead of a wait with no upper bound. **The bound is on the MCP
-  tool**: `groove index` runs in its own process and still overlaps a served
-  rebuild.
 
 ### Fixed
 
@@ -173,6 +200,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `groove.toml.example`; it was the last shipped example still in Japanese.
 
 ### Internal
+
+- **`docs/usage.md` now documents `RUST_LOG`.** Raising the log level is the
+  first step in diagnosing a wrong `groove.toml`, a `get_best_practice` that
+  reports "not found", or a query that matches less than expected — and the
+  variable appeared nowhere a user would look. The new section says which
+  target to raise, what each level adds, and what is *not* behind it: the
+  chosen config file is logged at `info` already, and `index`'s progress does
+  not go through the logger at all.
+
+- **The flag-coverage check no longer reads `docs/decisions/`.** An ADR
+  explaining why a flag was removed has to name it, which failed the reverse
+  direction of the check — and ADRs are immutable once merged, so the failure
+  could not have been repaired, only worked around. `CHANGELOG.md` was already
+  excluded for the same reason. This tightens the forward direction rather than
+  loosening it: a flag named only in a decision record no longer counts as
+  documented, and `every_long_flag_the_binary_accepts_is_documented` still
+  passes, so none was relying on one.
 
 - **Three holes in the tests that guard the frozen surface.** The flag-coverage
   check pooled the English and Japanese documentation into one buffer, so a flag

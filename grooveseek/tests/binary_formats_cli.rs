@@ -66,9 +66,9 @@ fn run_index(bin: &std::path::Path, cfg: &std::path::Path, kb: &std::path::Path)
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Run `groove status --kb-path <kb>` and return stderr (contains
+/// Run `groove status --kb-path <kb>` and return stdout (contains
 /// `Documents: N`). Same read convention as `tests/kb_small_smoke.rs`.
-fn status_stderr(bin: &std::path::Path, kb: &std::path::Path) -> String {
+fn status_stdout(bin: &std::path::Path, kb: &std::path::Path) -> String {
     let out = Command::new(bin)
         .args(["status", "--kb-path", &kb.display().to_string()])
         .output()
@@ -78,7 +78,7 @@ fn status_stderr(bin: &std::path::Path, kb: &std::path::Path) -> String {
         "status failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stderr).into_owned()
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Issue an MCP `tools/call` for `get_document` and return the deserialized
@@ -172,7 +172,7 @@ fn test_index_does_not_abort_on_binary_mixed_kb() {
     // valid.md + minimal.pdf are indexed; broken.md (invalid UTF-8) and
     // locked.pdf (encrypted) are skipped (never upserted into the DB).
     assert!(
-        status_stderr(&bin, layout.kb()).contains("Documents: 2"),
+        status_stdout(&bin, layout.kb()).contains("Documents: 2"),
         "expected 2 indexed docs (valid.md + doc.pdf)"
     );
 }
@@ -197,7 +197,7 @@ fn test_pdf_not_indexed_without_opt_in() {
     let bin = grooveseek_bin();
     run_index(&bin, &cfg, layout.kb());
     assert!(
-        status_stderr(&bin, layout.kb()).contains("Documents: 1"),
+        status_stdout(&bin, layout.kb()).contains("Documents: 1"),
         "expected only valid.md to be indexed; doc.pdf must be ignored without \
          [parsers].enabled opt-in"
     );
@@ -262,7 +262,7 @@ fn test_prune_retains_binary_grown_past_size_cap() {
     // ① Initial index: note.md + doc.pdf = 2 documents.
     run_index(&bin, &cfg, layout.kb());
     assert!(
-        status_stderr(&bin, layout.kb()).contains("Documents: 2"),
+        status_stdout(&bin, layout.kb()).contains("Documents: 2"),
         "expected 2 docs after initial index"
     );
 
@@ -282,7 +282,7 @@ fn test_prune_retains_binary_grown_past_size_cap() {
     // ③ The size-skipped pdf's document row is retained, not pruned
     //    (Documents count unchanged).
     assert!(
-        status_stderr(&bin, layout.kb()).contains("Documents: 2"),
+        status_stdout(&bin, layout.kb()).contains("Documents: 2"),
         "size-skipped binary must be retained, not pruned"
     );
 }
@@ -416,7 +416,7 @@ fn test_index_office_formats_and_ignores_lock_file() {
     // valid.md + report.docx + book.xlsx + deck.pptx = 4; ~$lock_dummy.docx
     // is never collected as a source file.
     assert!(
-        status_stderr(&bin, layout.kb()).contains("Documents: 4"),
+        status_stdout(&bin, layout.kb()).contains("Documents: 4"),
         "expected 4 indexed docs (md + docx + xlsx + pptx); lock file must be excluded"
     );
 

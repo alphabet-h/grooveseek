@@ -378,11 +378,11 @@ fn eval_retrieves_every_binary_format_from_body_text() {
         .arg(kb.kb())
         .output()
         .expect("spawn groove status");
-    let status_err = String::from_utf8_lossy(&status.stderr);
+    let status_out = String::from_utf8_lossy(&status.stdout);
     let expected_docs = TARGETS.len() + DISTRACTORS.len();
     assert!(
-        status_err.contains(&format!("Documents: {expected_docs}")),
-        "expected {expected_docs} indexed documents, got: {status_err}"
+        status_out.contains(&format!("Documents: {expected_docs}")),
+        "expected {expected_docs} indexed documents, got: {status_out}"
     );
 
     // 3) Golden file: one query per format, each expecting only its own file.

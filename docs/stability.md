@@ -116,24 +116,28 @@ Breaking any of these requires a major version.
   the result goes to stdout and diagnostics go to stderr. Pipelines depend on
   this, so it is frozen.
 
-  Six subcommands produce a result in that sense — `search`, `graph`, `doctor`,
-  `validate`, `eval`, and `tune` — and for those six the channel is frozen.
+  The subcommands that produce a result in that sense are `search`, `graph`,
+  `doctor`, `validate`, `eval`, `tune`, `status`, `service status` and
+  `service list`, and for each of them the channel is frozen.
 
-  `serve` is the seventh and the strictest. Over the default stdio transport its
-  stdout **is** the MCP connection, so nothing else may ever be written there:
-  a single stray line corrupts the session for every client. That is frozen too,
-  as a prohibition rather than a format.
+  `serve` is the strictest case. Over the default stdio transport its stdout
+  **is** the MCP connection, so nothing else may ever be written there: a single
+  stray line corrupts the session for every client. That is frozen too, as a
+  prohibition rather than a format.
 
-  `index`, `status`, and `service` currently write everything they have to say
-  to stderr, so **`groove status | …` receives nothing**, which is worth knowing
-  before building a pipeline on it. Whether some of that is a result rather than
-  progress — `status`'s counts and `service list`'s inventory have a fair claim
-  — **is not settled, and this paragraph does not freeze it**. If those move to
-  stdout, `2>&1` consumers are unaffected and anyone capturing stderr alone
-  would need to change; that is the trade being weighed, and it will be settled
-  before 1.0.0 rather than by it. In the meantime `groove doctor --format json`
-  is the machine-readable route to the two numbers `status` leads with,
-  `documents` and `chunks`.
+  Everything else is a diagnostic and stays on stderr. That includes `index`'s
+  progress, the confirmations from `service install` / `uninstall` /
+  `tray-install` / `tray-uninstall`, and `status`'s "No index found" — which
+  reports an inability to answer rather than an answer, and leaves stdout empty.
+
+  **`status`, `service status` and `service list` used to write their results
+  to stderr**, which is the question
+  [ADR-0008](decisions/0008-declare-what-1-0-freezes.md) left open and
+  [ADR-0010](decisions/0010-settle-what-the-1-0-command-line-freezes.md)
+  settles; the changelog entry names the release that moved them. A caller that
+  redirects with `2>&1` is unaffected. A caller that captured stderr alone now
+  reads nothing, and `groove status | …` now receives the counts it always
+  looked like it would.
 
 ### Machine-readable output
 
@@ -152,9 +156,13 @@ so that silence is never mistaken for a promise.
 
 **Not stable** — see [Unstable](#unstable):
 
-- All `--format text` output, from every subcommand, plus what `status` prints.
-  It is written for people to read, and gets reworded when a clearer wording
-  turns up.
+- All `--format text` output, from every subcommand, plus what `status`,
+  `service status` and `service list` print. It is written for people to read,
+  and gets reworded when a clearer wording turns up. Their **channel** is frozen
+  (above) and their **wording** is not, so a script may rely on the counts
+  arriving on stdout but not on the shape of the line carrying them —
+  `groove doctor --format json` is the stable machine-readable route to the two
+  numbers `status` leads with, `documents` and `chunks`.
 - `graph --format dot` and `--format svg`. They are drawings: the DOT is valid
   DOT and the SVG is valid SVG, but the layout, the labels, and the colors are
   presentation and will change.
