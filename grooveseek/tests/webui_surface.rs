@@ -17,6 +17,21 @@
 //! `tests/runtime_starvation.rs` needs a route that blocks on the embedder
 //! lock. The divergence is deliberate and documented; what was missing is
 //! anything asserting it, which the last test here supplies.
+//!
+//! # What this cannot do
+//!
+//! The page's request is **read** from `callTool`, not executed. Everything
+//! about the request itself is covered that way — the target, the method, the
+//! headers, the body with its envelope and nesting, the arguments the submit
+//! handler passes — and anything the reader cannot model stops the test rather
+//! than being approximated, so a page it no longer understands fails loudly.
+//!
+//! What it cannot reach is the browser's side of the flow: that the form
+//! exists, that its listener is attached, that the handler runs to the call.
+//! Deciding those needs a JavaScript runtime, and a runtime that is absent on
+//! some machine turns a check into a skip — which is the hole this file was
+//! written to close. A finding about DOM wiring is out of scope here by
+//! design; `webui_integration.rs` is where the rendered page is exercised.
 
 mod common;
 use common::mcp::spawn_mcp_server_ephemeral;
