@@ -226,13 +226,17 @@ mod tests {
     /// join relative, so a service would write its config under whatever
     /// directory it happened to start in and read a different one next time.
     ///
-    /// **This pins the consequence, not the filter.** The filter only runs on a
-    /// real environment variable, and reaching it from here would mean setting
-    /// one — which is the thing this whole change removes. What is asserted is
+    /// **This pins the consequence, not the filter.** What is asserted here is
     /// that an empty base really does produce a relative path, so the filter
-    /// has something to prevent. `GROOVE_CONFIG_HOME= cargo test --lib
-    /// service::tests` reaches the filter itself, through
-    /// `the_wrapper_passes_the_environment_through`.
+    /// has something to prevent. The filter itself is pinned in `config.rs`, by
+    /// `an_empty_directory_variable_counts_as_unset`, which asserts the rule on
+    /// the value instead of through a variable.
+    ///
+    /// Measured, because the obvious alternative does not work: running the
+    /// suite as `GROOVE_CONFIG_HOME= cargo test` does **not** catch a broken
+    /// filter. `the_wrapper_passes_the_environment_through` compares two calls
+    /// that both go through `env_dir`, so breaking `env_dir` breaks both sides
+    /// equally and they still agree.
     #[test]
     fn an_empty_base_would_be_a_relative_path() {
         let relative = resolve_config_home_in(Some(PathBuf::new()), "svc").unwrap();
