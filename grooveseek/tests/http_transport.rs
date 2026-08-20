@@ -9,6 +9,8 @@
 //! - `/healthz` が 200 "ok" を返す
 //! - `/mcp` に JSON-RPC initialize を POST して 200 を返す
 
+mod common;
+
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -73,27 +75,17 @@ fn test_http_serve_healthz_and_initialize() {
         .spawn()
         .expect("groove serve failed to spawn");
 
-    // Reading stderr is how the address arrives, and it also keeps the pipe
-    // from filling: both pipes are captured, and one nobody empties eventually
-    // blocks the process writing to it.
+    // `common::mcp::drain_stderr` is how the address arrives, and it also keeps
+    // the pipe from filling: both pipes are captured, and one nobody empties
+    // eventually blocks the process writing to it. Shared with the other
+    // spawners rather than copied, so a change to the server's wording cannot
+    // leave this test waiting out its timeout for a server that started fine.
     let stderr = child.stderr.take().expect("stderr was piped");
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    thread::spawn(move || {
-        use std::io::BufRead;
-        let mut reported = false;
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if !reported && let Some((_, rest)) = line.split_once("listening on ") {
-                reported = true;
-                let _ = tx.send(rest.trim().trim_end_matches(')').to_string());
-            }
-        }
-    });
+    let rx = common::mcp::drain_stderr(stderr);
     let addr = match rx.recv_timeout(Duration::from_secs(60)) {
-        Ok(addr) => addr,
-        Err(_) => {
+        Ok(common::mcp::Ready::Addr(addr)) => addr,
+        // This server runs `--no-watch`, so nothing else is ever reported.
+        Ok(common::mcp::Ready::Armed) | Err(_) => {
             let _ = child.kill();
             panic!(
                 "server did not report a bound address within 60s (looking for 'listening on ')"

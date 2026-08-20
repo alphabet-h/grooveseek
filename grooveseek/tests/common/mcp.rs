@@ -5,7 +5,8 @@
 //! requests for the `search` tool.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
+use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,11 +43,48 @@ pub fn wait_http_200(url: &str, deadline: Duration) -> bool {
 }
 
 /// What the reader thread on the server's stderr reports back.
-enum Ready {
+pub enum Ready {
     /// The address the OS actually assigned, from `listening on <addr>`.
     Addr(String),
     /// The file watcher finished arming, from `watcher: watching <path>`.
     Armed,
+}
+
+/// Drain a spawned server's stderr on its own thread and report what a caller
+/// can wait for.
+///
+/// The two jobs are one job. The assigned address exists only here — the
+/// server prints it after binding — and a captured pipe nobody empties
+/// eventually blocks the process writing to it, so anything that wants the
+/// address gets the draining for free and anything that wants the draining
+/// needs to read anyway.
+///
+/// Shared rather than copied because a second parser answers a different
+/// question the moment the server's wording changes: the copy's caller would
+/// then wait out its timeout and report a failure for a server that started
+/// correctly.
+pub fn drain_stderr(stderr: ChildStderr) -> Receiver<Ready> {
+    let (tx, rx) = std::sync::mpsc::channel::<Ready>();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        let (mut said_addr, mut said_armed) = (false, false);
+        // The loop outlives both sends on purpose: it keeps the pipe empty for
+        // the life of the process, which is the other half of why it exists.
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if !said_addr && let Some((_, rest)) = line.split_once("listening on ") {
+                said_addr = true;
+                let _ = tx.send(Ready::Addr(rest.trim().trim_end_matches(')').to_string()));
+            }
+            if !said_armed && line.contains("watcher: watching ") {
+                said_armed = true;
+                let _ = tx.send(Ready::Armed);
+            }
+        }
+    });
+    rx
 }
 
 /// Start `groove serve` on an OS-assigned port and wait until it is usable.
@@ -104,26 +142,7 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
         .take()
         .expect("stderr was piped");
 
-    let (tx, rx) = std::sync::mpsc::channel::<Ready>();
-    thread::spawn(move || {
-        use std::io::BufRead;
-        let (mut said_addr, mut said_armed) = (false, false);
-        // The loop outlives both sends on purpose: it keeps the pipe empty for
-        // the life of the process, which is the other half of why it exists.
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if !said_addr && let Some((_, rest)) = line.split_once("listening on ") {
-                said_addr = true;
-                let _ = tx.send(Ready::Addr(rest.trim().trim_end_matches(')').to_string()));
-            }
-            if !said_armed && line.contains("watcher: watching ") {
-                said_armed = true;
-                let _ = tx.send(Ready::Armed);
-            }
-        }
-    });
+    let rx = drain_stderr(stderr);
 
     // 60 s upper bound: covers a first-time model download on a cold cache.
     let deadline = Instant::now() + Duration::from_secs(60);
