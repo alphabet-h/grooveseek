@@ -53,8 +53,10 @@ fn test_http_serve_healthz_and_initialize() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Spawn the HTTP server.
-    let port = pick_free_port();
+    // Spawn the HTTP server. The OS assigns the port and the server reports
+    // it; this test used to bind `127.0.0.1:0` itself, read the number, drop
+    // the listener and pass that number on the command line, which leaves a
+    // window for anything else starting a server to take it first.
     let mut child = Command::new(&bin)
         .args([
             "serve",
@@ -62,8 +64,8 @@ fn test_http_serve_healthz_and_initialize() {
             kb_dir.join("knowledge-base").to_str().unwrap(),
             "--transport",
             "http",
-            "--port",
-            &port.to_string(),
+            "--bind",
+            "127.0.0.1:0",
             "--no-watch",
         ])
         .stdout(Stdio::piped())
@@ -71,7 +73,34 @@ fn test_http_serve_healthz_and_initialize() {
         .spawn()
         .expect("groove serve failed to spawn");
 
-    let base = format!("http://127.0.0.1:{port}");
+    // Reading stderr is how the address arrives, and it also keeps the pipe
+    // from filling: both pipes are captured, and one nobody empties eventually
+    // blocks the process writing to it.
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reported = false;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if !reported && let Some((_, rest)) = line.split_once("listening on ") {
+                reported = true;
+                let _ = tx.send(rest.trim().trim_end_matches(')').to_string());
+            }
+        }
+    });
+    let addr = match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(addr) => addr,
+        Err(_) => {
+            let _ = child.kill();
+            panic!(
+                "server did not report a bound address within 60s (looking for 'listening on ')"
+            );
+        }
+    };
+    let base = format!("http://{addr}");
     let healthz_ok = wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60));
     if !healthz_ok {
         let _ = child.kill();
@@ -144,16 +173,6 @@ fn tempdir(prefix: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}-{seq}"));
     std::fs::create_dir_all(&d).unwrap();
     d
-}
-
-/// tokio なしで ephemeral port を拾う: bind して local_addr を取り、すぐ drop。
-/// 取った直後に別プロセスに取られる TOCTOU は理論上あるが、integration test の
-/// 範囲では十分。
-fn pick_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
 }
 
 fn wait_http_200(url: &str, deadline: Duration) -> bool {

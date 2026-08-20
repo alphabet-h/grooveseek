@@ -23,7 +23,7 @@
 //! between deriving it and echoing it back.
 
 mod common;
-use common::mcp::spawn_mcp_server_ephemeral;
+use common::mcp::spawn_mcp_server;
 use common::temp::TempKbLayout;
 
 use std::process::Command;
@@ -86,7 +86,7 @@ fn start(prefix: &str, config_body: &str) -> (TempKbLayout, common::mcp::ServerG
     );
     let cfg = layout.root().join("groove.toml");
     std::fs::write(&cfg, config_body).expect("write groove.toml");
-    let (guard, base) = spawn_mcp_server_ephemeral(layout.kb(), &cfg);
+    let (guard, base) = spawn_mcp_server(layout.kb(), &cfg);
     (layout, guard, base)
 }
 

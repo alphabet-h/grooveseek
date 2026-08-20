@@ -15,17 +15,6 @@ pub fn grooveseek_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_groove"))
 }
 
-/// Pick a free ephemeral TCP port via `bind 127.0.0.1:0` then drop the
-/// listener. TOCTOU between drop and the spawned server's bind exists in
-/// theory but is fine for an integration test (same approach
-/// `tests/http_transport.rs` uses).
-pub fn pick_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
 /// Poll `<url>` until 200 or `deadline` expires.
 ///
 /// **TODO (feature-34 / F-55, Windows compatibility)**: `curl -o /dev/null`
@@ -52,10 +41,31 @@ pub fn wait_http_200(url: &str, deadline: Duration) -> bool {
     false
 }
 
-/// Spawn `groove serve --transport http` against the given KB + config and
-/// wait for `/healthz` to come up. Returns `(ServerGuard, base_url)`.
-pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    let port = pick_free_port();
+/// What the reader thread on the server's stderr reports back.
+enum Ready {
+    /// The address the OS actually assigned, from `listening on <addr>`.
+    Addr(String),
+    /// The file watcher finished arming, from `watcher: watching <path>`.
+    Armed,
+}
+
+/// Start `groove serve` on an OS-assigned port and wait until it is usable.
+///
+/// **The server binds; nothing here picks a port for it.** The helpers used to
+/// bind `127.0.0.1:0`, read the number, drop the listener, and pass that number
+/// on the command line — a window in which any other test starting a server
+/// could take it. A dozen of these run in parallel inside one test binary.
+///
+/// Draining stderr is not incidental either. It has to be read from the moment
+/// the child starts, because that is where the assigned address is announced,
+/// and a pipe nobody empties eventually blocks the process writing to it. The
+/// old spawners captured stderr and read none of it, or started reading only
+/// after `/healthz` answered — which leaves the whole startup window unread.
+///
+/// `watch` decides whether the file watcher runs: `spawn_mcp_server` freezes
+/// the index for deterministic search assertions, `spawn_mcp_server_with_watch`
+/// exercises the real-disk event pipeline.
+fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard, String) {
     let bin = grooveseek_bin();
     assert!(
         bin.exists(),
@@ -63,162 +73,28 @@ pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, Str
         bin.display()
     );
 
+    let mut args = vec![
+        "--config",
+        config_path.to_str().unwrap(),
+        "serve",
+        "--kb-path",
+        kb_path.to_str().unwrap(),
+        "--transport",
+        "http",
+        "--bind",
+        "127.0.0.1:0",
+    ];
+    if !watch {
+        args.push("--no-watch");
+    }
+
     let child = Command::new(&bin)
-        .args([
-            "--config",
-            config_path.to_str().unwrap(),
-            "serve",
-            "--kb-path",
-            kb_path.to_str().unwrap(),
-            "--transport",
-            "http",
-            "--port",
-            &port.to_string(),
-            "--no-watch",
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn groove serve");
 
-    let base = format!("http://127.0.0.1:{port}");
-    let guard = ServerGuard { child: Some(child) };
-
-    // 60 s upper bound: covers BGE-small first-time DL on cold cache.
-    if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
-        // guard's Drop will reap the child; surface a useful error.
-        panic!("/healthz did not return 200 within 60s — server failed to start");
-    }
-    (guard, base)
-}
-
-/// Same as [`spawn_mcp_server`] but **without** `--no-watch`, so the
-/// watcher (= `notify-debouncer-full` -> `run_watch_loop`) starts.
-///
-/// Used by F-57 watcher_e2e where the test specifically exercises the
-/// real-disk file event pipeline. All other callers should keep using
-/// [`spawn_mcp_server`], which freezes the index state for deterministic
-/// search assertions in mmr/parent integration tests.
-pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    let port = pick_free_port();
-    let bin = grooveseek_bin();
-    assert!(
-        bin.exists(),
-        "binary not found at {} — run `cargo build` first",
-        bin.display()
-    );
-
-    let child = Command::new(&bin)
-        .args([
-            "--config",
-            config_path.to_str().unwrap(),
-            "serve",
-            "--kb-path",
-            kb_path.to_str().unwrap(),
-            "--transport",
-            "http",
-            "--port",
-            &port.to_string(),
-            // NOTE: `--no-watch` is intentionally absent here so the
-            // watcher starts. This is the only difference from
-            // `spawn_mcp_server`.
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn groove serve (with watcher)");
-
-    let base = format!("http://127.0.0.1:{port}");
-    let mut guard = ServerGuard { child: Some(child) };
-
-    if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
-        panic!("groove serve (with watcher) did not become ready on {base}/healthz within 60s");
-    }
-
-    // (AU-55) `/healthz` says the *server* is up. The watcher is armed later,
-    // on its own thread, and a test that starts editing files in between can
-    // lose the event outright — the debouncer either saw it or it did not, and
-    // no amount of polling afterwards recovers it. That is why the wait here
-    // used to be a flat `sleep(2000)`: there was no signal to wait for.
-    //
-    // There is one now, printed the moment `debouncer.watch()` succeeds.
-    //
-    // The reader thread is not optional. Both pipes are captured but nothing
-    // drained stderr, so a long-running server could block on a full pipe; this
-    // keeps it emptied for the life of the process.
-    let stderr = guard
-        .child
-        .as_mut()
-        .expect("child is present")
-        .stderr
-        .take()
-        .expect("stderr was piped");
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    thread::spawn(move || {
-        use std::io::BufRead;
-        let mut armed = false;
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if !armed && line.contains("watcher: watching ") {
-                armed = true;
-                let _ = tx.send(());
-            }
-        }
-    });
-    if rx.recv_timeout(Duration::from_secs(30)).is_err() {
-        panic!("watcher did not report itself armed within 30s (looking for 'watcher: watching ')");
-    }
-
-    (guard, base)
-}
-
-/// Spawn `groove serve --bind 127.0.0.1:0` and learn the port the OS handed
-/// out. Returns `(ServerGuard, base_url)`.
-///
-/// Why this exists beside [`spawn_mcp_server`]: that one picks a free port
-/// itself and passes `--port`, so the address is known before the server ever
-/// runs. Nothing about `--bind …:0` can be known in advance — and that is
-/// precisely the case worth testing. The Origin allow-list is derived from the
-/// **bound** address: `run_http` binds, reads `local_addr()`, and only then
-/// builds the default origins. A test that supplies the port cannot tell a
-/// correct derivation from one that echoed back the number it was given; a test
-/// that lets the OS choose can (codex P1 round 1 on PR #173, where a default
-/// built before the bind allowed `http://127.0.0.1:0` and refused the real
-/// port).
-///
-/// The port arrives on stderr, in the ready line `run_http` prints. Draining
-/// stderr on a thread is not optional, for the same reason it is not in
-/// [`spawn_mcp_server_with_watch`]: both pipes are captured, and a server whose
-/// stderr nobody reads will eventually block on a full pipe.
-pub fn spawn_mcp_server_ephemeral(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    let bin = grooveseek_bin();
-    assert!(
-        bin.exists(),
-        "binary not found at {} — run `cargo build` first",
-        bin.display()
-    );
-
-    let child = Command::new(&bin)
-        .args([
-            "--config",
-            config_path.to_str().unwrap(),
-            "serve",
-            "--kb-path",
-            kb_path.to_str().unwrap(),
-            "--transport",
-            "http",
-            // The point of this helper: the OS assigns the port, not us.
-            "--bind",
-            "127.0.0.1:0",
-            "--no-watch",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn groove serve (ephemeral bind)");
-
     let mut guard = ServerGuard { child: Some(child) };
     let stderr = guard
         .child
@@ -228,35 +104,72 @@ pub fn spawn_mcp_server_ephemeral(kb_path: &Path, config_path: &Path) -> (Server
         .take()
         .expect("stderr was piped");
 
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = std::sync::mpsc::channel::<Ready>();
     thread::spawn(move || {
         use std::io::BufRead;
-        let mut reported = false;
+        let (mut said_addr, mut said_armed) = (false, false);
+        // The loop outlives both sends on purpose: it keeps the pipe empty for
+        // the life of the process, which is the other half of why it exists.
         for line in std::io::BufReader::new(stderr)
             .lines()
             .map_while(Result::ok)
         {
-            if !reported && let Some((_, rest)) = line.split_once("listening on ") {
-                reported = true;
-                let _ = tx.send(rest.trim().trim_end_matches(')').to_string());
+            if !said_addr && let Some((_, rest)) = line.split_once("listening on ") {
+                said_addr = true;
+                let _ = tx.send(Ready::Addr(rest.trim().trim_end_matches(')').to_string()));
+            }
+            if !said_armed && line.contains("watcher: watching ") {
+                said_armed = true;
+                let _ = tx.send(Ready::Armed);
             }
         }
     });
 
-    // 60 s upper bound, matching the other spawners: covers a cold model cache.
-    let addr = match rx.recv_timeout(Duration::from_secs(60)) {
-        Ok(addr) => addr,
-        Err(_) => panic!(
-            "server did not report a bound address within 60s \
-             (looking for 'listening on ' on stderr)"
-        ),
-    };
-    let base = format!("http://{addr}");
+    // 60 s upper bound: covers a first-time model download on a cold cache.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut addr: Option<String> = None;
+    let mut armed = !watch;
+    while addr.is_none() || !armed {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ready::Addr(a)) => addr = Some(a),
+            Ok(Ready::Armed) => armed = true,
+            Err(_) => panic!(
+                "server did not become ready within 60s (address: {}, watcher armed: {armed}); \
+                 looking for 'listening on ' and 'watcher: watching ' on stderr",
+                if addr.is_some() { "yes" } else { "no" }
+            ),
+        }
+    }
+    let base = format!("http://{}", addr.expect("the loop exits with an address"));
 
     if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
         panic!("/healthz did not return 200 within 60s on {base} — server failed to start");
     }
     (guard, base)
+}
+
+/// Spawn `groove serve --transport http --no-watch` and wait for `/healthz`.
+///
+/// Returns the guard and the base URL the OS assigned. The watcher is off, so
+/// the index state is frozen and search assertions stay deterministic.
+pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
+    spawn_serve(kb_path, config_path, false)
+}
+
+/// Same as [`spawn_mcp_server`] but **with** the watcher
+/// (= `notify-debouncer-full` -> `run_watch_loop`) running.
+///
+/// Used by F-57 `watcher_e2e`, which exercises the real-disk file event
+/// pipeline. Everything else should keep using [`spawn_mcp_server`].
+///
+/// (AU-55) `/healthz` says the *server* is up. The watcher arms later, on its
+/// own thread, and a test that starts editing files in between can lose the
+/// event outright — the debouncer either saw it or it did not, and no amount of
+/// polling afterwards recovers it. That is why the wait here used to be a flat
+/// `sleep(2000)`: there was no signal to wait for. There is one now, printed
+/// the moment `debouncer.watch()` succeeds, and [`spawn_serve`] waits for it.
+pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
+    spawn_serve(kb_path, config_path, true)
 }
 
 /// RAII handle for the spawned MCP server child. Kills + reaps on Drop so
