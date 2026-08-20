@@ -1,6 +1,6 @@
-# groove への貢献
+# GrooveSeek への貢献
 
-コントリビュート検討ありがとうございます。必要最低限の開発情報をここにまとめます。
+コントリビュート検討ありがとうございます。必要最低限の開発情報をここにまとめます。製品名は GrooveSeek、インストールされるコマンドは `groove` です ([ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.ja.md))。
 
 > **English version**: [CONTRIBUTING.md](./CONTRIBUTING.md)
 
@@ -30,12 +30,18 @@ cargo test -p grooveseek --lib <name>  # 名前指定で 1 本だけ実行 (work
                                   # あるため -p が要る。--lib で integration test binary を除外)
 ```
 
+**`--lib` は `main.rs` も除外する。** バイナリ側にも `#[cfg(test)]` モジュールが
+3 つあり (CLI 表面のテストはそちら)、`--lib` では 1 本も走らない。そちらは
+`--bin groove` で拾う。どのターゲットにあるか分からない時は、絞り込みを外して
+`cargo test <name>` に全部を探させる。
+
 CI と同じ検証をローカルで再現するには、次のすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
+cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
 ```

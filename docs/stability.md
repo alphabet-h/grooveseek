@@ -156,7 +156,7 @@ so that silence is never mistaken for a promise.
   It is written for people to read, and gets reworded when a clearer wording
   turns up.
 - `graph --format dot` and `--format svg`. They are drawings: the DOT is valid
-  DOT and the SVG is valid SVG, but the layout, the labels, and the colours are
+  DOT and the SVG is valid SVG, but the layout, the labels, and the colors are
   presentation and will change.
 - The **JSON** emitted by `eval` and `tune`. Both are power-user measurement
   tools whose numbers evolve with the metrics themselves — `eval` already
@@ -333,7 +333,7 @@ A stable surface is not removed without notice:
 2. It is removed no earlier than the next **major** release.
 
 The one exception is a security defect that cannot be fixed while keeping the old
-behaviour. If that happens it will be called out at the top of the changelog entry.
+behavior. If that happens it will be called out at the top of the changelog entry.
 
 ## Depending on GrooveSeek safely
 

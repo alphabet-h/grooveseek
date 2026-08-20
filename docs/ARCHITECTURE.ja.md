@@ -46,13 +46,14 @@ groove のソース構造とデータフロー。コードを拡張・修正す�
 | `grooveseek/src/mmr.rs` | (v0.7.0+) Maximal Marginal Relevance の貪欲再ランク + 類似度キャッシュ。`mmr_select` は post-rerank の候補プールに対して動き、`[search.mmr]` 設定または per-call `mmr` パラメータで gating される |
 | `grooveseek/src/parent.rs` | (v0.7.0+) 表示時 parent retriever。`apply_parent_retriever` がヒットチャンクを `expand_adjacent` (level 整合な隣接 sibling マージ) または `expand_whole_document` (`whole_doc_threshold_tokens` 未満チャンクの全文 fallback) で拡張する。score / rank / `match_spans` は元のヒットを保ち、`content` と新フィールド `expanded_from` のみが変わる |
 | `grooveseek/src/quality.rs` | チャンク単位の品質スコアリング (長さ / 定型語 / 構造シグナル) |
-| `grooveseek/src/graph_render.rs` | 完成した connection graph を図にする。Graphviz DOT と、依存に頼らず自前でレイアウトする単体 SVG (探索結果は木なので、深さ = 列 / 兄弟順 = 行で置ける)。CLI 専用で、MCP ツールは JSON のまま |
 | `grooveseek/src/graph.rs` | ベクトルインデックス上での Connection Graph BFS。`get_connection_graph` MCP ツールと `groove graph` CLI から利用 |
+| `grooveseek/src/graph_render.rs` | 完成した connection graph を図にする。Graphviz DOT と、依存に頼らず自前でレイアウトする単体 SVG (探索結果は木なので、深さ = 列 / 兄弟順 = 行で置ける)。CLI 専用で、MCP ツールは JSON のまま |
 | `grooveseek/src/eval.rs` | `groove eval` CLI 用のリトリーバル品質評価 (opt-in)。Golden YAML を parse し、各クエリを `db.search_hybrid` で実行、recall@k / MRR / nDCG@k を計算。`<kb_path>/.groove-eval-history.json` を読み書きして前回との差分を表示。`ConfigFingerprint` (v0.7.0+) は `mmr` / `parent_retriever` / `fusion` (v0.13.0+) を optional に保持し、設定違いの eval 実行を別 history entry として区別する。いずれもビルトイン既定値と異なるときだけ記録するため、旧 baseline との比較は維持される。索引済みコーパスも走査し (v0.24.0+)、golden query を 2 件以上逐語で含む文書を stderr と `findings` に報告する (exit code は動かさない)。`serve` / `search` / `index` の挙動は一切変えない |
 | `grooveseek/src/tune.rs` | (v0.13.0+) `groove tune` CLI 用の測定ツール (opt-in)。RRF 定数と FTS5 bm25 列重みの固定グリッドを golden query セット上で掃引し、nested leave-one-query-out CV (paired SE / selection stability / 副指標の非悪化。sign test も算出して report に載せるが `decide` は参照しない) で結果をガードした上で、貼り付け可能な `[search.fusion]` スニペットか「既定値維持」の結論のどちらかを出力する。自動では何も適用せず、reranker も一切使わない。`eval` の `GoldenSet` / `compute_query_metrics` と `db::fuse_rrf_ids` を再利用する |
 | `grooveseek/src/tune/grid.rs` | (v0.15.0+) `groove tune` が掃引するパラメータ空間と、掃引中に持ち回る per-query 状態。 |
 | `grooveseek/src/tune/stats.rs` | (v0.15.0+) 採否判定の統計 — 平均・標本 SD・paired SE・sign test と、採用閾値 `ADOPT_MIN_MEAN_DELTA` / `ADOPT_SE_MULTIPLIER` / `STABILITY_MIN`。 |
 | `grooveseek/src/tune/report.rs` | (v0.15.0+) 掃引結果の stdout 向け整形 (text は `print!`、JSON 形式も)。 |
+| `grooveseek/src/test_support.rs` | **`#[cfg(test)]` 限定**。`src/**` の unit test が共有する一時ディレクトリ生成 — 全テストが同じ作り方をするために置いてある。名前は PID + ナノ秒 + **アトミックカウンタ**で、前 2 つだけでは同一プロセスの並列スレッドで衝突する (推測ではなく実測)。`Drop` guard が木ごと消す。`tempfile` crate は意図的に使わない。`tests/` 配下の integration test からは**届かない**ので、そちらは `tests/common/temp.rs` に自前の実装を持つ |
 
 ## データフロー
 

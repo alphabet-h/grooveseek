@@ -305,7 +305,7 @@ baseline taken before this existed.
 Note that history written **before v0.13.0 is incompatible regardless of
 fusion settings**: `metric_version` went 1 → 2 when the metric implementation
 was corrected, and the fingerprint is compared as a whole. Those runs are
-skipped rather than compared, which is the intended behaviour — the older
+skipped rather than compared, which is the intended behavior — the older
 numbers were computed by a different formula.
 The same holds for history written **before v0.16.0**: `fts_query_version`
 went 1 → 2 when the query-to-`MATCH` compilation changed (see
