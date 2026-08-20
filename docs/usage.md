@@ -217,7 +217,7 @@ groove search "tokio spawn" \
   --min-confidence-ratio 1.5
 ```
 
-- `--path-glob <PATTERN>` (repeatable) — include / exclude by path glob; `!`-prefix is an exclude. MCP param: `path_globs`.
+- `--path-glob <PATTERN>` (repeatable) — include / exclude by path glob; `!`-prefix is an exclude. Give it once per pattern: it does **not** split on commas, because a glob's own syntax uses them (`docs/{a,b}/**` is one pattern, not two). MCP param: `path_globs`.
 - `--tag-any <a,b,c>` — pass if the chunk has **any** of these tags. MCP param: `tags_any`.
 - `--tag-all <a,b,c>` — pass only if the chunk has **all** of these tags. MCP param: `tags_all`.
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — lex comparison; chunks with no `date` are excluded strictly when either bound is set. MCP params: `date_from` / `date_to`.

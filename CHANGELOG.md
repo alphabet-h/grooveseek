@@ -31,7 +31,42 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   tool**: `groove index` runs in its own process and still overlaps a served
   rebuild.
 
+### Fixed
+
+- **`--path-glob` split its value on commas, which no glob survives.** A glob's
+  own syntax uses commas — `docs/{a,b}/**` is one pattern — and the flag cut it
+  in half, leaving `docs/{a` to be rejected as an unclosed alternate group. The
+  MCP `path_globs` parameter takes an array and never had the problem, so the
+  same value worked over one surface and failed over the other: exactly what
+  aligning the two was meant to prevent.
+
+  `docs/usage.md` had always described this flag as **(repeatable)** and never
+  as comma-separated, so the code was the side that disagreed. `--tag-any`,
+  `--tag-all` and `--exclude-paths` keep their commas, which is their documented
+  contract — none of those values can contain one meaningfully.
+
+  If you were passing several patterns in one `--path-glob` separated by commas
+  — undocumented, and it would have broken on any pattern containing braces —
+  pass the flag once per pattern instead.
+
 ### Internal
+
+- **Three holes in the tests that guard the frozen surface.** The flag-coverage
+  check pooled the English and Japanese documentation into one buffer, so a flag
+  described in only one language satisfied it — while `docs/stability.md`, the
+  page that gives "documented" its meaning, is the English one. Each language is
+  now checked separately; both pass, which is the cheapest moment to make sure
+  they keep doing so.
+
+  The pairing tables covered two of the six MCP tools. `rebuild_index` now pairs
+  with `groove index`, and the tools that have no command behind them —
+  `get_document`, `get_best_practice` — declare their parameters and the reason
+  they have no second surface, so a parameter cannot appear on any of the six
+  unnoticed. `list_topics` is recorded as the one that takes none at all.
+
+  And the pairing rule now checks values, not only names: a flag documented as
+  repeatable must not carry a delimiter, and one documented as a comma list
+  must.
 
 - **Origin validation is now tested through a running server.** The check
   shipped in 0.27.0 with twenty-five tests, every one of them against the
