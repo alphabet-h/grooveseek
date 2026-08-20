@@ -103,12 +103,19 @@ The flag is a heuristic and has been measured, so what it is worth is written
 down here rather than inferred from the formula. Two limits matter to anyone
 deciding how much weight to put on it.
 
-**It does not fire at all when reranking is on.** A cross-encoder scores with
-logits, and an irrelevant chunk gets a strongly negative one. Over ten results
-the mean is reliably negative, and the `mean(scores) > 0.0` condition above then
-answers false for every query. Measured over 25 queries with `bge-v2-m3`:
-`low_confidence` was `false` every time, including for queries with no answer in
-the corpus. **Treat the flag as absent whenever a reranker ran.**
+**Reranking can switch it off entirely.** A cross-encoder scores with logits,
+and an irrelevant chunk gets a strongly negative one, so the mean over a result
+set is often negative — and the `mean(scores) > 0.0` condition above then
+answers false whatever the spread was. Measured with `bge-v2-m3` over 25 queries
+returning ten results each: `low_confidence` was `false` every time, including
+for queries with no answer in the corpus.
+
+Whether it happens to your queries depends on the model, the result count, and
+how relevant the returned chunks are — a small result set of genuinely good
+matches can have a positive mean, and then the ratio is compared as usual. So
+the flag is not *guaranteed* absent under reranking. What it is, is unreliable:
+**a `false` tells you nothing when a reranker ran**, because it is the same
+`false` the sign check produces. A `true` still means what the formula says.
 
 **Without a reranker it tracks retriever overlap rather than correctness.** The
 denominator is the mean of the whole result set, so what moves the ratio is how

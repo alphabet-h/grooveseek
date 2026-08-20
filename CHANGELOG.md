@@ -219,9 +219,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   trip it are explicitly outside the freeze. Measured, it tracks how much the
   two retrieval legs overlapped rather than whether the answer is right — on a
   corpus where all 25 golden queries were answered correctly at rank 1 it still
-  fired on 14 of them, and it does not fire at all when a reranker runs, because
-  cross-encoder logits make the mean negative. `docs/filters.md` records both
-  limits. No behaviour changed: no corpus-independent threshold exists, so
+  fired on 14 of them, and reranking can switch it off outright — cross-encoder
+  logits often make the mean negative, and the sign check then answers `false`
+  whatever the spread was (measured: `false` for all 25 with `bge-v2-m3`). A
+  `false` therefore tells a caller nothing when a reranker ran.
+  `docs/filters.md` records both limits. No behaviour changed: no corpus-independent threshold exists, so
   moving the default would have swapped one arbitrary number for another.
 
 - **Two `chunks_exact(2)` calls in the PDF parser became `as_chunks::<2>()`.**

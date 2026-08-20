@@ -418,35 +418,46 @@ pub(crate) struct ErrorResponse {
     error: String,
 }
 
-/// `search` MCP ツールの新出力 (feature-26、wrapper 形)。
+/// The wrapper both search surfaces answer with (feature-26).
+///
+/// Generic over the hit type because the two surfaces differ in exactly one
+/// place: an MCP hit carries a `uri` and a command-line hit does not
+/// ([`HitWithUri`] versus [`crate::db::SearchHit`]). Everything else about the
+/// shape — the key names, which fields are omitted, how the echo is built — is
+/// one implementation rather than two, so the surfaces cannot come to disagree
+/// about the response that `docs/stability.md` freezes for both of them.
+///
+/// It used to be two: this type served `/mcp`, and `main.rs` assembled its own
+/// object with `serde_json::json!`. A field renamed on one side would have left
+/// the other unchanged and every test passing.
 #[derive(Serialize)]
-struct SearchResponse {
-    results: Vec<HitWithUri>,
-    low_confidence: bool,
+pub struct SearchResponse<H> {
+    pub results: Vec<H>,
+    pub low_confidence: bool,
     /// 入力 filter のうち non-default のものだけ正規化後の値で echo back。
-    filter_applied: SearchFilterEcho,
+    pub filter_applied: SearchFilterEcho,
 }
 
 /// 入力 filter のうち non-default のものだけ echo。`null`/空配列の項目は
 /// `skip_serializing_if` で JSON から省略される。
 #[derive(Serialize, Default)]
-struct SearchFilterEcho {
+pub struct SearchFilterEcho {
     #[serde(skip_serializing_if = "Option::is_none")]
-    category: Option<String>,
+    pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    topic: Option<String>,
+    pub topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    path_globs: Option<Vec<String>>,
+    pub path_globs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tags_any: Option<Vec<String>>,
+    pub tags_any: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tags_all: Option<Vec<String>>,
+    pub tags_all: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    date_from: Option<String>,
+    pub date_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    date_to: Option<String>,
+    pub date_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    min_confidence_ratio: Option<f32>,
+    pub min_confidence_ratio: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3635,12 +3646,38 @@ mod tests {
         }
     }
 
-    /// A response with **every** optional field populated.
+    /// The two surfaces, serialized.
     ///
-    /// The point is coverage, not realism: a field that is only ever emitted
-    /// under some condition still has to appear in the contract, so the sample
-    /// has to be the maximal shape rather than a typical one.
-    fn maximal_search_response() -> serde_json::Value {
+    /// The contract freezes the MCP tool *and* `groove search --format json`,
+    /// so checking one of them would leave the other free to drift while every
+    /// test passed — which is what the command line did for as long as it
+    /// assembled its own object (codex P2 on PR #201). They now share
+    /// [`SearchResponse`], and this returns both instantiations so the checks
+    /// below cover the pair.
+    fn both_surfaces() -> (serde_json::Value, serde_json::Value) {
+        let mcp = maximal_search_response();
+        let cli = serde_json::to_value(SearchResponse {
+            results: maximal_hits(),
+            low_confidence: true,
+            filter_applied: maximal_echo(),
+        })
+        .expect("the response type serializes");
+        (mcp, cli)
+    }
+
+    /// Every field either surface can emit.
+    fn all_emitted_fields() -> BTreeSet<String> {
+        let (mcp, cli) = both_surfaces();
+        let mut out = BTreeSet::new();
+        walk_fields(&mcp, "", &mut out);
+        walk_fields(&cli, "", &mut out);
+        out
+    }
+
+    /// Hits with every optional field populated, one per `expanded_from`
+    /// variant — the two carry different keys, so a sample with one of them
+    /// shows half the shape.
+    fn maximal_hits() -> Vec<crate::db::SearchHit> {
         let hit = |expanded: crate::db::ExpandedRange| crate::db::SearchHit {
             score: 0.5,
             path: "notes/a.md".to_string(),
@@ -3653,44 +3690,54 @@ mod tests {
             match_spans: Some(vec![crate::db::MatchSpan { start: 0, end: 1 }]),
             expanded_from: Some(expanded),
         };
+        vec![
+            hit(crate::db::ExpandedRange::Adjacent {
+                from_index: 0,
+                to_index: 1,
+            }),
+            hit(crate::db::ExpandedRange::WholeDocument { total_chunks: 3 }),
+        ]
+    }
+
+    fn maximal_echo() -> SearchFilterEcho {
+        SearchFilterEcho {
+            category: Some("c".to_string()),
+            topic: Some("t".to_string()),
+            path_globs: Some(vec!["**".to_string()]),
+            tags_any: Some(vec!["a".to_string()]),
+            tags_all: Some(vec!["b".to_string()]),
+            date_from: Some("2026-01-01".to_string()),
+            date_to: Some("2026-12-31".to_string()),
+            min_confidence_ratio: Some(1.5),
+        }
+    }
+
+    /// A response with **every** optional field populated.
+    ///
+    /// The point is coverage, not realism: a field that is only ever emitted
+    /// under some condition still has to appear in the contract, so the sample
+    /// has to be the maximal shape rather than a typical one.
+    fn maximal_search_response() -> serde_json::Value {
         // Built through the real constructor so the sample cannot claim a
         // shape the server does not produce. An empty oversized list plus a
         // registry that knows `.md` is what makes `uri` present.
         let registry = md_and_pdf_registry();
         let rules = ServableRules::new(&registry, Vec::new());
-        // One result per `expanded_from` variant: the two carry different
-        // keys, and a contract that only saw one of them would leave the
-        // other outside the freeze.
-        let results: Vec<HitWithUri> = [
-            crate::db::ExpandedRange::Adjacent {
-                from_index: 0,
-                to_index: 1,
-            },
-            crate::db::ExpandedRange::WholeDocument { total_chunks: 3 },
-        ]
-        .into_iter()
-        .map(|e| {
-            let h = HitWithUri::new(hit(e), &rules);
-            assert!(
-                h.uri.is_some(),
-                "the sample must carry a uri, or the maximal shape is not maximal"
-            );
-            h
-        })
-        .collect();
+        let results: Vec<HitWithUri> = maximal_hits()
+            .into_iter()
+            .map(|h| {
+                let h = HitWithUri::new(h, &rules);
+                assert!(
+                    h.uri.is_some(),
+                    "the sample must carry a uri, or the maximal shape is not maximal"
+                );
+                h
+            })
+            .collect();
         let response = SearchResponse {
             results,
             low_confidence: true,
-            filter_applied: SearchFilterEcho {
-                category: Some("c".to_string()),
-                topic: Some("t".to_string()),
-                path_globs: Some(vec!["**".to_string()]),
-                tags_any: Some(vec!["a".to_string()]),
-                tags_all: Some(vec!["b".to_string()]),
-                date_from: Some("2026-01-01".to_string()),
-                date_to: Some("2026-12-31".to_string()),
-                min_confidence_ratio: Some(1.5),
-            },
+            filter_applied: maximal_echo(),
         };
         serde_json::to_value(&response).expect("the response type serializes")
     }
@@ -3722,8 +3769,7 @@ mod tests {
     /// the promise in `docs/stability.md` cover less than it appears to.
     #[test]
     fn every_field_a_search_can_answer_with_is_in_the_contract() {
-        let mut emitted = BTreeSet::new();
-        walk_fields(&maximal_search_response(), "", &mut emitted);
+        let emitted = all_emitted_fields();
         let documented = contract_fields();
         let missing: Vec<&String> = emitted.difference(&documented).collect();
         assert!(
@@ -3740,8 +3786,7 @@ mod tests {
     /// checks for the same reason.
     #[test]
     fn the_contract_does_not_name_fields_a_search_cannot_answer_with() {
-        let mut emitted = BTreeSet::new();
-        walk_fields(&maximal_search_response(), "", &mut emitted);
+        let emitted = all_emitted_fields();
         let documented = contract_fields();
         let extra: Vec<&String> = documented.difference(&emitted).collect();
         assert!(
@@ -3749,6 +3794,30 @@ mod tests {
             "the contract lists fields the search response cannot produce: {extra:?}\n\
              Either the field was removed and the table was not, or the sample in \
              `maximal_search_response` stopped covering it."
+        );
+    }
+
+    /// The contract says `uri` is the one field the two surfaces differ on.
+    /// That is a claim about both of them, so it is checked on both rather
+    /// than inferred from the type that carries it.
+    #[test]
+    fn uri_is_the_only_field_the_two_surfaces_differ_on() {
+        let (mcp_value, cli_value) = both_surfaces();
+        let mut mcp = BTreeSet::new();
+        walk_fields(&mcp_value, "", &mut mcp);
+        let mut cli = BTreeSet::new();
+        walk_fields(&cli_value, "", &mut cli);
+
+        let only_mcp: Vec<&String> = mcp.difference(&cli).collect();
+        assert_eq!(
+            only_mcp,
+            vec!["results[].uri"],
+            "the contract says a uri is what an MCP hit adds, and nothing else"
+        );
+        let only_cli: Vec<&String> = cli.difference(&mcp).collect();
+        assert!(
+            only_cli.is_empty(),
+            "the command line must not answer with a field the tool cannot: {only_cli:?}"
         );
     }
 
