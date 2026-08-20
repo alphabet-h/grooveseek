@@ -496,6 +496,10 @@ impl Config {
             let dir = path.as_deref().and_then(Path::parent);
             config.restrict_untrusted(path.as_deref(), dir, roots)?;
         }
+        // **restriction の後**。ここより前で見ると、破棄される予定の
+        // `allowed_origins` を理由に全コマンドが起動しなくなる —
+        // `validate_allowed_origins` の doc がその経緯を持っている。
+        config.validate_allowed_origins()?;
         Ok(Discovered {
             config,
             source,
@@ -834,7 +838,9 @@ impl Config {
     /// - `[search.fusion].rrf_k` が有限かつ `>= 1.0`
     /// - `[search.fusion].bm25_*_weight` が有限かつ `>= 0.0`
     /// - `[search.fusion]` の 3 重みが全て `0.0` でない
-    /// - `[transport.http].allowed_origins` の各 entry が rmcp の照合まで届く
+    ///
+    /// `[transport.http].allowed_origins` の綴りは**ここでは見ない**。
+    /// [`Self::validate_allowed_origins`] が理由を持っている。
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
             // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
@@ -914,36 +920,48 @@ impl Config {
             }
         }
 
-        // `allowed_origins` の綴り。ここが唯一のゲートである事情は
-        // `[search.fusion]` と同じ — 下流に silent path があり、その先で
-        // 落ちても誰にも見えない。違うのは silent path の中身で、あちらは
-        // bind parameter が NaN を通すこと、こちらは rmcp が解釈できない
-        // entry を照合直前に捨てること (`check_origin_entry` 参照)。
-        //
-        // 空リストは合法。`[]` は「Origin 検証をしない」という文書化された
-        // 表明で、`run_http` が起動時に warn を出す。ループが回らないだけ。
-        //
-        // 発見された config も同じ扱いになる。`restrict_untrusted` が
-        // `allowed_origins` を落とすのは `load_from` の**後**なので、綴りが
-        // 壊れていればここで起動を拒む。値域チェック (`rrf_k` 等) が既に
-        // そうなっており、黙って動くより見える形で止まるほうがよい。
-        if let Some(origins) = self
+        Ok(())
+    }
+
+    /// `[transport.http].allowed_origins` の各 entry が rmcp の照合まで届くか。
+    ///
+    /// **`validate()` と分けてあるのは、呼ぶ時点が違うから。** 発見された
+    /// config の `allowed_origins` は `restrict_untrusted` が破棄するので、
+    /// 破棄される値を `load_from` の中で検証すると「**使われない値のせいで
+    /// 全コマンドが起動しない**」になる — そういう `groove.toml` を含む repo を
+    /// clone しただけで、CLI 側で安全な値を渡していても止まる。
+    ///
+    /// `[search.fusion]` の値域チェックと同じ場所に置いたのが誤りだった。
+    /// あちらは**発見された config でも honour される**値で、検証する対象と
+    /// 使われる対象が一致している。こちらは一致しない。
+    ///
+    /// 呼ぶのは [`Self::discover_in`] の restriction の**後**、1 箇所だけ。
+    pub(crate) fn validate_allowed_origins(&self) -> Result<()> {
+        let Some(origins) = self
             .transport
             .as_ref()
             .and_then(|t| t.http.as_ref())
             .and_then(|h| h.allowed_origins.as_ref())
-        {
-            for entry in origins {
-                if let Err(why) = crate::transport::http::check_origin_entry(entry) {
-                    anyhow::bail!(
-                        "[transport.http].allowed_origins: {why}, got {entry:?}. An entry \
-                         rmcp cannot parse is dropped before matching, which leaves Origin \
-                         validation switched on with nothing to match: every request \
-                         carrying an Origin header is then refused with 403, and nothing \
-                         says why. Note this key is stricter than allowed_hosts, which \
-                         accepts a bare host or host:port."
-                    );
-                }
+        else {
+            return Ok(());
+        };
+        // 空リストは合法。`[]` は「Origin 検証をしない」という文書化された
+        // 表明で、`run_http` が起動時に warn を出す。ループが回らないだけ。
+        for entry in origins {
+            if let Err(why) = crate::transport::http::check_origin_entry(entry) {
+                // この文面は stderr に出るので AGENTS.md の ASCII 規約が掛かる。
+                // `{entry:?}` (= `Debug`) は**印字可能な非 ASCII をそのまま通す**
+                // ので、IDN を含む entry が CP932 コンソールで mojibake になる。
+                // `escape_default` は非 ASCII を `\u{...}` に落とす。
+                let shown = entry.escape_default();
+                anyhow::bail!(
+                    "[transport.http].allowed_origins: {why}, got \"{shown}\". An entry \
+                     rmcp cannot parse is dropped before matching, which leaves Origin \
+                     validation switched on with nothing to match: every request \
+                     carrying an Origin header is then refused with 403, and nothing \
+                     says why. Note this key is stricter than allowed_hosts, which \
+                     accepts a bare host or host:port."
+                );
             }
         }
         Ok(())
@@ -3054,17 +3072,23 @@ lambda = 0.5
     /// on with nothing to match — so the server 403s every browser, including
     /// its own `/ui`, and the log is silent. Refusing the config is the only
     /// place this is still visible.
+    ///
+    /// Goes through `discover_in` rather than calling the check directly,
+    /// because **when** it runs is half of what it has to get right.
     #[test]
     fn an_origin_entry_that_never_reaches_the_comparison_stops_the_load() {
-        let toml = r#"
-[transport.http]
-allowed_origins = ["127.0.0.1:3100"]
-"#;
-        let cfg: Config = toml::from_str(toml).expect("the key parses; the value is the problem");
-        let err = cfg
-            .validate()
+        let dir = TempDir::new("groove-origins-named");
+        let named = dir.path().join("groove.toml");
+        std::fs::write(
+            &named,
+            "kb_path = \"kb\"\n\n[transport.http]\nallowed_origins = [\"127.0.0.1:3100\"]\n",
+        )
+        .unwrap();
+        let roots = roots_for(None, None);
+
+        let err = Config::discover_in(Some(&named), dir.path(), None, &roots)
             .expect_err("an entry rmcp would drop must not reach a running server");
-        let msg = format!("{err}");
+        let msg = format!("{err:#}");
         assert!(
             msg.contains("[transport.http].allowed_origins"),
             "the message must name the key, got {msg:?}"
@@ -3079,6 +3103,40 @@ allowed_origins = ["127.0.0.1:3100"]
         );
     }
 
+    /// The other half, and the one that is easy to get backwards: a config
+    /// groove merely *found* has its `allowed_origins` discarded, so checking
+    /// the spelling before the discard would refuse a value that was never
+    /// going to be used — a `groove.toml` in a cloned repository could then
+    /// stop every command, however safe the values on the command line.
+    ///
+    /// `[search.fusion]`'s range checks live in `validate()` and are not this
+    /// shape: those values *are* honoured from a discovered config, so what is
+    /// checked and what is used are the same thing. Here they are not.
+    #[test]
+    fn a_planted_origin_entry_is_discarded_rather_than_fatal() {
+        let dir = TempDir::new("groove-origins-planted");
+        let planted = format!(
+            "{}allowed_origins = [\"127.0.0.1:3100\"]\n",
+            planted_toml("kb")
+        );
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots)
+            .expect("a discovered config must not be able to stop the command");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let http = d
+            .config
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives");
+        assert!(
+            http.allowed_origins.is_none(),
+            "the planted list is dropped, which is why validating it first was wrong"
+        );
+    }
+
     /// Not every list is checked into oblivion: `[]` is the documented way to
     /// turn Origin validation off, and `run_http` warns about it at startup.
     /// Validation must not be the thing that refuses it.
@@ -3090,7 +3148,7 @@ allowed_origins = []
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            cfg.validate().is_ok(),
+            cfg.validate_allowed_origins().is_ok(),
             "an empty list is documented as disabling validation, not as a typo"
         );
     }
@@ -3103,8 +3161,31 @@ allowed_origins = []
 allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        cfg.validate()
+        cfg.validate_allowed_origins()
             .expect("examples/deployments/intranet-http ships exactly this list");
+    }
+
+    /// The rejected value reaches stderr, where AGENTS.md requires ASCII: a
+    /// Japanese Windows console is CP932 and renders anything else as mojibake.
+    /// `Debug` keeps printable non-ASCII as-is, so an internationalized host
+    /// name would have travelled through intact.
+    #[test]
+    fn a_rejected_entry_is_escaped_before_it_reaches_the_console() {
+        let toml = "[transport.http]\nallowed_origins = [\"\u{4f8b}\u{3048}.jp:3100\"]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate_allowed_origins()
+                .expect_err("no scheme, so it is refused")
+        );
+        assert!(
+            msg.is_ascii(),
+            "a diagnostic has to survive a CP932 console, got {msg:?}"
+        );
+        assert!(
+            msg.contains("\\u{4f8b}"),
+            "the operator still has to recognise which entry it was, got {msg:?}"
+        );
     }
 
     /// The planted value must not be used — but dropping it, rather than

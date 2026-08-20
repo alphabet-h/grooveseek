@@ -172,6 +172,32 @@ fn an_explicit_entry_is_the_one_that_gets_matched() {
     );
 }
 
+/// Whether a padded entry survives is not a question to settle by reading.
+///
+/// `check_origin_entry` trims before deciding, on the grounds that rmcp's
+/// `parse_origin_value` opens with `value.trim()` and is the only consumer of
+/// the allow-list. If that were wrong, the entry would be dropped exactly where
+/// we promised it would pass, and the server would answer 403 to every browser
+/// — the failure the check exists to prevent, reintroduced by the check itself.
+///
+/// So it is measured. The origin sent here matches the entry only after the
+/// padding is gone.
+#[test]
+fn an_entry_with_padding_is_still_honoured_by_the_server() {
+    const PUBLIC_ORIGIN: &str = "https://kb.example.com";
+    let (_kb, _guard, base) = start(
+        "groove-origin-padded",
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"  https://kb.example.com  \"]\n",
+    );
+
+    assert_eq!(
+        post_initialize(&base, Some(PUBLIC_ORIGIN)),
+        "200",
+        "a padded entry was dropped before matching; check_origin_entry must \
+         stop trimming, because the parser it mirrors no longer does"
+    );
+}
+
 /// The defect this pair of changes exists for.
 ///
 /// `allowed_hosts` takes a bare `host:port` — its parser falls back to reading

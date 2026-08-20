@@ -1670,6 +1670,29 @@ mod tests {
         assert_eq!(check_origin_entry("https://kb.example.com/mcp"), Ok(()));
     }
 
+    /// Padding is accepted **because rmcp trims first**: `parse_origin_value`
+    /// opens with `let value = value.trim();` (`tower.rs:782`) and is the only
+    /// consumer of the allow-list — `origin_is_allowed` maps every entry
+    /// through it (`:805`). Our own warning helper trims as well, in
+    /// `NormalizedAuthority::from_allowed_entry`.
+    ///
+    /// So this is not leniency, it is the mirror staying accurate. Should rmcp
+    /// ever stop trimming, the entry would be dropped where we said it would
+    /// pass — the failure this check exists to prevent — which is why the claim
+    /// is measured through a running server in `tests/http_origin.rs` rather
+    /// than asserted here alone.
+    #[test]
+    fn padding_is_accepted_because_the_parser_we_mirror_trims() {
+        for entry in [" https://kb.example.com ", "\thttp://127.0.0.1:3100\n"] {
+            assert_eq!(
+                check_origin_entry(entry),
+                Ok(()),
+                "{entry:?} reaches rmcp's comparison, so refusing it here would \
+                 stop a config that works"
+            );
+        }
+    }
+
     /// Empty and whitespace-only entries: rmcp drops these too.
     #[test]
     fn an_entry_with_nothing_in_it_is_refused() {
