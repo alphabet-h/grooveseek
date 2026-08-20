@@ -97,16 +97,31 @@ pub(crate) fn backend() -> Box<dyn ServiceBackend> {
 /// `<config_dir>/groove/<service-name>/` を返す。
 /// 優先順: (1) `GROOVE_CONFIG_HOME` env var、(2) `dirs::config_dir()` (= XDG_CONFIG_HOME / OS 標準)。
 pub(crate) fn resolve_config_home(service_name: &str) -> Result<PathBuf> {
-    // 空文字は未設定として扱う (BU-07)。通してしまうと base が空になり、
-    // `base.join("groove").join(name)` が **CWD 相対**のパスになる — service の
-    // config をカレントディレクトリ配下に書き、起動のたびに違う場所を見る。
-    let base = crate::config::env_dir("GROOVE_CONFIG_HOME")
-        .or_else(dirs::config_dir)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "config dir 解決失敗 (GROOVE_CONFIG_HOME / XDG_CONFIG_HOME / HOME いずれも未設定)"
-            )
-        })?;
+    resolve_config_home_in(crate::config::env_dir("GROOVE_CONFIG_HOME"), service_name)
+}
+
+/// [`resolve_config_home`] の、環境変数を**引数で受ける**版。
+///
+/// **env を読むのは呼び出し側 1 箇所だけ**にするためにある。テストが
+/// `GROOVE_CONFIG_HOME` を `set_var` で立てると、同じプロセスで並走している
+/// テストにも見える — そして `TrustRoots::from_env` が**同じ変数を trust root
+/// として読む** (`config.rs`)。つまり env を立てたテストの隣で `discover()` を
+/// 呼んでいるテストの**信頼判定が変わる**。落ちるのは env を触った方ではない。
+///
+/// `config.rs` は既にこの形で、`discover` が `discover_in` に
+/// `TrustRoots::from_env()` を渡すだけになっている。ここが最後の 1 箇所だった。
+pub(crate) fn resolve_config_home_in(
+    config_home: Option<PathBuf>,
+    service_name: &str,
+) -> Result<PathBuf> {
+    // 空文字は未設定として扱う (BU-07) — `env_dir` の責務。通してしまうと base が
+    // 空になり、`base.join("groove").join(name)` が **CWD 相対**のパスになる =
+    // service の config をカレントディレクトリ配下に書き、起動のたびに違う場所を見る。
+    let base = config_home.or_else(dirs::config_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "config dir 解決失敗 (GROOVE_CONFIG_HOME / XDG_CONFIG_HOME / HOME いずれも未設定)"
+        )
+    })?;
     Ok(base.join("groove").join(service_name))
 }
 
@@ -148,24 +163,80 @@ mod tests {
         assert!(validate_service_name("日本語").is_err());
     }
 
+    /// The same assertion this test always made, reached without mutating the
+    /// process environment.
+    ///
+    /// It used to `set_var("GROOVE_CONFIG_HOME", …)` and put it back afterwards,
+    /// with a SAFETY note claiming nothing else mutated env beside it. True as
+    /// far as it went, and beside the point: the hazard is not another *writer*,
+    /// it is every concurrent *reader*. `TrustRoots::from_env` reads this same
+    /// variable to decide which directories are trusted, so any test calling
+    /// `Config::discover()` while this one held the variable would have seen
+    /// `/tmp/groove-test-override` as a trust root — and failed somewhere else,
+    /// intermittently, for a reason not visible from where it failed.
     #[test]
     fn resolve_config_home_uses_env_var_when_set() {
-        let original = std::env::var("GROOVE_CONFIG_HOME").ok();
-        // SAFETY: edition 2024 made env mutation unsafe due to thread-safety
-        // 懸念。本 test は service::tests 内に閉じており他 env mutation と並走しない。
-        unsafe {
-            std::env::set_var("GROOVE_CONFIG_HOME", "/tmp/groove-test-override");
-        }
-        let result = resolve_config_home("svc").unwrap();
+        let result =
+            resolve_config_home_in(Some(PathBuf::from("/tmp/groove-test-override")), "svc")
+                .unwrap();
         assert_eq!(
             result,
             PathBuf::from("/tmp/groove-test-override/groove/svc")
         );
-        unsafe {
-            match original {
-                Some(v) => std::env::set_var("GROOVE_CONFIG_HOME", v),
-                None => std::env::remove_var("GROOVE_CONFIG_HOME"),
-            }
-        }
+    }
+
+    /// With nothing supplied it falls back to the OS config directory, and the
+    /// service name is still the last component. The base is whatever this
+    /// machine reports, so the shape is what can be asserted.
+    #[test]
+    fn resolve_config_home_falls_back_to_the_os_config_dir() {
+        let Some(expected_base) = dirs::config_dir() else {
+            // No HOME / XDG_CONFIG_HOME: the function is documented to fail.
+            assert!(resolve_config_home_in(None, "svc").is_err());
+            return;
+        };
+        assert_eq!(
+            resolve_config_home_in(None, "svc").unwrap(),
+            expected_base.join("groove").join("svc")
+        );
+    }
+
+    /// The wrapper still reads the variable.
+    ///
+    /// Every other test here calls `resolve_config_home_in` directly, so none
+    /// of them notices if `resolve_config_home` stops passing `env_dir(…)` —
+    /// the wiring could be cut and the suite would stay green. This compares
+    /// the two, which catches that.
+    ///
+    /// **It only bites where the variable is set.** With it unset both sides
+    /// take the `dirs::config_dir()` fallback and agree no matter what the
+    /// wrapper passes, so on an ordinary CI run this asserts nothing. Run it as
+    /// `GROOVE_CONFIG_HOME=/tmp/probe cargo test --lib service::tests` to
+    /// exercise it — reading the variable the harness was started with is not
+    /// mutation, and does not reach the tests running alongside.
+    #[test]
+    fn the_wrapper_passes_the_environment_through() {
+        assert_eq!(
+            resolve_config_home("svc").unwrap(),
+            resolve_config_home_in(crate::config::env_dir("GROOVE_CONFIG_HOME"), "svc").unwrap(),
+        );
+    }
+
+    /// (BU-07) An empty `GROOVE_CONFIG_HOME` must not reach here as
+    /// `Some("")` — `env_dir` filters it, because an empty base makes the join
+    /// relative and puts a service's config under whatever directory it happens
+    /// to start in. This pins the filter rather than trusting the comment.
+    #[test]
+    fn an_empty_env_value_never_becomes_a_relative_base() {
+        // SAFETY: no env mutation — this reads the rule directly.
+        assert_eq!(
+            crate::config::env_dir("GROOVE_CONFIG_HOME_DEFINITELY_UNSET_a9f3"),
+            None
+        );
+        let relative = resolve_config_home_in(Some(PathBuf::new()), "svc").unwrap();
+        assert!(
+            relative.is_relative(),
+            "an empty base would produce {relative:?}; this is what env_dir exists to stop"
+        );
     }
 }
