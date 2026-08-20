@@ -222,21 +222,28 @@ mod tests {
         );
     }
 
-    /// (BU-07) An empty `GROOVE_CONFIG_HOME` must not reach here as
-    /// `Some("")` — `env_dir` filters it, because an empty base makes the join
-    /// relative and puts a service's config under whatever directory it happens
-    /// to start in. This pins the filter rather than trusting the comment.
+    /// (BU-07) Why `env_dir` filters an empty value: an empty base makes the
+    /// join relative, so a service would write its config under whatever
+    /// directory it happened to start in and read a different one next time.
+    ///
+    /// **This pins the consequence, not the filter.** The filter only runs on a
+    /// real environment variable, and reaching it from here would mean setting
+    /// one — which is the thing this whole change removes. What is asserted is
+    /// that an empty base really does produce a relative path, so the filter
+    /// has something to prevent. `GROOVE_CONFIG_HOME= cargo test --lib
+    /// service::tests` reaches the filter itself, through
+    /// `the_wrapper_passes_the_environment_through`.
     #[test]
-    fn an_empty_env_value_never_becomes_a_relative_base() {
-        // SAFETY: no env mutation — this reads the rule directly.
-        assert_eq!(
-            crate::config::env_dir("GROOVE_CONFIG_HOME_DEFINITELY_UNSET_a9f3"),
-            None
-        );
+    fn an_empty_base_would_be_a_relative_path() {
         let relative = resolve_config_home_in(Some(PathBuf::new()), "svc").unwrap();
         assert!(
             relative.is_relative(),
-            "an empty base would produce {relative:?}; this is what env_dir exists to stop"
+            "an empty base produced {relative:?}; this is what env_dir exists to stop"
+        );
+        assert_eq!(
+            crate::config::env_dir("GROOVE_CONFIG_HOME_DEFINITELY_UNSET_a9f3"),
+            None,
+            "an unset variable is None, so the fallback is what runs"
         );
     }
 }
