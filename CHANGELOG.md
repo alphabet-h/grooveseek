@@ -16,6 +16,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **`groove status`, `groove service status` and `groove service list` print
+  their results on stdout.** All three used to write everything to stderr, so
+  `groove status | grep Documents` received nothing — the pipe looked like it
+  would work and silently did not.
+  [ADR-0008](docs/decisions/0008-declare-what-1-0-freezes.md) declared the
+  stdout/stderr split frozen but left these three explicitly unsettled;
+  [ADR-0010](docs/decisions/0010-settle-what-the-1-0-command-line-freezes.md)
+  settles them, because after 1.0.0 moving them would be a major release.
+
+  A caller redirecting with `2>&1` is unaffected. A caller capturing stderr
+  alone now reads nothing where it used to read the counts.
+
+  What stays on stderr is everything that is not an answer: `index`'s progress,
+  the confirmations from `service install` / `uninstall` / `tray-install` /
+  `tray-uninstall`, and `status`'s "No index found" — which reports an
+  inability to answer and leaves stdout empty. The **wording** of these lines is
+  still not stable; only the channel is. `groove doctor --format json` remains
+  the machine-readable route to `documents` and `chunks`.
+
 - **One implementation now answers `Host` and `Origin` wherever they are
   asked, `/mcp` included.** The two questions had four implementations —
   rmcp's for `/mcp`, and GrooveSeek's own for `/healthz` and for the admin

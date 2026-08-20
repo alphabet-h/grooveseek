@@ -19,8 +19,8 @@
 //!    skip fast path (would leave a stale title baked into `context_text`);
 //!    a frontmatter-only change to unrelated fields (e.g. `tags`, title
 //!    unchanged) must still take the fast path (no re-embed).
-//! 5. (controller follow-up) `groove status` displays `Context mode: ...`
-//!    and the config/DB mismatch warning lands on stderr. The `status`
+//! 5. (controller follow-up) `groove status` displays `Context mode: ...` on
+//!    stdout, and the config/DB mismatch warning lands on stderr. The `status`
 //!    display half needs no embedding model at all (`Commands::Status`
 //!    never touches the embedder) and runs as a normal, non-`#[ignore]`
 //!    test against a hand-built DB file; the warning-text half is only
@@ -77,7 +77,8 @@ fn run_index(bin: &Path, cfg: &Path, kb: &Path, force: bool) -> String {
 }
 
 /// Run `groove [--config cfg] status --kb-path <kb>`, asserting exit 0, and
-/// return stripped stderr.
+/// return stripped stdout. The counts are the command's result, so they are on
+/// stdout (ADR-0010); only the "No index found" branch stays on stderr.
 fn run_status(bin: &Path, cfg: Option<&Path>, kb: &Path) -> String {
     let mut args = Vec::new();
     if let Some(c) = cfg {
@@ -96,7 +97,7 @@ fn run_status(bin: &Path, cfg: Option<&Path>, kb: &Path) -> String {
         "status failed:\nstderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    strip_ansi(&String::from_utf8_lossy(&out.stderr))
+    strip_ansi(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Run `groove [--config cfg] search <query> --kb-path <kb> --format json`,
@@ -257,7 +258,7 @@ fn test_contextual_on_search_hits_via_context_and_status_shows_static() {
     let status = run_status(&bin, Some(&cfg), layout.kb());
     assert!(
         status.contains("Context mode: static"),
-        "expected 'Context mode: static' in status stderr, got:\n{status}"
+        "expected 'Context mode: static' in status stdout, got:\n{status}"
     );
 }
 
@@ -493,7 +494,7 @@ fn create_modern_context_db(path: &Path, mode: &str) {
     .expect("create modern schema db");
 }
 
-/// `groove status` displays `Context mode: static` on stderr. `status`
+/// `groove status` displays `Context mode: static` on stdout. `status`
 /// never constructs an `Embedder` (see `Commands::Status` in
 /// `src/main.rs`), so this needs neither `groove index` nor a model
 /// download -- a hand-built DB file with `index_meta.context_mode` set
@@ -513,7 +514,7 @@ fn test_status_shows_context_mode_static_without_model_download() {
     let status = run_status(&bin, None, layout.kb());
     assert!(
         status.contains("Context mode: static"),
-        "expected 'Context mode: static' in status stderr, got:\n{status}"
+        "expected 'Context mode: static' in status stdout, got:\n{status}"
     );
     assert!(status.contains("Documents: 1"), "got:\n{status}");
     assert!(status.contains("Chunks: 1"), "got:\n{status}");

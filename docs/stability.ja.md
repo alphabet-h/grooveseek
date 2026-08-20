@@ -109,22 +109,26 @@ loopback origin** である。
 - **stdout と stderr の責務分離**: コマンドが**結果**を出すなら、結果は stdout、
   診断は stderr。パイプラインが依存するので凍結する。
 
-  その意味で結果を出すのは 6 つ — `search` / `graph` / `doctor` / `validate` /
-  `eval` / `tune`。**この 6 つについては出力先を凍結する**。
+  その意味で結果を出すのは `search` / `graph` / `doctor` / `validate` /
+  `eval` / `tune` / `status` / `service status` / `service list`。
+  **これらについては出力先を凍結する**。
 
-  **7 つ目の `serve` が最も厳しい。** 既定の stdio transport では、その stdout が
+  **`serve` が最も厳しい。** 既定の stdio transport では、その stdout が
   **MCP 接続そのもの**であり、他のものを書いてはならない — 1 行混ざるだけで
   全クライアントのセッションが壊れる。これも凍結対象で、形式ではなく**禁止**として。
 
-  `index` / `status` / `service` は**現状すべて stderr に書く**ので、
-  **`groove status | …` には何も流れない**。パイプラインを組む前に知っておく価値がある。
-  そのうちどこまでが進捗ではなく「結果」なのか — `status` の件数や
-  `service list` の一覧には相応の言い分がある — は**未決であり、
-  この段落はそれを凍結しない**。stdout に移した場合、`2>&1` で受けている側は影響を受けず、
-  stderr だけを捕まえている側が直す必要がある。その天秤を **1.0.0 までに**決める
-  (1.0.0 が決めてしまうのではなく)。当面、`status` が最初に出す 2 つの数
-  (`documents` / `chunks`) を機械可読に取る経路は `groove doctor --format json`
-  である。
+  それ以外はすべて診断であり stderr に留まる。`index` の進捗、
+  `service install` / `uninstall` / `tray-install` / `tray-uninstall` の確認、
+  そして `status` の "No index found" — これは答えではなく**答えられないこと**の
+  報告なので、その場合 stdout は空になる。
+
+  **`status` / `service status` / `service list` はかつて結果を stderr に
+  書いていた**。それが [ADR-0008](decisions/0008-declare-what-1-0-freezes.ja.md)
+  の残した未決事項であり、
+  [ADR-0010](decisions/0010-settle-what-the-1-0-command-line-freezes.ja.md)
+  が決着させた (移したリリースは CHANGELOG が示す)。`2>&1` で受けている側は
+  影響を受けない。stderr だけを捕まえていた側には何も届かなくなり、
+  `groove status | …` には、ずっとそう見えていたとおりに件数が流れる。
 
 ### 機械可読な出力
 
@@ -143,8 +147,12 @@ loopback origin** である。
 
 **安定ではない** — [非安定](#非安定-unstable)を参照:
 
-- **すべてのサブコマンドの `--format text` 出力**と、`status` が印字するもの。
-  人間が読むために書かれており、より良い言い回しが見つかれば書き換える
+- **すべてのサブコマンドの `--format text` 出力**と、`status` / `service status` /
+  `service list` が印字するもの。人間が読むために書かれており、より良い言い回しが
+  見つかれば書き換える。**出力先は凍結する (上記) が、文面は凍結しない** — 件数が
+  stdout に届くことには依存してよいが、それを載せる行の形には依存できない。
+  `status` が最初に出す 2 つの数 (`documents` / `chunks`) を機械可読に取る
+  安定した経路は `groove doctor --format json` である
 - `graph --format dot` と `--format svg`。**これは図である**: DOT は妥当な DOT、
   SVG は妥当な SVG だが、レイアウト・ラベル・配色は見せ方であって変わる
 - `eval` と `tune` が出す **JSON**。どちらも指標そのものが良くなっていく前提の

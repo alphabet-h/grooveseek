@@ -84,19 +84,20 @@ fn test_kb_small_indexes_six_documents() {
     build_index(layout.kb());
 
     // `groove status` prints a human-readable block starting with `Documents: <N>`
-    // to **stderr** (= matches the rest of `Commands::Index` / `Commands::Status` in
-    // `src/main.rs`, which reserve stdout for data output like search JSON results
-    // and use stderr for status/progress reporting).
+    // to **stdout**: the counts are what the command was asked for, and ADR-0010
+    // settles that a result belongs on stdout even when it is meant for a human.
+    // `Commands::Index` still reports its progress on stderr, and so does the
+    // "No index found" branch of `Commands::Status` -- neither is an answer.
     let bin = grooveseek_bin();
     let out = Command::new(&bin)
         .args(["status", "--kb-path", &layout.kb().display().to_string()])
         .output()
         .expect("groove status");
     assert!(out.status.success(), "groove status failed: {:?}", out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("Documents: 6"),
-        "expected `Documents: 6` in status stderr, got:\n{stderr}"
+        stdout.contains("Documents: 6"),
+        "expected `Documents: 6` in status stdout, got:\n{stdout}"
     );
 }
 

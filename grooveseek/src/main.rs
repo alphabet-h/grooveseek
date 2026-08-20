@@ -913,17 +913,21 @@ fn main() -> anyhow::Result<()> {
             let total_docs = db.document_count()?;
             let total_chunks = db.chunk_count()?;
             let tags_failures = db.tags_parse_failure_count();
-            eprintln!("Documents: {total_docs}");
-            eprintln!("Chunks: {total_chunks}");
-            eprintln!("Tags parse failures: {tags_failures}");
+            // These lines are the answer to the question `status` was asked, so
+            // they go to stdout — the "No index found" branch above stays on
+            // stderr because it reports an inability to answer, not an answer.
+            // ADR-0010 settles the channel that ADR-0008 left open.
+            println!("Documents: {total_docs}");
+            println!("Chunks: {total_chunks}");
+            println!("Tags parse failures: {tags_failures}");
             let context_mode = db.read_context_mode()?.map(|m| m.as_str()).unwrap_or("off");
-            eprintln!("Context mode: {context_mode}");
+            println!("Context mode: {context_mode}");
             // Quality filter: 設定済みの threshold で filter される件数を表示
             let qf = cfg.quality_filter.clone().unwrap_or_default();
             let threshold = qf.effective_threshold();
             if threshold > 0.0 {
                 let (above, below) = db.chunk_count_by_quality(threshold)?;
-                eprintln!(
+                println!(
                     "Quality filter (threshold={threshold}): {above} passing, {below} below threshold"
                 );
             }
@@ -1456,13 +1460,16 @@ fn run_service(action: ServiceSubcommand) -> anyhow::Result<()> {
                 yes,
             })?;
         }
+        // `status` and `list` answer a question; `install` / `uninstall` /
+        // `tray-*` report on an action they performed. Only the first two put
+        // their output on stdout (ADR-0010).
         ServiceSubcommand::Status { service_name } => {
             let text = grooveseek::service::status::run_status(&service_name)?;
-            eprintln!("{}", text);
+            println!("{}", text);
         }
         ServiceSubcommand::List => {
             let text = grooveseek::service::status::run_list()?;
-            eprintln!("{}", text);
+            println!("{}", text);
         }
         ServiceSubcommand::TrayInstall {
             service_name,

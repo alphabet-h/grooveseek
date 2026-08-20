@@ -173,7 +173,9 @@ The tray polls `127.0.0.1:<port>/api/admin/status`, so the daemon must be bound 
 groove status --kb-path /path/to/knowledge-base
 ```
 
-Reports on the existing index, **on stderr** (`status` writes nothing to stdout, so do not pipe it): document and chunk counts, how many documents had unparseable `tags` frontmatter, and the context mode the index was built in (`static` / `off`). A fourth line reports how many chunks pass the quality filter — only when the effective threshold is above zero, so it is absent under `[quality_filter] enabled = false` or `threshold = 0.0`.
+Reports on the existing index, **on stdout**, so `groove status | …` works: document and chunk counts, how many documents had unparseable `tags` frontmatter, and the context mode the index was built in (`static` / `off`). A fourth line reports how many chunks pass the quality filter — only when the effective threshold is above zero, so it is absent under `[quality_filter] enabled = false` or `threshold = 0.0`.
+
+When there is no index yet, the "No index found" note goes to **stderr** and stdout stays empty — the command could not answer, so it produced no result. The wording of the lines above is not frozen ([docs/stability.md](stability.md)); for the two counts in a machine-readable form use `groove doctor --format json`.
 
 ## One-shot search from the command line
 

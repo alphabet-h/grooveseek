@@ -173,7 +173,9 @@ tray は `127.0.0.1:<port>/api/admin/status` を polling するので、daemon �
 groove status --kb-path /path/to/knowledge-base
 ```
 
-既存 index の状態を **stderr に** 表示する (`status` は stdout に何も書かないのでパイプで受けないこと): document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
+既存 index の状態を **stdout に** 表示するので `groove status | …` が使える: document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
+
+索引がまだ無い場合、"No index found" の案内は **stderr** に出て stdout は空のままになる — 答えられなかったので結果を出していない、ということ。上の各行の**文面は凍結していない** ([docs/stability.ja.md](stability.ja.md))。2 つの件数を機械可読に取りたい場合は `groove doctor --format json` を使う。
 
 ## コマンドラインからの一発検索
 
