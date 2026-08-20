@@ -86,6 +86,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   — undocumented, and it would have broken on any pattern containing braces —
   pass the flag once per pattern instead.
 
+- **`groove-schema.toml.example` offered two field types the schema refuses.**
+  The comment listed `"integer"` and `"date"` among its `type` values;
+  `schema.rs` rejects both at compile time, because frontmatter is held as
+  strings throughout and neither is implemented. Anyone following the template's
+  own documentation met a schema that would not load. The body was always
+  right — it already expresses a date as a string with a pattern — so it was the
+  comment above it that was wrong. The file is also now in English, matching
+  `groove.toml.example`; it was the last shipped example still in Japanese.
+
 ### Internal
 
 - **Three holes in the tests that guard the frozen surface.** The flag-coverage
@@ -119,6 +128,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   supplies the port cannot tell that apart from one that echoes it. And they run
   in ordinary `cargo test`, without `--ignore` and without a feature flag, so a
   regression fails the pull request that causes it rather than the next nightly.
+
+- **`/ui` and the request it sends are now exercised through a running
+  server.** The page started searching through `/mcp` in v0.27.0 and nothing
+  asserted since that the request it sends is one the server accepts — the
+  existing web UI tests are feature-gated and ignored, which is right for the
+  ones that build an index and wrong for a check PR CI therefore never runs.
+  Five tests, none ignored or gated: the page is served, the handshake-free
+  `tools/call` it sends is accepted, dropping the protocol header is refused
+  (which is what gives the previous one meaning), `/api/search` is absent from a
+  shipped server, and `/ui` refuses a foreign `Host`.
+
+  The request reads its protocol version out of the page rather than restating
+  it, and a separate assertion pins the page to rmcp's `STANDARD_HEADERS`. Both
+  are needed: measured, a page pinned to `LATEST` still gets a result, because
+  rmcp accepts a handshake-free call on known older versions — so the live test
+  alone would not have caught the mistake most likely to be made.
 
 ## [0.27.0] - 2026-08-18
 

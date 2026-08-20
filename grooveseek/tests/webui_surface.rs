@@ -54,12 +54,18 @@ fn curl(args: &[&str]) -> String {
 
 /// The version string the page actually pins, read out of the page.
 ///
-/// Written out rather than hard-coded here: a copy would let the page be
-/// changed to a version the server refuses while this file kept sending the
-/// one that works, and the test would pass for a `/ui` that cannot search.
-/// `src/transport/http.rs` separately pins the page against rmcp's
-/// `STANDARD_HEADERS`; this asserts the softer, more important half — whatever
-/// the page pins is accepted by the server it talks to.
+/// Read out rather than hard-coded: a copy would let the page be changed to a
+/// version the server refuses while this file kept sending the one that works,
+/// and the test would pass for a `/ui` that cannot search.
+///
+/// **What that does and does not catch, measured.** Setting the page to
+/// `1999-01-01` fails the test below, so a version rmcp does not know is
+/// caught. Setting it to `2025-11-25` — rmcp's `LATEST`, and the wrong choice
+/// here — **passes**: rmcp accepts a handshake-free call on known older
+/// versions too. So this half only proves the page names something the server
+/// will take. Which version it must name is pinned in
+/// `src/transport/http.rs`, against `STANDARD_HEADERS`, and that assertion is
+/// the one that catches the plausible mistake.
 fn version_the_page_pins() -> &'static str {
     const PAGE: &str = include_str!("../src/transport/webui_index.html");
     const MARKER: &str = "const MCP_VERSION = \"";

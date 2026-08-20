@@ -1819,16 +1819,21 @@ mod tests {
         );
     }
 
-    /// `/ui` calls `/mcp` with no handshake, which rmcp allows only for
-    /// requests carrying the SEP-2243 standard headers — so the version in the
-    /// page has to be `STANDARD_HEADERS`.
+    /// `/ui` calls `/mcp` with no handshake, and `STANDARD_HEADERS` is the
+    /// version that defines that mode — rmcp documents it as the first
+    /// requiring SEP-2243 standard HTTP headers. That is what the page names.
     ///
     /// **Not `LATEST`.** In rmcp 3.1.2 the two are deliberately different:
     /// `LATEST` is `2025-11-25`, the newest version the SDK negotiates, and
-    /// `STANDARD_HEADERS` is `2026-07-28`, the first that carries the protocol
-    /// in headers. `server.rs` reports `LATEST` in `initialize` and is right to.
-    /// Reaching for that same constant here is the obvious move and it fails
-    /// today, which is the whole reason this assertion names the other one.
+    /// `STANDARD_HEADERS` is `2026-07-28`. `server.rs` reports `LATEST` in
+    /// `initialize` and is right to; reaching for the same constant here is the
+    /// obvious move, and **this is the only place that catches it**.
+    ///
+    /// Measured, because the reverse would have been easy to assume: a page
+    /// pinned to `LATEST` still gets a result from a running server, since rmcp
+    /// accepts a handshake-free call on known older versions too. The live test
+    /// in `tests/webui_surface.rs` only notices a version rmcp has never heard
+    /// of. Leniency today is not the contract, so the pin stays here.
     #[test]
     fn the_page_names_the_protocol_version_that_allows_a_handshake_free_call() {
         let page = include_str!("webui_index.html");
