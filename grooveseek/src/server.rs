@@ -1087,47 +1087,21 @@ impl KbCore {
         }
     }
 
-    fn rebuild_index_blocking(&self, params: RebuildIndexParams) -> String {
+    /// The slot is claimed by the caller and handed over, not taken here.
+    ///
+    /// It has to be, because this body does not run when the request arrives.
+    /// `run_blocking` gives the closure to Tokio's blocking pool, and a
+    /// saturated pool queues it — a check made in here would run whenever the
+    /// closure was finally scheduled, which can be *after* the rebuild it should
+    /// have been refused for finished. The second rebuild would then be accepted
+    /// and the outage doubled, which is the thing the slot exists to prevent
+    /// (codex P2 on PR #187).
+    ///
+    /// Holding the slot for the length of this call is also what
+    /// `/api/admin/status` reads to report indexing.active=true (codex P2 rounds
+    /// 1 and 4 on PR #57).
+    fn rebuild_index_blocking(&self, params: RebuildIndexParams, _slot: RebuildSlot) -> String {
         let force = params.force.unwrap_or(false);
-
-        // codex P2 round 1 + P2 round 4 on PR #57: flip `indexing_state` to
-        // `Some` while the rebuild runs so `/api/admin/status` reports
-        // indexing.active=true. Use a refcount (`active_count`) so concurrent
-        // rebuild_index calls don't clear each other's state — first caller
-        // sets Some(count=1), subsequent callers ++count; on Drop, --count
-        // and clear the slot to None only when reaching 0.
-        //
-        // (BU-18) Both halves recover from a poisoned lock rather than skipping.
-        // Skipping the decrement is the worse failure: the slot keeps a count
-        // no rebuild owns, so `/api/admin/status` reports `indexing.active=true`
-        // for the rest of the process's life. The payload is plain data, so
-        // there is nothing to repair before using it.
-        struct IndexingGuard(Arc<Mutex<Option<IndexingState>>>);
-        impl Drop for IndexingGuard {
-            fn drop(&mut self) {
-                let mut guard = recover(self.0.lock(), "indexing_state");
-                if let Some(s) = guard.as_mut() {
-                    s.active_count = s.active_count.saturating_sub(1);
-                    if s.active_count == 0 {
-                        *guard = None;
-                    }
-                }
-            }
-        }
-        {
-            let mut guard = recover(self.indexing_state.lock(), "indexing_state");
-            match guard.as_mut() {
-                Some(s) => s.active_count += 1,
-                None => {
-                    *guard = Some(IndexingState {
-                        started_at: std::time::SystemTime::now(),
-                        progress: None,
-                        active_count: 1,
-                    });
-                }
-            }
-        }
-        let _indexing_guard = IndexingGuard(Arc::clone(&self.indexing_state));
 
         // Lock order: embedder first, then db (consistent with search)
         let mut embedder = recover(self.embedder.lock(), "embedder");
@@ -1300,8 +1274,22 @@ impl KbServer {
         description = "Rebuild the search index by scanning all source files in the knowledge base (Markdown plus any other extensions enabled via `[parsers].enabled` in groove.toml)."
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
+        // Claimed here, in the handler, rather than inside the closure below —
+        // see `rebuild_index_blocking`. The refusal has to be decided when the
+        // request arrives, not whenever the blocking pool gets round to it.
+        //
+        // This does not violate BU-06, which says a handler must not touch
+        // `db` / `embedder` / `reranker`: `indexing_state` is a mutex over a
+        // two-field struct, held for the length of one comparison.
+        let slot = match claim_rebuild_slot(&self.core.indexing_state) {
+            Ok(slot) => slot,
+            Err(started_at) => return rebuild_already_running(started_at),
+        };
         let core = Arc::clone(&self.core);
-        run_blocking("rebuild_index", move || core.rebuild_index_blocking(params)).await
+        run_blocking("rebuild_index", move || {
+            core.rebuild_index_blocking(params, slot)
+        })
+        .await
     }
 
     #[tool(
@@ -2574,17 +2562,81 @@ pub struct KbServerShared {
     pub allowed_admin_hosts: Vec<String>,
 }
 
+/// The one rebuild in progress, or `None`.
+///
+/// This used to carry a refcount, because two HTTP clients could both reach
+/// `rebuild_index` before the first finished and the first caller's guard would
+/// otherwise clear a slot the second still occupied (codex P2 round 4 on
+/// PR #57). Counting was the right answer while both were allowed to run; now
+/// only one is, so a count that can never exceed 1 would only describe a
+/// situation the code refuses to create. See [`claim_rebuild_slot`].
 #[derive(Debug)]
 pub struct IndexingState {
     pub started_at: std::time::SystemTime,
     pub progress: Option<IndexingProgress>,
-    /// (codex P2 round 4 on PR #57) Concurrent rebuild_index refcount.
-    /// Two HTTP clients can both reach `rebuild_index` before the first
-    /// finishes — without a refcount, the first caller's Drop guard would
-    /// clear the shared slot while the second is still running. Now: start
-    /// = `Some(count=1)` or `+=1` on existing; drop = `-=1` and clear to
-    /// `None` only when reaching 0.
-    pub active_count: u32,
+}
+
+/// An RAII claim on the single rebuild slot. Dropping it frees the slot.
+pub struct RebuildSlot(Arc<Mutex<Option<IndexingState>>>);
+
+impl Drop for RebuildSlot {
+    fn drop(&mut self) {
+        // (BU-18) Recover from a poisoned lock rather than skipping. Skipping
+        // is much the worse failure here: the slot would stay occupied for the
+        // rest of the process's life, `/api/admin/status` would report an index
+        // in progress forever, and every later rebuild would be refused by a
+        // rebuild that is not running. The payload is plain data, so there is
+        // nothing to repair before using it.
+        *recover(self.0.lock(), "indexing_state") = None;
+    }
+}
+
+/// What a caller is told when the slot is already taken.
+///
+/// The elapsed time is the useful part: "wait" without a number gives no way to
+/// tell a rebuild that is nearly done from one that just started.
+fn rebuild_already_running(started_at: std::time::SystemTime) -> String {
+    let secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    serde_json::to_string_pretty(&ErrorResponse {
+        error: format!(
+            "A rebuild is already running (started {secs}s ago). Wait for it to \
+             finish and call again: each rebuild re-embeds the whole corpus, and \
+             search is unavailable while one runs."
+        ),
+    })
+    .unwrap_or_default()
+}
+
+/// Take the rebuild slot, or report when the rebuild already holding it began.
+///
+/// `rebuild_index` re-embeds the whole corpus while holding the embedder and
+/// the database, so a second call does not run alongside the first — it queues
+/// behind it, and search is unavailable for the sum of the two. Nothing bounded
+/// how many could queue: `mcp_session_gate` lets every non-`initialize` request
+/// past without taking a seat, so `max_sessions` does not apply, and
+/// `spawn_blocking` cannot be aborted, so closing the connection does not stop
+/// one either. A few dozen bytes of request bought a full re-vectorisation of
+/// the corpus, as many times over as the caller liked.
+///
+/// Refusing the second caller is the whole fix, and it is worth noting what it
+/// is not: this bounds the MCP tool. `groove index` runs in its own process and
+/// calls the indexer directly, so a CLI rebuild still overlaps a served one.
+///
+/// The check and the claim share one critical section deliberately. Two callers
+/// that both read the slot before either wrote to it would both find it empty.
+fn claim_rebuild_slot(
+    slot: &Arc<Mutex<Option<IndexingState>>>,
+) -> Result<RebuildSlot, std::time::SystemTime> {
+    let mut guard = recover(slot.lock(), "indexing_state");
+    if let Some(running) = guard.as_ref() {
+        return Err(running.started_at);
+    }
+    *guard = Some(IndexingState {
+        started_at: std::time::SystemTime::now(),
+        progress: None,
+    });
+    drop(guard);
+    Ok(RebuildSlot(Arc::clone(slot)))
 }
 
 #[derive(Clone, Debug)]
@@ -3802,6 +3854,83 @@ mod tests {
             "spans cover {highlighted} of {} bytes; merging must not approximate \
              \"highlight everything\"",
             content.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // claim_rebuild_slot: one rebuild at a time
+    // -----------------------------------------------------------------------
+
+    /// The slot is what makes `rebuild_index` single-flight, and the reason it
+    /// needs to be is not throughput: a rebuild holds the embedder and the
+    /// database for its whole duration, so a second one does not run beside the
+    /// first, it queues behind it with search unavailable throughout. Nothing
+    /// else bounds how many can queue — the session gate lets every
+    /// non-`initialize` call past without a seat.
+    #[test]
+    fn the_second_caller_is_refused_and_told_when_the_first_began() {
+        let slot: Arc<Mutex<Option<IndexingState>>> = Arc::new(Mutex::new(None));
+
+        let first = claim_rebuild_slot(&slot).expect("the slot starts free");
+        let started = match claim_rebuild_slot(&slot) {
+            Ok(_) => panic!("a second rebuild took the slot while the first held it"),
+            Err(started_at) => started_at,
+        };
+
+        // The refusal carries a time so the caller can say how long to wait.
+        assert!(
+            started.elapsed().is_ok(),
+            "the refusal must report when the running rebuild started"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn releasing_the_slot_lets_the_next_rebuild_in() {
+        let slot: Arc<Mutex<Option<IndexingState>>> = Arc::new(Mutex::new(None));
+
+        drop(claim_rebuild_slot(&slot).expect("the slot starts free"));
+
+        claim_rebuild_slot(&slot).expect("a finished rebuild must not lock the slot shut");
+    }
+
+    /// The refusal is a tool result, so it has to be the error envelope every
+    /// other failure uses — a client that can read one can read this.
+    #[test]
+    fn the_refusal_is_the_same_error_envelope_as_every_other_failure() {
+        let started = std::time::SystemTime::now() - std::time::Duration::from_secs(42);
+        let body = rebuild_already_running(started);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("the refusal must be JSON a client can read");
+        let message = parsed["error"]
+            .as_str()
+            .expect("the refusal must use the `error` envelope");
+        assert!(
+            message.contains("42s ago"),
+            "the refusal must say how long the running rebuild has been going, \
+             or the caller cannot tell one that is nearly done from one that \
+             just started: {message}"
+        );
+    }
+
+    /// Holding the slot is also what `/api/admin/status` reads to say an index
+    /// is in progress, so the two cannot drift: there is one piece of state.
+    #[test]
+    fn the_slot_is_occupied_exactly_while_a_rebuild_holds_it() {
+        let slot: Arc<Mutex<Option<IndexingState>>> = Arc::new(Mutex::new(None));
+        assert!(slot.lock().expect("fresh mutex").is_none());
+
+        let held = claim_rebuild_slot(&slot).expect("the slot starts free");
+        assert!(
+            slot.lock().expect("fresh mutex").is_some(),
+            "status would report no indexing while a rebuild runs"
+        );
+
+        drop(held);
+        assert!(
+            slot.lock().expect("fresh mutex").is_none(),
+            "status would report indexing forever after one finished"
         );
     }
 

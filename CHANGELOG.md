@@ -14,6 +14,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **`rebuild_index` refuses a second call while one is running.** A rebuild
+  re-embeds the whole corpus while holding the embedder and the database, so a
+  second call never ran beside the first — it queued behind it, with `search`,
+  `get_document` and `/ui` unavailable for the sum of the two. Nothing bounded
+  how many could queue: the session gate lets every non-`initialize` request
+  past without taking a seat, so `max_sessions` did not apply, and
+  `spawn_blocking` cannot be aborted, so closing the connection did not stop one
+  either. A few dozen bytes of request bought a full re-vectorisation, as many
+  times over as the caller liked.
+
+  The second caller now gets an error naming how long the running rebuild has
+  been going, instead of a wait with no upper bound. **The bound is on the MCP
+  tool**: `groove index` runs in its own process and still overlaps a served
+  rebuild.
+
 ### Internal
 
 - **Origin validation is now tested through a running server.** The check
