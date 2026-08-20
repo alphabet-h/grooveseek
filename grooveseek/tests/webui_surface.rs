@@ -124,6 +124,19 @@ fn fetch_call() -> &'static str {
         1,
         "callTool now makes more than one request; this reads only the first"
     );
+    // Reading `callTool` proves nothing if the page stopped searching through
+    // it. Two `fetch` calls exist: this one and the admin-status poll. A third
+    // would be a path to the server that nothing here describes.
+    assert_eq!(
+        PAGE.matches("fetch(").count(),
+        2,
+        "the page makes a request this file does not know about"
+    );
+    assert!(
+        PAGE.contains("await callTool(\"search\""),
+        "the page's search no longer goes through callTool, so reading callTool \
+         describes a function nothing calls"
+    );
     let rest = body
         .split_once("await fetch")
         .expect("callTool calls fetch")
