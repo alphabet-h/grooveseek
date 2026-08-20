@@ -139,10 +139,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (which is what gives the previous one meaning), `/api/search` is absent from a
   shipped server, and `/ui` refuses a foreign `Host`.
 
-  The request reads its protocol version out of the page rather than restating
-  it, and a separate assertion pins the page to rmcp's `STANDARD_HEADERS`. Both
-  are needed: measured, a page pinned to `LATEST` still gets a result, because
-  rmcp accepts a handshake-free call on known older versions — so the live test
+  The request is **read out of the page**, not transcribed: the `fetch` target,
+  the method, the headers, and the stringified body with its envelope and
+  nesting all come from `callTool`. Anything the reader cannot model stops the
+  test rather than being skipped — a computed target, an unrecognised value, an
+  option the replay does not implement, a body that is no longer
+  JSON-stringified — because a shape it cannot read must never be reported as a
+  shape that matches. A transcribed request passes happily while the page it
+  claims to describe has changed.
+
+  A separate assertion pins the page to rmcp's `STANDARD_HEADERS`. Both are
+  needed: measured, a page pinned to `LATEST` still gets a result, because rmcp
+  accepts a handshake-free call on known older versions — so the live test
   alone would not have caught the mistake most likely to be made.
 
 ## [0.27.0] - 2026-08-18
