@@ -145,6 +145,184 @@ fn the_default_list_names_the_port_the_os_actually_assigned() {
     );
 }
 
+/// Setting the key replaces the default rather than extending it, and this is
+/// the end of that sentence: the entry an operator writes is the one that is
+/// matched, and the loopback origin that used to work no longer does. It also
+/// answers the question the refusal test cannot — that a *correctly* spelled
+/// entry reaches rmcp's comparison at all, so the check added in front of it
+/// is not simply refusing everything.
+#[test]
+fn an_explicit_entry_is_the_one_that_gets_matched() {
+    const PUBLIC_ORIGIN: &str = "https://kb.example.com";
+    let (_kb, _guard, base) = start(
+        "groove-origin-explicit",
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"https://kb.example.com\"]\n",
+    );
+
+    assert_eq!(
+        post_initialize(&base, Some(PUBLIC_ORIGIN)),
+        "200",
+        "the origin named in the config was refused"
+    );
+    assert_eq!(
+        post_initialize(&base, Some(&base)),
+        "403",
+        "the loopback origin still passed ({base}); setting the key is \
+         documented as replacing the default list, not adding to it"
+    );
+}
+
+/// Whether a padded entry survives is not a question to settle by reading.
+///
+/// `check_origin_entry` trims before deciding, on the grounds that rmcp's
+/// `parse_origin_value` opens with `value.trim()` and is the only consumer of
+/// the allow-list. If that were wrong, the entry would be dropped exactly where
+/// we promised it would pass, and the server would answer 403 to every browser
+/// — the failure the check exists to prevent, reintroduced by the check itself.
+///
+/// So it is measured. The origin sent here matches the entry only after the
+/// padding is gone.
+#[test]
+fn an_entry_with_padding_is_still_honoured_by_the_server() {
+    const PUBLIC_ORIGIN: &str = "https://kb.example.com";
+    let (_kb, _guard, base) = start(
+        "groove-origin-padded",
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"  https://kb.example.com  \"]\n",
+    );
+
+    assert_eq!(
+        post_initialize(&base, Some(PUBLIC_ORIGIN)),
+        "200",
+        "a padded entry was dropped before matching; check_origin_entry must \
+         stop trimming, because the parser it mirrors no longer does"
+    );
+}
+
+/// A command that opens no socket must not care what this key says.
+///
+/// The check sat in config loading for one revision, which meant a typo in an
+/// HTTP-only setting stopped `index`, `search` and `validate` as well —
+/// measured, not theorised: `groove validate`, which reads Markdown and exits,
+/// refused to run. It now lives in `Transport::resolve`'s HTTP arm, so this
+/// asserts the blast radius rather than the fix.
+///
+/// `validate` is the cheapest witness available: no model, no database, and
+/// with no schema file it exits 0 after a single line.
+#[test]
+fn a_command_with_no_http_transport_ignores_a_broken_origin_list() {
+    let layout = TempKbLayout::new("groove-origin-unrelated-cmd");
+    layout.write("note.md", "---\ntitle: Note\n---\n\n## body\n\nOne.\n");
+    let cfg = layout.root().join("groove.toml");
+    std::fs::write(
+        &cfg,
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"127.0.0.1:3100\"]\n",
+    )
+    .expect("write groove.toml");
+
+    let out = Command::new(common::mcp::grooveseek_bin())
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "validate",
+            "--kb-path",
+            layout.kb().to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn groove validate");
+
+    assert!(
+        out.status.success(),
+        "an HTTP-only setting stopped a command that never reads it; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The defect this pair of changes exists for.
+///
+/// `allowed_hosts` takes a bare `host:port` — its parser falls back to reading
+/// the whole string as a host — so the spelling travels one key over, where
+/// rmcp's origin parser requires a scheme, cannot find one, and drops the entry
+/// with `filter_map`. The list stays non-empty, so validation stays *on* with
+/// nothing left to match, and every request carrying an `Origin` is refused.
+/// Nothing warns: `names_a_loopback_host` strips the scheme optionally, reads
+/// the host as `127.0.0.1`, and concludes the list covers loopback.
+///
+/// So the server has to refuse to start. Reaching a listening state at all
+/// would mean shipping the 403.
+#[test]
+fn an_entry_rmcp_would_drop_stops_the_server_from_starting() {
+    let layout = TempKbLayout::new("groove-origin-scheme-less");
+    layout.write("note.md", "---\ntitle: Note\n---\n\n## body\n\nOne.\n");
+    let cfg = layout.root().join("groove.toml");
+    std::fs::write(
+        &cfg,
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"127.0.0.1:3100\"]\n",
+    )
+    .expect("write groove.toml");
+
+    let mut child = Command::new(common::mcp::grooveseek_bin())
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "serve",
+            "--kb-path",
+            layout.kb().to_str().unwrap(),
+            "--transport",
+            "http",
+            "--bind",
+            "127.0.0.1:0",
+            "--no-watch",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn groove serve");
+
+    // Polled rather than `output()`: if the guard ever regresses the server
+    // starts and serves, and `output()` would hang this test forever instead of
+    // failing it. A regression has to be reported, not waited on.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the server was still running after 30s with an entry rmcp \
+                     drops; it would answer 403 to every browser, including /ui"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    };
+    assert!(
+        !status.success(),
+        "groove serve exited successfully with an unusable Origin allow-list"
+    );
+
+    let mut stderr = String::new();
+    use std::io::Read as _;
+    child
+        .stderr
+        .take()
+        .expect("stderr was piped")
+        .read_to_string(&mut stderr)
+        .expect("read stderr");
+    let stderr = common::ansi::strip_ansi(&stderr);
+    for needle in [
+        "[transport.http].allowed_origins",
+        "127.0.0.1:3100",
+        "scheme",
+        "allowed_hosts",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "the refusal must contain {needle:?} for the operator to act on it, got:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn an_empty_allowed_origins_really_disables_the_check() {
     let (_kb, _guard, base) = start("groove-origin-disabled", ORIGINS_DISABLED);

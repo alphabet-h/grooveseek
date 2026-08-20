@@ -79,6 +79,12 @@ bind = "127.0.0.1:3100"
 # ブラウザ上のクライアントから使う場合は、送られてくる**公開 origin** を
 # ここに明示する。Origin を持たない要求 (通常の MCP クライアント / tray / curl)
 # はどちらでも素通り。空リストは検証を無効化し、起動時に警告が出る。
+# 綴りの規則が 2 つあり、どちらも見た目より厳しい。各 entry は **scheme が必須**
+# (allowed_hosts は host / host:port を受けるが、こちらは受けない)。scheme の
+# 無い entry は照合時に捨てられ、検証が有効なまま比較対象 0 件になって全ブラウザを
+# 拒む状態になるため、groove は**起動を拒否**する。もう 1 つ、**port の無い entry は
+# そのホストの全 port に一致する**ので、scheme の既定 port を意図する場合
+# (https://kb.example.com = 443) を除いて port を書く。
 # allowed_origins = ["https://kb.example.com"]
 # /healthz を allowed_hosts の検査対象外に置くか。既定は true (= public、Host
 # check なし)。false にすると /healthz も他のエンドポイントと同様に検証され、

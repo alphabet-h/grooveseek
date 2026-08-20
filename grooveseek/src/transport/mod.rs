@@ -173,6 +173,13 @@ impl Transport {
                 let allowed_origins = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.allowed_origins.clone());
+                // ここが `allowed_origins` の消費点 — この arm を通らない限り
+                // rmcp には渡らない。だから検査もここに置く。`Stdio` arm も、
+                // `index` / `search` も、このキーを読まない
+                // (`check_origin_list` の doc が 2 度の置き場所の誤りを持っている)。
+                if let Some(list) = allowed_origins.as_deref() {
+                    crate::transport::http::check_origin_list(list)?;
+                }
                 let healthz_public = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.healthz_public)
@@ -458,6 +465,63 @@ mod tests {
             ),
             _ => panic!("expected Transport::Http"),
         }
+    }
+
+    /// The spelling `allowed_hosts` accepts, written into the key next door.
+    /// rmcp drops it at match time and says nothing, leaving Origin validation
+    /// on with nothing to match — so the server 403s every browser, including
+    /// its own `/ui`, and the log is silent. Refusing here, before the list
+    /// becomes part of a running transport, is the last place it is visible.
+    #[test]
+    fn an_origin_entry_that_never_reaches_the_comparison_stops_the_http_transport() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                allowed_origins: Some(vec!["127.0.0.1:3100".to_string()]),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let msg = format!(
+            "{:#}",
+            Transport::resolve(None, None, None, Some(&cfg))
+                .expect_err("an entry rmcp would drop must not reach a running server")
+        );
+        for needle in [
+            "[transport.http].allowed_origins",
+            "127.0.0.1:3100",
+            "scheme",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "the refusal must contain {needle:?} to be actionable, got {msg:?}"
+            );
+        }
+    }
+
+    /// The other half, and the reason the check sits here rather than in
+    /// `Config`: `index`, `search` and a stdio server never read this key.
+    /// Measured while it was in `discover_in` — `groove validate`, which opens
+    /// no socket at all, refused to run because of an HTTP-only typo.
+    ///
+    /// `[transport.http]` alone implies HTTP, so `kind` is set explicitly here;
+    /// that sugar is what makes the stdio case easy to lose.
+    #[test]
+    fn a_stdio_transport_does_not_read_the_origin_list() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                allowed_origins: Some(vec!["127.0.0.1:3100".to_string()]),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert!(
+            matches!(
+                Transport::resolve(None, None, None, Some(&cfg)),
+                Ok(Transport::Stdio)
+            ),
+            "an HTTP-only setting must not stop a transport that never reads it"
+        );
     }
 
     /// 省略時は `None`。`run_http` がそこで **bind した port の loopback origin**

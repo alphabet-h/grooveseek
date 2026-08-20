@@ -180,6 +180,15 @@ and list that name in `[transport.http].allowed_hosts`. If browser-based clients
 will connect, list the public origin in `[transport.http].allowed_origins` as
 well — the browser sends the proxy's origin, not the server's.
 
+Origin entries are spelled unlike host entries, in two ways worth knowing before
+you write the line. A scheme is required, and a missing one stops groove from
+starting rather than being ignored: an entry that cannot be parsed is dropped
+before matching, and a list whose entries were all dropped leaves validation on
+with nothing to match, refusing every browser without a word in the log. And an
+entry with no port matches *every* port on that host, so name the port unless
+you mean the scheme's default — `https://kb.example.com` means 443, which is
+what you want behind the TLS termination above.
+
 ### `alwaysLoad: true` (client-side)
 
 The example client `.mcp.json` sets `"alwaysLoad": true`. This is a

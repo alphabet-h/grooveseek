@@ -80,6 +80,12 @@ bind = "127.0.0.1:3100"
 # proxy, since it then sends your public origin. Requests with no Origin
 # (ordinary MCP clients, the tray, curl) pass either way; an empty list disables
 # validation and warns at startup.
+# Two spelling rules, both stricter than they look. Every entry must carry a
+# scheme -- unlike allowed_hosts, which takes a bare host or host:port -- and
+# groove refuses to start on one that does not, because an entry it cannot
+# parse would be dropped at match time and leave the check refusing every
+# browser. And an entry with no port matches EVERY port on that host, so write
+# the port unless you mean the scheme's default (https://kb.example.com is 443).
 # allowed_origins = ["https://kb.example.com"]
 # Whether /healthz sits outside the allowed_hosts check. Default true (public,
 # no Host check). Set false to have /healthz validated like every other

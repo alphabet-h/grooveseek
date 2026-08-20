@@ -71,4 +71,12 @@ bind = "127.0.0.1:3100"
 # Setting the key REPLACES the default, so keep the loopback entries if you
 # also browse from the server itself. Entries carry a scheme and bracket IPv6.
 #
+# Two rules this key does not share with allowed_hosts above. A scheme is
+# required, and groove refuses to start without one rather than ignoring the
+# entry -- an unparseable entry is dropped before matching, which leaves the
+# check on with nothing to match and refuses every browser without a word. And
+# an entry with no port matches every port on that host, so name the port unless
+# you mean the scheme's default: https://kb.example.com is 443, which is what
+# you want behind the TLS proxy below.
+#
 # allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]

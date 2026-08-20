@@ -834,6 +834,10 @@ impl Config {
     /// - `[search.fusion].rrf_k` が有限かつ `>= 1.0`
     /// - `[search.fusion].bm25_*_weight` が有限かつ `>= 0.0`
     /// - `[search.fusion]` の 3 重みが全て `0.0` でない
+    ///
+    /// `[transport.http].allowed_origins` の綴りは**ここでは見ない**。
+    /// 消費点である `Transport::resolve` の HTTP arm が見る
+    /// (`transport::http::check_origin_list` の doc が理由を持っている)。
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
             // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
@@ -912,6 +916,7 @@ impl Config {
                 );
             }
         }
+
         Ok(())
     }
 
@@ -3012,6 +3017,41 @@ lambda = 0.5
         assert!(
             http.allowed_origins.is_none(),
             "an empty planted list disables validation, so it must be dropped too"
+        );
+    }
+
+    /// Loading a config never inspects the *spelling* of `allowed_origins` —
+    /// `Transport::resolve` does, where the list is consumed. This guards the
+    /// first of the two places that check was wrongly put: a config groove
+    /// merely *found* has its `allowed_origins` discarded, so refusing a
+    /// malformed one here would refuse a value that was never going to be read,
+    /// and a `groove.toml` in a cloned repository could stop every command.
+    ///
+    /// `[search.fusion]`'s range checks do live in `validate()` and are not
+    /// this shape: those values *are* honoured from a discovered config, so
+    /// what is checked and what is used are the same thing. Here they are not.
+    #[test]
+    fn a_planted_origin_entry_is_discarded_rather_than_fatal() {
+        let dir = TempDir::new("groove-origins-planted");
+        let planted = format!(
+            "{}allowed_origins = [\"127.0.0.1:3100\"]\n",
+            planted_toml("kb")
+        );
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots)
+            .expect("a discovered config must not be able to stop the command");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let http = d
+            .config
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives");
+        assert!(
+            http.allowed_origins.is_none(),
+            "the planted list is dropped, which is why validating it first was wrong"
         );
     }
 
