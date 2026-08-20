@@ -108,10 +108,25 @@ fn balanced(text: &str, open: u8, close: u8) -> &str {
 }
 
 /// The whole `fetch(...)` call `callTool` makes, parentheses included.
+///
+/// Anchored to `callTool` rather than to the first `fetch` in the file: the
+/// page makes two, and the other one polls `/api/admin/status`. Taking the
+/// first would be right today and silently wrong the moment a third is added
+/// above this one.
 fn fetch_call() -> &'static str {
-    let rest = PAGE
+    let after_fn = PAGE
+        .split_once("async function callTool(")
+        .expect("the page still defines callTool")
+        .1;
+    let body = balanced(after_fn, b'{', b'}');
+    assert_eq!(
+        body.matches("await fetch").count(),
+        1,
+        "callTool now makes more than one request; this reads only the first"
+    );
+    let rest = body
         .split_once("await fetch")
-        .expect("callTool still calls fetch")
+        .expect("callTool calls fetch")
         .1;
     balanced(rest, b'(', b')')
 }
@@ -221,6 +236,22 @@ fn request_the_page_builds(tool: &str) -> PageRequest {
     let mut openers = Vec::new();
     let opts = object_from(balanced(after_target, b'{', b'}'), tool, &mut openers);
     let opts = opts.as_object().expect("the options are an object").clone();
+
+    // Only these three are replayed through `curl`. An option that changes how
+    // the browser issues the request — `mode: "no-cors"` would strip the custom
+    // MCP headers, `credentials` changes what is attached — has no counterpart
+    // here, so accepting one quietly would mean replaying a request the page can
+    // no longer make. Same rule as `resolve`: what is not modelled stops the
+    // test.
+    const REPLAYED: [&str; 3] = ["method", "headers", "body"];
+    for key in opts.keys() {
+        assert!(
+            REPLAYED.contains(&key.as_str()),
+            "callTool now passes fetch a {key:?} option, which this replay does \
+             not model. Model it, or the request sent here stops matching the \
+             one the browser can issue."
+        );
+    }
 
     // Without `JSON.stringify` the browser sends "[object Object]"; a reader
     // that quietly accepted a bare `{` would serialise valid JSON here and
