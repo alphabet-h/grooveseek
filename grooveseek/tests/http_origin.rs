@@ -483,6 +483,98 @@ fn an_origin_gets_the_same_verdict_from_both_surfaces() {
     );
 }
 
+/// The other half of the comparison, and the half the first table misses.
+///
+/// (codex P1 round 2 on PR #193) A match reads **two** strings: the request's
+/// `Origin` and the allow-list entry it is compared against. The table above
+/// varies only the first, against the list groove derives from the bound port —
+/// which is always `http://<host>:<port>`, one shape. So every rule that
+/// applies to *entries* went unexercised, and the review named the one that
+/// matters most: an entry written without a port matches every port on that
+/// host (`a_port.is_none() || a_port == o_port`), a rule that lives in rmcp's
+/// matcher and in ours, in two places, agreeing by inspection.
+///
+/// One server per configured entry, because the entry is configuration. Slower
+/// than the table above and worth it: this is the side an rmcp upgrade would
+/// change without any test here noticing.
+#[test]
+fn a_configured_entry_gets_the_same_verdict_from_both_surfaces() {
+    // (entry as written in groove.toml, origins to ask both surfaces about)
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        // The rule the review named. RFC 6454 omits a default port, so the
+        // documented proxy recipe is port-less — and rmcp reads that as "any
+        // port", which is wider than the RFC and is why the startup warning
+        // about wide defaults exists.
+        (
+            "https://kb.example.com",
+            vec![
+                "https://kb.example.com",
+                "https://kb.example.com:443",
+                "https://kb.example.com:8443",
+                "http://kb.example.com",
+            ],
+        ),
+        // An entry with a port matches that port and no other.
+        (
+            "https://kb.example.com:8443",
+            vec![
+                "https://kb.example.com:8443",
+                "https://kb.example.com",
+                "https://kb.example.com:443",
+            ],
+        ),
+        // Padding around the entry, which rmcp trims and so do we.
+        (
+            "  https://kb.example.com  ",
+            vec!["https://kb.example.com", "https://evil.example"],
+        ),
+        // Case folding on the entry side rather than the request side.
+        (
+            "HTTPS://KB.EXAMPLE.COM",
+            vec![
+                "https://kb.example.com",
+                "https://KB.example.com",
+                "https://evil.example",
+            ],
+        ),
+        // The opaque origin as an entry: it matches only itself, never a tuple.
+        ("null", vec!["null", "https://evil.example"]),
+        // Bracketed IPv6 as an entry.
+        (
+            "https://[::1]:9443",
+            vec!["https://[::1]:9443", "https://[::1]:1"],
+        ),
+    ];
+
+    for (i, (entry, origins)) in cases.iter().enumerate() {
+        let config = format!(
+            "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"{entry}\"]\n"
+        );
+        let (_kb, _guard, base) = start(&format!("groove-origin-entry-{i}"), &config);
+
+        let mut verdicts = Vec::new();
+        for origin in origins {
+            let mcp = post_initialize(&base, Some(origin));
+            let admin = get_status(&base, "/api/admin/status", Some(origin));
+            assert_eq!(
+                mcp, admin,
+                "with allowed_origins = [\"{entry}\"], Origin {origin} got \
+                 {mcp} from /mcp and {admin} from /api/admin/status"
+            );
+            verdicts.push(mcp);
+        }
+
+        // Every row is written so that at least one origin matches the entry
+        // and at least one does not. If that stops being true the row has
+        // stopped testing the entry.
+        assert!(
+            verdicts.iter().any(|v| v == "200") && verdicts.iter().any(|v| v != "200"),
+            "the row for {entry:?} no longer separates a match from a miss: \
+             {verdicts:?}"
+        );
+    }
+}
+
 /// Host is checked before Origin, as it is in rmcp
 /// (`validate_dns_rebinding_headers`). A request failing both therefore hears
 /// about the Host — from either surface, which is the part worth pinning: the
