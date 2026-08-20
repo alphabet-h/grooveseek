@@ -27,6 +27,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the same answer. As on `/mcp`, a request carrying no `Origin` still passes,
   so the tray, `curl` and the page's own status poll are unaffected.
 
+- **Admin refusals no longer write a log line each.** Bound to a non-loopback
+  address, the peer check refuses before anything else looks at the request, so
+  a stream of cheap requests wrote an unbounded stream of lines to the daemon's
+  log file. The session gate on `/mcp` already thinned its refusals to one line
+  a minute, carrying the count of what it stood for; the admin gates now share
+  one such budget between them.
+
 - **`/ui` is served with a Content Security Policy and `nosniff`.** The policy
   is `default-src 'none'` plus exactly what the page uses — its inline
   `<script>` and `<style>`, its `data:` favicon, same-origin `fetch`,
