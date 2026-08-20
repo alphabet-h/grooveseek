@@ -254,7 +254,9 @@ fn bytewise_pair_signature_ratio(pages: &[String]) -> f64 {
                 }
             } else {
                 short_run_chars += chars.len();
-                for pair in chars.chunks_exact(2) {
+                // `as_chunks::<2>().0` drops a trailing odd element exactly as
+                // `chunks_exact(2)` did, and says the pair width in the type.
+                for pair in chars.as_chunks::<2>().0 {
                     *short_first_freq.entry(pair[0]).or_insert(0) += 1;
                     short_seconds.insert(pair[1]);
                     short_pairs += 1;
@@ -601,9 +603,13 @@ fn recover_utf16be_title(garbled: &str) -> Option<String> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return None; // 奇数バイトは UTF-16 code unit を組めない
     }
+    // The length check above rules out a remainder, so `.0` is every byte.
+    // `from_be_bytes` wants the `[u8; 2]` that `as_chunks` already produces.
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
         .collect();
     let recovered = String::from_utf16(&units).ok()?;
     if recovered.trim().is_empty() || recovered.chars().any(char::is_control) {
