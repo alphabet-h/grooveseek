@@ -61,11 +61,21 @@ loopback origin** である。
 したがってこのリストは**組み込みページが検索できるかどうかを決める** — 既定を
 公開 origin だけで置き換えると、`/ui` は表示されるのに検索できない状態になる。
 
-**全 route を同じ検査が、同じリストを読んで検証する** — `/mcp` も `/healthz` も
-admin route も同様。`/mcp` を MCP ライブラリに任せず GrooveSeek 自身が行うので、
-**面ごとに違う答えが出ることはない**。以前は 5 つの `Host` 綴りで実際に違っていた —
-その記録は [ADR-0009](decisions/0009-one-dns-rebinding-gate.ja.md)。
-`Origin` を持たないリクエストはどの面でも通るので、tray と `curl` は影響を受けない。
+**検査する route については、1 つの検査が答える** — `/mcp` を MCP ライブラリに
+任せず GrooveSeek 自身が行うので、**2 つの面が同じ値を 2 通りに読むことはもう
+起きない**。以前は 5 つの `Host` 綴りで実際に起きていた — その記録は
+[ADR-0009](decisions/0009-one-dns-rebinding-gate.ja.md)。
+
+**ただし「何と照合するか」は route ごとに違い、このキーは全部には届かない:**
+
+| Route | `Host` | `Origin` |
+| --- | --- | --- |
+| `/mcp` | `allowed_hosts` | `allowed_origins` |
+| `/ui` / `/api/admin/status` | loopback + bind アドレス (設定不可) | `allowed_origins` |
+| `/healthz` | `allowed_hosts`。ただし **`healthz_public = false` の時だけ** | 検証しない |
+
+`Origin` を持たないリクエストは、検査が走る面ではどこでも通る。だから tray と
+`curl` は影響を受けない。
 
 **`allowed_hosts` でも同じことが 1 段手前で起きる。** Host 検証は Origin 検証より
 先に走るので、公開ホスト名だけを並べたリストは、ローカルで開いた `/ui` が送る

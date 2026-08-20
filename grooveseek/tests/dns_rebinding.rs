@@ -186,6 +186,35 @@ fn the_admin_routes_read_a_host_the_same_way() {
     }
 }
 
+/// One implementation, **not** one list — and the review of this change was
+/// right that saying otherwise overstates it.
+///
+/// The admin routes match `Host` against `allowed_admin_hosts`, which is
+/// loopback plus the bind address and is not configurable. An operator who
+/// publishes through a proxy names their host in `allowed_hosts`, and that must
+/// reach `/mcp` **without** reaching `/ui`. Sharing the gate is exactly the
+/// change that could have collapsed the two lists by accident.
+#[test]
+fn a_published_host_reaches_mcp_and_not_the_admin_routes() {
+    let (_kb, _guard, base) = common::mcp::spawn_with_config(
+        "groove-gate-lists",
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_hosts = [\"kb.example.lan\"]\n",
+    );
+
+    assert_eq!(
+        mcp_status(&base, "kb.example.lan"),
+        "200",
+        "/mcp refused the host named in allowed_hosts"
+    );
+    assert_eq!(
+        get_status(&base, "/api/admin/status", "kb.example.lan"),
+        "403",
+        "the admin routes accepted a Host from allowed_hosts. They hold their \
+         own loopback-only list, and one gate reading one list would publish \
+         the operator's daemon page along with their knowledge base"
+    );
+}
+
 /// **The fingerprint.** These five are refused by `validate_host_header` and
 /// were accepted by rmcp, so a green run here says groove's gate is the thing
 /// answering — which parity alone cannot say.

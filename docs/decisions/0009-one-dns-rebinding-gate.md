@@ -57,8 +57,15 @@ repaired the half that agreed and left the half that did not.
 
 ## Decision
 
-**GrooveSeek validates `Host` and `Origin` for every route it serves,
-including `/mcp`, in one gate placed in front of everything.**
+**One implementation answers both questions, for every route that asks them —
+`/mcp` included.**
+
+This is a decision about *who answers*, not about *what is asked*. Which list
+a route is compared against, and whether it is asked at all, is unchanged:
+`/healthz` is still unguarded unless `healthz_public = false` and still
+validates `Host` only, and the admin routes still hold their own loopback-only
+`Host` list. What ends is that the same question had different answers
+depending on which path reached it.
 
 rmcp's own checks are switched off explicitly — `with_allowed_hosts(vec![])`
 and `with_allowed_origins(vec![])`, which upstream mean "accept every Host" and
@@ -71,7 +78,8 @@ The gate is one middleware, given a different list per route group:
 - `/mcp` — the effective `allowed_hosts` and `allowed_origins`.
 - `/healthz` — the same `Host` list, and no `Origin` list, because `/healthz`
   never validated one and this decision is about who answers a question, not
-  about asking new ones.
+  about asking new ones. It keeps its `healthz_public` opt-in too: on the
+  default the route carries no gate at all.
 - `/ui` and `/api/admin/status` — the admin `Host` list (loopback plus the bind
   address, not configurable), the same `Origin` list, and additionally the
   requirement that the peer address be loopback.

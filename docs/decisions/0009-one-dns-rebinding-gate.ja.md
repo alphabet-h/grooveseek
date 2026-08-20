@@ -54,8 +54,13 @@ admin は同じ文から接頭辞を落としたもの。さらに **groove 自�
 
 ## Decision
 
-**GrooveSeek が配信する全 route (`/mcp` を含む) の `Host` と `Origin` を、
-前段に置いた 1 つの門番で検証する。**
+**2 つの問いに、1 つの実装が答える — その問いを発する全 route (`/mcp` を含む) で。**
+
+これは**誰が答えるか**の決定であって、**何を問うか**の決定ではない。route ごとに
+「どのリストと照合するか」「そもそも問うか」は変わらない — `/healthz` は
+`healthz_public = false` の時だけ検査され、検査するのは `Host` だけ。admin route は
+引き続き独自の loopback 限定 `Host` リストを持つ。終わるのは、**同じ問いが到達経路に
+よって違う答えになる**ことである。
 
 rmcp 側の検査は**明示的に**止める — `with_allowed_hosts(vec![])` /
 `with_allowed_origins(vec![])` は上流で「全 Host 許可」「Origin を検証しない」を
@@ -68,7 +73,8 @@ rmcp 側の検査は**明示的に**止める — `with_allowed_hosts(vec![])` /
 - `/mcp` — effective な `allowed_hosts` と `allowed_origins`
 - `/healthz` — 同じ `Host` リスト、`Origin` リストは無し。`/healthz` は元々
   `Origin` を検証していないし、本決定は**問いの答え手を変えるもの**であって
-  新しい問いを増やすものではない
+  新しい問いを増やすものではない。`healthz_public` の opt-in もそのまま残る —
+  **既定ではこの route に門番は掛からない**
 - `/ui` / `/api/admin/status` — admin 用 `Host` リスト (loopback + bind
   アドレス、設定不可)、同じ `Origin` リスト、加えて **peer が loopback であること**
 
