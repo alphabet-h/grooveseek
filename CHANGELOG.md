@@ -14,6 +14,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Internal
+
+- **Origin validation is now tested through a running server.** The check
+  shipped in 0.27.0 with twenty-five tests, every one of them against the
+  function that assembles the allow-list rather than against the server that
+  applies it — deleting the call that hands that list to rmcp left the whole
+  suite passing. Four tests now bind a server, send real requests, and assert
+  what comes back: a foreign origin is refused, a request with no `Origin` is
+  not, the server accepts its own bound address, and an empty list really does
+  turn the check off.
+
+  They bind with `--bind 127.0.0.1:0` and read the port back, because the
+  allow-list is derived from the address the listener *received*; a test that
+  supplies the port cannot tell that apart from one that echoes it. And they run
+  in ordinary `cargo test`, without `--ignore` and without a feature flag, so a
+  regression fails the pull request that causes it rather than the next nightly.
+
 ## [0.27.0] - 2026-08-18
 
 ### Added
