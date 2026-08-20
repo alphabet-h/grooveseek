@@ -77,11 +77,23 @@ impl ServiceBackend for LaunchAgent {
         // `plist_path` は必ず `~/Library/LaunchAgents/` 配下を返すので親は
         // 存在するはずだが、`unwrap()` はその「はず」を実行時 panic で表明する。
         // 呼び出し元は `Result` を扱えるので、そちらに載せる。
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("plist パスに親ディレクトリが無い: {}", path.display()))?;
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("LaunchAgents ディレクトリ作成失敗: {}", parent.display()))?;
+        //
+        // 文面が英語で、パスを `escape_default()` に通すのは AGENTS.md の
+        // 「stderr は ASCII」による (codex P1 round 1 on PR #198)。`display()`
+        // は非 UTF-8 パスに U+FFFD を出すので、**この分岐が発火する時にこそ**
+        // 非 ASCII になる。`transport/http.rs::check_origin_list` と同じ手。
+        let parent = path.parent().ok_or_else(|| {
+            anyhow!(
+                "plist path has no parent directory: {}",
+                path.to_string_lossy().escape_default()
+            )
+        })?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create the LaunchAgents directory: {}",
+                parent.to_string_lossy().escape_default()
+            )
+        })?;
         if path.exists() && !ctx.force {
             return Err(anyhow!(
                 "plist が既存: {} (--force で上書き)",
@@ -107,9 +119,15 @@ impl ServiceBackend for LaunchAgent {
             // `launchctl` は引数を `&str` で受けるので、UTF-8 でないホーム
             // ディレクトリではここが唯一の失敗点になる。panic ではなく
             // 「なぜ install できないか」として返す。
-            let path_arg = path
-                .to_str()
-                .ok_or_else(|| anyhow!("plist パスが UTF-8 でない: {}", path.display()))?;
+            //
+            // ここは**定義上パスが UTF-8 でない**分岐なので、そのまま出すと
+            // 必ず非 ASCII になる。上の 2 つと同じ理由で escape する。
+            let path_arg = path.to_str().ok_or_else(|| {
+                anyhow!(
+                    "plist path is not valid UTF-8: {}",
+                    path.to_string_lossy().escape_default()
+                )
+            })?;
             run_launchctl(&["bootstrap", &format!("gui/{}", uid), path_arg])?;
         }
         Ok(())
