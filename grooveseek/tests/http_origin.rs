@@ -198,6 +198,45 @@ fn an_entry_with_padding_is_still_honoured_by_the_server() {
     );
 }
 
+/// A command that opens no socket must not care what this key says.
+///
+/// The check sat in config loading for one revision, which meant a typo in an
+/// HTTP-only setting stopped `index`, `search` and `validate` as well —
+/// measured, not theorised: `groove validate`, which reads Markdown and exits,
+/// refused to run. It now lives in `Transport::resolve`'s HTTP arm, so this
+/// asserts the blast radius rather than the fix.
+///
+/// `validate` is the cheapest witness available: no model, no database, and
+/// with no schema file it exits 0 after a single line.
+#[test]
+fn a_command_with_no_http_transport_ignores_a_broken_origin_list() {
+    let layout = TempKbLayout::new("groove-origin-unrelated-cmd");
+    layout.write("note.md", "---\ntitle: Note\n---\n\n## body\n\nOne.\n");
+    let cfg = layout.root().join("groove.toml");
+    std::fs::write(
+        &cfg,
+        "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"127.0.0.1:3100\"]\n",
+    )
+    .expect("write groove.toml");
+
+    let out = Command::new(common::mcp::grooveseek_bin())
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "validate",
+            "--kb-path",
+            layout.kb().to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn groove validate");
+
+    assert!(
+        out.status.success(),
+        "an HTTP-only setting stopped a command that never reads it; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The defect this pair of changes exists for.
 ///
 /// `allowed_hosts` takes a bare `host:port` — its parser falls back to reading

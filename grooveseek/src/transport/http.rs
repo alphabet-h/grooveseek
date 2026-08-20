@@ -147,6 +147,44 @@ pub(crate) fn check_origin_entry(entry: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Refuse a whole `[transport.http].allowed_origins` list before it becomes
+/// part of a running configuration.
+///
+/// **Where this is called is part of the design**, and two earlier placements
+/// were wrong for the same reason:
+///
+/// - in `Config::load_from`, it checked an `allowed_origins` that
+///   `restrict_untrusted` was about to discard, so a `groove.toml` in a cloned
+///   repository could have stopped every command;
+/// - in `Config::discover_in`, it checked a key that `index`, `search` and
+///   `serve --transport stdio` never read — measured: `groove validate`, which
+///   opens no socket at all, refused to run.
+///
+/// The rule both times is the same one: **check a value where it is
+/// consumed.** That place is `Transport::resolve`'s HTTP arm, which is where
+/// the list stops being text in a file and starts being what rmcp will match
+/// against.
+pub(crate) fn check_origin_list(origins: &[String]) -> anyhow::Result<()> {
+    for entry in origins {
+        if let Err(why) = check_origin_entry(entry) {
+            // この文面は stderr に出るので AGENTS.md の ASCII 規約が掛かる。
+            // `{entry:?}` (= `Debug`) は**印字可能な非 ASCII をそのまま通す**
+            // ので、IDN を含む entry が CP932 コンソールで mojibake になる。
+            // `escape_default` は非 ASCII を `\u{...}` に落とす。
+            let shown = entry.escape_default();
+            anyhow::bail!(
+                "[transport.http].allowed_origins: {why}, got \"{shown}\". An entry \
+                 rmcp cannot parse is dropped before matching, which leaves Origin \
+                 validation switched on with nothing to match: every request \
+                 carrying an Origin header is then refused with 403, and nothing \
+                 says why. Note this key is stricter than allowed_hosts, which \
+                 accepts a bare host or host:port."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Whether this entry leaves the port open, so that rmcp matches it against
 /// **every** port on that host (`a_port.is_none() || a_port == o_port`,
 /// `tower.rs:819`).
@@ -1713,6 +1751,47 @@ mod tests {
                 "{entry:?} names no host"
             );
         }
+    }
+
+    /// Not every list is checked into oblivion: `[]` is the documented way to
+    /// turn Origin validation off, and `run_http` warns about it at startup.
+    /// The check must not be the thing that refuses it.
+    #[test]
+    fn an_empty_origin_list_is_still_a_legal_config() {
+        check_origin_list(&[]).expect("an empty list disables validation, it is not a typo");
+    }
+
+    /// The list the shipped proxy recipe hands an operator has to load.
+    #[test]
+    fn the_origins_the_recipes_publish_pass_the_list_check() {
+        let shipped = [
+            "https://kb.example.com".to_string(),
+            "http://127.0.0.1:3100".to_string(),
+            "http://localhost:3100".to_string(),
+        ];
+        check_origin_list(&shipped)
+            .expect("examples/deployments/intranet-http ships exactly this list");
+    }
+
+    /// The rejected value reaches stderr, where AGENTS.md requires ASCII: a
+    /// Japanese Windows console is CP932 and renders anything else as mojibake.
+    /// `Debug` keeps printable non-ASCII as-is, so an internationalized host
+    /// name would have travelled through intact.
+    #[test]
+    fn a_rejected_entry_is_escaped_before_it_reaches_the_console() {
+        let bad = ["\u{4f8b}\u{3048}.jp:3100".to_string()];
+        let msg = format!(
+            "{:#}",
+            check_origin_list(&bad).expect_err("no scheme, so it is refused")
+        );
+        assert!(
+            msg.is_ascii(),
+            "a diagnostic has to survive a CP932 console, got {msg:?}"
+        );
+        assert!(
+            msg.contains("\\u{4f8b}"),
+            "the operator still has to recognise which entry it was, got {msg:?}"
+        );
     }
 
     /// The startup warning fires on a property of the list, not on a port

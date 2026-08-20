@@ -50,11 +50,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   answers 403 to everything. An empty list is still accepted: that one is the
   documented off switch.
 
-  The check runs only on a list that will actually be used. A config groove
-  merely *found* has its `allowed_origins` discarded as untrusted, so checking
-  the spelling first would refuse a value that was never going to be read —
-  a `groove.toml` in a cloned repository could then stop every command, however
-  safe the values on the command line.
+  The check runs where the list is consumed — resolving an HTTP transport —
+  and nowhere earlier, so it cannot refuse a value that was never going to be
+  read. Two earlier placements could. Checking during config loading meant a
+  `groove.toml` in a cloned repository could stop every command, because a
+  discovered config's `allowed_origins` is discarded as untrusted before it is
+  ever used. Checking after that, but still during loading, meant a typo in an
+  HTTP-only setting stopped `index`, `search`, `validate` and a stdio server —
+  none of which read the key.
 
   The same list carries a second cost, which cannot be removed. rmcp matches an
   entry with no port against *every* port on that host — wider than RFC 6454,

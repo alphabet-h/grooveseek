@@ -496,10 +496,6 @@ impl Config {
             let dir = path.as_deref().and_then(Path::parent);
             config.restrict_untrusted(path.as_deref(), dir, roots)?;
         }
-        // **restriction の後**。ここより前で見ると、破棄される予定の
-        // `allowed_origins` を理由に全コマンドが起動しなくなる —
-        // `validate_allowed_origins` の doc がその経緯を持っている。
-        config.validate_allowed_origins()?;
         Ok(Discovered {
             config,
             source,
@@ -840,7 +836,8 @@ impl Config {
     /// - `[search.fusion]` の 3 重みが全て `0.0` でない
     ///
     /// `[transport.http].allowed_origins` の綴りは**ここでは見ない**。
-    /// [`Self::validate_allowed_origins`] が理由を持っている。
+    /// 消費点である `Transport::resolve` の HTTP arm が見る
+    /// (`transport::http::check_origin_list` の doc が理由を持っている)。
     pub fn validate(&self) -> Result<()> {
         if let Some(s) = &self.search {
             // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
@@ -920,50 +917,6 @@ impl Config {
             }
         }
 
-        Ok(())
-    }
-
-    /// `[transport.http].allowed_origins` の各 entry が rmcp の照合まで届くか。
-    ///
-    /// **`validate()` と分けてあるのは、呼ぶ時点が違うから。** 発見された
-    /// config の `allowed_origins` は `restrict_untrusted` が破棄するので、
-    /// 破棄される値を `load_from` の中で検証すると「**使われない値のせいで
-    /// 全コマンドが起動しない**」になる — そういう `groove.toml` を含む repo を
-    /// clone しただけで、CLI 側で安全な値を渡していても止まる。
-    ///
-    /// `[search.fusion]` の値域チェックと同じ場所に置いたのが誤りだった。
-    /// あちらは**発見された config でも honour される**値で、検証する対象と
-    /// 使われる対象が一致している。こちらは一致しない。
-    ///
-    /// 呼ぶのは [`Self::discover_in`] の restriction の**後**、1 箇所だけ。
-    pub(crate) fn validate_allowed_origins(&self) -> Result<()> {
-        let Some(origins) = self
-            .transport
-            .as_ref()
-            .and_then(|t| t.http.as_ref())
-            .and_then(|h| h.allowed_origins.as_ref())
-        else {
-            return Ok(());
-        };
-        // 空リストは合法。`[]` は「Origin 検証をしない」という文書化された
-        // 表明で、`run_http` が起動時に warn を出す。ループが回らないだけ。
-        for entry in origins {
-            if let Err(why) = crate::transport::http::check_origin_entry(entry) {
-                // この文面は stderr に出るので AGENTS.md の ASCII 規約が掛かる。
-                // `{entry:?}` (= `Debug`) は**印字可能な非 ASCII をそのまま通す**
-                // ので、IDN を含む entry が CP932 コンソールで mojibake になる。
-                // `escape_default` は非 ASCII を `\u{...}` に落とす。
-                let shown = entry.escape_default();
-                anyhow::bail!(
-                    "[transport.http].allowed_origins: {why}, got \"{shown}\". An entry \
-                     rmcp cannot parse is dropped before matching, which leaves Origin \
-                     validation switched on with nothing to match: every request \
-                     carrying an Origin header is then refused with 403, and nothing \
-                     says why. Note this key is stricter than allowed_hosts, which \
-                     accepts a bare host or host:port."
-                );
-            }
-        }
         Ok(())
     }
 
@@ -3067,51 +3020,16 @@ lambda = 0.5
         );
     }
 
-    /// The spelling `allowed_hosts` accepts, written into the key next door.
-    /// rmcp drops it at match time and says nothing, leaving Origin validation
-    /// on with nothing to match — so the server 403s every browser, including
-    /// its own `/ui`, and the log is silent. Refusing the config is the only
-    /// place this is still visible.
+    /// Loading a config never inspects the *spelling* of `allowed_origins` —
+    /// `Transport::resolve` does, where the list is consumed. This guards the
+    /// first of the two places that check was wrongly put: a config groove
+    /// merely *found* has its `allowed_origins` discarded, so refusing a
+    /// malformed one here would refuse a value that was never going to be read,
+    /// and a `groove.toml` in a cloned repository could stop every command.
     ///
-    /// Goes through `discover_in` rather than calling the check directly,
-    /// because **when** it runs is half of what it has to get right.
-    #[test]
-    fn an_origin_entry_that_never_reaches_the_comparison_stops_the_load() {
-        let dir = TempDir::new("groove-origins-named");
-        let named = dir.path().join("groove.toml");
-        std::fs::write(
-            &named,
-            "kb_path = \"kb\"\n\n[transport.http]\nallowed_origins = [\"127.0.0.1:3100\"]\n",
-        )
-        .unwrap();
-        let roots = roots_for(None, None);
-
-        let err = Config::discover_in(Some(&named), dir.path(), None, &roots)
-            .expect_err("an entry rmcp would drop must not reach a running server");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("[transport.http].allowed_origins"),
-            "the message must name the key, got {msg:?}"
-        );
-        assert!(
-            msg.contains("127.0.0.1:3100"),
-            "the message must quote the entry, got {msg:?}"
-        );
-        assert!(
-            msg.contains("allowed_hosts"),
-            "the message must say which key does take this spelling, got {msg:?}"
-        );
-    }
-
-    /// The other half, and the one that is easy to get backwards: a config
-    /// groove merely *found* has its `allowed_origins` discarded, so checking
-    /// the spelling before the discard would refuse a value that was never
-    /// going to be used — a `groove.toml` in a cloned repository could then
-    /// stop every command, however safe the values on the command line.
-    ///
-    /// `[search.fusion]`'s range checks live in `validate()` and are not this
-    /// shape: those values *are* honoured from a discovered config, so what is
-    /// checked and what is used are the same thing. Here they are not.
+    /// `[search.fusion]`'s range checks do live in `validate()` and are not
+    /// this shape: those values *are* honoured from a discovered config, so
+    /// what is checked and what is used are the same thing. Here they are not.
     #[test]
     fn a_planted_origin_entry_is_discarded_rather_than_fatal() {
         let dir = TempDir::new("groove-origins-planted");
@@ -3134,57 +3052,6 @@ lambda = 0.5
         assert!(
             http.allowed_origins.is_none(),
             "the planted list is dropped, which is why validating it first was wrong"
-        );
-    }
-
-    /// Not every list is checked into oblivion: `[]` is the documented way to
-    /// turn Origin validation off, and `run_http` warns about it at startup.
-    /// Validation must not be the thing that refuses it.
-    #[test]
-    fn an_empty_origin_list_is_still_a_legal_config() {
-        let toml = r#"
-[transport.http]
-allowed_origins = []
-"#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(
-            cfg.validate_allowed_origins().is_ok(),
-            "an empty list is documented as disabling validation, not as a typo"
-        );
-    }
-
-    /// The list the shipped proxy recipe hands an operator has to load.
-    #[test]
-    fn the_origins_the_recipes_publish_pass_validation() {
-        let toml = r#"
-[transport.http]
-allowed_origins = ["https://kb.example.com", "http://127.0.0.1:3100", "http://localhost:3100"]
-"#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        cfg.validate_allowed_origins()
-            .expect("examples/deployments/intranet-http ships exactly this list");
-    }
-
-    /// The rejected value reaches stderr, where AGENTS.md requires ASCII: a
-    /// Japanese Windows console is CP932 and renders anything else as mojibake.
-    /// `Debug` keeps printable non-ASCII as-is, so an internationalized host
-    /// name would have travelled through intact.
-    #[test]
-    fn a_rejected_entry_is_escaped_before_it_reaches_the_console() {
-        let toml = "[transport.http]\nallowed_origins = [\"\u{4f8b}\u{3048}.jp:3100\"]\n";
-        let cfg: Config = toml::from_str(toml).unwrap();
-        let msg = format!(
-            "{:#}",
-            cfg.validate_allowed_origins()
-                .expect_err("no scheme, so it is refused")
-        );
-        assert!(
-            msg.is_ascii(),
-            "a diagnostic has to survive a CP932 console, got {msg:?}"
-        );
-        assert!(
-            msg.contains("\\u{4f8b}"),
-            "the operator still has to recognise which entry it was, got {msg:?}"
         );
     }
 
