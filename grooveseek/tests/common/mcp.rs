@@ -174,6 +174,91 @@ pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (Serve
     (guard, base)
 }
 
+/// Spawn `groove serve --bind 127.0.0.1:0` and learn the port the OS handed
+/// out. Returns `(ServerGuard, base_url)`.
+///
+/// Why this exists beside [`spawn_mcp_server`]: that one picks a free port
+/// itself and passes `--port`, so the address is known before the server ever
+/// runs. Nothing about `--bind …:0` can be known in advance — and that is
+/// precisely the case worth testing. The Origin allow-list is derived from the
+/// **bound** address: `run_http` binds, reads `local_addr()`, and only then
+/// builds the default origins. A test that supplies the port cannot tell a
+/// correct derivation from one that echoed back the number it was given; a test
+/// that lets the OS choose can (codex P1 round 1 on PR #173, where a default
+/// built before the bind allowed `http://127.0.0.1:0` and refused the real
+/// port).
+///
+/// The port arrives on stderr, in the ready line `run_http` prints. Draining
+/// stderr on a thread is not optional, for the same reason it is not in
+/// [`spawn_mcp_server_with_watch`]: both pipes are captured, and a server whose
+/// stderr nobody reads will eventually block on a full pipe.
+pub fn spawn_mcp_server_ephemeral(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
+    let bin = grooveseek_bin();
+    assert!(
+        bin.exists(),
+        "binary not found at {} — run `cargo build` first",
+        bin.display()
+    );
+
+    let child = Command::new(&bin)
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "serve",
+            "--kb-path",
+            kb_path.to_str().unwrap(),
+            "--transport",
+            "http",
+            // The point of this helper: the OS assigns the port, not us.
+            "--bind",
+            "127.0.0.1:0",
+            "--no-watch",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn groove serve (ephemeral bind)");
+
+    let mut guard = ServerGuard { child: Some(child) };
+    let stderr = guard
+        .child
+        .as_mut()
+        .expect("child is present")
+        .stderr
+        .take()
+        .expect("stderr was piped");
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reported = false;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if !reported && let Some((_, rest)) = line.split_once("listening on ") {
+                reported = true;
+                let _ = tx.send(rest.trim().trim_end_matches(')').to_string());
+            }
+        }
+    });
+
+    // 60 s upper bound, matching the other spawners: covers a cold model cache.
+    let addr = match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(addr) => addr,
+        Err(_) => panic!(
+            "server did not report a bound address within 60s \
+             (looking for 'listening on ' on stderr)"
+        ),
+    };
+    let base = format!("http://{addr}");
+
+    if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
+        panic!("/healthz did not return 200 within 60s on {base} — server failed to start");
+    }
+    (guard, base)
+}
+
 /// RAII handle for the spawned MCP server child. Kills + reaps on Drop so
 /// a panicking test does not orphan the server process.
 pub struct ServerGuard {
