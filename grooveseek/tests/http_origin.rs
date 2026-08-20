@@ -21,9 +21,15 @@
 //! advance. The allow-list is derived from the address the listener actually
 //! got, and only a port this test did not choose can tell the difference
 //! between deriving it and echoing it back.
+//!
+//! **Two surfaces enforce this list, not one.** rmcp checks `Origin` for
+//! `/mcp`; `/ui` and `/api/admin/status` are served by axum directly and had
+//! no check at all until L-5. rmcp keeps its matcher private, so the admin
+//! router cannot call it — what it can do is compare against the identical
+//! list, and the second half of this file asks both surfaces the same question
+//! and requires the same answer.
 
 mod common;
-use common::mcp::spawn_mcp_server;
 use common::temp::TempKbLayout;
 
 use std::process::Command;
@@ -69,25 +75,11 @@ fn post_initialize(base: &str, origin: Option<&str>) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// The layout is returned first so it drops **last**: locals drop in reverse
-/// declaration order, and its `Drop` removes a directory the server still has a
-/// database open under (codex P2 round 1 on PR #160).
-///
-/// `config_body` is written to a file passed with `--config`. That matters for
-/// the empty-list case: a `groove.toml` groove *discovered* has its
-/// `allowed_origins` stripped precisely so nobody can turn the check off by
-/// leaving a file beside the binary, so a test of the off switch has to hand
-/// the file over explicitly.
+/// Stand up a server for one of these tests. The fixture itself lives in
+/// `common::mcp` — `tests/admin_surface.rs` needs the identical thing, and the
+/// notes about drop order and about `--config` versus discovery belong with it.
 fn start(prefix: &str, config_body: &str) -> (TempKbLayout, common::mcp::ServerGuard, String) {
-    let layout = TempKbLayout::new(prefix);
-    layout.write(
-        "note.md",
-        "---\ntitle: Note\n---\n\n## body\n\nOne document so the knowledge base is not empty.\n",
-    );
-    let cfg = layout.root().join("groove.toml");
-    std::fs::write(&cfg, config_body).expect("write groove.toml");
-    let (guard, base) = spawn_mcp_server(layout.kb(), &cfg);
-    (layout, guard, base)
+    common::mcp::spawn_with_config(prefix, config_body)
 }
 
 /// The default list names loopback origins for the bound port and nothing else.
@@ -334,5 +326,299 @@ fn an_empty_allowed_origins_really_disables_the_check() {
         "with allowed_origins = [] the foreign origin got {code}; the off \
          switch is documented as off, and a check that cannot be turned off \
          cannot be reasoned about either"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (L-5) The admin router, which had no Origin check of its own until now.
+//
+// rmcp guards `/mcp`; these routes are served by axum directly, so nothing
+// upstream was ever going to guard them. The list is the same one, and these
+// ask what a browser actually gets back.
+// ---------------------------------------------------------------------------
+
+/// GET `<base><path>` and return the HTTP status code.
+fn get_status(base: &str, path: &str, origin: Option<&str>) -> String {
+    let url = format!("{base}{path}");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s"]);
+    if let Some(origin) = origin {
+        cmd.args(["-H", &format!("origin: {origin}")]);
+    }
+    cmd.args(["-o", "/dev/null", "-w", "%{http_code}", &url]);
+    let out = cmd.output().expect("curl spawn failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn a_cross_origin_request_to_the_admin_router_is_refused() {
+    let (_kb, _guard, base) = start("groove-admin-origin", NO_ORIGIN_KEYS);
+
+    for path in ["/ui", "/api/admin/status"] {
+        let code = get_status(&base, path, Some("https://evil.example"));
+        assert_eq!(
+            code, "403",
+            "{path} answered {code} to a foreign origin. Nothing leaks through \
+             a GET a browser cannot read the response of — but the next admin \
+             route with a side effect inherits whatever this answers today"
+        );
+    }
+}
+
+/// The failure this check breaks first if it is written too eagerly.
+///
+/// The page's own poll of `/api/admin/status` is a same-origin `GET`, and a
+/// browser sends no `Origin` on one of those. Neither does the tray, nor
+/// `curl`. A gate that demanded the header would refuse every real caller
+/// while still admitting the attacker, who sends one because they have to.
+#[test]
+fn the_admin_router_still_answers_a_request_with_no_origin() {
+    let (_kb, _guard, base) = start("groove-admin-no-origin", NO_ORIGIN_KEYS);
+
+    for path in ["/ui", "/api/admin/status"] {
+        let code = get_status(&base, path, None);
+        assert_eq!(
+            code, "200",
+            "{path} answered {code} to a request carrying no Origin header; \
+             that is what /ui's own status poll and the Windows tray send"
+        );
+    }
+}
+
+/// The loopback origin for the port the OS assigned is allowed here too — the
+/// same derivation `/mcp` gets, not a second list built from the requested
+/// address.
+#[test]
+fn the_admin_router_allows_the_origin_the_page_is_served_from() {
+    let (_kb, _guard, base) = start("groove-admin-own-origin", NO_ORIGIN_KEYS);
+
+    let code = get_status(&base, "/api/admin/status", Some(&base));
+
+    assert_eq!(
+        code, "200",
+        "the admin router answered {code} to {base}, which is the origin its \
+         own page is served from"
+    );
+}
+
+/// **The reason the admin gate compares against the same list rather than a
+/// list of its own.** Two surfaces, one setting: they have to reach the same
+/// verdict, or an operator debugging a 403 learns nothing from which URL they
+/// tried.
+///
+/// (codex P1 round 1 on PR #193) It is a *table*, not a pair. rmcp's matcher is
+/// private, so the admin gate necessarily holds a second implementation of one
+/// verdict — the same arrangement `validate_host_header` has had since #57 —
+/// and the failure mode is an rmcp upgrade changing semantics under one of
+/// them. Two origins would not notice: they agree on the ordinary allowed one
+/// and the ordinary foreign one no matter what either side does with case,
+/// brackets, userinfo or a port out of range. **These are the cases where an
+/// upgrade would show up first**, and this test is what turns "they might
+/// drift" into a CI failure on the day they do.
+///
+/// The expected verdicts are deliberately *not* written down. Pinning them
+/// would make this a test of rmcp, which is not ours to fix; requiring only
+/// that the two answers match leaves rmcp free to change and requires us to
+/// follow. The final assertion keeps that from degenerating into "both refuse
+/// everything, so both agree".
+#[test]
+fn an_origin_gets_the_same_verdict_from_both_surfaces() {
+    let (_kb, _guard, base) = start("groove-origin-agree", NO_ORIGIN_KEYS);
+    let port = base
+        .rsplit(':')
+        .next()
+        .expect("base names a port")
+        .to_string();
+
+    let cases = vec![
+        // The ordinary two.
+        ("the origin this page is served from", base.clone()),
+        ("a foreign origin", "https://evil.example".to_string()),
+        // Spellings of the same allowed origin. Every one of these depends on
+        // a normalization step that lives in both implementations.
+        ("a loopback alias", format!("http://localhost:{port}")),
+        ("bracketed IPv6", format!("http://[::1]:{port}")),
+        ("an upper-case scheme", format!("HTTP://127.0.0.1:{port}")),
+        ("an upper-case host", format!("http://LOCALHOST:{port}")),
+        (
+            "userinfo before the host",
+            format!("http://u@127.0.0.1:{port}"),
+        ),
+        // Near misses: right host, wrong one component.
+        ("the wrong scheme", format!("https://127.0.0.1:{port}")),
+        ("no port at all", "http://127.0.0.1".to_string()),
+        ("a different port", "http://127.0.0.1:1".to_string()),
+        // Not tuple origins.
+        ("the opaque origin", "null".to_string()),
+        // Unparseable, where the two could differ on 400 versus 403.
+        ("no scheme", format!("127.0.0.1:{port}")),
+        ("a scheme and nothing else", "http://".to_string()),
+        ("a port out of range", "http://127.0.0.1:99999".to_string()),
+        ("not a URI at all", "banana".to_string()),
+    ];
+
+    let mut verdicts = Vec::new();
+    for (what, origin) in &cases {
+        let mcp = post_initialize(&base, Some(origin));
+        let admin = get_status(&base, "/api/admin/status", Some(origin));
+        assert_eq!(
+            mcp, admin,
+            "{what} ({origin}) got {mcp} from /mcp and {admin} from \
+             /api/admin/status. rmcp guards one and this repository guards the \
+             other; they read one list and must reach one verdict"
+        );
+        verdicts.push(mcp);
+    }
+
+    // Without this, a gate that refused every request would pass the loop.
+    assert!(
+        verdicts.iter().any(|v| v == "200"),
+        "no case was allowed, so the agreement above is the agreement of two \
+         closed doors: {verdicts:?}"
+    );
+    assert!(
+        verdicts.iter().any(|v| v != "200"),
+        "no case was refused, so the agreement above is the agreement of two \
+         open doors: {verdicts:?}"
+    );
+}
+
+/// The other half of the comparison, and the half the first table misses.
+///
+/// (codex P1 round 2 on PR #193) A match reads **two** strings: the request's
+/// `Origin` and the allow-list entry it is compared against. The table above
+/// varies only the first, against the list groove derives from the bound port —
+/// which is always `http://<host>:<port>`, one shape. So every rule that
+/// applies to *entries* went unexercised, and the review named the one that
+/// matters most: an entry written without a port matches every port on that
+/// host (`a_port.is_none() || a_port == o_port`), a rule that lives in rmcp's
+/// matcher and in ours, in two places, agreeing by inspection.
+///
+/// One server per configured entry, because the entry is configuration. Slower
+/// than the table above and worth it: this is the side an rmcp upgrade would
+/// change without any test here noticing.
+#[test]
+fn a_configured_entry_gets_the_same_verdict_from_both_surfaces() {
+    // (entry as written in groove.toml, origins to ask both surfaces about)
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        // The rule the review named. RFC 6454 omits a default port, so the
+        // documented proxy recipe is port-less — and rmcp reads that as "any
+        // port", which is wider than the RFC and is why the startup warning
+        // about wide defaults exists.
+        (
+            "https://kb.example.com",
+            vec![
+                "https://kb.example.com",
+                "https://kb.example.com:443",
+                "https://kb.example.com:8443",
+                "http://kb.example.com",
+            ],
+        ),
+        // An entry with a port matches that port and no other.
+        (
+            "https://kb.example.com:8443",
+            vec![
+                "https://kb.example.com:8443",
+                "https://kb.example.com",
+                "https://kb.example.com:443",
+            ],
+        ),
+        // Padding around the entry, which rmcp trims and so do we.
+        (
+            "  https://kb.example.com  ",
+            vec!["https://kb.example.com", "https://evil.example"],
+        ),
+        // Case folding on the entry side rather than the request side.
+        (
+            "HTTPS://KB.EXAMPLE.COM",
+            vec![
+                "https://kb.example.com",
+                "https://KB.example.com",
+                "https://evil.example",
+            ],
+        ),
+        // The opaque origin as an entry: it matches only itself, never a tuple.
+        ("null", vec!["null", "https://evil.example"]),
+        // Bracketed IPv6 as an entry.
+        (
+            "https://[::1]:9443",
+            vec!["https://[::1]:9443", "https://[::1]:1"],
+        ),
+    ];
+
+    for (i, (entry, origins)) in cases.iter().enumerate() {
+        let config = format!(
+            "[watch]\nenabled = false\n\n[transport.http]\nallowed_origins = [\"{entry}\"]\n"
+        );
+        let (_kb, _guard, base) = start(&format!("groove-origin-entry-{i}"), &config);
+
+        let mut verdicts = Vec::new();
+        for origin in origins {
+            let mcp = post_initialize(&base, Some(origin));
+            let admin = get_status(&base, "/api/admin/status", Some(origin));
+            assert_eq!(
+                mcp, admin,
+                "with allowed_origins = [\"{entry}\"], Origin {origin} got \
+                 {mcp} from /mcp and {admin} from /api/admin/status"
+            );
+            verdicts.push(mcp);
+        }
+
+        // Every row is written so that at least one origin matches the entry
+        // and at least one does not. If that stops being true the row has
+        // stopped testing the entry.
+        assert!(
+            verdicts.iter().any(|v| v == "200") && verdicts.iter().any(|v| v != "200"),
+            "the row for {entry:?} no longer separates a match from a miss: \
+             {verdicts:?}"
+        );
+    }
+}
+
+/// Host is checked before Origin, as it is in rmcp
+/// (`validate_dns_rebinding_headers`). A request failing both therefore hears
+/// about the Host — from either surface, which is the part worth pinning: the
+/// admin router assembles its own layers, and layer order there is the reverse
+/// of the order they are written in.
+///
+/// **Its blind spot, measured:** it also passes with the Origin gate deleted
+/// outright, since the Host gate then answers by default. Order is all this one
+/// checks; the three tests above are what require the gate to be there at all.
+#[test]
+fn the_host_check_answers_before_the_origin_check() {
+    let (_kb, _guard, base) = start("groove-admin-gate-order", NO_ORIGIN_KEYS);
+
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-H",
+            "host: kb.example.lan",
+            "-H",
+            "origin: https://evil.example",
+            &format!("{base}/api/admin/status"),
+        ])
+        .output()
+        .expect("curl spawn failed");
+    let body = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        body.to_ascii_lowercase().contains("host"),
+        "a request failing both gates was answered with {body:?}; the Host \
+         check runs first for /mcp, and the two surfaces should not differ on \
+         which refusal an operator sees"
+    );
+}
+
+#[test]
+fn an_empty_allowed_origins_disables_the_admin_check_too() {
+    let (_kb, _guard, base) = start("groove-admin-disabled", ORIGINS_DISABLED);
+
+    let code = get_status(&base, "/api/admin/status", Some("https://evil.example"));
+
+    assert_eq!(
+        code, "200",
+        "with allowed_origins = [] the admin router answered {code}; the off \
+         switch turns off Origin validation, and an operator who read the \
+         warning and set it anyway did not ask for one surface to keep it on"
     );
 }

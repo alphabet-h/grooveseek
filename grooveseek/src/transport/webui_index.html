@@ -214,16 +214,12 @@ function renderStatus(s) {
   }
   facts.appendChild(fact(second));
 
-  // Windows canonicalisation hands back an extended-length path, so the band
-  // would read `\\?\C:\notes` where the operator typed `C:\notes`. Strip the
-  // prefix for display only; /api/admin/status keeps returning what it returns,
-  // because the tray reads that field too.
-  if (kb.path) {
-    const shown = kb.path
-      .replace(/^\\\\\?\\UNC\\/, "\\\\")
-      .replace(/^\\\\\?\\/, "");
-    facts.appendChild(fact([{ text: shown }]));
-  }
+  // (L-8) The knowledge base's absolute path used to be printed here, with a
+  // note saying the field had to stay in /api/admin/status "because the tray
+  // reads that field too". The tray never did — it reads daemon.pid and
+  // indexing.active. So the one thing displaying an operator's home directory,
+  // in the one view that gets screenshotted into bug reports, was this line,
+  // justified by a consumer that did not exist. Both are gone.
 }
 
 function renderResults(payload, elapsedMs) {
