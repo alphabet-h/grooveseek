@@ -372,10 +372,23 @@ fn metric(run: &serde_json::Value, pointer: &str) -> f64 {
         .unwrap_or_else(|| panic!("no numeric metric at {pointer} in eval JSON:\n{run}"))
 }
 
-/// Which group a golden query belongs to, read from the run rather than from
-/// the golden file, so the split is the one `groove eval` actually scored.
-fn is_multi_answer(q: &serde_json::Value) -> bool {
-    q["expected"].as_array().map_or(0, |e| e.len()) > 1
+/// **The** definition of which group a golden query belongs to.
+///
+/// Both callers reach this one: the model-free sync test, which has
+/// `GoldenQuery` values, and the gate, which has the JSON `groove eval`
+/// printed. Two spellings of the same predicate could disagree after a change
+/// to what "multi-answer" means — say, exactly two expectations rather than at
+/// least two — and the shape of that disagreement is a pull request passing
+/// while the nightly averages a different population.
+fn is_multi_answer(expected_count: usize) -> bool {
+    expected_count > 1
+}
+
+/// How many documents a `per_query` entry from the eval JSON expects. Read
+/// from the run rather than from the golden file, so the split is the one
+/// `groove eval` actually scored.
+fn expected_count(q: &serde_json::Value) -> usize {
+    q["expected"].as_array().map_or(0, |e| e.len())
 }
 
 /// The mean of one per-query metric over one group, and that group's size.
@@ -388,7 +401,7 @@ fn group_mean(run: &serde_json::Value, multi: bool, pointer: &str) -> (usize, f6
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|q| is_multi_answer(q) == multi)
+        .filter(|q| is_multi_answer(expected_count(q)) == multi)
         .map(|q| {
             q.pointer(pointer)
                 .and_then(|v| v.as_f64())
@@ -420,7 +433,7 @@ fn group_mean(run: &serde_json::Value, multi: bool, pointer: &str) -> (usize, f6
 fn incomplete_report(run: &serde_json::Value) -> String {
     let mut report = String::new();
     for q in run["per_query"].as_array().into_iter().flatten() {
-        if !is_multi_answer(q) {
+        if !is_multi_answer(expected_count(q)) {
             continue;
         }
         let at_5 = q["metrics"]["recall_at_k"]["5"].as_f64().unwrap_or(0.0);
@@ -604,7 +617,7 @@ fn kb_eval_corpus_and_golden_stay_in_sync() {
     let multi = golden
         .queries
         .iter()
-        .filter(|q| q.expected.len() > 1)
+        .filter(|q| is_multi_answer(q.expected.len()))
         .count();
     assert_eq!(
         multi, GOLDEN_MULTI_ANSWER_QUERY_COUNT,
