@@ -355,6 +355,214 @@ fn windows_register_scheduledtask_smoke_test() {
     );
 }
 
+/// The macOS backend, end to end, through the command line.
+///
+/// **L-3: there was no such test, and no leg that could have run one.** The
+/// launchd backend is reached only from `#[ignore]` territory, and nightly ran
+/// `ubuntu` and `windows` — so `install`, `status` and `uninstall` on macOS
+/// were never executed by anything, for the same reason AU-09 gave for adding
+/// the Windows leg.
+///
+/// It goes through the binary rather than `LaunchAgent` directly, because
+/// `ServiceBackend` is `pub(crate)` and because the argument wiring is part of
+/// what was unverified.
+///
+/// **What it asserts, and what it deliberately does not.** launchd knowing the
+/// label is the whole question here: `status` telling `not found` from anything
+/// else is what proves `bootstrap` reached `gui/<uid>`. Whether the daemon then
+/// *runs* depends on the embedding model loading and on a free port, neither of
+/// which this is about — so `running` is accepted and so is `stopped`, and only
+/// `not found` fails.
+///
+/// Measured before this was written: on a GitHub-hosted mac `launchctl
+/// managername` is `Aqua`, `bootstrap gui/501` exits 0, and `RunAtLoad` really
+/// does start the program. `.dev/knowledge/macos-ci-launchd-measurements.md`.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "bootstraps a real LaunchAgent — nightly's macOS leg, or run manually"]
+fn macos_install_status_uninstall_round_trip() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn groove() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_groove"))
+    }
+
+    let root = TempRoot::new("groove-macos-svc");
+    let kb = root.path().join("kb");
+    std::fs::create_dir_all(&kb).expect("create kb dir");
+    let config_home = root.path().join("cfg");
+
+    // Unique per run, and `validate_service_name`-clean.
+    let name = format!("smoke{}", std::process::id());
+    let plist = PathBuf::from(std::env::var("HOME").expect("HOME is set on macOS"))
+        .join("Library/LaunchAgents")
+        .join(format!("com.groove.{name}.plist"));
+
+    // `GROOVE_CONFIG_HOME` keeps the installer out of the real config
+    // directory; the plist still lands in the real `~/Library/LaunchAgents`,
+    // because that is the only place launchd reads user agents from. The
+    // cleanup below is what keeps that from leaking.
+    let run = |args: &[&str]| {
+        Command::new(groove())
+            .args(args)
+            .env("GROOVE_CONFIG_HOME", &config_home)
+            .output()
+            .expect("groove service invocation")
+    };
+
+    let install = run(&[
+        "service",
+        "install",
+        "--service-name",
+        &name,
+        "--kb-path",
+        kb.to_str().unwrap(),
+        // Port 0 so a busy 3100 cannot make this fail for an unrelated reason.
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+
+    // Cleanup before the asserts, so a failure leaves no agent loaded and no
+    // plist behind — the shape the Windows smoke test uses.
+    //
+    // **Every observation is taken before the cleanup and kept in a variable.**
+    // The first version asserted `!plist.exists()` *after* its own
+    // `remove_file`, so the cleanup rather than `uninstall` was what made it
+    // true, and the sibling test below asserted `plist.exists()` after the
+    // same line and failed on the macOS runner for exactly that. Cleanup-first
+    // is the right order; reading state the cleanup also writes is the trap.
+    let uninstall = run(&["service", "uninstall", "--service-name", &name]);
+    let plist_gone_after_uninstall = !plist.exists();
+    let after = run(&["service", "status", "--service-name", &name]);
+    let _ = std::fs::remove_file(&plist);
+
+    assert!(
+        install.status.success(),
+        "service install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert!(
+        uninstall.status.success(),
+        "service uninstall failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&uninstall.stdout),
+        String::from_utf8_lossy(&uninstall.stderr),
+    );
+    assert!(
+        plist_gone_after_uninstall,
+        "uninstall must remove {}",
+        plist.display()
+    );
+    // Same reasoning as its sibling: the status has to have run before its
+    // output means anything.
+    assert!(
+        after.status.success(),
+        "service status failed\nstderr: {}",
+        String::from_utf8_lossy(&after.stderr),
+    );
+    let after_text = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        after_text.contains("not found"),
+        "after uninstall the label must be gone from launchd, got: {after_text}"
+    );
+}
+
+/// The other half: while it is installed, launchd knows the label.
+///
+/// Separate from the round trip because it has to look **between** install and
+/// uninstall, and doing that inside the round trip would mean skipping the
+/// cleanup-before-assert order that keeps a failure from leaving an agent
+/// loaded.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "bootstraps a real LaunchAgent — nightly's macOS leg, or run manually"]
+fn macos_install_makes_launchd_know_the_label() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn groove() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_groove"))
+    }
+
+    let root = TempRoot::new("groove-macos-svc-status");
+    let kb = root.path().join("kb");
+    std::fs::create_dir_all(&kb).expect("create kb dir");
+    let config_home = root.path().join("cfg");
+    let name = format!("live{}", std::process::id());
+    let plist = PathBuf::from(std::env::var("HOME").expect("HOME is set on macOS"))
+        .join("Library/LaunchAgents")
+        .join(format!("com.groove.{name}.plist"));
+
+    let run = |args: &[&str]| {
+        Command::new(groove())
+            .args(args)
+            .env("GROOVE_CONFIG_HOME", &config_home)
+            .output()
+            .expect("groove service invocation")
+    };
+
+    let install = run(&[
+        "service",
+        "install",
+        "--service-name",
+        &name,
+        "--kb-path",
+        kb.to_str().unwrap(),
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+    // Read before the cleanup, keep the answer: the cleanup deletes this file,
+    // so asking afterwards asks about the cleanup. Measured on the runner —
+    // the first version of this test failed here with "install must write
+    // .../com.groove.live25874.plist" while its sibling round trip passed,
+    // because `install` really had written it and `remove_file` below really
+    // had taken it away again.
+    let plist_written_by_install = plist.exists();
+    let during = run(&["service", "status", "--service-name", &name]);
+    let list = run(&["service", "list"]);
+
+    let _ = run(&["service", "uninstall", "--service-name", &name]);
+    let _ = std::fs::remove_file(&plist);
+
+    assert!(
+        install.status.success(),
+        "service install failed\nstderr: {}",
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert!(
+        plist_written_by_install,
+        "install must write {}",
+        plist.display()
+    );
+
+    // `running` or `stopped` — either means `launchctl list <label>` found it,
+    // which is what `bootstrap gui/<uid>` succeeding looks like from here.
+    // Whether the daemon came up is a different question and not this one's.
+    //
+    // **Named positively, and after the exit status.** `!contains("not found")`
+    // passes on empty stdout, so a `status` that died before printing anything
+    // — a CLI dispatch regression, say — would read as success. Errors go to
+    // stderr under this project's output contract, so stdout alone cannot tell
+    // "found it" from "never got there" (codex P2 on PR #207).
+    assert!(
+        during.status.success(),
+        "service status failed\nstderr: {}",
+        String::from_utf8_lossy(&during.stderr),
+    );
+    let during_text = String::from_utf8_lossy(&during.stdout);
+    assert!(
+        during_text.contains("running") || during_text.contains("stopped"),
+        "while installed, launchd must know com.groove.{name} — status must say \
+         running or stopped, got: {during_text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains(&name),
+        "`service list` must name an installed instance, got: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}
+
 #[test]
 fn uninstall_purge_without_yes_returns_abort_msg() {
     let result =

@@ -53,34 +53,26 @@ jobs:
         include:
           - os: ubuntu-latest
             # Linux leg は全部走らせる (巨大モデルを要求するものを含む)。
-            skip_args: ''
+            big_models: run
             # resolve_cache_dir() の fallback #2 (dirs::cache_dir()) の実体。
             # なぜこれも cache するかは下の "Cache fastembed models" 参照。
             default_model_dir: ~/.cache/fastembed
           - os: windows-latest
-            # Windows leg は「巨大モデルを要求するもの」だけ除外する。
-            # **下の一覧がそのまま定義で、件数は書かない** — 数詞は一覧と別に
-            # 腐る (L-11 で同じ形を直した)。`skip_args` と 1 対 1 で対応する:
-            #   - test_bge_m3_produces_1024_dim       (BGE-M3 ~2.3 GB)
-            #   - test_bge_reranker_v2_m3_reorders_ja (reranker ~2.3 GB)
-            #   - kb_eval_retrieval_quality_bge_m3    (BGE-M3 ~2.3 GB、BU-11)
-            #   - groove_search_reads_rerank_by_default_from_the_config_file
-            #                                         (reranker ~2.3 GB、L-25)
-            # 理由:
-            #   (a) windows-latest の空きディスクは公称 14 GB しかなく、
-            #       4.6 GB のモデル展開はビルド領域を圧迫する
-            #   (b) Actions cache は repo あたり 10 GB 上限の LRU。Linux leg の
-            #       model cache だけで ~2.6 GB あり、同じものを Windows 側にも
-            #       積むと PR CI 用の cache まで押し出してしまう
-            # 除外しているものはいずれも埋め込み次元・rerank 並び替え・
-            # retrieval 品質・設定の配線を見る **OS 非依存** の検査で、
-            # Linux leg が同一の assert を通している。
-            # ONNX を Windows 上で実行する経路自体は BGE-small を使う他テストが
-            # 踏むため、除外しても Windows 固有の死角は生まれない — BU-11 の
-            # 品質ゲートも BGE-small 版 (kb_eval_retrieval_quality_bge_small)
-            # が両 OS で走る。
-            skip_args: '--skip test_bge_m3_produces_1024_dim --skip test_bge_reranker_v2_m3_reorders_ja --skip kb_eval_retrieval_quality_bge_m3 --skip groove_search_reads_rerank_by_default_from_the_config_file'
+            big_models: skip
             default_model_dir: ~/AppData/Local/fastembed
+          # L-3: macOS の service backend (launchd LaunchAgent) を検査する
+          # `#[ignore]` テストは leg が無い間**永久に走らない** — AU-09 が
+          # Windows について言ったのと同じ理由。GitHub の hosted mac は
+          # `launchctl managername` が `Aqua` を返す (= GUI セッションがある)
+          # ので、backend が使う `gui/<uid>` domain がそのまま通る。実測:
+          # `.dev/knowledge/macos-ci-launchd-measurements.md`。
+          #
+          # 公式 runner reference: 「Use of the standard GitHub-hosted runners
+          # is free and unlimited on public repositories」で、その表に
+          # `macos-latest` が入っている。
+          - os: macos-latest
+            big_models: skip
+            default_model_dir: ~/Library/Caches/fastembed
     # 初回は 5 GB 弱の DL があり得るので thoroughly 余裕を持つ。
     timeout-minutes: 60
     env:
@@ -175,7 +167,42 @@ jobs:
         # admin endpoint テスト 2 本は `#[ignore]` でもあるので、PR CI が
         # feature 付きで compile しても**走らない** — 実行まで届くのは
         # `--include-ignored` を渡すこの job だけ。
-        run: cargo test --features test-helpers -- --include-ignored ${{ matrix.skip_args }}
+        #
+        # **除外一覧はここに 1 つだけ置く。** matrix の leg ごとに書くと、
+        # skip する leg が 2 つある今は同じ長い文字列が 2 か所に並び、
+        # 片方だけ更新される形になる。leg 側は `big_models` で「走らせるか」
+        # だけを言い、何を外すかはここが決める。
+        #
+        # 一覧がそのまま定義で、件数は書かない (数詞は一覧と別に腐る。L-11)。
+        # 外しているのは巨大モデルを要求するものだけ:
+        #   - test_bge_m3_produces_1024_dim       (BGE-M3 ~2.3 GB)
+        #   - test_bge_reranker_v2_m3_reorders_ja (reranker ~2.3 GB)
+        #   - kb_eval_retrieval_quality_bge_m3    (BGE-M3 ~2.3 GB、BU-11)
+        #   - groove_search_reads_rerank_by_default_from_the_config_file
+        #                                         (reranker ~2.3 GB、L-25)
+        # 理由:
+        #   (a) windows-latest / macos-latest の空きディスクは公称 14 GB で、
+        #       4.6 GB のモデル展開はビルド領域を圧迫する
+        #   (b) Actions cache は repo あたり 10 GB 上限の LRU。Linux leg の
+        #       model cache だけで ~2.6 GB あり、同じものを他 leg にも積むと
+        #       PR CI 用の cache まで押し出してしまう
+        # いずれも埋め込み次元・rerank 並び替え・retrieval 品質・設定の配線を
+        # 見る **OS 非依存** の検査で、Linux leg が同一の assert を通している。
+        # ONNX を各 OS 上で実行する経路自体は BGE-small を使う他テストが踏むので、
+        # 除外しても OS 固有の死角は生まれない — BU-11 の品質ゲートも BGE-small 版
+        # (kb_eval_retrieval_quality_bge_small) が全 leg で走る。
+        shell: bash
+        run: |
+          if [ "${{ matrix.big_models }}" = "skip" ]; then
+            SKIP='--skip test_bge_m3_produces_1024_dim
+                  --skip test_bge_reranker_v2_m3_reorders_ja
+                  --skip kb_eval_retrieval_quality_bge_m3
+                  --skip groove_search_reads_rerank_by_default_from_the_config_file'
+          else
+            SKIP=''
+          fi
+          # Unquoted on purpose: the newlines above are argument separators.
+          cargo test --features test-helpers -- --include-ignored $SKIP
 
       # BU-25: the benches under `benches/` were compiled by every PR
       # (`cargo clippy --all-targets`, twice, so the `heavy-bench` halves are
