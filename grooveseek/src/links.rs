@@ -672,12 +672,17 @@ mod tests {
     /// `server/documents.rs` — three call sites, none of which noticed
     /// (codex P1 on PR #203). The wording is the easy thing to change back.
     ///
-    /// **The path is not covered by this**, and cannot be without deciding a
-    /// separate question: `path.display()` puts the file's own name in the
-    /// line, so a note named in Japanese makes it non-ASCII no matter what
-    /// these literals say. Escaping it would keep the promise and hand the
-    /// reader `\u{65e5}\u{672c}` where they expected a filename. The path here
-    /// is ASCII so that this test is about the wording only.
+    /// **The path is deliberately not covered.** `AGENTS.md` scopes the rule
+    /// to the words a diagnostic chooses rather than the data it names, and
+    /// the reason is measured: `groove index` already prints the relative path
+    /// of every file it indexes, so a note called `日本語のノート.md` reaches
+    /// stderr as itself on every ordinary run. A rule that forbade that would
+    /// condemn the main command's main output for the audience the project is
+    /// built for, and escaping it here would make this one line inconsistent
+    /// with the twelve others that name a path (codex P1 on PR #206).
+    ///
+    /// The path in the fixture is ASCII so that this test is about the wording
+    /// only.
     #[test]
     fn every_refusal_line_is_ascii() {
         let path = Path::new("/kb/notes.md");

@@ -43,6 +43,31 @@ pub const MAX_GOLDEN_FILE_BYTES: u64 = 1024 * 1024;
 /// that is not a history at all.
 pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Whether **the name** is taken, which is not the same as whether a file can
+/// be read through it.
+///
+/// `Path::exists` follows a symlink and answers about the target, so a link
+/// whose target is gone reads as absent. For these two files "absent" is the
+/// answer with consequences — the golden's absence is a hint and the history's
+/// absence is an empty history that then gets **saved over the link** — so the
+/// question has to be about the name, and anything else is left to
+/// [`read_bounded`] to refuse (codex P2 on PR #203).
+///
+/// **`NotFound` is an answer; anything else is a failure to ask.** An ACL, an
+/// unreadable parent, a filesystem that went away — returning `false` for
+/// those makes the history empty, and if the condition clears before the save
+/// the new run replaces the baselines without ever comparing (codex P2 on
+/// PR #206). The doctor half of the original PR had the same defect in the
+/// same shape.
+fn is_present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("could not look at {}", path.display())),
+    }
+}
+
 /// Read one of those two files, bounded, from the handle the check was made on.
 ///
 /// [`crate::links::read_checked`] is the same route `.grooveignore` takes, so a
@@ -56,19 +81,6 @@ pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// that refusing reparse points there would refuse every OneDrive and Dropbox
 /// placeholder. Saying "a symlink is refused" without that scope would be a
 /// promise this does not keep (codex P2 on PR #203).
-/// Whether **the name** is taken, which is not the same as whether a file can
-/// be read through it.
-///
-/// `Path::exists` follows a symlink and answers about the target, so a link
-/// whose target is gone reads as absent. For these two files "absent" is the
-/// answer with consequences — the golden's absence is a hint and the history's
-/// absence is an empty history that then gets **saved over the link** — so the
-/// question has to be about the name, and anything else is left to
-/// [`read_bounded`] to refuse (codex P2 on PR #203).
-fn is_present(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
-}
-
 fn read_bounded(path: &Path, cap: u64, what: &str) -> Result<Vec<u8>> {
     match crate::links::read_checked(path, cap) {
         Ok(crate::links::Content::Bytes(b)) => Ok(b),
@@ -131,7 +143,7 @@ impl GoldenSet {
     pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
         // See [`is_present`]: a dangling symlink is a name that is taken, and
         // "there is no golden file" would be the wrong thing to say about it.
-        if !is_present(path) {
+        if !is_present(path)? {
             anyhow::bail!(
                 "no golden file at {} (hint: pass --golden or create <kb>/.groove-eval.yml)",
                 path.display()
@@ -942,7 +954,7 @@ impl History {
         // disconnecting the baselines for good (codex P2 on PR #203). Asking
         // about the name rather than the target sends it to the checked read,
         // which refuses it and stops the run.
-        if !is_present(path) {
+        if !is_present(path)? {
             return Ok(Self::default());
         }
         let bytes = read_bounded(path, MAX_HISTORY_FILE_BYTES, "eval history")?;
