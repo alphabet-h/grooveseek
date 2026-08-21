@@ -288,6 +288,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   would take lines away from the first, and the first is where the bound
   address comes from.
 
+- **Nightly gained a macOS leg, and the launchd backend gained end-to-end
+  tests.** `install`, `status` and `uninstall` are reached only from `#[ignore]`
+  territory, and nightly ran Linux and Windows — so on macOS none of them had
+  ever been executed by anything. That is the same gap AU-09 closed for
+  Windows, left open for the third platform.
+
+  Measured on a GitHub-hosted runner before writing any of it: `launchctl
+  managername` answers `Aqua`, so the `gui/<uid>` domain the backend bootstraps
+  into exists there — which is not a given, since `launchctl(1)` says a GUI
+  domain is created at GUI login and other CI fleets report
+  `Bootstrap failed: 125` for exactly this. `bootstrap` exits 0, `RunAtLoad`
+  really starts the program, and `bootout` cleans up.
+
+  The skip list for the big-model tests moved out of the matrix and into the
+  step that uses it, now that two legs share it: a long string written once per
+  leg is a string that gets updated once.
+
 - **Four gaps the 2026-08-18 audit named now have tests.** No behaviour change.
 
   `groove service uninstall` and `status` take `--service-name`; the instance
