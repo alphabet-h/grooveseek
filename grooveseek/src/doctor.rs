@@ -771,10 +771,15 @@ mod tests {
     }
 
     #[test]
-    fn every_renamed_file_is_looked_for_where_its_replacement_is_read() {
-        // Table-driven rather than one test per row: a row added with the
-        // wrong `location` would be looked for in a directory the file is not
-        // in, so it would never fire and no per-row test would exist to say so.
+    fn every_row_in_the_table_raises_its_own_finding_and_only_that_one() {
+        // Table-driven rather than one test per row, so a row added later is
+        // covered without anyone remembering to cover it.
+        //
+        // This says nothing about *where* the file is looked for: the fixture
+        // is written at `Legacy::path`, so a mistake in `Legacy::path` moves
+        // the fixture with it. Measured — pointing `BesideIndex` at the
+        // knowledge base root left this green. That half is
+        // `each_old_name_is_looked_for_beside_the_file_that_replaced_it`.
         for legacy in RENAMED {
             let dir = TempDir::new("renamed");
             let kb = kb_in(&dir);
@@ -791,6 +796,62 @@ mod tests {
                 legacy.old,
                 path.display(),
                 legacy.check
+            );
+        }
+    }
+
+    /// Where each replacement is actually read from, taken from production
+    /// wherever production exposes it.
+    ///
+    /// This is the independent half. `Legacy::path` cannot be checked by a
+    /// test that also uses it to place the fixture, so the expectation has to
+    /// come from somewhere the check does not.
+    fn where_the_replacement_lives(kb: &Path) -> Vec<(&'static str, PathBuf)> {
+        vec![
+            // `ExclusionRules::load` reads `kb_path.join(IGNORE_FILE_NAME)`.
+            (
+                "legacy-ignore-file",
+                kb.join(crate::exclusion::IGNORE_FILE_NAME),
+            ),
+            ("legacy-index-file", crate::resolve_db_path(kb)),
+            ("legacy-history-file", crate::eval::default_history_path(kb)),
+            // `.groove-eval.yml` has no exposed default — `main.rs` builds it
+            // inline at the `eval` and `tune` call sites — so this restates
+            // the expression those two use. The weakest anchor of the four,
+            // and the only one that would survive production moving the file.
+            ("legacy-golden-file", kb.join(".groove-eval.yml")),
+        ]
+    }
+
+    #[test]
+    fn each_old_name_is_looked_for_beside_the_file_that_replaced_it() {
+        let kb = std::env::temp_dir()
+            .join("groove-doctor-anchor-no-such-parent")
+            .join("kb");
+        let anchors = where_the_replacement_lives(&kb);
+        assert_eq!(
+            anchors.len(),
+            RENAMED.len(),
+            "every row in RENAMED needs an anchor here, or its location is \
+             checked by nothing"
+        );
+        for (check, replacement) in anchors {
+            let legacy = RENAMED
+                .iter()
+                .find(|l| l.check == check)
+                .unwrap_or_else(|| panic!("{check} is not a row in RENAMED"));
+            assert_eq!(
+                replacement
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned()),
+                Some(legacy.new.to_string()),
+                "{check}: the table names a replacement production does not use"
+            );
+            assert_eq!(
+                legacy.path(&kb),
+                replacement.with_file_name(legacy.old),
+                "{check}: the old name is looked for somewhere other than \
+                 beside the file that replaced it"
             );
         }
     }

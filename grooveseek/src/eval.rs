@@ -3558,14 +3558,41 @@ enabled = true
         // last time costs less than refusing to measure at all.
         let dir = TempDir::new("big-history");
         let path = dir.0.join(".groove-eval-history.json");
-        let padding = "x".repeat(usize::try_from(MAX_EVAL_FILE_BYTES).unwrap_or(0) + 1);
-        std::fs::write(&path, format!("{{\"runs\": [], \"pad\": \"{padding}\"}}"))
-            .expect("write the oversize history");
+
+        // A real history with a run in it, then padded past the cap with a
+        // field `History` ignores. **The run is the point**: a fixture whose
+        // `runs` were empty would come back empty whether the cap fired or
+        // not, and the test would pass with no bound at all. Emptiness has to
+        // be something only the refusal can produce.
+        let mut real = History::default();
+        real.push_front(sample_run(100, 0.5), 10);
+        real.save(&path).expect("save a real history");
+        let saved = std::fs::read_to_string(&path).expect("read it back");
+        let pad = "x".repeat(usize::try_from(MAX_EVAL_FILE_BYTES).unwrap_or(0));
+        let padded = format!(
+            "{{\"pad\":\"{pad}\",{}",
+            saved
+                .trim()
+                .strip_prefix('{')
+                .expect("history is an object")
+        );
+        assert!(padded.len() as u64 > MAX_EVAL_FILE_BYTES);
+        std::fs::write(&path, &padded).expect("write the oversize history");
+
+        // The fixture parses when it is allowed to, so the emptiness below is
+        // the cap and nothing else.
+        assert_eq!(
+            serde_json::from_str::<History>(&padded)
+                .expect("the padded fixture is still valid history")
+                .runs
+                .len(),
+            1
+        );
 
         let history = History::load(&path).expect("history load never fails");
         assert!(
             history.runs.is_empty(),
-            "an unreadable history starts fresh rather than being parsed"
+            "an oversize history starts fresh rather than being read whole"
         );
     }
 }
