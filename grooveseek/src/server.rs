@@ -3717,6 +3717,18 @@ mod tests {
             // result can only ever show half of the shape.
             serde_json::Value::Array(items) => {
                 for item in items {
+                    // A primitive element has no path of its own — recursion
+                    // reaches it and finds nothing to name. Its kind belongs
+                    // to the container, whose documented type is what names
+                    // it: "array of strings" promises both. Without this,
+                    // `tags` could start carrying numbers with the type check
+                    // still green (codex P2 round 8 on PR #201).
+                    if !item.is_object() && !item.is_array() {
+                        kinds
+                            .entry(prefix.to_string())
+                            .or_default()
+                            .insert(json_kind(item));
+                    }
                     walk_with_kinds(item, &format!("{prefix}[]"), out, kinds);
                 }
             }
