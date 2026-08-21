@@ -2915,6 +2915,71 @@ mod tests {
         }
     }
 
+    /// The breaking change in #180, from the side that breaks.
+    ///
+    /// `uninstall` and `status` used to take the instance name **positionally**
+    /// while `install` took `--service-name`, so one thing had two spellings.
+    /// `docs/stability.md` freezes subcommand positionals as well as long
+    /// flags, so 1.0 would have kept both forever, and the positional was
+    /// removed instead.
+    ///
+    /// Nothing checked the removal. A `#[arg(long)]` that kept a positional
+    /// alias, or a `default_value` quietly swallowing the old spelling, would
+    /// look identical from inside the code and would refreeze what #180 set
+    /// out to drop.
+    #[test]
+    fn the_service_name_is_a_flag_on_every_subcommand_that_takes_one() {
+        for sub in ["uninstall", "status"] {
+            let cli = Cli::try_parse_from(["groove", "service", sub, "--service-name", "work"])
+                .unwrap_or_else(|e| panic!("`service {sub} --service-name work` must parse: {e}"));
+            assert_eq!(service_name_of(&cli), Some("work".to_string()));
+
+            // The old spelling. It has to be **rejected**, not ignored: a
+            // positional that clap accepts and drops would leave
+            // `groove service uninstall work` removing the instance named
+            // `groove`, which is worse than the error.
+            let old = Cli::try_parse_from(["groove", "service", sub, "work"]);
+            assert!(
+                old.is_err(),
+                "`service {sub} work` (the pre-#180 positional) must be refused, \
+                 not silently read as the default instance"
+            );
+
+            // Omitting it is the single-instance case, and both subcommands
+            // have to agree with `install` about what that name is.
+            let bare = Cli::try_parse_from(["groove", "service", sub])
+                .unwrap_or_else(|e| panic!("`service {sub}` must parse: {e}"));
+            assert_eq!(service_name_of(&bare), Some("groove".to_string()));
+
+            // The validator came with the flag: a name `install` refuses can
+            // never have been installed, so accepting it here would offer to
+            // operate on something that cannot exist.
+            assert!(
+                Cli::try_parse_from(["groove", "service", sub, "--service-name", "../escape"])
+                    .is_err(),
+                "`service {sub}` must apply the same name validator as `install`"
+            );
+        }
+    }
+
+    /// The `service_name` of whichever service subcommand this is, if it has
+    /// one. Keeps the loop above from having to name each variant twice.
+    fn service_name_of(cli: &Cli) -> Option<String> {
+        match &cli.command {
+            Commands::Service { action } => match action {
+                ServiceSubcommand::Install { service_name, .. }
+                | ServiceSubcommand::Uninstall { service_name, .. }
+                | ServiceSubcommand::Status { service_name }
+                | ServiceSubcommand::TrayInstall { service_name, .. }
+                | ServiceSubcommand::TrayUninstall { service_name, .. } => {
+                    Some(service_name.clone())
+                }
+                ServiceSubcommand::List => None,
+            },
+            _ => None,
+        }
+    }
+
     #[test]
     fn test_eval_cli_clap_parses_mmr_flags() {
         let cli = Cli::try_parse_from([

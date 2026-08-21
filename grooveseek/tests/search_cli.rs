@@ -207,3 +207,251 @@ fn test_search_cli_rejects_mmr_same_doc_penalty_above_one() {
         "stderr should contain parser error message; got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Boundary inputs (audit L-27)
+//
+// Three shapes nothing exercised: a knowledge base with nothing in it, a query
+// far past the 1 KiB the MCP surface refuses, and a query made only of
+// characters outside the BMP.
+//
+// All three go through `groove search`, because that is the surface where they
+// arrive untouched. The MCP tool rejects the long one at the door
+// (`SEARCH_QUERY_MAX_BYTES`) and the command line has no such cap, so what the
+// pipeline actually does with these inputs is only observable from here.
+// ---------------------------------------------------------------------------
+
+/// Index `kb` and hand back the status, so each test can say what it expects
+/// rather than unwrapping in the middle of itself.
+fn index(kb: &TempKb) -> std::process::ExitStatus {
+    Command::new(bin())
+        .args(["index", "--kb-path", kb.kb().to_str().unwrap()])
+        .status()
+        .expect("groove index")
+}
+
+fn search_json(kb: &TempKb, query: &str) -> std::process::Output {
+    Command::new(bin())
+        .args([
+            "search",
+            query,
+            "--kb-path",
+            kb.kb().to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("groove search")
+}
+
+#[test]
+#[ignore] // requires built binary + embedding model download
+fn an_empty_knowledge_base_searches_to_an_empty_result_set() {
+    // Not an error: there is an index, it just holds nothing. The wrapper has
+    // to come out whole so a caller parsing it does not need a special case
+    // for the empty corpus.
+    let kb = TempKb::new("groove-boundary-empty");
+    assert!(index(&kb).success(), "indexing an empty directory succeeds");
+
+    let out = search_json(&kb, "anything at all");
+    assert!(
+        out.status.success(),
+        "searching an empty index is not a failure; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the wrapper is still valid JSON");
+    assert_eq!(
+        v["results"].as_array().map(Vec::len),
+        Some(0),
+        "no documents means no results: {v}"
+    );
+    assert_eq!(
+        v["low_confidence"], false,
+        "with fewer than two scores there is no ratio to judge, so the flag is \
+         false rather than a guess: {v}"
+    );
+}
+
+#[test]
+#[ignore]
+fn a_query_far_past_the_mcp_cap_is_answered_rather_than_refused() {
+    // The MCP tool refuses anything over 1 KiB; `groove search` has no such
+    // cap. This records what that means instead of assuming it is harmless.
+    // What keeps it finite is `MAX_PHRASES` in the FTS compiler and the
+    // tokenizer's own truncation — neither of them a limit on the input.
+    let kb = TempKb::new("groove-boundary-long");
+    kb.write(
+        "a.md",
+        "---\ntitle: Tokio\n---\n\n# rust async\n\nThis document describes the \
+         tokio runtime, async/await, and rust concurrency primitives in detail.\n",
+    );
+    assert!(index(&kb).success());
+
+    // 8 KiB — eight times what the MCP surface accepts, and the largest round
+    // number that is portable.
+    //
+    // **The command line has an earlier bound than groove does, and it belongs
+    // to the OS.** Measured: 64 KiB here fails before the process starts, with
+    // `Os { code: 206, kind: InvalidFilename }` — Windows caps the whole
+    // command line at 32,767 characters. So on this surface the practical
+    // ceiling is the spawn, not anything in the search path, and a test that
+    // reached for a genuinely huge query would be measuring `CreateProcess`.
+    let long = "rust async tokio concurrency ".repeat(300);
+    assert!(long.len() > 8 * 1024 && long.len() < 16 * 1024);
+
+    let started = std::time::Instant::now();
+    let out = search_json(&kb, &long);
+    assert!(
+        out.status.success(),
+        "a long query is answered, not refused, on the command line; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .expect("the answer is still valid JSON");
+    // A tripwire, not a benchmark. If the work ever became linear in the input
+    // length this would be minutes rather than seconds, and the number is loose
+    // enough that a slow shared runner does not trip it.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "an 8 KiB query took {:?}; the phrase cap is supposed to keep the work \
+         bounded by the corpus rather than by the query",
+        started.elapsed()
+    );
+}
+
+#[test]
+#[ignore]
+fn a_query_of_only_astral_characters_is_answered_cleanly() {
+    // Every character here is a surrogate *pair* in UTF-16 and four bytes in
+    // UTF-8. The trigram and CJK paths slice by character while `match_spans`
+    // reports byte offsets, so a query where those two units differ by four is
+    // where an off-by-one would show.
+    let kb = TempKb::new("groove-boundary-astral");
+    kb.write(
+        "a.md",
+        "---\ntitle: Emoji\n---\n\n# symbols\n\nThis document is about the \
+         tokio runtime and has no emoji in it at all, deliberately.\n",
+    );
+    assert!(index(&kb).success());
+
+    let out = search_json(&kb, "🐙🦀🚀🎉🧭");
+    assert!(
+        out.status.success(),
+        "an astral-only query is answered, not a crash; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the answer is still valid JSON");
+    assert!(
+        v["results"].is_array(),
+        "the wrapper comes out whole even when nothing matches: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `rerank_by_default` on the command line (audit L-25)
+//
+// The decision is a pure function with its own tests (`cli_should_rerank` in
+// main.rs). What none of them can see is whether `groove search` hands it the
+// key from `groove.toml` at all — that join is one line, and a line that
+// stopped passing `cfg.rerank_by_default` would leave every one of those tests
+// green while the file silently stopped counting.
+//
+// The observable is the **shape of `score`**. Without rerank a score is an RRF
+// sum, bounded by `2 / (rrf_k + 1)` ≈ 0.033 at the default `rrf_k = 60`. With
+// rerank the score is replaced by the cross-encoder's logit, which is on a
+// different scale entirely and is usually negative for a weak match. So the
+// two runs are told apart by the number, without needing to reason about which
+// ordering is "better".
+// ---------------------------------------------------------------------------
+
+/// The largest an RRF score can be: both retrieval legs ranking a chunk first.
+const RRF_CEILING: f64 = 2.0 / 61.0;
+
+/// Search with an explicit config file, which is what makes it trusted.
+fn search_json_with_config(kb: &TempKb, query: &str, config: &Path) -> std::process::Output {
+    Command::new(bin())
+        .args([
+            "search",
+            query,
+            "--kb-path",
+            kb.kb().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("groove search")
+}
+
+fn scores(out: &std::process::Output) -> Vec<f64> {
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the answer is valid JSON");
+    v["results"]
+        .as_array()
+        .expect("results is an array")
+        .iter()
+        .map(|h| h["score"].as_f64().expect("score is a number"))
+        .collect()
+}
+
+#[test]
+#[ignore] // requires the built binary, the embedding model, and the reranker (~2.3 GB)
+fn groove_search_reads_rerank_by_default_from_the_config_file() {
+    let kb = TempKb::new("groove-rerank-by-default");
+    for (name, title) in [("a.md", "Tokio runtime"), ("b.md", "Async primitives")] {
+        kb.write(
+            name,
+            &format!(
+                "---\ntitle: {title}\n---\n\n# rust async\n\nThis document describes the \
+                 tokio runtime, async/await, and rust concurrency primitives in detail, \
+                 at enough length to pass the quality filter.\n"
+            ),
+        );
+    }
+    assert!(index(&kb).success());
+
+    // `bge-v2-m3` rather than the 280 MB `bge-base`, so this shares a cache
+    // entry with `test_bge_reranker_v2_m3_reorders_ja` instead of adding a
+    // second reranker to every nightly. It comes with that test's treatment
+    // too: the Windows leg skips it by name in `nightly.yml`, for the reasons
+    // written there. What is under test is OS-independent wiring, and the
+    // Linux leg runs it.
+    let off = kb.kb().join("rerank-off.toml");
+    std::fs::write(
+        &off,
+        "reranker = \"bge-v2-m3\"\nrerank_by_default = false\n",
+    )
+    .expect("write config");
+    let on = kb.kb().join("rerank-on.toml");
+    std::fs::write(&on, "reranker = \"bge-v2-m3\"\nrerank_by_default = true\n")
+        .expect("write config");
+
+    let without = search_json_with_config(&kb, "rust async runtime", &off);
+    assert!(
+        without.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    let plain = scores(&without);
+    assert!(!plain.is_empty(), "the corpus has matching documents");
+    assert!(
+        plain.iter().all(|s| *s > 0.0 && *s <= RRF_CEILING),
+        "`rerank_by_default = false` must leave RRF scores in place, got {plain:?}"
+    );
+
+    let with = search_json_with_config(&kb, "rust async runtime", &on);
+    assert!(
+        with.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with.stderr)
+    );
+    let reranked = scores(&with);
+    assert!(
+        reranked.iter().any(|s| *s > RRF_CEILING || *s <= 0.0),
+        "`rerank_by_default = true` must replace the score with the \
+         cross-encoder's, which is not on the RRF scale, got {reranked:?}"
+    );
+}

@@ -52,29 +52,34 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            # Linux leg は全部走らせる (巨大モデルを要求する 3 本を含む)。
+            # Linux leg は全部走らせる (巨大モデルを要求するものを含む)。
             skip_args: ''
             # resolve_cache_dir() の fallback #2 (dirs::cache_dir()) の実体。
             # なぜこれも cache するかは下の "Cache fastembed models" 参照。
             default_model_dir: ~/.cache/fastembed
           - os: windows-latest
-            # Windows leg は「巨大モデルを要求する 3 本」だけ除外する:
+            # Windows leg は「巨大モデルを要求するもの」だけ除外する。
+            # **下の一覧がそのまま定義で、件数は書かない** — 数詞は一覧と別に
+            # 腐る (L-11 で同じ形を直した)。`skip_args` と 1 対 1 で対応する:
             #   - test_bge_m3_produces_1024_dim       (BGE-M3 ~2.3 GB)
             #   - test_bge_reranker_v2_m3_reorders_ja (reranker ~2.3 GB)
             #   - kb_eval_retrieval_quality_bge_m3    (BGE-M3 ~2.3 GB、BU-11)
+            #   - groove_search_reads_rerank_by_default_from_the_config_file
+            #                                         (reranker ~2.3 GB、L-25)
             # 理由:
             #   (a) windows-latest の空きディスクは公称 14 GB しかなく、
             #       4.6 GB のモデル展開はビルド領域を圧迫する
             #   (b) Actions cache は repo あたり 10 GB 上限の LRU。Linux leg の
             #       model cache だけで ~2.6 GB あり、同じものを Windows 側にも
             #       積むと PR CI 用の cache まで押し出してしまう
-            # この 3 本は埋め込み次元・rerank 並び替え・retrieval 品質を見る
-            # **OS 非依存** の検査で、Linux leg が同一の assert を通している。
+            # 除外しているものはいずれも埋め込み次元・rerank 並び替え・
+            # retrieval 品質・設定の配線を見る **OS 非依存** の検査で、
+            # Linux leg が同一の assert を通している。
             # ONNX を Windows 上で実行する経路自体は BGE-small を使う他テストが
             # 踏むため、除外しても Windows 固有の死角は生まれない — BU-11 の
             # 品質ゲートも BGE-small 版 (kb_eval_retrieval_quality_bge_small)
             # が両 OS で走る。
-            skip_args: '--skip test_bge_m3_produces_1024_dim --skip test_bge_reranker_v2_m3_reorders_ja --skip kb_eval_retrieval_quality_bge_m3'
+            skip_args: '--skip test_bge_m3_produces_1024_dim --skip test_bge_reranker_v2_m3_reorders_ja --skip kb_eval_retrieval_quality_bge_m3 --skip groove_search_reads_rerank_by_default_from_the_config_file'
             default_model_dir: ~/AppData/Local/fastembed
     # 初回は 5 GB 弱の DL があり得るので thoroughly 余裕を持つ。
     timeout-minutes: 60

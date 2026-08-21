@@ -218,6 +218,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **Four gaps the 2026-08-18 audit named now have tests.** No behaviour change.
+
+  `groove service uninstall` and `status` take `--service-name`; the instance
+  name used to be positional on both, and nothing checked that the old spelling
+  was **refused** rather than quietly ignored — which would have left
+  `groove service uninstall work` removing the instance called `groove`.
+
+  `groove search` reads `rerank_by_default` from `groove.toml`. The decision
+  was a pure function with its own tests, none of which could see whether the
+  command line handed it the key at all. The new test tells the two apart by
+  the shape of `score`: an RRF sum is bounded by `2 / (rrf_k + 1)`, and a
+  cross-encoder logit is not on that scale.
+
+  Three boundary inputs: an empty knowledge base, a query far past the 1 KiB
+  the MCP surface refuses, and a query made only of characters outside the BMP.
+  The long-query test also records where the real ceiling is on that surface —
+  Windows caps a whole command line at 32,767 characters, so a 64 KiB query
+  fails before the process starts.
+
 - **`docs/stability.md` writes out what a search answers with.** It had
   promised since v0.27.0 that "every field documented today keeps its name,
   type, and meaning" while documenting none of them — a promise with no subject,
