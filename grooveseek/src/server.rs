@@ -3867,7 +3867,9 @@ mod tests {
             };
             for kind in observed {
                 if !ty.contains(kind) {
-                    wrong.push(format!("`{path}` serialized as {kind}, contract says {ty:?}"));
+                    wrong.push(format!(
+                        "`{path}` serialized as {kind}, contract says {ty:?}"
+                    ));
                 }
             }
         }
