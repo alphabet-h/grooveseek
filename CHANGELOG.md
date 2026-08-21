@@ -146,6 +146,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   anywhere said so. `doctor` names it — with the consequence, not just the
   rename — along with a stale `.kb-mcp.db` and the two old eval files.
 
+  When the file that replaced one of these is there too, the finding says
+  something different and advises something different. `doctor` does not read
+  either file, so with a live `.grooveignore` beside the old one it cannot
+  claim anything is leaking; and "rename it to `.grooveignore`" would be an
+  instruction to write over the configuration in use.
+
   `groove.toml` is deliberately not among them. Its location is *discovered*,
   from the working directory or a `.git` ancestor, so there is no one place the
   old name would be; and a configuration that silently did not load announces
@@ -172,6 +178,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `--fail-on-regression` would then pass without having compared anything.
   Content that was read and does not parse still starts fresh, unchanged: those
   bytes held no baseline to lose. `--no-history` skips the file entirely.
+
+  **And what `eval` writes is now bounded by what it will read.** `history_size`
+  bounds the number of runs kept and bounded nothing about the size, so a large
+  golden or a high `--limit` could write a history the next run refused —
+  `groove eval` producing a file only it could no longer read. Saving now drops
+  the **oldest** runs until the result fits, warning when it does; the run the
+  next diff compares against is the last to go. If a single run does not fit,
+  the save reports that instead of writing it, and says to reduce the golden or
+  the limit, or to pass `--no-history`.
 
   `groove tune` reached the golden through a different function than `groove
   eval` did, so the two are now one: `eval` no longer keeps its own copy of the

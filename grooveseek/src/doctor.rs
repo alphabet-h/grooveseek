@@ -287,15 +287,24 @@ enum Location {
 }
 
 /// One file ADR-0007 renamed, and what it costs to leave the old one there.
+///
+/// **Two of each, because the replacement may be there too.** A knowledge base
+/// with both `.kb-mcpignore` and a live `.grooveignore` is not leaking anything
+/// the new file also excludes, so the blunt claim would be wrong — and
+/// "rename it to `.grooveignore`" would tell the reader to write over the
+/// configuration they are actually using (codex P2 on PR #203).
 #[derive(Debug, Clone, Copy)]
 struct Legacy {
     check: &'static str,
     old: &'static str,
     new: &'static str,
     location: Location,
-    /// Completes "`<old>` …". The consequence, not the fact of the rename.
+    /// Completes "`<old>` …" when the replacement is **not** beside it.
     consequence: &'static str,
     remedy: &'static str,
+    /// The same two for when it is.
+    consequence_beside_replacement: &'static str,
+    remedy_beside_replacement: &'static str,
 }
 
 /// The file half of the 0.26.0 migration table in `CHANGELOG.md`.
@@ -319,14 +328,24 @@ const RENAMED: &[Legacy] = &[
         // longer reaches is exactly that. `--force` would re-embed the whole
         // corpus to reach the same state.
         remedy: "rename it to .grooveignore, then run `groove index`",
+        // With a live `.grooveignore` beside it, whether anything is leaking
+        // depends on what that file says — and this check does not read it, so
+        // it must not claim either way.
+        consequence_beside_replacement: "is not read; only .grooveignore decides what is excluded now",
+        remedy_beside_replacement: "merge any lines you still want into .grooveignore, then delete it \
+             and run `groove index`",
     },
     Legacy {
         check: "legacy-index-file",
         old: ".kb-mcp.db",
         new: ".groove.db",
         location: Location::BesideIndex,
+        // `doctor` only runs when there is an index, so the replacement is
+        // there in every case that reaches this: one message covers both.
         consequence: "is an index this binary never opens; the one in use is beside it",
         remedy: "delete it once `groove status` reports the documents you expect",
+        consequence_beside_replacement: "is an index this binary never opens; the one in use is beside it",
+        remedy_beside_replacement: "delete it once `groove status` reports the documents you expect",
     },
     Legacy {
         check: "legacy-golden-file",
@@ -335,6 +354,8 @@ const RENAMED: &[Legacy] = &[
         location: Location::KbRoot,
         consequence: "is not read, so `groove eval` reports that there is no golden file",
         remedy: "rename it to .groove-eval.yml",
+        consequence_beside_replacement: "is not read; .groove-eval.yml is the golden `groove eval` uses",
+        remedy_beside_replacement: "delete it, or merge its queries into .groove-eval.yml first",
     },
     Legacy {
         check: "legacy-history-file",
@@ -343,6 +364,8 @@ const RENAMED: &[Legacy] = &[
         location: Location::KbRoot,
         consequence: "is not read, so `groove eval` compares against nothing and starts fresh",
         remedy: "rename it to .groove-eval-history.json",
+        consequence_beside_replacement: "is not read; .groove-eval-history.json holds the baselines in use",
+        remedy_beside_replacement: "delete it — the newer file already holds the runs being compared",
     },
 ];
 
@@ -353,6 +376,24 @@ impl Legacy {
             // Derived from `resolve_db_path` rather than restated, so "beside
             // the knowledge base" cannot drift from where the index goes.
             Location::BesideIndex => crate::resolve_db_path(kb_path).with_file_name(self.old),
+        }
+    }
+
+    /// Where the file that replaced this one would be — the same directory,
+    /// by construction, which is what makes "beside it" mean anything.
+    fn replacement_path(&self, kb_path: &Path) -> PathBuf {
+        self.path(kb_path).with_file_name(self.new)
+    }
+
+    /// What to say, given whether the replacement is there too.
+    fn wording(&self, replacement_exists: bool) -> (&'static str, &'static str) {
+        if replacement_exists {
+            (
+                self.consequence_beside_replacement,
+                self.remedy_beside_replacement,
+            )
+        } else {
+            (self.consequence, self.remedy)
         }
     }
 }
@@ -368,16 +409,21 @@ fn files_that_stopped_being_read(kb_path: &Path) -> Vec<Finding> {
         .filter_map(|legacy| {
             let path = legacy.path(kb_path);
             std::fs::symlink_metadata(&path).ok()?;
+            // Same question for the replacement, and the same answer for the
+            // same reason: a dangling `.grooveignore` is a name that is taken.
+            let replacement_exists =
+                std::fs::symlink_metadata(legacy.replacement_path(kb_path)).is_ok();
+            let (consequence, remedy) = legacy.wording(replacement_exists);
             Some(Finding {
                 check: legacy.check,
                 severity: Severity::Warning,
                 summary: format!(
                     "{} {} (renamed to {} in 0.26.0, with no alias)",
-                    legacy.old, legacy.consequence, legacy.new
+                    legacy.old, consequence, legacy.new
                 ),
                 count: 1,
                 samples: vec![path.display().to_string()],
-                remedy: legacy.remedy,
+                remedy,
             })
         })
         .collect()
@@ -854,6 +900,54 @@ mod tests {
                  beside the file that replaced it"
             );
         }
+    }
+
+    #[test]
+    fn a_remedy_never_tells_you_to_write_over_a_file_you_are_using() {
+        // codex P2 on PR #203. "rename it to .grooveignore" is right until a
+        // `.grooveignore` is already there, and then it is an instruction to
+        // destroy the configuration in use. The rule is on the shape of the
+        // sentence, so a row added later cannot reintroduce it quietly.
+        for legacy in RENAMED {
+            assert!(
+                !legacy.remedy_beside_replacement.contains("rename it to"),
+                "{}: the remedy for the case where {} already exists must not \
+                 be a rename onto it, got: {}",
+                legacy.check,
+                legacy.new,
+                legacy.remedy_beside_replacement
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_replacement_changes_both_what_is_claimed_and_what_is_advised() {
+        let dir = TempDir::new("both-files");
+        let kb = kb_in(&dir);
+        std::fs::write(kb.join(".kb-mcpignore"), "secrets/\n").expect("write the old one");
+        std::fs::write(kb.join(".grooveignore"), "secrets/\n").expect("write the live one");
+
+        let db = db_with_one_chunk();
+        let report = run(&db, &registry_md(), &kb).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "legacy-ignore-file")
+            .expect("the old file is still worth naming");
+        // The claim `doctor` cannot support: it does not read either file, so
+        // with a live `.grooveignore` present it cannot know whether anything
+        // the old one excluded is in the index.
+        assert!(
+            !f.summary.contains("being indexed"),
+            "with a live .grooveignore beside it, doctor must not claim a leak \
+             it did not check: {}",
+            f.summary
+        );
+        assert!(
+            f.remedy.contains("merge"),
+            "the remedy must preserve the live file, got: {}",
+            f.remedy
+        );
     }
 
     #[test]

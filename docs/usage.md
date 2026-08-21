@@ -352,6 +352,8 @@ Search reads three tables that have to agree about a chunk — its text, its emb
 
 It also reports **files that stopped being read**. This project was named `kb-mcp` through v0.25.0, and the rename shipped no aliases and no automatic migration ([ADR-0007](decisions/0007-rename-the-project-to-grooveseek.md)) — a `groove` binary does not open anything `kb-mcp` left behind. A `.kb-mcpignore` still sitting in a knowledge base is the one that matters: it is not read, so **everything it excluded is in the index**, with nothing anywhere saying so. `doctor` names it, along with a stale `.kb-mcp.db` and the two old eval files. `groove.toml` is not among them, because its location is discovered rather than fixed and a configuration that failed to load announces itself immediately.
 
+**When the file that replaced one of these is there too, the finding says something different and advises something different.** `doctor` reads neither file, so with a live `.grooveignore` beside the old one it cannot claim anything is leaking — and "rename it to `.grooveignore`" would be telling you to write over the configuration you are using.
+
 Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index). Findings are reported, never repaired: each one names the command that fixes it, which is `groove index` or `groove index --force` for everything structural.
 
 > Like `search` and `eval`, this opens the database, and opening it applies any pending schema migration. It is read-only about its findings, not about the file.

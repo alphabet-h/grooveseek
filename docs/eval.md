@@ -312,6 +312,12 @@ baseline with one run, and `--fail-on-regression` would pass without having
 compared anything. Content that *was* read and does not parse still starts
 fresh, because those bytes held no baseline. `--no-history` skips the file.
 
+Saving is bounded by the same number, so `eval` cannot write a history it will
+refuse: the **oldest** runs are dropped until the file fits, with a warning
+naming how many were kept. `history_size` remains what you asked for; this is
+the floor under it. A single run that does not fit is reported instead of
+written — that means a very large golden set or a very high `--limit`.
+
 Note that history written **before v0.13.0 is incompatible regardless of
 fusion settings**: `metric_version` went 1 → 2 when the metric implementation
 was corrected, and the fingerprint is compared as a whole. Those runs are

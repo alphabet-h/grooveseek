@@ -949,9 +949,55 @@ impl History {
             .filter(|p| p.fingerprint == now.fingerprint)
     }
 
+    /// Serialise, dropping the **oldest** runs until the reader will take it
+    /// back.
+    ///
+    /// `history_size` bounds the run *count* and nothing bounded the bytes, so
+    /// a large golden or a high `limit` could write a file
+    /// [`Self::load`] then refuses — `groove eval` producing something only it
+    /// can no longer read, and needing the user to delete a file it wrote
+    /// before it would run again (codex P2 on PR #203).
+    ///
+    /// Retention by count is still the setting; this is the floor under it.
+    /// Dropping the oldest is the same direction `push_front` already prunes
+    /// in, so the run being compared against is the last to go.
+    fn bytes_within(&self, cap: u64) -> Result<Vec<u8>> {
+        let mut candidate = History {
+            runs: self.runs.clone(),
+        };
+        let mut bytes =
+            serde_json::to_vec_pretty(&candidate).context("failed to serialize eval history")?;
+        let kept_all = bytes.len() as u64 <= cap;
+        while bytes.len() as u64 > cap && candidate.runs.len() > 1 {
+            candidate.runs.pop_back();
+            bytes = serde_json::to_vec_pretty(&candidate)
+                .context("failed to serialize eval history")?;
+        }
+        if bytes.len() as u64 > cap {
+            // One run on its own is over the cap, so there is nothing left to
+            // drop. Saying so now is better than writing a file the next run
+            // refuses: the numbers for this run have already been printed.
+            anyhow::bail!(
+                "a single eval run serialises to {} bytes, over the {cap} byte cap, so the \
+                 history cannot be written in a form the next run could read. This means a \
+                 very large golden set or a very high --limit. Reduce either, or pass \
+                 --no-history to skip the file.",
+                bytes.len()
+            );
+        }
+        if !kept_all {
+            tracing::warn!(
+                "eval history trimmed to {} run(s) to stay under the {cap} byte cap; \
+                 [eval].history_size asked for more",
+                candidate.runs.len()
+            );
+        }
+        Ok(bytes)
+    }
+
     /// atomic rename で書き出す。
     pub fn save(&self, path: &Path) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).context("failed to serialize eval history")?;
+        let bytes = self.bytes_within(MAX_HISTORY_FILE_BYTES)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -3652,6 +3698,96 @@ enabled = true
 
         let history = History::load(&path).expect("unparseable content is not a read failure");
         assert!(history.runs.is_empty());
+    }
+
+    /// A history of `runs` runs, each carrying `queries` queries of `limit`
+    /// hits — the shape that decides how big the file gets.
+    fn history_of(runs: usize, queries: usize, limit: usize) -> History {
+        let mut h = History::default();
+        for i in 0..runs {
+            let mut run = sample_run(1000 + i as i64, 0.9);
+            run.per_query = (0..queries)
+                .map(|q| QueryResult {
+                    id: format!("q-{q}"),
+                    query: "本番に出した変更を前のバージョンへ戻したい".to_string(),
+                    expected: vec![ExpectedHit {
+                        path: format!("ops/doc-{q}.ja.md"),
+                        heading: None,
+                    }],
+                    top_k: (0..limit)
+                        .map(|r| HitRecord {
+                            rank: r,
+                            path: format!("ops/doc-{r}.ja.md"),
+                            heading: Some("切り戻しの手順".to_string()),
+                            score: 0.0123,
+                        })
+                        .collect(),
+                    metrics: QueryMetrics::default(),
+                })
+                .collect();
+            h.push_front(run, runs);
+        }
+        h
+    }
+
+    #[test]
+    fn whatever_save_writes_is_something_load_will_take_back() {
+        // codex P2 on PR #203: `history_size` bounds the run count and nothing
+        // bounded the bytes, so eval could write a file it then refused —
+        // needing the user to delete something eval itself produced before it
+        // would run again.
+        //
+        // A small cap stands in for a large golden here. The relationship is
+        // what matters, and driving it from the real constant would need a
+        // 64 MiB fixture to say the same thing.
+        let cap = 600 * 1024;
+        let big = history_of(10, 100, 10);
+        let one = history_of(1, 100, 10);
+        // The cap has to sit **between** one run and ten, or this exercises the
+        // other branch: below one run there is nothing to drop, and above ten
+        // there is nothing to trim. Measured here at roughly 0.21 MiB and
+        // 2.1 MiB.
+        assert!(
+            (serde_json::to_vec_pretty(&one).expect("serialize").len() as u64) < cap
+                && serde_json::to_vec_pretty(&big).expect("serialize").len() as u64 > cap,
+            "the fixture has to straddle the cap for this to mean anything"
+        );
+
+        let bytes = big
+            .bytes_within(cap)
+            .expect("a history that can be trimmed is written");
+        assert!(
+            bytes.len() as u64 <= cap,
+            "written bytes are within the cap"
+        );
+        let back: History = serde_json::from_slice(&bytes).expect("what was written parses");
+        assert!(
+            !back.runs.is_empty() && back.runs.len() < big.runs.len(),
+            "the oldest runs were dropped, not all of them: {} of {}",
+            back.runs.len(),
+            big.runs.len()
+        );
+        // Oldest first, so the run the next diff compares against survives.
+        assert_eq!(
+            back.runs.front().map(|r| r.timestamp),
+            big.runs.front().map(|r| r.timestamp)
+        );
+    }
+
+    #[test]
+    fn a_single_run_over_the_cap_is_reported_rather_than_written() {
+        // Nothing left to drop. Saying so now beats writing a file the next
+        // run refuses — the numbers for this run have already been printed.
+        let cap = 1024;
+        let one = history_of(1, 100, 10);
+        let err = one
+            .bytes_within(cap)
+            .expect_err("a single oversize run cannot be made to fit");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--no-history"),
+            "the error must name the way past it, got: {msg}"
+        );
     }
 
     #[test]
