@@ -5419,4 +5419,111 @@ mod tests {
         // ...and it still works standalone, where it opens its own.
         assert_eq!(db.corpus_snapshot().unwrap(), snapshot);
     }
+
+    /// Statements `search_hybrid` issues over `chunks` rows asking for `limit`
+    /// results, **excluding SQLite's own**.
+    ///
+    /// The `--` filter is the one `bu03_or_expansion_issues_one_statement`
+    /// already established: FTS5 writes its internal subqueries with that
+    /// prefix, so what is left is what this codebase asked for. `TRACED_SQL`
+    /// and `record_traced_sql` are that test's too — a second sink here would
+    /// be a second implementation of the same measurement.
+    ///
+    /// Seeding happens before the hook goes on: what is counted is the search.
+    fn groove_statements_for_search(chunks: i32, limit: u32) -> usize {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        for i in 0..chunks {
+            db.insert_chunk(
+                doc_id,
+                i,
+                Some("heading"),
+                None,
+                &format!("retrieval quality notes, section {i}, with enough words to index"),
+                None,
+                &dummy_embedding(0.5),
+                1.0,
+            )
+            .unwrap();
+        }
+
+        TRACED_SQL.with(|v| v.borrow_mut().clear());
+        db.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        let hits = db
+            .search_hybrid(
+                "retrieval quality",
+                &dummy_embedding(0.5),
+                limit,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        db.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+
+        assert!(
+            !hits.is_empty(),
+            "the corpus has to answer the query, or this counts the statements \
+             of a search that found nothing"
+        );
+        TRACED_SQL.with(|v| {
+            v.borrow()
+                .iter()
+                .filter(|sql| !sql.trim_start().starts_with("--"))
+                .count()
+        })
+    }
+
+    /// A hybrid search issues **two** statements, whatever it is asked and
+    /// whatever it is asked of.
+    ///
+    /// One for the vector leg and one for the full-text leg; the fusion is
+    /// arithmetic in Rust over what those two returned. Measured at every
+    /// combination below: 2, every time.
+    ///
+    /// **This is the count-based gate the audit asked for, and it is the shape
+    /// timing cannot have.** The suite's only other performance guard,
+    /// `bu03_or_expansion_stays_within_a_small_multiple_of_a_single_phrase`,
+    /// compares wall-clock as a ratio — right for what it guards, but
+    /// `#[ignore]`d because timing on a shared runner is noise, so it runs
+    /// once a night and its threshold has to be loose enough to survive that
+    /// runner. This costs milliseconds, is identical on every machine, and
+    /// runs on every pull request.
+    ///
+    /// What it catches is the failure timing notices last: a query issued per
+    /// candidate, per result, or per document. Any of those reads as `2 + n`
+    /// here on the first run, at a corpus small enough that a stopwatch would
+    /// show nothing.
+    ///
+    /// **Both axes are pinned, and the corpus one only counts because the
+    /// filter is there.** Counting every traced statement instead gives 175 at
+    /// 50 chunks and 769 at 500 — FTS5 reading `fts_chunks_docsize` once per
+    /// row it scores for bm25, which SQLite issues and this project neither
+    /// wrote nor wants to change. A gate over the unfiltered count would have
+    /// been red the day it landed.
+    ///
+    /// An exact number rather than a bound: a third statement is a design
+    /// change, and whoever makes it should say so here rather than find a
+    /// threshold already wide enough to hide it.
+    #[test]
+    fn a_hybrid_search_issues_two_statements_whatever_it_is_asked() {
+        /// One vector query, one full-text query.
+        const LEGS: usize = 2;
+
+        for (chunks, limit) in [(50, 1u32), (50, 10), (200, 1), (200, 10), (500, 10)] {
+            let n = groove_statements_for_search(chunks, limit);
+            assert_eq!(
+                n, LEGS,
+                "a search over {chunks} chunks for {limit} result(s) issued {n} \
+                 statements, not {LEGS}; a hybrid search reads each leg once \
+                 and fuses in Rust, so anything beyond that is work done per \
+                 candidate, per result or per document"
+            );
+        }
+    }
 }
