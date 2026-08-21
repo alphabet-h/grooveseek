@@ -655,7 +655,7 @@ fn an_origin_list_with_no_loopback_entry_says_the_page_cannot_search() {
     assert!(
         log.contains("names no loopback origin"),
         "replacing the default with a public origin leaves /ui served and its \
-         search refused, with nothing on screen to say why — this line is the \
+         search refused, with nothing on screen to say why; this line is the \
          only place the cause is visible. stderr was:\n{}",
         log.lines().join("\n")
     );

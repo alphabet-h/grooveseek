@@ -86,6 +86,11 @@ path that may not be valid UTF-8 — the reason is not the encoding, and the fix
 is named where that decision was taken (`transport/http.rs`'s refusals,
 `service/macos.rs`'s `escape_default`).
 
+The rule is about **what the binary writes**. A failing assertion's message is
+printed by `cargo test` to a developer, not by `groove` to an operator, so it
+is not covered — but it is read on the same console, so keep it ASCII anyway.
+That costs nothing and removes the question.
+
 ### One question gets one implementation
 
 When two places answer the same question — is this document servable, does this
