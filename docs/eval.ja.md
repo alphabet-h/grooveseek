@@ -285,6 +285,16 @@ model も golden も同じでも前後の run は **別の index** を測って�
 context off の run は何も記録しないので、この機能が無かった頃の baseline とも
 そのまま比較できる。
 
+**読めない history ファイルは実行を止める。** `eval` が扱う 2 ファイルはどちらも
+既定でナレッジベースの中に置かれるので、`.grooveignore` と同じ検査を通す —
+symlink / hard link / 通常ファイルでないもの / 上限超過 (golden は 1 MiB、
+history は 64 MiB) は**拒否**される。history の場合、その拒否は「空の history」
+ではなく**エラー**にしてある。空を返すと、新しい run がそれに積まれて**同じパスに
+保存され**、baseline が全部 1 run に置き換わり、`--fail-on-regression` は何とも
+比較しないまま通ってしまうため。**読めたうえでパースできなかった**場合は従来どおり
+空から始める — そのバイト列に baseline は入っていない。`--no-history` を渡せば
+ファイル自体を見ない。
+
 なお **v0.13.0 より前に記録した history は fusion 設定に関わらず非互換**:
 metric 実装の修正で `metric_version` が 1 → 2 になっており、fingerprint は
 構造体全体で比較されるため。それらの run は比較されず skip されるが、これは

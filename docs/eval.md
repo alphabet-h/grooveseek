@@ -302,6 +302,16 @@ the **index** carries (`index_meta.context_mode`), not what the config asked
 for. Context-off runs record nothing, so they stay comparable with every
 baseline taken before this existed.
 
+**A history file that cannot be read stops the run.** Both files `eval` keeps
+default to living inside the knowledge base, so both are read through the same
+checks `.grooveignore` gets: a symlink, a hard link, something that is not a
+regular file, or a size past the cap (1 MiB for the golden, 64 MiB for the
+history) is refused. For the history that refusal is an **error**, not an empty
+history — the new run would otherwise be saved over the file, replacing every
+baseline with one run, and `--fail-on-regression` would pass without having
+compared anything. Content that *was* read and does not parse still starts
+fresh, because those bytes held no baseline. `--no-history` skips the file.
+
 Note that history written **before v0.13.0 is incompatible regardless of
 fusion settings**: `metric_version` went 1 → 2 when the metric implementation
 was corrected, and the fingerprint is compared as a whole. Those runs are

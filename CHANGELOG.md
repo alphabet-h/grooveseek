@@ -152,11 +152,26 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   itself at once by indexing the wrong directory or none.
 
 - **The golden query file and the eval history are read with a bound.** Both
-  default to living inside the knowledge base, so both are written by whoever
-  writes the notes, and both were read whole with no cap — a stray binary on
-  one of those names was parsed as-is. They now go through the same route
-  `.grooveignore` takes, so a symlink, a hard link or a file over 1 MiB is a
-  refusal rather than an unbounded read.
+  default to living inside the knowledge base and both were read whole with no
+  cap — a stray binary on one of those names was parsed as-is. They now go
+  through the same route `.grooveignore` takes, so a symlink, a hard link, or
+  something that is not a regular file is a refusal rather than an unbounded
+  read.
+
+  The **size** caps differ, because the two files differ. The golden is written
+  by a person, and 1 MiB is far past what it is for. The history is written by
+  `groove eval` and carries every golden query with its hits, once per retained
+  run: measured, this repository's own 25-query golden produces **0.598 MiB**
+  after ten runs, and the same golden at `limit = 20` produces **1.049 MiB**. A
+  megabyte is inside its ordinary range, so the history's cap is 64 MiB.
+
+  **A history that cannot be read now stops `groove eval` instead of reading as
+  empty.** An empty history is not inert — the new run is pushed onto it and
+  saved back over the same path — so answering "empty" for a file that is
+  intact and merely unread would replace every baseline with one run, and
+  `--fail-on-regression` would then pass without having compared anything.
+  Content that was read and does not parse still starts fresh, unchanged: those
+  bytes held no baseline to lose. `--no-history` skips the file entirely.
 
   `groove tune` reached the golden through a different function than `groove
   eval` did, so the two are now one: `eval` no longer keeps its own copy of the
