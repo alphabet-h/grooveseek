@@ -137,6 +137,23 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **The documentation told you to type a prompt command no shipped recipe
+  produces.** `docs/mcp-tools.md`, its Japanese counterpart and `prompts.rs`
+  all rendered the prompt path as `/mcp__groove__<name>`, but a client builds
+  that path from the key **you** wrote in your `.mcp.json`, and all four
+  bundled recipes call the server `ai-knowledge`. Anyone who copied a recipe
+  was given the wrong command; anyone who chose their own name was given a
+  different wrong one. The path is now written `/mcp__<server>__<name>` with
+  the note that `<server>` is yours, and a test rejects any concrete name
+  spelled into that position.
+
+- **`docs/index.md` had no Japanese counterpart**, though the language policy
+  and `Corpus`'s own documentation both said every page under `docs/` has one.
+  The landing page's navigation text — the row describing each page — was
+  English-only. [docs/index.ja.md](docs/index.ja.md) now exists and the two
+  link to each other, and a test walks `docs/` in both directions so a page
+  published in one language cannot go missing from the other again.
+
 - **An `allowed_origins` entry without a scheme refused every browser, in
   silence.** `[transport.http].allowed_hosts` takes a bare `host:port` — its
   parser falls back to reading the whole string as a host — and the key beside

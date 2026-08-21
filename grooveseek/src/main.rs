@@ -2636,6 +2636,128 @@ mod documented_flags {
             stray.join("\n  --")
         );
     }
+
+    /// The bilingual rule, checked instead of asserted.
+    ///
+    /// `Corpus`'s own documentation says every page under `docs/` has a `.ja.md`
+    /// counterpart, and `CLAUDE.md` says the same thing about the whole tree.
+    /// Both were wrong: `docs/index.md` shipped without one, and nothing said
+    /// so, because the two corpora are only ever read separately — a page
+    /// missing from one of them is simply a page that language does not check.
+    ///
+    /// Both directions matter. A `.ja.md` with no English original is the same
+    /// break seen from the other side, and it is the likelier one to arrive by
+    /// accident when a page is renamed.
+    #[test]
+    fn every_documentation_page_is_published_in_both_languages() {
+        let docs = repo_root().join("docs");
+        let mut orphans: Vec<String> = Vec::new();
+        for entry in walkdir::WalkDir::new(&docs).into_iter().flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "md") {
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            // `.ja.md` and `.md` share an extension — the suffix is the only
+            // thing that tells them apart, which is why `Corpus::owns` reads
+            // the file name too.
+            let counterpart = match name.strip_suffix(".ja.md") {
+                Some(stem) => path.with_file_name(format!("{stem}.md")),
+                None => {
+                    let stem = name.trim_end_matches(".md");
+                    path.with_file_name(format!("{stem}.ja.md"))
+                }
+            };
+            if !counterpart.exists() {
+                orphans.push(format!(
+                    "{} has no {}",
+                    path.strip_prefix(repo_root()).unwrap_or(path).display(),
+                    counterpart
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                ));
+            }
+        }
+        orphans.sort();
+        assert!(
+            orphans.is_empty(),
+            "the language policy says every page under docs/ exists in both \
+             English and Japanese, and these do not:\n  {}\n\
+             Write the counterpart rather than relaxing this check — the \
+             coverage tests read one language at a time, so a page only one \
+             corpus has is a page the other never checks.",
+            orphans.join("\n  ")
+        );
+    }
+
+    /// `/mcp__<server>__<name>` — and `<server>` is not ours to name.
+    ///
+    /// A client builds that path from the key the **user** wrote in their
+    /// `.mcp.json`. Both `mcp-tools` pages and `prompts.rs` used to spell
+    /// `groove` into it, which no shipped recipe produces: all four call the
+    /// server `ai-knowledge`. Every reader who copied a recipe was told the
+    /// wrong command, and the one who renamed it was told a different wrong
+    /// command.
+    ///
+    /// Naming a concrete server is the defect whichever name is chosen, so the
+    /// check is on the shape, not on agreeing with the recipes. Anything but
+    /// the `<...>` placeholder fails.
+    #[test]
+    fn the_documentation_does_not_spell_a_server_name_into_a_prompt_path() {
+        /// Everything between `mcp__` and the next `__`, where that is a name
+        /// rather than a placeholder.
+        fn spelled_names(text: &str) -> Vec<String> {
+            const MARKER: &str = "mcp__";
+            let mut found = Vec::new();
+            let mut rest = text;
+            while let Some(i) = rest.find(MARKER) {
+                let after = &rest[i + MARKER.len()..];
+                if let Some(end) = after.find("__") {
+                    let name = &after[..end];
+                    // `<server>` is the placeholder. Whitespace means the two
+                    // `__` are unrelated prose rather than one path.
+                    if !name.is_empty()
+                        && !name.starts_with('<')
+                        && !name.chars().any(char::is_whitespace)
+                    {
+                        found.push(name.to_string());
+                    }
+                }
+                rest = after;
+            }
+            found
+        }
+
+        let mut sources = vec![
+            ("the English documentation", published_docs(Corpus::English)),
+            (
+                "the Japanese documentation",
+                published_docs(Corpus::Japanese),
+            ),
+            // The same sentence lives in the module that defines the prompts.
+            // The audit named the two pages and missed this one, which is the
+            // argument for checking a shape rather than a list of files.
+            ("src/prompts.rs", include_str!("prompts.rs").to_string()),
+        ];
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (label, text) in sources.drain(..) {
+            for name in spelled_names(&text) {
+                offenders.push(format!("{label}: /mcp__{name}__..."));
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "a prompt path names a specific server:\n  {}\n\
+             The client builds that path from the key the user gave this \
+             server in their own `.mcp.json`, so write `/mcp__<server>__<name>` \
+             and say where `<server>` comes from.",
+            offenders.join("\n  ")
+        );
+    }
 }
 
 #[cfg(test)]
