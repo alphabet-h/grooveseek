@@ -70,6 +70,13 @@ fn test_http_serve_healthz_and_initialize() {
             "127.0.0.1:0",
             "--no-watch",
         ])
+        // The same deterministic filter `common::mcp`'s spawner sets, for the
+        // same reason: `main` builds it from `RUST_LOG` and a runner carrying
+        // one decides what this server logs. Nothing here reads a warning
+        // today — `listening on` is `eprintln!` and unaffected — so this is
+        // consistency rather than a fix, and the note is here so the next
+        // person does not have to measure it again.
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

@@ -609,6 +609,84 @@ fn the_host_check_answers_before_the_origin_check() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// What the two startup warnings say, and when (audit L-26)
+//
+// Both are inline conditions in `serve_http` rather than predicates like
+// `should_warn_wide_default`, so nothing could reach them: their wording and
+// their trigger were untested. They are the only thing an operator gets in two
+// configurations that otherwise look like they are working — one where Origin
+// validation is off, and one where `/ui` is served but cannot search.
+//
+// They are read from the server's own stderr, which `common::mcp` now keeps.
+// No polling: both are written before the socket binds, so by the time
+// `/healthz` has answered they are already there.
+// ---------------------------------------------------------------------------
+
+/// A list with a scheme, so rmcp keeps it, and no loopback entry — which is
+/// the documented LAN recipe, and the configuration where `/ui` loads and its
+/// search returns 403.
+const PUBLIC_ORIGIN_ONLY: &str = "[watch]\nenabled = false\n\n[transport.http]\n\
+                                  allowed_origins = [\"https://notes.example.com\"]\n";
+
+#[test]
+fn switching_origin_validation_off_says_so_and_says_what_it_costs() {
+    let (_kb, guard, _base) = start("groove-warn-empty-origins", ORIGINS_DISABLED);
+    let log = guard.stderr();
+
+    assert!(
+        log.contains("allowed_origins is empty"),
+        "an empty list is the off switch for the check the MCP specification \
+         requires; the operator has to be told it is off. stderr was:\n{}",
+        log.lines().join("\n")
+    );
+    assert!(
+        log.contains("DNS rebinding"),
+        "and told what it is for, or 'disabled' is just a word. stderr was:\n{}",
+        log.lines().join("\n")
+    );
+}
+
+#[test]
+fn an_origin_list_with_no_loopback_entry_says_the_page_cannot_search() {
+    let (_kb, guard, _base) = start("groove-warn-public-origin", PUBLIC_ORIGIN_ONLY);
+    let log = guard.stderr();
+
+    assert!(
+        log.contains("names no loopback origin"),
+        "replacing the default with a public origin leaves /ui served and its \
+         search refused, with nothing on screen to say why; this line is the \
+         only place the cause is visible. stderr was:\n{}",
+        log.lines().join("\n")
+    );
+    assert!(
+        log.contains("/ui"),
+        "and it has to name the page, since that is the symptom the operator \
+         sees. stderr was:\n{}",
+        log.lines().join("\n")
+    );
+}
+
+#[test]
+fn neither_warning_fires_on_a_configuration_that_is_fine() {
+    // The other half of a warning: not appearing. A condition that fired
+    // always would satisfy both tests above and teach an operator to ignore
+    // the line.
+    let (_kb, guard, _base) = start("groove-warn-quiet", NO_ORIGIN_KEYS);
+    let log = guard.stderr();
+
+    assert!(
+        !log.contains("allowed_origins is empty"),
+        "the default list is not empty. stderr was:\n{}",
+        log.lines().join("\n")
+    );
+    assert!(
+        !log.contains("names no loopback origin"),
+        "the default list is loopback origins and nothing else. stderr was:\n{}",
+        log.lines().join("\n")
+    );
+}
+
 #[test]
 fn an_empty_allowed_origins_disables_the_admin_check_too() {
     let (_kb, _guard, base) = start("groove-admin-disabled", ORIGINS_DISABLED);
