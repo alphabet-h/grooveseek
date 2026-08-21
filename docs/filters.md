@@ -97,6 +97,53 @@ low_confidence ⇔ (results.len() >= 2)
 about citing them as authoritative." The actual `results` are still returned;
 the flag is purely advisory.
 
+### What it does and does not detect
+
+The flag is a heuristic and has been measured, so what it is worth is written
+down here rather than inferred from the formula. Two limits matter to anyone
+deciding how much weight to put on it.
+
+**Reranking can switch it off entirely.** A cross-encoder scores with logits,
+and an irrelevant chunk gets a strongly negative one, so the mean over a result
+set is often negative — and the `mean(scores) > 0.0` condition above then
+answers false whatever the spread was. Measured with `bge-v2-m3` over 25 queries
+returning ten results each: `low_confidence` was `false` every time, including
+for queries with no answer in the corpus.
+
+Whether it happens to your queries depends on the model, the result count, and
+how relevant the returned chunks are — a small result set of genuinely good
+matches can have a positive mean, and then the ratio is compared as usual. So
+the flag is not *guaranteed* absent under reranking. What it is, is unreliable:
+**a `false` tells you nothing when a reranker ran**, because it is the same
+`false` the sign check produces. A `true` still means what the formula says.
+
+**Without a reranker, what it responds to is the shape of the fused score
+distribution, not correctness.** RRF gives a hit `1 / (rrf_k + rank + 1)` from
+each leg it appears in, so the mean the top score is divided by moves with how
+many legs found each returned hit, at what rank each leg placed it, `rrf_k`, and
+how many results were asked for. None of those is "is the top hit right".
+
+Two measurements say what that costs in practice. On a 20-document corpus where
+every one of 25 queries was answered correctly at rank 1, the flag still fired
+on 14 of them. And the same queries land somewhere else entirely on a different
+corpus: twelve queries with **no answer at all** scored a median of 1.08 against
+that corpus and 1.40 against a 121-document one — which is where the
+correctly-answered queries had scored on the small one.
+
+In the sample measured, the hits that pushed the ratio up were the ones only one
+leg had found, which is where the overlap reading comes from. Treat that as an
+observation about those corpora rather than as the rule: the factors above can
+move the ratio without the overlap changing at all.
+
+It is not noise — queries with no answer do score lower than queries with one,
+on a fixed corpus. But there is **no threshold that means the same thing across
+two knowledge bases**, which is why the default has been left where it is
+instead of being tuned against any single corpus.
+
+Both limits are recorded as open work rather than as intended behaviour. The
+field itself is frozen for 1.0; the formula and the default explicitly are not
+([docs/stability.md](stability.md)).
+
 ## `category` vs `tags_any`: different filter axes
 
 These are **different fields** in the index:

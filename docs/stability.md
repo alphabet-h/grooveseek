@@ -171,6 +171,115 @@ so that silence is never mistaken for a promise.
   fingerprints its history with a `metric_version` for exactly that reason, and
   freezing the shape would freeze the metrics with it.
 
+### What a search answers
+
+The clause above promises that every documented field keeps its name, type and
+meaning. This is that set, written out, for the `search` MCP tool and for
+`groove search --format json` — which return the same wrapper and differ in one
+field, noted below. A field not on this list is not part of the promise.
+
+Names are given as paths because `topic` appears twice and means something
+different each time.
+
+| field | type | present |
+|---|---|---|
+| `results` | array | always |
+| `results[].score` | number | always |
+| `results[].path` | string | always, relative to the knowledge base |
+| `results[].title` | string or `null` | always, `null` when the document has no title |
+| `results[].heading` | string or `null` | always, `null` for a chunk with no heading |
+| `results[].topic` | string or `null` | always |
+| `results[].date` | string or `null` | always |
+| `results[].tags` | array of strings | always, `[]` when there are none |
+| `results[].content` | string | always |
+| `results[].match_spans` | array | **omitted** unless computed — see below |
+| `results[].match_spans[].start` | integer | byte offset into `content`, inclusive |
+| `results[].match_spans[].end` | integer | byte offset into `content`, exclusive |
+| `results[].expanded_from` | object | **omitted** unless the parent retriever considered the hit — present is not proof of expansion, see below |
+| `results[].expanded_from.kind` | string | `"adjacent"` or `"whole_document"`, and which one decides the keys below |
+| `results[].expanded_from.from_index` | integer | `adjacent` only — first chunk index merged in, inclusive |
+| `results[].expanded_from.to_index` | integer | `adjacent` only — last chunk index merged in, inclusive |
+| `results[].expanded_from.total_chunks` | integer | `whole_document` only — how many chunks the document has |
+| `results[].uri` | string | **omitted** unless the document is one the server will hand over, and **never present over the command line** |
+| `low_confidence` | boolean | always — **advisory**, see below |
+| `filter_applied` | object | always; `{}` carries a narrower meaning than it looks — see the note |
+| `filter_applied.category` | string | omitted unless given |
+| `filter_applied.topic` | string | omitted unless given |
+| `filter_applied.path_globs` | array of strings | omitted unless given |
+| `filter_applied.tags_any` | array of strings | omitted unless given |
+| `filter_applied.tags_all` | array of strings | omitted unless given |
+| `filter_applied.date_from` | string | omitted unless given |
+| `filter_applied.date_to` | string | omitted unless given |
+| `filter_applied.min_confidence_ratio` | number | omitted unless given |
+| `error` | string | **the whole response instead of the above**, when the MCP tool refuses or fails — see below |
+
+**A search answers with one of two shapes.** Everything above the last row is
+the successful one. When the MCP tool refuses a call or the search fails — an
+`mmr_lambda` out of range, a query past the 1 KiB cap, a malformed glob, an
+embedding or database failure — it answers `{"error": "…"}` instead, with no
+`results` key at all. Callers must branch on which arrived rather than reading
+`results` unconditionally. The command line has no such envelope: it reports
+the failure on stderr and exits non-zero, which is [the split](#command-line)
+two sections up.
+
+**`filter_applied` echoes those eight inputs when they arrived with an effect,
+and nothing else.** Three things follow, and none of them is what an empty
+object looks like it means:
+
+- `min_quality` and `include_low_quality` are applied and never echoed. The
+  quality filter is on by default, so `{}` does not say the results are
+  unfiltered.
+- An explicitly empty `tags_any` or `tags_all` is accepted and dropped from the
+  echo, because an empty list excludes nothing. An empty `path_globs` is the
+  exception: it is refused with the `error` envelope rather than accepted, since
+  a glob list that matches nothing is more likely a mistake than a request for
+  everything — pass `null` to disable it.
+- `min_confidence_ratio` is echoed but narrows nothing: it only sets the
+  threshold `low_confidence` is compared against. So the echo is not a list of
+  what filtered the results either.
+
+Read `{}` as "none of those eight arrived with an effect to report" — not "no
+filter was given", and not "no filter ran". Adding the quality inputs to the
+echo later would be a minor release, by the rule that new fields may be added.
+
+**Omitted means absent, not `null`.** Every row above that says "omitted" leaves
+the key out of the object entirely. A consumer must not distinguish a missing
+key from an explicit `null` — read both as "not provided".
+
+**`expanded_from` says the parent retriever ran, not that content grew.** An
+adjacent range whose two indices are equal is the degraded case: the neighbours
+would have exceeded `max_expanded_tokens`, so the hit was left at its own chunk
+and the field records that this happened. A single-chunk document produces the
+same shape for the same reason. Read `from_index == to_index` as "considered and
+not expanded" — the content is the original chunk either way.
+
+**`match_spans` carries three states**, and they are not the same: absent means
+the offsets were not computed — the query splits into a term containing a
+non-ASCII character, the query is empty or whitespace-only, or the chunk's
+content exceeds 256 KiB — `[]` means they were computed and nothing matched, and
+a non-empty array is the contract in [docs/citations.md](citations.md), which
+lists the same three cases.
+
+**`results[].uri` is the one difference between the two successful wrappers.**
+The MCP tool adds it when the document is servable; `groove search` never emits
+it. Adding it to the command line later would be a minor release, by the rule
+above that new fields may be added.
+
+**Failure is where the two surfaces genuinely part.** The MCP tool answers with
+the `error` envelope above and exit status has no meaning in a tool call; the
+command line writes the reason on stderr and exits non-zero, and emits no JSON
+at all. So the wrappers agree up to `uri` and the failure contracts do not
+correspond — code written against one surface cannot assume the other reports
+trouble the same way.
+
+**`low_confidence` is frozen as a field, not as a judgement.** What is promised
+is that the key is present and boolean. **The formula behind it, its default
+threshold, and which queries trip it are explicitly not frozen** and may change
+in any release. It is a heuristic, and measurement puts what it responds to in the shape of the
+fused score distribution rather than in whether the answer is right — so treat
+it as a hint to be careful and never as a verdict.
+[docs/filters.md](filters.md) records what it does and does not detect.
+
 ### MCP surface
 
 - **Tool names**, their **input schemas** (parameter names, types, and which are

@@ -418,19 +418,37 @@ pub(crate) struct ErrorResponse {
     error: String,
 }
 
-/// `search` MCP ツールの新出力 (feature-26、wrapper 形)。
+/// The wrapper both search surfaces answer with (feature-26).
+///
+/// Generic over the hit type because the two surfaces differ in exactly one
+/// place: an MCP hit carries a `uri` and a command-line hit does not
+/// ([`HitWithUri`] versus [`crate::db::SearchHit`]). Everything else about the
+/// shape — the key names, which fields are omitted, how the echo is built — is
+/// one implementation rather than two, so the surfaces cannot come to disagree
+/// about the response that `docs/stability.md` freezes for both of them.
+///
+/// It used to be two: this type served `/mcp`, and `main.rs` assembled its own
+/// object with `serde_json::json!`. A field renamed on one side would have left
+/// the other unchanged and every test passing.
 #[derive(Serialize)]
-struct SearchResponse {
-    results: Vec<HitWithUri>,
-    low_confidence: bool,
+pub struct SearchResponse<H> {
+    pub results: Vec<H>,
+    pub low_confidence: bool,
     /// 入力 filter のうち non-default のものだけ正規化後の値で echo back。
-    filter_applied: SearchFilterEcho,
+    pub filter_applied: SearchFilterEcho,
 }
 
 /// 入力 filter のうち non-default のものだけ echo。`null`/空配列の項目は
 /// `skip_serializing_if` で JSON から省略される。
+///
+/// **The fields are private on purpose.** What counts as "worth echoing" is a
+/// statement about the response that `docs/stability.md` freezes, and it was
+/// written twice — once here and once in `main.rs` — while the type was shared
+/// but the normalisation was not (codex P1 round 6 on PR #201). Construction
+/// goes through [`SearchFilterEcho::new`] so a caller cannot answer the
+/// question a second way.
 #[derive(Serialize, Default)]
-struct SearchFilterEcho {
+pub struct SearchFilterEcho {
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -447,6 +465,43 @@ struct SearchFilterEcho {
     date_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_confidence_ratio: Option<f32>,
+}
+
+impl SearchFilterEcho {
+    /// The echo, normalised the one way both surfaces use.
+    ///
+    /// A list that arrived empty is dropped rather than echoed, because an
+    /// empty list narrows nothing and the echo reports what had an effect.
+    /// Each caller converts its own spelling of the inputs — the MCP tool has
+    /// `Option<Vec<String>>`, the command line has `&[String]` — and the rule
+    /// itself lives here.
+    ///
+    /// Scalars pass through: `min_confidence_ratio` in particular is echoed
+    /// whenever it was given, even though it narrows nothing, because it
+    /// changes what `low_confidence` means for that call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        category: Option<String>,
+        topic: Option<String>,
+        path_globs: Option<Vec<String>>,
+        tags_any: Option<Vec<String>>,
+        tags_all: Option<Vec<String>>,
+        date_from: Option<String>,
+        date_to: Option<String>,
+        min_confidence_ratio: Option<f32>,
+    ) -> Self {
+        let with_effect = |v: Option<Vec<String>>| v.filter(|l| !l.is_empty());
+        Self {
+            category,
+            topic,
+            path_globs: with_effect(path_globs),
+            tags_any: with_effect(tags_any),
+            tags_all: with_effect(tags_all),
+            date_from,
+            date_to,
+            min_confidence_ratio,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1446,7 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
     /// The half of the naming rule that values are held to: a caller who
@@ -3588,5 +3644,539 @@ mod tests {
             "a read is bounded by the listing, so dropping it there is what \
              makes the read refuse"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The search response and the contract that describes it
+    // -----------------------------------------------------------------------
+
+    /// The contract lives in `docs/stability.md`, which is published from the
+    /// repository root while this crate sits one level down.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate directory always has a parent")
+            .to_path_buf()
+    }
+
+    /// Every field the response can emit, as the dotted paths the contract
+    /// uses.
+    ///
+    /// Paths rather than bare names because `topic` occurs under both a hit
+    /// and `filter_applied` and means something different in each; a flat set
+    /// would let one of them satisfy the check for the other.
+    fn walk_fields(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        let mut kinds = BTreeMap::new();
+        walk_with_kinds(value, prefix, out, &mut kinds);
+    }
+
+    /// The JSON kind a value serialized as, in the vocabulary the contract's
+    /// type column uses.
+    ///
+    /// `integer` is separated from `number` because the contract does: a byte
+    /// offset is not a score. `serde_json` keeps the distinction, so this
+    /// reads it rather than guessing from the value.
+    /// The type words a contract cell names.
+    ///
+    /// The same extraction serves the language check and the serializer check,
+    /// because they are asking one question — what does this cell claim — of
+    /// two different second opinions.
+    ///
+    /// Matching by substring is enough because the type column is a short
+    /// phrase built from these words: `array of strings`, `string or `null``.
+    fn kind_words(cell: &str) -> BTreeSet<&'static str> {
+        [
+            "array", "string", "number", "integer", "boolean", "object", "null",
+        ]
+        .into_iter()
+        .filter(|w| cell.contains(w))
+        .collect()
+    }
+
+    fn json_kind(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    /// [`walk_fields`] plus what each path serialized as.
+    ///
+    /// A path can be seen more than once with different kinds — `title` is a
+    /// string in the maximal sample and `null` in the minimal one — so the
+    /// kinds accumulate per path and the contract has to name all of them.
+    fn walk_with_kinds(
+        value: &serde_json::Value,
+        prefix: &str,
+        out: &mut BTreeSet<String>,
+        kinds: &mut BTreeMap<String, BTreeSet<&'static str>>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    out.insert(path.clone());
+                    kinds.entry(path.clone()).or_default().insert(json_kind(v));
+                    walk_with_kinds(v, &path, out, kinds);
+                }
+            }
+            // Every element, not just the first: `expanded_from` is a tagged
+            // enum whose two variants carry different keys, so one sample
+            // result can only ever show half of the shape.
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    // A primitive element has no path of its own — recursion
+                    // reaches it and finds nothing to name. Its kind belongs
+                    // to the container, whose documented type is what names
+                    // it: "array of strings" promises both. Without this,
+                    // `tags` could start carrying numbers with the type check
+                    // still green (codex P2 round 8 on PR #201).
+                    if !item.is_object() && !item.is_array() {
+                        kinds
+                            .entry(prefix.to_string())
+                            .or_default()
+                            .insert(json_kind(item));
+                    }
+                    walk_with_kinds(item, &format!("{prefix}[]"), out, kinds);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The two surfaces, serialized.
+    ///
+    /// The contract freezes the MCP tool *and* `groove search --format json`,
+    /// so checking one of them would leave the other free to drift while every
+    /// test passed — which is what the command line did for as long as it
+    /// assembled its own object (codex P2 on PR #201). They now share
+    /// [`SearchResponse`], and this returns both instantiations so the checks
+    /// below cover the pair.
+    fn both_surfaces() -> (serde_json::Value, serde_json::Value) {
+        let mcp = maximal_search_response();
+        let cli = serde_json::to_value(SearchResponse {
+            results: maximal_hits(),
+            low_confidence: true,
+            filter_applied: maximal_echo(),
+        })
+        .expect("the response type serializes");
+        (mcp, cli)
+    }
+
+    /// Every field either surface can emit, **including the refusal**.
+    ///
+    /// A `search` answers with one of two shapes: the wrapper, or
+    /// `{"error": …}` when the tool refuses or the search fails — nine return
+    /// sites in `server/search.rs` alone. Walking only the successful one left
+    /// `error` outside the contract while the section claimed to list
+    /// everything (codex P2 round 2 on PR #201).
+    fn all_emitted_fields() -> BTreeSet<String> {
+        let (mcp, cli) = both_surfaces();
+        let mut out = BTreeSet::new();
+        walk_fields(&mcp, "", &mut out);
+        walk_fields(&cli, "", &mut out);
+        let refusal = serde_json::to_value(ErrorResponse {
+            error: "why the call could not be answered".to_string(),
+        })
+        .expect("the error type serializes");
+        walk_fields(&refusal, "", &mut out);
+        out
+    }
+
+    /// Hits with every optional field populated, one per `expanded_from`
+    /// variant — the two carry different keys, so a sample with one of them
+    /// shows half the shape.
+    fn maximal_hits() -> Vec<crate::db::SearchHit> {
+        let hit = |expanded: crate::db::ExpandedRange| crate::db::SearchHit {
+            score: 0.5,
+            path: "notes/a.md".to_string(),
+            title: Some("A".to_string()),
+            heading: Some("H".to_string()),
+            topic: Some("t".to_string()),
+            date: Some("2026-01-01".to_string()),
+            tags: vec!["x".to_string()],
+            content: "body".to_string(),
+            match_spans: Some(vec![crate::db::MatchSpan { start: 0, end: 1 }]),
+            expanded_from: Some(expanded),
+        };
+        vec![
+            hit(crate::db::ExpandedRange::Adjacent {
+                from_index: 0,
+                to_index: 1,
+            }),
+            hit(crate::db::ExpandedRange::WholeDocument { total_chunks: 3 }),
+        ]
+    }
+
+    /// Through `new`, like both surfaces: a sample assembled another way could
+    /// claim a shape neither of them produces.
+    fn maximal_echo() -> SearchFilterEcho {
+        SearchFilterEcho::new(
+            Some("c".to_string()),
+            Some("t".to_string()),
+            Some(vec!["**".to_string()]),
+            Some(vec!["a".to_string()]),
+            Some(vec!["b".to_string()]),
+            Some("2026-01-01".to_string()),
+            Some("2026-12-31".to_string()),
+            Some(1.5),
+        )
+    }
+
+    /// A response with every optional left out.
+    ///
+    /// Its keys are exactly the set the contract may call unconditional, and
+    /// its `null`s are the other half of what `string or `null`` promises.
+    fn minimal_search_response() -> serde_json::Value {
+        serde_json::to_value(SearchResponse {
+            results: vec![crate::db::SearchHit {
+                score: 0.5,
+                path: "notes/a.md".to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: String::new(),
+                match_spans: None,
+                expanded_from: None,
+            }],
+            low_confidence: false,
+            filter_applied: SearchFilterEcho::default(),
+        })
+        .expect("the response type serializes")
+    }
+
+    /// Every response shape the contract describes, for reading kinds off.
+    fn every_sample() -> Vec<serde_json::Value> {
+        let (mcp, cli) = both_surfaces();
+        vec![
+            mcp,
+            cli,
+            minimal_search_response(),
+            serde_json::to_value(ErrorResponse {
+                error: "why the call could not be answered".to_string(),
+            })
+            .expect("the error type serializes"),
+        ]
+    }
+
+    /// The contract freezes each field's **type**, and until now nothing
+    /// connected that column to the serializer.
+    ///
+    /// The forward and reverse checks compare paths, and the language check
+    /// compares the two tables to each other — so a field that started
+    /// serializing as a string where the tables say `number` would leave both
+    /// of them stale with everything green (codex P2 round 7 on PR #201).
+    ///
+    /// Read as "the kind that came out must be named in the documented type",
+    /// which is what lets `string or `null`` cover both of the kinds `title`
+    /// actually takes, and `array of strings` cover the array `tags` is.
+    #[test]
+    fn the_contract_names_the_type_the_serializer_produces() {
+        let mut kinds: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+        for sample in every_sample() {
+            let mut paths = BTreeSet::new();
+            walk_with_kinds(&sample, "", &mut paths, &mut kinds);
+        }
+        let documented = contract_rows("stability.md", "### What a search answers");
+        let mut wrong = Vec::new();
+        for (path, observed) in &kinds {
+            let Some(ty) = documented.get(path) else {
+                continue; // absence is the other checks' job
+            };
+            let claimed = kind_words(ty);
+            if &claimed != observed {
+                wrong.push(format!(
+                    "`{path}`: contract says {claimed:?} (from {ty:?}), \
+                     response produces {observed:?}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the contract and the serializer must agree about every type:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    /// The rule `new` exists to hold: an empty list narrows nothing, so it is
+    /// not echoed. Pinned here because both surfaces now depend on it being
+    /// decided once, and a change made for one of them would otherwise be
+    /// invisible until a caller noticed the echo had grown.
+    #[test]
+    fn an_empty_list_filter_is_not_echoed() {
+        let echo = SearchFilterEcho::new(
+            None,
+            None,
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some(Vec::new()),
+            None,
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&echo).expect("the echo serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({}),
+            "lists that arrived empty must leave no key behind"
+        );
+
+        // And a scalar that narrows nothing is still echoed, because it
+        // changes what `low_confidence` means for the call.
+        let ratio_only =
+            SearchFilterEcho::new(None, None, None, None, None, None, None, Some(1.25));
+        assert_eq!(
+            serde_json::to_value(&ratio_only).expect("the echo serializes"),
+            serde_json::json!({"min_confidence_ratio": 1.25})
+        );
+    }
+
+    /// A response with **every** optional field populated.
+    ///
+    /// The point is coverage, not realism: a field that is only ever emitted
+    /// under some condition still has to appear in the contract, so the sample
+    /// has to be the maximal shape rather than a typical one.
+    fn maximal_search_response() -> serde_json::Value {
+        // Built through the real constructor so the sample cannot claim a
+        // shape the server does not produce. An empty oversized list plus a
+        // registry that knows `.md` is what makes `uri` present.
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        let results: Vec<HitWithUri> = maximal_hits()
+            .into_iter()
+            .map(|h| {
+                let h = HitWithUri::new(h, &rules);
+                assert!(
+                    h.uri.is_some(),
+                    "the sample must carry a uri, or the maximal shape is not maximal"
+                );
+                h
+            })
+            .collect();
+        let response = SearchResponse {
+            results,
+            low_confidence: true,
+            filter_applied: maximal_echo(),
+        };
+        serde_json::to_value(&response).expect("the response type serializes")
+    }
+
+    /// One contract table, parsed into `field -> type`.
+    ///
+    /// Both columns, because names alone let the two languages disagree about
+    /// everything else. They did: the Japanese `match_spans` row said the key
+    /// is absent *when* the spans were computed, the reverse of the English
+    /// row and of the code, and the name-only comparison passed it (codex P2
+    /// round 4 on PR #201).
+    ///
+    /// The type column is comparable across the pair because the type names
+    /// are English in both — `array`, `string`, `integer`. The presence column
+    /// is prose in two languages, so its *polarity* is not machine-checkable;
+    /// what is checked below is the classification it has to agree with, taken
+    /// from the serializer rather than from either page.
+    fn contract_rows(page: &str, heading: &str) -> BTreeMap<String, String> {
+        let path = repo_root().join("docs").join(page);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        let section = text
+            .split(heading)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{page} must carry the search response contract"))
+            .split("\n### ")
+            .next()
+            .expect("splitting always yields a first part");
+        section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|rest| {
+                let (name, tail) = rest.split_once('`')?;
+                let ty = tail.split('|').nth(1)?.trim();
+                Some((name.to_string(), ty.to_string()))
+            })
+            .collect()
+    }
+
+    /// The field names the contract table claims, from its first column.
+    ///
+    /// One table is the source: a second machine-readable list beside it would
+    /// be a copy, and copies agree only until someone edits one of them.
+    fn contract_fields() -> BTreeSet<String> {
+        let path = repo_root().join("docs").join("stability.md");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        let section = text
+            .split("### What a search answers")
+            .nth(1)
+            .expect("docs/stability.md must carry the search response contract")
+            .split("\n### ")
+            .next()
+            .expect("splitting always yields a first part");
+        section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|rest| rest.split('`').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Adding a field to the response without adding it to the contract makes
+    /// the promise in `docs/stability.md` cover less than it appears to.
+    #[test]
+    fn every_field_a_search_can_answer_with_is_in_the_contract() {
+        let emitted = all_emitted_fields();
+        let documented = contract_fields();
+        let missing: Vec<&String> = emitted.difference(&documented).collect();
+        assert!(
+            missing.is_empty(),
+            "the search response emits fields the contract does not list: {missing:?}\n\
+             Add them to the `### What a search answers` table in docs/stability.md \
+             (and its Japanese counterpart), or the freeze silently excludes them."
+        );
+    }
+
+    /// The other direction: a field removed from the response but left in the
+    /// table turns the contract into a promise about something that no longer
+    /// exists. `documented_flags` holds the command line to the same pair of
+    /// checks for the same reason.
+    #[test]
+    fn the_contract_does_not_name_fields_a_search_cannot_answer_with() {
+        let emitted = all_emitted_fields();
+        let documented = contract_fields();
+        let extra: Vec<&String> = documented.difference(&emitted).collect();
+        assert!(
+            extra.is_empty(),
+            "the contract lists fields the search response cannot produce: {extra:?}\n\
+             Either the field was removed and the table was not, or the sample in \
+             `maximal_search_response` stopped covering it."
+        );
+    }
+
+    /// The contract says `uri` is the one field the two **successful** wrappers
+    /// differ on. That is a claim about both of them, so it is checked on both
+    /// rather than inferred from the type that carries it.
+    ///
+    /// Successful only, deliberately: the failure contracts do not correspond
+    /// at all — the tool answers with the `error` envelope and the command line
+    /// writes to stderr and exits non-zero, emitting no JSON. Comparing those
+    /// two would be comparing a response with the absence of one.
+    #[test]
+    fn uri_is_the_only_field_the_two_successful_wrappers_differ_on() {
+        let (mcp_value, cli_value) = both_surfaces();
+        let mut mcp = BTreeSet::new();
+        walk_fields(&mcp_value, "", &mut mcp);
+        let mut cli = BTreeSet::new();
+        walk_fields(&cli_value, "", &mut cli);
+
+        let only_mcp: Vec<&String> = mcp.difference(&cli).collect();
+        assert_eq!(
+            only_mcp,
+            vec!["results[].uri"],
+            "the contract says a uri is what an MCP hit adds, and nothing else"
+        );
+        let only_cli: Vec<&String> = cli.difference(&mcp).collect();
+        assert!(
+            only_cli.is_empty(),
+            "the command line must not answer with a field the tool cannot: {only_cli:?}"
+        );
+    }
+
+    /// Both languages have to carry the same contract, because a reader of
+    /// either one is reading it.
+    ///
+    /// Fields *and* their types: a page that names the same fields can still
+    /// promise different things about them.
+    #[test]
+    fn both_languages_state_the_same_contract() {
+        let en = contract_rows("stability.md", "### What a search answers");
+        let ja = contract_rows("stability.ja.md", "### search が返すもの");
+        assert_eq!(
+            ja.keys().collect::<Vec<_>>(),
+            en.keys().collect::<Vec<_>>(),
+            "the two contract tables must name the same fields"
+        );
+        // Compared as the set of type words rather than verbatim: the type
+        // names are English on both pages but the sentence around them is
+        // translated, so `array of strings` and `string の array` are the same
+        // promise written twice.
+        let differing: Vec<(&String, &String, &String)> = en
+            .iter()
+            .filter_map(|(f, t)| {
+                ja.get(f)
+                    .filter(|j| kind_words(j) != kind_words(t))
+                    .map(|j| (f, t, j))
+            })
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "the two contract tables must give each field the same type: {differing:?}"
+        );
+    }
+
+    /// Which fields are always there is decided by the serializer, and both
+    /// pages have to agree with it.
+    ///
+    /// A response with every optional left out is exactly the set of keys the
+    /// contract may call unconditional; anything the maximal response adds is
+    /// conditional. Checking the tables against that, rather than against each
+    /// other, is what makes a row wrong rather than merely inconsistent.
+    ///
+    /// It does not read the prose. A presence cell that states the right
+    /// classification with the wrong polarity — "absent when computed" for a
+    /// key that is absent when it was *not* — passes this and is a review
+    /// concern; the languages differ, so there is nothing to compare it to.
+    #[test]
+    fn the_contract_agrees_with_the_serializer_about_what_is_always_there() {
+        let mut unconditional = BTreeSet::new();
+        walk_fields(&minimal_search_response(), "", &mut unconditional);
+
+        for (page, heading, always) in [
+            ("stability.md", "### What a search answers", "always"),
+            ("stability.ja.md", "### search が返すもの", "常に"),
+        ] {
+            let path = repo_root().join("docs").join(page);
+            let text = fs::read_to_string(&path).expect("the contract page is readable");
+            let section = text.split(heading).nth(1).expect("the contract is present");
+            for line in section.lines().filter(|l| l.starts_with("| `")) {
+                let Some((name, tail)) = line.trim_start_matches("| `").split_once('`') else {
+                    continue;
+                };
+                // `error` replaces the wrapper rather than joining it, so it is
+                // in neither set.
+                if name == "error" {
+                    continue;
+                }
+                // The marker has to *open* the cell. Searching anywhere in it
+                // reads the Japanese `uri` row — "**CLI では常に不在**",
+                // always *absent* — as a claim that the key is always there.
+                // `tail` opens with the separator, so the columns land at 1
+                // (type) and 2 (presence).
+                let Some(presence) = tail.split('|').nth(2) else {
+                    continue;
+                };
+                let claims_always = presence.trim().starts_with(always);
+                assert_eq!(
+                    claims_always,
+                    unconditional.contains(name),
+                    "{page}: `{name}` is {} in a response with every optional left out, \
+                     and the row says otherwise",
+                    if unconditional.contains(name) {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                );
+            }
+        }
     }
 }

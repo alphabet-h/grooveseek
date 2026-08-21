@@ -201,7 +201,7 @@ Starting in v0.3.0 the `search` MCP tool returns a wrapper object instead of a r
 {
   "results":        [{ "score": 0.83, "path": "...", "match_spans": [...], "tags": [...], ... }],
   "low_confidence": false,
-  "filter_applied": { /* non-default filters echoed back; empty object when no filters */ }
+  "filter_applied": { /* the echoed filters that were given; `{}` when none of them was. `min_quality` / `include_low_quality` apply without being echoed */ }
 }
 ```
 

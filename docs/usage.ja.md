@@ -201,7 +201,7 @@ v0.3.0 から `search` MCP ツールの戻り値が単なるヒット配列で�
 {
   "results":        [{ "score": 0.83, "path": "...", "match_spans": [...], "tags": [...], ... }],
   "low_confidence": false,
-  "filter_applied": { /* デフォルトと異なるフィルタだけ echo back、フィルタ無しなら空 object */ }
+  "filter_applied": { /* echo 対象のフィルタのうち指定されたものだけ。1 つも無ければ `{}`。min_quality / include_low_quality は適用されるが echo されない */ }
 }
 ```
 

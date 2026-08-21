@@ -434,9 +434,11 @@ fn parse_unit_f32(s: &str) -> Result<f32, String> {
 /// print.
 ///
 /// What rejecting at the entry buys, beyond the model download it saves: the
-/// JSON echo could not report the problem afterwards. serde writes a non-finite
-/// float as `null` and `strip_null_keys` drops the key, so the caller would see
-/// a result with no `low_confidence` and no sign that the override was ignored.
+/// JSON echo cannot report the problem afterwards. serde writes a non-finite
+/// float as `null`, so the echo would carry `min_confidence_ratio: null` beside
+/// a `low_confidence` computed against a comparison that is false for every
+/// score — a result with no sign that the override was ignored. Refusing here
+/// is what keeps the value that reaches the echo a finite one.
 ///
 /// The MCP parameter of the same name is deliberately not held to this — it
 /// cannot refuse a value mid-conversation, so it substitutes: a non-finite ratio
@@ -1850,24 +1852,31 @@ fn print_search_results(
 
     match format {
         SearchFormat::Json => {
-            let echo = serde_json::json!({
-                "category":              category,
-                "topic":                 topic,
-                "path_globs":            (if path_globs.is_empty() { None::<&[String]> } else { Some(path_globs) }),
-                "tags_any":              (if tags_any.is_empty()   { None::<&[String]> } else { Some(tags_any)   }),
-                "tags_all":              (if tags_all.is_empty()   { None::<&[String]> } else { Some(tags_all)   }),
-                "date_from":             date_from,
-                "date_to":               date_to,
-                "min_confidence_ratio":  explicit_ratio,
-            });
-            // 値が None のキーは JSON 上 null になるので、null は剥がす。
-            let echo = strip_null_keys(echo);
-
-            let wrapper = serde_json::json!({
-                "results":         hits,
-                "low_confidence":  low_confidence,
-                "filter_applied":  echo,
-            });
+            // The same wrapper type the MCP tool answers with, differing only
+            // in the hit: a command-line hit has no `uri`. Assembling a second
+            // object here with `serde_json::json!` is what used to let the two
+            // surfaces drift apart while `docs/stability.md` froze both, so the
+            // key names now live in exactly one place (codex P2 on PR #201).
+            let wrapper = grooveseek::server::SearchResponse {
+                results: hits,
+                low_confidence,
+                // Which inputs are worth echoing is decided inside `new`, not
+                // here: this side used to drop empty lists itself, and so did
+                // the MCP side, which is two answers to one question.
+                // `min_confidence_ratio` is always finite by the time it
+                // arrives — `parse_confidence_ratio` refuses the rest at the
+                // command line, before a model is even loaded.
+                filter_applied: grooveseek::server::SearchFilterEcho::new(
+                    category.map(str::to_owned),
+                    topic.map(str::to_owned),
+                    Some(path_globs.to_vec()),
+                    Some(tags_any.to_vec()),
+                    Some(tags_all.to_vec()),
+                    date_from.map(str::to_owned),
+                    date_to.map(str::to_owned),
+                    explicit_ratio,
+                ),
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&wrapper).unwrap_or_else(|_| "{}".into())
@@ -1907,21 +1916,6 @@ fn print_search_results(
                 println!("{}", h.content);
             }
         }
-    }
-}
-
-/// JSON object から null 値の key を再帰的に剥がす (filter_applied の non-default echo 用)。
-fn strip_null_keys(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let cleaned: serde_json::Map<String, serde_json::Value> = map
-                .into_iter()
-                .filter(|(_, v)| !v.is_null())
-                .map(|(k, v)| (k, strip_null_keys(v)))
-                .collect();
-            serde_json::Value::Object(cleaned)
-        }
-        other => other,
     }
 }
 
@@ -2836,9 +2830,9 @@ mod tests {
 
     /// A non-finite ratio reached `compute_low_confidence`, where every
     /// comparison against it is false: a value passed to *tighten* the check
-    /// turned it off instead. The JSON echo could not report that either — serde
-    /// writes a non-finite float as `null` and `strip_null_keys` then drops the
-    /// key, so the output carried no trace of the override at all.
+    /// turned it off instead. The JSON echo could not report that either —
+    /// serde writes a non-finite float as `null`, so the output said nothing
+    /// about the override having been ignored.
     #[test]
     fn a_non_finite_confidence_ratio_is_refused_at_the_entry() {
         for bad in ["nan", "NaN", "inf", "-inf", "infinity"] {

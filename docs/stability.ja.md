@@ -159,6 +159,107 @@ loopback origin** である。
   power-user 向け計測ツールで、`eval` は既にその理由で履歴に `metric_version` を
   刻んでいる。**形を凍らせると指標まで凍る**
 
+### search が返すもの
+
+上の節は「**文書化されたフィールド**は名前・型・意味を保つ」と約束している。
+**その集合がこれ**である — `search` MCP tool と `groove search --format json` の
+両方について書き下す (wrapper は同一、1 フィールドだけ違う。後述)。
+**この表に無いフィールドは約束の対象ではない。**
+
+`topic` が 2 箇所に出て意味が違うので、名前はパスで書く。
+
+| フィールド | 型 | 存在 |
+|---|---|---|
+| `results` | array | 常に |
+| `results[].score` | number | 常に |
+| `results[].path` | string | 常に。KB からの相対パス |
+| `results[].title` | string または `null` | 常に。title が無い文書では `null` |
+| `results[].heading` | string または `null` | 常に。見出しの無い chunk では `null` |
+| `results[].topic` | string または `null` | 常に |
+| `results[].date` | string または `null` | 常に |
+| `results[].tags` | string の array | 常に。無ければ `[]` |
+| `results[].content` | string | 常に |
+| `results[].match_spans` | array | **計算されなかった場合はキーごと不在**。後述 |
+| `results[].match_spans[].start` | integer | `content` へのバイトオフセット。開始 (含む) |
+| `results[].match_spans[].end` | integer | `content` へのバイトオフセット。終了 (含まない) |
+| `results[].expanded_from` | object | parent retriever が**扱った**場合のみ。他は**不在**。**あること = 拡張された証拠ではない** — 後述 |
+| `results[].expanded_from.kind` | string | `"adjacent"` または `"whole_document"`。**どちらかで下の 3 行の有無が決まる** |
+| `results[].expanded_from.from_index` | integer | `adjacent` のみ。merge した最初の chunk index (含む) |
+| `results[].expanded_from.to_index` | integer | `adjacent` のみ。merge した最後の chunk index (含む) |
+| `results[].expanded_from.total_chunks` | integer | `whole_document` のみ。その文書の chunk 総数 |
+| `results[].uri` | string | サーバが渡す文書のときのみ。**CLI では常に不在** |
+| `low_confidence` | boolean | 常に。**助言** — 後述 |
+| `filter_applied` | object | 常に。**`{}` の意味は見た目より狭い** — 後述 |
+| `filter_applied.category` | string | 指定時のみ |
+| `filter_applied.topic` | string | 指定時のみ |
+| `filter_applied.path_globs` | string の array | 指定時のみ |
+| `filter_applied.tags_any` | string の array | 指定時のみ |
+| `filter_applied.tags_all` | string の array | 指定時のみ |
+| `filter_applied.date_from` | string | 指定時のみ |
+| `filter_applied.date_to` | string | 指定時のみ |
+| `filter_applied.min_confidence_ratio` | number | 指定時のみ |
+| `error` | string | **上の全体の代わりに**これだけが返る。MCP tool が拒否・失敗したとき。後述 |
+
+**search の応答は 2 つの形のうちどちらか。** 最終行より上が成功時。MCP tool が
+呼び出しを拒否する / 検索が失敗する場合 — `mmr_lambda` が範囲外、query が 1 KiB を
+超える、glob が壊れている、embedding や DB の失敗 — は `{"error": "…"}` だけが
+返り、**`results` キーは存在しない**。呼び出し側は `results` を無条件に読まず、
+**どちらが来たかで分岐する**こと。CLI にこの封筒は無い — 失敗を stderr に出して
+非ゼロ終了する ([責務分離](#stable)の節のとおり)。
+
+**`filter_applied` が echo するのは、その 8 つが「効果を持って届いたとき」だけ。**
+そこから 3 つのことが follow する。**どれも空オブジェクトの見た目とは違う**:
+
+- `min_quality` と `include_low_quality` は**適用されるが決して echo されない**。
+  **品質フィルタは既定で有効**なので、`{}` は「結果に filter が掛かっていない」を
+  意味しない
+- **明示的に空の** `tags_any` / `tags_all` は受理されるが echo からは落ちる
+  (空リストは何も除外しないため)。**`path_globs` だけは例外で、空だと受理されず
+  `error` 封筒が返る** — 何にも一致しない glob リストは「全部よこせ」の要求より
+  書き間違いである可能性が高いため。無効にしたいなら `null` を渡す
+- **`min_confidence_ratio` は echo されるが何も絞らない** — `low_confidence` を
+  比べる閾値を決めるだけ。**echo は「結果を絞ったものの一覧」でもない**
+
+`{}` は「**その 8 つのうち、報告すべき効果を持って届いたものが 1 つも無かった**」と
+読む。「filter が指定されなかった」でも「filter が走らなかった」でもない。
+後から quality 入力を echo に足すのは「フィールドの追加」規則により minor である。
+
+**「不在」は `null` ではなくキーごと無いこと。** 上表で「のみ」と書いた行は、
+条件を満たさなければ**オブジェクトからキーが消える**。消費側は
+**キーの不在と明示的な `null` を区別してはならない** — どちらも「与えられていない」
+と読む。
+
+**`expanded_from` が言うのは「parent retriever が走った」であって
+「content が増えた」ではない。** `adjacent` の 2 つの index が**等しい**場合が
+degrade したケース — 隣接 chunk を足すと `max_expanded_tokens` を超えるので、
+hit を自分の chunk のまま残し、**そうなった事実をこのフィールドが記録する**。
+chunk が 1 つしかない文書も同じ理由で同じ形になる。
+**`from_index == to_index` は「扱ったが拡張していない」と読む** —
+どちらにせよ content は元の chunk である。
+
+**`match_spans` は 3 状態を持ち、それぞれ意味が違う**: **不在 = 計算していない**
+(query の分割語に非 ASCII 文字が含まれる / query が空または空白のみ /
+chunk の content が 256 KiB を超える)、`[]` = 計算したが一致なし、
+非空 = [docs/citations.ja.md](citations.ja.md) の契約 (同じ 3 ケースを列挙している)。
+
+**`results[].uri` が「成功時の wrapper」における唯一の差**。MCP tool は渡せる
+文書に付け、`groove search` は決して出さない。後から CLI 側に足すのは、上の
+「フィールドの追加」規則により minor である。
+
+**2 つの面が本当に分かれるのは失敗時**。MCP tool は上の `error` 封筒で答え、
+tool call に exit status は無い。CLI は理由を stderr に書いて非ゼロ終了し、
+**JSON は一切出さない**。つまり **wrapper は `uri` を除いて一致するが、
+失敗時の契約は対応していない** — 片方の面に対して書いたコードは、
+もう片方が同じ形で異常を報告するとは仮定できない。
+
+**`low_confidence` は「フィールドとして」凍結する。「判定として」ではない。**
+約束するのは**キーが存在し boolean であること**だけ。**その裏の式・既定の閾値・
+どのクエリで立つかは明示的に凍結せず**、どのリリースでも変わり得る。
+これはヒューリスティックであり、実測が示すのは「**答が正しいか**」ではなく
+「**融合後スコア分布の形**」に反応しているということなので、
+**注意の合図として読み、判定として読まないこと**。何を検出し何を検出しないかは
+[docs/filters.ja.md](filters.ja.md) に記録してある。
+
 ### MCP の面
 
 - **tool 名**、その**入力スキーマ**（パラメータ名・型・必須かどうか）、
