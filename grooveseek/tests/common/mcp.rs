@@ -160,8 +160,22 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
         args.push("--no-watch");
     }
 
+    // **`RUST_LOG` is set rather than inherited.** `main` builds its filter
+    // from that variable and falls back to `info` when it is unset, so a
+    // runner carrying `RUST_LOG=error` would silence every `tracing` line the
+    // server writes — and a test that asserts on a **warning** then fails for
+    // a reason that has nothing to do with the code (codex P2 on PR #208).
+    // `info` is the value the binary picks when the variable is absent, made
+    // independent of whoever runs the suite.
+    //
+    // The two readiness signals this function waits for are **not** affected:
+    // measured, `listening on` and `watcher: watching ` are both `eprintln!`,
+    // so 21 of the 23 tests in `http_origin.rs` pass under `RUST_LOG=error`
+    // with this line removed, and only the two that read warnings fail. The
+    // filter is a warning-reading concern, not a startup one.
     let child = Command::new(&bin)
         .args(&args)
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
