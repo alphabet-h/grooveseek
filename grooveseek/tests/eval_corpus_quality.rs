@@ -126,7 +126,7 @@ use std::process::Command;
 mod common;
 use common::temp::TempKbLayout;
 
-use grooveseek::eval::GoldenSet;
+use grooveseek::eval::{ExpectedHit, GoldenSet, HitRecord, is_hit};
 
 /// Every file under `tests/fixtures/kb-eval/`, relative to that directory and
 /// spelled with `/` the way the indexer stores paths (`indexer.rs` normalises
@@ -428,24 +428,22 @@ fn incomplete_report(run: &serde_json::Value) -> String {
             continue;
         }
         let id = q["id"].as_str().unwrap_or("<no id>");
-        let expected: Vec<&str> = q["expected"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e["path"].as_str())
-            .collect();
-        let returned: Vec<&str> = q["top_k"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(5)
-            .filter_map(|h| h["path"].as_str())
-            .filter(|p| expected.contains(p))
-            .collect();
-        let missing: Vec<&str> = expected
+        // `eval::is_hit`, the predicate `recall_at_k` scored with, over the
+        // same window it used. Comparing paths here instead would be a second
+        // and weaker definition of a hit: it calls a chunk from the right file
+        // under the wrong heading "returned", so this report would leave out
+        // the very expectation that caused the number it is explaining.
+        let expected: Vec<ExpectedHit> = serde_json::from_value(q["expected"].clone())
+            .unwrap_or_else(|e| panic!("per-query `expected` did not parse: {e}\n{q}"));
+        let top: Vec<HitRecord> = serde_json::from_value(q["top_k"].clone())
+            .unwrap_or_else(|e| panic!("per-query `top_k` did not parse: {e}\n{q}"));
+        let missing: Vec<String> = expected
             .iter()
-            .copied()
-            .filter(|p| !returned.contains(p))
+            .filter(|e| !top.iter().take(5).any(|h| is_hit(e, h)))
+            .map(|e| match &e.heading {
+                Some(h) => format!("{} ({h})", e.path),
+                None => e.path.clone(),
+            })
             .collect();
         report.push_str(&format!(
             "  {id}: recall@5 {at_5:.2}; missing from the top 5: {}\n",
