@@ -126,7 +126,7 @@ use std::process::Command;
 mod common;
 use common::temp::TempKbLayout;
 
-use grooveseek::eval::{ExpectedHit, GoldenSet, HitRecord, is_hit};
+use grooveseek::eval::{AggregateMetrics, GoldenSet, QueryResult, aggregate_metrics, is_hit};
 
 /// Every file under `tests/fixtures/kb-eval/`, relative to that directory and
 /// spelled with `/` the way the indexer stores paths (`indexer.rs` normalises
@@ -396,44 +396,62 @@ fn is_multi_answer(expected_count: usize) -> bool {
     expected_count > 1
 }
 
-/// How many documents a `per_query` entry from the eval JSON expects. Read
-/// from the run rather than from the golden file, so the split is the one
-/// `groove eval` actually scored.
-fn expected_count(q: &serde_json::Value) -> usize {
-    q["expected"].as_array().map_or(0, |e| e.len())
+/// The run's per-query results, as the types `groove eval` serialised them
+/// from. Parsed once and handed to everything below, so nothing here digs
+/// through the JSON a second time with its own idea of the shape.
+fn per_query(run: &serde_json::Value) -> Vec<QueryResult> {
+    serde_json::from_value(run["per_query"].clone())
+        .unwrap_or_else(|e| panic!("eval JSON `per_query` did not parse: {e}\n{run}"))
 }
 
-/// The mean of one per-query metric over one group, and that group's size.
+/// The `k` values this run scored, taken from its own fingerprint rather than
+/// written out here — a second list would be the same metric computed over a
+/// different set of `k` without anything saying so.
+fn k_values(run: &serde_json::Value) -> Vec<usize> {
+    serde_json::from_value(run["fingerprint"]["k_values"].clone())
+        .unwrap_or_else(|e| panic!("eval JSON `fingerprint.k_values` did not parse: {e}\n{run}"))
+}
+
+/// One group's results, and its means — from `eval::aggregate_metrics`, the
+/// function that produced the `aggregate` block of the run.
 ///
-/// Not `aggregate`: that is the blend of both groups, and the module docs say
-/// why this file must not read it. `pointer` is relative to a `per_query`
-/// entry, e.g. `/metrics/recall_at_k/5`.
-fn group_mean(run: &serde_json::Value, multi: bool, pointer: &str) -> (usize, f64) {
-    let values: Vec<f64> = run["per_query"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|q| is_multi_answer(expected_count(q)) == multi)
-        .map(|q| {
-            q.pointer(pointer)
-                .and_then(|v| v.as_f64())
-                .unwrap_or_else(|| {
-                    panic!("no numeric metric at {pointer} in per-query entry:\n{q}")
-                })
-        })
+/// **Not `aggregate` itself**: that averages both groups together, and the
+/// module docs say why this file must not read it. But the averaging *rule* is
+/// production's, so that a later change to which queries are eligible or how a
+/// missing metric is treated moves this gate and `groove eval` alike instead of
+/// silently parting them.
+fn group(all: &[QueryResult], multi: bool, ks: &[usize]) -> (Vec<QueryResult>, AggregateMetrics) {
+    let queries: Vec<QueryResult> = all
+        .iter()
+        .filter(|q| is_multi_answer(q.expected.len()) == multi)
+        .cloned()
         .collect();
     assert!(
-        !values.is_empty(),
-        "the eval run has no {} queries, so its mean at {pointer} would be an \
-         empty average rather than a measurement",
+        !queries.is_empty(),
+        "the eval run has no {} queries, so its means would be empty averages \
+         rather than measurements",
         if multi {
             "multi-answer"
         } else {
             "single-answer"
         }
     );
-    let n = values.len();
-    (n, values.iter().sum::<f64>() / n as f64)
+    let metrics = aggregate_metrics(&queries, ks);
+    (queries, metrics)
+}
+
+/// One mean out of an [`AggregateMetrics`], by `k`.
+///
+/// Panics rather than defaulting: a `k` the run did not score would otherwise
+/// read as 0.0 and fail the gate for a reason that has nothing to do with
+/// retrieval.
+fn at_k(metrics: &AggregateMetrics, k: usize, what: &str) -> f64 {
+    *metrics.recall_at_k.get(&k).unwrap_or_else(|| {
+        panic!(
+            "the {what} group has no recall@{k}; the run scored {:?}",
+            metrics.recall_at_k.keys().collect::<Vec<_>>()
+        )
+    })
 }
 
 /// Human-readable list of the multi-answer queries that did not get every
@@ -442,36 +460,30 @@ fn group_mean(run: &serde_json::Value, multi: bool, pointer: &str) -> (usize, f6
 /// The list above it cannot show these: a multi-answer query that returns one
 /// of its two documents at rank 1 has a reciprocal rank of 1.0 and looks
 /// perfect there, which is the whole reason this group exists.
-fn incomplete_report(run: &serde_json::Value) -> String {
+fn incomplete_report(multi: &[QueryResult]) -> String {
     let mut report = String::new();
-    for q in run["per_query"].as_array().into_iter().flatten() {
-        if !is_multi_answer(expected_count(q)) {
-            continue;
-        }
-        let at_5 = q["metrics"]["recall_at_k"]["5"].as_f64().unwrap_or(0.0);
+    for q in multi {
+        let at_5 = q.metrics.recall_at_k.get(&5).copied().unwrap_or(0.0);
         if at_5 >= 1.0 {
             continue;
         }
-        let id = q["id"].as_str().unwrap_or("<no id>");
         // `eval::is_hit`, the predicate `recall_at_k` scored with, over the
         // same window it used. Comparing paths here instead would be a second
         // and weaker definition of a hit: it calls a chunk from the right file
         // under the wrong heading "returned", so this report would leave out
         // the very expectation that caused the number it is explaining.
-        let expected: Vec<ExpectedHit> = serde_json::from_value(q["expected"].clone())
-            .unwrap_or_else(|e| panic!("per-query `expected` did not parse: {e}\n{q}"));
-        let top: Vec<HitRecord> = serde_json::from_value(q["top_k"].clone())
-            .unwrap_or_else(|e| panic!("per-query `top_k` did not parse: {e}\n{q}"));
-        let missing: Vec<String> = expected
+        let missing: Vec<String> = q
+            .expected
             .iter()
-            .filter(|e| !top.iter().take(5).any(|h| is_hit(e, h)))
+            .filter(|e| !q.top_k.iter().take(5).any(|h| is_hit(e, h)))
             .map(|e| match &e.heading {
                 Some(h) => format!("{} ({h})", e.path),
                 None => e.path.clone(),
             })
             .collect();
         report.push_str(&format!(
-            "  {id}: recall@5 {at_5:.2}; missing from the top 5: {}\n",
+            "  {}: recall@5 {at_5:.2}; missing from the top 5: {}\n",
+            q.id,
             missing.join(", ")
         ));
     }
@@ -484,40 +496,40 @@ fn incomplete_report(run: &serde_json::Value) -> String {
 /// Human-readable list of the queries that did not rank their expected
 /// document first. Included in every failure message: a nightly failure has to
 /// be diagnosable from the log alone, without re-running a 2.3 GB model.
-fn ranking_report(run: &serde_json::Value) -> String {
+fn ranking_report(all: &[QueryResult]) -> String {
     let mut report = String::new();
-    for q in run["per_query"].as_array().into_iter().flatten() {
-        let rr = q["metrics"]["reciprocal_rank"].as_f64().unwrap_or(0.0);
+    for q in all {
+        let rr = q.metrics.reciprocal_rank;
         if rr >= 1.0 {
             continue;
         }
-        let id = q["id"].as_str().unwrap_or("<no id>");
         // Every expected path, not just the first: `reciprocal_rank` is the
         // rank of the *earliest* expected hit, so naming one of several would
         // leave the reader guessing which one the rank refers to.
-        let expected: Vec<&str> = q["expected"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e["path"].as_str())
-            .collect();
+        let expected: Vec<&str> = q.expected.iter().map(|e| e.path.as_str()).collect();
         let expected = if expected.is_empty() {
             "<none>".to_string()
         } else {
             expected.join(", ")
         };
-        let top1 = q["top_k"][0]["path"]
-            .as_str()
+        let top1 = q
+            .top_k
+            .first()
+            .map(|h| h.path.as_str())
             .unwrap_or("<nothing returned>");
+        // "the earliest of them", because a multi-answer query names two and
+        // one rank cannot belong to both. Writing "at rank 2" after a list of
+        // two reads as though both sat there.
         let position = if rr > 0.0 {
             // `reciprocal_rank` is 1/rank of the first expected hit inside the
             // retrieved window; 0.0 means no expected hit was retrieved at all.
-            format!("rank {}", (1.0 / rr).round() as i64)
+            format!("earliest of them at rank {}", (1.0 / rr).round() as i64)
         } else {
-            "outside the retrieved window".to_string()
+            "none of them inside the retrieved window".to_string()
         };
         report.push_str(&format!(
-            "  {id}: expected {expected} at {position}; top-1 was {top1}\n"
+            "  {}: expected {expected}; {position}; top-1 was {top1}\n",
+            q.id
         ));
     }
     if report.is_empty() {
@@ -543,15 +555,23 @@ fn assert_retrieval_quality(
          recorded baseline"
     );
 
-    // Each group's own mean. `aggregate` blends them, and a blend of a metric
-    // whose ceiling differs between the two groups is not a measurement of
-    // anything (module docs, "The golden has two groups").
-    let (single_count, recall_at_1) = group_mean(run, false, "/metrics/recall_at_k/1");
-    let (_, recall_at_5) = group_mean(run, false, "/metrics/recall_at_k/5");
-    let (_, mrr) = group_mean(run, false, "/metrics/reciprocal_rank");
-    let (multi_count, multi_recall_at_5) = group_mean(run, true, "/metrics/recall_at_k/5");
-    let (_, multi_recall_at_1) = group_mean(run, true, "/metrics/recall_at_k/1");
-    let (_, multi_mrr) = group_mean(run, true, "/metrics/reciprocal_rank");
+    // Each group's own means, through production's averaging. `aggregate`
+    // blends the two groups, and a blend of a metric whose ceiling differs
+    // between them is not a measurement of anything (module docs, "The golden
+    // has two groups").
+    let all = per_query(run);
+    let ks = k_values(run);
+    let (_single, single_metrics) = group(&all, false, &ks);
+    let (multi, multi_metrics) = group(&all, true, &ks);
+
+    let single_count = single_metrics.query_count;
+    let multi_count = multi_metrics.query_count;
+    let recall_at_1 = at_k(&single_metrics, 1, "single-answer");
+    let recall_at_5 = at_k(&single_metrics, 5, "single-answer");
+    let mrr = single_metrics.mrr;
+    let multi_recall_at_1 = at_k(&multi_metrics, 1, "multi-answer");
+    let multi_recall_at_5 = at_k(&multi_metrics, 5, "multi-answer");
+    let multi_mrr = multi_metrics.mrr;
 
     assert_eq!(
         single_count, GOLDEN_SINGLE_ANSWER_QUERY_COUNT,
@@ -573,8 +593,8 @@ fn assert_retrieval_quality(
          recall@5={multi_recall_at_5:.3} MRR={multi_mrr:.3}\n\
          queries that missed rank 1:\n{}\
          multi-answer queries that did not return everything expected:\n{}",
-        ranking_report(run),
-        incomplete_report(run)
+        ranking_report(&all),
+        incomplete_report(&multi)
     );
 
     assert!(
