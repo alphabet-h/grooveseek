@@ -17,7 +17,7 @@ The MCP surface GrooveSeek exposes to a connected client.
 
 ## Prompts
 
-(v0.22.0+) Four prompts ship with the server. A client surfaces them as commands the **user** picks — Claude Code renders them as `/mcp__groove__<name>` — and each one exists because the tools alone do not say how to combine them: `search` does not tell a caller to follow it with `get_connection_graph`, or that a `low_confidence` flag means the answer should say so.
+(v0.22.0+) Four prompts ship with the server. A client surfaces them as commands the **user** picks — Claude Code renders them as `/mcp__<server>__<name>`, where `<server>` is the key you gave this server in your `.mcp.json`, not a name GrooveSeek chooses. Each one exists because the tools alone do not say how to combine them: `search` does not tell a caller to follow it with `get_connection_graph`, or that a `low_confidence` flag means the answer should say so.
 
 | Prompt | Arguments | What it asks for |
 |---|---|---|

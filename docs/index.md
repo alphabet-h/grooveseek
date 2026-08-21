@@ -8,12 +8,14 @@
 MCP server for semantic search over a Markdown / plain-text knowledge base. The
 command is `groove`.
 
+> **日本語版**: [index.ja.md](./index.ja.md)
+
 **Installing it, and getting a first search running, are on the front page:**
 [github.com/alphabet-h/grooveseek](https://github.com/alphabet-h/grooveseek).
 What follows is the reference.
 
 Every page exists in English and Japanese, and each links to its counterpart at
-the top. 各ページに日本語版があり、冒頭で相互にリンクしています。
+the top.
 
 ## Reference
 

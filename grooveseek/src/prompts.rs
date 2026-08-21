@@ -1,8 +1,10 @@
 //! The MCP `prompts` surface: named, argument-taking recipes a user invokes.
 //!
 //! Clients present these as commands the **user** picks — Claude Code renders
-//! them as `/mcp__groove__<name>` — so each one exists to answer a question the
-//! tools can already answer but that a caller has to know how to assemble.
+//! them as `/mcp__<server>__<name>`, where `<server>` is the key the user gave
+//! this server in `.mcp.json` rather than anything chosen here — so each one
+//! exists to answer a question the tools can already answer but that a caller
+//! has to know how to assemble.
 //! `search` alone does not tell anyone to follow it with `get_connection_graph`,
 //! or that a `low_confidence` flag means the answer should say so.
 //!

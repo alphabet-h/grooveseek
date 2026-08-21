@@ -2422,11 +2422,14 @@ mod documented_flags {
     /// flag described only in Japanese satisfied the coverage check. Nothing was
     /// wrong when this was measured — every flag appears on both sides today —
     /// and that is exactly when it is cheap to stop it from going wrong.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Corpus {
         English,
         Japanese,
     }
+
+    /// The suffix that puts a page in the Japanese corpus.
+    const JAPANESE_SUFFIX: &str = ".ja.md";
 
     impl Corpus {
         fn readme(self) -> &'static str {
@@ -2436,14 +2439,30 @@ mod documented_flags {
             }
         }
 
+        /// Which corpus a file name puts a page in, or `None` if it is not a
+        /// page.
+        ///
         /// `.ja.md` cannot be told from `.md` by extension — `Path::extension()`
         /// answers `"md"` for both, because it reads from the last dot. The file
-        /// name's suffix is the only thing that separates them.
+        /// name's suffix is the only thing that separates them, and **this is
+        /// the only place that reads it**. `owns` decides which corpus a
+        /// coverage check gathers, and [`counterpart`] decides which file to
+        /// look for beside a page; two classifiers would eventually disagree
+        /// about one name, and then a page could be English to one check and
+        /// Japanese to the other.
+        fn of(path: &Path) -> Option<Self> {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            if name.ends_with(JAPANESE_SUFFIX) {
+                Some(Corpus::Japanese)
+            } else if name.ends_with(".md") {
+                Some(Corpus::English)
+            } else {
+                None
+            }
+        }
+
         fn owns(self, path: &Path) -> bool {
-            let japanese = path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(".ja.md"));
-            matches!(self, Corpus::Japanese) == japanese
+            Self::of(path) == Some(self)
         }
 
         fn label(self) -> &'static str {
@@ -2452,6 +2471,20 @@ mod documented_flags {
                 Corpus::Japanese => "Japanese",
             }
         }
+    }
+
+    /// The file this page's counterpart in the other language would be.
+    ///
+    /// `None` when the path is not a page. Built on [`Corpus::of`] rather than
+    /// on its own reading of the suffix, so the classification and the
+    /// rename cannot disagree about a name.
+    fn counterpart(path: &Path) -> Option<PathBuf> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let renamed = match Corpus::of(path)? {
+            Corpus::Japanese => format!("{}.md", name.strip_suffix(JAPANESE_SUFFIX)?),
+            Corpus::English => format!("{}{JAPANESE_SUFFIX}", name.strip_suffix(".md")?),
+        };
+        Some(path.with_file_name(renamed))
     }
 
     /// Everything a reader of one published language sees.
@@ -2634,6 +2667,118 @@ mod documented_flags {
              existed. If it belongs to another program, add it to FOREIGN with \
              the reason.",
             stray.join("\n  --")
+        );
+    }
+
+    /// The bilingual rule, checked instead of asserted.
+    ///
+    /// `Corpus`'s own documentation says every page under `docs/` has a `.ja.md`
+    /// counterpart, and `CLAUDE.md` says the same thing about the whole tree.
+    /// Both were wrong: `docs/index.md` shipped without one, and nothing said
+    /// so, because the two corpora are only ever read separately — a page
+    /// missing from one of them is simply a page that language does not check.
+    ///
+    /// Both directions matter. A `.ja.md` with no English original is the same
+    /// break seen from the other side, and it is the likelier one to arrive by
+    /// accident when a page is renamed.
+    #[test]
+    fn every_documentation_page_is_published_in_both_languages() {
+        let docs = repo_root().join("docs");
+        let mut orphans: Vec<String> = Vec::new();
+        for entry in walkdir::WalkDir::new(&docs).into_iter().flatten() {
+            let path = entry.path();
+            // Through the same classifier the corpus split uses, so this check
+            // and `published_docs` cannot disagree about which language a page
+            // is in. `None` is "not a page", which covers the directories and
+            // any non-Markdown file the walk turns up.
+            let Some(other) = counterpart(path) else {
+                continue;
+            };
+            if !other.exists() {
+                orphans.push(format!(
+                    "{} has no {}",
+                    path.strip_prefix(repo_root()).unwrap_or(path).display(),
+                    other.file_name().unwrap_or_default().to_string_lossy(),
+                ));
+            }
+        }
+        orphans.sort();
+        assert!(
+            orphans.is_empty(),
+            "the language policy says every page under docs/ exists in both \
+             English and Japanese, and these do not:\n  {}\n\
+             Write the counterpart rather than relaxing this check — the \
+             coverage tests read one language at a time, so a page only one \
+             corpus has is a page the other never checks.",
+            orphans.join("\n  ")
+        );
+    }
+
+    /// `/mcp__<server>__<name>` — and `<server>` is not ours to name.
+    ///
+    /// A client builds that path from the key the **user** wrote in their
+    /// `.mcp.json`. Both `mcp-tools` pages and `prompts.rs` used to spell
+    /// `groove` into it, which no shipped recipe produces: all four call the
+    /// server `ai-knowledge`. Every reader who copied a recipe was told the
+    /// wrong command, and the one who renamed it was told a different wrong
+    /// command.
+    ///
+    /// Naming a concrete server is the defect whichever name is chosen, so the
+    /// check is on the shape, not on agreeing with the recipes. Anything but
+    /// the `<...>` placeholder fails.
+    #[test]
+    fn the_documentation_does_not_spell_a_server_name_into_a_prompt_path() {
+        /// Everything between `mcp__` and the next `__`, where that is a name
+        /// rather than a placeholder.
+        fn spelled_names(text: &str) -> Vec<String> {
+            const MARKER: &str = "mcp__";
+            let mut found = Vec::new();
+            let mut rest = text;
+            while let Some(i) = rest.find(MARKER) {
+                let after = &rest[i + MARKER.len()..];
+                if let Some(end) = after.find("__") {
+                    let name = &after[..end];
+                    // `<server>` is the placeholder. Whitespace means the two
+                    // `__` are unrelated prose rather than one path.
+                    if !name.is_empty()
+                        && !name.starts_with('<')
+                        && !name.chars().any(char::is_whitespace)
+                    {
+                        found.push(name.to_string());
+                    }
+                }
+                rest = after;
+            }
+            found
+        }
+
+        let mut sources = vec![
+            ("the English documentation", published_docs(Corpus::English)),
+            (
+                "the Japanese documentation",
+                published_docs(Corpus::Japanese),
+            ),
+            // The same sentence lives in the module that defines the prompts.
+            // The audit named the two pages and missed this one, which is the
+            // argument for checking a shape rather than a list of files.
+            ("src/prompts.rs", include_str!("prompts.rs").to_string()),
+        ];
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (label, text) in sources.drain(..) {
+            for name in spelled_names(&text) {
+                offenders.push(format!("{label}: /mcp__{name}__..."));
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "a prompt path names a specific server:\n  {}\n\
+             The client builds that path from the key the user gave this \
+             server in their own `.mcp.json`, so write `/mcp__<server>__<name>` \
+             and say where `<server>` comes from.",
+            offenders.join("\n  ")
         );
     }
 }
