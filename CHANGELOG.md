@@ -30,9 +30,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
   Light and dark, chosen by `prefers-color-scheme`, like the logo and the
   screenshot before it. WebP rather than PNG — 33 KB against roughly 1 MB, for
-  an image every visitor loads. The PNGs are committed too: `assets/README.md`
-  records why, and what to swap if the raw host turns out not to serve `.webp`
-  the way it serves `.png`.
+  an image every visitor loads. The PNGs are committed as a fallback, and
+  `assets/README.md` says what to swap.
+
+  **That file also stops repeating a claim it could never check.** It recorded
+  a report that `raw.githubusercontent.com` serves `.svg` as `text/plain`,
+  which is why nothing here references an SVG; the report could not be measured
+  when it was written because the host answered 429 all session. Measured now
+  against this repository's own files, the host answers `image/svg+xml` — and
+  `image/webp` for the banner. Whether GitHub's Markdown renderer would then
+  display an SVG is a second question, about its `camo` proxy, and is still
+  untested; the PNGs stay for that reason rather than the old one.
 
   The 56-pixel logo those four pages used to open with is gone, since the
   banner carries the mark at its centre. **No page embeds `assets/logo-*` any

@@ -35,11 +35,11 @@ not: a semantic path and a lexical path converging on a single node, and ranked
 results leaving it. That is the RRF fusion of the sqlite-vec and FTS5 legs.
 
 **WebP, not PNG.** 33 KB against roughly 1 MB, for an image every visitor
-loads. The PNGs stay as the fallback: `raw.githubusercontent.com` is reported to
-serve some types with a content type an `<img>` will not render, and that has
-never been measured here for `.webp` (see the last section). If the banner ever
-fails to render, swap the `srcset` and `src` values on all four front pages to
-the `.png` files; nothing else has to change.
+loads. **Measured**: the raw host serves these as `image/webp` (see the last
+section), so this is not the leap it looked like before the branch was pushed.
+The PNGs stay anyway — if the banner ever fails to render, swap the `srcset`
+and `src` values on all four front pages to the `.png` files and nothing else
+has to change.
 
 **The colours are close to the theme tokens but not equal to them.** Measured
 from the files:
@@ -67,17 +67,26 @@ publishes either the repository root or `/docs`, and v0.27.0 chose `/docs` — s
 `assets/` is not on the site, and a page under `docs/` cannot reach it
 same-origin either. Absolute URLs are what works from everywhere.
 
-An absolute URL resolves to `raw.githubusercontent.com`, which is reported to
-serve `.svg` as `text/plain` so that an `<img>` will not render it. That report
-could not be measured from the machine this was built on — the host answered 429
-for the whole session — so no page references an SVG, and the mark was rendered
-to PNG for the pages that used to embed it.
+An absolute URL resolves to `raw.githubusercontent.com`. This directory was
+built on a report that the host serves `.svg` as `text/plain`, so that an
+`<img>` would not render it — a report that could not be checked at the time,
+because the host answered 429 for the whole session. That is why the mark was
+rendered to PNG for the pages that embedded it.
 
-That was the whole rule while every image here was a PNG. The banner broke it
-deliberately: a 30× size difference is worth one more format. So `.webp` now
-carries the same unmeasured assumption `.svg` was refused for, which is why the
-PNG fallback in "The hero banner" above exists, and why the raw host is worth
-checking once.
+**Measured 2026-08-22, with a `HEAD` against this repository's own files:**
+
+| | status | content type |
+|---|---|---|
+| `grooveseek-readme-hero-light-v2.webp` | 200 | `image/webp` |
+| `screenshot-light.png` | 200 | `image/png` |
+| `logo-light.svg` | 200 | **`image/svg+xml`** |
+
+So `.webp` is served correctly, and **the report about `.svg` does not hold** —
+the host labels it as an image. What that measurement does *not* settle is
+whether GitHub's Markdown renderer displays an SVG referenced this way: it
+proxies images through `camo`, which is a second mechanism and was not tested.
+The PNGs are therefore still what the pages reference, but the reason is now
+"one untested step remains" rather than "the host mislabels it".
 
 ## Regenerating the PNGs
 
