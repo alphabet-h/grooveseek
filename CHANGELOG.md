@@ -144,11 +144,19 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   cost was never reported: a `.kb-mcpignore` still sitting in a knowledge base
   is not read, so **whatever it excluded that the current rules do not is in
   the index**, and nothing anywhere said so. `doctor` names it — with the
-  consequence, not just the rename — along with a stale `.kb-mcp.db` and the
-  two old eval files. It stops short of naming what leaked: that would mean
-  reading the file and re-running the exclusion decision, and a `doctor` that
-  computed its own answer to a question the indexer already answers is the
-  failure this whole subcommand exists to avoid.
+  consequence, not just the rename — along with a stale `.kb-mcp.db`. It stops
+  short of naming what leaked: that would mean reading the file and re-running
+  the exclusion decision, and a `doctor` that computed its own answer to a
+  question the indexer already answers is the failure this whole subcommand
+  exists to avoid.
+
+  Those two, and not the rest of the rename, because **their location is the
+  one thing nothing can move**: `.grooveignore` is read from a constant name in
+  the knowledge base root and the index is where `resolve_db_path` puts it, so
+  a file at the old name beside either is left behind and nothing else. The old
+  eval filenames are excluded for the reason `kb-mcp.toml` already was —
+  `[eval].golden` may point at any path, the old name included, and telling
+  someone to rename a file their configuration is using would break it.
 
   When the file that replaced one of these is there too, the finding says
   something different and advises something different. `doctor` does not read
@@ -164,9 +172,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **The golden query file and the eval history are read with a bound.** Both
   default to living inside the knowledge base and both were read whole with no
   cap — a stray binary on one of those names was parsed as-is. They now go
-  through the same route `.grooveignore` takes, so a symlink, a hard link, or
+  through the same route `.grooveignore` takes, so a hard link, a FIFO, or
   something that is not a regular file is a refusal rather than an unbounded
-  read.
+  read. Symlinks are refused **on Unix only**, which is that route's existing
+  and deliberate scope: making one on Windows needs a privilege this threat
+  model's attacker does not have, and refusing reparse points there would
+  refuse every OneDrive and Dropbox placeholder.
 
   The **size** caps differ, because the two files differ. The golden is written
   by a person, and 1 MiB is far past what it is for. The history is written by

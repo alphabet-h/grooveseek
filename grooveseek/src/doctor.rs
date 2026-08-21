@@ -310,15 +310,34 @@ struct Legacy {
     remedy_beside_replacement: &'static str,
 }
 
-/// The file half of the 0.26.0 migration table in `CHANGELOG.md`.
+/// The renamed files whose location **nothing can move**.
 ///
-/// Environment variables and command names are on that table too and are not
-/// here, because nothing on disk near a knowledge base reveals them.
-/// `kb-mcp.toml` is not here either, for a different reason: `groove.toml` is
-/// *discovered* — from the working directory, a `.git` ancestor, beside the
-/// binary, or the home directory — so there is no single place the old one
-/// would be, and a configuration that silently did not load announces itself
-/// immediately anyway, by indexing the wrong directory or none.
+/// This is a subset of the file half of the 0.26.0 migration table in
+/// `CHANGELOG.md`, and the line is drawn where this check stops being able to
+/// tell "left behind" from "in use".
+///
+/// `.grooveignore` is read from `kb_path.join(IGNORE_FILE_NAME)` with the name
+/// a constant, and the index is at `resolve_db_path(kb_path)`. Neither takes a
+/// configured path, so a file sitting at the *old* name beside them is left
+/// behind and nothing else.
+///
+/// The rest of that table is out for one reason or the other:
+///
+/// - **`kb-mcp.toml`.** `groove.toml` is *discovered* — from the working
+///   directory, a `.git` ancestor, beside the binary, or the home directory —
+///   so there is no single place the old name would be. A configuration that
+///   silently did not load also announces itself at once, by indexing the
+///   wrong directory or none.
+/// - **`.kb-mcp-eval.yml` and `.kb-mcp-eval-history.json`.** `[eval].golden`
+///   can point at any path, **including the old name**, in which case
+///   `groove eval` reads it and "rename it" would break the configured path
+///   (codex P2 on PR #203). Deciding otherwise would mean resolving the eval
+///   configuration here — a second implementation of a question `eval` already
+///   answers, which is the failure this whole module is written to avoid. The
+///   cost of leaving them out is small: a stale golden makes `groove eval`
+///   say there is no golden file, which is already a clear message.
+/// - **Environment variables and command names.** Nothing on disk near a
+///   knowledge base reveals them.
 const RENAMED: &[Legacy] = &[
     Legacy {
         check: "legacy-ignore-file",
@@ -356,31 +375,6 @@ const RENAMED: &[Legacy] = &[
         remedy: "delete it once `groove status` reports the documents you expect",
         consequence_beside_replacement: "is an index this binary never opens; the one in use is beside it",
         remedy_beside_replacement: "delete it once `groove status` reports the documents you expect",
-    },
-    Legacy {
-        check: "legacy-golden-file",
-        old: ".kb-mcp-eval.yml",
-        new: ".groove-eval.yml",
-        location: Location::KbRoot,
-        consequence: "is not read, so `groove eval` reports that there is no golden file",
-        remedy: "rename it to .groove-eval.yml",
-        consequence_beside_replacement: "is not read; .groove-eval.yml is the golden `groove eval` uses",
-        remedy_beside_replacement: "compare it with .groove-eval.yml, merge any queries still wanted, then delete it",
-    },
-    Legacy {
-        check: "legacy-history-file",
-        old: ".kb-mcp-eval-history.json",
-        new: ".groove-eval-history.json",
-        location: Location::KbRoot,
-        consequence: "is not read, so `groove eval` compares against nothing and starts fresh",
-        remedy: "rename it to .groove-eval-history.json",
-        consequence_beside_replacement: "is not read; .groove-eval-history.json is the file `groove eval` compares against",
-        // Not "the newer file already holds them". `History::load` turns
-        // content it cannot parse into an empty history, so a corrupt
-        // `.groove-eval-history.json` looks the same from here as a full one —
-        // and following a bare delete would throw away the only recoverable
-        // baselines (codex P2 on PR #203).
-        remedy_beside_replacement: "keep it until `groove eval` shows the baselines you expect, then delete it",
     },
 ];
 
@@ -870,6 +864,11 @@ mod tests {
     /// This is the independent half. `Legacy::path` cannot be checked by a
     /// test that also uses it to place the fixture, so the expectation has to
     /// come from somewhere the check does not.
+    ///
+    /// Every entry here comes out of production, which is also why `RENAMED`
+    /// holds only files production pins: a row whose location a configuration
+    /// can move has nothing to anchor to, and could not be checked from here
+    /// without re-deriving the resolution it is supposed to be independent of.
     fn where_the_replacement_lives(kb: &Path) -> Vec<(&'static str, PathBuf)> {
         vec![
             // `ExclusionRules::load` reads `kb_path.join(IGNORE_FILE_NAME)`.
@@ -878,12 +877,6 @@ mod tests {
                 kb.join(crate::exclusion::IGNORE_FILE_NAME),
             ),
             ("legacy-index-file", crate::resolve_db_path(kb)),
-            ("legacy-history-file", crate::eval::default_history_path(kb)),
-            // `.groove-eval.yml` has no exposed default — `main.rs` builds it
-            // inline at the `eval` and `tune` call sites — so this restates
-            // the expression those two use. The weakest anchor of the four,
-            // and the only one that would survive production moving the file.
-            ("legacy-golden-file", kb.join(".groove-eval.yml")),
         ]
     }
 

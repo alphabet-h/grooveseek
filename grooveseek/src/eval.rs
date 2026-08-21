@@ -46,8 +46,16 @@ pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Read one of those two files, bounded, from the handle the check was made on.
 ///
 /// [`crate::links::read_checked`] is the same route `.grooveignore` takes, so a
-/// symlink, a hard link, a FIFO or an oversize file is a **refusal** rather
-/// than an unbounded read. The refusal message names the path and the reason.
+/// hard link, a FIFO, something that is not a regular file, or a file over the
+/// cap is a **refusal** rather than an unbounded read. The refusal message
+/// names the path and the reason.
+///
+/// **The symlink half is Unix-only**, and that is `links`'s decision rather
+/// than an omission here: its module documentation records that making one on
+/// Windows needs a privilege the threat model's attacker does not have, and
+/// that refusing reparse points there would refuse every OneDrive and Dropbox
+/// placeholder. Saying "a symlink is refused" without that scope would be a
+/// promise this does not keep (codex P2 on PR #203).
 fn read_bounded(path: &Path, cap: u64, what: &str) -> Result<Vec<u8>> {
     match crate::links::read_checked(path, cap) {
         Ok(crate::links::Content::Bytes(b)) => Ok(b),
@@ -962,36 +970,66 @@ impl History {
     /// Dropping the oldest is the same direction `push_front` already prunes
     /// in, so the run being compared against is the last to go.
     fn bytes_within(&self, cap: u64) -> Result<Vec<u8>> {
-        let mut candidate = History {
-            runs: self.runs.clone(),
-        };
-        let mut bytes =
-            serde_json::to_vec_pretty(&candidate).context("failed to serialize eval history")?;
-        let kept_all = bytes.len() as u64 <= cap;
-        while bytes.len() as u64 > cap && candidate.runs.len() > 1 {
-            candidate.runs.pop_back();
-            bytes = serde_json::to_vec_pretty(&candidate)
-                .context("failed to serialize eval history")?;
+        /// The newest `keep` runs, serialised.
+        fn encode(runs: &VecDeque<EvalRun>, keep: usize) -> Result<Vec<u8>> {
+            let slice = History {
+                runs: runs.iter().take(keep).cloned().collect(),
+            };
+            serde_json::to_vec_pretty(&slice).context("failed to serialize eval history")
         }
-        if bytes.len() as u64 > cap {
+
+        let total = self.runs.len();
+        if total == 0 {
+            return encode(&self.runs, 0);
+        }
+
+        let whole = encode(&self.runs, total)?;
+        if whole.len() as u64 <= cap {
+            return Ok(whole);
+        }
+
+        // **Binary search, not one drop at a time.** Size is monotonic in run
+        // count, so the largest count that fits can be found in log₂(n)
+        // encodings. Dropping one at a time re-encodes the whole deque each
+        // round: a history holding thousands of small runs plus one large one
+        // would encode gigabytes on its way to the answer and look like a hang
+        // (codex P2 on PR #203).
+        let (mut lo, mut hi) = (1usize, total);
+        let mut best: Option<Vec<u8>> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let bytes = encode(&self.runs, mid)?;
+            if bytes.len() as u64 <= cap {
+                best = Some(bytes);
+                lo = mid + 1;
+            } else if mid == 1 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        let Some(bytes) = best else {
             // One run on its own is over the cap, so there is nothing left to
             // drop. Saying so now is better than writing a file the next run
             // refuses: the numbers for this run have already been printed.
+            let one = encode(&self.runs, 1)?;
             anyhow::bail!(
                 "a single eval run serialises to {} bytes, over the {cap} byte cap, so the \
                  history cannot be written in a form the next run could read. This means a \
                  very large golden set or a very high --limit. Reduce either, or pass \
                  --no-history to skip the file.",
-                bytes.len()
+                one.len()
             );
-        }
-        if !kept_all {
-            tracing::warn!(
-                "eval history trimmed to {} run(s) to stay under the {cap} byte cap; \
-                 [eval].history_size asked for more",
-                candidate.runs.len()
-            );
-        }
+        };
+        // `best` came from a `mid` that fit; recovering that count from the
+        // bytes is not worth a second parse, so count what the search settled
+        // on: `lo` is one past it.
+        tracing::warn!(
+            "eval history trimmed to {} run(s) to stay under the {cap} byte cap; \
+             [eval].history_size asked for more",
+            lo - 1
+        );
         Ok(bytes)
     }
 

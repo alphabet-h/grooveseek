@@ -287,8 +287,11 @@ context off の run は何も記録しないので、この機能が無かった
 
 **読めない history ファイルは実行を止める。** `eval` が扱う 2 ファイルはどちらも
 既定でナレッジベースの中に置かれるので、`.grooveignore` と同じ検査を通す —
-symlink / hard link / 通常ファイルでないもの / 上限超過 (golden は 1 MiB、
-history は 64 MiB) は**拒否**される。history の場合、その拒否は「空の history」
+hard link / 通常ファイルでないもの / 上限超過 (golden は 1 MiB、history は
+64 MiB) は**拒否**され、**Unix ではさらに symlink** も拒否される。symlink だけ
+Unix 限定なのは意図的で、Windows で symlink を作るには本脅威モデルの攻撃者が
+持たない権限が要り、かつ reparse point を拒否すると **OneDrive / Dropbox の
+placeholder が全部落ちる**ため。history の場合、その拒否は「空の history」
 ではなく**エラー**にしてある。空を返すと、新しい run がそれに積まれて**同じパスに
 保存され**、baseline が全部 1 run に置き換わり、`--fail-on-regression` は何とも
 比較しないまま通ってしまうため。**読めたうえでパースできなかった**場合は従来どおり

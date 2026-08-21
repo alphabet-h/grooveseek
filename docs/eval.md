@@ -304,9 +304,12 @@ baseline taken before this existed.
 
 **A history file that cannot be read stops the run.** Both files `eval` keeps
 default to living inside the knowledge base, so both are read through the same
-checks `.grooveignore` gets: a symlink, a hard link, something that is not a
-regular file, or a size past the cap (1 MiB for the golden, 64 MiB for the
-history) is refused. For the history that refusal is an **error**, not an empty
+checks `.grooveignore` gets: a hard link, something that is not a regular file,
+or a size past the cap (1 MiB for the golden, 64 MiB for the history) is
+refused — and, on Unix, a symlink. That last one is deliberately Unix-scoped:
+creating a symlink on Windows needs a privilege this threat model's attacker
+does not have, and refusing reparse points there would refuse every OneDrive
+and Dropbox placeholder. For the history that refusal is an **error**, not an empty
 history — the new run would otherwise be saved over the file, replacing every
 baseline with one run, and `--fail-on-regression` would pass without having
 compared anything. Content that *was* read and does not parse still starts
