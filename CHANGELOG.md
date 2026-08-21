@@ -272,6 +272,33 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **The eval golden has five questions with two right answers, and the quality
+  gate stopped averaging them together with the other twenty-five.** No
+  behaviour change; the last of the 2026-08-18 audit's test-coverage rows.
+
+  Every golden query named exactly one document, so nothing measured whether a
+  search returns several relevant documents when several are relevant. The five
+  new ones are built on pairs the fixture corpus already had — the two release
+  documents, the two database ones, the two authentication ones, the pair that
+  both say when to act before you know why, and the pair an incident write-up is
+  assembled from. No documents were added: the golden is never copied into the
+  corpus, so a new query cannot change the candidate set the other queries are
+  scored against, and the twenty-five re-measure identically.
+
+  **The two groups are averaged separately**, because a query with two right
+  answers caps recall@1 at 0.5 and blending them moves the headline number by an
+  amount that depends on how many such queries the golden holds rather than on
+  whether retrieval got worse — measured, adding five drags the blend from 0.92
+  to 0.85 on BGE-small with nothing changed. The four existing floors keep their
+  values and are now compared against the group they were measured over.
+
+  On the new group recall@1 is 0.50 on both models — its ceiling — and MRR is
+  1.000 on both, because every one of the five puts one of its two documents at
+  rank 1. That is exactly the blindness the queries were added for. recall@5 is
+  the one that separates the models, 0.80 against 1.00, where on the
+  single-answer group the same metric separates them 0.96 against 1.00 and was
+  rejected as a gate for that reason.
+
 - **A hybrid search is now held to a fixed number of SQL statements, and the
   two bounds a graph walk is built on are property-tested.** No behaviour
   change; two more of the gaps the 2026-08-18 audit named.

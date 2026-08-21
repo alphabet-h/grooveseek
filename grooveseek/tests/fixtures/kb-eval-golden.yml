@@ -1,8 +1,20 @@
 # Golden query set for the `kb-eval` fixture corpus (BU-11).
 #
-# One query per document: every file in `tests/fixtures/kb-eval/` is the
-# expected answer of exactly one query, so a doc that stops being findable
-# always shows up as a drop in recall@1 / MRR rather than being averaged away.
+# Two groups, and the difference between them is what each one can measure.
+#
+# **Single-answer queries** name exactly one document, and every file in
+# `tests/fixtures/kb-eval/` is named by at least one of them — so a document
+# that stops being findable shows up as a drop in recall@1 / MRR rather than
+# being averaged away. These carry the retrieval-quality gate.
+#
+# **Multi-answer queries** name two, and exist because recall@1 cannot say
+# anything about them: with two right answers the best possible recall@1 is
+# 0.5, so a system that returns one of the two and a system that returns both
+# score the same. What separates those two systems is recall@5, which on
+# single-answer queries is nearly always 1.0 and therefore says nothing. The
+# two groups are averaged separately in `tests/eval_corpus_quality.rs` for that
+# reason: mixing them would move the headline number without measuring
+# anything new.
 #
 # The queries are deliberately *paraphrases*: they avoid the document's own
 # headings and, where practical, its distinctive nouns ("カナリア", "postmortem",
@@ -135,3 +147,43 @@ queries:
     query: "02:00 UTC"
     expected:
       - path: "ops/database-backup.md"
+
+  # --- multi-answer group ---------------------------------------------------
+  # Queries with two right answers, one per distractor pair. The pairs are the
+  # ones the corpus was built with and the ones commented above: each is two
+  # documents on one subject, close enough that a single-answer query has to
+  # tell them apart. A multi-answer query asks the other question — whether
+  # both come back when both are right — and that is the one the single-answer
+  # group cannot ask.
+  #
+  # Deliberately built on existing documents. Adding a document would change
+  # the candidate set every other query is scored against; adding a query
+  # cannot, because the golden is never copied into the corpus.
+  #
+  # Each query is written to the subject the pair shares rather than to either
+  # side of it, so neither document is the better answer.
+  - id: multi-ja-release-safety
+    query: "新しい版を本番に届けるとき利用者への影響を小さく抑える進め方"
+    expected:
+      - path: "ops/deploy-canary.ja.md"
+      - path: "ops/deploy-rollback.ja.md"
+  - id: multi-en-database-recovery
+    query: "the arrangements that let a database be returned to an earlier moment after bad data lands"
+    expected:
+      - path: "ops/database-backup.md"
+      - path: "ops/database-restore.md"
+  - id: multi-en-credential-expiry
+    query: "a secret used to authenticate does not last forever, so how does a fresh one get into place before the old one dies"
+    expected:
+      - path: "ref/auth-api-keys.md"
+      - path: "ref/auth-oauth.md"
+  - id: multi-ja-act-before-you-know
+    query: "取り返しがつかなくなる前に、調べ終わるのを待たずに手を打ってよい場面"
+    expected:
+      - path: "ops/deploy-rollback.ja.md"
+      - path: "ops/oncall-escalation.ja.md"
+  - id: multi-en-incident-record
+    query: "an incident review is built out of what the services logged, so what has to be in those records"
+    expected:
+      - path: "ops/incident-postmortem.md"
+      - path: "ref/logging-format.md"

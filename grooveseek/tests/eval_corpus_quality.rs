@@ -20,7 +20,20 @@
 //! windows. They need no workflow change beyond the Windows skip for the
 //! BGE-M3 one (~2.3 GB, same reason as the two pre-existing skips).
 //!
-//! # Baseline, measured 2026-08-14 (25 queries, 20 documents, 60 chunks)
+//! # The golden has two groups, and they are averaged separately
+//!
+//! Twenty-five queries name one document each; five name two. **Their scores
+//! are never blended.** A query with two right answers caps recall@1 at 0.5, so
+//! averaging the groups together moves the headline number by an amount that
+//! depends on how many multi-answer queries the golden happens to hold and not
+//! at all on whether retrieval got worse. `aggregate` in the eval JSON is that
+//! blend; this file computes its own means from `per_query` instead.
+//!
+//! # Baseline, measured 2026-08-21 (30 queries, 20 documents, 60 chunks)
+//!
+//! Single-answer group, 25 queries. Unchanged from the 2026-08-14 measurement,
+//! which is the point: adding queries cannot move them, because the golden is
+//! never copied into the corpus.
 //!
 //! | | recall@1 | recall@5 | MRR |
 //! |---|---|---|---|
@@ -29,9 +42,28 @@
 //! | BGE-M3, as shipped | 1.00 | 1.00 | 1.000 |
 //! | BGE-M3, FTS leg forced silent | 1.00 | 1.00 | 1.000 |
 //!
-//! The "FTS leg forced silent" rows were produced by making `build_fts_query`
-//! return `None` in a scratch build — i.e. the exact failure mode this gate
-//! exists to catch. Three conclusions are baked into the thresholds below:
+//! Multi-answer group, 5 queries, two expected documents each. Three
+//! deliberate breakages rather than one, because the first two moved the other
+//! group and left this one where it was.
+//!
+//! | | recall@1 | recall@5 | MRR | nDCG@5 |
+//! |---|---|---|---|---|
+//! | BGE-small, as shipped | 0.50 | 0.80 | 1.000 | 0.821 |
+//! | BGE-small, FTS leg forced silent | 0.20 | 0.80 | 0.567 | 0.593 |
+//! | BGE-small, vector leg forced silent | 0.30 | 0.80 | 0.800 | 0.684 |
+//! | BGE-small, candidate over-fetch removed | 0.40 | 0.80 | 0.900 | 0.775 |
+//! | BGE-M3, as shipped | 0.50 | 1.00 | 1.000 | 0.927 |
+//! | BGE-M3, FTS leg forced silent | 0.50 | 0.90 | 1.000 | 0.861 |
+//! | BGE-M3, vector leg forced silent | 0.30 | 0.80 | 0.800 | 0.684 |
+//! | BGE-M3, candidate over-fetch removed | 0.50 | 1.00 | 1.000 | 0.913 |
+//!
+//! The broken rows come from scratch builds: `build_fts_query` returning
+//! `None`, `search_split_candidates` returning an empty vector-leg list, and
+//! `search_hybrid_candidates` asking for `limit` candidates instead of
+//! `limit * 5`. The two models agree exactly with the vector leg silent, which
+//! is the check that the probe silenced what it meant to.
+//!
+//! Six conclusions are baked into the thresholds below:
 //!
 //! 1. **BGE-small is the sensitive leg.** Killing the keyword half moves it by
 //!    0.12 recall@1 / 0.105 MRR. Four queries degrade, three of them Japanese
@@ -41,16 +73,52 @@
 //!    answers every query, keyword half or no keyword half. Its gate therefore
 //!    guards the Japanese *semantic* path and catches gross regressions; it is
 //!    not, and cannot be here, an FTS regression detector.
-//! 3. **recall@5 is not asserted.** Healthy 0.96 and FTS-dead 0.88 are only
-//!    two queries apart, so any threshold loose enough to survive ordinary
-//!    drift is also loose enough to sit below the broken state. It is printed
-//!    in the failure report instead.
+//! 3. **recall@5 is not asserted on the single-answer group.** Healthy 0.96 and
+//!    FTS-dead 0.88 are only two queries apart, so any threshold loose enough
+//!    to survive ordinary drift is also loose enough to sit below the broken
+//!    state. It is printed in the failure report instead.
+//! 4. **recall@5 is the only metric that carries information on the
+//!    multi-answer group, and it is the one asserted there.** recall@1 sits at
+//!    its ceiling of 0.50 on both models, and MRR is 1.000 on both, because
+//!    every one of the five puts one of its two documents at rank 1 — which is
+//!    exactly why these queries were needed: the metrics that gate the other
+//!    group are blind to whether the *second* right answer came back at all.
+//!    recall@5 separates the models 0.80 against 1.00, where on the
+//!    single-answer group the same metric separates them 0.96 against 1.00.
+//! 5. **BGE-small's multi recall@5 is 0.80 in every state measured**, healthy
+//!    and with either retrieval leg dead. Its floor is a pin, not a detector:
+//!    it records a level so that a future change dropping it is a named
+//!    failure, in the way `KB_EVAL_FILES` records a file list. The metric that
+//!    does move for BGE-small here is nDCG@5 (0.821 → 0.593 → 0.684 → 0.775),
+//!    but every one of those breakages already fails this file's BGE-small
+//!    recall@1 floor, so asserting it too would add a second way to hear about
+//!    something already heard.
+//! 6. **BGE-M3's multi floor is the one that can fail on its own.** A dead
+//!    vector leg takes it from 1.00 to 0.80, below the 0.90 floor. In that
+//!    particular run the recall@1 assertion fires first and reports it, so
+//!    what the multi floor adds there is the *shape* — printed by
+//!    `incomplete_report`, which names the document that left the top 5 — and
+//!    not the detection. What it would catch alone is a change that costs the
+//!    second right answer while leaving the first at rank 1, which is the one
+//!    kind of regression the other two assertions cannot see at all.
 //!
-//! Thresholds allow **two queries of drift and trip on the third**, which is
-//! the slack the scores need: RRF fusion runs on `f32`, and near-ties can come
-//! apart differently on another architecture (the same reason
-//! `common::mcp::extract_path_heading_order` compares paths instead of
+//! None of the three breakages above was needed to show the multi assertion
+//! fires: raising `BGE_M3_MIN_MULTI_RECALL_AT_5` to 1.01 against the shipped
+//! build does that, and the message it prints is
+//! `multi-answer recall@5 1.000 < 1.010`.
+//!
+//! Single-answer thresholds allow **two queries of drift and trip on the
+//! third**, which is the slack those scores need: RRF fusion runs on `f32`, and
+//! near-ties can come apart differently on another architecture (the same
+//! reason `common::mcp::extract_path_heading_order` compares paths instead of
 //! scores). A real retrieval regression moves many queries at once.
+//!
+//! **The multi-answer floors allow one half-answer, not two.** Five queries
+//! average less than twenty-five do, so the same absolute slack would put the
+//! floor at 0.60 for BGE-small — under 0.50 + one half-answer, which is to say
+//! under a search that returns exactly one document of every pair. Measurement
+//! is what makes the tighter slack safe: this metric held at 0.80 across three
+//! deliberate breakages, so it is not a number that drifts.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,7 +126,7 @@ use std::process::Command;
 mod common;
 use common::temp::TempKbLayout;
 
-use grooveseek::eval::GoldenSet;
+use grooveseek::eval::{AggregateMetrics, GoldenSet, QueryResult, aggregate_metrics, is_hit};
 
 /// Every file under `tests/fixtures/kb-eval/`, relative to that directory and
 /// spelled with `/` the way the indexer stores paths (`indexer.rs` normalises
@@ -93,7 +161,27 @@ const KB_EVAL_FILES: &[&str] = &[
 /// Number of queries in `tests/fixtures/kb-eval-golden.yml`. Pinned because
 /// every aggregate metric is an average over it: dropping the hard half of the
 /// golden would raise all three numbers and read as an improvement.
-const GOLDEN_QUERY_COUNT: usize = 25;
+const GOLDEN_QUERY_COUNT: usize = 30;
+
+/// And how that total splits, because the two groups are averaged separately
+/// and neither mean is comparable to the recorded baseline if its population
+/// changed. Pinning only the total would let a multi-answer query be rewritten
+/// into a single-answer one without anything noticing — which is the cheapest
+/// way to make this file's hardest queries disappear.
+const GOLDEN_SINGLE_ANSWER_QUERY_COUNT: usize = 25;
+const GOLDEN_MULTI_ANSWER_QUERY_COUNT: usize = 5;
+
+/// And how many documents each multi-answer query names. Pinned because the
+/// multi floors are stated in half-answers: five queries naming two documents
+/// each is ten of them, so one half-answer of drift is 0.1 and the floors below
+/// are one step under their measured baselines. A sixth expectation on some
+/// query, or the same path written twice, changes that arithmetic — the
+/// recall denominator with it — while leaving every count above satisfied.
+///
+/// The duplicate is the worse of the two: `recall_at_k` scores each expectation
+/// independently, so two identical entries are both satisfied by one retrieved
+/// document and the query reports perfect recall for half the work.
+const MULTI_ANSWER_EXPECTED_PER_QUERY: usize = 2;
 
 /// The corpus and the golden are required to stay bilingual (BU-11 asks for a
 /// mixed Japanese/English set). Minimums rather than exact counts, so the set
@@ -112,6 +200,14 @@ const BGE_SMALL_MIN_MRR: f64 = 0.88;
 /// "two queries of slack" rule puts the floors here.
 const BGE_M3_MIN_RECALL_AT_1: f64 = 0.92;
 const BGE_M3_MIN_MRR: f64 = 0.95;
+
+/// Multi-answer floors, on recall@5 — the only metric that is not saturated
+/// there (module docs, conclusion 4). Baselines 0.80 and 1.00 over ten
+/// half-answers, and **one** half-answer of slack rather than two: with five
+/// queries there is less averaging, and two would put the BGE-small floor
+/// below what a search returning one document of every pair scores.
+const BGE_SMALL_MIN_MULTI_RECALL_AT_5: f64 = 0.70;
+const BGE_M3_MIN_MULTI_RECALL_AT_5: f64 = 0.90;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -288,43 +384,152 @@ fn metric(run: &serde_json::Value, pointer: &str) -> f64 {
         .unwrap_or_else(|| panic!("no numeric metric at {pointer} in eval JSON:\n{run}"))
 }
 
+/// **The** definition of which group a golden query belongs to.
+///
+/// Both callers reach this one: the model-free sync test, which has
+/// `GoldenQuery` values, and the gate, which has the JSON `groove eval`
+/// printed. Two spellings of the same predicate could disagree after a change
+/// to what "multi-answer" means — say, exactly two expectations rather than at
+/// least two — and the shape of that disagreement is a pull request passing
+/// while the nightly averages a different population.
+fn is_multi_answer(expected_count: usize) -> bool {
+    expected_count > 1
+}
+
+/// The run's per-query results, as the types `groove eval` serialised them
+/// from. Parsed once and handed to everything below, so nothing here digs
+/// through the JSON a second time with its own idea of the shape.
+fn per_query(run: &serde_json::Value) -> Vec<QueryResult> {
+    serde_json::from_value(run["per_query"].clone())
+        .unwrap_or_else(|e| panic!("eval JSON `per_query` did not parse: {e}\n{run}"))
+}
+
+/// The `k` values this run scored, taken from its own fingerprint rather than
+/// written out here — a second list would be the same metric computed over a
+/// different set of `k` without anything saying so.
+fn k_values(run: &serde_json::Value) -> Vec<usize> {
+    serde_json::from_value(run["fingerprint"]["k_values"].clone())
+        .unwrap_or_else(|e| panic!("eval JSON `fingerprint.k_values` did not parse: {e}\n{run}"))
+}
+
+/// One group's results, and its means — from `eval::aggregate_metrics`, the
+/// function that produced the `aggregate` block of the run.
+///
+/// **Not `aggregate` itself**: that averages both groups together, and the
+/// module docs say why this file must not read it. But the averaging *rule* is
+/// production's, so that a later change to which queries are eligible or how a
+/// missing metric is treated moves this gate and `groove eval` alike instead of
+/// silently parting them.
+fn group(all: &[QueryResult], multi: bool, ks: &[usize]) -> (Vec<QueryResult>, AggregateMetrics) {
+    let queries: Vec<QueryResult> = all
+        .iter()
+        .filter(|q| is_multi_answer(q.expected.len()) == multi)
+        .cloned()
+        .collect();
+    assert!(
+        !queries.is_empty(),
+        "the eval run has no {} queries, so its means would be empty averages \
+         rather than measurements",
+        if multi {
+            "multi-answer"
+        } else {
+            "single-answer"
+        }
+    );
+    let metrics = aggregate_metrics(&queries, ks);
+    (queries, metrics)
+}
+
+/// One mean out of an [`AggregateMetrics`], by `k`.
+///
+/// Panics rather than defaulting: a `k` the run did not score would otherwise
+/// read as 0.0 and fail the gate for a reason that has nothing to do with
+/// retrieval.
+fn at_k(metrics: &AggregateMetrics, k: usize, what: &str) -> f64 {
+    *metrics.recall_at_k.get(&k).unwrap_or_else(|| {
+        panic!(
+            "the {what} group has no recall@{k}; the run scored {:?}",
+            metrics.recall_at_k.keys().collect::<Vec<_>>()
+        )
+    })
+}
+
+/// Human-readable list of the multi-answer queries that did not get every
+/// expected document into the top 5.
+///
+/// The list above it cannot show these: a multi-answer query that returns one
+/// of its two documents at rank 1 has a reciprocal rank of 1.0 and looks
+/// perfect there, which is the whole reason this group exists.
+fn incomplete_report(multi: &[QueryResult]) -> String {
+    let mut report = String::new();
+    for q in multi {
+        let at_5 = q.metrics.recall_at_k.get(&5).copied().unwrap_or(0.0);
+        if at_5 >= 1.0 {
+            continue;
+        }
+        // `eval::is_hit`, the predicate `recall_at_k` scored with, over the
+        // same window it used. Comparing paths here instead would be a second
+        // and weaker definition of a hit: it calls a chunk from the right file
+        // under the wrong heading "returned", so this report would leave out
+        // the very expectation that caused the number it is explaining.
+        let missing: Vec<String> = q
+            .expected
+            .iter()
+            .filter(|e| !q.top_k.iter().take(5).any(|h| is_hit(e, h)))
+            .map(|e| match &e.heading {
+                Some(h) => format!("{} ({h})", e.path),
+                None => e.path.clone(),
+            })
+            .collect();
+        report.push_str(&format!(
+            "  {}: recall@5 {at_5:.2}; missing from the top 5: {}\n",
+            q.id,
+            missing.join(", ")
+        ));
+    }
+    if report.is_empty() {
+        report.push_str("  (every multi-answer query returned both documents in the top 5)\n");
+    }
+    report
+}
+
 /// Human-readable list of the queries that did not rank their expected
 /// document first. Included in every failure message: a nightly failure has to
 /// be diagnosable from the log alone, without re-running a 2.3 GB model.
-fn ranking_report(run: &serde_json::Value) -> String {
+fn ranking_report(all: &[QueryResult]) -> String {
     let mut report = String::new();
-    for q in run["per_query"].as_array().into_iter().flatten() {
-        let rr = q["metrics"]["reciprocal_rank"].as_f64().unwrap_or(0.0);
+    for q in all {
+        let rr = q.metrics.reciprocal_rank;
         if rr >= 1.0 {
             continue;
         }
-        let id = q["id"].as_str().unwrap_or("<no id>");
         // Every expected path, not just the first: `reciprocal_rank` is the
         // rank of the *earliest* expected hit, so naming one of several would
         // leave the reader guessing which one the rank refers to.
-        let expected: Vec<&str> = q["expected"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e["path"].as_str())
-            .collect();
+        let expected: Vec<&str> = q.expected.iter().map(|e| e.path.as_str()).collect();
         let expected = if expected.is_empty() {
             "<none>".to_string()
         } else {
             expected.join(", ")
         };
-        let top1 = q["top_k"][0]["path"]
-            .as_str()
+        let top1 = q
+            .top_k
+            .first()
+            .map(|h| h.path.as_str())
             .unwrap_or("<nothing returned>");
+        // "the earliest of them", because a multi-answer query names two and
+        // one rank cannot belong to both. Writing "at rank 2" after a list of
+        // two reads as though both sat there.
         let position = if rr > 0.0 {
             // `reciprocal_rank` is 1/rank of the first expected hit inside the
             // retrieved window; 0.0 means no expected hit was retrieved at all.
-            format!("rank {}", (1.0 / rr).round() as i64)
+            format!("earliest of them at rank {}", (1.0 / rr).round() as i64)
         } else {
-            "outside the retrieved window".to_string()
+            "none of them inside the retrieved window".to_string()
         };
         report.push_str(&format!(
-            "  {id}: expected {expected} at {position}; top-1 was {top1}\n"
+            "  {}: expected {expected}; {position}; top-1 was {top1}\n",
+            q.id
         ));
     }
     if report.is_empty() {
@@ -340,6 +545,7 @@ fn assert_retrieval_quality(
     model: &str,
     min_recall_at_1: f64,
     min_mrr: f64,
+    min_multi_recall_at_5: f64,
 ) {
     let query_count = metric(run, "/aggregate/query_count") as usize;
     assert_eq!(
@@ -349,13 +555,46 @@ fn assert_retrieval_quality(
          recorded baseline"
     );
 
-    let recall_at_1 = metric(run, "/aggregate/recall_at_k/1");
-    let recall_at_5 = metric(run, "/aggregate/recall_at_k/5");
-    let mrr = metric(run, "/aggregate/mrr");
+    // Each group's own means, through production's averaging. `aggregate`
+    // blends the two groups, and a blend of a metric whose ceiling differs
+    // between them is not a measurement of anything (module docs, "The golden
+    // has two groups").
+    let all = per_query(run);
+    let ks = k_values(run);
+    let (_single, single_metrics) = group(&all, false, &ks);
+    let (multi, multi_metrics) = group(&all, true, &ks);
+
+    let single_count = single_metrics.query_count;
+    let multi_count = multi_metrics.query_count;
+    let recall_at_1 = at_k(&single_metrics, 1, "single-answer");
+    let recall_at_5 = at_k(&single_metrics, 5, "single-answer");
+    let mrr = single_metrics.mrr;
+    let multi_recall_at_1 = at_k(&multi_metrics, 1, "multi-answer");
+    let multi_recall_at_5 = at_k(&multi_metrics, 5, "multi-answer");
+    let multi_mrr = multi_metrics.mrr;
+
+    assert_eq!(
+        single_count, GOLDEN_SINGLE_ANSWER_QUERY_COUNT,
+        "{model}: {single_count} single-answer queries were scored but the \
+         golden holds {GOLDEN_SINGLE_ANSWER_QUERY_COUNT}; the floors below were \
+         measured over the recorded population"
+    );
+    assert_eq!(
+        multi_count, GOLDEN_MULTI_ANSWER_QUERY_COUNT,
+        "{model}: {multi_count} multi-answer queries were scored but the golden \
+         holds {GOLDEN_MULTI_ANSWER_QUERY_COUNT}; the floors below were measured \
+         over the recorded population"
+    );
+
     let context = format!(
-        "{model} over the kb-eval corpus: recall@1={recall_at_1:.3} \
-         recall@5={recall_at_5:.3} MRR={mrr:.3}\nqueries that missed rank 1:\n{}",
-        ranking_report(run)
+        "{model} over the kb-eval corpus\n  single-answer ({single_count}): \
+         recall@1={recall_at_1:.3} recall@5={recall_at_5:.3} MRR={mrr:.3}\n  \
+         multi-answer ({multi_count}): recall@1={multi_recall_at_1:.3} \
+         recall@5={multi_recall_at_5:.3} MRR={multi_mrr:.3}\n\
+         queries that missed rank 1:\n{}\
+         multi-answer queries that did not return everything expected:\n{}",
+        ranking_report(&all),
+        incomplete_report(&multi)
     );
 
     assert!(
@@ -365,6 +604,14 @@ fn assert_retrieval_quality(
     assert!(
         mrr >= min_mrr,
         "retrieval quality regressed: MRR {mrr:.3} < {min_mrr:.3}\n{context}"
+    );
+    // The one metric the other two cannot stand in for: with two right answers
+    // recall@1 is capped at 0.5 and a reciprocal rank of 1.0 is earned by
+    // returning either one of them, so both are silent about the second.
+    assert!(
+        multi_recall_at_5 >= min_multi_recall_at_5,
+        "retrieval quality regressed: multi-answer recall@5 {multi_recall_at_5:.3} \
+         < {min_multi_recall_at_5:.3}\n{context}"
     );
 }
 
@@ -392,6 +639,60 @@ fn kb_eval_corpus_and_golden_stay_in_sync() {
         "GOLDEN_QUERY_COUNT is stale; re-measure the baseline in this file's \
          module docs after changing the query set"
     );
+
+    // The split, checked here as well as in the gate, because this test needs
+    // no model and so runs on every pull request. Rewriting a multi-answer
+    // query down to one expected document would otherwise only be caught by
+    // the nightly, and it is the edit that quietly removes what the
+    // multi-answer group measures — recall@1 and MRR cannot see the second
+    // right answer, so nothing else in the suite would notice.
+    let multi = golden
+        .queries
+        .iter()
+        .filter(|q| is_multi_answer(q.expected.len()))
+        .count();
+    assert_eq!(
+        multi, GOLDEN_MULTI_ANSWER_QUERY_COUNT,
+        "{multi} golden queries name more than one document, expected \
+         {GOLDEN_MULTI_ANSWER_QUERY_COUNT}"
+    );
+    assert_eq!(
+        golden.queries.len() - multi,
+        GOLDEN_SINGLE_ANSWER_QUERY_COUNT,
+        "the single-answer group changed size; the floors in this file were \
+         measured over {GOLDEN_SINGLE_ANSWER_QUERY_COUNT} queries"
+    );
+
+    for q in golden
+        .queries
+        .iter()
+        .filter(|q| is_multi_answer(q.expected.len()))
+    {
+        let id = q.id.as_deref().unwrap_or("<no id>");
+        assert_eq!(
+            q.expected.len(),
+            MULTI_ANSWER_EXPECTED_PER_QUERY,
+            "golden query {id} names {} documents; the multi-answer floors are \
+             stated in half-answers and assume {MULTI_ANSWER_EXPECTED_PER_QUERY} \
+             per query, so this needs a re-measurement rather than a passing count",
+            q.expected.len()
+        );
+        // Compared by path, not by whole `ExpectedHit`. The pin above says two
+        // *documents*, and `ExpectedHit`'s own equality would let the same one
+        // through twice as long as the headings differed — worse, a path-only
+        // entry and a heading-scoped entry for that path are both satisfied by
+        // one chunk under that heading, so the query would report perfect
+        // recall for one returned document.
+        for (i, e) in q.expected.iter().enumerate() {
+            assert!(
+                !q.expected[..i].iter().any(|prev| prev.path == e.path),
+                "golden query {id} expects {} twice; two entries naming one \
+                 document can both be satisfied by one retrieved chunk, so the \
+                 query would report perfect recall for half the work",
+                e.path
+            );
+        }
+    }
 
     let mut ids: Vec<&str> = Vec::with_capacity(golden.queries.len());
     let mut covered: Vec<&str> = Vec::new();
@@ -472,6 +773,7 @@ fn kb_eval_retrieval_quality_bge_small() {
         "bge-small-en-v1.5",
         BGE_SMALL_MIN_RECALL_AT_1,
         BGE_SMALL_MIN_MRR,
+        BGE_SMALL_MIN_MULTI_RECALL_AT_5,
     );
 }
 
@@ -489,5 +791,11 @@ fn kb_eval_retrieval_quality_bge_m3() {
     index_corpus(layout.kb(), &config, "bge-m3");
     let run = run_eval(layout.kb(), &config, "bge-m3");
 
-    assert_retrieval_quality(&run, "bge-m3", BGE_M3_MIN_RECALL_AT_1, BGE_M3_MIN_MRR);
+    assert_retrieval_quality(
+        &run,
+        "bge-m3",
+        BGE_M3_MIN_RECALL_AT_1,
+        BGE_M3_MIN_MRR,
+        BGE_M3_MIN_MULTI_RECALL_AT_5,
+    );
 }
