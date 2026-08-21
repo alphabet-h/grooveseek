@@ -137,6 +137,31 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **`groove doctor` now reports the files the rename left behind.** v0.26.0
+  renamed everything this project writes to disk and shipped no aliases and no
+  automatic migration, deliberately
+  ([ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md)). The
+  cost was never reported: a `.kb-mcpignore` still sitting in a knowledge base
+  is not read, so **every path it excluded is in the index**, and nothing
+  anywhere said so. `doctor` names it — with the consequence, not just the
+  rename — along with a stale `.kb-mcp.db` and the two old eval files.
+
+  `groove.toml` is deliberately not among them. Its location is *discovered*,
+  from the working directory or a `.git` ancestor, so there is no one place the
+  old name would be; and a configuration that silently did not load announces
+  itself at once by indexing the wrong directory or none.
+
+- **The golden query file and the eval history are read with a bound.** Both
+  default to living inside the knowledge base, so both are written by whoever
+  writes the notes, and both were read whole with no cap — a stray binary on
+  one of those names was parsed as-is. They now go through the same route
+  `.grooveignore` takes, so a symlink, a hard link or a file over 1 MiB is a
+  refusal rather than an unbounded read.
+
+  `groove tune` reached the golden through a different function than `groove
+  eval` did, so the two are now one: `eval` no longer keeps its own copy of the
+  read-and-parse, and a bound added to either is a bound on both.
+
 - **An `allowed_origins` entry without a scheme refused every browser, in
   silence.** `[transport.http].allowed_hosts` takes a bare `host:port` — its
   parser falls back to reading the whole string as a host — and the key beside

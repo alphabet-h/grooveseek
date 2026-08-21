@@ -3463,4 +3463,102 @@ enabled = true
         let v = format_json(&now, None);
         assert_eq!(v["corpus_changed"], serde_json::Value::Null);
     }
+
+    // ---------- bounded reads (L-9) ----------
+
+    /// A directory that cleans itself up, for the two files `eval` keeps.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let p = crate::test_support::unique_temp_path(&format!("groove-eval-{prefix}"));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A syntactically valid golden padded past `MAX_EVAL_FILE_BYTES`.
+    ///
+    /// Valid on purpose: if the refusal came from the parser rather than from
+    /// the cap, the test would pass while the file was still read whole, which
+    /// is the thing being prevented.
+    fn oversize_golden(path: &std::path::Path) {
+        let mut body = String::from("queries:\n");
+        while body.len() as u64 <= MAX_EVAL_FILE_BYTES {
+            body.push_str(
+                "  - query: \"padding, and it parses\"\n    expected:\n      - path: \"a.md\"\n",
+            );
+        }
+        std::fs::write(path, body).expect("write the oversize golden");
+    }
+
+    #[test]
+    fn a_golden_over_the_cap_is_refused_rather_than_read() {
+        let dir = TempDir::new("big-golden");
+        let path = dir.0.join(".groove-eval.yml");
+        oversize_golden(&path);
+
+        let err = GoldenSet::load(&path).expect_err("an oversize golden must not be read");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to read"),
+            "the refusal must say it refused, got: {msg}"
+        );
+        assert!(
+            msg.contains("over the"),
+            "the refusal must say the cap is why, got: {msg}"
+        );
+    }
+
+    /// `tune` reaches the golden only through [`GoldenSet::load`], and `eval`
+    /// only through [`GoldenSet::load_with_bytes`]. The bound has to be on the
+    /// route both take, not on the one the audit happened to name — before
+    /// this, `eval` had its own `fs::read` and `tune` had none.
+    #[test]
+    fn both_ways_into_the_golden_share_the_bound() {
+        let dir = TempDir::new("shared-bound");
+        let path = dir.0.join(".groove-eval.yml");
+        oversize_golden(&path);
+
+        assert!(GoldenSet::load(&path).is_err(), "the tune route");
+        assert!(GoldenSet::load_with_bytes(&path).is_err(), "the eval route");
+    }
+
+    #[test]
+    fn a_golden_under_the_cap_is_read_normally() {
+        let dir = TempDir::new("small-golden");
+        let path = dir.0.join(".groove-eval.yml");
+        std::fs::write(
+            &path,
+            "queries:\n  - query: \"a question\"\n    expected:\n      - path: \"a.md\"\n",
+        )
+        .expect("write");
+
+        let (gs, bytes) = GoldenSet::load_with_bytes(&path).expect("a small golden loads");
+        assert_eq!(gs.queries.len(), 1);
+        // The bytes are the ones the fingerprint is taken over, so they have to
+        // be the file's, not a re-serialisation of the parsed form.
+        assert_eq!(bytes, std::fs::read(&path).expect("read back"));
+    }
+
+    #[test]
+    fn an_oversize_history_starts_fresh_instead_of_being_parsed() {
+        // Unlike the golden, this one fails open: losing the comparison with
+        // last time costs less than refusing to measure at all.
+        let dir = TempDir::new("big-history");
+        let path = dir.0.join(".groove-eval-history.json");
+        let padding = "x".repeat(usize::try_from(MAX_EVAL_FILE_BYTES).unwrap_or(0) + 1);
+        std::fs::write(&path, format!("{{\"runs\": [], \"pad\": \"{padding}\"}}"))
+            .expect("write the oversize history");
+
+        let history = History::load(&path).expect("history load never fails");
+        assert!(
+            history.runs.is_empty(),
+            "an unreadable history starts fresh rather than being parsed"
+        );
+    }
 }

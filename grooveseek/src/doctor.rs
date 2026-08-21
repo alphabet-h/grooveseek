@@ -709,4 +709,127 @@ mod tests {
         // Not an error: nothing is broken, the answer is just not known yet.
         assert_eq!(f.severity, Severity::Warning);
     }
+
+    // ---- files the rename left behind ------------------------------------
+
+    /// A knowledge base *inside* the temp directory, so that "beside it" — the
+    /// parent, where the index goes — is inside it too and is cleaned up with
+    /// it.
+    fn kb_in(dir: &TempDir) -> PathBuf {
+        let kb = dir.0.join("kb");
+        std::fs::create_dir_all(&kb).expect("create the knowledge base dir");
+        kb
+    }
+
+    #[test]
+    fn a_leftover_ignore_file_is_reported_with_what_it_costs() {
+        let dir = TempDir::new("legacy-ignore");
+        let kb = kb_in(&dir);
+        let left = kb.join(".kb-mcpignore");
+        std::fs::write(&left, "secrets/\n").expect("write the old ignore file");
+
+        let db = db_with_one_chunk();
+        let report = run(&db, &registry_md(), &kb).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "legacy-ignore-file")
+            .expect("an unread .kb-mcpignore must be reported");
+        // The consequence, not the fact of the rename: someone reading this
+        // needs to know their exclusions are not in effect.
+        assert!(
+            f.summary.contains("being indexed"),
+            "the summary must say what it costs, got: {}",
+            f.summary
+        );
+        assert!(
+            f.remedy.contains(".grooveignore"),
+            "the remedy must name the new file, got: {}",
+            f.remedy
+        );
+        assert_eq!(f.samples, vec![left.display().to_string()]);
+    }
+
+    #[test]
+    fn the_names_in_use_today_are_not_reported() {
+        // The check looks for the old name, not for "a file that sounds like
+        // an ignore file". A knowledge base that migrated correctly is clean.
+        let dir = TempDir::new("current-names");
+        let kb = kb_in(&dir);
+        std::fs::write(kb.join(".grooveignore"), "secrets/\n").expect("write");
+        std::fs::write(kb.join(".groove-eval.yml"), "queries: []\n").expect("write");
+        std::fs::write(kb.join(".groove-eval-history.json"), "{}").expect("write");
+        std::fs::write(dir.0.join(".groove.db"), b"the live index").expect("write");
+
+        let db = db_with_one_chunk();
+        let report = run(&db, &registry_md(), &kb).expect("run");
+        assert!(
+            report.is_clean(),
+            "a migrated knowledge base has nothing to report, got: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn every_renamed_file_is_looked_for_where_its_replacement_is_read() {
+        // Table-driven rather than one test per row: a row added with the
+        // wrong `location` would be looked for in a directory the file is not
+        // in, so it would never fire and no per-row test would exist to say so.
+        for legacy in RENAMED {
+            let dir = TempDir::new("renamed");
+            let kb = kb_in(&dir);
+            let path = legacy.path(&kb);
+            std::fs::write(&path, b"left behind").expect("write the legacy file");
+
+            let db = db_with_one_chunk();
+            let report = run(&db, &registry_md(), &kb).expect("run");
+            let found: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
+            assert_eq!(
+                found,
+                vec![legacy.check],
+                "{} at {} should raise exactly {}",
+                legacy.old,
+                path.display(),
+                legacy.check
+            );
+        }
+    }
+
+    #[test]
+    fn a_dangling_symlink_with_the_old_name_is_still_in_the_way() {
+        // Why `symlink_metadata` and not `exists()`: a symlink named
+        // `.kb-mcpignore` whose target is gone is still a file with that name
+        // sitting there, unread, and `exists()` follows the link and says no.
+        let dir = TempDir::new("dangling");
+        let kb = kb_in(&dir);
+        let link = kb.join(".kb-mcpignore");
+        let missing = kb.join("target-that-never-existed");
+
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&missing, &link).is_ok();
+        // Windows needs developer mode or admin rights for this (WinError
+        // 1314), so the branch is skipped rather than failed there — the same
+        // shape `watcher.rs` uses.
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&missing, &link).is_ok();
+
+        if !made {
+            return;
+        }
+        assert!(
+            !link.exists(),
+            "the link must dangle for this to mean anything"
+        );
+
+        let db = db_with_one_chunk();
+        let report = run(&db, &registry_md(), &kb).expect("run");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.check == "legacy-ignore-file"),
+            "a dangling .kb-mcpignore is still in the way, got: {:?}",
+            report.findings
+        );
+    }
 }
