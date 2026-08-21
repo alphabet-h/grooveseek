@@ -302,6 +302,25 @@ the **index** carries (`index_meta.context_mode`), not what the config asked
 for. Context-off runs record nothing, so they stay comparable with every
 baseline taken before this existed.
 
+**A history file that cannot be read stops the run.** Both files `eval` keeps
+default to living inside the knowledge base, so both are read through the same
+checks `.grooveignore` gets: a hard link, something that is not a regular file,
+or a size past the cap (1 MiB for the golden, 64 MiB for the history) is
+refused — and, on Unix, a symlink. That last one is deliberately Unix-scoped:
+creating a symlink on Windows needs a privilege this threat model's attacker
+does not have, and refusing reparse points there would refuse every OneDrive
+and Dropbox placeholder. For the history that refusal is an **error**, not an empty
+history — the new run would otherwise be saved over the file, replacing every
+baseline with one run, and `--fail-on-regression` would pass without having
+compared anything. Content that *was* read and does not parse still starts
+fresh, because those bytes held no baseline. `--no-history` skips the file.
+
+Saving is bounded by the same number, so `eval` cannot write a history it will
+refuse: the **oldest** runs are dropped until the file fits, with a warning
+naming how many were kept. `history_size` remains what you asked for; this is
+the floor under it. A single run that does not fit is reported instead of
+written — that means a very large golden set or a very high `--limit`.
+
 Note that history written **before v0.13.0 is incompatible regardless of
 fusion settings**: `metric_version` went 1 → 2 when the metric implementation
 was corrected, and the fingerprint is compared as a whole. Those runs are

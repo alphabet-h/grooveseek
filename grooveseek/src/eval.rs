@@ -9,6 +9,77 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
+/// Refuse to read more than this much of the golden file.
+///
+/// It defaults to living **inside the knowledge base**, at
+/// `<kb>/.groove-eval.yml`, so it is written by whoever writes the notes, and a
+/// stray binary that lands on that name should not be parsed whole.
+/// `.grooveignore` has the same argument and the same shape of cap.
+///
+/// A megabyte is far past what the file is for: the golden in
+/// `tests/fixtures/` is 5.5 KB for 25 queries, so this leaves room for
+/// thousands.
+pub const MAX_GOLDEN_FILE_BYTES: u64 = 1024 * 1024;
+
+/// The same for the history — and **much larger, for a different reason**.
+///
+/// The history is not written by a person. `groove eval` writes it, pruned to
+/// `history_size` runs, and each run carries every golden query with its
+/// `top_k` hits. Measured by serialising the real structures:
+///
+/// | golden queries | `limit` | 10 runs |
+/// |---|---|---|
+/// | 25 (this repo's fixture) | 10 | 0.598 MiB |
+/// | 25 | 20 | **1.049 MiB** |
+/// | 100 | 10 | 2.379 MiB |
+///
+/// So a megabyte is *inside* the ordinary range, not past it. Sharing the
+/// golden's cap would refuse a perfectly valid history — and, before
+/// [`History::load`] was made to fail on a refusal, the next run would then
+/// have saved a fresh history over it and taken every baseline with it
+/// (codex P1 on PR #203, measured above).
+///
+/// 64 MiB is roughly 25 times the largest of those, and still bounds a file
+/// that is not a history at all.
+pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read one of those two files, bounded, from the handle the check was made on.
+///
+/// [`crate::links::read_checked`] is the same route `.grooveignore` takes, so a
+/// hard link, a FIFO, something that is not a regular file, or a file over the
+/// cap is a **refusal** rather than an unbounded read. The refusal message
+/// names the path and the reason.
+///
+/// **The symlink half is Unix-only**, and that is `links`'s decision rather
+/// than an omission here: its module documentation records that making one on
+/// Windows needs a privilege the threat model's attacker does not have, and
+/// that refusing reparse points there would refuse every OneDrive and Dropbox
+/// placeholder. Saying "a symlink is refused" without that scope would be a
+/// promise this does not keep (codex P2 on PR #203).
+/// Whether **the name** is taken, which is not the same as whether a file can
+/// be read through it.
+///
+/// `Path::exists` follows a symlink and answers about the target, so a link
+/// whose target is gone reads as absent. For these two files "absent" is the
+/// answer with consequences — the golden's absence is a hint and the history's
+/// absence is an empty history that then gets **saved over the link** — so the
+/// question has to be about the name, and anything else is left to
+/// [`read_bounded`] to refuse (codex P2 on PR #203).
+fn is_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn read_bounded(path: &Path, cap: u64, what: &str) -> Result<Vec<u8>> {
+    match crate::links::read_checked(path, cap) {
+        Ok(crate::links::Content::Bytes(b)) => Ok(b),
+        Ok(crate::links::Content::Refused(r)) => {
+            anyhow::bail!("refusing to read the {what}: {}", r.log_line(path))
+        }
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("failed to read the {what}: {}", path.display())),
+    }
+}
+
 // ---------- Golden ----------
 
 #[derive(Debug, Deserialize)]
@@ -47,17 +118,29 @@ pub struct ExpectedHit {
 impl GoldenSet {
     /// Golden YAML を読み込む。欠損時は hint 付きエラー。
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        Ok(Self::load_with_bytes(path)?.0)
+    }
+
+    /// The same read, handing back the bytes the fingerprint is taken over.
+    ///
+    /// `eval::run` needs both and used to do its own `fs::read` and parse
+    /// beside this one: two reads of one file, two error messages, and — once
+    /// a cap existed — two places for it to disagree with itself. `tune` only
+    /// ever went through [`Self::load`], so a bound added to the other copy
+    /// would have missed it entirely.
+    pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
+        // See [`is_present`]: a dangling symlink is a name that is taken, and
+        // "there is no golden file" would be the wrong thing to say about it.
+        if !is_present(path) {
             anyhow::bail!(
                 "no golden file at {} (hint: pass --golden or create <kb>/.groove-eval.yml)",
                 path.display()
             );
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read golden file: {}", path.display()))?;
-        let gs: Self = serde_yaml_bw::from_str(&text)
+        let bytes = read_bounded(path, MAX_GOLDEN_FILE_BYTES, "golden file")?;
+        let gs: Self = serde_yaml_bw::from_slice(&bytes)
             .with_context(|| format!("failed to parse golden file: {}", path.display()))?;
-        Ok(gs)
+        Ok((gs, bytes))
     }
 
     /// Golden ファイルの生バイト列を sha256 ハッシュ化 (fingerprint 用)。
@@ -833,17 +916,36 @@ pub struct History {
 
 impl History {
     /// JSON ファイルから履歴を読む。不在・破損時は warn を出して空 History を返す。
+    ///
+    /// **"Could not read it" and "read it, and it was not a history" are not
+    /// the same answer.**
+    ///
+    /// An empty history is not inert: `groove eval` pushes the new run onto
+    /// whatever this returns and saves the result over the same path, so
+    /// answering "empty" for a file that is intact and unread **replaces every
+    /// baseline with one run**, and `--fail-on-regression` then passes without
+    /// having compared anything. The `corpus` field's own documentation
+    /// records that hazard for the deserializing half; this is the reading
+    /// half of it.
+    ///
+    /// So a file that could not be read at all — refused as a symlink, a hard
+    /// link, something that is not a regular file, or over
+    /// [`MAX_HISTORY_FILE_BYTES`] — is an **error**, and `eval` stops before
+    /// it can save. `--no-history` is the way past it. Content that was read
+    /// and does not parse keeps starting fresh: there was never a baseline in
+    /// those bytes to lose.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        // `symlink_metadata`, not `exists()`. A **dangling** symlink at this
+        // name — a history kept on a volume that is not mounted right now —
+        // makes `exists()` answer false, and "absent" is the one answer that
+        // leads straight to `save` renaming a fresh file over the link and
+        // disconnecting the baselines for good (codex P2 on PR #203). Asking
+        // about the name rather than the target sends it to the checked read,
+        // which refuses it and stops the run.
+        if !is_present(path) {
             return Ok(Self::default());
         }
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("failed to read eval history {}: {}", path.display(), e);
-                return Ok(Self::default());
-            }
-        };
+        let bytes = read_bounded(path, MAX_HISTORY_FILE_BYTES, "eval history")?;
         match serde_json::from_slice::<Self>(&bytes) {
             Ok(h) => Ok(h),
             Err(e) => {
@@ -877,9 +979,85 @@ impl History {
             .filter(|p| p.fingerprint == now.fingerprint)
     }
 
+    /// Serialise, dropping the **oldest** runs until the reader will take it
+    /// back.
+    ///
+    /// `history_size` bounds the run *count* and nothing bounded the bytes, so
+    /// a large golden or a high `limit` could write a file
+    /// [`Self::load`] then refuses — `groove eval` producing something only it
+    /// can no longer read, and needing the user to delete a file it wrote
+    /// before it would run again (codex P2 on PR #203).
+    ///
+    /// Retention by count is still the setting; this is the floor under it.
+    /// Dropping the oldest is the same direction `push_front` already prunes
+    /// in, so the run being compared against is the last to go.
+    fn bytes_within(&self, cap: u64) -> Result<Vec<u8>> {
+        /// The newest `keep` runs, serialised.
+        fn encode(runs: &VecDeque<EvalRun>, keep: usize) -> Result<Vec<u8>> {
+            let slice = History {
+                runs: runs.iter().take(keep).cloned().collect(),
+            };
+            serde_json::to_vec_pretty(&slice).context("failed to serialize eval history")
+        }
+
+        let total = self.runs.len();
+        if total == 0 {
+            return encode(&self.runs, 0);
+        }
+
+        let whole = encode(&self.runs, total)?;
+        if whole.len() as u64 <= cap {
+            return Ok(whole);
+        }
+
+        // **Binary search, not one drop at a time.** Size is monotonic in run
+        // count, so the largest count that fits can be found in log₂(n)
+        // encodings. Dropping one at a time re-encodes the whole deque each
+        // round: a history holding thousands of small runs plus one large one
+        // would encode gigabytes on its way to the answer and look like a hang
+        // (codex P2 on PR #203).
+        let (mut lo, mut hi) = (1usize, total);
+        let mut best: Option<Vec<u8>> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let bytes = encode(&self.runs, mid)?;
+            if bytes.len() as u64 <= cap {
+                best = Some(bytes);
+                lo = mid + 1;
+            } else if mid == 1 {
+                break;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        let Some(bytes) = best else {
+            // One run on its own is over the cap, so there is nothing left to
+            // drop. Saying so now is better than writing a file the next run
+            // refuses: the numbers for this run have already been printed.
+            let one = encode(&self.runs, 1)?;
+            anyhow::bail!(
+                "a single eval run serialises to {} bytes, over the {cap} byte cap, so the \
+                 history cannot be written in a form the next run could read. This means a \
+                 very large golden set or a very high --limit. Reduce either, or pass \
+                 --no-history to skip the file.",
+                one.len()
+            );
+        };
+        // `best` came from a `mid` that fit; recovering that count from the
+        // bytes is not worth a second parse, so count what the search settled
+        // on: `lo` is one past it.
+        tracing::warn!(
+            "eval history trimmed to {} run(s) to stay under the {cap} byte cap; \
+             [eval].history_size asked for more",
+            lo - 1
+        );
+        Ok(bytes)
+    }
+
     /// atomic rename で書き出す。
     pub fn save(&self, path: &Path) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).context("failed to serialize eval history")?;
+        let bytes = self.bytes_within(MAX_HISTORY_FILE_BYTES)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -1242,14 +1420,7 @@ pub fn normalize_eval_limit_and_k(limit: u32, k_values: &[usize]) -> (u32, Vec<u
 
 /// Golden を読み、search_hybrid で評価し、EvalRun を返す。履歴書き込みは呼び出し側責務。
 pub fn run(opts: &RunOpts) -> Result<EvalRun> {
-    let golden_bytes = std::fs::read(&opts.golden_path)
-        .with_context(|| format!("failed to read golden file: {}", opts.golden_path.display()))?;
-    let gs: GoldenSet = serde_yaml_bw::from_slice(&golden_bytes).with_context(|| {
-        format!(
-            "failed to parse golden file: {}",
-            opts.golden_path.display()
-        )
-    })?;
+    let (gs, golden_bytes) = GoldenSet::load_with_bytes(&opts.golden_path)?;
     let golden_hash = GoldenSet::hash_bytes(&golden_bytes);
 
     let db_path = crate::resolve_db_path(&opts.kb_path);
@@ -3424,5 +3595,336 @@ enabled = true
         // 比較対象が無いときは null。false (= 変わっていない) と混同させない。
         let v = format_json(&now, None);
         assert_eq!(v["corpus_changed"], serde_json::Value::Null);
+    }
+
+    // ---------- bounded reads (L-9) ----------
+
+    /// A directory that cleans itself up, for the two files `eval` keeps.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let p = crate::test_support::unique_temp_path(&format!("groove-eval-{prefix}"));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A syntactically valid golden, one query long, padded past
+    /// `MAX_EVAL_FILE_BYTES`.
+    ///
+    /// **Valid on purpose.** If the file were junk, removing the bound would
+    /// still leave the load failing — at the parser — and the test would pass
+    /// while the file was being read whole, which is the thing it exists to
+    /// prevent. Padding one query keeps it parseable at any size.
+    ///
+    /// One `repeat` rather than a loop that appends until it passes the cap:
+    /// the size follows the constant either way, and a loop that builds a
+    /// gigabyte three lines at a time is a slow way to learn someone raised it.
+    fn oversize_golden(path: &std::path::Path) {
+        let pad = "a".repeat(usize::try_from(MAX_GOLDEN_FILE_BYTES).unwrap_or(0));
+        let body =
+            format!("queries:\n  - query: \"{pad}\"\n    expected:\n      - path: \"a.md\"\n");
+        assert!(
+            body.len() as u64 > MAX_GOLDEN_FILE_BYTES,
+            "the fixture has to be over the cap for the test to mean anything"
+        );
+        std::fs::write(path, body).expect("write the oversize golden");
+    }
+
+    #[test]
+    fn a_golden_over_the_cap_is_refused_rather_than_read() {
+        let dir = TempDir::new("big-golden");
+        let path = dir.0.join(".groove-eval.yml");
+        oversize_golden(&path);
+
+        let err = GoldenSet::load(&path).expect_err("an oversize golden must not be read");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to read"),
+            "the refusal must say it refused, got: {msg}"
+        );
+        assert!(
+            msg.contains("over the"),
+            "the refusal must say the cap is why, got: {msg}"
+        );
+    }
+
+    /// `tune` reaches the golden only through [`GoldenSet::load`], and `eval`
+    /// only through [`GoldenSet::load_with_bytes`]. The bound has to be on the
+    /// route both take, not on the one the audit happened to name — before
+    /// this, `eval` had its own `fs::read` and `tune` had none.
+    #[test]
+    fn both_ways_into_the_golden_share_the_bound() {
+        let dir = TempDir::new("shared-bound");
+        let path = dir.0.join(".groove-eval.yml");
+        oversize_golden(&path);
+
+        assert!(GoldenSet::load(&path).is_err(), "the tune route");
+        assert!(GoldenSet::load_with_bytes(&path).is_err(), "the eval route");
+    }
+
+    #[test]
+    fn a_golden_under_the_cap_is_read_normally() {
+        let dir = TempDir::new("small-golden");
+        let path = dir.0.join(".groove-eval.yml");
+        std::fs::write(
+            &path,
+            "queries:\n  - query: \"a question\"\n    expected:\n      - path: \"a.md\"\n",
+        )
+        .expect("write");
+
+        let (gs, bytes) = GoldenSet::load_with_bytes(&path).expect("a small golden loads");
+        assert_eq!(gs.queries.len(), 1);
+        // The bytes are the ones the fingerprint is taken over, so they have to
+        // be the file's, not a re-serialisation of the parsed form.
+        assert_eq!(bytes, std::fs::read(&path).expect("read back"));
+    }
+
+    /// A real history with one run in it, padded past `cap` with a field
+    /// `History` ignores, written to `path`.
+    ///
+    /// **The run is the point.** A fixture whose `runs` were already empty
+    /// would come back empty whether the bound fired or not — measured: the
+    /// first version of this test passed with the bound removed.
+    fn oversize_history(path: &std::path::Path, cap: u64) {
+        let mut real = History::default();
+        real.push_front(sample_run(100, 0.5), 10);
+        real.save(path).expect("save a real history");
+        let saved = std::fs::read_to_string(path).expect("read it back");
+        let pad = "x".repeat(usize::try_from(cap).unwrap_or(0));
+        let padded = format!(
+            "{{\"pad\":\"{pad}\",{}",
+            saved
+                .trim()
+                .strip_prefix('{')
+                .expect("history is an object")
+        );
+        assert!(padded.len() as u64 > cap);
+        assert_eq!(
+            serde_json::from_str::<History>(&padded)
+                .expect("the padded fixture is still valid history")
+                .runs
+                .len(),
+            1,
+            "the fixture has to parse when it is allowed to, or the refusal \
+             below could be the parser"
+        );
+        std::fs::write(path, &padded).expect("write the oversize history");
+    }
+
+    #[test]
+    fn a_history_that_cannot_be_read_stops_the_run_instead_of_emptying_it() {
+        // The golden refuses and the history used to start fresh. Starting
+        // fresh is what makes this dangerous: `main.rs` pushes the new run
+        // onto whatever `load` returns and saves it back over the same path,
+        // so "empty" for a file that is intact and unread replaces every
+        // baseline with one run — and `--fail-on-regression` then passes
+        // without having compared anything. `?` at the call site is what stops
+        // it, and `?` needs an `Err`.
+        let dir = TempDir::new("unreadable-history");
+        let path = dir.0.join(".groove-eval-history.json");
+        oversize_history(&path, MAX_HISTORY_FILE_BYTES);
+
+        let err = History::load(&path).expect_err("an unreadable history must not read as empty");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to read"),
+            "the error must say it refused, got: {msg}"
+        );
+
+        // Nothing was written over it. Reading does not write, so this is the
+        // weaker half — the strong half is that `load` returned `Err` at all,
+        // because `main.rs` reaches `save` only past a `?`.
+        assert!(
+            std::fs::metadata(&path).expect("still there").len() as u64 > MAX_HISTORY_FILE_BYTES,
+            "the history must be left exactly as it was"
+        );
+    }
+
+    /// A dangling link is a name that is taken, and "absent" is the dangerous
+    /// answer.
+    ///
+    /// `Path::exists` follows the link and says no, which sends `eval` down
+    /// the empty-history path — and `save` then renames a fresh file **over
+    /// the link**, disconnecting whatever it pointed at (codex P2 on
+    /// PR #203). Asking about the name instead sends it to the checked read,
+    /// which refuses it and stops the run.
+    ///
+    /// Unix only: creating a symlink on Windows needs a privilege that is not
+    /// there by default, which is the same reason `links` guards the two
+    /// platforms differently.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_history_link_is_refused_rather_than_read_as_absent() {
+        let dir = TempDir::new("dangling-history");
+        let path = dir.0.join(".groove-eval-history.json");
+        let missing = dir.0.join("on-a-volume-that-is-not-mounted.json");
+        if std::os::unix::fs::symlink(&missing, &path).is_err() {
+            return;
+        }
+        assert!(
+            !path.exists(),
+            "the link must dangle for this to mean anything"
+        );
+
+        let err = History::load(&path).expect_err("a dangling link is not an absent history");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to read"),
+            "the refusal must say it refused, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_history_that_is_merely_not_history_still_starts_fresh() {
+        // The other half of the distinction: these bytes were read, and they
+        // hold no baseline to lose. `test_history_load_corrupt_returns_empty_
+        // with_warn` covers the same rule from before this change; this one
+        // states why the two answers differ.
+        let dir = TempDir::new("not-history");
+        let path = dir.0.join(".groove-eval-history.json");
+        std::fs::write(&path, "{not json").expect("write");
+
+        let history = History::load(&path).expect("unparseable content is not a read failure");
+        assert!(history.runs.is_empty());
+    }
+
+    /// A history of `runs` runs, each carrying `queries` queries of `limit`
+    /// hits — the shape that decides how big the file gets.
+    fn history_of(runs: usize, queries: usize, limit: usize) -> History {
+        let mut h = History::default();
+        for i in 0..runs {
+            let mut run = sample_run(1000 + i as i64, 0.9);
+            run.per_query = (0..queries)
+                .map(|q| QueryResult {
+                    id: format!("q-{q}"),
+                    query: "本番に出した変更を前のバージョンへ戻したい".to_string(),
+                    expected: vec![ExpectedHit {
+                        path: format!("ops/doc-{q}.ja.md"),
+                        heading: None,
+                    }],
+                    top_k: (0..limit)
+                        .map(|r| HitRecord {
+                            rank: r,
+                            path: format!("ops/doc-{r}.ja.md"),
+                            heading: Some("切り戻しの手順".to_string()),
+                            score: 0.0123,
+                        })
+                        .collect(),
+                    metrics: QueryMetrics::default(),
+                })
+                .collect();
+            h.push_front(run, runs);
+        }
+        h
+    }
+
+    #[test]
+    fn whatever_save_writes_is_something_load_will_take_back() {
+        // codex P2 on PR #203: `history_size` bounds the run count and nothing
+        // bounded the bytes, so eval could write a file it then refused —
+        // needing the user to delete something eval itself produced before it
+        // would run again.
+        //
+        // A small cap stands in for a large golden here. The relationship is
+        // what matters, and driving it from the real constant would need a
+        // 64 MiB fixture to say the same thing.
+        let cap = 600 * 1024;
+        let big = history_of(10, 100, 10);
+        let one = history_of(1, 100, 10);
+        // The cap has to sit **between** one run and ten, or this exercises the
+        // other branch: below one run there is nothing to drop, and above ten
+        // there is nothing to trim. Measured here at roughly 0.21 MiB and
+        // 2.1 MiB.
+        assert!(
+            (serde_json::to_vec_pretty(&one).expect("serialize").len() as u64) < cap
+                && serde_json::to_vec_pretty(&big).expect("serialize").len() as u64 > cap,
+            "the fixture has to straddle the cap for this to mean anything"
+        );
+
+        let bytes = big
+            .bytes_within(cap)
+            .expect("a history that can be trimmed is written");
+        assert!(
+            bytes.len() as u64 <= cap,
+            "written bytes are within the cap"
+        );
+        let back: History = serde_json::from_slice(&bytes).expect("what was written parses");
+        assert!(
+            !back.runs.is_empty() && back.runs.len() < big.runs.len(),
+            "the oldest runs were dropped, not all of them: {} of {}",
+            back.runs.len(),
+            big.runs.len()
+        );
+        // Oldest first, so the run the next diff compares against survives.
+        assert_eq!(
+            back.runs.front().map(|r| r.timestamp),
+            big.runs.front().map(|r| r.timestamp)
+        );
+    }
+
+    #[test]
+    fn a_single_run_over_the_cap_is_reported_rather_than_written() {
+        // Nothing left to drop. Saying so now beats writing a file the next
+        // run refuses — the numbers for this run have already been printed.
+        let cap = 1024;
+        let one = history_of(1, 100, 10);
+        let err = one
+            .bytes_within(cap)
+            .expect_err("a single oversize run cannot be made to fit");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--no-history"),
+            "the error must name the way past it, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_history_the_ordinary_way_round_is_well_under_the_cap() {
+        // Why the history does not share the golden's megabyte. This shape —
+        // 25 queries, 10 hits, 10 runs, this repo's own golden — serialises to
+        // about 0.52 MiB here; with per-query metrics filled in as a real run
+        // fills them, the same shape measured 0.598 MiB, and 25 queries at
+        // `limit = 20` measured 1.049 MiB. A megabyte is inside the ordinary
+        // range, not past it.
+        let mut h = History::default();
+        for i in 0..10 {
+            let mut run = sample_run(1000 + i, 0.9);
+            run.per_query = (0..25)
+                .map(|q| QueryResult {
+                    id: format!("q-{q}"),
+                    query: "本番に出した変更を前のバージョンへ戻したい".to_string(),
+                    expected: vec![ExpectedHit {
+                        path: format!("ops/doc-{q}.ja.md"),
+                        heading: None,
+                    }],
+                    top_k: (0..10)
+                        .map(|r| HitRecord {
+                            rank: r,
+                            path: format!("ops/doc-{r}.ja.md"),
+                            heading: Some("切り戻しの手順".to_string()),
+                            score: 0.0123,
+                        })
+                        .collect(),
+                    metrics: QueryMetrics::default(),
+                })
+                .collect();
+            h.push_front(run, 10);
+        }
+        let size = serde_json::to_vec_pretty(&h).expect("serialize").len() as u64;
+        assert!(
+            size > MAX_GOLDEN_FILE_BYTES / 4,
+            "if an ordinary history got this small, the argument for a \
+             separate cap is gone and this should be revisited: {size} bytes"
+        );
+        assert!(
+            size < MAX_HISTORY_FILE_BYTES / 8,
+            "an ordinary history is nowhere near the history cap: {size} bytes"
+        );
     }
 }
