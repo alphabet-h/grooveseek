@@ -3676,6 +3676,23 @@ mod tests {
     /// `integer` is separated from `number` because the contract does: a byte
     /// offset is not a score. `serde_json` keeps the distinction, so this
     /// reads it rather than guessing from the value.
+    /// The type words a contract cell names.
+    ///
+    /// The same extraction serves the language check and the serializer check,
+    /// because they are asking one question — what does this cell claim — of
+    /// two different second opinions.
+    ///
+    /// Matching by substring is enough because the type column is a short
+    /// phrase built from these words: `array of strings`, `string or `null``.
+    fn kind_words(cell: &str) -> BTreeSet<&'static str> {
+        [
+            "array", "string", "number", "integer", "boolean", "object", "null",
+        ]
+        .into_iter()
+        .filter(|w| cell.contains(w))
+        .collect()
+    }
+
     fn json_kind(value: &serde_json::Value) -> &'static str {
         match value {
             serde_json::Value::Null => "null",
@@ -3877,17 +3894,17 @@ mod tests {
             let Some(ty) = documented.get(path) else {
                 continue; // absence is the other checks' job
             };
-            for kind in observed {
-                if !ty.contains(kind) {
-                    wrong.push(format!(
-                        "`{path}` serialized as {kind}, contract says {ty:?}"
-                    ));
-                }
+            let claimed = kind_words(ty);
+            if &claimed != observed {
+                wrong.push(format!(
+                    "`{path}`: contract says {claimed:?} (from {ty:?}), \
+                     response produces {observed:?}"
+                ));
             }
         }
         assert!(
             wrong.is_empty(),
-            "the contract must name the type the response actually produces:\n  {}",
+            "the contract and the serializer must agree about every type:\n  {}",
             wrong.join("\n  ")
         );
     }
@@ -4092,19 +4109,11 @@ mod tests {
         // names are English on both pages but the sentence around them is
         // translated, so `array of strings` and `string の array` are the same
         // promise written twice.
-        let words = |cell: &str| -> BTreeSet<&'static str> {
-            [
-                "array", "string", "number", "integer", "boolean", "object", "null",
-            ]
-            .into_iter()
-            .filter(|w| cell.contains(w))
-            .collect()
-        };
         let differing: Vec<(&String, &String, &String)> = en
             .iter()
             .filter_map(|(f, t)| {
                 ja.get(f)
-                    .filter(|j| words(j) != words(t))
+                    .filter(|j| kind_words(j) != kind_words(t))
                     .map(|j| (f, t, j))
             })
             .collect();

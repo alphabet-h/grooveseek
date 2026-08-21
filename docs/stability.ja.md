@@ -182,7 +182,7 @@ loopback origin** である。
 | `results[].match_spans` | array | **計算されなかった場合はキーごと不在**。後述 |
 | `results[].match_spans[].start` | integer | `content` へのバイトオフセット。開始 (含む) |
 | `results[].match_spans[].end` | integer | `content` へのバイトオフセット。終了 (含まない) |
-| `results[].expanded_from` | object | parent retriever が拡張した場合のみ。他は**不在** |
+| `results[].expanded_from` | object | parent retriever が**扱った**場合のみ。他は**不在**。**あること = 拡張された証拠ではない** — 後述 |
 | `results[].expanded_from.kind` | string | `"adjacent"` または `"whole_document"`。**どちらかで下の 3 行の有無が決まる** |
 | `results[].expanded_from.from_index` | integer | `adjacent` のみ。merge した最初の chunk index (含む) |
 | `results[].expanded_from.to_index` | integer | `adjacent` のみ。merge した最後の chunk index (含む) |
@@ -228,6 +228,14 @@ loopback origin** である。
 条件を満たさなければ**オブジェクトからキーが消える**。消費側は
 **キーの不在と明示的な `null` を区別してはならない** — どちらも「与えられていない」
 と読む。
+
+**`expanded_from` が言うのは「parent retriever が走った」であって
+「content が増えた」ではない。** `adjacent` の 2 つの index が**等しい**場合が
+degrade したケース — 隣接 chunk を足すと `max_expanded_tokens` を超えるので、
+hit を自分の chunk のまま残し、**そうなった事実をこのフィールドが記録する**。
+chunk が 1 つしかない文書も同じ理由で同じ形になる。
+**`from_index == to_index` は「扱ったが拡張していない」と読む** —
+どちらにせよ content は元の chunk である。
 
 **`match_spans` は 3 状態を持ち、それぞれ意味が違う**: **不在 = 計算していない**
 (query の分割語に非 ASCII 文字が含まれる / query が空または空白のみ /

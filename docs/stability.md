@@ -195,7 +195,7 @@ different each time.
 | `results[].match_spans` | array | **omitted** unless computed — see below |
 | `results[].match_spans[].start` | integer | byte offset into `content`, inclusive |
 | `results[].match_spans[].end` | integer | byte offset into `content`, exclusive |
-| `results[].expanded_from` | object | **omitted** unless the parent retriever expanded the hit |
+| `results[].expanded_from` | object | **omitted** unless the parent retriever considered the hit — present is not proof of expansion, see below |
 | `results[].expanded_from.kind` | string | `"adjacent"` or `"whole_document"`, and which one decides the keys below |
 | `results[].expanded_from.from_index` | integer | `adjacent` only — first chunk index merged in, inclusive |
 | `results[].expanded_from.to_index` | integer | `adjacent` only — last chunk index merged in, inclusive |
@@ -245,6 +245,13 @@ echo later would be a minor release, by the rule that new fields may be added.
 **Omitted means absent, not `null`.** Every row above that says "omitted" leaves
 the key out of the object entirely. A consumer must not distinguish a missing
 key from an explicit `null` — read both as "not provided".
+
+**`expanded_from` says the parent retriever ran, not that content grew.** An
+adjacent range whose two indices are equal is the degraded case: the neighbours
+would have exceeded `max_expanded_tokens`, so the hit was left at its own chunk
+and the field records that this happened. A single-chunk document produces the
+same shape for the same reason. Read `from_index == to_index` as "considered and
+not expanded" — the content is the original chunk either way.
 
 **`match_spans` carries three states**, and they are not the same: absent means
 the offsets were not computed — the query splits into a term containing a
