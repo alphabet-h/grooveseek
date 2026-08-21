@@ -423,9 +423,17 @@ fn macos_install_status_uninstall_round_trip() {
         "127.0.0.1:0",
     ]);
 
-    // Best-effort cleanup before the asserts, so a failure leaves no agent
-    // loaded and no plist behind — the shape the Windows smoke test uses.
+    // Cleanup before the asserts, so a failure leaves no agent loaded and no
+    // plist behind — the shape the Windows smoke test uses.
+    //
+    // **Every observation is taken before the cleanup and kept in a variable.**
+    // The first version asserted `!plist.exists()` *after* its own
+    // `remove_file`, so the cleanup rather than `uninstall` was what made it
+    // true, and the sibling test below asserted `plist.exists()` after the
+    // same line and failed on the macOS runner for exactly that. Cleanup-first
+    // is the right order; reading state the cleanup also writes is the trap.
     let uninstall = run(&["service", "uninstall", "--service-name", &name]);
+    let plist_gone_after_uninstall = !plist.exists();
     let after = run(&["service", "status", "--service-name", &name]);
     let _ = std::fs::remove_file(&plist);
 
@@ -441,7 +449,11 @@ fn macos_install_status_uninstall_round_trip() {
         String::from_utf8_lossy(&uninstall.stdout),
         String::from_utf8_lossy(&uninstall.stderr),
     );
-    assert!(!plist.exists(), "uninstall must remove {}", plist.display());
+    assert!(
+        plist_gone_after_uninstall,
+        "uninstall must remove {}",
+        plist.display()
+    );
     let after_text = String::from_utf8_lossy(&after.stdout);
     assert!(
         after_text.contains("not found"),
@@ -493,6 +505,13 @@ fn macos_install_makes_launchd_know_the_label() {
         "--bind",
         "127.0.0.1:0",
     ]);
+    // Read before the cleanup, keep the answer: the cleanup deletes this file,
+    // so asking afterwards asks about the cleanup. Measured on the runner —
+    // the first version of this test failed here with "install must write
+    // .../com.groove.live25874.plist" while its sibling round trip passed,
+    // because `install` really had written it and `remove_file` below really
+    // had taken it away again.
+    let plist_written_by_install = plist.exists();
     let during = run(&["service", "status", "--service-name", &name]);
     let list = run(&["service", "list"]);
 
@@ -504,7 +523,11 @@ fn macos_install_makes_launchd_know_the_label() {
         "service install failed\nstderr: {}",
         String::from_utf8_lossy(&install.stderr),
     );
-    assert!(plist.exists(), "install must write {}", plist.display());
+    assert!(
+        plist_written_by_install,
+        "install must write {}",
+        plist.display()
+    );
 
     // `running` or `stopped` — either means `launchctl list <label>` found it,
     // which is what `bootstrap gui/<uid>` succeeding looks like from here.
