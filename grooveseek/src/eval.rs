@@ -3656,11 +3656,12 @@ enabled = true
 
     #[test]
     fn a_history_the_ordinary_way_round_is_well_under_the_cap() {
-        // Why the history does not share the golden's megabyte. Serialising
-        // the real structures for this repo's own golden — 25 queries, limit
-        // 10, 10 runs — measures 0.598 MiB, and 25 queries at limit 20
-        // measures 1.049 MiB. A megabyte is inside the ordinary range, not
-        // past it.
+        // Why the history does not share the golden's megabyte. This shape —
+        // 25 queries, 10 hits, 10 runs, this repo's own golden — serialises to
+        // about 0.52 MiB here; with per-query metrics filled in as a real run
+        // fills them, the same shape measured 0.598 MiB, and 25 queries at
+        // `limit = 20` measured 1.049 MiB. A megabyte is inside the ordinary
+        // range, not past it.
         let mut h = History::default();
         for i in 0..10 {
             let mut run = sample_run(1000 + i, 0.9);
