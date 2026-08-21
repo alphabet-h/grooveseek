@@ -1511,7 +1511,7 @@ fn run_doctor(
     let looked = (|| -> Result<grooveseek::doctor::Report> {
         let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
         let registry = cfg.build_parser_registry()?;
-        grooveseek::doctor::run(&db, &registry)
+        grooveseek::doctor::run(&db, &registry, kb_path)
     })();
     let report = match looked {
         Ok(r) => r,

@@ -1,6 +1,6 @@
 //! `groove doctor` — ask the index whether it is in the state it should be.
 //!
-//! Two groups of question, and one deliberate omission.
+//! Three groups of question, and one deliberate omission.
 //!
 //! **Integrity.** Search reads three tables that have to agree about a chunk:
 //! `chunks` holds the text, `vec_chunks` the embedding, `fts_chunks` the
@@ -18,6 +18,15 @@
 //! equivalent would eventually disagree with the thing it is reporting on,
 //! which is the failure mode this whole feature is about.
 //!
+//! **Files that stopped being read.** ADR-0007 renamed everything this project
+//! writes to disk and chose, deliberately, to ship no aliases and no automatic
+//! migration: a `groove` binary does not see what `kb-mcp` left behind. That is
+//! the right decision and this is its cost — the old file stays where it was,
+//! is never opened, and nothing says so. `.kb-mcpignore` is the one that hurts,
+//! because the consequence of not reading it is that **everything it excluded
+//! is now in the index**, silently and with no error anywhere. This is the only
+//! group that looks at the filesystem rather than at the database.
+//!
 //! **It does not repair.** Every finding names the command that fixes it. That
 //! is the contract `paths_with_unregistered_extension` already states for the
 //! narrower case — report the count, suggest `groove index`, never delete —
@@ -32,6 +41,7 @@ use crate::db::{Database, IntegrityScan};
 use crate::parser::Registry;
 use anyhow::Result;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 /// How many offending paths a finding carries. Enough to recognise the shape
 /// of the problem, few enough that a broken index does not print a novel.
@@ -110,8 +120,13 @@ fn finding(
 /// Findings come out in the order below — integrity before servability —
 /// because the first group means something is broken and the second means
 /// something is merely unavailable.
-pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
+pub fn run(db: &Database, registry: &Registry, kb_path: &Path) -> Result<Report> {
     let mut findings = Vec::new();
+
+    // First, because it is the only group that can explain why the index holds
+    // documents you thought you had excluded — every question below takes the
+    // corpus as given and asks whether the index agrees with itself about it.
+    findings.extend(files_that_stopped_being_read(kb_path));
 
     // Before the per-chunk comparisons, because those cannot see it: with the
     // table gone there is nothing to scan, so every one of them answers clean
@@ -262,6 +277,112 @@ pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
     })
 }
 
+/// Where a file sits, relative to the knowledge base.
+#[derive(Debug, Clone, Copy)]
+enum Location {
+    /// Inside it, where `.grooveignore` and the eval files are read from.
+    KbRoot,
+    /// Beside it, where the index goes.
+    BesideIndex,
+}
+
+/// One file ADR-0007 renamed, and what it costs to leave the old one there.
+#[derive(Debug, Clone, Copy)]
+struct Legacy {
+    check: &'static str,
+    old: &'static str,
+    new: &'static str,
+    location: Location,
+    /// Completes "`<old>` …". The consequence, not the fact of the rename.
+    consequence: &'static str,
+    remedy: &'static str,
+}
+
+/// The file half of the 0.26.0 migration table in `CHANGELOG.md`.
+///
+/// Environment variables and command names are on that table too and are not
+/// here, because nothing on disk near a knowledge base reveals them.
+/// `kb-mcp.toml` is not here either, for a different reason: `groove.toml` is
+/// *discovered* — from the working directory, a `.git` ancestor, beside the
+/// binary, or the home directory — so there is no single place the old one
+/// would be, and a configuration that silently did not load announces itself
+/// immediately anyway, by indexing the wrong directory or none.
+const RENAMED: &[Legacy] = &[
+    Legacy {
+        check: "legacy-ignore-file",
+        old: ".kb-mcpignore",
+        new: ".grooveignore",
+        location: Location::KbRoot,
+        consequence: "is not read, so every path it excluded is being indexed",
+        // A plain run is enough and `--force` would be wrong: documents that
+        // are neither visited nor skipped are pruned, and a file the walk no
+        // longer reaches is exactly that. `--force` would re-embed the whole
+        // corpus to reach the same state.
+        remedy: "rename it to .grooveignore, then run `groove index`",
+    },
+    Legacy {
+        check: "legacy-index-file",
+        old: ".kb-mcp.db",
+        new: ".groove.db",
+        location: Location::BesideIndex,
+        consequence: "is an index this binary never opens; the one in use is beside it",
+        remedy: "delete it once `groove status` reports the documents you expect",
+    },
+    Legacy {
+        check: "legacy-golden-file",
+        old: ".kb-mcp-eval.yml",
+        new: ".groove-eval.yml",
+        location: Location::KbRoot,
+        consequence: "is not read, so `groove eval` reports that there is no golden file",
+        remedy: "rename it to .groove-eval.yml",
+    },
+    Legacy {
+        check: "legacy-history-file",
+        old: ".kb-mcp-eval-history.json",
+        new: ".groove-eval-history.json",
+        location: Location::KbRoot,
+        consequence: "is not read, so `groove eval` compares against nothing and starts fresh",
+        remedy: "rename it to .groove-eval-history.json",
+    },
+];
+
+impl Legacy {
+    fn path(&self, kb_path: &Path) -> PathBuf {
+        match self.location {
+            Location::KbRoot => kb_path.join(self.old),
+            // Derived from `resolve_db_path` rather than restated, so "beside
+            // the knowledge base" cannot drift from where the index goes.
+            Location::BesideIndex => crate::resolve_db_path(kb_path).with_file_name(self.old),
+        }
+    }
+}
+
+/// Which renamed files are still sitting in this knowledge base.
+///
+/// `symlink_metadata`, not `exists()`: a dangling symlink named `.kb-mcpignore`
+/// is still a file with that name in the way, and `exists()` follows the link
+/// and answers no.
+fn files_that_stopped_being_read(kb_path: &Path) -> Vec<Finding> {
+    RENAMED
+        .iter()
+        .filter_map(|legacy| {
+            let path = legacy.path(kb_path);
+            std::fs::symlink_metadata(&path).ok()?;
+            Some(Finding {
+                check: legacy.check,
+                severity: Severity::Warning,
+                summary: format!(
+                    "{} {} (renamed to {} in 0.26.0, with no alias)",
+                    legacy.old, legacy.consequence, legacy.new
+                ),
+                count: 1,
+                samples: vec![path.display().to_string()],
+                remedy: legacy.remedy,
+            })
+        })
+        .collect()
+}
+
 /// Turn a full list of paths into the same shape the SQL scans produce.
 fn truncated(paths: Vec<String>) -> IntegrityScan {
     IntegrityScan {
@@ -341,10 +462,27 @@ mod tests {
         db
     }
 
+    /// A knowledge base with none of the renamed files anywhere near it.
+    ///
+    /// Every check except `files_that_stopped_being_read` reads the database
+    /// and nothing else, so all these tests need is a path where that one
+    /// finds nothing. A path that does not exist satisfies it exactly, with no
+    /// directory to clean up afterwards.
+    ///
+    /// Absolute, and under a parent that does not exist either: `.kb-mcp.db`
+    /// is looked for beside the knowledge base, and a *relative* path would
+    /// put "beside" in the working directory — which would make these tests
+    /// depend on what happens to be sitting in it.
+    fn kb_with_nothing_left_behind() -> PathBuf {
+        std::env::temp_dir()
+            .join("groove-doctor-no-such-parent")
+            .join("kb")
+    }
+
     #[test]
     fn a_healthy_index_has_nothing_to_report() {
         let db = db_with_one_chunk();
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         assert!(
             report.is_clean(),
             "a freshly built index should report nothing: {:?}",
@@ -358,7 +496,7 @@ mod tests {
         let db = db_with_one_chunk();
         db.execute_for_test("DELETE FROM vec_chunks").expect("del");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()
@@ -374,7 +512,7 @@ mod tests {
         let db = db_with_one_chunk();
         db.execute_for_test("DELETE FROM fts_chunks").expect("del");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()
@@ -397,7 +535,7 @@ mod tests {
         // the state a partially applied write would leave.
         db.execute_for_test("DELETE FROM chunks").expect("del");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
         assert!(checks.contains(&"orphan-embedding"), "{checks:?}");
         assert!(checks.contains(&"orphan-fts-row"), "{checks:?}");
@@ -414,7 +552,7 @@ mod tests {
         ))
         .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()
@@ -446,7 +584,7 @@ mod tests {
         //     embedding, which is just as loud.
         {
             let db = Database::open(&dir.db()).expect("reopen");
-            let report = run(&db, &registry_md()).expect("run");
+            let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
             let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
             assert!(
                 !checks.contains(&"vector-table-missing"),
@@ -470,7 +608,7 @@ mod tests {
         //     otherwise report a healthy index while vector search returns
         //     nothing at all.
         let db = Database::open(&dir.db()).expect("reopen");
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()
@@ -487,7 +625,9 @@ mod tests {
     fn an_empty_index_without_a_vector_table_is_not_a_finding() {
         let db = Database::open_in_memory().expect("open");
         assert!(
-            run(&db, &registry_md()).expect("run").is_clean(),
+            run(&db, &registry_md(), &kb_with_nothing_left_behind())
+                .expect("run")
+                .is_clean(),
             "a database with nothing in it has nothing wrong with it"
         );
     }
@@ -508,7 +648,7 @@ mod tests {
         )
         .expect("orphan the chunk");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()
@@ -540,7 +680,7 @@ mod tests {
         ))
         .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()
@@ -559,7 +699,7 @@ mod tests {
         db.execute_for_test("UPDATE documents SET size_bytes = NULL")
             .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), &kb_with_nothing_left_behind()).expect("run");
         let f = report
             .findings
             .iter()

@@ -9,6 +9,37 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
+/// Refuse to read more than this much of either file `eval` keeps.
+///
+/// Both of them default to living **inside the knowledge base** — the golden at
+/// `<kb>/.groove-eval.yml`, the history at `<kb>/.groove-eval-history.json` —
+/// so they are written by whoever writes the notes, and a stray binary that
+/// lands on one of those names should not be parsed whole. `.grooveignore` has
+/// the same argument and the same shape of cap.
+///
+/// A megabyte is far past what either file is for: the golden in
+/// `tests/fixtures/` is 5.5 KB for 25 queries, so this leaves room for
+/// thousands.
+pub const MAX_EVAL_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read one of those two files, bounded, from the handle the check was made on.
+///
+/// [`crate::links::read_checked`] is the same route `.grooveignore` takes, so a
+/// symlink, a hard link, a FIFO or an oversize file is a **refusal** rather
+/// than an unbounded read. The refusal message names the path and the reason;
+/// `Err` stays an ordinary I/O failure, which the two callers treat
+/// differently.
+fn read_bounded(path: &Path, what: &str) -> Result<Vec<u8>> {
+    match crate::links::read_checked(path, MAX_EVAL_FILE_BYTES) {
+        Ok(crate::links::Content::Bytes(b)) => Ok(b),
+        Ok(crate::links::Content::Refused(r)) => {
+            anyhow::bail!("refusing to read the {what}: {}", r.log_line(path))
+        }
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("failed to read the {what}: {}", path.display())),
+    }
+}
+
 // ---------- Golden ----------
 
 #[derive(Debug, Deserialize)]
@@ -47,17 +78,27 @@ pub struct ExpectedHit {
 impl GoldenSet {
     /// Golden YAML を読み込む。欠損時は hint 付きエラー。
     pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::load_with_bytes(path)?.0)
+    }
+
+    /// The same read, handing back the bytes the fingerprint is taken over.
+    ///
+    /// `eval::run` needs both and used to do its own `fs::read` and parse
+    /// beside this one: two reads of one file, two error messages, and — once
+    /// a cap existed — two places for it to disagree with itself. `tune` only
+    /// ever went through [`Self::load`], so a bound added to the other copy
+    /// would have missed it entirely.
+    pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
         if !path.exists() {
             anyhow::bail!(
                 "no golden file at {} (hint: pass --golden or create <kb>/.groove-eval.yml)",
                 path.display()
             );
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read golden file: {}", path.display()))?;
-        let gs: Self = serde_yaml_bw::from_str(&text)
+        let bytes = read_bounded(path, "golden file")?;
+        let gs: Self = serde_yaml_bw::from_slice(&bytes)
             .with_context(|| format!("failed to parse golden file: {}", path.display()))?;
-        Ok(gs)
+        Ok((gs, bytes))
     }
 
     /// Golden ファイルの生バイト列を sha256 ハッシュ化 (fingerprint 用)。
@@ -837,10 +878,14 @@ impl History {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let bytes = match std::fs::read(path) {
+        // Fails open, unlike the golden: a history that cannot be read costs
+        // the run its comparison with last time, while refusing to run would
+        // cost the measurement itself. The warning is the part that must not
+        // be silent — including when the refusal is the cap.
+        let bytes = match read_bounded(path, "eval history") {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!("failed to read eval history {}: {}", path.display(), e);
+                tracing::warn!("{e:#}, starting fresh");
                 return Ok(Self::default());
             }
         };
@@ -1242,14 +1287,7 @@ pub fn normalize_eval_limit_and_k(limit: u32, k_values: &[usize]) -> (u32, Vec<u
 
 /// Golden を読み、search_hybrid で評価し、EvalRun を返す。履歴書き込みは呼び出し側責務。
 pub fn run(opts: &RunOpts) -> Result<EvalRun> {
-    let golden_bytes = std::fs::read(&opts.golden_path)
-        .with_context(|| format!("failed to read golden file: {}", opts.golden_path.display()))?;
-    let gs: GoldenSet = serde_yaml_bw::from_slice(&golden_bytes).with_context(|| {
-        format!(
-            "failed to parse golden file: {}",
-            opts.golden_path.display()
-        )
-    })?;
+    let (gs, golden_bytes) = GoldenSet::load_with_bytes(&opts.golden_path)?;
     let golden_hash = GoldenSet::hash_bytes(&golden_bytes);
 
     let db_path = crate::resolve_db_path(&opts.kb_path);
