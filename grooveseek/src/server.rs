@@ -3666,6 +3666,39 @@ mod tests {
     /// and `filter_applied` and means something different in each; a flat set
     /// would let one of them satisfy the check for the other.
     fn walk_fields(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        let mut kinds = BTreeMap::new();
+        walk_with_kinds(value, prefix, out, &mut kinds);
+    }
+
+    /// The JSON kind a value serialized as, in the vocabulary the contract's
+    /// type column uses.
+    ///
+    /// `integer` is separated from `number` because the contract does: a byte
+    /// offset is not a score. `serde_json` keeps the distinction, so this
+    /// reads it rather than guessing from the value.
+    fn json_kind(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    /// [`walk_fields`] plus what each path serialized as.
+    ///
+    /// A path can be seen more than once with different kinds — `title` is a
+    /// string in the maximal sample and `null` in the minimal one — so the
+    /// kinds accumulate per path and the contract has to name all of them.
+    fn walk_with_kinds(
+        value: &serde_json::Value,
+        prefix: &str,
+        out: &mut BTreeSet<String>,
+        kinds: &mut BTreeMap<String, BTreeSet<&'static str>>,
+    ) {
         match value {
             serde_json::Value::Object(map) => {
                 for (k, v) in map {
@@ -3675,7 +3708,8 @@ mod tests {
                         format!("{prefix}.{k}")
                     };
                     out.insert(path.clone());
-                    walk_fields(v, &path, out);
+                    kinds.entry(path.clone()).or_default().insert(json_kind(v));
+                    walk_with_kinds(v, &path, out, kinds);
                 }
             }
             // Every element, not just the first: `expanded_from` is a tagged
@@ -3683,7 +3717,7 @@ mod tests {
             // result can only ever show half of the shape.
             serde_json::Value::Array(items) => {
                 for item in items {
-                    walk_fields(item, &format!("{prefix}[]"), out);
+                    walk_with_kinds(item, &format!("{prefix}[]"), out, kinds);
                 }
             }
             _ => {}
@@ -3767,6 +3801,81 @@ mod tests {
             Some("2026-12-31".to_string()),
             Some(1.5),
         )
+    }
+
+    /// A response with every optional left out.
+    ///
+    /// Its keys are exactly the set the contract may call unconditional, and
+    /// its `null`s are the other half of what `string or `null`` promises.
+    fn minimal_search_response() -> serde_json::Value {
+        serde_json::to_value(SearchResponse {
+            results: vec![crate::db::SearchHit {
+                score: 0.5,
+                path: "notes/a.md".to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: String::new(),
+                match_spans: None,
+                expanded_from: None,
+            }],
+            low_confidence: false,
+            filter_applied: SearchFilterEcho::default(),
+        })
+        .expect("the response type serializes")
+    }
+
+    /// Every response shape the contract describes, for reading kinds off.
+    fn every_sample() -> Vec<serde_json::Value> {
+        let (mcp, cli) = both_surfaces();
+        vec![
+            mcp,
+            cli,
+            minimal_search_response(),
+            serde_json::to_value(ErrorResponse {
+                error: "why the call could not be answered".to_string(),
+            })
+            .expect("the error type serializes"),
+        ]
+    }
+
+    /// The contract freezes each field's **type**, and until now nothing
+    /// connected that column to the serializer.
+    ///
+    /// The forward and reverse checks compare paths, and the language check
+    /// compares the two tables to each other — so a field that started
+    /// serializing as a string where the tables say `number` would leave both
+    /// of them stale with everything green (codex P2 round 7 on PR #201).
+    ///
+    /// Read as "the kind that came out must be named in the documented type",
+    /// which is what lets `string or `null`` cover both of the kinds `title`
+    /// actually takes, and `array of strings` cover the array `tags` is.
+    #[test]
+    fn the_contract_names_the_type_the_serializer_produces() {
+        let mut kinds: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+        for sample in every_sample() {
+            let mut paths = BTreeSet::new();
+            walk_with_kinds(&sample, "", &mut paths, &mut kinds);
+        }
+        let documented = contract_rows("stability.md", "### What a search answers");
+        let mut wrong = Vec::new();
+        for (path, observed) in &kinds {
+            let Some(ty) = documented.get(path) else {
+                continue; // absence is the other checks' job
+            };
+            for kind in observed {
+                if !ty.contains(kind) {
+                    wrong.push(format!("`{path}` serialized as {kind}, contract says {ty:?}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the contract must name the type the response actually produces:\n  {}",
+            wrong.join("\n  ")
+        );
     }
 
     /// The rule `new` exists to hold: an empty list narrows nothing, so it is
@@ -4005,25 +4114,8 @@ mod tests {
     /// concern; the languages differ, so there is nothing to compare it to.
     #[test]
     fn the_contract_agrees_with_the_serializer_about_what_is_always_there() {
-        let minimal = serde_json::to_value(SearchResponse {
-            results: vec![crate::db::SearchHit {
-                score: 0.5,
-                path: "notes/a.md".to_string(),
-                title: None,
-                heading: None,
-                topic: None,
-                date: None,
-                tags: Vec::new(),
-                content: String::new(),
-                match_spans: None,
-                expanded_from: None,
-            }],
-            low_confidence: false,
-            filter_applied: SearchFilterEcho::default(),
-        })
-        .expect("the response type serializes");
         let mut unconditional = BTreeSet::new();
-        walk_fields(&minimal, "", &mut unconditional);
+        walk_fields(&minimal_search_response(), "", &mut unconditional);
 
         for (page, heading, always) in [
             ("stability.md", "### What a search answers", "always"),
