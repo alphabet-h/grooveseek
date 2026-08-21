@@ -42,7 +42,7 @@
 
 use crate::db::{Database, IntegrityScan};
 use crate::parser::Registry;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -129,7 +129,7 @@ pub fn run(db: &Database, registry: &Registry, kb_path: &Path) -> Result<Report>
     // First, because it is the only group that can explain why the index holds
     // documents you thought you had excluded — every question below takes the
     // corpus as given and asks whether the index agrees with itself about it.
-    findings.extend(files_that_stopped_being_read(kb_path));
+    findings.extend(files_that_stopped_being_read(kb_path)?);
 
     // Before the per-chunk comparisons, because those cannot see it: with the
     // table gone there is nothing to scan, so every one of them answers clean
@@ -377,10 +377,19 @@ const RENAMED: &[Legacy] = &[
         location: Location::BesideIndex,
         // `doctor` only runs when there is an index, so the replacement is
         // there in every case that reaches this: one message covers both.
-        consequence: "is an index this binary never opens; the one in use is beside it",
-        remedy: "delete it once `groove status` reports the documents you expect",
-        consequence_beside_replacement: "is an index this binary never opens; the one in use is beside it",
-        remedy_beside_replacement: "delete it once `groove status` reports the documents you expect",
+        //
+        // Not "is an index". `symlink_metadata` establishes that the name is
+        // taken and nothing more — what sits there could be a directory, a
+        // link, or a file that was never a database — and calling it an index
+        // while advising a delete is how an operator removes something else
+        // (codex P2 on PR #203). The remedy already named the check that makes
+        // removing it safe; the sentence now stops short of the same guess.
+        consequence: "sits at the name the index used to have, and this binary never opens it",
+        remedy: "see what it is, then delete it once `groove status` reports the documents you \
+                 expect",
+        consequence_beside_replacement: "sits at the name the index used to have, and this binary never opens it",
+        remedy_beside_replacement: "see what it is, then delete it once `groove status` reports \
+                                    the documents you expect",
     },
 ];
 
@@ -418,30 +427,46 @@ impl Legacy {
 /// `symlink_metadata`, not `exists()`: a dangling symlink named `.kb-mcpignore`
 /// is still a file with that name in the way, and `exists()` follows the link
 /// and answers no.
-fn files_that_stopped_being_read(kb_path: &Path) -> Vec<Finding> {
-    RENAMED
-        .iter()
-        .filter_map(|legacy| {
-            let path = legacy.path(kb_path);
-            std::fs::symlink_metadata(&path).ok()?;
-            // Same question for the replacement, and the same answer for the
-            // same reason: a dangling `.grooveignore` is a name that is taken.
-            let replacement_exists =
-                std::fs::symlink_metadata(legacy.replacement_path(kb_path)).is_ok();
-            let (consequence, remedy) = legacy.wording(replacement_exists);
-            Some(Finding {
-                check: legacy.check,
-                severity: Severity::Warning,
-                summary: format!(
-                    "{} {} (renamed to {} in 0.26.0, with no alias)",
-                    legacy.old, consequence, legacy.new
-                ),
-                count: 1,
-                samples: vec![path.display().to_string()],
-                remedy,
-            })
-        })
-        .collect()
+/// **A failed look is not an absence.** `NotFound` means the name is free;
+/// anything else — an unreadable directory, an ACL, a filesystem that went
+/// away — means this check did not run, and swallowing it would let `doctor`
+/// print a clean report and exit 0 while its newest question went unasked
+/// (codex P2 on PR #203). `run_doctor` turns an `Err` from here into the
+/// documented exit 2, "could not inspect".
+fn files_that_stopped_being_read(kb_path: &Path) -> Result<Vec<Finding>> {
+    /// Whether the name is taken, distinguishing "no" from "could not tell".
+    fn name_is_taken(path: &Path) -> Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e))
+                .with_context(|| format!("could not look at {}", path.display())),
+        }
+    }
+
+    let mut findings = Vec::new();
+    for legacy in RENAMED {
+        let path = legacy.path(kb_path);
+        if !name_is_taken(&path)? {
+            continue;
+        }
+        // Same question for the replacement, and the same answer for the same
+        // reason: a dangling `.grooveignore` is a name that is taken.
+        let replacement_exists = name_is_taken(&legacy.replacement_path(kb_path))?;
+        let (consequence, remedy) = legacy.wording(replacement_exists);
+        findings.push(Finding {
+            check: legacy.check,
+            severity: Severity::Warning,
+            summary: format!(
+                "{} {} (renamed to {} in 0.26.0, with no alias)",
+                legacy.old, consequence, legacy.new
+            ),
+            count: 1,
+            samples: vec![path.display().to_string()],
+            remedy,
+        });
+    }
+    Ok(findings)
 }
 
 /// Turn a full list of paths into the same shape the SQL scans produce.
@@ -1038,6 +1063,34 @@ mod tests {
             f.remedy.contains("merge"),
             "the remedy must preserve the live file, got: {}",
             f.remedy
+        );
+    }
+
+    /// `NotFound` is an answer; everything else means the question was not
+    /// asked. Swallowing the difference let `doctor` print a clean report and
+    /// exit 0 while its newest check had not run (codex P2 on PR #203).
+    ///
+    /// **Unix only, and the reason is a measurement.** The way to make
+    /// `symlink_metadata` fail with something other than `NotFound` is to look
+    /// for a child of a path that is a *file*: Unix answers `NotADirectory`.
+    /// Windows answers **`NotFound`** for the same call — measured here — so
+    /// there the fixture would exercise the absence branch and assert nothing.
+    /// The distinction under test is platform-independent; only this way of
+    /// provoking it is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_look_that_failed_is_not_reported_as_a_clean_knowledge_base() {
+        let dir = TempDir::new("kb-is-a-file");
+        let not_a_dir = dir.0.join("kb");
+        std::fs::write(&not_a_dir, b"this is a file, not a knowledge base").expect("write");
+
+        let db = db_with_one_chunk();
+        let err = run(&db, &registry_md(), &not_a_dir)
+            .expect_err("a look that could not be taken must not read as absence");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not look at"),
+            "the error must name the look that failed, got: {msg}"
         );
     }
 

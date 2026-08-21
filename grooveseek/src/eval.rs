@@ -56,6 +56,19 @@ pub const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// that refusing reparse points there would refuse every OneDrive and Dropbox
 /// placeholder. Saying "a symlink is refused" without that scope would be a
 /// promise this does not keep (codex P2 on PR #203).
+/// Whether **the name** is taken, which is not the same as whether a file can
+/// be read through it.
+///
+/// `Path::exists` follows a symlink and answers about the target, so a link
+/// whose target is gone reads as absent. For these two files "absent" is the
+/// answer with consequences — the golden's absence is a hint and the history's
+/// absence is an empty history that then gets **saved over the link** — so the
+/// question has to be about the name, and anything else is left to
+/// [`read_bounded`] to refuse (codex P2 on PR #203).
+fn is_present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 fn read_bounded(path: &Path, cap: u64, what: &str) -> Result<Vec<u8>> {
     match crate::links::read_checked(path, cap) {
         Ok(crate::links::Content::Bytes(b)) => Ok(b),
@@ -116,7 +129,9 @@ impl GoldenSet {
     /// ever went through [`Self::load`], so a bound added to the other copy
     /// would have missed it entirely.
     pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
-        if !path.exists() {
+        // See [`is_present`]: a dangling symlink is a name that is taken, and
+        // "there is no golden file" would be the wrong thing to say about it.
+        if !is_present(path) {
             anyhow::bail!(
                 "no golden file at {} (hint: pass --golden or create <kb>/.groove-eval.yml)",
                 path.display()
@@ -920,7 +935,14 @@ impl History {
     /// and does not parse keeps starting fresh: there was never a baseline in
     /// those bytes to lose.
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        // `symlink_metadata`, not `exists()`. A **dangling** symlink at this
+        // name — a history kept on a volume that is not mounted right now —
+        // makes `exists()` answer false, and "absent" is the one answer that
+        // leads straight to `save` renaming a fresh file over the link and
+        // disconnecting the baselines for good (codex P2 on PR #203). Asking
+        // about the name rather than the target sends it to the checked read,
+        // which refuses it and stops the run.
+        if !is_present(path) {
             return Ok(Self::default());
         }
         let bytes = read_bounded(path, MAX_HISTORY_FILE_BYTES, "eval history")?;
@@ -3721,6 +3743,40 @@ enabled = true
         assert!(
             std::fs::metadata(&path).expect("still there").len() as u64 > MAX_HISTORY_FILE_BYTES,
             "the history must be left exactly as it was"
+        );
+    }
+
+    /// A dangling link is a name that is taken, and "absent" is the dangerous
+    /// answer.
+    ///
+    /// `Path::exists` follows the link and says no, which sends `eval` down
+    /// the empty-history path — and `save` then renames a fresh file **over
+    /// the link**, disconnecting whatever it pointed at (codex P2 on
+    /// PR #203). Asking about the name instead sends it to the checked read,
+    /// which refuses it and stops the run.
+    ///
+    /// Unix only: creating a symlink on Windows needs a privilege that is not
+    /// there by default, which is the same reason `links` guards the two
+    /// platforms differently.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_history_link_is_refused_rather_than_read_as_absent() {
+        let dir = TempDir::new("dangling-history");
+        let path = dir.0.join(".groove-eval-history.json");
+        let missing = dir.0.join("on-a-volume-that-is-not-mounted.json");
+        if std::os::unix::fs::symlink(&missing, &path).is_err() {
+            return;
+        }
+        assert!(
+            !path.exists(),
+            "the link must dangle for this to mean anything"
+        );
+
+        let err = History::load(&path).expect_err("a dangling link is not an absent history");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to read"),
+            "the refusal must say it refused, got: {msg}"
         );
     }
 
