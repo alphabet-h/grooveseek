@@ -272,6 +272,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **The two Origin startup warnings are now checked for what they say and when
+  they fire.** They are the only thing an operator gets in two configurations
+  that otherwise look like they are working — one where Origin validation is
+  off, and one where `/ui` is served but its search is refused with nothing on
+  screen to say why. Both are inline conditions rather than predicates, so
+  nothing could reach them: neither the wording nor the trigger was tested.
+
+  A third test asserts they stay **quiet** on an ordinary configuration. A
+  warning that fires always would satisfy the other two and teach an operator
+  to ignore the line.
+
+  The shared stderr drain in `tests/common` keeps its lines now rather than
+  discarding them. It has to be that one: a second reader on the same pipe
+  would take lines away from the first, and the first is where the bound
+  address comes from.
+
 - **Four gaps the 2026-08-18 audit named now have tests.** No behaviour change.
 
   `groove service uninstall` and `status` take `--service-name`; the instance
