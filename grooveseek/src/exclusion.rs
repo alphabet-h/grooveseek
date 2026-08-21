@@ -718,12 +718,26 @@ mod tests {
     // pick one negation and check it. A negation is a pattern language, and the
     // examples cover the spellings someone thought of.
     //
-    // What makes this worth generating rather than listing: the rule is
-    // enforced by an *ordering* — `matches` returns `true` from the denylist
-    // branch before it consults the ignore matcher. An edit that moved the
-    // ignore check first would keep every example above passing for whichever
-    // patterns those examples happen to use, and hand a knowledge base the
-    // ability to switch off `.git`.
+    // What makes this worth generating rather than listing was measured, by
+    // breaking `matches` three ways and recording which tests noticed.
+    //
+    // **Two of the three are caught without these properties.** Consulting the
+    // ignore matcher first, so a `!` wins outright, fails
+    // `a_negation_cannot_undo_exclude_dirs_or_the_hardcoded_denylist`. Applying
+    // the denylist only at the knowledge-base root fails
+    // `the_hardcoded_denylist_still_covers_everything_under_it` and
+    // `the_three_layers_are_a_union`. The examples above are not blind to a
+    // reordered `matches`, and saying they were would overstate what is added
+    // here.
+    //
+    // **The third is what these are for.** Give `!` gitignore's own rule — it
+    // wins where an earlier line ignored something, and loses otherwise — and
+    // every example passes, because each of them spells its negation `!name`
+    // in a file that carries no ignore line at all. Both properties fail, and
+    // proptest shrinks the input to `*\n!.git`: ignore everything, then take
+    // one back. That spelling is in the generated set and in none of the
+    // examples, which is the difference between covering a pattern language
+    // and covering the patterns someone thought of.
     // -----------------------------------------------------------------------
 
     /// Spellings of "un-ignore this", as a `.grooveignore` would carry them.

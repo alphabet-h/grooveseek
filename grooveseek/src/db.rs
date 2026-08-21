@@ -5498,7 +5498,13 @@ mod tests {
     /// What it catches is the failure timing notices last: a query issued per
     /// candidate, per result, or per document. Any of those reads as `2 + n`
     /// here on the first run, at a corpus small enough that a stopwatch would
-    /// show nothing.
+    /// show nothing. Measured rather than assumed: one `query_row` per returned
+    /// hit, added to the helper above between the two `trace_v2` calls, makes
+    /// the first pair `(50, 1)` fail at 3.
+    ///
+    /// **Between** the two, because that is the mistake to make here — the same
+    /// loop placed after the hook is turned off runs, costs the same, and is
+    /// counted zero times.
     ///
     /// **Both axes are pinned, and the corpus one only counts because the
     /// filter is there.** Counting every traced statement instead gives 175 at
