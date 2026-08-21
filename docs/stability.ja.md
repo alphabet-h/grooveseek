@@ -179,7 +179,7 @@ loopback origin** である。
 | `results[].date` | string または `null` | 常に |
 | `results[].tags` | string の array | 常に。無ければ `[]` |
 | `results[].content` | string | 常に |
-| `results[].match_spans` | array | 計算された場合のみ**キーごと不在**。後述 |
+| `results[].match_spans` | array | **計算されなかった場合はキーごと不在**。後述 |
 | `results[].match_spans[].start` | integer | `content` へのバイトオフセット。開始 (含む) |
 | `results[].match_spans[].end` | integer | `content` へのバイトオフセット。終了 (含まない) |
 | `results[].expanded_from` | object | parent retriever が拡張した場合のみ。他は**不在** |
@@ -189,7 +189,7 @@ loopback origin** である。
 | `results[].expanded_from.total_chunks` | integer | `whole_document` のみ。その文書の chunk 総数 |
 | `results[].uri` | string | サーバが渡す文書のときのみ。**CLI では常に不在** |
 | `low_confidence` | boolean | 常に。**助言** — 後述 |
-| `filter_applied` | object | 常に。**下の 8 つが 1 つも指定されなければ** `{}`。後述 |
+| `filter_applied` | object | 常に。**`{}` の意味は見た目より狭い** — 後述 |
 | `filter_applied.category` | string | 指定時のみ |
 | `filter_applied.topic` | string | 指定時のみ |
 | `filter_applied.path_globs` | string の array | 指定時のみ |
@@ -207,17 +207,19 @@ loopback origin** である。
 **どちらが来たかで分岐する**こと。CLI にこの封筒は無い — 失敗を stderr に出して
 非ゼロ終了する ([責務分離](#stable)の節のとおり)。
 
-**`filter_applied` が echo するのは上の 8 つだけで、しかも「絞り込んだとき」だけ。**
-そこから 2 つのことが follow する。**どちらも空オブジェクトの見た目とは違う**:
+**`filter_applied` が echo するのは、その 8 つが「効果を持って届いたとき」だけ。**
+そこから 3 つのことが follow する。**どれも空オブジェクトの見た目とは違う**:
 
 - `min_quality` と `include_low_quality` は**適用されるが決して echo されない**。
   **品質フィルタは既定で有効**なので、`{}` は「結果に filter が掛かっていない」を
   意味しない
 - **明示的に空の** `path_globs` / `tags_any` / `tags_all` は受理されるが echo からは
   落ちる (空リストは何も除外しないため)
+- **`min_confidence_ratio` は echo されるが何も絞らない** — `low_confidence` を
+  比べる閾値を決めるだけ。**echo は「結果を絞ったものの一覧」でもない**
 
-つまり `{}` の意味は「**その 8 つのうち、検索を絞る値が 1 つも来なかった**」。
-「filter が指定されなかった」でも「filter が走らなかった」でもない。
+`{}` は「**その 8 つのうち、報告すべき効果を持って届いたものが 1 つも無かった**」と
+読む。「filter が指定されなかった」でも「filter が走らなかった」でもない。
 後から quality 入力を echo に足すのは「フィールドの追加」規則により minor である。
 
 **「不在」は `null` ではなくキーごと無いこと。** 上表で「のみ」と書いた行は、
@@ -225,9 +227,10 @@ loopback origin** である。
 **キーの不在と明示的な `null` を区別してはならない** — どちらも「与えられていない」
 と読む。
 
-**`match_spans` は 3 状態を持ち、それぞれ意味が違う**: 不在 = 計算していない
-(query に非 ASCII term が含まれる / content が大きすぎる)、`[]` = 計算したが
-一致なし、非空 = [docs/citations.ja.md](citations.ja.md) の契約。
+**`match_spans` は 3 状態を持ち、それぞれ意味が違う**: **不在 = 計算していない**
+(query の分割語に非 ASCII 文字が含まれる / query が空または空白のみ /
+chunk の content が 256 KiB を超える)、`[]` = 計算したが一致なし、
+非空 = [docs/citations.ja.md](citations.ja.md) の契約 (同じ 3 ケースを列挙している)。
 
 **`results[].uri` が「成功時の wrapper」における唯一の差**。MCP tool は渡せる
 文書に付け、`groove search` は決して出さない。後から CLI 側に足すのは、上の

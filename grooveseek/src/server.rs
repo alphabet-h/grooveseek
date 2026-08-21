@@ -1402,7 +1402,7 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
     /// The half of the naming rule that values are held to: a caller who
@@ -3753,6 +3753,41 @@ mod tests {
         serde_json::to_value(&response).expect("the response type serializes")
     }
 
+    /// One contract table, parsed into `field -> type`.
+    ///
+    /// Both columns, because names alone let the two languages disagree about
+    /// everything else. They did: the Japanese `match_spans` row said the key
+    /// is absent *when* the spans were computed, the reverse of the English
+    /// row and of the code, and the name-only comparison passed it (codex P2
+    /// round 4 on PR #201).
+    ///
+    /// The type column is comparable across the pair because the type names
+    /// are English in both — `array`, `string`, `integer`. The presence column
+    /// is prose in two languages, so its *polarity* is not machine-checkable;
+    /// what is checked below is the classification it has to agree with, taken
+    /// from the serializer rather than from either page.
+    fn contract_rows(page: &str, heading: &str) -> BTreeMap<String, String> {
+        let path = repo_root().join("docs").join(page);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        let section = text
+            .split(heading)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{page} must carry the search response contract"))
+            .split("\n### ")
+            .next()
+            .expect("splitting always yields a first part");
+        section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|rest| {
+                let (name, tail) = rest.split_once('`')?;
+                let ty = tail.split('|').nth(1)?.trim();
+                Some((name.to_string(), ty.to_string()))
+            })
+            .collect()
+    }
+
     /// The field names the contract table claims, from its first column.
     ///
     /// One table is the source: a second machine-readable list beside it would
@@ -3837,32 +3872,117 @@ mod tests {
         );
     }
 
-    /// Both languages have to carry the same set, because a reader of either
-    /// one is reading the contract. The English page is what
-    /// `contract_fields` parses, so this is what keeps the Japanese page from
-    /// drifting away from it unnoticed.
+    /// Both languages have to carry the same contract, because a reader of
+    /// either one is reading it.
+    ///
+    /// Fields *and* their types: a page that names the same fields can still
+    /// promise different things about them.
     #[test]
     fn both_languages_state_the_same_contract() {
-        let ja_path = repo_root().join("docs").join("stability.ja.md");
-        let text = fs::read_to_string(&ja_path)
-            .unwrap_or_else(|e| panic!("{} must be readable: {e}", ja_path.display()));
-        let section = text
-            .split("### search が返すもの")
-            .nth(1)
-            .expect("docs/stability.ja.md must carry the contract too")
-            .split("\n### ")
-            .next()
-            .expect("splitting always yields a first part");
-        let ja: BTreeSet<String> = section
-            .lines()
-            .filter_map(|l| l.strip_prefix("| `"))
-            .filter_map(|rest| rest.split('`').next())
-            .map(str::to_string)
-            .collect();
+        let en = contract_rows("stability.md", "### What a search answers");
+        let ja = contract_rows("stability.ja.md", "### search が返すもの");
         assert_eq!(
-            ja,
-            contract_fields(),
+            ja.keys().collect::<Vec<_>>(),
+            en.keys().collect::<Vec<_>>(),
             "the two contract tables must name the same fields"
         );
+        // Compared as the set of type words rather than verbatim: the type
+        // names are English on both pages but the sentence around them is
+        // translated, so `array of strings` and `string の array` are the same
+        // promise written twice.
+        let words = |cell: &str| -> BTreeSet<&'static str> {
+            [
+                "array", "string", "number", "integer", "boolean", "object", "null",
+            ]
+            .into_iter()
+            .filter(|w| cell.contains(w))
+            .collect()
+        };
+        let differing: Vec<(&String, &String, &String)> = en
+            .iter()
+            .filter_map(|(f, t)| {
+                ja.get(f)
+                    .filter(|j| words(j) != words(t))
+                    .map(|j| (f, t, j))
+            })
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "the two contract tables must give each field the same type: {differing:?}"
+        );
+    }
+
+    /// Which fields are always there is decided by the serializer, and both
+    /// pages have to agree with it.
+    ///
+    /// A response with every optional left out is exactly the set of keys the
+    /// contract may call unconditional; anything the maximal response adds is
+    /// conditional. Checking the tables against that, rather than against each
+    /// other, is what makes a row wrong rather than merely inconsistent.
+    ///
+    /// It does not read the prose. A presence cell that states the right
+    /// classification with the wrong polarity — "absent when computed" for a
+    /// key that is absent when it was *not* — passes this and is a review
+    /// concern; the languages differ, so there is nothing to compare it to.
+    #[test]
+    fn the_contract_agrees_with_the_serializer_about_what_is_always_there() {
+        let minimal = serde_json::to_value(SearchResponse {
+            results: vec![crate::db::SearchHit {
+                score: 0.5,
+                path: "notes/a.md".to_string(),
+                title: None,
+                heading: None,
+                topic: None,
+                date: None,
+                tags: Vec::new(),
+                content: String::new(),
+                match_spans: None,
+                expanded_from: None,
+            }],
+            low_confidence: false,
+            filter_applied: SearchFilterEcho::default(),
+        })
+        .expect("the response type serializes");
+        let mut unconditional = BTreeSet::new();
+        walk_fields(&minimal, "", &mut unconditional);
+
+        for (page, heading, always) in [
+            ("stability.md", "### What a search answers", "always"),
+            ("stability.ja.md", "### search が返すもの", "常に"),
+        ] {
+            let path = repo_root().join("docs").join(page);
+            let text = fs::read_to_string(&path).expect("the contract page is readable");
+            let section = text.split(heading).nth(1).expect("the contract is present");
+            for line in section.lines().filter(|l| l.starts_with("| `")) {
+                let Some((name, tail)) = line.trim_start_matches("| `").split_once('`') else {
+                    continue;
+                };
+                // `error` replaces the wrapper rather than joining it, so it is
+                // in neither set.
+                if name == "error" {
+                    continue;
+                }
+                // The marker has to *open* the cell. Searching anywhere in it
+                // reads the Japanese `uri` row — "**CLI では常に不在**",
+                // always *absent* — as a claim that the key is always there.
+                // `tail` opens with the separator, so the columns land at 1
+                // (type) and 2 (presence).
+                let Some(presence) = tail.split('|').nth(2) else {
+                    continue;
+                };
+                let claims_always = presence.trim().starts_with(always);
+                assert_eq!(
+                    claims_always,
+                    unconditional.contains(name),
+                    "{page}: `{name}` is {} in a response with every optional left out, \
+                     and the row says otherwise",
+                    if unconditional.contains(name) {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                );
+            }
+        }
     }
 }

@@ -202,7 +202,7 @@ different each time.
 | `results[].expanded_from.total_chunks` | integer | `whole_document` only — how many chunks the document has |
 | `results[].uri` | string | **omitted** unless the document is one the server will hand over, and **never present over the command line** |
 | `low_confidence` | boolean | always — **advisory**, see below |
-| `filter_applied` | object | always, `{}` when none of the fields below was given — see the note |
+| `filter_applied` | object | always; `{}` carries a narrower meaning than it looks — see the note |
 | `filter_applied.category` | string | omitted unless given |
 | `filter_applied.topic` | string | omitted unless given |
 | `filter_applied.path_globs` | array of strings | omitted unless given |
@@ -222,29 +222,33 @@ embedding or database failure — it answers `{"error": "…"}` instead, with no
 the failure on stderr and exits non-zero, which is [the split](#command-line)
 two sections up.
 
-**`filter_applied` echoes the eight fields above it, and only when they
-narrowed anything.** Two things follow, and neither is what an empty object
-looks like it means:
+**`filter_applied` echoes those eight inputs when they arrived with an effect,
+and nothing else.** Three things follow, and none of them is what an empty
+object looks like it means:
 
 - `min_quality` and `include_low_quality` are applied and never echoed. The
   quality filter is on by default, so `{}` does not say the results are
   unfiltered.
 - An explicitly empty `path_globs`, `tags_any` or `tags_all` is accepted and
   dropped from the echo, because an empty list excludes nothing.
+- `min_confidence_ratio` is echoed but narrows nothing: it only sets the
+  threshold `low_confidence` is compared against. So the echo is not a list of
+  what filtered the results either.
 
-So `{}` means "none of those eight arrived with a value that narrowed the
-search" — not "no filter was given", and not "no filter ran". Adding the quality
-inputs to the echo later would be a minor release, by the rule that new fields
-may be added.
+Read `{}` as "none of those eight arrived with an effect to report" — not "no
+filter was given", and not "no filter ran". Adding the quality inputs to the
+echo later would be a minor release, by the rule that new fields may be added.
 
 **Omitted means absent, not `null`.** Every row above that says "omitted" leaves
 the key out of the object entirely. A consumer must not distinguish a missing
 key from an explicit `null` — read both as "not provided".
 
 **`match_spans` carries three states**, and they are not the same: absent means
-the offsets were not computed (the query contains a non-ASCII term, or the
-content is too large), `[]` means they were computed and nothing matched, and a
-non-empty array is the contract in [docs/citations.md](citations.md).
+the offsets were not computed — the query splits into a term containing a
+non-ASCII character, the query is empty or whitespace-only, or the chunk's
+content exceeds 256 KiB — `[]` means they were computed and nothing matched, and
+a non-empty array is the contract in [docs/citations.md](citations.md), which
+lists the same three cases.
 
 **`results[].uri` is the one difference between the two successful wrappers.**
 The MCP tool adds it when the document is servable; `groove search` never emits
