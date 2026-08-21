@@ -142,9 +142,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   automatic migration, deliberately
   ([ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md)). The
   cost was never reported: a `.kb-mcpignore` still sitting in a knowledge base
-  is not read, so **every path it excluded is in the index**, and nothing
-  anywhere said so. `doctor` names it — with the consequence, not just the
-  rename — along with a stale `.kb-mcp.db` and the two old eval files.
+  is not read, so **whatever it excluded that the current rules do not is in
+  the index**, and nothing anywhere said so. `doctor` names it — with the
+  consequence, not just the rename — along with a stale `.kb-mcp.db` and the
+  two old eval files. It stops short of naming what leaked: that would mean
+  reading the file and re-running the exclusion decision, and a `doctor` that
+  computed its own answer to a question the indexer already answers is the
+  failure this whole subcommand exists to avoid.
 
   When the file that replaced one of these is there too, the finding says
   something different and advises something different. `doctor` does not read

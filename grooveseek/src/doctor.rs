@@ -23,9 +23,12 @@
 //! migration: a `groove` binary does not see what `kb-mcp` left behind. That is
 //! the right decision and this is its cost — the old file stays where it was,
 //! is never opened, and nothing says so. `.kb-mcpignore` is the one that hurts,
-//! because the consequence of not reading it is that **everything it excluded
-//! is now in the index**, silently and with no error anywhere. This is the only
-//! group that looks at the filesystem rather than at the database.
+//! because the consequence of not reading it is that **whatever it excluded and
+//! the current rules do not is in the index**, silently and with no error
+//! anywhere. It stops there rather than naming what leaked: that would need
+//! this to read the file and re-run the exclusion decision, which is the one
+//! thing the paragraph above rules out. This is the only group that looks at
+//! the filesystem rather than at the database.
 //!
 //! **It does not repair.** Every finding names the command that fixes it. That
 //! is the contract `paths_with_unregistered_extension` already states for the
@@ -322,7 +325,14 @@ const RENAMED: &[Legacy] = &[
         old: ".kb-mcpignore",
         new: ".grooveignore",
         location: Location::KbRoot,
-        consequence: "is not read, so every path it excluded is being indexed",
+        // Not "every path it excluded is being indexed". `exclude_dirs` and
+        // the hardcoded denylist may already cover what it named — a
+        // `.kb-mcpignore` holding only `node_modules/` costs nothing — and
+        // this check reads neither the file nor the rules. Claiming the leak
+        // would be a second implementation of the exclusion decision, which
+        // the module doc rules out (codex P2 on PR #203).
+        consequence: "is not read, so anything it excluded that the current rules do not is \
+                      indexed now",
         // A plain run is enough and `--force` would be wrong: documents that
         // are neither visited nor skipped are pruned, and a file the walk no
         // longer reaches is exactly that. `--force` would re-embed the whole
@@ -355,7 +365,7 @@ const RENAMED: &[Legacy] = &[
         consequence: "is not read, so `groove eval` reports that there is no golden file",
         remedy: "rename it to .groove-eval.yml",
         consequence_beside_replacement: "is not read; .groove-eval.yml is the golden `groove eval` uses",
-        remedy_beside_replacement: "delete it, or merge its queries into .groove-eval.yml first",
+        remedy_beside_replacement: "compare it with .groove-eval.yml, merge any queries still wanted, then delete it",
     },
     Legacy {
         check: "legacy-history-file",
@@ -364,8 +374,13 @@ const RENAMED: &[Legacy] = &[
         location: Location::KbRoot,
         consequence: "is not read, so `groove eval` compares against nothing and starts fresh",
         remedy: "rename it to .groove-eval-history.json",
-        consequence_beside_replacement: "is not read; .groove-eval-history.json holds the baselines in use",
-        remedy_beside_replacement: "delete it — the newer file already holds the runs being compared",
+        consequence_beside_replacement: "is not read; .groove-eval-history.json is the file `groove eval` compares against",
+        // Not "the newer file already holds them". `History::load` turns
+        // content it cannot parse into an empty history, so a corrupt
+        // `.groove-eval-history.json` looks the same from here as a full one —
+        // and following a bare delete would throw away the only recoverable
+        // baselines (codex P2 on PR #203).
+        remedy_beside_replacement: "keep it until `groove eval` shows the baselines you expect, then delete it",
     },
 ];
 
@@ -782,9 +797,12 @@ mod tests {
             .find(|f| f.check == "legacy-ignore-file")
             .expect("an unread .kb-mcpignore must be reported");
         // The consequence, not the fact of the rename: someone reading this
-        // needs to know their exclusions are not in effect.
+        // needs to know their exclusions are not in effect. It stops short of
+        // naming what leaked, because this check reads neither the file nor
+        // the rules in force — see `a_summary_never_claims_a_leak_it_did_not_
+        // measure`.
         assert!(
-            f.summary.contains("being indexed"),
+            f.summary.contains("indexed now"),
             "the summary must say what it costs, got: {}",
             f.summary
         );
@@ -917,6 +935,66 @@ mod tests {
                 legacy.new,
                 legacy.remedy_beside_replacement
             );
+        }
+    }
+
+    #[test]
+    fn a_summary_never_claims_a_leak_it_did_not_measure() {
+        // `doctor` reads neither the legacy file nor the exclusion rules in
+        // force, and reimplementing either to sharpen the sentence is the one
+        // thing this module's documentation rules out. So "every path it
+        // excluded is being indexed" is a claim it cannot support: a
+        // `.kb-mcpignore` holding only `node_modules/` costs nothing, because
+        // `exclude_dirs` and the hardcoded denylist already cover it
+        // (codex P2 on PR #203).
+        for legacy in RENAMED {
+            for (label, text) in [
+                ("consequence", legacy.consequence),
+                (
+                    "consequence_beside_replacement",
+                    legacy.consequence_beside_replacement,
+                ),
+            ] {
+                assert!(
+                    !text.contains("every path"),
+                    "{}: {label} claims every excluded path leaked, which this \
+                     check does not measure, got: {text}",
+                    legacy.check
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_remedy_that_removes_something_says_how_to_know_it_is_safe() {
+        // The second half of the same lesson, from a second P2. "delete it —
+        // the newer file already holds the runs" reads as a fact and is a
+        // guess: `History::load` turns unparseable content into an empty
+        // history, so a corrupt replacement looks identical from here, and
+        // following that sentence throws away the only recoverable baselines.
+        //
+        // Nothing here can check the replacement's contents without becoming a
+        // second implementation of reading it, so the rule is on the sentence:
+        // a remedy that removes a file has to name the moment it becomes safe.
+        const CONDITIONS: &[&str] = &["once", "until", "then"];
+        for legacy in RENAMED {
+            for (label, remedy) in [
+                ("remedy", legacy.remedy),
+                (
+                    "remedy_beside_replacement",
+                    legacy.remedy_beside_replacement,
+                ),
+            ] {
+                if !remedy.contains("delete") {
+                    continue;
+                }
+                assert!(
+                    CONDITIONS.iter().any(|w| remedy.contains(w)),
+                    "{}: {label} removes a file without saying how to know that \
+                     is safe — name a check with one of {CONDITIONS:?}, got: {remedy}",
+                    legacy.check
+                );
+            }
         }
     }
 
