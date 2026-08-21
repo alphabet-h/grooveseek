@@ -2422,11 +2422,14 @@ mod documented_flags {
     /// flag described only in Japanese satisfied the coverage check. Nothing was
     /// wrong when this was measured — every flag appears on both sides today —
     /// and that is exactly when it is cheap to stop it from going wrong.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Corpus {
         English,
         Japanese,
     }
+
+    /// The suffix that puts a page in the Japanese corpus.
+    const JAPANESE_SUFFIX: &str = ".ja.md";
 
     impl Corpus {
         fn readme(self) -> &'static str {
@@ -2436,14 +2439,30 @@ mod documented_flags {
             }
         }
 
+        /// Which corpus a file name puts a page in, or `None` if it is not a
+        /// page.
+        ///
         /// `.ja.md` cannot be told from `.md` by extension — `Path::extension()`
         /// answers `"md"` for both, because it reads from the last dot. The file
-        /// name's suffix is the only thing that separates them.
+        /// name's suffix is the only thing that separates them, and **this is
+        /// the only place that reads it**. `owns` decides which corpus a
+        /// coverage check gathers, and [`counterpart`] decides which file to
+        /// look for beside a page; two classifiers would eventually disagree
+        /// about one name, and then a page could be English to one check and
+        /// Japanese to the other.
+        fn of(path: &Path) -> Option<Self> {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            if name.ends_with(JAPANESE_SUFFIX) {
+                Some(Corpus::Japanese)
+            } else if name.ends_with(".md") {
+                Some(Corpus::English)
+            } else {
+                None
+            }
+        }
+
         fn owns(self, path: &Path) -> bool {
-            let japanese = path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(".ja.md"));
-            matches!(self, Corpus::Japanese) == japanese
+            Self::of(path) == Some(self)
         }
 
         fn label(self) -> &'static str {
@@ -2452,6 +2471,20 @@ mod documented_flags {
                 Corpus::Japanese => "Japanese",
             }
         }
+    }
+
+    /// The file this page's counterpart in the other language would be.
+    ///
+    /// `None` when the path is not a page. Built on [`Corpus::of`] rather than
+    /// on its own reading of the suffix, so the classification and the
+    /// rename cannot disagree about a name.
+    fn counterpart(path: &Path) -> Option<PathBuf> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let renamed = match Corpus::of(path)? {
+            Corpus::Japanese => format!("{}.md", name.strip_suffix(JAPANESE_SUFFIX)?),
+            Corpus::English => format!("{}{JAPANESE_SUFFIX}", name.strip_suffix(".md")?),
+        };
+        Some(path.with_file_name(renamed))
     }
 
     /// Everything a reader of one published language sees.
@@ -2654,28 +2687,18 @@ mod documented_flags {
         let mut orphans: Vec<String> = Vec::new();
         for entry in walkdir::WalkDir::new(&docs).into_iter().flatten() {
             let path = entry.path();
-            if !path.extension().is_some_and(|e| e == "md") {
+            // Through the same classifier the corpus split uses, so this check
+            // and `published_docs` cannot disagree about which language a page
+            // is in. `None` is "not a page", which covers the directories and
+            // any non-Markdown file the walk turns up.
+            let Some(other) = counterpart(path) else {
                 continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            // `.ja.md` and `.md` share an extension — the suffix is the only
-            // thing that tells them apart, which is why `Corpus::owns` reads
-            // the file name too.
-            let counterpart = match name.strip_suffix(".ja.md") {
-                Some(stem) => path.with_file_name(format!("{stem}.md")),
-                None => {
-                    let stem = name.trim_end_matches(".md");
-                    path.with_file_name(format!("{stem}.ja.md"))
-                }
             };
-            if !counterpart.exists() {
+            if !other.exists() {
                 orphans.push(format!(
                     "{} has no {}",
                     path.strip_prefix(repo_root()).unwrap_or(path).display(),
-                    counterpart
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
+                    other.file_name().unwrap_or_default().to_string_lossy(),
                 ));
             }
         }
