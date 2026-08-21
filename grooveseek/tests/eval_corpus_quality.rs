@@ -657,12 +657,18 @@ fn kb_eval_corpus_and_golden_stay_in_sync() {
              per query, so this needs a re-measurement rather than a passing count",
             q.expected.len()
         );
+        // Compared by path, not by whole `ExpectedHit`. The pin above says two
+        // *documents*, and `ExpectedHit`'s own equality would let the same one
+        // through twice as long as the headings differed — worse, a path-only
+        // entry and a heading-scoped entry for that path are both satisfied by
+        // one chunk under that heading, so the query would report perfect
+        // recall for one returned document.
         for (i, e) in q.expected.iter().enumerate() {
             assert!(
-                !q.expected[..i].contains(e),
-                "golden query {id} expects {} twice; both entries would be \
-                 satisfied by one retrieved document, so the query would report \
-                 perfect recall for half the work",
+                !q.expected[..i].iter().any(|prev| prev.path == e.path),
+                "golden query {id} expects {} twice; two entries naming one \
+                 document can both be satisfied by one retrieved chunk, so the \
+                 query would report perfect recall for half the work",
                 e.path
             );
         }
