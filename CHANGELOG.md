@@ -137,6 +137,60 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **The golden query file and the eval history are read with a bound.** Both
+  default to living inside the knowledge base and both were read whole with no
+  cap — a stray binary on one of those names was parsed as-is. They now go
+  through the same route `.grooveignore` takes, so a hard link, a FIFO, or
+  something that is not a regular file is a refusal rather than an unbounded
+  read. Symlinks are refused **on Unix only**, which is that route's existing
+  and deliberate scope: making one on Windows needs a privilege this threat
+  model's attacker does not have, and refusing reparse points there would
+  refuse every OneDrive and Dropbox placeholder.
+
+  The **size** caps differ, because the two files differ. The golden is written
+  by a person, and 1 MiB is far past what it is for. The history is written by
+  `groove eval` and carries every golden query with its hits, once per retained
+  run: measured, this repository's own 25-query golden produces **0.598 MiB**
+  after ten runs, and the same golden at `limit = 20` produces **1.049 MiB**. A
+  megabyte is inside its ordinary range, so the history's cap is 64 MiB.
+
+  **A history that cannot be read now stops `groove eval` instead of reading as
+  empty.** An empty history is not inert — the new run is pushed onto it and
+  saved back over the same path — so answering "empty" for a file that is
+  intact and merely unread would replace every baseline with one run, and
+  `--fail-on-regression` would then pass without having compared anything.
+  Content that was read and does not parse still starts fresh, unchanged: those
+  bytes held no baseline to lose. `--no-history` skips the file entirely.
+
+  A **dangling symlink** counts as a file that is there, for the same reason.
+  `Path::exists` follows the link and answers about the target, so a history
+  kept on a volume that is not mounted read as absent — and absent is the
+  answer that leads to the new file being renamed over the link.
+
+  **And what `eval` writes is now bounded by what it will read.** `history_size`
+  bounds the number of runs kept and bounded nothing about the size, so a large
+  golden or a high `--limit` could write a history the next run refused —
+  `groove eval` producing a file only it could no longer read. Saving now drops
+  the **oldest** runs until the result fits, warning when it does; the run the
+  next diff compares against is the last to go. If a single run does not fit,
+  the save reports that instead of writing it, and says to reduce the golden or
+  the limit, or to pass `--no-history`.
+
+  `groove tune` reached the golden through a different function than `groove
+  eval` did, so the two are now one: `eval` no longer keeps its own copy of the
+  read-and-parse, and a bound added to either is a bound on both.
+
+- **A refusal printed to stderr carried an em dash.** `AGENTS.md` keeps stderr
+  ASCII so a CP932 console does not render it as mojibake, and
+  `Refused::log_line`'s "not a regular file" message had two — printed from
+  `groove index`, from the `.grooveignore` reader, and from `get_document`,
+  since each was written. A fourth caller in `eval` is what got it noticed.
+
+  The path in that line is still interpolated as-is: a note named in Japanese
+  makes the message non-ASCII whatever the wording is, and escaping it would
+  hand the reader `\u{65e5}\u{672c}` where they expected a filename. That
+  trade-off is left where it is, and the test that pins the wording says so.
+
 - **The documentation told you to type a prompt command no shipped recipe
   produces.** `docs/mcp-tools.md`, its Japanese counterpart and `prompts.rs`
   all rendered the prompt path as `/mcp__groove__<name>`, but a client builds
