@@ -220,10 +220,16 @@ impl Refused {
     pub(crate) fn log_line(&self, path: &Path) -> String {
         match self {
             Refused::MultiplyLinked => refusal_reason(path),
+            // ASCII, deliberately: this goes to stderr, and AGENTS.md keeps
+            // stderr ASCII so a CP932 console does not render it as mojibake.
+            // It used to carry two em dashes and reached stderr from three
+            // places (`exclusion.rs`, `indexer.rs`, `server/documents.rs`)
+            // before a fourth in `eval.rs` made someone look
+            // (codex P1 on PR #203).
             Refused::NotAPlainFile => format!(
                 "{} is not a regular file and was skipped: something other than the \
-                 note that was collected — a symlink, a device, a named pipe — was \
-                 in its place when it came to be read (BU-20).",
+                 note that was collected (a symlink, a device, a named pipe) was in \
+                 its place when it came to be read (BU-20).",
                 path.display()
             ),
             Refused::TooLarge { len, cap } => format!(
@@ -657,5 +663,46 @@ mod tests {
             Refused::NotAPlainFile,
             "a named pipe is not a note, and waiting on one would hang the run"
         );
+    }
+
+    /// Every refusal reaches stderr, and AGENTS.md keeps stderr ASCII.
+    ///
+    /// `NotAPlainFile` carried two em dashes and had done since it was
+    /// written, printed from `exclusion.rs`, `indexer.rs` and
+    /// `server/documents.rs` — three call sites, none of which noticed
+    /// (codex P1 on PR #203). The wording is the easy thing to change back.
+    ///
+    /// **The path is deliberately not covered.** `AGENTS.md` scopes the rule
+    /// to the words a diagnostic chooses rather than the data it names, and
+    /// the reason is measured: `groove index` already prints the relative path
+    /// of every file it indexes, so a note called `日本語のノート.md` reaches
+    /// stderr as itself on every ordinary run. A rule that forbade that would
+    /// condemn the main command's main output for the audience the project is
+    /// built for, and escaping it here would make this one line inconsistent
+    /// with the twelve others that name a path (codex P1 on PR #206).
+    ///
+    /// The path in the fixture is ASCII so that this test is about the wording
+    /// only.
+    #[test]
+    fn every_refusal_line_is_ascii() {
+        let path = Path::new("/kb/notes.md");
+        for refused in [
+            Refused::MultiplyLinked,
+            Refused::NotAPlainFile,
+            Refused::TooLarge {
+                len: 4096,
+                cap: 1024,
+            },
+        ] {
+            let line = refused.log_line(path);
+            assert!(
+                line.is_ascii(),
+                "a refusal printed to stderr must be ASCII (CP932 consoles), got: {line}"
+            );
+            assert!(
+                refused.client_message().is_ascii(),
+                "and so must the line a client sees"
+            );
+        }
     }
 }

@@ -72,6 +72,20 @@ Japanese Windows install that console is CP932, where `→` and emoji arrive as
 mojibake. The formatters that build stdout output may use them freely; the
 message on its way to stderr may not.
 
+**This is about the words a diagnostic chooses, not the data it names.** A
+path, a heading or a query echoed into a message carries whatever characters
+the knowledge base uses, and `groove index` prints the relative path of every
+file it indexes — measured, a note called `日本語のノート.md` comes out of
+`eprintln!` as itself. Escaping those would hand a reader `\u{65e5}\u{672c}`
+where they expected a filename, in a project whose recommended model is chosen
+for Japanese knowledge bases. What has to stay ASCII is everything the message
+contributes itself: no arrows, no em dashes, no emoji, no box drawing.
+
+Where echoing the value is itself the problem — a caller's `Host` header, a
+path that may not be valid UTF-8 — the reason is not the encoding, and the fix
+is named where that decision was taken (`transport/http.rs`'s refusals,
+`service/macos.rs`'s `escape_default`).
+
 ### One question gets one implementation
 
 When two places answer the same question — is this document servable, does this
