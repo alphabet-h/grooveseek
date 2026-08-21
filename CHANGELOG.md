@@ -217,7 +217,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   **`low_confidence` is frozen as a field, not as a judgement.** The key is
   present and boolean; the formula, the default threshold, and which queries
   trip it are explicitly outside the freeze. Measured, it tracks how much the
-  two retrieval legs overlapped rather than whether the answer is right — on a
+  fused scores are distributed rather than whether the answer is right — on a
   corpus where all 25 golden queries were answered correctly at rank 1 it still
   fired on 14 of them, and reranking can switch it off outright — cross-encoder
   logits often make the mean negative, and the sign check then answers `false`

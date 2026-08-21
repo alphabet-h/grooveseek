@@ -117,15 +117,23 @@ the flag is not *guaranteed* absent under reranking. What it is, is unreliable:
 **a `false` tells you nothing when a reranker ran**, because it is the same
 `false` the sign check produces. A `true` still means what the formula says.
 
-**Without a reranker it tracks retriever overlap rather than correctness.** The
-denominator is the mean of the whole result set, so what moves the ratio is how
-many of the returned hits both retrieval legs found — and that depends on the
-query and the corpus rather than on whether the top hit is right. Measured on a
-20-document corpus where every one of 25 queries was answered correctly at rank
-1, the flag still fired on 14 of them. The same queries on a 121-document corpus
-land in a different place entirely: queries with no answer at all scored a
-median of 1.08 against the small corpus and 1.40 against the larger one, which
-is where correctly-answered queries had scored before.
+**Without a reranker, what it responds to is the shape of the fused score
+distribution, not correctness.** RRF gives a hit `1 / (rrf_k + rank + 1)` from
+each leg it appears in, so the mean the top score is divided by moves with how
+many legs found each returned hit, at what rank each leg placed it, `rrf_k`, and
+how many results were asked for. None of those is "is the top hit right".
+
+Two measurements say what that costs in practice. On a 20-document corpus where
+every one of 25 queries was answered correctly at rank 1, the flag still fired
+on 14 of them. And the same queries land somewhere else entirely on a different
+corpus: twelve queries with **no answer at all** scored a median of 1.08 against
+that corpus and 1.40 against a 121-document one — which is where the
+correctly-answered queries had scored on the small one.
+
+In the sample measured, the hits that pushed the ratio up were the ones only one
+leg had found, which is where the overlap reading comes from. Treat that as an
+observation about those corpora rather than as the rule: the factors above can
+move the ratio without the overlap changing at all.
 
 It is not noise — queries with no answer do score lower than queries with one,
 on a fixed corpus. But there is **no threshold that means the same thing across

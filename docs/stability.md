@@ -222,11 +222,20 @@ embedding or database failure — it answers `{"error": "…"}` instead, with no
 the failure on stderr and exits non-zero, which is [the split](#command-line)
 two sections up.
 
-**`filter_applied` echoes the eight fields above it, not every filter that
-ran.** `min_quality` and `include_low_quality` are applied and are not echoed,
-so `{}` means "none of those eight was given" rather than "the results are
-unfiltered". Adding the quality inputs to the echo later would be a minor
-release, by the rule that new fields may be added.
+**`filter_applied` echoes the eight fields above it, and only when they
+narrowed anything.** Two things follow, and neither is what an empty object
+looks like it means:
+
+- `min_quality` and `include_low_quality` are applied and never echoed. The
+  quality filter is on by default, so `{}` does not say the results are
+  unfiltered.
+- An explicitly empty `path_globs`, `tags_any` or `tags_all` is accepted and
+  dropped from the echo, because an empty list excludes nothing.
+
+So `{}` means "none of those eight arrived with a value that narrowed the
+search" — not "no filter was given", and not "no filter ran". Adding the quality
+inputs to the echo later would be a minor release, by the rule that new fields
+may be added.
 
 **Omitted means absent, not `null`.** Every row above that says "omitted" leaves
 the key out of the object entirely. A consumer must not distinguish a missing
@@ -237,18 +246,25 @@ the offsets were not computed (the query contains a non-ASCII term, or the
 content is too large), `[]` means they were computed and nothing matched, and a
 non-empty array is the contract in [docs/citations.md](citations.md).
 
-**`results[].uri` is the one difference between the two surfaces.** The MCP tool
-adds it when the document is servable; `groove search` never emits it. Adding it
-to the command line later would be a minor release, by the rule above that new
-fields may be added.
+**`results[].uri` is the one difference between the two successful wrappers.**
+The MCP tool adds it when the document is servable; `groove search` never emits
+it. Adding it to the command line later would be a minor release, by the rule
+above that new fields may be added.
+
+**Failure is where the two surfaces genuinely part.** The MCP tool answers with
+the `error` envelope above and exit status has no meaning in a tool call; the
+command line writes the reason on stderr and exits non-zero, and emits no JSON
+at all. So the wrappers agree up to `uri` and the failure contracts do not
+correspond — code written against one surface cannot assume the other reports
+trouble the same way.
 
 **`low_confidence` is frozen as a field, not as a judgement.** What is promised
 is that the key is present and boolean. **The formula behind it, its default
 threshold, and which queries trip it are explicitly not frozen** and may change
-in any release. It is a heuristic that has been measured to track how much the
-two retrieval legs overlapped rather than whether the answer is right, so treat
-it as a hint to be careful and never as a verdict — [docs/filters.md](filters.md)
-records what it does and does not detect.
+in any release. It is a heuristic, and measurement puts what it responds to in the shape of the
+fused score distribution rather than in whether the answer is right — so treat
+it as a hint to be careful and never as a verdict.
+[docs/filters.md](filters.md) records what it does and does not detect.
 
 ### MCP surface
 

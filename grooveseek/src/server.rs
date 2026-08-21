@@ -3808,11 +3808,16 @@ mod tests {
         );
     }
 
-    /// The contract says `uri` is the one field the two surfaces differ on.
-    /// That is a claim about both of them, so it is checked on both rather
-    /// than inferred from the type that carries it.
+    /// The contract says `uri` is the one field the two **successful** wrappers
+    /// differ on. That is a claim about both of them, so it is checked on both
+    /// rather than inferred from the type that carries it.
+    ///
+    /// Successful only, deliberately: the failure contracts do not correspond
+    /// at all — the tool answers with the `error` envelope and the command line
+    /// writes to stderr and exits non-zero, emitting no JSON. Comparing those
+    /// two would be comparing a response with the absence of one.
     #[test]
-    fn uri_is_the_only_field_the_two_surfaces_differ_on() {
+    fn uri_is_the_only_field_the_two_successful_wrappers_differ_on() {
         let (mcp_value, cli_value) = both_surfaces();
         let mut mcp = BTreeSet::new();
         walk_fields(&mcp_value, "", &mut mcp);
