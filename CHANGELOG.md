@@ -14,6 +14,32 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **All four front pages open with a banner** — `README.md`, `README.ja.md`,
+  and the two `docs/index` pages. It draws what separates this from a plain
+  vector store: a semantic path and a lexical path converging on one node, and
+  ranked results leaving it for an MCP client — the RRF fusion of the
+  sqlite-vec and FTS5 legs.
+
+  **It carries no words.** A wordmark would repeat the `# GrooveSeek` heading
+  directly beneath it, a caption strip at this width is illegible on a phone,
+  and text drawn into an image is text no screen reader and no translation can
+  reach. The `alt` attribute carries the meaning instead, and it is written per
+  language.
+
+  Light and dark, chosen by `prefers-color-scheme`, like the logo and the
+  screenshot before it. WebP rather than PNG — 33 KB against roughly 1 MB, for
+  an image every visitor loads. The PNGs are committed too: `assets/README.md`
+  records why, and what to swap if the raw host turns out not to serve `.webp`
+  the way it serves `.png`.
+
+  The 56-pixel logo those four pages used to open with is gone, since the
+  banner carries the mark at its centre. **No page embeds `assets/logo-*` any
+  more** — `/ui` never did, drawing the diamond as a character and its favicon
+  as an inline `data:` URI. The files stay: the SVGs are where the mark is
+  defined, which is what the banner's colours were measured against.
+
 ### Changed
 
 - **`groove status`, `groove service status` and `groove service list` print

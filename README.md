@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-dark.png">
-  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-light.png" alt="" width="56" height="56">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/grooveseek-readme-hero-dark-v2.webp">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/grooveseek-readme-hero-light-v2.webp" alt="Markdown files flow into a chunker, a semantic path and a lexical path converge on one node, and ranked results leave it for an MCP client." width="100%">
 </picture>
 
 # GrooveSeek
