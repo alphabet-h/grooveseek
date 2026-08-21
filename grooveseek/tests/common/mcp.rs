@@ -64,7 +64,38 @@ pub enum Ready {
 /// then wait out its timeout and report a failure for a server that started
 /// correctly.
 pub fn drain_stderr(stderr: ChildStderr) -> Receiver<Ready> {
+    drain_stderr_keeping(stderr, StderrLog::default()).0
+}
+
+/// Every line the server wrote to stderr, in order, readable while it runs.
+///
+/// The drain already reads all of them and threw them away; a test that wants
+/// to assert on a **warning** needs them kept. Cheap to add here and impossible
+/// to add later — a second reader on the same pipe would take lines away from
+/// the first, and the first is what supplies the bound address.
+#[derive(Clone, Default)]
+pub struct StderrLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl StderrLog {
+    /// A copy of what has been read so far.
+    pub fn lines(&self) -> Vec<String> {
+        self.0.lock().expect("stderr log is not poisoned").clone()
+    }
+
+    /// Whether any line so far contains `needle`.
+    ///
+    /// Startup warnings are written **before** the server binds, so anything a
+    /// caller reaches through `spawn_mcp_server` has already been read by the
+    /// time `/healthz` answers. No polling, no window.
+    pub fn contains(&self, needle: &str) -> bool {
+        self.lines().iter().any(|l| l.contains(needle))
+    }
+}
+
+/// [`drain_stderr`], keeping the lines in `log` as they go past.
+pub fn drain_stderr_keeping(stderr: ChildStderr, log: StderrLog) -> (Receiver<Ready>, StderrLog) {
     let (tx, rx) = std::sync::mpsc::channel::<Ready>();
+    let sink = log.clone();
     thread::spawn(move || {
         use std::io::BufRead;
         let (mut said_addr, mut said_armed) = (false, false);
@@ -82,9 +113,12 @@ pub fn drain_stderr(stderr: ChildStderr) -> Receiver<Ready> {
                 said_armed = true;
                 let _ = tx.send(Ready::Armed);
             }
+            if let Ok(mut held) = sink.0.lock() {
+                held.push(line);
+            }
         }
     });
-    rx
+    (rx, log)
 }
 
 /// Start `groove serve` on an OS-assigned port and wait until it is usable.
@@ -133,7 +167,10 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
         .spawn()
         .expect("spawn groove serve");
 
-    let mut guard = ServerGuard { child: Some(child) };
+    let mut guard = ServerGuard {
+        child: Some(child),
+        stderr: StderrLog::default(),
+    };
     let stderr = guard
         .child
         .as_mut()
@@ -142,7 +179,7 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
         .take()
         .expect("stderr was piped");
 
-    let rx = drain_stderr(stderr);
+    let (rx, _) = drain_stderr_keeping(stderr, guard.stderr.clone());
 
     // 60 s upper bound: covers a first-time model download on a cold cache.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -225,6 +262,17 @@ pub fn spawn_with_config(
 /// a panicking test does not orphan the server process.
 pub struct ServerGuard {
     child: Option<Child>,
+    stderr: StderrLog,
+}
+
+impl ServerGuard {
+    /// What the server has written to stderr so far.
+    ///
+    /// Startup warnings are all written before it binds, so by the time a
+    /// caller holds this guard they are already here.
+    pub fn stderr(&self) -> &StderrLog {
+        &self.stderr
+    }
 }
 
 impl Drop for ServerGuard {
