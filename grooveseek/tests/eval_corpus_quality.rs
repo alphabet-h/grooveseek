@@ -171,6 +171,18 @@ const GOLDEN_QUERY_COUNT: usize = 30;
 const GOLDEN_SINGLE_ANSWER_QUERY_COUNT: usize = 25;
 const GOLDEN_MULTI_ANSWER_QUERY_COUNT: usize = 5;
 
+/// And how many documents each multi-answer query names. Pinned because the
+/// multi floors are stated in half-answers: five queries naming two documents
+/// each is ten of them, so one half-answer of drift is 0.1 and the floors below
+/// are one step under their measured baselines. A sixth expectation on some
+/// query, or the same path written twice, changes that arithmetic — the
+/// recall denominator with it — while leaving every count above satisfied.
+///
+/// The duplicate is the worse of the two: `recall_at_k` scores each expectation
+/// independently, so two identical entries are both satisfied by one retrieved
+/// document and the query reports perfect recall for half the work.
+const MULTI_ANSWER_EXPECTED_PER_QUERY: usize = 2;
+
 /// The corpus and the golden are required to stay bilingual (BU-11 asks for a
 /// mixed Japanese/English set). Minimums rather than exact counts, so the set
 /// can grow without editing this file — but neither language can drain away.
@@ -630,6 +642,31 @@ fn kb_eval_corpus_and_golden_stay_in_sync() {
         "the single-answer group changed size; the floors in this file were \
          measured over {GOLDEN_SINGLE_ANSWER_QUERY_COUNT} queries"
     );
+
+    for q in golden
+        .queries
+        .iter()
+        .filter(|q| is_multi_answer(q.expected.len()))
+    {
+        let id = q.id.as_deref().unwrap_or("<no id>");
+        assert_eq!(
+            q.expected.len(),
+            MULTI_ANSWER_EXPECTED_PER_QUERY,
+            "golden query {id} names {} documents; the multi-answer floors are \
+             stated in half-answers and assume {MULTI_ANSWER_EXPECTED_PER_QUERY} \
+             per query, so this needs a re-measurement rather than a passing count",
+            q.expected.len()
+        );
+        for (i, e) in q.expected.iter().enumerate() {
+            assert!(
+                !q.expected[..i].contains(e),
+                "golden query {id} expects {} twice; both entries would be \
+                 satisfied by one retrieved document, so the query would report \
+                 perfect recall for half the work",
+                e.path
+            );
+        }
+    }
 
     let mut ids: Vec<&str> = Vec::with_capacity(golden.queries.len());
     let mut covered: Vec<&str> = Vec::new();
