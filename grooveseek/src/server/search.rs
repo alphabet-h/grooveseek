@@ -216,16 +216,17 @@ impl KbCore {
             h.match_spans = compute_match_spans(&params.query, &h.content);
         }
 
-        let echo = SearchFilterEcho {
-            category: params.category.clone(),
-            topic: params.topic.clone(),
-            path_globs: params.path_globs.clone().filter(|v| !v.is_empty()),
-            tags_any: params.tags_any.clone().filter(|v| !v.is_empty()),
-            tags_all: params.tags_all.clone().filter(|v| !v.is_empty()),
-            date_from: params.date_from.clone(),
-            date_to: params.date_to.clone(),
-            min_confidence_ratio: params.min_confidence_ratio,
-        };
+        // The empty-list rule lives in `new`, shared with the command line.
+        let echo = SearchFilterEcho::new(
+            params.category.clone(),
+            params.topic.clone(),
+            params.path_globs.clone(),
+            params.tags_any.clone(),
+            params.tags_all.clone(),
+            params.date_from.clone(),
+            params.date_to.clone(),
+            params.min_confidence_ratio,
+        );
 
         // The `uri` on a hit and the URIs `resources/list` offers have to be the
         // same set, so both go through `ServableRules` rather than each testing

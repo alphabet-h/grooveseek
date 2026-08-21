@@ -1857,22 +1857,25 @@ fn print_search_results(
             // object here with `serde_json::json!` is what used to let the two
             // surfaces drift apart while `docs/stability.md` froze both, so the
             // key names now live in exactly one place (codex P2 on PR #201).
-            let some_if_any = |v: &[String]| (!v.is_empty()).then(|| v.to_vec());
             let wrapper = grooveseek::server::SearchResponse {
                 results: hits,
                 low_confidence,
-                filter_applied: grooveseek::server::SearchFilterEcho {
-                    category: category.map(str::to_owned),
-                    topic: topic.map(str::to_owned),
-                    path_globs: some_if_any(path_globs),
-                    tags_any: some_if_any(tags_any),
-                    tags_all: some_if_any(tags_all),
-                    date_from: date_from.map(str::to_owned),
-                    date_to: date_to.map(str::to_owned),
-                    // Always finite here: `parse_confidence_ratio` refuses the
-                    // rest at the command line before a model is even loaded.
-                    min_confidence_ratio: explicit_ratio,
-                },
+                // Which inputs are worth echoing is decided inside `new`, not
+                // here: this side used to drop empty lists itself, and so did
+                // the MCP side, which is two answers to one question.
+                // `min_confidence_ratio` is always finite by the time it
+                // arrives — `parse_confidence_ratio` refuses the rest at the
+                // command line, before a model is even loaded.
+                filter_applied: grooveseek::server::SearchFilterEcho::new(
+                    category.map(str::to_owned),
+                    topic.map(str::to_owned),
+                    Some(path_globs.to_vec()),
+                    Some(tags_any.to_vec()),
+                    Some(tags_all.to_vec()),
+                    date_from.map(str::to_owned),
+                    date_to.map(str::to_owned),
+                    explicit_ratio,
+                ),
             };
             println!(
                 "{}",

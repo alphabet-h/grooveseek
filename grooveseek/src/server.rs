@@ -440,24 +440,68 @@ pub struct SearchResponse<H> {
 
 /// 入力 filter のうち non-default のものだけ echo。`null`/空配列の項目は
 /// `skip_serializing_if` で JSON から省略される。
+///
+/// **The fields are private on purpose.** What counts as "worth echoing" is a
+/// statement about the response that `docs/stability.md` freezes, and it was
+/// written twice — once here and once in `main.rs` — while the type was shared
+/// but the normalisation was not (codex P1 round 6 on PR #201). Construction
+/// goes through [`SearchFilterEcho::new`] so a caller cannot answer the
+/// question a second way.
 #[derive(Serialize, Default)]
 pub struct SearchFilterEcho {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
+    topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path_globs: Option<Vec<String>>,
+    path_globs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags_any: Option<Vec<String>>,
+    tags_any: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags_all: Option<Vec<String>>,
+    tags_all: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub date_from: Option<String>,
+    date_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub date_to: Option<String>,
+    date_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_confidence_ratio: Option<f32>,
+    min_confidence_ratio: Option<f32>,
+}
+
+impl SearchFilterEcho {
+    /// The echo, normalised the one way both surfaces use.
+    ///
+    /// A list that arrived empty is dropped rather than echoed, because an
+    /// empty list narrows nothing and the echo reports what had an effect.
+    /// Each caller converts its own spelling of the inputs — the MCP tool has
+    /// `Option<Vec<String>>`, the command line has `&[String]` — and the rule
+    /// itself lives here.
+    ///
+    /// Scalars pass through: `min_confidence_ratio` in particular is echoed
+    /// whenever it was given, even though it narrows nothing, because it
+    /// changes what `low_confidence` means for that call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        category: Option<String>,
+        topic: Option<String>,
+        path_globs: Option<Vec<String>>,
+        tags_any: Option<Vec<String>>,
+        tags_all: Option<Vec<String>>,
+        date_from: Option<String>,
+        date_to: Option<String>,
+        min_confidence_ratio: Option<f32>,
+    ) -> Self {
+        let with_effect = |v: Option<Vec<String>>| v.filter(|l| !l.is_empty());
+        Self {
+            category,
+            topic,
+            path_globs: with_effect(path_globs),
+            tags_any: with_effect(tags_any),
+            tags_all: with_effect(tags_all),
+            date_from,
+            date_to,
+            min_confidence_ratio,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3710,17 +3754,52 @@ mod tests {
         ]
     }
 
+    /// Through `new`, like both surfaces: a sample assembled another way could
+    /// claim a shape neither of them produces.
     fn maximal_echo() -> SearchFilterEcho {
-        SearchFilterEcho {
-            category: Some("c".to_string()),
-            topic: Some("t".to_string()),
-            path_globs: Some(vec!["**".to_string()]),
-            tags_any: Some(vec!["a".to_string()]),
-            tags_all: Some(vec!["b".to_string()]),
-            date_from: Some("2026-01-01".to_string()),
-            date_to: Some("2026-12-31".to_string()),
-            min_confidence_ratio: Some(1.5),
-        }
+        SearchFilterEcho::new(
+            Some("c".to_string()),
+            Some("t".to_string()),
+            Some(vec!["**".to_string()]),
+            Some(vec!["a".to_string()]),
+            Some(vec!["b".to_string()]),
+            Some("2026-01-01".to_string()),
+            Some("2026-12-31".to_string()),
+            Some(1.5),
+        )
+    }
+
+    /// The rule `new` exists to hold: an empty list narrows nothing, so it is
+    /// not echoed. Pinned here because both surfaces now depend on it being
+    /// decided once, and a change made for one of them would otherwise be
+    /// invisible until a caller noticed the echo had grown.
+    #[test]
+    fn an_empty_list_filter_is_not_echoed() {
+        let echo = SearchFilterEcho::new(
+            None,
+            None,
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some(Vec::new()),
+            None,
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&echo).expect("the echo serializes");
+        assert_eq!(
+            value,
+            serde_json::json!({}),
+            "lists that arrived empty must leave no key behind"
+        );
+
+        // And a scalar that narrows nothing is still echoed, because it
+        // changes what `low_confidence` means for the call.
+        let ratio_only =
+            SearchFilterEcho::new(None, None, None, None, None, None, None, Some(1.25));
+        assert_eq!(
+            serde_json::to_value(&ratio_only).expect("the echo serializes"),
+            serde_json::json!({"min_confidence_ratio": 1.25})
+        );
     }
 
     /// A response with **every** optional field populated.
