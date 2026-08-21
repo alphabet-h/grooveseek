@@ -1,6 +1,6 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-dark.png">
-  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/logo-light.png" alt="" width="56" height="56">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/alphabet-h/grooveseek/raw/main/assets/grooveseek-readme-hero-dark-v2.webp">
+  <img src="https://github.com/alphabet-h/grooveseek/raw/main/assets/grooveseek-readme-hero-light-v2.webp" alt="Markdown ファイルがチャンク化を経て、意味の経路と字句の経路が 1 点に集まり、順位付けされた結果が MCP クライアントへ抜けていく図。" width="100%">
 </picture>
 
 # GrooveSeek
