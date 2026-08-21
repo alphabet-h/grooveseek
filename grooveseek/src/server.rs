@@ -3665,12 +3665,23 @@ mod tests {
         (mcp, cli)
     }
 
-    /// Every field either surface can emit.
+    /// Every field either surface can emit, **including the refusal**.
+    ///
+    /// A `search` answers with one of two shapes: the wrapper, or
+    /// `{"error": …}` when the tool refuses or the search fails — nine return
+    /// sites in `server/search.rs` alone. Walking only the successful one left
+    /// `error` outside the contract while the section claimed to list
+    /// everything (codex P2 round 2 on PR #201).
     fn all_emitted_fields() -> BTreeSet<String> {
         let (mcp, cli) = both_surfaces();
         let mut out = BTreeSet::new();
         walk_fields(&mcp, "", &mut out);
         walk_fields(&cli, "", &mut out);
+        let refusal = serde_json::to_value(ErrorResponse {
+            error: "why the call could not be answered".to_string(),
+        })
+        .expect("the error type serializes");
+        walk_fields(&refusal, "", &mut out);
         out
     }
 

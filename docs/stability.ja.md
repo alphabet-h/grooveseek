@@ -189,7 +189,7 @@ loopback origin** である。
 | `results[].expanded_from.total_chunks` | integer | `whole_document` のみ。その文書の chunk 総数 |
 | `results[].uri` | string | サーバが渡す文書のときのみ。**CLI では常に不在** |
 | `low_confidence` | boolean | 常に。**助言** — 後述 |
-| `filter_applied` | object | 常に。filter 未指定なら `{}` |
+| `filter_applied` | object | 常に。**下の 8 つが 1 つも指定されなければ** `{}`。後述 |
 | `filter_applied.category` | string | 指定時のみ |
 | `filter_applied.topic` | string | 指定時のみ |
 | `filter_applied.path_globs` | string の array | 指定時のみ |
@@ -198,6 +198,20 @@ loopback origin** である。
 | `filter_applied.date_from` | string | 指定時のみ |
 | `filter_applied.date_to` | string | 指定時のみ |
 | `filter_applied.min_confidence_ratio` | number | 指定時のみ |
+| `error` | string | **上の全体の代わりに**これだけが返る。MCP tool が拒否・失敗したとき。後述 |
+
+**search の応答は 2 つの形のうちどちらか。** 最終行より上が成功時。MCP tool が
+呼び出しを拒否する / 検索が失敗する場合 — `mmr_lambda` が範囲外、query が 1 KiB を
+超える、glob が壊れている、embedding や DB の失敗 — は `{"error": "…"}` だけが
+返り、**`results` キーは存在しない**。呼び出し側は `results` を無条件に読まず、
+**どちらが来たかで分岐する**こと。CLI にこの封筒は無い — 失敗を stderr に出して
+非ゼロ終了する ([責務分離](#stable)の節のとおり)。
+
+**`filter_applied` が echo するのは上の 8 つだけで、走った filter 全部ではない。**
+`min_quality` と `include_low_quality` は**適用されるが echo されない**ので、
+`{}` の意味は「**その 8 つが 1 つも指定されなかった**」であって
+「結果に filter が掛かっていない」ではない。後から quality 入力を echo に足すのは、
+「フィールドの追加」規則により minor である。
 
 **「不在」は `null` ではなくキーごと無いこと。** 上表で「のみ」と書いた行は、
 条件を満たさなければ**オブジェクトからキーが消える**。消費側は

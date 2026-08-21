@@ -202,7 +202,7 @@ different each time.
 | `results[].expanded_from.total_chunks` | integer | `whole_document` only — how many chunks the document has |
 | `results[].uri` | string | **omitted** unless the document is one the server will hand over, and **never present over the command line** |
 | `low_confidence` | boolean | always — **advisory**, see below |
-| `filter_applied` | object | always, `{}` when no filter was given |
+| `filter_applied` | object | always, `{}` when none of the fields below was given — see the note |
 | `filter_applied.category` | string | omitted unless given |
 | `filter_applied.topic` | string | omitted unless given |
 | `filter_applied.path_globs` | array of strings | omitted unless given |
@@ -211,6 +211,22 @@ different each time.
 | `filter_applied.date_from` | string | omitted unless given |
 | `filter_applied.date_to` | string | omitted unless given |
 | `filter_applied.min_confidence_ratio` | number | omitted unless given |
+| `error` | string | **the whole response instead of the above**, when the MCP tool refuses or fails — see below |
+
+**A search answers with one of two shapes.** Everything above the last row is
+the successful one. When the MCP tool refuses a call or the search fails — an
+`mmr_lambda` out of range, a query past the 1 KiB cap, a malformed glob, an
+embedding or database failure — it answers `{"error": "…"}` instead, with no
+`results` key at all. Callers must branch on which arrived rather than reading
+`results` unconditionally. The command line has no such envelope: it reports
+the failure on stderr and exits non-zero, which is [the split](#command-line)
+two sections up.
+
+**`filter_applied` echoes the eight fields above it, not every filter that
+ran.** `min_quality` and `include_low_quality` are applied and are not echoed,
+so `{}` means "none of those eight was given" rather than "the results are
+unfiltered". Adding the quality inputs to the echo later would be a minor
+release, by the rule that new fields may be added.
 
 **Omitted means absent, not `null`.** Every row above that says "omitted" leaves
 the key out of the object entirely. A consumer must not distinguish a missing
