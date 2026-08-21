@@ -708,4 +708,106 @@ mod tests {
         let kb = Path::new("/kb");
         assert_eq!(rel_key(kb, &kb.join("notes").join("a.md")), "notes/a.md");
     }
+
+    // -----------------------------------------------------------------------
+    // The fail-safe, under generated input (audit L-21)
+    //
+    // `matches` documents the rule this file exists to hold: `.grooveignore`'s
+    // `!` can undo an earlier line **of `.grooveignore`**, and never
+    // `exclude_dirs` or the hardcoded denylist. The example tests above each
+    // pick one negation and check it. A negation is a pattern language, and the
+    // examples cover the spellings someone thought of.
+    //
+    // What makes this worth generating rather than listing: the rule is
+    // enforced by an *ordering* — `matches` returns `true` from the denylist
+    // branch before it consults the ignore matcher. An edit that moved the
+    // ignore check first would keep every example above passing for whichever
+    // patterns those examples happen to use, and hand a knowledge base the
+    // ability to switch off `.git`.
+    // -----------------------------------------------------------------------
+
+    /// Spellings of "un-ignore this", as a `.grooveignore` would carry them.
+    ///
+    /// `{}` is filled with the directory name under test, so each one is a
+    /// negation aimed **at that name**, which is the only kind that could
+    /// plausibly reach it.
+    const NEGATION_SHAPES: &[&str] = &[
+        "!{}\n",
+        "!{}/\n",
+        "!/{}\n",
+        "!{}/**\n",
+        "!**/{}\n",
+        "!**/{}/**\n",
+        "*\n!{}\n",
+        "**/*\n!{}/**\n",
+        "!{}\n!{}/\n!**/{}/**\n",
+    ];
+
+    proptest::proptest! {
+        /// No `.grooveignore` can re-admit a directory the denylist refuses.
+        ///
+        /// `.git` and `node_modules` are a fail-safe, and a fail-safe that a
+        /// file inside the tree can switch off has stopped being one — a
+        /// checked-out repository would start indexing its own object store,
+        /// and the `.grooveignore` that did it would be a file the repository
+        /// itself could carry.
+        #[test]
+        fn no_negation_can_re_admit_a_hardcoded_directory(
+            shape in proptest::sample::select(NEGATION_SHAPES),
+            name in proptest::sample::select(crate::indexer::HARDCODED_EXCLUDE_DIRS),
+            depth in 0usize..3,
+        ) {
+            let r = rules(&shape.replace("{}", name), &[]);
+            let prefix = "sub/".repeat(depth);
+            let dir = format!("{prefix}{name}");
+            proptest::prop_assert!(
+                r.is_excluded(&dir, true),
+                "`{}` re-admitted {dir}, which the hardcoded denylist refuses",
+                shape.escape_debug()
+            );
+            proptest::prop_assert!(
+                r.is_excluded(&format!("{dir}/inside.md"), false),
+                "`{}` re-admitted a file under {dir}",
+                shape.escape_debug()
+            );
+        }
+
+        /// The same for a name the operator configured.
+        ///
+        /// `exclude_dirs` is the operator's list and `.grooveignore` is the
+        /// knowledge base's; the second must not overrule the first, or the
+        /// setting means "unless a file in the tree disagrees".
+        #[test]
+        fn no_negation_can_re_admit_a_configured_directory(
+            shape in proptest::sample::select(NEGATION_SHAPES),
+            name in "[a-z][a-z0-9_-]{0,12}",
+            depth in 0usize..3,
+        ) {
+            let r = rules(&shape.replace("{}", &name), &[&name]);
+            let prefix = "sub/".repeat(depth);
+            let dir = format!("{prefix}{name}");
+            proptest::prop_assert!(
+                r.is_excluded(&dir, true),
+                "`{}` re-admitted the configured directory {dir}",
+                shape.escape_debug()
+            );
+        }
+
+        /// And the boundary the two above could be satisfied by accident:
+        /// **a name nothing refuses is still reachable**.
+        ///
+        /// A `matches` that returned `true` unconditionally would pass both
+        /// properties above and exclude the whole knowledge base.
+        #[test]
+        fn a_directory_no_layer_names_is_not_excluded(
+            name in "[a-z][a-z0-9_-]{0,12}",
+        ) {
+            proptest::prop_assume!(!crate::indexer::is_hardcoded_excluded(&name));
+            let r = rules("", &[]);
+            proptest::prop_assert!(
+                !r.is_excluded(&name, true),
+                "{name} was excluded with an empty .grooveignore and no exclude_dirs"
+            );
+        }
+    }
 }
