@@ -3481,18 +3481,25 @@ enabled = true
         }
     }
 
-    /// A syntactically valid golden padded past `MAX_EVAL_FILE_BYTES`.
+    /// A syntactically valid golden, one query long, padded past
+    /// `MAX_EVAL_FILE_BYTES`.
     ///
-    /// Valid on purpose: if the refusal came from the parser rather than from
-    /// the cap, the test would pass while the file was still read whole, which
-    /// is the thing being prevented.
+    /// **Valid on purpose.** If the file were junk, removing the bound would
+    /// still leave the load failing — at the parser — and the test would pass
+    /// while the file was being read whole, which is the thing it exists to
+    /// prevent. Padding one query keeps it parseable at any size.
+    ///
+    /// One `repeat` rather than a loop that appends until it passes the cap:
+    /// the size follows the constant either way, and a loop that builds a
+    /// gigabyte three lines at a time is a slow way to learn someone raised it.
     fn oversize_golden(path: &std::path::Path) {
-        let mut body = String::from("queries:\n");
-        while body.len() as u64 <= MAX_EVAL_FILE_BYTES {
-            body.push_str(
-                "  - query: \"padding, and it parses\"\n    expected:\n      - path: \"a.md\"\n",
-            );
-        }
+        let pad = "a".repeat(usize::try_from(MAX_EVAL_FILE_BYTES).unwrap_or(0));
+        let body =
+            format!("queries:\n  - query: \"{pad}\"\n    expected:\n      - path: \"a.md\"\n");
+        assert!(
+            body.len() as u64 > MAX_EVAL_FILE_BYTES,
+            "the fixture has to be over the cap for the test to mean anything"
+        );
         std::fs::write(path, body).expect("write the oversize golden");
     }
 
