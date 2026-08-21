@@ -357,12 +357,18 @@ const RENAMED: &[Legacy] = &[
         // longer reaches is exactly that. `--force` would re-embed the whole
         // corpus to reach the same state.
         remedy: "rename it to .grooveignore, then run `groove index`",
-        // With a live `.grooveignore` beside it, whether anything is leaking
-        // depends on what that file says — and this check does not read it, so
-        // it must not claim either way.
-        consequence_beside_replacement: "is not read; only .grooveignore decides what is excluded now",
-        remedy_beside_replacement: "merge any lines you still want into .grooveignore, then delete it \
-             and run `groove index`",
+        // Only that the name is taken. Not "so `.grooveignore` decides what is
+        // excluded now" — a `.grooveignore` that is a directory, a hard link,
+        // or over the cap is **refused** by `ExclusionRules::load` and applies
+        // no patterns at all, and `symlink_metadata` cannot tell that apart
+        // from a working one (codex P2 on PR #203). Neither file is opened
+        // here, so neither is described.
+        consequence_beside_replacement: "is not read, and the name .grooveignore beside it is taken; this check opened neither",
+        // Starts with a look, for the same reason: if `.grooveignore` turns
+        // out to be a directory or something unreadable, "merge into it" is
+        // not an instruction anyone can follow.
+        remedy_beside_replacement: "read what .grooveignore holds, merge any lines you still want, \
+             then delete this one and run `groove index`",
     },
     Legacy {
         check: "legacy-index-file",
@@ -940,6 +946,19 @@ mod tests {
         // `.kb-mcpignore` holding only `node_modules/` costs nothing, because
         // `exclude_dirs` and the hardcoded denylist already cover it
         // (codex P2 on PR #203).
+        //
+        // The second phrase came from the next round of the same review. The
+        // presence of a `.grooveignore` is not the same as its being in
+        // effect: one that is a directory, a hard link or over the cap is
+        // refused by `ExclusionRules::load` and applies no patterns, and
+        // `symlink_metadata` sees a name either way.
+        const UNMEASURED: &[(&str, &str)] = &[
+            ("every path", "claims every excluded path leaked"),
+            (
+                "decides what",
+                "claims a file is in effect, which presence does not establish",
+            ),
+        ];
         for legacy in RENAMED {
             for (label, text) in [
                 ("consequence", legacy.consequence),
@@ -948,12 +967,13 @@ mod tests {
                     legacy.consequence_beside_replacement,
                 ),
             ] {
-                assert!(
-                    !text.contains("every path"),
-                    "{}: {label} claims every excluded path leaked, which this \
-                     check does not measure, got: {text}",
-                    legacy.check
-                );
+                for (phrase, why) in UNMEASURED {
+                    assert!(
+                        !text.contains(phrase),
+                        "{}: {label} {why} — this check opens nothing, got: {text}",
+                        legacy.check
+                    );
+                }
             }
         }
     }

@@ -159,15 +159,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   someone to rename a file their configuration is using would break it.
 
   When the file that replaced one of these is there too, the finding says
-  something different and advises something different. `doctor` does not read
-  either file, so with a live `.grooveignore` beside the old one it cannot
-  claim anything is leaking; and "rename it to `.grooveignore`" would be an
-  instruction to write over the configuration in use.
-
-  `groove.toml` is deliberately not among them. Its location is *discovered*,
-  from the working directory or a `.git` ancestor, so there is no one place the
-  old name would be; and a configuration that silently did not load announces
-  itself at once by indexing the wrong directory or none.
+  something different and advises something different. `doctor` opens neither
+  file, so all it knows then is that the name is taken — not that anything is
+  leaking, and not that the new file is in effect, since a `.grooveignore` that
+  is a directory or over the size cap is refused and applies nothing. What
+  changes is the advice: "rename it to `.grooveignore`" would be an instruction
+  to write over whatever is there.
 
 - **The golden query file and the eval history are read with a bound.** Both
   default to living inside the knowledge base and both were read whole with no
