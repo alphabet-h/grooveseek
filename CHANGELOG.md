@@ -272,6 +272,42 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **A hybrid search is now held to a fixed number of SQL statements, and the
+  two bounds a graph walk is built on are property-tested.** No behaviour
+  change; two more of the gaps the 2026-08-18 audit named.
+
+  The performance guard this project had compared wall-clock as a ratio. That
+  is right for what it guards and wrong as the only one: timing on a shared
+  runner is noise, so it is `#[ignore]`d, runs once a night, and its threshold
+  has to be loose enough to survive that runner. Counting statements instead
+  costs milliseconds, gives the same answer on every machine, and runs on every
+  pull request — and it catches the regression a stopwatch notices last, a
+  query issued per candidate, per result or per document.
+
+  `search_hybrid` issues **two** statements: one for the vector leg, one for
+  the full-text leg, with the fusion done in Rust over what they returned. Two
+  at 50 chunks and at 500, asking for one result and for ten. Counting every
+  statement SQLite traces instead gives 175 and 769 — FTS5 reading
+  `fts_chunks_docsize` once per row it scores for bm25, which this project
+  neither wrote nor wants to change, and a gate over that number would have
+  been red the day it landed.
+
+  The graph walk's node budget and seed cap take whatever an MCP client sends,
+  including `0` and `u32::MAX`. Both are now generated rather than sampled, and
+  the asymmetry at zero is stated as the rule rather than as two examples:
+  `max_nodes = 0` is a coherent request and is honoured, while
+  `max_seed_chunks = 0` would make an answer indistinguishable from "no such
+  document" and becomes 1.
+
+  `.grooveignore`'s `!` is generated too, across nine spellings, every
+  hardcoded name, and three depths. Breaking the rule three ways showed what
+  that adds: two of the three breakages are caught by the example tests as
+  well, and the third — giving `!` gitignore's own precedence, so it wins
+  where an earlier line ignored something — passes every example and fails
+  both properties, because each example spells its negation `!name` in a file
+  with no ignore line at all. The shrunk counterexample is `*` followed by
+  `!.git`.
+
 - **The two Origin startup warnings are now checked for what they say and when
   they fire.** They are the only thing an operator gets in two configurations
   that otherwise look like they are working — one where Origin validation is

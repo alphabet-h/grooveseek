@@ -1801,4 +1801,83 @@ mod tests {
         assert_eq!(TruncationReason::SeedChunks.as_str(), "seed_chunks");
         assert_eq!(TruncationReason::NodeBudget.as_str(), "node_budget");
     }
+
+    // -----------------------------------------------------------------------
+    // The two bounds, under generated input (audit L-21)
+    //
+    // These are what stands between a `get_connection_graph` call and an
+    // unbounded walk: the node budget decides how big an answer can get, and
+    // the seed cap decides how much of the start document is read. Both are
+    // reachable from an MCP client, so both take whatever a caller sends —
+    // including `0` and `u32::MAX`, which is exactly where an example test
+    // stops being convincing.
+    //
+    // The **asymmetry at zero is deliberate and documented**: `max_nodes = 0`
+    // is a coherent request ("return nothing") and is honoured, while
+    // `max_seed_chunks = 0` would make an answer indistinguishable from "the
+    // document does not exist", so it becomes 1. A property is the right shape
+    // for that, because the interesting part is that it holds for every other
+    // input while those two differ.
+    // -----------------------------------------------------------------------
+    proptest::proptest! {
+        #[test]
+        fn the_node_budget_never_exceeds_its_ceiling(n in proptest::prelude::any::<u32>()) {
+            proptest::prop_assert!(clamp_max_nodes(n) <= MAX_NODES_CEILING);
+            // And never invents work: a clamp that raised a small request
+            // would hand a caller more nodes than it asked for.
+            proptest::prop_assert!(clamp_max_nodes(n) <= n);
+        }
+
+        #[test]
+        fn the_seed_cap_lands_inside_its_documented_range(n in proptest::prelude::any::<u32>()) {
+            let c = clamp_max_seed_chunks(n);
+            proptest::prop_assert!((1..=MAX_SEED_CHUNKS_CEILING).contains(&c));
+        }
+
+        /// Clamping something already clamped changes nothing.
+        ///
+        /// The cheapest way to break a bound is to apply it twice somewhere —
+        /// a caller clamps, passes the value on, and the callee clamps again.
+        /// That is safe only while the function is idempotent, and nothing
+        /// said it was.
+        #[test]
+        fn clamping_twice_is_clamping_once(n in proptest::prelude::any::<u32>()) {
+            proptest::prop_assert_eq!(
+                clamp_max_nodes(clamp_max_nodes(n)),
+                clamp_max_nodes(n)
+            );
+            proptest::prop_assert_eq!(
+                clamp_max_seed_chunks(clamp_max_seed_chunks(n)),
+                clamp_max_seed_chunks(n)
+            );
+        }
+
+        /// Order survives. A clamp that ever inverted it would mean "ask for
+        /// more, get less" for some pair, which no caller could reason about.
+        #[test]
+        fn asking_for_more_never_yields_less(
+            a in proptest::prelude::any::<u32>(),
+            b in proptest::prelude::any::<u32>(),
+        ) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            proptest::prop_assert!(clamp_max_nodes(lo) <= clamp_max_nodes(hi));
+            proptest::prop_assert!(clamp_max_seed_chunks(lo) <= clamp_max_seed_chunks(hi));
+        }
+
+        /// The asymmetry itself, stated as the rule rather than as two cases:
+        /// **`max_nodes` honours zero and `max_seed_chunks` does not**, and
+        /// every other input passes through both unchanged until its ceiling.
+        #[test]
+        fn zero_is_the_only_input_the_two_bounds_disagree_about(
+            n in 0u32..=MAX_SEED_CHUNKS_CEILING,
+        ) {
+            if n == 0 {
+                proptest::prop_assert_eq!(clamp_max_nodes(n), 0);
+                proptest::prop_assert_eq!(clamp_max_seed_chunks(n), 1);
+            } else {
+                proptest::prop_assert_eq!(clamp_max_nodes(n), n);
+                proptest::prop_assert_eq!(clamp_max_seed_chunks(n), n);
+            }
+        }
+    }
 }

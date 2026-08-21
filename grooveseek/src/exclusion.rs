@@ -708,4 +708,120 @@ mod tests {
         let kb = Path::new("/kb");
         assert_eq!(rel_key(kb, &kb.join("notes").join("a.md")), "notes/a.md");
     }
+
+    // -----------------------------------------------------------------------
+    // The fail-safe, under generated input (audit L-21)
+    //
+    // `matches` documents the rule this file exists to hold: `.grooveignore`'s
+    // `!` can undo an earlier line **of `.grooveignore`**, and never
+    // `exclude_dirs` or the hardcoded denylist. The example tests above each
+    // pick one negation and check it. A negation is a pattern language, and the
+    // examples cover the spellings someone thought of.
+    //
+    // What makes this worth generating rather than listing was measured, by
+    // breaking `matches` three ways and recording which tests noticed.
+    //
+    // **Two of the three are caught without these properties.** Consulting the
+    // ignore matcher first, so a `!` wins outright, fails
+    // `a_negation_cannot_undo_exclude_dirs_or_the_hardcoded_denylist`. Applying
+    // the denylist only at the knowledge-base root fails
+    // `the_hardcoded_denylist_still_covers_everything_under_it` and
+    // `the_three_layers_are_a_union`. The examples above are not blind to a
+    // reordered `matches`, and saying they were would overstate what is added
+    // here.
+    //
+    // **The third is what these are for.** Give `!` gitignore's own rule — it
+    // wins where an earlier line ignored something, and loses otherwise — and
+    // every example passes, because each of them spells its negation `!name`
+    // in a file that carries no ignore line at all. Both properties fail, and
+    // proptest shrinks the input to `*\n!.git`: ignore everything, then take
+    // one back. That spelling is in the generated set and in none of the
+    // examples, which is the difference between covering a pattern language
+    // and covering the patterns someone thought of.
+    // -----------------------------------------------------------------------
+
+    /// Spellings of "un-ignore this", as a `.grooveignore` would carry them.
+    ///
+    /// `{}` is filled with the directory name under test, so each one is a
+    /// negation aimed **at that name**, which is the only kind that could
+    /// plausibly reach it.
+    const NEGATION_SHAPES: &[&str] = &[
+        "!{}\n",
+        "!{}/\n",
+        "!/{}\n",
+        "!{}/**\n",
+        "!**/{}\n",
+        "!**/{}/**\n",
+        "*\n!{}\n",
+        "**/*\n!{}/**\n",
+        "!{}\n!{}/\n!**/{}/**\n",
+    ];
+
+    proptest::proptest! {
+        /// No `.grooveignore` can re-admit a directory the denylist refuses.
+        ///
+        /// `.git` and `node_modules` are a fail-safe, and a fail-safe that a
+        /// file inside the tree can switch off has stopped being one — a
+        /// checked-out repository would start indexing its own object store,
+        /// and the `.grooveignore` that did it would be a file the repository
+        /// itself could carry.
+        #[test]
+        fn no_negation_can_re_admit_a_hardcoded_directory(
+            shape in proptest::sample::select(NEGATION_SHAPES),
+            name in proptest::sample::select(crate::indexer::HARDCODED_EXCLUDE_DIRS),
+            depth in 0usize..3,
+        ) {
+            let r = rules(&shape.replace("{}", name), &[]);
+            let prefix = "sub/".repeat(depth);
+            let dir = format!("{prefix}{name}");
+            proptest::prop_assert!(
+                r.is_excluded(&dir, true),
+                "`{}` re-admitted {dir}, which the hardcoded denylist refuses",
+                shape.escape_debug()
+            );
+            proptest::prop_assert!(
+                r.is_excluded(&format!("{dir}/inside.md"), false),
+                "`{}` re-admitted a file under {dir}",
+                shape.escape_debug()
+            );
+        }
+
+        /// The same for a name the operator configured.
+        ///
+        /// `exclude_dirs` is the operator's list and `.grooveignore` is the
+        /// knowledge base's; the second must not overrule the first, or the
+        /// setting means "unless a file in the tree disagrees".
+        #[test]
+        fn no_negation_can_re_admit_a_configured_directory(
+            shape in proptest::sample::select(NEGATION_SHAPES),
+            name in "[a-z][a-z0-9_-]{0,12}",
+            depth in 0usize..3,
+        ) {
+            let r = rules(&shape.replace("{}", &name), &[&name]);
+            let prefix = "sub/".repeat(depth);
+            let dir = format!("{prefix}{name}");
+            proptest::prop_assert!(
+                r.is_excluded(&dir, true),
+                "`{}` re-admitted the configured directory {dir}",
+                shape.escape_debug()
+            );
+        }
+
+        /// And the boundary the two above could be satisfied by accident:
+        /// **a name nothing refuses is still reachable**.
+        ///
+        /// A `matches` that returned `true` unconditionally would pass both
+        /// properties above and exclude the whole knowledge base.
+        #[test]
+        fn a_directory_no_layer_names_is_not_excluded(
+            name in "[a-z][a-z0-9_-]{0,12}",
+        ) {
+            proptest::prop_assume!(!crate::indexer::is_hardcoded_excluded(&name));
+            let r = rules("", &[]);
+            proptest::prop_assert!(
+                !r.is_excluded(&name, true),
+                "{name} was excluded with an empty .grooveignore and no exclude_dirs"
+            );
+        }
+    }
 }
