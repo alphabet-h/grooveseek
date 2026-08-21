@@ -454,6 +454,13 @@ fn macos_install_status_uninstall_round_trip() {
         "uninstall must remove {}",
         plist.display()
     );
+    // Same reasoning as its sibling: the status has to have run before its
+    // output means anything.
+    assert!(
+        after.status.success(),
+        "service status failed\nstderr: {}",
+        String::from_utf8_lossy(&after.stderr),
+    );
     let after_text = String::from_utf8_lossy(&after.stdout);
     assert!(
         after_text.contains("not found"),
@@ -532,10 +539,22 @@ fn macos_install_makes_launchd_know_the_label() {
     // `running` or `stopped` — either means `launchctl list <label>` found it,
     // which is what `bootstrap gui/<uid>` succeeding looks like from here.
     // Whether the daemon came up is a different question and not this one's.
+    //
+    // **Named positively, and after the exit status.** `!contains("not found")`
+    // passes on empty stdout, so a `status` that died before printing anything
+    // — a CLI dispatch regression, say — would read as success. Errors go to
+    // stderr under this project's output contract, so stdout alone cannot tell
+    // "found it" from "never got there" (codex P2 on PR #207).
+    assert!(
+        during.status.success(),
+        "service status failed\nstderr: {}",
+        String::from_utf8_lossy(&during.stderr),
+    );
     let during_text = String::from_utf8_lossy(&during.stdout);
     assert!(
-        !during_text.contains("not found"),
-        "while installed, launchd must know com.groove.{name}, got: {during_text}"
+        during_text.contains("running") || during_text.contains("stopped"),
+        "while installed, launchd must know com.groove.{name} — status must say \
+         running or stopped, got: {during_text}"
     );
     assert!(
         String::from_utf8_lossy(&list.stdout).contains(&name),
