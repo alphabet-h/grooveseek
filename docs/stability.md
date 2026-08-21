@@ -229,8 +229,11 @@ object looks like it means:
 - `min_quality` and `include_low_quality` are applied and never echoed. The
   quality filter is on by default, so `{}` does not say the results are
   unfiltered.
-- An explicitly empty `path_globs`, `tags_any` or `tags_all` is accepted and
-  dropped from the echo, because an empty list excludes nothing.
+- An explicitly empty `tags_any` or `tags_all` is accepted and dropped from the
+  echo, because an empty list excludes nothing. An empty `path_globs` is the
+  exception: it is refused with the `error` envelope rather than accepted, since
+  a glob list that matches nothing is more likely a mistake than a request for
+  everything — pass `null` to disable it.
 - `min_confidence_ratio` is echoed but narrows nothing: it only sets the
   threshold `low_confidence` is compared against. So the echo is not a list of
   what filtered the results either.

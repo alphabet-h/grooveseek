@@ -213,8 +213,10 @@ loopback origin** である。
 - `min_quality` と `include_low_quality` は**適用されるが決して echo されない**。
   **品質フィルタは既定で有効**なので、`{}` は「結果に filter が掛かっていない」を
   意味しない
-- **明示的に空の** `path_globs` / `tags_any` / `tags_all` は受理されるが echo からは
-  落ちる (空リストは何も除外しないため)
+- **明示的に空の** `tags_any` / `tags_all` は受理されるが echo からは落ちる
+  (空リストは何も除外しないため)。**`path_globs` だけは例外で、空だと受理されず
+  `error` 封筒が返る** — 何にも一致しない glob リストは「全部よこせ」の要求より
+  書き間違いである可能性が高いため。無効にしたいなら `null` を渡す
 - **`min_confidence_ratio` は echo されるが何も絞らない** — `low_confidence` を
   比べる閾値を決めるだけ。**echo は「結果を絞ったものの一覧」でもない**
 
