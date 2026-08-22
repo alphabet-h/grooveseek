@@ -89,7 +89,13 @@ impl ProgressReporter {
                         "[{elapsed_precise}] [{bar:24.cyan/blue}] {pos}/{len} ({percent}%, ETA {eta}) {msg}",
                     )
                     .expect("static template")
-                    .progress_chars("█▉▊▋▌▍▎▏ "),
+                    // ASCII, because indicatif draws this to stderr and
+                    // AGENTS.md keeps stderr readable on a CP932 console. The
+                    // bar used to be drawn with eighth-blocks, which is the one
+                    // place in this program where the rule was broken by a
+                    // library's rendering rather than by a message
+                    // (codex P2 on PR #213).
+                    .progress_chars("=>-"),
                 );
                 bar.enable_steady_tick(std::time::Duration::from_millis(100));
                 ProgressInner::Tty(bar)

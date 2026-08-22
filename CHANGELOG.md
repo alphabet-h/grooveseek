@@ -228,6 +228,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   The rule is about **the words a message chooses, not the data it names**, so a
   note called `日本語のノート.md` still comes out of `groove index` as itself.
 
+  **`groove index --progress` draws its bar with `=>-`** instead of eighth-block
+  characters. The bar is drawn to stderr by indicatif, which made it the one
+  place the rule was broken by a library's rendering rather than by a message —
+  and the one that would have looked worst on the console the rule is about.
+
   `tests/diagnostics_stay_ascii.rs` walks the workspace source at run time
   instead of naming files, so a new file is covered by existing rather than by
   being remembered.

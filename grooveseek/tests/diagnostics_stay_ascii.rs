@@ -71,6 +71,23 @@
 //! without anyone remembering. Adding that pass found an em dash the enumerated
 //! openers had missed.
 //!
+//! # Every way a literal reaches stderr, counted
+//!
+//! Four review rounds each named another surface, so the surfaces were
+//! enumerated and measured instead of waiting for a fifth:
+//!
+//! | surface | call sites | non-ASCII |
+//! |---|---|---|
+//! | the macro and panic openers below | see the list | 43, all fixed |
+//! | indicatif's progress style | 2 | 1, fixed and now an opener |
+//! | `write!` / `writeln!` / `write_all` aimed at stderr | 162 | 0 |
+//! | clap's `help` / `about` / `value_name` attributes | 111 | 0 |
+//!
+//! clap's error path was measured end to end as well, by running the binary
+//! with bad flags: its output is ASCII. `--help` is not -- some flag
+//! descriptions are in Japanese -- but that goes to stdout, where the rule
+//! does not reach, and it is a language-policy question rather than this one.
+//!
 //! # Known limits, all of which fail loudly
 //!
 //! A macro written with brackets (`eprintln![..]`) is not recognised as a call
@@ -115,6 +132,13 @@ const DIAGNOSTIC_OPENERS: &[&str] = &[
     ".with_context(",
     ".expect(",
     ".expect_err(",
+    // indicatif draws the `groove index` progress bar to stderr on a TTY, so
+    // the strings that style it are words this program puts on that console
+    // even though no message macro is involved.
+    ".progress_chars(",
+    ".tick_chars(",
+    "with_template(",
+    ".template(",
 ];
 
 /// The workspace root. `CARGO_MANIFEST_DIR` is `<root>/grooveseek` since the
