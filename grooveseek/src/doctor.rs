@@ -573,7 +573,9 @@ mod tests {
     fn an_empty_index_without_a_vector_table_is_not_a_finding() {
         let db = Database::open_in_memory().expect("open");
         assert!(
-            run(&db, &registry_md(), &empty_kb(), &[]).expect("run").is_clean(),
+            run(&db, &registry_md(), &empty_kb(), &[])
+                .expect("run")
+                .is_clean(),
             "a database with nothing in it has nothing wrong with it"
         );
     }

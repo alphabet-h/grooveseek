@@ -224,9 +224,9 @@ mod tests {
                 why.contains(LEGACY_IGNORE_FILE_NAME),
                 "the reason has to name the file it is about, got: {why}"
             ),
-            other => panic!(
-                "a file the read guard refuses must not be reported as read, got {other:?}"
-            ),
+            other => {
+                panic!("a file the read guard refuses must not be reported as read, got {other:?}")
+            }
         }
     }
 
@@ -254,7 +254,12 @@ mod tests {
         kb.write_legacy("# nothing but a comment\n");
         let rules = live(&kb, &[]);
         assert!(
-            named(&kb, &rules, &["node_modules/pkg/readme.md", "notes/keep.md"]).is_empty(),
+            named(
+                &kb,
+                &rules,
+                &["node_modules/pkg/readme.md", "notes/keep.md"]
+            )
+            .is_empty(),
             "an empty old file excludes nothing, whatever the denylist says"
         );
     }

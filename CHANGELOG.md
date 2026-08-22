@@ -16,6 +16,31 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **`groove doctor` says what an old `.kb-mcpignore` left in the index.**
+  [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md) renamed the
+  project with no aliases and no automatic migration, so an ignore file under the
+  old name is not read and whatever it used to keep out is indexed again on the
+  next run. Nothing said so.
+
+  Two findings, both warnings. `indexed-despite-legacy-ignore` names the indexed
+  documents the old file matches that the current rules do not exclude — real
+  paths, up to five of them, not a count. `legacy-ignore-not-examined` is what
+  comes out when the file is there and could not be read: **a check that could
+  not run is not a check that found nothing**, and reporting the two the same way
+  is how a clean bill of health stops meaning anything.
+
+  The remedy branches on what is already in place. With no live `.grooveignore`
+  it is a rename; with one, it is copying over the lines you still want, because
+  a remedy that overwrites a file in use is worse than no remedy. Neither branch
+  asks for a deletion — a knowledge base whose new file is broken looks identical
+  from here, and the old file may be the only copy of the patterns.
+
+  The old file goes through the same `ExclusionRules` the index walk asks, so
+  this is not a second implementation of the exclusion rule; and it is asked
+  about documents that are **in the database**, which is what lets the finding
+  carry paths instead of the observation that a filename exists. **The check is
+  for the migration and is due to be removed in 1.1.0**, in one file.
+
 - **All four front pages open with a banner** — `README.md`, `README.ja.md`,
   and the two `docs/index` pages. It draws what separates this from a plain
   vector store: a semantic path and a lexical path converging on one node, and
