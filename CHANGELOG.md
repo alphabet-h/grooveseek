@@ -216,13 +216,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   v0.24.0. Nothing checked it, and review kept finding the same defect one
   instance at a time.
 
-  **42 messages** contributed characters that console cannot render: the whole
+  **43 messages** contributed characters that console cannot render: the whole
   of `groove service install` / `uninstall` / `status` on all three platforms,
   which spoke Japanese and now speaks English; em dashes in `groove tune`'s two
   notes and two warnings, in three `groove index` PDF refusals, in the two
-  `[parsers].enabled` refusals, in the poisoned-mutex warning and in both
-  PowerShell decoding errors; and the `groove eval` note this began with. Only
-  the wording changed — an error that named a file still names the same file.
+  `[parsers].enabled` refusals, in a watcher diagnostic, in the poisoned-mutex
+  warning and in both PowerShell decoding errors; and the `groove eval` note
+  this began with. Only the wording changed — an error that named a file still
+  names the same file.
 
   The rule is about **the words a message chooses, not the data it names**, so a
   note called `日本語のノート.md` still comes out of `groove index` as itself.

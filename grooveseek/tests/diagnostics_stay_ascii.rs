@@ -15,7 +15,9 @@
 //!
 //! What a literal *contains* is not what it *emits*: `eprintln!("\u{2014}")` is
 //! ASCII in the file and an em dash on the console, so escapes are resolved
-//! before a literal is accepted.
+//! before a literal is accepted. A **char** literal inside a diagnostic is
+//! checked the same way, because a character interpolated from `'...'` is one
+//! the author chose just as much as a word in the message around it.
 //!
 //! # Why this shape
 //!
@@ -74,6 +76,11 @@
 //! and the paren scan runs past it. A trailing comment carrying non-ASCII on a
 //! code line inside a diagnostic call is reported. Neither can hide a
 //! violation; both produce a failure naming the file.
+//!
+//! A **raw byte string** (`br"..."`) would be read as an ordinary string, whose
+//! escapes it does not have. Plain `b"..."` is fine -- its escapes are the same
+//! ones, and Rust does not allow a non-ASCII character in it at all. There is
+//! no `br"` in this tree; `b"` appears and is handled.
 
 use std::path::{Path, PathBuf};
 
@@ -175,7 +182,7 @@ fn char_literal_end(src: &str, at: usize) -> Option<usize> {
 }
 
 /// One pass over a file: a copy with every comment, string and char literal
-/// blanked out, plus the byte range of each string literal.
+/// blanked out, plus the byte range of each string and char literal.
 ///
 /// Blanking is what keeps an opener named inside a doc comment, or a paren
 /// inside a message, from being read as code. Every range blanked starts and
@@ -271,6 +278,13 @@ fn mask_comments_and_strings(src: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
         }
         if bytes[i] == b'\'' {
             if let Some(end) = char_literal_end(src, i) {
+                // A char literal inside a diagnostic is a character the author
+                // chose, so it is checked like a string: `eprintln!("{}", '-')`
+                // with an em dash there emits one. It is only ever looked at
+                // when it falls inside a diagnostic call, so the `'.'` and
+                // `'\u{3000}'` that live in this tree's tokenizer tables are
+                // not affected.
+                literals.push((i, end));
                 blank(&mut masked, i, end);
                 i = end;
             } else {
@@ -284,7 +298,7 @@ fn mask_comments_and_strings(src: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
 }
 
 /// A source file read once: how to name it in a failure, its text, the masked
-/// copy, and the byte range of every string literal in it.
+/// copy, and the byte range of every string and char literal in it.
 struct Scanned {
     shown: String,
     src: String,
@@ -393,6 +407,9 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 
 /// The non-ASCII characters a literal actually puts on the console.
 ///
+/// Takes a string literal or a char literal; both spell their escapes the
+/// same way.
+///
 /// Reading the source spelling is not enough: `eprintln!("\u{2014}")` is nine
 /// ASCII characters in the file and an em dash on the console, so a guard that
 /// only looks at the source accepts exactly the output it promises to reject
@@ -429,6 +446,12 @@ fn offending_characters(literal: &str) -> String {
                 }
                 hex.push(h);
             }
+            // Rust allows underscores anywhere among those digits, including a
+            // trailing one: `\u{20_14}`, `\u{2_0_1_4}` and `\u{2014_}` all
+            // compile and all mean an em dash (measured with rustc, not read).
+            // Leaving them in makes `from_str_radix` fail, and a failed parse
+            // reads as "nothing to report" (codex P2 on PR #213).
+            hex.retain(|c| c != '_');
             // An unparseable escape would not compile, so this cannot hide one.
             if let Ok(point) = u32::from_str_radix(&hex, 16)
                 && point > 127
