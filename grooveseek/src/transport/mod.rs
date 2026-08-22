@@ -43,7 +43,11 @@ pub struct HttpTransportConfig {
 
     /// 受理する `Host` ヘッダの allow-list。`None` (省略) なら
     /// [`http::DEFAULT_LOOPBACK_HOSTS`](crate::transport::http::DEFAULT_LOOPBACK_HOSTS)
-    /// = `["localhost", "127.0.0.1", "[::1]"]` (loopback only、DNS rebinding 防御)。
+    /// = `["localhost", "127.0.0.1", "[::1]"]` **に加えて、実際に bind した
+    /// アドレスが loopback ならその表記も**許可される (`127.0.0.2` に bind すれば
+    /// それも通る)。組み立てているのは
+    /// [`http::effective_allowed_hosts`](crate::transport::http) なので、
+    /// **監査するならこの 3 要素ではなくそちらを見ること**。
     /// LAN / イントラ公開時は `["192.168.1.10", "kb.example.lan", ...]` のように
     /// 明示する。空 `Vec` を渡すと **全 Host を許可**する (rmcp の
     /// `disable_allowed_hosts` 相当)。public 公開時は推奨されない。
@@ -117,9 +121,11 @@ pub enum Transport {
     Http {
         addr: SocketAddr,
         /// `None` = [`http::DEFAULT_LOOPBACK_HOSTS`](crate::transport::http::DEFAULT_LOOPBACK_HOSTS)
-        /// の loopback-only allow-list を使う。`Some(vec)` = 明示 list
-        /// (空 `Vec` を渡すと全 Host 許可になる)。F-33 で `groove.toml` から
-        /// surface した。判定するのは ADR-0009 以降 groove 自身。
+        /// **+ bind したアドレスが loopback ならその表記**
+        /// ([`http::effective_allowed_hosts`](crate::transport::http) が組み立てる)。
+        /// `Some(vec)` = 明示 list (空 `Vec` を渡すと全 Host 許可になる)。
+        /// F-33 で `groove.toml` から surface した。判定するのは
+        /// ADR-0009 以降 groove 自身。
         allowed_hosts: Option<Vec<String>>,
         /// `None` = bind した port の loopback origin を既定として組み立てる
         /// ([`http::default_allowed_origins`](crate::transport::http::default_allowed_origins))。
