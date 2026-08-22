@@ -116,20 +116,46 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The directories holding the program's own source, discovered rather than
-/// listed so a new crate joins the check by existing.
+/// The source directory of every workspace member, read from the manifest.
+///
+/// The members list is the workspace's own answer to what this program is, so
+/// a crate added later joins the check by being added to the workspace. An
+/// earlier version walked `grooveseek/src` and `crates/*/src`: the same set
+/// today, and one that would quietly skip a member placed anywhere else --
+/// the shape of mistake this whole file exists to stop.
+///
+/// A member whose `src` is missing -- a glob in `members`, a moved crate --
+/// fails here rather than contributing nothing.
 fn source_dirs() -> Vec<PathBuf> {
     let root = workspace_root();
-    let mut dirs = vec![root.join("grooveseek").join("src")];
-    if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
-        let mut found: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path().join("src"))
-            .filter(|p| p.is_dir())
-            .collect();
-        found.sort();
-        dirs.extend(found);
+    let manifest_path = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", manifest_path.display()));
+    let manifest: toml::Value = toml::from_str(&text)
+        .unwrap_or_else(|e| panic!("could not parse {}: {e}", manifest_path.display()));
+    let members = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|members| members.as_array())
+        .unwrap_or_else(|| panic!("{} declares no workspace members", manifest_path.display()));
+
+    let mut dirs: Vec<PathBuf> = members
+        .iter()
+        .map(|member| {
+            let name = member
+                .as_str()
+                .unwrap_or_else(|| panic!("a workspace member that is not a path: {member}"));
+            root.join(name).join("src")
+        })
+        .collect();
+    for dir in &dirs {
+        assert!(
+            dir.is_dir(),
+            "a workspace member has no src directory, so nothing of it would be checked: {}",
+            dir.display()
+        );
     }
+    dirs.sort();
     dirs
 }
 
