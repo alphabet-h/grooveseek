@@ -25,9 +25,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Two findings, both warnings. `indexed-despite-legacy-ignore` names the indexed
   documents the old file matches that the current rules do not exclude — real
   paths, up to five of them, not a count. `legacy-ignore-not-examined` is what
-  comes out when the file is there and could not be read: **a check that could
-  not run is not a check that found nothing**, and reporting the two the same way
-  is how a clean bill of health stops meaning anything.
+  comes out when the check could not be completed — the file is there and cannot
+  be read, or the filesystem will not say whether it is there at all: **a check
+  that could not run is not a check that found nothing**, and reporting the two
+  the same way is how a clean bill of health stops meaning anything. Its wording
+  claims only that, with what was actually observed carried alongside, because
+  one of those two cases never established that the file exists.
 
   The remedy has three branches, because the destination has three states. With
   the name `.grooveignore` **free**, the fix is a rename. With a working ignore

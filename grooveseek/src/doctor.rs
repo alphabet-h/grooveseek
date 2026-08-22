@@ -286,15 +286,21 @@ pub fn run(
     let rules = crate::exclusion::ExclusionRules::load(kb_path, exclude_dirs.to_vec());
     match crate::legacy::inspect(kb_path, &rules, &all_paths) {
         LegacyIgnore::Absent => {}
+        // The summary does **not** say the old file is there. `CannotSay` also
+        // covers a name the filesystem would not answer for, where presence is
+        // exactly what was not established, and asserting it would be the thing
+        // this group exists to avoid (codex P2 round 6). What is measured in
+        // every case is that the check did not complete; `why` carries what was
+        // actually observed, and distinguishes the cases for a reader.
         LegacyIgnore::CannotSay(why) => findings.push(Finding {
             check: "legacy-ignore-not-examined",
             severity: Severity::Warning,
             summary: format!(
-                "a {} is present but could not be examined, so whether anything it names is \
-                 in the index is not known: {why}",
+                "the {} check could not be completed, so whether anything it names is in \
+                 the index is not known: {why}",
                 crate::legacy::LEGACY_IGNORE_FILE_NAME
             ),
-            // One file, not zero findings. A check that could not run reporting
+            // One name, not zero findings. A check that could not run reporting
             // a count of nothing is how it starts reading as a clean bill.
             count: 1,
             samples: Vec::new(),
@@ -941,6 +947,17 @@ mod tests {
             .expect("the check that could not run must say so");
         assert_eq!(f.severity, Severity::Warning);
         assert_eq!(f.count, 1);
+        // codex P2 round 6: this same finding is produced when the filesystem
+        // will not answer whether the name is taken at all, and the summary is
+        // one string for both. It may claim only what holds in both — that the
+        // check did not complete — with the observation itself left to the
+        // reason it carries.
+        assert!(
+            f.summary.contains("could not be completed"),
+            "the summary states the outcome of the check, not the state of a file it may \
+             not have seen: {}",
+            f.summary
+        );
     }
 
     /// codex round 3 on PR #203, the other half: an old file is not by itself a
