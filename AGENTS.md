@@ -91,6 +91,11 @@ printed by `cargo test` to a developer, not by `groove` to an operator, so it
 is not covered — but it is read on the same console, so keep it ASCII anyway.
 That costs nothing and removes the question.
 
+`grooveseek/tests/diagnostics_stay_ascii.rs` enforces this over every `.rs`
+under `grooveseek/src` and `crates/*/src`, so a review does not have to. What
+it cannot see is a message assembled from pieces rather than written as a
+literal; that still needs reading.
+
 ### One question gets one implementation
 
 When two places answer the same question — is this document servable, does this

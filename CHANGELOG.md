@@ -210,6 +210,27 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **Every word GrooveSeek writes to stderr is ASCII, and a test now says so.**
+  A Japanese Windows console is CP932, where an em dash or a kana arrives as
+  mojibake, so [AGENTS.md](AGENTS.md) has required diagnostics to be ASCII since
+  v0.24.0. Nothing checked it, and review kept finding the same defect one
+  instance at a time.
+
+  **42 messages** contributed characters that console cannot render: the whole
+  of `groove service install` / `uninstall` / `status` on all three platforms,
+  which spoke Japanese and now speaks English; em dashes in `groove tune`'s two
+  notes and two warnings, in three `groove index` PDF refusals, in the two
+  `[parsers].enabled` refusals, in the poisoned-mutex warning and in both
+  PowerShell decoding errors; and the `groove eval` note this began with. Only
+  the wording changed — an error that named a file still names the same file.
+
+  The rule is about **the words a message chooses, not the data it names**, so a
+  note called `日本語のノート.md` still comes out of `groove index` as itself.
+
+  `tests/diagnostics_stay_ascii.rs` walks the workspace source at run time
+  instead of naming files, so a new file is covered by existing rather than by
+  being remembered.
+
 - **The golden query file and the eval history are read with a bound.** Both
   default to living inside the knowledge base and both were read whole with no
   cap — a stray binary on one of those names was parsed as-is. They now go
