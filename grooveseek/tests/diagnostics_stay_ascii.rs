@@ -119,6 +119,12 @@ use std::path::{Path, PathBuf};
 /// its macros cannot appear. A macro this repo defines itself is found by
 /// shape rather than listed -- see [`wrapper_macros`].
 ///
+/// Naming the crate is half the argument: **every entry point of it that takes
+/// text has to be here too**. Listing indicatif's styling methods and not its
+/// message-bearing ones left `bar.println` unguarded directly below the
+/// `eprintln!` it mirrors, which is the asymmetry that makes this easy to get
+/// wrong -- one branch of a `match` checked and the next one not.
+///
 /// `anyhow!` / `bail!` / `ensure!` / `context` are here because `main` prints
 /// an error's body to stderr, so those messages are read on the same console
 /// as the rest. The panic family is here for the same reason one level down:
@@ -156,12 +162,20 @@ const DIAGNOSTIC_OPENERS: &[&str] = &[
     ".expect(",
     ".expect_err(",
     // indicatif draws the `groove index` progress bar to stderr on a TTY, so
-    // the strings that style it are words this program puts on that console
-    // even though no message macro is involved.
+    // every string it is handed is a word this program puts on that console
+    // even though no message macro is involved. Naming the crate is not enough:
+    // its styling entry points were listed and its message-bearing ones were
+    // not, which left `bar.println` and `bar.set_message` unguarded directly
+    // below the `eprintln!` they mirror (codex P2 on PR #213).
     ".progress_chars(",
     ".tick_chars(",
     "with_template(",
     ".template(",
+    ".println(",
+    ".set_message(",
+    ".set_prefix(",
+    ".finish_with_message(",
+    ".abandon_with_message(",
 ];
 
 /// The workspace root. `CARGO_MANIFEST_DIR` is `<root>/grooveseek` since the
