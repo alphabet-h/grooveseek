@@ -6,14 +6,16 @@
 //! other caller. Nothing else imports it.
 //!
 //! [ADR-0007] renamed the project with no aliases and no automatic migration.
-//! A `.kb-mcpignore` left in a knowledge base is therefore not read, and what
-//! it used to keep out comes back into the index on the next run — **except
-//! what the current rules exclude anyway**, which is most of a well-configured
-//! knowledge base and none of the interesting part. Nothing said so.
+//! A `.kb-mcpignore` left in a knowledge base is therefore not read, and
+//! **stops excluding anything at all**. What that costs is a separate question:
+//! two other gates still apply to any path it used to name — the current
+//! exclusion rules, and whether `[parsers].enabled` still opens that extension
+//! — so what comes back is whatever those two admit. Nothing said so.
 //!
-//! That qualification is not decoration. It is the difference between a finding
-//! that names documents and one that names a filename, and [`inspect`] applies
-//! it with `!current.is_excluded(...)` before naming anything.
+//! Which is why [`inspect`] does not reason forward from the old file at all.
+//! It reads the index, and reports the documents that are **in** it and that
+//! `current` does not exclude. Whatever the parser registry dropped is not in
+//! the index to be counted, so it is never claimed.
 //!
 //! # Why it opens the file
 //!
@@ -48,8 +50,15 @@ pub(crate) const LEGACY_IGNORE_FILE_NAME: &str = ".kb-mcpignore";
 pub(crate) enum LegacyIgnore {
     /// There is none. The ordinary case, and there is nothing to say.
     Absent,
-    /// There is one, and it could not be turned into a matcher. Carries the
-    /// operator-facing reason.
+    /// The check did not complete: the name could not be looked at, or what
+    /// holds it could not be turned into a matcher. Carries the
+    /// operator-facing reason, which says which.
+    ///
+    /// **It does not mean a file is there.** One of the two ways to reach it is
+    /// the filesystem declining to say whether anything is at the name at all,
+    /// so a match arm that reads this as "the old file exists" is wrong
+    /// (codex P3 round 8). Everything derived from it — summary, remedy —
+    /// claims only that the check did not complete.
     ///
     /// Distinct from `Read { still_indexed: [] }` on purpose. Reporting a check
     /// that could not run as a check that found nothing is what made a clean
