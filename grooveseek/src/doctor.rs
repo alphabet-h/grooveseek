@@ -313,9 +313,14 @@ pub fn run(
             // Never "delete the old file": a knowledge base whose new file is
             // broken looks the same from here, and that remedy would destroy
             // the only copy of the patterns (codex round 3 on PR #203). Never
-            // "rename it" when a live one is already there either — that
+            // "rename it" when the destination name is occupied either — that
             // overwrites a file in use (round 2).
-            let remedy = if rules.ignore_file_patterns().is_some() {
+            //
+            // Occupancy, **not** `rules.ignore_file_patterns()`: that answers
+            // `None` for a `.grooveignore` which exists and could not be read,
+            // and renaming onto it is exactly as destructive as renaming onto a
+            // working one (codex P2 round 1 on this PR).
+            let remedy = if crate::legacy::live_ignore_name_is_taken(kb_path) {
                 "copy the lines you still want from .kb-mcpignore into .grooveignore, \
                  then run groove index"
             } else {
@@ -740,6 +745,34 @@ mod tests {
         assert!(
             f.remedy.contains("rename"),
             "with nothing to overwrite, renaming is the shortest fix: {}",
+            f.remedy
+        );
+    }
+
+    /// codex P2 round 1 on this PR: `ignore_file_patterns()` answers `None`
+    /// both for "there is no `.grooveignore`" and for "there is one and it
+    /// could not be read", so branching on it sent an operator to `mv` onto an
+    /// occupied name — overwriting their file on Unix, failing on Windows, and
+    /// either way leaving the documents just reported still in the index.
+    ///
+    /// A directory is the cheapest unreadable file, the same fixture the
+    /// `CannotSay` tests use.
+    #[test]
+    fn a_grooveignore_that_exists_but_cannot_be_read_still_blocks_the_rename() {
+        let db = db_with_one_chunk();
+        let kb = LegacyKb::new("occupied");
+        kb.write(".kb-mcpignore", "notes/\n");
+        std::fs::create_dir_all(kb.0.join(".grooveignore")).expect("mkdir");
+
+        let report = kb.report(&db);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "indexed-despite-legacy-ignore")
+            .expect("the finding does not depend on the new file being readable");
+        assert!(
+            !f.remedy.contains("rename"),
+            "the destination name is taken, whether or not what holds it can be read: {}",
             f.remedy
         );
     }

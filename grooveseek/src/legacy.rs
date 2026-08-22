@@ -55,6 +55,26 @@ pub(crate) enum LegacyIgnore {
     Read { still_indexed: Vec<String> },
 }
 
+/// Whether the name `<kb_path>/.grooveignore` already holds something.
+///
+/// **Not** "is there an ignore file in effect".
+/// [`ExclusionRules::ignore_file_patterns`] answers `None` both when there is no
+/// file and when there is one that could not be read — a directory, a hard link,
+/// a symlink, something over the cap; [`ExclusionRules::load`] says so. A remedy
+/// that branched on that would tell an operator to rename onto an occupied name,
+/// which overwrites their file on Unix and fails on Windows, and either way
+/// leaves the documents this module reported still indexed (codex P2 round 1).
+///
+/// This is the question `symlink_metadata` is actually good for. It claims
+/// nothing about what is there — only that a `mv` onto it would not be free —
+/// and nothing built on it here says otherwise.
+pub(crate) fn live_ignore_name_is_taken(kb_path: &Path) -> bool {
+    kb_path
+        .join(crate::exclusion::IGNORE_FILE_NAME)
+        .symlink_metadata()
+        .is_ok()
+}
+
 /// Ask what `<kb_path>/.kb-mcpignore` would still keep out.
 ///
 /// `indexed` is `documents.path` as stored: `kb_path`-relative and
