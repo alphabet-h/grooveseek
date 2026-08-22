@@ -197,6 +197,39 @@ impl ExclusionRules {
             .is_some_and(|gi| gi.matched(rel, is_dir).is_ignore())
     }
 
+    /// Rules made of `bytes` alone, as if they were a `.grooveignore` with no
+    /// `exclude_dirs` behind them.
+    ///
+    /// For [`crate::legacy`], which has to answer what a file that is no longer
+    /// read still matches. Handing back an `ExclusionRules` rather than a bare
+    /// [`Gitignore`] is the whole point: the ancestor walk in
+    /// [`Self::is_excluded`] stays the only implementation of "a file under an
+    /// ignored directory is out", and the module docs above measure why that
+    /// walk cannot be swapped for `matched_path_or_any_parents`.
+    ///
+    /// `None` when the patterns could not be built into a matcher at all. A
+    /// caller must not report that as "nothing matched" — it is the difference
+    /// between a check that ran and a check that could not.
+    ///
+    /// The hardcoded denylist still applies through [`Self::matches`], so these
+    /// rules answer "excluded" for paths no pattern in `bytes` names. That
+    /// cannot reach a caller comparing them against live rules, because the
+    /// denylist is in those too; `crate::legacy` pins it.
+    ///
+    /// Delete this with `crate::legacy`, its only caller.
+    pub(crate) fn ignore_only_from_bytes(
+        kb_path: &Path,
+        source: &Path,
+        bytes: &[u8],
+    ) -> Option<Self> {
+        let (ignore, patterns) = compile(kb_path, source, bytes);
+        ignore.map(|gi| Self {
+            exclude_dirs: Vec::new(),
+            ignore: Some(gi),
+            patterns,
+        })
+    }
+
     /// Whether a `.grooveignore` is in effect, and with how many patterns.
     /// For the one line each entry point logs at startup.
     pub fn ignore_file_patterns(&self) -> Option<usize> {

@@ -16,6 +16,45 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **`groove doctor` says what an old `.kb-mcpignore` left in the index.**
+  [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md) renamed the
+  project with no aliases and no automatic migration, so an ignore file under the
+  old name is not read and stops excluding anything at all. What comes back into
+  the index is whatever the two gates that still apply admit — the current
+  exclusion rules, and whether `[parsers].enabled` opens that extension. Nothing
+  said so.
+
+  Two findings, both warnings. `indexed-despite-legacy-ignore` names the indexed
+  documents the old file matches that the current rules do not exclude — real
+  paths, up to five of them, not a count. `legacy-ignore-not-examined` is what
+  comes out when the check could not be completed — the file is there and cannot
+  be read, or the filesystem will not say whether it is there at all: **a check
+  that could not run is not a check that found nothing**, and reporting the two
+  the same way is how a clean bill of health stops meaning anything. Its wording
+  claims only that, with what was actually observed carried alongside, because
+  one of those two cases never established that the file exists.
+
+  The remedy has three branches, because the destination has three states. With
+  the name `.grooveignore` **free**, the fix is a rename. With a working ignore
+  file there, it is copying over the lines you still want — never an overwrite.
+  And when the name is not free but nothing is being applied from it — a
+  directory, a refused link, a file over the cap, or a name the filesystem would
+  not answer for — the remedy says that and sends you to the destination first,
+  because neither renaming nor copying into it produces an ignore file and the
+  documents just reported would stay indexed either way. No branch asks for a
+  deletion: a knowledge base whose new file is broken looks identical from here,
+  and the old file may be the only copy of the patterns.
+
+  "Free" throughout means the filesystem said so, not that it failed to say
+  otherwise. Whether a name is free, taken, or unanswerable is one three-valued
+  question with one implementation, asked by both the check and the remedy.
+
+  The old file goes through the same `ExclusionRules` the index walk asks, so
+  this is not a second implementation of the exclusion rule; and it is asked
+  about documents that are **in the database**, which is what lets the finding
+  carry paths instead of the observation that a filename exists. **The check is
+  for the migration and is due to be removed in 1.1.0**, in one file.
+
 - **All four front pages open with a banner** — `README.md`, `README.ja.md`,
   and the two `docs/index` pages. It draws what separates this from a plain
   vector store: a semantic path and a lexical path converging on one node, and
