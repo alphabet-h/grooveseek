@@ -96,11 +96,22 @@ SQLite は WAL で開かれ、`busy_timeout` が 30 秒に設定されている 
 **結論に不利な向き**に効いている — 遅い側の方が小さいコーパスで、文書数で 5 倍、
 chunk 数で 5.4 倍の開きがある。
 
-内訳は推論ではなく**対照実験**で分かる。`groove status` は同じ DB・同じ config に
-対して、検索経路がやることを全部やる (プロセス起動、config 探索、DB オープン) —
-**モデルのロードだけをしない**。これが **~35 ms**。つまり CLI の 3 秒のうち
-**約 99% がモデルロード**であり、同じクエリの 2 回目が速くならない
-(3,158 / 3,014 / 3,015 / 3,108 / 3,039 ms) のもこれで説明が付く。
+CLI の 3 秒はどこへ行くのか。3 項のうち 2 項は実測で、残りの 1 項は引き算で出る。
+
+| 項 | ms | その数字の出どころ |
+|---|---:|---|
+| プロセス起動 + config 探索 + DB オープン | ~35 | **実測**。`groove status` が同じ DB・同じ config に対してこれを全部やり、モデルを読まない |
+| クエリの embed + hybrid search + シリアライズ | ~200 | **実測**。上の daemon 行がまさにこの仕事を、モデルをロード済みの状態でやっている。ただし 5 倍大きいコーパスなので、135 文書ならもっと小さいはず |
+| モデルのロード | ~2,900 | **引き算で導いた値**。直接は測っていない |
+
+モデルロードが 1 桁大きい支配項であることは確かだが、**差の全部ではない**。そして
+`groove status` の対照だけではそれを示せない — `status` はモデルも検索も**どちらも
+やらない**ので、~35 ms が意味するのは「ロード以外の全部」ではなく「**他の 2 項の
+どちらでもない部分**」である。
+
+引き算を要しない事実の方はこう: **同じクエリの 2 回目が速くならない**
+(3,158 / 3,014 / 3,015 / 3,108 / 3,039 ms)。3 秒を使っているものが何であれ、
+温まったキャッシュが吸収できるものではない。
 
 **したがって PHP や Node からリクエストごとに CLI を叩く形は成立しない。**
 外部アプリは必ず「既にモデルを握っているプロセス」と話すことになる。
@@ -143,8 +154,44 @@ PHP-FPM のワーカは短命なので子プロセスを抱えられない — �
 
 `/mcp` は **stateless な POST を受ける** — `tools/call` 1 本で、`initialize`
 ハンドシェイクも session id も要らない (MCP 2026-07-28 / SEP-2567)。これが
-「次の瞬間には居ないワーカ」から使える理由。`/ui` 自身がまさにこの形で呼んでおり、
-Streamable HTTP 上の MCP クライアントとして**最小の動く実例**になっている。
+「次の瞬間には居ないワーカ」から使える理由。
+
+ただし **stateless は「素で投げてよい」ではない**。ヘッダ 3 つと `_meta` ブロックが
+プロトコルの要求で、どれか 1 つでも欠けると result は返らない。稼働中の v1.0.0
+サーバで実測すると、`MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` のいずれかを
+落とすと **HTTP 400 + `-32020`**、`_meta` を落とすと **HTTP 400 + `-32602`** になる。
+下のリクエストは result を返す:
+
+```http
+POST /mcp HTTP/1.1
+Host: 127.0.0.1:3100
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: search
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search",
+    "arguments": { "query": "semantic chunking", "limit": 5 },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+応答は (サーバを plain JSON に設定していない限り) `text/event-stream` なので、
+**`result` か `error` を載せた最初の `data:` 行まで読む**。
+
+`/ui` がこれの動く版そのもので (`grooveseek/src/transport/webui_index.html` の
+`callTool`。ストリーム読み取りを含めて 30 行ほど)、リポジトリ内で
+**Streamable HTTP 上の MCP クライアントとして最小の完動例**になっている。
 
 アプリを別コンテナに分けること自体は**できる** — `/mcp` に loopback peer の要求は
 無い。ただしそこからが本当の判断で、**判断の中身は到達性ではない**。

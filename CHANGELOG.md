@@ -30,10 +30,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   records each one, rather than as questions.
 
   The measurements are new: a resident daemon answers a search in about 200 ms
-  where the CLI takes about 3.1 seconds, and a control — `groove status`, which
-  does everything except load a model, in about 35 ms — puts roughly 99% of that
-  gap in the model load rather than in I/O. It also says the thing the internal
-  note did not: residency is not the same as speed. A first query after hours
+  where the CLI takes about 3.1 seconds. The page splits that three seconds into
+  three terms and says which two were measured — process and database setup at
+  about 35 ms, the search itself at about 200 ms — leaving the model load, about
+  2.9 seconds, as the one derived by subtraction. It also says the thing the
+  internal note did not: residency is not the same as speed. A first query after hours
   idle took 4.6 seconds, and a CLI search running alongside the daemon dragged it
   from 200 ms to 2 seconds, which is the page's own "one process, one model"
   warning arriving as latency.

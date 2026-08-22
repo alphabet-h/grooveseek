@@ -100,12 +100,23 @@ Two things look like a guard and are not:
 it runs *against* the conclusion: the slower side is the smaller corpus, by 5×
 the documents and 5.4× the chunks.
 
-The cost decomposes, with a control rather than an inference. `groove status`
-against the same database and config does everything the search path does —
-process start, config discovery, database open — except load a model, and it
-runs in **~35 ms**. So roughly **99% of the CLI's three seconds is model load**,
-which is also why a second identical query does not get faster: repeat runs
-measured 3,158 / 3,014 / 3,015 / 3,108 / 3,039 ms.
+Where do the CLI's three seconds go? Two of the three terms are measured; the
+third is what is left over.
+
+| Term | ms | Where the number comes from |
+|---|---:|---|
+| process start, config discovery, database open | ~35 | **Measured** — `groove status` against the same database and config does all of this and loads no model |
+| embed the query, hybrid search, serialize | ~200 | **Measured** — it is the daemon row above, which does exactly this work with the model already loaded. Over a 5× larger corpus, so on 135 documents it is likely less |
+| load the model | ~2,900 | **Derived by subtraction**, not measured directly |
+
+The model load dominates by an order of magnitude, but it is not the whole gap,
+and the `groove status` control alone cannot establish that it is: `status` skips
+the model *and* the search, so the ~35 ms figure means "neither of the other two
+terms", not "everything except loading".
+
+What does not need subtraction is that a second identical query is no faster —
+3,158 / 3,014 / 3,015 / 3,108 / 3,039 ms for the same query — so whatever costs
+the three seconds is not something a warm cache absorbs.
 
 **Therefore calling the CLI per request, from PHP or Node, does not work.** An
 external application has to talk to a process that is already holding the model.
@@ -152,9 +163,46 @@ a resident daemon instead:
 
 `/mcp` accepts a **stateless POST**: one `tools/call`, with no `initialize`
 handshake and no session id (MCP 2026-07-28, SEP-2567). That is what makes it
-usable from a worker that will not exist a moment later. `/ui` calls it exactly
-that way, and is the smallest working example of an MCP client over Streamable
-HTTP.
+usable from a worker that will not exist a moment later.
+
+Stateless does not mean bare, though. Three headers and a `_meta` block are what
+the protocol requires, and leaving any one of them out is answered with an error
+rather than a result — measured against a running v1.0.0 server: dropping
+`MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` gives **HTTP 400 with
+`-32020`**, and dropping `_meta` gives **HTTP 400 with `-32602`**. The request
+below returns a result:
+
+```http
+POST /mcp HTTP/1.1
+Host: 127.0.0.1:3100
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: search
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search",
+    "arguments": { "query": "semantic chunking", "limit": 5 },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+The reply is `text/event-stream` unless the server was configured for plain
+JSON, so read lines until the first `data:` carrying a `result` or an `error`.
+
+`/ui` is the working version of exactly this — `callTool` in
+`grooveseek/src/transport/webui_index.html`, roughly thirty lines including the
+stream reader — and is the smallest complete MCP client over Streamable HTTP in
+the repository.
 
 Splitting the application into a separate container **does** work — `/mcp` has
 no loopback-peer requirement — but it is where the real decision starts, and the
