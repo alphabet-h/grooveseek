@@ -88,17 +88,22 @@
 //! descriptions are in Japanese -- but that goes to stdout, where the rule
 //! does not reach, and it is a language-policy question rather than this one.
 //!
-//! # Known limits, all of which fail loudly
+//! # Known limits
 //!
-//! A macro written with brackets (`eprintln![..]`) is not recognised as a call
-//! and the paren scan runs past it. A trailing comment carrying non-ASCII on a
-//! code line inside a diagnostic call is reported. Neither can hide a
-//! violation; both produce a failure naming the file.
+//! A message **assembled from pieces** -- a `const` named in a format string, a
+//! `&str` returned by a helper -- has its literal somewhere outside the call,
+//! where nothing here looks. `AGENTS.md` says so where the rule is stated.
 //!
 //! A **raw byte string** (`br"..."`) would be read as an ordinary string, whose
 //! escapes it does not have. Plain `b"..."` is fine -- its escapes are the same
 //! ones, and Rust does not allow a non-ASCII character in it at all. There is
 //! no `br"` in this tree; `b"` appears and is handled.
+//!
+//! Two limits that used to be listed here were wrong rather than known. Macros
+//! written with brackets were said to fail loudly, and they failed silently
+//! (see [`call_end`]). A trailing non-ASCII comment inside a call was said to
+//! be reported, and it is not: comments are masked before anything is read,
+//! which is what the third measured shape was rejected for not doing.
 
 use std::path::{Path, PathBuf};
 
@@ -430,23 +435,37 @@ fn wrapper_macros(masked: &[u8]) -> Vec<String> {
     found
 }
 
-/// Byte just past the paren that closes the call starting at `from`.
+/// Byte just past the delimiter closing the call whose body opens at `from`.
+///
+/// A macro takes any of the three delimiters, and `eprintln![..]` compiles. A
+/// scan that counted only parentheses ended at the first `)` of a nested call
+/// and never saw the literals after it -- `eprintln!["{}", value(), "..."]`
+/// would have its last argument skipped **silently**, which is the one failure
+/// mode this file cannot afford (codex P2 on PR #213).
+///
+/// So the body's own delimiter decides. Anything between the opener and it is
+/// whitespace in code that compiles; if something else is there, the opener was
+/// not a call and the span is empty.
 fn call_end(masked: &[u8], from: usize) -> usize {
-    let mut depth = 0usize;
     let mut i = from;
+    while i < masked.len() && masked[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let (open, close) = match masked.get(i) {
+        Some(b'(') => (b'(', b')'),
+        Some(b'[') => (b'[', b']'),
+        Some(b'{') => (b'{', b'}'),
+        _ => return i,
+    };
+    let mut depth = 0usize;
     while i < masked.len() {
-        match masked[i] {
-            b'(' => depth += 1,
-            b')' => {
-                if depth == 0 {
-                    return i; // the opener was not a call after all
-                }
-                depth -= 1;
-                if depth == 0 {
-                    return i + 1;
-                }
+        if masked[i] == open {
+            depth += 1;
+        } else if masked[i] == close {
+            depth -= 1;
+            if depth == 0 {
+                return i + 1;
             }
-            _ => {}
         }
         i += 1;
     }
