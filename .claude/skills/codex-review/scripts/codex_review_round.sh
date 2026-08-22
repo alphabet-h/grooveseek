@@ -4,16 +4,20 @@
 # convergence with three layers, and print the round's findings.
 #
 # Usage:
-#   codex_review_round.sh <PR#> [per_round_timeout_sec] [trigger_body_file]
+#   codex_review_round.sh <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]
+#     max_rounds             default 3; the round number is derived from the PR's own
+#                            `@codex review` history, so the limit holds across processes
 #     per_round_timeout_sec  default 600 (wall-clock for Phase A + Phase B)
 #     trigger_body_file      re-review body (`@codex review` + fix sketch); omit for round 1
 #
 # Exit codes:
 #   0  round complete - read the `CONVERGED=true|false` line on stdout
+#   2  bad arguments
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
 #   4  codex returned a terminal error body; retry will not help (trap 10 / 56)
 #   5  trigger comment got no reaction = codex never received it (trap 47)
 #   6  trigger POST failed 3 times; do not wait, re-run later (trap 50)
+#   7  round limit reached; nothing was posted (trap 16 / 28)
 #
 # Output contract (AGENTS.md "Results go to stdout, diagnostics to stderr"):
 #   stdout = the review itself (baseline on first invocation, Step 4 summary, Step 5 render)
@@ -26,8 +30,12 @@
 set -u
 
 PR="${1:?PR number required}"
-PER_ROUND_TIMEOUT="${2:-600}"   # 罠 9: wall-clock timeout で stale connector を検知
-TRIGGER_BODY_FILE="${3:-}"
+MAX_ROUNDS="${2:-3}"            # 罠 16: cost-aware (25 credits x round)。/feature-flow は 5 を渡す (罠 28)
+PER_ROUND_TIMEOUT="${3:-600}"   # 罠 9: wall-clock timeout で stale connector を検知
+TRIGGER_BODY_FILE="${4:-}"
+case "$MAX_ROUNDS$PER_ROUND_TIMEOUT" in
+  *[!0-9]*|'') printf 'usage: %s <PR#> [max_rounds] [per_round_timeout_sec] [trigger_body_file]\n' "$0" >&2; exit 2;;
+esac
 QUIET_WINDOW_SEC=180            # 罠 34: 同一 commit への 2 本目を 144 秒後に観測、+ 安全率
 BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
 
@@ -129,7 +137,21 @@ PREV_ISSUES=$(snapshot_issues)
 PRIOR_TRIGGERS=$(gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
   --jq '[.[] | select(.body | startswith("@codex review"))] | length' | jq -s 'add // 0')
 FIRST_INVOCATION=$([ "${PRIOR_TRIGGERS}" = "0" ] && echo true || echo false)
-diag "prior @codex review triggers on this PR: ${PRIOR_TRIGGERS} (first invocation: ${FIRST_INVOCATION})"
+
+# 罠 16 / 罠 28 (codex P2 on PR #222): max_rounds を「宣言」しても、round 数を誰も
+# 持っていなければ上限は効かない — round ごとに別プロセスなので shell 変数には
+# 持てず (罠 51 と同じ理由)、controller の記憶に頼ると 5 round 目を 6 回目として
+# 回しても気付けない。**round 番号も投稿履歴から導く**: この PR に投げた
+# `@codex review` の数 + 1 が今の round。届かなかった trigger (罠 47 の再投稿) も
+# 1 と数える — 安全側に倒し、credit を使わなかった round を 1 つ余らせる方を取る。
+# 上限に達していたら **投稿する前に** 止める (投稿してからでは 1 round 分の credit が消える)。
+ROUND=$(( PRIOR_TRIGGERS + 1 ))
+diag "round ${ROUND}/${MAX_ROUNDS} (prior @codex review triggers on this PR: ${PRIOR_TRIGGERS}, first invocation: ${FIRST_INVOCATION})"
+if [ "$ROUND" -gt "$MAX_ROUNDS" ]; then
+  diag "STOP: round limit reached (${PRIOR_TRIGGERS} trigger(s) already posted, max_rounds=${MAX_ROUNDS}). Nothing was posted."
+  diag "Action: report to the user. Do not re-run with a larger limit on your own."
+  exit 7
+fi
 
 # 罠 51 (PR #178): **PR を開いた直後は baseline に指摘が入っている。** codex は
 # 「Open a pull request for review」でも trigger されるので、ここに来た時点で
@@ -379,7 +401,7 @@ if echo "$LATEST_ISSUE_BODY" | grep -qiE "$SENTINEL_PATTERN"; then
 fi
 
 echo "=== Step 4 summary ==="
-echo "first_invocation=${FIRST_INVOCATION} head=${HEAD_SHA} review_state=${REVIEW_STATE} commit_fresh=${COMMIT_FRESH} state_ok=${STATE_OK}"
+echo "round=${ROUND}/${MAX_ROUNDS} first_invocation=${FIRST_INVOCATION} head=${HEAD_SHA} review_state=${REVIEW_STATE} commit_fresh=${COMMIT_FRESH} state_ok=${STATE_OK}"
 echo "new_inline=$(echo "$NEW_INLINE" | jq 'length') new_reviews=$(echo "$NEW_REVIEWS" | jq 'length') new_issues=$(echo "$NEW_ISSUES" | jq 'length') round_empty=${ROUND_EMPTY}"
 echo "P0P1=${P0_P1_TAGS_PRESENT} P2=${P2_TAGS_PRESENT} P3=${P3_TAGS_PRESENT} sentinel=${SENTINEL_MATCH}"
 
