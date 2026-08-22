@@ -189,7 +189,7 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     wdiag!(
                                         "watcher: event channel full (capacity {WATCHER_CHANNEL_CAPACITY}); \
-                                         dropping batch — handle_events is too slow or blocked. \
+                                         dropping batch. handle_events is too slow or blocked. \
                                          Consider increasing groove resources or running rebuild_index manually."
                                     );
                                 }

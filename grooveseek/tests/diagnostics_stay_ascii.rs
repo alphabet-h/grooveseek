@@ -13,6 +13,10 @@
 //! reads string literals and never the values interpolated into them. A note
 //! called `<Japanese>.md` coming out of `groove index` is normal operation.
 //!
+//! What a literal *contains* is not what it *emits*: `eprintln!("\u{2014}")` is
+//! ASCII in the file and an em dash on the console, so escapes are resolved
+//! before a literal is accepted.
+//!
 //! # Why this shape
 //!
 //! Three shapes were measured against the tree before one was picked.
@@ -41,6 +45,16 @@
 //! scanning this directory would make the guard match the opener list below in
 //! its own source, a bug this repo has already shipped once (feature-51, cited
 //! at `watcher.rs`'s sibling guard).
+//!
+//! # Local wrappers
+//!
+//! A `macro_rules!` that expands into a diagnostic carries its words at the
+//! call sites rather than in its body, so listing only the standard macros
+//! checks the wrapper's one-line body and none of the messages. `watcher.rs`'s
+//! `wdiag!` is one, with some two dozen call sites. They are found by shape --
+//! a macro whose body reaches a known opener -- so the next wrapper is covered
+//! without anyone remembering. Adding that pass found an em dash the enumerated
+//! openers had missed.
 //!
 //! # Known limits, all of which fail loudly
 //!
@@ -257,6 +271,79 @@ fn mask_comments_and_strings(src: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
     (masked, literals)
 }
 
+/// A source file read once: how to name it in a failure, its text, the masked
+/// copy, and the byte range of every string literal in it.
+struct Scanned {
+    shown: String,
+    src: String,
+    masked: Vec<u8>,
+    literals: Vec<(usize, usize)>,
+}
+
+/// Byte just past the brace that closes the block starting at or after `from`.
+fn brace_end(masked: &[u8], from: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < masked.len() {
+        match masked[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    masked.len()
+}
+
+/// Local macros that expand into a diagnostic.
+///
+/// Such a macro carries its words at the **call sites**, not in the body, so
+/// listing only the standard macros checks the wrapper's own one-line body and
+/// none of the messages. `watcher.rs`'s `wdiag!` is the one that exists today
+/// and it has some two dozen call sites; the first version of this test looked
+/// at none of them.
+///
+/// Finding them by shape — a `macro_rules!` whose body reaches a known opener —
+/// means the next wrapper is covered by existing rather than by being added
+/// here. One level deep is enough for this tree; a wrapper of a wrapper is not
+/// recognised.
+fn wrapper_macros(masked: &[u8]) -> Vec<String> {
+    const DECL: &[u8] = b"macro_rules!";
+    let mut found = Vec::new();
+    for at in occurrences(masked, DECL) {
+        let mut i = at + DECL.len();
+        while i < masked.len() && masked[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < masked.len() && (masked[i].is_ascii_alphanumeric() || masked[i] == b'_') {
+            i += 1;
+        }
+        let Ok(name) = std::str::from_utf8(&masked[start..i]) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let body = &masked[i..brace_end(masked, i)];
+        if DIAGNOSTIC_OPENERS
+            .iter()
+            .any(|opener| !occurrences(body, opener.as_bytes()).is_empty())
+        {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
 /// Byte just past the paren that closes the call starting at `from`.
 fn call_end(masked: &[u8], from: usize) -> usize {
     let mut depth = 0usize;
@@ -292,10 +379,52 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// The characters a message contributes that a CP932 console cannot render,
-/// rendered so this failure is itself readable there.
+/// The non-ASCII characters a literal actually puts on the console.
+///
+/// Reading the source spelling is not enough: `eprintln!("\u{2014}")` is nine
+/// ASCII characters in the file and an em dash on the console, so a guard that
+/// only looks at the source accepts exactly the output it promises to reject
+/// (codex P2 on PR #213).
+///
+/// `\u{...}` is the only escape that can do this. Rust caps `\x` at `0x7F`
+/// inside a string literal, every other escape stands for an ASCII character,
+/// and a raw string has no escapes at all -- which is why a raw literal, whose
+/// span starts at its `r`, is read verbatim.
 fn offending_characters(literal: &str) -> String {
-    let mut seen: Vec<char> = literal.chars().filter(|c| !c.is_ascii()).collect();
+    let mut seen: Vec<char> = Vec::new();
+    if literal.starts_with('r') {
+        seen.extend(literal.chars().filter(|c| !c.is_ascii()));
+    } else {
+        let mut chars = literal.chars().peekable();
+        while let Some(c) = chars.next() {
+            if !c.is_ascii() {
+                seen.push(c);
+                continue;
+            }
+            if c != '\\' {
+                continue;
+            }
+            // Any escape consumes the character after the backslash. Only
+            // `\u{...}` can stand for something outside ASCII.
+            if chars.next() != Some('u') || chars.peek() != Some(&'{') {
+                continue;
+            }
+            chars.next();
+            let mut hex = String::new();
+            for h in chars.by_ref() {
+                if h == '}' {
+                    break;
+                }
+                hex.push(h);
+            }
+            // An unparseable escape would not compile, so this cannot hide one.
+            if let Ok(point) = u32::from_str_radix(&hex, 16)
+                && point > 127
+            {
+                seen.push(char::from_u32(point).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+        }
+    }
     seen.sort_unstable();
     seen.dedup();
     seen.iter().flat_map(|c| c.escape_default()).collect()
@@ -305,14 +434,15 @@ fn offending_characters(literal: &str) -> String {
 fn every_word_groove_writes_to_stderr_is_ascii() {
     let root = workspace_root();
     let mut offenders: Vec<String> = Vec::new();
-    let mut files = 0usize;
     let mut calls = 0usize;
 
+    // Read and mask every file once, because the wrapper pass below has to see
+    // the whole tree before the checking pass can start.
+    let mut scanned: Vec<Scanned> = Vec::new();
     for dir in source_dirs() {
         let mut paths = Vec::new();
         rust_files(&dir, &mut paths);
         for path in paths {
-            files += 1;
             let src = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
                 .replace("\r\n", "\n");
@@ -323,37 +453,63 @@ fn every_word_groove_writes_to_stderr_is_ascii() {
                 .display()
                 .to_string()
                 .replace('\\', "/");
+            scanned.push(Scanned {
+                shown,
+                src,
+                masked,
+                literals,
+            });
+        }
+    }
 
-            for opener in DIAGNOSTIC_OPENERS {
-                let macro_call = !opener.ends_with('(');
-                for at in occurrences(&masked, opener.as_bytes()) {
-                    if macro_call && preceded_by_ident(&masked, at) {
-                        continue; // `some_warn!`, not `warn!`
+    let mut openers: Vec<String> = DIAGNOSTIC_OPENERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for file in &scanned {
+        for name in wrapper_macros(&file.masked) {
+            let call = format!("{name}!");
+            if !openers.contains(&call) {
+                openers.push(call);
+            }
+        }
+    }
+
+    for Scanned {
+        shown,
+        src,
+        masked,
+        literals,
+    } in &scanned
+    {
+        for opener in &openers {
+            let macro_call = !opener.ends_with('(');
+            for at in occurrences(masked, opener.as_bytes()) {
+                if macro_call && preceded_by_ident(masked, at) {
+                    continue; // `some_warn!`, not `warn!`
+                }
+                calls += 1;
+                // A macro opener stops at `!`, so the scan looks ahead for
+                // the paren; `.context(` already sits on one.
+                let scan_from = if macro_call {
+                    at + opener.len()
+                } else {
+                    at + opener.len() - 1
+                };
+                let end = call_end(masked, scan_from);
+                for (start, stop) in literals.iter().copied() {
+                    if start < at || stop > end {
+                        continue;
                     }
-                    calls += 1;
-                    // A macro opener stops at `!`, so the scan looks ahead for
-                    // the paren; `.context(` already sits on one.
-                    let scan_from = if macro_call {
-                        at + opener.len()
-                    } else {
-                        at + opener.len() - 1
-                    };
-                    let end = call_end(&masked, scan_from);
-                    for (start, stop) in literals.iter().copied() {
-                        if start < at || stop > end {
-                            continue;
-                        }
-                        let text = &src[start..stop];
-                        if text.is_ascii() {
-                            continue;
-                        }
-                        let line = src[..start].matches('\n').count() + 1;
-                        offenders.push(format!(
-                            "{shown}:{line}: {} carries {}",
-                            opener,
-                            offending_characters(text)
-                        ));
+                    // Not `text.is_ascii()`: a literal can be ASCII in the file
+                    // and not on the console. `offending_characters` resolves
+                    // `\u{...}` before answering.
+                    let carried = offending_characters(&src[start..stop]);
+                    if carried.is_empty() {
+                        continue;
                     }
+                    let line = src[..start].matches('\n').count() + 1;
+                    offenders.push(format!("{shown}:{line}: {opener} carries {carried}"));
                 }
             }
         }
@@ -362,13 +518,21 @@ fn every_word_groove_writes_to_stderr_is_ascii() {
     // A walk that finds nothing passes, so say what was walked. Moving the
     // source tree must break this test rather than quietly satisfy it.
     assert!(
-        files > 0,
+        !scanned.is_empty(),
         "no source files were walked under {}",
         root.display()
     );
     assert!(
         calls > 0,
-        "no diagnostic calls were found in {files} source file(s)"
+        "no diagnostic calls were found in {} source file(s)",
+        scanned.len()
+    );
+    // The wrapper pass is the difference between checking two dozen watcher
+    // messages and checking none of them, and it fails silently if the shape it
+    // looks for stops matching.
+    assert!(
+        openers.len() > DIAGNOSTIC_OPENERS.len(),
+        "no local macro expanding into a diagnostic was found; this tree has one"
     );
 
     offenders.sort();
