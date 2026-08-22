@@ -213,7 +213,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **Every word GrooveSeek writes to stderr is ASCII, and a test now says so.**
   A Japanese Windows console is CP932, where an em dash or a kana arrives as
   mojibake, so [AGENTS.md](AGENTS.md) has required diagnostics to be ASCII since
-  v0.24.0. Nothing checked it, and review kept finding the same defect one
+  v0.25.0. Nothing checked it, and review kept finding the same defect one
   instance at a time.
 
   **43 messages** contributed characters that console cannot render: the whole
