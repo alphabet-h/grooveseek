@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Thirteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
+description: Fourteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -268,6 +268,34 @@ PYTHONIOENCODING=utf-8 python verify.py > out.txt     # 書く側
 
 出典: 2026-08-17 PR #175 (README を docs/ へ分割)。詳細は
 `.dev/knowledge/readme-split-link-surface.md`
+
+## 14. PowerShell 5.1 の `ConvertFrom-Json` は JSON 配列を **1 オブジェクト**として流す (filter が黙って素通り)
+
+**症状**: `gh run list --json event | ConvertFrom-Json | Where-Object { $_.event -eq "push" }` が
+push 以外も含む**全行**を返す。エラーも警告も出ないので、出力を目で見ない限り気付かない。
+
+**原因**: Windows PowerShell 5.1 の `ConvertFrom-Json` は JSON 配列を `Object[]` **1 個**として
+pipeline に出す (展開しない)。`Where-Object` の `$_` は配列そのものになり、`$_.event -eq "push"` は
+member enumeration で `@('push')` (= truthy) を返すので配列ごと通る。PowerShell 7 は展開する
+(`-NoEnumerate` が opt-out) ので、7 の知識で書くと 5.1 で黙って壊れる。罠 7 の `"` 問題を
+避けるために `--jq` から `ConvertFrom-Json` へ逃げた先で踏む。
+
+**正しいやり方**: 括弧で囲んで展開する。
+
+```powershell
+(gh run list --json event | ConvertFrom-Json) | Where-Object { $_.event -eq "push" }
+# または: ... | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { ... }
+```
+
+実測 (2026-08-23、PS 5.1.26100): `'[{"a":1},{"a":2},{"a":3}]' | ConvertFrom-Json | Measure-Object` →
+Count **1**、括弧つき → **3**。
+
+**補足**: `~/.claude/hooks/shell_trap_guard.py` の R10 が `--jq '…"…'` を deny して勧める代替形が
+まさにこの形だったので、reason に括弧を書き足した。**deny の reason が勧める代替形も、出荷前に
+1 度は実機で出力を見る**。
+
+出典: 2026-08-23 B6 smoke (hook deny 化の検証中、通過した代替形の出力が filter されていなかった)。
+詳細は `.dev/knowledge/shell-trap-guard-deny-rollout.md`
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
