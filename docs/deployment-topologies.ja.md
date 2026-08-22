@@ -6,8 +6,8 @@ GrooveSeek をどの形で走らせるか、常駐が実際に何を買ってい
 > **English version**: [deployment-topologies.md](./deployment-topologies.md)
 
 以下はすべて **v1.0.0** に対して 2026-08-22 に、1 台の Windows マシンで実測した。
-数値を挙げた箇所には、それを出したコマンドも併記してある (自分のハードウェアで
-反証できるように)。コードは**行番号ではなくファイル名と関数名**で引く —
+実行したコマンドは末尾の[数値の取り方](#数値の取り方)にまとめてあるので、
+自分のハードウェアで反証できる。コードは**行番号ではなくファイル名と関数名**で引く —
 このページの前身は行番号で引いており、**5 日で全部が嘘になった**。
 
 ## プロセスの形は 2 つ、そして 1 プロセスは必ずどちらか一方
@@ -49,10 +49,22 @@ fallthrough は無く、その分岐のコメント自身が「2 つの arm は�
 ```
 
 複数クライアントが 1 つのロード済みモデルと 1 つの索引を共有する。この形にだけ
-上限が 2 つ掛かる: 同時 session が最大 `DEFAULT_MAX_SESSIONS` (**256**)、
-リクエスト body が最大 `REQUEST_BODY_MAX_BYTES` (**1 MiB**)。body 上限に
-axum の `DefaultBodyLimit` ではなく `tower_http` の層を使うのは、前者が
-**自分で body を読むサービス**に効かないため — `rmcp` がまさにそれ。
+上限が 2 つ掛かる。
+
+**リクエスト body は最大 1 MiB** (`REQUEST_BODY_MAX_BYTES`)。axum の
+`DefaultBodyLimit` ではなく `tower_http` の層を使うのは、前者が**自分で body を
+読むサービス**に効かないため — `rmcp` がまさにそれ。
+
+**session 上限は既定 256** (`DEFAULT_MAX_SESSIONS`)。`[transport.http].max_sessions`
+で変更でき、**`0` は無制限**。上限に達している間、**新規**の session を開こうとする
+要求だけが 429 で断られる (既存 session は影響を受けない)。**この数字で容量設計を
+する前に読み方を確かめること** — 数えているのは **request ではなく session、しかも
+実際に作られる session だけ**である。`/mcp` の前段 gate が見るのは session を開きに
+来た要求だけ (POST で、`Mcp-Session-Id` を持たず、body が単一の `initialize`)。
+**MCP 2026-07-28 は session そのものを廃止した**ので、その版のクライアントが
+`tools/call` を直接呼ぶ限り session は作られず、席も取らない。つまりこの上限が
+縛るのは**古い stateful なクライアント**であって、下の PHP 節で勧めている
+stateless な形は**そもそも対象外**である。
 
 ### どちらの形でも成り立つ 3 つ
 
@@ -232,6 +244,13 @@ loopback origin が既定になる。`Origin` ヘッダを持たないリクエ�
 **外に出せる唯一の口が、誰も認証しない口である。**
 
 `/ui` と `/api/admin/status` は peer 検査で閉じている — これは呼び出し側が偽造できない。
+**ただしリバースプロキシは「peer そのものになる」ことで偽造してしまう。** 同一ホストの
+proxy は自身が loopback の呼び出し元であり、既定の `Host` も admin の allow-list に
+載っているので、**`/ui` を proxy 経由で公開すると、その proxy に届く誰にでもページを
+渡す**ことになる。peer 検査がこの 2 経路を守るのはネットワークからであって、
+**前に置いたものからではない**。**`/mcp` と `/healthz` だけを通すこと** —
+[clients.ja.md](clients.ja.md) の proxy レシピの節にも同じことが書いてある。
+
 `/mcp` は**検証されている** (`Host` と `Origin` を、GrooveSeek 自身の gate が、
 session gate より外側で。しかも置き換え前のライブラリより **5 つの不正な `Host` 綴りに
 対して厳しい**)。ただし peer を見ないので、**ポートに到達できて `Host: localhost` を
@@ -255,6 +274,39 @@ loopback 以外への bind を許すのは、コンテナがそうせざるを�
 | `Origin` を検証するか | **する。既定で有効** (v0.27.0)。さらに v1.0.0 で `Host` と `Origin` の両方をライブラリから取り上げ、全経路について GrooveSeek 自身が答えるようにした。[ADR-0009](decisions/0009-one-dns-rebinding-gate.ja.md) |
 | `/api/*` を公開 API に格上げするか | **しない — `/api/search` は凍結ではなく削除**した (v0.27.0)。`search` の 17 パラメータのうち 2 つ、6 tool のうち 1 つしか通しておらず、`/mcp` の方が既に優れていた。`/api/admin/status` は tray が polling するので**意図的に unstable のまま**残す。[ADR-0008](decisions/0008-declare-what-1-0-freezes.ja.md) |
 | `/ui` の位置づけ | **運用者が自分のサーバを覗く窓**。そして **1.x のうちに引退させる**予定 — `/mcp` を十分に話すクライアントが出てきた時点で。1.0 の凍結対象から外してあることが、それを minor リリースで済ませられる理由。[stability.ja.md](stability.ja.md) |
+
+## 数値の取り方
+
+Windows マシン 1 台、GrooveSeek v1.0.0、両側とも `bge-m3`、どちらも reranker 未設定。
+`<kb>` は自分のナレッジベースに読み替えること。
+
+**CLI 行** — プロセス全体を外から計測し、繰り返す:
+
+```bash
+groove search "semantic chunking" --kb-path <kb> --config <kb-config>
+```
+
+計測はシェル組み込みではなく**プロセスの外側**で取る。Windows PowerShell では
+ネイティブコマンドの stderr をリダイレクトすると、成功した実行が
+`NativeCommandError` になって計測ループごと止まるので、
+`System.Diagnostics.Process` で回す。
+
+**対照** — 同じ準備をして、モデルだけ読まない:
+
+```bash
+groove status --kb-path <kb> --config <kb-config>
+```
+
+**daemon 行** — [上](#php-アプリ)に全文を載せた `/mcp` リクエストを、既に 1 回以上
+応答している daemon に対して投げる。コーパスの規模は CLI 側が `groove status`、
+daemon 側が `/api/admin/status` から取った。
+
+**2 つの外れ値は意図的に作った。** 4,616 ms は **2.3 時間 idle させた** daemon への
+初回クエリ。~2,000 ms は、別のナレッジベースに対して `groove search` を**並走させ
+ながら**測った `/mcp` で、~180 ms への復帰はそのプロセスが終了した直後に測った。
+
+**CLI 行と daemon 行は別バッチで測ること。** 交互に測ると 2 つ目の外れ値が起き、
+比が ~15 倍から ~1.6 倍に潰れる。
 
 ## 関連
 

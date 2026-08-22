@@ -6,10 +6,11 @@ same-host boundary comes from — which is not one place, but three.
 > **日本語版**: [deployment-topologies.ja.md](./deployment-topologies.ja.md)
 
 Everything below was measured against **v1.0.0** on 2026-08-22, on one Windows
-machine. Where a number is quoted, the command that produced it is quoted too,
-so you can disagree with it on your own hardware. Code is cited by file and
-function name rather than by line number: an earlier version of this page cited
-lines, and every one of them was wrong within five days.
+machine, and the commands are in
+[How the numbers were taken](#how-the-numbers-were-taken) at the end so you can
+disagree with them on your own hardware. Code is cited by file and function name
+rather than by line number: an earlier version of this page cited lines, and
+every one of them was wrong within five days.
 
 ## Two process shapes, and a process is only ever one of them
 
@@ -51,10 +52,23 @@ never become questions at all.
 ```
 
 Many clients share one loaded model and one index. Two bounds apply here and
-nowhere else: at most `DEFAULT_MAX_SESSIONS` (256) concurrent sessions, and a
-request body of at most `REQUEST_BODY_MAX_BYTES` (1 MiB). The body cap is a
-`tower_http` layer rather than axum's `DefaultBodyLimit`, because the latter
-does not reach a service that reads its own body — which `rmcp` does.
+nowhere else.
+
+**A request body of at most 1 MiB** (`REQUEST_BODY_MAX_BYTES`). This is a
+`tower_http` layer rather than axum's `DefaultBodyLimit`, because the latter does
+not reach a service that reads its own body — which `rmcp` does.
+
+**A session cap, defaulting to 256** (`DEFAULT_MAX_SESSIONS`), settable through
+`[transport.http].max_sessions`, where `0` means unlimited. While the cap is
+reached, a request that would open a *new* session is refused with 429; existing
+sessions are untouched. Read it carefully before planning capacity around it:
+it counts **sessions, not requests, and only sessions that actually get
+created**. The gate in front of `/mcp` looks solely at requests arriving to open
+one — a POST, carrying no `Mcp-Session-Id`, whose body is a single `initialize`.
+MCP 2026-07-28 removed sessions altogether, so a client of that protocol calling
+`tools/call` directly never creates one and never occupies a seat. The cap
+therefore bounds older, stateful clients; the stateless shape recommended for a
+PHP application below is not subject to it at all.
 
 ### Three things that hold in both shapes
 
@@ -246,7 +260,14 @@ are unaffected. Setting the key *replaces* the default rather than extending it.
 **The one route you can expose is the one that does not authenticate anyone.**
 
 `/ui` and `/api/admin/status` are closed by the peer check, which a caller cannot
-forge. `/mcp` is validated — on `Host` and on `Origin`, by GrooveSeek's own gate,
+forge — **but a reverse proxy forges it for them, by being the peer.** A proxy on
+the same host is itself a loopback caller, and its default `Host` is on the
+admin allow-list, so mapping `/ui` through it hands the page to anyone who can
+reach the proxy. The peer check protects those two routes from the network, not
+from something you put in front of them. **Forward `/mcp` and `/healthz` only**;
+[clients.md](clients.md) says the same where the proxy recipes are.
+
+`/mcp` is validated — on `Host` and on `Origin`, by GrooveSeek's own gate,
 ahead of the session gate, and it is *stricter* than the library it replaced for
 five malformed `Host` spellings — but it has no peer check, so a caller who
 reaches the port and sends `Host: localhost` passes. `--bind` to a non-loopback
@@ -271,6 +292,41 @@ consequence of them.
 | Validate `Origin`? | **Yes, on by default** (v0.27.0), and in v1.0.0 GrooveSeek took both `Host` and `Origin` away from the library and answers them itself for every route. [ADR-0009](decisions/0009-one-dns-rebinding-gate.md) |
 | Promote `/api/*` to a public API? | **No — `/api/search` was removed** in v0.27.0 rather than frozen. It passed 2 of `search`'s 17 parameters, and 1 tool of 6; `/mcp` was already better at the job. `/api/admin/status` stays, deliberately unstable, because the tray polls it. [ADR-0008](decisions/0008-declare-what-1-0-freezes.md) |
 | What is `/ui` for? | **An operator's window onto their own server** — and one scheduled to go away during 1.x, once a client that speaks `/mcp` well enough exists. Keeping it outside the 1.0 freeze is what makes that a minor release. [stability.md](stability.md) |
+
+## How the numbers were taken
+
+One Windows machine, GrooveSeek v1.0.0, `bge-m3` on both sides, no reranker
+configured on either. Substitute your own knowledge base for `<kb>`.
+
+**The CLI row** — wall clock around the whole process, repeated:
+
+```bash
+groove search "semantic chunking" --kb-path <kb> --config <kb-config>
+```
+
+Time it from outside the process rather than with a shell builtin; on Windows
+PowerShell, redirecting a native command's stderr turns a successful run into a
+`NativeCommandError` and aborts a timing loop, so drive it through
+`System.Diagnostics.Process`.
+
+**The control** — the same setup work with no model:
+
+```bash
+groove status --kb-path <kb> --config <kb-config>
+```
+
+**The daemon row** — the `/mcp` request printed in full
+[above](#a-php-application), against a daemon that has already answered at least
+one query. Corpus sizes came from `groove status` for the CLI side and
+`/api/admin/status` for the daemon side.
+
+**The two outliers** were produced deliberately. The 4,616 ms figure is the first
+query sent to a daemon left idle for 2.3 hours. The ~2,000 ms figure is `/mcp`
+timed while a `groove search` runs concurrently against a different knowledge
+base, with the ~180 ms recovery measured immediately after that process exits.
+
+**Measure the CLI and daemon rows in separate batches.** Interleaving them is
+what produces the second outlier, and it collapses the ratio from ~15× to ~1.6×.
 
 ## Related
 
