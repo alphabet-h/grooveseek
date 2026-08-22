@@ -9,15 +9,16 @@
 //!
 //! The reason is CP932: a Japanese Windows console renders an em dash, an
 //! arrow or a kana as mojibake. `AGENTS.md` is precise about what that covers
-//! -- "the words a diagnostic chooses, not the data it names" -- so this scan
-//! reads string literals and never the values interpolated into them. A note
-//! called `<Japanese>.md` coming out of `groove index` is normal operation.
+//! -- "the words a diagnostic chooses, not the data it names" -- and the line
+//! that draws is **written here or came from somewhere else**. What is spelled
+//! out in the call is the author's choice and is checked, whatever slot it sits
+//! in: `eprintln!("{}", '-')` chose that character as surely as the words
+//! around it. What arrives at runtime is data and is not: a note called
+//! `<Japanese>.md` coming out of `groove index` is normal operation.
 //!
-//! What a literal *contains* is not what it *emits*: `eprintln!("\u{2014}")` is
-//! ASCII in the file and an em dash on the console, so escapes are resolved
-//! before a literal is accepted. A **char** literal inside a diagnostic is
-//! checked the same way, because a character interpolated from `'...'` is one
-//! the author chose just as much as a word in the message around it.
+//! What a literal *contains* is not what it *emits*, either.
+//! `eprintln!("\u{2014}")` is ASCII in the file and an em dash on the console,
+//! so escapes are resolved before a literal is accepted.
 //!
 //! # Why this shape
 //!
@@ -48,17 +49,17 @@
 //! its own source, a bug this repo has already shipped once (feature-51, cited
 //! at `watcher.rs`'s sibling guard).
 //!
-//! The **panic family** (`panic!`, `.expect(`, `unreachable!`) is not an opener,
-//! and that boundary was measured rather than assumed: across 614 call sites in
-//! this tree, two carry a non-ASCII character and both are inside `#[test]`
-//! functions. Excluding the family hides nothing today. A production panic does
-//! reach stderr, so this is a boundary to revisit, not a law.
+//! **`assert!` is the one family that cannot be guarded this way.** Of 2921
+//! call sites here, 255 carry non-ASCII -- and nearly all of it is the *data
+//! under test*: Japanese headings, half-width kana, a Korean phrase, the CJK
+//! strings the tokenizer exists to split. A scan cannot tell those from an em
+//! dash in the message beside them, which is the distinction the whole rule
+//! rests on. `AGENTS.md` puts a failing assertion outside the rule anyway,
+//! since `cargo test` prints it to a developer.
 //!
-//! **`assert!` cannot be guarded this way at all.** Of 2921 call sites, 255
-//! carry non-ASCII -- and nearly all of it is the *data under test*: Japanese
-//! headings, half-width kana, a Korean phrase, the CJK strings the tokenizer
-//! exists to split. A scan cannot tell those from an em dash in the message
-//! beside them, which is the distinction the whole rule rests on.
+//! The panic family is not like that, which is why it *is* an opener: across
+//! 614 call sites, two carried a non-ASCII character and both were messages
+//! rather than data.
 //!
 //! # Local wrappers
 //!
@@ -88,7 +89,10 @@ use std::path::{Path, PathBuf};
 ///
 /// `anyhow!` / `bail!` / `ensure!` / `context` are here because `main` prints
 /// an error's body to stderr, so those messages are read on the same console
-/// as the rest. `println!` is absent on purpose: stdout is a result.
+/// as the rest. The panic family is here for the same reason one level down:
+/// Rust's default hook writes the payload of a `panic!` or an `.expect(...)`
+/// to stderr, and a panic in a shipped binary is read by an operator.
+/// `println!` is absent on purpose: stdout is a result.
 ///
 /// The `tracing` levels are listed bare so that `tracing::warn!` and a
 /// `use tracing::warn;` shorthand are both caught by one entry.
@@ -103,8 +107,14 @@ const DIAGNOSTIC_OPENERS: &[&str] = &[
     "anyhow!",
     "bail!",
     "ensure!",
+    "panic!",
+    "unreachable!",
+    "todo!",
+    "unimplemented!",
     ".context(",
     ".with_context(",
+    ".expect(",
+    ".expect_err(",
 ];
 
 /// The workspace root. `CARGO_MANIFEST_DIR` is `<root>/grooveseek` since the

@@ -2338,7 +2338,7 @@ mod naming_surface {
             ])
             .unwrap_or_else(|e| {
                 panic!(
-                    "`groove graph --seed-strategy {}` must parse — it is in \
+                    "`groove graph --seed-strategy {}` must parse: it is in \
                      SeedStrategy::SPELLINGS, so the tool accepts it: {e}",
                     spelling.text
                 )
@@ -2349,7 +2349,7 @@ mod naming_surface {
                     "{} must mean the same strategy on both surfaces",
                     spelling.text
                 ),
-                _ => panic!("`groove graph …` must parse as the graph subcommand"),
+                _ => panic!("`groove graph ...` must parse as the graph subcommand"),
             }
         }
     }
