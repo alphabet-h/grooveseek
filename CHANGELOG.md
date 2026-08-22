@@ -30,14 +30,19 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is how a clean bill of health stops meaning anything.
 
   The remedy has three branches, because the destination has three states. With
-  the name `.grooveignore` free, the fix is a rename. With a working ignore file
-  there, it is copying over the lines you still want — never an overwrite. And
-  when something holds the name but is **not being read** — a directory, a
-  refused link, a file over the cap — the remedy says so and sends you there
-  first, because neither renaming nor copying into that produces an ignore file,
-  and the documents just reported would stay indexed either way. No branch asks
-  for a deletion: a knowledge base whose new file is broken looks identical from
-  here, and the old file may be the only copy of the patterns.
+  the name `.grooveignore` **free**, the fix is a rename. With a working ignore
+  file there, it is copying over the lines you still want — never an overwrite.
+  And when the name is not free but nothing is being applied from it — a
+  directory, a refused link, a file over the cap, or a name the filesystem would
+  not answer for — the remedy says that and sends you to the destination first,
+  because neither renaming nor copying into it produces an ignore file and the
+  documents just reported would stay indexed either way. No branch asks for a
+  deletion: a knowledge base whose new file is broken looks identical from here,
+  and the old file may be the only copy of the patterns.
+
+  "Free" throughout means the filesystem said so, not that it failed to say
+  otherwise. Whether a name is free, taken, or unanswerable is one three-valued
+  question with one implementation, asked by both the check and the remedy.
 
   The old file goes through the same `ExclusionRules` the index walk asks, so
   this is not a second implementation of the exclusion rule; and it is asked

@@ -55,24 +55,52 @@ pub(crate) enum LegacyIgnore {
     Read { still_indexed: Vec<String> },
 }
 
-/// Whether the name `<kb_path>/.grooveignore` already holds something.
+/// Whether a name is free, holds something, or cannot be answered for.
+///
+/// **Three values, because the question has three answers.** A `bool` here
+/// collapses "nothing is there" with "could not look", which is the distinction
+/// this whole module exists to keep — and it was collapsed twice before this
+/// type existed: once deciding [`LegacyIgnore::Absent`] and once choosing a
+/// remedy (codex P2 rounds 4 and 5).
+#[derive(Debug)]
+pub(crate) enum Occupancy {
+    /// Nothing is at the name.
+    Free,
+    /// Something is, whatever it turns out to be.
+    Taken,
+    /// The filesystem would not say — an ACL denial, a volume that went away.
+    /// Carries the operator-facing reason.
+    Unknown(String),
+}
+
+/// Ask a single name which of the three it is.
+///
+/// `symlink_metadata` rather than `metadata`, because it must not follow a
+/// symlink: a dangling one occupies its name exactly as much as a file does.
+/// Only `NotFound` means free; every other error means the answer is not known.
+///
+/// **One implementation, two callers** ([`inspect`] and the remedy branch in
+/// [`crate::doctor`]), as `AGENTS.md` requires of a question asked twice.
+pub(crate) fn occupancy(path: &Path) -> Occupancy {
+    match path.symlink_metadata() {
+        Ok(_) => Occupancy::Taken,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Occupancy::Free,
+        Err(e) => Occupancy::Unknown(format!("{} could not be looked at: {e}", path.display())),
+    }
+}
+
+/// What the name a live `.grooveignore` would occupy currently holds.
+///
+/// Asked by the remedy branch, which must not send an operator to `mv` onto a
+/// name that is taken — that overwrites their file on Unix and fails on Windows
+/// — nor onto one the filesystem would not answer for (codex P2 rounds 1 and 5).
 ///
 /// **Not** "is there an ignore file in effect".
 /// [`ExclusionRules::ignore_file_patterns`] answers `None` both when there is no
-/// file and when there is one that could not be read — a directory, a hard link,
-/// a symlink, something over the cap; [`ExclusionRules::load`] says so. A remedy
-/// that branched on that would tell an operator to rename onto an occupied name,
-/// which overwrites their file on Unix and fails on Windows, and either way
-/// leaves the documents this module reported still indexed (codex P2 round 1).
-///
-/// This is the question `symlink_metadata` is actually good for. It claims
-/// nothing about what is there — only that a `mv` onto it would not be free —
-/// and nothing built on it here says otherwise.
-pub(crate) fn live_ignore_name_is_taken(kb_path: &Path) -> bool {
-    kb_path
-        .join(crate::exclusion::IGNORE_FILE_NAME)
-        .symlink_metadata()
-        .is_ok()
+/// file and when there is one that could not be read; [`ExclusionRules::load`]
+/// says so. The two questions are separate and the remedy reads both.
+pub(crate) fn live_ignore_name(kb_path: &Path) -> Occupancy {
+    occupancy(&kb_path.join(crate::exclusion::IGNORE_FILE_NAME))
 }
 
 /// Ask what `<kb_path>/.kb-mcpignore` would still keep out.
@@ -105,12 +133,14 @@ pub(crate) fn inspect(
     // could have carried the hole alone. Asking here removes the difference
     // rather than special-casing it.
     //
-    // A file deleted between these two calls lands in `CannotSay` rather than
-    // `Absent`. That is the safe direction: "could not say" about a file that
-    // is gone costs a line, "found nothing" about a file that is there is the
-    // failure this whole module exists to avoid.
-    if path.symlink_metadata().is_err() {
-        return LegacyIgnore::Absent;
+    // A file deleted between this call and the read lands in `CannotSay` rather
+    // than `Absent`. That is the safe direction: "could not say" about a file
+    // that is gone costs a line, "found nothing" about a file that is there is
+    // the failure this whole module exists to avoid.
+    match occupancy(&path) {
+        Occupancy::Free => return LegacyIgnore::Absent,
+        Occupancy::Unknown(why) => return LegacyIgnore::CannotSay(why),
+        Occupancy::Taken => {}
     }
 
     let bytes = match crate::links::read_checked(&path, MAX_IGNORE_FILE_BYTES) {
@@ -268,6 +298,34 @@ mod tests {
                 panic!("a file the read guard refuses must not be reported as read, got {other:?}")
             }
         }
+    }
+
+    /// The two answers a test can construct, from the one function both callers
+    /// now ask (`AGENTS.md`: one question, one implementation).
+    ///
+    /// **`Unknown` is not here.** Producing it needs the filesystem to refuse a
+    /// `symlink_metadata` for a reason other than absence — an ACL denial, a
+    /// volume going away — which a test cannot arrange without privileges the
+    /// runners do not have. What it protects is stated in the type's own docs:
+    /// neither caller may read "could not look" as "free".
+    #[test]
+    fn a_name_is_free_until_something_is_at_it() {
+        let kb = TempKb::new("occupancy");
+        let path = kb.0.join(LEGACY_IGNORE_FILE_NAME);
+        assert!(
+            matches!(occupancy(&path), Occupancy::Free),
+            "nothing has been written yet"
+        );
+
+        kb.write_legacy("drafts/\n");
+        assert!(matches!(occupancy(&path), Occupancy::Taken));
+
+        std::fs::remove_file(&path).expect("rm");
+        std::fs::create_dir_all(&path).expect("mkdir");
+        assert!(
+            matches!(occupancy(&path), Occupancy::Taken),
+            "a directory holds the name as firmly as a file does"
+        );
     }
 
     /// `Absent` means the name is free. Nothing that occupies it may answer

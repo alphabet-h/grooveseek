@@ -324,28 +324,38 @@ pub fn run(
             // Whether it is *in effect* comes from the rules, because copying
             // lines into a directory or through a refused link does not produce
             // an ignore file either, and the documents stay indexed (round 2).
-            let remedy = match (
-                crate::legacy::live_ignore_name_is_taken(kb_path),
-                rules.ignore_file_patterns().is_some(),
-            ) {
+            //
+            // "Free" and not merely "not taken": the filesystem can also
+            // decline to answer, and a rename onto a name nobody could look at
+            // is the same gamble as a rename onto an occupied one (codex P2
+            // round 5). `Occupancy` carries that third value so neither caller
+            // has to remember it.
+            let destination_free = matches!(
+                crate::legacy::live_ignore_name(kb_path),
+                crate::legacy::Occupancy::Free
+            );
+            let remedy = match (destination_free, rules.ignore_file_patterns().is_some()) {
                 // The name is free. Nothing to lose, so the shortest fix works.
-                (false, _) => "rename .kb-mcpignore to .grooveignore, then run groove index",
+                (true, _) => "rename .kb-mcpignore to .grooveignore, then run groove index",
                 // A working ignore file is there. Merge, never overwrite.
-                (true, true) => concat!(
+                (false, true) => concat!(
                     "copy the lines you still want from .kb-mcpignore into .grooveignore, ",
                     "then run groove index"
                 ),
-                // Occupied and not in effect. This one branch is reached for
-                // every reason `links::read_checked` refuses — a directory, an
-                // extra hard link, a symlink, a file over the cap — so its
-                // wording must not name one of them: "make it a plain readable
-                // file" is a step already done for a file that is merely too
-                // big (codex P2 round 3). State the condition to reach, not the
-                // repair to perform, and it stays true for reasons added later.
-                (true, false) => concat!(
-                    "something is at .grooveignore that groove will not read: make that name ",
-                    "hold an ignore file groove accepts, then move the lines you still want ",
-                    "there and run groove index"
+                // Not free, and nothing in effect. This one branch is reached
+                // for every reason `links::read_checked` refuses — a directory,
+                // an extra hard link, a symlink, a file over the cap — and also
+                // when the name could not be looked at, so its wording must
+                // claim neither a reason nor that anything is there. "Make it a
+                // plain readable file" is a step already done for a file that
+                // is merely too big (codex P2 round 3). It states the one thing
+                // measured in all of them — no `.grooveignore` is being applied
+                // — and the condition to reach, which stays true for refusal
+                // reasons added later.
+                (false, false) => concat!(
+                    "groove is applying no .grooveignore here: make that name hold an ignore ",
+                    "file groove accepts, then move the lines you still want there and run ",
+                    "groove index"
                 ),
             };
             findings.extend(finding(
@@ -802,7 +812,7 @@ mod tests {
         // so the documents named in this very finding would stay indexed. The
         // remedy has to send the operator at the destination first.
         assert!(
-            f.remedy.contains("will not read"),
+            f.remedy.contains("applying no .grooveignore"),
             "a remedy that merges into an unreadable destination cannot work, so it has \
              to name that first: {}",
             f.remedy
@@ -854,7 +864,7 @@ mod tests {
         // Equality alone would pass with both falling into the merge branch,
         // which is the bug this is about. Pin the branch first.
         assert!(
-            oversized.contains("will not read"),
+            oversized.contains("applying no .grooveignore"),
             "over the cap is a refusal like any other: {oversized}"
         );
         assert_eq!(
