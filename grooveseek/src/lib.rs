@@ -19,6 +19,9 @@ pub mod graph;
 /// Drawing the connection graph (E-3): DOT for Graphviz, and standalone SVG.
 pub mod graph_render;
 pub mod indexer;
+/// The name this project stopped reading, and what it still costs (audit L-4).
+/// Internal, and **due for removal in 1.1.0** — see the module docs.
+pub(crate) mod legacy;
 /// Hard-link detection for the index / watcher / `get_document` guards (BU-20).
 pub(crate) mod links;
 pub mod markdown;
