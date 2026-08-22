@@ -46,6 +46,18 @@
 //! its own source, a bug this repo has already shipped once (feature-51, cited
 //! at `watcher.rs`'s sibling guard).
 //!
+//! The **panic family** (`panic!`, `.expect(`, `unreachable!`) is not an opener,
+//! and that boundary was measured rather than assumed: across 614 call sites in
+//! this tree, two carry a non-ASCII character and both are inside `#[test]`
+//! functions. Excluding the family hides nothing today. A production panic does
+//! reach stderr, so this is a boundary to revisit, not a law.
+//!
+//! **`assert!` cannot be guarded this way at all.** Of 2921 call sites, 255
+//! carry non-ASCII -- and nearly all of it is the *data under test*: Japanese
+//! headings, half-width kana, a Korean phrase, the CJK strings the tokenizer
+//! exists to split. A scan cannot tell those from an em dash in the message
+//! beside them, which is the distinction the whole rule rests on.
+//!
 //! # Local wrappers
 //!
 //! A `macro_rules!` that expands into a diagnostic carries its words at the
