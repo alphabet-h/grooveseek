@@ -147,22 +147,27 @@ cycle 完了時に必ず:
 
 これらは git untracked (`.dev/`) なので commit には乗らない (= subagent prompt で必ず明示する)。
 
-## Context overflow への備え (handoff 自動生成)
+## handoff と session の区切り
 
-Phase 5 / Phase 6 の途中で context が 80% を超えそうな兆候を検知したら:
+**Phase 7 で PR が merge されたら session を閉じる** (例外として、Phase 5 / Phase 6 の途中で
+context が逼迫したときも同じ手順)。`/compact` で続けない — 1 session 1 回まで
+(根拠: `.dev/knowledge/mistakes-repeat-session-length-ungated-rules-duplicated-facts.md`):
 
-1. **handoff doc を即時 write**: `.dev/knowledge/<feature-NN>-handoff.md`
+1. **handoff doc を即時 write**: `.dev/knowledge/session-<YYYY-MM-DD>-<topic>-handoff.md`
    - 現状の git state (`git log --oneline -5`)
    - 完了済 phase / 進行中 phase / 未着手 phase
    - 重要な constraint / pattern (`CLAUDE.local.md` 規約、subagent prompt の `.dev/` untracked 注意、codex review loop 規約)
    - 次セッションでの開始手順 (5-7 step に細分化)
    - オープン論点 / 注意
-   - 完了基準 chekclist
-2. ユーザに通知: `context が逼迫してきたので、handoff を <path> に書きました。/compact を打って、新 session で「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
+   - 完了基準 checklist
+   - background task leak の確認 (`run_in_background` の polling が残っていないか)
+2. `git -C .dev add -A && git -C .dev commit -F <msgfile> && git -C .dev push`
+3. ユーザに通知: `handoff を <path> に書き、.dev を push しました。この session を閉じて、新 session で「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
 
-ユーザが `/compact` を打って新 session が始まったら、SessionStart 通知を起点に handoff doc を読んで再開する (= layer 3 の hook 化を入れない場合の手動運用)。
+新 session が始まったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
-handoff doc の生成テンプレは `.dev/knowledge/feature-28-pr-4-handoff.md` を参考にする。
+handoff doc の型は `.dev/knowledge/session-2026-08-22-handoff-after-stderr-ascii.md` (★次にやること /
+main の状態 (実測) / 残っているもの / 測って分かったこと / 環境の罠 / 台帳 / 起票済み)。
 
 ## 介入ポイント以外でユーザを巻き込まない原則
 
@@ -190,7 +195,7 @@ handoff doc の生成テンプレは `.dev/knowledge/feature-28-pr-4-handoff.md`
 | `.dev/specs/<feature>.md` | 新規 (毎回) | spec ドキュメント (git untracked) |
 | `.dev/plans/<feature>.md` | 新規 (毎回) | 実装 plan (git untracked) |
 | `.dev/knowledge/<feature>-summary.md` | 新規 (毎回) | 振り返り + 工程ノート (git untracked) |
-| `.dev/knowledge/<feature>-handoff.md` | 必要時 | context overflow 時の申し送り (git untracked) |
+| `.dev/knowledge/session-<date>-<topic>-handoff.md` | merge ごと | session を閉じる前の申し送り (git untracked) |
 | `CHANGELOG.md` | 更新 | release 時に `[Unreleased]` → `[X.Y.Z]` |
 | `Cargo.toml` + `Cargo.lock` | 更新 | release 時 version bump |
 | README.md / docs/* | 更新 | リリース前ドキュメント同期チェックリストに従う |
