@@ -335,12 +335,17 @@ pub fn run(
                     "copy the lines you still want from .kb-mcpignore into .grooveignore, ",
                     "then run groove index"
                 ),
-                // Occupied and not in effect. Say that, rather than name a step
-                // that cannot succeed against whatever is holding the name.
+                // Occupied and not in effect. This one branch is reached for
+                // every reason `links::read_checked` refuses — a directory, an
+                // extra hard link, a symlink, a file over the cap — so its
+                // wording must not name one of them: "make it a plain readable
+                // file" is a step already done for a file that is merely too
+                // big (codex P2 round 3). State the condition to reach, not the
+                // repair to perform, and it stays true for reasons added later.
                 (true, false) => concat!(
-                    "something is at .grooveignore and is not being read: make it a plain ",
-                    "readable file first, then move the lines you still want there and run ",
-                    "groove index"
+                    "something is at .grooveignore that groove will not read: make that name ",
+                    "hold an ignore file groove accepts, then move the lines you still want ",
+                    "there and run groove index"
                 ),
             };
             findings.extend(finding(
@@ -797,10 +802,70 @@ mod tests {
         // so the documents named in this very finding would stay indexed. The
         // remedy has to send the operator at the destination first.
         assert!(
-            f.remedy.contains("is not being read"),
+            f.remedy.contains("will not read"),
             "a remedy that merges into an unreadable destination cannot work, so it has \
              to name that first: {}",
             f.remedy
+        );
+    }
+
+    /// codex P2 round 3: the repair branch is reached for every reason the read
+    /// guard refuses, so its wording cannot name one of them. A `.grooveignore`
+    /// over the cap is already a plain file and already readable — being told to
+    /// make it those things is a step that is already done.
+    ///
+    /// Asserting the two destinations get the *same* remedy is the point: one
+    /// branch, one wording, correct for reasons this test does not enumerate.
+    #[test]
+    fn every_destination_the_read_guard_refuses_gets_the_one_repair_remedy() {
+        let db = db_with_one_chunk();
+
+        let dir = LegacyKb::new("refused-dir");
+        dir.write(".kb-mcpignore", "notes/\n");
+        std::fs::create_dir_all(dir.0.join(".grooveignore")).expect("mkdir");
+
+        let big = LegacyKb::new("refused-size");
+        big.write(".kb-mcpignore", "notes/\n");
+        big.write(
+            ".grooveignore",
+            &"# padding\n".repeat(
+                (crate::exclusion::MAX_IGNORE_FILE_BYTES as usize / "# padding\n".len()) + 2,
+            ),
+        );
+        assert!(
+            std::fs::metadata(big.0.join(".grooveignore"))
+                .expect("stat")
+                .len()
+                > crate::exclusion::MAX_IGNORE_FILE_BYTES,
+            "the fixture has to be over the cap for this test to be about anything"
+        );
+
+        let remedy_of = |kb: &LegacyKb| -> String {
+            kb.report(&db)
+                .findings
+                .iter()
+                .find(|f| f.check == "indexed-despite-legacy-ignore")
+                .expect("reported whatever holds the destination")
+                .remedy
+                .to_string()
+        };
+
+        let oversized = remedy_of(&big);
+        // Equality alone would pass with both falling into the merge branch,
+        // which is the bug this is about. Pin the branch first.
+        assert!(
+            oversized.contains("will not read"),
+            "over the cap is a refusal like any other: {oversized}"
+        );
+        assert_eq!(
+            oversized,
+            remedy_of(&dir),
+            "one branch covers every refusal, so it says one thing"
+        );
+        assert!(
+            !oversized.contains("readable") && !oversized.contains("plain"),
+            "this file is already both; naming an attribute it has is a step already \
+             done: {oversized}"
         );
     }
 
