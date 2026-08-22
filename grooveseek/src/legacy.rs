@@ -92,12 +92,32 @@ pub(crate) fn inspect(
     indexed: &[String],
 ) -> LegacyIgnore {
     let path = kb_path.join(LEGACY_IGNORE_FILE_NAME);
+
+    // Occupancy decides `Absent`, and it is asked **first**, so that every
+    // other outcome below is either `Read` or `CannotSay`.
+    //
+    // Deriving `Absent` from a `NotFound` out of the read instead is wrong on
+    // Windows: `File::open` follows a symlink, so a `.kb-mcpignore` pointing at
+    // a target that has been deleted answers `NotFound` for a name that is very
+    // much occupied — and this module would then report nothing found for a
+    // check it never got to run (codex P2 round 4). Unix refuses the same file
+    // as a symlink and reaches `CannotSay` anyway, which is how one platform
+    // could have carried the hole alone. Asking here removes the difference
+    // rather than special-casing it.
+    //
+    // A file deleted between these two calls lands in `CannotSay` rather than
+    // `Absent`. That is the safe direction: "could not say" about a file that
+    // is gone costs a line, "found nothing" about a file that is there is the
+    // failure this whole module exists to avoid.
+    if path.symlink_metadata().is_err() {
+        return LegacyIgnore::Absent;
+    }
+
     let bytes = match crate::links::read_checked(&path, MAX_IGNORE_FILE_BYTES) {
         Ok(crate::links::Content::Bytes(b)) => b,
         // The same guard the live file goes through, so a hard link or a
         // symlink is refused here for the reason it is refused there.
         Ok(crate::links::Content::Refused(r)) => return LegacyIgnore::CannotSay(r.log_line(&path)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LegacyIgnore::Absent,
         Err(e) => {
             return LegacyIgnore::CannotSay(format!("{} could not be read: {e}", path.display()));
         }
@@ -247,6 +267,46 @@ mod tests {
             other => {
                 panic!("a file the read guard refuses must not be reported as read, got {other:?}")
             }
+        }
+    }
+
+    /// `Absent` means the name is free. Nothing that occupies it may answer
+    /// `Absent`, whatever the read of it does.
+    ///
+    /// codex P2 round 4 found the way that broke: on Windows `File::open`
+    /// follows a symlink, so a `.kb-mcpignore` whose target has been deleted
+    /// answers `NotFound` — and deriving `Absent` from that read error reported
+    /// nothing found for a check that never ran. `inspect` now asks occupancy
+    /// first, so the read's error kind cannot decide `Absent` at all.
+    ///
+    /// **That specific file is not in this table**, and saying so is the point:
+    /// creating a symlink here needs administrator rights or Developer Mode —
+    /// measured, `New-Item -ItemType SymbolicLink` answers "Administrator
+    /// privilege required" on this machine — and the CI runners are no
+    /// different. The case is closed by construction rather than by a fixture,
+    /// and this pins the invariant that closing it was for.
+    #[test]
+    fn nothing_that_occupies_the_name_is_ever_reported_absent() {
+        let plain = TempKb::new("occupied-plain");
+        plain.write_legacy("drafts/\n");
+
+        let dir = TempKb::new("occupied-dir");
+        std::fs::create_dir_all(dir.0.join(LEGACY_IGNORE_FILE_NAME)).expect("mkdir");
+
+        let linked = TempKb::new("occupied-link");
+        let elsewhere = linked.0.join("source.txt");
+        std::fs::write(&elsewhere, "drafts/\n").expect("write source");
+        std::fs::hard_link(&elsewhere, linked.0.join(LEGACY_IGNORE_FILE_NAME))
+            .expect("hard links need no privilege");
+
+        let indexed = vec!["notes/keep.md".to_string()];
+        for kb in [&plain, &dir, &linked] {
+            let rules = live(kb, &[]);
+            assert!(
+                !matches!(inspect(&kb.0, &rules, &indexed), LegacyIgnore::Absent),
+                "{} holds the name, so the answer cannot be that there is none",
+                kb.0.display()
+            );
         }
     }
 
