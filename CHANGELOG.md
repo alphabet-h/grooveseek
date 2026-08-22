@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-22
+
 ### Added
 
 - **`groove doctor` says what an old `.kb-mcpignore` left in the index.**
@@ -185,6 +187,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   page fails there rather than loading. Both headers are attached outside the
   two gates, so refusals carry them too.
 
+- **`h2` was updated 0.4.13 → 0.4.18 to clear RUSTSEC-2026-0258.** It is a
+  transitive dependency, reached through `hyper` — and so through `axum`, which
+  the HTTP transport is built on — and through `reqwest`, which the model
+  downloader uses. No GrooveSeek code calls it directly.
+
 ### Removed
 
 - **`groove validate --strict` is gone.** It was accepted and discarded — the
@@ -209,6 +216,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   now rather than during 1.x.
 
 ### Fixed
+
+- **`groove service install` on macOS reports an error instead of panicking.**
+  Two `unwrap()` calls in the LaunchAgent backend. Neither is reachable on a
+  normal system — `plist_path` always returns a path under
+  `~/Library/LaunchAgents`, and a home directory is normally UTF-8 — but
+  `install()` returns a `Result` and its caller already handles one, so a panic
+  was the wrong way to say either had gone wrong.
 
 - **Every word GrooveSeek writes to stderr is ASCII, and a test now says so.**
   A Japanese Windows console is CP932, where an em dash or a kana arrives as
@@ -371,6 +385,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `groove.toml.example`; it was the last shipped example still in Japanese.
 
 ### Internal
+
+- **`server.rs` became four files.** The search half is `server/search.rs`,
+  document reading is `server/documents.rs`, and the corpus side of the `kb://`
+  resource surface is `server/kb_uri.rs`. What stayed behind is the tool surface
+  itself — the `#[tool_router]` / `#[tool_handler]` impls, the parameter and
+  response types, and `mod tests`.
+
+  No behaviour change: the bodies moved byte-identical and in the order they
+  were already in. The only thing that changed was visibility, and only where
+  the parent still calls or names something — each `pub(super)` was named by
+  `cargo check` after a move that widened nothing, rather than chosen in
+  advance.
 
 - **The eval golden has five questions with two right answers, and the quality
   gate stopped averaging them together with the other twenty-five.** No
@@ -4385,7 +4411,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/alphabet-h/grooveseek/compare/v0.27.0...v1.0.0
 [0.27.0]: https://github.com/alphabet-h/grooveseek/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/alphabet-h/grooveseek/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/alphabet-h/grooveseek/compare/v0.24.0...v0.25.0
