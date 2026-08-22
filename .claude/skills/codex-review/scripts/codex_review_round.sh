@@ -18,6 +18,7 @@
 #   5  trigger comment got no reaction = codex never received it (trap 47)
 #   6  trigger POST failed 3 times; do not wait, re-run later (trap 50)
 #   7  round limit reached; nothing was posted (trap 16 / 28)
+#   8  could not read the PR before posting (gh api failed); nothing was posted
 #
 # Output contract (AGENTS.md "Results go to stdout, diagnostics to stderr"):
 #   stdout = the review itself (baseline on first invocation, Step 4 summary, Step 5 render)
@@ -27,7 +28,12 @@
 # guards it. The numbers refer to .dev/knowledge/codex-review-loop-pitfalls.md.
 # To list them:  grep -oE '罠 [0-9]+' "$0" | sort -u
 # The count is deliberately not written anywhere: a copied number rots.
-set -u
+#
+# pipefail: every snapshot is `gh api ... | jq -s ...`. Without it a failed
+# `gh api` leaves jq with empty input, jq prints `[]` / `0`, and the pipeline
+# "succeeds" with a baseline that says the PR is empty (codex P2 round 2 on
+# PR #222). With it the callers below can `|| abort_unreadable`.
+set -u -o pipefail
 
 PR="${1:?PR number required}"
 MAX_ROUNDS="${2:-3}"            # 罠 16: cost-aware (25 credits x round)。/feature-flow は 5 を渡す (罠 28)
@@ -44,12 +50,25 @@ BOT="chatgpt-codex-connector[bot]"   # 罠 11: login 完全一致で filter
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel) || exit 1
 cd "$REPO_DIR" || exit 1
-OWNER_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 
 # 進捗と警告は stderr、ASCII のみ (罠 52: AGENTS.md "Results go to stdout,
 # diagnostics to stderr"、および CP932 コンソールでの mojibake 回避)。この script の
 # *結果* は review の中身なので、それだけが stdout に出る。
 diag() { printf '%s\n' "$*" >&2; }
+
+# 投稿 *前* の読み取り (repo 名 / baseline / trigger 履歴) が失敗したら、投稿せずに
+# 止める。読めなかった結果を「空」として先へ進むと、baseline が空 = 既存の指摘が全部
+# 「この round の新規」に見え、trigger 履歴が 0 = round 1 と誤認して max_rounds を
+# 素通りする (codex P2 round 2 on PR #222)。polling 中の一時失敗はここでは扱わない —
+# そちらは罠 48 の二重確認が吸収する (投稿後に abort すると 1 round 分の credit が消える)。
+# top level から呼ぶこと: `$( )` の中では `exit` がサブシェルしか終わらせない (罠 54)。
+abort_unreadable() {
+  diag "ABORT: could not read $1 (gh api failed). Nothing was posted."
+  diag "Action: check gh auth status / rate limit, then re-run."
+  exit 8
+}
+
+OWNER_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || abort_unreadable "the repository name"
 
 # ---- snapshot helpers ----
 # 罠 8: per_page=30 で saturate するので `--paginate` + `?per_page=100`。
@@ -118,9 +137,9 @@ post_trigger() {   # $@ = gh pr comment の body 指定 (--body / --body-file)
 # trigger を先に投げてから baseline を取ると、baseline 時点で既に response が
 # 含まれており、Phase A の diff 判定が永久に false → wall-clock timeout。
 # **baseline は trigger 投稿 *前* に取る** (round 2 以降も順序は同じ)。
-PREV_INLINE=$(snapshot_inline)
-PREV_REVIEWS=$(snapshot_reviews)
-PREV_ISSUES=$(snapshot_issues)
+PREV_INLINE=$(snapshot_inline) || abort_unreadable "the inline-comment baseline"
+PREV_REVIEWS=$(snapshot_reviews) || abort_unreadable "the review baseline"
+PREV_ISSUES=$(snapshot_issues) || abort_unreadable "the issue-comment baseline"
 
 # 罠 51: 「今が初回か」を知る必要がある。round 1 の baseline は「PR を開いた時の
 # 自動レビュー」で controller は未読、round 2 以降の baseline は前 round の内容で
@@ -134,8 +153,11 @@ PREV_ISSUES=$(snapshot_issues)
 # **投稿履歴から判定する**: この PR に `@codex review` をまだ 1 度も投げていない
 # なら初回。状態を持たずに決まり、途中から実行しても正しい。
 # 罠 31: `--paginate --jq` は page ごとに出るので外側で足す。
-PRIOR_TRIGGERS=$(gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
-  --jq '[.[] | select(.body | startswith("@codex review"))] | length' | jq -s 'add // 0')
+# 読めなかった履歴を `add // 0` で 0 にしない — 取得と集計を分け、取得の失敗で止める
+# (codex P2 round 2 on PR #222: 失敗 = 0 = round 1 で、上限を素通りして投稿していた)。
+TRIGGER_HISTORY=$(gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
+  --jq '[.[] | select(.body | startswith("@codex review"))] | length') || abort_unreadable "the trigger history"
+PRIOR_TRIGGERS=$(printf '%s\n' "$TRIGGER_HISTORY" | jq -s 'add // 0')
 FIRST_INVOCATION=$([ "${PRIOR_TRIGGERS}" = "0" ] && echo true || echo false)
 
 # 罠 16 / 罠 28 (codex P2 on PR #222): max_rounds を「宣言」しても、round 数を誰も
