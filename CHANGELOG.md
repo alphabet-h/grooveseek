@@ -29,10 +29,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   not run is not a check that found nothing**, and reporting the two the same way
   is how a clean bill of health stops meaning anything.
 
-  The remedy branches on what is already in place. With no live `.grooveignore`
-  it is a rename; with one, it is copying over the lines you still want, because
-  a remedy that overwrites a file in use is worse than no remedy. Neither branch
-  asks for a deletion — a knowledge base whose new file is broken looks identical
+  The remedy branches on whether the name `.grooveignore` is free. If it is, the
+  fix is a rename; if anything holds it — a working ignore file, or one that
+  cannot be read — the fix is copying over the lines you still want, because a
+  remedy that overwrites a file in use is worse than no remedy. Neither branch
+  asks for a deletion: a knowledge base whose new file is broken looks identical
   from here, and the old file may be the only copy of the patterns.
 
   The old file goes through the same `ExclusionRules` the index walk asks, so
