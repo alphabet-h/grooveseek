@@ -111,9 +111,9 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
-3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/commands/codex-review.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。本 skill が以下を 1 step で固定化:
+3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。本 skill が以下を 1 step で固定化:
    - `@codex review` mention で codex trigger
-   - `pulls/<N>/comments` (inline) + `issues/<N>/comments` (top-level) + `pulls/<N>/reviews` (review body) の 3 endpoint を **count-base で同時 polling** (= `submitted_at` / `created_at` の時刻比較を avoid、bash quirks 回避)
+   - `pulls/<N>/comments` (inline) + `issues/<N>/comments` (top-level) + `pulls/<N>/reviews` (review body) の 3 endpoint を **`(id, updated_at)` set diff で同時 polling** (罠 13: count では edit / deletion を見落とす)。実体は `scripts/codex_review_round.sh` 1 本
    - 5 round 上限で auto break (CLAUDE.local.md guardrail と整合)
    - 結果 fetch + 整形して controller に提示 (= top-level summary + inline P1/P2 detail + review body)
 4. controller (= main agent) が `/codex-review` の出力を判定:
@@ -130,7 +130,7 @@ review 取り込み時の判断はすべて controller (= main agent) が行い�
 - 取り込みが「Phase 3 で承認した spec の前提を覆す」内容なら user に確認
 - 5 round 経過した時点で必ず user に状況を投げ、続行 / 妥協 / scope 縮小を判断してもらう
 
-参照: `.claude/commands/codex-review.md` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠カテゴリ蓄積、罠 7 = last-writer-wins まで記録済)
+参照: `.claude/skills/codex-review/SKILL.md` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠カテゴリ蓄積、罠 7 = last-writer-wins まで記録済)
 
 ### Phase 7 — CHANGELOG / version bump / tag (該当 PR が release worthy な場合のみ)
 
@@ -222,7 +222,7 @@ main の状態 (実測) / 残っているもの / 測って分かったこと / 
 - `CLAUDE.md` の「リリース前チェックリスト」 (= Phase 7 の docs sync 元)
 - `CLAUDE.local.md` の「開発フロー」節 (= 本 command の常時 guardrail)
 - `.claude/commands/full-audit.md` (Phase 7 で起動判断)
-- `.claude/commands/codex-review.md` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke)
+- `.claude/skills/codex-review/SKILL.md` + `scripts/codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke)
 - `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference、罠 1-7 蓄積)
 - `.dev/knowledge/index-progress-buffering-pitfall.md` (background bash の罠 reference)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` (orchestrate される 3 skill)
