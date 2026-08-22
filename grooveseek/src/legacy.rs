@@ -199,6 +199,37 @@ mod tests {
         }
     }
 
+    /// The other way for the read to be refused, and the reason there are two
+    /// tests here rather than one.
+    ///
+    /// The directory above takes a different route on each platform — Unix opens
+    /// it and finds a non-file, Windows refuses the open outright — so it only
+    /// ever exercises one of the two arms that answer `CannotSay`, and which one
+    /// depends on where the suite is running. **Measured**, by making each arm
+    /// answer `Absent` in turn: silencing the refusal left the directory test
+    /// green on Windows. A hard link is refused as a refusal on both, which is
+    /// what closes that half.
+    #[test]
+    fn a_hard_linked_old_file_is_refused_rather_than_read() {
+        let kb = TempKb::new("hardlink");
+        let elsewhere = kb.0.join("source.txt");
+        std::fs::write(&elsewhere, "drafts/\n").expect("write source");
+        std::fs::hard_link(&elsewhere, kb.0.join(LEGACY_IGNORE_FILE_NAME))
+            .expect("hard links need no privilege");
+
+        let rules = live(&kb, &[]);
+        let indexed = vec!["drafts/wip.md".to_string()];
+        match inspect(&kb.0, &rules, &indexed) {
+            LegacyIgnore::CannotSay(why) => assert!(
+                why.contains(LEGACY_IGNORE_FILE_NAME),
+                "the reason has to name the file it is about, got: {why}"
+            ),
+            other => panic!(
+                "a file the read guard refuses must not be reported as read, got {other:?}"
+            ),
+        }
+    }
+
     /// The old file names plenty this knowledge base has never held. Only what
     /// is in the index is reported, because only that was measured.
     #[test]
