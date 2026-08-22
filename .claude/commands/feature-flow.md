@@ -4,7 +4,8 @@ description: ブレスト → 仕様 → plan → 実装 → PR → codex review
 
 # /feature-flow
 
-新 feature の着想から release tag までを **同 session 内で完結** させるオーケストレータ。各フェーズ間の subagent self-review / codex review / handoff 生成を自動で回し、ユーザを「設計判断」だけに集中させる。
+新 feature の着想から release tag までを進めるオーケストレータ。**session の単位は PR 1 つ** —
+Phase 6 で merge したら session を閉じ、次の PR は新 session で始める (「handoff と session の区切り」節)。各フェーズ間の subagent self-review / codex review / handoff 生成を自動で回し、ユーザを「設計判断」だけに集中させる。
 
 ## 想定起動タイミング
 
@@ -21,6 +22,10 @@ description: ブレスト → 仕様 → plan → 実装 → PR → codex review
 - subagent type: `feature-dev:code-reviewer` / `feature-dev:code-architect` / `general-purpose` / `superpowers:code-reviewer` が available
 - GitHub CLI (`gh`) が認証済 (`gh auth status` で確認可)
 - `@codex review` 経由で chatgpt-codex-connector が動く (PR repo 側で設定済)
+- `.dev/` が **それ自体の private repository** として初期化済 (`git -C .dev rev-parse --show-toplevel` が
+  `/.dev` で終わる)。root repo は `.dev/` を `.git/info/exclude` で除外しているだけ (ADR-0000) なので、
+  nested repo が無い checkout では `git -C .dev` が**親 repo を拾う** — その状態で Phase 6 step 6 の
+  push を実行してはいけない
 - `CLAUDE.local.md` の「開発フロー」節 (本 command の常時 guardrail) を遵守する
 
 ## ユーザ介入ポイントの最小化方針
@@ -116,6 +121,10 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
    - inline に P1/P2 → 妥当な範囲で取り込み (P1 = 必須 fix、P2 = scaling/UX 退化、P3 以下は判断)、regression test を 1 件追加、再 push → goto step 3 (= `/codex-review` 再 invoke で re-review)
    - 5 round 経過しても収束しない → ユーザに相談 (← 介入ポイント 3)
 5. 収束したら `gh pr merge <N> --squash --delete-branch`
+6. **merge したら session を閉じる** — release worthy なら Phase 7、続けて Phase 8 を済ませ、
+   「handoff と session の区切り」の手順で handoff → `.dev` push → 新 session。
+   次の PR (PR-<n+1>) は新 session の Phase 5 から再開する。Phase 7 は release worthy な PR でしか
+   走らないので、session の区切りを Phase 7 に置くと非 release の merge で手順が抜ける
 
 review 取り込み時の判断はすべて controller (= main agent) が行い、user 介入はしない。**ただし**:
 - 取り込みが「Phase 3 で承認した spec の前提を覆す」内容なら user に確認
@@ -147,22 +156,34 @@ cycle 完了時に必ず:
 
 これらは git untracked (`.dev/`) なので commit には乗らない (= subagent prompt で必ず明示する)。
 
-## Context overflow への備え (handoff 自動生成)
+## handoff と session の区切り
 
-Phase 5 / Phase 6 の途中で context が 80% を超えそうな兆候を検知したら:
+**Phase 6 step 5 で PR が merge されたら (= step 6)、Phase 7 / 8 の後処理を済ませて session を閉じる**
+(例外として、Phase 5 / Phase 6 の途中で context が逼迫したときも同じ手順)。`/compact` で続けない — 1 session 1 回まで
+(根拠: `.dev/knowledge/mistakes-repeat-session-length-ungated-rules-duplicated-facts.md`):
 
-1. **handoff doc を即時 write**: `.dev/knowledge/<feature-NN>-handoff.md`
+1. **handoff doc を即時 write**: `.dev/knowledge/session-<YYYY-MM-DD>-<topic>-handoff.md`
    - 現状の git state (`git log --oneline -5`)
    - 完了済 phase / 進行中 phase / 未着手 phase
    - 重要な constraint / pattern (`CLAUDE.local.md` 規約、subagent prompt の `.dev/` untracked 注意、codex review loop 規約)
    - 次セッションでの開始手順 (5-7 step に細分化)
    - オープン論点 / 注意
-   - 完了基準 chekclist
-2. ユーザに通知: `context が逼迫してきたので、handoff を <path> に書きました。/compact を打って、新 session で「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
+   - 完了基準 checklist
+   - background task leak の確認 (`run_in_background` の polling が残っていないか)
+2. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
+   無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
+   ```bash
+   case "$(git -C .dev rev-parse --show-toplevel)" in
+     */.dev) git -C .dev add -A && git -C .dev commit -F <msgfile> && git -C .dev push ;;
+     *) echo "ABORT: .dev is not its own repository; see the preconditions" >&2; exit 1 ;;
+   esac
+   ```
+3. ユーザに通知: `handoff を <path> に書き、.dev を push しました。この session を閉じて、新 session で「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
 
-ユーザが `/compact` を打って新 session が始まったら、SessionStart 通知を起点に handoff doc を読んで再開する (= layer 3 の hook 化を入れない場合の手動運用)。
+新 session が始まったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
-handoff doc の生成テンプレは `.dev/knowledge/feature-28-pr-4-handoff.md` を参考にする。
+handoff doc の型は `.dev/knowledge/session-2026-08-22-handoff-after-stderr-ascii.md` (★次にやること /
+main の状態 (実測) / 残っているもの / 測って分かったこと / 環境の罠 / 台帳 / 起票済み)。
 
 ## 介入ポイント以外でユーザを巻き込まない原則
 
@@ -190,7 +211,7 @@ handoff doc の生成テンプレは `.dev/knowledge/feature-28-pr-4-handoff.md`
 | `.dev/specs/<feature>.md` | 新規 (毎回) | spec ドキュメント (git untracked) |
 | `.dev/plans/<feature>.md` | 新規 (毎回) | 実装 plan (git untracked) |
 | `.dev/knowledge/<feature>-summary.md` | 新規 (毎回) | 振り返り + 工程ノート (git untracked) |
-| `.dev/knowledge/<feature>-handoff.md` | 必要時 | context overflow 時の申し送り (git untracked) |
+| `.dev/knowledge/session-<date>-<topic>-handoff.md` | merge ごと | session を閉じる前の申し送り (git untracked) |
 | `CHANGELOG.md` | 更新 | release 時に `[Unreleased]` → `[X.Y.Z]` |
 | `Cargo.toml` + `Cargo.lock` | 更新 | release 時 version bump |
 | README.md / docs/* | 更新 | リリース前ドキュメント同期チェックリストに従う |
@@ -215,4 +236,5 @@ handoff doc の生成テンプレは `.dev/knowledge/feature-28-pr-4-handoff.md`
   - 統合 summary: `.dev/knowledge/feature-28-summary.md`
   - PR: #35 / #36 / #37 / #38
 
-このコマンドが対象とする「介入ポイントの 3 点絞り込み」が成立したかは、過去 cycle で「session を跨がず controller が即決した数 / ユーザに飛んだ判断の数」で判定する。
+このコマンドが対象とする「介入ポイントの 3 点絞り込み」が成立したかは、過去 cycle で「controller が即決した数 / ユーザに飛んだ判断の数」で判定する。session の数は
+PR の数で決まる (Phase 6 step 6) ので、session を跨いだこと自体は失敗ではない。
