@@ -25,6 +25,7 @@ MCP サーバ。コマンド名は `groove`。
 | `.mcp.json` のレシピ、HTTP トランスポート、PostToolUse フック、ファイル監視 | [clients.md](clients.md) | [clients.ja.md](clients.ja.md) |
 | MCP の面: ツール / プロンプト / `kb://` リソース | [mcp-tools.md](mcp-tools.md) | [mcp-tools.ja.md](mcp-tools.ja.md) |
 | 何が索引に入り、どこに保存され、どのファイルが拒否されるか | [behavior.md](behavior.md) | [behavior.ja.md](behavior.ja.md) |
+| どのプロセスの形で配置するか、常駐が何を買うか、同一ホスト制約がどこから来るか | [deployment-topologies.md](deployment-topologies.md) | [deployment-topologies.ja.md](deployment-topologies.ja.md) |
 
 ## 検索
 

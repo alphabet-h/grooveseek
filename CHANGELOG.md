@@ -14,6 +14,34 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **A page about which shape to deploy in.** [docs/deployment-topologies.md](docs/deployment-topologies.md)
+  answers three questions the reference pages each answer a piece of: whether to
+  let a client spawn `groove` or to leave one running, what residency actually
+  buys, and where the same-host boundary comes from.
+
+  It began as an internal note measured against v0.26.0 and was re-measured
+  against v1.0.0 before publishing, because the two releases in between changed
+  exactly what it was about. `/api/search` — which its benchmark named and its
+  fourth open question argued about — no longer exists. Origin validation, which
+  it listed as unresolved, ships on by default. All four of its open questions
+  were settled before 1.0.0, so they appear as outcomes with the ADR that
+  records each one, rather than as questions.
+
+  The measurements are new: a resident daemon answers a search in about 200 ms
+  where the CLI takes about 3.1 seconds. The page splits that three seconds into
+  three terms and says which two were measured — process and database setup at
+  about 35 ms, the search itself at about 200 ms — leaving the model load, about
+  2.9 seconds, as the one derived by subtraction. It also says the thing the
+  internal note did not: residency is not the same as speed. A first query after hours
+  idle took 4.6 seconds, and a CLI search running alongside the daemon dragged it
+  from 200 ms to 2 seconds, which is the page's own "one process, one model"
+  warning arriving as latency.
+
+  Nothing in it cites a line number. The version it replaced cited eleven, and
+  all eleven were wrong within five days.
+
 ## [1.0.0] - 2026-08-22
 
 ### Added

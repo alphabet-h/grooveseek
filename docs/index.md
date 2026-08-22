@@ -26,6 +26,7 @@ the top.
 | `.mcp.json` recipes, the HTTP transport, the PostToolUse hook, the file watcher | [clients.md](clients.md) | [clients.ja.md](clients.ja.md) |
 | The MCP surface: tools, prompts, and `kb://` resources | [mcp-tools.md](mcp-tools.md) | [mcp-tools.ja.md](mcp-tools.ja.md) |
 | What gets indexed, where it is stored, and which files are refused | [behavior.md](behavior.md) | [behavior.ja.md](behavior.ja.md) |
+| Which process shape to deploy, what residency costs, and where the same-host boundary comes from | [deployment-topologies.md](deployment-topologies.md) | [deployment-topologies.ja.md](deployment-topologies.ja.md) |
 
 ## Retrieval
 

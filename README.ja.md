@@ -105,6 +105,7 @@ groove search "semantic chunking" --kb-path /path/to/knowledge-base --limit 3
 | [docs/clients.ja.md](docs/clients.ja.md) | `.mcp.json` のレシピ、HTTP トランスポート、PostToolUse hook、file watcher |
 | [docs/mcp-tools.ja.md](docs/mcp-tools.ja.md) | MCP の面 — ツール / プロンプト / `kb://` リソース |
 | [docs/behavior.ja.md](docs/behavior.ja.md) | 何が索引され、どこに保存され、どのファイルが拒否されるか |
+| [docs/deployment-topologies.ja.md](docs/deployment-topologies.ja.md) | どのプロセスの形で配置するか、常駐が何を買うか、同一ホスト制約がどこから来るか |
 | [docs/retrieval-pipeline.ja.md](docs/retrieval-pipeline.ja.md) | RRF / reranker / MMR / parent retriever を実行順に |
 | [docs/filters.ja.md](docs/filters.ja.md) | 検索結果の絞り込み |
 | [docs/citations.ja.md](docs/citations.ja.md) | `match_spans` とバイトオフセット (出典を正確に引用するため) |
