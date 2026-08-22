@@ -41,12 +41,16 @@ pub struct HttpTransportConfig {
     #[serde(default)]
     pub bind: Option<String>,
 
-    /// 受理する `Host` ヘッダの allow-list。`None` (省略) なら rmcp の
-    /// default = `["localhost", "127.0.0.1", "::1"]` (loopback only、DNS
-    /// rebinding 防御) を使う。LAN / イントラ公開時は
-    /// `["192.168.1.10", "kb.example.lan", ...]` のように明示する。
-    /// 空 `Vec` を渡すと rmcp は **全 Host を許可** する (
-    /// `disable_allowed_hosts` と同等)。public 公開時は推奨されない。
+    /// 受理する `Host` ヘッダの allow-list。`None` (省略) なら
+    /// [`http::DEFAULT_LOOPBACK_HOSTS`](crate::transport::http::DEFAULT_LOOPBACK_HOSTS)
+    /// = `["localhost", "127.0.0.1", "[::1]"]` (loopback only、DNS rebinding 防御)。
+    /// LAN / イントラ公開時は `["192.168.1.10", "kb.example.lan", ...]` のように
+    /// 明示する。空 `Vec` を渡すと **全 Host を許可**する (rmcp の
+    /// `disable_allowed_hosts` 相当)。public 公開時は推奨されない。
+    ///
+    /// **検証するのは rmcp ではなく groove 自身**。ADR-0009 以降、rmcp の Host /
+    /// Origin 検査は空リストを渡して無効化してあり、`/mcp` も `/healthz` も admin
+    /// 経路も [`http::dns_rebinding_gate`](crate::transport::http) が答える。
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
 
@@ -60,11 +64,12 @@ pub struct HttpTransportConfig {
     /// MCP 仕様 2025-06-18 (Streamable HTTP / Security Warning) は
     /// *"Servers **MUST** validate the `Origin` header on all incoming
     /// connections to prevent DNS rebinding attacks"* と定めている。
-    /// rmcp の既定は空リスト = **検証しない** なので、既定値を空にはしない。
-    /// 空 `Vec` を明示すると検証は無効になる (起動時に warn を出す)。
+    /// rmcp の既定は空リスト = **検証しない** だったので、既定値を空にはしない
+    /// (ADR-0009 以降、検証しているのは rmcp ではなく groove 自身)。空 `Vec` を
+    /// 明示すると検証は無効になる (起動時に warn を出す)。
     ///
     /// **認証ではない。** `Origin` を送らない要求 (MCP クライアント / tray /
-    /// curl) は RFC 6454 と rmcp の仕様どおり素通りする。これで防げるのは
+    /// curl) は RFC 6454 どおり素通りする。これで防げるのは
     /// 「利用者のブラウザに載った別サイトの JS」だけである。
     #[serde(default)]
     pub allowed_origins: Option<Vec<String>>,
@@ -111,14 +116,15 @@ pub enum Transport {
     Stdio,
     Http {
         addr: SocketAddr,
-        /// `None` = rmcp の default loopback-only allow-list を使う。
-        /// `Some(vec)` = 明示 list (空 `Vec` を渡すと rmcp 側で全 Host
-        /// 許可になる)。F-33 で `groove.toml` から surface した。
+        /// `None` = [`http::DEFAULT_LOOPBACK_HOSTS`](crate::transport::http::DEFAULT_LOOPBACK_HOSTS)
+        /// の loopback-only allow-list を使う。`Some(vec)` = 明示 list
+        /// (空 `Vec` を渡すと全 Host 許可になる)。F-33 で `groove.toml` から
+        /// surface した。判定するのは ADR-0009 以降 groove 自身。
         allowed_hosts: Option<Vec<String>>,
         /// `None` = bind した port の loopback origin を既定として組み立てる
         /// ([`http::default_allowed_origins`](crate::transport::http::default_allowed_origins))。
-        /// `Some(vec)` = 明示 list。空 `Vec` は rmcp 側で **Origin 検証無効**
-        /// になるので、既定にはしない。
+        /// `Some(vec)` = 明示 list。空 `Vec` は **Origin 検証無効**になるので、
+        /// 既定にはしない。
         allowed_origins: Option<Vec<String>>,
         /// F-64: `/healthz` を `allowed_hosts` 検証配下に置くか。
         /// `true` (default) = 現行挙動 (Host check なし、public)。
