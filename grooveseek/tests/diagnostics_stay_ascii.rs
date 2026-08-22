@@ -80,7 +80,8 @@
 //! |---|---|---|
 //! | the macro and panic openers below | see the list | 43, all fixed |
 //! | indicatif's progress style | 2 | 1, fixed and now an opener |
-//! | `write!` / `writeln!` / `write_all` aimed at stderr | 162 | 0 |
+//! | `write!` / `writeln!` **aimed at stderr** | **0** | — |
+//! | `write!` / `writeln!` anywhere | 162 | 10, every one a stdout report |
 //! | clap's `help` / `about` / `value_name` attributes | 111 | 0 |
 //!
 //! clap's error path was measured end to end as well, by running the binary
@@ -109,18 +110,35 @@ use std::path::{Path, PathBuf};
 
 /// Calls whose string literals become the words groove writes to stderr.
 ///
+/// A list is only as good as the reason it is complete, so here is that reason.
+/// **The standard library writes to stderr from `eprint!`, `eprintln!`, `dbg!`
+/// and the panic family, and from nothing else**; `print!` / `println!` /
+/// `write!` to any other target are elsewhere by definition. Of the crates this
+/// program depends on, `tracing` renders through a subscriber pointed at stderr
+/// and `indicatif` draws the progress bar there. `log` is not a dependency, so
+/// its macros cannot appear. A macro this repo defines itself is found by
+/// shape rather than listed -- see [`wrapper_macros`].
+///
 /// `anyhow!` / `bail!` / `ensure!` / `context` are here because `main` prints
 /// an error's body to stderr, so those messages are read on the same console
 /// as the rest. The panic family is here for the same reason one level down:
 /// Rust's default hook writes the payload of a `panic!` or an `.expect(...)`
 /// to stderr, and a panic in a shipped binary is read by an operator.
-/// `println!` is absent on purpose: stdout is a result.
+///
+/// **`write!` / `writeln!` are the second family that cannot be guarded this
+/// way**, and adding them was tried rather than assumed: ten call sites carry
+/// non-ASCII, and every one builds a `groove eval` or `groove tune` report --
+/// which goes to stdout, where `AGENTS.md` says the formatters "may use them
+/// freely". The same macro serves both destinations and the call does not say
+/// which, so flagging them would flag exactly what the rule permits. Nothing
+/// is lost today: no call in this tree aims either macro at stderr at all.
 ///
 /// The `tracing` levels are listed bare so that `tracing::warn!` and a
 /// `use tracing::warn;` shorthand are both caught by one entry.
 const DIAGNOSTIC_OPENERS: &[&str] = &[
     "eprintln!",
     "eprint!",
+    "dbg!",
     "warn!",
     "error!",
     "info!",
