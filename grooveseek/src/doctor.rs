@@ -316,15 +316,32 @@ pub fn run(
             // "rename it" when the destination name is occupied either — that
             // overwrites a file in use (round 2).
             //
-            // Occupancy, **not** `rules.ignore_file_patterns()`: that answers
-            // `None` for a `.grooveignore` which exists and could not be read,
-            // and renaming onto it is exactly as destructive as renaming onto a
-            // working one (codex P2 round 1 on this PR).
-            let remedy = if crate::legacy::live_ignore_name_is_taken(kb_path) {
-                "copy the lines you still want from .kb-mcpignore into .grooveignore, \
-                 then run groove index"
-            } else {
-                "rename .kb-mcpignore to .grooveignore, then run groove index"
+            // **Three** states, not two, and neither signal alone separates
+            // them. Occupancy comes from the filesystem because
+            // `ignore_file_patterns()` answers `None` for a `.grooveignore`
+            // that exists and could not be read, and renaming onto that is as
+            // destructive as renaming onto a working one (codex P2 round 1).
+            // Whether it is *in effect* comes from the rules, because copying
+            // lines into a directory or through a refused link does not produce
+            // an ignore file either, and the documents stay indexed (round 2).
+            let remedy = match (
+                crate::legacy::live_ignore_name_is_taken(kb_path),
+                rules.ignore_file_patterns().is_some(),
+            ) {
+                // The name is free. Nothing to lose, so the shortest fix works.
+                (false, _) => "rename .kb-mcpignore to .grooveignore, then run groove index",
+                // A working ignore file is there. Merge, never overwrite.
+                (true, true) => concat!(
+                    "copy the lines you still want from .kb-mcpignore into .grooveignore, ",
+                    "then run groove index"
+                ),
+                // Occupied and not in effect. Say that, rather than name a step
+                // that cannot succeed against whatever is holding the name.
+                (true, false) => concat!(
+                    "something is at .grooveignore and is not being read: make it a plain ",
+                    "readable file first, then move the lines you still want there and run ",
+                    "groove index"
+                ),
             };
             findings.extend(finding(
                 "indexed-despite-legacy-ignore",
@@ -773,6 +790,39 @@ mod tests {
         assert!(
             !f.remedy.contains("rename"),
             "the destination name is taken, whether or not what holds it can be read: {}",
+            f.remedy
+        );
+        // codex P2 round 2: "not a rename" is not enough. Copying lines into a
+        // directory, or through a refused link, produces no ignore file either,
+        // so the documents named in this very finding would stay indexed. The
+        // remedy has to send the operator at the destination first.
+        assert!(
+            f.remedy.contains("is not being read"),
+            "a remedy that merges into an unreadable destination cannot work, so it has \
+             to name that first: {}",
+            f.remedy
+        );
+    }
+
+    /// The third state, and the reason the branch reads two signals rather than
+    /// one: a working `.grooveignore` takes the merge remedy, and only that
+    /// one. Occupancy alone cannot tell it from the case above.
+    #[test]
+    fn a_readable_grooveignore_gets_the_merge_remedy_and_not_the_repair_one() {
+        let db = db_with_one_chunk();
+        let kb = LegacyKb::new("readabledest");
+        kb.write(".kb-mcpignore", "notes/\n");
+        kb.write(".grooveignore", "logs/\n");
+
+        let report = kb.report(&db);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "indexed-despite-legacy-ignore")
+            .expect("still reported; only the remedy changes");
+        assert!(
+            f.remedy.starts_with("copy the lines"),
+            "there is nothing to repair here: {}",
             f.remedy
         );
     }
