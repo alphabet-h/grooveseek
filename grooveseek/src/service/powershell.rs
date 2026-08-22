@@ -69,7 +69,8 @@ pub fn decode_value(bytes: &[u8], what: &str) -> Result<String> {
         Ok(s) => Ok(s.to_string()),
         Err(e) => Err(anyhow!(
             "{what} is not valid UTF-8 (first bad byte at offset {}), so it cannot be used as a \
-             value. PowerShell was asked to emit UTF-8 via `{UTF8_OUTPUT_PRELUDE}` — that prelude \
+             value. PowerShell was asked to emit UTF-8 via `{UTF8_OUTPUT_PRELUDE}`, and that \
+             prelude \
              did not take effect.",
             e.valid_up_to(),
         )),

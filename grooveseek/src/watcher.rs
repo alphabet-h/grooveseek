@@ -895,8 +895,9 @@ mod tests {
             // **黙って return すると「通ったのに何も検証していない」テストになる**ので、
             // skip したことを出力に残す。Linux CI では必ず上の assert が走る。
             eprintln!(
-                "test_symlink_is_not_indexed_by_the_watcher: symlink 作成不可のため \
-                 symlink 分岐を skip (Windows の特権不足)。以下の分岐だけ検証する。"
+                "test_symlink_is_not_indexed_by_the_watcher: could not create a \
+                 symlink, so the symlink branch is skipped (Windows without the \
+                 privilege). Only the branch below is verified."
             );
         }
 

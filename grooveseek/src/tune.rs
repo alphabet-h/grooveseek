@@ -847,7 +847,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     let context_axis_noop = context_axis_is_noop(&db)?;
     if context_axis_noop {
         eprintln!(
-            "groove tune: WARNING — every chunk has an empty context column, so the \
+            "groove tune: WARNING: every chunk has an empty context column, so the \
              bm25_context_weight axis is a no-op on this KB (contextual retrieval is off). \
              Its rows below mean \"not measured\", not \"has no effect\"."
         );
@@ -868,7 +868,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     }
     if pre.effective.len() < SMALL_N_WARN {
         eprintln!(
-            "groove tune: WARNING — effective N = {} is below the IR convention of {SMALL_N_WARN} \
+            "groove tune: WARNING: effective N = {} is below the IR convention of {SMALL_N_WARN} \
              topics. Treat the numbers below as suggestive, not conclusive.",
             pre.effective.len()
         );

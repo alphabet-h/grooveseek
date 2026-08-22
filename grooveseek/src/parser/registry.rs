@@ -37,7 +37,8 @@ impl Registry {
                     "[parsers].enabled contains \"xls\", which this build does not index. \
                      Reading a .xls workbook makes calamine materialise one dense cell grid \
                      per sheet before groove regains control, and the BIFF format bounds a \
-                     sheet (65536 x 256 = 512 MB) but not a workbook — a small crafted file \
+                     sheet (65536 x 256 = 512 MB) but not a workbook, so a small crafted \
+                     file \
                      can declare enough sheets to exhaust memory, and an allocation failure \
                      aborts the process rather than skipping the file. Convert the workbook \
                      to .xlsx, which is read as a stream."
@@ -45,7 +46,7 @@ impl Registry {
                 "docx" => Box::new(DocxParser),
                 "pptx" => Box::new(PptxParser),
                 other => anyhow::bail!(
-                    "[parsers].enabled contains unknown id {:?} — \
+                    "[parsers].enabled contains unknown id {:?}; \
                      supported in this build: md, txt, pdf, docx, xlsx, pptx",
                     other
                 ),

@@ -1357,7 +1357,7 @@ fn main() -> anyhow::Result<()> {
                 .is_some_and(|s| s.mmr.enabled || s.parent_retriever.enabled)
             {
                 eprintln!(
-                    "groove tune: note — [search.mmr] / [search.parent_retriever] are enabled in \
+                    "groove tune: note: [search.mmr] / [search.parent_retriever] are enabled in \
                      groove.toml but tune measures the plain RRF stage only."
                 );
             }
@@ -1368,7 +1368,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(true)
             {
                 eprintln!(
-                    "groove tune: note — [search.fusion] is already customised in groove.toml; \
+                    "groove tune: note: [search.fusion] is already customised in groove.toml; \
                      tune still measures deltas against the BUILT-IN defaults, not your values."
                 );
             }

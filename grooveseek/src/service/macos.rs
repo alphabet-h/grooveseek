@@ -17,7 +17,7 @@ pub(crate) struct LaunchAgent;
 pub use super::render::render_plist;
 
 fn plist_path(service_name: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("HOME 解決失敗"))?;
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve HOME"))?;
     Ok(home.join(format!(
         "Library/LaunchAgents/com.groove.{}.plist",
         service_name
@@ -28,7 +28,7 @@ fn current_uid() -> Result<String> {
     let out = Command::new("id")
         .arg("-u")
         .output()
-        .context("id -u 実行失敗")?;
+        .context("could not run id -u")?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -36,10 +36,10 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
     let status = Command::new("launchctl")
         .args(args)
         .status()
-        .with_context(|| format!("launchctl {} 実行失敗", args.join(" ")))?;
+        .with_context(|| format!("could not run launchctl {}", args.join(" ")))?;
     if !status.success() {
         return Err(anyhow!(
-            "launchctl {} が失敗 (status: {})",
+            "launchctl {} failed (status: {})",
             args.join(" "),
             status
         ));
@@ -64,7 +64,7 @@ fn tighten_existing_logs(config_home: &Path) {
         }
         if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
             eprintln!(
-                "warning: 既存ログの permission を 0600 にできませんでした: {} ({e})",
+                "warning: could not set the existing log file to mode 0600: {} ({e})",
                 path.display()
             );
         }
@@ -96,7 +96,7 @@ impl ServiceBackend for LaunchAgent {
         })?;
         if path.exists() && !ctx.force {
             return Err(anyhow!(
-                "plist が既存: {} (--force で上書き)",
+                "the plist already exists: {} (pass --force to overwrite)",
                 path.display()
             ));
         }
@@ -148,7 +148,7 @@ impl ServiceBackend for LaunchAgent {
         let out = Command::new("launchctl")
             .args(["list", &format!("com.groove.{}", service_name)])
             .output()
-            .context("launchctl list 実行失敗")?;
+            .context("could not run launchctl list")?;
         if !out.status.success() {
             // exit 1 from launchctl list <label> = label not loaded
             return Ok(ServiceState::NotFound);
@@ -178,7 +178,7 @@ impl ServiceBackend for LaunchAgent {
     }
     fn list(&self) -> Result<Vec<(String, ServiceState)>> {
         let dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("HOME 解決失敗"))?
+            .ok_or_else(|| anyhow!("could not resolve HOME"))?
             .join("Library/LaunchAgents");
         let mut out = Vec::new();
         if !dir.exists() {

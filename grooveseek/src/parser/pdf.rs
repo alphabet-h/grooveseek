@@ -304,8 +304,8 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
         return Err(anyhow!(
             "{path_hint}: the text layer decoded to mojibake, not text: \
              {:.1}% of the extracted characters are C1 control codes \
-             (U+0080-U+009F), which correctly decoded text does not contain — \
-             skipping rather than indexing text that no query can match. This \
+             (U+0080-U+009F), which correctly decoded text does not contain. \
+             Skipping rather than indexing text that no query can match. This \
              build could not decode the font encoding this PDF uses; the text \
              is present and a viewer will show it correctly. Known trigger: a \
              CID-keyed font with a predefined CMap and no /ToUnicode",
@@ -317,13 +317,13 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
         return Err(anyhow!(
             "{path_hint}: the text layer decoded to mojibake, not text: \
              {:.0}% of the extracted characters alternate a near-constant \
-             character with varied ones — the signature of UTF-16BE text read \
-             one byte at a time (kana comes out as ASCII, e.g. あ becomes \
-             \"0B\") — skipping rather than indexing text that no query can \
-             match. This build could not decode the font encoding this PDF \
-             uses; the text is present and a viewer will show it correctly. \
-             Known trigger: a CID-keyed font with a predefined CMap and no \
-             /ToUnicode",
+             character with varied ones, the signature of UTF-16BE text read \
+             one byte at a time (a kana character at U+3042 comes out as the \
+             ASCII pair \"0B\"). Skipping rather than indexing text that no \
+             query can match. This build could not decode the font encoding \
+             this PDF uses; the text is present and a viewer will show it \
+             correctly. Known trigger: a CID-keyed font with a predefined \
+             CMap and no /ToUnicode",
             pair_ratio * 100.0
         ));
     }
@@ -339,7 +339,7 @@ fn reject_unindexable_pages(pages: &[String], path_hint: &str) -> Result<()> {
         return Err(anyhow!(
             "{path_hint}: too little text extracted to index: average {avg_chars} \
              chars/page across {non_empty_pages} non-empty page(s) < \
-             {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold — skipping. Common causes \
+             {SCANNED_PDF_MIN_CHARS_PER_PAGE} threshold; skipping. Common causes \
              include a scanned image with no text layer (OCR is not supported), a text \
              layer this build could not decode into anything (a PDF whose text you can \
              select in a viewer can still land here), and a document that genuinely \

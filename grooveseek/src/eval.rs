@@ -1458,7 +1458,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     let (limit, k_values) = normalize_eval_limit_and_k(opts.limit, &opts.k_values);
     if limit != opts.limit {
         eprintln!(
-            "groove eval: note — limit {} exceeds the retrieval cap; using {limit}",
+            "groove eval: note: limit {} exceeds the retrieval cap; using {limit}",
             opts.limit
         );
     }

@@ -17,7 +17,7 @@ pub use super::render::render_unit;
 
 fn unit_path(service_name: &str) -> Result<PathBuf> {
     let dir = dirs::config_dir()
-        .ok_or_else(|| anyhow!("XDG_CONFIG_HOME / HOME 解決失敗"))?
+        .ok_or_else(|| anyhow!("could not resolve XDG_CONFIG_HOME or HOME"))?
         .join("systemd/user");
     Ok(dir.join(format!("groove-{}.service", service_name)))
 }
@@ -27,10 +27,10 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
     cmd.arg("--user").args(args);
     let status = cmd
         .status()
-        .with_context(|| format!("systemctl --user {} の実行失敗", args.join(" ")))?;
+        .with_context(|| format!("could not run systemctl --user {}", args.join(" ")))?;
     if !status.success() {
         return Err(anyhow!(
-            "systemctl --user {} が失敗 (status: {})",
+            "systemctl --user {} failed (status: {})",
             args.join(" "),
             status
         ));
@@ -44,7 +44,7 @@ impl ServiceBackend for SystemdUser {
         std::fs::create_dir_all(path.parent().unwrap())?;
         if path.exists() && !ctx.force {
             return Err(anyhow!(
-                "service unit が既存: {} (--force で上書き)",
+                "the service unit already exists: {} (pass --force to overwrite)",
                 path.display()
             ));
         }
@@ -93,7 +93,7 @@ impl ServiceBackend for SystemdUser {
         let out = Command::new("systemctl")
             .args(["--user", "is-active", &unit_name])
             .output()
-            .context("systemctl --user is-active 実行失敗")?;
+            .context("could not run systemctl --user is-active")?;
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         Ok(match stdout.as_str() {
             "active" => ServiceState::Running {
@@ -111,7 +111,7 @@ impl ServiceBackend for SystemdUser {
     }
     fn list(&self) -> Result<Vec<(String, ServiceState)>> {
         let dir = dirs::config_dir()
-            .ok_or_else(|| anyhow!("config dir 解決失敗"))?
+            .ok_or_else(|| anyhow!("could not resolve the config directory"))?
             .join("systemd/user");
         let mut out = Vec::new();
         if !dir.exists() {
