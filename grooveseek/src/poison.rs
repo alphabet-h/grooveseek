@@ -74,7 +74,7 @@ fn report_into(reported: &AtomicBool, label: &str) -> bool {
         tracing::warn!(
             mutex = label,
             "a mutex was poisoned by an earlier panic; continuing with the state it \
-             left behind. Search keeps working, but something panicked — look for the \
+             left behind. Search keeps working, but something panicked; look for the \
              panic above this line."
         );
         true

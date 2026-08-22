@@ -1357,7 +1357,7 @@ fn main() -> anyhow::Result<()> {
                 .is_some_and(|s| s.mmr.enabled || s.parent_retriever.enabled)
             {
                 eprintln!(
-                    "groove tune: note — [search.mmr] / [search.parent_retriever] are enabled in \
+                    "groove tune: note: [search.mmr] / [search.parent_retriever] are enabled in \
                      groove.toml but tune measures the plain RRF stage only."
                 );
             }
@@ -1368,7 +1368,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(true)
             {
                 eprintln!(
-                    "groove tune: note — [search.fusion] is already customised in groove.toml; \
+                    "groove tune: note: [search.fusion] is already customised in groove.toml; \
                      tune still measures deltas against the BUILT-IN defaults, not your values."
                 );
             }
@@ -2338,7 +2338,7 @@ mod naming_surface {
             ])
             .unwrap_or_else(|e| {
                 panic!(
-                    "`groove graph --seed-strategy {}` must parse — it is in \
+                    "`groove graph --seed-strategy {}` must parse: it is in \
                      SeedStrategy::SPELLINGS, so the tool accepts it: {e}",
                     spelling.text
                 )
@@ -2349,7 +2349,7 @@ mod naming_surface {
                     "{} must mean the same strategy on both surfaces",
                     spelling.text
                 ),
-                _ => panic!("`groove graph …` must parse as the graph subcommand"),
+                _ => panic!("`groove graph ...` must parse as the graph subcommand"),
             }
         }
     }

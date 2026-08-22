@@ -80,16 +80,17 @@ pub(crate) fn run_with_backend(
         );
     }
 
-    let binary_path = std::env::current_exe().context("std::env::current_exe() 解決失敗")?;
+    let binary_path =
+        std::env::current_exe().context("could not resolve std::env::current_exe()")?;
 
     // (AU-30) The tray preflight runs before anything is written.
     //
     // It used to sit further down, after `groove.toml` had been created. A
     // preflight rejection there left the file behind, and the next attempt hit
-    // "groove.toml が既存 (--force で上書き)" — so the run that changed nothing
-    // still made the retry look like a second install, and the user had to pass
-    // --force to recover from an error that was supposed to mean "nothing
-    // happened".
+    // "groove.toml already exists (pass --force to overwrite)" — so the run that
+    // changed nothing still made the retry look like a second install, and the
+    // user had to pass --force to recover from an error that was supposed to
+    // mean "nothing happened".
     //
     // Nothing in the check depends on the toml: it needs the service name, the
     // directory holding groove.exe, and `force`.
@@ -125,7 +126,7 @@ pub(crate) fn run_with_backend(
     let toml_path = config_home.join(crate::service::render::SERVICE_CONFIG_FILE);
     if toml_path.exists() && !params.force {
         return Err(anyhow!(
-            "groove.toml が既存: {} (--force で上書き)",
+            "groove.toml already exists: {} (pass --force to overwrite)",
             toml_path.display()
         ));
     }
@@ -142,7 +143,7 @@ pub(crate) fn run_with_backend(
     // which is desirable here (= snapshot the install-time target).
     let kb_path = std::fs::canonicalize(&kb_path).with_context(|| {
         format!(
-            "kb_path を絶対パスに正規化できませんでした: {}",
+            "could not resolve kb_path to an absolute path: {}",
             kb_path.display()
         )
     })?;
@@ -233,10 +234,12 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
 
     let mut doc: DocumentMut = if path.exists() {
         let existing = std::fs::read_to_string(path)
-            .with_context(|| format!("groove.toml 読込失敗: {}", path.display()))?;
+            .with_context(|| format!("could not read groove.toml: {}", path.display()))?;
         existing.parse::<DocumentMut>().with_context(|| {
             format!(
-                "groove.toml が invalid TOML です: {}。手動で修正してから再 install してください (--force でも auto-overwrite しません)",
+                "groove.toml is invalid TOML: {}. Repair it by hand, then run service \
+                 install again (--force does not auto-overwrite a file this command \
+                 cannot parse)",
                 path.display()
             )
         })?
@@ -262,7 +265,8 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
     });
     let transport = transport_item.as_table_mut().ok_or_else(|| {
         anyhow!(
-            "groove.toml の `transport` キーが table ではありません: {}。手動で修正してから再 install してください",
+            "the `transport` key in groove.toml is not a table: {}. Repair it by \
+             hand, then run service install again",
             path.display()
         )
     })?;
@@ -273,7 +277,8 @@ fn write_toml(path: &std::path::Path, kb_path: &std::path::Path, bind: &str) -> 
     });
     let http = http_item.as_table_mut().ok_or_else(|| {
         anyhow!(
-            "groove.toml の `[transport.http]` セクションが table ではありません: {}。手動で修正してから再 install してください",
+            "the `[transport.http]` section in groove.toml is not a table: {}. \
+             Repair it by hand, then run service install again",
             path.display()
         )
     })?;
@@ -294,21 +299,17 @@ pub fn resolve_kb_path(flag: Option<PathBuf>, toml_path: Option<PathBuf>) -> Res
     }
     let Some(toml_path) = toml_path else {
         return Err(anyhow!(
-            "kb_path が解決できません: --kb-path flag を指定するか、groove.toml に top-level `kb_path` を書いてください"
+            "cannot resolve kb_path: pass --kb-path, or set a top-level `kb_path` \
+             in groove.toml"
         ));
     };
     let content = std::fs::read_to_string(&toml_path)
-        .with_context(|| format!("groove.toml 読込失敗: {}", toml_path.display()))?;
+        .with_context(|| format!("could not read groove.toml: {}", toml_path.display()))?;
     let parsed: toml::Value = toml::from_str(&content)?;
     let kb_path = parsed
         .get("kb_path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            anyhow!(
-                "{} に top-level `kb_path` がありません",
-                toml_path.display()
-            )
-        })?;
+        .ok_or_else(|| anyhow!("{} has no top-level `kb_path`", toml_path.display()))?;
     Ok(PathBuf::from(kb_path))
 }
 
@@ -579,9 +580,9 @@ mod au30_tests {
     /// AU-30. A rejected `--with-tray` preflight must leave nothing behind.
     ///
     /// It used to run *after* `groove.toml` was written, so a rejection left the
-    /// file on disk and the next attempt failed with "groove.toml が既存
-    /// (--force で上書き)" — a run that changed nothing still forced the user to
-    /// pass --force to recover.
+    /// file on disk and the next attempt failed with "groove.toml already exists
+    /// (pass --force to overwrite)" — a run that changed nothing still forced the
+    /// user to pass --force to recover.
     ///
     /// On Windows the preflight rejects because `groove-tray.exe` is not next
     /// to the test binary; on other platforms because --with-tray is

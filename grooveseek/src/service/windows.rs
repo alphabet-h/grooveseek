@@ -49,10 +49,10 @@ fn run_schtasks(args: &[&str]) -> Result<()> {
     let status = Command::new("schtasks")
         .args(args)
         .status()
-        .with_context(|| format!("schtasks {} 実行失敗", args.join(" ")))?;
+        .with_context(|| format!("could not run schtasks {}", args.join(" ")))?;
     if !status.success() {
         return Err(anyhow!(
-            "schtasks {} 失敗 (status: {})",
+            "schtasks {} failed (status: {})",
             args.join(" "),
             status
         ));
@@ -417,7 +417,7 @@ impl ServiceBackend for TaskScheduler {
         let out = Command::new("schtasks")
             .args(["/Query", "/FO", "CSV", "/NH"])
             .output()
-            .context("schtasks /Query 全体 実行失敗")?;
+            .context("could not run schtasks /Query for all tasks")?;
         // Same as `status`: `schtasks` output is code-page encoded and out of
         // reach of the PowerShell prelude, but only the ASCII `groove-` prefix
         // is matched here. A separate defect does live on this path — a service

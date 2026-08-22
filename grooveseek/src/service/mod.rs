@@ -119,7 +119,8 @@ pub(crate) fn resolve_config_home_in(
     // service の config をカレントディレクトリ配下に書き、起動のたびに違う場所を見る。
     let base = config_home.or_else(dirs::config_dir).ok_or_else(|| {
         anyhow::anyhow!(
-            "config dir 解決失敗 (GROOVE_CONFIG_HOME / XDG_CONFIG_HOME / HOME いずれも未設定)"
+            "could not resolve the config directory: none of GROOVE_CONFIG_HOME, \
+             XDG_CONFIG_HOME or HOME is set"
         )
     })?;
     Ok(base.join("groove").join(service_name))
