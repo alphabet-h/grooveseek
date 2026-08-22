@@ -111,16 +111,12 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
-3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。本 skill が以下を 1 step で固定化:
-   - `@codex review` mention で codex trigger
-   - `pulls/<N>/comments` (inline) + `issues/<N>/comments` (top-level) + `pulls/<N>/reviews` (review body) の 3 endpoint を **`(id, updated_at)` set diff で同時 polling** (罠 13: count では edit / deletion を見落とす)。実体は `scripts/codex_review_round.sh` 1 本
-   - 5 round 上限で auto break (CLAUDE.local.md guardrail と整合)
-   - 結果 fetch + 整形して controller に提示 (= top-level summary + inline P1/P2 detail + review body)
-4. controller (= main agent) が `/codex-review` の出力を判定:
-   - top-level に `Didn't find any major issues` (variation: `Hooray!` / `Keep them coming!` / `Bravo` 等) → **収束**、step 5 へ
-   - inline に P1/P2 → 妥当な範囲で取り込み (P1 = 必須 fix、P2 = scaling/UX 退化、P3 以下は判断)、regression test を 1 件追加、再 push → goto step 3 (= `/codex-review` 再 invoke で re-review)
-   - 5 round 経過しても収束しない → ユーザに相談 (← 介入ポイント 3)
-5. 収束したら `gh pr merge <N> --squash --delete-branch`
+3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。1 round = `scripts/codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
+4. controller (= main agent) は **script の verdict だけを読む** — stdout の `CONVERGED=` 行とその直前の判定行、および exit code。**判定の predicate (sentinel 文言 / P-badge の数え方 / 何を再 round にするか) をここに書き写さない**: 2 か所にあると script と食い違い、sentinel と P1 が同時に来た round で blocking な指摘を飛ばすか、P2 だけの round で無駄な 1 round を回す (codex P1 on PR #222、AGENTS.md "One question gets one implementation")。読み方の家は SKILL.md「結果の読み方」の表。そこから本 phase の分岐だけ言い直すと:
+   - `CONVERGED=true` → step 5 へ。P2 / P3 の note が付いていたら内容を見て取り込み or skip を即決する (再 round はしない)
+   - `WARN P0/P1 issues present` → 取り込み、regression test を 1 件追加、再 push → goto step 3 (re-trigger body 付きで `/codex-review` 再 invoke)
+   - `INDETERMINATE` / exit 3〜8 → SKILL.md の表のとおり。**exit 7 (= 5 round 到達、何も投稿していない) → ユーザに相談** (← 介入ポイント 3)
+5. `CONVERGED=true` になったら `gh pr merge <N> --squash --delete-branch`
 6. **merge したら session を閉じる** — release worthy なら Phase 7、続けて Phase 8 を済ませ、
    「handoff と session の区切り」の手順で handoff → `.dev` push → 新 session。
    次の PR (PR-<n+1>) は新 session の Phase 5 から再開する。Phase 7 は release worthy な PR でしか
