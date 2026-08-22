@@ -233,10 +233,19 @@ fn char_literal_end(src: &str, at: usize) -> Option<usize> {
     let mut i = at + 1;
     if bytes.get(i) == Some(&b'\\') {
         i += 1;
-        if bytes.get(i) == Some(&b'u') {
-            while i < bytes.len() && bytes[i] != b'}' {
-                i += 1;
+        match bytes.get(i) {
+            // `\u{...}` runs to its brace, `\xNN` takes exactly two more, and
+            // every other escape stands for one character. Reading `'\x41'` as
+            // a lifetime -- which is what happened before `\x` was handled --
+            // leaves its closing quote to open a literal of its own and
+            // mis-reads the rest of the file.
+            Some(&b'u') => {
+                while i < bytes.len() && bytes[i] != b'}' {
+                    i += 1;
+                }
             }
+            Some(&b'x') => i += 2,
+            _ => {}
         }
         i += 1;
     } else {
@@ -371,29 +380,6 @@ struct Scanned {
     literals: Vec<(usize, usize)>,
 }
 
-/// Byte just past the brace that closes the block starting at or after `from`.
-fn brace_end(masked: &[u8], from: usize) -> usize {
-    let mut depth = 0usize;
-    let mut i = from;
-    while i < masked.len() {
-        match masked[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                if depth == 0 {
-                    return i;
-                }
-                depth -= 1;
-                if depth == 0 {
-                    return i + 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    masked.len()
-}
-
 /// Local macros that expand into a diagnostic.
 ///
 /// Such a macro carries its words at the **call sites**, not in the body, so
@@ -424,7 +410,12 @@ fn wrapper_macros(masked: &[u8]) -> Vec<String> {
         if name.is_empty() {
             continue;
         }
-        let body = &masked[i..brace_end(masked, i)];
+        // `macro_rules! foo ( .. );` is as legal as the brace form, so where a
+        // definition's body ends is the same question a call asks, and gets the
+        // same implementation (AGENTS.md, "One question gets one
+        // implementation"). It had its own brace-only answer, which is the
+        // defect codex found one function over.
+        let body = &masked[i..call_end(masked, i)];
         if DIAGNOSTIC_OPENERS
             .iter()
             .any(|opener| !occurrences(body, opener.as_bytes()).is_empty())
