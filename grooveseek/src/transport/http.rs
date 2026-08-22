@@ -1721,10 +1721,13 @@ async fn healthz() -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// `/api/admin/status` endpoint — returns daemon / indexing / watcher / kb
-/// state. Gated by [`dns_rebinding_gate`], which for this route asks all three
-/// questions: the peer must be loopback (not configurable), the `Host` must be
-/// in `KbServerShared.allowed_admin_hosts`, and the `Origin`, when one is sent,
-/// must be in the shared `allowed_origins`.
+/// state. Gated by [`dns_rebinding_gate`]. Two of its questions always apply to
+/// this route: the peer must be loopback (not configurable by anything), and the
+/// `Host` must be in `KbServerShared.allowed_admin_hosts`. The third is
+/// conditional — an `Origin`, when one is sent, is checked against the shared
+/// `allowed_origins`, but [`DnsRebindingGate::decide`] returns before looking at
+/// it if that list is empty, which is what an explicit `allowed_origins = []`
+/// produces (a supported configuration; the server warns about it at startup).
 async fn api_admin_status(
     State(shared): State<Arc<KbServerShared>>,
 ) -> Result<axum::Json<AdminStatus>, (StatusCode, String)> {
