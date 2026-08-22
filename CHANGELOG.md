@@ -19,8 +19,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **`groove doctor` says what an old `.kb-mcpignore` left in the index.**
   [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md) renamed the
   project with no aliases and no automatic migration, so an ignore file under the
-  old name is not read and whatever it used to keep out is indexed again on the
-  next run. Nothing said so.
+  old name is not read and what it used to keep out is indexed again on the next
+  run — except whatever the current rules exclude anyway. Nothing said so.
 
   Two findings, both warnings. `indexed-despite-legacy-ignore` names the indexed
   documents the old file matches that the current rules do not exclude — real

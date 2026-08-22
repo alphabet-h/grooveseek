@@ -6,9 +6,14 @@
 //! other caller. Nothing else imports it.
 //!
 //! [ADR-0007] renamed the project with no aliases and no automatic migration.
-//! A `.kb-mcpignore` left in a knowledge base is therefore not read, and
-//! whatever it used to keep out comes back into the index on the next run.
-//! Nothing said so.
+//! A `.kb-mcpignore` left in a knowledge base is therefore not read, and what
+//! it used to keep out comes back into the index on the next run — **except
+//! what the current rules exclude anyway**, which is most of a well-configured
+//! knowledge base and none of the interesting part. Nothing said so.
+//!
+//! That qualification is not decoration. It is the difference between a finding
+//! that names documents and one that names a filename, and [`inspect`] applies
+//! it with `!current.is_excluded(...)` before naming anything.
 //!
 //! # Why it opens the file
 //!
