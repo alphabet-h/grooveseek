@@ -304,7 +304,14 @@ pub fn run(
             // a count of nothing is how it starts reading as a clean bill.
             count: 1,
             samples: Vec::new(),
-            remedy: "make it a plain readable file under the size cap, then run groove doctor again",
+            // Found reviewing this branch against the two roots the earlier
+            // rounds shared, rather than by a seventh round. It said "make it a
+            // plain readable file under the size cap" — "it" claims something
+            // is there, which `Unknown` never established, and naming two
+            // repairs is what round 3 corrected in the *other* remedy while
+            // this one kept the defect. The condition to reach covers every
+            // reason the check did not complete, including reasons added later.
+            remedy: "make that name one groove can read, then run groove doctor again",
         }),
         // Through the same `finding` helper as every check above, so "there is
         // an old file but it costs nothing today" stays silent by the same rule

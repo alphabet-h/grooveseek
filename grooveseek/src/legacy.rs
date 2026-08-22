@@ -305,9 +305,9 @@ mod tests {
     ///
     /// **`Unknown` is not here.** Producing it needs the filesystem to refuse a
     /// `symlink_metadata` for a reason other than absence — an ACL denial, a
-    /// volume going away — which a test cannot arrange without privileges the
-    /// runners do not have. What it protects is stated in the type's own docs:
-    /// neither caller may read "could not look" as "free".
+    /// volume going away — which no fixture here arranges. What it protects is
+    /// stated in the type's own docs: neither caller may read "could not look"
+    /// as "free".
     #[test]
     fn a_name_is_free_until_something_is_at_it() {
         let kb = TempKb::new("occupancy");
@@ -337,12 +337,12 @@ mod tests {
     /// nothing found for a check that never ran. `inspect` now asks occupancy
     /// first, so the read's error kind cannot decide `Absent` at all.
     ///
-    /// **That specific file is not in this table**, and saying so is the point:
-    /// creating a symlink here needs administrator rights or Developer Mode —
-    /// measured, `New-Item -ItemType SymbolicLink` answers "Administrator
-    /// privilege required" on this machine — and the CI runners are no
-    /// different. The case is closed by construction rather than by a fixture,
-    /// and this pins the invariant that closing it was for.
+    /// **That specific file is not in this table**, and saying so is the point.
+    /// Measured on the machine this was written on: `New-Item -ItemType
+    /// SymbolicLink` answers "Administrator privilege required". Whether a CI
+    /// runner could is not something anyone here found out, so the case is
+    /// closed by construction rather than by a fixture, and this pins the
+    /// invariant that closing it was for.
     #[test]
     fn nothing_that_occupies_the_name_is_ever_reported_absent() {
         let plain = TempKb::new("occupied-plain");
