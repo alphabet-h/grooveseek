@@ -108,6 +108,7 @@ uses.
 | [docs/clients.md](docs/clients.md) | `.mcp.json` recipes, the HTTP transport, the PostToolUse hook, the file watcher |
 | [docs/mcp-tools.md](docs/mcp-tools.md) | The MCP surface: tools, prompts, and `kb://` resources |
 | [docs/behavior.md](docs/behavior.md) | What gets indexed, where it is stored, and which files are refused |
+| [docs/deployment-topologies.md](docs/deployment-topologies.md) | Which process shape to deploy, what residency costs, and where the same-host boundary comes from |
 | [docs/retrieval-pipeline.md](docs/retrieval-pipeline.md) | RRF, reranking, MMR, and parent retriever, in the order they run |
 | [docs/filters.md](docs/filters.md) | Narrowing search results |
 | [docs/citations.md](docs/citations.md) | `match_spans` and byte offsets, for quoting sources accurately |
