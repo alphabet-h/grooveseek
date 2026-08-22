@@ -445,9 +445,9 @@ pub(crate) fn effective_allowed_hosts(
 /// それは別の面の話なので本 fn では触らない (`allowed_hosts` の既定は rmcp が
 /// 持っており、こちらで組み直すと既定値の実装が 2 つになる)。
 ///
-/// 判定に [`is_loopback_peer`] を使うのは、`admin_host_check` と**同じ問い**
-/// (「このアドレスは loopback か」) だから。別実装を置くと、IPv4-mapped IPv6 の
-/// ような端の扱いが 2 箇所で食い違う。
+/// 判定に [`is_loopback_peer`] を使うのは、[`DnsRebindingGate::decide`] の peer
+/// 検査と**同じ問い** (「このアドレスは loopback か」) だから。別実装を置くと、
+/// IPv4-mapped IPv6 のような端の扱いが 2 箇所で食い違う。
 pub(crate) fn effective_allowed_origins(
     configured: Option<Vec<String>>,
     bound: SocketAddr,
@@ -505,10 +505,10 @@ pub struct DaemonInfo {
     /// still running, stopping it killed the parent and the child survived, so
     /// the task's reach does not extend to descendants either way.
     ///
-    /// Only ever served from `/api/admin/status`, which `admin_host_check`
-    /// restricts to loopback unless the operator explicitly allows their bind
-    /// address. It is an identifier, not an action — stopping still requires
-    /// local privileges to signal the process.
+    /// Only ever served from `/api/admin/status`, which [`dns_rebinding_gate`]
+    /// restricts to a loopback peer — a requirement no configuration lifts. It
+    /// is an identifier, not an action — stopping still requires local
+    /// privileges to signal the process.
     pub pid: u32,
     pub uptime_secs: u64,
     pub started_at: String,
@@ -1721,8 +1721,13 @@ async fn healthz() -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// `/api/admin/status` endpoint — returns daemon / indexing / watcher / kb
-/// state. Gated by `admin_host_check` middleware (loopback only by default,
-/// callers add their bind addr to `KbServerShared.allowed_admin_hosts`).
+/// state. Gated by [`dns_rebinding_gate`]. Two of its questions always apply to
+/// this route: the peer must be loopback (not configurable by anything), and the
+/// `Host` must be in `KbServerShared.allowed_admin_hosts`. The third is
+/// conditional — an `Origin`, when one is sent, is checked against the shared
+/// `allowed_origins`, but [`DnsRebindingGate::decide`] returns before looking at
+/// it if that list is empty, which is what an explicit `allowed_origins = []`
+/// produces (a supported configuration; the server warns about it at startup).
 async fn api_admin_status(
     State(shared): State<Arc<KbServerShared>>,
 ) -> Result<axum::Json<AdminStatus>, (StatusCode, String)> {
