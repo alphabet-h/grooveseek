@@ -124,6 +124,13 @@ fn is_skipped_dir(relative: &Path) -> bool {
 }
 
 /// Every Markdown page this repository publishes, in a stable order.
+///
+/// A walk error is fatal rather than skipped. `.flatten()` would drop the
+/// unreadable directory and carry on, and the corpus would quietly lose whatever
+/// was under it -- a guard that checks less than it says it checks, which is the
+/// one failure this test has no way to report. The three named pages below catch
+/// a skip rule that grew too wide; they cannot catch a directory the filesystem
+/// refused halfway down.
 fn markdown_files(root: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = walkdir::WalkDir::new(root)
         .into_iter()
@@ -132,7 +139,15 @@ fn markdown_files(root: &Path) -> Vec<PathBuf> {
                 || !e.file_type().is_dir()
                 || !is_skipped_dir(e.path().strip_prefix(root).unwrap_or(e.path()))
         })
-        .flatten()
+        .map(|entry| {
+            entry.unwrap_or_else(|e| {
+                panic!(
+                    "the walk from {} failed partway through, so the corpus it \
+                     collected is smaller than this test claims to check: {e}",
+                    root.display()
+                )
+            })
+        })
         .map(|e| e.into_path())
         .filter(|p| p.extension().is_some_and(|e| e == "md"))
         .filter(|p| {
@@ -148,9 +163,11 @@ fn markdown_files(root: &Path) -> Vec<PathBuf> {
 
 /// One heading's anchor, the way GitHub generates it.
 ///
-/// GitHub's own implementation is `html-pipeline`'s table-of-contents filter:
-/// downcase, delete everything outside `[\p{Word}\- ]`, then turn spaces into
-/// hyphens. **The order is the part implementations get wrong.** Punctuation
+/// The algorithm is `github-slugger`'s -- the implementation the remark and MDX
+/// toolchains use to reproduce GitHub's anchors, and the oracle the cases below
+/// are taken from: downcase, delete everything outside `[\p{Word}\- ]`, then
+/// turn spaces into hyphens. **The order is the part implementations get wrong.**
+/// Punctuation
 /// goes first, so `信頼する置き場所 / しない置き場所` loses the slash and keeps
 /// *two* spaces, which become two hyphens -- and a slugger that mapped spaces
 /// first would produce one, and would then reject a link this repository
@@ -178,11 +195,25 @@ fn slug(heading_text: &str) -> String {
 /// as a heading and invents an anchor nothing links to -- harmless -- but the
 /// same regex misses a heading carrying a link or emphasis, which is not.
 ///
-/// Repeats get `-1`, `-2`, counted against the original slug, which is what
-/// GitHub does when a page says "## Notes" twice.
+/// Repeats get `-1`, `-2`, which is what GitHub does when a page says "## Notes"
+/// twice. The suffix is retried until it lands on an anchor nothing has taken:
+/// `# Foo`, `# Foo`, `# Foo-1` ends `foo`, `foo-1`, `foo-1-1`, because the third
+/// heading's own slug is already spoken for. Counting occurrences per base slug
+/// instead -- the shape the old `html-pipeline` filter had -- hands the third
+/// heading `foo-1` a second time, and a link to `#foo-1-1` is then reported
+/// broken.
+///
+/// **Which of the two GitHub itself does for that collision is not written down
+/// anywhere, and `POST /markdown` renders headings without ids, so it cannot be
+/// measured from here.** The retry is chosen because of how the two fail: it can
+/// only accept an anchor that does not exist, on a shape no page in this
+/// repository has, while the counter can reject a link that works and stop CI.
+/// A guard that cries wolf is a guard people learn to override.
 fn anchors_of(markdown: &str) -> BTreeSet<String> {
-    let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
-    let mut anchors = BTreeSet::new();
+    // Doubles as the set of anchors handed out: a key exists only because some
+    // heading was given exactly that anchor, and the value counts the suffixes
+    // tried against that key as a base.
+    let mut taken: BTreeMap<String, usize> = BTreeMap::new();
     let mut in_heading = false;
     let mut text = String::new();
 
@@ -195,26 +226,51 @@ fn anchors_of(markdown: &str) -> BTreeSet<String> {
             Event::End(TagEnd::Heading(_)) if in_heading => {
                 in_heading = false;
                 let base = slug(&text);
-                let seen = occurrences.entry(base.clone()).or_insert(0);
-                let anchor = if *seen == 0 {
-                    base.clone()
-                } else {
-                    format!("{base}-{seen}")
-                };
-                *seen += 1;
-                anchors.insert(anchor);
+                let mut anchor = base.clone();
+                while taken.contains_key(&anchor) {
+                    let tried = taken
+                        .get_mut(&base)
+                        .expect("the first collision was on `base`, so it is a key");
+                    *tried += 1;
+                    anchor = format!("{base}-{tried}");
+                }
+                taken.insert(anchor, 0);
             }
             Event::Text(t) | Event::Code(t) if in_heading => text.push_str(&t),
             Event::SoftBreak | Event::HardBreak if in_heading => text.push(' '),
             _ => {}
         }
     }
-    anchors
+    taken.into_keys().collect()
 }
 
 /// Whether a destination points outside the repository.
+///
+/// A leading `//` is a URL that borrows the page's scheme, not a path. Joining
+/// one to the source directory yields `\\example.com\guide` on Windows, which is
+/// a UNC share, and a missing file on the other two -- so a link a reader can
+/// follow would fail the build, differently on each operating system.
 fn is_external(dest: &str) -> bool {
-    dest.contains("://") || dest.starts_with("mailto:") || dest.starts_with("data:")
+    dest.contains("://")
+        || dest.starts_with("//")
+        || dest.starts_with("mailto:")
+        || dest.starts_with("data:")
+}
+
+/// A destination as the filesystem and the heading list spell it.
+///
+/// GitHub percent-decodes before it resolves, so `docs/my%20guide.md#caf%C3%A9`
+/// reaches `docs/my guide.md` and the heading `café`. Comparing the encoded form
+/// instead fails a link that works -- and the encoded form is what a writer
+/// produces by pasting a URL out of the address bar, which is the ordinary way
+/// to write a link to a page whose name has a space in it.
+///
+/// Split first, decode after: an encoded `%23` is a literal `#` in a filename,
+/// not the start of a fragment, and decoding first would cut the path there.
+fn decoded(part: &str) -> String {
+    percent_encoding::percent_decode_str(part)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 /// Every relative destination on this page, with the line it sits on.
@@ -282,8 +338,8 @@ fn every_relative_link_in_the_documentation_resolves() {
         for (line, dest) in links_of(&text) {
             checked += 1;
             let (path_part, anchor) = match dest.split_once('#') {
-                Some((p, a)) => (p, Some(a)),
-                None => (dest.as_str(), None),
+                Some((p, a)) => (decoded(p), Some(decoded(a))),
+                None => (decoded(&dest), None),
             };
             let where_ = format!("{shown}:{line}");
 
@@ -312,7 +368,7 @@ fn every_relative_link_in_the_documentation_resolves() {
                     .unwrap_or_else(|e| panic!("{} must be readable: {e}", target.display()));
                 anchors_of(&body)
             });
-            if !anchors.contains(anchor) {
+            if !anchors.contains(&anchor) {
                 broken.push(format!("{where_}  no such heading       -> {dest}"));
             }
         }
@@ -405,10 +461,63 @@ fn headings_come_from_the_parse_and_not_from_the_line_starts() {
     );
 }
 
+/// A heading whose own slug was already handed out, which is the case a
+/// per-base counter answers wrongly.
+///
+/// `# Foo`, `# Foo` leaves `foo` and `foo-1` taken. The third heading is written
+/// `Foo-1`, so it *wants* `foo-1` -- and has to keep going. The fourth is `Foo`
+/// again and takes the next suffix on its own base, not on the one the third
+/// heading ended up with.
+#[test]
+fn a_heading_whose_own_slug_is_taken_keeps_looking() {
+    let doc = "# Foo\n\n# Foo\n\n# Foo-1\n\n# Foo\n";
+    let anchors = anchors_of(doc);
+    assert_eq!(
+        anchors.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["foo", "foo-1", "foo-1-1", "foo-2"],
+        "{anchors:?}"
+    );
+}
+
 /// Reference-style links reach the checker resolved, so they are checked.
 #[test]
 fn a_reference_style_link_is_extracted_like_an_inline_one() {
     let doc = "See [the page][p] and [another](docs/x.md#h).\n\n[p]: docs/p.md\n";
     let found: Vec<String> = links_of(doc).into_iter().map(|(_, d)| d).collect();
     assert_eq!(found, vec!["docs/p.md", "docs/x.md#h"], "{found:?}");
+}
+
+/// What counts as pointing out of the repository, including the form that
+/// carries no scheme at all.
+#[test]
+fn a_destination_that_borrows_the_page_scheme_is_still_external() {
+    assert!(is_external("//example.com/guide"));
+    assert!(is_external("https://example.com"));
+    assert!(is_external("mailto:someone@example.com"));
+    assert!(!is_external("docs/usage.md"));
+    assert!(!is_external("#a-heading"));
+
+    // And it never reaches the resolver, which would read it as a UNC share.
+    let doc = "[mirror](//example.com/g) and [page](docs/p.md)\n";
+    let found: Vec<String> = links_of(doc).into_iter().map(|(_, d)| d).collect();
+    assert_eq!(found, vec!["docs/p.md"], "{found:?}");
+}
+
+/// Percent escapes are what a writer gets by copying a URL out of the address
+/// bar, and GitHub resolves them decoded.
+#[test]
+fn a_percent_encoded_destination_is_decoded_before_it_is_resolved() {
+    assert_eq!(decoded("docs/my%20guide.md"), "docs/my guide.md");
+    assert_eq!(decoded("caf%C3%A9"), "café");
+    assert_eq!(decoded("%E8%A6%8B%E5%87%BA%E3%81%97"), "見出し");
+
+    // Untouched when there is nothing to decode, including a bare `%`.
+    assert_eq!(decoded("docs/usage.md"), "docs/usage.md");
+    assert_eq!(decoded("100%-ok"), "100%-ok");
+
+    // An encoded `#` is part of the name, so the split has to happen first --
+    // decoding first would cut this destination into a path and a fragment.
+    let dest = "docs/c%23-notes.md";
+    assert!(dest.split_once('#').is_none());
+    assert_eq!(decoded(dest), "docs/c#-notes.md");
 }

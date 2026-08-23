@@ -170,6 +170,12 @@ criterion = { version = "0.5", default-features = false }
 # rusqlite without it and the shipped binary is unaffected; Cargo unifies the
 # feature into the same rusqlite when it builds the test targets.
 rusqlite = { version = "0.39", features = ["trace"] }
+# `tests/docs_links_resolve.rs` のみが使う。GitHub は Markdown のリンク先を
+# percent-decode してから解決するので (`docs/my%20guide.md` → `docs/my guide.md`)、
+# 同じ decode を挟まないと「読者が辿れるリンク」で CI が落ちる。`url` の transitive
+# 経由で既に lock に居るが、テストから直接 `use` する以上は direct dep 宣言する
+# (tower と同じ理由)。
+percent-encoding = "2"
 
 # Each `[[bench]]` entry below MUST set `harness = false` because criterion
 # brings its own harness. `name` matches the file under `benches/`.

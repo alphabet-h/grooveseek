@@ -74,19 +74,27 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   relative destinations, 35 of them anchored, 17 of those with Japanese
   fragments.
 
-  The anchor half is GitHub's own algorithm, from `html-pipeline`: downcase,
-  delete everything outside `[\p{Word}\- ]`, then turn spaces into hyphens. The
-  order is what implementations get wrong — `信頼する置き場所 / しない置き場所`
-  loses the slash first and keeps *two* spaces, so its anchor carries two
-  hyphens, and a slugger that mapped spaces before stripping punctuation would
-  reject a link this repository contains. Counted twice, with a second
-  implementation built on a different principle (Unicode general categories and a
-  line matcher, against this one's `char::is_alphanumeric` and a parser):
-  identical on all 792 anchors.
+  The anchor half follows `github-slugger`, the implementation the remark and
+  MDX toolchains use to reproduce GitHub's anchors: downcase, delete everything
+  outside `[\p{Word}\- ]`, then turn spaces into hyphens. The order is what
+  implementations get wrong — `信頼する置き場所 / しない置き場所` loses the slash
+  first and keeps *two* spaces, so its anchor carries two hyphens, and a slugger
+  that mapped spaces before stripping punctuation would reject a link this
+  repository contains. Counted twice, with a second implementation built on a
+  different principle (Unicode general categories and a line matcher, against
+  this one's `char::is_alphanumeric` and a parser): identical on all 792 anchors.
+
+  Repeats retry their suffix until it is free, so `# Foo`, `# Foo`, `# Foo-1`
+  ends `foo`, `foo-1`, `foo-1-1` rather than handing `foo-1` out twice. Which of
+  the two GitHub itself does is not documented and cannot be measured (`POST
+  /markdown` renders headings without ids); the retry is the side that can only
+  ever accept a missing anchor, where the counter can reject a working link and
+  stop CI.
 
   Pages are parsed rather than matched line by line, which is what makes a `#`
   inside a fenced TOML block not a heading and a reference-style link still a
-  link. External URLs are skipped entirely — a guard that can fail because
+  link, and destinations are percent-decoded the way GitHub decodes them before
+  resolving. External URLs are skipped entirely — a guard that can fail because
   someone else's server is down stops being read — and what it cannot catch is
   written down in the test: a link that resolves while the sentence around it
   lies, which is the failure the same README split shipped seven of.

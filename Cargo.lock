@@ -1941,6 +1941,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "oxidize-pdf",
+ "percent-encoding",
  "proptest",
  "pulldown-cmark",
  "quick-xml",
