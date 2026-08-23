@@ -5,10 +5,10 @@
 //! shape — and the shape is the reason the graph exists.
 //!
 //! **No layout dependency.** A general graph would need one, but this is a tree:
-//! [`GraphNode`] carries a single `parent_id`, and the walk's `visited` set means
-//! no node is reached twice. Depth becomes the column and sibling order the row,
-//! which is both easy to compute and a better fit for a BFS result than a
-//! general-purpose layout would be.
+//! [`crate::graph::GraphNode`] carries a single `parent_id`, and the walk's
+//! `visited` set means no node is reached twice. Depth becomes the column and
+//! sibling order the row, which is both easy to compute and a better fit for a
+//! BFS result than a general-purpose layout would be.
 
 use crate::graph::{ConnectionGraph, GraphNode};
 use std::collections::HashMap;

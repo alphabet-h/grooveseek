@@ -534,7 +534,7 @@ pub(crate) struct EvalCliArgs {
     /// Path to the knowledge-base directory
     #[arg(long)]
     pub(crate) kb_path: Option<PathBuf>,
-    /// Override golden file path. Default: <kb_path>/.groove-eval.yml or [eval].golden.
+    /// Override golden file path. Default: <kb_path>/.groove-eval.yml or `[eval].golden`.
     #[arg(long)]
     pub(crate) golden: Option<PathBuf>,
     /// Embedding model (must match the index)
@@ -543,7 +543,7 @@ pub(crate) struct EvalCliArgs {
     /// Optional cross-encoder reranker for this run.
     #[arg(long, value_enum)]
     pub(crate) reranker: Option<RerankerChoice>,
-    /// Comma-separated k list (default: [eval].k_values or 1,5,10)
+    /// Comma-separated k list (default: `[eval].k_values` or 1,5,10)
     #[arg(long, value_delimiter = ',')]
     pub(crate) k: Option<Vec<usize>>,
     /// Max hits to fetch per query (default: max of k list)
@@ -591,13 +591,13 @@ pub(crate) struct TuneCliArgs {
     /// Path to the knowledge-base directory
     #[arg(long)]
     pub(crate) kb_path: Option<PathBuf>,
-    /// Override golden file path. Default: <kb_path>/.groove-eval.yml or [eval].golden.
+    /// Override golden file path. Default: <kb_path>/.groove-eval.yml or `[eval].golden`.
     #[arg(long)]
     pub(crate) golden: Option<PathBuf>,
     /// Embedding model (must match the index)
     #[arg(long, value_enum)]
     pub(crate) model: Option<ModelChoice>,
-    /// Comma-separated k list to report (default: [eval].k_values or 1,5,10).
+    /// Comma-separated k list to report (default: `[eval].k_values` or 1,5,10).
     /// k=5 is always included: the adoption threshold is calibrated on nDCG@5.
     #[arg(long, value_delimiter = ',')]
     pub(crate) k: Option<Vec<usize>>,

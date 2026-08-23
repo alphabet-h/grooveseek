@@ -64,7 +64,7 @@ pub struct FieldRule {
     #[serde(default)]
     pub required: bool,
     /// `"string"` / `"array"` / `"date"` / `"integer"`。
-    /// 現状 Frontmatter は string と array<string> のみだが、スキーマ側は
+    /// 現状 Frontmatter は `string` と `array<string>` のみだが、スキーマ側は
     /// ユーザの書き方を広めに受け入れ、loader が妥当性を判断する。
     #[serde(default, rename = "type")]
     pub field_type: Option<FieldType>,

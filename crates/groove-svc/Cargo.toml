@@ -22,3 +22,7 @@ targets = ["x86_64-pc-windows-msvc"]
 [[bin]]
 name = "groove-svc"
 path = "src/main.rs"
+
+# rustdoc lint levels come from the workspace root, where the reasoning lives.
+[lints]
+workspace = true

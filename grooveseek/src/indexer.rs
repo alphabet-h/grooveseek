@@ -465,7 +465,7 @@ pub enum SingleResult {
 /// since the last index run are skipped.
 ///
 /// `exclude_headings`:
-/// - `None` → use [`markdown::DEFAULT_EXCLUDED_HEADINGS`]
+/// - `None` → use [`crate::parser::DEFAULT_EXCLUDED_HEADINGS`]
 /// - `Some(list)` → completely overrides the default list (pass `&[]` to
 ///   disable heading-based exclusion entirely).
 #[allow(clippy::too_many_arguments)] // D-10 で 8 個に。config struct 化は別 cycle
@@ -938,7 +938,7 @@ fn index_single_disk_entry(
 /// - 拡張子が `registry` に登録されていなければ `Skipped` を返す
 /// - hash が DB と一致なら `Unchanged`、違えば upsert + embedding 再計算
 /// - **size cap**: `is_binary()` な拡張子が `MAX_RAW_BINARY_BYTES` を超えていれば
-///   `fs::read` する前に skip する ([`binary_size_exceeded`]、codex P2 round 2:
+///   `fs::read` する前に skip する ([`size_cap_exceeded`]、codex P2 round 2:
 ///   watcher の create/modify 経路は元々これをバイパスして全量 read/hash していた)
 ///
 /// watcher から Create/Modify イベントを受けた時に呼ぶ。
@@ -1081,7 +1081,7 @@ pub enum RenameOutcome {
 /// - DB 側の path を UPDATE し、必要なら再 index (内容変更がある場合)
 /// - **size cap**: `is_binary()` な拡張子の新 path が `MAX_RAW_BINARY_BYTES`
 ///   を超えていれば hash 再計算のための `fs::read` をスキップする
-///   ([`binary_size_exceeded`]、codex P2 round 3。これで scan / reindex /
+///   ([`size_cap_exceeded`]、codex P2 round 3。これで scan / reindex /
 ///   rename の 3 read 経路すべてが同じ size-cap guard を通るようになった)
 ///
 /// watcher から Rename イベントペアを受けた時に呼ぶ。
@@ -1223,12 +1223,12 @@ pub fn rename_single_file(
 /// `registry`. Anything `rules` excludes is skipped — a directory along with
 /// its whole subtree. Sort for deterministic ordering.
 ///
-/// (feature-49) The decision moved into [`ExclusionRules`] so that this walk,
-/// the `validate` walk and the live watcher cannot answer it differently; the
-/// three had already drifted twice (AU-03, BU-19). The visible change here is
-/// that **files are filtered too**: `exclude_dirs` only ever named directories,
-/// but `.grooveignore` can name a file, so `filter_entry` no longer waves every
-/// non-directory through.
+/// (feature-49) The decision moved into [`crate::exclusion::ExclusionRules`] so
+/// that this walk, the `validate` walk and the live watcher cannot answer it
+/// differently; the three had already drifted twice (AU-03, BU-19). The visible
+/// change here is that **files are filtered too**: `exclude_dirs` only ever
+/// named directories, but `.grooveignore` can name a file, so `filter_entry` no
+/// longer waves every non-directory through.
 /// `pub(crate)` only so `watcher.rs` can put this walk and `should_process` side
 /// by side in one test and assert they answer the same way. Keeping them in
 /// separate test modules is how they drifted apart in the first place.

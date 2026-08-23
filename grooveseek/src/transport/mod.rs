@@ -42,7 +42,7 @@ pub struct HttpTransportConfig {
     pub bind: Option<String>,
 
     /// 受理する `Host` ヘッダの allow-list。`None` (省略) なら
-    /// [`http::DEFAULT_LOOPBACK_HOSTS`](crate::transport::http::DEFAULT_LOOPBACK_HOSTS)
+    /// [`http::DEFAULT_LOOPBACK_HOSTS`]
     /// = `["localhost", "127.0.0.1", "[::1]"]` **に加えて、実際に bind した
     /// アドレスが loopback ならその表記も**許可される (`127.0.0.2` に bind すれば
     /// それも通る)。組み立てているのは
@@ -120,7 +120,7 @@ pub enum Transport {
     Stdio,
     Http {
         addr: SocketAddr,
-        /// `None` = [`http::DEFAULT_LOOPBACK_HOSTS`](crate::transport::http::DEFAULT_LOOPBACK_HOSTS)
+        /// `None` = [`http::DEFAULT_LOOPBACK_HOSTS`]
         /// **+ bind したアドレスが loopback ならその表記**
         /// ([`http::effective_allowed_hosts`](crate::transport::http) が組み立てる)。
         /// `Some(vec)` = 明示 list (空 `Vec` を渡すと全 Host 許可になる)。
@@ -128,7 +128,7 @@ pub enum Transport {
         /// ADR-0009 以降 groove 自身。
         allowed_hosts: Option<Vec<String>>,
         /// `None` = bind した port の loopback origin を既定として組み立てる
-        /// ([`http::default_allowed_origins`](crate::transport::http::default_allowed_origins))。
+        /// ([`http::default_allowed_origins`])。
         /// `Some(vec)` = 明示 list。空 `Vec` は **Origin 検証無効**になるので、
         /// 既定にはしない。
         allowed_origins: Option<Vec<String>>,

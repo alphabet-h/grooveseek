@@ -28,6 +28,51 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# A doc comment that names something this tree no longer has fails the build.
+#
+# `transport/http.rs` named `admin_host_check` for two days after ADR-0009
+# deleted it, and nothing noticed: CI runs fmt / clippy / check / test, and a
+# backticked name is invisible to both rustc and rustdoc. Only an intra-doc link
+# — `` [`name`] `` — is checked at all, and only when someone runs `cargo doc`.
+# The levels below are what make that run mean something; the `test` job in
+# `ci.yml` is what makes it happen.
+#
+# **Here rather than in a CI-only `RUSTDOCFLAGS`** for two reasons. A local
+# `cargo doc` then answers the same way CI does, instead of showing warnings
+# where CI shows errors. And `[lints]` is package-scoped: `RUSTDOCFLAGS` reaches
+# every rustdoc invocation in the graph, so toggling it re-documents the path
+# dependencies as well.
+#
+# **Enumerated rather than `-D warnings`.** rustdoc gains lints between stable
+# releases and `dtolnay/rust-toolchain@stable` pins nothing, so a blanket deny
+# turns an unrelated PR red on the day a new lint lands — the failure mode that
+# already cost a morning when Rust 1.98 added a clippy lint. Every warn-by-
+# default rustdoc lint is named here, so adding the next one is a decision.
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+bare_urls = "deny"
+redundant_explicit_links = "deny"
+# The one warn-by-default rustdoc lint left alone, deliberately.
+#
+# It fires when a *public* item's documentation links to a *private* one, and it
+# fires only when that link **resolves** — the item is there, it is just not in
+# the published set. `docs/stability.md` puts this crate's Rust API under
+# Unstable and the rustdoc HTML is published nowhere, so a doc comment pointing
+# at the private helper that actually answers the question is the useful thing
+# to write, and `--document-private-items` renders it.
+#
+# What must not rot is the *name*, and a name that no longer exists is
+# `broken_intra_doc_links` above: the two triggers are disjoint, one requiring
+# resolution to succeed and the other requiring it to fail. Measured — renaming
+# `size_cap_exceeded` while leaving its four doc references alone fails this
+# build with four errors.
+#
+# Cargo already passes this same allow to the bin target on its own.
+private_intra_doc_links = "allow"
+
 # The profile that 'dist' will build with (moved from grooveseek/Cargo.toml during
 # feature-44 PR-1 workspace split; profiles must live at the workspace root).
 [profile.dist]

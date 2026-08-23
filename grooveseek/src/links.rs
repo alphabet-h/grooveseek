@@ -24,20 +24,20 @@
 //!
 //! ## Two questions, two entry points
 //!
-//! [`is_multiply_linked`] answers *which files belong in the index at all*, and
-//! it answers it about a **path**: the walk uses it to decide what to collect,
-//! and the watcher to decide whether an event is worth acting on. Both are
-//! bookkeeping decisions, and both need the path form — the watcher in
-//! particular gates deindexing, where there is no file left to open. Not
-//! collecting a file is also what *evicts* an already-indexed document that
+//! [`crate::links::is_multiply_linked`] answers *which files belong in the
+//! index at all*, and it answers it about a **path**: the walk uses it to
+//! decide what to collect, and the watcher to decide whether an event is worth
+//! acting on. Both are bookkeeping decisions, and both need the path form — the
+//! watcher in particular gates deindexing, where there is no file left to open.
+//! Not collecting a file is also what *evicts* an already-indexed document that
 //! gained a second name, since the deletion pass treats "not collected" as gone.
 //!
-//! [`read_checked`] answers the other question — *may these bytes be used* — and
-//! it answers it about a **handle**. It opens the file once and takes every
-//! decision from that open file description: link count, file type and size all
-//! come from one `fstat`, and the content is read from the same descriptor.
-//! Nothing can be substituted in between, because after the open there is no
-//! name left in the loop to substitute.
+//! [`crate::links::read_checked`] answers the other question — *may these bytes
+//! be used* — and it answers it about a **handle**. It opens the file once and
+//! takes every decision from that open file description: link count, file type
+//! and size all come from one `fstat`, and the content is read from the same
+//! descriptor. Nothing can be substituted in between, because after the open
+//! there is no name left in the loop to substitute.
 //!
 //! The second entry point exists because the first is not enough on its own. The
 //! walk collects paths and the bytes are read later, so a KB writer who could
@@ -97,10 +97,12 @@
 //! read.
 //!
 //! **Fail-open on error.** A path that cannot be examined is allowed through by
-//! [`is_multiply_linked`]. Deletion events arrive after the file is gone, and
-//! `should_process_parts` gates deindexing as well as indexing: refusing what we
-//! cannot stat would leave deleted documents in the index forever. The rule does
-//! not extend to [`read_checked`], where a file that cannot be opened yields no
+//! [`crate::links::is_multiply_linked`]. Deletion events arrive after the file
+//! is gone, and the gate in [`crate::watcher`] covers deindexing as well as
+//! indexing -- `should_process_parts`, private to that module and so nameable
+//! from here only in prose. Refusing what we cannot stat would leave deleted
+//! documents in the index forever. The rule does not extend to
+//! [`crate::links::read_checked`], where a file that cannot be opened yields no
 //! bytes either way.
 
 use std::fs::File;

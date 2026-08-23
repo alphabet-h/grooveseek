@@ -26,9 +26,9 @@
 //!   the connection is not dropped either, because the mutex outlives the
 //!   panicking thread. Then the transaction is still open, every later write
 //!   joins it silently (the `&self` API is autocommit-aware by design), and
-//!   nobody commits it. [`recover_db`] asks the connection whether that
-//!   happened and rolls back explicitly if so — cheap, and the only branch that
-//!   is not "do nothing" says so in the log.
+//!   nobody commits it. [`crate::poison::recover_db`] asks the connection
+//!   whether that happened and rolls back explicitly if so — cheap, and the
+//!   only branch that is not "do nothing" says so in the log.
 //! - **`Embedder` / `Reranker`** (fastembed over ONNX Runtime): recovery is a
 //!   judgement, not a proof. Neither crate exposes a way to ask a session
 //!   whether it is still consistent, so "the session is fine" cannot be

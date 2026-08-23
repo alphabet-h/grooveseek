@@ -304,7 +304,7 @@ impl<T: Parser + ?Sized> ParserExt for T {
 // Config
 // ---------------------------------------------------------------------------
 
-/// [parsers] セクション (`groove.toml`)。
+/// `[parsers]` セクション (`groove.toml`)。
 ///
 /// - キー省略時 (`parsers: None`) は `Registry::defaults()` (= `["md"]` のみ、
 ///   legacy 完全後方互換) を適用する。ユーザが `.txt` 等を index したい

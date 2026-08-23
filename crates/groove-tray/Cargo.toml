@@ -27,6 +27,10 @@ path = "src/main.rs"
 name = "groove_tray"
 path = "src/lib.rs"
 
+# rustdoc lint levels come from the workspace root, where the reasoning lives.
+[lints]
+workspace = true
+
 # Windows-only runtime dependencies. The non-Windows build path is a fail-fast
 # stub (see src/main.rs) so these deps are not compiled on Linux/macOS.
 [target.'cfg(windows)'.dependencies]

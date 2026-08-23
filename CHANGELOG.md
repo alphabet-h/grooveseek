@@ -58,6 +58,52 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Nothing about reranking changed — only what the tool says it costs, and
   therefore the advice about when to switch it on.
 
+### Internal
+
+- **A doc comment that names something this tree no longer has now fails CI.**
+  `cargo doc --no-deps --workspace --all-features --document-private-items` runs
+  as the last step of the `test` job, and `[workspace.lints.rustdoc]` in the root
+  `Cargo.toml` denies every warn-by-default rustdoc lint except one. Until now CI
+  ran fmt, clippy, check and test, none of which read a doc comment:
+  `transport/http.rs` named `admin_host_check` for two days after
+  [ADR-0009](docs/decisions/0009-one-dns-rebinding-gate.md) deleted it, and
+  PR #219 converted references like it into links that nothing was yet checking.
+
+  Twenty-four references were already broken when the check was switched on, and
+  the interesting ones were not typos. `binary_size_exceeded` was the old name of
+  `size_cap_exceeded`, cited twice. `Refusal::message` had become
+  `Refusal::response`. Six more — `GraphNode`, `inspect`, `is_multiply_linked`
+  twice, `read_checked` twice, `recover_db` — sat in module `//!` headers, where
+  a bare name does not resolve even to an item defined in the same file; they
+  are absolute paths now. The rest were prose that rustdoc was reading as a link:
+  a TOML section `[eval]`, an interval `[30,100]`, an `array<string>` that parsed
+  as an unclosed HTML tag.
+
+  `private_intra_doc_links` is the one lint left at `allow`. It fires when a
+  public item's documentation links to a private one **and that link resolves** —
+  the item is there, it is simply not in the published set. This crate's Rust API
+  is Unstable by [docs/stability.md](docs/stability.md) and its rustdoc is
+  published nowhere, so pointing at the private helper that answers the question
+  is the useful thing to write. A name that no longer exists is a different lint,
+  and that one is denied: renaming `size_cap_exceeded` while leaving its four
+  doc references alone fails the build with four errors.
+
+  `--all-features` is there for the reason clippy runs twice: `test-helpers` is
+  default-off and gates documented items, and rustdoc removes a gated item's doc
+  comment along with the item. Unlike clippy this needs only one run, because the
+  workspace's only `#[cfg(not(feature = ...))]` is in `benches/`, which `cargo
+  doc` does not document either way.
+
+  It is a step in an existing job rather than a fourth job. `cargo doc --no-deps`
+  wants exactly the dependency metadata `cargo check --all-targets` already
+  produced, so it costs one rustdoc pass — 15.8 s over the whole workspace,
+  measured — instead of a second dependency build, and it adds no cache entry to
+  a repository whose Actions caches already total 13.6 GB against a 10 GB limit.
+  Being in that job is also what puts it on all three operating systems, which is
+  the point: `service/{linux,macos,windows}.rs` are whole modules behind
+  `#[cfg(target_os = ...)]`, so a single-OS doc check would never read two of
+  them.
+
 ## [1.0.0] - 2026-08-22
 
 ### Added
