@@ -49,9 +49,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   query on CPU with `bge-v2-m3` over 50 candidates". Measured against 1.0.0 on
   one Windows machine, the same query takes 3.1–3.6 s without it and 74–87 s
   with it through `groove search`, and 0.1 s against 74–79 s through a resident
-  daemon. Residency does not help: the first reranked query on a fresh daemon,
-  the one that pays the model load, was the fastest of its batch, so the cost is
-  the cross-encoder pass over the candidate pool rather than the load.
+  daemon. Residency does not help: the daemon builds the reranker at startup, so
+  its second and later reranked queries have no model left to load and still take
+  74–79 s. The cost is the cross-encoder pass over the candidate pool.
 
   The number, the `--help` line, and the recommendation table built on the
   number are replaced by the measurement and the conditions it was taken under.
