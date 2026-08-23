@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-24
+
 ### Added
 
 - **A page about which shape to deploy in.** [docs/deployment-topologies.md](docs/deployment-topologies.md)
@@ -57,6 +59,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   number are replaced by the measurement and the conditions it was taken under.
   Nothing about reranking changed — only what the tool says it costs, and
   therefore the advice about when to switch it on.
+
+- **`docs/mcp-tools.md` dated the `rebuild_index` bound to a version that never
+  existed.** It said the one-at-a-time refusal arrived in `v0.28.0`; 0.27.0 was
+  followed by 1.0.0, so there is no such release. The bound shipped in 1.0.0 and
+  the page now says so.
 
 ### Internal
 
@@ -4557,7 +4564,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/alphabet-h/grooveseek/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/alphabet-h/grooveseek/compare/v0.27.0...v1.0.0
 [0.27.0]: https://github.com/alphabet-h/grooveseek/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/alphabet-h/grooveseek/compare/v0.25.0...v0.26.0

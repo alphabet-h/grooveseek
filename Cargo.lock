@@ -1896,11 +1896,11 @@ dependencies = [
 
 [[package]]
 name = "groove-svc"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "groove-tray"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "grooveseek"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "axum",
