@@ -46,7 +46,7 @@ pub struct HttpTransportConfig {
     /// = `["localhost", "127.0.0.1", "[::1]"]` **に加えて、実際に bind した
     /// アドレスが loopback ならその表記も**許可される (`127.0.0.2` に bind すれば
     /// それも通る)。組み立てているのは
-    /// [`http::effective_allowed_hosts`](crate::transport::http) なので、
+    /// [`http::effective_allowed_hosts`] なので、
     /// **監査するならこの 3 要素ではなくそちらを見ること**。
     /// LAN / イントラ公開時は `["192.168.1.10", "kb.example.lan", ...]` のように
     /// 明示する。空 `Vec` を渡すと **全 Host を許可**する (rmcp の
@@ -54,7 +54,7 @@ pub struct HttpTransportConfig {
     ///
     /// **検証するのは rmcp ではなく groove 自身**。ADR-0009 以降、rmcp の Host /
     /// Origin 検査は空リストを渡して無効化してあり、`/mcp` も `/healthz` も admin
-    /// 経路も [`http::dns_rebinding_gate`](crate::transport::http) が答える。
+    /// 経路も [`http`] の `dns_rebinding_gate` が答える。
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
 
@@ -122,7 +122,7 @@ pub enum Transport {
         addr: SocketAddr,
         /// `None` = [`http::DEFAULT_LOOPBACK_HOSTS`]
         /// **+ bind したアドレスが loopback ならその表記**
-        /// ([`http::effective_allowed_hosts`](crate::transport::http) が組み立てる)。
+        /// ([`http::effective_allowed_hosts`] が組み立てる)。
         /// `Some(vec)` = 明示 list (空 `Vec` を渡すと全 Host 許可になる)。
         /// F-33 で `groove.toml` から surface した。判定するのは
         /// ADR-0009 以降 groove 自身。
@@ -151,7 +151,7 @@ impl Transport {
     /// - HTTP bind 解決: `--bind` (完全形) > `(127.0.0.1, --port)` > config bind > `127.0.0.1:3100`
     /// - `allowed_hosts`: `[transport.http].allowed_hosts` が指定されていれば
     ///   それ、無ければ
-    ///   [`http::effective_allowed_hosts`](crate::transport::http) が組み立てる
+    ///   [`http::effective_allowed_hosts`] が組み立てる
     ///   既定 (loopback 名 + bind したアドレスが loopback ならその表記) になる。
     ///   **ADR-0009 以降、判定するのは rmcp ではなく groove 自身**。CLI からは
     ///   設定不可 (config 専用、誤設定を防ぐ意図 — ここを CLI で渡せると public
@@ -483,8 +483,8 @@ mod tests {
     }
 
     /// The spelling `allowed_hosts` accepts, written into the key next door.
-    /// [`http::parse_origin`](crate::transport::http) drops it at match time and
-    /// says nothing, leaving Origin validation on with nothing to match — so the
+    /// The `parse_origin` in [`http`] drops it at match time and says nothing,
+    /// leaving Origin validation on with nothing to match — so the
     /// server 403s every browser, including its own `/ui`, and the log is
     /// silent. Refusing here, before the list becomes part of a running
     /// transport, is the last place it is visible.
@@ -541,9 +541,9 @@ mod tests {
     }
 
     /// 省略時は `None`。`run_http` がそこで **bind した port の loopback origin**
-    /// を組み立てる。`Some(vec![])` との違いが要点で、空 `Vec` は
-    /// [`http::origin_is_allowed`](crate::transport::http) が「検証しない」と
-    /// 読む符号 (rmcp から受け継いだ約束) なので、省略の既定にしてはならない。
+    /// を組み立てる。`Some(vec![])` との違いが要点で、空 `Vec` は [`http`] の
+    /// `origin_is_allowed` が「検証しない」と読む符号 (rmcp から受け継いだ約束)
+    /// なので、省略の既定にしてはならない。
     #[test]
     fn test_resolve_config_omitted_allowed_origins_is_none_not_empty() {
         let cfg = TransportConfig {
@@ -566,7 +566,7 @@ mod tests {
     }
 
     /// F-33: `[transport.http].allowed_hosts` の deserialize は省略可。
-    /// toml に書かなければ `None` (= [`http::effective_allowed_hosts`](crate::transport::http)
+    /// toml に書かなければ `None` (= [`http::effective_allowed_hosts`]
     /// が組む loopback-only な既定)。
     #[test]
     fn test_http_transport_config_omits_allowed_hosts() {
@@ -593,8 +593,8 @@ mod tests {
         );
     }
 
-    /// F-33: 空配列も valid ([`http::validate_host_header`](crate::transport::http)
-    /// が全 Host 許可として扱う、operator 自己責任)。
+    /// F-33: 空配列も valid ([`http::validate_host_header`] が全 Host 許可として
+    /// 扱う、operator 自己責任)。
     #[test]
     fn test_http_transport_config_allows_empty_vec() {
         let toml_str = r#"

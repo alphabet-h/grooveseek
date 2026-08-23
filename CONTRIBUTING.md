@@ -120,14 +120,11 @@ So: if you add a module, add tests with it. When the floor trips, the offending 
 
 1. Fork the repo and branch from `main`
 2. Add tests for new behavior (unit tests inline, integration tests under `tests/`)
-3. Run the checks above — both clippy legs, not just the first:
-   ```bash
-   cargo fmt --all
-   cargo clippy --all-targets -- -D warnings
-   cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
-   cargo test
-   cargo doc --no-deps --workspace --all-features --document-private-items
-   ```
+3. Run **every** command in the block under [Build and test](#build-and-test),
+   in the order it gives them. It is not repeated here on purpose: this step
+   used to carry its own shorter copy, and the copy drifted — it named one
+   clippy leg where CI runs two, which is the exact failure the block above
+   warns about.
 4. Open a PR describing the problem and the change; link any related issues
 
 ## Reporting bugs
