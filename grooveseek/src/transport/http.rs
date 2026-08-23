@@ -91,7 +91,8 @@ const _: () = assert!(
 /// origin に混ぜても誰も送ってこない値が増えるだけになる。
 ///
 /// IPv6 に角括弧を付けるのは RFC 6454 の origin シリアライズに合わせるため
-/// (`http://[::1]:3100`)。rmcp は entry に scheme を要求する。
+/// (`http://[::1]:3100`)。entry に scheme が要るのは
+/// [`check_origin_entry`] がそう要求するからで、規則は rmcp から受け継いだもの。
 ///
 /// `https://` を混ぜていないのは、TLS を終端するのは常に前段の proxy であり、
 /// その時ブラウザが送る origin は loopback ではなく公開ホスト名になるから。
@@ -166,10 +167,11 @@ enum NormalizedOrigin {
     },
 }
 
-/// Why an origin string did not survive parsing. rmcp keeps no such distinction
-/// — it returns `Option` and drops the entry — but [`check_origin_list`] has to
-/// tell the operator *which* rule their entry broke, so the reason is carried
-/// here and turned into words there.
+/// Why an origin string did not survive parsing. The upstream shape this was
+/// modelled on has no such distinction — it returns `Option` and drops the entry
+/// with nothing to say — but [`check_origin_list`] has to tell the operator
+/// *which* rule their entry broke, so the reason is carried here and turned into
+/// words there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OriginRejection {
     Empty,
@@ -188,13 +190,16 @@ enum OriginRejection {
 /// same browser.
 ///
 /// It deliberately omits the defensive rejects `validate_host_header` adds for
-/// `Host` (userinfo, port out of range). Those make groove *stricter* than rmcp,
-/// which is safe when groove is the only gate. Here it is not: `/mcp` is guarded
-/// by rmcp's copy and the admin router by this one, and a rule present in only
-/// one of them is a surface answering 403 where its neighbour answers 200.
+/// `Host` (userinfo, port out of range). The reason was that two matchers were
+/// live — `/mcp` was guarded by rmcp's copy and the admin router by this one —
+/// and a rule present in only one of them is a surface answering 403 where its
+/// neighbour answers 200. ADR-0009 ended that: this parser now answers for every
+/// route. The omission stands because narrowing it would refuse configurations
+/// that work today, which is a behaviour change and not a comment's to make.
 fn parse_origin(value: &str) -> Result<NormalizedOrigin, OriginRejection> {
-    // rmcp trims first (`tower.rs:782`), so a padded entry in `groove.toml`
-    // is honoured rather than dropped. Measured, not assumed — see
+    // Trimming first is what makes a padded entry in `groove.toml` honoured
+    // rather than dropped; rmcp's `parse_origin_value` trims too, which is where
+    // the behaviour was inherited from. Measured, not assumed — see
     // `an_entry_with_padding_is_still_honoured_by_the_server`.
     let value = value.trim();
     if value.is_empty() {
@@ -218,8 +223,9 @@ fn parse_origin(value: &str) -> Result<NormalizedOrigin, OriginRejection> {
     })
 }
 
-/// Does this request's origin match the allow-list? `rmcp`'s `origin_is_allowed`
-/// (`tower.rs:799-822`), for the routes rmcp does not serve.
+/// Does this request's origin match the allow-list? Modelled on `rmcp`'s
+/// `origin_is_allowed`, and since ADR-0009 the only one that runs — for every
+/// route, `/mcp` included.
 ///
 /// An empty list means "do not validate", exactly as it does upstream — that is
 /// what `allowed_origins = []` buys, and both surfaces have to read it the same
@@ -276,8 +282,8 @@ pub(crate) fn check_origin_list(origins: &[String]) -> anyhow::Result<()> {
             let shown = entry.escape_default();
             anyhow::bail!(
                 "[transport.http].allowed_origins: {why}, got \"{shown}\". An entry \
-                 rmcp cannot parse is dropped before matching, which leaves Origin \
-                 validation switched on with nothing to match: every request \
+                 that cannot be parsed is dropped before matching, which leaves \
+                 Origin validation switched on with nothing to match: every request \
                  carrying an Origin header is then refused with 403, and nothing \
                  says why. Note this key is stricter than allowed_hosts, which \
                  accepts a bare host or host:port."
@@ -287,9 +293,9 @@ pub(crate) fn check_origin_list(origins: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether this entry leaves the port open, so that rmcp matches it against
-/// **every** port on that host (`a_port.is_none() || a_port == o_port`,
-/// `tower.rs:819`).
+/// Whether this entry leaves the port open, so that it matches **every** port on
+/// that host ([`NormalizedAuthority::matches`], which keeps rmcp's rule:
+/// an absent port in the allow-list entry matches any port in the request).
 ///
 /// That is wider than RFC 6454, where an omitted port *means* the scheme's
 /// default port — but it cannot be narrowed from here. The browser omits the
@@ -436,14 +442,15 @@ pub(crate) fn effective_allowed_hosts(
 ///    開いたブラウザは `Origin: http://127.0.0.2:3100` を送る。既定 3 種にそれが
 ///    無いと、Origin 検証が理由で 403 になる (codex P2 round 2 on PR #173)
 ///
-/// **ただし 2 は「Origin では弾かない」までしか保証しない。** 実測 (bind
-/// `127.0.0.2:3197`): `Host: 127.0.0.2:3197` は **rmcp の Host allow-list**
-/// (既定 = `localhost` / `127.0.0.1` / `::1`) で先に 403 になる。`Host` を
-/// `127.0.0.1` にすると 200 が返り、その状態で `Origin: http://127.0.0.2:3197`
-/// も通る = ここの修正は効いている。つまり 127.0.0.1 以外の loopback を
-/// **ブラウザから実際に使う**には `[transport.http].allowed_hosts` の設定も要る。
-/// それは別の面の話なので本 fn では触らない (`allowed_hosts` の既定は rmcp が
-/// 持っており、こちらで組み直すと既定値の実装が 2 つになる)。
+/// **round 2 の時点では、2 は「Origin では弾かない」までしか保証しなかった。**
+/// 実測 (bind `127.0.0.2:3197`) では `Host: 127.0.0.2:3197` が **rmcp の Host
+/// allow-list** (当時の既定 = `localhost` / `127.0.0.1` / `::1`) で先に 403 に
+/// なり、127.0.0.1 以外の loopback をブラウザから使うには
+/// `[transport.http].allowed_hosts` を別途書く必要があった。
+///
+/// **その制約はもう無い。** round 8 で [`effective_allowed_hosts`] が Host 側にも
+/// 同じ bind アドレスを足すようになり、ADR-0009 が rmcp の検査を空リストで
+/// 無効化したので、既定値の実装は 1 つしか無く、2 面が揃って動く。
 ///
 /// 判定に [`is_loopback_peer`] を使うのは、[`DnsRebindingGate::decide`] の peer
 /// 検査と**同じ問い** (「このアドレスは loopback か」) だから。別実装を置くと、
@@ -666,17 +673,18 @@ fn has_explicit_port_suffix(raw: &str) -> bool {
 /// 「このサーバに届くローカルな名前」の**唯一の定義**。
 ///
 /// 元は rmcp の default loopback list の *mirror* だったが、
-/// (codex P1 round 8 on PR #173) で **こちらを定義側にした** — `allowed_hosts`
-/// 省略時も `with_allowed_hosts` でこの集合を rmcp に渡すようにしたので、
-/// mirror ではなくなった。上流の既定が変わっても、こちらの 4 つのリストが
-/// 揃ってずれる / 揃わなくなる、のどちらも起きない。
+/// (codex P1 round 8 on PR #173) で **こちらを定義側にした**。ADR-0009 以降は
+/// rmcp に**空リストを渡して検査ごと無効化**しているので、この集合は rmcp へ
+/// 渡るのではなく [`DnsRebindingGate`] がそのまま突き合わせる。上流の既定が
+/// 変わっても、こちらの 4 つのリストが揃ってずれる / 揃わなくなる、の
+/// どちらも起きない。
 ///
 /// IPv6 は **bracketed** (`"[::1]"`) を一次形にする。allow-list 側は
 /// `NormalizedAuthority::from_allowed_entry` の fallback で unbracketed
 /// (`"::1"`) も同等扱いされるため、`Authority::try_from` が parse できる
-/// bracketed 形式にすると helper 内 normalize が単純化される。
-/// **rmcp 側も同じ正規化を持つ** (本ファイルの `NormalizedAuthority` がその
-/// mirror) ため、bracketed のまま渡して問題ない — 実測で確認済み。
+/// bracketed 形式にすると helper 内 normalize が単純化される。突き合わせるのは
+/// 本ファイルの [`NormalizedAuthority`] (rmcp の正規化の mirror) だけなので、
+/// bracketed のままで完結する — 実測で確認済み。
 /// (codex P1 round 7 on PR #173) `pub(crate)`: this is the crate's one answer to
 /// "which local names reach this server". Four allow-lists ask it — `/healthz`
 /// Host validation, the `/mcp` Host defaults ([`effective_allowed_hosts`]), the
@@ -813,12 +821,14 @@ fn forbidden_plain(msg: &str) -> Response {
 /// helpful context message.
 ///
 /// `allowed_hosts`:
-/// - `None` → rmcp の default (`["localhost", "127.0.0.1", "::1"]`、loopback
-///   only) を使う。DNS rebinding 攻撃に対する標準的な防御。
+/// - `None` → [`effective_allowed_hosts`] が [`DEFAULT_LOOPBACK_HOSTS`]
+///   (`"localhost"` / `"127.0.0.1"` / `"[::1]"`)、および bind が loopback なら
+///   そのアドレスも足した list を作る。DNS rebinding 攻撃に対する標準的な防御で、
+///   突き合わせるのは [`DnsRebindingGate`] (ADR-0009 以降、rmcp ではない)。
 /// - `Some(vec)` → `[transport.http].allowed_hosts` で operator が明示した
 ///   list を使う。LAN / イントラ公開時はここに公開ホスト名 / IP を入れる。
-///   空 `Vec` を渡すと rmcp は **全 Host ヘッダを許可** する (
-///   `disable_allowed_hosts` と同等)。public 公開時は推奨されない。
+///   空 `Vec` を渡すと [`validate_host_header`] が **全 Host ヘッダを許可**
+///   する (rmcp の `disable_allowed_hosts` 相当)。public 公開時は推奨されない。
 ///
 /// 加えて、bind が **非 loopback** (`0.0.0.0`、特定 LAN IP 等) の状態で
 /// `allowed_hosts` が `None` (= loopback only な default) のままなら、
@@ -930,10 +940,11 @@ pub async fn run_http(
     // default in place, which made `/mcp`'s Host check the one list not fed by
     // `DEFAULT_LOOPBACK_HOSTS` — so the next alias added to that constant would
     // have been honoured by `/healthz`, by Origin validation and by the admin
-    // router, and refused by `/mcp`. Passing it explicitly inverts the old
-    // relationship on purpose: the constant stops being a mirror of an upstream
-    // value and becomes the definition, which also means a change to rmcp's
-    // default can no longer move one of our four lists without the others.
+    // router, and refused by `/mcp`. Round 8 inverted that relationship and
+    // ADR-0009 finished it: rmcp is handed an empty list below and matches
+    // nothing, so the constant is not a mirror of an upstream value but the
+    // definition, and a change to rmcp's default can no longer move one of our
+    // four lists without the others.
     //
     // `should_warn_non_loopback_bind` above still reads the operator's
     // `allowed_hosts`, not this: the warning is about whether they said
@@ -1997,13 +2008,13 @@ mod tests {
 
     /// The trap this check exists for. `allowed_hosts` takes a bare `host:port`
     /// — its parser ends in a fallback that reads the whole string as a host —
-    /// so the spelling carries over to the neighbouring key, where rmcp drops it
-    /// without a word and refuses every request that carries an `Origin`.
+    /// so the spelling carries over to the neighbouring key, where [`parse_origin`]
+    /// drops it without a word and every request carrying an `Origin` is refused.
     #[test]
     fn a_bare_host_and_port_is_refused_where_allowed_hosts_would_take_it() {
         for entry in ["127.0.0.1:3100", "localhost:3100", "kb.example.com"] {
             let why = check_origin_entry(entry)
-                .expect_err("a spelling with no scheme never reaches rmcp's comparison");
+                .expect_err("a spelling with no scheme never reaches the comparison");
             assert!(
                 why.contains("scheme"),
                 "the message has to name what is missing, got {why:?}"
@@ -2026,8 +2037,8 @@ mod tests {
     }
 
     /// `null` is a real origin (RFC 6454 §6.1 — sandboxed frames, `file://`),
-    /// and rmcp gives it a variant of its own, so refusing it here would reject
-    /// a config that works.
+    /// and [`NormalizedOrigin`] gives it a variant of its own, so refusing it
+    /// here would reject a config that works.
     #[test]
     fn the_null_origin_is_an_origin() {
         for entry in ["null", "NULL", " null "] {
@@ -2035,40 +2046,42 @@ mod tests {
         }
     }
 
-    /// The check answers "does rmcp still have this at match time", not "is this
-    /// a well-formed origin". A trailing path is not part of a serialized origin,
-    /// but rmcp keeps only the scheme and authority and never looks at it — so
-    /// refusing it here would stop a config that works today from starting.
-    /// Being stricter than the parser we are protecting is its own defect.
+    /// The check answers "does the matcher still have this at match time", not
+    /// "is this a well-formed origin". A trailing path is not part of a
+    /// serialized origin, but [`parse_origin`] keeps only the scheme and
+    /// authority and never looks at it — so refusing it here would stop a config
+    /// that works today from starting. Being stricter than the parser we are
+    /// protecting is its own defect.
     #[test]
     fn a_trailing_path_is_not_this_checks_business() {
         assert_eq!(check_origin_entry("https://kb.example.com/mcp"), Ok(()));
     }
 
-    /// Padding is accepted **because rmcp trims first**: `parse_origin_value`
-    /// opens with `let value = value.trim();` (`tower.rs:782`) and is the only
-    /// consumer of the allow-list — `origin_is_allowed` maps every entry
-    /// through it (`:805`). Our own warning helper trims as well, in
-    /// `NormalizedAuthority::from_allowed_entry`.
+    /// Padding is accepted **because the matcher trims first**: [`parse_origin`]
+    /// opens with `let value = value.trim();`, and since ADR-0009 it is the only
+    /// consumer of the allow-list — [`origin_is_allowed`] maps every entry
+    /// through it. Our own warning helper trims as well, in
+    /// `NormalizedAuthority::from_allowed_entry`. rmcp's `parse_origin_value`
+    /// trims too, which is where this behaviour was inherited from.
     ///
-    /// So this is not leniency, it is the mirror staying accurate. Should rmcp
-    /// ever stop trimming, the entry would be dropped where we said it would
-    /// pass — the failure this check exists to prevent — which is why the claim
-    /// is measured through a running server in `tests/http_origin.rs` rather
-    /// than asserted here alone.
+    /// So this is not leniency, it is the check agreeing with the parser it
+    /// guards. Should that parser ever stop trimming, the entry would be dropped
+    /// where we said it would pass — the failure this check exists to prevent —
+    /// which is why the claim is measured through a running server in
+    /// `tests/http_origin.rs` rather than asserted here alone.
     #[test]
     fn padding_is_accepted_because_the_parser_we_mirror_trims() {
         for entry in [" https://kb.example.com ", "\thttp://127.0.0.1:3100\n"] {
             assert_eq!(
                 check_origin_entry(entry),
                 Ok(()),
-                "{entry:?} reaches rmcp's comparison, so refusing it here would \
+                "{entry:?} reaches the comparison, so refusing it here would \
                  stop a config that works"
             );
         }
     }
 
-    /// Empty and whitespace-only entries: rmcp drops these too.
+    /// Empty and whitespace-only entries: the matcher drops these too.
     #[test]
     fn an_entry_with_nothing_in_it_is_refused() {
         for entry in ["", "   ", "\t"] {
@@ -2250,11 +2263,14 @@ mod tests {
     /// three fixed defaults do not contain. The bound address itself has to join
     /// the list, so that Origin validation is not the thing refusing it.
     ///
-    /// Measured caveat, recorded so nobody reads more into this than it does:
-    /// with `--bind 127.0.0.2`, `Host: 127.0.0.2:PORT` is refused a step earlier
-    /// by rmcp's Host allow-list. Reaching such a bind from a browser also needs
-    /// `[transport.http].allowed_hosts` — a separate surface, deliberately not
-    /// changed here.
+    /// The caveat this test was written under is gone, and saying so is the
+    /// point of keeping the sentence: at round 2, `--bind 127.0.0.2` still had
+    /// `Host: 127.0.0.2:PORT` refused a step earlier by rmcp's Host allow-list,
+    /// so reaching such a bind from a browser also needed
+    /// `[transport.http].allowed_hosts`. Round 8 gave the Host side the same
+    /// treatment this test asserts for the Origin side —
+    /// [`effective_allowed_hosts`] adds the bound address too — so both halves
+    /// now agree without extra configuration.
     #[test]
     fn effective_origins_include_a_bound_loopback_address_beyond_127_0_0_1() {
         let bound: SocketAddr = "127.0.0.2:3100".parse().unwrap();
@@ -2298,11 +2314,11 @@ mod tests {
     /// (codex P1 round 8 on PR #173) The constant is the definition of the
     /// `/healthz` default set, not a list that happens to look like it. Pinning
     /// this is what makes adding an alias a one-line change: the same constant
-    /// feeds Origin defaults, the admin allow-list, and — since round 8 — the
-    /// list handed to rmcp for `/mcp`.
+    /// feeds Origin defaults, the admin allow-list, and — since round 8 —
+    /// `/mcp`'s Host list, which was rmcp's until ADR-0009.
     ///
-    /// rmcp's own acceptance of the bracketed spelling is covered end to end
-    /// rather than here: a server started with the shared set answers 200 to
+    /// Acceptance of the bracketed spelling is covered end to end rather than
+    /// here: a server started with the shared set answers 200 to
     /// `Host: 127.0.0.1`, `localhost` and `[::1]`, and 403 to `evil.example`.
     #[test]
     fn every_shared_alias_passes_the_default_host_check() {
@@ -2741,8 +2757,8 @@ mod tests {
         );
     }
 
-    /// `healthz_public = false` + `allowed_hosts = None` → rmcp default
-    /// loopback list 互換 (= localhost / 127.0.0.1 / ::1 のみ pass)。
+    /// `healthz_public = false` + `allowed_hosts = None` → groove 自身の
+    /// [`DEFAULT_LOOPBACK_HOSTS`] (= localhost / 127.0.0.1 / ::1 のみ pass)。
     #[tokio::test]
     async fn test_healthz_public_false_with_none_allowed_hosts_uses_loopback_default() {
         // non-loopback Host → 403
