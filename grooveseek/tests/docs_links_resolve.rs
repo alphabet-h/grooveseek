@@ -37,9 +37,10 @@
 //! someone else's server is down stops being read.
 //!
 //! A fragment is read in the language of the file it lands on, because GitHub
-//! reads it that way: a heading slug on a page, a line range such as `#L10` on
-//! anything rendered as source, where what is checked is that the line is in the
-//! file.
+//! reads it that way: on a page a heading slug or an anchor the page names
+//! outright with `<a name>`, on anything rendered as source a line range such as
+//! `#L10`, where what is checked is that the line is in the file, and on a
+//! directory the README shown under its file list.
 //!
 //! Existence is asked of the filesystem, so **the ubuntu leg of CI is the only
 //! one that sees a link whose case is wrong**: Windows and macOS both answer
@@ -219,6 +220,8 @@ fn anchors_of(markdown: &str) -> BTreeSet<String> {
     // heading was given exactly that anchor, and the value counts the suffixes
     // tried against that key as a base.
     let mut taken: BTreeMap<String, usize> = BTreeMap::new();
+    // Anchors the page names outright, which are verbatim rather than slugged.
+    let mut named: BTreeSet<String> = BTreeSet::new();
     let mut in_heading = false;
     let mut text = String::new();
 
@@ -243,10 +246,85 @@ fn anchors_of(markdown: &str) -> BTreeSet<String> {
             }
             Event::Text(t) | Event::Code(t) if in_heading => text.push_str(&t),
             Event::SoftBreak | Event::HardBreak if in_heading => text.push(' '),
+            Event::Html(h) | Event::InlineHtml(h) => named.extend(explicit_anchors(&h)),
             _ => {}
         }
     }
-    taken.into_keys().collect()
+    named.extend(taken.into_keys());
+    named
+}
+
+/// The anchors a page names outright instead of growing from a heading.
+///
+/// `<a name="install"></a>` is how a paragraph is given a stable link target,
+/// and GitHub honours it, so `#install` is a link that works and a page that
+/// only knew about headings called it a missing one. `id` is the same thing
+/// spelled the modern way.
+///
+/// Taken verbatim: an explicit anchor is not slugged, and it takes no part in
+/// the numbering headings do -- GitHub's own numbering counts headings.
+///
+/// Lowercased for comparison only, and with `to_ascii_lowercase`, which is the
+/// part worth saying: `to_lowercase` can change a string's *length* (`İ` is two
+/// bytes and lowercases to three), and every index below is an index into both
+/// strings at once.
+fn explicit_anchors(html: &str) -> Vec<String> {
+    let lowered = html.to_ascii_lowercase();
+    let mut found = Vec::new();
+    let mut from = 0;
+
+    while let Some(open) = lowered[from..].find("<a").map(|at| from + at) {
+        let after_name = open + "<a".len();
+        let Some(close) = lowered[after_name..].find('>').map(|at| after_name + at) else {
+            break;
+        };
+        from = close + 1;
+
+        // `<abbr` and `<article` also start with `<a`.
+        let (tag, lowered_tag) = (&html[after_name..close], &lowered[after_name..close]);
+        if lowered_tag.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-') {
+            continue;
+        }
+
+        for attribute in ["name", "id"] {
+            if let Some(value) = attribute_value(tag, lowered_tag, attribute) {
+                found.push(value.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// One attribute's value out of a tag's text, or nothing if it has no such
+/// attribute with a quoted value.
+///
+/// `lowered` is `tag` ASCII-lowercased, so the two share every index; the name
+/// is matched against it and the value is cut out of `tag`, because the name is
+/// case-insensitive and the value is not.
+///
+/// The name has to be a whole one -- `data-id="x"` ends in `id=` and names
+/// nothing -- and HTML allows spaces around the `=`, which is why this is a scan
+/// and not a search for `id="`.
+fn attribute_value<'a>(tag: &'a str, lowered: &str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(at) = lowered[from..].find(name).map(|found| from + found) {
+        from = at + name.len();
+        if !tag[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        {
+            continue;
+        }
+        let after_equals = tag[from..].trim_start().strip_prefix('=')?.trim_start();
+        let Some(quote @ ('"' | '\'')) = after_equals.chars().next() else {
+            continue;
+        };
+        if let Some(end) = after_equals[1..].find(quote) {
+            return Some(&after_equals[1..1 + end]);
+        }
+    }
+    None
 }
 
 /// Whether a destination points outside the repository.
@@ -367,17 +445,51 @@ fn normalized(path: &Path) -> PathBuf {
     out
 }
 
-/// The page GitHub shows for a directory, which is where a fragment on a
-/// directory link has to resolve.
+/// What a fragment on a directory link resolves against.
 ///
 /// Browsing to `examples/deployments/personal/` renders that directory's README
 /// underneath the file list, headings and anchors included, so
 /// `examples/deployments/personal/#設置` is a link that works. A directory has no
 /// `.md` extension, so without this it would be read as a file whose fragment
 /// cannot be a heading.
-fn rendered_readme(directory: &Path) -> Option<PathBuf> {
-    let readme = directory.join("README.md");
-    readme.is_file().then_some(readme)
+enum DirectoryPage {
+    /// A README whose anchors this test generates the way GitHub does.
+    Markdown(PathBuf),
+    /// A README in a language this test cannot slug. GitHub also renders
+    /// `README.rst` and `README.adoc`, and their anchors follow their own
+    /// languages' rules -- reproducing those would be a check with nothing to
+    /// verify it against, so the fragment goes unchecked. That is the direction
+    /// taken elsewhere here whenever the answer is not knowable: accept, rather
+    /// than fail a link that works. This repository is Markdown throughout, so
+    /// nothing takes this path today.
+    Unreadable,
+    /// No README at all, so the directory's page has no anchors to hit.
+    Missing,
+}
+
+/// The README GitHub would render under this directory's file list.
+fn directory_page(directory: &Path) -> DirectoryPage {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return DirectoryPage::Missing;
+    };
+    let mut found = DirectoryPage::Missing;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("readme") || !path.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+        {
+            return DirectoryPage::Markdown(path);
+        }
+        found = DirectoryPage::Unreadable;
+    }
+    found
 }
 
 /// The lines a `#L10` or `#L10-L20` fragment selects, if that is what it is.
@@ -501,9 +613,14 @@ fn every_relative_link_in_the_documentation_resolves() {
 
             // A directory is shown as its README, so that is the page the
             // fragment belongs to.
-            let target = match rendered_readme(&target) {
-                Some(readme) => readme,
-                None => target,
+            let target = if target.is_dir() {
+                match directory_page(&target) {
+                    DirectoryPage::Markdown(readme) => readme,
+                    DirectoryPage::Unreadable => continue,
+                    DirectoryPage::Missing => target,
+                }
+            } else {
+                target
             };
 
             if target.extension().is_none_or(|e| e != "md") {
@@ -760,13 +877,52 @@ fn a_destination_that_leaves_the_repository_is_caught_by_the_text() {
 #[test]
 fn a_directory_is_anchored_through_the_readme_github_renders() {
     let root = repo_root();
-    assert_eq!(rendered_readme(&root), Some(root.join("README.md")));
+    assert!(
+        matches!(directory_page(&root), DirectoryPage::Markdown(readme) if readme == root.join("README.md"))
+    );
 
     // A directory without one has no page for a fragment to land on.
-    assert_eq!(rendered_readme(&root.join("docs").join("decisions")), None);
+    assert!(matches!(
+        directory_page(&root.join("docs").join("decisions")),
+        DirectoryPage::Missing
+    ));
 
-    // And a file is not a directory, so it is left alone.
-    assert_eq!(rendered_readme(&root.join("README.md")), None);
+    // Neither has something that is not a directory at all.
+    assert!(matches!(
+        directory_page(&root.join("README.md")),
+        DirectoryPage::Missing
+    ));
+}
+
+/// Anchors a page names outright, which GitHub honours and a heading list does
+/// not contain.
+#[test]
+fn an_explicit_html_anchor_is_an_anchor() {
+    let doc = "<a name=\"install\"></a>\n\n# Install it\n\nText.\n";
+    let anchors = anchors_of(doc);
+    assert!(anchors.contains("install"), "{anchors:?}");
+    assert!(anchors.contains("install-it"), "{anchors:?}");
+
+    // Verbatim, not slugged: the two would differ, and GitHub keeps the name.
+    let shouty = "<a id=\"Step_ONE\"></a>\n\ntext\n";
+    assert!(anchors_of(shouty).contains("Step_ONE"), "not verbatim");
+
+    // Attribute and tag names are case-insensitive; the value is not.
+    assert_eq!(explicit_anchors("<A NAME='top'></A>"), vec!["top"]);
+    assert_eq!(explicit_anchors("<a  id = \"x\" >"), vec!["x"]);
+
+    // Other tags starting with `a` are not anchors.
+    assert!(explicit_anchors("<abbr id=\"x\">ms</abbr>").is_empty());
+    assert!(explicit_anchors("<article id=\"x\">").is_empty());
+
+    // Nor is an attribute that merely ends in one of the two names.
+    assert!(explicit_anchors("<a data-id=\"x\">").is_empty());
+    assert!(explicit_anchors("<a data-name=\"x\">").is_empty());
+
+    // And nothing to find is not something to find.
+    assert!(explicit_anchors("<a href=\"docs/x.md\">page</a>").is_empty());
+    assert!(explicit_anchors("plain text").is_empty());
+    assert!(explicit_anchors("<a name=unquoted>").is_empty());
 }
 
 /// Line fragments, which are what a fragment means on a file GitHub renders as

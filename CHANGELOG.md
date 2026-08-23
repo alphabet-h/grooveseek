@@ -99,10 +99,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   way GitHub decodes them, and a rooted path — `/x`, `\x`, or the `%2F` that
   decodes into one — is answered as the site-root path it is rather than by
   asking a filesystem that differs between CI and a laptop. A fragment is read
-  in the language of the file it lands on: a heading slug on a page, a line
-  range on anything GitHub renders as source (`#L10` is checked against the
-  file's length), and on a directory the headings of the README GitHub shows
-  underneath its file list. Destinations are resolved lexically and required to
+  in the language of the file it lands on: on a page a heading slug or an anchor
+  the page names outright with `<a name="…">`, on anything GitHub renders as
+  source a line range (`#L10` is checked against the file's length), and on a
+  directory the README GitHub shows underneath its file list. Destinations are
+  resolved lexically and required to
   stay inside the repository, which `exists()` cannot check — a link that climbs
   out of the checkout and back in through its parent lands on a real file
   whenever the checkout is `work/<repo>/<repo>`, as it is on Actions. External
