@@ -60,6 +60,37 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **A Markdown link that no longer resolves now fails the test suite.**
+  `grooveseek/tests/docs_links_resolve.rs` walks every `.md` file in the
+  repository and checks two things about each relative destination: that the file
+  is there, and that an `#anchor` matches a heading GitHub would generate in it.
+  It found one, in [docs/stability.ja.md](docs/stability.ja.md), which had
+  carried the English page's `#stable` since it was translated — a link that
+  opened the right page at the wrong place for anyone who followed it. The
+  Japanese anchor is `#コマンドライン`.
+
+  A throwaway script checked this once by hand during the README split and then
+  lived in a scratch directory. This is that check in the tree: 70 pages, 489
+  relative destinations, 35 of them anchored, 17 of those with Japanese
+  fragments.
+
+  The anchor half is GitHub's own algorithm, from `html-pipeline`: downcase,
+  delete everything outside `[\p{Word}\- ]`, then turn spaces into hyphens. The
+  order is what implementations get wrong — `信頼する置き場所 / しない置き場所`
+  loses the slash first and keeps *two* spaces, so its anchor carries two
+  hyphens, and a slugger that mapped spaces before stripping punctuation would
+  reject a link this repository contains. Counted twice, with a second
+  implementation built on a different principle (Unicode general categories and a
+  line matcher, against this one's `char::is_alphanumeric` and a parser):
+  identical on all 792 anchors.
+
+  Pages are parsed rather than matched line by line, which is what makes a `#`
+  inside a fenced TOML block not a heading and a reference-style link still a
+  link. External URLs are skipped entirely — a guard that can fail because
+  someone else's server is down stops being read — and what it cannot catch is
+  written down in the test: a link that resolves while the sentence around it
+  lies, which is the failure the same README split shipped seven of.
+
 - **A doc comment that names something this tree no longer has now fails CI.**
   `cargo doc --no-deps --workspace --all-features --document-private-items` runs
   as the last step of the `test` job, and `[workspace.lints.rustdoc]` in the root
