@@ -2039,6 +2039,120 @@ lambda = 0.5
         }
     }
 
+    /// Turn a commented configuration example into TOML with every key live.
+    ///
+    /// Both the shipped template and the configuration page write each field as
+    /// a `# key = value` line, so nothing in either is exercised until the `#`
+    /// comes off. Prose comments and commented section headers are left alone:
+    /// they are not keys, and TOML ignores them either way.
+    ///
+    /// A key is sometimes shown more than once — `exclude_headings` appears as
+    /// a populated list and as `[]` — and two live copies of one key is a TOML
+    /// error, so only the first occurrence **within its section** is uncommented.
+    /// Per-section rather than per-file: `enabled` is a real key in five
+    /// different sections, and a file-wide rule would silence four of them and
+    /// leave four tables empty.
+    ///
+    /// Section headers are uncommented too, and they have to be. The template
+    /// leaves `[search.mmr]` live and comments only the keys under it; the
+    /// configuration page comments the header as well. Strip the keys without
+    /// the header and those keys land in whichever table was open above them,
+    /// where `deny_unknown_fields` rejects them — a failure that says nothing
+    /// about the file being checked. A header is `[...]` alone on the line, so
+    /// the template's `# --- [contextual] — static ... ---` banner stays a
+    /// comment, which is what it is.
+    ///
+    /// One helper rather than one per caller. The template and the page are two
+    /// answers to "which keys does groove accept", and a second copy of this
+    /// rule is exactly how they would drift apart (`AGENTS.md`, "One question
+    /// gets one implementation").
+    /// Whether `text` is a TOML bare key (dotted keys included).
+    ///
+    /// The point is what it excludes: prose. `docs/configuration.md` explains a
+    /// key in prose that quotes an assignment — "Set `enabled = false` to
+    /// restore ..." — and a rule that only asks for a leading letter and an `=`
+    /// uncomments that sentence into the file.
+    fn is_bare_key(text: &str) -> bool {
+        !text.is_empty()
+            && text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    }
+
+    fn uncomment_every_key(raw: &str) -> String {
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut section = String::new();
+        raw.lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() {
+                    return String::new();
+                }
+                let bare = trimmed.strip_prefix('#').map(str::trim_start);
+                // `[section]` / `# [section]`。行がそれ 1 つで終わる時だけ。
+                let candidate = bare.unwrap_or(trimmed);
+                if candidate.starts_with('[')
+                    && candidate.ends_with(']')
+                    && !candidate[1..candidate.len() - 1].contains(['[', ']'])
+                {
+                    section = candidate.to_string();
+                    return candidate.to_string();
+                }
+                // `# key = value` 行を剥がす。純粋な説明コメント
+                // (`# Copy this file...`) はそのまま残す — toml には影響しない。
+                //
+                // `=` の左が **TOML の bare key そのもの**であることまで見る。
+                // 「先頭が英字で `=` を含む」だけだと、散文が巻き込まれる:
+                // configuration.md には
+                // `# Set `enabled = false` to restore ...` という説明行があり、
+                // これを剥がすと TOML として壊れる (実測: line 23, column 5)。
+                if let Some(rest) = bare
+                    && let Some(eq_idx) = rest.find('=')
+                    && is_bare_key(rest[..eq_idx].trim())
+                {
+                    let key = rest[..eq_idx].trim().to_string();
+                    if seen.insert((section.clone(), key)) {
+                        return rest.to_string();
+                    }
+                    // 2 回目以降はコメントのまま残して重複を避ける
+                }
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The first ```` ```toml ```` block of a Markdown page.
+    ///
+    /// The configuration pages open with one block that carries every key, and
+    /// their later blocks are `jsonc`. Taking the first `toml` fence rather
+    /// than a line range means the check survives the page growing a paragraph.
+    fn first_toml_block(markdown: &str, page: &Path) -> String {
+        let mut lines = markdown.lines();
+        let mut block: Vec<&str> = Vec::new();
+        for line in lines.by_ref() {
+            if line.trim_end() == "```toml" {
+                break;
+            }
+        }
+        for line in lines {
+            if line.trim_end().starts_with("```") {
+                return block.join("\n");
+            }
+            block.push(line);
+        }
+        panic!(
+            "{} must contain a closed ```toml block: it is where the page \
+             documents every groove.toml key",
+            page.display()
+        )
+    }
+
     #[test]
     fn test_toml_example_parses_with_all_keys_uncommented() {
         // groove.toml.example のすべてのキーが Config で受け入れられるかを検証。
@@ -2052,42 +2166,7 @@ lambda = 0.5
         let raw = std::fs::read_to_string(&example_path)
             .expect("groove.toml.example must exist at repository root");
 
-        // 同じキーを 2 回以上コメント化して例示することがある
-        // (例: exclude_headings の `[...]` と `[]` の両方を示す)。
-        // uncomment 後に重複キーになると toml::from_str がエラーになるので、
-        // 「同じキーは最初の 1 行だけ uncomment、以降はコメントのまま残す」
-        // 方針で剥がす。
-        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let uncommented: String = raw
-            .lines()
-            .map(|line| {
-                let trimmed = line.trim_start();
-                // 見出しコメントや空行はそのまま (除外しても同じ挙動)
-                if trimmed.is_empty() {
-                    return String::new();
-                }
-                // `# key = value` 行を剥がす。ただし純粋な説明コメント
-                // (例: `# Copy this file...`) はそのまま残す (toml には
-                // 影響しないので除外しても同じ)。判定は `# <ident> =` の形。
-                if let Some(rest) = trimmed.strip_prefix('#') {
-                    let rest = rest.trim_start();
-                    if let Some(eq_idx) = rest.find('=')
-                        && rest
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    {
-                        let key = rest[..eq_idx].trim().to_string();
-                        if seen_keys.insert(key) {
-                            return rest.to_string();
-                        }
-                        // 2 回目以降はコメントのまま残して重複を避ける
-                    }
-                }
-                line.to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let uncommented = uncomment_every_key(&raw);
 
         let cfg: Config = toml::from_str(&uncommented).unwrap_or_else(|e| {
             panic!(
@@ -2102,6 +2181,61 @@ lambda = 0.5
             !cfg.is_empty(),
             "groove.toml.example contains no parseable keys"
         );
+    }
+
+    /// The configuration page is a second answer to "which keys does groove
+    /// accept", and until this test nothing read it.
+    ///
+    /// It is not a copy of `groove.toml.example` that could be diffed: the page
+    /// condenses a 280-line template into a 140-line retelling, deliberately,
+    /// because a reference page and a file you copy are read differently. What
+    /// the two do share is the key set — and `#[serde(deny_unknown_fields)]`
+    /// (on `Config` and on every section struct) already refuses a key that
+    /// does not exist. Putting the page's block through the same uncommenting
+    /// the template gets therefore catches a key the page invented, a key it
+    /// misspelled, and a value it gave the wrong type, without inventing a
+    /// second notion of what a key is.
+    ///
+    /// **What it cannot catch: a key the page never mentions.** That direction
+    /// needs the field list, and `Config` derives `Deserialize` only, so there
+    /// is nothing to enumerate at run time; writing the list out here would be
+    /// a third copy of the very thing being checked. The forward direction is
+    /// left to review, and the page was verified complete when this was added.
+    ///
+    /// It also says nothing about whether a documented value is a good one —
+    /// `test_toml_example_matches_shipped_defaults` does that job for the
+    /// template, and the page states defaults in prose rather than in TOML.
+    ///
+    /// Both languages are checked, because each page carries its own copy of
+    /// the block and a copy is what drifts.
+    #[test]
+    fn the_configuration_page_documents_only_keys_that_exist() {
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crate directory always has a parent")
+            .join("docs");
+        for page in ["configuration.md", "configuration.ja.md"] {
+            let path = docs.join(page);
+            let markdown = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{} must be readable to check the documented keys: {e}",
+                    path.display()
+                )
+            });
+            let uncommented = uncomment_every_key(&first_toml_block(&markdown, &path));
+            let cfg: Config = toml::from_str(&uncommented).unwrap_or_else(|e| {
+                panic!(
+                    "docs/{page} documents a groove.toml this build refuses: {e}\n\
+                     Fix the page rather than relaxing this check -- the page is \
+                     what a reader copies from.\n\
+                     --- generated TOML ---\n{uncommented}\n---"
+                )
+            });
+            assert!(
+                !cfg.is_empty(),
+                "docs/{page} has a toml block with no parseable keys"
+            );
+        }
     }
 
     #[test]
