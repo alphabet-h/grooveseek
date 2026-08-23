@@ -99,10 +99,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   way GitHub decodes them, and a rooted path — `/x`, `\x`, or the `%2F` that
   decodes into one — is answered as the site-root path it is rather than by
   asking a filesystem that differs between CI and a laptop. A fragment is read
-  in the language of the file it lands on: a heading slug on a page, and on
-  anything GitHub renders as source a line range, where `#L10` is checked
-  against the file's length. External URLs are skipped entirely — a guard that
-  can fail because
+  in the language of the file it lands on: a heading slug on a page, a line
+  range on anything GitHub renders as source (`#L10` is checked against the
+  file's length), and on a directory the headings of the README GitHub shows
+  underneath its file list. Destinations are resolved lexically and required to
+  stay inside the repository, which `exists()` cannot check — a link that climbs
+  out of the checkout and back in through its parent lands on a real file
+  whenever the checkout is `work/<repo>/<repo>`, as it is on Actions. External
+  URLs are skipped entirely, on the URI grammar rather than a list of the
+  schemes seen so far, so `tel:` and `MAILTO:` are not looked for on disk — a
+  guard that can fail because
   someone else's server is down stops being read — and what it cannot catch is
   written down in the test: a link that resolves while the sentence around it
   lies, which is the failure the same README split shipped seven of.

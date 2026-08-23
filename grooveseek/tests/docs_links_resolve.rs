@@ -59,7 +59,7 @@
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The extensions GitHub renders these pages with, and only those.
 ///
@@ -256,10 +256,29 @@ fn anchors_of(markdown: &str) -> BTreeSet<String> {
 /// a UNC share, and a missing file on the other two -- so a link a reader can
 /// follow would fail the build, differently on each operating system.
 fn is_external(dest: &str) -> bool {
-    dest.contains("://")
-        || dest.starts_with("//")
-        || dest.starts_with("mailto:")
-        || dest.starts_with("data:")
+    dest.starts_with("//") || has_scheme(dest)
+}
+
+/// Whether the destination opens with a URI scheme.
+///
+/// The rule is the grammar rather than a list of the schemes seen so far:
+/// RFC 3986 says `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`, and it is
+/// case-insensitive, so `MAILTO:` is one and a list of lowercase prefixes says
+/// it is a filename. So do `tel:`, `sms:` and `urn:`, which have no `://` for a
+/// substring search to find. Every one of those would be looked up on disk and
+/// reported missing.
+///
+/// A relative path keeps its colon, because a scheme cannot contain `/`:
+/// `docs/a:b.md` splits into `docs/a`, which the grammar rejects. What this does
+/// take is `C:\x`, and correctly -- a browser reads that as a scheme too, so it
+/// is not a link to anything in this repository either way.
+fn has_scheme(dest: &str) -> bool {
+    let Some((scheme, _)) = dest.split_once(':') else {
+        return false;
+    };
+    let mut characters = scheme.chars();
+    characters.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// A destination as the filesystem and the heading list spell it.
@@ -319,6 +338,46 @@ fn split_destination(dest: &str) -> (&str, Option<&str>) {
 /// decode into exactly these.
 fn is_rooted(path: &str) -> bool {
     path.starts_with('/') || path.starts_with('\\') || Path::new(path).has_root()
+}
+
+/// The path with its `.` and `..` resolved by the text, without asking the
+/// filesystem anything.
+///
+/// This is how GitHub resolves a destination, and it is the only way to ask
+/// whether one stays inside the repository. `exists()` cannot answer that: a
+/// link that climbs out and back in resolves to a real file whenever the
+/// checkout has a directory of the right name beside it -- and on GitHub Actions
+/// it always does, because the checkout is `work/<repo>/<repo>`. So
+/// `../grooveseek/README.md` written on a root-level page is a link GitHub
+/// serves as a 404 that CI would call fine and a laptop would call broken.
+///
+/// Lexical on purpose. Resolving symlinks would answer a different question than
+/// the one GitHub answers, and would need the file to exist to ask it.
+fn normalized(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            named => out.push(named),
+        }
+    }
+    out
+}
+
+/// The page GitHub shows for a directory, which is where a fragment on a
+/// directory link has to resolve.
+///
+/// Browsing to `examples/deployments/personal/` renders that directory's README
+/// underneath the file list, headings and anchors included, so
+/// `examples/deployments/personal/#設置` is a link that works. A directory has no
+/// `.md` extension, so without this it would be read as a file whose fragment
+/// cannot be a heading.
+fn rendered_readme(directory: &Path) -> Option<PathBuf> {
+    let readme = directory.join("README.md");
+    readme.is_file().then_some(readme)
 }
 
 /// The lines a `#L10` or `#L10-L20` fragment selects, if that is what it is.
@@ -418,10 +477,18 @@ fn every_relative_link_in_the_documentation_resolves() {
             let target = if path_part.is_empty() {
                 file.clone()
             } else {
-                let joined = file
-                    .parent()
-                    .expect("a file always has a parent directory")
-                    .join(path_part);
+                let joined = normalized(
+                    &file
+                        .parent()
+                        .expect("a file always has a parent directory")
+                        .join(path_part),
+                );
+                // Asked before `exists()`, because climbing out of the checkout
+                // and back in through its parent lands on a real file.
+                if !joined.starts_with(&root) {
+                    broken.push(format!("{where_}  leaves the repository -> {dest}"));
+                    continue;
+                }
                 if !joined.exists() {
                     broken.push(format!("{where_}  no such file          -> {dest}"));
                     continue;
@@ -431,11 +498,19 @@ fn every_relative_link_in_the_documentation_resolves() {
 
             let Some(anchor) = anchor else { continue };
             anchored += 1;
+
+            // A directory is shown as its README, so that is the page the
+            // fragment belongs to.
+            let target = match rendered_readme(&target) {
+                Some(readme) => readme,
+                None => target,
+            };
+
             if target.extension().is_none_or(|e| e != "md") {
                 // Not a page, so the fragment is not a heading. On anything
                 // GitHub renders as source it is a line range instead.
                 match selected_lines(&anchor) {
-                    Some((_, last)) => {
+                    Some((_, last)) if target.is_file() => {
                         let body = std::fs::read_to_string(&target).unwrap_or_else(|e| {
                             panic!("{} must be readable: {e}", target.display())
                         });
@@ -443,7 +518,7 @@ fn every_relative_link_in_the_documentation_resolves() {
                             broken.push(format!("{where_}  past the last line    -> {dest}"));
                         }
                     }
-                    None => broken.push(format!("{where_}  anchor on a non-page  -> {dest}")),
+                    _ => broken.push(format!("{where_}  anchor on a non-page  -> {dest}")),
                 }
                 continue;
             }
@@ -581,6 +656,22 @@ fn a_destination_that_borrows_the_page_scheme_is_still_external() {
     assert!(!is_external("docs/usage.md"));
     assert!(!is_external("#a-heading"));
 
+    // Schemes are a grammar, not a list: these have no `://` to search for, and
+    // the case is not the writer's to get right.
+    assert!(is_external("tel:+15550100"));
+    assert!(is_external("sms:+15550100"));
+    assert!(is_external("urn:isbn:0451450523"));
+    assert!(is_external("MAILTO:someone@example.com"));
+    assert!(is_external("HTTPS://example.com"));
+    assert!(is_external("view-source:https://example.com"));
+
+    // A colon inside a path is not a scheme, because a scheme has no `/`.
+    assert!(!is_external("docs/a:b.md"));
+    assert!(!is_external("./a:b.md"));
+    assert!(!is_external("../notes/9:30.md"));
+    // Nor is a leading digit, which the grammar does not allow.
+    assert!(!is_external("1password:vault"));
+
     // And it never reaches the resolver, which would read it as a UNC share.
     let doc = "[mirror](//example.com/g) and [page](docs/p.md)\n";
     let found: Vec<String> = links_of(doc).into_iter().map(|(_, d)| d).collect();
@@ -638,6 +729,44 @@ fn a_rooted_destination_is_recognised_from_the_string() {
     assert!(!is_rooted("%2Fetc/passwd"));
     assert!(is_rooted(&decoded("%2Fetc/passwd")));
     assert!(is_rooted(&decoded("%5CWindows%5Csystem32")));
+}
+
+/// A destination that climbs out of the repository, which `exists()` cannot
+/// tell from one that stays in.
+#[test]
+fn a_destination_that_leaves_the_repository_is_caught_by_the_text() {
+    let root = repo_root();
+
+    // The shape that made CI and a laptop disagree: written on a root-level
+    // page, this climbs out of the checkout and back into a sibling that
+    // `work/<repo>/<repo>` guarantees exists on GitHub Actions.
+    let escaping = normalized(&root.join("../grooveseek/README.md"));
+    assert!(!escaping.starts_with(&root), "{}", escaping.display());
+
+    // `..` that stays inside is ordinary, and this repository is full of it.
+    let staying = normalized(&root.join("docs").join("../README.md"));
+    assert_eq!(staying, root.join("README.md"));
+    assert!(staying.starts_with(&root));
+
+    // `.` is dropped, and the answer never touches the filesystem.
+    assert_eq!(
+        normalized(Path::new("a/./b/../c/d.md")),
+        PathBuf::from("a/c/d.md")
+    );
+    assert_eq!(normalized(Path::new("a/b/../..")), PathBuf::new());
+}
+
+/// A directory link, which GitHub answers with the directory's README.
+#[test]
+fn a_directory_is_anchored_through_the_readme_github_renders() {
+    let root = repo_root();
+    assert_eq!(rendered_readme(&root), Some(root.join("README.md")));
+
+    // A directory without one has no page for a fragment to land on.
+    assert_eq!(rendered_readme(&root.join("docs").join("decisions")), None);
+
+    // And a file is not a directory, so it is left alone.
+    assert_eq!(rendered_readme(&root.join("README.md")), None);
 }
 
 /// Line fragments, which are what a fragment means on a file GitHub renders as
