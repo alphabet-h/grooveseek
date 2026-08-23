@@ -36,6 +36,11 @@
 //! outright -- reaching them needs a network, and a guard that can fail because
 //! someone else's server is down stops being read.
 //!
+//! A fragment is read in the language of the file it lands on, because GitHub
+//! reads it that way: a heading slug on a page, a line range such as `#L10` on
+//! anything rendered as source, where what is checked is that the line is in the
+//! file.
+//!
 //! Existence is asked of the filesystem, so **the ubuntu leg of CI is the only
 //! one that sees a link whose case is wrong**: Windows and macOS both answer
 //! yes to `Readme.md`, and GitHub does not. That is a reason this test is in the
@@ -298,6 +303,42 @@ fn split_destination(dest: &str) -> (&str, Option<&str>) {
     (path, fragment.filter(|f| !f.is_empty()))
 }
 
+/// Whether a destination carries a root, so it names somewhere other than this
+/// repository.
+///
+/// GitHub resolves `/docs/usage.md` against the site root -- it means
+/// `github.com/docs/usage.md`, not this file -- so a rooted destination is
+/// broken wherever it is written. Saying so from the string matters more than
+/// the verdict: `Path::join` **throws the document's directory away** when what
+/// it is given has a root, so the alternative is asking the filesystem about the
+/// machine's own root, and CI and a laptop do not have the same things there.
+///
+/// Both separators, because a link is not typed by the platform that reads it,
+/// and `has_root` to catch what a bare `starts_with` misses -- `C:\x` on
+/// Windows. This has to be asked **after** decoding, since `%2F` and `%5C`
+/// decode into exactly these.
+fn is_rooted(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('\\') || Path::new(path).has_root()
+}
+
+/// The lines a `#L10` or `#L10-L20` fragment selects, if that is what it is.
+///
+/// GitHub gives every file it renders a fragment language, and only Markdown's
+/// comes from headings. On source it is line numbers, and
+/// `[the walk](../tests/docs_links_resolve.rs#L120)` is an ordinary thing to
+/// write in an architecture page. Reporting those as broken anchors would fail
+/// links that work, so they get the check that does apply to them: the line has
+/// to be in the file.
+fn selected_lines(fragment: &str) -> Option<(usize, usize)> {
+    let (first, last) = match fragment.split_once('-') {
+        Some((first, last)) => (first, last),
+        None => (fragment, fragment),
+    };
+    let number = |part: &str| part.strip_prefix('L')?.parse::<usize>().ok();
+    let (first, last) = (number(first)?, number(last)?);
+    (first >= 1 && last >= first).then_some((first, last))
+}
+
 /// Every relative destination on this page, with the line it sits on.
 ///
 /// Images count: a missing screenshot is the same defect as a missing page.
@@ -365,18 +406,14 @@ fn every_relative_link_in_the_documentation_resolves() {
             let (raw_path, raw_anchor) = split_destination(&dest);
             let where_ = format!("{shown}:{line}");
 
-            // A leading slash is resolved against the site root rather than the
-            // repository, so `/docs/usage.md` is `github.com/docs/usage.md` and
-            // not this file. Answered here rather than by the filesystem: on
-            // Linux that question reaches the system root, where what is there
-            // depends on the machine, and CI and a laptop would disagree.
-            if raw_path.starts_with('/') {
+            let path_part = decoded(raw_path);
+            let anchor = raw_anchor.map(decoded);
+
+            // Asked of the decoded path, because `%2F` decodes into one.
+            if is_rooted(&path_part) {
                 broken.push(format!("{where_}  site-root path        -> {dest}"));
                 continue;
             }
-
-            let path_part = decoded(raw_path);
-            let anchor = raw_anchor.map(decoded);
 
             let target = if path_part.is_empty() {
                 file.clone()
@@ -395,7 +432,19 @@ fn every_relative_link_in_the_documentation_resolves() {
             let Some(anchor) = anchor else { continue };
             anchored += 1;
             if target.extension().is_none_or(|e| e != "md") {
-                broken.push(format!("{where_}  anchor on a non-page  -> {dest}"));
+                // Not a page, so the fragment is not a heading. On anything
+                // GitHub renders as source it is a line range instead.
+                match selected_lines(&anchor) {
+                    Some((_, last)) => {
+                        let body = std::fs::read_to_string(&target).unwrap_or_else(|e| {
+                            panic!("{} must be readable: {e}", target.display())
+                        });
+                        if last > body.lines().count() {
+                            broken.push(format!("{where_}  past the last line    -> {dest}"));
+                        }
+                    }
+                    None => broken.push(format!("{where_}  anchor on a non-page  -> {dest}")),
+                }
                 continue;
             }
             let anchors = anchor_cache.entry(target.clone()).or_insert_with(|| {
@@ -572,6 +621,41 @@ fn a_destination_is_cut_where_the_url_grammar_cuts_it() {
     let encoded = "docs/c%23-and-q%3F.md";
     assert_eq!(split_destination(encoded), (encoded, None));
     assert_eq!(decoded(encoded), "docs/c#-and-q?.md");
+}
+
+/// A rooted destination, in every spelling that would make `Path::join` drop
+/// the directory the document sits in.
+#[test]
+fn a_rooted_destination_is_recognised_from_the_string() {
+    assert!(is_rooted("/docs/usage.md"));
+    assert!(is_rooted("\\docs\\usage.md"));
+    assert!(!is_rooted("docs/usage.md"));
+    assert!(!is_rooted("../docs/usage.md"));
+    assert!(!is_rooted(""));
+
+    // The check runs on the decoded path, which is the only place these two are
+    // distinguishable from an ordinary name.
+    assert!(!is_rooted("%2Fetc/passwd"));
+    assert!(is_rooted(&decoded("%2Fetc/passwd")));
+    assert!(is_rooted(&decoded("%5CWindows%5Csystem32")));
+}
+
+/// Line fragments, which are what a fragment means on a file GitHub renders as
+/// source rather than as a page.
+#[test]
+fn a_line_fragment_is_told_apart_from_a_heading() {
+    assert_eq!(selected_lines("L10"), Some((10, 10)));
+    assert_eq!(selected_lines("L10-L20"), Some((10, 20)));
+
+    // A heading slug is not a line range, however much it starts like one.
+    assert_eq!(selected_lines("license"), None);
+    assert_eq!(selected_lines("L"), None);
+    assert_eq!(selected_lines("L10-20"), None);
+    assert_eq!(selected_lines("Lx"), None);
+
+    // Ranges that cannot select anything are not line ranges either.
+    assert_eq!(selected_lines("L0"), None);
+    assert_eq!(selected_lines("L20-L10"), None);
 }
 
 /// Percent escapes are what a writer gets by copying a URL out of the address
