@@ -188,7 +188,7 @@ bind = "127.0.0.1:3100"
 | フィールド | 信頼しない config の場合 |
 | --- | --- |
 | `fastembed_cache_dir` | 警告して無視し、標準のキャッシュディレクトリを使う。どの `.onnx` を読むかを決める値であり、キャッシュに既にあるモデルは検証されないため (関連: `FASTEMBED_CACHE_DIR` は絶対パス必須で、モデルディレクトリが CWD 相対に解決されることは無い) |
-| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `allowed_origins` / `healthz_public` / `max_sessions` は破棄する — 前 3 つは loopback 限定の既定に戻し、4 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`allowed_origins` の破棄は両方向に効く — 植えられたリストは攻撃者の origin を名指しできるし、**空リストは rmcp では「Origin を検証しない」の意味**になるため。`kind` は尊重する |
+| `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `allowed_origins` / `healthz_public` / `max_sessions` は破棄する — 前 3 つは loopback 限定の既定に戻し、4 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`allowed_origins` の破棄は両方向に効く — 植えられたリストは攻撃者の origin を名指しできるし、**空リストは「Origin を検証しない」の意味**になるため。`kind` は尊重する |
 | `kb_path` | ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指していれば**警告して無視**。`--kb-path` は従来どおり効くので上書きでき、どちらも無ければ通常どおり「`--kb-path` is required」で停止する |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
