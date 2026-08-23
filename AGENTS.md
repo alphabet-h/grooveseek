@@ -33,20 +33,24 @@ cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
+cargo doc --no-deps --workspace --document-private-items
 ```
 
 Clippy runs **twice** because the second pass is the only one that compiles the
 code behind `test-helpers` and `heavy-bench` (`.github/workflows/ci.yml`). The
-order of the last two matters on a cold model cache: `index_progress_cli` spawns
-`groove` subprocesses that each need BGE-small, and in parallel they race on the
-HuggingFace download lock. `CONTRIBUTING.md` explains both at length.
+order of the two `cargo test` lines matters on a cold model cache:
+`index_progress_cli` spawns `groove` subprocesses that each need BGE-small, and
+in parallel they race on the HuggingFace download lock. `cargo doc` is a check
+rather than a build step here — `--document-private-items` is what makes it read
+this crate's private modules, which is most of it. `CONTRIBUTING.md` explains all
+three at length.
 
 Windows needs no extra DLLs: ONNX Runtime and SQLite are linked in statically.
 
 ## Code Review Rules
 
-These are the four things a reviewer here has had to explain more than once.
-Each states what must hold and the way to satisfy it.
+These are the things a reviewer here has had to explain more than once. Each
+states what must hold and the way to satisfy it.
 
 ### A field added to a persisted struct needs `#[serde(default)]`
 
@@ -119,3 +123,22 @@ correct, passes its tests, and does nothing on the corpus it was meant to fix.
 Write the value from the scan that measured it, unconditionally, so the paths
 that skip work still record it. Prove it with a test that indexes twice and
 asserts the value is present after the second, no-op run.
+
+### A doc comment that names something in this tree links to it
+
+`cargo doc` runs in CI and `[workspace.lints.rustdoc]` denies a link that no
+longer resolves, so a renamed function cannot leave its documentation behind.
+That guard sees links and nothing else. A name in plain backticks — `` `foo` ``
+— is invisible to rustc and to rustdoc alike, so writing one opts the sentence
+out of the check without saying so, and it reads exactly like the checked form.
+`transport/http.rs` named a function ADR-0009 had deleted, in backticks, for two
+days.
+
+Write `` [`foo`] `` for anything that exists in this workspace: a function, a
+type, a constant, a module. In a module's own `//!` header the name has to be
+absolute — `` [`crate::links::read_checked`] `` — because a bare name there does
+not resolve even to an item in that same file, which is measured and is the
+opposite of how `///` on an item behaves. Prose about something *outside* the
+tree — an upstream symbol, a TOML key like `` `[eval].golden` ``, an interval
+like `` `k in [30,100]` `` — stays in backticks, which is also what keeps
+rustdoc from reading the brackets as a link.

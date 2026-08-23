@@ -44,9 +44,17 @@ cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
+cargo doc --no-deps --workspace --document-private-items
 ```
 
-最後の 2 つは**順序が意味を持つ** (モデルキャッシュが cold の場合)。CI も同じ順で回している。`index_progress_cli` は BGE-small を必要とする `groove` サブプロセスを複数起動するので、並列で走らせると HuggingFace の download lock を奪い合って `Lock acquisition failed` で落ちる。この target を先にシングルスレッドで回せば DL するプロセスがちょうど 1 つになり、後続のフルスイートは warm cache に対して走る。
+`cargo doc` が入っているのは、**doc コメントがツリーに無い名前を指している**という欠陥を
+他の誰も捕まえないため。バッククォートだけの名前は rustc から見えず、検査されるのは
+intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.toml` の
+`[workspace.lints.rustdoc]` に置いてあるので、このコマンドはローカルでも CI と同じことを
+言う。`--document-private-items` は省略できない — このクレートの大半は private module で、
+付けなければその doc コメントは一度も読まれない。
+
+`cargo test` の 2 行は**順序が意味を持つ** (モデルキャッシュが cold の場合)。CI も同じ順で回している。`index_progress_cli` は BGE-small を必要とする `groove` サブプロセスを複数起動するので、並列で走らせると HuggingFace の download lock を奪い合って `Lock acquisition failed` で落ちる。この target を先にシングルスレッドで回せば DL するプロセスがちょうど 1 つになり、後続のフルスイートは warm cache に対して走る。
 
 > **`cargo test -- --ignored` は実際にマシンの状態を変える。** 実行前に次節を読むこと。
 
@@ -83,7 +91,7 @@ cargo test
 
 ## テストの 2 層構造
 
-- **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**PR を gate するのはこの層だけ** (`ci.yml` はこれしか回さない)
+- **軽量テスト**: 既定の `cargo test`。ネットワーク・モデル DL 不要、秒オーダーで完了。**PR を gate する*テスト*はこの層だけ** (`ci.yml` は他のテストを回さない。テスト以外は上に挙げた検査 — fmt / clippy / check / `cargo doc` — を回す)
 - **ignored テスト** (`#[ignore]`): `cargo test -- --ignored` で opt-in。PR は gate しないが**手動専用でもない**: `nightly.yml` が毎日 ubuntu-latest と windows-latest の両方で `cargo test --features test-helpers -- --include-ignored` を回している (ただし 1 日遅れ、かつ Windows leg は ~2.3 GB のモデルを要する 3 本を除外)。この 1 つのフラグの裏に**性質の違う 2 種類のコスト**が同居している:
   - **モデル DL** — 初回に ONNX モデルを取得する (BGE-small ~130 MB / BGE-M3 ~2.3 GB / BGE-reranker-v2-m3 ~2.3 GB)。以降は OS 標準キャッシュに残る。ネットワーク都合で DL が失敗する場合は [docs/clients.ja.md](docs/clients.ja.md) の「HuggingFace の TLS 失敗への対処」節を参照
   - **マシンの状態を実際に変える** — 一部のテストは OS のサービスを本当に登録・解除する。`grooveseek/tests/service_install_integration.rs` は Windows で `Register-ScheduledTask` を呼び、`crates/groove-tray/tests/install_integration.rs` は `%APPDATA%\…\Start Menu\Programs\Startup\` にショートカットを書く。PID ごとに固有のサービス名を使い後始末もするが、**途中で kill すると scheduled task や startup ショートカットが残る**。途中で落ちたら `Get-ScheduledTask -TaskName 'groove*'` で確認すること
@@ -108,7 +116,7 @@ retrieval に触れる変更 (クエリのコンパイル、fusion、chunk 分�
 
 1. リポジトリを fork し、`main` からブランチを切る
 2. 新しい挙動にはテストを追加 (ユニットは inline、integration は `tests/` 配下)
-3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test` を pass
+3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test && cargo doc --no-deps --workspace --document-private-items` を pass
 4. 問題と変更内容を明示した PR を開く (関連 issue があればリンク)
 
 ## バグ報告

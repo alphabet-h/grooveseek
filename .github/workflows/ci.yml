@@ -66,6 +66,37 @@ jobs:
       - name: cargo test (non-ignored only; ignored tests download ONNX models)
         run: cargo test
 
+      # doc rot, on the same 3 OSes and for ~16 seconds.
+      #
+      # A step in this job rather than a fourth job: `cargo doc --no-deps` wants
+      # exactly the dependency metadata `cargo check --all-targets` produced
+      # above, so here it costs one rustdoc pass (measured locally: 15.8 s over
+      # the whole workspace with a warm dependency tree) instead of a second
+      # dependency build. A separate job would also add three `rust-cache`
+      # entries to a repository whose Actions cache is already 13.6 GB across 23
+      # entries against a 10 GB limit (measured 2026-08-23), so entries are being
+      # evicted and the new job's cost would land on the other jobs' cold runs.
+      #
+      # The matrix is the point. `service/{linux,macos,windows}.rs` are whole
+      # modules behind `#[cfg(target_os = ...)]` and `links.rs` gates function
+      # bodies the same way, so exactly one branch of each is documented per
+      # runner: a single-OS doc check leaves the other two unread.
+      #
+      # `!cancelled()` rather than the default: run this even when the test step
+      # above failed, so one run reports both. Ordered last for the same reason
+      # in the other direction -- a stale doc reference must not withhold the
+      # test results this job exists to produce.
+      #
+      # `--document-private-items` is what makes it a guard rather than a
+      # formality: most of this crate is private modules, and six dead names
+      # (`GraphNode`, `inspect`, `is_multiply_linked` x2, `read_checked` x2)
+      # sat in `//!` docs that the public-only walk never read. Levels come from
+      # `[workspace.lints.rustdoc]` in the root Cargo.toml, where the reasoning
+      # is; nothing here sets them, so a local `cargo doc` says the same thing.
+      - name: cargo doc (doc comments may not name what the tree lacks)
+        if: ${{ !cancelled() }}
+        run: cargo doc --no-deps --workspace --document-private-items
+
   clippy:
     name: clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
