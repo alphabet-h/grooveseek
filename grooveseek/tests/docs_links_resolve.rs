@@ -273,6 +273,31 @@ fn decoded(part: &str) -> String {
         .into_owned()
 }
 
+/// The path a destination names and the heading it asks for, still encoded.
+///
+/// A relative URL is `path [ "?" query ] [ "#" fragment ]`, and only the path is
+/// a filename. `docs/usage.md?plain=1#search` is a link GitHub hands out from
+/// its own interface; leaving the query on the path looks for a file called
+/// `usage.md?plain=1`, which no filesystem here can even hold.
+///
+/// The fragment is cut first, so a `?` on the far side of the `#` stays in the
+/// fragment where it belongs. Both cuts happen before [`decoded`] runs, for the
+/// reason written there: a path may not carry a bare `?` or `#`, so an encoded
+/// one is part of the name and has to survive the split to be decoded into it.
+///
+/// An empty fragment is dropped. `page.md#` and `#` are the top of the page,
+/// which every page has and no heading is named.
+fn split_destination(dest: &str) -> (&str, Option<&str>) {
+    let (before_fragment, fragment) = match dest.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (dest, None),
+    };
+    let path = before_fragment
+        .split_once('?')
+        .map_or(before_fragment, |(path, _query)| path);
+    (path, fragment.filter(|f| !f.is_empty()))
+}
+
 /// Every relative destination on this page, with the line it sits on.
 ///
 /// Images count: a missing screenshot is the same defect as a missing page.
@@ -337,11 +362,21 @@ fn every_relative_link_in_the_documentation_resolves() {
 
         for (line, dest) in links_of(&text) {
             checked += 1;
-            let (path_part, anchor) = match dest.split_once('#') {
-                Some((p, a)) => (decoded(p), Some(decoded(a))),
-                None => (decoded(&dest), None),
-            };
+            let (raw_path, raw_anchor) = split_destination(&dest);
             let where_ = format!("{shown}:{line}");
+
+            // A leading slash is resolved against the site root rather than the
+            // repository, so `/docs/usage.md` is `github.com/docs/usage.md` and
+            // not this file. Answered here rather than by the filesystem: on
+            // Linux that question reaches the system root, where what is there
+            // depends on the machine, and CI and a laptop would disagree.
+            if raw_path.starts_with('/') {
+                broken.push(format!("{where_}  site-root path        -> {dest}"));
+                continue;
+            }
+
+            let path_part = decoded(raw_path);
+            let anchor = raw_anchor.map(decoded);
 
             let target = if path_part.is_empty() {
                 file.clone()
@@ -501,6 +536,42 @@ fn a_destination_that_borrows_the_page_scheme_is_still_external() {
     let doc = "[mirror](//example.com/g) and [page](docs/p.md)\n";
     let found: Vec<String> = links_of(doc).into_iter().map(|(_, d)| d).collect();
     assert_eq!(found, vec!["docs/p.md"], "{found:?}");
+}
+
+/// A destination is a URL, and only the first of its three parts is a filename.
+#[test]
+fn a_destination_is_cut_where_the_url_grammar_cuts_it() {
+    assert_eq!(split_destination("docs/usage.md"), ("docs/usage.md", None));
+    assert_eq!(
+        split_destination("docs/usage.md#search"),
+        ("docs/usage.md", Some("search"))
+    );
+
+    // `?plain=1` is a link GitHub's own interface hands out.
+    assert_eq!(
+        split_destination("docs/usage.md?plain=1#search"),
+        ("docs/usage.md", Some("search"))
+    );
+    assert_eq!(
+        split_destination("docs/usage.md?plain=1"),
+        ("docs/usage.md", None)
+    );
+
+    // The query ends at the fragment, so a `?` past the `#` stays in it.
+    assert_eq!(
+        split_destination("docs/x.md#what-now?"),
+        ("docs/x.md", Some("what-now?"))
+    );
+
+    // The top of a page is not a heading, and every page has one.
+    assert_eq!(split_destination("docs/x.md#"), ("docs/x.md", None));
+    assert_eq!(split_destination("#"), ("", None));
+    assert_eq!(split_destination("#a-heading"), ("", Some("a-heading")));
+
+    // Encoded separators are name, not grammar, and survive to be decoded.
+    let encoded = "docs/c%23-and-q%3F.md";
+    assert_eq!(split_destination(encoded), (encoded, None));
+    assert_eq!(decoded(encoded), "docs/c#-and-q?.md");
 }
 
 /// Percent escapes are what a writer gets by copying a URL out of the address

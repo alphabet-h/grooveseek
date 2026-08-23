@@ -93,8 +93,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
   Pages are parsed rather than matched line by line, which is what makes a `#`
   inside a fenced TOML block not a heading and a reference-style link still a
-  link, and destinations are percent-decoded the way GitHub decodes them before
-  resolving. External URLs are skipped entirely — a guard that can fail because
+  link, and destinations are read as the URLs they are before they are read as
+  paths: the query and the fragment are cut off first (`docs/usage.md?plain=1`
+  is a link GitHub's own interface hands out), percent escapes are decoded the
+  way GitHub decodes them, and a leading `/` is answered as the site-root path
+  it is rather than by asking a filesystem that differs between CI and a laptop.
+  External URLs are skipped entirely — a guard that can fail because
   someone else's server is down stops being read — and what it cannot catch is
   written down in the test: a link that resolves while the sentence around it
   lies, which is the failure the same README split shipped seven of.
