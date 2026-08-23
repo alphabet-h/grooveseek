@@ -26,6 +26,3 @@ groove.toml
 # split moved examples/ to grooveseek/examples/.
 !grooveseek/examples/deployments/**/.mcp.json
 !grooveseek/examples/deployments/**/groove.toml
-
-# /codex-review skill working directory (= per-round baseline JSON snapshots)
-.codex-review-tmp/

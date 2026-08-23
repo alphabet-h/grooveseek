@@ -68,3 +68,10 @@ ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and
 [ADR-0007](decisions/0007-rename-the-project-to-grooveseek.md) explains why
 `kb-mcp` in anything dated before 2026-08-17 means this project.
+
+ADR-0000 rules `.dev/` out as a home for decision records partly on the grounds
+that it "has no nested repository, and is not backed up". That stopped being true
+on 2026-08-10, when `.dev/` gained a private mirror. The decision stands on the
+two grounds that did not change: a private mirror still does not arrive with a
+clone, and public documentation still cannot link into it. The record is left as
+written, for the same reason ADR-0003's filename is.

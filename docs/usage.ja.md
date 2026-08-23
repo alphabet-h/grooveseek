@@ -72,7 +72,7 @@ groove serve --kb-path ... --no-watch                           # ライブ同�
 - `jina-v2-ml` — jinaai/jina-reranker-v2-base-multilingual (多言語、約 1.2 GB)。軽量版
 - `bge-base` — BAAI/bge-reranker-base (英語 / 中国語のみ、約 280 MB)。日本語では非推奨
 
-再ランクのレイテンシコストは、CPU で `bge-v2-m3` を 50 候補に適用した場合 1 クエリあたり約 300–700 ms。`--rerank-by-default <BOOL>` (`--reranker` 指定時は既定 on) はすべての `search` 呼び出しで再ランクするかを制御する。**値を取るフラグ**なので、無効化は `--rerank-by-default=false` と書く。MCP ツール側は `rerank: Option<bool>` で per-query 上書き可能。reranker の切替に**再インデックスは不要** (index 非依存)。
+再ランクは CPU では高い。しかも効いているのはモデルのロードではなく cross-encoder の推論そのものである。v1.0.0 に対して 1 台の Windows マシンで実測 (CPU のみ、埋め込み `bge-m3`、reranker `bge-v2-m3`、141 文書 / 1,855 chunk の KB、`limit = 5` なので候補プールは 50 ペア): 1 クエリが `groove search` で **74〜87 秒**、常駐 daemon の `/mcp` 経由で **74〜79 秒**。同じクエリを再ランク無しで投げると **3.1〜3.6 秒** と **約 0.1 秒**である。**常駐させても救われない**: reranker は `run_server` が起動時に構築するので、daemon の 2 本目以降にロードすべきモデルは残っていない。それでも 74〜79 秒かかる。効いているのは候補プールに対する cross-encoder の推論そのものである。有効にする前に自分のハードウェアで測ること: `groove search "<query>" --reranker bge-v2-m3` と `--reranker none` を同条件で繰り返し、プロセスの外側から時間を計る。`--rerank-by-default <BOOL>` (`--reranker` 指定時は既定 on) はすべての `search` 呼び出しで再ランクするかを制御する。**値を取るフラグ**なので、無効化は `--rerank-by-default=false` と書く。MCP ツール側は `rerank: Option<bool>` で per-query 上書き可能。reranker の切替に**再インデックスは不要** (index 非依存)。
 
 v0.27.0 以降、`rerank_by_default` は `groove search` も読む。同じ `groove.toml` で「CLI は再ランクするがサーバはしない」という食い違いは起きない。コマンドライン側の per-query 上書きは `--reranker` そのもので、モデルを明示すればファイルが `false` でもそのクエリだけ再ランクし、`--reranker none` ならそのクエリだけ切れる (`groove eval` は意図的にこのキーを読まない — 測るのは `--reranker` が選んだパイプラインで、run fingerprint もそのモデルを記録するため、黙って別物を測ってはいけない)。
 
@@ -82,8 +82,8 @@ v0.27.0 以降、`rerank_by_default` は `groove search` も読む。同じ `gro
 
 | シナリオ | 推奨 |
 |---|---|
-| 対話的エージェントフロー (LLM が 1 ターンで 2–5 回 `search` を呼ぶ) | **切っておく**。+500 ms × N が積もって重くなる。BGE-M3 + 見出し加重 bm25 の検索品質で大抵十分 |
-| 精度重視の単発クエリ (調査・定義的回答) | **有効化**。レイテンシ税は 1 ターンに 1 回、cross-encoder が意味的に関連する候補を明確に前に出す |
+| 対話的エージェントフロー (LLM が 1 ターンで 2–5 回 `search` を呼ぶ) | **切っておく**。1 回 1 分超では「レイテンシ税」ではなく別の対話形式になる。BGE-M3 + 見出し加重 bm25 の検索品質で大抵十分 |
+| 精度重視の単発クエリ (調査・定義的回答) | **1 クエリ 1 分を許容できるなら有効化**。支払いは 1 ターンに 1 回で、cross-encoder が意味的に関連する候補を明確に前に出す。ただし CPU ではその 1 分が回答時間そのものなので、既定 on より per-query の opt-in (`rerank: true`) を勧める |
 | 混在 | `rerank_by_default = false` で始め、呼び出し側が個別に選べるようにする — MCP ツールの `rerank: true`、コマンドラインなら `--reranker <model>` |
 
 再ランクを入れるべきサイン:

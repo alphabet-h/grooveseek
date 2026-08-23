@@ -152,8 +152,11 @@ kind = "stdio"
 bind = "127.0.0.1:3100"
 
 # Allow-list of accepted Host headers (DNS-rebinding defence, v0.5.0+).
-# Omitted, rmcp's default of localhost / 127.0.0.1 / ::1 (loopback only)
-# applies. ALWAYS set this explicitly when exposing the server on a LAN:
+# Omitted, groove accepts localhost / 127.0.0.1 / [::1] plus the address it
+# bound to when that address is itself loopback, so `--bind 127.0.0.2:3100`
+# also accepts `Host: 127.0.0.2`. groove decides this, not rmcp, whose own
+# check is switched off (docs/decisions/0009-one-dns-rebinding-gate.md).
+# ALWAYS set this explicitly when exposing the server on a LAN:
 # binding 0.0.0.0 while the allow-list stays loopback-only means every external
 # request is rejected with 403 by Host validation, which is almost always an
 # operator mistake, so startup warns about it. An empty list allows EVERY Host,

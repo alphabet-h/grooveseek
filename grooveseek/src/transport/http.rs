@@ -678,10 +678,15 @@ fn has_explicit_port_suffix(raw: &str) -> bool {
 /// **rmcp 側も同じ正規化を持つ** (本ファイルの `NormalizedAuthority` がその
 /// mirror) ため、bracketed のまま渡して問題ない — 実測で確認済み。
 /// (codex P1 round 7 on PR #173) `pub(crate)`: this is the crate's one answer to
-/// "which local names reach this server". Three allow-lists ask it — `/healthz`
-/// Host validation, the `/mcp` Origin defaults, and the admin router's
+/// "which local names reach this server". Four allow-lists ask it — `/healthz`
+/// Host validation, the `/mcp` Host defaults ([`effective_allowed_hosts`]), the
+/// `/mcp` Origin defaults ([`default_allowed_origins`]), and the admin router's
 /// `allowed_admin_hosts` — and a copy in any of them means a new alias would be
 /// accepted by one surface and refused by another.
+///
+/// It was three until ADR-0009: `/mcp`'s Host list was rmcp's, so this constant
+/// did not reach it. The count below and the one in `run_http` say four; this
+/// sentence said three for two days after that stopped being true.
 ///
 /// The bracketed IPv6 spelling is the primary form here;
 /// [`NormalizedAuthority::from_allowed_entry`] strips the brackets, so an entry
@@ -1616,10 +1621,10 @@ async fn dns_rebinding_gate(
 ///
 /// - `None` (= loopback only の default allow-list) — 外部クライアントは
 ///   Host header validation で必ず 403 になる。公開したいのに届かない。
-/// - `Some([])` — rmcp の `host_is_allowed` は**空リストを「全 Host 許可」
-///   として扱う** (rmcp 1.4.0 `streamable_http_server/tower.rs`: 空なら
-///   即 `true`)。つまり Host 検証が丸ごと無効で、非 loopback bind と
-///   組み合わせると LAN 全体に無認証で開く。
+/// - `Some([])` — **空リストは「全 Host 許可」の意味**になる
+///   ([`validate_host_header`] がそう実装している。上流も同じ綴りだが、
+///   ADR-0009 以降 `/mcp` の Host を判定するのはこちら)。つまり Host 検証が
+///   丸ごと無効で、非 loopback bind と組み合わせると LAN 全体に無認証で開く。
 ///
 /// (BU-01) 後者はもともと「operator が明示的に無効化した自己責任」として
 /// 警告対象外だった (F-33)。だが **いちばん危険な構成がいちばん静か**に

@@ -462,7 +462,9 @@ pub(crate) struct SearchCliArgs {
     /// Embedding model (must match the index; defaults to config or built-in)
     #[arg(long, value_enum)]
     pub(crate) model: Option<ModelChoice>,
-    /// Optional cross-encoder reranker. Adds 300-700ms but improves precision.
+    /// Optional cross-encoder reranker. Improves precision, and on CPU costs
+    /// far more than the search it refines -- measure before enabling; see
+    /// "When to enable reranking" in docs/usage.md.
     #[arg(long, value_enum)]
     pub(crate) reranker: Option<RerankerChoice>,
     /// Max results to return

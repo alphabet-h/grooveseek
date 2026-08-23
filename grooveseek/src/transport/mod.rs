@@ -150,8 +150,11 @@ impl Transport {
     /// - `[transport.http]` 単独指定 (kind 省略) は HTTP 扱い (糖衣)
     /// - HTTP bind 解決: `--bind` (完全形) > `(127.0.0.1, --port)` > config bind > `127.0.0.1:3100`
     /// - `allowed_hosts`: `[transport.http].allowed_hosts` が指定されていれば
-    ///   それ、無ければ rmcp default (loopback only) を保つ。CLI からは設定
-    ///   不可 (config 専用、誤設定を防ぐ意図 — ここを CLI で渡せると public
+    ///   それ、無ければ
+    ///   [`http::effective_allowed_hosts`](crate::transport::http) が組み立てる
+    ///   既定 (loopback 名 + bind したアドレスが loopback ならその表記) になる。
+    ///   **ADR-0009 以降、判定するのは rmcp ではなく groove 自身**。CLI からは
+    ///   設定不可 (config 専用、誤設定を防ぐ意図 — ここを CLI で渡せると public
     ///   bind 時に「うっかり全 Host 許可」が起きやすい)。
     pub fn resolve(
         cli_transport: Option<TransportKind>,
