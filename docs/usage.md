@@ -72,7 +72,7 @@ The server exposes 6 tools (see [docs/mcp-tools.md](mcp-tools.md)) and keeps the
 - `jina-v2-ml` — jinaai/jina-reranker-v2-base-multilingual (multilingual, ~1.2 GB). Lighter alternative.
 - `bge-base` — BAAI/bge-reranker-base (English/Chinese only, ~280 MB). Not recommended for Japanese.
 
-Latency cost of rerank is roughly 300–700 ms per query on CPU with `bge-v2-m3` over 50 candidates. `--rerank-by-default <BOOL>` (on by default when `--reranker` is set) controls whether every `search` call uses rerank. It takes a value rather than being a bare flag, so turning it off is `--rerank-by-default=false`; the MCP tool takes `rerank: Option<bool>` to override per query. Switching the reranker does **not** require re-indexing (it is index-independent).
+Rerank is expensive on CPU, and what costs is the cross-encoder pass rather than the model load. Measured against v1.0.0 on one Windows machine (CPU only, `bge-m3` embedder, `bge-v2-m3` reranker, a 141-document / 1,855-chunk knowledge base, `limit = 5` so the candidate pool is 50 pairs): one query took **74–87 s** through `groove search` and **74–79 s** through a resident daemon over `/mcp`, against **3.1–3.6 s** and **~0.1 s** for the same query with rerank off. Residency does not rescue it — the first reranked query on a freshly started daemon, the one that pays the model load, was the fastest of its batch. Time it on your own hardware before turning it on: repeat `groove search "<query>" --reranker bge-v2-m3` against the same command with `--reranker none`, timing each process from outside it. `--rerank-by-default <BOOL>` (on by default when `--reranker` is set) controls whether every `search` call uses rerank. It takes a value rather than being a bare flag, so turning it off is `--rerank-by-default=false`; the MCP tool takes `rerank: Option<bool>` to override per query. Switching the reranker does **not** require re-indexing (it is index-independent).
 
 As of v0.27.0 the `rerank_by_default` key is read by `groove search` as well, so one `groove.toml` no longer means rerank here and no rerank there. On the command line the per-query override is `--reranker` itself: naming a model opts that query in even when the file says `false`, and `--reranker none` opts it out. (`groove eval` deliberately ignores the key — it measures whatever `--reranker` selects, and its run fingerprint records that model, so a run must not silently measure something else.)
 
@@ -82,8 +82,8 @@ Rerank trades latency for precision. The right choice depends on usage pattern:
 
 | Scenario | Recommendation |
 |---|---|
-| Interactive agent flows (the LLM calls `search` 2–5 times per turn) | **Leave off.** +500 ms × N search calls adds up fast; retrieval quality from BGE-M3 + heading-weighted bm25 is usually sufficient. |
-| One-shot, precision-critical queries (research, definitive answers) | **Enable.** The latency tax is paid once per turn, and the cross-encoder meaningfully promotes semantically relevant candidates. |
+| Interactive agent flows (the LLM calls `search` 2–5 times per turn) | **Leave off.** At a minute or more per reranked call this is not a latency tax, it is a different interaction; retrieval quality from BGE-M3 + heading-weighted bm25 is usually sufficient. |
+| One-shot, precision-critical queries (research, definitive answers) | **Enable only if a minute per query is acceptable.** It is paid once per turn and the cross-encoder meaningfully promotes semantically relevant candidates — but on CPU that minute *is* the answer time, so prefer a per-query opt-in (`rerank: true`) over a standing default. |
 | Mixed usage | Start with `rerank_by_default = false` and let the caller opt in per query — `rerank: true` on the MCP tool, or `--reranker <model>` on the command line. |
 
 Symptoms that suggest you should turn rerank on:

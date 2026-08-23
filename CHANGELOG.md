@@ -42,6 +42,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Nothing in it cites a line number. The version it replaced cited eleven, and
   all eleven were wrong within five days.
 
+### Fixed
+
+- **The reranker's documented latency was wrong by two orders of magnitude.**
+  `--help` and [docs/usage.md](docs/usage.md) said rerank adds "300–700 ms per
+  query on CPU with `bge-v2-m3` over 50 candidates". Measured against 1.0.0 on
+  one Windows machine, the same query takes 3.1–3.6 s without it and 74–87 s
+  with it through `groove search`, and 0.1 s against 74–79 s through a resident
+  daemon. Residency does not help: the first reranked query on a fresh daemon,
+  the one that pays the model load, was the fastest of its batch, so the cost is
+  the cross-encoder pass over the candidate pool rather than the load.
+
+  The number, the `--help` line, and the recommendation table built on the
+  number are replaced by the measurement and the conditions it was taken under.
+  Nothing about reranking changed — only what the tool says it costs, and
+  therefore the advice about when to switch it on.
+
 ## [1.0.0] - 2026-08-22
 
 ### Added

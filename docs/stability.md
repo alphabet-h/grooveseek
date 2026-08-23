@@ -16,9 +16,9 @@ Within this document:
 ## Why this document exists
 
 Without it, "1.0.0" would promise that **everything observable** stays fixed until
-2.0.0. That is not a promise this project can keep: at the time of writing the code
-exposes 408 public Rust items across 24 modules, 138 command-line flags, 6 MCP tools,
-11 configuration sections, and a SQLite schema. Freezing all of it would mean either
+2.0.0. That is not a promise this project can keep: the observable surface is the
+whole public Rust API, every command-line flag, the six MCP tools, every
+`groove.toml` section, and a SQLite schema. Freezing all of it would mean either
 never improving the parts nobody depends on, or shipping major versions for changes
 nobody would notice.
 

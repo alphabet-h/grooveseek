@@ -31,5 +31,5 @@ chunks or the whole document, giving the caller more context per result.
 
 The server speaks MCP (Model Context Protocol) over either stdio or a
 Streamable HTTP transport. Both share the same set of tools (`search`,
-`get_document`, `graph`, `get_best_practice`) backed by the same
-indexing core.
+`get_document`, `list_topics`, `get_connection_graph`, `get_best_practice`,
+`rebuild_index`) backed by the same indexing core.
