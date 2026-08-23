@@ -721,7 +721,14 @@ impl KbServer {
 
     #[tool(
         name = "rebuild_index",
-        description = "Rebuild the search index by scanning all source files in the knowledge base (Markdown plus any other extensions enabled via `[parsers].enabled` in groove.toml)."
+        description = "Rebuild the search index by scanning all source files in \
+                       the knowledge base (Markdown plus any other extensions \
+                       enabled via `[parsers].enabled` in groove.toml). One at \
+                       a time: a call arriving while a rebuild is already \
+                       running is refused with an error naming how long the \
+                       running one has been going. Search is unavailable until \
+                       a rebuild finishes, because it holds the embedder and \
+                       the database."
     )]
     async fn rebuild_index(&self, Parameters(params): Parameters<RebuildIndexParams>) -> String {
         // Claimed here, in the handler, rather than inside the closure below —
@@ -746,8 +753,9 @@ impl KbServer {
         name = "get_connection_graph",
         description = "BFS-expand semantically related chunks starting from a \
                        document path. Returns a flat list of nodes with \
-                       parent_id / depth / score, useful for chained context \
-                       discovery by an LLM agent."
+                       parent_id / depth / score / snippet, useful for chained \
+                       context discovery by an LLM agent, plus truncated and \
+                       truncation[] when a bound cut the walk short."
     )]
     async fn get_connection_graph(
         &self,

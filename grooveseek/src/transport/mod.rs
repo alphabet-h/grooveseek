@@ -189,7 +189,7 @@ impl Transport {
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.allowed_origins.clone());
                 // ここが `allowed_origins` の消費点 — この arm を通らない限り
-                // rmcp には渡らない。だから検査もここに置く。`Stdio` arm も、
+                // gate には渡らない。だから検査もここに置く。`Stdio` arm も、
                 // `index` / `search` も、このキーを読まない
                 // (`check_origin_list` の doc が 2 度の置き場所の誤りを持っている)。
                 if let Some(list) = allowed_origins.as_deref() {
@@ -483,10 +483,11 @@ mod tests {
     }
 
     /// The spelling `allowed_hosts` accepts, written into the key next door.
-    /// rmcp drops it at match time and says nothing, leaving Origin validation
-    /// on with nothing to match — so the server 403s every browser, including
-    /// its own `/ui`, and the log is silent. Refusing here, before the list
-    /// becomes part of a running transport, is the last place it is visible.
+    /// [`http::parse_origin`](crate::transport::http) drops it at match time and
+    /// says nothing, leaving Origin validation on with nothing to match — so the
+    /// server 403s every browser, including its own `/ui`, and the log is
+    /// silent. Refusing here, before the list becomes part of a running
+    /// transport, is the last place it is visible.
     #[test]
     fn an_origin_entry_that_never_reaches_the_comparison_stops_the_http_transport() {
         let cfg = TransportConfig {
@@ -500,7 +501,7 @@ mod tests {
         let msg = format!(
             "{:#}",
             Transport::resolve(None, None, None, Some(&cfg))
-                .expect_err("an entry rmcp would drop must not reach a running server")
+                .expect_err("an entry the matcher would drop must not reach a running server")
         );
         for needle in [
             "[transport.http].allowed_origins",
@@ -540,8 +541,9 @@ mod tests {
     }
 
     /// 省略時は `None`。`run_http` がそこで **bind した port の loopback origin**
-    /// を組み立てる。`Some(vec![])` との違いが要点で、空 `Vec` は rmcp では
-    /// 「検証しない」を意味するため、省略の既定にしてはならない。
+    /// を組み立てる。`Some(vec![])` との違いが要点で、空 `Vec` は
+    /// [`http::origin_is_allowed`](crate::transport::http) が「検証しない」と
+    /// 読む符号 (rmcp から受け継いだ約束) なので、省略の既定にしてはならない。
     #[test]
     fn test_resolve_config_omitted_allowed_origins_is_none_not_empty() {
         let cfg = TransportConfig {
@@ -564,7 +566,8 @@ mod tests {
     }
 
     /// F-33: `[transport.http].allowed_hosts` の deserialize は省略可。
-    /// toml に書かなければ `None` (= rmcp default loopback-only).
+    /// toml に書かなければ `None` (= [`http::effective_allowed_hosts`](crate::transport::http)
+    /// が組む loopback-only な既定)。
     #[test]
     fn test_http_transport_config_omits_allowed_hosts() {
         let toml_str = r#"bind = "127.0.0.1:3100""#;
@@ -590,7 +593,8 @@ mod tests {
         );
     }
 
-    /// F-33: 空配列も valid (rmcp 側で全 Host 許可になる、operator 自己責任)。
+    /// F-33: 空配列も valid ([`http::validate_host_header`](crate::transport::http)
+    /// が全 Host 許可として扱う、operator 自己責任)。
     #[test]
     fn test_http_transport_config_allows_empty_vec() {
         let toml_str = r#"

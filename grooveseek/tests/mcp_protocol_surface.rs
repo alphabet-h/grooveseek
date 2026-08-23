@@ -558,3 +558,80 @@ fn resources_list_and_read_agree_with_the_index() {
         "every search hit must carry the resource URI for its document: {hits}"
     );
 }
+
+/// The tool descriptions a client reads, against the behaviour the server has.
+///
+/// A client never opens `docs/mcp-tools.md`. The `description=` string is the
+/// whole of what it is told, and both of these had drifted from the page:
+/// `rebuild_index` enforced a one-at-a-time bound it did not mention, and
+/// `get_connection_graph` returned two fields it did not name.
+///
+/// Worth saying what substring assertions cannot do. This catches a fact being
+/// deleted from a description. It does not catch a description disagreeing with
+/// the page, because nothing here reads the page — that is a different guard,
+/// and it does not exist.
+///
+/// The full-phrase assertions are load-bearing for a second reason. Those
+/// literals are joined with `\` continuations, which eat the newline *and the
+/// leading whitespace* of the next line, so one missing trailing space welds
+/// two words together and nothing else in the tree would notice.
+#[test]
+fn the_tool_descriptions_name_the_behaviour_the_server_has() {
+    let (_kb, _guard, base) = start();
+
+    let listed = rpc(&base, "tools/list", serde_json::json!({"_meta": meta()}));
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list must return an array: {listed}"));
+
+    let describe = |name: &str| -> String {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be advertised: {listed}"));
+        tool["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} must carry a description: {listed}"))
+            .to_string()
+    };
+
+    // `claim_rebuild_slot` refuses a call that arrives during a rebuild, and
+    // `rebuild_already_running` names the elapsed time in the error.
+    let rebuild = describe("rebuild_index");
+    for wanted in [
+        "all source files in the knowledge base",
+        "One at a time",
+        "refused",
+        "how long the running one has been going",
+    ] {
+        assert!(
+            rebuild.contains(wanted),
+            "rebuild_index refuses a concurrent call and its description must \
+             say so: {wanted:?} missing from {rebuild:?}"
+        );
+    }
+
+    // Fields `GraphNode` and the response envelope actually carry.
+    let graph = describe("get_connection_graph");
+    for wanted in [
+        "parent_id / depth / score / snippet",
+        "truncated",
+        "truncation[]",
+    ] {
+        assert!(
+            graph.contains(wanted),
+            "get_connection_graph returns {wanted:?} and must name it: {graph:?}"
+        );
+    }
+
+    for (name, text) in [
+        ("rebuild_index", &rebuild),
+        ("get_connection_graph", &graph),
+    ] {
+        assert!(
+            !text.contains("  ") && !text.contains('\n'),
+            "{name}'s description must read as one paragraph, so a continuation \
+             that kept its indentation is a defect: {text:?}"
+        );
+    }
+}
