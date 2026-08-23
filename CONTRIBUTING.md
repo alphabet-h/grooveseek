@@ -45,16 +45,18 @@ cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
-cargo doc --no-deps --workspace --document-private-items
+cargo doc --no-deps --workspace --all-features --document-private-items
 ```
 
 `cargo doc` is there because a doc comment that names something the tree no
 longer has is a defect nothing else catches: a backticked name is invisible to
 rustc, and only an intra-doc link — `` [`name`] `` — is checked at all. The lint
 levels come from `[workspace.lints.rustdoc]` in the root `Cargo.toml`, so this
-command says the same thing locally as it does in CI. `--document-private-items`
-is not optional: most of this crate is private modules, and without it their doc
-comments are never read.
+command says the same thing locally as it does in CI. Neither flag is optional:
+most of this crate is private modules, and without `--document-private-items`
+their doc comments are never read; `test-helpers` is default-off and gates
+documented items, which rustdoc removes along with the items unless
+`--all-features` is set.
 
 The order of the two `cargo test` lines matters on a cold model cache, which is why CI runs them that way too. `index_progress_cli` spawns `groove` subprocesses that each need BGE-small; run in parallel they race on the HuggingFace download lock and fail with "Lock acquisition failed". Running that target single-threaded first lets exactly one process do the download, and the full suite then runs against a warm cache.
 
@@ -118,7 +120,7 @@ So: if you add a module, add tests with it. When the floor trips, the offending 
 
 1. Fork the repo and branch from `main`
 2. Add tests for new behavior (unit tests inline, integration tests under `tests/`)
-3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test && cargo doc --no-deps --workspace --document-private-items`
+3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test && cargo doc --no-deps --workspace --all-features --document-private-items`
 4. Open a PR describing the problem and the change; link any related issues
 
 ## Reporting bugs

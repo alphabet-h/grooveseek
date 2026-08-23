@@ -61,8 +61,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Internal
 
 - **A doc comment that names something this tree no longer has now fails CI.**
-  `cargo doc --no-deps --workspace --document-private-items` runs as the last
-  step of the `test` job, and `[workspace.lints.rustdoc]` in the root
+  `cargo doc --no-deps --workspace --all-features --document-private-items` runs
+  as the last step of the `test` job, and `[workspace.lints.rustdoc]` in the root
   `Cargo.toml` denies every warn-by-default rustdoc lint except one. Until now CI
   ran fmt, clippy, check and test, none of which read a doc comment:
   `transport/http.rs` named `admin_host_check` for two days after
@@ -87,6 +87,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is the useful thing to write. A name that no longer exists is a different lint,
   and that one is denied: renaming `size_cap_exceeded` while leaving its four
   doc references alone fails the build with four errors.
+
+  `--all-features` is there for the reason clippy runs twice: `test-helpers` is
+  default-off and gates documented items, and rustdoc removes a gated item's doc
+  comment along with the item. Unlike clippy this needs only one run, because the
+  workspace's only `#[cfg(not(feature = ...))]` is in `benches/`, which `cargo
+  doc` does not document either way.
 
   It is a step in an existing job rather than a fourth job. `cargo doc --no-deps`
   wants exactly the dependency metadata `cargo check --all-targets` already

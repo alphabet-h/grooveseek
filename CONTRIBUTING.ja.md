@@ -44,15 +44,17 @@ cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
-cargo doc --no-deps --workspace --document-private-items
+cargo doc --no-deps --workspace --all-features --document-private-items
 ```
 
 `cargo doc` が入っているのは、**doc コメントがツリーに無い名前を指している**という欠陥を
 他の誰も捕まえないため。バッククォートだけの名前は rustc から見えず、検査されるのは
 intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.toml` の
 `[workspace.lints.rustdoc]` に置いてあるので、このコマンドはローカルでも CI と同じことを
-言う。`--document-private-items` は省略できない — このクレートの大半は private module で、
-付けなければその doc コメントは一度も読まれない。
+言う。**2 つのフラグはどちらも省略できない** — このクレートの大半は private module なので
+`--document-private-items` を付けなければその doc コメントは一度も読まれず、
+`test-helpers` は既定 off かつ doc コメント付きの item を gate しているので、
+`--all-features` が無いと rustdoc が item ごとその doc を落とす。
 
 `cargo test` の 2 行は**順序が意味を持つ** (モデルキャッシュが cold の場合)。CI も同じ順で回している。`index_progress_cli` は BGE-small を必要とする `groove` サブプロセスを複数起動するので、並列で走らせると HuggingFace の download lock を奪い合って `Lock acquisition failed` で落ちる。この target を先にシングルスレッドで回せば DL するプロセスがちょうど 1 つになり、後続のフルスイートは warm cache に対して走る。
 
@@ -116,7 +118,7 @@ retrieval に触れる変更 (クエリのコンパイル、fusion、chunk 分�
 
 1. リポジトリを fork し、`main` からブランチを切る
 2. 新しい挙動にはテストを追加 (ユニットは inline、integration は `tests/` 配下)
-3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test && cargo doc --no-deps --workspace --document-private-items` を pass
+3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test && cargo doc --no-deps --workspace --all-features --document-private-items` を pass
 4. 問題と変更内容を明示した PR を開く (関連 issue があればリンク)
 
 ## バグ報告

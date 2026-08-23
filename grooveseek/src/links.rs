@@ -98,10 +98,12 @@
 //!
 //! **Fail-open on error.** A path that cannot be examined is allowed through by
 //! [`crate::links::is_multiply_linked`]. Deletion events arrive after the file
-//! is gone, and `should_process_parts` gates deindexing as well as indexing:
-//! refusing what we cannot stat would leave deleted documents in the index
-//! forever. The rule does not extend to [`crate::links::read_checked`], where a
-//! file that cannot be opened yields no bytes either way.
+//! is gone, and the gate in [`crate::watcher`] covers deindexing as well as
+//! indexing -- `should_process_parts`, private to that module and so nameable
+//! from here only in prose. Refusing what we cannot stat would leave deleted
+//! documents in the index forever. The rule does not extend to
+//! [`crate::links::read_checked`], where a file that cannot be opened yields no
+//! bytes either way.
 
 use std::fs::File;
 use std::path::Path;

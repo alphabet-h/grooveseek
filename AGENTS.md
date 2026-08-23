@@ -33,7 +33,7 @@ cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 cargo check --all-targets
 cargo test --test index_progress_cli -- --test-threads=1   # first, and single-threaded
 cargo test
-cargo doc --no-deps --workspace --document-private-items
+cargo doc --no-deps --workspace --all-features --document-private-items
 ```
 
 Clippy runs **twice** because the second pass is the only one that compiles the
@@ -42,7 +42,8 @@ order of the two `cargo test` lines matters on a cold model cache:
 `index_progress_cli` spawns `groove` subprocesses that each need BGE-small, and
 in parallel they race on the HuggingFace download lock. `cargo doc` is a check
 rather than a build step here — `--document-private-items` is what makes it read
-this crate's private modules, which is most of it. `CONTRIBUTING.md` explains all
+this crate's private modules, which is most of it, and `--all-features` is what
+makes it read the items `test-helpers` gates. `CONTRIBUTING.md` explains all
 three at length.
 
 Windows needs no extra DLLs: ONNX Runtime and SQLite are linked in statically.
@@ -142,3 +143,9 @@ opposite of how `///` on an item behaves. Prose about something *outside* the
 tree — an upstream symbol, a TOML key like `` `[eval].golden` ``, an interval
 like `` `k in [30,100]` `` — stays in backticks, which is also what keeps
 rustdoc from reading the brackets as a link.
+
+One case cannot be written as a link at all: an item **private to another
+module**, which Rust does not let you name from here and rustdoc reports as "no
+item named". Link the module and leave the item in prose — `` the gate in
+[`crate::watcher`] ... `should_process_parts` `` — rather than widening the
+item's visibility so a sentence can point at it.

@@ -93,9 +93,16 @@ jobs:
       # sat in `//!` docs that the public-only walk never read. Levels come from
       # `[workspace.lints.rustdoc]` in the root Cargo.toml, where the reasoning
       # is; nothing here sets them, so a local `cargo doc` says the same thing.
+      #
+      # `--all-features` for the same reason clippy runs twice: `test-helpers`
+      # is default-off and gates documented items -- `web_search` in `server.rs`
+      # and the test-only handlers in `transport/http.rs` -- whose doc comments
+      # rustdoc removes along with the items. Unlike clippy this needs only one
+      # run: the only `#[cfg(not(feature = ...))]` in the workspace is in
+      # `benches/`, which `cargo doc` does not document either way.
       - name: cargo doc (doc comments may not name what the tree lacks)
         if: ${{ !cancelled() }}
-        run: cargo doc --no-deps --workspace --document-private-items
+        run: cargo doc --no-deps --workspace --all-features --document-private-items
 
   clippy:
     name: clippy (${{ matrix.os }})
