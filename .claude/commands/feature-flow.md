@@ -5,7 +5,7 @@ description: ブレスト → 仕様 → plan → 実装 → PR → codex review
 # /feature-flow
 
 新 feature の着想から release tag までを進めるオーケストレータ。**session の単位は PR 1 つ** —
-Phase 6 で merge したら session を閉じ、次の PR は新 session で始める (「handoff と session の区切り」節)。各フェーズ間の subagent self-review / codex review / handoff 生成を自動で回し、ユーザを「設計判断」だけに集中させる。
+Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっさらな context で始める (「handoff と session の区切り」節)。各フェーズ間の subagent self-review / codex review / handoff 生成を自動で回し、ユーザを「設計判断」だけに集中させる。
 
 ## 想定起動タイミング
 
@@ -118,8 +118,8 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
    - `INDETERMINATE` / exit 3〜8 → SKILL.md の表のとおり。**exit 7 (= 5 round 到達、何も投稿していない) → ユーザに相談** (← 介入ポイント 3)
 5. `CONVERGED=true` になったら `gh pr merge <N> --squash --delete-branch`
 6. **merge したら session を閉じる** — release worthy なら Phase 7、続けて Phase 8 を済ませ、
-   「handoff と session の区切り」の手順で handoff → `.dev` push → 新 session。
-   次の PR (PR-<n+1>) は新 session の Phase 5 から再開する。Phase 7 は release worthy な PR でしか
+   「handoff と session の区切り」の手順で handoff → `.dev` push → **`/clear`**。
+   次の PR (PR-<n+1>) はその後の Phase 5 から再開する。Phase 7 は release worthy な PR でしか
    走らないので、session の区切りを Phase 7 に置くと非 release の merge で手順が抜ける
 
 review 取り込み時の判断はすべて controller (= main agent) が行い、user 介入はしない。**ただし**:
@@ -156,7 +156,12 @@ cycle 完了時に必ず:
 
 **Phase 6 step 5 で PR が merge されたら (= step 6)、Phase 7 / 8 の後処理を済ませて session を閉じる**
 (例外として、Phase 5 / Phase 6 の途中で context が逼迫したときも同じ手順)。`/compact` で続けない — 1 session 1 回まで
-(根拠: `.dev/knowledge/mistakes-repeat-session-length-ungated-rules-duplicated-facts.md`):
+(根拠: `.dev/knowledge/mistakes-repeat-session-length-ungated-rules-duplicated-facts.md`)。
+
+**閉じ方は `/clear` で足りる** — 止めたいのは「溜まった context に compaction を重ねること」であって
+プロセスの寿命ではない。`/clear` は context を捨て、transcript も切り替わる (実測: 同日の 3 本が
+226 MB / 1 MB / 3 MB)。立ち上げ直す価値があるのは **`settings.json` / hook を触った直後だけ**
+(skill は同 session 内で反映される)。`/clear` は background task を止めないので、下の leak 確認が効く:
 
 1. **handoff doc を即時 write**: `.dev/knowledge/session-<YYYY-MM-DD>-<topic>-handoff.md`
    - 現状の git state (`git log --oneline -5`)
@@ -174,9 +179,9 @@ cycle 完了時に必ず:
      *) echo "ABORT: .dev is not its own repository; see the preconditions" >&2; exit 1 ;;
    esac
    ```
-3. ユーザに通知: `handoff を <path> に書き、.dev を push しました。この session を閉じて、新 session で「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
+3. ユーザに通知: `handoff を <path> に書き、.dev を push しました。/clear して「<path> を読んで続きを進めて」と一言伝えれば再開できます。`
 
-新 session が始まったら、SessionStart 通知を起点に handoff doc を読んで再開する。
+context が切り替わったら、SessionStart 通知を起点に handoff doc を読んで再開する。
 
 handoff doc の型は `.dev/knowledge/session-2026-08-22-handoff-after-stderr-ascii.md` (★次にやること /
 main の状態 (実測) / 残っているもの / 測って分かったこと / 環境の罠 / 台帳 / 起票済み)。
