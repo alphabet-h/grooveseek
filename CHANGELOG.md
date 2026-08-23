@@ -60,6 +60,62 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **A Markdown link that no longer resolves now fails the test suite.**
+  `grooveseek/tests/docs_links_resolve.rs` walks every `.md` file in the
+  repository and checks two things about each relative destination: that the file
+  is there, and that an `#anchor` matches a heading GitHub would generate in it.
+  It found one, in [docs/stability.ja.md](docs/stability.ja.md), which had
+  carried the English page's `#stable` since it was translated — a link that
+  opened the right page at the wrong place for anyone who followed it. The
+  Japanese anchor is `#コマンドライン`.
+
+  A throwaway script checked this once by hand during the README split and then
+  lived in a scratch directory. This is that check in the tree: 70 pages, 489
+  relative destinations, 35 of them anchored, 17 of those with Japanese
+  fragments.
+
+  The anchor half follows `github-slugger`, the implementation the remark and
+  MDX toolchains use to reproduce GitHub's anchors: downcase, delete everything
+  outside `[\p{Word}\- ]`, then turn spaces into hyphens. The order is what
+  implementations get wrong — `信頼する置き場所 / しない置き場所` loses the slash
+  first and keeps *two* spaces, so its anchor carries two hyphens, and a slugger
+  that mapped spaces before stripping punctuation would reject a link this
+  repository contains. Counted twice, with a second implementation built on a
+  different principle (Unicode general categories and a line matcher, against
+  this one's `char::is_alphanumeric` and a parser): identical on all 792 anchors.
+
+  Repeats retry their suffix until it is free, so `# Foo`, `# Foo`, `# Foo-1`
+  ends `foo`, `foo-1`, `foo-1-1` rather than handing `foo-1` out twice. Which of
+  the two GitHub itself does is not documented and cannot be measured (`POST
+  /markdown` renders headings without ids); the retry is the side that can only
+  ever accept a missing anchor, where the counter can reject a working link and
+  stop CI.
+
+  Pages are parsed rather than matched line by line, which is what makes a `#`
+  inside a fenced TOML block not a heading and a reference-style link still a
+  link, and destinations are read as the URLs they are before they are read as
+  paths: the query and the fragment are cut off first (`docs/usage.md?plain=1`
+  is a link GitHub's own interface hands out), percent escapes are decoded the
+  way GitHub decodes them, and a rooted path — `/x`, `\x`, or the `%2F` that
+  decodes into one — is answered as the site-root path it is rather than by
+  asking a filesystem that differs between CI and a laptop. A fragment is read
+  in the language of the file it lands on: on a page a heading slug or an anchor
+  the page names outright with `<a name="…">`, on anything GitHub renders as
+  source a line range (`#L10` is checked against the file's length), and on a
+  directory the README GitHub shows underneath its file list. Destinations are
+  resolved lexically, counting depth from the
+  repository root, so a `..` that would climb above it is out of bounds wherever
+  the checkout happens to sit — `exists()` cannot ask that, and neither can
+  folding the path absolutely, which merely walks up one directory and back down
+  into whatever sits beside the checkout. On Actions that is the checkout
+  itself, since the path is `work/<repo>/<repo>`. External
+  URLs are skipped entirely, on the URI grammar rather than a list of the
+  schemes seen so far, so `tel:` and `MAILTO:` are not looked for on disk — a
+  guard that can fail because
+  someone else's server is down stops being read — and what it cannot catch is
+  written down in the test: a link that resolves while the sentence around it
+  lies, which is the failure the same README split shipped seven of.
+
 - **A doc comment that names something this tree no longer has now fails CI.**
   `cargo doc --no-deps --workspace --all-features --document-private-items` runs
   as the last step of the `test` job, and `[workspace.lints.rustdoc]` in the root
