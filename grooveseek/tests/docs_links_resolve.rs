@@ -418,31 +418,46 @@ fn is_rooted(path: &str) -> bool {
     path.starts_with('/') || path.starts_with('\\') || Path::new(path).has_root()
 }
 
-/// The path with its `.` and `..` resolved by the text, without asking the
-/// filesystem anything.
+/// The destination resolved against the page's own directory, or `None` if it
+/// climbs out of the repository.
 ///
-/// This is how GitHub resolves a destination, and it is the only way to ask
-/// whether one stays inside the repository. `exists()` cannot answer that: a
-/// link that climbs out and back in resolves to a real file whenever the
-/// checkout has a directory of the right name beside it -- and on GitHub Actions
-/// it always does, because the checkout is `work/<repo>/<repo>`. So
-/// `../grooveseek/README.md` written on a root-level page is a link GitHub
-/// serves as a 404 that CI would call fine and a laptop would call broken.
+/// Resolved by the text, because `exists()` cannot answer this: a link that
+/// leaves the checkout lands wherever the machine happens to keep things, and
+/// whether that is a file is not a fact about this repository.
 ///
-/// Lexical on purpose. Resolving symlinks would answer a different question than
-/// the one GitHub answers, and would need the file to exist to ask it.
-fn normalized(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
+/// **Counted from the root rather than from `/`, which is the whole point.**
+/// `../grooveseek/README.md` on a root-level page is out of the repository, and
+/// GitHub serves it as a 404 -- there is nothing above a repository to address.
+/// Fold it absolutely and it merely walks up one directory and back down into
+/// whatever sits beside the checkout; on GitHub Actions that is the checkout
+/// itself, because the path is `work/<repo>/<repo>`, so the link would resolve
+/// to a real tracked file and pass. The name of the directory the repository
+/// happens to be cloned into then decides the verdict. Counting depth from the
+/// root asks the question GitHub asks, and gives the same answer everywhere.
+///
+/// Lexical for the same reason: resolving symlinks would answer a different
+/// question than GitHub's, and would need the file to exist in order to ask.
+fn resolved_within(root: &Path, directory: &Path, destination: &str) -> Option<PathBuf> {
+    let mut from_root: Vec<Component> = directory
+        .strip_prefix(root)
+        .expect("every page walked was found under the repository root")
+        .components()
+        .collect();
+
+    for component in Path::new(destination).components() {
         match component {
             Component::CurDir => {}
+            // Nothing is above the repository, so this is where a link leaves.
             Component::ParentDir => {
-                out.pop();
+                from_root.pop()?;
             }
-            named => out.push(named),
+            named => from_root.push(named),
         }
     }
-    out
+
+    let mut resolved = root.to_path_buf();
+    resolved.extend(from_root.iter());
+    Some(resolved)
 }
 
 /// What a fragment on a directory link resolves against.
@@ -589,18 +604,13 @@ fn every_relative_link_in_the_documentation_resolves() {
             let target = if path_part.is_empty() {
                 file.clone()
             } else {
-                let joined = normalized(
-                    &file
-                        .parent()
-                        .expect("a file always has a parent directory")
-                        .join(path_part),
-                );
+                let directory = file.parent().expect("a file always has a parent directory");
                 // Asked before `exists()`, because climbing out of the checkout
                 // and back in through its parent lands on a real file.
-                if !joined.starts_with(&root) {
+                let Some(joined) = resolved_within(&root, directory, &path_part) else {
                     broken.push(format!("{where_}  leaves the repository -> {dest}"));
                     continue;
-                }
+                };
                 if !joined.exists() {
                     broken.push(format!("{where_}  no such file          -> {dest}"));
                     continue;
@@ -850,27 +860,39 @@ fn a_rooted_destination_is_recognised_from_the_string() {
 
 /// A destination that climbs out of the repository, which `exists()` cannot
 /// tell from one that stays in.
+///
+/// The root here is a made-up relative path, and that is deliberate: the answers
+/// below must not depend on where the repository is checked out or what the
+/// directory holding it is called. Written against the real root, the first case
+/// passes on a laptop and fails on GitHub Actions -- measured, on all three
+/// runners -- because there the checkout is `work/grooveseek/grooveseek` and
+/// `../grooveseek/` climbs out and lands straight back in.
 #[test]
 fn a_destination_that_leaves_the_repository_is_caught_by_the_text() {
-    let root = repo_root();
+    let root = Path::new("repo");
+    let pages = root.join("docs");
 
-    // The shape that made CI and a laptop disagree: written on a root-level
-    // page, this climbs out of the checkout and back into a sibling that
-    // `work/<repo>/<repo>` guarantees exists on GitHub Actions.
-    let escaping = normalized(&root.join("../grooveseek/README.md"));
-    assert!(!escaping.starts_with(&root), "{}", escaping.display());
+    // Nothing is above a repository, whatever sits beside it on this machine.
+    assert_eq!(resolved_within(root, root, "../grooveseek/README.md"), None);
+    assert_eq!(resolved_within(root, &pages, "../../elsewhere.md"), None);
 
     // `..` that stays inside is ordinary, and this repository is full of it.
-    let staying = normalized(&root.join("docs").join("../README.md"));
-    assert_eq!(staying, root.join("README.md"));
-    assert!(staying.starts_with(&root));
+    assert_eq!(
+        resolved_within(root, &pages, "../README.md"),
+        Some(root.join("README.md"))
+    );
 
     // `.` is dropped, and the answer never touches the filesystem.
     assert_eq!(
-        normalized(Path::new("a/./b/../c/d.md")),
-        PathBuf::from("a/c/d.md")
+        resolved_within(root, &pages, "./a/../b/c.md"),
+        Some(pages.join("b").join("c.md"))
     );
-    assert_eq!(normalized(Path::new("a/b/../..")), PathBuf::new());
+
+    // Landing on the root itself is inside it.
+    assert_eq!(
+        resolved_within(root, &pages, ".."),
+        Some(root.to_path_buf())
+    );
 }
 
 /// A directory link, which GitHub answers with the directory's README.

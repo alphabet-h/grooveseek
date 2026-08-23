@@ -103,10 +103,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the page names outright with `<a name="…">`, on anything GitHub renders as
   source a line range (`#L10` is checked against the file's length), and on a
   directory the README GitHub shows underneath its file list. Destinations are
-  resolved lexically and required to
-  stay inside the repository, which `exists()` cannot check — a link that climbs
-  out of the checkout and back in through its parent lands on a real file
-  whenever the checkout is `work/<repo>/<repo>`, as it is on Actions. External
+  resolved lexically, counting depth from the
+  repository root, so a `..` that would climb above it is out of bounds wherever
+  the checkout happens to sit — `exists()` cannot ask that, and neither can
+  folding the path absolutely, which merely walks up one directory and back down
+  into whatever sits beside the checkout. On Actions that is the checkout
+  itself, since the path is `work/<repo>/<repo>`. External
   URLs are skipped entirely, on the URI grammar rather than a list of the
   schemes seen so far, so `tel:` and `MAILTO:` are not looked for on disk — a
   guard that can fail because
