@@ -699,7 +699,8 @@ pub(crate) const DEFAULT_LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1", "
 /// - `host_raw`: HTTP Host header 文字列、または URI authority の文字列
 ///   (HTTP/2 / proxy-forwarded fallback)。両方不在なら `None` で `MissingHost`
 /// - `allowed`:
-///   - `None` → `DEFAULT_LOOPBACK_HOSTS` ("localhost" / "127.0.0.1" / "[::1]")
+///   - `None` → `DEFAULT_LOOPBACK_HOSTS`
+///     (`"localhost"` / `"127.0.0.1"` / `"[::1]"`)
 ///   - `Some(&[])` → 全許可 (= rmcp `disable_allowed_hosts` 相当)
 ///   - `Some(&[..])` → 厳密 match
 ///
@@ -1416,7 +1417,7 @@ async fn mcp_session_gate(
 // ---------------------------------------------------------------------------
 
 /// Why a request was turned away. Carries the offending value **for the log
-/// only** — [`Refusal::message`] never contains it, because the caller supplied
+/// only** — [`Refusal::response`] never contains it, because the caller supplied
 /// it and a body is not the place to hand it back (L-7).
 #[derive(Debug)]
 enum Refusal {

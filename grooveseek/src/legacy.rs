@@ -12,10 +12,10 @@
 //! exclusion rules, and whether `[parsers].enabled` still opens that extension
 //! — so what comes back is whatever those two admit. Nothing said so.
 //!
-//! Which is why [`inspect`] does not reason forward from the old file at all.
-//! It reads the index, and reports the documents that are **in** it and that
-//! `current` does not exclude. Whatever the parser registry dropped is not in
-//! the index to be counted, so it is never claimed.
+//! Which is why [`crate::legacy::inspect`] does not reason forward from the old
+//! file at all. It reads the index, and reports the documents that are **in**
+//! it and that `current` does not exclude. Whatever the parser registry dropped
+//! is not in the index to be counted, so it is never claimed.
 //!
 //! # Why it opens the file
 //!

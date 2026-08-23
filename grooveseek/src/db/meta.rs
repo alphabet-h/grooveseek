@@ -479,7 +479,8 @@ impl Database {
     }
 
     /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
-    /// チャンクを検出し、[`quality::chunk_quality_score`] で再計算して UPDATE する (冪等)。
+    /// チャンクを検出し、[`crate::quality::chunk_quality_score`] で再計算して
+    /// UPDATE する (冪等)。
     ///
     /// `binary_exts` = is_binary な parser の拡張子集合。document の path 拡張子が
     /// これに含まれれば `is_binary=true` で再計算し、length/structure penalty を免除する。
