@@ -139,8 +139,17 @@ pub const JAPANESE_SUFFIX: &str = ".ja.md";
 /// `Path::extension` answers `"md"` for both halves, because it reads from the
 /// last dot. The file name's suffix is the only thing that separates them, and
 /// this is the only place in these guards that reads it.
+///
+/// The name is read with `to_string_lossy`, which is what
+/// `main.rs`'s `documented_flags::Corpus::of` does, and the match matters. An
+/// earlier version here used `to_str()` and returned `None` for a name that is
+/// not valid UTF-8. The binary would have called such a name Japanese and the
+/// twin guard would have skipped it -- **silently**, which is the one way a
+/// guard fails without saying so. The two classifiers cannot be collapsed into
+/// one (see this module's header), so the next best thing is that they read a
+/// name the same way, and that this is written where either is edited.
 pub fn english_counterpart(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
     let stem = name.strip_suffix(JAPANESE_SUFFIX)?;
     Some(path.with_file_name(format!("{stem}.md")))
 }

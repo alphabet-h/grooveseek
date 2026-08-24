@@ -64,6 +64,56 @@ fn block_commands(markdown: &str) -> Vec<(usize, Vec<String>)> {
         .collect()
 }
 
+/// Everything the two halves of a pair disagree about, block by block.
+///
+/// Every way the sequences can differ has to produce a line here. Reporting
+/// only the commands one side is missing would let a block that names the same
+/// commands in a different order pass **after** the comparison had already
+/// noticed it was not equal, and order is the instruction: `CONTRIBUTING.md`
+/// runs one test target before the full suite on purpose.
+fn block_differences(
+    en_name: &str,
+    en_blocks: &[(usize, Vec<String>)],
+    ja_name: &str,
+    ja_blocks: &[(usize, Vec<String>)],
+) -> Vec<String> {
+    if en_blocks.len() != ja_blocks.len() {
+        return vec![format!(
+            "{en_name} has {} shell block(s), {ja_name} has {}",
+            en_blocks.len(),
+            ja_blocks.len()
+        )];
+    }
+    let mut found = Vec::new();
+    for ((en_line, en_cmds), (ja_line, ja_cmds)) in en_blocks.iter().zip(ja_blocks) {
+        if en_cmds == ja_cmds {
+            continue;
+        }
+        let before = found.len();
+        for command in en_cmds {
+            if !ja_cmds.contains(command) {
+                found.push(format!(
+                    "{en_name}:{en_line} has `{command}`, {ja_name}:{ja_line} does not"
+                ));
+            }
+        }
+        for command in ja_cmds {
+            if !en_cmds.contains(command) {
+                found.push(format!(
+                    "{ja_name}:{ja_line} has `{command}`, {en_name}:{en_line} does not"
+                ));
+            }
+        }
+        if found.len() == before {
+            found.push(format!(
+                "{en_name}:{en_line} and {ja_name}:{ja_line} name the same commands in a \
+                 different order or a different number of times"
+            ));
+        }
+    }
+    found
+}
+
 /// How many of each inline chain a page carries.
 fn chain_multiset(markdown: &str) -> BTreeMap<Vec<String>, usize> {
     let mut counted = BTreeMap::new();
@@ -119,33 +169,9 @@ fn a_page_and_its_japanese_twin_name_the_same_commands() {
             pairs_with_blocks.insert(en_name.clone());
         }
 
-        if en_blocks.len() != ja_blocks.len() {
-            offenders.push(format!(
-                "{en_name} has {} shell block(s), {ja_name} has {}",
-                en_blocks.len(),
-                ja_blocks.len()
-            ));
-        } else {
-            for ((en_line, en_cmds), (ja_line, ja_cmds)) in en_blocks.iter().zip(&ja_blocks) {
-                if en_cmds == ja_cmds {
-                    continue;
-                }
-                for command in en_cmds {
-                    if !ja_cmds.contains(command) {
-                        offenders.push(format!(
-                            "{en_name}:{en_line} has `{command}`, {ja_name}:{ja_line} does not"
-                        ));
-                    }
-                }
-                for command in ja_cmds {
-                    if !en_cmds.contains(command) {
-                        offenders.push(format!(
-                            "{ja_name}:{ja_line} has `{command}`, {en_name}:{en_line} does not"
-                        ));
-                    }
-                }
-            }
-        }
+        offenders.extend(block_differences(
+            &en_name, &en_blocks, &ja_name, &ja_blocks,
+        ));
 
         let en_chains = chain_multiset(&en);
         let ja_chains = chain_multiset(&ja);
@@ -226,6 +252,55 @@ fn a_translated_comment_is_not_a_drifted_command() {
     let en = command_lines("cargo test --test index_progress_cli   # first, single-threaded\n");
     let ja = command_lines("cargo test --test index_progress_cli   # 先に、シングルスレッドで\n");
     assert_eq!(en, ja, "{en:?} vs {ja:?}");
+}
+
+#[test]
+fn the_same_commands_in_a_different_order_are_a_difference() {
+    // Membership alone would call these equal. The comparison has already
+    // decided they are not, and the branch that decides what to say about it
+    // must not be able to say nothing.
+    let en = vec![(
+        10usize,
+        vec![
+            "cargo test --test index_progress_cli".to_string(),
+            "cargo test".to_string(),
+        ],
+    )];
+    let ja = vec![(
+        10usize,
+        vec![
+            "cargo test".to_string(),
+            "cargo test --test index_progress_cli".to_string(),
+        ],
+    )];
+    let found = block_differences("a.md", &en, "a.ja.md", &ja);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("different order"), "{found:?}");
+}
+
+#[test]
+fn a_command_repeated_on_one_side_only_is_a_difference() {
+    let en = vec![(1usize, vec!["cargo test".to_string()])];
+    let ja = vec![(
+        1usize,
+        vec!["cargo test".to_string(), "cargo test".to_string()],
+    )];
+    let found = block_differences("a.md", &en, "a.ja.md", &ja);
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn a_missing_command_is_named_rather_than_summarised() {
+    let en = vec![(1usize, vec!["cargo check --all-targets".to_string()])];
+    let ja = vec![(1usize, vec!["cargo check".to_string()])];
+    let found = block_differences("a.md", &en, "a.ja.md", &ja);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("cargo check --all-targets")),
+        "{found:?}"
+    );
 }
 
 #[test]
