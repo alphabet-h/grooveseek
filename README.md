@@ -66,6 +66,7 @@ Index a knowledge base, then point an MCP client at it:
 groove index --kb-path /path/to/knowledge-base
 ```
 
+<!-- groove-pin: mcp-stdio-snippet -->
 ```json
 {
   "mcpServers": {

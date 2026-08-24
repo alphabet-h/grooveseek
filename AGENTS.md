@@ -26,6 +26,7 @@ cargo test -- --ignored                                 # runs them (~130 MB / ~
 fails. No count is written down on purpose: the list is the list, and a number
 beside it is one more thing that can go stale.
 
+<!-- groove-pin: ci-command-block -->
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings

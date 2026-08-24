@@ -9,6 +9,7 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 
 プロジェクトルート (またはクライアント対応の MCP 設定場所) の `.mcp.json` に以下を追加:
 
+<!-- groove-pin: mcp-stdio-snippet -->
 ```json
 {
   "mcpServers": {
@@ -83,6 +84,7 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 ## PostToolUse hook による index 鮮度保守
 Claude Code セッション内部からナレッジベースを編集する (または Markdown を書く skill を実行する) 場合、MCP サーバは再構築されるまで古い結果を返し続ける。`.claude/settings.json` の `PostToolUse` hook で書込み後に自動再 index できる。最小形:
 
+<!-- groove-pin: posttooluse-hook-snippet -->
 ```json
 {
   "hooks": {
