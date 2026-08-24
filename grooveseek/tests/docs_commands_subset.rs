@@ -21,10 +21,12 @@
 //!
 //! Within one page: an inline `` `a && b` `` chain whose commands are a subset
 //! of some fenced shell block's commands on the same page. Commands are compared
-//! by identity -- program plus subcommand -- and not by their flags, because a
-//! copy that drifts drifts in its flags first, and `cargo fmt --all` against
-//! `cargo fmt --all -- --check` is exactly the difference that has to register
-//! as "the same command" for the copy to be visible at all.
+//! by identity -- the program and the word after it -- and not by their flags,
+//! because a copy that drifts drifts in its flags first, and `cargo fmt --all`
+//! against `cargo fmt --all -- --check` is exactly the difference that has to
+//! register as "the same command" for the copy to be visible at all. A program
+//! named by path is the same program: `/usr/local/bin/groove index` and
+//! `groove index` are one instruction written for two installations.
 //!
 //! # What this cannot catch
 //!
@@ -270,6 +272,58 @@ fn a_command_is_identified_by_its_program_and_subcommand_and_not_its_flags() {
     assert_eq!(head_of("{"), None);
     assert_eq!(head_of("\"command\": \"/path/to/groove\","), None);
     assert_eq!(head_of("- item"), None);
+}
+
+#[test]
+fn a_command_invoked_by_path_is_the_same_command() {
+    use common::docs::head_of;
+    // A path says where the program is installed, not which program it is.
+    for spelling in [
+        "groove index --kb-path ./kb",
+        "./groove index --kb-path ./kb",
+        "/usr/local/bin/groove index --kb-path ./kb",
+    ] {
+        assert_eq!(
+            head_of(spelling).as_deref(),
+            Some("groove index"),
+            "{spelling}"
+        );
+    }
+    // The argument after the program is not a second program.
+    assert_eq!(head_of("groove ./kb").as_deref(), Some("groove"));
+}
+
+#[test]
+fn sudo_options_name_a_user_and_not_a_program() {
+    use common::docs::head_of;
+    // `grooveseek/examples/deployments/intranet-http/README.md` runs this, and
+    // reading `groove` as the program would take the user to become for the
+    // thing being run.
+    assert_eq!(
+        head_of("sudo -u groove /usr/local/bin/groove index --kb-path /srv/groove/kb").as_deref(),
+        Some("groove index")
+    );
+    // The word after the program is a subcommand for `groove` and an argument
+    // for `cp`, and this does not tell them apart -- deliberately, since being
+    // wrong here splits one identity into two rather than merging two into one.
+    assert_eq!(
+        head_of("sudo cp groove.service /etc/systemd/system/").as_deref(),
+        Some("cp groove.service")
+    );
+}
+
+#[test]
+fn a_line_run_through_sudo_is_kept_as_written() {
+    // The deployment recipes were invisible to every one of these guards before
+    // paths were read: both translations dropped the same line, so they agreed
+    // by both holding nothing, and a change to one would not have been reported.
+    let kept =
+        command_lines("sudo -u groove /usr/local/bin/groove index --kb-path /srv/groove/kb\n");
+    assert_eq!(
+        kept,
+        vec!["sudo -u groove /usr/local/bin/groove index --kb-path /srv/groove/kb".to_string()],
+        "{kept:?}"
+    );
 }
 
 #[test]

@@ -340,10 +340,9 @@ fn heredoc_tag(line: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Whether a token can start a command: an identifier, not a brace, a flag or
-/// a quoted string.
-fn is_command_token(token: &str) -> bool {
-    let mut chars = token.chars();
+/// Whether a bare word is a name a program could have.
+fn is_program_name(word: &str) -> bool {
+    let mut chars = word.chars();
     let Some(first) = chars.next() else {
         return false;
     };
@@ -351,6 +350,61 @@ fn is_command_token(token: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+}
+
+/// The program a token names, if it names one.
+///
+/// A command is often invoked by path -- `./groove`, `/usr/local/bin/groove`,
+/// `.\groove.exe` -- and the deployment recipes here do exactly that. Reading
+/// only bare words dropped those lines entirely, which is worse than reading
+/// them wrong: both halves of a translated pair dropped the same line, so they
+/// agreed by both being invisible, and a change to one of them would not have
+/// been reported.
+///
+/// The identity is the last path component, because that is the program:
+/// `/usr/local/bin/groove index` and `groove index` are the same instruction
+/// written for different installations. A path is not evidence of a different
+/// command, so it should not read as one.
+fn command_token_name(token: &str) -> Option<&str> {
+    let name = token.rsplit(['/', '\\']).next()?;
+    if is_program_name(name) {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Whether a token can start a command.
+fn is_command_token(token: &str) -> bool {
+    command_token_name(token).is_some()
+}
+
+/// `sudo` options that take a value, so the value is not read as the program.
+///
+/// `sudo -u groove /usr/local/bin/groove index` is in this repository's
+/// deployment recipes, and `groove` there is the user to become, not the thing
+/// being run. Enumerated rather than guessed: a rule like "skip the token after
+/// any flag" would swallow the program itself after `sudo -n`.
+const SUDO_FLAGS_WITH_VALUES: &[&str] = &[
+    "-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-c", "-r", "-t",
+];
+
+/// Drop a leading `sudo` and the options that belong to it.
+fn without_sudo(tokens: &mut Vec<String>) {
+    if tokens.first().map(String::as_str) != Some("sudo") {
+        return;
+    }
+    tokens.remove(0);
+    while let Some(first) = tokens.first() {
+        if !first.starts_with('-') {
+            break;
+        }
+        let takes_value = SUDO_FLAGS_WITH_VALUES.contains(&first.as_str());
+        tokens.remove(0);
+        if takes_value && !tokens.is_empty() {
+            tokens.remove(0);
+        }
+    }
 }
 
 /// Strip a leading `VAR=value` environment prefix, however many there are.
@@ -366,13 +420,23 @@ fn without_env_prefix(tokens: &[&str]) -> Vec<String> {
     rest.iter().map(|t| (*t).to_string()).collect()
 }
 
-/// One command's identity: its program, plus its subcommand when it has one.
+/// One command's identity: its program, plus the bare word after it.
 ///
 /// Flags are deliberately dropped. `cargo fmt --all` and
 /// `cargo fmt --all -- --check` are the same command run differently, and a
 /// copy that names the same commands with different flags is the copy this
 /// guard exists to find -- comparing whole lines would rank that as a
 /// difference and miss it.
+///
+/// The word after the program is a subcommand for `cargo` and `groove` and an
+/// argument for `cp`, and nothing here tells them apart: `sudo cp
+/// groove.service /etc/systemd/system/` reads as `cp groove.service`. That is
+/// tolerated rather than fixed, because getting it wrong can only ever **split**
+/// one identity into two, never merge two into one -- and the direction that
+/// matters is the second. A merge would let an unrelated command satisfy a
+/// subset; a split at worst leaves a copy unreported, which is the failure this
+/// guard already accepts elsewhere. Telling them apart would need a list of
+/// which programs take subcommands, and a list is a thing that goes stale.
 pub fn head_of(fragment: &str) -> Option<String> {
     let text = without_comment(fragment.trim()).trim();
     if text.is_empty() {
@@ -380,16 +444,11 @@ pub fn head_of(fragment: &str) -> Option<String> {
     }
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let mut tokens = without_env_prefix(&tokens);
-    if tokens.first().map(String::as_str) == Some("sudo") {
-        tokens.remove(0);
-    }
-    let first = tokens.first()?;
-    if !is_command_token(first) {
-        return None;
-    }
-    let mut head = first.clone();
+    without_sudo(&mut tokens);
+    let mut head = command_token_name(tokens.first()?)?.to_string();
+    // A subcommand is a bare word. `groove ./kb` names one program, not two.
     if let Some(second) = tokens.get(1)
-        && is_command_token(second)
+        && is_program_name(second)
     {
         head.push(' ');
         head.push_str(second);
@@ -447,9 +506,14 @@ pub fn command_lines(body: &str) -> Vec<String> {
             .unwrap_or(&text)
             .to_string();
         let tokens: Vec<&str> = text.split_whitespace().collect();
-        let tokens = without_env_prefix(&tokens);
-        match tokens.first() {
-            Some(first) if is_command_token(first) => out.push(tokens.join(" ")),
+        let kept = without_env_prefix(&tokens);
+        // Whether this is a command is decided on the program, after `sudo` and
+        // its options; what is kept is the line as written, so a changed path or
+        // a changed user still reads as a difference between two translations.
+        let mut probe = kept.clone();
+        without_sudo(&mut probe);
+        match probe.first() {
+            Some(first) if is_command_token(first) => out.push(kept.join(" ")),
             _ => {}
         }
     }
