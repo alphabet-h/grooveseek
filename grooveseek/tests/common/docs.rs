@@ -390,7 +390,7 @@ const SUDO_FLAGS_WITH_VALUES: &[&str] = &[
 ];
 
 /// Drop a leading `sudo` and the options that belong to it.
-fn without_sudo(tokens: &mut Vec<String>) {
+fn strip_sudo(tokens: &mut Vec<String>) {
     if tokens.first().map(String::as_str) != Some("sudo") {
         return;
     }
@@ -407,17 +407,40 @@ fn without_sudo(tokens: &mut Vec<String>) {
     }
 }
 
-/// Strip a leading `VAR=value` environment prefix, however many there are.
-fn without_env_prefix(tokens: &[&str]) -> Vec<String> {
-    let mut rest = tokens;
-    while let Some(first) = rest.first() {
+/// Drop a leading `VAR=value` environment prefix, however many there are.
+fn strip_env_prefix(tokens: &mut Vec<String>) {
+    while let Some(first) = tokens.first() {
         if first.contains('=') && !first.starts_with('-') {
-            rest = &rest[1..];
+            tokens.remove(0);
         } else {
             break;
         }
     }
-    rest.iter().map(|t| (*t).to_string()).collect()
+}
+
+/// Step past everything that wraps a command without being one, until what is
+/// left starts with the program.
+///
+/// Both orders occur. `RUST_LOG=debug groove serve` sets the environment and
+/// then runs; `sudo -u groove RUST_LOG=debug groove serve` runs sudo, which
+/// takes its own options and *then* accepts assignments -- the usage line puts
+/// `[VAR=value]` after the options. Stripping each once in a fixed order leaves
+/// the probe pointing at whichever wrapper came second, and a line whose program
+/// is never found is a line dropped in silence.
+///
+/// One function because both callers ask the same question. [`head_of`] needs
+/// the program to name the command and [`command_lines`] needs it to decide
+/// whether the line is a command at all; two copies of this sequence would
+/// answer differently the first time either grew a case.
+fn strip_wrappers(tokens: &mut Vec<String>) {
+    loop {
+        let before = tokens.len();
+        strip_env_prefix(tokens);
+        strip_sudo(tokens);
+        if tokens.len() == before {
+            return;
+        }
+    }
 }
 
 /// One command's identity: its program, plus the bare word after it.
@@ -442,9 +465,8 @@ pub fn head_of(fragment: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    let mut tokens = without_env_prefix(&tokens);
-    without_sudo(&mut tokens);
+    let mut tokens: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    strip_wrappers(&mut tokens);
     let mut head = command_token_name(tokens.first()?)?.to_string();
     // A subcommand is a bare word. `groove ./kb` names one program, not two.
     if let Some(second) = tokens.get(1)
@@ -505,17 +527,17 @@ pub fn command_lines(body: &str) -> Vec<String> {
             .or_else(|| text.strip_prefix("> "))
             .unwrap_or(&text)
             .to_string();
-        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let tokens: Vec<String> = text.split_whitespace().map(str::to_string).collect();
         // Two different questions, and they must not share an answer. *Whether*
-        // this line is a command is decided on the program, which is found by
-        // stepping past an environment prefix and `sudo` with its options.
-        // *What is kept* is the line as written, because everything stepped over
-        // is still part of the instruction: `RUST_LOG=grooveseek=debug groove
-        // serve` and `RUST_LOG=trace groove serve` tell a reader to do different
-        // things, and `docs/usage.md` sets RUST_LOG on three lines whose
-        // Japanese twin would otherwise be free to disagree about it.
-        let mut probe = without_env_prefix(&tokens);
-        without_sudo(&mut probe);
+        // this line is a command is decided on the program, which
+        // [`strip_wrappers`] finds. *What is kept* is the line as written,
+        // because everything stepped over is still part of the instruction:
+        // `RUST_LOG=grooveseek=debug groove serve` and `RUST_LOG=trace groove
+        // serve` tell a reader to do different things, and `docs/usage.md` sets
+        // RUST_LOG on three lines whose Japanese twin would otherwise be free to
+        // disagree about it.
+        let mut probe = tokens.clone();
+        strip_wrappers(&mut probe);
         match probe.first() {
             Some(first) if is_command_token(first) => out.push(tokens.join(" ")),
             _ => {}

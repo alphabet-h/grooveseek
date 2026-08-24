@@ -299,6 +299,18 @@ fn sudo_options_name_a_user_and_not_a_program() {
     // `grooveseek/examples/deployments/intranet-http/README.md` runs this, and
     // reading `groove` as the program would take the user to become for the
     // thing being run.
+    // sudo takes its own options and then accepts assignments, so the two kinds
+    // of wrapper interleave. Stripping each once in a fixed order leaves the
+    // probe pointing at whichever came second, and the line is dropped without
+    // anything being said about it.
+    assert_eq!(
+        head_of("sudo -u groove RUST_LOG=debug /usr/local/bin/groove serve").as_deref(),
+        Some("groove serve")
+    );
+    assert_eq!(
+        head_of("RUST_LOG=debug sudo -u groove groove index").as_deref(),
+        Some("groove index")
+    );
     assert_eq!(
         head_of("sudo -u groove /usr/local/bin/groove index --kb-path /srv/groove/kb").as_deref(),
         Some("groove index")
