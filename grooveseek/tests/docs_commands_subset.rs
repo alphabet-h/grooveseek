@@ -378,6 +378,28 @@ fn an_assignment_that_runs_a_command_keeps_the_command() {
 }
 
 #[test]
+fn setting_a_variable_is_an_instruction_even_with_no_program_in_it() {
+    // `.claude/skills/codex-review/SKILL.md` opens a block with `S=<scratchpad>`
+    // and then uses `$S`. The value is a step the reader performs and a thing a
+    // translation can get wrong, and it was being dropped: the block still had
+    // other lines, so no guard noticed it had stopped being compared.
+    let lines = command_lines("S=<scratchpad>\nbash script.sh $S/out\n");
+    assert_eq!(
+        lines,
+        vec![
+            "S=<scratchpad>".to_string(),
+            "bash script.sh $S/out".to_string()
+        ],
+        "{lines:?}"
+    );
+    // A shell array assignment is the same shape and was dropped the same way.
+    let array = command_lines("cargo test\nFILES=(a b)\n");
+    assert_eq!(array.len(), 2, "{array:?}");
+    // And a chain of nothing but assignments is still two instructions.
+    assert_eq!(inline_chains("`FOO=1 && BAR=2`").len(), 1);
+}
+
+#[test]
 fn a_span_the_reader_only_half_understands_is_reported_rather_than_dropped() {
     use common::docs::half_read_chains;
     // `&&` is shell and nothing else, so failing on half of one is worth saying.

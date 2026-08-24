@@ -647,14 +647,35 @@ pub fn command_lines(body: &str) -> Vec<String> {
         // serve` tell a reader to do different things, and `docs/usage.md` sets
         // RUST_LOG on three lines whose Japanese twin would otherwise be free to
         // disagree about it.
-        let mut probe = tokens.clone();
-        strip_wrappers(&mut probe);
-        match probe.first() {
-            Some(first) if is_command_token(first) => out.push(tokens.join(" ")),
-            _ => {}
+        let joined = tokens.join(" ");
+        if is_instruction(&joined) {
+            out.push(joined);
         }
     }
     out
+}
+
+/// Whether a fragment tells the reader to do something.
+///
+/// Wider than [`head_of`], which answers "which program is this". A line can be
+/// an instruction and name no program: `S=<scratchpad>` in the codex-review
+/// skill, `FILES=(a b)`, `FOO=1 && BAR=2`. Setting a variable is a step a reader
+/// performs and a value a translation can get wrong, so it has to survive into
+/// what gets compared -- and before this it did not, which put a whole class of
+/// line back in the silence these guards exist to end.
+///
+/// Assignments have no program, so they contribute nothing to [`heads_of`] and
+/// cannot make one block look like a subset of another. They matter to the twin
+/// comparison, which reads whole lines.
+pub fn is_instruction(fragment: &str) -> bool {
+    if head_of(fragment).is_some() {
+        return true;
+    }
+    let text = without_comment(fragment.trim()).trim();
+    text.split_whitespace()
+        .next()
+        .and_then(assignment_value)
+        .is_some()
 }
 
 /// The set of command identities a group of command lines names.
@@ -773,7 +794,22 @@ fn read_chains(markdown: &str) -> (Vec<InlineChain>, Vec<InlineChain>) {
         }
         let shell_only =
             find_unquoted(&code, "&&").is_some() || find_unquoted(&code, "||").is_some();
-        let read = commands.iter().filter(|c| head_of(c).is_some()).count();
+        // What counts as read depends on how much the separator already told us.
+        // `&&` is shell, so a part that merely sets a variable is an instruction
+        // like any other. `;` is not, so a span held together only by it has to
+        // name a **program** in every part before it is a chain at all --
+        // otherwise `text/plain; charset=utf-8` qualifies, `charset=utf-8` being
+        // shaped exactly like an assignment and `text/plain` reading as a path.
+        let read = commands
+            .iter()
+            .filter(|c| {
+                if shell_only {
+                    is_instruction(c)
+                } else {
+                    head_of(c).is_some()
+                }
+            })
+            .count();
         let chain = InlineChain {
             line: line_of(markdown, range.start),
             text: code.split_whitespace().collect::<Vec<_>>().join(" "),
