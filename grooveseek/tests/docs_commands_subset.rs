@@ -228,12 +228,7 @@ fn the_copy_this_guard_was_built_for_is_caught_where_it_stood() {
     let found = shortened_copies(STEP_3_BEFORE);
     assert_eq!(found.len(), 1, "{found:?}");
     let only = &found[0];
-    for named in [
-        "cargo fmt",
-        "cargo clippy",
-        "cargo test",
-        "cargo doc",
-    ] {
+    for named in ["cargo fmt", "cargo clippy", "cargo test", "cargo doc"] {
         assert!(only.contains(named), "{only}");
     }
     // The block names one command the copy does not, which is the whole point.
@@ -311,7 +306,8 @@ fn a_heredoc_body_is_not_read_as_commands() {
 
 #[test]
 fn a_trailing_comment_goes_but_a_hash_inside_an_argument_stays() {
-    let lines = command_lines("cargo test   # first, and single-threaded\ngroove search \"issue #12\"\n");
+    let lines =
+        command_lines("cargo test   # first, and single-threaded\ngroove search \"issue #12\"\n");
     assert_eq!(
         lines,
         vec![
@@ -324,7 +320,8 @@ fn a_trailing_comment_goes_but_a_hash_inside_an_argument_stays() {
 
 #[test]
 fn a_continued_line_is_one_command() {
-    let lines = command_lines("groove search \"tokio spawn\" \\\n  --kb-path ./kb \\\n  --limit 3\n");
+    let lines =
+        command_lines("groove search \"tokio spawn\" \\\n  --kb-path ./kb \\\n  --limit 3\n");
     assert_eq!(
         lines,
         vec!["groove search \"tokio spawn\" --kb-path ./kb --limit 3".to_string()],

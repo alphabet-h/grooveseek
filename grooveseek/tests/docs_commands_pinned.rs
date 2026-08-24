@@ -335,7 +335,8 @@ fn a_marker_written_into_a_sentence_resolves_to_nothing() {
 
 #[test]
 fn two_markers_on_one_block_leave_the_first_one_pointing_at_nothing() {
-    let sites = pin_sites("<!-- groove-pin: a -->\n<!-- groove-pin: b -->\n```bash\ncargo test\n```\n");
+    let sites =
+        pin_sites("<!-- groove-pin: a -->\n<!-- groove-pin: b -->\n```bash\ncargo test\n```\n");
     assert_eq!(sites.len(), 2);
     let a = sites.iter().find(|s| s.id == "a").expect("a");
     let b = sites.iter().find(|s| s.id == "b").expect("b");
@@ -370,7 +371,10 @@ fn an_indented_block_is_not_the_block_a_pin_can_name() {
 
 #[test]
 fn json_members_are_compared_as_values_and_not_as_characters() {
-    let one_line = normalise(Shape::Json, "{ \"type\": \"command\", \"command\": \"groove index\" }");
+    let one_line = normalise(
+        Shape::Json,
+        "{ \"type\": \"command\", \"command\": \"groove index\" }",
+    );
     let spread = normalise(
         Shape::Json,
         "{\n  \"command\": \"groove index\",\n  \"type\": \"command\"\n}",

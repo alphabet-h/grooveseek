@@ -323,10 +323,10 @@ fn heredoc_tag(line: &str) -> Option<String> {
     if end == 0 {
         return None;
     }
-    if let Some(q) = quote {
-        if !rest[end..].starts_with(q) {
-            return None;
-        }
+    if let Some(q) = quote
+        && !rest[end..].starts_with(q)
+    {
+        return None;
     }
     Some(rest[..end].to_string())
 }
@@ -379,11 +379,11 @@ pub fn head_of(fragment: &str) -> Option<String> {
         return None;
     }
     let mut head = first.clone();
-    if let Some(second) = tokens.get(1) {
-        if is_command_token(second) {
-            head.push(' ');
-            head.push_str(second);
-        }
+    if let Some(second) = tokens.get(1)
+        && is_command_token(second)
+    {
+        head.push(' ');
+        head.push_str(second);
     }
     Some(head)
 }
@@ -560,10 +560,9 @@ fn marker_id(html: &str) -> Option<String> {
 /// pin that reached one would hand an untagged body to a reader expecting a
 /// tagged one.
 pub fn pin_sites(markdown: &str) -> Vec<PinSite> {
-    let events: Vec<(Event, std::ops::Range<usize>)> =
-        Parser::new_ext(markdown, github_flavour())
-            .into_offset_iter()
-            .collect();
+    let events: Vec<(Event, std::ops::Range<usize>)> = Parser::new_ext(markdown, github_flavour())
+        .into_offset_iter()
+        .collect();
 
     let mut sites = Vec::new();
     let mut pending: Option<(String, usize)> = None;
