@@ -21,7 +21,8 @@
 
 #![allow(dead_code)] // each guard uses a different part of this module
 
-use pulldown_cmark::Options;
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The extensions GitHub renders these pages with, and only those.
@@ -127,4 +128,491 @@ pub fn markdown_files(root: &Path) -> Vec<PathBuf> {
         .collect();
     found.sort();
     found
+}
+
+/// The suffix that puts a page in the Japanese half of a bilingual pair.
+pub const JAPANESE_SUFFIX: &str = ".ja.md";
+
+/// The English page a Japanese one translates, or `None` when this is not a
+/// Japanese page.
+///
+/// `Path::extension` answers `"md"` for both halves, because it reads from the
+/// last dot. The file name's suffix is the only thing that separates them, and
+/// this is the only place in these guards that reads it.
+pub fn english_counterpart(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(JAPANESE_SUFFIX)?;
+    Some(path.with_file_name(format!("{stem}.md")))
+}
+
+/// Fence info strings under which this project writes commands.
+///
+/// A tag rather than a guess at the contents: an untagged fence in this corpus
+/// is a transcript of output, and reading those as commands makes the answer
+/// depend on whether a word in the output happens to look like a program name.
+pub const SHELL_TAGS: &[&str] = &[
+    "bash",
+    "sh",
+    "shell",
+    "console",
+    "zsh",
+    "powershell",
+    "pwsh",
+    "bat",
+    "cmd",
+];
+
+/// Whether a fence's info string names one of [`SHELL_TAGS`].
+pub fn is_shell_tag(info: &str) -> bool {
+    let first = info.split_whitespace().next().unwrap_or_default();
+    SHELL_TAGS.contains(&first.to_ascii_lowercase().as_str())
+}
+
+/// One fenced code block, located well enough to name in a failure.
+#[derive(Clone, Debug)]
+pub struct FencedBlock {
+    /// 1-based line of the opening fence.
+    pub line: usize,
+    /// The info string's first word, lowercased. Empty when the fence has none.
+    pub tag: String,
+    /// The text between the fences, verbatim.
+    pub body: String,
+}
+
+/// One inline `` `code` `` span that chains commands with `&&` or `||`.
+#[derive(Clone, Debug)]
+pub struct InlineChain {
+    /// 1-based line the span starts on.
+    pub line: usize,
+    /// The chain's parts, normalised the way [`command_lines`] normalises a
+    /// block's lines.
+    pub commands: Vec<String>,
+}
+
+/// A `<!-- groove-pin: id -->` marker and the block it names, if it names one.
+#[derive(Clone, Debug)]
+pub struct PinSite {
+    pub id: String,
+    /// 1-based line of the marker.
+    pub line: usize,
+    /// The fenced block immediately after the marker. `None` when the next
+    /// thing in the document is anything else -- see [`pin_sites`].
+    pub block: Option<FencedBlock>,
+}
+
+/// The 1-based line an offset falls on.
+fn line_of(markdown: &str, offset: usize) -> usize {
+    markdown[..offset].matches('\n').count() + 1
+}
+
+/// Every fenced code block in the document, in source order.
+///
+/// Fenced only. An indented block carries no info string, so it cannot say
+/// whether it holds commands, and these guards say outright that they do not
+/// read them.
+pub fn fenced_blocks(markdown: &str) -> Vec<FencedBlock> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(usize, String, String)> = None;
+    for (event, range) in Parser::new_ext(markdown, github_flavour()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+                let tag = info
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                open = Some((line_of(markdown, range.start), tag, String::new()));
+            }
+            Event::Text(text) => {
+                if let Some((_, _, body)) = open.as_mut() {
+                    body.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((line, tag, body)) = open.take() {
+                    blocks.push(FencedBlock { line, tag, body });
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// The fenced blocks whose tag is one of [`SHELL_TAGS`].
+pub fn shell_blocks(markdown: &str) -> Vec<FencedBlock> {
+    fenced_blocks(markdown)
+        .into_iter()
+        .filter(|b| is_shell_tag(&b.tag))
+        .collect()
+}
+
+/// The first occurrence of `needle` that is not inside single or double quotes.
+///
+/// The scan is over bytes and the comparison is between bytes, because these
+/// pages are bilingual: slicing the `str` at a byte offset to compare there
+/// panics the moment the offset lands inside a Japanese character. Every needle
+/// and every quote here is ASCII, and an ASCII byte never occurs inside a
+/// multi-byte UTF-8 sequence, so a byte match is always at a character boundary
+/// and the offset returned is safe to slice at.
+fn find_unquoted(line: &str, needle: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let needle = needle.as_bytes();
+    let mut quote: Option<u8> = None;
+    for i in 0..bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[i] == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote = Some(bytes[i]);
+                } else if bytes[i..].starts_with(needle) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The line with any trailing `# comment` removed.
+///
+/// A `#` only starts a comment at the start of a word and outside quotes, so
+/// `groove search "a #b"` keeps its argument. Backslash escapes inside quotes
+/// are not handled; no line in this corpus needs them.
+fn without_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    for i in 0..bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[i] == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    quote = Some(bytes[i]);
+                } else if bytes[i] == b'#'
+                    && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t')
+                {
+                    return &line[..i];
+                }
+            }
+        }
+    }
+    line
+}
+
+/// The delimiter a heredoc on this line opens, if it opens one.
+fn heredoc_tag(line: &str) -> Option<String> {
+    let at = find_unquoted(line, "<<")?;
+    let rest = &line[at + 2..];
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let rest = rest.trim_start();
+    let (quote, rest) = match rest.chars().next() {
+        Some(c @ ('\'' | '"')) => (Some(c), &rest[c.len_utf8()..]),
+        _ => (None, rest),
+    };
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    if let Some(q) = quote {
+        if !rest[end..].starts_with(q) {
+            return None;
+        }
+    }
+    Some(rest[..end].to_string())
+}
+
+/// Whether a token can start a command: an identifier, not a brace, a flag or
+/// a quoted string.
+fn is_command_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
+}
+
+/// Strip a leading `VAR=value` environment prefix, however many there are.
+fn without_env_prefix(tokens: &[&str]) -> Vec<String> {
+    let mut rest = tokens;
+    while let Some(first) = rest.first() {
+        if first.contains('=') && !first.starts_with('-') {
+            rest = &rest[1..];
+        } else {
+            break;
+        }
+    }
+    rest.iter().map(|t| (*t).to_string()).collect()
+}
+
+/// One command's identity: its program, plus its subcommand when it has one.
+///
+/// Flags are deliberately dropped. `cargo fmt --all` and
+/// `cargo fmt --all -- --check` are the same command run differently, and a
+/// copy that names the same commands with different flags is the copy this
+/// guard exists to find -- comparing whole lines would rank that as a
+/// difference and miss it.
+pub fn head_of(fragment: &str) -> Option<String> {
+    let text = without_comment(fragment.trim()).trim();
+    if text.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let mut tokens = without_env_prefix(&tokens);
+    if tokens.first().map(String::as_str) == Some("sudo") {
+        tokens.remove(0);
+    }
+    let first = tokens.first()?;
+    if !is_command_token(first) {
+        return None;
+    }
+    let mut head = first.clone();
+    if let Some(second) = tokens.get(1) {
+        if is_command_token(second) {
+            head.push(' ');
+            head.push_str(second);
+        }
+    }
+    Some(head)
+}
+
+/// The command lines of a block body, normalised.
+///
+/// Heredoc bodies are dropped: they are data, and reading them as commands both
+/// invents head names out of the payload and makes a translated payload look
+/// like a drifted command. Continuations are joined, comments removed,
+/// whitespace squeezed, and anything whose first word cannot start a command --
+/// JSON braces, prose, transcript output -- is left out.
+pub fn command_lines(body: &str) -> Vec<String> {
+    let mut joined: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for raw in body.lines() {
+        let line = raw.trim_end();
+        let line = if pending.is_empty() {
+            line.to_string()
+        } else {
+            format!("{} {}", pending.trim_end(), line.trim_start())
+        };
+        pending.clear();
+        if let Some(stripped) = line.strip_suffix('\\') {
+            pending = stripped.to_string();
+            continue;
+        }
+        joined.push(line);
+    }
+    if !pending.is_empty() {
+        joined.push(pending);
+    }
+
+    let mut out = Vec::new();
+    let mut skip_until: Option<String> = None;
+    for line in joined {
+        if let Some(tag) = skip_until.as_deref() {
+            if line.trim() == tag {
+                skip_until = None;
+            }
+            continue;
+        }
+        if let Some(tag) = heredoc_tag(&line) {
+            skip_until = Some(tag);
+        }
+        let text = without_comment(&line).trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let text = text
+            .strip_prefix("$ ")
+            .or_else(|| text.strip_prefix("> "))
+            .unwrap_or(&text)
+            .to_string();
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let tokens = without_env_prefix(&tokens);
+        match tokens.first() {
+            Some(first) if is_command_token(first) => out.push(tokens.join(" ")),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The set of command identities a group of command lines names.
+pub fn heads_of(lines: &[String]) -> BTreeSet<String> {
+    let mut heads = BTreeSet::new();
+    for line in lines {
+        for part in split_chain(line) {
+            if let Some(head) = head_of(&part) {
+                heads.insert(head);
+            }
+        }
+    }
+    heads
+}
+
+/// Split on `&&` and `||`, and on nothing else.
+///
+/// A pipeline is one command's output feeding another's input, not two things
+/// a reader is told to run, so `groove search ... | jq ...` stays one entry --
+/// splitting it would make every block that pipes look like a superset of every
+/// block that does not. `;` is left alone for the same reason and because it
+/// appears inside PowerShell and JSON arguments.
+pub fn split_chain(line: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = line;
+    loop {
+        let and = find_unquoted(rest, "&&");
+        let or = find_unquoted(rest, "||");
+        let at = match (and, or) {
+            (Some(a), Some(o)) => Some(a.min(o)),
+            (Some(a), None) => Some(a),
+            (None, Some(o)) => Some(o),
+            (None, None) => None,
+        };
+        match at {
+            Some(i) => {
+                parts.push(rest[..i].trim().to_string());
+                rest = &rest[i + 2..];
+            }
+            None => {
+                parts.push(rest.trim().to_string());
+                break;
+            }
+        }
+    }
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// Every inline code span that chains at least two distinct commands.
+///
+/// The floor of two is what keeps `` `groove service install` `` -- prose
+/// naming a command, which this repository does dozens of times -- out of the
+/// corpus. It is also why the floor is not three: `docs/usage.md`'s two
+/// service-removal chains are the only chains that survive fixing the copy this
+/// guard was built for, and without them the guard would have nothing left to
+/// compare and would pass by having nothing to say.
+pub fn inline_chains(markdown: &str) -> Vec<InlineChain> {
+    let mut found = Vec::new();
+    for (event, range) in Parser::new_ext(markdown, github_flavour()).into_offset_iter() {
+        let Event::Code(code) = event else {
+            continue;
+        };
+        if find_unquoted(&code, "&&").is_none() && find_unquoted(&code, "||").is_none() {
+            continue;
+        }
+        let commands: Vec<String> = split_chain(&code)
+            .into_iter()
+            .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|p| !p.is_empty())
+            .collect();
+        let distinct: BTreeSet<String> = commands.iter().filter_map(|c| head_of(c)).collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        found.push(InlineChain {
+            line: line_of(markdown, range.start),
+            commands,
+        });
+    }
+    found
+}
+
+/// The text that opens a pin marker.
+pub const PIN_MARKER_OPEN: &str = "<!-- groove-pin:";
+
+/// The id in a pin marker, if the text is one.
+fn marker_id(html: &str) -> Option<String> {
+    let at = html.find(PIN_MARKER_OPEN)?;
+    let rest = &html[at + PIN_MARKER_OPEN.len()..];
+    let end = rest.find("-->")?;
+    let id = rest[..end].trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// Every pin marker in the document, with the block it resolves to.
+///
+/// The rule is adjacency, measured against pulldown-cmark rather than reasoned
+/// about: a block-level `<!-- ... -->` arrives as `Start(HtmlBlock)`, `Html`,
+/// `End(HtmlBlock)`, so what has to be a fenced code block is **the event after
+/// `End(HtmlBlock)`**. Searching forward for the next code block instead would
+/// step over an intervening paragraph and bind the pin to a block further down,
+/// silently -- the same shape as keying a pin on its contents, which the guard
+/// refuses for the same reason.
+///
+/// A marker written inside a paragraph becomes `InlineHtml` and never opens an
+/// HTML block, so it resolves to nothing and is reported. So does a marker whose
+/// next event is an indented code block: this module does not read those, and a
+/// pin that reached one would hand an untagged body to a reader expecting a
+/// tagged one.
+pub fn pin_sites(markdown: &str) -> Vec<PinSite> {
+    let events: Vec<(Event, std::ops::Range<usize>)> =
+        Parser::new_ext(markdown, github_flavour())
+            .into_offset_iter()
+            .collect();
+
+    let mut sites = Vec::new();
+    let mut pending: Option<(String, usize)> = None;
+    for (index, (event, range)) in events.iter().enumerate() {
+        match event {
+            Event::Html(html) | Event::InlineHtml(html) => {
+                if let Some(id) = marker_id(html) {
+                    let line = line_of(markdown, range.start);
+                    if matches!(event, Event::InlineHtml(_)) {
+                        // Never opens an HTML block, so it can never be adjacent
+                        // to one. Reported rather than silently ignored.
+                        sites.push(PinSite {
+                            id,
+                            line,
+                            block: None,
+                        });
+                    } else {
+                        pending = Some((id, line));
+                    }
+                }
+            }
+            Event::End(TagEnd::HtmlBlock) => {
+                let Some((id, line)) = pending.take() else {
+                    continue;
+                };
+                let block = match events.get(index + 1) {
+                    Some((Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))), next)) => {
+                        let tag = info
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        let body = fenced_blocks(markdown)
+                            .into_iter()
+                            .find(|b| b.line == line_of(markdown, next.start))
+                            .map(|b| b.body)
+                            .unwrap_or_default();
+                        Some(FencedBlock {
+                            line: line_of(markdown, next.start),
+                            tag,
+                            body,
+                        })
+                    }
+                    _ => None,
+                };
+                sites.push(PinSite { id, line, block });
+            }
+            _ => {}
+        }
+    }
+    sites
 }
