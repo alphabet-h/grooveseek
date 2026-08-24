@@ -39,7 +39,7 @@
 mod common;
 
 use common::docs::{command_lines, markdown_files, pin_sites, repo_root};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// How a group's members are compared.
@@ -61,6 +61,15 @@ struct Pin {
     id: &'static str,
     why: &'static str,
     shape: Shape,
+    /// The pages this group is known to have, by path from the repository root.
+    ///
+    /// Listed rather than counted, and required rather than exhaustive. A
+    /// marker deleted from one member of a four-member group leaves three that
+    /// still agree, so a check that only asks "two or more, and equal" reports
+    /// success for a copy it has stopped watching. Extra members are welcome:
+    /// a snippet copied along with its marker joins its own group and is
+    /// compared from then on.
+    members: &'static [&'static str],
     /// Members outside the Markdown corpus, by path from the repository root.
     /// The walk only collects `.md`, so these are read directly.
     beyond_markdown: &'static [&'static str],
@@ -73,6 +82,7 @@ const PINS: &[Pin] = &[
               contributor reads; a list of commands you are meant to run is \
               worth nothing behind a link to the other audience's document",
         shape: Shape::ShellCommands,
+        members: &["AGENTS.md", "CONTRIBUTING.md"],
         beyond_markdown: &[],
     },
     Pin {
@@ -80,6 +90,12 @@ const PINS: &[Pin] = &[
         why: "README.md has to get a reader running without leaving the page, \
               and docs/clients.md is where the same snippet is explained",
         shape: Shape::Json,
+        members: &[
+            "README.md",
+            "README.ja.md",
+            "docs/clients.md",
+            "docs/clients.ja.md",
+        ],
         beyond_markdown: &[],
     },
     Pin {
@@ -88,6 +104,12 @@ const PINS: &[Pin] = &[
               that links elsewhere for its own contents has stopped being a \
               recipe; settings.snippet.json is the file those recipes point at",
         shape: Shape::Json,
+        members: &[
+            "docs/clients.md",
+            "docs/clients.ja.md",
+            "grooveseek/examples/hooks/README.md",
+            "grooveseek/examples/hooks/README.ja.md",
+        ],
         beyond_markdown: &["grooveseek/examples/hooks/settings.snippet.json"],
     },
 ];
@@ -122,6 +144,7 @@ fn every_copy_that_cannot_be_deleted_is_pinned_to_the_others() {
     let files = markdown_files(&root);
 
     let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut pages_by_id: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut unresolved: Vec<String> = Vec::new();
 
     for file in &files {
@@ -130,10 +153,16 @@ fn every_copy_that_cannot_be_deleted_is_pinned_to_the_others() {
         for site in pin_sites(&markdown) {
             let where_ = format!("{name}:{}", site.line);
             match site.block {
-                Some(block) => groups
-                    .entry(site.id)
-                    .or_default()
-                    .push((where_, block.body)),
+                Some(block) => {
+                    pages_by_id
+                        .entry(site.id.clone())
+                        .or_default()
+                        .insert(name.clone());
+                    groups
+                        .entry(site.id)
+                        .or_default()
+                        .push((where_, block.body));
+                }
                 None => unresolved.push(format!("{where_}  {}", site.id)),
             }
         }
@@ -221,6 +250,24 @@ fn every_copy_that_cannot_be_deleted_is_pinned_to_the_others() {
     // A walk that finds nothing passes, so every registered pin has to have
     // been seen. A typo in an id would otherwise leave its group silently
     // unchecked while the marker sat in the page looking like protection.
+    // A member that lost its marker leaves the rest of its group agreeing with
+    // each other, so "two or more, and equal" would report success for a copy
+    // that had stopped being watched.
+    for pin in PINS {
+        let seen = pages_by_id.get(pin.id).cloned().unwrap_or_default();
+        for member in pin.members {
+            if !seen.contains(*member) {
+                offenders.push(format!(
+                    "pin `{}` names {member}, and no marker for it was found \
+                     there. If the copy is gone, take the page out of PINS in \
+                     the same commit; if it is still there, it is no longer \
+                     being compared. Registered because: {}",
+                    pin.id, pin.why
+                ));
+            }
+        }
+    }
+
     for pin in PINS {
         assert!(
             groups.contains_key(pin.id),
