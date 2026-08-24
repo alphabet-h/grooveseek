@@ -12,7 +12,7 @@
 //!
 //! # What is walked
 //!
-//! The corpus `common::docs::markdown_files` collects: every `.md` file in the
+//! The corpus [`common::docs::markdown_files`] collects: every `.md` file in the
 //! repository except build output, the search fixtures, unpublished
 //! dot-directories and `*.local.md`. The link guard walks the same set through
 //! the same function.
@@ -193,9 +193,17 @@ fn no_page_tells_you_to_run_a_shortened_copy_of_its_own_command_block() {
 // Copied out of `git show` by hand, and the expectations below are written by
 // hand too. Deriving either from the extractor would make these tests agree
 // with whatever it does rather than with what the pages said.
+//
+// They are excerpts, not transcripts. **Every command line and every fence is
+// verbatim**, because those are what the predicate reads; the prose between
+// them is shortened, since a paragraph explaining why CI needs two clippy legs
+// changes nothing about which commands the page names. Saying "copied by hand"
+// without saying that would be the kind of claim this whole pull request exists
+// to catch.
 // ---------------------------------------------------------------------------
 
-/// `git show 5e6b645^:CONTRIBUTING.md`, the two regions that matter.
+/// `git show 5e6b645^:CONTRIBUTING.md`: the CI block and the step that copied
+/// it, with the prose between them shortened.
 const STEP_3_BEFORE: &str = r#"
 To reproduce what CI runs, all of these have to pass:
 
@@ -217,8 +225,8 @@ cargo doc --no-deps --workspace --all-features --document-private-items
 4. Open a PR describing the problem and the change; link any related issues
 "#;
 
-/// `git show 5e6b645:CONTRIBUTING.md`, the same two regions after the copy was
-/// deleted and replaced with a reference.
+/// `git show 5e6b645:CONTRIBUTING.md`: the same two regions after the copy was
+/// deleted and replaced with a reference, shortened the same way.
 const STEP_3_AFTER: &str = r#"
 To reproduce what CI runs, all of these have to pass:
 
@@ -341,6 +349,58 @@ fn sudo_options_name_a_user_and_not_a_program() {
 }
 
 #[test]
+fn an_assignment_that_runs_a_command_keeps_the_command() {
+    use common::docs::head_of;
+    // `.claude/commands/full-audit.md` writes this. Splitting on whitespace
+    // makes `NEXT_ID=$(jq` one token, and dropping it as an environment prefix
+    // took `jq` with it -- leaving fragments that name no program, so the line
+    // fell out of the corpus without a word.
+    assert_eq!(
+        head_of("NEXT_ID=$(jq '.features | map(.id) | max + 1' .dev/features.json)").as_deref(),
+        Some("jq")
+    );
+    assert_eq!(
+        head_of("OUT=\"$(groove status --kb-path ./kb)\"").as_deref(),
+        Some("groove status")
+    );
+    // An assignment that runs nothing is still just an assignment.
+    assert_eq!(
+        head_of("RUST_LOG=debug groove serve").as_deref(),
+        Some("groove serve")
+    );
+}
+
+#[test]
+fn a_subshell_bracket_is_not_the_program() {
+    use common::docs::head_of;
+    assert_eq!(
+        head_of(
+            "(gh run list --json event | ConvertFrom-Json) | Where-Object { $_.event -eq 'push' }"
+        )
+        .as_deref(),
+        Some("gh run")
+    );
+}
+
+#[test]
+fn a_heredoc_body_cannot_swallow_its_own_terminator() {
+    // The continuation join used to run over every raw line before the heredoc
+    // was noticed, so a payload line ending in a backslash absorbed the line
+    // after it. When that line was the terminator, the skip never ended and
+    // every command below it vanished from a block that still looked read.
+    let body = "cat > f <<'EOF'\npayload \\\nEOF\ngroove index --kb-path ./kb\n";
+    let lines = command_lines(body);
+    assert_eq!(
+        lines,
+        vec![
+            "cat > f <<'EOF'".to_string(),
+            "groove index --kb-path ./kb".to_string()
+        ],
+        "{lines:?}"
+    );
+}
+
+#[test]
 fn a_line_run_through_sudo_is_kept_as_written() {
     // The deployment recipes were invisible to every one of these guards before
     // paths were read: both translations dropped the same line, so they agreed
@@ -442,4 +502,99 @@ fn one_program_run_twice_is_two_instructions_but_not_a_possible_copy() {
         comparable_chains("`systemctl --user disable groove && rm ~/.config/groove`").len(),
         1
     );
+}
+
+/// Every shell block in this repository names at least one command.
+///
+/// This is the guard for the class of defect the rest of this pull request kept
+/// finding one instance at a time: a line the reader does not understand is
+/// dropped, both translations drop the same line, and the two then agree by both
+/// holding nothing. Six of those were found by review -- a command invoked by
+/// path, an environment prefix, a `sudo -u` option, a `;` chain, wrappers in
+/// either order, and an assignment that runs a command. Each was fixed, and the
+/// seventh would have arrived the same way.
+///
+/// A block tagged as shell and yielding no command means the reader failed to
+/// read it. Whether that block is compared against anything today is beside the
+/// point: it is the shape that goes silent, and it cannot be in the tree.
+///
+/// The rule for an exception, if one is ever needed: it goes in a list with the
+/// reason, the way `common::docs::SKIPPED_PATHS` does. There is nothing to
+/// exempt today.
+#[test]
+fn every_shell_block_in_the_corpus_names_a_command() {
+    let root = repo_root();
+    let mut silent: Vec<String> = Vec::new();
+    let mut understood = 0usize;
+    for file in markdown_files(&root) {
+        let shown = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let markdown = read(&file);
+        for block in shell_blocks(&markdown) {
+            let commands = command_lines(&block.body);
+            if commands.is_empty() {
+                let first = block
+                    .body
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                silent.push(format!("{shown}:{} starts `{}`", block.line, first.trim()));
+            } else {
+                understood += 1;
+            }
+        }
+    }
+    assert!(
+        understood > 0,
+        "no shell block was read at all, so this check has nothing to say"
+    );
+    silent.sort();
+    assert!(
+        silent.is_empty(),
+        "these blocks are tagged as shell and the reader found no command in \
+         them, so every guard that compares them is comparing nothing and will \
+         say so by staying quiet:\n  {}\n\
+         Teach the reader the shape rather than the page. Every entry that has \
+         appeared here so far was a syntax it did not know, and each one was \
+         invisible to all three guards until someone read the block by hand.",
+        silent.join("\n  ")
+    );
+}
+
+/// Not a guard: it counts the relation this file's header says it refuses to
+/// check, so the number quoted there is measured against the extractor that
+/// ships rather than an earlier one.
+#[test]
+fn the_block_subset_relation_this_guard_refuses_is_still_common() {
+    let root = repo_root();
+    let mut pairs: Vec<String> = Vec::new();
+    for file in markdown_files(&root) {
+        let shown = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let markdown = read(&file);
+        let blocks: Vec<(usize, BTreeSet<String>)> = shell_blocks(&markdown)
+            .iter()
+            .map(|b| (b.line, heads_of(&command_lines(&b.body))))
+            .filter(|(_, heads)| !heads.is_empty())
+            .collect();
+        for (a_line, a) in &blocks {
+            for (b_line, b) in &blocks {
+                if a_line != b_line && a != b && a.is_subset(b) {
+                    pairs.push(format!("{shown}:{a_line} in {shown}:{b_line}"));
+                }
+            }
+        }
+    }
+    // The header says "fifteen times". If this count moves, that sentence is
+    // wrong and has to move with it -- a number written beside a claim goes
+    // stale on its own, and this file exists because of that class of defect.
+    assert_eq!(pairs.len(), 15, "{pairs:#?}");
 }

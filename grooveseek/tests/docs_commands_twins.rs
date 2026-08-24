@@ -10,16 +10,19 @@
 //!
 //! # What is walked
 //!
-//! Every `X.ja.md` in the corpus `common::docs::markdown_files` collects,
+//! Every `X.ja.md` in the corpus [`common::docs::markdown_files`] collects,
 //! paired with the `X.md` beside it.
 //!
 //! # What is checked
 //!
 //! Two things, and only about commands. The sequence of fenced shell blocks:
 //! same number, and the i-th block on each side naming the same commands in the
-//! same order. And the multiset of inline `a && b` chains. Comparison is by
-//! normalised command line, so a translated trailing comment is not a
-//! difference and a changed flag is.
+//! same order. And the multiset of inline chains -- `` `a && b` ``, `` `a || b` ``
+//! or `` `a ; b` ``, including one program run twice, since the service
+//! migration note's Windows line ends a task and then deletes it. Comparison is
+//! by normalised command line, so a translated trailing comment is not a
+//! difference while a changed flag, a changed path, a changed environment
+//! variable and a changed `sudo -u` are.
 //!
 //! Single commands named in running prose are not compared. Which command a
 //! sentence points at is the translator's call, and pinning it would make every

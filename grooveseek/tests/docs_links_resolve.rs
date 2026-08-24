@@ -30,7 +30,7 @@
 //! Everything else is in, including `.claude/` and `grooveseek/examples/`: a
 //! link that no longer resolves is wrong wherever it was written.
 //!
-//! That walk is `common::docs::markdown_files`, shared with the command-copy
+//! That walk is [`common::docs::markdown_files`], shared with the command-copy
 //! guards so both ask one implementation which files are the documentation.
 //!
 //! # What is checked

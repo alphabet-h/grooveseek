@@ -18,6 +18,16 @@
 //! code in the shipping library, which this project has deliberately avoided.
 //! So there are two classifiers, and the claim in `main.rs` is scoped to its own
 //! module rather than the tree.
+//!
+//! # Nothing checks the links in this file
+//!
+//! `AGENTS.md` asks for `` [`name`] `` over a plain backtick because `cargo doc`
+//! then fails when the name leaves the tree. That guard does not reach here:
+//! every target under `tests/` is `doc = false` (`cargo metadata`), so rustdoc
+//! never reads these comments and a `` [`link`] `` in this file is a convention
+//! rather than a checked reference. Written down because the brackets look like
+//! the guarded form, and a reference that looks guarded and is not is worse than
+//! one that never claimed to be.
 
 #![allow(dead_code)] // each guard uses a different part of this module
 
@@ -171,10 +181,20 @@ pub const SHELL_TAGS: &[&str] = &[
     "cmd",
 ];
 
+/// A fence's language, lowercased. Empty when the fence has no info string.
+///
+/// One function because two callers ask it: [`fenced_blocks`] to label every
+/// block it collects, and [`pin_sites`] to label the one a marker names.
+pub fn fence_tag(info: &str) -> String {
+    info.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 /// Whether a fence's info string names one of [`SHELL_TAGS`].
 pub fn is_shell_tag(info: &str) -> bool {
-    let first = info.split_whitespace().next().unwrap_or_default();
-    SHELL_TAGS.contains(&first.to_ascii_lowercase().as_str())
+    SHELL_TAGS.contains(&fence_tag(info).as_str())
 }
 
 /// One fenced code block, located well enough to name in a failure.
@@ -229,11 +249,7 @@ pub fn fenced_blocks(markdown: &str) -> Vec<FencedBlock> {
     for (event, range) in Parser::new_ext(markdown, github_flavour()).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-                let tag = info
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
+                let tag = fence_tag(&info);
                 open = Some((line_of(markdown, range.start), tag, String::new()));
             }
             Event::Text(text) => {
@@ -411,13 +427,57 @@ fn strip_sudo(tokens: &mut Vec<String>) {
     }
 }
 
+/// Where a token's `NAME=` assignment ends, if it opens one.
+fn assignment_value(token: &str) -> Option<&str> {
+    let at = token.find('=')?;
+    let name = &token[..at];
+    if name.is_empty() || !is_program_name(name) {
+        return None;
+    }
+    Some(&token[at + 1..])
+}
+
 /// Drop a leading `VAR=value` environment prefix, however many there are.
+///
+/// An assignment whose value *runs* something keeps the program instead of
+/// taking it away. `NEXT_ID=$(jq '...' file)` splits on whitespace into
+/// `NEXT_ID=$(jq` and the rest, and dropping that first token would drop `jq`
+/// with it -- leaving fragments that name no program, so the whole line fell out
+/// of the corpus without a word. `.claude/commands/full-audit.md` writes exactly
+/// that.
 fn strip_env_prefix(tokens: &mut Vec<String>) {
     while let Some(first) = tokens.first() {
-        if first.contains('=') && !first.starts_with('-') {
-            tokens.remove(0);
-        } else {
+        if first.starts_with('-') {
             break;
+        }
+        let Some(value) = assignment_value(first) else {
+            break;
+        };
+        let opened = value
+            .trim_start_matches(['"', '\''])
+            .strip_prefix("$(")
+            .or_else(|| value.trim_start_matches(['"', '\'']).strip_prefix('`'));
+        match opened {
+            Some(program) if !program.is_empty() => {
+                tokens[0] = program.to_string();
+                break;
+            }
+            _ => {
+                tokens.remove(0);
+            }
+        }
+    }
+}
+
+/// Step past a subshell's opening parenthesis.
+///
+/// `(gh run list ...) | Where-Object { ... }` runs `gh`; the bracket is
+/// grouping, not a program.
+fn strip_subshell(tokens: &mut [String]) {
+    if let Some(first) = tokens.first() {
+        let opened = first.trim_start_matches('(');
+        if opened.len() != first.len() && !opened.is_empty() {
+            tokens[0] = opened.to_string();
         }
     }
 }
@@ -438,10 +498,13 @@ fn strip_env_prefix(tokens: &mut Vec<String>) {
 /// answer differently the first time either grew a case.
 fn strip_wrappers(tokens: &mut Vec<String>) {
     loop {
-        let before = tokens.len();
+        let before = (tokens.len(), tokens.first().cloned());
+        strip_subshell(tokens);
         strip_env_prefix(tokens);
         strip_sudo(tokens);
-        if tokens.len() == before {
+        // Length alone is not progress any more: unwrapping an assignment that
+        // runs something rewrites the first token instead of removing it.
+        if (tokens.len(), tokens.first().cloned()) == before {
             return;
         }
     }
@@ -489,10 +552,26 @@ pub fn head_of(fragment: &str) -> Option<String> {
 /// like a drifted command. Continuations are joined, comments removed,
 /// whitespace squeezed, and anything whose first word cannot start a command --
 /// JSON braces, prose, transcript output -- is left out.
+///
+/// The heredoc and the continuation are tracked in **one** pass, and the order
+/// matters. Joining continuations first lets a heredoc body line ending in `\`
+/// swallow the line after it -- and if that line was the terminator, the skip
+/// never ends and every command below it disappears from a block that still
+/// looks like it was read. A payload is text, so a backslash at the end of one
+/// is a character rather than a continuation.
 pub fn command_lines(body: &str) -> Vec<String> {
-    let mut joined: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     let mut pending = String::new();
+    let mut skip_until: Option<String> = None;
+
     for raw in body.lines() {
+        if let Some(tag) = skip_until.as_deref() {
+            if raw.trim() == tag {
+                skip_until = None;
+            }
+            continue;
+        }
+
         let line = raw.trim_end();
         let line = if pending.is_empty() {
             line.to_string()
@@ -504,21 +583,7 @@ pub fn command_lines(body: &str) -> Vec<String> {
             pending = stripped.to_string();
             continue;
         }
-        joined.push(line);
-    }
-    if !pending.is_empty() {
-        joined.push(pending);
-    }
 
-    let mut out = Vec::new();
-    let mut skip_until: Option<String> = None;
-    for line in joined {
-        if let Some(tag) = skip_until.as_deref() {
-            if line.trim() == tag {
-                skip_until = None;
-            }
-            continue;
-        }
         if let Some(tag) = heredoc_tag(&line) {
             skip_until = Some(tag);
         }
@@ -702,16 +767,20 @@ pub fn pin_sites(markdown: &str) -> Vec<PinSite> {
                 };
                 let block = match events.get(index + 1) {
                     Some((Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))), next)) => {
-                        let tag = info
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or_default()
-                            .to_ascii_lowercase();
-                        let body = fenced_blocks(markdown)
-                            .into_iter()
-                            .find(|b| b.line == line_of(markdown, next.start))
-                            .map(|b| b.body)
-                            .unwrap_or_default();
+                        let tag = fence_tag(info);
+                        // Read the body out of the events already in hand.
+                        // Re-parsing the document and matching the block by its
+                        // line number would be the same work again per pin, and
+                        // a lookup that missed would hand back an empty body --
+                        // a pin comparing nothing against nothing.
+                        let mut body = String::new();
+                        for (event, _) in &events[index + 2..] {
+                            match event {
+                                Event::Text(text) => body.push_str(text),
+                                Event::End(TagEnd::CodeBlock) => break,
+                                _ => {}
+                            }
+                        }
                         Some(FencedBlock {
                             line: line_of(markdown, next.start),
                             tag,
