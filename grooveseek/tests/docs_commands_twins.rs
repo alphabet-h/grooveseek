@@ -115,10 +115,15 @@ fn block_differences(
 }
 
 /// How many of each inline chain a page carries.
-fn chain_multiset(markdown: &str) -> BTreeMap<Vec<String>, usize> {
-    let mut counted = BTreeMap::new();
+///
+/// Keyed on the commands, so a chain written with `;` on one page and `&&` on
+/// the other still counts as the same instruction; the span as written is
+/// carried alongside so a failure can quote what the page actually says.
+fn chain_multiset(markdown: &str) -> BTreeMap<Vec<String>, (usize, String)> {
+    let mut counted: BTreeMap<Vec<String>, (usize, String)> = BTreeMap::new();
     for chain in inline_chains(markdown) {
-        *counted.entry(chain.commands).or_insert(0) += 1;
+        let entry = counted.entry(chain.commands).or_insert((0, chain.text));
+        entry.0 += 1;
     }
     counted
 }
@@ -178,20 +183,16 @@ fn a_page_and_its_japanese_twin_name_the_same_commands() {
         if !en_chains.is_empty() || !ja_chains.is_empty() {
             pairs_with_chains += 1;
         }
-        for (chain, count) in &en_chains {
-            if ja_chains.get(chain).copied().unwrap_or(0) != *count {
-                offenders.push(format!(
-                    "{en_name} chains `{}`, {ja_name} does not",
-                    chain.join(" && ")
-                ));
+        for (chain, (count, text)) in &en_chains {
+            let there = ja_chains.get(chain).map(|(n, _)| *n).unwrap_or(0);
+            if there != *count {
+                offenders.push(format!("{en_name} chains `{text}`, {ja_name} does not"));
             }
         }
-        for (chain, count) in &ja_chains {
-            if en_chains.get(chain).copied().unwrap_or(0) != *count {
-                offenders.push(format!(
-                    "{ja_name} chains `{}`, {en_name} does not",
-                    chain.join(" && ")
-                ));
+        for (chain, (count, text)) in &ja_chains {
+            let there = en_chains.get(chain).map(|(n, _)| *n).unwrap_or(0);
+            if there != *count {
+                offenders.push(format!("{ja_name} chains `{text}`, {en_name} does not"));
             }
         }
     }

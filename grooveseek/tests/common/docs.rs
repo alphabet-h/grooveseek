@@ -193,6 +193,10 @@ pub struct FencedBlock {
 pub struct InlineChain {
     /// 1-based line the span starts on.
     pub line: usize,
+    /// The span as the page writes it, for quoting in a failure. Rebuilding it
+    /// from [`commands`](Self::commands) would print a separator the page does
+    /// not use and send a reader searching for text that is not there.
+    pub text: String,
     /// The chain's parts, normalised the way [`command_lines`] normalises a
     /// block's lines.
     pub commands: Vec<String>,
@@ -559,29 +563,32 @@ pub fn heads_of(lines: &[String]) -> BTreeSet<String> {
     heads
 }
 
-/// Split on `&&` and `||`, and on nothing else.
+/// What separates one instruction from the next.
 ///
-/// A pipeline is one command's output feeding another's input, not two things
-/// a reader is told to run, so `groove search ... | jq ...` stays one entry --
+/// A pipeline is **not** here. `groove search ... | jq ...` is one command's
+/// output feeding another's input, not two things a reader is told to run, and
 /// splitting it would make every block that pipes look like a superset of every
-/// block that does not. `;` is left alone for the same reason and because it
-/// appears inside PowerShell and JSON arguments.
+/// block that does not.
+///
+/// `;` is here because this repository uses it: the Windows line of the service
+/// migration note runs `schtasks /End ... ; schtasks /Delete ...`, beside a
+/// Linux line and a macOS line that use `&&`. Leaving it out made the Windows
+/// instruction the only one of the three that no guard compared.
+const CHAIN_SEPARATORS: &[&str] = &["&&", "||", ";"];
+
+/// Split a line into the instructions it chains together.
 pub fn split_chain(line: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut rest = line;
     loop {
-        let and = find_unquoted(rest, "&&");
-        let or = find_unquoted(rest, "||");
-        let at = match (and, or) {
-            (Some(a), Some(o)) => Some(a.min(o)),
-            (Some(a), None) => Some(a),
-            (None, Some(o)) => Some(o),
-            (None, None) => None,
-        };
-        match at {
-            Some(i) => {
-                parts.push(rest[..i].trim().to_string());
-                rest = &rest[i + 2..];
+        let cut = CHAIN_SEPARATORS
+            .iter()
+            .filter_map(|sep| find_unquoted(rest, sep).map(|at| (at, sep.len())))
+            .min_by_key(|(at, _)| *at);
+        match cut {
+            Some((at, width)) => {
+                parts.push(rest[..at].trim().to_string());
+                rest = &rest[at + width..];
             }
             None => {
                 parts.push(rest.trim().to_string());
@@ -593,34 +600,40 @@ pub fn split_chain(line: &str) -> Vec<String> {
     parts
 }
 
-/// Every inline code span that chains at least two distinct commands.
+/// Every inline code span that chains two or more commands.
 ///
-/// The floor of two is what keeps `` `groove service install` `` -- prose
-/// naming a command, which this repository does dozens of times -- out of the
-/// corpus. It is also why the floor is not three: `docs/usage.md`'s two
-/// service-removal chains are the only chains that survive fixing the copy this
-/// guard was built for, and without them the guard would have nothing left to
-/// compare and would pass by having nothing to say.
+/// The floor of two commands is what keeps `` `groove service install` `` --
+/// prose naming a command, which this repository does dozens of times -- out of
+/// the corpus.
+///
+/// It is a floor on **commands**, not on distinct ones, and the difference is
+/// the Windows line of the service migration note:
+/// `schtasks /End ... ; schtasks /Delete ...` runs one program twice, and both
+/// halves are instructions a reader follows. Requiring two distinct programs
+/// would leave it uncompared beside a Linux line and a macOS line that are.
+///
+/// A caller that needs a stricter floor applies its own. The subset guard does:
+/// a chain naming one program is a subset of any block that runs it, so it asks
+/// for two distinct commands before treating a chain as a possible copy. That
+/// belongs there, with its reason, rather than here where it would silently
+/// narrow what every caller sees.
 pub fn inline_chains(markdown: &str) -> Vec<InlineChain> {
     let mut found = Vec::new();
     for (event, range) in Parser::new_ext(markdown, github_flavour()).into_offset_iter() {
         let Event::Code(code) = event else {
             continue;
         };
-        if find_unquoted(&code, "&&").is_none() && find_unquoted(&code, "||").is_none() {
-            continue;
-        }
         let commands: Vec<String> = split_chain(&code)
             .into_iter()
             .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|p| !p.is_empty())
             .collect();
-        let distinct: BTreeSet<String> = commands.iter().filter_map(|c| head_of(c)).collect();
-        if distinct.len() < 2 {
+        if commands.len() < 2 || commands.iter().any(|c| head_of(c).is_none()) {
             continue;
         }
         found.push(InlineChain {
             line: line_of(markdown, range.start),
+            text: code.split_whitespace().collect::<Vec<_>>().join(" "),
             commands,
         });
     }

@@ -19,8 +19,9 @@
 //!
 //! # What is checked
 //!
-//! Within one page: an inline `` `a && b` `` chain whose commands are a subset
-//! of some fenced shell block's commands on the same page. Commands are compared
+//! Within one page: an inline chain -- `` `a && b` ``, `` `a || b` `` or
+//! `` `a ; b` `` -- naming two or more different commands, all of which some
+//! fenced shell block on the same page also names. Commands are compared
 //! by identity -- the program and the word after it -- and not by their flags,
 //! because a copy that drifts drifts in its flags first, and `cargo fmt --all`
 //! against `cargo fmt --all -- --check` is exactly the difference that has to
@@ -49,6 +50,22 @@ use common::docs::{
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// The chains this guard can say anything about.
+///
+/// A chain naming one program -- `schtasks /End ... ; schtasks /Delete ...`, or
+/// `cargo test && cargo test --release` -- is a subset of any block that runs
+/// that program, so treating it as a possible copy would report every page that
+/// mentions a command twice in one breath. Two distinct commands is the floor
+/// here and nowhere else: the twin guard compares those same chains and needs
+/// them, since running one program twice is still two instructions.
+fn comparable_chains(markdown: &str) -> Vec<(usize, BTreeSet<String>)> {
+    inline_chains(markdown)
+        .into_iter()
+        .map(|chain| (chain.line, heads_of(&chain.commands)))
+        .filter(|(_, heads)| heads.len() >= 2)
+        .collect()
+}
+
 /// Every place a page tells the reader to run a subset of what one of its own
 /// blocks tells them to run.
 ///
@@ -62,13 +79,12 @@ fn shortened_copies(markdown: &str) -> Vec<String> {
         .collect();
 
     let mut found = Vec::new();
-    for chain in inline_chains(markdown) {
-        let heads = heads_of(&chain.commands);
+    for (chain_line, heads) in comparable_chains(markdown) {
         for (line, block) in &blocks {
             if heads.is_subset(block) {
                 found.push(format!(
                     "line {} repeats the block at line {}: {}",
-                    chain.line,
+                    chain_line,
                     line,
                     heads.iter().cloned().collect::<Vec<_>>().join(", ")
                 ));
@@ -84,7 +100,7 @@ fn comparisons_in(markdown: &str) -> usize {
         .iter()
         .filter(|b| !heads_of(&command_lines(&b.body)).is_empty())
         .count();
-    inline_chains(markdown).len() * blocks
+    comparable_chains(markdown).len() * blocks
 }
 
 fn read(path: &Path) -> String {
@@ -398,13 +414,32 @@ fn a_continued_line_is_one_command() {
 #[test]
 fn prose_naming_one_command_is_not_a_chain() {
     // `groove service install` appears dozens of times in running text. Without
-    // the floor of two distinct commands, every one of them would be a
-    // candidate.
+    // the floor of two commands, every one of them would be a candidate.
     assert!(inline_chains("Run `groove service install` to set it up.").is_empty());
     assert_eq!(
         inline_chains("Run `systemctl --user disable groove && rm ~/.config/groove`.").len(),
         1
     );
-    // Two spellings of the same command are one command, not a chain.
-    assert!(inline_chains("`cargo test && cargo test --release`").is_empty());
+}
+
+#[test]
+fn one_program_run_twice_is_two_instructions_but_not_a_possible_copy() {
+    // `docs/usage.md`'s Windows migration line ends a task and then deletes it,
+    // beside a Linux line and a macOS line that chain with `&&`. All three are
+    // instructions a reader follows, so all three are chains.
+    let windows = inline_chains(
+        "- Windows: `schtasks /End /TN '\\groove' ; schtasks /Delete /TN '\\groove' /F`",
+    );
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    assert_eq!(windows[0].commands.len(), 2, "{windows:?}");
+
+    // The subset guard cannot say anything about them, though: a chain naming
+    // one program is a subset of every block that runs it, so it would report
+    // any page that mentions a command twice in one breath. That floor lives in
+    // this guard, not in the extractor the twin guard shares.
+    assert!(comparable_chains("`cargo test && cargo test --release`").is_empty());
+    assert_eq!(
+        comparable_chains("`systemctl --user disable groove && rm ~/.config/groove`").len(),
+        1
+    );
 }
