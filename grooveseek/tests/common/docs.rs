@@ -506,14 +506,18 @@ pub fn command_lines(body: &str) -> Vec<String> {
             .unwrap_or(&text)
             .to_string();
         let tokens: Vec<&str> = text.split_whitespace().collect();
-        let kept = without_env_prefix(&tokens);
-        // Whether this is a command is decided on the program, after `sudo` and
-        // its options; what is kept is the line as written, so a changed path or
-        // a changed user still reads as a difference between two translations.
-        let mut probe = kept.clone();
+        // Two different questions, and they must not share an answer. *Whether*
+        // this line is a command is decided on the program, which is found by
+        // stepping past an environment prefix and `sudo` with its options.
+        // *What is kept* is the line as written, because everything stepped over
+        // is still part of the instruction: `RUST_LOG=grooveseek=debug groove
+        // serve` and `RUST_LOG=trace groove serve` tell a reader to do different
+        // things, and `docs/usage.md` sets RUST_LOG on three lines whose
+        // Japanese twin would otherwise be free to disagree about it.
+        let mut probe = without_env_prefix(&tokens);
         without_sudo(&mut probe);
         match probe.first() {
-            Some(first) if is_command_token(first) => out.push(kept.join(" ")),
+            Some(first) if is_command_token(first) => out.push(tokens.join(" ")),
             _ => {}
         }
     }

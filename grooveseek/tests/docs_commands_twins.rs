@@ -309,3 +309,25 @@ fn a_changed_flag_is_a_drifted_command() {
     let ja = command_lines("cargo fmt --all\n");
     assert_ne!(en, ja);
 }
+
+#[test]
+fn an_environment_assignment_is_part_of_the_instruction() {
+    // `docs/usage.md` sets RUST_LOG on three lines. Stepping past the prefix to
+    // find the program is right; dropping it from what gets compared would let
+    // the Japanese page tell its readers to set a different level.
+    let en = command_lines("RUST_LOG=grooveseek=debug groove serve --kb-path ./kb\n");
+    let ja = command_lines("RUST_LOG=trace groove serve --kb-path ./kb\n");
+    assert_ne!(en, ja, "{en:?}");
+    assert_eq!(
+        en,
+        vec!["RUST_LOG=grooveseek=debug groove serve --kb-path ./kb".to_string()],
+        "{en:?}"
+    );
+}
+
+#[test]
+fn the_user_a_command_runs_as_is_part_of_the_instruction() {
+    let en = command_lines("sudo -u groove /usr/local/bin/groove index --kb-path /srv/kb\n");
+    let ja = command_lines("sudo -u root /usr/local/bin/groove index --kb-path /srv/kb\n");
+    assert_ne!(en, ja, "{en:?}");
+}
