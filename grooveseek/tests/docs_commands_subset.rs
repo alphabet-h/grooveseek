@@ -45,7 +45,8 @@
 mod common;
 
 use common::docs::{
-    command_lines, heads_of, inline_chains, markdown_files, repo_root, shell_blocks,
+    command_lines, half_read_chains, heads_of, inline_chains, markdown_files, repo_root,
+    shell_blocks,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -368,6 +369,49 @@ fn an_assignment_that_runs_a_command_keeps_the_command() {
         head_of("RUST_LOG=debug groove serve").as_deref(),
         Some("groove serve")
     );
+    // A substitution with no arguments is one token, so the closing bracket is
+    // still stuck to the program. `PWD=$(pwd)` is the commoner spelling of the
+    // two and was still falling out after the arguments case was fixed.
+    assert_eq!(head_of("PWD=$(pwd)").as_deref(), Some("pwd"));
+    assert_eq!(head_of("STAMP=`date`").as_deref(), Some("date"));
+    assert_eq!(head_of("OUT=\"$(pwd)\"").as_deref(), Some("pwd"));
+}
+
+#[test]
+fn a_span_the_reader_only_half_understands_is_reported_rather_than_dropped() {
+    use common::docs::half_read_chains;
+    // `&&` is shell and nothing else, so failing on half of one is worth saying.
+    let mixed = half_read_chains("Run `groove index && ???unreadable???`.");
+    assert_eq!(mixed.len(), 1, "{mixed:?}");
+    // Reading all of it, or none of it, is not the same thing at all.
+    assert!(half_read_chains("`groove index && groove status`").is_empty());
+    assert!(half_read_chains("`??? && ???`").is_empty());
+}
+
+#[test]
+fn a_semicolon_alone_is_not_evidence_of_a_shell_chain() {
+    use common::docs::half_read_chains;
+    // All three are in the tree, inside backticks, and none is a command chain.
+    for not_a_chain in [
+        "`text/plain; charset=utf-8`",
+        "`vec![Data::default(); rows * cols]`",
+        "`[Console]::OutputEncoding=[Text.Encoding]::UTF8; Write-Output x`",
+    ] {
+        assert!(
+            half_read_chains(not_a_chain).is_empty(),
+            "reported as half-read: {not_a_chain}"
+        );
+        assert!(
+            inline_chains(not_a_chain).is_empty(),
+            "treated as a chain: {not_a_chain}"
+        );
+    }
+    // A `;` span the reader understands end to end is still a chain, which is
+    // what the Windows migration line needs.
+    assert_eq!(
+        inline_chains("`schtasks /End /TN x ; schtasks /Delete /TN x /F`").len(),
+        1
+    );
 }
 
 #[test]
@@ -525,7 +569,7 @@ fn one_program_run_twice_is_two_instructions_but_not_a_possible_copy() {
 fn every_shell_block_in_the_corpus_names_a_command() {
     let root = repo_root();
     let mut silent: Vec<String> = Vec::new();
-    let mut understood = 0usize;
+    let mut pages_read: BTreeSet<String> = BTreeSet::new();
     for file in markdown_files(&root) {
         let shown = file
             .strip_prefix(&root)
@@ -544,14 +588,28 @@ fn every_shell_block_in_the_corpus_names_a_command() {
                     .unwrap_or("");
                 silent.push(format!("{shown}:{} starts `{}`", block.line, first.trim()));
             } else {
-                understood += 1;
+                pages_read.insert(shown.clone());
             }
         }
     }
-    assert!(
-        understood > 0,
-        "no shell block was read at all, so this check has nothing to say"
-    );
+    // Named pages rather than a count, for the reason the other guards in this
+    // file name theirs: "some block somewhere was read" still passes when a skip
+    // rule grows wide enough to drop a whole directory, and this guard exists
+    // precisely to notice reading less than it claims to.
+    for required in [
+        "AGENTS.md",
+        "CONTRIBUTING.md",
+        "docs/usage.md",
+        "grooveseek/examples/deployments/intranet-http/README.md",
+    ] {
+        assert!(
+            pages_read.contains(required),
+            "no shell block in {required} was read, so either the walk stopped \
+             reaching it or the reader stopped understanding it. Reached {} \
+             page(s) with shell blocks",
+            pages_read.len()
+        );
+    }
     silent.sort();
     assert!(
         silent.is_empty(),
@@ -562,6 +620,43 @@ fn every_shell_block_in_the_corpus_names_a_command() {
          appeared here so far was a syntax it did not know, and each one was \
          invisible to all three guards until someone read the block by hand.",
         silent.join("\n  ")
+    );
+}
+
+/// No inline chain is read halfway.
+///
+/// The sibling of the block guard above, for the half of the corpus it does not
+/// reach. A span whose parts are all commands is a chain and gets compared; a
+/// span where none of them are is not one -- prose about boolean operators, a
+/// line of Rust -- and is rightly ignored. In between is the silence: the reader
+/// recognises one part, fails on the next, and drops the span whole, taking the
+/// part it understood with it. Nothing is then being compared and nothing says
+/// so, which is this pull request's subject stated once more.
+#[test]
+fn no_inline_chain_in_the_corpus_is_read_halfway() {
+    let root = repo_root();
+    let mut partial: Vec<String> = Vec::new();
+    for file in markdown_files(&root) {
+        let shown = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let markdown = read(&file);
+        for chain in half_read_chains(&markdown) {
+            partial.push(format!("{shown}:{} `{}`", chain.line, chain.text));
+        }
+    }
+    partial.sort();
+    assert!(
+        partial.is_empty(),
+        "the reader understood part of each of these spans and not the rest, so \
+         it dropped them whole and the part it did understand went with them:\n  \
+         {}\n\
+         Teach it the syntax it stumbled on. Leaving the span out is the failure \
+         mode every finding in this pull request has had.",
+        partial.join("\n  ")
     );
 }
 

@@ -183,8 +183,11 @@ pub const SHELL_TAGS: &[&str] = &[
 
 /// A fence's language, lowercased. Empty when the fence has no info string.
 ///
-/// One function because two callers ask it: [`fenced_blocks`] to label every
-/// block it collects, and [`pin_sites`] to label the one a marker names.
+/// One function because more than one caller asks it -- [`fenced_blocks`] to
+/// label every block it collects, [`pin_sites`] to label the one a marker names,
+/// [`is_shell_tag`] to decide whether it is a shell. How many callers there are
+/// is not written down: a number beside a list goes stale on its own, which is
+/// what this file exists to catch.
 pub fn fence_tag(info: &str) -> String {
     info.split_whitespace()
         .next()
@@ -238,31 +241,50 @@ fn line_of(markdown: &str, offset: usize) -> usize {
     markdown[..offset].matches('\n').count() + 1
 }
 
+/// The document as a list of events, which both readers below walk.
+type Events<'a> = Vec<(Event<'a>, std::ops::Range<usize>)>;
+
+fn events_of(markdown: &str) -> Events<'_> {
+    Parser::new_ext(markdown, github_flavour())
+        .into_offset_iter()
+        .collect()
+}
+
+/// The text inside the code block whose `Start` event is at `index`.
+///
+/// One function because two readers want it: [`fenced_blocks`], which collects
+/// every block, and [`pin_sites`], which wants the one block a marker names.
+/// Written twice, the two would answer differently the first time pulldown-cmark
+/// put an event inside a code block that neither expected -- and the shape that
+/// disagreement takes is a body silently missing part of itself, which is the
+/// failure this whole file exists to refuse.
+fn code_block_body(events: &Events<'_>, index: usize) -> String {
+    let mut body = String::new();
+    for (event, _) in &events[index + 1..] {
+        match event {
+            Event::Text(text) => body.push_str(text),
+            Event::End(TagEnd::CodeBlock) => break,
+            _ => {}
+        }
+    }
+    body
+}
+
 /// Every fenced code block in the document, in source order.
 ///
 /// Fenced only. An indented block carries no info string, so it cannot say
 /// whether it holds commands, and these guards say outright that they do not
 /// read them.
 pub fn fenced_blocks(markdown: &str) -> Vec<FencedBlock> {
+    let events = events_of(markdown);
     let mut blocks = Vec::new();
-    let mut open: Option<(usize, String, String)> = None;
-    for (event, range) in Parser::new_ext(markdown, github_flavour()).into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-                let tag = fence_tag(&info);
-                open = Some((line_of(markdown, range.start), tag, String::new()));
-            }
-            Event::Text(text) => {
-                if let Some((_, _, body)) = open.as_mut() {
-                    body.push_str(&text);
-                }
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                if let Some((line, tag, body)) = open.take() {
-                    blocks.push(FencedBlock { line, tag, body });
-                }
-            }
-            _ => {}
+    for (index, (event, range)) in events.iter().enumerate() {
+        if let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) = event {
+            blocks.push(FencedBlock {
+                line: line_of(markdown, range.start),
+                tag: fence_tag(info),
+                body: code_block_body(&events, index),
+            });
         }
     }
     blocks
@@ -445,6 +467,12 @@ fn assignment_value(token: &str) -> Option<&str> {
 /// with it -- leaving fragments that name no program, so the whole line fell out
 /// of the corpus without a word. `.claude/commands/full-audit.md` writes exactly
 /// that.
+///
+/// The substitution has to be closed as well as opened. `PWD=$(pwd)` takes no
+/// arguments, so the whole thing is **one** token and the `)` is still attached
+/// to the program -- and `pwd)` names no program, which put the line back in the
+/// silence this was meant to end. A no-argument substitution is the commoner
+/// spelling of the two.
 fn strip_env_prefix(tokens: &mut Vec<String>) {
     while let Some(first) = tokens.first() {
         if first.starts_with('-') {
@@ -453,16 +481,22 @@ fn strip_env_prefix(tokens: &mut Vec<String>) {
         let Some(value) = assignment_value(first) else {
             break;
         };
+        let value = value.trim_start_matches(['"', '\'']);
         let opened = value
-            .trim_start_matches(['"', '\''])
             .strip_prefix("$(")
-            .or_else(|| value.trim_start_matches(['"', '\'']).strip_prefix('`'));
+            .map(|rest| (rest, ')'))
+            .or_else(|| value.strip_prefix('`').map(|rest| (rest, '`')));
         match opened {
-            Some(program) if !program.is_empty() => {
-                tokens[0] = program.to_string();
-                break;
+            Some((rest, closer)) => {
+                let program = rest.trim_end_matches(['"', '\'']).trim_end_matches(closer);
+                if program.is_empty() {
+                    tokens.remove(0);
+                } else {
+                    tokens[0] = program.to_string();
+                    break;
+                }
             }
-            _ => {
+            None => {
                 tokens.remove(0);
             }
         }
@@ -683,7 +717,40 @@ pub fn split_chain(line: &str) -> Vec<String> {
 /// belongs there, with its reason, rather than here where it would silently
 /// narrow what every caller sees.
 pub fn inline_chains(markdown: &str) -> Vec<InlineChain> {
-    let mut found = Vec::new();
+    read_chains(markdown).0
+}
+
+/// The spans where the reader understood **some** of a chain and not the rest.
+///
+/// A span whose parts are all commands is a chain. A span where none of them are
+/// is not one -- `` `a && b` `` in prose about boolean operators, a line of Rust
+/// -- and ignoring it is right. Between those two is the shape that goes silent:
+/// the reader recognises one half, fails on the other, and drops the span
+/// whole, taking the half it understood with it. No guard is then comparing
+/// anything, and none of them say so.
+///
+/// Returned separately rather than fixed in place because the two halves want
+/// opposite things: a comparison needs whole chains, and a person needs to be
+/// told the reader has met a syntax it cannot read.
+pub fn half_read_chains(markdown: &str) -> Vec<InlineChain> {
+    read_chains(markdown).1
+}
+
+/// Both halves of the split, from one pass: the chains, and the spans the reader
+/// only partly understood.
+///
+/// What separates them decides how much doubt a partly-read span earns.
+/// `&&` and `||` are shell and nothing else, so a span containing one is a chain
+/// and failing to read half of it is worth saying out loud. `;` is not: it ends
+/// a statement in Rust, separates parameters in a MIME type, and joins
+/// PowerShell assignments, and this repository writes all three inside
+/// backticks -- `text/plain; charset=utf-8` and `vec![Data::default(); rows *
+/// cols]` are in the tree today. A span held together only by `;` therefore has
+/// to be readable end to end to count as a chain at all, and is otherwise not
+/// one rather than a half-read one.
+fn read_chains(markdown: &str) -> (Vec<InlineChain>, Vec<InlineChain>) {
+    let mut whole = Vec::new();
+    let mut partial = Vec::new();
     for (event, range) in Parser::new_ext(markdown, github_flavour()).into_offset_iter() {
         let Event::Code(code) = event else {
             continue;
@@ -693,16 +760,24 @@ pub fn inline_chains(markdown: &str) -> Vec<InlineChain> {
             .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
             .filter(|p| !p.is_empty())
             .collect();
-        if commands.len() < 2 || commands.iter().any(|c| head_of(c).is_none()) {
+        if commands.len() < 2 {
             continue;
         }
-        found.push(InlineChain {
+        let shell_only =
+            find_unquoted(&code, "&&").is_some() || find_unquoted(&code, "||").is_some();
+        let read = commands.iter().filter(|c| head_of(c).is_some()).count();
+        let chain = InlineChain {
             line: line_of(markdown, range.start),
             text: code.split_whitespace().collect::<Vec<_>>().join(" "),
             commands,
-        });
+        };
+        if read == chain.commands.len() {
+            whole.push(chain);
+        } else if read > 0 && shell_only {
+            partial.push(chain);
+        }
     }
-    found
+    (whole, partial)
 }
 
 /// The text that opens a pin marker.
@@ -737,10 +812,7 @@ fn marker_id(html: &str) -> Option<String> {
 /// pin that reached one would hand an untagged body to a reader expecting a
 /// tagged one.
 pub fn pin_sites(markdown: &str) -> Vec<PinSite> {
-    let events: Vec<(Event, std::ops::Range<usize>)> = Parser::new_ext(markdown, github_flavour())
-        .into_offset_iter()
-        .collect();
-
+    let events = events_of(markdown);
     let mut sites = Vec::new();
     let mut pending: Option<(String, usize)> = None;
     for (index, (event, range)) in events.iter().enumerate() {
@@ -765,26 +837,17 @@ pub fn pin_sites(markdown: &str) -> Vec<PinSite> {
                 let Some((id, line)) = pending.take() else {
                     continue;
                 };
+                // Read out of the events already in hand, through the same
+                // function that reads every other block. Re-parsing and matching
+                // by line number would be the work again per pin, and a lookup
+                // that missed would hand back an empty body -- a pin comparing
+                // nothing against nothing.
                 let block = match events.get(index + 1) {
                     Some((Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))), next)) => {
-                        let tag = fence_tag(info);
-                        // Read the body out of the events already in hand.
-                        // Re-parsing the document and matching the block by its
-                        // line number would be the same work again per pin, and
-                        // a lookup that missed would hand back an empty body --
-                        // a pin comparing nothing against nothing.
-                        let mut body = String::new();
-                        for (event, _) in &events[index + 2..] {
-                            match event {
-                                Event::Text(text) => body.push_str(text),
-                                Event::End(TagEnd::CodeBlock) => break,
-                                _ => {}
-                            }
-                        }
                         Some(FencedBlock {
                             line: line_of(markdown, next.start),
-                            tag,
-                            body,
+                            tag: fence_tag(info),
+                            body: code_block_body(&events, index + 1),
                         })
                     }
                     _ => None,
