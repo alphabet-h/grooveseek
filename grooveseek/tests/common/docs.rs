@@ -407,6 +407,14 @@ fn is_program_name(word: &str) -> bool {
 /// `/usr/local/bin/groove index` and `groove index` are the same instruction
 /// written for different installations. A path is not evidence of a different
 /// command, so it should not read as one.
+///
+/// This is deliberately loose in one direction: anything shaped like a path
+/// reads as a program, so `text/plain` answers `plain`. Nothing here can tell
+/// an install path from a MIME type, and narrowing it to `./`, `../` and `/`
+/// would drop `scripts/build.sh`, which is how a relative invocation is
+/// ordinarily written. What keeps the looseness harmless is that a caller has
+/// to have other reasons to be reading the text as a command: a shell fence, or
+/// a span held together by `&&`. `text/plain; charset=utf-8` reaches neither.
 fn command_token_name(token: &str) -> Option<&str> {
     let name = token.rsplit(['/', '\\']).next()?;
     if is_program_name(name) {

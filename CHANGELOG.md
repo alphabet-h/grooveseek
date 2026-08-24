@@ -30,11 +30,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Japanese counterpart to name the same commands.
 
   The last of those found what it was built for.
-  [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) still told Japanese readers to run
-  `cargo clippy --all-targets` alone before opening a pull request, the
-  shortened copy the English page deleted in #228 — three lines below its own
-  warning that this exact command is not what CI checks. It now points at the
-  block, as the English page does.
+  [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) still gave Japanese readers a
+  four-command line to run before opening a pull request — the shortened copy
+  the English page deleted in #228, naming one clippy leg where CI runs two.
+  The block it was copied from is on the same page and says so outright, in a
+  different section eighty lines up, which is exactly how a copy drifts without
+  either half looking wrong. It now points at that block, as the English page
+  does.
 
   Commands compare by identity — program plus subcommand — and not by their
   flags, because a copy drifts in its flags first. The subset rule is
