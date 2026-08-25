@@ -738,13 +738,18 @@ pub struct ReadLine {
 ///    that swallows the rest of the block.
 /// 3. A `\` at the end of what is left continues the line -- outside quotes
 ///    only. Inside a quote the backslash is a character.
-/// 4. A heredoc opener ends the instruction here, whatever quote is open: the
-///    body starts on the next line and rule 1 takes it.
+/// 4. A heredoc opener ends the instruction here, once no quote is open: the
+///    body starts on the next line and rule 1 takes it. The shell reads the
+///    body after the line that *completes* the command, and a line with a
+///    quote still open has not completed it -- so it falls to rule 5, and the
+///    body begins after the line that closes the quote.
 /// 5. A quote still open continues the line.
 ///
 /// What never closes is reported, not swallowed: a quote open at the end of the
 /// block, a heredoc without its terminator, a `\` on the last line. Each of
-/// those used to take every line under it into silence.
+/// those used to take every line under it into silence -- and the first is
+/// what keeps a quote from swallowing a terminator, since the opener is
+/// reported rather than the lines under it being skipped.
 ///
 /// Four things the first reader did that this one does not, none of which any
 /// page in the tree relies on: a `\` at the end of a comment continued the
@@ -818,7 +823,9 @@ pub fn read_block(body: &str) -> Vec<ReadLine> {
             continue;
         }
         // 4.
-        if let Some(tag) = heredoc_tag(&g.text) {
+        if open_out.is_none()
+            && let Some(tag) = heredoc_tag(&g.text)
+        {
             skip_until = Some((tag, g.start));
             let done = group.take().expect("still open");
             out[done.start].read = classify(&done.text, &mut in_case);

@@ -649,15 +649,26 @@ fn a_quote_that_never_closes_is_reported_rather_than_swallowed() {
 }
 
 #[test]
-fn a_quote_open_on_a_heredoc_opener_does_not_swallow_the_terminator() {
-    // The heredoc starts on the next line whatever quote is open, so the
-    // opener ends the instruction there and the body is skipped as a body.
-    let lines = command_lines("cat <<'EOF' \"\nbody\nEOF\ngroove index\n");
+fn a_heredoc_opener_with_a_quote_still_open_is_not_finished() {
+    use common::docs::{LineRead, read_block};
+    // The shell reads the body after the line that completes the command, and
+    // a line with a quote still open has not completed it. So the quote
+    // continues (codex P2 on #233: closing the group at the opener discarded
+    // the quote and let a malformed block pass), the body starts after the
+    // line that closes it, and a quote that never closes is reported -- which
+    // is also what keeps a terminator from being swallowed in silence.
+    let lines = command_lines("cat <<EOF \"\n\"\nbody\nEOF\ngroove index\n");
     assert_eq!(
         lines,
-        vec!["cat <<'EOF' \"".to_string(), "groove index".to_string()],
+        vec!["cat <<EOF \" \"".to_string(), "groove index".to_string()],
         "{lines:?}"
     );
+    let placed = read_block("cat <<'EOF' \"\nbody\nEOF\ngroove index\n");
+    assert!(
+        matches!(&placed[0].read, LineRead::Unread(why) if why.contains("never closes")),
+        "{placed:?}"
+    );
+    assert!(command_lines("cat <<'EOF' \"\nbody\nEOF\ngroove index\n").is_empty());
 }
 
 #[test]
@@ -898,7 +909,8 @@ fn every_shell_block_in_the_corpus_names_a_command() {
 /// instruction, a continuation, a heredoc payload, a blank, a comment -- and a
 /// line it cannot place is reported here with the reason.
 ///
-/// A new variant of `LineRead` has to be placed in the `match` below by hand:
+/// A new variant of [`common::docs::LineRead`] has to be placed in the `match`
+/// below by hand:
 /// there is no wildcard arm, so the compiler asks whether the new class is
 /// reported or accounted for, which is the question a silent class skips.
 #[test]
