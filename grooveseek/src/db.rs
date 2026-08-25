@@ -3495,8 +3495,9 @@ mod tests {
         assert!(group.titles.contains(&"plain title".to_string()));
     }
 
-    /// The half of the tree that `segment_tree`'s own unit tests cannot see:
-    /// the paths have to travel out of SQLite and into the tree builder.
+    /// The half of the tree that the tree builder's own unit tests in
+    /// [`crate::db::meta`] cannot see: the paths have to travel out of SQLite
+    /// and into the tree builder.
     /// Measured, a missing column makes the query fail outright and a column
     /// read at the wrong index builds the tree out of the titles instead --
     /// and all ten unit tests pass through both, because none of them go near

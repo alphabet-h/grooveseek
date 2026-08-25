@@ -676,8 +676,8 @@ fn start_with_indexed_paths(
 }
 
 /// What a client sees of the directory tree, over the transport that carries
-/// it -- the assertion the unit tests below `segment_tree` cannot make, because
-/// they never go through the SQL, the `TopicInfo` -> `TopicEntry` copy, or
+/// it -- the assertion the tree builder's unit tests in the db layer cannot
+/// make, because they never go through the SQL, the domain-to-wire copy, or
 /// serde.
 ///
 /// `deep-dive/other/notes/x.md` is filed under topic `mcp` even though its
