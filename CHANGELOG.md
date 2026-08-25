@@ -16,6 +16,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **A sentence that says it lists every command is now compared with the
+  binary.** `README.md`, `README.ja.md` and the two `docs/index` pages each
+  open their reference table with "Every command: `index`, `serve`, …", and
+  the README once shipped that sentence with `status` missing — nine names
+  under a heading that promises ten. The flag guards could not see it: they
+  read tokens that begin with `--`, and a subcommand name has no such shape.
+  A test in the binary's `documented_flags` module now reads every such
+  sentence and requires the enumerated set to equal `Cli::command()`'s
+  subcommands, nothing missing and nothing extra; the same test pins
+  `groove service <verb>` in both directions against
+  [docs/usage.md](docs/usage.md).
+
 - **A command list copied into a second place now fails the test suite when the
   copies disagree.** Three guards under `grooveseek/tests/` read every Markdown
   page the repository publishes. `docs_commands_subset.rs` reports a page that

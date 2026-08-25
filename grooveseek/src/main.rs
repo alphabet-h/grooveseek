@@ -2724,6 +2724,114 @@ mod documented_flags {
         );
     }
 
+    /// "Every command: `index`, `serve`, …" is a claim about a set, and the set
+    /// has one owner: `Cli::command()`.
+    ///
+    /// The README once listed nine of the ten subcommands under exactly that
+    /// heading — `status` was missing — and nothing noticed, because the flag
+    /// checks above read tokens that start with `--` and a subcommand name has
+    /// no such shape. A sentence that names itself as the whole list is the one
+    /// place where "the list" can be compared with the thing it enumerates, so
+    /// that is what is compared: not that each name appears somewhere, but that
+    /// the enumeration is the set, with nothing missing and nothing extra.
+    ///
+    /// The same is done for `groove service <verb>`: every verb the binary has
+    /// must be shown as a command in `docs/usage.md`, and every verb the pages
+    /// show must be one the binary has. Both directions, like the flags.
+    #[test]
+    fn every_sentence_that_says_every_command_names_exactly_the_commands_the_binary_has() {
+        let cli = Cli::command();
+        let own: BTreeSet<String> = cli
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        let token = regex::Regex::new(r"`([a-z][a-z-]*)`").expect("a valid pattern");
+
+        let mut enumerations = 0;
+        let mut wrong: Vec<String> = Vec::new();
+        for corpus in [Corpus::English, Corpus::Japanese] {
+            for line in published_docs(corpus).lines() {
+                if !(line.contains("Every command")
+                    || line.contains("全コマンド")
+                    || line.contains("全サブコマンド"))
+                {
+                    continue;
+                }
+                let named: BTreeSet<String> = token
+                    .captures_iter(line)
+                    .map(|c| c[1].to_string())
+                    .collect();
+                // Fewer than three names is a mention, not an enumeration.
+                if named.len() < 3 {
+                    continue;
+                }
+                enumerations += 1;
+                if named != own {
+                    wrong.push(format!(
+                        "{}: {}\n    missing: {:?}\n    not a subcommand: {:?}",
+                        corpus.label(),
+                        line.trim(),
+                        own.difference(&named).collect::<Vec<_>>(),
+                        named.difference(&own).collect::<Vec<_>>(),
+                    ));
+                }
+            }
+        }
+        // README.md, README.ja.md, docs/index.md and docs/index.ja.md each
+        // carry one today. If that stops being true this test has lost its
+        // subject, which is a different failure from the list being wrong.
+        assert!(
+            enumerations >= 4,
+            "expected at least four sentences that enumerate every command \
+             (README.md, README.ja.md, docs/index.md, docs/index.ja.md), found \
+             {enumerations}. Either the wording moved away from `Every command` \
+             / `全コマンド` / `全サブコマンド` — update the needle here — or the \
+             enumeration was deleted."
+        );
+        assert!(
+            wrong.is_empty(),
+            "a sentence that says it lists every command does not list \
+             exactly the commands `groove --help` shows:\n  {}\n\
+             The binary is the list; fix the sentence.",
+            wrong.join("\n  ")
+        );
+
+        let own_verbs: BTreeSet<String> = cli
+            .find_subcommand("service")
+            .expect("groove has a `service` subcommand")
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        let verb = regex::Regex::new(r"groove service ([a-z][a-z-]*)").expect("a valid pattern");
+        let mut shown: BTreeSet<String> = BTreeSet::new();
+        for corpus in [Corpus::English, Corpus::Japanese] {
+            shown.extend(
+                verb.captures_iter(&published_docs(corpus))
+                    .map(|c| c[1].to_string()),
+            );
+        }
+        let usage = std::fs::read_to_string(repo_root().join("docs/usage.md"))
+            .expect("docs/usage.md is the page that documents every subcommand");
+        let shown_in_usage: BTreeSet<String> = verb
+            .captures_iter(&usage)
+            .map(|c| c[1].to_string())
+            .collect();
+
+        let undocumented: Vec<&String> = own_verbs.difference(&shown_in_usage).collect();
+        assert!(
+            undocumented.is_empty(),
+            "docs/usage.md never shows these as `groove service <verb>`: {undocumented:?}. \
+             Show each verb as a command a reader can run, not only in prose."
+        );
+        let stray: Vec<&String> = shown.difference(&own_verbs).collect();
+        assert!(
+            stray.is_empty(),
+            "the documentation shows `groove service <verb>` for verbs the binary \
+             lacks: {stray:?}. Either the verb was renamed and the pages were not, \
+             or it never existed."
+        );
+    }
+
     /// `/mcp__<server>__<name>` — and `<server>` is not ours to name.
     ///
     /// A client builds that path from the key the **user** wrote in their
