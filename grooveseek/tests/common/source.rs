@@ -91,9 +91,11 @@ pub fn source_dirs() -> Vec<PathBuf> {
 /// in git is reported like any other, which is the right answer for a stray
 /// `.orig` or a scratch module -- it is in the tree the binary is built from.
 ///
-/// The one exception is a name starting with a dot. `.DS_Store` and an
-/// editor's swap file are on one machine only, and reporting them would make
-/// this check answer differently on every machine.
+/// Nothing is filtered here, dot-prefixed names included. The stderr guard
+/// reads every `.rs` the compiler might, and `#[path = ".generated.rs"]` is
+/// one; a walk that dropped it would let that module's diagnostics go
+/// unchecked (codex P2 on PR #231). A caller that wants machine-local
+/// artifacts such as `.DS_Store` out of its answer drops them itself.
 ///
 /// A walk error is fatal rather than skipped, for the reason
 /// [`super::docs::markdown_files`] gives: `.flatten()` would drop the
@@ -102,10 +104,7 @@ pub fn source_tree() -> BTreeSet<String> {
     let root = repo_root();
     let mut found = BTreeSet::new();
     for dir in source_dirs() {
-        let entries = walkdir::WalkDir::new(&dir)
-            .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'));
-        for entry in entries {
+        for entry in walkdir::WalkDir::new(&dir) {
             let entry = entry.unwrap_or_else(|e| {
                 panic!(
                     "the walk from {} failed partway through, so the tree it \

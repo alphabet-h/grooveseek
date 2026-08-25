@@ -17,7 +17,10 @@
 //! guard that sees different things locally and in CI is the property
 //! `docs_links_resolve.rs` refuses. So a stray file under `src` fails here on
 //! the machine it is on, which is the right answer for a file the binary is
-//! built from.
+//! built from. The one thing not asked for a row is a name starting with a
+//! dot -- `.DS_Store`, a swap file -- which is on one machine only; that is
+//! decided here, not in the walk, because the stderr guard shares the walk
+//! and reads every `.rs` the compiler might.
 //!
 //! # What is checked
 //!
@@ -361,6 +364,16 @@ fn extensions_of(table: &Table, members: &[String], tree: &BTreeSet<String>) -> 
         .collect()
 }
 
+/// Whether a path has a component starting with a dot: `.DS_Store`, an
+/// editor's swap file, a tool's cache directory. Those are on one machine
+/// only, and asking for a row for them would make this check answer
+/// differently on every machine. They are dropped from the "missing" side
+/// here, not from the walk, because the stderr guard shares that walk and
+/// has to see a `.rs` the compiler is pointed at by `#[path]`.
+fn is_machine_local(path: &str) -> bool {
+    path.split('/').any(|part| part.starts_with('.'))
+}
+
 /// Whether anything in the tree lives under `dir` (which ends in `/`).
 fn tree_has_dir(tree: &BTreeSet<String>, dir: &str) -> bool {
     tree.range(dir.to_string()..)
@@ -412,7 +425,10 @@ fn drift(table: &Table, members: &[String], tree: &BTreeSet<String>) -> Drift {
     }
 
     let mut missing: Vec<String> = Vec::new();
-    for f in tree.iter().filter(|f| under_enumerated(f)) {
+    for f in tree
+        .iter()
+        .filter(|f| under_enumerated(f) && !is_machine_local(f))
+    {
         if lines_by_path.contains_key(f.as_str()) {
             continue;
         }
@@ -896,6 +912,35 @@ fn a_directory_row_for_a_directory_the_tree_does_not_have_is_stale() {
             (30, "grooveseek/src/gone/".to_string()),
             (30, "grooveseek/src/gone/x.rs".to_string()),
         ]
+    );
+}
+
+#[test]
+fn a_dot_prefixed_name_is_not_asked_for_a_row_but_is_still_in_the_tree() {
+    // `.DS_Store` is on one machine only, so no row is demanded for it; a row
+    // that names a dot-prefixed file is still compared with the tree.
+    let table = Table {
+        rows: vec![
+            row(11, "grooveseek/src/lib.rs", &[]),
+            row(12, "grooveseek/src/.generated.rs", &[]),
+        ],
+        ..Default::default()
+    };
+    let seen = tree(&[
+        "grooveseek/src/lib.rs",
+        "grooveseek/src/.DS_Store",
+        "grooveseek/src/.generated.rs",
+        "grooveseek/src/.cache/scratch.rs",
+    ]);
+    let d = drift(&table, &members(&["grooveseek"]), &seen);
+    assert!(d.missing.is_empty(), "{:?}", d.missing);
+    assert!(d.stale.is_empty(), "{:?}", d.stale);
+
+    let gone = tree(&["grooveseek/src/lib.rs"]);
+    let d = drift(&table, &members(&["grooveseek"]), &gone);
+    assert_eq!(
+        d.stale,
+        vec![(12, "grooveseek/src/.generated.rs".to_string())]
     );
 }
 
