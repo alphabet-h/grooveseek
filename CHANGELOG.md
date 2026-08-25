@@ -42,6 +42,40 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **Every line of a shell block in the documentation is now accounted for.**
+  The reader behind the command-copy guards (#229) was checked one block at a
+  time: a fenced shell block that yielded no command failed the suite, but a
+  block that yielded one command and dropped the rest passed, and because both
+  translations dropped the same lines, the guards comparing them compared
+  nothing there and stayed quiet. `common::docs::read_block` now returns every
+  raw line of a block with what the reader made of it -- an instruction, a
+  continuation, a heredoc payload, a blank, a comment, grammar, or unread with
+  the reason -- and `command_lines` is a filter over it, so the function that
+  decides a line is not a command is the one that says why. A new guard in
+  `docs_commands_subset.rs` fails on any line left unread, naming the page,
+  the line and the reason.
+
+  Written against today's tree, the guard named thirteen lines in three
+  shapes, and the reader learned each: a quoted argument that closes lines
+  later (`python -c "` in the Windows quirks skill, `jq '` in the full-audit
+  command -- the payload is now part of the instruction, and the `&& mv`
+  chained after `jq`'s closing quote is compared for the first time), the arms
+  of a `case` (the pattern is a branch condition and `;;` is grammar; what
+  stands between them is read), and a PowerShell assignment (`$action =
+  New-ScheduledTaskAction ...` keeps the cmdlet, as `NEXT_ID=$(jq ...)` keeps
+  `jq`). Before this, a payload line of that `python -c` block was being read
+  as a shell assignment.
+
+  What never closes is reported rather than swallowed: a quote open at the end
+  of a block, a heredoc without its terminator, a `\` on the last line -- each
+  of which used to take every line under it into silence. Four things the old
+  reader did are gone, none of which any page relied on: a `\` at the end of a
+  comment continued the line, a `<<` inside a comment opened a heredoc, a `\`
+  inside an open quote was a continuation, and that last-line `\` vanished.
+  The block-against-block count the subset guard's header quotes moved from
+  fifteen to sixteen: the `jq` block now names `mv`, and the block above it,
+  which runs `jq` alone, is a subset of it.
+
 - **The source layout table in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
   is now compared with the tree.** The table went unrepaired across #195,
   #196 and #197, which each split a module out of `server.rs`, and #212,

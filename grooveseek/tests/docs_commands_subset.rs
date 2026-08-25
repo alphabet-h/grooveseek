@@ -29,14 +29,22 @@
 //! named by path is the same program: `/usr/local/bin/groove index` and
 //! `groove index` are one instruction written for two installations.
 //!
+//! Underneath that, two guards on the reader itself, because every defect this
+//! file's history records took the same shape -- a line the reader did not
+//! understand was dropped, both translations dropped it alike, and the guards
+//! comparing them agreed by both holding nothing. Every fenced shell block in
+//! the corpus has to name at least one command, and every line of every such
+//! block has to be placed: an instruction, a continuation, a heredoc payload,
+//! a blank, a comment, grammar -- or reported, with the reason.
+//!
 //! # What this cannot catch
 //!
 //! **Block against block, and page against page.** Two fenced blocks on one page
-//! stand in this relation fifteen times in this repository today -- `AGENTS.md`
+//! stand in this relation sixteen times in this repository today -- `AGENTS.md`
 //! lists three commands to run while working and five that reproduce CI,
 //! `docs/usage.md` shows one `groove` subcommand at a time and then all three
 //! under `RUST_LOG` -- and every one of them is deliberate. A rule symmetric
-//! enough to catch a copied block would fail on all fifteen, and a guard that
+//! enough to catch a copied block would fail on all sixteen, and a guard that
 //! cries wolf gets switched off. Copies that span pages are held by
 //! `docs_commands_pinned.rs`; copies between an English page and its Japanese
 //! twin by `docs_commands_twins.rs`. Neither of those discovers a new copy: they
@@ -515,6 +523,266 @@ fn a_trailing_comment_goes_but_a_hash_inside_an_argument_stays() {
 }
 
 #[test]
+fn every_line_of_a_block_is_placed_and_the_place_is_its_page_line() {
+    use common::docs::{LineRead, fenced_blocks, read_block};
+    // A fence at the top level and one inside a list item, both with a blank
+    // line inside: pulldown-cmark strips the item's indent from the body, and
+    // this pins that it keeps the blank line, so `block.line + 1 + index` is the
+    // page line of the raw line -- the number a failure has to name.
+    let markdown = "# T\n\n```bash\ncargo test\n\ncargo doc\n```\n\n- item\n\n   ```bash\n   groove index\n\n   groove status\n   ```\n";
+    let page: Vec<&str> = markdown.lines().collect();
+    let blocks = fenced_blocks(markdown);
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    for block in &blocks {
+        let lines = read_block(&block.body);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        for line in &lines {
+            let at = block.line + 1 + line.index;
+            assert_eq!(page[at - 1].trim(), line.raw.trim(), "{block:?} {line:?}");
+        }
+        assert_eq!(lines[1].read, LineRead::Blank, "{lines:?}");
+    }
+    // Every class the reader can answer, on one body, in the order the lines
+    // come: a comment, a blank, a heredoc opener and its payload and terminator,
+    // a continued instruction and the line it continues onto.
+    let placed = read_block(
+        "# only a comment\n\ncat <<EOF\npayload\nEOF\ngroove index \\\n  --kb-path ./kb\n",
+    );
+    let reads: Vec<&LineRead> = placed.iter().map(|l| &l.read).collect();
+    assert_eq!(
+        reads,
+        vec![
+            &LineRead::Comment,
+            &LineRead::Blank,
+            &LineRead::Instruction("cat <<EOF".to_string()),
+            &LineRead::HeredocBody,
+            &LineRead::HeredocBody,
+            &LineRead::Instruction("groove index --kb-path ./kb".to_string()),
+            &LineRead::Continued,
+        ],
+        "{placed:?}"
+    );
+}
+
+#[test]
+fn an_argument_that_continues_onto_the_next_line_is_part_of_the_instruction() {
+    use common::docs::{LineRead, heads_of, read_block};
+    // `.claude/skills/windows-quirks/SKILL.md` opens `python -c "` and closes
+    // the quote three lines down. The payload is what the reader runs, so it is
+    // part of the instruction -- the same reason `RUST_LOG=...` is kept -- and
+    // the lines it spans are continuations, not instructions of their own.
+    // Before this, `b=open(...)` inside the quote read as an assignment.
+    let placed = read_block("python -c \"\nb=1\n\"\n");
+    let reads: Vec<&LineRead> = placed.iter().map(|l| &l.read).collect();
+    assert_eq!(
+        reads,
+        vec![
+            &LineRead::Instruction("python -c \" b=1 \"".to_string()),
+            &LineRead::Continued,
+            &LineRead::Continued,
+        ],
+        "{placed:?}"
+    );
+    // `.claude/commands/full-audit.md` feeds jq a quoted filter over nine
+    // lines and chains `&& mv` after the closing quote. The chain is outside
+    // the quote, so both programs are named.
+    let lines =
+        command_lines("jq '.a += [\n  {\n    \"id\": 1\n  }\n]' f > /tmp/g && mv /tmp/g f\n");
+    assert_eq!(
+        lines,
+        vec!["jq '.a += [ { \"id\": 1 } ]' f > /tmp/g && mv /tmp/g f".to_string()],
+        "{lines:?}"
+    );
+    let heads = heads_of(&lines);
+    assert!(heads.contains("jq") && heads.contains("mv"), "{heads:?}");
+    // A translated payload is a drifted instruction, which the twin guard
+    // compares whole lines to see.
+    assert_ne!(
+        command_lines("python -c \"\na\n\"\n"),
+        command_lines("python -c \"\nb\n\"\n")
+    );
+}
+
+#[test]
+fn a_hash_inside_an_open_quote_is_not_a_comment_and_a_quote_inside_a_comment_opens_nothing() {
+    // Inside the quote, `#` is payload.
+    let lines = command_lines("python -c \"\n# not a comment\n\"\n");
+    assert_eq!(
+        lines,
+        vec!["python -c \" # not a comment \"".to_string()],
+        "{lines:?}"
+    );
+    // Inside a comment, an apostrophe is prose. `docs/usage.md` writes
+    // `# default 'groove'` after a command, and a comment that carried its
+    // quote to the next line would swallow the rest of the block.
+    let lines = command_lines("cargo test # it's\ncargo doc\n");
+    assert_eq!(
+        lines,
+        vec!["cargo test".to_string(), "cargo doc".to_string()],
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_backslash_inside_an_open_quote_is_a_character() {
+    // Outside quotes a trailing backslash continues the line and is dropped.
+    // Inside, it is part of the argument, and the line continues anyway
+    // because the quote is still open.
+    let lines = command_lines("python -c \"\nprint(1) \\\n\"\n");
+    assert_eq!(
+        lines,
+        vec!["python -c \" print(1) \\ \"".to_string()],
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_quote_that_never_closes_is_reported_rather_than_swallowed() {
+    use common::docs::{LineRead, read_block};
+    let placed = read_block("echo \"a\ncargo test\n");
+    assert!(
+        matches!(&placed[0].read, LineRead::Unread(why) if why.contains("never closes")),
+        "{placed:?}"
+    );
+    assert_eq!(placed[1].read, LineRead::Continued, "{placed:?}");
+    assert!(command_lines("echo \"a\ncargo test\n").is_empty());
+}
+
+#[test]
+fn a_heredoc_opener_with_a_quote_still_open_is_not_finished() {
+    use common::docs::{LineRead, read_block};
+    // The shell reads the body after the line that completes the command, and
+    // a line with a quote still open has not completed it. So the quote
+    // continues (codex P2 on #233: closing the group at the opener discarded
+    // the quote and let a malformed block pass), the body starts after the
+    // line that closes it, and a quote that never closes is reported -- which
+    // is also what keeps a terminator from being swallowed in silence.
+    let lines = command_lines("cat <<EOF \"\n\"\nbody\nEOF\ngroove index\n");
+    assert_eq!(
+        lines,
+        vec!["cat <<EOF \" \"".to_string(), "groove index".to_string()],
+        "{lines:?}"
+    );
+    let placed = read_block("cat <<'EOF' \"\nbody\nEOF\ngroove index\n");
+    assert!(
+        matches!(&placed[0].read, LineRead::Unread(why) if why.contains("never closes")),
+        "{placed:?}"
+    );
+    assert!(command_lines("cat <<'EOF' \"\nbody\nEOF\ngroove index\n").is_empty());
+}
+
+#[test]
+fn a_heredoc_that_never_terminates_is_reported_rather_than_swallowed() {
+    use common::docs::{LineRead, read_block};
+    let placed = read_block("cat <<EOF\nbody\ngroove index\n");
+    assert!(
+        matches!(&placed[0].read, LineRead::Unread(why) if why.contains("never terminates")),
+        "{placed:?}"
+    );
+    assert!(command_lines("cat <<EOF\nbody\ngroove index\n").is_empty());
+}
+
+#[test]
+fn a_case_arm_is_read_as_the_instruction_it_runs() {
+    use common::docs::{LineRead, heads_of, read_block};
+    // `.claude/commands/feature-flow.md` commits `.dev` inside a `case` on the
+    // repository root. The pattern is a branch condition, not an instruction,
+    // and `;;` is grammar; what stands between them is what the reader runs,
+    // and it was invisible to every guard.
+    let lines = command_lines(
+        "case x in\n  */.dev) git -C .dev push ;;\n  *) echo \"a; b\" >&2; exit 1 ;;\nesac\n",
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "case x in".to_string(),
+            "git -C .dev push".to_string(),
+            "echo \"a; b\" >&2; exit 1".to_string(),
+        ],
+        "{lines:?}"
+    );
+    let heads = heads_of(&lines);
+    for head in ["git", "echo", "exit"] {
+        assert!(heads.contains(head), "{heads:?}");
+    }
+    // A label on a line of its own, a `;;` on its own and `esac` are grammar:
+    // placed, contributing nothing, and not unread.
+    let placed = read_block("case x in\n  a)\n    ls\n    ;;\n  *) ;;\nesac\n");
+    let reads: Vec<&LineRead> = placed.iter().map(|l| &l.read).collect();
+    assert_eq!(
+        reads,
+        vec![
+            &LineRead::Instruction("case x in".to_string()),
+            &LineRead::Syntax,
+            &LineRead::Instruction("ls".to_string()),
+            &LineRead::Syntax,
+            &LineRead::Syntax,
+            &LineRead::Syntax,
+        ],
+        "{placed:?}"
+    );
+    // Outside a `case`, a word ending in `)` is not a label.
+    let outside = read_block("foo) bar\n");
+    assert!(
+        matches!(outside[0].read, LineRead::Unread(_)),
+        "{outside:?}"
+    );
+}
+
+#[test]
+fn every_word_in_syntax_only_reads_as_syntax_on_a_line_of_its_own() {
+    use common::docs::{LineRead, SYNTAX_ONLY, read_block};
+    // The list is exact whole-line matches, so each entry is a class of its own
+    // that nothing else exercises; each has to be seen to be placed.
+    for word in SYNTAX_ONLY {
+        let placed = read_block(&format!("{word}\n"));
+        assert_eq!(placed[0].read, LineRead::Syntax, "{word}");
+    }
+}
+
+#[test]
+fn a_powershell_assignment_is_an_instruction_and_names_the_cmdlet_it_runs() {
+    use common::docs::{LineRead, head_of, read_block};
+    // `CHANGELOG.md`'s service migration note assigns the result of a cmdlet:
+    // `$action = New-ScheduledTaskAction ...`. The `=` is its own token, unlike
+    // POSIX `NAME=value`, and the line runs the cmdlet, so it keeps the program
+    // the way `NEXT_ID=$(jq ...)` does.
+    assert_eq!(
+        head_of("$action = New-ScheduledTaskAction -Execute x").as_deref(),
+        Some("New-ScheduledTaskAction")
+    );
+    // Setting a variable to a value is still an instruction, with no program.
+    assert_eq!(command_lines("$x = 5\n"), vec!["$x = 5".to_string()]);
+    assert_eq!(head_of("$x = 5"), None);
+    // A comparison is not an assignment.
+    let compared = read_block("$x == 5\n");
+    assert!(
+        matches!(compared[0].read, LineRead::Unread(_)),
+        "{compared:?}"
+    );
+    // The POSIX shape is unchanged.
+    assert_eq!(
+        command_lines("S=<scratchpad>\n"),
+        vec!["S=<scratchpad>".to_string()]
+    );
+}
+
+#[test]
+fn a_continuation_on_the_last_line_is_reported_rather_than_dropped() {
+    use common::docs::{LineRead, read_block};
+    // A trailing backslash with nothing after it used to leave the joined text
+    // in a buffer the loop never flushed, so the line vanished from the block
+    // without a word. It is still not a command; now it is said to be nothing.
+    let placed = read_block("cargo test \\\n");
+    assert_eq!(placed.len(), 1, "{placed:?}");
+    assert!(
+        matches!(&placed[0].read, LineRead::Unread(why) if why.contains("continuation")),
+        "{placed:?}"
+    );
+    assert!(command_lines("cargo test \\\n").is_empty());
+}
+
+#[test]
 fn a_continued_line_is_one_command() {
     let lines =
         command_lines("groove search \"tokio spawn\" \\\n  --kb-path ./kb \\\n  --limit 3\n");
@@ -572,6 +840,10 @@ fn one_program_run_twice_is_two_instructions_but_not_a_possible_copy() {
 /// read it. Whether that block is compared against anything today is beside the
 /// point: it is the shape that goes silent, and it cannot be in the tree.
 ///
+/// This is the coarse half. A block that yields one command and drops three is
+/// read as far as this guard can tell; the line guard below asks about the
+/// three.
+///
 /// The rule for an exception, if one is ever needed: it goes in a list with the
 /// reason, the way `common::docs::SKIPPED_PATHS` does. There is nothing to
 /// exempt today.
@@ -625,6 +897,78 @@ fn every_shell_block_in_the_corpus_names_a_command() {
          appeared here so far was a syntax it did not know, and each one was \
          invisible to all three guards until someone read the block by hand.",
         silent.join("\n  ")
+    );
+}
+
+/// No line of a shell block is left unread.
+///
+/// The block guard above fails when a block yields nothing. It passes a block
+/// that yields one command and drops the other three, and both translations
+/// drop the same three, so the guards that compare them compare nothing there
+/// and stay quiet. This asks the reader to account for every line: an
+/// instruction, a continuation, a heredoc payload, a blank, a comment -- and a
+/// line it cannot place is reported here with the reason.
+///
+/// A new variant of [`common::docs::LineRead`] has to be placed in the `match`
+/// below by hand:
+/// there is no wildcard arm, so the compiler asks whether the new class is
+/// reported or accounted for, which is the question a silent class skips.
+#[test]
+fn no_line_in_a_shell_block_in_the_corpus_is_left_unread() {
+    use common::docs::{LineRead, read_block};
+    use std::collections::BTreeMap;
+    let root = repo_root();
+    let mut unread: Vec<String> = Vec::new();
+    let mut seen: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for file in markdown_files(&root) {
+        let shown = shown(&root, &file);
+        let markdown = read(&file);
+        for block in shell_blocks(&markdown) {
+            for line in read_block(&block.body) {
+                let at = block.line + 1 + line.index;
+                let class = match &line.read {
+                    LineRead::Instruction(_) => "instruction",
+                    LineRead::Continued => "continued",
+                    LineRead::HeredocBody => "heredoc",
+                    LineRead::Blank => "blank",
+                    LineRead::Comment => "comment",
+                    LineRead::Syntax => "syntax",
+                    LineRead::Unread(why) => {
+                        unread.push(format!("{shown}:{at} `{}` -- {why}", line.raw.trim()));
+                        continue;
+                    }
+                };
+                seen.entry(class).or_default().insert(shown.clone());
+            }
+        }
+    }
+    // Every class the reader can answer is answered on a page known to need
+    // it. A class that stops being produced is a reader that stopped seeing a
+    // shape, and "some line somewhere was continued" would not notice.
+    for (class, page) in [
+        ("instruction", "AGENTS.md"),
+        // A `\` continuation, and a quote that closes lines later.
+        ("continued", "docs/usage.md"),
+        ("continued", ".claude/skills/windows-quirks/SKILL.md"),
+        ("heredoc", "docs/usage.md"),
+        ("comment", "docs/usage.md"),
+        ("blank", "docs/usage.md"),
+        // `esac`, and the arms of the one `case` in the tree.
+        ("syntax", ".claude/commands/feature-flow.md"),
+    ] {
+        assert!(
+            seen.get(class).is_some_and(|pages| pages.contains(page)),
+            "no line in {page} was read as {class}, so either the walk stopped \
+             reaching it or the reader stopped seeing that shape"
+        );
+    }
+    unread.sort();
+    assert!(
+        unread.is_empty(),
+        "these lines sit in blocks tagged as shell and the reader could not \
+         place them, so no guard is comparing them and none will say so:\n  {}\n\
+         Teach the reader the shape rather than the page.",
+        unread.join("\n  ")
     );
 }
 
@@ -683,8 +1027,12 @@ fn the_block_subset_relation_this_guard_refuses_is_still_common() {
             }
         }
     }
-    // The header says "fifteen times". If this count moves, that sentence is
+    // The header says "sixteen times". If this count moves, that sentence is
     // wrong and has to move with it -- a number written beside a claim goes
     // stale on its own, and this file exists because of that class of defect.
-    assert_eq!(pairs.len(), 15, "{pairs:#?}");
+    // It moved from fifteen when the reader learned to follow a quoted argument
+    // across lines: the `jq` block in `.claude/commands/full-audit.md` then
+    // named the `mv` chained after its closing quote, and the block above it,
+    // which runs `jq` alone, became a subset of it.
+    assert_eq!(pairs.len(), 16, "{pairs:#?}");
 }

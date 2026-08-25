@@ -321,64 +321,91 @@ pub fn shell_blocks(markdown: &str) -> Vec<FencedBlock> {
         .collect()
 }
 
-/// The first occurrence of `needle` that is not inside single or double quotes.
+/// The byte ranges of `line` that lie outside single or double quotes, given
+/// the quote (if any) still open when the line started, and the quote (if any)
+/// still open when it ends.
 ///
-/// The scan is over bytes and the comparison is between bytes, because these
-/// pages are bilingual: slicing the `str` at a byte offset to compare there
-/// panics the moment the offset lands inside a Japanese character. Every needle
-/// and every quote here is ASCII, and an ASCII byte never occurs inside a
-/// multi-byte UTF-8 sequence, so a byte match is always at a character boundary
-/// and the offset returned is safe to slice at.
-fn find_unquoted(line: &str, needle: &str) -> Option<usize> {
+/// Every question about quoting in this file goes through here: where a `#`
+/// starts a comment, where `&&` splits a chain, where `<<` opens a heredoc.
+/// Two copies of the scan agreed right up until one of them needed to carry a
+/// quote across a line, which is the shape `AGENTS.md` says to collapse before
+/// adding the condition.
+///
+/// Bytes, not chars, because these pages are bilingual: slicing the `str` at a
+/// byte offset to compare there panics the moment the offset lands inside a
+/// Japanese character. Every needle and every quote here is ASCII, and an
+/// ASCII byte never occurs inside a multi-byte UTF-8 sequence, so a byte match
+/// is always at a character boundary and the offset returned is safe to slice
+/// at. Backslash escapes inside quotes are not handled; no line in this corpus
+/// needs them.
+fn unquoted_spans(line: &str, open_in: Option<u8>) -> (Vec<std::ops::Range<usize>>, Option<u8>) {
     let bytes = line.as_bytes();
-    let needle = needle.as_bytes();
-    let mut quote: Option<u8> = None;
-    for i in 0..bytes.len() {
+    let mut spans = Vec::new();
+    let mut quote = open_in;
+    let mut start = if quote.is_none() { Some(0) } else { None };
+    for (i, &byte) in bytes.iter().enumerate() {
         match quote {
             Some(q) => {
-                if bytes[i] == q {
+                if byte == q {
                     quote = None;
+                    start = Some(i + 1);
                 }
             }
             None => {
-                if bytes[i] == b'\'' || bytes[i] == b'"' {
-                    quote = Some(bytes[i]);
-                } else if bytes[i..].starts_with(needle) {
-                    return Some(i);
+                if byte == b'\'' || byte == b'"' {
+                    quote = Some(byte);
+                    if let Some(s) = start.take() {
+                        spans.push(s..i);
+                    }
                 }
             }
         }
     }
-    None
+    if let Some(s) = start {
+        spans.push(s..bytes.len());
+    }
+    (spans, quote)
+}
+
+/// The first occurrence of `needle` that is not inside single or double quotes.
+fn find_unquoted(line: &str, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    let (spans, _) = unquoted_spans(line, None);
+    spans.into_iter().find_map(|r| {
+        line.as_bytes()[r.clone()]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|at| r.start + at)
+    })
+}
+
+/// Where a trailing `# comment` starts on this line, if one does, given the
+/// quote open when the line began -- and the quote still open at the end of
+/// what is not comment.
+///
+/// A `#` only starts a comment at the start of a word and outside quotes, so
+/// `groove search "a #b"` keeps its argument. The comment runs to the end of
+/// the line, so an apostrophe inside it -- `# default 'groove'`, or a
+/// `retriever's` -- opens nothing that the next line would have to close.
+fn comment_start(line: &str, open_in: Option<u8>) -> (Option<usize>, Option<u8>) {
+    let bytes = line.as_bytes();
+    let (spans, open_out) = unquoted_spans(line, open_in);
+    for r in spans {
+        for i in r {
+            if bytes[i] == b'#' && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+                return (Some(i), unquoted_spans(&line[..i], open_in).1);
+            }
+        }
+    }
+    (None, open_out)
 }
 
 /// The line with any trailing `# comment` removed.
-///
-/// A `#` only starts a comment at the start of a word and outside quotes, so
-/// `groove search "a #b"` keeps its argument. Backslash escapes inside quotes
-/// are not handled; no line in this corpus needs them.
 fn without_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut quote: Option<u8> = None;
-    for i in 0..bytes.len() {
-        match quote {
-            Some(q) => {
-                if bytes[i] == q {
-                    quote = None;
-                }
-            }
-            None => {
-                if bytes[i] == b'\'' || bytes[i] == b'"' {
-                    quote = Some(bytes[i]);
-                } else if bytes[i] == b'#'
-                    && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t')
-                {
-                    return &line[..i];
-                }
-            }
-        }
+    match comment_start(line, None).0 {
+        Some(at) => &line[..at],
+        None => line,
     }
-    line
 }
 
 /// The delimiter a heredoc on this line opens, if it opens one.
@@ -534,6 +561,27 @@ fn strip_env_prefix(tokens: &mut Vec<String>) {
     }
 }
 
+/// Whether the tokens open with a PowerShell assignment: `$action = New-...`.
+///
+/// The spelling differs from POSIX `NAME=value` in the one way that matters
+/// here -- the `=` is its own token -- so [`assignment_value`] never sees it.
+/// Not gated on the fence's tag: a `$x = y` line in a bash fence would run
+/// whatever `$x` holds with `=` as its argument, which nobody writes, and the
+/// tag is not carried this far by any caller.
+fn is_powershell_assignment(tokens: &[String]) -> bool {
+    tokens.len() >= 2
+        && tokens[1] == "="
+        && tokens[0].strip_prefix('$').is_some_and(is_program_name)
+}
+
+/// Drop a leading `$name =`, so a line that assigns what a cmdlet returns
+/// keeps the cmdlet -- `NEXT_ID=$(jq ...)` keeps `jq` for the same reason.
+fn strip_powershell_assignment(tokens: &mut Vec<String>) {
+    if is_powershell_assignment(tokens) {
+        tokens.drain(..2);
+    }
+}
+
 /// Step past a subshell's opening parenthesis.
 ///
 /// `(gh run list ...) | Where-Object { ... }` runs `gh`; the bracket is
@@ -567,6 +615,7 @@ fn strip_wrappers(tokens: &mut Vec<String>) {
         strip_subshell(tokens);
         strip_env_prefix(tokens);
         strip_sudo(tokens);
+        strip_powershell_assignment(tokens);
         // Length alone is not progress any more: unwrapping an assignment that
         // runs something rewrites the first token instead of removing it.
         if (tokens.len(), tokens.first().cloned()) == before {
@@ -610,72 +659,284 @@ pub fn head_of(fragment: &str) -> Option<String> {
     Some(head)
 }
 
-/// The command lines of a block body, normalised.
+/// What the reader made of one raw line of a shell block.
 ///
-/// Heredoc bodies are dropped: they are data, and reading them as commands both
-/// invents head names out of the payload and makes a translated payload look
-/// like a drifted command. Continuations are joined, comments removed,
-/// whitespace squeezed, and anything whose first word cannot start a command --
-/// JSON braces, prose, transcript output -- is left out.
-///
-/// The heredoc and the continuation are tracked in **one** pass, and the order
-/// matters. Joining continuations first lets a heredoc body line ending in `\`
-/// swallow the line after it -- and if that line was the terminator, the skip
-/// never ends and every command below it disappears from a block that still
-/// looks like it was read. A payload is text, so a backslash at the end of one
-/// is a character rather than a continuation.
-pub fn command_lines(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut pending = String::new();
-    let mut skip_until: Option<String> = None;
+/// Every line lands in exactly one variant. A line the reader cannot place is
+/// [`Unread`](Self::Unread), with the reason, and the line guard in
+/// `docs_commands_subset.rs` reports those. There is no "ignored" variant, and
+/// adding one is the way that guard would go quiet: a class that is neither
+/// reported nor accounted for is a line dropped in silence, which is the
+/// failure this file exists to refuse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LineRead {
+    /// An instruction, normalised the way [`command_lines`] always has.
+    Instruction(String),
+    /// Joined onto the instruction that started above it by a `\` continuation.
+    Continued,
+    /// A heredoc's payload, or its terminator.
+    HeredocBody,
+    /// Nothing but whitespace.
+    Blank,
+    /// Nothing but a `#` comment.
+    Comment,
+    /// Shell grammar with no operand: one of [`SYNTAX_ONLY`] on a line of its
+    /// own, or a `case` arm's pattern standing alone.
+    Syntax,
+    /// The reader could not place it, and why not. ASCII, for the failure
+    /// message; the line itself is quoted beside it.
+    Unread(String),
+}
 
-    for raw in body.lines() {
-        if let Some(tag) = skip_until.as_deref() {
+/// Reserved words that carry no operand, and are grammar rather than an
+/// instruction when they fill a line by themselves.
+///
+/// Exact whole-line matches only, and only the words this corpus writes that
+/// way: `esac` closes the one `case` in `.claude/commands/feature-flow.md`,
+/// `;;` ends an arm. A word that takes an operand -- `if`, `for`, `case` --
+/// keeps being read as the instruction it introduces, since its operand is
+/// text a translation can get wrong. The rest of the family (`then`, `fi`,
+/// `do`, `done`, `{`, `}`) is not here because nothing in the tree writes it
+/// on a line of its own: a class no page exercises is one the guard cannot be
+/// seen to place, and it is added the day the line guard names one.
+pub const SYNTAX_ONLY: &[&str] = &["esac", ";;"];
+
+/// One raw line of a block body and what the reader made of it.
+#[derive(Clone, Debug)]
+pub struct ReadLine {
+    /// 0-based index into `body.lines()`. The page line is
+    /// `block.line + 1 + index`: the body starts on the line after the fence.
+    pub index: usize,
+    /// The line as the page writes it, for quoting in a failure.
+    pub raw: String,
+    pub read: LineRead,
+}
+
+/// Every raw line of a block body, and what the reader made of each.
+///
+/// Heredoc bodies are data, and reading them as commands both invents head
+/// names out of the payload and makes a translated payload look like a drifted
+/// command. Continuations are joined, comments removed, whitespace squeezed,
+/// and anything whose first word cannot start a command -- JSON braces, prose,
+/// transcript output -- is [`LineRead::Unread`] with the reason.
+///
+/// An instruction spans lines in two ways: a `\` at the end of a line, and a
+/// quote that opens on one line and closes on a later one -- `python -c "` with
+/// the program on the lines below, `jq '` with the filter. Everything inside
+/// the quote is part of the argument, so the payload is part of the
+/// instruction (the same reason an environment prefix is kept), and a
+/// translated payload is a drifted instruction.
+///
+/// One pass over the raw lines, in this order, and the order is what keeps the
+/// reader from swallowing what it should not:
+///
+/// 1. A heredoc body is skipped on the raw line, before anything else. Nothing
+///    in a payload -- a `\`, an odd quote -- reaches the rules below, so a
+///    payload line ending in `\` cannot absorb the terminator after it.
+/// 2. The comment on **this** raw line is stripped, given the quote carried in
+///    from the line above. This precedes the quote decision: `# default
+///    'groove'`, and a `retriever's` in a comment, would otherwise open a quote
+///    that swallows the rest of the block.
+/// 3. A `\` at the end of what is left continues the line -- outside quotes
+///    only. Inside a quote the backslash is a character.
+/// 4. A heredoc opener ends the instruction here, once no quote is open: the
+///    body starts on the next line and rule 1 takes it. The shell reads the
+///    body after the line that *completes* the command, and a line with a
+///    quote still open has not completed it -- so it falls to rule 5, and the
+///    body begins after the line that closes the quote.
+/// 5. A quote still open continues the line.
+///
+/// What never closes is reported, not swallowed: a quote open at the end of the
+/// block, a heredoc without its terminator, a `\` on the last line. Each of
+/// those used to take every line under it into silence -- and the first is
+/// what keeps a quote from swallowing a terminator, since the opener is
+/// reported rather than the lines under it being skipped.
+///
+/// Four things the first reader did that this one does not, none of which any
+/// page in the tree relies on: a `\` at the end of a comment continued the
+/// line; a `<<` inside a comment opened a heredoc; a `\` at the end of a line
+/// inside an open quote was a continuation rather than a character; and a `\`
+/// on the block's last line vanished without a word.
+pub fn read_block(body: &str) -> Vec<ReadLine> {
+    /// The instruction being assembled across lines.
+    struct Group {
+        /// The line it started on.
+        start: usize,
+        /// Its text so far, comments removed, lines joined by one space.
+        text: String,
+        /// The quote still open at the end of the text, if one is.
+        open: Option<u8>,
+    }
+    let mut out: Vec<ReadLine> = Vec::new();
+    let mut group: Option<Group> = None;
+    // The heredoc being skipped: its terminator, and the line that opened it.
+    let mut skip_until: Option<(String, usize)> = None;
+    // Between `case ... in` and `esac`, where a line may open with a pattern.
+    let mut in_case = false;
+
+    for (index, raw) in body.lines().enumerate() {
+        out.push(ReadLine {
+            index,
+            raw: raw.to_string(),
+            read: LineRead::Continued,
+        });
+        let here = out.len() - 1;
+
+        // 1.
+        if let Some((tag, _)) = &skip_until {
+            out[here].read = LineRead::HeredocBody;
             if raw.trim() == tag {
                 skip_until = None;
             }
             continue;
         }
 
-        let line = raw.trim_end();
-        let line = if pending.is_empty() {
-            line.to_string()
-        } else {
-            format!("{} {}", pending.trim_end(), line.trim_start())
-        };
-        pending.clear();
-        if let Some(stripped) = line.strip_suffix('\\') {
-            pending = stripped.to_string();
-            continue;
-        }
+        // 2.
+        let open_in = group.as_ref().and_then(|g| g.open);
+        let (comment_at, open_out) = comment_start(raw, open_in);
+        let text = raw[..comment_at.unwrap_or(raw.len())].trim_end();
 
-        if let Some(tag) = heredoc_tag(&line) {
-            skip_until = Some(tag);
+        if group.is_none() {
+            if text.trim().is_empty() {
+                out[here].read = if raw.trim().is_empty() {
+                    LineRead::Blank
+                } else {
+                    LineRead::Comment
+                };
+                continue;
+            }
+            group = Some(Group {
+                start: here,
+                text: String::new(),
+                open: None,
+            });
         }
-        let text = without_comment(&line).trim().to_string();
-        if text.is_empty() {
+        let g = group.as_mut().expect("opened just above");
+        if !g.text.is_empty() {
+            g.text.push(' ');
+        }
+        g.text.push_str(text.trim_start());
+        g.open = open_out;
+
+        // 3.
+        if open_out.is_none() && g.text.ends_with('\\') {
+            g.text.pop();
             continue;
         }
-        let text = text
-            .strip_prefix("$ ")
-            .or_else(|| text.strip_prefix("> "))
-            .unwrap_or(&text)
-            .to_string();
-        let tokens: Vec<String> = text.split_whitespace().map(str::to_string).collect();
-        // Two different questions, and they must not share an answer. *Whether*
-        // this line is a command is decided on the program, which
-        // [`strip_wrappers`] finds. *What is kept* is the line as written,
-        // because everything stepped over is still part of the instruction:
-        // `RUST_LOG=grooveseek=debug groove serve` and `RUST_LOG=trace groove
-        // serve` tell a reader to do different things, and `docs/usage.md` sets
-        // RUST_LOG on three lines whose Japanese twin would otherwise be free to
-        // disagree about it.
-        let joined = tokens.join(" ");
-        if is_instruction(&joined) {
-            out.push(joined);
+        // 4.
+        if open_out.is_none()
+            && let Some(tag) = heredoc_tag(&g.text)
+        {
+            skip_until = Some((tag, g.start));
+            let done = group.take().expect("still open");
+            out[done.start].read = classify(&done.text, &mut in_case);
+            continue;
         }
+        // 5.
+        if open_out.is_some() {
+            continue;
+        }
+        let done = group.take().expect("still open");
+        out[done.start].read = classify(&done.text, &mut in_case);
+    }
+
+    if let Some(g) = group {
+        out[g.start].read = LineRead::Unread(if g.open.is_some() {
+            "opens a quote that never closes in this block".to_string()
+        } else {
+            "ends with a continuation and nothing follows".to_string()
+        });
+    }
+    if let Some((tag, opener)) = skip_until {
+        out[opener].read = LineRead::Unread(format!(
+            "opens a heredoc `{tag}` that never terminates in this block"
+        ));
     }
     out
+}
+
+/// What one assembled line is, once its continuations are joined and its
+/// comments removed.
+///
+/// Inside a `case`, a line may open with its pattern -- `*/.dev) git ...`,
+/// `*) exit 1 ;;` -- and the pattern is a branch condition rather than an
+/// instruction, so it is dropped along with the `;;` that ends the arm; what
+/// stands between them is what the reader runs. The `case X in` line itself
+/// stays an instruction: `X` is text a translation can get wrong.
+fn classify(text: &str, in_case: &mut bool) -> LineRead {
+    let text = text.trim();
+    if text.is_empty() {
+        return LineRead::Blank;
+    }
+    let text = text
+        .strip_prefix("$ ")
+        .or_else(|| text.strip_prefix("> "))
+        .unwrap_or(text);
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if SYNTAX_ONLY.contains(&joined.as_str()) {
+        if joined == "esac" {
+            *in_case = false;
+        }
+        return LineRead::Syntax;
+    }
+    if joined.starts_with("case ") && joined.ends_with(" in") {
+        *in_case = true;
+    }
+    let body = if *in_case {
+        match case_arm_body(&joined) {
+            Some(body) => body,
+            None => return LineRead::Syntax,
+        }
+    } else {
+        joined.as_str()
+    };
+    let body = body.strip_suffix(";;").map(str::trim_end).unwrap_or(body);
+    if body.is_empty() {
+        return LineRead::Syntax;
+    }
+    // Two different questions, and they must not share an answer. *Whether*
+    // this line is a command is decided on the program, which
+    // [`strip_wrappers`] finds. *What is kept* is the line as written,
+    // because everything stepped over is still part of the instruction:
+    // `RUST_LOG=grooveseek=debug groove serve` and `RUST_LOG=trace groove
+    // serve` tell a reader to do different things, and `docs/usage.md` sets
+    // RUST_LOG on three lines whose Japanese twin would otherwise be free to
+    // disagree about it.
+    if is_instruction(body) {
+        LineRead::Instruction(body.to_string())
+    } else {
+        let first = body.split_whitespace().next().unwrap_or("");
+        LineRead::Unread(format!("first word `{first}` cannot start a command"))
+    }
+}
+
+/// The text after a `case` arm's pattern, when the line opens with one; the
+/// line itself when it does not; `None` when the line is a pattern and
+/// nothing else.
+///
+/// A pattern is the first word when it ends in `)` and contains no `(`:
+/// `*/.dev)`, `*)`, `a|b)`. A subshell `(cd x && make)` opens with `(`, and a
+/// substitution `NEXT_ID=$(jq` contains one, so neither is taken for a label.
+fn case_arm_body(text: &str) -> Option<&str> {
+    let first = text.split_whitespace().next()?;
+    if first.ends_with(')') && !first.contains('(') {
+        let rest = text[first.len()..].trim();
+        return if rest.is_empty() { None } else { Some(rest) };
+    }
+    Some(text)
+}
+
+/// The command lines of a block body, normalised.
+///
+/// A filter over [`read_block`], so there is one reader and not two: the
+/// function that decides a line is not a command is the one that says why.
+pub fn command_lines(body: &str) -> Vec<String> {
+    read_block(body)
+        .into_iter()
+        .filter_map(|line| match line.read {
+            LineRead::Instruction(text) => Some(text),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether a fragment tells the reader to do something.
@@ -695,10 +956,11 @@ pub fn is_instruction(fragment: &str) -> bool {
         return true;
     }
     let text = without_comment(fragment.trim()).trim();
-    text.split_whitespace()
-        .next()
-        .and_then(assignment_value)
-        .is_some()
+    let tokens: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    tokens
+        .first()
+        .is_some_and(|first| assignment_value(first).is_some())
+        || is_powershell_assignment(&tokens)
 }
 
 /// The set of command identities a group of command lines names.
