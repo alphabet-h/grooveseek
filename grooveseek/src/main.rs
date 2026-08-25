@@ -2754,11 +2754,18 @@ mod documented_flags {
     ///
     /// The trailing boundary keeps `groove services` and a name glued to the
     /// next word out; what precedes it is [`NAME`], so anything name-shaped is
-    /// returned as written rather than truncated to a real verb.
+    /// returned as written rather than truncated to a real verb. A group
+    /// written as `groove service install/uninstall/tray-install` — the form
+    /// `docs/ARCHITECTURE.md` uses — is one match split on `/`, so every name
+    /// in the group reaches the comparison, not only the first.
     fn service_verbs(text: &str) -> BTreeSet<String> {
-        let verb = regex::Regex::new(&format!(r"groove service ({NAME})(?:[^a-z0-9_-]|$)"))
-            .expect("a valid pattern");
-        verb.captures_iter(text).map(|c| c[1].to_string()).collect()
+        let verb = regex::Regex::new(&format!(
+            r"groove service ({NAME}(?:/{NAME})*)(?:[^a-z0-9_/-]|$)"
+        ))
+        .expect("a valid pattern");
+        verb.captures_iter(text)
+            .flat_map(|c| c[1].split('/').map(str::to_string).collect::<Vec<_>>())
+            .collect()
     }
 
     #[test]
@@ -2775,6 +2782,16 @@ mod documented_flags {
         assert_eq!(
             verbs,
             ["status2", "tray-install_legacy"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        // The grouped form, with a stray in the middle of the group.
+        let grouped = service_verbs("`groove service install/bogus/tray-install/tray-uninstall`");
+        assert_eq!(
+            grouped,
+            ["install", "bogus", "tray-install", "tray-uninstall"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
