@@ -189,21 +189,6 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut here: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    here.sort();
-    for path in here {
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 fn blank(masked: &mut [u8], from: usize, to: usize) {
     for byte in &mut masked[from..to] {
         *byte = b' ';
@@ -534,21 +519,22 @@ fn every_word_groove_writes_to_stderr_is_ascii() {
 
     // Read and mask every file once, because the wrapper pass below has to see
     // the whole tree before the checking pass can start.
+    // The same walk the source layout guard uses, kept to `.rs` here: two
+    // guards that discover the tree separately drift apart the first time one
+    // of them changes how it treats an unreadable directory or a dot-file.
     let mut scanned: Vec<Scanned> = Vec::new();
-    for dir in common::source::source_dirs() {
-        let mut paths = Vec::new();
-        rust_files(&dir, &mut paths);
-        for path in paths {
-            let src = common::docs::read(&path);
-            let (masked, literals) = mask_comments_and_strings(&src);
-            let shown = common::docs::shown(&root, &path);
-            scanned.push(Scanned {
-                shown,
-                src,
-                masked,
-                literals,
-            });
+    for shown in common::source::source_tree() {
+        if !shown.ends_with(".rs") {
+            continue;
         }
+        let src = common::docs::read(&root.join(&shown));
+        let (masked, literals) = mask_comments_and_strings(&src);
+        scanned.push(Scanned {
+            shown,
+            src,
+            masked,
+            literals,
+        });
     }
 
     let mut openers: Vec<String> = DIAGNOSTIC_OPENERS

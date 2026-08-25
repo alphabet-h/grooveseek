@@ -123,14 +123,27 @@ struct Drift {
 }
 
 /// `|` characters that separate cells: every one not escaped with `\`.
+///
+/// A backslash escapes the character after it, including another backslash,
+/// so what decides is the length of the run of backslashes before the pipe:
+/// `\|` is an escaped pipe and `\\|` is an escaped backslash followed by a
+/// pipe that still separates cells. Looking at the one preceding character
+/// would call the second shape escaped and let the parser split the row while
+/// this check stayed quiet (codex P2 on PR #231).
 fn unescaped_pipes(line: &str) -> usize {
     let mut count = 0;
-    let mut previous = '\0';
+    let mut backslashes = 0usize;
     for c in line.chars() {
-        if c == '|' && previous != '\\' {
-            count += 1;
+        match c {
+            '\\' => backslashes += 1,
+            '|' => {
+                if backslashes.is_multiple_of(2) {
+                    count += 1;
+                }
+                backslashes = 0;
+            }
+            _ => backslashes = 0,
         }
-        previous = c;
     }
     count
 }
@@ -646,6 +659,18 @@ fn a_pipe_inside_a_cell_is_reported_rather_than_swallowed() {
         "{:?}",
         table.rows[0].spans
     );
+}
+
+#[test]
+fn a_pipe_after_an_escaped_backslash_still_separates_cells() {
+    // `\\|` is an escaped backslash and then a pipe. GitHub and pulldown-cmark
+    // split the row there, so the count has to see it as a separator; only an
+    // odd run of backslashes escapes the pipe.
+    assert_eq!(unescaped_pipes(r"| `a.rs` | x \| y |"), 3);
+    assert_eq!(unescaped_pipes(r"| `a.rs` | x \\| y |"), 4);
+    assert_eq!(unescaped_pipes(r"| `a.rs` | x \\\| y |"), 3);
+    let table = read_page(r"| `a.rs` | a span with `x \\| y` inside |");
+    assert_eq!(table.ragged, [(5, 4)]);
 }
 
 #[test]
