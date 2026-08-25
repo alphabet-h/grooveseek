@@ -2725,7 +2725,7 @@ mod documented_flags {
     }
 
     /// "Every command: `index`, `serve`, …" is a claim about a set, and the set
-    /// has one owner: `Cli::command()`.
+    /// has one owner: [`Cli`], through clap's `command()`.
     ///
     /// The README once listed nine of the ten subcommands under exactly that
     /// heading — `status` was missing — and nothing noticed, because the flag
