@@ -17,9 +17,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Internal
 
 - **The source layout table in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-  is now compared with the tree.** The table went four pull requests without
-  being updated — #195, #196 and #197 each split a module out of `server.rs`,
-  #212 added `legacy.rs` — and a docs-only #214 repaired it by hand, because
+  is now compared with the tree.** The table went unrepaired across #195,
+  #196 and #197, which each split a module out of `server.rs`, and #212,
+  which added `legacy.rs`; a docs-only #214 repaired it by hand, because
   nothing read it. `grooveseek/tests/docs_source_layout.rs` now walks every
   file under each workspace member's `src` and requires both tables to
   describe it: a row of its own, or its directory's row naming it in

@@ -1,9 +1,9 @@
 //! The source layout table in `docs/ARCHITECTURE.md` describes the tree, in
 //! both languages.
 //!
-//! The table went four pull requests without being updated -- #195, #196 and
-//! #197 each split a module out of `server.rs`, #212 added `legacy.rs` -- and
-//! a docs-only #214 repaired it by hand, because nothing read it. The release
+//! The table went unrepaired across #195, #196 and #197, which each split a
+//! module out of `server.rs`, and #212, which added `legacy.rs`; a docs-only
+//! #214 repaired it by hand, because nothing read it. The release
 //! checklist did list it, on the same line as `docs/usage.md`, whose flags a
 //! test already compares with the binary; the green half of that line hid the
 //! red half. This is the reader that line was missing.
@@ -72,9 +72,10 @@ use common::source::{source_tree, workspace_members};
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::path::Path;
 
 /// One data row of the layout table.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Row {
     /// 1-based line of the row in the page.
     line: usize,
@@ -102,10 +103,13 @@ struct Table {
     /// How many tables the section holds. The guard wants exactly one, so a
     /// second table under the same heading cannot lend its rows to the first.
     tables: usize,
+    /// How many columns the table's header declares; a row's source line has
+    /// one more `|` than that.
+    columns: usize,
 }
 
 /// What the table and the tree disagree about.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Drift {
     /// Files under a file-level member that no row covers.
     missing: Vec<String>,
@@ -198,6 +202,7 @@ fn layout_rows(markdown: &str, section: &str) -> Option<Table> {
             Event::Start(Tag::Table(alignments)) => {
                 table.tables += 1;
                 columns = alignments.len();
+                table.columns = columns;
             }
             Event::Start(Tag::TableRow) => {
                 current = Some(RowUnderRead {
@@ -952,10 +957,9 @@ fn the_extensions_a_bare_name_may_carry_come_from_the_tree() {
     assert_eq!(ext, want);
 }
 
-#[test]
-fn the_walk_reaches_every_member_and_every_extension() {
-    let root = repo_root();
-    let tree = source_tree();
+/// The walk has to reach each of [`WALK_ANCHORS`], or whatever it reached is
+/// not this workspace's source.
+fn assert_walk_reaches(root: &Path, tree: &BTreeSet<String>) {
     for required in WALK_ANCHORS {
         assert!(
             tree.contains(*required),
@@ -968,9 +972,18 @@ fn the_walk_reaches_every_member_and_every_extension() {
     }
 }
 
+#[test]
+fn the_walk_reaches_every_member_and_every_extension() {
+    assert_walk_reaches(&repo_root(), &source_tree());
+}
+
 // ---------------------------------------------------------------------------
 // The live pages against the live tree.
 // ---------------------------------------------------------------------------
+
+/// The crate the table exists to describe file by file. A crate-level row for
+/// it is refused, and a hint about a file in any other crate may offer one.
+const TABLE_CRATE: &str = "grooveseek";
 
 /// The pages under guard and the heading their table sits under.
 const PAGES: &[(&str, &str)] = &[
@@ -1011,14 +1024,7 @@ fn live() -> Vec<Live> {
     let root = repo_root();
     let members = workspace_members();
     let tree = source_tree();
-    for required in WALK_ANCHORS {
-        assert!(
-            tree.contains(*required),
-            "the walk from {} did not reach {required}; see \
-             the_walk_reaches_every_member_and_every_extension",
-            root.display()
-        );
-    }
+    assert_walk_reaches(&root, &tree);
 
     let mut out = Vec::new();
     for (page, section) in PAGES {
@@ -1044,8 +1050,8 @@ fn live() -> Vec<Live> {
             table.unreadable
         );
         assert!(
-            !has_crate_row(&table, "grooveseek"),
-            "{page} has a `grooveseek/` row, which would describe the crate at \
+            !has_crate_row(&table, TABLE_CRATE),
+            "{page} has a `{TABLE_CRATE}/` row, which would describe the crate at \
              crate level and switch off the file-by-file check for the one \
              crate this table exists to describe. Delete that row; the files \
              are the rows"
@@ -1116,7 +1122,7 @@ fn hint_for(path: &str, table: &Table, members: &[String]) -> String {
     };
     if let Some(member) = members
         .iter()
-        .find(|m| m.as_str() != "grooveseek" && path.starts_with(&format!("{m}/src/")))
+        .find(|m| m.as_str() != TABLE_CRATE && path.starts_with(&format!("{m}/src/")))
     {
         hint.push_str(&format!(
             ", or describe the crate as a whole with a `{member}/` row"
@@ -1184,8 +1190,9 @@ fn no_row_names_a_file_or_directory_the_tree_does_not_have() {
         "the source layout table names what the tree does not have:\n  {}\n\
          Paths compare as written, so a wrong case fails here on every platform. \
          Delete or rename the row in the commit that deletes or renames the file. \
-         `legacy.rs` is scheduled to go in 1.1.0 and will land here when it does; \
-         its row goes with it.",
+         A bare name in a directory row is read as a file of that directory; to \
+         mention a file elsewhere, write its full path. `legacy.rs` is scheduled \
+         to go in 1.1.0 and will land here when it does; its row goes with it.",
         offenders.join("\n  ")
     );
 }
@@ -1196,8 +1203,9 @@ fn every_row_in_the_layout_table_has_as_many_cells_as_its_header() {
     for live in live() {
         for (line, pipes) in &live.table.ragged {
             offenders.push(format!(
-                "{}:{line}: {pipes} unescaped `|` where the header has three",
-                live.page
+                "{}:{line}: {pipes} unescaped `|` where the header has {}",
+                live.page,
+                live.table.columns + 1
             ));
         }
     }
@@ -1280,7 +1288,8 @@ fn the_english_and_japanese_tables_list_the_same_paths_in_the_same_order_with_th
 
 /// `git -C <root> show 739210b:docs/ARCHITECTURE.md`, blob
 /// `9ce36a925dd9c9566e1ac7d0bfdb8a550c9b8641` -- the parent of `6191340`
-/// (#214), which added four rows and changed nothing else.
+/// (#214), which added four rows and reworded the `doctor.rs` row; the reader
+/// sees only the rows.
 const PAGE_AT_739210B: &str = include_str!("fixtures/docs-history/ARCHITECTURE-739210b.md");
 
 /// `git -C <root> show 739210b:docs/ARCHITECTURE.ja.md`, blob
