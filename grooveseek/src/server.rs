@@ -1592,7 +1592,7 @@ mod tests {
 
     /// The key order a client reads, pinned as text.
     ///
-    /// It cannot be pinned through [`serde_json::Value`]: without
+    /// It cannot be pinned through `serde_json::Value`: without
     /// `preserve_order` its `Map` is a `BTreeMap`, so every object comes back
     /// alphabetised and the declaration order is gone before the assertion
     /// runs.
