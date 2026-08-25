@@ -2754,14 +2754,16 @@ mod documented_flags {
     /// backtick, with the punctuation prose hangs on the end (`.` `,` `;` `:`
     /// `)`) removed. A group written as `install/uninstall/tray-install` — the
     /// form `docs/ARCHITECTURE.md` uses — is split on `/` so every name in it
-    /// reaches the comparison. A `<placeholder>` is not a candidate.
+    /// reaches the comparison. A `<placeholder>` — opening and closing angle
+    /// bracket as the whole candidate — is not a candidate; `<verb>BAD` is.
     fn service_verbs(text: &str) -> BTreeSet<String> {
         let verb = regex::Regex::new("groove service ([^\\s`]+)").expect("a valid pattern");
+        let placeholder = |name: &str| name.starts_with('<') && name.ends_with('>');
         verb.captures_iter(text)
             .flat_map(|c| {
                 c[1].trim_end_matches(['.', ',', ';', ':', ')'])
                     .split('/')
-                    .filter(|name| !name.is_empty() && !name.starts_with('<'))
+                    .filter(|name| !name.is_empty() && !placeholder(name))
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             })
@@ -2781,11 +2783,12 @@ mod documented_flags {
 
         let verbs = service_verbs(
             "run `groove service status2` then `groove service tray-install_legacy`, \
-             or groove service statusBAD. Never groove service <verb>.",
+             or groove service statusBAD. Never groove service <verb>, \
+             and not groove service <verb>BAD either.",
         );
         assert_eq!(
             verbs,
-            ["status2", "tray-install_legacy", "statusBAD"]
+            ["status2", "tray-install_legacy", "statusBAD", "<verb>BAD"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
