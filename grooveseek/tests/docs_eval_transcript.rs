@@ -30,17 +30,16 @@ mod common;
 use chrono::{TimeZone, Utc};
 use common::docs::{fenced_blocks, read, repo_root, shown};
 use grooveseek::eval::{
-    ConfigFingerprint, CorpusSnapshot, EvalRun, FTS_QUERY_VERSION, GoldenSet, HitRecord,
-    METRIC_VERSION, QueryResult, aggregate_metrics, compute_query_metrics, format_text, query_id,
+    ConfigFingerprint, CorpusSnapshot, DEFAULT_K_VALUES, DEFAULT_REGRESSION_THRESHOLD, EvalRun,
+    FTS_QUERY_VERSION, GoldenSet, HitRecord, METRIC_VERSION, QueryResult, aggregate_metrics,
+    compute_query_metrics, format_text, query_id,
 };
 
-/// The `k` values the example reports (`recall@1`, `recall@5`, `recall@10`,
-/// `nDCG@10`), which are the binary's defaults.
-const K_VALUES: [usize; 3] = [1, 5, 10];
-
-/// `format_text`'s regression threshold. Unused on a first run, which has
-/// nothing to regress from, but the signature wants one.
-const REGRESSION_THRESHOLD: f64 = 0.05;
+// The example is the documented invocation with no `--k` and no `--limit`, so
+// the k values, the limit (the largest k, as `main.rs` resolves it) and the
+// threshold are the binary's defaults, read from where the binary reads them.
+// A copy of `[1, 5, 10]` here would keep this guard green after the default
+// moved, while the page showed labels the binary no longer prints.
 
 fn hit(rank: usize, path: &str, heading: Option<&str>) -> HitRecord {
     HitRecord {
@@ -87,25 +86,29 @@ fn quick_start_run(golden: &GoldenSet) -> EvalRun {
             id: query_id(q1),
             query: q1.query.clone(),
             expected: q1.expected.clone(),
-            metrics: compute_query_metrics(&q1.expected, &top1, &K_VALUES),
+            metrics: compute_query_metrics(&q1.expected, &top1, &DEFAULT_K_VALUES),
             top_k: top1,
         },
         QueryResult {
             id: query_id(q2),
             query: q2.query.clone(),
             expected: q2.expected.clone(),
-            metrics: compute_query_metrics(&q2.expected, &top2, &K_VALUES),
+            metrics: compute_query_metrics(&q2.expected, &top2, &DEFAULT_K_VALUES),
             top_k: top2,
         },
     ];
-    let aggregate = aggregate_metrics(&per_query, &K_VALUES);
+    let aggregate = aggregate_metrics(&per_query, &DEFAULT_K_VALUES);
+    let limit = *DEFAULT_K_VALUES
+        .iter()
+        .max()
+        .expect("the default k list is not empty") as u32;
     EvalRun {
         timestamp: Utc.with_ymd_and_hms(2026, 4, 24, 5, 32, 1).unwrap(),
         fingerprint: ConfigFingerprint {
             model: "bge-m3".to_string(),
             reranker: None,
-            limit: 10,
-            k_values: K_VALUES.to_vec(),
+            limit,
+            k_values: DEFAULT_K_VALUES.to_vec(),
             golden_hash: "not printed".to_string(),
             metric_version: METRIC_VERSION,
             fts_query_version: FTS_QUERY_VERSION,
@@ -160,7 +163,12 @@ fn transcript_is_what_format_text_prints(page: &str) {
         "{where_}: expected one untagged fence starting with the `groove eval` banner"
     );
 
-    let expected = format_text(&quick_start_run(&golden), None, false, REGRESSION_THRESHOLD);
+    let expected = format_text(
+        &quick_start_run(&golden),
+        None,
+        false,
+        DEFAULT_REGRESSION_THRESHOLD,
+    );
     assert_eq!(
         transcripts[0].body, expected,
         "{where_}:{}: the quick start transcript is not what format_text prints over the golden above it",
