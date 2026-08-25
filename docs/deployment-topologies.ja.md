@@ -136,6 +136,37 @@ CLI の 3 秒はどこへ行くのか。3 項のうち 2 項は実測で、残�
 > トリムされ、次のクエリでフォールトして戻すため。**上の表を再現するなら 2 行を
 > 別バッチで測ること。** 交互に測ると比が ~15 倍から無意味な ~1.6 倍に潰れる。
 
+### 同時 client が何を払うのか、実測
+
+1 つの daemon は embedder 1 つ、reranker の枠 1 つ、DB 接続 1 つをそれぞれ mutex の
+内側に持ち、`search` はその 3 つを全部取る — embedder はクエリを embed する間だけ、
+残り 2 つは pipeline の終わりまで。リクエストは HTTP 層でも tokio の blocking pool でも
+並行に動くが、この lock の前で並ぶ。同時に N client が来た時に何を払うかを、上の表と
+同じマシンで測った (release build、`bge-m3`、reranker 無し。計測は
+`cargo test -p grooveseek --release --test http_lock_contention -- --ignored --nocapture`、
+詳細は下の「数値の取り方」):
+
+| コーパス | tool | 1 client の p50 | 8 client の p50 | 1 client の qps | 8 client の qps |
+|---|---|---:|---:|---:|---:|
+| 59 文書 / 794 chunk | `search` | 62〜83 ms | 242〜355 ms | 11.7〜16.1 | 12.6〜19.8 |
+| | `get_connection_graph` (DB の lock だけ) | 10.6 ms | 42 ms | 92 | 98 |
+| | `get_document` (lock 無し) | 1.0 ms | 3.2〜3.7 ms | 870〜1,000 | 1,870〜2,130 |
+| 686 文書 / 9,813 chunk | `search` | 136〜140 ms | 593〜606 ms | 7.1〜7.3 | 8.9 |
+| | `get_connection_graph` | 74 ms | 297〜304 ms | 13.4 | 13.4〜13.5 |
+| | `get_document` | 1.0 ms | 3.9〜4.1 ms | 754〜783 | 1,515〜1,653 |
+
+レイテンシは client 数とともに伸び (8 client で約 4.5 倍 = 8 本を順に捌いた時の中央値)、
+スループットはほとんど動かない。ただしこれは「lock の裏でハードウェアが遊んでいる」
+のではない — クエリ 1 本の embed が既に全コアで走るので、同じコーパスのコピーを
+2 つ目の daemon に持たせても、8 client 合計のスループットは小さいコーパスで 12%、
+大きい方で 32% しか増えなかった。コアが本当に遊ぶのは DB 側で (graph tool は 1 コアが
+働き残り 15 コアが待つ)、その割合はコーパスとともに増える: hybrid の候補取得 1 回は
+794 chunk で 10.6 ms、9,813 chunk で 79.9 ms (KNN が総当たり) で、~50 ms の embed を
+追い越すのはおよそ 5 千 chunk。それ未満では lock をどう直しても `search` の
+スループットは上がらず、それ以上では read-only 接続の pool で上がるが、上限は
+2 つ目の daemon が示した分まで — 次の天井が embed の CPU だから。reranker 付きの
+クエリは別の話で、lock を ~48 秒握り、同時に来た 2 本目は 1 本目を丸ごと待つ。
+
 ## 誰が呼ぶかが、認証が自分の問題になるかを決める
 
 GrooveSeek は API を提供し、人が見る画面は前段のアプリが持つ。そのアプリが
@@ -307,6 +338,24 @@ daemon 側が `/api/admin/status` から取った。
 
 **CLI 行と daemon 行は別バッチで測ること。** 交互に測ると 2 つ目の外れ値が起き、
 比が ~15 倍から ~1.6 倍に潰れる。
+
+**同時 client の表** — `grooveseek/tests/http_lock_contention.rs` (ignored の
+integration test)、GrooveSeek 1.0.1、同じマシン (8 コア / 16 スレッド):
+
+```bash
+GROOVE_BENCH_KB=<kb> GROOVE_BENCH_CONFIG=<kb-config> \
+  cargo test -p grooveseek --release --test http_lock_contention -- --ignored --nocapture
+```
+
+コーパスと索引を一時ディレクトリに複製し (指定されたコーパスを索引し直すことは
+しない)、そこに `groove serve --transport http --no-watch` を立て、client 数 N ごとに
+N 本のスレッドが先に接続してから 1 つの barrier で一斉に解放され、それぞれが解放から
+応答の最初の byte までを自分で計る (`Connection: close`)。スループットは round 全体を
+coordinator の時計で測る。N は 1, 2, 4, 8, 16, 8, 4, 2, 1 の順で回すので、drift は同じ N
+への 2 回の訪問の差として現れる — 表のレンジがその 2 回。「2 つ目の daemon」の数字は
+同じコーパスを 2 部複製して 2 プロセスで serve し、8 client を 4 + 4 に割ったもの。
+必ず release build で測ること — dev profile は同梱の sqlite-vec を最適化なしで
+コンパイルするので、DB 側だけが膨らむ。
 
 ## 関連
 

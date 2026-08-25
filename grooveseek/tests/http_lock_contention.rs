@@ -1,15 +1,16 @@
 //! How much does the lock inside `search` cost concurrent HTTP clients?
 //!
-//! `search_blocking` takes three `std::sync::Mutex`es in order: `embedder`
-//! (released as soon as the query is embedded), then `reranker` (taken even
-//! when no reranker is configured) and `db`, both held to the end of the
-//! pipeline. Every HTTP session shares the same three. Feature idea D-13
+//! The server's `KbCore::search_blocking` (private to `grooveseek::server`)
+//! takes three [`std::sync::Mutex`]es in order: `embedder` (released as soon
+//! as the query is embedded), then `reranker` (taken even when no reranker is
+//! configured) and `db`, both held to the end of the pipeline. Every HTTP
+//! session shares the same three. Feature idea D-13
 //! asks whether that serialisation is a real problem for N concurrent
 //! clients, and whether splitting the locks would buy anything.
 //!
 //! This is a **measurement**, not a guard. It starts a real `groove serve
 //! --transport http`, fires N concurrent stateless `tools/call` requests at
-//! `/mcp` from N OS threads released by one `Barrier`, and prints a table.
+//! `/mcp` from N OS threads released by one [`Barrier`], and prints a table.
 //! The verdict it prints is not asserted: what it asserts is that the
 //! harness measured something (non-empty hits, no failed requests, the
 //! client really ran in parallel). The nightly `--include-ignored` run
@@ -27,8 +28,8 @@
 //! | `document` | `get_document`         | none (filesystem)           |
 //!
 //! `document` is the control arm: it goes through the same HTTP, rmcp and
-//! `spawn_blocking` path and takes nothing, so what it shows at N=8 is
-//! transport cost, not lock waiting.
+//! [`tokio::task::spawn_blocking`] path and takes nothing, so what it shows
+//! at N=8 is transport cost, not lock waiting.
 //!
 //! Beyond the table, three discriminators decide the D-13 question, because
 //! the table alone cannot tell "serialised and CPU-bound" from "serialised
@@ -102,7 +103,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// What the test serves: a temp copy it owns, plus the config to pass.
 ///
-/// The original corpus is never opened by the daemon. `build_index` is
+/// The original corpus is never opened by the daemon. [`build_index`] is
 /// pinned to BGE-small, and pointing it at a BGE-M3 index would wipe that
 /// index (the model switch resets the database), so a corpus that comes
 /// from the environment is copied with its database and **never indexed**.
@@ -114,7 +115,7 @@ struct Staged {
     label: String,
 }
 
-/// Owns the temp tree so it is removed when the `Staged` drops. Never read,
+/// Owns the temp tree so it is removed when the [`Staged`] drops. Never read,
 /// only dropped.
 #[allow(dead_code)]
 enum Hold {
@@ -169,7 +170,11 @@ fn stage_fixture() -> Staged {
     let config = layout.root().join("groove.toml");
     std::fs::write(&config, "[watch]\nenabled = false\n").expect("write groove.toml");
     let db = grooveseek::resolve_db_path(layout.kb());
-    assert!(db.exists(), "build_index left no database at {}", db.display());
+    assert!(
+        db.exists(),
+        "build_index left no database at {}",
+        db.display()
+    );
     Staged {
         kb: layout.kb().to_path_buf(),
         db,
@@ -315,7 +320,9 @@ impl Workload {
                 let nodes = inner["nodes"].as_array().map(Vec::len).unwrap_or(0);
                 let knn = inner["stats"]["knn_queries"].as_u64().unwrap_or(0);
                 if nodes == 0 || knn == 0 {
-                    Err(format!("graph returned {nodes} nodes after {knn} knn queries"))
+                    Err(format!(
+                        "graph returned {nodes} nodes after {knn} knn queries"
+                    ))
                 } else {
                     Ok(inner["stats"]["duration_ms"].as_u64())
                 }
@@ -391,8 +398,8 @@ fn request_bytes(authority: &str, tool: &str, body: &[u8]) -> Vec<u8> {
 }
 
 fn connect(authority: &str, read_timeout: Duration) -> TcpStream {
-    let stream = TcpStream::connect(authority)
-        .unwrap_or_else(|e| panic!("connect {authority}: {e}"));
+    let stream =
+        TcpStream::connect(authority).unwrap_or_else(|e| panic!("connect {authority}: {e}"));
     stream.set_nodelay(true).expect("set_nodelay");
     stream
         .set_read_timeout(Some(read_timeout))
@@ -512,8 +519,12 @@ fn envelope(resp: &Response) -> Result<Value, String> {
             resp.body.len()
         ))
     } else {
-        serde_json::from_str::<Value>(text.trim())
-            .map_err(|e| format!("body is not JSON ({e}): {}", text.chars().take(200).collect::<String>()))
+        serde_json::from_str::<Value>(text.trim()).map_err(|e| {
+            format!(
+                "body is not JSON ({e}): {}",
+                text.chars().take(200).collect::<String>()
+            )
+        })
     }
 }
 
@@ -543,7 +554,9 @@ fn exchange(stream: &mut TcpStream, req: &[u8], t0: Instant, workload: Workload)
                     if find(&raw[scan_from..], b"data:").is_some() {
                         first_data = Some(t0.elapsed().as_secs_f64() * 1000.0);
                     } else if find(&raw[scan_from..], b"\r\n\r\n").is_some()
-                        && !String::from_utf8_lossy(&raw).to_ascii_lowercase().contains("text/event-stream")
+                        && !String::from_utf8_lossy(&raw)
+                            .to_ascii_lowercase()
+                            .contains("text/event-stream")
                         && find(&raw, b"\r\n\r\n").is_some()
                     {
                         // Not a stream: the body arrives whole, count it when
@@ -585,7 +598,10 @@ fn exchange(stream: &mut TcpStream, req: &[u8], t0: Instant, workload: Workload)
             return Err(format!(
                 "HTTP {}: {}",
                 resp.status,
-                String::from_utf8_lossy(&resp.body).chars().take(200).collect::<String>()
+                String::from_utf8_lossy(&resp.body)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
             ));
         }
         let env = envelope(&resp)?;
@@ -628,7 +644,13 @@ fn exchange(stream: &mut TcpStream, req: &[u8], t0: Instant, workload: Workload)
 
 /// One request, sequentially, from the calling thread. Used for warm-up and
 /// for the admin status read.
-fn one_call(authority: &str, workload: Workload, query: &str, doc: &str, timeout: Duration) -> Sample {
+fn one_call(
+    authority: &str,
+    workload: Workload,
+    query: &str,
+    doc: &str,
+    timeout: Duration,
+) -> Sample {
     let body = stateless_tools_call(workload.tool(), &workload.arguments(query, doc));
     let req = request_bytes(authority, workload.tool(), &body);
     let mut stream = connect(authority, timeout);
@@ -720,7 +742,13 @@ impl Site<'_> {
 /// The clock: every thread connects **before** the barrier and takes `t0`
 /// the moment `wait` returns, before writing a byte. A clock started inside
 /// the server's queue would exclude the queueing it exists to measure.
-fn run_cell(site: &Site<'_>, workload: Workload, n: usize, rounds: usize, pass: &'static str) -> Cell {
+fn run_cell(
+    site: &Site<'_>,
+    workload: Workload,
+    n: usize,
+    rounds: usize,
+    pass: &'static str,
+) -> Cell {
     let cpu_before = site.pid.and_then(cpu_ms);
     let mut samples = Vec::with_capacity(n * rounds);
     let mut wall_ms = 0.0;
@@ -816,7 +844,10 @@ fn cpu_ms(pid: u32) -> Option<f64> {
         ])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -913,7 +944,11 @@ impl Cell {
             .map(|s| s.eof_ms - s.first_data_ms)
             .collect();
         let tail = median(&mut tails);
-        let mut srv: Vec<f64> = self.samples.iter().filter_map(|s| s.srv_ms.map(|v| v as f64)).collect();
+        let mut srv: Vec<f64> = self
+            .samples
+            .iter()
+            .filter_map(|s| s.srv_ms.map(|v| v as f64))
+            .collect();
         let srv_p50 = if srv.is_empty() {
             "-".to_string()
         } else {
@@ -974,8 +1009,21 @@ impl Cell {
 fn header_line() -> String {
     format!(
         "{:<13} {:>3} {:<5} {:>7} {:>9} {:>9} {:>9} {:>8} {:>4} {:>4} {:>8} {:>8} {:>8} {:>8} {:>6}",
-        "workload", "N", "pass", "samples", "p50_ms", "p95_ms", "max_ms", "qps", "ok", "err",
-        "tail_ms", "srv_p50", "cpu_ms", "cpu/req", "util"
+        "workload",
+        "N",
+        "pass",
+        "samples",
+        "p50_ms",
+        "p95_ms",
+        "max_ms",
+        "qps",
+        "ok",
+        "err",
+        "tail_ms",
+        "srv_p50",
+        "cpu_ms",
+        "cpu/req",
+        "util"
     )
 }
 
@@ -1019,7 +1067,13 @@ fn version_line() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "n/a".to_string());
     let describe = Command::new("git")
-        .args(["-C", env!("CARGO_MANIFEST_DIR"), "describe", "--always", "--dirty"])
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "describe",
+            "--always",
+            "--dirty",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -1115,8 +1169,14 @@ fn concurrent_tools_call_latency_table() {
         );
     }
     let query = std::env::var("GROOVE_BENCH_QUERY").unwrap_or_else(|_| "tokio runtime".to_string());
-    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let build = if cfg!(debug_assertions) { "DEBUG" } else { "release" };
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let build = if cfg!(debug_assertions) {
+        "DEBUG"
+    } else {
+        "release"
+    };
 
     let staged = stage_corpus();
     let (guard, base) = spawn_mcp_server(&staged.kb, &staged.config);
@@ -1134,7 +1194,11 @@ fn concurrent_tools_call_latency_table() {
 
     println!();
     println!("http_lock_contention: corpus={}", staged.label);
-    println!("  config={} db={}", staged.config.display(), staged.db.display());
+    println!(
+        "  config={} db={}",
+        staged.config.display(),
+        staged.db.display()
+    );
     println!(
         "  daemon pid={} base={} build={build} cores(logical)={cores} groove={}",
         guard.pid(),
@@ -1143,8 +1207,12 @@ fn concurrent_tools_call_latency_table() {
     );
     println!(
         "  model={kb_model} documents={} chunks={}",
-        documents.map(|v| v.to_string()).unwrap_or_else(|| "n/a".to_string()),
-        chunks.map(|v| v.to_string()).unwrap_or_else(|| "n/a".to_string())
+        documents
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string()),
+        chunks
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
     );
     if cfg!(debug_assertions) {
         println!("  DEBUG BUILD: numbers are not decision-grade");
@@ -1253,7 +1321,11 @@ fn concurrent_tools_call_latency_table() {
         let rr_pid = Some(rr_guard.pid());
         let rr_timeout = Duration::from_secs(900);
         let warm = one_call(&rr_authority, Workload::Search, &query, &doc, rr_timeout);
-        assert!(warm.ok, "warm-up on the reranker daemon failed: {}", warm.why.unwrap_or_default());
+        assert!(
+            warm.ok,
+            "warm-up on the reranker daemon failed: {}",
+            warm.why.unwrap_or_default()
+        );
         let rr_site = Site {
             authorities: vec![rr_authority.clone()],
             query: &query,
@@ -1285,7 +1357,12 @@ fn concurrent_tools_call_latency_table() {
     let ed = measure_embed_and_fetch(&kb_model, &staged.db, &query);
 
     // ---- assertions: the harness measured something ---------------------
-    for c in cells.iter().chain(loops.iter()).chain(rerank_cells.iter()).chain([&twin_cell, &twin_single]) {
+    for c in cells
+        .iter()
+        .chain(loops.iter())
+        .chain(rerank_cells.iter())
+        .chain([&twin_cell, &twin_single])
+    {
         assert_eq!(
             c.errors(),
             0,
@@ -1294,7 +1371,10 @@ fn concurrent_tools_call_latency_table() {
             c.n,
             c.pass,
             c.errors(),
-            c.samples.iter().find_map(|s| s.why.clone()).unwrap_or_default()
+            c.samples
+                .iter()
+                .find_map(|s| s.why.clone())
+                .unwrap_or_default()
         );
     }
     let search_n8 = merged(&cells, Workload::Search, 8).expect("search N=8 cell");
@@ -1352,8 +1432,10 @@ fn concurrent_tools_call_latency_table() {
     };
 
     println!();
-    println!("in-process halves ({}): E = {:.1} ms (one query embedding), D = {:.1} ms (one hybrid fetch, {} candidates; floor for the db-held span)",
-        ed.model, e, ed.d_ms, ed.candidates);
+    println!(
+        "in-process halves ({}): E = {:.1} ms (one query embedding), D = {:.1} ms (one hybrid fetch, {} candidates; floor for the db-held span)",
+        ed.model, e, ed.d_ms, ed.candidates
+    );
     println!(
         "  D_full = search N=1 p50 {:.1} - document N=1 p50 {:.1} - E {:.1} = {:.1} ms",
         search_n1.p50(),
@@ -1378,8 +1460,16 @@ fn concurrent_tools_call_latency_table() {
         doc_n8.p50() / doc_n1.p50(),
         parallel_ratio
     );
-    let mut srv1: Vec<f64> = graph_n1.samples.iter().filter_map(|s| s.srv_ms.map(|v| v as f64)).collect();
-    let mut srv8: Vec<f64> = graph_n8.samples.iter().filter_map(|s| s.srv_ms.map(|v| v as f64)).collect();
+    let mut srv1: Vec<f64> = graph_n1
+        .samples
+        .iter()
+        .filter_map(|s| s.srv_ms.map(|v| v as f64))
+        .collect();
+    let mut srv8: Vec<f64> = graph_n8
+        .samples
+        .iter()
+        .filter_map(|s| s.srv_ms.map(|v| v as f64))
+        .collect();
     if !srv1.is_empty() && !srv8.is_empty() {
         println!(
             "  graph client p50 - server p50 (lock wait + transport): N=1 {:.1} ms, N=8 {:.1} ms",
@@ -1389,11 +1479,15 @@ fn concurrent_tools_call_latency_table() {
     }
     println!(
         "  cpu per request, search N=8 / N=1: {}",
-        cpu_ratio.map(|r| format!("x{r:.2}")).unwrap_or_else(|| "n/a".to_string())
+        cpu_ratio
+            .map(|r| format!("x{r:.2}"))
+            .unwrap_or_else(|| "n/a".to_string())
     );
     println!(
         "verdict: refactor warranted = {verdict} (D_full > E: {d_wins}, twin >= 1.5: {twin_wins}, cpu/req N8 vs N1: {})",
-        cpu_ratio.map(|r| format!("x{r:.2}")).unwrap_or_else(|| "n/a".to_string())
+        cpu_ratio
+            .map(|r| format!("x{r:.2}"))
+            .unwrap_or_else(|| "n/a".to_string())
     );
 
     // ---- JSON ----------------------------------------------------------
@@ -1426,7 +1520,10 @@ fn concurrent_tools_call_latency_table() {
                     "qps_now": qps_now, "qps_pool8": qps_pool8 },
         "verdict": { "refactor_warranted": verdict, "d_full_gt_e": d_wins, "twin_ge_1_5": twin_wins, "cpu_per_req_ratio": cpu_ratio },
     });
-    std::fs::write(&out, serde_json::to_string_pretty(&report).expect("serialise report"))
-        .unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
+    std::fs::write(
+        &out,
+        serde_json::to_string_pretty(&report).expect("serialise report"),
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
     println!("json: {}", out.display());
 }

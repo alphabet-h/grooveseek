@@ -2658,6 +2658,18 @@ mod documented_flags {
                 "include",
                 "huggingface-cli download --include, in clients.md",
             ),
+            (
+                "test",
+                "cargo test --test http_lock_contention, in deployment-topologies.md",
+            ),
+            (
+                "ignored",
+                "cargo test -- --ignored, in deployment-topologies.md",
+            ),
+            (
+                "nocapture",
+                "cargo test -- --nocapture, in deployment-topologies.md",
+            ),
         ];
 
         // Which command owns a flag does not matter here; only whether the

@@ -14,6 +14,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **What concurrent HTTP clients pay for the search locks is now measured, and
+  the docs say so.** [docs/clients.md](docs/clients.md) claimed "~10 qps
+  expected for `search`" with nothing behind it. Eight clients at once now have
+  a table in [docs/deployment-topologies.md](docs/deployment-topologies.md#concurrent-clients-measured),
+  taken with `cargo test -p grooveseek --release --test http_lock_contention -- --ignored --nocapture`:
+  `search` throughput moves from ~7 to ~9 qps on a 9,813-chunk corpus and from
+  ~12–16 to ~13–20 qps on a 794-chunk one, latency grows about 4.5× at eight
+  clients, and a second daemon on a copy of the same corpus adds only 12–32% —
+  one query embedding already runs across every core, so the lock is not
+  holding idle hardware back. The database side is where cores wait (the graph
+  tool keeps one busy), and its share overtakes the embedding at roughly five
+  thousand chunks; below that no lock refactor can raise `search` throughput.
+
+  `grooveseek/tests/http_lock_contention.rs` is the instrument: an ignored
+  integration test that starts a real `groove serve --transport http`, releases
+  N threads from one barrier against `/mcp`, and prints the table with the
+  three discriminators the decision needed (one embedding versus one hybrid
+  fetch timed in-process, two daemons versus one, CPU per request). It asserts
+  only that it measured something — non-empty hits, no failed requests, the
+  latencies of a round summing to more than the round took — and runs on the
+  three-file fixture in the nightly `--include-ignored` job.
+
 ### Fixed
 
 - **The `groove eval` transcript in the quick start now shows what the binary
