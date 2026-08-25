@@ -16,6 +16,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **The source layout table in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+  is now compared with the tree.** The table went unrepaired across #195,
+  #196 and #197, which each split a module out of `server.rs`, and #212,
+  which added `legacy.rs`; a docs-only #214 repaired it by hand, because
+  nothing read it. `grooveseek/tests/docs_source_layout.rs` now walks every
+  file under each workspace member's `src` and requires both tables to
+  describe it: a row of its own, or its directory's row naming it in
+  backticks inside that row — the rule #214 worked out by hand, since a match
+  by file name hides `server/search.rs` behind `db/search.rs` — or, for a
+  member the table describes with a single crate-level row such as
+  `crates/groove-svc/`, that row alone. The other
+  direction too, compared as written so a wrong case fails on Windows as it
+  does on Linux; the English and Japanese tables in the same order; and a row
+  the reader cannot classify, or one with a `|` the parser would swallow, is
+  reported rather than skipped. The pages as they stood before #214 are
+  frozen under `grooveseek/tests/fixtures/docs-history/`, and the test
+  requires exactly those four modules to be what it reports there.
+
+  The `main.rs` row no longer copies the subcommand list. README and
+  `docs/index` carry it under a sentence the binary's `documented_flags`
+  module already compares with `Cli::command()`, and a second copy in a table
+  row is what the table just spent four pull requests demonstrating. It
+  points at [docs/usage.md](docs/usage.md) instead.
+
 - **A sentence that says it lists every command is now compared with the
   binary.** `README.md`, `README.ja.md` and the two `docs/index` pages each
   open their reference table with "Every command: `index`, `serve`, …", and

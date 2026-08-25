@@ -66,6 +66,28 @@ pub fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// A page's text with Windows line endings folded, so a byte offset and a
+/// line number mean the same thing on every checkout.
+///
+/// Three guards carried this as a private copy each before the fourth one
+/// arrived; `AGENTS.md` says the copy is collapsed by the change that would add
+/// another, so it lives here now.
+pub fn read(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// The path as a failure message names it: relative to the repository root,
+/// with `/` on every platform, so a message reads the same on Windows and in CI.
+pub fn shown(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+
 /// Directories the walk refuses to enter, by their path from the repository
 /// root, each with the reason -- so that removing one is an argument rather than
 /// a deletion.
@@ -73,7 +95,8 @@ pub const SKIPPED_PATHS: &[(&str, &str)] = &[
     ("target", "build output, including vendored sources"),
     (
         "grooveseek/tests/fixtures",
-        "knowledge bases under test, not documentation",
+        "knowledge bases under test and pages frozen from this repository's \
+         history, not documentation",
     ),
 ];
 
@@ -237,7 +260,7 @@ pub struct PinSite {
 }
 
 /// The 1-based line an offset falls on.
-fn line_of(markdown: &str, offset: usize) -> usize {
+pub fn line_of(markdown: &str, offset: usize) -> usize {
     markdown[..offset].matches('\n').count() + 1
 }
 

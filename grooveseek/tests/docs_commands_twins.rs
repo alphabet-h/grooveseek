@@ -40,24 +40,11 @@
 mod common;
 
 use common::docs::{
-    command_lines, english_counterpart, inline_chains, markdown_files, repo_root, shell_blocks,
+    command_lines, english_counterpart, inline_chains, markdown_files, read, repo_root,
+    shell_blocks, shown,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
-}
-
-fn shown(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-        .replace('\\', "/")
-}
 
 /// The commands each fenced shell block names, in source order.
 fn block_commands(markdown: &str) -> Vec<(usize, Vec<String>)> {
