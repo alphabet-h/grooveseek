@@ -9,6 +9,7 @@ HTTP transport for several clients at once, and the pieces around them.
 
 Add the following to `.mcp.json` in your project root (or the equivalent MCP config for your client):
 
+<!-- groove-pin: mcp-stdio-snippet -->
 ```json
 {
   "mcpServers": {
@@ -83,6 +84,7 @@ The server will be started automatically when the client connects.
 ## Keeping the index fresh via PostToolUse hook
 If you edit the knowledge base from inside a Claude Code session (or run a skill that writes Markdown files), the running MCP server will keep returning stale results until the index is rebuilt. A `PostToolUse` hook in `.claude/settings.json` can re-index automatically after every write. Minimal form:
 
+<!-- groove-pin: posttooluse-hook-snippet -->
 ```json
 {
   "hooks": {

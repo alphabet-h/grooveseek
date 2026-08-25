@@ -20,6 +20,7 @@ re-run indexing manually.
 
 Place this in `.claude/settings.json` alongside your other settings:
 
+<!-- groove-pin: posttooluse-hook-snippet -->
 ```json
 {
   "hooks": {

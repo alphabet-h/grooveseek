@@ -65,6 +65,7 @@ cargo build --release
 groove index --kb-path /path/to/knowledge-base
 ```
 
+<!-- groove-pin: mcp-stdio-snippet -->
 ```json
 {
   "mcpServers": {

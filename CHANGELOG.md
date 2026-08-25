@@ -14,6 +14,37 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Internal
+
+- **A command list copied into a second place now fails the test suite when the
+  copies disagree.** Three guards under `grooveseek/tests/` read every Markdown
+  page the repository publishes. `docs_commands_subset.rs` reports a page that
+  tells a reader to run a shortened copy of a command block it already carries;
+  `docs_commands_pinned.rs` holds the snippets published in more than one place
+  on purpose — the CI commands in [AGENTS.md](AGENTS.md) and
+  [CONTRIBUTING.md](CONTRIBUTING.md), the minimal `.mcp.json` in the README and
+  [docs/clients.md](docs/clients.md), the hook recipe in
+  [grooveseek/examples/hooks/](grooveseek/examples/hooks/) — each marked with an
+  invisible `<!-- groove-pin: id -->` and compared as a value rather than as
+  characters; and `docs_commands_twins.rs` requires an English page and its
+  Japanese counterpart to name the same commands.
+
+  The last of those found what it was built for.
+  [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) still gave Japanese readers a
+  four-command line to run before opening a pull request — the shortened copy
+  the English page deleted in #228, naming one clippy leg where CI runs two.
+  The block it was copied from is on the same page and says so outright, in a
+  different section eighty lines up, which is exactly how a copy drifts without
+  either half looking wrong. It now points at that block, as the English page
+  does.
+
+  Commands compare by identity — program plus subcommand — and not by their
+  flags, because a copy drifts in its flags first. The subset rule is
+  one-directional for a measured reason: two fenced blocks on one page stand in
+  a subset relation fifteen times here today, in `AGENTS.md`, `docs/usage.md`
+  and two deployment READMEs, and every one is deliberate, so a symmetric rule
+  would report fifteen false alarms on a clean tree.
+
 ## [1.0.1] - 2026-08-24
 
 ### Added

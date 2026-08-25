@@ -17,6 +17,7 @@ Claude Code の [PostToolUse hook](https://docs.claude.com/en/docs/claude-code/h
 
 以下を他の設定と並べて `.claude/settings.json` に配置:
 
+<!-- groove-pin: posttooluse-hook-snippet -->
 ```json
 {
   "hooks": {

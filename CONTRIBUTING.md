@@ -38,6 +38,7 @@ of them.
 
 To reproduce what CI runs, all of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails:
 
+<!-- groove-pin: ci-command-block -->
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings

@@ -2447,11 +2447,19 @@ mod documented_flags {
         /// `.ja.md` cannot be told from `.md` by extension — `Path::extension()`
         /// answers `"md"` for both, because it reads from the last dot. The file
         /// name's suffix is the only thing that separates them, and **this is
-        /// the only place that reads it**. `owns` decides which corpus a
-        /// coverage check gathers, and [`counterpart`] decides which file to
-        /// look for beside a page; two classifiers would eventually disagree
-        /// about one name, and then a page could be English to one check and
-        /// Japanese to the other.
+        /// the only place in this module that reads it**. `owns` decides which
+        /// corpus a coverage check gathers, and [`counterpart`] decides which
+        /// file to look for beside a page; two classifiers would eventually
+        /// disagree about one name, and then a page could be English to one
+        /// check and Japanese to the other.
+        ///
+        /// It is not the only one in the tree. `tests/common/docs.rs` reads the
+        /// suffix as well, for the guard that compares a page's commands with
+        /// its twin's. This module is `#[cfg(test)]` inside the **binary** and
+        /// an integration test links the library, so the two cannot be shared
+        /// without moving test-only code into the shipping library. The scope of
+        /// the claim above is this module, and it is written down here rather
+        /// than left to be rediscovered.
         fn of(path: &Path) -> Option<Self> {
             let name = path.file_name()?.to_string_lossy().into_owned();
             if name.ends_with(JAPANESE_SUFFIX) {

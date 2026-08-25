@@ -118,7 +118,10 @@ retrieval に触れる変更 (クエリのコンパイル、fusion、chunk 分�
 
 1. リポジトリを fork し、`main` からブランチを切る
 2. 新しい挙動にはテストを追加 (ユニットは inline、integration は `tests/` 配下)
-3. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test && cargo doc --no-deps --workspace --all-features --document-private-items` を pass
+3. [ビルドとテスト](#ビルドとテスト)のブロックにあるコマンドを、**そこに書かれた順で
+   すべて**通す。ここに再掲しないのは意図的 — **この手順はかつて自前の短いコピーを
+   持っていて、そのコピーがドリフトした**。CI が 2 脚回している clippy を 1 脚しか
+   書いておらず、上のブロックが警告しているとおりの失敗そのものだった
 4. 問題と変更内容を明示した PR を開く (関連 issue があればリンク)
 
 ## バグ報告
