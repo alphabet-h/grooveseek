@@ -681,8 +681,9 @@ fn normalize_for_quote(s: &str) -> String {
 /// レポートに出す query の識別子。`id` が無い golden では文面の先頭を使う。
 ///
 /// [`run`] の per-query ループと所見の両方がこれを呼ぶ。2 箇所で別々に組み立てると
-/// 同じ query が違う名前で出る。
-fn query_id(q: &GoldenQuery) -> String {
+/// 同じ query が違う名前で出る。`tests/docs_eval_transcript.rs` も docs の出力例の
+/// 行 id をここから作る (例が別の規則で id を書くのを防ぐ)。
+pub fn query_id(q: &GoldenQuery) -> String {
     q.id.clone()
         .unwrap_or_else(|| q.query.chars().take(32).collect())
 }

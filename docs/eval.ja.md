@@ -49,15 +49,19 @@ groove eval --kb-path ./knowledge-base
 出力:
 
 ```
-groove eval — 2026-04-24T14:32:01+09:00
+groove eval — 2026-04-24T05:32:01+00:00
   model: bge-m3    reranker: none    limit: 10    queries: 2
+  corpus: 646 docs / 11215 chunks
 
 Aggregate
-  recall@1   0.500
-  recall@5   1.000
-  recall@10  1.000
-  MRR        0.750
-  nDCG@10    0.821
+  recall@1   0.250
+  recall@5   0.500
+  recall@10  0.500
+  MRR        0.500
+  nDCG@10    0.460
+
+Per-query (regressions and misses, 1 of 2)
+  ✗ チャンクの重複排除はどうしている？        recall@10: 0.00
 ```
 
 2 回目以降は自動で前回との差分が表示される。
@@ -77,7 +81,8 @@ Aggregate
 | `defaults.rerank` | bool | no | 予約フィールド。現状は CLI `--reranker` を使う |
 
 **ヒット判定**: `path` が search 結果と完全一致、かつ (heading 指定があれば)
-`trim` + 小文字化した heading が一致したら正解。
+`trim` + 小文字化した heading が一致したら正解。`heading` を省略した場合は、
+そのファイル内のどの chunk がヒットしても正解。
 
 ## 指標の意味
 
@@ -101,7 +106,7 @@ top 内の並び順は関係ない。
 
 top の 1 件だけが本命で良いユースケースで特に重要。
 
-### nDCG@k
+### nDCG@k (Normalized Discounted Cumulative Gain)
 
 > 「正解が上の方に集中しているか」
 
