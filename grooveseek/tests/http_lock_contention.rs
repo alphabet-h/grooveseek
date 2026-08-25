@@ -1,10 +1,10 @@
 //! How much does the lock inside `search` cost concurrent HTTP clients?
 //!
-//! The server's `KbCore::search_blocking` (private to `grooveseek::server`)
-//! takes three [`std::sync::Mutex`]es in order: `embedder` (released as soon
-//! as the query is embedded), then `reranker` (taken even when no reranker is
-//! configured) and `db`, both held to the end of the pipeline. Every HTTP
-//! session shares the same three. Feature idea D-13
+//! The search body in [`grooveseek::server`] (a private `search_blocking` on
+//! its `KbCore`) takes three [`std::sync::Mutex`]es in order: `embedder`
+//! (released as soon as the query is embedded), then `reranker` (taken even
+//! when no reranker is configured) and `db`, both held to the end of the
+//! pipeline. Every HTTP session shares the same three. Feature idea D-13
 //! asks whether that serialisation is a real problem for N concurrent
 //! clients, and whether splitting the locks would buy anything.
 //!
@@ -58,9 +58,9 @@
 //! With no environment variables that copies `tests/fixtures/kb-bench` to a
 //! temp directory, indexes it with BGE-small and measures that. For decision
 //! numbers point it at a real, already-indexed corpus (the test copies the
-//! tree and its `.groove.db` to a temp root first and never touches the
-//! original) and build in release, because the dev profile compiles the
-//! bundled sqlite-vec at `-O0` and inflates D alone:
+//! tree and takes a consistent snapshot of its `.groove.db` into a temp root
+//! first, and never writes to the original) and build in release, because the
+//! dev profile compiles the bundled sqlite-vec at `-O0` and inflates D alone:
 //!
 //! ```text
 //! GROOVE_BENCH_KB=<kb dir>            # its parent must hold .groove.db
@@ -84,7 +84,7 @@
 
 mod common;
 
-use common::mcp::{build_index, spawn_mcp_server, spawn_mcp_server_with_args};
+use common::mcp::{build_index, spawn_mcp_server_with_args};
 use common::temp::{TempKbLayout, TempRoot};
 use grooveseek::db::{Database, FusionParams, SearchFilters};
 use grooveseek::embedder::{Embedder, ModelChoice};
@@ -240,16 +240,29 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// Copy `.groove.db` and, if present, its `-wal` sidecar. The `-shm` file
-/// is per-process state and is rebuilt by whoever opens the copy.
+/// A consistent snapshot of `.groove.db` at `dst_db`, taken with SQLite's
+/// `VACUUM INTO` from a connection of our own.
+///
+/// Copying the main file and its `-wal` as two filesystem operations is not
+/// a snapshot: a writer (a daemon's watcher, an `index` run) committing or
+/// checkpointing between the two copies pairs files from different moments,
+/// and the copy is then stale or torn (codex P2 round 1 on PR #235).
+/// `VACUUM INTO` reads the source inside one read transaction and writes a
+/// complete database, so what the daemon opens is what the source was at
+/// one instant. It is read-only on the source, and it does not need the
+/// sqlite-vec module: the `vec0` tables' data lives in ordinary shadow
+/// tables, and their declarations are copied as schema rows.
 fn copy_db_files(src_db: &Path, dst_db: &Path) {
-    std::fs::copy(src_db, dst_db)
-        .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src_db.display(), dst_db.display()));
-    let wal = PathBuf::from(format!("{}-wal", src_db.display()));
-    if wal.exists() {
-        std::fs::copy(&wal, PathBuf::from(format!("{}-wal", dst_db.display())))
-            .unwrap_or_else(|e| panic!("copy {}: {e}", wal.display()));
-    }
+    let src = rusqlite::Connection::open(src_db)
+        .unwrap_or_else(|e| panic!("open {} for the snapshot: {e}", src_db.display()));
+    src.execute("VACUUM INTO ?1", [dst_db.to_string_lossy().as_ref()])
+        .unwrap_or_else(|e| {
+            panic!(
+                "VACUUM INTO {} from {}: {e}",
+                dst_db.display(),
+                src_db.display()
+            )
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,7 +1192,12 @@ fn concurrent_tools_call_latency_table() {
     };
 
     let staged = stage_corpus();
-    let (guard, base) = spawn_mcp_server(&staged.kb, &staged.config);
+    // `--reranker none` is explicit rather than left to the config: a
+    // production `groove.toml` names a reranker, and `serve` would load it
+    // (2.3 GB resident) into a daemon whose table says "no reranker"
+    // (codex P1 round 1 on PR #235). Only the reference daemon gets one.
+    let no_reranker = ["--reranker", "none"];
+    let (guard, base) = spawn_mcp_server_with_args(&staged.kb, &staged.config, &no_reranker);
     let authority = authority_of(&base);
     let pid = Some(guard.pid());
 
@@ -1295,7 +1313,8 @@ fn concurrent_tools_call_latency_table() {
 
     // Twin: the same corpus served twice, N=8 split 4+4.
     let twin_corpus = staged.twin();
-    let (twin_guard, twin_base) = spawn_mcp_server(&twin_corpus.kb, &twin_corpus.config);
+    let (twin_guard, twin_base) =
+        spawn_mcp_server_with_args(&twin_corpus.kb, &twin_corpus.config, &no_reranker);
     let twin_site = Site {
         authorities: vec![authority.clone(), authority_of(&twin_base)],
         query: &query,
