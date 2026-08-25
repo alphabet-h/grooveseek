@@ -2724,6 +2724,183 @@ mod documented_flags {
         );
     }
 
+    /// Neither reader below has a grammar for what a name looks like, on
+    /// purpose. A grammar always has a boundary a stray can hide behind:
+    /// `[a-z-]*` read `status2` as `status`, `[a-z0-9_-]*` read `statusBAD`
+    /// as `status`, and each time the set still equalled the binary's with the
+    /// wrong name on the page. So the readers take the whole delimited
+    /// candidate — everything between the backticks, the whole non-space run
+    /// after `groove service` — and leave the judgement to the set comparison,
+    /// which is the only part of this that knows what a name is.
+    ///
+    /// The names a line enumerates, when the line says it is the whole list.
+    /// The needles are the English wording and its two Japanese renderings;
+    /// fewer than three names is a mention, not an enumeration.
+    fn enumerated_names(line: &str) -> Option<BTreeSet<String>> {
+        let says_every = line.contains("Every command")
+            || line.contains("全コマンド")
+            || line.contains("全サブコマンド");
+        let token = regex::Regex::new("`([^`\n]+)`").expect("a valid pattern");
+        let named: BTreeSet<String> = token
+            .captures_iter(line)
+            .map(|c| c[1].to_string())
+            .collect();
+        (says_every && named.len() >= 3).then_some(named)
+    }
+
+    /// Every `groove service <verb>` a body of prose shows, verbs taken whole.
+    ///
+    /// The candidate is the non-space run after `groove service` up to a
+    /// backtick, with the punctuation prose hangs on the end (`.` `,` `;` `:`
+    /// `)`) removed. A group written as `install/uninstall/tray-install` — the
+    /// form `docs/ARCHITECTURE.md` uses — is split on `/` so every name in it
+    /// reaches the comparison. A `<placeholder>` — opening and closing angle
+    /// bracket as the whole candidate — is not a candidate; `<verb>BAD` is.
+    fn service_verbs(text: &str) -> BTreeSet<String> {
+        let verb = regex::Regex::new("groove service ([^\\s`]+)").expect("a valid pattern");
+        let placeholder = |name: &str| name.starts_with('<') && name.ends_with('>');
+        verb.captures_iter(text)
+            .flat_map(|c| {
+                c[1].trim_end_matches(['.', ',', ';', ':', ')'])
+                    .split('/')
+                    .filter(|name| !name.is_empty() && !placeholder(name))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_malformed_name_is_captured_whole_rather_than_dropped() {
+        let named = enumerated_names(
+            "| Every command: `index`, `status2`, `serve`, `foo_bar`, `bogusBAD` |",
+        )
+        .expect("three or more names under the needle is an enumeration");
+        for stray in ["status2", "foo_bar", "bogusBAD"] {
+            assert!(named.contains(stray), "{stray} should be in {named:?}");
+        }
+        assert!(!named.contains("status"), "{named:?}");
+
+        let verbs = service_verbs(
+            "run `groove service status2` then `groove service tray-install_legacy`, \
+             or groove service statusBAD. Never groove service <verb>, \
+             and not groove service <verb>BAD either.",
+        );
+        assert_eq!(
+            verbs,
+            ["status2", "tray-install_legacy", "statusBAD", "<verb>BAD"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+
+        // The grouped form, with a stray in the middle of the group.
+        let grouped = service_verbs("`groove service install/bogus/tray-install/tray-uninstall`");
+        assert_eq!(
+            grouped,
+            ["install", "bogus", "tray-install", "tray-uninstall"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    /// "Every command: `index`, `serve`, …" is a claim about a set, and the set
+    /// has one owner: [`Cli`], through clap's `command()`.
+    ///
+    /// The README once listed nine of the ten subcommands under exactly that
+    /// heading — `status` was missing — and nothing noticed, because the flag
+    /// checks above read tokens that start with `--` and a subcommand name has
+    /// no such shape. A sentence that names itself as the whole list is the one
+    /// place where "the list" can be compared with the thing it enumerates, so
+    /// that is what is compared: not that each name appears somewhere, but that
+    /// the enumeration is the set, with nothing missing and nothing extra.
+    ///
+    /// The same is done for `groove service <verb>`: every verb the binary has
+    /// must be shown as a command in `docs/usage.md`, and every verb the pages
+    /// show must be one the binary has. Both directions, like the flags.
+    #[test]
+    fn every_sentence_that_says_every_command_names_exactly_the_commands_the_binary_has() {
+        let cli = Cli::command();
+        let own: BTreeSet<String> = cli
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        // The four pages that carry the sentence today, each required on its
+        // own. A count over the whole corpus would let a new enumeration on
+        // some other page stand in for one of these being reworded away, and
+        // losing the subject is a different failure from the list being wrong.
+        const SITES: &[&str] = &[
+            "README.md",
+            "README.ja.md",
+            "docs/index.md",
+            "docs/index.ja.md",
+        ];
+        for site in SITES {
+            let page = std::fs::read_to_string(repo_root().join(site))
+                .unwrap_or_else(|e| panic!("{site} must be readable: {e}"));
+            assert!(
+                page.lines().any(|line| enumerated_names(line).is_some()),
+                "{site} no longer carries a sentence that enumerates every \
+                 command. Either the wording moved away from the needles this \
+                 test reads (update them here) or the enumeration was deleted."
+            );
+        }
+
+        let mut wrong: Vec<String> = Vec::new();
+        for corpus in [Corpus::English, Corpus::Japanese] {
+            for line in published_docs(corpus).lines() {
+                let Some(named) = enumerated_names(line) else {
+                    continue;
+                };
+                if named != own {
+                    wrong.push(format!(
+                        "{}: {}\n    missing: {:?}\n    not a subcommand: {:?}",
+                        corpus.label(),
+                        line.trim(),
+                        own.difference(&named).collect::<Vec<_>>(),
+                        named.difference(&own).collect::<Vec<_>>(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a sentence that says it lists every command does not list \
+             exactly the commands `groove --help` shows:\n  {}\n\
+             The binary is the list; fix the sentence.",
+            wrong.join("\n  ")
+        );
+
+        let own_verbs: BTreeSet<String> = cli
+            .find_subcommand("service")
+            .expect("groove has a `service` subcommand")
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect();
+        let mut shown: BTreeSet<String> = BTreeSet::new();
+        for corpus in [Corpus::English, Corpus::Japanese] {
+            shown.extend(service_verbs(&published_docs(corpus)));
+        }
+        let usage = std::fs::read_to_string(repo_root().join("docs/usage.md"))
+            .expect("docs/usage.md is the page that documents every subcommand");
+        let shown_in_usage = service_verbs(&usage);
+
+        let undocumented: Vec<&String> = own_verbs.difference(&shown_in_usage).collect();
+        assert!(
+            undocumented.is_empty(),
+            "docs/usage.md never shows these as `groove service <verb>`: {undocumented:?}. \
+             Show each verb as a command a reader can run, not only in prose."
+        );
+        let stray: Vec<&String> = shown.difference(&own_verbs).collect();
+        assert!(
+            stray.is_empty(),
+            "the documentation shows `groove service <verb>` for verbs the binary \
+             lacks: {stray:?}. Either the verb was renamed and the pages were not, \
+             or it never existed."
+        );
+    }
+
     /// `/mcp__<server>__<name>` — and `<server>` is not ours to name.
     ///
     /// A client builds that path from the key the **user** wrote in their
