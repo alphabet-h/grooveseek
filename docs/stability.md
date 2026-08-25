@@ -284,7 +284,9 @@ it as a hint to be careful and never as a verdict.
 
 - **Tool names**, their **input schemas** (parameter names, types, and which are
   required), and the **fields of their results**. Fields may be added; existing
-  fields do not change meaning.
+  fields do not change meaning. `list_topics` gaining `children` in 1.1.0 is
+  what such an addition looks like: a new key on every entry, nothing existing
+  renamed or re-typed.
 - **Prompt names**: `deep_dive`, `find_gaps`, `summarize_topic`, `whats_new`. The
   prompt *text* they expand to is not stable.
 - **The `kb://` resource URI scheme**, including `kb://doc/{path}` and

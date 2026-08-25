@@ -148,14 +148,16 @@ field itself is frozen for 1.0; the formula and the default explicitly are not
 
 These are **different fields** in the index:
 
-- **`category`** filters `documents.category`, a single string column populated
-  from the `category:` frontmatter field (or auto-derived path segment).
+- **`category`** filters `documents.category`, a single string column derived
+  from the first path segment of the document. There is no `category:`
+  frontmatter field; only `topic:` can be set in frontmatter, and it overrides
+  the second path segment.
 - **`tags_any` / `tags_all`** filter `documents.tags`, a JSON array of tag
   strings populated from the `tags:` frontmatter list.
 
-A document with `category: "deep-dive"` and `tags: ["mcp", "rust"]` matches
-`category: "deep-dive"` but **does not** match `tags_any: ["deep-dive"]` —
-they're separate axes.
+A document at `deep-dive/mcp/x.md` with `tags: ["mcp", "rust"]` matches the
+filter `category: "deep-dive"` but **does not** match `tags_any: ["deep-dive"]`
+— they're separate axes.
 
 ## Combining filters
 
