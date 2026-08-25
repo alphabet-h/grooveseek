@@ -177,11 +177,11 @@ fn layout_rows(markdown: &str, section: &str) -> Option<Table> {
             continue;
         }
         if let Event::End(TagEnd::Heading(level)) = event {
-            if let Some(text) = heading.take() {
-                if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-                    in_section = text.trim() == section;
-                    found |= in_section;
-                }
+            if let Some(text) = heading.take()
+                && matches!(level, HeadingLevel::H1 | HeadingLevel::H2)
+            {
+                in_section = text.trim() == section;
+                found |= in_section;
             }
             continue;
         }
@@ -228,10 +228,11 @@ fn layout_rows(markdown: &str, section: &str) -> Option<Table> {
                 }
             }
             Event::Text(t) => {
-                if let Some(r) = current.as_mut() {
-                    if r.cell == 1 && !t.trim().is_empty() {
-                        r.first_has_text = true;
-                    }
+                if let Some(r) = current.as_mut()
+                    && r.cell == 1
+                    && !t.trim().is_empty()
+                {
+                    r.first_has_text = true;
                 }
             }
             Event::End(TagEnd::TableRow) => {
@@ -998,6 +999,7 @@ const DIRECTORY_ANCHORS: &[(&str, &str)] = &[
 struct Live {
     page: &'static str,
     table: Table,
+    members: Vec<String>,
     extensions: BTreeSet<String>,
     drift: Drift,
 }
@@ -1089,6 +1091,7 @@ fn live() -> Vec<Live> {
         out.push(Live {
             page,
             table,
+            members: members.clone(),
             extensions,
             drift,
         });
@@ -1096,19 +1099,30 @@ fn live() -> Vec<Live> {
     out
 }
 
-/// What to do about a file the table does not cover.
-fn hint_for(path: &str, table: &Table) -> String {
+/// What to do about a file the table does not cover: the ways a row can
+/// cover it, and -- for a crate other than the one this table is for -- the
+/// crate-level row that would describe the crate as a whole instead.
+fn hint_for(path: &str, table: &Table, members: &[String]) -> String {
     let (parent, name) = path
         .rsplit_once('/')
         .expect("a path under src has a parent");
     let dir = format!("{parent}/");
-    match table.rows.iter().find(|r| r.path == dir) {
+    let mut hint = match table.rows.iter().find(|r| r.path == dir) {
         Some(row) => format!(
             "name `{name}` in the `{dir}` row at line {}, or give it a row of its own",
             row.line
         ),
         None => format!("give it a row of its own, or a `{dir}` row that names it"),
+    };
+    if let Some(member) = members
+        .iter()
+        .find(|m| m.as_str() != "grooveseek" && path.starts_with(&format!("{m}/src/")))
+    {
+        hint.push_str(&format!(
+            ", or describe the crate as a whole with a `{member}/` row"
+        ));
     }
+    hint
 }
 
 #[test]
@@ -1119,7 +1133,7 @@ fn every_file_under_a_file_level_member_has_a_row_or_is_named_by_its_directory_r
         for path in &live.drift.missing {
             offenders.push(format!(
                 "{page}: `{path}` has no row -- {}",
-                hint_for(path, &live.table)
+                hint_for(path, &live.table, &live.members)
             ));
         }
         for (line, dir) in &live.drift.empty {
