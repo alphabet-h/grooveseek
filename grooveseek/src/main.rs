@@ -2746,26 +2746,47 @@ mod documented_flags {
             .map(|c| c.get_name().to_string())
             .collect();
         let token = regex::Regex::new(r"`([a-z][a-z-]*)`").expect("a valid pattern");
+        // The names a line enumerates, when the line says it is the whole
+        // list. The needles are the English wording and its two Japanese
+        // renderings; fewer than three names is a mention, not an enumeration.
+        let enumerated = |line: &str| -> Option<BTreeSet<String>> {
+            let says_every = line.contains("Every command")
+                || line.contains("全コマンド")
+                || line.contains("全サブコマンド");
+            let named: BTreeSet<String> = token
+                .captures_iter(line)
+                .map(|c| c[1].to_string())
+                .collect();
+            (says_every && named.len() >= 3).then_some(named)
+        };
 
-        let mut enumerations = 0;
+        // The four pages that carry the sentence today, each required on its
+        // own. A count over the whole corpus would let a new enumeration on
+        // some other page stand in for one of these being reworded away, and
+        // losing the subject is a different failure from the list being wrong.
+        const SITES: &[&str] = &[
+            "README.md",
+            "README.ja.md",
+            "docs/index.md",
+            "docs/index.ja.md",
+        ];
+        for site in SITES {
+            let page = std::fs::read_to_string(repo_root().join(site))
+                .unwrap_or_else(|e| panic!("{site} must be readable: {e}"));
+            assert!(
+                page.lines().any(|line| enumerated(line).is_some()),
+                "{site} no longer carries a sentence that enumerates every \
+                 command. Either the wording moved away from the needles this \
+                 test reads (update them here) or the enumeration was deleted."
+            );
+        }
+
         let mut wrong: Vec<String> = Vec::new();
         for corpus in [Corpus::English, Corpus::Japanese] {
             for line in published_docs(corpus).lines() {
-                if !(line.contains("Every command")
-                    || line.contains("全コマンド")
-                    || line.contains("全サブコマンド"))
-                {
+                let Some(named) = enumerated(line) else {
                     continue;
-                }
-                let named: BTreeSet<String> = token
-                    .captures_iter(line)
-                    .map(|c| c[1].to_string())
-                    .collect();
-                // Fewer than three names is a mention, not an enumeration.
-                if named.len() < 3 {
-                    continue;
-                }
-                enumerations += 1;
+                };
                 if named != own {
                     wrong.push(format!(
                         "{}: {}\n    missing: {:?}\n    not a subcommand: {:?}",
@@ -2777,17 +2798,6 @@ mod documented_flags {
                 }
             }
         }
-        // README.md, README.ja.md, docs/index.md and docs/index.ja.md each
-        // carry one today. If that stops being true this test has lost its
-        // subject, which is a different failure from the list being wrong.
-        assert!(
-            enumerations >= 4,
-            "expected at least four sentences that enumerate every command \
-             (README.md, README.ja.md, docs/index.md, docs/index.ja.md), found \
-             {enumerations}. Either the wording moved away from `Every command` \
-             / `全コマンド` / `全サブコマンド` — update the needle here — or the \
-             enumeration was deleted."
-        );
         assert!(
             wrong.is_empty(),
             "a sentence that says it lists every command does not list \
@@ -2802,7 +2812,11 @@ mod documented_flags {
             .get_subcommands()
             .map(|c| c.get_name().to_string())
             .collect();
-        let verb = regex::Regex::new(r"groove service ([a-z][a-z-]*)").expect("a valid pattern");
+        // The trailing boundary is what makes the reverse direction mean
+        // anything: without it `groove service status2` would be read as
+        // `status` and vouched for by the real verb it extends.
+        let verb = regex::Regex::new(r"groove service ([a-z][a-z-]*)(?:[^a-z0-9_-]|$)")
+            .expect("a valid pattern");
         let mut shown: BTreeSet<String> = BTreeSet::new();
         for corpus in [Corpus::English, Corpus::Japanese] {
             shown.extend(
