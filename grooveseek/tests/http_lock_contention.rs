@@ -896,6 +896,15 @@ impl Cell {
         self.cpu_ms.map(|c| c / self.samples.len().max(1) as f64)
     }
 
+    /// Sum of the samples' latencies over the wall clock they took: 1.0 for
+    /// requests issued one after another, up to N for N fully overlapping.
+    fn overlap(&self) -> f64 {
+        if self.wall_ms <= 0.0 {
+            return f64::NAN;
+        }
+        self.samples.iter().map(|s| s.first_data_ms).sum::<f64>() / self.wall_ms
+    }
+
     fn row(&self, cores: usize) -> String {
         let lat = sorted_latencies(&self.samples);
         let mut tails: Vec<f64> = self
@@ -1306,20 +1315,21 @@ fn concurrent_tools_call_latency_table() {
             search_n1.p50()
         );
     }
-    let parallel_ratio = doc_n8.qps() / doc_n1.qps();
-    assert!(
-        parallel_ratio > 1.0,
-        "document qps at N=8 ({:.1}) is not above N=1 ({:.1}): the client did not run in parallel",
-        doc_n8.qps(),
-        doc_n1.qps()
-    );
-    if real_corpus {
+    // The client really ran in parallel: the latencies of one round add up
+    // to more than the round took. A sequential client scores exactly 1.0
+    // here whatever the server does (probe M1: making the fan-out a loop
+    // left the qps ratios within noise on 2 ms requests, so a qps ratio
+    // is not the invariant; this is).
+    for c in [&search_n8, &doc_n8] {
         assert!(
-            parallel_ratio >= 3.0,
-            "document qps at N=8 is only {parallel_ratio:.2}x N=1 on a real corpus; the load generator \
-             is not delivering eight concurrent requests"
+            c.overlap() >= 2.0,
+            "{} N=8: the latencies sum to {:.2}x the wall clock; below 2.0 the eight requests \
+             were not in flight together, so the load generator is not delivering what the table claims",
+            c.workload.name(),
+            c.overlap()
         );
     }
+    let parallel_ratio = doc_n8.qps() / doc_n1.qps();
 
     // ---- verdict --------------------------------------------------------
     let e = ed.e_ms;
