@@ -2724,6 +2724,63 @@ mod documented_flags {
         );
     }
 
+    /// What a command or verb name looks like on a page, for both readers below.
+    ///
+    /// Wider than what clap would accept on purpose: a malformed name such as
+    /// `status2` or `tray-install_legacy` has to be captured **whole** so that
+    /// it lands in the set and the comparison rejects it. A grammar that
+    /// stopped at the first digit or underscore would read `status2` as
+    /// `status` — a real name vouching for a wrong one — or skip it, and a set
+    /// that equalled the binary's would pass with the stray still on the page.
+    const NAME: &str = r"[a-z][a-z0-9_-]*";
+
+    /// The names a line enumerates, when the line says it is the whole list.
+    ///
+    /// The needles are the English wording and its two Japanese renderings;
+    /// fewer than three names is a mention, not an enumeration.
+    fn enumerated_names(line: &str) -> Option<BTreeSet<String>> {
+        let says_every = line.contains("Every command")
+            || line.contains("全コマンド")
+            || line.contains("全サブコマンド");
+        let token = regex::Regex::new(&format!("`({NAME})`")).expect("a valid pattern");
+        let named: BTreeSet<String> = token
+            .captures_iter(line)
+            .map(|c| c[1].to_string())
+            .collect();
+        (says_every && named.len() >= 3).then_some(named)
+    }
+
+    /// Every `groove service <verb>` a body of prose shows, verbs captured whole.
+    ///
+    /// The trailing boundary keeps `groove services` and a name glued to the
+    /// next word out; what precedes it is [`NAME`], so anything name-shaped is
+    /// returned as written rather than truncated to a real verb.
+    fn service_verbs(text: &str) -> BTreeSet<String> {
+        let verb = regex::Regex::new(&format!(r"groove service ({NAME})(?:[^a-z0-9_-]|$)"))
+            .expect("a valid pattern");
+        verb.captures_iter(text).map(|c| c[1].to_string()).collect()
+    }
+
+    #[test]
+    fn a_malformed_name_is_captured_whole_rather_than_dropped() {
+        let named = enumerated_names("| Every command: `index`, `status2`, `serve`, `foo_bar` |")
+            .expect("three or more names under the needle is an enumeration");
+        assert!(named.contains("status2"), "{named:?}");
+        assert!(named.contains("foo_bar"), "{named:?}");
+        assert!(!named.contains("status"), "{named:?}");
+
+        let verbs = service_verbs(
+            "run `groove service status2` then `groove service tray-install_legacy`.",
+        );
+        assert_eq!(
+            verbs,
+            ["status2", "tray-install_legacy"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
     /// "Every command: `index`, `serve`, …" is a claim about a set, and the set
     /// has one owner: [`Cli`], through clap's `command()`.
     ///
@@ -2745,21 +2802,6 @@ mod documented_flags {
             .get_subcommands()
             .map(|c| c.get_name().to_string())
             .collect();
-        let token = regex::Regex::new(r"`([a-z][a-z-]*)`").expect("a valid pattern");
-        // The names a line enumerates, when the line says it is the whole
-        // list. The needles are the English wording and its two Japanese
-        // renderings; fewer than three names is a mention, not an enumeration.
-        let enumerated = |line: &str| -> Option<BTreeSet<String>> {
-            let says_every = line.contains("Every command")
-                || line.contains("全コマンド")
-                || line.contains("全サブコマンド");
-            let named: BTreeSet<String> = token
-                .captures_iter(line)
-                .map(|c| c[1].to_string())
-                .collect();
-            (says_every && named.len() >= 3).then_some(named)
-        };
-
         // The four pages that carry the sentence today, each required on its
         // own. A count over the whole corpus would let a new enumeration on
         // some other page stand in for one of these being reworded away, and
@@ -2774,7 +2816,7 @@ mod documented_flags {
             let page = std::fs::read_to_string(repo_root().join(site))
                 .unwrap_or_else(|e| panic!("{site} must be readable: {e}"));
             assert!(
-                page.lines().any(|line| enumerated(line).is_some()),
+                page.lines().any(|line| enumerated_names(line).is_some()),
                 "{site} no longer carries a sentence that enumerates every \
                  command. Either the wording moved away from the needles this \
                  test reads (update them here) or the enumeration was deleted."
@@ -2784,7 +2826,7 @@ mod documented_flags {
         let mut wrong: Vec<String> = Vec::new();
         for corpus in [Corpus::English, Corpus::Japanese] {
             for line in published_docs(corpus).lines() {
-                let Some(named) = enumerated(line) else {
+                let Some(named) = enumerated_names(line) else {
                     continue;
                 };
                 if named != own {
@@ -2812,24 +2854,13 @@ mod documented_flags {
             .get_subcommands()
             .map(|c| c.get_name().to_string())
             .collect();
-        // The trailing boundary is what makes the reverse direction mean
-        // anything: without it `groove service status2` would be read as
-        // `status` and vouched for by the real verb it extends.
-        let verb = regex::Regex::new(r"groove service ([a-z][a-z-]*)(?:[^a-z0-9_-]|$)")
-            .expect("a valid pattern");
         let mut shown: BTreeSet<String> = BTreeSet::new();
         for corpus in [Corpus::English, Corpus::Japanese] {
-            shown.extend(
-                verb.captures_iter(&published_docs(corpus))
-                    .map(|c| c[1].to_string()),
-            );
+            shown.extend(service_verbs(&published_docs(corpus)));
         }
         let usage = std::fs::read_to_string(repo_root().join("docs/usage.md"))
             .expect("docs/usage.md is the page that documents every subcommand");
-        let shown_in_usage: BTreeSet<String> = verb
-            .captures_iter(&usage)
-            .map(|c| c[1].to_string())
-            .collect();
+        let shown_in_usage = service_verbs(&usage);
 
         let undocumented: Vec<&String> = own_verbs.difference(&shown_in_usage).collect();
         assert!(
