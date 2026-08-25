@@ -137,7 +137,16 @@ pub fn drain_stderr_keeping(stderr: ChildStderr, log: StderrLog) -> (Receiver<Re
 /// `watch` decides whether the file watcher runs: `spawn_mcp_server` freezes
 /// the index for deterministic search assertions, `spawn_mcp_server_with_watch`
 /// exercises the real-disk event pipeline.
-fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard, String) {
+///
+/// `extra_args` is appended verbatim after the flags above, so a caller can
+/// add a `serve` option the helper has no opinion about (`--reranker`, ...)
+/// without carrying a second copy of the spawn-and-wait logic.
+fn spawn_serve(
+    kb_path: &Path,
+    config_path: &Path,
+    watch: bool,
+    extra_args: &[&str],
+) -> (ServerGuard, String) {
     let bin = grooveseek_bin();
     assert!(
         bin.exists(),
@@ -159,6 +168,7 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
     if !watch {
         args.push("--no-watch");
     }
+    args.extend_from_slice(extra_args);
 
     // **`RUST_LOG` is set rather than inherited.** `main` builds its filter
     // from that variable and falls back to `info` when it is unset, so a
@@ -223,7 +233,22 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
 /// Returns the guard and the base URL the OS assigned. The watcher is off, so
 /// the index state is frozen and search assertions stay deterministic.
 pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    spawn_serve(kb_path, config_path, false)
+    spawn_serve(kb_path, config_path, false, &[])
+}
+
+/// [`spawn_mcp_server`] with extra `serve` arguments appended after the
+/// helper's own (`--no-watch` included).
+///
+/// Used by `tests/http_lock_contention.rs` to start a daemon with
+/// `--reranker bge-v2-m3` for its reference rows. The flags stay with the
+/// caller because they are the caller's question; the spawning and the
+/// readiness wait stay here because they are everyone's.
+pub fn spawn_mcp_server_with_args(
+    kb_path: &Path,
+    config_path: &Path,
+    extra_args: &[&str],
+) -> (ServerGuard, String) {
+    spawn_serve(kb_path, config_path, false, extra_args)
 }
 
 /// Same as [`spawn_mcp_server`] but **with** the watcher
@@ -239,7 +264,7 @@ pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, Str
 /// `sleep(2000)`: there was no signal to wait for. There is one now, printed
 /// the moment `debouncer.watch()` succeeds, and [`spawn_serve`] waits for it.
 pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    spawn_serve(kb_path, config_path, true)
+    spawn_serve(kb_path, config_path, true, &[])
 }
 
 /// Stand up a one-document knowledge base with the given `groove.toml`, and
@@ -286,6 +311,15 @@ impl ServerGuard {
     /// caller holds this guard they are already here.
     pub fn stderr(&self) -> &StderrLog {
         &self.stderr
+    }
+
+    /// OS process id of the server child.
+    ///
+    /// A measurement that samples the daemon's CPU time from outside
+    /// (`Get-Process -Id`, `/proc/<pid>/stat`) needs the id; nothing else
+    /// about the child is exposed, so the guard stays the only owner.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("child is present").id()
     }
 }
 
