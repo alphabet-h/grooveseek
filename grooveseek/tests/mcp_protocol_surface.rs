@@ -638,12 +638,12 @@ fn the_tool_descriptions_name_the_behaviour_the_server_has() {
 
 /// A server over an index seeded through the library, the way
 /// `tests/doctor_cli.rs` seeds one: no model run is needed for rows to exist,
-/// and `serve` does not index on start, so what the tool reads back is exactly
+/// and `groove serve` does not index on start, so what the tool reads back is exactly
 /// what was written. Each row is `(path, category, topic)`, spelled out rather
 /// than derived, because the derivation is the indexer's and one row below
 /// deliberately disagrees with it.
 ///
-/// The layout comes first in the tuple for the reason `start()` gives: it must
+/// The layout comes first in the tuple for the reason [`start`] gives: it must
 /// drop after the guard has killed the server.
 fn start_with_indexed_paths(
     rows: &[(&str, Option<&str>, Option<&str>)],
@@ -773,7 +773,7 @@ fn list_topics_returns_the_directory_tree_beneath_each_group_over_http() {
 /// nobody asks for.
 ///
 /// The paragraph assertion is the same one
-/// `the_tool_descriptions_name_the_behaviour_the_server_has` makes. This
+/// [`the_tool_descriptions_name_the_behaviour_the_server_has`] makes. This
 /// description is one unbroken literal today, so the assertion is aimed at the
 /// rewrite that splits it: the `\` continuations the longer descriptions use
 /// eat the newline *and* the leading whitespace of the next line, so a missing

@@ -846,7 +846,8 @@ impl Database {
 /// and with the indexer's own split for every path the indexer produces, which
 /// is all of them -- those come from `walkdir` and so carry no empty segment.
 /// Only a hand-written `a//b/c.md` would part company, because
-/// `extract_category_topic` counts the empty segment and the two here do not.
+/// the indexer's split ([`crate::indexer`]) counts the empty segment and the
+/// two here do not.
 const GROUP_KEY_SEGMENTS: usize = 2;
 
 /// The directory tree beneath one `(category, topic)` group, from the paths of
@@ -873,8 +874,8 @@ const GROUP_KEY_SEGMENTS: usize = 2;
 /// same partition: a frontmatter `topic:` moves a document into another
 /// database group without moving the prefix it is listed under. All the two
 /// could share is the `split('/')` filtered of empty segments -- a primitive,
-/// not a rule -- which is not worth adding a dependency from `db` to
-/// `resources` to reuse.
+/// not a rule -- which is not worth adding a dependency from [`crate::db`] to
+/// [`crate::resources`] to reuse.
 fn segment_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<TopicNode> {
     /// The tree while it is being built: a map, so the same directory reached
     /// by two documents is one entry rather than two nodes.
