@@ -18,6 +18,9 @@
 //! - [`docs`] — the walk that decides which Markdown files are this
 //!   repository's documentation, and the reader that pulls commands out of
 //!   them. Shared by the link guard and the command-copy guards.
+//! - [`source`] — the workspace members from the root manifest and the walk
+//!   over their `src` directories. Shared by the stderr guard and the source
+//!   layout guard.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -28,4 +31,5 @@
 pub mod ansi;
 pub mod docs;
 pub mod mcp;
+pub mod source;
 pub mod temp;

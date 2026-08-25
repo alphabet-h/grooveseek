@@ -45,11 +45,10 @@
 mod common;
 
 use common::docs::{
-    command_lines, half_read_chains, heads_of, inline_chains, markdown_files, repo_root,
-    shell_blocks,
+    command_lines, half_read_chains, heads_of, inline_chains, markdown_files, read, repo_root,
+    shell_blocks, shown,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
 
 /// The chains this guard can say anything about.
 ///
@@ -104,12 +103,6 @@ fn comparisons_in(markdown: &str) -> usize {
     comparable_chains(markdown).len() * blocks
 }
 
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
-}
-
 #[test]
 fn no_page_tells_you_to_run_a_shortened_copy_of_its_own_command_block() {
     let root = repo_root();
@@ -121,12 +114,7 @@ fn no_page_tells_you_to_run_a_shortened_copy_of_its_own_command_block() {
     let mut pages_with_blocks: BTreeSet<String> = BTreeSet::new();
 
     for file in &files {
-        let shown = file
-            .strip_prefix(&root)
-            .unwrap_or(file)
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        let shown = shown(&root, file);
         let markdown = read(file);
         if !inline_chains(&markdown).is_empty() {
             pages_with_chains.insert(shown.clone());

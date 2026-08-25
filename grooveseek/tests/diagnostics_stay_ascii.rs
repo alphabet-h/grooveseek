@@ -108,6 +108,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
 /// Calls whose string literals become the words groove writes to stderr.
 ///
 /// A list is only as good as the reason it is complete, so here is that reason.
@@ -185,49 +187,6 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("CARGO_MANIFEST_DIR is <workspace root>/grooveseek, which has a parent")
         .to_path_buf()
-}
-
-/// The source directory of every workspace member, read from the manifest.
-///
-/// The members list is the workspace's own answer to what this program is, so
-/// a crate added later joins the check by being added to the workspace. An
-/// earlier version walked `grooveseek/src` and `crates/*/src`: the same set
-/// today, and one that would quietly skip a member placed anywhere else --
-/// the shape of mistake this whole file exists to stop.
-///
-/// A member whose `src` is missing -- a glob in `members`, a moved crate --
-/// fails here rather than contributing nothing.
-fn source_dirs() -> Vec<PathBuf> {
-    let root = workspace_root();
-    let manifest_path = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", manifest_path.display()));
-    let manifest: toml::Value = toml::from_str(&text)
-        .unwrap_or_else(|e| panic!("could not parse {}: {e}", manifest_path.display()));
-    let members = manifest
-        .get("workspace")
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(|members| members.as_array())
-        .unwrap_or_else(|| panic!("{} declares no workspace members", manifest_path.display()));
-
-    let mut dirs: Vec<PathBuf> = members
-        .iter()
-        .map(|member| {
-            let name = member
-                .as_str()
-                .unwrap_or_else(|| panic!("a workspace member that is not a path: {member}"));
-            root.join(name).join("src")
-        })
-        .collect();
-    for dir in &dirs {
-        assert!(
-            dir.is_dir(),
-            "a workspace member has no src directory, so nothing of it would be checked: {}",
-            dir.display()
-        );
-    }
-    dirs.sort();
-    dirs
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -576,7 +535,7 @@ fn every_word_groove_writes_to_stderr_is_ascii() {
     // Read and mask every file once, because the wrapper pass below has to see
     // the whole tree before the checking pass can start.
     let mut scanned: Vec<Scanned> = Vec::new();
-    for dir in source_dirs() {
+    for dir in common::source::source_dirs() {
         let mut paths = Vec::new();
         rust_files(&dir, &mut paths);
         for path in paths {
