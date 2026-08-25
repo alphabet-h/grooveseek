@@ -49,7 +49,11 @@ impl Database {
                 .map(|v| v.into_iter().flatten().collect())
                 .unwrap_or_default();
             // `documents.path` is `TEXT UNIQUE NOT NULL`, so unlike the titles
-            // above there is no NULL to flatten away.
+            // above there is no NULL to flatten away. The parse cannot fail in
+            // practice either -- `json_group_array` emits structurally valid
+            // JSON and every element is a non-NULL string -- so the fallback to
+            // an empty tree is unreachable, and is written the same way as the
+            // titles line above rather than as an error path of its own.
             let paths_json: Option<String> = row.get(5)?;
             let paths: Vec<String> = paths_json
                 .as_deref()
@@ -860,7 +864,18 @@ const GROUP_KEY_SEGMENTS: usize = 2;
 /// with no segment left after the two drops contributes no node. Siblings are
 /// sorted by segment, so the result is a function of the *set* of paths and not
 /// of the row order SQLite happened to return.
-pub(crate) fn segment_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<TopicNode> {
+///
+/// **Deliberately not shared with [`crate::resources::group_prefix`], because
+/// the two answer different questions.** That one answers *which group a path
+/// belongs to* -- it computes the partition `resources/list` is built from.
+/// This one answers *what lies beneath a group the database has already
+/// formed*, by `GROUP BY category, topic`. The two partitions are not even the
+/// same partition: a frontmatter `topic:` moves a document into another
+/// database group without moving the prefix it is listed under. All the two
+/// could share is the `split('/')` filtered of empty segments -- a primitive,
+/// not a rule -- which is not worth adding a dependency from `db` to
+/// `resources` to reuse.
+fn segment_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<TopicNode> {
     /// The tree while it is being built: a map, so the same directory reached
     /// by two documents is one entry rather than two nodes.
     #[derive(Default)]
