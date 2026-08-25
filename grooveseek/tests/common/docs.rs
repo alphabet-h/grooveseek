@@ -343,17 +343,17 @@ fn unquoted_spans(line: &str, open_in: Option<u8>) -> (Vec<std::ops::Range<usize
     let mut spans = Vec::new();
     let mut quote = open_in;
     let mut start = if quote.is_none() { Some(0) } else { None };
-    for i in 0..bytes.len() {
+    for (i, &byte) in bytes.iter().enumerate() {
         match quote {
             Some(q) => {
-                if bytes[i] == q {
+                if byte == q {
                     quote = None;
                     start = Some(i + 1);
                 }
             }
             None => {
-                if bytes[i] == b'\'' || bytes[i] == b'"' {
-                    quote = Some(bytes[i]);
+                if byte == b'\'' || byte == b'"' {
+                    quote = Some(byte);
                     if let Some(s) = start.take() {
                         spans.push(s..i);
                     }
