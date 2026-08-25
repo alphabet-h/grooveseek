@@ -30,9 +30,8 @@ mod common;
 use chrono::{TimeZone, Utc};
 use common::docs::{fenced_blocks, read, repo_root, shown};
 use grooveseek::eval::{
-    aggregate_metrics, compute_query_metrics, format_text, query_id, ConfigFingerprint,
-    CorpusSnapshot, EvalRun, GoldenSet, HitRecord, QueryResult, FTS_QUERY_VERSION,
-    METRIC_VERSION,
+    ConfigFingerprint, CorpusSnapshot, EvalRun, FTS_QUERY_VERSION, GoldenSet, HitRecord,
+    METRIC_VERSION, QueryResult, aggregate_metrics, compute_query_metrics, format_text, query_id,
 };
 
 /// The `k` values the example reports (`recall@1`, `recall@5`, `recall@10`,
