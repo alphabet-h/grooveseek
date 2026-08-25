@@ -145,6 +145,41 @@ external application has to talk to a process that is already holding the model.
 > two rows in **separate batches**; interleaving them collapses the ratio from
 > ~15× to a meaningless ~1.6×.
 
+### Concurrent clients, measured
+
+One daemon holds one embedder, one reranker slot and one database connection,
+each behind a mutex, and `search` takes all three — the embedder only while the
+query is embedded, the other two for the rest of the pipeline. Requests are
+concurrent at the HTTP layer and on tokio's blocking pool; they queue on those
+locks. What that costs N clients arriving at once, on the machine of the table
+above (release build, `bge-m3`, no reranker; measured with
+`cargo test -p grooveseek --release --test http_lock_contention -- --ignored --nocapture`,
+see below):
+
+| corpus | tool | one client, p50 | eight clients, p50 | one client, qps | eight clients, qps |
+|---|---|---:|---:|---:|---:|
+| 59 docs / 794 chunks | `search` | 62–83 ms | 242–355 ms | 11.7–16.1 | 12.6–19.8 |
+| | `get_connection_graph` (database lock only) | 10.6 ms | 42 ms | 92 | 98 |
+| | `get_document` (no lock) | 1.0 ms | 3.2–3.7 ms | 870–1,000 | 1,870–2,130 |
+| 686 docs / 9,813 chunks | `search` | 136–140 ms | 593–606 ms | 7.1–7.3 | 8.9 |
+| | `get_connection_graph` | 74 ms | 297–304 ms | 13.4 | 13.4–13.5 |
+| | `get_document` | 1.0 ms | 3.9–4.1 ms | 754–783 | 1,515–1,653 |
+
+Latency grows with the number of clients — about 4.5× at eight, the median of
+eight requests served one after another — and throughput barely moves. That is
+not idle hardware waiting on a lock: one query embedding already runs across
+every core, so a second daemon serving a copy of the same corpus raised the
+combined eight-client throughput by only 12% on the small corpus and 32% on the
+large one. The database side is where cores do sit idle — the graph tool keeps
+one core busy and the other fifteen waiting — and its share grows with the
+corpus: one hybrid candidate fetch takes 10.6 ms at 794 chunks and 79.9 ms at
+9,813 (the KNN is a brute-force scan), overtaking the ~50 ms embedding at
+roughly five thousand chunks. Below that, no lock refactor can raise `search`
+throughput; above it, a pool of read-only connections would raise it by at most
+what the second daemon showed, because the embedding's CPU is the next ceiling.
+A reranked query is a different matter: it holds its lock for ~48 seconds, and a
+second concurrent client waits out the whole of the first.
+
 ## Who is calling decides whether authentication is your problem
 
 GrooveSeek provides the API; the interface a person looks at belongs to the
@@ -327,6 +362,27 @@ base, with the ~180 ms recovery measured immediately after that process exits.
 
 **Measure the CLI and daemon rows in separate batches.** Interleaving them is
 what produces the second outlier, and it collapses the ratio from ~15× to ~1.6×.
+
+**The concurrent-clients table** — `grooveseek/tests/http_lock_contention.rs`,
+an ignored integration test, GrooveSeek 1.0.1 on the same machine
+(8 cores / 16 threads):
+
+```bash
+GROOVE_BENCH_KB=<kb> GROOVE_BENCH_CONFIG=<kb-config> \
+  cargo test -p grooveseek --release --test http_lock_contention -- --ignored --nocapture
+```
+
+It copies the corpus and its index to a temporary directory (it never indexes a
+corpus it was pointed at), starts `groove serve --transport http --no-watch` on
+it, and for each client count N spawns N threads that connect first, are released
+by one barrier, and each time their own request from release to the first byte
+of the response, with `Connection: close`. Throughput is the coordinator's clock
+over the round. N runs in the order 1, 2, 4, 8, 16, 8, 4, 2, 1, so drift shows up
+as a difference between the two visits to the same N; the ranges in the table are
+those two visits. The "second daemon" figure is the same corpus copied twice,
+served by two processes, eight clients split four and four. Use a release build:
+the dev profile compiles the bundled sqlite-vec without optimisation and inflates
+the database side alone.
 
 ## Related
 

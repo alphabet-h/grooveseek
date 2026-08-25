@@ -137,7 +137,22 @@ pub fn drain_stderr_keeping(stderr: ChildStderr, log: StderrLog) -> (Receiver<Re
 /// `watch` decides whether the file watcher runs: `spawn_mcp_server` freezes
 /// the index for deterministic search assertions, `spawn_mcp_server_with_watch`
 /// exercises the real-disk event pipeline.
-fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard, String) {
+///
+/// `extra_args` is appended verbatim after the flags above, so a caller can
+/// add a `serve` option the helper has no opinion about (`--reranker`, ...)
+/// without carrying a second copy of the spawn-and-wait logic.
+///
+/// `startup` bounds each of the two readiness waits (the announced address,
+/// then `/healthz`). The tests here use 60 s, enough for BGE-small on a cold
+/// cache; a caller that starts `serve` on a 2.3 GB model passes more, since
+/// the model is downloaded and loaded before the socket binds.
+fn spawn_serve(
+    kb_path: &Path,
+    config_path: &Path,
+    watch: bool,
+    extra_args: &[&str],
+    startup: Duration,
+) -> (ServerGuard, String) {
     let bin = grooveseek_bin();
     assert!(
         bin.exists(),
@@ -159,6 +174,7 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
     if !watch {
         args.push("--no-watch");
     }
+    args.extend_from_slice(extra_args);
 
     // **`RUST_LOG` is set rather than inherited.** `main` builds its filter
     // from that variable and falls back to `info` when it is unset, so a
@@ -195,8 +211,7 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
 
     let (rx, _) = drain_stderr_keeping(stderr, guard.stderr.clone());
 
-    // 60 s upper bound: covers a first-time model download on a cold cache.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + startup;
     let mut addr: Option<String> = None;
     let mut armed = !watch;
     while addr.is_none() || !armed {
@@ -204,26 +219,53 @@ fn spawn_serve(kb_path: &Path, config_path: &Path, watch: bool) -> (ServerGuard,
             Ok(Ready::Addr(a)) => addr = Some(a),
             Ok(Ready::Armed) => armed = true,
             Err(_) => panic!(
-                "server did not become ready within 60s (address: {}, watcher armed: {armed}); \
+                "server did not become ready within {}s (address: {}, watcher armed: {armed}); \
                  looking for 'listening on ' and 'watcher: watching ' on stderr",
+                startup.as_secs(),
                 if addr.is_some() { "yes" } else { "no" }
             ),
         }
     }
     let base = format!("http://{}", addr.expect("the loop exits with an address"));
 
-    if !wait_http_200(&format!("{base}/healthz"), Duration::from_secs(60)) {
-        panic!("/healthz did not return 200 within 60s on {base} — server failed to start");
+    if !wait_http_200(&format!("{base}/healthz"), startup) {
+        panic!(
+            "/healthz did not return 200 within {}s on {base} — server failed to start",
+            startup.as_secs()
+        );
     }
     (guard, base)
 }
+
+/// The readiness wait the ordinary spawners use: enough for BGE-small on a
+/// cold cache.
+const DEFAULT_STARTUP: Duration = Duration::from_secs(60);
 
 /// Spawn `groove serve --transport http --no-watch` and wait for `/healthz`.
 ///
 /// Returns the guard and the base URL the OS assigned. The watcher is off, so
 /// the index state is frozen and search assertions stay deterministic.
 pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    spawn_serve(kb_path, config_path, false)
+    spawn_serve(kb_path, config_path, false, &[], DEFAULT_STARTUP)
+}
+
+/// [`spawn_mcp_server`] with extra `serve` arguments appended after the
+/// helper's own (`--no-watch` included), and a readiness wait of the
+/// caller's choosing.
+///
+/// Used by `tests/http_lock_contention.rs` to start daemons with
+/// `--reranker none` or `--reranker bge-v2-m3`, whose 2.3 GB models take
+/// longer than [`DEFAULT_STARTUP`] to fetch and load on a cold cache (codex
+/// P2 round 2 on PR #235). The flags and the deadline stay with the caller
+/// because they are the caller's question; the spawning and the readiness
+/// wait stay here because they are everyone's.
+pub fn spawn_mcp_server_with_args(
+    kb_path: &Path,
+    config_path: &Path,
+    extra_args: &[&str],
+    startup: Duration,
+) -> (ServerGuard, String) {
+    spawn_serve(kb_path, config_path, false, extra_args, startup)
 }
 
 /// Same as [`spawn_mcp_server`] but **with** the watcher
@@ -239,7 +281,7 @@ pub fn spawn_mcp_server(kb_path: &Path, config_path: &Path) -> (ServerGuard, Str
 /// `sleep(2000)`: there was no signal to wait for. There is one now, printed
 /// the moment `debouncer.watch()` succeeds, and [`spawn_serve`] waits for it.
 pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
-    spawn_serve(kb_path, config_path, true)
+    spawn_serve(kb_path, config_path, true, &[], DEFAULT_STARTUP)
 }
 
 /// Stand up a one-document knowledge base with the given `groove.toml`, and
@@ -286,6 +328,15 @@ impl ServerGuard {
     /// caller holds this guard they are already here.
     pub fn stderr(&self) -> &StderrLog {
         &self.stderr
+    }
+
+    /// OS process id of the server child.
+    ///
+    /// A measurement that samples the daemon's CPU time from outside
+    /// (`Get-Process -Id`, `/proc/<pid>/stat`) needs the id; nothing else
+    /// about the child is exposed, so the guard stays the only owner.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("child is present").id()
     }
 }
 
