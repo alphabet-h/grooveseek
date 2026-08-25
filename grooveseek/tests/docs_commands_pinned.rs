@@ -564,8 +564,8 @@ fn json_members_are_compared_as_values_and_not_as_characters() {
 /// the block still claims to reproduce it.
 ///
 /// The workflow comes from the registration, not from a literal here: a pin
-/// whose `reproduces` was emptied would otherwise leave every test green
-/// with the comparison gone. Named jobs rather than a count, for the reason
+/// whose [`Pin::reproduces`] was emptied would otherwise leave every test
+/// green with the comparison gone. Named jobs rather than a count, for the reason
 /// `docs_commands_subset.rs` names its pages: "some step somewhere was read"
 /// still passes when the reader stops understanding a job. Two commands are
 /// named literally -- `cargo test`, and the second clippy pass the block's

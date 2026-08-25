@@ -49,7 +49,8 @@ pub struct RunStep {
     pub commands: Vec<String>,
     /// The lines of the `run:` the reader could not place: the line as
     /// written and why, in file order. Not dropped, because a caller comparing
-    /// `commands` with something has to know what is missing from them.
+    /// [`RunStep::commands`] with something has to know what is missing from
+    /// them.
     pub unread: Vec<UnreadLine>,
 }
 
