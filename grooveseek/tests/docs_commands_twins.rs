@@ -32,10 +32,13 @@
 //!
 //! **A pair that drifts on both sides at once**, and anything outside a shell
 //! fence: untagged blocks here are transcripts of output, whose Japanese half is
-//! legitimately a translation, and `docs/eval.ja.md` differs from
-//! `docs/eval.md` inside one of them today by dropping a whole section. That is
-//! a real defect and a different one -- a missing paragraph, not a drifted
-//! command -- and it is filed rather than caught here.
+//! legitimately a translation. `docs/eval.ja.md` once dropped a whole section
+//! from one of them -- a missing paragraph, not a drifted command, and reading
+//! an untagged block as commands would have failed it for a reason that was an
+//! accident of the reader, so it was filed instead of caught. That transcript
+//! is now compared with what the formatter prints, in
+//! `tests/docs_eval_transcript.rs`; every other untagged block is still unread
+//! here.
 
 mod common;
 

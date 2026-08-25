@@ -399,6 +399,18 @@ pub fn describe_corpus_change(
     ))
 }
 
+/// `--k` も `[eval].k_values` も無いときに報告する k のリスト。
+///
+/// `eval` と `tune` の両方の解決 (`main.rs`) と、docs の出力例を formatter に
+/// pin する test (`tests/docs_eval_transcript.rs`) がここを読む。3 箇所で別々に
+/// `[1, 5, 10]` と書くと、既定を変えた日に test だけが古いラベルで緑のまま
+/// docs と食い違う (codex P1 on PR #232)。
+pub const DEFAULT_K_VALUES: [usize; 3] = [1, 5, 10];
+
+/// `[eval].regression_threshold` が無いときの閾値。この幅を超えた低下が
+/// 「劣化」で、超えない動きはノイズとして灰色で出る。
+pub const DEFAULT_REGRESSION_THRESHOLD: f64 = 0.05;
+
 /// 現行の metric 実装 version。recall / MRR / nDCG の計算式を修正するたびに
 /// +1 する。[`ConfigFingerprint::metric_version`] を参照。
 pub const METRIC_VERSION: u32 = 2;
@@ -681,8 +693,9 @@ fn normalize_for_quote(s: &str) -> String {
 /// レポートに出す query の識別子。`id` が無い golden では文面の先頭を使う。
 ///
 /// [`run`] の per-query ループと所見の両方がこれを呼ぶ。2 箇所で別々に組み立てると
-/// 同じ query が違う名前で出る。
-fn query_id(q: &GoldenQuery) -> String {
+/// 同じ query が違う名前で出る。`tests/docs_eval_transcript.rs` も docs の出力例の
+/// 行 id をここから作る (例が別の規則で id を書くのを防ぐ)。
+pub fn query_id(q: &GoldenQuery) -> String {
     q.id.clone()
         .unwrap_or_else(|| q.query.chars().take(32).collect())
 }

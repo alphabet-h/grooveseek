@@ -14,6 +14,32 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `groove eval` transcript in the quick start now shows what the binary
+  prints, on both pages.** [docs/eval.ja.md](docs/eval.ja.md) had translated the
+  example without its `Per-query` section, so a Japanese reader was never shown
+  the one line that names a query that missed. The English example was not what
+  the binary prints either: it lacked the `corpus:` line every run has carried
+  since 0.15.0, ended its per-query row with an `expected ... missing` phrase
+  the formatter has no code for, gave the row a placeholder id where the real
+  one is the first 32 characters of the query, wrote the timestamp with a
+  `+09:00` offset where the binary writes UTC, and its aggregate could not have
+  come from its own row — one of two queries at `recall@10: 0.00` does not
+  average to `recall@10 1.000`. Both examples are now derived from the golden
+  file above them: two hits at ranks 1 and 3 for the first query, a miss for the
+  second, `recall@10 0.500`, `MRR 0.500`, `nDCG@10 0.460`. The Japanese page
+  also gains the sentence on heading-less expected hits and the expansion of
+  `nDCG` that its English twin already had.
+
+  `grooveseek/tests/docs_eval_transcript.rs` keeps it that way. It parses the
+  golden fence on each page, runs the metric and formatting code the binary
+  runs over the hits the example assumes, and requires the transcript fence to
+  equal the output character for character. The ranks are the example's
+  premise, not a measurement — what the test pins is that the numbers, the
+  layout and the row id follow from them. `eval::query_id` is public for it,
+  so the row id rule lives in one place.
+
 ### Internal
 
 - **The source layout table in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)

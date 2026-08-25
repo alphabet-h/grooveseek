@@ -654,7 +654,9 @@ fn resolve_tune_k_and_limit(
     cfg_k: Option<Vec<usize>>,
     cli_limit: Option<u32>,
 ) -> anyhow::Result<(Vec<usize>, u32)> {
-    let raw = cli_k.or(cfg_k).unwrap_or_else(|| vec![1, 5, 10]);
+    let raw = cli_k
+        .or(cfg_k)
+        .unwrap_or_else(|| grooveseek::eval::DEFAULT_K_VALUES.to_vec());
     let k_values = grooveseek::tune::normalize_k_values(&raw);
     // clamp と上限検証 (MAX_TUNE_K 超は reject) は tune::effective_limit に集約
     // (codex P2 round 2/3/4 on PR #79)。--limit 未指定は 0 を渡せば max(k) に
@@ -1207,10 +1209,12 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| kb_path.join(".groove-eval.yml"));
             let k_values = k
                 .or(eval_cfg.k_values.clone())
-                .unwrap_or_else(|| vec![1, 5, 10]);
+                .unwrap_or_else(|| grooveseek::eval::DEFAULT_K_VALUES.to_vec());
             let limit_val = limit.unwrap_or_else(|| *k_values.iter().max().unwrap_or(&10) as u32);
             let history_size = eval_cfg.history_size.unwrap_or(10);
-            let regression_threshold = eval_cfg.regression_threshold.unwrap_or(0.05);
+            let regression_threshold = eval_cfg
+                .regression_threshold
+                .unwrap_or(grooveseek::eval::DEFAULT_REGRESSION_THRESHOLD);
 
             let opts = grooveseek::eval::RunOpts {
                 kb_path: kb_path.clone(),
