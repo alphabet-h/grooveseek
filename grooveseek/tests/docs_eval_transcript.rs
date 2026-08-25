@@ -1,4 +1,5 @@
-//! The `groove eval` transcript in the quick start is what `format_text` prints.
+//! The `groove eval` transcript in the quick start is what
+//! [`grooveseek::eval::format_text`] prints.
 //!
 //! The block was typed by hand. It drifted from the formatter in four places at
 //! once while both pages looked fine -- no `corpus:` line, a trailing phrase the
@@ -15,7 +16,8 @@
 //! run is built from it under the retrieval the example assumes (both hits of
 //! the first query found, at ranks 1 and 3; the second query missed), and the
 //! one untagged fence whose body starts with `groove eval — ` has to equal
-//! [`format_text`] over that run, character for character. The row id, the
+//! [`grooveseek::eval::format_text`] over that run, character for character.
+//! The row id, the
 //! padding, the numbers and the layout all follow from the golden and the
 //! formatter; none of them is written down here.
 //!
