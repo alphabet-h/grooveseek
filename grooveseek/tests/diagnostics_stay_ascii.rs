@@ -106,8 +106,6 @@
 //! be reported, and it is not: comments are masked before anything is read,
 //! which is what the third measured shape was rejected for not doing.
 
-use std::path::{Path, PathBuf};
-
 mod common;
 
 /// Calls whose string literals become the words groove writes to stderr.
@@ -179,15 +177,6 @@ const DIAGNOSTIC_OPENERS: &[&str] = &[
     ".finish_with_message(",
     ".abandon_with_message(",
 ];
-
-/// The workspace root. `CARGO_MANIFEST_DIR` is `<root>/grooveseek` since the
-/// workspace split (feature-44 PR-1).
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("CARGO_MANIFEST_DIR is <workspace root>/grooveseek, which has a parent")
-        .to_path_buf()
-}
 
 fn blank(masked: &mut [u8], from: usize, to: usize) {
     for byte in &mut masked[from..to] {
@@ -513,7 +502,7 @@ fn offending_characters(literal: &str) -> String {
 
 #[test]
 fn every_word_groove_writes_to_stderr_is_ascii() {
-    let root = workspace_root();
+    let root = common::docs::repo_root();
     let mut offenders: Vec<String> = Vec::new();
     let mut calls = 0usize;
 

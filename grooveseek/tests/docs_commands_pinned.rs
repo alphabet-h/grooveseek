@@ -16,8 +16,9 @@
 //!
 //! That every marker resolves to a fenced block, that every id is registered
 //! below with the reason its copies cannot be collapsed, that a registered id
-//! is found in more than one place, and that all of a group's members carry
-//! the same value.
+//! is found in more than one place, that all of a group's members carry the
+//! same value, and that a group which says it reproduces a workflow names the
+//! same set of commands as that workflow's `run:` steps.
 //!
 //! Value, not text: `grooveseek/examples/hooks/settings.snippet.json` is a real
 //! file the hook recipes point at, and it writes the same object across four
@@ -31,14 +32,31 @@
 //! any of them, written without the marker, is invisible here. It is a pin, not
 //! a detector.
 //!
-//! The one it most wants and does not have is
-//! `.github/workflows/ci.yml`, which is what the CI command block is a copy
-//! *of*. Both halves of that pin can drift away from the workflow together and
-//! agree with each other the whole way down.
+//! **What the workflow does around a command.** The CI block is compared with
+//! the `run:` steps of `.github/workflows/ci.yml` as a set of commands, plus
+//! the order within each job, and only that. Not the order between jobs: the
+//! block is written cheapest-first for a person reproducing CI by hand, and
+//! the workflow's jobs run in parallel, so neither order is the other's.
+//! Within one job the order is kept, because it is the order that works --
+//! `cargo test --test index_progress_cli` runs before `cargo test` so that
+//! one process warms the model cache -- and the block is what a reader
+//! follows. Not the environment (`FASTEMBED_CACHE_DIR`), the OS matrix, the
+//! `if:` on the doc step, or which job a command runs in -- a command moved
+//! between jobs, or run on one OS out of three, compares equal. `nightly.yml`
+//! and `release.yml` are compared with nothing here: the block does not claim
+//! to reproduce them.
+//!
+//! **A check written as an action.** Only `run:` steps are read. Every `uses:`
+//! in `ci.yml` today is setup -- checkout, toolchain, cache -- so a `uses:` is
+//! not compared, and a check that arrives as an action rather than a command
+//! would be invisible here. The reader in `common/workflow.rs` is where such
+//! an action would be told apart from setup, with a reason, the day one is
+//! added.
 
 mod common;
 
 use common::docs::{command_lines, markdown_files, pin_sites, read, repo_root, shown};
+use common::workflow::{RunStep, run_steps};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// How a group's members are compared.
@@ -72,6 +90,12 @@ struct Pin {
     /// Members outside the Markdown corpus, by path from the repository root.
     /// The walk only collects `.md`, so these are read directly.
     beyond_markdown: &'static [&'static str],
+    /// The workflows this block claims to reproduce, by path from the
+    /// repository root. The block's set of commands has to equal the set of
+    /// `run:` steps there, order aside: the block is written cheapest-first
+    /// for a person, and the workflow's jobs run in parallel. Only a block of
+    /// shell commands can claim this, and the registration is checked for it.
+    reproduces: &'static [&'static str],
 }
 
 const PINS: &[Pin] = &[
@@ -83,6 +107,7 @@ const PINS: &[Pin] = &[
         shape: Shape::ShellCommands,
         members: &["AGENTS.md", "CONTRIBUTING.md"],
         beyond_markdown: &[],
+        reproduces: &[".github/workflows/ci.yml"],
     },
     Pin {
         id: "mcp-stdio-snippet",
@@ -96,6 +121,7 @@ const PINS: &[Pin] = &[
             "docs/clients.ja.md",
         ],
         beyond_markdown: &[],
+        reproduces: &[],
     },
     Pin {
         id: "posttooluse-hook-snippet",
@@ -110,6 +136,7 @@ const PINS: &[Pin] = &[
             "grooveseek/examples/hooks/README.ja.md",
         ],
         beyond_markdown: &["grooveseek/examples/hooks/settings.snippet.json"],
+        reproduces: &[],
     },
 ];
 
@@ -121,6 +148,132 @@ fn normalise(shape: Shape, body: &str) -> Result<String, String> {
             .map(|value| value.to_string())
             .map_err(|e| format!("is not JSON: {e}")),
     }
+}
+
+/// Everything a block and the workflow it claims to reproduce disagree about,
+/// one line each, naming the command, the side that has it alone, and where.
+///
+/// A set on each side, not a sequence and not a multiset. Two jobs that run
+/// the same command are one thing a reader is told to run, and the block's
+/// own order is compared with its copies elsewhere, not with the workflow --
+/// except within one job, whose step order the block has to keep: the
+/// pre-warm step runs before the suite for a reason, and a block that lists
+/// them the other way round sends a reader into the race the order avoids.
+///
+/// A step whose `run:` yields no command, and a line of a `run:` the reader
+/// could not place, are reported rather than skipped: either one is a command
+/// the workflow may run that is being compared with nothing. Returned rather
+/// than asserted so the fixtures below run the same predicate as the corpus.
+fn reproduction_gap(
+    id: &str,
+    why: &str,
+    block_where: &str,
+    block_value: &str,
+    workflow: &str,
+    steps: &[RunStep],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let block: BTreeSet<&str> = block_value.lines().collect();
+    let mut ran: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for step in steps {
+        // A step with no command and no unread line read as nothing at all
+        // (a comment, say). One with unread lines is explained by them below;
+        // reporting it here too would name one cause twice.
+        if step.commands.is_empty() && step.unread.is_empty() {
+            out.push(format!(
+                "{workflow}: pin `{id}`: {} has a `run:` that reads as no \
+                 command, so whatever it runs is not being compared with \
+                 {block_where}",
+                step.position()
+            ));
+        }
+        for line in &step.unread {
+            out.push(format!(
+                "{workflow}: pin `{id}`: {}, line {} of its `run:`, `{}`: {}. \
+                 A line the reader cannot place is not being compared with \
+                 {block_where}, so it is reported here rather than dropped",
+                step.position(),
+                line.index + 1,
+                line.raw.trim(),
+                line.why
+            ));
+        }
+        for command in &step.commands {
+            ran.entry(command.as_str())
+                .or_default()
+                .push(step.position());
+        }
+    }
+    for command in block.iter().filter(|c| !ran.contains_key(*c)) {
+        out.push(format!(
+            "pin `{id}`: {block_where} tells a reader to run `{command}`, and \
+             {workflow} has no `run:` step that runs it. Either the block is \
+             stale or CI stopped checking it; carry the edit to every member \
+             of the block, or to the workflow. Registered because: {why}"
+        ));
+    }
+    for (command, at) in ran.iter().filter(|(c, _)| !block.contains(*c)) {
+        out.push(format!(
+            "pin `{id}`: {workflow} runs `{command}` at {} and {block_where} \
+             does not list it. The block says it is everything CI checks; add \
+             the command to every member, or, if it is setup a contributor \
+             already has rather than a check, teach this reader to tell the \
+             two apart here rather than dropping the step from the comparison",
+            at.join(", ")
+        ));
+    }
+    // Within one job, the block has to list the job's commands in the job's
+    // order. A command the block lacks was reported just above and is skipped
+    // here; a decreasing block position between two consecutive commands of
+    // one job is an inversion, and one is enough to name. A command the block
+    // lists twice is refused outright: the set above cannot see the second
+    // copy, and a position taken from either copy would let `cargo test`,
+    // the pre-warm, `cargo test` read as ordered.
+    let mut block_at: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, line) in block_value.lines().enumerate() {
+        if let Some(first) = block_at.get(line) {
+            out.push(format!(
+                "pin `{id}`: {block_where} lists `{line}` twice (its lines {} and {}). A \
+                 block that reproduces a workflow lists each command once, where the \
+                 workflow runs it; delete one copy from every member",
+                first + 1,
+                i + 1
+            ));
+            continue;
+        }
+        block_at.insert(line, i);
+    }
+    let mut by_job: BTreeMap<&str, Vec<(&str, String)>> = BTreeMap::new();
+    for step in steps {
+        for command in &step.commands {
+            by_job
+                .entry(step.job.as_str())
+                .or_default()
+                .push((command.as_str(), step.position()));
+        }
+    }
+    for (job, commands) in &by_job {
+        let mut last: Option<(&str, &str, usize)> = None;
+        for (command, position) in commands {
+            let Some(&at) = block_at.get(command) else {
+                continue;
+            };
+            if let Some((prev, prev_position, prev_at)) = last
+                && at < prev_at
+            {
+                out.push(format!(
+                    "pin `{id}`: {block_where} lists `{command}` before `{prev}`, and \
+                     {workflow} runs them the other way round in jobs.{job} \
+                     ({prev_position}, then {position}). Within one job the \
+                     workflow's order is the order that works, and the block is \
+                     what a reader follows, so it has to keep that order; between \
+                     jobs it is free"
+                ));
+            }
+            last = Some((command, position, at));
+        }
+    }
+    out
 }
 
 #[test]
@@ -228,6 +381,38 @@ fn every_copy_that_cannot_be_deleted_is_pinned_to_the_others() {
                      Registered because: {}",
                     pin.why
                 ));
+            }
+        }
+
+        // Against the first member only -- the walk is sorted, so today that is
+        // `AGENTS.md`, and the message names it. The loop above has already
+        // reported every other member that differs from it, so a comparison of
+        // each member with the workflow would repeat one gap once per copy.
+        for workflow in pin.reproduces {
+            assert_eq!(
+                pin.shape,
+                Shape::ShellCommands,
+                "pin `{id}` says it reproduces {workflow}, and only a block of \
+                 shell commands can. Registered because: {}",
+                pin.why
+            );
+            let path = root.join(workflow);
+            assert!(
+                path.is_file(),
+                "pin `{id}` says it reproduces {workflow}, which is not in the \
+                 tree. Registered because: {}",
+                pin.why
+            );
+            match run_steps(&read(&path)) {
+                Ok(steps) => offenders.extend(reproduction_gap(
+                    id,
+                    pin.why,
+                    first_where,
+                    first_value,
+                    workflow,
+                    &steps,
+                )),
+                Err(why) => offenders.push(format!("{workflow}: pin `{id}` {why}")),
             }
         }
     }
@@ -366,4 +551,307 @@ fn json_members_are_compared_as_values_and_not_as_characters() {
     );
     assert_eq!(one_line, spread);
     assert!(normalise(Shape::Json, "not json").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The workflow side. A pass over the corpus proves nothing about the reader
+// if the workflow happens to be the shape it expects, so the anchor below
+// names what it expects, and the fixtures run the same predicate the corpus
+// runs on shapes the corpus does not have today.
+// ---------------------------------------------------------------------------
+
+/// The workflow the CI block reproduces is still one this reader reads, and
+/// the block still claims to reproduce it.
+///
+/// The workflow comes from the registration, not from a literal here: a pin
+/// whose [`Pin::reproduces`] was emptied would otherwise leave every test
+/// green with the comparison gone. Named jobs rather than a count, for the reason
+/// `docs_commands_subset.rs` names its pages: "some step somewhere was read"
+/// still passes when the reader stops understanding a job. Two commands are
+/// named literally -- `cargo test`, and the second clippy pass the block's
+/// own prose singles out -- because the block and the workflow losing a line
+/// *together* is a set equality that holds, and this is the one place that
+/// would notice.
+#[test]
+fn the_ci_workflow_is_still_the_shape_this_reader_reads() {
+    const CI: &str = ".github/workflows/ci.yml";
+    let claimed: Vec<&str> = PINS
+        .iter()
+        .filter(|p| p.id == "ci-command-block")
+        .flat_map(|p| p.reproduces.iter().copied())
+        .collect();
+    assert!(
+        claimed.contains(&CI),
+        "pin `ci-command-block` no longer says it reproduces {CI} (it names \
+         {claimed:?}), so the block is not being compared with the workflow \
+         it copies. If the block stopped being a copy of CI, this test goes \
+         with it in the same commit"
+    );
+    let steps = run_steps(&read(&repo_root().join(CI))).unwrap_or_else(|why| panic!("{CI} {why}"));
+    for job in ["test", "clippy", "fmt"] {
+        assert!(
+            steps.iter().any(|s| s.job == job),
+            "no `run:` step was read from jobs.{job} of {CI}. If the job was \
+             renamed, rename it here; if its checks moved to `uses:`, the \
+             reader has stopped seeing them and the block is being compared \
+             with less than CI runs. Read: {:?}",
+            steps.iter().map(RunStep::position).collect::<Vec<_>>()
+        );
+    }
+    for command in [
+        "cargo test",
+        "cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings",
+    ] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.commands.iter().any(|c| c == command)),
+            "no `run:` step of {CI} reads as `{command}`. The comparison with \
+             the block passes when both sides lose a line; this is the one \
+             that notices. Read: {:?}",
+            steps
+                .iter()
+                .flat_map(|s| s.commands.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The reader's output for a one-job, one-step workflow around `run`.
+fn one_run(run: &str) -> Result<Vec<RunStep>, String> {
+    run_steps(&format!(
+        "jobs:\n  x:\n    steps:\n      - uses: a/b@v1\n      - run: {run}\n"
+    ))
+}
+
+#[test]
+fn a_run_step_goes_through_the_same_normaliser_as_a_fenced_block() {
+    // A comment, a blank, a continuation and a heredoc, in one block scalar.
+    let body =
+        "# setup\ncargo check \\\n  --all-targets\n\ncat <<EOF\nnot a command\nEOF\ncargo test\n";
+    let indented = body
+        .lines()
+        .map(|l| format!("          {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let steps = one_run(&format!("|\n{indented}\n")).expect("reads");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].commands, command_lines(body));
+    // The opener is a command (`cat`); its payload and terminator are not.
+    assert_eq!(
+        steps[0].commands,
+        vec![
+            "cargo check --all-targets".to_string(),
+            "cat <<EOF".to_string(),
+            "cargo test".to_string()
+        ]
+    );
+    assert!(steps[0].unread.is_empty(), "{:?}", steps[0].unread);
+    assert_eq!(steps[0].position(), "jobs.x.steps[1]");
+}
+
+#[test]
+fn a_folded_run_is_one_command() {
+    let steps = one_run(">\n          cargo test\n          --bench a\n          --bench b\n")
+        .expect("reads");
+    assert_eq!(
+        steps[0].commands,
+        vec!["cargo test --bench a --bench b".to_string()]
+    );
+}
+
+#[test]
+fn a_named_step_is_located_by_index_and_name() {
+    let steps = run_steps(
+        "jobs:\n  fmt:\n    steps:\n      - name: check formatting\n        run: cargo fmt\n",
+    )
+    .expect("reads");
+    assert_eq!(steps[0].position(), "jobs.fmt.steps[0] (check formatting)");
+}
+
+#[test]
+fn a_step_with_neither_run_nor_uses_is_reported_not_skipped() {
+    let err =
+        run_steps("jobs:\n  x:\n    steps:\n      - run: cargo test\n      - name: nothing\n")
+            .expect_err("a step that runs nothing is not a step this reader knows");
+    assert!(err.contains("jobs.x.steps[1]"), "{err}");
+    assert!(err.contains("neither `run` nor `uses`"), "{err}");
+}
+
+#[test]
+fn a_step_with_both_run_and_uses_is_reported() {
+    let err = run_steps("jobs:\n  x:\n    steps:\n      - uses: a/b@v1\n        run: cargo test\n")
+        .expect_err("both");
+    assert!(err.contains("jobs.x.steps[0]"), "{err}");
+    assert!(err.contains("both `run` and `uses`"), "{err}");
+}
+
+#[test]
+fn a_workflow_without_jobs_is_reported() {
+    let err = run_steps("name: CI\non: push\njob:\n  x:\n    steps: []\n").expect_err("no jobs");
+    assert!(err.contains("no `jobs` mapping"), "{err}");
+    let err = run_steps("jobs:\n  x:\n    uses: ./.github/workflows/other.yml\n")
+        .expect_err("a job without steps");
+    assert!(err.contains("jobs.x has no `steps` sequence"), "{err}");
+}
+
+#[test]
+fn the_top_level_on_key_does_not_break_the_read() {
+    // YAML 1.1 reads a bare `on` as a boolean; the parser here keeps it a
+    // string, and either way `jobs` is looked up by name.
+    let steps = run_steps(
+        "on:\n  push:\n    branches: [main]\njobs:\n  x:\n    steps:\n      - run: cargo test\n",
+    )
+    .expect("reads");
+    assert_eq!(steps[0].commands, vec!["cargo test".to_string()]);
+}
+
+#[test]
+fn a_run_that_reads_as_nothing_is_reported() {
+    let steps = one_run("\"# only a comment\"").expect("reads");
+    assert!(steps[0].commands.is_empty(), "{steps:?}");
+    let gap = reproduction_gap("p", "why", "A.md:1", "cargo test", "w.yml", &steps);
+    // Two lines: the step that reads as nothing, and the block's command that
+    // no step runs. The second is true on its own; the first says why.
+    assert_eq!(gap.len(), 2, "{gap:?}");
+    assert!(
+        gap.iter()
+            .any(|g| g.contains("jobs.x.steps[1] has a `run:` that reads as no command")),
+        "{gap:?}"
+    );
+    assert!(
+        gap.iter()
+            .any(|g| g.contains("A.md:1 tells a reader to run `cargo test`")),
+        "{gap:?}"
+    );
+}
+
+#[test]
+fn a_line_of_a_run_the_reader_cannot_place_is_reported() {
+    // `%%%` cannot start a command. The step still yields `cargo test`, so a
+    // reader that dropped the line would compare equal and say nothing.
+    let steps = one_run("|\n          cargo test\n          %%% not shell\n").expect("reads");
+    assert_eq!(steps[0].commands, vec!["cargo test".to_string()]);
+    assert_eq!(steps[0].unread.len(), 1, "{:?}", steps[0].unread);
+    let gap = reproduction_gap("p", "why", "A.md:1", "cargo test", "w.yml", &steps);
+    assert_eq!(gap.len(), 1, "{gap:?}");
+    assert!(
+        gap[0].contains("jobs.x.steps[1], line 2 of its `run:`, `%%% not shell`"),
+        "{gap:?}"
+    );
+    assert!(gap[0].contains("cannot start a command"), "{gap:?}");
+
+    // A step made only of such lines is explained by them, once each, and not
+    // also reported as reading as nothing.
+    let steps = one_run("|\n          %%% not shell\n          ((( nor this\n").expect("reads");
+    assert!(steps[0].commands.is_empty(), "{steps:?}");
+    let gap = reproduction_gap("p", "why", "A.md:1", "", "w.yml", &steps);
+    assert_eq!(gap.len(), 2, "{gap:?}");
+    assert!(gap.iter().all(|g| g.contains("of its `run:`")), "{gap:?}");
+}
+
+#[test]
+fn order_between_the_block_and_the_workflow_is_not_a_difference() {
+    let steps = run_steps(
+        "jobs:\n  a:\n    steps:\n      - run: cargo test\n  b:\n    steps:\n      - run: cargo fmt\n      - run: cargo test\n",
+    )
+    .expect("reads");
+    // The block lists them in the other order, and one of them twice in the
+    // workflow: neither is a gap.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo fmt\ncargo test",
+        "w.yml",
+        &steps,
+    );
+    assert!(gap.is_empty(), "{gap:?}");
+}
+
+#[test]
+fn the_block_keeps_a_job_s_order_and_is_free_between_jobs() {
+    let steps = run_steps(
+        "jobs:\n  a:\n    steps:\n      - name: warm\n        run: cargo warm\n      - run: cargo test\n  b:\n    steps:\n      - run: cargo fmt\n",
+    )
+    .expect("reads");
+    // b's command first, then a's two in a's order: no gap.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo fmt\ncargo warm\ncargo test",
+        "w.yml",
+        &steps,
+    );
+    assert!(gap.is_empty(), "{gap:?}");
+    // a's two the other way round: named, with the job and both steps.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo test\ncargo warm\ncargo fmt",
+        "w.yml",
+        &steps,
+    );
+    assert_eq!(gap.len(), 1, "{gap:?}");
+    assert!(
+        gap[0].contains(
+            "A.md:1 lists `cargo test` before `cargo warm`, and w.yml runs them the other way \
+             round in jobs.a (jobs.a.steps[0] (warm), then jobs.a.steps[1])"
+        ),
+        "{gap:?}"
+    );
+    // A duplicate cannot stand in for the right order: the same set, and the
+    // second copy after the pre-warm, is refused as a duplicate and the order
+    // is judged on the first copy.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo test\ncargo warm\ncargo test\ncargo fmt",
+        "w.yml",
+        &steps,
+    );
+    assert_eq!(gap.len(), 2, "{gap:?}");
+    assert!(
+        gap.iter()
+            .any(|g| g.contains("A.md:1 lists `cargo test` twice (its lines 1 and 3)")),
+        "{gap:?}"
+    );
+    assert!(
+        gap.iter()
+            .any(|g| g.contains("lists `cargo test` before `cargo warm`")),
+        "{gap:?}"
+    );
+}
+
+#[test]
+fn a_command_on_one_side_only_names_the_side_and_the_step() {
+    let steps = run_steps(
+        "jobs:\n  x:\n    steps:\n      - run: cargo test\n      - name: audit\n        run: cargo deny check\n",
+    )
+    .expect("reads");
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo test\ncargo doc",
+        "w.yml",
+        &steps,
+    );
+    assert_eq!(gap.len(), 2, "{gap:?}");
+    let docs_only = gap
+        .iter()
+        .find(|g| g.contains("A.md:1 tells a reader to run `cargo doc`"))
+        .unwrap_or_else(|| panic!("{gap:?}"));
+    assert!(
+        docs_only.contains("w.yml has no `run:` step that runs it"),
+        "{docs_only}"
+    );
+    let ci_only = gap
+        .iter()
+        .find(|g| g.contains("w.yml runs `cargo deny check` at jobs.x.steps[1] (audit)"))
+        .unwrap_or_else(|| panic!("{gap:?}"));
+    assert!(ci_only.contains("A.md:1 does not list it"), "{ci_only}");
 }
