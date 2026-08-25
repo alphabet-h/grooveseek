@@ -53,7 +53,7 @@ fn hit(rank: usize, path: &str, heading: Option<&str>) -> HitRecord {
 }
 
 /// The run the quick start shows: its golden, under the retrieval the example
-/// assumes. Ranks are 1-based, as `reciprocal_rank` requires.
+/// assumes. Ranks are 1-based, as [`grooveseek::eval::reciprocal_rank`] requires.
 fn quick_start_run(golden: &GoldenSet) -> EvalRun {
     let [q1, q2] = golden.queries.as_slice() else {
         panic!(
