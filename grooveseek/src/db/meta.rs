@@ -18,9 +18,14 @@
 //! byte-identical and keep their visibility.
 
 use super::*;
+use std::collections::BTreeMap;
 
 impl Database {
     /// List all indexed topics grouped by (category, topic).
+    ///
+    /// [`TopicInfo::children`] is built here rather than by a second query:
+    /// the paths of a group's documents come back with the group, and
+    /// [`segment_tree`] turns them into the tree.
     pub fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         // タイトルは json_group_array で集めて JSON 配列として受ける。
         // 旧実装は GROUP_CONCAT(title, '||') + split を使っていたが、
@@ -29,7 +34,8 @@ impl Database {
             SELECT category, topic,
                    COUNT(*) AS file_count,
                    MAX(last_indexed) AS last_updated,
-                   json_group_array(title) AS titles_json
+                   json_group_array(title) AS titles_json,
+                   json_group_array(path) AS paths_json
             FROM documents
             GROUP BY category, topic
             ORDER BY category, topic
@@ -42,12 +48,20 @@ impl Database {
                 .and_then(|s| serde_json::from_str::<Vec<Option<String>>>(s).ok())
                 .map(|v| v.into_iter().flatten().collect())
                 .unwrap_or_default();
+            // `documents.path` is `TEXT UNIQUE NOT NULL`, so unlike the titles
+            // above there is no NULL to flatten away.
+            let paths_json: Option<String> = row.get(5)?;
+            let paths: Vec<String> = paths_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
             Ok(TopicInfo {
                 category: row.get(0)?,
                 topic: row.get(1)?,
                 file_count: row.get(2)?,
                 last_updated: row.get(3)?,
                 titles,
+                children: segment_tree(paths.iter().map(String::as_str)),
             })
         })?;
         rows.into_iter()
@@ -813,5 +827,198 @@ impl Database {
         tx.commit()
             .context("rename_documents_atomic: COMMIT failed")?;
         Ok(())
+    }
+}
+
+/// How many leading segments a `(category, topic)` group already accounts for.
+///
+/// The indexer keys a group by the first two segments of a path
+/// (`extract_category_topic` in [`crate::indexer`]), so those two are not
+/// repeated as nodes. The boundary is **positional**: a frontmatter `topic:`
+/// changes which group a document is filed under, not which segment its
+/// directories start at.
+///
+/// The count agrees with [`crate::resources::group_prefix`] for every path,
+/// and with the indexer's own split for every path the indexer produces, which
+/// is all of them -- those come from `walkdir` and so carry no empty segment.
+/// Only a hand-written `a//b/c.md` would part company, because
+/// `extract_category_topic` counts the empty segment and the two here do not.
+const GROUP_KEY_SEGMENTS: usize = 2;
+
+/// The directory tree beneath one `(category, topic)` group, from the paths of
+/// the documents in it.
+///
+/// Paths are knowledge-base-relative and forward-slashed, the form
+/// `documents.path` stores. For each one the last non-empty segment is the file
+/// and is dropped; the first [`GROUP_KEY_SEGMENTS`] are the group key and are
+/// dropped too; every prefix of what remains is a node, and a node's
+/// `file_count` is the number of documents under that prefix -- so a parent
+/// counts everything beneath it, not only the files directly in it.
+///
+/// Empty segments (`a//b`) are ignored, as [`crate::resources::group_prefix`]
+/// ignores them, so a trailing slash behaves as if it were not there. A path
+/// with no segment left after the two drops contributes no node. Siblings are
+/// sorted by segment, so the result is a function of the *set* of paths and not
+/// of the row order SQLite happened to return.
+pub(crate) fn segment_tree<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<TopicNode> {
+    /// The tree while it is being built: a map, so the same directory reached
+    /// by two documents is one entry rather than two nodes.
+    #[derive(Default)]
+    struct Node {
+        file_count: u32,
+        children: BTreeMap<String, Node>,
+    }
+
+    fn into_nodes(children: BTreeMap<String, Node>) -> Vec<TopicNode> {
+        children
+            .into_iter()
+            .map(|(segment, node)| TopicNode {
+                segment,
+                file_count: node.file_count,
+                children: into_nodes(node.children),
+            })
+            .collect()
+    }
+
+    let mut root = Node::default();
+    for path in paths {
+        let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        segments.pop(); // the file name
+        let mut cursor = &mut root;
+        for segment in segments.into_iter().skip(GROUP_KEY_SEGMENTS) {
+            cursor = cursor.children.entry(segment.to_string()).or_default();
+            cursor.file_count += 1;
+        }
+    }
+    into_nodes(root.children)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spelled out rather than built by a helper that mirrors the production
+    /// one: an expectation derived the same way as the code under test agrees
+    /// with it by construction.
+    fn node(segment: &str, file_count: u32, children: Vec<TopicNode>) -> TopicNode {
+        TopicNode {
+            segment: segment.to_string(),
+            file_count,
+            children,
+        }
+    }
+
+    #[test]
+    fn children_follow_the_directory_segments_after_the_topic() {
+        assert_eq!(
+            segment_tree(["deep-dive/mcp/a/b/leaf.md"]),
+            vec![node("a", 1, vec![node("b", 1, vec![])])],
+            "each directory below the topic nests inside the one above it"
+        );
+    }
+
+    #[test]
+    fn the_category_and_topic_segments_are_not_repeated() {
+        let tree = segment_tree(["deep-dive/mcp/sub/leaf.md"]);
+        assert_eq!(
+            tree.iter().map(|n| n.segment.as_str()).collect::<Vec<_>>(),
+            vec!["sub"],
+            "the group already names its category and topic, so the tree \
+             starts below them"
+        );
+    }
+
+    #[test]
+    fn the_file_name_is_not_a_node() {
+        assert_eq!(
+            segment_tree(["deep-dive/mcp/sub/leaf.md"]),
+            vec![node("sub", 1, vec![])],
+            "the last segment is the document, not a directory"
+        );
+    }
+
+    #[test]
+    fn a_parent_counts_every_document_beneath_it() {
+        assert_eq!(
+            segment_tree([
+                "deep-dive/mcp/a/x.md",
+                "deep-dive/mcp/a/b/y.md",
+                "deep-dive/mcp/a/b/z.md",
+            ]),
+            vec![node("a", 3, vec![node("b", 2, vec![])])],
+            "a directory counts what is under it at any depth, not only the \
+             documents sitting directly in it"
+        );
+    }
+
+    #[test]
+    fn the_same_directory_reached_by_two_documents_is_one_node() {
+        assert_eq!(
+            segment_tree(["deep-dive/mcp/sub/a.md", "deep-dive/mcp/sub/b.md"]),
+            vec![node("sub", 2, vec![])],
+            "two documents in one directory are two counts on one node"
+        );
+    }
+
+    #[test]
+    fn a_document_directly_under_its_topic_adds_no_node() {
+        assert_eq!(
+            segment_tree(["deep-dive/mcp/overview.md"]),
+            vec![],
+            "there is no directory between the topic and the document"
+        );
+    }
+
+    #[test]
+    fn category_only_and_root_documents_add_no_node() {
+        assert_eq!(
+            segment_tree(["ai-news/2026-04-16.md", "index.md"]),
+            vec![],
+            "a path with fewer segments than the group key leaves nothing to \
+             put in the tree"
+        );
+    }
+
+    #[test]
+    fn a_frontmatter_topic_does_not_move_the_segment_boundary() {
+        // Filed under topic `mcp` by its frontmatter, while its own second
+        // segment reads `x`. The boundary is positional, so `x` is consumed as
+        // the topic segment and never becomes a node.
+        assert_eq!(
+            segment_tree(["deep-dive/x/sub/leaf.md"]),
+            vec![node("sub", 1, vec![])],
+            "the two segments dropped are the first two, whichever group the \
+             document was filed under"
+        );
+    }
+
+    #[test]
+    fn siblings_are_sorted_by_segment() {
+        let tree = segment_tree([
+            "deep-dive/mcp/z/f.md",
+            "deep-dive/mcp/a/f.md",
+            "deep-dive/mcp/m/f.md",
+        ]);
+        assert_eq!(
+            tree.iter().map(|n| n.segment.as_str()).collect::<Vec<_>>(),
+            vec!["a", "m", "z"],
+            "the tree is a function of the set of paths, not of the order \
+             SQLite happened to return them in"
+        );
+    }
+
+    #[test]
+    fn empty_segments_and_a_trailing_slash_are_ignored() {
+        assert_eq!(
+            segment_tree(["deep-dive//mcp/sub//leaf.md"]),
+            vec![node("sub", 1, vec![])],
+            "an empty segment is not a directory"
+        );
+        assert_eq!(
+            segment_tree(["deep-dive/mcp/sub/"]),
+            vec![],
+            "with the trailing slash gone the last segment is the file name, \
+             so this path is a document directly under its topic"
+        );
     }
 }

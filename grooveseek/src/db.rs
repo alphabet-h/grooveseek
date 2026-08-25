@@ -324,6 +324,22 @@ impl IntegrityScan {
     }
 }
 
+/// One directory beneath a `(category, topic)` group, as
+/// [`Database::list_topics`] reports it in [`TopicInfo::children`].
+///
+/// `Eq` so a test can compare a whole subtree at once: the tree is a value,
+/// and asserting on it field by field is how a missing level goes unnoticed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicNode {
+    /// The path segment, without slashes.
+    pub segment: String,
+    /// Documents whose path has this directory as a prefix, at any depth
+    /// beneath it.
+    pub file_count: u32,
+    /// The directories directly beneath this one, sorted by segment.
+    pub children: Vec<TopicNode>,
+}
+
 /// Topic/category grouping returned by [`Database::list_topics`].
 #[derive(Debug, Clone)]
 pub struct TopicInfo {
@@ -332,6 +348,10 @@ pub struct TopicInfo {
     pub file_count: u32,
     pub last_updated: Option<String>,
     pub titles: Vec<String>,
+    /// The directory tree beneath this group, sorted by segment at every
+    /// level. Empty when every document in the group sits directly in the
+    /// group's own directory.
+    pub children: Vec<TopicNode>,
 }
 
 // feature-48: `sanitize_fts_query` はここにあったが、クエリ全体を単一 phrase 化する
@@ -3473,6 +3493,95 @@ mod tests {
             group.titles
         );
         assert!(group.titles.contains(&"plain title".to_string()));
+    }
+
+    /// The half of the tree that `segment_tree`'s own unit tests cannot see:
+    /// the paths have to travel out of SQLite and into the tree builder.
+    /// Measured, a missing column makes the query fail outright and a column
+    /// read at the wrong index builds the tree out of the titles instead --
+    /// and all ten unit tests pass through both, because none of them go near
+    /// the SQL.
+    ///
+    /// `deep-dive/other/notes/x.md` is filed under topic `mcp`, which is what a
+    /// frontmatter `topic:` does to a document. It joins that group and
+    /// contributes `notes` -- the directory after its second path segment --
+    /// rather than moving where its directories start.
+    ///
+    /// The titles are deliberately not the paths. `json_group_array(title)` is
+    /// the column next to `json_group_array(path)`, so a mapper reading the
+    /// wrong index would build the tree out of titles -- and a fixture whose
+    /// title *is* its path cannot tell the two apart.
+    #[test]
+    fn list_topics_reports_the_directories_beneath_each_group() {
+        let db = Database::open_in_memory().unwrap();
+        for (path, category, topic) in [
+            ("index.md", None, None),
+            ("ai-news/2026-04-16.md", Some("ai-news"), None),
+            ("deep-dive/mcp/overview.md", Some("deep-dive"), Some("mcp")),
+            (
+                "deep-dive/mcp/transport/stdio.md",
+                Some("deep-dive"),
+                Some("mcp"),
+            ),
+            (
+                "deep-dive/mcp/transport/http/streamable.md",
+                Some("deep-dive"),
+                Some("mcp"),
+            ),
+            ("deep-dive/other/notes/x.md", Some("deep-dive"), Some("mcp")),
+        ] {
+            db.upsert_document(path, Some("Doc"), topic, category, None, &[], None, "h", 0)
+                .unwrap();
+        }
+
+        let topics = db.list_topics().unwrap();
+
+        let mcp = topics
+            .iter()
+            .find(|t| t.topic.as_deref() == Some("mcp"))
+            .expect("the mcp group exists");
+        assert_eq!(mcp.file_count, 4, "four documents are filed under mcp");
+        assert_eq!(
+            mcp.children,
+            vec![
+                TopicNode {
+                    segment: "notes".to_string(),
+                    file_count: 1,
+                    children: vec![],
+                },
+                TopicNode {
+                    segment: "transport".to_string(),
+                    file_count: 2,
+                    children: vec![TopicNode {
+                        segment: "http".to_string(),
+                        file_count: 1,
+                        children: vec![],
+                    }],
+                },
+            ],
+            "the whole tree, so a level lost between the query and the caller \
+             cannot pass"
+        );
+
+        let news = topics
+            .iter()
+            .find(|t| t.category.as_deref() == Some("ai-news"))
+            .expect("the ai-news group exists");
+        assert!(
+            news.children.is_empty(),
+            "a category-only group is flat: {:?}",
+            news.children
+        );
+
+        let root = topics
+            .iter()
+            .find(|t| t.category.is_none())
+            .expect("the root group exists");
+        assert!(
+            root.children.is_empty(),
+            "a document at the root has no directory beneath its group: {:?}",
+            root.children
+        );
     }
 
     #[test]
