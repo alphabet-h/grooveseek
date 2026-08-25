@@ -225,12 +225,24 @@ fn reproduction_gap(
     // Within one job, the block has to list the job's commands in the job's
     // order. A command the block lacks was reported just above and is skipped
     // here; a decreasing block position between two consecutive commands of
-    // one job is an inversion, and one is enough to name.
-    let block_at: BTreeMap<&str, usize> = block_value
-        .lines()
-        .enumerate()
-        .map(|(i, line)| (line, i))
-        .collect();
+    // one job is an inversion, and one is enough to name. A command the block
+    // lists twice is refused outright: the set above cannot see the second
+    // copy, and a position taken from either copy would let `cargo test`,
+    // the pre-warm, `cargo test` read as ordered.
+    let mut block_at: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, line) in block_value.lines().enumerate() {
+        if let Some(first) = block_at.get(line) {
+            out.push(format!(
+                "pin `{id}`: {block_where} lists `{line}` twice (its lines {} and {}). A \
+                 block that reproduces a workflow lists each command once, where the \
+                 workflow runs it; delete one copy from every member",
+                first + 1,
+                i + 1
+            ));
+            continue;
+        }
+        block_at.insert(line, i);
+    }
     let mut by_job: BTreeMap<&str, Vec<(&str, String)>> = BTreeMap::new();
     for step in steps {
         for command in &step.commands {
@@ -788,6 +800,28 @@ fn the_block_keeps_a_job_s_order_and_is_free_between_jobs() {
             "A.md:1 lists `cargo test` before `cargo warm`, and w.yml runs them the other way \
              round in jobs.a (jobs.a.steps[0] (warm), then jobs.a.steps[1])"
         ),
+        "{gap:?}"
+    );
+    // A duplicate cannot stand in for the right order: the same set, and the
+    // second copy after the pre-warm, is refused as a duplicate and the order
+    // is judged on the first copy.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo test\ncargo warm\ncargo test\ncargo fmt",
+        "w.yml",
+        &steps,
+    );
+    assert_eq!(gap.len(), 2, "{gap:?}");
+    assert!(
+        gap.iter()
+            .any(|g| g.contains("A.md:1 lists `cargo test` twice (its lines 1 and 3)")),
+        "{gap:?}"
+    );
+    assert!(
+        gap.iter()
+            .any(|g| g.contains("lists `cargo test` before `cargo warm`")),
         "{gap:?}"
     );
 }

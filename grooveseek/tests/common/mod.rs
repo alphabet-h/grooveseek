@@ -21,8 +21,8 @@
 //! - [`source`] — the workspace members from the root manifest and the walk
 //!   over their `src` directories. Shared by the stderr guard and the source
 //!   layout guard.
-//! - [`workflow`] — the `run:` steps of a GitHub Actions workflow, read from
-//!   its YAML. Shared by the pin guard and the bench guard.
+//! - [`crate::common::workflow`] — the `run:` steps of a GitHub Actions
+//!   workflow, read from its YAML. Shared by the pin guard and the bench guard.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
