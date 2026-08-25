@@ -2724,25 +2724,23 @@ mod documented_flags {
         );
     }
 
-    /// What a command or verb name looks like on a page, for both readers below.
+    /// Neither reader below has a grammar for what a name looks like, on
+    /// purpose. A grammar always has a boundary a stray can hide behind:
+    /// `[a-z-]*` read `status2` as `status`, `[a-z0-9_-]*` read `statusBAD`
+    /// as `status`, and each time the set still equalled the binary's with the
+    /// wrong name on the page. So the readers take the whole delimited
+    /// candidate — everything between the backticks, the whole non-space run
+    /// after `groove service` — and leave the judgement to the set comparison,
+    /// which is the only part of this that knows what a name is.
     ///
-    /// Wider than what clap would accept on purpose: a malformed name such as
-    /// `status2` or `tray-install_legacy` has to be captured **whole** so that
-    /// it lands in the set and the comparison rejects it. A grammar that
-    /// stopped at the first digit or underscore would read `status2` as
-    /// `status` — a real name vouching for a wrong one — or skip it, and a set
-    /// that equalled the binary's would pass with the stray still on the page.
-    const NAME: &str = r"[a-z][a-z0-9_-]*";
-
     /// The names a line enumerates, when the line says it is the whole list.
-    ///
     /// The needles are the English wording and its two Japanese renderings;
     /// fewer than three names is a mention, not an enumeration.
     fn enumerated_names(line: &str) -> Option<BTreeSet<String>> {
         let says_every = line.contains("Every command")
             || line.contains("全コマンド")
             || line.contains("全サブコマンド");
-        let token = regex::Regex::new(&format!("`({NAME})`")).expect("a valid pattern");
+        let token = regex::Regex::new("`([^`\n]+)`").expect("a valid pattern");
         let named: BTreeSet<String> = token
             .captures_iter(line)
             .map(|c| c[1].to_string())
@@ -2750,38 +2748,44 @@ mod documented_flags {
         (says_every && named.len() >= 3).then_some(named)
     }
 
-    /// Every `groove service <verb>` a body of prose shows, verbs captured whole.
+    /// Every `groove service <verb>` a body of prose shows, verbs taken whole.
     ///
-    /// The trailing boundary keeps `groove services` and a name glued to the
-    /// next word out; what precedes it is [`NAME`], so anything name-shaped is
-    /// returned as written rather than truncated to a real verb. A group
-    /// written as `groove service install/uninstall/tray-install` — the form
-    /// `docs/ARCHITECTURE.md` uses — is one match split on `/`, so every name
-    /// in the group reaches the comparison, not only the first.
+    /// The candidate is the non-space run after `groove service` up to a
+    /// backtick, with the punctuation prose hangs on the end (`.` `,` `;` `:`
+    /// `)`) removed. A group written as `install/uninstall/tray-install` — the
+    /// form `docs/ARCHITECTURE.md` uses — is split on `/` so every name in it
+    /// reaches the comparison. A `<placeholder>` is not a candidate.
     fn service_verbs(text: &str) -> BTreeSet<String> {
-        let verb = regex::Regex::new(&format!(
-            r"groove service ({NAME}(?:/{NAME})*)(?:[^a-z0-9_/-]|$)"
-        ))
-        .expect("a valid pattern");
+        let verb = regex::Regex::new("groove service ([^\\s`]+)").expect("a valid pattern");
         verb.captures_iter(text)
-            .flat_map(|c| c[1].split('/').map(str::to_string).collect::<Vec<_>>())
+            .flat_map(|c| {
+                c[1].trim_end_matches(['.', ',', ';', ':', ')'])
+                    .split('/')
+                    .filter(|name| !name.is_empty() && !name.starts_with('<'))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
     #[test]
     fn a_malformed_name_is_captured_whole_rather_than_dropped() {
-        let named = enumerated_names("| Every command: `index`, `status2`, `serve`, `foo_bar` |")
-            .expect("three or more names under the needle is an enumeration");
-        assert!(named.contains("status2"), "{named:?}");
-        assert!(named.contains("foo_bar"), "{named:?}");
+        let named = enumerated_names(
+            "| Every command: `index`, `status2`, `serve`, `foo_bar`, `bogusBAD` |",
+        )
+        .expect("three or more names under the needle is an enumeration");
+        for stray in ["status2", "foo_bar", "bogusBAD"] {
+            assert!(named.contains(stray), "{stray} should be in {named:?}");
+        }
         assert!(!named.contains("status"), "{named:?}");
 
         let verbs = service_verbs(
-            "run `groove service status2` then `groove service tray-install_legacy`.",
+            "run `groove service status2` then `groove service tray-install_legacy`, \
+             or groove service statusBAD. Never groove service <verb>.",
         );
         assert_eq!(
             verbs,
-            ["status2", "tray-install_legacy"]
+            ["status2", "tray-install_legacy", "statusBAD"]
                 .into_iter()
                 .map(str::to_string)
                 .collect()
