@@ -1197,7 +1197,11 @@ fn concurrent_tools_call_latency_table() {
     // (2.3 GB resident) into a daemon whose table says "no reranker"
     // (codex P1 round 1 on PR #235). Only the reference daemon gets one.
     let no_reranker = ["--reranker", "none"];
-    let (guard, base) = spawn_mcp_server_with_args(&staged.kb, &staged.config, &no_reranker);
+    // A BGE-M3 corpus means a 2.3 GB model fetched and loaded before the
+    // socket binds; 300 s covers a cold cache on an ordinary connection.
+    let startup = Duration::from_secs(300);
+    let (guard, base) =
+        spawn_mcp_server_with_args(&staged.kb, &staged.config, &no_reranker, startup);
     let authority = authority_of(&base);
     let pid = Some(guard.pid());
 
@@ -1314,7 +1318,7 @@ fn concurrent_tools_call_latency_table() {
     // Twin: the same corpus served twice, N=8 split 4+4.
     let twin_corpus = staged.twin();
     let (twin_guard, twin_base) =
-        spawn_mcp_server_with_args(&twin_corpus.kb, &twin_corpus.config, &no_reranker);
+        spawn_mcp_server_with_args(&twin_corpus.kb, &twin_corpus.config, &no_reranker, startup);
     let twin_site = Site {
         authorities: vec![authority.clone(), authority_of(&twin_base)],
         query: &query,
@@ -1334,8 +1338,13 @@ fn concurrent_tools_call_latency_table() {
     let search_n1 = merged(&cells, Workload::Search, 1).expect("search N=1 cell");
     if env_flag("GROOVE_BENCH_RERANK") {
         drop(guard);
-        let (rr_guard, rr_base) =
-            spawn_mcp_server_with_args(&staged.kb, &staged.config, &["--reranker", "bge-v2-m3"]);
+        // Two 2.3 GB models this time, the embedder and the reranker.
+        let (rr_guard, rr_base) = spawn_mcp_server_with_args(
+            &staged.kb,
+            &staged.config,
+            &["--reranker", "bge-v2-m3"],
+            Duration::from_secs(900),
+        );
         let rr_authority = authority_of(&rr_base);
         let rr_pid = Some(rr_guard.pid());
         let rr_timeout = Duration::from_secs(900);
