@@ -955,7 +955,7 @@ fn the_extensions_a_bare_name_may_carry_come_from_the_tree() {
 #[test]
 fn the_walk_reaches_every_member_and_every_extension() {
     let root = repo_root();
-    let tree = source_tree(&root);
+    let tree = source_tree();
     for required in WALK_ANCHORS {
         assert!(
             tree.contains(*required),
@@ -1010,7 +1010,7 @@ struct Live {
 fn live() -> Vec<Live> {
     let root = repo_root();
     let members = workspace_members();
-    let tree = source_tree(&root);
+    let tree = source_tree();
     for required in WALK_ANCHORS {
         assert!(
             tree.contains(*required),

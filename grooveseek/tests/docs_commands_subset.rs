@@ -581,12 +581,7 @@ fn every_shell_block_in_the_corpus_names_a_command() {
     let mut silent: Vec<String> = Vec::new();
     let mut pages_read: BTreeSet<String> = BTreeSet::new();
     for file in markdown_files(&root) {
-        let shown = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        let shown = shown(&root, &file);
         let markdown = read(&file);
         for block in shell_blocks(&markdown) {
             let commands = command_lines(&block.body);
@@ -647,12 +642,7 @@ fn no_inline_chain_in_the_corpus_is_read_halfway() {
     let root = repo_root();
     let mut partial: Vec<String> = Vec::new();
     for file in markdown_files(&root) {
-        let shown = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        let shown = shown(&root, &file);
         let markdown = read(&file);
         for chain in half_read_chains(&markdown) {
             partial.push(format!("{shown}:{} `{}`", chain.line, chain.text));
@@ -678,12 +668,7 @@ fn the_block_subset_relation_this_guard_refuses_is_still_common() {
     let root = repo_root();
     let mut pairs: Vec<String> = Vec::new();
     for file in markdown_files(&root) {
-        let shown = file
-            .strip_prefix(&root)
-            .unwrap_or(&file)
-            .display()
-            .to_string()
-            .replace('\\', "/");
+        let shown = shown(&root, &file);
         let markdown = read(&file);
         let blocks: Vec<(usize, BTreeSet<String>)> = shell_blocks(&markdown)
             .iter()

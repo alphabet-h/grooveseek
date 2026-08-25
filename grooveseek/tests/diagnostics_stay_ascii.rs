@@ -539,16 +539,9 @@ fn every_word_groove_writes_to_stderr_is_ascii() {
         let mut paths = Vec::new();
         rust_files(&dir, &mut paths);
         for path in paths {
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
-                .replace("\r\n", "\n");
+            let src = common::docs::read(&path);
             let (masked, literals) = mask_comments_and_strings(&src);
-            let shown = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .display()
-                .to_string()
-                .replace('\\', "/");
+            let shown = common::docs::shown(&root, &path);
             scanned.push(Scanned {
                 shown,
                 src,

@@ -24,7 +24,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   file under each workspace member's `src` and requires both tables to
   describe it: a row of its own, or its directory's row naming it in
   backticks inside that row — the rule #214 worked out by hand, since a match
-  by file name hides `server/search.rs` behind `db/search.rs`. The other
+  by file name hides `server/search.rs` behind `db/search.rs` — or, for a
+  member the table describes with a single crate-level row such as
+  `crates/groove-svc/`, that row alone. The other
   direction too, compared as written so a wrong case fails on Windows as it
   does on Linux; the English and Japanese tables in the same order; and a row
   the reader cannot classify, or one with a `|` the parser would swallow, is

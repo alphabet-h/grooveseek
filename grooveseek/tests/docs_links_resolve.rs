@@ -16,9 +16,9 @@
 //! Every `.md` file under the repository root except:
 //!
 //! - `target/`, which is build output, and `grooveseek/tests/fixtures/`, which
-//!   is knowledge bases fed to the search engine -- inputs under test rather
-//!   than documentation, and a fixture is entitled to contain a link that goes
-//!   nowhere.
+//!   is knowledge bases fed to the search engine and pages frozen from this
+//!   repository's history -- inputs under test rather than documentation, and
+//!   a fixture is entitled to contain a link that goes nowhere.
 //! - every dot-directory except `.claude/` and `.github/`. `.git/` is one case;
 //!   the ones that matter are `.dev/` (a nested private repository, here and not
 //!   in a fresh clone) and `.remember/` (one machine's session notes). Walking

@@ -14,16 +14,17 @@
 //! shape of mistake these guards exist to stop.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::docs::{repo_root, shown};
 
 /// Every `[workspace].members` entry of the root manifest, as written there.
 ///
-/// A manifest with no members, a member that is not a plain path, or a list
-/// that does not name `grooveseek` -- the crate these tests belong to -- fails
-/// here rather than contributing nothing: a walk over zero members finds zero
-/// files and every check downstream passes on an empty tree.
+/// A manifest with no members, a member that is not a string, a member
+/// written with glob syntax (`*`, `?`, `[`), or a list that does not name
+/// `grooveseek` -- the crate these tests belong to -- fails here rather than
+/// contributing nothing: a walk over zero members finds zero files and every
+/// check downstream passes on an empty tree.
 pub fn workspace_members() -> Vec<String> {
     let manifest_path = repo_root().join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest_path)
@@ -43,7 +44,7 @@ pub fn workspace_members() -> Vec<String> {
                 .as_str()
                 .unwrap_or_else(|| panic!("a workspace member that is not a path: {member}"));
             assert!(
-                !name.contains('*'),
+                !name.contains(['*', '?', '[']),
                 "a workspace member written as a glob cannot be walked as a path, so \
                  nothing under it would be checked: {name}"
             );
@@ -59,9 +60,9 @@ pub fn workspace_members() -> Vec<String> {
     members
 }
 
-/// The source directory of every workspace member.
+/// The source directory of every workspace member, under the repository root.
 ///
-/// A member whose `src` is missing -- a glob in `members`, a moved crate --
+/// A member whose `src` is missing -- a moved crate, a renamed directory --
 /// fails here rather than contributing nothing.
 pub fn source_dirs() -> Vec<PathBuf> {
     let root = repo_root();
@@ -81,7 +82,8 @@ pub fn source_dirs() -> Vec<PathBuf> {
 }
 
 /// Every file under every member's `src`, whatever its extension, named the
-/// way a failure message names it (see [`shown`]).
+/// way a failure message names it (see [`shown`]): relative to the repository
+/// root, with `/`.
 ///
 /// The filesystem is walked, not `git ls-files`: the CI checkout is one commit
 /// deep and a guard that sees different things locally and in CI is the one
@@ -96,7 +98,8 @@ pub fn source_dirs() -> Vec<PathBuf> {
 /// A walk error is fatal rather than skipped, for the reason
 /// [`super::docs::markdown_files`] gives: `.flatten()` would drop the
 /// unreadable directory and the tree would quietly lose whatever was under it.
-pub fn source_tree(root: &Path) -> BTreeSet<String> {
+pub fn source_tree() -> BTreeSet<String> {
+    let root = repo_root();
     let mut found = BTreeSet::new();
     for dir in source_dirs() {
         let entries = walkdir::WalkDir::new(&dir)
@@ -111,7 +114,7 @@ pub fn source_tree(root: &Path) -> BTreeSet<String> {
                 )
             });
             if entry.file_type().is_file() {
-                found.insert(shown(root, entry.path()));
+                found.insert(shown(&root, entry.path()));
             }
         }
     }
