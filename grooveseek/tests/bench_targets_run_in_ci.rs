@@ -13,17 +13,15 @@
 //! what makes a bench added later easy to leave out, so this test pins the two
 //! lists to each other — in both directions, because a name that is wrong in the
 //! workflow would otherwise only surface in the next nightly run.
+//!
+//! The workflow is read through `common::workflow`, so only what a `run:` step
+//! runs is looked at; the file mentions the flag in comments too.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-/// The workspace root. `CARGO_MANIFEST_DIR` is `<root>/groove` since the
-/// workspace split (feature-44 PR-1).
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("CARGO_MANIFEST_DIR is <workspace root>/groove, which has a parent")
-        .to_path_buf()
-}
+use common::docs::repo_root;
+use common::workflow::run_steps;
+use std::path::Path;
 
 /// The `name` of every `[[bench]]` entry in groove's manifest.
 fn declared_bench_targets() -> Vec<String> {
@@ -51,12 +49,13 @@ fn declared_bench_targets() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every bench target named after a `--bench` flag in the workflow.
+/// Every bench target named after a `--bench` flag in the commands.
 ///
-/// The workflow mentions the flag in prose too (the step name, the comment
-/// above it), so only tokens shaped like a cargo target name are taken to be
-/// one. A misspelled target still looks like a name and is still caught; the
-/// prose that follows `--bench` in a sentence does not.
+/// The input is what the workflow's `run:` steps run, one command per line,
+/// so a `--bench` in a comment or a step name is not here to be counted. The
+/// shape filter stays: a `--bench` that ends a line, or is followed by another
+/// flag, names no target, and a misspelled target still looks like a name and
+/// is still caught.
 fn bench_targets_referenced_by(workflow: &str) -> Vec<&str> {
     workflow
         .split("--bench ")
@@ -84,7 +83,7 @@ fn every_bench_target_is_executed_by_the_nightly_workflow() {
          above stopped seeing them (then this guard silently stopped guarding)"
     );
 
-    let path = workspace_root()
+    let path = repo_root()
         .join(".github")
         .join("workflows")
         .join("nightly.yml");
@@ -96,10 +95,20 @@ fn every_bench_target_is_executed_by_the_nightly_workflow() {
         )
     });
 
+    // What the steps run, and nothing else in the file. Before this the whole
+    // text was scanned, and a target that survived only in a comment counted
+    // as run.
+    let commands = run_steps(&workflow)
+        .unwrap_or_else(|why| panic!("{} {why}", path.display()))
+        .into_iter()
+        .flat_map(|step| step.commands)
+        .collect::<Vec<_>>()
+        .join("\n");
+
     // Both directions compare whole tokens. A `contains("--bench <name>")` scan
     // would report `search` as covered because `--bench search_latency` starts
     // with it.
-    let referenced = bench_targets_referenced_by(&workflow);
+    let referenced = bench_targets_referenced_by(&commands);
 
     let missing: Vec<&str> = declared
         .iter()

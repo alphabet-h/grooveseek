@@ -42,6 +42,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Internal
 
+- **The CI command block is now compared with the workflow it copies.**
+  `AGENTS.md` and `CONTRIBUTING.md` each carry the commands that reproduce
+  CI, and #229 pinned the two copies to each other -- which left the thing
+  they are copies *of*, `.github/workflows/ci.yml`, outside the comparison:
+  both could drift from the workflow together and agree with each other the
+  whole way down. `grooveseek/tests/docs_commands_pinned.rs` now reads the
+  workflow's `run:` steps through the same reader as the fenced block and
+  requires the two sets of commands to be equal, naming the command and the
+  side -- `jobs.clippy.steps[3]`, or the block -- that has it alone. Order is
+  not compared: the block is written cheapest-first for someone reproducing
+  CI by hand, and the workflow's jobs run in parallel, so neither order is
+  the other's. A step the reader cannot classify, a `run:` that reads as no
+  command, and a line inside a `run:` the reader cannot place are each
+  reported rather than skipped, since any of them is a command CI may run
+  that is being compared with nothing.
+
+  The workflow reader lives in `tests/common/workflow.rs`, and
+  `bench_targets_run_in_ci.rs` now reads `nightly.yml` through it instead of
+  scanning the file as text -- so a `--bench` name that survives only in a
+  comment no longer counts as run. Two private copies of the repository-root
+  helper, in that test and in `diagnostics_stay_ascii.rs`, are folded into
+  the shared one.
+
 - **Every line of a shell block in the documentation is now accounted for.**
   The reader behind the command-copy guards (#229) was checked one block at a
   time: a fenced shell block that yielded no command failed the suite, but a

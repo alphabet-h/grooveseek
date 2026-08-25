@@ -36,7 +36,7 @@ under `--lib`. Reach those with `--bin groove`, and when you are not sure which
 target a test lives in, drop the filter and let `cargo test <name>` search all
 of them.
 
-To reproduce what CI runs, all of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails:
+To reproduce what CI runs, all of these have to pass — `cargo clippy --all-targets` alone is **not** what CI checks, so it can be clean locally while CI fails. `grooveseek/tests/docs_commands_pinned.rs` compares this block with the `run:` steps of `.github/workflows/ci.yml`, order aside, so a check added to one and not the other fails the suite:
 
 <!-- groove-pin: ci-command-block -->
 ```bash
