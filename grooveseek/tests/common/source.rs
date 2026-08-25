@@ -91,20 +91,21 @@ pub fn source_dirs() -> Vec<PathBuf> {
 /// in git is reported like any other, which is the right answer for a stray
 /// `.orig` or a scratch module -- it is in the tree the binary is built from.
 ///
-/// Nothing is filtered here, dot-prefixed names included. The stderr guard
-/// reads every `.rs` the compiler might, and `#[path = ".generated.rs"]` is
-/// one; a walk that dropped it would let that module's diagnostics go
-/// unchecked (codex P2 on PR #231). A caller that wants machine-local
-/// artifacts such as `.DS_Store` out of its answer drops them itself.
-///
-/// A walk error is fatal rather than skipped, for the reason
-/// [`super::docs::markdown_files`] gives: `.flatten()` would drop the
-/// unreadable directory and the tree would quietly lose whatever was under it.
+/// The walk reaches everything the compiler could: dot-prefixed names are
+/// kept, since `#[path = ".generated.rs"]` is a module, and symlinks are
+/// followed, since rustc reads through them (walkdir does neither by default;
+/// both were codex findings on PR #231, each one narrower than the recursion
+/// the stderr guard used to have). A caller that wants machine-local
+/// artifacts such as `.DS_Store` out of its answer drops them itself. A
+/// symlink loop is a walk error, and a walk error is fatal rather than
+/// skipped, for the reason [`super::docs::markdown_files`] gives:
+/// `.flatten()` would drop the unreadable directory and the tree would
+/// quietly lose whatever was under it.
 pub fn source_tree() -> BTreeSet<String> {
     let root = repo_root();
     let mut found = BTreeSet::new();
     for dir in source_dirs() {
-        for entry in walkdir::WalkDir::new(&dir) {
+        for entry in walkdir::WalkDir::new(&dir).follow_links(true) {
             let entry = entry.unwrap_or_else(|e| {
                 panic!(
                     "the walk from {} failed partway through, so the tree it \
