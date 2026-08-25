@@ -9,8 +9,9 @@
 //! counted a `--bench` name in a comment as a step; a `run:` is read here and
 //! nothing else is.
 //!
-//! Every `run:` value goes through [`read_block`], the reader the fenced
-//! blocks go through, so a comment, a continuation and a heredoc mean the same
+//! Every `run:` value goes through [`crate::common::docs::read_block`], the
+//! reader the fenced blocks go through, so a comment, a continuation and a
+//! heredoc mean the same
 //! thing on both sides of a comparison. A block scalar (`|`, `>`) arrives from
 //! the parser as one string -- `|` with its newlines, `>` folded onto one line
 //! -- and is split the same way. A line the reader cannot place is kept beside

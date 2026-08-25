@@ -14,8 +14,8 @@
 //! lists to each other — in both directions, because a name that is wrong in the
 //! workflow would otherwise only surface in the next nightly run.
 //!
-//! The workflow is read through [`common::workflow`], so only what a `run:`
-//! step runs is looked at; the file mentions the flag in comments too.
+//! The workflow is read through [`crate::common::workflow`], so only what a
+//! `run:` step runs is looked at; the file mentions the flag in comments too.
 
 mod common;
 

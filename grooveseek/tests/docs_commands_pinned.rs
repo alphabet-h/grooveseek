@@ -33,14 +33,18 @@
 //! a detector.
 //!
 //! **What the workflow does around a command.** The CI block is compared with
-//! the `run:` steps of `.github/workflows/ci.yml` as a set of commands, and
-//! only that. Not the order: the block is written cheapest-first for a person
-//! reproducing CI by hand, and the workflow's jobs run in parallel, so neither
-//! order is the other's. Not the environment (`FASTEMBED_CACHE_DIR`), the OS
-//! matrix, the `if:` on the doc step, or which job a command runs in -- a
-//! command moved between jobs, or run on one OS out of three, compares equal.
-//! `nightly.yml` and `release.yml` are compared with nothing here: the block
-//! does not claim to reproduce them.
+//! the `run:` steps of `.github/workflows/ci.yml` as a set of commands, plus
+//! the order within each job, and only that. Not the order between jobs: the
+//! block is written cheapest-first for a person reproducing CI by hand, and
+//! the workflow's jobs run in parallel, so neither order is the other's.
+//! Within one job the order is kept, because it is the order that works --
+//! `cargo test --test index_progress_cli` runs before `cargo test` so that
+//! one process warms the model cache -- and the block is what a reader
+//! follows. Not the environment (`FASTEMBED_CACHE_DIR`), the OS matrix, the
+//! `if:` on the doc step, or which job a command runs in -- a command moved
+//! between jobs, or run on one OS out of three, compares equal. `nightly.yml`
+//! and `release.yml` are compared with nothing here: the block does not claim
+//! to reproduce them.
 //!
 //! **A check written as an action.** Only `run:` steps are read. Every `uses:`
 //! in `ci.yml` today is setup -- checkout, toolchain, cache -- so a `uses:` is
@@ -151,7 +155,10 @@ fn normalise(shape: Shape, body: &str) -> Result<String, String> {
 ///
 /// A set on each side, not a sequence and not a multiset. Two jobs that run
 /// the same command are one thing a reader is told to run, and the block's
-/// own order is compared with its copies elsewhere, not with the workflow.
+/// own order is compared with its copies elsewhere, not with the workflow --
+/// except within one job, whose step order the block has to keep: the
+/// pre-warm step runs before the suite for a reason, and a block that lists
+/// them the other way round sends a reader into the race the order avoids.
 ///
 /// A step whose `run:` yields no command, and a line of a `run:` the reader
 /// could not place, are reported rather than skipped: either one is a command
@@ -214,6 +221,45 @@ fn reproduction_gap(
              two apart here rather than dropping the step from the comparison",
             at.join(", ")
         ));
+    }
+    // Within one job, the block has to list the job's commands in the job's
+    // order. A command the block lacks was reported just above and is skipped
+    // here; a decreasing block position between two consecutive commands of
+    // one job is an inversion, and one is enough to name.
+    let block_at: BTreeMap<&str, usize> = block_value
+        .lines()
+        .enumerate()
+        .map(|(i, line)| (line, i))
+        .collect();
+    let mut by_job: BTreeMap<&str, Vec<(&str, String)>> = BTreeMap::new();
+    for step in steps {
+        for command in &step.commands {
+            by_job
+                .entry(step.job.as_str())
+                .or_default()
+                .push((command.as_str(), step.position()));
+        }
+    }
+    for (job, commands) in &by_job {
+        let mut last: Option<(&str, &str, usize)> = None;
+        for (command, position) in commands {
+            let Some(&at) = block_at.get(command) else {
+                continue;
+            };
+            if let Some((prev, prev_position, prev_at)) = last
+                && at < prev_at
+            {
+                out.push(format!(
+                    "pin `{id}`: {block_where} lists `{command}` before `{prev}`, and \
+                     {workflow} runs them the other way round in jobs.{job} \
+                     ({prev_position}, then {position}). Within one job the \
+                     workflow's order is the order that works, and the block is \
+                     what a reader follows, so it has to keep that order; between \
+                     jobs it is free"
+                ));
+            }
+            last = Some((command, position, at));
+        }
     }
     out
 }
@@ -709,6 +755,41 @@ fn order_between_the_block_and_the_workflow_is_not_a_difference() {
         &steps,
     );
     assert!(gap.is_empty(), "{gap:?}");
+}
+
+#[test]
+fn the_block_keeps_a_job_s_order_and_is_free_between_jobs() {
+    let steps = run_steps(
+        "jobs:\n  a:\n    steps:\n      - name: warm\n        run: cargo warm\n      - run: cargo test\n  b:\n    steps:\n      - run: cargo fmt\n",
+    )
+    .expect("reads");
+    // b's command first, then a's two in a's order: no gap.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo fmt\ncargo warm\ncargo test",
+        "w.yml",
+        &steps,
+    );
+    assert!(gap.is_empty(), "{gap:?}");
+    // a's two the other way round: named, with the job and both steps.
+    let gap = reproduction_gap(
+        "p",
+        "why",
+        "A.md:1",
+        "cargo test\ncargo warm\ncargo fmt",
+        "w.yml",
+        &steps,
+    );
+    assert_eq!(gap.len(), 1, "{gap:?}");
+    assert!(
+        gap[0].contains(
+            "A.md:1 lists `cargo test` before `cargo warm`, and w.yml runs them the other way \
+             round in jobs.a (jobs.a.steps[0] (warm), then jobs.a.steps[1])"
+        ),
+        "{gap:?}"
+    );
 }
 
 #[test]

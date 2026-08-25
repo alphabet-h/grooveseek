@@ -50,10 +50,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   whole way down. `grooveseek/tests/docs_commands_pinned.rs` now reads the
   workflow's `run:` steps through the same reader as the fenced block and
   requires the two sets of commands to be equal, naming the command and the
-  side -- `jobs.clippy.steps[3]`, or the block -- that has it alone. Order is
-  not compared: the block is written cheapest-first for someone reproducing
-  CI by hand, and the workflow's jobs run in parallel, so neither order is
-  the other's. A step the reader cannot classify, a `run:` that reads as no
+  side -- `jobs.clippy.steps[3]`, or the block -- that has it alone. Order
+  between jobs is not compared: the block is written cheapest-first for
+  someone reproducing CI by hand, and the workflow's jobs run in parallel, so
+  neither order is the other's. Order within a job is: `cargo test --test
+  index_progress_cli` runs before `cargo test` so that one process warms the
+  model cache, and a block that lists them the other way round sends a
+  reader into the race that order avoids. A step the reader cannot classify, a `run:` that reads as no
   command, and a line inside a `run:` the reader cannot place are each
   reported rather than skipped, since any of them is a command CI may run
   that is being compared with nothing. Only `run:` steps are read: every
