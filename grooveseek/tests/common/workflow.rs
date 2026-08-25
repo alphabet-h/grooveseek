@@ -19,11 +19,17 @@
 //!
 //! A shape this reader does not know -- no `jobs`, a job without `steps`, a
 //! step with neither `run` nor `uses` -- is an error rather than a skip, for
-//! the same reason. Setup in these workflows is written with `uses:` and every
-//! `run:` is a check; that is why every `run:` counts and no allowlist exists.
+//! the same reason. A `uses:` step is not read at all: in `ci.yml` every
+//! `uses:` is setup (checkout, toolchain, cache) and every `run:` is a check,
+//! which is why every `run:` counts and no allowlist exists, and also why a
+//! check written as an action would be invisible to a caller. The pin guard's
+//! module doc names that blind spot; the day such an action arrives, this is
+//! where it is taught apart from setup, with a reason.
 //!
-//! Not read: `shell:`, `working-directory:`, `if:`, `env:`, the matrix. A
-//! `run:` containing `${{ matrix.x }}` compares as the literal text.
+//! Not read: `shell:`, `working-directory:`, `if:`, `continue-on-error:`,
+//! `env:`, the matrix. A `run:` containing `${{ matrix.x }}` compares as the
+//! literal text, and a step CI runs but no longer requires to pass compares
+//! as a step CI runs.
 
 use super::docs::{LineRead, read_block};
 use serde_yaml_bw::Value;
@@ -32,8 +38,9 @@ use serde_yaml_bw::Value;
 #[derive(Clone, Debug)]
 pub struct RunStep {
     pub job: String,
-    /// 0-based index among the job's `steps`, `uses:` steps included, so the
-    /// number matches what a reader counts in the file.
+    /// 0-based index among the job's `steps`, `uses:` steps included: a path
+    /// index, the way `yq '.jobs.fmt.steps[2]'` would name the same step, so
+    /// a failure message can be pasted into a query against the file.
     pub index: usize,
     pub name: Option<String>,
     /// The `run:` text through [`read_block`], instructions only. Empty when
@@ -127,7 +134,12 @@ pub fn run_steps(yaml: &str) -> Result<Vec<RunStep>, String> {
                     });
                 }
                 (None, Some(_)) => {}
-                (Some(_), Some(_)) => return Err(format!("{at} has both `run` and `uses`")),
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "{at} has both `run` and `uses`; a step does one or the other, so this \
+                         is the workflow to fix rather than the reader"
+                    ));
+                }
                 (None, None) => {
                     return Err(format!(
                         "{at} has neither `run` nor `uses`, a step shape this reader does not know"

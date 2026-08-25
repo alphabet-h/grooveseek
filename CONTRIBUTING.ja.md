@@ -35,7 +35,7 @@ cargo test -p grooveseek --lib <name>  # 名前指定で 1 本だけ実行 (work
 `--bin groove` で拾う。どのターゲットにあるか分からない時は、絞り込みを外して
 `cargo test <name>` に全部を探させる。
 
-CI と同じ検証をローカルで再現するには、次のすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる。`grooveseek/tests/docs_commands_pinned.rs` がこの block を `.github/workflows/ci.yml` の `run:` step と順序不問で比較するので、片方にだけ検査を足すとスイートが落ちる:
+CI と同じ検証をローカルで再現するには、次のすべてを通す必要がある。**`cargo clippy --all-targets` だけでは CI と一致しない** ので、ローカルで緑でも CI が落ちうる。英語版 `CONTRIBUTING.md` の block は `grooveseek/tests/docs_commands_pinned.rs` が `.github/workflows/ci.yml` の `run:` step と順序不問で比較し、この block は `docs_commands_twins.rs` が英語版と比較する。どれか 1 つにだけコマンドを足すとスイートが落ちる:
 
 ```bash
 cargo fmt --all -- --check

@@ -27,8 +27,8 @@ fails. No count is written down on purpose: the list is the list, and a number
 beside it is one more thing that can go stale.
 
 `grooveseek/tests/docs_commands_pinned.rs` compares this block with the `run:`
-steps of `.github/workflows/ci.yml`, order aside, so a check added to the block
-and not the workflow, or the other way round, fails the suite.
+steps of `.github/workflows/ci.yml`, order aside, so a command added to the
+block and not the workflow, or the other way round, fails the suite.
 
 <!-- groove-pin: ci-command-block -->
 ```bash

@@ -41,6 +41,13 @@
 //! command moved between jobs, or run on one OS out of three, compares equal.
 //! `nightly.yml` and `release.yml` are compared with nothing here: the block
 //! does not claim to reproduce them.
+//!
+//! **A check written as an action.** Only `run:` steps are read. Every `uses:`
+//! in `ci.yml` today is setup -- checkout, toolchain, cache -- so a `uses:` is
+//! not compared, and a check that arrives as an action rather than a command
+//! would be invisible here. The reader in `common/workflow.rs` is where such
+//! an action would be told apart from setup, with a reason, the day one is
+//! added.
 
 mod common;
 
@@ -162,7 +169,10 @@ fn reproduction_gap(
     let block: BTreeSet<&str> = block_value.lines().collect();
     let mut ran: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for step in steps {
-        if step.commands.is_empty() {
+        // A step with no command and no unread line read as nothing at all
+        // (a comment, say). One with unread lines is explained by them below;
+        // reporting it here too would name one cause twice.
+        if step.commands.is_empty() && step.unread.is_empty() {
             out.push(format!(
                 "{workflow}: pin `{id}`: {} has a `run:` that reads as no \
                  command, so whatever it runs is not being compared with \
@@ -316,9 +326,10 @@ fn every_copy_that_cannot_be_deleted_is_pinned_to_the_others() {
             }
         }
 
-        // Against the first member only. The loop above has already reported
-        // every other member that differs from it, so a comparison of each
-        // member with the workflow would repeat one gap once per copy.
+        // Against the first member only -- the walk is sorted, so today that is
+        // `AGENTS.md`, and the message names it. The loop above has already
+        // reported every other member that differs from it, so a comparison of
+        // each member with the workflow would repeat one gap once per copy.
         for workflow in pin.reproduces {
             assert_eq!(
                 pin.shape,
@@ -491,40 +502,61 @@ fn json_members_are_compared_as_values_and_not_as_characters() {
 // runs on shapes the corpus does not have today.
 // ---------------------------------------------------------------------------
 
-/// The workflow the CI block reproduces is still one this reader reads.
+/// The workflow the CI block reproduces is still one this reader reads, and
+/// the block still claims to reproduce it.
 ///
-/// Named jobs rather than a count, for the reason `docs_commands_subset.rs`
-/// names its pages: "some step somewhere was read" still passes when the
-/// reader stops understanding a job. `cargo test` is named literally because
-/// the block and the workflow losing that line *together* is a set equality
-/// that holds, and this is the one place that would notice.
+/// The workflow comes from the registration, not from a literal here: a pin
+/// whose `reproduces` was emptied would otherwise leave every test green
+/// with the comparison gone. Named jobs rather than a count, for the reason
+/// `docs_commands_subset.rs` names its pages: "some step somewhere was read"
+/// still passes when the reader stops understanding a job. Two commands are
+/// named literally -- `cargo test`, and the second clippy pass the block's
+/// own prose singles out -- because the block and the workflow losing a line
+/// *together* is a set equality that holds, and this is the one place that
+/// would notice.
 #[test]
 fn the_ci_workflow_is_still_the_shape_this_reader_reads() {
-    let path = repo_root().join(".github/workflows/ci.yml");
-    let steps =
-        run_steps(&read(&path)).unwrap_or_else(|why| panic!(".github/workflows/ci.yml {why}"));
+    const CI: &str = ".github/workflows/ci.yml";
+    let claimed: Vec<&str> = PINS
+        .iter()
+        .filter(|p| p.id == "ci-command-block")
+        .flat_map(|p| p.reproduces.iter().copied())
+        .collect();
+    assert!(
+        claimed.contains(&CI),
+        "pin `ci-command-block` no longer says it reproduces {CI} (it names \
+         {claimed:?}), so the block is not being compared with the workflow \
+         it copies. If the block stopped being a copy of CI, this test goes \
+         with it in the same commit"
+    );
+    let steps = run_steps(&read(&repo_root().join(CI))).unwrap_or_else(|why| panic!("{CI} {why}"));
     for job in ["test", "clippy", "fmt"] {
         assert!(
             steps.iter().any(|s| s.job == job),
-            "no `run:` step was read from jobs.{job} of .github/workflows/ci.yml. \
-             If the job was renamed, rename it here; if its checks moved to \
-             `uses:`, the reader has stopped seeing them and the block is \
-             being compared with less than CI runs. Read: {:?}",
+            "no `run:` step was read from jobs.{job} of {CI}. If the job was \
+             renamed, rename it here; if its checks moved to `uses:`, the \
+             reader has stopped seeing them and the block is being compared \
+             with less than CI runs. Read: {:?}",
             steps.iter().map(RunStep::position).collect::<Vec<_>>()
         );
     }
-    assert!(
-        steps
-            .iter()
-            .any(|s| s.commands.iter().any(|c| c == "cargo test")),
-        "no `run:` step of .github/workflows/ci.yml reads as `cargo test`. The \
-         comparison with the block passes when both sides lose a line; this \
-         is the one that notices. Read: {:?}",
-        steps
-            .iter()
-            .flat_map(|s| s.commands.clone())
-            .collect::<Vec<_>>()
-    );
+    for command in [
+        "cargo test",
+        "cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings",
+    ] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.commands.iter().any(|c| c == command)),
+            "no `run:` step of {CI} reads as `{command}`. The comparison with \
+             the block passes when both sides lose a line; this is the one \
+             that notices. Read: {:?}",
+            steps
+                .iter()
+                .flat_map(|s| s.commands.clone())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// The reader's output for a one-job, one-step workflow around `run`.
@@ -650,6 +682,14 @@ fn a_line_of_a_run_the_reader_cannot_place_is_reported() {
         "{gap:?}"
     );
     assert!(gap[0].contains("cannot start a command"), "{gap:?}");
+
+    // A step made only of such lines is explained by them, once each, and not
+    // also reported as reading as nothing.
+    let steps = one_run("|\n          %%% not shell\n          ((( nor this\n").expect("reads");
+    assert!(steps[0].commands.is_empty(), "{steps:?}");
+    let gap = reproduction_gap("p", "why", "A.md:1", "", "w.yml", &steps);
+    assert_eq!(gap.len(), 2, "{gap:?}");
+    assert!(gap.iter().all(|g| g.contains("of its `run:`")), "{gap:?}");
 }
 
 #[test]

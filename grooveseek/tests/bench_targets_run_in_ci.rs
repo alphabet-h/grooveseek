@@ -14,8 +14,8 @@
 //! lists to each other — in both directions, because a name that is wrong in the
 //! workflow would otherwise only surface in the next nightly run.
 //!
-//! The workflow is read through `common::workflow`, so only what a `run:` step
-//! runs is looked at; the file mentions the flag in comments too.
+//! The workflow is read through [`common::workflow`], so only what a `run:`
+//! step runs is looked at; the file mentions the flag in comments too.
 
 mod common;
 
@@ -52,10 +52,14 @@ fn declared_bench_targets() -> Vec<String> {
 /// Every bench target named after a `--bench` flag in the commands.
 ///
 /// The input is what the workflow's `run:` steps run, one command per line,
-/// so a `--bench` in a comment or a step name is not here to be counted. The
-/// shape filter stays: a `--bench` that ends a line, or is followed by another
-/// flag, names no target, and a misspelled target still looks like a name and
-/// is still caught.
+/// plus every line of a `run:` the reader could not place, as written. So a
+/// `--bench` in a comment or a step name is not here to be counted, and a
+/// `--bench` on a line the reader does not understand still is: the question
+/// here is what the steps pass to the flag, and a line dropped for being
+/// unreadable would shrink the answer without a word. The shape filter stays:
+/// a `--bench` that ends a line, or is followed by another flag, names no
+/// target, and a misspelled target still looks like a name and is still
+/// caught.
 fn bench_targets_referenced_by(workflow: &str) -> Vec<&str> {
     workflow
         .split("--bench ")
@@ -97,11 +101,17 @@ fn every_bench_target_is_executed_by_the_nightly_workflow() {
 
     // What the steps run, and nothing else in the file. Before this the whole
     // text was scanned, and a target that survived only in a comment counted
-    // as run.
+    // as run. A line the reader could not place is kept, as text: nightly.yml
+    // has a few (a brace group's `{` and `}`, the `)` closing a `$(cat <<BODY`),
+    // and none of them names a bench today, but the day one does it has to be
+    // seen here rather than lost to the reader's vocabulary.
     let commands = run_steps(&workflow)
         .unwrap_or_else(|why| panic!("{} {why}", path.display()))
         .into_iter()
-        .flat_map(|step| step.commands)
+        .flat_map(|step| {
+            let unread = step.unread.into_iter().map(|line| line.raw);
+            step.commands.into_iter().chain(unread)
+        })
         .collect::<Vec<_>>()
         .join("\n");
 

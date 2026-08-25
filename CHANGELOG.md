@@ -56,14 +56,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the other's. A step the reader cannot classify, a `run:` that reads as no
   command, and a line inside a `run:` the reader cannot place are each
   reported rather than skipped, since any of them is a command CI may run
-  that is being compared with nothing.
+  that is being compared with nothing. Only `run:` steps are read: every
+  `uses:` in the workflow today is setup, and the module doc names a check
+  written as an action as the thing this cannot see.
 
-  The workflow reader lives in `tests/common/workflow.rs`, and
-  `bench_targets_run_in_ci.rs` now reads `nightly.yml` through it instead of
-  scanning the file as text -- so a `--bench` name that survives only in a
-  comment no longer counts as run. Two private copies of the repository-root
-  helper, in that test and in `diagnostics_stay_ascii.rs`, are folded into
-  the shared one.
+  The workflow reader lives in `grooveseek/tests/common/workflow.rs`, and
+  `grooveseek/tests/bench_targets_run_in_ci.rs` now reads `nightly.yml`
+  through it instead of scanning the file as text -- so a `--bench` name that
+  survives only in a comment no longer counts as run, while a line the reader
+  cannot place is still scanned as text rather than dropped. Two private
+  copies of the repository-root helper, in that test and in
+  `diagnostics_stay_ascii.rs`, are folded into the shared one.
 
 - **Every line of a shell block in the documentation is now accounted for.**
   The reader behind the command-copy guards (#229) was checked one block at a
