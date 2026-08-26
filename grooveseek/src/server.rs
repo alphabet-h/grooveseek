@@ -2488,14 +2488,16 @@ mod tests {
     /// The cap holds on the whitespace-fallback path, which has no term limit
     /// of its own.
     ///
-    /// `query_phrases` caps phrases at 32, but it does **not** apply
-    /// `fallback_whole_query` — that is `build_fts_query`'s job — so a query
-    /// whose fragments are all below the trigram floor yields no phrases at
-    /// all and `compute_match_spans` falls back to `split_whitespace`, which
-    /// is unbounded. With a per-term budget of at least one span, 150 terms
-    /// would mean 150 spans unless the term list is clamped. Without
-    /// `MATCH_SPAN_MAX_TERMS` this test is the only thing between a long
-    /// query and a broken cap.
+    /// [`crate::db::query_phrases`] caps phrases at 32 and returns the positive
+    /// list alone: the whole-query fallback that [`crate::db::parse_query`]
+    /// builds alongside it (`fallback_whole_query`, private to
+    /// `grooveseek/src/db/fts_query.rs`) is not part of that return value. So a
+    /// query whose fragments are all below the trigram floor yields no phrases
+    /// at all and [`crate::server::compute_match_spans`] falls back to
+    /// `split_whitespace`, which is unbounded. With a per-term budget of at
+    /// least one span, 150 terms would mean 150 spans unless the term list is
+    /// clamped. Without [`crate::server::search::MATCH_SPAN_MAX_TERMS`] this
+    /// test is the only thing between a long query and a broken cap.
     #[test]
     fn the_cap_holds_on_the_unbounded_whitespace_fallback() {
         let words: Vec<String> = (0..150)

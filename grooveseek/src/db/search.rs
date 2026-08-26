@@ -412,7 +412,7 @@ impl Database {
     /// これは「その phrase の doc-freq」= FTS5 の IDF クランプ条件そのものだったが、
     /// 現在は [`parse_query`] が生む複数 phrase の**和集合**の大きさであり、
     /// 個々の phrase の doc-freq の**上界**でしかない
-    /// (`tune::grid::QueryDiagnostics::idf_clamped` の注記を参照)。
+    /// ([`crate::tune::QueryDiagnostics::idf_clamped`] の注記を参照)。
     ///
     /// feature-55 以降、クエリが除外を含むなら数えるのは `(正) NOT (負)` の行数 =
     /// **除外語を含む行は数えない**。

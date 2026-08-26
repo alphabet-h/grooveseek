@@ -1985,8 +1985,9 @@ mod tests {
 
     #[test]
     fn fts_call_is_counted_even_when_the_query_compiles_to_nothing() {
-        // AU-22 の往復会計は「呼んだ回数」で数える。`build_fts_query` が None を
-        // 返すクエリも 1 往復として数える現行の並び順を pin する。
+        // AU-22 の往復会計は「呼んだ回数」で数える。`ParsedQuery::match_expr` が
+        // None を返すクエリも 1 往復として数える現行の並び順 — counter は
+        // `search_fts_candidates_parsed` の早期 return より上にある — を pin する。
         let db = db_with_384();
         add_fts_doc(&db, "a.md", "A", "anything", 0.1);
         FTS_CANDIDATE_CALLS.with(|c| c.set(0));

@@ -127,7 +127,7 @@ pub struct QueryDiagnostics {
     /// 既定重みでの FTS 候補数 (pool 内)。実効 query の判定に使う。
     pub fts_candidates: usize,
     /// クエリの phrase のいずれかにマッチする chunk 数 (LIMIT なし)。IDF クランプ
-    /// 診断 (`idf_clamped`) の入力。
+    /// 診断 ([`QueryDiagnostics::idf_clamped`]) の入力。
     ///
     /// feature-48 以前は「クエリ全体という単一 phrase の doc-freq」だったが、現在は
     /// [`crate::db::parse_query`] が生む **OR 集合の和集合**の大きさであり、個々の
