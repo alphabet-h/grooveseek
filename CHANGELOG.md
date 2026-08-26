@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-26
+
 ### Added
 
 - **`list_topics` now returns the directory tree beneath each topic.** Every
@@ -121,6 +123,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   layout and the row id follow from them. `eval::query_id` is public for it,
   so the row id rule lives in one place.
 
+- **The MCP tool descriptions, and twenty-three sentences that still credited
+  rmcp with checks it had stopped performing.** [ADR-0009](docs/decisions/0009-one-dns-rebinding-gate.md)
+  moved Host and Origin validation into `groove`, which hands rmcp empty
+  allow-lists so it matches nothing; the doc comments around that code, the
+  `anyhow::bail!` an operator sees for an `allowed_origins` entry that will not
+  parse, and `CONTRIBUTING.md`'s clippy step had not all been told. The two
+  that reach a caller are the `description=` strings, which are all an LLM
+  client is given: `rebuild_index` refuses a call that arrives during a rebuild
+  and did not say so, and `get_connection_graph` returns `snippet` on every
+  node plus `truncated` and `truncation[]` on the envelope and named neither.
+  Both facts were already on [docs/mcp-tools.md](docs/mcp-tools.md) and missing
+  from the only string a client reads.
+
+  `tools/list` now carries an assertion about description content in
+  `grooveseek/tests/mcp_protocol_surface.rs`, honest about being a substring
+  check: it catches a fact being deleted, not a description drifting from the
+  page.
+
 ### Removed
 
 - **The `.kb-mcpignore` migration check, and the module behind it.** v1.0.0
@@ -146,6 +166,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   proved the remedy) and the four helpers only those two called.
 
 ### Internal
+
+- **Four comments named something other than what the code does.** feature-55
+  demoted `build_fts_query` to a `#[cfg(test)]` helper, and two comments
+  outside its file still described it as the entry point production calls: the
+  whole-query fallback is assembled by `parse_query` into a field
+  `query_phrases` does not return, and the round-trip counter a `db.rs` test
+  pins sits above the early return where `ParsedQuery::match_expr` gives
+  `None`. Two more wrote `QueryDiagnostics::idf_clamped` in plain backticks
+  where the paragraph beside them already linked it.
+
+  Which of those names could become intra-doc links was settled by running
+  rustdoc rather than by reading, because whether a link resolves depends on
+  the module doing the linking and not on the item alone:
+  `crate::server::search::MATCH_SPAN_MAX_TERMS` resolves from `server.rs`,
+  whose own private `mod search` it is, and not from `db/search.rs`.
+  `fallback_whole_query` resolves from nowhere outside `db`, so it stays a
+  backtick with its file named in prose. Checking for a generated rustdoc page
+  instead answers a different question and gets both of those backwards.
 
 - **The CI command block is now compared with the workflow it copies.**
   `AGENTS.md` and `CONTRIBUTING.md` each carry the commands that reproduce
@@ -4825,7 +4863,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/alphabet-h/grooveseek/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/alphabet-h/grooveseek/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/alphabet-h/grooveseek/compare/v0.27.0...v1.0.0
 [0.27.0]: https://github.com/alphabet-h/grooveseek/compare/v0.26.0...v0.27.0
