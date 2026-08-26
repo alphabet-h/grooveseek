@@ -84,6 +84,20 @@ fn matches_date_range(hit_date: Option<&str>, from: Option<&str>, to: Option<&st
     true
 }
 
+/// [`Database::fetch_vec_page`] が KNN 1 回から持ち帰るもの。
+///
+/// 3 要素の tuple にすると呼び出し側で `.0` / `.1` の意味が読めなくなる。どれも
+/// 「もう一度引くべきか」を決める材料なので、名前を付けて 1 個で返す。
+struct VecPage {
+    /// クエリから読んだ行数。`fetch_k` に満たなければ corpus を読み切っている。
+    rows_seen: usize,
+    /// そのうち `excluded` に載っていたので落とした行数。**0 なら、足りないのは
+    /// 除外のせいではない**。
+    dropped_by_exclusion: usize,
+    /// 行ごとの連言 (除外 → filter 群) を通った候補。
+    hits: Vec<(i64, SearchResult)>,
+}
+
 impl Database {
     /// ベクトル単体類似検索。最大 `limit` 件を距離昇順 (小さい = より類似) で返す。
     ///
@@ -442,7 +456,7 @@ impl Database {
     /// [`Self::search_vec_candidates`] と bit-exact** — over-fetch の条件にも入らず、
     /// KNN も下の再取得ループを 1 周しかしない。
     ///
-    /// # 除外があるときだけ回す再取得ループ (codex review round 1、P2)
+    /// # そのページが除外で行を落としたときだけ回す再取得ループ (codex review round 1・2、P2)
     ///
     /// 倍率をかけた枠は**除外だけで尽きうる**。`-について` のように大半の chunk に
     /// 当たる除外語なら、最も近い `limit` × [`FILTER_OVERFETCH_FACTOR`] 件が全部
@@ -451,10 +465,17 @@ impl Database {
     /// `fetch_k` を倍にする:
     ///
     /// - `limit` 件埋まった
-    /// - `excluded` が空 (= filter だけで枠が空になる目減りは feature-26 以来の既存挙動で、
-    ///   ここで直す話ではない)
+    /// - そのページが除外で 1 行も落としていない ([`VecPage::dropped_by_exclusion`] が 0)
     /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
     /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
+    ///
+    /// 2 つ目が「`excluded` が空」ではないのが要点 (round 2)。category / path / date /
+    /// quality の filter で `limit` に届かないのは feature-26 以来の既存挙動で、ここで
+    /// 直す話ではない。「除外集合が空でなければ広げる」にすると、**取ってきた候補を 1 件も
+    /// 落としていない** `-term` が、その filter 付きクエリの候補リストを変え、KNN を上限まで
+    /// 引き延ばす — 同じクエリを除外なしで投げたときと挙動が違ってしまう。除外が原因で
+    /// 足りないときだけ広げる。空集合はどの行も落とせないので、この条件が
+    /// 「`excluded` が空なら 1 回」も兼ねる。
     ///
     /// KNN に cursor は無いので、各回は**最初から引き直して結果を作り直す** (追記すると
     /// 重複する)。最悪ケースは「除外語がほぼ全近傍に当たる」場合の、`k` に
@@ -490,14 +511,13 @@ impl Database {
         let embedding_json = serde_json::to_string(query_embedding)?;
 
         loop {
-            let (rows_seen, out) =
-                self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
-            if out.len() >= limit as usize
-                || excluded.is_empty()
-                || rows_seen < fetch_k as usize
+            let page = self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
+            if page.hits.len() >= limit as usize
+                || page.dropped_by_exclusion == 0
+                || page.rows_seen < fetch_k as usize
                 || fetch_k >= VEC_KNN_MAX_K
             {
-                return Ok(out);
+                return Ok(page.hits);
             }
             fetch_k = fetch_k.saturating_mul(2).min(VEC_KNN_MAX_K);
         }
@@ -505,11 +525,13 @@ impl Database {
 
     /// KNN を 1 回だけ引き、行ごとの連言 (除外 → filter 群) を通したものを返す。
     ///
-    /// 戻り値の第 1 要素は**クエリから読んだ行数**。`fetch_k` に満たなければ
-    /// corpus を読み切ったということなので、呼び出し側はそこで再取得をやめる。
-    /// `limit` 件埋まった時点で読むのをやめるため、その場合の行数は `fetch_k` より
-    /// 小さくなるが、そのときは呼び出し側の「埋まった」条件が先に成立するので
-    /// 読み切り判定には使われない。
+    /// [`VecPage::rows_seen`] が `fetch_k` に満たなければ corpus を読み切ったということ
+    /// なので、呼び出し側はそこで再取得をやめる。[`VecPage::dropped_by_exclusion`] が 0 なら
+    /// 足りない原因は除外ではない (= filter) ので、やはりやめる。
+    ///
+    /// `limit` 件埋まった時点で読むのをやめるため、その場合はどちらの数も**途中まで**の
+    /// 値になる。ただしそのときは呼び出し側の「埋まった」条件が先に成立するので、
+    /// 2 つとも参照されない。
     fn fetch_vec_page(
         &self,
         embedding_json: &str,
@@ -517,7 +539,7 @@ impl Database {
         limit: u32,
         filters: &SearchFilters<'_>,
         excluded: &HashSet<i64>,
-    ) -> Result<(usize, Vec<(i64, SearchResult)>)> {
+    ) -> Result<VecPage> {
         let sql = "
             SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
@@ -559,6 +581,7 @@ impl Database {
         // 倍にしていってもここは 4096 要素で頭打ちになる。
         let mut out = Vec::with_capacity(fetch_k.min(FILTER_OVERFETCH_CAP) as usize);
         let mut rows_seen = 0usize;
+        let mut dropped_by_exclusion = 0usize;
         for row in rows {
             rows_seen += 1;
             let (
@@ -577,7 +600,11 @@ impl Database {
                 context_text,
             ) = row?;
             // 除外 (F-4)。filter と同じ行ごとの連言なので、他の filter との順序は無関係。
+            // 落とした数を数えるのは、枠を広げ直すべきかの判定に使うため — 順序が
+            // 無関係でも**この判定だけは先頭**に置く必要がある。filter の後ろに回すと
+            // 「filter で落ちた行が除外語も持っていた」ケースを数え損ねる。
             if excluded.contains(&chunk_id) {
+                dropped_by_exclusion += 1;
                 continue;
             }
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
@@ -630,6 +657,10 @@ impl Database {
                 break;
             }
         }
-        Ok((rows_seen, out))
+        Ok(VecPage {
+            rows_seen,
+            dropped_by_exclusion,
+            hits: out,
+        })
     }
 }

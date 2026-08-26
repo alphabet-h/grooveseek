@@ -2368,6 +2368,66 @@ mod tests {
         );
     }
 
+    /// (codex review round 2, P2) 足りない原因が filter なら、除外語が corpus の
+    /// **どこかに**当たっているだけで枠を広げてはいけない。
+    ///
+    /// 広げると、取ってきた候補を 1 件も落としていない `-term` が、無関係な
+    /// filter 付きクエリの候補リストを変え、KNN を 4096 まで引き延ばす。同じクエリを
+    /// 除外なしで投げたときと**同じ挙動**でなければならない。
+    #[test]
+    fn a_filter_only_shortfall_does_not_widen_for_an_irrelevant_exclusion() {
+        let db = db_with_384();
+        // 最初の枠 (limit=1) をちょうど超える数の近傍。どれも除外語を持たない。
+        let planted = crate::db::search::FILTER_OVERFETCH_FACTOR + 2;
+        for i in 0..planted {
+            add_fts_doc(
+                &db,
+                &format!("near{i:02}.md"),
+                "N",
+                "tokio runtime notes",
+                0.5 - (i as f32 + 1.0) * 0.001,
+            );
+        }
+        // 除外語を持つ chunk は **最初のページの外**に置く (クエリ埋め込みから遠い)。
+        add_fts_doc(&db, "far.md", "F", "rayon parallel pools", 0.9);
+
+        let excluded = db.excluded_chunk_ids(Some("(\"rayon\")")).unwrap();
+        assert_eq!(
+            excluded.len(),
+            1,
+            "fixture: the excluded chunk exists, but sits past the first window"
+        );
+        // 足りない原因はこちら: どの chunk も届かない quality 閾値。
+        let filters = SearchFilters {
+            min_quality: 2.0,
+            ..Default::default()
+        };
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let with_exclusion = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 1, &filters, &excluded)
+            .unwrap();
+        let attempts = VEC_KNN_ATTEMPTS.with(|c| c.get());
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let without_exclusion = db
+            .search_vec_candidates(&dummy_embedding(0.5), 1, &filters)
+            .unwrap();
+
+        let ids = |hits: &[(i64, SearchResult)]| hits.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&with_exclusion),
+            ids(&without_exclusion),
+            "an exclusion that discarded nothing must leave the candidate list alone"
+        );
+        assert_eq!(
+            attempts,
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            "and it must cost the same number of KNN queries as having no exclusion at all"
+        );
+        assert_eq!(attempts, 1, "which is one");
+    }
+
     #[test]
     fn count_fts_matches_counts_positives_minus_negatives() {
         let db = db_with_384();
