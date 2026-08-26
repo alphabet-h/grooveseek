@@ -121,6 +121,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   layout and the row id follow from them. `eval::query_id` is public for it,
   so the row id rule lives in one place.
 
+### Removed
+
+- **The `.kb-mcpignore` migration check, and the module behind it.** v1.0.0
+  added two `groove doctor` findings about an ignore file left under the name
+  the project used before
+  [ADR-0007](docs/decisions/0007-rename-the-project-to-grooveseek.md) — and
+  said in the same breath that they were for the migration and would go in
+  1.1.0. The module doc, the `docs/ARCHITECTURE.md` row and
+  [docs/usage.md](docs/usage.md) all carried that date. This is that removal:
+  `grooveseek/src/legacy.rs`, the findings it fed
+  (`indexed-despite-legacy-ignore` and `legacy-ignore-not-examined`), and
+  `ExclusionRules::ignore_only_from_bytes`, which had no other caller, are all
+  gone. A `.kb-mcpignore` still keeps nothing out — that is ADR-0007's
+  decision and has not changed — but `doctor` no longer opens one to say so.
+
+  `doctor` therefore asks two groups of question rather than three, and
+  `doctor::run` takes `(db, registry)` rather than also a `kb_path` and an
+  `exclude_dirs`. That signature is internal: `groove doctor` still requires
+  `--kb-path` to find the index, and every remaining check, exit code and JSON
+  field keeps its name, type and meaning. The tests that covered the removed
+  findings went with them — the unit tests in `src/doctor.rs`, two in
+  `tests/doctor_cli.rs` (one of them the `#[ignore]` end-to-end run that
+  proved the remedy) and the four helpers only those two called.
+
 ### Internal
 
 - **The CI command block is now compared with the workflow it copies.**
