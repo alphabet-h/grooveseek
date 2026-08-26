@@ -2428,6 +2428,83 @@ mod tests {
         assert_eq!(attempts, 1, "which is one");
     }
 
+    /// (codex review round 3, P2) filter が既に落としている行を、除外でも落ちたからと
+    /// いって「除外のせいで足りない」に数えない。
+    ///
+    /// 数えると、広げた先で読み直すのは**同じ prefix** なので、その行がまた除外として
+    /// 数えられ、上限まで倍々に伸び続ける。しかも伸ばした先で「filter を通る遠い行」を
+    /// 拾ってしまう — 同じクエリを除外なしで投げたら決して取ってこない行が返る。
+    #[test]
+    fn an_excluded_row_a_filter_also_rejects_does_not_widen() {
+        let db = db_with_384();
+        let add = |path: &str, category: &str, content: &str, e: f32| {
+            let doc = db
+                .upsert_document(
+                    path,
+                    Some(path),
+                    None,
+                    Some(category),
+                    None,
+                    &[],
+                    None,
+                    path,
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(doc, 0, Some("H"), None, content, None, &vec![e; 384], 1.0)
+                .unwrap();
+        };
+
+        // 最初の枠を埋める近傍は、除外語を持ち **かつ** category filter でも落ちる。
+        let planted = crate::db::search::FILTER_OVERFETCH_FACTOR + 2;
+        for i in 0..planted {
+            add(
+                &format!("near{i:02}.md"),
+                "wrong",
+                "rayon parallel pools",
+                0.5 - (i as f32 + 1.0) * 0.001,
+            );
+        }
+        // filter を通る唯一の行は遠い = 最初の枠には入らない。枠を広げれば届いてしまう。
+        add("far.md", "right", "tokio runtime notes", 0.9);
+
+        let excluded = db.excluded_chunk_ids(Some("(\"rayon\")")).unwrap();
+        assert_eq!(
+            excluded.len(),
+            planted as usize,
+            "fixture: every chunk in the first window holds the excluded term"
+        );
+        let filters = SearchFilters {
+            category: Some("right"),
+            ..Default::default()
+        };
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let with_exclusion = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 1, &filters, &excluded)
+            .unwrap();
+        let attempts = VEC_KNN_ATTEMPTS.with(|c| c.get());
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let without_exclusion = db
+            .search_vec_candidates(&dummy_embedding(0.5), 1, &filters)
+            .unwrap();
+
+        let ids = |hits: &[(i64, SearchResult)]| hits.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&with_exclusion),
+            ids(&without_exclusion),
+            "those rows were lost to the filter with or without the exclusion, so the \
+             exclusion must not reach past the window for a row the plain query never sees"
+        );
+        assert_eq!(
+            attempts,
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            "and it must cost the same number of KNN queries"
+        );
+        assert_eq!(attempts, 1, "which is one");
+    }
+
     #[test]
     fn count_fts_matches_counts_positives_minus_negatives() {
         let db = db_with_384();

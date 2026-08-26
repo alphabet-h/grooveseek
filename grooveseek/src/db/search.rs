@@ -91,8 +91,9 @@ fn matches_date_range(hit_date: Option<&str>, from: Option<&str>, to: Option<&st
 struct VecPage {
     /// クエリから読んだ行数。`fetch_k` に満たなければ corpus を読み切っている。
     rows_seen: usize,
-    /// そのうち `excluded` に載っていたので落とした行数。**0 なら、足りないのは
-    /// 除外のせいではない**。
+    /// そのうち、**filter をすべて通ったうえで** `excluded` に載っていたので落とした
+    /// 行数。filter が先に落とした行は数えない — その行は除外の有無に関わらず失われる。
+    /// **0 なら、足りないのは除外のせいではない**。
     dropped_by_exclusion: usize,
     /// 行ごとの連言 (除外 → filter 群) を通った候補。
     hits: Vec<(i64, SearchResult)>,
@@ -465,7 +466,8 @@ impl Database {
     /// `fetch_k` を倍にする:
     ///
     /// - `limit` 件埋まった
-    /// - そのページが除外で 1 行も落としていない ([`VecPage::dropped_by_exclusion`] が 0)
+    /// - そのページが除外で 1 行も落としていない ([`VecPage::dropped_by_exclusion`] が 0 =
+    ///   **filter をすべて通った行**を除外で落とした数が 0)
     /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
     /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
     ///
@@ -476,6 +478,11 @@ impl Database {
     /// 引き延ばす — 同じクエリを除外なしで投げたときと挙動が違ってしまう。除外が原因で
     /// 足りないときだけ広げる。空集合はどの行も落とせないので、この条件が
     /// 「`excluded` が空なら 1 回」も兼ねる。
+    ///
+    /// 数えるのが **filter を通った行だけ**なのも同じ理由 (round 3)。filter が先に落とした
+    /// 行は除外の有無に関わらず失われるので、それを「除外のせい」に数えると、広げた先で
+    /// 読み直す同じ prefix でまた数えられ、上限まで伸びたうえで「filter を通る遠い行」を
+    /// 拾う — 除外なしの同じクエリが決して返さない行が返る。
     ///
     /// KNN に cursor は無いので、各回は**最初から引き直して結果を作り直す** (追記すると
     /// 重複する)。最悪ケースは「除外語がほぼ全近傍に当たる」場合の、`k` に
@@ -599,14 +606,6 @@ impl Database {
                 tags_json,
                 context_text,
             ) = row?;
-            // 除外 (F-4)。filter と同じ行ごとの連言なので、他の filter との順序は無関係。
-            // 落とした数を数えるのは、枠を広げ直すべきかの判定に使うため — 順序が
-            // 無関係でも**この判定だけは先頭**に置く必要がある。filter の後ろに回すと
-            // 「filter で落ちた行が除外語も持っていた」ケースを数え損ねる。
-            if excluded.contains(&chunk_id) {
-                dropped_by_exclusion += 1;
-                continue;
-            }
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
             }
@@ -636,6 +635,17 @@ impl Database {
             }
             // date_from / date_to filter (Task 3 追加)
             if !matches_date_range(date.as_deref(), filters.date_from, filters.date_to) {
+                continue;
+            }
+            // 除外 (F-4)。結果だけを見れば行ごとの連言なので順序は無関係だが、
+            // **この判定は連言の最後**でなければならない (codex review round 3)。
+            // ここで数えた数が「枠を広げ直すか」を決めるので、filter が既に落とした行を
+            // 数えてはいけない — その行は除外があってもなくても失われており、
+            // 足りない原因は除外ではない。数えると、広げた先で読み直すのは同じ prefix
+            // なので同じ行がまた数えられ、上限まで伸び続けたうえで「filter を通る遠い行」を
+            // 拾う = 除外なしの同じクエリが決して返さない行が返る。
+            if excluded.contains(&chunk_id) {
+                dropped_by_exclusion += 1;
                 continue;
             }
             out.push((
