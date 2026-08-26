@@ -315,9 +315,12 @@ metric 実装の修正で `metric_version` が 1 → 2 になっており、fing
 意図した挙動 (古い数値は別の式で計算されている)。
 **v0.16.0 より前の history** も同様: クエリから `MATCH` 式を作る規則が変わった
 ときに `fts_query_version` が 1 → 2 になっているため
-([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照)、凍結した baseline
-を含めて比較対象から外れる。これも意図的で、両者は FTS5 に別の式を投げている
-以上、model も index も golden も同じでも測っているものが違う。
+([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照)、また v1.1.0 で
+`-term` 除外を足したときに 2 → 3 になっているため
+([ADR-0011](./decisions/0011-exclude-a-term-from-both-halves-of-the-search.ja.md)
+参照)、いずれも凍結した baseline を含めて比較対象から外れる。これも意図的で、
+どの version も FTS5 に別の式を投げている以上、model も index も golden も
+同じでも測っているものが違う。
 golden YAML を更新した直後の run も同じ理由で比較対象外となる。
 
 履歴は exit より前に書き出されるので、今回の run は次回比較用に保存される。
@@ -384,8 +387,10 @@ v0.16.0 以降、groove はクエリを token 単位の phrase にコンパイ�
 **クエリが本文に逐語で出現しなくても bm25 段に到達する** — 断片ごとに単独で
 マッチできるので、自然文の golden セットもそもそも測定対象になる。それでも測る
 ものが無くなるのは、phrase が 1 つも残らない query か、phrase がどこにもマッチ
-しない query の場合で、grid のどの点でも同じ順位が返る。そこで tune は
-pre-flight を先に走らせる:
+しない query の場合で、grid のどの点でも同じ順位が返る。golden の query も
+他の query と同じく `-term` 除外を使ってよい (v1.1.0+)。除外だけで positive
+term が残らない query は、grid の実行前に golden file の読み込み時点で拒否
+される。そこで tune は pre-flight を先に走らせる:
 
 - query ごとの FTS 候補数を数え、**実効 N** (候補 2 件以上の query 数。0 件は
   vector-only にフォールバックし、1 件は rank が固定なので重みに不感) を報告する

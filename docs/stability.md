@@ -216,15 +216,16 @@ different each time.
 
 **A search answers with one of two shapes.** Everything above the last row is
 the successful one. When the MCP tool refuses a call or the search fails — an
-`mmr_lambda` out of range, a query past the 1 KiB cap, a malformed glob, an
-embedding or database failure — it answers `{"error": "…"}` instead, with no
+`mmr_lambda` out of range, a query past the 1 KiB cap, a malformed glob, a
+query made only of exclusions, an embedding or database failure — it answers
+`{"error": "…"}` instead, with no
 `results` key at all. Callers must branch on which arrived rather than reading
 `results` unconditionally. The command line has no such envelope: it reports
 the failure on stderr and exits non-zero, which is [the split](#command-line)
 two sections up.
 
-**`filter_applied` echoes those eight inputs when they arrived with an effect,
-and nothing else.** Three things follow, and none of them is what an empty
+**`filter_applied` echoes the rows above when they arrived with an effect,
+and nothing else.** Four things follow, and none of them is what an empty
 object looks like it means:
 
 - `min_quality` and `include_low_quality` are applied and never echoed. The
@@ -238,10 +239,14 @@ object looks like it means:
 - `min_confidence_ratio` is echoed but narrows nothing: it only sets the
   threshold `low_confidence` is compared against. So the echo is not a list of
   what filtered the results either.
+- An exclusion alone leaves `filter_applied` non-empty: `excluded_terms` is
+  echoed whenever the query excluded something, even when no other filter
+  was given.
 
-Read `{}` as "none of those eight arrived with an effect to report" — not "no
-filter was given", and not "no filter ran". Adding the quality inputs to the
-echo later would be a minor release, by the rule that new fields may be added.
+Read `{}` as "none of the rows above arrived with an effect to report" — not
+"no filter was given", and not "no filter ran". Adding the quality inputs to
+the echo later would be a minor release, by the rule that new fields may be
+added.
 
 **Omitted means absent, not `null`.** Every row above that says "omitted" leaves
 the key out of the object entirely. A consumer must not distinguish a missing

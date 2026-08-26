@@ -67,7 +67,7 @@ intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.
 
 - `grooveseek/src/parser/` — `Parser` trait + `Registry` (形式ごとに impl 1 個)
 - `grooveseek/src/indexer.rs` — `walkdir` → パース → 埋め込み → 格納のパイプライン
-- `grooveseek/src/db.rs` + `grooveseek/src/db/` — SQLite + sqlite-vec + FTS5。v0.15.0 で分割: `schema.rs` (スキーマ作成 + 前方マイグレーション) / `storage.rs` (CRUD) / `search.rs` (ベクトル KNN・FTS 候補・RRF 融合 = `search_hybrid`、既定 k=60) / `meta.rs` (`index_meta` の key/value) / `fts_query.rs` (クエリを per-token FTS phrase にコンパイル、v0.16.0+)
+- `grooveseek/src/db.rs` + `grooveseek/src/db/` — SQLite + sqlite-vec + FTS5。v0.15.0 で分割: `schema.rs` (スキーマ作成 + 前方マイグレーション) / `storage.rs` (CRUD) / `search.rs` (ベクトル KNN・FTS 候補・RRF 融合 = `search_hybrid`、既定 k=60) / `meta.rs` (`index_meta` の key/value) / `fts_query.rs` (クエリを per-token FTS phrase にコンパイル、v0.16.0+。`-term` 除外も担う、v1.1.0+)
 - `grooveseek/src/embedder.rs` — `fastembed-rs` ラッパ (embedding + cross-encoder reranker)
 - `grooveseek/src/mmr.rs` — MMR 多様性再ランク (`mmr_select`、v0.7.0+)
 - `grooveseek/src/parent.rs` — Parent retriever 表示時 content 展開 (`apply_parent_retriever`、v0.7.0+)

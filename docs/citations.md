@@ -64,7 +64,7 @@ If you ever observe a span that breaks codepoint boundaries, please file a bug.
 
 `match_spans` are computed by:
 
-1. Splitting the query into terms with `query_phrases` (v0.16.0+) — **the same split that produces the FTS5 phrases** (see [retrieval-pipeline.md](./retrieval-pipeline.md)). Before v0.16.0 the split here was an independent whitespace split, so a quoted query such as `"Foundry Local"` was looked up as `"Foundry` and `Local"`: FTS matched the phrase while the spans came back empty.
+1. Splitting the query into terms with `query_phrases` (v0.16.0+) — run against the **positive text**, the raw query with any `-term` exclusion cut out (v1.1.0+), so an excluded group produces no span for itself. This is almost always the same split that produces the FTS5 phrases (see [retrieval-pipeline.md](./retrieval-pipeline.md)), with one exception: `foo -"bar"-baz` keeps a literal `-baz` in the raw query after a quoted exclusion, but the positive text re-reads it as a second exclusion, so a highlight for that `-baz` is lost even though the search results are unaffected. Before v0.16.0 the split here was an independent whitespace split, so a quoted query such as `"Foundry Local"` was looked up as `"Foundry` and `Local"`: FTS matched the phrase while the spans came back empty.
 2. Falling back to a whitespace split of the trimmed query when — and only when — that split yields no phrase at all, as in `ab cd` where every fragment is under the trigram floor. Such a query does not reach FTS through phrases either.
 3. Lower-casing both the terms and the content (ASCII fold only).
 4. Searching for each term as a substring (case-insensitive) in `content`.

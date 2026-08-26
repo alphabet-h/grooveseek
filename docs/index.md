@@ -63,6 +63,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 8. Declare what 1.0.0 freezes, and leave the Rust API out of it | [en](decisions/0008-declare-what-1-0-freezes.md) | [ja](decisions/0008-declare-what-1-0-freezes.ja.md) |
 | 9. One DNS-rebinding gate, owned here | [en](decisions/0009-one-dns-rebinding-gate.md) | [ja](decisions/0009-one-dns-rebinding-gate.ja.md) |
 | 10. Settle the three command-line questions ADR-0008 left open | [en](decisions/0010-settle-what-the-1-0-command-line-freezes.md) | [ja](decisions/0010-settle-what-the-1-0-command-line-freezes.ja.md) |
+| 11. Exclude a term from both halves of the hybrid search | [en](decisions/0011-exclude-a-term-from-both-halves-of-the-search.md) | [ja](decisions/0011-exclude-a-term-from-both-halves-of-the-search.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

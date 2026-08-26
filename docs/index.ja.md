@@ -62,6 +62,7 @@ Architecture Decision Record — 何を選び、どの代替案を退け、そ�
 | 8. 1.0.0 が凍結するものを宣言し、Rust API はその外に置く | [en](decisions/0008-declare-what-1-0-freezes.md) | [ja](decisions/0008-declare-what-1-0-freezes.ja.md) |
 | 9. DNS リバインディングのゲートを 1 つにし、こちらで持つ | [en](decisions/0009-one-dns-rebinding-gate.md) | [ja](decisions/0009-one-dns-rebinding-gate.ja.md) |
 | 10. ADR-0008 が開けたままにしたコマンドラインの 3 問に決着を付ける | [en](decisions/0010-settle-what-the-1-0-command-line-freezes.md) | [ja](decisions/0010-settle-what-the-1-0-command-line-freezes.ja.md) |
+| 11. ハイブリッド検索の両脚から語を除外する | [en](decisions/0011-exclude-a-term-from-both-halves-of-the-search.md) | [ja](decisions/0011-exclude-a-term-from-both-halves-of-the-search.ja.md) |
 
 ADR-0003 のファイル名は今も `kb-mcpignore` のままです。そこで説明されているファイルは
 現在 `.grooveignore` ですが、**ADR は merge 後に編集しません**。2026-08-17 より前の

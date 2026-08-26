@@ -64,7 +64,7 @@ let snippet = content.get(span.start..span.end).unwrap_or("");
 
 `match_spans` の計算手順:
 
-1. query を `query_phrases` で term に分割する (v0.16.0+) — **FTS5 の phrase を作るのと同じ分割** ([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照)。v0.16.0 より前はここが独立した whitespace 分割だったため、`"Foundry Local"` のような quote 付き query は `"Foundry` / `Local"` を探しに行っていた (FTS は phrase に当たっているのに span だけ空になる)
+1. query を `query_phrases` で term に分割する (v0.16.0+) — 分割の対象は**positive text** (raw query から `-term` 除外を切り落としたもの、v1.1.0+) で、除外 group はそれ自体の span を作らない。これはほぼ常に **FTS5 の phrase を作るのと同じ分割** ([retrieval-pipeline.ja.md](./retrieval-pipeline.ja.md) 参照) だが、1 つだけ例外がある: `foo -"bar"-baz` では raw query は quote された除外の後の逐語 `-baz` を保つが、positive text はそれを 2 つ目の除外として読み直すため、その `-baz` の highlight は失われる (検索結果への影響は無い)。v0.16.0 より前はここが独立した whitespace 分割だったため、`"Foundry Local"` のような quote 付き query は `"Foundry` / `Local"` を探しに行っていた (FTS は phrase に当たっているのに span だけ空になる)
 2. 上の分割で phrase が 1 つも作れなかった場合に**限り**、trim 後の query を whitespace 分割へ落とす (`ab cd` のように全断片が trigram の下限未満のケース)。この形の query は FTS 側でも phrase 経由では届いていない
 3. term / content を ASCII-fold case-insensitive で小文字化
 4. 各 term を `content` 内で substring 検索 (case-insensitive)

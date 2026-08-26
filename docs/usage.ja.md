@@ -191,6 +191,8 @@ groove search "クエリ最適化" --reranker bge-v2-m3        # 呼び出し単
 
 **クエリがどうマッチするか** (v0.16.0+): ハイブリッドの FTS 側はクエリを逐語で探すわけではない。クエリを Separator と文字種境界 (漢字 / ひらがな / カタカナ / それ以外の語構成文字) で割り、trigram 下限の 3 文字に満たない断片は隣接断片と連結し、そうしてできた phrase 群を `OR` で結んで検索する — つまり `再ランキングの評価について` は `再ランキング` / `ランキング` / `の評価` / `について` を探すので、自然文の質問がそのままの形で出現していなくてもマッチする。1 個の逐語 phrase として固めたい部分は `"..."` で囲む (`groove search '"Foundry Local" の設定'`)。クエリ全体を囲めば v0.16.0 以前の部分文字列検索がそのまま再現される。`search` MCP ツールも同じコードパスを通るので挙動は変わらない。この変更に再 index は不要。詳細は [docs/retrieval-pipeline.ja.md](retrieval-pipeline.ja.md) を参照。
 
+**語を除外する** (v1.1.0+): whitespace 区切りの group の先頭に `-` を付けると、検索するのではなく両脚から除外する。例: `groove search 'rust -async'`。コマンドラインでは positive の語を先に置くこと — 先頭が `-` のクエリは引数パーサに flag と解釈される — 先頭の除外は `groove search -- '-async rust'` で escape する。先頭ハイフンを逐語検索したいなら quote する (`"-foo"`)。詳細: [ADR-0011](decisions/0011-exclude-a-term-from-both-halves-of-the-search.ja.md)。
+
 典型的な skill-bin 用途: Claude Code の skill が `bin/` に `groove.exe` + `groove.toml` を同梱し、`groove search "<user_query>" --format text --limit 3` のようなコマンドで LLM が引用するための参照抜粋を返す。
 
 ## 検索フィルタと引用 (v0.3.0+)

@@ -38,6 +38,31 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   saying that `category` can come from a `category:` frontmatter field; there
   is no such field, only `topic:`.
 
+- **A group that starts with `-` is excluded from the search.** `rust -async`
+  drops every chunk containing `async` from both halves of the hybrid: the
+  full-text half compiles to `("rust") NOT ("async")`, and the vector half
+  drops the candidates whose chunk matches the same negative expression, so
+  one FTS5 judgement (trigram, case-insensitive, diacritics removed) decides
+  the question for both legs. The judgment is made against the same FTS row a
+  positive match sees — `heading`, the contextual prefix, and `content`
+  together — not the body alone, so an excluded term in a heading also drops
+  the chunk. `-"exact phrase"` excludes a verbatim phrase; an unquoted
+  `-word` is tokenized with the same rules as the rest of the query, so
+  `-再ランキング` also excludes `ランキング` — quote it to exclude only the
+  compound. The embedder, the reranker and `match_spans` see the query with
+  its exclusions cut out, so a query without one is embedded exactly as
+  before. The response echoes what was excluded in
+  `filter_applied.excluded_terms`, and a query made only of exclusions is
+  refused (`{"error": …}` over MCP, stderr and a non-zero exit on the command
+  line, a load error for a golden file). An excluded phrase under the
+  three-character trigram floor excludes nothing; the parent retriever may
+  expand a hit into text that contains the excluded term, since exclusion is
+  judged on the hit chunk, not on content a later expansion adds.
+  `a_chunk_holding_an_excluded_term_never_reaches_the_fts_leg` and
+  `an_excluded_term_drops_the_vector_nearest_chunk_too` pin the two halves
+  against a real FTS5 table. Rationale in
+  [ADR-0011](docs/decisions/0011-exclude-a-term-from-both-halves-of-the-search.md).
+
 ### Changed
 
 - **What concurrent HTTP clients pay for the search locks is now measured, and
@@ -61,6 +86,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   only that it measured something — non-empty hits, no failed requests, the
   latencies of a round summing to more than the round took — and runs on the
   three-file fixture in the nightly `--include-ignored` job.
+
+- **A `-` that begins a whitespace-delimited group changed meaning.** Until
+  now `-foo` was searched for as the literal token `-foo` (a hyphen is a word
+  character, so `sqlite-vec` stays one token — that is unchanged). It is now
+  an exclusion. To search for a leading hyphen literally, quote it:
+  `"-foo"`. `---`, a lone `-`, and `- foo` are not exclusions. Evaluation
+  history is fingerprinted with `fts_query_version` 3 for this release, so
+  `groove eval --fail-on-regression` will not compare across the change.
 
 ### Fixed
 
