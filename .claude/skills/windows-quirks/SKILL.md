@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Fourteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), or diagnosing "works on Linux, fails on Windows" failures
+description: Fifteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -296,6 +296,56 @@ Count **1**、括弧つき → **3**。
 
 出典: 2026-08-23 B6 smoke (hook deny 化の検証中、通過した代替形の出力が filter されていなかった)。
 詳細は `.dev/knowledge/shell-trap-guard-deny-rollout.md`
+
+## 15. `jq.exe` は書く改行ごとに CR を足す。`gh --jq` は足さない (混ぜた比較が全件不一致になる)
+
+**症状**: `jq` で作った一覧と `gh --jq` で作った一覧を `comm` / `diff` / `sort -u` で突き合わせると、
+中身が同じでも**全行が「相違」**として返る。エラーも警告も出ない。
+
+**原因**: Windows ネイティブ build の `jq.exe` は stdout を text mode で開くので、**自分が書く `\n` が
+`\r\n` になる**。`gh` の `--jq` は内部が Go 実装 (gojq) なので変換しない。つまり片方だけ CR が付いた
+文字列同士を比較することになる。**JSON を吐いた側は無実**のことが多い — jq の入力に CR があっても
+JSON parser は whitespace として食うので、上流を疑っても何も出てこない。
+
+**どこまで残るか** (実測、Git Bash + jq-1.8.1):
+
+| 経路 | CR |
+|---|---|
+| `jq -r` / 素の `jq` / `jq -c` | **書いた改行 1 つにつき 1 個** (2 行出力 → 2、1 行 → 1) |
+| `jq -j` (改行を書かない) | 0 |
+| `jq ... > file` / `jq ... \| sort` | **残る** |
+| `X=$(... \| jq -r ...)` | **残らない** (bash が落とす。`od -c` で確認) |
+| `gh --jq` / `gh --json` | **0** |
+
+→ **壊れるのは file / pipe 経由の比較だけ**で、scalar を `$( )` で受ける形は無事。
+この repo の `.claude/skills/codex-review/scripts/codex_review_round.sh` が全部 `$( )` 受けなのは
+その意味で安全 (同 script の「罠 19」コメントは jq の**入力**側 CR の話で、これとは別)。
+
+**正しいやり方**: 比較の前に jq 側へ `tr -d '\r'` を通す。
+
+```bash
+jq -r '.artifacts | keys[]' plan.json | tr -d '\r' | sort > a.txt
+gh release view vX.Y.Z --json assets --jq '.assets[].name' | sort > b.txt
+comm -23 a.txt b.txt        # a にしか無いもの
+comm -13 a.txt b.txt        # b にしか無いもの
+```
+
+**どちらに CR が居るかは推測せず数える**: `tr -cd '\r' < f | wc -c`。
+
+**実測 (2026-08-26、v1.1.0 の配布物検証)**: `dist plan --tag=v1.1.0 --output-format=json` の生 JSON は
+470 行で CR **0 バイト**。そこから `jq -r` で取り出した 15 行の一覧は CR **15 バイト**。
+`gh release view --json assets --jq` 側は **0**。この 2 つを `comm` に渡したら、**両方向とも 15 行**が
+「相違」として返った。`tr -d '\r'` を通すと差は `dist-manifest.json` 1 件だけになる (公開時に付く asset なので
+plan に無いのが正しい)。
+
+**最初は `dist` が CRLF を吐いていると誤読した。** 生ファイルを `tr -cd '\r' | wc -c` で数えて初めて
+jq だと分かった。**出力の異常を、出力を作った最初のコマンドのせいにしない** — パイプの各段で数える。
+
+罠 10 (Python の text mode が file 全体を LF → CRLF に反転させる) と同じ「text mode が黙って改行を変える」
+形で、向きが書き込み側ではなく**読み出し側**なのが違い。
+
+出典: 2026-08-26 v1.1.0 リリースの配布物検証。詳細は `.dev/release-checklist.md` の
+「バイナリ配布チェック」節
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
