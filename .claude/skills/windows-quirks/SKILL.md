@@ -307,36 +307,64 @@ Count **1**、括弧つき → **3**。
 文字列同士を比較することになる。**JSON を吐いた側は無実**のことが多い — jq の入力に CR があっても
 JSON parser は whitespace として食うので、上流を疑っても何も出てこない。
 
-**どこまで残るか** (実測、Git Bash + jq-1.8.1):
+**どこまで残るか** — 下の表はすべてこの 2 つで測った (Git Bash + jq-1.8.1):
+
+```bash
+echo '{"a":"x","b":"y"}' | jq -r '.a, .b' | tr -cd '\r' | wc -c   # 経路ごとに差し替える
+M=$(echo '{"a":"x","b":"y"}' | jq -r '.a, .b'); printf '%s' "$M" | od -c
+```
 
 | 経路 | CR |
 |---|---|
 | `jq -r` / 素の `jq` / `jq -c` | **書いた改行 1 つにつき 1 個** (2 行出力 → 2、1 行 → 1) |
+| `jq -b` (`--binary`) を足す | **0** — これが正しい対処 |
 | `jq -j` (改行を書かない) | 0 |
 | `jq ... > file` / `jq ... \| sort` | **残る** |
-| `X=$(... \| jq -r ...)` | **残らない** (bash が落とす。`od -c` で確認) |
+| `X=$(... \| jq -r ...)` が **1 行**のとき | 残らない (末尾の `\r\n` ごと落ちる) |
+| `X=$(... \| jq -r ...)` が **複数行**のとき | **残る** — `od -c` に `x \r \n y` |
 | `gh --jq` / `gh --json` | **0** |
 
-→ **壊れるのは file / pipe 経由の比較だけ**で、scalar を `$( )` で受ける形は無事。
-この repo の `.claude/skills/codex-review/scripts/codex_review_round.sh` が全部 `$( )` 受けなのは
-その意味で安全 (同 script の「罠 19」コメントは jq の**入力**側 CR の話で、これとは別)。
+**`$( )` を安全装置と思わないこと。** bash が保証するのは *trailing newline* の除去だけで
+([GNU Bash manual, Command Substitution](https://www.gnu.org/software/bash/manual/html_node/Command-Substitution.html))、
+CR を落とすとは書かれていない。上の表のとおり、綺麗になるのは 1 行のときだけ。
 
-**正しいやり方**: 比較の前に jq 側へ `tr -d '\r'` を通す。
+この repo の `.claude/skills/codex-review/scripts/codex_review_round.sh` も
+**複数行の jq 出力を変数に入れている** (via:
+`grep -n '=\$(.*jq' .claude/skills/codex-review/scripts/codex_review_round.sh`
+→ `LATEST_REVIEW` `:315` / `LATEST_ISSUE_BODY` `:325` / `REVIEW_BODY` `:389` ほか)。
+CR は変数の中に入っている。それでも壊れていないのは **`$( )` のおかげではなく**、
+(1) JSON を再び jq に食わせる経路は CR を whitespace として読み飛ばし、
+(2) sentinel 照合が行内の部分一致だから。**条件が変われば壊れる**。
+
+**正しいやり方**: `jq` に **`-b` / `--binary`** を付ける。行末だけが LF になり、値の中身は変わらない。
 
 ```bash
-jq -r '.artifacts | keys[]' plan.json | tr -d '\r' | sort > a.txt
+jq -br '.artifacts | keys[]' plan.json | sort > a.txt
 gh release view vX.Y.Z --json assets --jq '.assets[].name' | sort > b.txt
 comm -23 a.txt b.txt        # a にしか無いもの
 comm -13 a.txt b.txt        # b にしか無いもの
 ```
+
+**`tr -d '\r'` で代用しない** — 値の中にある正当な CR まで消す
+(via: `echo '{"v":"AB"}' | jq -r '.v' | od -c`、`... | tr -d '\r' | od -c`、`... | jq -br '.v' | od -c`):
+
+| | `od -c` |
+|---|---|
+| `jq -r` | `A \r B \r \n` (データの CR + 行末の CR) |
+| `jq -r \| tr -d '\r'` | `A B \n` — **データが壊れた** |
+| `jq -br` | `A \r B \n` — データは保たれ、行末だけ直る |
+
+`-b` が使えない古い jq でしか `tr` は選ばない。その時も**行末だけ**を落とす
+(`sed 's/\r$//'`) のであって、全部消さない。
 
 **どちらに CR が居るかは推測せず数える**: `tr -cd '\r' < f | wc -c`。
 
 **実測 (2026-08-26、v1.1.0 の配布物検証)**: `dist plan --tag=v1.1.0 --output-format=json` の生 JSON は
 470 行で CR **0 バイト**。そこから `jq -r` で取り出した 15 行の一覧は CR **15 バイト**。
 `gh release view --json assets --jq` 側は **0**。この 2 つを `comm` に渡したら、**両方向とも 15 行**が
-「相違」として返った。`tr -d '\r'` を通すと差は `dist-manifest.json` 1 件だけになる (公開時に付く asset なので
-plan に無いのが正しい)。
+「相違」として返った。行末を揃えると差は `dist-manifest.json` 1 件だけになる (公開時に付く asset なので
+plan に無いのが正しい)。**この時は `tr -d '\r'` で揃えた** — asset 名に CR は入らないので結果は正しいが、
+上のとおり一般には `-b` の方が正しい。**「その場で効いた対処」を、そのまま一般解として書かない。**
 
 **最初は `dist` が CRLF を吐いていると誤読した。** 生ファイルを `tr -cd '\r' | wc -c` で数えて初めて
 jq だと分かった。**出力の異常を、出力を作った最初のコマンドのせいにしない** — パイプの各段で数える。
