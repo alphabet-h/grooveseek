@@ -142,14 +142,16 @@ rank 1 で正解**しているのに **14 件で発火**した。そして同じ
 
 これらは index 上で **別のフィールド**:
 
-- **`category`** は `documents.category` (単一 string 列)。frontmatter の
-  `category:` フィールド (もしくは path から自動算出) から populate される
+- **`category`** は `documents.category` (単一 string 列)。文書 path の先頭
+  segment から導出される。frontmatter に `category:` フィールドは無い —
+  frontmatter で指定できるのは `topic:` だけで、こちらは path の 2 番目の
+  segment を上書きする
 - **`tags_any` / `tags_all`** は `documents.tags` (JSON 配列)。frontmatter の
   `tags:` リストから populate される
 
-`category: "deep-dive"` と `tags: ["mcp", "rust"]` を持つドキュメントは
-`category: "deep-dive"` で **マッチする**が、`tags_any: ["deep-dive"]` では
-**マッチしない**。これらは別軸。
+`deep-dive/mcp/x.md` にある `tags: ["mcp", "rust"]` を持つドキュメントは、
+フィルタ `category: "deep-dive"` に **マッチする**が、
+`tags_any: ["deep-dive"]` では **マッチしない**。これらは別軸。
 
 ## フィルタの組み合わせ
 

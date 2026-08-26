@@ -14,6 +14,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **`list_topics` now returns the directory tree beneath each topic.** Every
+  entry carries a `children` array: one node per path segment below the
+  category and topic, each with `segment`, `file_count` (the documents under
+  that prefix, so a parent counts everything beneath it) and its own
+  `children`. Root and category-only entries, and topics whose documents sit
+  directly in the topic directory, carry `[]`. The tree is built from
+  `documents.path`, so a document whose frontmatter `topic:` overrides the
+  path-derived topic still contributes the directories after its second path
+  segment to the group it was filed under, and siblings are sorted by name so
+  the output does not depend on the order SQLite returns rows. This is a field
+  addition under the 1.0 freeze ([docs/stability.md](docs/stability.md#mcp-surface)):
+  nothing existing changes shape, and the tool still takes no parameters.
+
+  `list_topics_returns_the_directory_tree_beneath_each_group_over_http` in
+  `grooveseek/tests/mcp_protocol_surface.rs` reads it back through the
+  Streamable HTTP transport from a seeded index, and `segment_tree`'s unit
+  tests in `grooveseek/src/db/meta.rs` pin the rules one at a time — the file
+  name is not a node, the first two segments are not repeated, a parent counts
+  every document beneath it, siblings are sorted. `docs/filters.md` also stops
+  saying that `category` can come from a `category:` frontmatter field; there
+  is no such field, only `topic:`.
+
 ### Changed
 
 - **What concurrent HTTP clients pay for the search locks is now measured, and

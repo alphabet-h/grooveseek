@@ -263,7 +263,9 @@ tool call に exit status は無い。CLI は理由を stderr に書いて非ゼ
 ### MCP の面
 
 - **tool 名**、その**入力スキーマ**（パラメータ名・型・必須かどうか）、
-  および**結果のフィールド**。フィールドは追加されうるが、既存のものの意味は変わらない
+  および**結果のフィールド**。フィールドは追加されうるが、既存のものの意味は変わらない。
+  1.1.0 で `list_topics` に `children` が付いたのがその形——全 entry に
+  新しいキーが 1 つ増え、既存のものは名前も型も変わらない
 - **prompt 名**: `deep_dive` / `find_gaps` / `summarize_topic` / `whats_new`。
   展開される**文面**は安定ではない
 - **`kb://` の resource URI スキーム**（`kb://doc/{path}` と `kb://topic/{prefix}`）、

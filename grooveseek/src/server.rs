@@ -9,7 +9,7 @@ use rmcp::schemars;
 use rmcp::{ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Database, SearchHit};
+use crate::db::{Database, SearchHit, TopicInfo, TopicNode};
 use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
 use crate::parser::{ParserExt, Registry};
@@ -375,6 +375,48 @@ struct TopicEntry {
     file_count: u32,
     last_updated: Option<String>,
     titles: Vec<String>,
+    /// (v1.1.0+) The directory tree beneath this group; `[]` when flat.
+    ///
+    /// No `skip_serializing_if`: a client reading an entry has to be able to
+    /// tell "nothing beneath this group" from "this server does not report
+    /// trees", and an omitted key says both.
+    children: Vec<TopicNodeEntry>,
+}
+
+/// The wire form of [`TopicNode`]: `segment`, `file_count`, `children`, in that
+/// order, all three always present.
+#[derive(Serialize)]
+struct TopicNodeEntry {
+    segment: String,
+    file_count: u32,
+    children: Vec<TopicNodeEntry>,
+}
+
+impl From<TopicNode> for TopicNodeEntry {
+    fn from(node: TopicNode) -> Self {
+        Self {
+            segment: node.segment,
+            file_count: node.file_count,
+            children: node.children.into_iter().map(Self::from).collect(),
+        }
+    }
+}
+
+impl From<TopicInfo> for TopicEntry {
+    fn from(info: TopicInfo) -> Self {
+        Self {
+            category: info.category,
+            topic: info.topic,
+            file_count: info.file_count,
+            last_updated: info.last_updated,
+            titles: info.titles,
+            children: info
+                .children
+                .into_iter()
+                .map(TopicNodeEntry::from)
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -518,16 +560,7 @@ impl KbCore {
         let db = recover_db(self.db.lock());
         match db.list_topics() {
             Ok(topics) => {
-                let entries: Vec<TopicEntry> = topics
-                    .into_iter()
-                    .map(|t| TopicEntry {
-                        category: t.category,
-                        topic: t.topic,
-                        file_count: t.file_count,
-                        last_updated: t.last_updated,
-                        titles: t.titles,
-                    })
-                    .collect();
+                let entries: Vec<TopicEntry> = topics.into_iter().map(TopicEntry::from).collect();
                 serde_json::to_string_pretty(&entries).unwrap_or_default()
             }
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
@@ -688,7 +721,7 @@ impl KbServer {
 
     #[tool(
         name = "list_topics",
-        description = "List all indexed topics and categories with document counts."
+        description = "List all indexed topics and categories with document counts. Each entry also carries children: the directory tree beneath that category/topic, one node per path segment with segment, file_count (documents under that prefix) and nested children; a flat group returns an empty array."
     )]
     async fn list_topics(&self) -> String {
         let core = Arc::clone(&self.core);
@@ -1487,6 +1520,114 @@ mod tests {
                 spelling.text
             );
         }
+    }
+
+    /// `children` is on the wire for every group, including the ones with no
+    /// directory beneath them.
+    ///
+    /// A client that has to tell "no tree" from "this build does not send one"
+    /// cannot, so the empty array is as load-bearing as a populated one --
+    /// which is what `skip_serializing_if` would quietly take away.
+    #[test]
+    fn every_topic_entry_carries_children_and_flat_groups_carry_an_empty_array() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        for (path, category, topic) in [
+            ("index.md", None, None),
+            ("ai-news/2026-04-16.md", Some("ai-news"), None),
+            (
+                "deep-dive/mcp/transport/stdio.md",
+                Some("deep-dive"),
+                Some("mcp"),
+            ),
+        ] {
+            // Title deliberately not the path: see
+            // `list_topics_reports_the_directories_beneath_each_group`.
+            db.upsert_document(path, Some("Doc"), topic, category, None, &[], None, "h", 0)
+                .expect("upsert");
+        }
+
+        let entries: Vec<TopicEntry> = db
+            .list_topics()
+            .expect("list_topics")
+            .into_iter()
+            .map(TopicEntry::from)
+            .collect();
+        let value = serde_json::to_value(&entries).expect("serialize");
+        let listed = value.as_array().expect("an array of entries");
+        assert_eq!(listed.len(), 3, "three groups: {value}");
+
+        for entry in listed {
+            assert!(
+                entry["children"].is_array(),
+                "every entry carries children: {entry}"
+            );
+        }
+
+        let flat: Vec<_> = listed.iter().filter(|e| e["topic"].is_null()).collect();
+        assert_eq!(
+            flat.len(),
+            2,
+            "the root and the category-only group, so the loop below cannot \
+             pass by matching nothing: {value}"
+        );
+        for entry in flat {
+            assert_eq!(
+                entry["children"],
+                serde_json::json!([]),
+                "a group with no topic has no directory beneath it, and says \
+                 so with an empty array rather than by omitting the key: \
+                 {entry}"
+            );
+        }
+
+        let mcp = listed
+            .iter()
+            .find(|e| e["topic"] == "mcp")
+            .unwrap_or_else(|| panic!("the mcp group: {value}"));
+        assert_eq!(
+            mcp["children"][0]["segment"], "transport",
+            "the tree survives the TopicInfo -> TopicEntry copy: {mcp}"
+        );
+    }
+
+    /// The key order a client reads, pinned as text.
+    ///
+    /// It cannot be pinned through `serde_json::Value`: without
+    /// `preserve_order` its `Map` is a `BTreeMap`, so every object comes back
+    /// alphabetised and the declaration order is gone before the assertion
+    /// runs.
+    #[test]
+    fn a_topic_node_serialises_as_segment_file_count_children_in_that_order() {
+        let node = TopicNode {
+            segment: "a".to_string(),
+            file_count: 2,
+            children: vec![TopicNode {
+                segment: "b".to_string(),
+                file_count: 1,
+                children: vec![],
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&TopicNodeEntry::from(node)).expect("serialize"),
+            r#"{"segment":"a","file_count":2,"children":[{"segment":"b","file_count":1,"children":[]}]}"#,
+            "a node names itself, then its count, then what is under it -- at \
+             every depth"
+        );
+
+        let info = TopicInfo {
+            category: Some("deep-dive".to_string()),
+            topic: Some("mcp".to_string()),
+            file_count: 1,
+            last_updated: None,
+            titles: vec!["T".to_string()],
+            children: vec![],
+        };
+        let text = serde_json::to_string(&TopicEntry::from(info)).expect("serialize");
+        assert!(
+            text.contains(r#""titles":["T"],"children":[]"#),
+            "children is the last key of an entry, after the ones 1.0 froze: \
+             {text}"
+        );
     }
 
     /// 一意な tempdir を作って kb_path として返す。Drop で削除。

@@ -635,3 +635,175 @@ fn the_tool_descriptions_name_the_behaviour_the_server_has() {
         );
     }
 }
+
+/// A server over an index seeded through the library, the way
+/// `tests/doctor_cli.rs` seeds one: no model run is needed for rows to exist,
+/// and `groove serve` does not index on start, so what the tool reads back is exactly
+/// what was written. Each row is `(path, category, topic)`, spelled out rather
+/// than derived, because the derivation is the indexer's and one row below
+/// deliberately disagrees with it.
+///
+/// The layout comes first in the tuple for the reason [`start`] gives: it must
+/// drop after the guard has killed the server.
+fn start_with_indexed_paths(
+    rows: &[(&str, Option<&str>, Option<&str>)],
+) -> (TempKbLayout, common::mcp::ServerGuard, String) {
+    let layout = TempKbLayout::new("groove-protocol-surface-tree");
+    for &(path, ..) in rows {
+        layout.write(path, "---\ntitle: Doc\n---\n\n## body\n\ntext\n");
+    }
+    let cfg = layout.root().join("groove.toml");
+    std::fs::write(&cfg, "[watch]\nenabled = false\n").expect("write groove.toml");
+    {
+        let db_path = grooveseek::resolve_db_path(layout.kb());
+        let db = grooveseek::db::Database::open(&db_path.to_string_lossy()).expect("open db");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("meta");
+        for &(path, category, topic) in rows {
+            // The title is deliberately not the path: `list_topics` selects the
+            // titles and the paths as adjacent columns, and a fixture whose
+            // title *is* its path cannot tell a tree built from the wrong one.
+            db.upsert_document(path, Some("Doc"), topic, category, None, &[], None, "h", 0)
+                .expect("upsert");
+        }
+        // Every write above has already committed itself: `upsert_document`
+        // opens its own transaction (`db/storage.rs`) and
+        // `verify_embedding_meta` runs in autocommit. This block exists only to
+        // close the connection before `serve` opens the same file.
+    }
+    let (guard, base) = spawn_mcp_server(layout.kb(), &cfg);
+    (layout, guard, base)
+}
+
+/// What a client sees of the directory tree, over the transport that carries
+/// it -- the assertion the tree builder's unit tests in the db layer cannot
+/// make, because they never go through the SQL, the domain-to-wire copy, or
+/// serde.
+///
+/// `deep-dive/other/notes/x.md` is filed under topic `mcp` even though its
+/// second path segment says `other`: a frontmatter `topic:` moves a document
+/// between groups, and the point of the row is that it does *not* move where
+/// that document's directories start. It contributes `notes`, not `other`.
+///
+/// Off `#[ignore]` for the same reason as every other test here that spawns a
+/// server: CI warms the model cache before this file runs.
+#[test]
+fn list_topics_returns_the_directory_tree_beneath_each_group_over_http() {
+    let (_kb, _guard, base) = start_with_indexed_paths(&[
+        ("index.md", None, None),
+        ("ai-news/2026-04-16.md", Some("ai-news"), None),
+        ("deep-dive/mcp/overview.md", Some("deep-dive"), Some("mcp")),
+        (
+            "deep-dive/mcp/transport/stdio.md",
+            Some("deep-dive"),
+            Some("mcp"),
+        ),
+        (
+            "deep-dive/mcp/transport/http/streamable.md",
+            Some("deep-dive"),
+            Some("mcp"),
+        ),
+        ("deep-dive/other/notes/x.md", Some("deep-dive"), Some("mcp")),
+    ]);
+
+    let resp = rpc_named(
+        &base,
+        "tools/call",
+        Some("list_topics"),
+        serde_json::json!({"name": "list_topics", "arguments": {}, "_meta": meta()}),
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content: {resp}"));
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(text).expect("list_topics returns a JSON array");
+
+    for entry in &entries {
+        assert!(
+            entry["children"].is_array(),
+            "every entry carries `children`, so a client can read the tree \
+             without knowing which groups have one: {entry}"
+        );
+    }
+
+    let root = entries
+        .iter()
+        .find(|e| e["category"].is_null())
+        .unwrap_or_else(|| panic!("the root group must be listed: {text}"));
+    assert_eq!(
+        root["children"],
+        serde_json::json!([]),
+        "a document at the root has no directory beneath its group: {root}"
+    );
+
+    let news = entries
+        .iter()
+        .find(|e| e["category"] == "ai-news")
+        .unwrap_or_else(|| panic!("the ai-news group must be listed: {text}"));
+    assert_eq!(
+        news["children"],
+        serde_json::json!([]),
+        "a category-only group is flat: {news}"
+    );
+
+    let mcp = entries
+        .iter()
+        .find(|e| e["topic"] == "mcp")
+        .unwrap_or_else(|| panic!("the mcp group must be listed: {text}"));
+    assert_eq!(mcp["file_count"], 4, "four documents are filed under mcp");
+    assert_eq!(
+        mcp["children"],
+        serde_json::json!([
+            {"segment": "notes", "file_count": 1, "children": []},
+            {
+                "segment": "transport",
+                "file_count": 2,
+                "children": [
+                    {"segment": "http", "file_count": 1, "children": []}
+                ]
+            }
+        ]),
+        "the tree beneath mcp, siblings by name and parents counting \
+         everything beneath them: {mcp}"
+    );
+}
+
+/// A caller decides whether to call a tool from its description alone, so a
+/// field the tool returns and the description does not mention is a field
+/// nobody asks for.
+///
+/// The paragraph assertion is the same one
+/// [`the_tool_descriptions_name_the_behaviour_the_server_has`] makes. This
+/// description is one unbroken literal today, so the assertion is aimed at the
+/// rewrite that splits it: the `\` continuations the longer descriptions use
+/// eat the newline *and* the leading whitespace of the next line, so a missing
+/// trailing space welds two words together and nothing else would notice.
+#[test]
+fn list_topics_describes_the_children_tree_it_returns() {
+    let (_kb, _guard, base) = start();
+
+    let listed = rpc(&base, "tools/list", serde_json::json!({"_meta": meta()}));
+    let tools = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list must return an array: {listed}"));
+    let described = tools
+        .iter()
+        .find(|t| t["name"] == "list_topics")
+        .unwrap_or_else(|| panic!("list_topics must be advertised: {listed}"));
+    let description = described["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("list_topics must carry a description: {listed}"));
+
+    for wanted in ["children", "segment", "file_count"] {
+        assert!(
+            description.contains(wanted),
+            "every key list_topics puts on the wire must be named in its \
+             description: {wanted:?} missing from {description:?}"
+        );
+    }
+    assert!(
+        !description.contains("  ") && !description.contains('\n'),
+        "list_topics's description must read as one paragraph, so a \
+         continuation that kept its indentation is a defect: {description:?}"
+    );
+}
