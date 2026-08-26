@@ -420,12 +420,15 @@ fn legacy_metric_version() -> u32 {
 }
 
 /// 現行の FTS クエリコンパイル規則の version。クエリ文字列から FTS5 の MATCH 式を
-/// 作る規則 (`db::fts_query::build_fts_query`) の**出力が変わる**変更のたびに +1 する。
+/// 作る規則 ([`crate::db::parse_query`]) の**出力が変わる**変更のたびに +1 する。
 /// [`ConfigFingerprint::fts_query_version`] を参照。
 ///
 /// [`METRIC_VERSION`] とは責務が違う。あちらは recall / MRR / nDCG の**計算式**専用で
 /// 「同じ検索結果から違う数値が出る」ケース、こちらは**検索結果そのもの**が変わるケース。
-pub const FTS_QUERY_VERSION: u32 = 2;
+///
+/// - 2: feature-48 (v0.16.0) — クエリを文字種 token の OR 式にコンパイルする
+/// - 3: feature-55 (v1.1.0) — group 先頭の `-` が除外になり、式が `(正) NOT (負)` を取り得る
+pub const FTS_QUERY_VERSION: u32 = 3;
 
 fn legacy_fts_query_version() -> u32 {
     1
@@ -3369,6 +3372,24 @@ enabled = true
         };
         let v = serde_json::to_value(&fp).unwrap();
         assert_eq!(v["fts_query_version"], serde_json::json!(FTS_QUERY_VERSION));
+    }
+
+    /// feature-55 (F-4) の bump を忘れる mutation の**唯一**の検出器。
+    ///
+    /// 先頭 `-` が除外になったことで、同じクエリ文字列から出る MATCH 式が変わり得る =
+    /// 検索結果そのものが変わる。bump しないと、規則が違う run どうしを eval が
+    /// 比較可能とみなし、構文変更による差を retrieval regression として報告する。
+    /// 既存のテストは値 2 を pin していないので、ここだけが気付ける。
+    #[test]
+    fn fts_query_version_covers_exclusion_syntax() {
+        // `let` を 1 つ挟むのは `clippy::assertions_on_constants` を避けるためで、
+        // 見ているのは const の値そのもの。
+        let recorded = FTS_QUERY_VERSION;
+        assert!(
+            recorded >= 3,
+            "the leading-hyphen exclusion syntax changes what a query compiles to, \
+             so runs from before it must not be compared against runs from after it"
+        );
     }
 
     // -----------------------------------------------------------------------

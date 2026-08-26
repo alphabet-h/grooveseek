@@ -14,11 +14,14 @@
 //!
 //! | spec | 実装 |
 //! |---|---|
-//! | 1. quote セグメント化 | [`split_quotes`] |
+//! | 1. quote セグメント化 | [`scan`] |
 //! | 2. whitespace 分割 + 3. 文字種 run 分割 | [`split_groups`] + [`split_runs`] |
 //! | 4. 短 run の隣接結合と独立 emit | [`emit_group`] |
-//! | 5. dedup / 上限 | [`dedup_and_cap_counted`] ([`query_phrases_counted`] の末尾) |
-//! | 5. phrase 化 + 6. fallback | [`build_fts_query`] + [`fallback_whole_query`] |
+//! | 5. dedup / 上限 | [`dedup_and_cap_counted`] ([`parse_query`] の末尾) |
+//! | 5. phrase 化 + 6. fallback | [`ParsedQuery::match_expr`] + [`fallback_whole_query`] |
+//!
+//! feature-55 (F-4) で [`scan`] は quote に加えて **group 先頭の `-`** も切るようになり、
+//! 手順 1〜5 は正側と除外側の両方を同じ関数で通る。組み立てだけが `(正) NOT (負)` に分かれる。
 //!
 //! [`query_phrases`] が式に組み立てる**前**の phrase 内容を返すのは、
 //! `server::compute_match_spans` が citation の offset を求めるのに同じ分割を要るため。
@@ -57,6 +60,9 @@
 //! - 英数字・CJK を 1 文字も含まない run (`---` など) も phrase になる。Markdown の水平線と
 //!   衝突してノイズ源になり得るが、クエリに `---` が現れること自体が稀なので許容している
 
+use std::borrow::Cow;
+use std::ops::Range;
+
 /// trigram tokenizer が phrase を照合できる最小文字数。
 ///
 /// これ未満の phrase は FTS5 でエラーにならず**恒久的に 0 件**を返す
@@ -71,11 +77,27 @@ const MIN_PHRASE_CHARS: usize = 3;
 /// OR で並べる phrase 数の上限 (DoS / 式肥大ガード。AU-17 の list 上限の前例に倣う)。
 const MAX_PHRASES: usize = 32;
 
-/// quote 走査後の区間。`Quoted` は `""` を literal `"` へ畳んだ**後**の内容を持つ。
+/// 走査後の区間。`Quoted` は `""` を literal `"` へ畳んだ**後**の内容を持つ。
+///
+/// `Excluded*` は group 先頭の `-` で始まっていた区間 (F-4)。`-` そのものは
+/// 内容に含めない。極性が違うだけで、この先の phrase 化は正側と同じ関数を通る。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment<'a> {
     Quoted(String),
     Plain(&'a str),
+    /// `-"..."`: 逐語 phrase として除外する。doubled-quote 規約は `Quoted` と同じ。
+    ExcludedQuoted(String),
+    /// `-word`: `-` の直後から次の whitespace まで。正側と同じ規則で token 化して除外する。
+    ExcludedPlain(&'a str),
+}
+
+/// [`scan`] の生の結果。
+///
+/// `exclusions` は raw の中の除外 group の byte span で、**先頭の `-` を含む**
+/// (= [`cut_exclusions`] がそのまま切り落とせる区間)。昇順・非重複。
+struct Scan<'a> {
+    segments: Vec<Segment<'a>>,
+    exclusions: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,53 +149,119 @@ fn classify(c: char) -> CharClass {
     }
 }
 
-/// クエリを quoted 区間と素の区間に割る (spec 手順 1)。
+/// 開き `"` を消費した直後から phrase を読む (spec 手順 1 の走査本体)。
 ///
-/// 走査規約は FTS5 自身の doubled-quote 規約と同じ: 開き `"` の後、`""` は literal `"` 1 文字
-/// として内容に取り込んで走査を継続し、単独の `"` で phrase を閉じる。閉じ `"` に到達せず
-/// 入力が尽きたら、その開き `"` は通常文字だったものとして**残り全体を 1 個の
-/// [`Segment::Plain`] として返し、走査を打ち切る**。
-fn split_quotes(raw: &str) -> Vec<Segment<'_>> {
-    let mut out = Vec::new();
+/// 規約は FTS5 自身の doubled-quote 規約と同じ: `""` は literal `"` 1 文字として内容に
+/// 取り込んで走査を継続し、単独の `"` で phrase を閉じる。戻り値の第 2 要素は閉じ `"` の
+/// **直後**の byte offset で、閉じずに入力が尽きたときは `None`。
+///
+/// 正側 (`"..."`) と除外側 (`-"..."`) の両方がここを呼ぶ。2 つ目の quote parser を
+/// 作ると doubled-quote の畳み方が 2 か所に分かれる。
+fn scan_quoted(it: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> (String, Option<usize>) {
+    let mut content = String::new();
+    while let Some((j, d)) = it.next() {
+        if d == '"' {
+            if matches!(it.peek(), Some((_, '"'))) {
+                it.next();
+                content.push('"');
+                continue;
+            }
+            return (content, Some(j + d.len_utf8()));
+        }
+        content.push(d);
+    }
+    (content, None)
+}
+
+/// クエリを quoted 区間 / 素の区間 / 除外 group に 1 パスで割る (spec 手順 1 + F-4)。
+///
+/// 閉じ `"` に到達せず入力が尽きたら、その開き `"` は通常文字だったものとして
+/// **残り全体を 1 個の [`Segment::Plain`] として返し、走査を打ち切る**。打ち切った後ろに
+/// ある `-` は除外として見ない (既存の走査規則をそのまま保つ)。
+///
+/// 除外と見なすのは **group 先頭の `-`** だけ: 直前が入力の先頭か whitespace
+/// (`char::is_whitespace()` なので全角空白 U+3000 も含む) で、かつ直後が `"` か
+/// 「[`CharClass::Separator`] でも `-` でもない文字」のときに限る。`sqlite-vec` /
+/// `foo,-bar` / `"foo"-bar` の `-` は group 先頭ではないので今日どおり
+/// [`CharClass::OtherWord`] のまま、`---` / `- foo` / `--foo` / 末尾の `-` も literal。
+fn scan(raw: &str) -> Scan<'_> {
+    let mut segments = Vec::new();
+    let mut exclusions = Vec::new();
     let mut plain_start = 0usize;
+    // 直前に消費した文字が whitespace か (= 次の文字が group の先頭か)。
+    let mut at_group_start = true;
     let mut it = raw.char_indices().peekable();
 
     while let Some((i, c)) = it.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut content = String::new();
-        let mut closed_at = None;
-        while let Some((j, d)) = it.next() {
-            if d == '"' {
-                if matches!(it.peek(), Some((_, '"'))) {
-                    it.next();
-                    content.push('"');
-                    continue;
-                }
-                closed_at = Some(j + d.len_utf8());
-                break;
-            }
-            content.push(d);
-        }
-        match closed_at {
-            Some(end) => {
-                if plain_start < i {
-                    out.push(Segment::Plain(&raw[plain_start..i]));
-                }
-                out.push(Segment::Quoted(content));
-                plain_start = end;
-            }
+        if c == '"' {
+            let (content, closed_at) = scan_quoted(&mut it);
             // 閉じられなかった。`plain_start` は直近に閉じた quote の直後 (無ければ 0) を
             // 指したままなので、下の flush が開き `"` を含む残り全体を Plain として出す。
-            None => break,
+            let Some(end) = closed_at else { break };
+            if plain_start < i {
+                segments.push(Segment::Plain(&raw[plain_start..i]));
+            }
+            segments.push(Segment::Quoted(content));
+            plain_start = end;
+            at_group_start = false;
+            continue;
         }
+
+        if c == '-' && at_group_start {
+            match it.peek().copied() {
+                Some((_, '"')) => {
+                    it.next(); // 開き `"` を消費し、正側と同じ走査へ入る
+                    let (content, closed_at) = scan_quoted(&mut it);
+                    let Some(end) = closed_at else { break };
+                    if plain_start < i {
+                        segments.push(Segment::Plain(&raw[plain_start..i]));
+                    }
+                    segments.push(Segment::ExcludedQuoted(content));
+                    exclusions.push(i..end);
+                    plain_start = end;
+                    at_group_start = false;
+                    continue;
+                }
+                Some((_, d)) if classify(d) != CharClass::Separator && d != '-' => {
+                    // 次の whitespace までが除外 group。whitespace 自体は消費しないので、
+                    // 次の外側 iteration がそれを見て `at_group_start` を立てる。
+                    let mut end = raw.len();
+                    while let Some(&(j, e)) = it.peek() {
+                        if e.is_whitespace() {
+                            end = j;
+                            break;
+                        }
+                        it.next();
+                    }
+                    if plain_start < i {
+                        segments.push(Segment::Plain(&raw[plain_start..i]));
+                    }
+                    segments.push(Segment::ExcludedPlain(&raw[i + '-'.len_utf8()..end]));
+                    exclusions.push(i..end);
+                    plain_start = end;
+                    continue;
+                }
+                // `-` の直後が `-` / Separator / 末尾 → 今日どおり literal。
+                _ => {}
+            }
+        }
+
+        at_group_start = c.is_whitespace();
     }
 
     if plain_start < raw.len() {
-        out.push(Segment::Plain(&raw[plain_start..]));
+        segments.push(Segment::Plain(&raw[plain_start..]));
     }
-    out
+    Scan {
+        segments,
+        exclusions,
+    }
+}
+
+/// [`scan`] の segment だけを見る入口 (走査規則そのもののテスト用)。
+#[cfg(test)]
+fn split_quotes(raw: &str) -> Vec<Segment<'_>> {
+    scan(raw).segments
 }
 
 /// Separator を 1 つも含まない極大区間 (= 群) を返す (spec 手順 2 + 3 の前半)。
@@ -303,7 +391,7 @@ fn concat(rs: &[Run<'_>]) -> String {
 /// 副作用を持たないのは意図的で、警告を出すかどうかの判断をログ収集なしでテスト
 /// できるようにするため (`.dev` の罠 W-7 と同じ理由 — script 生成と subprocess 起動を
 /// 混ぜると assert する手段が実行しかなくなる、という前例)。実際の warn は
-/// [`build_fts_query`] にある。
+/// [`ParsedQuery::warn_if_truncated`] にある。
 fn dedup_and_cap_counted(phrases: Vec<String>) -> (Vec<String>, usize) {
     let mut seen = std::collections::HashSet::new();
     let mut kept: Vec<String> = Vec::new();
@@ -354,6 +442,21 @@ fn emit_truncation_warning(dropped: usize) {
     );
 }
 
+/// 除外側の切り詰め警告。正側 ([`emit_truncation_warning`]) と別の関数なのは、
+/// 落ちたときに起きることが**逆向き**だから: 正側は「探す語が減る」= 取りこぼしが増え、
+/// 除外側は「落とす語が減る」= 望まない行が結果に**増える**。読む人が向きを取り違えると
+/// 対処 (クエリを短くする / 除外を減らす) を間違える。
+fn emit_exclusion_truncation_warning(dropped: usize) {
+    #[cfg(test)]
+    TRUNCATION_WARNINGS.with(|c| c.set(c.get() + 1));
+    tracing::warn!(
+        max = MAX_PHRASES,
+        dropped,
+        "fts_query: query exceeded the exclusion cap; trailing excluded phrases were dropped, \
+         so the search excluded less than the query asked for"
+    );
+}
+
 // 切り詰め警告の発火回数 (テスト専用)。`compute_match_spans` がヒットごとに
 // `query_phrases` を呼ぶため、そこで警告すると 1 検索で N+1 回出てしまう。
 #[cfg(test)]
@@ -361,80 +464,308 @@ thread_local! {
     static TRUNCATION_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// クエリ文字列を FTS5 の MATCH 式にコンパイルする。
+/// quoted 区間 1 個を phrase にする。NUL と 3 文字床の 2 判定 (正 / 除外で共通)。
 ///
-/// `None` は「FTS 側に投げるものが無い」= 呼び出し側は vector 単独で検索する、の意味。
+/// NUL を弾く理由は [`fallback_whole_query`] と同じ — FTS5 の式パーサは C 文字列を
+/// 読むので、内部 NUL で式が切れて検索全体が `Err` になる。
+fn quoted_phrase(content: &str) -> Option<String> {
+    if content.contains('\0') {
+        tracing::debug!("fts_query: dropping a quoted phrase containing NUL");
+        return None;
+    }
+    if content.chars().count() < MIN_PHRASE_CHARS {
+        tracing::debug!("fts_query: dropping a quoted phrase below the trigram floor");
+        return None;
+    }
+    Some(content.to_string())
+}
+
+/// 素の区間を群 → run → phrase に落として `out` に足す (spec 手順 2〜4)。
+/// 正側と除外側が**同じ**この関数を通ることが、両極性の規則が一致していることの実体。
+fn plain_phrases(text: &str, out: &mut Vec<String>) {
+    for group in split_groups(text) {
+        out.extend(emit_group(&split_runs(group)));
+    }
+}
+
+/// raw を除外 span で割った、除外されていない区間の列。span が無ければ raw 全体 1 つ。
+fn positive_regions<'a>(raw: &'a str, spans: &[Range<usize>]) -> Vec<&'a str> {
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    let mut cursor = 0usize;
+    for span in spans {
+        out.push(&raw[cursor..span.start]);
+        cursor = span.end;
+    }
+    out.push(&raw[cursor..]);
+    out
+}
+
+/// 除外 group を raw から切り落として、埋め込み / reranker / span 用の文字列を作る。
 ///
-/// 切り詰めの警告 (BU-31) は**ここだけ**で出す。1 検索につき 1 回しか呼ばれない唯一の
-/// 経路だからで、理由は [`query_phrases_counted`] の doc を参照。上限に当たると落ちるのは
-/// クエリ**末尾**の phrase なので、検索は成功したまま recall だけが静かに下がる —
-/// 気付けない類の劣化である。dogfood の golden 37 件では phrase 数の最大が 9 で、
-/// この上限は**実クエリに当たっていない**と実測できている。したがって発火自体が稀であり、
-/// 発火したらそれ自体が「そんなに長いクエリが来ている」という見る価値のある信号になる。
-/// (上限を下げれば最悪コストは下がるが、静かな切り詰めが始まる長さも下がるため、
-/// 値ではなく可視性の側を直した。計測値は台帳 BU-31 と ADR-0002 を参照)
-pub(super) fn build_fts_query(raw: &str) -> Option<String> {
-    let (phrases, dropped) = query_phrases_counted(raw);
-    if dropped > 0 {
-        emit_truncation_warning(dropped);
+/// group の直後の whitespace run ごと切る。末尾の group (後ろに whitespace が無い) では
+/// 代わりに直前の whitespace を落とす — `rust -async` が `rust ` ではなく `rust` になる。
+/// raw に元からある二重空白は触らない (embedder には無害で、触ると raw との一致が崩れる)。
+///
+/// span が空なら `Cow::Borrowed(raw)`。除外を書かないクエリの埋め込み入力が今日と
+/// byte 単位で同一であることを、実行時の比較ではなく**型**で示すためにこの形にしてある。
+fn cut_exclusions<'a>(raw: &'a str, spans: &[Range<usize>]) -> Cow<'a, str> {
+    if spans.is_empty() {
+        return Cow::Borrowed(raw);
     }
-    if phrases.is_empty() {
-        return fallback_whole_query(raw);
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        out.push_str(&raw[cursor..span.start]);
+        let mut end = span.end;
+        while let Some(c) = raw[end..].chars().next().filter(|c| c.is_whitespace()) {
+            end += c.len_utf8();
+        }
+        if end == span.end && end == raw.len() {
+            out.truncate(out.trim_end().len());
+        }
+        cursor = end;
     }
-    Some(
-        phrases
-            .iter()
-            .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    )
+    out.push_str(&raw[cursor..]);
+    Cow::Owned(out)
+}
+
+/// phrase 列を FTS5 の OR 式にする。phrase 内の `"` は FTS5 の規約どおり `""` へ畳む。
+fn join_phrases(phrases: &[String]) -> String {
+    phrases
+        .iter()
+        .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// 除外しかないクエリを断るときの文言。stderr に出るので **ASCII のみ** (AGENTS.md)。
+const EXCLUSION_ONLY_MESSAGE: &str = concat!(
+    "query has no positive term: every group is an exclusion (-term). ",
+    "Add a term to search for, or quote a leading hyphen (\"-term\") ",
+    "to search for it literally."
+);
+
+/// クエリを解析した結果。**1 回の走査**で「埋め込む文字列」「FTS が探す phrase」
+/// 「FTS が除外する phrase」を確定して持ち回るための型 (F-4)。
+///
+/// entry point (MCP / CLI / golden の load) がこれを 1 個作り、DB 層と embedder の
+/// 両方へ渡す。文字列を二度解析しないので、「FTS が探した語」と「埋め込んだ文字列」が
+/// 食い違いようがない。
+///
+/// 「その chunk は除外語を含むか」の判定は**すべて FTS5 に委ねる**: FTS 半身は
+/// [`Self::match_expr`] の `NOT` を native に評価し、vector 半身も同じ
+/// [`Self::negative_match`] にマッチした rowid 集合で落とす。Rust 側の substring 判定は
+/// 持たない (一つの問いに一つの実装)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedQuery<'a> {
+    raw: &'a str,
+    /// 除外 group を切り落とした raw。除外が無ければ `Cow::Borrowed(raw)`。
+    positive_text: Cow<'a, str>,
+    /// FTS が探す phrase (dedup + cap 済)。式に組み立てる前の素の内容。
+    include: Vec<String>,
+    /// FTS が除外する phrase (dedup + cap 済、正側と同じ 3 文字床)。
+    exclude: Vec<String>,
+    /// `include` が空のときに使う region 単位の全体 fallback。**quote 済み**の形で持つ
+    /// ([`fallback_whole_query`] の戻り値そのもの)。
+    fallback: Vec<String>,
+    /// 構文上の除外 group の数 (3 文字床で phrase が落ちる**前**)。拒否判定に使う。
+    exclusion_groups: usize,
+    dropped_include: usize,
+    dropped_exclude: usize,
+}
+
+/// クエリ文字列を解析する (spec 手順 1〜6 + F-4 の除外 group)。
+///
+/// **純粋**: ログも警告も出さない。切り詰めの警告は、1 検索につき 1 回だけ
+/// [`ParsedQuery::warn_if_truncated`] を呼ぶ側の責務。
+pub fn parse_query(raw: &str) -> ParsedQuery<'_> {
+    let scanned = scan(raw);
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+
+    for seg in &scanned.segments {
+        match seg {
+            Segment::Quoted(content) => include.extend(quoted_phrase(content)),
+            Segment::Plain(text) => plain_phrases(text, &mut include),
+            Segment::ExcludedQuoted(content) => exclude.extend(quoted_phrase(content)),
+            Segment::ExcludedPlain(text) => plain_phrases(text, &mut exclude),
+        }
+    }
+
+    // 上限は極性ごとに別枠。共有枠にすると「クエリ順で先頭 32 個」の規則が極性を跨ぎ、
+    // 除外を書いた位置で正側の phrase が落ちる (またはその逆) — 両半身とも今日の
+    // 正側と同じ規則に保つ方が、説明も検証も 1 行で済む。
+    let (include, mut dropped_include) = dedup_and_cap_counted(include);
+    let (exclude, dropped_exclude) = dedup_and_cap_counted(exclude);
+
+    // fallback は **raw を除外 span で割った positive region ごと**に効かせる。
+    // 連結後の positive text に効かせると出力 phrase が raw の連続部分文字列でなくなり、
+    // module 冒頭の中心的な不変条件が崩れる (`xy -abc z` が `"xy z"` になる)。
+    // 除外が無ければ region は raw 全体 1 つ = 今日と同じ 1 回の呼び出し。
+    let fallback = if include.is_empty() {
+        let regions = positive_regions(raw, &scanned.exclusions);
+        let (kept, dropped) = dedup_and_cap_counted(
+            regions
+                .into_iter()
+                .filter_map(fallback_whole_query)
+                .collect(),
+        );
+        dropped_include += dropped;
+        kept
+    } else {
+        Vec::new()
+    };
+
+    ParsedQuery {
+        raw,
+        positive_text: cut_exclusions(raw, &scanned.exclusions),
+        include,
+        exclude,
+        fallback,
+        exclusion_groups: scanned.exclusions.len(),
+        dropped_include,
+        dropped_exclude,
+    }
+}
+
+impl<'a> ParsedQuery<'a> {
+    /// 解析前のクエリ文字列。DB 層は除外を効かせるためにこちらを見る。
+    pub fn raw(&self) -> &'a str {
+        self.raw
+    }
+
+    /// 除外 group を切り落とした文字列。embedder / reranker / citation の span は
+    /// こちらを見る — raw を渡すと `sqlite -vec` の `-vec` が
+    /// `sqlite-vec` にハイライトを当ててしまう。
+    pub fn positive_text(&self) -> &str {
+        &self.positive_text
+    }
+
+    /// FTS が探す phrase (式に組み立てる前の素の内容)。
+    pub fn include(&self) -> &[String] {
+        &self.include
+    }
+
+    /// FTS が除外する phrase。response に echo するのは**実際に適用されたこれ**であって
+    /// クエリに書かれた group ではない — `-再ランキング` が `ランキング` まで落とすことを
+    /// 利用者に見せるため。
+    pub fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
+    /// 除外 group はあるが、探すものが何も残っていない。
+    ///
+    /// 判定は **positive text** であって FTS phrase の有無ではない: `xy -abc z` は
+    /// FTS phrase を 1 つも作れないが埋め込む文字列は残るので、`ab` が今日 vector 単独で
+    /// 通るのと同じに通す。空クエリ `""` は除外 group が 0 なので今日どおり通る。
+    pub fn is_exclusion_only(&self) -> bool {
+        self.exclusion_groups > 0 && self.positive_text.trim().is_empty()
+    }
+
+    /// 3 つの entry point (MCP / CLI / golden の load) が共有する拒否。
+    ///
+    /// **DB 層はこれを呼ばない**。`search_fts_candidates("-abc")` は今日どおり
+    /// `Ok(vec![])` を返す (`db::tests` の proptest がそれを要求する) — 拒否は
+    /// 「利用者に言い直してもらう」ための入口の判断であって、検索そのものの失敗ではない。
+    pub fn require_positive(&self) -> anyhow::Result<()> {
+        if self.is_exclusion_only() {
+            anyhow::bail!("{}", EXCLUSION_ONLY_MESSAGE);
+        }
+        Ok(())
+    }
+
+    /// FTS の正側 `"a" OR "b"`。token 化で phrase を作れなければ region 単位の
+    /// fallback、それも無ければ `None` (= FTS 半身は休み、vector 単独で検索する)。
+    pub(crate) fn positive_match(&self) -> Option<String> {
+        if !self.include.is_empty() {
+            return Some(join_phrases(&self.include));
+        }
+        if self.fallback.is_empty() {
+            return None;
+        }
+        Some(self.fallback.join(" OR "))
+    }
+
+    /// FTS の負側 `"c" OR "d"`。3 文字床を越えた除外 phrase が 1 つも無ければ `None`
+    /// (= `foo -ab` は**何も除外しない**)。vector 半身の除外もこの式で判定する。
+    pub(crate) fn negative_match(&self) -> Option<String> {
+        if self.exclude.is_empty() {
+            return None;
+        }
+        Some(join_phrases(&self.exclude))
+    }
+
+    /// FTS5 へ投げる式。負側が無ければ正側そのまま (今日と byte 単位で同一)。
+    ///
+    /// **両辺を常に括弧で包む**。FTS5 の優先順位は NOT > OR (fts5.html §3.7) なので、
+    /// 括弧を落とした `"a" OR "b" NOT "c"` は `"a" OR ("b" NOT "c")` と読まれ、除外が
+    /// 最後の phrase にしか効かない — 構文的には正しいままなので、受理を見るテストでは
+    /// 捕まらず、意味を見るテストでしか落ちない。単一 phrase でも `("a") NOT ("c")` と
+    /// 一様にするのは、形が 1 つだとテストと mutation probe が単純になるため。
+    pub(crate) fn match_expr(&self) -> Option<String> {
+        let positive = self.positive_match()?;
+        Some(match self.negative_match() {
+            Some(negative) => format!("({positive}) NOT ({negative})"),
+            None => positive,
+        })
+    }
+
+    /// 切り詰めの警告 (BU-31) を出す。**1 検索につき 1 回**だけ呼ぶこと。
+    ///
+    /// `server::compute_match_spans` は citation の offset を求めるために**ヒットごとに**
+    /// [`query_phrases`] を呼ぶので、分割側で警告すると N 件返したクエリが同じ警告を
+    /// N+1 回出す (codex review P2、PR #138)。稀にしか出ないことが信号としての価値を
+    /// 作っているので、それを潰さない。production の呼び出し点は
+    /// [`crate::db::Database`] の `search_fts_candidates_parsed` だけ。
+    ///
+    /// 上限に当たって落ちるのはクエリ**末尾**の phrase なので、検索は成功したまま
+    /// recall だけが静かに下がる — 気付けない類の劣化である。dogfood の golden 37 件では
+    /// phrase 数の最大が 9 で、この上限は**実クエリに当たっていない**と実測できている。
+    /// したがって発火自体が稀であり、発火したらそれ自体が「そんなに長いクエリが来ている」
+    /// という見る価値のある信号になる。(上限を下げれば最悪コストは下がるが、静かな
+    /// 切り詰めが始まる長さも下がるため、値ではなく可視性の側を直した。計測値は台帳
+    /// BU-31 と ADR-0002 を参照)
+    pub(crate) fn warn_if_truncated(&self) {
+        if self.dropped_include > 0 {
+            emit_truncation_warning(self.dropped_include);
+        }
+        if self.dropped_exclude > 0 {
+            emit_exclusion_truncation_warning(self.dropped_exclude);
+        }
+    }
 }
 
 /// FTS へ投げる phrase の**中身**を、式に組み立てる前の形で返す (手順 1〜5)。
 ///
-/// `build_fts_query` の途中結果だが、`server::compute_match_spans` も同じ分割を
+/// [`parse_query`] の途中結果だが、`server::compute_match_spans` も同じ分割を
 /// 必要とする。あちらが独自に whitespace 分割していると、`"Foundry Local"` のような
 /// quote 付きクエリで `"Foundry` / `Local"` を探しにいって citation の offset が
 /// 空になる (FTS は当たっているのにハイライトだけ消える)。**分割規則は 1 か所に置く。**
 ///
+/// 除外 phrase は**含まない** — 除外語はハイライトする対象ではない。span を求める側は
+/// [`ParsedQuery::positive_text`] を渡すので、その入力から出る phrase 列と一致する。
+///
 /// 空 `Vec` は「token 化では phrase を作れなかった」= 呼び出し側が全体 fallback を
 /// 判断する、の意味。
 pub(crate) fn query_phrases(raw: &str) -> Vec<String> {
-    query_phrases_counted(raw).0
+    parse_query(raw).include
 }
 
-/// [`query_phrases`] に「上限で落とした distinct phrase 数」を添えた版。
+/// 旧入口。**テスト専用**に残してある。
 ///
-/// 切り詰めの警告を出してよいのは **1 検索あたり 1 回**、すなわち
-/// [`build_fts_query`] だけである。[`query_phrases`] は
-/// `server::compute_match_spans` が**ヒットごとに**呼ぶので、そちらで警告すると
-/// N 件ヒットしたクエリが同じ警告を N+1 回出す (codex review P2、PR #138)。
-/// 稀にしか出ないことが信号としての価値を作っているので、それを潰さない。
-fn query_phrases_counted(raw: &str) -> (Vec<String>, usize) {
-    let mut phrases = Vec::new();
-
-    for seg in split_quotes(raw) {
-        match seg {
-            Segment::Quoted(content) => {
-                if content.contains('\0') {
-                    tracing::debug!("fts_query: dropping a quoted phrase containing NUL");
-                    continue;
-                }
-                if content.chars().count() < MIN_PHRASE_CHARS {
-                    tracing::debug!("fts_query: dropping a quoted phrase below the trigram floor");
-                    continue;
-                }
-                phrases.push(content);
-            }
-            Segment::Plain(text) => {
-                for group in split_groups(text) {
-                    phrases.extend(emit_group(&split_runs(group)));
-                }
-            }
-        }
-    }
-
-    dedup_and_cap_counted(phrases)
+/// 戻り値は今日と同じ**正側だけの OR 式**で、除外は含まない: proptest
+/// `every_phrase_is_a_substring_of_the_input` は戻り値を `" OR "` で割って raw の
+/// 部分文字列であることを要求し、`build_fts_query_never_exceeds_the_phrase_cap` は
+/// 同じ割り方で個数を数えるので、括弧付きの `NOT` 式を返すと両方が落ちる。
+///
+/// 警告をここで出すのは `the_truncation_warning_fires_once_per_search_not_once_per_hit`
+/// が「1 検索 1 回」をこの関数経由の発火回数で数えているため。production の発火点は
+/// [`ParsedQuery::warn_if_truncated`]。
+#[cfg(test)]
+fn build_fts_query(raw: &str) -> Option<String> {
+    let parsed = parse_query(raw);
+    parsed.warn_if_truncated();
+    parsed.positive_match()
 }
 
 #[cfg(test)]
@@ -644,6 +975,90 @@ mod tests {
         assert_eq!(
             split_quotes("abc \"de\"\" fg"),
             vec![Segment::Plain("abc \"de\"\" fg")]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 除外 group (F-4)。scanner が「先頭 `-`」と見なす位置だけを押さえる層。
+    // phrase 化した結果は下の parse_query の節で見る。
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn split_quotes_marks_a_leading_hyphen_group_as_excluded() {
+        assert_eq!(
+            split_quotes("rust -async"),
+            vec![Segment::Plain("rust "), Segment::ExcludedPlain("async")]
+        );
+        assert_eq!(
+            split_quotes("-async rust"),
+            vec![Segment::ExcludedPlain("async"), Segment::Plain(" rust")]
+        );
+    }
+
+    #[test]
+    fn split_quotes_excludes_a_quoted_phrase_after_a_hyphen() {
+        assert_eq!(
+            split_quotes("foo -\"bar baz\""),
+            vec![
+                Segment::Plain("foo "),
+                Segment::ExcludedQuoted("bar baz".to_string()),
+            ]
+        );
+        // doubled quote の畳み方は Quoted と同じ規約 (走査本体を共有している)。
+        assert_eq!(
+            split_quotes("-\"say \"\"hi\"\"\""),
+            vec![Segment::ExcludedQuoted("say \"hi\"".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_hyphen_is_only_an_exclusion_at_a_whitespace_boundary() {
+        assert_eq!(split_quotes("foo,-bar"), vec![Segment::Plain("foo,-bar")]);
+        assert_eq!(split_quotes("kb-mcp"), vec![Segment::Plain("kb-mcp")]);
+        assert_eq!(
+            split_quotes("\"foo\"-bar"),
+            vec![Segment::Quoted("foo".to_string()), Segment::Plain("-bar")]
+        );
+    }
+
+    #[test]
+    fn a_hyphen_followed_by_a_hyphen_a_separator_or_the_end_is_literal() {
+        assert_eq!(split_quotes("---"), vec![Segment::Plain("---")]);
+        assert_eq!(split_quotes("- foo"), vec![Segment::Plain("- foo")]);
+        assert_eq!(split_quotes("foo -"), vec![Segment::Plain("foo -")]);
+        assert_eq!(split_quotes("--foo"), vec![Segment::Plain("--foo")]);
+    }
+
+    /// 先頭ハイフンを literal で探す逃げ道。quote すれば正側の phrase に戻る。
+    #[test]
+    fn a_quoted_leading_hyphen_is_a_positive_phrase() {
+        assert_eq!(
+            split_quotes("\"-foo\""),
+            vec![Segment::Quoted("-foo".to_string())]
+        );
+        let p = parse_query("\"-foo\"");
+        assert_eq!(p.include, vec!["-foo".to_string()]);
+        assert!(p.exclude.is_empty());
+    }
+
+    /// 未閉じ quote に当たったら走査を打ち切る、という既存規則は除外にも先に効く。
+    #[test]
+    fn an_unterminated_quote_after_a_hyphen_is_not_an_exclusion() {
+        assert_eq!(split_quotes("-\"abc"), vec![Segment::Plain("-\"abc")]);
+        assert_eq!(
+            split_quotes("rust \"async -tokio"),
+            vec![Segment::Plain("rust \"async -tokio")]
+        );
+    }
+
+    #[test]
+    fn a_full_width_space_is_a_group_boundary_for_exclusion() {
+        assert_eq!(
+            split_quotes("再ランキング\u{3000}-評価"),
+            vec![
+                Segment::Plain("再ランキング\u{3000}"),
+                Segment::ExcludedPlain("評価"),
+            ]
         );
     }
 
@@ -987,6 +1402,178 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // 除外構文 (F-4): parse_query が作る 2 極の phrase 列と MATCH 式
+    // ---------------------------------------------------------------------
+
+    /// 除外側も正側と**同じ関数**を通るので、独立 emit の過剰さもそのまま出る。
+    /// `-再ランキング` が `ランキング` まで落とすのは仕様であり、echo でそれを見せる。
+    #[test]
+    fn parse_query_tokenizes_the_excluded_group_with_the_positive_rules() {
+        let p = parse_query("-再ランキング");
+        assert_eq!(
+            p.exclude,
+            vec!["再ランキング".to_string(), "ランキング".to_string()]
+        );
+        assert!(p.include.is_empty());
+        // quote すれば逐語 = 過剰除外の逃げ道。
+        assert_eq!(
+            parse_query("-\"再ランキング\"").exclude,
+            vec!["再ランキング".to_string()]
+        );
+    }
+
+    /// trigram の 3 文字床は除外側にも効く。届かない除外語は**何も落とさない**。
+    #[test]
+    fn an_excluded_phrase_under_the_trigram_floor_excludes_nothing() {
+        let p = parse_query("foo -ab");
+        assert!(p.exclude.is_empty());
+        assert_eq!(p.negative_match(), None);
+        assert_eq!(p.match_expr(), some("\"foo\""));
+    }
+
+    /// FTS5 の優先順位は NOT > OR なので、括弧を落とすと
+    /// `"a" OR "b" NOT "c"` = `"a" OR ("b" NOT "c")` になり除外が片側にしか効かない。
+    #[test]
+    fn the_match_expression_parenthesises_both_sides_of_not() {
+        assert_eq!(
+            parse_query("rust tokio -async -\"sync io\"").match_expr(),
+            some("(\"rust\" OR \"tokio\") NOT (\"async\" OR \"sync io\")")
+        );
+        // 片側 1 個でも形は同じ (一様な形はテストと probe を単純にする)。
+        assert_eq!(
+            parse_query("foo -bar").match_expr(),
+            some("(\"foo\") NOT (\"bar\")")
+        );
+    }
+
+    /// 除外を書かないクエリの出力は byte 単位で今日と同じ。
+    #[test]
+    fn a_query_without_exclusions_compiles_exactly_as_before() {
+        for raw in [
+            "再ランキングの評価について",
+            "retry budget の設定",
+            "\"Foundry Local\" の設定",
+            "\"再ランキングの評価について\"",
+            "E0382",
+            "暗号化",
+            "評価は",
+            "システム化",
+            "\"ab\" テスト",
+            "ab",
+            "",
+            "   ",
+            "エラー",
+            "AI と ML",
+            "sqlite-vec",
+            "---",
+            "foo \"bar\" AND",
+        ] {
+            assert_eq!(
+                parse_query(raw).match_expr(),
+                build_fts_query(raw),
+                "{raw:?} must compile exactly as it did before exclusions existed"
+            );
+        }
+    }
+
+    /// 埋め込み / reranker / span に渡る文字列。除外 group と、それに続く
+    /// whitespace run 1 つを切る (末尾 group なら直前の whitespace を切る)。
+    #[test]
+    fn positive_text_is_the_raw_query_with_the_exclusion_and_one_whitespace_run_cut() {
+        assert_eq!(parse_query("rust -async").positive_text(), "rust");
+        assert_eq!(parse_query("-async rust").positive_text(), "rust");
+        assert_eq!(parse_query("a -b c").positive_text(), "a c");
+        assert_eq!(parse_query("a -b -c").positive_text(), "a");
+        assert_eq!(
+            parse_query("foo -\"bar baz\" qux").positive_text(),
+            "foo qux"
+        );
+    }
+
+    /// 除外が無ければ **borrow** = raw と byte 単位で同一であることを型で示す。
+    #[test]
+    fn positive_text_borrows_the_raw_query_when_nothing_is_excluded() {
+        assert!(matches!(
+            parse_query("rust async").positive_text,
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            parse_query("rust -async").positive_text,
+            Cow::Owned(_)
+        ));
+    }
+
+    /// fallback は positive_text ではなく **raw の positive region ごと**に効く。
+    /// 連結後の文字列に効かせると、出力 phrase が raw の部分文字列でなくなる。
+    #[test]
+    fn the_fallback_applies_to_each_positive_region() {
+        assert_eq!(
+            parse_query("AI と ML -foo").match_expr(),
+            some("(\"AI と ML\") NOT (\"foo\")")
+        );
+        // 正側が全部 3 文字未満 = FTS 半身は休み (vector 単独)。除外は vec 側で効く。
+        assert_eq!(parse_query("xy -abc z").positive_match(), None);
+        assert_eq!(parse_query("xy -abc z").match_expr(), None);
+        assert_eq!(parse_query("xy -abc z").exclude, vec!["abc".to_string()]);
+    }
+
+    /// 拒否は「FTS phrase が作れたか」ではなく「埋め込む文字列が残ったか」で決める。
+    #[test]
+    fn an_exclusion_only_query_is_refused_and_a_short_positive_is_not() {
+        for raw in ["-foo", "-\"ab\"", "-a -b", "  -foo  "] {
+            let p = parse_query(raw);
+            assert!(p.is_exclusion_only(), "{raw:?} has nothing to search for");
+            assert!(p.require_positive().is_err(), "{raw:?}");
+        }
+        for raw in ["xy -abc z", "", "   ", "rust -async", "\"-foo\""] {
+            let p = parse_query(raw);
+            assert!(!p.is_exclusion_only(), "{raw:?} still has a positive side");
+            assert!(p.require_positive().is_ok(), "{raw:?}");
+        }
+    }
+
+    /// 上限は極性ごとに別枠。共有枠だと「除外を書いた位置」で正側の語が落ちる。
+    #[test]
+    fn each_polarity_has_its_own_phrase_cap() {
+        let positives: Vec<String> = (0..40).map(|i| format!("w{i:02}")).collect();
+        let negatives: Vec<String> = (0..40).map(|i| format!("-x{i:02}")).collect();
+        let raw = format!("{} {}", positives.join(" "), negatives.join(" "));
+
+        let p = parse_query(&raw);
+        assert_eq!(p.include.len(), MAX_PHRASES);
+        assert_eq!(p.exclude.len(), MAX_PHRASES);
+        assert_eq!(p.include[MAX_PHRASES - 1], "w31");
+        assert_eq!(p.exclude[MAX_PHRASES - 1], "x31");
+        assert_eq!(p.dropped_include, 8);
+        assert_eq!(p.dropped_exclude, 8);
+    }
+
+    /// 除外側の切り詰めも **1 検索 1 回**だけ警告する (正側と同じ理由)。
+    #[test]
+    fn the_exclusion_cap_warns_once_per_search_too() {
+        let positives: Vec<String> = (0..MAX_PHRASES + 5).map(|i| format!("w{i:02}")).collect();
+        let negatives: Vec<String> = (0..MAX_PHRASES + 5).map(|i| format!("-x{i:02}")).collect();
+        let raw = format!("{} {}", positives.join(" "), negatives.join(" "));
+
+        TRUNCATION_WARNINGS.with(|c| c.set(0));
+        for _ in 0..5 {
+            let _ = query_phrases(&raw);
+        }
+        assert_eq!(
+            TRUNCATION_WARNINGS.with(|c| c.get()),
+            0,
+            "the per-hit span path must stay silent on both polarities"
+        );
+
+        parse_query(&raw).warn_if_truncated();
+        assert_eq!(
+            TRUNCATION_WARNINGS.with(|c| c.get()),
+            2,
+            "one warning per polarity that was actually truncated"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // 不変条件 (proptest)
     // ---------------------------------------------------------------------
 
@@ -1041,6 +1628,55 @@ mod tests {
         #[test]
         fn build_fts_query_never_panics_on_arbitrary_text(raw in ".{0,200}") {
             let _ = build_fts_query(&raw);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 不変条件 (proptest) — 除外構文 (F-4)
+    // ---------------------------------------------------------------------
+
+    proptest::proptest! {
+        /// 除外を書かないクエリでは埋め込む文字列が raw と **byte 単位で**同じ。
+        /// 既存の embedding / eval が除外構文の導入で動かないことの根拠。
+        #[test]
+        fn positive_text_equals_the_raw_query_when_no_group_is_excluded(raw in ".{0,200}") {
+            let p = parse_query(&raw);
+            proptest::prop_assert_eq!(
+                p.exclusion_groups == 0,
+                p.positive_text() == raw,
+                "raw {:?} -> {:?}", raw, p.positive_text()
+            );
+        }
+
+        /// span 用の分割 ([`query_phrases`]) を positive text に対して行っても、
+        /// FTS が実際に探した phrase と一致する。`compute_match_spans` に
+        /// positive text を渡してよい根拠がこれ。
+        #[test]
+        fn the_include_phrases_of_the_positive_text_are_the_include_phrases_of_the_raw_query(
+            raw in "[^\"]{0,120}"
+        ) {
+            let p = parse_query(&raw);
+            proptest::prop_assert_eq!(query_phrases(p.positive_text()), p.include.clone());
+        }
+
+        /// 中心的な不変条件は除外側にも及ぶ: 除外 phrase も元クエリの連続部分文字列。
+        #[test]
+        fn excluded_phrases_are_substrings_of_the_input_too(raw in "[^\"]{0,120}") {
+            for phrase in parse_query(&raw).exclude {
+                proptest::prop_assert!(
+                    raw.contains(&phrase),
+                    "excluded phrase {phrase:?} is not a substring of {raw:?}"
+                );
+            }
+        }
+
+        /// byte index が常に char 境界であること (除外 span の切り出しを含む)。
+        #[test]
+        fn parse_query_never_panics_on_arbitrary_text(raw in ".{0,200}") {
+            let p = parse_query(&raw);
+            let _ = p.match_expr();
+            let _ = p.positive_text();
+            let _ = p.require_positive();
         }
     }
 }

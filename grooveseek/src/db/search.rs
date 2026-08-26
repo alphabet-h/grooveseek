@@ -15,9 +15,18 @@
 //! `tune.rs` (`crate::db::FTS_CANDIDATE_CALLS`), so moving it would break the
 //! AU-22 round-trip guard that counts FTS calls during a sweep.
 //!
-//! Compiling a user query into an FTS5 MATCH expression lives in the sibling
-//! module `fts_query` (feature-48, v0.16.0). It reaches here through `db.rs`'s
-//! `use fts_query::build_fts_query;` plus the `use super::*;` below.
+//! Parsing a user query — the FTS5 MATCH expression it compiles to, the terms
+//! it excludes, and the text an embedder should see — lives in the sibling
+//! module `fts_query` (feature-48, v0.16.0; exclusions in feature-55). It
+//! reaches here through `db.rs`'s `pub use fts_query::{ParsedQuery, parse_query};`
+//! plus the `use super::*;` below.
+//!
+//! A hybrid search parses **once**: [`Database::search_split_candidates`] hands
+//! the same [`ParsedQuery`] to both halves, so the phrases the full-text half
+//! searched for and the ids the vector half dropped cannot come from two
+//! different readings of the same string. The single-leg entry points
+//! (`search_fts_candidates`, `count_fts_matches`) parse for themselves — they
+//! are `tune`'s, and have no second half to agree with.
 
 // The parent module is what this file was carved out of, so it keeps seeing
 // exactly what it saw before. A hand-written list would be a second thing to
@@ -102,9 +111,29 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        self.search_fts_candidates_parsed(&parse_query(query_text), limit, filters, fusion)
+    }
+
+    /// [`Self::search_fts_candidates`] の本体。解析済みのクエリを受ける形。
+    ///
+    /// `search_split_candidates` は vector 半身と同じ [`ParsedQuery`] をここへ渡す。
+    /// 文字列から作り直すと、除外に使う式と FTS が探す式が別々の解析結果になり得る。
+    ///
+    /// 除外がある場合の MATCH 式は `(正) NOT (負)` で、`NOT` は**式の中**にあるので
+    /// SQL の `LIMIT` は除外**後**の行に効く (公式 docs に記述が無いので
+    /// `the_limit_is_applied_after_the_exclusion_not_before` が実 SQLite で固定している)。
+    pub(crate) fn search_fts_candidates_parsed(
+        &self,
+        query: &ParsedQuery<'_>,
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        fusion: FusionParams,
+    ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
-        let Some(fts_query) = build_fts_query(query_text) else {
+        // 切り詰めの警告は 1 検索 1 回。ここが「クエリを FTS に投げる」唯一の経路。
+        query.warn_if_truncated();
+        let Some(fts_query) = query.match_expr() else {
             return Ok(Vec::new());
         };
 
@@ -319,9 +348,37 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<(CandidateHits, CandidateHits)> {
-        let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
-        let fts_hits = self.search_fts_candidates(query_text, candidates, filters, fusion)?;
+        let parsed = parse_query(query_text);
+        let excluded = self.excluded_chunk_ids(parsed.negative_match().as_deref())?;
+        let vec_hits =
+            self.search_vec_candidates_excluding(query_embedding, candidates, filters, &excluded)?;
+        let fts_hits = self.search_fts_candidates_parsed(&parsed, candidates, filters, fusion)?;
         Ok((vec_hits, fts_hits))
+    }
+
+    /// 負の式にマッチする chunk id。vector 半身から落とす集合 (F-4)。
+    ///
+    /// 「その chunk は除外語を含むか」の判定は FTS5 (trigram / case-insensitive /
+    /// `remove_diacritics`) に任せ、FTS 半身の `NOT` と**同じ式文字列**を使う =
+    /// 一つの問いに一つの実装。Rust 側で content を substring 検索すると、
+    /// 大小・濁点・見出し列の扱いが 2 つに分かれる。
+    ///
+    /// 判定対象は FTS の行、すなわち `heading` / `context` / `content` の 3 列
+    /// (正側が探すのと同じ text)。本文に無くても heading や生成された context に
+    /// 除外語があれば、その chunk は落ちる。
+    ///
+    /// bm25 も `ORDER BY` も **`LIMIT` も無い**: 順位は要らず、`LIMIT` を付けると
+    /// 除外漏れが静かに起きる。コストは負 phrase 群の rowid 走査 1 回で、cap は
+    /// 置かない (phrase 数は [`ParsedQuery`] 側で 32 に bound されている)。
+    pub(crate) fn excluded_chunk_ids(&self, negative: Option<&str>) -> Result<HashSet<i64>> {
+        let Some(expr) = negative else {
+            return Ok(HashSet::new());
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ?1")?;
+        let ids = stmt.query_map(params![expr], |row| row.get::<_, i64>(0))?;
+        Ok(ids.collect::<std::result::Result<HashSet<_>, _>>()?)
     }
 
     /// クエリの phrase のいずれかにマッチする chunk 数 (LIMIT / filter なし)。
@@ -329,14 +386,17 @@ impl Database {
     ///
     /// **v0.16.0 で意味が変わった**: 旧実装はクエリ全体を 1 phrase にしていたので
     /// これは「その phrase の doc-freq」= FTS5 の IDF クランプ条件そのものだったが、
-    /// 現在は [`build_fts_query`] が生む複数 phrase の**和集合**の大きさであり、
+    /// 現在は [`parse_query`] が生む複数 phrase の**和集合**の大きさであり、
     /// 個々の phrase の doc-freq の**上界**でしかない
     /// (`tune::grid::QueryDiagnostics::idf_clamped` の注記を参照)。
+    ///
+    /// feature-55 以降、クエリが除外を含むなら数えるのは `(正) NOT (負)` の行数 =
+    /// **除外語を含む行は数えない**。
     ///
     /// 有効な phrase が 1 つも作れないクエリは `Ok(0)`。**「3 文字未満なら」ではない** —
     /// `ab` は落ちるが `AI と ML` は全体 fallback で phrase になる。
     pub(crate) fn count_fts_matches(&self, query_text: &str) -> Result<i64> {
-        let Some(fts_query) = build_fts_query(query_text) else {
+        let Some(fts_query) = parse_query(query_text).match_expr() else {
             return Ok(0);
         };
         let n: i64 = self.conn.query_row(
@@ -363,10 +423,26 @@ impl Database {
         limit: u32,
         filters: &SearchFilters<'_>,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        self.search_vec_candidates_excluding(query_embedding, limit, filters, &HashSet::new())
+    }
+
+    /// [`Self::search_vec_candidates`] の本体に、除外する chunk id 集合を足した形 (F-4)。
+    ///
+    /// `excluded` は [`Self::excluded_chunk_ids`] が返す「負の FTS 式にマッチした行」で、
+    /// filter と同じく Rust 側で 1 行ずつ落とす。**空集合なら
+    /// [`Self::search_vec_candidates`] と bit-exact** — over-fetch の条件にも入らない。
+    pub(crate) fn search_vec_candidates_excluding(
+        &self,
+        query_embedding: &[f32],
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        excluded: &HashSet<i64>,
+    ) -> Result<Vec<(i64, SearchResult)>> {
         // filter 指定があれば over-fetch する (詳細は SearchFilters::has_any)。
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。
-        let fetch_k = if filters.has_any() {
+        // 除外も同じ理由で広げる — 最近傍が除外語を含むだけで limit が埋まらなくなる。
+        let fetch_k = if filters.has_any() || !excluded.is_empty() {
             limit
                 .saturating_mul(FILTER_OVERFETCH_FACTOR)
                 .min(FILTER_OVERFETCH_CAP)
@@ -435,6 +511,10 @@ impl Database {
                 tags_json,
                 context_text,
             ) = row?;
+            // 除外 (F-4)。filter と同じ行ごとの連言なので、他の filter との順序は無関係。
+            if excluded.contains(&chunk_id) {
+                continue;
+            }
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
             }

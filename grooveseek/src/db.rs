@@ -11,9 +11,16 @@ mod storage;
 // feature-48. The FTS half of the hybrid search compiles a user query into an
 // FTS5 MATCH expression; that compilation is a self-contained string-to-string
 // problem with no database access, so it lives in its own module with its own
-// tests. Imported here (not `#[cfg(test)]`, unlike `parse_dim_from_create_sql`
-// below) because `search.rs` reaches it through `use super::*`.
-use fts_query::build_fts_query;
+// tests.
+//
+// feature-55 (F-4) turned that compilation into a parse: `parse_query` also
+// decides what the query *excludes* and what text the embedder should see, and
+// the entry points hand the resulting `ParsedQuery` around instead of the raw
+// string. Re-exported `pub` rather than imported privately (unlike
+// `parse_dim_from_create_sql` below) because those entry points name it from
+// outside this module as `grooveseek::db::parse_query`; `search.rs` reaches it
+// through `use super::*`.
+pub use fts_query::{ParsedQuery, parse_query};
 // `server::compute_match_spans` が citation の offset を求めるのに同じ分割規則を使う。
 pub(crate) use fts_query::query_phrases;
 
@@ -27,7 +34,7 @@ use schema::parse_dim_from_create_sql;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, TransactionBehavior, params};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -356,7 +363,7 @@ pub struct TopicInfo {
 
 // feature-48: `sanitize_fts_query` はここにあったが、クエリ全体を単一 phrase 化する
 // その規則こそが「自然文クエリで FTS 候補が 0 件になる」原因だったので、
-// `db/fts_query.rs` の `build_fts_query` に置き換えた。旧規則自体は
+// `db/fts_query.rs` の `parse_query` に置き換えた。旧規則自体は
 // `fallback_whole_query` として同モジュールに残っている (token 化で phrase が
 // 1 つも作れなかったときの逃げ道)。
 
@@ -2089,6 +2096,272 @@ mod tests {
             .unwrap();
     }
 
+    // ---------------------------------------------------------------------
+    // 除外構文 (F-4)。fts_query.rs の unit test は文字列しか見ないので、
+    // 「生成した `(正) NOT (負)` 式が SQLite で意図した行を落とすか」「vector 半身が
+    // 同じ集合で落ちるか」はここでしか確かめられない。in-memory なのでモデル不要。
+    // ---------------------------------------------------------------------
+
+    /// 括弧の検出器でもある。`(P) NOT (N)` の括弧を落とすと FTS5 は
+    /// `"tokio" OR ("rayon" NOT "async")` と読み、async 入りの tokio 行が生き残る。
+    #[test]
+    fn a_chunk_holding_an_excluded_term_never_reaches_the_fts_leg() {
+        let db = db_with_384();
+        add_fts_doc(&db, "a.md", "A", "tokio async runtime", 0.1);
+        add_fts_doc(&db, "b.md", "B", "tokio sync runtime", 0.2);
+        add_fts_doc(&db, "c.md", "C", "rayon parallel", 0.3);
+
+        let hits = db
+            .search_fts_candidates(
+                "tokio rayon -async",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        let mut paths: Vec<&str> = hits.iter().map(|(_, r)| r.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["b.md", "c.md"],
+            "the excluded term must not survive on either arm of the OR"
+        );
+    }
+
+    /// 除外は FTS 半身だけの話ではない。vector 側の最近傍でも落ちる。
+    #[test]
+    fn an_excluded_term_drops_the_vector_nearest_chunk_too() {
+        let db = db_with_384();
+        // 最近傍 (クエリ埋め込みと同値) の側に除外語を置く。
+        add_fts_doc(&db, "near.md", "N", "tokio async runtime", 0.5);
+        add_fts_doc(&db, "far.md", "F", "tokio runtime basics", 0.1);
+
+        let control = db
+            .search_hybrid(
+                "tokio",
+                &dummy_embedding(0.5),
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            control[0].path, "near.md",
+            "control: without an exclusion the vector-nearest chunk ranks first"
+        );
+
+        let hits = db
+            .search_hybrid(
+                "tokio -async",
+                &dummy_embedding(0.5),
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["far.md"],
+            "the vector half must drop the chunk the negative expression matches"
+        );
+    }
+
+    /// 「含まれるか」は FTS5 の tokenizer が決める = `case_sensitive 0` と
+    /// `remove_diacritics 1` がそのまま除外にも効く (Rust 側に 2 つ目の判定を持たない)。
+    #[test]
+    fn exclusion_is_judged_by_the_trigram_tokenizer_case_and_diacritics_included() {
+        let db = db_with_384();
+        add_fts_doc(&db, "upper.md", "U", "pipelines Async everywhere", 0.1);
+        add_fts_doc(
+            &db,
+            "accent.md",
+            "D",
+            "pipelines \u{c1}sync everywhere",
+            0.2,
+        );
+        add_fts_doc(&db, "plain.md", "P", "pipelines everywhere", 0.3);
+
+        let hits = db
+            .search_fts_candidates(
+                "pipelines -async",
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|(_, r)| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["plain.md"],
+            "`Async` and `\u{c1}sync` are the same trigrams as `async` to this tokenizer"
+        );
+    }
+
+    #[test]
+    fn the_excluded_id_set_is_the_rows_the_negative_expression_matches() {
+        let db = db_with_384();
+        // 除外語は **2 chunk** に置く。1 個だと `LIMIT 1` を足す mutation
+        // (= 静かな除外漏れ) がこのテストを緑のまま通り抜ける。
+        add_fts_doc(&db, "a.md", "A", "tokio async runtime", 0.1);
+        add_fts_doc(&db, "b.md", "B", "tokio sync runtime", 0.2);
+        add_fts_doc(&db, "c.md", "C", "rayon async pools", 0.3);
+
+        assert!(
+            db.excluded_chunk_ids(None).unwrap().is_empty(),
+            "no negative expression means nothing is excluded"
+        );
+
+        let expected: std::collections::HashSet<i64> = db
+            .conn
+            .prepare("SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ?1")
+            .unwrap()
+            .query_map(params!["\"async\""], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            expected.len(),
+            2,
+            "fixture: two chunks hold the excluded term"
+        );
+        assert_eq!(
+            db.excluded_chunk_ids(Some("(\"async\")")).unwrap(),
+            expected,
+            "every matching row, not a capped prefix of them"
+        );
+    }
+
+    /// 最近傍が除外語を持っていても `limit` は埋まる = KNN を広げてから落としている。
+    #[test]
+    fn exclusion_overfetches_the_vector_leg_so_the_limit_is_still_filled() {
+        let db = db_with_384();
+        add_fts_doc(&db, "near.md", "N", "tokio async runtime", 0.5);
+        add_fts_doc(&db, "next.md", "X", "tokio runtime basics", 0.49);
+
+        let excluded = db.excluded_chunk_ids(Some("(\"async\")")).unwrap();
+        assert_eq!(
+            excluded.len(),
+            1,
+            "fixture: the nearest chunk is the excluded one"
+        );
+
+        let hits = db
+            .search_vec_candidates_excluding(
+                &dummy_embedding(0.5),
+                1,
+                &SearchFilters::default(),
+                &excluded,
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "with k=1 the KNN returns only the excluded chunk and the caller gets nothing"
+        );
+        assert_eq!(hits[0].1.path, "next.md");
+    }
+
+    #[test]
+    fn count_fts_matches_counts_positives_minus_negatives() {
+        let db = db_with_384();
+        add_fts_doc(&db, "a.md", "A", "tokio async runtime", 0.1);
+        add_fts_doc(&db, "b.md", "B", "tokio sync runtime", 0.2);
+        add_fts_doc(&db, "c.md", "C", "tokio async pools", 0.3);
+
+        assert_eq!(db.count_fts_matches("tokio").unwrap(), 3);
+        assert_eq!(
+            db.count_fts_matches("tokio -async").unwrap(),
+            1,
+            "rows holding the excluded term are not counted"
+        );
+    }
+
+    /// SQLite fts5 の公式 docs は NOT と LIMIT の相互作用を書いていないので、実機で固定する。
+    /// `NOT` は MATCH 式の**中**にあるので `LIMIT` は除外後の行に効く — 逆なら
+    /// 除外語を含む行が枠を食って、返る件数が静かに減る。
+    #[test]
+    fn the_limit_is_applied_after_the_exclusion_not_before() {
+        let db = db_with_384();
+        for i in 0..8 {
+            add_fts_doc(&db, &format!("drop{i}.md"), "D", "alpha beta gamma", 0.1);
+        }
+        for i in 0..2 {
+            add_fts_doc(&db, &format!("keep{i}.md"), "K", "alpha gamma only", 0.2);
+        }
+
+        let hits = db
+            .search_fts_candidates(
+                "alpha -beta",
+                2,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "the limit must be filled from the rows that survive the NOT"
+        );
+        for (_, r) in &hits {
+            assert!(!r.content.contains("beta"), "{:?}", r.path);
+        }
+    }
+
+    /// `every_generated_expression_is_accepted_by_fts5` の兄弟。除外を含む形の式が
+    /// SQLite に受理されること (escape 崩れ / NUL / 括弧の対応はここでしか捕まらない)。
+    #[test]
+    fn every_generated_expression_with_an_exclusion_is_accepted_by_fts5() {
+        let db = db_with_384();
+        add_fts_doc(&db, "a.md", "A", "anything at all", 0.1);
+
+        // 除外側の上限 (32) を越える数。cap を跨いだ式も受理されること。
+        let many_exclusions = (0..40)
+            .map(|i| format!("-x{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inputs = [
+            "rust -async",
+            "-async rust",
+            "foo -\"bar baz\"",
+            "-\"say \"\"hi\"\"\"",
+            "-foo",
+            "-\"ab\"",
+            "--foo",
+            "- foo",
+            "a -b -c",
+            "-日本語 テスト",
+            "-x\"y\" z",
+            "NEAR(a b) -x",
+            "-\0ab cd",
+            "-\"a\0b\" cd",
+            many_exclusions.as_str(),
+        ];
+        for raw in inputs {
+            let hits = db.search_fts_candidates(
+                raw,
+                10,
+                &SearchFilters::default(),
+                FusionParams::default(),
+            );
+            assert!(
+                hits.is_ok(),
+                "FTS5 rejected the expression built from {raw:?}: {:?}",
+                hits.err()
+            );
+            // 負の式は `NOT` の中だけでなく、vector 半身を濾すための**単独の**
+            // MATCH クエリとしても SQLite に渡る。そちらの受理も同じ入力で見る —
+            // ここが赤くなると hybrid 検索そのものが Err で落ちる。
+            let negative = parse_query(raw).negative_match();
+            let ids = db.excluded_chunk_ids(negative.as_deref());
+            assert!(
+                ids.is_ok(),
+                "FTS5 rejected the negative expression built from {raw:?}: {:?}",
+                ids.err()
+            );
+        }
+    }
+
     #[test]
     fn test_parse_dim_from_create_sql() {
         let sql = "CREATE VIRTUAL TABLE vec_chunks USING vec0(\
@@ -2985,6 +3258,115 @@ mod tests {
              same {n}-row population; measured 10.1-11.0x when this guard was \
              written, growing linearly with arm count. A jump here means arm count \
              started costing more than linearly."
+        );
+    }
+
+    /// (F-4) 除外が足す仕事の値段を、それが濾す検索そのものと比べて測る。
+    ///
+    /// `excluded_chunk_ids` は bm25 も `ORDER BY` も `LIMIT` も持たない rowid 走査 1 回で、
+    /// vector 半身から落とす id 集合を作る。BU-03 が測ったのは「32 arm の OR が単一
+    /// phrase の何倍か」= 式の幅の値段で、こちらは「順位を付けない走査が、同じ母集団に
+    /// 順位を付ける検索の何倍か」= 除外が 1 検索に足す値段。
+    ///
+    /// 負の式は**ほぼ全行にマッチする**もの (`-について`) を選ぶ。除外語が稀なら
+    /// doclist が短くて安いのは自明なので、測る値打ちがあるのは最悪形の方。
+    ///
+    /// ガードは絶対時間ではなく**倍率**で書く (BU-03 と同じ理由)。絶対値は機械と
+    /// SQLite 版で動くが、「順位なしの走査が順位ありの検索の何倍か」は次数が変わらない
+    /// 限り安定する。
+    ///
+    /// 測定値 (5,000 chunk / 全行マッチの負の式 / release、`cargo test -p grooveseek
+    /// --release --lib the_exclusion_id_scan_stays_cheaper_than_the_ranked_fts_query --
+    /// --ignored --nocapture`): id 走査 934.5µs、同じ母集団に順位を付ける FTS が
+    /// 3.5855ms、除外込みの hybrid 1 回が 7.009ms — 比は **0.26x**。上限 2x は測定値の
+    /// 7 倍以上の余裕があり、機械差では届かない。
+    #[test]
+    #[ignore = "timing-based; run on the nightly leg or by hand"]
+    fn the_exclusion_id_scan_stays_cheaper_than_the_ranked_fts_query() {
+        use std::time::Instant;
+        let n: i32 = std::env::var("F4_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
+        println!("corpus = {n} chunks");
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("m.md", Some("m"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        for i in 0..n {
+            db.insert_chunk(
+                doc_id,
+                i,
+                None,
+                None,
+                &format!("について 評価を記録した第 {i} 節の本文"),
+                None,
+                &dummy_embedding(0.5),
+                1.0,
+            )
+            .unwrap();
+        }
+
+        let negative = crate::db::parse_query("-について")
+            .negative_match()
+            .expect("the fixture query must produce a negative expression");
+        println!("negative expression = {negative}");
+
+        let mut best_scan = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let ids = db.excluded_chunk_ids(Some(&negative)).unwrap();
+            best_scan = best_scan.min(t.elapsed());
+            assert_eq!(
+                ids.len(),
+                n as usize,
+                "the fixture's negative expression must match every row"
+            );
+        }
+
+        let mut best_ranked = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let hits = db
+                .search_fts_candidates(
+                    "について",
+                    10,
+                    &SearchFilters::default(),
+                    FusionParams::default(),
+                )
+                .unwrap();
+            best_ranked = best_ranked.min(t.elapsed());
+            assert_eq!(hits.len(), 10);
+        }
+
+        // 参考: 除外込みの検索 1 回ぶん (走査 + `(正) NOT (負)` の評価)。
+        let mut best_excluding = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let _ = db
+                .search_hybrid(
+                    "について -評価",
+                    &dummy_embedding(0.5),
+                    10,
+                    &SearchFilters::default(),
+                    FusionParams::default(),
+                )
+                .unwrap();
+            best_excluding = best_excluding.min(t.elapsed());
+        }
+
+        println!("     id scan: best_of_5={best_scan:?}");
+        println!("  ranked fts: best_of_5={best_ranked:?}");
+        println!("hybrid+excl: best_of_5={best_excluding:?}");
+
+        let ratio = best_scan.as_secs_f64() / best_ranked.as_secs_f64();
+        println!("ratio id_scan/ranked_fts = {ratio:.2}x (bound: 2x)");
+        assert!(
+            ratio < 2.0,
+            "the exclusion id scan now costs {ratio:.2}x the ranked query it filters, over the \
+             same {n}-row population; measured 0.26x when this guard was written. It does \
+             strictly less work (no bm25, no ORDER BY), so a ratio above 1 means the set build \
+             itself started dominating."
         );
     }
 
