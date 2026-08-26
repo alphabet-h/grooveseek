@@ -1,6 +1,6 @@
 //! `groove doctor` — ask the index whether it is in the state it should be.
 //!
-//! Three groups of question, and one deliberate omission.
+//! Two groups of question, and one deliberate omission.
 //!
 //! **Integrity.** Search reads three tables that have to agree about a chunk:
 //! `chunks` holds the text, `vec_chunks` the embedding, `fts_chunks` the
@@ -18,14 +18,6 @@
 //! equivalent would eventually disagree with the thing it is reporting on,
 //! which is the failure mode this whole feature is about.
 //!
-//! **The migration period.** Whether a `.kb-mcpignore` — the name the ignore
-//! file had before [ADR-0007] — is still keeping documents out on paper while
-//! the index holds them anyway. This is the one group that opens something
-//! outside the database, and the same reasoning applies to it: the old file
-//! goes through [`crate::exclusion::ExclusionRules`], the type the index walk
-//! itself asks, rather than through a matcher assembled here. It is also the
-//! one group with a removal date — see [`crate::legacy`], which owns it.
-//!
 //! **It does not repair.** Every finding names the command that fixes it. That
 //! is the contract `paths_with_unregistered_extension` already states for the
 //! narrower case — report the count, suggest `groove index`, never delete —
@@ -35,13 +27,8 @@
 //! database runs the forward migrations (see `db/schema.rs`), so `doctor` is
 //! read-only about its findings but not about the file. `eval` and `search`
 //! have the same property.
-//!
-//! [ADR-0007]: ../../docs/decisions/0007-rename-the-project-to-grooveseek.md
-
-use std::path::Path;
 
 use crate::db::{Database, IntegrityScan};
-use crate::legacy::LegacyIgnore;
 use crate::parser::Registry;
 use anyhow::Result;
 use serde::Serialize;
@@ -120,20 +107,10 @@ fn finding(
 
 /// Run every check against `db` and collect what it found.
 ///
-/// Findings come out in the order below — integrity, then servability, then the
-/// migration period — because the first group means something is broken, the
-/// second means something is merely unavailable, and the third means the index
-/// is not what its knowledge base was set up to produce.
-///
-/// `kb_path` and `exclude_dirs` are only the third group's, and go away with it
-/// (see [`crate::legacy`]). They are passed rather than a whole `Config` so
-/// that removing the group removes the argument too.
-pub fn run(
-    db: &Database,
-    registry: &Registry,
-    kb_path: &Path,
-    exclude_dirs: &[String],
-) -> Result<Report> {
+/// Findings come out in the order below — integrity, then servability —
+/// because the first group means something is broken and the second means
+/// something is merely unavailable.
+pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
     let mut findings = Vec::new();
 
     // Before the per-chunk comparisons, because those cannot see it: with the
@@ -278,109 +255,6 @@ pub fn run(
         });
     }
 
-    // -- the migration period: the name this project stopped reading ---------
-    //
-    // Last, because it is the only group that opens anything outside the
-    // database, and the only one that gets deleted. `all_paths` above is the
-    // evidence it works from, so no further query is issued.
-    let rules = crate::exclusion::ExclusionRules::load(kb_path, exclude_dirs.to_vec());
-    match crate::legacy::inspect(kb_path, &rules, &all_paths) {
-        LegacyIgnore::Absent => {}
-        // The summary does **not** say the old file is there. `CannotSay` also
-        // covers a name the filesystem would not answer for, where presence is
-        // exactly what was not established, and asserting it would be the thing
-        // this group exists to avoid (codex P2 round 6). What is measured in
-        // every case is that the check did not complete; `why` carries what was
-        // actually observed, and distinguishes the cases for a reader.
-        LegacyIgnore::CannotSay(why) => findings.push(Finding {
-            check: "legacy-ignore-not-examined",
-            severity: Severity::Warning,
-            summary: format!(
-                "the {} check could not be completed, so whether anything it names is in \
-                 the index is not known: {why}",
-                crate::legacy::LEGACY_IGNORE_FILE_NAME
-            ),
-            // One name, not zero findings. A check that could not run reporting
-            // a count of nothing is how it starts reading as a clean bill.
-            count: 1,
-            samples: Vec::new(),
-            // Found reviewing this branch against the two roots the earlier
-            // rounds shared, rather than by a seventh round. It said "make it a
-            // plain readable file under the size cap" — "it" claims something
-            // is there, which `Unknown` never established, and naming two
-            // repairs is what round 3 corrected in the *other* remedy while
-            // this one kept the defect. The condition to reach covers every
-            // reason the check did not complete, including reasons added later.
-            remedy: "make that name one groove can read, then run groove doctor again",
-        }),
-        // Through the same `finding` helper as every check above, so "there is
-        // an old file but it costs nothing today" stays silent by the same rule
-        // that keeps a clean integrity scan silent.
-        LegacyIgnore::Read { still_indexed } => {
-            let summary = format!(
-                "{} indexed document(s) match a pattern in {}, which is no longer read; the \
-                 current rules do not exclude them",
-                still_indexed.len(),
-                crate::legacy::LEGACY_IGNORE_FILE_NAME
-            );
-            // Never "delete the old file": a knowledge base whose new file is
-            // broken looks the same from here, and that remedy would destroy
-            // the only copy of the patterns (codex round 3 on PR #203). Never
-            // "rename it" when the destination name is occupied either — that
-            // overwrites a file in use (round 2).
-            //
-            // **Three** states, not two, and neither signal alone separates
-            // them. Occupancy comes from the filesystem because
-            // `ignore_file_patterns()` answers `None` for a `.grooveignore`
-            // that exists and could not be read, and renaming onto that is as
-            // destructive as renaming onto a working one (codex P2 round 1).
-            // Whether it is *in effect* comes from the rules, because copying
-            // lines into a directory or through a refused link does not produce
-            // an ignore file either, and the documents stay indexed (round 2).
-            //
-            // "Free" and not merely "not taken": the filesystem can also
-            // decline to answer, and a rename onto a name nobody could look at
-            // is the same gamble as a rename onto an occupied one (codex P2
-            // round 5). `Occupancy` carries that third value so neither caller
-            // has to remember it.
-            let destination_free = matches!(
-                crate::legacy::live_ignore_name(kb_path),
-                crate::legacy::Occupancy::Free
-            );
-            let remedy = match (destination_free, rules.ignore_file_patterns().is_some()) {
-                // The name is free. Nothing to lose, so the shortest fix works.
-                (true, _) => "rename .kb-mcpignore to .grooveignore, then run groove index",
-                // A working ignore file is there. Merge, never overwrite.
-                (false, true) => concat!(
-                    "copy the lines you still want from .kb-mcpignore into .grooveignore, ",
-                    "then run groove index"
-                ),
-                // Not free, and nothing in effect. This one branch is reached
-                // for every reason `links::read_checked` refuses — a directory,
-                // an extra hard link, a symlink, a file over the cap — and also
-                // when the name could not be looked at, so its wording must
-                // claim neither a reason nor that anything is there. "Make it a
-                // plain readable file" is a step already done for a file that
-                // is merely too big (codex P2 round 3). It states the one thing
-                // measured in all of them — no `.grooveignore` is being applied
-                // — and the condition to reach, which stays true for refusal
-                // reasons added later.
-                (false, false) => concat!(
-                    "groove is applying no .grooveignore here: make that name hold an ignore ",
-                    "file groove accepts, then move the lines you still want there and run ",
-                    "groove index"
-                ),
-            };
-            findings.extend(finding(
-                "indexed-despite-legacy-ignore",
-                Severity::Warning,
-                summary,
-                truncated(still_indexed),
-                remedy,
-            ));
-        }
-    }
-
     Ok(Report {
         documents: db.document_count()?,
         chunks: db.chunk_count()?,
@@ -445,16 +319,6 @@ mod tests {
             .expect("chunk");
     }
 
-    /// A knowledge base for the checks that are not about one.
-    ///
-    /// Every test below except the migration-period ones wants
-    /// `<kb_path>/.kb-mcpignore` to be absent, and a path that was never
-    /// created answers that the same way an empty directory does — without a
-    /// directory to clean up. Unique per call so no two tests can collide on it.
-    fn empty_kb() -> std::path::PathBuf {
-        crate::test_support::unique_temp_path("groove-doctor-nokb")
-    }
-
     fn db_with_one_chunk() -> Database {
         let db = Database::open_in_memory().expect("open");
         db.verify_embedding_meta("bge-small-en-v1.5", 384)
@@ -480,7 +344,7 @@ mod tests {
     #[test]
     fn a_healthy_index_has_nothing_to_report() {
         let db = db_with_one_chunk();
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         assert!(
             report.is_clean(),
             "a freshly built index should report nothing: {:?}",
@@ -494,7 +358,7 @@ mod tests {
         let db = db_with_one_chunk();
         db.execute_for_test("DELETE FROM vec_chunks").expect("del");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -510,7 +374,7 @@ mod tests {
         let db = db_with_one_chunk();
         db.execute_for_test("DELETE FROM fts_chunks").expect("del");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -533,7 +397,7 @@ mod tests {
         // the state a partially applied write would leave.
         db.execute_for_test("DELETE FROM chunks").expect("del");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
         assert!(checks.contains(&"orphan-embedding"), "{checks:?}");
         assert!(checks.contains(&"orphan-fts-row"), "{checks:?}");
@@ -550,7 +414,7 @@ mod tests {
         ))
         .expect("update");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -582,7 +446,7 @@ mod tests {
         //     embedding, which is just as loud.
         {
             let db = Database::open(&dir.db()).expect("reopen");
-            let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+            let report = run(&db, &registry_md()).expect("run");
             let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
             assert!(
                 !checks.contains(&"vector-table-missing"),
@@ -606,7 +470,7 @@ mod tests {
         //     otherwise report a healthy index while vector search returns
         //     nothing at all.
         let db = Database::open(&dir.db()).expect("reopen");
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -623,9 +487,7 @@ mod tests {
     fn an_empty_index_without_a_vector_table_is_not_a_finding() {
         let db = Database::open_in_memory().expect("open");
         assert!(
-            run(&db, &registry_md(), &empty_kb(), &[])
-                .expect("run")
-                .is_clean(),
+            run(&db, &registry_md()).expect("run").is_clean(),
             "a database with nothing in it has nothing wrong with it"
         );
     }
@@ -646,7 +508,7 @@ mod tests {
         )
         .expect("orphan the chunk");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -678,7 +540,7 @@ mod tests {
         ))
         .expect("update");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -697,7 +559,7 @@ mod tests {
         db.execute_for_test("UPDATE documents SET size_bytes = NULL")
             .expect("update");
 
-        let report = run(&db, &registry_md(), &empty_kb(), &[]).expect("run");
+        let report = run(&db, &registry_md()).expect("run");
         let f = report
             .findings
             .iter()
@@ -706,280 +568,5 @@ mod tests {
         assert_eq!(f.count, 1);
         // Not an error: nothing is broken, the answer is just not known yet.
         assert_eq!(f.severity, Severity::Warning);
-    }
-
-    // -----------------------------------------------------------------------
-    // The migration period (audit L-4)
-    //
-    // What the old file matches is unit-tested in `crate::legacy`. These are
-    // about the report: which finding comes out, and what it tells an operator
-    // to do. Each names the review round on PR #203 it answers, because that
-    // withdrawn attempt is the reason this group is shaped the way it is.
-
-    struct LegacyKb(std::path::PathBuf);
-
-    impl LegacyKb {
-        fn new(prefix: &str) -> Self {
-            let p =
-                crate::test_support::unique_temp_path(&format!("groove-doctor-legacy-{prefix}"));
-            std::fs::create_dir_all(&p).expect("create kb");
-            Self(p)
-        }
-        fn write(&self, name: &str, body: &str) {
-            std::fs::write(self.0.join(name), body).expect("write");
-        }
-        fn report(&self, db: &Database) -> Report {
-            run(db, &registry_md(), &self.0, &[]).expect("run")
-        }
-    }
-
-    impl Drop for LegacyKb {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// The finding carries the path, which is the whole reason this group opens
-    /// the file rather than asking whether the name is taken.
-    #[test]
-    fn a_document_the_old_ignore_file_names_is_reported_with_its_path() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("named");
-        kb.write(".kb-mcpignore", "notes/\n");
-
-        let report = kb.report(&db);
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.check == "indexed-despite-legacy-ignore")
-            .expect("a document the old file names must be reported");
-        assert_eq!(f.severity, Severity::Warning);
-        assert_eq!(f.count, 1);
-        assert_eq!(f.samples, vec!["notes/a.md".to_string()]);
-    }
-
-    /// codex round 2 on PR #203: the remedy told an operator to put the old
-    /// file in place of the one currently in effect.
-    #[test]
-    fn the_remedy_never_overwrites_a_grooveignore_that_is_in_use() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("bothfiles");
-        kb.write(".kb-mcpignore", "notes/\n");
-        kb.write(".grooveignore", "logs/\n");
-
-        let report = kb.report(&db);
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.check == "indexed-despite-legacy-ignore")
-            .expect("the finding is the same one; only the remedy changes");
-        assert!(
-            !f.remedy.contains("rename"),
-            "a .grooveignore in effect must not be renamed over: {}",
-            f.remedy
-        );
-
-        // And the other way round, so this pins a branch rather than a constant.
-        std::fs::remove_file(kb.0.join(".grooveignore")).expect("rm");
-        let report = kb.report(&db);
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.check == "indexed-despite-legacy-ignore")
-            .expect("still reported with no live file");
-        assert!(
-            f.remedy.contains("rename"),
-            "with nothing to overwrite, renaming is the shortest fix: {}",
-            f.remedy
-        );
-    }
-
-    /// codex P2 round 1 on this PR: `ignore_file_patterns()` answers `None`
-    /// both for "there is no `.grooveignore`" and for "there is one and it
-    /// could not be read", so branching on it sent an operator to `mv` onto an
-    /// occupied name — overwriting their file on Unix, failing on Windows, and
-    /// either way leaving the documents just reported still in the index.
-    ///
-    /// A directory is the cheapest unreadable file, the same fixture the
-    /// `CannotSay` tests use.
-    #[test]
-    fn a_grooveignore_that_exists_but_cannot_be_read_still_blocks_the_rename() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("occupied");
-        kb.write(".kb-mcpignore", "notes/\n");
-        std::fs::create_dir_all(kb.0.join(".grooveignore")).expect("mkdir");
-
-        let report = kb.report(&db);
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.check == "indexed-despite-legacy-ignore")
-            .expect("the finding does not depend on the new file being readable");
-        assert!(
-            !f.remedy.contains("rename"),
-            "the destination name is taken, whether or not what holds it can be read: {}",
-            f.remedy
-        );
-        // codex P2 round 2: "not a rename" is not enough. Copying lines into a
-        // directory, or through a refused link, produces no ignore file either,
-        // so the documents named in this very finding would stay indexed. The
-        // remedy has to send the operator at the destination first.
-        assert!(
-            f.remedy.contains("applying no .grooveignore"),
-            "a remedy that merges into an unreadable destination cannot work, so it has \
-             to name that first: {}",
-            f.remedy
-        );
-    }
-
-    /// codex P2 round 3: the repair branch is reached for every reason the read
-    /// guard refuses, so its wording cannot name one of them. A `.grooveignore`
-    /// over the cap is already a plain file and already readable — being told to
-    /// make it those things is a step that is already done.
-    ///
-    /// Asserting the two destinations get the *same* remedy is the point: one
-    /// branch, one wording, correct for reasons this test does not enumerate.
-    #[test]
-    fn every_destination_the_read_guard_refuses_gets_the_one_repair_remedy() {
-        let db = db_with_one_chunk();
-
-        let dir = LegacyKb::new("refused-dir");
-        dir.write(".kb-mcpignore", "notes/\n");
-        std::fs::create_dir_all(dir.0.join(".grooveignore")).expect("mkdir");
-
-        let big = LegacyKb::new("refused-size");
-        big.write(".kb-mcpignore", "notes/\n");
-        big.write(
-            ".grooveignore",
-            &"# padding\n".repeat(
-                (crate::exclusion::MAX_IGNORE_FILE_BYTES as usize / "# padding\n".len()) + 2,
-            ),
-        );
-        assert!(
-            std::fs::metadata(big.0.join(".grooveignore"))
-                .expect("stat")
-                .len()
-                > crate::exclusion::MAX_IGNORE_FILE_BYTES,
-            "the fixture has to be over the cap for this test to be about anything"
-        );
-
-        let remedy_of = |kb: &LegacyKb| -> String {
-            kb.report(&db)
-                .findings
-                .iter()
-                .find(|f| f.check == "indexed-despite-legacy-ignore")
-                .expect("reported whatever holds the destination")
-                .remedy
-                .to_string()
-        };
-
-        let oversized = remedy_of(&big);
-        // Equality alone would pass with both falling into the merge branch,
-        // which is the bug this is about. Pin the branch first.
-        assert!(
-            oversized.contains("applying no .grooveignore"),
-            "over the cap is a refusal like any other: {oversized}"
-        );
-        assert_eq!(
-            oversized,
-            remedy_of(&dir),
-            "one branch covers every refusal, so it says one thing"
-        );
-        assert!(
-            !oversized.contains("readable") && !oversized.contains("plain"),
-            "this file is already both; naming an attribute it has is a step already \
-             done: {oversized}"
-        );
-    }
-
-    /// The third state, and the reason the branch reads two signals rather than
-    /// one: a working `.grooveignore` takes the merge remedy, and only that
-    /// one. Occupancy alone cannot tell it from the case above.
-    #[test]
-    fn a_readable_grooveignore_gets_the_merge_remedy_and_not_the_repair_one() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("readabledest");
-        kb.write(".kb-mcpignore", "notes/\n");
-        kb.write(".grooveignore", "logs/\n");
-
-        let report = kb.report(&db);
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.check == "indexed-despite-legacy-ignore")
-            .expect("still reported; only the remedy changes");
-        assert!(
-            f.remedy.starts_with("copy the lines"),
-            "there is nothing to repair here: {}",
-            f.remedy
-        );
-    }
-
-    /// No remedy in this group tells anyone to delete anything — codex round 3
-    /// on PR #203, where "remove the old file" read the same whether or not the
-    /// new one was any good.
-    #[test]
-    fn no_remedy_here_asks_for_a_deletion() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("nodelete");
-        kb.write(".kb-mcpignore", "notes/\n");
-
-        for f in &kb.report(&db).findings {
-            assert!(
-                !f.remedy.contains("delete") && !f.remedy.contains("remove"),
-                "{}: {}",
-                f.check,
-                f.remedy
-            );
-        }
-    }
-
-    /// codex round 7 on PR #203: the check could not run and the report said
-    /// the index was clean.
-    #[test]
-    fn an_old_file_that_could_not_be_examined_is_a_finding_not_a_clean_bill() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("unreadable");
-        std::fs::create_dir_all(kb.0.join(".kb-mcpignore")).expect("mkdir");
-
-        let report = kb.report(&db);
-        assert!(
-            !report.is_clean(),
-            "a check that could not look must not report a clean bill"
-        );
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.check == "legacy-ignore-not-examined")
-            .expect("the check that could not run must say so");
-        assert_eq!(f.severity, Severity::Warning);
-        assert_eq!(f.count, 1);
-        // codex P2 round 6: this same finding is produced when the filesystem
-        // will not answer whether the name is taken at all, and the summary is
-        // one string for both. It may claim only what holds in both — that the
-        // check did not complete — with the observation itself left to the
-        // reason it carries.
-        assert!(
-            f.summary.contains("could not be completed"),
-            "the summary states the outcome of the check, not the state of a file it may \
-             not have seen: {}",
-            f.summary
-        );
-    }
-
-    /// codex round 3 on PR #203, the other half: an old file is not by itself a
-    /// problem. It becomes one when the index holds something it names.
-    #[test]
-    fn an_old_file_that_costs_nothing_today_is_not_a_finding() {
-        let db = db_with_one_chunk();
-        let kb = LegacyKb::new("harmless");
-        kb.write(".kb-mcpignore", "logs/\n");
-
-        let report = kb.report(&db);
-        assert!(
-            report.is_clean(),
-            "nothing indexed is under logs/, so there is nothing to say: {:?}",
-            report.findings
-        );
     }
 }

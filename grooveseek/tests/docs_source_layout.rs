@@ -1261,8 +1261,8 @@ fn no_row_names_a_file_or_directory_the_tree_does_not_have() {
          Paths compare as written, so a wrong case fails here on every platform. \
          Delete or rename the row in the commit that deletes or renames the file. \
          A bare name in a directory row is read as a file of that directory; to \
-         mention a file elsewhere, write its full path. `legacy.rs` is scheduled \
-         to go in 1.1.0 and will land here when it does; its row goes with it.",
+         mention a file elsewhere, write its full path. `legacy.rs` was deleted \
+         for 1.1.0 and surfaced here first; its row went in the same commit.",
         offenders.join("\n  ")
     );
 }
@@ -1346,13 +1346,13 @@ fn the_english_and_japanese_tables_list_the_same_paths_in_the_same_order_with_th
 // them as documentation). The tree and the expectations below are written by
 // hand from `git ls-tree`; deriving either from the walker would make these
 // tests agree with whatever it does rather than with what the repository held.
-// The tree is kept as a literal even though it equals today's tree: `legacy.rs`
-// is scheduled for deletion in 1.1.0, and a walker-derived tree would turn
-// "four missing, none stale" into "three missing, one stale" that day.
+// The tree is kept as a literal, and no longer equals today's tree: `legacy.rs`
+// was deleted for 1.1.0, and a walker-derived tree would now turn
+// "four missing, none stale" into "three missing, one stale".
 //
-// The frozen pages are not run against the live tree on purpose. Today the two
-// trees are identical, so the result would be the same four; the first file
-// added under `src` would make it five and teach whoever hit it to edit the
+// The frozen pages are not run against the live tree on purpose. The two trees
+// have diverged, and every file added under or removed from `src` moves them
+// further apart; a live comparison would teach whoever hit it to edit the
 // expectation, which is the rot this file exists to stop.
 // ---------------------------------------------------------------------------
 
