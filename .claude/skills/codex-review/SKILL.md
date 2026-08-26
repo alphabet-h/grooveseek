@@ -19,6 +19,53 @@ detection + 結果 fetch + 整形** する。`/feature-flow` Phase 6 の sub-ste
 上限は process を跨いで効く (controller が数えなくてよい、数えてはいけない)。
 前提: `gh auth status` OK、repo に codex connector app install 済。destructive 操作なし (GitHub へ comment を post するだけ)。
 
+## PR を開く前と、fix を push する前に doc comment の名前を洗う
+
+codex は `AGENTS.md` の rule 5 (「tree の中にあるものを名指しするならリンクにする」) を
+**字義どおり**適用する。人間の review が認める例外 — private item は module link + 散文、
+`tests/` は rustdoc の対象外 — を codex は認めず、**round を 1 つ使って P1 で返す**。
+PR #222 / #234 / #236 / #237 で起きていて、#234 では 3 round 連続した
+(台帳 `.dev/knowledge/repeat-offences-ledger.md` の category 4)。round は `<max_rounds>` で
+頭打ちなので、これは review に見つけさせるものではない。
+
+**打つのは 2 か所**: PR を開く直前と、**P0/P1 を直して再 push する直前**。指摘された行だけ
+直して push すると、同じ形が次の round で返ってくる (#234 / #236 はそれで round を溶かした):
+
+```bash
+git -C <abs> diff main...HEAD -- grooveseek/src grooveseek/tests crates | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c
+```
+
+角括弧を残して抽出しているので、**bare backtick と `` [`..`] `` が同じ出力の中で区別できる** —
+sweep は両方向で、リンクにし忘れた項とリンクにしてはいけない項の両方がここに並ぶ:
+
+| 出力の項 | どうするか |
+|---|---|
+| tree の中の item (fn / struct / const / module / test fn) が bare backtick | `` [`path`] `` に直す |
+| tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
+| `::` / 演算子 / `{}` / `;` を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` | **中の名前を 1 つずつほどいて**上の 2 行を適用する。#237 round 1 の P1 はこの形 |
+
+**identifier だけに絞らない。** 2 つ目の `grep` を `` '\[?`[A-Za-z_][A-Za-z0-9_:]*`\]?' `` にすると
+項は減る (#237 の diff で 170 → 100。via: 上のコマンドの `grep -oE` をそれに差し替え、末尾を
+`sort -u | wc -l` にして `fe7ac23...70dc178` で実行) が、落ちるのは表の 3 行目
+= 実際に P1 を受けた形なので、絞ると意味が無くなる。
+
+`` [`..`] `` の path の作り方 (実測は `.dev/knowledge/comments-the-compiler-cannot-see.md`):
+
+- **`//!` の中は bare 名も `self::` も解決しない。** 同じ file の item でも
+  `` [`crate::db::search`] `` と絶対で書く
+- `///` は同 scope なら bare でよい。`` [`Self::method`] `` も張れる
+- `tests/` crate から lib の **`pub`** item は `` [`grooveseek::db::ParsedQuery::match_expr`] ``
+  の形で書く。**`pub(crate)` は届かない**ので backtick + 散文。なお `tests/` の target は
+  `doc = false` なので、ここの link を検査するのは `cargo doc` ではなく codex だけ
+- 同じ `#[cfg(test)] mod tests` の中なら、隣の test fn 名は bare link
+- **リンクにできないものは backtick のまま残し、散文で持ち主 (module / file) を名指す**:
+  他 module に private な item / 非 test の doc から名指した `#[cfg(test)]` の item /
+  `tests/` crate から見た lib の `pub(crate)` item / 別の `tests/` crate の test fn
+
+**見えるのは追加行だけ** (`^+` で絞っている)。既存行に残った古い名前はここには出ない —
+そちらは `cargo doc` と review 側の仕事。分類の実例は
+`.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表。
+
 ## 1 round の回し方 (controller = main agent)
 
 Phase A 最大 600 s + quiet window 180 s で **tool の 10 分上限を超え得る**ので、`run_in_background` で回し、
