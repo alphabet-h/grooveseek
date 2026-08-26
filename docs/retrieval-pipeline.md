@@ -55,7 +55,7 @@ Every optional stage is a no-op when its config is off, so a v0.6.x configuratio
 
 `vec_chunks` (sqlite-vec, L2 distance — its default metric) and `fts_chunks` (FTS5 trigram over three columns since v0.12.0 — `heading`, `context`, `content` — scored with bm25 at a 2× heading weight by default) each return their own top-N. Reciprocal Rank Fusion combines them on the Rust side with `k = 60` by default (the standard RRF constant). The score returned to clients is the RRF score (higher = better), not a distance.
 
-**How the query reaches FTS5** (v0.16.0+): the query string is not sent as-is. `build_fts_query` compiles it into a set of quoted phrases joined with ` OR `:
+**How the query reaches FTS5** (v0.16.0+): the query string is not sent as-is. `parse_query` compiles it into a set of quoted phrases joined with ` OR `, and `ParsedQuery::match_expr` is the `MATCH` expression built from them:
 
 - A region you wrap in `"..."` is kept as a **verbatim phrase**, under FTS5's own doubled-quote convention (`""` inside a phrase is a literal `"`). A quoted phrase holding fewer than 3 characters is dropped.
 - Outside quotes, the query is cut into groups at separators (whitespace, punctuation, symbols), and each group is cut further at **script boundaries** — kanji / hiragana / katakana / other word characters. `再ランキングの評価について` yields the runs `再` / `ランキング` / `の` / `評価` / `について`.

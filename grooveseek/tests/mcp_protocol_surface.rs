@@ -454,8 +454,8 @@ fn the_tool_list_is_six_tools_with_the_caching_hints_the_spec_requires() {
 ///
 /// It is also the only test of the wiring that the default suite runs: the
 /// unit test in `server.rs` can build the envelope but cannot call
-/// `search_blocking`, which needs a real embedder, and
-/// `an_exclusion_only_query_is_refused_over_mcp` in
+/// `search_blocking` in `grooveseek/src/server/search.rs`, which needs a real
+/// embedder, and `an_exclusion_only_query_is_refused_over_mcp` in
 /// `tests/search_exclusion_integration.rs` — which checks the same refusal
 /// against a populated index — is `#[ignore]`d. Off `#[ignore]` for the same
 /// reason as its neighbours: the refusal lands before the index is consulted,

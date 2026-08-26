@@ -17,16 +17,21 @@
 //!
 //! Parsing a user query — the FTS5 MATCH expression it compiles to, the terms
 //! it excludes, and the text an embedder should see — lives in the sibling
-//! module `fts_query` (feature-48, v0.16.0; exclusions in feature-55). It
+//! module [`super::fts_query`] (feature-48, v0.16.0; exclusions in feature-55). It
 //! reaches here through `db.rs`'s `pub use fts_query::{ParsedQuery, parse_query};`
 //! plus the `use super::*;` below.
 //!
-//! A hybrid search parses **once**: [`Database::search_split_candidates`] hands
-//! the same [`ParsedQuery`] to both halves, so the phrases the full-text half
-//! searched for and the ids the vector half dropped cannot come from two
-//! different readings of the same string. The single-leg entry points
-//! (`search_fts_candidates`, `count_fts_matches`) parse for themselves — they
-//! are `tune`'s, and have no second half to agree with.
+//! A hybrid search parses **once inside this layer**:
+//! [`Database::search_split_candidates`] parses the raw string it was given and
+//! hands the same [`ParsedQuery`] to both halves, so the phrases the full-text
+//! half searched for and the ids the vector half dropped cannot come from two
+//! different readings of it. The request as a whole is parsed at the entry
+//! point as well — that parse is what the embedder, the reranker and the spans
+//! see — and the two readings agree because [`crate::db::parse_query`] is pure,
+//! not because there is only one of them. The single-leg entry points
+//! ([`crate::db::Database::search_fts_candidates`],
+//! [`crate::db::Database::count_fts_matches`]) parse for themselves — they are
+//! [`crate::tune`]'s, and have no second half to agree with.
 
 // The parent module is what this file was carved out of, so it keeps seeing
 // exactly what it saw before. A hand-written list would be a second thing to
@@ -116,12 +121,13 @@ impl Database {
 
     /// [`Self::search_fts_candidates`] の本体。解析済みのクエリを受ける形。
     ///
-    /// `search_split_candidates` は vector 半身と同じ [`ParsedQuery`] をここへ渡す。
+    /// [`Self::search_split_candidates`] は vector 半身と同じ [`ParsedQuery`] をここへ渡す。
     /// 文字列から作り直すと、除外に使う式と FTS が探す式が別々の解析結果になり得る。
     ///
     /// 除外がある場合の MATCH 式は `(正) NOT (負)` で、`NOT` は**式の中**にあるので
-    /// SQL の `LIMIT` は除外**後**の行に効く (公式 docs に記述が無いので
-    /// `the_limit_is_applied_after_the_exclusion_not_before` が実 SQLite で固定している)。
+    /// SQL の `LIMIT` は除外**後**の行に効く (公式 docs に記述が無いので、`db.rs` の
+    /// test module にある `the_limit_is_applied_after_the_exclusion_not_before` が
+    /// 実 SQLite で固定している)。
     pub(crate) fn search_fts_candidates_parsed(
         &self,
         query: &ParsedQuery<'_>,

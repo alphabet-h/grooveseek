@@ -2103,14 +2103,22 @@ mod tests {
     /// - `sqlite -vec` is the contract. Both halves of the search already drop
     ///   the excluded rows, so nothing downstream would notice a span that
     ///   covered `vec`; this row is what says the highlight follows the search.
-    ///   It passes on the raw query too — `query_phrases` reads the exclusion
-    ///   off the raw text as well, so the two inputs agree here.
+    ///   It passes on the raw query too — [`crate::db::query_phrases`] reads
+    ///   the exclusion off the raw text as well, so the two inputs agree here.
     /// - `xy -abc z` is the **detector**. Its positive terms are all under the
-    ///   trigram floor, so `compute_match_spans` falls through to splitting on
-    ///   whitespace, and that split has no idea what a `-` group means: handed
-    ///   the raw query it searches the hit for the literal `-abc` and finds it.
-    ///   That is the mutation the signature cannot catch, since
-    ///   `compute_match_spans` takes a `&str` either way.
+    ///   trigram floor, so [`crate::server::compute_match_spans`] falls through
+    ///   to splitting on whitespace, and that split has no idea what a `-`
+    ///   group means: handed the raw query it searches the hit for the literal
+    ///   `-abc` and finds it. So this row is what catches a
+    ///   [`crate::db::ParsedQuery::positive_text`] that returned the raw query.
+    ///
+    /// What it does **not** hold is the wiring. The closure below calls
+    /// [`crate::server::compute_match_spans`] itself, so this pins the
+    /// function's contract *given* the positive text; reverting a call site —
+    /// the spans call in `server/search.rs` or in `main.rs` — to `&params.query`
+    /// leaves it green. That those call sites, and the embedder and reranker
+    /// beside them, pass `positive_text()` is a review item (ADR-0011,
+    /// Confirmation), not something a test holds.
     #[test]
     fn match_spans_never_cover_an_excluded_term() {
         let covered = |query: &str, content: &str| -> Vec<String> {
@@ -4225,13 +4233,13 @@ mod tests {
     /// A query made only of exclusions is refused, and the refusal is the
     /// `error` envelope every other MCP failure uses.
     ///
-    /// `search_blocking` is a method on [`KbCore`], which owns a real
+    /// [`KbCore::search_blocking`] is a method on [`KbCore`], which owns a real
     /// [`crate::embedder::Embedder`] — there is no stub — so what a unit test
     /// can pin is the pair the tool body puts together: the decision
-    /// (`require_positive`) and the shape it is reported in. That the two are
-    /// actually wired to each other is pinned over the wire by
-    /// `an_exclusion_only_query_is_refused_over_the_protocol` in
-    /// `tests/mcp_protocol_surface.rs`.
+    /// ([`crate::db::ParsedQuery::require_positive`]) and the shape it is
+    /// reported in. That the two are actually wired to each other is pinned
+    /// over the wire by `an_exclusion_only_query_is_refused_over_the_protocol`
+    /// in `tests/mcp_protocol_surface.rs`.
     #[test]
     fn an_exclusion_only_query_is_refused_with_the_error_envelope() {
         for query in ["-foo", "-\"ab\"", "-a -b"] {

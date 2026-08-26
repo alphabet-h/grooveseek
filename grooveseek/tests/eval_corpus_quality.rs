@@ -58,7 +58,7 @@
 //! | BGE-M3, candidate over-fetch removed | 0.50 | 1.00 | 1.000 | 0.913 |
 //!
 //! The broken rows come from scratch builds: the full-text leg's MATCH
-//! expression (`db::fts_query::ParsedQuery::match_expr`, named
+//! expression ([`grooveseek::db::ParsedQuery::match_expr`], named
 //! `build_fts_query` when these were measured) returning `None`,
 //! `search_split_candidates` returning an empty vector-leg list, and
 //! `search_hybrid_candidates` asking for `limit` candidates instead of

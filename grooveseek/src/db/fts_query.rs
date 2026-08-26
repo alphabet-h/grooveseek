@@ -77,15 +77,16 @@ const MIN_PHRASE_CHARS: usize = 3;
 /// OR で並べる phrase 数の上限 (DoS / 式肥大ガード。AU-17 の list 上限の前例に倣う)。
 const MAX_PHRASES: usize = 32;
 
-/// 走査後の区間。`Quoted` は `""` を literal `"` へ畳んだ**後**の内容を持つ。
+/// 走査後の区間。[`Segment::Quoted`] は `""` を literal `"` へ畳んだ**後**の内容を持つ。
 ///
-/// `Excluded*` は group 先頭の `-` で始まっていた区間 (F-4)。`-` そのものは
-/// 内容に含めない。極性が違うだけで、この先の phrase 化は正側と同じ関数を通る。
+/// [`Segment::ExcludedQuoted`] と [`Segment::ExcludedPlain`] は group 先頭の `-` で
+/// 始まっていた区間 (F-4)。`-` そのものは内容に含めない。極性が違うだけで、この先の
+/// phrase 化は正側と同じ関数を通る。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment<'a> {
     Quoted(String),
     Plain(&'a str),
-    /// `-"..."`: 逐語 phrase として除外する。doubled-quote 規約は `Quoted` と同じ。
+    /// `-"..."`: 逐語 phrase として除外する。doubled-quote 規約は [`Segment::Quoted`] と同じ。
     ExcludedQuoted(String),
     /// `-word`: `-` の直後から次の whitespace まで。正側と同じ規則で token 化して除外する。
     ExcludedPlain(&'a str),
@@ -548,9 +549,12 @@ const EXCLUSION_ONLY_MESSAGE: &str = concat!(
 /// クエリを解析した結果。**1 回の走査**で「埋め込む文字列」「FTS が探す phrase」
 /// 「FTS が除外する phrase」を確定して持ち回るための型 (F-4)。
 ///
-/// entry point (MCP / CLI / golden の load) がこれを 1 個作り、DB 層と embedder の
-/// 両方へ渡す。文字列を二度解析しないので、「FTS が探した語」と「埋め込んだ文字列」が
-/// 食い違いようがない。
+/// entry point (MCP / CLI / golden の load) がこれを 1 個作り、拒否判定・embedder・
+/// reranker・span・echo をすべてその 1 個から賄う。DB 層は `&str` の API のままなので
+/// raw を受け取り、[`crate::db::Database::search_split_candidates`] の中で自分でもう
+/// 一度解析する (FTS 半身と vector 半身はそこの 1 回の解析を共有する)。2 つの解析結果が
+/// 食い違わないのは「一度しか解析しないから」ではなく、[`parse_query`] が純関数だから
+/// である。
 ///
 /// 「その chunk は除外語を含むか」の判定は**すべて FTS5 に委ねる**: FTS 半身は
 /// [`Self::match_expr`] の `NOT` を native に評価し、vector 半身も同じ
@@ -635,8 +639,8 @@ impl<'a> ParsedQuery<'a> {
     }
 
     /// 除外 group を切り落とした文字列。embedder / reranker / citation の span は
-    /// こちらを見る — raw を渡すと `sqlite -vec` の `-vec` が
-    /// `sqlite-vec` にハイライトを当ててしまう。
+    /// こちらを見る — 正側が全部 trigram 下限を割る `xy -abc z` に raw を渡すと、
+    /// span 側が whitespace fallback に落ちて literal な `-abc` をハイライトする。
     pub fn positive_text(&self) -> &str {
         &self.positive_text
     }
@@ -665,7 +669,7 @@ impl<'a> ParsedQuery<'a> {
     /// 3 つの entry point (MCP / CLI / golden の load) が共有する拒否。
     ///
     /// **DB 層はこれを呼ばない**。`search_fts_candidates("-abc")` は今日どおり
-    /// `Ok(vec![])` を返す (`db::tests` の proptest がそれを要求する) — 拒否は
+    /// `Ok(vec![])` を返す (`db.rs` の test module にある proptest がそれを要求する) — 拒否は
     /// 「利用者に言い直してもらう」ための入口の判断であって、検索そのものの失敗ではない。
     pub fn require_positive(&self) -> anyhow::Result<()> {
         if self.is_exclusion_only() {
@@ -712,11 +716,11 @@ impl<'a> ParsedQuery<'a> {
 
     /// 切り詰めの警告 (BU-31) を出す。**1 検索につき 1 回**だけ呼ぶこと。
     ///
-    /// `server::compute_match_spans` は citation の offset を求めるために**ヒットごとに**
-    /// [`query_phrases`] を呼ぶので、分割側で警告すると N 件返したクエリが同じ警告を
-    /// N+1 回出す (codex review P2、PR #138)。稀にしか出ないことが信号としての価値を
-    /// 作っているので、それを潰さない。production の呼び出し点は
-    /// [`crate::db::Database`] の `search_fts_candidates_parsed` だけ。
+    /// [`crate::server::compute_match_spans`] は citation の offset を求めるために
+    /// **ヒットごとに** [`query_phrases`] を呼ぶので、分割側で警告すると N 件返した
+    /// クエリが同じ警告を N+1 回出す (codex review P2、PR #138)。稀にしか出ないことが
+    /// 信号としての価値を作っているので、それを潰さない。production の呼び出し点は
+    /// [`crate::db::Database::search_fts_candidates_parsed`] だけ。
     ///
     /// 上限に当たって落ちるのはクエリ**末尾**の phrase なので、検索は成功したまま
     /// recall だけが静かに下がる — 気付けない類の劣化である。dogfood の golden 37 件では
@@ -737,13 +741,16 @@ impl<'a> ParsedQuery<'a> {
 
 /// FTS へ投げる phrase の**中身**を、式に組み立てる前の形で返す (手順 1〜5)。
 ///
-/// [`parse_query`] の途中結果だが、`server::compute_match_spans` も同じ分割を
+/// [`parse_query`] の途中結果だが、[`crate::server::compute_match_spans`] も同じ分割を
 /// 必要とする。あちらが独自に whitespace 分割していると、`"Foundry Local"` のような
 /// quote 付きクエリで `"Foundry` / `Local"` を探しにいって citation の offset が
 /// 空になる (FTS は当たっているのにハイライトだけ消える)。**分割規則は 1 か所に置く。**
 ///
 /// 除外 phrase は**含まない** — 除外語はハイライトする対象ではない。span を求める側は
-/// [`ParsedQuery::positive_text`] を渡すので、その入力から出る phrase 列と一致する。
+/// [`ParsedQuery::positive_text`] を渡すので、その入力から出る phrase 列は raw から出る
+/// ものと一致する — quote された除外の直後に literal なハイフンが続く `foo -"bar"-baz`
+/// を除いて。この 1 例だけは positive text 側が `-baz` を 2 つ目の除外として読み直す
+/// (ADR-0011 の帰結。検索結果は変わらず、失われるのは highlight だけ)。
 ///
 /// 空 `Vec` は「token 化では phrase を作れなかった」= 呼び出し側が全体 fallback を
 /// 判断する、の意味。
@@ -754,11 +761,12 @@ pub(crate) fn query_phrases(raw: &str) -> Vec<String> {
 /// 旧入口。**テスト専用**に残してある。
 ///
 /// 戻り値は今日と同じ**正側だけの OR 式**で、除外は含まない: proptest
-/// `every_phrase_is_a_substring_of_the_input` は戻り値を `" OR "` で割って raw の
-/// 部分文字列であることを要求し、`build_fts_query_never_exceeds_the_phrase_cap` は
-/// 同じ割り方で個数を数えるので、括弧付きの `NOT` 式を返すと両方が落ちる。
+/// [`tests::every_phrase_is_a_substring_of_the_input`] は戻り値を `" OR "` で割って raw
+/// の部分文字列であることを要求し、[`tests::build_fts_query_never_exceeds_the_phrase_cap`]
+/// は同じ割り方で個数を数えるので、括弧付きの `NOT` 式を返すと両方が落ちる。
 ///
-/// 警告をここで出すのは `the_truncation_warning_fires_once_per_search_not_once_per_hit`
+/// 警告をここで出すのは
+/// [`tests::the_truncation_warning_fires_once_per_search_not_once_per_hit`]
 /// が「1 検索 1 回」をこの関数経由の発火回数で数えているため。production の発火点は
 /// [`ParsedQuery::warn_if_truncated`]。
 #[cfg(test)]
@@ -1649,8 +1657,13 @@ mod tests {
         }
 
         /// span 用の分割 ([`query_phrases`]) を positive text に対して行っても、
-        /// FTS が実際に探した phrase と一致する。`compute_match_spans` に
-        /// positive text を渡してよい根拠がこれ。
+        /// FTS が実際に探した phrase と一致する。[`crate::server::compute_match_spans`]
+        /// に positive text を渡してよい根拠がこれ。
+        ///
+        /// 成り立つのは「quote された除外の直後に literal なハイフンが続かない」
+        /// クエリで、`foo -"bar"-baz` がその例外 (ADR-0011)。この proptest の
+        /// alphabet `[^"]{0,120}` は quote を作れないので例外は生成され得ず、
+        /// ここで固定できるのは例外を除いた側だけである。
         #[test]
         fn the_include_phrases_of_the_positive_text_are_the_include_phrases_of_the_raw_query(
             raw in "[^\"]{0,120}"

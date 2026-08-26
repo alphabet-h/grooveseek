@@ -61,7 +61,8 @@ of 5,000 chunks — the worst case, an excluded term present in every row —
 against 3.5855ms for the ranked FTS query it accompanies in the same search
 (measured:
 `cargo test -p grooveseek --release --lib the_exclusion_id_scan_stays_cheaper_than_the_ranked_fts_query -- --ignored --nocapture`).
-The scan stays under a quarter of the cost of the query it rides alongside.
+The scan stays at just over a quarter of the cost of the query it rides
+alongside.
 
 ### Interface changes
 
@@ -117,12 +118,15 @@ The scan stays under a quarter of the cost of the query it rides alongside.
 - proptest `positive_text_equals_the_raw_query_when_no_group_is_excluded`
   pins that a query without an exclusion embeds, compiles and evaluates
   exactly as it did before this decision.
-- **Not held by a type**: that the embedder and the reranker actually
-  receive `positive_text()` rather than the raw query. Both legs of the
-  hybrid already drop the excluded rows, so an integration test cannot see
-  the difference if a future change quietly reverts to embedding raw input
-  — `match_spans_never_cover_an_excluded_term` catches this for spans but
-  not for embedding or reranking. This is a review item, not a guard.
+- **Not held by a type**: that the embedder, the reranker and the spans call
+  actually receive `positive_text()` rather than the raw query. Both legs of
+  the hybrid already drop the excluded rows, so an integration test cannot
+  see the difference if a future change quietly reverts to raw input.
+  `match_spans_never_cover_an_excluded_term` does not close this for spans
+  either: it calls `compute_match_spans(parsed.positive_text(), …)` itself,
+  so what it pins is that function's behaviour *given* the positive text,
+  and a call site reverted to the raw query leaves it green. All three call
+  sites are a review item, not a guard.
 
 ## More Information
 

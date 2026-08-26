@@ -463,11 +463,12 @@ fn groove_search_reads_rerank_by_default_from_the_config_file() {
 /// expensive happens, and the refusal reaches stderr.
 ///
 /// **Not `#[ignore]`d, and that is the assertion.** The refusal sits ahead of
-/// `require_kb_path`, the model load and the database open, so this test needs
-/// none of them — it points `--kb-path` at an empty directory that has never
-/// been indexed and still expects the sentence. If the check ever drifted
-/// below the model load, this test would start needing a 130 MB download to
-/// pass, which is the failure showing up as a cost rather than as a red test.
+/// `require_kb_path` in `grooveseek/src/main.rs`, the model load and the
+/// database open, so this test needs none of them — it points `--kb-path` at
+/// an empty directory that has never been indexed and still expects the
+/// sentence. If the check ever drifted below the model load, this test would
+/// start needing a 130 MB download to pass, which is the failure showing up as
+/// a cost rather than as a red test.
 ///
 /// The `--` is load-bearing: `-foo` is a value that starts with a hyphen, and
 /// the argument parser reads it as flags (`-f -o -o`) and exits 2 long before
@@ -514,8 +515,8 @@ fn an_exclusion_only_query_fails_on_stderr_and_exits_non_zero() {
 ///
 /// Both directions, because the absence is the half a caller has to be able to
 /// read: `excluded_terms` present means rows were dropped, and the key missing
-/// means none were — the rule `SearchFilterEcho::new` applies to every other
-/// list in the echo.
+/// means none were — the rule [`grooveseek::server::SearchFilterEcho::new`]
+/// applies to every other list in the echo.
 #[test]
 #[ignore] // requires built binary + embedding model download
 fn the_command_line_echoes_excluded_terms_in_json() {

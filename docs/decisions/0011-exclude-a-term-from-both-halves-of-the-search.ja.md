@@ -55,7 +55,7 @@ chunk を再び拾い上げてしまい、「除外した」と報告しなが�
 (best of 5) と実測した。同じ検索に伴う ranking 付き FTS query の 3.5855ms に
 対する比であり (measured:
 `cargo test -p grooveseek --release --lib the_exclusion_id_scan_stays_cheaper_than_the_ranked_fts_query -- --ignored --nocapture`)、
-併走する query のコストの 4 分の 1 未満に収まる。
+併走する query のコストの 4 分の 1 強にとどまる。
 
 ### インタフェースの変更
 
@@ -104,12 +104,14 @@ chunk を再び拾い上げてしまい、「除外した」と報告しなが�
 - proptest `positive_text_equals_the_raw_query_when_no_group_is_excluded` が、
   除外の無いクエリは本決定より前と同じに埋め込み・コンパイル・評価される
   ことを固定する
-- **型では担保していない**: embedder と reranker が実際に raw ではなく
-  `positive_text()` を受け取っていること。ハイブリッドの両脚は既に除外行を
-  落としているので、将来の変更が静かに raw の埋め込みへ戻しても integration
-  test では見分けが付かない — `match_spans_never_cover_an_excluded_term` は
-  span についてはこれを検出するが、embedding や reranking については検出
-  しない。これは review 項目であり、guard ではない
+- **型では担保していない**: embedder と reranker と span 計算が実際に raw では
+  なく `positive_text()` を受け取っていること。ハイブリッドの両脚は既に除外行を
+  落としているので、将来の変更が静かに raw へ戻しても integration test では
+  見分けが付かない。`match_spans_never_cover_an_excluded_term` は span について
+  もこれを塞がない: このテスト自身が `compute_match_spans(parsed.positive_text(),
+  …)` を呼ぶので、固定できるのは「positive text を**渡されたとき**の当該関数の
+  振る舞い」であり、呼び出し側が raw へ戻っても緑のままである。3 つの呼び出し点は
+  いずれも review 項目であり、guard ではない
 
 ## 参考
 

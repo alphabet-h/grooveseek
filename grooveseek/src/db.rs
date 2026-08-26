@@ -2308,7 +2308,7 @@ mod tests {
         }
     }
 
-    /// `every_generated_expression_is_accepted_by_fts5` の兄弟。除外を含む形の式が
+    /// [`every_generated_expression_is_accepted_by_fts5`] の兄弟。除外を含む形の式が
     /// SQLite に受理されること (escape 崩れ / NUL / 括弧の対応はここでしか捕まらない)。
     #[test]
     fn every_generated_expression_with_an_exclusion_is_accepted_by_fts5() {
@@ -3263,10 +3263,11 @@ mod tests {
 
     /// (F-4) 除外が足す仕事の値段を、それが濾す検索そのものと比べて測る。
     ///
-    /// `excluded_chunk_ids` は bm25 も `ORDER BY` も `LIMIT` も持たない rowid 走査 1 回で、
-    /// vector 半身から落とす id 集合を作る。BU-03 が測ったのは「32 arm の OR が単一
-    /// phrase の何倍か」= 式の幅の値段で、こちらは「順位を付けない走査が、同じ母集団に
-    /// 順位を付ける検索の何倍か」= 除外が 1 検索に足す値段。
+    /// [`Database::excluded_chunk_ids`] は bm25 も `ORDER BY` も `LIMIT` も持たない
+    /// rowid 走査 1 回で、vector 半身から落とす id 集合を作る。BU-03 が測ったのは
+    /// 「32 arm の OR が単一 phrase の何倍か」= 式の幅の値段で、こちらは「順位を
+    /// 付けない走査が、同じ母集団に順位を付ける検索の何倍か」= 除外が 1 検索に
+    /// 足す値段。
     ///
     /// 負の式は**ほぼ全行にマッチする**もの (`-について`) を選ぶ。除外語が稀なら
     /// doclist が短くて安いのは自明なので、測る値打ちがあるのは最悪形の方。

@@ -131,7 +131,8 @@ pub struct QueryDiagnostics {
     ///
     /// feature-48 以前は「クエリ全体という単一 phrase の doc-freq」だったが、現在は
     /// [`crate::db::parse_query`] が生む **OR 集合の和集合**の大きさであり、個々の
-    /// phrase の doc-freq の**上界**でしかない (下の `idf_clamped` の注記を参照)。
+    /// phrase の doc-freq の**上界**でしかない (下の [`QueryDiagnostics::idf_clamped`]
+    /// の注記を参照)。
     ///
     /// feature-55 以降は**除外を適用した後**の数でもある: `-term` を書いたクエリでは
     /// [`crate::db::ParsedQuery::match_expr`] が `(正) NOT (負)` になるので、除外語を

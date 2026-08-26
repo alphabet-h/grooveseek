@@ -55,7 +55,7 @@ match_spans  → top-`limit` SearchHit を
 
 `vec_chunks` (sqlite-vec、L2 距離 — sqlite-vec 既定のメトリック) と `fts_chunks` (v0.12.0 以降は `heading` / `context` / `content` の 3 列に対する FTS5 trigram を bm25 でスコアリング、既定では見出しに 2 倍重み) からそれぞれ top-N を取り、Rust 側で Reciprocal Rank Fusion (既定 `k = 60`、RRF の標準定数) でマージする。クライアントに返す `score` は RRF スコア (大きいほど良い) で距離ではない。
 
-**クエリが FTS5 に届くまで** (v0.16.0+): クエリ文字列はそのまま投げられるわけではない。`build_fts_query` がクエリを quoted phrase の集合にコンパイルし、` OR ` で結合する:
+**クエリが FTS5 に届くまで** (v0.16.0+): クエリ文字列はそのまま投げられるわけではない。`parse_query` がクエリを quoted phrase の集合にコンパイルして ` OR ` で結合し、そこから組み立てた `MATCH` 式が `ParsedQuery::match_expr` である:
 
 - `"..."` で囲んだ区間は **逐語 phrase** として温存される。規約は FTS5 自身の doubled-quote 規約と同じ (phrase 内の `""` は literal な `"` 1 文字)。内容が 3 文字未満の quoted phrase は落とす
 - quote の外は、まず Separator (空白・句読点・記号) で群に割り、さらに群の中を **文字種境界** (漢字 / ひらがな / カタカナ / それ以外の語構成文字) で割る。`再ランキングの評価について` は `再` / `ランキング` / `の` / `評価` / `について` の run になる

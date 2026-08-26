@@ -147,8 +147,9 @@ impl GoldenSet {
     /// run", so a query that quietly returned nothing would land in the
     /// recall and MRR denominators as a genuine zero and drag the reported
     /// numbers down without saying why. It is a broken golden in the same
-    /// sense an unknown field is, and fixing it changes `golden_hash`, which
-    /// is exactly what should happen to a history comparison across the fix.
+    /// sense an unknown field is, and fixing it changes
+    /// [`ConfigFingerprint::golden_hash`], which is exactly what should happen
+    /// to a history comparison across the fix.
     pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
         // See [`is_present`]: a dangling symlink is a name that is taken, and
         // "there is no golden file" would be the wrong thing to say about it.
@@ -2007,9 +2008,10 @@ mod tests {
     /// is refused at the read rather than scored as a miss.
     ///
     /// Both routes in are checked, because they are two functions and only one
-    /// of them carries the loop: `tune` reaches the golden through
-    /// [`GoldenSet::load`] and `eval` through [`GoldenSet::load_with_bytes`],
-    /// exactly as `both_ways_into_the_golden_share_the_bound` says of the size
+    /// of them carries the loop: [`crate::tune`] reaches the golden through
+    /// [`GoldenSet::load`] and [`crate::eval`] through
+    /// [`GoldenSet::load_with_bytes`], exactly as
+    /// [`both_ways_into_the_golden_share_the_bound`] says of the size
     /// cap. The context names the query, because a golden with forty entries
     /// and one bad line is otherwise a hunt.
     #[test]
