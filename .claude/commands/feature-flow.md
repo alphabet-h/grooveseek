@@ -25,7 +25,10 @@ Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっ
 - `.dev/` が **それ自体の private repository** として初期化済 (`git -C .dev rev-parse --show-toplevel` が
   `/.dev` で終わる)。root repo は `.dev/` を `.git/info/exclude` で除外しているだけ (ADR-0000) なので、
   nested repo が無い checkout では `git -C .dev` が**親 repo を拾う** — その状態で Phase 6 step 6 の
-  push を実行してはいけない
+  push を実行してはいけない。本 command が読む `.dev/release-checklist.md` / `.dev/feature-ideas.md` /
+  `.dev/knowledge/*.md` も、書き出す `.dev/specs/` `.dev/plans/` `.dev/knowledge/` も、すべてこの
+  private repo 側にある。**公開 repo を clone しただけの checkout には無い**ので、本 command は
+  そのままでは動かない (= owner 用の workflow で、手順を公開側へ写して二重化することはしない)
 - `CLAUDE.local.md` の「開発フロー」節 (本 command の常時 guardrail) を遵守する
 
 ## ユーザ介入ポイントの最小化方針

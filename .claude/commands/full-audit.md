@@ -20,6 +20,9 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 - `.dev/knowledge/` と `.dev/features.json` の運用ルール (`CLAUDE.local.md`) が有効
 - subagent type: `feature-dev:code-reviewer`, `general-purpose` が available
 - 過去 audit の実例: `.dev/knowledge/review-2026-04-29-full-audit.md`
+- `.dev/` は `.git/info/exclude` で公開 repo の追跡外にある owner 側の private repo。本 command が
+  参照する `.dev/release-checklist.md` も書き出す `.dev/knowledge/` もそちらにあり、**公開 repo を
+  clone しただけの checkout には無い**。内容を公開側へ写して二重化することはしない
 
 ## 実行フロー
 
