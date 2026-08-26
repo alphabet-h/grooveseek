@@ -109,6 +109,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 各 phase の最後で:
 
+0. **push の前に doc comment の名前を洗う — この branch を push するたび、毎回。** PR を開く前も、review の指摘を直した後も同じで、P0/P1 の fix だけでなく**収束した round の P2/P3 を取り込んだ push も含む**。指摘された行だけ直して push すると同じ形が次の round で返り、収束後の取り込みはそのまま merge へ行く (#234 / #236 はそれで round を溶かした)。手順は `.claude/skills/codex-review/SKILL.md` の「push する前に doc comment の名前を洗う」節。sweep のコマンドと判定はそこにあり、ここには写さない (step 4 の注意と同じ理由)
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
 3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。1 round = `scripts/codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
