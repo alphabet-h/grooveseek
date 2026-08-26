@@ -17,9 +17,9 @@
 //!
 //! Parsing a user query — the FTS5 MATCH expression it compiles to, the terms
 //! it excludes, and the text an embedder should see — lives in the sibling
-//! module [`super::fts_query`] (feature-48, v0.16.0; exclusions in feature-55). It
-//! reaches here through `db.rs`'s `pub use fts_query::{ParsedQuery, parse_query};`
-//! plus the `use super::*;` below.
+//! module [`super::fts_query`] (feature-48, v0.16.0; exclusions in feature-55).
+//! `db.rs` re-exports [`crate::db::ParsedQuery`] and [`crate::db::parse_query`]
+//! from it, and this module sees both through the `use super::*;` below.
 //!
 //! A hybrid search parses **once inside this layer**:
 //! [`Database::search_split_candidates`] parses the raw string it was given and
@@ -39,7 +39,10 @@
 use super::*;
 /// filter (category / topic) を Rust 側で適用する際の KNN / FTS の over-fetch 倍率。
 /// filter が選択的な場合に target `limit` 件に届くよう多めに候補を取る。
-const FILTER_OVERFETCH_FACTOR: u32 = 10;
+///
+/// `pub(super)` なのは、除外の再取得テストが「最初の枠を埋め尽くす数」をこの値から
+/// 導くため — 10 を書き写すと、倍率を変えた日にテストが黙って意味を失う。
+pub(super) const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
 /// `any_pool` が空なら常に pass (= フィルタ無効)。
@@ -436,7 +439,29 @@ impl Database {
     ///
     /// `excluded` は [`Self::excluded_chunk_ids`] が返す「負の FTS 式にマッチした行」で、
     /// filter と同じく Rust 側で 1 行ずつ落とす。**空集合なら
-    /// [`Self::search_vec_candidates`] と bit-exact** — over-fetch の条件にも入らない。
+    /// [`Self::search_vec_candidates`] と bit-exact** — over-fetch の条件にも入らず、
+    /// KNN も下の再取得ループを 1 周しかしない。
+    ///
+    /// # 除外があるときだけ回す再取得ループ (codex review round 1、P2)
+    ///
+    /// 倍率をかけた枠は**除外だけで尽きうる**。`-について` のように大半の chunk に
+    /// 当たる除外語なら、最も近い `limit` × [`FILTER_OVERFETCH_FACTOR`] 件が全部
+    /// 除外語を持つことは普通に起きる。1 回きりの KNN だと、その 1 件後ろに適格な近傍がいても
+    /// 0 件で返る。そこで [`Self::fetch_vec_page`] を呼び直し、次のどれかが成り立つまで
+    /// `fetch_k` を倍にする:
+    ///
+    /// - `limit` 件埋まった
+    /// - `excluded` が空 (= filter だけで枠が空になる目減りは feature-26 以来の既存挙動で、
+    ///   ここで直す話ではない)
+    /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
+    /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
+    ///
+    /// KNN に cursor は無いので、各回は**最初から引き直して結果を作り直す** (追記すると
+    /// 重複する)。最悪ケースは「除外語がほぼ全近傍に当たる」場合の、`k` に
+    /// [`VEC_KNN_MAX_K`] を取った KNN 1 回ぶんで、そこで打ち切る。
+    /// 2 回目以降の `fetch_k` は [`FILTER_OVERFETCH_CAP`] を超え得るが
+    /// [`VEC_KNN_MAX_K`] 以下には収まる (AU-01 の事前確保の話は
+    /// [`Self::fetch_vec_page`] 側の注記を参照)。
     pub(crate) fn search_vec_candidates_excluding(
         &self,
         query_embedding: &[f32],
@@ -448,7 +473,7 @@ impl Database {
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。
         // 除外も同じ理由で広げる — 最近傍が除外語を含むだけで limit が埋まらなくなる。
-        let fetch_k = if filters.has_any() || !excluded.is_empty() {
+        let mut fetch_k = if filters.has_any() || !excluded.is_empty() {
             limit
                 .saturating_mul(FILTER_OVERFETCH_FACTOR)
                 .min(FILTER_OVERFETCH_CAP)
@@ -463,6 +488,36 @@ impl Database {
         // (82*5*10 = 4100 > 4096)。候補が減るだけの degrade に倒す。
         .min(VEC_KNN_MAX_K);
         let embedding_json = serde_json::to_string(query_embedding)?;
+
+        loop {
+            let (rows_seen, out) =
+                self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
+            if out.len() >= limit as usize
+                || excluded.is_empty()
+                || rows_seen < fetch_k as usize
+                || fetch_k >= VEC_KNN_MAX_K
+            {
+                return Ok(out);
+            }
+            fetch_k = fetch_k.saturating_mul(2).min(VEC_KNN_MAX_K);
+        }
+    }
+
+    /// KNN を 1 回だけ引き、行ごとの連言 (除外 → filter 群) を通したものを返す。
+    ///
+    /// 戻り値の第 1 要素は**クエリから読んだ行数**。`fetch_k` に満たなければ
+    /// corpus を読み切ったということなので、呼び出し側はそこで再取得をやめる。
+    /// `limit` 件埋まった時点で読むのをやめるため、その場合の行数は `fetch_k` より
+    /// 小さくなるが、そのときは呼び出し側の「埋まった」条件が先に成立するので
+    /// 読み切り判定には使われない。
+    fn fetch_vec_page(
+        &self,
+        embedding_json: &str,
+        fetch_k: u32,
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        excluded: &HashSet<i64>,
+    ) -> Result<(usize, Vec<(i64, SearchResult)>)> {
         let sql = "
             SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
@@ -473,6 +528,8 @@ impl Database {
             WHERE v.embedding MATCH ?1 AND k = ?2
             ORDER BY v.distance
         ";
+        #[cfg(test)]
+        VEC_KNN_ATTEMPTS.with(|c| c.set(c.get() + 1));
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![embedding_json, fetch_k], |row| {
             let chunk_id: i64 = row.get(0)?;
@@ -498,10 +555,12 @@ impl Database {
         // 呼び出し側で cap されない値が来うるため、これを直接使うと
         // `Vec::with_capacity(u32::MAX)` = allocation abort になる
         // (full-audit 2026-07-26 AU-01: 実機で 927 GB 確保を試みて即死)。
-        // `fetch_k` は上の `FILTER_OVERFETCH_CAP` clamp を通っており、
-        // filter 無しの経路でも `FILTER_OVERFETCH_CAP` を上限として扱う。
+        // `fetch_k` は呼び出し側で `VEC_KNN_MAX_K` に clamp 済みなので、再取得で
+        // 倍にしていってもここは 4096 要素で頭打ちになる。
         let mut out = Vec::with_capacity(fetch_k.min(FILTER_OVERFETCH_CAP) as usize);
+        let mut rows_seen = 0usize;
         for row in rows {
+            rows_seen += 1;
             let (
                 chunk_id,
                 distance,
@@ -571,6 +630,6 @@ impl Database {
                 break;
             }
         }
-        Ok(out)
+        Ok((rows_seen, out))
     }
 }

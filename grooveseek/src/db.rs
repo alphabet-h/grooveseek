@@ -63,6 +63,20 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// KNN queries issued by `Database::search_vec_candidates_excluding` on the
+// current thread — *attempts*, not calls: an exclusion that empties the
+// over-fetch makes it widen `k` and ask again, and the difference between
+// "asked once" and "asked twice" is the only thing that distinguishes the
+// re-fetch loop from the single fetch it replaced.
+//
+// Thread-local and reset-before-use for the same reasons as
+// `FTS_CANDIDATE_CALLS` above.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static VEC_KNN_ATTEMPTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Fusion (RRF + FTS5 bm25 column weight) の実行時パラメータ。
 ///
 /// feature-47 以前はすべてコンパイル時定数だった。`[search.fusion]` から
@@ -2260,6 +2274,98 @@ mod tests {
             "with k=1 the KNN returns only the excluded chunk and the caller gets nothing"
         );
         assert_eq!(hits[0].1.path, "next.md");
+    }
+
+    /// (codex review round 1, P2) over-fetch の**枠そのもの**が除外で尽きる形。
+    ///
+    /// 倍率をかけた 1 回きりの KNN では、最初の 1 枠 (`limit` に over-fetch 倍率を
+    /// かけた件数) が全部除外語を持っていれば、その 1 件後ろに適格な近傍がいても 0 件で返る
+    /// (`-について` のように大半の chunk に当たる除外語で現実に起きる)。
+    /// 埋まるまで `k` を倍にして取り直すこと、を固定する。
+    #[test]
+    fn exclusion_keeps_fetching_until_the_limit_is_filled() {
+        let db = db_with_384();
+        // 最初の枠 (limit=1 なので FILTER_OVERFETCH_FACTOR 件) を除外語だけで
+        // 埋め尽くし、適格な chunk はその後ろに置く。件数は定数から導く —
+        // 10 を書き写すと、倍率を変えた日にこのテストが黙って意味を失う。
+        let planted = crate::db::search::FILTER_OVERFETCH_FACTOR + 2;
+        for i in 0..planted {
+            add_fts_doc(
+                &db,
+                &format!("drop{i:02}.md"),
+                "D",
+                "tokio async runtime",
+                0.5 - (i as f32 + 1.0) * 0.001,
+            );
+        }
+        add_fts_doc(
+            &db,
+            "keep.md",
+            "K",
+            "tokio runtime basics",
+            0.5 - (planted as f32 + 1.0) * 0.001,
+        );
+
+        let excluded = db.excluded_chunk_ids(Some("(\"async\")")).unwrap();
+        assert_eq!(
+            excluded.len(),
+            planted as usize,
+            "fixture: every chunk nearer than keep.md holds the excluded term"
+        );
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(
+                &dummy_embedding(0.5),
+                1,
+                &SearchFilters::default(),
+                &excluded,
+            )
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the eligible neighbour sits just past the first over-fetch window"
+        );
+        assert_eq!(hits[0].1.path, "keep.md");
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            2,
+            "the first window was exhausted, so the KNN had to be widened once"
+        );
+    }
+
+    /// 除外が無いクエリでは KNN は **1 回**。filter だけで枠が空になっても
+    /// 取り直さない — それは feature-26 以来の既存挙動で、除外の再取得ループが
+    /// 巻き込んで変えてよいものではない。
+    #[test]
+    fn a_query_without_exclusions_fetches_once() {
+        let db = db_with_384();
+        for i in 0..(crate::db::search::FILTER_OVERFETCH_FACTOR + 2) {
+            add_fts_doc(
+                &db,
+                &format!("q{i:02}.md"),
+                "Q",
+                "tokio runtime",
+                0.5 - (i as f32 + 1.0) * 0.001,
+            );
+        }
+        // どの chunk も届かない quality 閾値 = over-fetch した枠が空になる形。
+        let filters = SearchFilters {
+            min_quality: 2.0,
+            ..Default::default()
+        };
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates(&dummy_embedding(0.5), 1, &filters)
+            .unwrap();
+        assert!(hits.is_empty(), "the filter rejects every candidate");
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            1,
+            "without an exclusion the KNN runs exactly once, as it did before"
+        );
     }
 
     #[test]
