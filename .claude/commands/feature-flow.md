@@ -25,7 +25,10 @@ Phase 6 で merge したら `/clear` で session を閉じ、次の PR はまっ
 - `.dev/` が **それ自体の private repository** として初期化済 (`git -C .dev rev-parse --show-toplevel` が
   `/.dev` で終わる)。root repo は `.dev/` を `.git/info/exclude` で除外しているだけ (ADR-0000) なので、
   nested repo が無い checkout では `git -C .dev` が**親 repo を拾う** — その状態で Phase 6 step 6 の
-  push を実行してはいけない
+  push を実行してはいけない。本 command が読む `.dev/release-checklist.md` / `.dev/feature-ideas.md` /
+  `.dev/knowledge/*.md` も、書き出す `.dev/specs/` `.dev/plans/` `.dev/knowledge/` も、すべてこの
+  private repo 側にある。**公開 repo を clone しただけの checkout には無い**ので、本 command は
+  そのままでは動かない (= owner 用の workflow で、手順を公開側へ写して二重化することはしない)
 - `CLAUDE.local.md` の「開発フロー」節 (本 command の常時 guardrail) を遵守する
 
 ## ユーザ介入ポイントの最小化方針
@@ -112,7 +115,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 0. **push の前に doc comment の名前を洗う — この branch を push するたび、毎回。** PR を開く前も、review の指摘を直した後も同じで、P0/P1 の fix だけでなく**収束した round の P2/P3 を取り込んだ push も含む**。指摘された行だけ直して push すると同じ形が次の round で返り、収束後の取り込みはそのまま merge へ行く (#234 / #236 はそれで round を溶かした)。手順は `.claude/skills/codex-review/SKILL.md` の「push する前に doc comment の名前を洗う」節。sweep のコマンドと判定はそこにあり、ここには写さない (step 4 の注意と同じ理由)
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
-3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える / 罠 28 codex P2 on PR #54)。1 round = `scripts/codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
+3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える — 揃えないと本 command と skill で default がずれる、PR #54 codex round 2 の P2)。1 round = `.claude/skills/codex-review/scripts/codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
 4. controller (= main agent) は **script の verdict だけを読む** — stdout の `CONVERGED=` 行とその直前の判定行、および exit code。**判定の predicate (sentinel 文言 / P-badge の数え方 / 何を再 round にするか) をここに書き写さない**: 2 か所にあると script と食い違い、sentinel と P1 が同時に来た round で blocking な指摘を飛ばすか、P2 だけの round で無駄な 1 round を回す (codex P1 on PR #222、AGENTS.md "One question gets one implementation")。読み方の家は SKILL.md「結果の読み方」の表。そこから本 phase の分岐だけ言い直すと:
    - `CONVERGED=true` → step 5 へ。P2 / P3 の note が付いていたら内容を見て取り込み or skip を即決する (再 round はしない)
    - `WARN P0/P1 issues present` → 取り込み、regression test を 1 件追加、再 push → goto step 3 (re-trigger body 付きで `/codex-review` 再 invoke)
@@ -127,15 +130,15 @@ review 取り込み時の判断はすべて controller (= main agent) が行い�
 - 取り込みが「Phase 3 で承認した spec の前提を覆す」内容なら user に確認
 - 5 round 経過した時点で必ず user に状況を投げ、続行 / 妥協 / scope 縮小を判断してもらう
 
-参照: `.claude/skills/codex-review/SKILL.md` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠カテゴリ蓄積、罠 7 = last-writer-wins まで記録済)
+参照: `.claude/skills/codex-review/SKILL.md` (= polling 実装の固定化、`/codex-review` skill 本体)、`.dev/knowledge/codex-review-loop-pitfalls.md` (運用上の罠の蓄積)。**罠の番号や本数をここに写さない** — あのノートは追記順に並んでいて番号が飛び、重複もあるので、番号で引くと外れる。見出しから引く: `grep -n '^#\+ 罠' .dev/knowledge/codex-review-loop-pitfalls.md`
 
 ### Phase 7 — CHANGELOG / version bump / tag (該当 PR が release worthy な場合のみ)
 
 phase が **release を構成する最終 PR** だった場合のみ:
 
-1. `CHANGELOG.md` の `[Unreleased]` を `[X.Y.Z] - YYYY-MM-DD` に rename + 空 `[Unreleased]` を再 seed
+1. `CHANGELOG.md` の release 化 — `[Unreleased]` を `[X.Y.Z] - YYYY-MM-DD` に rename、空 `[Unreleased]` を再 seed、最下部に compare link を追加、並行 PR が重複させた `### Added` / `### Changed` 等を節ごとにまとめ直す。順序と畳み方は `.dev/release-checklist.md` の「ドキュメント同期」節にあり、ここには写さない (step 3 と同じ理由)
 2. `Cargo.toml` の `version` を bump (`cargo check` で `Cargo.lock` 自動追従)
-3. `CLAUDE.md` のリリース前ドキュメント同期チェックリストを実行 (README / ARCHITECTURE / 各 docs)
+3. `.dev/release-checklist.md` の「ドキュメント同期」節を実行 (README / ARCHITECTURE / 各 docs)
 4. `/full-audit` 起動判断 (CLAUDE.local.md の trigger 該当時のみ)
 5. tag 作成: `git tag -a vX.Y.Z -m "..."` → `git push origin vX.Y.Z`
 6. `release.yml` (cargo-dist) が auto で binary build + GH Release を作成 (手動の `gh release create` は禁止)
@@ -148,10 +151,11 @@ cycle 完了時に必ず:
 
 - `.dev/knowledge/<feature-NN>-summary.md` 作成 (結果サマリ / 設計判断 / ハマりどころ / 工程まとめ / 後続候補)
 - `.dev/feature-ideas.md` の対応 ID を `done` マーク + done line に PR 番号と merge 日付を追記
-- `CHANGELOG.md` の release 行に PR # 添付
 - `/full-audit` を回した場合は `.dev/archive/<date>-cycle/audit-todos.md` に deferred items を整理
 
-これらは git untracked (`.dev/`) なので commit には乗らない (= subagent prompt で必ず明示する)。
+上の 3 つはどれも `.dev/` 配下 = git untracked なので commit には乗らない (= subagent prompt で必ず明示する)。
+
+`CHANGELOG.md` はこの Phase では触らない。entry は変更した PR 自身が `[Unreleased]` に足し、`[X.Y.Z]` への畳み込みは Phase 7 step 1 が持つ。**release 見出しにも entry にも PR 番号は付けない** — 付いている行は無い (via: `grep -c '^## .*(#' CHANGELOG.md` / `grep -c '^- .*(#[0-9]' CHANGELOG.md`)。PR 番号は散文の中で経緯として書く時だけ現れる。`.claude/` だけを触る PR は entry 自体を書かない (#220 / #222 / #238 の型)。
 
 ## handoff と session の区切り
 
@@ -198,7 +202,7 @@ main の状態 (実測) / 残っているもの / 測って分かったこと / 
 - CHANGELOG / docs の文言調整
 - merge commit message の draft
 - tag message の draft
-- release 後の `.dev/feature-ideas.md` / CHANGELOG の done マーク更新
+- release 後の `.dev/feature-ideas.md` の done 行更新
 
 ただし以下は必ず確認 (介入ポイント 3):
 - spec で承認した API surface / scope / 設計原則を覆す指摘
@@ -216,16 +220,16 @@ main の状態 (実測) / 残っているもの / 測って分かったこと / 
 | `.dev/knowledge/session-<date>-<topic>-handoff.md` | merge ごと | session を閉じる前の申し送り (git untracked) |
 | `CHANGELOG.md` | 更新 | release 時に `[Unreleased]` → `[X.Y.Z]` |
 | `Cargo.toml` + `Cargo.lock` | 更新 | release 時 version bump |
-| README.md / docs/* | 更新 | リリース前ドキュメント同期チェックリストに従う |
+| README.md / docs/* | 更新 | `.dev/release-checklist.md` の「ドキュメント同期」節に従う |
 | `.dev/feature-ideas.md` | 更新 | done 行を該当 ID に追記 |
 
 ## 関連
 
-- `CLAUDE.md` の「リリース前チェックリスト」 (= Phase 7 の docs sync 元)
+- `.dev/release-checklist.md` (= Phase 7 step 1 / step 3 の元。`CLAUDE.local.md` の「リリース運用」から辿れる)
 - `CLAUDE.local.md` の「開発フロー」節 (= 本 command の常時 guardrail)
 - `.claude/commands/full-audit.md` (Phase 7 で起動判断)
-- `.claude/skills/codex-review/SKILL.md` + `scripts/codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke)
-- `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference、罠 1-7 蓄積)
+- `.claude/skills/codex-review/SKILL.md` + `.claude/skills/codex-review/scripts/codex_review_round.sh` (= Phase 6 の codex review loop 実装、`/codex-review <PR#>` で invoke)
+- `.dev/knowledge/codex-review-loop-pitfalls.md` (Phase 6 の運用 reference。罠の番号はここに写さない — 引き方は Phase 6 の参照行)
 - `.dev/knowledge/index-progress-buffering-pitfall.md` (background bash の罠 reference)
 - `superpowers:brainstorming` / `superpowers:writing-plans` / `superpowers:subagent-driven-development` (orchestrate される 3 skill)
 

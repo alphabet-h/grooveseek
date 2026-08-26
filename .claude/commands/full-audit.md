@@ -13,13 +13,16 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 - 大規模 refactor が間に挟まった
 - 重大なセキュリティ修正の後
 
-詳しい判断軸は `CLAUDE.local.md` の「リリース前チェックリスト」を参照。
+詳しい判断軸は `.dev/release-checklist.md` の「`/full-audit` の起動判断」節を参照。
 
 ## 前提
 
 - `.dev/knowledge/` と `.dev/features.json` の運用ルール (`CLAUDE.local.md`) が有効
 - subagent type: `feature-dev:code-reviewer`, `general-purpose` が available
 - 過去 audit の実例: `.dev/knowledge/review-2026-04-29-full-audit.md`
+- `.dev/` は `.git/info/exclude` で公開 repo の追跡外にある owner 側の private repo。本 command が
+  参照する `.dev/release-checklist.md` も書き出す `.dev/knowledge/` もそちらにあり、**公開 repo を
+  clone しただけの checkout には無い**。内容を公開側へ写して二重化することはしない
 
 ## 実行フロー
 
@@ -170,7 +173,7 @@ prompt:
 - 英語プライマリの日英バイリンガル運用
 - ドキュメント: README.md / README.ja.md、docs/{configuration,usage,clients,mcp-tools,behavior}.{md,ja.md}、docs/ARCHITECTURE.{md,ja.md}、docs/{eval,citations,filters,retrieval-pipeline,stability}.{md,ja.md}、CHANGELOG.md、CLAUDE.md、CLAUDE.local.md、CONTRIBUTING.{md,ja.md}、examples/deployments/{personal,nas-shared,intranet-http}/README{,.ja}.md、groove.toml.example
 - リリース履歴: git tag --list で確認
-- CLAUDE.md にリリース前ドキュメント同期チェックリストあり (要参照)
+- `.dev/release-checklist.md` に「ドキュメント同期」節あり (要参照)
 
 # レビューしてほしい観点 (すべて)
 1. drift / 不整合 (実装と docs 乖離、設定キー / フラグ / フィールドの抜け)
@@ -287,5 +290,5 @@ jq '.features += [
 
 ## 関連
 
-- `CLAUDE.local.md` の「`.dev/knowledge/` への書き込み (毎回)」と「リリース前チェックリスト」
+- `CLAUDE.local.md` の「`.dev/knowledge/` への書き込み (毎回)」と「リリース運用」
 - `.dev/feature-ideas.md` の「優先度ピック」 (= 既知の長期計画)、本コマンドが登録する todo は実装可能性の高い具体 issue
