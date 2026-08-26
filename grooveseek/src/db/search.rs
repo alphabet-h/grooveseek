@@ -95,7 +95,7 @@ struct VecPage {
     /// 行数。filter が先に落とした行は数えない — その行は除外の有無に関わらず失われる。
     /// **0 なら、足りないのは除外のせいではない**。
     dropped_by_exclusion: usize,
-    /// 行ごとの連言 (除外 → filter 群) を通った候補。
+    /// 行ごとの連言 (filter 群 → 除外) を通った候補。
     hits: Vec<(i64, SearchResult)>,
 }
 
@@ -530,7 +530,7 @@ impl Database {
         }
     }
 
-    /// KNN を 1 回だけ引き、行ごとの連言 (除外 → filter 群) を通したものを返す。
+    /// KNN を 1 回だけ引き、行ごとの連言 (filter 群 → 除外) を通したものを返す。
     ///
     /// [`VecPage::rows_seen`] が `fetch_k` に満たなければ corpus を読み切ったということ
     /// なので、呼び出し側はそこで再取得をやめる。[`VecPage::dropped_by_exclusion`] が 0 なら

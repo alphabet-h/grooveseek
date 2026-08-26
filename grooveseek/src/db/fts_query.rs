@@ -668,9 +668,10 @@ impl<'a> ParsedQuery<'a> {
 
     /// 3 つの entry point (MCP / CLI / golden の load) が共有する拒否。
     ///
-    /// **DB 層はこれを呼ばない**。`search_fts_candidates("-abc")` は今日どおり
-    /// `Ok(vec![])` を返す (`db.rs` の test module にある proptest がそれを要求する) — 拒否は
-    /// 「利用者に言い直してもらう」ための入口の判断であって、検索そのものの失敗ではない。
+    /// **DB 層はこれを呼ばない**。[`crate::db::Database::search_fts_candidates`] に
+    /// `-abc` だけの query を渡しても今日どおり `Ok(vec![])` を返す (`db.rs` の test module に
+    /// ある proptest がそれを要求する) — 拒否は「利用者に言い直してもらう」ための入口の
+    /// 判断であって、検索そのものの失敗ではない。
     pub fn require_positive(&self) -> anyhow::Result<()> {
         if self.is_exclusion_only() {
             anyhow::bail!("{}", EXCLUSION_ONLY_MESSAGE);
