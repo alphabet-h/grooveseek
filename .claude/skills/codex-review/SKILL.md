@@ -19,7 +19,7 @@ detection + 結果 fetch + 整形** する。`/feature-flow` Phase 6 の sub-ste
 上限は process を跨いで効く (controller が数えなくてよい、数えてはいけない)。
 前提: `gh auth status` OK、repo に codex connector app install 済。destructive 操作なし (GitHub へ comment を post するだけ)。
 
-## PR を開く前と、fix を push する前に doc comment の名前を洗う
+## push する前に doc comment の名前を洗う
 
 codex は `AGENTS.md` の rule 5 (「tree の中にあるものを名指しするならリンクにする」) を
 **字義どおり**適用する。人間の review が認める例外 — private item は module link + 散文、
@@ -28,8 +28,10 @@ PR #222 / #234 / #236 / #237 で起きていて、#234 では 3 round 連続し�
 (台帳 `.dev/knowledge/repeat-offences-ledger.md` の category 4)。round は `<max_rounds>` で
 頭打ちなので、これは review に見つけさせるものではない。
 
-**打つのは 2 か所**: PR を開く直前と、**P0/P1 を直して再 push する直前**。指摘された行だけ
-直して push すると、同じ形が次の round で返ってくる (#234 / #236 はそれで round を溶かした):
+**打つのは、この branch を push するたび。** PR を開く直前も、review の指摘を直した後も同じで、
+P0/P1 だけでなく**収束した round の P2/P3 を取り込んだ push も含む** (codex P2 on #238: 「収束後の
+取り込みは merge へ向かうので、そこで足した doc comment を誰も見ない」)。指摘された行だけ直して
+push すると、同じ形が次の round で返ってくる (#234 / #236 はそれで round を溶かした):
 
 ```bash
 git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c
