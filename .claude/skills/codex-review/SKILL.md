@@ -32,8 +32,12 @@ PR #222 / #234 / #236 / #237 で起きていて、#234 では 3 round 連続し�
 直して push すると、同じ形が次の round で返ってくる (#234 / #236 はそれで round を溶かした):
 
 ```bash
-git -C <abs> diff main...HEAD -- grooveseek/src grooveseek/tests crates | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c
+git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c
 ```
+
+pathspec は `'*.rs'` — **directory を並べない**。`grooveseek/src grooveseek/tests crates` と
+書くと `grooveseek/benches` が落ちる (codex P2 on #238。bench にも `//!` / `///` はあり、
+`` `compute_match_spans` `` のような tree の名前が今も入っている) し、crate が増えた日に黙って狭くなる。
 
 角括弧を残して抽出しているので、**bare backtick と `` [`..`] `` が同じ出力の中で区別できる** —
 sweep は両方向で、リンクにし忘れた項とリンクにしてはいけない項の両方がここに並ぶ:
@@ -56,7 +60,8 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
 - `///` は同 scope なら bare でよい。`` [`Self::method`] `` も張れる
 - `tests/` crate から lib の **`pub`** item は `` [`grooveseek::db::ParsedQuery::match_expr`] ``
   の形で書く。**`pub(crate)` は届かない**ので backtick + 散文。なお `tests/` の target は
-  `doc = false` なので、ここの link を検査するのは `cargo doc` ではなく codex だけ
+  `doc = false`、`benches/` は `cargo doc` が document しないので、この 2 つの中の link を
+  検査するのは `cargo doc` ではなく codex だけ
 - 同じ `#[cfg(test)] mod tests` の中なら、隣の test fn 名は bare link
 - **リンクにできないものは backtick のまま残し、散文で持ち主 (module / file) を名指す**:
   他 module に private な item / 非 test の doc から名指した `#[cfg(test)]` の item /
