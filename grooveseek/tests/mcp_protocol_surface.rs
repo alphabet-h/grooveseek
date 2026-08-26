@@ -442,6 +442,62 @@ fn the_tool_list_is_six_tools_with_the_caching_hints_the_spec_requires() {
     );
 }
 
+/// A query made only of `-term` exclusions is refused, and the refusal comes
+/// back the way every other tool failure does.
+///
+/// **Where it lands is the point.** A tool that cannot answer still answers:
+/// the JSON-RPC call succeeds (`error` is null on the envelope) and the
+/// refusal is inside `result.content[0].text` as `{"error": "…"}` — the same
+/// two-layer shape `list_topics` returns its array in. A client that branched
+/// on the JSON-RPC `error` would see this call as a success carrying no
+/// results.
+///
+/// It is also the only test of the wiring that the default suite runs: the
+/// unit test in `server.rs` can build the envelope but cannot call
+/// `search_blocking` in `grooveseek/src/server/search.rs`, which needs a real
+/// embedder, and `an_exclusion_only_query_is_refused_over_mcp` in
+/// `tests/search_exclusion_integration.rs` — which checks the same refusal
+/// against a populated index — is `#[ignore]`d. Off `#[ignore]` for the same
+/// reason as its neighbours: the refusal lands before the index is consulted,
+/// so an empty knowledge base is all it needs.
+#[test]
+fn an_exclusion_only_query_is_refused_over_the_protocol() {
+    let (_kb, _guard, base) = start();
+
+    let resp = rpc_named(
+        &base,
+        "tools/call",
+        Some("search"),
+        serde_json::json!({
+            "name": "search",
+            "arguments": {"query": "-foo"},
+            "_meta": meta(),
+        }),
+    );
+    assert!(
+        resp["error"].is_null(),
+        "a refused search is a tool result, not a protocol error: {resp}"
+    );
+
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content: {resp}"));
+    let inner: serde_json::Value =
+        serde_json::from_str(text).expect("the tool answers with a JSON body");
+
+    let message = inner["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refusal must use the `error` envelope: {text}"));
+    assert!(
+        message.contains("query has no positive term"),
+        "the refusal must say what is missing: {message}"
+    );
+    assert!(
+        inner.get("results").is_none(),
+        "the envelope replaces the wrapper rather than joining it: {text}"
+    );
+}
+
 /// (feature-50 PR 3) The resource surface with an index behind it — the half
 /// the tests above cannot reach, because `resources/list` is built from what is
 /// indexed and `resources/read` refuses anything that is not.

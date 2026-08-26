@@ -972,6 +972,15 @@ fn main() -> anyhow::Result<()> {
             // echo 用の値も実際に使われる値と揃えたいので同じ helper を通す。
             let limit = grooveseek::server::clamp_search_limit(limit);
 
+            // F-4: `-term` の解析。**model も DB も開く前**に断ることが目的なので、
+            // `require_kb_path` より前に置く: 探すものが無いクエリのために
+            // 130 MB のモデルを読み込む理由は無い。`?` 経由なので stderr に
+            // `Error: query has no positive term ...` が出て exit 1 — path glob の
+            // 不正 (`compile_path_globs`) と同じ経路で、MCP 側の `ErrorResponse` と
+            // 同じ 1 文を読む ([`grooveseek::db::ParsedQuery::require_positive`])。
+            let parsed = grooveseek::db::parse_query(&query);
+            parsed.require_positive()?;
+
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
             // `--reranker` given here is a choice about this query; a model that
@@ -987,7 +996,7 @@ fn main() -> anyhow::Result<()> {
             db.verify_embedding_meta(model.model_id(), dim)?;
 
             let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
-            let query_embedding = embedder.embed_single(&query)?;
+            let query_embedding = embedder.embed_single(parsed.positive_text())?;
 
             let server_default = cfg
                 .quality_filter
@@ -1034,7 +1043,7 @@ fn main() -> anyhow::Result<()> {
             let pipeline = grooveseek::server::run_search_pipeline(
                 &db,
                 reranker_obj.as_mut(),
-                &query,
+                &parsed,
                 &query_embedding,
                 limit,
                 &filters,
@@ -1065,7 +1074,8 @@ fn main() -> anyhow::Result<()> {
             // match_spans は Parent retriever 拡張後の content に対して計算する
             // (`expand_parent` は defensive に None クリアするので必ず再計算が要る)。
             for h in &mut hits {
-                h.match_spans = grooveseek::server::compute_match_spans(&query, &h.content);
+                h.match_spans =
+                    grooveseek::server::compute_match_spans(parsed.positive_text(), &h.content);
             }
 
             let effective_ratio = min_confidence_ratio
@@ -1083,6 +1093,7 @@ fn main() -> anyhow::Result<()> {
                 category.as_deref(),
                 topic.as_deref(),
                 min_confidence_ratio,
+                parsed.exclude(),
                 format,
             );
         }
@@ -1851,6 +1862,7 @@ fn print_search_results(
     category: Option<&str>,
     topic: Option<&str>,
     explicit_ratio: Option<f32>,
+    excluded_terms: &[String],
     format: SearchFormat,
 ) {
     let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
@@ -1881,6 +1893,7 @@ fn print_search_results(
                     date_from.map(str::to_owned),
                     date_to.map(str::to_owned),
                     explicit_ratio,
+                    excluded_terms.to_vec(),
                 ),
             };
             println!(

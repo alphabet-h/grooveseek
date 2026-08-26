@@ -191,6 +191,8 @@ groove search "クエリ最適化" --reranker bge-v2-m3        # optional per-in
 
 **How the query is matched** (v0.16.0+): the FTS half of the hybrid does not look for the query verbatim. It cuts the query at separators and at script boundaries (kanji / hiragana / katakana / other word characters), joins any fragment under the 3-character trigram floor to its neighbours, and searches for the resulting phrases joined with `OR` — so `再ランキングの評価について` looks for `再ランキング` / `ランキング` / `の評価` / `について`, and a natural-language question matches without appearing word-for-word. Wrap a substring in `"..."` to keep it together as one verbatim phrase (`groove search '"Foundry Local" の設定'`); quoting the whole query restores the pre-v0.16.0 substring search exactly. The same applies to the `search` MCP tool, which runs the same code path; none of this needs a re-index. Details: [docs/retrieval-pipeline.md](retrieval-pipeline.md).
 
+**Excluding a term** (v1.1.0+): prefix a whitespace-delimited group with `-` to drop it from both halves of the search instead of searching for it, e.g. `groove search 'rust -async'`. Put the positive term first on the command line — a query that begins with `-` is read as a flag by the argument parser — and escape a leading exclusion with `groove search -- '-async rust'`. Quote a leading hyphen (`"-foo"`) to search for it literally. Details: [ADR-0011](decisions/0011-exclude-a-term-from-both-halves-of-the-search.md).
+
 Typical skill-bin use: a Claude Code skill places `groove.exe` + `groove.toml` in its `bin/`, then a command like `groove search "<user_query>" --format text --limit 3` returns a focused reference excerpt for the LLM to cite.
 
 ## Search filters and citations (v0.3.0+)

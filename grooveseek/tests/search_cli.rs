@@ -1,5 +1,8 @@
 //! `groove search` CLI integration test。wrapper 形式の出力 + 新フィルタ引数の sanity。
 
+mod common;
+use common::ansi::strip_ansi;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -453,5 +456,103 @@ fn groove_search_reads_rerank_by_default_from_the_config_file() {
         reranked.iter().any(|s| *s > RRF_CEILING || *s <= 0.0),
         "`rerank_by_default = true` must replace the score with the \
          cross-encoder's, which is not on the RRF scale, got {reranked:?}"
+    );
+}
+
+/// A query with nothing left to search for is refused before anything
+/// expensive happens, and the refusal reaches stderr.
+///
+/// **Not `#[ignore]`d, and that is the assertion.** The refusal sits ahead of
+/// `require_kb_path` in `grooveseek/src/main.rs`, the model load and the
+/// database open, so this test needs none of them — it points `--kb-path` at
+/// an empty directory that has never been indexed and still expects the
+/// sentence. If the check ever drifted below the model load, this test would
+/// start needing a 130 MB download to pass, which is the failure showing up as
+/// a cost rather than as a red test.
+///
+/// The `--` is load-bearing: `-foo` is a value that starts with a hyphen, and
+/// the argument parser reads it as flags (`-f -o -o`) and exits 2 long before
+/// `main` sees a query. `allow_hyphen_values` is deliberately *not* set on the
+/// argument — it would make `groove search -l 5` search for the string `-l`
+/// instead of reporting a typo — so `--` is how a leading-hyphen query is
+/// written on this surface.
+#[test]
+fn an_exclusion_only_query_fails_on_stderr_and_exits_non_zero() {
+    let kb = TempKb::new("groove-exclusion-only-cli");
+
+    let out = Command::new(bin())
+        .args([
+            "search",
+            "--kb-path",
+            kb.kb().to_str().unwrap(),
+            "--",
+            "-foo",
+        ])
+        .output()
+        .expect("groove search");
+
+    assert!(
+        !out.status.success(),
+        "a query that cannot be searched must not exit 0; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // Windows `tracing-subscriber` colours stderr, so the escapes come off
+    // before the text is read.
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stderr.contains("Error: query has no positive term"),
+        "the failure has to say what is wrong with the query, on stderr: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a refusal writes no result to stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The command line reports what it excluded, in the same field the MCP tool
+/// uses.
+///
+/// Both directions, because the absence is the half a caller has to be able to
+/// read: `excluded_terms` present means rows were dropped, and the key missing
+/// means none were — the rule [`grooveseek::server::SearchFilterEcho::new`]
+/// applies to every other list in the echo.
+#[test]
+#[ignore] // requires built binary + embedding model download
+fn the_command_line_echoes_excluded_terms_in_json() {
+    let kb = TempKb::new("groove-exclusion-echo-cli");
+    kb.write(
+        "tokio.md",
+        "---\ntitle: Tokio\n---\n\n# tokio runtime\n\nThe tokio runtime is an async \
+         executor for rust that drives futures to completion on a work-stealing \
+         scheduler.\n",
+    );
+    assert!(index(&kb).success());
+
+    let out = search_json(&kb, "tokio runtime -rayon");
+    assert!(
+        out.status.success(),
+        "a query with something left to search for is answered; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the answer is valid JSON");
+    assert_eq!(
+        v["filter_applied"]["excluded_terms"],
+        serde_json::json!(["rayon"]),
+        "the echo names the phrases the search actually excluded: {v}"
+    );
+
+    let plain = search_json(&kb, "tokio runtime");
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let p: serde_json::Value =
+        serde_json::from_slice(&plain.stdout).expect("the answer is valid JSON");
+    assert!(
+        p["filter_applied"].get("excluded_terms").is_none(),
+        "a query with no exclusions must leave no key behind: {p}"
     );
 }

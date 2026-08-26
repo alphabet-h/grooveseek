@@ -329,10 +329,13 @@ skipped rather than compared, which is the intended behavior — the older
 numbers were computed by a different formula.
 The same holds for history written **before v0.16.0**: `fts_query_version`
 went 1 → 2 when the query-to-`MATCH` compilation changed (see
-[retrieval-pipeline.md](./retrieval-pipeline.md)), so those runs — including a
-frozen baseline — drop out of the comparison. That is intentional as well: the
-two versions send different expressions to FTS5, so they measure different
-retrieval even with the same model, index, and golden file.
+[retrieval-pipeline.md](./retrieval-pipeline.md)), and 2 → 3 when v1.1.0 added
+`-term` exclusion (see
+[ADR-0011](./decisions/0011-exclude-a-term-from-both-halves-of-the-search.md)),
+so those runs — including a frozen baseline — drop out of the comparison
+either way. That is intentional as well: each version sends a different
+expression to FTS5, so they measure different retrieval even with the same
+model, index, and golden file.
 Updating the golden file likewise does **not** trigger a false regression
 on the next run; it just means the comparison is skipped.
 
@@ -406,7 +409,10 @@ has to occur verbatim in the text to reach the bm25 stage** — each of its
 fragments can match on its own, which is what makes a natural-language golden
 set measurable at all. What still leaves nothing to measure is a query from
 which no phrase survives, or whose phrases match nothing: every grid point then
-returns the same ranking. `tune` therefore starts with a pre-flight pass:
+returns the same ranking. A golden query may use `-term` exclusion (v1.1.0+)
+the same as any other query; one that excludes everything and leaves nothing
+positive to search for is refused when the golden file loads, before any grid
+point runs. `tune` therefore starts with a pre-flight pass:
 
 - it counts FTS candidates per query and reports the **effective N** (queries
   with at least 2 candidates — 0 candidates falls back to vector-only, 1

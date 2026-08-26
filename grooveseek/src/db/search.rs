@@ -15,9 +15,23 @@
 //! `tune.rs` (`crate::db::FTS_CANDIDATE_CALLS`), so moving it would break the
 //! AU-22 round-trip guard that counts FTS calls during a sweep.
 //!
-//! Compiling a user query into an FTS5 MATCH expression lives in the sibling
-//! module `fts_query` (feature-48, v0.16.0). It reaches here through `db.rs`'s
-//! `use fts_query::build_fts_query;` plus the `use super::*;` below.
+//! Parsing a user query — the FTS5 MATCH expression it compiles to, the terms
+//! it excludes, and the text an embedder should see — lives in the sibling
+//! module [`super::fts_query`] (feature-48, v0.16.0; exclusions in feature-55).
+//! `db.rs` re-exports [`crate::db::ParsedQuery`] and [`crate::db::parse_query`]
+//! from it, and this module sees both through the `use super::*;` below.
+//!
+//! A hybrid search parses **once inside this layer**:
+//! [`Database::search_split_candidates`] parses the raw string it was given and
+//! hands the same [`ParsedQuery`] to both halves, so the phrases the full-text
+//! half searched for and the ids the vector half dropped cannot come from two
+//! different readings of it. The request as a whole is parsed at the entry
+//! point as well — that parse is what the embedder, the reranker and the spans
+//! see — and the two readings agree because [`crate::db::parse_query`] is pure,
+//! not because there is only one of them. The single-leg entry points
+//! ([`crate::db::Database::search_fts_candidates`],
+//! [`crate::db::Database::count_fts_matches`]) parse for themselves — they are
+//! [`crate::tune`]'s, and have no second half to agree with.
 
 // The parent module is what this file was carved out of, so it keeps seeing
 // exactly what it saw before. A hand-written list would be a second thing to
@@ -25,7 +39,10 @@
 use super::*;
 /// filter (category / topic) を Rust 側で適用する際の KNN / FTS の over-fetch 倍率。
 /// filter が選択的な場合に target `limit` 件に届くよう多めに候補を取る。
-const FILTER_OVERFETCH_FACTOR: u32 = 10;
+///
+/// `pub(super)` なのは、除外の再取得テストが「最初の枠を埋め尽くす数」をこの値から
+/// 導くため — 10 を書き写すと、倍率を変えた日にテストが黙って意味を失う。
+pub(super) const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
 /// `any_pool` が空なら常に pass (= フィルタ無効)。
@@ -67,6 +84,21 @@ fn matches_date_range(hit_date: Option<&str>, from: Option<&str>, to: Option<&st
     true
 }
 
+/// [`Database::fetch_vec_page`] が KNN 1 回から持ち帰るもの。
+///
+/// 3 要素の tuple にすると呼び出し側で `.0` / `.1` の意味が読めなくなる。どれも
+/// 「もう一度引くべきか」を決める材料なので、名前を付けて 1 個で返す。
+struct VecPage {
+    /// クエリから読んだ行数。`fetch_k` に満たなければ corpus を読み切っている。
+    rows_seen: usize,
+    /// そのうち、**filter をすべて通ったうえで** `excluded` に載っていたので落とした
+    /// 行数。filter が先に落とした行は数えない — その行は除外の有無に関わらず失われる。
+    /// **0 なら、足りないのは除外のせいではない**。
+    dropped_by_exclusion: usize,
+    /// 行ごとの連言 (filter 群 → 除外) を通った候補。
+    hits: Vec<(i64, SearchResult)>,
+}
+
 impl Database {
     /// ベクトル単体類似検索。最大 `limit` 件を距離昇順 (小さい = より類似) で返す。
     ///
@@ -102,9 +134,30 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        self.search_fts_candidates_parsed(&parse_query(query_text), limit, filters, fusion)
+    }
+
+    /// [`Self::search_fts_candidates`] の本体。解析済みのクエリを受ける形。
+    ///
+    /// [`Self::search_split_candidates`] は vector 半身と同じ [`ParsedQuery`] をここへ渡す。
+    /// 文字列から作り直すと、除外に使う式と FTS が探す式が別々の解析結果になり得る。
+    ///
+    /// 除外がある場合の MATCH 式は `(正) NOT (負)` で、`NOT` は**式の中**にあるので
+    /// SQL の `LIMIT` は除外**後**の行に効く (公式 docs に記述が無いので、`db.rs` の
+    /// test module にある `the_limit_is_applied_after_the_exclusion_not_before` が
+    /// 実 SQLite で固定している)。
+    pub(crate) fn search_fts_candidates_parsed(
+        &self,
+        query: &ParsedQuery<'_>,
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        fusion: FusionParams,
+    ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
-        let Some(fts_query) = build_fts_query(query_text) else {
+        // 切り詰めの警告は 1 検索 1 回。ここが「クエリを FTS に投げる」唯一の経路。
+        query.warn_if_truncated();
+        let Some(fts_query) = query.match_expr() else {
             return Ok(Vec::new());
         };
 
@@ -319,9 +372,37 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<(CandidateHits, CandidateHits)> {
-        let vec_hits = self.search_vec_candidates(query_embedding, candidates, filters)?;
-        let fts_hits = self.search_fts_candidates(query_text, candidates, filters, fusion)?;
+        let parsed = parse_query(query_text);
+        let excluded = self.excluded_chunk_ids(parsed.negative_match().as_deref())?;
+        let vec_hits =
+            self.search_vec_candidates_excluding(query_embedding, candidates, filters, &excluded)?;
+        let fts_hits = self.search_fts_candidates_parsed(&parsed, candidates, filters, fusion)?;
         Ok((vec_hits, fts_hits))
+    }
+
+    /// 負の式にマッチする chunk id。vector 半身から落とす集合 (F-4)。
+    ///
+    /// 「その chunk は除外語を含むか」の判定は FTS5 (trigram / case-insensitive /
+    /// `remove_diacritics`) に任せ、FTS 半身の `NOT` と**同じ式文字列**を使う =
+    /// 一つの問いに一つの実装。Rust 側で content を substring 検索すると、
+    /// 大小・濁点・見出し列の扱いが 2 つに分かれる。
+    ///
+    /// 判定対象は FTS の行、すなわち `heading` / `context` / `content` の 3 列
+    /// (正側が探すのと同じ text)。本文に無くても heading や生成された context に
+    /// 除外語があれば、その chunk は落ちる。
+    ///
+    /// bm25 も `ORDER BY` も **`LIMIT` も無い**: 順位は要らず、`LIMIT` を付けると
+    /// 除外漏れが静かに起きる。コストは負 phrase 群の rowid 走査 1 回で、cap は
+    /// 置かない (phrase 数は [`ParsedQuery`] 側で 32 に bound されている)。
+    pub(crate) fn excluded_chunk_ids(&self, negative: Option<&str>) -> Result<HashSet<i64>> {
+        let Some(expr) = negative else {
+            return Ok(HashSet::new());
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ?1")?;
+        let ids = stmt.query_map(params![expr], |row| row.get::<_, i64>(0))?;
+        Ok(ids.collect::<std::result::Result<HashSet<_>, _>>()?)
     }
 
     /// クエリの phrase のいずれかにマッチする chunk 数 (LIMIT / filter なし)。
@@ -329,14 +410,17 @@ impl Database {
     ///
     /// **v0.16.0 で意味が変わった**: 旧実装はクエリ全体を 1 phrase にしていたので
     /// これは「その phrase の doc-freq」= FTS5 の IDF クランプ条件そのものだったが、
-    /// 現在は [`build_fts_query`] が生む複数 phrase の**和集合**の大きさであり、
+    /// 現在は [`parse_query`] が生む複数 phrase の**和集合**の大きさであり、
     /// 個々の phrase の doc-freq の**上界**でしかない
     /// (`tune::grid::QueryDiagnostics::idf_clamped` の注記を参照)。
+    ///
+    /// feature-55 以降、クエリが除外を含むなら数えるのは `(正) NOT (負)` の行数 =
+    /// **除外語を含む行は数えない**。
     ///
     /// 有効な phrase が 1 つも作れないクエリは `Ok(0)`。**「3 文字未満なら」ではない** —
     /// `ab` は落ちるが `AI と ML` は全体 fallback で phrase になる。
     pub(crate) fn count_fts_matches(&self, query_text: &str) -> Result<i64> {
-        let Some(fts_query) = build_fts_query(query_text) else {
+        let Some(fts_query) = parse_query(query_text).match_expr() else {
             return Ok(0);
         };
         let n: i64 = self.conn.query_row(
@@ -363,10 +447,61 @@ impl Database {
         limit: u32,
         filters: &SearchFilters<'_>,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        self.search_vec_candidates_excluding(query_embedding, limit, filters, &HashSet::new())
+    }
+
+    /// [`Self::search_vec_candidates`] の本体に、除外する chunk id 集合を足した形 (F-4)。
+    ///
+    /// `excluded` は [`Self::excluded_chunk_ids`] が返す「負の FTS 式にマッチした行」で、
+    /// filter と同じく Rust 側で 1 行ずつ落とす。**空集合なら
+    /// [`Self::search_vec_candidates`] と bit-exact** — over-fetch の条件にも入らず、
+    /// KNN も下の再取得ループを 1 周しかしない。
+    ///
+    /// # そのページが除外で行を落としたときだけ回す再取得ループ (codex review round 1・2、P2)
+    ///
+    /// 倍率をかけた枠は**除外だけで尽きうる**。`-について` のように大半の chunk に
+    /// 当たる除外語なら、最も近い `limit` × [`FILTER_OVERFETCH_FACTOR`] 件が全部
+    /// 除外語を持つことは普通に起きる。1 回きりの KNN だと、その 1 件後ろに適格な近傍がいても
+    /// 0 件で返る。そこで [`Self::fetch_vec_page`] を呼び直し、次のどれかが成り立つまで
+    /// `fetch_k` を倍にする:
+    ///
+    /// - `limit` 件埋まった
+    /// - そのページが除外で 1 行も落としていない ([`VecPage::dropped_by_exclusion`] が 0 =
+    ///   **filter をすべて通った行**を除外で落とした数が 0)
+    /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
+    /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
+    ///
+    /// 2 つ目が「`excluded` が空」ではないのが要点 (round 2)。category / path / date /
+    /// quality の filter で `limit` に届かないのは feature-26 以来の既存挙動で、ここで
+    /// 直す話ではない。「除外集合が空でなければ広げる」にすると、**取ってきた候補を 1 件も
+    /// 落としていない** `-term` が、その filter 付きクエリの候補リストを変え、KNN を上限まで
+    /// 引き延ばす — 同じクエリを除外なしで投げたときと挙動が違ってしまう。除外が原因で
+    /// 足りないときだけ広げる。空集合はどの行も落とせないので、この条件が
+    /// 「`excluded` が空なら 1 回」も兼ねる。
+    ///
+    /// 数えるのが **filter を通った行だけ**なのも同じ理由 (round 3)。filter が先に落とした
+    /// 行は除外の有無に関わらず失われるので、それを「除外のせい」に数えると、広げた先で
+    /// 読み直す同じ prefix でまた数えられ、上限まで伸びたうえで「filter を通る遠い行」を
+    /// 拾う — 除外なしの同じクエリが決して返さない行が返る。
+    ///
+    /// KNN に cursor は無いので、各回は**最初から引き直して結果を作り直す** (追記すると
+    /// 重複する)。最悪ケースは「除外語がほぼ全近傍に当たる」場合の、`k` に
+    /// [`VEC_KNN_MAX_K`] を取った KNN 1 回ぶんで、そこで打ち切る。
+    /// 2 回目以降の `fetch_k` は [`FILTER_OVERFETCH_CAP`] を超え得るが
+    /// [`VEC_KNN_MAX_K`] 以下には収まる (AU-01 の事前確保の話は
+    /// [`Self::fetch_vec_page`] 側の注記を参照)。
+    pub(crate) fn search_vec_candidates_excluding(
+        &self,
+        query_embedding: &[f32],
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        excluded: &HashSet<i64>,
+    ) -> Result<Vec<(i64, SearchResult)>> {
         // filter 指定があれば over-fetch する (詳細は SearchFilters::has_any)。
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。
-        let fetch_k = if filters.has_any() {
+        // 除外も同じ理由で広げる — 最近傍が除外語を含むだけで limit が埋まらなくなる。
+        let mut fetch_k = if filters.has_any() || !excluded.is_empty() {
             limit
                 .saturating_mul(FILTER_OVERFETCH_FACTOR)
                 .min(FILTER_OVERFETCH_CAP)
@@ -381,6 +516,37 @@ impl Database {
         // (82*5*10 = 4100 > 4096)。候補が減るだけの degrade に倒す。
         .min(VEC_KNN_MAX_K);
         let embedding_json = serde_json::to_string(query_embedding)?;
+
+        loop {
+            let page = self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
+            if page.hits.len() >= limit as usize
+                || page.dropped_by_exclusion == 0
+                || page.rows_seen < fetch_k as usize
+                || fetch_k >= VEC_KNN_MAX_K
+            {
+                return Ok(page.hits);
+            }
+            fetch_k = fetch_k.saturating_mul(2).min(VEC_KNN_MAX_K);
+        }
+    }
+
+    /// KNN を 1 回だけ引き、行ごとの連言 (filter 群 → 除外) を通したものを返す。
+    ///
+    /// [`VecPage::rows_seen`] が `fetch_k` に満たなければ corpus を読み切ったということ
+    /// なので、呼び出し側はそこで再取得をやめる。[`VecPage::dropped_by_exclusion`] が 0 なら
+    /// 足りない原因は除外ではない (= filter) ので、やはりやめる。
+    ///
+    /// `limit` 件埋まった時点で読むのをやめるため、その場合はどちらの数も**途中まで**の
+    /// 値になる。ただしそのときは呼び出し側の「埋まった」条件が先に成立するので、
+    /// 2 つとも参照されない。
+    fn fetch_vec_page(
+        &self,
+        embedding_json: &str,
+        fetch_k: u32,
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        excluded: &HashSet<i64>,
+    ) -> Result<VecPage> {
         let sql = "
             SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
@@ -391,6 +557,8 @@ impl Database {
             WHERE v.embedding MATCH ?1 AND k = ?2
             ORDER BY v.distance
         ";
+        #[cfg(test)]
+        VEC_KNN_ATTEMPTS.with(|c| c.set(c.get() + 1));
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![embedding_json, fetch_k], |row| {
             let chunk_id: i64 = row.get(0)?;
@@ -416,10 +584,13 @@ impl Database {
         // 呼び出し側で cap されない値が来うるため、これを直接使うと
         // `Vec::with_capacity(u32::MAX)` = allocation abort になる
         // (full-audit 2026-07-26 AU-01: 実機で 927 GB 確保を試みて即死)。
-        // `fetch_k` は上の `FILTER_OVERFETCH_CAP` clamp を通っており、
-        // filter 無しの経路でも `FILTER_OVERFETCH_CAP` を上限として扱う。
+        // `fetch_k` は呼び出し側で `VEC_KNN_MAX_K` に clamp 済みなので、再取得で
+        // 倍にしていってもここは 4096 要素で頭打ちになる。
         let mut out = Vec::with_capacity(fetch_k.min(FILTER_OVERFETCH_CAP) as usize);
+        let mut rows_seen = 0usize;
+        let mut dropped_by_exclusion = 0usize;
         for row in rows {
+            rows_seen += 1;
             let (
                 chunk_id,
                 distance,
@@ -466,6 +637,17 @@ impl Database {
             if !matches_date_range(date.as_deref(), filters.date_from, filters.date_to) {
                 continue;
             }
+            // 除外 (F-4)。結果だけを見れば行ごとの連言なので順序は無関係だが、
+            // **この判定は連言の最後**でなければならない (codex review round 3)。
+            // ここで数えた数が「枠を広げ直すか」を決めるので、filter が既に落とした行を
+            // 数えてはいけない — その行は除外があってもなくても失われており、
+            // 足りない原因は除外ではない。数えると、広げた先で読み直すのは同じ prefix
+            // なので同じ行がまた数えられ、上限まで伸び続けたうえで「filter を通る遠い行」を
+            // 拾う = 除外なしの同じクエリが決して返さない行が返る。
+            if excluded.contains(&chunk_id) {
+                dropped_by_exclusion += 1;
+                continue;
+            }
             out.push((
                 chunk_id,
                 SearchResult {
@@ -485,6 +667,10 @@ impl Database {
                 break;
             }
         }
-        Ok(out)
+        Ok(VecPage {
+            rows_seen,
+            dropped_by_exclusion,
+            hits: out,
+        })
     }
 }

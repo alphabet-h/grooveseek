@@ -198,17 +198,19 @@ loopback origin** である。
 | `filter_applied.date_from` | string | 指定時のみ |
 | `filter_applied.date_to` | string | 指定時のみ |
 | `filter_applied.min_confidence_ratio` | number | 指定時のみ |
+| `filter_applied.excluded_terms` | string の array | query に除外があったときのみ |
 | `error` | string | **上の全体の代わりに**これだけが返る。MCP tool が拒否・失敗したとき。後述 |
 
 **search の応答は 2 つの形のうちどちらか。** 最終行より上が成功時。MCP tool が
 呼び出しを拒否する / 検索が失敗する場合 — `mmr_lambda` が範囲外、query が 1 KiB を
-超える、glob が壊れている、embedding や DB の失敗 — は `{"error": "…"}` だけが
+超える、glob が壊れている、除外だけの query、embedding や DB の失敗 — は
+`{"error": "…"}` だけが
 返り、**`results` キーは存在しない**。呼び出し側は `results` を無条件に読まず、
 **どちらが来たかで分岐する**こと。CLI にこの封筒は無い — 失敗を stderr に出して
 非ゼロ終了する ([責務分離](#コマンドライン)の節のとおり)。
 
-**`filter_applied` が echo するのは、その 8 つが「効果を持って届いたとき」だけ。**
-そこから 3 つのことが follow する。**どれも空オブジェクトの見た目とは違う**:
+**`filter_applied` が echo するのは、上表の行が「効果を持って届いたとき」だけ。**
+そこから 4 つのことが follow する。**どれも空オブジェクトの見た目とは違う**:
 
 - `min_quality` と `include_low_quality` は**適用されるが決して echo されない**。
   **品質フィルタは既定で有効**なので、`{}` は「結果に filter が掛かっていない」を
@@ -219,8 +221,10 @@ loopback origin** である。
   書き間違いである可能性が高いため。無効にしたいなら `null` を渡す
 - **`min_confidence_ratio` は echo されるが何も絞らない** — `low_confidence` を
   比べる閾値を決めるだけ。**echo は「結果を絞ったものの一覧」でもない**
+- **除外だけでも `filter_applied` は空にならない**: query が何かを除外して
+  いれば、他の filter が無くても `excluded_terms` が echo される
 
-`{}` は「**その 8 つのうち、報告すべき効果を持って届いたものが 1 つも無かった**」と
+`{}` は「**上表の行のうち、報告すべき効果を持って届いたものが 1 つも無かった**」と
 読む。「filter が指定されなかった」でも「filter が走らなかった」でもない。
 後から quality 入力を echo に足すのは「フィールドの追加」規則により minor である。
 

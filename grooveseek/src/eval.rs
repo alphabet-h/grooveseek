@@ -140,6 +140,16 @@ impl GoldenSet {
     /// a cap existed — two places for it to disagree with itself. `tune` only
     /// ever went through [`Self::load`], so a bound added to the other copy
     /// would have missed it entirely.
+    ///
+    /// A golden holding a query that cannot be searched — one made only of
+    /// `-term` exclusions — is refused here, at the read, rather than scored
+    /// as a miss. [`QueryResult`] has nowhere to record "this query was never
+    /// run", so a query that quietly returned nothing would land in the
+    /// recall and MRR denominators as a genuine zero and drag the reported
+    /// numbers down without saying why. It is a broken golden in the same
+    /// sense an unknown field is, and fixing it changes
+    /// [`ConfigFingerprint::golden_hash`], which is exactly what should happen
+    /// to a history comparison across the fix.
     pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
         // See [`is_present`]: a dangling symlink is a name that is taken, and
         // "there is no golden file" would be the wrong thing to say about it.
@@ -152,6 +162,11 @@ impl GoldenSet {
         let bytes = read_bounded(path, MAX_GOLDEN_FILE_BYTES, "golden file")?;
         let gs: Self = serde_yaml_bw::from_slice(&bytes)
             .with_context(|| format!("failed to parse golden file: {}", path.display()))?;
+        for q in &gs.queries {
+            crate::db::parse_query(&q.query)
+                .require_positive()
+                .with_context(|| format!("golden query {:?} cannot be searched", query_id(q)))?;
+        }
         Ok((gs, bytes))
     }
 
@@ -420,12 +435,15 @@ fn legacy_metric_version() -> u32 {
 }
 
 /// 現行の FTS クエリコンパイル規則の version。クエリ文字列から FTS5 の MATCH 式を
-/// 作る規則 (`db::fts_query::build_fts_query`) の**出力が変わる**変更のたびに +1 する。
+/// 作る規則 ([`crate::db::parse_query`]) の**出力が変わる**変更のたびに +1 する。
 /// [`ConfigFingerprint::fts_query_version`] を参照。
 ///
 /// [`METRIC_VERSION`] とは責務が違う。あちらは recall / MRR / nDCG の**計算式**専用で
 /// 「同じ検索結果から違う数値が出る」ケース、こちらは**検索結果そのもの**が変わるケース。
-pub const FTS_QUERY_VERSION: u32 = 2;
+///
+/// - 2: feature-48 (v0.16.0) — クエリを文字種 token の OR 式にコンパイルする
+/// - 3: feature-55 (v1.1.0) — group 先頭の `-` が除外になり、式が `(正) NOT (負)` を取り得る
+pub const FTS_QUERY_VERSION: u32 = 3;
 
 fn legacy_fts_query_version() -> u32 {
     1
@@ -1499,14 +1517,20 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
         let qid = query_id(q);
-        let qe = embedder.embed_single(&q.query)?;
+        // The embedder sees what the caller is looking for, not what they
+        // ruled out; the database gets the raw query and drops the excluded
+        // rows itself. `load_with_bytes` has already refused a golden whose
+        // query is nothing but exclusions, so `positive_text` is non-empty
+        // here for the same reason it is at the other two entry points.
+        let parsed = crate::db::parse_query(&q.query);
+        let qe = embedder.embed_single(parsed.positive_text())?;
         // Eval shares the MMR-aware pipeline with MCP / CLI search so the
         // golden YAML reflects the actual production retrieval (e.g. when
         // `[search.mmr] enabled = true`).
         let pipeline = crate::server::run_search_pipeline(
             &db,
             reranker.as_mut(),
-            &q.query,
+            &parsed,
             &qe,
             max_k as u32,
             &crate::db::SearchFilters::default(),
@@ -1977,6 +2001,53 @@ mod tests {
             msg.contains("bogus") || msg.contains("unknown"),
             "error chain should mention bogus/unknown, got: {msg}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A golden holding a query nobody can search is a broken golden, and it
+    /// is refused at the read rather than scored as a miss.
+    ///
+    /// Both routes in are checked, because they are two functions and only one
+    /// of them carries the loop: [`crate::tune`] reaches the golden through
+    /// [`GoldenSet::load`] and [`crate::eval`] through
+    /// [`GoldenSet::load_with_bytes`], exactly as
+    /// [`both_ways_into_the_golden_share_the_bound`] says of the size
+    /// cap. The context names the query, because a golden with forty entries
+    /// and one bad line is otherwise a hunt.
+    #[test]
+    fn a_golden_query_without_a_positive_term_is_refused_at_load() {
+        let path = write_yaml(
+            "eval-golden-exclusion-only",
+            "queries:\n\
+             - id: \"findable\"\n  query: \"rust async\"\n  expected:\n  - path: \"a.md\"\n\
+             - id: \"nothing-left\"\n  query: \"-foo\"\n  expected:\n  - path: \"b.md\"\n",
+        );
+
+        for msg in [
+            format!(
+                "{:#}",
+                GoldenSet::load(&path).expect_err("the tune route must refuse it")
+            ),
+            format!(
+                "{:#}",
+                GoldenSet::load_with_bytes(&path).expect_err("the eval route must refuse it")
+            ),
+        ] {
+            assert!(
+                msg.contains("cannot be searched"),
+                "the refusal must say the golden is unusable, not merely that \
+                 something failed: {msg}"
+            );
+            assert!(
+                msg.contains("nothing-left"),
+                "the refusal must name the offending query: {msg}"
+            );
+            assert!(
+                msg.contains("query has no positive term"),
+                "the reason is the one sentence all three entry points share: {msg}"
+            );
+        }
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3369,6 +3440,24 @@ enabled = true
         };
         let v = serde_json::to_value(&fp).unwrap();
         assert_eq!(v["fts_query_version"], serde_json::json!(FTS_QUERY_VERSION));
+    }
+
+    /// feature-55 (F-4) の bump を忘れる mutation の**唯一**の検出器。
+    ///
+    /// 先頭 `-` が除外になったことで、同じクエリ文字列から出る MATCH 式が変わり得る =
+    /// 検索結果そのものが変わる。bump しないと、規則が違う run どうしを eval が
+    /// 比較可能とみなし、構文変更による差を retrieval regression として報告する。
+    /// 既存のテストは値 2 を pin していないので、ここだけが気付ける。
+    #[test]
+    fn fts_query_version_covers_exclusion_syntax() {
+        // `let` を 1 つ挟むのは `clippy::assertions_on_constants` を避けるためで、
+        // 見ているのは const の値そのもの。
+        let recorded = FTS_QUERY_VERSION;
+        assert!(
+            recorded >= 3,
+            "the leading-hyphen exclusion syntax changes what a query compiles to, \
+             so runs from before it must not be compared against runs from after it"
+        );
     }
 
     // -----------------------------------------------------------------------

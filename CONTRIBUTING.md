@@ -70,7 +70,7 @@ The order of the two `cargo test` lines matters on a cold model cache, which is 
 
 - `grooveseek/src/parser/` — `Parser` trait + `Registry` (one impl per file format)
 - `grooveseek/src/indexer.rs` — `walkdir` → parse → embed → store pipeline
-- `grooveseek/src/db.rs` + `grooveseek/src/db/` — SQLite + sqlite-vec + FTS5 storage. Split in v0.15.0 into `schema.rs` (creation + forward migrations), `storage.rs` (CRUD), `search.rs` (vector KNN, FTS candidates, RRF fusion — `search_hybrid`, k=60 by default), `meta.rs` (`index_meta` key/value), and `fts_query.rs` (compiling a query into per-token FTS phrases, v0.16.0+)
+- `grooveseek/src/db.rs` + `grooveseek/src/db/` — SQLite + sqlite-vec + FTS5 storage. Split in v0.15.0 into `schema.rs` (creation + forward migrations), `storage.rs` (CRUD), `search.rs` (vector KNN, FTS candidates, RRF fusion — `search_hybrid`, k=60 by default), `meta.rs` (`index_meta` key/value), and `fts_query.rs` (compiling a query into per-token FTS phrases, v0.16.0+, and `-term` exclusions, v1.1.0+)
 - `grooveseek/src/embedder.rs` — `fastembed-rs` wrapper (embeddings + cross-encoder rerankers)
 - `grooveseek/src/mmr.rs` — MMR diversity re-rank (`mmr_select`, v0.7.0+)
 - `grooveseek/src/parent.rs` — Parent retriever content expansion (`apply_parent_retriever`, v0.7.0+)
