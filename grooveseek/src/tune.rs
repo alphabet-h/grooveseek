@@ -10,8 +10,8 @@
 //!   効く query 数を「実効 N」として先に測り、0 なら掃引せず exit 2 で終わる。
 //!   v0.15.x までは `sanitize_fts_query` がクエリ全体を単一 phrase 化していたため
 //!   これは「query が逐語で出現する場合だけ」を意味したが、feature-48 (v0.16.0) で
-//!   `db::fts_query::build_fts_query` が文字種 token の OR 式にコンパイルするように
-//!   なったので、自然文 query でも実効になり得る
+//!   [`crate::db::parse_query`] が文字種 token の OR 式 ([`crate::db::ParsedQuery::match_expr`])
+//!   にコンパイルするようになったので、自然文 query でも実効になり得る
 //! - grid は「query embedding 一括 → vec 候補 query あたり 1 回 → FTS 候補
 //!   bm25 条件ごと 1 回 → rrf_k はメモリ内」の 4 層に因数分解される
 //! - 小 golden set の argmax は overfit するので、nested leave-one-query-out
@@ -821,7 +821,19 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     // 高速化ポイントになる。
     let embeddings = {
         let usable = usable_queries(&golden);
-        let texts: Vec<&str> = usable.iter().map(|q| q.query.as_str()).collect();
+        // What gets embedded is the query with its `-term` groups cut out, the
+        // same text the MCP tool and `groove search` embed. **Nothing is
+        // filtered or reordered here**: `preflight_from_embeddings` zips this
+        // list with `usable_queries_quiet` by position and bails on a length
+        // mismatch, so dropping a query would silently mis-pair every query
+        // after it with someone else's embedding. There is nothing to drop in
+        // any case — `GoldenSet::load` has already refused a golden holding a
+        // query that is nothing but exclusions.
+        let parsed: Vec<crate::db::ParsedQuery<'_>> = usable
+            .iter()
+            .map(|q| crate::db::parse_query(&q.query))
+            .collect();
+        let texts: Vec<&str> = parsed.iter().map(|p| p.positive_text()).collect();
         embedder
             .embed_texts(&texts)
             .context("failed to embed golden queries")?

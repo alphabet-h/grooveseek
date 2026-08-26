@@ -130,8 +130,12 @@ pub struct QueryDiagnostics {
     /// 診断 (`idf_clamped`) の入力。
     ///
     /// feature-48 以前は「クエリ全体という単一 phrase の doc-freq」だったが、現在は
-    /// `build_fts_query` が生む **OR 集合の和集合**の大きさであり、個々の phrase の
-    /// doc-freq の**上界**でしかない (下の `idf_clamped` の注記を参照)。
+    /// [`crate::db::parse_query`] が生む **OR 集合の和集合**の大きさであり、個々の
+    /// phrase の doc-freq の**上界**でしかない (下の `idf_clamped` の注記を参照)。
+    ///
+    /// feature-55 以降は**除外を適用した後**の数でもある: `-term` を書いたクエリでは
+    /// [`crate::db::ParsedQuery::match_expr`] が `(正) NOT (負)` になるので、除外語を
+    /// 含む行はここに入らない。
     pub fts_total_matches: i64,
     /// vec pool と FTS list の重複 chunk 数。**0 なら全スコアが単項
     /// `1/(k+r+1)` になり順位が rrf_k 不変** = rrf_k 軸が測定不能。
@@ -139,6 +143,10 @@ pub struct QueryDiagnostics {
     /// grid 端の重み (heading 偏重 vs content 偏重) で FTS 順位が変わったか。
     pub bm25_sensitive: bool,
     /// クエリがマッチする chunk が総数の半分以上 = FTS5 の IDF クランプ域。
+    ///
+    /// 数えるのは**除外を適用した後**の一致数 (feature-55)。`-term` を書いたクエリでは
+    /// 除外語を含む行が母数から落ちるので、この診断は「実際に融合へ入る候補」について
+    /// の判定になる。
     ///
     /// feature-48 以降、この値は **OR 集合の和集合**の大きさから決まる。FTS5 は
     /// IDF を phrase ごとに計算してクランプするので、これは個々の phrase の

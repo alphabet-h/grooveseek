@@ -198,6 +198,7 @@ loopback origin** である。
 | `filter_applied.date_from` | string | 指定時のみ |
 | `filter_applied.date_to` | string | 指定時のみ |
 | `filter_applied.min_confidence_ratio` | number | 指定時のみ |
+| `filter_applied.excluded_terms` | string の array | query に除外があったときのみ |
 | `error` | string | **上の全体の代わりに**これだけが返る。MCP tool が拒否・失敗したとき。後述 |
 
 **search の応答は 2 つの形のうちどちらか。** 最終行より上が成功時。MCP tool が

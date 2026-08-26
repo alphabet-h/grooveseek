@@ -507,6 +507,8 @@ pub struct SearchFilterEcho {
     date_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_confidence_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded_terms: Option<Vec<String>>,
 }
 
 impl SearchFilterEcho {
@@ -521,6 +523,13 @@ impl SearchFilterEcho {
     /// Scalars pass through: `min_confidence_ratio` in particular is echoed
     /// whenever it was given, even though it narrows nothing, because it
     /// changes what `low_confidence` means for that call.
+    ///
+    /// `excluded_terms` arrives as a plain `Vec` rather than an `Option` and
+    /// takes the same rule, because there is nothing for a caller to have
+    /// left unset: the exclusions are what the parser found in the query, so
+    /// "none given" and "an empty list" are the same fact. They are the
+    /// phrases that were **applied**, not the `-groups` the query was written
+    /// with — see [`crate::db::ParsedQuery::exclude`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         category: Option<String>,
@@ -531,6 +540,7 @@ impl SearchFilterEcho {
         date_from: Option<String>,
         date_to: Option<String>,
         min_confidence_ratio: Option<f32>,
+        excluded_terms: Vec<String>,
     ) -> Self {
         let with_effect = |v: Option<Vec<String>>| v.filter(|l| !l.is_empty());
         Self {
@@ -542,6 +552,7 @@ impl SearchFilterEcho {
             date_from,
             date_to,
             min_confidence_ratio,
+            excluded_terms: with_effect(Some(excluded_terms)),
         }
     }
 }
@@ -712,7 +723,7 @@ where
 impl KbServer {
     #[tool(
         name = "search",
-        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them)."
+        description = "Hybrid search (vector + FTS5 full-text, merged via Reciprocal Rank Fusion) over the knowledge base. Returns a wrapper with results, low_confidence flag, and filter_applied echo. The `score` field is the RRF score (or cross-encoder score when reranker is enabled). `match_spans` field (when present) gives byte offsets into `content` for ASCII query phrases. The full-text half splits the query into per-token phrases combined with OR, so a sentence-shaped query matches documents containing any of its terms; wrap a substring in double quotes to require it verbatim, e.g. `\"Foundry Local\" setup`. Fragments shorter than three characters are merged into a neighbouring token, or dropped when they stand alone (quote them to keep them). Prefix a whitespace-delimited group with a hyphen to exclude it from both halves of the search, e.g. `rust -async` or `-\"exact phrase\"`; the excluded phrases are echoed in filter_applied.excluded_terms. A query made only of exclusions is refused, and a hyphen inside quotes (`\"-foo\"`) is searched for literally."
     )]
     pub(crate) async fn search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         let core = Arc::clone(&self.core);
@@ -2084,6 +2095,51 @@ mod tests {
         assert_eq!(&content[spans[1].start..spans[1].end], "Local");
     }
 
+    /// The spans are computed over the **positive text**, so a term the caller
+    /// excluded is never handed back to them highlighted.
+    ///
+    /// Two inputs, because they fail for different reasons:
+    ///
+    /// - `sqlite -vec` is the contract. Both halves of the search already drop
+    ///   the excluded rows, so nothing downstream would notice a span that
+    ///   covered `vec`; this row is what says the highlight follows the search.
+    ///   It passes on the raw query too — `query_phrases` reads the exclusion
+    ///   off the raw text as well, so the two inputs agree here.
+    /// - `xy -abc z` is the **detector**. Its positive terms are all under the
+    ///   trigram floor, so `compute_match_spans` falls through to splitting on
+    ///   whitespace, and that split has no idea what a `-` group means: handed
+    ///   the raw query it searches the hit for the literal `-abc` and finds it.
+    ///   That is the mutation the signature cannot catch, since
+    ///   `compute_match_spans` takes a `&str` either way.
+    #[test]
+    fn match_spans_never_cover_an_excluded_term() {
+        let covered = |query: &str, content: &str| -> Vec<String> {
+            let parsed = crate::db::parse_query(query);
+            compute_match_spans(parsed.positive_text(), content)
+                .expect("an ASCII query computes spans")
+                .iter()
+                .map(|s| content[s.start..s.end].to_string())
+                .collect()
+        };
+
+        let one = covered("sqlite -vec", "sqlite-vec is the vector extension");
+        assert!(
+            one.iter().all(|t| !t.to_ascii_lowercase().contains("vec")),
+            "an excluded term must not be highlighted as a match: {one:?}"
+        );
+        assert!(
+            one.iter().any(|t| t.eq_ignore_ascii_case("sqlite")),
+            "the positive term is still highlighted: {one:?}"
+        );
+
+        let two = covered("xy -abc z", "xy-abc z is the literal spelling");
+        assert!(
+            two.iter().all(|t| !t.to_ascii_lowercase().contains("abc")),
+            "the whitespace fallback must split the positive text, not the raw \
+             query, or an excluded group comes back as a highlight: {two:?}"
+        );
+    }
+
     #[test]
     fn test_compute_match_spans_case_insensitive_ascii() {
         let spans = compute_match_spans("Rust", "RUST is rusty").unwrap();
@@ -3037,8 +3093,17 @@ mod tests {
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
         let qe = vec![0.0_f32; 384];
-        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml)
-            .expect_err("out-of-range lambda must error");
+        let err = run_search_pipeline(
+            &db,
+            None,
+            &crate::db::parse_query("q"),
+            &qe,
+            5,
+            &filters,
+            &overrides,
+            &toml,
+        )
+        .expect_err("out-of-range lambda must error");
         assert!(
             err.to_string().contains("mmr_lambda out of range"),
             "expected mmr_lambda out-of-range error, got: {err}"
@@ -3057,8 +3122,17 @@ mod tests {
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
         let qe = vec![0.0_f32; 384];
-        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml)
-            .expect_err("out-of-range penalty must error");
+        let err = run_search_pipeline(
+            &db,
+            None,
+            &crate::db::parse_query("q"),
+            &qe,
+            5,
+            &filters,
+            &overrides,
+            &toml,
+        )
+        .expect_err("out-of-range penalty must error");
         assert!(
             err.to_string()
                 .contains("mmr_same_doc_penalty out of range"),
@@ -3081,8 +3155,17 @@ mod tests {
         let toml = crate::config::SearchConfig::default();
         let filters = crate::db::SearchFilters::default();
         let qe = vec![0.0_f32; 384];
-        let err = run_search_pipeline(&db, None, "q", &qe, 5, &filters, &overrides, &toml)
-            .expect_err("NaN lambda must error");
+        let err = run_search_pipeline(
+            &db,
+            None,
+            &crate::db::parse_query("q"),
+            &qe,
+            5,
+            &filters,
+            &overrides,
+            &toml,
+        )
+        .expect_err("NaN lambda must error");
         assert!(
             err.to_string().contains("mmr_lambda out of range"),
             "expected NaN lambda to be reported as out-of-range, got: {err}"
@@ -3184,7 +3267,7 @@ mod tests {
             run_search_pipeline(
                 &db,
                 None,
-                "zebrafish",
+                &crate::db::parse_query("zebrafish"),
                 &emb(0.2),
                 5,
                 &filters,
@@ -3258,7 +3341,7 @@ mod tests {
         let hits = run_search_pipeline(
             &db,
             None,
-            "zebrafish",
+            &crate::db::parse_query("zebrafish"),
             &emb(0.2),
             u32::MAX,
             &filters,
@@ -3978,6 +4061,7 @@ mod tests {
             Some("2026-01-01".to_string()),
             Some("2026-12-31".to_string()),
             Some(1.5),
+            vec!["async".to_string()],
         )
     }
 
@@ -4073,6 +4157,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         let value = serde_json::to_value(&echo).expect("the echo serializes");
         assert_eq!(
@@ -4083,12 +4168,113 @@ mod tests {
 
         // And a scalar that narrows nothing is still echoed, because it
         // changes what `low_confidence` means for the call.
-        let ratio_only =
-            SearchFilterEcho::new(None, None, None, None, None, None, None, Some(1.25));
+        let ratio_only = SearchFilterEcho::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1.25),
+            Vec::new(),
+        );
         assert_eq!(
             serde_json::to_value(&ratio_only).expect("the echo serializes"),
             serde_json::json!({"min_confidence_ratio": 1.25})
         );
+    }
+
+    /// The exclusions follow the same rule as every other list in the echo:
+    /// reported when they had an effect, absent when there was none.
+    ///
+    /// What is echoed is the phrases that were **applied**, not the groups the
+    /// caller wrote. They differ, and that is the point of showing them:
+    /// `-再ランキング` also excludes `ランキング`, and `-ab` excludes nothing
+    /// at all because it is under the trigram floor. A caller who cannot see
+    /// which of the two happened cannot tell an over-broad exclusion from a
+    /// silently ignored one.
+    #[test]
+    fn the_echo_lists_the_applied_exclusions_and_omits_an_empty_list() {
+        let echo = |excluded: Vec<String>| {
+            serde_json::to_value(SearchFilterEcho::new(
+                None, None, None, None, None, None, None, None, excluded,
+            ))
+            .expect("the echo serializes")
+        };
+
+        assert_eq!(
+            echo(Vec::new()),
+            serde_json::json!({}),
+            "a query that excluded nothing must leave no key behind, the same \
+             way an empty `tags_any` does"
+        );
+        assert_eq!(
+            echo(vec!["async".to_string()]),
+            serde_json::json!({"excluded_terms": ["async"]}),
+            "a search that dropped rows has to say which term dropped them"
+        );
+        assert_eq!(
+            echo(vec!["再ランキング".to_string(), "ランキング".to_string()]),
+            serde_json::json!({"excluded_terms": ["再ランキング", "ランキング"]}),
+            "the applied phrases are echoed verbatim, including the extra one \
+             tokenisation produced, so an over-broad exclusion is visible"
+        );
+    }
+
+    /// A query made only of exclusions is refused, and the refusal is the
+    /// `error` envelope every other MCP failure uses.
+    ///
+    /// `search_blocking` is a method on [`KbCore`], which owns a real
+    /// [`crate::embedder::Embedder`] — there is no stub — so what a unit test
+    /// can pin is the pair the tool body puts together: the decision
+    /// (`require_positive`) and the shape it is reported in. That the two are
+    /// actually wired to each other is pinned over the wire by
+    /// `an_exclusion_only_query_is_refused_over_the_protocol` in
+    /// `tests/mcp_protocol_surface.rs`.
+    #[test]
+    fn an_exclusion_only_query_is_refused_with_the_error_envelope() {
+        for query in ["-foo", "-\"ab\"", "-a -b"] {
+            let parsed = crate::db::parse_query(query);
+            let err = parsed
+                .require_positive()
+                .expect_err("a query with nothing to search for must be refused");
+
+            // The body the tool answers with, assembled the way the tool
+            // assembles it.
+            let body = serde_json::to_string_pretty(&ErrorResponse {
+                error: err.to_string(),
+            })
+            .expect("the error type serializes");
+            let value: serde_json::Value =
+                serde_json::from_str(&body).expect("the refusal must be JSON a client can read");
+
+            let message = value["error"]
+                .as_str()
+                .expect("the refusal must use the `error` envelope");
+            assert!(
+                message.contains("query has no positive term"),
+                "the refusal must say what is missing, not merely that the \
+                 query failed: {message}"
+            );
+            assert!(
+                message.is_ascii(),
+                "the same sentence reaches stderr from the command line, and \
+                 stderr is ASCII: {message}"
+            );
+            assert!(
+                value.get("results").is_none(),
+                "the envelope replaces the wrapper rather than joining it: {value}"
+            );
+        }
+
+        // The counterpart: an exclusion beside something to search for is a
+        // normal query, and a query with no exclusions at all is untouched.
+        for query in ["xy -abc z", "rust -async", ""] {
+            crate::db::parse_query(query)
+                .require_positive()
+                .unwrap_or_else(|e| panic!("`{query}` must still be searchable: {e}"));
+        }
     }
 
     /// A response with **every** optional field populated.

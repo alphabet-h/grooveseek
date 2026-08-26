@@ -66,6 +66,19 @@ impl KbCore {
             .unwrap_or_default();
         }
 
+        // F-4: `-term` の解析。**1 リクエストにつきここで 1 回**行い、以降は
+        // この `ParsedQuery` を持ち回る。除外しか書かれていないクエリは探す
+        // ものが無いので、1 KiB 超と同じ経路で断る — モデルにも DB にも触る
+        // 前に。断り文句は [`crate::db::ParsedQuery::require_positive`] が
+        // 持っており、CLI と golden の load も同じ 1 文を読む。
+        let parsed = crate::db::parse_query(&params.query);
+        if let Err(e) = parsed.require_positive() {
+            return serde_json::to_string_pretty(&ErrorResponse {
+                error: e.to_string(),
+            })
+            .unwrap_or_default();
+        }
+
         // AU-17: list 型 filter の件数・要素長の上限。`query` にだけ cap が
         // あって、同じリクエストに載る list は無制限という非対称を埋める。
         // 3 つの上限をここで並べて読めるようにしてある (`path_globs` は
@@ -100,7 +113,7 @@ impl KbCore {
         // query embedding
         let query_embedding = {
             let mut embedder = recover(self.embedder.lock(), "embedder");
-            match embedder.embed_single(&params.query) {
+            match embedder.embed_single(parsed.positive_text()) {
                 Ok(emb) => emb,
                 Err(e) => {
                     return serde_json::to_string_pretty(&ErrorResponse {
@@ -158,7 +171,7 @@ impl KbCore {
         let after_mmr = match run_search_pipeline(
             &db,
             reranker_arg,
-            &params.query,
+            &parsed,
             &query_embedding,
             limit,
             &filters,
@@ -213,7 +226,7 @@ impl KbCore {
         // match_spans は Parent retriever 拡張後の content に対して計算する
         // (`expand_parent` は defensive に None クリアするので必ず再計算が要る)。
         for h in &mut hits {
-            h.match_spans = compute_match_spans(&params.query, &h.content);
+            h.match_spans = compute_match_spans(parsed.positive_text(), &h.content);
         }
 
         // The empty-list rule lives in `new`, shared with the command line.
@@ -226,6 +239,7 @@ impl KbCore {
             params.date_from.clone(),
             params.date_to.clone(),
             params.min_confidence_ratio,
+            parsed.exclude().to_vec(),
         );
 
         // The `uri` on a hit and the URIs `resources/list` offers have to be the
@@ -292,6 +306,14 @@ pub(super) fn compute_reranker_input_limit(mmr_enabled: bool, pool_size: usize, 
 /// Returns `Vec<(chunk_id, SearchResult)>` so callers can apply their own
 /// final formatting (match_spans, JSON wrapper, eval metrics, etc.).
 ///
+/// The query arrives already parsed, as a [`crate::db::ParsedQuery`] rather
+/// than a `&str`. That is the whole reason the type exists: a `-term` group
+/// means one thing to the database (rows to drop) and another to the reranker
+/// (text that is not part of what the caller asked for), and a `&str` cannot
+/// tell a caller which of the two it is holding. Each of the three callers
+/// parses once, at the point it can still refuse the query, and hands the
+/// result down.
+///
 /// Range validation for `mmr_lambda` / `mmr_same_doc_penalty` is performed
 /// here so that all 3 callers reject `1.5` / `-0.1` / `NaN` consistently.
 /// Caller-side early reject (e.g. for a richer error response shape) is OK
@@ -300,7 +322,7 @@ pub(super) fn compute_reranker_input_limit(mmr_enabled: bool, pool_size: usize, 
 pub fn run_search_pipeline(
     db: &Database,
     reranker: Option<&mut Reranker>,
-    query: &str,
+    query: &crate::db::ParsedQuery<'_>,
     query_embedding: &[f32],
     limit: u32,
     filters: &crate::db::SearchFilters<'_>,
@@ -337,10 +359,17 @@ pub fn run_search_pipeline(
     //    多様化選抜、user の `limit` を反映して overfetch を計算)、reranker
     //    on → overfetch (`limit*5.max(50)`)、どちらも off → 最小コストで
     //    `limit` 件 (invariant #3 の bit-exact path)。
+    //
+    //    **The database gets the raw query; everything else gets the positive
+    //    text.** Both legs need the exclusions — dropping the rows that match
+    //    them is the whole job — so the db layer keeps its `&str` API and
+    //    parses for itself in `search_split_candidates`. The reranker below is
+    //    scoring a hit against what the caller asked for, and a term they ruled
+    //    out is not that.
     let mmr_pool_size = limit.saturating_mul(5).max(50);
     let candidates_pool: Vec<(i64, crate::db::SearchResult)> = if resolved.mmr_enabled {
         db.search_hybrid_candidates_unbounded(
-            query,
+            query.raw(),
             query_embedding,
             mmr_pool_size,
             filters,
@@ -348,14 +377,14 @@ pub fn run_search_pipeline(
         )?
     } else if use_rerank {
         db.search_hybrid_candidates(
-            query,
+            query.raw(),
             query_embedding,
             limit.saturating_mul(5).max(50),
             filters,
             fusion,
         )?
     } else {
-        db.search_hybrid_candidates(query, query_embedding, limit, filters, fusion)?
+        db.search_hybrid_candidates(query.raw(), query_embedding, limit, filters, fusion)?
     };
 
     // 2. Optional reranker。MMR off の reranker 入力 limit は `limit` (元の挙動
@@ -367,7 +396,11 @@ pub fn run_search_pipeline(
     let reranker_input_limit =
         compute_reranker_input_limit(resolved.mmr_enabled, candidates_pool.len(), limit);
     let reranked: Vec<(i64, crate::db::SearchResult)> = match reranker {
-        Some(r) => r.rerank_candidates_with_ids(query, candidates_pool, reranker_input_limit)?,
+        Some(r) => r.rerank_candidates_with_ids(
+            query.positive_text(),
+            candidates_pool,
+            reranker_input_limit,
+        )?,
         None => candidates_pool,
     };
 

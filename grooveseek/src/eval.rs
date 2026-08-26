@@ -140,6 +140,15 @@ impl GoldenSet {
     /// a cap existed — two places for it to disagree with itself. `tune` only
     /// ever went through [`Self::load`], so a bound added to the other copy
     /// would have missed it entirely.
+    ///
+    /// A golden holding a query that cannot be searched — one made only of
+    /// `-term` exclusions — is refused here, at the read, rather than scored
+    /// as a miss. [`QueryResult`] has nowhere to record "this query was never
+    /// run", so a query that quietly returned nothing would land in the
+    /// recall and MRR denominators as a genuine zero and drag the reported
+    /// numbers down without saying why. It is a broken golden in the same
+    /// sense an unknown field is, and fixing it changes `golden_hash`, which
+    /// is exactly what should happen to a history comparison across the fix.
     pub fn load_with_bytes(path: &Path) -> Result<(Self, Vec<u8>)> {
         // See [`is_present`]: a dangling symlink is a name that is taken, and
         // "there is no golden file" would be the wrong thing to say about it.
@@ -152,6 +161,11 @@ impl GoldenSet {
         let bytes = read_bounded(path, MAX_GOLDEN_FILE_BYTES, "golden file")?;
         let gs: Self = serde_yaml_bw::from_slice(&bytes)
             .with_context(|| format!("failed to parse golden file: {}", path.display()))?;
+        for q in &gs.queries {
+            crate::db::parse_query(&q.query)
+                .require_positive()
+                .with_context(|| format!("golden query {:?} cannot be searched", query_id(q)))?;
+        }
         Ok((gs, bytes))
     }
 
@@ -1502,14 +1516,20 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     let mut per_query = Vec::with_capacity(gs.queries.len());
     for q in &gs.queries {
         let qid = query_id(q);
-        let qe = embedder.embed_single(&q.query)?;
+        // The embedder sees what the caller is looking for, not what they
+        // ruled out; the database gets the raw query and drops the excluded
+        // rows itself. `load_with_bytes` has already refused a golden whose
+        // query is nothing but exclusions, so `positive_text` is non-empty
+        // here for the same reason it is at the other two entry points.
+        let parsed = crate::db::parse_query(&q.query);
+        let qe = embedder.embed_single(parsed.positive_text())?;
         // Eval shares the MMR-aware pipeline with MCP / CLI search so the
         // golden YAML reflects the actual production retrieval (e.g. when
         // `[search.mmr] enabled = true`).
         let pipeline = crate::server::run_search_pipeline(
             &db,
             reranker.as_mut(),
-            &q.query,
+            &parsed,
             &qe,
             max_k as u32,
             &crate::db::SearchFilters::default(),
@@ -1980,6 +2000,52 @@ mod tests {
             msg.contains("bogus") || msg.contains("unknown"),
             "error chain should mention bogus/unknown, got: {msg}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A golden holding a query nobody can search is a broken golden, and it
+    /// is refused at the read rather than scored as a miss.
+    ///
+    /// Both routes in are checked, because they are two functions and only one
+    /// of them carries the loop: `tune` reaches the golden through
+    /// [`GoldenSet::load`] and `eval` through [`GoldenSet::load_with_bytes`],
+    /// exactly as `both_ways_into_the_golden_share_the_bound` says of the size
+    /// cap. The context names the query, because a golden with forty entries
+    /// and one bad line is otherwise a hunt.
+    #[test]
+    fn a_golden_query_without_a_positive_term_is_refused_at_load() {
+        let path = write_yaml(
+            "eval-golden-exclusion-only",
+            "queries:\n\
+             - id: \"findable\"\n  query: \"rust async\"\n  expected:\n  - path: \"a.md\"\n\
+             - id: \"nothing-left\"\n  query: \"-foo\"\n  expected:\n  - path: \"b.md\"\n",
+        );
+
+        for msg in [
+            format!(
+                "{:#}",
+                GoldenSet::load(&path).expect_err("the tune route must refuse it")
+            ),
+            format!(
+                "{:#}",
+                GoldenSet::load_with_bytes(&path).expect_err("the eval route must refuse it")
+            ),
+        ] {
+            assert!(
+                msg.contains("cannot be searched"),
+                "the refusal must say the golden is unusable, not merely that \
+                 something failed: {msg}"
+            );
+            assert!(
+                msg.contains("nothing-left"),
+                "the refusal must name the offending query: {msg}"
+            );
+            assert!(
+                msg.contains("query has no positive term"),
+                "the reason is the one sentence all three entry points share: {msg}"
+            );
+        }
+
         let _ = std::fs::remove_file(&path);
     }
 

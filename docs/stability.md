@@ -211,6 +211,7 @@ different each time.
 | `filter_applied.date_from` | string | omitted unless given |
 | `filter_applied.date_to` | string | omitted unless given |
 | `filter_applied.min_confidence_ratio` | number | omitted unless given |
+| `filter_applied.excluded_terms` | array of strings | omitted unless the query excluded something |
 | `error` | string | **the whole response instead of the above**, when the MCP tool refuses or fails — see below |
 
 **A search answers with one of two shapes.** Everything above the last row is
