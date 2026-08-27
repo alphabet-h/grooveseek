@@ -3,7 +3,7 @@
 //! There is no logic here on purpose. What a plugin has to get right — the
 //! symbol names, their signatures, the NUL terminators, the length
 //! out-parameter for the tags query — lives in the macro
-//! `groove_grammar_abi::groove_grammar_plugin!`, so that a second grammar is a
+//! [`groove_grammar_abi::groove_grammar_plugin`], so that a second grammar is a
 //! manifest and one macro call rather than an FFI surface to review again.
 //!
 //! What this crate chooses is the four values:
