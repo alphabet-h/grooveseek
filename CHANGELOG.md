@@ -23,10 +23,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   opened unless `[parsers].enabled` names the language it belongs to: opening
   one runs its initialisers before a single symbol can be inspected, so groove
   looks up the file by name from a fixed table rather than reading whatever is
-  in the directory. An accepted plugin is checked for the exports it must have,
-  the ABI version it declares, a tree-sitter version this build speaks, a tags
-  query that compiles against its own grammar, and exactly one valid file
-  extension. See "Placing a grammar plugin" in
+  in the directory. A plugin is checked for the ABI version it declares —
+  first, and on its own, since every other export is read through the signature
+  that version defines — then for the exports it must have, a tree-sitter
+  version this build speaks, a tags query that compiles against its own
+  grammar, a language name a `lang:` filter can be written against, and exactly
+  one valid file extension, which must be the one the enabled id stands for. A
+  library found under one language's name that declares another is refused
+  rather than registered, so a mispackaged download cannot quietly take a file
+  type out of the index and put a different one in. See
+  "Placing a grammar plugin" in
   [docs/clients.md](docs/clients.md). *The first published grammar, Python,
   follows in the next release; this one adds the loader.*
 - **An id that needs a plugin says so, instead of reading as a typo.** Writing

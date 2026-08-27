@@ -34,7 +34,7 @@ pub use docx::DocxParser;
 /// knowledge base from ever reading `GROOVE_GRAMMAR_DIR`.
 pub fn needs_grammar_plugin(ids: &[String]) -> bool {
     ids.iter()
-        .any(|id| code::plugin::plugin_stem(&id.to_ascii_lowercase()).is_some())
+        .any(|id| code::plugin::plugin_entry(&id.to_ascii_lowercase()).is_some())
 }
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;

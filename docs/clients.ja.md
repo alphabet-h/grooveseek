@@ -243,7 +243,7 @@ groove はソースコードを定義 1 つ = chunk 1 つで parse するが、�
 1. [releases ページ](https://github.com/alphabet-h/grooveseek/releases)で、**使っている groove の版**の `groove-grammar-<言語>-<target>` アーカイブを探す。plugin とバイナリは ABI 版を共有するので、別の release のものは拒否されうる。
 2. 展開して、ライブラリを grammar ディレクトリに置く。既定は Windows なら `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、macOS なら `~/Library/Application Support/groove/grammars`。別の場所にするなら `groove.toml` の `grammar_dir` か、環境変数 `GROOVE_GRAMMAR_DIR` を使う — こちらは**絶対パス必須**で、相対値だと「クライアントがたまたま groove を起動したディレクトリ」に対して解決されてしまうため。
 3. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。
-4. **service に任せる前に、`groove doctor` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。自分で 1 回叩けば、その文言が画面に出る。
+4. **service に任せる前に、`groove index` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
 
 自動 DL は一切しないし、`enabled` に書いた言語以外は開かない — そのディレクトリに有効化していない言語のファイルがあっても触らない。有効化した言語の plugin が使えない場合、コマンドは「どのファイルをどこに置くべきか」を告げて止まる。ソースを plain text として索引するフォールバックはしない。
 

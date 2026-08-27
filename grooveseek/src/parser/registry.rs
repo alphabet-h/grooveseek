@@ -111,18 +111,6 @@ pub(crate) fn plugin_dir_undecidable_message(id: &str) -> String {
     )
 }
 
-/// Two parsers claiming the same extension. Refused rather than resolved by order.
-///
-/// First-wins would make which grammar parses a file depend on the order of
-/// `[parsers].enabled`, and a plugin declares its own extension — so a file the user placed
-/// could quietly take over `.rs` and the index would change with nothing to point at.
-pub(crate) fn extension_conflict_message(extension: &str, first: &str, second: &str) -> String {
-    format!(
-        "[parsers].enabled has both {first:?} and {second:?} claiming the file extension \
-         {extension:?}. groove indexes one file with one parser, so remove one of them."
-    )
-}
-
 #[cfg(feature = "grammar-rust")]
 fn rust_parser(code: &CodeParsersConfig) -> Result<Box<dyn Parser>> {
     let grammar = super::code::static_rust::grammar()?;
@@ -152,7 +140,7 @@ fn rust_parser(_code: &CodeParsersConfig) -> Result<Box<dyn Parser>> {
 /// The directory is read only from here, and only for an id that needs it: a knowledge base of
 /// Markdown never touches it, whatever command is running.
 fn plugin_parser(
-    id: &str,
+    id: &'static str,
     stem: &str,
     code: &CodeParsersConfig,
     grammar_dir: Option<&Path>,
@@ -165,7 +153,11 @@ fn plugin_parser(
     if !path.exists() {
         anyhow::bail!(plugin_missing_message(id, dir, &file_name));
     }
-    let loaded = super::code::plugin::load(&path)
+    // The id is handed to the loader as the extension the library is expected to declare. It
+    // is not a hint: a library that declares something else is refused, because groove found
+    // this file *by* the id and registering another extension would move the language without
+    // saying so.
+    let loaded = super::code::plugin::load(&path, id)
         .map_err(|r| anyhow::anyhow!(plugin_rejected_message(id, &path, &r.describe())))?;
     Ok(Box::new(super::CodeParser::new(
         loaded.grammar,
@@ -222,10 +214,6 @@ impl Registry {
         }
         let mut parsers: Vec<Box<dyn Parser>> = Vec::with_capacity(ids.len());
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Which id claimed each extension. A plugin declares its own, so this is the only place
-        // that can notice two parsers wanting the same file.
-        let mut claimed: std::collections::HashMap<&'static str, String> =
-            std::collections::HashMap::new();
         let mut code_max_chunk_chars = None;
         for id in ids {
             let lower = id.to_ascii_lowercase();
@@ -260,10 +248,10 @@ impl Registry {
                 // (feature-56 PR-3a) A grammar the user placed. The table is consulted before
                 // the id is called unknown, so a language groove knows how to load gets the
                 // "put the file here" answer instead of a spelling suggestion.
-                other => match super::code::plugin::plugin_stem(other) {
-                    Some(stem) => {
+                other => match super::code::plugin::plugin_entry(other) {
+                    Some((canonical, stem)) => {
                         code_max_chunk_chars = Some(code.max_chunk_chars);
-                        plugin_parser(other, stem, code, grammar_dir)?
+                        plugin_parser(canonical, stem, code, grammar_dir)?
                     }
                     None => anyhow::bail!(unresolved_id_message(
                         other,
@@ -273,15 +261,18 @@ impl Registry {
                     )),
                 },
             };
-            // Checked for every parser, not just the plugins: the rule is "one extension, one
-            // parser", and a rule that only looks at the new arrivals is a rule with a hole.
-            if let Some(first) = claimed.insert(parser.extension(), lower.clone()) {
-                anyhow::bail!(extension_conflict_message(
-                    parser.extension(),
-                    &first,
-                    &lower
-                ));
-            }
+            // No collision check here, deliberately. Every id above registers a parser whose
+            // extension **is** that id — the built-ins by construction, the compiled-in Rust
+            // grammar by the literal it is built with, and a plugin because the loader refuses
+            // one that declares anything else. Together with the duplicate-id check above, two
+            // parsers claiming one extension is not a state this loop can reach, so a guard
+            // against it would be a branch no test could enter. What holds the property up is
+            // `every_registered_parser_answers_to_the_id_that_enabled_it` below.
+            debug_assert_eq!(
+                parser.extension(),
+                lower,
+                "a parser must answer to the id that enabled it"
+            );
             parsers.push(parser);
         }
         Ok(Self {
@@ -504,13 +495,31 @@ mod tests {
         assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
     }
 
-    /// Two parsers for one extension is refused, and the message names both
-    /// ids — the user has to know which two to choose between.
+    /// **Every parser answers to the id that enabled it.**
+    ///
+    /// This is the property that makes "one extension, one parser" true, and
+    /// the reason the loop needs no collision check: with the duplicate-id
+    /// check it already has, two parsers cannot claim one extension unless an
+    /// id and its extension come apart. A new built-in whose
+    /// [`super::Parser::extension`]
+    /// disagrees with its id fails here, where the answer is one line, rather
+    /// than at some later point where a file is quietly parsed by the wrong
+    /// thing.
     #[test]
-    fn an_extension_claimed_twice_names_both_claimants() {
-        let msg = extension_conflict_message("rs", "rs", "py");
-        assert!(msg.contains("\"rs\"") && msg.contains("\"py\""), "{msg}");
-        assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
+    fn every_registered_parser_answers_to_the_id_that_enabled_it() {
+        // Every id this build can construct a parser for without a file being
+        // placed first, which is exactly `available_ids`.
+        let ids: Vec<String> = available_ids().iter().map(|s| s.to_string()).collect();
+        let registry = Registry::from_enabled_with_plugins(&ids, &Default::default(), None)
+            .expect("every available id builds");
+        let mut extensions = registry.extensions();
+        extensions.sort_unstable();
+        let mut expected = available_ids();
+        expected.sort_unstable();
+        assert_eq!(
+            extensions, expected,
+            "an id and the extension its parser answers to must be the same string"
+        );
     }
 
     /// An id no plugin claims still fails the way it always did, and an id a

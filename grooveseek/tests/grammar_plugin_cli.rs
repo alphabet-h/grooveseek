@@ -217,18 +217,20 @@ fn a_library_without_the_contract_is_refused_by_the_symbol_it_lacks() {
 }
 
 // ---------------------------------------------------------------------------
-// Extension collision
+// The declared extension has to be the one the id stands for
 // ---------------------------------------------------------------------------
 
-/// A plugin cannot take over a file type by being listed, whatever the order.
+/// A plugin cannot move the language it was loaded for.
 ///
-/// Both orders are run: first-wins would make one of them succeed, and testing one order only
-/// would not tell the difference between "refused" and "the compiled-in grammar happened to be
-/// registered first".
+/// groove found this file by building its name from the enabled id, so the two already claim
+/// to be the same thing. A library declaring something else is a mispackaged plugin, and
+/// registering what it says would take `.py` out of the index and put `.rs` in — with nothing
+/// refused and nothing logged. Both orders are run because the answer must not depend on
+/// whether the compiled-in grammar happened to be registered first.
 #[test]
-fn a_plugin_claiming_a_compiled_in_extension_is_refused_in_either_order() {
+fn a_plugin_declaring_another_languages_extension_is_refused_in_either_order() {
     for enabled in ["[\"rs\", \"py\"]", "[\"py\", \"rs\"]"] {
-        let layout = TempKbLayout::new("groove-plugin-conflict");
+        let layout = TempKbLayout::new("groove-plugin-mismatch");
         layout.write("notes.md", SAMPLE_MD);
         let grammars = empty_grammar_dir(&layout);
         place_plugin(&grammars, "groove_grammar_claims_rs");
@@ -240,10 +242,13 @@ fn a_plugin_claiming_a_compiled_in_extension_is_refused_in_either_order() {
         std::fs::write(&cfg, body).expect("write config");
 
         let (ok, stderr) = run_index(&cfg, layout.kb());
-        assert!(!ok, "{enabled}: a claimed extension must fail:\n{stderr}");
         assert!(
-            stderr.contains("claiming the file extension"),
-            "{enabled}: expected the conflict wording:\n{stderr}"
+            !ok,
+            "{enabled}: a mismatched extension must fail:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("but the id it was loaded for stands for"),
+            "{enabled}: expected the mismatch wording:\n{stderr}"
         );
         assert!(!db_path(&layout).exists(), "{enabled}");
     }

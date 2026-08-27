@@ -1,14 +1,14 @@
-//! (feature-56 PR-3a) A valid plugin that claims an extension already taken.
+//! (feature-56 PR-3a) A valid plugin that declares the wrong language's extension.
 //!
-//! Identical to `valid.rs` except for the extension it declares, which is the one the
-//! compiled-in Rust grammar owns. Loading it succeeds — everything about the contract is in
-//! order — and the registry refuses the *pair*, which is the behaviour under test: a plugin
-//! must not be able to take over a file type by being listed first.
+//! Identical to `valid.rs` except for the extension it declares. Every part of the contract is
+//! in order — the exports, the ABI version, the grammar, the tags query — so the only thing
+//! wrong is that a library found under the `py` id says it is for `rs`. That is what a
+//! mispackaged download looks like, and refusing it is what stops one from silently taking
+//! `.py` out of the index and putting `.rs` in.
 //!
-//! Plugin-versus-plugin collision has no fixture because it is unreachable in this release:
-//! the id-to-file table holds one entry, so two plugins cannot both be enabled. The registry
-//! check is written over all parsers rather than over the new ones, so it covers that case the
-//! day a second language is added.
+//! It is loaded under the `py` id, never under `rs`, so it also stands in for the collision
+//! case the registry no longer needs a check for: with the declared extension pinned to the
+//! id, two parsers claiming one extension is not a state the registry can reach.
 
 #[cfg(feature = "grammar-rust")]
 groove_grammar_abi::groove_grammar_plugin! {

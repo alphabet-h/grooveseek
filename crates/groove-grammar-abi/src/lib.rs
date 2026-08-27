@@ -186,11 +186,75 @@ pub fn extension_is_valid(extension: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// Whether a declared language name is one groove will accept.
+///
+/// The name is not decoration: it becomes the `lang:` tag on every chunk the grammar produces,
+/// so a filter like `lang:python` is written against it. A plugin that hands back an empty
+/// string, or one in a case nobody would guess, loads successfully and then makes those filters
+/// match nothing — a failure with no error attached to it. Checking here turns that into a
+/// refusal the user can read.
+///
+/// Slightly wider than [`extension_is_valid`], because a language name is prose where an
+/// extension is a file suffix: `-` and `_` are allowed, so `c-sharp` and `objective_c` are
+/// spellable.
+pub fn name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
 impl GrammarDescriptor {
     /// Whether this descriptor's declared extension is one groove will accept.
     ///
     /// See [`extension_is_valid`], which holds the rule.
     pub fn extension_is_valid(&self) -> bool {
         extension_is_valid(self.extension)
+    }
+
+    /// Whether this descriptor's declared language name is one groove will accept.
+    ///
+    /// See [`name_is_valid`], which holds the rule.
+    pub fn name_is_valid(&self) -> bool {
+        name_is_valid(self.name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compiled-in path is held to the same contract the loader enforces on a plugin.
+    ///
+    /// Without this, the rules could tighten on one side only, and the grammar nobody has to
+    /// place would be the one that stopped satisfying them.
+    #[test]
+    fn the_rules_a_plugin_must_satisfy_accept_an_ordinary_descriptor() {
+        assert!(extension_is_valid("py"));
+        assert!(extension_is_valid("rs"));
+        assert!(name_is_valid("python"));
+        assert!(name_is_valid("c-sharp"));
+        assert!(name_is_valid("objective_c"));
+    }
+
+    #[test]
+    fn an_extension_groove_cannot_key_a_parser_by_is_refused() {
+        assert!(!extension_is_valid(""), "empty");
+        assert!(!extension_is_valid(".py"), "leading dot");
+        assert!(!extension_is_valid("PY"), "uppercase");
+        assert!(!extension_is_valid("py;pyi"), "the reserved separator");
+        assert!(!extension_is_valid(&"p".repeat(65)), "unreasonably long");
+    }
+
+    /// The name reaches search filters as `lang:<name>`, so the same shapes are refused —
+    /// plus the ones that would still key a parser but read as nothing to a user.
+    #[test]
+    fn a_language_name_no_filter_could_match_is_refused() {
+        assert!(!name_is_valid(""), "empty");
+        assert!(!name_is_valid("Python"), "uppercase");
+        assert!(!name_is_valid("py thon"), "whitespace");
+        assert!(!name_is_valid("py:thon"), "the tag separator itself");
+        assert!(!name_is_valid(&"p".repeat(65)), "unreasonably long");
     }
 }
