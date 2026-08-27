@@ -44,11 +44,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
-- **Replacing a grammar plugin is noticed.** groove records which plugin cut the
-  code chunks in an index — by a hash of the library's own bytes, not by the
-  version it claims, so a rebuild against a newer grammar counts as a change
-  whether or not its author moved a version number — and says so when the
-  plugins loaded now are not the ones that did. A rebuilt grammar can move where definitions begin and end, but
+- **Replacing a grammar plugin is noticed.** groove records what cut the code
+  chunks in an index and says so when that is no longer what is loaded. The
+  record covers both halves of the answer: a hash of each plugin library's own
+  bytes — not the version it claims, so a rebuild against a newer grammar counts
+  whether or not its author moved a number — and a version for groove's own
+  chunking rules, which decide where a definition begins and ends whatever
+  grammar supplied the parse tree. With `[parsers.code].max_chunk_chars`, which
+  was already recorded, that is everything that determines a code chunk's
+  boundaries. A record is written only once a plugin has actually cut something,
+  and retired once nothing it describes is left. A rebuilt grammar can move where definitions begin and end, but
   indexing skips files whose content has not changed — so without this, an index
   would quietly come to hold two generations of chunks as files were edited. The
   recorded value is deliberately not updated on a mismatch: writing it would

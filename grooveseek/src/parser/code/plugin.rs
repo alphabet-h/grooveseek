@@ -467,6 +467,22 @@ mod tests {
         }
     }
 
+    /// The host's chunking version is part of what a code chunk's boundaries depend on, so it
+    /// has to be something a release can move.
+    ///
+    /// Not an assertion about its value — that changes on purpose. What must hold is that it
+    /// exists and is carried, which the registry's generation string does; this pins the type
+    /// so that turning it into something derived (groove's version, a build timestamp) is a
+    /// visible change rather than a quiet one.
+    #[test]
+    fn the_host_chunking_version_is_a_number_a_release_sets_deliberately() {
+        let schema: u32 = super::super::CHUNKING_SCHEMA;
+        assert!(
+            schema >= 1,
+            "the first version is 1; 0 would read as 'unset'"
+        );
+    }
+
     /// The hash has to change when the bytes do, and not when they do not.
     ///
     /// That is the whole contract: it stands in for "is this the same library", which the

@@ -1357,7 +1357,7 @@ pub async fn run_server(
         indexer::resolve_code_chunk_budget(&db, budget, false)?;
     }
     if let Some(generation) = parser_registry.code_grammar_generation() {
-        indexer::resolve_grammar_generation(&db, generation, false)?;
+        indexer::report_grammar_generation(&db, generation)?;
     }
 
     // AU-06 (codex P2): `[parsers].enabled` を狭めた後、その拡張子の行は DB に
@@ -3265,9 +3265,9 @@ mod tests {
     fn test_serve_resolves_code_chunk_provenance_before_the_watcher() {
         let db = crate::db::Database::open_in_memory().expect("in-memory db");
 
-        // Fresh index: both are simply adopted, the way the mode above is.
+        // An index built by a previous `groove index`, which is what `serve` opens.
         crate::indexer::resolve_code_chunk_budget(&db, 3500, false).expect("budget");
-        crate::indexer::resolve_grammar_generation(&db, "py=plugin 1.0.0", false)
+        crate::indexer::record_grammar_generation(&db, Some("py=plugin 1.0.0"), true, false)
             .expect("generation");
         assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(3500));
         assert_eq!(
@@ -3277,10 +3277,10 @@ mod tests {
 
         // Restarted after both moved. Neither recorded value may change: the chunks in the
         // index are still the ones the old settings cut, and recording the new ones would
-        // silence the next start while leaving the index just as mixed.
+        // silence the next start while leaving the index just as mixed. `serve` uses the
+        // reporting half only, which cannot write at all.
         crate::indexer::resolve_code_chunk_budget(&db, 1200, false).expect("budget");
-        crate::indexer::resolve_grammar_generation(&db, "py=plugin 2.0.0", false)
-            .expect("generation");
+        crate::indexer::report_grammar_generation(&db, "py=plugin 2.0.0").expect("generation");
         assert_eq!(
             db.read_code_max_chunk_chars().unwrap(),
             Some(3500),

@@ -48,6 +48,26 @@ pub(crate) const MAX_RAW_CODE_BYTES: u64 = 1024 * 1024;
 /// file that wants more than this is a file that should not have been indexed.
 const MAX_CHUNKS_PER_FILE: usize = 512;
 
+/// (feature-56 PR-3a) Version of the chunking rules on **this** side of the grammar.
+///
+/// A grammar supplies a parse table and a tags query; everything done with them lives here —
+/// where a definition begins and ends, how far back a doc comment pulls it, which gaps become
+/// chunks and which are dropped, how an oversized definition is split. A release that changes
+/// any of that cuts the same file differently while the plugin's bytes are identical, so
+/// hashing the library alone would report no change and files that were not edited would keep
+/// the old boundaries silently — the same failure a replaced plugin causes, from the other
+/// side of the same seam.
+///
+/// **Bump this when those rules change what a chunk covers.** It is a decision, not something
+/// derived: groove's own version would advance on every release whether or not chunking moved,
+/// and a marker that changes when nothing did teaches people to ignore it. Not bumping it after
+/// a real change is the failure this guards against, so treat it the way a schema migration is
+/// treated — part of the change, not a follow-up.
+///
+/// Purely cosmetic edits here (naming, comments, a faster path to the same output) do not move
+/// it.
+pub(crate) const CHUNKING_SCHEMA: u32 = 1;
+
 /// Default budget for one chunk, counted in non-whitespace characters.
 ///
 /// Above the largest definition the spike measured (3404), so ordinary functions stay whole:

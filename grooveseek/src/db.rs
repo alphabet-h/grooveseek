@@ -4062,8 +4062,8 @@ mod tests {
         let first = "py=groove-grammar-python 1.3.0; grammar python";
         let second = "py=groove-grammar-python 1.4.0; grammar python";
 
-        // First index with a plugin: nothing recorded yet, so it is simply adopted.
-        crate::indexer::resolve_grammar_generation(&db, first, false).unwrap();
+        // First index with a plugin that cut something: nothing recorded yet, so it is adopted.
+        crate::indexer::record_grammar_generation(&db, Some(first), true, false).unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some(first)
@@ -4071,24 +4071,63 @@ mod tests {
 
         // The plugin is replaced. Unchanged files keep chunks the old grammar cut, so the
         // recorded value must NOT move — the same rule the budget follows.
-        crate::indexer::resolve_grammar_generation(&db, second, false).unwrap();
+        crate::indexer::record_grammar_generation(&db, Some(second), true, false).unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some(first),
             "a mismatch must not be recorded away"
         );
-        crate::indexer::resolve_grammar_generation(&db, second, false).unwrap();
+        crate::indexer::record_grammar_generation(&db, Some(second), true, false).unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some(first)
         );
 
         // A forced re-index re-chunks everything, so the index does then match.
-        crate::indexer::resolve_grammar_generation(&db, second, true).unwrap();
+        crate::indexer::record_grammar_generation(&db, Some(second), true, true).unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some(second)
         );
+    }
+
+    /// (feature-56 PR-3a) A plugin enabled for a knowledge base with none of its files must
+    /// not leave a record behind.
+    ///
+    /// The record says which grammar cut the chunks in this index. With no file of that
+    /// language indexed, it cut none — and a record of that would report a difference, on
+    /// every run after the plugin is replaced, that cannot have changed one indexed document.
+    /// The user would be sent to `--force` a rebuild with nothing in it to rebuild.
+    #[test]
+    fn a_plugin_that_cut_nothing_leaves_no_record_to_warn_about_later() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Enabled, loaded, and not a single file of that language in the knowledge base.
+        crate::indexer::record_grammar_generation(&db, Some("py=plugin 1.0.0"), false, false)
+            .unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap(),
+            None,
+            "a grammar that cut nothing has nothing to describe"
+        );
+
+        // Even under --force, which re-chunks everything: everything is still nothing.
+        crate::indexer::record_grammar_generation(&db, Some("py=plugin 1.0.0"), false, true)
+            .unwrap();
+        assert_eq!(db.read_code_grammar_generation().unwrap(), None);
+
+        // A file of that language appears, and now there is something to record.
+        crate::indexer::record_grammar_generation(&db, Some("py=plugin 1.0.0"), true, false)
+            .unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some("py=plugin 1.0.0")
+        );
+
+        // The last such file is deleted, so the record stops describing anything and goes.
+        crate::indexer::record_grammar_generation(&db, Some("py=plugin 1.0.0"), false, false)
+            .unwrap();
+        assert_eq!(db.read_code_grammar_generation().unwrap(), None);
     }
 
     /// (feature-56 PR-3a) A record must not outlive the chunks it describes.
@@ -4116,8 +4155,13 @@ mod tests {
 
         // And with the record gone, enabling a plugin again adopts its generation quietly
         // rather than reporting a change.
-        crate::indexer::resolve_grammar_generation(&db, "py=groove-grammar-python 1.4.0", false)
-            .unwrap();
+        crate::indexer::record_grammar_generation(
+            &db,
+            Some("py=groove-grammar-python 1.4.0"),
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some("py=groove-grammar-python 1.4.0")
@@ -4152,7 +4196,8 @@ mod tests {
             db.read_code_grammar_generation().unwrap().is_some(),
             "a run that failed before pruning must leave the record describing what remains"
         );
-        crate::indexer::resolve_grammar_generation(&db, "py=plugin 2.0.0", false).unwrap();
+        crate::indexer::record_grammar_generation(&db, Some("py=plugin 2.0.0"), true, false)
+            .unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some("py=plugin 1.0.0"),
@@ -4166,7 +4211,7 @@ mod tests {
     fn an_index_that_predates_the_grammar_generation_key_adopts_it_silently() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.read_code_grammar_generation().unwrap().is_none());
-        crate::indexer::resolve_grammar_generation(&db, "py=x 1.0.0", false).unwrap();
+        crate::indexer::record_grammar_generation(&db, Some("py=x 1.0.0"), true, false).unwrap();
         assert_eq!(
             db.read_code_grammar_generation().unwrap().as_deref(),
             Some("py=x 1.0.0")
