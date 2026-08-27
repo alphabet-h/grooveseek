@@ -4050,6 +4050,60 @@ mod tests {
         assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(1200));
     }
 
+    /// (feature-56 PR-3a) A replaced grammar plugin behaves exactly like a moved chunk budget.
+    ///
+    /// Written as its own test rather than folded into the one above because the two are
+    /// independent inputs to the same outcome: a rebuilt plugin at the same budget still cuts
+    /// differently, and a moved budget with the same plugin does too. Sharing a test would let
+    /// one of them stop working while the other kept it green.
+    #[test]
+    fn a_replaced_grammar_plugin_keeps_warning_until_a_forced_reindex() {
+        let db = Database::open_in_memory().unwrap();
+        let first = "py=groove-grammar-python 1.3.0; grammar python";
+        let second = "py=groove-grammar-python 1.4.0; grammar python";
+
+        // First index with a plugin: nothing recorded yet, so it is simply adopted.
+        crate::indexer::resolve_grammar_generation(&db, first, false).unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some(first)
+        );
+
+        // The plugin is replaced. Unchanged files keep chunks the old grammar cut, so the
+        // recorded value must NOT move — the same rule the budget follows.
+        crate::indexer::resolve_grammar_generation(&db, second, false).unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some(first),
+            "a mismatch must not be recorded away"
+        );
+        crate::indexer::resolve_grammar_generation(&db, second, false).unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some(first)
+        );
+
+        // A forced re-index re-chunks everything, so the index does then match.
+        crate::indexer::resolve_grammar_generation(&db, second, true).unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some(second)
+        );
+    }
+
+    /// An index built before this key existed adopts the current generation rather than
+    /// warning about a value it never recorded.
+    #[test]
+    fn an_index_that_predates_the_grammar_generation_key_adopts_it_silently() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.read_code_grammar_generation().unwrap().is_none());
+        crate::indexer::resolve_grammar_generation(&db, "py=x 1.0.0", false).unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some("py=x 1.0.0")
+        );
+    }
+
     #[test]
     fn test_context_mode_malformed_is_none() {
         let db = Database::open_in_memory().unwrap();

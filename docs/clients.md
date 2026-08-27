@@ -248,6 +248,8 @@ groove parses source code one definition at a time, but only Rust is compiled in
 
 Nothing is downloaded automatically and nothing but the enabled languages is opened — a file in that directory belonging to a language you did not enable is never touched. If an enabled language has no usable plugin, the command stops and says which file it wanted and where; it does not fall back to indexing the source as plain text.
 
+**When you replace a plugin, re-index with `--force`.** A rebuilt grammar can cut the same file into different chunks, but indexing skips files whose content has not changed, so a plain re-index would leave those files with chunks the old grammar made and apply the new one only to files you edit afterwards. groove records which build cut the chunks in an index and warns when it no longer matches; `groove index --force` is what actually re-chunks them. The same is true after changing `[parsers.code].max_chunk_chars`, and for the same reason.
+
 > **A grammar plugin is native code that groove loads into its own process.** Treat one like any other binary you install: take it from the release page for the version you are running, and not from anywhere else. This is also why a `groove.toml` that groove merely *found* — rather than one you named with `--config` — cannot choose the directory; see [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
 
 ## Working around HuggingFace TLS failures on first download

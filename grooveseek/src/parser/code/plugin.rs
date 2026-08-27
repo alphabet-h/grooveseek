@@ -156,6 +156,13 @@ pub(crate) struct LoadedPlugin {
     pub(crate) grammar: Arc<LoadedGrammar>,
     /// Leaked from the library's own string, so it outlives any borrow of it.
     pub(crate) extension: &'static str,
+    /// What the plugin says built it, verbatim.
+    ///
+    /// Logged, and carried into the index so that replacing a plugin with a newer build can be
+    /// noticed. A rebuilt grammar can cut the same file into different chunks, and a file whose
+    /// content has not changed never reaches the parser again — the same shape
+    /// `[parsers.code].max_chunk_chars` already has, and handled the same way.
+    pub(crate) build_info: String,
 }
 
 /// Open one plugin and check it.
@@ -257,6 +264,7 @@ pub(crate) fn load(
     Ok(LoadedPlugin {
         grammar: Arc::new(grammar),
         extension,
+        build_info: raw.build_info,
     })
 }
 

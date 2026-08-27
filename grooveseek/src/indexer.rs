@@ -515,6 +515,12 @@ pub fn rebuild_index(
     if let Some(budget) = registry.code_max_chunk_chars() {
         resolve_code_chunk_budget(db, budget, force)?;
     }
+    // (feature-56 PR-3a) And when a grammar plugin has been replaced since then. Separate from
+    // the budget above because the two move independently: a rebuilt plugin with the same
+    // budget still cuts differently, and a changed budget with the same plugin does too.
+    if let Some(generation) = registry.code_grammar_generation() {
+        resolve_grammar_generation(db, generation, force)?;
+    }
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
@@ -1386,6 +1392,42 @@ pub(crate) fn resolve_code_chunk_budget(db: &Database, desired: usize, force: bo
         }
         Some(_) => {}
         None => db.write_code_max_chunk_chars(desired)?,
+    }
+    Ok(())
+}
+
+/// (feature-56 PR-3a) Compare the grammar plugins loaded now with the ones that cut the code
+/// chunks in this index, and say so when they differ.
+///
+/// The same problem [`resolve_code_chunk_budget`] describes, arriving by a different door.
+/// Replacing a plugin with a newer build can move where definitions begin and end — a fixed
+/// tags query, a regenerated parse table — but a file whose content has not changed never
+/// reaches the parser again, so the new grammar applies to files edited afterwards and to
+/// nothing else. Handled the same way, for the same reason: **warn, and do not update the
+/// recorded value**, because writing it would silence the next run while leaving the index
+/// exactly as mixed.
+///
+/// # What this deliberately does not cover
+///
+/// Grammars compiled into the binary. Their generation is the binary's own, so the only marker
+/// available is groove's version — which changes on every release whether or not a grammar
+/// moved. A warning that fires on every upgrade is one people stop reading, and it would fire
+/// for the compiled-in Rust grammar far more often than that grammar actually changes. Until
+/// there is a marker that tracks the grammar rather than the release, upgrading groove and then
+/// re-indexing without `--force` keeps its existing `.rs` boundaries.
+pub(crate) fn resolve_grammar_generation(db: &Database, desired: &str, force: bool) -> Result<()> {
+    if force {
+        db.write_code_grammar_generation(desired)?;
+        return Ok(());
+    }
+    match db.read_code_grammar_generation()? {
+        Some(stored) if stored != desired => {
+            eprintln!(
+                "warning: the grammar plugins loaded now are {desired}, but the code chunks in this index were cut by {stored}. Files whose content has not changed keep their existing chunks. Re-run with --force to re-chunk them."
+            );
+        }
+        Some(_) => {}
+        None => db.write_code_grammar_generation(desired)?,
     }
     Ok(())
 }

@@ -144,6 +144,7 @@ fn plugin_parser(
     stem: &str,
     code: &CodeParsersConfig,
     grammar_dir: Option<&Path>,
+    generation: &mut Vec<String>,
 ) -> Result<Box<dyn Parser>> {
     let Some(dir) = grammar_dir else {
         anyhow::bail!(plugin_dir_undecidable_message(id));
@@ -159,6 +160,9 @@ fn plugin_parser(
     // saying so.
     let loaded = super::code::plugin::load(&path, id)
         .map_err(|r| anyhow::anyhow!(plugin_rejected_message(id, &path, &r.describe())))?;
+    // What built this grammar, kept so the indexer can notice when it is replaced. The id is
+    // included because the string on its own says nothing about which language it belongs to.
+    generation.push(format!("{id}={}", loaded.build_info));
     Ok(Box::new(super::CodeParser::new(
         loaded.grammar,
         loaded.extension,
@@ -175,6 +179,18 @@ pub struct Registry {
     /// budget is baked into the instance, so this is the only place left that still knows the
     /// number the chunks in a given index were cut at.
     code_max_chunk_chars: Option<usize>,
+    /// (feature-56 PR-3a) What built the grammar plugins in this registry, or `None` when none
+    /// came from a plugin.
+    ///
+    /// Here for the same reason as the budget above: a rebuilt grammar can cut the same file
+    /// into different chunks, and this is the only place that still knows which build produced
+    /// the ones in a given index.
+    ///
+    /// **Compiled-in grammars are deliberately absent.** Their generation is the binary's, so
+    /// marking it would fire on every groove upgrade whether or not a grammar moved — a warning
+    /// that cries wolf is a warning people learn to skip. What that leaves uncovered is stated
+    /// in [`crate::indexer::resolve_grammar_generation`].
+    code_grammar_generation: Option<String>,
 }
 
 impl Registry {
@@ -215,6 +231,7 @@ impl Registry {
         let mut parsers: Vec<Box<dyn Parser>> = Vec::with_capacity(ids.len());
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut code_max_chunk_chars = None;
+        let mut generation: Vec<String> = Vec::new();
         for id in ids {
             let lower = id.to_ascii_lowercase();
             if !seen.insert(lower.clone()) {
@@ -251,7 +268,7 @@ impl Registry {
                 other => match super::code::plugin::plugin_entry(other) {
                     Some((canonical, stem)) => {
                         code_max_chunk_chars = Some(code.max_chunk_chars);
-                        plugin_parser(canonical, stem, code, grammar_dir)?
+                        plugin_parser(canonical, stem, code, grammar_dir, &mut generation)?
                     }
                     None => anyhow::bail!(unresolved_id_message(
                         other,
@@ -278,6 +295,12 @@ impl Registry {
         Ok(Self {
             parsers,
             code_max_chunk_chars,
+            // Sorted so that the same set of plugins produces the same string whatever order
+            // `[parsers].enabled` lists them in — reordering the config is not a new grammar.
+            code_grammar_generation: (!generation.is_empty()).then(|| {
+                generation.sort();
+                generation.join(" ")
+            }),
         })
     }
 
@@ -287,6 +310,7 @@ impl Registry {
         Self {
             parsers: vec![Box::new(MarkdownParser)],
             code_max_chunk_chars: None,
+            code_grammar_generation: None,
         }
     }
 
@@ -294,6 +318,11 @@ impl Registry {
     /// registry has none.
     pub fn code_max_chunk_chars(&self) -> Option<usize> {
         self.code_max_chunk_chars
+    }
+
+    /// (feature-56 PR-3a) What built the grammar plugins here, or `None` when none is a plugin.
+    pub fn code_grammar_generation(&self) -> Option<&str> {
+        self.code_grammar_generation.as_deref()
     }
 
     /// Lookup a parser by file extension (lowercase, no leading dot).
@@ -551,6 +580,27 @@ mod tests {
         let err = Registry::from_enabled_with_plugins(&["rst".into()], &code, Some(&dir))
             .expect_err("an unknown id must still fail");
         assert!(err.to_string().contains("unknown id"), "{err}");
+    }
+
+    /// A registry with no plugin in it has no grammar generation to record.
+    ///
+    /// `None` rather than an empty string, so the indexer never writes a key for an index that
+    /// has nothing to compare — and so a knowledge base that later enables a plugin adopts its
+    /// generation quietly instead of reporting a change from "".
+    #[test]
+    fn a_registry_without_a_plugin_records_no_grammar_generation() {
+        let registry = Registry::from_enabled_with_plugins(
+            &["md".into(), "rs".into()],
+            &Default::default(),
+            None,
+        )
+        .expect("md and the compiled-in grammar build");
+        assert_eq!(
+            registry.code_grammar_generation(),
+            None,
+            "only a grammar the user placed has a generation groove can track"
+        );
+        assert_eq!(Registry::defaults().code_grammar_generation(), None);
     }
 
     /// The directory is consulted only when an enabled id needs it.

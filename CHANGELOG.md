@@ -44,6 +44,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **Replacing a grammar plugin is noticed.** groove records which build cut the
+  code chunks in an index, and says so when the plugins loaded now are not the
+  ones that did. A rebuilt grammar can move where definitions begin and end, but
+  indexing skips files whose content has not changed — so without this, an index
+  would quietly come to hold two generations of chunks as files were edited. The
+  recorded value is deliberately not updated on a mismatch: writing it would
+  silence the next run while leaving the index exactly as mixed. `groove index
+  --force` is what re-chunks. This is the treatment
+  `[parsers.code].max_chunk_chars` already gets, applied to the other thing that
+  moves chunk boundaries. Grammars compiled into the binary are not tracked this
+  way, because the only marker available for them is groove's own version, which
+  changes on every release whether or not a grammar did.
 - **A run that cannot succeed still stops before it creates anything.** Every
   one of the failures above is decided while the parser registry is built,
   which happens before the database is opened and before any model is
