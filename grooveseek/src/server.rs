@@ -1342,6 +1342,24 @@ pub async fn run_server(
     // 「DB に記録された mode に追従する」設計を変えない (呼ぶのはここ 1 回だけ)。
     indexer::resolve_context_mode(&db, context_mode_desired, false)?;
 
+    // (feature-56) The same argument, for the two things that decide where code chunks are
+    // cut. The watcher re-indexes a single edited file through `reindex_single_file`, which
+    // never passes through `indexer::rebuild_index` — so without this, replacing a plugin or
+    // moving `max_chunk_chars` and then restarting `serve` would write chunks from the new
+    // setting into edited files, leave every unchanged file on the old one, and say nothing.
+    // Resolved once here, before the watcher can run, exactly like the mode above.
+    //
+    // **Nothing is cleared on this path**, only compared. `serve` deliberately does not remove
+    // documents whose extension `[parsers].enabled` no longer covers (see just below), so the
+    // chunks a now-disabled plugin cut are still in the index and the record still describes
+    // them. `indexer::rebuild_index`, which does prune, is where the record is retired.
+    if let Some(budget) = parser_registry.code_max_chunk_chars() {
+        indexer::resolve_code_chunk_budget(&db, budget, false)?;
+    }
+    if let Some(generation) = parser_registry.code_grammar_generation() {
+        indexer::resolve_grammar_generation(&db, generation, false)?;
+    }
+
     // AU-06 (codex P2): `[parsers].enabled` を狭めた後、その拡張子の行は DB に
     // 残る。`groove index` なら prune されるが `serve` は index しないので、
     // serve しか使わない運用では残り続け、**search には出るのに
@@ -3226,6 +3244,52 @@ mod tests {
             mode_seen_by_watcher,
             crate::db::ContextMode::Static,
             "watcher's fallback read must now see Static, not silently fall back to Off"
+        );
+    }
+
+    /// (feature-56 PR-3a) The same shape, for the two things that decide where code chunks
+    /// are cut.
+    ///
+    /// The watcher re-indexes an edited file through [`crate::indexer::reindex_single_file`],
+    /// which never passes through [`crate::indexer::rebuild_index`] — so a plugin replaced or
+    /// a budget moved between `serve` restarts would be written into edited files and into
+    /// nothing else, silently. [`super::run_server`] resolves both once before the watcher can
+    /// run, and this reproduces that call pattern without standing up an embedder or a
+    /// listener.
+    ///
+    /// The asymmetry with [`crate::indexer::rebuild_index`] is the point of the last assertion:
+    /// `serve` **compares and never retires** a record, because it warns about documents whose
+    /// extension is no longer enabled rather than removing them, so their chunks — and the
+    /// record describing them — are still real.
+    #[test]
+    fn test_serve_resolves_code_chunk_provenance_before_the_watcher() {
+        let db = crate::db::Database::open_in_memory().expect("in-memory db");
+
+        // Fresh index: both are simply adopted, the way the mode above is.
+        crate::indexer::resolve_code_chunk_budget(&db, 3500, false).expect("budget");
+        crate::indexer::resolve_grammar_generation(&db, "py=plugin 1.0.0", false)
+            .expect("generation");
+        assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(3500));
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some("py=plugin 1.0.0")
+        );
+
+        // Restarted after both moved. Neither recorded value may change: the chunks in the
+        // index are still the ones the old settings cut, and recording the new ones would
+        // silence the next start while leaving the index just as mixed.
+        crate::indexer::resolve_code_chunk_budget(&db, 1200, false).expect("budget");
+        crate::indexer::resolve_grammar_generation(&db, "py=plugin 2.0.0", false)
+            .expect("generation");
+        assert_eq!(
+            db.read_code_max_chunk_chars().unwrap(),
+            Some(3500),
+            "serve must report the difference, not record it away"
+        );
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some("py=plugin 1.0.0"),
+            "serve must report the difference, not record it away"
         );
     }
 

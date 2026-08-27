@@ -4091,6 +4091,44 @@ mod tests {
         );
     }
 
+    /// (feature-56 PR-3a) A record must not outlive the chunks it describes.
+    ///
+    /// Disabling a plugin and re-indexing removes every document with that extension, so no
+    /// chunk the plugin cut is left. Keeping the recorded generation would make the *next*
+    /// time that language is enabled report a difference from something that no longer owns
+    /// anything — a warning telling the user to `--force` a rebuild they do not need.
+    ///
+    /// The clearing happens in [`crate::indexer::rebuild_index`], which prunes; `serve` warns
+    /// about such documents instead of removing them, so it compares and never clears.
+    #[test]
+    fn a_grammar_generation_does_not_survive_the_chunks_it_describes() {
+        let db = Database::open_in_memory().unwrap();
+        db.write_code_grammar_generation("py=groove-grammar-python 1.3.0")
+            .unwrap();
+        assert!(db.read_code_grammar_generation().unwrap().is_some());
+
+        db.clear_code_grammar_generation().unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap(),
+            None,
+            "a retired record must leave nothing behind to compare against"
+        );
+
+        // And with the record gone, enabling a plugin again adopts its generation quietly
+        // rather than reporting a change.
+        crate::indexer::resolve_grammar_generation(&db, "py=groove-grammar-python 1.4.0", false)
+            .unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some("py=groove-grammar-python 1.4.0")
+        );
+
+        // Clearing something that was never there is not an error.
+        db.clear_code_grammar_generation().unwrap();
+        db.clear_code_grammar_generation().unwrap();
+        assert_eq!(db.read_code_grammar_generation().unwrap(), None);
+    }
+
     /// An index built before this key existed adopts the current generation rather than
     /// warning about a value it never recorded.
     #[test]

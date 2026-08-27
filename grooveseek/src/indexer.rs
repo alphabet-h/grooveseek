@@ -518,8 +518,18 @@ pub fn rebuild_index(
     // (feature-56 PR-3a) And when a grammar plugin has been replaced since then. Separate from
     // the budget above because the two move independently: a rebuilt plugin with the same
     // budget still cuts differently, and a changed budget with the same plugin does too.
-    if let Some(generation) = registry.code_grammar_generation() {
-        resolve_grammar_generation(db, generation, force)?;
+    match registry.code_grammar_generation() {
+        Some(generation) => resolve_grammar_generation(db, generation, force)?,
+        // No plugin is enabled any more. **This run prunes**, below, every document whose
+        // extension `[parsers].enabled` no longer covers — so by the time it ends, not one
+        // chunk any plugin cut is left in the index. Keeping the record would leave it
+        // describing nothing, and warning about a difference from a generation that no longer
+        // owns anything the next time a plugin is enabled.
+        //
+        // Only safe here. `serve` warns about those documents rather than removing them
+        // (deliberately: a narrowed `enabled` is often temporary), so on that path the old
+        // chunks are still present and the record still describes them.
+        None => db.clear_code_grammar_generation()?,
     }
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP

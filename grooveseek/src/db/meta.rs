@@ -223,6 +223,19 @@ impl Database {
         Ok(())
     }
 
+    /// (feature-56 PR-3a) `index_meta.code_grammar_generation` を消す。
+    ///
+    /// **呼んでよいのは、その grammar が切った chunk が索引に 1 つも残っていない時だけ。**
+    /// 記録は「この索引の chunk を誰が切ったか」なので、覆う対象が消えたのに残していると、
+    /// あとで plugin を有効化し直した時に**誰も切っていない世代との差**を警告してしまう。
+    pub fn clear_code_grammar_generation(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_meta WHERE key = 'code_grammar_generation'",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
     /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {
