@@ -67,8 +67,10 @@ fn example_cdylib(name: &str) -> PathBuf {
     let path = profile_dir.join("examples").join(&file);
     assert!(
         path.exists(),
-        "the {name} fixture was not built; add `--examples` to the cargo invocation (plain \
-         `cargo test` already builds them, `--test <name>` on its own does not) to produce {}",
+        "the {name} fixture was not built. Run `cargo build --examples -p grooveseek` first, or \
+         drop the `--test` filter: plain `cargo test` builds the examples as libraries, a \
+         `--test`-filtered run does not, and `--examples` does not fix that -- under `cargo \
+         test` it builds each example as a test executable instead. Expected {}",
         path.display()
     );
     path
@@ -303,13 +305,19 @@ fn a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory()
 /// A plugin that passes every check parses its files like a compiled-in grammar would.
 ///
 /// `#[ignore]` because this one indexes for real, which loads the BGE-small model (~130 MB).
-/// Run with `cargo test --examples --test grammar_plugin_cli -- --ignored`.
+/// Run with `cargo build --examples -p grooveseek` followed by
+/// `cargo test --test grammar_plugin_cli -- --ignored`.
 ///
-/// The `--examples` is load-bearing: selecting a test target on its own does not build the
-/// fixture libraries, so without it every test here that places a plugin fails on a file that
-/// was never produced (via: `cargo test --test grammar_plugin_cli --no-run
-/// --message-format=json | grep -c '"kind":\["example"\]'` reports none, against the plain
-/// form which reports one per `[[example]]`).
+/// **The build step is separate because no form of `cargo test` that also filters targets will
+/// produce these libraries.** A `--test`-filtered run does not build examples at all, and
+/// adding `--examples` does not repair it: under `cargo test` that flag means *test the
+/// examples*, so cargo builds each one as a test executable
+/// (`target/<profile>/examples/<name>-<hash>.exe`) and never as the `cdylib` the loader has to
+/// open. Measured by deleting the library, touching the fixture source, and running
+/// `cargo test --examples --test grammar_plugin_cli --no-run`: it recompiles and lists the
+/// three executables, and `ls target/debug/examples/groove_grammar_python.dll` still reports
+/// no such file. Plain `cargo test` with no target filter does build them, which is why CI —
+/// which runs exactly that — has always had them.
 #[test]
 #[ignore]
 fn a_plugin_the_loader_accepts_indexes_the_files_it_claims() {
@@ -417,9 +425,20 @@ fn shipped_cdylib() -> PathBuf {
 /// spelling. A rename that broke any link would leave every other test here passing.
 ///
 /// `#[ignore]` for the same reason as the test above (it indexes for real, ~130 MB of model),
-/// and additionally because the library has to be built by a separate command. Run with
-/// `cargo build -p groove-grammar-python` followed by
-/// `cargo test --test grammar_plugin_cli -- --ignored`.
+/// and additionally because the library it needs is one `cargo test` does not build at all:
+/// cargo does not build a `cdylib` nothing depends on (rust-lang/cargo#8311). Run with
+///
+/// ```text
+/// cargo build -p groove-grammar-python
+/// cargo build --examples -p grooveseek
+/// cargo test --test grammar_plugin_cli -- --ignored
+/// ```
+///
+/// **The two builds produce different files and neither substitutes for the other.**
+/// `-p groove-grammar-python` writes the shipped library to `target/<profile>/`, and
+/// `--examples -p grooveseek` writes the fixtures one directory down. The run selects every
+/// ignored test in this file, so omitting the second command fails the test above rather than
+/// this one — see the note there for why no `cargo test` flag replaces it.
 #[test]
 #[ignore]
 fn the_python_grammar_groove_publishes_is_one_its_loader_accepts() {
