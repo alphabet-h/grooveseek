@@ -173,10 +173,10 @@ macro_rules! groove_grammar_plugin {
 /// A plugin is arbitrary native code, so the strings it hands back are checked like any
 /// other untrusted input before they reach a filesystem walk.
 ///
-/// A free function rather than only a method on [`GrammarDescriptor`]: a descriptor's
-/// `extension` is `&'static str`, which a compiled-in grammar has and a string just copied
-/// out of a freshly opened library does not. The rule is one rule, so it is written once and
-/// takes whatever lifetime the caller has.
+/// A free function rather than only a method on [`GrammarDescriptor`]:
+/// [`GrammarDescriptor::extension`] is `&'static str`, which a compiled-in grammar has and a
+/// string just copied out of a freshly opened library does not. The rule is one rule, so it is
+/// written once and takes whatever lifetime the caller has.
 pub fn extension_is_valid(extension: &str) -> bool {
     !extension.is_empty()
         && extension.len() <= 64

@@ -518,18 +518,11 @@ pub fn rebuild_index(
     // (feature-56 PR-3a) And when a grammar plugin has been replaced since then. Separate from
     // the budget above because the two move independently: a rebuilt plugin with the same
     // budget still cuts differently, and a changed budget with the same plugin does too.
-    match registry.code_grammar_generation() {
-        Some(generation) => resolve_grammar_generation(db, generation, force)?,
-        // No plugin is enabled any more. **This run prunes**, below, every document whose
-        // extension `[parsers].enabled` no longer covers — so by the time it ends, not one
-        // chunk any plugin cut is left in the index. Keeping the record would leave it
-        // describing nothing, and warning about a difference from a generation that no longer
-        // owns anything the next time a plugin is enabled.
-        //
-        // Only safe here. `serve` warns about those documents rather than removing them
-        // (deliberately: a narrowed `enabled` is often temporary), so on that path the old
-        // chunks are still present and the record still describes them.
-        None => db.clear_code_grammar_generation()?,
+    // Retiring the record when no plugin is enabled happens **after** the prune, not here:
+    // see the call further down. Comparing, on the other hand, belongs up front, beside the
+    // budget above — it only reads.
+    if let Some(generation) = registry.code_grammar_generation() {
+        resolve_grammar_generation(db, generation, force)?;
     }
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
@@ -691,6 +684,25 @@ pub fn rebuild_index(
         db.delete_document(&db_path)?;
         deleted += 1;
         progress.report_deleted(&db_path);
+    }
+
+    // (feature-56 PR-3a) No plugin is enabled any more, and the deletion above has just taken
+    // out every document whose extension `[parsers].enabled` no longer covers — so not one
+    // chunk any plugin cut is left, and the recorded generation now describes nothing.
+    // Keeping it would make the next run that enables a language report a difference from a
+    // generation that owns no chunks, telling the user to force a rebuild they do not need.
+    //
+    // **After the prune, not before it.** Everything between the top of this function and here
+    // is fallible — the filesystem walk, embedding, the writes — and clearing up front would
+    // mean a run that died in the middle had removed the record while the old chunks were
+    // still in the index. The next run would then see nothing recorded and silently adopt
+    // whatever grammar it had, which is the mixing this record exists to report.
+    //
+    // Only on this path. `serve` warns about those documents rather than removing them
+    // (deliberately: a narrowed `enabled` is often temporary), so there the old chunks are
+    // still present and the record still describes them.
+    if registry.code_grammar_generation().is_none() {
+        db.clear_code_grammar_generation()?;
     }
 
     // Count total documents remaining (includes unchanged ones)

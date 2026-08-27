@@ -242,9 +242,21 @@ whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
 groove parses source code one definition at a time, but only Rust is compiled into the binary. Every other language is a small library you download and place — that asymmetry, and why it is not a feature flag, is [ADR-0013](decisions/0013-compile-in-one-grammar-and-load-the-rest.md).
 
 1. Find the archive named `groove-grammar-<language>-<target>` for **your groove version** on the [releases page](https://github.com/alphabet-h/grooveseek/releases). The plugin and the binary share an ABI version, so a plugin from a different release may be refused.
-2. Unpack it and put the library in the grammar directory. The default is `%LOCALAPPDATA%\groove\grammars` on Windows, `~/.local/share/groove/grammars` on Linux, and `~/Library/Application Support/groove/grammars` on macOS. To use a different one, set `grammar_dir` in `groove.toml`, or the `GROOVE_GRAMMAR_DIR` environment variable — which must be an absolute path, because a relative one would resolve against whatever directory the client happened to launch groove from.
-3. Add the language to `[parsers].enabled`, e.g. `enabled = ["md", "py"]`.
-4. **Run `groove index` once by hand before letting a service do it.** A registered Windows service discards stdio, so if the plugin is missing or refused, the message saying so goes nowhere and the daemon simply does not work. `groove index` resolves every enabled language before it opens the database or loads a model, so a bad plugin stops it immediately, on your screen, having created nothing. (`groove doctor` checks an index that already exists; on a fresh setup it answers "No index found" without ever reaching the plugin, so it is not the command for this step.)
+2. **Verify its checksum before unpacking.** Every archive is published with a `.sha256` beside it. Loading a library runs its own initialisation before groove can inspect a single symbol, so a substituted or corrupted archive is native code running as you — and no check groove performs afterwards changes that. This step is the one that has to happen before the file is ever opened.
+
+   ```bash
+   # Linux / macOS
+   sha256sum -c groove-grammar-python-x86_64-unknown-linux-gnu.tar.xz.sha256
+   ```
+
+   ```powershell
+   # Windows
+   (Get-FileHash groove-grammar-python-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash -eq `
+       (Get-Content groove-grammar-python-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToUpper()
+   ```
+3. Unpack it and put the library in the grammar directory. The default is `%LOCALAPPDATA%\groove\grammars` on Windows, `~/.local/share/groove/grammars` on Linux, and `~/Library/Application Support/groove/grammars` on macOS. To use a different one, set `grammar_dir` in `groove.toml`, or the `GROOVE_GRAMMAR_DIR` environment variable — which must be an absolute path, because a relative one would resolve against whatever directory the client happened to launch groove from.
+4. Add the language to `[parsers].enabled`, e.g. `enabled = ["md", "py"]`.
+5. **Run `groove index` once by hand before letting a service do it.** A registered Windows service discards stdio, so if the plugin is missing or refused, the message saying so goes nowhere and the daemon simply does not work. `groove index` resolves every enabled language before it opens the database or loads a model, so a bad plugin stops it immediately, on your screen, having created nothing. (`groove doctor` checks an index that already exists; on a fresh setup it answers "No index found" without ever reaching the plugin, so it is not the command for this step.)
 
 Nothing is downloaded automatically and nothing but the enabled languages is opened — a file in that directory belonging to a language you did not enable is never touched. If an enabled language has no usable plugin, the command stops and says which file it wanted and where; it does not fall back to indexing the source as plain text.
 

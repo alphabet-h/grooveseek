@@ -4129,6 +4129,37 @@ mod tests {
         assert_eq!(db.read_code_grammar_generation().unwrap(), None);
     }
 
+    /// **Retiring the record and removing the chunks it describes must not come apart.**
+    ///
+    /// The clearing sits after the deletion loop in [`crate::indexer::rebuild_index`], not
+    /// beside the comparison at the top, because everything in between can fail — the
+    /// filesystem walk, embedding, the writes. Clearing up front would mean a run that died
+    /// halfway had taken the record away while the old plugin-cut chunks were still indexed,
+    /// and the next run would see nothing recorded and adopt whatever grammar it had: exactly
+    /// the silent mixing the record exists to report.
+    ///
+    /// Written against the two states rather than by driving a failing index, because what
+    /// went wrong was an ordering and this pins the consequence of getting it wrong.
+    #[test]
+    fn a_generation_record_outlives_a_run_that_did_not_finish_pruning() {
+        let db = Database::open_in_memory().unwrap();
+        db.write_code_grammar_generation("py=plugin 1.0.0").unwrap();
+
+        // The state a half-finished run leaves behind: chunks still there, record still there.
+        // The next run must therefore still have something to compare against, so that
+        // re-enabling a different build is reported rather than adopted.
+        assert!(
+            db.read_code_grammar_generation().unwrap().is_some(),
+            "a run that failed before pruning must leave the record describing what remains"
+        );
+        crate::indexer::resolve_grammar_generation(&db, "py=plugin 2.0.0", false).unwrap();
+        assert_eq!(
+            db.read_code_grammar_generation().unwrap().as_deref(),
+            Some("py=plugin 1.0.0"),
+            "the difference must still be reportable, not adopted"
+        );
+    }
+
     /// An index built before this key existed adopts the current generation rather than
     /// warning about a value it never recorded.
     #[test]

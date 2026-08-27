@@ -1125,12 +1125,12 @@ pub struct TrustRoots {
     cache_env_set: bool,
     /// (feature-56) OS 標準のローカルデータディレクトリ (`grammar_dir` の差し替え先)。
     ///
-    /// `cache_dir` と別に持つ。plugin は利用者が意図して置く成果物なので、
+    /// [`TrustRoots::cache_dir`] と別に持つ。plugin は利用者が意図して置く成果物なので、
     /// キャッシュと同じ場所に置くと「掃除したら壊れた」が起きる。
     data_local_dir: Option<PathBuf>,
     /// `GROOVE_GRAMMAR_DIR` が既に環境にあるか。**あるなら config の
     /// `grammar_dir` はそもそも効かない** ([`grammar_dir_from`] は env を先に見る)
-    /// ので、`cache_env_set` と同じく差し替え先を探す必要が無い。
+    /// ので、[`TrustRoots::cache_env_set`] と同じく差し替え先を探す必要が無い。
     grammar_env_set: bool,
 }
 
