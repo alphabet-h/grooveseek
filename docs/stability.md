@@ -366,7 +366,8 @@ These are the reason the project renamed itself before 1.0.0 rather than after:
 | exclusion file | `.grooveignore` |
 | evaluation set / history | `.groove-eval.yml` / `.groove-eval-history.json` |
 | service artifacts | task, unit, and launch-agent names derived from the service name, and the layout of the config home |
-| environment variables | `GROOVE_CONFIG_HOME`, `GROOVE_TRAY_LOG`. (`FASTEMBED_CACHE_DIR` is fastembed's name — honoured, but not ours to freeze. `GROOVE_BIN` belongs to the shipped example hook, not to the binary.) |
+| environment variables | `GROOVE_CONFIG_HOME`, `GROOVE_TRAY_LOG`, `GROOVE_GRAMMAR_DIR` (v1.3.0+; must be absolute). (`FASTEMBED_CACHE_DIR` is fastembed's name — honoured, but not ours to freeze. `GROOVE_BIN` belongs to the shipped example hook, not to the binary.) |
+| grammar plugin layout | one library per language, named `groove_grammar_<language>` with the platform's own prefix and suffix, in the grammar directory. The C symbols it exports and the ABI version it declares are frozen too: a plugin built for one 1.x groove loads in the next. |
 
 ## Unstable
 

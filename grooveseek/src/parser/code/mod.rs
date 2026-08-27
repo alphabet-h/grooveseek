@@ -15,6 +15,10 @@
 //! (`comment`), both of which hold across grammars, so adding a language stays a matter of
 //! supplying data rather than code.
 
+// Deliberately not behind `grammar-rust`: which grammars are compiled in and whether groove
+// can load one from disk are separate questions, and a build with no compiled-in grammar is
+// exactly the build that has nothing but plugins to offer.
+pub(crate) mod plugin;
 #[cfg(feature = "grammar-rust")]
 pub(crate) mod static_rust;
 
@@ -83,12 +87,6 @@ impl LoadedGrammar {
             language,
             config,
         })
-    }
-
-    /// ABI version the grammar was generated against. Checked when loading a plugin.
-    #[allow(dead_code)] // consumed by the plugin loader (PR-3a)
-    pub(crate) fn abi_version(&self) -> usize {
-        self.language.abi_version()
     }
 }
 

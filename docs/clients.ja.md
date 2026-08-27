@@ -236,6 +236,40 @@ peer で、既定の `Host` も allow-list に載るため、`/ui` を proxy す
 - **耐障害性**。watcher タスク内部のエラーは stderr にログされ (黙殺しない)、MCP サーバは動作し続ける。ローカルディスクを想定 — WSL / SMB / ネットワーク共有上の inotify は保証外
 - **バックプレッシャ (v0.6.0+)**。debouncer から indexer task へのブリッジは bounded な 64 batch channel。consumer が追い付けない場合 (embedder が一時停止中など) は無限に queue が伸びることはなく、超過 batch を warn ログ付きで drop する。バースト後に `rebuild_index` を手動実行で取り漏らしを補える
 
+## grammar plugin の置き方 (v1.3.0+)
+
+groove はソースコードを定義 1 つ = chunk 1 つで parse するが、バイナリに焼き込んであるのは Rust だけ。他の言語はすべて、自分で DL して置く小さなライブラリになる。この非対称と「なぜ feature flag ではないのか」は [ADR-0013](decisions/0013-compile-in-one-grammar-and-load-the-rest.ja.md) にある。
+
+1. [releases ページ](https://github.com/alphabet-h/grooveseek/releases)で、**使っている groove の版**の `groove-grammar-<言語>-<target>` アーカイブを探す。plugin とバイナリは ABI 版を共有するので、別の release のものは拒否されうる。
+2. **展開する前に checksum を検証する。** どのアーカイブにも `.sha256` が並んで公開されている。ライブラリを開くと、groove が symbol を 1 つも見ないうちに**そのライブラリ自身の初期化が走る**ので、すり替えられた / 壊れたアーカイブは「自分の権限で動くネイティブコード」そのものであり、あとから groove が何を検査しても変わらない。**ファイルを開く前**に済ませる必要があるのはこの手順だけ。
+
+   **アーカイブと `.sha256` を両方置いたディレクトリで**実行すること: `.sha256` は自分が属するアーカイブのファイル名を持っていて、検証はその名前で探す。target は実際に落としたものに置き換える — 公開されているのは `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` / `aarch64-apple-darwin` / `x86_64-pc-windows-msvc`。
+
+   ```bash
+   # Linux
+   sha256sum -c groove-grammar-python-x86_64-unknown-linux-gnu.tar.xz.sha256
+   ```
+
+   ```bash
+   # macOS — 素の macOS に sha256sum は無い。Mac 向けに公開しているのは Apple Silicon だけ
+   shasum -a 256 -c groove-grammar-python-aarch64-apple-darwin.tar.xz.sha256
+   ```
+
+   ```powershell
+   # Windows
+   (Get-FileHash groove-grammar-python-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash -eq `
+       (Get-Content groove-grammar-python-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToUpper()
+   ```
+3. 展開して、ライブラリを grammar ディレクトリに置く。既定は Windows なら `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、macOS なら `~/Library/Application Support/groove/grammars`。別の場所にするなら `groove.toml` の `grammar_dir` か、環境変数 `GROOVE_GRAMMAR_DIR` を使う — こちらは**絶対パス必須**で、相対値だと「クライアントがたまたま groove を起動したディレクトリ」に対して解決されてしまうため。
+4. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。
+5. **service に任せる前に、`groove index` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
+
+自動 DL は一切しないし、`enabled` に書いた言語以外は開かない — そのディレクトリに有効化していない言語のファイルがあっても触らない。有効化した言語の plugin が使えない場合、コマンドは「どのファイルをどこに置くべきか」を告げて止まる。ソースを plain text として索引するフォールバックはしない。
+
+**plugin を差し替えたら `groove index --force` で索引し直すこと。** grammar を作り直すと同じファイルでも chunk の切れ目が動きうるが、索引は内容が変わっていないファイルを飛ばすので、普通に index し直しても**そのファイルは古い grammar が切った chunk のまま**残り、新しい grammar はその後編集したファイルにだけ効く。結果として索引が 2 世代を同時に抱える。**現時点では groove がこれを検出して警告することはない**ので、`--force` は利用者の側の判断になる。groove 本体を上げた時も同様。**`[parsers.code].max_chunk_chars` を変えた時だけは groove が報告する**: 索引はコード chunk を切った時の budget を記録しているので、違う値で次を走らせると `--force` を名指しする warning が出る。
+
+> **grammar plugin は groove が自分のプロセスへ読み込むネイティブコード。** インストールする他のバイナリと同じ扱いにすること — 使っている版の release ページから取り、それ以外の場所からは取らない。groove が**見つけただけ**の `groove.toml` (`--config` で名指ししていないもの) がこのディレクトリを選べないのも同じ理由: [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
+
 ## HuggingFace の TLS 失敗への対処 (初回 DL 時)
 
 環境によっては (企業プロキシ、TLS inspection を行うファイアウォール) fastembed の native TLS 接続が `huggingface.co` に対して `os error 10054` / "Connection was reset" で失敗する。その場合は Python の HuggingFace CLI で事前にモデルを DL し、`FASTEMBED_CACHE_DIR` で HF Hub キャッシュを指す:

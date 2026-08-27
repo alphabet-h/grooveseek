@@ -20,6 +20,19 @@ reranker = "bge-v2-m3"
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 
+# Where grammar plugins live (v1.3.0+). A language that is not compiled in —
+# everything except Rust — is a library you download and place yourself; this
+# names the directory it goes in. `GROOVE_GRAMMAR_DIR` overrides it and must be
+# absolute. Read **only** when `[parsers].enabled` names a language that needs a
+# plugin, so a Markdown knowledge base never consults it.
+# Default: `<local data dir>/groove/grammars`, which is
+# `%LOCALAPPDATA%\groove\grammars` on Windows, `~/.local/share/groove/grammars`
+# on Linux, and `~/Library/Application Support/groove/grammars` on macOS. If none
+# of those can be determined the key has no default, and a command that needs a
+# plugin says so rather than guessing a working-directory-relative path.
+# See docs/clients.md for how to put a plugin in place.
+grammar_dir = "/home/you/.local/share/groove/grammars"
+
 # Heading substrings to exclude from chunking. Omit the key for no exclusions
 # (the default is an empty list). Any heading containing one of these
 # substrings — and its body content — is dropped from the chunk stream.
@@ -198,8 +211,8 @@ it as yours:
 
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
-`[parsers]`, `[watch]`, `[contextual]` — is honoured unchanged. Three fields
-are restricted, because they decide which binary runs, what leaves the machine,
+`[parsers]`, `[watch]`, `[contextual]` — is honoured unchanged. Four fields
+are restricted, because they decide which code runs, what leaves the machine,
 and who can reach it:
 
 | Field | From an untrusted config |
@@ -207,6 +220,7 @@ and who can reach it:
 | `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. (Related: `FASTEMBED_CACHE_DIR` must be an absolute path, and the model directory is never resolved relative to the working directory.) |
 | `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts`, `allowed_origins`, `healthz_public`, and `max_sessions` are dropped — the first three restore the loopback-only defaults, and the last falls back to the built-in limit, so that a planted `max_sessions = 1` cannot leave the server unable to accept a second client. Dropping `allowed_origins` matters in both directions: a planted list could name an attacker's origin, or be empty, which is how "do not validate Origin at all" is spelled. `kind` is honoured. |
 | `kb_path` | **Ignored with a warning** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. `--kb-path` still applies, so you can override it; with neither, the command stops with the usual "`--kb-path` is required". |
+| `grammar_dir` | Ignored with a warning; the standard location is used. It selects which native library is `dlopen`ed into the process, and a grammar plugin is code, not data. Set for every untrusted config, present or not — omitting the key would otherwise be a way to influence the choice by saying nothing. If no standard location can be determined the key is dropped instead, and a command that needs a plugin then stops with a message naming `GROOVE_GRAMMAR_DIR`. |
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
 `kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local
