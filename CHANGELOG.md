@@ -44,25 +44,6 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
-- **Replacing a grammar plugin is noticed.** groove records what cut the code
-  chunks in an index and says so when that is no longer what is loaded. The
-  record covers both halves of the answer: a hash of each plugin library's own
-  bytes — not the version it claims, so a rebuild against a newer grammar counts
-  whether or not its author moved a number — and a version for groove's own
-  chunking rules, which decide where a definition begins and ends whatever
-  grammar supplied the parse tree. With `[parsers.code].max_chunk_chars`, which
-  was already recorded, that is everything that determines a code chunk's
-  boundaries. A record is written only once a plugin has actually cut something,
-  and retired once nothing it describes is left. A rebuilt grammar can move where definitions begin and end, but
-  indexing skips files whose content has not changed — so without this, an index
-  would quietly come to hold two generations of chunks as files were edited. The
-  recorded value is deliberately not updated on a mismatch: writing it would
-  silence the next run while leaving the index exactly as mixed. `groove index
-  --force` is what re-chunks. This is the treatment
-  `[parsers.code].max_chunk_chars` already gets, applied to the other thing that
-  moves chunk boundaries. Grammars compiled into the binary are not tracked this
-  way, because the only marker available for them is groove's own version, which
-  changes on every release whether or not a grammar did.
 - **A run that cannot succeed still stops before it creates anything.** Every
   one of the failures above is decided while the parser registry is built,
   which happens before the database is opened and before any model is

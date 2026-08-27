@@ -518,13 +518,6 @@ pub fn rebuild_index(
     // (feature-56 PR-3a) And when a grammar plugin has been replaced since then. Separate from
     // the budget above because the two move independently: a rebuilt plugin with the same
     // budget still cuts differently, and a changed budget with the same plugin does too.
-    // Reporting a moved generation belongs up front, beside the budget above — it only reads,
-    // and a user should see it before waiting for the run rather than after. **Deciding what
-    // the record should say happens after the scan and the prune**, once this run has
-    // established what is actually in the index: see the call further down.
-    if let Some(generation) = registry.code_grammar_generation() {
-        report_grammar_generation(db, generation)?;
-    }
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
@@ -686,23 +679,6 @@ pub fn rebuild_index(
         deleted += 1;
         progress.report_deleted(&db_path);
     }
-
-    // (feature-56 PR-3a) Now that the scan and the prune are done, the index's contents are
-    // settled and the record can be decided against them: adopted if a plugin actually cut
-    // something, retired if nothing it describes is left.
-    //
-    // **After the prune, not before it.** Everything between the top of this function and here
-    // is fallible — the filesystem walk, embedding, the writes — so deciding up front would
-    // mean a run that died in the middle had already written or removed a record describing an
-    // index it never finished changing. `visited_paths` is every path this run saw, which is
-    // exactly the set that survives the deletion above.
-    //
-    // Only on this path. `serve` warns about documents whose extension is no longer enabled
-    // rather than removing them (deliberately: a narrowed `enabled` is often temporary), so
-    // there the old chunks are still present and the record still describes them; it compares
-    // and never writes.
-    let plugin_backed = registry.has_plugin_backed_path(visited_paths.iter().map(String::as_str));
-    record_grammar_generation(db, registry.code_grammar_generation(), plugin_backed, force)?;
 
     // Count total documents remaining (includes unchanged ones)
     let total_documents = db.document_count()?;
@@ -1413,78 +1389,6 @@ pub(crate) fn resolve_code_chunk_budget(db: &Database, desired: usize, force: bo
         }
         Some(_) => {}
         None => db.write_code_max_chunk_chars(desired)?,
-    }
-    Ok(())
-}
-
-/// (feature-56 PR-3a) Compare the grammar plugins loaded now with the ones that cut the code
-/// chunks in this index, and say so when they differ.
-///
-/// The same problem [`resolve_code_chunk_budget`] describes, arriving by a different door.
-/// Replacing a plugin with a newer build can move where definitions begin and end — a fixed
-/// tags query, a regenerated parse table — but a file whose content has not changed never
-/// reaches the parser again, so the new grammar applies to files edited afterwards and to
-/// nothing else. Handled the same way, for the same reason: **warn, and do not update the
-/// recorded value**, because writing it would silence the next run while leaving the index
-/// exactly as mixed.
-///
-/// `desired` identifies each plugin by a hash of its bytes, not by the version it declares:
-/// the two examples above — a fixed tags query, a regenerated parse table — are exactly the
-/// changes a plugin can ship without its own version moving, and a marker that missed those
-/// would miss the case this exists for.
-///
-/// # What this deliberately does not cover
-///
-/// Grammars compiled into the binary. Their generation is the binary's own, so the only marker
-/// available is groove's version — which changes on every release whether or not a grammar
-/// moved. A warning that fires on every upgrade is one people stop reading, and it would fire
-/// for the compiled-in Rust grammar far more often than that grammar actually changes. Until
-/// there is a marker that tracks the grammar rather than the release, upgrading groove and then
-/// re-indexing without `--force` keeps its existing `.rs` boundaries.
-/// The reading half: say so when the record does not match what is loaded now.
-///
-/// Split from the writing half because the two belong at different points in a run. Reporting
-/// belongs at the start, where a user sees it before waiting; deciding what the record *should*
-/// say belongs at the end, once the run has established what is actually in the index. Reading
-/// early is safe — a run that dies afterwards has changed nothing.
-pub(crate) fn report_grammar_generation(db: &Database, desired: &str) -> Result<()> {
-    if let Some(stored) = db.read_code_grammar_generation()?
-        && stored != desired
-    {
-        eprintln!(
-            "warning: the grammar plugins loaded now are {desired}, but the code chunks in this index were cut by {stored}. Files whose content has not changed keep their existing chunks. Re-run with --force to re-chunk them."
-        );
-    }
-    Ok(())
-}
-
-/// The writing half, at the end of a run: adopt, keep, or retire the record.
-///
-/// `describes_something` is whether the index now holds a document a grammar plugin here would
-/// have parsed. It gates both directions:
-///
-/// - **Adopting.** Enabling a language for a knowledge base with no files in it would otherwise
-///   record a grammar that cut nothing, and replacing that plugin later would warn on every run
-///   about a difference that cannot have changed one indexed document — sending the user to a
-///   forced rebuild with nothing in it to rebuild.
-/// - **Retiring.** Once the prune has removed the last document a plugin owned, the record
-///   describes nothing and has to go, or enabling that language again reports a change from a
-///   generation with no chunks to its name.
-///
-/// A mismatch is left alone rather than overwritten: [`report_grammar_generation`] has already
-/// said so, and recording the new value would silence the next run while leaving the index
-/// exactly as mixed. Only `force`, which re-chunks everything, makes the new value true.
-pub(crate) fn record_grammar_generation(
-    db: &Database,
-    desired: Option<&str>,
-    describes_something: bool,
-    force: bool,
-) -> Result<()> {
-    let Some(desired) = desired.filter(|_| describes_something) else {
-        return db.clear_code_grammar_generation();
-    };
-    if force || db.read_code_grammar_generation()?.is_none() {
-        db.write_code_grammar_generation(desired)?;
     }
     Ok(())
 }

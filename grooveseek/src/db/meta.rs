@@ -197,45 +197,6 @@ impl Database {
         Ok(())
     }
 
-    /// (feature-56 PR-3a) `index_meta.code_grammar_generation` を読む。key 不在なら `None`。
-    ///
-    /// 「この索引のコード chunk を、どの build の grammar plugin が切ったか」。
-    /// 値は不透明な文字列で、**中身を解釈しない** — 一致するか否かだけを見る。
-    pub fn read_code_grammar_generation(&self) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT value FROM index_meta WHERE key = 'code_grammar_generation'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
-    /// (feature-56 PR-3a) `index_meta.code_grammar_generation` を記録する (INSERT OR REPLACE)。
-    pub fn write_code_grammar_generation(&self, generation: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO index_meta (key, value) \
-             VALUES ('code_grammar_generation', ?1)",
-            params![generation],
-        )?;
-        Ok(())
-    }
-
-    /// (feature-56 PR-3a) `index_meta.code_grammar_generation` を消す。
-    ///
-    /// **呼んでよいのは、その grammar が切った chunk が索引に 1 つも残っていない時だけ。**
-    /// 記録は「この索引の chunk を誰が切ったか」なので、覆う対象が消えたのに残していると、
-    /// あとで plugin を有効化し直した時に**誰も切っていない世代との差**を警告してしまう。
-    pub fn clear_code_grammar_generation(&self) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM index_meta WHERE key = 'code_grammar_generation'",
-            [],
-        )?;
-        Ok(())
-    }
-
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
     /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {

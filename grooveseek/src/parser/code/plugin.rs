@@ -156,37 +156,6 @@ pub(crate) struct LoadedPlugin {
     pub(crate) grammar: Arc<LoadedGrammar>,
     /// Leaked from the library's own string, so it outlives any borrow of it.
     pub(crate) extension: &'static str,
-    /// What the plugin says built it, verbatim.
-    ///
-    /// Diagnostic only, by the ABI's own definition: it is what the plugin *says* built it.
-    /// Logged, and put in front of the hash below so that a message about a change names
-    /// something a reader recognises.
-    pub(crate) build_info: String,
-    /// What the library actually is: the first half of a SHA-256 over its bytes.
-    ///
-    /// The identity the index records, because [`Self::build_info`] cannot serve as one.
-    /// The macro builds that string from `CARGO_PKG_NAME`, `CARGO_PKG_VERSION` and the
-    /// language name, so a plugin rebuilt against a newer grammar or a fixed tags query —
-    /// without its own version moving — hands back a string identical to the previous build's.
-    /// A grammar that changed would then look unchanged, and chunks from two builds would mix
-    /// with nothing said, which is the outcome recording a generation exists to prevent.
-    ///
-    /// Hashing the file answers the question directly: the thing that cut the chunks is this
-    /// library, and this is what it was. It does not depend on the plugin's author being
-    /// careful with a version number, and an identical rebuild hashing the same is correct
-    /// rather than a miss.
-    pub(crate) content_hash: String,
-}
-
-/// Bytes read from a plugin before it is opened, for [`LoadedPlugin::content_hash`].
-///
-/// Half of a SHA-256, hex. This is a change detector, not a security boundary — what stands
-/// between the user and a substituted library is verifying the published checksum before the
-/// file is ever placed, which the setup instructions cover and no check here can replace.
-fn content_hash(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Open one plugin and check it.
@@ -200,13 +169,6 @@ pub(crate) fn load(
     // Absolute, because on Windows a relative path sends the loader through the current
     // directory search order, and the whole point of the flags below is to not do that.
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-
-    // Read before opening. A file groove cannot read is a file it cannot load either, so the
-    // failure belongs to the same case; and doing it first means the hash describes the bytes
-    // as they were before anything in them ran.
-    let hash = std::fs::read(&absolute)
-        .map(|bytes| content_hash(&bytes))
-        .map_err(|e| Rejection::NotLoadable(format!("{e}")))?;
 
     let lib = open_library(&absolute)?;
 
@@ -286,7 +248,6 @@ pub(crate) fn load(
         grammar = name,
         extension,
         build_info = %raw.build_info,
-        content_hash = %hash,
         "loaded a grammar plugin"
     );
 
@@ -297,8 +258,6 @@ pub(crate) fn load(
     Ok(LoadedPlugin {
         grammar: Arc::new(grammar),
         extension,
-        build_info: raw.build_info,
-        content_hash: hash,
     })
 }
 
@@ -465,43 +424,6 @@ mod tests {
                 "{stem:?} would escape the grammar directory"
             );
         }
-    }
-
-    /// The host's chunking version is part of what a code chunk's boundaries depend on, so it
-    /// has to be something a release can move.
-    ///
-    /// Not an assertion about its value — that changes on purpose. What must hold is that it
-    /// exists and is carried, which the registry's generation string does; this pins the type
-    /// so that turning it into something derived (groove's version, a build timestamp) is a
-    /// visible change rather than a quiet one.
-    #[test]
-    fn the_host_chunking_version_is_a_number_a_release_sets_deliberately() {
-        let schema: u32 = super::super::CHUNKING_SCHEMA;
-        assert!(
-            schema >= 1,
-            "the first version is 1; 0 would read as 'unset'"
-        );
-    }
-
-    /// The hash has to change when the bytes do, and not when they do not.
-    ///
-    /// That is the whole contract: it stands in for "is this the same library", which the
-    /// plugin's own [`LoadedPlugin::build_info`] cannot answer: that is built from a version
-    /// number the author may not have moved.
-    #[test]
-    fn the_content_hash_follows_the_bytes_and_nothing_else() {
-        let a = content_hash(b"one grammar");
-        let b = content_hash(b"another grammar");
-        assert_ne!(a, b, "different bytes must not hash alike");
-        assert_eq!(
-            a,
-            content_hash(b"one grammar"),
-            "the same bytes must hash the same, so an identical rebuild is not a change"
-        );
-        // A single flipped bit is a different grammar as far as this is concerned.
-        assert_ne!(a, content_hash(b"one grammat"));
-        assert_eq!(a.len(), 32, "half of a SHA-256, hex: {a}");
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
     }
 
     /// Each reason reads as one clause after "…was refused because", and stays ASCII.
