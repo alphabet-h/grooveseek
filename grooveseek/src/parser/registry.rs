@@ -160,9 +160,18 @@ fn plugin_parser(
     // saying so.
     let loaded = super::code::plugin::load(&path, id)
         .map_err(|r| anyhow::anyhow!(plugin_rejected_message(id, &path, &r.describe())))?;
-    // What built this grammar, kept so the indexer can notice when it is replaced. The id is
-    // included because the string on its own says nothing about which language it belongs to.
-    generation.push(format!("{id}={}", loaded.build_info));
+    // What this grammar *is*, kept so the indexer can notice when it is replaced. The id is
+    // included because neither half says on its own which language it belongs to.
+    //
+    // The hash is what makes this an identity: `build_info` is the plugin's own account of
+    // itself, built from its package version, so a rebuild against a newer grammar without a
+    // version bump would repeat it verbatim and a changed grammar would read as unchanged. The
+    // build info stays in front of it anyway, so that a message about a difference names
+    // something a reader recognises rather than only two hex strings.
+    generation.push(format!(
+        "{id}={} sha256:{}",
+        loaded.build_info, loaded.content_hash
+    ));
     Ok(Box::new(super::CodeParser::new(
         loaded.grammar,
         loaded.extension,
@@ -179,12 +188,14 @@ pub struct Registry {
     /// budget is baked into the instance, so this is the only place left that still knows the
     /// number the chunks in a given index were cut at.
     code_max_chunk_chars: Option<usize>,
-    /// (feature-56 PR-3a) What built the grammar plugins in this registry, or `None` when none
-    /// came from a plugin.
+    /// (feature-56 PR-3a) Which grammar plugins are in this registry, by content, or `None`
+    /// when none came from a plugin.
     ///
     /// Here for the same reason as the budget above: a rebuilt grammar can cut the same file
     /// into different chunks, and this is the only place that still knows which build produced
-    /// the ones in a given index.
+    /// the ones in a given index. Each entry carries a hash of the library's bytes rather than
+    /// only what the plugin says built it — the latter comes from a package version, which a
+    /// rebuild against a newer grammar need not move.
     ///
     /// **Compiled-in grammars are deliberately absent.** Their generation is the binary's, so
     /// marking it would fire on every groove upgrade whether or not a grammar moved — a warning

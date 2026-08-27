@@ -44,9 +44,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
-- **Replacing a grammar plugin is noticed.** groove records which build cut the
-  code chunks in an index, and says so when the plugins loaded now are not the
-  ones that did. A rebuilt grammar can move where definitions begin and end, but
+- **Replacing a grammar plugin is noticed.** groove records which plugin cut the
+  code chunks in an index — by a hash of the library's own bytes, not by the
+  version it claims, so a rebuild against a newer grammar counts as a change
+  whether or not its author moved a version number — and says so when the
+  plugins loaded now are not the ones that did. A rebuilt grammar can move where definitions begin and end, but
   indexing skips files whose content has not changed — so without this, an index
   would quietly come to hold two generations of chunks as files were edited. The
   recorded value is deliberately not updated on a mismatch: writing it would

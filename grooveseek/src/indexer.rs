@@ -1429,6 +1429,11 @@ pub(crate) fn resolve_code_chunk_budget(db: &Database, desired: usize, force: bo
 /// recorded value**, because writing it would silence the next run while leaving the index
 /// exactly as mixed.
 ///
+/// `desired` identifies each plugin by a hash of its bytes, not by the version it declares:
+/// the two examples above — a fixed tags query, a regenerated parse table — are exactly the
+/// changes a plugin can ship without its own version moving, and a marker that missed those
+/// would miss the case this exists for.
+///
 /// # What this deliberately does not cover
 ///
 /// Grammars compiled into the binary. Their generation is the binary's own, so the only marker
