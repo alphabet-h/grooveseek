@@ -78,20 +78,33 @@ pub(crate) fn unresolved_id_message(
 /// The release page is named without a URL. A test pins this wording, and a URL in it would
 /// make that test fail the day the page moves — so the address lives in `docs/clients.md`,
 /// where a stale link is visible to a reader rather than to CI.
-pub(crate) fn plugin_missing_message(id: &str, dir: &Path, file_name: &str) -> String {
+///
+/// `archive` comes from [`super::code::plugin::plugin_archive_name`], not from `id`: the two
+/// are different words, and it is the archive's name that has to match what a release publishes.
+pub(crate) fn plugin_missing_message(
+    id: &str,
+    dir: &Path,
+    file_name: &str,
+    archive: &str,
+) -> String {
     format!(
         "[parsers].enabled contains {id:?}, whose grammar is a plugin, and {file_name} is not \
-         in {}. Download the groove-grammar-{id}-<target> archive from the groove release page \
+         in {}. Download the {archive}-<target> archive from the groove release page \
          (see docs/clients.md), unpack it, and put {file_name} there.",
         dir.display()
     )
 }
 
 /// (ii) The file is there and was refused.
-pub(crate) fn plugin_rejected_message(id: &str, path: &Path, reason: &str) -> String {
+pub(crate) fn plugin_rejected_message(
+    id: &str,
+    path: &Path,
+    reason: &str,
+    archive: &str,
+) -> String {
     format!(
         "[parsers].enabled contains {id:?}, and {} was refused because {reason}. Take the \
-         groove-grammar-{id}-<target> archive from the release for groove {} and use the file \
+         {archive}-<target> archive from the release for groove {} and use the file \
          from it.",
         path.display(),
         env!("CARGO_PKG_VERSION"),
@@ -149,16 +162,18 @@ fn plugin_parser(
         anyhow::bail!(plugin_dir_undecidable_message(id));
     };
     let file_name = super::code::plugin::plugin_file_name(stem);
+    let archive = super::code::plugin::plugin_archive_name(stem);
     let path = dir.join(&file_name);
     if !path.exists() {
-        anyhow::bail!(plugin_missing_message(id, dir, &file_name));
+        anyhow::bail!(plugin_missing_message(id, dir, &file_name, &archive));
     }
     // The id is handed to the loader as the extension the library is expected to declare. It
     // is not a hint: a library that declares something else is refused, because groove found
     // this file *by* the id and registering another extension would move the language without
     // saying so.
-    let loaded = super::code::plugin::load(&path, id)
-        .map_err(|r| anyhow::anyhow!(plugin_rejected_message(id, &path, &r.describe())))?;
+    let loaded = super::code::plugin::load(&path, id).map_err(|r| {
+        anyhow::anyhow!(plugin_rejected_message(id, &path, &r.describe(), &archive))
+    })?;
     Ok(Box::new(super::CodeParser::new(
         loaded.grammar,
         loaded.extension,
@@ -452,13 +467,26 @@ mod tests {
 
     /// (i) The directory is known and the file is not in it. No URL, so the
     /// wording survives the release page moving.
+    ///
+    /// The archive is named after the plugin's crate, so the message says
+    /// `groove-grammar-python` where the enabled id is `py`. Naming the id
+    /// there would send the reader to a file no release publishes.
     #[test]
     fn a_missing_plugin_names_the_directory_the_file_belongs_in() {
         let dir = Path::new("/plugins");
-        let msg = plugin_missing_message("py", dir, "libgroove_grammar_python.so");
+        let msg = plugin_missing_message(
+            "py",
+            dir,
+            "libgroove_grammar_python.so",
+            "groove-grammar-python",
+        );
         assert!(msg.contains("libgroove_grammar_python.so"), "{msg}");
         assert!(msg.contains("plugins"), "{msg}");
-        assert!(msg.contains("groove-grammar-py-<target>"), "{msg}");
+        assert!(msg.contains("groove-grammar-python-<target>"), "{msg}");
+        assert!(
+            !msg.contains("groove-grammar-py-<target>"),
+            "the archive is named after the language, not the id: {msg}"
+        );
         assert!(
             !msg.contains("http://") && !msg.contains("https://"),
             "the address lives in docs/clients.md, not in a pinned string: {msg}"
@@ -471,9 +499,15 @@ mod tests {
     #[test]
     fn a_refused_plugin_names_the_path_the_reason_and_this_version() {
         let path = Path::new("/plugins/libgroove_grammar_python.so");
-        let msg = plugin_rejected_message("py", path, "it does not export groove_grammar_name");
+        let msg = plugin_rejected_message(
+            "py",
+            path,
+            "it does not export groove_grammar_name",
+            "groove-grammar-python",
+        );
         assert!(msg.contains("libgroove_grammar_python.so"), "{msg}");
         assert!(msg.contains("does not export groove_grammar_name"), "{msg}");
+        assert!(msg.contains("groove-grammar-python-<target>"), "{msg}");
         assert!(
             msg.contains(env!("CARGO_PKG_VERSION")),
             "a replacement has to match this build: {msg}"

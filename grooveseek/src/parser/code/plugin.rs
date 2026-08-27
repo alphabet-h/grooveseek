@@ -78,6 +78,19 @@ pub(crate) fn plugin_file_name(stem: &str) -> String {
     )
 }
 
+/// The release archive a plugin arrives in: `groove-grammar-python`, from the stem
+/// `groove_grammar_python`.
+///
+/// Built from the stem and **not** from the enabled id, which is the same reason
+/// [`plugin_file_name`] is: the archive is named after the plugin's crate, and cargo names a
+/// crate's `cdylib` after that crate with `-` turned into `_`. So the file groove opens and the
+/// archive a user downloads are one name in cargo's two spellings, and deriving one from the
+/// other is what stops them drifting. The id cannot stand in — `py` is the id, `python` is the
+/// language, and `groove-grammar-py` is a name no release publishes.
+pub(crate) fn plugin_archive_name(stem: &str) -> String {
+    stem.replace('_', "-")
+}
+
 /// Why a file that exists was not accepted as a grammar.
 ///
 /// Separate from the message so the wording lives in one place ([`Self::describe`]) and the
@@ -422,6 +435,27 @@ mod tests {
             assert!(
                 !stem.contains(['/', '\\']),
                 "{stem:?} would escape the grammar directory"
+            );
+        }
+    }
+
+    /// The archive a diagnostic tells the user to download is the plugin's **crate**, which is
+    /// its library stem in cargo's other spelling — never the enabled id.
+    ///
+    /// `py` and `python` are different words, so a message built from the id would name
+    /// `groove-grammar-py`, which no release publishes. Every future id whose language is
+    /// spelled differently (`ts`, `kt`) has the same shape.
+    #[test]
+    fn the_archive_a_diagnostic_names_is_the_crate_the_library_came_from() {
+        assert_eq!(
+            plugin_archive_name("groove_grammar_python"),
+            "groove-grammar-python"
+        );
+        for (_, stem) in PLUGIN_GRAMMARS {
+            assert_eq!(
+                &plugin_archive_name(stem).replace('-', "_"),
+                stem,
+                "the archive and the library it holds must be one name in two spellings"
             );
         }
     }

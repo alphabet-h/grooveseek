@@ -65,7 +65,8 @@ fn example_cdylib(name: &str) -> PathBuf {
     let path = profile_dir.join("examples").join(&file);
     assert!(
         path.exists(),
-        "the {name} fixture was not built; `cargo test` should have produced {}",
+        "the {name} fixture was not built; add `--examples` to the cargo invocation (plain \
+         `cargo test` already builds them, `--test <name>` on its own does not) to produce {}",
         path.display()
     );
     path
@@ -158,7 +159,7 @@ fn a_missing_plugin_stops_the_run_before_a_database_exists() {
         "the message should name the file to place:\n{stderr}"
     );
     assert!(
-        stderr.contains("groove-grammar-py-<target>"),
+        stderr.contains("groove-grammar-python-<target>"),
         "the message should name the release asset:\n{stderr}"
     );
     assert!(
@@ -300,7 +301,13 @@ fn a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory()
 /// A plugin that passes every check parses its files like a compiled-in grammar would.
 ///
 /// `#[ignore]` because this one indexes for real, which loads the BGE-small model (~130 MB).
-/// Run with `cargo test --test grammar_plugin_cli -- --ignored`.
+/// Run with `cargo test --examples --test grammar_plugin_cli -- --ignored`.
+///
+/// The `--examples` is load-bearing: selecting a test target on its own does not build the
+/// fixture libraries, so without it every test here that places a plugin fails on a file that
+/// was never produced (via: `cargo test --test grammar_plugin_cli --no-run
+/// --message-format=json | grep -c '"kind":\["example"\]'` reports none, against the plain
+/// form which reports one per `[[example]]`).
 #[test]
 #[ignore]
 fn a_plugin_the_loader_accepts_indexes_the_files_it_claims() {

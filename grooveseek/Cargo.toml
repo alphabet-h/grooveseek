@@ -132,8 +132,9 @@ groove-grammar-abi = { path = "../crates/groove-grammar-abi" }
 # Unconditional rather than behind a feature: the loader is what makes an id
 # resolvable at all, so a build without it could only ever answer "unknown id"
 # for every language that is not compiled in — the diagnostic this feature
-# exists to replace. The crate is a thin wrapper over the platform call and
-# pulls in `cfg-if` and `windows-targets`, both already in the lock.
+# exists to replace. The crate is a thin wrapper over the platform call: its
+# only dependencies are `cfg-if` and `windows-link`, and both were already in
+# the lock before this edge existed.
 #
 # The Windows path needs `os::windows::Library::load_with_flags`, which is why
 # the OS-specific half of the API is used rather than the portable `Library::new`:
