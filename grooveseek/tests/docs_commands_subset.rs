@@ -40,11 +40,11 @@
 //! # What this cannot catch
 //!
 //! **Block against block, and page against page.** Two fenced blocks on one page
-//! stand in this relation sixteen times in this repository today -- `AGENTS.md`
+//! stand in this relation fifteen times in this repository today -- `AGENTS.md`
 //! lists three commands to run while working and five that reproduce CI,
 //! `docs/usage.md` shows one `groove` subcommand at a time and then all three
 //! under `RUST_LOG` -- and every one of them is deliberate. A rule symmetric
-//! enough to catch a copied block would fail on all sixteen, and a guard that
+//! enough to catch a copied block would fail on all fifteen, and a guard that
 //! cries wolf gets switched off. Copies that span pages are held by
 //! `docs_commands_pinned.rs`; copies between an English page and its Japanese
 //! twin by `docs_commands_twins.rs`. Neither of those discovers a new copy: they
@@ -348,10 +348,10 @@ fn sudo_options_name_a_user_and_not_a_program() {
 #[test]
 fn an_assignment_that_runs_a_command_keeps_the_command() {
     use common::docs::head_of;
-    // `.claude/commands/full-audit.md` writes this. Splitting on whitespace
-    // makes `NEXT_ID=$(jq` one token, and dropping it as an environment prefix
-    // took `jq` with it -- leaving fragments that name no program, so the line
-    // fell out of the corpus without a word.
+    // Splitting on whitespace makes `NEXT_ID=$(jq` one token, and dropping it
+    // as an environment prefix took `jq` with it -- leaving fragments that name
+    // no program, so the line fell out of the corpus without a word. The page
+    // that wrote it has stopped; the shape is what this holds.
     assert_eq!(
         head_of("NEXT_ID=$(jq '.features | map(.id) | max + 1' .dev/features.json)").as_deref(),
         Some("jq")
@@ -583,9 +583,9 @@ fn an_argument_that_continues_onto_the_next_line_is_part_of_the_instruction() {
         ],
         "{placed:?}"
     );
-    // `.claude/commands/full-audit.md` feeds jq a quoted filter over nine
-    // lines and chains `&& mv` after the closing quote. The chain is outside
-    // the quote, so both programs are named.
+    // A quoted jq filter can run past the end of its line and chain `&& mv`
+    // after the closing quote. The chain is outside the quote, so both
+    // programs are named.
     let lines =
         command_lines("jq '.a += [\n  {\n    \"id\": 1\n  }\n]' f > /tmp/g && mv /tmp/g f\n");
     assert_eq!(
@@ -1027,12 +1027,13 @@ fn the_block_subset_relation_this_guard_refuses_is_still_common() {
             }
         }
     }
-    // The header says "sixteen times". If this count moves, that sentence is
+    // The header says "fifteen times". If this count moves, that sentence is
     // wrong and has to move with it -- a number written beside a claim goes
     // stale on its own, and this file exists because of that class of defect.
-    // It moved from fifteen when the reader learned to follow a quoted argument
-    // across lines: the `jq` block in `.claude/commands/full-audit.md` then
-    // named the `mv` chained after its closing quote, and the block above it,
-    // which runs `jq` alone, became a subset of it.
-    assert_eq!(pairs.len(), 16, "{pairs:#?}");
+    // It has moved both ways: up when the reader learned to follow a quoted
+    // argument across lines, so a block running one program became a subset of
+    // the block that chained a second after a closing quote; and back down when
+    // the page carrying that pair stopped shipping the blocks at all. Neither
+    // time was the guard wrong -- the corpus moved under it.
+    assert_eq!(pairs.len(), 15, "{pairs:#?}");
 }
