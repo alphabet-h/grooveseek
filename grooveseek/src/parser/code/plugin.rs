@@ -2,8 +2,8 @@
 //!
 //! Rust is compiled in; every other language is a `cdylib` exporting the six symbols in
 //! [`groove_grammar_abi::symbols`]. That asymmetry is ADR-0013. This module is the half that
-//! opens one, checks it, and hands back the same [`LoadedGrammar`] the compiled-in path
-//! produces — so nothing downstream learns which way a grammar arrived.
+//! opens one, checks it, and hands back the same [`crate::parser::code::LoadedGrammar`] the
+//! compiled-in path produces — so nothing downstream learns which way a grammar arrived.
 //!
 //! # Why the file is opened by name and the directory is never enumerated
 //!
