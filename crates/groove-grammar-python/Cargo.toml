@@ -1,0 +1,45 @@
+[package]
+name = "groove-grammar-python"
+version = "1.2.0"
+edition = "2024"
+description = "The Python grammar, as a library groove loads at run time"
+authors = ["koshian"]
+
+# Never published to crates.io: it is a plugin for one program, shipped as a
+# release asset. publish = false also avoids the crates.io readme/metadata
+# validation the other satellite crates opted out of.
+publish = false
+
+# The crate name decides two names that must not drift: cargo builds the cdylib
+# as `groove_grammar_python.<dll suffix>`, which is the file groove opens
+# (`plugin_file_name` in grooveseek/src/parser/code/plugin.rs), and dist names
+# the archive after the package, which is what the diagnostics tell a user to
+# download (`plugin_archive_name`, same file). Renaming this package silently
+# breaks both.
+[lib]
+name = "groove_grammar_python"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+# cargo-dist distributes binaries by default; a package with no `[[bin]]` is
+# invisible to it until libraries are opted into. Both keys are required --
+# measured with `dist plan --tag=v0.1.0` on a throwaway workspace: with
+# `cdylibs` alone dist exits with "This workspace doesn't have anything for dist
+# to Release!". `targets` is deliberately absent so this inherits the workspace
+# list from dist-workspace.toml; groove-tray and groove-svc override it because
+# they are Windows-only, and a grammar is not.
+[package.metadata.dist]
+dist = true
+package-libraries = ["cdylib"]
+cdylibs = ["groove_grammar_python"]
+
+[dependencies]
+groove-grammar-abi = { path = "../groove-grammar-abi" }
+# The grammar itself. It depends on `tree-sitter-language` rather than on the
+# tree-sitter runtime, which is why a plugin built here can hand its parse table
+# to whatever runtime groove was built with.
+tree-sitter-python = "0.25"
+
+# rustdoc lint levels come from the workspace root, where the reasoning lives.
+[lints]
+workspace = true

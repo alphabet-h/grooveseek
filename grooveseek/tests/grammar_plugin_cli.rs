@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
+use common::ansi::strip_ansi;
 use common::mcp::grooveseek_bin;
 use common::temp::TempKbLayout;
 
@@ -36,7 +37,8 @@ const PARSERS_MD_PY: &str =
 ///
 /// The fixture declares the `py` extension and hands over the Rust parse table, so feeding it
 /// Rust is what makes the definitions in the assertions real rather than a tree of errors.
-/// What is under test is the loader, not a Python grammar — that arrives with PR-3b.
+/// What is under test here is the loader, not a Python grammar. The grammar groove actually
+/// publishes is exercised separately, at the bottom of this file, against real Python.
 const SAMPLE_PY: &str = r#"/// Rebalances the shard table after a node leaves.
 pub fn rebalance_shard_table(nodes: usize) -> usize {
     let quorum_drift_budget = 7;
@@ -362,5 +364,122 @@ fn a_plugin_the_loader_accepts_indexes_the_files_it_claims() {
     assert!(
         hit["start_line"].is_number() && hit["end_line"].is_number(),
         "a definition chunk carries its line range: {hit}"
+    );
+}
+
+/// Real Python, for the grammar groove publishes rather than the fixture's Rust table.
+///
+/// One of each definition kind Python's `tags.scm` captures — a module-level assignment, a
+/// function, a class — so the assertion below is about the vocabulary reaching the index and
+/// not about one lucky node type.
+const SAMPLE_PY_REAL: &str = r#"import re
+
+QUORUM_DRIFT_BUDGET = re.compile(r"^drift-[0-9]+$")
+
+
+def rebalance_shard_table(nodes):
+    """Return the shard count after a node leaves."""
+    return nodes * 7
+
+
+class ShardTable:
+    def __init__(self, nodes):
+        self.nodes = nodes
+"#;
+
+/// Where `cargo build -p groove-grammar-python` left the shipped library.
+///
+/// The profile directory, **not** `examples/` beside it: the fixture above is named
+/// `groove_grammar_python` too, on purpose, because both have to answer to the one name the
+/// loader builds from the `py` id. They coexist because cargo writes examples one directory
+/// down — so the only thing separating the grammar groove ships from a test fixture that
+/// hands out Rust is which of these two paths a test reads.
+fn shipped_cdylib() -> PathBuf {
+    let path = grooveseek_bin()
+        .parent()
+        .expect("the test binary knows where groove is")
+        .join(plugin_file_name());
+    assert!(
+        path.exists(),
+        "the shipped Python grammar was not built. `cargo test` does not build a cdylib that \
+         nothing depends on (rust-lang/cargo#8311), and `--examples` only reaches the fixtures \
+         beside it. Run `cargo build -p groove-grammar-python` first to produce {}",
+        path.display()
+    );
+    path
+}
+
+/// The grammar groove publishes is one its own loader accepts, and it parses Python.
+///
+/// This is the end of the chain the other tests only cover in halves: the crate name decides
+/// the library name, the library name is what the loader looks up from the `py` id, and the
+/// archive a diagnostic tells the user to download is that same name in cargo's other
+/// spelling. A rename that broke any link would leave every other test here passing.
+///
+/// `#[ignore]` for the same reason as the test above (it indexes for real, ~130 MB of model),
+/// and additionally because the library has to be built by a separate command. Run with
+/// `cargo build -p groove-grammar-python` followed by
+/// `cargo test --test grammar_plugin_cli -- --ignored`.
+#[test]
+#[ignore]
+fn the_python_grammar_groove_publishes_is_one_its_loader_accepts() {
+    let layout = TempKbLayout::new("groove-plugin-python");
+    layout.write("shards.py", SAMPLE_PY_REAL);
+    let grammars = empty_grammar_dir(&layout);
+    std::fs::copy(shipped_cdylib(), grammars.join(plugin_file_name())).expect("place plugin");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(
+        ok,
+        "indexing with the shipped grammar must succeed:\n{stderr}"
+    );
+    // The field name and its value are separated by colour codes on Windows, so the pair only
+    // reads as one string once those are gone.
+    let plain = strip_ansi(&stderr);
+    assert!(
+        plain.contains("grammar=\"python\""),
+        "the load should name the language a `lang:` filter is written against:\n{plain}"
+    );
+
+    let out = Command::new(grooveseek_bin())
+        .args([
+            "--config",
+            cfg.to_str().unwrap(),
+            "search",
+            "shard table rebalancing after a node leaves",
+            "--kb-path",
+            &layout.kb().display().to_string(),
+            "--limit",
+            "10",
+        ])
+        .output()
+        .expect("groove search");
+    assert!(
+        out.status.success(),
+        "search failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("search returns json by default");
+    let results = body["results"].as_array().expect("results array");
+
+    let kinds: Vec<&str> = results
+        .iter()
+        .filter_map(|r| r["symbol_kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"function") && kinds.contains(&"class"),
+        "Python's tags query captures functions and classes, so both should reach the index: \
+         {body}"
+    );
+    let tagged = results.iter().any(|r| {
+        r["tags"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|x| x == "lang:python"))
+    });
+    assert!(
+        tagged,
+        "the grammar's own name is what a `lang:` filter matches on: {body}"
     );
 }

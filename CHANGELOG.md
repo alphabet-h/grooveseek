@@ -33,8 +33,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   rather than registered, so a mispackaged download cannot quietly take a file
   type out of the index and put a different one in. See
   "Placing a grammar plugin" in
-  [docs/clients.md](docs/clients.md). *The first published grammar, Python,
-  follows in the next release; this one adds the loader.*
+  [docs/clients.md](docs/clients.md).
+- **Python is the first grammar published this way.** `groove-grammar-python`
+  is a new release asset — one archive per platform, each with its `.sha256`,
+  built from the same four targets as groove itself. Download it, check the
+  hash, unpack the library into the grammar directory, and add `"py"` to
+  `[parsers].enabled`; a Python file is then indexed one definition at a time,
+  the way a Rust file already was, with `class` / `function` / `constant` in
+  `symbol_kind` and `lang:python` among the tags. It is a separate download
+  rather than a second compiled-in grammar because every language that is
+  compiled in is paid for by everyone, whether or not they index it — see
+  [ADR-0013](docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md).
 - **An id that needs a plugin says so, instead of reading as a typo.** Writing
   `"py"` in `[parsers].enabled` used to be answered with the list of supported
   ids, as if it were misspelled. It now names the file to place and the
