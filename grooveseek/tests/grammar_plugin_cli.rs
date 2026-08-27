@@ -67,13 +67,48 @@ fn example_cdylib(name: &str) -> PathBuf {
     let path = profile_dir.join("examples").join(&file);
     assert!(
         path.exists(),
-        "the {name} fixture was not built. Run `cargo build --examples -p grooveseek` first, or \
-         drop the `--test` filter: plain `cargo test` builds the examples as libraries, a \
+        "the {name} fixture was not built. Run `cargo build --examples -p grooveseek{}` first, \
+         or drop the `--test` filter: plain `cargo test` builds the examples as libraries, a \
          `--test`-filtered run does not, and `--examples` does not fix that -- under `cargo \
          test` it builds each example as a test executable instead. Expected {}",
+        profile_flag(&profile_dir),
         path.display()
     );
     path
+}
+
+/// The cargo flag that puts a build in the same profile directory this test is reading.
+///
+/// A repair instruction that names a directory the caller is not using is worse than none: a
+/// `--release` run reads `target/release`, and a build command without the flag writes
+/// `target/debug`, so following the message leaves the file exactly as absent as before.
+/// Derived from the path rather than from `cfg!(debug_assertions)`, which describes how the
+/// *test* was compiled and not where cargo put the artifacts.
+fn profile_flag(profile_dir: &Path) -> &'static str {
+    match profile_dir.file_name().and_then(|n| n.to_str()) {
+        Some("debug") => "",
+        // Any other profile is reached by name; `release` has its own shorthand.
+        Some("release") => " --release",
+        _ => " --profile <the profile you are running>",
+    }
+}
+
+/// A repair instruction has to build into the directory the test is reading.
+///
+/// Both "not built" messages name a `cargo build`, and both are reached from a path under
+/// `target/<profile>/`. Without the flag a `--release` run is told to run a command that writes
+/// `target/debug`, so following the message changes nothing and the reader concludes the build
+/// is broken rather than the instruction. Cheap to get wrong again, so it is pinned here rather
+/// than only in the two `assert!` strings.
+#[test]
+fn a_repair_instruction_names_the_profile_it_has_to_build_into() {
+    assert_eq!(profile_flag(Path::new("/w/target/debug")), "");
+    assert_eq!(profile_flag(Path::new("/w/target/release")), " --release");
+    assert_eq!(
+        profile_flag(Path::new("/w/target/dist")),
+        " --profile <the profile you are running>",
+        "a named profile is still reachable, and saying nothing would repeat the bug"
+    );
 }
 
 /// The file name the loader looks for, whatever this platform calls a dynamic library.
@@ -380,6 +415,12 @@ fn a_plugin_the_loader_accepts_indexes_the_files_it_claims() {
 /// One of each definition kind Python's `tags.scm` captures — a module-level assignment, a
 /// function, a class — so the assertion below is about the vocabulary reaching the index and
 /// not about one lucky node type.
+///
+/// The assignment is the one to keep: it is easy to assume a tags query only captures `def` and
+/// `class`, and review did assume it. Indexing this exact file returns
+/// `constant QUORUM_DRIFT_BUDGET` at lines 3-3 with `symbol_kind` `constant`, beside
+/// `function rebalance_shard_table` 6-8 and `class ShardTable` 11-13, which is why the test
+/// below asserts all three kinds rather than the two obvious ones.
 const SAMPLE_PY_REAL: &str = r#"import re
 
 QUORUM_DRIFT_BUDGET = re.compile(r"^drift-[0-9]+$")
@@ -403,15 +444,17 @@ class ShardTable:
 /// down — so the only thing separating the grammar groove ships from a test fixture that
 /// hands out Rust is which of these two paths a test reads.
 fn shipped_cdylib() -> PathBuf {
-    let path = grooveseek_bin()
+    let profile_dir = grooveseek_bin()
         .parent()
         .expect("the test binary knows where groove is")
-        .join(plugin_file_name());
+        .to_path_buf();
+    let path = profile_dir.join(plugin_file_name());
     assert!(
         path.exists(),
         "the shipped Python grammar was not built. `cargo test` does not build a cdylib that \
          nothing depends on (rust-lang/cargo#8311), and `--examples` only reaches the fixtures \
-         beside it. Run `cargo build -p groove-grammar-python` first to produce {}",
+         beside it. Run `cargo build -p groove-grammar-python{}` first to produce {}",
+        profile_flag(&profile_dir),
         path.display()
     );
     path
@@ -487,10 +530,14 @@ fn the_python_grammar_groove_publishes_is_one_its_loader_accepts() {
         .iter()
         .filter_map(|r| r["symbol_kind"].as_str())
         .collect();
+    // All three kinds, not just the two obvious ones. `constant` is the one worth pinning: it
+    // comes from a module-level assignment rather than a `def` or a `class`, it is the kind the
+    // CHANGELOG promises by name, and it is the one a reader is most likely to assume Python's
+    // tags query does not capture.
     assert!(
-        kinds.contains(&"function") && kinds.contains(&"class"),
-        "Python's tags query captures functions and classes, so both should reach the index: \
-         {body}"
+        kinds.contains(&"function") && kinds.contains(&"class") && kinds.contains(&"constant"),
+        "Python's tags query captures functions, classes and module-level assignments, so all \
+         three should reach the index: {body}"
     );
     let tagged = results.iter().any(|r| {
         r["tags"]
