@@ -4,7 +4,7 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 # /full-audit
 
-プロジェクト全体を多角的に厳しめにレビューし、結果を `.dev/knowledge/` 配下のノートと `.dev/features.json` に整理し、着手プランを提示する。リリース前 / 大規模 refactor 後 / 四半期定期 等の節目で意図的に起動する想定。
+プロジェクト全体を多角的に厳しめにレビューし、結果を `.dev/knowledge/` 配下の audit ノートと `.dev/archive/<date>-cycle/audit-todos.md` に整理し、着手プランを提示する。リリース前 / 大規模 refactor 後 / 四半期定期 等の節目で意図的に起動する想定。
 
 ## 想定起動タイミング
 
@@ -17,9 +17,10 @@ description: 4-軸 (コード品質 / セキュリティ / テスト / docs) の
 
 ## 前提
 
-- `.dev/knowledge/` と `.dev/features.json` の運用ルール (`CLAUDE.local.md`) が有効
+- `.dev/knowledge/` の運用ルールと、「audit / 大改修サイクルは Markdown ベース (`audit-todos.md` 等) を
+  `.dev/archive/<date>-cycle/` 配下に作る」方針 (`CLAUDE.local.md`) が有効
 - subagent type: `feature-dev:code-reviewer`, `general-purpose` が available
-- 過去 audit の実例: `.dev/knowledge/review-2026-04-29-full-audit.md`
+- 過去 audit の実例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md`
 - `.dev/` は `.git/info/exclude` で公開 repo の追跡外にある owner 側の private repo。本 command が
   参照する `.dev/release-checklist.md` も書き出す `.dev/knowledge/` もそちらにあり、**公開 repo を
   clone しただけの checkout には無い**。内容を公開側へ写して二重化することはしない
@@ -209,7 +210,7 @@ prompt:
 4. **既知の良い点 (Pass 判定)** — 監査でクリアと確認できた防御策
 5. **推奨アクション** — 短期 / 中期 / 長期の 3 段階に分けて
 
-過去の出力例: `.dev/knowledge/review-2026-04-29-full-audit.md` を参考にする。
+過去の出力例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md` を参考にする。
 
 ---
 
@@ -217,40 +218,38 @@ prompt:
 
 #### 3-1. knowledge note を作成
 
-新規ファイル: `.dev/knowledge/review-YYYY-MM-DD-full-audit.md` (`YYYY-MM-DD` は audit 実施日 UTC)
+新規ファイル: `.dev/knowledge/review-YYYY-MM-DD-full-audit.md` (`YYYY-MM-DD` は audit 実施日 UTC)。
+**新規は必ず `.dev/knowledge/` 直下に書く** — 済んだサイクルのノートは
+`.dev/knowledge/archive/audits/` へ移してあるので、最新はいつも live 側にある。
 
-テンプレ要素 (詳細は過去版 `review-2026-04-29-full-audit.md` 参照):
+テンプレ要素 (詳細は過去版 `archive/audits/review-2026-08-18-full-audit.md` 参照):
 - 取得環境 (groove version / commit / 対象ブランチ / 軸)
 - 結論サマリ
 - 横断テーマ
 - 個別の高優先度 Issue
 - レビューで確認できた良い点
-- TODO 化マッピング (新規 feature ID と category 案)
+- TODO 化マッピング (3-2 の台帳へ起票する ID と重大度)
 - 推奨着手順序
 
-#### 3-2. `.dev/features.json` に新規 feature を append
+#### 3-2. `.dev/archive/<YYYY-MM-DD>-cycle/audit-todos.md` に起票
 
-既存 feature の最大 ID を取得して連番で追加:
+サイクル用のディレクトリと台帳を新規に作り、Phase 2 で統合した issue を Markdown で並べる。
+**機械可読フォーマットは使わない** — 読むのは人間だけなので、列はサイクルごとに調整してよい。
 
-```bash
-NEXT_ID=$(jq '.features | map(.id) | max + 1' .dev/features.json)
-```
+冒頭に置くもの:
 
-`status: "todo"` で append する jq one-liner:
+- **出典** = Phase 3-1 で書いた `.dev/knowledge/review-YYYY-MM-DD-full-audit.md` (+ 対象 commit)
+- **ID** = 短いプレフィックス + 連番 (`AU-01` / `BU-01` ...)。プレフィックスはサイクルごとに決める
+- **status** の語彙 = `todo` / `wip` / `done` / `declined`
 
-```bash
-jq '.features += [
-  {
-    "id": <NEXT_ID>,
-    "category": "<security-fix|bug-fix|docs|refactor|security|dependency|hardening|quality|infra|infra-bench|...>",
-    "description": "<1-2 段落: 何を / なぜ / 主要修正方針 / 注意点>",
-    "status": "todo",
-    "verification": "未着手 (TODO)。実装後: <実装後の検証手順>"
-  }
-]' .dev/features.json > /tmp/features.tmp.json && mv /tmp/features.tmp.json .dev/features.json
-```
+本体は重大度ごとに節を切り、各節を表にする。過去サイクルが使った列:
 
-複数 feature を 1 配列でまとめて append できる。
+| ID | 重大度 | status | 対象 | 内容 / 修正方針 | 検証 |
+|---|---|---|---|---|---|
+| `AU-01` | **Critical** | todo | `src/db.rs:1618` | 何が / なぜ壊れるか / どう直すか | 実装後に何を見れば直ったと言えるか |
+
+**タグ前に fix した分は載せない** — それは review ノート側の「推奨着手順序」が持っている。
+この台帳が管理するのは**リリース後に着手する繰り越し分**。
 
 ---
 
@@ -278,15 +277,15 @@ jq '.features += [
 | 場所 | 種別 | 用途 |
 |---|---|---|
 | `.dev/knowledge/review-YYYY-MM-DD-full-audit.md` | 新規 (毎回別ファイル) | 人間用 audit 凍結アーカイブ |
-| `.dev/features.json` | 既存に append | 機械可読 todo |
+| `.dev/archive/<YYYY-MM-DD>-cycle/audit-todos.md` | 新規 (サイクルごと) | 繰り越し issue の人読み台帳 |
 
 `.dev/` は git 追跡外なので commit には乗らない (ローカルのみ)。
 
 ## 過去 audit の参照
 
-実例: `.dev/knowledge/review-2026-04-29-full-audit.md`
+実例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md`
 
-このファイルが存在すれば、Phase 0 で「前回 audit (`<date>`) からの差分にフォーカスすべき箇所はあるか」をユーザに確認してもよい。
+直前の audit ノートは `find .dev -name 'review-*full-audit*' | sort | tail -1` で取れる。それがあれば、Phase 0 で「前回 audit (`<date>`) からの差分にフォーカスすべき箇所はあるか」をユーザに確認してもよい。
 
 ## 関連
 

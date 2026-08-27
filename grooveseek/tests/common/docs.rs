@@ -523,8 +523,7 @@ fn assignment_value(token: &str) -> Option<&str> {
 /// taking it away. `NEXT_ID=$(jq '...' file)` splits on whitespace into
 /// `NEXT_ID=$(jq` and the rest, and dropping that first token would drop `jq`
 /// with it -- leaving fragments that name no program, so the whole line fell out
-/// of the corpus without a word. `.claude/commands/full-audit.md` writes exactly
-/// that.
+/// of the corpus without a word.
 ///
 /// The substitution has to be closed as well as opened. `PWD=$(pwd)` takes no
 /// arguments, so the whole thing is **one** token and the `)` is still attached
