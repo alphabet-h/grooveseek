@@ -244,9 +244,16 @@ groove parses source code one definition at a time, but only Rust is compiled in
 1. Find the archive named `groove-grammar-<language>-<target>` for **your groove version** on the [releases page](https://github.com/alphabet-h/grooveseek/releases). The plugin and the binary share an ABI version, so a plugin from a different release may be refused.
 2. **Verify its checksum before unpacking.** Every archive is published with a `.sha256` beside it. Loading a library runs its own initialisation before groove can inspect a single symbol, so a substituted or corrupted archive is native code running as you — and no check groove performs afterwards changes that. This step is the one that has to happen before the file is ever opened.
 
+   Run these in the directory you downloaded both files into: a `.sha256` names the archive it belongs to, and the check looks for it by that name. Substitute the target you actually downloaded — the published ones are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`.
+
    ```bash
-   # Linux / macOS
+   # Linux
    sha256sum -c groove-grammar-python-x86_64-unknown-linux-gnu.tar.xz.sha256
+   ```
+
+   ```bash
+   # macOS — no sha256sum in the base system, and Apple Silicon is the only Mac target published
+   shasum -a 256 -c groove-grammar-python-aarch64-apple-darwin.tar.xz.sha256
    ```
 
    ```powershell

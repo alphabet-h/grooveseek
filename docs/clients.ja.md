@@ -243,9 +243,16 @@ groove はソースコードを定義 1 つ = chunk 1 つで parse するが、�
 1. [releases ページ](https://github.com/alphabet-h/grooveseek/releases)で、**使っている groove の版**の `groove-grammar-<言語>-<target>` アーカイブを探す。plugin とバイナリは ABI 版を共有するので、別の release のものは拒否されうる。
 2. **展開する前に checksum を検証する。** どのアーカイブにも `.sha256` が並んで公開されている。ライブラリを開くと、groove が symbol を 1 つも見ないうちに**そのライブラリ自身の初期化が走る**ので、すり替えられた / 壊れたアーカイブは「自分の権限で動くネイティブコード」そのものであり、あとから groove が何を検査しても変わらない。**ファイルを開く前**に済ませる必要があるのはこの手順だけ。
 
+   **アーカイブと `.sha256` を両方置いたディレクトリで**実行すること: `.sha256` は自分が属するアーカイブのファイル名を持っていて、検証はその名前で探す。target は実際に落としたものに置き換える — 公開されているのは `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` / `aarch64-apple-darwin` / `x86_64-pc-windows-msvc`。
+
    ```bash
-   # Linux / macOS
+   # Linux
    sha256sum -c groove-grammar-python-x86_64-unknown-linux-gnu.tar.xz.sha256
+   ```
+
+   ```bash
+   # macOS — 素の macOS に sha256sum は無い。Mac 向けに公開しているのは Apple Silicon だけ
+   shasum -a 256 -c groove-grammar-python-aarch64-apple-darwin.tar.xz.sha256
    ```
 
    ```powershell
