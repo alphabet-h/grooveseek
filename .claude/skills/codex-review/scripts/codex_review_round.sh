@@ -19,6 +19,8 @@
 #   6  trigger POST failed 3 times; do not wait, re-run later (trap 50)
 #   7  round limit reached; nothing was posted (trap 16 / 28)
 #   8  could not read the PR before posting (gh api failed); nothing was posted
+#   9  a round delta could not be computed (jq failed); the round's findings are
+#      unknown, so nothing is reported as converged (trap 59)
 #
 # Output contract (AGENTS.md "Results go to stdout, diagnostics to stderr"):
 #   stdout = the review itself (baseline on first invocation, Step 4 summary, Step 5 render)
@@ -55,6 +57,13 @@ cd "$REPO_DIR" || exit 1
 # diagnostics to stderr"、および CP932 コンソールでの mojibake 回避)。この script の
 # *結果* は review の中身なので、それだけが stdout に出る。
 diag() { printf '%s\n' "$*" >&2; }
+
+# 罠 59: snapshot は **ファイル経由で** jq に渡す (下の json_delta)。置き場は
+# `mktemp -d` の絶対パス — この script は repo root へ cd しているので、相対パスで
+# 書くと作業ツリーに残骸を落とす。EXIT trap で必ず消すので、どの exit code で
+# 抜けても残らない。
+ROUND_TMP=$(mktemp -d) || { diag "ABORT: could not create a temporary directory."; exit 8; }
+trap 'rm -rf "$ROUND_TMP"' EXIT
 
 # 投稿 *前* の読み取り (repo 名 / baseline / trigger 履歴) が失敗したら、投稿せずに
 # 止める。読めなかった結果を「空」として先へ進むと、baseline が空 = 既存の指摘が全部
@@ -99,6 +108,45 @@ snapshot_issues() {
   gh api --paginate "repos/${OWNER_REPO}/issues/${PR}/comments?per_page=100" \
     --jq "[.[] | select(.user.login==\"${BOT}\") | {id, updated_at, body}]" \
     | jq -s "add // [] | sort_by(.id)"
+}
+
+# ---- round delta (罠 29 の compound key を、罠 59 を踏まない渡し方で) ----
+# 罠 29: id 単独の set diff は **edit を miss する** — codex が既存 comment の body を
+#   update して P-badge を足す case で false-converge する。`(id, <timestamp>)` で取る。
+# 罠 59 (PR #247 round 11): その diff を `jq -n --argjson prev "$PREV" --argjson cur "$CUR"`
+#   で書くと、**snapshot は comment 本文を含むので argv がすぐ上限を超える**。実測: PR #247 の
+#   inline snapshot 1 本が 16,532 bytes、prev + cur で 33,064 bytes で
+#   `jq: Argument list too long` (exit 126)、`$( )` は **空文字列**を返す
+#   (via: `jq -n --argjson prev "$(cat inline.json)" --argjson cur "$(cat inline.json)" '...'`)。
+#   空文字列は下流で「指摘 0 件」と見分けが付かない (`echo '' | jq length` は何も出さず、
+#   `$(( + 0 + 0 ))` は 0 になる) ので、**落ちたのに収束側に倒れる**。
+#   ファイル経由 (`--slurpfile`) にすれば argv に本文が乗らない。
+#   同じ形が 3 endpoint 分あったので、**関数 1 つに寄せる** (罠 53: 同じ操作を複数箇所に
+#   書くと片方だけ直し忘れる)。
+json_delta() {   # $1 = prev の JSON file, $2 = cur の JSON file, $3 = 比較する timestamp field
+  jq -n --slurpfile prev "$1" --slurpfile cur "$2" --arg ts "$3" '
+    ($prev[0] | map({key: (.id|tostring), value: .[$ts]}) | from_entries) as $prev_map |
+    $cur[0] | map(select(.id as $i | ($prev_map[$i|tostring] // null) != .[$ts]))
+  '
+}
+
+# 罠 59 の二次被害を止める: **空文字列は「指摘なし」ではなく「読めなかった」**。
+# 罠 48 が「空欄を指摘なしと読むな」を人間の手順として書いていたものを、ここで機械化する。
+# ここまで来ると trigger は投稿済みなので credit は既に消えている — それでも
+# 「収束した」と報告するより、読めなかったと言って終わる方が安い。
+require_delta() {   # $1 = 値, $2 = 何の delta か
+  case "$1" in
+    '') diag "ABORT: ${2} could not be computed (jq failed, trap 59)."
+        diag "Action: re-run this round. Do NOT read the empty list as 'no findings'."
+        exit 9;;
+  esac
+}
+
+# snapshot を delta 用のファイルに落とす。`printf '%s'` は末尾に改行を足さない —
+# jq は JSON stream として読むのでどちらでも通るが、余計な差を作らない。
+stash_json() {   # $1 = JSON 文字列, $2 = ファイル名 (ROUND_TMP からの相対)
+  printf '%s' "$1" > "${ROUND_TMP}/$2"
+  printf '%s' "${ROUND_TMP}/$2"
 }
 
 # trigger の投稿は **1 か所だけ**に置く (罠 53: 初回 round と re-review round の
@@ -314,10 +362,9 @@ done
 # SENTINEL_MATCH=true → false-converge する。
 LATEST_REVIEW=$(snapshot_reviews | jq '.[-1]')
 CUR_ISSUES_FRESH=$(snapshot_issues)
-NEW_ISSUES=$(jq -n --argjson prev "$PREV_ISSUES" --argjson cur "$CUR_ISSUES_FRESH" '
-  ($prev | map({key: (.id|tostring), value: .updated_at}) | from_entries) as $prev_map |
-  $cur | map(select(.id as $i | ($prev_map[$i|tostring] // null) != .updated_at))
-')
+NEW_ISSUES=$(json_delta "$(stash_json "$PREV_ISSUES" prev_issues.json)" \
+                        "$(stash_json "$CUR_ISSUES_FRESH" cur_issues.json)" updated_at)
+require_delta "$NEW_ISSUES" "the issue-comment delta"
 # codex P1 round 9 (PR #54): **この round の comment は複数ありうる** (罠 32/34 が
 # 前提にしている multi-write そのもの) ので、`.[-1]` だけ見ると先に来た方の
 # sentinel / terminal error を落とす。特に terminal error を落とすと「retry しても
@@ -367,10 +414,9 @@ COMMIT_FRESH=$([ "$REVIEW_COMMIT" = "$HEAD_SHA" ] && echo "true" || echo "false"
 #   codex が既存 inline (= 同じ id) の body を update して P-badge を追加 / 昇格する
 #   case で false-converge する。`(id, updated_at)` の compound key で diff を取る。
 CUR_INLINE_FRESH=$(snapshot_inline)
-NEW_INLINE=$(jq -n --argjson prev "$PREV_INLINE" --argjson cur "$CUR_INLINE_FRESH" '
-  ($prev | map({key: (.id|tostring), value: .updated_at}) | from_entries) as $prev_map |
-  $cur | map(select(.id as $i | ($prev_map[$i|tostring] // null) != .updated_at))
-')
+NEW_INLINE=$(json_delta "$(stash_json "$PREV_INLINE" prev_inline.json)" \
+                        "$(stash_json "$CUR_INLINE_FRESH" cur_inline.json)" updated_at)
+require_delta "$NEW_INLINE" "the inline-comment delta"
 # 罠 49 (PR #164 round 7): codex は指摘を **review 本文**に書くこともある — inline の
 # アンカーではなく permalink の形で。inline だけ数えると「activity あり / inline 0」が
 # 「レビュー済み・指摘なし」と見分けられず、Layer 1 (state=COMMENTED) と Layer 3
@@ -378,10 +424,9 @@ NEW_INLINE=$(jq -n --argjson prev "$PREV_INLINE" --argjson cur "$CUR_INLINE_FRES
 # ...and **round-scoped**, like NEW_INLINE (罠 27) and NEW_ISSUES (罠 33): 罠 21 の
 # とおり re-review で新 submission が出ない round があり、`LATEST_REVIEW` が前 round の
 # ままだと修正済みの指摘を数え続けて収束しない (codex P2 round 8 on PR #164)。
-NEW_REVIEWS=$(jq -n --argjson prev "$PREV_REVIEWS" --argjson cur "$(snapshot_reviews)" '
-  ($prev | map({key: (.id|tostring), value: .submitted_at}) | from_entries) as $p |
-  $cur | map(select(.id as $i | ($p[$i|tostring] // null) != .submitted_at))
-')
+NEW_REVIEWS=$(json_delta "$(stash_json "$PREV_REVIEWS" prev_reviews.json)" \
+                         "$(stash_json "$(snapshot_reviews)" cur_reviews.json)" submitted_at)
+require_delta "$NEW_REVIEWS" "the review-body delta"
 # 罠 34 が記録しているとおり **1 round に review submission が複数来る**。`.[-1]` だけ
 # 数えると、先の submission に P0/P1 があって最後のに badge が無い round で
 # `P0_P1_TAGS_PRESENT=0` になり、**blocking な指摘を持ったまま収束**する
