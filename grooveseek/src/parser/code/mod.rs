@@ -88,12 +88,6 @@ impl LoadedGrammar {
             config,
         })
     }
-
-    /// ABI version the grammar was generated against. Checked when loading a plugin.
-    #[allow(dead_code)] // consumed by the plugin loader (PR-3a)
-    pub(crate) fn abi_version(&self) -> usize {
-        self.language.abi_version()
-    }
 }
 
 /// One parser instance per extension, holding the grammar it parses with.

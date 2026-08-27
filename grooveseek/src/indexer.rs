@@ -515,9 +515,6 @@ pub fn rebuild_index(
     if let Some(budget) = registry.code_max_chunk_chars() {
         resolve_code_chunk_budget(db, budget, force)?;
     }
-    // (feature-56 PR-3a) And when a grammar plugin has been replaced since then. Separate from
-    // the budget above because the two move independently: a rebuilt plugin with the same
-    // budget still cuts differently, and a changed budget with the same plugin does too.
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
