@@ -20,6 +20,18 @@ reranker = "bge-v2-m3"
 rerank_by_default = true
 fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 
+# grammar plugin の置き場 (v1.3.0+)。焼き込まれていない言語 — Rust 以外すべて —
+# は自分で DL して置くライブラリで、このキーがその置き場を指す。
+# `GROOVE_GRAMMAR_DIR` が優先し、そちらは絶対パス必須。
+# **`[parsers].enabled` に plugin が要る言語がある時だけ読む**ので、Markdown だけの
+# ナレッジベースがこの値を参照することは無い。
+# 既定は `<ローカルデータディレクトリ>/groove/grammars` で、Windows なら
+# `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、
+# macOS なら `~/Library/Application Support/groove/grammars`。どれも決められない
+# 環境では既定を持たず、plugin を必要とするコマンドがその旨を告げて止まる
+# (CWD 相対には推測で落とさない)。置き方は docs/clients.ja.md を参照。
+grammar_dir = "/home/you/.local/share/groove/grammars"
+
 # チャンキング時に除外する見出し部分文字列。省略すると除外なし
 # (既定は空リスト)。いずれかを substring として含む見出しのセクションは
 # 本文ごとチャンク化対象から外される。
@@ -191,7 +203,7 @@ bind = "127.0.0.1:3100"
 
 信頼しない config も**読み込みはする**。KB の見せ方を決めるだけのもの
 (`[search]` / `[quality_filter]` / `exclude_dirs` / `[parsers]` / `[watch]` /
-`[contextual]`) はそのまま効く。制限するのは 3 つだけで、これらは「どのバイナリを
+`[contextual]`) はそのまま効く。制限するのは 4 つだけで、これらは「どのコードを
 実行するか」「何が外に出るか」「誰から届くか」を決めるため:
 
 | フィールド | 信頼しない config の場合 |
@@ -199,6 +211,7 @@ bind = "127.0.0.1:3100"
 | `fastembed_cache_dir` | 警告して無視し、標準のキャッシュディレクトリを使う。どの `.onnx` を読むかを決める値であり、キャッシュに既にあるモデルは検証されないため (関連: `FASTEMBED_CACHE_DIR` は絶対パス必須で、モデルディレクトリが CWD 相対に解決されることは無い) |
 | `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `allowed_origins` / `healthz_public` / `max_sessions` は破棄する — 前 3 つは loopback 限定の既定に戻し、4 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`allowed_origins` の破棄は両方向に効く — 植えられたリストは攻撃者の origin を名指しできるし、**空リストは「Origin を検証しない」の意味**になるため。`kind` は尊重する |
 | `kb_path` | ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指していれば**警告して無視**。`--kb-path` は従来どおり効くので上書きでき、どちらも無ければ通常どおり「`--kb-path` is required」で停止する |
+| `grammar_dir` | 警告して無視し、標準の置き場を使う。プロセスへ `dlopen` されるネイティブライブラリを選ぶ値であり、grammar plugin はデータではなくコードであるため。**キーの有無に関わらず必ず設定する** — 書かないことで選択に影響できてしまうため。標準の置き場が決められない場合は代わりにキーを落とし、plugin を必要とするコマンドが `GROOVE_GRAMMAR_DIR` を案内して停止する |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
 `kb_path = "/srv/kb/knowledge-base"` も通る (project-local な `groove.toml` に

@@ -25,6 +25,17 @@ pub mod xlsx;
 
 pub use code::CodeParser;
 pub use docx::DocxParser;
+
+/// (feature-56) Whether any of these ids can only be satisfied by a grammar the user placed.
+///
+/// The question the caller is really asking is "do I have to work out where plugins live",
+/// which is why it is answered here from the same table the loader opens files by rather than
+/// re-derived from a list of built-in ids. A `false` answer is what keeps a Markdown-only
+/// knowledge base from ever reading `GROOVE_GRAMMAR_DIR`.
+pub fn needs_grammar_plugin(ids: &[String]) -> bool {
+    ids.iter()
+        .any(|id| code::plugin::plugin_stem(&id.to_ascii_lowercase()).is_some())
+}
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;
 pub use pptx::PptxParser;

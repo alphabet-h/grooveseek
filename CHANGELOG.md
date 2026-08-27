@@ -14,6 +14,45 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **groove can load a grammar it was not built with.** A language that is not
+  compiled in — everything except Rust — arrives as a small library you
+  download and put in a directory, named by the new `grammar_dir` key or by
+  `GROOVE_GRAMMAR_DIR`. Nothing is downloaded automatically, and no library is
+  opened unless `[parsers].enabled` names the language it belongs to: opening
+  one runs its initialisers before a single symbol can be inspected, so groove
+  looks up the file by name from a fixed table rather than reading whatever is
+  in the directory. An accepted plugin is checked for the exports it must have,
+  the ABI version it declares, a tree-sitter version this build speaks, a tags
+  query that compiles against its own grammar, and exactly one valid file
+  extension. See "Placing a grammar plugin" in
+  [docs/clients.md](docs/clients.md). *The first published grammar, Python,
+  follows in the next release; this one adds the loader.*
+- **An id that needs a plugin says so, instead of reading as a typo.** Writing
+  `"py"` in `[parsers].enabled` used to be answered with the list of supported
+  ids, as if it were misspelled. It now names the file to place and the
+  directory to place it in — or, on a machine where no such directory can be
+  determined, names `GROOVE_GRAMMAR_DIR` instead of a path that does not exist.
+  A plugin that is present but unusable is refused with its path and the reason.
+
+### Changed
+
+- **A run that cannot succeed still stops before it creates anything.** Every
+  one of the failures above is decided while the parser registry is built,
+  which happens before the database is opened and before any model is
+  downloaded — so a missing or broken plugin costs you a message, not a
+  half-built index.
+- **A `groove.toml` that groove merely found cannot choose the grammar
+  directory.** `grammar_dir` joins `fastembed_cache_dir`,
+  `[transport.http].bind` and `kb_path` as a key that an untrusted config does
+  not get to set, because a grammar plugin is native code loaded into the
+  process. As with the cache directory, the safe value is applied whether or
+  not the key is present: omitting it would otherwise be a way to influence the
+  choice by saying nothing. Naming the config with `--config` accepts it as
+  written, as before. Refusing a missing grammar is **not** affected by trust —
+  the same failure happens either way.
+
 ## [1.2.0] - 2026-08-27
 
 ### Added

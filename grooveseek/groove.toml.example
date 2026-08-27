@@ -55,6 +55,18 @@
 # fails.
 #fastembed_cache_dir = "/path/to/.cache/huggingface/hub"
 
+# Where grammar plugins live (v1.3.0+). Read ONLY when [parsers].enabled names a
+# language that is not compiled in -- see the [parsers] section below -- so a
+# Markdown knowledge base never consults it. Omitted, the default is
+# `<local data dir>/groove/grammars`: %LOCALAPPDATA%\groove\grammars on Windows,
+# ~/.local/share/groove/grammars on Linux, ~/Library/Application Support/groove/
+# grammars on macOS. GROOVE_GRAMMAR_DIR overrides it and must be absolute.
+#
+# Write the path with FORWARD SLASHES even on Windows: a backslash starts an
+# escape sequence in a TOML basic string, so "C:\Users\..." fails to parse.
+# See "Placing a grammar plugin" in docs/clients.md.
+#grammar_dir = "C:/Users/you/AppData/Local/groove/grammars"
+
 # Heading substrings to exclude when chunking Markdown. Omitted, nothing is
 # excluded. A heading containing any of these substrings loses its whole
 # section, but descendants keep their correct ancestry breadcrumb.
@@ -107,8 +119,11 @@ threshold = 0.3
 #   - explicit empty list … rejected at startup, so that "nothing is indexed"
 #                           cannot happen silently
 #   - explicit list       … exactly those extensions
-# Supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx", "pptx"
-# (v0.11.0+). Unknown ids such as "rst" or "adoc" are rejected at startup.
+# Ids the default build supports on its own: "md", "txt", "pdf" (v0.10.0+),
+# "docx", "xlsx", "pptx" (v0.11.0+), "rs" (v1.2.0+). A language whose grammar is
+# not compiled in -- "py" (v1.3.0+) -- also needs its plugin placed in
+# `grammar_dir` first, and the run stops with instructions if it is not there.
+# Unknown ids such as "rst" or "adoc" are rejected at startup.
 # "xls" was withdrawn in v0.14.0 and is rejected with an explanation: BIFF
 # bounds a sheet but not a workbook, so a small file declaring many sheets can
 # exhaust memory. Convert such a workbook to `.xlsx`, which is read as a stream.

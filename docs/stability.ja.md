@@ -338,7 +338,8 @@ snake_case で、配列は複数形。よって `--path-glob` と `path_globs` �
 | 除外ファイル | `.grooveignore` |
 | 評価セット / 履歴 | `.groove-eval.yml` / `.groove-eval-history.json` |
 | サービス成果物 | サービス名から導かれる task / unit / launch agent の名前、および config home の構成 |
-| 環境変数 | `GROOVE_CONFIG_HOME` / `GROOVE_TRAY_LOG` (`FASTEMBED_CACHE_DIR` は fastembed の名前なので尊重はするが凍結対象にはしない。`GROOVE_BIN` は同梱サンプル hook の変数で、バイナリは読まない) |
+| 環境変数 | `GROOVE_CONFIG_HOME` / `GROOVE_TRAY_LOG` / `GROOVE_GRAMMAR_DIR` (v1.3.0+、絶対パス必須) (`FASTEMBED_CACHE_DIR` は fastembed の名前なので尊重はするが凍結対象にはしない。`GROOVE_BIN` は同梱サンプル hook の変数で、バイナリは読まない) |
+| grammar plugin の配置 | 1 言語 1 ライブラリ。名前は `groove_grammar_<言語>` にプラットフォーム固有の接頭辞・拡張子を付けたもので、grammar ディレクトリに置く。export する C symbol と宣言する ABI 版も凍結対象 — ある 1.x 向けにビルドした plugin は次の 1.x でもロードできる |
 
 ## 非安定 (Unstable)
 

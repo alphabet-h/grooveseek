@@ -127,6 +127,19 @@ tree-sitter-tags = "0.26"
 tree-sitter-language = { workspace = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 groove-grammar-abi = { path = "../crates/groove-grammar-abi" }
+# (feature-56 PR-3a) `dlopen` for grammars that arrive as separate libraries.
+#
+# Unconditional rather than behind a feature: the loader is what makes an id
+# resolvable at all, so a build without it could only ever answer "unknown id"
+# for every language that is not compiled in — the diagnostic this feature
+# exists to replace. The crate is a thin wrapper over the platform call and
+# pulls in `cfg-if` and `windows-targets`, both already in the lock.
+#
+# The Windows path needs `os::windows::Library::load_with_flags`, which is why
+# the OS-specific half of the API is used rather than the portable `Library::new`:
+# the flags decide which directories the loader searches for the plugin's own
+# dependencies, and the default search order includes the current directory.
+libloading = "0.9"
 
 # (feature-44 PR-3) Windows-only path dep on the tray crate so
 # `groove service install --with-tray` can call into the tray's
@@ -223,4 +236,33 @@ harness = false
 [[bench]]
 name = "index_throughput"
 harness = false
+
+# (feature-56 PR-3a) Grammar plugin fixtures for `tests/grammar_plugin_cli.rs`.
+#
+# `[[example]]` with `crate-type = ["cdylib"]` because that is the shape a real grammar plugin
+# has, and because `cargo test` builds it: measured, `cargo test --no-run` leaves
+# `target/<profile>/examples/<name>.<dll suffix>` in place, so the test finds the file rather
+# than shelling out to cargo to make one. Building from a test would take the same build lock
+# the test is already running under.
+#
+# `path` is explicit and points **outside** `examples/`: that directory is the user-facing
+# recipe collection the docs link to, and the docs corpus guards walk it.
+#
+# Declaring any `[[example]]` turns off example autodiscovery for this package. Nothing is lost
+# today (`examples/` holds no `.rs`), but a `.rs` dropped in there later will not be built
+# unless it is named here too.
+[[example]]
+name = "groove_grammar_python"
+path = "tests/fixtures/grammar_plugins/valid.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_no_symbols"
+path = "tests/fixtures/grammar_plugins/no_symbols.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_claims_rs"
+path = "tests/fixtures/grammar_plugins/claims_rs.rs"
+crate-type = ["cdylib"]
 

@@ -44,6 +44,16 @@ pub struct Config {
     /// `FASTEMBED_CACHE_DIR` 環境変数の既定値。
     /// 既に env が設定されていればそちらを優先し、未設定のときだけ適用する。
     pub fastembed_cache_dir: Option<PathBuf>,
+    /// (feature-56) grammar plugin (`[parsers].enabled` の plugin 言語) の置き場。
+    ///
+    /// `GROOVE_GRAMMAR_DIR` > このキー > OS 既定
+    /// (`dirs::data_local_dir()/groove/grammars`) の順。取れなければ**未設定**で、
+    /// **CWD 相対には落とさない** — plugin は利用者が意図して置く成果物なので、
+    /// 「どこから起動したか」で読み先が変わってはいけない
+    /// (`fastembed_cache_dir` の CWD fallback が untrusted config の議論を生んだ)。
+    ///
+    /// **plugin 言語を `enabled` に書いていなければ、この値は読まれない。**
+    pub grammar_dir: Option<PathBuf>,
     /// Markdown チャンク化時に除外する見出し文字列の一覧 (substring match)。
     /// 省略時 (`None`) は [`crate::markdown::DEFAULT_EXCLUDED_HEADINGS`]。
     /// 明示的に `[]` を与えると「除外しない」という意味になる。
@@ -738,6 +748,59 @@ impl Config {
             self.kb_path = None;
         }
 
+        // R4 (feature-56): どのネイティブコードを `dlopen` するか。
+        //
+        // R1 と**同型**であって、同じ理由で同じ形にしてある。plugin は検証なしに
+        // プロセスへ読み込まれる任意のネイティブコードなので、置き場を決めるキーは
+        // 「どの .onnx を読むか」と同じ重みを持つ。
+        //
+        // **キーの有無に関わらず必ず設定する。** 「書いてあったら差し替える」だけでは
+        // **キーを省いた planted config が素通りする** — `grammar_dir` が `None` なら
+        // `grammar_dir_from` は OS 既定へ落ちるが、それは*このプロセスの*既定であって
+        // 「untrusted config の隣にある dir ではない」ことを保証しない。R1 が
+        // 明示的に潰した穴なので、同じ穴を作らない。
+        //
+        // 差し替え先が取れなければ**落とすだけ**にして、ここでは止めない (R1 と同じ)。
+        // 落としておけば、実際に plugin を要求するコマンドだけが R4 (iii) の文言で
+        // 止まる — grammar を必要としない `validate` は動き続ける。
+        //
+        // **untrusted 由来の例外は作らない。** 差し戻した既定 dir に plugin が在れば
+        // 解決するし、無ければ trusted でも止めたい条件なので、trust で fail と warn を
+        // 分けると同じ物理条件が二重の意味を持つ。
+        if roots.grammar_env_set {
+            // `GROOVE_GRAMMAR_DIR` が既にあるなら config の値はそもそも効かない
+            // (`grammar_dir_from` は env を先に見る)。差し替え先を探す必要は無いので
+            // 落とすだけにする。R1 の `cache_env_set` 分岐と同じ理由 —
+            // ここで OS 既定を要求すると、エラー文が案内している env を設定しても
+            // 直らないという矛盾になる。
+            if let Some(dir) = self.grammar_dir.take() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    requested = %dir.display(),
+                    "ignoring grammar_dir from a config found in an untrusted location \
+                     (GROOVE_GRAMMAR_DIR is already set and takes precedence anyway)"
+                );
+            }
+        } else {
+            let safe_grammar = roots
+                .data_local_dir
+                .as_ref()
+                .map(|d| d.join("groove").join("grammars"));
+            let previous = match safe_grammar.clone() {
+                Some(safe) => self.grammar_dir.replace(safe),
+                None => self.grammar_dir.take(),
+            };
+            if let Some(dir) = previous {
+                tracing::warn!(
+                    config = %shown.display(),
+                    requested = %dir.display(),
+                    using = safe_grammar.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none -- set GROOVE_GRAMMAR_DIR)".into()),
+                    "ignoring grammar_dir from a config found in an untrusted location \
+                     (it selects which native library is loaded); pass --config to accept it"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -758,6 +821,9 @@ impl Config {
         if let Some(base) = path.parent() {
             cfg.kb_path = cfg.kb_path.map(|p| resolve_relative(base, p));
             cfg.fastembed_cache_dir = cfg.fastembed_cache_dir.map(|p| resolve_relative(base, p));
+            // (feature-56) `kb_path` と同じ扱い: config ファイルのある場所を基準にする。
+            // cwd 基準にすると、同じ config が起動場所によって別の plugin を読む。
+            cfg.grammar_dir = cfg.grammar_dir.map(|p| resolve_relative(base, p));
             if let Some(e) = cfg.eval.as_mut() {
                 e.golden = e.golden.take().map(|p| resolve_relative(base, p));
             }
@@ -792,6 +858,7 @@ impl Config {
             && self.reranker.is_none()
             && self.rerank_by_default.is_none()
             && self.fastembed_cache_dir.is_none()
+            && self.grammar_dir.is_none()
             && self.exclude_headings.is_none()
             && self.exclude_dirs.is_none()
             && self.quality_filter.is_none()
@@ -820,9 +887,36 @@ impl Config {
             // (feature-56) `[parsers.code]` reaches the parser here rather than at parse time:
             // `Parser::parse_bytes_inner` takes no configuration, so a code parser has to be
             // built already knowing its chunk budget.
-            Some(p) => crate::parser::Registry::from_enabled_with_code(&p.enabled, &p.code),
+            Some(p) => {
+                // (feature-56 PR-3a) The grammar directory is worked out **only** when an
+                // enabled id actually needs one. A knowledge base of Markdown never reads
+                // `GROOVE_GRAMMAR_DIR` and never asks the OS where local data lives, so a
+                // machine where neither can be answered is not a machine where `groove index`
+                // stops working.
+                let grammar_dir = if crate::parser::needs_grammar_plugin(&p.enabled) {
+                    self.resolve_grammar_dir()?
+                } else {
+                    None
+                };
+                crate::parser::Registry::from_enabled_with_plugins(
+                    &p.enabled,
+                    &p.code,
+                    grammar_dir.as_deref(),
+                )
+            }
             None => Ok(crate::parser::Registry::defaults()),
         }
+    }
+
+    /// (feature-56) grammar plugin の置き場を決める。`Ok(None)` は「決められない」。
+    ///
+    /// **呼ぶのは plugin 言語が `enabled` にあるときだけ** ([`Self::build_parser_registry`])。
+    pub fn resolve_grammar_dir(&self) -> Result<Option<PathBuf>> {
+        grammar_dir_from(
+            std::env::var_os("GROOVE_GRAMMAR_DIR"),
+            self.grammar_dir.as_deref(),
+            dirs::data_local_dir(),
+        )
     }
 
     /// パース後の値域 / 整合性チェック。`load_from` のような構文レベルの
@@ -1029,6 +1123,15 @@ pub struct TrustRoots {
     /// `fastembed_cache_dir` はそもそも効かない** (`cache_dir_env_override` は
     /// env が既設なら `None` を返す) ので、差し替え先を探す必要すら無い。
     cache_env_set: bool,
+    /// (feature-56) OS 標準のローカルデータディレクトリ (`grammar_dir` の差し替え先)。
+    ///
+    /// `cache_dir` と別に持つ。plugin は利用者が意図して置く成果物なので、
+    /// キャッシュと同じ場所に置くと「掃除したら壊れた」が起きる。
+    data_local_dir: Option<PathBuf>,
+    /// `GROOVE_GRAMMAR_DIR` が既に環境にあるか。**あるなら config の
+    /// `grammar_dir` はそもそも効かない** ([`grammar_dir_from`] は env を先に見る)
+    /// ので、`cache_env_set` と同じく差し替え先を探す必要が無い。
+    grammar_env_set: bool,
 }
 
 impl TrustRoots {
@@ -1048,17 +1151,22 @@ impl TrustRoots {
             dirs::home_dir(),
             dirs::cache_dir(),
             env_cache_dir_is_usable(),
+            dirs::data_local_dir(),
+            env_dir("GROOVE_GRAMMAR_DIR").is_some(),
         )
     }
 
     /// [`Self::from_env`] の純粋な中身。env を読む場所を 1 箇所に閉じ込めたまま
     /// 「どのディレクトリを根にするか」をテストできるようにするための分離。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_bases(
         config_home_override: Option<PathBuf>,
         config_dir: Option<PathBuf>,
         home: Option<PathBuf>,
         cache_dir: Option<PathBuf>,
         cache_env_set: bool,
+        data_local_dir: Option<PathBuf>,
+        grammar_env_set: bool,
     ) -> Self {
         // **どちらの base にも `groove` を足す。**
         // `service::resolve_config_home` が `base.join("groove").join(service)` を
@@ -1075,6 +1183,8 @@ impl TrustRoots {
             home,
             cache_dir,
             cache_env_set,
+            data_local_dir,
+            grammar_env_set,
         }
     }
 
@@ -1088,6 +1198,9 @@ impl TrustRoots {
             // `new_with_cache` で明示的に作る。
             cache_dir: Some(std::env::temp_dir().join("groove-test-cache")),
             cache_env_set: false,
+            // 同上。grammar 側の「差し替え先が無い」分岐は `new_with_grammar` で作る。
+            data_local_dir: Some(std::env::temp_dir().join("groove-test-data")),
+            grammar_env_set: false,
         }
     }
 
@@ -1103,6 +1216,28 @@ impl TrustRoots {
             home,
             cache_dir,
             cache_env_set,
+            data_local_dir: Some(std::env::temp_dir().join("groove-test-data")),
+            grammar_env_set: false,
+        }
+    }
+
+    /// (feature-56) grammar 側の環境事実だけ差し替えるテスト用コンストラクタ。
+    ///
+    /// `new_with_cache` と対になる。`data_local_dir: None` が
+    /// 「差し替え先を名指しできない」= R4 (iii) へ落ちる経路。
+    #[cfg(test)]
+    pub(crate) fn new_with_grammar(
+        home: Option<PathBuf>,
+        data_local_dir: Option<PathBuf>,
+        grammar_env_set: bool,
+    ) -> Self {
+        Self {
+            roots: Vec::new(),
+            home,
+            cache_dir: Some(std::env::temp_dir().join("groove-test-cache")),
+            cache_env_set: false,
+            data_local_dir,
+            grammar_env_set,
         }
     }
 
@@ -1176,6 +1311,45 @@ pub(crate) fn env_dir(name: &str) -> Option<PathBuf> {
 /// 判断が変わる。値を受け取る形にしておけば、その必要が最初から生じない。
 fn dir_from_env_value(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     raw.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// (feature-56) grammar plugin の置き場を決める規則。入力をすべて引数で受ける。
+///
+/// 分けてある理由は [`dir_from_env_value`] と同じ — `GROOVE_GRAMMAR_DIR` は
+/// プロセス全体で共有なので、テストがそこへ書くと隣で走るテストの判断が変わる。
+///
+/// 優先順位は **env > config > OS 既定**。どれも取れなければ `Ok(None)` で、
+/// **CWD 相対には落とさない**。`Ok(None)` を受けた先が R4 (iii) の文言を出す。
+///
+/// env が相対パスなら**エラー**にする。`FASTEMBED_CACHE_DIR` と同じ規則
+/// ([`crate::embedder`] の `cache_dir_from`) で、理由も同じ: 相対値は起動場所に対して
+/// 解決されるので、**利用者が管理していないディレクトリからネイティブコードを
+/// 読み込む**ことになる。plugin は検証なしに `dlopen` される。
+pub(crate) fn grammar_dir_from(
+    env: Option<std::ffi::OsString>,
+    configured: Option<&Path>,
+    data_local: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    if let Some(raw) = env
+        && !raw.is_empty()
+    {
+        let dir = PathBuf::from(raw);
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "GROOVE_GRAMMAR_DIR must be an absolute path, got {}.\n\
+             A relative value resolves against the working directory, which may be a \
+             directory you do not control; a grammar plugin is native code and is loaded \
+             from it without verification.",
+            dir.display()
+        );
+        return Ok(Some(dir));
+    }
+    if let Some(dir) = configured {
+        return Ok(Some(dir.to_path_buf()));
+    }
+    // `data_local_dir()` であって `cache_dir()` ではない。plugin は利用者が意図して置く
+    // 成果物で、キャッシュのように消してよいものではない。
+    Ok(data_local.map(|base| base.join("groove").join("grammars")))
 }
 
 /// `FASTEMBED_CACHE_DIR` が**モデルの置き場所として使える値**か (BU-07)。
@@ -2994,6 +3168,160 @@ lambda = 0.5
         );
     }
 
+    /// (feature-56) The fourth privileged key, and the same rule as the first.
+    ///
+    /// A grammar plugin is native code `dlopen`ed into the process without any
+    /// verification, so a directory a planted config chose is at least as bad
+    /// as a model directory it chose.
+    #[test]
+    fn an_untrusted_config_cannot_choose_which_native_library_is_loaded() {
+        let dir = TempDir::new("groove-untrusted-grammar");
+        let toml = format!(
+            "kb_path = \"kb\"\ngrammar_dir = {:?}\n",
+            dir.path().join("evil-grammars").to_string_lossy()
+        );
+        std::fs::write(dir.path().join("groove.toml"), toml).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let used = d.config.grammar_dir.expect("a grammar dir is always set");
+        assert!(
+            used.is_absolute() && !used.starts_with(dir.path()),
+            "the plugin directory must not be one the planted config chose: {}",
+            used.display()
+        );
+    }
+
+    /// Omitting the key is an attack, not an absence — the same hole the cache
+    /// rule closed. Without this, a planted config that simply says nothing
+    /// about `grammar_dir` leaves the process resolving plugins by whatever
+    /// `grammar_dir_from` falls back to, which is a decision the untrusted file
+    /// got to influence by staying silent.
+    #[test]
+    fn an_untrusted_config_gets_a_safe_grammar_dir_even_when_it_names_none() {
+        let dir = TempDir::new("groove-untrusted-no-grammar-key");
+        std::fs::write(dir.path().join("groove.toml"), "kb_path = \"kb\"\n").unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let used = d
+            .config
+            .grammar_dir
+            .expect("an untrusted config always gets an explicit grammar dir");
+        assert!(
+            used.is_absolute() && !used.starts_with(dir.path()),
+            "the plugin directory must never resolve inside the untrusted directory: {}",
+            used.display()
+        );
+    }
+
+    /// (feature-56) Dropping rather than replacing, when nothing safe can be
+    /// named — and the remedy the diagnostic names actually working.
+    ///
+    /// Mirrors `the_cache_rule_never_leaves_a_planted_value_in_place`. What is
+    /// deliberately **not** here is a trusted-versus-untrusted split in whether
+    /// the eventual failure is loud: R4 (iii) fires on the same physical
+    /// condition either way.
+    #[test]
+    fn the_grammar_rule_never_leaves_a_planted_value_in_place() {
+        let dir = TempDir::new("groove-untrusted-grammar-env");
+        let toml = format!(
+            "kb_path = \"kb\"\ngrammar_dir = {:?}\n",
+            dir.path().join("evil-grammars").to_string_lossy()
+        );
+        std::fs::write(dir.path().join("groove.toml"), &toml).unwrap();
+
+        // No local data directory and no override: no safe substitute can be
+        // named, so the planted value is dropped rather than replaced.
+        // Discovery still succeeds, because a command that enables no plugin
+        // language never asks where plugins live.
+        let no_data = TrustRoots::new_with_grammar(None, None, false);
+        let d = Config::discover_in(None, dir.path(), None, &no_data)
+            .expect("a command that needs no plugin must still run");
+        assert!(
+            d.config.grammar_dir.is_none(),
+            "the planted value must not survive"
+        );
+
+        // Following the advice works: with the variable set, the config's value
+        // cannot take effect anyway, so it is simply dropped.
+        let with_env = TrustRoots::new_with_grammar(None, None, true);
+        let d = Config::discover_in(None, dir.path(), None, &with_env)
+            .expect("setting GROOVE_GRAMMAR_DIR must actually get past this");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config.grammar_dir.is_none(),
+            "the planted value is dropped; the environment already wins"
+        );
+    }
+
+    /// The precedence, and the one value the rule refuses outright.
+    ///
+    /// Every input is an argument: `GROOVE_GRAMMAR_DIR` is process-wide, and a
+    /// test that set it would reach into every test running beside it.
+    #[test]
+    fn the_grammar_directory_prefers_the_environment_and_refuses_a_relative_one() {
+        let abs = if cfg!(windows) {
+            PathBuf::from("C:\\plugins")
+        } else {
+            PathBuf::from("/plugins")
+        };
+        let configured = PathBuf::from("/from-config");
+        let data_local = PathBuf::from("/data-local");
+
+        // env wins over both.
+        assert_eq!(
+            grammar_dir_from(
+                Some(abs.clone().into_os_string()),
+                Some(&configured),
+                Some(data_local.clone())
+            )
+            .unwrap(),
+            Some(abs.clone())
+        );
+
+        // Empty is not set (the rule `dir_from_env_value` already states for
+        // the other variables), so the config value is used.
+        assert_eq!(
+            grammar_dir_from(
+                Some(std::ffi::OsString::new()),
+                Some(&configured),
+                Some(data_local.clone())
+            )
+            .unwrap(),
+            Some(configured.clone())
+        );
+
+        // No env, no config: the OS location, under `groove/grammars`.
+        let fallback = grammar_dir_from(None, None, Some(data_local.clone()))
+            .unwrap()
+            .expect("a local data directory names a grammar directory");
+        assert!(
+            fallback.ends_with(Path::new("groove").join("grammars")),
+            "unexpected fallback: {}",
+            fallback.display()
+        );
+
+        // Nothing at all: undecidable, and never a working-directory-relative
+        // guess. This is the state R4 (iii) reports.
+        assert_eq!(grammar_dir_from(None, None, None).unwrap(), None);
+
+        // A relative override is refused, for the reason the cache variable is:
+        // it resolves against a working directory that may not be the user's.
+        let err = grammar_dir_from(
+            Some(std::ffi::OsString::from("plugins")),
+            Some(&configured),
+            Some(data_local),
+        )
+        .expect_err("a relative GROOVE_GRAMMAR_DIR must be refused");
+        assert!(
+            err.to_string().contains("must be an absolute path"),
+            "unexpected message: {err}"
+        );
+    }
+
     /// An empty directory variable makes every path built from it relative,
     /// which means the working directory — the thing this whole feature exists
     /// to stop trusting. One predicate covers every such variable so the rule
@@ -3004,8 +3332,15 @@ lambda = 0.5
         // Behavioural consequence, stated where it bites: an empty override
         // must not become a trust root, because `PathBuf::from("").join(..)`
         // is relative and would resolve against the cwd.
-        let empty_override =
-            TrustRoots::from_bases(Some(PathBuf::from("")), None, None, None, false);
+        let empty_override = TrustRoots::from_bases(
+            Some(PathBuf::from("")),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
         let anywhere = PathBuf::from("some-repo").join("groove.toml");
         assert_eq!(
             classify_trust(ConfigSource::Cwd, Some(&anywhere), &empty_override),
@@ -3028,8 +3363,15 @@ lambda = 0.5
     #[test]
     fn the_trust_root_is_the_grooveseek_subdirectory_of_each_base() {
         let base = TempDir::new("groove-trust-root-base");
-        let roots =
-            TrustRoots::from_bases(Some(base.path().to_path_buf()), None, None, None, false);
+        let roots = TrustRoots::from_bases(
+            Some(base.path().to_path_buf()),
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+        );
 
         let inside = base.path().join("groove").join("svc").join("groove.toml");
         assert_eq!(

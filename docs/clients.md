@@ -237,6 +237,19 @@ whoever can reach the proxy. Forward `/mcp` and `/healthz` only.
 - **Resilience**. Errors inside the watcher task are logged to stderr (not silently dropped) and the MCP server keeps running. Local disk is assumed — inotify on WSL / SMB / network shares is not guaranteed.
 - **Backpressure (v0.6.0+)**. The bridge from the debouncer to the indexer task uses a bounded 64-batch channel; if the consumer cannot keep up (e.g. embedder is paused), excess batches are dropped with a warn log instead of growing the queue indefinitely. Run `rebuild_index` manually after the burst to recover any missed events.
 
+## Placing a grammar plugin (v1.3.0+)
+
+groove parses source code one definition at a time, but only Rust is compiled into the binary. Every other language is a small library you download and place — that asymmetry, and why it is not a feature flag, is [ADR-0013](decisions/0013-compile-in-one-grammar-and-load-the-rest.md).
+
+1. Find the archive named `groove-grammar-<language>-<target>` for **your groove version** on the [releases page](https://github.com/alphabet-h/grooveseek/releases). The plugin and the binary share an ABI version, so a plugin from a different release may be refused.
+2. Unpack it and put the library in the grammar directory. The default is `%LOCALAPPDATA%\groove\grammars` on Windows, `~/.local/share/groove/grammars` on Linux, and `~/Library/Application Support/groove/grammars` on macOS. To use a different one, set `grammar_dir` in `groove.toml`, or the `GROOVE_GRAMMAR_DIR` environment variable — which must be an absolute path, because a relative one would resolve against whatever directory the client happened to launch groove from.
+3. Add the language to `[parsers].enabled`, e.g. `enabled = ["md", "py"]`.
+4. **Run `groove doctor` once by hand before letting a service do it.** A registered Windows service discards stdio, so if the plugin is missing or refused, the message saying so goes nowhere and the daemon simply does not work. Running the command yourself puts that message on your screen.
+
+Nothing is downloaded automatically and nothing but the enabled languages is opened — a file in that directory belonging to a language you did not enable is never touched. If an enabled language has no usable plugin, the command stops and says which file it wanted and where; it does not fall back to indexing the source as plain text.
+
+> **A grammar plugin is native code that groove loads into its own process.** Treat one like any other binary you install: take it from the release page for the version you are running, and not from anywhere else. This is also why a `groove.toml` that groove merely *found* — rather than one you named with `--config` — cannot choose the directory; see [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
+
 ## Working around HuggingFace TLS failures on first download
 
 Some environments (corporate proxies, firewalls with TLS inspection) reject fastembed's native TLS connection to `huggingface.co` with `os error 10054` / "Connection was reset". In that case, pre-download the model via the Python HuggingFace CLI and point `FASTEMBED_CACHE_DIR` at the HF Hub cache:

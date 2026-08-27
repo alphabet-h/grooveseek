@@ -236,6 +236,19 @@ peer で、既定の `Host` も allow-list に載るため、`/ui` を proxy す
 - **耐障害性**。watcher タスク内部のエラーは stderr にログされ (黙殺しない)、MCP サーバは動作し続ける。ローカルディスクを想定 — WSL / SMB / ネットワーク共有上の inotify は保証外
 - **バックプレッシャ (v0.6.0+)**。debouncer から indexer task へのブリッジは bounded な 64 batch channel。consumer が追い付けない場合 (embedder が一時停止中など) は無限に queue が伸びることはなく、超過 batch を warn ログ付きで drop する。バースト後に `rebuild_index` を手動実行で取り漏らしを補える
 
+## grammar plugin の置き方 (v1.3.0+)
+
+groove はソースコードを定義 1 つ = chunk 1 つで parse するが、バイナリに焼き込んであるのは Rust だけ。他の言語はすべて、自分で DL して置く小さなライブラリになる。この非対称と「なぜ feature flag ではないのか」は [ADR-0013](decisions/0013-compile-in-one-grammar-and-load-the-rest.ja.md) にある。
+
+1. [releases ページ](https://github.com/alphabet-h/grooveseek/releases)で、**使っている groove の版**の `groove-grammar-<言語>-<target>` アーカイブを探す。plugin とバイナリは ABI 版を共有するので、別の release のものは拒否されうる。
+2. 展開して、ライブラリを grammar ディレクトリに置く。既定は Windows なら `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、macOS なら `~/Library/Application Support/groove/grammars`。別の場所にするなら `groove.toml` の `grammar_dir` か、環境変数 `GROOVE_GRAMMAR_DIR` を使う — こちらは**絶対パス必須**で、相対値だと「クライアントがたまたま groove を起動したディレクトリ」に対して解決されてしまうため。
+3. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。
+4. **service に任せる前に、`groove doctor` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。自分で 1 回叩けば、その文言が画面に出る。
+
+自動 DL は一切しないし、`enabled` に書いた言語以外は開かない — そのディレクトリに有効化していない言語のファイルがあっても触らない。有効化した言語の plugin が使えない場合、コマンドは「どのファイルをどこに置くべきか」を告げて止まる。ソースを plain text として索引するフォールバックはしない。
+
+> **grammar plugin は groove が自分のプロセスへ読み込むネイティブコード。** インストールする他のバイナリと同じ扱いにすること — 使っている版の release ページから取り、それ以外の場所からは取らない。groove が**見つけただけ**の `groove.toml` (`--config` で名指ししていないもの) がこのディレクトリを選べないのも同じ理由: [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
+
 ## HuggingFace の TLS 失敗への対処 (初回 DL 時)
 
 環境によっては (企業プロキシ、TLS inspection を行うファイアウォール) fastembed の native TLS 接続が `huggingface.co` に対して `os error 10054` / "Connection was reset" で失敗する。その場合は Python の HuggingFace CLI で事前にモデルを DL し、`FASTEMBED_CACHE_DIR` で HF Hub キャッシュを指す:
