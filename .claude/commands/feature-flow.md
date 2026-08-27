@@ -119,7 +119,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 4. controller (= main agent) は **script の verdict だけを読む** — stdout の `CONVERGED=` 行とその直前の判定行、および exit code。**判定の predicate (sentinel 文言 / P-badge の数え方 / 何を再 round にするか) をここに書き写さない**: 2 か所にあると script と食い違い、sentinel と P1 が同時に来た round で blocking な指摘を飛ばすか、P2 だけの round で無駄な 1 round を回す (codex P1 on PR #222、AGENTS.md "One question gets one implementation")。読み方の家は SKILL.md「結果の読み方」の表。そこから本 phase の分岐だけ言い直すと:
    - `CONVERGED=true` → step 5 へ。P2 / P3 の note が付いていたら内容を見て取り込み or skip を即決する (再 round はしない)
    - `WARN P0/P1 issues present` → 取り込み、regression test を 1 件追加、再 push → goto step 3 (re-trigger body 付きで `/codex-review` 再 invoke)
-   - `INDETERMINATE` / exit 3〜8 → SKILL.md の表のとおり。**exit 7 (= 5 round 到達、何も投稿していない) → ユーザに相談** (← 介入ポイント 3)
+   - `INDETERMINATE` / exit 3〜9 → SKILL.md の表のとおり。**exit 7 (= 5 round 到達、何も投稿していない) → ユーザに相談** (← 介入ポイント 3)
 5. `CONVERGED=true` になったら `gh pr merge <N> --squash --delete-branch`
 6. **merge したら session を閉じる** — release worthy なら Phase 7、続けて Phase 8 を済ませ、
    「handoff と session の区切り」の手順で handoff → `.dev` push → **`/clear`**。
