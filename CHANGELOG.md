@@ -41,7 +41,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **`[parsers.code].max_chunk_chars`** (default 3500, counted in
   non-whitespace characters) sets the budget for one chunk. A definition that
   fits stays whole; one that does not is split into its nested definitions, or
-  by lines when it has none — the usual case for a long function.
+  by lines when it has none — the usual case for a long function. Changing it
+  does not re-chunk files whose content has not changed, since those never
+  reach the parser again; `groove index` says so and names `--force`, and keeps
+  saying so until the index actually matches the setting.
 
 ## [1.1.0] - 2026-08-26
 

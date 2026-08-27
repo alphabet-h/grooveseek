@@ -63,6 +63,13 @@ fn rust_parser(_code: &CodeParsersConfig) -> Result<Box<dyn Parser>> {
 
 pub struct Registry {
     parsers: Vec<Box<dyn Parser>>,
+    /// (feature-56) The chunk budget the code parsers here were built with, or `None` when no
+    /// code parser is registered.
+    ///
+    /// Kept on the registry because a [`Parser`] takes no configuration at parse time: the
+    /// budget is baked into the instance, so this is the only place left that still knows the
+    /// number the chunks in a given index were cut at.
+    code_max_chunk_chars: Option<usize>,
 }
 
 impl Registry {
@@ -84,6 +91,7 @@ impl Registry {
         }
         let mut parsers: Vec<Box<dyn Parser>> = Vec::with_capacity(ids.len());
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut code_max_chunk_chars = None;
         for id in ids {
             let lower = id.to_ascii_lowercase();
             if !seen.insert(lower.clone()) {
@@ -110,12 +118,18 @@ impl Registry {
                 "pptx" => Box::new(PptxParser),
                 // (feature-56) The one grammar compiled in. Others are loaded from a plugin
                 // directory, which arrives with the loader.
-                "rs" => rust_parser(code)?,
+                "rs" => {
+                    code_max_chunk_chars = Some(code.max_chunk_chars);
+                    rust_parser(code)?
+                }
                 other => anyhow::bail!(unresolved_id_message(other, KNOWN_IDS, &available_ids())),
             };
             parsers.push(parser);
         }
-        Ok(Self { parsers })
+        Ok(Self {
+            parsers,
+            code_max_chunk_chars,
+        })
     }
 
     /// Default registry: `["md"]` only. Pre-feature-20 behaviour — `.txt`
@@ -123,7 +137,14 @@ impl Registry {
     pub fn defaults() -> Self {
         Self {
             parsers: vec![Box::new(MarkdownParser)],
+            code_max_chunk_chars: None,
         }
+    }
+
+    /// (feature-56) The chunk budget the code parsers were built with, or `None` when this
+    /// registry has none.
+    pub fn code_max_chunk_chars(&self) -> Option<usize> {
+        self.code_max_chunk_chars
     }
 
     /// Lookup a parser by file extension (lowercase, no leading dot).

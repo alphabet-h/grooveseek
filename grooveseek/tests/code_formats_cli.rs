@@ -310,6 +310,60 @@ fn crlf_line_endings_report_the_same_lines_as_lf() {
 
 #[test]
 #[ignore = "spawns groove index (loads the embedding model)"]
+fn shifting_a_definition_without_changing_its_text_moves_the_reported_lines() {
+    let bin = grooveseek_bin();
+    let layout = TempKbLayout::new("code-shift");
+    layout.write("fusion.rs", SAMPLE_RS);
+    let cfg = write_config(&layout, PARSERS_MD_RS);
+    run_index(&bin, &cfg, layout.kb());
+
+    let method_start = |hits: &[serde_json::Value]| -> u64 {
+        hits.iter()
+            .find(|h| h["heading"].as_str() == Some("method insert_row"))
+            .and_then(|h| h["start_line"].as_u64())
+            .unwrap_or_else(|| panic!("no insert_row hit with a line: {hits:#?}"))
+    };
+
+    let before = run_search(
+        &bin,
+        &cfg,
+        layout.kb(),
+        "rows insert key value",
+        &["--tag-any", "code"],
+    );
+    let start_before = method_start(&before);
+
+    // A blank line between the function and the struct, chosen because it changes no chunk
+    // text at all: the run between those two definitions is whitespace only, so it produces
+    // no chunk to differ. Every chunk body therefore matches one for one and indexing takes
+    // the path that skips re-embedding -- while the definitions below have moved down a line.
+    // Without the fast path also rewriting the code columns, the stored line numbers stay on
+    // the previous version of the file, which is a wrong answer given confidently.
+    let shifted = SAMPLE_RS.replace("\npub struct RankTable {", "\n\npub struct RankTable {");
+    assert_ne!(
+        shifted, SAMPLE_RS,
+        "the fixture changed shape; fix the marker"
+    );
+    layout.write("fusion.rs", &shifted);
+    run_index(&bin, &cfg, layout.kb());
+
+    let after = run_search(
+        &bin,
+        &cfg,
+        layout.kb(),
+        "rows insert key value",
+        &["--tag-any", "code"],
+    );
+    let start_after = method_start(&after);
+    assert_eq!(
+        start_after,
+        start_before + 1,
+        "the reported line did not follow the definition (before={start_before}, after={start_after})"
+    );
+}
+
+#[test]
+#[ignore = "spawns groove index (loads the embedding model)"]
 fn the_command_line_prints_the_line_range_for_a_code_hit() {
     let bin = grooveseek_bin();
     let layout = TempKbLayout::new("code-text-out");

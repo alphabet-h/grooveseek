@@ -511,6 +511,11 @@ pub fn rebuild_index(
         force,
     )?;
 
+    // (feature-56) Notice when the code chunk budget has moved since these chunks were cut.
+    if let Some(budget) = registry.code_max_chunk_chars() {
+        resolve_code_chunk_budget(db, budget, force)?;
+    }
+
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
     // 起動時に 1 度解決して焼き込むと、daemon 側だけ古い規則で走り続ける。
@@ -849,6 +854,7 @@ fn index_single_disk_entry(
     };
 
     if !force && chunks_unchanged {
+        let tx = db.begin_transaction()?;
         let updated = db.update_document_meta(
             &entry.rel,
             parsed.frontmatter.title.as_deref(),
@@ -861,11 +867,31 @@ fn index_single_disk_entry(
             size_bytes,
         )?;
         if updated {
+            // (feature-56) The chunk texts match, so the embeddings still stand — but the
+            // *positions* may not. Inserting a blank line above a function, or trimming a
+            // comment short enough to be dropped as a thin gap, moves every definition below
+            // it while leaving every chunk body identical. Without this the stored line
+            // numbers would keep pointing at the previous version of the file until someone
+            // re-indexed with --force, and a line number that is confidently wrong is worse
+            // than one that is absent.
+            if parsed.chunks.iter().any(|c| c.line_range.is_some()) {
+                let metas: Vec<crate::db::CodeMeta<'_>> = parsed
+                    .chunks
+                    .iter()
+                    .map(|c| crate::db::CodeMeta {
+                        line_range: c.line_range,
+                        symbol_kind: c.symbol_kind.as_deref(),
+                    })
+                    .collect();
+                db.update_chunk_code_meta(&entry.rel, &metas)?;
+            }
+            tx.commit()?;
             return Ok(SingleResult::Updated {
                 chunks: parsed.chunks.len() as u32,
             });
         }
         // update が 0 行なら通常経路にフォールスルー (レース耐性)
+        tx.commit()?;
     }
 
     // Embed first, *outside* the DB tx — fastembed inference can take
@@ -1334,6 +1360,35 @@ fn extract_category_topic(rel_path: &str) -> (Option<String>, Option<String>) {
 }
 
 use crate::db::ContextMode;
+
+/// (feature-56) Compare the configured code chunk budget with the one this index was built
+/// with, and say so when they differ.
+///
+/// Changing `[parsers.code].max_chunk_chars` moves where chunks are cut, but a file whose
+/// content has not changed never reaches the parser again — the content hash matches and the
+/// walker skips it. So the new budget applies to files edited afterwards and to nothing else,
+/// and the index quietly holds two generations of boundaries.
+///
+/// **The recorded value is deliberately not updated on a mismatch.** Writing it would silence
+/// the warning on the next run while leaving the index exactly as inconsistent, which turns a
+/// visible problem into an invisible one. It is written when the index is first built or
+/// rebuilt with `force` — the moments when the whole index actually does match the setting.
+pub(crate) fn resolve_code_chunk_budget(db: &Database, desired: usize, force: bool) -> Result<()> {
+    if force {
+        db.write_code_max_chunk_chars(desired)?;
+        return Ok(());
+    }
+    match db.read_code_max_chunk_chars()? {
+        Some(stored) if stored != desired => {
+            eprintln!(
+                "warning: [parsers.code].max_chunk_chars is {desired}, but the code chunks in this index were cut at {stored}. Files whose content has not changed keep their existing boundaries. Re-run with --force to re-chunk them."
+            );
+        }
+        Some(_) => {}
+        None => db.write_code_max_chunk_chars(desired)?,
+    }
+    Ok(())
+}
 
 /// force / config-desired / DB-stored から effective context mode を決める (feature-46 §4.8)。
 /// 副作用: fresh/legacy/force のケースで `index_meta.context_mode` を記録する。

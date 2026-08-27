@@ -458,6 +458,42 @@ impl Database {
         Ok(out)
     }
 
+    /// (feature-56) Rewrite the code columns of a document's chunks, in chunk order.
+    ///
+    /// Exists for the path where a file changed but its chunk *text* did not: inserting a
+    /// blank line above a function, or editing a comment short enough to be dropped as a thin
+    /// gap, moves every definition below it without changing a single chunk body. That path
+    /// deliberately skips re-embedding — the vectors are still correct — but the line numbers
+    /// are not, and a stale line number is worse than none: it sends a reader to the wrong
+    /// place with no sign that anything is off.
+    ///
+    /// Positional by `chunk_index`, which is sound precisely because the caller has just
+    /// established that the chunk texts match one for one.
+    pub fn update_chunk_code_meta(&self, path: &str, metas: &[CodeMeta<'_>]) -> Result<()> {
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let mut stmt = self.conn.prepare(
+            "UPDATE chunks SET start_line = ?1, end_line = ?2, symbol_kind = ?3
+             WHERE chunk_index = ?4
+               AND document_id = (SELECT id FROM documents WHERE path = ?5)",
+        )?;
+        for (index, meta) in metas.iter().enumerate() {
+            let (start, end) = match meta.line_range {
+                Some((s, e)) => (Some(i64::from(s)), Some(i64::from(e))),
+                None => (None, None),
+            };
+            stmt.execute(params![start, end, meta.symbol_kind, index as i64, path])?;
+        }
+        drop(stmt);
+        if let Some(tx) = local_tx {
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     /// 指定 `chunk_id` の embedding を取り出す。存在しなければ `None`。
     /// BFS の 2-hop 目以降で「親チャンクの embedding を起点に KNN を実行」する
     /// ために使う。

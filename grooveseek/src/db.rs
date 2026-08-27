@@ -4007,6 +4007,50 @@ mod tests {
     }
 
     #[test]
+    fn the_code_chunk_budget_round_trips_and_a_malformed_value_reads_as_unrecorded() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.read_code_max_chunk_chars().unwrap().is_none());
+        db.write_code_max_chunk_chars(3500).unwrap();
+        assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(3500));
+        db.write_code_max_chunk_chars(1200).unwrap();
+        assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(1200));
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('code_max_chunk_chars', 'wide')",
+                [],
+            )
+            .unwrap();
+        // Unreadable is treated as unrecorded rather than as an error: a value nobody can
+        // parse says nothing about where the chunks were cut, and refusing to index over it
+        // would strand the knowledge base.
+        assert!(db.read_code_max_chunk_chars().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_changed_code_chunk_budget_keeps_warning_until_a_forced_reindex() {
+        let db = Database::open_in_memory().unwrap();
+        // First index: nothing recorded yet, so the setting is simply adopted.
+        crate::indexer::resolve_code_chunk_budget(&db, 3500, false).unwrap();
+        assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(3500));
+
+        // The user lowers it. The chunks already in the index were cut at the old value and a
+        // plain re-index will not touch unchanged files, so the recorded value must NOT move:
+        // updating it would silence the warning while leaving the index just as mixed.
+        crate::indexer::resolve_code_chunk_budget(&db, 1200, false).unwrap();
+        assert_eq!(
+            db.read_code_max_chunk_chars().unwrap(),
+            Some(3500),
+            "a mismatch must not be recorded away"
+        );
+        crate::indexer::resolve_code_chunk_budget(&db, 1200, false).unwrap();
+        assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(3500));
+
+        // A forced re-index re-chunks everything, so at that point the index does match.
+        crate::indexer::resolve_code_chunk_budget(&db, 1200, true).unwrap();
+        assert_eq!(db.read_code_max_chunk_chars().unwrap(), Some(1200));
+    }
+
+    #[test]
     fn test_context_mode_malformed_is_none() {
         let db = Database::open_in_memory().unwrap();
         db.conn
