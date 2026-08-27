@@ -6,7 +6,7 @@
 //! which is a different branch and a different sentence.
 //!
 //! It exports one symbol so that the library is not empty enough for a linker to discard, and
-//! deliberately not one of the six in `groove_grammar_abi::symbols`.
+//! deliberately not one of the six in [`groove_grammar_abi::symbols`].
 
 #[unsafe(no_mangle)]
 pub extern "C" fn groove_not_a_grammar_at_all() -> u32 {

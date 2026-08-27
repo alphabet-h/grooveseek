@@ -1223,7 +1223,7 @@ impl TrustRoots {
 
     /// (feature-56) grammar 側の環境事実だけ差し替えるテスト用コンストラクタ。
     ///
-    /// `new_with_cache` と対になる。`data_local_dir: None` が
+    /// [`Self::new_with_cache`] と対になる。`data_local_dir: None` が
     /// 「差し替え先を名指しできない」= R4 (iii) へ落ちる経路。
     #[cfg(test)]
     pub(crate) fn new_with_grammar(
@@ -3196,7 +3196,7 @@ lambda = 0.5
     /// Omitting the key is an attack, not an absence — the same hole the cache
     /// rule closed. Without this, a planted config that simply says nothing
     /// about `grammar_dir` leaves the process resolving plugins by whatever
-    /// `grammar_dir_from` falls back to, which is a decision the untrusted file
+    /// [`super::grammar_dir_from`] falls back to, which is a decision the untrusted file
     /// got to influence by staying silent.
     #[test]
     fn an_untrusted_config_gets_a_safe_grammar_dir_even_when_it_names_none() {
@@ -3220,7 +3220,7 @@ lambda = 0.5
     /// (feature-56) Dropping rather than replacing, when nothing safe can be
     /// named — and the remedy the diagnostic names actually working.
     ///
-    /// Mirrors `the_cache_rule_never_leaves_a_planted_value_in_place`. What is
+    /// Mirrors [`the_cache_rule_never_leaves_a_planted_value_in_place`]. What is
     /// deliberately **not** here is a trusted-versus-untrusted split in whether
     /// the eventual failure is loud: R4 (iii) fires on the same physical
     /// condition either way.

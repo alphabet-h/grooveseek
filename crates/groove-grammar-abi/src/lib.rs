@@ -78,7 +78,7 @@ pub mod symbols {
 /// keeps adding a language to supplying data.
 ///
 /// `name` and `extension` must be string **literals**: the exported functions hand back
-/// pointers to NUL-terminated static data, which is built here with [`concat!`].
+/// pointers to NUL-terminated static data, which is built here with `concat!`.
 ///
 /// The expansion defines `#[unsafe(no_mangle)] pub extern "C"` functions and dereferences the
 /// caller's out-pointer, so the invoking crate must permit unsafe code. That is inherent to

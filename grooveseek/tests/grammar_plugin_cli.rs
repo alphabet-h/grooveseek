@@ -6,8 +6,10 @@
 //!
 //! # Why most of these are not `#[ignore]`
 //!
-//! Every failing path is decided while the parser registry is built, which `Commands::Index`
-//! does before `Database::open` and before `Embedder::with_model` — deliberately, so that a
+//! Every failing path is decided while the parser registry is built, which the `Commands::Index`
+//! arm in `src/main.rs` (a binary, so not linkable from here) does before
+//! [`grooveseek::db::Database::open`] and before
+//! [`grooveseek::embedder::Embedder::with_model`] — deliberately, so that a
 //! run known to fail cannot first create a database or download a model. So the refusals cost
 //! a process spawn and nothing else. Only the accepting path indexes for real, and that one is
 //! `#[ignore]` like the rest of the model-loading tests.
@@ -137,7 +139,8 @@ fn db_path(layout: &TempKbLayout) -> PathBuf {
 
 /// The whole point of failing at registry construction: nothing is created first.
 ///
-/// Placed before `Database::open` on purpose (see the comment on `Commands::Index`), and this
+/// Placed before [`grooveseek::db::Database::open`] on purpose (see the comment on the
+/// `Commands::Index` arm in `src/main.rs`), and this
 /// is the test that says so from outside. Without it, a later refactor could move the check
 /// down and only a careful reader would notice.
 #[test]

@@ -5,7 +5,9 @@
 //! **fixture**, not a shipped grammar: the Python grammar itself arrives in PR-3b.
 //!
 //! It hands over the Rust parse table under the `py` extension. That mismatch is the point —
-//! the loader's job is to check a contract and produce a `LoadedGrammar`, and it neither knows
+//! the loader's job is to check a contract and produce a `LoadedGrammar` — grooveseek's own
+//! type, in `src/parser/code/`, which is `pub(crate)` and so cannot be linked from here — and
+//! it neither knows
 //! nor cares which language the table describes. Using a grammar that is already a dependency
 //! keeps the fixture from adding one, and keeps what is being tested to the loader.
 

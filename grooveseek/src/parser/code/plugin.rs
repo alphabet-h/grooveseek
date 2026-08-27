@@ -20,7 +20,7 @@
 //! # Why a loaded library is never unloaded
 //!
 //! The parse table, the language name and the tags query are static data inside the library.
-//! [`tree_sitter::Language`] holds a pointer straight into it, and chunks made from it carry
+//! `tree_sitter::Language` holds a pointer straight into it, and chunks made from it carry
 //! the name. Unloading would leave those dangling, and groove has no reason to: a registry
 //! lives as long as the process. So a library that passes every check is deliberately leaked.
 //! A library that fails one is dropped, which is safe precisely because nothing derived from
@@ -63,7 +63,7 @@ pub(crate) fn plugin_ids() -> Vec<&'static str> {
 /// The file name a plugin has on this platform: `groove_grammar_python.dll`,
 /// `libgroove_grammar_python.so`, `libgroove_grammar_python.dylib`.
 ///
-/// Built from [`std::env::consts`] rather than a `cfg!` chain so it always agrees with what
+/// Built from `std::env::consts` rather than a `cfg!` chain so it always agrees with what
 /// Cargo names the `cdylib` it produced — the two would otherwise be free to drift on a
 /// platform nobody tested.
 pub(crate) fn plugin_file_name(stem: &str) -> String {
