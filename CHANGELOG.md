@@ -14,6 +14,38 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **Source code is indexed one definition at a time.** Enable it with
+  `[parsers].enabled = ["md", "rs"]`. A function, a struct, a method each
+  become their own chunk, carrying the doc comment written above them and the
+  scope they sit in, so a hit is something you can act on rather than a window
+  that starts mid-body. Everything no definition covers — imports, top-level
+  statements, the frame of an `impl` block, and any region the parser could not
+  understand — is filled in by line, so a file with a syntax error still
+  contributes the definitions around the break instead of collapsing into one
+  chunk. Rust is compiled in behind the default-on `grammar-rust` feature,
+  measured at just over a megabyte of binary; other languages arrive as
+  separate libraries you place, in a later release. See
+  [ADR-0012](docs/decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.md)
+  and [ADR-0013](docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md).
+- **Search results from source files carry `start_line`, `end_line` and
+  `symbol_kind`.** The line range describes the chunk rather than the
+  definition it came from — a doc comment pulled in above a function is inside
+  it, and a long function split across chunks gives each piece its own — so
+  opening the file at that line always shows what was returned. `symbol_kind`
+  is the grammar's own word (`function`, `class`, `method`, `constant`, …), not
+  the language's keyword, and the set grows as languages are added. All three
+  keys are **absent** rather than `null` on anything that did not come from a
+  source file, so no prose response changes shape.
+- **`[parsers.code].max_chunk_chars`** (default 3500, counted in
+  non-whitespace characters) sets the budget for one chunk. A definition that
+  fits stays whole; one that does not is split into its nested definitions, or
+  by lines when it has none — the usual case for a long function. Changing it
+  does not re-chunk files whose content has not changed, since those never
+  reach the parser again; `groove index` says so and names `--force`, and keeps
+  saying so until the index actually matches the setting.
+
 ## [1.1.0] - 2026-08-26
 
 ### Added

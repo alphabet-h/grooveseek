@@ -53,6 +53,16 @@ These match against `documents.tags` (the YAML frontmatter `tags:` array).
 }
 ```
 
+Source code (v1.2.0+) is tagged by the parser rather than by frontmatter: every
+chunk from a source file carries `code` and `lang:<name>`. Code and prose mix in
+results by default, and these filters are what separates them — no search
+parameter was added for it.
+
+```jsonc
+{ "tags_any": ["code"] }        // definitions only
+{ "path_globs": ["!**/*.rs"] }  // prose only; an exclude-only list is valid
+```
+
 ## `date_from` / `date_to`
 
 - Use **`YYYY-MM-DD`** (recommended) or RFC 3339 timestamps.

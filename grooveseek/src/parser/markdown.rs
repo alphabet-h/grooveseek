@@ -231,6 +231,8 @@ fn chunk_body(body: &str, excludes: &[&str], title: Option<&str>) -> Vec<Chunk> 
                 level,
                 content,
                 context,
+                line_range: None,
+                symbol_kind: None,
             }
         })
         .collect()

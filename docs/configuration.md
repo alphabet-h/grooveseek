@@ -49,10 +49,19 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # via an explicit list. An empty array is rejected to prevent silent
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
-# "pptx" (v0.11.0+). ("xls" was withdrawn in v0.14.0 — see behavior.md.)
+# "pptx" (v0.11.0+), "rs" (v1.2.0+). ("xls" was withdrawn in v0.14.0 — see
+# behavior.md.) Other languages arrive as libraries you place (v1.3.0+).
 # Example enabling everything:
 [parsers]
-enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
+enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"]
+
+# Source code only. max_chunk_chars is the budget for one chunk in
+# non-whitespace characters: a definition that fits becomes one chunk, one that
+# does not is split into its nested definitions, or by lines when it has none
+# (the usual case for a long function). Lower it for finer-grained hits, raise
+# it to keep long bodies whole. Default 3500.
+[parsers.code]
+max_chunk_chars = 3500
 
 # Live-sync file watcher. When `groove serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally

@@ -3858,6 +3858,9 @@ mod tests {
         //    cannot drift without this test failing.
         let hit = |path: &str| {
             let mut h = crate::db::SearchHit {
+                start_line: None,
+                end_line: None,
+                symbol_kind: None,
                 score: 1.0,
                 path: path.to_string(),
                 title: None,
@@ -4039,6 +4042,12 @@ mod tests {
     /// shows half the shape.
     fn maximal_hits() -> Vec<crate::db::SearchHit> {
         let hit = |expanded: crate::db::ExpandedRange| crate::db::SearchHit {
+            // (feature-56) Populated, not defaulted: this fixture's whole job is to show the
+            // full key set, so a field left out here would quietly narrow the contract it
+            // documents.
+            start_line: Some(12),
+            end_line: Some(40),
+            symbol_kind: Some("function".to_string()),
             score: 0.5,
             path: "notes/a.md".to_string(),
             title: Some("A".to_string()),
@@ -4082,6 +4091,9 @@ mod tests {
     fn minimal_search_response() -> serde_json::Value {
         serde_json::to_value(SearchResponse {
             results: vec![crate::db::SearchHit {
+                start_line: None,
+                end_line: None,
+                symbol_kind: None,
                 score: 0.5,
                 path: "notes/a.md".to_string(),
                 title: None,

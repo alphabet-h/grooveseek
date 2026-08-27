@@ -114,6 +114,20 @@ calamine = "0.36"
 zip = "8"
 quick-xml = "0.41"
 
+# (feature-56) Source code parsed into one chunk per definition. `tree-sitter` is
+# the runtime, `tree-sitter-tags` turns a parse tree into definitions and
+# references using the grammar's own `tags.scm`, and `tree-sitter-language` is
+# the thin crate a grammar hands its parse table over through.
+#
+# The Rust grammar is compiled in behind `grammar-rust` (on by default, measured
+# at just over a megabyte); other languages arrive as separate libraries the user
+# places, which is ADR-0013.
+tree-sitter = "0.26"
+tree-sitter-tags = "0.26"
+tree-sitter-language = { workspace = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+groove-grammar-abi = { path = "../crates/groove-grammar-abi" }
+
 # (feature-44 PR-3) Windows-only path dep on the tray crate so
 # `groove service install --with-tray` can call into the tray's
 # shell:startup shortcut installer. Library API only — the
@@ -138,6 +152,17 @@ groove-tray = { path = "../crates/groove-tray" }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
+# (feature-56) The Rust grammar, compiled in. On by default: it is the language
+# groove is written in, and the increment was measured at just over a megabyte,
+# small enough to carry whether or not a given user indexes code.
+#
+# Turning it off is supported and checked in CI (`cargo check
+# --no-default-features -p grooveseek`), which is what keeps the id-resolution
+# path honest about a build that knows `rs` but cannot parse it. Tests run with
+# default features, so the message for that state is pinned through a pure
+# function rather than through a feature-off test binary.
+default = ["grammar-rust"]
+grammar-rust = ["dep:tree-sitter-rust"]
 # Reranker (~2.3 GB) を要求する bench を default 起動から除外する gate。
 # `cargo bench --features heavy-bench --bench search_latency` で reranker bench fn が
 # compile + 実行される (criterion 0.5 には #[ignore] 機構がないため Cargo feature で gate)。

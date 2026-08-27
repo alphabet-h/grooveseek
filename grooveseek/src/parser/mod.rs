@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+pub mod code;
 pub mod docx;
 pub mod markdown;
 pub mod ooxml;
@@ -22,6 +23,7 @@ pub mod registry;
 pub mod txt;
 pub mod xlsx;
 
+pub use code::CodeParser;
 pub use docx::DocxParser;
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;
@@ -47,10 +49,10 @@ pub struct Frontmatter {
 
 /// A single chunk of a parsed document.
 ///
-/// All fields use their type's natural default (`0`, `None`, `None`,
-/// `String::new()`), so `#[derive(Default)]` is sufficient and clippy-compliant.
-/// Other config-like structs in this crate (e.g. `MmrConfig`) use a hand-written
-/// `Default` because some defaults are non-zero (e.g. `lambda = 0.7`).
+/// Every field's default is its type's natural one (`0`, `None`, `String::new()`),
+/// so `#[derive(Default)]` is sufficient and clippy-compliant. Other config-like
+/// structs in this crate (e.g. `MmrConfig`) use a hand-written `Default` because
+/// some defaults are non-zero (e.g. `lambda = 0.7`).
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub index: usize,
@@ -65,6 +67,25 @@ pub struct Chunk {
     /// 例: "設計ノート > 検索パイプライン > RRF の実装"。
     /// None = context なし (生成不能ケース / 旧 parser 実装)。
     pub context: Option<String>,
+    /// (feature-56) 1-based inclusive line range this chunk occupies in the
+    /// source file, or `None` for formats without a line concept.
+    ///
+    /// Describes **the chunk**, not the definition it came from: a doc comment
+    /// pulled in above a function is part of the range, and a function split
+    /// across several chunks gives each piece its own. That is the only reading
+    /// under which "open the file at this line and you see this chunk" stays
+    /// true for every chunk a code file produces.
+    pub line_range: Option<(u32, u32)>,
+    /// (feature-56) What kind of definition this chunk holds, verbatim from the
+    /// grammar's tags query (`function` / `class` / `method` / `constant` …), or
+    /// `None` for chunks that are not a definition.
+    ///
+    /// Deliberately the tags vocabulary rather than the language's own keyword:
+    /// `struct`, `enum` and `union` are all `class` to Rust's tags query, and
+    /// recovering the keyword would mean a per-language table on groove's side —
+    /// the thing that keeps a grammar to data. The set grows as languages are
+    /// added, so this is a free-form string rather than a closed enum.
+    pub symbol_kind: Option<String>,
 }
 
 /// A fully parsed document: frontmatter + chunks + retained raw content.
@@ -130,6 +151,8 @@ pub(crate) fn sheet_chunk(index: usize, title: &str, name: &str, text: &str) -> 
         level: Some(2),
         content: text.trim_end().to_string(),
         context,
+        line_range: None,
+        symbol_kind: None,
     }
 }
 
@@ -185,6 +208,8 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
             level: None,
             content: body,
             context,
+            line_range: None,
+            symbol_kind: None,
         }]
     };
     ParsedDocument {
@@ -315,6 +340,40 @@ impl<T: Parser + ?Sized> ParserExt for T {
 #[serde(deny_unknown_fields)]
 pub struct ParsersConfig {
     pub enabled: Vec<String>,
+    /// `[parsers.code]` — settings that only apply to source-code parsers.
+    #[serde(default)]
+    pub code: CodeParsersConfig,
+}
+
+/// `[parsers.code]` セクション (`groove.toml`)。
+///
+/// Only one knob is exposed. The remaining limits a code parser enforces — the raw-byte
+/// ceiling and the per-file chunk count — are constants: they exist to keep a pathological
+/// file from taking the process down, and a setting whose only effect is to weaken that is
+/// not worth the surface.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeParsersConfig {
+    /// Budget for one chunk, in non-whitespace characters.
+    ///
+    /// A definition that fits becomes one chunk. One that does not is split — into its nested
+    /// definitions where it has them, and by lines where it does not, which is the common case
+    /// for a long function. Lowering this yields finer-grained hits at the cost of cutting
+    /// bodies apart; raising it does the reverse.
+    #[serde(default = "default_max_chunk_chars")]
+    pub max_chunk_chars: usize,
+}
+
+fn default_max_chunk_chars() -> usize {
+    code::DEFAULT_MAX_CHUNK_CHARS
+}
+
+impl Default for CodeParsersConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_chars: default_max_chunk_chars(),
+        }
+    }
 }
 
 impl ParsersConfig {
@@ -340,7 +399,10 @@ mod tests {
 
     #[test]
     fn test_parsers_config_rejects_empty() {
-        let cfg = ParsersConfig { enabled: vec![] };
+        let cfg = ParsersConfig {
+            enabled: vec![],
+            code: CodeParsersConfig::default(),
+        };
         let err = cfg.validate().expect_err("empty enabled must be an error");
         assert!(err.to_string().contains("empty array"));
     }
@@ -349,6 +411,7 @@ mod tests {
     fn test_parsers_config_accepts_non_empty() {
         let cfg = ParsersConfig {
             enabled: vec!["md".to_string()],
+            code: CodeParsersConfig::default(),
         };
         cfg.validate().unwrap();
     }

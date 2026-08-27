@@ -1,0 +1,22 @@
+[package]
+name = "groove-grammar-abi"
+version = "1.1.0"
+edition = "2024"
+description = "The contract between groove and a tree-sitter grammar, whether compiled in or loaded from a plugin"
+authors = ["koshian"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alphabet-h/grooveseek"
+homepage = "https://github.com/alphabet-h/grooveseek"
+# Internal crate (= the shared shape between grooveseek and the grammar plugin
+# packages). publish = false avoids the crates.io readme/metadata validation.
+publish = false
+
+[dependencies]
+# The thin crate a grammar exposes its parse table through. Grammar crates from
+# 0.23 onwards depend on this and not on the tree-sitter runtime, which is what
+# lets grammars at different versions share one runtime.
+tree-sitter-language = { workspace = true }
+
+# rustdoc lint levels come from the workspace root, where the reasoning lives.
+[lints]
+workspace = true

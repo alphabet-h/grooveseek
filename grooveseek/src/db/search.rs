@@ -181,7 +181,8 @@ impl Database {
         let sql = "
             SELECT c.id, bm25(fts_chunks, ?3, ?4, ?5) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
-                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
+                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text,
+                   c.start_line, c.end_line, c.symbol_kind
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
@@ -217,6 +218,11 @@ impl Database {
                     row.get::<_, Option<String>>(10)?, // category
                     row.get::<_, Option<String>>(11)?, // tags (JSON)
                     row.get::<_, Option<String>>(12)?, // context_text
+                    // (feature-56) NULL on every prose chunk, and on code chunks written
+                    // before these columns existed.
+                    row.get::<_, Option<u32>>(13)?,    // start_line
+                    row.get::<_, Option<u32>>(14)?,    // end_line
+                    row.get::<_, Option<String>>(15)?, // symbol_kind
                 ))
             },
         )?;
@@ -237,6 +243,9 @@ impl Database {
                 r_category,
                 tags_json,
                 context_text,
+                start_line,
+                end_line,
+                symbol_kind,
             ) = row?;
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
@@ -282,6 +291,9 @@ impl Database {
                     date,
                     tags: hit_tags,
                     context_text,
+                    start_line,
+                    end_line,
+                    symbol_kind,
                 },
             ));
             if results.len() >= limit as usize {
@@ -550,7 +562,8 @@ impl Database {
         let sql = "
             SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
-                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text
+                   d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text,
+                   c.start_line, c.end_line, c.symbol_kind
             FROM vec_chunks v
             JOIN chunks c ON c.id = v.chunk_id
             JOIN documents d ON d.id = c.document_id
@@ -577,6 +590,11 @@ impl Database {
                 row.get::<_, Option<String>>(10)?, // category
                 row.get::<_, Option<String>>(11)?, // tags (JSON)
                 row.get::<_, Option<String>>(12)?, // context_text
+                // (feature-56) NULL on every prose chunk, and on code chunks written
+                // before these columns existed.
+                row.get::<_, Option<u32>>(13)?,    // start_line
+                row.get::<_, Option<u32>>(14)?,    // end_line
+                row.get::<_, Option<String>>(15)?, // symbol_kind
             ))
         })?;
 
@@ -605,6 +623,9 @@ impl Database {
                 r_category,
                 tags_json,
                 context_text,
+                start_line,
+                end_line,
+                symbol_kind,
             ) = row?;
             if filters.min_quality > 0.0 && quality_score < filters.min_quality {
                 continue;
@@ -661,6 +682,9 @@ impl Database {
                     date,
                     tags: hit_tags,
                     context_text,
+                    start_line,
+                    end_line,
+                    symbol_kind,
                 },
             ));
             if out.len() >= limit as usize {

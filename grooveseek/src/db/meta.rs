@@ -170,6 +170,33 @@ impl Database {
         Ok(())
     }
 
+    /// (feature-56) `index_meta.code_max_chunk_chars` を読む。key 不在 / 非数値は `None`。
+    ///
+    /// Unlike the model and the context mode, this does not describe the embedding space —
+    /// it describes where chunks were cut. Recording it is what lets an index notice that the
+    /// setting has moved since the chunks in it were made.
+    pub fn read_code_max_chunk_chars(&self) -> Result<Option<usize>> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'code_max_chunk_chars'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.as_deref().and_then(|s| s.parse::<usize>().ok()))
+    }
+
+    /// (feature-56) `index_meta.code_max_chunk_chars` を記録する (INSERT OR REPLACE)。
+    pub fn write_code_max_chunk_chars(&self, chars: usize) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('code_max_chunk_chars', ?1)",
+            params![chars.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
     /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {

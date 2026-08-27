@@ -92,7 +92,13 @@ impl Database {
                 content       TEXT NOT NULL,
                 token_count   INTEGER,
                 quality_score REAL NOT NULL DEFAULT 1.0,
-                context_text  TEXT
+                context_text  TEXT,
+                -- (feature-56) Filled in only by a source-code parser; NULL on
+                -- every chunk that came from prose, and the response layer
+                -- reads that NULL as: this chunk is not a definition.
+                start_line    INTEGER,
+                end_line      INTEGER,
+                symbol_kind   TEXT
             );
             -- quality_score のインデックスは `ensure_quality_score_column` で
             -- 列存在保証の後にまとめて作成する (legacy DB は ALTER が
@@ -136,6 +142,7 @@ impl Database {
         // legacy DB 互換: chunks.context_text 列が無ければ ALTER で追加する
         // (feature-46。NULL のまま — 値は PR-2 の context_mode 導入後、再 index で埋まる)。
         self.ensure_context_text_column()?;
+        self.ensure_code_columns()?;
 
         // legacy DB 互換: documents.size_bytes 列が無ければ ALTER で追加する
         // (feature-51。NULL のまま — 値は次の index 実行時に backfill される)。
@@ -250,6 +257,45 @@ impl Database {
                 .conn
                 .execute_batch("ALTER TABLE chunks ADD COLUMN context_text TEXT;")
             {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("duplicate column") => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// `chunks` の code 由来 3 列を追加する (idempotent、feature-56)。
+    ///
+    /// `start_line` / `end_line` / `symbol_kind` は source code parser だけが埋める。
+    /// 散文由来の行は NULL のままで、それが「この chunk は定義ではない」の表現に
+    /// なる (応答側でも key ごと落ちる)。legacy DB を開いても失敗しないよう init
+    /// 経路から呼ぶ。race 条件は duplicate column エラーを吸収。
+    pub(super) fn ensure_code_columns(&self) -> Result<()> {
+        let existing: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(chunks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        for (name, ddl) in [
+            (
+                "start_line",
+                "ALTER TABLE chunks ADD COLUMN start_line INTEGER;",
+            ),
+            (
+                "end_line",
+                "ALTER TABLE chunks ADD COLUMN end_line INTEGER;",
+            ),
+            (
+                "symbol_kind",
+                "ALTER TABLE chunks ADD COLUMN symbol_kind TEXT;",
+            ),
+        ] {
+            if existing.iter().any(|c| c == name) {
+                continue;
+            }
+            match self.conn.execute_batch(ddl) {
                 Ok(()) => {}
                 Err(e) if e.to_string().contains("duplicate column") => {}
                 Err(e) => return Err(e.into()),
