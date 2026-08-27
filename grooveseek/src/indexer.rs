@@ -909,7 +909,7 @@ fn index_single_disk_entry(
             ContextMode::Static => chunk.context.as_deref(),
             ContextMode::Off => None,
         };
-        db.insert_chunk(
+        db.insert_chunk_with_code(
             doc_id,
             chunk.index as i32,
             chunk.heading.as_deref(),
@@ -918,6 +918,10 @@ fn index_single_disk_entry(
             context,
             embedding,
             score,
+            crate::db::CodeMeta {
+                line_range: chunk.line_range,
+                symbol_kind: chunk.symbol_kind.as_deref(),
+            },
         )?;
     }
     tx.commit()?;

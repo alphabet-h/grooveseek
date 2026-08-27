@@ -187,6 +187,9 @@ loopback origin** である。
 | `results[].expanded_from.from_index` | integer | `adjacent` のみ。merge した最初の chunk index (含む) |
 | `results[].expanded_from.to_index` | integer | `adjacent` のみ。merge した最後の chunk index (含む) |
 | `results[].expanded_from.total_chunks` | integer | `whole_document` のみ。その文書の chunk 総数 |
+| `results[].start_line` | integer | chunk がソースファイル由来のときのみ。他は**不在**。1 始まりで、**由来した定義ではなく chunk 自身**の範囲を指す |
+| `results[].end_line` | integer | 同上。1 始まりで終端を含む |
+| `results[].symbol_kind` | string | chunk が定義のときのみ。他は**不在**。grammar 自身の語 (`function` / `class` / `method` / `constant` …) で、対応言語が増えると値も増える |
 | `results[].uri` | string | サーバが渡す文書のときのみ。**CLI では常に不在** |
 | `low_confidence` | boolean | 常に。**助言** — 後述 |
 | `filter_applied` | object | 常に。**`{}` の意味は見た目より狭い** — 後述 |

@@ -36,6 +36,8 @@ impl Parser for TxtParser {
                 level: None,
                 content: body,
                 context,
+                line_range: None,
+                symbol_kind: None,
             }]
         };
 

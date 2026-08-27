@@ -266,6 +266,9 @@ mod tests {
 
     fn make_hit(path: &str, content: &str) -> SearchHit {
         SearchHit {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
             score: 1.0,
             path: path.into(),
             title: None,

@@ -117,7 +117,22 @@ threshold = 0.3
 # skipped, tables are flattened to plain text) are described in docs/behavior.md.
 [parsers]
 enabled = ["md"]
-# (everything this build supports: enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"])
+# (the default build supports: enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"])
+
+# Source code (v1.2.0+) is chunked one definition at a time -- a function, a
+# struct, a method -- with everything no definition covers filled in by line, so
+# a file with a syntax error still contributes the definitions around the break.
+# Rust is compiled in; other languages arrive as separate libraries you place
+# (v1.3.0+). Hits carry the line range and the kind of definition, and mix with
+# prose by default; separate them with tags_any = ["code"] or a path_globs entry
+# beginning with "!". See docs/decisions/0012 and 0013.
+#
+# max_chunk_chars is the budget for one chunk in non-whitespace characters. A
+# definition that fits becomes one chunk; one that does not is split into its
+# nested definitions, or by lines when it has none. Lower it for finer-grained
+# hits, raise it to keep long bodies whole.
+[parsers.code]
+#max_chunk_chars = 3500
 
 # --- [watch] — live-sync file watcher ------------------------------------
 # Active during `groove serve` only. Detects changes, additions, deletions and

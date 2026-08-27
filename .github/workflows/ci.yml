@@ -55,6 +55,12 @@ jobs:
           key: fastembed-bge-small-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: cargo check
         run: cargo check --all-targets
+      # (feature-56) The Rust grammar is behind a default-on feature, so the
+      # build without it is a path nothing else exercises: `cargo test` runs
+      # with default features. Checking it here is what keeps the id-resolution
+      # branch for "known but not compiled in" compiling at all.
+      - name: cargo check (grammar feature off)
+        run: cargo check --no-default-features -p grooveseek
       - name: Pre-warm embedding model cache (serial)
         # index_progress_cli spawns groove subprocesses that each need the
         # BGE-small model. On a cold cache, running them in parallel makes

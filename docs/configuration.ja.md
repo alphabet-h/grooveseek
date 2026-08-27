@@ -47,10 +47,19 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # (.md のみ)。明示リストで .txt / .pdf / .docx / .xlsx / .pptx に
 # オプトイン。空配列 [] は「何もインデックスされない」事故を防ぐため拒否
 # される。現在サポート id: "md" / "txt" / "pdf" (v0.10.0+) / "docx" /
-# "xlsx" / "pptx" (v0.11.0+)。("xls" は v0.14.0 で取り下げ、behavior.ja.md 参照)
+# "xlsx" / "pptx" (v0.11.0+) / "rs" (v1.2.0+)。
+# ("xls" は v0.14.0 で取り下げ、behavior.ja.md 参照)
+# 他の言語は利用者が置くライブラリとして届く (v1.3.0+)。
 # 全部入り例:
 [parsers]
-enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx"]
+enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"]
+
+# ソースコード専用。max_chunk_chars は 1 chunk の予算 (非空白文字数)。
+# 収まる定義は 1 chunk になり、超えた定義は入れ子の定義へ、入れ子が無ければ
+# 行で割る (長い関数では後者が通常)。細かい粒度が欲しければ下げ、長い本体を
+# 割りたくなければ上げる。既定 3500。
+[parsers.code]
+max_chunk_chars = 3500
 
 # ライブ同期ファイルウォッチャ。`groove serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ

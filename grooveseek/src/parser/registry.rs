@@ -5,7 +5,61 @@ use anyhow::Result;
 
 // `XlsParser` はここでは import しない: AU-06 で registry から外したため
 // (型そのものは `parser::XlsParser` として残っており、その unit test も残る)。
-use super::{DocxParser, MarkdownParser, Parser, PdfParser, PptxParser, TxtParser, XlsxParser};
+use super::{
+    CodeParsersConfig, DocxParser, MarkdownParser, Parser, PdfParser, PptxParser, TxtParser,
+    XlsxParser,
+};
+
+/// Every id this build recognises, whether or not it can act on it.
+///
+/// Kept separate from what the build can actually construct: a grammar can be compiled out,
+/// and an id that is real but unavailable deserves a different answer than a typo. Without
+/// this list the two are indistinguishable and the user is told to check their spelling.
+const KNOWN_IDS: &[&str] = &["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"];
+
+/// Ids this build can build a parser for, in the order the diagnostic lists them.
+fn available_ids() -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = vec!["md", "txt", "pdf", "docx", "xlsx", "pptx"];
+    if cfg!(feature = "grammar-rust") {
+        ids.push("rs");
+    }
+    ids
+}
+
+/// The diagnostic for an id that resolved to nothing.
+///
+/// A pure function on purpose. The "compiled without the grammar" branch only ever fires in a
+/// build where that feature is off, and CI only *checks* such a build — it never runs its
+/// tests. Taking the id sets as arguments means the wording can be pinned by an ordinary test
+/// under default features, instead of living in a binary nobody executes.
+pub(crate) fn unresolved_id_message(id: &str, known: &[&str], available: &[&str]) -> String {
+    if known.contains(&id) {
+        format!(
+            "[parsers].enabled contains {id:?}, which this build recognises but was compiled \
+             without a grammar for. Rebuild with default features to parse it."
+        )
+    } else {
+        format!(
+            "[parsers].enabled contains unknown id {id:?}; supported in this build: {}",
+            available.join(", ")
+        )
+    }
+}
+
+#[cfg(feature = "grammar-rust")]
+fn rust_parser(code: &CodeParsersConfig) -> Result<Box<dyn Parser>> {
+    let grammar = super::code::static_rust::grammar()?;
+    Ok(Box::new(super::CodeParser::new(
+        grammar,
+        "rs",
+        code.max_chunk_chars,
+    )))
+}
+
+#[cfg(not(feature = "grammar-rust"))]
+fn rust_parser(_code: &CodeParsersConfig) -> Result<Box<dyn Parser>> {
+    anyhow::bail!(unresolved_id_message("rs", KNOWN_IDS, &available_ids()))
+}
 
 pub struct Registry {
     parsers: Vec<Box<dyn Parser>>,
@@ -16,6 +70,15 @@ impl Registry {
     /// Unknown ids fail loudly — this catches typos (`"markdown"` instead of
     /// `"md"`) and parsers that don't exist yet (`"rst"` / `"adoc"`).
     pub fn from_enabled(ids: &[String]) -> Result<Self> {
+        Self::from_enabled_with_code(ids, &CodeParsersConfig::default())
+    }
+
+    /// Same, with the `[parsers.code]` settings a code parser needs.
+    ///
+    /// A separate constructor rather than a parameter on [`Registry::from_enabled`] so that
+    /// the existing one keeps its meaning — "build from ids alone" — for the callers and
+    /// tests that have no configuration to hand.
+    pub fn from_enabled_with_code(ids: &[String], code: &CodeParsersConfig) -> Result<Self> {
         if ids.is_empty() {
             anyhow::bail!("[parsers].enabled must contain at least one id (got empty list)");
         }
@@ -45,11 +108,10 @@ impl Registry {
                 ),
                 "docx" => Box::new(DocxParser),
                 "pptx" => Box::new(PptxParser),
-                other => anyhow::bail!(
-                    "[parsers].enabled contains unknown id {:?}; \
-                     supported in this build: md, txt, pdf, docx, xlsx, pptx",
-                    other
-                ),
+                // (feature-56) The one grammar compiled in. Others are loaded from a plugin
+                // directory, which arrives with the loader.
+                "rs" => rust_parser(code)?,
+                other => anyhow::bail!(unresolved_id_message(other, KNOWN_IDS, &available_ids())),
             };
             parsers.push(parser);
         }

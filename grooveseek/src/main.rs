@@ -1918,6 +1918,15 @@ fn print_search_results(
                     println!("{}#{heading}", h.path);
                 }
                 println!("score: {:.4}", h.score);
+                // (feature-56) Only a source-code hit has these. Printed together on one line
+                // so that a reader can go straight to the file, and printed at all because the
+                // text output is what a person reads -- the JSON already carries them.
+                if let (Some(start), Some(end)) = (h.start_line, h.end_line) {
+                    match h.symbol_kind.as_deref() {
+                        Some(kind) => println!("lines: {start}-{end} ({kind})"),
+                        None => println!("lines: {start}-{end}"),
+                    }
+                }
                 if !h.tags.is_empty() {
                     println!("tags: {}", h.tags.join(", "));
                 }

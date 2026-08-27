@@ -17,6 +17,18 @@ use super::*;
 /// `chunks_for_path*` の戻り値の要素型。
 pub type SeedChunk = (i64, Vec<f32>, SearchResult);
 
+/// (feature-56) What a chunk knows about the source file it came from.
+///
+/// Empty for every chunk a prose parser produces, which is why it defaults to nothing rather
+/// than being required at the call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CodeMeta<'a> {
+    /// 1-based inclusive line range of the chunk within its file.
+    pub line_range: Option<(u32, u32)>,
+    /// The grammar's own word for what kind of definition this is.
+    pub symbol_kind: Option<&'a str>,
+}
+
 impl Database {
     /// Insert or update a document row. On update the old chunks (and their
     /// vec_chunks entries) are deleted so the caller can re-insert fresh ones.
@@ -144,6 +156,39 @@ impl Database {
         embedding: &[f32],
         quality_score: f32,
     ) -> Result<i64> {
+        self.insert_chunk_with_code(
+            document_id,
+            chunk_index,
+            heading,
+            level,
+            content,
+            context,
+            embedding,
+            quality_score,
+            CodeMeta::default(),
+        )
+    }
+
+    /// (feature-56) Same, for a chunk that came from a source file and therefore knows where
+    /// in that file it lives.
+    ///
+    /// A second constructor rather than three more parameters on [`Self::insert_chunk`]: that
+    /// signature is called from over a hundred places, nearly all of them tests that have no
+    /// opinion about source lines, and widening it would rewrite all of them to say `None`
+    /// three times. The prose path keeps the call it already had.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_chunk_with_code(
+        &self,
+        document_id: i64,
+        chunk_index: i32,
+        heading: Option<&str>,
+        level: Option<u8>,
+        content: &str,
+        context: Option<&str>,
+        embedding: &[f32],
+        quality_score: f32,
+        code: CodeMeta<'_>,
+    ) -> Result<i64> {
         // Rough token estimate: 1 token ~= 4 chars (English average).
         // F-46: saturate at i32::MAX rather than wrap on the rare 8 GiB+
         // content path (chunker is hard-capped well below this in practice;
@@ -161,10 +206,14 @@ impl Database {
         // and the legacy-row migration path (chunks indexed before
         // feature-28 keep `level = NULL` until re-indexed).
         let level_bind = level.map(|l| l as i64);
+        let (start_line, end_line) = match code.line_range {
+            Some((s, e)) => (Some(i64::from(s)), Some(i64::from(e))),
+            None => (None, None),
+        };
         self.conn.execute(
-            "INSERT INTO chunks (document_id, chunk_index, heading, level, content, context_text, token_count, quality_score)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![document_id, chunk_index, heading, level_bind, content, context, token_count, quality_score],
+            "INSERT INTO chunks (document_id, chunk_index, heading, level, content, context_text, token_count, quality_score, start_line, end_line, symbol_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![document_id, chunk_index, heading, level_bind, content, context, token_count, quality_score, start_line, end_line, code.symbol_kind],
         )?;
         let chunk_id = self.conn.last_insert_rowid();
 
@@ -398,6 +447,11 @@ impl Database {
                     tags: self.parse_tags_json_recording(tags_json),
                     // graph seed は rerank しないので context 合成は不要。
                     context_text: None,
+                    // (feature-56) The graph surface does not carry definition metadata —
+                    // `GraphNode` has no place to put it — so it is not selected here either.
+                    start_line: None,
+                    end_line: None,
+                    symbol_kind: None,
                 },
             ));
         }

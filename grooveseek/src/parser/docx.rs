@@ -220,6 +220,8 @@ fn parse_document_xml(xml: &[u8], excludes: &[&str], title: Option<&str>) -> Vec
                 level: s.level,
                 content: s.body,
                 context,
+                line_range: None,
+                symbol_kind: None,
             }
         })
         .collect()

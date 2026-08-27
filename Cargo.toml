@@ -1,5 +1,10 @@
 [workspace]
-members = ["grooveseek", "crates/groove-tray", "crates/groove-svc"]
+members = [
+    "grooveseek",
+    "crates/groove-tray",
+    "crates/groove-svc",
+    "crates/groove-grammar-abi",
+]
 resolver = "2"
 
 # Dependencies declared by more than one member, so a version bump happens in
@@ -27,6 +32,11 @@ tokio = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# (feature-56) Shared by grooveseek and the grammar ABI crate. Grammar crates
+# must be 0.23 or newer: those depend on this crate alone rather than on the
+# tree-sitter runtime, so grammars at different versions still resolve to a
+# single runtime. Mixing in an older grammar resolves two runtimes and breaks.
+tree-sitter-language = "0.1"
 
 # A doc comment that names something this tree no longer has fails the build.
 #

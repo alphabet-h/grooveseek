@@ -21,6 +21,9 @@ mod storage;
 // outside this module as `grooveseek::db::parse_query`; `search.rs` reaches it
 // through `use super::*`.
 pub use fts_query::{ParsedQuery, parse_query};
+// (feature-56) The indexer names this when it hands a code chunk's line range and definition
+// kind to the storage layer; every other caller uses the constructor that defaults it away.
+pub use storage::CodeMeta;
 // `server::compute_match_spans` が citation の offset を求めるのに同じ分割規則を使う。
 pub(crate) use fts_query::query_phrases;
 
@@ -142,6 +145,13 @@ pub struct SearchResult {
     /// LLM が付与)。`None` = context 機能 off の DB / context なし chunk。
     /// reranker 入力合成にのみ使い、`SearchHit` へは carry しない (API 不変)。
     pub context_text: Option<String>,
+    /// (feature-56) 1-based inclusive line range of the chunk in its source file.
+    /// `None` for prose, and for code chunks indexed before this column existed.
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    /// (feature-56) The grammar's word for the kind of definition this chunk holds.
+    /// `None` for prose and for chunks that are not a definition.
+    pub symbol_kind: Option<String>,
 }
 
 /// `SearchHit.content` (UTF-8) 内の byte offset 範囲。
@@ -195,6 +205,23 @@ pub struct SearchHit {
     /// or the hit chunk was not expanded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded_from: Option<ExpandedRange>,
+
+    /// (feature-56) Where in the source file this chunk is, 1-based and inclusive.
+    ///
+    /// Absent — the key itself, not a `null` — for anything that did not come from a source
+    /// file, which is every hit in a prose knowledge base. Describes the chunk rather than
+    /// the definition: a doc comment pulled in above a function is inside the range, and a
+    /// long function split across chunks gives each piece its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+
+    /// (feature-56) What kind of definition this chunk holds, in the grammar's own
+    /// vocabulary (`function` / `class` / `method` / `constant` …). Absent for chunks that
+    /// are not a definition, and for every non-code hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
 }
 
 impl From<SearchResult> for SearchHit {
@@ -210,6 +237,12 @@ impl From<SearchResult> for SearchHit {
             content: r.content,
             match_spans: None,
             expanded_from: None,
+            // (feature-56) Carried rather than defaulted: this is the one conversion every
+            // hit passes through on its way out, so dropping them here would make the columns
+            // unreachable from the API no matter what the parser wrote.
+            start_line: r.start_line,
+            end_line: r.end_line,
+            symbol_kind: r.symbol_kind,
         }
     }
 }
@@ -678,6 +711,9 @@ impl Drop for Database {
 #[cfg(test)]
 fn dummy_search_result_for_id(id: i64) -> SearchResult {
     SearchResult {
+        start_line: None,
+        end_line: None,
+        symbol_kind: None,
         score: 0.0, // overwritten by rrf_topk
         content: String::new(),
         heading: None,
@@ -4637,6 +4673,9 @@ mod tests {
         // SearchResult から SearchHit に変換した直後は match_spans は None。
         // (具体的な計算は server レイヤで行う)
         let r = SearchResult {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
             score: 0.1,
             content: "abc".into(),
             heading: None,
@@ -4656,6 +4695,9 @@ mod tests {
     fn test_searchhit_does_not_serialize_context_text() {
         // context_text を持つ SearchResult を SearchHit に変換 → JSON に context が出ない
         let r = SearchResult {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
             score: 1.0,
             content: "body".to_string(),
             heading: Some("H".to_string()),
@@ -5189,6 +5231,9 @@ mod tests {
             rows.insert(
                 id,
                 SearchResult {
+                    start_line: None,
+                    end_line: None,
+                    symbol_kind: None,
                     score: 0.0,
                     content: format!("c{id}"),
                     heading: None,
@@ -5220,6 +5265,9 @@ mod tests {
             rows.insert(
                 id,
                 SearchResult {
+                    start_line: None,
+                    end_line: None,
+                    symbol_kind: None,
                     score: 0.0,
                     content: format!("c{id}"),
                     heading: None,
@@ -5266,6 +5314,9 @@ mod tests {
     #[test]
     fn test_search_hit_expanded_from_omitted_when_none() {
         let hit = SearchHit {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
             score: 1.0,
             path: "p".into(),
             title: None,

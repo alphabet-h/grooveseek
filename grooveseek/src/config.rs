@@ -817,7 +817,10 @@ impl Config {
     /// `Registry::defaults()` = `["md"]` のみ (legacy 後方互換)。
     pub fn build_parser_registry(&self) -> Result<crate::parser::Registry> {
         match &self.parsers {
-            Some(p) => crate::parser::Registry::from_enabled(&p.enabled),
+            // (feature-56) `[parsers.code]` reaches the parser here rather than at parse time:
+            // `Parser::parse_bytes_inner` takes no configuration, so a code parser has to be
+            // built already knowing its chunk budget.
+            Some(p) => crate::parser::Registry::from_enabled_with_code(&p.enabled, &p.code),
             None => Ok(crate::parser::Registry::defaults()),
         }
     }

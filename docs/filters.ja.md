@@ -53,6 +53,15 @@
 }
 ```
 
+ソースコード (v1.2.0+) のタグは frontmatter ではなく parser が付ける: ソースファイル由来の
+chunk はすべて `code` と `lang:<name>` を持つ。結果は既定でコードと散文が混ざり、それを
+分けるのがこの filter である — そのために search の parameter を足してはいない。
+
+```jsonc
+{ "tags_any": ["code"] }        // 定義だけ
+{ "path_globs": ["!**/*.rs"] }  // 散文だけ。exclude だけの list は有効
+```
+
 ## `date_from` / `date_to`
 
 - **`YYYY-MM-DD`** (推奨) または RFC 3339 タイムスタンプ

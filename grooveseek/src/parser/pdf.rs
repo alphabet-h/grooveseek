@@ -391,6 +391,8 @@ impl Parser for PdfParser {
                 level: None,
                 content,
                 context,
+                line_range: None,
+                symbol_kind: None,
             });
         }
 

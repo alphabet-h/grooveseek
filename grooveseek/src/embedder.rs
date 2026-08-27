@@ -487,6 +487,9 @@ mod tests {
     /// model DL 不要な pure fn テストから使う test-local helper。
     fn mk_with_context(content: &str, context_text: Option<&str>) -> SearchResult {
         SearchResult {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
             score: 0.0,
             content: content.to_string(),
             heading: None,
@@ -527,6 +530,9 @@ mod tests {
         // SearchResult は db::SearchResult を使う
         use crate::db::SearchResult;
         let mk = |content: &str| SearchResult {
+            start_line: None,
+            end_line: None,
+            symbol_kind: None,
             score: 0.0,
             content: content.to_string(),
             heading: None,
