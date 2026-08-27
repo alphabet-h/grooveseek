@@ -1,6 +1,6 @@
 [package]
 name = "groove-svc"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Windows hidden-console launcher for groove.exe serve (v0.9.1 hot-fix for visible terminal window via Task Scheduler)"
 authors = ["koshian"]
