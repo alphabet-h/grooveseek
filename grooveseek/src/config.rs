@@ -591,10 +591,14 @@ impl Config {
 
     /// 信頼できない場所で見つかった config に制限を掛ける (BU-07)。
     ///
-    /// 制限するのは**特権的な 4 つ**だけで、`[search]` / `[quality_filter]` /
-    /// `exclude_dirs` / `[parsers]` 等はそのまま通す。前者は「どのコードが
-    /// 実行されるか」「何を外に出すか」「誰から届くか」を決めるのに対し、後者は
-    /// 選ばれた KB の中での見せ方でしかないため。
+    /// 制限するのは**特権的な 5 つ**だけで、`[search]` / `[quality_filter]` /
+    /// `exclude_dirs` / `[watch]` / `[contextual]` 等はそのまま通す。前者は
+    /// 「どのコードが実行されるか」「何を外に出すか」「誰から届くか」を決めるのに対し、
+    /// 後者は選ばれた KB の中での見せ方でしかないため。
+    ///
+    /// `[parsers]` は R5 (AV-05) で前者へ移した。`enabled` は「見せ方」ではなく
+    /// **どの parser を走らせるか**の指定で、plugin が要る id を 1 つ足すだけで
+    /// ネイティブライブラリの `dlopen` が発火する。
     ///
     /// **致命的なのは `kb_path` だけ**。他の 3 つは警告 + 安全側の値への差し替えで
     /// 続行する。ここで起動を止めると、Windows daemon が **何の出力も残さずに
@@ -750,6 +754,23 @@ impl Config {
 
         // R4 (feature-56): どのネイティブコードを `dlopen` するか。
         //
+        // ★ **R5 (下) がこの規則の前に立つので、今日この差し替えは観測できない。**
+        // untrusted config の `[parsers].enabled` は R5 が落とすため
+        // [`crate::parser::needs_grammar_plugin`] は false になり、
+        // [`Self::build_parser_registry`] は [`Self::resolve_grammar_dir`] を呼ばない。
+        // それでもここは残す:
+        //
+        // - 到達不能なのは **R5 の性質**であって、この規則の性質ではない。
+        //   [`Self::resolve_grammar_dir`] は `pub` で、2 本目の呼び出し元
+        //   (plugin をどこから探すかを報告する診断など) が生えた瞬間に、
+        //   植えられた `grammar_dir` を止めるものが無くなる
+        // - 2 つは違う問いに答えている: R4 は「どのディレクトリか」、R5 は「どの言語か」。
+        //   下の `grammar_env_set` 分岐は R5 が説明しないものを説明している
+        // - ADR-0013 が「plugin の置き場は特権的な設定になる」を明文の帰結として持つ
+        //
+        // 消してよいのは、[`Self::resolve_grammar_dir`] が private になり、呼び出し元が
+        // [`Self::build_parser_registry`] 1 本であることが型で言えるようになったときだけ。
+        //
         // R1 と**同型**であって、同じ理由で同じ形にしてある。plugin は検証なしに
         // プロセスへ読み込まれる任意のネイティブコードなので、置き場を決めるキーは
         // 「どの .onnx を読むか」と同じ重みを持つ。
@@ -799,6 +820,46 @@ impl Config {
                      (it selects which native library is loaded); pass --config to accept it"
                 );
             }
+        }
+
+        // R5 (AV-05): どの parser が走るか -- そして **plugin をそもそも dlopen するか**。
+        //
+        // R4 は「どのディレクトリから grammar plugin を読むか」を決める。こちらは
+        // 「読むかどうか」を決める。[`Self::build_parser_registry`] が
+        // [`Self::resolve_grammar_dir`] を呼ぶのは
+        // [`crate::parser::needs_grammar_plugin`] が true のときだけなので、
+        // 植えられた `enabled = ["md", "py"]` こそが dlopen の点火装置になる。
+        // 置き場だけ縛って点火装置を素通しにするのが、R4 のコメントが自分で書いている
+        // 理屈 (「dlopen 先を決めるキーは .onnx を選ぶのと同じ重み」) に対する非対称だった。
+        //
+        // **plugin が要る id 以外も同じ扱いにする。** `md` を超える id はどれも
+        // 「KB のバイトをどの parser に渡すか」の指定で、運用者が opt-in しなかった
+        // parser (pdf / xlsx / pptx / docx) を他人の config が再有効化してよい理由は無い。
+        // `[parsers.code]` も一緒に落ちるが、有効な code parser が 1 つも無くなった後に
+        // その設定だけ残す形はここに前例が無い。
+        //
+        // ★ **R1 / R4 と違い「キーの有無に関わらず必ず設定する」形は要らない。**
+        // あの 2 つが必要だったのは、キーを落とした先が**まだ探し続ける resolver**
+        // だったから: `resolve_cache_dir` の末尾は CWD 相対、[`grammar_dir_from`] の
+        // 末尾は OS 既定で、どちらも「黙っていること」が答えに影響できた。ここは
+        // `parsers: None` -> [`crate::parser::Registry::defaults`] で、中身は
+        // `MarkdownParser` 1 つという定数 -- パスも env も経由しない。
+        // **省略されたキーが到達できる、これより静かな答えは無い。**
+        // (この非対称は意図的。R1 の形へ「揃える」修正をしないこと。)
+        //
+        // 止めない (R1 / R3 / R4 と同じ)。むしろ止めないことがこの規則の効能でもある:
+        // R5 が無いと、`enabled = ["py"]` を植えられた daemon は R4 が差し戻した既定 dir に
+        // plugin が無いので [`Self::build_parser_registry`] で失敗して死ぬ。Windows service は
+        // stdio を捨てるので何も残らない。既定へ落として続行する方がその silent death を無くす。
+        if let Some(p) = self.parsers.take() {
+            tracing::warn!(
+                config = %shown.display(),
+                requested = ?p.enabled,
+                using = "md",
+                "ignoring [parsers] from a config found in an untrusted location \
+                 (it selects which parsers run, and whether a grammar plugin is \
+                 loaded at all); pass --config to accept it"
+            );
         }
 
         Ok(())
@@ -3254,6 +3315,183 @@ lambda = 0.5
         assert!(
             d.config.grammar_dir.is_none(),
             "the planted value is dropped; the environment already wins"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // R5 (AV-05): which parsers run, and whether a plugin is opened at all
+    // -----------------------------------------------------------------------
+
+    /// A config body naming `enabled`, for the R5 tests.
+    fn planted_parsers(enabled: &str) -> String {
+        format!("kb_path = \"kb\"\n[parsers]\nenabled = {enabled}\n")
+    }
+
+    /// The key that decides whether a native library is `dlopen`ed at all.
+    ///
+    /// `grammar_dir` (R4) chooses *which directory* a plugin is read from;
+    /// `[parsers].enabled` chooses *whether one is read*. A planted `"py"` is
+    /// the ignition, so the rule that only guards the directory guards the
+    /// second half of the sequence.
+    ///
+    /// The registry is asserted rather than the field alone: the guarantee is
+    /// "no parser the operator did not ask for", and that survives moving where
+    /// the reset happens.
+    #[test]
+    fn an_untrusted_config_cannot_turn_on_a_parser() {
+        let dir = TempDir::new("groove-untrusted-parsers");
+        std::fs::write(
+            dir.path().join("groove.toml"),
+            planted_parsers("[\"md\", \"py\"]"),
+        )
+        .unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config.parsers.is_none(),
+            "a discovered config must not choose the parser set"
+        );
+
+        let registry = d
+            .config
+            .build_parser_registry()
+            .expect("the default registry needs no plugin and no environment");
+        assert!(
+            registry.has_extension("md"),
+            "markdown is what the default registry indexes"
+        );
+        assert!(
+            !registry.has_extension("py"),
+            "a planted plugin language must never reach the registry"
+        );
+    }
+
+    /// The same rule, on the half of it that has nothing to do with `dlopen`.
+    ///
+    /// `pdf` / `xlsx` / `pptx` / `docx` are the parsers with the widest input
+    /// surface, and an operator who left them off did so deliberately. A rule
+    /// that stripped only the ids needing a grammar plugin would pass
+    /// [`an_untrusted_config_cannot_turn_on_a_parser`] and fail here.
+    #[test]
+    fn an_untrusted_config_cannot_turn_on_a_parser_that_needs_no_plugin() {
+        let dir = TempDir::new("groove-untrusted-parsers-builtin");
+        std::fs::write(
+            dir.path().join("groove.toml"),
+            planted_parsers("[\"md\", \"txt\", \"pdf\", \"xlsx\"]"),
+        )
+        .unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config.parsers.is_none(),
+            "no id beyond the default is honoured, plugin or not"
+        );
+
+        let registry = d.config.build_parser_registry().expect("default registry");
+        for ext in ["txt", "pdf", "xlsx"] {
+            assert!(
+                !registry.has_extension(ext),
+                "a planted {ext:?} parser must not be registered"
+            );
+        }
+    }
+
+    /// The other direction: the rule is about where the file was found, not
+    /// about the value. Without this, a rule that always reset `[parsers]`
+    /// would pass every test above.
+    #[test]
+    fn a_config_named_on_the_command_line_keeps_its_parsers() {
+        let dir = TempDir::new("groove-trusted-parsers");
+        let toml = dir.path().join("groove.toml");
+        std::fs::write(&toml, planted_parsers("[\"md\", \"py\"]")).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(Some(&toml), dir.path(), None, &roots)
+            .expect("--config is trusted, so nothing is refused");
+        assert_eq!(d.source, ConfigSource::Explicit);
+        assert_eq!(d.trust, ConfigTrust::Trusted);
+        let enabled = d
+            .config
+            .parsers
+            .as_ref()
+            .map(|p| p.enabled.clone())
+            .expect("a named config keeps its parser set");
+        assert_eq!(enabled, vec!["md".to_string(), "py".to_string()]);
+    }
+
+    /// ★ Why R5 is shaped differently from R1 and R4, as a test rather than a
+    /// comment.
+    ///
+    /// Those two set their key for **every** untrusted config, present or not,
+    /// because omitting it leaves a resolver still searching: the model cache
+    /// ends at a cwd-relative directory, the grammar directory at this
+    /// process's own default. Compare
+    /// [`an_untrusted_config_gets_a_safe_cache_dir_even_when_it_names_none`],
+    /// which asserts the opposite conclusion for the same input shape.
+    ///
+    /// `[parsers]` has nowhere to search. An absent key reaches
+    /// [`crate::parser::Registry::defaults`] -- a constant, no path and no
+    /// environment -- so dropping is already the floor and there is nothing to
+    /// substitute. If that ever stops being true, this test is where it shows.
+    #[test]
+    fn the_parser_rule_needs_no_substitute_for_a_key_that_is_absent() {
+        let dir = TempDir::new("groove-untrusted-no-parsers-key");
+        std::fs::write(dir.path().join("groove.toml"), "kb_path = \"kb\"\n").unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config.parsers.is_none(),
+            "an absent key stays absent; there is no safer value to write"
+        );
+
+        let registry = d.config.build_parser_registry().expect("default registry");
+        assert_eq!(
+            registry.extensions(),
+            vec!["md"],
+            "the floor an omitted key lands on is markdown and nothing else"
+        );
+    }
+
+    /// R4 keeps its own coverage now that R5 stands in front of it.
+    ///
+    /// After R5 no discovered config can enable a plugin language, so
+    /// [`Self::resolve_grammar_dir`] is no longer reached from
+    /// [`Self::build_parser_registry`] and the substitution cannot be observed
+    /// end to end. It is still made, and this is the test that says so -- so
+    /// that "unreachable, therefore delete it" fails here rather than silently.
+    #[test]
+    fn the_grammar_directory_is_still_replaced_when_no_parser_asks_for_it() {
+        let dir = TempDir::new("groove-untrusted-grammar-and-parsers");
+        let planted = dir.path().join("evil-grammars");
+        let body = format!(
+            "kb_path = \"kb\"\ngrammar_dir = \"{}\"\n[parsers]\nenabled = [\"md\", \"py\"]\n",
+            planted.display().to_string().replace('\\', "/")
+        );
+        std::fs::write(dir.path().join("groove.toml"), body).unwrap();
+        let data_local = TempDir::new("groove-untrusted-data-local");
+        let roots =
+            TrustRoots::new_with_grammar(None, Some(data_local.path().to_path_buf()), false);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config.parsers.is_none(),
+            "R5 still drops the parser set (this test must not pass for that reason alone)"
+        );
+        let used = d
+            .config
+            .grammar_dir
+            .expect("an untrusted config always gets an explicit grammar dir");
+        assert!(
+            used.is_absolute() && !used.starts_with(dir.path()),
+            "the plugin directory must never resolve inside the untrusted directory: {}",
+            used.display()
         );
     }
 

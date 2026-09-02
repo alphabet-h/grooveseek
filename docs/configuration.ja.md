@@ -203,8 +203,8 @@ bind = "127.0.0.1:3100"
 - **信頼しない**: それ以外の、CWD / `.git` 祖先で見つかったもの
 
 信頼しない config も**読み込みはする**。KB の見せ方を決めるだけのもの
-(`[search]` / `[quality_filter]` / `exclude_dirs` / `[parsers]` / `[watch]` /
-`[contextual]`) はそのまま効く。制限するのは 4 つだけで、これらは「どのコードを
+(`[search]` / `[quality_filter]` / `exclude_dirs` / `[watch]` /
+`[contextual]`) はそのまま効く。制限するのは 5 つだけで、これらは「どのコードを
 実行するか」「何が外に出るか」「誰から届くか」を決めるため:
 
 | フィールド | 信頼しない config の場合 |
@@ -213,6 +213,7 @@ bind = "127.0.0.1:3100"
 | `[transport.http].bind` | 非 loopback ならポートを保ったまま `127.0.0.1` に降格 (警告つき)。`allowed_hosts` / `allowed_origins` / `healthz_public` / `max_sessions` は破棄する — 前 3 つは loopback 限定の既定に戻し、4 つ目は組み込みの既定に戻す (植えられた `max_sessions = 1` で「2 人目が繋げないサーバ」を他人に作らせないため)。`allowed_origins` の破棄は両方向に効く — 植えられたリストは攻撃者の origin を名指しできるし、**空リストは「Origin を検証しない」の意味**になるため。`kind` は尊重する |
 | `kb_path` | ファイルシステムのルート / ホームディレクトリ / その祖先 / config ファイルのあるディレクトリの祖先 を指していれば**警告して無視**。`--kb-path` は従来どおり効くので上書きでき、どちらも無ければ通常どおり「`--kb-path` is required」で停止する |
 | `grammar_dir` | 警告して無視し、標準の置き場を使う。プロセスへ `dlopen` されるネイティブライブラリを選ぶ値であり、grammar plugin はデータではなくコードであるため。**キーの有無に関わらず必ず設定する** — 書かないことで選択に影響できてしまうため。標準の置き場が決められない場合は代わりにキーを落とし、plugin を必要とするコマンドが `GROOVE_GRAMMAR_DIR` を案内して停止する |
+| `[parsers]` | 警告して無視し、既定の集合 (Markdown のみ) を使う。`enabled` は**そもそもどの parser を走らせるか**を決めるので、KB の隣で見つかった config が、運用者が外していた最も入力面の広い形式 (`pdf` / `xlsx` / `pptx` / `docx`) を再有効化したり、grammar plugin が `dlopen` される言語を名指ししたりできてしまう。`grammar_dir` が向きだけを決めているスイッチがこちら — 有効な言語が plugin を必要としなければ、plugin は探されない。上 2 つと違い**キーが無い場合の差し替えは不要** — `[parsers]` を省略した時点で Markdown のみに落ちており、この規則が行き着く先と同じだから。`[parsers.code]` も一緒に落ちる (設定する対象の parser が残らないため) |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
 `kb_path = "/srv/kb/knowledge-base"` も通る (project-local な `groove.toml` に

@@ -14,6 +14,13 @@
 //! a process spawn and nothing else. Only the accepting path indexes for real, and that one is
 //! `#[ignore]` like the rest of the model-loading tests.
 //!
+//! One test reaches that same point through `serve --port` rather than `index`:
+//! [`a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory`]. Its input
+//! is an untrusted config, so since R5 (AV-05) no plugin language is enabled at all and
+//! `index` would have nothing left to refuse — it would go on to open a database and load a
+//! model. `serve --port` on the default stdio transport is refused after the registry is built
+//! and before a runtime exists, which keeps that test in the same cost class as its neighbours.
+//!
 //! # The fixtures
 //!
 //! `tests/fixtures/grammar_plugins/*.rs`, built as `cdylib`s by `cargo test` through the
@@ -378,12 +385,21 @@ fn a_plugin_declaring_another_languages_extension_is_refused_in_either_order() {
 // The untrusted-location rule, from outside
 // ---------------------------------------------------------------------------
 
-/// A config found rather than named cannot choose which native library is loaded.
+/// A config found rather than named cannot bring a plugin into the process.
 ///
-/// The plugin is placed exactly where the planted config points, and the run still fails —
-/// because the value was replaced with the machine's own default before the loader saw it.
-/// The failure is (i), the same wording a trusted config gets when its directory is empty:
-/// **trust decides which directory, never whether a missing grammar is fatal.**
+/// The plugin is placed exactly where the planted config points, and it is still never
+/// opened — because both of the values that would reach it were replaced with the
+/// machine's own defaults before the loader could be asked for anything.
+///
+/// **The probe is `serve --port`, not `index`.** Since R5 (AV-05) the planted
+/// `[parsers].enabled` is dropped too, so `py` is no longer enabled and nothing asks
+/// where plugins live; `index` would therefore go on to open a database and load a
+/// model, which is a cost this file does not pay (see the header). `serve --port` on the
+/// default stdio transport is refused *after* the parser registry is built and *before* a
+/// runtime exists, so it reaches the same decision and stops on its own.
+///
+/// The last assertion is the one R5 owns: with that rule removed, `py` survives, the
+/// registry construction goes looking for the library and names the file it wants.
 #[test]
 fn a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory() {
     let layout = TempKbLayout::new("groove-plugin-untrusted");
@@ -394,10 +410,16 @@ fn a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory()
     write_config(&layout, Some(&grammars));
 
     let out = Command::new(grooveseek_bin())
-        .args(["index", "--kb-path", &layout.kb().display().to_string()])
+        .args([
+            "serve",
+            "--kb-path",
+            &layout.kb().display().to_string(),
+            "--port",
+            "3100",
+        ])
         .current_dir(layout.root())
         .output()
-        .expect("groove index");
+        .expect("groove serve");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -410,6 +432,10 @@ fn a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory()
     assert!(
         !stderr.contains("loaded a grammar plugin"),
         "the planted plugin must never be opened:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(&plugin_file_name()),
+        "an untrusted config must not turn a plugin language on at all:\n{stderr}"
     );
 }
 

@@ -314,3 +314,64 @@ impl Drop for Cleanup {
 fn scopeguard_like(file: PathBuf, dir: PathBuf) -> Cleanup {
     Cleanup { file, dir }
 }
+
+// ---------------------------------------------------------------------------
+// R5 (AV-05): a discovered config cannot choose which parsers run
+// ---------------------------------------------------------------------------
+
+/// A config body that would change the parser set, and a `kb` beside it.
+///
+/// `xls` is the id the registry refuses by name, which is what makes the
+/// refusal observable from outside: if `[parsers]` were honoured, building the
+/// registry would stop the run with that message before anything else could.
+const PARSERS_MD_XLS: &str = "[parsers]\nenabled = [\"md\", \"xls\"]\n";
+
+/// `serve --port` on the default stdio transport is refused *after* the parser
+/// registry is built and *before* a runtime or a model exists, so it is the
+/// cheapest probe in the CLI that proves the registry was built from the
+/// default set rather than from the planted one.
+#[test]
+fn test_untrusted_config_cannot_enable_a_parser() {
+    let dir = TempDir::new("groove-cfg-untrusted-parsers");
+    dir.write("groove.toml", PARSERS_MD_XLS);
+    dir.write("kb/notes.md", "# Note\n\nbody\n");
+    let kb = dir.path().join("kb");
+
+    let out = dir.run_grooveseek(&["serve", "--kb-path", kb.to_str().unwrap(), "--port", "3100"]);
+    let plain = strip_ansi(&stderr_str(&out));
+
+    assert!(
+        !out.status.success(),
+        "`--port` on stdio must stop the run: {plain}"
+    );
+    assert!(
+        !plain.contains("which this build does not index"),
+        "the planted parser set must never reach the registry: {plain}"
+    );
+    assert!(
+        plain.contains("--bind / --port require"),
+        "the run has to get as far as the transport check: {plain}"
+    );
+}
+
+/// The substitution is announced by discovery, so it is reported even by a
+/// command that never builds a registry at all.
+#[test]
+fn test_untrusted_config_announces_the_parser_substitution() {
+    let dir = TempDir::new("groove-cfg-untrusted-parsers-warn");
+    dir.write("groove.toml", PARSERS_MD_XLS);
+    dir.write("kb/notes.md", "# Note\n\nbody\n");
+    let kb = dir.path().join("kb");
+
+    let out = dir.run_grooveseek(&["status", "--kb-path", kb.to_str().unwrap()]);
+    let plain = strip_ansi(&stderr_str(&out));
+
+    assert!(
+        plain.contains("ignoring [parsers]"),
+        "the dropped key has to be named: {plain}"
+    );
+    assert!(
+        plain.contains("untrusted location"),
+        "and the reason it was dropped: {plain}"
+    );
+}

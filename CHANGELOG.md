@@ -67,6 +67,21 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   choice by saying nothing. Naming the config with `--config` accepts it as
   written, as before. Refusing a missing grammar is **not** affected by trust —
   the same failure happens either way.
+- **A `groove.toml` that groove merely found cannot choose which parsers run
+  either.** Guarding only `grammar_dir` guarded the wrong half: naming a
+  language in `[parsers].enabled` is what causes a plugin to be looked for at
+  all, and the same key can switch on the formats with the widest input surface
+  — `pdf`, `xlsx`, `pptx`, `docx` — that an operator had deliberately left off.
+  A discovered config now has `[parsers]` ignored with a warning naming what it
+  asked for, and the default set, Markdown alone, is used. Unlike the cache and
+  grammar directories, an absent key needs no substitute: omitting `[parsers]`
+  already means Markdown alone, so there is nothing quieter to fall back to.
+  `[parsers.code]` goes with it, having no parser left to configure.
+  **If you keep a `groove.toml` beside a project and rely on it to index
+  anything but Markdown, name it: `groove serve --config ./groove.toml`.** The
+  `personal` deployment recipe now does that, for this reason; the
+  `intranet-http` one already did. A config next to the binary, or one
+  `groove service install` placed, is trusted as before and needs no change.
 
 ### Fixed
 

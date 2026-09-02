@@ -20,15 +20,15 @@ stdio.
 | File | Purpose |
 | --- | --- |
 | [`groove.toml`](./groove.toml) | Server-side defaults: model, watcher, parsers, quality filter |
-| [`.mcp.json`](./.mcp.json) | Client-side stub: `groove serve` (no args — discovery picks up the toml) |
+| [`.mcp.json`](./.mcp.json) | Client-side stub: `groove serve --config ./groove.toml` |
 
 ## Setup
 
 1. **Install groove**. Either grab a [prebuilt binary](https://github.com/alphabet-h/grooveseek/releases/latest) and place it on `PATH`, or `cargo install --path grooveseek` from a clone (the repository root is a workspace manifest, so `--path .` fails).
 2. **Decide where the KB lives**. For example `~/notes/` (personal notes) or `~/projects/<repo>/docs/` (project-scoped).
 3. **Pick a config location**. Two natural options — see [Config file discovery](../../../../docs/configuration.md#config-file-discovery):
-   - **Project-scoped**: drop both `groove.toml` and `.mcp.json` next to your project (commit them — `groove.toml` is meant to be shared).
-   - **Global**: place `groove.toml` next to the binary (`~/.local/bin/groove.toml` or `%USERPROFILE%\bin\groove.toml`) so every project sees the same defaults.
+   - **Project-scoped**: drop both `groove.toml` and `.mcp.json` next to your project (commit them — `groove.toml` is meant to be shared). **The `.mcp.json` here names the file with `--config`, and that is not a style choice**: a `groove.toml` groove only *found* is honoured in part, and `[parsers]` is one of the keys reset to its default, so a project-scoped config that opts into `.txt`, PDFs or source code would silently index Markdown alone. See [Trusted and untrusted config locations](../../../../docs/configuration.md#trusted-and-untrusted-config-locations).
+   - **Global**: place `groove.toml` next to the binary (`~/.local/bin/groove.toml` or `%USERPROFILE%\bin\groove.toml`) so every project sees the same defaults. The binary's own directory is trusted, so `--config` is not needed for this one.
 4. **Edit `groove.toml`**: set `kb_path` to the absolute path of your KB. Adjust the model and reranker if the defaults don't match your language.
 5. **Build the initial index**:
 

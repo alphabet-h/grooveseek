@@ -28,6 +28,13 @@ model = "bge-small-en-v1.5"
 # Indexing extensions. ["md"] is the default. Add "txt" if your KB also
 # contains plain-text notes (each .txt becomes a single chunk titled from
 # the filename).
+#
+# This key only takes effect from a config groove trusts -- one named with
+# --config (which the .mcp.json beside this file does), one next to the
+# binary, or one `groove service install` placed. A groove.toml groove merely
+# discovered has [parsers] reset to the default, because the key decides which
+# parsers run and, for a language whose grammar arrives as a plugin, whether a
+# native library is loaded at all.
 [parsers]
 enabled = ["md"]
 

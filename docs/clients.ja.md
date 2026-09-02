@@ -261,14 +261,14 @@ groove はソースコードを定義 1 つ = chunk 1 つで parse するが、�
        (Get-Content groove-grammar-python-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToUpper()
    ```
 3. 展開して、ライブラリを grammar ディレクトリに置く。既定は Windows なら `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、macOS なら `~/Library/Application Support/groove/grammars`。別の場所にするなら `groove.toml` の `grammar_dir` か、環境変数 `GROOVE_GRAMMAR_DIR` を使う — こちらは**絶対パス必須**で、相対値だと「クライアントがたまたま groove を起動したディレクトリ」に対して解決されてしまうため。
-4. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。
+4. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。ただし groove が**信頼する** config に書くこと。プロジェクトの隣で見つけただけの `groove.toml` は `[parsers]` が無視されるので、言語が有効にならず plugin も開かれない。`--config` で名指しするか、バイナリの隣に置くか、`groove service install` に置かせること。[信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
 5. **service に任せる前に、`groove index` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
 
 自動 DL は一切しないし、`enabled` に書いた言語以外は開かない — そのディレクトリに有効化していない言語のファイルがあっても触らない。有効化した言語の plugin が使えない場合、コマンドは「どのファイルをどこに置くべきか」を告げて止まる。ソースを plain text として索引するフォールバックはしない。
 
 **plugin を差し替えたら `groove index --force` で索引し直すこと。** grammar を作り直すと同じファイルでも chunk の切れ目が動きうるが、索引は内容が変わっていないファイルを飛ばすので、普通に index し直しても**そのファイルは古い grammar が切った chunk のまま**残り、新しい grammar はその後編集したファイルにだけ効く。結果として索引が 2 世代を同時に抱える。**現時点では groove がこれを検出して警告することはない**ので、`--force` は利用者の側の判断になる。groove 本体を上げた時も同様。**`[parsers.code].max_chunk_chars` を変えた時だけは groove が報告する**: 索引はコード chunk を切った時の budget を記録しているので、違う値で次を走らせると `--force` を名指しする warning が出る。
 
-> **grammar plugin は groove が自分のプロセスへ読み込むネイティブコード。** インストールする他のバイナリと同じ扱いにすること — 使っている版の release ページから取り、それ以外の場所からは取らない。groove が**見つけただけ**の `groove.toml` (`--config` で名指ししていないもの) がこのディレクトリを選べないのも同じ理由: [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
+> **grammar plugin は groove が自分のプロセスへ読み込むネイティブコード。** インストールする他のバイナリと同じ扱いにすること — 使っている版の release ページから取り、それ以外の場所からは取らない。groove が**見つけただけ**の `groove.toml` (`--config` で名指ししていないもの) が、このディレクトリも、そもそもライブラリを開かせる言語の指定も選べないのは同じ理由: [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
 
 ## HuggingFace の TLS 失敗への対処 (初回 DL 時)
 

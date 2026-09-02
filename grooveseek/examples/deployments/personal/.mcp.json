@@ -1,11 +1,12 @@
 {
-  "_comment_personal": "Personal local deployment — stdio, single client. The empty `args` relies on `groove.toml` being on the discovery path (CWD / .git ancestor / binary side). Drop this in your project root next to groove.toml, or point Claude Code at it via `~/.config/claude/.mcp.json`.",
+  "_comment_personal": "Personal local deployment — stdio, single client. Drop this in your project root next to groove.toml, or point Claude Code at it via `~/.config/claude/.mcp.json`.",
+  "_comment_config": "`--config` names the file rather than letting groove discover it, which is what makes it trusted. A config found beside a project is honoured only in part: [parsers], grammar_dir, fastembed_cache_dir, kb_path and the [transport.http] gates are reset to safe defaults with a warning, so a project-scoped groove.toml would silently index Markdown alone. `./groove.toml` resolves against the directory the client launches groove from — replace it with an absolute path if your client does not set that to the project root. See docs/configuration.md, 'Trusted and untrusted config locations'.",
   "_comment_alwaysLoad": "alwaysLoad: true is a Claude Code v2.1.121+ option that ensures groove's tools are present at initial load (skips tool-search lookup latency). Other MCP clients (Cursor, etc.) ignore the field. Drop it if first-startup model download cost outweighs the latency win.",
   "mcpServers": {
     "ai-knowledge": {
       "type": "stdio",
       "command": "groove",
-      "args": ["serve"],
+      "args": ["serve", "--config", "./groove.toml"],
       "alwaysLoad": true
     }
   }
