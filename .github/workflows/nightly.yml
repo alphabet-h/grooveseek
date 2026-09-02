@@ -158,6 +158,19 @@ jobs:
           echo "::error::pre-warm failed after 3 attempts" >&2
           exit 1
 
+      # `cargo test` builds the three `[[example]]` fixtures beside it -- it
+      # carries no target filter, so example targets are in scope -- but it does
+      # not build a `cdylib` no target depends on (rust-lang/cargo#8311). The
+      # shipped Python grammar is exactly that: a release asset the loader opens
+      # by path, which nothing in the workspace links. So the one test that
+      # checks the grammar groove actually publishes is a grammar its own loader
+      # accepts had no artefact to open, and said so in its assert.
+      #
+      # No `--features test-helpers` here: this package declares no features,
+      # and naming one cargo cannot resolve fails the step.
+      - name: Build the cdylib nothing depends on
+        run: cargo build -p groove-grammar-python
+
       - name: cargo test -- --include-ignored
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では
         # 通常の `cargo test` も合わせて走らせて、ignored だけ落ちる
@@ -322,14 +335,57 @@ jobs:
       # table + TOTAL 行のみ出力 (= F-59 「死角を定量化」要件)。
       # `--color never` で ANSI escape を抑制し GITHUB_STEP_SUMMARY の
       # code block 整合性を保つ。
-      - name: Run coverage (non-ignored only)
-        # `--no-report` stops here with the profile data on disk; the two
-        # `report` invocations below re-render it without re-running anything,
-        # so the human-readable table and the threshold below share one test run.
-        run: cargo llvm-cov --no-report
+      # The floor below excludes `crates/groove-grammar-abi/src/lib.rs`, because in a
+      # workspace run the only regions attributed to that file are the exports
+      # `groove_grammar_plugin!` expands into each plugin -- see the exclusion's own
+      # comment. Excluding it there and stopping would leave the crate with no floor
+      # at all, so it gets one here instead: a `-p` run sees its unit tests and reads
+      # 86.36%, well over the same 35.
+      #
+      # First, and on its own: this uses the default `target/llvm-cov-target`, while
+      # the workspace run below writes under `target`, so neither can pick up the
+      # other's counters. It costs one small crate's build.
+      - name: Enforce the floor on the grammar ABI crate, which the workspace run cannot see
+        run: cargo llvm-cov --summary-only --fail-under-file-lines 35 -p groove-grammar-abi
 
+      - name: Run coverage (non-ignored only)
+        # Driven through `show-env` rather than plain `cargo llvm-cov`, because
+        # that form runs `cargo test --tests` internally and `--tests` is a
+        # target filter: it never builds the `[[example]]` cdylibs the
+        # grammar-plugin tests open, so three tests that are not `#[ignore]`
+        # failed here while passing under the plain `cargo test` the other job
+        # runs. `--examples` is not the fix -- under `cargo test` that builds
+        # each example as a test executable rather than as a `cdylib`.
+        #
+        # So the environment is exported and the commands are run directly. A
+        # `cargo test` with no target filter builds the example libraries, the
+        # same way the ignored-tests job's does. No report is written here; the
+        # two `report` invocations below re-render the profile data left on
+        # disk without re-running anything, so the human-readable table and the
+        # threshold below share one test run.
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--sh`, not the older `--export-prefix`: that name still works as an
+          # alias but warns that it may go in a breaking release, and the
+          # install step pins the minor version, not the patch.
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo test
+
+      # The environment is exported again rather than carried over: each step is
+      # its own shell, and without it `report` looks for the profile data in
+      # `target/llvm-cov-target` -- where a plain `cargo llvm-cov` would have put
+      # it -- while the step above wrote it under `target`. `show-env` builds
+      # nothing, so asking twice costs a process. It cannot be hoisted into
+      # `$GITHUB_ENV` either: the values arrive single-quoted and that file does
+      # not unquote them, so `LLVM_PROFILE_FILE` would keep its quotes.
       - name: Render the coverage summary
-        run: cargo llvm-cov report --summary-only --color never > coverage_summary.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov report --summary-only --color never > coverage_summary.txt
 
       # `if: always()` matters now that a later step can fail the job: the run
       # where the floor trips is exactly the run where you want the table
@@ -383,17 +439,40 @@ jobs:
       #                            `#[ignore]` tests that touch the real user
       #                            session
       #   - groove-tray/main.rs  — a 3-line Windows GUI entry point
+      #   - groove-grammar-abi/src/lib.rs
+      #                          — the only regions a workspace run attributes
+      #                            to this file are the six exports
+      #                            `groove_grammar_plugin!` expands into each
+      #                            plugin and fixture, and they run when a
+      #                            plugin loads, which no non-ignored test does.
+      #                            Measured: `cargo llvm-cov report --json`
+      #                            lists exactly `groove_grammar_abi_version`,
+      #                            `_build_info`, `_extensions`, `_language`,
+      #                            `_name` and `_tags_query` against it, all at
+      #                            zero, and none of the crate's own functions.
+      #                            Its logic is covered by its own unit tests —
+      #                            `cargo llvm-cov -p groove-grammar-abi` reads
+      #                            86.36% — but that data does not survive the
+      #                            merge, so the floor here reads 0% whether the
+      #                            crate has tests or not. A tripwire that
+      #                            always fires is not one. **The crate is not
+      #                            left ungated**: the step above enforces the
+      #                            same floor against a `-p` run, which does see
+      #                            its unit tests.
       # `report` reuses the data collected above, so this costs seconds.
       - name: Enforce a per-file line-coverage floor
         shell: bash
         run: |
           set -euo pipefail
+          # Same reason as the summary step above: `report` has to be told where
+          # the profile data is, and each step is a fresh shell.
+          source <(cargo llvm-cov show-env --sh)
           FLOOR=35
           # Forward slashes: llvm-cov matches the regex against the path as the
           # coverage data records it, which on this runner is POSIX. The same
           # command run on Windows matches nothing (the separators are
           # backslashes there) and reports the excluded files too.
-          IGNORE='(grooveseek/src/transport/stdio\.rs|grooveseek/src/service/linux\.rs|crates/groove-tray/src/main\.rs)$'
+          IGNORE='(grooveseek/src/transport/stdio\.rs|grooveseek/src/service/linux\.rs|crates/groove-tray/src/main\.rs|crates/groove-grammar-abi/src/lib\.rs)$'
           # cargo-llvm-cov exits 1 without naming the file that tripped the
           # floor, so name it here — a nightly failure has to be diagnosable
           # from the log without re-running a coverage build locally.

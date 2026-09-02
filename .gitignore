@@ -3,6 +3,14 @@
 # fastembed-rs が cache_dir 未解決時に使うローカルフォールバック
 .fastembed_cache/
 
+# Coverage counters. The nightly coverage step is now a plain sequence anyone
+# can copy (`cargo llvm-cov show-env --sh`, then build and test), and an
+# instrumented process that runs without `LLVM_PROFILE_FILE` set writes its
+# counters beside itself — `crates/<name>/default_*.profraw`, outside `target/`
+# and next to a Cargo.toml, where `git add -A` would take it.
+*.profraw
+*.profdata
+
 # Claude Code (local settings, reproducible skills)
 CLAUDE.local.md
 *.local.md
