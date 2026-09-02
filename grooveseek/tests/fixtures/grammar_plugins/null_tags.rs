@@ -40,7 +40,7 @@ pub extern "C" fn groove_grammar_extensions() -> *const c_char {
 /// # Safety
 ///
 /// `len` must be null or point at a writable `usize`, the same contract
-/// `groove_grammar_plugin!` states for the export it generates.
+/// [`groove_grammar_abi::groove_grammar_plugin`] states for the export it generates.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn groove_grammar_tags_query(len: *mut usize) -> *const u8 {
     if !len.is_null() {

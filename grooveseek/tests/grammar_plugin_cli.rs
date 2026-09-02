@@ -267,8 +267,8 @@ fn a_library_without_the_contract_is_refused_by_the_symbol_it_lacks() {
 /// other bad plugin gets a line naming the file and the reason. Under the Windows service,
 /// which discards stdio, it died silently.
 ///
-/// The fixture is hand-written because `groove_grammar_plugin!` cannot express it — the macro
-/// builds this export from a real grammar's `LanguageFn`.
+/// The fixture is hand-written because [`groove_grammar_abi::groove_grammar_plugin`] cannot
+/// express it — the macro builds this export from a real grammar's `LanguageFn`.
 #[test]
 fn a_plugin_that_hands_back_no_grammar_is_refused_rather_than_dereferenced() {
     let layout = TempKbLayout::new("groove-plugin-nullgrammar");
