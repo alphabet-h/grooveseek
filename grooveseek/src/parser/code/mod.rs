@@ -294,7 +294,17 @@ fn chunk_source_capped(
         );
         defs.clear();
         let context_parts: Vec<String> = title.iter().cloned().collect();
-        push_gap(0..text.len(), &context_parts, text, budget, &mut pieces);
+        // Not droppable, unlike an ordinary gap. A gap is the frame around content that was
+        // chunked as a definition; here there is no such content, so a thin last piece is the
+        // end of the file rather than a stray closing brace beside something that survived.
+        push_line_pieces(
+            0..text.len(),
+            &context_parts,
+            text,
+            budget,
+            false,
+            &mut pieces,
+        );
     } else {
         link_containment(&mut defs);
         let roots: Vec<usize> = (0..defs.len()).filter(|i| defs[*i].depth == 0).collect();
@@ -577,20 +587,26 @@ fn fill_gaps(
     let mut cursor = 0usize;
     for span in spans {
         if cursor < span.start {
-            push_gap(cursor..span.start, &context_parts, text, budget, out);
+            push_line_pieces(cursor..span.start, &context_parts, text, budget, true, out);
         }
         cursor = span.end.max(cursor);
     }
     if cursor < text.len() {
-        push_gap(cursor..text.len(), &context_parts, text, budget, out);
+        push_line_pieces(cursor..text.len(), &context_parts, text, budget, true, out);
     }
 }
 
-fn push_gap(
+/// Headingless pieces covering `range`, split to the budget.
+///
+/// `droppable` decides what [`drop_thin_fragments`] may take back: a gap is droppable because
+/// a closing brace beside a definition that survived is noise, but the same pieces standing in
+/// for the whole file are the file.
+fn push_line_pieces(
     range: Range<usize>,
     context_parts: &[String],
     text: &str,
     budget: usize,
+    droppable: bool,
     out: &mut Vec<Piece>,
 ) {
     for r in split_by_lines(text, &range, budget) {
@@ -600,7 +616,7 @@ fn push_gap(
             level: None,
             symbol_kind: None,
             context_parts: context_parts.to_vec(),
-            droppable: true,
+            droppable,
         });
     }
 }
@@ -890,10 +906,14 @@ impl Counter {
     }
 
     fn parse_capped(src: &str, scope_limit: usize) -> ParsedDocument {
+        parse_capped_with(src, DEFAULT_MAX_CHUNK_CHARS, scope_limit)
+    }
+
+    fn parse_capped_with(src: &str, budget: usize, scope_limit: usize) -> ParsedDocument {
         let grammar = static_rust::grammar().expect("rust grammar builds");
         chunk_source_capped(
             &grammar,
-            DEFAULT_MAX_CHUNK_CHARS,
+            budget,
             src.as_bytes(),
             src,
             "src/lib.rs",
@@ -958,6 +978,45 @@ impl Counter {
             "tags were {:?}",
             outside.frontmatter.tags
         );
+    }
+
+    #[test]
+    fn the_line_fallback_keeps_a_tail_too_thin_to_survive_as_a_gap() {
+        // A gap fragment under the short-content threshold is dropped on purpose, and the
+        // fallback covers the whole file with the same kind of piece. Droppable pieces would
+        // lose the tail here, and with it the promise that the file keeps every byte.
+        //
+        // The budget is injected so the split lands where the test needs it: each filler line
+        // weighs exactly one budget, so the closing brace cannot join the piece before it. The
+        // filler is also long enough to clear the short-content threshold on its own - if
+        // every piece were thin, the rule that keeps a file from ending up with no chunks at
+        // all would hide the bug this test is for.
+        const FILLER: &str = "pub fn function_with_a_name()->u32{7}\n";
+        let budget = non_ws(FILLER, &(0..FILLER.len()));
+        let mut src = String::from("pub mod outer {\n");
+        for _ in 0..3 {
+            src.push_str(FILLER);
+        }
+        src.push_str("}\n");
+
+        let doc = parse_capped_with(&src, budget, 1);
+        assert!(
+            doc.frontmatter.tags.iter().any(|t| t == "parse:too-deep"),
+            "the fixture is supposed to take the fallback, tags were {:?}",
+            doc.frontmatter.tags
+        );
+        assert!(
+            doc.chunks.len() > 1,
+            "the fixture is supposed to span more than one chunk, got {}",
+            doc.chunks.len()
+        );
+        let last = doc.chunks.last().expect("chunks are not empty");
+        assert!(
+            last.content.trim().chars().count() < MIN_FRAGMENT_CHARS,
+            "the last chunk is supposed to be the thin one, got {:?}",
+            last.content
+        );
+        assert_eq!(last.content.trim(), "}", "the tail is the closing brace");
     }
 
     #[test]
