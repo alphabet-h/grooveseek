@@ -22,6 +22,8 @@ Add the following to `.mcp.json` in your project root (or the equivalent MCP con
 }
 ```
 
+> **Using a `groove.toml` that sits in the project?** Add `"--config", "/abs/path/to/groove.toml"` to `args`, before `serve`. groove decides from a config's *location* how far to trust it, and a file it merely found has its privileged keys reset — `[parsers]` among them, so a knowledge base of anything but Markdown would be served as if it were Markdown only. The same applies to every other `groove` invocation against that config, `index` most of all. See [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations). A config beside the binary, or one `groove service install` placed, is trusted as it is.
+
 With a multilingual model and reranker enabled:
 
 ```json

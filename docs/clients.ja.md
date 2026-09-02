@@ -22,6 +22,8 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 }
 ```
 
+> **`groove.toml` がプロジェクト内にある場合**は、`args` の `serve` の前に `"--config", "/abs/path/to/groove.toml"` を足すこと。groove は config を**置き場所**でどこまで信頼するか決めるので、見つけただけのファイルは特権的なキーが既定へ戻される — `[parsers]` もその 1 つで、Markdown 以外の KB が Markdown だけとして提供されることになる。同じ config を読む他の `groove` 実行にも同様に効き、**特に `index` で効く**。[信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。バイナリの隣にある config や `groove service install` が置いた config はそのまま信頼される。
+
 多言語モデル + 再ランクを有効化する場合:
 
 ```json
