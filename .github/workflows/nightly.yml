@@ -158,6 +158,19 @@ jobs:
           echo "::error::pre-warm failed after 3 attempts" >&2
           exit 1
 
+      # `cargo test` builds the three `[[example]]` fixtures beside it -- it
+      # carries no target filter, so example targets are in scope -- but it does
+      # not build a `cdylib` no target depends on (rust-lang/cargo#8311). The
+      # shipped Python grammar is exactly that: a release asset the loader opens
+      # by path, which nothing in the workspace links. So the one test that
+      # checks the grammar groove actually publishes is a grammar its own loader
+      # accepts had no artefact to open, and said so in its assert.
+      #
+      # No `--features test-helpers` here: this package declares no features,
+      # and naming one cargo cannot resolve fails the step.
+      - name: Build the cdylib nothing depends on
+        run: cargo build -p groove-grammar-python
+
       - name: cargo test -- --include-ignored
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では
         # 通常の `cargo test` も合わせて走らせて、ignored だけ落ちる
@@ -323,10 +336,29 @@ jobs:
       # `--color never` で ANSI escape を抑制し GITHUB_STEP_SUMMARY の
       # code block 整合性を保つ。
       - name: Run coverage (non-ignored only)
-        # `--no-report` stops here with the profile data on disk; the two
-        # `report` invocations below re-render it without re-running anything,
-        # so the human-readable table and the threshold below share one test run.
-        run: cargo llvm-cov --no-report
+        # Driven through `show-env` rather than plain `cargo llvm-cov`, because
+        # that form runs `cargo test --tests` internally and `--tests` is a
+        # target filter: it never builds the `[[example]]` cdylibs the
+        # grammar-plugin tests open, so three tests that are not `#[ignore]`
+        # failed here while passing under the plain `cargo test` the other job
+        # runs. `--examples` is not the fix -- under `cargo test` that builds
+        # each example as a test executable rather than as a `cdylib`.
+        #
+        # So the environment is exported and the commands are run directly. A
+        # `cargo test` with no target filter builds the example libraries, the
+        # same way the ignored-tests job's does. No report is written here; the
+        # two `report` invocations below re-render the profile data left on
+        # disk without re-running anything, so the human-readable table and the
+        # threshold below share one test run.
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--sh`, not the older `--export-prefix`: that name still works as an
+          # alias but warns that it may go in a breaking release, and the
+          # install step pins the minor version, not the patch.
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          cargo test
 
       - name: Render the coverage summary
         run: cargo llvm-cov report --summary-only --color never > coverage_summary.txt
