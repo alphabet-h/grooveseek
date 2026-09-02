@@ -3,9 +3,12 @@
 # Place this at /srv/groove/groove.toml. The systemd unit and the index command
 # both name it with `--config`, which is what makes groove treat it as trusted:
 # a config groove only *discovers* has fastembed_cache_dir, allowed_hosts,
-# allowed_origins and a non-loopback bind stripped out of it, and this file sets
-# all four. See "Trusted and untrusted config locations" in docs/configuration.md
-# and README.md / README.ja.md for the full setup.
+# allowed_origins and a non-loopback bind stripped out of it. This file sets the
+# first of those below; the other three belong to the LAN and reverse-proxy
+# variants it describes, and are commented out until you pick one. So the
+# stripping costs you the model cache today, and whichever of the three you turn
+# on tomorrow. See "Trusted and untrusted config locations" in
+# docs/configuration.md and README.md / README.ja.md for the full setup.
 
 # Absolute path to the knowledge base directory on the server.
 # .groove.db will land at /srv/groove/.groove.db (parent of kb_path).
