@@ -264,7 +264,7 @@ groove はソースコードを定義 1 つ = chunk 1 つで parse するが、�
    ```
 3. 展開して、ライブラリを grammar ディレクトリに置く。既定は Windows なら `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、macOS なら `~/Library/Application Support/groove/grammars`。別の場所にするなら `groove.toml` の `grammar_dir` か、環境変数 `GROOVE_GRAMMAR_DIR` を使う — こちらは**絶対パス必須**で、相対値だと「クライアントがたまたま groove を起動したディレクトリ」に対して解決されてしまうため。
 4. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。ただし groove が**信頼する** config に書くこと。プロジェクトの隣で見つけただけの `groove.toml` は `[parsers]` が無視されるので、言語が有効にならず plugin も開かれない。`--config` で名指しするか、バイナリの隣に置くか、`groove service install` に置かせること。[信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
-5. **service に任せる前に、`groove index` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
+5. **service に任せる前に、`groove index` を 1 回手で走らせる — 手順 4 で `--config` を使ったなら、ここでも同じように名指しすること。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。**ここで `--config` を落とすと派手に失敗はしない** — 言語が有効にならないので誰も plugin を探さず、置いたはずの plugin を一度も検査しないまま run が成功する。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
 
 自動 DL は一切しないし、`enabled` に書いた言語以外は開かない — そのディレクトリに有効化していない言語のファイルがあっても触らない。有効化した言語の plugin が使えない場合、コマンドは「どのファイルをどこに置くべきか」を告げて止まる。ソースを plain text として索引するフォールバックはしない。
 
