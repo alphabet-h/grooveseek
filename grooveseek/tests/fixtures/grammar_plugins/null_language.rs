@@ -2,7 +2,7 @@
 //!
 //! Written out symbol by symbol rather than through
 //! [`groove_grammar_abi::groove_grammar_plugin`], because the macro cannot produce this: it
-//! builds `groove_grammar_language` from a `LanguageFn` a real grammar crate supplies, so
+//! builds [`crate::groove_grammar_language`] from a `LanguageFn` a real grammar crate supplies, so
 //! every library the macro makes returns a parse table. The shapes the loader refuses are
 //! exactly the ones the macro cannot express, which is why they need hand-written fixtures.
 //!

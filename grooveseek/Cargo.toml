@@ -281,3 +281,11 @@ name = "groove_grammar_null_tags"
 path = "tests/fixtures/grammar_plugins/null_tags.rs"
 crate-type = ["cdylib"]
 
+# Needs `grammar-rust`, unlike the two above: it has to hand over a *real* parse table the
+# first time before it starts answering NULL, and a fixture with no real table to hand over
+# would be `null_language.rs` rather than this one.
+[[example]]
+name = "groove_grammar_flaky_language"
+path = "tests/fixtures/grammar_plugins/flaky_language.rs"
+crate-type = ["cdylib"]
+

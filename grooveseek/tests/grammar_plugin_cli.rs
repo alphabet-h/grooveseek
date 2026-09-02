@@ -308,6 +308,34 @@ fn a_null_tags_query_is_refused_rather_than_read_as_an_empty_one() {
     assert!(!db_path(&layout).exists());
 }
 
+/// The pointer the loader checks has to be the pointer it uses.
+///
+/// `tree_sitter::Language` can only be built by *calling* a `LanguageFn`, so handing it the
+/// plugin's own export would put the check and the use one call apart. This fixture answers
+/// with a real parse table once and NULL after, which nothing in the ABI forbids — so a loader
+/// that checked the first answer would dereference the second, and the run would end without a
+/// word instead of being refused.
+///
+/// The refusal it does reach is the extension mismatch, several checks later. Reaching a later
+/// check at all is the evidence.
+#[test]
+fn a_grammar_export_that_answers_twice_is_used_on_the_answer_that_was_checked() {
+    let layout = TempKbLayout::new("groove-plugin-flaky");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_flaky_language");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a mismatched extension must fail:\n{stderr}");
+    assert!(
+        stderr.contains("but the id it was loaded for stands for"),
+        "expected the run to reach the extension check, which it can only do if the table it \
+         verified is the table it used:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
 // ---------------------------------------------------------------------------
 // The declared extension has to be the one the id stands for
 // ---------------------------------------------------------------------------
