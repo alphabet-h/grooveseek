@@ -61,9 +61,9 @@ pub(crate) const DEFAULT_MAX_CHUNK_CHARS: usize = 3500;
 /// and `Node::parent` is a search rather than a pointer, so the cost grows with the cube of
 /// the nesting depth. On one line of `mod a{` repeated, indexing took 316 ms at 125 levels,
 /// 8,191 ms at 500 and 63,989 ms at 1000 — while the file stayed under 10 KB and so never came
-/// near [`MAX_RAW_CODE_BYTES`], the only bound that existed. `rebuild_index` holds the embedder
-/// and database locks for its whole run, so one such file in a knowledge base stops every
-/// request the server has.
+/// near [`MAX_RAW_CODE_BYTES`], the only bound that existed. [`crate::indexer::rebuild_index`]
+/// holds the embedder and database locks for its whole run, so one such file in a knowledge
+/// base stops every request the server has.
 ///
 /// The bound is on the input, not on a clock: a wall-clock budget would let the same file
 /// produce different chunks on different machines, and those chunks are the index. Definitions
