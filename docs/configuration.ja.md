@@ -256,15 +256,22 @@ config ファイルではなくコマンドライン全体を握っている。g
 // repo-root/.mcp.json
 {
   "mcpServers": {
-    "kb": { "command": "groove", "args": ["serve"] }
+    "kb": { "command": "groove", "args": ["serve", "--config", "./groove.toml"] }
   }
 }
 ```
 
 `groove.toml` を `.mcp.json` の隣にコミットしておけば、Claude Code が
 プロジェクトを開いた時点で `groove serve` がリポジトリルートから起動し、
-CWD 探索でその `groove.toml` を拾う。`.mcp.json` 側に引数を書く必要が
-無くなる。
+`--config` がすぐ隣にあるそのファイルを名指しする。
+
+**名指しすることが「効かせる」ということ。** 省いても CWD 探索はそのファイルを
+見つけるが、**信頼しない config として扱う** — まさにこの節が扱っている形
+(自分で指した config ではなく、groove が見つけた config) だからだ。
+Markdown 以外のプロジェクト KB は Markdown だけとして提供されることになる。
+この config を読む他の `groove` コマンドにも同じ引数が要り、**特に `index`**:
+訪れなかった document を削除するので、既定の parser 集合で再構築すると
+Markdown 以外が索引から消える。
 
 ### 例: 1 セッションで複数 KB を併用
 

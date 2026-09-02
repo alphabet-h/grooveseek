@@ -268,14 +268,22 @@ groove can help there; that is what your MCP client's approval prompt is for.
 // repo-root/.mcp.json
 {
   "mcpServers": {
-    "kb": { "command": "groove", "args": ["serve"] }
+    "kb": { "command": "groove", "args": ["serve", "--config", "./groove.toml"] }
   }
 }
 ```
 
 Commit `groove.toml` next to `.mcp.json`. Opening the project in Claude Code
-launches `groove serve` from the repo root, the CWD lookup picks up
-the project's `groove.toml`, and `.mcp.json` stays minimal.
+launches `groove serve` from the repo root, and `--config` names the file that
+is sitting right there.
+
+**Naming it is what makes it count.** Left off, the CWD lookup would still find
+the file — and then treat it as untrusted, because that is exactly the shape
+this section is about: a config groove found rather than one you pointed at. A
+project KB of anything but Markdown would be served as Markdown only. Every
+other `groove` command run against this config wants the same argument, `index`
+most of all: it deletes the documents it did not visit, so a rebuild with the
+default parser set removes the non-Markdown ones from the index.
 
 ### Example: multiple KBs in the same Claude Code session
 
