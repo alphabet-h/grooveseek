@@ -257,6 +257,86 @@ fn a_library_without_the_contract_is_refused_by_the_symbol_it_lacks() {
 }
 
 // ---------------------------------------------------------------------------
+// An export that hands back NULL is refused, not dereferenced
+// ---------------------------------------------------------------------------
+
+/// A plugin that exports the contract and hands back no grammar is refused with a sentence.
+///
+/// This is the one malformed shape that used to end the process instead: `abi_version`
+/// dereferences the parse-table pointer with no check of its own, so the run died where every
+/// other bad plugin gets a line naming the file and the reason. Under the Windows service,
+/// which discards stdio, it died silently.
+///
+/// The fixture is hand-written because [`groove_grammar_abi::groove_grammar_plugin`] cannot
+/// express it — the macro builds this export from a real grammar's `LanguageFn`.
+#[test]
+fn a_plugin_that_hands_back_no_grammar_is_refused_rather_than_dereferenced() {
+    let layout = TempKbLayout::new("groove-plugin-nullgrammar");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_null_language");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a NULL grammar must fail:\n{stderr}");
+    assert!(
+        stderr.contains("its grammar export returned NULL"),
+        "expected the NULL grammar to be named as the reason:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// "No tags query", written the obvious way, is refused rather than read.
+///
+/// A NULL pointer with a length of zero is what a plugin author reaches for to say the grammar
+/// has no tags query, and `slice::from_raw_parts` requires a non-NULL pointer even then. So the
+/// friendliest possible mistake was undefined behaviour.
+#[test]
+fn a_null_tags_query_is_refused_rather_than_read_as_an_empty_one() {
+    let layout = TempKbLayout::new("groove-plugin-nulltags");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_null_tags");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a NULL tags query must fail:\n{stderr}");
+    assert!(
+        stderr.contains("its tags query export returned NULL"),
+        "expected the NULL tags query to be named as the reason:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// The pointer the loader checks has to be the pointer it uses.
+///
+/// `tree_sitter::Language` can only be built by *calling* a `LanguageFn`, so handing it the
+/// plugin's own export would put the check and the use one call apart. This fixture answers
+/// with a real parse table once and NULL after, which nothing in the ABI forbids — so a loader
+/// that checked the first answer would dereference the second, and the run would end without a
+/// word instead of being refused.
+///
+/// The refusal it does reach is the extension mismatch, several checks later. Reaching a later
+/// check at all is the evidence.
+#[test]
+fn a_grammar_export_that_answers_twice_is_used_on_the_answer_that_was_checked() {
+    let layout = TempKbLayout::new("groove-plugin-flaky");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_flaky_language");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a mismatched extension must fail:\n{stderr}");
+    assert!(
+        stderr.contains("but the id it was loaded for stands for"),
+        "expected the run to reach the extension check, which it can only do if the table it \
+         verified is the table it used:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+// ---------------------------------------------------------------------------
 // The declared extension has to be the one the id stands for
 // ---------------------------------------------------------------------------
 

@@ -267,3 +267,25 @@ name = "groove_grammar_claims_rs"
 path = "tests/fixtures/grammar_plugins/claims_rs.rs"
 crate-type = ["cdylib"]
 
+# The two below are hand-written rather than built by `groove_grammar_plugin!`, and neither
+# needs `grammar-rust`: the macro cannot express a NULL export, and a fixture that carries a
+# real parse table would need a grammar crate to test something that has nothing to do with
+# one. So these two are the only grammar fixtures a `--no-default-features` build still has.
+[[example]]
+name = "groove_grammar_null_language"
+path = "tests/fixtures/grammar_plugins/null_language.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_null_tags"
+path = "tests/fixtures/grammar_plugins/null_tags.rs"
+crate-type = ["cdylib"]
+
+# Needs `grammar-rust`, unlike the two above: it has to hand over a *real* parse table the
+# first time before it starts answering NULL, and a fixture with no real table to hand over
+# would be `null_language.rs` rather than this one.
+[[example]]
+name = "groove_grammar_flaky_language"
+path = "tests/fixtures/grammar_plugins/flaky_language.rs"
+crate-type = ["cdylib"]
+
