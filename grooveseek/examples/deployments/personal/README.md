@@ -28,11 +28,17 @@ stdio.
 2. **Decide where the KB lives**. For example `~/notes/` (personal notes) or `~/projects/<repo>/docs/` (project-scoped).
 3. **Pick a config location**. Two natural options — see [Config file discovery](../../../../docs/configuration.md#config-file-discovery):
    - **Project-scoped**: drop both `groove.toml` and `.mcp.json` next to your project (commit them — `groove.toml` is meant to be shared). **The `.mcp.json` here names the file with `--config`, and that is not a style choice**: a `groove.toml` groove only *found* is honoured in part, and `[parsers]` is one of the keys reset to its default, so a project-scoped config that opts into `.txt`, PDFs or source code would silently index Markdown alone. See [Trusted and untrusted config locations](../../../../docs/configuration.md#trusted-and-untrusted-config-locations).
-   - **Global**: place `groove.toml` next to the binary (`~/.local/bin/groove.toml` or `%USERPROFILE%\bin\groove.toml`) so every project sees the same defaults. The binary's own directory is trusted, so `--config` is not needed for this one.
+   - **Global**: place `groove.toml` next to the binary (`~/.local/bin/groove.toml` or `%USERPROFILE%\bin\groove.toml`) so every project sees the same defaults. The binary's own directory is trusted, so `--config` is not needed — **delete `"--config", "./groove.toml"` from `.mcp.json`** if you take this route. A `--config` naming a file that is not there is an error, not a fallback to discovery.
 4. **Edit `groove.toml`**: set `kb_path` to the absolute path of your KB. Adjust the model and reranker if the defaults don't match your language.
-5. **Build the initial index**:
+5. **Build the initial index** — **naming the config, for the same reason `.mcp.json` does**. `groove index` discovers its config like any other command, so leaving `--config` off here would build the first index with `[parsers]` reset to Markdown alone, and nothing later rebuilds it: `serve` opens the index it finds rather than re-indexing.
 
    ```bash
+   # Project-scoped: run this from the directory holding groove.toml
+   groove index --config ./groove.toml --kb-path /absolute/path/to/kb
+   ```
+
+   ```bash
+   # Global (groove.toml beside the binary): no --config, that location is trusted
    groove index --kb-path /absolute/path/to/kb
    ```
 
