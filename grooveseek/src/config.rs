@@ -3461,10 +3461,11 @@ lambda = 0.5
     /// R4 keeps its own coverage now that R5 stands in front of it.
     ///
     /// After R5 no discovered config can enable a plugin language, so
-    /// [`Self::resolve_grammar_dir`] is no longer reached from
-    /// [`Self::build_parser_registry`] and the substitution cannot be observed
-    /// end to end. It is still made, and this is the test that says so -- so
-    /// that "unreachable, therefore delete it" fails here rather than silently.
+    /// [`crate::config::Config::resolve_grammar_dir`] is no longer reached from
+    /// [`crate::config::Config::build_parser_registry`] and the substitution
+    /// cannot be observed end to end. It is still made, and this is the test
+    /// that says so -- so that "unreachable, therefore delete it" fails here
+    /// rather than silently.
     #[test]
     fn the_grammar_directory_is_still_replaced_when_no_parser_asks_for_it() {
         let dir = TempDir::new("groove-untrusted-grammar-and-parsers");

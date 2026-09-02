@@ -15,7 +15,7 @@
 //! `#[ignore]` like the rest of the model-loading tests.
 //!
 //! One test reaches that same point through `serve --port` rather than `index`:
-//! [`a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory`]. Its input
+//! [`crate::a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory`]. Its input
 //! is an untrusted config, so since R5 (AV-05) no plugin language is enabled at all and
 //! `index` would have nothing left to refuse — it would go on to open a database and load a
 //! model. `serve --port` on the default stdio transport is refused after the registry is built
