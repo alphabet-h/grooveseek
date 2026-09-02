@@ -78,10 +78,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   already means Markdown alone, so there is nothing quieter to fall back to.
   `[parsers.code]` goes with it, having no parser left to configure.
   **If you keep a `groove.toml` beside a project and rely on it to index
-  anything but Markdown, name it: `groove serve --config ./groove.toml`.** The
-  `personal` deployment recipe now does that, for this reason; the
-  `intranet-http` one already did. A config next to the binary, or one
-  `groove service install` placed, is trusted as before and needs no change.
+  anything but Markdown, name it — on `index` as well as on `serve`:**
+  `groove index --config ./groove.toml --kb-path <kb>`. Naming it only when
+  serving leaves the index itself built from the default set, and `serve` opens
+  the index it finds rather than rebuilding it. The `personal` deployment recipe
+  now names it in both places, for this reason; the `intranet-http` one already
+  did. A config next to the binary, or one `groove service install` placed, is
+  trusted as before and needs no change — and `--config` naming a file that is
+  not there is an error rather than a fallback, so do not add it to a setup that
+  relies on the binary-side location.
 
 ### Fixed
 
