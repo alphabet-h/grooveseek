@@ -67,6 +67,7 @@ intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.
 ## リポジトリ構成
 
 - `grooveseek/src/parser/` — `Parser` trait + `Registry` (形式ごとに impl 1 個)
+- `grooveseek/src/parser/code/` — tree-sitter でソースコードを定義単位にチャンク化 (v1.2.0+)。`plugin.rs` はバイナリに焼き込まれていない grammar を開く側 (v1.3.0+)
 - `grooveseek/src/indexer.rs` — `walkdir` → パース → 埋め込み → 格納のパイプライン
 - `grooveseek/src/db.rs` + `grooveseek/src/db/` — SQLite + sqlite-vec + FTS5。v0.15.0 で分割: `schema.rs` (スキーマ作成 + 前方マイグレーション) / `storage.rs` (CRUD) / `search.rs` (ベクトル KNN・FTS 候補・RRF 融合 = `search_hybrid`、既定 k=60) / `meta.rs` (`index_meta` の key/value) / `fts_query.rs` (クエリを per-token FTS phrase にコンパイル、v0.16.0+。`-term` 除外も担う、v1.1.0+)
 - `grooveseek/src/embedder.rs` — `fastembed-rs` ラッパ (embedding + cross-encoder reranker)
@@ -88,6 +89,8 @@ intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.
 - `grooveseek/src/test_support.rs` — テスト共有ヘルパ。特に `unique_temp_path` (本リポジトリは意図的に `tempfile` crate を使わない。理由は同ファイルのコメント参照)
 - `crates/groove-tray/` — Windows system tray モニタ (`groove-tray.exe`、v0.9.0+)
 - `crates/groove-svc/` — scheduled task が起動する Windows hidden-console launcher (v0.9.1+)
+- `crates/groove-grammar-abi/` — tree-sitter grammar を受け渡す契約。焼き込み grammar と全 plugin が同じ規則に従う (v1.2.0+)
+- `crates/groove-grammar-python/` — Python grammar を読み込み可能な `cdylib` として提供。独立した release asset として配布 (v1.3.0+)
 - `grooveseek/tests/` — 統合テスト、`grooveseek/benches/` — criterion ベンチ
 
 詳細は [docs/ARCHITECTURE.ja.md](./docs/ARCHITECTURE.ja.md) を参照。

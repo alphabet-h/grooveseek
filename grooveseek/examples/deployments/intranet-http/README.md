@@ -43,9 +43,17 @@ machines on the same intranet over Streamable HTTP.
    sudo cp -r ./knowledge-base /srv/groove/
    sudo chown -R groove:groove /srv/groove/
    ```
-3. Drop `groove.toml` from this directory at `/srv/groove/groove.toml`
-   (CWD discovery — the systemd unit sets `WorkingDirectory=/srv/groove`).
+3. Drop `groove.toml` from this directory at `/srv/groove/groove.toml`.
    Edit `kb_path`, `model`, and `[transport.http].bind` to taste.
+
+   **Every command below names it with `--config`, and that is not a style
+   choice.** Naming a config is what makes groove *trust* it. A config groove
+   only finds — from the working directory, or from a `.git` ancestor — has
+   `fastembed_cache_dir`, `allowed_hosts`, `allowed_origins` and a
+   non-loopback `bind` stripped out of it, because a file found that way is
+   one anyone who can write to the directory could have put there. Every key
+   this recipe depends on is on that list. See
+   [Trusted and untrusted config locations](../../../../docs/configuration.md#trusted-and-untrusted-config-locations).
 
    **If clients connect from other machines, set
    `[transport.http].allowed_hosts` as well.** It defaults to loopback only
@@ -73,10 +81,15 @@ machines on the same intranet over Streamable HTTP.
 
    ```bash
    sudo -u groove /usr/local/bin/groove index \
-       --kb-path /srv/groove/knowledge-base
+       --config /srv/groove/groove.toml
    ```
 
    Expect minutes the first time (model download + embedding generation).
+
+   The config is named here for a second reason on top of step 3's: it carries
+   `model`, and an index is built with one embedding model and can only be
+   read with the same one. Indexing without it would use the built-in default
+   and produce an index the server then refuses at startup.
 6. Install the systemd unit:
 
    ```bash

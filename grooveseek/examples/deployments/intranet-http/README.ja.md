@@ -42,9 +42,17 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
    sudo cp -r ./knowledge-base /srv/groove/
    sudo chown -R groove:groove /srv/groove/
    ```
-3. このディレクトリの `groove.toml` を `/srv/groove/groove.toml` に置く
-   (CWD 探索 — systemd unit が `WorkingDirectory=/srv/groove` を設定する)。
+3. このディレクトリの `groove.toml` を `/srv/groove/groove.toml` に置く。
    `kb_path` / `model` / `[transport.http].bind` を環境に合わせる
+
+   **以下のコマンドはすべて `--config` で名指しする。これは書き方の好みではない。**
+   名指しすることが、groove がその config を**信頼する**条件になっている。
+   groove が見つけただけの config (working directory や `.git` の祖先から) は、
+   `fastembed_cache_dir` / `allowed_hosts` / `allowed_origins` / 非 loopback の
+   `bind` が落とされる — そうやって見つかるファイルは、そのディレクトリに
+   書ける者なら誰でも置けたものだから。**このレシピが依存するキーは全部その
+   リストに載っている**。
+   [信頼する置き場所 / しない置き場所](../../../../docs/configuration.ja.md#信頼する置き場所--しない置き場所) を参照
 
    **他マシンから接続させるなら `[transport.http].allowed_hosts` も設定する。**
    既定は DNS rebinding 対策として loopback のみ (`localhost` / `127.0.0.1` /
@@ -71,10 +79,15 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
 
    ```bash
    sudo -u groove /usr/local/bin/groove index \
-       --kb-path /srv/groove/knowledge-base
+       --config /srv/groove/groove.toml
    ```
 
    初回はモデル DL + embedding 生成で数分かかる
+
+   ここで config を名指しする理由は手順 3 のものに加えてもう 1 つある:
+   config は `model` を持っており、**index は 1 つの埋め込みモデルで作られ、
+   同じモデルでしか読めない**。名指ししないと組み込み既定のモデルで索引され、
+   サーバが起動時にその index を拒否する
 6. systemd unit インストール:
 
    ```bash

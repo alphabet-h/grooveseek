@@ -64,7 +64,7 @@ groove のソース構造とデータフロー。コードを拡張・修正す�
 ## データフロー
 
 ```
-.md / .txt / .pdf / .docx / .xlsx / .pptx ファイル
+.md / .txt / .pdf / .docx / .xlsx / .pptx / .rs ファイル (.py は plugin が要る)
 (Registry::extensions() でフィルタ。既定で有効なのは .md のみ)
      │
      ▼ walkdir
@@ -163,3 +163,6 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 - **`indicatif`** 0.18 — `groove index --progress` の TTY プログレスバー (v0.7.8 / D-10 追加)。MSRV 1.70+、binary size 約 +150 KB。stderr の TTY 自動検出は `std::io::IsTerminal` (Rust 1.70+ stdlib) を使用
 - **`wide`** 0.7 — pure-rust SIMD プリミティブ (`f32x8`)、MMR cosine kernel で使用 (v0.7.2 / feature-31 で追加)
 - **`tray-icon`** 0.24 + **`tao`** 0.35 + **`image`** 0.25 + **`tracing-appender`** 0.2 + **`winresource`** 0.1 (build-dep) — `groove-tray` crate の Windows 限定 deps (v0.9.0 / feature-44 で追加)。`tray-icon` が muda ベースの context menu + icon swap、`tao` が Win32 event loop、`image` が embed PNG status icon の RGBA decode、`tracing-appender` が daily rotating tray log、`winresource` が `assets/app.ico` を exe icon として embed。すべて `target_os = "windows"` で gate され、非 Windows workspace build では skip。
+- **`tree-sitter`** 0.26 + **`tree-sitter-tags`** 0.26 + **`tree-sitter-language`** 0.1 — ソースコードのパース (v1.2.0 / feature-56 で追加)。`tree-sitter` が runtime、`tree-sitter-tags` が grammar 同梱の `tags.scm` を使って parse tree を定義列へ変換、`tree-sitter-language` は grammar が parse table を渡すための薄い crate — 0.23 以降の grammar は runtime ではなくこちらに依存するので、別々に作られた grammar が 1 つの runtime を共有できる。`[workspace.dependencies]` に置いてあるのはそのため (古い grammar を混ぜると runtime が 2 つ解決される)
+- **`tree-sitter-rust`** 0.24 — optional、既定 on の `grammar-rust` feature 配下。**焼き込まれる唯一の grammar** で、バイナリへの上乗せは 1 MB 強 (v1.2.0 / feature-56 で追加)。他の言語は plugin として届く = [ADR-0013](decisions/0013-compile-in-one-grammar-and-load-the-rest.ja.md)
+- **`libloading`** 0.9 — grammar ディレクトリからの `dlopen` (v1.3.0 / feature-56 で追加)。feature 配下ではなく無条件: loader があって初めて plugin の id が解決可能になるため。portable な `Library::new` ではなく OS 固有 API を使うのは、plugin 自身の依存をどのディレクトリから探すかを flag で決める必要があるから (既定の探索順はカレントディレクトリを含む)

@@ -16,12 +16,24 @@ Type=simple
 User=groove
 Group=groove
 
-# CWD = /srv/groove so that Config::discover() picks up
-# /srv/groove/groove.toml automatically (priority 2 — CWD).
+# The index, the database and the config all live here.
 WorkingDirectory=/srv/groove
 
-# `serve` reads transport / kb_path / model from groove.toml — keep ExecStart minimal.
-ExecStart=/usr/local/bin/groove serve
+# `--config` names the file instead of letting discovery find it, and naming it
+# is what makes it *trusted*. A config groove only discovers — from the working
+# directory, or from a .git ancestor — has `fastembed_cache_dir`,
+# `allowed_hosts`, `allowed_origins` and a non-loopback `bind` stripped out of
+# it, because a file found that way is one anyone who can write to the
+# directory could have put there.
+#
+# Discovered, this unit would therefore ignore the `fastembed_cache_dir` in
+# groove.toml and fall back to the OS cache directory — which `ProtectSystem`
+# and `ProtectHome` below make unwritable, since `ReadWritePaths=` grants the
+# one path the config names. The model download fails, and nothing about the
+# error says the config was the reason.
+#
+# See "Trusted and untrusted config locations" in docs/configuration.md.
+ExecStart=/usr/local/bin/groove serve --config /srv/groove/groove.toml
 
 # Restart on transient failures (network blips, OOM kills, etc.).
 Restart=on-failure

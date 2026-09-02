@@ -64,6 +64,8 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 9. One DNS-rebinding gate, owned here | [en](decisions/0009-one-dns-rebinding-gate.md) | [ja](decisions/0009-one-dns-rebinding-gate.ja.md) |
 | 10. Settle the three command-line questions ADR-0008 left open | [en](decisions/0010-settle-what-the-1-0-command-line-freezes.md) | [ja](decisions/0010-settle-what-the-1-0-command-line-freezes.ja.md) |
 | 11. Exclude a term from both halves of the hybrid search | [en](decisions/0011-exclude-a-term-from-both-halves-of-the-search.md) | [ja](decisions/0011-exclude-a-term-from-both-halves-of-the-search.ja.md) |
+| 12. Chunk code at its definitions and fill the gaps by line | [en](decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.md) | [ja](decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.ja.md) |
+| 13. Compile in one grammar and load the rest | [en](decisions/0013-compile-in-one-grammar-and-load-the-rest.md) | [ja](decisions/0013-compile-in-one-grammar-and-load-the-rest.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and
