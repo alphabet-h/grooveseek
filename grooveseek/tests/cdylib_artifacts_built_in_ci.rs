@@ -1,5 +1,6 @@
 //! AV-02: a `cdylib` no target depends on must be *built* by the job whose
-//! tests open it, or those tests fail on an artefact that was never produced.
+//! tests open it, and built *before* them, or those tests fail on an artefact
+//! that was never produced.
 //!
 //! `cargo test` builds the `[[example]]` fixtures beside it — it carries no
 //! target filter, so example targets are in scope — but it does not build a
@@ -15,16 +16,24 @@
 //! missing. The test was right, the workflow had simply never been told.
 //!
 //! So this guard pins the two lists to each other, the way
-//! `bench_targets_run_in_ci.rs` pins `[[bench]]` targets to the `--bench`
-//! flags: every workspace member that produces a `cdylib` must be named by a
-//! `cargo build -p <name>` step in the job that runs `--include-ignored`, and
-//! a `-p` naming a package that is not one must be reported too, because a
-//! misspelled package name builds nothing and says so only in that job's log.
+//! [`crate::common::workflow`]'s other caller pins `[[bench]]` targets to the
+//! `--bench` flags: every workspace member that produces a `cdylib` must be
+//! named by a `cargo build -p <name>` step **earlier in the same job** than the
+//! one that runs `--include-ignored`, and a `-p` naming a package that is not
+//! one must be reported too, because a misspelled package name builds nothing
+//! and says so only in that job's log.
 //!
-//! Deriving the list from the manifest rather than writing it here is what
+//! The ordering half is not decoration: a build step moved below the tests
+//! still appears in the job, so a guard that only asked "is it there" would
+//! pass while the tests ran first and failed on the missing file.
+//!
+//! Deriving the list from the manifests rather than writing it here is what
 //! makes a *future* grammar crate covered on the day it is added: a new
 //! `crates/groove-grammar-<lang>` with `crate-type = ["cdylib"]` fails this
-//! test until the workflow builds it.
+//! test until the workflow builds it. The members come from
+//! [`crate::common::source::workspace_members`] rather than a second reading of
+//! the root manifest, so this guard cannot disagree with the source-tree guards
+//! about what the workspace is.
 //!
 //! The workflow is read through [`crate::common::workflow`], so only what a
 //! `run:` step runs is looked at; a package named in a comment does not count.
@@ -32,6 +41,7 @@
 mod common;
 
 use common::docs::repo_root;
+use common::source::workspace_members;
 use common::workflow::run_steps;
 
 /// The `run:` text that marks the job whose tests need these artefacts.
@@ -44,35 +54,20 @@ const IGNORED_TESTS_MARKER: &str = "--include-ignored";
 
 /// Every workspace member whose manifest declares a `cdylib`.
 ///
-/// Read from `[workspace] members` and each member's `[lib] crate-type`, so a
-/// crate added later is covered without editing this file. `[[example]]`
-/// cdylibs are deliberately not here: they live in `grooveseek`'s own manifest
-/// and a plain `cargo test` builds them.
+/// The member list is [`crate::common::source::workspace_members`]; only the
+/// per-member `[lib] crate-type` is read here. `[[example]]` cdylibs are
+/// deliberately not included: they live in `grooveseek`'s own manifest and a
+/// plain `cargo test` builds them.
 fn cdylib_packages() -> Vec<String> {
-    let root = repo_root().join("Cargo.toml");
-    let text =
-        std::fs::read_to_string(&root).unwrap_or_else(|e| panic!("read {}: {e}", root.display()));
-    let manifest: toml::Value =
-        toml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", root.display()));
-
-    let members = manifest
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
-        .unwrap_or_else(|| panic!("{} has no [workspace] members array", root.display()));
-
     let mut out = Vec::new();
-    for member in members {
-        let dir = member
-            .as_str()
-            .unwrap_or_else(|| panic!("a non-string member in {}: {member}", root.display()));
-        let path = repo_root().join(dir).join("Cargo.toml");
+    for member in workspace_members() {
+        let path = repo_root().join(&member).join("Cargo.toml");
         let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let member_manifest: toml::Value =
-            toml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let manifest: toml::Value = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("could not parse {}: {e}", path.display()));
 
-        let is_cdylib = member_manifest
+        let is_cdylib = manifest
             .get("lib")
             .and_then(|lib| lib.get("crate-type"))
             .and_then(|kinds| kinds.as_array())
@@ -81,7 +76,7 @@ fn cdylib_packages() -> Vec<String> {
             continue;
         }
 
-        let name = member_manifest
+        let name = manifest
             .get("package")
             .and_then(|p| p.get("name"))
             .and_then(|n| n.as_str())
@@ -116,13 +111,13 @@ fn packages_built_by(commands: &[String]) -> Vec<String> {
 }
 
 #[test]
-fn every_cdylib_the_ignored_tests_open_is_built_by_that_job() {
+fn every_cdylib_the_ignored_tests_open_is_built_before_them() {
     let declared = cdylib_packages();
     // Anti-vacuity: if the manifest walk above ever stops finding them, the
     // comparison below would pass by examining nothing at all.
     assert!(
         !declared.is_empty(),
-        "no workspace member declaring `crate-type = [\"cdylib\"]` was found — either \
+        "no workspace member declaring `crate-type = [\"cdylib\"]` was found. Either \
          they were all removed (then this guard has nothing left to protect) or the \
          manifest walk stopped seeing them (then this guard silently stopped guarding)"
     );
@@ -133,36 +128,39 @@ fn every_cdylib_the_ignored_tests_open_is_built_by_that_job() {
         .join("nightly.yml");
     let workflow = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "read {}: {e} — the ignored tests run there; if the workflow moved, \
-             point this guard at its new home",
+            "could not read {}: {e}. The ignored tests run there; if the workflow \
+             moved, point this guard at its new home",
             path.display()
         )
     });
     let steps = run_steps(&workflow).unwrap_or_else(|why| panic!("{} {why}", path.display()));
 
-    // The job is found by what it runs, not by its name. A line the reader
+    // The step is found by what it runs, not by its name. A line the reader
     // could not place is kept as written, for the same reason the bench guard
     // keeps it: a line dropped in silence shrinks the set of commands, and a
     // smaller set agrees more easily.
-    let job = steps
+    let marker = steps
         .iter()
         .find(|step| {
             step.commands
                 .iter()
                 .any(|command| command.contains(IGNORED_TESTS_MARKER))
         })
-        .map(|step| step.job.clone())
         .unwrap_or_else(|| {
             panic!(
-                "no step in {} runs `{IGNORED_TESTS_MARKER}` — the ignored tests are what \
-                 open a published grammar, so if they moved, this guard has to move with them",
+                "no step in {} runs `{IGNORED_TESTS_MARKER}`. The ignored tests are what \
+                 open a published grammar, so if they moved, this guard has to move with \
+                 them",
                 path.display()
             )
         });
 
+    // Only steps *before* the marker, in its job. A build moved below the tests
+    // is still a step of that job, so position is the whole point: the tests
+    // would run first and fail on a file that does not exist yet.
     let commands: Vec<String> = steps
         .iter()
-        .filter(|step| step.job == job)
+        .filter(|step| step.job == marker.job && step.index < marker.index)
         .flat_map(|step| {
             let unread = step.unread.iter().map(|line| line.raw.clone());
             step.commands.iter().cloned().chain(unread)
@@ -173,10 +171,12 @@ fn every_cdylib_the_ignored_tests_open_is_built_by_that_job() {
     let missing: Vec<&String> = declared.iter().filter(|p| !built.contains(p)).collect();
     assert!(
         missing.is_empty(),
-        "these workspace members produce a `cdylib` but are never built by the `{job}` job \
-         of {}: {missing:?}. `cargo test` does not build a cdylib nothing depends on \
+        "these workspace members produce a `cdylib` but are not built before {} of {}: \
+         {missing:?}. `cargo test` does not build a cdylib nothing depends on \
          (rust-lang/cargo#8311), so a test that opens one fails on a file that was never \
-         produced. Add `cargo build -p <name>` to that job.",
+         produced. Add `cargo build -p <name>` to that job, above the step that runs the \
+         tests",
+        marker.position(),
         path.display()
     );
 
@@ -187,9 +187,10 @@ fn every_cdylib_the_ignored_tests_open_is_built_by_that_job() {
         .collect();
     assert!(
         unknown.is_empty(),
-        "the `{job}` job of {} runs `cargo build -p` for {unknown:?}, which no workspace \
+        "the `{}` job of {} runs `cargo build -p` for {unknown:?}, which no workspace \
          member declaring a cdylib is named. A package name cargo cannot resolve fails the \
-         step; one it can resolve but that produces no cdylib builds nothing this job needs.",
+         step; one it can resolve but that produces no cdylib builds nothing this job needs",
+        marker.job,
         path.display()
     );
 }
