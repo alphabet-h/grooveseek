@@ -92,6 +92,28 @@ rebuild, but naming fewer means edits to those files never trigger one.
 "command": "KB_PATH=/abs/path/to/knowledge-base KB_EXTENSIONS='md txt' /abs/path/to/rebuild-on-edit.sh"
 ```
 
+### `GROOVE_CONFIG` — set it if `groove.toml` is beside the project
+
+`groove index` discovers its config like any other command, and a discovered
+config is honoured only in part: `[parsers]` is reset to Markdown alone
+([Trusted and untrusted config locations](../../../docs/configuration.md#trusted-and-untrusted-config-locations)).
+Here that is not merely incomplete. **`groove index` deletes the documents it
+did not visit**, so a rebuild that collects only `.md` removes every `.txt`,
+PDF, Office document and source file already in the index — and a hook fires on
+the next edit, without anyone deciding to run it.
+
+So name the file when it lives beside the project:
+
+```json
+"command": "KB_PATH=/abs/path/to/knowledge-base GROOVE_CONFIG=/abs/path/to/groove.toml /abs/path/to/rebuild-on-edit.sh"
+```
+
+Leave it unset when `groove.toml` sits next to the `groove` binary, or was
+placed by `groove service install` — those locations are trusted and nothing is
+reset. The script checks that the file exists and skips the rebuild with a
+message if it does not, rather than letting `--config path not found` fail the
+hook on every edit.
+
 ## Notes
 
 - **Concurrency**: SQLite is configured in WAL mode, so a running MCP server

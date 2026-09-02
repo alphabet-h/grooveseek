@@ -71,6 +71,26 @@ Claude Code の [PostToolUse hook](https://docs.claude.com/en/docs/claude-code/h
 "command": "KB_PATH=/abs/path/to/knowledge-base KB_EXTENSIONS='md txt' /abs/path/to/rebuild-on-edit.sh"
 ```
 
+### `GROOVE_CONFIG` — `groove.toml` がプロジェクトの隣にあるなら設定する
+
+`groove index` も他のコマンドと同じように config を discover し、見つけただけの config は
+一部しか効かない — `[parsers]` は Markdown のみへ戻される
+([信頼する置き場所 / しない置き場所](../../../docs/configuration.ja.md#信頼する置き場所--しない置き場所))。
+ここではそれが「不完全」で済まない。**`groove index` は訪れなかった document を削除する**ので、
+`.md` しか集めない rebuild は、索引済みの `.txt` / PDF / Office 文書 / ソースコードを
+すべて消す — しかも hook は次の編集で、誰も実行を決めないまま発火する。
+
+`groove.toml` がプロジェクトの隣にあるなら名指しすること:
+
+```json
+"command": "KB_PATH=/abs/path/to/knowledge-base GROOVE_CONFIG=/abs/path/to/groove.toml /abs/path/to/rebuild-on-edit.sh"
+```
+
+`groove` バイナリの隣にある場合や `groove service install` が置いた場合は未設定でよい
+(信頼される置き場なので何も戻されない)。スクリプトはファイルの存在を確認し、無ければ
+`--config path not found` で毎回の編集ごとに hook を失敗させる代わりに、メッセージを出して
+rebuild をスキップする。
+
 ## 補足
 
 - **並行実行**: SQLite は WAL モードで構成されているため、起動中の MCP サーバと hook トリガーの `groove index` が共存できる。hook は rebuild 完了までツール実行をブロックするが、小さな KB では気にならないほど速い

@@ -78,15 +78,20 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   already means Markdown alone, so there is nothing quieter to fall back to.
   `[parsers.code]` goes with it, having no parser left to configure.
   **If you keep a `groove.toml` beside a project and rely on it to index
-  anything but Markdown, name it — on `index` as well as on `serve`:**
-  `groove index --config ./groove.toml --kb-path <kb>`. Naming it only when
-  serving leaves the index itself built from the default set, and `serve` opens
-  the index it finds rather than rebuilding it. The `personal` deployment recipe
-  now names it in both places, for this reason; the `intranet-http` one already
-  did. A config next to the binary, or one `groove service install` placed, is
-  trusted as before and needs no change — and `--config` naming a file that is
-  not there is an error rather than a fallback, so do not add it to a setup that
-  relies on the binary-side location.
+  anything but Markdown, name it — everywhere `groove` runs, not only when
+  serving:** `groove --config ./groove.toml index --kb-path <kb>`. This matters
+  most on `index`, and not because the new index would merely be incomplete:
+  `groove index` deletes the documents it did not visit, so a rebuild that
+  collects only `.md` **removes every `.txt`, PDF, Office document and source
+  file already indexed**. A `PostToolUse` hook fires on the next edit, so for
+  anyone using one that is the first thing that happens after upgrading. The
+  `rebuild-on-edit.sh` recipe now takes `GROOVE_CONFIG` for this, and the
+  `personal` deployment recipe names the config on both `index` and `serve`;
+  `intranet-http` already did. A config next to the binary, or one
+  `groove service install` placed, is trusted as before and needs no change —
+  and `--config` naming a file that is not there is an error rather than a
+  fallback to discovery, so do not add it to a setup that relies on the
+  binary-side location.
 
 ### Fixed
 

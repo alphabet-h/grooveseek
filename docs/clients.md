@@ -100,7 +100,9 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 }
 ```
 
-SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+> **If your `groove.toml` sits beside the project rather than beside the binary, name it here too**: `groove --config /abs/path/groove.toml index`. A discovered config has `[parsers]` reset to Markdown alone ([Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations)), and `groove index` deletes the documents it did not visit — so a hook that rebuilds with the default parser set removes every `.txt`, PDF, Office document and source file already in the index, on the first edit after you upgrade. A config next to the binary, or one `groove service install` placed, is trusted and needs nothing added.
+
+SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md) — it takes `GROOVE_CONFIG` for exactly this. SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
 
 ## Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:

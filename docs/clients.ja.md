@@ -100,7 +100,9 @@ Claude Code セッション内部からナレッジベースを編集する (ま
 }
 ```
 
-`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
+> **`groove.toml` がバイナリの隣ではなくプロジェクトの隣にあるなら、ここでも名指しすること**: `groove --config /abs/path/groove.toml index`。見つけただけの config は `[parsers]` が Markdown のみへ戻され ([信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所))、`groove index` は**訪れなかった document を削除する** — つまり既定の parser 集合で再構築する hook は、アップグレード後の最初の編集で、索引済みの `.txt` / PDF / Office 文書 / ソースコードをすべて索引から消す。バイナリの隣にある config や `groove service install` が置いた config は信頼されるので何も足さなくてよい。
+
+`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照 (まさにこのために `GROOVE_CONFIG` を受け取る)。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
 
 ## Frontmatter スキーマ検証
 ナレッジベースで frontmatter 規約を運用しているなら (例: `title` 必須、`date` は YYYY-MM-DD、`topic` は enum)、以下でファイル毎の違反をチェックできる:
