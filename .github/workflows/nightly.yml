@@ -335,6 +335,19 @@ jobs:
       # table + TOTAL 行のみ出力 (= F-59 「死角を定量化」要件)。
       # `--color never` で ANSI escape を抑制し GITHUB_STEP_SUMMARY の
       # code block 整合性を保つ。
+      # The floor below excludes `crates/groove-grammar-abi/src/lib.rs`, because in a
+      # workspace run the only regions attributed to that file are the exports
+      # `groove_grammar_plugin!` expands into each plugin -- see the exclusion's own
+      # comment. Excluding it there and stopping would leave the crate with no floor
+      # at all, so it gets one here instead: a `-p` run sees its unit tests and reads
+      # 86.36%, well over the same 35.
+      #
+      # First, and on its own: this uses the default `target/llvm-cov-target`, while
+      # the workspace run below writes under `target`, so neither can pick up the
+      # other's counters. It costs one small crate's build.
+      - name: Enforce the floor on the grammar ABI crate, which the workspace run cannot see
+        run: cargo llvm-cov --summary-only --fail-under-file-lines 35 -p groove-grammar-abi
+
       - name: Run coverage (non-ignored only)
         # Driven through `show-env` rather than plain `cargo llvm-cov`, because
         # that form runs `cargo test --tests` internally and `--tests` is a
@@ -442,8 +455,10 @@ jobs:
       #                            86.36% — but that data does not survive the
       #                            merge, so the floor here reads 0% whether the
       #                            crate has tests or not. A tripwire that
-      #                            always fires is not one; check the crate on
-      #                            its own instead.
+      #                            always fires is not one. **The crate is not
+      #                            left ungated**: the step above enforces the
+      #                            same floor against a `-p` run, which does see
+      #                            its unit tests.
       # `report` reuses the data collected above, so this costs seconds.
       - name: Enforce a per-file line-coverage floor
         shell: bash
