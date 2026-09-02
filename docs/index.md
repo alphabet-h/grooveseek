@@ -66,6 +66,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 11. Exclude a term from both halves of the hybrid search | [en](decisions/0011-exclude-a-term-from-both-halves-of-the-search.md) | [ja](decisions/0011-exclude-a-term-from-both-halves-of-the-search.ja.md) |
 | 12. Chunk code at its definitions and fill the gaps by line | [en](decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.md) | [ja](decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.ja.md) |
 | 13. Compile in one grammar and load the rest | [en](decisions/0013-compile-in-one-grammar-and-load-the-rest.md) | [ja](decisions/0013-compile-in-one-grammar-and-load-the-rest.ja.md) |
+| 14. Bound the chunker by the shape of its input, not by a clock | [en](decisions/0014-bound-the-chunker-by-the-shape-of-its-input.md) | [ja](decisions/0014-bound-the-chunker-by-the-shape-of-its-input.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

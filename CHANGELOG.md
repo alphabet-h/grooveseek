@@ -68,6 +68,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   written, as before. Refusing a missing grammar is **not** affected by trust —
   the same failure happens either way.
 
+### Fixed
+
+- **One deeply nested source file no longer stalls indexing.** Working out the
+  scope a definition sits in means walking to the root of the syntax tree, and
+  that walk costs more the deeper the definition is, so the total grows with
+  the cube of the nesting: a single 10 KB file of `mod a{` repeated a thousand
+  times took 64 seconds to index, and the byte ceiling that was supposed to
+  bound this never fired because the file was nowhere near 1 MiB. Since
+  `rebuild_index` holds the embedder and the database for its whole run, one
+  such file in a knowledge base stopped every request the server had. A file
+  holding a definition nested under more than 64 syntax-tree ancestors is now
+  chunked by lines rather than by definition, and tagged `parse:too-deep` so
+  the choice is visible to a search. The file still contributes every byte it
+  has, as [ADR-0012](docs/decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.md)
+  promises; what it loses is the definition metadata. The bound counts
+  ancestors rather than seconds on purpose — a wall-clock budget would let the
+  same file produce different chunks on different machines, and those chunks
+  are the index. Definitions in groove's own sources sit under at most 8
+  ancestors, so real code has eight times the room it uses. An index built
+  before this release keeps its old chunks for files whose content has not
+  changed; `groove index --force` rebuilds them. See
+  [ADR-0014](docs/decisions/0014-bound-the-chunker-by-the-shape-of-its-input.md).
+
 ## [1.2.0] - 2026-08-27
 
 ### Added

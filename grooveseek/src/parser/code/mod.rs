@@ -55,6 +55,26 @@ const MAX_CHUNKS_PER_FILE: usize = 512;
 /// the context that made it worth retrieving.
 pub(crate) const DEFAULT_MAX_CHUNK_CHARS: usize = 3500;
 
+/// Ancestors a definition may sit under before the file is chunked by lines instead.
+///
+/// [`scope_chain`] walks from a definition up to the root for every definition in the file,
+/// and `Node::parent` is a search rather than a pointer, so the cost grows with the cube of
+/// the nesting depth. On one line of `mod a{` repeated, indexing took 316 ms at 125 levels,
+/// 8,191 ms at 500 and 63,989 ms at 1000 — while the file stayed under 10 KB and so never came
+/// near [`MAX_RAW_CODE_BYTES`], the only bound that existed. `rebuild_index` holds the embedder
+/// and database locks for its whole run, so one such file in a knowledge base stops every
+/// request the server has.
+///
+/// The bound is on the input, not on a clock: a wall-clock budget would let the same file
+/// produce different chunks on different machines, and those chunks are the index. Definitions
+/// in this repository's own sources sit under at most 8 ancestors, so this leaves real code
+/// eight times the room it uses.
+//
+// Measured 2026-09-03, release build, both binaries run alternately on the same machine:
+//   depth:  target/release/groove.exe --config <cfg> index --force  (fixtures of `mod a{` x N)
+//   real code: parse every file under grooveseek/src and record the longest walk (62 files)
+const MAX_DEFINITION_SCOPE_DEPTH: usize = 64;
+
 /// Below this many characters (after trimming) a fragment is not worth a chunk of its own.
 ///
 /// The same threshold the quality filter uses for "too short to be worth much", reused rather
@@ -185,6 +205,27 @@ fn chunk_source(
     text: &str,
     path_hint: &str,
 ) -> Result<ParsedDocument> {
+    chunk_source_capped(
+        grammar,
+        budget,
+        bytes,
+        text,
+        path_hint,
+        MAX_DEFINITION_SCOPE_DEPTH,
+    )
+}
+
+/// [`chunk_source`] with the scope bound injected, so a unit test can take the fallback
+/// without building a source deep enough to take it for real (the same split
+/// [`super::pdf`] uses for its page budgets).
+fn chunk_source_capped(
+    grammar: &LoadedGrammar,
+    budget: usize,
+    bytes: &[u8],
+    text: &str,
+    path_hint: &str,
+    scope_limit: usize,
+) -> Result<ParsedDocument> {
     let title = super::txt::derive_title_pub(path_hint);
     let mut ts = tree_sitter::Parser::new();
     ts.set_language(&grammar.language)
@@ -200,6 +241,7 @@ fn chunk_source(
         .map_err(|e| anyhow::anyhow!("{path_hint}: tags query failed: {e:?}"))?;
 
     let mut defs: Vec<Def> = Vec::new();
+    let mut too_deep = false;
     for tag in tags {
         let tag = tag.map_err(|e| anyhow::anyhow!("{path_hint}: tag: {e:?}"))?;
         if !tag.is_definition {
@@ -217,7 +259,18 @@ fn chunk_source(
         let start = node
             .map(|n| doc_comment_start(n, bytes))
             .unwrap_or(tag.range.start);
-        let scope = node.map(|n| scope_chain(n, text)).unwrap_or_default();
+        // Stop at the first definition nested past the bound rather than finishing the file:
+        // every remaining definition would pay the same walk, and the answer is already known.
+        let scope = match node {
+            Some(n) => match scope_chain(n, text, scope_limit) {
+                Some(scope) => scope,
+                None => {
+                    too_deep = true;
+                    break;
+                }
+            },
+            None => Vec::new(),
+        };
         defs.push(Def {
             kind,
             name,
@@ -228,14 +281,28 @@ fn chunk_source(
         });
     }
 
-    link_containment(&mut defs);
-
     let mut pieces: Vec<Piece> = Vec::new();
-    let roots: Vec<usize> = (0..defs.len()).filter(|i| defs[*i].depth == 0).collect();
-    for i in &roots {
-        emit_def(*i, &defs, text, budget, &title, &mut pieces);
+    if too_deep {
+        // The file still contributes every byte it has (ADR-0012); it contributes them as
+        // lines, which is the shape a region no definition covers already gets. Falling back
+        // to the plain-text parser instead would make the whole file one chunk, the shape this
+        // module exists to avoid.
+        tracing::warn!(
+            path = path_hint,
+            limit = scope_limit,
+            "a definition is nested deeper than the limit; chunking this file by lines instead"
+        );
+        defs.clear();
+        let context_parts: Vec<String> = title.iter().cloned().collect();
+        push_gap(0..text.len(), &context_parts, text, budget, &mut pieces);
+    } else {
+        link_containment(&mut defs);
+        let roots: Vec<usize> = (0..defs.len()).filter(|i| defs[*i].depth == 0).collect();
+        for i in &roots {
+            emit_def(*i, &defs, text, budget, &title, &mut pieces);
+        }
+        fill_gaps(&roots, &defs, text, budget, &title, &mut pieces);
     }
-    fill_gaps(&roots, &defs, text, budget, &title, &mut pieces);
 
     pieces.sort_by_key(|p| p.range.start);
     let kept = drop_thin_fragments(pieces, text);
@@ -282,6 +349,12 @@ fn chunk_source(
     if has_error {
         tags_out.push("parse:degraded".to_string());
     }
+    // A separate tag from `parse:degraded`, which answers a different question: that one says
+    // the grammar could not read part of the file, this one says groove declined to chunk a
+    // file it could read. A caller filtering for one does not want the other.
+    if too_deep {
+        tags_out.push("parse:too-deep".to_string());
+    }
     // The source, verbatim -- not the chunks rejoined, which is what the prose parsers do.
     // Rejoining is right when chunks are a lossy view of the document, because then it is the
     // only text that matches what was indexed. Here the chunks already cover every byte, so
@@ -321,16 +394,25 @@ fn doc_comment_start(node: Node, src: &[u8]) -> usize {
     start
 }
 
-/// Names of the enclosing scopes, outermost first.
+/// Names of the enclosing scopes, outermost first, or `None` when the definition sits under
+/// more than `limit` ancestors.
 ///
 /// Walks real parents rather than the definition tree because the two disagree: Rust's tags
 /// query captures `impl` blocks as references, not definitions, so `impl Database` never
 /// becomes a definition node — yet it is exactly the context that tells two `open` methods
 /// apart.
-fn scope_chain(node: Node, text: &str) -> Vec<String> {
+///
+/// This walk is also what makes deeply nested sources expensive, which is why it counts its
+/// steps rather than trusting the input: see [`MAX_DEFINITION_SCOPE_DEPTH`].
+fn scope_chain(node: Node, text: &str, limit: usize) -> Option<Vec<String>> {
     let mut out = Vec::new();
+    let mut steps = 0usize;
     let mut cursor = node.parent();
     while let Some(parent) = cursor {
+        steps += 1;
+        if steps > limit {
+            return None;
+        }
         for field in ["name", "type", "trait"] {
             if let Some(child) = parent.child_by_field_name(field) {
                 if let Some(s) = text.get(child.byte_range()) {
@@ -342,7 +424,7 @@ fn scope_chain(node: Node, text: &str) -> Vec<String> {
         cursor = parent.parent();
     }
     out.reverse();
-    out
+    Some(out)
 }
 
 /// Turn the flat definition list into a containment forest.
@@ -786,6 +868,115 @@ impl Counter {
         parser
             .parse_bytes(src.as_bytes(), "edge.rs", &[])
             .expect("a file of exactly the cap parses");
+    }
+
+    /// `levels` nested modules around one function, on a single line.
+    ///
+    /// Built here rather than committed for the same reason the other fixtures are: a file on
+    /// disk would arrive with whatever line endings the checkout gives it.
+    fn deeply_nested(levels: usize) -> String {
+        let mut src = String::new();
+        for i in 0..levels {
+            src.push_str("mod a");
+            src.push_str(&i.to_string());
+            src.push('{');
+        }
+        src.push_str("pub fn leaf()->u32{7}");
+        for _ in 0..levels {
+            src.push('}');
+        }
+        src.push('\n');
+        src
+    }
+
+    fn parse_capped(src: &str, scope_limit: usize) -> ParsedDocument {
+        let grammar = static_rust::grammar().expect("rust grammar builds");
+        chunk_source_capped(
+            &grammar,
+            DEFAULT_MAX_CHUNK_CHARS,
+            src.as_bytes(),
+            src,
+            "src/lib.rs",
+            scope_limit,
+        )
+        .expect("a nested file still parses")
+    }
+
+    #[test]
+    fn a_definition_nested_past_the_scope_limit_is_chunked_by_lines_rather_than_by_definition() {
+        let doc = parse(&deeply_nested(200), DEFAULT_MAX_CHUNK_CHARS);
+        assert!(!doc.chunks.is_empty(), "the file still has content");
+        assert!(
+            doc.chunks.iter().all(|c| c.symbol_kind.is_none()),
+            "line chunks carry no definition kind, got {:?}",
+            doc.chunks
+                .iter()
+                .map(|c| &c.symbol_kind)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            doc.frontmatter.tags.iter().any(|t| t == "parse:too-deep"),
+            "tags were {:?}",
+            doc.frontmatter.tags
+        );
+    }
+
+    #[test]
+    fn the_scope_limit_is_what_decides_it_rather_than_the_source() {
+        // One source, two bounds. Under the shipped bound it chunks at its definitions; under
+        // a bound of one ancestor the inner function is already too deep and the file takes
+        // the line fallback.
+        let src = "pub mod outer {\n    pub fn inner() -> u32 {\n        7\n    }\n}\n";
+
+        let inside = parse_capped(src, MAX_DEFINITION_SCOPE_DEPTH);
+        assert!(
+            inside.chunks.iter().any(|c| c.symbol_kind.is_some()),
+            "expected definition chunks, got {:?}",
+            inside.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
+        );
+        assert!(
+            !inside
+                .frontmatter
+                .tags
+                .iter()
+                .any(|t| t == "parse:too-deep"),
+            "tags were {:?}",
+            inside.frontmatter.tags
+        );
+
+        let outside = parse_capped(src, 1);
+        assert!(
+            outside.chunks.iter().all(|c| c.symbol_kind.is_none()),
+            "expected line chunks only"
+        );
+        assert!(
+            outside
+                .frontmatter
+                .tags
+                .iter()
+                .any(|t| t == "parse:too-deep"),
+            "tags were {:?}",
+            outside.frontmatter.tags
+        );
+    }
+
+    #[test]
+    fn a_file_chunked_by_lines_still_covers_every_byte() {
+        // ADR-0012 promises a file contributes every byte it has whether or not it parses.
+        // The fallback has to keep that promise too, which is why it fills the file with gap
+        // chunks rather than refusing it.
+        let src = deeply_nested(200);
+        let doc = parse(&src, DEFAULT_MAX_CHUNK_CHARS);
+        // Asserted first so this cannot quietly become a test of the definition path.
+        assert!(
+            doc.frontmatter.tags.iter().any(|t| t == "parse:too-deep"),
+            "this fixture is supposed to take the fallback, tags were {:?}",
+            doc.frontmatter.tags
+        );
+        let seen: String = doc.chunks.iter().map(|c| c.content.as_str()).collect();
+        let seen_ws_free: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
+        let want: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(seen_ws_free, want, "the fallback dropped part of the file");
     }
 
     #[test]
