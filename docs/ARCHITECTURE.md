@@ -64,7 +64,7 @@ Source-level structure and data flow of groove, for contributors extending or mo
 ## Data flow
 
 ```
-.md / .txt / .pdf / .docx / .xlsx / .pptx files
+.md / .txt / .pdf / .docx / .xlsx / .pptx / .rs files (.py needs a plugin)
 (filtered by Registry::extensions(); only .md is on by default)
      │
      ▼ walkdir
@@ -169,3 +169,6 @@ When writing subprocess tests, grep `grooveseek/src/main.rs` for the correspondi
 - **`indicatif`** 0.18 — TTY progress bar for `groove index --progress` (added v0.7.8 / D-10). MSRV 1.70+, ~150 KB binary impact. Auto-detection of stderr TTY uses `std::io::IsTerminal` (Rust 1.70+ stdlib).
 - **`wide`** 0.7 — pure-rust SIMD primitives (`f32x8`) used by the MMR cosine kernel (added in v0.7.2 / feature-31)
 - **`tray-icon`** 0.24 + **`tao`** 0.35 + **`image`** 0.25 + **`tracing-appender`** 0.2 + **`winresource`** 0.1 (build-dep) — Windows-only deps of the `groove-tray` crate (added v0.9.0 / feature-44). `tray-icon` provides the muda-based context menu + icon swap, `tao` the Win32 event loop, `image` decodes embedded PNG status icons to RGBA, `tracing-appender` writes the daily rotating tray log, `winresource` embeds `assets/app.ico` as the exe icon. All gated to `target_os = "windows"` so non-Windows workspace builds skip them.
+- **`tree-sitter`** 0.26 + **`tree-sitter-tags`** 0.26 + **`tree-sitter-language`** 0.1 — source-code parsing (added v1.2.0 / feature-56). `tree-sitter` is the runtime, `tree-sitter-tags` turns a parse tree into definitions using the grammar's own `tags.scm`, and `tree-sitter-language` is the thin crate a grammar hands its parse table over through — grammars from 0.23 onwards depend on it rather than on the runtime, which is what lets grammars built elsewhere share one. It is a `[workspace.dependencies]` entry for that reason: mixing an older grammar in would resolve two runtimes.
+- **`tree-sitter-rust`** 0.24 — optional, behind the default-on `grammar-rust` feature: the one grammar compiled in, at just over a megabyte (added v1.2.0 / feature-56). Every other language arrives as a plugin instead, which is [ADR-0013](decisions/0013-compile-in-one-grammar-and-load-the-rest.md).
+- **`libloading`** 0.9 — `dlopen`s a grammar plugin from the grammar directory (added v1.3.0 / feature-56). Unconditional rather than behind a feature: the loader is what makes a plugin id resolvable at all. The OS-specific half of its API is used rather than `Library::new`, because the flags decide which directories the loader searches for the plugin's own dependencies and the default order includes the current directory.

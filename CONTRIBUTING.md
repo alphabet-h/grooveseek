@@ -70,6 +70,7 @@ The order of the two `cargo test` lines matters on a cold model cache, which is 
 ## Repository layout
 
 - `grooveseek/src/parser/` — `Parser` trait + `Registry` (one impl per file format)
+- `grooveseek/src/parser/code/` — source code chunked one definition at a time via tree-sitter (v1.2.0+); `plugin.rs` is the half that opens a grammar the binary was not built with (v1.3.0+)
 - `grooveseek/src/indexer.rs` — `walkdir` → parse → embed → store pipeline
 - `grooveseek/src/db.rs` + `grooveseek/src/db/` — SQLite + sqlite-vec + FTS5 storage. Split in v0.15.0 into `schema.rs` (creation + forward migrations), `storage.rs` (CRUD), `search.rs` (vector KNN, FTS candidates, RRF fusion — `search_hybrid`, k=60 by default), `meta.rs` (`index_meta` key/value), and `fts_query.rs` (compiling a query into per-token FTS phrases, v0.16.0+, and `-term` exclusions, v1.1.0+)
 - `grooveseek/src/embedder.rs` — `fastembed-rs` wrapper (embeddings + cross-encoder rerankers)
@@ -91,6 +92,8 @@ The order of the two `cargo test` lines matters on a cold model cache, which is 
 - `grooveseek/src/test_support.rs` — shared test helpers, notably `unique_temp_path` (this repo deliberately does not use the `tempfile` crate; see the comment there)
 - `crates/groove-tray/` — Windows system-tray monitor (`groove-tray.exe`, v0.9.0+)
 - `crates/groove-svc/` — Windows hidden-console launcher started by the scheduled task (v0.9.1+)
+- `crates/groove-grammar-abi/` — the contract a tree-sitter grammar is handed across, held to by the compiled-in grammar and by every plugin (v1.2.0+)
+- `crates/groove-grammar-python/` — the Python grammar as a loadable `cdylib`, shipped as its own release asset (v1.3.0+)
 - `grooveseek/tests/` — integration tests; `grooveseek/benches/` — criterion benchmarks
 
 See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.

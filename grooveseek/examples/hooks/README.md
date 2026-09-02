@@ -81,9 +81,10 @@ targets an indexable file under `$KB_PATH`. `Skill` invocations have no file
 path in the payload, so they fall through to an unconditional rebuild (cheap
 thanks to diffing).
 
-Which extensions count is `KB_EXTENSIONS`, defaulting to every format groove
-can parse (`md txt pdf docx xlsx pptx`, matched case-insensitively so
-`Report.PDF` counts too). **Keep it in line with `[parsers].enabled` in your
+Which extensions count is `KB_EXTENSIONS`, defaulting to every format a default
+build can parse (`md txt pdf docx xlsx pptx rs`, matched case-insensitively so
+`Report.PDF` counts too — `py` is left out because it needs a grammar plugin
+placed first). **Keep it in line with `[parsers].enabled` in your
 `groove.toml`**: naming more formats than you index only costs a no-op
 rebuild, but naming fewer means edits to those files never trigger one.
 

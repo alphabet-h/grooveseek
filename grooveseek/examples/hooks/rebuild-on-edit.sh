@@ -36,9 +36,10 @@ GROOVE_BIN="${GROOVE_BIN:-groove}"   # override if not on PATH
 # Extensions that count as knowledge-base content, space separated and without
 # the dot. Keep this in sync with `[parsers].enabled` in your groove.toml:
 # listing more than you index only costs a no-op rebuild, listing fewer means
-# edits to those files are silently not re-indexed. Defaults to every format
-# groove can parse.
-KB_EXTENSIONS="${KB_EXTENSIONS:-md txt pdf docx xlsx pptx}"
+# edits to those files are silently not re-indexed. Defaults to every format a
+# default build can parse. "py" is not among them because it needs a grammar
+# plugin placed first; add it yourself once you have.
+KB_EXTENSIONS="${KB_EXTENSIONS:-md txt pdf docx xlsx pptx rs}"
 # -----------------------------------------------------------------------------
 
 if [[ -z "$KB_PATH" ]]; then

@@ -15,6 +15,8 @@ groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # switch 
 
 Scans source files under the given directory, skipping the default `exclude_dirs` set (`.obsidian`, `.git`, `node_modules`, `target`, `.vscode`, `.idea` — see "Directory exclusion" in [docs/behavior.md](behavior.md)). By default only `.md` is picked up. Add `[parsers].enabled = ["md", "txt"]` to `groove.toml` to also index `.txt` files — their title is derived from the filename (`deep-dive-2026.txt` → `"deep dive 2026"`) and the whole body becomes a single chunk. Files whose content hash has not changed since the last run are skipped unless `--force` is passed.
 
+`[parsers].enabled = ["md", "rs"]` (v1.2.0+) additionally indexes Rust source, one chunk per definition rather than per heading — see the source code indexing note in [docs/behavior.md](behavior.md). Every other language arrives as a plugin you place yourself: `"py"` (v1.3.0+) needs `groove-grammar-python` in the grammar directory first, described in [Placing a grammar plugin](clients.md#placing-a-grammar-plugin-v130). Changing `[parsers.code].max_chunk_chars` changes how existing files would be split, and `index` cannot tell that from an unchanged file — it warns and names `--force`, which is what re-chunks them.
+
 `--model` accepts:
 - `bge-small-en-v1.5` (default) — 384 dim, English-focused, ~130 MB first download.
 - `bge-m3` — 1024 dim, multilingual (100+ languages incl. Japanese), ~2.3 GB first download. Recommended for Japanese-heavy knowledge bases.

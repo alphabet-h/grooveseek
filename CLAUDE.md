@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## プロジェクト概要
 
-Markdown / プレーンテキスト / PDF / Office 文書のナレッジベースに対するセマンティック検索を提供する MCP (Model Context Protocol) サーバ。YAML frontmatter 付きの Markdown (および opt-in で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) を見出し (シート / スライド / ページ) 単位でチャンク化し、選択可能な埋め込みモデル (BGE-small-en-v1.5 / BGE-M3) でベクトル化。sqlite-vec のベクトル検索と FTS5 全文検索を Reciprocal Rank Fusion で融合し、任意で cross-encoder reranker を適用する。stdio または Streamable HTTP トランスポートで Claude Code / Cursor 等の MCP クライアントに接続する。
+Markdown / プレーンテキスト / PDF / Office 文書**およびソースコード**のナレッジベースに対するセマンティック検索を提供する MCP (Model Context Protocol) サーバ。YAML frontmatter 付きの Markdown (および opt-in で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`) を見出し (シート / スライド / ページ) 単位で、ソースコード (opt-in で `.rs`、plugin を置けば `.py`) を**定義**単位でチャンク化し、選択可能な埋め込みモデル (BGE-small-en-v1.5 / BGE-M3) でベクトル化。sqlite-vec のベクトル検索と FTS5 全文検索を Reciprocal Rank Fusion で融合し、任意で cross-encoder reranker を適用する。stdio または Streamable HTTP トランスポートで Claude Code / Cursor 等の MCP クライアントに接続する。
+
+**Cargo workspace 構成**: 本体は `grooveseek/` (lib + bin `groove`)。`crates/` に
+`groove-grammar-abi` (tree-sitter grammar を受け渡す契約)、`groove-grammar-python`
+(Python grammar の `cdylib`、独立した release asset)、`groove-tray` / `groove-svc`
+(Windows 専用) が並ぶ。**ソースは repo 直下の `src/` ではなく `grooveseek/src/`**。
 
 詳細:
 - **レビューで見る不変条件**: [AGENTS.md](./AGENTS.md) の `## Code Review Rules` (英語)。

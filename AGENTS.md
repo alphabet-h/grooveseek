@@ -1,13 +1,15 @@
 # AGENTS.md
 
 GrooveSeek is a Rust MCP server for semantic search over a knowledge base of
-Markdown, plain text, PDF and Office documents. Documents are chunked by heading
-(sheet / slide / page), embedded, and retrieved by fusing sqlite-vec KNN with
-FTS5 full-text search through Reciprocal Rank Fusion, optionally reranked by a
-cross-encoder. It serves MCP clients over stdio or Streamable HTTP.
+Markdown, plain text, PDF and Office documents, and of source code. Documents
+are chunked by heading (sheet / slide / page) and code by definition, then
+embedded and retrieved by fusing sqlite-vec KNN with FTS5 full-text search
+through Reciprocal Rank Fusion, optionally reranked by a cross-encoder. It
+serves MCP clients over stdio or Streamable HTTP.
 
-The workspace holds the `groove` binary plus two Windows satellites: a tray app
-and a service launcher.
+The workspace holds the `groove` binary, the Windows satellites (a tray app and
+a service launcher), and the grammar crates: the contract a tree-sitter grammar
+is handed across, and the Python grammar shipped as a library groove loads.
 
 - Development guidance in depth (Japanese): `CLAUDE.md`
 - Source layout: `docs/ARCHITECTURE.md`
