@@ -852,10 +852,14 @@ impl Config {
         // plugin が無いので [`Self::build_parser_registry`] で失敗して死ぬ。Windows service は
         // stdio を捨てるので何も残らない。既定へ落として続行する方がその silent death を無くす。
         if let Some(p) = self.parsers.take() {
+            // `using` is asked of the same registry the run will build, not spelled out
+            // here: this is a diagnostic about a fallback, and a diagnostic that keeps its
+            // own copy of the answer is the one that goes stale when the answer changes.
+            let using = crate::parser::Registry::defaults().extensions().join(",");
             tracing::warn!(
                 config = %shown.display(),
                 requested = ?p.enabled,
-                using = "md",
+                using,
                 "ignoring [parsers] from a config found in an untrusted location \
                  (it selects which parsers run, and whether a grammar plugin is \
                  loaded at all); pass --config to accept it"

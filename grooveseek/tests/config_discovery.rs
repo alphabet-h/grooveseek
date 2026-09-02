@@ -374,4 +374,16 @@ fn test_untrusted_config_announces_the_parser_substitution() {
         plain.contains("untrusted location"),
         "and the reason it was dropped: {plain}"
     );
+    // The substitute is asked of `Registry::defaults()` rather than spelled out in the
+    // warning, so this is the only place that says what a reader actually sees. It is an
+    // expectation about output, not a second copy of the rule: if the default set changes,
+    // this fails and the release notes get looked at.
+    assert!(
+        plain.contains("using=\"md\""),
+        "the warning has to name what runs instead: {plain}"
+    );
+    assert!(
+        plain.contains("xls"),
+        "and what was asked for, so the reader can tell which config it means: {plain}"
+    );
 }
