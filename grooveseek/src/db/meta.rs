@@ -523,39 +523,56 @@ impl Database {
         )
     }
 
-    /// legacy / 前回 index 済み DB で `quality_score` が DEFAULT 1.0 のままの
-    /// チャンクを検出し、[`crate::quality::chunk_quality_score`] で再計算して
-    /// UPDATE する (冪等)。
+    /// legacy / 前回 index 済み DB のチャンクを [`crate::quality::chunk_quality_score`]
+    /// で再計算して UPDATE する (冪等)。
     ///
     /// `binary_exts` = is_binary な parser の拡張子集合。document の path 拡張子が
-    /// これに含まれれば `is_binary=true` で再計算し、length/structure penalty を免除する。
-    /// これを怠ると初回 index で免除された binary chunk が 2 回目 backfill で penalty
-    /// 転落する (§4.8 P0)。
+    /// これに含まれれば [`crate::quality::QualityProfile::Binary`] で再計算し、
+    /// length/structure penalty を免除する。これを怠ると初回 index で免除された
+    /// binary chunk が 2 回目 backfill で penalty 転落する (§4.8 P0)。
+    /// `symbol_kind` を持つ行は同じ理由で `Definition` として扱う (AV-07)。
     pub fn backfill_quality(&self, binary_exts: &[&str]) -> Result<u32> {
-        // 旧 DB (= default 1.0 のまま) のみを対象にする: score != 1.0 の行は
-        // 既に計算済みとみなしてスキップ。初期値 1.0 で再計算結果も 1.0 の
-        // 正当な行は再 UPDATE されないが、冪等性のためには十分 (挙動上同じ)。
-        let sql = "SELECT c.id, c.heading, c.content, d.path
+        // 母集団は 2 つ:
+        //
+        // ① `quality_score = 1.0` の行 = 旧 DB の DEFAULT のまま。score != 1.0 の行は
+        //    既に計算済みとみなす。
+        // ② `symbol_kind IS NOT NULL` の行 = 定義単位チャンク。**score が入っていても
+        //    拾う**: AV-07 より前の版が付けた 0.1 は当時の規則としては正しく、①だけでは
+        //    永久に拾われない。`quality_score` 列を UPDATE するだけなので**再 embedding は
+        //    不要**で、`--force` 再 index を案内するより安い。
+        //
+        // ★ ②を足したことで「拾う行は必ず 1.0」という前提が消えた。UPDATE の要否は
+        //   **現在値との比較**で決めること — 「再計算結果が 1.0 なら不要」と書くと、
+        //   0.1 から 1.0 へ戻る行 (= AV-07 が直したい行そのもの) だけが黙って落ちる。
+        let sql = "SELECT c.id, c.heading, c.content, c.symbol_kind, c.quality_score, d.path
                    FROM chunks c JOIN documents d ON d.id = c.document_id
-                   WHERE c.quality_score = 1.0";
+                   WHERE c.quality_score = 1.0 OR c.symbol_kind IS NOT NULL";
         let mut stmt = self.conn.prepare(sql)?;
-        let rows: Vec<(i64, Option<String>, String, String)> = stmt
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, Option<String>, String, Option<String>, f32, String)> = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut updated = 0u32;
-        for (id, heading, content, path) in rows {
+        for (id, heading, content, symbol_kind, current, path) in rows {
             let ext = std::path::Path::new(&path)
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
-            let score =
-                crate::quality::chunk_quality_score(heading.as_deref(), &content, is_binary);
-            if (score - 1.0).abs() < f32::EPSILON {
-                // 再計算でも 1.0 (高品質) → UPDATE 不要
+            let profile = crate::quality::QualityProfile::of(is_binary, symbol_kind.is_some());
+            let score = crate::quality::chunk_quality_score(heading.as_deref(), &content, profile);
+            if (score - current).abs() < f32::EPSILON {
+                // 現在値と同じ → UPDATE 不要 (冪等性はここが担う)
                 continue;
             }
             self.conn.execute(

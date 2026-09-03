@@ -929,7 +929,7 @@ fn index_single_disk_entry(
         let score = quality::chunk_quality_score(
             chunk.heading.as_deref(),
             &chunk.content,
-            parser.is_binary(),
+            quality::QualityProfile::of(parser.is_binary(), chunk.symbol_kind.is_some()),
         );
         let context = match context_mode {
             ContextMode::Static => chunk.context.as_deref(),

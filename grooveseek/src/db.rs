@@ -1176,6 +1176,98 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_scored_by_the_older_rules_is_lifted_by_the_next_backfill() {
+        // AV-07: v1.4.0 より前の版は 1 行の定義に 0.1 を書いた。それは当時の規則と
+        // しては正しい値なので `quality_score = 1.0` の母集団には入らず、SELECT を
+        // `symbol_kind IS NOT NULL` へ広げないと永久に拾われない。
+        //
+        // ★ 広げるだけでは足りない。UPDATE の要否を「再計算結果が 1.0 なら不要」で
+        //   判定していると、0.1 から 1.0 へ戻るこの行だけが黙って落ちる = 直したい
+        //   行そのものが対象外になる。現在値と比較すること。
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("src/lib.rs", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk_with_code(
+            doc_id,
+            0,
+            Some("MAXYEAR"),
+            None,
+            "MAXYEAR = 9999",
+            None,
+            &dummy_embedding(0.1),
+            0.1, // 旧版が書いた値
+            crate::db::CodeMeta {
+                line_range: Some((3, 3)),
+                symbol_kind: Some("constant"),
+            },
+        )
+        .unwrap();
+
+        let (above_before, below_before) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!((above_before, below_before), (0, 1), "starts hidden");
+
+        let updated = db.backfill_quality(&[]).unwrap();
+        assert_eq!(updated, 1, "the definition must be re-scored");
+        let (above, below) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(
+            (above, below),
+            (1, 0),
+            "a definition is exempt from the shortness penalties"
+        );
+
+        let again = db.backfill_quality(&[]).unwrap();
+        assert_eq!(again, 0, "second call must be a no-op");
+    }
+
+    #[test]
+    fn widening_the_backfill_to_definitions_does_not_reach_prose() {
+        // 広げた母集団は `symbol_kind IS NOT NULL` の行だけ。散文の低スコア行は
+        // 既に計算済みなので、以前と同じく触らない。
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("notes/a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        // 散文で、既にスコアが入っている (= 計算済み) 短い chunk。
+        db.insert_chunk(
+            doc_id,
+            0,
+            None,
+            None,
+            "短い本文。",
+            None,
+            &dummy_embedding(0.2),
+            0.1,
+        )
+        .unwrap();
+        // 定義で、既に正しいスコアが入っている chunk。
+        db.insert_chunk_with_code(
+            doc_id,
+            1,
+            None,
+            None,
+            "pub mod x;",
+            None,
+            &dummy_embedding(0.3),
+            1.0,
+            crate::db::CodeMeta {
+                line_range: Some((1, 1)),
+                symbol_kind: Some("module"),
+            },
+        )
+        .unwrap();
+
+        let updated = db.backfill_quality(&[]).unwrap();
+        assert_eq!(updated, 0, "neither row changes value");
+        let (above, below) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(
+            (above, below),
+            (1, 1),
+            "the prose chunk keeps the score it already had"
+        );
+    }
+
+    #[test]
     fn test_rename_document_preserves_chunks() {
         // File rename: rename_document は path だけ変え、chunks/vec/fts は維持する
         let db = db_with_384();
