@@ -11,7 +11,7 @@ re-run indexing manually.
 
 | File | Purpose |
 |---|---|
-| `settings.snippet.json` | Minimal `hooks` block to copy into your project's `.claude/settings.json` — it is **not** a complete settings file. Rebuilds the index unconditionally after any `Write` / `Edit` / `MultiEdit` / `Skill`. |
+| `settings.snippet.json` | Minimal `hooks` block to copy into your project's `.claude/settings.json` — it is **not** a complete settings file. Rebuilds the index unconditionally after any `Write` / `Edit` / `MultiEdit` / `Skill`. **Its `groove index` names no config; read the note under Tier A before using it with a project-scoped `groove.toml`.** |
 | `rebuild-on-edit.sh` | Richer shell hook that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH`. Recommended when the Claude Code project touches files outside the knowledge base. Requires a Unix-like shell (bash + jq); Windows users should run it from Git Bash or WSL. |
 
 **Notes on the `Skill` matcher**: Claude Code exposes skills via a `Skill` tool at the time of writing (v1.x). If your installed Claude Code version renames or splits this tool, adjust the matcher accordingly — no other part of groove depends on the tool name.
@@ -45,6 +45,20 @@ The `kb_path` is read from `groove.toml` (see [*Config file discovery*](../../..
 for the full lookup order — typically the project
 root or alongside the binary). You can also hard-code it with
 `groove index --kb-path /abs/path/to/knowledge-base`.
+
+> **If that `groove.toml` sits in the project rather than beside the binary,
+> name it here**: `groove --config /abs/path/to/groove.toml index`. groove
+> honours a config it merely discovered only in part, and `[parsers]` is one of
+> the keys it resets to the default — Markdown alone
+> ([Trusted and untrusted config locations](../../../docs/configuration.md#trusted-and-untrusted-config-locations)).
+> That is not just an incomplete rebuild: **`groove index` deletes the documents
+> it did not visit**, so a run that collects only `.md` removes every `.txt`,
+> PDF, Office document and source file already in the index — and this hook
+> fires on the next edit, so it happens without anyone deciding to re-index.
+> `settings.snippet.json` is the same minimal form and needs the same change.
+> Nothing to add when the config lives beside the binary or was placed by
+> `groove service install`; those locations are trusted. Do not add `--config`
+> pointing at a file that is not there — that is an error, not a fallback.
 
 ## Tier B — path-filtered rebuild (script)
 
@@ -91,6 +105,28 @@ rebuild, but naming fewer means edits to those files never trigger one.
 ```json
 "command": "KB_PATH=/abs/path/to/knowledge-base KB_EXTENSIONS='md txt' /abs/path/to/rebuild-on-edit.sh"
 ```
+
+### `GROOVE_CONFIG` — set it if `groove.toml` is beside the project
+
+`groove index` discovers its config like any other command, and a discovered
+config is honoured only in part: `[parsers]` is reset to Markdown alone
+([Trusted and untrusted config locations](../../../docs/configuration.md#trusted-and-untrusted-config-locations)).
+Here that is not merely incomplete. **`groove index` deletes the documents it
+did not visit**, so a rebuild that collects only `.md` removes every `.txt`,
+PDF, Office document and source file already in the index — and a hook fires on
+the next edit, without anyone deciding to run it.
+
+So name the file when it lives beside the project:
+
+```json
+"command": "KB_PATH=/abs/path/to/knowledge-base GROOVE_CONFIG=/abs/path/to/groove.toml /abs/path/to/rebuild-on-edit.sh"
+```
+
+Leave it unset when `groove.toml` sits next to the `groove` binary, or was
+placed by `groove service install` — those locations are trusted and nothing is
+reset. The script checks that the file exists and skips the rebuild with a
+message if it does not, rather than letting `--config path not found` fail the
+hook on every edit.
 
 ## Notes
 

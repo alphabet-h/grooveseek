@@ -22,6 +22,8 @@ Add the following to `.mcp.json` in your project root (or the equivalent MCP con
 }
 ```
 
+> **Using a `groove.toml` that sits in the project?** Add `"--config", "/abs/path/to/groove.toml"` to `args`, before `serve`. groove decides from a config's *location* how far to trust it, and a file it merely found has its privileged keys reset — `[parsers]` among them, so a knowledge base of anything but Markdown would be served as if it were Markdown only. The same applies to every other `groove` invocation against that config, `index` most of all. See [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations). A config beside the binary, or one `groove service install` placed, is trusted as it is.
+
 With a multilingual model and reranker enabled:
 
 ```json
@@ -100,7 +102,9 @@ If you edit the knowledge base from inside a Claude Code session (or run a skill
 }
 ```
 
-SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md). SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
+> **If your `groove.toml` sits beside the project rather than beside the binary, name it here too**: `groove --config /abs/path/groove.toml index`. A discovered config has `[parsers]` reset to Markdown alone ([Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations)), and `groove index` deletes the documents it did not visit — so a hook that rebuilds with the default parser set removes every `.txt`, PDF, Office document and source file already in the index, on the first edit after you upgrade. A config next to the binary, or one `groove service install` placed, is trusted and needs nothing added.
+
+SHA-256 diffing in `groove index` makes the second-and-later invocations fast (usually sub-second on small KBs). A richer shell script that inspects the tool payload and only rebuilds when the edited file is under `$KB_PATH` ships with the repo: see [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.md) — it takes `GROOVE_CONFIG` for exactly this. SQLite runs in WAL mode so the hook can safely run while the MCP server is still up.
 
 ## Frontmatter schema validation
 If your knowledge base follows a frontmatter convention (e.g. `title` required, `date` is YYYY-MM-DD, `topic` limited to an enum), you can check every `.md` file for violations with:
@@ -262,14 +266,14 @@ groove parses source code one definition at a time, but only Rust is compiled in
        (Get-Content groove-grammar-python-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToUpper()
    ```
 3. Unpack it and put the library in the grammar directory. The default is `%LOCALAPPDATA%\groove\grammars` on Windows, `~/.local/share/groove/grammars` on Linux, and `~/Library/Application Support/groove/grammars` on macOS. To use a different one, set `grammar_dir` in `groove.toml`, or the `GROOVE_GRAMMAR_DIR` environment variable — which must be an absolute path, because a relative one would resolve against whatever directory the client happened to launch groove from.
-4. Add the language to `[parsers].enabled`, e.g. `enabled = ["md", "py"]`.
-5. **Run `groove index` once by hand before letting a service do it.** A registered Windows service discards stdio, so if the plugin is missing or refused, the message saying so goes nowhere and the daemon simply does not work. `groove index` resolves every enabled language before it opens the database or loads a model, so a bad plugin stops it immediately, on your screen, having created nothing. (`groove doctor` checks an index that already exists; on a fresh setup it answers "No index found" without ever reaching the plugin, so it is not the command for this step.)
+4. Add the language to `[parsers].enabled`, e.g. `enabled = ["md", "py"]` — in a config groove **trusts**. A `groove.toml` groove merely found beside your project has its `[parsers]` ignored, so the language would never be enabled and the plugin never opened; name the file with `--config` (or keep it next to the binary, or let `groove service install` place it). See [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
+5. **Run `groove index` once by hand before letting a service do it — with the same `--config` you gave in step 4 if the file is one groove would otherwise merely discover.** A registered Windows service discards stdio, so if the plugin is missing or refused, the message saying so goes nowhere and the daemon simply does not work. `groove index` resolves every enabled language before it opens the database or loads a model, so a bad plugin stops it immediately, on your screen, having created nothing. Leaving `--config` off here does not fail loudly — the language is simply not enabled, nothing looks for a plugin, and the run succeeds without ever having checked the one you placed. (`groove doctor` checks an index that already exists; on a fresh setup it answers "No index found" without ever reaching the plugin, so it is not the command for this step.)
 
 Nothing is downloaded automatically and nothing but the enabled languages is opened — a file in that directory belonging to a language you did not enable is never touched. If an enabled language has no usable plugin, the command stops and says which file it wanted and where; it does not fall back to indexing the source as plain text.
 
 **When you replace a plugin, re-index with `groove index --force`.** A rebuilt grammar can cut the same file into different chunks, but indexing skips files whose content has not changed — so a plain re-index leaves those files with chunks the old grammar made and applies the new one only to files you edit afterwards, and the index comes to hold two generations at once. Nothing detects this for you yet: **groove does not currently warn that the plugin has changed**, so the `--force` is on you. The same is true after upgrading groove itself. Changing `[parsers.code].max_chunk_chars` is the one case groove does report: the index records the budget its code chunks were cut at, so a later run configured with a different one prints a warning naming `--force`.
 
-> **A grammar plugin is native code that groove loads into its own process.** Treat one like any other binary you install: take it from the release page for the version you are running, and not from anywhere else. This is also why a `groove.toml` that groove merely *found* — rather than one you named with `--config` — cannot choose the directory; see [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
+> **A grammar plugin is native code that groove loads into its own process.** Treat one like any other binary you install: take it from the release page for the version you are running, and not from anywhere else. This is also why a `groove.toml` that groove merely *found* — rather than one you named with `--config` — can choose neither the directory nor the language, which is what would open a library from it at all; see [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
 
 ## Working around HuggingFace TLS failures on first download
 

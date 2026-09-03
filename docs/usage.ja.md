@@ -13,7 +13,7 @@ groove index --kb-path /path/to/knowledge-base --force   # 完全再インデッ
 groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 (1024 dim、多言語) に切替
 ```
 
-指定ディレクトリ配下のソースファイルを走査し、既定の `exclude_dirs` セット (`.obsidian` / `.git` / `node_modules` / `target` / `.vscode` / `.idea` — [docs/behavior.ja.md](behavior.ja.md) の「ディレクトリ除外」参照) をスキップする。既定では `.md` のみ取り込み。`groove.toml` に `[parsers].enabled = ["md", "txt"]` を追加すると `.txt` もインデックス対象になる (タイトルはファイル名から派生: `deep-dive-2026.txt` → `"deep dive 2026"`、本文全体が 1 チャンク)。前回実行時と content hash が変わっていないファイルは `--force` を渡さない限りスキップされる。
+指定ディレクトリ配下のソースファイルを走査し、既定の `exclude_dirs` セット (`.obsidian` / `.git` / `node_modules` / `target` / `.vscode` / `.idea` — [docs/behavior.ja.md](behavior.ja.md) の「ディレクトリ除外」参照) をスキップする。既定では `.md` のみ取り込み。`groove.toml` に `[parsers].enabled = ["md", "txt"]` を追加すると `.txt` もインデックス対象になる (タイトルはファイル名から派生: `deep-dive-2026.txt` → `"deep dive 2026"`、本文全体が 1 チャンク)。このキーは groove が**信頼する** `groove.toml` — `--config` で名指ししたもの、バイナリの隣にあるもの、`groove service install` が置いたもの — に書くこと。KB の隣で見つけただけの config は `[parsers]` が既定へ戻される ([信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所))。前回実行時と content hash が変わっていないファイルは `--force` を渡さない限りスキップされる。
 
 `[parsers].enabled = ["md", "rs"]` (v1.2.0+) を指定すると Rust のソースも index 対象になる。単位は見出しではなく**定義 1 つにつき 1 チャンク** — 詳細は [docs/behavior.ja.md](behavior.ja.md) のソースコードインデックスの補足を参照。他の言語は利用者が置く plugin として届き、`"py"` (v1.3.0+) は先に grammar ディレクトリへ `groove-grammar-python` を置く必要がある ([grammar plugin の置き方](clients.ja.md#grammar-plugin-の置き方-v130))。`[parsers.code].max_chunk_chars` を変えると既存ファイルの切れ目も変わるが、`index` は内容が変わっていないファイルとそれを区別できない — 警告を出して `--force` を名指しするので、再チャンクはそれで行う。
 

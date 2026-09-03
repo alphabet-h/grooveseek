@@ -94,7 +94,11 @@ and its tags query at versions that were built together.
   model cache: it would turn "index this folder" into "run this code". When
   an untrusted configuration is detected, the setting is reset to the safe
   default whether or not the file mentioned it — omitting the key must not
-  be a way around the rule.
+  be a way around the rule. *(Since v1.3.0 the same applies one step earlier,
+  to `[parsers].enabled`: naming a language is what causes a library to be
+  opened at all, so guarding only the directory left the ignition unguarded.
+  That key needs no substitute when absent — an omitted `[parsers]` already
+  means Markdown alone.)*
 - **An enabled language that cannot be resolved stops the run**, with a
   message naming what is missing and where it should go, and without
   creating a database. This holds whether or not the configuration was

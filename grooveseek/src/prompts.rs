@@ -14,7 +14,7 @@
 //! the working directory or a `.git` ancestor — and a discovered file is not
 //! necessarily one the user wrote. The untrusted-config rule in
 //! [`crate::config`] — `Config::restrict_untrusted`, private to that module —
-//! already drops four fields, and the reason given for the strictest of them,
+//! already drops five fields, and the reason given for the strictest of them,
 //! `kb_path`, is that it decides *what gets indexed and handed to the LLM
 //! client*. Prompt text is squarely inside that reasoning, so
 //! a `[prompts]` section would need a restriction rule of its own to be safe,

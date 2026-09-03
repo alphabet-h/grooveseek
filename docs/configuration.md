@@ -5,7 +5,7 @@ looked for, and which of those locations are trusted.
 
 > **日本語版**: [configuration.ja.md](./configuration.ja.md)
 
-Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) to `groove.toml` and edit.
+Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Those two are not equivalent: a file groove *found* is trusted only in part, so a project-root placement wants `--config` naming it. See [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations). Copy [`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) to `groove.toml` and edit.
 
 **A fresh copy of that template changes nothing.** It is not blank — twelve sections (`[quality_filter]`, `[best_practice]`, `[parsers]`, `[parsers.code]`, `[watch]`, `[transport]`, `[transport.http]`, `[eval]`, `[search]`, `[search.mmr]`, `[search.fusion]`, `[search.parent_retriever]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behavior is commented out. The block below is a different thing: an illustration of what each key does, with values filled in — some of them non-default, some of them just the default spelled out. Read it as a menu, not as a file to paste wholesale:
 
@@ -175,7 +175,7 @@ bind = "127.0.0.1:3100"
 # enabled = true
 ```
 
-With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
+With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags — **provided groove trusts where the file is**. One it merely found, which is what a project-root or `.git`-ancestor placement means, keeps everything about presentation but has `kb_path`, `[parsers]`, `grammar_dir`, `fastembed_cache_dir` and the `[transport.http]` gates reset to safe defaults. Name it — `groove --config ./groove.toml index` — to have it honoured in full. [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations) says which keys and why; `index` is the one to get right first, since it deletes documents whose extension the parser set no longer covers. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
 
 ## Config file discovery
 
@@ -185,9 +185,9 @@ and stops at the first hit:
 | Priority | Location                                  | Notes                                        |
 | -------- | ----------------------------------------- | -------------------------------------------- |
 | 1        | `--config <PATH>` (any subcommand)        | Errors out if the file does not exist.       |
-| 2        | `./groove.toml` (current working dir)     | Most natural for project-local KBs.          |
-| 3        | `<git-root>/groove.toml` (walks up)       | Checks CWD + up to 19 ancestors (20 dirs total). |
-| 4        | `<binary-dir>/groove.toml`                | Legacy / global-install fallback.            |
+| 2        | `./groove.toml` (current working dir)     | Most natural for project-local KBs — but **found, not named**, so trusted only in part (below). |
+| 3        | `<git-root>/groove.toml` (walks up)       | Checks CWD + up to 19 ancestors (20 dirs total). Found, not named, as above. |
+| 4        | `<binary-dir>/groove.toml`                | Legacy / global-install fallback. Trusted in full. |
 | 5        | (no config — built-in defaults)           | `--kb-path` becomes mandatory on the CLI.    |
 
 `~` in `--config` is expanded to the home directory on all platforms
@@ -212,7 +212,7 @@ it as yours:
 
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
-`[parsers]`, `[watch]`, `[contextual]` — is honoured unchanged. Four fields
+`[watch]`, `[contextual]` — is honoured unchanged. Five fields
 are restricted, because they decide which code runs, what leaves the machine,
 and who can reach it:
 
@@ -222,6 +222,7 @@ and who can reach it:
 | `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts`, `allowed_origins`, `healthz_public`, and `max_sessions` are dropped — the first three restore the loopback-only defaults, and the last falls back to the built-in limit, so that a planted `max_sessions = 1` cannot leave the server unable to accept a second client. Dropping `allowed_origins` matters in both directions: a planted list could name an attacker's origin, or be empty, which is how "do not validate Origin at all" is spelled. `kind` is honoured. |
 | `kb_path` | **Ignored with a warning** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. `--kb-path` still applies, so you can override it; with neither, the command stops with the usual "`--kb-path` is required". |
 | `grammar_dir` | Ignored with a warning; the standard location is used. It selects which native library is `dlopen`ed into the process, and a grammar plugin is code, not data. Set for every untrusted config, present or not — omitting the key would otherwise be a way to influence the choice by saying nothing. If no standard location can be determined the key is dropped instead, and a command that needs a plugin then stops with a message naming `GROOVE_GRAMMAR_DIR`. |
+| `[parsers]` | Ignored with a warning; the default set — Markdown alone — is used. `enabled` decides which parsers run at all, so a config found beside a knowledge base could otherwise switch on the formats with the widest input surface (`pdf`, `xlsx`, `pptx`, `docx`) that the operator had left off, or name a language whose grammar plugin then gets `dlopen`ed. It is the switch `grammar_dir` only aims: no enabled language needs a plugin, and no plugin is looked for. Unlike the two above, an absent key needs no substitute — omitting `[parsers]` already lands on Markdown alone, which is where this rule puts it. `[parsers.code]` goes with it, having no parser left to configure. |
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
 `kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local
@@ -267,14 +268,22 @@ groove can help there; that is what your MCP client's approval prompt is for.
 // repo-root/.mcp.json
 {
   "mcpServers": {
-    "kb": { "command": "groove", "args": ["serve"] }
+    "kb": { "command": "groove", "args": ["serve", "--config", "./groove.toml"] }
   }
 }
 ```
 
 Commit `groove.toml` next to `.mcp.json`. Opening the project in Claude Code
-launches `groove serve` from the repo root, the CWD lookup picks up
-the project's `groove.toml`, and `.mcp.json` stays minimal.
+launches `groove serve` from the repo root, and `--config` names the file that
+is sitting right there.
+
+**Naming it is what makes it count.** Left off, the CWD lookup would still find
+the file — and then treat it as untrusted, because that is exactly the shape
+this section is about: a config groove found rather than one you pointed at. A
+project KB of anything but Markdown would be served as Markdown only. Every
+other `groove` command run against this config wants the same argument, `index`
+most of all: it deletes the documents it did not visit, so a rebuild with the
+default parser set removes the non-Markdown ones from the index.
 
 ### Example: multiple KBs in the same Claude Code session
 

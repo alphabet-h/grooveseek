@@ -17,19 +17,25 @@ Claude Code は stdio 経由で groove を起動する。
 | ファイル | 用途 |
 | --- | --- |
 | [`groove.toml`](./groove.toml) | サーバ側既定値: model / watcher / parsers / quality filter |
-| [`.mcp.json`](./.mcp.json) | クライアント側設定: `groove serve` (引数なし、toml から discover) |
+| [`.mcp.json`](./.mcp.json) | クライアント側設定: `groove serve --config ./groove.toml` |
 
 ## セットアップ
 
 1. **groove をインストール**。[ビルド済バイナリ](https://github.com/alphabet-h/grooveseek/releases/latest) を `PATH` の通った場所に置くか、clone から `cargo install --path grooveseek` (リポジトリ root は workspace manifest なので `--path .` は失敗する)
 2. **KB の置き場所を決める**。例: `~/notes/` (個人ノート) や `~/projects/<repo>/docs/` (プロジェクト単位)
 3. **設定ファイルの置き場所**。自然な選択肢は 2 つ — [Config file discovery](../../../../docs/configuration.ja.md#設定ファイルの探索順) を参照:
-   - **プロジェクト単位**: `groove.toml` と `.mcp.json` を一緒にプロジェクトリポジトリに置いて commit (toml は共有前提に作られている)
-   - **グローバル**: `groove.toml` をバイナリの隣 (`~/.local/bin/groove.toml` や `%USERPROFILE%\bin\groove.toml`) に置けば全プロジェクトで同じ設定を共有
+   - **プロジェクト単位**: `groove.toml` と `.mcp.json` を一緒にプロジェクトリポジトリに置いて commit (toml は共有前提に作られている)。**ここの `.mcp.json` が `--config` でファイルを名指ししているのは好みの問題ではない** — groove が**見つけただけ**の `groove.toml` は一部しか効かず、`[parsers]` は既定へ戻されるキーの 1 つなので、`.txt` / PDF / ソースコードを opt-in したプロジェクト単位の config が黙って Markdown だけを索引することになる。[信頼する置き場所 / しない置き場所](../../../../docs/configuration.ja.md#信頼する置き場所--しない置き場所) を参照
+   - **グローバル**: `groove.toml` をバイナリの隣 (`~/.local/bin/groove.toml` や `%USERPROFILE%\bin\groove.toml`) に置けば全プロジェクトで同じ設定を共有。バイナリの隣は信頼される置き場なので `--config` は要らない — **この場合は `.mcp.json` から `"--config", "./groove.toml"` を削ること**。存在しないファイルを `--config` で名指しするのはエラーであって、discovery へのフォールバックではない
 4. **`groove.toml` を編集**: `kb_path` を KB の絶対パスに。言語が合わなければ model と reranker を調整
-5. **初回インデックス構築**:
+5. **初回インデックス構築** — **`.mcp.json` と同じ理由で、ここでも config を名指しする**。`groove index` も他のコマンドと同じように config を discover するので、`--config` を落とすと `[parsers]` が既定へ戻った状態で最初の索引が作られ、しかも後から作り直されない (`serve` は見つけた索引を開くだけで再 index しない)。
 
    ```bash
+   # プロジェクト単位: groove.toml のあるディレクトリで実行する
+   groove index --config ./groove.toml --kb-path /absolute/path/to/kb
+   ```
+
+   ```bash
+   # グローバル (バイナリの隣に groove.toml): 信頼される置き場なので --config は不要
    groove index --kb-path /absolute/path/to/kb
    ```
 

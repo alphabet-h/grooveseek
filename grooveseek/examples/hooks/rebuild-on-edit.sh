@@ -26,12 +26,28 @@
 # unrelated edits from triggering a rebuild. KB_EXTENSIONS controls which
 # file types count as knowledge-base content — set it to match
 # `[parsers].enabled` in your groove.toml.
+#
+# **Set GROOVE_CONFIG if your groove.toml lives beside the project rather than
+# beside the binary.** groove honours a config it merely discovered only in
+# part, and `[parsers]` is one of the keys it resets to the default — Markdown
+# alone. That matters more here than anywhere else: `groove index` deletes the
+# documents it did not visit, so a rebuild that only collects `.md` removes
+# every `.txt`, PDF, Office document and source file already in the index. One
+# hook firing is enough. Naming the config with `--config` makes it trusted and
+# keeps the parser set the one you configured.
 
 set -euo pipefail
 
 # --- configure ---------------------------------------------------------------
 KB_PATH="${KB_PATH:-}"               # e.g. /repo/knowledge-base
 GROOVE_BIN="${GROOVE_BIN:-groove}"   # override if not on PATH
+
+# Absolute path to the groove.toml this rebuild should use, or empty to let
+# groove discover one. Leave it empty ONLY when the config lives beside the
+# binary or was placed by `groove service install` -- those locations are
+# trusted, so nothing is reset. A groove.toml sitting in the project is not:
+# see the note in the header about what that costs on a rebuild.
+GROOVE_CONFIG="${GROOVE_CONFIG:-}"
 
 # Extensions that count as knowledge-base content, space separated and without
 # the dot. Keep this in sync with `[parsers].enabled` in your groove.toml:
@@ -92,4 +108,15 @@ if [[ "$should_rebuild" != "true" ]]; then
   exit 0
 fi
 
-"$GROOVE_BIN" index --kb-path "$KB_PATH" >&2
+# `--config` goes before the subcommand: it is a global flag.
+if [[ -n "$GROOVE_CONFIG" ]]; then
+  if [[ ! -f "$GROOVE_CONFIG" ]]; then
+    # groove would stop with "--config path not found", and a hook that fails
+    # is noise on every edit. Say what is wrong once and leave the index alone.
+    echo "rebuild-on-edit.sh: GROOVE_CONFIG=$GROOVE_CONFIG does not exist; skipping" >&2
+    exit 0
+  fi
+  "$GROOVE_BIN" --config "$GROOVE_CONFIG" index --kb-path "$KB_PATH" >&2
+else
+  "$GROOVE_BIN" index --kb-path "$KB_PATH" >&2
+fi

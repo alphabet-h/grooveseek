@@ -22,6 +22,8 @@ MCP クライアントを GrooveSeek に向ける方法 — stdio の `.mcp.json
 }
 ```
 
+> **`groove.toml` がプロジェクト内にある場合**は、`args` の `serve` の前に `"--config", "/abs/path/to/groove.toml"` を足すこと。groove は config を**置き場所**でどこまで信頼するか決めるので、見つけただけのファイルは特権的なキーが既定へ戻される — `[parsers]` もその 1 つで、Markdown 以外の KB が Markdown だけとして提供されることになる。同じ config を読む他の `groove` 実行にも同様に効き、**特に `index` で効く**。[信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。バイナリの隣にある config や `groove service install` が置いた config はそのまま信頼される。
+
 多言語モデル + 再ランクを有効化する場合:
 
 ```json
@@ -100,7 +102,9 @@ Claude Code セッション内部からナレッジベースを編集する (ま
 }
 ```
 
-`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
+> **`groove.toml` がバイナリの隣ではなくプロジェクトの隣にあるなら、ここでも名指しすること**: `groove --config /abs/path/groove.toml index`。見つけただけの config は `[parsers]` が Markdown のみへ戻され ([信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所))、`groove index` は**訪れなかった document を削除する** — つまり既定の parser 集合で再構築する hook は、アップグレード後の最初の編集で、索引済みの `.txt` / PDF / Office 文書 / ソースコードをすべて索引から消す。バイナリの隣にある config や `groove service install` が置いた config は信頼されるので何も足さなくてよい。
+
+`groove index` の SHA-256 差分検出により 2 回目以降は高速 (小さな KB なら大抵 1 秒未満)。ツールペイロードを精査して編集ファイルが `$KB_PATH` 配下のときだけ再構築する、より精密なシェルスクリプトがリポジトリ同梱 — [`grooveseek/examples/hooks/`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/examples/hooks/README.ja.md) 参照 (まさにこのために `GROOVE_CONFIG` を受け取る)。SQLite は WAL モードで動作するため、MCP サーバ起動中に hook が走っても安全。
 
 ## Frontmatter スキーマ検証
 ナレッジベースで frontmatter 規約を運用しているなら (例: `title` 必須、`date` は YYYY-MM-DD、`topic` は enum)、以下でファイル毎の違反をチェックできる:
@@ -261,14 +265,14 @@ groove はソースコードを定義 1 つ = chunk 1 つで parse するが、�
        (Get-Content groove-grammar-python-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToUpper()
    ```
 3. 展開して、ライブラリを grammar ディレクトリに置く。既定は Windows なら `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、macOS なら `~/Library/Application Support/groove/grammars`。別の場所にするなら `groove.toml` の `grammar_dir` か、環境変数 `GROOVE_GRAMMAR_DIR` を使う — こちらは**絶対パス必須**で、相対値だと「クライアントがたまたま groove を起動したディレクトリ」に対して解決されてしまうため。
-4. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。
-5. **service に任せる前に、`groove index` を 1 回手で走らせる。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
+4. `[parsers].enabled` にその言語を足す (例: `enabled = ["md", "py"]`)。ただし groove が**信頼する** config に書くこと。プロジェクトの隣で見つけただけの `groove.toml` は `[parsers]` が無視されるので、言語が有効にならず plugin も開かれない。`--config` で名指しするか、バイナリの隣に置くか、`groove service install` に置かせること。[信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
+5. **service に任せる前に、`groove index` を 1 回手で走らせる — 手順 4 で `--config` を使ったなら、ここでも同じように名指しすること。** 登録した Windows service は stdio を捨てるので、plugin が無い / 拒否された場合の**メッセージがどこにも出ず**、daemon がただ動かないという状態になる。`groove index` は DB を開くよりもモデルを読むよりも先に有効化した言語をすべて解決するので、壊れた plugin はその場で、何も作らずに、画面の上で止まる。**ここで `--config` を落とすと派手に失敗はしない** — 言語が有効にならないので誰も plugin を探さず、置いたはずの plugin を一度も検査しないまま run が成功する。(`groove doctor` は**既にある索引**を検査するコマンドで、索引がまだ無い状態では plugin に触れる前に「No index found」と答える。この手順には使えない。)
 
 自動 DL は一切しないし、`enabled` に書いた言語以外は開かない — そのディレクトリに有効化していない言語のファイルがあっても触らない。有効化した言語の plugin が使えない場合、コマンドは「どのファイルをどこに置くべきか」を告げて止まる。ソースを plain text として索引するフォールバックはしない。
 
 **plugin を差し替えたら `groove index --force` で索引し直すこと。** grammar を作り直すと同じファイルでも chunk の切れ目が動きうるが、索引は内容が変わっていないファイルを飛ばすので、普通に index し直しても**そのファイルは古い grammar が切った chunk のまま**残り、新しい grammar はその後編集したファイルにだけ効く。結果として索引が 2 世代を同時に抱える。**現時点では groove がこれを検出して警告することはない**ので、`--force` は利用者の側の判断になる。groove 本体を上げた時も同様。**`[parsers.code].max_chunk_chars` を変えた時だけは groove が報告する**: 索引はコード chunk を切った時の budget を記録しているので、違う値で次を走らせると `--force` を名指しする warning が出る。
 
-> **grammar plugin は groove が自分のプロセスへ読み込むネイティブコード。** インストールする他のバイナリと同じ扱いにすること — 使っている版の release ページから取り、それ以外の場所からは取らない。groove が**見つけただけ**の `groove.toml` (`--config` で名指ししていないもの) がこのディレクトリを選べないのも同じ理由: [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
+> **grammar plugin は groove が自分のプロセスへ読み込むネイティブコード。** インストールする他のバイナリと同じ扱いにすること — 使っている版の release ページから取り、それ以外の場所からは取らない。groove が**見つけただけ**の `groove.toml` (`--config` で名指ししていないもの) が、このディレクトリも、そもそもライブラリを開かせる言語の指定も選べないのは同じ理由: [信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所) を参照。
 
 ## HuggingFace の TLS 失敗への対処 (初回 DL 時)
 
