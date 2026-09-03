@@ -369,10 +369,12 @@ fn a_contract_version_this_groove_does_not_speak_is_refused_before_any_other_exp
 /// Each export the contract names is looked up, and the one that is absent is the one named.
 ///
 /// The five here are the exports read after the version, one fixture per missing symbol. The
-/// realistic way to break any of these lines is not to delete it -- `get(lib, symbols::X)?` is
-/// load-bearing, so a deletion does not compile -- but to look up the wrong constant, and a
-/// ladder is the only thing that catches that: with `symbols::LANGUAGE` swapped for
-/// `symbols::NAME`, the library missing the language export is no longer refused for it.
+/// realistic way to break any of these lines is not to delete it -- the `get` helper they all
+/// go through, private to `grooveseek/src/parser/code/plugin.rs`, is load-bearing and a
+/// deletion does not compile -- but to look up the wrong constant, and a ladder is the only
+/// thing that catches that: with [`groove_grammar_abi::symbols::LANGUAGE`] swapped for
+/// [`groove_grammar_abi::symbols::NAME`], the library missing the language export is no longer
+/// refused for it.
 ///
 /// **What this does not pin is the order of the five among themselves.** A library missing
 /// exactly one export names that one whichever order the lookups happen in, so the prose in

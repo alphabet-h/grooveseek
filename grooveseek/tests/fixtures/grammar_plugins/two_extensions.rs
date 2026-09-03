@@ -5,7 +5,8 @@
 //! declaration is expressible without hand-writing the exports. Everything else here is in
 //! order -- a real parse table, a real tags query -- so the only thing wrong is the string.
 //!
-//! Needs `grammar-rust`, unlike the fixtures refused inside `read_exports`: the extension is
+//! Needs `grammar-rust`, unlike the fixtures refused while the loader is still reading exports
+//! (`read_exports`, private to `grooveseek/src/parser/code/plugin.rs`): the extension is
 //! checked *after* the parse table has been accepted, so this one has to carry a real grammar
 //! to reach the line it is about.
 //!
