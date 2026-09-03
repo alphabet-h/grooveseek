@@ -701,11 +701,16 @@ fn split_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<
 /// A thin piece is folded forward, onto the piece that follows it, and only the last one is
 /// folded backwards, because nothing follows it to absorb it.
 ///
-/// **Definitions only**, which is why this is not folded into [`split_by_lines`] itself. The
-/// other two callers cut gap and interstitial pieces, whose chunks carry no [`crate::parser::Chunk::symbol_kind`] and
-/// so take the length penalties as before — a thin tail there is stored but never returned,
-/// and this module's own `the_line_fallback_keeps_a_tail_too_thin_to_survive_as_a_gap` test pins that it is kept
-/// rather than dropped, because ADR-0012 promises the file contributes every byte it has.
+/// **Definitions only**, which is why this is not folded into [`split_by_lines`] itself. Of the
+/// three callers, this is the only one whose thin pieces are *both* non-droppable and carrying
+/// a [`crate::parser::Chunk::symbol_kind`], and it takes both to be a problem:
+///
+/// - [`push_interstitial`] does set a [`Piece::symbol_kind`], but its pieces are droppable, so
+///   [`drop_thin_fragments`] removes a thin one before it ever reaches the index.
+/// - The gap and fallback caller emits no [`crate::parser::Chunk::symbol_kind`], so a thin piece there keeps taking the
+///   length penalties and is stored but never returned — and ADR-0012 wants it *kept*, which
+///   this module's own `the_line_fallback_keeps_a_tail_too_thin_to_survive_as_a_gap` test pins.
+///   Merging there would break that test, correctly.
 ///
 /// The floor is [`MIN_FRAGMENT_CHARS`], the one [`drop_thin_fragments`] applies to gap
 /// fragments. This merges where that drops, for the same ADR-0012 reason: a piece cut out of a

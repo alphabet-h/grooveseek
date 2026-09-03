@@ -493,11 +493,19 @@ pub fn rebuild_index(
         eprintln!("Backfilled {backfilled} chunks into FTS index");
     }
 
-    // legacy DB (quality_score = 1.0 のまま) を一度だけ再評価する。
-    // 既にスコアが入っているチャンクは触らないため冪等。
-    let quality_updated = db.backfill_quality(&registry.binary_extensions())?;
-    if quality_updated > 0 {
-        eprintln!("Backfilled {quality_updated} chunks with quality scores");
+    // legacy DB のチャンクを一度だけ再評価する。既に正しいスコアが入っている行は
+    // 触らないため冪等。
+    //
+    // **force のときは走らせない。** すぐ下の reset_and_resolve_context_mode が
+    // force なら DB を消し、その後の再 index が全チャンクを作り直すので、ここでの
+    // UPDATE は捨てられる行に対する仕事になる。加えて backfill は「短い定義チャンクを
+    // 昇格させた」時に `groove index --force` を案内する warning を出すので、
+    // **force で走っている最中に force を勧める**ことになる (codex P2 on PR #263)。
+    if !force {
+        let quality_updated = db.backfill_quality(&registry.binary_extensions())?;
+        if quality_updated > 0 {
+            eprintln!("Backfilled {quality_updated} chunks with quality scores");
+        }
     }
 
     // feature-46: effective context mode を解決 (force / grandfather / warn を含む)。
