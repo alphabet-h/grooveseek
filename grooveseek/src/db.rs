@@ -250,15 +250,22 @@ impl From<SearchResult> for SearchHit {
 /// Parent retriever 用 chunk row 抜粋。`fetch_chunks_by_index_range` の戻り値要素。
 ///
 /// Display-time content expansion で隣接 chunk を読み取るために必要な
-/// 最小フィールドのみ (`chunk_index` / `content` / `token_count` / `level`)。
-/// `level` は legacy DB (feature-28 以前) では NULL になる可能性があるため、
-/// `Option<u8>` として返す。
+/// 最小フィールドのみ。`level` は legacy DB (feature-28 以前) では NULL に
+/// なる可能性があるため、`Option<u8>` として返す。
+///
+/// 行範囲も「最小」に入る: 展開後の `SearchHit` が主張する `start_line` /
+/// `end_line` は、**その content を実際に作った chunk 群**から作り直す必要が
+/// あり (AV-08)、材料はここ以外から取れない。`symbol_kind` は載せない —
+/// 展開された hit は複数定義を跨ぐか文書全体なので、種別に単一の答えが無い。
 #[derive(Debug, Clone)]
 pub struct ChunkRow {
     pub chunk_index: i64,
     pub content: String,
     pub token_count: Option<i64>,
     pub level: Option<u8>,
+    /// (feature-56) prose chunk と、この列が出来る前に書かれた code chunk では NULL。
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
 }
 
 /// index の context 適用状態 (feature-46)。`index_meta.context_mode` に永続化する。
