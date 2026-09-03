@@ -100,7 +100,7 @@ impl QualityFilterConfig {
 /// [`LENGTH_PENALTY`] と [`STRUCTURE_PENALTY`] は「短さ」を内容の薄さの代理として読む
 /// 減点なので、**短さが形式の構造に由来する**チャンクには当てはまらない。その判定を
 /// [`crate::parser::Parser::is_binary`] の bool に兼ねさせると、あの関数が同時に持つ
-/// 「バイナリ形式 parser か」(= `get_document` の cap 分類まで流れる意味) に 2 つ目の
+/// 「バイナリ形式 parser か」(= [`crate::server`] の `documents` module にある `get_document` の cap 分類まで流れる意味) に 2 つ目の
 /// 意味が乗る。減点側だけを独立した型にして切り離す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityProfile {
@@ -109,7 +109,7 @@ pub enum QualityProfile {
     /// バイナリ形式 parser (Pdf/Docx/Xlsx/Pptx) 由来。ページ / シート / スライドの
     /// 短さは形式の構造であって内容の薄さではない (§4.8)。
     Binary,
-    /// ソースコードの定義単位チャンク (`symbol_kind` を持つ)。`MAXYEAR = 9999` や
+    /// ソースコードの定義単位チャンク ([`crate::parser::Chunk::symbol_kind`] を持つ)。`MAXYEAR = 9999` や
     /// `type ShardId = u64;` のような 1 行の定義は、短くても**値そのものが情報**で、
     /// その値はどこにも別途 index されていない (AV-07)。
     Definition,
@@ -120,7 +120,7 @@ impl QualityProfile {
     /// [`crate::db::Database::backfill_quality`]) が各自 `match` を書くと、同じ問いに
     /// 2 つ目の答えができる。
     ///
-    /// バイナリ形式 parser は `symbol_kind` を出さないので 2 つの真は同時に立たないが、
+    /// バイナリ形式 parser は [`crate::parser::Chunk::symbol_kind`] を出さないので 2 つの真は同時に立たないが、
     /// 優先順は決めておく。
     pub fn of(is_binary: bool, is_definition: bool) -> Self {
         if is_binary {
