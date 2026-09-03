@@ -5,7 +5,7 @@ looked for, and which of those locations are trusted.
 
 > **日本語版**: [configuration.ja.md](./configuration.ja.md)
 
-Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Copy [`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) to `groove.toml` and edit.
+Any CLI option in [docs/usage.md](usage.md) can be given a default via a `groove.toml` file. CLI arguments always win; the file just removes repetition for a given deployment. The discovery order is described in [Config file discovery](#config-file-discovery) below — the most common placement is the project root (CWD) or alongside the binary. Those two are not equivalent: a file groove *found* is trusted only in part, so a project-root placement wants `--config` naming it. See [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations). Copy [`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) to `groove.toml` and edit.
 
 **A fresh copy of that template changes nothing.** It is not blank — twelve sections (`[quality_filter]`, `[best_practice]`, `[parsers]`, `[parsers.code]`, `[watch]`, `[transport]`, `[transport.http]`, `[eval]`, `[search]`, `[search.mmr]`, `[search.fusion]`, `[search.parent_retriever]`) are left active so that the shape of the file is visible — but every active value in it is already the built-in default, so copying it pins those defaults rather than altering anything. Everything that *would* alter behavior is commented out. The block below is a different thing: an illustration of what each key does, with values filled in — some of them non-default, some of them just the default spelled out. Read it as a menu, not as a file to paste wholesale:
 
@@ -175,7 +175,7 @@ bind = "127.0.0.1:3100"
 # enabled = true
 ```
 
-With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
+With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags — **provided groove trusts where the file is**. One it merely found, which is what a project-root or `.git`-ancestor placement means, keeps everything about presentation but has `kb_path`, `[parsers]`, `grammar_dir`, `fastembed_cache_dir` and the `[transport.http]` gates reset to safe defaults. Name it — `groove --config ./groove.toml index` — to have it honoured in full. [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations) says which keys and why; `index` is the one to get right first, since it deletes documents whose extension the parser set no longer covers. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
 
 ## Config file discovery
 
@@ -185,9 +185,9 @@ and stops at the first hit:
 | Priority | Location                                  | Notes                                        |
 | -------- | ----------------------------------------- | -------------------------------------------- |
 | 1        | `--config <PATH>` (any subcommand)        | Errors out if the file does not exist.       |
-| 2        | `./groove.toml` (current working dir)     | Most natural for project-local KBs.          |
-| 3        | `<git-root>/groove.toml` (walks up)       | Checks CWD + up to 19 ancestors (20 dirs total). |
-| 4        | `<binary-dir>/groove.toml`                | Legacy / global-install fallback.            |
+| 2        | `./groove.toml` (current working dir)     | Most natural for project-local KBs — but **found, not named**, so trusted only in part (below). |
+| 3        | `<git-root>/groove.toml` (walks up)       | Checks CWD + up to 19 ancestors (20 dirs total). Found, not named, as above. |
+| 4        | `<binary-dir>/groove.toml`                | Legacy / global-install fallback. Trusted in full. |
 | 5        | (no config — built-in defaults)           | `--kb-path` becomes mandatory on the CLI.    |
 
 `~` in `--config` is expanded to the home directory on all platforms

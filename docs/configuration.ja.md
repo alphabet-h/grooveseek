@@ -5,7 +5,7 @@
 
 > **English version**: [configuration.md](./configuration.md)
 
-[docs/usage.ja.md](usage.ja.md) の CLI オプションはすべて `groove.toml` で既定値を与えられる。CLI 引数は常に優先され、設定ファイルは単に同じデプロイでの記述の繰り返しを減らすためのもの。配置場所の探索順は [設定ファイルの探索順](#設定ファイルの探索順) を参照 — 最も一般的なのはプロジェクトルート (CWD) かバイナリの隣。[`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) を `groove.toml` にコピーして編集する。
+[docs/usage.ja.md](usage.ja.md) の CLI オプションはすべて `groove.toml` で既定値を与えられる。CLI 引数は常に優先され、設定ファイルは単に同じデプロイでの記述の繰り返しを減らすためのもの。配置場所の探索順は [設定ファイルの探索順](#設定ファイルの探索順) を参照 — 最も一般的なのはプロジェクトルート (CWD) かバイナリの隣。**この 2 つは同等ではない**: groove が**見つけた**ファイルは一部しか信頼されないので、プロジェクトルートに置くなら `--config` で名指しするのがよい。[信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。[`grooveseek/groove.toml.example`](https://github.com/alphabet-h/grooveseek/blob/main/grooveseek/groove.toml.example) を `groove.toml` にコピーして編集する。
 
 **このテンプレートはコピーしても何も変わらない。** 空ではなく、ファイルの形が見えるように 12 個のセクション (`[quality_filter]` / `[best_practice]` / `[parsers]` / `[parsers.code]` / `[watch]` / `[transport]` / `[transport.http]` / `[eval]` / `[search]` / `[search.mmr]` / `[search.fusion]` / `[search.parent_retriever]`) は有効なまま残してあるが、**有効な値はすべて既定値そのもの**なので、コピーは「既定値を明示的に固定する」だけで挙動を変えない。挙動が変わる項目はすべてコメントアウトしてある。一方、下のブロックは別物で、各キーが何をするかを示すために値を入れた**説明用の例** — 既定値でない値もあれば、既定値をそのまま書いているものもある。**丸ごと貼るためのものではなく、メニューとして**読むこと:
 
@@ -169,7 +169,7 @@ bind = "127.0.0.1:3100"
 # enabled = true
 ```
 
-この設定ファイルを置けば `groove serve` / `index` / `status` / `graph` / `search` のどれも対応フラグを省略して動かせる。未知のキーはタイポ対策のため拒否される。`FASTEMBED_CACHE_DIR` の実環境変数は設定ファイルの同項目より優先される。
+この設定ファイルを置けば `groove serve` / `index` / `status` / `graph` / `search` のどれも対応フラグを省略して動かせる — **ただし groove がその置き場所を信頼する場合**。プロジェクトルートや `.git` 祖先に置く = groove が**見つけただけ**なので、見せ方に関するキーはそのまま効くが、`kb_path` / `[parsers]` / `grammar_dir` / `fastembed_cache_dir` / `[transport.http]` のゲートは安全な既定へ戻される。丸ごと効かせたいなら名指しすること — `groove --config ./groove.toml index`。どのキーがなぜ制限されるかは [信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。**まず直すべきは `index`** — parser 集合が対象外にした拡張子の document を削除するため。未知のキーはタイポ対策のため拒否される。`FASTEMBED_CACHE_DIR` の実環境変数は設定ファイルの同項目より優先される。
 
 ## 設定ファイルの探索順
 
@@ -179,9 +179,9 @@ bind = "127.0.0.1:3100"
 | 優先 | 場所                                       | 備考                                                     |
 | ---- | ------------------------------------------ | -------------------------------------------------------- |
 | 1    | `--config <PATH>` (全 subcommand 共通)     | 指定したファイルが無ければエラー終了 (フォールバック禁止) |
-| 2    | `./groove.toml` (CWD 直下)                 | プロジェクトローカル KB に最適                           |
-| 3    | `<git-root>/groove.toml` (祖先方向に探索)  | CWD + 最大 19 祖先 (合計 20 ディレクトリ) を確認        |
-| 4    | `<binary-dir>/groove.toml`                 | 後方互換 / グローバル install 用フォールバック            |
+| 2    | `./groove.toml` (CWD 直下)                 | プロジェクトローカル KB に最適 — ただし**名指しではなく発見**なので一部しか信頼されない (下記) |
+| 3    | `<git-root>/groove.toml` (祖先方向に探索)  | CWD + 最大 19 祖先 (合計 20 ディレクトリ) を確認。発見であることは上と同じ |
+| 4    | `<binary-dir>/groove.toml`                 | 後方互換 / グローバル install 用フォールバック。丸ごと信頼される |
 | 5    | (なし — 組み込み既定値)                    | この場合 `--kb-path` を CLI で必ず指定する必要あり        |
 
 `--config` に渡した `~` は全プラットフォームで home に展開する (`~` を展開
