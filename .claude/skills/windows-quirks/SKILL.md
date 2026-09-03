@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Fifteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, or diagnosing "works on Linux, fails on Windows" failures
+description: Sixteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -382,6 +382,27 @@ jq だと分かった。**出力の異常を、出力を作った最初のコマ
 
 出典: 2026-08-26 v1.1.0 リリースの配布物検証。詳細は `.dev/release-checklist.md` の
 「バイナリ配布チェック」節
+
+## 16. `cargo test` が `LNK1102: メモリ不足です` で落ちる (コードは無関係)
+
+full suite の link 段で MSVC の `link.exe` が exit 1102 を返し、`could not compile
+grooveseek (test "<name>")` で止まる。**コード起因ではない** — 直前まで同じ tree で
+`cargo test` が通っていても出る。
+
+```
+error: linking with `link.exe` failed: exit code: 1102
+  = note: LINK : fatal error LNK1102: メモリ不足です。
+```
+
+このリポジトリの統合テストは 1 本ごとに独立した exe になり、それぞれが ort / aws-lc-sys /
+tree-sitter などを静的リンクする。cargo は既定でコア数ぶん並列に link する。
+**同時に走る link.exe の本数がメモリを食い切るのが原因** (未計測の推定。確かなのは
+並列度を下げると通ること)。
+
+**対処: `cargo test -j 2`** で通る。エラー文面を読まずに「さっきのコード変更が悪い」と
+diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **まず並列度**。
+
+出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
