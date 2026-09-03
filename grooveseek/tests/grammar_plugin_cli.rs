@@ -41,6 +41,7 @@
 //! [`crate::every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file`] is
 //! what keeps the manifest and this file from drifting apart.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -146,12 +147,12 @@ fn a_repair_instruction_names_the_profile_it_has_to_build_into() {
 /// because declaring any `[[example]]` turns autodiscovery off; a user-facing recipe added that
 /// way is not this file's business and must not fail its test.
 ///
-/// **A name is placed, not merely mentioned.** Comment lines are dropped and the name is looked
-/// for in quotes, so a fixture named in prose does not count -- which matters, because prose
-/// naming fixtures is exactly what these docs are full of. What is left is a string literal in
-/// code, which is what every placement is: [`place_plugin`] takes the fixture name as one,
-/// whether written at the call site or in the ladder's table. A literal that no call reaches
-/// would be an unused binding, and this file has no blanket `dead_code` allowance.
+/// **A name is placed, not merely mentioned.** Only two shapes count, because only two exist:
+/// an argument written at a [`place_plugin`] call, and a row of [`LADDER`], which the ladder
+/// test hands to that same call one at a time. A name anywhere else in the file -- prose, an
+/// assertion message, some other live literal -- is a mention, and telling a mention from a
+/// placement is the whole job here: these docs are full of prose naming fixtures, so a search
+/// of the file at large would have called every one of them placed.
 ///
 /// One direction only, on purpose: a fixture named by a test but *not* declared in the manifest
 /// already fails loudly, because [`example_cdylib`] panics naming the file it could not find.
@@ -163,11 +164,37 @@ fn every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file(
     // Everything under here is a fixture for this file; anything else is someone else's example.
     const FIXTURE_DIR: &str = "tests/fixtures/grammar_plugins/";
 
-    let code = THIS_FILE
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Every placement in this file, and nothing else: the text of each `place_plugin` call, and
+    // the rows of `LADDER` that the ladder test feeds to one.
+    let mut placements = String::new();
+    let mut in_ladder = false;
+    for line in THIS_FILE.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("const LADDER") {
+            in_ladder = true;
+        }
+        if in_ladder {
+            placements.push_str(line);
+            placements.push('\n');
+            if trimmed.starts_with("];") {
+                in_ladder = false;
+            }
+            continue;
+        }
+        if let Some(call) = line.find("place_plugin(") {
+            placements.push_str(&line[call..]);
+            placements.push('\n');
+        }
+    }
+    // Both doors have to have been found. Renaming either one would otherwise leave this string
+    // short of the names it should hold, and every assertion below would pass on nothing.
+    assert!(
+        placements.contains("place_plugin(") && placements.contains("const LADDER"),
+        "a placement shape was not found, so this guard would have compared nothing"
+    );
 
     let mut in_example = false;
     let mut name = None;
@@ -208,11 +235,89 @@ fn every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file(
     );
     for fixture in declared {
         assert!(
-            code.contains(&format!("\"{fixture}\"")),
+            placements.contains(&format!("\"{fixture}\"")),
             "{fixture} is built by every `cargo test` and placed by no test here: either place \
              it in one, or drop its [[example]] entry"
         );
     }
+}
+
+/// The names inside backticks on one comment line that look like a fixture beside it.
+///
+/// Odd-numbered pieces of a split on the backtick are the ones between a pair. A stem is
+/// required, and it has to look like a file name: that drops the bare extension these docs
+/// sometimes write on its own, and any path such as `src/main.rs`, which names something in
+/// another directory and is not this guard's business.
+fn backticked_fixture_names(line: &str) -> Vec<&str> {
+    line.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|piece| {
+            piece.strip_suffix(".rs").is_some_and(|stem| {
+                !stem.is_empty()
+                    && stem
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+        })
+        .collect()
+}
+
+/// Every fixture that a fixture's own comments name is a file that is still there.
+///
+/// These fixtures cross-reference each other constantly -- "hand-written for the same reason as
+/// `null_language.rs`", "its pair is `wrong_abi.rs`" -- and **a file name cannot be written as
+/// an intra-doc link.** `AGENTS.md` asks for one for "a function, a type, a constant, a module",
+/// and rustdoc resolves items, not paths; on top of that these are `[[example]]` crates, and no
+/// two of them are in each other's dependency graph, so there is no link to write even in
+/// principle. Nor would `cargo doc` read it: it does not document example targets.
+///
+/// So the guarantee the link would have bought is bought here instead. Rename a fixture and
+/// leave a sentence pointing at the old name, and this fails naming both.
+#[test]
+fn every_fixture_named_in_a_fixture_comment_is_a_file_that_still_exists() {
+    let dir = common::docs::repo_root().join("grooveseek/tests/fixtures/grammar_plugins");
+    let mut present = BTreeSet::new();
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read the grammar fixture directory") {
+        let path = entry.expect("a grammar fixture directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a fixture file name")
+            .to_owned();
+        sources.push((name.clone(), common::docs::read(&path)));
+        present.insert(name);
+    }
+    assert!(
+        !present.is_empty(),
+        "no fixture was read out of {}, so this guard compared nothing",
+        dir.display()
+    );
+
+    let mut compared = 0usize;
+    for (owner, body) in &sources {
+        for line in body
+            .lines()
+            .filter(|line| line.trim_start().starts_with("//"))
+        {
+            for named in backticked_fixture_names(line) {
+                assert!(
+                    present.contains(named),
+                    "{owner} names {named}, which is not a file in {}",
+                    dir.display()
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(
+        compared > 0,
+        "no fixture comment named another fixture, so this guard compared nothing"
+    );
 }
 
 /// The file name the loader looks for, whatever this platform calls a dynamic library.
@@ -401,15 +506,38 @@ fn a_contract_version_this_groove_does_not_speak_is_refused_before_any_other_exp
     assert!(!db_path(&layout).exists());
 }
 
+/// The exports read after the version, each with the fixture that omits exactly that one.
+///
+/// A named table rather than an array written inside the loop, because
+/// [`every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file`] reads it:
+/// these five names reach [`place_plugin`] through a variable, so this table is where their
+/// placements are written and the only place that guard can see them.
+const LADDER: &[(&str, &str)] = &[
+    ("groove_grammar_without_language", "groove_grammar_language"),
+    ("groove_grammar_without_name", "groove_grammar_name"),
+    (
+        "groove_grammar_without_extensions",
+        "groove_grammar_extensions",
+    ),
+    (
+        "groove_grammar_without_tags_query",
+        "groove_grammar_tags_query",
+    ),
+    (
+        "groove_grammar_without_build_info",
+        "groove_grammar_build_info",
+    ),
+];
+
 /// Each export the contract names is looked up, and the one that is absent is the one named.
 ///
-/// The five here are the exports read after the version, one fixture per missing symbol. The
-/// realistic way to break any of these lines is not to delete it -- the helper they all go
-/// through, `get` in the plugin loader under [`grooveseek::parser::code`], is load-bearing and
-/// a deletion does not compile -- but to look up the wrong constant, and a ladder is the only
-/// thing that catches that: with [`groove_grammar_abi::symbols::LANGUAGE`] swapped for
-/// [`groove_grammar_abi::symbols::NAME`], the library missing the language export is no longer
-/// refused for it.
+/// The five in [`LADDER`] are the exports read after the version, one fixture per missing
+/// symbol. The realistic way to break any of these lines is not to delete it -- the helper they
+/// all go through, `get` in the plugin loader under [`grooveseek::parser::code`], is
+/// load-bearing and a deletion does not compile -- but to look up the wrong constant, and a
+/// ladder is the only thing that catches that: with [`groove_grammar_abi::symbols::LANGUAGE`]
+/// swapped for [`groove_grammar_abi::symbols::NAME`], the library missing the language export
+/// is no longer refused for it.
 ///
 /// **What this does not pin is the order of the five among themselves.** A library missing
 /// exactly one export names that one whichever order the lookups happen in, so the prose in
@@ -418,22 +546,7 @@ fn a_contract_version_this_groove_does_not_speak_is_refused_before_any_other_exp
 /// `wrong_abi.rs` (the language is the first read after it).
 #[test]
 fn every_export_the_contract_names_is_required_and_named_when_it_is_missing() {
-    for (fixture, symbol) in [
-        ("groove_grammar_without_language", "groove_grammar_language"),
-        ("groove_grammar_without_name", "groove_grammar_name"),
-        (
-            "groove_grammar_without_extensions",
-            "groove_grammar_extensions",
-        ),
-        (
-            "groove_grammar_without_tags_query",
-            "groove_grammar_tags_query",
-        ),
-        (
-            "groove_grammar_without_build_info",
-            "groove_grammar_build_info",
-        ),
-    ] {
+    for &(fixture, symbol) in LADDER {
         let layout = TempKbLayout::new("groove-plugin-ladder");
         layout.write("notes.md", SAMPLE_MD);
         let grammars = empty_grammar_dir(&layout);
