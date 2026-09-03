@@ -235,8 +235,9 @@ struct SearchParams {
     /// `content`, `expanded_from`, `match_spans` and the line metadata
     /// (`start_line` / `end_line` / `symbol_kind`) all change, because they
     /// describe the text that came back rather than the hit's ranking. An
-    /// expanded hit reports the range covering every chunk it merged, and
-    /// omits the keys entirely when the merged chunks do not all carry one.
+    /// expanded hit reports the range covering every chunk it merged, omits
+    /// the range entirely when the merged chunks do not all carry one, and
+    /// omits `symbol_kind` once more than one chunk went into the answer.
     /// When `null`, falls back to `[search.parent_retriever].enabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_retriever: Option<bool>,

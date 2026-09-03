@@ -253,10 +253,10 @@ impl From<SearchResult> for SearchHit {
 /// 最小フィールドのみ。`level` は legacy DB (feature-28 以前) では NULL に
 /// なる可能性があるため、`Option<u8>` として返す。
 ///
-/// 行範囲も「最小」に入る: 展開後の [`SearchHit`] が主張する `start_line` /
-/// `end_line` は、**その content を実際に作った chunk 群**から作り直す必要が
-/// あり (AV-08)、材料はここ以外から取れない。`symbol_kind` は載せない —
-/// 展開された hit は複数定義を跨ぐか文書全体なので、種別に単一の答えが無い。
+/// 行メタ 3 つも「最小」に入る: 展開後の [`SearchHit`] が主張する `start_line` /
+/// `end_line` / `symbol_kind` は、**その content を実際に作った chunk 群**から
+/// 作り直す必要があり (AV-08)、材料はここ以外から取れない。入力 hit の値を
+/// 継承すると、返した本文とずれたまま残る。
 #[derive(Debug, Clone)]
 pub struct ChunkRow {
     pub chunk_index: i64,
@@ -266,6 +266,7 @@ pub struct ChunkRow {
     /// (feature-56) prose chunk と、この列が出来る前に書かれた code chunk では NULL。
     pub start_line: Option<u32>,
     pub end_line: Option<u32>,
+    pub symbol_kind: Option<String>,
 }
 
 /// index の context 適用状態 (feature-46)。`index_meta.context_mode` に永続化する。
