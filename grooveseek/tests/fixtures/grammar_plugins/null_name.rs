@@ -11,8 +11,9 @@
 //! would also send the reader looking for an encoding problem in a string that was never there.
 //!
 //! The name is the first of the three strings copied out, so this fixture is what reaches that
-//! line at all; `plugin.rs` names which export was NULL from an argument, and the wording of all
-//! three is pinned by its unit tests rather than by three fixtures here.
+//! line at all; the loader under [`grooveseek::parser::code`] names which export was NULL from
+//! an argument, and the wording of all three is pinned by its own unit tests rather than by
+//! three fixtures here.
 
 use core::ffi::c_char;
 

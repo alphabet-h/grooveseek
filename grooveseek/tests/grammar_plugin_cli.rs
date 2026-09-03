@@ -141,6 +141,18 @@ fn a_repair_instruction_names_the_profile_it_has_to_build_into() {
 /// Both halves are read at compile time, so the manifest checked is the one that built the
 /// libraries this binary opens rather than whatever happens to be on disk when it runs.
 ///
+/// **Only the entries whose `path` is under the grammar fixture directory are asked about.**
+/// The manifest says an `.rs` dropped into `examples/` later has to be declared here too,
+/// because declaring any `[[example]]` turns autodiscovery off; a user-facing recipe added that
+/// way is not this file's business and must not fail its test.
+///
+/// **A name is placed, not merely mentioned.** Comment lines are dropped and the name is looked
+/// for in quotes, so a fixture named in prose does not count -- which matters, because prose
+/// naming fixtures is exactly what these docs are full of. What is left is a string literal in
+/// code, which is what every placement is: [`place_plugin`] takes the fixture name as one,
+/// whether written at the call site or in the ladder's table. A literal that no call reaches
+/// would be an unused binding, and this file has no blanket `dead_code` allowance.
+///
 /// One direction only, on purpose: a fixture named by a test but *not* declared in the manifest
 /// already fails loudly, because [`example_cdylib`] panics naming the file it could not find.
 /// The silent half is the other one.
@@ -148,8 +160,17 @@ fn a_repair_instruction_names_the_profile_it_has_to_build_into() {
 fn every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file() {
     const MANIFEST: &str = include_str!("../Cargo.toml");
     const THIS_FILE: &str = include_str!("grammar_plugin_cli.rs");
+    // Everything under here is a fixture for this file; anything else is someone else's example.
+    const FIXTURE_DIR: &str = "tests/fixtures/grammar_plugins/";
+
+    let code = THIS_FILE
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut in_example = false;
+    let mut name = None;
     let mut declared = Vec::new();
     for line in MANIFEST.lines() {
         let line = line.trim();
@@ -157,25 +178,39 @@ fn every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file(
         // this manifest that holds an array writes it on one line, after its key.
         if line.starts_with('[') && line.ends_with(']') {
             in_example = line == "[[example]]";
+            name = None;
             continue;
         }
-        if in_example
-            && let Some(rest) = line.strip_prefix("name = \"")
-            && let Some(name) = rest.strip_suffix('"')
+        if !in_example {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name = \"")
+            && let Some(value) = rest.strip_suffix('"')
         {
-            declared.push(name);
+            name = Some(value);
+        }
+        if let Some(rest) = line.strip_prefix("path = \"")
+            && let Some(value) = rest.strip_suffix('"')
+            && value.starts_with(FIXTURE_DIR)
+        {
+            // Reading `name` then `path` is an assumption about the manifest's own order, so a
+            // block written the other way round is a loud failure rather than a fixture the
+            // guard quietly stops asking about.
+            declared.push(name.take().unwrap_or_else(|| {
+                panic!("{value} declares its path before its name, which this guard reads first")
+            }));
         }
     }
 
     assert!(
         !declared.is_empty(),
-        "no [[example]] name was read out of the manifest, so this guard compared nothing"
+        "no grammar fixture was read out of the manifest, so this guard compared nothing"
     );
-    for name in declared {
+    for fixture in declared {
         assert!(
-            THIS_FILE.contains(name),
-            "{name} is built by every `cargo test` and opened by no test here: either place it \
-             in one, or drop its [[example]] entry"
+            code.contains(&format!("\"{fixture}\"")),
+            "{fixture} is built by every `cargo test` and placed by no test here: either place \
+             it in one, or drop its [[example]] entry"
         );
     }
 }
@@ -369,9 +404,9 @@ fn a_contract_version_this_groove_does_not_speak_is_refused_before_any_other_exp
 /// Each export the contract names is looked up, and the one that is absent is the one named.
 ///
 /// The five here are the exports read after the version, one fixture per missing symbol. The
-/// realistic way to break any of these lines is not to delete it -- the `get` helper they all
-/// go through, private to `grooveseek/src/parser/code/plugin.rs`, is load-bearing and a
-/// deletion does not compile -- but to look up the wrong constant, and a ladder is the only
+/// realistic way to break any of these lines is not to delete it -- the helper they all go
+/// through, `get` in the plugin loader under [`grooveseek::parser::code`], is load-bearing and
+/// a deletion does not compile -- but to look up the wrong constant, and a ladder is the only
 /// thing that catches that: with [`groove_grammar_abi::symbols::LANGUAGE`] swapped for
 /// [`groove_grammar_abi::symbols::NAME`], the library missing the language export is no longer
 /// refused for it.

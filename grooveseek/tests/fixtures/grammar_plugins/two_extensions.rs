@@ -6,7 +6,7 @@
 //! order -- a real parse table, a real tags query -- so the only thing wrong is the string.
 //!
 //! Needs `grammar-rust`, unlike the fixtures refused while the loader is still reading exports
-//! (`read_exports`, private to `grooveseek/src/parser/code/plugin.rs`): the extension is
+//! (`read_exports`, in the plugin loader under [`grooveseek::parser::code`]): the extension is
 //! checked *after* the parse table has been accepted, so this one has to carry a real grammar
 //! to reach the line it is about.
 //!
