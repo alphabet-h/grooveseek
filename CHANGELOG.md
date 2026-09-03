@@ -51,6 +51,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `quality_score`, so nothing is re-embedded and `--force` is not needed. See
   [ADR-0015](docs/decisions/0015-let-a-definition-be-short.md).
 
+- **A definition split across chunks no longer ends in a chunk holding only its
+  closing brace.** A definition over `[parsers.code].max_chunk_chars` is split
+  by lines, each piece keeping the definition's heading and kind, and a split
+  whose last cut landed just before the closing brace left a chunk whose text
+  was `}` and whose heading was the function's name — which bm25 weights. The
+  quality filter hid it, and the exemption above would have started returning
+  it. A final piece under the short-content threshold is now folded back onto
+  the piece before it. Gap and fallback pieces are unchanged: they carry no
+  `symbol_kind`, so they keep taking the length penalties, and a thin tail there
+  is deliberately kept rather than merged.
+
 ### Fixed
 
 - **A hit the parent retriever expanded now reports the line range of what

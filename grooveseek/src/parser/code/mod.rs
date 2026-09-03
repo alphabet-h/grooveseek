@@ -499,7 +499,7 @@ fn emit_def(
     if def.children.is_empty() {
         // Methods and functions hold no nested definitions, so this is the common path for an
         // oversized body rather than an exceptional one.
-        for range in split_by_lines(text, &def.covered, budget) {
+        for range in split_definition_by_lines(text, &def.covered, budget) {
             out.push(Piece {
                 range,
                 heading: Some(heading.clone()),
@@ -684,6 +684,46 @@ fn split_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<
     out
 }
 
+/// [`split_by_lines`], with a final piece too thin to stand alone folded back onto the piece
+/// before it.
+///
+/// A cut lands wherever the next line would overrun the budget, so the last piece can end up
+/// holding nothing but a closing brace. For a piece of a **definition** that is a chunk worth
+/// removing: it carries the definition's heading and kind — and bm25 weights the heading —
+/// while its text says nothing. Since [ADR-0015] made a definition exempt from the length
+/// penalties, the quality filter no longer hides it either.
+///
+/// Only the last piece can be this small: a cut happens only when a line would overrun the
+/// budget, so every piece before it ends at or past the budget.
+///
+/// **Definitions only**, which is why this is not folded into [`split_by_lines`] itself. The
+/// other two callers cut gap and interstitial pieces, whose chunks carry no [`crate::parser::Chunk::symbol_kind`] and
+/// so take the length penalties as before — a thin tail there is stored but never returned,
+/// and this module's own `the_line_fallback_keeps_a_tail_too_thin_to_survive_as_a_gap` test pins that it is kept
+/// rather than dropped, because ADR-0012 promises the file contributes every byte it has.
+///
+/// The floor is [`MIN_FRAGMENT_CHARS`], the one [`drop_thin_fragments`] applies to gap
+/// fragments. This merges where that drops, for the same ADR-0012 reason: a piece cut out of a
+/// definition is not droppable, so its bytes have to go somewhere.
+///
+/// The invariant it buys: **a chunk carrying a `symbol_kind` and shorter than
+/// [`MIN_FRAGMENT_CHARS`] is a whole short definition.** That is the assumption the quality
+/// filter's definition exemption rests on.
+///
+/// [ADR-0015]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0015-let-a-definition-be-short.md
+fn split_definition_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<usize>> {
+    let mut out = split_by_lines(text, range, budget);
+    if out.len() > 1 {
+        let last = out[out.len() - 1].clone();
+        if fragment_chars(text, &last) < MIN_FRAGMENT_CHARS {
+            out.pop();
+            let prev = out.len() - 1;
+            out[prev].end = last.end;
+        }
+    }
+    out
+}
+
 fn line_starts(text: &str) -> Vec<usize> {
     let mut out = vec![0usize];
     for (i, b) in text.bytes().enumerate() {
@@ -831,6 +871,45 @@ impl Counter {
             gap.content
         );
         assert_eq!(gap.symbol_kind, None);
+    }
+
+    /// A split must not leave a piece holding only the closing brace.
+    ///
+    /// Built to land exactly on that: at a budget of 40, the signature weighs 9 non-whitespace
+    /// characters and the middle line is padded to weigh 31, so the two together fill the
+    /// budget and the next line — `}`, weighing 1 — overruns it. Before the merge this
+    /// produced a chunk whose content was `}` and whose heading and `symbol_kind` were the
+    /// function's, which the quality filter used to hide and, once definitions became exempt
+    /// from the length penalties (ADR-0015), would have started returning.
+    #[test]
+    fn a_split_never_leaves_a_piece_too_thin_to_stand_alone() {
+        let digits = "1".repeat(25);
+        let src = format!("pub fn f(){{\n    let x = {digits};\n}}\n");
+        let doc = parse(&src, 40);
+        let defs: Vec<&Chunk> = doc
+            .chunks
+            .iter()
+            .filter(|c| c.symbol_kind.is_some())
+            .collect();
+        assert!(
+            !defs.is_empty(),
+            "expected definition chunks: {:#?}",
+            doc.chunks
+        );
+        for d in &defs {
+            assert!(
+                d.content.trim().chars().count() >= MIN_FRAGMENT_CHARS,
+                "a definition chunk under the fragment floor can only be a whole short \
+                 definition, got {:?} from a split of an oversized one",
+                d.content
+            );
+        }
+        // The bytes are not lost, only moved onto the piece before (ADR-0012).
+        let joined: String = defs.iter().map(|d| d.content.as_str()).collect();
+        assert!(
+            joined.contains('}'),
+            "the closing brace has to survive the merge: {joined:?}"
+        );
     }
 
     #[test]

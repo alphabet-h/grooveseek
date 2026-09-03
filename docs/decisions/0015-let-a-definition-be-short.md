@@ -121,6 +121,19 @@ ride on a flag that also decides size caps.
 - **The boilerplate penalty still applies to a definition.** A chunk whose whole
   text is `TODO` is thin whatever produced it. Only the two length-based signals
   are exempted.
+- **The chunker had to stop producing one shape for this to be safe.** A
+  definition over the chunk budget is split by lines, and each piece keeps the
+  definition's heading and kind — so a split whose last cut landed before the
+  closing brace produced a chunk whose text was `}` and whose heading was the
+  function's name, which bm25 weights. The quality filter used to hide it; the
+  exemption would have started returning it. A final piece under the
+  short-content threshold is now folded back onto the piece before it, which
+  makes the assumption this decision rests on true: **a chunk carrying a
+  `symbol_kind` and shorter than that threshold is a whole short definition.**
+  Gap and fallback pieces are untouched — they carry no `symbol_kind`, take the
+  penalties as before, and ADR-0012 wants their thin tails kept rather than
+  merged. An index built before this release keeps whatever chunks it has until
+  the file changes or `groove index --force` rebuilds it.
 - **An index built before this release catches up on its next `groove index`.**
   The backfill pass, which previously looked only at chunks still holding the
   column default, now also revisits chunks carrying a `symbol_kind`. It rewrites
