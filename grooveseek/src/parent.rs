@@ -39,6 +39,32 @@ pub(crate) fn is_small_chunk(token_count: Option<i64>, threshold: u32) -> bool {
     token_count.map(|t| (t as u32) < threshold).unwrap_or(false)
 }
 
+/// 連結した `rows` が覆う 1-based inclusive の行範囲。**全 row が範囲を持つとき
+/// だけ** `(Some(min), Some(max))` を返し、1 つでも欠けるか空なら `(None, None)`。
+///
+/// **all-or-nothing の理由 (AV-08)**: 範囲を持つ row だけで min/max を取ると、
+/// 範囲の外にある本文が `content` に混ざったまま「返した本文はこの範囲から来て
+/// いる」と主張することになる。`docs/behavior.md` が約束しているのはその主張
+/// そのものなので、揃わないときは**主張しない** — `SearchHit` の 3 つの行
+/// フィールドは `skip_serializing_if` 付きなので、`None` は「キーごと不在」= 既に
+/// 散文 hit が取っている形になり、client から見た shape は変わらない。
+///
+/// 散文だけの KB では 3 列が全 NULL なので必ず `(None, None)` を返す = 代入の
+/// 前後で値が変わらない。行メタは ranking にも入らないので、eval の
+/// 「parent retriever は metric に触らない」invariant はこの関数を足しても保たれる。
+fn merged_line_bounds(rows: &[ChunkRow]) -> (Option<u32>, Option<u32>) {
+    let mut min_start = None::<u32>;
+    let mut max_end = None::<u32>;
+    for row in rows {
+        let (Some(start), Some(end)) = (row.start_line, row.end_line) else {
+            return (None, None);
+        };
+        min_start = Some(min_start.map_or(start, |m| m.min(start)));
+        max_end = Some(max_end.map_or(end, |m| m.max(end)));
+    }
+    (min_start, max_end)
+}
+
 /// Parent retriever 設定。groove.toml `[search.parent_retriever]` と
 /// 1:1 対応する。Task 3.5 で `ParentRetrieverConfig` を加えた後はこの構造体を
 /// 該当 config から構築する。
@@ -144,6 +170,15 @@ fn expand_adjacent(
         // find 失敗時も拡張前 match_spans が stale で残らず、observability
         // 上 cap-exceeded path 通過が常に検出できる。
         hit.match_spans = None;
+        // AV-08: **この経路では行メタを触らない。** 上の `find` が当たれば
+        // `hit.content` に入るのは hit chunk 自身の content で、search が返した
+        // ものと同じ文字列 (どちらも `chunks.content` を素で読む。context 合成も
+        // スニペット化も挟まない)。当たらなければ `hit.content` は書き換わらない。
+        // どちらの答えでも本文は hit chunk のものなので、行範囲は正しいまま —
+        // ここで `None` にするのは情報を捨てるだけになる。
+        //
+        // 「content を差し替えたら派生メタも無効」という `match_spans` の推論は
+        // **content が実際に差し替わった経路にしか当てはまらない**。
         hit.expanded_from = Some(ExpandedRange::Adjacent {
             from_index: chunk_idx as usize,
             to_index: chunk_idx as usize,
@@ -175,6 +210,17 @@ fn expand_adjacent(
     // ここで defensive に None クリアしておけば「再計算忘れ」で stale offset
     // が leak することを防げる。
     hit.match_spans = None;
+    // AV-08: 行メタは content と同じ材料 (`sorted`) から作り直す。継承しない。
+    //
+    // **`match_spans` と扱いが違う理由**: あちらは無条件 `None` でよい —
+    // 呼び出し側に「拡張後 content に対して再計算する」受け皿があるので、
+    // ここでの None は「まだ計算していない」を意味する。行メタには受け皿が
+    // 無いので、None は「範囲を主張できない」を意味する終端の答えになる。
+    // 同じ「派生メタは無効」という推論から、片方は clear、もう片方は
+    // recompute という違う結論が出る。
+    (hit.start_line, hit.end_line) = merged_line_bounds(&sorted);
+    // 複数の定義を跨いだので「この chunk が持つ定義の種別」に単一の答えが無い。
+    hit.symbol_kind = None;
     hit.expanded_from = Some(ExpandedRange::Adjacent {
         from_index: from_idx,
         to_index: to_idx,
@@ -236,6 +282,13 @@ fn expand_whole_document(
     // adjacent merge と同様に defensive クリア。呼び出し側 (run_search_pipeline)
     // が拡張後 content に対して compute_match_spans を再計算する責務。
     hit.match_spans = None;
+    // AV-08: adjacent merge と同じ規則で `chunks` から作り直す。ここに到達した
+    // 時点で `chunks` は truncate されていないその doc の全 chunk である —
+    // row_cap で切られた場合と token cap を超えた場合はどちらも上で
+    // `expand_adjacent` へ委譲して return しているので、この範囲は
+    // 「文書全体」として正当。
+    (hit.start_line, hit.end_line) = merged_line_bounds(&chunks);
+    hit.symbol_kind = None;
     hit.expanded_from = Some(ExpandedRange::WholeDocument { total_chunks });
     Ok(hit)
 }
@@ -1407,6 +1460,14 @@ mod tests {
         assert_eq!(expanded.start_line, Some(501));
         assert_eq!(expanded.end_line, Some(1000));
         assert_eq!(expanded.symbol_kind.as_deref(), Some("function"));
+    }
+
+    /// 空 slice では範囲を主張しない。`merged_line_bounds` の 2 つの呼び出し元は
+    /// どちらも直前に `is_empty()` で早期 return する (`neighbors` / `chunks`) ので
+    /// 統合経路からは到達できない = pure fn を直接呼ぶ以外にこの答えを覆う手が無い。
+    #[test]
+    fn test_merged_line_bounds_on_empty_slice_claims_nothing() {
+        assert_eq!(merged_line_bounds(&[]), (None, None));
     }
 
     proptest::proptest! {
