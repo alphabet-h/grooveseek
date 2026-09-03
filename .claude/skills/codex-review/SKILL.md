@@ -65,9 +65,16 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
   `doc = false`、`benches/` は `cargo doc` が document しないので、この 2 つの中の link を
   検査するのは `cargo doc` ではなく codex だけ
 - 同じ `#[cfg(test)] mod tests` の中なら、隣の test fn 名は bare link
+- **同じ module の doc から、その module の private item へは張れる。** `const LENGTH_PENALTY`
+  のような非 `pub` の const でも、`quality.rs` の `//!` / `///` からなら rustdoc が解決する
+  (2026-09-04 に確認: リンク化して `cargo doc --no-deps` が exit 0、対照として 1 語を存在しない
+  名前に変えると `error: unresolved link` で exit 101 = lint は生きている)。**「private」の一語で
+  下の行へ振らない** — 台帳 #43 はそれで P2 を受けた
 - **リンクにできないものは backtick のまま残し、散文で持ち主 (module / file) を名指す**:
-  他 module に private な item / 非 test の doc から名指した `#[cfg(test)]` の item /
-  `tests/` crate から見た lib の `pub(crate)` item / 別の `tests/` crate の test fn
+  **他** module に private な item / 非 test の doc から名指した `#[cfg(test)]` の item /
+  `tests/` crate から見た lib の `pub(crate)` item / 別の `tests/` crate の test fn。
+  **迷ったらリンクにして `cargo doc --no-deps` を 1 回回す** — 張れないなら
+  `unresolved link` で落ちるので、推測する必要が無い
 
 **見えるのは追加行だけ** (`^+` で絞っている)。既存行に残った古い名前はここには出ない —
 そちらは `cargo doc` と review 側の仕事。分類の実例は
