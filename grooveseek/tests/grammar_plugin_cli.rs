@@ -1280,3 +1280,69 @@ fn the_python_grammar_groove_publishes_is_one_its_loader_accepts() {
         "the grammar's own name is what a `lang:` filter matches on: {body}"
     );
 }
+
+/// Module-level constants short enough that the prose quality rules used to hide them.
+///
+/// [`SAMPLE_PY_REAL`] above cannot stand in for this: its one assignment is 48 characters, over
+/// the 30-character short-content threshold, so it never took the penalties this is about.
+/// These three are 14, 18 and 24 characters and, before v1.4.0, each scored
+/// `1.0 - 0.6 (length) - 0.3 (structure) = 0.1` against a default cutoff of `0.3`.
+///
+/// The values are the point: `9999`, `44` and `0x00100000` are what a reader is looking for,
+/// and none of them is written down anywhere else in an index. This is the shape the AV-07
+/// census found 721 of in CPython's `Lib/*.py`, against 0 in the Rust the same census read.
+const SHORT_CONSTANTS_PY: &str = "MAXYEAR = 9999\nHAVE_ARGUMENT = 44\nSF_NOUNLINK = 0x00100000\n";
+
+#[test]
+#[ignore]
+fn a_short_python_constant_comes_back_without_asking_for_low_quality_hits() {
+    let layout = TempKbLayout::new("groove-plugin-python-short");
+    layout.write("consts.py", SHORT_CONSTANTS_PY);
+    let grammars = empty_grammar_dir(&layout);
+    std::fs::copy(shipped_cdylib(), grammars.join(plugin_file_name())).expect("place plugin");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(
+        ok,
+        "indexing with the shipped grammar must succeed:\n{stderr}"
+    );
+
+    for (query, needle) in [
+        ("MAXYEAR", "MAXYEAR = 9999"),
+        ("HAVE_ARGUMENT", "HAVE_ARGUMENT = 44"),
+        ("SF_NOUNLINK", "SF_NOUNLINK = 0x00100000"),
+    ] {
+        let out = Command::new(grooveseek_bin())
+            .args([
+                "--config",
+                cfg.to_str().unwrap(),
+                "search",
+                query,
+                "--kb-path",
+                &layout.kb().display().to_string(),
+                "--limit",
+                "10",
+            ])
+            // Deliberately no `--include-low-quality`: that flag passing is what the old
+            // behaviour already did, and it would make this test green either way.
+            .output()
+            .expect("groove search");
+        assert!(
+            out.status.success(),
+            "search failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("search returns json by default");
+        let results = body["results"].as_array().expect("results array");
+        let hit = results
+            .iter()
+            .find(|r| r["content"].as_str().unwrap_or_default().contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} was filtered out of a default search: {body}"));
+        assert_eq!(
+            hit["symbol_kind"], "constant",
+            "the value has to come back as the definition it is, not as a gap fragment: {hit}"
+        );
+    }
+}
