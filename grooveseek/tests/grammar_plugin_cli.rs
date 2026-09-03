@@ -24,10 +24,24 @@
 //! # The fixtures
 //!
 //! `tests/fixtures/grammar_plugins/*.rs`, built as `cdylib`s by `cargo test` through the
-//! `[[example]]` entries in `Cargo.toml`. They hand over the Rust parse table under whatever
-//! extension the case needs; the loader checks a contract and does not know one language from
-//! another.
+//! `[[example]]` entries in `Cargo.toml`. They come in two families, and which family a case
+//! belongs to is decided by the loader rather than by taste:
+//!
+//! - **Built by [`groove_grammar_abi::groove_grammar_plugin`]**, and so needing `grammar-rust`
+//!   to have a parse table to hand over. These are the cases decided *after* the table has been
+//!   accepted -- the extension, the name, the tags query -- which a fixture with no real table
+//!   cannot reach. They hand over the Rust parse table under whatever extension the case needs;
+//!   the loader checks a contract and does not know one language from another.
+//! - **Hand-written, export by export**, and needing no grammar crate at all. These are the
+//!   cases decided *before* the table is asked for: a version, a missing export, a NULL, a
+//!   length that does not describe its pointer, bytes that are not UTF-8. Every one of them is
+//!   a shape the macro cannot express, which is why they are written out by hand rather than
+//!   out of preference.
+//!
+//! [`crate::every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file`] is
+//! what keeps the manifest and this file from drifting apart.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -115,6 +129,194 @@ fn a_repair_instruction_names_the_profile_it_has_to_build_into() {
         profile_flag(Path::new("/w/target/dist")),
         " --profile <the profile you are running>",
         "a named profile is still reachable, and saying nothing would repeat the bug"
+    );
+}
+
+/// Every grammar fixture the manifest builds is opened by a test in this file.
+///
+/// The failure this stops is the one `AV-09` found: a `[[example]]` declared, built by every
+/// `cargo test` since, and opened by nothing -- so the check it was written for stayed
+/// unverified while the build cost was paid on every run. A list with nothing to compare
+/// against is how that survives, and this is the comparison.
+///
+/// Both halves are read at compile time, so the manifest checked is the one that built the
+/// libraries this binary opens rather than whatever happens to be on disk when it runs.
+///
+/// **Only the entries whose `path` is under the grammar fixture directory are asked about.**
+/// The manifest says an `.rs` dropped into `examples/` later has to be declared here too,
+/// because declaring any `[[example]]` turns autodiscovery off; a user-facing recipe added that
+/// way is not this file's business and must not fail its test.
+///
+/// **A name is placed, not merely mentioned.** Only two shapes count, because only two exist:
+/// an argument written at a [`place_plugin`] call, and a row of [`LADDER`], which the ladder
+/// test hands to that same call one at a time. A name anywhere else in the file -- prose, an
+/// assertion message, some other live literal -- is a mention, and telling a mention from a
+/// placement is the whole job here: these docs are full of prose naming fixtures, so a search
+/// of the file at large would have called every one of them placed.
+///
+/// One direction only, on purpose: a fixture named by a test but *not* declared in the manifest
+/// already fails loudly, because [`example_cdylib`] panics naming the file it could not find.
+/// The silent half is the other one.
+#[test]
+fn every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file() {
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+    const THIS_FILE: &str = include_str!("grammar_plugin_cli.rs");
+    // Everything under here is a fixture for this file; anything else is someone else's example.
+    const FIXTURE_DIR: &str = "tests/fixtures/grammar_plugins/";
+
+    // Every placement in this file, and nothing else: the text of each `place_plugin` call, and
+    // the rows of `LADDER` that the ladder test feeds to one.
+    let mut placements = String::new();
+    let mut in_ladder = false;
+    for line in THIS_FILE.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("const LADDER") {
+            in_ladder = true;
+        }
+        if in_ladder {
+            placements.push_str(line);
+            placements.push('\n');
+            if trimmed.starts_with("];") {
+                in_ladder = false;
+            }
+            continue;
+        }
+        if let Some(call) = line.find("place_plugin(") {
+            placements.push_str(&line[call..]);
+            placements.push('\n');
+        }
+    }
+    // Both doors have to have been found. Renaming either one would otherwise leave this string
+    // short of the names it should hold, and every assertion below would pass on nothing.
+    assert!(
+        placements.contains("place_plugin(") && placements.contains("const LADDER"),
+        "a placement shape was not found, so this guard would have compared nothing"
+    );
+
+    let mut in_example = false;
+    let mut name = None;
+    let mut declared = Vec::new();
+    for line in MANIFEST.lines() {
+        let line = line.trim();
+        // A trimmed line that opens and closes with a bracket is a table header; every value in
+        // this manifest that holds an array writes it on one line, after its key.
+        if line.starts_with('[') && line.ends_with(']') {
+            in_example = line == "[[example]]";
+            name = None;
+            continue;
+        }
+        if !in_example {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("name = \"")
+            && let Some(value) = rest.strip_suffix('"')
+        {
+            name = Some(value);
+        }
+        if let Some(rest) = line.strip_prefix("path = \"")
+            && let Some(value) = rest.strip_suffix('"')
+            && value.starts_with(FIXTURE_DIR)
+        {
+            // Reading `name` then `path` is an assumption about the manifest's own order, so a
+            // block written the other way round is a loud failure rather than a fixture the
+            // guard quietly stops asking about.
+            declared.push(name.take().unwrap_or_else(|| {
+                panic!("{value} declares its path before its name, which this guard reads first")
+            }));
+        }
+    }
+
+    assert!(
+        !declared.is_empty(),
+        "no grammar fixture was read out of the manifest, so this guard compared nothing"
+    );
+    for fixture in declared {
+        assert!(
+            placements.contains(&format!("\"{fixture}\"")),
+            "{fixture} is built by every `cargo test` and placed by no test here: either place \
+             it in one, or drop its [[example]] entry"
+        );
+    }
+}
+
+/// The names inside backticks on one comment line that look like a fixture beside it.
+///
+/// Odd-numbered pieces of a split on the backtick are the ones between a pair. A stem is
+/// required, and it has to look like a file name: that drops the bare extension these docs
+/// sometimes write on its own, and any path such as `src/main.rs`, which names something in
+/// another directory and is not this guard's business.
+fn backticked_fixture_names(line: &str) -> Vec<&str> {
+    line.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|piece| {
+            piece.strip_suffix(".rs").is_some_and(|stem| {
+                !stem.is_empty()
+                    && stem
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+        })
+        .collect()
+}
+
+/// Every fixture that a fixture's own comments name is a file that is still there.
+///
+/// These fixtures cross-reference each other constantly -- "hand-written for the same reason as
+/// `null_language.rs`", "its pair is `wrong_abi.rs`" -- and **a file name cannot be written as
+/// an intra-doc link.** `AGENTS.md` asks for one for "a function, a type, a constant, a module",
+/// and rustdoc resolves items, not paths; on top of that these are `[[example]]` crates, and no
+/// two of them are in each other's dependency graph, so there is no link to write even in
+/// principle. Nor would `cargo doc` read it: it does not document example targets.
+///
+/// So the guarantee the link would have bought is bought here instead. Rename a fixture and
+/// leave a sentence pointing at the old name, and this fails naming both.
+#[test]
+fn every_fixture_named_in_a_fixture_comment_is_a_file_that_still_exists() {
+    let dir = common::docs::repo_root().join("grooveseek/tests/fixtures/grammar_plugins");
+    let mut present = BTreeSet::new();
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read the grammar fixture directory") {
+        let path = entry.expect("a grammar fixture directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a fixture file name")
+            .to_owned();
+        sources.push((name.clone(), common::docs::read(&path)));
+        present.insert(name);
+    }
+    assert!(
+        !present.is_empty(),
+        "no fixture was read out of {}, so this guard compared nothing",
+        dir.display()
+    );
+
+    let mut compared = 0usize;
+    for (owner, body) in &sources {
+        for line in body
+            .lines()
+            .filter(|line| line.trim_start().starts_with("//"))
+        {
+            for named in backticked_fixture_names(line) {
+                assert!(
+                    present.contains(named),
+                    "{owner} names {named}, which is not a file in {}",
+                    dir.display()
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(
+        compared > 0,
+        "no fixture comment named another fixture, so this guard compared nothing"
     );
 }
 
@@ -264,6 +466,217 @@ fn a_library_without_the_contract_is_refused_by_the_symbol_it_lacks() {
 }
 
 // ---------------------------------------------------------------------------
+// (iii) Everything the loader settles before it asks for a parse table
+// ---------------------------------------------------------------------------
+//
+// The contract version, the five remaining exports, and the bytes each of them hands back.
+// None of these fixtures carries a grammar, because none of them is reached with one: the
+// loader decides all of it inside `read_exports`, which runs before the table is asked for.
+
+/// The version is settled while nothing else has been touched.
+///
+/// Every other export is read through the signature *this* ABI defines, so a library built at
+/// another version may have dropped a symbol -- which would be reported as a missing export,
+/// sending the user to look for a corrupt download rather than a mismatched version -- or kept
+/// the name and changed the signature, in which case calling it is undefined behaviour.
+///
+/// **The second assertion is the one that pins the order.** `wrong_abi.rs` exports the version
+/// and nothing else, so a loader that read the exports first could only answer "it does not
+/// export groove_grammar_language". Its pair is `without_language.rs`, which lacks that same
+/// export and *does* get that answer, the only difference between them being a version number
+/// this groove speaks.
+#[test]
+fn a_contract_version_this_groove_does_not_speak_is_refused_before_any_other_export_is_read() {
+    let layout = TempKbLayout::new("groove-plugin-wrongabi");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_wrong_abi");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a contract version mismatch must fail:\n{stderr}");
+    assert!(
+        stderr.contains("declares grammar ABI version"),
+        "expected the version to be named as the reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("does not export"),
+        "the version must be settled before any export is looked up:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// The exports read after the version, each with the fixture that omits exactly that one.
+///
+/// A named table rather than an array written inside the loop, because
+/// [`every_grammar_fixture_the_manifest_declares_is_placed_by_a_test_in_this_file`] reads it:
+/// these five names reach [`place_plugin`] through a variable, so this table is where their
+/// placements are written and the only place that guard can see them.
+const LADDER: &[(&str, &str)] = &[
+    ("groove_grammar_without_language", "groove_grammar_language"),
+    ("groove_grammar_without_name", "groove_grammar_name"),
+    (
+        "groove_grammar_without_extensions",
+        "groove_grammar_extensions",
+    ),
+    (
+        "groove_grammar_without_tags_query",
+        "groove_grammar_tags_query",
+    ),
+    (
+        "groove_grammar_without_build_info",
+        "groove_grammar_build_info",
+    ),
+];
+
+/// Each export the contract names is looked up, and the one that is absent is the one named.
+///
+/// The five in [`LADDER`] are the exports read after the version, one fixture per missing
+/// symbol. The realistic way to break any of these lines is not to delete it -- the helper they
+/// all go through, `get` in the plugin loader under [`grooveseek::parser::code`], is
+/// load-bearing and a deletion does not compile -- but to look up the wrong constant, and a
+/// ladder is the only thing that catches that: with [`groove_grammar_abi::symbols::LANGUAGE`]
+/// swapped for [`groove_grammar_abi::symbols::NAME`], the library missing the language export
+/// is no longer refused for it.
+///
+/// **What this does not pin is the order of the five among themselves.** A library missing
+/// exactly one export names that one whichever order the lookups happen in, so the prose in
+/// [`groove_grammar_abi::symbols`] is not observable from out here beyond its head -- and the
+/// head is pinned twice already, by `no_symbols.rs` (the version is looked up first) and by
+/// `wrong_abi.rs` (the language is the first read after it).
+#[test]
+fn every_export_the_contract_names_is_required_and_named_when_it_is_missing() {
+    for &(fixture, symbol) in LADDER {
+        let layout = TempKbLayout::new("groove-plugin-ladder");
+        layout.write("notes.md", SAMPLE_MD);
+        let grammars = empty_grammar_dir(&layout);
+        place_plugin(&grammars, fixture);
+        let cfg = write_config(&layout, Some(&grammars));
+
+        let (ok, stderr) = run_index(&cfg, layout.kb());
+        assert!(!ok, "{fixture}: a missing export must fail:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("does not export {symbol}")),
+            "{fixture}: expected {symbol} to be named:\n{stderr}"
+        );
+        assert!(!db_path(&layout).exists(), "{fixture}");
+    }
+}
+
+/// A declared length is checked before it is used to build a slice.
+///
+/// The tags query crosses the ABI as a pointer and a length, and nothing makes the two agree.
+/// The fixture's pointer is real and two bytes long, so a loader that trusted the length would
+/// hand `slice::from_raw_parts` a gigabyte starting at a two-byte static: a read off the end of
+/// the mapping, with no refusal and no diagnostic. That is the same "dies without a word"
+/// signature the NULL exports had.
+///
+/// The assertions read prose, not numbers: the cap is a refusal threshold this build happens to
+/// hold, and a test naming it would have to be edited the day it moves.
+#[test]
+fn a_tags_query_longer_than_this_build_reads_is_refused_by_the_length_it_declares() {
+    let layout = TempKbLayout::new("groove-plugin-hugetags");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_huge_tags_query");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "an oversized tags query must fail:\n{stderr}");
+    assert!(
+        stderr.contains("declares a tags query of"),
+        "expected the declared length to be named:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("this build reads at most"),
+        "expected the message to say what this build will read:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// The query's bytes are validated rather than assumed to be text.
+///
+/// The query is data -- it may embed a NUL, which is why it crosses as a pointer and a length
+/// rather than as a C string -- so on this side of the boundary it is bytes and nothing but the
+/// loader's own check says otherwise. Reaching for `from_utf8_unchecked` to save a pass over a
+/// few kilobytes would turn a plugin's own bytes into undefined behaviour.
+#[test]
+fn a_tags_query_that_is_not_utf8_is_refused_rather_than_read_as_text() {
+    let layout = TempKbLayout::new("groove-plugin-badutf8tags");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_not_utf8_tags_query");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a tags query that is not UTF-8 must fail:\n{stderr}");
+    assert!(
+        stderr.contains("its tags query is not valid UTF-8"),
+        "expected the encoding to be named as the reason:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// A string export that hands back NULL is answered as NULL, not as bad UTF-8.
+///
+/// The three string exports are copied out through one helper, and that helper checks the
+/// pointer before `CStr::from_ptr`, which has none of its own and would dereference NULL.
+/// Folding the two answers together would make the friendliest possible mistake into undefined
+/// behaviour, and would send the reader looking for an encoding problem in a string that was
+/// never read.
+///
+/// The name is the first of the three copied out, so it is the one that reaches the line at
+/// all; which export was NULL comes from an argument, and the wording for all three is pinned
+/// by the unit tests beside the loader rather than by three fixtures here.
+#[test]
+fn a_string_export_that_hands_back_null_is_named_as_null_rather_than_as_bad_utf8() {
+    let layout = TempKbLayout::new("groove-plugin-nullname");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_null_name");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a NULL name must fail:\n{stderr}");
+    assert!(
+        stderr.contains("its name export returned NULL"),
+        "expected the NULL to be named as the reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("not valid UTF-8"),
+        "a NULL is not an encoding problem, and saying so sends the reader nowhere:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// A NUL-terminated string that is not UTF-8 is refused, and the export it came from is named.
+///
+/// The other half of the same helper. A C string is a run of bytes ending in NUL and nothing
+/// more, so this is what a plugin written in C hands over without meaning anything by it. The
+/// name becomes the `lang:` tag on every chunk and is leaked as a `&'static str`, so bytes that
+/// are not text would be carried the whole length of the index.
+#[test]
+fn a_string_export_that_is_not_utf8_is_refused_by_the_export_it_came_from() {
+    let layout = TempKbLayout::new("groove-plugin-badutf8name");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_not_utf8_name");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a name that is not UTF-8 must fail:\n{stderr}");
+    assert!(
+        stderr.contains("its name is not valid UTF-8"),
+        "expected the export and the encoding to be named:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("returned NULL"),
+        "a pointer that was read is not a NULL one:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+// ---------------------------------------------------------------------------
 // An export that hands back NULL is refused, not dereferenced
 // ---------------------------------------------------------------------------
 
@@ -382,6 +795,122 @@ fn a_plugin_declaring_another_languages_extension_is_refused_in_either_order() {
 }
 
 // ---------------------------------------------------------------------------
+// (iv) The strings a plugin declares about itself
+// ---------------------------------------------------------------------------
+//
+// Checked after the parse table has been accepted, so every fixture here carries a real
+// grammar and needs `grammar-rust` -- one without a table would be refused several checks
+// earlier and never reach the line it is for. A plugin is arbitrary native code, so what it
+// says about itself is checked like any other untrusted input before it reaches a filesystem
+// walk or the index.
+
+/// Two extensions in one declaration is refused as two, before either is checked for validity.
+///
+/// [`groove_grammar_abi::EXTENSION_SEPARATOR`] is reserved for a future grammar that claims
+/// more than one, and this build does not speak it yet. The order matters to the reader rather
+/// than to the machine: "you declared two" and "that is not an extension" send them to
+/// different places, and the validity rule refuses both -- which is what the second assertion
+/// watches for, since `"py;pyi"` would fail validity too if the separator check went away.
+#[test]
+fn a_plugin_claiming_more_than_one_extension_is_refused_before_the_extension_is_validated() {
+    let layout = TempKbLayout::new("groove-plugin-twoext");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_two_extensions");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "two declared extensions must fail:\n{stderr}");
+    assert!(
+        stderr.contains("claims more than one file extension"),
+        "expected the count to be named as the reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("which is not lowercase ASCII"),
+        "the separator is answered before validity, or the reader is sent to the wrong \
+         place:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// An extension groove could not key a parser by is refused as an extension.
+///
+/// groove keys parsers by a bare lowercase extension, so the leading dot is the mistake an
+/// author makes on the first try. The rule is applied to what the *library* says, not only to
+/// what a config says.
+#[test]
+fn an_extension_groove_cannot_key_a_parser_by_is_refused_as_an_extension() {
+    let layout = TempKbLayout::new("groove-plugin-dottedext");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_bad_extension");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "a dotted extension must fail:\n{stderr}");
+    assert!(
+        stderr.contains("claims the file extension"),
+        "expected the declared extension to be quoted back:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("which is not lowercase ASCII"),
+        "expected the rule it broke to be stated:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// A language name no `lang:` filter could match is refused rather than carried into the index.
+///
+/// The name is not decoration: it becomes `lang:<name>` on every chunk the grammar produces.
+/// A name with a space in it is a grammar that loads and then cannot be searched by language --
+/// a failure with no message anywhere, found by a user whose filter silently matches nothing.
+///
+/// The fixture declares `py`, the id it is loaded under, because the extension is matched
+/// against that id first; anything else would be refused for the mismatch and never reach here.
+#[test]
+fn a_language_name_no_lang_filter_could_match_is_refused() {
+    let layout = TempKbLayout::new("groove-plugin-badname");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_bad_name");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "an unsearchable language name must fail:\n{stderr}");
+    assert!(
+        stderr.contains("it calls its language"),
+        "expected the declared name to be quoted back:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+/// A tags query that does not compile against its own grammar is a refusal, not a panic.
+///
+/// The query is compiled while the plugin is being accepted, which is the last thing the loader
+/// does. The alternative to refusing here is a grammar that loads and then produces no
+/// definitions for any file it claims -- an empty result that looks like a knowledge base with
+/// nothing in it.
+///
+/// `((` is unbalanced against every grammar, which keeps the fixture about the check rather
+/// than about a node name a future `tree-sitter-rust` might rename.
+#[test]
+fn a_tags_query_that_does_not_compile_against_its_own_grammar_is_refused() {
+    let layout = TempKbLayout::new("groove-plugin-brokenquery");
+    layout.write("notes.md", SAMPLE_MD);
+    let grammars = empty_grammar_dir(&layout);
+    place_plugin(&grammars, "groove_grammar_uncompilable_tags_query");
+    let cfg = write_config(&layout, Some(&grammars));
+
+    let (ok, stderr) = run_index(&cfg, layout.kb());
+    assert!(!ok, "an uncompilable tags query must fail:\n{stderr}");
+    assert!(
+        stderr.contains("its tags query does not compile"),
+        "expected the query to be named as the reason:\n{stderr}"
+    );
+    assert!(!db_path(&layout).exists());
+}
+
+// ---------------------------------------------------------------------------
 // The untrusted-location rule, from outside
 // ---------------------------------------------------------------------------
 
@@ -455,10 +984,10 @@ fn a_config_found_in_the_working_directory_cannot_choose_the_grammar_directory()
 /// examples*, so cargo builds each one as a test executable
 /// (`target/<profile>/examples/<name>-<hash>.exe`) and never as the `cdylib` the loader has to
 /// open. Measured by deleting the library, touching the fixture source, and running
-/// `cargo test --examples --test grammar_plugin_cli --no-run`: it recompiles and lists the
-/// three executables, and `ls target/debug/examples/groove_grammar_python.dll` still reports
-/// no such file. Plain `cargo test` with no target filter does build them, which is why CI —
-/// which runs exactly that — has always had them.
+/// `cargo test --examples --test grammar_plugin_cli --no-run`: it recompiles and lists them as
+/// executables, and `ls target/debug/examples/groove_grammar_python.dll` still reports no such
+/// file. Plain `cargo test` with no target filter does build them, which is why CI — which runs
+/// exactly that — has always had them.
 #[test]
 #[ignore]
 fn a_plugin_the_loader_accepts_indexes_the_files_it_claims() {
