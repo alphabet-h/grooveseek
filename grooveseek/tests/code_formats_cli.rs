@@ -439,4 +439,25 @@ fn a_one_line_definition_comes_back_without_asking_for_low_quality_hits() {
             "{needle:?} came back as something other than a definition: {hit:#?}"
         );
     }
+
+    // And no threshold takes them away again. `min_quality` is clamped to 1.0, an exempt
+    // definition scores exactly 1.0, and a chunk is dropped only when its score is *below*
+    // the threshold — so the highest value a caller can ask for still returns `pub mod
+    // shard;`. The search path compares in `db/search.rs` rather than through
+    // `passes_quality_filter`, so the unit test on that helper does not cover this.
+    let ceiling = run_search(
+        &bin,
+        &cfg,
+        layout.kb(),
+        "shard module declaration",
+        &["--min-quality", "1.0"],
+    );
+    assert!(
+        results_for(&ceiling, ".rs").iter().any(|h| h["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mod shard")),
+        "raising min_quality to its ceiling must not be documented as a way to drop these: \
+         {ceiling:#?}"
+    );
 }

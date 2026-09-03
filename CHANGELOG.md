@@ -36,8 +36,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   **Name-only declarations (`pub mod x;`, unit structs) come back too**, and
   the documented limitation that said otherwise is gone. They cannot be
   separated: at the default cutoff a chunk falls only when both length-based
-  signals fire, so exempting either one lifts both kinds. Raise `min_quality`
-  per query, or exclude the paths, if you do not want them. Which one-liners
+  signals fire, so exempting either one lifts both kinds. **Nor can a threshold
+  take them back**: an exempt definition scores exactly `1.0`, `min_quality` is
+  clamped to `1.0`, and a chunk is dropped only when its score is *below* the
+  threshold, so there is no value that removes `pub mod x;` and keeps anything
+  else. Exclude them by path instead — a `path_globs` entry beginning with `!`,
+  or `tags_any: ["code"]` to ask for the other half — or leave the language out
+  of `[parsers].enabled` for that tree. Which one-liners
   are definitions at all is the grammar's decision — Python's tags query
   captures module-level assignments, Rust's captures no constants — so the
   effect differs by language. **An existing index catches up on its next

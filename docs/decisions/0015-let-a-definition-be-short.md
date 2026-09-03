@@ -103,10 +103,15 @@ ride on a flag that also decides size caps.
 
 ### Consequences
 
-- **Name-only declarations come back too.** That is the price of option 2 not
-  existing, and the documentation now says so rather than the opposite. A caller
-  who does not want them raises `min_quality` for that query, or excludes the
-  paths.
+- **Name-only declarations come back too, and no threshold takes them back.**
+  That is the price of option 2 not existing, and the documentation now says so
+  rather than the opposite. The second half is worth stating on its own: an
+  exempt definition takes no penalty at all, so it scores exactly `1.0`;
+  `min_quality` is clamped to `1.0`; and a chunk is dropped only when its score
+  is *below* the threshold. There is therefore no value a caller can pass that
+  removes `pub mod x;` while keeping anything else. What is left is excluding by
+  path — a `path_globs` entry beginning with `!` — asking for the other half
+  with `tags_any: ["code"]`, or not enabling the language for that tree.
 - **The effect differs by language, because which one-liners are definitions at
   all is the grammar's decision.** Python's tags query captures module-level
   assignments. Rust's captures class, method, function, interface, module and

@@ -399,6 +399,27 @@ mod tests {
     }
 
     #[test]
+    fn no_threshold_can_hide_a_definition_that_takes_no_penalty() {
+        // The exemption leaves a non-boilerplate definition at exactly 1.0, and `min_quality`
+        // is clamped to 1.0, and a chunk passes when its score is not *below* the threshold.
+        // The three together mean there is no value a caller can pass that drops `pub mod x;`
+        // — which is why the documentation sends them to `path_globs` rather than here.
+        //
+        // Pinned because the obvious sentence to write in a release note is "raise
+        // `min_quality` if you do not want them", and it is false.
+        let score = chunk_quality_score(None, "pub mod x;", QualityProfile::Definition);
+        let ceiling = resolve_effective_threshold(false, Some(2.0), DEFAULT_QUALITY_THRESHOLD);
+        assert!(
+            (ceiling - 1.0).abs() < 1e-5,
+            "min_quality is clamped to 1.0, got {ceiling}"
+        );
+        assert!(
+            passes_quality_filter(score, ceiling),
+            "a definition at {score} passes even the highest threshold a caller can ask for"
+        );
+    }
+
+    #[test]
     fn the_profile_of_a_chunk_is_decided_in_one_place() {
         // 呼び出し側が各自 match を書くと同じ問いに 2 つ目の答えができるので、
         // 変換はこの関数にだけ置く。バイナリ形式 parser は symbol_kind を出さない
