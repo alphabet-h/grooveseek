@@ -291,13 +291,14 @@ path = "tests/fixtures/grammar_plugins/flaky_language.rs"
 crate-type = ["cdylib"]
 
 
-# (AV-09) The rest of the fixtures, in two families.
+# (AV-09) The rest of the fixtures, in three families. What separates them is not taste: a
+# fixture is hand-written when the shape it needs is one `groove_grammar_plugin!` cannot say,
+# and it needs `grammar-rust` when the check it is about sits past the parse table.
 #
-# **Hand-written, and none of them needs `grammar-rust`.** Each is refused inside the loader's
-# `read_exports`, before a parse table is asked for, so none has to carry one. They are
-# hand-written because each says something `groove_grammar_plugin!` cannot: a version other
-# than the one the macro was compiled against, a missing export, a NULL, a length that does not
-# describe its pointer, or bytes that are not UTF-8.
+# **Hand-written, and refused before a parse table is asked for**, so none of these needs
+# `grammar-rust`. Each says something the macro cannot: a version other than the one the macro
+# was compiled against, a missing export, a NULL, a length that does not describe its pointer,
+# or bytes that are not UTF-8.
 [[example]]
 name = "groove_grammar_wrong_abi"
 path = "tests/fixtures/grammar_plugins/wrong_abi.rs"
@@ -350,6 +351,23 @@ crate-type = ["cdylib"]
 name = "groove_grammar_not_utf8_name"
 path = "tests/fixtures/grammar_plugins/not_utf8_name.rs"
 crate-type = ["cdylib"]
+
+# **Hand-written, and carrying a parse table of their own making.** The one check that happens
+# *at* the table rather than before or after it -- is its Tree-sitter ABI one this build speaks
+# -- can be reached from neither of the other two families: the macro only ever hands over a
+# table a real grammar crate supplies, and a fixture with no table at all is refused a few lines
+# earlier. So these two forge one, which needs no grammar crate. They sit here, between the
+# families, because that is where the check they are about sits in the loader.
+[[example]]
+name = "groove_grammar_stale_tree_sitter"
+path = "tests/fixtures/grammar_plugins/stale_tree_sitter.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_future_tree_sitter"
+path = "tests/fixtures/grammar_plugins/future_tree_sitter.rs"
+crate-type = ["cdylib"]
+
 
 # **Built by `groove_grammar_plugin!`, and all of them need `grammar-rust`.** These are refused
 # for a string they declare, and every one of those checks sits *after* the parse table has been

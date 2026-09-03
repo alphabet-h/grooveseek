@@ -294,6 +294,16 @@ pub(crate) fn load(
         // cannot substitute its own.
         Language::from(unsafe { LanguageFn::from_raw(checked_language) })
     };
+    // **The grammar's own Tree-sitter ABI is settled before anything is built from the table.**
+    // This is the only check that reads the table without using it, and the last thing standing
+    // between a grammar from a CLI this runtime cannot speak and `TagsConfiguration`, which
+    // reads the parse table proper.
+    //
+    // Both ends are reported because a plugin arrives on its own: nothing makes the CLI that
+    // generated it older than the runtime groove links, and "yours is too old" and "yours is
+    // too new" send the reader to different downloads. `stale_tree_sitter.rs` and
+    // `future_tree_sitter.rs` in `tests/fixtures/grammar_plugins/` hold one side each, so
+    // neither half of the comparison can be dropped without a test going red.
     let found = language.abi_version();
     let min = tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION;
     let max = tree_sitter::LANGUAGE_VERSION;
