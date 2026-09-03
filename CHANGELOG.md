@@ -14,6 +14,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **A hit the parent retriever expanded now reports the line range of what
+  it returned.** `start_line` / `end_line` / `symbol_kind` were left holding
+  whatever the hit chunk arrived with while `content` was rewritten to span
+  several chunks, or a whole document — so opening the file at that line
+  showed one definition out of the several that came back, breaking the one
+  thing the range is documented to guarantee. The range is now derived from
+  the chunks the content was actually built from, and all three keys are
+  **omitted** when those chunks do not all carry a range; `symbol_kind` is
+  always omitted on an expanded hit, since the text no longer describes a
+  single definition. The response schema is unchanged: no key is added or
+  removed, no type changes, and omission already meant "this did not come
+  from a source file". `parent_retriever` is off by default, so an index
+  needs no rebuild and only configurations that turned it on were affected.
+  The cap-degraded path is untouched — it hands back the hit chunk's own
+  content, so its range was never wrong.
+
 ## [1.3.0] - 2026-09-03
 
 ### Added
