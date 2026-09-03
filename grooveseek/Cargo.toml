@@ -267,10 +267,11 @@ name = "groove_grammar_claims_rs"
 path = "tests/fixtures/grammar_plugins/claims_rs.rs"
 crate-type = ["cdylib"]
 
-# The two below are hand-written rather than built by `groove_grammar_plugin!`, and neither
-# needs `grammar-rust`: the macro cannot express a NULL export, and a fixture that carries a
-# real parse table would need a grammar crate to test something that has nothing to do with
-# one. So these two are the only grammar fixtures a `--no-default-features` build still has.
+# The two below are hand-written rather than built by `groove_grammar_plugin!`: the macro
+# cannot express a NULL export. Like every hand-written fixture here they need no
+# `grammar-rust`, because the loader refuses them before it ever asks for a parse table -- one
+# carrying a real table would need a grammar crate to test something that has nothing to do
+# with one.
 [[example]]
 name = "groove_grammar_null_language"
 path = "tests/fixtures/grammar_plugins/null_language.rs"
@@ -289,3 +290,88 @@ name = "groove_grammar_flaky_language"
 path = "tests/fixtures/grammar_plugins/flaky_language.rs"
 crate-type = ["cdylib"]
 
+
+# (AV-09) The rest of the fixtures, in two families.
+#
+# **Hand-written, and none of them needs `grammar-rust`.** Each is refused inside the loader's
+# `read_exports`, before a parse table is asked for, so none has to carry one. They are
+# hand-written because each says something `groove_grammar_plugin!` cannot: a version other
+# than the one the macro was compiled against, a missing export, a NULL, a length that does not
+# describe its pointer, or bytes that are not UTF-8.
+[[example]]
+name = "groove_grammar_wrong_abi"
+path = "tests/fixtures/grammar_plugins/wrong_abi.rs"
+crate-type = ["cdylib"]
+
+# The five below are one ladder: each omits exactly one export, in the order
+# `groove_grammar_abi::symbols` lists them, which is the order the ABI says the loader looks
+# them up in. `no_symbols.rs` above covers the first rung by omitting all six.
+[[example]]
+name = "groove_grammar_without_language"
+path = "tests/fixtures/grammar_plugins/without_language.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_without_name"
+path = "tests/fixtures/grammar_plugins/without_name.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_without_extensions"
+path = "tests/fixtures/grammar_plugins/without_extensions.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_without_tags_query"
+path = "tests/fixtures/grammar_plugins/without_tags_query.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_without_build_info"
+path = "tests/fixtures/grammar_plugins/without_build_info.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_huge_tags_query"
+path = "tests/fixtures/grammar_plugins/huge_tags_query.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_not_utf8_tags_query"
+path = "tests/fixtures/grammar_plugins/not_utf8_tags_query.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_null_name"
+path = "tests/fixtures/grammar_plugins/null_name.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_not_utf8_name"
+path = "tests/fixtures/grammar_plugins/not_utf8_name.rs"
+crate-type = ["cdylib"]
+
+# **Built by `groove_grammar_plugin!`, and all of them need `grammar-rust`.** These are refused
+# for a string they declare, and every one of those checks sits *after* the parse table has been
+# accepted -- so unlike the family above, each has to hand over a real grammar to reach the line
+# it is about. The macro validates nothing at compile time, which is what lets a broken
+# declaration be written without hand-writing six exports.
+[[example]]
+name = "groove_grammar_two_extensions"
+path = "tests/fixtures/grammar_plugins/two_extensions.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_bad_extension"
+path = "tests/fixtures/grammar_plugins/bad_extension.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_bad_name"
+path = "tests/fixtures/grammar_plugins/bad_name.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "groove_grammar_uncompilable_tags_query"
+path = "tests/fixtures/grammar_plugins/uncompilable_tags_query.rs"
+crate-type = ["cdylib"]

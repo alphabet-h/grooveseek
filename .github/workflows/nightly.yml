@@ -158,7 +158,7 @@ jobs:
           echo "::error::pre-warm failed after 3 attempts" >&2
           exit 1
 
-      # `cargo test` builds the three `[[example]]` fixtures beside it -- it
+      # `cargo test` builds the `[[example]]` fixtures beside it -- it
       # carries no target filter, so example targets are in scope -- but it does
       # not build a `cdylib` no target depends on (rust-lang/cargo#8311). The
       # shipped Python grammar is exactly that: a release asset the loader opens
