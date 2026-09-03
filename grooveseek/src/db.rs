@@ -1101,9 +1101,9 @@ mod tests {
         )
         .unwrap();
 
-        let updated1 = db.backfill_quality(&[]).unwrap();
+        let updated1 = db.backfill_quality(&[]).unwrap().updated;
         assert!(updated1 >= 1, "stub chunk must be updated, got {updated1}");
-        let updated2 = db.backfill_quality(&[]).unwrap();
+        let updated2 = db.backfill_quality(&[]).unwrap().updated;
         assert_eq!(updated2, 0, "second call must be a no-op");
     }
 
@@ -1140,8 +1140,8 @@ mod tests {
         .unwrap();
 
         // binary_exts に "pdf" を渡す → 免除で 1.0 維持。2 回連続でも安定。
-        let u1 = db.backfill_quality(&["pdf"]).unwrap();
-        let u2 = db.backfill_quality(&["pdf"]).unwrap();
+        let u1 = db.backfill_quality(&["pdf"]).unwrap().updated;
+        let u2 = db.backfill_quality(&["pdf"]).unwrap().updated;
         assert_eq!(u1, 0, "binary chunk must stay exempt (no update)");
         assert_eq!(u2, 0, "second backfill must be a no-op too");
         let (above, _below) = db.chunk_count_by_quality(0.3).unwrap();
@@ -1169,10 +1169,144 @@ mod tests {
         db.insert_chunk(doc_id, 0, Some("p.1"), None, "短い本文。", None, &emb, 1.0)
             .unwrap();
         // md は binary_exts に無い → penalty 適用で 1.0 未満へ。
-        let updated = db.backfill_quality(&[]).unwrap();
+        let updated = db.backfill_quality(&[]).unwrap().updated;
         assert_eq!(updated, 1);
         let (_above, below) = db.chunk_count_by_quality(0.3).unwrap();
         assert_eq!(below, 1, "non-binary short chunk drops below threshold");
+    }
+
+    #[test]
+    fn a_definition_scored_by_the_older_rules_is_lifted_by_the_next_backfill() {
+        // AV-07: v1.4.0 より前の版は 1 行の定義に 0.1 を書いた。それは当時の規則と
+        // しては正しい値なので `quality_score = 1.0` の母集団には入らず、SELECT を
+        // `symbol_kind IS NOT NULL` へ広げないと永久に拾われない。
+        //
+        // ★ 広げるだけでは足りない。UPDATE の要否を「再計算結果が 1.0 なら不要」で
+        //   判定していると、0.1 から 1.0 へ戻るこの行だけが黙って落ちる = 直したい
+        //   行そのものが対象外になる。現在値と比較すること。
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("src/lib.rs", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk_with_code(
+            doc_id,
+            0,
+            Some("MAXYEAR"),
+            None,
+            "MAXYEAR = 9999",
+            None,
+            &dummy_embedding(0.1),
+            0.1, // 旧版が書いた値
+            crate::db::CodeMeta {
+                line_range: Some((3, 3)),
+                symbol_kind: Some("constant"),
+            },
+        )
+        .unwrap();
+
+        let (above_before, below_before) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!((above_before, below_before), (0, 1), "starts hidden");
+
+        let report = db.backfill_quality(&[]).unwrap();
+        assert_eq!(report.updated, 1, "the definition must be re-scored");
+        assert_eq!(
+            report.newly_visible, 1,
+            "this one really was below the cutoff, so it counts toward the warning"
+        );
+        let (above, below) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(
+            (above, below),
+            (1, 0),
+            "a definition is exempt from the shortness penalties"
+        );
+
+        let again = db.backfill_quality(&[]).unwrap().updated;
+        assert_eq!(again, 0, "second call must be a no-op");
+    }
+
+    #[test]
+    fn a_short_definition_that_was_never_hidden_is_not_counted_as_newly_visible() {
+        // `fn f() {\n}` is under the short-content threshold but holds a newline, so the prose
+        // rules took the length penalty alone: 0.4, which the default 0.3 cutoff already let
+        // through. Raising it to 1.0 is a change, but not the change the warning is about, and
+        // counting it would tell an operator that something was hidden and recommend a forced
+        // re-chunk that cannot help.
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("src/lib.rs", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk_with_code(
+            doc_id,
+            0,
+            Some("function f"),
+            None,
+            "fn f() {\n}",
+            None,
+            &dummy_embedding(0.1),
+            0.4, // 旧 Text profile の値。既定しきい値は通っていた
+            crate::db::CodeMeta {
+                line_range: Some((1, 2)),
+                symbol_kind: Some("function"),
+            },
+        )
+        .unwrap();
+
+        let (above_before, _) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(above_before, 1, "the fixture starts visible");
+
+        let report = db.backfill_quality(&[]).unwrap();
+        assert_eq!(report.updated, 1, "0.4 -> 1.0 is still a rewrite");
+        assert_eq!(
+            report.newly_visible, 0,
+            "nothing crossed the cutoff, so nothing is worth warning about"
+        );
+    }
+
+    #[test]
+    fn widening_the_backfill_to_definitions_does_not_reach_prose() {
+        // 広げた母集団は `symbol_kind IS NOT NULL` の行だけ。散文の低スコア行は
+        // 既に計算済みなので、以前と同じく触らない。
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("notes/a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        // 散文で、既にスコアが入っている (= 計算済み) 短い chunk。
+        db.insert_chunk(
+            doc_id,
+            0,
+            None,
+            None,
+            "短い本文。",
+            None,
+            &dummy_embedding(0.2),
+            0.1,
+        )
+        .unwrap();
+        // 定義で、既に正しいスコアが入っている chunk。
+        db.insert_chunk_with_code(
+            doc_id,
+            1,
+            None,
+            None,
+            "pub mod x;",
+            None,
+            &dummy_embedding(0.3),
+            1.0,
+            crate::db::CodeMeta {
+                line_range: Some((1, 1)),
+                symbol_kind: Some("module"),
+            },
+        )
+        .unwrap();
+
+        let updated = db.backfill_quality(&[]).unwrap().updated;
+        assert_eq!(updated, 0, "neither row changes value");
+        let (above, below) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(
+            (above, below),
+            (1, 1),
+            "the prose chunk keeps the score it already had"
+        );
     }
 
     #[test]

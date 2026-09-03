@@ -67,6 +67,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 12. Chunk code at its definitions and fill the gaps by line | [en](decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.md) | [ja](decisions/0012-chunk-code-at-its-definitions-and-fill-the-gaps-by-line.ja.md) |
 | 13. Compile in one grammar and load the rest | [en](decisions/0013-compile-in-one-grammar-and-load-the-rest.md) | [ja](decisions/0013-compile-in-one-grammar-and-load-the-rest.ja.md) |
 | 14. Bound the chunker by the shape of its input, not by a clock | [en](decisions/0014-bound-the-chunker-by-the-shape-of-its-input.md) | [ja](decisions/0014-bound-the-chunker-by-the-shape-of-its-input.ja.md) |
+| 15. Let a definition be short | [en](decisions/0015-let-a-definition-be-short.md) | [ja](decisions/0015-let-a-definition-be-short.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

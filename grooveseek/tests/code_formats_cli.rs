@@ -56,6 +56,18 @@ impl RankTable {
 }
 "#;
 
+/// Definitions that are one line, shorter than the quality filter's short-content threshold,
+/// and carry no doc comment — the exact shape AV-07 is about. `mod shard;` names nothing but
+/// itself; `type ShardId = u64;` carries a width that is written down nowhere else.
+///
+/// Deliberately no `const`: `tree-sitter-rust`'s tags query emits class / method / function /
+/// interface / module / macro and **no constant**
+/// (via: `grep -n 'definition\.' <registry>/tree-sitter-rust-0.24.2/queries/tags.scm`), so a
+/// `const` item in Rust is never a definition chunk to begin with. It reaches the gap-fill
+/// path instead and, under 30 characters, is dropped there. Python is the language where
+/// short constants are definitions — see `grammar_plugin_cli.rs`.
+const SHORT_DEFS_RS: &str = "pub mod shard;\n\ntype ShardId = u64;\n";
+
 const SAMPLE_MD: &str = "---\ntitle: Fusion notes\n---\n\n## Reciprocal rank fusion\n\nThe prose page also talks about reciprocal fusion weight, at length, so that a search for it\nhas something to find in both halves of the knowledge base and the two can be told apart by\nwhat the response carries rather than by which one happened to win.\n";
 
 fn write_config(layout: &TempKbLayout, body: &str) -> std::path::PathBuf {
@@ -391,5 +403,61 @@ fn the_command_line_prints_the_line_range_for_a_code_hit() {
     assert!(
         stdout.contains("lines: "),
         "the text output should say where in the file the hit is:\n{stdout}"
+    );
+}
+
+#[test]
+#[ignore = "spawns groove index (loads the embedding model)"]
+fn a_one_line_definition_comes_back_without_asking_for_low_quality_hits() {
+    // AV-07. Every definition here is one line, under the quality filter's 30-character
+    // short-content threshold, and has no doc comment above it -- so before v1.4.0 each
+    // scored 1.0 - 0.6 - 0.3 = 0.1 and sat below the default 0.3 cutoff forever. The point
+    // of the test is the **absence** of `--include-low-quality` in the search below.
+    let bin = grooveseek_bin();
+    let layout = TempKbLayout::new("code-short-defs");
+    layout.write("shard.rs", SHORT_DEFS_RS);
+    let cfg = write_config(&layout, PARSERS_MD_RS);
+    run_index(&bin, &cfg, layout.kb());
+
+    for (query, needle) in [
+        ("ShardId type alias", "ShardId"),
+        ("shard module declaration", "mod shard"),
+    ] {
+        let hits = run_search(&bin, &cfg, layout.kb(), query, &[]);
+        let code = results_for(&hits, ".rs");
+        let hit = code
+            .iter()
+            .find(|h| h["content"].as_str().unwrap_or_default().contains(needle))
+            .unwrap_or_else(|| {
+                panic!("{needle:?} was filtered out of a default search for {query:?}: {hits:#?}")
+            });
+        // Without this the test would also pass if the chunker had given up on the file and
+        // returned it as line-filled gap fragments, which carry no `symbol_kind`. What has to
+        // come back is the definition chunk.
+        assert!(
+            hit["symbol_kind"].is_string(),
+            "{needle:?} came back as something other than a definition: {hit:#?}"
+        );
+    }
+
+    // And no threshold takes them away again. `min_quality` is clamped to 1.0, an exempt
+    // definition scores exactly 1.0, and a chunk is dropped only when its score is *below*
+    // the threshold — so the highest value a caller can ask for still returns `pub mod
+    // shard;`. The search path compares in `db/search.rs` rather than through
+    // `passes_quality_filter`, so the unit test on that helper does not cover this.
+    let ceiling = run_search(
+        &bin,
+        &cfg,
+        layout.kb(),
+        "shard module declaration",
+        &["--min-quality", "1.0"],
+    );
+    assert!(
+        results_for(&ceiling, ".rs").iter().any(|h| h["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mod shard")),
+        "raising min_quality to its ceiling must not be documented as a way to drop these: \
+         {ceiling:#?}"
     );
 }

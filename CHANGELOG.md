@@ -14,6 +14,59 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Changed
+
+- **A one-line definition is no longer hidden by the quality filter.** The
+  filter reads shortness as a proxy for a thin section, and two of its three
+  signals fire together on any chunk under 30 characters with no newline in it.
+  Chunks from a binary format were already exempt, because a short page or
+  slide is the shape of the format; a source-code definition was not, because
+  the exemption rode on "is this a binary parser". So `MAXYEAR = 9999` was
+  indexed and then filtered out of every default search — and the value is the
+  information, indexed nowhere else. A definition is now exempt from the same
+  two signals, and the boilerplate signal still applies to it.
+
+  Re-measuring the limitation this retracts is what decided it: across the Rust
+  sources of this repository the original finding held, with **no** definition
+  under the cutoff carrying anything but a name, while CPython's `Lib/*.py` had
+  **721** that did — pickle opcodes, token ids, `stat` flags. v1.3.0 was the
+  release that made that reachable, by shipping the first grammar for a second
+  language.
+
+  **Name-only declarations (`pub mod x;`, unit structs) come back too**, and
+  the documented limitation that said otherwise is gone. They cannot be
+  separated: at the default cutoff a chunk falls only when both length-based
+  signals fire, so exempting either one lifts both kinds. **Nor can a threshold
+  take them back**: an exempt definition scores exactly `1.0`, `min_quality` is
+  clamped to `1.0`, and a chunk is dropped only when its score is *below* the
+  threshold, so there is no value that removes `pub mod x;` and keeps anything
+  else. Exclude them by path instead — a `path_globs` entry beginning with `!`,
+  or `tags_any: ["code"]` to ask for the other half — or leave the language out
+  of `[parsers].enabled` for that tree. Which one-liners
+  are definitions at all is the grammar's decision — Python's tags query
+  captures module-level assignments, Rust's captures no constants — so the
+  effect differs by language. **An existing index catches up on its next
+  `groove index`**: the backfill now revisits chunks carrying a `symbol_kind`
+  as well as chunks still holding the column default, and it rewrites only
+  `quality_score`, so nothing is re-embedded and `--force` is not needed. See
+  [ADR-0015](docs/decisions/0015-let-a-definition-be-short.md).
+
+- **A definition split across chunks no longer ends in a chunk holding only its
+  closing brace.** A definition over `[parsers.code].max_chunk_chars` is split
+  by lines, each piece keeping the definition's heading and kind, and a split
+  whose last cut landed just before the closing brace left a chunk whose text
+  was `}` and whose heading was the function's name — which bm25 weights. The
+  quality filter hid it, and the exemption above would have started returning
+  it. A final piece under the short-content threshold is now folded back onto
+  the piece before it. Gap and fallback pieces are unchanged: they carry no
+  `symbol_kind`, so they keep taking the length penalties, and a thin tail there
+  is deliberately kept rather than merged.
+
+  **An index built before this release still holds any such chunk**, because the
+  backfill re-scores what is stored and an unchanged file is not re-chunked. The
+  backfill now says so whenever it promotes a short definition chunk, and points
+  at `groove index --force` for re-cutting those files.
+
 ### Fixed
 
 - **A hit the parent retriever expanded now reports the line range of what

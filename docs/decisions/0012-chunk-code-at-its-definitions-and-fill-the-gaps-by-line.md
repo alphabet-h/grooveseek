@@ -124,6 +124,13 @@ than two that can drift apart.
   information beyond their name, and the thing they name is indexed
   separately.
 
+  **This bullet stopped holding in v1.4.0**
+  ([ADR-0015](0015-let-a-definition-be-short.md)). The measurement above
+  reproduced for Rust, but a Python index was losing definitions whose value
+  *is* the information and is indexed nowhere else, so a definition is now
+  exempt from the two length-based penalties. The decision this ADR records —
+  chunking code at its definitions and filling the gaps by line — is unchanged.
+
 ## More Information
 
 The chunker lives in `grooveseek/src/parser/code/`. The companion decision
