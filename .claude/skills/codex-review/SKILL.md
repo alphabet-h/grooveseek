@@ -65,6 +65,14 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
   `doc = false`、`benches/` は `cargo doc` が document しないので、この 2 つの中の link を
   検査するのは `cargo doc` ではなく codex だけ
 - 同じ `#[cfg(test)] mod tests` の中なら、隣の test fn 名は bare link
+- **`#[cfg(test)]` の item へのリンクは `cargo doc` が検証しない。** 存在する名前でも
+  存在しない名前でも `cargo doc --no-deps` は exit 0 (2026-09-04 に対照つきで確認)。
+  rustdoc は test module を解決しないので、**リンクにすると「検証済みの参照」に見えて
+  何も検証していない**状態になる。非 test の doc から test 名を呼ぶときは backtick +
+  持ち主を散文で書き、**stale 検出が要るなら test で書く** (`include_str!` して
+  `fn <name>(` を探す形。PR #263 の
+  `a_test_named_by_a_doc_comment_in_this_file_still_exists`)。codex はここをリンクにせよと
+  P2 で言ってくるので、**対照 (名前を 1 文字変えて `cargo doc`) を添えて返す**
 - **同じ module の doc から、その module の private item へは張れる。** `const LENGTH_PENALTY`
   のような非 `pub` の const でも、`quality.rs` の `//!` / `///` からなら rustdoc が解決する
   (2026-09-04 に確認: リンク化して `cargo doc --no-deps` が exit 0、対照として 1 語を存在しない
