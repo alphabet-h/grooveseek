@@ -45,7 +45,7 @@ pub(crate) fn is_small_chunk(token_count: Option<i64>, threshold: u32) -> bool {
 /// **all-or-nothing の理由 (AV-08)**: 範囲を持つ row だけで min/max を取ると、
 /// 範囲の外にある本文が `content` に混ざったまま「返した本文はこの範囲から来て
 /// いる」と主張することになる。`docs/behavior.md` が約束しているのはその主張
-/// そのものなので、揃わないときは**主張しない** — `SearchHit` の 3 つの行
+/// そのものなので、揃わないときは**主張しない** — [`SearchHit`] の 3 つの行
 /// フィールドは `skip_serializing_if` 付きなので、`None` は「キーごと不在」= 既に
 /// 散文 hit が取っている形になり、client から見た shape は変わらない。
 ///
@@ -1105,8 +1105,8 @@ mod tests {
     // 一度も存在しなかった。`search_parent_integration.rs` の fixture は Markdown だけ、
     // `code_formats_cli.rs` は parent retriever を有効化しない。
 
-    /// 行メタを持つ code hit を作る。既存 12 本が使う `make_hit` は
-    /// `start_line: None` を明示しているので、**`make_hit` に引数を足すのではなく
+    /// 行メタを持つ code hit を作る。既存 12 本が使う [`make_hit`] は
+    /// `start_line: None` を明示しているので、**[`make_hit`] に引数を足すのではなく
     /// 別 helper を新設する** — 既存の呼び出しに一切触れないため。
     fn make_code_hit(
         path: &str,
@@ -1315,8 +1315,8 @@ mod tests {
         assert!(expanded.symbol_kind.is_none());
     }
 
-    /// whole-document 展開でも同じ規則。`:211-215` の row_cap truncate と
-    /// `:224-227` の token cap 超過はどちらも `expand_adjacent` へ委譲して
+    /// whole-document 展開でも同じ規則。row_cap で truncate された場合と
+    /// token cap を超えた場合はどちらも [`expand_adjacent`] へ委譲して
     /// return するので、merge に到達した `chunks` は truncate されていない
     /// その doc の全 chunk = 範囲は「文書全体」として正当。
     ///
@@ -1462,7 +1462,7 @@ mod tests {
         assert_eq!(expanded.symbol_kind.as_deref(), Some("function"));
     }
 
-    /// 空 slice では範囲を主張しない。`merged_line_bounds` の 2 つの呼び出し元は
+    /// 空 slice では範囲を主張しない。[`merged_line_bounds`] の 2 つの呼び出し元は
     /// どちらも直前に `is_empty()` で早期 return する (`neighbors` / `chunks`) ので
     /// 統合経路からは到達できない = pure fn を直接呼ぶ以外にこの答えを覆う手が無い。
     #[test]

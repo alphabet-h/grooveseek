@@ -253,7 +253,7 @@ impl From<SearchResult> for SearchHit {
 /// 最小フィールドのみ。`level` は legacy DB (feature-28 以前) では NULL に
 /// なる可能性があるため、`Option<u8>` として返す。
 ///
-/// 行範囲も「最小」に入る: 展開後の `SearchHit` が主張する `start_line` /
+/// 行範囲も「最小」に入る: 展開後の [`SearchHit`] が主張する `start_line` /
 /// `end_line` は、**その content を実際に作った chunk 群**から作り直す必要が
 /// あり (AV-08)、材料はここ以外から取れない。`symbol_kind` は載せない —
 /// 展開された hit は複数定義を跨ぐか文書全体なので、種別に単一の答えが無い。
