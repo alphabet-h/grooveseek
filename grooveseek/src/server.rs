@@ -231,10 +231,14 @@ struct SearchParams {
 
     /// (v0.7.0+) Enable parent retriever content expansion. When `true`,
     /// short hit chunks are expanded to adjacent siblings or the whole
-    /// document; the score, rank, path, and `match_spans` of the hit are
-    /// preserved (only `content` and the new `expanded_from` field
-    /// change). When `null`, falls back to
-    /// `[search.parent_retriever].enabled`.
+    /// document. The `score`, rank and `path` of the hit are preserved;
+    /// `content`, `expanded_from`, `match_spans` and the line metadata
+    /// (`start_line` / `end_line` / `symbol_kind`) all change, because they
+    /// describe the text that came back rather than the hit's ranking. An
+    /// expanded hit reports the range covering every chunk it merged, omits
+    /// the range entirely when the merged chunks do not all carry one, and
+    /// omits `symbol_kind` once more than one chunk went into the answer.
+    /// When `null`, falls back to `[search.parent_retriever].enabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_retriever: Option<bool>,
 }

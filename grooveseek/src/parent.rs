@@ -39,6 +39,48 @@ pub(crate) fn is_small_chunk(token_count: Option<i64>, threshold: u32) -> bool {
     token_count.map(|t| (t as u32) < threshold).unwrap_or(false)
 }
 
+/// 連結した `rows` だけを材料にして、返す content が主張できる行メタを作る。
+/// **両方の展開経路がこの 1 つの判断を共有する** ので、経路ごとに規則がずれない。
+///
+/// - 行範囲: **全 row が範囲を持つときだけ** `(Some(min), Some(max))`。
+///   1 つでも欠けるか空なら `(None, None)`
+/// - `symbol_kind`: **寄与した row が 1 つだけなら**その row の種別。2 つ以上なら
+///   `None`
+///
+/// **all-or-nothing の理由 (AV-08)**: 範囲を持つ row だけで min/max を取ると、
+/// 範囲の外にある本文が `content` に混ざったまま「返した本文はこの範囲から来て
+/// いる」と主張することになる。`docs/behavior.md` が約束しているのはその主張
+/// そのものなので、揃わないときは**主張しない** — [`SearchHit`] の 3 つの行
+/// フィールドは `skip_serializing_if` 付きなので、`None` は「キーごと不在」= 既に
+/// 散文 hit が取っている形になり、client から見た shape は変わらない。
+///
+/// **1 row の扱い (codex P2 on #262)**: chunk を 1 つしか持たない source file では、
+/// どちらの経路も hit chunk だけを「merge」するので content は 1 つの定義その
+/// ものになる。そこで種別を捨てるのは、cap-degrade で「content が変わらないなら
+/// 消さない」と決めたのと同じ状況で逆をやることになる。**hit から継承するのでは
+/// なく row から取る**ので、DB の不整合で hit chunk が取れず隣が 1 つだけ返った
+/// 場合でも、返した本文の種別を答えることになり破綻しない。
+///
+/// 散文だけの KB では 3 列が全 NULL なので必ず全部 `None` を返す = 代入の前後で
+/// 値が変わらない。行メタは ranking にも入らないので、eval の「parent retriever は
+/// metric に触らない」invariant はこの関数を足しても保たれる。
+fn merged_code_meta(rows: &[ChunkRow]) -> (Option<u32>, Option<u32>, Option<String>) {
+    let symbol_kind = match rows {
+        [only] => only.symbol_kind.clone(),
+        _ => None,
+    };
+    let mut min_start = None::<u32>;
+    let mut max_end = None::<u32>;
+    for row in rows {
+        let (Some(start), Some(end)) = (row.start_line, row.end_line) else {
+            return (None, None, symbol_kind);
+        };
+        min_start = Some(min_start.map_or(start, |m| m.min(start)));
+        max_end = Some(max_end.map_or(end, |m| m.max(end)));
+    }
+    (min_start, max_end, symbol_kind)
+}
+
 /// Parent retriever 設定。groove.toml `[search.parent_retriever]` と
 /// 1:1 対応する。Task 3.5 で `ParentRetrieverConfig` を加えた後はこの構造体を
 /// 該当 config から構築する。
@@ -144,6 +186,15 @@ fn expand_adjacent(
         // find 失敗時も拡張前 match_spans が stale で残らず、observability
         // 上 cap-exceeded path 通過が常に検出できる。
         hit.match_spans = None;
+        // AV-08: **この経路では行メタを触らない。** 上の `find` が当たれば
+        // `hit.content` に入るのは hit chunk 自身の content で、search が返した
+        // ものと同じ文字列 (どちらも `chunks.content` を素で読む。context 合成も
+        // スニペット化も挟まない)。当たらなければ `hit.content` は書き換わらない。
+        // どちらの答えでも本文は hit chunk のものなので、行範囲は正しいまま —
+        // ここで `None` にするのは情報を捨てるだけになる。
+        //
+        // 「content を差し替えたら派生メタも無効」という `match_spans` の推論は
+        // **content が実際に差し替わった経路にしか当てはまらない**。
         hit.expanded_from = Some(ExpandedRange::Adjacent {
             from_index: chunk_idx as usize,
             to_index: chunk_idx as usize,
@@ -175,6 +226,15 @@ fn expand_adjacent(
     // ここで defensive に None クリアしておけば「再計算忘れ」で stale offset
     // が leak することを防げる。
     hit.match_spans = None;
+    // AV-08: 行メタは content と同じ材料 (`sorted`) から作り直す。継承しない。
+    //
+    // **`match_spans` と扱いが違う理由**: あちらは無条件 `None` でよい —
+    // 呼び出し側に「拡張後 content に対して再計算する」受け皿があるので、
+    // ここでの None は「まだ計算していない」を意味する。行メタには受け皿が
+    // 無いので、None は「範囲を主張できない」を意味する終端の答えになる。
+    // 同じ「派生メタは無効」という推論から、片方は clear、もう片方は
+    // recompute という違う結論が出る。
+    (hit.start_line, hit.end_line, hit.symbol_kind) = merged_code_meta(&sorted);
     hit.expanded_from = Some(ExpandedRange::Adjacent {
         from_index: from_idx,
         to_index: to_idx,
@@ -236,6 +296,12 @@ fn expand_whole_document(
     // adjacent merge と同様に defensive クリア。呼び出し側 (run_search_pipeline)
     // が拡張後 content に対して compute_match_spans を再計算する責務。
     hit.match_spans = None;
+    // AV-08: adjacent merge と**同じ判断**を `chunks` に対して適用する。ここに
+    // 到達した時点で `chunks` は truncate されていないその doc の全 chunk である
+    // — row_cap で切られた場合と token cap を超えた場合はどちらも上で
+    // `expand_adjacent` へ委譲して return しているので、この範囲は
+    // 「文書全体」として正当。
+    (hit.start_line, hit.end_line, hit.symbol_kind) = merged_code_meta(&chunks);
     hit.expanded_from = Some(ExpandedRange::WholeDocument { total_chunks });
     Ok(hit)
 }
@@ -243,7 +309,7 @@ fn expand_whole_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::db::{CodeMeta, Database};
 
     // tempdir helper: db.rs の test mod の TempPath パターンを踏襲。
     // (db.rs と parent.rs は同 crate 内、再利用するか自前定義するか
@@ -1044,6 +1110,486 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start, 10);
         assert_eq!(spans[0].end, 20);
+    }
+
+    // ---- AV-08: 行メタは展開後の content と一致していなければならない ----------
+    //
+    // 交差 (code chunk × parent retriever) はこの節が入るまでテストにも fixture にも
+    // 一度も存在しなかった。`search_parent_integration.rs` の fixture は Markdown だけ、
+    // `code_formats_cli.rs` は parent retriever を有効化しない。
+
+    /// 行メタを持つ code hit を作る。既存 12 本が使う [`make_hit`] は
+    /// `start_line: None` を明示しているので、**[`make_hit`] に引数を足すのではなく
+    /// 別 helper を新設する** — 既存の呼び出しに一切触れないため。
+    fn make_code_hit(
+        path: &str,
+        content: &str,
+        start_line: u32,
+        end_line: u32,
+        symbol_kind: &str,
+    ) -> SearchHit {
+        SearchHit {
+            start_line: Some(start_line),
+            end_line: Some(end_line),
+            symbol_kind: Some(symbol_kind.into()),
+            ..make_hit(path, content)
+        }
+    }
+
+    /// adjacent merge は 3 chunk を連結するので、行範囲は連結した全 chunk を
+    /// 覆う `[min(start), max(end)]` でなければならない。`symbol_kind` は
+    /// 複数定義を跨いだ時点で単一の答えを失うので落ちる。
+    ///
+    /// **fix 前の落ち方**: 入力 hit の `Some(41)` / `Some(80)` / `Some("function")` が
+    /// そのまま残るので 3 つの assert がすべて落ちる。min↔max を取り違えた実装は
+    /// `Some(81)` / `Some(40)` を返すので、start / end を個別に assert して分離する。
+    #[test]
+    fn test_parent_adjacent_merge_recomputes_line_bounds() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document(
+                "/lib.rs",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
+            .expect("upsert");
+        // ~900 byte (= token_count ~225) で adjacent 経路に確実に乗せる。
+        let alpha = format!("fn alpha() {{}} {}", "// body body body ".repeat(50));
+        let beta = format!("fn beta() {{}} {}", "// body body body ".repeat(50));
+        let gamma = format!("fn gamma() {{}} {}", "// body body body ".repeat(50));
+        let _c0 = db
+            .insert_chunk_with_code(
+                doc_id,
+                0,
+                Some("alpha"),
+                None,
+                &alpha,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((1, 40)),
+                    symbol_kind: Some("function"),
+                },
+            )
+            .expect("c0");
+        let c1 = db
+            .insert_chunk_with_code(
+                doc_id,
+                1,
+                Some("beta"),
+                None,
+                &beta,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((41, 80)),
+                    symbol_kind: Some("function"),
+                },
+            )
+            .expect("c1");
+        let _c2 = db
+            .insert_chunk_with_code(
+                doc_id,
+                2,
+                Some("gamma"),
+                None,
+                &gamma,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((81, 120)),
+                    symbol_kind: Some("function"),
+                },
+            )
+            .expect("c2");
+
+        let hit = make_code_hit("/lib.rs", &beta, 41, 80, "function");
+        let expanded = expand_parent(hit, c1, &db, params()).expect("expand");
+        // 拡張が実際に起きたことを先に固定する (assert が空振りしないため)。
+        match expanded.expanded_from {
+            Some(ExpandedRange::Adjacent {
+                from_index: 0,
+                to_index: 2,
+            }) => {}
+            ref other => panic!("expected Adjacent {{0,2}}, got {other:?}"),
+        }
+        assert!(expanded.content.contains("fn alpha"));
+        assert!(expanded.content.contains("fn gamma"));
+        // 行範囲は連結した 3 chunk を覆う。start / end を個別に見て swap を殺す。
+        assert_eq!(expanded.start_line, Some(1));
+        assert_eq!(expanded.end_line, Some(120));
+        // 3 つの定義を跨いだので「この chunk の定義の種別」は答えを持たない。
+        assert!(expanded.symbol_kind.is_none());
+    }
+
+    /// 隣接 chunk のうち 1 つでも行範囲を持たなければ、範囲は主張できない。
+    /// Some を持つ row だけで min/max を取ると、範囲外の本文が `content` に
+    /// 混ざったまま「本文はこの範囲から来ている」と言うことになる。
+    ///
+    /// **fix 前の落ち方**: 入力 hit の `Some(41)` が残るので `is_none()` が落ちる。
+    /// 「Some の row だけで min/max」実装では `Some(1)` / `Some(80)` になるので、
+    /// この 1 本が `||` の 2 つ目の答え (欠損あり) を単独で殺す。
+    #[test]
+    fn test_parent_adjacent_merge_drops_bounds_when_a_neighbor_has_none() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document(
+                "/lib.rs",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
+            .expect("upsert");
+        let alpha = format!("fn alpha() {{}} {}", "// body body body ".repeat(50));
+        let beta = format!("fn beta() {{}} {}", "// body body body ".repeat(50));
+        // gap chunk: import 行や top-level 文と同じく行範囲を持たない。
+        let gap = format!("use std::io; {}", "// body body body ".repeat(50));
+        let _c0 = db
+            .insert_chunk_with_code(
+                doc_id,
+                0,
+                Some("alpha"),
+                None,
+                &alpha,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((1, 40)),
+                    symbol_kind: Some("function"),
+                },
+            )
+            .expect("c0");
+        let c1 = db
+            .insert_chunk_with_code(
+                doc_id,
+                1,
+                Some("beta"),
+                None,
+                &beta,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((41, 80)),
+                    symbol_kind: Some("function"),
+                },
+            )
+            .expect("c1");
+        // `insert_chunk` は `CodeMeta::default()` を渡すので行範囲は NULL。
+        let _c2 = db
+            .insert_chunk(
+                doc_id,
+                2,
+                Some("gap"),
+                None,
+                &gap,
+                None,
+                &dummy_emb_384(),
+                1.0,
+            )
+            .expect("c2");
+
+        let hit = make_code_hit("/lib.rs", &beta, 41, 80, "function");
+        let expanded = expand_parent(hit, c1, &db, params()).expect("expand");
+        // 拡張は起きている (= 範囲を落とす理由が「拡張しなかった」ではない)。
+        match expanded.expanded_from {
+            Some(ExpandedRange::Adjacent {
+                from_index: 0,
+                to_index: 2,
+            }) => {}
+            ref other => panic!("expected Adjacent {{0,2}}, got {other:?}"),
+        }
+        assert!(expanded.content.contains("use std::io"));
+        assert!(expanded.start_line.is_none());
+        assert!(expanded.end_line.is_none());
+        assert!(expanded.symbol_kind.is_none());
+    }
+
+    /// whole-document 展開でも同じ規則。row_cap で truncate された場合と
+    /// token cap を超えた場合はどちらも [`expand_adjacent`] へ委譲して
+    /// return するので、merge に到達した `chunks` は truncate されていない
+    /// その doc の全 chunk = 範囲は「文書全体」として正当。
+    ///
+    /// **fix 前の落ち方**: hit は真ん中の chunk なので `Some(4)` / `Some(6)` が残り、
+    /// start / end の両方が落ちる (端の chunk を hit にすると片側が偶然一致する)。
+    #[test]
+    fn test_parent_whole_doc_recomputes_line_bounds() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document(
+                "/lib.rs",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
+            .expect("upsert");
+        // 全 chunk を small (token_count < 100) にして whole-doc 経路に乗せる。
+        for (idx, (body, range)) in [
+            ("type A = u8;", (1u32, 3u32)),
+            ("type B = u16;", (4, 6)),
+            ("type C = u32;", (7, 9)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.insert_chunk_with_code(
+                doc_id,
+                idx as i32,
+                Some("alias"),
+                None,
+                body,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some(*range),
+                    symbol_kind: Some("class"),
+                },
+            )
+            .expect("insert");
+        }
+        // 真ん中を hit にするので、その id を取り直す。
+        let c1 = db
+            .insert_chunk_with_code(
+                doc_id,
+                3,
+                Some("alias"),
+                None,
+                "type D = u64;",
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((10, 12)),
+                    symbol_kind: Some("class"),
+                },
+            )
+            .expect("c3");
+
+        let hit = make_code_hit("/lib.rs", "type D = u64;", 10, 12, "class");
+        let expanded = expand_parent(hit, c1, &db, params()).expect("expand");
+        match expanded.expanded_from {
+            Some(ExpandedRange::WholeDocument { total_chunks: 4 }) => {}
+            ref other => panic!("expected WholeDocument {{total_chunks: 4}}, got {other:?}"),
+        }
+        assert_eq!(expanded.start_line, Some(1));
+        assert_eq!(expanded.end_line, Some(12));
+        assert!(expanded.symbol_kind.is_none());
+    }
+
+    /// cap-degrade は行メタを**触ってはいけない**。この経路で `hit.content` に
+    /// 入るのは hit chunk 自身の content (`c.content` は search が返したものと
+    /// 同一文字列) で、find が失敗する経路では content が一切書き換わらない。
+    /// どちらの答えでも行範囲は正しいままなので、消すのは純粋な情報損失。
+    ///
+    /// **このテストは fix 前から緑**。守っているのは「3 経路すべてでクリアする」
+    /// という素朴な実装 (= 台帳が指示していた形) が入ることで、そのとき単独で赤になる。
+    #[test]
+    fn test_parent_cap_degrade_keeps_the_hit_line_range() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document(
+                "/lib.rs",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
+            .expect("upsert");
+        // 各 chunk ~20000 byte (= token_count ~5000) で cap 2000 を超えさせる。
+        let big = format!("fn big() {{}} {}", "// body body body ".repeat(1200));
+        let mut ids = Vec::new();
+        for (idx, range) in [(0i32, (1u32, 500u32)), (1, (501, 1000)), (2, (1001, 1500))] {
+            ids.push(
+                db.insert_chunk_with_code(
+                    doc_id,
+                    idx,
+                    Some("big"),
+                    None,
+                    &big,
+                    None,
+                    &dummy_emb_384(),
+                    1.0,
+                    CodeMeta {
+                        line_range: Some(range),
+                        symbol_kind: Some("function"),
+                    },
+                )
+                .expect("insert"),
+            );
+        }
+        let c1 = ids[1];
+
+        let hit = make_code_hit("/lib.rs", &big, 501, 1000, "function");
+        let expanded = expand_parent(hit, c1, &db, params()).expect("expand");
+        // cap で hit chunk のみに縮退したことを固定する。
+        match expanded.expanded_from {
+            Some(ExpandedRange::Adjacent {
+                from_index: 1,
+                to_index: 1,
+            }) => {}
+            ref other => panic!("expected Adjacent {{1,1}} (cap reduced), got {other:?}"),
+        }
+        assert_eq!(expanded.start_line, Some(501));
+        assert_eq!(expanded.end_line, Some(1000));
+        assert_eq!(expanded.symbol_kind.as_deref(), Some("function"));
+    }
+
+    /// 空 slice では何も主張しない。[`merged_code_meta`] の 2 つの呼び出し元は
+    /// どちらも直前に `is_empty()` で早期 return する (`neighbors` / `chunks`) ので
+    /// 統合経路からは到達できない = pure fn を直接呼ぶ以外にこの答えを覆う手が無い。
+    #[test]
+    fn test_merged_code_meta_on_empty_slice_claims_nothing() {
+        assert_eq!(merged_code_meta(&[]), (None, None, None));
+    }
+
+    /// chunk を 1 つしか持たない source file では、adjacent 経路が「merge」するのは
+    /// hit chunk だけ = content は 1 つの定義そのもの。**そこで `symbol_kind` を
+    /// 捨てるのは、cap-degrade で「content が変わらないなら消さない」と決めたのと
+    /// 同じ状況で逆をやること**になる (codex P2 on #262)。
+    ///
+    /// 行範囲もその 1 row から出るので、hit 自身の範囲と一致する。
+    #[test]
+    fn test_parent_adjacent_singleton_keeps_the_definition_kind() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document(
+                "/one.rs",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
+            .expect("upsert");
+        // 1 chunk だけの doc。~900 byte (token ~225) で small を外し adjacent 経路へ。
+        let only = format!("fn only() {{}} {}", "// body body body ".repeat(50));
+        let c0 = db
+            .insert_chunk_with_code(
+                doc_id,
+                0,
+                Some("only"),
+                None,
+                &only,
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((7, 21)),
+                    symbol_kind: Some("function"),
+                },
+            )
+            .expect("c0");
+
+        let hit = make_code_hit("/one.rs", &only, 7, 21, "function");
+        let expanded = expand_parent(hit, c0, &db, params()).expect("expand");
+        match expanded.expanded_from {
+            Some(ExpandedRange::Adjacent {
+                from_index: 0,
+                to_index: 0,
+            }) => {}
+            ref other => panic!("expected Adjacent {{0,0}}, got {other:?}"),
+        }
+        assert_eq!(expanded.start_line, Some(7));
+        assert_eq!(expanded.end_line, Some(21));
+        assert_eq!(expanded.symbol_kind.as_deref(), Some("function"));
+    }
+
+    /// whole-document 経路でも同じ判断が効くこと。小さい 1 chunk の doc なので
+    /// [`expand_whole_document`] に入るが、merge するのはその 1 row だけ。
+    #[test]
+    fn test_parent_whole_doc_singleton_keeps_the_definition_kind() {
+        let tmp = tempdir_for_test();
+        let path = tmp.0.join("test.db");
+        let db = Database::open(path.to_str().unwrap()).expect("open");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("vec_chunks");
+        let doc_id = db
+            .upsert_document(
+                "/one.rs",
+                Some("d"),
+                Some("t"),
+                None,
+                None,
+                &[],
+                None,
+                "h",
+                0,
+            )
+            .expect("upsert");
+        let c0 = db
+            .insert_chunk_with_code(
+                doc_id,
+                0,
+                Some("alias"),
+                None,
+                "type ShardId = u64;",
+                None,
+                &dummy_emb_384(),
+                1.0,
+                CodeMeta {
+                    line_range: Some((3, 3)),
+                    symbol_kind: Some("class"),
+                },
+            )
+            .expect("c0");
+
+        let hit = make_code_hit("/one.rs", "type ShardId = u64;", 3, 3, "class");
+        let expanded = expand_parent(hit, c0, &db, params()).expect("expand");
+        match expanded.expanded_from {
+            Some(ExpandedRange::WholeDocument { total_chunks: 1 }) => {}
+            ref other => panic!("expected WholeDocument {{total_chunks: 1}}, got {other:?}"),
+        }
+        assert_eq!(expanded.start_line, Some(3));
+        assert_eq!(expanded.end_line, Some(3));
+        assert_eq!(expanded.symbol_kind.as_deref(), Some("class"));
     }
 
     proptest::proptest! {

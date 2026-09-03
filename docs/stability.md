@@ -200,9 +200,9 @@ different each time.
 | `results[].expanded_from.from_index` | integer | `adjacent` only — first chunk index merged in, inclusive |
 | `results[].expanded_from.to_index` | integer | `adjacent` only — last chunk index merged in, inclusive |
 | `results[].expanded_from.total_chunks` | integer | `whole_document` only — how many chunks the document has |
-| `results[].start_line` | integer | **omitted** unless the chunk came from a source file — 1-based, and describes the chunk rather than the definition it came from |
-| `results[].end_line` | integer | **omitted** unless the chunk came from a source file — 1-based and inclusive |
-| `results[].symbol_kind` | string | **omitted** unless the chunk is a definition — the grammar's own word (`function`, `class`, `method`, `constant`, …), and the set grows as languages are added |
+| `results[].start_line` | integer | **omitted** unless the chunk came from a source file — 1-based, and describes the `content` returned rather than the definition it came from, so a hit the parent retriever expanded reports the range covering every chunk merged in, and omits the key when those chunks do not all carry one |
+| `results[].end_line` | integer | **omitted** on the same terms — 1-based and inclusive |
+| `results[].symbol_kind` | string | **omitted** unless the chunk is a definition, and on any hit whose expansion merged more than one chunk — the grammar's own word (`function`, `class`, `method`, `constant`, …), and the set grows as languages are added |
 | `results[].uri` | string | **omitted** unless the document is one the server will hand over, and **never present over the command line** |
 | `low_confidence` | boolean | always — **advisory**, see below |
 | `filter_applied` | object | always; `{}` carries a narrower meaning than it looks — see the note |

@@ -607,7 +607,8 @@ impl Database {
         // derived from `max_expanded_tokens`). `max_rows = 0` is
         // treated as "no rows", matching SQLite LIMIT 0 semantics.
         let mut stmt = self.conn.prepare(
-            "SELECT chunk_index, content, token_count, level FROM chunks
+            "SELECT chunk_index, content, token_count, level, start_line, end_line, symbol_kind
+               FROM chunks
              WHERE document_id = ?1 AND chunk_index >= ?2 AND chunk_index <= ?3
              ORDER BY chunk_index ASC
              LIMIT ?4",
@@ -618,6 +619,12 @@ impl Database {
                 content: row.get(1)?,
                 token_count: row.get(2)?,
                 level: row.get::<_, Option<i64>>(3)?.map(|v| v as u8),
+                // (feature-56) NULL on every prose chunk, and on code chunks
+                // written before these columns existed — same read as the
+                // search path does at `db/search.rs`.
+                start_line: row.get::<_, Option<u32>>(4)?,
+                end_line: row.get::<_, Option<u32>>(5)?,
+                symbol_kind: row.get::<_, Option<String>>(6)?,
             })
         })?;
         let mut out = Vec::new();
