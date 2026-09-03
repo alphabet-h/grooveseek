@@ -23,7 +23,8 @@
 //! - Dropping the `Language` on the refusal calls `ts_language_delete`, which is
 //!   `if (self && ts_language_is_wasm(self))`. Without the `wasm` feature -- which nothing in
 //!   this workspace turns on -- `ts_language_is_wasm` is a stub that ignores `self` and returns
-//!   false. The `wasm` build of it reads `self->lex_fn`, which is why [`ForgedLanguage`] carries
+//!   false. The `wasm` build of it reads `self->lex_fn`, which is why [`crate::ForgedLanguage`]
+//!   carries
 //!   room for the rest of the struct rather than stopping after the one field read today.
 //!
 //! Its pair is `future_tree_sitter.rs`, the same fixture with its version on the other side of

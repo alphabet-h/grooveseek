@@ -25,8 +25,10 @@
 //!
 //! `tests/fixtures/grammar_plugins/*.rs`, built as `cdylib`s by `cargo test` through the
 //! `[[example]]` entries in `Cargo.toml`. They come in three families, and which family a case
-//! belongs to is decided by the loader rather than by taste -- by where in `load` the check
-//! sits relative to the parse table:
+//! belongs to is decided by the loader rather than by taste -- by where the check sits relative
+//! to the parse table. The loader is `load`, in the `plugin` module of
+//! [`grooveseek::parser::code`]; that module is `pub(crate)`, so it is named here rather than
+//! linked to:
 //!
 //! - **Built by [`groove_grammar_abi::groove_grammar_plugin`]**, and so needing `grammar-rust`
 //!   to have a parse table to hand over. These are the cases decided *after* the table has been
