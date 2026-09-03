@@ -161,7 +161,7 @@ pub fn chunk_quality_score(heading: Option<&str>, content: &str, profile: Qualit
     let exempt = profile.exempts_shortness();
     let mut score: f32 = 1.0;
 
-    if !exempt && char_count < SHORT_CONTENT_THRESHOLD {
+    if !exempt && is_short_content(content) {
         score -= LENGTH_PENALTY;
     }
 
@@ -177,13 +177,16 @@ pub fn chunk_quality_score(heading: Option<&str>, content: &str, profile: Qualit
     score.max(0.0)
 }
 
-/// 本文が短さ由来の 2 減点を受ける長さかどうか。
+/// 本文が [`LENGTH_PENALTY`] を受ける短さかどうか。**この問いの実装はここ 1 つ。**
 ///
-/// [`crate::db::Database::backfill_quality`] のために公開している。あの pass が扱うのは
-/// **既に DB にあるチャンク**で、v1.4.0 より前の chunker が切ったものが混じり得る。当時は
-/// 予算超過の定義を行で割った片が短いまま残ることがあり、それも
-/// [`crate::parser::Chunk::symbol_kind`] を持つので
-/// 免除の対象に見えてしまう。数えて警告するために、判定を 1 か所から借りる。
+/// [`chunk_quality_score`] と [`crate::db::Database::backfill_quality`] の両方が呼ぶ。
+/// backfill が出す「短い定義チャンクを昇格させた」warning は、**採点と同じ集合を数えて
+/// いること**が前提になっている — 正規化 (trim) と閾値のどちらかが片方だけ動くと、
+/// 警告の件数が黙ってずれる。
+///
+/// backfill がこれを要るのは、あの pass が扱うのが**既に DB にあるチャンク**で、v1.4.0 より
+/// 前の chunker が切ったものが混じり得るから。当時は予算超過の定義を行で割った片が短いまま
+/// 残ることがあり、それも [`crate::parser::Chunk::symbol_kind`] を持つので免除の対象に見える。
 pub(crate) fn is_short_content(content: &str) -> bool {
     content.trim().chars().count() < SHORT_CONTENT_THRESHOLD
 }
@@ -428,6 +431,31 @@ mod tests {
             passes_quality_filter(score, ceiling),
             "a definition at {score} passes even the highest threshold a caller can ask for"
         );
+    }
+
+    #[test]
+    fn the_scorer_and_the_backfill_read_the_same_shortness() {
+        // The backfill's "promoted N short definition chunks" warning is only meaningful while
+        // it counts the same set the scorer penalises. Pinned at the boundary, and through the
+        // trim, because a drift in either the normalisation or the cutoff would show here
+        // before it showed as a wrong count in a diagnostic nobody re-derives.
+        let just_under = "a".repeat(SHORT_CONTENT_THRESHOLD - 1);
+        let exactly_at = "a".repeat(SHORT_CONTENT_THRESHOLD);
+        let padded = format!("  \n{just_under}\t ");
+
+        assert!(is_short_content(&just_under));
+        assert!(!is_short_content(&exactly_at));
+        assert!(is_short_content(&padded), "the count is of trimmed content");
+
+        for content in [&just_under, &exactly_at, &padded] {
+            let scored = chunk_quality_score(None, content, QualityProfile::Text);
+            let penalised = scored < 1.0 - LENGTH_PENALTY + 1e-5;
+            assert_eq!(
+                penalised,
+                is_short_content(content),
+                "the two disagree on {content:?} (scored {scored})"
+            );
+        }
     }
 
     #[test]
