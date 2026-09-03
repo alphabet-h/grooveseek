@@ -97,7 +97,7 @@ impl QualityFilterConfig {
 
 /// どの減点を適用するかを決めるチャンクの出自。
 ///
-/// `LENGTH_PENALTY` と `STRUCTURE_PENALTY` は「短さ」を内容の薄さの代理として読む
+/// [`LENGTH_PENALTY`] と [`STRUCTURE_PENALTY`] は「短さ」を内容の薄さの代理として読む
 /// 減点なので、**短さが形式の構造に由来する**チャンクには当てはまらない。その判定を
 /// [`crate::parser::Parser::is_binary`] の bool に兼ねさせると、あの関数が同時に持つ
 /// 「バイナリ形式 parser か」(= `get_document` の cap 分類まで流れる意味) に 2 つ目の
@@ -132,9 +132,9 @@ impl QualityProfile {
         }
     }
 
-    /// 短さ由来の減点 (`LENGTH_PENALTY` / `STRUCTURE_PENALTY`) を免除するか。
+    /// 短さ由来の減点 ([`LENGTH_PENALTY`] / [`STRUCTURE_PENALTY`]) を免除するか。
     ///
-    /// `BOILERPLATE_PENALTY` は 3 profile とも据え置く: 「TBD」しか書かれていない
+    /// [`BOILERPLATE_PENALTY`] は 3 profile とも据え置く: 「TBD」しか書かれていない
     /// チャンクは出自が何であれ薄い。
     fn exempts_shortness(self) -> bool {
         matches!(self, Self::Binary | Self::Definition)
@@ -147,11 +147,11 @@ impl QualityProfile {
 /// 受けるが、MVP では減点には使わず `_` で無視する。
 ///
 /// `profile` が [`QualityProfile::Binary`] / [`QualityProfile::Definition`] のときは
-/// `LENGTH_PENALTY` と `STRUCTURE_PENALTY` を免除する。理由は型側の doc を参照。
+/// [`LENGTH_PENALTY`] と [`STRUCTURE_PENALTY`] を免除する。理由は型側の doc を参照。
 ///
 /// **片方だけの免除は意味を持たない**: 既定しきい値 0.3 に対し減点 1 個では
 /// LENGTH のみ 0.4 / STRUCTURE のみ 0.7 / BOILERPLATE のみ 0.5 でいずれも落ちず、
-/// かつ `SHORT_CONTENT_THRESHOLD < STRUCTURE_POOR_THRESHOLD` なので
+/// かつ [`SHORT_CONTENT_THRESHOLD`] は [`STRUCTURE_POOR_THRESHOLD`] より小さいので
 /// 「30 文字未満」は必ず「80 文字未満」でもある。つまり**落ちるのは 2 減点が
 /// 同時に立つ場合だけ**で、どちらを免除しても同じ集合が戻る。
 pub fn chunk_quality_score(heading: Option<&str>, content: &str, profile: QualityProfile) -> f32 {
