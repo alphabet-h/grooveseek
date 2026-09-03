@@ -502,9 +502,9 @@ pub fn rebuild_index(
     // 昇格させた」時に `groove index --force` を案内する warning を出すので、
     // **force で走っている最中に force を勧める**ことになる (codex P2 on PR #263)。
     if !force {
-        let quality_updated = db.backfill_quality(&registry.binary_extensions())?;
-        if quality_updated > 0 {
-            eprintln!("Backfilled {quality_updated} chunks with quality scores");
+        let quality = db.backfill_quality(&registry.binary_extensions())?;
+        if quality.updated > 0 {
+            eprintln!("Backfilled {} chunks with quality scores", quality.updated);
         }
     }
 

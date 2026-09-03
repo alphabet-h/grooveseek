@@ -20,6 +20,21 @@
 use super::*;
 use std::collections::BTreeMap;
 
+/// What one [`Database::backfill_quality`] pass did.
+///
+/// Two numbers rather than one because they answer different questions and only the first is
+/// arithmetic. [`Self::updated`] is how many rows were written; [`Self::newly_visible`] is how many of those
+/// crossed the default quality cutoff from below, which is the only part a person needs to be
+/// told about, and the part that has to be checkable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QualityBackfill {
+    /// Rows whose `quality_score` was rewritten.
+    pub updated: u32,
+    /// Rows that were below [`crate::quality::DEFAULT_QUALITY_THRESHOLD`] and are now at or
+    /// above it — chunks a default search did not return before and does now.
+    pub newly_visible: u32,
+}
+
 impl Database {
     /// List all indexed topics grouped by (category, topic).
     ///
@@ -532,7 +547,12 @@ impl Database {
     /// binary chunk が 2 回目 backfill で penalty 転落する (§4.8 P0)。
     /// `symbol_kind` を持つ行は同じ理由で [`crate::quality::QualityProfile::Definition`]
     /// として扱う (AV-07)。
-    pub fn backfill_quality(&self, binary_exts: &[&str]) -> Result<u32> {
+    ///
+    /// 返すのが件数 1 つではなく [`QualityBackfill`] なのは、**警告が主張している数を
+    /// テストから読めるようにするため**。この数は 2 度誤って数えた (短さだけで数えて
+    /// 「隠れていた」と言った / force 実行中に force を勧めた) 場所で、tracing にしか
+    /// 出ないと検査のしようがない。
+    pub fn backfill_quality(&self, binary_exts: &[&str]) -> Result<QualityBackfill> {
         // 母集団は 2 つ:
         //
         // ① `quality_score = 1.0` の行 = 旧 DB の DEFAULT のまま。score != 1.0 の行は
@@ -564,7 +584,7 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut updated = 0u32;
-        let mut short_definitions = 0u32;
+        let mut newly_visible = 0u32;
         for (id, heading, content, symbol_kind, current, path) in rows {
             let ext = std::path::Path::new(&path)
                 .extension()
@@ -578,8 +598,17 @@ impl Database {
                 // 現在値と同じ → UPDATE 不要 (冪等性はここが担う)
                 continue;
             }
-            if is_definition && score > current && crate::quality::is_short_content(&content) {
-                short_definitions += 1;
+            // 数えるのは「**実際に隠れていた**行が見えるようになった」場合だけ。短いだけ
+            // では足りない: 改行を含む短い定義 (`fn f() {\n}` 等) は旧 Text profile でも
+            // STRUCTURE 減点が立たず 0.4 で、既定 0.3 を**通っていた**。それを数えると、
+            // 隠れていなかったものについて「隠れていた」と警告し、効かない `--force` を
+            // 勧めることになる。
+            //
+            // 使えるのは既定しきい値だけ (設定はこの pass に届かない) なので、文言でも
+            // 「既定の」と限定する。
+            const HIDDEN: f32 = crate::quality::DEFAULT_QUALITY_THRESHOLD;
+            if is_definition && current < HIDDEN && score >= HIDDEN {
+                newly_visible += 1;
             }
             self.conn.execute(
                 "UPDATE chunks SET quality_score = ?1 WHERE id = ?2",
@@ -587,7 +616,7 @@ impl Database {
             )?;
             updated += 1;
         }
-        if short_definitions > 0 {
+        if newly_visible > 0 {
             // これらは検索に戻る側の変化なので黙って通さない。**このパスは既存チャンクを
             // 分類し直すだけで、chunker は通らない** — v1.4.0 より前に切られた index には、
             // 予算超過の定義を割った末尾片 (本文が閉じ括弧だけ) が残っていることがあり、
@@ -596,13 +625,16 @@ impl Database {
             //
             // ASCII only: stderr goes to a console groove does not choose the code page of.
             tracing::warn!(
-                "re-scored {short_definitions} short definition chunk(s) that the quality \
-                 filter used to hide; if this index predates v1.4.0, some may be tails of a \
+                "re-scored {newly_visible} definition chunk(s) from below the default quality \
+                 cutoff to above it; if this index predates v1.4.0, some may be tails of a \
                  definition split across chunks - run `groove index --force` to re-chunk those \
                  files"
             );
         }
-        Ok(updated)
+        Ok(QualityBackfill {
+            updated,
+            newly_visible,
+        })
     }
 
     /// `threshold` 以上 / 未満のチャンク数を `(above, below)` で返す。

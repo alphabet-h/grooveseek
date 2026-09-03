@@ -179,15 +179,10 @@ pub fn chunk_quality_score(heading: Option<&str>, content: &str, profile: Qualit
 
 /// 本文が [`LENGTH_PENALTY`] を受ける短さかどうか。**この問いの実装はここ 1 つ。**
 ///
-/// [`chunk_quality_score`] と [`crate::db::Database::backfill_quality`] の両方が呼ぶ。
-/// backfill が出す「短い定義チャンクを昇格させた」warning は、**採点と同じ集合を数えて
-/// いること**が前提になっている — 正規化 (trim) と閾値のどちらかが片方だけ動くと、
-/// 警告の件数が黙ってずれる。
-///
-/// backfill がこれを要るのは、あの pass が扱うのが**既に DB にあるチャンク**で、v1.4.0 より
-/// 前の chunker が切ったものが混じり得るから。当時は予算超過の定義を行で割った片が短いまま
-/// 残ることがあり、それも [`crate::parser::Chunk::symbol_kind`] を持つので免除の対象に見える。
-pub(crate) fn is_short_content(content: &str) -> bool {
+/// [`chunk_quality_score`] から切り出してあるのは、この規則が「trim してから数える」という
+/// 正規化と閾値の**組**だから。どちらか片方だけを別の場所で書き直すと、同じ問いに 2 つ目の
+/// 答えができる ([`crate::db::Database::backfill_quality`] が診断のためにそれをやりかけた)。
+fn is_short_content(content: &str) -> bool {
     content.trim().chars().count() < SHORT_CONTENT_THRESHOLD
 }
 
@@ -434,11 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn the_scorer_and_the_backfill_read_the_same_shortness() {
-        // The backfill's "promoted N short definition chunks" warning is only meaningful while
-        // it counts the same set the scorer penalises. Pinned at the boundary, and through the
-        // trim, because a drift in either the normalisation or the cutoff would show here
-        // before it showed as a wrong count in a diagnostic nobody re-derives.
+    fn the_length_penalty_and_the_shortness_predicate_agree() {
+        // The rule is a pair — trim, then compare a character count — and a second copy of it
+        // would only have to drift on one half to disagree. Pinned at the boundary and through
+        // the trim, from both sides, so a change to either half shows here.
         let just_under = "a".repeat(SHORT_CONTENT_THRESHOLD - 1);
         let exactly_at = "a".repeat(SHORT_CONTENT_THRESHOLD);
         let padded = format!("  \n{just_under}\t ");

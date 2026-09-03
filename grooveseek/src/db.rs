@@ -1101,9 +1101,9 @@ mod tests {
         )
         .unwrap();
 
-        let updated1 = db.backfill_quality(&[]).unwrap();
+        let updated1 = db.backfill_quality(&[]).unwrap().updated;
         assert!(updated1 >= 1, "stub chunk must be updated, got {updated1}");
-        let updated2 = db.backfill_quality(&[]).unwrap();
+        let updated2 = db.backfill_quality(&[]).unwrap().updated;
         assert_eq!(updated2, 0, "second call must be a no-op");
     }
 
@@ -1140,8 +1140,8 @@ mod tests {
         .unwrap();
 
         // binary_exts に "pdf" を渡す → 免除で 1.0 維持。2 回連続でも安定。
-        let u1 = db.backfill_quality(&["pdf"]).unwrap();
-        let u2 = db.backfill_quality(&["pdf"]).unwrap();
+        let u1 = db.backfill_quality(&["pdf"]).unwrap().updated;
+        let u2 = db.backfill_quality(&["pdf"]).unwrap().updated;
         assert_eq!(u1, 0, "binary chunk must stay exempt (no update)");
         assert_eq!(u2, 0, "second backfill must be a no-op too");
         let (above, _below) = db.chunk_count_by_quality(0.3).unwrap();
@@ -1169,7 +1169,7 @@ mod tests {
         db.insert_chunk(doc_id, 0, Some("p.1"), None, "短い本文。", None, &emb, 1.0)
             .unwrap();
         // md は binary_exts に無い → penalty 適用で 1.0 未満へ。
-        let updated = db.backfill_quality(&[]).unwrap();
+        let updated = db.backfill_quality(&[]).unwrap().updated;
         assert_eq!(updated, 1);
         let (_above, below) = db.chunk_count_by_quality(0.3).unwrap();
         assert_eq!(below, 1, "non-binary short chunk drops below threshold");
@@ -1207,8 +1207,12 @@ mod tests {
         let (above_before, below_before) = db.chunk_count_by_quality(0.3).unwrap();
         assert_eq!((above_before, below_before), (0, 1), "starts hidden");
 
-        let updated = db.backfill_quality(&[]).unwrap();
-        assert_eq!(updated, 1, "the definition must be re-scored");
+        let report = db.backfill_quality(&[]).unwrap();
+        assert_eq!(report.updated, 1, "the definition must be re-scored");
+        assert_eq!(
+            report.newly_visible, 1,
+            "this one really was below the cutoff, so it counts toward the warning"
+        );
         let (above, below) = db.chunk_count_by_quality(0.3).unwrap();
         assert_eq!(
             (above, below),
@@ -1216,8 +1220,46 @@ mod tests {
             "a definition is exempt from the shortness penalties"
         );
 
-        let again = db.backfill_quality(&[]).unwrap();
+        let again = db.backfill_quality(&[]).unwrap().updated;
         assert_eq!(again, 0, "second call must be a no-op");
+    }
+
+    #[test]
+    fn a_short_definition_that_was_never_hidden_is_not_counted_as_newly_visible() {
+        // `fn f() {\n}` is under the short-content threshold but holds a newline, so the prose
+        // rules took the length penalty alone: 0.4, which the default 0.3 cutoff already let
+        // through. Raising it to 1.0 is a change, but not the change the warning is about, and
+        // counting it would tell an operator that something was hidden and recommend a forced
+        // re-chunk that cannot help.
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("src/lib.rs", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.insert_chunk_with_code(
+            doc_id,
+            0,
+            Some("function f"),
+            None,
+            "fn f() {\n}",
+            None,
+            &dummy_embedding(0.1),
+            0.4, // 旧 Text profile の値。既定しきい値は通っていた
+            crate::db::CodeMeta {
+                line_range: Some((1, 2)),
+                symbol_kind: Some("function"),
+            },
+        )
+        .unwrap();
+
+        let (above_before, _) = db.chunk_count_by_quality(0.3).unwrap();
+        assert_eq!(above_before, 1, "the fixture starts visible");
+
+        let report = db.backfill_quality(&[]).unwrap();
+        assert_eq!(report.updated, 1, "0.4 -> 1.0 is still a rewrite");
+        assert_eq!(
+            report.newly_visible, 0,
+            "nothing crossed the cutoff, so nothing is worth warning about"
+        );
     }
 
     #[test]
@@ -1257,7 +1299,7 @@ mod tests {
         )
         .unwrap();
 
-        let updated = db.backfill_quality(&[]).unwrap();
+        let updated = db.backfill_quality(&[]).unwrap().updated;
         assert_eq!(updated, 0, "neither row changes value");
         let (above, below) = db.chunk_count_by_quality(0.3).unwrap();
         assert_eq!(
