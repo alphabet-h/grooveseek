@@ -564,23 +564,43 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut updated = 0u32;
+        let mut short_definitions = 0u32;
         for (id, heading, content, symbol_kind, current, path) in rows {
             let ext = std::path::Path::new(&path)
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
-            let profile = crate::quality::QualityProfile::of(is_binary, symbol_kind.is_some());
+            let is_definition = symbol_kind.is_some();
+            let profile = crate::quality::QualityProfile::of(is_binary, is_definition);
             let score = crate::quality::chunk_quality_score(heading.as_deref(), &content, profile);
             if (score - current).abs() < f32::EPSILON {
                 // 現在値と同じ → UPDATE 不要 (冪等性はここが担う)
                 continue;
+            }
+            if is_definition && score > current && crate::quality::is_short_content(&content) {
+                short_definitions += 1;
             }
             self.conn.execute(
                 "UPDATE chunks SET quality_score = ?1 WHERE id = ?2",
                 params![score, id],
             )?;
             updated += 1;
+        }
+        if short_definitions > 0 {
+            // これらは検索に戻る側の変化なので黙って通さない。**このパスは既存チャンクを
+            // 分類し直すだけで、chunker は通らない** — v1.4.0 より前に切られた index には、
+            // 予算超過の定義を割った末尾片 (本文が閉じ括弧だけ) が残っていることがあり、
+            // それも `symbol_kind` を持つので同じ免除に乗る。新しい chunker はそれを作らない
+            // が、内容の変わっていないファイルは切り直されないので、消すには `--force` が要る。
+            //
+            // ASCII only: stderr goes to a console groove does not choose the code page of.
+            tracing::warn!(
+                "re-scored {short_definitions} short definition chunk(s) that the quality \
+                 filter used to hide; if this index predates v1.4.0, some may be tails of a \
+                 definition split across chunks - run `groove index --force` to re-chunk those \
+                 files"
+            );
         }
         Ok(updated)
     }

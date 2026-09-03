@@ -177,6 +177,17 @@ pub fn chunk_quality_score(heading: Option<&str>, content: &str, profile: Qualit
     score.max(0.0)
 }
 
+/// 本文が短さ由来の 2 減点を受ける長さかどうか。
+///
+/// [`crate::db::Database::backfill_quality`] のために公開している。あの pass が扱うのは
+/// **既に DB にあるチャンク**で、v1.4.0 より前の chunker が切ったものが混じり得る。当時は
+/// 予算超過の定義を行で割った片が短いまま残ることがあり、それも
+/// [`crate::parser::Chunk::symbol_kind`] を持つので
+/// 免除の対象に見えてしまう。数えて警告するために、判定を 1 か所から借りる。
+pub(crate) fn is_short_content(content: &str) -> bool {
+    content.trim().chars().count() < SHORT_CONTENT_THRESHOLD
+}
+
 /// `threshold <= 0.0` なら常に true (フィルタ無効)。
 /// そうでなければ `score >= threshold` のとき通過。
 pub fn passes_quality_filter(score: f32, threshold: f32) -> bool {

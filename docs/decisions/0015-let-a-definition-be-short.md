@@ -132,8 +132,14 @@ ride on a flag that also decides size caps.
   `symbol_kind` and shorter than that threshold is a whole short definition.**
   Gap and fallback pieces are untouched — they carry no `symbol_kind`, take the
   penalties as before, and ADR-0012 wants their thin tails kept rather than
-  merged. An index built before this release keeps whatever chunks it has until
-  the file changes or `groove index --force` rebuilds it.
+  merged. **An index built before this release keeps whatever chunks it has**:
+  the backfill re-scores what is stored, and unchanged files are not re-chunked,
+  so a tail cut by the old splitter is still there and is exempted along with
+  everything else carrying a `symbol_kind`. The backfill says so when it
+  promotes any short definition chunk, and names `groove index --force` as the
+  way to re-cut those files. Gating the exemption on a re-chunk instead would
+  cost every existing code index a full re-embed to fix a shape most of them do
+  not have.
 - **An index built before this release catches up on its next `groove index`.**
   The backfill pass, which previously looked only at chunks still holding the
   column default, now also revisits chunks carrying a `symbol_kind`. It rewrites

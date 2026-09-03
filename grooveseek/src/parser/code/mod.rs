@@ -693,8 +693,13 @@ fn split_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<
 /// while its text says nothing. Since [ADR-0015] made a definition exempt from the length
 /// penalties, the quality filter no longer hides it either.
 ///
-/// Only the last piece can be this small: a cut happens only when a line would overrun the
-/// budget, so every piece before it ends at or past the budget.
+/// **Not only the last piece.** A cut also lands *before* a line that overruns the budget on
+/// its own, and what it pushes out is whatever had accumulated so far — which can be a single
+/// short line. A signature followed by one very long line leaves the signature as a thin piece
+/// with a piece after it, so every piece is checked rather than just the tail.
+///
+/// A thin piece is folded forward, onto the piece that follows it, and only the last one is
+/// folded backwards, because nothing follows it to absorb it.
 ///
 /// **Definitions only**, which is why this is not folded into [`split_by_lines`] itself. The
 /// other two callers cut gap and interstitial pieces, whose chunks carry no [`crate::parser::Chunk::symbol_kind`] and
@@ -706,20 +711,26 @@ fn split_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<
 /// fragments. This merges where that drops, for the same ADR-0012 reason: a piece cut out of a
 /// definition is not droppable, so its bytes have to go somewhere.
 ///
-/// The invariant it buys: **a chunk carrying a `symbol_kind` and shorter than
+/// The invariant it buys: **a chunk carrying a [`crate::parser::Chunk::symbol_kind`] and shorter than
 /// [`MIN_FRAGMENT_CHARS`] is a whole short definition.** That is the assumption the quality
 /// filter's definition exemption rests on.
 ///
 /// [ADR-0015]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0015-let-a-definition-be-short.md
 fn split_definition_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<usize>> {
-    let mut out = split_by_lines(text, range, budget);
-    if out.len() > 1 {
-        let last = out[out.len() - 1].clone();
-        if fragment_chars(text, &last) < MIN_FRAGMENT_CHARS {
-            out.pop();
-            let prev = out.len() - 1;
-            out[prev].end = last.end;
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for piece in split_by_lines(text, range, budget) {
+        match out.last_mut() {
+            // The piece already collected is too thin to stand on its own, so this one extends
+            // it rather than starting another. Repeated, this absorbs a run of thin pieces.
+            Some(prev) if fragment_chars(text, prev) < MIN_FRAGMENT_CHARS => prev.end = piece.end,
+            _ => out.push(piece),
         }
+    }
+    // Nothing follows the last piece, so it folds the other way.
+    if out.len() > 1 && fragment_chars(text, &out[out.len() - 1]) < MIN_FRAGMENT_CHARS {
+        let last = out.pop().expect("checked len > 1");
+        let prev = out.len() - 1;
+        out[prev].end = last.end;
     }
     out
 }
@@ -881,35 +892,63 @@ impl Counter {
     /// produced a chunk whose content was `}` and whose heading and `symbol_kind` were the
     /// function's, which the quality filter used to hide and, once definitions became exempt
     /// from the length penalties (ADR-0015), would have started returning.
+    /// The one test named from a doc comment in this file still exists.
+    ///
+    /// `split_definition_by_lines` names it in prose rather than as an intra-doc link, and that
+    /// is not a style choice: a link into a `#[cfg(test)]` module is not checked. Linking a name
+    /// that does not exist there leaves `cargo doc --no-deps` at exit 0 just as a real one does
+    /// (measured both ways, 2026-09-04), so the link would look like a guarantee while checking
+    /// nothing. This assertion is the check that link would only have appeared to be.
+    #[test]
+    fn a_test_named_by_a_doc_comment_in_this_file_still_exists() {
+        const NAMED: &str = "the_line_fallback_keeps_a_tail_too_thin_to_survive_as_a_gap";
+        let src = include_str!("mod.rs");
+        assert!(
+            src.contains(&format!("`{NAMED}`")),
+            "no doc comment names {NAMED} any more - drop it from this guard too"
+        );
+        assert!(
+            src.contains(&format!("fn {NAMED}()")),
+            "a doc comment in this file names {NAMED}, which no longer exists"
+        );
+    }
+
     #[test]
     fn a_split_never_leaves_a_piece_too_thin_to_stand_alone() {
-        let digits = "1".repeat(25);
-        let src = format!("pub fn f(){{\n    let x = {digits};\n}}\n");
-        let doc = parse(&src, 40);
-        let defs: Vec<&Chunk> = doc
-            .chunks
-            .iter()
-            .filter(|c| c.symbol_kind.is_some())
-            .collect();
-        assert!(
-            !defs.is_empty(),
-            "expected definition chunks: {:#?}",
-            doc.chunks
-        );
-        for d in &defs {
+        // Two shapes, because a cut lands in two places and only one of them is the tail.
+        //
+        // `tail`: the budget fills exactly, so the closing brace starts the last piece.
+        // `head`: the second line overruns the budget on its own, so the cut pushes out what
+        //         had accumulated — the signature — as a piece with pieces after it.
+        let tail = format!("pub fn f(){{\n    let x = {};\n}}\n", "1".repeat(25));
+        let head = format!("pub fn f(){{\n    let x = {};\n}}\n", "1".repeat(50));
+        for (name, src) in [("tail", &tail), ("head", &head)] {
+            let doc = parse(src, 40);
+            let defs: Vec<&Chunk> = doc
+                .chunks
+                .iter()
+                .filter(|c| c.symbol_kind.is_some())
+                .collect();
             assert!(
-                d.content.trim().chars().count() >= MIN_FRAGMENT_CHARS,
-                "a definition chunk under the fragment floor can only be a whole short \
-                 definition, got {:?} from a split of an oversized one",
-                d.content
+                !defs.is_empty(),
+                "{name}: expected definition chunks: {:#?}",
+                doc.chunks
+            );
+            for d in &defs {
+                assert!(
+                    d.content.trim().chars().count() >= MIN_FRAGMENT_CHARS,
+                    "{name}: a definition chunk under the fragment floor can only be a whole \
+                     short definition, got {:?} from a split of an oversized one",
+                    d.content
+                );
+            }
+            // The bytes are not lost, only moved onto a neighbour (ADR-0012).
+            let joined: String = defs.iter().map(|d| d.content.as_str()).collect();
+            assert!(
+                joined.contains("pub fn f") && joined.contains('}'),
+                "{name}: the signature and the closing brace both have to survive: {joined:?}"
             );
         }
-        // The bytes are not lost, only moved onto the piece before (ADR-0012).
-        let joined: String = defs.iter().map(|d| d.content.as_str()).collect();
-        assert!(
-            joined.contains('}'),
-            "the closing brace has to survive the merge: {joined:?}"
-        );
     }
 
     #[test]

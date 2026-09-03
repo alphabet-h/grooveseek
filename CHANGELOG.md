@@ -62,6 +62,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `symbol_kind`, so they keep taking the length penalties, and a thin tail there
   is deliberately kept rather than merged.
 
+  **An index built before this release still holds any such chunk**, because the
+  backfill re-scores what is stored and an unchanged file is not re-chunked. The
+  backfill now says so whenever it promotes a short definition chunk, and points
+  at `groove index --force` for re-cutting those files.
+
 ### Fixed
 
 - **A hit the parent retriever expanded now reports the line range of what
