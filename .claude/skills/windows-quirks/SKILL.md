@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Sixteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -403,6 +403,43 @@ tree-sitter などを静的リンクする。cargo は既定でコア数ぶん�
 diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **まず並列度**。
 
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
+
+## 17. CRLF のファイルに LF を追記しても `git diff` に出ない (混在したまま残る)
+
+罠 15 と同じ「行末が揃っていない」だが、**こちらは検出器が沈黙する**ぶん残りやすい。
+
+Windows で編集されてきたファイルは CRLF で保存されていることがある。そこへ
+`cat new-section.md >> old.md` や LF で書いた script の出力を足すと、**1 つのファイルの中で
+CRLF と LF が混ざる**。既存行は 1 byte も変わらないので、
+
+```
+git diff --stat   # -> 1 file changed, 78 insertions(+)      混在は見えない
+```
+
+追加行だけの diff になり、**whole-file diff にならない = 気付く手がかりが無い**。
+LF のファイルを丸ごと CRLF に flip する事故 (Python の text mode 書き戻し) は全行が差分に
+なるので目立つが、逆向きは目立たない。
+
+**追記の前に行末を数える**:
+
+```bash
+echo "lines=$(wc -l < f) CR=$(tr -cd '\r' < f | wc -c)"
+# lines == CR なら CRLF、CR == 0 なら LF
+```
+
+**混ざってしまったら、既存行に触れずに揃え直す** — 全行を CRLF 化すると、もともと CRLF
+だった行の byte は変わらないので diff は追加行のみのまま直る (Python、binary mode で読み書き):
+
+```python
+raw = io.open(p, "rb").read()
+io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+```
+
+逆に「LF へ寄せる」と既存の CRLF 行が全部差分になるので、**多数派に合わせる**のが安い。
+
+出典: 2026-09-04 v1.5.0 リリース。`.dev/knowledge/dogfood-daemon-upgrade-runbook.md` だけが
+CRLF で、他の `.dev` の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
+**同じディレクトリのファイルが同じ行末とは限らない。**
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
