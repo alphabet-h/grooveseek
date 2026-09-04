@@ -131,7 +131,7 @@ git grep -lE '(/var/)[^ ]*foo' -- .          # → 一致する ('(' で始ま�
 
 **症状**: `python - <<'PY' ... open(p,'w').write(s) ... PY` で数行だけ書き換えたつもりが、`git diff --stat` が **ファイル全体の書き換え**になる (例: 350 行のファイルが `350 +++ 350 ---`)。`cargo fmt` / `clippy` / `cargo test` は全て通るので、diffstat を見るまで気付かない。
 
-★ **この症状の出方は repo の正規化設定で変わる。まず罠 17 の `git check-attr` を引くこと。** 上の diffstat は **`text` 属性が無かった頃のこのリポジトリ** (初出 2026-07-27) と、今も属性を持たない repo での見え方。**このリポジトリは 2026-08-13 の `a098436` (#144) 以降 `* text=auto eol=lf` を宣言している**ので、tracked な text file では clean filter が比較前に正規化し、**diff には出ない** — 代わりに `warning: in the working copy of '<path>', CRLF will be replaced by LF the next time Git touches it` が出て、作業コピーが黙って書き戻される。**反転そのものは同じように起きている**ので、対処は変わらない。
+★ **この症状の出方は repo の正規化設定で変わる。まず罠 17 の 2 コマンド (`git check-attr` と `git config --get core.autocrlf`) を引くこと。** 上の diffstat は **`text` 属性が無かった頃のこのリポジトリ** (初出 2026-07-27) と、今も属性を持たない repo での見え方。**このリポジトリは 2026-08-13 の `a098436` (#144) 以降 `* text=auto eol=lf` を宣言している**ので、tracked な text file では clean filter が比較前に正規化し、**diff には出ない** — 代わりに `warning: in the working copy of '<path>', CRLF will be replaced by LF the next time Git touches it` が出て、作業コピーが黙って書き戻される。**反転そのものは同じように起きている**ので、対処は変わらない。
 
 **原因**: Python の text mode は読み込みで universal newlines により `\r\n` / `\n` を `\n` に統一し、**書き込みで `os.linesep` (Windows では `\r\n`) に変換する**。したがって LF のファイルを text mode で round-trip させるだけで CRLF になる。`rustfmt` の `newline_style` は既定 `Auto` = ファイルの現行スタイルを踏襲するので、`cargo fmt` を後から走らせても**元に戻らない**。
 
@@ -409,17 +409,42 @@ diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **�
 
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
 
-## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **ただし repo が正規化していない場合だけ**
+## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **どの設定でも出ない。残るかどうかが設定で変わる**
 
 罠 10 / 罠 15 と同じ「行末が揃っていない」だが、こちらは**検出器が沈黙する**。
 そして**沈黙するかどうかは repo の設定で決まる**ので、先にそれを見る。
-**罠 10 の症状の出方も同じ設定に依存する**ので、この節の `git check-attr` は 2 つの節の共通の入口。
+**罠 10 の症状の出方も同じ設定に依存する**ので、この節の 2 コマンドは 2 つの節の共通の入口。
 
-### まず `git check-attr` を打つ
+### まず変換の有無を 2 つ打つ — 属性だけでは足りない
 
 ```bash
 git check-attr text eol -- <file>
+git config --get core.autocrlf
 ```
+
+**`check-attr` 単独では `core.autocrlf` を見落とす。** 属性が無い repo でも `autocrlf=true` なら
+git は変換しており、`check-attr` は `unspecified` としか答えない。答えの組で 3 通りに分かれる:
+
+| 属性 / `autocrlf` | index | working tree | 混在は commit に入るか | 寄せ先 |
+|---|---|---|---|---|
+| `text=auto eol=lf` (このリポジトリ) | LF | LF | **入らない** | LF |
+| 属性なし + `autocrlf=true` | LF | **CRLF** | **入らない** (作業コピーだけ混ざる) | **CRLF** |
+| 属性なし + `autocrlf=false` | そのまま | そのまま | **入る** ← 罠が成立するのはここだけ | そのファイルの追記前の行末 |
+
+★ **`git show HEAD:<path>` で寄せ先を決めてよいのは 3 行目だけ。** 上 2 行では blob は必ず LF
+なので、CRLF の作業コピーに対して**逆を指す**。実測 (git 2.55.0.windows.5、使い捨て repo):
+
+<!-- via: git init / config core.autocrlf true / CRLF のファイルを commit / LF を 1 行 append -->
+
+```
+check-attr   : text: unspecified   eol: unspecified      <- 属性では分からない
+worktree CR=2 (CRLF)   HEAD blob CR=0 (LF)               <- blob は working tree と別物
+LF を 1 行 append -> worktree CR=2 / lines=3 = 混在
+git diff --stat -> ` note.md | 1 +`  (warning: LF will be replaced by CRLF ...)
+```
+
+**混在は見えないが、commit には入らない** — clean filter が正規化するため。**直すのは
+作業コピーの一貫性のためで、diff のためではない。**
 
 **このリポジトリは `.gitattributes` で `* text=auto eol=lf` を宣言している**ので、
 tracked な text file は repo の中も working tree も LF に固定される。この状態では:
@@ -468,11 +493,10 @@ echo "lines=$(wc -l < f) CR=$(tr -cd '\r' < f | wc -c)"
 ```
 
 混ざってしまったら、**そのファイル自身の追記前の行末へ寄せる** (repo の多数派ではない)。
-正規化していない repo では git が寄せ先を決めてくれないので、自分で選ぶことになるが、
-**選ぶ基準は「既存行の byte が変わらない向き」**の一択:
+`autocrlf=false` + 属性なしの時だけ、追記前の姿を blob から取れる:
 
 ```bash
-git show HEAD:<path> | tr -cd '\r' | wc -c    # 追記前の姿を直接見る
+git show HEAD:<path> | tr -cd '\r' | wc -c    # 上の表の 3 行目でのみ有効
 ```
 
 ★ **repo の多数派で決めると逆を引く。** 実際の事故がその形だった — 追記先は CRLF なのに、
@@ -494,8 +518,8 @@ raw = io.open(p, "rb").read()
 io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 ```
 
-★ **「行末が混ざった」の対処は 1 つではない。** `git check-attr` が先。**正規化している repo なら
-寄せ先は LF、していない repo ならそのファイルの追記前の行末。repo の多数派はどちらの答えでもない。**
+★ **「行末が混ざった」の対処は 1 つではない。** 先に打つのは `check-attr` **と** `core.autocrlf` の 2 つ。
+寄せ先は上の表が決める (LF / CRLF / そのファイルの追記前の行末)。**repo の多数派はどの行の答えでもない。**
 
 出典: 2026-09-04 v1.5.0 リリース。**正規化していない private repo** のノート 1 本だけが CRLF で、
 同じディレクトリの他の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
