@@ -404,41 +404,75 @@ diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **�
 
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
 
-## 17. CRLF のファイルに LF を追記しても `git diff` に出ない (混在したまま残る)
+## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **ただし repo が正規化していない場合だけ**
 
-罠 15 と同じ「行末が揃っていない」だが、**こちらは検出器が沈黙する**ぶん残りやすい。
+罠 15 と同じ「行末が揃っていない」だが、こちらは**検出器が沈黙する**。
+そして**沈黙するかどうかは repo の設定で決まる**ので、先にそれを見る。
 
-Windows で編集されてきたファイルは CRLF で保存されていることがある。そこへ
+### まず `git check-attr` を打つ
+
+```bash
+git check-attr text eol -- <file>
+```
+
+**このリポジトリは `.gitattributes` で `* text=auto eol=lf` を宣言している**ので、
+tracked な text file は repo の中も working tree も LF に固定される。この状態では:
+
+- checkout が LF で書き出すので、そもそも CRLF のファイルが手元にできない
+- 仮に作業コピーを CRLF にしても、git は比較の前に正規化するので**差分にならない**
+
+<!-- via: 作業コピーを全行 CRLF 化 -> git diff --stat -> git checkout -- <file> で復元 -->
+
+```
+$ git check-attr text eol -- CONTRIBUTING.md
+CONTRIBUTING.md: text: auto
+CONTRIBUTING.md: eol: lf
+$ python fix_crlf.py CONTRIBUTING.md      # cr_before=0 cr_after=146
+$ git diff --stat -- CONTRIBUTING.md
+warning: in the working copy of 'CONTRIBUTING.md', CRLF will be replaced by LF the next time Git touches it
+                                          # 差分ゼロ。git が正規化して比較している
+$ git checkout -- CONTRIBUTING.md         # 復元後 sha256 一致
+```
+
+→ **ここでは行末を「揃え直す」判断自体が要らない。要るなら行き先は LF**。
+CRLF へ寄せると git が次に触ったときに書き戻すだけで、`.gitattributes` の宣言とも矛盾する。
+
+### 沈黙するのは、正規化していない repo のほう
+
+`.gitattributes` が無く `core.autocrlf=false` の repo (この repo の private dev mirror が
+そうだった) では、git は**バイト列をそのまま**格納する。そこへ
 `cat new-section.md >> old.md` や LF で書いた script の出力を足すと、**1 つのファイルの中で
-CRLF と LF が混ざる**。既存行は 1 byte も変わらないので、
+CRLF と LF が混ざったまま commit される**。しかも既存行は 1 byte も変わらないので:
 
 ```
-git diff --stat   # -> 1 file changed, 78 insertions(+)      混在は見えない
+$ git diff --stat
+ old-note.md | 78 +++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
 ```
 
-追加行だけの diff になり、**whole-file diff にならない = 気付く手がかりが無い**。
-LF のファイルを丸ごと CRLF に flip する事故 (Python の text mode 書き戻し) は全行が差分に
-なるので目立つが、逆向きは目立たない。
+**意図どおりの追記と見分けが付かない。** LF のファイルを丸ごと CRLF に flip する事故
+(罠 15 / Python の text mode 書き戻し) は全行が差分になるので目立つが、**逆向きは目立たない**。
 
-**追記の前に行末を数える**:
+追記の前に行末を数える:
 
 ```bash
 echo "lines=$(wc -l < f) CR=$(tr -cd '\r' < f | wc -c)"
 # lines == CR なら CRLF、CR == 0 なら LF
 ```
 
-**混ざってしまったら、既存行に触れずに揃え直す** — 全行を CRLF 化すると、もともと CRLF
-だった行の byte は変わらないので diff は追加行のみのまま直る (Python、binary mode で読み書き):
+混ざってしまったら、**その repo の多数派へ寄せる** (正規化していない repo なので、
+git は寄せ先を決めてくれない)。既存行の byte が変わらない向きを選べば、修復は
+追加行だけの diff のままになる。CRLF へ寄せるなら binary mode で読み書きする:
 
 ```python
 raw = io.open(p, "rb").read()
 io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 ```
 
-逆に「LF へ寄せる」と既存の CRLF 行が全部差分になるので、**多数派に合わせる**のが安い。
+★ **「行末が混ざった」の対処は 1 つではない。`git check-attr` が先で、寄せ先はその答えが決める。**
 
-出典: 2026-09-04 v1.5.0 リリース。`.dev/knowledge/dogfood-daemon-upgrade-runbook.md` だけが
-CRLF で、他の `.dev` の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
+出典: 2026-09-04 v1.5.0 リリース。**正規化していない private repo** のノート 1 本だけが CRLF で、
+同じディレクトリの他の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
 **同じディレクトリのファイルが同じ行末とは限らない。**
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
