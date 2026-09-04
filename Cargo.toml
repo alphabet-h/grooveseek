@@ -5,6 +5,7 @@ members = [
     "crates/groove-svc",
     "crates/groove-grammar-abi",
     "crates/groove-grammar-python",
+    "crates/groove-grammar-php",
 ]
 resolver = "2"
 

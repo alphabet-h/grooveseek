@@ -61,7 +61,7 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # される。現在サポート id: "md" / "txt" / "pdf" (v0.10.0+) / "docx" /
 # "xlsx" / "pptx" (v0.11.0+) / "rs" (v1.2.0+)。
 # ("xls" は v0.14.0 で取り下げ、behavior.ja.md 参照)
-# grammar が焼き込まれていない言語 — "py" (v1.3.0+) — は plugin を先に
+# grammar が焼き込まれていない言語 — "py" (v1.3.0+)、"php" (v1.5.0+) — は plugin を先に
 # 置く必要がある (clients.ja.md 参照)。
 # 全部入り例:
 [parsers]

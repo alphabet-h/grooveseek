@@ -9,7 +9,8 @@ serves MCP clients over stdio or Streamable HTTP.
 
 The workspace holds the `groove` binary, the Windows satellites (a tray app and
 a service launcher), and the grammar crates: the contract a tree-sitter grammar
-is handed across, and the Python grammar shipped as a library groove loads.
+is handed across, and the grammars shipped as libraries groove loads (Python,
+PHP).
 
 - Development guidance in depth (Japanese): `CLAUDE.md`
 - Source layout: `docs/ARCHITECTURE.md`

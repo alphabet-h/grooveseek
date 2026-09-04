@@ -91,6 +91,7 @@ intra-doc link (`` [`name`] ``) だけである。lint の水準は root `Cargo.
 - `crates/groove-svc/` — scheduled task が起動する Windows hidden-console launcher (v0.9.1+)
 - `crates/groove-grammar-abi/` — tree-sitter grammar を受け渡す契約。焼き込み grammar と全 plugin が同じ規則に従う (v1.2.0+)
 - `crates/groove-grammar-python/` — Python grammar を読み込み可能な `cdylib` として提供。独立した release asset として配布 (v1.3.0+)
+- `crates/groove-grammar-php/` — PHP grammar を同じ形で提供 (v1.5.0+)
 - `grooveseek/tests/` — 統合テスト、`grooveseek/benches/` — criterion ベンチ
 
 詳細は [docs/ARCHITECTURE.ja.md](./docs/ARCHITECTURE.ja.md) を参照。

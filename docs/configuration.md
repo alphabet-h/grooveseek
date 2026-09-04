@@ -63,8 +63,8 @@ path_templates = ["best-practices/{target}/PERFECT.md", "docs/{target}.md"]
 # "nothing is indexed" failures.
 # Currently supported ids: "md", "txt", "pdf" (v0.10.0+), "docx", "xlsx",
 # "pptx" (v0.11.0+), "rs" (v1.2.0+). ("xls" was withdrawn in v0.14.0 — see
-# behavior.md.) A language whose grammar is not compiled in — "py" (v1.3.0+) —
-# also needs its plugin placed first; see clients.md.
+# behavior.md.) A language whose grammar is not compiled in — "py" (v1.3.0+),
+# "php" (v1.5.0+) — also needs its plugin placed first; see clients.md.
 # Example enabling everything:
 [parsers]
 enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"]

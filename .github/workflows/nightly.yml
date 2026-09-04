@@ -160,16 +160,21 @@ jobs:
 
       # `cargo test` builds the `[[example]]` fixtures beside it -- it
       # carries no target filter, so example targets are in scope -- but it does
-      # not build a `cdylib` no target depends on (rust-lang/cargo#8311). The
-      # shipped Python grammar is exactly that: a release asset the loader opens
-      # by path, which nothing in the workspace links. So the one test that
-      # checks the grammar groove actually publishes is a grammar its own loader
-      # accepts had no artefact to open, and said so in its assert.
+      # not build a `cdylib` no target depends on (rust-lang/cargo#8311). Every
+      # shipped grammar is exactly that: a release asset the loader opens by
+      # path, which nothing in the workspace links. So the tests that check the
+      # grammars groove actually publishes are grammars its own loader accepts
+      # had no artefact to open, and said so in their asserts.
       #
-      # No `--features test-helpers` here: this package declares no features,
+      # The list is not maintained by eye: `cdylib_artifacts_built_in_ci.rs`
+      # derives the cdylib-producing members from their manifests and fails if
+      # one is not named here, so a new grammar crate cannot ship without this
+      # step learning about it.
+      #
+      # No `--features test-helpers` here: these packages declare no features,
       # and naming one cargo cannot resolve fails the step.
-      - name: Build the cdylib nothing depends on
-        run: cargo build -p groove-grammar-python
+      - name: Build the cdylibs nothing depends on
+        run: cargo build -p groove-grammar-python -p groove-grammar-php
 
       - name: cargo test -- --include-ignored
         # `--include-ignored` は ignored + 通常両方を走らせる。nightly では

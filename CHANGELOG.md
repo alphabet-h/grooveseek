@@ -14,6 +14,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **PHP arrives as a grammar you place.** `groove-grammar-php` is a new release
+  asset — one archive per platform, each with its `.sha256`, built from the same
+  four targets as groove itself. Download it, check the hash, unpack the library
+  into the grammar directory, and add `"php"` to `[parsers].enabled`; a `.php`
+  file is then indexed one definition at a time, the way a Rust or Python file
+  already was, with `class` / `function` / `interface` / `module` / `field` in
+  `symbol_kind` and `lang:php` among the tags. Nothing is downloaded
+  automatically and no library is opened unless that key names the language it
+  belongs to, exactly as for the grammar published before it.
+
+  **A `const` is not a definition here.** PHP's tags query — the grammar's own,
+  travelling with the parse table it was written for — captures namespaces,
+  classes, interfaces, traits (as `interface`), functions, methods and
+  properties, and nothing else, so `const MAX_NODES = 64;` is filled in by line
+  along with the rest of what no definition covers. That is the same shape
+  Rust's query has and the opposite of Python's, whose module-level assignments
+  are captured; which one-liners are definitions at all has always been the
+  grammar's decision rather than groove's. A `.php` file that opens in HTML and
+  switches at `<?php` parses, because the grammar taken here is the one upstream
+  declares for the `.php` extension rather than its code-only sibling.
+
 ## [1.4.0] - 2026-09-04
 
 ### Changed
