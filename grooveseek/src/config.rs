@@ -1600,18 +1600,13 @@ pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Optio
     if target.starts_with(&target_kb) {
         return Some("it is inside the knowledge base");
     }
-    // (2) 書かれたパスで見る。KB の**中**に置いたリンクが外を指す形は (1) を抜ける —
+    // (2) エントリの位置で見る。KB の**中**に置いたリンクが外を指す形は (1) を抜ける —
     // 解決してしまうと「そのエントリ自体は KB の中にある」という事実が消えるため。
     // エントリを差し替えられるのは KB に書ける者なので、**指す先が外にあることは保護に
     // ならない**: 自分で用意した外のディレクトリへ向け直せばよい。
     // (codex P1 round 1 on PR #268。着手前調査で「危険度は低い」と切り捨てた形だが、
     //  攻撃者はまさに KB に書ける者なので前提が偽だった。)
-    //
-    // `std::path::absolute` は字句的に働き symlink を解決しないので、ここでは
-    // [`canonical_with_unresolved_tail`] を使わない — 使うと (1) と同じ答えになる。
-    let written = lexically_absolute(grammar_dir);
-    let written_kb = lexically_absolute(kb_path);
-    if written == written_kb || written.starts_with(&written_kb) {
+    if entry_or_ancestor_inside(grammar_dir, &target_kb) {
         return Some(
             "the path names an entry inside the knowledge base, and whoever can write there \
              can repoint it",
@@ -1620,11 +1615,29 @@ pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Optio
     None
 }
 
-/// symlink を**解決せずに**絶対パスへ。`std::path::absolute` は字句的に働くので、
-/// 「そのエントリ自体がどこにあるか」を判定できる ([`canonical_with_unresolved_tail`] は
-/// 実体を答えるので、この問いには使えない)。
-fn lexically_absolute(p: &Path) -> PathBuf {
-    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+/// `grammar_dir` 自身とその祖先を 1 段ずつ、**エントリとしての位置**で見る。
+///
+/// 「エントリとしての位置」= **親を実体に解決した先 + 自分の名前**。自分自身は解決しないので、
+/// KB の中に置かれたリンクが外を指していても「そのリンクが KB の中にある」ことが分かる。
+///
+/// **祖先まで辿る**のは、途中の component がリンクでも同じことが言えるから:
+/// `<kb>/a/b` で `a` が外を指すリンクなら、差し替えられるのは `a` の方で、`a` は KB の中にいる。
+///
+/// **字句比較では足りない。** 最初の実装は両側を `std::path::absolute` で絶対化して比べて
+/// いたが、`kb_path` が alias で `grammar_dir` が実体の綴りだと prefix を共有せず素通りする
+/// (codex P1 round 2 on PR #268)。junction で再現した: `kb-alias -> real-kb` と
+/// `real-kb/grammars -> outside` を作ると、同じ `grammar_dir` でも **KB をどう綴ったかで
+/// 答えが変わった**。だから比較は綴りではなく実体 (`canonical_kb`) に対して行う。
+fn entry_or_ancestor_inside(grammar_dir: &Path, canonical_kb: &Path) -> bool {
+    let mut cur = grammar_dir;
+    while let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) {
+        let here = canonical_with_unresolved_tail(parent).join(name);
+        if here == canonical_kb || here.starts_with(canonical_kb) {
+            return true;
+        }
+        cur = parent;
+    }
+    false
 }
 
 /// (AV-11) [`grammar_dir_inside_kb`] が該当を返したときの拒否。
@@ -3834,25 +3847,39 @@ lambda = 0.5
         );
     }
 
-    /// The lexical form must resolve nothing: it answers *where the entry is*,
-    /// not what it points at. Without that property the second half of
-    /// [`grammar_dir_inside_kb`] would just repeat the answer of the first, and
-    /// the link-pointing-outward case would be unguarded again. This one runs
-    /// on Windows too, where the symlink test below cannot.
+    /// [`entry_or_ancestor_inside`] walks up, so a directory *containing* the
+    /// knowledge base is not mistaken for one inside it, and it terminates on
+    /// both absolute and relative input. Runs everywhere, including where the
+    /// link tests below cannot.
     #[test]
-    fn the_lexical_form_of_a_path_resolves_nothing() {
-        let tmp = TempDir::new("groove-av11-lexical");
+    fn the_entry_walk_climbs_out_and_terminates() {
+        let tmp = TempDir::new("groove-av11-walk");
         let kb = tmp.path().join("kb");
         std::fs::create_dir_all(&kb).unwrap();
+        let canonical_kb = canonical_with_unresolved_tail(&kb);
 
-        // Nothing exists here, so a resolving helper has to fall back to some
-        // other answer; the lexical one hands back the path it was given.
-        let named = kb.join("grammars");
-        assert_eq!(lexically_absolute(&named), named);
         assert!(
-            lexically_absolute(Path::new("relative")).is_absolute(),
-            "a relative path still has to come back absolute"
+            entry_or_ancestor_inside(&kb.join("grammars"), &canonical_kb),
+            "a name directly under the knowledge base is inside it"
         );
+        assert!(
+            entry_or_ancestor_inside(&kb.join("a").join("b"), &canonical_kb),
+            "an ancestor inside the knowledge base is enough"
+        );
+        assert!(
+            !entry_or_ancestor_inside(tmp.path(), &canonical_kb),
+            "the directory holding the knowledge base is not inside it"
+        );
+        assert!(
+            !entry_or_ancestor_inside(&tmp.path().join("grammars"), &canonical_kb),
+            "a sibling is not inside it"
+        );
+        // A relative path has an empty parent, which is where the walk has to
+        // stop instead of looping.
+        assert!(!entry_or_ancestor_inside(
+            Path::new("relative"),
+            &canonical_kb
+        ));
     }
 
     /// ★ The mirror image, and the one canonicalizing alone lets through: a
@@ -3929,6 +3956,74 @@ lambda = 0.5
         assert!(
             grammar_dir_inside_kb(&link, &kb).is_some(),
             "an entry inside the knowledge base can be repointed by whoever writes there"
+        );
+    }
+
+    /// ★ The knowledge base can be named through an alias while `grammar_dir`
+    /// names it canonically. Comparing the two paths *as spelled* shares no
+    /// prefix, so the check answered `None` even though the entry sits
+    /// physically inside — the same `grammar_dir` gave a different answer
+    /// depending only on how the knowledge base was spelled. Reproduced with
+    /// junctions before fixing it. (codex P1, round 2 on PR #268.)
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_for_the_knowledge_base_does_not_hide_an_entry_inside_it() {
+        let tmp = TempDir::new("groove-av11-alias");
+        let real = tmp.path().join("real-kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let alias = tmp.path().join("kb-alias");
+        let grammars = real.join("grammars");
+
+        for (link, target) in [(&alias, &real), (&grammars, &outside)] {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+
+        assert!(
+            grammar_dir_inside_kb(&grammars, &alias).is_some(),
+            "naming the knowledge base through an alias must not change the answer"
+        );
+        assert_eq!(
+            grammar_dir_inside_kb(&grammars, &alias).is_some(),
+            grammar_dir_inside_kb(&grammars, &real).is_some(),
+            "the spelling of the knowledge base must not decide this"
+        );
+    }
+
+    /// The same shape on Unix, where the alias and the outward link are both
+    /// symlinks. See the Windows twin for what it protects against.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_for_the_knowledge_base_does_not_hide_an_entry_inside_it() {
+        let tmp = TempDir::new("groove-av11-alias");
+        let real = tmp.path().join("real-kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let alias = tmp.path().join("kb-alias");
+        let grammars = real.join("grammars");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &grammars).unwrap();
+
+        assert!(
+            grammar_dir_inside_kb(&grammars, &alias).is_some(),
+            "naming the knowledge base through an alias must not change the answer"
+        );
+        assert_eq!(
+            grammar_dir_inside_kb(&grammars, &alias).is_some(),
+            grammar_dir_inside_kb(&grammars, &real).is_some(),
+            "the spelling of the knowledge base must not decide this"
         );
     }
 
