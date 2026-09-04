@@ -983,7 +983,7 @@ impl Config {
     ///
     /// **呼ぶのは plugin 言語が `enabled` にあるときだけ** ([`Self::build_parser_registry`])。
     ///
-    /// (AV-11) **拒否はここに置く**。この関数は `pub` で、`restrict_untrusted` の R4 が
+    /// (AV-11) **拒否はここに置く**。この関数は `pub` で、[`Self::restrict_untrusted`] の R4 が
     /// 「2 本目の呼び出し元が生えた瞬間に、植えられた `grammar_dir` を止めるものが
     /// 無くなる」と既に警告している。検査を [`Self::build_parser_registry`] 側に置くと、
     /// **その警告どおりの穴を新しい検査で作り直す**ことになる。
@@ -3748,7 +3748,7 @@ lambda = 0.5
     // -----------------------------------------------------------------------
 
     /// Loading a grammar plugin *is* execution, while the knowledge base is --
-    /// by documented design (ADR-0003, `crate::links`) -- not a security
+    /// by documented design (ADR-0003, [`crate::links`]) -- not a security
     /// boundary. Where the two meet, "index this folder" becomes "run this
     /// code".
     #[test]
@@ -3881,8 +3881,8 @@ lambda = 0.5
 
     /// A Markdown-only knowledge base opens no plugin, so where plugins would
     /// live is not its business -- the laziness feature-56 built in
-    /// (`needs_grammar_plugin`) stays intact. Without this the new check would
-    /// start failing runs that load no native code at all.
+    /// ([`crate::parser::needs_grammar_plugin`]) stays intact. Without this the
+    /// new check would start failing runs that load no native code at all.
     #[test]
     fn a_markdown_only_knowledge_base_is_not_judged_on_the_plugin_directory() {
         let tmp = TempDir::new("groove-av11-md-only");
