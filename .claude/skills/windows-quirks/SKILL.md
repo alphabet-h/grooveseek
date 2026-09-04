@@ -415,24 +415,41 @@ diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **�
 そして**沈黙するかどうかは repo の設定で決まる**ので、先にそれを見る。
 **罠 10 の症状の出方も同じ設定に依存する**ので、この節の 2 コマンドは 2 つの節の共通の入口。
 
-### まず変換の有無を 2 つ打つ — 属性だけでは足りない
+### まず実体を見る — 属性は「宣言」であって「実体」ではない
 
 ```bash
-git check-attr text eol -- <file>
+git ls-files --eol -- <file>        # i/<index の行末>  w/<working tree の行末>  attr/<宣言>
 git config --get core.autocrlf
 ```
 
-**`check-attr` 単独では `core.autocrlf` を見落とす。** 属性が無い repo でも `autocrlf=true` なら
-git は変換しており、`check-attr` は `unspecified` としか答えない。答えの組で 3 通りに分かれる:
+**`check-attr` だけで決めない。** 理由は 2 つあり、どちらも実測で出た:
 
-| 属性 / `autocrlf` | index | working tree | 混在は commit に入るか | 寄せ先 |
-|---|---|---|---|---|
-| `text=auto eol=lf` (このリポジトリ) | LF | LF | **入らない** | LF |
-| 属性なし + `autocrlf=true` | LF | **CRLF** | **入らない** (作業コピーだけ混ざる) | **CRLF** |
-| 属性なし + `autocrlf=false` | そのまま | そのまま | **入る** ← 罠が成立するのはここだけ | そのファイルの追記前の行末 |
+- 属性が無い repo でも `autocrlf=true` なら git は変換しており、`check-attr` は
+  `unspecified` としか答えない
+- **`text=auto eol=lf` を宣言していても、その宣言より前に CRLF で commit された blob は
+  変換されない** (`git add --renormalize` を打つまで)。`check-attr` は `eol: lf` と答えるのに
+  実体は `i/crlf` のまま
 
-★ **`git show HEAD:<path>` で寄せ先を決めてよいのは 3 行目だけ。** 上 2 行では blob は必ず LF
-なので、CRLF の作業コピーに対して**逆を指す**。実測 (git 2.55.0.windows.5、使い捨て repo):
+`ls-files --eol` は **index 側と working tree 側の実体**を別々に出すので、この 2 つを跨いで
+1 行で答える。下の表の各行は、使い捨て repo で引いた結果:
+
+<!-- via: 使い捨て repo に CRLF ファイルを commit -> 設定を変える -> LF を 1 行 append -> git add -> git ls-files --eol と staged blob の CR を数える -->
+
+| 設定 / 出自 | `ls-files --eol` | 混在が commit に入るか | 寄せ先 |
+|---|---|---|---|
+| `text=auto eol=lf`、宣言後に作られたファイル (このリポジトリ) | `i/lf w/lf` | **入らない** | LF |
+| `text=auto eol=lf`、宣言**前**に CRLF で commit された blob | `i/crlf w/crlf` | **入る** | そのファイルの行末 (CRLF)。整えるなら `git add --renormalize` |
+| 属性なし + `autocrlf=true` | `i/lf w/crlf` | **入らない** (作業コピーだけ混ざる) | **CRLF**。blob は LF なので**見ると逆を指す** |
+| 属性なし + `autocrlf=false` | `i/crlf w/crlf` | **入る** | そのファイルの追記前の行末 |
+
+★ **この表にあるのは引いた設定だけ。** `core.autocrlf=input` と `eol=crlf` は引いていないので
+書いていない。当たったら**同じ手順で自分で確かめる** — `ls-files --eol` で実体を見て、
+LF を 1 行足して `git add` し、staged blob の CR を数えれば、その設定の行が 1 分で埋まる。
+
+★ **`git show HEAD:<path>` で寄せ先を決めてよいのは `i/` と `w/` が一致している行だけ。**
+`autocrlf=true` の行では blob は LF、作業コピーは CRLF なので逆を指す。
+
+実測 (git 2.55.0.windows.5、使い捨て repo):
 
 <!-- via: git init / config core.autocrlf true / CRLF のファイルを commit / LF を 1 行 append -->
 
@@ -443,8 +460,16 @@ LF を 1 行 append -> worktree CR=2 / lines=3 = 混在
 git diff --stat -> ` note.md | 1 +`  (warning: LF will be replaced by CRLF ...)
 ```
 
-**混在は見えないが、commit には入らない** — clean filter が正規化するため。**直すのは
-作業コピーの一貫性のためで、diff のためではない。**
+<!-- via: CRLF で commit -> 後から `* text=auto eol=lf` を追加 -> LF を 1 行 append -> git add -->
+
+```
+check-attr     : text: auto   eol: lf                    <- 宣言は「LF に固定」
+ls-files --eol : i/crlf  w/crlf  attr/text=auto eol=lf   <- 実体は CRLF のまま
+LF を 1 行 append -> worktree CR=2 / staged blob CR=2 / committed blob CR=2  = 混在が commit に入った
+```
+
+**混在が diff に出ないのは、引いたどの設定でも同じ。** 設定が決めるのは**残るかどうか**で、
+正規化される行では**直すのは作業コピーの一貫性のためであって diff のためではない**。
 
 **このリポジトリは `.gitattributes` で `* text=auto eol=lf` を宣言している**ので、
 tracked な text file は repo の中も working tree も LF に固定される。この状態では:
