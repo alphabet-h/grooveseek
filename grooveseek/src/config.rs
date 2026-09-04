@@ -1651,7 +1651,16 @@ fn entry_or_ancestor_inside(grammar_dir: &Path, canonical_kb: &Path) -> bool {
         //  エントリである」を暗黙に仮定していた。)
         if let Some(name) = cur.file_name() {
             let here = canonical_with_unresolved_tail(parent).join(name);
-            if here == canonical_kb || here.starts_with(canonical_kb) {
+            // **真の子孫だけ**。知識ベースそのもののエントリは知識ベースの*親*にあり、
+            // そこへ書けることは知識ベースへ書けることが与える権限ではない。等値まで
+            // 拒否すると、`<kb>/../grammars` (知識ベース直下に置いた config が
+            // `grammar_dir = "../grammars"` と書くと [`resolve_relative`] がこう綴る) が
+            // 拒まれる — 実体は外にあるのに、**綴り方だけで答えが変わる**。
+            // (codex P2 round 5 on PR #268。実測: 同じディレクトリを直に書けば通る。)
+            //
+            // 置き場が知識ベース**そのもの**である場合は、この関数の呼び出し元が
+            // 解決後の等値で先に答えている。
+            if here != canonical_kb && here.starts_with(canonical_kb) {
                 return true;
             }
         }
@@ -4181,6 +4190,44 @@ lambda = 0.5
         assert!(
             inside_knowledge_base(&via_dotdot, &kb).is_some(),
             "a path traversing an entry inside the knowledge base must be refused"
+        );
+    }
+
+    /// ★ A sibling directory spelled *through* the knowledge base must still be
+    /// allowed. A config sitting at the knowledge-base root writing
+    /// `grammar_dir = "../grammars"` is kept by [`resolve_relative`] as
+    /// `<kb>/../grammars`, whose target is outside — but the walk passes through
+    /// the `<kb>` component itself on the way up. Rejecting on equality there
+    /// made the answer depend on **how the directory was spelled** rather than
+    /// on where it is. (codex P2, round 5 on PR #268.)
+    ///
+    /// Writing inside the knowledge base does not grant the ability to repoint
+    /// the knowledge base's own entry, which lives in its parent.
+    #[test]
+    fn a_sibling_directory_spelled_through_the_knowledge_base_is_allowed() {
+        let tmp = TempDir::new("groove-av11-sibling");
+        let kb = tmp.path().join("kb");
+        let sibling = tmp.path().join("grammars");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let spelled = kb.join("..").join("grammars");
+        assert_eq!(
+            inside_knowledge_base(&spelled, &kb),
+            None,
+            "the target is outside; the spelling must not decide this"
+        );
+        assert_eq!(
+            inside_knowledge_base(&spelled, &kb),
+            inside_knowledge_base(&sibling, &kb),
+            "both spellings name the same directory and must agree"
+        );
+
+        // The knowledge base itself is still refused -- by the resolved half,
+        // which is why the walk can afford to look only at true descendants.
+        assert_eq!(
+            inside_knowledge_base(&kb, &kb),
+            Some("it is the knowledge base directory itself")
         );
     }
 
