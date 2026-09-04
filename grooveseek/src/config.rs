@@ -1588,18 +1588,43 @@ fn canonical_with_unresolved_tail(p: &Path) -> PathBuf {
 /// [ADR-0003]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md
 /// [ADR-0013]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md
 pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Option<&'static str> {
-    let dir = canonical_with_unresolved_tail(grammar_dir);
-    let kb = canonical_with_unresolved_tail(kb_path);
+    // (1) 実体で見る。KB の**外**に置いたリンクが KB の中を指す形を捕まえる。
+    let target = canonical_with_unresolved_tail(grammar_dir);
+    let target_kb = canonical_with_unresolved_tail(kb_path);
     // 等値と真の子孫を分けて答える。`starts_with` は等値を含むので 1 つにまとめられるが、
     // まとめると「KB そのもの」を潰す変異がどのテストも赤にしない (AV-09 の教訓: 1 行に
     // 見える条件の答えの数を数える)。
-    if dir == kb {
+    if target == target_kb {
         return Some("it is the knowledge base directory itself");
     }
-    if dir.starts_with(&kb) {
+    if target.starts_with(&target_kb) {
         return Some("it is inside the knowledge base");
     }
+    // (2) 書かれたパスで見る。KB の**中**に置いたリンクが外を指す形は (1) を抜ける —
+    // 解決してしまうと「そのエントリ自体は KB の中にある」という事実が消えるため。
+    // エントリを差し替えられるのは KB に書ける者なので、**指す先が外にあることは保護に
+    // ならない**: 自分で用意した外のディレクトリへ向け直せばよい。
+    // (codex P1 round 1 on PR #268。着手前調査で「危険度は低い」と切り捨てた形だが、
+    //  攻撃者はまさに KB に書ける者なので前提が偽だった。)
+    //
+    // `std::path::absolute` は字句的に働き symlink を解決しないので、ここでは
+    // [`canonical_with_unresolved_tail`] を使わない — 使うと (1) と同じ答えになる。
+    let written = lexically_absolute(grammar_dir);
+    let written_kb = lexically_absolute(kb_path);
+    if written == written_kb || written.starts_with(&written_kb) {
+        return Some(
+            "the path names an entry inside the knowledge base, and whoever can write there \
+             can repoint it",
+        );
+    }
     None
+}
+
+/// symlink を**解決せずに**絶対パスへ。`std::path::absolute` は字句的に働くので、
+/// 「そのエントリ自体がどこにあるか」を判定できる ([`canonical_with_unresolved_tail`] は
+/// 実体を答えるので、この問いには使えない)。
+fn lexically_absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// (AV-11) [`grammar_dir_inside_kb`] が該当を返したときの拒否。
@@ -3806,6 +3831,104 @@ lambda = 0.5
             grammar_dir_inside_kb(&link, &kb),
             Some("it is inside the knowledge base"),
             "a link sitting outside but pointing in is inside"
+        );
+    }
+
+    /// The lexical form must resolve nothing: it answers *where the entry is*,
+    /// not what it points at. Without that property the second half of
+    /// [`grammar_dir_inside_kb`] would just repeat the answer of the first, and
+    /// the link-pointing-outward case would be unguarded again. This one runs
+    /// on Windows too, where the symlink test below cannot.
+    #[test]
+    fn the_lexical_form_of_a_path_resolves_nothing() {
+        let tmp = TempDir::new("groove-av11-lexical");
+        let kb = tmp.path().join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+
+        // Nothing exists here, so a resolving helper has to fall back to some
+        // other answer; the lexical one hands back the path it was given.
+        let named = kb.join("grammars");
+        assert_eq!(lexically_absolute(&named), named);
+        assert!(
+            lexically_absolute(Path::new("relative")).is_absolute(),
+            "a relative path still has to come back absolute"
+        );
+    }
+
+    /// ★ The mirror image, and the one canonicalizing alone lets through: a
+    /// link **inside** the knowledge base that points out of it. Resolving the
+    /// path erases the fact that the entry itself sits where anyone who can
+    /// write the knowledge base controls it, and such a writer can simply
+    /// repoint it at a directory of their own holding the expected library —
+    /// so the target being outside is no protection. (codex P1, round 1 on
+    /// PR #268.)
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_the_knowledge_base_is_refused_even_when_it_points_out() {
+        let tmp = TempDir::new("groove-av11-outward-link");
+        let kb = tmp.path().join("kb");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = kb.join("grammars");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        // The target is genuinely outside, so the check that resolves cannot
+        // see the problem -- the one that reads the path as written must.
+        assert_eq!(
+            canonical_with_unresolved_tail(&link),
+            canonical_with_unresolved_tail(&elsewhere),
+            "the link really does resolve out of the knowledge base"
+        );
+        assert!(
+            grammar_dir_inside_kb(&link, &kb).is_some(),
+            "an entry inside the knowledge base can be repointed by whoever writes there"
+        );
+    }
+
+    /// The same shape on Windows, where it is **easier** to set up than on
+    /// Unix: a directory junction needs no elevation, while a symlink does.
+    /// Measured on a developer machine — `New-Item -ItemType SymbolicLink` fails
+    /// with "Administrator privilege required" while `mklink /J` succeeds, and
+    /// `canonicalize` then follows the junction out of the knowledge base, so
+    /// the resolving half alone would accept it.
+    ///
+    /// No std API creates a junction, hence the `cmd` call. It is asserted
+    /// rather than skipped: a silent skip would hide the fact that this
+    /// platform's cheapest version of the attack is no longer covered.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_inside_the_knowledge_base_is_refused_even_when_it_points_out() {
+        let tmp = TempDir::new("groove-av11-junction");
+        let kb = tmp.path().join("kb");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = kb.join("grammars");
+
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.display().to_string(),
+                &elsewhere.display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(
+            made.success(),
+            "mklink /J needs no elevation and must succeed"
+        );
+
+        assert_eq!(
+            canonical_with_unresolved_tail(&link),
+            canonical_with_unresolved_tail(&elsewhere),
+            "the junction really does resolve out of the knowledge base"
+        );
+        assert!(
+            grammar_dir_inside_kb(&link, &kb).is_some(),
+            "an entry inside the knowledge base can be repointed by whoever writes there"
         );
     }
 
