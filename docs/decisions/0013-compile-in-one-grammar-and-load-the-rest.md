@@ -98,7 +98,10 @@ and its tags query at versions that were built together.
   to `[parsers].enabled`: naming a language is what causes a library to be
   opened at all, so guarding only the directory left the ignition unguarded.
   That key needs no substitute when absent — an omitted `[parsers]` already
-  means Markdown alone.)*
+  means Markdown alone.)* *(Since v1.6.0, see
+  [ADR-0016](0016-keep-the-plugin-directory-outside-the-knowledge-base.md): this
+  consequence covers **who may write the value**, and the directory it names is
+  now also refused when it points inside the knowledge base.)*
 - **An enabled language that cannot be resolved stops the run**, with a
   message naming what is missing and where it should go, and without
   creating a database. This holds whether or not the configuration was

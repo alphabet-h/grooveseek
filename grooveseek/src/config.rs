@@ -947,7 +947,7 @@ impl Config {
 
     /// 設定から `parser::Registry` を構築する。キー省略時は
     /// `Registry::defaults()` = `["md"]` のみ (legacy 後方互換)。
-    pub fn build_parser_registry(&self) -> Result<crate::parser::Registry> {
+    pub fn build_parser_registry(&self, kb_path: &Path) -> Result<crate::parser::Registry> {
         match &self.parsers {
             // (feature-56) `[parsers.code]` reaches the parser here rather than at parse time:
             // `Parser::parse_bytes_inner` takes no configuration, so a code parser has to be
@@ -958,8 +958,14 @@ impl Config {
                 // `GROOVE_GRAMMAR_DIR` and never asks the OS where local data lives, so a
                 // machine where neither can be answered is not a machine where `groove index`
                 // stops working.
+                //
+                // (AV-11) `kb_path` is threaded through for the same reason: the check that
+                // the plugin directory is not inside the knowledge base only makes sense
+                // against the **effective** knowledge base, which the CLI can override
+                // (`main.rs`'s `require_kb_path`). Reading `self.kb_path` here would compare
+                // against a value the run is not using.
                 let grammar_dir = if crate::parser::needs_grammar_plugin(&p.enabled) {
-                    self.resolve_grammar_dir()?
+                    self.resolve_grammar_dir(kb_path)?
                 } else {
                     None
                 };
@@ -976,12 +982,27 @@ impl Config {
     /// (feature-56) grammar plugin の置き場を決める。`Ok(None)` は「決められない」。
     ///
     /// **呼ぶのは plugin 言語が `enabled` にあるときだけ** ([`Self::build_parser_registry`])。
-    pub fn resolve_grammar_dir(&self) -> Result<Option<PathBuf>> {
-        grammar_dir_from(
+    ///
+    /// (AV-11) **拒否はここに置く**。この関数は `pub` で、`restrict_untrusted` の R4 が
+    /// 「2 本目の呼び出し元が生えた瞬間に、植えられた `grammar_dir` を止めるものが
+    /// 無くなる」と既に警告している。検査を [`Self::build_parser_registry`] 側に置くと、
+    /// **その警告どおりの穴を新しい検査で作り直す**ことになる。
+    ///
+    /// 判定は解決**後**の 1 箇所で行う。env / config / OS 既定のどれで決まっても危険は
+    /// 同じなので、経路ごとに分けると同じ物理状況が複数の意味を持つ (ADR-0013 が退けた形)。
+    pub fn resolve_grammar_dir(&self, kb_path: &Path) -> Result<Option<PathBuf>> {
+        let Some((dir, source)) = grammar_dir_from(
             std::env::var_os("GROOVE_GRAMMAR_DIR"),
             self.grammar_dir.as_deref(),
             dirs::data_local_dir(),
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = grammar_dir_inside_kb(&dir, kb_path) {
+            return Err(refuse_grammar_dir_inside_kb(&dir, source, kb_path, reason));
+        }
+        Ok(Some(dir))
     }
 
     /// パース後の値域 / 整合性チェック。`load_from` のような構文レベルの
@@ -1378,6 +1399,32 @@ fn dir_from_env_value(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     raw.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
+/// (AV-11) 解決された `grammar_dir` が**どの入力で決まったか**。
+///
+/// 値だけを返すと、拒否した理由を伝えるときに「どれを直せばよいか」が言えない。
+/// 環境変数を設定した利用者に「config を直せ」と案内するのは、直しても直らない
+/// 指示になる ([`grammar_dir_from`] は env を先に見るため)。
+///
+/// 優先順位を知っているのは [`grammar_dir_from`] **だけ**にする。出所を別の関数で
+/// 判定し直すと、同じ問いに 2 つの答えを持つ場所ができて、いずれ食い違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrammarDirSource {
+    Environment,
+    Config,
+    OsDefault,
+}
+
+impl GrammarDirSource {
+    /// 利用者に見せる名前。**その値を実際に変えられる場所**を指す。
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Environment => "GROOVE_GRAMMAR_DIR",
+            Self::Config => "`grammar_dir` in the config file",
+            Self::OsDefault => "the OS default location for local data",
+        }
+    }
+}
+
 /// (feature-56) grammar plugin の置き場を決める規則。入力をすべて引数で受ける。
 ///
 /// 分けてある理由は [`dir_from_env_value`] と同じ — `GROOVE_GRAMMAR_DIR` は
@@ -1390,11 +1437,15 @@ fn dir_from_env_value(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// ([`crate::embedder`] の `cache_dir_from`) で、理由も同じ: 相対値は起動場所に対して
 /// 解決されるので、**利用者が管理していないディレクトリからネイティブコードを
 /// 読み込む**ことになる。plugin は検証なしに `dlopen` される。
+///
+/// (AV-11) 値と一緒に [`GrammarDirSource`] を返す。KB の内側を指していたときに
+/// **どの入力を直せばよいか**を言うためで、判定側 ([`Config::resolve_grammar_dir`]) が
+/// 優先順位を推測し直さずに済む。
 pub(crate) fn grammar_dir_from(
     env: Option<std::ffi::OsString>,
     configured: Option<&Path>,
     data_local: Option<PathBuf>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<(PathBuf, GrammarDirSource)>> {
     if let Some(raw) = env
         && !raw.is_empty()
     {
@@ -1407,14 +1458,19 @@ pub(crate) fn grammar_dir_from(
              from it without verification.",
             dir.display()
         );
-        return Ok(Some(dir));
+        return Ok(Some((dir, GrammarDirSource::Environment)));
     }
     if let Some(dir) = configured {
-        return Ok(Some(dir.to_path_buf()));
+        return Ok(Some((dir.to_path_buf(), GrammarDirSource::Config)));
     }
     // `data_local_dir()` であって `cache_dir()` ではない。plugin は利用者が意図して置く
     // 成果物で、キャッシュのように消してよいものではない。
-    Ok(data_local.map(|base| base.join("groove").join("grammars")))
+    Ok(data_local.map(|base| {
+        (
+            base.join("groove").join("grammars"),
+            GrammarDirSource::OsDefault,
+        )
+    }))
 }
 
 /// `FASTEMBED_CACHE_DIR` が**モデルの置き場所として使える値**か (BU-07)。
@@ -1477,6 +1533,107 @@ pub(crate) fn forbidden_kb_path(
     None
 }
 
+/// 存在しないパスでも比較できるよう、**存在する祖先までを実体に解決**して残りを継ぎ足す。
+///
+/// [`canonical_or_as_is`] では足りない。`grammar_dir` はまだ作られていないのが普通の状態で
+/// (plugin 未配置は正常)、そのとき片側だけ `canonicalize` が成功する。Windows の
+/// `canonicalize` は verbatim prefix (`\\?\`) を付けて返すので、**片側にだけ付くと
+/// `starts_with` が必ず false になる** — 検査が黙って素通りする形。両側を同じ規則に
+///通せば prefix の有無が揃う。
+///
+/// `main.rs` の `validate` が「canonicalize は使わない」と書いているのと矛盾しない:
+/// あちらは strip_prefix の相手が同形なので解決が要らない。ここは **symlink を実体で
+/// 判定する必要がある** (KB の外に置いた symlink が KB の中を指す形が主眼) ので、
+/// 解決したうえで prefix を揃える。
+fn canonical_with_unresolved_tail(p: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(cur) {
+            let mut out = resolved;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            // ルートまで遡っても解決できない。字面で答える (両側とも同じ扱いになる)。
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// (AV-11) 解決された `grammar_dir` が知識ベースの内側か。該当すれば理由を返す。
+///
+/// **plugin を読み込む決定を、索引される側のディレクトリに委ねない。** grammar plugin は
+/// 検証なしに `dlopen` される native code なので、置き場に書ける者はこのプロセスで任意の
+/// コードを実行できる ([ADR-0013] が「plugin の置き場は特権的な設定になる」と明記)。一方
+/// KB ディレクトリは [ADR-0003] と [`crate::links`] が繰り返し「**セキュリティ境界では
+/// ない**」と宣言している。2 つが交わる — 置き場が KB の内側にある — と、「このフォルダを
+/// index して」が「このコードを実行して」に化ける。
+///
+/// **[`forbidden_kb_path`] と違い trust では分岐しない。** あちらは「信頼できない config が
+/// 書いてよい値か」を問うが、こちらの危険は config がどこで見つかったかと無関係に成り立つ。
+/// ADR-0013 が「有効化された言語が解決できなければ実行を止める。これは設定が trusted か
+/// どうかに関わらず成り立つ」と書いたのと同じ理由 — **同じ物理的状況が「どこで見つかったか」で
+/// 2 通りの意味を持ってはならない**。
+///
+/// **存在しないパスは拒否しない。** plugin をまだ置いていない KB は正常な状態で、置き場が
+/// 無いことは R4 (iii) の文言が受ける。[`forbidden_kb_path`] が「解決できない symlink」を
+/// 拒否するのは、あちらが*索引される場所*を決めていて判定不能を素通しにできないからで、
+/// ここで同じ扱いをすると Markdown だけの利用者まで止まる。
+///
+/// [ADR-0003]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md
+/// [ADR-0013]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md
+pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Option<&'static str> {
+    let dir = canonical_with_unresolved_tail(grammar_dir);
+    let kb = canonical_with_unresolved_tail(kb_path);
+    // 等値と真の子孫を分けて答える。`starts_with` は等値を含むので 1 つにまとめられるが、
+    // まとめると「KB そのもの」を潰す変異がどのテストも赤にしない (AV-09 の教訓: 1 行に
+    // 見える条件の答えの数を数える)。
+    if dir == kb {
+        return Some("it is the knowledge base directory itself");
+    }
+    if dir.starts_with(&kb) {
+        return Some("it is inside the knowledge base");
+    }
+    None
+}
+
+/// (AV-11) [`grammar_dir_inside_kb`] が該当を返したときの拒否。
+///
+/// [`Config::resolve_grammar_dir`] から切り出してあるのは **`GROOVE_GRAMMAR_DIR` を
+/// 立てずに文言をテストするため**。あの関数は env を読むので、文言のテストがそこを通ると
+/// プロセス全体で共有された変数に依存し、隣で走るテストの判断を変えてしまう
+/// (`AV-41` が挙げている形)。
+fn refuse_grammar_dir_inside_kb(
+    dir: &Path,
+    source: GrammarDirSource,
+    kb_path: &Path,
+    reason: &str,
+) -> anyhow::Error {
+    // `concat!` で組む: 文字列リテラルの `\<改行>` 継続は「改行 + 先頭空白」を食うので、
+    // 数え間違えても黙ってコンパイルが通る。
+    anyhow::anyhow!(
+        concat!(
+            "grammar_dir must not be inside the knowledge base -- {reason}.\n",
+            "\n",
+            "  grammar_dir: {dir} (from {source})\n",
+            "  kb_path:     {kb}\n",
+            "\n",
+            "A grammar plugin is native code, loaded without verification. Anyone who\n",
+            "can write to the knowledge base could place a library there, so the\n",
+            "directory that decides which code runs must sit outside it.",
+        ),
+        reason = reason,
+        dir = dir.display(),
+        source = source.describe(),
+        kb = kb_path.display(),
+    )
+}
+
 /// `~` を home に展開する。home が取れない (CI 等) 場合は入力をそのまま返す。
 /// 内部的には `shellexpand::tilde` のラッパで、Windows でも `~` を解決する。
 pub fn expand_tilde(s: &str) -> String {
@@ -1521,6 +1678,13 @@ fn resolve_relative(base: &Path, path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// (AV-11) [`Config::build_parser_registry`] へ渡す KB。**この値は答えに影響しない** —
+    /// これを使うテストが有効にする id はどれも grammar plugin を要求しないので、
+    /// [`grammar_dir_inside_kb`] の検査はそもそも走らない
+    /// ([`Config::build_parser_registry`] が [`crate::parser::needs_grammar_plugin`] で
+    /// 分岐する)。検査が関わるテストは自分の KB を作って渡す。
+    const KB_NOT_UNDER_TEST: &str = "kb-not-under-test";
 
     #[test]
     fn test_load_missing_file_returns_empty() {
@@ -1698,7 +1862,9 @@ mod tests {
         writeln!(file, r#"model = "bge-small-en-v1.5""#).unwrap();
         let cfg = Config::load_from(file.path()).unwrap();
         assert!(cfg.parsers.is_none());
-        let reg = cfg.build_parser_registry().unwrap();
+        let reg = cfg
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .unwrap();
         assert_eq!(reg.extensions(), vec!["md"]);
     }
 
@@ -2066,7 +2232,7 @@ lambda = 0.5
         let cfg = Config::load_from(file.path()).unwrap();
         // validate is passed, but build_parser_registry should fail on "rst"
         let err = cfg
-            .build_parser_registry()
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
             .expect_err("rst must be rejected");
         assert!(err.to_string().contains("rst"));
     }
@@ -3360,7 +3526,7 @@ lambda = 0.5
 
         let registry = d
             .config
-            .build_parser_registry()
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
             .expect("the default registry needs no plugin and no environment");
         assert!(
             registry.has_extension("md"),
@@ -3395,7 +3561,10 @@ lambda = 0.5
             "no id beyond the default is honoured, plugin or not"
         );
 
-        let registry = d.config.build_parser_registry().expect("default registry");
+        let registry = d
+            .config
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .expect("default registry");
         for ext in ["txt", "pdf", "xlsx"] {
             assert!(
                 !registry.has_extension(ext),
@@ -3454,7 +3623,10 @@ lambda = 0.5
             "an absent key stays absent; there is no safer value to write"
         );
 
-        let registry = d.config.build_parser_registry().expect("default registry");
+        let registry = d
+            .config
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .expect("default registry");
         assert_eq!(
             registry.extensions(),
             vec!["md"],
@@ -3514,7 +3686,8 @@ lambda = 0.5
         let configured = PathBuf::from("/from-config");
         let data_local = PathBuf::from("/data-local");
 
-        // env wins over both.
+        // env wins over both. (AV-11) The source travels with the value, so the
+        // refusal can name the input the reader has to change.
         assert_eq!(
             grammar_dir_from(
                 Some(abs.clone().into_os_string()),
@@ -3522,7 +3695,7 @@ lambda = 0.5
                 Some(data_local.clone())
             )
             .unwrap(),
-            Some(abs.clone())
+            Some((abs.clone(), GrammarDirSource::Environment))
         );
 
         // Empty is not set (the rule `dir_from_env_value` already states for
@@ -3534,17 +3707,22 @@ lambda = 0.5
                 Some(data_local.clone())
             )
             .unwrap(),
-            Some(configured.clone())
+            Some((configured.clone(), GrammarDirSource::Config))
         );
 
         // No env, no config: the OS location, under `groove/grammars`.
-        let fallback = grammar_dir_from(None, None, Some(data_local.clone()))
+        let (fallback, source) = grammar_dir_from(None, None, Some(data_local.clone()))
             .unwrap()
             .expect("a local data directory names a grammar directory");
         assert!(
             fallback.ends_with(Path::new("groove").join("grammars")),
             "unexpected fallback: {}",
             fallback.display()
+        );
+        assert_eq!(
+            source,
+            GrammarDirSource::OsDefault,
+            "the fallback must report itself as the OS default, not as the config"
         );
 
         // Nothing at all: undecidable, and never a working-directory-relative
@@ -3563,6 +3741,167 @@ lambda = 0.5
             err.to_string().contains("must be an absolute path"),
             "unexpected message: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AV-11: the plugin directory must not sit inside the knowledge base
+    // -----------------------------------------------------------------------
+
+    /// Loading a grammar plugin *is* execution, while the knowledge base is --
+    /// by documented design (ADR-0003, `crate::links`) -- not a security
+    /// boundary. Where the two meet, "index this folder" becomes "run this
+    /// code".
+    #[test]
+    fn a_grammar_directory_inside_the_knowledge_base_is_refused() {
+        let tmp = TempDir::new("groove-av11-inside");
+        let kb = tmp.path().join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+
+        assert_eq!(
+            grammar_dir_inside_kb(&kb, &kb),
+            Some("it is the knowledge base directory itself"),
+            "the knowledge base itself is the strongest form of the problem"
+        );
+        // Not created yet -- placing the plugin comes later, so the rule has to
+        // answer for a path that does not exist. This is also the case where
+        // only one side canonicalizes, which is where a Windows verbatim prefix
+        // (`\\?\`) on one side alone would make `starts_with` answer false.
+        assert_eq!(
+            grammar_dir_inside_kb(&kb.join("plugins"), &kb),
+            Some("it is inside the knowledge base")
+        );
+        assert_eq!(
+            grammar_dir_inside_kb(&kb.join("a").join("b"), &kb),
+            Some("it is inside the knowledge base")
+        );
+
+        for outside in [
+            tmp.path().join("grammars"),
+            tmp.path().to_path_buf(),
+            // Shares the prefix as a *string*, but not as a path component.
+            tmp.path().join("kb-2"),
+        ] {
+            assert_eq!(
+                grammar_dir_inside_kb(&outside, &kb),
+                None,
+                "{} is not inside the knowledge base",
+                outside.display()
+            );
+        }
+    }
+
+    /// The rule follows the target, not the name -- the same reason
+    /// [`forbidden_kb_path`] resolves symlinks. Unix-only because creating one
+    /// on Windows needs Developer Mode or elevation, which CI runners may lack;
+    /// the ubuntu and macOS legs cover it.
+    #[cfg(unix)]
+    #[test]
+    fn a_grammar_directory_symlink_is_judged_by_its_target() {
+        let tmp = TempDir::new("groove-av11-symlink");
+        let kb = tmp.path().join("kb");
+        std::fs::create_dir_all(kb.join("inside")).unwrap();
+        let link = tmp.path().join("grammars");
+        std::os::unix::fs::symlink(kb.join("inside"), &link).unwrap();
+        assert_eq!(
+            grammar_dir_inside_kb(&link, &kb),
+            Some("it is inside the knowledge base"),
+            "a link sitting outside but pointing in is inside"
+        );
+    }
+
+    /// The refusal has to name the input the reader can actually change:
+    /// telling someone who set the environment variable to edit the config file
+    /// is advice that cannot work, because the variable wins either way.
+    #[test]
+    fn the_refusal_names_the_input_that_has_to_change() {
+        let kb = Path::new("/kb");
+        let dir = Path::new("/kb/plugins");
+        for (source, expected) in [
+            (GrammarDirSource::Environment, "GROOVE_GRAMMAR_DIR"),
+            (GrammarDirSource::Config, "`grammar_dir` in the config file"),
+            (
+                GrammarDirSource::OsDefault,
+                "the OS default location for local data",
+            ),
+        ] {
+            let msg =
+                refuse_grammar_dir_inside_kb(dir, source, kb, "it is inside the knowledge base")
+                    .to_string();
+            assert!(
+                msg.contains(expected),
+                "message must name {expected}: {msg}"
+            );
+            assert!(
+                msg.contains("must not be inside the knowledge base"),
+                "message must state the rule: {msg}"
+            );
+            assert!(
+                msg.contains("native code"),
+                "message must say why the rule exists: {msg}"
+            );
+        }
+    }
+
+    /// ★ The check is only meaningful against the knowledge base the run is
+    /// actually using. `--kb-path` overrides the config (`require_kb_path`, in
+    /// the binary), so reading `self.kb_path` here would compare against a
+    /// directory nobody indexes. Threading it through as an argument is exactly
+    /// what makes the two answers below differ.
+    #[test]
+    fn the_plugin_directory_is_judged_against_the_knowledge_base_the_run_uses() {
+        let tmp = TempDir::new("groove-av11-effective-kb");
+        let configured_kb = tmp.path().join("kb-from-config");
+        let actual_kb = tmp.path().join("kb-from-cli");
+        let grammars = actual_kb.join("grammars");
+        std::fs::create_dir_all(&configured_kb).unwrap();
+        std::fs::create_dir_all(&grammars).unwrap();
+
+        let file = tmp.path().join("groove.toml");
+        std::fs::write(
+            &file,
+            format!("kb_path = {configured_kb:?}\ngrammar_dir = {grammars:?}\n"),
+        )
+        .unwrap();
+        let cfg = Config::load_from(&file).unwrap();
+
+        assert!(
+            cfg.resolve_grammar_dir(&configured_kb).is_ok(),
+            "the directory is outside the knowledge base the config names"
+        );
+
+        let err = cfg
+            .resolve_grammar_dir(&actual_kb)
+            .expect_err("the effective knowledge base contains the plugin directory");
+        assert!(
+            err.to_string()
+                .contains("must not be inside the knowledge base"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// A Markdown-only knowledge base opens no plugin, so where plugins would
+    /// live is not its business -- the laziness feature-56 built in
+    /// (`needs_grammar_plugin`) stays intact. Without this the new check would
+    /// start failing runs that load no native code at all.
+    #[test]
+    fn a_markdown_only_knowledge_base_is_not_judged_on_the_plugin_directory() {
+        let tmp = TempDir::new("groove-av11-md-only");
+        let kb = tmp.path().join("kb");
+        let grammars = kb.join("grammars");
+        std::fs::create_dir_all(&grammars).unwrap();
+
+        let file = tmp.path().join("groove.toml");
+        std::fs::write(
+            &file,
+            format!("grammar_dir = {grammars:?}\n[parsers]\nenabled = [\"md\"]\n"),
+        )
+        .unwrap();
+        let cfg = Config::load_from(&file).unwrap();
+
+        let registry = cfg
+            .build_parser_registry(&kb)
+            .expect("a Markdown-only registry never asks where plugins live");
+        assert_eq!(registry.extensions(), vec!["md"]);
     }
 
     /// An empty directory variable makes every path built from it relative,
