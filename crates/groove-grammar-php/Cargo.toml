@@ -1,6 +1,6 @@
 [package]
 name = "groove-grammar-php"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "The PHP grammar, as a library groove loads at run time"
 authors = ["koshian"]

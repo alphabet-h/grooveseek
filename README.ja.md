@@ -45,7 +45,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 > | `groove-svc-x86_64-pc-windows-msvc.zip` | `groove service install` は `groove-svc.exe` が `groove.exe` の隣にあればそれを logon task の起動対象にし、**無ければ console 可視の launcher に fallback する** — 毎回のログオンでコンソール窓が一瞬出る。fallback したことは warning で報告されるが、`service install` の**前に**展開しておけば入れ直さずに済む。 |
 > | `groove-tray-x86_64-pc-windows-msvc.zip` | 任意。system tray 監視 binary で、`service install --with-tray` を使う場合のみ必要。 |
 
-> **grammar が焼き込まれていない言語は archive がもう 1 つ要る。** Rust は `groove` 本体に入っているが、Python は別ダウンロード (v1.3.0 以降) — `groove-grammar-python-<target>.tar.xz` (Windows は `.zip`) が上の表と同じ 4 ターゲットぶんある。展開したライブラリを `grammar_dir` が指すディレクトリに置き、`[parsers].enabled` に `"py"` を足す。自動 DL は一切行われず、そのキーが言語を名指さない限りライブラリは開かれない — [grammar plugin の置き方](docs/clients.ja.md#grammar-plugin-の置き方-v130) を参照。
+> **grammar が焼き込まれていない言語は archive がもう 1 つ要る。** Rust は `groove` 本体に入っているが、それ以外の言語はそれぞれ別ダウンロード — `groove-grammar-<言語>-<target>.tar.xz` (Windows は `.zip`) が上の表と同じターゲットぶんある。現在公開しているのは `groove-grammar-python` (v1.3.0 以降、`[parsers].enabled` には `"py"`) と `groove-grammar-php` (v1.5.0 以降、同じく `"php"`)。展開したライブラリを `grammar_dir` が指すディレクトリに置き、その id を `[parsers].enabled` に足す。自動 DL は一切行われず、そのキーが言語を名指さない限りライブラリは開かれない — [grammar plugin の置き方](docs/clients.ja.md#grammar-plugin-の置き方-v130) を参照。
 
 各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。
 
