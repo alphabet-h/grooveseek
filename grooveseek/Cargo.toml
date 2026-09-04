@@ -1,6 +1,6 @@
 [package]
 name = "grooveseek"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "Semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a local knowledge base of Markdown, plain-text, PDF and Office documents, served over MCP or a web UI."
 authors = ["koshian"]
