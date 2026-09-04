@@ -40,11 +40,11 @@
 //! # What this cannot catch
 //!
 //! **Block against block, and page against page.** Two fenced blocks on one page
-//! stand in this relation fifteen times in this repository today -- `AGENTS.md`
+//! stand in this relation sixteen times in this repository today -- `AGENTS.md`
 //! lists three commands to run while working and five that reproduce CI,
 //! `docs/usage.md` shows one `groove` subcommand at a time and then all three
 //! under `RUST_LOG` -- and every one of them is deliberate. A rule symmetric
-//! enough to catch a copied block would fail on all fifteen, and a guard that
+//! enough to catch a copied block would fail on all sixteen, and a guard that
 //! cries wolf gets switched off. Copies that span pages are held by
 //! `docs_commands_pinned.rs`; copies between an English page and its Japanese
 //! twin by `docs_commands_twins.rs`. Neither of those discovers a new copy: they
@@ -1027,7 +1027,7 @@ fn the_block_subset_relation_this_guard_refuses_is_still_common() {
             }
         }
     }
-    // The header says "fifteen times". If this count moves, that sentence is
+    // The header says "sixteen times". If this count moves, that sentence is
     // wrong and has to move with it -- a number written beside a claim goes
     // stale on its own, and this file exists because of that class of defect.
     // It has moved both ways: up when the reader learned to follow a quoted
@@ -1035,5 +1035,5 @@ fn the_block_subset_relation_this_guard_refuses_is_still_common() {
     // the block that chained a second after a closing quote; and back down when
     // the page carrying that pair stopped shipping the blocks at all. Neither
     // time was the guard wrong -- the corpus moved under it.
-    assert_eq!(pairs.len(), 15, "{pairs:#?}");
+    assert_eq!(pairs.len(), 16, "{pairs:#?}");
 }

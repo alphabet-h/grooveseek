@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Sixteen field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -131,13 +131,15 @@ git grep -lE '(/var/)[^ ]*foo' -- .          # → 一致する ('(' で始ま�
 
 **症状**: `python - <<'PY' ... open(p,'w').write(s) ... PY` で数行だけ書き換えたつもりが、`git diff --stat` が **ファイル全体の書き換え**になる (例: 350 行のファイルが `350 +++ 350 ---`)。`cargo fmt` / `clippy` / `cargo test` は全て通るので、diffstat を見るまで気付かない。
 
-**原因**: このリポジトリは全ファイル **LF** (`core.autocrlf=false`、`.gitattributes` に `text` 指定なし)。Python の text mode は読み込みで universal newlines により `\r\n` / `\n` を `\n` に統一し、**書き込みで `os.linesep` (Windows では `\r\n`) に変換する**。したがって LF のファイルを text mode で round-trip させるだけで CRLF になる。`rustfmt` の `newline_style` は既定 `Auto` = ファイルの現行スタイルを踏襲するので、`cargo fmt` を後から走らせても**元に戻らない**。
+★ **この症状の出方は repo の正規化設定で変わる。まず罠 17 の 2 コマンド (`git check-attr` と `git config --get core.autocrlf`) を引くこと。** 上の diffstat は **`text` 属性が無かった頃のこのリポジトリ** (初出 2026-07-27) と、今も属性を持たない repo での見え方。**このリポジトリは 2026-08-13 の `a098436` (#144) 以降 `* text=auto eol=lf` を宣言している**ので、tracked な text file では clean filter が比較前に正規化し、**diff には出ない** — 代わりに `warning: in the working copy of '<path>', CRLF will be replaced by LF the next time Git touches it` が出て、作業コピーが黙って書き戻される。**反転そのものは同じように起きている**ので、対処は変わらない。
+
+**原因**: Python の text mode は読み込みで universal newlines により `\r\n` / `\n` を `\n` に統一し、**書き込みで `os.linesep` (Windows では `\r\n`) に変換する**。したがって LF のファイルを text mode で round-trip させるだけで CRLF になる。`rustfmt` の `newline_style` は既定 `Auto` = ファイルの現行スタイルを踏襲するので、`cargo fmt` を後から走らせても**元に戻らない**。
 
 **検出のしかた** (`grep -c $'\r'` は当てにならない。od の出力行を数えるのも誤り):
 ```bash
 python -c "b=open('path','rb').read(); print('CRLF=', b.count(b'\r\n'), 'LF=', b.count(b'\n')-b.count(b'\r\n'))"
 ```
-コミット前なら `git diff --stat --ignore-all-space` と素の `--stat` を比べる。数字が大きく食い違えば改行が原因。
+コミット前に `git diff --stat --ignore-all-space` と素の `--stat` を比べる手もあるが、**これが効くのは正規化していない repo だけ** — `eol=lf` の下ではどちらも空になる。**バイトを数えるほうは設定に依らない**ので、上の 1 行を先に打つ。
 
 **正しいやり方**: 3 つのいずれか。
 
@@ -153,7 +155,10 @@ open('path','wb').write(b.replace(b'\r\n', b'\n'))
 "
 ```
 
-出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)
+出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)。
+**この時点ではまだ `text` 属性が無く、diffstat に全行が出た** — `* text=auto eol=lf` はその
+2 週間後 (`a098436`、#144) に、まさにこの再発を防ぐために足された。属性が入った今は
+同じ操作が diff に出ないので、**この節の症状で気付こうとしない**。罠 17 参照
 
 ## 11. スクリプト経由でソースに書いた backslash は、数え間違えても**コンパイルが通る**
 
@@ -403,6 +408,147 @@ tree-sitter などを静的リンクする。cargo は既定でコア数ぶん�
 diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **まず並列度**。
 
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
+
+## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **どの設定でも出ない。残るかどうかが設定で変わる**
+
+罠 10 / 罠 15 と同じ「行末が揃っていない」だが、こちらは**検出器が沈黙する**。
+そして**沈黙するかどうかは repo の設定で決まる**ので、先にそれを見る。
+**罠 10 の症状の出方も同じ設定に依存する**ので、この節の 2 コマンドは 2 つの節の共通の入口。
+
+### まず実体を見る — 属性は「宣言」であって「実体」ではない
+
+```bash
+git ls-files --eol -- <file>        # i/<index の行末>  w/<working tree の行末>  attr/<宣言>
+git config --get core.autocrlf
+```
+
+**`check-attr` だけで決めない。** 理由は 2 つあり、どちらも実測で出た:
+
+- 属性が無い repo でも `autocrlf=true` なら git は変換しており、`check-attr` は
+  `unspecified` としか答えない
+- **`text=auto eol=lf` を宣言していても、その宣言より前に CRLF で commit された blob は
+  変換されない** (`git add --renormalize` を打つまで)。`check-attr` は `eol: lf` と答えるのに
+  実体は `i/crlf` のまま
+
+`ls-files --eol` は **index 側と working tree 側の実体**を別々に出すので、この 2 つを跨いで
+1 行で答える。下の表の各行は、使い捨て repo で引いた結果:
+
+<!-- via: 使い捨て repo に CRLF ファイルを commit -> 設定を変える -> LF を 1 行 append -> git add -> git ls-files --eol と staged blob の CR を数える -->
+
+| 設定 / 出自 | `ls-files --eol` | 混在が commit に入るか | 寄せ先 |
+|---|---|---|---|
+| `text=auto eol=lf`、宣言後に作られたファイル (このリポジトリ) | `i/lf w/lf` | **入らない** | LF |
+| `text=auto eol=lf`、宣言**前**に CRLF で commit された blob | `i/crlf w/crlf` | **入る** | そのファイルの行末 (CRLF)。整えるなら `git add --renormalize` |
+| 属性なし + `autocrlf=true` | `i/lf w/crlf` | **入らない** (作業コピーだけ混ざる) | **CRLF**。blob は LF なので**見ると逆を指す** |
+| 属性なし + `autocrlf=false` | `i/crlf w/crlf` | **入る** | そのファイルの追記前の行末 |
+
+★ **この表にあるのは引いた設定だけ。** `core.autocrlf=input` と `eol=crlf` は引いていないので
+書いていない。当たったら**同じ手順で自分で確かめる** — `ls-files --eol` で実体を見て、
+LF を 1 行足して `git add` し、staged blob の CR を数えれば、その設定の行が 1 分で埋まる。
+
+★ **`git show HEAD:<path>` で寄せ先を決めてよいのは `i/` と `w/` が一致している行だけ。**
+`autocrlf=true` の行では blob は LF、作業コピーは CRLF なので逆を指す。
+
+実測 (git 2.55.0.windows.5、使い捨て repo):
+
+<!-- via: git init / config core.autocrlf true / CRLF のファイルを commit / LF を 1 行 append -->
+
+```
+check-attr   : text: unspecified   eol: unspecified      <- 属性では分からない
+worktree CR=2 (CRLF)   HEAD blob CR=0 (LF)               <- blob は working tree と別物
+LF を 1 行 append -> worktree CR=2 / lines=3 = 混在
+git diff --stat -> ` note.md | 1 +`  (warning: LF will be replaced by CRLF ...)
+```
+
+<!-- via: CRLF で commit -> 後から `* text=auto eol=lf` を追加 -> LF を 1 行 append -> git add -->
+
+```
+check-attr     : text: auto   eol: lf                    <- 宣言は「LF に固定」
+ls-files --eol : i/crlf  w/crlf  attr/text=auto eol=lf   <- 実体は CRLF のまま
+LF を 1 行 append -> worktree CR=2 / staged blob CR=2 / committed blob CR=2  = 混在が commit に入った
+```
+
+**混在が diff に出ないのは、引いたどの設定でも同じ。** 設定が決めるのは**残るかどうか**で、
+正規化される行では**直すのは作業コピーの一貫性のためであって diff のためではない**。
+
+**このリポジトリは `.gitattributes` で `* text=auto eol=lf` を宣言している**ので、
+tracked な text file は repo の中も working tree も LF に固定される。この状態では:
+
+- checkout が LF で書き出すので、そもそも CRLF のファイルが手元にできない
+- 仮に作業コピーを CRLF にしても、git は比較の前に正規化するので**差分にならない**
+
+<!-- via: 作業コピーを全行 CRLF 化 -> git diff --stat -> git checkout -- <file> で復元 -->
+
+```
+$ git check-attr text eol -- CONTRIBUTING.md
+CONTRIBUTING.md: text: auto
+CONTRIBUTING.md: eol: lf
+$ python fix_crlf.py CONTRIBUTING.md      # cr_before=0 cr_after=146
+$ git diff --stat -- CONTRIBUTING.md
+warning: in the working copy of 'CONTRIBUTING.md', CRLF will be replaced by LF the next time Git touches it
+                                          # 差分ゼロ。git が正規化して比較している
+$ git checkout -- CONTRIBUTING.md         # 復元後 sha256 一致
+```
+
+→ **ここでは行末を「揃え直す」判断自体が要らない。要るなら行き先は LF**。
+CRLF へ寄せると git が次に触ったときに書き戻すだけで、`.gitattributes` の宣言とも矛盾する。
+
+### 沈黙するのは、正規化していない repo のほう
+
+`.gitattributes` が無く `core.autocrlf=false` の repo (この repo の private dev mirror が
+そうだった) では、git は**バイト列をそのまま**格納する。そこへ
+`cat new-section.md >> old.md` や LF で書いた script の出力を足すと、**1 つのファイルの中で
+CRLF と LF が混ざったまま commit される**。しかも既存行は 1 byte も変わらないので:
+
+```
+$ git diff --stat
+ old-note.md | 78 +++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+```
+
+**意図どおりの追記と見分けが付かない。** LF のファイルを丸ごと CRLF に flip する事故
+(罠 10 / Python の text mode 書き戻し) は、**正規化していない repo でなら**全行が差分になるので
+目立つ。こちらは正規化していない repo でも目立たない。
+
+追記の前に行末を数える:
+
+```bash
+echo "lines=$(wc -l < f) CR=$(tr -cd '\r' < f | wc -c)"
+# lines == CR なら CRLF、CR == 0 なら LF
+```
+
+混ざってしまったら、**そのファイル自身の追記前の行末へ寄せる** (repo の多数派ではない)。
+`autocrlf=false` + 属性なしの時だけ、追記前の姿を blob から取れる:
+
+```bash
+git show HEAD:<path> | tr -cd '\r' | wc -c    # 上の表の 3 行目でのみ有効
+```
+
+★ **repo の多数派で決めると逆を引く。** 実際の事故がその形だった — 追記先は CRLF なのに、
+その repo の Markdown はほとんど LF:
+
+<!-- via: for f in <repo>/**/*.md; do n=$(wc -l < "$f"); c=$(tr -cd '\r' < "$f" | wc -c); ... done -->
+
+```
+LF=120  CRLF=2  MIXED=0        (CRLF の 2 本のうち 1 本が追記先だった)
+```
+
+多数派 (LF) へ寄せると既存行が全部書き換わり、避けようとしていた whole-file diff を
+自分で作ることになる。
+
+追記前が CRLF だったなら、binary mode で読み書きして CRLF へ寄せる:
+
+```python
+raw = io.open(p, "rb").read()
+io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+```
+
+★ **「行末が混ざった」の対処は 1 つではない。** 先に打つのは `check-attr` **と** `core.autocrlf` の 2 つ。
+寄せ先は上の表が決める (LF / CRLF / そのファイルの追記前の行末)。**repo の多数派はどの行の答えでもない。**
+
+出典: 2026-09-04 v1.5.0 リリース。**正規化していない private repo** のノート 1 本だけが CRLF で、
+同じディレクトリの他の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
+**同じディレクトリのファイルが同じ行末とは限らない。**
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
