@@ -972,7 +972,14 @@ impl Config {
                 crate::parser::Registry::from_enabled_with_plugins(
                     &p.enabled,
                     &p.code,
-                    grammar_dir.as_deref(),
+                    // (AV-11) The knowledge base travels with the directory: what gets
+                    // opened is judged against it, not just the directory holding it.
+                    grammar_dir
+                        .as_deref()
+                        .map(|dir| crate::parser::PluginSource {
+                            dir,
+                            knowledge_base: kb_path,
+                        }),
                 )
             }
             None => Ok(crate::parser::Registry::defaults()),
@@ -999,8 +1006,8 @@ impl Config {
         else {
             return Ok(None);
         };
-        if let Some(reason) = grammar_dir_inside_kb(&dir, kb_path) {
-            return Err(refuse_grammar_dir_inside_kb(&dir, source, kb_path, reason));
+        if let Some(reason) = inside_knowledge_base(&dir, kb_path) {
+            return Err(refuse_inside_knowledge_base(&dir, source, kb_path, reason));
         }
         Ok(Some(dir))
     }
@@ -1587,9 +1594,14 @@ fn canonical_with_unresolved_tail(p: &Path) -> PathBuf {
 ///
 /// [ADR-0003]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md
 /// [ADR-0013]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md
-pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Option<&'static str> {
+/// **判定するのは置き場だけではない。** `<grammar_dir>/<library>` そのものにも当てる:
+/// 置き場が KB の外でも、その中に期待された名前のリンクがあって KB の中を指していれば、
+/// [`crate::parser::code::plugin::load`] はそれを追う。ディレクトリだけ確かめるのは、
+/// **開くファイルではなくその親を
+/// 確かめている**ことになる (codex P1 round 4 on PR #268)。
+pub(crate) fn inside_knowledge_base(path: &Path, kb_path: &Path) -> Option<&'static str> {
     // (1) 実体で見る。KB の**外**に置いたリンクが KB の中を指す形を捕まえる。
-    let target = canonical_with_unresolved_tail(grammar_dir);
+    let target = canonical_with_unresolved_tail(path);
     let target_kb = canonical_with_unresolved_tail(kb_path);
     // 等値と真の子孫を分けて答える。`starts_with` は等値を含むので 1 つにまとめられるが、
     // まとめると「KB そのもの」を潰す変異がどのテストも赤にしない (AV-09 の教訓: 1 行に
@@ -1606,7 +1618,7 @@ pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Optio
     // ならない**: 自分で用意した外のディレクトリへ向け直せばよい。
     // (codex P1 round 1 on PR #268。着手前調査で「危険度は低い」と切り捨てた形だが、
     //  攻撃者はまさに KB に書ける者なので前提が偽だった。)
-    if entry_or_ancestor_inside(grammar_dir, &target_kb) {
+    if entry_or_ancestor_inside(path, &target_kb) {
         return Some(
             "the path names an entry inside the knowledge base, and whoever can write there \
              can repoint it",
@@ -1648,13 +1660,13 @@ fn entry_or_ancestor_inside(grammar_dir: &Path, canonical_kb: &Path) -> bool {
     false
 }
 
-/// (AV-11) [`grammar_dir_inside_kb`] が該当を返したときの拒否。
+/// (AV-11) [`inside_knowledge_base`] が該当を返したときの拒否。
 ///
 /// [`Config::resolve_grammar_dir`] から切り出してあるのは **`GROOVE_GRAMMAR_DIR` を
 /// 立てずに文言をテストするため**。あの関数は env を読むので、文言のテストがそこを通ると
 /// プロセス全体で共有された変数に依存し、隣で走るテストの判断を変えてしまう
 /// (`AV-41` が挙げている形)。
-fn refuse_grammar_dir_inside_kb(
+fn refuse_inside_knowledge_base(
     dir: &Path,
     source: GrammarDirSource,
     kb_path: &Path,
@@ -1727,7 +1739,7 @@ mod tests {
 
     /// (AV-11) [`Config::build_parser_registry`] へ渡す KB。**この値は答えに影響しない** —
     /// これを使うテストが有効にする id はどれも grammar plugin を要求しないので、
-    /// [`grammar_dir_inside_kb`] の検査はそもそも走らない
+    /// [`inside_knowledge_base`] の検査はそもそも走らない
     /// ([`Config::build_parser_registry`] が [`crate::parser::needs_grammar_plugin`] で
     /// 分岐する)。検査が関わるテストは自分の KB を作って渡す。
     const KB_NOT_UNDER_TEST: &str = "kb-not-under-test";
@@ -3804,7 +3816,7 @@ lambda = 0.5
         std::fs::create_dir_all(&kb).unwrap();
 
         assert_eq!(
-            grammar_dir_inside_kb(&kb, &kb),
+            inside_knowledge_base(&kb, &kb),
             Some("it is the knowledge base directory itself"),
             "the knowledge base itself is the strongest form of the problem"
         );
@@ -3813,11 +3825,11 @@ lambda = 0.5
         // only one side canonicalizes, which is where a Windows verbatim prefix
         // (`\\?\`) on one side alone would make `starts_with` answer false.
         assert_eq!(
-            grammar_dir_inside_kb(&kb.join("plugins"), &kb),
+            inside_knowledge_base(&kb.join("plugins"), &kb),
             Some("it is inside the knowledge base")
         );
         assert_eq!(
-            grammar_dir_inside_kb(&kb.join("a").join("b"), &kb),
+            inside_knowledge_base(&kb.join("a").join("b"), &kb),
             Some("it is inside the knowledge base")
         );
 
@@ -3828,7 +3840,7 @@ lambda = 0.5
             tmp.path().join("kb-2"),
         ] {
             assert_eq!(
-                grammar_dir_inside_kb(&outside, &kb),
+                inside_knowledge_base(&outside, &kb),
                 None,
                 "{} is not inside the knowledge base",
                 outside.display()
@@ -3849,7 +3861,7 @@ lambda = 0.5
         let link = tmp.path().join("grammars");
         std::os::unix::fs::symlink(kb.join("inside"), &link).unwrap();
         assert_eq!(
-            grammar_dir_inside_kb(&link, &kb),
+            inside_knowledge_base(&link, &kb),
             Some("it is inside the knowledge base"),
             "a link sitting outside but pointing in is inside"
         );
@@ -3916,7 +3928,7 @@ lambda = 0.5
             "the link really does resolve out of the knowledge base"
         );
         assert!(
-            grammar_dir_inside_kb(&link, &kb).is_some(),
+            inside_knowledge_base(&link, &kb).is_some(),
             "an entry inside the knowledge base can be repointed by whoever writes there"
         );
     }
@@ -3962,7 +3974,7 @@ lambda = 0.5
             "the junction really does resolve out of the knowledge base"
         );
         assert!(
-            grammar_dir_inside_kb(&link, &kb).is_some(),
+            inside_knowledge_base(&link, &kb).is_some(),
             "an entry inside the knowledge base can be repointed by whoever writes there"
         );
     }
@@ -3999,12 +4011,12 @@ lambda = 0.5
         }
 
         assert!(
-            grammar_dir_inside_kb(&grammars, &alias).is_some(),
+            inside_knowledge_base(&grammars, &alias).is_some(),
             "naming the knowledge base through an alias must not change the answer"
         );
         assert_eq!(
-            grammar_dir_inside_kb(&grammars, &alias).is_some(),
-            grammar_dir_inside_kb(&grammars, &real).is_some(),
+            inside_knowledge_base(&grammars, &alias).is_some(),
+            inside_knowledge_base(&grammars, &real).is_some(),
             "the spelling of the knowledge base must not decide this"
         );
     }
@@ -4025,12 +4037,12 @@ lambda = 0.5
         std::os::unix::fs::symlink(&outside, &grammars).unwrap();
 
         assert!(
-            grammar_dir_inside_kb(&grammars, &alias).is_some(),
+            inside_knowledge_base(&grammars, &alias).is_some(),
             "naming the knowledge base through an alias must not change the answer"
         );
         assert_eq!(
-            grammar_dir_inside_kb(&grammars, &alias).is_some(),
-            grammar_dir_inside_kb(&grammars, &real).is_some(),
+            inside_knowledge_base(&grammars, &alias).is_some(),
+            inside_knowledge_base(&grammars, &real).is_some(),
             "the spelling of the knowledge base must not decide this"
         );
     }
@@ -4071,7 +4083,7 @@ lambda = 0.5
             "the nested path really does resolve out of the knowledge base"
         );
         assert!(
-            grammar_dir_inside_kb(&nested, &kb).is_some(),
+            inside_knowledge_base(&nested, &kb).is_some(),
             "the intermediate entry is inside the knowledge base and can be repointed"
         );
     }
@@ -4096,7 +4108,7 @@ lambda = 0.5
             "the nested path really does resolve out of the knowledge base"
         );
         assert!(
-            grammar_dir_inside_kb(&nested, &kb).is_some(),
+            inside_knowledge_base(&nested, &kb).is_some(),
             "the intermediate entry is inside the knowledge base and can be repointed"
         );
     }
@@ -4132,7 +4144,7 @@ lambda = 0.5
             "the resolved target is outside, so only the walk can catch this"
         );
         assert!(
-            grammar_dir_inside_kb(&via_dotdot, &kb).is_some(),
+            inside_knowledge_base(&via_dotdot, &kb).is_some(),
             "the link the path traverses is inside the knowledge base"
         );
     }
@@ -4167,7 +4179,7 @@ lambda = 0.5
 
         let via_dotdot = a.join("..").join("plugins");
         assert!(
-            grammar_dir_inside_kb(&via_dotdot, &kb).is_some(),
+            inside_knowledge_base(&via_dotdot, &kb).is_some(),
             "a path traversing an entry inside the knowledge base must be refused"
         );
     }
@@ -4188,7 +4200,7 @@ lambda = 0.5
             ),
         ] {
             let msg =
-                refuse_grammar_dir_inside_kb(dir, source, kb, "it is inside the knowledge base")
+                refuse_inside_knowledge_base(dir, source, kb, "it is inside the knowledge base")
                     .to_string();
             assert!(
                 msg.contains(expected),

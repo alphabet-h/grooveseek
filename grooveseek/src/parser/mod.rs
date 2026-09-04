@@ -39,7 +39,7 @@ pub fn needs_grammar_plugin(ids: &[String]) -> bool {
 pub use markdown::MarkdownParser;
 pub use pdf::PdfParser;
 pub use pptx::PptxParser;
-pub use registry::Registry;
+pub use registry::{PluginSource, Registry};
 pub use txt::TxtParser;
 pub use xlsx::{XlsParser, XlsxParser};
 
