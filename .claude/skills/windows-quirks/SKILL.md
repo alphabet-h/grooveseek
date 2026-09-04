@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF and producing whole-file diffs (Python text mode), Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -131,13 +131,15 @@ git grep -lE '(/var/)[^ ]*foo' -- .          # → 一致する ('(' で始ま�
 
 **症状**: `python - <<'PY' ... open(p,'w').write(s) ... PY` で数行だけ書き換えたつもりが、`git diff --stat` が **ファイル全体の書き換え**になる (例: 350 行のファイルが `350 +++ 350 ---`)。`cargo fmt` / `clippy` / `cargo test` は全て通るので、diffstat を見るまで気付かない。
 
-**原因**: このリポジトリは全ファイル **LF** (`core.autocrlf=false`、`.gitattributes` に `text` 指定なし)。Python の text mode は読み込みで universal newlines により `\r\n` / `\n` を `\n` に統一し、**書き込みで `os.linesep` (Windows では `\r\n`) に変換する**。したがって LF のファイルを text mode で round-trip させるだけで CRLF になる。`rustfmt` の `newline_style` は既定 `Auto` = ファイルの現行スタイルを踏襲するので、`cargo fmt` を後から走らせても**元に戻らない**。
+★ **この症状の出方は repo の正規化設定で変わる。まず罠 17 の `git check-attr` を引くこと。** 上の diffstat は **`text` 属性が無かった頃のこのリポジトリ** (初出 2026-07-27) と、今も属性を持たない repo での見え方。**このリポジトリは 2026-08-13 の `a098436` (#144) 以降 `* text=auto eol=lf` を宣言している**ので、tracked な text file では clean filter が比較前に正規化し、**diff には出ない** — 代わりに `warning: in the working copy of '<path>', CRLF will be replaced by LF the next time Git touches it` が出て、作業コピーが黙って書き戻される。**反転そのものは同じように起きている**ので、対処は変わらない。
+
+**原因**: Python の text mode は読み込みで universal newlines により `\r\n` / `\n` を `\n` に統一し、**書き込みで `os.linesep` (Windows では `\r\n`) に変換する**。したがって LF のファイルを text mode で round-trip させるだけで CRLF になる。`rustfmt` の `newline_style` は既定 `Auto` = ファイルの現行スタイルを踏襲するので、`cargo fmt` を後から走らせても**元に戻らない**。
 
 **検出のしかた** (`grep -c $'\r'` は当てにならない。od の出力行を数えるのも誤り):
 ```bash
 python -c "b=open('path','rb').read(); print('CRLF=', b.count(b'\r\n'), 'LF=', b.count(b'\n')-b.count(b'\r\n'))"
 ```
-コミット前なら `git diff --stat --ignore-all-space` と素の `--stat` を比べる。数字が大きく食い違えば改行が原因。
+コミット前に `git diff --stat --ignore-all-space` と素の `--stat` を比べる手もあるが、**これが効くのは正規化していない repo だけ** — `eol=lf` の下ではどちらも空になる。**バイトを数えるほうは設定に依らない**ので、上の 1 行を先に打つ。
 
 **正しいやり方**: 3 つのいずれか。
 
@@ -153,7 +155,10 @@ open('path','wb').write(b.replace(b'\r\n', b'\n'))
 "
 ```
 
-出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)
+出典: 2026-07-27 AU-10 session (`service/mod.rs` ほか 4 ファイルを反転させ、commit --amend で修復)。
+**この時点ではまだ `text` 属性が無く、diffstat に全行が出た** — `* text=auto eol=lf` はその
+2 週間後 (`a098436`、#144) に、まさにこの再発を防ぐために足された。属性が入った今は
+同じ操作が diff に出ないので、**この節の症状で気付こうとしない**。罠 17 参照
 
 ## 11. スクリプト経由でソースに書いた backslash は、数え間違えても**コンパイルが通る**
 
@@ -406,8 +411,9 @@ diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **�
 
 ## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **ただし repo が正規化していない場合だけ**
 
-罠 15 と同じ「行末が揃っていない」だが、こちらは**検出器が沈黙する**。
+罠 10 / 罠 15 と同じ「行末が揃っていない」だが、こちらは**検出器が沈黙する**。
 そして**沈黙するかどうかは repo の設定で決まる**ので、先にそれを見る。
+**罠 10 の症状の出方も同じ設定に依存する**ので、この節の `git check-attr` は 2 つの節の共通の入口。
 
 ### まず `git check-attr` を打つ
 
@@ -451,7 +457,8 @@ $ git diff --stat
 ```
 
 **意図どおりの追記と見分けが付かない。** LF のファイルを丸ごと CRLF に flip する事故
-(罠 15 / Python の text mode 書き戻し) は全行が差分になるので目立つが、**逆向きは目立たない**。
+(罠 10 / Python の text mode 書き戻し) は、**正規化していない repo でなら**全行が差分になるので
+目立つ。こちらは正規化していない repo でも目立たない。
 
 追記の前に行末を数える:
 
