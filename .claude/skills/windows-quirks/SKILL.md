@@ -467,16 +467,35 @@ echo "lines=$(wc -l < f) CR=$(tr -cd '\r' < f | wc -c)"
 # lines == CR なら CRLF、CR == 0 なら LF
 ```
 
-混ざってしまったら、**その repo の多数派へ寄せる** (正規化していない repo なので、
-git は寄せ先を決めてくれない)。既存行の byte が変わらない向きを選べば、修復は
-追加行だけの diff のままになる。CRLF へ寄せるなら binary mode で読み書きする:
+混ざってしまったら、**そのファイル自身の追記前の行末へ寄せる** (repo の多数派ではない)。
+正規化していない repo では git が寄せ先を決めてくれないので、自分で選ぶことになるが、
+**選ぶ基準は「既存行の byte が変わらない向き」**の一択:
+
+```bash
+git show HEAD:<path> | tr -cd '\r' | wc -c    # 追記前の姿を直接見る
+```
+
+★ **repo の多数派で決めると逆を引く。** 実際の事故がその形だった — 追記先は CRLF なのに、
+その repo の Markdown はほとんど LF:
+
+<!-- via: for f in <repo>/**/*.md; do n=$(wc -l < "$f"); c=$(tr -cd '\r' < "$f" | wc -c); ... done -->
+
+```
+LF=120  CRLF=2  MIXED=0        (CRLF の 2 本のうち 1 本が追記先だった)
+```
+
+多数派 (LF) へ寄せると既存行が全部書き換わり、避けようとしていた whole-file diff を
+自分で作ることになる。
+
+追記前が CRLF だったなら、binary mode で読み書きして CRLF へ寄せる:
 
 ```python
 raw = io.open(p, "rb").read()
 io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 ```
 
-★ **「行末が混ざった」の対処は 1 つではない。`git check-attr` が先で、寄せ先はその答えが決める。**
+★ **「行末が混ざった」の対処は 1 つではない。** `git check-attr` が先。**正規化している repo なら
+寄せ先は LF、していない repo ならそのファイルの追記前の行末。repo の多数派はどちらの答えでもない。**
 
 出典: 2026-09-04 v1.5.0 リリース。**正規化していない private repo** のノート 1 本だけが CRLF で、
 同じディレクトリの他の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
