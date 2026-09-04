@@ -29,7 +29,11 @@ fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 # `%LOCALAPPDATA%\groove\grammars`、Linux なら `~/.local/share/groove/grammars`、
 # macOS なら `~/Library/Application Support/groove/grammars`。どれも決められない
 # 環境では既定を持たず、plugin を必要とするコマンドがその旨を告げて止まる
-# (CWD 相対には推測で落とさない)。置き方は docs/clients.ja.md を参照。
+# (CWD 相対には推測で落とさない)。
+# **`kb_path` の内側は指せない**: grammar plugin は読み込むこと自体が実行であり、
+# ナレッジベースはセキュリティ境界ではないので、内側を指すとそこに書ける者が
+# このプロセスの実行内容を選べてしまう。plugin を必要とする実行は、その置き場から
+# 読み込む代わりに停止する (ADR-0016)。置き方は docs/clients.ja.md を参照。
 grammar_dir = "/home/you/.local/share/groove/grammars"
 
 # チャンキング時に除外する見出し部分文字列。省略すると除外なし

@@ -752,7 +752,7 @@ fn main() -> anyhow::Result<()> {
                 .effective_threshold();
             let best_practice_templates =
                 cfg.best_practice.clone().unwrap_or_default().path_templates;
-            let parser_registry = cfg.build_parser_registry()?;
+            let parser_registry = cfg.build_parser_registry(&kb_path)?;
 
             // watch config の解決
             // 優先順位: --no-watch CLI > [watch].enabled config > default(true)
@@ -858,7 +858,7 @@ fn main() -> anyhow::Result<()> {
             //
             // `.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当だった設定の
             // まま upgrade した人がこの経路に入る。
-            let registry = cfg.build_parser_registry()?;
+            let registry = cfg.build_parser_registry(&kb_path)?;
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
@@ -1527,7 +1527,7 @@ fn run_doctor(
     // gate could not tell a corrupt database from a finding (codex P2 round 1).
     let looked = (|| -> Result<grooveseek::doctor::Report> {
         let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
-        let registry = cfg.build_parser_registry()?;
+        let registry = cfg.build_parser_registry(kb_path)?;
         grooveseek::doctor::run(&db, &registry)
     })();
     let report = match looked {

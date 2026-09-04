@@ -947,7 +947,7 @@ impl Config {
 
     /// 設定から `parser::Registry` を構築する。キー省略時は
     /// `Registry::defaults()` = `["md"]` のみ (legacy 後方互換)。
-    pub fn build_parser_registry(&self) -> Result<crate::parser::Registry> {
+    pub fn build_parser_registry(&self, kb_path: &Path) -> Result<crate::parser::Registry> {
         match &self.parsers {
             // (feature-56) `[parsers.code]` reaches the parser here rather than at parse time:
             // `Parser::parse_bytes_inner` takes no configuration, so a code parser has to be
@@ -958,15 +958,28 @@ impl Config {
                 // `GROOVE_GRAMMAR_DIR` and never asks the OS where local data lives, so a
                 // machine where neither can be answered is not a machine where `groove index`
                 // stops working.
+                //
+                // (AV-11) `kb_path` is threaded through for the same reason: the check that
+                // the plugin directory is not inside the knowledge base only makes sense
+                // against the **effective** knowledge base, which the CLI can override
+                // (`main.rs`'s `require_kb_path`). Reading `self.kb_path` here would compare
+                // against a value the run is not using.
                 let grammar_dir = if crate::parser::needs_grammar_plugin(&p.enabled) {
-                    self.resolve_grammar_dir()?
+                    self.resolve_grammar_dir(kb_path)?
                 } else {
                     None
                 };
                 crate::parser::Registry::from_enabled_with_plugins(
                     &p.enabled,
                     &p.code,
-                    grammar_dir.as_deref(),
+                    // (AV-11) The knowledge base travels with the directory: what gets
+                    // opened is judged against it, not just the directory holding it.
+                    grammar_dir
+                        .as_deref()
+                        .map(|dir| crate::parser::PluginSource {
+                            dir,
+                            knowledge_base: kb_path,
+                        }),
                 )
             }
             None => Ok(crate::parser::Registry::defaults()),
@@ -976,12 +989,27 @@ impl Config {
     /// (feature-56) grammar plugin の置き場を決める。`Ok(None)` は「決められない」。
     ///
     /// **呼ぶのは plugin 言語が `enabled` にあるときだけ** ([`Self::build_parser_registry`])。
-    pub fn resolve_grammar_dir(&self) -> Result<Option<PathBuf>> {
-        grammar_dir_from(
+    ///
+    /// (AV-11) **拒否はここに置く**。この関数は `pub` で、[`Self::restrict_untrusted`] の R4 が
+    /// 「2 本目の呼び出し元が生えた瞬間に、植えられた `grammar_dir` を止めるものが
+    /// 無くなる」と既に警告している。検査を [`Self::build_parser_registry`] 側に置くと、
+    /// **その警告どおりの穴を新しい検査で作り直す**ことになる。
+    ///
+    /// 判定は解決**後**の 1 箇所で行う。env / config / OS 既定のどれで決まっても危険は
+    /// 同じなので、経路ごとに分けると同じ物理状況が複数の意味を持つ (ADR-0013 が退けた形)。
+    pub fn resolve_grammar_dir(&self, kb_path: &Path) -> Result<Option<PathBuf>> {
+        let Some((dir, source)) = grammar_dir_from(
             std::env::var_os("GROOVE_GRAMMAR_DIR"),
             self.grammar_dir.as_deref(),
             dirs::data_local_dir(),
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = inside_knowledge_base(&dir, kb_path) {
+            return Err(refuse_inside_knowledge_base(&dir, source, kb_path, reason));
+        }
+        Ok(Some(dir))
     }
 
     /// パース後の値域 / 整合性チェック。`load_from` のような構文レベルの
@@ -1378,6 +1406,32 @@ fn dir_from_env_value(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     raw.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
+/// (AV-11) 解決された `grammar_dir` が**どの入力で決まったか**。
+///
+/// 値だけを返すと、拒否した理由を伝えるときに「どれを直せばよいか」が言えない。
+/// 環境変数を設定した利用者に「config を直せ」と案内するのは、直しても直らない
+/// 指示になる ([`grammar_dir_from`] は env を先に見るため)。
+///
+/// 優先順位を知っているのは [`grammar_dir_from`] **だけ**にする。出所を別の関数で
+/// 判定し直すと、同じ問いに 2 つの答えを持つ場所ができて、いずれ食い違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrammarDirSource {
+    Environment,
+    Config,
+    OsDefault,
+}
+
+impl GrammarDirSource {
+    /// 利用者に見せる名前。**その値を実際に変えられる場所**を指す。
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Environment => "GROOVE_GRAMMAR_DIR",
+            Self::Config => "`grammar_dir` in the config file",
+            Self::OsDefault => "the OS default location for local data",
+        }
+    }
+}
+
 /// (feature-56) grammar plugin の置き場を決める規則。入力をすべて引数で受ける。
 ///
 /// 分けてある理由は [`dir_from_env_value`] と同じ — `GROOVE_GRAMMAR_DIR` は
@@ -1390,11 +1444,15 @@ fn dir_from_env_value(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// ([`crate::embedder`] の `cache_dir_from`) で、理由も同じ: 相対値は起動場所に対して
 /// 解決されるので、**利用者が管理していないディレクトリからネイティブコードを
 /// 読み込む**ことになる。plugin は検証なしに `dlopen` される。
+///
+/// (AV-11) 値と一緒に [`GrammarDirSource`] を返す。KB の内側を指していたときに
+/// **どの入力を直せばよいか**を言うためで、判定側 ([`Config::resolve_grammar_dir`]) が
+/// 優先順位を推測し直さずに済む。
 pub(crate) fn grammar_dir_from(
     env: Option<std::ffi::OsString>,
     configured: Option<&Path>,
     data_local: Option<PathBuf>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<(PathBuf, GrammarDirSource)>> {
     if let Some(raw) = env
         && !raw.is_empty()
     {
@@ -1407,14 +1465,19 @@ pub(crate) fn grammar_dir_from(
              from it without verification.",
             dir.display()
         );
-        return Ok(Some(dir));
+        return Ok(Some((dir, GrammarDirSource::Environment)));
     }
     if let Some(dir) = configured {
-        return Ok(Some(dir.to_path_buf()));
+        return Ok(Some((dir.to_path_buf(), GrammarDirSource::Config)));
     }
     // `data_local_dir()` であって `cache_dir()` ではない。plugin は利用者が意図して置く
     // 成果物で、キャッシュのように消してよいものではない。
-    Ok(data_local.map(|base| base.join("groove").join("grammars")))
+    Ok(data_local.map(|base| {
+        (
+            base.join("groove").join("grammars"),
+            GrammarDirSource::OsDefault,
+        )
+    }))
 }
 
 /// `FASTEMBED_CACHE_DIR` が**モデルの置き場所として使える値**か (BU-07)。
@@ -1477,6 +1540,167 @@ pub(crate) fn forbidden_kb_path(
     None
 }
 
+/// 存在しないパスでも比較できるよう、**存在する祖先までを実体に解決**して残りを継ぎ足す。
+///
+/// [`canonical_or_as_is`] では足りない。`grammar_dir` はまだ作られていないのが普通の状態で
+/// (plugin 未配置は正常)、そのとき片側だけ `canonicalize` が成功する。Windows の
+/// `canonicalize` は verbatim prefix (`\\?\`) を付けて返すので、**片側にだけ付くと
+/// `starts_with` が必ず false になる** — 検査が黙って素通りする形。両側を同じ規則に
+///通せば prefix の有無が揃う。
+///
+/// `main.rs` の `validate` が「canonicalize は使わない」と書いているのと矛盾しない:
+/// あちらは strip_prefix の相手が同形なので解決が要らない。ここは **symlink を実体で
+/// 判定する必要がある** (KB の外に置いた symlink が KB の中を指す形が主眼) ので、
+/// 解決したうえで prefix を揃える。
+fn canonical_with_unresolved_tail(p: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(cur) {
+            let mut out = resolved;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            // ルートまで遡っても解決できない。字面で答える (両側とも同じ扱いになる)。
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// (AV-11) 解決された `grammar_dir` が知識ベースの内側か。該当すれば理由を返す。
+///
+/// **plugin を読み込む決定を、索引される側のディレクトリに委ねない。** grammar plugin は
+/// 検証なしに `dlopen` される native code なので、置き場に書ける者はこのプロセスで任意の
+/// コードを実行できる ([ADR-0013] が「plugin の置き場は特権的な設定になる」と明記)。一方
+/// KB ディレクトリは [ADR-0003] と [`crate::links`] が繰り返し「**セキュリティ境界では
+/// ない**」と宣言している。2 つが交わる — 置き場が KB の内側にある — と、「このフォルダを
+/// index して」が「このコードを実行して」に化ける。
+///
+/// **[`forbidden_kb_path`] と違い trust では分岐しない。** あちらは「信頼できない config が
+/// 書いてよい値か」を問うが、こちらの危険は config がどこで見つかったかと無関係に成り立つ。
+/// ADR-0013 が「有効化された言語が解決できなければ実行を止める。これは設定が trusted か
+/// どうかに関わらず成り立つ」と書いたのと同じ理由 — **同じ物理的状況が「どこで見つかったか」で
+/// 2 通りの意味を持ってはならない**。
+///
+/// **存在しないパスは拒否しない。** plugin をまだ置いていない KB は正常な状態で、置き場が
+/// 無いことは R4 (iii) の文言が受ける。[`forbidden_kb_path`] が「解決できない symlink」を
+/// 拒否するのは、あちらが*索引される場所*を決めていて判定不能を素通しにできないからで、
+/// ここで同じ扱いをすると Markdown だけの利用者まで止まる。
+///
+/// [ADR-0003]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md
+/// [ADR-0013]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md
+/// **判定するのは置き場だけではない。** `<grammar_dir>/<library>` そのものにも当てる:
+/// 置き場が KB の外でも、その中に期待された名前のリンクがあって KB の中を指していれば、
+/// [`crate::parser::code::plugin::load`] はそれを追う。ディレクトリだけ確かめるのは、
+/// **開くファイルではなくその親を
+/// 確かめている**ことになる (codex P1 round 4 on PR #268)。
+pub(crate) fn inside_knowledge_base(path: &Path, kb_path: &Path) -> Option<&'static str> {
+    // (1) 実体で見る。KB の**外**に置いたリンクが KB の中を指す形を捕まえる。
+    let target = canonical_with_unresolved_tail(path);
+    let target_kb = canonical_with_unresolved_tail(kb_path);
+    // 等値と真の子孫を分けて答える。`starts_with` は等値を含むので 1 つにまとめられるが、
+    // まとめると「KB そのもの」を潰す変異がどのテストも赤にしない (AV-09 の教訓: 1 行に
+    // 見える条件の答えの数を数える)。
+    if target == target_kb {
+        return Some("it is the knowledge base directory itself");
+    }
+    if target.starts_with(&target_kb) {
+        return Some("it is inside the knowledge base");
+    }
+    // (2) エントリの位置で見る。KB の**中**に置いたリンクが外を指す形は (1) を抜ける —
+    // 解決してしまうと「そのエントリ自体は KB の中にある」という事実が消えるため。
+    // エントリを差し替えられるのは KB に書ける者なので、**指す先が外にあることは保護に
+    // ならない**: 自分で用意した外のディレクトリへ向け直せばよい。
+    // (codex P1 round 1 on PR #268。着手前調査で「危険度は低い」と切り捨てた形だが、
+    //  攻撃者はまさに KB に書ける者なので前提が偽だった。)
+    if entry_or_ancestor_inside(path, &target_kb) {
+        return Some(
+            "the path names an entry inside the knowledge base, and whoever can write there \
+             can repoint it",
+        );
+    }
+    None
+}
+
+/// `grammar_dir` 自身とその祖先を 1 段ずつ、**エントリとしての位置**で見る。
+///
+/// 「エントリとしての位置」= **親を実体に解決した先 + 自分の名前**。自分自身は解決しないので、
+/// KB の中に置かれたリンクが外を指していても「そのリンクが KB の中にある」ことが分かる。
+///
+/// **祖先まで辿る**のは、途中の component がリンクでも同じことが言えるから:
+/// `<kb>/a/b` で `a` が外を指すリンクなら、差し替えられるのは `a` の方で、`a` は KB の中にいる。
+///
+/// **字句比較では足りない。** 最初の実装は両側を `std::path::absolute` で絶対化して比べて
+/// いたが、`kb_path` が alias で `grammar_dir` が実体の綴りだと prefix を共有せず素通りする
+/// (codex P1 round 2 on PR #268)。junction で再現した: `kb-alias -> real-kb` と
+/// `real-kb/grammars -> outside` を作ると、同じ `grammar_dir` でも **KB をどう綴ったかで
+/// 答えが変わった**。だから比較は綴りではなく実体 (`canonical_kb`) に対して行う。
+fn entry_or_ancestor_inside(grammar_dir: &Path, canonical_kb: &Path) -> bool {
+    let mut cur = grammar_dir;
+    while let Some(parent) = cur.parent() {
+        // `..` (と `.`) は `file_name()` が `None` を返す。**そこで walk を止めない** —
+        // 止めると、その上にある KB 内のリンクを検査しないまま終わる。
+        // `<kb>/a -> outside/sub` と `<kb>/a/../plugins` の形で、解決先は KB の外なので
+        // (1) も答えず、`a` を見られるのは `..` を越えて登った先だけ。
+        // (codex P1 round 3 on PR #268。ここは「名前を持つ component だけが
+        //  エントリである」を暗黙に仮定していた。)
+        if let Some(name) = cur.file_name() {
+            let here = canonical_with_unresolved_tail(parent).join(name);
+            // **真の子孫だけ**。知識ベースそのもののエントリは知識ベースの*親*にあり、
+            // そこへ書けることは知識ベースへ書けることが与える権限ではない。等値まで
+            // 拒否すると、`<kb>/../grammars` (知識ベース直下に置いた config が
+            // `grammar_dir = "../grammars"` と書くと [`resolve_relative`] がこう綴る) が
+            // 拒まれる — 実体は外にあるのに、**綴り方だけで答えが変わる**。
+            // (codex P2 round 5 on PR #268。実測: 同じディレクトリを直に書けば通る。)
+            //
+            // 置き場が知識ベース**そのもの**である場合は、この関数の呼び出し元が
+            // 解決後の等値で先に答えている。
+            if here != canonical_kb && here.starts_with(canonical_kb) {
+                return true;
+            }
+        }
+        cur = parent;
+    }
+    false
+}
+
+/// (AV-11) [`inside_knowledge_base`] が該当を返したときの拒否。
+///
+/// [`Config::resolve_grammar_dir`] から切り出してあるのは **`GROOVE_GRAMMAR_DIR` を
+/// 立てずに文言をテストするため**。あの関数は env を読むので、文言のテストがそこを通ると
+/// プロセス全体で共有された変数に依存し、隣で走るテストの判断を変えてしまう
+/// (`AV-41` が挙げている形)。
+fn refuse_inside_knowledge_base(
+    dir: &Path,
+    source: GrammarDirSource,
+    kb_path: &Path,
+    reason: &str,
+) -> anyhow::Error {
+    // `concat!` で組む: 文字列リテラルの `\<改行>` 継続は「改行 + 先頭空白」を食うので、
+    // 数え間違えても黙ってコンパイルが通る。
+    anyhow::anyhow!(
+        concat!(
+            "grammar_dir must not be inside the knowledge base -- {reason}.\n",
+            "\n",
+            "  grammar_dir: {dir} (from {source})\n",
+            "  kb_path:     {kb}\n",
+            "\n",
+            "A grammar plugin is native code, loaded without verification. Anyone who\n",
+            "can write to the knowledge base could place a library there, so the\n",
+            "directory that decides which code runs must sit outside it.",
+        ),
+        reason = reason,
+        dir = dir.display(),
+        source = source.describe(),
+        kb = kb_path.display(),
+    )
+}
+
 /// `~` を home に展開する。home が取れない (CI 等) 場合は入力をそのまま返す。
 /// 内部的には `shellexpand::tilde` のラッパで、Windows でも `~` を解決する。
 pub fn expand_tilde(s: &str) -> String {
@@ -1521,6 +1745,13 @@ fn resolve_relative(base: &Path, path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// (AV-11) [`Config::build_parser_registry`] へ渡す KB。**この値は答えに影響しない** —
+    /// これを使うテストが有効にする id はどれも grammar plugin を要求しないので、
+    /// [`inside_knowledge_base`] の検査はそもそも走らない
+    /// ([`Config::build_parser_registry`] が [`crate::parser::needs_grammar_plugin`] で
+    /// 分岐する)。検査が関わるテストは自分の KB を作って渡す。
+    const KB_NOT_UNDER_TEST: &str = "kb-not-under-test";
 
     #[test]
     fn test_load_missing_file_returns_empty() {
@@ -1698,7 +1929,9 @@ mod tests {
         writeln!(file, r#"model = "bge-small-en-v1.5""#).unwrap();
         let cfg = Config::load_from(file.path()).unwrap();
         assert!(cfg.parsers.is_none());
-        let reg = cfg.build_parser_registry().unwrap();
+        let reg = cfg
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .unwrap();
         assert_eq!(reg.extensions(), vec!["md"]);
     }
 
@@ -2066,7 +2299,7 @@ lambda = 0.5
         let cfg = Config::load_from(file.path()).unwrap();
         // validate is passed, but build_parser_registry should fail on "rst"
         let err = cfg
-            .build_parser_registry()
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
             .expect_err("rst must be rejected");
         assert!(err.to_string().contains("rst"));
     }
@@ -3360,7 +3593,7 @@ lambda = 0.5
 
         let registry = d
             .config
-            .build_parser_registry()
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
             .expect("the default registry needs no plugin and no environment");
         assert!(
             registry.has_extension("md"),
@@ -3395,7 +3628,10 @@ lambda = 0.5
             "no id beyond the default is honoured, plugin or not"
         );
 
-        let registry = d.config.build_parser_registry().expect("default registry");
+        let registry = d
+            .config
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .expect("default registry");
         for ext in ["txt", "pdf", "xlsx"] {
             assert!(
                 !registry.has_extension(ext),
@@ -3454,7 +3690,10 @@ lambda = 0.5
             "an absent key stays absent; there is no safer value to write"
         );
 
-        let registry = d.config.build_parser_registry().expect("default registry");
+        let registry = d
+            .config
+            .build_parser_registry(Path::new(KB_NOT_UNDER_TEST))
+            .expect("default registry");
         assert_eq!(
             registry.extensions(),
             vec!["md"],
@@ -3514,7 +3753,8 @@ lambda = 0.5
         let configured = PathBuf::from("/from-config");
         let data_local = PathBuf::from("/data-local");
 
-        // env wins over both.
+        // env wins over both. (AV-11) The source travels with the value, so the
+        // refusal can name the input the reader has to change.
         assert_eq!(
             grammar_dir_from(
                 Some(abs.clone().into_os_string()),
@@ -3522,7 +3762,7 @@ lambda = 0.5
                 Some(data_local.clone())
             )
             .unwrap(),
-            Some(abs.clone())
+            Some((abs.clone(), GrammarDirSource::Environment))
         );
 
         // Empty is not set (the rule `dir_from_env_value` already states for
@@ -3534,17 +3774,22 @@ lambda = 0.5
                 Some(data_local.clone())
             )
             .unwrap(),
-            Some(configured.clone())
+            Some((configured.clone(), GrammarDirSource::Config))
         );
 
         // No env, no config: the OS location, under `groove/grammars`.
-        let fallback = grammar_dir_from(None, None, Some(data_local.clone()))
+        let (fallback, source) = grammar_dir_from(None, None, Some(data_local.clone()))
             .unwrap()
             .expect("a local data directory names a grammar directory");
         assert!(
             fallback.ends_with(Path::new("groove").join("grammars")),
             "unexpected fallback: {}",
             fallback.display()
+        );
+        assert_eq!(
+            source,
+            GrammarDirSource::OsDefault,
+            "the fallback must report itself as the OS default, not as the config"
         );
 
         // Nothing at all: undecidable, and never a working-directory-relative
@@ -3563,6 +3808,522 @@ lambda = 0.5
             err.to_string().contains("must be an absolute path"),
             "unexpected message: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AV-11: the plugin directory must not sit inside the knowledge base
+    // -----------------------------------------------------------------------
+
+    /// Loading a grammar plugin *is* execution, while the knowledge base is --
+    /// by documented design (ADR-0003, [`crate::links`]) -- not a security
+    /// boundary. Where the two meet, "index this folder" becomes "run this
+    /// code".
+    #[test]
+    fn a_grammar_directory_inside_the_knowledge_base_is_refused() {
+        let tmp = TempDir::new("groove-av11-inside");
+        let kb = tmp.path().join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+
+        assert_eq!(
+            inside_knowledge_base(&kb, &kb),
+            Some("it is the knowledge base directory itself"),
+            "the knowledge base itself is the strongest form of the problem"
+        );
+        // Not created yet -- placing the plugin comes later, so the rule has to
+        // answer for a path that does not exist. This is also the case where
+        // only one side canonicalizes, which is where a Windows verbatim prefix
+        // (`\\?\`) on one side alone would make `starts_with` answer false.
+        assert_eq!(
+            inside_knowledge_base(&kb.join("plugins"), &kb),
+            Some("it is inside the knowledge base")
+        );
+        assert_eq!(
+            inside_knowledge_base(&kb.join("a").join("b"), &kb),
+            Some("it is inside the knowledge base")
+        );
+
+        for outside in [
+            tmp.path().join("grammars"),
+            tmp.path().to_path_buf(),
+            // Shares the prefix as a *string*, but not as a path component.
+            tmp.path().join("kb-2"),
+        ] {
+            assert_eq!(
+                inside_knowledge_base(&outside, &kb),
+                None,
+                "{} is not inside the knowledge base",
+                outside.display()
+            );
+        }
+    }
+
+    /// The rule follows the target, not the name -- the same reason
+    /// [`forbidden_kb_path`] resolves symlinks. Unix-only because creating one
+    /// on Windows needs Developer Mode or elevation, which CI runners may lack;
+    /// the ubuntu and macOS legs cover it.
+    #[cfg(unix)]
+    #[test]
+    fn a_grammar_directory_symlink_is_judged_by_its_target() {
+        let tmp = TempDir::new("groove-av11-symlink");
+        let kb = tmp.path().join("kb");
+        std::fs::create_dir_all(kb.join("inside")).unwrap();
+        let link = tmp.path().join("grammars");
+        std::os::unix::fs::symlink(kb.join("inside"), &link).unwrap();
+        assert_eq!(
+            inside_knowledge_base(&link, &kb),
+            Some("it is inside the knowledge base"),
+            "a link sitting outside but pointing in is inside"
+        );
+    }
+
+    /// [`entry_or_ancestor_inside`] walks up, so a directory *containing* the
+    /// knowledge base is not mistaken for one inside it, and it terminates on
+    /// both absolute and relative input. Runs everywhere, including where the
+    /// link tests below cannot.
+    #[test]
+    fn the_entry_walk_climbs_out_and_terminates() {
+        let tmp = TempDir::new("groove-av11-walk");
+        let kb = tmp.path().join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        let canonical_kb = canonical_with_unresolved_tail(&kb);
+
+        assert!(
+            entry_or_ancestor_inside(&kb.join("grammars"), &canonical_kb),
+            "a name directly under the knowledge base is inside it"
+        );
+        assert!(
+            entry_or_ancestor_inside(&kb.join("a").join("b"), &canonical_kb),
+            "an ancestor inside the knowledge base is enough"
+        );
+        assert!(
+            !entry_or_ancestor_inside(tmp.path(), &canonical_kb),
+            "the directory holding the knowledge base is not inside it"
+        );
+        assert!(
+            !entry_or_ancestor_inside(&tmp.path().join("grammars"), &canonical_kb),
+            "a sibling is not inside it"
+        );
+        // A relative path has an empty parent, which is where the walk has to
+        // stop instead of looping.
+        assert!(!entry_or_ancestor_inside(
+            Path::new("relative"),
+            &canonical_kb
+        ));
+    }
+
+    /// ★ The mirror image, and the one canonicalizing alone lets through: a
+    /// link **inside** the knowledge base that points out of it. Resolving the
+    /// path erases the fact that the entry itself sits where anyone who can
+    /// write the knowledge base controls it, and such a writer can simply
+    /// repoint it at a directory of their own holding the expected library —
+    /// so the target being outside is no protection. (codex P1, round 1 on
+    /// PR #268.)
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_the_knowledge_base_is_refused_even_when_it_points_out() {
+        let tmp = TempDir::new("groove-av11-outward-link");
+        let kb = tmp.path().join("kb");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = kb.join("grammars");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        // The target is genuinely outside, so the check that resolves cannot
+        // see the problem -- the one that reads the path as written must.
+        assert_eq!(
+            canonical_with_unresolved_tail(&link),
+            canonical_with_unresolved_tail(&elsewhere),
+            "the link really does resolve out of the knowledge base"
+        );
+        assert!(
+            inside_knowledge_base(&link, &kb).is_some(),
+            "an entry inside the knowledge base can be repointed by whoever writes there"
+        );
+    }
+
+    /// The same shape on Windows, where it is **easier** to set up than on
+    /// Unix: a directory junction needs no elevation, while a symlink does.
+    /// Measured on a developer machine — `New-Item -ItemType SymbolicLink` fails
+    /// with "Administrator privilege required" while `mklink /J` succeeds, and
+    /// `canonicalize` then follows the junction out of the knowledge base, so
+    /// the resolving half alone would accept it.
+    ///
+    /// No std API creates a junction, hence the `cmd` call. It is asserted
+    /// rather than skipped: a silent skip would hide the fact that this
+    /// platform's cheapest version of the attack is no longer covered.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_inside_the_knowledge_base_is_refused_even_when_it_points_out() {
+        let tmp = TempDir::new("groove-av11-junction");
+        let kb = tmp.path().join("kb");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = kb.join("grammars");
+
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &link.display().to_string(),
+                &elsewhere.display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(
+            made.success(),
+            "mklink /J needs no elevation and must succeed"
+        );
+
+        assert_eq!(
+            canonical_with_unresolved_tail(&link),
+            canonical_with_unresolved_tail(&elsewhere),
+            "the junction really does resolve out of the knowledge base"
+        );
+        assert!(
+            inside_knowledge_base(&link, &kb).is_some(),
+            "an entry inside the knowledge base can be repointed by whoever writes there"
+        );
+    }
+
+    /// ★ The knowledge base can be named through an alias while `grammar_dir`
+    /// names it canonically. Comparing the two paths *as spelled* shares no
+    /// prefix, so the check answered `None` even though the entry sits
+    /// physically inside — the same `grammar_dir` gave a different answer
+    /// depending only on how the knowledge base was spelled. Reproduced with
+    /// junctions before fixing it. (codex P1, round 2 on PR #268.)
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_for_the_knowledge_base_does_not_hide_an_entry_inside_it() {
+        let tmp = TempDir::new("groove-av11-alias");
+        let real = tmp.path().join("real-kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let alias = tmp.path().join("kb-alias");
+        let grammars = real.join("grammars");
+
+        for (link, target) in [(&alias, &real), (&grammars, &outside)] {
+            let made = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &link.display().to_string(),
+                    &target.display().to_string(),
+                ])
+                .status()
+                .expect("mklink must be runnable");
+            assert!(made.success(), "mklink /J needs no elevation");
+        }
+
+        assert!(
+            inside_knowledge_base(&grammars, &alias).is_some(),
+            "naming the knowledge base through an alias must not change the answer"
+        );
+        assert_eq!(
+            inside_knowledge_base(&grammars, &alias).is_some(),
+            inside_knowledge_base(&grammars, &real).is_some(),
+            "the spelling of the knowledge base must not decide this"
+        );
+    }
+
+    /// The same shape on Unix, where the alias and the outward link are both
+    /// symlinks. See the Windows twin for what it protects against.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_for_the_knowledge_base_does_not_hide_an_entry_inside_it() {
+        let tmp = TempDir::new("groove-av11-alias");
+        let real = tmp.path().join("real-kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let alias = tmp.path().join("kb-alias");
+        let grammars = real.join("grammars");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &grammars).unwrap();
+
+        assert!(
+            inside_knowledge_base(&grammars, &alias).is_some(),
+            "naming the knowledge base through an alias must not change the answer"
+        );
+        assert_eq!(
+            inside_knowledge_base(&grammars, &alias).is_some(),
+            inside_knowledge_base(&grammars, &real).is_some(),
+            "the spelling of the knowledge base must not decide this"
+        );
+    }
+
+    /// ★ Climbing the chain is what covers an **intermediate** component being
+    /// the link. With `<kb>/a` pointing outward, `<kb>/a/b` resolves entirely
+    /// outside *and so does its immediate parent* — only the step above sees
+    /// that `a`, the entry that can be repointed, is inside the knowledge base.
+    ///
+    /// Added because a mutation that stops the walk after one step failed no
+    /// other test: the climb was load-bearing and unpinned.
+    #[cfg(windows)]
+    #[test]
+    fn an_intermediate_link_inside_the_knowledge_base_is_refused() {
+        let tmp = TempDir::new("groove-av11-mid");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("b")).unwrap();
+
+        let a = kb.join("a");
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &a.display().to_string(),
+                &outside.display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(made.success(), "mklink /J needs no elevation");
+
+        let nested = a.join("b");
+        assert_eq!(
+            canonical_with_unresolved_tail(&nested),
+            canonical_with_unresolved_tail(&outside.join("b")),
+            "the nested path really does resolve out of the knowledge base"
+        );
+        assert!(
+            inside_knowledge_base(&nested, &kb).is_some(),
+            "the intermediate entry is inside the knowledge base and can be repointed"
+        );
+    }
+
+    /// The same shape on Unix. See the Windows twin for why the climb matters.
+    #[cfg(unix)]
+    #[test]
+    fn an_intermediate_link_inside_the_knowledge_base_is_refused() {
+        let tmp = TempDir::new("groove-av11-mid");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("b")).unwrap();
+
+        let a = kb.join("a");
+        std::os::unix::fs::symlink(&outside, &a).unwrap();
+
+        let nested = a.join("b");
+        assert_eq!(
+            canonical_with_unresolved_tail(&nested),
+            canonical_with_unresolved_tail(&outside.join("b")),
+            "the nested path really does resolve out of the knowledge base"
+        );
+        assert!(
+            inside_knowledge_base(&nested, &kb).is_some(),
+            "the intermediate entry is inside the knowledge base and can be repointed"
+        );
+    }
+
+    /// ★ A `..` in the path used to end the walk: `file_name()` answers `None`
+    /// for a component that is `..`, and the loop stopped there, leaving the
+    /// in-knowledge-base link above it unexamined. With `<kb>/a` pointing out
+    /// and `grammar_dir = <kb>/a/../plugins`, the resolved target is outside,
+    /// so the first half stays silent too. (codex P1, round 3 on PR #268.)
+    ///
+    /// This is the platform where the fix earns its keep: POSIX applies `..`
+    /// after following the link, so the path leaves the knowledge base.
+    /// Windows resolves `..` lexically and lands back inside, which is why its
+    /// twin asserts only the verdict. The first assertion below states that
+    /// difference as a precondition, so the test cannot quietly start passing
+    /// for the Windows reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_dotdot_does_not_end_the_walk_before_an_inside_link() {
+        let tmp = TempDir::new("groove-av11-dotdot");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+
+        let a = kb.join("a");
+        std::os::unix::fs::symlink(outside.join("sub"), &a).unwrap();
+        let via_dotdot = a.join("..").join("plugins");
+
+        assert!(
+            !canonical_with_unresolved_tail(&via_dotdot)
+                .starts_with(canonical_with_unresolved_tail(&kb)),
+            "the resolved target is outside, so only the walk can catch this"
+        );
+        assert!(
+            inside_knowledge_base(&via_dotdot, &kb).is_some(),
+            "the link the path traverses is inside the knowledge base"
+        );
+    }
+
+    /// The same path shape on Windows, where `..` is resolved **lexically**
+    /// even across a junction. Measured on a developer machine: `<kb>/a`
+    /// canonicalizes to the outside target, while `<kb>/a/../plugins`
+    /// canonicalizes back to `<kb>/plugins`. The resolved half therefore
+    /// answers here, and the walk is what covers the shape on Unix — so this
+    /// asserts the verdict without pinning which half produced it.
+    #[cfg(windows)]
+    #[test]
+    fn a_dotdot_does_not_end_the_walk_before_an_inside_link() {
+        let tmp = TempDir::new("groove-av11-dotdot");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+
+        let a = kb.join("a");
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &a.display().to_string(),
+                &outside.join("sub").display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(made.success(), "mklink /J needs no elevation");
+
+        let via_dotdot = a.join("..").join("plugins");
+        assert!(
+            inside_knowledge_base(&via_dotdot, &kb).is_some(),
+            "a path traversing an entry inside the knowledge base must be refused"
+        );
+    }
+
+    /// ★ A sibling directory spelled *through* the knowledge base must still be
+    /// allowed. A config sitting at the knowledge-base root writing
+    /// `grammar_dir = "../grammars"` is kept by [`resolve_relative`] as
+    /// `<kb>/../grammars`, whose target is outside — but the walk passes through
+    /// the `<kb>` component itself on the way up. Rejecting on equality there
+    /// made the answer depend on **how the directory was spelled** rather than
+    /// on where it is. (codex P2, round 5 on PR #268.)
+    ///
+    /// Writing inside the knowledge base does not grant the ability to repoint
+    /// the knowledge base's own entry, which lives in its parent.
+    #[test]
+    fn a_sibling_directory_spelled_through_the_knowledge_base_is_allowed() {
+        let tmp = TempDir::new("groove-av11-sibling");
+        let kb = tmp.path().join("kb");
+        let sibling = tmp.path().join("grammars");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let spelled = kb.join("..").join("grammars");
+        assert_eq!(
+            inside_knowledge_base(&spelled, &kb),
+            None,
+            "the target is outside; the spelling must not decide this"
+        );
+        assert_eq!(
+            inside_knowledge_base(&spelled, &kb),
+            inside_knowledge_base(&sibling, &kb),
+            "both spellings name the same directory and must agree"
+        );
+
+        // The knowledge base itself is still refused -- by the resolved half,
+        // which is why the walk can afford to look only at true descendants.
+        assert_eq!(
+            inside_knowledge_base(&kb, &kb),
+            Some("it is the knowledge base directory itself")
+        );
+    }
+
+    /// The refusal has to name the input the reader can actually change:
+    /// telling someone who set the environment variable to edit the config file
+    /// is advice that cannot work, because the variable wins either way.
+    #[test]
+    fn the_refusal_names_the_input_that_has_to_change() {
+        let kb = Path::new("/kb");
+        let dir = Path::new("/kb/plugins");
+        for (source, expected) in [
+            (GrammarDirSource::Environment, "GROOVE_GRAMMAR_DIR"),
+            (GrammarDirSource::Config, "`grammar_dir` in the config file"),
+            (
+                GrammarDirSource::OsDefault,
+                "the OS default location for local data",
+            ),
+        ] {
+            let msg =
+                refuse_inside_knowledge_base(dir, source, kb, "it is inside the knowledge base")
+                    .to_string();
+            assert!(
+                msg.contains(expected),
+                "message must name {expected}: {msg}"
+            );
+            assert!(
+                msg.contains("must not be inside the knowledge base"),
+                "message must state the rule: {msg}"
+            );
+            assert!(
+                msg.contains("native code"),
+                "message must say why the rule exists: {msg}"
+            );
+        }
+    }
+
+    /// ★ The check is only meaningful against the knowledge base the run is
+    /// actually using. `--kb-path` overrides the config (`require_kb_path`, in
+    /// the binary), so reading `self.kb_path` here would compare against a
+    /// directory nobody indexes. Threading it through as an argument is exactly
+    /// what makes the two answers below differ.
+    #[test]
+    fn the_plugin_directory_is_judged_against_the_knowledge_base_the_run_uses() {
+        let tmp = TempDir::new("groove-av11-effective-kb");
+        let configured_kb = tmp.path().join("kb-from-config");
+        let actual_kb = tmp.path().join("kb-from-cli");
+        let grammars = actual_kb.join("grammars");
+        std::fs::create_dir_all(&configured_kb).unwrap();
+        std::fs::create_dir_all(&grammars).unwrap();
+
+        let file = tmp.path().join("groove.toml");
+        std::fs::write(
+            &file,
+            format!("kb_path = {configured_kb:?}\ngrammar_dir = {grammars:?}\n"),
+        )
+        .unwrap();
+        let cfg = Config::load_from(&file).unwrap();
+
+        assert!(
+            cfg.resolve_grammar_dir(&configured_kb).is_ok(),
+            "the directory is outside the knowledge base the config names"
+        );
+
+        let err = cfg
+            .resolve_grammar_dir(&actual_kb)
+            .expect_err("the effective knowledge base contains the plugin directory");
+        assert!(
+            err.to_string()
+                .contains("must not be inside the knowledge base"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// A Markdown-only knowledge base opens no plugin, so where plugins would
+    /// live is not its business -- the laziness feature-56 built in
+    /// ([`crate::parser::needs_grammar_plugin`]) stays intact. Without this the
+    /// new check would start failing runs that load no native code at all.
+    #[test]
+    fn a_markdown_only_knowledge_base_is_not_judged_on_the_plugin_directory() {
+        let tmp = TempDir::new("groove-av11-md-only");
+        let kb = tmp.path().join("kb");
+        let grammars = kb.join("grammars");
+        std::fs::create_dir_all(&grammars).unwrap();
+
+        let file = tmp.path().join("groove.toml");
+        std::fs::write(
+            &file,
+            format!("grammar_dir = {grammars:?}\n[parsers]\nenabled = [\"md\"]\n"),
+        )
+        .unwrap();
+        let cfg = Config::load_from(&file).unwrap();
+
+        let registry = cfg
+            .build_parser_registry(&kb)
+            .expect("a Markdown-only registry never asks where plugins live");
+        assert_eq!(registry.extensions(), vec!["md"]);
     }
 
     /// An empty directory variable makes every path built from it relative,

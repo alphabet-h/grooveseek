@@ -62,6 +62,11 @@
 # ~/.local/share/groove/grammars on Linux, ~/Library/Application Support/groove/
 # grammars on macOS. GROOVE_GRAMMAR_DIR overrides it and must be absolute.
 #
+# It must NOT be inside kb_path. Loading a grammar plugin is executing it, and
+# the knowledge base is not a security boundary, so a directory inside it would
+# let anyone who can write there choose what this process runs; a run that needs
+# a plugin stops instead of loading from there (ADR-0016).
+#
 # Write the path with FORWARD SLASHES even on Windows: a backslash starts an
 # escape sequence in a TOML basic string, so "C:\Users\..." fails to parse.
 # See "Placing a grammar plugin" in docs/clients.md.

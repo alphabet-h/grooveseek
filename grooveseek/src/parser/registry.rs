@@ -111,6 +111,35 @@ pub(crate) fn plugin_rejected_message(
     )
 }
 
+/// (AV-11) The library about to be opened resolves into the knowledge base.
+///
+/// Separate from the `grammar_dir` refusal in [`crate::config`], because the reader here has a
+/// different thing to fix: the directory may be perfectly placed, and it is the file inside
+/// it that leads back in.
+pub(crate) fn plugin_inside_kb_message(
+    id: &str,
+    path: &Path,
+    kb_path: &Path,
+    reason: &str,
+) -> String {
+    format!(
+        concat!(
+            "refusing to load the {id} grammar plugin -- {reason}.\n",
+            "\n",
+            "  library: {path}\n",
+            "  kb_path: {kb}\n",
+            "\n",
+            "The directory is not the only thing that decides which code runs: a link under\n",
+            "the expected name is followed when the library is opened. Anyone who can write\n",
+            "to the knowledge base could replace what it points at.",
+        ),
+        id = id,
+        reason = reason,
+        path = path.display(),
+        kb = kb_path.display(),
+    )
+}
+
 /// (iii) The id is a plugin's and there is no directory to name.
 ///
 /// Distinct from (i) because (i)'s wording is built around a path, and there is none: on a
@@ -144,6 +173,27 @@ fn rust_parser(_code: &CodeParsersConfig) -> Result<Box<dyn Parser>> {
     ))
 }
 
+/// (AV-11) Where grammar plugins are read from, together with the knowledge base being
+/// indexed.
+///
+/// The two travel as one value so that **neither can be supplied without the other**. Checking
+/// the directory alone is not enough: a directory outside the knowledge base can hold a link
+/// under the expected library name that points back into it, and opening the library follows
+/// that link. Judging what gets opened therefore needs the knowledge base at hand, and a
+/// caller that had to pass it separately could forget to.
+///
+/// Loading a plugin is executing it, while the knowledge base is — by documented design
+/// ([ADR-0003]) — not a security boundary, so anything that resolves inside it is refused.
+///
+/// [ADR-0003]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0003-kb-mcpignore-bounds-indexing-not-access.md
+#[derive(Debug, Clone, Copy)]
+pub struct PluginSource<'a> {
+    /// The directory to look for the library in.
+    pub dir: &'a Path,
+    /// The knowledge base this run indexes. Treated as writable by someone else.
+    pub knowledge_base: &'a Path,
+}
+
 /// Resolve one plugin-backed id into a parser, or say why it could not be.
 ///
 /// `grammar_dir` is `None` when no directory could be worked out at all, which is a different
@@ -156,16 +206,29 @@ fn plugin_parser(
     id: &'static str,
     stem: &str,
     code: &CodeParsersConfig,
-    grammar_dir: Option<&Path>,
+    plugins: Option<PluginSource<'_>>,
 ) -> Result<Box<dyn Parser>> {
-    let Some(dir) = grammar_dir else {
+    let Some(source) = plugins else {
         anyhow::bail!(plugin_dir_undecidable_message(id));
     };
+    let dir = source.dir;
     let file_name = super::code::plugin::plugin_file_name(stem);
     let archive = super::code::plugin::plugin_archive_name(stem);
     let path = dir.join(&file_name);
     if !path.exists() {
         anyhow::bail!(plugin_missing_message(id, dir, &file_name, &archive));
+    }
+    // (AV-11) The file about to be opened, not just the directory holding it. A directory
+    // outside the knowledge base can still contain a link under the expected name that points
+    // into it, and `load` follows the link — so checking only the parent checks something
+    // other than what gets opened. (codex P1 round 4 on PR #268.)
+    if let Some(reason) = crate::config::inside_knowledge_base(&path, source.knowledge_base) {
+        anyhow::bail!(plugin_inside_kb_message(
+            id,
+            &path,
+            source.knowledge_base,
+            reason
+        ));
     }
     // The id is handed to the loader as the extension the library is expected to declare. It
     // is not a hint: a library that declares something else is refused, because groove found
@@ -211,7 +274,7 @@ impl Registry {
 
     /// Same again, with the directory grammar plugins are loaded from.
     ///
-    /// `grammar_dir` is `None` for "no directory could be worked out", which is the state
+    /// `plugins` is `None` for "no directory could be worked out", which is the state
     /// [`plugin_dir_undecidable_message`] describes — not "there is no directory to look in".
     /// It is consulted lazily: an `enabled` list this build resolves on its own never reaches
     /// the filesystem, whatever command is running.
@@ -222,7 +285,7 @@ impl Registry {
     pub fn from_enabled_with_plugins(
         ids: &[String],
         code: &CodeParsersConfig,
-        grammar_dir: Option<&Path>,
+        plugins: Option<PluginSource<'_>>,
     ) -> Result<Self> {
         if ids.is_empty() {
             anyhow::bail!("[parsers].enabled must contain at least one id (got empty list)");
@@ -266,7 +329,7 @@ impl Registry {
                 other => match super::code::plugin::plugin_entry(other) {
                     Some((canonical, stem)) => {
                         code_max_chunk_chars = Some(code.max_chunk_chars);
-                        plugin_parser(canonical, stem, code, grammar_dir)?
+                        plugin_parser(canonical, stem, code, plugins)?
                     }
                     None => anyhow::bail!(unresolved_id_message(
                         other,
@@ -373,6 +436,32 @@ impl std::fmt::Debug for Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A temporary tree that removes itself.
+    ///
+    /// The name comes from [`crate::test_support::unique_temp_path`], which is the shared rule
+    /// (pid + nanos + an atomic counter); the guard is local because this module has only the
+    /// AV-11 tests below that need to create one. `remove_dir_all` does not follow the links
+    /// those tests plant, so the tree it deletes is the one it made.
+    struct TempTree(std::path::PathBuf);
+
+    impl TempTree {
+        fn new(prefix: &str) -> Self {
+            let path = crate::test_support::unique_temp_path(prefix);
+            std::fs::create_dir_all(&path).expect("temp tree");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     // ---------------------------------------------------------------------
     // (feature-56 PR-3a) The four families of "this id did not resolve".
@@ -570,9 +659,16 @@ mod tests {
             "unexpected message: {err}"
         );
 
-        // A directory that exists but holds no plugin: (i).
+        // A directory that exists but holds no plugin: (i). The knowledge base
+        // named here is somewhere else entirely, so the AV-11 check has nothing
+        // to say and (i) is what answers.
         let dir = std::env::temp_dir().join("groove-registry-no-such-grammar-dir");
-        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(&dir))
+        let kb = std::env::temp_dir().join("groove-registry-kb-elsewhere");
+        let source = PluginSource {
+            dir: &dir,
+            knowledge_base: &kb,
+        };
+        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(source))
             .expect_err("a plugin id with no file must fail");
         let msg = err.to_string();
         assert!(msg.contains("is not in"), "unexpected message: {msg}");
@@ -582,9 +678,93 @@ mod tests {
         );
 
         // An id nothing claims is still a typo, wherever the directory is.
-        let err = Registry::from_enabled_with_plugins(&["rst".into()], &code, Some(&dir))
+        let err = Registry::from_enabled_with_plugins(&["rst".into()], &code, Some(source))
             .expect_err("an unknown id must still fail");
         assert!(err.to_string().contains("unknown id"), "{err}");
+    }
+
+    /// ★ (AV-11) The directory being outside the knowledge base is not enough. A link under
+    /// the expected library name, sitting in that directory and pointing back into the
+    /// knowledge base, is followed when the library is opened — so whoever can write the
+    /// knowledge base would choose the code that runs. The refusal has to name the file.
+    /// (codex P1, round 4 on PR #268.)
+    ///
+    /// A junction is used rather than a symlink because it needs no elevation on Windows;
+    /// the Unix twin below uses a symlink. Neither creates a real library: the check has to
+    /// answer before anything is opened, which is the point.
+    #[cfg(windows)]
+    #[test]
+    fn a_library_that_leads_back_into_the_knowledge_base_is_refused() {
+        let tmp = TempTree::new("groove-registry-av11-lib");
+        let kb = tmp.path().join("kb");
+        let grammars = tmp.path().join("grammars");
+        std::fs::create_dir_all(kb.join("evil")).unwrap();
+        std::fs::create_dir_all(&grammars).unwrap();
+
+        let planted = grammars.join(super::super::code::plugin::plugin_file_name(
+            "groove_grammar_python",
+        ));
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &planted.display().to_string(),
+                &kb.join("evil").display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(made.success(), "mklink /J needs no elevation");
+
+        let code = CodeParsersConfig::default();
+        let source = PluginSource {
+            dir: &grammars,
+            knowledge_base: &kb,
+        };
+        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(source))
+            .expect_err("a library resolving into the knowledge base must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to load"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("knowledge base"),
+            "the refusal must say where the library leads: {msg}"
+        );
+    }
+
+    /// The same shape on Unix. See the Windows twin for what it protects against.
+    #[cfg(unix)]
+    #[test]
+    fn a_library_that_leads_back_into_the_knowledge_base_is_refused() {
+        let tmp = TempTree::new("groove-registry-av11-lib");
+        let kb = tmp.path().join("kb");
+        let grammars = tmp.path().join("grammars");
+        std::fs::create_dir_all(kb.join("evil")).unwrap();
+        std::fs::create_dir_all(&grammars).unwrap();
+
+        let planted = grammars.join(super::super::code::plugin::plugin_file_name(
+            "groove_grammar_python",
+        ));
+        std::os::unix::fs::symlink(kb.join("evil"), &planted).unwrap();
+
+        let code = CodeParsersConfig::default();
+        let source = PluginSource {
+            dir: &grammars,
+            knowledge_base: &kb,
+        };
+        let err = Registry::from_enabled_with_plugins(&["py".into()], &code, Some(source))
+            .expect_err("a library resolving into the knowledge base must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to load"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.contains("knowledge base"),
+            "the refusal must say where the library leads: {msg}"
+        );
     }
 
     /// The directory is consulted only when an enabled id needs it.

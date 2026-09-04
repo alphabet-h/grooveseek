@@ -14,6 +14,21 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **A grammar plugin can no longer be read from inside the knowledge base.**
+  Loading a plugin is executing it, while the knowledge base is — by documented
+  design — not a security boundary, so a `grammar_dir` pointing inside it let
+  anyone who could write there decide what this process runs. When the resolved
+  directory is inside `kb_path`, or is `kb_path` itself, a run that needs a
+  plugin now stops and names the input to change (`GROOVE_GRAMMAR_DIR`, the
+  config file, or the OS default) rather than loading the library. The rule
+  applies whatever the trust of the config, for the reason a relative
+  `GROOVE_GRAMMAR_DIR` was already refused outright. Symlinks are judged by
+  their target, a directory that does not exist yet is not refused, and a
+  knowledge base whose `[parsers].enabled` needs no plugin is unaffected. See
+  [ADR-0016](docs/decisions/0016-keep-the-plugin-directory-outside-the-knowledge-base.md).
+
 ## [1.5.0] - 2026-09-04
 
 ### Added

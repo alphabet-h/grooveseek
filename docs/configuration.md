@@ -30,6 +30,10 @@ fastembed_cache_dir = "/home/you/.cache/huggingface/hub"
 # on Linux, and `~/Library/Application Support/groove/grammars` on macOS. If none
 # of those can be determined the key has no default, and a command that needs a
 # plugin says so rather than guessing a working-directory-relative path.
+# It must not be inside `kb_path`: loading a grammar plugin is executing it, and
+# the knowledge base is not a security boundary, so a directory inside it would
+# let anyone who can write there choose what this process runs. A run that needs
+# a plugin stops rather than loading from such a directory (ADR-0016).
 # See docs/clients.md for how to put a plugin in place.
 grammar_dir = "/home/you/.local/share/groove/grammars"
 
