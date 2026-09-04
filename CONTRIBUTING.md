@@ -94,6 +94,7 @@ The order of the two `cargo test` lines matters on a cold model cache, which is 
 - `crates/groove-svc/` — Windows hidden-console launcher started by the scheduled task (v0.9.1+)
 - `crates/groove-grammar-abi/` — the contract a tree-sitter grammar is handed across, held to by the compiled-in grammar and by every plugin (v1.2.0+)
 - `crates/groove-grammar-python/` — the Python grammar as a loadable `cdylib`, shipped as its own release asset (v1.3.0+)
+- `crates/groove-grammar-php/` — the PHP grammar, the same way (v1.5.0+)
 - `grooveseek/tests/` — integration tests; `grooveseek/benches/` — criterion benchmarks
 
 See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for a detailed walkthrough.

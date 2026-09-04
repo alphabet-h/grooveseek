@@ -46,7 +46,10 @@ use super::LoadedGrammar;
 /// the "put the file here" diagnostic to be reachable at all, and a user who follows that
 /// diagnostic to a release that has no such asset yet is told so by the release page rather
 /// than by a typo message.
-const PLUGIN_GRAMMARS: &[(&str, &str)] = &[("py", "groove_grammar_python")];
+const PLUGIN_GRAMMARS: &[(&str, &str)] = &[
+    ("py", "groove_grammar_python"),
+    ("php", "groove_grammar_php"),
+];
 
 /// The most a plugin's tags query may declare itself to be.
 ///
@@ -515,6 +518,10 @@ mod tests {
     #[test]
     fn only_ids_in_the_table_resolve_to_a_plugin() {
         assert_eq!(plugin_entry("py"), Some(("py", "groove_grammar_python")));
+        // Spelled out rather than left to the two tests below that iterate the table: those
+        // check that each entry is *shaped* right, which a plausible-looking typo like
+        // `groove_grammar_pyth` would also satisfy. Only the pair written here catches it.
+        assert_eq!(plugin_entry("php"), Some(("php", "groove_grammar_php")));
         assert_eq!(plugin_entry("rs"), None, "rs is compiled in, not a plugin");
         assert_eq!(plugin_entry("rst"), None);
     }

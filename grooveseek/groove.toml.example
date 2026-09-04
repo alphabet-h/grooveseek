@@ -121,7 +121,7 @@ threshold = 0.3
 #   - explicit list       … exactly those extensions
 # Ids the default build supports on its own: "md", "txt", "pdf" (v0.10.0+),
 # "docx", "xlsx", "pptx" (v0.11.0+), "rs" (v1.2.0+). A language whose grammar is
-# not compiled in -- "py" (v1.3.0+) -- also needs its plugin placed in
+# not compiled in -- "py" (v1.3.0+), "php" (v1.5.0+) -- also needs its plugin placed in
 # `grammar_dir` first, and the run stops with instructions if it is not there.
 # Unknown ids such as "rst" or "adoc" are rejected at startup.
 # "xls" was withdrawn in v0.14.0 and is rejected with an explanation: BIFF
