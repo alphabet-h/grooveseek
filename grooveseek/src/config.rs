@@ -1630,10 +1630,18 @@ pub(crate) fn grammar_dir_inside_kb(grammar_dir: &Path, kb_path: &Path) -> Optio
 /// 答えが変わった**。だから比較は綴りではなく実体 (`canonical_kb`) に対して行う。
 fn entry_or_ancestor_inside(grammar_dir: &Path, canonical_kb: &Path) -> bool {
     let mut cur = grammar_dir;
-    while let (Some(parent), Some(name)) = (cur.parent(), cur.file_name()) {
-        let here = canonical_with_unresolved_tail(parent).join(name);
-        if here == canonical_kb || here.starts_with(canonical_kb) {
-            return true;
+    while let Some(parent) = cur.parent() {
+        // `..` (と `.`) は `file_name()` が `None` を返す。**そこで walk を止めない** —
+        // 止めると、その上にある KB 内のリンクを検査しないまま終わる。
+        // `<kb>/a -> outside/sub` と `<kb>/a/../plugins` の形で、解決先は KB の外なので
+        // (1) も答えず、`a` を見られるのは `..` を越えて登った先だけ。
+        // (codex P1 round 3 on PR #268。ここは「名前を持つ component だけが
+        //  エントリである」を暗黙に仮定していた。)
+        if let Some(name) = cur.file_name() {
+            let here = canonical_with_unresolved_tail(parent).join(name);
+            if here == canonical_kb || here.starts_with(canonical_kb) {
+                return true;
+            }
         }
         cur = parent;
     }
@@ -4024,6 +4032,143 @@ lambda = 0.5
             grammar_dir_inside_kb(&grammars, &alias).is_some(),
             grammar_dir_inside_kb(&grammars, &real).is_some(),
             "the spelling of the knowledge base must not decide this"
+        );
+    }
+
+    /// ★ Climbing the chain is what covers an **intermediate** component being
+    /// the link. With `<kb>/a` pointing outward, `<kb>/a/b` resolves entirely
+    /// outside *and so does its immediate parent* — only the step above sees
+    /// that `a`, the entry that can be repointed, is inside the knowledge base.
+    ///
+    /// Added because a mutation that stops the walk after one step failed no
+    /// other test: the climb was load-bearing and unpinned.
+    #[cfg(windows)]
+    #[test]
+    fn an_intermediate_link_inside_the_knowledge_base_is_refused() {
+        let tmp = TempDir::new("groove-av11-mid");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("b")).unwrap();
+
+        let a = kb.join("a");
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &a.display().to_string(),
+                &outside.display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(made.success(), "mklink /J needs no elevation");
+
+        let nested = a.join("b");
+        assert_eq!(
+            canonical_with_unresolved_tail(&nested),
+            canonical_with_unresolved_tail(&outside.join("b")),
+            "the nested path really does resolve out of the knowledge base"
+        );
+        assert!(
+            grammar_dir_inside_kb(&nested, &kb).is_some(),
+            "the intermediate entry is inside the knowledge base and can be repointed"
+        );
+    }
+
+    /// The same shape on Unix. See the Windows twin for why the climb matters.
+    #[cfg(unix)]
+    #[test]
+    fn an_intermediate_link_inside_the_knowledge_base_is_refused() {
+        let tmp = TempDir::new("groove-av11-mid");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("b")).unwrap();
+
+        let a = kb.join("a");
+        std::os::unix::fs::symlink(&outside, &a).unwrap();
+
+        let nested = a.join("b");
+        assert_eq!(
+            canonical_with_unresolved_tail(&nested),
+            canonical_with_unresolved_tail(&outside.join("b")),
+            "the nested path really does resolve out of the knowledge base"
+        );
+        assert!(
+            grammar_dir_inside_kb(&nested, &kb).is_some(),
+            "the intermediate entry is inside the knowledge base and can be repointed"
+        );
+    }
+
+    /// ★ A `..` in the path used to end the walk: `file_name()` answers `None`
+    /// for a component that is `..`, and the loop stopped there, leaving the
+    /// in-knowledge-base link above it unexamined. With `<kb>/a` pointing out
+    /// and `grammar_dir = <kb>/a/../plugins`, the resolved target is outside,
+    /// so the first half stays silent too. (codex P1, round 3 on PR #268.)
+    ///
+    /// This is the platform where the fix earns its keep: POSIX applies `..`
+    /// after following the link, so the path leaves the knowledge base.
+    /// Windows resolves `..` lexically and lands back inside, which is why its
+    /// twin asserts only the verdict. The first assertion below states that
+    /// difference as a precondition, so the test cannot quietly start passing
+    /// for the Windows reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_dotdot_does_not_end_the_walk_before_an_inside_link() {
+        let tmp = TempDir::new("groove-av11-dotdot");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+
+        let a = kb.join("a");
+        std::os::unix::fs::symlink(outside.join("sub"), &a).unwrap();
+        let via_dotdot = a.join("..").join("plugins");
+
+        assert!(
+            !canonical_with_unresolved_tail(&via_dotdot)
+                .starts_with(canonical_with_unresolved_tail(&kb)),
+            "the resolved target is outside, so only the walk can catch this"
+        );
+        assert!(
+            grammar_dir_inside_kb(&via_dotdot, &kb).is_some(),
+            "the link the path traverses is inside the knowledge base"
+        );
+    }
+
+    /// The same path shape on Windows, where `..` is resolved **lexically**
+    /// even across a junction. Measured on a developer machine: `<kb>/a`
+    /// canonicalizes to the outside target, while `<kb>/a/../plugins`
+    /// canonicalizes back to `<kb>/plugins`. The resolved half therefore
+    /// answers here, and the walk is what covers the shape on Unix — so this
+    /// asserts the verdict without pinning which half produced it.
+    #[cfg(windows)]
+    #[test]
+    fn a_dotdot_does_not_end_the_walk_before_an_inside_link() {
+        let tmp = TempDir::new("groove-av11-dotdot");
+        let kb = tmp.path().join("kb");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+
+        let a = kb.join("a");
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                &a.display().to_string(),
+                &outside.join("sub").display().to_string(),
+            ])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(made.success(), "mklink /J needs no elevation");
+
+        let via_dotdot = a.join("..").join("plugins");
+        assert!(
+            grammar_dir_inside_kb(&via_dotdot, &kb).is_some(),
+            "a path traversing an entry inside the knowledge base must be refused"
         );
     }
 
