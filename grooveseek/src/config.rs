@@ -414,7 +414,7 @@ impl SearchOverrides {
 pub struct EvalConfig {
     /// Golden YAML ファイルへのパス。相対なら**設定ファイルのあるディレクトリ**基準で
     /// 解決する ([`Config::load_from`]、`kb_path` と同じ扱い)。絶対も可。省略時は
-    /// `<kb_path>/.groove-eval.yml` (`main.rs` 側の定数 fallback)。
+    /// `<kb_path>/.groove-eval.yml` (CLI 側の定数 fallback)。
     ///
     /// (AV-31) untrusted config からは落とされる ([`Config::restrict_untrusted`] の R6)。
     pub golden: Option<PathBuf>,
@@ -1037,8 +1037,7 @@ impl Config {
     /// 受けるのは [`grammar_dir_from`] / [`cache_dir_env_override`] と同じ理由で、
     /// **env が unit test の答えを決めてはいけない**から: 開発機でこの変数が export
     /// されていると、`std::env::var_os` を読む側を呼ぶテストは両方の assert が
-    /// 反転する。テストはこちらを `None` で呼ぶ
-    /// (`the_plugin_directory_is_judged_against_the_knowledge_base_the_run_uses`)。
+    /// 反転する。plugin directory を KB と突き合わせる unit test はこちらを `None` で呼ぶ。
     fn resolve_grammar_dir_from(
         &self,
         env: Option<std::ffi::OsString>,
