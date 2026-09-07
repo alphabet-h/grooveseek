@@ -22,6 +22,7 @@ pub(crate) mod plugin;
 #[cfg(feature = "grammar-rust")]
 pub(crate) mod static_rust;
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -139,11 +140,27 @@ pub(crate) struct LoadedGrammar {
 impl LoadedGrammar {
     // A build with no grammar compiled in has no way to construct one of these, but the
     // chunker still compiles — which is the point: turning a language on is a Cargo feature,
-    // not a code change. The plugin loader will be a second caller.
+    // not a code change. The plugin loader is the second caller.
+    //
+    // The name is taken either way a grammar arrives: the compiled-in one hands a `&'static
+    // str`, a plugin hands the `String` it copied out of the library. An owned name is leaked
+    // to `'static` -- `CodeParser` and every chunk key on it for the rest of the process --
+    // but only once the tags query has compiled, so a refused grammar keeps nothing. That is
+    // the same rule the plugin loader applies to the library itself (`mem::forget` after the
+    // last check, drop on any refusal).
     #[cfg_attr(not(feature = "grammar-rust"), allow(dead_code))]
-    pub(crate) fn new(name: &'static str, language: Language, tags_query: &str) -> Result<Self> {
+    pub(crate) fn new(
+        name: impl Into<Cow<'static, str>>,
+        language: Language,
+        tags_query: &str,
+    ) -> Result<Self> {
+        let name = name.into();
         let config = TagsConfiguration::new(language.clone(), tags_query, "")
             .map_err(|e| anyhow::anyhow!("grammar {name}: tags query rejected: {e:?}"))?;
+        let name: &'static str = match name {
+            Cow::Borrowed(name) => name,
+            Cow::Owned(name) => String::leak(name),
+        };
         Ok(Self {
             name,
             language,
@@ -1707,6 +1724,20 @@ impl Counter {
             query,
         )
         .expect("the hand-written tags query compiles against the Rust grammar")
+    }
+
+    /// A name that arrived as an owned `String` (a plugin's) is named in the refusal, and the
+    /// refusal is the one path on which `new` keeps nothing: the leak is after the compile.
+    #[test]
+    fn an_owned_grammar_name_is_named_in_a_rejected_query() {
+        let err = LoadedGrammar::new(
+            String::from("plugin-lang"),
+            Language::from(static_rust::DESCRIPTOR.language),
+            "((",
+        )
+        .err()
+        .expect("an unbalanced query must be refused");
+        assert!(format!("{err}").contains("grammar plugin-lang:"), "{err}");
     }
 
     /// One `@definition.*` on the outer node, one `@name` per repeated inner child: the shape

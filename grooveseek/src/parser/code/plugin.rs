@@ -342,11 +342,13 @@ pub(crate) fn load(
         return Err(Rejection::Name(raw.name));
     }
 
-    // Leaked rather than borrowed: `LoadedGrammar` and `CodeParser` both key on `&'static str`,
-    // and a copy of our own is one less thing tied to the library staying mapped.
-    let name: &'static str = String::leak(raw.name);
-    let grammar = LoadedGrammar::new(name, language, &raw.tags_query)
+    // Copies of our own rather than borrows: `LoadedGrammar` and `CodeParser` both key on
+    // `&'static str`, and a copy is one less thing tied to the library staying mapped. Both
+    // are leaked only once every check has passed -- the name inside `LoadedGrammar::new`,
+    // after the tags query compiles, and the extension here -- so a refusal drops everything.
+    let grammar = LoadedGrammar::new(raw.name, language, &raw.tags_query)
         .map_err(|e| Rejection::TagsQuery(format!("{e}")))?;
+    let name = grammar.name;
     let extension: &'static str = String::leak(raw.extension);
 
     tracing::info!(
