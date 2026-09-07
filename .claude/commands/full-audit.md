@@ -212,6 +212,17 @@ prompt:
 
 過去の出力例: `.dev/knowledge/archive/audits/review-2026-08-18-full-audit.md` を参考にする。
 
+#### 既知の偽陽性 (起票前に grep で潰す)
+
+subagent の指摘のうち、過去に **同じ内容を 2 回以上「欠けている」と誤起票した** ものを置く。
+台帳へ載せる前に、ここに当たるものは指摘された場所を自分の目で確認する:
+
+- **`cargo audit` は CI に無い**: 無いのではなく nightly-only。`.github/workflows/nightly.yml` の
+  job `cargo-audit` が走り、失敗 issue を起こす job は `needs:` でそれを待つ。2026-07-26 サイクルの
+  AU-27 と 2026-09-02 の AV-42 で 2 度「CI に欠けている」と起票された。どちらも、手元の shell に
+  `cargo-audit` が入っていなかったのを「CI にも無い」と読んでいた。次に同じ指摘が出たら、起票する前に
+  `grep -n "cargo audit" .github/workflows/*.yml` を実行する
+
 ---
 
 ### Phase 3 — TODO 化

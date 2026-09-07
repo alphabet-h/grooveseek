@@ -97,6 +97,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   documentation also said the path was resolved against `kb_path`; it is
   resolved against the config file's directory, as `kb_path` itself is.
 
+### Internal
+
+- **A bare local `cargo clippy` now refuses the clippy lints CI refuses** (AV-26). The workspace manifest sets `clippy::all` to deny, so a clippy warning is an error locally without `-- -D warnings` (rustc warnings such as `unused_variables` still print and pass locally; only CI's `-D warnings` denies those); a toolchain update can therefore stop a local clippy run the same day it stops CI. rustc's `warnings` is deliberately not denied there: cargo forwards `[lints.rust]` to rustdoc, where it would turn every future warn-by-default rustdoc lint into an error, so a plain `cargo build` still reports rustc warnings as warnings.
+- **CI adds a second feature-off check that covers every target** (AV-27). `cargo check --no-default-features -p grooveseek` stays as it was, and a second step runs the same check with `--all-targets`, so the tests and grammar fixtures that carry `cfg(feature = "grammar-rust")` are compiled on that path too. The two are kept separate on purpose: building test targets unifies dev-dependency features into the normal targets, so the all-targets step cannot stand in for the production-only one.
+
 ## [1.5.0] - 2026-09-04
 
 ### Added

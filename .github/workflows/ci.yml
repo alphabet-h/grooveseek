@@ -59,8 +59,22 @@ jobs:
       # build without it is a path nothing else exercises: `cargo test` runs
       # with default features. Checking it here is what keeps the id-resolution
       # branch for "known but not compiled in" compiling at all.
+      #
+      # (AV-27) Two commands, not one. The lib is not the only thing that reads
+      # the feature: two integration tests and seven of the `[[example]]`
+      # grammar fixtures carry `cfg(feature = "grammar-rust")` too, and a
+      # lib-only check left every one of them uncompiled on this path, so the
+      # second command adds `--all-targets`. It cannot replace the first:
+      # building test and bench targets lets resolver v2 unify their
+      # dev-dependency features into the normal targets (`rusqlite` here has
+      # `bundled` as a normal dependency and `trace` only under
+      # dev-dependencies), so a production use of a dev-only API would pass
+      # the all-targets check and fail the build a user actually makes. The
+      # production-only line is what the feature-off user gets.
       - name: cargo check (grammar feature off)
         run: cargo check --no-default-features -p grooveseek
+      - name: cargo check (grammar feature off, all targets)
+        run: cargo check --no-default-features --all-targets -p grooveseek
       - name: Pre-warm embedding model cache (serial)
         # index_progress_cli spawns groove subprocesses that each need the
         # BGE-small model. On a cold cache, running them in parallel makes

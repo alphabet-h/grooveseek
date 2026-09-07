@@ -60,6 +60,36 @@ tree-sitter-language = "0.1"
 # turns an unrelated PR red on the day a new lint lands — the failure mode that
 # already cost a morning when Rust 1.98 added a clippy lint. Every warn-by-
 # default rustdoc lint is named here, so adding the next one is a decision.
+#
+# clippy is the other way round, on purpose. CI already runs it under
+# `-D warnings` (`ci.yml`, and the block CONTRIBUTING pins), so a clippy warning
+# there is a red run whatever this file says; what the group below changes is
+# that a bare local `cargo clippy` now refuses the clippy lints CI refuses,
+# instead of printing them as warnings. Only the clippy lints: a rustc warning
+# such as `unused_variables` still prints and exits 0 locally, and only CI's
+# `-D warnings` turns it red (the next paragraph is why that half stays
+# undenied here). The cost is the one the paragraph above
+# describes: a toolchain update can stop a local clippy run the same day it
+# stops CI. That is the trade — one answer, not two. `priority = -1` ranks the
+# group below any single lint named after it, so a later `some_lint = "allow"`
+# overrides the group rather than being overridden.
+#
+# **No `[workspace.lints.rust] warnings = "deny"` to match**, though it was
+# tried. cargo hands the `[lints.rust]` table to rustdoc as well as to rustc
+# (`cargo doc -vv` shows `--deny=warnings` on the rustdoc line), and rustc's
+# `warnings` is not a lint but a switch over everything emitted at warn level:
+# a later `--warn=rustdoc::all` does not take it back. Measured 2026-09-07 —
+# with `bare_urls` dropped from the list below and `rustdoc::all` set to warn
+# after it, a bare URL in a doc comment still failed `cargo doc` with an error.
+# So that one line would have turned every future warn-by-default rustdoc lint
+# into a hard error, which is what the enumeration below is there to prevent.
+# `clippy::all` is forwarded to rustdoc too, and is harmless there: rustdoc
+# has no clippy lints, and the run above was clean with the flag present. A
+# rustc warning therefore stays a warning in a local `cargo build`; CI's
+# `-D warnings` on the clippy job is where it becomes a red run.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 invalid_codeblock_attributes = "deny"
