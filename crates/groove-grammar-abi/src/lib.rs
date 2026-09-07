@@ -74,10 +74,15 @@ pub mod symbols {
 
 /// Export a grammar across the C ABI this crate defines.
 ///
-/// A plugin crate is `crate-type = ["cdylib"]`, depends on a `tree-sitter-<lang>` crate and on
-/// this one, and invokes this macro once. Everything else groove needs — walking scopes,
-/// collecting doc comments, deciding chunk boundaries — is on groove's side, which is what
-/// keeps adding a language to supplying data.
+/// The plugin crates live in this tree as `crates/groove-grammar-<lang>`: each is
+/// `crate-type = ["cdylib"]`, depends on a `tree-sitter-<lang>` crate and on this one, and
+/// invokes this macro once. A new language therefore arrives with a groove release rather than
+/// from a third party —
+/// [ADR-0013](../../../docs/decisions/0013-compile-in-one-grammar-and-load-the-rest.md)
+/// explains why (groove has to know a library's file name before it opens anything).
+/// Everything else groove needs — walking scopes, collecting doc comments,
+/// deciding chunk boundaries — is on groove's side, which is what keeps adding a language to
+/// supplying data.
 ///
 /// `name` and `extension` must be string **literals**: the exported functions hand back
 /// pointers to NUL-terminated static data, which is built here with `concat!`.

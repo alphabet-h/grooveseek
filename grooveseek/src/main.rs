@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 // command in the report template failed for everyone.
 #[command(version)]
 #[command(
-    about = "MCP server for semantic search over a knowledge base of Markdown and plain-text files",
+    about = "MCP server for semantic search over a knowledge base of Markdown (optionally plain-text, PDF, Office and source-code files)",
     // The reference link is built against this binary's own version tag, not
     // `main`: a release archive ships the binary and README.md but no `docs/`,
     // so the reader has to follow a URL, and `main` would hand an older binary
@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
     // what actually prints.
     long_about = concat!(
         "MCP server for semantic search over a knowledge base of Markdown\n",
-        "(and optionally plain-text, opt-in via [parsers].enabled) files.\n",
+        "files, plus plain-text, PDF and Office documents and source code\n",
+        "(Rust in the default build; Python and PHP via downloaded grammars),\n",
+        "each opt-in via [parsers].enabled.\n",
         "\n",
         "Any of the options below can be provided via `groove.toml`. The file\n",
         "is discovered in priority order: --config <PATH>, then ./groove.toml,\n",

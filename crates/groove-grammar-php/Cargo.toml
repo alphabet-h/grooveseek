@@ -4,10 +4,11 @@ version = "1.5.0"
 edition = "2024"
 description = "The PHP grammar, as a library groove loads at run time"
 authors = ["koshian"]
-
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alphabet-h/grooveseek"
+homepage = "https://github.com/alphabet-h/grooveseek"
 # Never published to crates.io: it is a plugin for one program, shipped as a
-# release asset. publish = false also avoids the crates.io readme/metadata
-# validation the other satellite crates opted out of.
+# release asset.
 publish = false
 
 # The crate name decides two names that must not drift: cargo builds the cdylib
