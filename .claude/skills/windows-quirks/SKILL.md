@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a log line when the same event announces itself from two different sites so the assertion passes on one OS and fails on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -630,14 +630,21 @@ junction 解決前の書かれたパスの親に戻す。**POSIX** はリンク�
 出典: 2026-09-05 AV-11 (PR #268)。詳細は `.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md` /
 `.dev/knowledge/session-2026-09-05-av-11-grammar-dir-handoff.md:47-58`
 
-## 19. 同じイベントが複数の場所から名乗るので、ログ文言の assert は OS で通ったり落ちたりする
+## 19. 起動途中のログ行を assert すると、OS ごとのタイミングで通ったり落ちたりする
 
 **症状**: `serve` の stderr に `watching` を探す subprocess test が **Windows では通り、macOS の CI で
-落ちた**。罠 5 (ANSI 色) とは別物 — 色を剥がしても直らない。**文言そのものが違う**。
+落ちた** — macOS 側の stderr にあったのは `watcher started` だけ。罠 5 (ANSI 色) とは別物で、
+色を剥がしても直らない。
 
-**原因**: watcher は `grooveseek/src/watcher.rs:245` (`watcher: watching ...`) と `:268-272`
-(`watcher started ...`) の両方から名乗り (via: `rg -n 'watcher: watching|watcher started' grooveseek/src/watcher.rs`)、どちらが出るかは実行環境で変わる。テストが
-「watcher がこう名乗る」を契約にしていたが、それはテストの関心ではない。
+**原因**: 2 つの行は**同じイベントの別名ではなく、別の lifecycle event** (via:
+`rg -n 'watcher: watching|watcher started' grooveseek/src/watcher.rs`)。`watcher started`
+(`grooveseek/src/watcher.rs:268-272`) は watcher thread を spawn した直後に出る。
+`watcher: watching` (`:245`) はその thread の中で `watch()` が成功した後にしか出ない。
+テストが stderr を読んだ瞬間にどこまで進んでいるかは OS と runner の速さで変わるので、
+**後の行を探す assert は startup race になる**。「文言が環境で変わる」のではなく、
+「読んだ時点でまだ出ていない」。
+
+テストは「watcher がこう名乗る」を契約にしていたが、それはテストの関心ではなかった。
 
 **正しいやり方**: **assert したい性質そのものに一番近い観測点を選ぶ**。ここでの性質は
 「索引が作られ得る」なので、DB ファイルの存在を見る (`grooveseek/tests/doctor_cli.rs:193`
@@ -681,8 +688,12 @@ DB 存在の assert をそこへ流用すると、watcher が一度も動かな�
 > 評価した**ので、その subexpression の成功が `$?` を上書きしていた。**`$?` は直前に評価した
 > 式のもの**で、文字列展開の中の `$( )` も「式」に数える。`$?` を読むなら **それを最初に**置く。
 
-**`$?` は exit code と一致しない**し、pipeline に来るのは文字列ではない。`Out-String` に通せば
-文字列比較は通ることもあるが、**行を `-eq` / `Select-String` で見る形は当たらない**。
+**`$?` は exit code と一致しない**し、pipeline に来るのは文字列ではない。`Out-String` に通した
+`-match` は通った (上の実測で `Finished` に一致)。**当たらないのは行を `-eq` で比べる形や型で
+振り分ける形** — `ErrorRecord` は `String` ではない。`Select-String` は
+[公式 docs](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/select-string?view=powershell-5.1)
+どおり非文字列を `ToString()` してから探すので、それ自体は一致し得る (未実測)。AV-13 で判定文字列に
+当たらなかった経路は `$?` で止まった計測ループ側で、`Select-String` の不一致ではない。
 罠 8 の `2>$null` が「診断を捨てて成功に見せる」失敗なら、こちらは「成功を失敗に見せて診断を
 壊す」失敗で、向きが逆。
 
