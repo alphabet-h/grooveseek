@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation while symlinks do, and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a log line when the same event announces itself from two different sites so the assertion passes on one OS and fails on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so an exit-0 run looks failed and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation while symlinks do, and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a log line when the same event announces itself from two different sites so the assertion passes on one OS and fails on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -588,16 +588,19 @@ sub =     C:\Users\YABUSH~1\AppData\Local\Temp\...\kb\plugins  <- 素のまま
 回帰テストは `config.rs:3822` `a_grammar_directory_inside_the_knowledge_base_is_refused`
 (`:3833-3836` のコメントが `\\?\` の形を名指ししている)。
 
-### ★ junction は昇格が要らない — Windows の方が攻撃の敷居が低い
+### ★ junction は昇格が要らない — Windows にも Unix の symlink と同じ「非特権の経路」がある
 
 ```
 New-Item -ItemType SymbolicLink  ->  Administrator privilege required for this operation.
 cmd /c mklink /J                 ->  Junction created.   (昇格なし)
 ```
 
-(via: 同 note `:117-122`)。**symlink は管理者権限が要るが、directory junction は要らない**。
-そして Rust の `canonicalize` は junction を**追う**。つまり「KB 内のエントリが外を指す」は
-Unix より Windows で作りやすい。
+(via: 同 note `:117-122`)。この開発機では **symlink は管理者権限が要るが、directory junction は
+要らない**。そして Rust の `canonicalize` は junction を**追う**。つまり「KB 内のエントリが外を指す」は
+Windows でも非特権ユーザが作れる — Unix で一般ユーザが symlink を張れるのと同じ敷居。
+**「Windows の方が敷居が低い」ではない** (Unix の symlink も昇格不要。Windows も Developer Mode
+なら symlink を非特権で張れるが、それは測っていない)。要点は「symlink を塞いだ = Windows は安全」
+にならないこと。
 
 **`#[cfg(unix)]` だけでテストを閉じると、「その OS で一番作りやすい形」が未検証で残る。**
 `#[cfg(windows)]` の twin を **skip ではなく assert** で置く
@@ -647,14 +650,25 @@ junction 解決前の書かれたパスの親に戻す。**POSIX** はリンク�
 当たらない。2026-08-21 から 2026-09-06 までに 4 session で踏んだ (via: `rg -l 'NativeCommandError' .dev/knowledge` → `readme-split-link-surface.md:74-75` / `session-2026-08-22-handoff-after-stderr-ascii.md:100-101` / `session-2026-08-25-claim-guard-live-count-handoff.md:62` / `av-13-identical-ranges-pitfalls.md:139-144`)。
 
 **原因**: Windows PowerShell 5.1 は `2>&1` で native command の stderr を pipeline に流す時、
-**各行を `NativeCommandError` の ErrorRecord に包み、`$?` を false にする**。実測
-(PS 5.1.26100.9168、via: `$c = cargo check -p groove-grammar-abi 2>&1; "$? $LASTEXITCODE"; $c | ForEach-Object { $_.GetType().Name }`):
+**各行を `NativeCommandError` の ErrorRecord に包む**。そして **stderr の行が 1 つでも通ると
+`$?` が false になる** — exit code とは無関係。実測 (PS 5.1.26100.9168、via:
+`$c = cargo check -p groove-grammar-abi 2>&1; "$? $($c.Count) $LASTEXITCODE"` の形を各行で):
 
-| コマンド | `$?` | `$LASTEXITCODE` | pipeline の型 |
-|---|---|---|---|
-| `cargo check ... 2>&1` (stderr に `Finished` を書く、exit 0) | **False** | 0 | `ErrorRecord` |
-| `cmd /c "echo x 1>&2 & exit 0" 2>&1` | True | 0 | `ErrorRecord` |
-| `cargo --version 2>&1` (stderr なし) | True | 0 | `String` |
+| コマンド | stderr 行数 | `$?` | `$LASTEXITCODE` | pipeline の型 |
+|---|---|---|---|---|
+| `cargo check ... 2>&1` (`Finished` を stderr に書く) | 1 | **False** | 0 | `ErrorRecord` |
+| `cargo check ... --quiet 2>&1` | 0 | True | 0 | (空) |
+| `cmd /c "echo x 1>&2 & exit 0" 2>&1` | 1 | **False** | 0 | `ErrorRecord` |
+| `cmd /c "echo x 1>&2 & exit 1" 2>&1` | 1 | False | 1 | `ErrorRecord` |
+| `cargo --version 2>&1` | 0 | True | 0 | `String` |
+
+観測した条件は「**stderr に 1 行以上書いた native exe を `2>&1` で受けた**」で、行数や exit code は
+関係なかった。stderr に何も書かない呼び出し (`--quiet`) は `2>&1` を付けても無傷。
+
+> ★ **この表の初版は `cmd ... exit 0` の行を `$?` = True と書いていた** (codex P2 on PR #275)。
+> 原因は測り方: `"type=$($r.GetType().Name) dollar-q=$?"` と **同じ文字列の中で `$( )` を先に
+> 評価した**ので、その subexpression の成功が `$?` を上書きしていた。**`$?` は直前に評価した
+> 式のもの**で、文字列展開の中の `$( )` も「式」に数える。`$?` を読むなら **それを最初に**置く。
 
 **`$?` は exit code と一致しない**し、pipeline に来るのは文字列ではない。`Out-String` に通せば
 文字列比較は通ることもあるが、**行を `-eq` / `Select-String` で見る形は当たらない**。
