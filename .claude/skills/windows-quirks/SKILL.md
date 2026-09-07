@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation while symlinks do, and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a log line when the same event announces itself from two different sites so the assertion passes on one OS and fails on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so an exit-0 run looks failed and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -89,7 +89,7 @@ groove を Windows (特に日本語 locale) 向けに開発する中で、公式
 
 **原因**: cargo / rustc の診断は **stdout ではなく stderr** に出る。`2>$null` はそれを丸ごと捨てるため、grep 対象が空になって常に「警告なし」に見える。`Select-String` の結果が空 = 成功、と読んでしまうのが罠。さらに `-D warnings` を付けていなければ warning は exit code にも出ない。
 
-**正しいやり方**: 検証コマンドでは **stderr を捨てない**。Bash tool 側で `cargo clippy --all-targets -- -D warnings 2>&1 | tail -5` として exit code を見るか、PowerShell なら `2>$null` を外して `$LASTEXITCODE` を確認する。「grep がヒット 0 件」を成功条件にしない — **exit code を成功条件にする**。
+**正しいやり方**: 検証コマンドでは **stderr を捨てない**。Bash tool 側で `cargo clippy --all-targets -- -D warnings 2>&1 | tail -5` として exit code を見るか、PowerShell なら `2>$null` を外して `$LASTEXITCODE` を確認する。**この `2>&1` は Bash tool 限定** — `powershell.exe` に持ち込むと罠 20 の `NativeCommandError` になる。「grep がヒット 0 件」を成功条件にしない — **exit code を成功条件にする**。
 
 **補足**: これは「検証コマンドが壊れていても成功に見える」class の罠。同 session では codex polling script を `run_in_background` ではなく shell の `&` で起動して harness の追跡外に置く失敗も 2 回起こしており (詳細は `.dev/knowledge/codex-review-loop-pitfalls.md` 罠 38)、**1 度 note に書いただけでは再発を防げなかった**。検証系のコマンドは「exit code を見る」形に統一するのが唯一効く対策。
 
@@ -549,6 +549,132 @@ io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 出典: 2026-09-04 v1.5.0 リリース。**正規化していない private repo** のノート 1 本だけが CRLF で、
 同じディレクトリの他の Markdown は LF だった (via: 上の `wc -l` / `tr -cd` を各ファイルに)。
 **同じディレクトリのファイルが同じ行末とは限らない。**
+
+## 18. パス比較で片側だけ `canonicalize` すると検査が黙って素通りする (`\\?\` prefix と 8.3 短縮名)
+
+**症状**: 「`grammar_dir` が KB の中にあるか」を `Path::starts_with` で見る検査が、Windows だけ
+**false を返して KB 内の plugin dir を通す**。エラーも警告も出ない。Linux では字面がそのまま
+prefix になるので**再現しない** — Windows だけで黙って通る検査ができる。
+
+**原因**: 片側 (KB) だけ `std::fs::canonicalize` に通し、もう片側 (まだ存在しない plugin dir) は
+そのまま比べていた。実測では prefix と短縮名の食い違いが同時に出た (via: `bash scratchpad/av11_observe.sh`、`.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md:51-53`):
+
+```
+kb  = \\?\C:\Users\yabushita\AppData\Local\Temp\...\kb          <- canonicalize 済
+sub =     C:\Users\YABUSH~1\AppData\Local\Temp\...\kb\plugins  <- 素のまま
+```
+
+- **verbatim prefix `\\?\`** — Windows の `canonicalize` が付ける
+- **8.3 短縮名** — TEMP 環境変数の値が `YABUSH~1` で、canonicalize 側だけ `yabushita` に展開される
+
+`starts_with` は component 単位なので、**どちらか一方でも食い違えば false**。つまり
+**`\\?\` を strip するだけでは足りない**。短縮名の方は **TEMP の値に依存する**ので、
+「Windows ならいつも両方食い違う」とは書かない — 観測したのはこの開発機 (TEMP が 8.3 名を持つ) まで。
+
+「KB は存在し、plugin dir はまだ無い」は**攻撃者にとって一番普通の状態**で、mutation probe で
+片側 canonicalize に戻すとその assert だけが死んだ (同 note `:74-76`)。気付かず出荷していたら
+検査は無いのと同じだった。
+
+**正しいやり方**: **両側を同じ規則に通す**。`grooveseek/src/config.rs:1543-1573`
+`canonical_with_unresolved_tail` — 存在する祖先まで `canonicalize` で解決し、存在しない残りを
+継ぎ足す。両側がこれを通れば prefix も短縮名も揃う。問いによって解決の仕方が違う
+(同 note `:154-171`):
+
+- 「**実体はどこか**」→ 両側とも解決する (`inside_knowledge_base` `config.rs:1602-1628` の前半)
+- 「**エントリはどこか**」→ 親だけ解決し、名前は解決しない (`entry_or_ancestor_inside` `config.rs:1643-1670`)。
+  比較相手は実体の側。最初の実装は両側を `std::path::absolute` で絶対化して比べていたが、
+  KB が alias で `grammar_dir` が実体の綴りだと prefix を共有せず素通りした (同 file `:1638-1642`)
+
+回帰テストは `config.rs:3822` `a_grammar_directory_inside_the_knowledge_base_is_refused`
+(`:3833-3836` のコメントが `\\?\` の形を名指ししている)。
+
+### ★ junction は昇格が要らない — Windows の方が攻撃の敷居が低い
+
+```
+New-Item -ItemType SymbolicLink  ->  Administrator privilege required for this operation.
+cmd /c mklink /J                 ->  Junction created.   (昇格なし)
+```
+
+(via: 同 note `:117-122`)。**symlink は管理者権限が要るが、directory junction は要らない**。
+そして Rust の `canonicalize` は junction を**追う**。つまり「KB 内のエントリが外を指す」は
+Unix より Windows で作りやすい。
+
+**`#[cfg(unix)]` だけでテストを閉じると、「その OS で一番作りやすい形」が未検証で残る。**
+`#[cfg(windows)]` の twin を **skip ではなく assert** で置く
+(`config.rs:3957` `a_junction_inside_the_knowledge_base_is_refused_even_when_it_points_out`、
+`cmd /c mklink /J` で作る)。silent skip はカバレッジが消えたことを隠す。
+
+### ★ 同じパス文字列が OS によって違う場所に解決される (`..` は Windows では字句的)
+
+```
+kb/a            = ...\outside\sub        <- junction を解決
+kb/a/../plugins = ...\kb\plugins         <- .. は字句的に処理され KB の中へ戻る
+```
+
+(via: `bash scratchpad/av11_dotdot_obs.sh`、同 note `:227-231`)。**Windows** は `..` を
+junction 解決前の書かれたパスの親に戻す。**POSIX** はリンクを解決した後に `..` を適用するので
+`outside` へ出る。つまり **`..` の walk を止めない修正が効くのは Unix** で、Windows は別の理由で
+元から守られていた。
+
+**テストは verdict (拒否されること) を assert し、どちらの半分が答えたかは pin しない**
+(`config.rs:4139` / `:4169` `a_dotdot_does_not_end_the_walk_before_an_inside_link` の unix / windows twin)。
+**手元 (Windows) では Unix の経路を検証できない** — CI の ubuntu leg が検証点。
+
+出典: 2026-09-05 AV-11 (PR #268)。詳細は `.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md` /
+`.dev/knowledge/session-2026-09-05-av-11-grammar-dir-handoff.md:47-58`
+
+## 19. 同じイベントが複数の場所から名乗るので、ログ文言の assert は OS で通ったり落ちたりする
+
+**症状**: `serve` の stderr に `watching` を探す subprocess test が **Windows では通り、macOS の CI で
+落ちた**。罠 5 (ANSI 色) とは別物 — 色を剥がしても直らない。**文言そのものが違う**。
+
+**原因**: watcher は `grooveseek/src/watcher.rs:245` (`watcher: watching ...`) と `:268-272`
+(`watcher started ...`) の両方から名乗り (via: `rg -n 'watcher: watching|watcher started' grooveseek/src/watcher.rs`)、どちらが出るかは実行環境で変わる。テストが
+「watcher がこう名乗る」を契約にしていたが、それはテストの関心ではない。
+
+**正しいやり方**: **assert したい性質そのものに一番近い観測点を選ぶ**。ここでの性質は
+「索引が作られ得る」なので、DB ファイルの存在を見る (`grooveseek/tests/doctor_cli.rs:193`
+`serve_starts_its_watcher_without_an_index_so_the_watcher_can_seed_one`、`:206-210` のコメントが
+一次記録、assert は `resolve_db_path(...).exists()`)。**ログ行は診断であって契約ではない** —
+文言を assert に使うなら、同じイベントを別の文言で名乗る場所が無いことを `rg -n '<文言>' grooveseek/src` で確かめてからにする。
+
+出典: 2026-09-06 AV-12 (PR #269)。`.dev/knowledge/av-12-chunk-cap-degrade-pitfalls.md:156-163`
+
+## 20. PowerShell 5.1 で native exe に `2>&1` を付けると `NativeCommandError` に包まれて結果が読めない
+
+**症状**: `cargo clippy ... 2>&1` / `cargo test ... 2>&1` / `python test.py 2>&1` が **exit 0 なのに
+赤い ErrorRecord の山**になり、判定文字列 (例: stack overflow の `has overflowed its stack`) に
+当たらない。2026-08-21 から 2026-09-06 までに 4 session で踏んだ (via: `rg -l 'NativeCommandError' .dev/knowledge` → `readme-split-link-surface.md:74-75` / `session-2026-08-22-handoff-after-stderr-ascii.md:100-101` / `session-2026-08-25-claim-guard-live-count-handoff.md:62` / `av-13-identical-ranges-pitfalls.md:139-144`)。
+
+**原因**: Windows PowerShell 5.1 は `2>&1` で native command の stderr を pipeline に流す時、
+**各行を `NativeCommandError` の ErrorRecord に包み、`$?` を false にする**。実測
+(PS 5.1.26100.9168、via: `$c = cargo check -p groove-grammar-abi 2>&1; "$? $LASTEXITCODE"; $c | ForEach-Object { $_.GetType().Name }`):
+
+| コマンド | `$?` | `$LASTEXITCODE` | pipeline の型 |
+|---|---|---|---|
+| `cargo check ... 2>&1` (stderr に `Finished` を書く、exit 0) | **False** | 0 | `ErrorRecord` |
+| `cmd /c "echo x 1>&2 & exit 0" 2>&1` | True | 0 | `ErrorRecord` |
+| `cargo --version 2>&1` (stderr なし) | True | 0 | `String` |
+
+**`$?` は exit code と一致しない**し、pipeline に来るのは文字列ではない。`Out-String` に通せば
+文字列比較は通ることもあるが、**行を `-eq` / `Select-String` で見る形は当たらない**。
+罠 8 の `2>$null` が「診断を捨てて成功に見せる」失敗なら、こちらは「成功を失敗に見せて診断を
+壊す」失敗で、向きが逆。
+
+**正しいやり方**: PowerShell では native exe に **`2>&1` を付けない**。
+
+1. **`> out.txt 2> err.txt` で別ファイルに落として読む** — 最も確実。判定文字列は err 側にある
+2. exit code で判定できるものは **文言でなく `$LASTEXITCODE`** を見る (stack overflow は
+   Windows では `0xC00000FD` = `STATUS_STACK_OVERFLOW`)
+3. stderr も含めて単一のストリームで読みたいなら **Bash tool** 側で `2>&1` (罠 8 の推奨形はこれ)
+4. 計測ループなど `$?` の false で止まると困る場面は `System.Diagnostics.Process` で起動する
+   (`docs/deployment-topologies.md:342-345`、`.dev/tools/measure-rerank.ps1:4`)
+
+`2>$null` + `$LASTEXITCODE` も動くが、罠 8 のとおり診断が消えるので、**失敗した時に読み返す
+stderr が要る検証には使わない**。
+
+出典: 2026-08-21 (初出、`.dev/knowledge/archive/superseded/bash-tool-wrapper-parse-error.md:48-50`) /
+2026-09-06 AV-13 (`cargo test` の stack overflow 判定が当たらなかった、`.dev/knowledge/av-13-identical-ranges-pitfalls.md:139-144`)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
