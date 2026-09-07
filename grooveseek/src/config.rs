@@ -412,8 +412,11 @@ impl SearchOverrides {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvalConfig {
-    /// Golden YAML ファイルへのパス (kb-path 基準の相対 or 絶対)。省略時は
-    /// `<kb_path>/.groove-eval.yml`。
+    /// Golden YAML ファイルへのパス。相対なら**設定ファイルのあるディレクトリ**基準で
+    /// 解決する ([`Config::load_from`]、`kb_path` と同じ扱い)。絶対も可。省略時は
+    /// `<kb_path>/.groove-eval.yml` (CLI 側の定数 fallback)。
+    ///
+    /// (AV-31) untrusted config からは落とされる ([`Config::restrict_untrusted`] の R6)。
     pub golden: Option<PathBuf>,
     /// 保持する過去実行の件数。省略時は 10。
     pub history_size: Option<usize>,
@@ -591,17 +594,18 @@ impl Config {
 
     /// 信頼できない場所で見つかった config に制限を掛ける (BU-07)。
     ///
-    /// 制限するのは**特権的な 5 つ**だけで、`[search]` / `[quality_filter]` /
-    /// `exclude_dirs` / `[watch]` / `[contextual]` 等はそのまま通す。前者は
-    /// 「どのコードが実行されるか」「何を外に出すか」「誰から届くか」を決めるのに対し、
-    /// 後者は選ばれた KB の中での見せ方でしかないため。
+    /// 制限するのは**特権的なキー** (下の R1 〜 R6) だけで、`[search]` /
+    /// `[quality_filter]` / `exclude_dirs` / `[watch]` / `[contextual]` 等はそのまま
+    /// 通す。前者は「どのコードが実行されるか」「何を読むか / 外に出すか」「誰から
+    /// 届くか」を決めるのに対し、後者は選ばれた KB の中での見せ方でしかないため。
     ///
     /// `[parsers]` は R5 (AV-05) で前者へ移した。`enabled` は「見せ方」ではなく
     /// **どの parser を走らせるか**の指定で、plugin が要る id を 1 つ足すだけで
-    /// ネイティブライブラリの `dlopen` が発火する。
+    /// ネイティブライブラリの `dlopen` が発火する。`[eval].golden` は R6 (AV-31) で
+    /// 移した。絶対パスで**この run が読むファイル**を選べるため。
     ///
-    /// **致命的なのは `kb_path` だけ**。他の 3 つは警告 + 安全側の値への差し替えで
-    /// 続行する。ここで起動を止めると、Windows daemon が **何の出力も残さずに
+    /// **致命的なのは `kb_path` だけ**。他はすべて警告 + 安全側の値への差し替え
+    /// (または落とすだけ) で続行する。ここで起動を止めると、Windows daemon が **何の出力も残さずに
     /// 死ぬ** (`groove-svc` が stdio を `Stdio::null()` にするため、利用者には
     /// 「動かない」以上の情報が出ない)。
     fn restrict_untrusted(
@@ -866,6 +870,34 @@ impl Config {
             );
         }
 
+        // R6 (AV-31): `groove eval` / `groove tune` がどのファイルを読むか。
+        //
+        // `[eval].golden` は [`Self::load_from`] で config ファイルのディレクトリ基準に
+        // 解決されるが、絶対パスならマシン上のどのファイルでも指せる。読んだ先は
+        // YAML として parse され、失敗の文言にはファイルの断片が混じる。
+        //
+        // **過大評価しないこと。** 読みは [`crate::eval`] の `read_bounded` (1 MiB、
+        // [`crate::links::read_checked`] 経由) で bound されている。露出は
+        // 「bounded read の中身が YAML error を通して表に出る」であって、code
+        // execution でも無制限の読み出しでもない。それでも、KB の隣で見つかった
+        // config が「この run が読むファイル」を絶対パスで選べてよい理由は無い —
+        // R3 が `kb_path` について答えているのと同じ問い。
+        //
+        // R5 と同じ形で、**キーが無い場合の差し替えは要らない。** 落とした先は
+        // `main.rs` の `kb_path.join(".groove-eval.yml")` — **有効な KB に対する
+        // 定数**で、パスも env も経由しない。`--golden` は config より優先されるので
+        // 正当な上書きはそのまま通る。`[eval]` の他のキー (`history_size` 等) は
+        // 見せ方の範囲なので残す。
+        if let Some(golden) = self.eval.as_mut().and_then(|e| e.golden.take()) {
+            tracing::warn!(
+                config = %shown.display(),
+                requested = %golden.display(),
+                "ignoring [eval].golden from a config found in an untrusted location \
+                 (it selects which file groove eval reads); pass --golden, or \
+                 --config to accept it"
+            );
+        }
+
         Ok(())
     }
 
@@ -998,11 +1030,21 @@ impl Config {
     /// 判定は解決**後**の 1 箇所で行う。env / config / OS 既定のどれで決まっても危険は
     /// 同じなので、経路ごとに分けると同じ物理状況が複数の意味を持つ (ADR-0013 が退けた形)。
     pub fn resolve_grammar_dir(&self, kb_path: &Path) -> Result<Option<PathBuf>> {
-        let Some((dir, source)) = grammar_dir_from(
-            std::env::var_os("GROOVE_GRAMMAR_DIR"),
-            self.grammar_dir.as_deref(),
-            dirs::data_local_dir(),
-        )?
+        self.resolve_grammar_dir_from(std::env::var_os("GROOVE_GRAMMAR_DIR"), kb_path)
+    }
+
+    /// (AV-41) [`Self::resolve_grammar_dir`] の本体。`GROOVE_GRAMMAR_DIR` を引数で
+    /// 受けるのは [`grammar_dir_from`] / [`cache_dir_env_override`] と同じ理由で、
+    /// **env が unit test の答えを決めてはいけない**から: 開発機でこの変数が export
+    /// されていると、`std::env::var_os` を読む側を呼ぶテストは両方の assert が
+    /// 反転する。plugin directory を KB と突き合わせる unit test はこちらを `None` で呼ぶ。
+    fn resolve_grammar_dir_from(
+        &self,
+        env: Option<std::ffi::OsString>,
+        kb_path: &Path,
+    ) -> Result<Option<PathBuf>> {
+        let Some((dir, source)) =
+            grammar_dir_from(env, self.grammar_dir.as_deref(), dirs::data_local_dir())?
         else {
             return Ok(None);
         };
@@ -3701,6 +3743,101 @@ lambda = 0.5
         );
     }
 
+    // -----------------------------------------------------------------------
+    // R6 (AV-31): a discovered config cannot choose which golden file is read
+    // -----------------------------------------------------------------------
+
+    /// A config body naming `[eval].golden`, for the R6 tests. `golden` is the
+    /// absolute path given, written with forward slashes so it parses on
+    /// Windows too; the sibling key stays so the test can see that only
+    /// `golden` is dropped.
+    fn planted_golden(golden: &Path) -> String {
+        format!(
+            "kb_path = \"kb\"\n[eval]\ngolden = \"{}\"\nhistory_size = 3\n",
+            golden.display().to_string().replace('\\', "/")
+        )
+    }
+
+    /// The read is bounded and parsed as YAML, so what a planted path exposes
+    /// is a bounded read surfaced through a parse error, not code execution.
+    /// It is still a file the operator did not choose, and `--golden` or
+    /// `--config` are the two ways an operator chooses one.
+    #[test]
+    fn an_untrusted_config_cannot_choose_which_golden_file_is_read() {
+        let dir = TempDir::new("groove-untrusted-golden");
+        let secrets = TempDir::new("groove-untrusted-golden-target");
+        let planted = secrets.path().join("not-yours.yml");
+        std::fs::write(dir.path().join("groove.toml"), planted_golden(&planted)).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let eval = d
+            .config
+            .eval
+            .as_ref()
+            .expect("the [eval] table itself survives; only golden is privileged");
+        assert!(
+            eval.golden.is_none(),
+            "a planted golden path must never be read: {:?}",
+            eval.golden
+        );
+        assert_eq!(
+            eval.history_size,
+            Some(3),
+            "the sibling keys shape how results are kept, not what is read, and stay"
+        );
+    }
+
+    /// Same reasoning as the parser-rule test above that needs no substitute for an
+    /// absent key: with the key dropped, `groove eval` lands on `<kb_path>/.groove-eval.yml`,
+    /// a constant under the knowledge base the run uses -- no path or
+    /// environment is consulted, so an absent key has nothing safer to become.
+    #[test]
+    fn the_golden_rule_needs_no_substitute_for_a_key_that_is_absent() {
+        let dir = TempDir::new("groove-untrusted-no-golden-key");
+        std::fs::write(
+            dir.path().join("groove.toml"),
+            "kb_path = \"kb\"\n[eval]\nhistory_size = 3\n",
+        )
+        .unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        let eval = d.config.eval.as_ref().expect("[eval] survives");
+        assert!(
+            eval.golden.is_none(),
+            "an absent key stays absent; there is no safer value to write"
+        );
+        assert_eq!(eval.history_size, Some(3));
+    }
+
+    /// The other direction: the rule is about where the file was found, not
+    /// about the value. Without this, a rule that always reset `golden` would
+    /// pass both tests above.
+    #[test]
+    fn a_config_named_on_the_command_line_keeps_its_golden_file() {
+        let dir = TempDir::new("groove-trusted-golden");
+        let target = TempDir::new("groove-trusted-golden-target");
+        let chosen = target.path().join("mine.yml");
+        let toml = dir.path().join("groove.toml");
+        std::fs::write(&toml, planted_golden(&chosen)).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(Some(&toml), dir.path(), None, &roots)
+            .expect("--config is trusted, so nothing is refused");
+        assert_eq!(d.source, ConfigSource::Explicit);
+        assert_eq!(d.trust, ConfigTrust::Trusted);
+        let golden = d
+            .config
+            .eval
+            .as_ref()
+            .and_then(|e| e.golden.clone())
+            .expect("a named config keeps its golden file");
+        assert_eq!(golden, chosen);
+    }
+
     /// R4 keeps its own coverage now that R5 stands in front of it.
     ///
     /// After R5 no discovered config can enable a plugin language, so
@@ -4286,13 +4423,15 @@ lambda = 0.5
         .unwrap();
         let cfg = Config::load_from(&file).unwrap();
 
+        // (AV-41) The env-free seam: a `GROOVE_GRAMMAR_DIR` exported on the
+        // developer's machine must not decide either assertion below.
         assert!(
-            cfg.resolve_grammar_dir(&configured_kb).is_ok(),
+            cfg.resolve_grammar_dir_from(None, &configured_kb).is_ok(),
             "the directory is outside the knowledge base the config names"
         );
 
         let err = cfg
-            .resolve_grammar_dir(&actual_kb)
+            .resolve_grammar_dir_from(None, &actual_kb)
             .expect_err("the effective knowledge base contains the plugin directory");
         assert!(
             err.to_string()

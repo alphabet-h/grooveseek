@@ -86,6 +86,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   their target, a directory that does not exist yet is not refused, and a
   knowledge base whose `[parsers].enabled` needs no plugin is unaffected. See
   [ADR-0016](docs/decisions/0016-keep-the-plugin-directory-outside-the-knowledge-base.md).
+- **A config found rather than named can no longer choose the golden file.**
+  `[eval].golden` names the file `groove eval` and `groove tune` read, and as
+  an absolute path it could name any file on the machine; the trust rules left
+  it alone. From an untrusted config it is now dropped with a warning, and the
+  commands fall back to `<kb_path>/.groove-eval.yml` as they do when the key is
+  absent. What a planted path could have exposed was a bounded read (1 MiB)
+  surfaced through a YAML parse error, not code execution. `--golden`, and a
+  config named with `--config`, still choose the file. The `[eval]` key's
+  documentation also said the path was resolved against `kb_path`; it is
+  resolved against the config file's directory, as `kb_path` itself is.
 
 ## [1.5.0] - 2026-09-04
 
