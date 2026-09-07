@@ -2018,22 +2018,27 @@ impl Counter {
         /// than the next chunk's first, is asserted as well because its message is the one a
         /// reader can check against the source by eye.
         ///
+        /// Every generated definition is textually unique -- its identifier carries the token's
+        /// index -- because the witness is only as strong as the text is unambiguous: two
+        /// identical definitions on one line would let a chunk emitted twice match the second
+        /// occurrence instead of the first and pass as disjoint (codex P2 on PR #281).
+        ///
         /// Both fallbacks are reached: the smallest `scope_depth` refuses anything nested, and
         /// a `chunks` bound of one refuses any file with two definitions.
         #[test]
         fn prop_chunks_are_ordered_disjoint_and_within_the_chunk_bound(
             tokens in proptest::collection::vec(
                 proptest::sample::select(vec![
-                    "fn f(){}\n",
-                    "mod m{\n",
+                    "fn f{n}(){}\n",
+                    "mod m{n}{\n",
                     "}\n",
-                    "struct S;\n",
+                    "struct S{n};\n",
                     "// c\n",
                     "\n",
-                    "const X: u32 = 1;\n",
-                    "type T = u8;\n",
-                    "fn g(a: u32) -> u32 { a + 1 }",
-                    "pub fn h() {}",
+                    "const X{n}: u32 = 1;\n",
+                    "type T{n} = u8;\n",
+                    "fn g{n}(a: u32) -> u32 { a + 1 }",
+                    "pub fn h{n}() {}",
                 ]),
                 0..64,
             ),
@@ -2041,7 +2046,12 @@ impl Counter {
             scope_depth in 1usize..70,
             chunks in 1usize..600,
         ) {
-            let src: String = tokens.concat();
+            // `{n}` is the token's position in the sequence, so no two definitions share a name.
+            let src: String = tokens
+                .iter()
+                .enumerate()
+                .map(|(n, t)| t.replace("{n}", &n.to_string()))
+                .collect();
             let grammar = static_rust::grammar().expect("rust grammar builds");
             let doc = chunk_source_capped(
                 &grammar,
