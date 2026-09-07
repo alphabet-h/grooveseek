@@ -91,8 +91,9 @@ fn flat_embedding() -> Vec<f32> {
 /// where `groove index` hands it the model's.
 ///
 /// Nothing about how a chunk becomes a row is decided here: the quality profile, the
-/// `CodeMeta` and the context handling are the indexer's, so a change to how it forwards
-/// `line_range` or `symbol_kind` is a change to what this suite reads back. The path-derived
+/// [`grooveseek::db::CodeMeta`] and the context handling are the indexer's, so a change to
+/// how it forwards [`Chunk::line_range`] or [`Chunk::symbol_kind`] is a change to what this
+/// suite reads back. The path-derived
 /// topic and category are `None` because there is no directory to derive them from.
 fn store(db: &Database, rel: &str, parser: &dyn Parser, doc: &ParsedDocument) {
     let embeddings: Vec<Vec<f32>> = doc.chunks.iter().map(|_| flat_embedding()).collect();

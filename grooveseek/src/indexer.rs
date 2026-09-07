@@ -952,9 +952,10 @@ fn index_single_disk_entry(
 }
 
 /// Write a parsed document into the index: its `documents` row, then one chunk row per parsed
-/// chunk, scored under the quality profile the parser's kind and the chunk's `symbol_kind`
-/// decide and carrying the chunk's [`crate::parser::Chunk::line_range`] and
-/// [`crate::parser::Chunk::symbol_kind`] as [`crate::db::CodeMeta`].
+/// chunk, scored under the quality profile the parser's kind and the chunk's
+/// [`crate::parser::Chunk::symbol_kind`] decide and carrying the chunk's
+/// [`crate::parser::Chunk::line_range`] and [`crate::parser::Chunk::symbol_kind`] as
+/// [`crate::db::CodeMeta`].
 ///
 /// This is the one place a parsed chunk becomes a row. Indexing calls it with the embeddings
 /// the model produced; `tests/code_formats_light.rs` calls it with constants, so that what a
