@@ -15,6 +15,19 @@
 # The project root (2) and next to the binary (4) are the common choices. See
 # "Config file discovery" in docs/configuration.md for the full rules.
 #
+# TRUST DEPENDS ON WHERE THE FILE WAS FOUND. A file reached through (2) or (3)
+# was found, not named, so it is trusted only in part: everything about how the
+# knowledge base is presented is honoured, but the five settings that decide
+# which code runs, what leaves the machine and who can reach the server --
+# kb_path (in part), [parsers], grammar_dir, fastembed_cache_dir and the
+# [transport.http] gates -- are reset to safe defaults with a warning. Name the
+# file with `--config` (1) to have it honoured in full; (4) is trusted as well,
+# and so is a file that (2) or (3) finds inside the config home that
+# `groove service install` uses, since writing there already means owning the
+# installation. The startup log line `loaded config ... trust=...` says which
+# case applied.
+# See "Trusted and untrusted config locations" in docs/configuration.md.
+#
 # NOTHING HERE CHANGES BEHAVIOUR AS SHIPPED. Every value left uncommented below
 # is already the built-in default, and everything that would alter how groove
 # behaves is commented out — so a fresh copy is inert, and what you turn on is
@@ -52,7 +65,9 @@
 # difference: the file key is lower-case, and the upper-case name works only in
 # a real environment. Point it at a HuggingFace Hub cache you populated with
 # `hf download` to work around environments where fastembed's own TLS download
-# fails.
+# fails. Honoured only from a trusted config (see "TRUST" above): a file groove
+# found in the working directory or a `.git` ancestor has this key ignored with
+# a warning, because it selects which `.onnx` file is loaded.
 #fastembed_cache_dir = "/path/to/.cache/huggingface/hub"
 
 # Where grammar plugins live (v1.3.0+). Read ONLY when [parsers].enabled names a
@@ -66,6 +81,11 @@
 # the knowledge base is not a security boundary, so a directory inside it would
 # let anyone who can write there choose what this process runs; a run that needs
 # a plugin stops instead of loading from there (ADR-0016).
+#
+# Honoured only from a trusted config (see "TRUST" above): a file groove found
+# in the working directory or a `.git` ancestor has this key ignored with a
+# warning and the default location used, present or not, because the plugin it
+# points at is code that gets loaded into this process.
 #
 # Write the path with FORWARD SLASHES even on Windows: a backslash starts an
 # escape sequence in a TOML basic string, so "C:\Users\..." fails to parse.
@@ -180,7 +200,12 @@ kind = "stdio"
 # line below repeats. Note the asymmetry once you do switch to http: a
 # non-loopback `--bind` on the COMMAND LINE is refused unless you add
 # `--i-know`, whereas a non-loopback address set HERE is not gated, because a
-# config file is taken as a deliberate deployment decision. groove ships NO
+# config file you NAMED with `--config` is taken as a deliberate deployment
+# decision. That holds only for a trusted config (see "TRUST" above): from a
+# file groove found in the working directory or a `.git` ancestor, a
+# non-loopback bind is moved back to 127.0.0.1 (keeping the port), and
+# allowed_hosts, allowed_origins, healthz_public and max_sessions below are
+# dropped back to their defaults, each with a warning. groove ships NO
 # authentication of its own, so before exposing it to anything untrusted, set
 # `allowed_hosts` below and put a reverse proxy that does authenticate in front
 # of it.
