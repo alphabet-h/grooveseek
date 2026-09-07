@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
     long_about = concat!(
         "MCP server for semantic search over a knowledge base of Markdown\n",
         "files, plus plain-text, PDF and Office documents and source code\n",
-        "(Rust built in; Python and PHP via downloaded grammars), each opt-in\n",
-        "via [parsers].enabled.\n",
+        "(Rust in the default build; Python and PHP via downloaded grammars),\n",
+        "each opt-in via [parsers].enabled.\n",
         "\n",
         "Any of the options below can be provided via `groove.toml`. The file\n",
         "is discovered in priority order: --config <PATH>, then ./groove.toml,\n",
