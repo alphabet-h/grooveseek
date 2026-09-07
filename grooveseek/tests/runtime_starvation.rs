@@ -36,6 +36,18 @@ mod with_helpers {
     /// How long the main thread waits before measuring, to be sure the worker
     /// has actually entered the search handler.
     const SETTLE: Duration = Duration::from_millis(300);
+    /// How long `/healthz` may take while the search is stalled.
+    ///
+    /// A genuine wall-clock bound, not a wait that polling could replace: the
+    /// quantity under test is how long `/healthz` queues behind the stalled
+    /// search on a one-worker runtime. Derived from [`STALL`] and [`SETTLE`]
+    /// rather than chosen on its own: the failing case measures roughly
+    /// `STALL - SETTLE` (the part of the stall left after the main thread
+    /// stops settling, about 1200 ms), the passing case one local HTTP round
+    /// trip, so 400 ms leaves a wide margin on both sides -- a third of what a
+    /// starved runtime takes, and far above a healthy answer even on a loaded
+    /// CI box.
+    const HEALTHZ_BUDGET: Duration = Duration::from_millis(400);
 
     fn build_shared(prefix: &str) -> Arc<KbServerShared> {
         use common::temp::TempRoot;
@@ -151,7 +163,7 @@ mod with_helpers {
              would pass for the wrong reason."
         );
         assert!(
-            healthz_elapsed < Duration::from_millis(400),
+            healthz_elapsed < HEALTHZ_BUDGET,
             "/healthz waited {healthz_elapsed:?} behind a search that was \
              blocked for {search_elapsed:?}. Tool bodies are running on the \
              async workers again and starving the runtime (BU-06)."
