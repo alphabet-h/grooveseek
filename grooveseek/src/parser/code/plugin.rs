@@ -204,9 +204,14 @@ pub(crate) struct LoadedPlugin {
 
 /// Held across parking a checked parse table and handing it to tree-sitter.
 ///
-/// Two threads can build a parser registry at the same time -- an HTTP transport builds one per
-/// request that needs it -- and [`CHECKED_TABLE`] is one slot. Without this, one load could
-/// hand tree-sitter the other's table.
+/// [`CHECKED_TABLE`] is one process-wide slot, and this lock is what keeps two loaders from
+/// sharing it: without it, one [`load`] could hand tree-sitter the other's table. The binary
+/// does not race here today -- [`crate::config::Config::build_parser_registry`] runs once per
+/// process, and the HTTP transport's per-session factory
+/// ([`crate::server::KbServer::from_shared`]) clones the `Arc` around that one registry rather
+/// than building another. The lock stays because the slot is process-wide and the loader is
+/// not: in-process tests, or a future caller, can run two loads concurrently, and the
+/// handover must be correct for them too.
 static HANDOVER: Mutex<()> = Mutex::new(());
 
 /// The parse table [`load`] checked, waiting for the one call `Language::new` makes.
@@ -238,8 +243,11 @@ pub(crate) fn load(
     expected_extension: &'static str,
 ) -> std::result::Result<LoadedPlugin, Rejection> {
     // Absolute, because on Windows a relative path sends the loader through the current
-    // directory search order, and the whole point of the flags below is to not do that.
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    // directory search order, and the whole point of the flags below is to not do that. A path
+    // that cannot be made absolute is refused rather than handed over as it is: falling back to
+    // the relative path would be exactly the search the flags in `open_library` exist to
+    // prevent, so refusing here is what makes those flags meaningful.
+    let absolute = std::path::absolute(path).map_err(|e| Rejection::NotLoadable(format!("{e}")))?;
 
     let lib = open_library(&absolute)?;
 
@@ -610,6 +618,32 @@ mod tests {
                 !text.ends_with('.'),
                 "reasons are clauses, not sentences: {text}"
             );
+        }
+    }
+
+    /// A path that cannot be made absolute is refused, not handed to the loader as it is.
+    ///
+    /// The empty path is the one input `std::path::absolute` rejects on every platform, so it
+    /// exercises the refusal without a library on disk. The fallback this replaces would have
+    /// opened `""` relative to the cwd -- the search the loader flags exist to prevent -- and
+    /// the OS loader refuses that too, so "it failed" alone would not tell the two apart. The
+    /// payload has to be the error `std::path::absolute` gave, not the loader's.
+    #[test]
+    fn a_path_that_cannot_be_made_absolute_is_refused_before_the_loader_sees_it() {
+        let expected = std::path::absolute(Path::new(""))
+            .expect_err("std refuses to make the empty path absolute")
+            .to_string();
+        match load(Path::new(""), "py") {
+            Err(Rejection::NotLoadable(err)) => {
+                assert_eq!(
+                    err, expected,
+                    "the refusal must come from std::path::absolute, not from the loader"
+                );
+                let text = Rejection::NotLoadable(err).describe();
+                assert!(text.starts_with("it could not be loaded ("), "{text}");
+            }
+            Err(other) => panic!("expected NotLoadable, got {}", other.describe()),
+            Ok(_) => panic!("an empty path must not load"),
         }
     }
 
