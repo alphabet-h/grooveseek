@@ -9,14 +9,15 @@
 //!
 //! # What the light suite pins, by line
 //!
-//! The line numbers below are 1-based lines of [`SAMPLE_RS`] itself, counted from its first
+//! The line numbers below are 1-based lines of [`crate::common::code_fixtures::SAMPLE_RS`]
+//! itself, counted from its first
 //! `use` line. They are asserted literally, so a change to the fixture's shape is a change to
 //! those assertions and to `code_formats_cli.rs`'s "the range must start at the doc comment"
 //! check — which is the point: the numbers live here, next to the text they describe.
 //!
 //! | lines | what is there | the chunk it becomes |
 //! |---|---|---|
-//! | 1-2 | two `use` lines | a headingless gap chunk, no `symbol_kind` |
+//! | 1-2 | two `use` lines | a headingless gap chunk, no [`grooveseek::parser::Chunk::symbol_kind`] |
 //! | 4-6 | the `///` doc comment | pulled into the chunk below it |
 //! | 7-17 | `pub fn fuse_ranked_lists` | `function fuse_ranked_lists`, lines 4-17 |
 //! | 19-21 | `pub struct RankTable` | `class RankTable`, lines 19-21 |
