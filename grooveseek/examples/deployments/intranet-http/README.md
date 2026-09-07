@@ -57,7 +57,7 @@ machines on the same intranet over Streamable HTTP.
 
    **If clients connect from other machines, set
    `[transport.http].allowed_hosts` as well.** It defaults to loopback only
-   (`localhost`, `127.0.0.1`, `::1`) as a DNS-rebinding defence, so a LAN
+   (`localhost`, `127.0.0.1`, `[::1]`) as a DNS-rebinding defence, so a LAN
    client requesting `http://kb-server.lan:3100/mcp` is answered with 403 no
    matter what `bind` says. List every hostname / address clients put in
    their URL:

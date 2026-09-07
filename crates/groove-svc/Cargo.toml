@@ -2,7 +2,7 @@
 name = "groove-svc"
 version = "1.5.0"
 edition = "2024"
-description = "Windows hidden-console launcher for groove.exe serve (v0.9.1 hot-fix for visible terminal window via Task Scheduler)"
+description = "Windows hidden-console launcher for groove.exe serve"
 authors = ["koshian"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alphabet-h/grooveseek"

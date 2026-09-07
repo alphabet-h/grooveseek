@@ -56,7 +56,7 @@ writer 接続を保持。同じ社内 LAN の複数クライアントマシン�
 
    **他マシンから接続させるなら `[transport.http].allowed_hosts` も設定する。**
    既定は DNS rebinding 対策として loopback のみ (`localhost` / `127.0.0.1` /
-   `::1`) なので、`http://kb-server.lan:3100/mcp` を叩く LAN クライアントは
+   `[::1]`) なので、`http://kb-server.lan:3100/mcp` を叩く LAN クライアントは
    **`bind` を何にしても 403 になる**。クライアントが URL に書くホスト名 /
    アドレスをすべて列挙する:
 

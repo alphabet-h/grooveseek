@@ -2,7 +2,7 @@
 name = "groove-tray"
 version = "1.5.0"
 edition = "2024"
-description = "Windows system tray monitor for groove daemon (Phase 2 of F-6/H-9)"
+description = "Windows system tray monitor for groove daemon"
 authors = ["koshian"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alphabet-h/grooveseek"

@@ -2,7 +2,7 @@
 name = "grooveseek"
 version = "1.5.0"
 edition = "2024"
-description = "Semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a local knowledge base of Markdown, plain-text, PDF and Office documents, served over MCP or a web UI."
+description = "Semantic hybrid search (sqlite-vec + FTS5 with optional cross-encoder reranking) over a local knowledge base of Markdown, plain-text, PDF, Office documents and source code, served over MCP or a web UI."
 authors = ["koshian"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alphabet-h/grooveseek"
