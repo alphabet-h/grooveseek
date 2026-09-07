@@ -2014,7 +2014,12 @@ impl Counter {
         /// text there beginning with its content. Taking the *smallest* such offset for every
         /// chunk in turn is complete -- if the real ranges are sorted and disjoint, the walk
         /// succeeds -- so a failure is a real overlap or a real reordering, never a false
-        /// alarm. The line-level shadow of the same fact, that one chunk's last line is no later
+        /// alarm. The search stops *before* the next line's first byte: a range that begins
+        /// on the reported line begins at or before that line's newline, which [`line_of`]
+        /// counts as the last byte of the line, so even a gap chunk whose content opens with
+        /// that newline is admitted, while a chunk whose reported line slipped back by one
+        /// is not (codex P2 round 2 on PR #281). The line-level shadow of the same fact, that
+        /// one chunk's last line is no later
         /// than the next chunk's first, is asserted as well because its message is the one a
         /// reader can check against the source by eye.
         ///
@@ -2023,8 +2028,8 @@ impl Counter {
         /// identical definitions on one line would let a chunk emitted twice match the second
         /// occurrence instead of the first and pass as disjoint (codex P2 on PR #281).
         ///
-        /// Both fallbacks are reached: the smallest `scope_depth` refuses anything nested, and
-        /// a `chunks` bound of one refuses any file with two definitions.
+        /// Both fallbacks are reached: the smallest [`Bounds::scope_depth`] refuses anything
+        /// nested, and a [`Bounds::chunks`] of one refuses any file with two definitions.
         #[test]
         fn prop_chunks_are_ordered_disjoint_and_within_the_chunk_bound(
             tokens in proptest::collection::vec(
@@ -2091,7 +2096,7 @@ impl Counter {
                 prev_last_line = last;
 
                 let (line_from, line_to) = line_bounds(&starts, src.len(), first);
-                let witness = (line_from.max(min_end)..=line_to)
+                let witness = (line_from.max(min_end)..line_to)
                     .find(|&p| src.get(p..).is_some_and(|rest| rest.starts_with(&chunk.content)));
                 proptest::prop_assert!(
                     witness.is_some(),

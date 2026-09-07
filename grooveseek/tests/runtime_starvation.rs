@@ -40,7 +40,7 @@ mod with_helpers {
     ///
     /// A genuine wall-clock bound, not a wait that polling could replace: the
     /// quantity under test is how long `/healthz` queues behind the stalled
-    /// search on a one-worker runtime. Derived from the two constants above
+    /// search on a one-worker runtime. Derived from [`STALL`] and [`SETTLE`]
     /// rather than chosen on its own: the failing case measures roughly
     /// `STALL - SETTLE` (the part of the stall left after the main thread
     /// stops settling, about 1200 ms), the passing case one local HTTP round
