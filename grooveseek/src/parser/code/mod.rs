@@ -1727,7 +1727,8 @@ impl Counter {
     }
 
     /// A name that arrived as an owned `String` (a plugin's) is named in the refusal, and the
-    /// refusal is the one path on which `new` keeps nothing: the leak is after the compile.
+    /// refusal is the one path on which [`LoadedGrammar::new`] keeps nothing: the leak is after
+    /// the compile.
     #[test]
     fn an_owned_grammar_name_is_named_in_a_rejected_query() {
         let err = LoadedGrammar::new(
