@@ -249,9 +249,12 @@ harness = false
 # `path` is explicit and points **outside** `examples/`: that directory is the user-facing
 # recipe collection the docs link to, and the docs corpus guards walk it.
 #
-# Declaring any `[[example]]` turns off example autodiscovery for this package. Nothing is lost
-# today (`examples/` holds no `.rs`), but a `.rs` dropped in there later will not be built
-# unless it is named here too.
+# (AV-28) Declaring these does **not** turn off example autodiscovery: that was 2015-edition
+# behaviour, and this crate is edition 2024, where `autoexamples` stays on regardless. Measured
+# on 2026-09-07 — `cargo metadata --no-deps` with a `zzz_probe.rs` dropped in `examples/` lists
+# 23 example targets, the 22 named here plus the probe. So a `.rs` placed in `examples/` later
+# is built by `--all-targets` without a line here; what `examples/` holds today is recipes, not
+# Rust.
 [[example]]
 name = "groove_grammar_python"
 path = "tests/fixtures/grammar_plugins/valid.rs"

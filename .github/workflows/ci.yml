@@ -59,8 +59,15 @@ jobs:
       # build without it is a path nothing else exercises: `cargo test` runs
       # with default features. Checking it here is what keeps the id-resolution
       # branch for "known but not compiled in" compiling at all.
+      #
+      # (AV-27) `--all-targets`, because the lib is not the only thing that
+      # reads the feature: two integration tests and seven of the `[[example]]`
+      # grammar fixtures carry `cfg(feature = "grammar-rust")` too, and a
+      # lib-only check left every one of them uncompiled on this path. The
+      # fixtures that need the grammar are cfg-gated to an empty crate without
+      # it, so this stays a check of what the feature-off user can build.
       - name: cargo check (grammar feature off)
-        run: cargo check --no-default-features -p grooveseek
+        run: cargo check --no-default-features --all-targets -p grooveseek
       - name: Pre-warm embedding model cache (serial)
         # index_progress_cli spawns groove subprocesses that each need the
         # BGE-small model. On a cold cache, running them in parallel makes

@@ -430,7 +430,11 @@ jobs:
       #   - code reachable only from `#[ignore]` tests reads as 0% in this job,
       #     which pulls it *down* (see the exclusions below);
       #   - ~3,400 lines of Windows/macOS-only code are not in this leg's
-      #     denominator at all.
+      #     denominator at all. (AV-35) `crates/groove-tray` is the largest
+      #     single case: a Windows-only bin whose modules sit behind
+      #     `#[cfg(target_os = "windows")]`, so on this ubuntu leg none of its
+      #     files appear in the llvm-cov report and the floor never judges
+      #     them. A per-crate floor for it would need a windows-latest leg.
       # A global threshold is also satisfiable by adding tests to a module that
       # already has plenty, which is not the failure being guarded against.
       #

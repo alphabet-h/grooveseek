@@ -87,6 +87,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   knowledge base whose `[parsers].enabled` needs no plugin is unaffected. See
   [ADR-0016](docs/decisions/0016-keep-the-plugin-directory-outside-the-knowledge-base.md).
 
+### Internal
+
+- **A bare local `cargo clippy` / `cargo build` / `cargo test` now answers the same as CI** (AV-26). The workspace manifest sets rustc `warnings` and `clippy::all` to deny, so a warning is an error locally without `-- -D warnings`; a toolchain update can therefore stop a local build the same day it stops CI.
+- **The feature-off check in CI covers every target** (AV-27). `cargo check --no-default-features -p grooveseek` now runs with `--all-targets`, so the tests and grammar fixtures that carry `cfg(feature = "grammar-rust")` are compiled on that path too instead of only the library.
+
 ## [1.5.0] - 2026-09-04
 
 ### Added
