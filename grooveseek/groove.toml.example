@@ -21,8 +21,11 @@
 # which code runs, what leaves the machine and who can reach the server --
 # kb_path (in part), [parsers], grammar_dir, fastembed_cache_dir and the
 # [transport.http] gates -- are reset to safe defaults with a warning. Name the
-# file with `--config` (1) to have it honoured in full; (4) is trusted as well.
-# The startup log line `loaded config ... trust=...` says which case applied.
+# file with `--config` (1) to have it honoured in full; (4) is trusted as well,
+# and so is a file that (2) or (3) finds inside the config home that
+# `groove service install` uses, since writing there already means owning the
+# installation. The startup log line `loaded config ... trust=...` says which
+# case applied.
 # See "Trusted and untrusted config locations" in docs/configuration.md.
 #
 # NOTHING HERE CHANGES BEHAVIOUR AS SHIPPED. Every value left uncommented below
