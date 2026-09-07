@@ -17,10 +17,11 @@
 #
 # TRUST DEPENDS ON WHERE THE FILE WAS FOUND. A file reached through (2) or (3)
 # was found, not named, so it is trusted only in part: everything about how the
-# knowledge base is presented is honoured, but the five settings that decide
-# which code runs, what leaves the machine and who can reach the server --
-# kb_path (in part), [parsers], grammar_dir, fastembed_cache_dir and the
-# [transport.http] gates -- are reset to safe defaults with a warning. Name the
+# knowledge base is presented is honoured, but the six settings that decide
+# which code runs, what is read or leaves the machine and who can reach the
+# server -- kb_path (in part), [parsers], grammar_dir, fastembed_cache_dir,
+# [eval].golden and the [transport.http] gates -- are reset to safe defaults
+# with a warning. Name the
 # file with `--config` (1) to have it honoured in full; (4) is trusted as well,
 # and so is a file that (2) or (3) finds inside the config home that
 # `groove service install` uses, since writing there already means owning the
@@ -286,6 +287,11 @@ bind = "127.0.0.1:3100"
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------
 # Only needed if you run `groove eval`. See docs/eval.md. The commented values
 # are the built-in defaults.
+#
+# `golden` is resolved relative to this file, or absolute. Honoured only from a
+# trusted config (see "TRUST" above): a file groove found in the working
+# directory or a `.git` ancestor has it ignored with a warning, because it names
+# the file `groove eval` reads; `--golden` still applies.
 [eval]
 #golden = ".groove-eval.yml"    # default: <kb_path>/.groove-eval.yml
 #history_size = 10              # default: 10
