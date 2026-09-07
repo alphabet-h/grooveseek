@@ -166,7 +166,7 @@ fn watcher_reloads_grooveseekignore_while_running() {
     std::fs::write(&cfg_path, "[watch]\nenabled = true\ndebounce_ms = 500\n")
         .expect("write groove.toml");
 
-    let (_guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
+    let (guard, base) = spawn_mcp_server_with_watch(layout.kb(), &cfg_path);
     let session = mcp_initialize(&base);
 
     // The server started without one, so this write is the reload.
@@ -177,7 +177,28 @@ fn watcher_reloads_grooveseekignore_while_running() {
     // but a note landing in an *earlier* batch than the ignore file would be
     // indexed, and the failure would look like a broken reload rather than a
     // racy fixture.
-    sleep(Duration::from_millis(2000));
+    //
+    // (AV-32) Waited for, not slept through. `.grooveignore` has no parser, so
+    // `search` cannot show the reload — but the watcher says it on stderr the
+    // moment `reload_rules` has run, and that line is written from inside the
+    // batch that carried the ignore file, so seeing it means that batch is
+    // closed and the writes below cannot fall into it. A fixed 2 s was four
+    // debounce windows on a fast host and no guarantee on a slow one; this
+    // takes the same 8 s budget as the search polls and fails loudly instead of
+    // quietly landing the fixture in the wrong batch.
+    let reload_line = "watcher: reloaded .grooveignore";
+    let deadline = Duration::from_millis(8000);
+    let poll_interval = Duration::from_millis(250);
+    let start = Instant::now();
+    while !guard.stderr().contains(reload_line) {
+        assert!(
+            start.elapsed() < deadline,
+            "the watcher never reported reloading .grooveignore within {deadline:?}; \
+             stderr so far: {:?}",
+            guard.stderr().lines()
+        );
+        sleep(poll_interval);
+    }
 
     // Both bodies have to be substantial. The per-chunk quality filter is on by
     // default at threshold 0.3, and a one-line section under 30 characters

@@ -1972,4 +1972,178 @@ impl Counter {
             doc.chunks.iter().map(|c| &c.heading).collect::<Vec<_>>()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // (AV-33) chunk-range invariants, over generated sources rather than fixtures
+    // -----------------------------------------------------------------------
+
+    /// Byte offset where 1-based line `line` starts, and where the line after it starts.
+    fn line_bounds(starts: &[usize], text_len: usize, line: u32) -> (usize, usize) {
+        let idx = usize::try_from(line)
+            .expect("u32 fits usize")
+            .saturating_sub(1);
+        let from = starts.get(idx).copied().unwrap_or(text_len);
+        let to = starts.get(idx + 1).copied().unwrap_or(text_len);
+        (from, to)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// Over any Rust-flavoured source and any pair of bounds, the chunks come back in file
+        /// order, do not overlap, describe a line range that runs forwards, and never outnumber
+        /// the chunk bound.
+        ///
+        /// The example tests around this one each pin **one** fixture through **one** path
+        /// (definition chunking, the scope fallback, the chunk-count fallback, the thin-piece
+        /// merges). None of them says anything about what the pieces look like relative to
+        /// *each other*, and the pieces are assembled by four writers ([`emit_def`],
+        /// [`push_interstitial`], [`fill_gaps`], [`line_chunk_whole_file`]) that only meet in
+        /// [`settle`] -- an off-by-one in any one of them is an overlap the fixtures cannot
+        /// reach because it needs a particular neighbour. Generating the neighbours is what
+        /// this test is for.
+        ///
+        /// A [`Chunk`] exposes no byte range, only [`Chunk::line_range`] and [`Chunk::content`],
+        /// so the byte-level claim is checked through a witness instead: the content is the
+        /// range's text with the end trimmed, so each chunk has to start somewhere on its own
+        /// start line, at or past
+        /// the smallest end its predecessor can have (its start plus its content), with the
+        /// text there beginning with its content. Taking the *smallest* such offset for every
+        /// chunk in turn is complete -- if the real ranges are sorted and disjoint, the walk
+        /// succeeds -- so a failure is a real overlap or a real reordering, never a false
+        /// alarm. The line-level shadow of the same fact, that one chunk's last line is no later
+        /// than the next chunk's first, is asserted as well because its message is the one a
+        /// reader can check against the source by eye.
+        ///
+        /// Both fallbacks are reached: the smallest `scope_depth` refuses anything nested, and
+        /// a `chunks` bound of one refuses any file with two definitions.
+        #[test]
+        fn prop_chunks_are_ordered_disjoint_and_within_the_chunk_bound(
+            tokens in proptest::collection::vec(
+                proptest::sample::select(vec![
+                    "fn f(){}\n",
+                    "mod m{\n",
+                    "}\n",
+                    "struct S;\n",
+                    "// c\n",
+                    "\n",
+                    "const X: u32 = 1;\n",
+                    "type T = u8;\n",
+                    "fn g(a: u32) -> u32 { a + 1 }",
+                    "pub fn h() {}",
+                ]),
+                0..64,
+            ),
+            budget in 1usize..4000,
+            scope_depth in 1usize..70,
+            chunks in 1usize..600,
+        ) {
+            let src: String = tokens.concat();
+            let grammar = static_rust::grammar().expect("rust grammar builds");
+            let doc = chunk_source_capped(
+                &grammar,
+                budget,
+                src.as_bytes(),
+                &src,
+                "src/lib.rs",
+                Bounds { scope_depth, chunks },
+            )
+            .expect("a generated file still parses");
+
+            proptest::prop_assert!(
+                doc.chunks.len() <= chunks,
+                "{} chunks came back under a bound of {chunks} (source {src:?})",
+                doc.chunks.len()
+            );
+
+            let starts = line_starts(&src);
+            let mut min_end = 0usize;
+            let mut prev_last_line = 1u32;
+            for (i, chunk) in doc.chunks.iter().enumerate() {
+                proptest::prop_assert!(
+                    chunk.line_range.is_some(),
+                    "chunk {i} has no line range (source {src:?})"
+                );
+                let (first, last) = chunk.line_range.expect("asserted above");
+                proptest::prop_assert!(
+                    first <= last,
+                    "chunk {i} runs backwards, lines {first}..{last} (source {src:?})"
+                );
+                proptest::prop_assert!(
+                    prev_last_line <= first,
+                    "chunk {i} starts on line {first}, before chunk {} ended on line \
+                     {prev_last_line} (source {src:?})",
+                    i.wrapping_sub(1)
+                );
+                prev_last_line = last;
+
+                let (line_from, line_to) = line_bounds(&starts, src.len(), first);
+                let witness = (line_from.max(min_end)..=line_to)
+                    .find(|&p| src.get(p..).is_some_and(|rest| rest.starts_with(&chunk.content)));
+                proptest::prop_assert!(
+                    witness.is_some(),
+                    "chunk {i} ({:?}) fits nowhere on its line {first} at or past byte \
+                     {min_end}, where the chunk before it ends at the earliest (source {src:?})",
+                    chunk.content
+                );
+                min_end = witness.expect("asserted above") + chunk.content.len();
+            }
+        }
+    }
+}
+
+/// [`line_of`] needs no grammar, so its property lives outside the gated module and runs
+/// under every feature set.
+#[cfg(test)]
+mod line_props {
+    use super::{line_of, line_starts};
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// [`line_of`] is one plus the newlines before the offset, is never below one, and
+        /// never decreases as the offset grows -- for offsets past the end of the text as well,
+        /// which the chunker reaches through `range.end.saturating_sub(1)` on a range that ends
+        /// at `text.len()`.
+        ///
+        /// The example tests exercise [`line_of`] only through whole chunks whose ranges land
+        /// on definition boundaries; the binary search inside it has two arms (`Ok` for an
+        /// offset that *is* a line start, `Err` for one inside a line) and the fixtures do not
+        /// say which arm they took. Generated offsets land on both, on the first byte of the
+        /// text, on the last, and beyond it.
+        #[test]
+        fn prop_line_of_counts_newlines_and_is_monotone(
+            s in "[\\PC\\n]{0,512}",
+            off in 0usize..600,
+            step in 0usize..600,
+        ) {
+            let starts = line_starts(&s);
+            let seen = s.as_bytes()[..off.min(s.len())]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count();
+            let line = line_of(&starts, off);
+            proptest::prop_assert!(line >= 1, "line numbers are 1-based, got {line}");
+            proptest::prop_assert_eq!(
+                usize::try_from(line).expect("u32 fits usize"),
+                seen + 1,
+                "offset {} of {:?}",
+                off,
+                s
+            );
+            proptest::prop_assert!(
+                line <= line_of(&starts, off + step),
+                "line_of went backwards between offsets {} and {} in {:?}",
+                off,
+                off + step,
+                s
+            );
+        }
+    }
 }
