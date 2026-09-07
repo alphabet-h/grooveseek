@@ -28,6 +28,10 @@
 //!   reading the run back. Shared by the prose retrieval gate
 //!   (`eval_corpus_quality.rs`) and the code one (`code_eval_quality.rs`).
 //!   How a golden is grouped and where its floors sit stays with each gate.
+//! - [`crate::common::code_fixtures`] — the source file and the configurations the
+//!   code-parser tests read. Shared by the `#[ignore]` end-to-end suite
+//!   (`code_formats_cli.rs`) and the in-process one that runs on every pull
+//!   request (`code_formats_light.rs`, AV-16).
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -36,6 +40,7 @@
 #![allow(dead_code)] // helpers are referenced lazily from individual integration tests
 
 pub mod ansi;
+pub mod code_fixtures;
 pub mod docs;
 pub mod eval_gate;
 pub mod mcp;

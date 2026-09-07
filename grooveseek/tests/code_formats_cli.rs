@@ -13,48 +13,12 @@ use std::path::Path;
 use std::process::Command;
 
 mod common;
+// The source file and the two configurations are shared with `tests/code_formats_light.rs`,
+// which runs the same file through the parser and the database in-process on every pull
+// request (AV-16). The line numbers that suite asserts are documented beside the fixture.
+use common::code_fixtures::{PARSERS_DEFAULT, PARSERS_MD_RS, SAMPLE_MD, SAMPLE_RS};
 use common::mcp::grooveseek_bin;
 use common::temp::TempKbLayout;
-
-/// Opts the `rs` parser in alongside the always-on default `md`.
-const PARSERS_MD_RS: &str =
-    "model = \"bge-small-en-v1.5\"\n[parsers]\nenabled = [\"md\", \"rs\"]\n";
-
-/// No `[parsers]` section, so the registry falls back to `["md"]` only.
-const PARSERS_DEFAULT: &str = "model = \"bge-small-en-v1.5\"\n";
-
-/// A file with one documented function, one struct and one `impl` block.
-///
-/// `reciprocal_fusion_weight` is a term that appears only inside a function body, so a hit on
-/// it can only have come from a code chunk.
-const SAMPLE_RS: &str = r#"use std::collections::BTreeMap;
-use std::fmt::Debug;
-
-/// Combines two ranked lists into one.
-///
-/// The doc comment is part of the definition's chunk, not of the imports above it.
-pub fn fuse_ranked_lists(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let reciprocal_fusion_weight = 60;
-    let mut out = Vec::new();
-    for (rank, id) in a.iter().enumerate() {
-        out.push(id + rank + reciprocal_fusion_weight);
-    }
-    for (rank, id) in b.iter().enumerate() {
-        out.push(id + rank + reciprocal_fusion_weight);
-    }
-    out
-}
-
-pub struct RankTable {
-    rows: BTreeMap<usize, usize>,
-}
-
-impl RankTable {
-    pub fn insert_row(&mut self, key: usize, value: usize) {
-        self.rows.insert(key, value);
-    }
-}
-"#;
 
 /// Definitions that are one line, shorter than the quality filter's short-content threshold,
 /// and carry no doc comment — the exact shape AV-07 is about. `mod shard;` names nothing but
@@ -67,8 +31,6 @@ impl RankTable {
 /// path instead and, under 30 characters, is dropped there. Python is the language where
 /// short constants are definitions — see `grammar_plugin_cli.rs`.
 const SHORT_DEFS_RS: &str = "pub mod shard;\n\ntype ShardId = u64;\n";
-
-const SAMPLE_MD: &str = "---\ntitle: Fusion notes\n---\n\n## Reciprocal rank fusion\n\nThe prose page also talks about reciprocal fusion weight, at length, so that a search for it\nhas something to find in both halves of the knowledge base and the two can be told apart by\nwhat the response carries rather than by which one happened to win.\n";
 
 fn write_config(layout: &TempKbLayout, body: &str) -> std::path::PathBuf {
     let cfg = layout.root().join("groove.toml");

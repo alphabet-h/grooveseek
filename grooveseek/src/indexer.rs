@@ -932,15 +932,77 @@ fn index_single_disk_entry(
     // mismatch on the 3rd chunk) rolls the whole file back instead of
     // leaving a documents row with M < N chunks.
     let tx = db.begin_transaction()?;
-    let doc_id = db.upsert_document(
+    write_parsed_document(
+        db,
         &entry.rel,
-        parsed.frontmatter.title.as_deref(),
-        parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
+        &parsed,
+        parser,
+        &embeddings,
+        context_mode,
+        &entry.hash,
+        size_bytes,
+        topic.as_deref(),
         category.as_deref(),
+    )?;
+    tx.commit()?;
+
+    Ok(SingleResult::Updated {
+        chunks: parsed.chunks.len() as u32,
+    })
+}
+
+/// Write a parsed document into the index: its `documents` row, then one chunk row per parsed
+/// chunk, scored under the quality profile the parser's kind and the chunk's
+/// [`crate::parser::Chunk::symbol_kind`] decide and carrying the chunk's
+/// [`crate::parser::Chunk::line_range`] and [`crate::parser::Chunk::symbol_kind`] as
+/// [`crate::db::CodeMeta`].
+///
+/// This is the one place a parsed chunk becomes a row. Indexing calls it with the embeddings
+/// the model produced; `tests/code_formats_light.rs` calls it with constants, so that what a
+/// pull request checks is the same write path the binary runs and not a copy of it (codex P1
+/// on PR #273, under `AGENTS.md`'s "One question gets one implementation"). Anything the
+/// indexer decides *before* a chunk is written — the unchanged check, the frontmatter-only
+/// update, reading and parsing the file — stays with the indexer; anything about how a chunk
+/// is written belongs here.
+///
+/// `embeddings` holds one vector per chunk, in chunk order; a mismatch is an error rather
+/// than a silent truncation, since a document whose last chunks were never written would
+/// pass every count that reads `documents` and fail only a search for what they held.
+///
+/// The transaction is the caller's: the two write helpers this uses are autocommit-aware,
+/// so a caller that wants the file written atomically opens one around the call (indexing
+/// does) and a caller that does not, need not.
+///
+/// `topic` and `category` are the values derived from the path ([`extract_category_topic`]);
+/// a topic in the frontmatter wins over the derived one, as it always has.
+#[allow(clippy::too_many_arguments)]
+pub fn write_parsed_document(
+    db: &Database,
+    rel: &str,
+    parsed: &crate::parser::ParsedDocument,
+    parser: &dyn crate::parser::Parser,
+    embeddings: &[Vec<f32>],
+    context_mode: ContextMode,
+    content_hash: &str,
+    size_bytes: u64,
+    topic: Option<&str>,
+    category: Option<&str>,
+) -> Result<i64> {
+    anyhow::ensure!(
+        embeddings.len() == parsed.chunks.len(),
+        "{rel}: {} chunks but {} embeddings",
+        parsed.chunks.len(),
+        embeddings.len()
+    );
+    let doc_id = db.upsert_document(
+        rel,
+        parsed.frontmatter.title.as_deref(),
+        parsed.frontmatter.topic.as_deref().or(topic),
+        category,
         parsed.frontmatter.depth.as_deref(),
         &parsed.frontmatter.tags,
         parsed.frontmatter.date.as_deref(),
-        &entry.hash,
+        content_hash,
         size_bytes,
     )?;
 
@@ -969,11 +1031,7 @@ fn index_single_disk_entry(
             },
         )?;
     }
-    tx.commit()?;
-
-    Ok(SingleResult::Updated {
-        chunks: parsed.chunks.len() as u32,
-    })
+    Ok(doc_id)
 }
 
 // ---------------------------------------------------------------------------
