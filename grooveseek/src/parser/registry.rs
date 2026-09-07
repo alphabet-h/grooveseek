@@ -263,29 +263,27 @@ impl Registry {
     /// Build a Registry from a list of parser ids (from `[parsers].enabled`).
     /// Unknown ids fail loudly — this catches typos (`"markdown"` instead of
     /// `"md"`) and parsers that don't exist yet (`"rst"` / `"adoc"`).
-    pub fn from_enabled(ids: &[String]) -> Result<Self> {
-        Self::from_enabled_with_code(ids, &CodeParsersConfig::default())
-    }
-
-    /// Same, with the `[parsers.code]` settings a code parser needs.
     ///
-    /// A separate constructor rather than a parameter on [`Registry::from_enabled`] so that
-    /// the existing one keeps its meaning — "build from ids alone" — for the callers and
-    /// tests that have no configuration to hand.
-    pub fn from_enabled_with_code(ids: &[String], code: &CodeParsersConfig) -> Result<Self> {
-        Self::from_enabled_with_plugins(ids, code, None)
+    /// This is "build from ids alone": default `[parsers.code]` settings and no plugin
+    /// directory, for the callers and tests that have no configuration to hand. Everything
+    /// that does have one goes through [`Self::from_enabled_with_plugins`], of which this is
+    /// the ids-only shorthand.
+    pub fn from_enabled(ids: &[String]) -> Result<Self> {
+        Self::from_enabled_with_plugins(ids, &CodeParsersConfig::default(), None)
     }
 
-    /// Same again, with the directory grammar plugins are loaded from.
+    /// Same, with the `[parsers.code]` settings a code parser needs and the directory grammar
+    /// plugins are loaded from.
     ///
     /// `plugins` is `None` for "no directory could be worked out", which is the state
     /// [`plugin_dir_undecidable_message`] describes — not "there is no directory to look in".
     /// It is consulted lazily: an `enabled` list this build resolves on its own never reaches
     /// the filesystem, whatever command is running.
     ///
-    /// A third constructor rather than a parameter on the other two, for the reason the second
-    /// exists: the callers and tests that have no configuration to hand keep a constructor
-    /// whose meaning has not changed.
+    /// A separate constructor rather than parameters on [`Self::from_enabled`] so that the
+    /// existing one keeps its meaning — "build from ids alone" — for the callers and tests
+    /// that have no configuration to hand. There used to be a middle rung taking only `code`;
+    /// it had no caller but [`Self::from_enabled`] and was folded into this one.
     pub fn from_enabled_with_plugins(
         ids: &[String],
         code: &CodeParsersConfig,
