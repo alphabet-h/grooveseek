@@ -13,8 +13,8 @@
 //!   [`grooveseek::config::Config::build_parser_registry`] the binary calls, rather than from
 //!   a private constructor;
 //! - a chunk's [`grooveseek::parser::Chunk::line_range`] /
-//!   [`grooveseek::parser::Chunk::symbol_kind`] surviving
-//!   [`grooveseek::db::Database::insert_chunk_with_code`] and coming back out of
+//!   [`grooveseek::parser::Chunk::symbol_kind`] surviving the indexer's own write path,
+//!   [`grooveseek::indexer::write_parsed_document`], and coming back out of
 //!   [`grooveseek::db::Database::search_hybrid`] as [`grooveseek::db::SearchResult::start_line`]
 //!   / [`grooveseek::db::SearchResult::end_line`] / [`grooveseek::db::SearchResult::symbol_kind`]
 //!   — the SQLite round trip the heavy suite's module doc names as the thing unit tests
@@ -34,9 +34,9 @@ use common::code_fixtures::{PARSERS_DEFAULT, PARSERS_MD_RS, SAMPLE_MD, SAMPLE_RS
 use common::temp::TempKbLayout;
 
 use grooveseek::config::Config;
-use grooveseek::db::{CodeMeta, Database, FusionParams, SearchFilters, SearchResult};
+use grooveseek::db::{ContextMode, Database, FusionParams, SearchFilters, SearchResult};
+use grooveseek::indexer::write_parsed_document;
 use grooveseek::parser::{Chunk, ParsedDocument, Parser, ParserExt, Registry};
-use grooveseek::quality::{QualityProfile, chunk_quality_score};
 
 /// The dimension [`Database::verify_embedding_meta`] is told below; every vector in this file
 /// has it.
@@ -86,54 +86,29 @@ fn flat_embedding() -> Vec<f32> {
     vec![0.1; DIM]
 }
 
-/// Write a parsed document the way `groove index` does, minus the embedder.
+/// Write a parsed document through the indexer's own write path,
+/// [`grooveseek::indexer::write_parsed_document`], handing it one constant vector per chunk
+/// where `groove index` hands it the model's.
 ///
-/// This mirrors the per-chunk loop of `index_single_disk_entry`, a private function of
-/// [`grooveseek::indexer`]: the quality profile from [`Parser::is_binary`] and
-/// [`Chunk::symbol_kind`], then [`Database::insert_chunk_with_code`] with the chunk's
-/// [`Chunk::line_range`] and [`Chunk::symbol_kind`]. It is a second copy of that loop, kept
-/// because the indexer takes its embeddings from a model-backed
-/// [`grooveseek::embedder::Embedder`] with no seam to hand it constants. If the indexer
-/// changes how it fills [`CodeMeta`], this helper keeps writing the old shape and this suite
-/// keeps passing on it — the drift is the price of running without the model, and this
-/// comment is where it is written down.
+/// Nothing about how a chunk becomes a row is decided here: the quality profile, the
+/// `CodeMeta` and the context handling are the indexer's, so a change to how it forwards
+/// `line_range` or `symbol_kind` is a change to what this suite reads back. The path-derived
+/// topic and category are `None` because there is no directory to derive them from.
 fn store(db: &Database, rel: &str, parser: &dyn Parser, doc: &ParsedDocument) {
-    let fm = &doc.frontmatter;
-    let doc_id = db
-        .upsert_document(
-            rel,
-            fm.title.as_deref(),
-            fm.topic.as_deref(),
-            None,
-            fm.depth.as_deref(),
-            &fm.tags,
-            fm.date.as_deref(),
-            "hash",
-            doc.raw_content.len() as u64,
-        )
-        .unwrap_or_else(|e| panic!("upsert {rel}: {e}"));
-    for chunk in &doc.chunks {
-        let score = chunk_quality_score(
-            chunk.heading.as_deref(),
-            &chunk.content,
-            QualityProfile::of(parser.is_binary(), chunk.symbol_kind.is_some()),
-        );
-        db.insert_chunk_with_code(
-            doc_id,
-            chunk.index as i32,
-            chunk.heading.as_deref(),
-            chunk.level,
-            &chunk.content,
-            chunk.context.as_deref(),
-            &flat_embedding(),
-            score,
-            CodeMeta {
-                line_range: chunk.line_range,
-                symbol_kind: chunk.symbol_kind.as_deref(),
-            },
-        )
-        .unwrap_or_else(|e| panic!("insert chunk {} of {rel}: {e}", chunk.index));
-    }
+    let embeddings: Vec<Vec<f32>> = doc.chunks.iter().map(|_| flat_embedding()).collect();
+    write_parsed_document(
+        db,
+        rel,
+        doc,
+        parser,
+        &embeddings,
+        ContextMode::Off,
+        "hash",
+        doc.raw_content.len() as u64,
+        None,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("write {rel}: {e}"));
 }
 
 fn hit_headed<'h>(hits: &'h [SearchResult], heading: &str) -> &'h SearchResult {
