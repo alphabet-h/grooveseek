@@ -2018,7 +2018,11 @@ impl Counter {
         /// on the reported line begins at or before that line's newline, which [`line_of`]
         /// counts as the last byte of the line, so even a gap chunk whose content opens with
         /// that newline is admitted, while a chunk whose reported line slipped back by one
-        /// is not (codex P2 round 2 on PR #281). The line-level shadow of the same fact, that
+        /// is not (codex P2 round 2 on PR #281). The end line is tied to the witness as well:
+        /// no earlier than the line holding the content's last byte, no later than the line
+        /// where the whitespace after it runs out -- a pair rather than an equality because
+        /// [`Chunk::content`] is the piece with its end trimmed, so the exact end byte is not
+        /// recoverable (codex P2 round 3). The line-level shadow of the same fact, that
         /// one chunk's last line is no later
         /// than the next chunk's first, is asserted as well because its message is the one a
         /// reader can check against the source by eye.
@@ -2095,16 +2099,39 @@ impl Counter {
                 );
                 prev_last_line = last;
 
-                let (line_from, line_to) = line_bounds(&starts, src.len(), first);
-                let witness = (line_from.max(min_end)..line_to)
-                    .find(|&p| src.get(p..).is_some_and(|rest| rest.starts_with(&chunk.content)));
                 proptest::prop_assert!(
-                    witness.is_some(),
+                    !chunk.content.is_empty(),
+                    "chunk {i} has no content (source {src:?})"
+                );
+                let (line_from, line_to) = line_bounds(&starts, src.len(), first);
+                let candidates: Vec<usize> = (line_from.max(min_end)..line_to)
+                    .filter(|&p| src.get(p..).is_some_and(|rest| rest.starts_with(&chunk.content)))
+                    .collect();
+                proptest::prop_assert!(
+                    !candidates.is_empty(),
                     "chunk {i} ({:?}) fits nowhere on its line {first} at or past byte \
                      {min_end}, where the chunk before it ends at the earliest (source {src:?})",
                     chunk.content
                 );
-                min_end = witness.expect("asserted above") + chunk.content.len();
+                let witness = candidates[0];
+                // The piece ended somewhere in the whitespace after its content, so the reported
+                // end line is at least the line of the content's last byte and at most the line
+                // where that whitespace run stops -- measured from the last candidate, which
+                // reaches furthest.
+                let floor = line_of(&starts, witness + chunk.content.len() - 1);
+                let run_from = candidates[candidates.len() - 1] + chunk.content.len();
+                let run_to = src
+                    .get(run_from..)
+                    .and_then(|rest| rest.find(|c: char| !c.is_whitespace()))
+                    .map_or(src.len(), |k| run_from + k);
+                let ceiling = line_of(&starts, run_to.saturating_sub(1));
+                proptest::prop_assert!(
+                    floor <= last && last <= ceiling,
+                    "chunk {i} ({:?}) reports its end on line {last}, but its content ends on \
+                     line {floor} and the whitespace after it on line {ceiling} (source {src:?})",
+                    chunk.content
+                );
+                min_end = witness + chunk.content.len();
             }
         }
     }
