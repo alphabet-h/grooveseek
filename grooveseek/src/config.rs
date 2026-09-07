@@ -3789,8 +3789,8 @@ lambda = 0.5
         );
     }
 
-    /// Same reasoning as `the_parser_rule_needs_no_substitute_for_a_key_that_is_absent`:
-    /// with the key dropped, `groove eval` lands on `<kb_path>/.groove-eval.yml`,
+    /// Same reasoning as the parser-rule test above that needs no substitute for an
+    /// absent key: with the key dropped, `groove eval` lands on `<kb_path>/.groove-eval.yml`,
     /// a constant under the knowledge base the run uses -- no path or
     /// environment is consulted, so an absent key has nothing safer to become.
     #[test]
