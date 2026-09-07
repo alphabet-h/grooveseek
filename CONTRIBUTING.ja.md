@@ -42,7 +42,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-helpers,heavy-bench -- -D warnings
 cargo check --all-targets
-cargo check --no-default-features --all-targets -p grooveseek   # Rust grammar 無しのビルド
+cargo check --no-default-features -p grooveseek                 # Rust grammar 無しのビルド
+cargo check --no-default-features --all-targets -p grooveseek   # そのテストと fixture も
 cargo test --test index_progress_cli -- --test-threads=1   # 先に、シングルスレッドで
 cargo test
 cargo doc --no-deps --workspace --all-features --document-private-items

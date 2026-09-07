@@ -432,9 +432,12 @@ jobs:
       #   - ~3,400 lines of Windows/macOS-only code are not in this leg's
       #     denominator at all. (AV-35) `crates/groove-tray` is the largest
       #     single case: a Windows-only bin whose modules sit behind
-      #     `#[cfg(target_os = "windows")]`, so on this ubuntu leg none of its
-      #     files appear in the llvm-cov report and the floor never judges
-      #     them. A per-crate floor for it would need a windows-latest leg.
+      #     `#[cfg(target_os = "windows")]`. On this ubuntu leg those modules
+      #     are never compiled, so they have no entry in the llvm-cov report;
+      #     the one file that does compile here is the non-Windows stub in
+      #     `main.rs`, and that file is named in IGNORE below. So the floor
+      #     never judges the crate: the Windows half is absent, the stub is
+      #     excluded. A per-crate floor for it would need a windows-latest leg.
       # A global threshold is also satisfiable by adding tests to a module that
       # already has plenty, which is not the failure being guarded against.
       #
