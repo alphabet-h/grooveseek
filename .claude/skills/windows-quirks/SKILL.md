@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation while symlinks do, and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a log line when the same event announces itself from two different sites so the assertion passes on one OS and fails on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a log line when the same event announces itself from two different sites so the assertion passes on one OS and fails on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -553,8 +553,12 @@ io.open(p, "wb").write(raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 ## 18. パス比較で片側だけ `canonicalize` すると検査が黙って素通りする (`\\?\` prefix と 8.3 短縮名)
 
 **症状**: 「`grammar_dir` が KB の中にあるか」を `Path::starts_with` で見る検査が、Windows だけ
-**false を返して KB 内の plugin dir を通す**。エラーも警告も出ない。Linux では字面がそのまま
-prefix になるので**再現しない** — Windows だけで黙って通る検査ができる。
+**false を返して KB 内の plugin dir を通す**。エラーも警告も出ない。**素の path で比べる限り**
+Linux では字面がそのまま prefix になるので再現しない — Windows だけで黙って通る検査ができる。
+ただし「片側だけ canonicalize」の失敗そのものは Windows 限定ではない: KB を symlink の alias で
+名指しし、未作成の plugin path が元の綴りのままなら、Unix でも同じ `starts_with` が false になる
+(`config.rs:4037` の `#[cfg(unix)]` alias twin がその形)。Windows 固有なのは **prefix と短縮名という
+「alias を作っていないのに食い違う」入力**の方。
 
 **原因**: 片側 (KB) だけ `std::fs::canonicalize` に通し、もう片側 (まだ存在しない plugin dir) は
 そのまま比べていた。実測では prefix と短縮名の食い違いが同時に出た (via: `bash scratchpad/av11_observe.sh`、`.dev/knowledge/av-11-grammar-dir-inside-kb-pitfalls.md:51-53`):
@@ -640,6 +644,13 @@ junction 解決前の書かれたパスの親に戻す。**POSIX** はリンク�
 `serve_starts_its_watcher_without_an_index_so_the_watcher_can_seed_one`、`:206-210` のコメントが
 一次記録、assert は `resolve_db_path(...).exists()`)。**ログ行は診断であって契約ではない** —
 文言を assert に使うなら、同じイベントを別の文言で名乗る場所が無いことを `rg -n '<文言>' grooveseek/src` で確かめてからにする。
+
+**観測点は性質ごとに違う** (codex P2 on PR #275)。DB の存在が証明するのは「`serve` が索引なしでも
+拒否せず DB を作った」までで、**watcher が armed になったこと**ではない — DB は
+`grooveseek/src/server.rs:1333-1334` で開かれ、`run_watch_loop` の spawn は `:1466-1467` と後、
+`watcher: watching` はさらにその中で `watch()` が成功した後にしか出ない。watcher の readiness を
+証明したいテストなら、その性質に合う状態 (ファイルを触って再索引が起きる、など) を観測する。
+DB 存在の assert をそこへ流用すると、watcher が一度も動かない回帰を見逃す。
 
 出典: 2026-09-06 AV-12 (PR #269)。`.dev/knowledge/av-12-chunk-cap-degrade-pitfalls.md:156-163`
 
