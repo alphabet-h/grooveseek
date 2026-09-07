@@ -14,6 +14,44 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-07
+
+### Added
+
+- **`groove doctor` reports the source files it chunked by lines.** A new
+  `chunked-without-definitions` finding names the indexed files carrying
+  `parse:too-deep` or `parse:too-many-chunks` — whole and searchable, but with
+  chunks that carry no symbol kind, heading or scope, so a query shaped like a
+  definition cannot reach them. `parse:too-deep` has been written on documents
+  since v1.3.0 and nothing read it back. The remedy it names is the file rather
+  than a command, because an index run reaches the same bound and makes the same
+  choice. **This can turn a previously clean `groove doctor` into exit 1** on an
+  index that already holds such files.
+- **`groove doctor` says when it cannot answer that yet.** A file whose content
+  has not changed is never re-chunked, so an index built before this release may
+  still hold files the old truncation cut short — and they carry no tag to find
+  them by, which would let the finding above report a clean bill over exactly
+  the damage it exists to expose. An index now records which chunking policy
+  built it — this one when it is built from empty or with `--force`, and
+  otherwise a marker saying it was built by something else — and a second
+  finding, `chunk-policy-not-recorded`, reports an index holding source files
+  under anything but the current policy. `groove index --force` re-chunks them
+  and the finding goes away.
+
+### Changed
+
+- **The example MCP config names the server `ai-knowledge`.** `.mcp.json.example`
+  called it `groove` while every other shipped config and `docs/clients.md` used
+  `ai-knowledge`. The key is the tool namespace the client shows
+  (`mcp__ai-knowledge__search`), so a config copied from the old example gave
+  its tools a different prefix from the one the documentation shows; renaming
+  the key in an existing `.mcp.json` changes those names and nothing else, as
+  the server never reads it. The same editorial pass rewrote the `--help` text
+  and the crate descriptions to mention source code alongside documents, spelled
+  the IPv6 loopback `[::1]` throughout the intranet recipe (both spellings were
+  and are accepted), and made `groove.toml.example` say in its comments which
+  config locations are trusted — the rule itself is unchanged.
+
 ### Fixed
 
 - **A PHP file declaring many properties in one statement no longer ends the
@@ -49,28 +87,6 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   file loses is its definition metadata, not its content. The same truncation
   applied to files stopped by the scope bound, and is gone for them too. See
   [ADR-0017](docs/decisions/0017-bound-the-chunk-count-without-dropping-bytes.md).
-
-### Added
-
-- **`groove doctor` reports the source files it chunked by lines.** A new
-  `chunked-without-definitions` finding names the indexed files carrying
-  `parse:too-deep` or `parse:too-many-chunks` — whole and searchable, but with
-  chunks that carry no symbol kind, heading or scope, so a query shaped like a
-  definition cannot reach them. `parse:too-deep` has been written on documents
-  since v1.3.0 and nothing read it back. The remedy it names is the file rather
-  than a command, because an index run reaches the same bound and makes the same
-  choice. **This can turn a previously clean `groove doctor` into exit 1** on an
-  index that already holds such files.
-- **`groove doctor` says when it cannot answer that yet.** A file whose content
-  has not changed is never re-chunked, so an index built before this release may
-  still hold files the old truncation cut short — and they carry no tag to find
-  them by, which would let the finding above report a clean bill over exactly
-  the damage it exists to expose. An index now records which chunking policy
-  built it — this one when it is built from empty or with `--force`, and
-  otherwise a marker saying it was built by something else — and a second
-  finding, `chunk-policy-not-recorded`, reports an index holding source files
-  under anything but the current policy. `groove index --force` re-chunks them
-  and the finding goes away.
 
 ### Security
 
@@ -5187,7 +5203,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/alphabet-h/grooveseek/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/alphabet-h/grooveseek/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/alphabet-h/grooveseek/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/alphabet-h/grooveseek/compare/v1.2.0...v1.3.0
