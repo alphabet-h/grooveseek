@@ -650,6 +650,36 @@ impl std::fmt::Display for CorruptDatabase {
 
 impl std::error::Error for CorruptDatabase {}
 
+/// Delete the database at `path` and its `-wal` / `-shm` sidecars, so that
+/// [`Database::open_or_replace_corrupt`] can create it afresh. A missing
+/// file is fine; any other failure to remove one stops the run and names it.
+///
+/// Least to most valuable (codex P2 on #284, twice): the `-shm` index is
+/// rebuilt from the WAL, the WAL carries committed pages, the database is
+/// the file itself. A removal that fails (locked, or owned by someone else)
+/// then leaves everything more valuable still on disk instead of a
+/// half-deleted set -- and a stale WAL beside a recreated database is the
+/// one leftover that could poison the replacement.
+///
+/// Separate from the open so the order can be tested without SQLite in the
+/// way: on unix, SQLite opens the WAL before it reads the header, so a
+/// directory where `-wal` should be makes the open fail as "cannot open"
+/// rather than "not a database", and the removal is never reached.
+fn remove_database_files(path: &str) -> Result<()> {
+    for suffix in ["-shm", "-wal", ""] {
+        let victim = format!("{path}{suffix}");
+        match std::fs::remove_file(&victim) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("failed to remove {victim} so it could be replaced")));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Database {
     /// Open (or create) a file-backed database at `path`.
     ///
@@ -701,23 +731,7 @@ impl Database {
         }
         // The failed `open` dropped its connection with the error, so the
         // file is closed here -- Windows refuses to delete an open one.
-        //
-        // Sidecars first, the database last (codex P2 on #284): a sidecar that
-        // cannot be removed (locked, or owned by someone else) then stops the
-        // run with the database still on disk, instead of leaving a half-
-        // deleted set -- and a stale WAL beside a recreated database is the
-        // one leftover that could poison the replacement.
-        for suffix in ["-wal", "-shm", ""] {
-            let victim = format!("{path}{suffix}");
-            match std::fs::remove_file(&victim) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("failed to remove {victim} so it could be replaced")));
-                }
-            }
-        }
+        remove_database_files(path)?;
         let db = Self::open(path)
             .with_context(|| format!("failed to create a replacement database at {path}"))?;
         Ok((db, true))
@@ -6782,7 +6796,7 @@ mod tests {
     // ---- issue #253: a database file that is not a database ----
 
     /// A directory that outlives one [`Database`], so the file can be closed,
-    /// damaged and reopened; `doctor.rs` keeps the same shape.
+    /// damaged and reopened; [`crate::doctor`] keeps the same shape.
     struct CorruptDir(std::path::PathBuf);
     impl CorruptDir {
         fn new(prefix: &str) -> Self {
@@ -6895,10 +6909,14 @@ mod tests {
         }
     }
 
-    /// A sidecar that cannot be removed stops the replacement with the
-    /// database still on disk (codex P2 on #284). A directory where `-wal`
-    /// should be is the portable way to make `remove_file` fail: a locked file
-    /// would need a second process on Windows and nothing at all on Linux.
+    /// A sidecar that cannot be removed stops the removal with the database
+    /// still on disk (codex P2 on #284). A directory where `-wal` should be
+    /// is the portable way to make `remove_file` fail: a locked file would
+    /// need a second process on Windows and nothing at all on Linux. The
+    /// helper is called directly because SQLite on unix trips over that
+    /// directory before it ever reads the header (see [`remove_database_files`]
+    /// in this module) -- the round-1 version of this test went through the
+    /// open and was green only on Windows.
     #[test]
     fn a_sidecar_that_cannot_be_removed_leaves_the_database_on_disk() {
         let dir = CorruptDir::new("stuck-sidecar");
@@ -6906,10 +6924,7 @@ mod tests {
         std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
         std::fs::create_dir_all(format!("{db_path}-wal")).expect("mkdir where -wal goes");
 
-        let err = match Database::open_or_replace_corrupt(&db_path) {
-            Ok(_) => panic!("a sidecar that will not go must stop the replacement"),
-            Err(e) => e,
-        };
+        let err = remove_database_files(&db_path).expect_err("a sidecar that will not go");
         assert!(
             format!("{err:#}").contains("-wal"),
             "the file that stopped it is named: {err:#}"
@@ -6918,6 +6933,57 @@ mod tests {
             std::fs::read(&db_path).expect("read back"),
             b"not a sqlite database",
             "the database is not deleted before its sidecars are gone"
+        );
+    }
+
+    /// The `-shm` goes before the `-wal` (codex P2 on #284, round 2): when
+    /// it is the one that will not go, the WAL and the database are both
+    /// still on disk.
+    #[test]
+    fn a_stuck_shm_leaves_the_wal_and_the_database_on_disk() {
+        let dir = CorruptDir::new("stuck-shm");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::write(format!("{db_path}-wal"), b"stale wal").expect("write wal");
+        std::fs::create_dir_all(format!("{db_path}-shm")).expect("mkdir where -shm goes");
+
+        let err = remove_database_files(&db_path).expect_err("a sidecar that will not go");
+        assert!(
+            format!("{err:#}").contains("-shm"),
+            "the file that stopped it is named: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(format!("{db_path}-wal")).expect("read wal back"),
+            b"stale wal",
+            "the WAL is not deleted before the shm is gone"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "nor is the database"
+        );
+    }
+
+    /// The composed path, asserted only as far as every platform agrees: with
+    /// a directory where `-wal` should be, Windows reads the header first and
+    /// reports corruption, unix opens the WAL first and reports "cannot open".
+    /// Either way [`Database::open_or_replace_corrupt`] must fail and the database must
+    /// still be there -- which of the two errors it was is not the contract.
+    #[test]
+    fn a_directory_where_a_sidecar_goes_never_costs_the_database() {
+        let dir = CorruptDir::new("stuck-composed");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::create_dir_all(format!("{db_path}-wal")).expect("mkdir where -wal goes");
+
+        assert!(
+            Database::open_or_replace_corrupt(&db_path).is_err(),
+            "a sidecar that will not go must stop the replacement"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the database is not deleted"
         );
     }
 
