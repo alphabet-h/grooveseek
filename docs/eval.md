@@ -413,7 +413,7 @@ reported as unsupported and excluded rather than scored as failures, leaving
 | QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
 
 **Where GrooveSeek lost.** *typo* (n=6): P@1 0.500 against QMD's 0.833, the
-only class QMD won outright. *deprecated-trap* (n=4): P@1 **0.000** — a
+widest margin in QMD's favour of any class. *deprecated-trap* (n=4): P@1 **0.000** — a
 deprecated runbook with heavier keyword overlap beats its active replacement
 at rank 1 every time. *environment-filtered* (n=5): 0.200, tied. *ambiguous*
 (n=4): 0.500 against 0.750. The cross-encoder reranker cost 51× median latency
