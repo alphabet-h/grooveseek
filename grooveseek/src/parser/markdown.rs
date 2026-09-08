@@ -1,9 +1,11 @@
 //! Markdown (`.md`) parser. Moved from the old `src/markdown.rs` and adapted
 //! to the `Parser` trait. Behaviour is identical to legacy.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
-use super::{Chunk, Frontmatter, ParsedDocument, Parser};
+use super::{Chunk, FieldValue, Frontmatter, ParsedDocument, Parser};
 
 /// Markdown parser. Handles YAML frontmatter + heading-based chunking using
 /// [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark) rules informally
@@ -48,9 +50,17 @@ pub const TAG_FRONTMATTER_UNPARSED: &str = "frontmatter:unparsed";
 // Internal: serde helper for flexible YAML deserialization
 // ---------------------------------------------------------------------------
 
+/// The YAML merge key. `#[serde(flatten)]` would otherwise capture it as a
+/// literal `"<<"` entry (merge expansion runs only on the fallback path that
+/// a successful direct deserialize never takes), and every strict run would
+/// then report it as undeclared. It is dropped, as it was before the map
+/// existed; merges are still not expanded.
+const MERGE_KEY: &str = "<<";
+
 /// Intermediate representation for serde_yaml_bw deserialization.
 /// `date` is captured as `serde_yaml_bw::Value` so it works regardless of whether
 /// the YAML encodes it as a string (`"2026-04-10"`) or a native date value.
+/// `extra` (feature-57) receives every other top-level key.
 #[derive(Deserialize)]
 struct RawFrontmatter {
     title: Option<String>,
@@ -59,6 +69,47 @@ struct RawFrontmatter {
     depth: Option<serde_yaml_bw::Value>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml_bw::Value>,
+}
+
+/// The string a scalar `Value` is held as, or `None` for a shape that is not
+/// a scalar. A tagged value (`!!str x`) is classified by what it wraps.
+fn scalar_text(v: &serde_yaml_bw::Value) -> Option<String> {
+    use serde_yaml_bw::Value as V;
+    match v {
+        V::String(s, ..) => Some(s.clone()),
+        V::Bool(b, ..) => Some(b.to_string()),
+        V::Number(n, ..) => Some(n.to_string()),
+        V::Tagged(t) => scalar_text(&t.value),
+        V::Null(..) | V::Sequence(..) | V::Mapping(..) | V::Alias(..) => None,
+    }
+}
+
+/// One of the three shapes a retained value takes. Total over every variant
+/// of `serde_yaml_bw::Value` -- no `_` arm, so a new variant is a compile
+/// error here rather than a silent fourth shape.
+fn classify(v: serde_yaml_bw::Value) -> FieldValue {
+    use serde_yaml_bw::Value as V;
+    match v {
+        V::String(..) | V::Bool(..) | V::Number(..) => {
+            FieldValue::Scalar(scalar_text(&v).expect("a scalar variant has text"))
+        }
+        V::Sequence(items, ..) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in &items {
+                match scalar_text(item) {
+                    Some(s) => out.push(s),
+                    None => return FieldValue::Other("nested sequence"),
+                }
+            }
+            FieldValue::List(out)
+        }
+        V::Mapping(..) => FieldValue::Other("mapping"),
+        V::Null(..) => FieldValue::Other("null"),
+        V::Alias(..) => FieldValue::Other("alias"),
+        V::Tagged(t) => classify(t.value),
+    }
 }
 
 impl From<RawFrontmatter> for Frontmatter {
@@ -79,12 +130,20 @@ impl From<RawFrontmatter> for Frontmatter {
             other => format!("{other:?}"),
         });
 
+        let extra = raw
+            .extra
+            .into_iter()
+            .filter(|(k, _)| k != MERGE_KEY)
+            .map(|(k, v)| (k, classify(v)))
+            .collect();
+
         Frontmatter {
             title: raw.title,
             date,
             topic: raw.topic,
             depth,
             tags: raw.tags,
+            extra,
         }
     }
 }
@@ -312,6 +371,139 @@ mod tests {
         let doc = parse("---\ntitle: x\nno closing fence, so this is body text as before.\n");
         assert_eq!(doc.frontmatter_error, None);
         assert!(doc.frontmatter.tags.is_empty());
+    }
+
+    // feature-57: every key the five named fields do not claim is retained by
+    // shape, so a schema can name it later.
+    #[test]
+    fn test_unknown_keys_are_retained_by_shape() {
+        use crate::parser::FieldValue;
+        let md = "---\ntitle: T\nstatus: active\nenvironment: [dev, test]\nflag: false\nn: 10\nratio: 1.5\nmeta: {a: 1}\nempty:\nnested: [[a]]\nlong: |\n  two\n  lines\ntagged: !!str yes\ninlist: [!!str a, b]\n---\n\nBody long enough to stand as one chunk on its own here.\n";
+        let doc = parse(md);
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("T"));
+        let e = &doc.frontmatter.extra;
+        assert_eq!(e["status"], FieldValue::Scalar("active".into()));
+        assert_eq!(
+            e["environment"],
+            FieldValue::List(vec!["dev".into(), "test".into()])
+        );
+        assert_eq!(e["flag"], FieldValue::Scalar("false".into()));
+        assert_eq!(e["n"], FieldValue::Scalar("10".into()));
+        assert_eq!(e["ratio"], FieldValue::Scalar("1.5".into()));
+        assert_eq!(e["meta"], FieldValue::Other("mapping"));
+        assert_eq!(e["empty"], FieldValue::Other("null"));
+        assert_eq!(e["nested"], FieldValue::Other("nested sequence"));
+        assert_eq!(e["long"], FieldValue::Scalar("two\nlines\n".into()));
+        assert_eq!(e["tagged"], FieldValue::Scalar("yes".into()));
+        assert_eq!(e["inlist"], FieldValue::List(vec!["a".into(), "b".into()]));
+        assert!(!e.contains_key("title"), "a named field is not an extra");
+        assert_eq!(e.len(), 11, "every unknown key and nothing else: {e:?}");
+    }
+
+    /// A document with no unknown keys has an empty map; the five named
+    /// fields behave exactly as before the map existed.
+    #[test]
+    fn test_named_fields_only_leaves_extra_empty() {
+        let doc = parse(
+            "---\ntitle: T\ndate: 2026-09-09\ntopic: x\ndepth: 2\ntags: [a]\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert!(doc.frontmatter.extra.is_empty());
+        assert_eq!(doc.frontmatter.date.as_deref(), Some("2026-09-09"));
+        assert_eq!(doc.frontmatter.depth.as_deref(), Some("2"));
+        assert_eq!(doc.frontmatter.tags, vec!["a"]);
+    }
+
+    /// The YAML merge key is never surfaced: with `#[serde(flatten)]` it would
+    /// otherwise arrive as a literal `"<<"` key and be an undeclared field in
+    /// every strict run.
+    #[test]
+    fn test_merge_key_is_not_an_extra() {
+        let doc = parse(
+            "---\nbase: &b\n  status: active\n<<: *b\ntitle: T\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None, "a merge key is valid YAML");
+        assert!(
+            !doc.frontmatter.extra.contains_key("<<"),
+            "merge key leaked: {:?}",
+            doc.frontmatter.extra
+        );
+        assert_eq!(doc.frontmatter.extra["base"], crate::parser::FieldValue::Other("mapping"));
+    }
+
+    /// `#[serde(flatten)]` moves the whole struct onto serde's buffering path,
+    /// which is the mechanism most likely to change how a wrong-typed named
+    /// field is refused. Pin that it still is. (A scalar number into a
+    /// `String` field, e.g. `title: 123`, is coerced by `serde_yaml_bw`
+    /// rather than refused, both before and after this change, so it is not
+    /// a refusal case here -- see `test_named_scalar_coercion_is_unchanged_with_extra`.)
+    #[test]
+    fn test_named_field_type_mismatch_is_still_refused_with_extra() {
+        for yaml in ["topic: [a]", "tags: [[a]]", "tags: notalist"] {
+            let doc = parse(&format!(
+                "---\n{yaml}\nstatus: active\n---\n\nBody long enough to stand as one chunk on its own here.\n"
+            ));
+            assert!(
+                doc.frontmatter_error.is_some(),
+                "{yaml:?} must still be refused, got {:?}",
+                doc.frontmatter
+            );
+            assert_eq!(doc.frontmatter.tags, vec![TAG_FRONTMATTER_UNPARSED]);
+            assert!(doc.frontmatter.extra.is_empty(), "a refused block keeps nothing");
+        }
+    }
+
+    /// `title: 123` is not a refusal case (see the doc comment above): pin
+    /// that the coercion itself, and `extra` alongside it, are unaffected by
+    /// adding the flatten map.
+    #[test]
+    fn test_named_scalar_coercion_is_unchanged_with_extra() {
+        use crate::parser::FieldValue;
+        let doc = parse(
+            "---\ntitle: 123\nstatus: active\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("123"));
+        assert_eq!(
+            doc.frontmatter.extra["status"],
+            FieldValue::Scalar("active".into())
+        );
+    }
+
+    /// An alias bomb under an unknown key must not panic or hang: `Other` never
+    /// walks a mapping or nested sequence, so the cost stays what
+    /// `serde_yaml_bw`'s own budget already bounds.
+    #[test]
+    fn test_alias_bomb_under_unknown_key_is_safe() {
+        let bomb = "---\ntitle: bomb\nblob:\n  - &a x\n  - &b [*a, *a, *a, *a, *a, *a, *a, *a]\n  - &c [*b, *b, *b, *b, *b, *b, *b, *b]\n  - &d [*c, *c, *c, *c, *c, *c, *c, *c]\n  - &e [*d, *d, *d, *d, *d, *d, *d, *d]\n---\nbody\n";
+        let doc = parse(bomb);
+        // Either the parser refused it (budget) or it is one opaque value.
+        if doc.frontmatter_error.is_none() {
+            assert_eq!(
+                doc.frontmatter.extra["blob"],
+                crate::parser::FieldValue::Other("nested sequence")
+            );
+        }
+    }
+
+    /// How an alias under an unknown key arrives. Through `#[serde(flatten)]`
+    /// the value is buffered via `deserialize_any`, which may already resolve
+    /// the alias; if it does not, `Value::Alias` is classified as
+    /// `Other("alias")`. Whichever this build observes is the behavior the
+    /// spec pins (feature-57, acceptance criterion 13).
+    #[test]
+    fn test_alias_under_unknown_key_is_resolved_or_opaque() {
+        use crate::parser::FieldValue;
+        let doc = parse(
+            "---\nbase: &b active\nstatus: *b\ntitle: T\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        let got = &doc.frontmatter.extra["status"];
+        assert!(
+            *got == FieldValue::Scalar("active".into()) || *got == FieldValue::Other("alias"),
+            "alias arrived as {got:?}"
+        );
     }
 
     #[test]
