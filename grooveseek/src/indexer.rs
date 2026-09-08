@@ -676,6 +676,20 @@ pub fn rebuild_index(
     let mut updated: u32 = 0;
     let mut frontmatter_unparsed: u32 = 0;
     let mut refreshed: u32 = 0;
+    // (#251, codex P2 round 2) The one-time check is recorded as done only when every
+    // Markdown document it was meant to read was read. A legacy file the scan could not
+    // open, or that this loop skips or refuses, keeps the check pending: its row is
+    // retained, so when the file is back with the same content the fast path would
+    // otherwise hide it for good.
+    let mut refresh_pending = false;
+    if refresh_frontmatter {
+        for rel in &skipped_paths {
+            if is_indexed_markdown(db, registry, rel)? {
+                refresh_pending = true;
+                break;
+            }
+        }
+    }
 
     // 2. Process each file
     for entry in &disk_entries {
@@ -720,12 +734,18 @@ pub fn rebuild_index(
                 if fm_unparsed {
                     frontmatter_unparsed += 1;
                 }
+                if refresh_frontmatter && is_indexed_markdown(db, registry, &entry.rel)? {
+                    refresh_pending = true;
+                }
                 progress.report_unchanged(&entry.rel);
             }
             // A refusal counts as a skip here for the same reason a size cap
             // does: the file is not indexed and the reason is already on stderr.
             SingleResult::Refused => {
                 skipped_count += 1;
+                if refresh_frontmatter && is_indexed_markdown(db, registry, &entry.rel)? {
+                    refresh_pending = true;
+                }
                 progress.report_unchanged(&entry.rel);
             }
             SingleResult::MetadataRefreshed => {
@@ -743,8 +763,9 @@ pub fn rebuild_index(
 
     // (#251) Every unchanged Markdown document has now been looked at under this policy, so
     // the next run can take the fast path again. Written after the loop on purpose: a run
-    // that stops halfway leaves the key absent and the next run looks again.
-    if refresh_frontmatter || force {
+    // that stops halfway leaves the key absent and the next run looks again -- and so does
+    // one that could not read a document it holds a row for.
+    if force || (refresh_frontmatter && !refresh_pending) {
         db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
     }
     if refreshed > 0 {
@@ -799,6 +820,21 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
         }
         _ => chunk.content.clone(),
     }
+}
+
+/// Whether `rel` is a Markdown file -- by the parser the registry would hand it, so `.MD`
+/// counts -- that the index already holds a row for. The one-time frontmatter check
+/// (#251) asks this about every file it could not read: only such a file can come back
+/// later with a matching hash and slip past the check for good.
+fn is_indexed_markdown(db: &Database, registry: &Registry, rel: &str) -> Result<bool> {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let is_markdown = registry
+        .by_extension(ext)
+        .is_some_and(|p| p.extension() == "md");
+    Ok(is_markdown && db.get_document_hash(rel)?.is_some())
 }
 
 /// How [`index_single_disk_entry`] treats a file whose content hash the index
@@ -860,22 +896,26 @@ fn index_single_disk_entry(
     //
     // (#251) The one exception is the one-time upgrade check: an unchanged Markdown
     // document is read and parsed once more, and only its metadata may be rewritten.
-    let unchanged = !force
-        && db
-            .get_document_hash(&entry.rel)?
-            .is_some_and(|existing| existing == entry.hash);
-    let refresh_only = unchanged && refresh_frontmatter && ext == "md";
-    if unchanged && !refresh_only {
-        return Ok(SingleResult::Unchanged);
-    }
-
-    // Read + parse only for files we actually need to embed.
+    //
+    // Resolved ahead of the unchanged check so the check can ask the parser, not the
+    // spelling: the scan and [`Registry::by_extension`] both take `.MD` as Markdown, and a
+    // comparison against the literal did not (codex P1, round 2).
     let Some(parser) = registry.by_extension(ext) else {
         return Ok(SingleResult::Skipped {
             reason: "no parser for extension",
             frontmatter_unparsed: false,
         });
     };
+    let unchanged = !force
+        && db
+            .get_document_hash(&entry.rel)?
+            .is_some_and(|existing| existing == entry.hash);
+    let refresh_only = unchanged && refresh_frontmatter && parser.extension() == "md";
+    if unchanged && !refresh_only {
+        return Ok(SingleResult::Unchanged);
+    }
+
+    // Read + parse only for files we actually need to embed.
     // (BU-20) The bytes that become chunks come from a handle whose link count,
     // file type and size were all read off that same handle — this is the read
     // a swapped-in hard link has to get past, and cannot.

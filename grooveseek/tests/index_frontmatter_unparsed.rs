@@ -253,6 +253,89 @@ fn test_first_run_after_upgrade_tags_unchanged_legacy_documents() {
     assert!(!third.contains("warning: broken.md"), "{third}");
 }
 
+/// Put the index back into the shape an older version leaves: the row for
+/// `rel` carries no tag and nothing says the frontmatter was ever checked.
+fn make_legacy(kb: &TempKbLayout, rel: &str) {
+    let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).expect("open db");
+    conn.execute("UPDATE documents SET tags = '[]' WHERE path = ?1", [rel])
+        .unwrap();
+    conn.execute(
+        "DELETE FROM index_meta WHERE key = 'frontmatter_policy'",
+        [],
+    )
+    .unwrap();
+}
+
+fn frontmatter_policy(kb: &TempKbLayout) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).expect("open db");
+    conn.query_row(
+        "SELECT value FROM index_meta WHERE key = 'frontmatter_policy'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .unwrap()
+}
+
+/// (codex P1, round 2) The scan and the registry take `.MD` as Markdown, so
+/// the one-time check has to as well, or the upper-case file is recorded as
+/// checked without ever being read.
+#[test]
+fn test_upgrade_check_recognises_uppercase_markdown_extension() {
+    let kb = TempKbLayout::new("groove-fm-upper");
+    kb.write("good.md", GOOD);
+    kb.write("UPPER.MD", BROKEN);
+    let (first, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "first run failed: {status:?}\n{first}");
+    make_legacy(&kb, "UPPER.MD");
+
+    let (second, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "second run failed: {status:?}\n{second}");
+    assert!(
+        second.contains("warning: UPPER.MD: failed to parse YAML frontmatter: "),
+        "{second}"
+    );
+    let (_, tags) = document_row(&kb, "UPPER.MD");
+    assert!(tags.contains("frontmatter:unparsed"), "{tags}");
+    assert_eq!(frontmatter_policy(&kb).as_deref(), Some("tag-unparsed"));
+}
+
+/// (codex P2, round 2) A legacy Markdown file the check could not read or
+/// parse leaves the check pending, so a later run looks again once the file
+/// is back; recording "checked" over a file that was never read would hide it
+/// behind the fast path for good.
+#[test]
+fn test_upgrade_check_stays_pending_when_a_legacy_file_cannot_be_parsed() {
+    let kb = build_kb("groove-fm-pending");
+    let (first, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "first run failed: {status:?}\n{first}");
+    make_legacy(&kb, "broken.md");
+
+    // Not valid UTF-8: the run cannot parse it, and the row is retained.
+    std::fs::write(kb.kb().join("broken.md"), [0xff, 0xfe, 0xfd]).unwrap();
+    let (second, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "second run failed: {status:?}\n{second}");
+    assert_eq!(
+        frontmatter_policy(&kb),
+        None,
+        "a Markdown document the check could not read must keep it pending:\n{second}"
+    );
+
+    // Back to the content the row was indexed from: same hash, so only the
+    // pending check can reach it.
+    kb.write("broken.md", BROKEN);
+    let (third, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "third run failed: {status:?}\n{third}");
+    assert!(
+        third.contains("warning: broken.md: failed to parse YAML frontmatter: "),
+        "{third}"
+    );
+    let (_, tags) = document_row(&kb, "broken.md");
+    assert!(tags.contains("frontmatter:unparsed"), "{tags}");
+    assert_eq!(frontmatter_policy(&kb).as_deref(), Some("tag-unparsed"));
+}
+
 #[test]
 fn test_repairing_the_frontmatter_removes_the_tag() {
     let kb = build_kb("groove-fm-repair");
