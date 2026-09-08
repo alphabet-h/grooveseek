@@ -6855,7 +6855,7 @@ mod tests {
         }
     }
 
-    /// `expect_err` needs `Database: Debug`, which it is not.
+    /// `expect_err` needs the `Ok` type to be `Debug`, and [`Database`] is not.
     fn open_error(path: &str, why: &str) -> anyhow::Error {
         match Database::open(path) {
             Ok(_) => panic!("{why}"),
