@@ -152,7 +152,15 @@ impl<'de> Visitor<'de> for RawFrontmatterVisitor {
                 }
                 _ => {
                     let value = map.next_value::<FieldValue>()?;
-                    extra.insert(key, value);
+                    // Mirrors the five named arms above: a repeated key is
+                    // refused rather than silently overwritten by the second
+                    // occurrence's value. `duplicate_field` itself wants a
+                    // `&'static str`, which an owned `key` cannot provide, so
+                    // `custom` carries the same "duplicate field `<name>`"
+                    // wording by hand.
+                    if let Some(_prev) = extra.insert(key.clone(), value) {
+                        return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                    }
                 }
             }
         }
@@ -742,6 +750,21 @@ mod tests {
             doc.frontmatter.extra["base"],
             crate::parser::FieldValue::Other("mapping")
         );
+    }
+
+    /// A repeated retained (unknown) key is refused the same way a repeated
+    /// named key is. In practice both are already caught by
+    /// `serde_yaml_bw`'s own mapping parser before either visitor arm runs
+    /// (confirmed by comparing its "duplicate entry with key" wording against
+    /// a duplicate `title` in an ad hoc probe), so this also exercises that
+    /// upstream guarantee; the visitor's own check in the `_` arm is the
+    /// belt to that suspenders, matching the five named arms.
+    #[test]
+    fn test_duplicate_retained_key_is_refused() {
+        let md = "---\ntitle: T\nstatus: retired\nstatus: active\n---\n\nBody long enough to stand as one chunk on its own here.\n";
+        let doc = parse(md);
+        assert!(doc.frontmatter_error.is_some());
+        assert_eq!(doc.frontmatter.tags, vec![TAG_FRONTMATTER_UNPARSED]);
     }
 
     /// Reading the block through a hand-written visitor is the mechanism most
