@@ -78,6 +78,14 @@ enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"]
 [parsers.code]
 max_chunk_chars = 3500
 
+# 任意: YAML frontmatter が parse できない Markdown があったら `groove index` を
+# 失敗させる (v1.7.0+)。既定は off: そのファイルは metadata 空 + tag
+# `frontmatter:unparsed` で索引され、`warning:` 行で名指しされ、summary で数えられる。
+# on にしても全ファイルを索引し終えてから exit 1 になる。MCP `rebuild_index` は
+# 件数と一緒に `error` を返す。watcher はこのキーを読まない。
+# [index]
+# fail_on_frontmatter_error = true
+
 # ライブ同期ファイルウォッチャ。`groove serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
 # 増分再インデックスされる。PostToolUse hook を補完する位置付け:
@@ -208,7 +216,7 @@ bind = "127.0.0.1:3100"
 
 信頼しない config も**読み込みはする**。KB の見せ方を決めるだけのもの
 (`[search]` / `[quality_filter]` / `exclude_dirs` / `[watch]` /
-`[contextual]`) はそのまま効く。制限するのは 6 つだけで、これらは「どのコードを
+`[contextual]` / `[index]`) はそのまま効く。制限するのは 6 つだけで、これらは「どのコードを
 実行するか」「何を読み、何が外に出るか」「誰から届くか」を決めるため:
 
 | フィールド | 信頼しない config の場合 |

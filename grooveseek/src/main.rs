@@ -801,6 +801,12 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     grooveseek::db::ContextMode::Off
                 };
+            // (#251) Same switch `groove index` reads; the MCP `rebuild_index`
+            // tool answers with an `error` beside the counts when it is set.
+            let fail_on_frontmatter_error = cfg
+                .index
+                .as_ref()
+                .is_some_and(|i| i.fail_on_frontmatter_error);
 
             // evaluator 指摘 High #2: `--bind` / `--port` が指定されているのに
             // 実効 transport が Stdio なら silent ignore は footgun なので reject。
@@ -831,6 +837,7 @@ fn main() -> anyhow::Result<()> {
                     search_config,
                     source,
                     context_mode_desired,
+                    fail_on_frontmatter_error,
                 )
                 .await
             })?;
@@ -896,15 +903,31 @@ fn main() -> anyhow::Result<()> {
                 context_mode_desired,
             )?;
             eprintln!(
-                "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped), {} chunks",
+                "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped, {} frontmatter unparsed), {} chunks",
                 result.duration_ms,
                 result.total_documents,
                 result.updated,
                 result.renamed,
                 result.deleted,
                 result.skipped,
+                result.frontmatter_unparsed,
                 result.total_chunks
             );
+            // (#251) Strictness changes the exit code, not the run: every file
+            // was indexed and every broken one named above, so the summary is
+            // printed first and one failure covers the whole corpus.
+            let strict = cfg
+                .index
+                .as_ref()
+                .is_some_and(|i| i.fail_on_frontmatter_error);
+            if strict && result.frontmatter_unparsed > 0 {
+                anyhow::bail!(
+                    "{} document(s) have YAML frontmatter that could not be parsed (see the warnings above); \
+                     [index].fail_on_frontmatter_error is set, so this run is reported as a failure. \
+                     The index was still written. Fix the files and run `groove index` again.",
+                    result.frontmatter_unparsed
+                );
+            }
         }
         Commands::Status { kb_path } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;

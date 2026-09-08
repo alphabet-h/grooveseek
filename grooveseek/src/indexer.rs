@@ -428,6 +428,12 @@ pub struct IndexResult {
     pub deleted: u32,
     /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
     pub skipped: u32,
+    /// Documents indexed this run whose YAML frontmatter could not be parsed
+    /// and were therefore written with empty metadata and the
+    /// `frontmatter:unparsed` tag (#251). Per run, like `updated`: a file that
+    /// has not changed is not re-parsed and so is not re-counted; `force`
+    /// re-parses everything.
+    pub frontmatter_unparsed: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
 }
@@ -438,8 +444,14 @@ pub struct IndexResult {
 pub enum SingleResult {
     /// hash が既存と一致、embedding 再計算不要 (no-op)
     Unchanged,
-    /// upsert + embedding 完了 (chunk 数)
-    Updated { chunks: u32 },
+    /// upsert + embedding 完了 (chunk 数)。`frontmatter_unparsed` は #251:
+    /// この文書の YAML frontmatter が parse できず、metadata 空 +
+    /// `frontmatter:unparsed` tag で書かれたことを示す。`rebuild_index` の
+    /// summary はこれを数える。
+    Updated {
+        chunks: u32,
+        frontmatter_unparsed: bool,
+    },
     /// 処理対象外 (空本文など)。reason は human-readable。
     Skipped { reason: &'static str },
     /// (BU-20) 開いた handle が「集めた時のファイルではない」と答えた
@@ -643,6 +655,7 @@ pub fn rebuild_index(
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
     let mut updated: u32 = 0;
+    let mut frontmatter_unparsed: u32 = 0;
 
     // 2. Process each file
     for entry in &disk_entries {
@@ -661,8 +674,14 @@ pub fn rebuild_index(
             entry_force,
             context_mode,
         )? {
-            SingleResult::Updated { chunks } => {
+            SingleResult::Updated {
+                chunks,
+                frontmatter_unparsed: fm_unparsed,
+            } => {
                 updated += 1;
+                if fm_unparsed {
+                    frontmatter_unparsed += 1;
+                }
                 progress.report_indexed(&entry.rel, chunks);
             }
             // A refusal counts as a skip here for the same reason a size cap
@@ -704,6 +723,7 @@ pub fn rebuild_index(
         renamed,
         deleted,
         skipped: skipped_count,
+        frontmatter_unparsed,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })
@@ -818,6 +838,18 @@ fn index_single_disk_entry(
         }
     };
 
+    // (#251) The parser hands the refused YAML back as data; this is the one
+    // place that knows the file, so this is where it is named. Written
+    // directly, like `Skipping ...` above, so `--quiet` and `RUST_LOG` do not
+    // hide it. Before the empty-chunks check on purpose: a frontmatter-only
+    // stub with broken YAML is still worth naming even though it is skipped.
+    if let Some(e) = &parsed.frontmatter_error {
+        eprintln!(
+            "warning: {}: failed to parse YAML frontmatter: {e}",
+            entry.rel
+        );
+    }
+
     if parsed.chunks.is_empty() {
         return Ok(SingleResult::Skipped {
             reason: "no embeddable chunks",
@@ -907,6 +939,7 @@ fn index_single_disk_entry(
             tx.commit()?;
             return Ok(SingleResult::Updated {
                 chunks: parsed.chunks.len() as u32,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
             });
         }
         // update が 0 行なら通常経路にフォールスルー (レース耐性)
@@ -948,6 +981,7 @@ fn index_single_disk_entry(
 
     Ok(SingleResult::Updated {
         chunks: parsed.chunks.len() as u32,
+        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
     })
 }
 
@@ -1313,7 +1347,7 @@ pub fn rename_single_file(
         same_hash,
         context_mode,
     )? {
-        SingleResult::Updated { chunks } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
+        SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         // (codex P2 round 1 on PR #157) `index_single_disk_entry` reads the file
         // a **second** time, and the whole premise of this guard is that a path
         // can change between two reads. Letting that refusal fall into the
@@ -2791,14 +2825,42 @@ mod tests {
     /// するため通常の cargo test には載せない)。
     #[test]
     fn test_single_result_variants_are_distinct() {
-        assert_ne!(SingleResult::Unchanged, SingleResult::Updated { chunks: 0 });
+        assert_ne!(
+            SingleResult::Unchanged,
+            SingleResult::Updated {
+                chunks: 0,
+                frontmatter_unparsed: false
+            }
+        );
         assert_ne!(
             SingleResult::Unchanged,
             SingleResult::Skipped { reason: "test" }
         );
         assert_ne!(
-            SingleResult::Updated { chunks: 1 },
-            SingleResult::Updated { chunks: 2 }
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false
+            },
+            SingleResult::Updated {
+                chunks: 2,
+                frontmatter_unparsed: false
+            }
+        );
+    }
+
+    /// #251: the run summary counts documents written with the
+    /// `frontmatter:unparsed` tag, so the per-file result has to say so.
+    #[test]
+    fn test_updated_distinguishes_frontmatter_unparsed() {
+        assert_ne!(
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: true
+            },
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false
+            }
         );
     }
 

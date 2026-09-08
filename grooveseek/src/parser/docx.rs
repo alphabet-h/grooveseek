@@ -47,6 +47,7 @@ impl Parser for DocxParser {
             frontmatter,
             chunks,
             raw_content,
+            frontmatter_error: None,
         })
     }
 }

@@ -208,6 +208,7 @@ impl Parser for CodeParser {
             frontmatter: Frontmatter::default(),
             chunks: Vec::new(),
             raw_content: String::new(),
+            frontmatter_error: None,
         }
     }
 
@@ -453,6 +454,7 @@ fn chunk_source_capped(
         },
         chunks,
         raw_content,
+        frontmatter_error: None,
     })
 }
 

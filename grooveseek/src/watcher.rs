@@ -715,8 +715,18 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         state.exclude_headings.as_deref(),
         &state.registry,
     ) {
-        Ok(indexer::SingleResult::Updated { chunks }) => {
-            wdiag!("watcher: reindexed {rel} ({chunks} chunks)");
+        Ok(indexer::SingleResult::Updated {
+            chunks,
+            frontmatter_unparsed,
+        }) => {
+            // (#251) The per-file warning naming the file is already on stderr
+            // from the indexer; this only says the reindex kept the tag.
+            let note = if frontmatter_unparsed {
+                ", frontmatter unparsed"
+            } else {
+                ""
+            };
+            wdiag!("watcher: reindexed {rel} ({chunks} chunks{note})");
         }
         Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
         // (BU-20) The reason is already on stderr from the read; this says what

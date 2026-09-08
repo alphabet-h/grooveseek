@@ -27,13 +27,15 @@ Switching models on an existing index requires `--force` (the DB records the mod
 
 Two flags control how `groove index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
 
-- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang.
+- `--quiet`: suppress per-file output; only print start / `Found N source files` / `Done in ...` summary lines. Useful when running from harnesses (e.g. Claude Code Bash tool) that buffer streaming output until exit, so you can recognise "silence = still working" instead of confusing it with a hang. Warnings are not progress and are never suppressed: `warning: <path>: failed to parse YAML frontmatter: ...` prints under `--quiet` too.
 - `--progress`: show progress UI. Auto-detects via `IsTerminal` on stderr — TTY gets an `indicatif` bar with elapsed / position / percent / ETA, non-TTY gets periodic `Progress: N/M (P%)` lines (~20 emits per run plus a 100 % anchor) so `tail -f indexing.log` works.
 
 ```bash
 groove index --kb-path ./big-kb --quiet         # silent except for start / done
 groove index --kb-path ./big-kb --progress      # bar in TTY, periodic lines in pipe
 ```
+
+The `Done in` line counts what the run did: `updated` (files whose content changed and were re-embedded), `renamed`, `deleted`, `skipped` (present on disk but not indexed — unreadable, over the size cap, or empty), and `frontmatter unparsed` (v1.7.0+). That last one counts Markdown files indexed this run whose YAML frontmatter did not parse: each is named in a `warning:` line above, indexed with empty `title` / `date` / `topic`, and tagged `frontmatter:unparsed` so `--tag-any frontmatter:unparsed` lists them. A file that has not changed since it was last indexed is not re-parsed and so is not re-counted; `--force` re-parses everything. With `[index].fail_on_frontmatter_error = true` in `groove.toml` the run finishes, prints the summary, and then exits 1 when that count is non-zero.
 
 ### Model selection trade-offs
 
@@ -438,9 +440,10 @@ Two things you might go looking for are not behind `RUST_LOG` at all. **Which
 `groove.toml` won** is logged at `info`, so it is already visible without
 raising anything: `loaded config source=… path=… trust=…` (see
 [docs/configuration.md](configuration.md)). And `index`'s progress — the
-`Indexing …`, `  indexed: …` and `Done in …` lines — is written directly rather
-than through the logger, so it appears at any level and is controlled by
-`--quiet` / `--progress` instead.
+`Indexing …`, `  indexed: …` and `Done in …` lines, and its per-file
+`warning:` lines — is written directly rather than through the logger, so it
+appears at any level; the progress is controlled by `--quiet` / `--progress`
+instead, and the warnings by nothing.
 
 Logs go to stderr on every subcommand, so raising the level never disturbs
 output being piped from stdout — which matters most for `serve`, where over the

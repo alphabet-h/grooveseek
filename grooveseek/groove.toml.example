@@ -175,6 +175,16 @@ enabled = ["md"]
 [parsers.code]
 #max_chunk_chars = 3500
 
+# --- [index] — `groove index` and the MCP rebuild_index tool -------------
+# A Markdown file whose YAML frontmatter fails to parse is still indexed, with
+# empty title / date / topic and the tag `frontmatter:unparsed`; the run names
+# it (`warning: <path>: failed to parse YAML frontmatter: ...`) and counts it
+# in the `Done in` summary. Set this to true to have `groove index` exit 1
+# after such a run. The index is still written and every broken file is still
+# named; only the exit code changes. The watcher never reads this.
+# [index]
+#fail_on_frontmatter_error = false
+
 # --- [watch] — live-sync file watcher ------------------------------------
 # Active during `groove serve` only. Detects changes, additions, deletions and
 # renames under kb_path and re-indexes just the affected files, which covers

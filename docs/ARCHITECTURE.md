@@ -150,7 +150,7 @@ The `groove` CLI follows a **stdout = data, stderr = progress** convention:
   - `groove service status` and `groove service list` (`run_status` / `run_list`
     build the text; the arm prints it)
 - **stderr** carries human-readable progress, warnings, and errors:
-  - `groove index` progress lines (`Indexing ...`, `Done in ...`, per-file `  indexed:` / `  renamed:` / `  deleted:`). Use `--quiet` to suppress per-file output (start / found / done summary only) or `--progress` to switch to an `indicatif` bar (TTY) / periodic `Progress: N/M (P%)` lines (non-TTY). The two flags are mutually exclusive and default-off (added v0.7.8).
+  - `groove index` progress lines (`Indexing ...`, `Done in ...`, per-file `  indexed:` / `  renamed:` / `  deleted:`), and its per-file `warning: <path>: failed to parse YAML frontmatter: ...` lines, which no flag suppresses (v1.7.0+). Use `--quiet` to suppress per-file output (start / found / done summary only) or `--progress` to switch to an `indicatif` bar (TTY) / periodic `Progress: N/M (P%)` lines (non-TTY). The two flags are mutually exclusive and default-off (added v0.7.8).
   - `groove status`'s "No index found" note — it reports an inability to answer, so stdout stays empty
   - `groove service install/uninstall/tray-install/tray-uninstall` confirmations: they report on an action performed, not on a question asked
   - All `tracing` / `eprintln!` diagnostics
