@@ -6775,7 +6775,7 @@ mod tests {
 
     // ---- issue #253: a database file that is not a database ----
 
-    /// A directory that outlives one `Database`, so the file can be closed,
+    /// A directory that outlives one [`Database`], so the file can be closed,
     /// damaged and reopened; `doctor.rs` keeps the same shape.
     struct CorruptDir(std::path::PathBuf);
     impl CorruptDir {
@@ -6804,7 +6804,7 @@ mod tests {
 
     /// The issue's own reproduction: a file whose first bytes are not the
     /// SQLite header. `Connection::open` does not read the header, so the
-    /// failure only surfaces on the first statement `init` runs.
+    /// failure only surfaces on the first statement [`Database::init`] runs.
     #[test]
     fn opening_a_file_that_is_not_a_database_names_the_file_and_the_remedy() {
         let dir = CorruptDir::new("notadb");
@@ -6889,7 +6889,7 @@ mod tests {
         }
     }
 
-    /// Any other failure inside `init` is not corruption and must not be
+    /// Any other failure inside [`Database::init`] is not corruption and must not be
     /// reported as such -- `--force` deleting a file over an unrelated error
     /// would be worse than the bug being fixed.
     #[test]
