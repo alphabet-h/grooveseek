@@ -429,7 +429,10 @@ mod tests {
             "merge key leaked: {:?}",
             doc.frontmatter.extra
         );
-        assert_eq!(doc.frontmatter.extra["base"], crate::parser::FieldValue::Other("mapping"));
+        assert_eq!(
+            doc.frontmatter.extra["base"],
+            crate::parser::FieldValue::Other("mapping")
+        );
     }
 
     /// `#[serde(flatten)]` moves the whole struct onto serde's buffering path,
@@ -450,7 +453,10 @@ mod tests {
                 doc.frontmatter
             );
             assert_eq!(doc.frontmatter.tags, vec![TAG_FRONTMATTER_UNPARSED]);
-            assert!(doc.frontmatter.extra.is_empty(), "a refused block keeps nothing");
+            assert!(
+                doc.frontmatter.extra.is_empty(),
+                "a refused block keeps nothing"
+            );
         }
     }
 
