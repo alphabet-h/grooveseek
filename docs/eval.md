@@ -380,6 +380,62 @@ when the previous run's fingerprint differs.
 - **Mandatory adoption**: running `eval` does not change anything about
   `index` / `serve` / `search`. It is a purely auxiliary tool
 
+## A third-party measurement
+
+The numbers below were measured and published by **Johannes Engler
+([@johannes-engler-mw](https://github.com/johannes-engler-mw))** in
+[issue #252](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5586388455),
+and are reproduced here with permission and attribution. They are not this
+project's own measurements; the conditions and the losses are copied along
+with the wins, because a citation that omits them is not worth much.
+
+**Conditions.** macOS 26.5.1 (arm64), one machine, CLI only on both sides.
+`groove 1.2.0`, re-measured at `1.7.0` with **0 score changes and 0 top-5
+ordering changes across all 60 cases in all four modes** (chunking identical
+too: 57 documents → 297 chunks), against `qmd 2.8.3`. A 57-document synthetic
+Platform Engineering corpus, no real data: 38 git-sourced documents, 10
+Confluence exports, 7 deliberate decoys (a production runbook lexically
+near-identical to the staging one; a deprecated runbook with heavier keyword
+overlap than its replacement), 2 untrusted. 60 fixture cases over 12 query
+classes, graded deterministically against document-level judgements — no LLM
+judge in the retrieval numbers. Both engines return chunk-level hits,
+deduplicated to document level identically.
+
+**Like-for-like.** QMD has no metadata filter, so the 17 filtered cases were
+reported as unsupported and excluded rather than scored as failures, leaving
+43 cases both engines run identically:
+
+| Backend / mode | n | P@1 | MRR | nDCG@5 |
+| --- | ---: | ---: | ---: | ---: |
+| GrooveSeek hybrid (no filter) | 43 | **0.651** | **0.873** | **0.775** |
+| QMD `vsearch` | 43 | 0.558 | 0.845 | 0.708 |
+| QMD `query` (hybrid + LLM rerank) | 43 | 0.512 | 0.857 | 0.750 |
+| QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
+
+**Where GrooveSeek lost or tied.** *typo* (n=6): P@1 0.500 against QMD's 0.833, the
+widest margin in QMD's favour of any class. *deprecated-trap* (n=4): P@1 **0.000** — a
+deprecated runbook with heavier keyword overlap beats its active replacement
+at rank 1 every time. *environment-filtered* (n=5): 0.200, tied. *ambiguous*
+(n=4): 0.500 against 0.750. The cross-encoder reranker cost 51× median latency
+to lose 0.067 P@1 and is off in that deployment (65× at 1.2.0; the rerank path
+got faster without changing what it returns).
+
+**What decided it** was the metadata filters, which QMD does not have: with
+them, over all 60 cases, GrooveSeek hybrid reaches P@1 0.683 / MRR 0.862 /
+nDCG@5 0.776 at a median of 112 ms (p95 118 ms); P@1 goes 0.567 → 0.683 and
+the rate at which a forbidden document reaches the top 5 halves, 0.417 →
+0.200. On a corpus where `status` and `environment` decide whether an answer
+is *safe*, that second number is the whole argument. Weighted total 0.9488
+against 0.6850 on the brief's default weights.
+
+**Caveats, as stated by the author:** synthetic single-domain corpus, one
+machine, and QMD has no frontmatter model at all — so metadata is a capability
+gap rather than a loss on quality.
+
+The *deprecated-trap* result is the one this project takes as a to-do rather
+than a footnote; it is on the record here so that a later release can be
+measured against it.
+
 ## `groove tune` — measuring the fusion parameters (v0.13.0+)
 
 `groove eval` tells you how good retrieval is. `groove tune` tells you whether

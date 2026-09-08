@@ -361,6 +361,53 @@ CI 例:
   `groove tune`)
 - **必須化**: `eval` は `index` / `serve` / `search` の挙動を 1 バイトも変えない
 
+## 第三者による計測
+
+以下の数値は **Johannes Engler
+([@johannes-engler-mw](https://github.com/johannes-engler-mw))** 氏が
+[issue #252](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5586388455)
+で計測・公開したもので、許可を得て帰属を明記して転載している。本プロジェクト自身の
+計測ではない。条件と負けた項目も勝った項目と一緒に写している — それを省いた引用には
+価値が無いため。
+
+**条件。** macOS 26.5.1 (arm64)、1 台、両側とも CLI のみ。`groove 1.2.0` を `1.7.0` で
+再計測し、**4 モード × 60 ケースすべてでスコア変化 0・top-5 順位変化 0** (chunking も
+同一: 57 文書 → 297 chunk)。比較対象は `qmd 2.8.3`。57 文書の合成 Platform Engineering
+corpus で実データは無し: git 由来 38、Confluence export 10、意図的な decoy 7 (staging の
+runbook と字面がほぼ同じ production runbook、後継より keyword の重なりが多い deprecated
+runbook)、untrusted 2。12 query class にわたる 60 fixture case を文書単位の判定に対して
+決定的に採点 — retrieval の数値に LLM judge は入っていない。両エンジンとも chunk 単位の
+hit を返し、同じ方法で文書単位に dedup。
+
+**同条件比較。** QMD には metadata filter が無いので、filter 付きの 17 case は失敗と
+採点せず unsupported として除外し、両エンジンが同じ条件で走る 43 case を比べた:
+
+| Backend / mode | n | P@1 | MRR | nDCG@5 |
+| --- | ---: | ---: | ---: | ---: |
+| GrooveSeek hybrid (filter 無し) | 43 | **0.651** | **0.873** | **0.775** |
+| QMD `vsearch` | 43 | 0.558 | 0.845 | 0.708 |
+| QMD `query` (hybrid + LLM rerank) | 43 | 0.512 | 0.857 | 0.750 |
+| QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
+
+**GrooveSeek が負けた、または同点だった項目。** *typo* (n=6): P@1 0.500 対 QMD 0.833、全 class の中で
+QMD 側の差が最も大きい。*deprecated-trap* (n=4): P@1 **0.000** — keyword の重なりが多い deprecated
+runbook が、現行の後継を毎回 rank 1 で押しのける。*environment-filtered* (n=5): 0.200 で
+同点。*ambiguous* (n=4): 0.500 対 0.750。cross-encoder reranker は中央値 latency を
+51 倍にして P@1 を 0.067 落としたので、その環境では off (1.2.0 では 65 倍。rerank の
+経路は返す物を変えずに速くなった)。
+
+**決め手**は QMD に無い metadata filter だった: filter ありの 60 case 全体で GrooveSeek
+hybrid は P@1 0.683 / MRR 0.862 / nDCG@5 0.776、中央値 112 ms (p95 118 ms)。P@1 は
+0.567 → 0.683 に上がり、禁止された文書が top 5 に入る率は 0.417 → 0.200 と半減。
+`status` と `environment` が「その答えは安全か」を決める corpus では、後者の数字が
+議論のすべてになる。brief の既定重みでの加重合計は 0.9488 対 0.6850。
+
+**著者が付けた注意書き:** 合成の単一 domain corpus、1 台、そして QMD には frontmatter
+model 自体が無い — つまり metadata は品質の負けではなく機能の差。
+
+*deprecated-trap* の結果は本プロジェクトが脚注ではなく to-do として受け取るもので、後の
+版がこれに対して測れるようにここに記録しておく。
+
 ## `groove tune` — fusion パラメータを測る (v0.13.0+)
 
 `groove eval` は「検索品質がどれくらい良いか」を教えてくれる。`groove tune` は
