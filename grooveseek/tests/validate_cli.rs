@@ -450,3 +450,107 @@ fn validate_honours_grooveseekignore() {
          file pattern, leaving good.md and notes/a.md"
     );
 }
+
+/// feature-57: `--strict` reports each key the schema does not name, and
+/// the five named fields are never among them.
+#[test]
+fn test_validate_strict_reports_undeclared_keys_json() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-strict");
+    kb.write(
+        "a.md",
+        "---\ntitle: A\ndate: 2026-09-09\nstatus: active\nteam: platform\nmeta: {a: 1}\n---\n# body\n",
+    );
+    kb.write(
+        "groove-schema.toml",
+        "[fields.title]\nrequired = true\n\n[fields.status]\n",
+    );
+    let args = [
+        "validate",
+        "--kb-path",
+        kb.path.to_str().unwrap(),
+        "--format",
+        "json",
+    ];
+
+    let (code, out, err) = run(&bin, &args);
+    assert_eq!(
+        code, 0,
+        "without --strict the undeclared keys pass: {err}\n{out}"
+    );
+
+    let mut strict = args.to_vec();
+    strict.push("--strict");
+    let (code, out, err) = run(&bin, &strict);
+    assert_eq!(code, 1, "strict: stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON output");
+    assert_eq!(v["violated"], 1);
+    let violations = v["files"][0]["violations"].as_array().unwrap();
+    let fields: Vec<&str> = violations
+        .iter()
+        .map(|x| {
+            assert_eq!(x["kind"], "undeclared_field");
+            x["field"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["meta", "team"],
+        "one per key, in key order; date is named"
+    );
+}
+
+/// The config form needs no flag, and text / github keep one line per violation.
+#[test]
+fn test_validate_allow_unknown_fields_false_needs_no_flag() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-strict-config");
+    kb.write("a.md", "---\ntitle: A\nteam: platform\n---\n# body\n");
+    kb.write(
+        "groove-schema.toml",
+        "[options]\nallow_unknown_fields = false\n\n[fields.title]\nrequired = true\n",
+    );
+    let kbp = kb.path.to_str().unwrap();
+
+    let (code, out, _err) = run(&bin, &["validate", "--kb-path", kbp, "--no-color"]);
+    assert_eq!(code, 1);
+    let lines: Vec<&str> = out.lines().filter(|l| l.contains("team")).collect();
+    assert_eq!(lines.len(), 1, "one text line for the key: {out}");
+    assert!(lines[0].contains("is not declared in the schema"), "{out}");
+
+    let (code, out, _err) = run(&bin, &["validate", "--kb-path", kbp, "--format", "github"]);
+    assert_eq!(code, 1);
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("::error file=a.md") && l.contains("team is not declared")),
+        "github annotation: {out}"
+    );
+}
+
+/// `--strict` with no schema is still the non-disruptive exit 0.
+#[test]
+fn test_validate_strict_without_schema_exits_zero() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-strict-noschema");
+    kb.write("a.md", "---\ntitle: X\nteam: p\n---\n# body\n");
+    let (code, _out, err) = run(
+        &bin,
+        &[
+            "validate",
+            "--kb-path",
+            kb.path.to_str().unwrap(),
+            "--strict",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("no schema found"), "{err}");
+}
