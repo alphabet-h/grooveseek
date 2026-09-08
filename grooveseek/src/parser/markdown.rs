@@ -57,6 +57,12 @@ pub const TAG_FRONTMATTER_UNPARSED: &str = "frontmatter:unparsed";
 /// entry that every strict run reports as undeclared. Merge expansion runs only
 /// on the fallback path a successful direct deserialize never takes, so the
 /// value behind it is unexpanded and is not read either.
+///
+/// A *quoted* `"<<"` key (a literal string, not a merge) is not distinguished
+/// from this and is dropped the same way: serde's map API hands the key over
+/// as a plain `String` with no record of its YAML style, so there is no way
+/// to tell the two apart here. 1.8.0 dropped a quoted `"<<"` too, so this is
+/// an existing limitation rather than one this change introduces.
 const MERGE_KEY: &str = "<<";
 
 /// Intermediate representation for serde_yaml_bw deserialization.
@@ -169,6 +175,37 @@ fn number_text(n: impl Into<serde_yaml_bw::Number>) -> String {
     n.into().to_string()
 }
 
+/// A YAML scalar on its way to becoming the text [`FieldValue::Scalar`] and a
+/// retained list element hold it as. [`ScalarValue::text`] is the one
+/// function both [`FieldValueVisitor`]'s own scalar arms and
+/// [`SeqElementVisitor`]'s route every primitive through, so a scalar is
+/// turned into text in exactly one place whether it sits at a mapping's top
+/// level or inside a list -- the two visitors' non-scalar arms still differ
+/// on purpose (see [`SeqElementVisitor`]'s doc comment).
+enum ScalarValue {
+    Str(String),
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    I128(i128),
+    U128(u128),
+}
+
+impl ScalarValue {
+    fn text(self) -> String {
+        match self {
+            ScalarValue::Str(s) => s,
+            ScalarValue::Bool(v) => v.to_string(),
+            ScalarValue::I64(v) => number_text(v),
+            ScalarValue::U64(v) => number_text(v),
+            ScalarValue::F64(v) => number_text(v),
+            ScalarValue::I128(v) => v.to_string(),
+            ScalarValue::U128(v) => v.to_string(),
+        }
+    }
+}
+
 /// Reads a retained value for its **shape**, never its contents (feature-57).
 ///
 /// Every nested thing is drained with `IgnoredAny`: a mapping's entries and
@@ -177,6 +214,12 @@ fn number_text(n: impl Into<serde_yaml_bw::Number>) -> String {
 /// standard tags are resolved by the deserializer before a visitor sees them,
 /// so there is no alias or tagged shape here -- [`FieldValue::Other`] is exactly `"mapping"`,
 /// `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
+///
+/// `visit_some` and `visit_newtype_struct` are deliberately not implemented:
+/// `serde_yaml_bw`'s `deserialize_any` does not call either of them today, so
+/// they are dead code here; were that to change, serde's default for a
+/// `Visitor` without them is an error, which is a safe (loud, not silent)
+/// failure mode to fall through to rather than a guess at the right shape.
 struct FieldValueVisitor;
 
 impl<'de> Deserialize<'de> for FieldValue {
@@ -193,38 +236,38 @@ impl<'de> Visitor<'de> for FieldValueVisitor {
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(v.to_string()))
+        Ok(FieldValue::Scalar(ScalarValue::Str(v.to_string()).text()))
     }
 
     fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(v))
+        Ok(FieldValue::Scalar(ScalarValue::Str(v).text()))
     }
 
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(v.to_string()))
+        Ok(FieldValue::Scalar(ScalarValue::Bool(v).text()))
     }
 
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(number_text(v)))
+        Ok(FieldValue::Scalar(ScalarValue::I64(v).text()))
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(number_text(v)))
+        Ok(FieldValue::Scalar(ScalarValue::U64(v).text()))
     }
 
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(number_text(v)))
+        Ok(FieldValue::Scalar(ScalarValue::F64(v).text()))
     }
 
     /// An integer too wide for `i64` / `u64`. `serde_yaml_bw` hands those over
     /// as 128-bit rather than as text, and serde's default for these is an
     /// error -- which would refuse a whole block over a key nobody declared.
     fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(v.to_string()))
+        Ok(FieldValue::Scalar(ScalarValue::I128(v).text()))
     }
 
     fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
-        Ok(FieldValue::Scalar(v.to_string()))
+        Ok(FieldValue::Scalar(ScalarValue::U128(v).text()))
     }
 
     /// A key written with no value (`status:`, `~`, `null`).
@@ -254,11 +297,21 @@ impl<'de> Visitor<'de> for FieldValueVisitor {
         Ok(FieldValue::Other("mapping"))
     }
 
+    /// Each element is read as a [`SeqElement`], not recursively as a
+    /// [`FieldValue`]: a non-scalar element (a nested mapping or sequence)
+    /// must stay on the cheap `IgnoredAny`-draining path [`SeqElementVisitor`]
+    /// gives it, the same way [`Self::visit_map`] drains a mapping's entries.
+    /// Recursing through [`FieldValue`] here instead was tried and reverted --
+    /// materialising a nested sequence as a value (rather than draining it)
+    /// forces `serde_yaml_bw` to fully resolve any alias inside it, which
+    /// spends the same repetition budget [`RawFrontmatter`]'s doc comment
+    /// says retaining a key must not spend, and refuses the alias-graph
+    /// fixture in this module's tests that 1.8.0 indexed fine. Draining
+    /// continues past the first non-scalar: stopping mid-sequence would leave
+    /// the deserializer's own position inside it.
     fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
         let mut items = Vec::new();
         let mut opaque = false;
-        // Draining continues past the first non-scalar: stopping mid-sequence
-        // would leave the deserializer's own position inside it.
         while let Some(SeqElement(text)) = seq.next_element::<SeqElement>()? {
             match text {
                 Some(s) => items.push(s),
@@ -282,8 +335,13 @@ impl<'de> Visitor<'de> for FieldValueVisitor {
 }
 
 /// One element of a retained sequence: `Some(text)` for a scalar, `None` for a
-/// shape that makes the whole sequence opaque. The non-scalar is drained, not
-/// read -- that is what keeps a nested structure from being walked.
+/// shape that makes the whole sequence opaque. A non-scalar element is
+/// drained with `IgnoredAny`, not read: that is what keeps a nested mapping
+/// or sequence -- and any alias inside it -- from being walked or resolved,
+/// exactly as [`FieldValueVisitor::visit_map`] does for a mapping. Every
+/// scalar arm here routes through the same [`ScalarValue::text`] that
+/// [`FieldValueVisitor`]'s own scalar arms use, so a scalar is classified in
+/// one place regardless of which of the two visitors sees it.
 struct SeqElement(Option<String>);
 
 impl<'de> Deserialize<'de> for SeqElement {
@@ -302,35 +360,35 @@ impl<'de> Visitor<'de> for SeqElementVisitor {
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(v.to_string())))
+        Ok(SeqElement(Some(ScalarValue::Str(v.to_string()).text())))
     }
 
     fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(v)))
+        Ok(SeqElement(Some(ScalarValue::Str(v).text())))
     }
 
     fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(v.to_string())))
+        Ok(SeqElement(Some(ScalarValue::Bool(v).text())))
     }
 
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(number_text(v))))
+        Ok(SeqElement(Some(ScalarValue::I64(v).text())))
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(number_text(v))))
+        Ok(SeqElement(Some(ScalarValue::U64(v).text())))
     }
 
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(number_text(v))))
+        Ok(SeqElement(Some(ScalarValue::F64(v).text())))
     }
 
     fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(v.to_string())))
+        Ok(SeqElement(Some(ScalarValue::I128(v).text())))
     }
 
     fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
-        Ok(SeqElement(Some(v.to_string())))
+        Ok(SeqElement(Some(ScalarValue::U128(v).text())))
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -626,7 +684,7 @@ mod tests {
     #[test]
     fn test_unknown_keys_are_retained_by_shape() {
         use crate::parser::FieldValue;
-        let md = "---\ntitle: T\nstatus: active\nenvironment: [dev, test]\nflag: false\nn: 10\nratio: 1.5\nmeta: {a: 1}\nempty:\nnested: [[a]]\nlong: |\n  two\n  lines\ntagged: !!str yes\ninlist: [!!str a, b]\n---\n\nBody long enough to stand as one chunk on its own here.\n";
+        let md = "---\ntitle: T\nstatus: active\nenvironment: [dev, test]\nflag: false\nn: 10\nratio: 1.5\nwhole: 1.0\nmeta: {a: 1}\nempty:\nnested: [[a]]\nlong: |\n  two\n  lines\ntagged: !!str yes\ninlist: [!!str a, b]\n---\n\nBody long enough to stand as one chunk on its own here.\n";
         let doc = parse(md);
         assert_eq!(doc.frontmatter_error, None);
         assert_eq!(doc.frontmatter.title.as_deref(), Some("T"));
@@ -639,6 +697,9 @@ mod tests {
         assert_eq!(e["flag"], FieldValue::Scalar("false".into()));
         assert_eq!(e["n"], FieldValue::Scalar("10".into()));
         assert_eq!(e["ratio"], FieldValue::Scalar("1.5".into()));
+        // A whole-number float prints with its `.0`, the YAML-writer shape
+        // `number_text` exists for -- not Rust's own `1` a bare cast would give.
+        assert_eq!(e["whole"], FieldValue::Scalar("1.0".into()));
         assert_eq!(e["meta"], FieldValue::Other("mapping"));
         assert_eq!(e["empty"], FieldValue::Other("null"));
         assert_eq!(e["nested"], FieldValue::Other("nested sequence"));
@@ -646,7 +707,7 @@ mod tests {
         assert_eq!(e["tagged"], FieldValue::Scalar("yes".into()));
         assert_eq!(e["inlist"], FieldValue::List(vec!["a".into(), "b".into()]));
         assert!(!e.contains_key("title"), "a named field is not an extra");
-        assert_eq!(e.len(), 11, "every unknown key and nothing else: {e:?}");
+        assert_eq!(e.len(), 12, "every unknown key and nothing else: {e:?}");
     }
 
     /// A document with no unknown keys has an empty map; the five named
