@@ -26,7 +26,7 @@
 //! ```
 //!
 //! `validate(fm, schema)` は `Frontmatter` 構造体に対して違反を返す。
-//! `validate_document(doc, schema)` はその前段で、YAML が parse できなかった
+//! [`crate::schema::validate_document`] はその前段で、YAML が parse できなかった
 //! 文書を違反 1 件 (`frontmatter_unparsed`) に畳む。CLI `groove validate`
 //! サブコマンドは後者を呼ぶ。
 
@@ -329,11 +329,11 @@ pub fn validate(fm: &Frontmatter, schema: &Schema) -> Vec<Violation> {
 }
 
 /// Validate a parsed Markdown document. A `---` block the parser refused
-/// (`doc.frontmatter_error` is `Some`) is one [`Violation::FrontmatterUnparsed`]
+/// ([`ParsedDocument::frontmatter_error`] is `Some`) is one [`Violation::FrontmatterUnparsed`]
 /// and the schema is not applied -- the frontmatter behind it is the parser's
 /// placeholder (empty fields, the `frontmatter:unparsed` tag), and blaming
 /// those would name the tag rather than the YAML (#251, #252). Otherwise this
-/// is [`validate`] on `doc.frontmatter`.
+/// is [`validate`] on [`ParsedDocument::frontmatter`].
 pub fn validate_document(doc: &ParsedDocument, schema: &Schema) -> Vec<Violation> {
     match &doc.frontmatter_error {
         Some(reason) => vec![Violation::FrontmatterUnparsed {
@@ -784,7 +784,7 @@ enum = ["mcp", "rag"]"#,
     }
 
     /// `pattern` on an array field is applied to every element, the way
-    /// `enum` is: one `PatternMismatch` per offending element, in tag order,
+    /// `enum` is: one [`Violation::PatternMismatch`] per offending element, in tag order,
     /// carrying the element as `actual` (#252).
     #[test]
     fn test_validate_tags_pattern_on_each_element() {
@@ -840,7 +840,7 @@ pattern = '^[a-z-]+$'"#,
     }
 
     /// An element that fails both checks yields both violations, pattern
-    /// first -- the order `check_string` uses for a string field.
+    /// first -- the order [`check_string`] uses for a string field.
     #[test]
     fn test_validate_tags_pattern_then_enum_for_one_element() {
         let s = schema(
@@ -964,7 +964,7 @@ min_length = 1"#,
         crate::parser::MarkdownParser.parse(raw, "doc.md", &[])
     }
 
-    /// The schema every `validate_document` test below is held against:
+    /// The schema every [`validate_document`] test below is held against:
     /// each rule would fire on the empty metadata the parser leaves behind a
     /// refused block, so any of them leaking through is visible.
     fn strict_schema() -> Schema {
@@ -988,8 +988,8 @@ enum = ["mcp"]"#,
 
     /// Since 1.7.0 the parser tags a document whose YAML was refused with
     /// `frontmatter:unparsed` and leaves every other field empty (#251), so
-    /// `validate` on that frontmatter blamed the tag and the missing title.
-    /// `validate_document` reports the refusal itself, once, instead.
+    /// [`validate`] on that frontmatter blamed the tag and the missing title.
+    /// [`validate_document`] reports the refusal itself, once, instead.
     #[test]
     fn test_validate_document_broken_yaml_is_one_violation() {
         let doc = parse_md("---\ntitle: [unclosed\n---\n# body\n");
