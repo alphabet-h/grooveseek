@@ -1,6 +1,6 @@
 [package]
 name = "groove-tray"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 description = "Windows system tray monitor for groove daemon"
 authors = ["koshian"]
