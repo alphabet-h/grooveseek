@@ -701,7 +701,13 @@ impl Database {
         }
         // The failed `open` dropped its connection with the error, so the
         // file is closed here -- Windows refuses to delete an open one.
-        for suffix in ["", "-wal", "-shm"] {
+        //
+        // Sidecars first, the database last (codex P2 on #284): a sidecar that
+        // cannot be removed (locked, or owned by someone else) then stops the
+        // run with the database still on disk, instead of leaving a half-
+        // deleted set -- and a stale WAL beside a recreated database is the
+        // one leftover that could poison the replacement.
+        for suffix in ["-wal", "-shm", ""] {
             let victim = format!("{path}{suffix}");
             match std::fs::remove_file(&victim) {
                 Ok(()) => {}
@@ -6887,6 +6893,32 @@ mod tests {
                 assert_ne!(bytes, b"stale shm", "{p} must not be the stale sidecar");
             }
         }
+    }
+
+    /// A sidecar that cannot be removed stops the replacement with the
+    /// database still on disk (codex P2 on #284). A directory where `-wal`
+    /// should be is the portable way to make `remove_file` fail: a locked file
+    /// would need a second process on Windows and nothing at all on Linux.
+    #[test]
+    fn a_sidecar_that_cannot_be_removed_leaves_the_database_on_disk() {
+        let dir = CorruptDir::new("stuck-sidecar");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::create_dir_all(format!("{db_path}-wal")).expect("mkdir where -wal goes");
+
+        let err = match Database::open_or_replace_corrupt(&db_path) {
+            Ok(_) => panic!("a sidecar that will not go must stop the replacement"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("-wal"),
+            "the file that stopped it is named: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the database is not deleted before its sidecars are gone"
+        );
     }
 
     /// Any other failure inside [`Database::init`] is not corruption and must not be
