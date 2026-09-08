@@ -755,16 +755,15 @@ impl Database {
     /// over an error that is not corruption.
     ///
     /// Two `--force` runs on the same file are serialised by
-    /// [`ReplaceLock`] (codex P2 on #284, round 3): the second waits for
-    /// nothing, it fails naming the lock. Under the lock the file is looked
-    /// at again, so a run that classified it as corrupt before another run
-    /// replaced it opens the replacement instead of deleting it.
+    /// [`ReplaceLock`] (codex P2 on #284, rounds 3 and 4): the lock is taken
+    /// before the first look, so a run never opens a file another run is in
+    /// the middle of replacing -- on Windows that open would hold the file
+    /// against the deletion -- and never opens a half-made replacement. The
+    /// second run waits for nothing, it fails naming the lock. The lock
+    /// covers the open, not the indexing that follows: two runs that both
+    /// get a database to open then race exactly as two `--force` runs on a
+    /// healthy file always have.
     pub fn open_or_replace_corrupt(path: &str) -> Result<(Self, bool)> {
-        match Self::open(path) {
-            Ok(db) => return Ok((db, false)),
-            Err(err) if err.downcast_ref::<CorruptDatabase>().is_none() => return Err(err),
-            Err(_) => {}
-        }
         let _lock = ReplaceLock::acquire(path)?;
         match Self::open(path) {
             Ok(db) => return Ok((db, false)),
@@ -7036,10 +7035,10 @@ mod tests {
         );
     }
 
-    /// A run that saw the file as corrupt, then took the lock after another
-    /// run had already replaced it, opens the replacement rather than
-    /// deleting it. Simulated by the healthy file itself: what the second look
-    /// under the lock sees is the same either way.
+    /// A run that reaches the lock after another run has replaced the file
+    /// opens the replacement rather than deleting it, and leaves no lock
+    /// behind. Simulated by the healthy file itself: what the look under the
+    /// lock sees is the same either way.
     #[test]
     fn a_replacement_that_appeared_before_the_lock_is_kept() {
         let dir = CorruptDir::new("relooked");
