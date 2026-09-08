@@ -474,11 +474,12 @@ pub enum SingleResult {
         reason: &'static str,
         frontmatter_unparsed: bool,
     },
-    /// (#251) 内容は変わっていないが、この版が frontmatter の parse 失敗を tag として
-    /// 書くようになる前に索引された文書だったので、metadata だけ書き直した
-    /// (= `frontmatter:unparsed` を付けた)。embedding は触らない。[`rebuild_index`] の
-    /// 1 回限りの upgrade 経路でしか返らない。
-    MetadataRefreshed,
+    /// (#251 / feature-58) 内容は変わっていないが metadata だけ書き直した。embedding は触らない。
+    /// `rebuild_index` の upgrade 経路でしか返らない。`frontmatter_unparsed` は
+    /// **この文書の frontmatter が壊れていたか** — 集計はそれだけを
+    /// [`IndexResult::frontmatter_unparsed`] に数える。宣言 key の書き直しだけで
+    /// 通った文書は `false` で返り、`[index].fail_on_frontmatter_error` を動かさない。
+    MetadataRefreshed { frontmatter_unparsed: bool },
     /// (BU-20) 開いた handle が「集めた時のファイルではない」と答えた
     /// (hardlink / symlink / 非通常ファイル / handle 側 size 超過)。
     ///
@@ -570,6 +571,22 @@ pub fn rebuild_index(
     // unchanged Markdown document once; `--force` re-parses everything anyway.
     let refresh_frontmatter =
         !force && db.read_frontmatter_policy()?.as_deref() != Some(FRONTMATTER_POLICY);
+
+    // (feature-58) The keys the schema declares are what `document_fields` holds.
+    // Read here, on every run, from the same path `groove validate` uses; a
+    // schema that does not load stops the run the way a config that does not
+    // load stops the binary -- silently indexing without it would make every
+    // `--field` answer empty and say nothing. Compared with what the last
+    // completed run recorded: on a difference every unchanged Markdown document
+    // is read once more so its rows follow the schema, without re-embedding.
+    let schema = crate::schema::Schema::load_optional(&kb_path.join("groove-schema.toml"))?;
+    let declared_fields = declared_field_names(schema.as_ref());
+    let declared_json = serde_json::to_string(&declared_fields)?;
+    let stored_declared = db.read_declared_fields()?;
+    let refresh_fields = !force
+        && stored_declared.as_deref() != Some(declared_json.as_str())
+        && !(stored_declared.is_none() && declared_json == DECLARED_FIELDS_NONE);
+    let refresh_any = refresh_frontmatter || refresh_fields;
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
@@ -688,13 +705,14 @@ pub fn rebuild_index(
     let mut updated: u32 = 0;
     let mut frontmatter_unparsed: u32 = 0;
     let mut refreshed: u32 = 0;
+    let mut refreshed_fields: u32 = 0;
     // (#251, codex P2 round 2) The one-time check is recorded as done only when every
     // Markdown document it was meant to read was read. A legacy file the scan could not
     // open, or that this loop skips or refuses, keeps the check pending: its row is
     // retained, so when the file is back with the same content the fast path would
     // otherwise hide it for good.
     let mut refresh_pending = false;
-    if refresh_frontmatter {
+    if refresh_any {
         for rel in &skipped_paths {
             if indexed_markdown_hash(db, registry, rel)?.is_some() {
                 refresh_pending = true;
@@ -714,6 +732,7 @@ pub fn rebuild_index(
         } else {
             Reindex::Incremental {
                 check_frontmatter: refresh_frontmatter,
+                refresh_fields,
             }
         };
 
@@ -725,6 +744,7 @@ pub fn rebuild_index(
             registry,
             mode,
             context_mode,
+            &declared_fields,
         )? {
             SingleResult::Updated {
                 chunks,
@@ -752,7 +772,7 @@ pub fn rebuild_index(
                 // which is the row's bytes only when the hashes agree. Otherwise the old
                 // bytes can come back, match the retained hash, and hide behind the fast
                 // path for good (codex P2, rounds 3 and 4).
-                if refresh_frontmatter
+                if refresh_any
                     && let Some(row_hash) = indexed_markdown_hash(db, registry, &entry.rel)?
                     && (reason != SKIPPED_NO_CHUNKS || row_hash != entry.hash)
                 {
@@ -764,15 +784,21 @@ pub fn rebuild_index(
             // does: the file is not indexed and the reason is already on stderr.
             SingleResult::Refused => {
                 skipped_count += 1;
-                if refresh_frontmatter && indexed_markdown_hash(db, registry, &entry.rel)?.is_some()
-                {
+                if refresh_any && indexed_markdown_hash(db, registry, &entry.rel)?.is_some() {
                     refresh_pending = true;
                 }
                 progress.report_unchanged(&entry.rel);
             }
-            SingleResult::MetadataRefreshed => {
-                frontmatter_unparsed += 1;
-                refreshed += 1;
+            SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: fm_unparsed,
+            } => {
+                if fm_unparsed {
+                    frontmatter_unparsed += 1;
+                    refreshed += 1;
+                }
+                if refresh_fields {
+                    refreshed_fields += 1;
+                }
                 progress.report_unchanged(&entry.rel);
             }
             SingleResult::Unchanged => {
@@ -790,10 +816,23 @@ pub fn rebuild_index(
     if force || (refresh_frontmatter && !refresh_pending) {
         db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
     }
+    // (feature-58) Recorded after the loop for the same reason as the policy
+    // above: a run that stopped halfway leaves the old value and the next run
+    // looks again. Rewriting an unchanged value is harmless, and it is how an
+    // index with nothing to declare gets its `[]` without a pass.
+    if force || !refresh_fields || !refresh_pending {
+        db.write_declared_fields(&declared_json)?;
+    }
     if refreshed > 0 {
         eprintln!(
             "Tagged {refreshed} unchanged Markdown document(s) whose YAML frontmatter had failed to parse \
              before this version recorded it (one-time check; nothing was re-embedded)"
+        );
+    }
+    if refreshed_fields > 0 {
+        eprintln!(
+            "Recorded the declared frontmatter fields of {refreshed_fields} unchanged Markdown document(s) \
+             (the schema's declared keys changed; nothing was re-embedded)"
         );
     }
 
@@ -892,7 +931,13 @@ enum Reindex {
     /// Skip a file whose hash matches. With `check_frontmatter` set, an
     /// unchanged Markdown file is still read once so a frontmatter that fails
     /// to parse can be tagged without re-embedding ([`FRONTMATTER_POLICY`]).
-    Incremental { check_frontmatter: bool },
+    /// With `refresh_fields` set it is read once so its `document_fields`
+    /// rows follow the keys the schema now declares (feature-58). Either
+    /// reason opens the file; each decides its own write.
+    Incremental {
+        check_frontmatter: bool,
+        refresh_fields: bool,
+    },
 }
 
 /// 単一 DiskEntry を index する内部関数。
@@ -907,12 +952,16 @@ fn index_single_disk_entry(
     registry: &Registry,
     mode: Reindex,
     context_mode: ContextMode,
+    declared_fields: &[String],
 ) -> Result<SingleResult> {
     let force = mode == Reindex::Force;
-    let refresh_frontmatter = mode
-        == Reindex::Incremental {
-            check_frontmatter: true,
-        };
+    let (refresh_frontmatter, refresh_fields) = match mode {
+        Reindex::Incremental {
+            check_frontmatter,
+            refresh_fields,
+        } => (check_frontmatter, refresh_fields),
+        Reindex::Force => (false, false),
+    };
     // (AV-12) Every path that can put a document into an index arrives here, which is why the
     // chunking policy is resolved here rather than at each caller: the first attempt covered
     // `reindex_single_file` and missed the rename branch, which reaches this function directly
@@ -949,7 +998,8 @@ fn index_single_disk_entry(
         && db
             .get_document_hash(&entry.rel)?
             .is_some_and(|existing| existing == entry.hash);
-    let refresh_only = unchanged && refresh_frontmatter && parser.extension() == "md";
+    let refresh_only =
+        unchanged && (refresh_frontmatter || refresh_fields) && parser.extension() == "md";
     if unchanged && !refresh_only {
         return Ok(SingleResult::Unchanged);
     }
@@ -1036,23 +1086,40 @@ fn index_single_disk_entry(
                 frontmatter_unparsed: parsed.frontmatter_error.is_some(),
             });
         }
-        if parsed.frontmatter_error.is_none() {
+        // (#251 / feature-58) Two reasons open an unchanged file, and each decides
+        // its own write: a broken frontmatter gets its metadata -- which is where
+        // the tag lives -- written again; a changed declared-key set gets the
+        // document's rows written again. A clean file under the first reason
+        // alone is left exactly as it was.
+        let broken = parsed.frontmatter_error.is_some();
+        let tag_it = broken && refresh_frontmatter;
+        if !tag_it && !refresh_fields {
             return Ok(SingleResult::Unchanged);
         }
         let tx = db.begin_transaction()?;
-        db.update_document_meta(
-            &entry.rel,
-            parsed.frontmatter.title.as_deref(),
-            parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
-            category.as_deref(),
-            parsed.frontmatter.depth.as_deref(),
-            &parsed.frontmatter.tags,
-            parsed.frontmatter.date.as_deref(),
-            &entry.hash,
-            size_bytes,
-        )?;
+        if tag_it {
+            db.update_document_meta(
+                &entry.rel,
+                parsed.frontmatter.title.as_deref(),
+                parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
+                category.as_deref(),
+                parsed.frontmatter.depth.as_deref(),
+                &parsed.frontmatter.tags,
+                parsed.frontmatter.date.as_deref(),
+                &entry.hash,
+                size_bytes,
+            )?;
+        }
+        if refresh_fields {
+            db.replace_document_fields(
+                &entry.rel,
+                &declared_field_rows(&parsed.frontmatter.extra, declared_fields),
+            )?;
+        }
         tx.commit()?;
-        return Ok(SingleResult::MetadataRefreshed);
+        return Ok(SingleResult::MetadataRefreshed {
+            frontmatter_unparsed: tag_it,
+        });
     }
 
     if parsed.chunks.is_empty() {
@@ -1122,6 +1189,10 @@ fn index_single_disk_entry(
             size_bytes,
         )?;
         if updated {
+            db.replace_document_fields(
+                &entry.rel,
+                &declared_field_rows(&parsed.frontmatter.extra, declared_fields),
+            )?;
             // (feature-56) The chunk texts match, so the embeddings still stand — but the
             // *positions* may not. Inserting a blank line above a function, or trimming a
             // comment short enough to be dropped as a thin gap, moves every definition below
@@ -1180,6 +1251,10 @@ fn index_single_disk_entry(
         size_bytes,
         topic.as_deref(),
         category.as_deref(),
+    )?;
+    db.replace_document_fields(
+        &entry.rel,
+        &declared_field_rows(&parsed.frontmatter.extra, declared_fields),
     )?;
     tx.commit()?;
 
@@ -1367,6 +1442,13 @@ pub fn reindex_single_file(
     };
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    // (feature-58) The watcher paths write what the last completed `rebuild_index`
+    // recorded; they do not read the schema themselves.
+    let declared_fields: Vec<String> = match db.read_declared_fields()? {
+        Some(json) => serde_json::from_str(&json)
+            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}"))?,
+        None => Vec::new(),
+    };
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     index_single_disk_entry(
         db,
@@ -1376,8 +1458,10 @@ pub fn reindex_single_file(
         registry,
         Reindex::Incremental {
             check_frontmatter: false,
+            refresh_fields: false,
         },
         context_mode,
+        &declared_fields,
     )
 }
 
@@ -1455,7 +1539,7 @@ pub fn rename_single_file(
                 SingleResult::Updated { .. }
                 | SingleResult::Unchanged
                 | SingleResult::Skipped { .. }
-                | SingleResult::MetadataRefreshed => RenameOutcome::OldPathMissing,
+                | SingleResult::MetadataRefreshed { .. } => RenameOutcome::OldPathMissing,
             },
         );
     };
@@ -1545,6 +1629,13 @@ pub fn rename_single_file(
         full,
         size: new_bytes.len() as u64,
     };
+    // (feature-58) The watcher paths write what the last completed `rebuild_index`
+    // recorded; they do not read the schema themselves.
+    let declared_fields: Vec<String> = match db.read_declared_fields()? {
+        Some(json) => serde_json::from_str(&json)
+            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}"))?,
+        None => Vec::new(),
+    };
     // same_hash (= Static-mode-forced) の場合のみ force=true で
     // hash 一致 fast path をバイパスする。内容が変わっている場合は
     // 通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
@@ -1559,9 +1650,11 @@ pub fn rename_single_file(
         } else {
             Reindex::Incremental {
                 check_frontmatter: false,
+                refresh_fields: false,
             }
         },
         context_mode,
+        &declared_fields,
     )? {
         SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         // (codex P2 round 1 on PR #157) `index_single_disk_entry` reads the file
@@ -1576,7 +1669,7 @@ pub fn rename_single_file(
         // path) and is named so that adding a variant stays a compile error.
         SingleResult::Unchanged
         | SingleResult::Skipped { .. }
-        | SingleResult::MetadataRefreshed => Ok(RenameOutcome::Renamed),
+        | SingleResult::MetadataRefreshed { .. } => Ok(RenameOutcome::Renamed),
     }
 }
 
@@ -1737,6 +1830,48 @@ pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
 /// [`rebuild_index`] would never read them again. The value is a generation, like
 /// [`CODE_CHUNK_POLICY`]: it changes when what the parser writes changes.
 pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
+
+/// (feature-58) What `index_meta.declared_fields` holds when the schema declares
+/// no key beyond the five named ones, or there is no schema: the JSON of an
+/// empty list. Recorded without a refresh pass, since there is nothing to write.
+pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
+
+/// The keys `groove-schema.toml` declares that the parser keeps in
+/// [`crate::parser::Frontmatter::extra`] — every `[fields.<name>]` except the
+/// five the parser stores in their own fields, which have their own columns
+/// and their own filters. Sorted, so its JSON is a stable generation key.
+pub(crate) fn declared_field_names(schema: Option<&crate::schema::Schema>) -> Vec<String> {
+    const NAMED: [&str; 5] = ["title", "date", "topic", "depth", "tags"];
+    schema
+        .map(|s| {
+            s.fields
+                .keys()
+                .filter(|k| !NAMED.contains(&k.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `document_fields` rows of one document: for each declared key the
+/// frontmatter holds, a scalar as one row and a list as one row per element.
+/// An opaque shape and a null hold no value (ADR-0019) and write nothing;
+/// an undeclared key is not the index's business.
+pub(crate) fn declared_field_rows(
+    extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
+    declared: &[String],
+) -> Vec<(String, String)> {
+    use crate::parser::FieldValue;
+    let mut rows = Vec::new();
+    for key in declared {
+        match extra.get(key) {
+            Some(FieldValue::Scalar(s)) => rows.push((key.clone(), s.clone())),
+            Some(FieldValue::List(vs)) => rows.extend(vs.iter().map(|v| (key.clone(), v.clone()))),
+            Some(FieldValue::Other(_)) | None => {}
+        }
+    }
+    rows
+}
 
 /// What an index that was built before [`CODE_CHUNK_POLICY`] existed is recorded as.
 ///
@@ -2881,6 +3016,63 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // feature-58: declared fields (pure fn)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn declared_field_names_drops_the_five_named_fields_and_sorts() {
+        let schema = crate::schema::Schema::from_toml_str(
+            "[fields.title]\nrequired = true\n[fields.team]\n[fields.status]\nenum = [\"active\"]\n[fields.tags]\ntype = \"array\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared_field_names(Some(&schema)),
+            vec!["status".to_string(), "team".to_string()]
+        );
+        assert!(declared_field_names(None).is_empty());
+    }
+
+    #[test]
+    fn declared_field_rows_keeps_scalars_and_list_elements_of_declared_keys_only() {
+        use crate::parser::FieldValue;
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "status".to_string(),
+            FieldValue::Scalar("active".to_string()),
+        );
+        extra.insert(
+            "environment".to_string(),
+            FieldValue::List(vec![
+                "dev".to_string(),
+                "prod".to_string(),
+                "dev".to_string(),
+            ]),
+        );
+        extra.insert("owner".to_string(), FieldValue::Other("mapping"));
+        extra.insert("note".to_string(), FieldValue::Other(FieldValue::NULL));
+        extra.insert(
+            "undeclared".to_string(),
+            FieldValue::Scalar("x".to_string()),
+        );
+        let declared = [
+            "environment".to_string(),
+            "note".to_string(),
+            "owner".to_string(),
+            "status".to_string(),
+        ];
+        assert_eq!(
+            declared_field_rows(&extra, &declared),
+            vec![
+                ("environment".to_string(), "dev".to_string()),
+                ("environment".to_string(), "prod".to_string()),
+                ("environment".to_string(), "dev".to_string()), // the DB folds it; the rows are what the parser held
+                ("status".to_string(), "active".to_string()),
+            ]
+        );
+        assert!(declared_field_rows(&extra, &[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // 増分 index API
     // -----------------------------------------------------------------------
 
@@ -3124,8 +3316,10 @@ mod tests {
             &Registry::default(),
             Reindex::Incremental {
                 check_frontmatter: true,
+                refresh_fields: false,
             },
             ContextMode::Off,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -3165,8 +3359,10 @@ mod tests {
             &Registry::default(),
             Reindex::Incremental {
                 check_frontmatter: true,
+                refresh_fields: false,
             },
             ContextMode::Off,
+            &[],
         )
         .unwrap();
         assert_eq!(

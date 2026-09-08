@@ -730,7 +730,7 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         }
         // (#251) `MetadataRefreshed` cannot come back here: the one-time check
         // is off on this path. Named so a new variant stays a compile error.
-        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed) => {
+        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed { .. }) => {
             /* no-op */
         }
         // (BU-20) The reason is already on stderr from the read; this says what
