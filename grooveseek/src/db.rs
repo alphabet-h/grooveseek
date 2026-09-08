@@ -294,6 +294,34 @@ impl ContextMode {
     }
 }
 
+/// A declared-field filter, normalised the one way both surfaces use
+/// (feature-58): key → the values that count, in the order they were given,
+/// without duplicates, and never empty. The command line builds it from
+/// repeated `--field key=value`, the MCP tool from a `fields` object; both go
+/// through [`normalize_field_filters`] so the two cannot disagree.
+pub type FieldFilters = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Build a [`FieldFilters`] from raw `(key, values)` pairs. The same key
+/// given twice is one entry with the lists joined; a duplicate value is kept
+/// once; a key left with no value is dropped, because it would narrow nothing
+/// and the echo reports what had an effect.
+pub fn normalize_field_filters<I>(raw: I) -> FieldFilters
+where
+    I: IntoIterator<Item = (String, Vec<String>)>,
+{
+    let mut out = FieldFilters::new();
+    for (key, values) in raw {
+        let entry = out.entry(key).or_default();
+        for v in values {
+            if !entry.contains(&v) {
+                entry.push(v);
+            }
+        }
+    }
+    out.retain(|_, v| !v.is_empty());
+    out
+}
+
 /// Search 系 API に渡す filter 引数の集約。
 ///
 /// 既存の category / topic / min_quality に加え、feature-26 で path_globs /
@@ -311,6 +339,13 @@ pub struct SearchFilters<'a> {
     pub tags_all: &'a [String],
     pub date_from: Option<&'a str>,
     pub date_to: Option<&'a str>,
+    /// Declared-field filter (feature-58): every entry must match (AND), an
+    /// entry matches when the document holds one of its values (OR). `None`
+    /// and an empty map are the same: no filter.
+    pub fields: Option<&'a FieldFilters>,
+    /// The exclusion form: a document holding one of the values of any entry
+    /// is dropped; a document without the key survives.
+    pub fields_not: Option<&'a FieldFilters>,
 }
 
 impl<'a> SearchFilters<'a> {
@@ -329,6 +364,8 @@ impl<'a> SearchFilters<'a> {
             || !self.tags_all.is_empty()
             || self.date_from.is_some()
             || self.date_to.is_some()
+            || self.fields.is_some_and(|f| !f.is_empty())
+            || self.fields_not.is_some_and(|f| !f.is_empty())
     }
 }
 
@@ -5087,6 +5124,213 @@ mod tests {
         assert!(paths.contains(&"doc_d.md"));
         assert!(!paths.contains(&"doc_b.md"));
         assert!(!paths.contains(&"doc_c.md"));
+    }
+
+    /// Three documents: a.md status=active team=core, b.md status=deprecated,
+    /// c.md has no declared field. Every chunk body carries the same unique
+    /// keyword so the FTS leg matches all three.
+    fn db_with_declared_fields() -> Database {
+        let db = db_with_384();
+        for (i, p) in ["a.md", "b.md", "c.md"].iter().enumerate() {
+            let id = db
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(
+                id,
+                0,
+                None,
+                None,
+                "fieldfilter_unique_keyword body",
+                None,
+                &dummy_embedding(0.1 + i as f32 * 0.01),
+                1.0,
+            )
+            .unwrap();
+        }
+        db.replace_document_fields(
+            "a.md",
+            &[
+                ("status".to_string(), "active".to_string()),
+                ("team".to_string(), "core".to_string()),
+            ],
+        )
+        .unwrap();
+        db.replace_document_fields("b.md", &[("status".to_string(), "deprecated".to_string())])
+            .unwrap();
+        db
+    }
+
+    fn field_map(pairs: &[(&str, &[&str])]) -> FieldFilters {
+        pairs
+            .iter()
+            .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))
+            .collect()
+    }
+
+    // NOTE: `search_similar` returns `Vec<SearchResult>` (not `(chunk_id,
+    // SearchResult)` tuples like the `pub(crate)` candidate methods), so this
+    // maps `.path` directly rather than destructuring a tuple.
+    fn paths_vec(db: &Database, filters: &SearchFilters<'_>) -> Vec<String> {
+        let mut v: Vec<String> = db
+            .search_similar(&dummy_embedding(0.1), 10, filters)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn paths_fts(db: &Database, filters: &SearchFilters<'_>) -> Vec<String> {
+        let mut v: Vec<String> = db
+            .search_fts_candidates(
+                "fieldfilter_unique_keyword",
+                10,
+                filters,
+                FusionParams::default(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r.path)
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn fields_filter_keeps_only_documents_holding_one_of_the_values() {
+        let db = db_with_declared_fields();
+        let one = field_map(&[("status", &["active"])]);
+        let f = SearchFilters {
+            fields: Some(&one),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md"]);
+
+        // Same key, two values: OR.
+        let either = field_map(&[("status", &["active", "deprecated"])]);
+        let f = SearchFilters {
+            fields: Some(&either),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md", "b.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md", "b.md"]);
+
+        // Two keys: AND. b.md has no team.
+        let both = field_map(&[("status", &["active", "deprecated"]), ("team", &["core"])]);
+        let f = SearchFilters {
+            fields: Some(&both),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md"]);
+
+        // An undeclared key matches nothing rather than erroring.
+        let nope = field_map(&[("nope", &["x"])]);
+        let f = SearchFilters {
+            fields: Some(&nope),
+            ..Default::default()
+        };
+        assert!(paths_vec(&db, &f).is_empty());
+        assert!(paths_fts(&db, &f).is_empty());
+    }
+
+    #[test]
+    fn fields_not_drops_matching_documents_and_keeps_those_without_the_key() {
+        let db = db_with_declared_fields();
+        let dep = field_map(&[("status", &["deprecated"])]);
+        let f = SearchFilters {
+            fields_not: Some(&dep),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md", "c.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md", "c.md"]);
+
+        // Two exclusions: a document matching either is dropped.
+        let two = field_map(&[("status", &["deprecated"]), ("team", &["core"])]);
+        let f = SearchFilters {
+            fields_not: Some(&two),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["c.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["c.md"]);
+
+        // Positive and negative together.
+        let pos = field_map(&[("status", &["active", "deprecated"])]);
+        let neg = field_map(&[("team", &["core"])]);
+        let f = SearchFilters {
+            fields: Some(&pos),
+            fields_not: Some(&neg),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["b.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["b.md"]);
+    }
+
+    #[test]
+    fn field_filters_count_as_a_filter_for_over_fetch_and_normalise_one_way() {
+        let m = field_map(&[("status", &["active"])]);
+        assert!(
+            SearchFilters {
+                fields: Some(&m),
+                ..Default::default()
+            }
+            .has_any()
+        );
+        assert!(
+            SearchFilters {
+                fields_not: Some(&m),
+                ..Default::default()
+            }
+            .has_any()
+        );
+        let empty = FieldFilters::new();
+        assert!(
+            !SearchFilters {
+                fields: Some(&empty),
+                ..Default::default()
+            }
+            .has_any()
+        );
+
+        let n = normalize_field_filters(vec![
+            (
+                "status".to_string(),
+                vec![
+                    "draft".to_string(),
+                    "active".to_string(),
+                    "draft".to_string(),
+                ],
+            ),
+            ("team".to_string(), vec![]),
+            (
+                "status".to_string(),
+                vec!["active".to_string(), "archived".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            n.get("status").unwrap(),
+            &vec![
+                "draft".to_string(),
+                "active".to_string(),
+                "archived".to_string()
+            ]
+        );
+        assert!(
+            !n.contains_key("team"),
+            "a key whose list is empty narrows nothing and is dropped"
+        );
     }
 
     #[test]

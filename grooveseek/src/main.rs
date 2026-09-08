@@ -1079,6 +1079,10 @@ fn main() -> anyhow::Result<()> {
                 tags_all: &tags_all,
                 date_from: date_from.as_deref(),
                 date_to: date_to.as_deref(),
+                // fields / fields_not (feature-58): not yet wired to a CLI
+                // flag, so this call site defaults to "no filter" like every
+                // other unset field here. A later task wires the surface.
+                ..Default::default()
             };
 
             // Both CLI and MCP go through the shared MMR-aware pipeline so the

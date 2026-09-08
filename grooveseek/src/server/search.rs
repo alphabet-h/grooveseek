@@ -149,6 +149,10 @@ impl KbCore {
             tags_all,
             date_from: params.date_from.as_deref(),
             date_to: params.date_to.as_deref(),
+            // fields / fields_not (feature-58): not yet wired to an MCP tool
+            // param, so this call site defaults to "no filter" like every
+            // other unset field here. A later task wires the surface.
+            ..Default::default()
         };
 
         // feature-28 Task 2.9: MMR / parent_retriever の effective config を解決し、

@@ -45,6 +45,59 @@ use super::*;
 pub(super) const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
+/// The `AND …` text and the values to bind for the declared-field filters
+/// (feature-58), numbered from `first`. Both search legs append this to their
+/// `WHERE`; the FTS leg starts at `?6` and the vector leg at `?3`, because
+/// both queries use **numbered** parameters and a bare `?` would be counted
+/// again where `bm25(...)` repeats in `ORDER BY` (the warning above the FTS
+/// query). Every value goes through a bind, never into the SQL text.
+fn field_predicates(
+    first: usize,
+    fields: Option<&FieldFilters>,
+    fields_not: Option<&FieldFilters>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    fn push(
+        n: &mut usize,
+        map: Option<&FieldFilters>,
+        keyword: &str,
+        sql: &mut String,
+        binds: &mut Vec<rusqlite::types::Value>,
+    ) {
+        for (key, values) in map.into_iter().flatten() {
+            if values.is_empty() {
+                continue;
+            }
+            let key_slot = *n;
+            *n += 1;
+            let value_slots: Vec<String> = values
+                .iter()
+                .map(|_| {
+                    let slot = *n;
+                    *n += 1;
+                    format!("?{slot}")
+                })
+                .collect();
+            sql.push_str(&format!(
+                " AND {keyword} (SELECT 1 FROM document_fields df \
+                 WHERE df.document_id = d.id AND df.key = ?{key_slot} AND df.value IN ({}))",
+                value_slots.join(", ")
+            ));
+            binds.push(rusqlite::types::Value::Text(key.clone()));
+            binds.extend(
+                values
+                    .iter()
+                    .map(|v| rusqlite::types::Value::Text(v.clone())),
+            );
+        }
+    }
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    let mut n = first;
+    push(&mut n, fields, "EXISTS", &mut sql, &mut binds);
+    push(&mut n, fields_not, "NOT EXISTS", &mut sql, &mut binds);
+    (sql, binds)
+}
+
 /// `any_pool` が空なら常に pass (= フィルタ無効)。
 fn matches_tags_any(hit_tags: &[String], any_pool: &[String]) -> bool {
     if any_pool.is_empty() {
@@ -175,57 +228,58 @@ impl Database {
         //
         // feature-47 D-4: 重みは **番号付き** bind parameter で渡す。匿名 `?` は
         // SELECT と ORDER BY で別々に採番されて既存の `?1`/`?2` と衝突し
-        // "statement uses 6, 5 supplied" になるため使ってはならない。
+        // "statement uses 6, 5 supplied" になるため使ってはならない。feature-58
+        // の `?6` 以降は [`field_predicates`] が同じ理由で採番する。
         // NaN / inf は bind 経路を silent に通ってしまうので、値域の防波堤は
         // `Config::validate()` 唯一 (D-2 / E-2)。
-        let sql = "
-            SELECT c.id, bm25(fts_chunks, ?3, ?4, ?5) AS score,
+        let (pred, pred_binds) = field_predicates(6, filters.fields, filters.fields_not);
+        let sql = format!(
+            "SELECT c.id, bm25(fts_chunks, ?3, ?4, ?5) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
                    d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text,
                    c.start_line, c.end_line, c.symbol_kind
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
-            WHERE fts_chunks MATCH ?1
+            WHERE fts_chunks MATCH ?1{pred}
             ORDER BY bm25(fts_chunks, ?3, ?4, ?5)
-            LIMIT ?2
-            ";
-        let mut stmt = self.conn.prepare(sql)?;
+            LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         // f64 へ拡幅してから bind する。sqlite3_value_double が受けるのは double
         // であり、f32 → f64 は値を変えない (2.0 / 1.0 / 0.5 / 4.0 いずれも厳密表現)。
-        let rows = stmt.query_map(
-            params![
-                fts_query,
-                fetch_limit,
-                fusion.bm25_heading_weight as f64,
-                fusion.bm25_context_weight as f64,
-                fusion.bm25_content_weight as f64
-            ],
-            |row| {
-                let chunk_id: i64 = row.get(0)?;
-                let score: f32 = row.get(1)?;
-                Ok((
-                    chunk_id,
-                    score,
-                    row.get::<_, String>(2)?,          // content
-                    row.get::<_, Option<String>>(3)?,  // heading
-                    row.get::<_, f32>(4)?,             // quality_score
-                    row.get::<_, i64>(5)?,             // document_id (F-41)
-                    row.get::<_, String>(6)?,          // path
-                    row.get::<_, Option<String>>(7)?,  // title
-                    row.get::<_, Option<String>>(8)?,  // topic
-                    row.get::<_, Option<String>>(9)?,  // date
-                    row.get::<_, Option<String>>(10)?, // category
-                    row.get::<_, Option<String>>(11)?, // tags (JSON)
-                    row.get::<_, Option<String>>(12)?, // context_text
-                    // (feature-56) NULL on every prose chunk, and on code chunks written
-                    // before these columns existed.
-                    row.get::<_, Option<u32>>(13)?,    // start_line
-                    row.get::<_, Option<u32>>(14)?,    // end_line
-                    row.get::<_, Option<String>>(15)?, // symbol_kind
-                ))
-            },
-        )?;
+        let mut binds: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(fts_query),
+            rusqlite::types::Value::Integer(i64::from(fetch_limit)),
+            rusqlite::types::Value::Real(fusion.bm25_heading_weight as f64),
+            rusqlite::types::Value::Real(fusion.bm25_context_weight as f64),
+            rusqlite::types::Value::Real(fusion.bm25_content_weight as f64),
+        ];
+        binds.extend(pred_binds);
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+            let chunk_id: i64 = row.get(0)?;
+            let score: f32 = row.get(1)?;
+            Ok((
+                chunk_id,
+                score,
+                row.get::<_, String>(2)?,          // content
+                row.get::<_, Option<String>>(3)?,  // heading
+                row.get::<_, f32>(4)?,             // quality_score
+                row.get::<_, i64>(5)?,             // document_id (F-41)
+                row.get::<_, String>(6)?,          // path
+                row.get::<_, Option<String>>(7)?,  // title
+                row.get::<_, Option<String>>(8)?,  // topic
+                row.get::<_, Option<String>>(9)?,  // date
+                row.get::<_, Option<String>>(10)?, // category
+                row.get::<_, Option<String>>(11)?, // tags (JSON)
+                row.get::<_, Option<String>>(12)?, // context_text
+                // (feature-56) NULL on every prose chunk, and on code chunks written
+                // before these columns existed.
+                row.get::<_, Option<u32>>(13)?,    // start_line
+                row.get::<_, Option<u32>>(14)?,    // end_line
+                row.get::<_, Option<String>>(15)?, // symbol_kind
+            ))
+        })?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -512,6 +566,8 @@ impl Database {
         // filter 指定があれば over-fetch する (詳細は SearchFilters::has_any)。
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。
+        // fields / fields_not は SQL 側 (feature-58, field_predicates) だが、
+        // KNN の k 件から絞る点は同じなので over-fetch はやはり必要。
         // 除外も同じ理由で広げる — 最近傍が除外語を含むだけで limit が埋まらなくなる。
         let mut fetch_k = if filters.has_any() || !excluded.is_empty() {
             limit
@@ -551,6 +607,10 @@ impl Database {
     /// `limit` 件埋まった時点で読むのをやめるため、その場合はどちらの数も**途中まで**の
     /// 値になる。ただしそのときは呼び出し側の「埋まった」条件が先に成立するので、
     /// 2 つとも参照されない。
+    ///
+    /// `rows_seen` は SQL が返した行数 (feature-58 の `fields` / `fields_not` は
+    /// `WHERE` 句の `EXISTS` / `NOT EXISTS` で SQLite 側が落とすため、その行は
+    /// 数えない — カウントの意味は Task 3 の Rust 側フィルタ群と同じ)。
     fn fetch_vec_page(
         &self,
         embedding_json: &str,
@@ -559,21 +619,27 @@ impl Database {
         filters: &SearchFilters<'_>,
         excluded: &HashSet<i64>,
     ) -> Result<VecPage> {
-        let sql = "
-            SELECT v.chunk_id, v.distance,
+        let (pred, pred_binds) = field_predicates(3, filters.fields, filters.fields_not);
+        let sql = format!(
+            "SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
                    d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text,
                    c.start_line, c.end_line, c.symbol_kind
             FROM vec_chunks v
             JOIN chunks c ON c.id = v.chunk_id
             JOIN documents d ON d.id = c.document_id
-            WHERE v.embedding MATCH ?1 AND k = ?2
-            ORDER BY v.distance
-        ";
+            WHERE v.embedding MATCH ?1 AND k = ?2{pred}
+            ORDER BY v.distance"
+        );
         #[cfg(test)]
         VEC_KNN_ATTEMPTS.with(|c| c.set(c.get() + 1));
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![embedding_json, fetch_k], |row| {
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut binds: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(embedding_json.to_string()),
+            rusqlite::types::Value::Integer(i64::from(fetch_k)),
+        ];
+        binds.extend(pred_binds);
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
             let chunk_id: i64 = row.get(0)?;
             let distance: f32 = row.get(1)?;
             Ok((
