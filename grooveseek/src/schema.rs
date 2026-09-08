@@ -37,7 +37,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::parser::{Frontmatter, ParsedDocument};
+use crate::parser::{FieldValue, Frontmatter, ParsedDocument};
 
 // ---------------------------------------------------------------------------
 // Schema types
@@ -258,6 +258,12 @@ pub enum Violation {
         field: String,
         reason: String,
     },
+    /// A key the frontmatter carries that no `[fields.*]` table names,
+    /// reported only when `[options].allow_unknown_fields = false` or
+    /// `groove validate --strict` (feature-57). One per key, in key order.
+    UndeclaredField {
+        field: String,
+    },
 }
 
 /// The `field` a [`Violation::FrontmatterUnparsed`] carries. Every violation
@@ -273,6 +279,7 @@ impl Violation {
             Violation::NotInEnum { field, .. } => field,
             Violation::LengthOutOfRange { field, .. } => field,
             Violation::FrontmatterUnparsed { field, .. } => field,
+            Violation::UndeclaredField { field } => field,
         }
     }
 
@@ -323,6 +330,9 @@ impl Violation {
                 };
                 format!("{field} length {actual} is out of range {range}")
             }
+            Violation::UndeclaredField { field } => {
+                format!("{field} is not declared in the schema")
+            }
         }
     }
 }
@@ -331,7 +341,16 @@ impl Violation {
 // Validation
 // ---------------------------------------------------------------------------
 
+/// The five keys the parser stores in their own `Frontmatter` fields. They
+/// are declared whether or not the schema names them: `groove` knows them,
+/// so strict mode never reports them as undeclared.
+pub const NAMED_FIELDS: &[&str] = &["title", "date", "topic", "depth", "tags"];
+
 /// `Frontmatter` を `Schema` に照らして違反リストを返す。空リストなら OK。
+///
+/// 5 名は専用 field から、それ以外は `extra` から引く (feature-57)。
+/// `schema.allow_unknown_fields` が false なら、`extra` にあって schema に
+/// 無い key を `UndeclaredField` として key 順に足す。
 pub fn validate(fm: &Frontmatter, schema: &Schema) -> Vec<Violation> {
     let mut out = Vec::new();
 
@@ -342,7 +361,15 @@ pub fn validate(fm: &Frontmatter, schema: &Schema) -> Vec<Violation> {
             "topic" => check_string(&mut out, name, rule, fm.topic.as_deref()),
             "depth" => check_string(&mut out, name, rule, fm.depth.as_deref()),
             "tags" => check_tags(&mut out, name, rule, &fm.tags),
-            _ => {} // schema::compile で弾いているので到達しない
+            _ => check_extra(&mut out, name, rule, fm.extra.get(name)),
+        }
+    }
+
+    if !schema.allow_unknown_fields {
+        for key in fm.extra.keys() {
+            if !schema.fields.contains_key(key) && !NAMED_FIELDS.contains(&key.as_str()) {
+                out.push(Violation::UndeclaredField { field: key.clone() });
+            }
         }
     }
 
@@ -508,6 +535,47 @@ fn check_tags(out: &mut Vec<Violation>, name: &str, rule: &CompiledRule, tags: &
                     field: name.to_string(),
                     actual: t.to_string(),
                     allowed: allowed.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// A rule on a key the parser holds in `extra` (feature-57). With no `type`
+/// the value's own shape picks the path: a scalar is checked like a string
+/// field, a list like `tags`. An opaque shape satisfies `required` and
+/// nothing else: any rule that would read the value is one `type_mismatch`
+/// naming the shape.
+fn check_extra(
+    out: &mut Vec<Violation>,
+    name: &str,
+    rule: &CompiledRule,
+    value: Option<&FieldValue>,
+) {
+    match value {
+        None => {
+            if rule.required {
+                out.push(Violation::MissingRequired {
+                    field: name.to_string(),
+                });
+            }
+        }
+        Some(FieldValue::Scalar(s)) => check_string(out, name, rule, Some(s)),
+        Some(FieldValue::List(items)) => check_tags(out, name, rule, items),
+        Some(other @ FieldValue::Other(_)) => {
+            let reads_the_value = rule.field_type.is_some()
+                || rule.pattern.is_some()
+                || rule.enum_values.is_some()
+                || rule.min_length.is_some()
+                || rule.max_length.is_some();
+            if reads_the_value {
+                out.push(Violation::TypeMismatch {
+                    field: name.to_string(),
+                    expected: rule
+                        .field_type
+                        .map(|t| t.as_str().to_string())
+                        .unwrap_or_else(|| "string or array".to_string()),
+                    actual: other.shape().to_string(),
                 });
             }
         }
@@ -1146,5 +1214,225 @@ pattern = '^[a-z-]+$'"#,
             multi.message(),
             "frontmatter could not be parsed as YAML: line one line two"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-57: extra fields and strict mode
+    // -----------------------------------------------------------------------
+
+    fn fm_with(extra: &[(&str, FieldValue)]) -> Frontmatter {
+        Frontmatter {
+            title: Some("T".into()),
+            extra: extra
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            ..Frontmatter::default()
+        }
+    }
+
+    /// Acceptance 1: an empty table declares the key; a document with it and
+    /// one without it both pass.
+    #[test]
+    fn test_empty_table_is_declared_not_required() {
+        let s = schema("[fields.status]\n");
+        assert!(validate(&fm_with(&[("status", FieldValue::Scalar("x".into()))]), &s).is_empty());
+        assert!(validate(&fm_with(&[]), &s).is_empty());
+    }
+
+    /// Acceptance 2: an extra scalar takes `enum`.
+    #[test]
+    fn test_extra_scalar_enum() {
+        let s = schema("[fields.status]\nenum = [\"active\", \"deprecated\"]\n");
+        let v = validate(
+            &fm_with(&[("status", FieldValue::Scalar("retired".into()))]),
+            &s,
+        );
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(
+            matches!(&v[0], Violation::NotInEnum { field, actual, .. } if field == "status" && actual == "retired")
+        );
+        assert!(
+            validate(
+                &fm_with(&[("status", FieldValue::Scalar("active".into()))]),
+                &s
+            )
+            .is_empty()
+        );
+    }
+
+    /// Acceptance 3: with no `type`, a list takes element-wise `enum` and a
+    /// scalar takes the same `enum` whole.
+    #[test]
+    fn test_extra_untyped_rule_follows_the_value_shape() {
+        let s = schema("[fields.environment]\nenum = [\"dev\", \"test\", \"prod\"]\n");
+        let list = FieldValue::List(vec!["dev".into(), "staging".into()]);
+        let v = validate(&fm_with(&[("environment", list)]), &s);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Violation::NotInEnum { actual, .. } if actual == "staging"));
+        assert!(
+            validate(
+                &fm_with(&[("environment", FieldValue::Scalar("dev".into()))]),
+                &s
+            )
+            .is_empty()
+        );
+    }
+
+    /// Acceptance 3, pattern half: element-wise on a list.
+    #[test]
+    fn test_extra_list_pattern_is_element_wise() {
+        let s = schema("[fields.environment]\ntype = \"array\"\npattern = '^[a-z]+$'\n");
+        let list = FieldValue::List(vec!["dev".into(), "Prod".into(), "x1".into()]);
+        let v = validate(&fm_with(&[("environment", list)]), &s);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(
+            v.iter()
+                .all(|x| matches!(x, Violation::PatternMismatch { .. }))
+        );
+    }
+
+    /// Acceptance 4: a boolean is the string it prints as.
+    #[test]
+    fn test_extra_bool_is_checked_as_a_string() {
+        let s = schema("[fields.environment_declared]\nenum = [\"true\", \"false\"]\n");
+        assert!(
+            validate(
+                &fm_with(&[("environment_declared", FieldValue::Scalar("false".into()))]),
+                &s
+            )
+            .is_empty()
+        );
+        let v = validate(
+            &fm_with(&[("environment_declared", FieldValue::Scalar("no".into()))]),
+            &s,
+        );
+        assert_eq!(v.len(), 1, "{v:?}");
+    }
+
+    /// Acceptance 5: an opaque shape satisfies `required` and nothing else.
+    #[test]
+    fn test_extra_other_is_present_but_not_checkable() {
+        let only_required = schema("[fields.meta]\nrequired = true\n");
+        assert!(
+            validate(
+                &fm_with(&[("meta", FieldValue::Other("mapping"))]),
+                &only_required
+            )
+            .is_empty()
+        );
+
+        let with_pattern = schema("[fields.meta]\npattern = '.'\n");
+        let v = validate(
+            &fm_with(&[("meta", FieldValue::Other("mapping"))]),
+            &with_pattern,
+        );
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(
+            &v[0],
+            Violation::TypeMismatch { field, expected, actual }
+                if field == "meta" && expected == "string or array" && actual == "mapping"
+        ));
+
+        let typed = schema("[fields.meta]\ntype = \"string\"\nenum = [\"a\"]\nmin_length = 1\n");
+        let v = validate(&fm_with(&[("meta", FieldValue::Other("null"))]), &typed);
+        assert_eq!(v.len(), 1, "one type_mismatch, not one per rule: {v:?}");
+        assert!(
+            matches!(&v[0], Violation::TypeMismatch { expected, actual, .. } if expected == "string" && actual == "null")
+        );
+    }
+
+    /// Declared `type` against the opposite shape reports the same
+    /// `type_mismatch` the five named fields already report.
+    #[test]
+    fn test_extra_declared_type_mismatch() {
+        let s = schema("[fields.a]\ntype = \"string\"\n\n[fields.b]\ntype = \"array\"\n");
+        let v = validate(
+            &fm_with(&[
+                ("a", FieldValue::List(vec![])),
+                ("b", FieldValue::Scalar("x".into())),
+            ]),
+            &s,
+        );
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(
+            matches!(&v[0], Violation::TypeMismatch { field, expected, actual } if field == "a" && expected == "string" && actual == "array")
+        );
+        assert!(
+            matches!(&v[1], Violation::TypeMismatch { field, expected, actual } if field == "b" && expected == "array" && actual == "string")
+        );
+    }
+
+    /// A declared-but-absent extra is `missing_required` only when required;
+    /// a declared `type = "array"` does not turn absence into a type error.
+    #[test]
+    fn test_extra_absent() {
+        let s = schema(
+            "[fields.a]\nrequired = true\ntype = \"array\"\n\n[fields.b]\ntype = \"array\"\n",
+        );
+        let v = validate(&fm_with(&[]), &s);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Violation::MissingRequired { field } if field == "a"));
+    }
+
+    /// Acceptance 6 and 7: strict reports each undeclared key once, in key
+    /// order; the five named fields are never undeclared.
+    #[test]
+    fn test_strict_reports_each_undeclared_key() {
+        let mut s = schema("[fields.status]\n");
+        let fm = Frontmatter {
+            title: Some("T".into()),
+            tags: vec!["x".into()],
+            extra: [
+                ("team".to_string(), FieldValue::Scalar("p".into())),
+                ("status".to_string(), FieldValue::Scalar("active".into())),
+                ("meta".to_string(), FieldValue::Other("mapping")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Frontmatter::default()
+        };
+        assert!(
+            validate(&fm, &s).is_empty(),
+            "not strict: nothing to report"
+        );
+
+        s.allow_unknown_fields = false;
+        let v = validate(&fm, &s);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(matches!(&v[0], Violation::UndeclaredField { field } if field == "meta"));
+        assert!(matches!(&v[1], Violation::UndeclaredField { field } if field == "team"));
+    }
+
+    #[test]
+    fn test_strict_from_options_needs_no_flag() {
+        let s = schema("[options]\nallow_unknown_fields = false\n\n[fields.title]\n");
+        let v = validate(&fm_with(&[("team", FieldValue::Scalar("p".into()))]), &s);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Violation::UndeclaredField { field } if field == "team"));
+    }
+
+    /// Acceptance 8: a refused block is one `frontmatter_unparsed`, strict or
+    /// not -- there are no keys to call undeclared.
+    #[test]
+    fn test_strict_broken_yaml_is_still_one_violation() {
+        let mut s = strict_schema();
+        s.allow_unknown_fields = false;
+        let doc = parse_md("---\ntitle: [unclosed\nteam: p\n---\n# body\n");
+        let v = validate_document(&doc, &s);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Violation::FrontmatterUnparsed { .. }));
+    }
+
+    #[test]
+    fn test_undeclared_field_json_and_message() {
+        let v = Violation::UndeclaredField {
+            field: "team".into(),
+        };
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["kind"], "undeclared_field");
+        assert_eq!(json["field"], "team");
+        assert_eq!(v.field(), "team");
+        assert_eq!(v.message(), "team is not declared in the schema");
     }
 }
