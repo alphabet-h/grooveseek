@@ -52,8 +52,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   and rebuilds from scratch, saying so with the path in a warning. Only that
   case is replaced: a directory in the way, a permission problem or a failed
   migration still stops the run with the file untouched, and without `--force`
-  nothing is ever deleted. Other failures inside the open now name the file
-  too. (#253)
+  nothing is ever deleted. Two `--force` runs on the same file are serialised
+  by a `.groove.db.replace-lock` beside it: the second stops naming the lock,
+  and a run that saw the file as corrupt before another run replaced it opens
+  the replacement instead of deleting it. Other failures inside the open now
+  name the file too. (#253)
 
 ## [1.6.0] - 2026-09-07
 

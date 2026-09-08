@@ -665,6 +665,38 @@ impl std::error::Error for CorruptDatabase {}
 /// way: on unix, SQLite opens the WAL before it reads the header, so a
 /// directory where `-wal` should be makes the open fail as "cannot open"
 /// rather than "not a database", and the removal is never reached.
+/// The file `<db>.replace-lock`, held while [`Database::open_or_replace_corrupt`]
+/// deletes and recreates a database. `create_new` is atomic on every
+/// platform, so exactly one process gets past [`ReplaceLock::acquire`];
+/// the other fails naming the lock rather than waiting, since the window is
+/// milliseconds and a stale lock (a run killed inside it) needs a person to
+/// look. Removed on drop, on the error paths too.
+struct ReplaceLock(std::path::PathBuf);
+
+impl ReplaceLock {
+    fn acquire(db_path: &str) -> Result<Self> {
+        let lock = format!("{db_path}.replace-lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => Ok(Self(lock.into())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
+                "{lock} exists: another `groove index --force` is replacing {db_path}. \
+                 If none is running, that run was interrupted; delete the lock file and retry"
+            ),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("failed to create {lock}"))),
+        }
+    }
+}
+
+impl Drop for ReplaceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn remove_database_files(path: &str) -> Result<()> {
     for suffix in ["-shm", "-wal", ""] {
         let victim = format!("{path}{suffix}");
@@ -721,13 +753,23 @@ impl Database {
     /// a file that cannot be opened is what the flag promised. Every other
     /// failure to open is returned unchanged; in particular nothing is deleted
     /// over an error that is not corruption.
+    ///
+    /// Two `--force` runs on the same file are serialised by
+    /// [`ReplaceLock`] (codex P2 on #284, round 3): the second waits for
+    /// nothing, it fails naming the lock. Under the lock the file is looked
+    /// at again, so a run that classified it as corrupt before another run
+    /// replaced it opens the replacement instead of deleting it.
     pub fn open_or_replace_corrupt(path: &str) -> Result<(Self, bool)> {
-        let err = match Self::open(path) {
+        match Self::open(path) {
             Ok(db) => return Ok((db, false)),
-            Err(err) => err,
-        };
-        if err.downcast_ref::<CorruptDatabase>().is_none() {
-            return Err(err);
+            Err(err) if err.downcast_ref::<CorruptDatabase>().is_none() => return Err(err),
+            Err(_) => {}
+        }
+        let _lock = ReplaceLock::acquire(path)?;
+        match Self::open(path) {
+            Ok(db) => return Ok((db, false)),
+            Err(err) if err.downcast_ref::<CorruptDatabase>().is_none() => return Err(err),
+            Err(_) => {}
         }
         // The failed `open` dropped its connection with the error, so the
         // file is closed here -- Windows refuses to delete an open one.
@@ -6961,6 +7003,59 @@ mod tests {
             std::fs::read(&db_path).expect("read back"),
             b"not a sqlite database",
             "nor is the database"
+        );
+    }
+
+    /// Two `--force` runs on one corrupt file (codex P2 on #284, round 3):
+    /// the second finds the first's lock and stops, naming it, with the file
+    /// untouched. Simulated by holding the lock from the test.
+    #[test]
+    fn a_second_force_run_stops_at_the_lock_and_deletes_nothing() {
+        let dir = CorruptDir::new("locked");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        let held = ReplaceLock::acquire(&db_path).expect("the first run takes the lock");
+
+        let err = match Database::open_or_replace_corrupt(&db_path) {
+            Ok(_) => panic!("a held lock must stop the second run"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains(".replace-lock"),
+            "the lock is named so a stale one can be found: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the second run deleted nothing"
+        );
+        drop(held);
+        assert!(
+            !std::path::Path::new(&format!("{db_path}.replace-lock")).exists(),
+            "the lock goes with its holder"
+        );
+    }
+
+    /// A run that saw the file as corrupt, then took the lock after another
+    /// run had already replaced it, opens the replacement rather than
+    /// deleting it. Simulated by the healthy file itself: what the second look
+    /// under the lock sees is the same either way.
+    #[test]
+    fn a_replacement_that_appeared_before_the_lock_is_kept() {
+        let dir = CorruptDir::new("relooked");
+        {
+            let db = Database::open(&dir.db()).expect("another run's replacement");
+            db.verify_embedding_meta("bge-small-en-v1.5", 384)
+                .expect("meta");
+            db.upsert_document("a.md", Some("A"), None, None, None, &[], None, "h", 1)
+                .expect("upsert");
+        }
+        let (db, replaced) = Database::open_or_replace_corrupt(&dir.db()).expect("open");
+        assert!(!replaced, "nothing to replace");
+        assert_eq!(db.document_count().expect("count"), 1, "its rows survive");
+        assert!(
+            !std::path::Path::new(&format!("{}.replace-lock", dir.db())).exists(),
+            "no lock is left behind"
         );
     }
 
