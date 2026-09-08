@@ -43,19 +43,41 @@ use crate::parser::{Frontmatter, ParsedDocument};
 // Schema types
 // ---------------------------------------------------------------------------
 
-/// Known frontmatter fields. Schema の keys はこのうちどれかでなければ
-/// unsupported field としてエラー (loader 段階で弾く)。
-const KNOWN_FIELDS: &[&str] = &["title", "date", "topic", "depth", "tags"];
+/// `[options]` of `groove-schema.toml` (feature-57).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaOptions {
+    /// `false` makes a frontmatter key that no `[fields.*]` table names an
+    /// `undeclared_field` violation. `groove validate --strict` has the same
+    /// effect from the command line. The default is `true`: today's behavior.
+    #[serde(default = "default_allow_unknown_fields")]
+    pub allow_unknown_fields: bool,
+}
+
+fn default_allow_unknown_fields() -> bool {
+    true
+}
+
+impl Default for SchemaOptions {
+    fn default() -> Self {
+        Self {
+            allow_unknown_fields: default_allow_unknown_fields(),
+        }
+    }
+}
 
 /// `groove-schema.toml` のルート構造。
 ///
-/// MVP では `fields` のみ。`[options]` セクションは future-only として
-/// planner 仕様書で予告しているが現行実装では持たない (dead flag を避けるため)。
+/// `[fields.<name>]` は任意の名前を受ける (feature-57)。`title` / `date` /
+/// `topic` / `depth` / `tags` は parser が専用 field に持つが、schema の側では
+/// 他の名前と同じ rule で扱う。
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RawSchema {
     #[serde(default)]
     pub fields: BTreeMap<String, FieldRule>,
+    #[serde(default)]
+    pub options: SchemaOptions,
 }
 
 /// 個々のフィールドに対する検証ルール。
@@ -118,6 +140,9 @@ impl FieldType {
 #[derive(Debug)]
 pub struct Schema {
     pub fields: BTreeMap<String, CompiledRule>,
+    /// From `[options].allow_unknown_fields`; `groove validate --strict`
+    /// sets it to `false` after loading (feature-57).
+    pub allow_unknown_fields: bool,
 }
 
 #[derive(Debug)]
@@ -133,7 +158,7 @@ pub struct CompiledRule {
 
 impl Schema {
     /// TOML 文字列からスキーマを読み、コンパイルして返す。
-    /// 未サポートキー (KNOWN_FIELDS 以外) や不正な regex はここで reject する。
+    /// 不正な regex や未実装の type はここで reject する。
     pub fn from_toml_str(src: &str) -> Result<Self> {
         let raw: RawSchema = toml::from_str(src).context("failed to parse schema TOML")?;
         Self::compile(raw)
@@ -154,13 +179,6 @@ impl Schema {
     fn compile(raw: RawSchema) -> Result<Self> {
         let mut out: BTreeMap<String, CompiledRule> = BTreeMap::new();
         for (name, rule) in raw.fields {
-            if !KNOWN_FIELDS.contains(&name.as_str()) {
-                anyhow::bail!(
-                    "unsupported field {:?} in schema. Known fields: {:?}",
-                    name,
-                    KNOWN_FIELDS
-                );
-            }
             // MVP では Frontmatter 側が全フィールドを string で持つため、
             // integer / date は実装されていない。silent pass を避けるため
             // compile 段階で reject し、代わりに pattern で表現するよう誘導する。
@@ -194,7 +212,10 @@ impl Schema {
                 },
             );
         }
-        Ok(Schema { fields: out })
+        Ok(Schema {
+            fields: out,
+            allow_unknown_fields: raw.options.allow_unknown_fields,
+        })
     }
 }
 
@@ -581,16 +602,58 @@ mod tests {
         assert_eq!(s.fields["title"].field_type, Some(FieldType::String));
     }
 
+    /// feature-57: a schema names any key it wants. The five the parser
+    /// stores in their own fields are not special here.
     #[test]
-    fn test_unknown_field_in_schema_is_rejected() {
-        let err = Schema::from_toml_str(
+    fn test_any_field_name_is_accepted() {
+        let s = schema(
             r#"
-            [fields.bogus]
-            required = true
+            [fields.status]
+            enum = ["active", "deprecated"]
+
+            [fields.team]
+
+            [fields."last modified"]
+            pattern = '^\d{4}-'
             "#,
-        )
-        .expect_err("unknown field must fail");
-        assert!(err.to_string().contains("unsupported field"));
+        );
+        assert_eq!(s.fields.len(), 3);
+        assert!(
+            !s.fields["team"].required,
+            "an empty table declares, it does not require"
+        );
+        assert!(s.fields["team"].field_type.is_none());
+        assert!(s.fields["last modified"].pattern.is_some());
+    }
+
+    #[test]
+    fn test_options_default_allows_unknown_fields() {
+        let s = schema("[fields.title]\nrequired = true\n");
+        assert!(s.allow_unknown_fields, "the default is today's behavior");
+    }
+
+    #[test]
+    fn test_options_allow_unknown_fields_false_is_read() {
+        let s = schema("[options]\nallow_unknown_fields = false\n\n[fields.title]\n");
+        assert!(!s.allow_unknown_fields);
+    }
+
+    #[test]
+    fn test_options_unknown_key_is_rejected() {
+        let err = Schema::from_toml_str("[options]\nstrict = true\n")
+            .expect_err("an unknown key under [options] is a load error");
+        assert!(
+            format!("{err:#}").contains("strict"),
+            "the error names the key: {err:#}"
+        );
+    }
+
+    /// The reporter's `known = true` proposal is not a rule key; a schema
+    /// carrying it still fails to load, as any unknown rule key does.
+    #[test]
+    fn test_known_is_not_a_rule_key() {
+        Schema::from_toml_str("[fields.status]\nknown = true\n")
+            .expect_err("`known` is not a rule");
     }
 
     #[test]
