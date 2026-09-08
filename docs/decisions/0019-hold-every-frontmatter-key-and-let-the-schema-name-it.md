@@ -75,13 +75,13 @@ or the schema?**
   flatten would surface it unexpanded, and it was never a field.
 - **A retained value has one of three shapes.** A string, a boolean or a number
   is the string it prints as. A sequence whose every element is such a scalar is
-  a list of strings. Anything else — a mapping, a sequence holding a mapping or a
-  sequence, a null, an unresolved alias — is opaque: the parser keeps the shape's
-  name and never reads the value. In practice an alias under an unknown key
-  arrives already resolved to the value it names, so the opaque case is a guard
-  rather than a path a document takes. The classification is total over the YAML
-  value type, with no default arm, so a new shape is a compile error rather than
-  a silent fourth kind.
+  a list of strings. Anything else — a mapping, a sequence holding anything that
+  is not such a scalar, a null, an unresolved alias — is opaque: the parser keeps
+  the shape's name and never reads the value. In practice an alias under an
+  unknown key arrives already resolved to the value it names, so the opaque case
+  is a guard rather than a path a document takes. The classification is total
+  over the YAML value type, with no default arm, so a new shape is a compile
+  error rather than a silent fourth kind.
 - **The schema names any key.** `[fields.<name>]` accepts any name; an empty
   table declares the key and checks nothing; `required = true` stays explicit.
   The existing rules apply to a retained value by its shape when `type` is not
@@ -103,19 +103,19 @@ or the schema?**
 
 ## Consequences
 
-- `groove validate --strict` parses again, four releases after ADR-0010 removed
-  it, with the meaning that ADR reserved for it. `[index].fail_on_frontmatter_error`
-  keeps its own name for its own meaning.
+- `groove validate --strict` parses again, removed in 1.0.0 by ADR-0010 and back
+  in 1.9.0 with the meaning that ADR reserved for it.
+  `[index].fail_on_frontmatter_error` keeps its own name for its own meaning.
 - `Frontmatter` gained a field; every parser but Markdown leaves it empty. Code
   that constructs a `Frontmatter` by naming every field has to name this one.
 - A schema that a 1.8.0 binary refused with `unsupported field` loads on 1.9.0.
   A schema that carried `[fields.tags] pattern` with no `type` started reporting
   in 1.8.0; nothing else that loaded before changes what it reports, because the
   default `allow_unknown_fields = true` is the behavior 1.8.0 had.
-- `serde`'s flatten moves the whole struct onto its buffering path. Whether a
-  wrong-shaped named field (`topic: [a]`) is still refused is pinned by a test,
-  and that a number given to `title` is still coerced to the string `"123"` as it
-  always was, because no earlier test covered either.
+- `serde`'s flatten moves the whole struct onto its buffering path. Two things
+  are pinned by tests: that a wrong-shaped named field (`topic: [a]`) is still
+  refused, and that a number given to `title` is still coerced to the string
+  `"123"` as it always was. No earlier test covered either.
 
 ## References
 
