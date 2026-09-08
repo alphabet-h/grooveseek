@@ -458,8 +458,9 @@ struct IndexStats {
     /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
     #[serde(default)]
     skipped: u32,
-    /// (#251) Documents indexed this run whose YAML frontmatter could not be
-    /// parsed; each was written with the `frontmatter:unparsed` tag.
+    /// (#251) Markdown files this run warned about for a YAML frontmatter that
+    /// could not be parsed: indexed with the `frontmatter:unparsed` tag, skipped
+    /// as an empty stub, or tagged by the one-time check over an older index.
     #[serde(default)]
     frontmatter_unparsed: u32,
     total_chunks: u32,

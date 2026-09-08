@@ -252,6 +252,30 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.frontmatter_policy` を読む (#251)。未記録なら `None` =
+    /// この index の unchanged な Markdown は、frontmatter の parse 失敗を
+    /// tag として書く版でまだ一度も見られていない。
+    pub fn read_frontmatter_policy(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'frontmatter_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// `index_meta.frontmatter_policy` を記録する (INSERT OR REPLACE、#251)。
+    pub fn write_frontmatter_policy(&self, policy: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('frontmatter_policy', ?1)",
+            params![policy],
+        )?;
+        Ok(())
+    }
+
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
     /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {

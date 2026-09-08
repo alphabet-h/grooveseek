@@ -28,7 +28,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `[index] fail_on_frontmatter_error = true` makes `groove index` exit 1 after
   such a run — after, not during: every file is still indexed and every broken
   one is named, so one failure covers the corpus. The watcher ignores the key.
-  One visible consequence: a `groove validate` schema that constrains `tags`
+  An index an older version wrote is checked once: the first `groove index` of
+  this version re-reads the frontmatter of every unchanged Markdown file, tags
+  the broken ones without re-embedding anything, and records that it has
+  looked, so a document that was already broken before the upgrade does not
+  stay invisible until it happens to change. A frontmatter-only stub is skipped
+  for having no content and still named and counted. One visible consequence: a `groove validate` schema that constrains `tags`
   with `enum` or `pattern` now reports `frontmatter:unparsed` as an offending
   value on such a file, where before it saw an empty list. (#251)
 

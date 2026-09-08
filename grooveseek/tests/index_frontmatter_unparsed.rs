@@ -179,6 +179,80 @@ fn test_strict_mode_passes_a_clean_kb() {
     assert!(stderr.contains(", 0 frontmatter unparsed), "), "{stderr}");
 }
 
+/// A frontmatter block with nothing after it: broken YAML, no chunks.
+const STUB: &str = "---\ntitle: [unclosed\n---\n";
+
+/// (codex P2, round 1) A stub is skipped for having no chunks, but its
+/// frontmatter still failed to parse, so it is named and counted -- and under
+/// strict mode it fails the run like any other broken file.
+#[test]
+fn test_stub_with_broken_frontmatter_is_counted_although_skipped() {
+    let kb = TempKbLayout::new("groove-fm-stub");
+    kb.write("good.md", GOOD);
+    kb.write("stub.md", STUB);
+    let (stderr, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "exit failed: {status:?}\n{stderr}");
+    assert!(
+        stderr.contains("warning: stub.md: failed to parse YAML frontmatter: "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(", 1 skipped, 1 frontmatter unparsed), "),
+        "skipped and counted are not exclusive:\n{stderr}"
+    );
+
+    let cfg = strict_config(&kb);
+    let (stderr, status) = run_index(kb.kb(), Some(&cfg), &[]);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+}
+
+/// (codex P1, round 1) An index written before this version holds broken
+/// documents with a matching content hash and no tag. The first run of this
+/// version re-reads the frontmatter of unchanged Markdown once, names and tags
+/// what it finds, and records that it has looked so the next run does not.
+#[test]
+fn test_first_run_after_upgrade_tags_unchanged_legacy_documents() {
+    let kb = build_kb("groove-fm-legacy");
+    let (first, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "first run failed: {status:?}\n{first}");
+
+    // Make the index look like one an older version wrote: the row is there
+    // with an empty tag list, and nothing says the frontmatter was ever checked.
+    let db = kb.root().join(".groove.db");
+    let conn = rusqlite::Connection::open(&db).expect("open db");
+    conn.execute(
+        "UPDATE documents SET tags = '[]' WHERE path = 'broken.md'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM index_meta WHERE key = 'frontmatter_policy'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let (second, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "second run failed: {status:?}\n{second}");
+    assert!(
+        second.contains("warning: broken.md: failed to parse YAML frontmatter: "),
+        "the legacy document must be named:\n{second}"
+    );
+    assert!(
+        second.contains("(0 updated, ") && second.contains(", 1 frontmatter unparsed), "),
+        "tagged without re-embedding:\n{second}"
+    );
+    let (title, tags) = document_row(&kb, "broken.md");
+    assert_eq!(title, None);
+    assert!(tags.contains("frontmatter:unparsed"), "{tags}");
+
+    // Looked once; the third run is an ordinary no-op.
+    let (third, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "third run failed: {status:?}\n{third}");
+    assert!(third.contains(", 0 frontmatter unparsed), "), "{third}");
+    assert!(!third.contains("warning: broken.md"), "{third}");
+}
+
 #[test]
 fn test_repairing_the_frontmatter_removes_the_tag() {
     let kb = build_kb("groove-fm-repair");

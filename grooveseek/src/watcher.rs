@@ -728,13 +728,17 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             };
             wdiag!("watcher: reindexed {rel} ({chunks} chunks{note})");
         }
-        Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
+        // (#251) `MetadataRefreshed` cannot come back here: the one-time check
+        // is off on this path. Named so a new variant stays a compile error.
+        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed) => {
+            /* no-op */
+        }
         // (BU-20) The reason is already on stderr from the read; this says what
         // happened to the document, which the reason does not.
         Ok(indexer::SingleResult::Refused) => {
             wdiag!("watcher: {rel} refused, index left as it was");
         }
-        Ok(indexer::SingleResult::Skipped { reason }) => {
+        Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
         }
         Err(e) => {
