@@ -8,7 +8,7 @@
 //! rewrite or relabel the whole index — `backfill_fts`, `backfill_quality`,
 //! `reset_for_model`, the renames.
 //!
-//! `reset_for_model` is the sharpest of these: five writes (three DELETEs, the
+//! `reset_for_model` is the sharpest of these: six writes (four DELETEs, the
 //! `vec_chunks` rebuild, the `index_meta` update) that have to land as one
 //! transaction, because a partial failure leaves a state no re-run repairs —
 //! documents present with no chunks, or `vec_chunks` at a new dimension while
@@ -272,6 +272,33 @@ impl Database {
         self.conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('frontmatter_policy', ?1)",
             params![policy],
+        )?;
+        Ok(())
+    }
+
+    /// `index_meta.declared_fields` (feature-58): the sorted JSON array of key
+    /// names `groove-schema.toml` declared when the index was last completed.
+    /// `None` = never recorded, which is every index written before 1.9.0.
+    /// [`crate::indexer::rebuild_index`] compares it with the schema it reads
+    /// and, on a difference, reads every unchanged Markdown document's
+    /// frontmatter again so `document_fields` follows the schema.
+    pub fn read_declared_fields(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'declared_fields'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record `index_meta.declared_fields` (INSERT OR REPLACE, feature-58).
+    pub fn write_declared_fields(&self, json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('declared_fields', ?1)",
+            params![json],
         )?;
         Ok(())
     }
@@ -730,7 +757,7 @@ impl Database {
     /// を全消ししてから新しい `(model, dim)` を記録する。`indexer::rebuild_index`
     /// が直後にすべての文書を再インデックスすることを前提とする。
     ///
-    /// 5 つの書き込み (DELETE ×3 / vec_chunks 再生成 / index_meta 更新) は
+    /// 6 つの書き込み (DELETE ×4 / vec_chunks 再生成 / index_meta 更新) は
     /// **1 つの transaction にまとめる**。途中で失敗ないし中断すると、
     /// 「documents は残っているのに chunks が空」「`vec_chunks` が新しい次元
     /// なのに `index_meta` は旧 model」といった、どの再実行経路でも自動修復
@@ -750,6 +777,7 @@ impl Database {
         };
         self.conn.execute_batch(
             "DELETE FROM fts_chunks; \
+             DELETE FROM document_fields; \
              DELETE FROM chunks; \
              DELETE FROM documents;",
         )?;

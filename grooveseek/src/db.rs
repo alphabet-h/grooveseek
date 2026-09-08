@@ -940,6 +940,164 @@ mod tests {
         db
     }
 
+    #[test]
+    fn replace_document_fields_writes_the_rows_and_replaces_them_whole() {
+        let db = db_with_384();
+        db.upsert_document("a.md", Some("t"), None, None, None, &[], None, "h1", 0)
+            .unwrap();
+        db.replace_document_fields(
+            "a.md",
+            &[
+                ("status".to_string(), "active".to_string()),
+                ("environment".to_string(), "dev".to_string()),
+                ("environment".to_string(), "prod".to_string()),
+                ("environment".to_string(), "dev".to_string()), // duplicate: one row
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            db.document_fields_for_path("a.md").unwrap(),
+            vec![
+                ("environment".to_string(), "dev".to_string()),
+                ("environment".to_string(), "prod".to_string()),
+                ("status".to_string(), "active".to_string()),
+            ]
+        );
+        // A second call replaces, it does not merge.
+        db.replace_document_fields("a.md", &[("team".to_string(), "core".to_string())])
+            .unwrap();
+        assert_eq!(
+            db.document_fields_for_path("a.md").unwrap(),
+            vec![("team".to_string(), "core".to_string())]
+        );
+        // Unknown path: nothing written, no error.
+        db.replace_document_fields("missing.md", &[("k".to_string(), "v".to_string())])
+            .unwrap();
+        assert!(
+            db.document_fields_for_path("missing.md")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deleting_a_document_removes_its_fields_and_reset_empties_the_table() {
+        let db = db_with_384();
+        db.upsert_document("a.md", Some("t"), None, None, None, &[], None, "h1", 0)
+            .unwrap();
+        db.replace_document_fields("a.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.delete_document("a.md").unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM document_fields", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "delete_document must clear document_fields explicitly"
+        );
+
+        db.upsert_document("b.md", Some("t"), None, None, None, &[], None, "h2", 0)
+            .unwrap();
+        db.replace_document_fields("b.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.reset_for_model("bge-small-en-v1.5", 384).unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM document_fields", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "reset_for_model must empty document_fields");
+    }
+
+    #[test]
+    fn declared_fields_meta_round_trips() {
+        let db = db_with_384();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        db.write_declared_fields("[\"status\",\"team\"]").unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some("[\"status\",\"team\"]")
+        );
+        db.write_declared_fields("[]").unwrap();
+        assert_eq!(db.read_declared_fields().unwrap().as_deref(), Some("[]"));
+    }
+
+    /// sqlite-vec's KNN (`embedding MATCH ?1 AND k = ?2`) with an `EXISTS`
+    /// predicate on the joined `documents` row: the query is accepted, rows
+    /// whose document lacks the field are not returned, and no more than `k`
+    /// rows come back. Spec R4 of feature-58 rests on this; if it ever fails
+    /// the vector leg falls back to a Rust-side filter (the spec's fallback).
+    #[test]
+    fn vec_knn_accepts_an_exists_predicate_on_the_joined_document() {
+        let db = db_with_384();
+        for (i, p) in ["a.md", "b.md", "c.md"].iter().enumerate() {
+            let id = db
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(
+                id,
+                0,
+                None,
+                None,
+                "body",
+                None,
+                &dummy_embedding(0.1 + i as f32 * 0.01),
+                1.0,
+            )
+            .unwrap();
+        }
+        db.replace_document_fields("a.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.replace_document_fields("b.md", &[("status".to_string(), "deprecated".to_string())])
+            .unwrap();
+        // c.md has no status at all.
+        let embedding_json = serde_json::to_string(&dummy_embedding(0.1)).unwrap();
+        let sql = "SELECT d.path FROM vec_chunks v \
+                   JOIN chunks c ON c.id = v.chunk_id \
+                   JOIN documents d ON d.id = c.document_id \
+                   WHERE v.embedding MATCH ?1 AND k = ?2 \
+                   AND EXISTS (SELECT 1 FROM document_fields df \
+                               WHERE df.document_id = d.id AND df.key = ?3 AND df.value IN (?4)) \
+                   ORDER BY v.distance";
+        let mut stmt = db.conn.prepare(sql).unwrap();
+        let paths: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![embedding_json, 10, "status", "active"],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(paths, vec!["a.md".to_string()]);
+
+        let sql_not = sql.replace("AND EXISTS", "AND NOT EXISTS");
+        let mut stmt = db.conn.prepare(&sql_not).unwrap();
+        let mut paths: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![embedding_json, 10, "status", "deprecated"],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["a.md".to_string(), "c.md".to_string()],
+            "a document without the key survives NOT EXISTS"
+        );
+    }
+
     thread_local! {
         /// SQL statements traced off a connection while a test has tracing on.
         /// Lets a test count what SQLite actually executed rather than how many
