@@ -51,8 +51,8 @@ pub use xlsx::{XlsParser, XlsxParser};
 /// One frontmatter value the schema did not name in advance (feature-57).
 ///
 /// Frontmatter is held as strings throughout, so a value is either a string,
-/// a list of strings, or a shape neither of those can carry. `Other` keeps the
-/// shape's name and nothing else: the deserializer in [`markdown`] reads a
+/// a list of strings, or a shape neither of those can carry. [`FieldValue::Other`]
+/// keeps the shape's name and nothing else: the deserializer in [`markdown`] reads a
 /// retained value for its shape and skips the nesting under it rather than
 /// buffering it, so retaining an unknown key costs what the YAML parser
 /// already paid -- the recursion and repetition budgets that bound a document
@@ -61,7 +61,7 @@ pub use xlsx::{XlsParser, XlsxParser};
 pub enum FieldValue {
     /// A YAML string, bool (`"true"` / `"false"`) or number (`to_string`).
     Scalar(String),
-    /// A sequence whose every element is a `Scalar`.
+    /// A sequence whose every element is a [`FieldValue::Scalar`].
     List(Vec<String>),
     /// `"mapping"`, `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
     /// A mapping, a sequence holding a non-scalar, and an explicit `!!binary`
@@ -74,7 +74,7 @@ pub enum FieldValue {
 impl FieldValue {
     /// The shape name for a key written with no value (`status:`, `~`,
     /// `null`). Named rather than spelled out twice: the parser produces it
-    /// and `schema::check_extra` reads it to treat the key as absent.
+    /// and [`crate::schema`]'s `check_extra` reads it to treat the key as absent.
     pub const NULL: &'static str = "null";
 
     /// The word a `type_mismatch` reports as `actual`.

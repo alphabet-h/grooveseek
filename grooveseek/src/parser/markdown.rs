@@ -53,7 +53,7 @@ pub const TAG_FRONTMATTER_UNPARSED: &str = "frontmatter:unparsed";
 // ---------------------------------------------------------------------------
 
 /// The YAML merge key. It arrives as a key like any other and is dropped here,
-/// as it was before `extra` existed: kept, it would show up as a literal `"<<"`
+/// as it was before [`Frontmatter::extra`] existed: kept, it would show up as a literal `"<<"`
 /// entry that every strict run reports as undeclared. Merge expansion runs only
 /// on the fallback path a successful direct deserialize never takes, so the
 /// value behind it is unexpanded and is not read either.
@@ -62,16 +62,16 @@ const MERGE_KEY: &str = "<<";
 /// Intermediate representation for serde_yaml_bw deserialization.
 /// `date` is captured as `serde_yaml_bw::Value` so it works regardless of whether
 /// the YAML encodes it as a string (`"2026-04-10"`) or a native date value.
-/// `extra` (feature-57) receives every other top-level key.
+/// [`RawFrontmatter::extra`] (feature-57) receives every other top-level key.
 ///
-/// [`Deserialize`] is written out below rather than derived with
+/// `Deserialize` is written out below rather than derived with
 /// `#[serde(flatten)]`: flatten routes the whole struct through serde's
 /// buffering path, which materialises every unknown value into a `Content`
 /// tree before anything decides it is opaque. That made a deep mapping or a
 /// wide anchor graph under an unknown key cost what walking it costs, and a
 /// document 1.8.0 indexed fine could be refused outright. The visitor reads
 /// each unknown value for its shape only and skips the nesting with
-/// [`IgnoredAny`], so retaining a key costs what the YAML parser already paid.
+/// `IgnoredAny`, so retaining a key costs what the YAML parser already paid.
 struct RawFrontmatter {
     title: Option<String>,
     date: Option<serde_yaml_bw::Value>,
@@ -171,11 +171,11 @@ fn number_text(n: impl Into<serde_yaml_bw::Number>) -> String {
 
 /// Reads a retained value for its **shape**, never its contents (feature-57).
 ///
-/// Every nested thing is drained with [`IgnoredAny`]: a mapping's entries and
+/// Every nested thing is drained with `IgnoredAny`: a mapping's entries and
 /// a non-scalar sequence element are skipped rather than built, so an unknown
 /// key costs the same walk the YAML parser was already doing. Aliases and
 /// standard tags are resolved by the deserializer before a visitor sees them,
-/// so there is no alias or tagged shape here -- `Other` is exactly `"mapping"`,
+/// so there is no alias or tagged shape here -- [`FieldValue::Other`] is exactly `"mapping"`,
 /// `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
 struct FieldValueVisitor;
 
@@ -688,7 +688,7 @@ mod tests {
     /// still is. (A scalar number into a `String` field, e.g. `title: 123`, is
     /// coerced by `serde_yaml_bw` rather than refused, both before and after
     /// this change, so it is not a refusal case here -- see
-    /// `test_named_scalar_coercion_is_unchanged_with_extra`.)
+    /// [`test_named_scalar_coercion_is_unchanged_with_extra`].)
     #[test]
     fn test_named_field_type_mismatch_is_still_refused_with_extra() {
         for yaml in ["topic: [a]", "tags: [[a]]", "tags: notalist"] {
@@ -709,7 +709,7 @@ mod tests {
     }
 
     /// `title: 123` is not a refusal case (see the doc comment above): pin
-    /// that the coercion itself, and `extra` alongside it, are unaffected by
+    /// that the coercion itself, and [`Frontmatter::extra`] alongside it, are unaffected by
     /// retaining unknown keys.
     #[test]
     fn test_named_scalar_coercion_is_unchanged_with_extra() {
@@ -746,7 +746,7 @@ mod tests {
 
     /// A mapping nested far deeper than any schema would name is still one
     /// opaque value: the visitor skips what is under it, so the depth the
-    /// parser tolerates is the depth it tolerated before `extra` existed.
+    /// parser tolerates is the depth it tolerated before [`Frontmatter::extra`] existed.
     #[test]
     fn test_deep_mapping_under_unknown_key_parses() {
         const DEPTH: usize = 130;
