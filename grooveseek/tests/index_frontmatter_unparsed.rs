@@ -336,6 +336,28 @@ fn test_upgrade_check_stays_pending_when_a_legacy_file_cannot_be_parsed() {
     assert_eq!(frontmatter_policy(&kb).as_deref(), Some("tag-unparsed"));
 }
 
+/// (codex P2, round 3) A legacy file whose body was emptied parses fine and
+/// is skipped for having no chunks. Its frontmatter *was* read, so it must not
+/// keep the check pending -- otherwise every later run re-reads the whole
+/// corpus for nothing.
+#[test]
+fn test_upgrade_check_completes_over_a_file_that_parsed_but_has_no_chunks() {
+    let kb = build_kb("groove-fm-emptied");
+    let (first, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "first run failed: {status:?}\n{first}");
+    make_legacy(&kb, "broken.md");
+
+    kb.write("broken.md", "---\ntitle: Emptied\n---\n");
+    let (second, status) = run_index(kb.kb(), None, &[]);
+    assert!(status.success(), "second run failed: {status:?}\n{second}");
+    assert!(second.contains(", 1 skipped, "), "{second}");
+    assert_eq!(
+        frontmatter_policy(&kb).as_deref(),
+        Some("tag-unparsed"),
+        "a file that parsed has been checked:\n{second}"
+    );
+}
+
 #[test]
 fn test_repairing_the_frontmatter_removes_the_tag() {
     let kb = build_kb("groove-fm-repair");

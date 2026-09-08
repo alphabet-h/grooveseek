@@ -727,14 +727,19 @@ pub fn rebuild_index(
             // A skip that still failed to parse its frontmatter was named on
             // stderr, so it is counted like an indexed one (codex P2, round 1).
             SingleResult::Skipped {
+                reason,
                 frontmatter_unparsed: fm_unparsed,
-                ..
             } => {
                 skipped_count += 1;
                 if fm_unparsed {
                     frontmatter_unparsed += 1;
                 }
-                if refresh_frontmatter && is_indexed_markdown(db, registry, &entry.rel)? {
+                // A file skipped *after* parsing has had its frontmatter read; only a
+                // skip that never got that far can leave one unchecked (codex P2, round 3).
+                if refresh_frontmatter
+                    && reason != SKIPPED_NO_CHUNKS
+                    && is_indexed_markdown(db, registry, &entry.rel)?
+                {
                     refresh_pending = true;
                 }
                 progress.report_unchanged(&entry.rel);
@@ -821,6 +826,11 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
         _ => chunk.content.clone(),
     }
 }
+
+/// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed. The
+/// one-time frontmatter check (#251) treats every other skip as "not read", because those
+/// return before the parser runs.
+const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
 
 /// Whether `rel` is a Markdown file -- by the parser the registry would hand it, so `.MD`
 /// counts -- that the index already holds a row for. The one-time frontmatter check
@@ -1007,7 +1017,7 @@ fn index_single_disk_entry(
 
     if parsed.chunks.is_empty() {
         return Ok(SingleResult::Skipped {
-            reason: "no embeddable chunks",
+            reason: SKIPPED_NO_CHUNKS,
             frontmatter_unparsed: parsed.frontmatter_error.is_some(),
         });
     }
