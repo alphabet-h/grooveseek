@@ -850,6 +850,12 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
 /// the bytes the retained row holds.
 const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
 
+/// The [`SingleResult::Skipped`] reason the one-time frontmatter check (#251) returns when
+/// the bytes it read are not the bytes the scan hashed: the file was swapped between the
+/// two reads, so nothing about the retained row has been learned, and the skip keeps the
+/// check pending for the next run (codex P2, round 5).
+const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
+
 /// The stored content hash of `rel` when it is a Markdown file -- by the parser the
 /// registry would hand it, so `.MD` counts -- that the index already holds a row for;
 /// `None` otherwise. The one-time frontmatter check (#251) asks this about every file it
@@ -1019,6 +1025,15 @@ fn index_single_disk_entry(
     // exactly as it was; a broken one gets its metadata -- which is where the tag lives --
     // written again, and nothing else is touched.
     if refresh_only {
+        // "Unchanged" was decided from the scan's hash; the bytes just parsed came from a
+        // second read. If they differ the row's bytes were not what was read, and saying
+        // "checked" would let the originals slip past the fast path when they come back.
+        if sha256_hex_bytes(&bytes) != entry.hash {
+            return Ok(SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false,
+            });
+        }
         if parsed.frontmatter_error.is_none() {
             return Ok(SingleResult::Unchanged);
         }
@@ -3061,6 +3076,64 @@ mod tests {
                 frontmatter_unparsed: false
             }
         );
+    }
+
+    /// #251 (codex P2, round 5): the one-time check decides "unchanged" from
+    /// the hash the scan took, then reads the file again. Bytes swapped
+    /// between the two reads are not the row's bytes, so the check must not
+    /// treat them as read -- it reports a skip that keeps the check pending.
+    #[test]
+    #[ignore = "requires embedding model download"]
+    fn test_refresh_skips_a_file_whose_bytes_changed_between_scan_and_read() {
+        let dir = crate::test_support::unique_temp_path("groove-fm-race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = "---\ntitle: [unclosed\n---\n\n# Broken\n\nBody long enough to be a chunk.\n";
+        let clean = "---\ntitle: Clean\n---\n\n# Clean\n\nBody long enough to be a chunk.\n";
+        let full = dir.join("swapped.md");
+        // On disk: the clean bytes. In the index and in the scan: the broken ones.
+        std::fs::write(&full, clean).unwrap();
+        let old_hash = sha256_hex_bytes(broken.as_bytes());
+
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document(
+            "swapped.md",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &old_hash,
+            broken.len() as u64,
+        )
+        .unwrap();
+        let mut embedder = Embedder::new().unwrap();
+        let entry = DiskEntry {
+            rel: "swapped.md".to_string(),
+            hash: old_hash,
+            full,
+            size: broken.len() as u64,
+        };
+        let result = index_single_disk_entry(
+            &db,
+            &mut embedder,
+            &entry,
+            None,
+            &Registry::default(),
+            Reindex::Incremental {
+                check_frontmatter: true,
+            },
+            ContextMode::Off,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// #251 (codex P1, round 4): the CLI exit code and the MCP `error` reply
