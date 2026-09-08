@@ -1028,10 +1028,12 @@ fn index_single_disk_entry(
         // "Unchanged" was decided from the scan's hash; the bytes just parsed came from a
         // second read. If they differ the row's bytes were not what was read, and saying
         // "checked" would let the originals slip past the fast path when they come back.
+        // The warning above already named the file if what was read failed to parse,
+        // and a named failure is a counted one (codex P2, round 6).
         if sha256_hex_bytes(&bytes) != entry.hash {
             return Ok(SingleResult::Skipped {
                 reason: SKIPPED_CHANGED_DURING_READ,
-                frontmatter_unparsed: false,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
             });
         }
         if parsed.frontmatter_error.is_none() {
@@ -3131,6 +3133,47 @@ mod tests {
             SingleResult::Skipped {
                 reason: SKIPPED_CHANGED_DURING_READ,
                 frontmatter_unparsed: false
+            }
+        );
+
+        // The other direction (codex P2, round 6): the scan saw clean bytes, the
+        // second read finds broken ones. The warning names the file, so the
+        // skip has to carry the failure or the summary undercounts what it said.
+        let new_hash = sha256_hex_bytes(clean.as_bytes());
+        db.update_document_meta(
+            "swapped.md",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &new_hash,
+            clean.len() as u64,
+        )
+        .unwrap();
+        std::fs::write(&entry.full, broken).unwrap();
+        let entry = DiskEntry {
+            hash: new_hash,
+            ..entry
+        };
+        let result = index_single_disk_entry(
+            &db,
+            &mut embedder,
+            &entry,
+            None,
+            &Registry::default(),
+            Reindex::Incremental {
+                check_frontmatter: true,
+            },
+            ContextMode::Off,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: true
             }
         );
         std::fs::remove_dir_all(&dir).ok();
