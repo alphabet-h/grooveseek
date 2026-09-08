@@ -594,8 +594,131 @@ pub type ChunkTextWithContext = (Option<String>, String, Option<String>);
 /// (`parser::markdown::RawChunk` と同じ扱い)。
 pub(crate) type CandidateHits = Vec<(i64, SearchResult)>;
 
+/// The file at `path` exists but SQLite cannot read it as a database
+/// (`SQLITE_NOTADB` or `SQLITE_CORRUPT`).
+///
+/// A typed error rather than a message so that `groove index --force` can
+/// tell this case apart from every other open failure and replace the file
+/// (#253). The index is derived from the corpus, so replacing it loses
+/// nothing -- but only this case is safe to act on; a directory in the way,
+/// a permission problem or a failed migration must still stop the run.
+#[derive(Debug)]
+pub struct CorruptDatabase {
+    path: String,
+    detail: String,
+}
+
+impl CorruptDatabase {
+    /// The file that could not be read.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// `Some` when `err` is SQLite reporting that the file is not a database.
+    fn from_init_error(path: &str, err: &anyhow::Error) -> Option<Self> {
+        use rusqlite::ErrorCode::{DatabaseCorrupt, NotADatabase};
+        match err.downcast_ref::<rusqlite::Error>()? {
+            rusqlite::Error::SqliteFailure(ffi, msg)
+                if matches!(ffi.code, NotADatabase | DatabaseCorrupt) =>
+            {
+                Some(Self {
+                    path: path.to_string(),
+                    detail: msg.clone().unwrap_or_else(|| ffi.to_string()),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+// One line on purpose: `groove doctor` prints it through `{:#}`, which joins
+// the chain with `: `, and a message that names the file *and* the two ways
+// out is the whole fix -- the file lives in the parent of `--kb-path`, which
+// is the half a user cannot guess.
+impl std::fmt::Display for CorruptDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is not a usable SQLite database ({}). The index is derived from the corpus \
+             and can be rebuilt: delete that file (and any -wal / -shm beside it) and run \
+             `groove index --kb-path <path>` again, or run \
+             `groove index --kb-path <path> --force` to replace it",
+            self.path, self.detail
+        )
+    }
+}
+
+impl std::error::Error for CorruptDatabase {}
+
+/// Delete the database at `path` and its `-wal` / `-shm` sidecars, so that
+/// [`Database::open_or_replace_corrupt`] can create it afresh. A missing
+/// file is fine; any other failure to remove one stops the run and names it.
+///
+/// Least to most valuable (codex P2 on #284, twice): the `-shm` index is
+/// rebuilt from the WAL, the WAL carries committed pages, the database is
+/// the file itself. A removal that fails (locked, or owned by someone else)
+/// then leaves everything more valuable still on disk instead of a
+/// half-deleted set -- and a stale WAL beside a recreated database is the
+/// one leftover that could poison the replacement.
+///
+/// Separate from the open so the order can be tested without SQLite in the
+/// way: on unix, SQLite opens the WAL before it reads the header, so a
+/// directory where `-wal` should be makes the open fail as "cannot open"
+/// rather than "not a database", and the removal is never reached.
+/// The file `<db>.replace-lock`, held while [`Database::open_or_replace_corrupt`]
+/// deletes and recreates a database. `create_new` is atomic on every
+/// platform, so exactly one process gets past [`ReplaceLock::acquire`];
+/// the other fails naming the lock rather than waiting, since the window is
+/// milliseconds and a stale lock (a run killed inside it) needs a person to
+/// look. Removed on drop, on the error paths too.
+struct ReplaceLock(std::path::PathBuf);
+
+impl ReplaceLock {
+    fn acquire(db_path: &str) -> Result<Self> {
+        let lock = format!("{db_path}.replace-lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => Ok(Self(lock.into())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => anyhow::bail!(
+                "{lock} exists: another `groove index --force` is replacing {db_path}. \
+                 If none is running, that run was interrupted; delete the lock file and retry"
+            ),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("failed to create {lock}"))),
+        }
+    }
+}
+
+impl Drop for ReplaceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn remove_database_files(path: &str) -> Result<()> {
+    for suffix in ["-shm", "-wal", ""] {
+        let victim = format!("{path}{suffix}");
+        match std::fs::remove_file(&victim) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("failed to remove {victim} so it could be replaced")));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Database {
     /// Open (or create) a file-backed database at `path`.
+    ///
+    /// A file that SQLite cannot read as a database fails with
+    /// [`CorruptDatabase`], which names the file and the remedy. Nothing is
+    /// deleted here; [`Database::open_or_replace_corrupt`] is the call that
+    /// replaces it, and only `index --force` makes that call.
     pub fn open(path: &str) -> Result<Self> {
         ensure_vec_extension();
         let conn =
@@ -608,8 +731,51 @@ impl Database {
             conn,
             tags_parse_failures: AtomicU64::new(0),
         };
-        db.init()?;
+        // `Connection::open` does not read the file header, so a file that is
+        // not a database gets this far and fails on the first statement `init`
+        // runs (#253). That is why the corruption check sits here, not above.
+        if let Err(err) = db.init() {
+            return Err(match CorruptDatabase::from_init_error(path, &err) {
+                Some(corrupt) => anyhow::Error::new(corrupt),
+                None => err.context(format!("failed to initialise database at {path}")),
+            });
+        }
         Ok(db)
+    }
+
+    /// [`Database::open`], except that a file SQLite cannot read as a database
+    /// is deleted -- together with its `-wal` / `-shm` sidecars -- and
+    /// created afresh. The flag says whether that happened, so the caller can
+    /// say so on stderr.
+    ///
+    /// Only `groove index --force` calls this (#253): the index is derived
+    /// from the corpus and `--force` already means "start over", so replacing
+    /// a file that cannot be opened is what the flag promised. Every other
+    /// failure to open is returned unchanged; in particular nothing is deleted
+    /// over an error that is not corruption.
+    ///
+    /// Two `--force` runs on the same file are serialised by
+    /// [`ReplaceLock`] (codex P2 on #284, rounds 3 and 4): the lock is taken
+    /// before the first look, so a run never opens a file another run is in
+    /// the middle of replacing -- on Windows that open would hold the file
+    /// against the deletion -- and never opens a half-made replacement. The
+    /// second run waits for nothing, it fails naming the lock. The lock
+    /// covers the open, not the indexing that follows: two runs that both
+    /// get a database to open then race exactly as two `--force` runs on a
+    /// healthy file always have.
+    pub fn open_or_replace_corrupt(path: &str) -> Result<(Self, bool)> {
+        let _lock = ReplaceLock::acquire(path)?;
+        match Self::open(path) {
+            Ok(db) => return Ok((db, false)),
+            Err(err) if err.downcast_ref::<CorruptDatabase>().is_none() => return Err(err),
+            Err(_) => {}
+        }
+        // The failed `open` dropped its connection with the error, so the
+        // file is closed here -- Windows refuses to delete an open one.
+        remove_database_files(path)?;
+        let db = Self::open(path)
+            .with_context(|| format!("failed to create a replacement database at {path}"))?;
+        Ok((db, true))
     }
 
     /// Open an in-memory database (useful for tests).
@@ -6666,5 +6832,283 @@ mod tests {
                  candidate, per result or per document"
             );
         }
+    }
+
+    // ---- issue #253: a database file that is not a database ----
+
+    /// A directory that outlives one [`Database`], so the file can be closed,
+    /// damaged and reopened; [`crate::doctor`] keeps the same shape.
+    struct CorruptDir(std::path::PathBuf);
+    impl CorruptDir {
+        fn new(prefix: &str) -> Self {
+            let p = crate::test_support::unique_temp_path(&format!("groove-corrupt-{prefix}"));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            Self(p)
+        }
+        fn db(&self) -> String {
+            self.0.join(".groove.db").to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for CorruptDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `expect_err` needs the `Ok` type to be `Debug`, and [`Database`] is not.
+    fn open_error(path: &str, why: &str) -> anyhow::Error {
+        match Database::open(path) {
+            Ok(_) => panic!("{why}"),
+            Err(e) => e,
+        }
+    }
+
+    /// The issue's own reproduction: a file whose first bytes are not the
+    /// SQLite header. `Connection::open` does not read the header, so the
+    /// failure only surfaces on the first statement [`Database::init`] runs.
+    #[test]
+    fn opening_a_file_that_is_not_a_database_names_the_file_and_the_remedy() {
+        let dir = CorruptDir::new("notadb");
+        std::fs::write(dir.db(), b"not a sqlite database").expect("write garbage");
+
+        let err = open_error(&dir.db(), "garbage must not open");
+        let corrupt = err.downcast_ref::<CorruptDatabase>().unwrap_or_else(|| {
+            panic!("the error must be typed so `--force` can act on it: {err:#}")
+        });
+        let text = corrupt.to_string();
+        assert!(
+            text.contains(&dir.db()),
+            "the path is the half a user cannot guess: {text}"
+        );
+        assert!(
+            text.contains("groove index"),
+            "the remedy names the command: {text}"
+        );
+        assert!(
+            text.contains("--force"),
+            "and the flag that replaces the file: {text}"
+        );
+        assert!(
+            !text.contains('\n'),
+            "doctor prints it with {{:#}} on one line: {text}"
+        );
+        assert!(text.is_ascii(), "diagnostics stay ASCII: {text}");
+        // The failed attempt must not have replaced anything on its own.
+        assert_eq!(
+            std::fs::read(dir.db()).expect("read back"),
+            b"not a sqlite database"
+        );
+    }
+
+    #[test]
+    fn open_or_replace_corrupt_leaves_a_healthy_database_alone() {
+        let dir = CorruptDir::new("healthy");
+        {
+            let db = Database::open(&dir.db()).expect("create");
+            db.verify_embedding_meta("bge-small-en-v1.5", 384)
+                .expect("meta");
+            db.upsert_document("a.md", Some("A"), None, None, None, &[], None, "h", 1)
+                .expect("upsert");
+        }
+        let (db, replaced) = Database::open_or_replace_corrupt(&dir.db()).expect("reopen");
+        assert!(!replaced, "a database that opens is never replaced");
+        assert_eq!(db.document_count().expect("count"), 1, "its rows survive");
+    }
+
+    /// `-wal` / `-shm` go with the file: a stale WAL beside a fresh database
+    /// is exactly the kind of leftover a killed process leaves behind.
+    #[test]
+    fn open_or_replace_corrupt_replaces_the_file_and_its_sidecars() {
+        let dir = CorruptDir::new("replace");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::write(format!("{db_path}-wal"), b"stale wal").expect("write wal");
+        std::fs::write(format!("{db_path}-shm"), b"stale shm").expect("write shm");
+
+        let (db, replaced) = Database::open_or_replace_corrupt(&db_path).expect("replace and open");
+        assert!(
+            replaced,
+            "garbage is replaced, and the caller is told so it can warn"
+        );
+        assert_eq!(
+            db.document_count().expect("count"),
+            0,
+            "the replacement starts empty"
+        );
+        drop(db);
+        assert_ne!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the garbage is gone from disk"
+        );
+        for side in ["-wal", "-shm"] {
+            let p = format!("{db_path}{side}");
+            if let Ok(bytes) = std::fs::read(&p) {
+                assert_ne!(bytes, b"stale wal", "{p} must not be the stale sidecar");
+                assert_ne!(bytes, b"stale shm", "{p} must not be the stale sidecar");
+            }
+        }
+    }
+
+    /// A sidecar that cannot be removed stops the removal with the database
+    /// still on disk (codex P2 on #284). A directory where `-wal` should be
+    /// is the portable way to make `remove_file` fail: a locked file would
+    /// need a second process on Windows and nothing at all on Linux. The
+    /// helper is called directly because SQLite on unix trips over that
+    /// directory before it ever reads the header (see [`remove_database_files`]
+    /// in this module) -- the round-1 version of this test went through the
+    /// open and was green only on Windows.
+    #[test]
+    fn a_sidecar_that_cannot_be_removed_leaves_the_database_on_disk() {
+        let dir = CorruptDir::new("stuck-sidecar");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::create_dir_all(format!("{db_path}-wal")).expect("mkdir where -wal goes");
+
+        let err = remove_database_files(&db_path).expect_err("a sidecar that will not go");
+        assert!(
+            format!("{err:#}").contains("-wal"),
+            "the file that stopped it is named: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the database is not deleted before its sidecars are gone"
+        );
+    }
+
+    /// The `-shm` goes before the `-wal` (codex P2 on #284, round 2): when
+    /// it is the one that will not go, the WAL and the database are both
+    /// still on disk.
+    #[test]
+    fn a_stuck_shm_leaves_the_wal_and_the_database_on_disk() {
+        let dir = CorruptDir::new("stuck-shm");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::write(format!("{db_path}-wal"), b"stale wal").expect("write wal");
+        std::fs::create_dir_all(format!("{db_path}-shm")).expect("mkdir where -shm goes");
+
+        let err = remove_database_files(&db_path).expect_err("a sidecar that will not go");
+        assert!(
+            format!("{err:#}").contains("-shm"),
+            "the file that stopped it is named: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(format!("{db_path}-wal")).expect("read wal back"),
+            b"stale wal",
+            "the WAL is not deleted before the shm is gone"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "nor is the database"
+        );
+    }
+
+    /// Two `--force` runs on one corrupt file (codex P2 on #284, round 3):
+    /// the second finds the first's lock and stops, naming it, with the file
+    /// untouched. Simulated by holding the lock from the test.
+    #[test]
+    fn a_second_force_run_stops_at_the_lock_and_deletes_nothing() {
+        let dir = CorruptDir::new("locked");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        let held = ReplaceLock::acquire(&db_path).expect("the first run takes the lock");
+
+        let err = match Database::open_or_replace_corrupt(&db_path) {
+            Ok(_) => panic!("a held lock must stop the second run"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains(".replace-lock"),
+            "the lock is named so a stale one can be found: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the second run deleted nothing"
+        );
+        drop(held);
+        assert!(
+            !std::path::Path::new(&format!("{db_path}.replace-lock")).exists(),
+            "the lock goes with its holder"
+        );
+    }
+
+    /// A run that reaches the lock after another run has replaced the file
+    /// opens the replacement rather than deleting it, and leaves no lock
+    /// behind. Simulated by the healthy file itself: what the look under the
+    /// lock sees is the same either way.
+    #[test]
+    fn a_replacement_that_appeared_before_the_lock_is_kept() {
+        let dir = CorruptDir::new("relooked");
+        {
+            let db = Database::open(&dir.db()).expect("another run's replacement");
+            db.verify_embedding_meta("bge-small-en-v1.5", 384)
+                .expect("meta");
+            db.upsert_document("a.md", Some("A"), None, None, None, &[], None, "h", 1)
+                .expect("upsert");
+        }
+        let (db, replaced) = Database::open_or_replace_corrupt(&dir.db()).expect("open");
+        assert!(!replaced, "nothing to replace");
+        assert_eq!(db.document_count().expect("count"), 1, "its rows survive");
+        assert!(
+            !std::path::Path::new(&format!("{}.replace-lock", dir.db())).exists(),
+            "no lock is left behind"
+        );
+    }
+
+    /// The composed path, asserted only as far as every platform agrees: with
+    /// a directory where `-wal` should be, Windows reads the header first and
+    /// reports corruption, unix opens the WAL first and reports "cannot open".
+    /// Either way [`Database::open_or_replace_corrupt`] must fail and the database must
+    /// still be there -- which of the two errors it was is not the contract.
+    #[test]
+    fn a_directory_where_a_sidecar_goes_never_costs_the_database() {
+        let dir = CorruptDir::new("stuck-composed");
+        let db_path = dir.db();
+        std::fs::write(&db_path, b"not a sqlite database").expect("write garbage");
+        std::fs::create_dir_all(format!("{db_path}-wal")).expect("mkdir where -wal goes");
+
+        assert!(
+            Database::open_or_replace_corrupt(&db_path).is_err(),
+            "a sidecar that will not go must stop the replacement"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read back"),
+            b"not a sqlite database",
+            "the database is not deleted"
+        );
+    }
+
+    /// Any other failure inside [`Database::init`] is not corruption and must not be
+    /// reported as such -- `--force` deleting a file over an unrelated error
+    /// would be worse than the bug being fixed.
+    #[test]
+    fn a_directory_in_place_of_the_database_is_not_reported_as_corrupt() {
+        let dir = CorruptDir::new("isdir");
+        std::fs::create_dir_all(dir.db()).expect("mkdir where the db goes");
+
+        let err = open_error(&dir.db(), "a directory cannot be opened");
+        assert!(
+            err.downcast_ref::<CorruptDatabase>().is_none(),
+            "not corruption: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains(&dir.db()),
+            "but the path is still named: {err:#}"
+        );
+        let err = match Database::open_or_replace_corrupt(&dir.db()) {
+            Ok(_) => panic!("still refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<CorruptDatabase>().is_none(),
+            "and never replaced: {err:#}"
+        );
+        assert!(
+            dir.0.join(".groove.db").is_dir(),
+            "the directory is untouched"
+        );
     }
 }

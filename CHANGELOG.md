@@ -37,6 +37,27 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   with `enum` or `pattern` now reports `frontmatter:unparsed` as an offending
   value on such a file, where before it saw an empty list. (#251)
 
+### Fixed
+
+- **A `.groove.db` that cannot be opened now names itself and its remedy, and
+  `groove index --force` repairs it.** When the file was not a SQLite database
+  (a truncated write, a process killed mid-migration), every command failed
+  with `Error: file is not a database` — no path, although the file lives in
+  the parent of `--kb-path`, and no hint that deleting it is the fix. `groove
+  index --force`, the one repair verb the command line has, failed the same
+  way because it only ever emptied a database it could open. The error now
+  reads `<path> is not a usable SQLite database (...)` followed by the two ways
+  out, on one line so `groove doctor` (which still exits 2) carries it whole;
+  and `groove index --force` deletes the file and its `-wal` / `-shm` sidecars
+  and rebuilds from scratch, saying so with the path in a warning. Only that
+  case is replaced: a directory in the way, a permission problem or a failed
+  migration still stops the run with the file untouched, and without `--force`
+  nothing is ever deleted. Two `--force` runs on the same file are serialised
+  by a `.groove.db.replace-lock` beside it: the second stops naming the lock,
+  and a run that saw the file as corrupt before another run replaced it opens
+  the replacement instead of deleting it. Other failures inside the open now
+  name the file too. (#253)
+
 ## [1.6.0] - 2026-09-07
 
 ### Added
