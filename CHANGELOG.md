@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-09-08
+
 ### Added
 
 - **`pattern` on an array field checks every element.** A `groove-schema.toml`
@@ -31,9 +33,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **`groove validate` reports a file whose YAML frontmatter does not parse as
   one violation.** The violation has `kind: "frontmatter_unparsed"`,
   `field: "frontmatter"` and the parser's `reason`; the schema is not applied
-  to that file. In 1.7.0 the same file produced `missing_required` on `title`
-  and `not_in_enum` on the tag `frontmatter:unparsed`, blaming the placeholder
-  the parser had left rather than the YAML. The new `kind` is an addition to
+  to that file. This corrects an interaction the 1.7.0 notes did not spell
+  out: since 1.7.0 such a file is indexed with the tag `frontmatter:unparsed`,
+  so a schema that constrains `tags` with `enum` or `pattern` reported that
+  placeholder as an offending value, alongside `missing_required` on `title`,
+  blaming what the parser had left rather than the YAML; 1.8.0 stops that by
+  not applying the schema to the file at all. The new `kind` is an addition to
   the documented JSON, which `docs/stability.md` allows in a minor release;
   a consumer that switches on `kind` should let unknown kinds through. A note
   whose valid YAML lists `frontmatter:unparsed` by hand is not a parse
@@ -5274,7 +5279,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/alphabet-h/grooveseek/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/alphabet-h/grooveseek/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/alphabet-h/grooveseek/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/alphabet-h/grooveseek/compare/v1.4.0...v1.5.0
