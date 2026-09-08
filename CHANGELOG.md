@@ -22,13 +22,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `pattern` / `enum` / `min_length` / `max_length` / `allow_empty`) apply to
   it. A string, a boolean or a number is checked as the string it prints as
   (`enum = ["true", "false"]` is the check for a boolean; there is no
-  `type = "bool"`), a list of those element by element, and a mapping or a
-  null satisfies `required` alone, reporting one `type_mismatch` naming its
-  shape against any rule that would read it. A schema a 1.8.0 binary refused
-  with `unsupported field` now loads. (#252)
+  `type = "bool"`), a list of those element by element, and a mapping — or a
+  list holding one — satisfies `required` alone, reporting one `type_mismatch`
+  naming its shape against any rule that would read it. A key written with no
+  value (`status:`) counts as absent for every rule, so `required` catches a
+  blank `status:` the way it catches a blank `title:`. A schema a 1.8.0 binary
+  refused with `unsupported field` now loads. (#252)
 - **`[options] allow_unknown_fields = false`, and `groove validate --strict`.**
   Either reports every frontmatter key the schema does not name as one
-  `undeclared_field` violation, in key order; `title`, `date`, `topic`,
+  `undeclared_field` violation, in key order — a key with no value included,
+  since the key is still there; `title`, `date`, `topic`,
   `depth` and `tags` are always declared. The flag is the one ADR-0010 removed
   in 1.0.0 and priced as a minor release to bring back with this meaning.
   `undeclared_field` is an addition to `validate`'s JSON `kind` vocabulary;
@@ -40,7 +43,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **The Markdown parser keeps every top-level frontmatter key**, not only the
   five it has fields for. Nothing but `groove validate` reads the extra keys:
   the index, its filters, `get_document` and every other parser are unchanged,
-  and the YAML merge key `<<` is still dropped.
+  and the YAML merge key `<<` is still dropped. A retained value is read for
+  its shape only and the nesting under it is skipped rather than buffered, so
+  the parser's recursion and repetition budgets apply exactly as they did
+  before — a document 1.8.0 indexed still indexes.
 
 ## [1.8.0] - 2026-09-08
 

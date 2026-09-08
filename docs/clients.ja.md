@@ -159,11 +159,14 @@ allow_unknown_fields = true      # false: a key with no [fields.*] table is a vi
   parser は block の top-level key を全部保持する: string / bool / number は印字した文字列として
   持つので (`environment_declared: false` は `enum = ["true", "false"]` で検査する。`type = "bool"`
   は無い)、list はその文字列の list として持ち `enum` / `pattern` を要素ごとに当てる。
-  mapping / 入れ子の list / null は `required` を満たすだけで、値を読む rule があれば形の名前
-  (`mapping` / `nested sequence` / `null`) を添えた `type_mismatch` 1 件になる。
+  mapping、および mapping を含む list は `required` を満たすだけで、値を読む rule があれば
+  形の名前 (`mapping` / `nested sequence`) を添えた `type_mismatch` 1 件になる。
+  値を書かなかった key (`status:` / `~` / `null`) はどの rule から見ても「無い」扱いで、
+  空の `title:` と同じように `required` が捕まえる。
   これらの key を見るのは `groove validate` だけで、索引・filter・`get_document` は変わらない
 - **`[options] allow_unknown_fields = false`** または `groove validate --strict` (v1.9.0+) は、
-  スキーマが名指ししていない key を `undeclared_field` 違反として 1 件ずつ報告する。`title` /
+  スキーマが名指ししていない key を `undeclared_field` 違反として 1 件ずつ報告する。値を
+  書かなかった key も、key 自体はあるので報告される。`title` /
   `date` / `topic` / `depth` / `tags` は常に宣言済み扱い。`frontmatter_unparsed` の block には
   報告する key が無い。[ADR-0019](decisions/0019-hold-every-frontmatter-key-and-let-the-schema-name-it.ja.md) 参照
 - `---` ブロックが YAML として parse できない `.md` は、parser の reason を添えた `frontmatter_unparsed` 1 件の違反として報告され、スキーマは当てない (v1.8.0+)。valid な YAML に手書きで `frontmatter:unparsed` の tag を書いた note は他と同じく検証される

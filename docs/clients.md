@@ -161,15 +161,18 @@ allow_unknown_fields = true      # false: a key with no [fields.*] table is a vi
   string it prints as (so `environment_declared: false` is checked with
   `enum = ["true", "false"]`; there is no `type = "bool"`), and a list of
   those is held as a list of strings and takes `enum` / `pattern` element by
-  element. A mapping, a nested list or a null satisfies `required` and
-  nothing else — any rule that would read the value reports one
-  `type_mismatch` naming the shape (`mapping`, `nested sequence`, `null`).
+  element. A mapping, or a list holding one, satisfies `required` and nothing
+  else — any rule that would read the value reports one `type_mismatch`
+  naming the shape (`mapping`, `nested sequence`). A key written with no
+  value (`status:`, `~`, `null`) counts as absent for every rule, so
+  `required` catches a blank `status:` the way it catches a blank `title:`.
   Only `groove validate` sees these keys; the index, its filters and
   `get_document` are unchanged.
 - **`[options] allow_unknown_fields = false`**, or `groove validate --strict`
   (v1.9.0+), reports every key the schema does not name as one
-  `undeclared_field` violation. `title`, `date`, `topic`, `depth` and `tags`
-  are always declared. A `frontmatter_unparsed` block has no keys to report.
+  `undeclared_field` violation — a key with no value included, since the key
+  is still there. `title`, `date`, `topic`, `depth` and `tags` are always
+  declared. A `frontmatter_unparsed` block has no keys to report.
   See [ADR-0019](decisions/0019-hold-every-frontmatter-key-and-let-the-schema-name-it.md).
 - A `.md` whose `---` block does not parse as YAML is reported as a single `frontmatter_unparsed` violation carrying the parser's reason, and the schema is not applied to it (v1.8.0+). A note whose valid YAML lists the tag `frontmatter:unparsed` by hand is checked like any other.
 - The `index` and `serve` commands are not affected — validation is opt-in only.

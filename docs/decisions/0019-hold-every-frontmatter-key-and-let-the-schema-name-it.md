@@ -71,26 +71,27 @@ or the schema?**
 
 - **The parser keeps every top-level key of the block.** The five it stores in
   their own fields are unchanged; every other key goes to `Frontmatter.extra`
-  under its own name. The YAML merge key `<<` is the one exception: serde's
-  flatten would surface it unexpanded, and it was never a field.
+  under its own name. The YAML merge key `<<` is the one exception: it would
+  surface unexpanded, and it was never a field.
 - **A retained value has one of three shapes.** A string, a boolean or a number
   is the string it prints as. A sequence whose every element is such a scalar is
-  a list of strings. Anything else — a mapping, a sequence holding anything that
-  is not such a scalar, a null, an unresolved alias — is opaque: the parser keeps
-  the shape's name and never reads the value. In practice an alias under an
-  unknown key arrives already resolved to the value it names, so the opaque case
-  is a guard rather than a path a document takes. The classification is total
-  over the YAML value type, with no default arm, so a new shape is a compile
-  error rather than a silent fourth kind.
+  a list of strings. A mapping, or a sequence holding anything that is not such
+  a scalar, is opaque: the parser keeps the shape's name and never reads the
+  value. A null is neither — `status:` with nothing after it is the key without
+  a value, and it counts as absent. An alias arrives already resolved to the
+  value it names, and a tag is resolved before the shape is decided, so neither
+  is a shape of its own.
 - **The schema names any key.** `[fields.<name>]` accepts any name; an empty
   table declares the key and checks nothing; `required = true` stays explicit.
   The existing rules apply to a retained value by its shape when `type` is not
   given, and against the declared `type` when it is. An opaque value satisfies
   `required` and reports one `type_mismatch` naming its shape against any rule
-  that would read it.
+  that would read it; a null satisfies nothing, so `required` catches a blank
+  `status:` the way it catches a blank `title:`.
 - **`[options].allow_unknown_fields = false`, or `groove validate --strict`,
   reports each key the schema does not name as one `undeclared_field`
-  violation**, in key order. The five named fields are always declared. A block
+  violation**, in key order — a key with no value included, since the key is
+  still there. The five named fields are always declared. A block
   the parser refused is still one `frontmatter_unparsed` and nothing else. The
   flag only tightens: there is no `--no-strict`.
 - **Retained keys reach `groove validate` and nothing else, in this release.**
@@ -112,14 +113,21 @@ or the schema?**
   A schema that carried `[fields.tags] pattern` with no `type` started reporting
   in 1.8.0; nothing else that loaded before changes what it reports, because the
   default `allow_unknown_fields = true` is the behavior 1.8.0 had.
-- `serde`'s flatten moves the whole struct onto its buffering path. Two things
-  are pinned by tests: that a wrong-shaped named field (`topic: [a]`) is still
-  refused, and that a number given to `title` is still coerced to the string
-  `"123"` as it always was. No earlier test covered either.
+- Nested content under an unknown key is skipped rather than buffered: the
+  block is read by a hand-written deserializer that takes a retained value's
+  shape and drops what is under it, so the parser's recursion and repetition
+  budgets apply exactly as they did before any key was kept. `#[serde(flatten)]`
+  would have been shorter and does the opposite — it materialises every unknown
+  value first, which refused documents 1.8.0 indexed.
+- Reading the block by hand is also the mechanism most likely to change how a
+  named field is refused. Two things are pinned by tests: that a wrong-shaped
+  named field (`topic: [a]`) is still refused, and that a number given to
+  `title` is still coerced to the string `"123"` as it always was. No earlier
+  test covered either.
 
 ## References
 
 - Issue #252 (design input, the reporter's corpus and their conditions).
 - ADR-0010 for the removal this reverses and the pricing it set.
-- `grooveseek/src/parser/markdown.rs` (`RawFrontmatter`, `classify`),
-  `grooveseek/src/schema.rs` (`check_extra`, `NAMED_FIELDS`).
+- `grooveseek/src/parser/markdown.rs` (`RawFrontmatter`, `FieldValueVisitor`),
+  `grooveseek/src/schema.rs` (`check_extra`, `require_declared_fields`).
