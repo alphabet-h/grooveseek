@@ -27,13 +27,15 @@ groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 
 
 `groove index` の進捗表示を切り替える 2 フラグ。**相互排他** + フラグなしの既定動作は不変 (= 既存の per-file `  indexed: foo.md (N chunks)` 出力をそのまま維持)。
 
-- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。
+- `--quiet`: 各ファイルごとの出力を抑止し、開始 / `Found N source files` / `Done in ...` のサマリ 3 行のみ。harness (Claude Code Bash tool 等) では子 process の streaming 出力が exit まで集約 buffer されるため、`--quiet` で「無音 = 進行中」と認識可能。ハングと進行中の混同を防ぐ。warning は進捗ではないので抑止されない: `warning: <path>: failed to parse YAML frontmatter: ...` は `--quiet` でも出る。
 - `--progress`: 進捗 UI を表示。stderr の `IsTerminal` で自動分岐 — TTY なら `indicatif` バー (経過時間 / 件数 / % / ETA)、非 TTY (pipe / redirect) なら `Progress: N/M (P%)` 行を約 20 回 + 100% アンカー 1 回で flush。`tail -f indexing.log` で監視可能。
 
 ```bash
 groove index --kb-path ./big-kb --quiet         # 完了まで silence
 groove index --kb-path ./big-kb --progress      # TTY ではバー、pipe では定期行
 ```
+
+`Done in` 行はその run が何をしたかを数える: `updated` (内容が変わって再 embedding したファイル)、`renamed`、`deleted`、`skipped` (disk にはあるが索引されなかった — read 不能 / size cap 超過 / 空)、そして `frontmatter unparsed` (v1.7.0+)。最後のものは、その run で YAML frontmatter が parse できなかった Markdown の件数。各ファイルは上の `warning:` 行で名指しされ、`title` / `date` / `topic` 空で索引され、`frontmatter:unparsed` の tag が付くので `--tag-any frontmatter:unparsed` で一覧できる。frontmatter だけの stub は本文が無いので skip されるが、名指しはされたので数には入る。前回の索引から変わっていないファイルは再 parse されないので再カウントもされない。`--force` なら全件 parse し直す。例外は、旧版が書いた index にこの版を初めて当てる run で、変わっていない Markdown 全件の frontmatter を 1 回だけ読み直し、見つけたものに tag を付けて数え (再 embedding はしない)、`Tagged N unchanged Markdown document(s) ...` と報告する。次の run からは fast path に戻る。`groove.toml` に `[index].fail_on_frontmatter_error = true` があると、run を完走して summary を出してから、この件数が 0 でなければ exit 1 で終わる。
 
 ### モデル選択のトレードオフ
 
@@ -433,8 +435,9 @@ HTTP スタックと ONNX runtime は `info` のまま残す。これで増え�
 **`RUST_LOG` の管轄外**のものが 2 つある。**どの `groove.toml` が勝ったか**は
 `info` で出るので、そもそも上げる必要がない (`loaded config source=… path=…
 trust=…`。[docs/configuration.ja.md](configuration.ja.md) 参照)。`index` の進捗
-(`Indexing …` / `  indexed: …` / `Done in …`) は logger を通さず直接書いているので、
-**どのレベルでも出る** — 制御するのは `--quiet` / `--progress` の方。
+(`Indexing …` / `  indexed: …` / `Done in …`) と各ファイルの `warning:` 行は logger を
+通さず直接書いているので、**どのレベルでも出る** — 進捗を制御するのは `--quiet` /
+`--progress` の方で、warning を止めるものは無い。
 
 ログは全サブコマンドで stderr に出るので、レベルを上げても stdout から取っている
 出力を乱さない。とくに `serve` で効く — 既定の stdio transport では stdout が

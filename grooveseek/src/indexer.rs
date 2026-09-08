@@ -419,6 +419,7 @@ fn documents_to_delete(
 }
 
 /// Summary returned by [`rebuild_index`].
+#[derive(Debug, Default)]
 pub struct IndexResult {
     pub total_documents: u32,
     pub updated: u32,
@@ -428,8 +429,28 @@ pub struct IndexResult {
     pub deleted: u32,
     /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
     pub skipped: u32,
+    /// Markdown files this run named with `warning: <path>: failed to parse
+    /// YAML frontmatter` (#251): the ones indexed with empty metadata and the
+    /// `frontmatter:unparsed` tag, the ones skipped for having no chunks after
+    /// that (a frontmatter-only stub), and -- on the first run of this build
+    /// over an older index -- the unchanged ones the one-time check tagged.
+    /// Per run, like [`Self::updated`]: a file that has not changed is not
+    /// re-parsed and so is not re-counted once the check has run; the `force`
+    /// argument of [`rebuild_index`] re-parses everything.
+    pub frontmatter_unparsed: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
+}
+
+impl IndexResult {
+    /// Whether this run is a failure under `[index].fail_on_frontmatter_error`
+    /// (#251). One decision, rendered twice: `groove index` turns `true` into
+    /// exit 1, the MCP `rebuild_index` tool into an `error` beside the counts.
+    /// The two surfaces call this rather than each comparing the count, so
+    /// they cannot come to disagree (codex P1, round 4).
+    pub fn fails_strict_frontmatter(&self, fail_on_frontmatter_error: bool) -> bool {
+        fail_on_frontmatter_error && self.frontmatter_unparsed > 0
+    }
 }
 
 /// 単一ファイルのインデックス結果。`rebuild_index` 内での
@@ -438,10 +459,26 @@ pub struct IndexResult {
 pub enum SingleResult {
     /// hash が既存と一致、embedding 再計算不要 (no-op)
     Unchanged,
-    /// upsert + embedding 完了 (chunk 数)
-    Updated { chunks: u32 },
-    /// 処理対象外 (空本文など)。reason は human-readable。
-    Skipped { reason: &'static str },
+    /// upsert + embedding 完了 (chunk 数)。`frontmatter_unparsed` は #251:
+    /// この文書の YAML frontmatter が parse できず、metadata 空 +
+    /// `frontmatter:unparsed` tag で書かれたことを示す。[`rebuild_index`] の
+    /// summary はこれを数える。
+    Updated {
+        chunks: u32,
+        frontmatter_unparsed: bool,
+    },
+    /// 処理対象外 (空本文など)。reason は human-readable。`frontmatter_unparsed`
+    /// は #251: 索引されなかったが YAML frontmatter の parse には失敗していた
+    /// (= frontmatter だけの stub)。warning で名指しした以上、summary でも数える。
+    Skipped {
+        reason: &'static str,
+        frontmatter_unparsed: bool,
+    },
+    /// (#251) 内容は変わっていないが、この版が frontmatter の parse 失敗を tag として
+    /// 書くようになる前に索引された文書だったので、metadata だけ書き直した
+    /// (= `frontmatter:unparsed` を付けた)。embedding は触らない。[`rebuild_index`] の
+    /// 1 回限りの upgrade 経路でしか返らない。
+    MetadataRefreshed,
     /// (BU-20) 開いた handle が「集めた時のファイルではない」と答えた
     /// (hardlink / symlink / 非通常ファイル / handle 側 size 超過)。
     ///
@@ -527,6 +564,12 @@ pub fn rebuild_index(
     // files this run will not re-chunk. Not gated on a code parser being enabled: an index
     // built with one and re-indexed without it still holds those documents.
     resolve_code_chunk_policy(db, force)?;
+    // (#251, codex P1 round 1) An index written before the parser tagged a broken frontmatter
+    // holds such documents with a matching hash and no tag, and the unchanged fast path would
+    // never look at them again. The first run of this build re-reads the frontmatter of every
+    // unchanged Markdown document once; `--force` re-parses everything anyway.
+    let refresh_frontmatter =
+        !force && db.read_frontmatter_policy()?.as_deref() != Some(FRONTMATTER_POLICY);
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
@@ -643,6 +686,22 @@ pub fn rebuild_index(
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
     let mut updated: u32 = 0;
+    let mut frontmatter_unparsed: u32 = 0;
+    let mut refreshed: u32 = 0;
+    // (#251, codex P2 round 2) The one-time check is recorded as done only when every
+    // Markdown document it was meant to read was read. A legacy file the scan could not
+    // open, or that this loop skips or refuses, keeps the check pending: its row is
+    // retained, so when the file is back with the same content the fast path would
+    // otherwise hide it for good.
+    let mut refresh_pending = false;
+    if refresh_frontmatter {
+        for rel in &skipped_paths {
+            if indexed_markdown_hash(db, registry, rel)?.is_some() {
+                refresh_pending = true;
+                break;
+            }
+        }
+    }
 
     // 2. Process each file
     for entry in &disk_entries {
@@ -650,7 +709,13 @@ pub fn rebuild_index(
 
         // rename された entry (Static モードのみ) は force=true で再 parse/embed
         // させ、他の unchanged file の hash fast path はそのまま活かす。
-        let entry_force = force || renamed_new_paths.contains(&entry.rel);
+        let mode = if force || renamed_new_paths.contains(&entry.rel) {
+            Reindex::Force
+        } else {
+            Reindex::Incremental {
+                check_frontmatter: refresh_frontmatter,
+            }
+        };
 
         match index_single_disk_entry(
             db,
@@ -658,17 +723,56 @@ pub fn rebuild_index(
             entry,
             exclude_headings,
             registry,
-            entry_force,
+            mode,
             context_mode,
         )? {
-            SingleResult::Updated { chunks } => {
+            SingleResult::Updated {
+                chunks,
+                frontmatter_unparsed: fm_unparsed,
+            } => {
                 updated += 1;
+                if fm_unparsed {
+                    frontmatter_unparsed += 1;
+                }
                 progress.report_indexed(&entry.rel, chunks);
+            }
+            // A skip that still failed to parse its frontmatter was named on
+            // stderr, so it is counted like an indexed one (codex P2, round 1).
+            SingleResult::Skipped {
+                reason,
+                frontmatter_unparsed: fm_unparsed,
+            } => {
+                skipped_count += 1;
+                if fm_unparsed {
+                    frontmatter_unparsed += 1;
+                }
+                // What the check has to have read is the bytes the *row* was written
+                // from, and a skip retains that row. A skip decided before parsing read
+                // nothing; one decided after parsing (no chunks) read the file on disk,
+                // which is the row's bytes only when the hashes agree. Otherwise the old
+                // bytes can come back, match the retained hash, and hide behind the fast
+                // path for good (codex P2, rounds 3 and 4).
+                if refresh_frontmatter
+                    && let Some(row_hash) = indexed_markdown_hash(db, registry, &entry.rel)?
+                    && (reason != SKIPPED_NO_CHUNKS || row_hash != entry.hash)
+                {
+                    refresh_pending = true;
+                }
+                progress.report_unchanged(&entry.rel);
             }
             // A refusal counts as a skip here for the same reason a size cap
             // does: the file is not indexed and the reason is already on stderr.
-            SingleResult::Skipped { .. } | SingleResult::Refused => {
+            SingleResult::Refused => {
                 skipped_count += 1;
+                if refresh_frontmatter && indexed_markdown_hash(db, registry, &entry.rel)?.is_some()
+                {
+                    refresh_pending = true;
+                }
+                progress.report_unchanged(&entry.rel);
+            }
+            SingleResult::MetadataRefreshed => {
+                frontmatter_unparsed += 1;
+                refreshed += 1;
                 progress.report_unchanged(&entry.rel);
             }
             SingleResult::Unchanged => {
@@ -677,6 +781,20 @@ pub fn rebuild_index(
                 progress.report_unchanged(&entry.rel);
             }
         }
+    }
+
+    // (#251) Every unchanged Markdown document has now been looked at under this policy, so
+    // the next run can take the fast path again. Written after the loop on purpose: a run
+    // that stops halfway leaves the key absent and the next run looks again -- and so does
+    // one that could not read a document it holds a row for.
+    if force || (refresh_frontmatter && !refresh_pending) {
+        db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
+    }
+    if refreshed > 0 {
+        eprintln!(
+            "Tagged {refreshed} unchanged Markdown document(s) whose YAML frontmatter had failed to parse \
+             before this version recorded it (one-time check; nothing was re-embedded)"
+        );
     }
 
     // 3. Delete documents in DB that no longer exist on disk.
@@ -704,6 +822,7 @@ pub fn rebuild_index(
         renamed,
         deleted,
         skipped: skipped_count,
+        frontmatter_unparsed,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })
@@ -725,6 +844,57 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
     }
 }
 
+/// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed. The
+/// one-time frontmatter check (#251) treats every other skip as "not read", because those
+/// return before the parser runs; this one counts as read only when the bytes parsed are
+/// the bytes the retained row holds.
+const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
+
+/// The [`SingleResult::Skipped`] reason the one-time frontmatter check (#251) returns when
+/// the bytes it read are not the bytes the scan hashed: the file was swapped between the
+/// two reads, so nothing about the retained row has been learned, and the skip keeps the
+/// check pending for the next run (codex P2, round 5).
+const SKIPPED_CHANGED_DURING_READ: &str = "changed between scan and read";
+
+/// The stored content hash of `rel` when it is a Markdown file -- by the parser the
+/// registry would hand it, so `.MD` counts -- that the index already holds a row for;
+/// `None` otherwise. The one-time frontmatter check (#251) asks this about every file it
+/// did not index: only such a file can come back later with a matching hash and slip past
+/// the check for good, and the hash is what says whether the bytes that were read this
+/// run are the ones the row was written from.
+fn indexed_markdown_hash(db: &Database, registry: &Registry, rel: &str) -> Result<Option<String>> {
+    let ext = Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let is_markdown = registry
+        .by_extension(ext)
+        .is_some_and(|p| p.extension() == "md");
+    if !is_markdown {
+        return Ok(None);
+    }
+    db.get_document_hash(rel)
+}
+
+/// How [`index_single_disk_entry`] treats a file whose content hash the index
+/// already holds.
+///
+/// `force` and the one-time frontmatter check (#251) are not two independent
+/// switches: under `Force` every file is re-parsed and re-embedded, so there is
+/// nothing left for the check to do. Folding them into one value says so in
+/// the type instead of leaving a `(true, true)` that means the same as
+/// `(true, false)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Reindex {
+    /// Re-parse and re-embed regardless of the stored hash (`--force`, or a
+    /// renamed entry under static context mode).
+    Force,
+    /// Skip a file whose hash matches. With `check_frontmatter` set, an
+    /// unchanged Markdown file is still read once so a frontmatter that fails
+    /// to parse can be tagged without re-embedding ([`FRONTMATTER_POLICY`]).
+    Incremental { check_frontmatter: bool },
+}
+
 /// 単一 DiskEntry を index する内部関数。
 /// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
@@ -735,9 +905,14 @@ fn index_single_disk_entry(
     entry: &DiskEntry,
     exclude_headings: Option<&[String]>,
     registry: &Registry,
-    force: bool,
+    mode: Reindex,
     context_mode: ContextMode,
 ) -> Result<SingleResult> {
+    let force = mode == Reindex::Force;
+    let refresh_frontmatter = mode
+        == Reindex::Incremental {
+            check_frontmatter: true,
+        };
     // (AV-12) Every path that can put a document into an index arrives here, which is why the
     // chunking policy is resolved here rather than at each caller: the first attempt covered
     // `reindex_single_file` and missed the rename branch, which reaches this function directly
@@ -745,17 +920,6 @@ fn index_single_disk_entry(
     // "was there a source file here before this run", and after the insert there would be.
     resolve_code_chunk_policy(db, false)?;
 
-    // Skip unchanged files unless forced.
-    // rename で path UPDATE 済のものは「DB 側 hash == disk hash」なので
-    // ここで自然に skip される (embedding 再計算なし)。
-    if !force
-        && let Some(existing_hash) = db.get_document_hash(&entry.rel)?
-        && existing_hash == entry.hash
-    {
-        return Ok(SingleResult::Unchanged);
-    }
-
-    // Read + parse only for files we actually need to embed.
     // 拡張子で Registry から Parser を選択。collect_source_files
     // が Registry の extensions() のみを拾うため、通常は必ず見つかる。
     // 見つからなければ安全側に Skip 扱いで返し、crash せず次に進む。
@@ -764,11 +928,33 @@ fn index_single_disk_entry(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
+
+    // Skip unchanged files unless forced.
+    // rename で path UPDATE 済のものは「DB 側 hash == disk hash」なので
+    // ここで自然に skip される (embedding 再計算なし)。
+    //
+    // (#251) The one exception is the one-time upgrade check: an unchanged Markdown
+    // document is read and parsed once more, and only its metadata may be rewritten.
+    //
+    // Resolved ahead of the unchanged check so the check can ask the parser, not the
+    // spelling: the scan and [`Registry::by_extension`] both take `.MD` as Markdown, and a
+    // comparison against the literal did not (codex P1, round 2).
     let Some(parser) = registry.by_extension(ext) else {
         return Ok(SingleResult::Skipped {
             reason: "no parser for extension",
+            frontmatter_unparsed: false,
         });
     };
+    let unchanged = !force
+        && db
+            .get_document_hash(&entry.rel)?
+            .is_some_and(|existing| existing == entry.hash);
+    let refresh_only = unchanged && refresh_frontmatter && parser.extension() == "md";
+    if unchanged && !refresh_only {
+        return Ok(SingleResult::Unchanged);
+    }
+
+    // Read + parse only for files we actually need to embed.
     // (BU-20) The bytes that become chunks come from a handle whose link count,
     // file type and size were all read off that same handle — this is the read
     // a swapped-in hard link has to get past, and cannot.
@@ -794,6 +980,7 @@ fn index_single_disk_entry(
             eprintln!("Skipping {}: failed to read: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
                 reason: "read failed",
+                frontmatter_unparsed: false,
             });
         }
     };
@@ -814,17 +1001,66 @@ fn index_single_disk_entry(
             eprintln!("Skipping {}: parse failed: {e}", entry.rel);
             return Ok(SingleResult::Skipped {
                 reason: "parse failed",
+                frontmatter_unparsed: false,
             });
         }
     };
 
-    if parsed.chunks.is_empty() {
-        return Ok(SingleResult::Skipped {
-            reason: "no embeddable chunks",
-        });
+    // (#251) The parser hands the refused YAML back as data; this is the one
+    // place that knows the file, so this is where it is named. Written
+    // directly, like `Skipping ...` above, so `--quiet` and `RUST_LOG` do not
+    // hide it. Before the empty-chunks check on purpose: a frontmatter-only
+    // stub with broken YAML is still worth naming even though it is skipped.
+    if let Some(e) = &parsed.frontmatter_error {
+        eprintln!(
+            "warning: {}: failed to parse YAML frontmatter: {e}",
+            entry.rel
+        );
     }
 
     let (category, topic) = extract_category_topic(&entry.rel);
+
+    // (#251) The upgrade check: the content is what the index already holds, so the only
+    // question is whether this document should have carried the tag. A clean one is left
+    // exactly as it was; a broken one gets its metadata -- which is where the tag lives --
+    // written again, and nothing else is touched.
+    if refresh_only {
+        // "Unchanged" was decided from the scan's hash; the bytes just parsed came from a
+        // second read. If they differ the row's bytes were not what was read, and saying
+        // "checked" would let the originals slip past the fast path when they come back.
+        // The warning above already named the file if what was read failed to parse,
+        // and a named failure is a counted one (codex P2, round 6).
+        if sha256_hex_bytes(&bytes) != entry.hash {
+            return Ok(SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+            });
+        }
+        if parsed.frontmatter_error.is_none() {
+            return Ok(SingleResult::Unchanged);
+        }
+        let tx = db.begin_transaction()?;
+        db.update_document_meta(
+            &entry.rel,
+            parsed.frontmatter.title.as_deref(),
+            parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
+            category.as_deref(),
+            parsed.frontmatter.depth.as_deref(),
+            &parsed.frontmatter.tags,
+            parsed.frontmatter.date.as_deref(),
+            &entry.hash,
+            size_bytes,
+        )?;
+        tx.commit()?;
+        return Ok(SingleResult::MetadataRefreshed);
+    }
+
+    if parsed.chunks.is_empty() {
+        return Ok(SingleResult::Skipped {
+            reason: SKIPPED_NO_CHUNKS,
+            frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+        });
+    }
 
     // frontmatter-only skip: 既存 DB のチャンクテキストと
     // 新 parse 結果のチャンクテキストを比較し、完全一致ならチャンク本体は
@@ -907,6 +1143,7 @@ fn index_single_disk_entry(
             tx.commit()?;
             return Ok(SingleResult::Updated {
                 chunks: parsed.chunks.len() as u32,
+                frontmatter_unparsed: parsed.frontmatter_error.is_some(),
             });
         }
         // update が 0 行なら通常経路にフォールスルー (レース耐性)
@@ -948,6 +1185,7 @@ fn index_single_disk_entry(
 
     Ok(SingleResult::Updated {
         chunks: parsed.chunks.len() as u32,
+        frontmatter_unparsed: parsed.frontmatter_error.is_some(),
     })
 }
 
@@ -1061,6 +1299,7 @@ pub fn reindex_single_file(
     if !full.exists() {
         return Ok(SingleResult::Skipped {
             reason: "file no longer exists",
+            frontmatter_unparsed: false,
         });
     }
 
@@ -1090,6 +1329,7 @@ pub fn reindex_single_file(
         }
         return Ok(SingleResult::Skipped {
             reason: "file too large",
+            frontmatter_unparsed: false,
         });
     }
 
@@ -1127,13 +1367,16 @@ pub fn reindex_single_file(
     };
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     index_single_disk_entry(
         db,
         embedder,
         &entry,
         exclude_headings,
         registry,
-        false,
+        Reindex::Incremental {
+            check_frontmatter: false,
+        },
         context_mode,
     )
 }
@@ -1211,7 +1454,8 @@ pub fn rename_single_file(
                 SingleResult::Refused => RenameOutcome::OldPathMissingAndRefused,
                 SingleResult::Updated { .. }
                 | SingleResult::Unchanged
-                | SingleResult::Skipped { .. } => RenameOutcome::OldPathMissing,
+                | SingleResult::Skipped { .. }
+                | SingleResult::MetadataRefreshed => RenameOutcome::OldPathMissing,
             },
         );
     };
@@ -1310,10 +1554,16 @@ pub fn rename_single_file(
         &entry,
         exclude_headings,
         registry,
-        same_hash,
+        if same_hash {
+            Reindex::Force
+        } else {
+            Reindex::Incremental {
+                check_frontmatter: false,
+            }
+        },
         context_mode,
     )? {
-        SingleResult::Updated { chunks } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
+        SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         // (codex P2 round 1 on PR #157) `index_single_disk_entry` reads the file
         // a **second** time, and the whole premise of this guard is that a path
         // can change between two reads. Letting that refusal fall into the
@@ -1322,7 +1572,11 @@ pub fn rename_single_file(
         SingleResult::Refused => Ok(RenameOutcome::RenamedButRefused),
         // Spelled out rather than `_`: a catch-all is what swallowed the
         // refusal in the first place, and it would swallow the next variant too.
-        SingleResult::Unchanged | SingleResult::Skipped { .. } => Ok(RenameOutcome::Renamed),
+        // `MetadataRefreshed` cannot come back here (the check is off on this
+        // path) and is named so that adding a variant stays a compile error.
+        SingleResult::Unchanged
+        | SingleResult::Skipped { .. }
+        | SingleResult::MetadataRefreshed => Ok(RenameOutcome::Renamed),
     }
 }
 
@@ -1474,6 +1728,15 @@ pub(crate) fn resolve_code_chunk_budget(db: &Database, desired: usize, force: bo
 ///
 /// [ADR-0017]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0017-bound-the-chunk-count-without-dropping-bytes.md
 pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
+
+/// (#251) Recorded in `index_meta.frontmatter_policy` once every unchanged Markdown document
+/// in the index has been looked at by a build that tags a frontmatter it could not parse.
+///
+/// Absence means "not looked at yet": an index written before this existed may hold such
+/// documents with a matching content hash and no tag, and the unchanged fast path in
+/// [`rebuild_index`] would never read them again. The value is a generation, like
+/// [`CODE_CHUNK_POLICY`]: it changes when what the parser writes changes.
+pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 
 /// What an index that was built before [`CODE_CHUNK_POLICY`] existed is recorded as.
 ///
@@ -2791,14 +3054,179 @@ mod tests {
     /// するため通常の cargo test には載せない)。
     #[test]
     fn test_single_result_variants_are_distinct() {
-        assert_ne!(SingleResult::Unchanged, SingleResult::Updated { chunks: 0 });
         assert_ne!(
             SingleResult::Unchanged,
-            SingleResult::Skipped { reason: "test" }
+            SingleResult::Updated {
+                chunks: 0,
+                frontmatter_unparsed: false
+            }
         );
         assert_ne!(
-            SingleResult::Updated { chunks: 1 },
-            SingleResult::Updated { chunks: 2 }
+            SingleResult::Unchanged,
+            SingleResult::Skipped {
+                reason: "test",
+                frontmatter_unparsed: false
+            }
+        );
+        assert_ne!(
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false
+            },
+            SingleResult::Updated {
+                chunks: 2,
+                frontmatter_unparsed: false
+            }
+        );
+    }
+
+    /// #251 (codex P2, round 5): the one-time check decides "unchanged" from
+    /// the hash the scan took, then reads the file again. Bytes swapped
+    /// between the two reads are not the row's bytes, so the check must not
+    /// treat them as read -- it reports a skip that keeps the check pending.
+    #[test]
+    #[ignore = "requires embedding model download"]
+    fn test_refresh_skips_a_file_whose_bytes_changed_between_scan_and_read() {
+        let dir = crate::test_support::unique_temp_path("groove-fm-race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = "---\ntitle: [unclosed\n---\n\n# Broken\n\nBody long enough to be a chunk.\n";
+        let clean = "---\ntitle: Clean\n---\n\n# Clean\n\nBody long enough to be a chunk.\n";
+        let full = dir.join("swapped.md");
+        // On disk: the clean bytes. In the index and in the scan: the broken ones.
+        std::fs::write(&full, clean).unwrap();
+        let old_hash = sha256_hex_bytes(broken.as_bytes());
+
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document(
+            "swapped.md",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &old_hash,
+            broken.len() as u64,
+        )
+        .unwrap();
+        let mut embedder = Embedder::new().unwrap();
+        let entry = DiskEntry {
+            rel: "swapped.md".to_string(),
+            hash: old_hash,
+            full,
+            size: broken.len() as u64,
+        };
+        let result = index_single_disk_entry(
+            &db,
+            &mut embedder,
+            &entry,
+            None,
+            &Registry::default(),
+            Reindex::Incremental {
+                check_frontmatter: true,
+            },
+            ContextMode::Off,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: false
+            }
+        );
+
+        // The other direction (codex P2, round 6): the scan saw clean bytes, the
+        // second read finds broken ones. The warning names the file, so the
+        // skip has to carry the failure or the summary undercounts what it said.
+        let new_hash = sha256_hex_bytes(clean.as_bytes());
+        db.update_document_meta(
+            "swapped.md",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &new_hash,
+            clean.len() as u64,
+        )
+        .unwrap();
+        std::fs::write(&entry.full, broken).unwrap();
+        let entry = DiskEntry {
+            hash: new_hash,
+            ..entry
+        };
+        let result = index_single_disk_entry(
+            &db,
+            &mut embedder,
+            &entry,
+            None,
+            &Registry::default(),
+            Reindex::Incremental {
+                check_frontmatter: true,
+            },
+            ContextMode::Off,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            SingleResult::Skipped {
+                reason: SKIPPED_CHANGED_DURING_READ,
+                frontmatter_unparsed: true
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #251 (codex P1, round 4): the CLI exit code and the MCP `error` reply
+    /// are two renderings of one decision, so the decision lives here.
+    #[test]
+    fn test_fails_strict_frontmatter_needs_both_the_switch_and_a_count() {
+        let clean = IndexResult {
+            frontmatter_unparsed: 0,
+            ..IndexResult::default()
+        };
+        let broken = IndexResult {
+            frontmatter_unparsed: 2,
+            ..IndexResult::default()
+        };
+        assert!(!clean.fails_strict_frontmatter(false));
+        assert!(!clean.fails_strict_frontmatter(true));
+        assert!(!broken.fails_strict_frontmatter(false));
+        assert!(broken.fails_strict_frontmatter(true));
+    }
+
+    /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is
+    /// skipped for having no chunks, and still has to be counted, so the
+    /// skipped result carries the flag too.
+    #[test]
+    fn test_skipped_distinguishes_frontmatter_unparsed() {
+        assert_ne!(
+            SingleResult::Skipped {
+                reason: "no embeddable chunks",
+                frontmatter_unparsed: true
+            },
+            SingleResult::Skipped {
+                reason: "no embeddable chunks",
+                frontmatter_unparsed: false
+            }
+        );
+    }
+
+    /// #251: the run summary counts documents written with the
+    /// `frontmatter:unparsed` tag, so the per-file result has to say so.
+    #[test]
+    fn test_updated_distinguishes_frontmatter_unparsed() {
+        assert_ne!(
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: true
+            },
+            SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false
+            }
         );
     }
 

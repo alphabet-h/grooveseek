@@ -16,7 +16,7 @@ impl Parser for MarkdownParser {
     }
 
     fn parse(&self, raw: &str, path_hint: &str, exclude_headings: &[&str]) -> ParsedDocument {
-        let (frontmatter, body) = extract_frontmatter(raw);
+        let (frontmatter, body, frontmatter_error) = extract_frontmatter(raw);
         // context 用 title: frontmatter.title (非空) → filename stem fallback (E-1)。
         // documents.title は frontmatter.title のまま (ここでは context 生成にのみ使う)。
         let ctx_title = frontmatter
@@ -30,9 +30,19 @@ impl Parser for MarkdownParser {
             frontmatter,
             chunks,
             raw_content: raw.to_string(),
+            frontmatter_error,
         }
     }
 }
+
+/// Tag on a Markdown document whose YAML frontmatter could not be parsed (#251).
+///
+/// Such a document goes into the index with `title`, `date`, `topic` and
+/// `depth` empty, so a filter on any of them silently drops it; this tag is
+/// what makes it findable again (`tags_any: ["frontmatter:unparsed"]`). Like
+/// every tag it is frontmatter, so a note with valid YAML can declare it by
+/// hand; [`ParsedDocument::frontmatter_error`] is the parser's own word.
+pub const TAG_FRONTMATTER_UNPARSED: &str = "frontmatter:unparsed";
 
 // ---------------------------------------------------------------------------
 // Internal: serde helper for flexible YAML deserialization
@@ -83,11 +93,19 @@ impl From<RawFrontmatter> for Frontmatter {
 // Frontmatter extraction
 // ---------------------------------------------------------------------------
 
-fn extract_frontmatter(raw: &str) -> (Frontmatter, String) {
+/// Split `raw` into frontmatter, body and, when a `---` block was found but
+/// its YAML was refused, the parser's error text.
+///
+/// The three shapes a file can take are told apart by the caller only through
+/// that third element: no block and an unterminated block both come back as
+/// `(default, body, None)`, as before; a block that does not parse comes back
+/// with the [`TAG_FRONTMATTER_UNPARSED`] tag and `Some(reason)`. Nothing is
+/// printed here -- see [`ParsedDocument::frontmatter_error`] for why.
+fn extract_frontmatter(raw: &str) -> (Frontmatter, String, Option<String>) {
     let trimmed = raw.trim_start_matches('\u{feff}'); // strip BOM if present
 
     if !trimmed.starts_with("---") {
-        return (Frontmatter::default(), trimmed.to_string());
+        return (Frontmatter::default(), trimmed.to_string(), None);
     }
 
     let after_first = &trimmed[3..];
@@ -111,17 +129,18 @@ fn extract_frontmatter(raw: &str) -> (Frontmatter, String) {
             yaml_raw
         };
 
-        let fm = match serde_yaml_bw::from_str::<RawFrontmatter>(yaml_str) {
-            Ok(raw_fm) => Frontmatter::from(raw_fm),
+        match serde_yaml_bw::from_str::<RawFrontmatter>(yaml_str) {
+            Ok(raw_fm) => (Frontmatter::from(raw_fm), body, None),
             Err(e) => {
-                eprintln!("warning: failed to parse YAML frontmatter: {e}");
-                Frontmatter::default()
+                let fm = Frontmatter {
+                    tags: vec![TAG_FRONTMATTER_UNPARSED.to_string()],
+                    ..Frontmatter::default()
+                };
+                (fm, body, Some(e.to_string()))
             }
-        };
-
-        (fm, body)
+        }
     } else {
-        (Frontmatter::default(), trimmed.to_string())
+        (Frontmatter::default(), trimmed.to_string(), None)
     }
 }
 
@@ -259,6 +278,40 @@ mod tests {
 
     fn parse(md: &str) -> ParsedDocument {
         MarkdownParser.parse(md, "test.md", &[])
+    }
+
+    // #251: a frontmatter block that does not parse is reported as data, not
+    // printed, and the document carries the tag that makes it findable again.
+    #[test]
+    fn test_broken_frontmatter_is_tagged_and_reports_error() {
+        let md = "---\ntitle: [unclosed\n---\n\n# Broken\n\nBody long enough to stand as one chunk on its own here.\n";
+        let doc = parse(md);
+        assert!(doc.frontmatter_error.is_some());
+        assert_eq!(doc.frontmatter.tags, vec![TAG_FRONTMATTER_UNPARSED]);
+        assert_eq!(doc.frontmatter.title, None);
+        assert_eq!(doc.chunks.len(), 1);
+        assert!(!doc.chunks[0].content.contains("title:"));
+    }
+
+    #[test]
+    fn test_valid_and_absent_frontmatter_carry_no_error() {
+        let valid = parse(
+            "---\ntitle: Fine\ntags: [ok]\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(valid.frontmatter_error, None);
+        assert_eq!(valid.frontmatter.tags, vec!["ok"]);
+
+        let absent =
+            parse("# No frontmatter\n\nBody long enough to stand as one chunk on its own here.\n");
+        assert_eq!(absent.frontmatter_error, None);
+        assert!(absent.frontmatter.tags.is_empty());
+    }
+
+    #[test]
+    fn test_unterminated_frontmatter_is_not_an_error() {
+        let doc = parse("---\ntitle: x\nno closing fence, so this is body text as before.\n");
+        assert_eq!(doc.frontmatter_error, None);
+        assert!(doc.frontmatter.tags.is_empty());
     }
 
     #[test]

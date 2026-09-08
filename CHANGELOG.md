@@ -14,6 +14,29 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **A Markdown file with broken YAML frontmatter is now named, counted and
+  tagged.** `groove index` used to print `warning: failed to parse YAML
+  frontmatter: ...` with no path, index the file with empty metadata, and say
+  nothing in its summary — so the document appeared in an unfiltered search and
+  vanished from every `--tag-all` / `topic` filter with nothing to grep for. The
+  warning now reads `warning: <path>: failed to parse YAML frontmatter: ...` and
+  prints under `--quiet` too; the `Done in` summary and the MCP `rebuild_index`
+  stats carry a `frontmatter unparsed` count; and the document is tagged
+  `frontmatter:unparsed` so `tags_any` can list them. A new
+  `[index] fail_on_frontmatter_error = true` makes `groove index` exit 1 after
+  such a run — after, not during: every file is still indexed and every broken
+  one is named, so one failure covers the corpus. The watcher ignores the key.
+  An index an older version wrote is checked once: the first `groove index` of
+  this version re-reads the frontmatter of every unchanged Markdown file, tags
+  the broken ones without re-embedding anything, and records that it has
+  looked, so a document that was already broken before the upgrade does not
+  stay invisible until it happens to change. A frontmatter-only stub is skipped
+  for having no content and still named and counted. One visible consequence: a `groove validate` schema that constrains `tags`
+  with `enum` or `pattern` now reports `frontmatter:unparsed` as an offending
+  value on such a file, where before it saw an empty list. (#251)
+
 ## [1.6.0] - 2026-09-07
 
 ### Added

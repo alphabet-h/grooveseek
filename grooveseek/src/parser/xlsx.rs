@@ -149,6 +149,7 @@ fn parse_xlsx_bytes_capped(
         frontmatter,
         chunks,
         raw_content,
+        frontmatter_error: None,
     })
 }
 
@@ -303,6 +304,7 @@ fn parse_xls_bytes_capped(
         frontmatter,
         chunks,
         raw_content,
+        frontmatter_error: None,
     })
 }
 

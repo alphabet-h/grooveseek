@@ -715,16 +715,30 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         state.exclude_headings.as_deref(),
         &state.registry,
     ) {
-        Ok(indexer::SingleResult::Updated { chunks }) => {
-            wdiag!("watcher: reindexed {rel} ({chunks} chunks)");
+        Ok(indexer::SingleResult::Updated {
+            chunks,
+            frontmatter_unparsed,
+        }) => {
+            // (#251) The per-file warning naming the file is already on stderr
+            // from the indexer; this only says the reindex kept the tag.
+            let note = if frontmatter_unparsed {
+                ", frontmatter unparsed"
+            } else {
+                ""
+            };
+            wdiag!("watcher: reindexed {rel} ({chunks} chunks{note})");
         }
-        Ok(indexer::SingleResult::Unchanged) => { /* no-op */ }
+        // (#251) `MetadataRefreshed` cannot come back here: the one-time check
+        // is off on this path. Named so a new variant stays a compile error.
+        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed) => {
+            /* no-op */
+        }
         // (BU-20) The reason is already on stderr from the read; this says what
         // happened to the document, which the reason does not.
         Ok(indexer::SingleResult::Refused) => {
             wdiag!("watcher: {rel} refused, index left as it was");
         }
-        Ok(indexer::SingleResult::Skipped { reason }) => {
+        Ok(indexer::SingleResult::Skipped { reason, .. }) => {
             wdiag!("watcher: skipped {rel} ({reason})");
         }
         Err(e) => {

@@ -403,6 +403,7 @@ impl Parser for PdfParser {
             frontmatter,
             chunks,
             raw_content,
+            frontmatter_error: None,
         })
     }
 }

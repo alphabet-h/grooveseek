@@ -45,6 +45,7 @@ impl Parser for TxtParser {
             frontmatter,
             chunks,
             raw_content: raw.to_string(),
+            frontmatter_error: None,
         }
     }
 }

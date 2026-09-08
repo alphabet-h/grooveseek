@@ -62,6 +62,14 @@ chunk はすべて `code` と `lang:<name>` を持つ。結果は既定でコー
 { "path_globs": ["!**/*.rs"] }  // 散文だけ。exclude だけの list は有効
 ```
 
+YAML frontmatter が parse できなかった Markdown (v1.7.0+) にも、同じ理由で parser が
+`frontmatter:unparsed` の tag を付ける: `title` / `date` / `topic` が空なので、
+他のどの filter でも届かないから。
+
+```jsonc
+{ "tags_any": ["frontmatter:unparsed"] }  // frontmatter が壊れたまま索引された文書
+```
+
 ## `date_from` / `date_to`
 
 - **`YYYY-MM-DD`** (推奨) または RFC 3339 タイムスタンプ

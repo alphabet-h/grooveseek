@@ -90,6 +90,28 @@ pub struct Config {
     /// 静的 Contextual Retrieval (feature-46) の設定。
     /// 省略時 (`None`) は `ContextualConfig::default()` (enabled=false) 相当。
     pub contextual: Option<ContextualConfig>,
+    /// `[index]` セクション (#251)。`groove index` と MCP `rebuild_index` の設定。
+    /// 省略時 (`None`) は [`IndexConfig::default()`] (fail_on_frontmatter_error=false)。
+    pub index: Option<IndexConfig>,
+}
+
+/// `[index]` section (`groove.toml`), #251. Settings that apply to
+/// `groove index` and the MCP `rebuild_index` tool; the watcher reads none of
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Fail the run when any Markdown file's YAML frontmatter could not be
+    /// parsed.
+    ///
+    /// The run still indexes every file -- the document goes in with empty
+    /// metadata and the `frontmatter:unparsed` tag -- and the failure is
+    /// reported after the summary, so one run names every broken file.
+    /// `groove index` exits 1; the MCP tool answers with an `error` alongside
+    /// the stats. The watcher ignores this: a daemon does not exit because a
+    /// note was saved half-written.
+    #[serde(default)]
+    pub fail_on_frontmatter_error: bool,
 }
 
 /// `get_best_practice` の opt-in 設定。
@@ -966,6 +988,7 @@ impl Config {
             && self.eval.is_none()
             && self.search.is_none()
             && self.contextual.is_none()
+            && self.index.is_none()
     }
 
     /// `exclude_dirs` の実効値を返す。設定省略時は [`DEFAULT_EXCLUDE_DIRS`]
@@ -2668,6 +2691,36 @@ lambda = 0.5
              documents every groove.toml key",
             page.display()
         )
+    }
+
+    // (#251) `[index]` section.
+    #[test]
+    fn test_index_section_defaults_to_lenient() {
+        let cfg: Config = toml::from_str("[index]\n").unwrap();
+        let index = cfg.index.expect("[index] present");
+        assert!(!index.fail_on_frontmatter_error);
+        assert_eq!(index, IndexConfig::default());
+    }
+
+    #[test]
+    fn test_index_section_accepts_fail_on_frontmatter_error() {
+        let cfg: Config = toml::from_str("[index]\nfail_on_frontmatter_error = true\n").unwrap();
+        assert!(cfg.index.unwrap().fail_on_frontmatter_error);
+        assert!(!cfg_with_index_is_empty());
+    }
+
+    fn cfg_with_index_is_empty() -> bool {
+        toml::from_str::<Config>("[index]\n").unwrap().is_empty()
+    }
+
+    #[test]
+    fn test_index_section_rejects_unknown_key() {
+        let err = toml::from_str::<Config>("[index]\nfail_on_frontmater_error = true\n")
+            .expect_err("a misspelt key must not be silently ignored");
+        assert!(
+            err.to_string().contains("fail_on_frontmater_error"),
+            "{err}"
+        );
     }
 
     #[test]

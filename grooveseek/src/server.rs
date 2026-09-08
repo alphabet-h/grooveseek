@@ -140,6 +140,9 @@ pub(crate) struct KbCore {
     search_config: crate::config::SearchConfig,
     /// feature-46: `rebuild_index` MCP tool の force 時 adopt 値 (§4.8)。
     context_mode_desired: crate::db::ContextMode,
+    /// (#251) `[index].fail_on_frontmatter_error`: the MCP `rebuild_index` tool answers with
+    /// an `error` beside the counts when a run wrote any `frontmatter:unparsed`.
+    fail_on_frontmatter_error: bool,
     /// Shared indexing-state slot — `rebuild_index` flips it Some/None so
     /// `/api/admin/status` (= `KbServerShared.indexing_state`) reflects the
     /// in-process index operation (codex P2 round 1 on PR #57).
@@ -455,8 +458,23 @@ struct IndexStats {
     /// disk 上に存在するが index されなかったファイル数 (read/size/parse 失敗・空本文)。
     #[serde(default)]
     skipped: u32,
+    /// (#251) Markdown files this run warned about for a YAML frontmatter that
+    /// could not be parsed: indexed with the `frontmatter:unparsed` tag, skipped
+    /// as an empty stub, or tagged by the one-time check over an older index.
+    #[serde(default)]
+    frontmatter_unparsed: u32,
     total_chunks: u32,
     duration_ms: u64,
+}
+
+/// (#251) The MCP `rebuild_index` tool's reply under `[index].fail_on_frontmatter_error`
+/// when the count is non-zero: the run did happen, so the counts are still
+/// there, flattened beside the `error` a client keys on.
+#[derive(Serialize)]
+struct StrictIndexFailure {
+    error: String,
+    #[serde(flatten)]
+    stats: IndexStats,
 }
 
 #[derive(Serialize, Debug)]
@@ -623,9 +641,22 @@ impl KbCore {
                     renamed: result.renamed,
                     deleted: result.deleted,
                     skipped: result.skipped,
+                    frontmatter_unparsed: result.frontmatter_unparsed,
                     total_chunks: result.total_chunks,
                     duration_ms: result.duration_ms,
                 };
+                if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
+                    let reply = StrictIndexFailure {
+                        error: format!(
+                            "{} document(s) have YAML frontmatter that could not be parsed; \
+                             [index].fail_on_frontmatter_error is set. The index was still written; \
+                             each file is named on the server's stderr and carries the tag frontmatter:unparsed.",
+                            stats.frontmatter_unparsed
+                        ),
+                        stats,
+                    };
+                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                }
                 serde_json::to_string_pretty(&stats).unwrap_or_default()
             }
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
@@ -1056,6 +1087,8 @@ pub struct KbServerShared {
     /// から算出)。`rebuild_index` MCP tool が force 時の adopt 値に使う。非 force は
     /// DB 側モードが優先されるため、この値は force 移行時のみ効く。
     pub context_mode_desired: crate::db::ContextMode,
+    /// (#251) `[index].fail_on_frontmatter_error`, read by the MCP `rebuild_index` tool.
+    pub fail_on_frontmatter_error: bool,
 
     // (v0.8.0+, feature-43 PR-2) Fields surfaced by `/api/admin/status`.
     /// Wall-clock daemon start time, used for ISO formatting in admin status.
@@ -1178,6 +1211,7 @@ impl KbServer {
                 min_confidence_ratio: shared.min_confidence_ratio,
                 search_config: shared.search_config.clone(),
                 context_mode_desired: shared.context_mode_desired,
+                fail_on_frontmatter_error: shared.fail_on_frontmatter_error,
                 indexing_state: Arc::clone(&shared.indexing_state),
             }),
             tool_router: KbServer::tool_router(),
@@ -1291,6 +1325,7 @@ impl KbServerShared {
             min_confidence_ratio: 1.5,
             search_config: crate::config::SearchConfig::default(),
             context_mode_desired: crate::db::ContextMode::Off,
+            fail_on_frontmatter_error: false,
             started_at: SystemTime::now(),
             started_instant: Instant::now(),
             indexing_state: Arc::new(Mutex::new(None)),
@@ -1326,6 +1361,7 @@ pub async fn run_server(
     search_config: crate::config::SearchConfig,
     config_source: crate::config::ConfigSource,
     context_mode_desired: crate::db::ContextMode,
+    fail_on_frontmatter_error: bool,
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::time::{Instant, SystemTime};
@@ -1440,6 +1476,7 @@ pub async fn run_server(
         min_confidence_ratio,
         search_config,
         context_mode_desired,
+        fail_on_frontmatter_error,
         started_at: SystemTime::now(),
         started_instant: Instant::now(),
         indexing_state: Arc::new(Mutex::new(None)),
@@ -1504,6 +1541,31 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+
+    /// (#251) Under `[index].fail_on_frontmatter_error` the tool still ran, so
+    /// the reply carries the counts next to the `error` a client keys on.
+    #[test]
+    fn strict_index_failure_serialises_error_beside_the_stats() {
+        let reply = StrictIndexFailure {
+            error: "2 document(s) have YAML frontmatter that could not be parsed".to_string(),
+            stats: IndexStats {
+                total_documents: 3,
+                updated: 3,
+                renamed: 0,
+                deleted: 0,
+                skipped: 0,
+                frontmatter_unparsed: 2,
+                total_chunks: 5,
+                duration_ms: 7,
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&reply).unwrap()).unwrap();
+        assert_eq!(json["frontmatter_unparsed"], 2);
+        assert_eq!(json["total_documents"], 3);
+        assert!(json["error"].as_str().unwrap().contains("frontmatter"));
+        assert!(json.get("stats").is_none(), "flattened, not nested: {json}");
+    }
 
     /// The half of the naming rule that values are held to: a caller who
     /// copies a spelling from the command line into a tool call must not get

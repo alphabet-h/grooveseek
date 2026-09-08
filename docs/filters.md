@@ -63,6 +63,14 @@ parameter was added for it.
 { "path_globs": ["!**/*.rs"] }  // prose only; an exclude-only list is valid
 ```
 
+A Markdown file whose YAML frontmatter did not parse (v1.7.0+) is tagged
+`frontmatter:unparsed` by the parser for the same reason: its `title`, `date`
+and `topic` are empty, so no other filter can reach it.
+
+```jsonc
+{ "tags_any": ["frontmatter:unparsed"] }  // documents indexed with broken frontmatter
+```
+
 ## `date_from` / `date_to`
 
 - Use **`YYYY-MM-DD`** (recommended) or RFC 3339 timestamps.

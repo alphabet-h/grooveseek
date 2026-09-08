@@ -105,6 +105,17 @@ pub struct ParsedDocument {
     pub frontmatter: Frontmatter,
     pub chunks: Vec<Chunk>,
     pub raw_content: String,
+    /// Why the YAML frontmatter could not be parsed, when it could not.
+    ///
+    /// `None` for a document without a frontmatter block and for one whose
+    /// block parsed. `Some` only when a block was found and the YAML inside
+    /// it was refused; [`Frontmatter`] is then empty apart from the
+    /// [`markdown::TAG_FRONTMATTER_UNPARSED`] tag. The parser returns this as
+    /// data rather than printing it because it does not know the file's path
+    /// and is also run by `get_document` and `groove validate`, which want no
+    /// stray stderr line; the indexer is the one caller that names the file,
+    /// counts it and decides the exit code.
+    pub frontmatter_error: Option<String>,
 }
 
 /// Section headings excluded by default when the caller does not override.
@@ -230,6 +241,7 @@ pub(crate) fn single_text_chunk(raw: &str, path_hint: &str) -> ParsedDocument {
         },
         chunks,
         raw_content: raw.to_string(),
+        frontmatter_error: None,
     }
 }
 

@@ -144,7 +144,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
   - `groove service status` / `groove service list` (`run_status` / `run_list` が
     文字列を組み立て、arm が印字する)
 - **stderr** は人間向けの進捗 / warning / error:
-  - `groove index` の進捗行 (`Indexing ...`, `Done in ...`、各ファイル毎の `  indexed:` / `  renamed:` / `  deleted:`)。`--quiet` で per-file 出力を抑止 (start / found / done のサマリだけ残す)、`--progress` で `indicatif` バー (TTY) または定期 `Progress: N/M (P%)` 行 (非 TTY) に切替。両 flag は相互排他 + 既定 off (v0.7.8 追加)
+  - `groove index` の進捗行 (`Indexing ...`, `Done in ...`、各ファイル毎の `  indexed:` / `  renamed:` / `  deleted:`) と、各ファイルの `warning: <path>: failed to parse YAML frontmatter: ...` 行 (v1.7.0+、どの flag でも抑止されない)。`--quiet` で per-file 出力を抑止 (start / found / done のサマリだけ残す)、`--progress` で `indicatif` バー (TTY) または定期 `Progress: N/M (P%)` 行 (非 TTY) に切替。両 flag は相互排他 + 既定 off (v0.7.8 追加)
   - `groove status` の "No index found" — **答えられないこと**の報告なので stdout は空のまま
   - `groove service install/uninstall/tray-install/tray-uninstall` の確認メッセージ。**行った動作**の報告であって、問われたことへの答えではない
   - すべての `tracing` / `eprintln!` 系診断メッセージ

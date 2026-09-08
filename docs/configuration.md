@@ -81,6 +81,15 @@ enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"]
 [parsers.code]
 max_chunk_chars = 3500
 
+# Optional: fail `groove index` on a Markdown file whose YAML frontmatter does
+# not parse (v1.7.0+). Off by default: the file is indexed with empty metadata
+# and the tag `frontmatter:unparsed`, named in a `warning:` line, and counted
+# in the summary. On, the run still indexes everything and then exits 1. The
+# MCP `rebuild_index` tool answers with an `error` alongside the counts. The
+# watcher ignores this key.
+# [index]
+# fail_on_frontmatter_error = true
+
 # Live-sync file watcher. When `groove serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally
 # within `debounce_ms`. Complementary to the PostToolUse hook: covers manual
@@ -216,7 +225,7 @@ it as yours:
 
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
-`[watch]`, `[contextual]` — is honoured unchanged. Six fields
+`[watch]`, `[contextual]`, `[index]` — is honoured unchanged. Six fields
 are restricted, because they decide which code runs, what is read or leaves
 the machine, and who can reach it:
 

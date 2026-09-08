@@ -138,6 +138,7 @@ fn parse_bytes_impl(bytes: &[u8], path_hint: &str) -> Result<ParsedDocument> {
         frontmatter,
         chunks,
         raw_content,
+        frontmatter_error: None,
     })
 }
 
