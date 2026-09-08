@@ -389,7 +389,7 @@ hit を返し、同じ方法で文書単位に dedup。
 | QMD `query` (hybrid + LLM rerank) | 43 | 0.512 | 0.857 | 0.750 |
 | QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
 
-**GrooveSeek が負けた項目。** *typo* (n=6): P@1 0.500 対 QMD 0.833、全 class の中で
+**GrooveSeek が負けた、または同点だった項目。** *typo* (n=6): P@1 0.500 対 QMD 0.833、全 class の中で
 QMD 側の差が最も大きい。*deprecated-trap* (n=4): P@1 **0.000** — keyword の重なりが多い deprecated
 runbook が、現行の後継を毎回 rank 1 で押しのける。*environment-filtered* (n=5): 0.200 で
 同点。*ambiguous* (n=4): 0.500 対 0.750。cross-encoder reranker は中央値 latency を

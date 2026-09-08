@@ -17,7 +17,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`groove validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。
 
 57 文書の合成 corpus で QMD と比較した第三者の benchmark — 同条件の数値、GrooveSeek が
-負けた class、決め手 — を帰属を明記して
+負けたか同点だった class、決め手 — を帰属を明記して
 [docs/eval.ja.md](./docs/eval.ja.md#第三者による計測) に転載している。
 
 > **English version**: [README.md](./README.md)

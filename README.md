@@ -18,7 +18,7 @@ Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`, p
 A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `groove validate`.
 
 A third-party benchmark against QMD on a 57-document synthetic corpus — like-for-like
-numbers, the classes GrooveSeek lost, and what decided it — is reproduced with
+numbers, the classes GrooveSeek lost or tied, and what decided it — is reproduced with
 attribution in [docs/eval.md](./docs/eval.md#a-third-party-measurement).
 
 > **日本語版**: [README.ja.md](./README.ja.md)

@@ -412,7 +412,7 @@ reported as unsupported and excluded rather than scored as failures, leaving
 | QMD `query` (hybrid + LLM rerank) | 43 | 0.512 | 0.857 | 0.750 |
 | QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
 
-**Where GrooveSeek lost.** *typo* (n=6): P@1 0.500 against QMD's 0.833, the
+**Where GrooveSeek lost or tied.** *typo* (n=6): P@1 0.500 against QMD's 0.833, the
 widest margin in QMD's favour of any class. *deprecated-trap* (n=4): P@1 **0.000** — a
 deprecated runbook with heavier keyword overlap beats its active replacement
 at rank 1 every time. *environment-filtered* (n=5): 0.200, tied. *ambiguous*
