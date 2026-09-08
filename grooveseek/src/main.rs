@@ -1661,7 +1661,7 @@ fn run_validate(
     // (feature-57) `--strict` is the flag form of `[options].allow_unknown_fields
     // = false`; it only ever tightens.
     if strict {
-        schema_obj.allow_unknown_fields = false;
+        schema_obj.require_declared_fields();
     }
 
     // parser registry は `[parsers].enabled` 準拠で .md ファイル列挙に再利用

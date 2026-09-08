@@ -164,6 +164,16 @@ impl Schema {
         Self::compile(raw)
     }
 
+    /// Make a frontmatter key no `[fields.*]` table names a violation: the
+    /// flag form of `[options].allow_unknown_fields = false` (feature-57).
+    ///
+    /// It only ever tightens. A schema that already asks for this is
+    /// unaffected, and there is no call that loosens it back -- `--strict` has
+    /// no `--no-strict`, so the schema file is the only place `true` is set.
+    pub fn require_declared_fields(&mut self) {
+        self.allow_unknown_fields = false;
+    }
+
     /// ファイルパスから読み込み。存在しなければ `None` を返す。
     pub fn load_optional(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
@@ -341,16 +351,13 @@ impl Violation {
 // Validation
 // ---------------------------------------------------------------------------
 
-/// The five keys the parser stores in their own `Frontmatter` fields. They
-/// are declared whether or not the schema names them: `groove` knows them,
-/// so strict mode never reports them as undeclared.
-pub const NAMED_FIELDS: &[&str] = &["title", "date", "topic", "depth", "tags"];
-
 /// `Frontmatter` を `Schema` に照らして違反リストを返す。空リストなら OK。
 ///
 /// 5 名は専用 field から、それ以外は `extra` から引く (feature-57)。
 /// `schema.allow_unknown_fields` が false なら、`extra` にあって schema に
-/// 無い key を `UndeclaredField` として key 順に足す。
+/// 無い key を `UndeclaredField` として key 順に足す。`title` / `date` /
+/// `topic` / `depth` / `tags` は parser がそれぞれの field へ振り分けるので
+/// `extra` に現れず、schema に無くても undeclared にならない。
 pub fn validate(fm: &Frontmatter, schema: &Schema) -> Vec<Violation> {
     let mut out = Vec::new();
 
@@ -367,7 +374,7 @@ pub fn validate(fm: &Frontmatter, schema: &Schema) -> Vec<Violation> {
 
     if !schema.allow_unknown_fields {
         for key in fm.extra.keys() {
-            if !schema.fields.contains_key(key) && !NAMED_FIELDS.contains(&key.as_str()) {
+            if !schema.fields.contains_key(key) {
                 out.push(Violation::UndeclaredField { field: key.clone() });
             }
         }
@@ -543,9 +550,14 @@ fn check_tags(out: &mut Vec<Violation>, name: &str, rule: &CompiledRule, tags: &
 
 /// A rule on a key the parser holds in `extra` (feature-57). With no `type`
 /// the value's own shape picks the path: a scalar is checked like a string
-/// field, a list like `tags`. An opaque shape satisfies `required` and
-/// nothing else: any rule that would read the value is one `type_mismatch`
-/// naming the shape.
+/// field, a list like `tags`. A mapping, or a sequence holding a non-scalar,
+/// is opaque -- it satisfies `required` and nothing else, and any rule that
+/// would read the value is one `type_mismatch` naming the shape.
+///
+/// A null ([`FieldValue::NULL`]) is not that: `status:` with nothing after it
+/// is the key without a value, so it counts as absent for every rule and
+/// `required` catches it the way it catches a blank `title:`. The key stays in
+/// `extra`, so strict still reports it when no `[fields.*]` table names it.
 fn check_extra(
     out: &mut Vec<Violation>,
     name: &str,
@@ -553,7 +565,7 @@ fn check_extra(
     value: Option<&FieldValue>,
 ) {
     match value {
-        None => {
+        None | Some(FieldValue::Other(FieldValue::NULL)) => {
             if rule.required {
                 out.push(Violation::MissingRequired {
                     field: name.to_string(),
@@ -1335,11 +1347,115 @@ pattern = '^[a-z-]+$'"#,
         ));
 
         let typed = schema("[fields.meta]\ntype = \"string\"\nenum = [\"a\"]\nmin_length = 1\n");
-        let v = validate(&fm_with(&[("meta", FieldValue::Other("null"))]), &typed);
+        let v = validate(&fm_with(&[("meta", FieldValue::Other("mapping"))]), &typed);
         assert_eq!(v.len(), 1, "one type_mismatch, not one per rule: {v:?}");
         assert!(
-            matches!(&v[0], Violation::TypeMismatch { expected, actual, .. } if expected == "string" && actual == "null")
+            matches!(&v[0], Violation::TypeMismatch { expected, actual, .. } if expected == "string" && actual == "mapping")
         );
+    }
+
+    /// A null is the key written with no value, so every rule reads it as
+    /// absent: `required` catches a blank `meta:` the way it catches a blank
+    /// `title:`, and a rule that would read a value has nothing to read.
+    #[test]
+    fn test_extra_null_counts_as_absent_but_is_still_a_key() {
+        let null = || fm_with(&[("meta", FieldValue::Other("null"))]);
+
+        let required = schema("[fields.meta]\nrequired = true\n");
+        let v = validate(&null(), &required);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Violation::MissingRequired { field } if field == "meta"));
+
+        let with_pattern = schema("[fields.meta]\npattern = '.'\n");
+        assert!(
+            validate(&null(), &with_pattern).is_empty(),
+            "there is no value to hold a pattern against"
+        );
+
+        // Absent for the rules, present for strict: the key is in the block.
+        let mut strict = schema("[fields.title]\n");
+        strict.require_declared_fields();
+        let v = validate(&null(), &strict);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(&v[0], Violation::UndeclaredField { field } if field == "meta"));
+    }
+
+    /// Every named field is read from its own `Frontmatter` field, and none of
+    /// them can be undeclared -- the parser never puts one in `extra`, so the
+    /// strict loop has nothing to exempt. One case per match arm, `depth`
+    /// included.
+    #[test]
+    fn test_each_named_field_is_read_from_its_own_field() {
+        let cases = [
+            (
+                "title",
+                Frontmatter {
+                    title: Some("T".into()),
+                    ..Frontmatter::default()
+                },
+            ),
+            (
+                "date",
+                Frontmatter {
+                    date: Some("2026-09-09".into()),
+                    ..Frontmatter::default()
+                },
+            ),
+            (
+                "topic",
+                Frontmatter {
+                    topic: Some("mcp".into()),
+                    ..Frontmatter::default()
+                },
+            ),
+            (
+                "depth",
+                Frontmatter {
+                    depth: Some("2".into()),
+                    ..Frontmatter::default()
+                },
+            ),
+            (
+                "tags",
+                Frontmatter {
+                    tags: vec!["a".into()],
+                    ..Frontmatter::default()
+                },
+            ),
+        ];
+        for (name, f) in cases {
+            assert!(f.extra.is_empty(), "{name}: the fixture holds no extras");
+
+            let mut s = schema(&format!("[fields.{name}]\nrequired = true\n"));
+            assert!(
+                validate(&f, &s).is_empty(),
+                "{name} is satisfied by its own field, got {:?}",
+                validate(&f, &s)
+            );
+
+            s.require_declared_fields();
+            assert!(
+                validate(&f, &s).is_empty(),
+                "{name} is never undeclared, got {:?}",
+                validate(&f, &s)
+            );
+        }
+    }
+
+    /// `--strict` reaches the schema through this, and it only tightens: a
+    /// schema that already asks for it is unchanged.
+    #[test]
+    fn test_require_declared_fields_only_tightens() {
+        let mut s = schema("[fields.title]\n");
+        assert!(s.allow_unknown_fields);
+        s.require_declared_fields();
+        assert!(!s.allow_unknown_fields);
+        s.require_declared_fields();
+        assert!(!s.allow_unknown_fields);
+
+        let mut already = schema("[options]\nallow_unknown_fields = false\n");
+        already.require_declared_fields();
+        assert!(!already.allow_unknown_fields);
     }
 
     /// Declared `type` against the opposite shape reports the same
