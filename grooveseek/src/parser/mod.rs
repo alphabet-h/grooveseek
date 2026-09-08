@@ -51,22 +51,32 @@ pub use xlsx::{XlsParser, XlsxParser};
 /// One frontmatter value the schema did not name in advance (feature-57).
 ///
 /// Frontmatter is held as strings throughout, so a value is either a string,
-/// a list of strings, or a shape neither of those can carry. `Other` keeps
-/// the shape's name and nothing else: a mapping's contents are never walked,
-/// so retaining an unknown key costs what the YAML parser already paid.
+/// a list of strings, or a shape neither of those can carry. `Other` keeps the
+/// shape's name and nothing else: the deserializer in [`markdown`] reads a
+/// retained value for its shape and skips the nesting under it rather than
+/// buffering it, so retaining an unknown key costs what the YAML parser
+/// already paid -- the recursion and repetition budgets that bound a document
+/// are the same ones that bounded it before any key was kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldValue {
     /// A YAML string, bool (`"true"` / `"false"`) or number (`to_string`).
     Scalar(String),
     /// A sequence whose every element is a `Scalar`.
     List(Vec<String>),
-    /// `"mapping"`, `"nested sequence"`, `"null"` or `"alias"`. The key is
-    /// present, so `required` is satisfied; any rule that reads the value
-    /// reports a `type_mismatch` naming this shape.
+    /// `"mapping"`, `"nested sequence"` or [`FieldValue::NULL`]. A mapping or
+    /// a sequence holding a non-scalar is present but unreadable: `required`
+    /// is satisfied and any rule that reads the value reports a
+    /// `type_mismatch` naming this shape. A null is the key without a value
+    /// and counts as absent for every rule instead.
     Other(&'static str),
 }
 
 impl FieldValue {
+    /// The shape name for a key written with no value (`status:`, `~`,
+    /// `null`). Named rather than spelled out twice: the parser produces it
+    /// and `schema::check_extra` reads it to treat the key as absent.
+    pub const NULL: &'static str = "null";
+
     /// The word a `type_mismatch` reports as `actual`.
     pub fn shape(&self) -> &'static str {
         match self {
