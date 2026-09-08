@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 pub mod code;
 pub mod docx;
@@ -47,6 +48,45 @@ pub use xlsx::{XlsParser, XlsxParser};
 // Data types (formerly in src/markdown.rs)
 // ---------------------------------------------------------------------------
 
+/// One frontmatter value the schema did not name in advance (feature-57).
+///
+/// [`Frontmatter`] is held as strings throughout, so a value is either a string,
+/// a list of strings, or a shape neither of those can carry. [`FieldValue::Other`]
+/// keeps the shape's name and nothing else: the deserializer in [`markdown`] reads a
+/// retained value for its shape and skips the nesting under it rather than
+/// buffering it, so retaining an unknown key costs what the YAML parser
+/// already paid -- the recursion and repetition budgets that bound a document
+/// are the same ones that bounded it before any key was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldValue {
+    /// A YAML string, bool (`"true"` / `"false"`) or number (`to_string`).
+    Scalar(String),
+    /// A sequence whose every element is a [`FieldValue::Scalar`].
+    List(Vec<String>),
+    /// `"mapping"`, `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
+    /// A mapping, a sequence holding a non-scalar, and an explicit `!!binary`
+    /// are present but unreadable: `required` is satisfied and any rule that
+    /// reads the value reports a `type_mismatch` naming this shape. A null is
+    /// the key without a value and counts as absent for every rule instead.
+    Other(&'static str),
+}
+
+impl FieldValue {
+    /// The shape name for a key written with no value (`status:`, `~`,
+    /// `null`). Named rather than spelled out twice: the parser produces it
+    /// and [`crate::schema`]'s `check_extra` reads it to treat the key as absent.
+    pub const NULL: &'static str = "null";
+
+    /// The word a `type_mismatch` reports as `actual`.
+    pub fn shape(&self) -> &'static str {
+        match self {
+            FieldValue::Scalar(_) => "string",
+            FieldValue::List(_) => "array",
+            FieldValue::Other(name) => name,
+        }
+    }
+}
+
 /// Metadata extracted from a document header (YAML frontmatter for `.md`,
 /// filename-derived for `.txt`, etc.).
 #[derive(Debug, Clone, Default)]
@@ -56,6 +96,9 @@ pub struct Frontmatter {
     pub topic: Option<String>,
     pub depth: Option<String>,
     pub tags: Vec<String>,
+    /// Every other top-level key of the block, by name (feature-57). Empty for
+    /// every parser but Markdown. The YAML merge key `<<` is never here.
+    pub extra: BTreeMap<String, FieldValue>,
 }
 
 /// A single chunk of a parsed document.

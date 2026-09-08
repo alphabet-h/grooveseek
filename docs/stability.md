@@ -151,6 +151,9 @@ so that silence is never mistaken for a promise.
 - `validate --format github`, the GitHub Actions annotation form
   (`::error file=…::message`). Its shape is GitHub's rather than ours; what is
   promised here is that the flag keeps producing it.
+- The `kind` vocabulary of `validate`'s JSON grows by addition only: a
+  consumer that switches on `kind` must let an unknown one through.
+  `frontmatter_unparsed` (1.8.0) and `undeclared_field` (1.9.0) arrived that way.
 - **New fields may be added in a minor release.** Consumers must ignore fields they
   do not recognise — that is the mechanism by which the format can grow at all.
 
@@ -342,6 +345,9 @@ both sides**: `seed_strategy` takes `all_chunks` and `all-chunks` either way.
 
 - **Key names, their types, and their default values.** Adding a key is a minor
   release.
+- **`groove-schema.toml` is a configuration file in this sense too**: its
+  `[fields.*]` rule keys and `[options]` keys are frozen by name, and unknown
+  keys are rejected. Field *names* are the operator's, not ours (v1.9.0+).
 - **Configuration files are not forward compatible.** Unknown keys are rejected, so
   a 1.0.x binary will refuse a configuration written for 1.1. This is deliberate:
   the alternative is that a typo such as `modle = "bge-m3"` is silently ignored and

@@ -1,9 +1,13 @@
 //! Markdown (`.md`) parser. Moved from the old `src/markdown.rs` and adapted
 //! to the `Parser` trait. Behaviour is identical to legacy.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::fmt;
 
-use super::{Chunk, Frontmatter, ParsedDocument, Parser};
+use serde::de::{self, EnumAccess, IgnoredAny, MapAccess, SeqAccess, VariantAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+
+use super::{Chunk, FieldValue, Frontmatter, ParsedDocument, Parser};
 
 /// Markdown parser. Handles YAML frontmatter + heading-based chunking using
 /// [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark) rules informally
@@ -48,17 +52,385 @@ pub const TAG_FRONTMATTER_UNPARSED: &str = "frontmatter:unparsed";
 // Internal: serde helper for flexible YAML deserialization
 // ---------------------------------------------------------------------------
 
+/// The YAML merge key. It arrives as a key like any other and is dropped here,
+/// as it was before [`Frontmatter::extra`] existed: kept, it would show up as a literal `"<<"`
+/// entry that every strict run reports as undeclared. Merge expansion runs only
+/// on the fallback path a successful direct deserialize never takes, so the
+/// value behind it is unexpanded and is not read either.
+///
+/// A *quoted* `"<<"` key (a literal string, not a merge) is not distinguished
+/// from this and is dropped the same way: serde's map API hands the key over
+/// as a plain `String` with no record of its YAML style, so there is no way
+/// to tell the two apart here. 1.8.0 dropped a quoted `"<<"` too, so this is
+/// an existing limitation rather than one this change introduces.
+const MERGE_KEY: &str = "<<";
+
 /// Intermediate representation for serde_yaml_bw deserialization.
 /// `date` is captured as `serde_yaml_bw::Value` so it works regardless of whether
 /// the YAML encodes it as a string (`"2026-04-10"`) or a native date value.
-#[derive(Deserialize)]
+/// [`RawFrontmatter::extra`] (feature-57) receives every other top-level key.
+///
+/// `Deserialize` is written out below rather than derived with
+/// `#[serde(flatten)]`: flatten routes the whole struct through serde's
+/// buffering path, which materialises every unknown value into a `Content`
+/// tree before anything decides it is opaque. That made a deep mapping or a
+/// wide anchor graph under an unknown key cost what walking it costs, and a
+/// document 1.8.0 indexed fine could be refused outright. The visitor reads
+/// each unknown value for its shape only and skips the nesting with
+/// `IgnoredAny`, so retaining a key costs what the YAML parser already paid.
 struct RawFrontmatter {
     title: Option<String>,
     date: Option<serde_yaml_bw::Value>,
     topic: Option<String>,
     depth: Option<serde_yaml_bw::Value>,
-    #[serde(default)]
     tags: Vec<String>,
+    extra: BTreeMap<String, FieldValue>,
+}
+
+impl<'de> Deserialize<'de> for RawFrontmatter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `deserialize_map`, not `deserialize_struct` with a field list:
+        // a struct's field list is what filters unknown keys out before the
+        // visitor sees them, and every one of those is what `extra` is for.
+        deserializer.deserialize_map(RawFrontmatterVisitor)
+    }
+}
+
+struct RawFrontmatterVisitor;
+
+impl<'de> Visitor<'de> for RawFrontmatterVisitor {
+    type Value = RawFrontmatter;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a YAML mapping of frontmatter keys")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        let mut title: Option<Option<String>> = None;
+        let mut date: Option<Option<serde_yaml_bw::Value>> = None;
+        let mut topic: Option<Option<String>> = None;
+        let mut depth: Option<Option<serde_yaml_bw::Value>> = None;
+        let mut tags: Option<Vec<String>> = None;
+        let mut extra: BTreeMap<String, FieldValue> = BTreeMap::new();
+
+        while let Some(key) = map.next_key::<String>()? {
+            // The five named keys keep the types they always had, so a value
+            // the wrong shape for one of them is refused exactly as before.
+            match key.as_str() {
+                "title" => {
+                    if title.is_some() {
+                        return Err(de::Error::duplicate_field("title"));
+                    }
+                    title = Some(map.next_value()?);
+                }
+                "date" => {
+                    if date.is_some() {
+                        return Err(de::Error::duplicate_field("date"));
+                    }
+                    date = Some(map.next_value()?);
+                }
+                "topic" => {
+                    if topic.is_some() {
+                        return Err(de::Error::duplicate_field("topic"));
+                    }
+                    topic = Some(map.next_value()?);
+                }
+                "depth" => {
+                    if depth.is_some() {
+                        return Err(de::Error::duplicate_field("depth"));
+                    }
+                    depth = Some(map.next_value()?);
+                }
+                "tags" => {
+                    if tags.is_some() {
+                        return Err(de::Error::duplicate_field("tags"));
+                    }
+                    tags = Some(map.next_value()?);
+                }
+                MERGE_KEY => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+                _ => {
+                    let value = map.next_value::<FieldValue>()?;
+                    // Mirrors the five named arms above: a repeated key is
+                    // refused rather than silently overwritten by the second
+                    // occurrence's value. `duplicate_field` itself wants a
+                    // `&'static str`, which an owned `key` cannot provide, so
+                    // `custom` carries the same "duplicate field `<name>`"
+                    // wording by hand.
+                    if let Some(_prev) = extra.insert(key.clone(), value) {
+                        return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                    }
+                }
+            }
+        }
+
+        Ok(RawFrontmatter {
+            title: title.flatten(),
+            date: date.flatten(),
+            topic: topic.flatten(),
+            depth: depth.flatten(),
+            tags: tags.unwrap_or_default(),
+            extra,
+        })
+    }
+}
+
+/// The text a number is held as. It goes through `serde_yaml_bw::Number` so
+/// that a float prints the way YAML writes one (`1.0`, not Rust's `1`), which
+/// is what the `Value`-based classifier this replaced did.
+fn number_text(n: impl Into<serde_yaml_bw::Number>) -> String {
+    n.into().to_string()
+}
+
+/// A YAML scalar on its way to becoming the text [`FieldValue::Scalar`] and a
+/// retained list element hold it as. [`ScalarValue::text`] is the one
+/// function both [`FieldValueVisitor`]'s own scalar arms and
+/// [`SeqElementVisitor`]'s route every primitive through, so a scalar is
+/// turned into text in exactly one place whether it sits at a mapping's top
+/// level or inside a list -- the two visitors' non-scalar arms still differ
+/// on purpose (see [`SeqElementVisitor`]'s doc comment).
+enum ScalarValue {
+    Str(String),
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    I128(i128),
+    U128(u128),
+}
+
+impl ScalarValue {
+    fn text(self) -> String {
+        match self {
+            ScalarValue::Str(s) => s,
+            ScalarValue::Bool(v) => v.to_string(),
+            ScalarValue::I64(v) => number_text(v),
+            ScalarValue::U64(v) => number_text(v),
+            ScalarValue::F64(v) => number_text(v),
+            ScalarValue::I128(v) => v.to_string(),
+            ScalarValue::U128(v) => v.to_string(),
+        }
+    }
+}
+
+/// Reads a retained value for its **shape**, never its contents (feature-57).
+///
+/// Every nested thing is drained with `IgnoredAny`: a mapping's entries and
+/// a non-scalar sequence element are skipped rather than built, so an unknown
+/// key costs the same walk the YAML parser was already doing. Aliases and
+/// standard tags are resolved by the deserializer before a visitor sees them,
+/// so there is no alias or tagged shape here -- [`FieldValue::Other`] is exactly `"mapping"`,
+/// `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
+///
+/// `visit_some` and `visit_newtype_struct` are deliberately not implemented:
+/// `serde_yaml_bw`'s `deserialize_any` does not call either of them today, so
+/// they are dead code here; were that to change, serde's default for a
+/// `Visitor` without them is an error, which is a safe (loud, not silent)
+/// failure mode to fall through to rather than a guess at the right shape.
+struct FieldValueVisitor;
+
+impl<'de> Deserialize<'de> for FieldValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(FieldValueVisitor)
+    }
+}
+
+impl<'de> Visitor<'de> for FieldValueVisitor {
+    type Value = FieldValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any YAML value")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::Str(v.to_string()).text()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::Str(v).text()))
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::Bool(v).text()))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::I64(v).text()))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::U64(v).text()))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::F64(v).text()))
+    }
+
+    /// An integer too wide for `i64` / `u64`. `serde_yaml_bw` hands those over
+    /// as 128-bit rather than as text, and serde's default for these is an
+    /// error -- which would refuse a whole block over a key nobody declared.
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::I128(v).text()))
+    }
+
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        Ok(FieldValue::Scalar(ScalarValue::U128(v).text()))
+    }
+
+    /// A key written with no value (`status:`, `~`, `null`).
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(FieldValue::Other(FieldValue::NULL))
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(FieldValue::Other(FieldValue::NULL))
+    }
+
+    /// An explicit `!!binary`, which `serde_yaml_bw` base64-decodes and hands
+    /// over as bytes. It is opaque like a mapping: the decoded bytes are not a
+    /// string and are not kept. Without this arm serde's default is an error,
+    /// which would refuse a whole block over a key nobody declared -- 1.8.0
+    /// dropped the key and indexed the document.
+    fn visit_bytes<E: de::Error>(self, _v: &[u8]) -> Result<Self::Value, E> {
+        Ok(FieldValue::Other("binary"))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, _v: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(FieldValue::Other("binary"))
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(FieldValue::Other("mapping"))
+    }
+
+    /// Each element is read as a [`SeqElement`], not recursively as a
+    /// [`FieldValue`]: a non-scalar element (a nested mapping or sequence)
+    /// must stay on the cheap `IgnoredAny`-draining path [`SeqElementVisitor`]
+    /// gives it, the same way [`Self::visit_map`] drains a mapping's entries.
+    /// Recursing through [`FieldValue`] here instead was tried and reverted --
+    /// materialising a nested sequence as a value (rather than draining it)
+    /// forces `serde_yaml_bw` to fully resolve any alias inside it, which
+    /// spends the same repetition budget [`RawFrontmatter`]'s doc comment
+    /// says retaining a key must not spend, and refuses the alias-graph
+    /// fixture in this module's tests that 1.8.0 indexed fine. Draining
+    /// continues past the first non-scalar: stopping mid-sequence would leave
+    /// the deserializer's own position inside it.
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+        let mut items = Vec::new();
+        let mut opaque = false;
+        while let Some(SeqElement(text)) = seq.next_element::<SeqElement>()? {
+            match text {
+                Some(s) => items.push(s),
+                None => opaque = true,
+            }
+        }
+        if opaque {
+            Ok(FieldValue::Other("nested sequence"))
+        } else {
+            Ok(FieldValue::List(items))
+        }
+    }
+
+    /// A value carrying a custom tag (`!Kind value`) reaches `deserialize_any`
+    /// as an enum. The tag is dropped and the value it wraps decides the shape,
+    /// the way a standard tag (`!!str x`) is resolved before it gets here.
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+        let (_tag, variant) = data.variant::<IgnoredAny>()?;
+        variant.newtype_variant::<FieldValue>()
+    }
+}
+
+/// One element of a retained sequence: `Some(text)` for a scalar, `None` for a
+/// shape that makes the whole sequence opaque. A non-scalar element is
+/// drained with `IgnoredAny`, not read: that is what keeps a nested mapping
+/// or sequence -- and any alias inside it -- from being walked or resolved,
+/// exactly as [`FieldValueVisitor::visit_map`] does for a mapping. Every
+/// scalar arm here routes through the same [`ScalarValue::text`] that
+/// [`FieldValueVisitor`]'s own scalar arms use, so a scalar is classified in
+/// one place regardless of which of the two visitors sees it.
+struct SeqElement(Option<String>);
+
+impl<'de> Deserialize<'de> for SeqElement {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(SeqElementVisitor)
+    }
+}
+
+struct SeqElementVisitor;
+
+impl<'de> Visitor<'de> for SeqElementVisitor {
+    type Value = SeqElement;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any YAML value")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::Str(v.to_string()).text())))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::Str(v).text())))
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::Bool(v).text())))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::I64(v).text())))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::U64(v).text())))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::F64(v).text())))
+    }
+
+    fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::I128(v).text())))
+    }
+
+    fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        Ok(SeqElement(Some(ScalarValue::U128(v).text())))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(SeqElement(None))
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(SeqElement(None))
+    }
+
+    /// `!!binary` is not a scalar the list can hold, so it makes the whole
+    /// sequence opaque the way a mapping element does.
+    fn visit_bytes<E: de::Error>(self, _v: &[u8]) -> Result<Self::Value, E> {
+        Ok(SeqElement(None))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, _v: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(SeqElement(None))
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(SeqElement(None))
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(SeqElement(None))
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+        let (_tag, variant) = data.variant::<IgnoredAny>()?;
+        variant.newtype_variant::<SeqElement>()
+    }
 }
 
 impl From<RawFrontmatter> for Frontmatter {
@@ -85,6 +457,7 @@ impl From<RawFrontmatter> for Frontmatter {
             topic: raw.topic,
             depth,
             tags: raw.tags,
+            extra: raw.extra,
         }
     }
 }
@@ -312,6 +685,220 @@ mod tests {
         let doc = parse("---\ntitle: x\nno closing fence, so this is body text as before.\n");
         assert_eq!(doc.frontmatter_error, None);
         assert!(doc.frontmatter.tags.is_empty());
+    }
+
+    // feature-57: every key the five named fields do not claim is retained by
+    // shape, so a schema can name it later.
+    #[test]
+    fn test_unknown_keys_are_retained_by_shape() {
+        use crate::parser::FieldValue;
+        let md = "---\ntitle: T\nstatus: active\nenvironment: [dev, test]\nflag: false\nn: 10\nratio: 1.5\nwhole: 1.0\nmeta: {a: 1}\nempty:\nnested: [[a]]\nlong: |\n  two\n  lines\ntagged: !!str yes\ninlist: [!!str a, b]\n---\n\nBody long enough to stand as one chunk on its own here.\n";
+        let doc = parse(md);
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("T"));
+        let e = &doc.frontmatter.extra;
+        assert_eq!(e["status"], FieldValue::Scalar("active".into()));
+        assert_eq!(
+            e["environment"],
+            FieldValue::List(vec!["dev".into(), "test".into()])
+        );
+        assert_eq!(e["flag"], FieldValue::Scalar("false".into()));
+        assert_eq!(e["n"], FieldValue::Scalar("10".into()));
+        assert_eq!(e["ratio"], FieldValue::Scalar("1.5".into()));
+        // A whole-number float prints with its `.0`, the YAML-writer shape
+        // `number_text` exists for -- not Rust's own `1` a bare cast would give.
+        assert_eq!(e["whole"], FieldValue::Scalar("1.0".into()));
+        assert_eq!(e["meta"], FieldValue::Other("mapping"));
+        assert_eq!(e["empty"], FieldValue::Other("null"));
+        assert_eq!(e["nested"], FieldValue::Other("nested sequence"));
+        assert_eq!(e["long"], FieldValue::Scalar("two\nlines\n".into()));
+        assert_eq!(e["tagged"], FieldValue::Scalar("yes".into()));
+        assert_eq!(e["inlist"], FieldValue::List(vec!["a".into(), "b".into()]));
+        assert!(!e.contains_key("title"), "a named field is not an extra");
+        assert_eq!(e.len(), 12, "every unknown key and nothing else: {e:?}");
+    }
+
+    /// A document with no unknown keys has an empty map; the five named
+    /// fields behave exactly as before the map existed.
+    #[test]
+    fn test_named_fields_only_leaves_extra_empty() {
+        let doc = parse(
+            "---\ntitle: T\ndate: 2026-09-09\ntopic: x\ndepth: 2\ntags: [a]\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert!(doc.frontmatter.extra.is_empty());
+        assert_eq!(doc.frontmatter.date.as_deref(), Some("2026-09-09"));
+        assert_eq!(doc.frontmatter.depth.as_deref(), Some("2"));
+        assert_eq!(doc.frontmatter.tags, vec!["a"]);
+    }
+
+    /// The YAML merge key is never surfaced: retained, it would arrive as a
+    /// literal `"<<"` key and be an undeclared field in every strict run. The
+    /// document itself still parses -- dropping the key is not refusing it.
+    #[test]
+    fn test_merge_key_is_not_an_extra() {
+        let doc = parse(
+            "---\nbase: &b\n  status: active\n<<: *b\ntitle: T\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None, "a merge key is valid YAML");
+        assert!(
+            !doc.frontmatter.extra.contains_key("<<"),
+            "merge key leaked: {:?}",
+            doc.frontmatter.extra
+        );
+        assert_eq!(
+            doc.frontmatter.extra["base"],
+            crate::parser::FieldValue::Other("mapping")
+        );
+    }
+
+    /// A repeated retained (unknown) key is refused the same way a repeated
+    /// named key is. In practice both are already caught by
+    /// `serde_yaml_bw`'s own mapping parser before either visitor arm runs
+    /// (confirmed by comparing its "duplicate entry with key" wording against
+    /// a duplicate `title` in an ad hoc probe), so this also exercises that
+    /// upstream guarantee; the visitor's own check in the `_` arm is the
+    /// belt to that suspenders, matching the five named arms.
+    #[test]
+    fn test_duplicate_retained_key_is_refused() {
+        let md = "---\ntitle: T\nstatus: retired\nstatus: active\n---\n\nBody long enough to stand as one chunk on its own here.\n";
+        let doc = parse(md);
+        assert!(doc.frontmatter_error.is_some());
+        assert_eq!(doc.frontmatter.tags, vec![TAG_FRONTMATTER_UNPARSED]);
+    }
+
+    /// Reading the block through a hand-written visitor is the mechanism most
+    /// likely to change how a wrong-typed named field is refused. Pin that it
+    /// still is. (A scalar number into a `String` field, e.g. `title: 123`, is
+    /// coerced by `serde_yaml_bw` rather than refused, both before and after
+    /// this change, so it is not a refusal case here -- see
+    /// [`test_named_scalar_coercion_is_unchanged_with_extra`].)
+    #[test]
+    fn test_named_field_type_mismatch_is_still_refused_with_extra() {
+        for yaml in ["topic: [a]", "tags: [[a]]", "tags: notalist"] {
+            let doc = parse(&format!(
+                "---\n{yaml}\nstatus: active\n---\n\nBody long enough to stand as one chunk on its own here.\n"
+            ));
+            assert!(
+                doc.frontmatter_error.is_some(),
+                "{yaml:?} must still be refused, got {:?}",
+                doc.frontmatter
+            );
+            assert_eq!(doc.frontmatter.tags, vec![TAG_FRONTMATTER_UNPARSED]);
+            assert!(
+                doc.frontmatter.extra.is_empty(),
+                "a refused block keeps nothing"
+            );
+        }
+    }
+
+    /// `title: 123` is not a refusal case (see the doc comment above): pin
+    /// that the coercion itself, and [`Frontmatter::extra`] alongside it, are unaffected by
+    /// retaining unknown keys.
+    #[test]
+    fn test_named_scalar_coercion_is_unchanged_with_extra() {
+        use crate::parser::FieldValue;
+        let doc = parse(
+            "---\ntitle: 123\nstatus: active\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("123"));
+        assert_eq!(
+            doc.frontmatter.extra["status"],
+            FieldValue::Scalar("active".into())
+        );
+    }
+
+    /// An anchor graph under an unknown key is the document 1.8.0 indexed: it
+    /// parses, and the key is one opaque value. Retaining it must not cost
+    /// more than the YAML parser already paid -- buffering the expansion is
+    /// what would spend `serde_yaml_bw`'s repetition budget and refuse a
+    /// document that used to be fine.
+    #[test]
+    fn test_alias_bomb_under_unknown_key_is_safe() {
+        let bomb = "---\ntitle: bomb\nblob:\n  - &a x\n  - &b [*a, *a, *a, *a, *a, *a, *a, *a]\n  - &c [*b, *b, *b, *b, *b, *b, *b, *b]\n  - &d [*c, *c, *c, *c, *c, *c, *c, *c]\n  - &e [*d, *d, *d, *d, *d, *d, *d, *d]\n---\nbody\n";
+        let doc = parse(bomb);
+        assert_eq!(
+            doc.frontmatter_error, None,
+            "1.8.0 indexed this document; retaining a key must not refuse it"
+        );
+        assert_eq!(
+            doc.frontmatter.extra["blob"],
+            crate::parser::FieldValue::Other("nested sequence")
+        );
+    }
+
+    /// A mapping nested far deeper than any schema would name is still one
+    /// opaque value: the visitor skips what is under it, so the depth the
+    /// parser tolerates is the depth it tolerated before [`Frontmatter::extra`] existed.
+    #[test]
+    fn test_deep_mapping_under_unknown_key_parses() {
+        const DEPTH: usize = 130;
+        let mut yaml = String::from("---\nblob:\n");
+        for i in 1..=DEPTH {
+            yaml.push_str(&"  ".repeat(i));
+            yaml.push_str(&format!("k{i}:\n"));
+        }
+        yaml.push_str("---\nbody\n");
+        let doc = parse(&yaml);
+        assert_eq!(
+            doc.frontmatter_error, None,
+            "a {DEPTH}-deep mapping under an unknown key must still parse"
+        );
+        assert_eq!(
+            doc.frontmatter.extra["blob"],
+            crate::parser::FieldValue::Other("mapping")
+        );
+
+        // The same document with a title: the named field is read as usual.
+        let with_title = yaml.replacen("---\nblob:\n", "---\ntitle: T\nblob:\n", 1);
+        let doc = parse(&with_title);
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("T"));
+        assert_eq!(
+            doc.frontmatter.extra["blob"],
+            crate::parser::FieldValue::Other("mapping")
+        );
+    }
+
+    /// An explicit `!!binary` is base64-decoded into bytes, which no shape can
+    /// hold as text. It is opaque rather than a refusal: 1.8.0 dropped the key
+    /// and indexed the document, and retaining keys must not change that.
+    #[test]
+    fn test_binary_under_unknown_key_is_opaque() {
+        use crate::parser::FieldValue;
+        let doc = parse(
+            "---\ntitle: T\nblob: !!binary \"aGVsbG8=\"\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("T"));
+        assert_eq!(doc.frontmatter.extra["blob"], FieldValue::Other("binary"));
+
+        // In a sequence it is not a scalar, so the whole list goes opaque.
+        let in_list = parse(
+            "---\ntitle: T\nblob: [a, !!binary \"aGVsbG8=\"]\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(in_list.frontmatter_error, None);
+        assert_eq!(
+            in_list.frontmatter.extra["blob"],
+            FieldValue::Other("nested sequence")
+        );
+    }
+
+    /// An alias under an unknown key arrives as the value it points at: the
+    /// deserializer resolves it before any visitor sees it, so there is no
+    /// alias shape to hold (feature-57, acceptance criterion 13).
+    #[test]
+    fn test_alias_under_unknown_key_is_resolved() {
+        use crate::parser::FieldValue;
+        let doc = parse(
+            "---\nbase: &b active\nstatus: *b\ntitle: T\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(
+            doc.frontmatter.extra["status"],
+            FieldValue::Scalar("active".into())
+        );
     }
 
     #[test]

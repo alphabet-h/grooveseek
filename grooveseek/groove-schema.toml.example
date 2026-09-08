@@ -29,7 +29,13 @@
 # A `.md` whose `---` block is not valid YAML is reported as one
 # `frontmatter_unparsed` violation carrying the parser's reason; the rules
 # below are not applied to it.
-# Field names other than title / date / topic / depth / tags are refused.
+# Any field name is accepted (v1.9.0+). An empty `[fields.<name>]` table
+# declares the key without checking it. Values are held as strings, a list as
+# a list of strings; a mapping, a list holding one, or an explicit `!!binary`
+# satisfies `required` and nothing else. A key written with no value
+# (`status:`) counts as absent for every rule, so `required` catches it.
+# `[options] allow_unknown_fields = false` (or `groove validate --strict`)
+# reports every key the schema does not name -- a blank one included.
 
 [fields.title]
 required = true
@@ -59,3 +65,18 @@ min_length = 1
 max_length = 10
 # pattern = '^[a-z0-9-]+$'   # every element must match; the tag
 #                            # `frontmatter:unparsed` never reaches this rule
+
+# Domain keys the five above do not cover.
+[fields.status]
+enum = ["active", "deprecated"]
+
+[fields.environment]
+enum = ["dev", "test", "prod"]   # a list is checked element by element
+
+# Declared, not checked: present or absent, any value.
+[fields.team]
+
+[options]
+# false: a key with no [fields.*] table above is an `undeclared_field`
+# violation. `groove validate --strict` has the same effect for one run.
+allow_unknown_fields = true

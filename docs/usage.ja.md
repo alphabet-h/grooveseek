@@ -339,6 +339,9 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 - `--schema <PATH>` — `<kb-path>/groove-schema.toml` 以外からスキーマを読む。
   **ナレッジベースの隣に置かないスキーマを使う唯一の手段** — 複数のベースで
   1 つのスキーマを共有する、CI 用に厳しめのものを別に置く、といった場合
+- `--strict` (v1.9.0+) — スキーマが宣言していない frontmatter key を `undeclared_field`
+  違反として key ごとに 1 件報告する。スキーマの `[options] allow_unknown_fields = false`
+  と同じ効果で、flag は厳しくする方向にしか働かない。スキーマファイルが無ければ従来どおり exit 0
 - `--fail-fast` — 最初の違反で exit 1 して残りを走査しない。
   「何が悪いか」ではなく「きれいかどうか」だけ知りたいときに使う
 - `--no-color` — `--format text` の ANSI 色を落とす。stdout が TTY でなければ

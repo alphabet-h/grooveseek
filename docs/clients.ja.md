@@ -135,6 +135,18 @@ enum = ["mcp", "rag", "ai", "tooling", "ops"]
 required = true
 type = "array"
 min_length = 1
+
+# Any other key (v1.9.0+): an empty table declares it, rules are optional
+[fields.status]
+enum = ["active", "deprecated"]
+
+[fields.environment]
+enum = ["dev", "test", "prod"]   # a list is checked element by element
+
+[fields.team]
+
+[options]
+allow_unknown_fields = true      # false: a key with no [fields.*] table is a violation
 ```
 
 - **スキーマファイル無し → exit 0** と短い "no schema found" メッセージ。従来挙動を保持
@@ -142,6 +154,22 @@ min_length = 1
 - 終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)
 - `.txt` は frontmatter の概念が無いのでスキップ
 - `pattern` は string field なら値全体、array field なら各要素 (v1.8.0+) に当て、マッチしない要素ごとに 1 件の違反を出す。`enum` と同じ扱いなので、`[fields.tags] pattern = '^[a-z0-9-]+$'` で tag の綴りを 1 通りに揃えられる。regex は値のどこにでもマッチするので `^` と `$` で anchor する
+- **任意の key を宣言できる** (v1.9.0+)。`[fields.<name>]` は任意の名前を受け、空の table は
+  key を「宣言する」だけで検査しない — 宣言と必須は別で、`required = true` は明示 key のまま。
+  parser は block の top-level key を全部保持する: string / bool / number は印字した文字列として
+  持つので (`environment_declared: false` は `enum = ["true", "false"]` で検査する。`type = "bool"`
+  は無い)、list はその文字列の list として持ち `enum` / `pattern` を要素ごとに当てる。
+  mapping、mapping を含む list、および明示的な `!!binary` は `required` を満たすだけで、
+  値を読む rule があれば形の名前 (`mapping` / `nested sequence` / `binary`) を添えた
+  `type_mismatch` 1 件になる。
+  値を書かなかった key (`status:` / `~` / `null`) はどの rule から見ても「無い」扱いで、
+  空の `title:` と同じように `required` が捕まえる。
+  これらの key を見るのは `groove validate` だけで、索引・filter・`get_document` は変わらない
+- **`[options] allow_unknown_fields = false`** または `groove validate --strict` (v1.9.0+) は、
+  スキーマが名指ししていない key を `undeclared_field` 違反として 1 件ずつ報告する。値を
+  書かなかった key も、key 自体はあるので報告される。`title` /
+  `date` / `topic` / `depth` / `tags` は常に宣言済み扱い。`frontmatter_unparsed` の block には
+  報告する key が無い。[ADR-0019](decisions/0019-hold-every-frontmatter-key-and-let-the-schema-name-it.ja.md) 参照
 - `---` ブロックが YAML として parse できない `.md` は、parser の reason を添えた `frontmatter_unparsed` 1 件の違反として報告され、スキーマは当てない (v1.8.0+)。valid な YAML に手書きで `frontmatter:unparsed` の tag を書いた note は他と同じく検証される
 - `index` / `serve` コマンドには影響しない — 検証は opt-in のみ
 

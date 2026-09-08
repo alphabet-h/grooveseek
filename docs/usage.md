@@ -340,6 +340,10 @@ Flags:
   `<kb-path>/groove-schema.toml`. This is the only way to point `validate` at a
   schema that does not sit beside the knowledge base — one shared schema for
   several bases, or a stricter one kept in CI.
+- `--strict` (v1.9.0+) — report a frontmatter key the schema does not declare
+  as an `undeclared_field` violation, one per key. Same effect as
+  `[options] allow_unknown_fields = false` in the schema; the flag only ever
+  tightens, and with no schema file the command still exits 0.
 - `--fail-fast` — exit 1 at the first violation instead of scanning the rest.
   Useful when the answer you want is "is it clean", not "what is wrong".
 - `--no-color` — drop ANSI color from `--format text`. Color is already off

@@ -314,6 +314,11 @@ enum Commands {
         /// Exit 1 at the first violation without scanning the rest.
         #[arg(long = "fail-fast", default_value_t = false)]
         fail_fast: bool,
+        /// Report a frontmatter key the schema does not declare as an
+        /// `undeclared_field` violation. Same effect as
+        /// `[options] allow_unknown_fields = false` in the schema.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
     /// One-shot search from the command line (no MCP transport).
     /// Useful for shell scripts / skill bins where invoking the binary
@@ -1214,6 +1219,7 @@ fn main() -> anyhow::Result<()> {
             format,
             no_color,
             fail_fast,
+            strict,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             // canonicalize は使わない: walkdir は相対パスでも動作し、strip_prefix
@@ -1222,7 +1228,15 @@ fn main() -> anyhow::Result<()> {
             // (feature-49) `validate` も index walk と同じ除外規則で歩く。
             let rules =
                 grooveseek::exclusion::ExclusionRules::load(&kb_path, cfg.resolve_exclude_dirs());
-            let exit = run_validate(&kb_path, &schema_path, format, no_color, fail_fast, &rules)?;
+            let exit = run_validate(
+                &kb_path,
+                &schema_path,
+                format,
+                no_color,
+                fail_fast,
+                strict,
+                &rules,
+            )?;
             std::process::exit(exit);
         }
         Commands::Eval(args) => {
@@ -1625,10 +1639,11 @@ fn run_validate(
     format: ValidateFormat,
     no_color: bool,
     fail_fast: bool,
+    strict: bool,
     rules: &grooveseek::exclusion::ExclusionRules,
 ) -> Result<i32> {
     // スキーマ読み込み: 存在しなければ legacy 挙動 (exit 0)
-    let schema_obj = match grooveseek::schema::Schema::load_optional(schema_path) {
+    let mut schema_obj = match grooveseek::schema::Schema::load_optional(schema_path) {
         Ok(Some(s)) => s,
         Ok(None) => {
             eprintln!(
@@ -1642,6 +1657,12 @@ fn run_validate(
             return Ok(2);
         }
     };
+
+    // (feature-57) `--strict` is the flag form of `[options].allow_unknown_fields
+    // = false`; it only ever tightens.
+    if strict {
+        schema_obj.require_declared_fields();
+    }
 
     // parser registry は `[parsers].enabled` 準拠で .md ファイル列挙に再利用
     // (.txt は frontmatter 概念なしで対象外)。

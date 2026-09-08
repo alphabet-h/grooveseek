@@ -135,6 +135,18 @@ enum = ["mcp", "rag", "ai", "tooling", "ops"]
 required = true
 type = "array"
 min_length = 1
+
+# Any other key (v1.9.0+): an empty table declares it, rules are optional
+[fields.status]
+enum = ["active", "deprecated"]
+
+[fields.environment]
+enum = ["dev", "test", "prod"]   # a list is checked element by element
+
+[fields.team]
+
+[options]
+allow_unknown_fields = true      # false: a key with no [fields.*] table is a violation
 ```
 
 - **No schema file → exit 0** with a short "no schema found" note. Backward compatible: existing pipelines that don't yet have a schema file continue to pass.
@@ -142,6 +154,27 @@ min_length = 1
 - Exit codes: `0` (no violations), `1` (violations), `2` (schema load error).
 - `.txt` files are skipped (no frontmatter concept).
 - `pattern` checks the whole value of a string field, or every element of an array field (v1.8.0+), one violation per element that does not match. Like `enum`, so `[fields.tags] pattern = '^[a-z0-9-]+$'` keeps a tag list to one spelling. The regex matches anywhere in the value; anchor it with `^` and `$`.
+- **Any key can be named** (v1.9.0+). `[fields.<name>]` accepts any name, and
+  an empty table declares the key without checking it — declared is not
+  required; `required = true` stays an explicit key. The parser keeps every
+  top-level key of the block: a string, a boolean or a number is held as the
+  string it prints as (so `environment_declared: false` is checked with
+  `enum = ["true", "false"]`; there is no `type = "bool"`), and a list of
+  those is held as a list of strings and takes `enum` / `pattern` element by
+  element. A mapping, a list holding one, or an explicit `!!binary` satisfies
+  `required` and nothing else — any rule that would read the value reports one
+  `type_mismatch` naming the shape (`mapping`, `nested sequence`, `binary`).
+  A key written with no
+  value (`status:`, `~`, `null`) counts as absent for every rule, so
+  `required` catches a blank `status:` the way it catches a blank `title:`.
+  Only `groove validate` sees these keys; the index, its filters and
+  `get_document` are unchanged.
+- **`[options] allow_unknown_fields = false`**, or `groove validate --strict`
+  (v1.9.0+), reports every key the schema does not name as one
+  `undeclared_field` violation — a key with no value included, since the key
+  is still there. `title`, `date`, `topic`, `depth` and `tags` are always
+  declared. A `frontmatter_unparsed` block has no keys to report.
+  See [ADR-0019](decisions/0019-hold-every-frontmatter-key-and-let-the-schema-name-it.md).
 - A `.md` whose `---` block does not parse as YAML is reported as a single `frontmatter_unparsed` violation carrying the parser's reason, and the schema is not applied to it (v1.8.0+). A note whose valid YAML lists the tag `frontmatter:unparsed` by hand is checked like any other.
 - The `index` and `serve` commands are not affected — validation is opt-in only.
 
