@@ -8,9 +8,12 @@
 #   required      : true means a missing value, an empty string, or an empty
 #                   array counts as a violation
 #   type          : "string" / "array"
-#   pattern       : regular expression, string-typed fields only (Rust `regex`
-#                   syntax). Write it as a TOML literal string in single quotes
-#                   so backslashes do not need doubling
+#   pattern       : regular expression (Rust `regex` syntax), matched against a
+#                   string field or against every element of an array field,
+#                   one violation per element that does not match. It matches
+#                   anywhere in the value, so anchor it with ^ and $. Write it
+#                   as a TOML literal string in single quotes so backslashes do
+#                   not need doubling
 #   enum          : allowed values, compared exactly against a string field or
 #                   against every element of an array field
 #   min_length    : characters for a string, elements for an array
@@ -23,6 +26,9 @@
 # Express a date as a string with a pattern, the way `[fields.date]` does below.
 #
 # Only `.md` files are checked; `.txt` has no frontmatter and is skipped.
+# A `.md` whose `---` block is not valid YAML is reported as one
+# `frontmatter_unparsed` violation carrying the parser's reason; the rules
+# below are not applied to it.
 # Field names other than title / date / topic / depth / tags are refused.
 
 [fields.title]
@@ -51,3 +57,5 @@ required = true
 type = "array"
 min_length = 1
 max_length = 10
+# pattern = '^[a-z0-9-]+$'   # every element must match; the tag
+#                            # `frontmatter:unparsed` never reaches this rule

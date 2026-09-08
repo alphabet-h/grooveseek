@@ -345,7 +345,7 @@ Flags:
 - `--no-color` — drop ANSI color from `--format text`. Color is already off
   when stdout is not a TTY, so this is for the case where it is one.
 
-Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
+Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). A file whose frontmatter block is not valid YAML counts as one violation (`frontmatter_unparsed`, v1.8.0+), so it exits 1 like any other. When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
 
 ## Check the index itself (v0.23.0+)
 

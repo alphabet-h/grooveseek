@@ -1669,7 +1669,7 @@ fn run_validate(
             .replace('\\', "/");
         use grooveseek::parser::Parser as ParserTrait;
         let parsed = md_parser.parse(&raw, &rel, &[]);
-        let violations = grooveseek::schema::validate(&parsed.frontmatter, &schema_obj);
+        let violations = grooveseek::schema::validate_document(&parsed, &schema_obj);
         if !violations.is_empty() {
             violated += 1;
             has_violation = true;

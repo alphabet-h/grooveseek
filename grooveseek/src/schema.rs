@@ -26,7 +26,9 @@
 //! ```
 //!
 //! `validate(fm, schema)` は `Frontmatter` 構造体に対して違反を返す。
-//! CLI `groove validate` サブコマンドから呼ばれる。
+//! [`crate::schema::validate_document`] はその前段で、YAML が parse できなかった
+//! 文書を違反 1 件 (`frontmatter_unparsed`) に畳む。CLI `groove validate`
+//! サブコマンドは後者を呼ぶ。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -35,7 +37,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::parser::Frontmatter;
+use crate::parser::{Frontmatter, ParsedDocument};
 
 // ---------------------------------------------------------------------------
 // Schema types
@@ -68,7 +70,8 @@ pub struct FieldRule {
     /// ユーザの書き方を広めに受け入れ、loader が妥当性を判断する。
     #[serde(default, rename = "type")]
     pub field_type: Option<FieldType>,
-    /// 正規表現 (Rust `regex` 互換)。string 型にのみ適用。
+    /// 正規表現 (Rust `regex` 互換)。string なら値全体、array なら各要素に
+    /// 適用 (enum と同じ、1.8.0 から / #252)。
     #[serde(default)]
     pub pattern: Option<String>,
     /// 許容値リスト。string / array 要素に対して完全一致をチェック。
@@ -158,11 +161,6 @@ impl Schema {
                     KNOWN_FIELDS
                 );
             }
-            // array フィールドに pattern が付いていても現状意味がないため
-            // 明示的にはじく (将来 array 要素への pattern を入れる場合は要拡張)
-            if rule.field_type == Some(FieldType::Array) && rule.pattern.is_some() {
-                anyhow::bail!("field {name:?}: `pattern` is only valid for string-typed fields");
-            }
             // MVP では Frontmatter 側が全フィールドを string で持つため、
             // integer / date は実装されていない。silent pass を避けるため
             // compile 段階で reject し、代わりに pattern で表現するよう誘導する。
@@ -231,7 +229,19 @@ pub enum Violation {
         min: Option<usize>,
         max: Option<usize>,
     },
+    /// The file's `---` block was found but its YAML was refused (#251), so
+    /// there is no frontmatter to hold the schema against. Reported instead
+    /// of the schema violations, not beside them (#252). `field` is always
+    /// [`FRONTMATTER_FIELD`]: the block itself, not a schema field.
+    FrontmatterUnparsed {
+        field: String,
+        reason: String,
+    },
 }
+
+/// The `field` a [`Violation::FrontmatterUnparsed`] carries. Every violation
+/// object has a `field` key, so a consumer reading it never sees null.
+pub const FRONTMATTER_FIELD: &str = "frontmatter";
 
 impl Violation {
     pub fn field(&self) -> &str {
@@ -241,12 +251,19 @@ impl Violation {
             Violation::PatternMismatch { field, .. } => field,
             Violation::NotInEnum { field, .. } => field,
             Violation::LengthOutOfRange { field, .. } => field,
+            Violation::FrontmatterUnparsed { field, .. } => field,
         }
     }
 
     /// 人間向けの 1 行メッセージ。
     pub fn message(&self) -> String {
         match self {
+            Violation::FrontmatterUnparsed { field, reason } => {
+                // serde_yaml_bw の reason は複数行になり得る。text format は
+                // `\n` を置換しないので、ここで 1 行に畳む。
+                let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!("{field} could not be parsed as YAML: {reason}")
+            }
             Violation::MissingRequired { field } => {
                 format!("{field} is required but missing (or empty)")
             }
@@ -309,6 +326,22 @@ pub fn validate(fm: &Frontmatter, schema: &Schema) -> Vec<Violation> {
     }
 
     out
+}
+
+/// Validate a parsed Markdown document. A `---` block the parser refused
+/// ([`ParsedDocument::frontmatter_error`] is `Some`) is one [`Violation::FrontmatterUnparsed`]
+/// and the schema is not applied -- the frontmatter behind it is the parser's
+/// placeholder (empty fields, the `frontmatter:unparsed` tag), and blaming
+/// those would name the tag rather than the YAML (#251, #252). Otherwise this
+/// is [`validate`] on [`ParsedDocument::frontmatter`].
+pub fn validate_document(doc: &ParsedDocument, schema: &Schema) -> Vec<Violation> {
+    match &doc.frontmatter_error {
+        Some(reason) => vec![Violation::FrontmatterUnparsed {
+            field: FRONTMATTER_FIELD.to_string(),
+            reason: reason.clone(),
+        }],
+        None => validate(&doc.frontmatter, schema),
+    }
 }
 
 fn check_string(out: &mut Vec<Violation>, name: &str, rule: &CompiledRule, value: Option<&str>) {
@@ -431,6 +464,19 @@ fn check_tags(out: &mut Vec<Violation>, name: &str, rule: &CompiledRule, tags: &
             min: rule.min_length,
             max: Some(max),
         });
+    }
+
+    // pattern: 各要素が regex にマッチするか (check_string と同じく enum の前)
+    if let Some(re) = &rule.pattern {
+        for t in tags {
+            if !re.is_match(t) {
+                out.push(Violation::PatternMismatch {
+                    field: name.to_string(),
+                    pattern: re.as_str().to_string(),
+                    actual: t.to_string(),
+                });
+            }
+        }
     }
 
     // enum: 各要素が enum に含まれているか
@@ -585,17 +631,20 @@ mod tests {
         assert!(err.to_string().contains("not implemented"));
     }
 
+    /// Until 1.8.0 this schema was refused with "`pattern` is only valid for
+    /// string-typed fields" (#252). It now compiles, and the pattern is held
+    /// for [`check_tags`] to apply to every element.
     #[test]
-    fn test_pattern_on_array_is_rejected() {
-        let err = Schema::from_toml_str(
+    fn test_pattern_on_array_is_accepted() {
+        let s = Schema::from_toml_str(
             r#"
             [fields.tags]
             type = "array"
             pattern = "^foo"
             "#,
         )
-        .expect_err("pattern on array must fail");
-        assert!(err.to_string().contains("pattern"));
+        .expect("pattern on an array field compiles since 1.8.0 (#252)");
+        assert!(s.fields["tags"].pattern.is_some());
     }
 
     #[test]
@@ -734,6 +783,80 @@ enum = ["mcp", "rag"]"#,
         ));
     }
 
+    /// `pattern` on an array field is applied to every element, the way
+    /// `enum` is: one [`Violation::PatternMismatch`] per offending element, in tag order,
+    /// carrying the element as `actual` (#252).
+    #[test]
+    fn test_validate_tags_pattern_on_each_element() {
+        let s = schema(
+            r#"[fields.tags]
+type = "array"
+pattern = '^[a-z-]+$'"#,
+        );
+        let mut f = fm();
+        f.tags = vec!["mcp".into(), "Bad Tag".into(), "rag".into(), "x_y".into()];
+        let v = validate(&f, &s);
+        assert_eq!(v.len(), 2, "one violation per offending element, got {v:?}");
+        assert!(matches!(
+            &v[0],
+            Violation::PatternMismatch { field, pattern, actual }
+                if field == "tags" && pattern == "^[a-z-]+$" && actual == "Bad Tag"
+        ));
+        assert!(matches!(
+            &v[1],
+            Violation::PatternMismatch { actual, .. } if actual == "x_y"
+        ));
+    }
+
+    #[test]
+    fn test_validate_tags_pattern_match_ok() {
+        let s = schema(
+            r#"[fields.tags]
+type = "array"
+pattern = '^[a-z-]+$'"#,
+        );
+        let mut f = fm();
+        f.tags = vec!["mcp".into(), "status-active".into()];
+        let v = validate(&f, &s);
+        assert!(v.is_empty(), "every element matches, got {v:?}");
+    }
+
+    /// `[fields.tags] pattern = ...` without a `type` key compiled before
+    /// 1.8.0 and was silently ignored. It is applied now.
+    #[test]
+    fn test_validate_tags_pattern_applies_without_type_key() {
+        let s = schema(
+            r#"[fields.tags]
+pattern = '^[a-z-]+$'"#,
+        );
+        let mut f = fm();
+        f.tags = vec!["ok".into(), "Not OK".into()];
+        let v = validate(&f, &s);
+        assert_eq!(v.len(), 1, "got {v:?}");
+        assert!(matches!(
+            &v[0],
+            Violation::PatternMismatch { actual, .. } if actual == "Not OK"
+        ));
+    }
+
+    /// An element that fails both checks yields both violations, pattern
+    /// first -- the order [`check_string`] uses for a string field.
+    #[test]
+    fn test_validate_tags_pattern_then_enum_for_one_element() {
+        let s = schema(
+            r#"[fields.tags]
+type = "array"
+pattern = '^[a-z]+$'
+enum = ["mcp"]"#,
+        );
+        let mut f = fm();
+        f.tags = vec!["Bad".into()];
+        let v = validate(&f, &s);
+        assert_eq!(v.len(), 2, "got {v:?}");
+        assert!(matches!(&v[0], Violation::PatternMismatch { .. }));
+        assert!(matches!(&v[1], Violation::NotInEnum { .. }));
+    }
+
     #[test]
     fn test_validate_type_mismatch_string_vs_array() {
         // title に array 型を指定すると Frontmatter 側 string と不一致
@@ -830,5 +953,135 @@ min_length = 1"#,
         f.tags = vec!["one".into()];
         let v = validate(&f, &s);
         assert!(v.is_empty(), "expected no violations, got {v:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_document: a refused frontmatter block is one violation (#252)
+    // -----------------------------------------------------------------------
+
+    fn parse_md(raw: &str) -> crate::parser::ParsedDocument {
+        use crate::parser::Parser as _;
+        crate::parser::MarkdownParser.parse(raw, "doc.md", &[])
+    }
+
+    /// The schema every [`validate_document`] test below is held against:
+    /// each rule would fire on the empty metadata the parser leaves behind a
+    /// refused block, so any of them leaking through is visible.
+    fn strict_schema() -> Schema {
+        schema(
+            r#"[fields.title]
+required = true
+type = "string"
+
+[fields.date]
+required = true
+type = "string"
+pattern = '^\d{4}-\d{2}-\d{2}$'
+
+[fields.tags]
+required = true
+type = "array"
+pattern = '^[a-z-]+$'
+enum = ["mcp"]"#,
+        )
+    }
+
+    /// Since 1.7.0 the parser tags a document whose YAML was refused with
+    /// `frontmatter:unparsed` and leaves every other field empty (#251), so
+    /// [`validate`] on that frontmatter blamed the tag and the missing title.
+    /// [`validate_document`] reports the refusal itself, once, instead.
+    #[test]
+    fn test_validate_document_broken_yaml_is_one_violation() {
+        let doc = parse_md("---\ntitle: [unclosed\n---\n# body\n");
+        assert!(doc.frontmatter_error.is_some(), "fixture must be refused");
+        let v = validate_document(&doc, &strict_schema());
+        assert_eq!(v.len(), 1, "one violation for the block, got {v:?}");
+        assert!(matches!(
+            &v[0],
+            Violation::FrontmatterUnparsed { field, reason }
+                if field == "frontmatter" && !reason.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_validate_document_valid_yaml_equals_validate() {
+        let doc =
+            parse_md("---\ntitle: Hello\ndate: \"2026-09-08\"\ntags: [mcp, Bad]\n---\n# body\n");
+        assert!(doc.frontmatter_error.is_none());
+        let s = strict_schema();
+        let v = validate_document(&doc, &s);
+        assert_eq!(v, validate(&doc.frontmatter, &s));
+        assert!(
+            v.iter()
+                .any(|x| matches!(x, Violation::PatternMismatch { actual, .. } if actual == "Bad")),
+            "the schema is applied as before, got {v:?}"
+        );
+    }
+
+    /// No block, and a block without a closing fence, are not parse errors:
+    /// the schema is applied to the (empty) frontmatter as before.
+    #[test]
+    fn test_validate_document_absent_and_unterminated_block_use_schema() {
+        for raw in ["# no frontmatter\n", "---\ntitle: x\nno closing fence\n"] {
+            let doc = parse_md(raw);
+            assert!(doc.frontmatter_error.is_none(), "{raw:?}");
+            let v = validate_document(&doc, &strict_schema());
+            assert!(
+                v.iter()
+                    .any(|x| matches!(x, Violation::MissingRequired { field } if field == "title")),
+                "{raw:?}: schema applies, got {v:?}"
+            );
+            assert!(
+                !v.iter()
+                    .any(|x| matches!(x, Violation::FrontmatterUnparsed { .. })),
+                "{raw:?}: not a refused block, got {v:?}"
+            );
+        }
+    }
+
+    /// The tag is frontmatter, so valid YAML can declare it by hand. That is
+    /// not a refused block: the schema applies and a tag pattern flags it.
+    #[test]
+    fn test_validate_document_hand_written_unparsed_tag_is_checked_by_schema() {
+        let doc = parse_md("---\ntags: [\"frontmatter:unparsed\"]\n---\n");
+        assert!(doc.frontmatter_error.is_none());
+        let s = schema(
+            r#"[fields.tags]
+type = "array"
+pattern = '^[a-z-]+$'"#,
+        );
+        let v = validate_document(&doc, &s);
+        assert_eq!(v.len(), 1, "got {v:?}");
+        assert!(matches!(
+            &v[0],
+            Violation::PatternMismatch { actual, .. } if actual == "frontmatter:unparsed"
+        ));
+    }
+
+    /// The parser's reason may span lines; the violation is one line in
+    /// every output format, and its JSON carries the documented keys.
+    #[test]
+    fn test_violation_frontmatter_unparsed_message_is_one_line_and_serialises() {
+        let doc = parse_md("---\ntitle: [unclosed\n---\n");
+        let v = validate_document(&doc, &strict_schema());
+        let m = v[0].message();
+        assert!(!m.contains('\n'), "one line: {m:?}");
+        assert!(
+            m.starts_with("frontmatter could not be parsed as YAML: "),
+            "{m:?}"
+        );
+        let json = serde_json::to_value(&v[0]).unwrap();
+        assert_eq!(json["kind"], "frontmatter_unparsed");
+        assert_eq!(json["field"], "frontmatter");
+        assert!(json["reason"].as_str().is_some_and(|r| !r.is_empty()));
+
+        let multi = Violation::FrontmatterUnparsed {
+            field: "frontmatter".into(),
+            reason: "line one\n  line two".into(),
+        };
+        assert_eq!(
+            multi.message(),
+            "frontmatter could not be parsed as YAML: line one line two"
+        );
     }
 }

@@ -141,6 +141,8 @@ min_length = 1
 - `--format text` (default, color when TTY) / `json` / `github` for CI annotations.
 - Exit codes: `0` (no violations), `1` (violations), `2` (schema load error).
 - `.txt` files are skipped (no frontmatter concept).
+- `pattern` checks the whole value of a string field, or every element of an array field (v1.8.0+), one violation per element that does not match. Like `enum`, so `[fields.tags] pattern = '^[a-z0-9-]+$'` keeps a tag list to one spelling. The regex matches anywhere in the value; anchor it with `^` and `$`.
+- A `.md` whose `---` block does not parse as YAML is reported as a single `frontmatter_unparsed` violation carrying the parser's reason, and the schema is not applied to it (v1.8.0+). A note whose valid YAML lists the tag `frontmatter:unparsed` by hand is checked like any other.
 - The `index` and `serve` commands are not affected — validation is opt-in only.
 
 ## HTTP transport for multiple simultaneous clients

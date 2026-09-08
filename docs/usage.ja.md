@@ -344,7 +344,7 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 - `--no-color` — `--format text` の ANSI 色を落とす。stdout が TTY でなければ
   元から色は付かないので、TTY のときに落としたい場合のフラグ
 
-終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)。`--kb-path` 直下に `groove-schema.toml` が無いときは短い "no schema found" メッセージと共に exit 0 となるため、既存ワークフローへの `groove validate` 追加は実際にスキーマを書くまで非破壊。
+終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)。frontmatter ブロックが YAML として不正なファイルは違反 1 件 (`frontmatter_unparsed`、v1.8.0+) として数えるので、他の違反と同じく exit 1 になる。`--kb-path` 直下に `groove-schema.toml` が無いときは短い "no schema found" メッセージと共に exit 0 となるため、既存ワークフローへの `groove validate` 追加は実際にスキーマを書くまで非破壊。
 
 ## 索引そのものを検査する (v0.23.0+)
 

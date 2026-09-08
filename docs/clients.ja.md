@@ -141,6 +141,8 @@ min_length = 1
 - `--format text` (既定、TTY では色付き) / `json` / `github` (CI annotation 用)
 - 終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)
 - `.txt` は frontmatter の概念が無いのでスキップ
+- `pattern` は string field なら値全体、array field なら各要素 (v1.8.0+) に当て、マッチしない要素ごとに 1 件の違反を出す。`enum` と同じ扱いなので、`[fields.tags] pattern = '^[a-z0-9-]+$'` で tag の綴りを 1 通りに揃えられる。regex は値のどこにでもマッチするので `^` と `$` で anchor する
+- `---` ブロックが YAML として parse できない `.md` は、parser の reason を添えた `frontmatter_unparsed` 1 件の違反として報告され、スキーマは当てない (v1.8.0+)。valid な YAML に手書きで `frontmatter:unparsed` の tag を書いた note は他と同じく検証される
 - `index` / `serve` コマンドには影響しない — 検証は opt-in のみ
 
 ## HTTP トランスポート (複数クライアント同時接続)
