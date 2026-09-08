@@ -50,7 +50,7 @@ pub use xlsx::{XlsParser, XlsxParser};
 
 /// One frontmatter value the schema did not name in advance (feature-57).
 ///
-/// Frontmatter is held as strings throughout, so a value is either a string,
+/// [`Frontmatter`] is held as strings throughout, so a value is either a string,
 /// a list of strings, or a shape neither of those can carry. [`FieldValue::Other`]
 /// keeps the shape's name and nothing else: the deserializer in [`markdown`] reads a
 /// retained value for its shape and skips the nesting under it rather than

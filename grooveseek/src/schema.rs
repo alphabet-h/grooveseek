@@ -354,7 +354,7 @@ impl Violation {
 /// `Frontmatter` を `Schema` に照らして違反リストを返す。空リストなら OK。
 ///
 /// 5 名は専用 field から、それ以外は [`Frontmatter::extra`] から引く (feature-57)。
-/// `schema.allow_unknown_fields` が false なら、[`Frontmatter::extra`] にあって schema に
+/// [`Schema::allow_unknown_fields`] が false なら、[`Frontmatter::extra`] にあって schema に
 /// 無い key を [`Violation::UndeclaredField`] として key 順に足す。`title` / `date` /
 /// `topic` / `depth` / `tags` は parser がそれぞれの field へ振り分けるので
 /// [`Frontmatter::extra`] に現れず、schema に無くても undeclared にならない。
