@@ -14,6 +14,31 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **`pattern` on an array field checks every element.** A `groove-schema.toml`
+  rule such as `[fields.tags] type = "array" pattern = '^[a-z0-9-]+$'` now
+  applies the regex to each element the way `enum` already did, and reports
+  one `pattern_mismatch` per element that does not match, with the element as
+  `actual`. The schema used to refuse to compile with `pattern is only valid
+  for string-typed fields`; and with the `type` key left out it compiled and
+  the pattern was silently ignored, so a schema that relied on that shape will
+  start reporting. Anchor the regex with `^` and `$`: it matches anywhere in
+  the value. (#252)
+
+### Changed
+
+- **`groove validate` reports a file whose YAML frontmatter does not parse as
+  one violation.** The violation has `kind: "frontmatter_unparsed"`,
+  `field: "frontmatter"` and the parser's `reason`; the schema is not applied
+  to that file. In 1.7.0 the same file produced `missing_required` on `title`
+  and `not_in_enum` on the tag `frontmatter:unparsed`, blaming the placeholder
+  the parser had left rather than the YAML. The new `kind` is an addition to
+  the documented JSON, which `docs/stability.md` allows in a minor release;
+  a consumer that switches on `kind` should let unknown kinds through. A note
+  whose valid YAML lists `frontmatter:unparsed` by hand is not a parse
+  failure and is checked like any other. (#251, #252)
+
 ## [1.7.0] - 2026-09-08
 
 ### Added

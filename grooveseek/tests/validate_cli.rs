@@ -241,6 +241,162 @@ min_length = 1
     assert!(out.contains("1 files OK"), "text summary: {out}");
 }
 
+/// (#252) `pattern` on an array field is applied to every element, one
+/// `pattern_mismatch` per offending element with the element as `actual`.
+/// Through the binary because the JSON shape is the promise
+/// (`docs/stability.md`), not the Rust enum.
+#[test]
+fn test_validate_tags_pattern_reports_each_offending_element_json() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-tag-pattern");
+    kb.write(
+        "a.md",
+        "---\ntitle: X\ntags: [ok, \"Bad Tag\", x_y]\n---\n# body\n",
+    );
+    kb.write(
+        "groove-schema.toml",
+        "[fields.tags]\ntype = \"array\"\npattern = '^[a-z-]+$'\n",
+    );
+    let (code, out, err) = run(
+        &bin,
+        &[
+            "validate",
+            "--kb-path",
+            kb.path.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 1, "two elements fail the pattern: stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON output");
+    assert_eq!(v["violated"], 1);
+    let violations = v["files"][0]["violations"].as_array().unwrap();
+    assert_eq!(
+        violations.len(),
+        2,
+        "one per offending element: {violations:?}"
+    );
+    for viol in violations {
+        assert_eq!(viol["kind"], "pattern_mismatch");
+        assert_eq!(viol["field"], "tags");
+        assert_eq!(viol["pattern"], "^[a-z-]+$");
+    }
+    let actual: Vec<&str> = violations
+        .iter()
+        .map(|x| x["actual"].as_str().unwrap())
+        .collect();
+    assert_eq!(actual, ["Bad Tag", "x_y"], "tag order is kept");
+}
+
+/// (#251, #252) A file whose `---` block is not YAML is one
+/// `frontmatter_unparsed` violation, and the schema is not applied to the
+/// placeholder frontmatter the parser leaves behind it. In 1.7.0 the same
+/// file produced `missing_required` on `title` and `not_in_enum` on the tag
+/// `frontmatter:unparsed`.
+#[test]
+fn test_validate_broken_frontmatter_is_one_frontmatter_unparsed_violation() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-unparsed");
+    kb.write("good.md", "---\ntitle: OK\ntags: [ok]\n---\n# body\n");
+    kb.write("broken.md", "---\ntitle: [unclosed\n---\n# body\n");
+    kb.write(
+        "groove-schema.toml",
+        "[fields.title]\nrequired = true\ntype = \"string\"\n\n\
+         [fields.tags]\ntype = \"array\"\npattern = '^[a-z-]+$'\nenum = [\"ok\"]\n",
+    );
+    let (code, out, err) = run(
+        &bin,
+        &[
+            "validate",
+            "--kb-path",
+            kb.path.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(code, 1, "the refused block is a violation: stderr={err}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON output");
+    assert_eq!(v["scanned"], 2);
+    assert_eq!(v["violated"], 1);
+    assert_eq!(v["files"][0]["path"], "broken.md");
+    let violations = v["files"][0]["violations"].as_array().unwrap();
+    assert_eq!(
+        violations.len(),
+        1,
+        "one violation for the block: {violations:?}"
+    );
+    assert_eq!(violations[0]["kind"], "frontmatter_unparsed");
+    assert_eq!(violations[0]["field"], "frontmatter");
+    assert!(
+        violations[0]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "the parser's reason travels with it: {violations:?}"
+    );
+}
+
+/// The same file in the two human-facing formats: one line each, and the
+/// github annotation keeps the `::error file=...` shape the docs promise.
+#[test]
+fn test_validate_broken_frontmatter_text_and_github_are_one_line() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-unparsed-fmt");
+    kb.write("good.md", "---\ntitle: OK\n---\n# body\n");
+    kb.write("broken.md", "---\ntitle: [unclosed\n---\n# body\n");
+    kb.write(
+        "groove-schema.toml",
+        "[fields.title]\nrequired = true\ntype = \"string\"\n",
+    );
+    let kb_path = kb.path.to_str().unwrap();
+
+    let (code, out, _err) = run(
+        &bin,
+        &["validate", "--kb-path", kb_path, "--format", "github"],
+    );
+    assert_eq!(code, 1);
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "one annotation: {out:?}");
+    assert!(
+        lines[0].starts_with(
+            "::error file=broken.md,line=1,title=frontmatter::frontmatter could not be parsed as YAML: "
+        ),
+        "github annotation: {out:?}"
+    );
+
+    let (code, out, _err) = run(
+        &bin,
+        &[
+            "validate",
+            "--kb-path",
+            kb_path,
+            "--format",
+            "text",
+            "--no-color",
+        ],
+    );
+    assert_eq!(code, 1);
+    assert!(
+        out.contains("1 file(s) with violations (1 OK)"),
+        "header: {out:?}"
+    );
+    assert!(out.contains("broken.md"), "path: {out:?}");
+    let indented: Vec<&str> = out.lines().filter(|l| l.starts_with("  ")).collect();
+    assert_eq!(indented.len(), 1, "one violation line: {out:?}");
+    assert!(
+        indented[0].starts_with("  frontmatter could not be parsed as YAML: "),
+        "text line: {out:?}"
+    );
+}
+
 /// (feature-49) `validate` is the third exclusion surface, and the one that is
 /// easiest to leave behind: `validate_collect_md_files` lives in the **binary**
 /// target and reaches the shared decision through the library's public API, so
