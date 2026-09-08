@@ -22,9 +22,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `pattern` / `enum` / `min_length` / `max_length` / `allow_empty`) apply to
   it. A string, a boolean or a number is checked as the string it prints as
   (`enum = ["true", "false"]` is the check for a boolean; there is no
-  `type = "bool"`), a list of those element by element, and a mapping — or a
-  list holding one — satisfies `required` alone, reporting one `type_mismatch`
-  naming its shape against any rule that would read it. A key written with no
+  `type = "bool"`), a list of those element by element, and a mapping — a list
+  holding one, or an explicit `!!binary`, likewise — satisfies `required`
+  alone, reporting one `type_mismatch` naming its shape (`mapping`,
+  `nested sequence`, `binary`) against any rule that would read it. A key written with no
   value (`status:`) counts as absent for every rule, so `required` catches a
   blank `status:` the way it catches a blank `title:`. A schema a 1.8.0 binary
   refused with `unsupported field` now loads. (#252)

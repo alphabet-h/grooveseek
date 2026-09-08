@@ -159,8 +159,9 @@ allow_unknown_fields = true      # false: a key with no [fields.*] table is a vi
   parser は block の top-level key を全部保持する: string / bool / number は印字した文字列として
   持つので (`environment_declared: false` は `enum = ["true", "false"]` で検査する。`type = "bool"`
   は無い)、list はその文字列の list として持ち `enum` / `pattern` を要素ごとに当てる。
-  mapping、および mapping を含む list は `required` を満たすだけで、値を読む rule があれば
-  形の名前 (`mapping` / `nested sequence`) を添えた `type_mismatch` 1 件になる。
+  mapping、mapping を含む list、および明示的な `!!binary` は `required` を満たすだけで、
+  値を読む rule があれば形の名前 (`mapping` / `nested sequence` / `binary`) を添えた
+  `type_mismatch` 1 件になる。
   値を書かなかった key (`status:` / `~` / `null`) はどの rule から見ても「無い」扱いで、
   空の `title:` と同じように `required` が捕まえる。
   これらの key を見るのは `groove validate` だけで、索引・filter・`get_document` は変わらない

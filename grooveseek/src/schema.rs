@@ -1354,6 +1354,25 @@ pattern = '^[a-z-]+$'"#,
         );
     }
 
+    /// `binary` is opaque like `mapping`: present for `required`, unreadable
+    /// for everything else, and named as `actual` when a rule reads it.
+    #[test]
+    fn test_extra_binary_is_opaque() {
+        let binary = || fm_with(&[("blob", FieldValue::Other("binary"))]);
+
+        let only_required = schema("[fields.blob]\nrequired = true\n");
+        assert!(validate(&binary(), &only_required).is_empty());
+
+        let with_pattern = schema("[fields.blob]\npattern = '.'\n");
+        let v = validate(&binary(), &with_pattern);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(matches!(
+            &v[0],
+            Violation::TypeMismatch { field, expected, actual }
+                if field == "blob" && expected == "string or array" && actual == "binary"
+        ));
+    }
+
     /// A null is the key written with no value, so every rule reads it as
     /// absent: `required` catches a blank `meta:` the way it catches a blank
     /// `title:`, and a rule that would read a value has nothing to read.

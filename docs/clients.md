@@ -161,9 +161,10 @@ allow_unknown_fields = true      # false: a key with no [fields.*] table is a vi
   string it prints as (so `environment_declared: false` is checked with
   `enum = ["true", "false"]`; there is no `type = "bool"`), and a list of
   those is held as a list of strings and takes `enum` / `pattern` element by
-  element. A mapping, or a list holding one, satisfies `required` and nothing
-  else — any rule that would read the value reports one `type_mismatch`
-  naming the shape (`mapping`, `nested sequence`). A key written with no
+  element. A mapping, a list holding one, or an explicit `!!binary` satisfies
+  `required` and nothing else — any rule that would read the value reports one
+  `type_mismatch` naming the shape (`mapping`, `nested sequence`, `binary`).
+  A key written with no
   value (`status:`, `~`, `null`) counts as absent for every rule, so
   `required` catches a blank `status:` the way it catches a blank `title:`.
   Only `groove validate` sees these keys; the index, its filters and

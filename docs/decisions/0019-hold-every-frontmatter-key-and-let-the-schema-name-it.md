@@ -75,11 +75,12 @@ or the schema?**
   surface unexpanded, and it was never a field.
 - **A retained value has one of three shapes.** A string, a boolean or a number
   is the string it prints as. A sequence whose every element is such a scalar is
-  a list of strings. A mapping, or a sequence holding anything that is not such
-  a scalar, is opaque: the parser keeps the shape's name and never reads the
-  value. A null is neither — `status:` with nothing after it is the key without
-  a value, and it counts as absent. An alias arrives already resolved to the
-  value it names, and a tag is resolved before the shape is decided, so neither
+  a list of strings. A mapping, a sequence holding anything that is not such a
+  scalar, and an explicit `!!binary` are opaque: the parser keeps the shape's
+  name (`mapping`, `nested sequence`, `binary`) and never reads the value. A
+  null is neither — `status:` with nothing after it is the key without a value,
+  and it counts as absent. An alias arrives already resolved to the value it
+  names, and a standard tag is resolved before the shape is decided, so neither
   is a shape of its own.
 - **The schema names any key.** `[fields.<name>]` accepts any name; an empty
   table declares the key and checks nothing; `required = true` stays explicit.

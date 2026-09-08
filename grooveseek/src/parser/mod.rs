@@ -63,11 +63,11 @@ pub enum FieldValue {
     Scalar(String),
     /// A sequence whose every element is a `Scalar`.
     List(Vec<String>),
-    /// `"mapping"`, `"nested sequence"` or [`FieldValue::NULL`]. A mapping or
-    /// a sequence holding a non-scalar is present but unreadable: `required`
-    /// is satisfied and any rule that reads the value reports a
-    /// `type_mismatch` naming this shape. A null is the key without a value
-    /// and counts as absent for every rule instead.
+    /// `"mapping"`, `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
+    /// A mapping, a sequence holding a non-scalar, and an explicit `!!binary`
+    /// are present but unreadable: `required` is satisfied and any rule that
+    /// reads the value reports a `type_mismatch` naming this shape. A null is
+    /// the key without a value and counts as absent for every rule instead.
     Other(&'static str),
 }
 

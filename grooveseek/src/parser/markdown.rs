@@ -176,7 +176,7 @@ fn number_text(n: impl Into<serde_yaml_bw::Number>) -> String {
 /// key costs the same walk the YAML parser was already doing. Aliases and
 /// standard tags are resolved by the deserializer before a visitor sees them,
 /// so there is no alias or tagged shape here -- `Other` is exactly `"mapping"`,
-/// `"nested sequence"` or [`FieldValue::NULL`].
+/// `"nested sequence"`, `"binary"` or [`FieldValue::NULL`].
 struct FieldValueVisitor;
 
 impl<'de> Deserialize<'de> for FieldValue {
@@ -234,6 +234,19 @@ impl<'de> Visitor<'de> for FieldValueVisitor {
 
     fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
         Ok(FieldValue::Other(FieldValue::NULL))
+    }
+
+    /// An explicit `!!binary`, which `serde_yaml_bw` base64-decodes and hands
+    /// over as bytes. It is opaque like a mapping: the decoded bytes are not a
+    /// string and are not kept. Without this arm serde's default is an error,
+    /// which would refuse a whole block over a key nobody declared -- 1.8.0
+    /// dropped the key and indexed the document.
+    fn visit_bytes<E: de::Error>(self, _v: &[u8]) -> Result<Self::Value, E> {
+        Ok(FieldValue::Other("binary"))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, _v: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(FieldValue::Other("binary"))
     }
 
     fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
@@ -325,6 +338,16 @@ impl<'de> Visitor<'de> for SeqElementVisitor {
     }
 
     fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(SeqElement(None))
+    }
+
+    /// `!!binary` is not a scalar the list can hold, so it makes the whole
+    /// sequence opaque the way a mapping element does.
+    fn visit_bytes<E: de::Error>(self, _v: &[u8]) -> Result<Self::Value, E> {
+        Ok(SeqElement(None))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, _v: Vec<u8>) -> Result<Self::Value, E> {
         Ok(SeqElement(None))
     }
 
@@ -751,6 +774,30 @@ mod tests {
         assert_eq!(
             doc.frontmatter.extra["blob"],
             crate::parser::FieldValue::Other("mapping")
+        );
+    }
+
+    /// An explicit `!!binary` is base64-decoded into bytes, which no shape can
+    /// hold as text. It is opaque rather than a refusal: 1.8.0 dropped the key
+    /// and indexed the document, and retaining keys must not change that.
+    #[test]
+    fn test_binary_under_unknown_key_is_opaque() {
+        use crate::parser::FieldValue;
+        let doc = parse(
+            "---\ntitle: T\nblob: !!binary \"aGVsbG8=\"\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(doc.frontmatter_error, None);
+        assert_eq!(doc.frontmatter.title.as_deref(), Some("T"));
+        assert_eq!(doc.frontmatter.extra["blob"], FieldValue::Other("binary"));
+
+        // In a sequence it is not a scalar, so the whole list goes opaque.
+        let in_list = parse(
+            "---\ntitle: T\nblob: [a, !!binary \"aGVsbG8=\"]\n---\n\nBody long enough to stand as one chunk on its own here.\n",
+        );
+        assert_eq!(in_list.frontmatter_error, None);
+        assert_eq!(
+            in_list.frontmatter.extra["blob"],
+            FieldValue::Other("nested sequence")
         );
     }
 

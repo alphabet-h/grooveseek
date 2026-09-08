@@ -31,9 +31,9 @@
 # below are not applied to it.
 # Any field name is accepted (v1.9.0+). An empty `[fields.<name>]` table
 # declares the key without checking it. Values are held as strings, a list as
-# a list of strings; a mapping, or a list holding one, satisfies `required`
-# and nothing else. A key written with no value (`status:`) counts as absent
-# for every rule, so `required` catches it.
+# a list of strings; a mapping, a list holding one, or an explicit `!!binary`
+# satisfies `required` and nothing else. A key written with no value
+# (`status:`) counts as absent for every rule, so `required` catches it.
 # `[options] allow_unknown_fields = false` (or `groove validate --strict`)
 # reports every key the schema does not name -- a blank one included.
 
