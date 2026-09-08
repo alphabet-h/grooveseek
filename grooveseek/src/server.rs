@@ -140,7 +140,7 @@ pub(crate) struct KbCore {
     search_config: crate::config::SearchConfig,
     /// feature-46: `rebuild_index` MCP tool の force 時 adopt 値 (§4.8)。
     context_mode_desired: crate::db::ContextMode,
-    /// (#251) `[index].fail_on_frontmatter_error`: `rebuild_index` answers with
+    /// (#251) `[index].fail_on_frontmatter_error`: the MCP `rebuild_index` tool answers with
     /// an `error` beside the counts when a run wrote any `frontmatter:unparsed`.
     fail_on_frontmatter_error: bool,
     /// Shared indexing-state slot — `rebuild_index` flips it Some/None so
@@ -466,7 +466,7 @@ struct IndexStats {
     duration_ms: u64,
 }
 
-/// (#251) The `rebuild_index` reply under `[index].fail_on_frontmatter_error`
+/// (#251) The MCP `rebuild_index` tool's reply under `[index].fail_on_frontmatter_error`
 /// when the count is non-zero: the run did happen, so the counts are still
 /// there, flattened beside the `error` a client keys on.
 #[derive(Serialize)]
@@ -1086,7 +1086,7 @@ pub struct KbServerShared {
     /// から算出)。`rebuild_index` MCP tool が force 時の adopt 値に使う。非 force は
     /// DB 側モードが優先されるため、この値は force 移行時のみ効く。
     pub context_mode_desired: crate::db::ContextMode,
-    /// (#251) `[index].fail_on_frontmatter_error`, read by `rebuild_index`.
+    /// (#251) `[index].fail_on_frontmatter_error`, read by the MCP `rebuild_index` tool.
     pub fail_on_frontmatter_error: bool,
 
     // (v0.8.0+, feature-43 PR-2) Fields surfaced by `/api/admin/status`.

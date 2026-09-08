@@ -430,9 +430,9 @@ pub struct IndexResult {
     pub skipped: u32,
     /// Documents indexed this run whose YAML frontmatter could not be parsed
     /// and were therefore written with empty metadata and the
-    /// `frontmatter:unparsed` tag (#251). Per run, like `updated`: a file that
-    /// has not changed is not re-parsed and so is not re-counted; `force`
-    /// re-parses everything.
+    /// `frontmatter:unparsed` tag (#251). Per run, like [`Self::updated`]: a
+    /// file that has not changed is not re-parsed and so is not re-counted;
+    /// the `force` argument of [`rebuild_index`] re-parses everything.
     pub frontmatter_unparsed: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
@@ -446,7 +446,7 @@ pub enum SingleResult {
     Unchanged,
     /// upsert + embedding 完了 (chunk 数)。`frontmatter_unparsed` は #251:
     /// この文書の YAML frontmatter が parse できず、metadata 空 +
-    /// `frontmatter:unparsed` tag で書かれたことを示す。`rebuild_index` の
+    /// `frontmatter:unparsed` tag で書かれたことを示す。[`rebuild_index`] の
     /// summary はこれを数える。
     Updated {
         chunks: u32,
