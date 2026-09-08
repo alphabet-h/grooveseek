@@ -23,6 +23,8 @@ Scans source files under the given directory, skipping the default `exclude_dirs
 
 Switching models on an existing index requires `--force` (the DB records the model/dim in `index_meta` and rejects mismatched runtimes).
 
+`--force` is also the repair for a `.groove.db` that cannot be opened as a database — a truncated write or a process killed mid-migration is enough. Any command that opens the file then fails with a message naming the file (it lives in the **parent** of `--kb-path`) and the two ways out: delete it and run `groove index`, or run `groove index --force`, which replaces the file and its `-wal` / `-shm` sidecars and rebuilds from scratch. The index is entirely derived from the corpus, so nothing is lost. Without `--force` the file is never touched.
+
 ### Progress reporting flags (v0.7.8+)
 
 Two flags control how `groove index` reports progress; they are mutually exclusive and default-off (the existing per-file `  indexed: foo.md (N chunks)` output is unchanged when neither flag is given).
@@ -360,7 +362,7 @@ It also names the source files that were chunked by lines rather than at their d
 
 An index built before v1.6.0 gets a different answer first. Up to that release a file over the chunk limit was **truncated**, and a file whose content has not changed is never re-chunked, so such an index may still hold files whose tails are missing — with nothing on the document to find them by. `doctor` says so rather than reporting a clean bill: it checks whether the index recorded which chunking policy built it, and where it did not and the index holds source files, it reports that the question cannot be answered yet. `groove index --force` re-chunks them and the note goes away.
 
-Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index). Findings are reported, never repaired: each one names what fixes it, which is `groove index` or `groove index --force` for everything structural, and a change to the document itself where no command can.
+Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index, or one that cannot be opened; the message on stderr names the file and the command that repairs it). Findings are reported, never repaired: each one names what fixes it, which is `groove index` or `groove index --force` for everything structural, and a change to the document itself where no command can.
 
 > Like `search` and `eval`, this opens the database, and opening it applies any pending schema migration. It is read-only about its findings, not about the file.
 

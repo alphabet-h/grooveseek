@@ -192,7 +192,8 @@ enum Commands {
         /// Path to the knowledge-base directory
         #[arg(long)]
         kb_path: Option<PathBuf>,
-        /// Force full re-index. Required when switching `--model`.
+        /// Force full re-index. Required when switching `--model`. Also
+        /// replaces a `.groove.db` that cannot be opened as a database.
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Embedding model to use
@@ -870,7 +871,26 @@ fn main() -> anyhow::Result<()> {
             let registry = cfg.build_parser_registry(&kb_path)?;
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
-            let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
+            let db_path_str = db_path.to_string_lossy();
+            // `--force` is the one repair verb the command line offers, so it
+            // has to reach a database that cannot be opened (#253): the index
+            // is derived from the corpus, and "start over" is what the flag
+            // already means. Without the flag the file is left alone and the
+            // error names it and the remedy.
+            let db = if force {
+                let (db, replaced) =
+                    grooveseek::db::Database::open_or_replace_corrupt(&db_path_str)?;
+                if replaced {
+                    eprintln!(
+                        "warning: {} could not be opened as a SQLite database; \
+                         --force replaced it and the index is rebuilt from scratch",
+                        db_path.display()
+                    );
+                }
+                db
+            } else {
+                grooveseek::db::Database::open(&db_path_str)?
+            };
             // モデル DL (BGE-M3 なら ~2.3 GB) の前に meta 整合性を先に確認する。
             // そうしないと不整合時にユーザが不要な DL を待たされる。
             let dim = model.dimension() as u32;
