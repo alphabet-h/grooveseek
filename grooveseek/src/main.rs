@@ -920,7 +920,7 @@ fn main() -> anyhow::Result<()> {
                 .index
                 .as_ref()
                 .is_some_and(|i| i.fail_on_frontmatter_error);
-            if strict && result.frontmatter_unparsed > 0 {
+            if result.fails_strict_frontmatter(strict) {
                 anyhow::bail!(
                     "{} document(s) have YAML frontmatter that could not be parsed (see the warnings above); \
                      [index].fail_on_frontmatter_error is set, so this run is reported as a failure. \

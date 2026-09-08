@@ -419,6 +419,7 @@ fn documents_to_delete(
 }
 
 /// Summary returned by [`rebuild_index`].
+#[derive(Debug, Default)]
 pub struct IndexResult {
     pub total_documents: u32,
     pub updated: u32,
@@ -439,6 +440,17 @@ pub struct IndexResult {
     pub frontmatter_unparsed: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
+}
+
+impl IndexResult {
+    /// Whether this run is a failure under `[index].fail_on_frontmatter_error`
+    /// (#251). One decision, rendered twice: `groove index` turns `true` into
+    /// exit 1, the MCP `rebuild_index` tool into an `error` beside the counts.
+    /// The two surfaces call this rather than each comparing the count, so
+    /// they cannot come to disagree (codex P1, round 4).
+    pub fn fails_strict_frontmatter(&self, fail_on_frontmatter_error: bool) -> bool {
+        fail_on_frontmatter_error && self.frontmatter_unparsed > 0
+    }
 }
 
 /// 単一ファイルのインデックス結果。`rebuild_index` 内での
@@ -684,7 +696,7 @@ pub fn rebuild_index(
     let mut refresh_pending = false;
     if refresh_frontmatter {
         for rel in &skipped_paths {
-            if is_indexed_markdown(db, registry, rel)? {
+            if indexed_markdown_hash(db, registry, rel)?.is_some() {
                 refresh_pending = true;
                 break;
             }
@@ -734,11 +746,15 @@ pub fn rebuild_index(
                 if fm_unparsed {
                     frontmatter_unparsed += 1;
                 }
-                // A file skipped *after* parsing has had its frontmatter read; only a
-                // skip that never got that far can leave one unchecked (codex P2, round 3).
+                // What the check has to have read is the bytes the *row* was written
+                // from, and a skip retains that row. A skip decided before parsing read
+                // nothing; one decided after parsing (no chunks) read the file on disk,
+                // which is the row's bytes only when the hashes agree. Otherwise the old
+                // bytes can come back, match the retained hash, and hide behind the fast
+                // path for good (codex P2, rounds 3 and 4).
                 if refresh_frontmatter
-                    && reason != SKIPPED_NO_CHUNKS
-                    && is_indexed_markdown(db, registry, &entry.rel)?
+                    && let Some(row_hash) = indexed_markdown_hash(db, registry, &entry.rel)?
+                    && (reason != SKIPPED_NO_CHUNKS || row_hash != entry.hash)
                 {
                     refresh_pending = true;
                 }
@@ -748,7 +764,8 @@ pub fn rebuild_index(
             // does: the file is not indexed and the reason is already on stderr.
             SingleResult::Refused => {
                 skipped_count += 1;
-                if refresh_frontmatter && is_indexed_markdown(db, registry, &entry.rel)? {
+                if refresh_frontmatter && indexed_markdown_hash(db, registry, &entry.rel)?.is_some()
+                {
                     refresh_pending = true;
                 }
                 progress.report_unchanged(&entry.rel);
@@ -829,14 +846,17 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
 
 /// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed. The
 /// one-time frontmatter check (#251) treats every other skip as "not read", because those
-/// return before the parser runs.
+/// return before the parser runs; this one counts as read only when the bytes parsed are
+/// the bytes the retained row holds.
 const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
 
-/// Whether `rel` is a Markdown file -- by the parser the registry would hand it, so `.MD`
-/// counts -- that the index already holds a row for. The one-time frontmatter check
-/// (#251) asks this about every file it could not read: only such a file can come back
-/// later with a matching hash and slip past the check for good.
-fn is_indexed_markdown(db: &Database, registry: &Registry, rel: &str) -> Result<bool> {
+/// The stored content hash of `rel` when it is a Markdown file -- by the parser the
+/// registry would hand it, so `.MD` counts -- that the index already holds a row for;
+/// `None` otherwise. The one-time frontmatter check (#251) asks this about every file it
+/// did not index: only such a file can come back later with a matching hash and slip past
+/// the check for good, and the hash is what says whether the bytes that were read this
+/// run are the ones the row was written from.
+fn indexed_markdown_hash(db: &Database, registry: &Registry, rel: &str) -> Result<Option<String>> {
     let ext = Path::new(rel)
         .extension()
         .and_then(|e| e.to_str())
@@ -844,7 +864,10 @@ fn is_indexed_markdown(db: &Database, registry: &Registry, rel: &str) -> Result<
     let is_markdown = registry
         .by_extension(ext)
         .is_some_and(|p| p.extension() == "md");
-    Ok(is_markdown && db.get_document_hash(rel)?.is_some())
+    if !is_markdown {
+        return Ok(None);
+    }
+    db.get_document_hash(rel)
 }
 
 /// How [`index_single_disk_entry`] treats a file whose content hash the index
@@ -3038,6 +3061,24 @@ mod tests {
                 frontmatter_unparsed: false
             }
         );
+    }
+
+    /// #251 (codex P1, round 4): the CLI exit code and the MCP `error` reply
+    /// are two renderings of one decision, so the decision lives here.
+    #[test]
+    fn test_fails_strict_frontmatter_needs_both_the_switch_and_a_count() {
+        let clean = IndexResult {
+            frontmatter_unparsed: 0,
+            ..IndexResult::default()
+        };
+        let broken = IndexResult {
+            frontmatter_unparsed: 2,
+            ..IndexResult::default()
+        };
+        assert!(!clean.fails_strict_frontmatter(false));
+        assert!(!clean.fails_strict_frontmatter(true));
+        assert!(!broken.fails_strict_frontmatter(false));
+        assert!(broken.fails_strict_frontmatter(true));
     }
 
     /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is

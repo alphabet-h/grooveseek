@@ -645,7 +645,7 @@ impl KbCore {
                     total_chunks: result.total_chunks,
                     duration_ms: result.duration_ms,
                 };
-                if self.fail_on_frontmatter_error && stats.frontmatter_unparsed > 0 {
+                if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
                     let reply = StrictIndexFailure {
                         error: format!(
                             "{} document(s) have YAML frontmatter that could not be parsed; \
