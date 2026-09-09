@@ -826,10 +826,10 @@ pub(crate) const FILTER_ITEM_MAX_BYTES: usize = SEARCH_QUERY_MAX_BYTES;
 /// on PR #291).
 ///
 /// [`validate_filter_list`] bounds each key's own value list independently -- [`FILTER_LIST_MAX_ITEMS`]
-/// entries of [`FILTER_ITEM_MAX_BYTES`] bytes each -- so a map with [`FILTER_LIST_MAX_ITEMS`]
-/// keys, every one of them individually legal at that per-list bound, can still cost up to
-/// `FILTER_LIST_MAX_ITEMS * FILTER_LIST_MAX_ITEMS * FILTER_ITEM_MAX_BYTES` ~= 4 MiB (twice that
-/// across `fields` and `fields_not` in the same request) while every per-list check passes. The
+/// entries of [`FILTER_ITEM_MAX_BYTES`] bytes each -- so a map with up to [`FILTER_LIST_MAX_ITEMS`]
+/// keys, each with up to [`FILTER_LIST_MAX_ITEMS`] values of [`FILTER_ITEM_MAX_BYTES`] bytes,
+/// every one of them individually legal at that per-list bound, can still cost up to ~4 MiB
+/// (twice that across `fields` and `fields_not` in the same request) while every per-list check passes. The
 /// Streamable HTTP transport refuses a body over [`crate::transport::http::REQUEST_BODY_MAX_BYTES`]
 /// (1 MiB) with a 413 before [`KbCore::search_blocking`] runs at all, so a request the
 /// documented per-list limits accept can still never reach this validation over HTTP. Capping a
