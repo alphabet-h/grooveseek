@@ -75,7 +75,7 @@ groove serve --kb-path ... --no-watch                           # ライブ同�
 
 - `none` — 無効 (既定)
 - `bge-v2-m3` — BAAI/bge-reranker-v2-m3 (多言語 100+、初回 DL 約 2.3 GB)。日本語 KB では推奨
-- `jina-v2-ml` — jinaai/jina-reranker-v2-base-multilingual (多言語、約 1.2 GB)。軽量版
+- `jina-v2-ml` — jinaai/jina-reranker-v2-base-multilingual (多言語、約 1.2 GB)。軽量版。**Jina AI のライセンスは CC-BY-NC-4.0 で、研究・評価用途のみ、商用利用は不可** — 商用は Jina の API か marketplace 経由になる。商用の用途では `bge-v2-m3` (Apache-2.0) を選ぶこと
 - `bge-base` — BAAI/bge-reranker-base (英語 / 中国語のみ、約 280 MB)。日本語では非推奨
 
 再ランクは CPU では高い。しかも効いているのはモデルのロードではなく cross-encoder の推論そのものである。v1.0.0 に対して 1 台の Windows マシンで実測 (CPU のみ、埋め込み `bge-m3`、reranker `bge-v2-m3`、141 文書 / 1,855 chunk の KB、`limit = 5` なので候補プールは 50 ペア): 1 クエリが `groove search` で **74〜87 秒**、常駐 daemon の `/mcp` 経由で **74〜79 秒**。同じクエリを再ランク無しで投げると **3.1〜3.6 秒** と **約 0.1 秒**である。**常駐させても救われない**: reranker は `run_server` が起動時に構築するので、daemon の 2 本目以降にロードすべきモデルは残っていない。それでも 74〜79 秒かかる。効いているのは候補プールに対する cross-encoder の推論そのものである。有効にする前に自分のハードウェアで測ること: `groove search "<query>" --reranker bge-v2-m3` と `--reranker none` を同条件で繰り返し、プロセスの外側から時間を計る。`--rerank-by-default <BOOL>` (`--reranker` 指定時は既定 on) はすべての `search` 呼び出しで再ランクするかを制御する。**値を取るフラグ**なので、無効化は `--rerank-by-default=false` と書く。MCP ツール側は `rerank: Option<bool>` で per-query 上書き可能。reranker の切替に**再インデックスは不要** (index 非依存)。

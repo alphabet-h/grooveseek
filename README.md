@@ -5,8 +5,13 @@
 
 # GrooveSeek
 
-MCP server for semantic search over a Markdown / plain-text knowledge base. The
-command is `groove`.
+MCP server for hybrid (semantic + full-text) search over a knowledge base of
+Markdown — and, opted in, plain text, PDF, Office documents and source code.
+The command is `groove`.
+
+Out of the box — no config file, default model — it indexes English Markdown
+with YAML frontmatter. Japanese or other multilingual content needs
+`--model bge-m3`; every other file format is an opt-in in `groove.toml`.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/alphabet-h/grooveseek/ci.yml?branch=main&label=CI)](https://github.com/alphabet-h/grooveseek/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/alphabet-h/grooveseek?label=release)](https://github.com/alphabet-h/grooveseek/releases/latest)
@@ -52,7 +57,7 @@ Download the archive for your platform from the [latest GitHub release](https://
 
 > **A language whose grammar is not compiled in needs one more archive.** Rust is built into `groove`; every other language arrives as its own download — `groove-grammar-<language>-<target>.tar.xz`, or `.zip` on Windows, built for the same targets as the table above. Published so far: `groove-grammar-python` (v1.3.0+, enabled as `"py"`), `groove-grammar-php` (v1.5.0+, as `"php"`). Unpack the library into the directory `grammar_dir` names, then add that id to `[parsers].enabled`. Nothing is downloaded automatically, and no library is opened unless that key names the language it belongs to — see [Placing a grammar plugin](docs/clients.md#placing-a-grammar-plugin-v130).
 
-Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running.
+Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY-LICENSES.md` (the notices of every crate linked in), and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running. Archives are also signed with a GitHub artifact attestation; `gh attestation verify <archive> --repo alphabet-h/grooveseek` checks that a download was built by GitHub Actions in this repository.
 
 ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. Embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](docs/clients.md#working-around-huggingface-tls-failures-on-first-download) if your network blocks that.
 
@@ -145,7 +150,14 @@ itself exposed as `kb://` resources. Parameters and return shapes are in
 
 Decisions that shaped the architecture — what was chosen, which alternatives were rejected, and what it cost — are recorded as [Architecture Decision Records](docs/decisions/) in `docs/decisions/`. Start with [ADR-0000](docs/decisions/0000-record-decisions-as-adrs.md), which describes when a decision is recorded and when a changelog entry is enough. Japanese versions are alongside as `*.ja.md`.
 
+## Security
+
+Report a vulnerability through GitHub's private reporting rather than a public
+issue — the steps, the response target and what is in scope are in
+[SECURITY.md](./SECURITY.md).
+
 ## License
 
 Dual-licensed under [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE), at
-your option.
+your option. The licenses of the crates linked into the binaries are collected
+in [THIRD-PARTY-LICENSES.md](./THIRD-PARTY-LICENSES.md).

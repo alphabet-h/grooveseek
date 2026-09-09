@@ -2917,6 +2917,10 @@ mod documented_flags {
                 "nocapture",
                 "cargo test -- --nocapture, in deployment-topologies.md",
             ),
+            (
+                "repo",
+                "gh attestation verify --repo, in the README's archive note",
+            ),
         ];
 
         // Which command owns a flag does not matter here; only whether the

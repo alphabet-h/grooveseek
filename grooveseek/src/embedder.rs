@@ -204,7 +204,7 @@ pub enum RerankerChoice {
     #[value(name = "bge-v2-m3")]
     #[serde(rename = "bge-v2-m3")]
     BgeV2M3,
-    /// jinaai/jina-reranker-v2-base-multilingual (多言語, ~1.2 GB)。軽量多言語
+    /// jinaai/jina-reranker-v2-base-multilingual (多言語, ~1.2 GB)。軽量多言語。CC-BY-NC-4.0 = 研究・評価用途のみ、商用利用不可
     #[value(name = "jina-v2-ml")]
     #[serde(rename = "jina-v2-ml")]
     JinaV2Multilingual,

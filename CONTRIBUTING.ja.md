@@ -136,6 +136,24 @@ retrieval に触れる変更 (クエリのコンパイル、fusion、chunk 分�
    書いておらず、上のブロックが警告しているとおりの失敗そのものだった
 4. 問題と変更内容を明示した PR を開く (関連 issue があればリンク)
 
+### 変更が `Cargo.lock` に触れるとき
+
+`THIRD-PARTY-LICENSES.md` は lock file から生成され、全リリース archive に同梱される。
+依存を変えた PR は同じ PR で再生成すること (commit された copy がずれていると nightly が
+fail する):
+
+```bash
+cargo install --locked --version 0.9.2 --features cli cargo-about
+cargo about generate --locked --fail -c about.toml -o THIRD-PARTY-LICENSES.md about.hbs
+```
+
+版を固定しているのは、file の形を決めるのが generator 側だから — lock file が同じでも新しい
+cargo-about は出力を変え得るし、nightly job も同じ版を install する。上げるときは
+ここと `.github/workflows/nightly.yml` の pin を一緒に上げ、同じ PR で再生成する。
+`--fail` は「crate X のライセンス本文が見つからない」を error にする。直すのは
+`about.toml` 側 — cargo-about に組み込みがあれば `workarounds` に crate 名を足し、
+無ければ `[<crate>.clarify]` block を書く。生成物を手で編集しない。
+
 ## バグ報告
 
 以下を含めて issue を開いてください:

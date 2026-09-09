@@ -5,7 +5,9 @@
 
 # GrooveSeek
 
-Markdown / プレーンテキストのナレッジベースに対するセマンティック検索を提供する MCP サーバ。コマンド名は `groove`。
+Markdown のナレッジベース — opt-in でプレーンテキスト / PDF / Office 文書 / ソースコードも — に対するハイブリッド (セマンティック + 全文) 検索を提供する MCP サーバ。コマンド名は `groove`。
+
+置くだけで動くのは、設定ファイル無し・既定モデルで、YAML frontmatter 付きの英語 Markdown を索引する構成。日本語やその他の多言語の内容には `--model bge-m3` が要り、それ以外のファイル形式はすべて `groove.toml` での opt-in になる。
 
 [![CI](https://img.shields.io/github/actions/workflow/status/alphabet-h/grooveseek/ci.yml?branch=main&label=CI)](https://github.com/alphabet-h/grooveseek/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/alphabet-h/grooveseek?label=release)](https://github.com/alphabet-h/grooveseek/releases/latest)
@@ -51,7 +53,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 
 > **grammar が焼き込まれていない言語は archive がもう 1 つ要る。** Rust は `groove` 本体に入っているが、それ以外の言語はそれぞれ別ダウンロード — `groove-grammar-<言語>-<target>.tar.xz` (Windows は `.zip`) が上の表と同じターゲットぶんある。現在公開しているのは `groove-grammar-python` (v1.3.0 以降、`[parsers].enabled` には `"py"`) と `groove-grammar-php` (v1.5.0 以降、同じく `"php"`)。展開したライブラリを `grammar_dir` が指すディレクトリに置き、その id を `[parsers].enabled` に足す。自動 DL は一切行われず、そのキーが言語を名指さない限りライブラリは開かれない — [grammar plugin の置き方](docs/clients.ja.md#grammar-plugin-の置き方-v130) を参照。
 
-各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。
+各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `THIRD-PARTY-LICENSES.md` (リンクされている全 crate の notice) / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。アーカイブには GitHub の artifact attestation も付いており、`gh attestation verify <archive> --repo alphabet-h/grooveseek` で「この repo の GitHub Actions が build した物か」を検証できる。
 
 ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](docs/clients.ja.md#huggingface-の-tls-失敗への対処-初回-dl-時) を参照。
 
@@ -142,7 +144,13 @@ groove search "semantic chunking" --kb-path /path/to/knowledge-base --limit 3
 
 アーキテクチャを形づくった決定 — 何を選び、どの選択肢を却下し、その代償は何だったか — は [Architecture Decision Record](docs/decisions/) として `docs/decisions/` に残している。まず [ADR-0000](docs/decisions/0000-record-decisions-as-adrs.ja.md) を読むと、何を ADR に書き、何は CHANGELOG で足りるのかが分かる。日本語版は同じディレクトリに `*.ja.md` で並べてある。
 
+## セキュリティ
+
+脆弱性は public な issue ではなく GitHub の非公開報告で — 手順、返信の目安、対象範囲は
+[SECURITY.md](./SECURITY.md) (英語) にある。
+
 ## ライセンス
 
 [MIT](./LICENSE-MIT) と [Apache-2.0](./LICENSE-APACHE) のデュアルライセンス。
-どちらを選んでもよい。
+どちらを選んでもよい。バイナリにリンクされている crate のライセンスは
+[THIRD-PARTY-LICENSES.md](./THIRD-PARTY-LICENSES.md) にまとめてある。

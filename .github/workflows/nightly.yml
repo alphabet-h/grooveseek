@@ -13,6 +13,8 @@ name: Nightly
 #   「何も測っていない」状態に腐るのを止めるのが目的 (詳細は当該 step の注)。
 # - cargo audit: 依存ツリーを RustSec advisory DB と突合。新しい advisory
 #   が出た時に nightly が fail することで notification として機能する。
+# - cargo about: THIRD-PARTY-LICENSES.md を Cargo.lock から再生成し、commit 済みの
+#   copy とずれていれば fail する (配布物の notice が黙って古くなるのを止める)。
 #
 # workflow_dispatch も付けてあるので、依存 bump 後やリリース前に手動トリガ
 # 可能。`gh workflow run nightly.yml` で起動できる。
@@ -280,6 +282,40 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
+  # THIRD-PARTY-LICENSES.md は Cargo.lock から cargo-about が生成した物を commit し、
+  # 全 release archive に同梱している (dist-workspace.toml の include)。依存を
+  # 変えた PR が再生成を忘れると、配布物の notice が黙って古くなる。ここで
+  # 再生成して commit 済みの copy と突き合わせ、ずれていれば fail させる。
+  third-party-licenses:
+    name: THIRD-PARTY-LICENSES.md is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 生成物は cargo-about の版に依存する (license の探索と描画は generator 側)。
+      # commit 済みの file を作った版に固定し、上げる時は再生成と同じ PR で上げる。
+      # CONTRIBUTING の install 行と同じ版であること。
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+
+      # about.toml は 4 target を列挙するので、この Linux runner でも Windows 専用
+      # crate (tray-icon / tao / windows) の source が要る。cargo-about 0.9 は
+      # license 本文を crate source からしか読まない (外部 harvest の照会なし)
+      # ので、network はこの fetch だけで、出力は lock file に対して決定的。
+      - name: Fetch crate sources
+        run: cargo fetch --locked
+
+      - name: Regenerate the notice
+        run: cargo about generate --locked --fail -c about.toml -o THIRD-PARTY-LICENSES.md about.hbs
+
+      - name: The committed copy matches
+        run: git diff --exit-code -- THIRD-PARTY-LICENSES.md
+
   coverage:
     name: line coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest
@@ -523,7 +559,7 @@ jobs:
   # ---------------------------------------------------------------------------
   report:
     name: report nightly status
-    needs: [ignored-tests, cargo-audit, coverage]
+    needs: [ignored-tests, cargo-audit, third-party-licenses, coverage]
     # always(): 失敗した時こそ動く必要がある。scheduled 実行と、明示的に
     # 頼まれた手動実行だけに絞り、branch での試し撃ちが issue を作らないようにする。
     if: always() && (github.event_name == 'schedule' || inputs.notify)
@@ -570,7 +606,8 @@ jobs:
           Run: $RUN_URL
 
           The heavy checks live only here - \`--include-ignored\`, \`cargo audit\`,
-          the per-file coverage floor and the golden-query retrieval gate. While
+          the THIRD-PARTY-LICENSES.md drift check, the per-file coverage floor
+          and the golden-query retrieval gate. While
           this is red that whole layer is off, so a green CI on a pull request is
           saying less than it looks like it is.
 
