@@ -160,11 +160,16 @@ severity は **`critical` / `high` / `medium` / `low`** の 4 段 (同 file の 
 | Verdict | controller の手 |
 |---|---|
 | `approve` | sweep を済ませて push |
-| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。`[low]` は内容を見て即決 |
+| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。`[low]` だけなら内容を見て即決: **skip なら push してよい、取り込むなら diff が変わるので次の round を打つ** (その round も上限に数える) |
 | exit ≠ 0 / `Verdict` 行が無い | `local-N.err` を読む。model 拒否 (400 / 404) / capacity / runtime の残留を切り分ける。判定材料が無いだけで「指摘なし」ではない |
 
-**上限は push 1 回につき 3 round** (memory `feedback_local_codex_before_github_rounds`、2026-09-09 の合意)。
-3 round で収束しない = fix が次の指摘を生んでいる (台帳 category 6) = user に相談 (介入ポイント 3)。
+**上限は push 1 回につき 3 round** — 打った回数で数える (approve で終わる round も、`[low]` を取り込んで
+打ち直した round も 1 つ)。上限の出所は 2026-09-09 の user 判断「ローカルで収束させてから GitHub round」
+(`.dev/knowledge/feature-58-summary.md` の「後続」節に記録。GitHub round の上限が 3 / 5 なのと同じ理由 =
+cost と、収束しない loop は spec の問題という判定)。**3 round 目が `needs-attention` で終わったら**:
+`[critical]` / `[high]` が残っているなら fix が次の指摘を生んでいる (台帳 category 6) = user に相談
+(介入ポイント 3)。`[medium]` / `[low]` だけなら取り込んで **4 round 目は打たず push** し、取り込んだ内容を
+PR 本文に書いて GitHub round に確認させる (GitHub が最終確認、の役割どおり)。自分で上限を上げない。
 **fix を書いたら「その fix の最悪ケース」を自分で 1 つ書いてから出す** — r10 の fix (KNN の page が
 空でも広げる) は r11 で「match 0 の corpus が cap まで広げ続ける」と返った。
 

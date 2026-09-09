@@ -116,7 +116,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 
 0. **push の前に 2 つ — この branch を push するたび、毎回。** PR を開く前も、review の指摘を直した後も同じで、P0/P1 の fix だけでなく**収束した round の P2/P3 を取り込んだ push も含む**
    - (a) **doc comment の名前を洗う**。指摘された行だけ直して push すると同じ形が次の round で返り、収束後の取り込みはそのまま merge へ行く (#234 / #236 はそれで round を溶かした)。手順は `.claude/skills/codex-review/SKILL.md` の「push する前に doc comment の名前を洗う」節
-   - (b) **ローカルの Codex (adversarial review) を収束させてから push する**。役割は「ローカル = 明白な違反の前掃除、GitHub = 最終確認」(2026-09-09 の user 判断。feature-58 で GitHub round が P2 の連鎖になった後に決めた)。実行形 / focus の定型 / 上限 (push 1 回につき 3 round、超えたら介入ポイント 3) は同 SKILL.md の「push する前にローカルの Codex で前掃除する」節
+   - (b) **ローカルの Codex (adversarial review) を収束させてから push する**。役割は「ローカル = 明白な違反の前掃除、GitHub = 最終確認」(2026-09-09 の user 判断。feature-58 で GitHub round が P2 の連鎖になった後に決めた)。実行形 / focus の定型 / 上限 (push 1 回につき 3 round) と上限に達した時の手は同 SKILL.md の「push する前にローカルの Codex で前掃除する」節。上限で critical / high が残ったら介入ポイント 3
    - どちらも、コマンドと判定はそこにあり、ここには写さない (step 4 の注意と同じ理由)
 1. `git push -u origin feature/<feature-NN-name>-pr-<n>` で push
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
@@ -212,7 +212,7 @@ main の状態 (実測) / 残っているもの / 測って分かったこと / 
 
 ただし以下は必ず確認 (介入ポイント 3):
 - spec で承認した API surface / scope / 設計原則を覆す指摘
-- 5 round 経過しても収束しない review loop (ローカル Codex は push 1 回につき 3 round で同じ扱い)
+- 5 round 経過しても収束しない review loop (ローカル Codex は push 1 回につき 3 round で、critical / high が残ったまま上限に達した時)
 - audit で release-blocker と判断される指摘
 - 想定外のリポジトリ状態 (uncommitted changes / 別 branch にいる等) を検出した時
 
