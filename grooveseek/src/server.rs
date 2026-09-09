@@ -63,8 +63,8 @@ use documents::{
 
 pub use search::{
     RERANK_BY_DEFAULT, SEARCH_LIMIT_MAX, clamp_search_limit, compile_path_globs,
-    compute_low_confidence, compute_match_spans, field_filters_from_params, run_search_pipeline,
-    should_rerank, validate_field_filters, validate_filter_list,
+    compute_low_confidence, compute_match_spans, run_search_pipeline, should_rerank,
+    validate_field_filters, validate_filter_list,
 };
 
 // The rest are reached only from tests, and the compiler is what said so: left
@@ -84,7 +84,7 @@ pub(crate) use search::{FILTER_ITEM_MAX_BYTES, FILTER_LIST_MAX_ITEMS, SEARCH_QUE
 #[cfg(test)]
 use search::{
     MATCH_SPAN_CONTENT_MAX_BYTES, MATCH_SPAN_MAX_COUNT, compute_reranker_input_limit,
-    merge_disjoint_spans,
+    field_filters_from_params, merge_disjoint_spans,
 };
 
 /// Request-independent server state.
@@ -166,26 +166,6 @@ pub struct KbServer {
 // Tool parameter types
 // ---------------------------------------------------------------------------
 
-/// One value or a list of values for a declared-field filter (feature-58).
-/// The tool accepts both spellings so `{"status": "active"}` and
-/// `{"status": ["active"]}` are the same request; the echo always answers
-/// with the list.
-#[derive(Deserialize, schemars::JsonSchema, Clone, Debug)]
-#[serde(untagged)]
-pub(crate) enum FieldValues {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl FieldValues {
-    pub(crate) fn into_vec(self) -> Vec<String> {
-        match self {
-            FieldValues::One(s) => vec![s],
-            FieldValues::Many(v) => v,
-        }
-    }
-}
-
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 struct SearchParams {
@@ -225,18 +205,18 @@ struct SearchParams {
     /// Inclusive upper bound on `frontmatter.date` (lexicographic, ISO-8601 friendly).
     date_to: Option<String>,
     /// (v1.9.0+) Keep only documents whose frontmatter holds one of the given
-    /// values for each key: `{"status": "active", "environment": ["dev", "prod"]}`
+    /// values for each key: `{"status": ["active"], "environment": ["dev", "prod"]}`
     /// means status is active AND environment is dev or prod. Exact string
     /// comparison. Only keys `groove-schema.toml` declared when the index was
     /// built are in the index; a key it did not declare matches nothing.
     /// A document without the key does not match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    fields: Option<std::collections::BTreeMap<String, FieldValues>>,
+    fields: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// (v1.9.0+) Drop documents whose frontmatter holds one of the given
-    /// values for any key: `{"status": "deprecated"}`. A document without the
-    /// key is kept. Same shape and rules as `fields`.
+    /// values for any key: `{"status": ["deprecated"]}`. A document without
+    /// the key is kept. Same shape and rules as `fields`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    fields_not: Option<std::collections::BTreeMap<String, FieldValues>>,
+    fields_not: Option<std::collections::BTreeMap<String, Vec<String>>>,
 
     // ----- low-confidence cutoff -----
     /// Rank-based ratio threshold for trimming low-confidence tail results.
@@ -2225,19 +2205,68 @@ mod tests {
     }
 
     #[test]
-    fn a_string_and_a_one_element_list_are_the_same_field_filter() {
-        let raw: std::collections::BTreeMap<String, FieldValues> = serde_json::from_str(
-            r#"{"status": "active", "team": ["core", "core", "infra"], "empty": []}"#,
-        )
-        .unwrap();
+    fn a_fields_object_of_lists_normalises_one_way() {
+        let raw: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_str(r#"{"team": ["core", "core", "infra"], "empty": []}"#).unwrap();
         let f = field_filters_from_params(Some(raw));
-        assert_eq!(f.get("status").unwrap(), &vec!["active".to_string()]);
         assert_eq!(
             f.get("team").unwrap(),
             &vec!["core".to_string(), "infra".to_string()]
         );
         assert!(!f.contains_key("empty"));
         assert!(field_filters_from_params(None).is_empty());
+    }
+
+    /// The MCP shape for a declared-field filter is array-only (feature-58
+    /// review round 1): `key -> string[]`, the same shape `tags_any` already
+    /// uses, never `key -> string | string[]`. An untagged `string | Vec`
+    /// enum would have advertised `anyOf`, the union `schema_compat.rs`
+    /// exists to strip for runtimes that cannot compile one into a decoding
+    /// grammar (issue #75) — this pins that `fields` / `fields_not` never put
+    /// one back, on the schema `rmcp` actually serves.
+    #[test]
+    fn the_search_tool_schema_has_no_union_for_field_filters() {
+        use rmcp::handler::server::common::schema_for_type;
+        let schema = schema_for_type::<SearchParams>();
+        let value = serde_json::Value::Object((*schema).clone());
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains("anyOf"), "schema carries anyOf: {text}");
+        assert!(!text.contains("oneOf"), "schema carries oneOf: {text}");
+
+        // Follow a `$ref` into `$defs` if schemars ever starts emitting one
+        // for this shape (it currently inlines it, since neither `BTreeMap`
+        // nor `Vec` is a named type schemars gives its own definition).
+        fn resolve<'a>(
+            root: &'a serde_json::Value,
+            node: &'a serde_json::Value,
+        ) -> &'a serde_json::Value {
+            match node.get("$ref").and_then(|r| r.as_str()) {
+                Some(r) => {
+                    let key = r.strip_prefix("#/$defs/").expect("unexpected $ref shape");
+                    &root["$defs"][key]
+                }
+                None => node,
+            }
+        }
+
+        let fields_schema = resolve(&value, &value["properties"]["fields"]);
+        assert_eq!(
+            fields_schema["type"].as_str(),
+            Some("object"),
+            "fields must be a plain object: {fields_schema}"
+        );
+        let additional = resolve(&value, &fields_schema["additionalProperties"]);
+        assert_eq!(
+            additional["type"].as_str(),
+            Some("array"),
+            "fields' values must be arrays, never a bare string: {additional}"
+        );
+        let items = resolve(&value, &additional["items"]);
+        assert_eq!(
+            items["type"].as_str(),
+            Some("string"),
+            "fields' array elements must be strings: {items}"
+        );
     }
 
     #[test]

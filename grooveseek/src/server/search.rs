@@ -845,20 +845,17 @@ pub fn validate_filter_list(name: &str, items: &[String]) -> anyhow::Result<()> 
 }
 
 /// The declared-field filters of a request as one [`crate::db::FieldFilters`]
-/// (feature-58): a string becomes a one-element list, lists are joined per
-/// key, duplicates and keys left empty are dropped. `None` is an empty map.
+/// (feature-58): duplicate values are dropped, and a key left with no values
+/// is dropped too. `None` is an empty map.
 ///
-/// `FieldValues` stays `pub(crate)` — it is the untagged JSON bridge type the
-/// `fields` / `fields_not` tool parameters deserialize into, not part of the
-/// public API — while this function is `pub` so `main.rs`, a separate crate,
-/// can still reach it (in practice always with `None`, since the type it
-/// would otherwise have to name is not visible there). The mismatch is
-/// intentional, not a leak to fix; `private_interfaces` is silenced for it.
-#[allow(private_interfaces)]
-pub fn field_filters_from_params(
-    raw: Option<std::collections::BTreeMap<String, crate::server::FieldValues>>,
+/// `pub(crate)`, not `pub`: the command line never calls this — it folds its
+/// own `--field` / `--field-not` pairs through
+/// [`crate::db::normalize_field_filters`] directly — so the MCP tool body in
+/// this module is the only caller outside `mod tests`.
+pub(crate) fn field_filters_from_params(
+    raw: Option<std::collections::BTreeMap<String, Vec<String>>>,
 ) -> crate::db::FieldFilters {
-    crate::db::normalize_field_filters(raw.into_iter().flatten().map(|(k, v)| (k, v.into_vec())))
+    crate::db::normalize_field_filters(raw.into_iter().flatten())
 }
 
 /// The bounds of a declared-field filter, through [`validate_filter_list`]
