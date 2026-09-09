@@ -875,8 +875,9 @@ fn the_mcp_search_tool_filters_on_declared_fields_and_echoes_them() {
 }
 
 /// Delete `index_meta.declared_fields` the way an interrupted refresh leaves it
-/// (`rebuild_index` clears the key when a refresh starts and writes it back only
-/// at the end of a completed pass), without touching the rows it protects.
+/// ([`grooveseek::indexer::rebuild_index`] clears the key when a refresh starts and
+/// writes it back only at the end of a completed pass), without touching the rows
+/// it protects.
 fn clear_declared_meta(kb: &Path) {
     let conn = rusqlite::Connection::open(kb.parent().unwrap().join(".groove.db")).unwrap();
     conn.execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])
@@ -989,7 +990,8 @@ fn the_mcp_search_tool_refuses_a_field_filter_while_the_declared_set_is_pending(
 /// arguments alone, **before** the database is opened or the embedding model loaded: the
 /// knowledge base here has never been indexed, and after the refused call there must still
 /// be no `.groove.db` beside it. (The model load is not observable from outside; the database
-/// file is, and in `Commands::Search` the two sit together, the check now ahead of both.)
+/// file is, and in `main.rs`'s `Commands::Search` arm the two sit together, the check now
+/// ahead of both.)
 #[test]
 fn a_field_list_past_the_bound_is_refused_before_the_database_is_opened() {
     let kb = corpus();

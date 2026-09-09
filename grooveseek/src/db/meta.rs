@@ -792,12 +792,13 @@ impl Database {
     /// (feature-58, local Codex on PR #291 after round 10) `index_meta.declared_fields`
     /// goes in the **same** transaction as the `document_fields` wipe. The key says
     /// "these rows were written under this declared set"; once the rows are gone that
-    /// claim is false, and `rebuild_index` only clears the key later, in its own
-    /// commit. In the gap -- or for good, if the process dies between the two -- a
+    /// claim is false, and [`crate::indexer::rebuild_index`] only clears the key later, in
+    /// its own commit. In the gap -- or for good, if the process dies between the two -- a
     /// search carrying `fields` / `fields_not` would read a recorded generation over
     /// an empty (then partially rebuilt) table and answer "no match" instead of the
-    /// refusal [`Database::refuse_field_filters_while_pending`] exists to give. Absent
-    /// is the state `rebuild_index` expects after `force` anyway (it clears the key on
+    /// refusal the search legs exist to give (`refuse_field_filters_while_pending` in
+    /// `db/search.rs`, the private check behind [`crate::db::FIELD_FILTERS_PENDING`]). Absent
+    /// is the state [`crate::indexer::rebuild_index`] expects after `force` anyway (it clears the key on
     /// `force` itself), so this only moves the clear to where it is atomic with the
     /// wipe it belongs to.
     pub fn reset_for_model(&self, model: &str, dim: u32) -> Result<()> {

@@ -202,7 +202,8 @@ fn test_off_mode_watcher_rename_keeps_fast_path() {
 /// (codex P2 round 10 on PR #291) A watcher rename that crosses a parser **and** changes the
 /// bytes -- here a Markdown document renamed to `.pdf` with its content edited, so the
 /// stored hash no longer matches -- goes through the changed-content arm of
-/// `rename_single_file` rather than the forced same-byte reparse round 9 settled. When the
+/// [`grooveseek::indexer::rename_single_file`] rather than the forced same-byte reparse
+/// round 9 settled. When the
 /// destination parser then refuses the bytes (the PDF parser cannot read Markdown), the row
 /// under the new path is still whatever the Markdown parser wrote: chunks, title,
 /// `document_fields`. Round 10 settles that arm too, so the row is dropped exactly as it is

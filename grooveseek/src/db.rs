@@ -1058,10 +1058,10 @@ mod tests {
     }
 
     /// (local Codex on PR #291 after round 10) The generation key goes with the
-    /// rows it vouches for: after `reset_for_model` wiped `document_fields`, the
-    /// key must be absent (pending) in the same commit, not still naming a set no
-    /// row was written under -- otherwise a field-filtered search in the gap
-    /// before `rebuild_index` clears it answers "no match" instead of refusing.
+    /// rows it vouches for: after [`Database::reset_for_model`] wiped `document_fields`,
+    /// the key must be absent (pending) in the same commit, not still naming a set no
+    /// row was written under -- otherwise a field-filtered search in the gap before
+    /// [`crate::indexer::rebuild_index`] clears it answers "no match" instead of refusing.
     #[test]
     fn reset_for_model_leaves_the_declared_set_pending_with_the_rows_it_wiped() {
         let db = db_with_384();
@@ -5277,8 +5277,8 @@ mod tests {
     /// then: `[]` and a real list are recorded answers, and a request without a
     /// field filter is not gated at all. [`Database::refuse_field_filters_while_pending`]'s
     /// doc has why the absent state cannot be answered from. The hybrid path and
-    /// (local Codex after round 10) the single-leg entry points `search_similar` /
-    /// `search_fts_candidates` are all asserted, since the guard sits in the legs.
+    /// (local Codex after round 10) the single-leg entry points [`Database::search_similar`] /
+    /// [`Database::search_fts_candidates`] are all asserted, since the guard sits in the legs.
     #[test]
     fn a_field_filter_is_refused_until_the_index_records_its_declared_set() {
         let db = db_with_declared_fields();

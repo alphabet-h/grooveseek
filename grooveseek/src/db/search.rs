@@ -459,15 +459,15 @@ impl Database {
     /// (feature-58, codex P2 round 10 on PR #291) A `fields` / `fields_not` filter
     /// is refused while `index_meta.declared_fields` is **absent**.
     ///
-    /// `rebuild_index` clears that key when a schema refresh starts and writes it
-    /// back only when the pass completed (`Database::clear_declared_fields`'s doc
-    /// has the state machine). In between -- a refresh in progress, or one that
-    /// was interrupted or stopped short on an unreadable document -- `document_fields`
-    /// can hold rows from **both** the old and the new declared set, so a predicate
-    /// that reads it would answer from a mixture and call it a result. The
-    /// watcher paths already treat that state as "do not touch the rows"
-    /// (`declared_fields_recorded` returning `None`); this is the same rule on the
-    /// read side.
+    /// [`crate::indexer::rebuild_index`] clears that key when a schema refresh starts
+    /// and writes it back only when the pass completed
+    /// ([`Database::clear_declared_fields`]'s doc has the state machine). In between --
+    /// a refresh in progress, or one that was interrupted or stopped short on an
+    /// unreadable document -- `document_fields` can hold rows from **both** the old
+    /// and the new declared set, so a predicate that reads it would answer from a
+    /// mixture and call it a result. The watcher paths already treat that state as
+    /// "do not touch the rows" (`indexer.rs`'s private `declared_fields_recorded`
+    /// returning `None`); this is the same rule on the read side.
     ///
     /// Here rather than in the CLI arm or the MCP tool body, and in **both legs**
     /// rather than only where the hybrid search joins them: the refusal has one
@@ -478,8 +478,8 @@ impl Database {
     /// and the single-leg `pub` / `pub(crate)` methods ([`Database::search_similar`],
     /// [`Database::search_fts_candidates`]) a library caller or a sweep uses directly
     /// (local Codex on PR #291 after round 10: gating only
-    /// [`Database::search_split_candidates`] left `search_similar` answering from the
-    /// pending state). A hybrid search therefore asks twice, one tiny `index_meta` read
+    /// [`Database::search_split_candidates`] left [`Database::search_similar`] answering
+    /// from the pending state). A hybrid search therefore asks twice, one tiny `index_meta` read
     /// per leg, and only when a field filter is present. An empty map is not a filter
     /// and is not refused; `[]` (a completed pass that declared nothing) is a recorded
     /// answer, and a filter against it simply matches nothing, as documented.
