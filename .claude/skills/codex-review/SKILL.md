@@ -115,7 +115,7 @@ plugin の agent 定義は `task` だけを forward し、`adversarial-review` �
 ```bash
 S=<scratchpad>
 CODEX_PLUGIN=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ | sort -V | tail -1)
-node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --base main --scope branch --model gpt-5.6-terra --cwd <abs repo> "$(cat "$S/local-1-focus.txt")" > "$S/local-1.out" 2> "$S/local-1.err"; echo exit=$?
+node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --base main --model gpt-5.6-terra --cwd <abs repo> "$(cat "$S/local-1-focus.txt")" > "$S/local-1.out" 2> "$S/local-1.err"; echo exit=$?
 ```
 
 - path は `ls | sort -V | tail -1` で解決する。`${CLAUDE_PLUGIN_ROOT}` は plugin 自身の command /
@@ -128,7 +128,10 @@ node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --ba
 - npm で `@openai/codex` を更新した直後は、更新前に起動した shared runtime の `codex.exe` が残って
   同じ 400 を返す。`Get-Process codex` の StartTime が更新より前なら `taskkill` する (desktop app の
   `AppData\Local\OpenAI\Codex\bin\…\codex.exe` は別物、触らない)
-- `--scope branch` は `main...HEAD` の diff を見る。`.md` だけの diff でも動く
+- 対象を決めるのは **`--base main`** (= `main...HEAD` の diff。plugin の `scripts/lib/git.mjs` の
+  `resolveReviewTarget` は `base` があれば `scope` を見ない)。`--scope branch` は `--base` 無しの時に
+  default branch を検出する別経路なので、`--base main` と並べて書かない (ローカル r1 の medium)。
+  **未 commit の変更は対象外** — commit してから打つ。`.md` だけの diff でも動く
 
 ### focus の書き方
 
@@ -148,13 +151,16 @@ plugin の `prompts/adversarial-review.md` の `User focus:` に差し込まれ�
 
 ### 結果の読み方
 
-stdout に `Verdict: approve` か `Verdict: needs-attention` が 1 行、続いて
-`- [high|medium|low] <title> (<file>:<line>)` (plugin の `scripts/lib/render.mjs` の `renderReviewResult`)。
+stdout の並びは header (`# Codex Adversarial Review`) / `Target:` / **`Verdict: approve|needs-attention`** /
+summary 1 段落 / `Findings:` か `No material findings.` (plugin の `scripts/lib/render.mjs` の
+`renderReviewResult`)。finding は `- [<severity>] <title> (<file>:<line>)` + 本文 + `Recommendation:` で、
+severity は **`critical` / `high` / `medium` / `low`** の 4 段 (同 file の `severityRank`、この順に並ぶ)。
+`grep -n '^Verdict:'` と `grep -n '^- \['` で引く — 隣接に頼らない。
 
 | Verdict | controller の手 |
 |---|---|
 | `approve` | sweep を済ませて push |
-| `needs-attention` | `[high]` / `[medium]` を読んで取り込む。反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目) |
+| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。`[low]` は内容を見て即決 |
 | exit ≠ 0 / `Verdict` 行が無い | `local-N.err` を読む。model 拒否 (400 / 404) / capacity / runtime の残留を切り分ける。判定材料が無いだけで「指摘なし」ではない |
 
 **上限は push 1 回につき 3 round** (memory `feedback_local_codex_before_github_rounds`、2026-09-09 の合意)。
