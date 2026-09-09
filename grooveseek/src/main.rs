@@ -2918,8 +2918,8 @@ mod documented_flags {
                 "cargo test -- --nocapture, in deployment-topologies.md",
             ),
             (
-                "owner",
-                "gh attestation verify --owner, in the README's archive note",
+                "repo",
+                "gh attestation verify --repo, in the README's archive note",
             ),
         ];
 

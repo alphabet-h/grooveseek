@@ -31,7 +31,7 @@ include = ["THIRD-PARTY-LICENSES.md"]
 
 # Sign every archive with a GitHub artifact attestation (Sigstore, public
 # repositories only). Verify a download with
-# `gh attestation verify <archive> --owner alphabet-h`. Changing this key
+# `gh attestation verify <archive> --repo alphabet-h/grooveseek`. Changing this key
 # means re-running `dist generate` so release.yml gains the attest step.
 github-attestations = true
 

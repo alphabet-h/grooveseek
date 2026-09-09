@@ -53,7 +53,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 
 > **grammar が焼き込まれていない言語は archive がもう 1 つ要る。** Rust は `groove` 本体に入っているが、それ以外の言語はそれぞれ別ダウンロード — `groove-grammar-<言語>-<target>.tar.xz` (Windows は `.zip`) が上の表と同じターゲットぶんある。現在公開しているのは `groove-grammar-python` (v1.3.0 以降、`[parsers].enabled` には `"py"`) と `groove-grammar-php` (v1.5.0 以降、同じく `"php"`)。展開したライブラリを `grammar_dir` が指すディレクトリに置き、その id を `[parsers].enabled` に足す。自動 DL は一切行われず、そのキーが言語を名指さない限りライブラリは開かれない — [grammar plugin の置き方](docs/clients.ja.md#grammar-plugin-の置き方-v130) を参照。
 
-各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `THIRD-PARTY-LICENSES.md` (リンクされている全 crate の notice) / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。アーカイブには GitHub の artifact attestation も付いており、`gh attestation verify <archive> --owner alphabet-h` で「この repo の release workflow が build した物か」を検証できる。
+各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `THIRD-PARTY-LICENSES.md` (リンクされている全 crate の notice) / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。アーカイブには GitHub の artifact attestation も付いており、`gh attestation verify <archive> --repo alphabet-h/grooveseek` で「この repo の release workflow が build した物か」を検証できる。
 
 ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](docs/clients.ja.md#huggingface-の-tls-失敗への対処-初回-dl-時) を参照。
 
