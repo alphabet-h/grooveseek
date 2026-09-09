@@ -71,10 +71,15 @@ fn build_initial_index(
     .expect("verify_embedding_meta");
     let mut embedder = Embedder::with_model(ModelChoice::BgeSmallEnV15).expect("load embedder");
     let registry = Registry::defaults();
+    // (codex P2 round 3 on PR #291) `rebuild_index` takes the loaded schema rather than
+    // reading the path itself; this KB has none, so `None` is exactly what a real caller's
+    // `load_declared_schema` would read back too.
+    let schema = grooveseek::indexer::load_declared_schema(layout.kb()).unwrap();
     indexer::rebuild_index(
         &db,
         &mut embedder,
         layout.kb(),
+        schema,
         false,
         None,
         &[],
@@ -191,5 +196,331 @@ fn test_off_mode_watcher_rename_keeps_fast_path() {
     assert!(
         ctx_after.is_none(),
         "Off mode never stores context_text, got: {ctx_after:?}"
+    );
+}
+
+/// (codex P2 round 10 on PR #291) A watcher rename that crosses a parser **and** changes the
+/// bytes -- here a Markdown document renamed to `.pdf` with its content edited, so the
+/// stored hash no longer matches -- goes through the changed-content arm of
+/// [`grooveseek::indexer::rename_single_file`] rather than the forced same-byte reparse
+/// round 9 settled. When the
+/// destination parser then refuses the bytes (the PDF parser cannot read Markdown), the row
+/// under the new path is still whatever the Markdown parser wrote: chunks, title,
+/// `document_fields`. Round 10 settles that arm too, so the row is dropped exactly as it is
+/// for the same-byte case
+/// (`tests/index_declared_fields.rs::a_cross_parser_rename_whose_destination_parser_refuses_the_bytes_drops_the_row`).
+///
+/// Same `#[ignore]` policy as the tests above: building the initial index loads the model.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_changed_bytes_cross_parser_rename_that_the_new_parser_refuses_drops_the_row() {
+    let layout = TempKbLayout::new("groove-watcher-rename-cross-parser");
+    layout.write("runbook.md", NO_TITLE_MD);
+    let db_path = layout.root().join(".groove.db");
+    let db = Database::open(db_path.to_str().expect("db path utf-8")).expect("open db");
+    db.verify_embedding_meta(
+        ModelChoice::BgeSmallEnV15.model_id(),
+        ModelChoice::BgeSmallEnV15.dimension() as u32,
+    )
+    .expect("verify_embedding_meta");
+    let mut embedder = Embedder::with_model(ModelChoice::BgeSmallEnV15).expect("load embedder");
+    // `.pdf` is not in `Registry::defaults()`; the rename has to land on a parser that is
+    // registered, or the crossing would be into "no parser at all" rather than into one
+    // that reads the bytes and refuses them.
+    let registry =
+        Registry::from_enabled(&["md".to_string(), "pdf".to_string()]).expect("md + pdf registry");
+    let schema = grooveseek::indexer::load_declared_schema(layout.kb()).unwrap();
+    indexer::rebuild_index(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        schema,
+        false,
+        None,
+        &[],
+        &registry,
+        ProgressReporter::new(ProgressMode::Quiet),
+        ContextMode::Off,
+    )
+    .expect("initial rebuild_index");
+    let _ = chunk_row_for_path(&db_path, "runbook.md");
+
+    // Rename across parsers *and* change the bytes, so the stored hash no longer matches
+    // and the same-byte forced-reparse arm is not the one taken.
+    std::fs::rename(
+        layout.kb().join("runbook.md"),
+        layout.kb().join("runbook.pdf"),
+    )
+    .expect("rename on disk");
+    std::fs::write(
+        layout.kb().join("runbook.pdf"),
+        format!("{NO_TITLE_MD}\nEdited after the rename, so the hash differs.\n"),
+    )
+    .expect("edit after rename");
+
+    let outcome = indexer::rename_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "runbook.md",
+        "runbook.pdf",
+        None,
+        &registry,
+    )
+    .expect("rename_single_file");
+    assert_eq!(
+        outcome,
+        RenameOutcome::RenamedButRefusedAndDropped,
+        "the PDF parser cannot read Markdown bytes, and the row was dropped, so the outcome \
+         must say so (codex P2 round 13): {outcome:?}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
+    for path in ["runbook.md", "runbook.pdf"] {
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "{path}: the destination parser refused the bytes, so the Markdown parser's \
+             stale row must be dropped, not kept under the new path"
+        );
+    }
+}
+
+/// (codex P2 round 11 on PR #291) The two exits of [`grooveseek::indexer::rename_single_file`]
+/// that return
+/// **before** any parse -- the size cap, and the read refusal -- used to sit ahead of the
+/// parser-crossing check, so a Markdown row renamed to an oversized `.pdf` kept the
+/// Markdown parser's chunks and `document_fields` under the new path, and a later full
+/// index preserved it as an oversized skip. The crossing is now decided right after the row
+/// moves, and both exits settle it the way the reparse arms do: the row is dropped.
+///
+/// The size cap is exercised here (a `.pdf` past the binary cap); the read refusal shares
+/// the same three lines and the same helper, and has no deterministic trigger from a test.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_cross_parser_rename_to_an_oversized_destination_drops_the_row() {
+    let layout = TempKbLayout::new("groove-watcher-rename-cross-parser-oversized");
+    layout.write("runbook.md", NO_TITLE_MD);
+    let db_path = layout.root().join(".groove.db");
+    let db = Database::open(db_path.to_str().expect("db path utf-8")).expect("open db");
+    db.verify_embedding_meta(
+        ModelChoice::BgeSmallEnV15.model_id(),
+        ModelChoice::BgeSmallEnV15.dimension() as u32,
+    )
+    .expect("verify_embedding_meta");
+    let mut embedder = Embedder::with_model(ModelChoice::BgeSmallEnV15).expect("load embedder");
+    let registry =
+        Registry::from_enabled(&["md".to_string(), "pdf".to_string()]).expect("md + pdf registry");
+    let schema = grooveseek::indexer::load_declared_schema(layout.kb()).unwrap();
+    indexer::rebuild_index(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        schema,
+        false,
+        None,
+        &[],
+        &registry,
+        ProgressReporter::new(ProgressMode::Quiet),
+        ContextMode::Off,
+    )
+    .expect("initial rebuild_index");
+    let _ = chunk_row_for_path(&db_path, "runbook.md");
+
+    // Rename across parsers and make the destination one byte past the binary cap, so
+    // `rename_single_file` takes the size-cap exit before reading or parsing anything.
+    std::fs::rename(
+        layout.kb().join("runbook.md"),
+        layout.kb().join("runbook.pdf"),
+    )
+    .expect("rename on disk");
+    let oversized = std::fs::File::create(layout.kb().join("runbook.pdf")).expect("create");
+    oversized
+        .set_len(grooveseek::parser::MAX_RAW_BINARY_BYTES + 1)
+        .expect("grow past the cap");
+    drop(oversized);
+
+    let outcome = indexer::rename_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "runbook.md",
+        "runbook.pdf",
+        None,
+        &registry,
+    )
+    .expect("rename_single_file");
+    assert_eq!(
+        outcome,
+        RenameOutcome::RenamedSizeCappedAndDropped,
+        "the destination is past the cap and the rename crossed a parser, so the size-cap exit \
+         is the one taken and it reports the drop (codex P2 round 12): {outcome:?}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
+    for path in ["runbook.md", "runbook.pdf"] {
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "{path}: the rename crossed a parser and nothing rewrote the row, so the size-cap \
+             exit must drop it rather than keep the Markdown parser's row under the new path"
+        );
+    }
+}
+
+/// (codex P2 round 12 on PR #291) The watcher side of the pass-token handshake: while a
+/// refresh pass in another process has the generation cleared (its token is recorded), a
+/// watcher reindex of a changed document writes the document -- new hash, new chunks -- but
+/// leaves its `document_fields` rows exactly as the previous generation left them, and
+/// records the pass token as the dirty mark, so that pass will not record the new
+/// generation over rows it never rewrote. The pass side of the handshake is
+/// `grooveseek/src/indexer.rs`'s unit test
+/// `a_watcher_write_under_the_running_pass_keeps_the_generation_pending`.
+///
+/// Same `#[ignore]` policy as the tests above: the reindex embeds the changed document.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_reindex_under_a_pending_generation_keeps_the_rows_and_marks_the_pass() {
+    let layout = TempKbLayout::new("groove-watcher-reindex-pending");
+    layout.write("groove-schema.toml", "[fields.status]\n");
+    layout.write(
+        "runbook.md",
+        "---\nstatus: active\n---\n\n## Section\n\nBody content that is long enough to pass the quality filter comfortably, mentioning the pending generation handshake.\n",
+    );
+    let (db, mut embedder, registry, db_path) = build_initial_index(&layout, ContextMode::Off);
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
+    let rows_of = |path: &str| -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.key, f.value FROM document_fields f JOIN documents d ON d.id = f.document_id \
+                 WHERE d.path = ?1 ORDER BY f.key, f.value",
+            )
+            .unwrap();
+        stmt.query_map([path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows_of("runbook.md"),
+        vec![("status".to_string(), "active".to_string())],
+        "the completed index wrote the declared row"
+    );
+    let (id_before, _) = chunk_row_for_path(&db_path, "runbook.md");
+
+    // Another process starts a refresh pass: generation cleared, token recorded. (The
+    // private `begin_declared_fields_pass` does exactly these two writes in one transaction.)
+    db.clear_declared_fields().expect("clear generation");
+    db.write_declared_fields_pass("other-process-pass")
+        .expect("record pass token");
+
+    // The document changes and the watcher reindexes it while the pass is still running.
+    layout.write(
+        "runbook.md",
+        "---\nstatus: deprecated\n---\n\n## Section\n\nBody content that is long enough to pass the quality filter comfortably, mentioning the pending generation handshake, edited.\n",
+    );
+    let outcome = indexer::reindex_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "runbook.md",
+        None,
+        &registry,
+    )
+    .expect("reindex_single_file");
+    assert!(
+        matches!(outcome, indexer::SingleResult::Updated { .. }),
+        "the content changed, so the watcher reindexes it: {outcome:?}"
+    );
+
+    let (id_after, _) = chunk_row_for_path(&db_path, "runbook.md");
+    assert_ne!(
+        id_before, id_after,
+        "the document was rewritten (new chunk row)"
+    );
+    assert_eq!(
+        rows_of("runbook.md"),
+        vec![("status".to_string(), "active".to_string())],
+        "the rows are the previous generation's, untouched: the watcher does not know the set"
+    );
+    assert_eq!(
+        db.read_declared_fields_dirty()
+            .expect("read dirty mark")
+            .as_deref(),
+        Some("other-process-pass"),
+        "the watcher recorded that it wrote under the running pass"
+    );
+    assert_eq!(
+        db.read_declared_fields().expect("read generation"),
+        None,
+        "the watcher never records a generation"
+    );
+}
+
+/// (local Codex on PR #291 after round 13) A same-parser rename in Static mode is forced
+/// through a reparse so the path-derived breadcrumb follows the new name. When that reparse
+/// comes back [`grooveseek::indexer::SingleResult::Skipped`] -- here, the one heading is
+/// excluded, so there is nothing to chunk --
+/// nothing was written: the row under the new path still holds the previous chunks and the
+/// previous path's breadcrumb. The row is deliberately kept, but the outcome must not be the
+/// plain [`grooveseek::indexer::RenameOutcome::Renamed`] (= content identical, path updated)
+/// the watcher reports as a success.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_static_mode_rename_whose_forced_reparse_is_skipped_reports_it() {
+    let layout = TempKbLayout::new("groove-watcher-rename-static-skipped");
+    layout.write("old-widget-doc.md", NO_TITLE_MD);
+    let (db, mut embedder, registry, db_path) = build_initial_index(&layout, ContextMode::Static);
+    let (id_before, ctx_before) = chunk_row_for_path(&db_path, "old-widget-doc.md");
+    assert!(
+        ctx_before
+            .as_deref()
+            .is_some_and(|c| c.contains("old widget doc"))
+    );
+
+    std::fs::rename(
+        layout.kb().join("old-widget-doc.md"),
+        layout.kb().join("new-gadget-doc.md"),
+    )
+    .expect("rename on disk");
+
+    // The forced reparse runs under a heading exclusion that leaves nothing to chunk.
+    let exclude = vec!["Section".to_string()];
+    let outcome = indexer::rename_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "old-widget-doc.md",
+        "new-gadget-doc.md",
+        Some(&exclude),
+        &registry,
+    )
+    .expect("rename_single_file");
+    assert_eq!(
+        outcome,
+        RenameOutcome::RenamedButNotReindexed,
+        "the forced reparse was skipped, so the outcome must say the row was not rewritten: {outcome:?}"
+    );
+
+    let (id_after, ctx_after) = chunk_row_for_path(&db_path, "new-gadget-doc.md");
+    assert_eq!(
+        id_before, id_after,
+        "the row is kept, not rewritten and not dropped"
+    );
+    assert_eq!(
+        ctx_before, ctx_after,
+        "and it still carries the previous path's breadcrumb -- which is what the outcome reports"
     );
 }

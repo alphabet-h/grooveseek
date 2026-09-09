@@ -16,6 +16,16 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **Search filters on the keys the schema declares.** `groove search --field
+  status=active` / `--field-not status=deprecated`, and `fields` / `fields_not`
+  on the MCP `search` tool, keep or drop documents by the exact value of a
+  frontmatter key `groove-schema.toml` declares — the same key twice is OR,
+  two keys are AND, and a document without the key survives an exclusion.
+  `groove index` stores those values per document and rewrites them, without
+  re-embedding, when the declared set changes; while that rewrite is pending
+  (in progress, interrupted, or not yet run on an older index) a search
+  carrying either filter is refused rather than answered from mixed rows.
+  `filter_applied` echoes both as `key → list`. (#289)
 - **A schema can name any frontmatter key.** `[fields.<name>]` in
   `groove-schema.toml` accepts any name; an empty table declares the key
   without checking it, and the existing rules (`required` / `type` /
@@ -48,6 +58,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   its shape only and the nesting under it is skipped rather than buffered, so
   the parser's recursion and repetition budgets apply exactly as they did
   before — a document 1.8.0 indexed still indexes.
+- **`groove index` reads `groove-schema.toml`.** The file `groove validate`
+  reads is now also read at index time, from the knowledge base root, to
+  learn which keys to store; a schema that does not load stops the index
+  with its load error instead of indexing without it. (#289)
 
 ## [1.8.0] - 2026-09-08
 

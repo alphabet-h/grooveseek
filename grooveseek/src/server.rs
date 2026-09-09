@@ -64,7 +64,7 @@ use documents::{
 pub use search::{
     RERANK_BY_DEFAULT, SEARCH_LIMIT_MAX, clamp_search_limit, compile_path_globs,
     compute_low_confidence, compute_match_spans, run_search_pipeline, should_rerank,
-    validate_filter_list,
+    validate_field_filters, validate_filter_list, validate_raw_field_filters,
 };
 
 // The rest are reached only from tests, and the compiler is what said so: left
@@ -75,16 +75,18 @@ pub use search::{
 // dropped entirely.
 //
 // `pub(crate)` on the first line because `transport::http`'s own tests reach
-// two of them by path (`crate::server::FILTER_LIST_MAX_ITEMS`).
+// these by path (e.g. `crate::server::FILTER_LIST_MAX_ITEMS`).
 // `MATCH_SPAN_MAX_TERMS` is deliberately absent: it survives only inside doc
 // comments and assertion messages, so re-importing it would be a name kept
 // alive by prose.
 #[cfg(test)]
-pub(crate) use search::{FILTER_ITEM_MAX_BYTES, FILTER_LIST_MAX_ITEMS, SEARCH_QUERY_MAX_BYTES};
+pub(crate) use search::{
+    FIELD_FILTERS_MAX_BYTES, FILTER_ITEM_MAX_BYTES, FILTER_LIST_MAX_ITEMS, SEARCH_QUERY_MAX_BYTES,
+};
 #[cfg(test)]
 use search::{
     MATCH_SPAN_CONTENT_MAX_BYTES, MATCH_SPAN_MAX_COUNT, compute_reranker_input_limit,
-    merge_disjoint_spans,
+    field_filters_from_params, merge_disjoint_spans,
 };
 
 /// Request-independent server state.
@@ -204,6 +206,19 @@ struct SearchParams {
     date_from: Option<String>,
     /// Inclusive upper bound on `frontmatter.date` (lexicographic, ISO-8601 friendly).
     date_to: Option<String>,
+    /// (v1.9.0+) Keep only documents whose frontmatter holds one of the given
+    /// values for each key: `{"status": ["active"], "environment": ["dev", "prod"]}`
+    /// means status is active AND environment is dev or prod. Exact string
+    /// comparison. Only keys `groove-schema.toml` declared when the index was
+    /// built are in the index; a key it did not declare matches nothing.
+    /// A document without the key does not match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fields: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// (v1.9.0+) Drop documents whose frontmatter holds one of the given
+    /// values for any key: `{"status": ["deprecated"]}`. A document without
+    /// the key is kept. Same shape and rules as `fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fields_not: Option<std::collections::BTreeMap<String, Vec<String>>>,
 
     // ----- low-confidence cutoff -----
     /// Rank-based ratio threshold for trimming low-confidence tail results.
@@ -531,6 +546,10 @@ pub struct SearchFilterEcho {
     min_confidence_ratio: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_terms: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields: Option<crate::db::FieldFilters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields_not: Option<crate::db::FieldFilters>,
 }
 
 impl SearchFilterEcho {
@@ -552,6 +571,13 @@ impl SearchFilterEcho {
     /// "none given" and "an empty list" are the same fact. They are the
     /// phrases that were **applied**, not the `-groups` the query was written
     /// with — see [`crate::db::ParsedQuery::exclude`].
+    ///
+    /// `fields` / `fields_not` are the normalised maps as-is: a key with no
+    /// values would not be in the map to begin with
+    /// ([`crate::db::normalize_field_filters`] already drops it), so an empty
+    /// map is the only "no filter" state and
+    /// is omitted the same way an empty list is; a present map's values are
+    /// always arrays, never a bare string.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         category: Option<String>,
@@ -563,6 +589,8 @@ impl SearchFilterEcho {
         date_to: Option<String>,
         min_confidence_ratio: Option<f32>,
         excluded_terms: Vec<String>,
+        fields: crate::db::FieldFilters,
+        fields_not: crate::db::FieldFilters,
     ) -> Self {
         let with_effect = |v: Option<Vec<String>>| v.filter(|l| !l.is_empty());
         Self {
@@ -575,6 +603,8 @@ impl SearchFilterEcho {
             date_to,
             min_confidence_ratio,
             excluded_terms: with_effect(Some(excluded_terms)),
+            fields: Some(fields).filter(|m| !m.is_empty()),
+            fields_not: Some(fields_not).filter(|m| !m.is_empty()),
         }
     }
 }
@@ -623,10 +653,26 @@ impl KbCore {
         let mut embedder = recover(self.embedder.lock(), "embedder");
         let db = recover_db(self.db.lock());
 
+        // (feature-58, codex P2 round 3 on PR #291) Read the schema once, here, before
+        // `rebuild_index` -- it no longer reads the file itself and takes this snapshot
+        // instead. Unlike the CLI's `index --force` arm, there is no reset ahead of this call
+        // on the MCP path, so this load already runs before anything destructive; a failure is
+        // reported through the same `Err(e)` -> "Rebuild failed" shape `rebuild_index` uses.
+        let schema = match indexer::load_declared_schema(&self.kb_path) {
+            Ok(schema) => schema,
+            Err(e) => {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: format!("Rebuild failed: {e}"),
+                })
+                .unwrap_or_default();
+            }
+        };
+
         match indexer::rebuild_index(
             &db,
             &mut embedder,
             &self.kb_path,
+            schema,
             force,
             self.exclude_headings.as_deref(),
             &self.exclude_dirs,
@@ -2115,6 +2161,236 @@ mod tests {
         // 「filter 無効」を表す空配列は、上限の観点では常に OK。
         // (`path_globs` の空配列は compile_path_globs 側で別途エラーになる)
         assert!(validate_filter_list("tags_any", &[]).is_ok());
+    }
+
+    #[test]
+    fn field_filters_are_validated_keys_first_then_each_value_list_in_key_order() {
+        use crate::db::FieldFilters;
+        let mut ok = FieldFilters::new();
+        ok.insert("status".into(), vec!["active".into()]);
+        assert!(validate_field_filters("fields", &ok).is_ok());
+
+        let mut too_many_keys = FieldFilters::new();
+        for i in 0..=FILTER_LIST_MAX_ITEMS {
+            too_many_keys.insert(format!("k{i:03}"), vec!["v".into()]);
+        }
+        let err = validate_field_filters("fields", &too_many_keys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("fields has too many entries"), "{err}");
+
+        let mut too_many_values = FieldFilters::new();
+        too_many_values.insert(
+            "status".into(),
+            (0..=FILTER_LIST_MAX_ITEMS)
+                .map(|i| format!("v{i}"))
+                .collect(),
+        );
+        let err = validate_field_filters("fields_not", &too_many_values)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields_not.status has too many entries"),
+            "{err}"
+        );
+
+        let mut long_value = FieldFilters::new();
+        long_value.insert("status".into(), vec!["x".repeat(FILTER_ITEM_MAX_BYTES + 1)]);
+        let err = validate_field_filters("fields", &long_value)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields.status has an entry that is too large"),
+            "{err}"
+        );
+
+        let mut empty_key = FieldFilters::new();
+        empty_key.insert(String::new(), vec!["v".into()]);
+        assert_eq!(
+            validate_field_filters("fields", &empty_key)
+                .unwrap_err()
+                .to_string(),
+            "fields has an empty key"
+        );
+
+        let mut empty_value = FieldFilters::new();
+        empty_value.insert("status".into(), vec![String::new()]);
+        assert_eq!(
+            validate_field_filters("fields", &empty_value)
+                .unwrap_err()
+                .to_string(),
+            "fields.status has an empty value"
+        );
+    }
+
+    /// (codex P2 round 6 on PR #291) Each key's own value list can be individually legal at
+    /// every per-list bound above -- [`FILTER_LIST_MAX_ITEMS`] keys, each with
+    /// [`FILTER_ITEM_MAX_BYTES`] worth of value -- while the whole map costs far more than
+    /// [`FIELD_FILTERS_MAX_BYTES`] allows, because the per-list checks never look at the map
+    /// as a whole.
+    #[test]
+    fn a_field_filters_map_within_every_per_list_bound_can_still_exceed_the_aggregate_cap() {
+        use crate::db::FieldFilters;
+
+        let build = |value_len: usize| {
+            let mut m = FieldFilters::new();
+            for i in 0..FILTER_LIST_MAX_ITEMS {
+                m.insert(format!("k{i:03}"), vec!["x".repeat(value_len)]);
+            }
+            m
+        };
+
+        let too_large = build(FILTER_ITEM_MAX_BYTES);
+        let err = validate_field_filters("fields", &too_large)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("fields is too large"), "{err}");
+
+        // (codex P2 round 7 on PR #291) The cap is spent against the map's JSON encoding, which
+        // costs more than the raw strings: `"k000":["xxx..xxx"]` adds two key quotes, a colon,
+        // brackets, two value quotes, and a comma between entries -- 8 bytes of overhead per
+        // entry here (all-ASCII values add none of their own past that). 1,000-byte values keep
+        // every per-list bound satisfied and land comfortably under the aggregate cap even with
+        // that overhead counted.
+        let just_under = build(1_000);
+        assert!(
+            validate_field_filters("fields", &just_under).is_ok(),
+            "a map just under the aggregate cap must still pass"
+        );
+    }
+
+    /// (codex P2 round 7 on PR #291) A control character decodes to one byte but encodes to
+    /// a six-byte escape, so a map whose decoded lengths sit comfortably under
+    /// [`FIELD_FILTERS_MAX_BYTES`] can still encode past it -- the shape the round 6 aggregate
+    /// check (summed `.len()`s) missed.
+    #[test]
+    fn a_field_filters_map_of_control_characters_is_refused_by_its_encoded_size() {
+        use crate::db::FieldFilters;
+
+        // FILTER_LIST_MAX_ITEMS keys (the key-list bound), one 200-byte value of the control
+        // character U+0001 each (well under FILTER_ITEM_MAX_BYTES decoded, so every per-list
+        // bound stays satisfied): decoded, that is ~13 KiB, comfortably under the 64 KiB
+        // aggregate cap. Encoded, each of the 12,800 control characters costs six bytes
+        // instead of one, so the map is well over the cap.
+        let mut m = FieldFilters::new();
+        for i in 0..FILTER_LIST_MAX_ITEMS {
+            m.insert(format!("k{i:03}"), vec!["\u{1}".repeat(200)]);
+        }
+        let err = validate_field_filters("fields", &m)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields is too large") && err.contains("bytes encoded"),
+            "{err}"
+        );
+    }
+
+    /// (codex P2 round 8 on PR #291) A raw list of one more copy of one value than
+    /// [`FILTER_LIST_MAX_ITEMS`] allows must be refused by its own, raw, count -- before this
+    /// fix, only the *normalised* map was bounded, and [`crate::db::normalize_field_filters`]
+    /// collapsed those repeated copies down to one occurrence (well under the limit) before
+    /// [`validate_field_filters`] ever ran, so the rest were never counted.
+    #[test]
+    fn a_raw_field_list_of_repeated_values_past_the_limit_is_refused_before_dedup() {
+        let mut raw: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        raw.insert(
+            "status".to_string(),
+            vec!["active".to_string(); FILTER_LIST_MAX_ITEMS + 1],
+        );
+        let err = validate_raw_field_filters("fields", &raw)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields.status has too many entries"),
+            "{err}"
+        );
+    }
+
+    /// The companion positive case (codex P2 round 8 on PR #291): a raw list at exactly the
+    /// key-list bound, every value distinct, passes the raw check and normalises to the same
+    /// count -- there is nothing for dedup to collapse.
+    #[test]
+    fn a_raw_field_list_of_distinct_values_at_the_limit_passes_and_normalises_unchanged() {
+        let mut raw: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        raw.insert(
+            "status".to_string(),
+            (0..FILTER_LIST_MAX_ITEMS)
+                .map(|i| format!("v{i:03}"))
+                .collect(),
+        );
+        assert!(validate_raw_field_filters("fields", &raw).is_ok());
+        let normalised = crate::db::normalize_field_filters(raw);
+        assert_eq!(
+            normalised.get("status").unwrap().len(),
+            FILTER_LIST_MAX_ITEMS
+        );
+    }
+
+    #[test]
+    fn a_fields_object_of_lists_normalises_one_way() {
+        let raw: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_str(r#"{"team": ["core", "core", "infra"], "empty": []}"#).unwrap();
+        let f = field_filters_from_params(Some(raw));
+        assert_eq!(
+            f.get("team").unwrap(),
+            &vec!["core".to_string(), "infra".to_string()]
+        );
+        assert!(!f.contains_key("empty"));
+        assert!(field_filters_from_params(None).is_empty());
+    }
+
+    /// The MCP shape for a declared-field filter is array-only (feature-58
+    /// review round 1): `key -> string[]`, the same shape [`Self::tags_any`]
+    /// already uses, never `key -> string | string[]`. An untagged `string | Vec`
+    /// enum would have advertised `anyOf`, the union `schema_compat.rs`
+    /// exists to strip for runtimes that cannot compile one into a decoding
+    /// grammar (issue #75) — this pins that `fields` / `fields_not` never put
+    /// one back, on the schema `rmcp` actually serves.
+    #[test]
+    fn the_search_tool_schema_has_no_union_for_field_filters() {
+        use rmcp::handler::server::common::schema_for_type;
+        let schema = schema_for_type::<SearchParams>();
+        let value = serde_json::Value::Object((*schema).clone());
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains("anyOf"), "schema carries anyOf: {text}");
+        assert!(!text.contains("oneOf"), "schema carries oneOf: {text}");
+
+        // Follow a `$ref` into `$defs` if schemars ever starts emitting one
+        // for this shape (it currently inlines it, since neither `BTreeMap`
+        // nor `Vec` is a named type schemars gives its own definition).
+        fn resolve<'a>(
+            root: &'a serde_json::Value,
+            node: &'a serde_json::Value,
+        ) -> &'a serde_json::Value {
+            match node.get("$ref").and_then(|r| r.as_str()) {
+                Some(r) => {
+                    let key = r.strip_prefix("#/$defs/").expect("unexpected $ref shape");
+                    &root["$defs"][key]
+                }
+                None => node,
+            }
+        }
+
+        let fields_schema = resolve(&value, &value["properties"]["fields"]);
+        assert_eq!(
+            fields_schema["type"].as_str(),
+            Some("object"),
+            "fields must be a plain object: {fields_schema}"
+        );
+        let additional = resolve(&value, &fields_schema["additionalProperties"]);
+        assert_eq!(
+            additional["type"].as_str(),
+            Some("array"),
+            "fields' values must be arrays, never a bare string: {additional}"
+        );
+        let items = resolve(&value, &additional["items"]);
+        assert_eq!(
+            items["type"].as_str(),
+            Some("string"),
+            "fields' array elements must be strings: {items}"
+        );
     }
 
     #[test]
@@ -4016,6 +4292,17 @@ mod tests {
         }
     }
 
+    /// Paths whose object keys are caller-chosen data, not part of the documented shape.
+    ///
+    /// (codex round 2 on PR #291) `fields` / `fields_not` are `key -> array of strings` for
+    /// whatever keys `groove-schema.toml` declares (feature-58) — the sample this walker reads
+    /// has to use *some* concrete key to show the map is non-empty, and recursing into it would
+    /// ask the contract to name that key (`filter_applied.fields.status`) as if it were a fixed
+    /// field, the way `results[].expanded_from`'s tagged-enum keys are. It is not: the next
+    /// schema could name it `team` instead. [`walk_with_kinds`] still records the path itself
+    /// (`filter_applied.fields`, kind `object`) — only its children are skipped.
+    const OPAQUE_MAP_PATHS: &[&str] = &["filter_applied.fields", "filter_applied.fields_not"];
+
     /// [`walk_fields`] plus what each path serialized as.
     ///
     /// A path can be seen more than once with different kinds — `title` is a
@@ -4037,7 +4324,9 @@ mod tests {
                     };
                     out.insert(path.clone());
                     kinds.entry(path.clone()).or_default().insert(json_kind(v));
-                    walk_with_kinds(v, &path, out, kinds);
+                    if !OPAQUE_MAP_PATHS.contains(&path.as_str()) {
+                        walk_with_kinds(v, &path, out, kinds);
+                    }
                 }
             }
             // Every element, not just the first: `expanded_from` is a tagged
@@ -4136,6 +4425,11 @@ mod tests {
 
     /// Through `new`, like both surfaces: a sample assembled another way could
     /// claim a shape neither of them produces.
+    ///
+    /// `fields` / `fields_not` are non-empty (codex round 2 on PR #291):
+    /// [`SearchFilterEcho::new`] omits an empty map, so an empty sample here would never emit
+    /// `filter_applied.fields` / `filter_applied.fields_not`, and the contract
+    /// guard that walks this sample would not know those two rows exist.
     fn maximal_echo() -> SearchFilterEcho {
         SearchFilterEcho::new(
             Some("c".to_string()),
@@ -4147,7 +4441,45 @@ mod tests {
             Some("2026-12-31".to_string()),
             Some(1.5),
             vec!["async".to_string()],
+            crate::db::FieldFilters::from([("status".to_string(), vec!["active".to_string()])]),
+            crate::db::FieldFilters::from([("team".to_string(), vec!["archived".to_string()])]),
         )
+    }
+
+    #[test]
+    fn the_echo_carries_field_filters_as_arrays_and_omits_empty_maps() {
+        use crate::db::FieldFilters;
+        let mut fields = FieldFilters::new();
+        fields.insert("status".into(), vec!["active".into()]);
+        let echo = SearchFilterEcho::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            fields,
+            FieldFilters::new(),
+        );
+        let v = serde_json::to_value(&echo).unwrap();
+        assert_eq!(v, serde_json::json!({"fields": {"status": ["active"]}}));
+        let empty = SearchFilterEcho::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            FieldFilters::new(),
+            FieldFilters::new(),
+        );
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
     }
 
     /// A response with every optional left out.
@@ -4246,6 +4578,8 @@ mod tests {
             None,
             None,
             Vec::new(),
+            crate::db::FieldFilters::new(),
+            crate::db::FieldFilters::new(),
         );
         let value = serde_json::to_value(&echo).expect("the echo serializes");
         assert_eq!(
@@ -4266,6 +4600,8 @@ mod tests {
             None,
             Some(1.25),
             Vec::new(),
+            crate::db::FieldFilters::new(),
+            crate::db::FieldFilters::new(),
         );
         assert_eq!(
             serde_json::to_value(&ratio_only).expect("the echo serializes"),
@@ -4286,7 +4622,17 @@ mod tests {
     fn the_echo_lists_the_applied_exclusions_and_omits_an_empty_list() {
         let echo = |excluded: Vec<String>| {
             serde_json::to_value(SearchFilterEcho::new(
-                None, None, None, None, None, None, None, None, excluded,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                excluded,
+                crate::db::FieldFilters::new(),
+                crate::db::FieldFilters::new(),
             ))
             .expect("the echo serializes")
         };

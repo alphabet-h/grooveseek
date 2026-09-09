@@ -392,7 +392,10 @@ hit を返し、同じ方法で文書単位に dedup。
 **GrooveSeek が負けた、または同点だった項目。** *typo* (n=6): P@1 0.500 対 QMD 0.833、全 class の中で
 QMD 側の差が最も大きい。*deprecated-trap* (n=4): P@1 **0.000** — keyword の重なりが多い deprecated
 runbook が、現行の後継を毎回 rank 1 で押しのける。*environment-filtered* (n=5): 0.200 で
-同点。*ambiguous* (n=4): 0.500 対 0.750。cross-encoder reranker は中央値 latency を
+同点 — ただし著者はこれを retrieval ではなく corpus に起因すると跡付けている: 74 文書中
+69 文書は、出典が environment を明記していないため一律 `[dev, test, prod]` を持ち、その
+結果 filter は 1 文書しか除かない。benchmark corpus も同じ形をしている (57 文書中 38 文書が
+`env-staging` と `env-production` の両方を持つ) (#289)。*ambiguous* (n=4): 0.500 対 0.750。cross-encoder reranker は中央値 latency を
 51 倍にして P@1 を 0.067 落としたので、その環境では off (1.2.0 では 65 倍。rerank の
 経路は返す物を変えずに速くなった)。
 
@@ -406,7 +409,9 @@ hybrid は P@1 0.683 / MRR 0.862 / nDCG@5 0.776、中央値 112 ms (p95 118 ms)�
 model 自体が無い — つまり metadata は品質の負けではなく機能の差。
 
 *deprecated-trap* の結果は本プロジェクトが脚注ではなく to-do として受け取るもので、後の
-版がこれに対して測れるようにここに記録しておく。
+版がこれに対して測れるようにここに記録しておく。1.9.0 はこれを解消する手段を追加する ——
+`status` が宣言 key になっていれば `--field-not status=deprecated` —— ここに記した数値は、
+後の run がそれに対して測られる基準になる。
 
 ## `groove tune` — fusion パラメータを測る (v0.13.0+)
 

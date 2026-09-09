@@ -3547,14 +3547,22 @@ mod tests {
 
     /// 上限は `search` の filter 上限より十分大きいこと。片方だけ動かすと
     /// 「上限内の正当なリクエストが transport で落ちる」状態になりうる。
+    ///
+    /// (codex P2 round 6 on PR #291) `fields` / `fields_not` はそれぞれ独立に
+    /// [`crate::server::FIELD_FILTERS_MAX_BYTES`] まで許されるので、この
+    /// worst case にも両方を 1 回ずつ足す。足さなければ、この test は
+    /// [`crate::server::validate_field_filters`] の aggregate cap が実際に body limit の
+    /// 内側に収まるかを何も確認しないまま通ってしまう。
     #[test]
     fn the_body_limit_leaves_room_for_a_fully_loaded_search_request() {
         let filters = crate::server::FILTER_LIST_MAX_ITEMS * crate::server::FILTER_ITEM_MAX_BYTES;
-        let worst_case = filters * 3 + crate::server::SEARCH_QUERY_MAX_BYTES;
+        let worst_case = filters * 3
+            + crate::server::SEARCH_QUERY_MAX_BYTES
+            + crate::server::FIELD_FILTERS_MAX_BYTES * 2;
         assert!(
             worst_case * 2 < REQUEST_BODY_MAX_BYTES,
             "body limit {REQUEST_BODY_MAX_BYTES} leaves too little room for a \
-             maximal search request ({worst_case} bytes of filters and query)"
+             maximal search request ({worst_case} bytes of filters, fields, fields_not, and query)"
         );
     }
 

@@ -21,6 +21,7 @@ mod storage;
 // outside this module as `grooveseek::db::parse_query`; `search.rs` reaches it
 // through `use super::*`.
 pub use fts_query::{ParsedQuery, parse_query};
+pub use search::FIELD_FILTERS_PENDING;
 // (feature-56) The indexer names this when it hands a code chunk's line range and definition
 // kind to the storage layer; every other caller uses the constructor that defaults it away.
 pub use storage::CodeMeta;
@@ -294,6 +295,44 @@ impl ContextMode {
     }
 }
 
+/// A declared-field filter, normalised the one way both surfaces use
+/// (feature-58): key → the values that count, in the order they were given,
+/// without duplicates, and never empty. The command line builds it from
+/// repeated `--field key=value`, the MCP tool from a `fields` object; both go
+/// through [`normalize_field_filters`] so the two cannot disagree.
+pub type FieldFilters = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Build a [`FieldFilters`] from raw `(key, values)` pairs. The same key
+/// given twice is one entry with the lists joined; a duplicate value is kept
+/// once, at its first occurrence; a key left with no value is dropped,
+/// because it would narrow nothing and the echo reports what had an effect.
+///
+/// (codex P2 round 8 on PR #291) Dedup goes through a per-key `seen` set
+/// rather than `Vec::contains`: a linear scan per value makes the whole
+/// function O(n²) in the list's length, and [`crate::server::validate_raw_field_filters`]
+/// exists precisely so the *raw* list is bounded before this function ever
+/// runs -- a caller could still hand this function a large list directly, so
+/// the O(n) shape belongs here, not only at the validation boundary.
+pub fn normalize_field_filters<I>(raw: I) -> FieldFilters
+where
+    I: IntoIterator<Item = (String, Vec<String>)>,
+{
+    let mut out = FieldFilters::new();
+    let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (key, values) in raw {
+        let entry = out.entry(key.clone()).or_default();
+        let seen_values = seen.entry(key).or_default();
+        for v in values {
+            if seen_values.insert(v.clone()) {
+                entry.push(v);
+            }
+        }
+    }
+    out.retain(|_, v| !v.is_empty());
+    out
+}
+
 /// Search 系 API に渡す filter 引数の集約。
 ///
 /// 既存の category / topic / min_quality に加え、feature-26 で path_globs /
@@ -311,6 +350,13 @@ pub struct SearchFilters<'a> {
     pub tags_all: &'a [String],
     pub date_from: Option<&'a str>,
     pub date_to: Option<&'a str>,
+    /// Declared-field filter (feature-58): every entry must match (AND), an
+    /// entry matches when the document holds one of its values (OR). `None`
+    /// and an empty map are the same: no filter.
+    pub fields: Option<&'a FieldFilters>,
+    /// The exclusion form: a document holding one of the values of any entry
+    /// is dropped; a document without the key survives.
+    pub fields_not: Option<&'a FieldFilters>,
 }
 
 impl<'a> SearchFilters<'a> {
@@ -329,6 +375,8 @@ impl<'a> SearchFilters<'a> {
             || !self.tags_all.is_empty()
             || self.date_from.is_some()
             || self.date_to.is_some()
+            || self.fields.is_some_and(|f| !f.is_empty())
+            || self.fields_not.is_some_and(|f| !f.is_empty())
     }
 }
 
@@ -802,6 +850,23 @@ impl Database {
         Ok(self.conn.unchecked_transaction()?)
     }
 
+    /// [`Self::begin_transaction`], but `BEGIN IMMEDIATE`: the write lock is taken
+    /// **before the first statement**, so what the transaction then reads is what
+    /// it will write over -- no other connection (another process included) can
+    /// commit in between (local Codex on PR #291 after round 12). For a
+    /// read-then-decide-then-write sequence a deferred transaction is not enough:
+    /// under WAL its reads run on a snapshot and the write only takes the lock
+    /// afterwards, so a writer that committed in the gap is either invisible to
+    /// the decision or turns the write into `SQLITE_BUSY_SNAPSHOT`. The connection's
+    /// busy timeout ([`Self::init`]) makes this wait rather than fail when the
+    /// lock is held.
+    pub fn begin_immediate_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
+
     /// 開いたまま残った transaction を巻き戻す (BU-18)。
     ///
     /// 通常、unwind は `Transaction` の Drop を走らせるので ROLLBACK は自動で
@@ -938,6 +1003,214 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
         db
+    }
+
+    #[test]
+    fn replace_document_fields_writes_the_rows_and_replaces_them_whole() {
+        let db = db_with_384();
+        db.upsert_document("a.md", Some("t"), None, None, None, &[], None, "h1", 0)
+            .unwrap();
+        db.replace_document_fields(
+            "a.md",
+            &[
+                ("status".to_string(), "active".to_string()),
+                ("environment".to_string(), "dev".to_string()),
+                ("environment".to_string(), "prod".to_string()),
+                ("environment".to_string(), "dev".to_string()), // duplicate: one row
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            db.document_fields_for_path("a.md").unwrap(),
+            vec![
+                ("environment".to_string(), "dev".to_string()),
+                ("environment".to_string(), "prod".to_string()),
+                ("status".to_string(), "active".to_string()),
+            ]
+        );
+        // A second call replaces, it does not merge.
+        db.replace_document_fields("a.md", &[("team".to_string(), "core".to_string())])
+            .unwrap();
+        assert_eq!(
+            db.document_fields_for_path("a.md").unwrap(),
+            vec![("team".to_string(), "core".to_string())]
+        );
+        // Unknown path: nothing written, no error.
+        db.replace_document_fields("missing.md", &[("k".to_string(), "v".to_string())])
+            .unwrap();
+        assert!(
+            db.document_fields_for_path("missing.md")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deleting_a_document_removes_its_fields_and_reset_empties_the_table() {
+        let db = db_with_384();
+        db.upsert_document("a.md", Some("t"), None, None, None, &[], None, "h1", 0)
+            .unwrap();
+        db.replace_document_fields("a.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.delete_document("a.md").unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM document_fields", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "delete_document must clear document_fields explicitly"
+        );
+
+        db.upsert_document("b.md", Some("t"), None, None, None, &[], None, "h2", 0)
+            .unwrap();
+        db.replace_document_fields("b.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.reset_for_model("bge-small-en-v1.5", 384).unwrap();
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM document_fields", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "reset_for_model must empty document_fields");
+    }
+
+    /// (local Codex on PR #291 after round 10) The generation key goes with the
+    /// rows it vouches for: after [`Database::reset_for_model`] wiped `document_fields`,
+    /// the key must be absent (pending) in the same commit, not still naming a set no
+    /// row was written under -- otherwise a field-filtered search in the gap before
+    /// [`crate::indexer::rebuild_index`] clears it answers "no match" instead of refusing.
+    #[test]
+    fn reset_for_model_leaves_the_declared_set_pending_with_the_rows_it_wiped() {
+        let db = db_with_384();
+        db.upsert_document("a.md", Some("t"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.replace_document_fields("a.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+
+        db.reset_for_model("bge-small-en-v1.5", 384).unwrap();
+
+        assert_eq!(
+            db.read_declared_fields().unwrap(),
+            None,
+            "the key must fall with the rows, in the same transaction"
+        );
+        let active = field_map(&[("status", &["active"])]);
+        let f = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_similar(&dummy_embedding(0.1), 10, &f)
+                .unwrap_err()
+                .to_string(),
+            FIELD_FILTERS_PENDING,
+            "a search in the gap after the reset is refused, not answered as empty"
+        );
+    }
+
+    #[test]
+    fn declared_fields_meta_round_trips() {
+        let db = db_with_384();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        db.write_declared_fields("[\"status\",\"team\"]").unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some("[\"status\",\"team\"]")
+        );
+        db.write_declared_fields("[]").unwrap();
+        assert_eq!(db.read_declared_fields().unwrap().as_deref(), Some("[]"));
+    }
+
+    /// (codex P2 round 3 on PR #291) [`Database::clear_declared_fields`] leaves the key
+    /// absent, not merely unchanged -- the point is to undo a prior
+    /// [`Database::write_declared_fields`], not to be a no-op beside it.
+    #[test]
+    fn clear_declared_fields_leaves_the_key_absent() {
+        let db = db_with_384();
+        db.write_declared_fields("[\"status\"]").unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some("[\"status\"]")
+        );
+        db.clear_declared_fields().unwrap();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+    }
+
+    /// sqlite-vec's KNN (`embedding MATCH ?1 AND k = ?2`) with an `EXISTS`
+    /// predicate on the joined `documents` row: the query is accepted, rows
+    /// whose document lacks the field are not returned, and no more than `k`
+    /// rows come back. Spec R4 of feature-58 rests on this; if it ever fails
+    /// the vector leg falls back to a Rust-side filter (the spec's fallback).
+    #[test]
+    fn vec_knn_accepts_an_exists_predicate_on_the_joined_document() {
+        let db = db_with_384();
+        for (i, p) in ["a.md", "b.md", "c.md"].iter().enumerate() {
+            let id = db
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(
+                id,
+                0,
+                None,
+                None,
+                "body",
+                None,
+                &dummy_embedding(0.1 + i as f32 * 0.01),
+                1.0,
+            )
+            .unwrap();
+        }
+        db.replace_document_fields("a.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.replace_document_fields("b.md", &[("status".to_string(), "deprecated".to_string())])
+            .unwrap();
+        // c.md has no status at all.
+        let embedding_json = serde_json::to_string(&dummy_embedding(0.1)).unwrap();
+        let sql = "SELECT d.path FROM vec_chunks v \
+                   JOIN chunks c ON c.id = v.chunk_id \
+                   JOIN documents d ON d.id = c.document_id \
+                   WHERE v.embedding MATCH ?1 AND k = ?2 \
+                   AND EXISTS (SELECT 1 FROM document_fields df \
+                               WHERE df.document_id = d.id AND df.key = ?3 AND df.value IN (?4)) \
+                   ORDER BY v.distance";
+        let mut stmt = db.conn.prepare(sql).unwrap();
+        let paths: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![embedding_json, 10, "status", "active"],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(paths, vec!["a.md".to_string()]);
+
+        let sql_not = sql.replace("AND EXISTS", "AND NOT EXISTS");
+        let mut stmt = db.conn.prepare(&sql_not).unwrap();
+        let mut paths: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![embedding_json, 10, "status", "deprecated"],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["a.md".to_string(), "c.md".to_string()],
+            "a document without the key survives NOT EXISTS"
+        );
     }
 
     thread_local! {
@@ -4929,6 +5202,707 @@ mod tests {
         assert!(paths.contains(&"doc_d.md"));
         assert!(!paths.contains(&"doc_b.md"));
         assert!(!paths.contains(&"doc_c.md"));
+    }
+
+    /// Three documents: a.md status=active team=core, b.md status=deprecated,
+    /// c.md has no declared field. Every chunk body carries the same unique
+    /// keyword so the FTS leg matches all three.
+    fn db_with_declared_fields() -> Database {
+        let db = db_with_384();
+        for (i, p) in ["a.md", "b.md", "c.md"].iter().enumerate() {
+            let id = db
+                .upsert_document(
+                    p,
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(
+                id,
+                0,
+                None,
+                None,
+                "fieldfilter_unique_keyword body",
+                None,
+                &dummy_embedding(0.1 + i as f32 * 0.01),
+                1.0,
+            )
+            .unwrap();
+        }
+        db.replace_document_fields(
+            "a.md",
+            &[
+                ("status".to_string(), "active".to_string()),
+                ("team".to_string(), "core".to_string()),
+            ],
+        )
+        .unwrap();
+        db.replace_document_fields("b.md", &[("status".to_string(), "deprecated".to_string())])
+            .unwrap();
+        // The generation key a completed `rebuild_index` would have recorded for
+        // these rows: without it every field-filtered search below is refused as
+        // pending (`Database::refuse_field_filters_while_pending`).
+        db.write_declared_fields(r#"["status","team"]"#).unwrap();
+        db
+    }
+
+    fn field_map(pairs: &[(&str, &[&str])]) -> FieldFilters {
+        pairs
+            .iter()
+            .map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect()))
+            .collect()
+    }
+
+    // NOTE: `search_similar` returns `Vec<SearchResult>` (not `(chunk_id,
+    // SearchResult)` tuples like the `pub(crate)` candidate methods), so this
+    // maps `.path` directly rather than destructuring a tuple.
+    fn paths_vec(db: &Database, filters: &SearchFilters<'_>) -> Vec<String> {
+        let mut v: Vec<String> = db
+            .search_similar(&dummy_embedding(0.1), 10, filters)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn paths_fts(db: &Database, filters: &SearchFilters<'_>) -> Vec<String> {
+        let mut v: Vec<String> = db
+            .search_fts_candidates(
+                "fieldfilter_unique_keyword",
+                10,
+                filters,
+                FusionParams::default(),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r.path)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// (codex P2 round 10 on PR #291) Every search leg refuses a `fields` /
+    /// `fields_not` filter while `index_meta.declared_fields` is absent, and only
+    /// then: `[]` and a real list are recorded answers, and a request without a
+    /// field filter is not gated at all. [`Database::refuse_field_filters_while_pending`]'s
+    /// doc has why the absent state cannot be answered from. The hybrid path and
+    /// (local Codex after round 10) the single-leg entry points [`Database::search_similar`] /
+    /// [`Database::search_fts_candidates`] are all asserted, since the guard sits in the legs.
+    #[test]
+    fn a_field_filter_is_refused_until_the_index_records_its_declared_set() {
+        let db = db_with_declared_fields();
+        db.clear_declared_fields().unwrap();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        let active = field_map(&[("status", &["active"])]);
+        let with_filter = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        let hybrid = |f: &SearchFilters<'_>| {
+            db.search_hybrid(
+                "fieldfilter_unique_keyword",
+                &dummy_embedding(0.1),
+                10,
+                f,
+                FusionParams::default(),
+            )
+        };
+
+        let err = hybrid(&with_filter).unwrap_err();
+        assert_eq!(err.to_string(), FIELD_FILTERS_PENDING);
+        let not_filter = SearchFilters {
+            fields_not: Some(&active),
+            ..Default::default()
+        };
+        assert_eq!(
+            hybrid(&not_filter).unwrap_err().to_string(),
+            FIELD_FILTERS_PENDING,
+            "fields_not is gated the same way"
+        );
+        assert_eq!(
+            db.search_similar(&dummy_embedding(0.1), 10, &with_filter)
+                .unwrap_err()
+                .to_string(),
+            FIELD_FILTERS_PENDING,
+            "the vector leg alone is gated too"
+        );
+        assert_eq!(
+            db.search_fts_candidates(
+                "fieldfilter_unique_keyword",
+                10,
+                &with_filter,
+                FusionParams::default()
+            )
+            .unwrap_err()
+            .to_string(),
+            FIELD_FILTERS_PENDING,
+            "the FTS leg alone is gated too"
+        );
+
+        // No field filter: the pending state is not the search's concern.
+        assert_eq!(hybrid(&SearchFilters::default()).unwrap().len(), 3);
+        let empty = FieldFilters::new();
+        let empty_filter = SearchFilters {
+            fields: Some(&empty),
+            fields_not: Some(&empty),
+            ..Default::default()
+        };
+        assert_eq!(
+            hybrid(&empty_filter).unwrap().len(),
+            3,
+            "an empty map is not a filter and is not refused"
+        );
+
+        // `[]` is a completed answer ("declares nothing"), not the pending state:
+        // the call is not refused once the key is recorded. (The fixture wrote
+        // its rows by hand, so what the filter then returns is not asserted --
+        // a `[]` generation beside rows is a state `rebuild_index` never leaves.)
+        db.write_declared_fields("[]").unwrap();
+        assert!(hybrid(&with_filter).is_ok());
+        db.write_declared_fields(r#"["status","team"]"#).unwrap();
+        let paths: Vec<String> = hybrid(&with_filter)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(paths, vec!["a.md"]);
+    }
+
+    /// (local Codex on PR #291 after round 12, third pass) A field-filtered search reads
+    /// one committed state from its pending check to its last statement. Two connections
+    /// on one file: A opens the snapshot a field-filtered search opens
+    /// ([`Database::field_filter_snapshot`]) and reads the generation; B -- the refresh in
+    /// another process -- clears it and commits; A reads again and must still see the
+    /// generation it checked, and only after its snapshot ends does it see the clear. No
+    /// filter, no snapshot: the search has nothing to pin.
+    #[test]
+    fn a_field_filtered_search_reads_one_committed_state_across_a_concurrent_refresh() {
+        let dir = crate::test_support::unique_temp_path("groove-search-snapshot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(".groove.db");
+        let a = Database::open(db_path.to_str().unwrap()).unwrap();
+        let b = Database::open(db_path.to_str().unwrap()).unwrap();
+        a.write_declared_fields(r#"["status"]"#).unwrap();
+
+        let active = field_map(&[("status", &["active"])]);
+        let filtered = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        assert!(
+            a.field_filter_snapshot(&SearchFilters::default())
+                .unwrap()
+                .is_none(),
+            "no field filter, no snapshot"
+        );
+
+        let snapshot = a
+            .field_filter_snapshot(&filtered)
+            .unwrap()
+            .expect("a snapshot");
+        assert!(
+            a.refuse_field_filters_while_pending(Some(&active), None)
+                .is_ok()
+        );
+        // B: a refresh begins and commits while A's request is still running.
+        b.clear_declared_fields().unwrap();
+        assert_eq!(b.read_declared_fields().unwrap(), None);
+        assert_eq!(
+            a.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["status"]"#),
+            "inside its snapshot A still sees the generation it checked"
+        );
+        assert!(
+            a.refuse_field_filters_while_pending(Some(&active), None)
+                .is_ok(),
+            "and a statement of the same request is not refused halfway through"
+        );
+        snapshot.commit().unwrap();
+        assert_eq!(
+            a.read_declared_fields().unwrap(),
+            None,
+            "after the snapshot ends the clear is visible, and the next request is refused"
+        );
+        assert_eq!(
+            a.refuse_field_filters_while_pending(Some(&active), None)
+                .unwrap_err()
+                .to_string(),
+            FIELD_FILTERS_PENDING
+        );
+
+        drop(b);
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (local Codex on PR #291 after round 12, third pass) The statements of one
+    /// field-filtered hybrid search sit between a `BEGIN` and a `COMMIT` -- the snapshot
+    /// the test above shows the effect of. Traced the way
+    /// [`a_hybrid_search_issues_two_statements_whatever_it_is_asked`] traces an unfiltered
+    /// search, which opens no transaction and keeps its two statements.
+    #[test]
+    fn a_field_filtered_hybrid_search_runs_inside_one_transaction() {
+        let db = db_with_declared_fields();
+        let active = field_map(&[("status", &["active"])]);
+        let filtered = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        TRACED_SQL.with(|v| v.borrow_mut().clear());
+        db.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        let hits = db
+            .search_hybrid(
+                "fieldfilter_unique_keyword",
+                &dummy_embedding(0.1),
+                10,
+                &filtered,
+                FusionParams::default(),
+            )
+            .unwrap();
+        db.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(hits.len(), 1);
+        let traced: Vec<String> = TRACED_SQL.with(|v| {
+            v.borrow()
+                .iter()
+                .filter(|sql| !sql.trim_start().starts_with("--"))
+                .cloned()
+                .collect()
+        });
+        assert!(
+            traced
+                .first()
+                .is_some_and(|s| s.trim_start().starts_with("BEGIN")),
+            "the request must open its snapshot before its first read, got: {traced:?}"
+        );
+        assert!(
+            traced
+                .last()
+                .is_some_and(|s| s.trim_start().starts_with("COMMIT")),
+            "and close it after its last statement, got: {traced:?}"
+        );
+        assert!(
+            traced
+                .iter()
+                .filter(|s| s.contains("declared_fields"))
+                .count()
+                >= 1,
+            "the pending check runs inside the snapshot, got: {traced:?}"
+        );
+    }
+
+    /// (local Codex on PR #291 after round 12, fourth pass) The front ends open the snapshot
+    /// around the whole request -- pipeline, MMR pool, parent retriever -- and the legs,
+    /// finding a transaction already open, must add none of their own (`BEGIN` inside an
+    /// open transaction is an error). A hybrid search under a caller-held snapshot must
+    /// therefore succeed and answer from that snapshot, and the caller commits it after.
+    #[test]
+    fn a_hybrid_search_under_a_caller_held_snapshot_opens_no_transaction_of_its_own() {
+        let db = db_with_declared_fields();
+        let active = field_map(&[("status", &["active"])]);
+        let filtered = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        let snapshot = db
+            .field_filter_snapshot(&filtered)
+            .unwrap()
+            .expect("a snapshot");
+        assert!(!db.conn.is_autocommit());
+        let hits = db
+            .search_hybrid(
+                "fieldfilter_unique_keyword",
+                &dummy_embedding(0.1),
+                10,
+                &filtered,
+                FusionParams::default(),
+            )
+            .expect("the legs join the caller's snapshot instead of opening a second one");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.md");
+        assert!(
+            !db.conn.is_autocommit(),
+            "the caller's snapshot is still open after the search"
+        );
+        snapshot.commit().unwrap();
+        assert!(db.conn.is_autocommit());
+    }
+
+    #[test]
+    fn fields_filter_keeps_only_documents_holding_one_of_the_values() {
+        let db = db_with_declared_fields();
+        let one = field_map(&[("status", &["active"])]);
+        let f = SearchFilters {
+            fields: Some(&one),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md"]);
+
+        // Same key, two values: OR.
+        let either = field_map(&[("status", &["active", "deprecated"])]);
+        let f = SearchFilters {
+            fields: Some(&either),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md", "b.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md", "b.md"]);
+
+        // Two keys: AND. b.md has no team.
+        let both = field_map(&[("status", &["active", "deprecated"]), ("team", &["core"])]);
+        let f = SearchFilters {
+            fields: Some(&both),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md"]);
+
+        // An undeclared key matches nothing rather than erroring.
+        let nope = field_map(&[("nope", &["x"])]);
+        let f = SearchFilters {
+            fields: Some(&nope),
+            ..Default::default()
+        };
+        assert!(paths_vec(&db, &f).is_empty());
+        assert!(paths_fts(&db, &f).is_empty());
+    }
+
+    #[test]
+    fn fields_not_drops_matching_documents_and_keeps_those_without_the_key() {
+        let db = db_with_declared_fields();
+        let dep = field_map(&[("status", &["deprecated"])]);
+        let f = SearchFilters {
+            fields_not: Some(&dep),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["a.md", "c.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["a.md", "c.md"]);
+
+        // Two exclusions: a document matching either is dropped.
+        let two = field_map(&[("status", &["deprecated"]), ("team", &["core"])]);
+        let f = SearchFilters {
+            fields_not: Some(&two),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["c.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["c.md"]);
+
+        // Positive and negative together.
+        let pos = field_map(&[("status", &["active", "deprecated"])]);
+        let neg = field_map(&[("team", &["core"])]);
+        let f = SearchFilters {
+            fields: Some(&pos),
+            fields_not: Some(&neg),
+            ..Default::default()
+        };
+        assert_eq!(paths_vec(&db, &f), vec!["b.md"]);
+        assert_eq!(paths_fts(&db, &f), vec!["b.md"]);
+    }
+
+    /// (codex P2 round 1 on PR #291) A field predicate sits inside the KNN SQL's
+    /// `WHERE`, so `rows_seen` (`db/search.rs`'s private `VecPage`) only counts
+    /// rows that already passed it. Before the fix, a page shorter than
+    /// `fetch_k` was treated as "corpus exhausted" even when it was really the
+    /// field predicate, not the corpus, that shrank the page -- so the retry
+    /// loop stopped without ever reaching eligible rows sitting past the first
+    /// window.
+    ///
+    /// Corpus (60 chunks, closest to farthest from the query embedding):
+    /// - 25 "near" chunks: `status = active`, hold the word `banana`, all placed
+    ///   in `excluded` by chunk id (they are the field filter's honest matches,
+    ///   just not what this query wants back).
+    /// - 30 "noise" chunks next: no declared `status` at all, so the field
+    ///   predicate drops them in SQL -- this is what shrinks `rows_seen` below
+    ///   `fetch_k` on the first page without the corpus being exhausted (60
+    ///   chunks exist; the first page only asks for 50).
+    /// - 5 "far" chunks: `status = active`, hold the word `cherry`, past the
+    ///   first page entirely.
+    ///
+    /// With the bug, the first page returns `rows_seen = 25` (the 25 "near"
+    /// chunks; SQL already dropped the 25 "noise" chunks sharing that window)
+    /// and `dropped_by_exclusion = 25`, so `rows_seen < fetch_k` (25 < 50) stops
+    /// the loop with zero hits -- the 5 "far" chunks that satisfy the query, the
+    /// filter, and the exclusion are never reached. Fixed, the loop widens once
+    /// more, the second page covers the whole 60-chunk corpus, and the 5 "far"
+    /// chunks fill `limit`.
+    /// (local Codex on PR #291 after round 13) The field predicate sits in the KNN SQL, so
+    /// it can empty the first page on its own -- no exclusion involved, the page's
+    /// exclusion count stays 0 -- while the one matching chunk sits just past that page. The old stop rule
+    /// read "the exclusion dropped nothing" as "widening cannot help" and returned empty;
+    /// under a field filter the leg must keep widening until `limit` is filled or the KNN
+    /// cap is reached.
+    #[test]
+    fn a_field_filter_that_empties_the_first_page_still_widens_to_the_match_past_it() {
+        let db = db_with_384();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+        let add = |path: &str, e: f32, active: bool| {
+            let doc = db
+                .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)
+                .unwrap();
+            if active {
+                db.replace_document_fields(path, &[("status".to_string(), "active".to_string())])
+                    .unwrap();
+            }
+            db.insert_chunk(doc, 0, None, None, "body", None, &vec![e; 384], 1.0)
+                .unwrap();
+        };
+        // With `limit == 1` and a filter, the first page is `1 * FILTER_OVERFETCH_FACTOR`
+        // rows. Fill exactly that many with the nearest chunks that carry no field...
+        for i in 0..search::FILTER_OVERFETCH_FACTOR {
+            add(
+                &format!("near{i:02}.md"),
+                0.5 - (i as f32 + 1.0) * 0.001,
+                false,
+            );
+        }
+        // ...and put the only matching chunk one rank past the page.
+        add("match.md", 0.5 - 0.05, true);
+
+        let active = field_map(&[("status", &["active"])]);
+        let filters = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 1, &filters, &HashSet::new())
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|(_, r)| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["match.md"],
+            "the matching chunk past the first page must be found, not dropped as \
+             \"nothing to widen for\""
+        );
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            2,
+            "the first page held no match, so the KNN had to be widened once"
+        );
+    }
+
+    /// (local Codex on PR #291 after round 13, sixth pass) The counterpart of the test above:
+    /// a field filter that matches nothing on a corpus smaller than the first page must not
+    /// keep widening -- the page already spans the whole corpus, so one KNN is the answer.
+    #[test]
+    fn a_field_filter_matching_nothing_on_a_small_corpus_asks_the_knn_once() {
+        let db = db_with_384();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+        for i in 0..3 {
+            let doc = db
+                .upsert_document(
+                    &format!("d{i}.md"),
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(doc, 0, None, None, "body", None, &vec![0.5; 384], 1.0)
+                .unwrap();
+        }
+        let absent = field_map(&[("status", &["absent"])]);
+        let filters = SearchFilters {
+            fields: Some(&absent),
+            ..Default::default()
+        };
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 1, &filters, &HashSet::new())
+            .unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            1,
+            "the first page already covered the whole corpus; widening cannot help"
+        );
+    }
+
+    #[test]
+    fn a_field_filter_shortfall_still_widens_past_an_exclusion_heavy_window() {
+        let db = db_with_384();
+        // The vector leg refuses a field filter until the declared set is recorded
+        // (round 10); this test is about the widening, so record it up front.
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+        let add = |path: &str, content: &str, e: f32, active: bool| -> i64 {
+            let doc = db
+                .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)
+                .unwrap();
+            if active {
+                db.replace_document_fields(path, &[("status".to_string(), "active".to_string())])
+                    .unwrap();
+            }
+            db.insert_chunk(doc, 0, None, None, content, None, &vec![e; 384], 1.0)
+                .unwrap()
+        };
+
+        let mut excluded = HashSet::new();
+        // Closest 25: status=active, hold "banana", excluded by chunk id.
+        for i in 0..25 {
+            let id = add(
+                &format!("near{i:02}.md"),
+                "banana body",
+                0.5 - (i as f32 + 1.0) * 0.001,
+                true,
+            );
+            excluded.insert(id);
+        }
+        // Next 30: no declared field at all -- the field predicate, not the
+        // exclusion set, is what drops these.
+        for i in 25..55 {
+            add(
+                &format!("noise{i:02}.md"),
+                "noise body",
+                0.5 - (i as f32 + 1.0) * 0.001,
+                false,
+            );
+        }
+        // Farthest 5: status=active, hold "cherry", past the first fetch_k window.
+        for i in 55..60 {
+            add(
+                &format!("far{i:02}.md"),
+                "cherry body",
+                0.5 - (i as f32 + 1.0) * 0.001,
+                true,
+            );
+        }
+
+        let active = field_map(&[("status", &["active"])]);
+        let filters = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 5, &filters, &excluded)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            5,
+            "the 5 eligible chunks sit past a window the field predicate and the \
+             exclusion both emptied; the loop must widen past it"
+        );
+        let paths: std::collections::BTreeSet<&str> =
+            hits.iter().map(|(_, r)| r.path.as_str()).collect();
+        assert!(
+            paths.iter().all(|p| p.starts_with("far")),
+            "only the far, non-excluded, status=active chunks should come back: {paths:?}"
+        );
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            2,
+            "the first window (25 excluded + 30 field-dropped) was not the whole \
+             corpus, so the KNN had to be widened once"
+        );
+    }
+
+    #[test]
+    fn field_filters_count_as_a_filter_for_over_fetch_and_normalise_one_way() {
+        let m = field_map(&[("status", &["active"])]);
+        assert!(
+            SearchFilters {
+                fields: Some(&m),
+                ..Default::default()
+            }
+            .has_any()
+        );
+        assert!(
+            SearchFilters {
+                fields_not: Some(&m),
+                ..Default::default()
+            }
+            .has_any()
+        );
+        let empty = FieldFilters::new();
+        assert!(
+            !SearchFilters {
+                fields: Some(&empty),
+                ..Default::default()
+            }
+            .has_any()
+        );
+
+        let n = normalize_field_filters(vec![
+            (
+                "status".to_string(),
+                vec![
+                    "draft".to_string(),
+                    "active".to_string(),
+                    "draft".to_string(),
+                ],
+            ),
+            ("team".to_string(), vec![]),
+            (
+                "status".to_string(),
+                vec!["active".to_string(), "archived".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            n.get("status").unwrap(),
+            &vec![
+                "draft".to_string(),
+                "active".to_string(),
+                "archived".to_string()
+            ]
+        );
+        assert!(
+            !n.contains_key("team"),
+            "a key whose list is empty narrows nothing and is dropped"
+        );
+    }
+
+    /// (codex P2 round 8 on PR #291) [`normalize_field_filters`]'s dedup goes through a per-key
+    /// seen-set (O(n) in the list length) rather than the old `Vec::contains` scan per value
+    /// (O(n²)). No timing assert -- that would be its own kind of flaky -- but 10,000 distinct
+    /// entries have to come back as 10,000, not hang or panic, which is what the O(n) path
+    /// buys over the quadratic one; and the seen-set has to keep the same first-occurrence
+    /// order the old scan gave, which the small interleaved-duplicates check below pins.
+    #[test]
+    fn normalize_field_filters_handles_a_large_distinct_list_and_keeps_first_occurrence_order() {
+        let distinct: Vec<String> = (0..10_000usize).map(|i| format!("v{i:05}")).collect();
+        let n = normalize_field_filters(vec![("status".to_string(), distinct.clone())]);
+        assert_eq!(
+            n.get("status").unwrap().len(),
+            10_000,
+            "10,000 already-distinct values must all survive"
+        );
+        assert_eq!(n.get("status").unwrap(), &distinct);
+
+        let interleaved = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+            "d".to_string(),
+        ];
+        let n = normalize_field_filters(vec![("status".to_string(), interleaved)]);
+        assert_eq!(
+            n.get("status").unwrap(),
+            &vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            "duplicates interleaved throughout the list must not disturb first-occurrence order"
+        );
     }
 
     #[test]

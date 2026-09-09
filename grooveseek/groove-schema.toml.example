@@ -66,7 +66,9 @@ max_length = 10
 # pattern = '^[a-z0-9-]+$'   # every element must match; the tag
 #                            # `frontmatter:unparsed` never reaches this rule
 
-# Domain keys the five above do not cover.
+# Domain keys the five above do not cover. A declared key is also what
+# `groove search --field status=active` filters on (v1.9.0+); the index
+# stores its values when `groove index` runs.
 [fields.status]
 enum = ["active", "deprecated"]
 

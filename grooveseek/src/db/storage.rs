@@ -634,6 +634,75 @@ impl Database {
         Ok(out)
     }
 
+    /// Replace every `document_fields` row of `path` with `rows` (feature-58).
+    ///
+    /// The rows are the values of the keys `groove-schema.toml` declares, one
+    /// row per scalar and one per list element; the indexer computes them from
+    /// [`crate::parser::Frontmatter::extra`] and this method only stores them.
+    /// A delete-then-insert, so a key the schema no longer declares disappears
+    /// with the next write. `INSERT OR IGNORE` folds a duplicate element into
+    /// one row. Nothing is written when `path` has no `documents` row.
+    ///
+    /// Autocommit-aware like [`Database::upsert_document`]: it joins the
+    /// caller's transaction when one is open and opens its own otherwise.
+    pub fn replace_document_fields(&self, path: &str, rows: &[(String, String)]) -> Result<()> {
+        let local_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        self.conn.execute(
+            "DELETE FROM document_fields WHERE document_id IN \
+             (SELECT id FROM documents WHERE path = ?1)",
+            params![path],
+        )?;
+        {
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO document_fields (document_id, key, value) \
+                 SELECT id, ?2, ?3 FROM documents WHERE path = ?1",
+            )?;
+            for (key, value) in rows {
+                stmt.execute(params![path, key, value])?;
+            }
+        }
+        if let Some(tx) = local_tx {
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// The `(key, value)` rows [`Database::replace_document_fields`] holds for
+    /// `path`, ordered by key then value. Empty for a path with no row.
+    pub fn document_fields_for_path(&self, path: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.key, f.value FROM document_fields f \
+             JOIN documents d ON d.id = f.document_id \
+             WHERE d.path = ?1 ORDER BY f.key, f.value",
+        )?;
+        let rows = stmt
+            .query_map(params![path], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Whether `document_fields` holds no row at all, across every document.
+    ///
+    /// (codex P2 round 2 on PR #291) [`crate::indexer::rebuild_index`] uses this
+    /// to tell "an index that has never declared a field" from "an index whose
+    /// generation key was lost mid-run but whose per-document rows are still
+    /// there" -- an absent `index_meta.declared_fields` key alone cannot, since
+    /// [`Database::replace_document_fields`] writes those rows before
+    /// [`Database::write_declared_fields`] records the set that produced them.
+    pub fn document_fields_is_empty(&self) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT NOT EXISTS (SELECT 1 FROM document_fields)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Delete a document and all associated chunks / vectors / FTS rows.
     pub fn delete_document(&self, path: &str) -> Result<()> {
         // Delete vector entries first (no FK from virtual table)
@@ -646,6 +715,13 @@ impl Database {
         self.conn.execute(
             "DELETE FROM fts_chunks WHERE rowid IN \
              (SELECT c.id FROM chunks c JOIN documents d ON c.document_id = d.id WHERE d.path = ?1)",
+            params![path],
+        )?;
+        // Declared frontmatter fields (feature-58). The FK cascades, but every
+        // dependent table is deleted explicitly here, so this one is too.
+        self.conn.execute(
+            "DELETE FROM document_fields WHERE document_id IN \
+             (SELECT id FROM documents WHERE path = ?1)",
             params![path],
         )?;
         // Delete chunks (cascade would handle this, but be explicit)

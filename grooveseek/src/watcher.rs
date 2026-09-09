@@ -730,7 +730,7 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
         }
         // (#251) `MetadataRefreshed` cannot come back here: the one-time check
         // is off on this path. Named so a new variant stays a compile error.
-        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed) => {
+        Ok(indexer::SingleResult::Unchanged | indexer::SingleResult::MetadataRefreshed { .. }) => {
             /* no-op */
         }
         // (BU-20) The reason is already on stderr from the read; this says what
@@ -785,6 +785,30 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         Ok(indexer::RenameOutcome::RenamedSizeCapped) => {
             wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
+            );
+        }
+        // (codex P2 round 12 on PR #291) The crossed-parser twins say the document is gone,
+        // because it is: "content left as it was" would send a reader looking for a row
+        // that was dropped.
+        Ok(indexer::RenameOutcome::RenamedSizeCappedAndDropped) => {
+            wdiag!(
+                "watcher: renamed {old_rel} -> {new_rel} (too large for the new parser, \
+                 document dropped from the index)"
+            );
+        }
+        // (local Codex on PR #291 after round 13) Not a success: the reparse wrote nothing,
+        // so the previous content (and, in Static mode, the previous path's breadcrumb)
+        // is what the new path serves until the file is indexed again.
+        Ok(indexer::RenameOutcome::RenamedButNotReindexed) => {
+            wdiag!(
+                "watcher: renamed {old_rel} -> {new_rel} (reparse skipped, previous content \
+                 kept under the new path; see the reason above)"
+            );
+        }
+        Ok(indexer::RenameOutcome::RenamedButRefusedAndDropped) => {
+            wdiag!(
+                "watcher: renamed {old_rel} -> {new_rel} (the new parser could not index it, \
+                 document dropped from the index)"
             );
         }
         // (BU-20) The reason is already on stderr from `read_for_index`; this

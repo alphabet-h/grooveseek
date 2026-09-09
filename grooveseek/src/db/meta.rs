@@ -6,13 +6,14 @@
 //! writing `index_meta` (embedding model, dimension, context mode, the tags
 //! parse-failure counter), counting what is stored, and the operations that
 //! rewrite or relabel the whole index — `backfill_fts`, `backfill_quality`,
-//! `reset_for_model`, the renames.
+//! [`crate::db::Database::reset_for_model`], the renames.
 //!
-//! `reset_for_model` is the sharpest of these: five writes (three DELETEs, the
-//! `vec_chunks` rebuild, the `index_meta` update) that have to land as one
-//! transaction, because a partial failure leaves a state no re-run repairs —
-//! documents present with no chunks, or `vec_chunks` at a new dimension while
-//! `index_meta` still names the old model.
+//! [`crate::db::Database::reset_for_model`] is the sharpest of these: six
+//! writes (four DELETEs, the `vec_chunks` rebuild, the `index_meta` update)
+//! that have to land as one transaction, because a partial failure leaves a
+//! state no re-run repairs — documents present with no chunks, or
+//! `vec_chunks` at a new dimension while `index_meta` still names the old
+//! model.
 //!
 //! Split out of `db.rs` in AU-25 (PR-4), completing the item. The methods are
 //! byte-identical and keep their visibility.
@@ -272,6 +273,127 @@ impl Database {
         self.conn.execute(
             "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('frontmatter_policy', ?1)",
             params![policy],
+        )?;
+        Ok(())
+    }
+
+    /// `index_meta.declared_fields` (feature-58): the sorted JSON array of key
+    /// names `groove-schema.toml` declared when the index was last completed.
+    /// `None` = never recorded, which is every index written before 1.9.0.
+    /// [`crate::indexer::rebuild_index`] compares it with the schema it reads
+    /// and, on a difference, reads every unchanged Markdown document's
+    /// frontmatter again so `document_fields` follows the schema.
+    pub fn read_declared_fields(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'declared_fields'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record `index_meta.declared_fields` (INSERT OR REPLACE, feature-58).
+    pub fn write_declared_fields(&self, json: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('declared_fields', ?1)",
+            params![json],
+        )?;
+        Ok(())
+    }
+
+    /// Delete `index_meta.declared_fields`, leaving it absent (codex P2 round 3 on PR #291).
+    ///
+    /// [`crate::indexer::rebuild_index`] calls this right after it decides a declared-field
+    /// refresh will run (or `force`, which rewrites every document anyway), before the loop
+    /// that writes `document_fields` rows starts. An interrupted pass -- the process dies after
+    /// committing some documents' rows but before the end-of-run [`Database::write_declared_fields`]
+    /// -- must leave the generation key absent, not the value it had before the refresh began:
+    /// restoring the *old* schema afterward would otherwise compare stored-old == declared-old,
+    /// skip the refresh, and leave the newer rows in place indefinitely. Absent is safe in both
+    /// directions once [`Database::document_fields_is_empty`] backs the empty-set shortcut
+    /// (codex P2 round 2): a genuinely fresh index reads as "nothing to refresh", and an
+    /// interrupted one reads as "refresh again".
+    pub fn clear_declared_fields(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])?;
+        Ok(())
+    }
+
+    /// `index_meta.declared_fields_pass`: the token of the refresh pass that is
+    /// currently running, written by [`crate::indexer::rebuild_index`] together with
+    /// [`Database::clear_declared_fields`] and removed when the pass finishes (codex P2
+    /// round 12 on PR #291). `None` = no pass has the generation cleared right now.
+    ///
+    /// Why a token and not a flag: a watcher in **another process** (the server's,
+    /// while `groove index` runs) can write a document after this pass already
+    /// processed it and before the pass records the generation. That document's
+    /// `document_fields` rows are then whatever the *previous* generation left, under a
+    /// hash the pass will consider current. The watcher cannot replace the rows (it
+    /// does not know the set -- `indexer.rs`'s private `declared_fields_recorded`
+    /// returns `None`), so it
+    /// records instead that it wrote *during* this pass: [`Database::mark_declared_fields_dirty`]
+    /// stores the token it read here, and the pass, on finishing, keeps the generation
+    /// pending when the stored token is its own. A write that happened under an older,
+    /// interrupted pass carries that pass's token and is ignored -- the refresh this pass
+    /// just ran rewrote every document's rows anyway.
+    pub fn read_declared_fields_pass(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'declared_fields_pass'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record the token of the refresh pass that starts now (see
+    /// [`Database::read_declared_fields_pass`]).
+    pub fn write_declared_fields_pass(&self, token: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('declared_fields_pass', ?1)",
+            params![token],
+        )?;
+        Ok(())
+    }
+
+    /// A watcher path wrote a document while the generation was pending: remember the
+    /// pass token it saw, so that pass keeps the generation pending when it finishes
+    /// (see [`Database::read_declared_fields_pass`]). Without a running pass there is
+    /// no token to remember, and nothing to do -- the next refresh rewrites every row.
+    pub fn mark_declared_fields_dirty(&self) -> Result<()> {
+        if let Some(token) = self.read_declared_fields_pass()? {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('declared_fields_dirty', ?1)",
+                params![token],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The pass token a watcher write recorded (see [`Database::mark_declared_fields_dirty`]).
+    pub fn read_declared_fields_dirty(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'declared_fields_dirty'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Remove the pass token and the dirty mark together: a pass is over, whether it
+    /// recorded the generation or left it pending.
+    pub fn clear_declared_fields_pass(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_meta WHERE key IN ('declared_fields_pass', 'declared_fields_dirty')",
+            [],
         )?;
         Ok(())
     }
@@ -730,7 +852,7 @@ impl Database {
     /// を全消ししてから新しい `(model, dim)` を記録する。`indexer::rebuild_index`
     /// が直後にすべての文書を再インデックスすることを前提とする。
     ///
-    /// 5 つの書き込み (DELETE ×3 / vec_chunks 再生成 / index_meta 更新) は
+    /// 6 つの書き込み (DELETE ×4 / vec_chunks 再生成 / index_meta 更新) は
     /// **1 つの transaction にまとめる**。途中で失敗ないし中断すると、
     /// 「documents は残っているのに chunks が空」「`vec_chunks` が新しい次元
     /// なのに `index_meta` は旧 model」といった、どの再実行経路でも自動修復
@@ -742,6 +864,19 @@ impl Database {
     /// 親 transaction にそのまま参加する。SQLite は真のネスト transaction を
     /// 持たないため (`db-transaction-composition-pattern.md` 罠 1、
     /// `upsert_document` と同じ形)。
+    ///
+    /// (feature-58, local Codex on PR #291 after round 10) `index_meta.declared_fields`
+    /// goes in the **same** transaction as the `document_fields` wipe. The key says
+    /// "these rows were written under this declared set"; once the rows are gone that
+    /// claim is false, and [`crate::indexer::rebuild_index`] only clears the key later, in
+    /// its own commit. In the gap -- or for good, if the process dies between the two -- a
+    /// search carrying `fields` / `fields_not` would read a recorded generation over
+    /// an empty (then partially rebuilt) table and answer "no match" instead of the
+    /// refusal the search legs exist to give (`refuse_field_filters_while_pending` in
+    /// `db/search.rs`, the private check behind [`crate::db::FIELD_FILTERS_PENDING`]). Absent
+    /// is the state [`crate::indexer::rebuild_index`] expects after `force` anyway (it clears the key on
+    /// `force` itself), so this only moves the clear to where it is atomic with the
+    /// wipe it belongs to.
     pub fn reset_for_model(&self, model: &str, dim: u32) -> Result<()> {
         let local_tx = if self.conn.is_autocommit() {
             Some(self.conn.unchecked_transaction()?)
@@ -750,6 +885,8 @@ impl Database {
         };
         self.conn.execute_batch(
             "DELETE FROM fts_chunks; \
+             DELETE FROM document_fields; \
+             DELETE FROM index_meta WHERE key = 'declared_fields'; \
              DELETE FROM chunks; \
              DELETE FROM documents;",
         )?;

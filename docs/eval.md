@@ -415,7 +415,7 @@ reported as unsupported and excluded rather than scored as failures, leaving
 **Where GrooveSeek lost or tied.** *typo* (n=6): P@1 0.500 against QMD's 0.833, the
 widest margin in QMD's favour of any class. *deprecated-trap* (n=4): P@1 **0.000** — a
 deprecated runbook with heavier keyword overlap beats its active replacement
-at rank 1 every time. *environment-filtered* (n=5): 0.200, tied. *ambiguous*
+at rank 1 every time. *environment-filtered* (n=5): 0.200, tied — and traced by the corpus author to the corpus rather than to retrieval: 69 of its 74 documents carry a blanket `[dev, test, prod]` because the sources state no environment, so the filter removes one document, and the benchmark corpus has the same shape (38 of 57 carry both `env-staging` and `env-production`) (#289). *ambiguous*
 (n=4): 0.500 against 0.750. The cross-encoder reranker cost 51× median latency
 to lose 0.067 P@1 and is off in that deployment (65× at 1.2.0; the rerank path
 got faster without changing what it returns).
@@ -434,7 +434,7 @@ gap rather than a loss on quality.
 
 The *deprecated-trap* result is the one this project takes as a to-do rather
 than a footnote; it is on the record here so that a later release can be
-measured against it.
+measured against it. 1.9.0 adds the means to close it — `--field-not status=deprecated`, once `status` is a declared key — and the number here is the one a later run is measured against.
 
 ## `groove tune` — measuring the fusion parameters (v0.13.0+)
 

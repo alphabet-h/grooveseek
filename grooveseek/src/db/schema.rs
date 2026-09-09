@@ -103,6 +103,15 @@ impl Database {
             -- quality_score のインデックスは `ensure_quality_score_column` で
             -- 列存在保証の後にまとめて作成する (legacy DB は ALTER が
             -- 先に走る必要があるため、ここでは列だけ用意する)。
+
+            CREATE TABLE IF NOT EXISTS document_fields (
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                UNIQUE (document_id, key, value)
+            );
+            CREATE INDEX IF NOT EXISTS idx_document_fields_key_value
+                ON document_fields(key, value, document_id);
             ",
         )?;
 

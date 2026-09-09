@@ -86,6 +86,15 @@ max_chunk_chars = 3500
 # [index]
 # fail_on_frontmatter_error = true
 
+# `groove index` は存在すれば `<kb_path>/groove-schema.toml` も読む
+# (v1.9.0+)。宣言された key — `title` / `date` / `topic` / `depth` / `tags`
+# の他に — は文書ごとに保存され、`search --field` が filter する値になる。
+# path 用の key は無い — それは `groove validate` が読むファイルである。
+# スキーマの読み込みに失敗すると、index せずに続けるのではなく、その
+# load error で index を止める。`groove index` が読むのはこの 1 か所だけ:
+# 別の場所に置いて `groove validate --schema <path>` に渡しているスキーマは
+# index からは見えないので、それに対する `search --field` filter は空を返す。
+
 # ライブ同期ファイルウォッチャ。`groove serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
 # 増分再インデックスされる。PostToolUse hook を補完する位置付け:

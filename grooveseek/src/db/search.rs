@@ -45,6 +45,68 @@ use super::*;
 pub(super) const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
+/// The one sentence a `fields` / `fields_not` filter is refused with while the
+/// index has no recorded declared-field set (feature-58, codex P2 round 10 on
+/// PR #291; see [`Database::refuse_field_filters_while_pending`]). `pub` so the
+/// subprocess tests assert the CLI's stderr and the MCP tool's error envelope
+/// against the same text rather than two copies of it.
+pub const FIELD_FILTERS_PENDING: &str = "fields / fields_not cannot be applied: the index has \
+    no recorded declared-field set (a `groove index` run is in progress, was interrupted, or \
+    has not run since the index was created); let `groove index` complete and retry";
+
+/// The `AND …` text and the values to bind for the declared-field filters
+/// (feature-58), numbered from `first`. Both search legs append this to their
+/// `WHERE`; the FTS leg starts at `?6` and the vector leg at `?3`, because
+/// both queries use **numbered** parameters and a bare `?` would be counted
+/// again where `bm25(...)` repeats in `ORDER BY` (the warning above the FTS
+/// query). Every value goes through a bind, never into the SQL text.
+fn field_predicates(
+    first: usize,
+    fields: Option<&FieldFilters>,
+    fields_not: Option<&FieldFilters>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    fn push(
+        n: &mut usize,
+        map: Option<&FieldFilters>,
+        keyword: &str,
+        sql: &mut String,
+        binds: &mut Vec<rusqlite::types::Value>,
+    ) {
+        for (key, values) in map.into_iter().flatten() {
+            if values.is_empty() {
+                continue;
+            }
+            let key_slot = *n;
+            *n += 1;
+            let value_slots: Vec<String> = values
+                .iter()
+                .map(|_| {
+                    let slot = *n;
+                    *n += 1;
+                    format!("?{slot}")
+                })
+                .collect();
+            sql.push_str(&format!(
+                " AND {keyword} (SELECT 1 FROM document_fields df \
+                 WHERE df.document_id = d.id AND df.key = ?{key_slot} AND df.value IN ({}))",
+                value_slots.join(", ")
+            ));
+            binds.push(rusqlite::types::Value::Text(key.clone()));
+            binds.extend(
+                values
+                    .iter()
+                    .map(|v| rusqlite::types::Value::Text(v.clone())),
+            );
+        }
+    }
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    let mut n = first;
+    push(&mut n, fields, "EXISTS", &mut sql, &mut binds);
+    push(&mut n, fields_not, "NOT EXISTS", &mut sql, &mut binds);
+    (sql, binds)
+}
+
 /// `any_pool` が空なら常に pass (= フィルタ無効)。
 fn matches_tags_any(hit_tags: &[String], any_pool: &[String]) -> bool {
     if any_pool.is_empty() {
@@ -153,8 +215,27 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        // Pin the snapshot for the pending check and the query (see `field_filter_snapshot`).
+        let snapshot = self.field_filter_snapshot(filters)?;
+        let hits = self.search_fts_candidates_parsed_pinned(query, limit, filters, fusion)?;
+        if let Some(tx) = snapshot {
+            tx.commit()?;
+        }
+        Ok(hits)
+    }
+
+    /// The body of [`Self::search_fts_candidates_parsed`], run inside whatever snapshot
+    /// that wrapper (or the hybrid path) opened.
+    fn search_fts_candidates_parsed_pinned(
+        &self,
+        query: &ParsedQuery<'_>,
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        fusion: FusionParams,
+    ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
+        self.refuse_field_filters_while_pending(filters.fields, filters.fields_not)?;
         // 切り詰めの警告は 1 検索 1 回。ここが「クエリを FTS に投げる」唯一の経路。
         query.warn_if_truncated();
         let Some(fts_query) = query.match_expr() else {
@@ -175,57 +256,58 @@ impl Database {
         //
         // feature-47 D-4: 重みは **番号付き** bind parameter で渡す。匿名 `?` は
         // SELECT と ORDER BY で別々に採番されて既存の `?1`/`?2` と衝突し
-        // "statement uses 6, 5 supplied" になるため使ってはならない。
+        // "statement uses 6, 5 supplied" になるため使ってはならない。feature-58
+        // の `?6` 以降は `field_predicates` が同じ理由で採番する。
         // NaN / inf は bind 経路を silent に通ってしまうので、値域の防波堤は
         // `Config::validate()` 唯一 (D-2 / E-2)。
-        let sql = "
-            SELECT c.id, bm25(fts_chunks, ?3, ?4, ?5) AS score,
+        let (pred, pred_binds) = field_predicates(6, filters.fields, filters.fields_not);
+        let sql = format!(
+            "SELECT c.id, bm25(fts_chunks, ?3, ?4, ?5) AS score,
                    c.content, c.heading, c.quality_score, c.document_id,
                    d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text,
                    c.start_line, c.end_line, c.symbol_kind
             FROM fts_chunks f
             JOIN chunks c ON c.id = f.rowid
             JOIN documents d ON d.id = c.document_id
-            WHERE fts_chunks MATCH ?1
+            WHERE fts_chunks MATCH ?1{pred}
             ORDER BY bm25(fts_chunks, ?3, ?4, ?5)
-            LIMIT ?2
-            ";
-        let mut stmt = self.conn.prepare(sql)?;
+            LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         // f64 へ拡幅してから bind する。sqlite3_value_double が受けるのは double
         // であり、f32 → f64 は値を変えない (2.0 / 1.0 / 0.5 / 4.0 いずれも厳密表現)。
-        let rows = stmt.query_map(
-            params![
-                fts_query,
-                fetch_limit,
-                fusion.bm25_heading_weight as f64,
-                fusion.bm25_context_weight as f64,
-                fusion.bm25_content_weight as f64
-            ],
-            |row| {
-                let chunk_id: i64 = row.get(0)?;
-                let score: f32 = row.get(1)?;
-                Ok((
-                    chunk_id,
-                    score,
-                    row.get::<_, String>(2)?,          // content
-                    row.get::<_, Option<String>>(3)?,  // heading
-                    row.get::<_, f32>(4)?,             // quality_score
-                    row.get::<_, i64>(5)?,             // document_id (F-41)
-                    row.get::<_, String>(6)?,          // path
-                    row.get::<_, Option<String>>(7)?,  // title
-                    row.get::<_, Option<String>>(8)?,  // topic
-                    row.get::<_, Option<String>>(9)?,  // date
-                    row.get::<_, Option<String>>(10)?, // category
-                    row.get::<_, Option<String>>(11)?, // tags (JSON)
-                    row.get::<_, Option<String>>(12)?, // context_text
-                    // (feature-56) NULL on every prose chunk, and on code chunks written
-                    // before these columns existed.
-                    row.get::<_, Option<u32>>(13)?,    // start_line
-                    row.get::<_, Option<u32>>(14)?,    // end_line
-                    row.get::<_, Option<String>>(15)?, // symbol_kind
-                ))
-            },
-        )?;
+        let mut binds: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(fts_query),
+            rusqlite::types::Value::Integer(i64::from(fetch_limit)),
+            rusqlite::types::Value::Real(fusion.bm25_heading_weight as f64),
+            rusqlite::types::Value::Real(fusion.bm25_context_weight as f64),
+            rusqlite::types::Value::Real(fusion.bm25_content_weight as f64),
+        ];
+        binds.extend(pred_binds);
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+            let chunk_id: i64 = row.get(0)?;
+            let score: f32 = row.get(1)?;
+            Ok((
+                chunk_id,
+                score,
+                row.get::<_, String>(2)?,          // content
+                row.get::<_, Option<String>>(3)?,  // heading
+                row.get::<_, f32>(4)?,             // quality_score
+                row.get::<_, i64>(5)?,             // document_id (F-41)
+                row.get::<_, String>(6)?,          // path
+                row.get::<_, Option<String>>(7)?,  // title
+                row.get::<_, Option<String>>(8)?,  // topic
+                row.get::<_, Option<String>>(9)?,  // date
+                row.get::<_, Option<String>>(10)?, // category
+                row.get::<_, Option<String>>(11)?, // tags (JSON)
+                row.get::<_, Option<String>>(12)?, // context_text
+                // (feature-56) NULL on every prose chunk, and on code chunks written
+                // before these columns existed.
+                row.get::<_, Option<u32>>(13)?,    // start_line
+                row.get::<_, Option<u32>>(14)?,    // end_line
+                row.get::<_, Option<String>>(15)?, // symbol_kind
+            ))
+        })?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -384,12 +466,106 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<(CandidateHits, CandidateHits)> {
+        // (local Codex on PR #291 after round 12, third pass) One snapshot for the whole
+        // request when a field filter is on: both legs, their pending checks and the vector
+        // leg's pages all read the same committed state -- see `field_filter_snapshot`.
+        let snapshot = self.field_filter_snapshot(filters)?;
         let parsed = parse_query(query_text);
         let excluded = self.excluded_chunk_ids(parsed.negative_match().as_deref())?;
         let vec_hits =
             self.search_vec_candidates_excluding(query_embedding, candidates, filters, &excluded)?;
         let fts_hits = self.search_fts_candidates_parsed(&parsed, candidates, filters, fusion)?;
+        if let Some(tx) = snapshot {
+            tx.commit()?;
+        }
         Ok((vec_hits, fts_hits))
+    }
+
+    /// (local Codex on PR #291 after round 12, third pass) The read snapshot a
+    /// field-filtered search runs inside, or `None` when there is nothing to pin.
+    ///
+    /// [`Database::refuse_field_filters_while_pending`] reads the generation key once;
+    /// the candidate statements run afterwards, and under WAL each statement outside a
+    /// transaction sees whatever is committed *then*. A refresh in another process can
+    /// begin between the check and a leg's query -- or between two pages of the vector
+    /// leg -- clear the key and commit per-document row replacements, and the search
+    /// answers from a mix of generations after having passed the check. A deferred
+    /// transaction pins the snapshot at its first read: the check and every statement
+    /// until the commit see one committed state, so a refresh that begins in between is
+    /// invisible to this request and the next request is refused. Opened only when a
+    /// field filter is present (the only reader the generation protects) and only when
+    /// no transaction is open already (the hybrid path opens one for both legs; a leg
+    /// called on its own opens its own). A deferred transaction takes no write lock, so
+    /// it never blocks the writer whose commits it is shielded from.
+    ///
+    /// `pub`, because the front ends open it **around the whole request** (local Codex on
+    /// PR #291 after round 12, fourth pass): the candidates are not the last thing a
+    /// request reads -- the MMR pool fetches the candidates' embeddings and the parent
+    /// retriever reads neighbouring chunks after the legs return -- so the command line and
+    /// the MCP tool open the snapshot before [`crate::server::run_search_pipeline`] and commit it after the
+    /// parent retriever, and the legs, finding a transaction open, add none of their own
+    /// (`eval` runs its golden queries without filters and opens nothing). A chunk a concurrent reindex replaced is then still the chunk the
+    /// request searched, not a hole in the answer. (An unfiltered search keeps the
+    /// pre-existing behaviour: no snapshot, each statement on the state committed then.)
+    pub fn field_filter_snapshot(
+        &self,
+        filters: &SearchFilters<'_>,
+    ) -> Result<Option<rusqlite::Transaction<'_>>> {
+        let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
+            || filters.fields_not.is_some_and(|f| !f.is_empty());
+        if field_filtered && self.conn.is_autocommit() {
+            Ok(Some(self.conn.unchecked_transaction()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// (feature-58, codex P2 round 10 on PR #291) A `fields` / `fields_not` filter
+    /// is refused while `index_meta.declared_fields` is **absent**.
+    ///
+    /// [`crate::indexer::rebuild_index`] clears that key when a schema refresh starts
+    /// and writes it back only when the pass completed
+    /// ([`Database::clear_declared_fields`]'s doc has the state machine). In between --
+    /// a refresh in progress, or one that was interrupted or stopped short on an
+    /// unreadable document -- `document_fields` can hold rows from **both** the old
+    /// and the new declared set, so a predicate that reads it would answer from a
+    /// mixture and call it a result. The watcher paths already treat that state as
+    /// "do not touch the rows" (`indexer.rs`'s private `declared_fields_recorded`
+    /// returning `None`); this is the same rule on the read side.
+    ///
+    /// Here rather than in the CLI arm or the MCP tool body, and in **both legs**
+    /// rather than only where the hybrid search joins them: the refusal has one
+    /// implementation, called from the two places that build the field predicate
+    /// ([`Database::search_vec_candidates_excluding`] and
+    /// [`Database::search_fts_candidates_parsed`]), so no entry point can reach the
+    /// predicate around it -- `groove search`, the MCP `search` tool, `eval`, `tune`,
+    /// and the single-leg `pub` / `pub(crate)` methods ([`Database::search_similar`],
+    /// [`Database::search_fts_candidates`]) a library caller or a sweep uses directly
+    /// (local Codex on PR #291 after round 10: gating only
+    /// [`Database::search_split_candidates`] left [`Database::search_similar`] answering
+    /// from the pending state). A hybrid search therefore asks twice, one tiny `index_meta` read
+    /// per leg, and only when a field filter is present. An empty map is not a filter
+    /// and is not refused; `[]` (a completed pass that declared nothing) is a recorded
+    /// answer, and a filter against it simply matches nothing, as documented.
+    ///
+    /// `pub`, and taking the two maps rather than a whole [`SearchFilters`], because the
+    /// front ends ask it **early** as well (codex P2 round 11 on PR #291): the command
+    /// line right after opening the database and before
+    /// [`crate::embedder::Embedder::with_model`] (a
+    /// request this refuses must not first pay for a model download), the MCP tool
+    /// before embedding the query. The legs keep asking too -- they are the check that
+    /// cannot be bypassed; the early calls only move the answer forward.
+    pub fn refuse_field_filters_while_pending(
+        &self,
+        fields: Option<&FieldFilters>,
+        fields_not: Option<&FieldFilters>,
+    ) -> Result<()> {
+        let field_filtered =
+            fields.is_some_and(|f| !f.is_empty()) || fields_not.is_some_and(|f| !f.is_empty());
+        if field_filtered && self.read_declared_fields()?.is_none() {
+            anyhow::bail!("{FIELD_FILTERS_PENDING}");
+        }
+        Ok(())
     }
 
     /// 負の式にマッチする chunk id。vector 半身から落とす集合 (F-4)。
@@ -480,8 +656,14 @@ impl Database {
     /// - `limit` 件埋まった
     /// - そのページが除外で 1 行も落としていない ([`VecPage::dropped_by_exclusion`] が 0 =
     ///   **filter をすべて通った行**を除外で落とした数が 0)
-    /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
+    /// - `fields` / `fields_not` が指定されていないときに限り、KNN が `fetch_k` に
+    ///   満たない行数を返した = corpus を読み切った
     /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
+    ///
+    /// 3 つ目に field filter の除外を付けたのは (codex P2 round 1 on PR #291)、
+    /// `fields` / `fields_not` が SQL 側の `WHERE` で落とした行は
+    /// [`VecPage::rows_seen`] に数えられないため、field filter があるときの
+    /// `fetch_k` 未満は corpus の残りと無関係に起きるからである。
     ///
     /// 2 つ目が「`excluded` が空」ではないのが要点 (round 2)。category / path / date /
     /// quality の filter で `limit` に届かないのは feature-26 以来の既存挙動で、ここで
@@ -509,9 +691,31 @@ impl Database {
         filters: &SearchFilters<'_>,
         excluded: &HashSet<i64>,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        // Pin the snapshot for the pending check and every page (see `field_filter_snapshot`).
+        let snapshot = self.field_filter_snapshot(filters)?;
+        let hits =
+            self.search_vec_candidates_excluding_pinned(query_embedding, limit, filters, excluded)?;
+        if let Some(tx) = snapshot {
+            tx.commit()?;
+        }
+        Ok(hits)
+    }
+
+    /// The body of [`Self::search_vec_candidates_excluding`], run inside whatever
+    /// snapshot that wrapper (or the hybrid path) opened.
+    fn search_vec_candidates_excluding_pinned(
+        &self,
+        query_embedding: &[f32],
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        excluded: &HashSet<i64>,
+    ) -> Result<Vec<(i64, SearchResult)>> {
+        self.refuse_field_filters_while_pending(filters.fields, filters.fields_not)?;
         // filter 指定があれば over-fetch する (詳細は SearchFilters::has_any)。
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。
+        // fields / fields_not は SQL 側 (feature-58, field_predicates) だが、
+        // KNN の k 件から絞る点は同じなので over-fetch はやはり必要。
         // 除外も同じ理由で広げる — 最近傍が除外語を含むだけで limit が埋まらなくなる。
         let mut fetch_k = if filters.has_any() || !excluded.is_empty() {
             limit
@@ -529,12 +733,37 @@ impl Database {
         .min(VEC_KNN_MAX_K);
         let embedding_json = serde_json::to_string(query_embedding)?;
 
+        // (codex P2 round 1 on PR #291) A field predicate lives inside the KNN SQL's
+        // `WHERE`, so `rows_seen` only counts rows that survived it -- a page shorter
+        // than `fetch_k` no longer proves the corpus is exhausted when one is active.
+        let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
+            || filters.fields_not.is_some_and(|f| !f.is_empty());
+        // (local Codex on PR #291 after round 13, sixth pass) The one exhaustion signal that
+        // survives a field predicate: the corpus size. Read once per request, inside the
+        // request's snapshot; a page whose `fetch_k` already covers every chunk cannot be
+        // widened into anything, whatever the predicate let through. Without it a filter
+        // that matches nothing walked the KNN up to the cap on a corpus of a few chunks.
+        let corpus_chunks = if field_filtered {
+            Some(self.chunk_count()?)
+        } else {
+            None
+        };
+
         loop {
             let page = self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
-            if page.hits.len() >= limit as usize
-                || page.dropped_by_exclusion == 0
-                || page.rows_seen < fetch_k as usize
-                || fetch_k >= VEC_KNN_MAX_K
+            // (local Codex on PR #291 after round 13) Under a field filter neither of the
+            // two "widening will not help" signals holds: `rows_seen` counts rows the SQL
+            // predicate let through (round 1), and `dropped_by_exclusion == 0` only says the
+            // *exclusion* dropped nothing -- the predicate may have emptied the whole page
+            // by itself, with a matching chunk sitting just past it. A field-filtered page
+            // therefore keeps widening until `limit` is filled, the KNN cap is reached, or
+            // the page already spans the whole corpus; an unfiltered one stops as before.
+            let widening_cannot_help = if field_filtered {
+                corpus_chunks.is_some_and(|total| fetch_k >= total)
+            } else {
+                page.dropped_by_exclusion == 0 || page.rows_seen < fetch_k as usize
+            };
+            if page.hits.len() >= limit as usize || widening_cannot_help || fetch_k >= VEC_KNN_MAX_K
             {
                 return Ok(page.hits);
             }
@@ -545,12 +774,18 @@ impl Database {
     /// KNN を 1 回だけ引き、行ごとの連言 (filter 群 → 除外) を通したものを返す。
     ///
     /// [`VecPage::rows_seen`] が `fetch_k` に満たなければ corpus を読み切ったということ
-    /// なので、呼び出し側はそこで再取得をやめる。[`VecPage::dropped_by_exclusion`] が 0 なら
-    /// 足りない原因は除外ではない (= filter) ので、やはりやめる。
+    /// なので、呼び出し側はそこで再取得をやめる — ただし field filter があるときは除く
+    /// (codex P2 round 1 on PR #291、理由は [`Database::search_vec_candidates_excluding`]
+    /// の doc を参照)。[`VecPage::dropped_by_exclusion`] が 0 なら足りない原因は除外では
+    /// ない (= filter) ので、やはりやめる。
     ///
     /// `limit` 件埋まった時点で読むのをやめるため、その場合はどちらの数も**途中まで**の
     /// 値になる。ただしそのときは呼び出し側の「埋まった」条件が先に成立するので、
     /// 2 つとも参照されない。
+    ///
+    /// `rows_seen` は SQL が返した行数 (feature-58 の `fields` / `fields_not` は
+    /// `WHERE` 句の `EXISTS` / `NOT EXISTS` で SQLite 側が落とすため、その行は
+    /// 数えない — カウントの意味は Task 3 の Rust 側フィルタ群と同じ)。
     fn fetch_vec_page(
         &self,
         embedding_json: &str,
@@ -559,21 +794,27 @@ impl Database {
         filters: &SearchFilters<'_>,
         excluded: &HashSet<i64>,
     ) -> Result<VecPage> {
-        let sql = "
-            SELECT v.chunk_id, v.distance,
+        let (pred, pred_binds) = field_predicates(3, filters.fields, filters.fields_not);
+        let sql = format!(
+            "SELECT v.chunk_id, v.distance,
                    c.content, c.heading, c.quality_score, c.document_id,
                    d.path, d.title, d.topic, d.date, d.category, d.tags, c.context_text,
                    c.start_line, c.end_line, c.symbol_kind
             FROM vec_chunks v
             JOIN chunks c ON c.id = v.chunk_id
             JOIN documents d ON d.id = c.document_id
-            WHERE v.embedding MATCH ?1 AND k = ?2
-            ORDER BY v.distance
-        ";
+            WHERE v.embedding MATCH ?1 AND k = ?2{pred}
+            ORDER BY v.distance"
+        );
         #[cfg(test)]
         VEC_KNN_ATTEMPTS.with(|c| c.set(c.get() + 1));
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![embedding_json, fetch_k], |row| {
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut binds: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Text(embedding_json.to_string()),
+            rusqlite::types::Value::Integer(i64::from(fetch_k)),
+        ];
+        binds.extend(pred_binds);
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
             let chunk_id: i64 = row.get(0)?;
             let distance: f32 = row.get(1)?;
             Ok((

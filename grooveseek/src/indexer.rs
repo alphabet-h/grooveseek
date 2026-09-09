@@ -364,6 +364,60 @@ fn detect_renames(
     pairs
 }
 
+/// Whether renaming `old_rel` to `new_rel` moves the file to a different parser
+/// (feature-58, codex P2 round 5 on PR #291).
+///
+/// A same-hash rename normally skips re-parsing on both paths that see one --
+/// [`rebuild_index`]'s rename-detection loop and the watcher's
+/// [`rename_single_file`] -- because the bytes did not change, so there is
+/// nothing new to embed. That shortcut is wrong when the rename also crosses
+/// parsers: `document_fields`, `title`, and `tags` all came from whichever
+/// parser last read the file, and a `.txt` renamed to `.md` (or back) with the
+/// same bytes needs the *other* parser's reading, not none. [`Registry::by_extension`]
+/// (case-insensitive, same lookup [`indexed_markdown_hash`] and the rename
+/// code already use) resolving to `None` on one side and `Some` on the other
+/// counts as a crossing too -- an unregistered extension has no parser at
+/// all, which is as different from any registered one as two registered
+/// parsers are from each other.
+///
+/// One predicate rather than the check duplicated at each of the two call
+/// sites (AGENTS "one question gets one implementation"): the parser-crossing
+/// decision has one definition, and both rename paths ask it the same
+/// question.
+fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) -> bool {
+    let parser_of = |rel: &str| {
+        let ext = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        registry.by_extension(ext).map(|p| p.extension())
+    };
+    parser_of(old_rel) != parser_of(new_rel)
+}
+
+/// After a rename [`rename_crosses_a_parser`] said crosses parsers, the caller reparses the
+/// file under the destination parser -- forced when the bytes did not change (codex P2 round 5
+/// on PR #291), or through the ordinary changed-content arm when they did (codex P2 round 10:
+/// [`rename_single_file`] settles both, not only the same-byte case). When that reparse does
+/// not end in [`SingleResult::Updated`] -- the new parser refuses the bytes
+/// ([`SingleResult::Refused`]), fails to parse them (a [`SingleResult::Skipped`] whose reason is
+/// "parse failed"), or finds nothing to chunk (a [`SingleResult::Skipped`] whose reason is
+/// [`SKIPPED_NO_CHUNKS`]) -- the document row at `rel` is still whatever the *old* parser last
+/// wrote there: chunks, metadata, `document_fields`, none of which the new path's parser stands
+/// behind (codex P2 round 9 on PR #291, a regression the round 5 fix introduced: it forces the
+/// reparse but never checked what the reparse came back with). Delete the row so it matches
+/// what a fresh file the new parser cannot read already gets: nothing.
+///
+/// Shared by [`rebuild_index`]'s rename loop and [`rename_single_file`], the only two callers
+/// of [`rename_crosses_a_parser`], so the decision has one home (AGENTS.md "one question gets
+/// one implementation") rather than being reimplemented at each call site.
+fn settle_cross_parser_rename(db: &Database, rel: &str, outcome: &SingleResult) -> Result<()> {
+    if !matches!(outcome, SingleResult::Updated { .. }) {
+        db.delete_document(rel)?;
+    }
+    Ok(())
+}
+
 /// この document path を現在の registry で開けるか。
 ///
 /// 「どの行を提供できるか」と「どの行が registry から外れたか」(AU-06) を
@@ -474,11 +528,12 @@ pub enum SingleResult {
         reason: &'static str,
         frontmatter_unparsed: bool,
     },
-    /// (#251) 内容は変わっていないが、この版が frontmatter の parse 失敗を tag として
-    /// 書くようになる前に索引された文書だったので、metadata だけ書き直した
-    /// (= `frontmatter:unparsed` を付けた)。embedding は触らない。[`rebuild_index`] の
-    /// 1 回限りの upgrade 経路でしか返らない。
-    MetadataRefreshed,
+    /// (#251 / feature-58) 内容は変わっていないが metadata だけ書き直した。embedding は触らない。
+    /// [`rebuild_index`] の upgrade 経路でしか返らない。`frontmatter_unparsed` は
+    /// **この文書の frontmatter が壊れていたか** — 集計はそれだけを
+    /// [`IndexResult::frontmatter_unparsed`] に数える。宣言 key の書き直しだけで
+    /// 通った文書は `false` で返り、`[index].fail_on_frontmatter_error` を動かさない。
+    MetadataRefreshed { frontmatter_unparsed: bool },
     /// (BU-20) 開いた handle が「集めた時のファイルではない」と答えた
     /// (hardlink / symlink / 非通常ファイル / handle 側 size 超過)。
     ///
@@ -505,11 +560,18 @@ pub enum SingleResult {
 /// - `None` → use [`crate::parser::DEFAULT_EXCLUDED_HEADINGS`]
 /// - `Some(list)` → completely overrides the default list (pass `&[]` to
 ///   disable heading-based exclusion entirely).
+///
+/// `schema` is [`load_declared_schema`]'s result, not a path (codex P2 round 3 on PR #291):
+/// the caller reads `groove-schema.toml` once, before anything destructive it is about to do,
+/// and hands the snapshot in here rather than letting this function read the file again after
+/// the fact. See [`load_declared_schema`]'s doc for why a second read, on a schema a caller has
+/// already validated, would only reopen the TOCTOU window `--force` closed (codex P1 round 1).
 #[allow(clippy::too_many_arguments)] // D-10 で 8 個に。config struct 化は別 cycle
 pub fn rebuild_index(
     db: &Database,
     embedder: &mut Embedder,
     kb_path: &Path,
+    schema: Option<crate::schema::Schema>,
     force: bool,
     exclude_headings: Option<&[String]>,
     exclude_dirs: &[String],
@@ -571,6 +633,49 @@ pub fn rebuild_index(
     let refresh_frontmatter =
         !force && db.read_frontmatter_policy()?.as_deref() != Some(FRONTMATTER_POLICY);
 
+    // (feature-58) The keys the schema declares are what `document_fields` holds.
+    // `schema` was already loaded above, before the destructive reset, from the
+    // same path `groove validate` uses -- silently indexing without it would
+    // make every `--field` answer empty and say nothing. Compared with what the
+    // last completed run recorded: on a difference every unchanged Markdown
+    // document is read once more so its rows follow the schema, without
+    // re-embedding.
+    let declared_fields = declared_field_names(schema.as_ref());
+    let declared_json = serde_json::to_string(&declared_fields)?;
+    let stored_declared = db.read_declared_fields()?;
+    // (codex P2 round 2 on PR #291) "absent generation key + empty declared set" is safe to
+    // skip only when `document_fields` is actually empty, not merely assumed to be. A run that
+    // declared keys, wrote some documents' rows via `replace_document_fields`, and was
+    // interrupted before `write_declared_fields` recorded the set leaves both: no generation
+    // key stored AND leftover rows. If the schema is then removed (`declared_json ==
+    // DECLARED_FIELDS_NONE`), the shortcut must not fire -- it would record `[]` over rows the
+    // refresh pass exists to clear, and `--field` would keep matching keys the completed index
+    // no longer declares.
+    let refresh_fields = !force
+        && stored_declared.as_deref() != Some(declared_json.as_str())
+        && !(stored_declared.is_none()
+            && declared_json == DECLARED_FIELDS_NONE
+            && db.document_fields_is_empty()?);
+    // (codex P2 round 3 on PR #291) Clear the generation key before the refresh writes a single
+    // `document_fields` row, not after. An interrupted pass -- some documents' rows committed,
+    // the process dies before the end-of-run `write_declared_fields` below -- must leave the key
+    // absent, so the next run refreshes again even if it finds the *old* schema restored: with
+    // the key still holding the old value, stored-old == declared-old would compare equal and
+    // skip the refresh, leaving the newer rows behind indefinitely. `force` rewrites every
+    // document's rows the same way a refresh does, so an interruption mid-force leaves the same
+    // kind of partial state and clears the key for the same reason. See
+    // `Database::clear_declared_fields`'s doc for why "absent" is safe in both directions,
+    // now that `Database::document_fields_is_empty` (round 2) backs the empty-set shortcut.
+    // (codex P2 round 12 on PR #291) The clear is paired with a pass token, so a watcher in
+    // another process that writes a document while this pass runs can say *which* pass it
+    // wrote under -- see `begin_declared_fields_pass` / `finish_declared_fields_pass`.
+    let pass_token = if refresh_fields || force {
+        Some(begin_declared_fields_pass(db)?)
+    } else {
+        None
+    };
+    let refresh_any = refresh_frontmatter || refresh_fields;
+
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
     // `rebuild_index` は同じこの関数を通るので、どちらも常に今のファイルを見る。
     // 起動時に 1 度解決して焼き込むと、daemon 側だけ古い規則で走り続ける。
@@ -628,7 +733,20 @@ pub fn rebuild_index(
     // stem 由来 (E-1) にもかかわらず再 parse されず、breadcrumb (chunk.context)
     // が旧 filename のまま stale 化する。Off モードは context を embed に使わない
     // ため無害 = 従来通り fast path を維持する。
+    // (codex P2 round 5 on PR #291) **parser を跨ぐ rename は mode を問わず force する。**
+    // `.txt` ↔ `.md` のような rename は bytes が同じでも読む parser が変わるので、
+    // 旧 parser が書いた `document_fields` / title / tags がそのまま残ってしまう
+    // (Off モードで fast path に乗ると一生直らない -- hash も世代 key も一致するため)。
+    // `rename_crosses_a_parser` は watcher 側の `rename_single_file` とも共有する
+    // 1 つの判定 (AGENTS "one question gets one implementation")。
     let mut renamed_new_paths: HashSet<String> = HashSet::new();
+    // (codex P2 round 9 on PR #291) A narrower set than `renamed_new_paths`: only the renames
+    // that actually crossed a parser, not every rename Static mode also forces a reparse for.
+    // `settle_cross_parser_rename` below must fire only for the former -- a same-parser rename
+    // forced by Static mode that happens to end in `Skipped` (e.g. the content shrank to
+    // nothing) is a pre-existing edit-time gap this round does not touch, not a stale
+    // cross-parser row.
+    let mut crossed_parser_renames: HashSet<String> = HashSet::new();
     let renamed: u32 = if force {
         0
     } else {
@@ -639,8 +757,12 @@ pub fn rebuild_index(
         db.rename_documents_atomic(&pairs)?;
         for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
-            if context_mode == ContextMode::Static {
+            let crossed = rename_crosses_a_parser(registry, old_path, new_path);
+            if context_mode == ContextMode::Static || crossed {
                 renamed_new_paths.insert(new_path.clone());
+            }
+            if crossed {
+                crossed_parser_renames.insert(new_path.clone());
             }
         }
         pairs.len() as u32
@@ -688,13 +810,14 @@ pub fn rebuild_index(
     let mut updated: u32 = 0;
     let mut frontmatter_unparsed: u32 = 0;
     let mut refreshed: u32 = 0;
+    let mut refreshed_fields: u32 = 0;
     // (#251, codex P2 round 2) The one-time check is recorded as done only when every
     // Markdown document it was meant to read was read. A legacy file the scan could not
     // open, or that this loop skips or refuses, keeps the check pending: its row is
     // retained, so when the file is back with the same content the fast path would
     // otherwise hide it for good.
     let mut refresh_pending = false;
-    if refresh_frontmatter {
+    if refresh_any {
         for rel in &skipped_paths {
             if indexed_markdown_hash(db, registry, rel)?.is_some() {
                 refresh_pending = true;
@@ -714,10 +837,11 @@ pub fn rebuild_index(
         } else {
             Reindex::Incremental {
                 check_frontmatter: refresh_frontmatter,
+                refresh_fields,
             }
         };
 
-        match index_single_disk_entry(
+        let single_result = index_single_disk_entry(
             db,
             embedder,
             entry,
@@ -725,7 +849,20 @@ pub fn rebuild_index(
             registry,
             mode,
             context_mode,
-        )? {
+            DeclaredSet::Known {
+                list: &declared_fields,
+                pass: pass_token.as_deref(),
+                generation: &declared_json,
+            },
+        )?;
+        // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
+        // as: if this was a forced reparse across a parser boundary and it did not end in
+        // `Updated`, the row is stale under the new path and must go. See
+        // `settle_cross_parser_rename`'s doc for why.
+        if crossed_parser_renames.contains(&entry.rel) {
+            settle_cross_parser_rename(db, &entry.rel, &single_result)?;
+        }
+        match single_result {
             SingleResult::Updated {
                 chunks,
                 frontmatter_unparsed: fm_unparsed,
@@ -752,7 +889,7 @@ pub fn rebuild_index(
                 // which is the row's bytes only when the hashes agree. Otherwise the old
                 // bytes can come back, match the retained hash, and hide behind the fast
                 // path for good (codex P2, rounds 3 and 4).
-                if refresh_frontmatter
+                if refresh_any
                     && let Some(row_hash) = indexed_markdown_hash(db, registry, &entry.rel)?
                     && (reason != SKIPPED_NO_CHUNKS || row_hash != entry.hash)
                 {
@@ -764,15 +901,21 @@ pub fn rebuild_index(
             // does: the file is not indexed and the reason is already on stderr.
             SingleResult::Refused => {
                 skipped_count += 1;
-                if refresh_frontmatter && indexed_markdown_hash(db, registry, &entry.rel)?.is_some()
-                {
+                if refresh_any && indexed_markdown_hash(db, registry, &entry.rel)?.is_some() {
                     refresh_pending = true;
                 }
                 progress.report_unchanged(&entry.rel);
             }
-            SingleResult::MetadataRefreshed => {
-                frontmatter_unparsed += 1;
-                refreshed += 1;
+            SingleResult::MetadataRefreshed {
+                frontmatter_unparsed: fm_unparsed,
+            } => {
+                if fm_unparsed {
+                    frontmatter_unparsed += 1;
+                    refreshed += 1;
+                }
+                if refresh_fields {
+                    refreshed_fields += 1;
+                }
                 progress.report_unchanged(&entry.rel);
             }
             SingleResult::Unchanged => {
@@ -783,17 +926,16 @@ pub fn rebuild_index(
         }
     }
 
-    // (#251) Every unchanged Markdown document has now been looked at under this policy, so
-    // the next run can take the fast path again. Written after the loop on purpose: a run
-    // that stops halfway leaves the key absent and the next run looks again -- and so does
-    // one that could not read a document it holds a row for.
-    if force || (refresh_frontmatter && !refresh_pending) {
-        db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
-    }
     if refreshed > 0 {
         eprintln!(
             "Tagged {refreshed} unchanged Markdown document(s) whose YAML frontmatter had failed to parse \
              before this version recorded it (one-time check; nothing was re-embedded)"
+        );
+    }
+    if refreshed_fields > 0 {
+        eprintln!(
+            "Recorded the declared frontmatter fields of {refreshed_fields} unchanged Markdown document(s) \
+             (the schema's declared keys changed; nothing was re-embedded)"
         );
     }
 
@@ -806,6 +948,41 @@ pub fn rebuild_index(
         deleted += 1;
         progress.report_deleted(&db_path);
     }
+
+    // (#251, codex P2 round 6 on PR #291) Every unchanged Markdown document has now been
+    // looked at under this policy, so the next run can take the fast path again. Written
+    // after the deletion sweep above, not merely after the loop: a Markdown file the schema
+    // change is meant to cover can be absent from disk during this run (renamed away,
+    // temporarily moved) and so is never visited by the loop at all -- only the sweep decides
+    // its row is gone. A run that stops between the loop and the sweep must not claim the pass
+    // completed, or a same-hash file restored later would take the fast path over a row the
+    // sweep never got to prune. Written after the loop on purpose either way: a run that stops
+    // halfway leaves the key absent and the next run looks again -- and so does one that could
+    // not read a document it holds a row for.
+    if force || (refresh_frontmatter && !refresh_pending) {
+        db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
+    }
+    // (feature-58, codex P2 round 6 on PR #291) Recorded after the deletion sweep for the same
+    // reason as the policy above, not only after the loop: a run that stopped halfway must not
+    // claim the new set, and an orphaned document the loop never visited is only accounted for
+    // once the sweep prunes it. Before round 3 (codex P2 on PR #291) stopping halfway meant
+    // leaving the old value in place; now the key was already cleared, ahead of the loop,
+    // whenever a refresh (or `force`) was going to touch a row -- see the `clear_declared_fields`
+    // call above -- so a run that stopped halfway, whether inside the loop or between the loop and
+    // the sweep, leaves it absent and the next run refreshes again rather than trusting a set
+    // some documents (visited or pruned) were never brought in line with. Rewriting an unchanged
+    // value is harmless, and it is how an index with nothing to declare gets its `[]` without a
+    // pass. (codex P2 round 12) Recorded through `finish_declared_fields_pass`, which leaves
+    // the generation pending instead when a watcher in another process wrote a document
+    // under this pass's token -- that document's rows are the previous generation's, and
+    // recording the new set over them would make them current for good.
+    finish_declared_fields_pass(
+        db,
+        pass_token.as_deref(),
+        stored_declared.as_deref(),
+        &declared_json,
+        force || !refresh_fields || !refresh_pending,
+    )?;
 
     // Count total documents remaining (includes unchanged ones)
     let total_documents = db.document_count()?;
@@ -892,13 +1069,28 @@ enum Reindex {
     /// Skip a file whose hash matches. With `check_frontmatter` set, an
     /// unchanged Markdown file is still read once so a frontmatter that fails
     /// to parse can be tagged without re-embedding ([`FRONTMATTER_POLICY`]).
-    Incremental { check_frontmatter: bool },
+    /// With `refresh_fields` set it is read once so its `document_fields`
+    /// rows follow the keys the schema now declares (feature-58). Either
+    /// reason opens the file; each decides its own write.
+    Incremental {
+        check_frontmatter: bool,
+        refresh_fields: bool,
+    },
 }
 
 /// 単一 DiskEntry を index する内部関数。
 /// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
 /// 同時呼び出し不可)。呼び出し側で Mutex 経由の相互排他を保証すること。
+///
+/// `declared` says where the declared-field set comes from -- see [`DeclaredSet`]. With
+/// [`DeclaredSet::Known`] every `document_fields` write below uses that list (an empty list
+/// still replaces stale rows from an undeclared key). With [`DeclaredSet::FromIndex`] the
+/// list is read off `index_meta` **inside each write transaction**, right before the rows
+/// are written, and an absent generation (pending: a [`rebuild_index`] refresh has cleared
+/// the key and not yet rewritten it, or has not run at all) leaves the rows untouched and
+/// marks the running pass instead ([`write_declared_rows_or_mark_dirty`]).
+#[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
     db: &Database,
     embedder: &mut Embedder,
@@ -907,12 +1099,16 @@ fn index_single_disk_entry(
     registry: &Registry,
     mode: Reindex,
     context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
 ) -> Result<SingleResult> {
     let force = mode == Reindex::Force;
-    let refresh_frontmatter = mode
-        == Reindex::Incremental {
-            check_frontmatter: true,
-        };
+    let (refresh_frontmatter, refresh_fields) = match mode {
+        Reindex::Incremental {
+            check_frontmatter,
+            refresh_fields,
+        } => (check_frontmatter, refresh_fields),
+        Reindex::Force => (false, false),
+    };
     // (AV-12) Every path that can put a document into an index arrives here, which is why the
     // chunking policy is resolved here rather than at each caller: the first attempt covered
     // `reindex_single_file` and missed the rename branch, which reaches this function directly
@@ -949,7 +1145,8 @@ fn index_single_disk_entry(
         && db
             .get_document_hash(&entry.rel)?
             .is_some_and(|existing| existing == entry.hash);
-    let refresh_only = unchanged && refresh_frontmatter && parser.extension() == "md";
+    let refresh_only =
+        unchanged && (refresh_frontmatter || refresh_fields) && parser.extension() == "md";
     if unchanged && !refresh_only {
         return Ok(SingleResult::Unchanged);
     }
@@ -1036,23 +1233,40 @@ fn index_single_disk_entry(
                 frontmatter_unparsed: parsed.frontmatter_error.is_some(),
             });
         }
-        if parsed.frontmatter_error.is_none() {
+        // (#251 / feature-58) Two reasons open an unchanged file, and each decides
+        // its own write: a broken frontmatter gets its metadata -- which is where
+        // the tag lives -- written again; a changed declared-key set gets the
+        // document's rows written again. A clean file under the first reason
+        // alone is left exactly as it was.
+        let broken = parsed.frontmatter_error.is_some();
+        let tag_it = broken && refresh_frontmatter;
+        if !tag_it && !refresh_fields {
             return Ok(SingleResult::Unchanged);
         }
         let tx = db.begin_transaction()?;
-        db.update_document_meta(
-            &entry.rel,
-            parsed.frontmatter.title.as_deref(),
-            parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
-            category.as_deref(),
-            parsed.frontmatter.depth.as_deref(),
-            &parsed.frontmatter.tags,
-            parsed.frontmatter.date.as_deref(),
-            &entry.hash,
-            size_bytes,
-        )?;
+        if tag_it {
+            db.update_document_meta(
+                &entry.rel,
+                parsed.frontmatter.title.as_deref(),
+                parsed.frontmatter.topic.as_deref().or(topic.as_deref()),
+                category.as_deref(),
+                parsed.frontmatter.depth.as_deref(),
+                &parsed.frontmatter.tags,
+                parsed.frontmatter.date.as_deref(),
+                &entry.hash,
+                size_bytes,
+            )?;
+        }
+        // (codex P2 round 9 on PR #291) `declared_fields: None` means the caller does not yet
+        // know the current set (see this fn's doc) -- leave the row as the last completed pass
+        // left it rather than write nothing where something declared may already exist.
+        if refresh_fields {
+            write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
+        }
         tx.commit()?;
-        return Ok(SingleResult::MetadataRefreshed);
+        return Ok(SingleResult::MetadataRefreshed {
+            frontmatter_unparsed: tag_it,
+        });
     }
 
     if parsed.chunks.is_empty() {
@@ -1122,6 +1336,10 @@ fn index_single_disk_entry(
             size_bytes,
         )?;
         if updated {
+            // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the
+            // frontmatter-only path above: a `None` here must not overwrite a document's rows
+            // with an empty set just because the caller does not yet know the real one.
+            write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
             // (feature-56) The chunk texts match, so the embeddings still stand — but the
             // *positions* may not. Inserting a blank line above a function, or trimming a
             // comment short enough to be dropped as a thin gap, moves every definition below
@@ -1181,6 +1399,11 @@ fn index_single_disk_entry(
         topic.as_deref(),
         category.as_deref(),
     )?;
+    // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the two paths above:
+    // a `None` here writes nothing, so a freshly written or newly changed document simply has
+    // no `document_fields` rows until a completed [`rebuild_index`] pass gives a real answer --
+    // preferable to a wrong one guessed as empty.
+    write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
     tx.commit()?;
 
     Ok(SingleResult::Updated {
@@ -1367,6 +1590,12 @@ pub fn reindex_single_file(
     };
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
+    // (feature-58) The watcher paths write what the last completed `rebuild_index`
+    // recorded; they do not read the schema themselves. (codex P2 round 9 on PR #291,
+    // local Codex after round 12) Resolved by `index_single_disk_entry` **inside its
+    // write transaction**, not read here ahead of the file I/O and the embedding: a
+    // `rebuild_index` in another process can clear the generation in that window, and a
+    // list read before it would be written over rows the new pass never sees again.
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     index_single_disk_entry(
         db,
@@ -1376,8 +1605,10 @@ pub fn reindex_single_file(
         registry,
         Reindex::Incremental {
             check_frontmatter: false,
+            refresh_fields: false,
         },
         context_mode,
+        DeclaredSet::FromIndex,
     )
 }
 
@@ -1413,6 +1644,11 @@ pub enum RenameOutcome {
     /// content_hash は旧内容のまま据え置き、次回 full rebuild の
     /// `scan_disk_entries` の size-cap 判定に委ねる (§4.2 skip 統一原則)。
     RenamedSizeCapped,
+    /// (codex P2 round 11 / 12 on PR #291) [`RenameOutcome::RenamedSizeCapped`], but the rename
+    /// crossed a parser, so the old parser's row was **dropped** rather than left under the
+    /// new extension. A variant of its own because the watcher's diagnostic says what happened
+    /// to the document, and "hash check skipped, content kept" would be false here.
+    RenamedSizeCappedAndDropped,
     /// (BU-20) path は UPDATE 済だが、新 path を開いた handle が
     /// 「集めた時のファイルではない」と答えた (hardlink / symlink / 非通常
     /// ファイル / handle 側の size 超過) ため hash 再計算 / reindex はスキップした。
@@ -1424,6 +1660,18 @@ pub enum RenameOutcome {
     /// 理由は refusal」と伝わる。DB の content_hash は旧内容のままで、
     /// 次回 full rebuild の walk-time check が row ごと取り除く。
     RenamedButRefused,
+    /// (codex P2 round 11 / 12 / 13 on PR #291) The rename crossed a parser and the new
+    /// parser could not index the bytes -- it refused them at either read, failed to parse
+    /// them, or found nothing to chunk -- so the old parser's row was **dropped**; "content
+    /// left as it was" would be false, hence the separate variant.
+    RenamedButRefusedAndDropped,
+    /// (local Codex on PR #291 after round 13) path は UPDATE 済で、同じ parser の再 parse
+    /// (Static モードが同 bytes の rename に強制するもの、または内容が変わった通常の parse) が
+    /// [`SingleResult::Skipped`] で終わった: 行は書き換えられず、**以前の内容** (Static なら以前の path 由来の
+    /// breadcrumb も) が新 path の下に残っている。行は消さない (skip の理由は stderr に出ている)
+    /// が、[`RenameOutcome::Renamed`] (= 内容同一で path だけ更新) と区別して watcher が「古い内容のまま」と言える
+    /// ようにする。
+    RenamedButNotReindexed,
 }
 
 /// 単一ファイルの rename を処理する。
@@ -1455,12 +1703,20 @@ pub fn rename_single_file(
                 SingleResult::Updated { .. }
                 | SingleResult::Unchanged
                 | SingleResult::Skipped { .. }
-                | SingleResult::MetadataRefreshed => RenameOutcome::OldPathMissing,
+                | SingleResult::MetadataRefreshed { .. } => RenameOutcome::OldPathMissing,
             },
         );
     };
 
     db.rename_document(old_rel, new_rel)?;
+
+    // (codex P2 round 11 on PR #291) Decided here, right after the row moved and before any
+    // of the early returns below: a rename that crosses a parser leaves the *old* parser's
+    // row under the new path until something rewrites it, and the size-cap and read-refusal
+    // exits below rewrite nothing. Each of them settles the crossing the same way the reparse
+    // arms further down do (`settle_cross_parser_rename`'s doc), so the row is dropped rather
+    // than kept as a stale hit a later full index would preserve as an oversized skip.
+    let crosses_a_parser = rename_crosses_a_parser(registry, old_rel, new_rel);
 
     // 新 path の実体 hash を読み直し、DB 側 (= old_hash) と比較
     let full = kb_path.join(new_rel);
@@ -1486,6 +1742,12 @@ pub fn rename_single_file(
     ) {
         let kind = size_cap_kind(is_binary_ext);
         eprintln!("Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        // (codex P2 round 11 on PR #291) Crossed a parser: the row is the old parser's
+        // and nothing below will rewrite it. Settle before recording a size for it.
+        if crosses_a_parser {
+            settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
+            return Ok(RenameOutcome::RenamedSizeCappedAndDropped);
+        }
         // (codex P2 round 7) The rename has already been applied, so the row is
         // under `new_rel` with the size it had when it was small enough to
         // index. Measuring the file and returning without writing leaves it
@@ -1508,6 +1770,12 @@ pub fn rename_single_file(
         // (codex P2 round 6) The rename target has the same stat-then-read
         // window as every other reader, and this was the last caller still
         // dropping the length the refusal measured.
+        // (codex P2 round 11 on PR #291) Same as the size-cap exit above: a crossed
+        // parser's stale row is dropped rather than left under the new path.
+        if crosses_a_parser {
+            settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
+            return Ok(RenameOutcome::RenamedButRefusedAndDropped);
+        }
         if let Some(len) = measured
             && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
         {
@@ -1529,9 +1797,14 @@ pub fn rename_single_file(
     // filename stem 由来 (E-1) のため、再 parse しない限り旧 filename のまま
     // stale 化してしまう。Off モードは context を embed に使わないため無害 =
     // 従来通り fast path を維持する。
+    // (codex P2 round 5 on PR #291) **parser を跨ぐ rename も同様に無効化する**:
+    // mode を問わず、`rename_crosses_a_parser` (`rebuild_index` の一括 rename と
+    // 共有する 1 つの判定) が true なら fast path から外す。bytes は同じでも
+    // 旧 parser が書いた `document_fields` / title / tags が新 parser の読みへ
+    // 更新されないまま残ってしまうため。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     let same_hash = new_hash == old_hash;
-    if same_hash && context_mode != ContextMode::Static {
+    if same_hash && context_mode != ContextMode::Static && !crosses_a_parser {
         return Ok(RenameOutcome::Renamed);
     }
 
@@ -1545,10 +1818,14 @@ pub fn rename_single_file(
         full,
         size: new_bytes.len() as u64,
     };
-    // same_hash (= Static-mode-forced) の場合のみ force=true で
-    // hash 一致 fast path をバイパスする。内容が変わっている場合は
-    // 通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
-    match index_single_disk_entry(
+    // (feature-58) The watcher paths write what the last completed `rebuild_index`
+    // recorded; they do not read the schema themselves -- and (local Codex after round
+    // 12) do not read the generation here either: `index_single_disk_entry` resolves
+    // `DeclaredSet::FromIndex` inside its write transaction, see `reindex_single_file`.
+    // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
+    // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
+    // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
+    let single_result = index_single_disk_entry(
         db,
         embedder,
         &entry,
@@ -1559,10 +1836,33 @@ pub fn rename_single_file(
         } else {
             Reindex::Incremental {
                 check_frontmatter: false,
+                refresh_fields: false,
             }
         },
         context_mode,
-    )? {
+        DeclaredSet::FromIndex,
+    )?;
+    // (codex P2 round 9 on PR #291) Crossed a parser: whatever the reparse came back with,
+    // settle it the same way `rebuild_index`'s rename loop does. See
+    // `settle_cross_parser_rename`'s doc. (codex P2 round 10) On `crosses_a_parser` alone,
+    // not `same_hash && crosses_a_parser`: a watcher rename whose bytes also changed goes
+    // through the `Incremental` arm above instead of `Force`, but when the destination
+    // parser then refuses or fails to parse those bytes the row under `new_rel` is still
+    // whatever the *old* parser wrote -- the same stale row the same-byte case left, reached
+    // by a different arm. `rebuild_index`'s loop has no such gap: `detect_renames` only pairs
+    // paths by equal hash, so every rename it settles is same-byte by construction.
+    if crosses_a_parser {
+        settle_cross_parser_rename(db, new_rel, &single_result)?;
+    }
+    // (codex P2 round 13 on PR #291) Once the settlement above dropped the row, the outcome
+    // must say so whatever the reparse came back with: the second-read refusal and a parse
+    // that failed or found nothing all leave the same state -- no document under the new
+    // path -- and `RenamedButRefused` / `Renamed` would both tell the watcher's reader the
+    // content was kept.
+    if crosses_a_parser && !matches!(single_result, SingleResult::Updated { .. }) {
+        return Ok(RenameOutcome::RenamedButRefusedAndDropped);
+    }
+    match single_result {
         SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         // (codex P2 round 1 on PR #157) `index_single_disk_entry` reads the file
         // a **second** time, and the whole premise of this guard is that a path
@@ -1574,9 +1874,17 @@ pub fn rename_single_file(
         // refusal in the first place, and it would swallow the next variant too.
         // `MetadataRefreshed` cannot come back here (the check is off on this
         // path) and is named so that adding a variant stays a compile error.
-        SingleResult::Unchanged
-        | SingleResult::Skipped { .. }
-        | SingleResult::MetadataRefreshed => Ok(RenameOutcome::Renamed),
+        // (local Codex on PR #291 after round 13) `Skipped` is not `Renamed`: the reparse
+        // this arm was reached through -- forced by Static mode for a same-byte rename, or
+        // the ordinary changed-content parse -- wrote nothing, so the row under the new
+        // path still holds the previous content and, in Static mode, the previous path's
+        // breadcrumb. The row is kept (the bytes it was built from were once indexable and
+        // the reason for the skip is already on stderr), but the outcome says so, and the
+        // watcher's line no longer reports a plain success over stale content.
+        SingleResult::Unchanged | SingleResult::MetadataRefreshed { .. } => {
+            Ok(RenameOutcome::Renamed)
+        }
+        SingleResult::Skipped { .. } => Ok(RenameOutcome::RenamedButNotReindexed),
     }
 }
 
@@ -1737,6 +2045,321 @@ pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
 /// [`rebuild_index`] would never read them again. The value is a generation, like
 /// [`CODE_CHUNK_POLICY`]: it changes when what the parser writes changes.
 pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
+
+/// Where [`index_single_disk_entry`] gets the declared-field set from (feature-58; codex P2
+/// round 9 / 12 on PR #291, local Codex after round 12).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DeclaredSet<'a> {
+    /// The caller knows the set: [`rebuild_index`], which just read the schema. Written as
+    /// given. `pass` is the token of the pass this run began ([`begin_declared_fields_pass`]),
+    /// or `None` when it had nothing to refresh; either way, a write that finds **another**
+    /// pass's token in the database marks that pass dirty (local Codex on PR #291 after
+    /// round 12, second pass: two [`rebuild_index`] runs in separate processes can overlap,
+    /// and the later one must not record its generation over rows the earlier one wrote
+    /// after it had passed them).
+    Known {
+        list: &'a [String],
+        pass: Option<&'a str>,
+        /// The JSON of `list`, the generation this run will record at its finish (codex P2
+        /// round 14 on PR #291): a write that finds **no** pass open but a *different*
+        /// generation recorded has been overtaken by a pass that already finished -- its
+        /// rows would sit under that generation -- and clears the key so the index reads
+        /// as pending until the next run refreshes.
+        generation: &'a str,
+    },
+    /// The caller does not know it and must not guess: the watcher paths
+    /// ([`reindex_single_file`], [`rename_single_file`]), which write what the last
+    /// completed pass recorded. Resolved **inside the write transaction**, after the
+    /// document row was written and so under the write lock, never ahead of the file I/O
+    /// and the embedding -- a [`rebuild_index`] in another process can clear the
+    /// generation in that window, and a list read before it would then be written over
+    /// rows the new pass has already processed and will never revisit (local Codex after
+    /// round 12; before, the watcher read the list up front and passed `Option`).
+    FromIndex,
+}
+
+/// (feature-58, codex P2 round 9 / 12 on PR #291) Write a document's `document_fields` rows
+/// when the declared set is known, and when it is **not** -- [`DeclaredSet::FromIndex`]
+/// resolving to an absent generation, because a [`rebuild_index`] refresh has it cleared
+/// right now -- leave the rows alone and record that this document was written under the
+/// pass that is running ([`Database::mark_declared_fields_dirty`]). The three write paths of
+/// [`index_single_disk_entry`] all come through here so the rule has one home, and each
+/// calls it inside its transaction after a document write, so the read of `index_meta` and
+/// the rows it decides are one atomic unit against any other connection.
+///
+/// The mark is what closes the cross-process window round 12 found: the rebuild in another
+/// process may already have processed this document; its rows are then the *previous*
+/// generation's under a hash the rebuild considers current, and only the rebuild can act on
+/// that -- by not recording the new generation ([`finish_declared_fields_pass`]).
+fn write_declared_rows_or_mark_dirty(
+    db: &Database,
+    rel: &str,
+    extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
+    declared: DeclaredSet<'_>,
+) -> Result<()> {
+    let (resolved, my_pass, my_generation): (Option<Vec<String>>, Option<&str>, Option<&str>) =
+        match declared {
+            DeclaredSet::Known {
+                list,
+                pass,
+                generation,
+            } => (Some(list.to_vec()), pass, Some(generation)),
+            DeclaredSet::FromIndex => (declared_fields_recorded(db)?, None, None),
+        };
+    if let Some(list) = &resolved {
+        db.replace_document_fields(rel, &declared_field_rows(extra, list))?;
+    }
+    // (local Codex on PR #291 after round 12, second pass) A pass that is not this caller's
+    // is running -- another process's `rebuild_index`, overlapping this one or this
+    // watcher -- and it may already have processed this document. The rows just written are
+    // this caller's answer, not that pass's, so that pass must not record its generation
+    // over them: mark it dirty, exactly as a watcher does for an absent generation.
+    let current_pass = db.read_declared_fields_pass()?;
+    let foreign_pass_running = match (current_pass.as_deref(), my_pass) {
+        (Some(current), Some(mine)) => current != mine,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if resolved.is_none() || foreign_pass_running {
+        db.mark_declared_fields_dirty()?;
+    }
+    // (codex P2 round 14 on PR #291) No pass open, but the generation recorded is not the
+    // one this run writes under: a pass that began after this run *finished* already --
+    // recorded its set and cleared its token -- and the rows just written sit under that
+    // set as if they belonged to it. Nothing is running to mark, so the key itself goes:
+    // an absent generation refuses field filters and makes the next run refresh, and this
+    // run's own finish, finding its observation or token gone, records nothing.
+    if let Some(mine) = my_generation
+        && current_pass.is_none()
+        && db
+            .read_declared_fields()?
+            .is_some_and(|recorded| recorded != mine)
+    {
+        db.clear_declared_fields()?;
+    }
+    Ok(())
+}
+
+/// (codex P2 round 12 on PR #291) Start a declared-field refresh pass: clear the generation
+/// key ([`Database::clear_declared_fields`], the round 3 rule) and record a token naming
+/// this pass ([`Database::write_declared_fields_pass`]) in the same transaction, so a
+/// watcher in another process that writes a document meanwhile can say it did so under
+/// *this* pass. Returns the token for [`finish_declared_fields_pass`].
+///
+/// A previous pass's leftover token or dirty mark is replaced here: whatever that pass left
+/// behind, this one rewrites every document's rows before it finishes. That includes a pass
+/// that is **still running** in another process (local Codex on PR #291 after round 12,
+/// second pass): refusing or waiting would let a crashed pass's token block every later
+/// run for good, so the later pass takes over instead, and the earlier one finds at
+/// [`finish_declared_fields_pass`] that it no longer owns the token and records nothing --
+/// while any document it writes after this point marks the new pass dirty
+/// ([`write_declared_rows_or_mark_dirty`]), so the new pass records nothing either and
+/// the run after that refreshes again.
+fn begin_declared_fields_pass(db: &Database) -> Result<String> {
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tx = db.begin_immediate_transaction()?;
+    db.clear_declared_fields()?;
+    db.clear_declared_fields_pass()?;
+    db.write_declared_fields_pass(&token)?;
+    tx.commit()?;
+    Ok(token)
+}
+
+/// (codex P2 round 12 on PR #291) End a pass: remove its token and any dirty mark, then
+/// record `declared_json` as the generation -- unless `record` is false (the caller's
+/// existing reasons for leaving the key absent: a refresh that could not read every
+/// document), or the dirty mark carries **this pass's** token, meaning a watcher in another
+/// process wrote a document after this pass may have processed it. That document's rows are
+/// the previous generation's under a hash this pass considers current; recording the new set
+/// would make them current for good, so the key stays absent, the next run refreshes again
+/// (absent != declared, the round 3 rule), and the operator is told why. Returns whether the
+/// generation was recorded.
+///
+/// A dirty mark carrying an *older* token is a write under a pass that never finished; the
+/// refresh that just ran rewrote that document's rows too, so it is dropped with the token.
+///
+/// The mark is read **inside** an immediate transaction ([`Database::begin_immediate_transaction`]):
+/// the write lock is held from before the read until the decision is committed, so a
+/// watcher in another process cannot commit a document and its mark between "no mark seen"
+/// and "generation recorded" (local Codex after round 12 -- reading the mark first and
+/// opening the transaction afterwards left exactly that gap).
+fn finish_declared_fields_pass(
+    db: &Database,
+    token: Option<&str>,
+    observed_at_start: Option<&str>,
+    declared_json: &str,
+    record: bool,
+) -> Result<bool> {
+    let tx = db.begin_immediate_transaction()?;
+    // (codex P2 round 13 on PR #291) A run that began no pass (its schema matched the
+    // recorded generation) still must not write over a generation some other process
+    // recorded meanwhile: B changes the schema, refreshes every row, records `[b]` and
+    // clears its token before A gets here, and A -- token-less, seeing no pass open --
+    // would rewrite `[a]` over rows B produced. The evidence A has is the generation it
+    // observed when it started; if the key no longer reads that, another run finished in
+    // between and A's answer is stale.
+    if token.is_none() && db.read_declared_fields()?.as_deref() != observed_at_start {
+        tx.commit()?;
+        tracing::warn!(
+            "another `groove index` run recorded a different declared-field set while this \
+             one was running; this run leaves that set in place"
+        );
+        return Ok(false);
+    }
+    // (local Codex on PR #291 after round 12, second pass) Ownership first: the token in the
+    // database is this pass's only if no other process began a pass since. If another did,
+    // its generation is the one in flight -- this run's rows were written under a set that
+    // pass will rewrite, or already has -- so this run must neither clear that pass's token
+    // and mark nor record a generation of its own; it leaves everything to the owner. A run
+    // that never began a pass (`token == None`, nothing to refresh) likewise must not record
+    // while some other process's pass is open: writing the key would end that pass's
+    // "pending" from outside.
+    let current = db.read_declared_fields_pass()?;
+    let superseded = match (token, current.as_deref()) {
+        (Some(mine), Some(theirs)) => mine != theirs,
+        // This pass's token is gone: only another pass's begin (which replaces it) or its
+        // finish (which, being the owner by then, clears it) can have removed it. Either way
+        // that pass rewrote or is rewriting rows this run had already passed.
+        (Some(_), None) => true,
+        (None, Some(_)) => true,
+        (None, None) => false,
+    };
+    if superseded {
+        tx.commit()?;
+        tracing::warn!(
+            "another `groove index` run began while this one was refreshing the declared \
+             fields; this run leaves the declared-field set to that run"
+        );
+        return Ok(false);
+    }
+    let dirty_under_this_pass = match (token, db.read_declared_fields_dirty()?) {
+        (Some(mine), Some(dirty)) => mine == dirty,
+        _ => false,
+    };
+    db.clear_declared_fields_pass()?;
+    let recorded = record && !dirty_under_this_pass;
+    if recorded {
+        db.write_declared_fields(declared_json)?;
+    }
+    tx.commit()?;
+    if dirty_under_this_pass {
+        tracing::warn!(
+            "another process updated a document while this run was refreshing the declared \
+             fields; the declared-field set is left pending -- run `groove index` again"
+        );
+    }
+    Ok(recorded)
+}
+
+/// (feature-58) What `index_meta.declared_fields` holds when the schema declares
+/// no key beyond the five named ones, or there is no schema: the JSON of an
+/// empty list. An absent generation key skips the refresh pass and is recorded
+/// as this value directly only when there is nothing to write **and** nothing
+/// left over from an earlier, interrupted run -- `document_fields` must be
+/// empty too (codex P2 round 2 on PR #291; see
+/// [`Database::document_fields_is_empty`]'s use in [`rebuild_index`]).
+pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
+
+/// The declared-field list the last completed [`rebuild_index`] recorded, read
+/// back via [`Database::read_declared_fields`] and parsed out of its JSON --
+/// for the watcher paths ([`reindex_single_file`], [`rename_single_file`]),
+/// which do not derive their own list from a schema the way [`rebuild_index`]
+/// does.
+///
+/// Three states, not two (codex P2 round 9 on PR #291): the generation key can be **absent**
+/// (a refresh is in progress -- see [`Database::clear_declared_fields`]'s doc for when
+/// [`rebuild_index`] clears it at the *start* of a pass -- or a run ended before writing it),
+/// hold **`[]`** (the schema declares nothing, or there is no schema), or hold a **non-empty
+/// list**. Only the first is genuinely unknown: `[]` is a completed answer meaning "no declared
+/// keys", exactly like an empty list from a schema with none. Returning `None` for "absent" and
+/// `Some(vec![])` for "declared nothing" is what lets [`index_single_disk_entry`]'s
+/// `declared_fields` parameter tell "I do not know yet" from "there is nothing to write" --
+/// before this fix, an absent key collapsed to an empty list here, and a watcher event that
+/// landed while a refresh was clearing and rewriting the key would wipe a document's valid
+/// `document_fields` rows down to nothing.
+fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
+    match db.read_declared_fields()? {
+        Some(json) => serde_json::from_str(&json)
+            .map(Some)
+            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}")),
+        None => Ok(None),
+    }
+}
+
+/// Reads `<kb_path>/groove-schema.toml` — the same file `groove validate`
+/// reads — and compiles it, without deriving anything from it yet.
+///
+/// (feature-58, codex P1 round 1, P2 round 3 on PR #291) Read once by the caller, before
+/// anything destructive, and handed to [`rebuild_index`] rather than read again inside it: a
+/// schema that does not load must stop the run before anything is deleted, the way a
+/// `groove.toml` that does not load stops the binary before it opens the database.
+/// [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call can empty the index on
+/// `--force`, and the CLI's `index --force` arm (in `main.rs`) resets even earlier, before
+/// [`rebuild_index`] is entered — so `main.rs` calls this before either reset. The MCP path
+/// (`server.rs`'s `rebuild_index_blocking`) has no reset of its own ahead of the call, but
+/// calls this first anyway, for the same "fail before anything runs" reason and so both callers
+/// give [`rebuild_index`] the same kind of snapshot.
+///
+/// A second read inside [`rebuild_index`], after the caller's own validation and reset, would
+/// only reopen the window between the two reads to a schema that changes out from under the
+/// run — the file could be replaced with something malformed in between and the reset would
+/// already be done. Reading once, before either side of that window, is what removes it, not
+/// what happens to be closed after (codex P1 round 1); the reverse ordering is not something an
+/// in-process test can force, since it requires a second process editing the file between two
+/// reads this process makes microseconds apart.
+///
+/// (codex P2 round 9 on PR #291) The CLI's `Commands::Index` arm also calls this ahead of
+/// [`Embedder::with_model`], not only ahead of the resets: a malformed schema is refused before a
+/// run that is already doomed pays for a model download or load (BGE-M3: ~2.3 GB) it was never
+/// going to use, the same "cheap checks first" reasoning `main.rs` already applies to
+/// `[parsers].enabled` validation.
+pub fn load_declared_schema(kb_path: &Path) -> Result<Option<crate::schema::Schema>> {
+    crate::schema::Schema::load_optional(&kb_path.join("groove-schema.toml"))
+}
+
+/// The keys `groove-schema.toml` declares that the parser keeps in
+/// [`crate::parser::Frontmatter::extra`] — every `[fields.<name>]` except the
+/// five the parser stores in their own fields, which have their own columns
+/// and their own filters. Sorted, so its JSON is a stable generation key.
+pub(crate) fn declared_field_names(schema: Option<&crate::schema::Schema>) -> Vec<String> {
+    const NAMED: [&str; 5] = ["title", "date", "topic", "depth", "tags"];
+    schema
+        .map(|s| {
+            s.fields
+                .keys()
+                .filter(|k| !NAMED.contains(&k.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `document_fields` rows of one document: for each declared key the
+/// frontmatter holds, a scalar as one row and a list as one row per element.
+/// An opaque shape and a null hold no value (ADR-0019) and write nothing;
+/// an undeclared key is not the index's business.
+pub(crate) fn declared_field_rows(
+    extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
+    declared: &[String],
+) -> Vec<(String, String)> {
+    use crate::parser::FieldValue;
+    let mut rows = Vec::new();
+    for key in declared {
+        match extra.get(key) {
+            Some(FieldValue::Scalar(s)) => rows.push((key.clone(), s.clone())),
+            Some(FieldValue::List(vs)) => rows.extend(vs.iter().map(|v| (key.clone(), v.clone()))),
+            Some(FieldValue::Other(_)) | None => {}
+        }
+    }
+    rows
+}
 
 /// What an index that was built before [`CODE_CHUNK_POLICY`] existed is recorded as.
 ///
@@ -2000,6 +2623,96 @@ mod tests {
         let skipped: HashSet<String> = ["a.md".to_string()].into_iter().collect();
         let pairs = detect_renames(&disk, &db, &skipped);
         assert!(pairs.is_empty());
+    }
+
+    /// (codex P2 round 5 on PR #291) `.txt` ↔ `.md` is exactly the crossing the fix exists
+    /// for -- see `an_interrupted_...`-style E2E coverage in
+    /// `tests/index_declared_fields.rs` for the `document_fields` consequence; this pins the
+    /// predicate itself, both directions and the unregistered-extension edge.
+    #[test]
+    fn rename_crosses_a_parser_is_true_for_txt_md_and_an_unknown_extension() {
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&reg, "note.txt", "note.md"),
+            "txt -> md changes which parser reads the same bytes"
+        );
+        assert!(
+            rename_crosses_a_parser(&reg, "note.md", "note.txt"),
+            "the reverse direction crosses too"
+        );
+        assert!(
+            !rename_crosses_a_parser(&reg, "old.md", "new.md"),
+            "an .md -> .md rename never changes the parser"
+        );
+        assert!(
+            rename_crosses_a_parser(&reg, "note.xyz", "note.md"),
+            "an unregistered extension (no parser at all) is as different from `.md` as any \
+             other parser would be"
+        );
+        assert!(
+            !rename_crosses_a_parser(&reg, "note.xyz", "other.xyz"),
+            "two unregistered extensions do not cross -- neither side has a parser to lose"
+        );
+    }
+
+    /// (codex P2 round 9 on PR #291) [`settle_cross_parser_rename`] is the decision, not the
+    /// I/O -- it needs only a [`Database`] and a [`SingleResult`], no embedder, so this pins the
+    /// decision directly rather than through a full rename E2E (see
+    /// `tests/index_declared_fields.rs` for the subprocess-level coverage of the bug this
+    /// closes: a cross-parser rename whose destination parser refuses the bytes used to leave
+    /// the old parser's row behind).
+    #[test]
+    fn settle_cross_parser_rename_deletes_the_row_unless_the_reparse_updated_it() {
+        let db = Database::open_in_memory().unwrap();
+        // `delete_document` also deletes from `vec_chunks`, a table `open_in_memory` alone does
+        // not create -- it exists at a fixed dimension, set up the same way a real run's
+        // `verify_embedding_meta` call would (`db_with_384` in `db.rs`'s own tests does the
+        // same for the same reason).
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        assert_eq!(db.document_count().unwrap(), 1);
+
+        settle_cross_parser_rename(
+            &db,
+            "note.md",
+            &SingleResult::Skipped {
+                reason: "parse failed",
+                frontmatter_unparsed: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.document_count().unwrap(),
+            0,
+            "Skipped is not Updated, so the stale row must be dropped"
+        );
+
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        settle_cross_parser_rename(&db, "note.md", &SingleResult::Refused).unwrap();
+        assert_eq!(
+            db.document_count().unwrap(),
+            0,
+            "Refused is not Updated either"
+        );
+
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        settle_cross_parser_rename(
+            &db,
+            "note.md",
+            &SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.document_count().unwrap(),
+            1,
+            "Updated means the new parser wrote a fresh row -- it must be left alone"
+        );
     }
 
     #[test]
@@ -2881,6 +3594,486 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // feature-58: declared fields, generation key (DB-backed)
+    // -----------------------------------------------------------------------
+
+    /// (codex P2 round 9 on PR #291) The three states [`declared_fields_recorded`]'s doc
+    /// describes, pinned directly against [`Database::open_in_memory`] -- no embedder needed,
+    /// unlike a test through [`index_single_disk_entry`] or its watcher callers (see this
+    /// round's final-review.md entry for why no such test was added: constructing an
+    /// [`Embedder`] always touches the model cache/download, so every existing test that goes
+    /// through [`index_single_disk_entry`] is `#[ignore]`d, and this fn alone -- the only *new*
+    /// production code this round adds -- has no such cost).
+    /// (codex P2 round 12 on PR #291) The pass token / dirty mark handshake between
+    /// [`begin_declared_fields_pass`], a watcher write under a pending generation
+    /// ([`Database::mark_declared_fields_dirty`], which [`write_declared_rows_or_mark_dirty`]
+    /// calls), and [`finish_declared_fields_pass`]: a write under *this* pass keeps the
+    /// generation pending; a write under an older pass, or none, lets it be recorded.
+    /// Database-only, like the test below -- the watcher side that produces the mark through
+    /// [`index_single_disk_entry`] is covered in-process by
+    /// `tests/watcher_rename_context_mode.rs` (`#[ignore]`, model load).
+    #[test]
+    fn a_watcher_write_under_the_running_pass_keeps_the_generation_pending() {
+        let db = Database::open_in_memory().unwrap();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+
+        // No pass running: a watcher mark is a no-op, and a finish with no token records.
+        db.mark_declared_fields_dirty().unwrap();
+        assert_eq!(db.read_declared_fields_dirty().unwrap(), None);
+        assert!(
+            finish_declared_fields_pass(&db, None, Some(r#"["status"]"#), r#"["status"]"#, true)
+                .unwrap()
+        );
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["status"]"#)
+        );
+
+        // A pass starts: the key is cleared and the token recorded, atomically.
+        let token = begin_declared_fields_pass(&db).unwrap();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token.as_str())
+        );
+
+        // A watcher (another process) writes a document meanwhile and marks the pass.
+        db.mark_declared_fields_dirty().unwrap();
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap().as_deref(),
+            Some(token.as_str())
+        );
+
+        // The pass finishes: it must NOT record the generation, and it cleans up after itself.
+        assert!(
+            !finish_declared_fields_pass(&db, Some(&token), None, r#"["status","team"]"#, true)
+                .unwrap(),
+            "a write under this pass leaves the generation pending"
+        );
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(db.read_declared_fields_pass().unwrap(), None);
+        assert_eq!(db.read_declared_fields_dirty().unwrap(), None);
+
+        // The next pass finds no mark of its own (the old one was dropped) and records.
+        let next = begin_declared_fields_pass(&db).unwrap();
+        assert_ne!(next, token);
+        assert!(
+            finish_declared_fields_pass(&db, Some(&next), None, r#"["status","team"]"#, true)
+                .unwrap()
+        );
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["status","team"]"#)
+        );
+
+        // A mark left by an older, unfinished pass does not stop a newer pass from recording.
+        let stale = begin_declared_fields_pass(&db).unwrap();
+        db.mark_declared_fields_dirty().unwrap();
+        let newer = begin_declared_fields_pass(&db).unwrap();
+        assert_ne!(newer, stale);
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap(),
+            None,
+            "beginning a pass drops the previous pass's mark with its token"
+        );
+        assert!(finish_declared_fields_pass(&db, Some(&newer), None, "[]", true).unwrap());
+
+        // `record == false` (the caller's own reasons to leave the key absent) still cleans up.
+        let t = begin_declared_fields_pass(&db).unwrap();
+        assert!(!finish_declared_fields_pass(&db, Some(&t), None, "[]", false).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(db.read_declared_fields_pass().unwrap(), None);
+    }
+
+    /// (local Codex on PR #291 after round 12) The finish side of the handshake against a
+    /// **second connection**, the shape another process takes. Connection B holds the write
+    /// lock (an immediate transaction) while it commits a watcher's document write and its
+    /// dirty mark; connection A calls [`finish_declared_fields_pass`] in that window. Because
+    /// A reads the mark inside its own immediate transaction, it waits for B's lock (the
+    /// connection's busy timeout) and then sees the mark -- and must not record the
+    /// generation. Reading the mark first and opening the transaction afterwards let B's
+    /// commit land in between, and A recorded the generation over rows B left stale.
+    ///
+    /// Deterministic without a pause hook: B takes the lock *before* A is called, and holds
+    /// it for longer than A needs to reach its `BEGIN IMMEDIATE`; A cannot proceed until B
+    /// commits, so the only order the lock permits is the one asserted.
+    #[test]
+    fn a_mark_committed_while_the_pass_finishes_still_keeps_the_generation_pending() {
+        let dir = crate::test_support::unique_temp_path("groove-pass-race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(".groove.db");
+        let a = Database::open(db_path.to_str().unwrap()).unwrap();
+        let b = Database::open(db_path.to_str().unwrap()).unwrap();
+
+        let token = begin_declared_fields_pass(&a).unwrap();
+        assert_eq!(a.read_declared_fields().unwrap(), None);
+
+        // B: the other process's watcher, mid-commit, holding the write lock.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let token_for_b = token.clone();
+        let db_path_for_b = db_path.clone();
+        let b_thread = std::thread::spawn(move || {
+            drop(b);
+            let b = Database::open(db_path_for_b.to_str().unwrap()).unwrap();
+            let tx = b.begin_immediate_transaction().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            b.mark_declared_fields_dirty().unwrap();
+            assert_eq!(
+                b.read_declared_fields_dirty().unwrap().as_deref(),
+                Some(token_for_b.as_str())
+            );
+            tx.commit().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        // A: the pass finishing while B holds the lock. It must wait, then see the mark.
+        let started = std::time::Instant::now();
+        let recorded =
+            finish_declared_fields_pass(&a, Some(&token), None, r#"["status"]"#, true).unwrap();
+        b_thread.join().unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "A must have waited for B's lock, not read around it: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !recorded,
+            "B's mark landed under A's token before A decided, so the generation stays pending"
+        );
+        assert_eq!(a.read_declared_fields().unwrap(), None);
+        assert_eq!(a.read_declared_fields_dirty().unwrap(), None);
+        assert_eq!(a.read_declared_fields_pass().unwrap(), None);
+
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (local Codex on PR #291 after round 12, second pass) Two [`rebuild_index`] runs in two
+    /// processes overlap: B begins after A and takes the token over. Whatever A does from then
+    /// on must not end in a recorded generation -- A's finish sees it no longer owns the
+    /// token and records nothing, and a document A writes meanwhile marks B's pass dirty, so
+    /// B records nothing either and the next run refreshes again. A run that began no pass
+    /// (nothing to refresh) must not record while another process's pass is open, since the
+    /// key it would write is what ends that pass's "pending".
+    #[test]
+    fn an_overlapping_pass_in_another_process_is_never_recorded_over() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document("x.md", Some("t"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let list_a = vec!["a".to_string()];
+
+        // A begins, then B begins: B owns the token now.
+        let token_a = begin_declared_fields_pass(&db).unwrap();
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        assert_ne!(token_a, token_b);
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token_b.as_str())
+        );
+
+        // A finishes first: superseded, records nothing, leaves B's token alone.
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), None, r#"["a"]"#, true).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token_b.as_str()),
+            "a superseded pass must not clear the owner's token"
+        );
+        // B finishes with no mark against it: records.
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#)
+        );
+
+        // Same overlap, but A writes a document after B took over: B's pass is marked dirty
+        // and B records nothing; A, superseded, records nothing either.
+        let token_a = begin_declared_fields_pass(&db).unwrap();
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: Some(&token_a),
+                generation: r#"["a"]"#,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap().as_deref(),
+            Some(token_b.as_str()),
+            "A's write under B's pass marks B, not A"
+        );
+        assert!(!finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), None, r#"["a"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap(),
+            None,
+            "still pending: the next run refreshes"
+        );
+
+        // A run with no pass of its own (nothing to refresh) writes a changed document while
+        // another process's pass is open: it marks that pass and does not record at the end.
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: None,
+                generation: r#"["a"]"#,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap().as_deref(),
+            Some(token_b.as_str())
+        );
+        assert!(!finish_declared_fields_pass(&db, None, None, r#"["a"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token_b.as_str()),
+            "a pass-less run leaves the open pass untouched"
+        );
+        assert!(!finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+
+        // With no pass open at all, a pass-less run records as before.
+        assert!(finish_declared_fields_pass(&db, None, None, r#"["a"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["a"]"#)
+        );
+    }
+
+    /// (codex P2 round 13 on PR #291) A run that began no pass -- its schema matched the
+    /// recorded generation -- finishes after another process changed the schema, refreshed
+    /// every row, recorded the new generation and cleared its token. No pass is open, so
+    /// the ownership check alone would let the first run rewrite its stale set over rows
+    /// the other produced. The evidence it has is the generation it observed at its start;
+    /// when the key no longer reads that, it records nothing.
+    #[test]
+    fn a_pass_less_run_does_not_write_over_a_generation_recorded_while_it_ran() {
+        let db = Database::open_in_memory().unwrap();
+        db.write_declared_fields(r#"["a"]"#).unwrap();
+        // A starts: schema `[a]` matches the recorded generation, so no pass, and it
+        // remembers what it observed.
+        let observed_by_a = db.read_declared_fields().unwrap();
+        assert_eq!(observed_by_a.as_deref(), Some(r#"["a"]"#));
+
+        // B: schema changed to `[b]`, a full pass, recorded, token cleared.
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#)
+        );
+
+        // A finishes: no pass open, but the key is not what A observed -- it must not
+        // write `[a]` back over B's rows.
+        assert!(
+            !finish_declared_fields_pass(&db, None, observed_by_a.as_deref(), r#"["a"]"#, true)
+                .unwrap()
+        );
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#),
+            "B's generation stands; A's stale set was not written over it"
+        );
+
+        // Control: had nothing changed, the same run rewrites its (unchanged) value.
+        db.write_declared_fields(r#"["a"]"#).unwrap();
+        assert!(
+            finish_declared_fields_pass(&db, None, observed_by_a.as_deref(), r#"["a"]"#, true)
+                .unwrap()
+        );
+    }
+
+    /// (codex P2 round 14 on PR #291) B begins after A, finishes first (records `[b]`, clears
+    /// its token), and only then does A write a document under `[a]`. No pass is open to
+    /// mark, and the row would sit under `[b]` as if it belonged to it. The write must
+    /// clear the generation instead, so the index reads as pending, A's own finish records
+    /// nothing, and the next run refreshes.
+    #[test]
+    fn a_write_after_a_later_pass_already_recorded_leaves_the_generation_pending() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document("x.md", Some("t"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let list_a = vec!["a".to_string()];
+
+        let token_a = begin_declared_fields_pass(&db).unwrap();
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#)
+        );
+        assert_eq!(db.read_declared_fields_pass().unwrap(), None);
+
+        // A, still running, writes a document under its own set.
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: Some(&token_a),
+                generation: r#"["a"]"#,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap(),
+            None,
+            "the recorded `[b]` would have claimed A's `[a]` rows; the key must be cleared"
+        );
+        // A finishes: its token is gone, so it records nothing, and the index stays pending.
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), None, r#"["a"]"#, true).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+
+        // Control: a write whose generation matches the recorded one leaves it in place.
+        db.write_declared_fields(r#"["a"]"#).unwrap();
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: None,
+                generation: r#"["a"]"#,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["a"]"#)
+        );
+    }
+
+    /// (codex P2 round 12 on PR #291) The crossed-parser twins are distinct outcomes: the
+    /// watcher's diagnostic is chosen by variant, and "content kept" versus "document
+    /// dropped" must not collapse into one arm.
+    #[test]
+    fn the_dropped_rename_outcomes_are_distinct_from_the_kept_ones() {
+        assert_ne!(
+            RenameOutcome::RenamedSizeCappedAndDropped,
+            RenameOutcome::RenamedSizeCapped
+        );
+        assert_ne!(
+            RenameOutcome::RenamedButRefusedAndDropped,
+            RenameOutcome::RenamedButRefused
+        );
+        assert_ne!(
+            RenameOutcome::RenamedSizeCappedAndDropped,
+            RenameOutcome::RenamedButRefusedAndDropped
+        );
+        // (local Codex after round 13) "not reindexed" is neither a plain rename nor a drop.
+        assert_ne!(
+            RenameOutcome::RenamedButNotReindexed,
+            RenameOutcome::Renamed
+        );
+        assert_ne!(
+            RenameOutcome::RenamedButNotReindexed,
+            RenameOutcome::RenamedButRefusedAndDropped
+        );
+    }
+
+    #[test]
+    fn declared_fields_recorded_tells_absent_from_declared_nothing_from_a_list() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            None,
+            "no generation key written yet: pending, not an empty answer"
+        );
+
+        db.write_declared_fields("[]").unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            Some(Vec::new()),
+            "`[]` is a completed answer: the schema declares nothing"
+        );
+
+        db.write_declared_fields(r#"["environment","status"]"#)
+            .unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            Some(vec!["environment".to_string(), "status".to_string()])
+        );
+
+        db.clear_declared_fields().unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            None,
+            "clearing the key (what a refresh does at its start) must read back as pending again, \
+             not as the list that was there a moment ago"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // feature-58: declared fields (pure fn)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn declared_field_names_drops_the_five_named_fields_and_sorts() {
+        let schema = crate::schema::Schema::from_toml_str(
+            "[fields.title]\nrequired = true\n[fields.team]\n[fields.status]\nenum = [\"active\"]\n[fields.tags]\ntype = \"array\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared_field_names(Some(&schema)),
+            vec!["status".to_string(), "team".to_string()]
+        );
+        assert!(declared_field_names(None).is_empty());
+    }
+
+    #[test]
+    fn declared_field_rows_keeps_scalars_and_list_elements_of_declared_keys_only() {
+        use crate::parser::FieldValue;
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            "status".to_string(),
+            FieldValue::Scalar("active".to_string()),
+        );
+        extra.insert(
+            "environment".to_string(),
+            FieldValue::List(vec![
+                "dev".to_string(),
+                "prod".to_string(),
+                "dev".to_string(),
+            ]),
+        );
+        extra.insert("owner".to_string(), FieldValue::Other("mapping"));
+        extra.insert("note".to_string(), FieldValue::Other(FieldValue::NULL));
+        extra.insert(
+            "undeclared".to_string(),
+            FieldValue::Scalar("x".to_string()),
+        );
+        let declared = [
+            "environment".to_string(),
+            "note".to_string(),
+            "owner".to_string(),
+            "status".to_string(),
+        ];
+        assert_eq!(
+            declared_field_rows(&extra, &declared),
+            vec![
+                ("environment".to_string(), "dev".to_string()),
+                ("environment".to_string(), "prod".to_string()),
+                ("environment".to_string(), "dev".to_string()), // the DB folds it; the rows are what the parser held
+                ("status".to_string(), "active".to_string()),
+            ]
+        );
+        assert!(declared_field_rows(&extra, &[]).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // 増分 index API
     // -----------------------------------------------------------------------
 
@@ -3124,8 +4317,14 @@ mod tests {
             &Registry::default(),
             Reindex::Incremental {
                 check_frontmatter: true,
+                refresh_fields: false,
             },
             ContextMode::Off,
+            DeclaredSet::Known {
+                list: &[],
+                pass: None,
+                generation: "[]",
+            },
         )
         .unwrap();
         assert_eq!(
@@ -3165,8 +4364,14 @@ mod tests {
             &Registry::default(),
             Reindex::Incremental {
                 check_frontmatter: true,
+                refresh_fields: false,
             },
             ContextMode::Off,
+            DeclaredSet::Known {
+                list: &[],
+                pass: None,
+                generation: "[]",
+            },
         )
         .unwrap();
         assert_eq!(

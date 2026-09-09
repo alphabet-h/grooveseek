@@ -460,6 +460,39 @@ fn parse_confidence_ratio(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
+/// `--field` / `--field-not` take `key=value`, split at the **first** `=`, so a
+/// value may itself contain `=`, commas or spaces. A missing `=`, an empty key
+/// or an empty value is a usage error (exit 2) before any model is loaded:
+/// the MCP tool refuses the same inputs with its error envelope.
+fn parse_field_pair(s: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = s.split_once('=') else {
+        return Err(format!("expected key=value, got {s:?}"));
+    };
+    if key.is_empty() {
+        return Err("the key before '=' is empty".into());
+    }
+    if value.is_empty() {
+        return Err("the value after '=' is empty".into());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// The `--field` / `--field-not` pairs a repeated flag collects, grouped by key -- one value
+/// per occurrence, in the order clap saw them, with no deduplication (codex P2 round 8 on PR
+/// #291): this is the *raw* map [`grooveseek::server::validate_raw_field_filters`] bounds
+/// before [`grooveseek::db::normalize_field_filters`] dedups it, matching the MCP path's raw
+/// `fields` / `fields_not` object one key can also repeat values under.
+fn group_field_pairs(
+    pairs: Vec<(String, String)>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut raw: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (key, value) in pairs {
+        raw.entry(key).or_default().push(value);
+    }
+    raw
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct SearchCliArgs {
     /// Search query text (positional)
@@ -516,6 +549,15 @@ pub(crate) struct SearchCliArgs {
     /// date filter 上限 (両端含む)
     #[arg(long = "date-to")]
     pub(crate) date_to: Option<String>,
+    /// 宣言 key の値で絞る (`--field status=active`)。**繰り返して**指定する。
+    /// 同じ key は OR、違う key は AND。最初の `=` で分けるので値に `=` や
+    /// カンマがあってもそのまま。MCP param: `fields`
+    #[arg(long = "field", value_name = "KEY=VALUE", value_parser = parse_field_pair)]
+    pub(crate) fields: Vec<(String, String)>,
+    /// 宣言 key の値を持つ文書を除外する (`--field-not status=deprecated`)。
+    /// key を持たない文書は残る。MCP param: `fields_not`
+    #[arg(long = "field-not", value_name = "KEY=VALUE", value_parser = parse_field_pair)]
+    pub(crate) fields_not: Vec<(String, String)>,
     /// rank-based low_confidence ratio (default: 1.5、0.0 で判定無効)
     #[arg(
         long = "min-confidence-ratio",
@@ -874,6 +916,13 @@ fn main() -> anyhow::Result<()> {
             // `.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当だった設定の
             // まま upgrade した人がこの経路に入る。
             let registry = cfg.build_parser_registry(&kb_path)?;
+            // (feature-58, codex P2 round 9 on PR #291) Read next to `[parsers].enabled`
+            // above, not after `Embedder::with_model` below: this needs only `kb_path`, the
+            // same as the registry check, and a malformed schema is refused before a run that
+            // is already doomed pays for a model download it was never going to use (see
+            // `load_declared_schema`'s doc for the full "cheap checks first" ordering this
+            // extends -- the resets it was already ahead of are further down still).
+            let schema = grooveseek::indexer::load_declared_schema(&kb_path)?;
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             let db_path_str = db_path.to_string_lossy();
@@ -903,6 +952,12 @@ fn main() -> anyhow::Result<()> {
                 db.verify_embedding_meta(model.model_id(), dim)?;
             }
             let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
+            // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) `schema` was already read
+            // above, before any reset -- a malformed schema must fail before `--force` empties
+            // the index, not after. `rebuild_index` no longer reads the file itself (round 3):
+            // that snapshot is what it gets, so the file is read exactly once per run rather
+            // than once above and once more inside it. (codex P2 round 9) Moved above this
+            // `Embedder::with_model` call too -- see `load_declared_schema`'s doc.
             if force {
                 db.reset_for_model(embedder.model_id(), dim)?;
             }
@@ -920,6 +975,7 @@ fn main() -> anyhow::Result<()> {
                 &db,
                 &mut embedder,
                 &kb_path,
+                schema,
                 force,
                 cfg.exclude_headings.as_deref(),
                 &exclude_dirs,
@@ -1009,6 +1065,8 @@ fn main() -> anyhow::Result<()> {
                 tags_all,
                 date_from,
                 date_to,
+                fields,
+                fields_not,
                 min_confidence_ratio,
                 // MMR / parent-retriever flags are wired through `overrides` above.
                 mmr: _,
@@ -1031,6 +1089,23 @@ fn main() -> anyhow::Result<()> {
             let parsed = grooveseek::db::parse_query(&query);
             parsed.require_positive()?;
 
+            // (codex P2 round 8 on PR #291) The raw, pre-dedup map is bounded first -- a
+            // repeated `--field status=x` past the per-list limit is refused by its raw count,
+            // not the count `normalize_field_filters`'s dedup would leave behind.
+            // (codex P2 round 10) Up here with the query check, **before `Database::open` and
+            // `Embedder::with_model` below**, for the same reason `Commands::Index` reads the
+            // schema before loading the model: these bounds need nothing but the arguments,
+            // and a request they refuse must not first open the DB and pay for a model load
+            // (BGE-M3 uncached: ~2.3 GB) it was never going to use.
+            let fields_raw = group_field_pairs(fields);
+            grooveseek::server::validate_raw_field_filters("fields", &fields_raw)?;
+            let fields_not_raw = group_field_pairs(fields_not);
+            grooveseek::server::validate_raw_field_filters("fields_not", &fields_not_raw)?;
+            let fields = grooveseek::db::normalize_field_filters(fields_raw);
+            let fields_not = grooveseek::db::normalize_field_filters(fields_not_raw);
+            grooveseek::server::validate_field_filters("fields", &fields)?;
+            grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
+
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
             // `--reranker` given here is a choice about this query; a model that
@@ -1042,6 +1117,12 @@ fn main() -> anyhow::Result<()> {
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
+            // (codex P2 round 11 on PR #291) A field filter the index cannot answer yet
+            // (its declared set is pending) is refused here, on the opened database and
+            // before `Embedder::with_model` below -- the search legs refuse it too, but
+            // only after the model was loaded and the query embedded. Same ordering
+            // argument as `--field` bounds above and the schema read in `Commands::Index`.
+            db.refuse_field_filters_while_pending(Some(&fields), Some(&fields_not))?;
             let dim = model.dimension() as u32;
             db.verify_embedding_meta(model.model_id(), dim)?;
 
@@ -1069,6 +1150,8 @@ fn main() -> anyhow::Result<()> {
             // AU-17: `tags_*` は glob と違って compile を通らないので、ここで検査する。
             grooveseek::server::validate_filter_list("tags_any", &tags_any)?;
             grooveseek::server::validate_filter_list("tags_all", &tags_all)?;
+            // `--field` / `--field-not` were bounded and normalised above, before the DB
+            // was opened (codex P2 round 10 on PR #291).
 
             let filters = grooveseek::db::SearchFilters {
                 category: category.as_deref(),
@@ -1079,6 +1162,8 @@ fn main() -> anyhow::Result<()> {
                 tags_all: &tags_all,
                 date_from: date_from.as_deref(),
                 date_to: date_to.as_deref(),
+                fields: Some(&fields),
+                fields_not: Some(&fields_not),
             };
 
             // Both CLI and MCP go through the shared MMR-aware pipeline so the
@@ -1090,6 +1175,10 @@ fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
+            // (local Codex on PR #291 after round 12, fourth pass) A field-filtered request
+            // reads one committed state from here to the end of the parent retriever --
+            // see `Database::field_filter_snapshot`. `None` when no field filter is on.
+            let snapshot = db.field_filter_snapshot(&filters)?;
             let pipeline = grooveseek::server::run_search_pipeline(
                 &db,
                 reranker_obj.as_mut(),
@@ -1121,6 +1210,10 @@ fn main() -> anyhow::Result<()> {
                     resolved.parent_retriever_enabled,
                     parent_params,
                 );
+            // The last DB read of this request is behind us; release the snapshot.
+            if let Some(tx) = snapshot {
+                tx.commit()?;
+            }
             // match_spans は Parent retriever 拡張後の content に対して計算する
             // (`expand_parent` は defensive に None クリアするので必ず再計算が要る)。
             for h in &mut hits {
@@ -1144,6 +1237,8 @@ fn main() -> anyhow::Result<()> {
                 topic.as_deref(),
                 min_confidence_ratio,
                 parsed.exclude(),
+                &fields,
+                &fields_not,
                 format,
             );
         }
@@ -1929,6 +2024,8 @@ fn print_search_results(
     topic: Option<&str>,
     explicit_ratio: Option<f32>,
     excluded_terms: &[String],
+    fields: &grooveseek::db::FieldFilters,
+    fields_not: &grooveseek::db::FieldFilters,
     format: SearchFormat,
 ) {
     let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
@@ -1960,6 +2057,8 @@ fn print_search_results(
                     date_to.map(str::to_owned),
                     explicit_ratio,
                     excluded_terms.to_vec(),
+                    fields.clone(),
+                    fields_not.clone(),
                 ),
             };
             println!(
@@ -2013,6 +2112,62 @@ fn print_search_results(
     }
 }
 
+#[cfg(test)]
+mod field_flag {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_field_pair_splits_at_the_first_equals_and_keeps_the_rest_verbatim() {
+        assert_eq!(
+            parse_field_pair("status=active").unwrap(),
+            ("status".into(), "active".into())
+        );
+        assert_eq!(
+            parse_field_pair("url=a=b,c d").unwrap(),
+            ("url".into(), "a=b,c d".into())
+        );
+        assert!(parse_field_pair("status").is_err());
+        assert!(parse_field_pair("=active").is_err());
+        assert!(parse_field_pair("status=").is_err());
+    }
+
+    #[test]
+    fn groove_search_refuses_a_field_without_a_value_as_a_usage_error() {
+        // `Cli` does not derive `Debug` (nor do several types it is built
+        // from), so `.unwrap_err()` cannot be used here -- it requires the
+        // `Ok` side to implement `Debug` for the panic message. A match
+        // extracts the error without that bound.
+        let err = match Cli::try_parse_from(["groove", "search", "q", "--field", "status"]) {
+            Ok(_) => panic!("--field status (no value) must be a usage error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let ok = Cli::try_parse_from([
+            "groove",
+            "search",
+            "q",
+            "--field",
+            "status=active",
+            "--field",
+            "team=core",
+            "--field-not",
+            "status=deprecated",
+        ])
+        .unwrap();
+        match ok.command {
+            Commands::Search(a) => {
+                assert_eq!(a.fields.len(), 2);
+                assert_eq!(
+                    a.fields_not,
+                    vec![("status".to_string(), "deprecated".to_string())]
+                );
+            }
+            _ => panic!("not a search"),
+        }
+    }
+}
+
 /// The command line and the MCP tools are two namespaces that
 /// [`docs/stability.md`] freezes separately, and the promise made there is that
 /// where both expose the same concept they use the same noun. Nothing enforces
@@ -2043,6 +2198,8 @@ mod naming_surface {
         ("category", "category"),
         ("date_from", "date-from"),
         ("date_to", "date-to"),
+        ("fields", "field"),
+        ("fields_not", "field-not"),
         ("include_low_quality", "include-low-quality"),
         ("limit", "limit"),
         ("min_confidence_ratio", "min-confidence-ratio"),
@@ -2205,6 +2362,8 @@ mod naming_surface {
         ("search", "path-glob", Multiplicity::Repeatable),
         ("search", "tag-any", Multiplicity::CommaList),
         ("search", "tag-all", Multiplicity::CommaList),
+        ("search", "field", Multiplicity::Repeatable),
+        ("search", "field-not", Multiplicity::Repeatable),
         ("graph", "exclude-paths", Multiplicity::CommaList),
     ];
 
@@ -3097,6 +3256,8 @@ mod tests {
             tags_all: Vec::new(),
             date_from: None,
             date_to: None,
+            fields: Vec::new(),
+            fields_not: Vec::new(),
             min_confidence_ratio: None,
             mmr: None,
             mmr_lambda: None,
