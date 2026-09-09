@@ -5376,6 +5376,132 @@ mod tests {
         assert_eq!(paths, vec!["a.md"]);
     }
 
+    /// (local Codex on PR #291 after round 12, third pass) A field-filtered search reads
+    /// one committed state from its pending check to its last statement. Two connections
+    /// on one file: A opens the snapshot a field-filtered search opens
+    /// ([`Database::field_filter_snapshot`]) and reads the generation; B -- the refresh in
+    /// another process -- clears it and commits; A reads again and must still see the
+    /// generation it checked, and only after its snapshot ends does it see the clear. No
+    /// filter, no snapshot: the search has nothing to pin.
+    #[test]
+    fn a_field_filtered_search_reads_one_committed_state_across_a_concurrent_refresh() {
+        let dir = crate::test_support::unique_temp_path("groove-search-snapshot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(".groove.db");
+        let a = Database::open(db_path.to_str().unwrap()).unwrap();
+        let b = Database::open(db_path.to_str().unwrap()).unwrap();
+        a.write_declared_fields(r#"["status"]"#).unwrap();
+
+        let active = field_map(&[("status", &["active"])]);
+        let filtered = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        assert!(
+            a.field_filter_snapshot(&SearchFilters::default())
+                .unwrap()
+                .is_none(),
+            "no field filter, no snapshot"
+        );
+
+        let snapshot = a
+            .field_filter_snapshot(&filtered)
+            .unwrap()
+            .expect("a snapshot");
+        assert!(
+            a.refuse_field_filters_while_pending(Some(&active), None)
+                .is_ok()
+        );
+        // B: a refresh begins and commits while A's request is still running.
+        b.clear_declared_fields().unwrap();
+        assert_eq!(b.read_declared_fields().unwrap(), None);
+        assert_eq!(
+            a.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["status"]"#),
+            "inside its snapshot A still sees the generation it checked"
+        );
+        assert!(
+            a.refuse_field_filters_while_pending(Some(&active), None)
+                .is_ok(),
+            "and a statement of the same request is not refused halfway through"
+        );
+        snapshot.commit().unwrap();
+        assert_eq!(
+            a.read_declared_fields().unwrap(),
+            None,
+            "after the snapshot ends the clear is visible, and the next request is refused"
+        );
+        assert_eq!(
+            a.refuse_field_filters_while_pending(Some(&active), None)
+                .unwrap_err()
+                .to_string(),
+            FIELD_FILTERS_PENDING
+        );
+
+        drop(b);
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (local Codex on PR #291 after round 12, third pass) The statements of one
+    /// field-filtered hybrid search sit between a `BEGIN` and a `COMMIT` -- the snapshot
+    /// the test above shows the effect of. Traced the way
+    /// [`a_hybrid_search_issues_two_statements_whatever_it_is_asked`] traces an unfiltered
+    /// search, which opens no transaction and keeps its two statements.
+    #[test]
+    fn a_field_filtered_hybrid_search_runs_inside_one_transaction() {
+        let db = db_with_declared_fields();
+        let active = field_map(&[("status", &["active"])]);
+        let filtered = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        TRACED_SQL.with(|v| v.borrow_mut().clear());
+        db.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_sql),
+        );
+        let hits = db
+            .search_hybrid(
+                "fieldfilter_unique_keyword",
+                &dummy_embedding(0.1),
+                10,
+                &filtered,
+                FusionParams::default(),
+            )
+            .unwrap();
+        db.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(hits.len(), 1);
+        let traced: Vec<String> = TRACED_SQL.with(|v| {
+            v.borrow()
+                .iter()
+                .filter(|sql| !sql.trim_start().starts_with("--"))
+                .cloned()
+                .collect()
+        });
+        assert!(
+            traced
+                .first()
+                .is_some_and(|s| s.trim_start().starts_with("BEGIN")),
+            "the request must open its snapshot before its first read, got: {traced:?}"
+        );
+        assert!(
+            traced
+                .last()
+                .is_some_and(|s| s.trim_start().starts_with("COMMIT")),
+            "and close it after its last statement, got: {traced:?}"
+        );
+        assert!(
+            traced
+                .iter()
+                .filter(|s| s.contains("declared_fields"))
+                .count()
+                >= 1,
+            "the pending check runs inside the snapshot, got: {traced:?}"
+        );
+    }
+
     #[test]
     fn fields_filter_keeps_only_documents_holding_one_of_the_values() {
         let db = db_with_declared_fields();

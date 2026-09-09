@@ -215,6 +215,24 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        // Pin the snapshot for the pending check and the query (see `field_filter_snapshot`).
+        let snapshot = self.field_filter_snapshot(filters)?;
+        let hits = self.search_fts_candidates_parsed_pinned(query, limit, filters, fusion)?;
+        if let Some(tx) = snapshot {
+            tx.commit()?;
+        }
+        Ok(hits)
+    }
+
+    /// The body of [`Self::search_fts_candidates_parsed`], run inside whatever snapshot
+    /// that wrapper (or the hybrid path) opened.
+    fn search_fts_candidates_parsed_pinned(
+        &self,
+        query: &ParsedQuery<'_>,
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        fusion: FusionParams,
+    ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
         self.refuse_field_filters_while_pending(filters.fields, filters.fields_not)?;
@@ -448,12 +466,48 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<(CandidateHits, CandidateHits)> {
+        // (local Codex on PR #291 after round 12, third pass) One snapshot for the whole
+        // request when a field filter is on: both legs, their pending checks and the vector
+        // leg's pages all read the same committed state -- see `field_filter_snapshot`.
+        let snapshot = self.field_filter_snapshot(filters)?;
         let parsed = parse_query(query_text);
         let excluded = self.excluded_chunk_ids(parsed.negative_match().as_deref())?;
         let vec_hits =
             self.search_vec_candidates_excluding(query_embedding, candidates, filters, &excluded)?;
         let fts_hits = self.search_fts_candidates_parsed(&parsed, candidates, filters, fusion)?;
+        if let Some(tx) = snapshot {
+            tx.commit()?;
+        }
         Ok((vec_hits, fts_hits))
+    }
+
+    /// (local Codex on PR #291 after round 12, third pass) The read snapshot a
+    /// field-filtered search runs inside, or `None` when there is nothing to pin.
+    ///
+    /// [`Database::refuse_field_filters_while_pending`] reads the generation key once;
+    /// the candidate statements run afterwards, and under WAL each statement outside a
+    /// transaction sees whatever is committed *then*. A refresh in another process can
+    /// begin between the check and a leg's query -- or between two pages of the vector
+    /// leg -- clear the key and commit per-document row replacements, and the search
+    /// answers from a mix of generations after having passed the check. A deferred
+    /// transaction pins the snapshot at its first read: the check and every statement
+    /// until the commit see one committed state, so a refresh that begins in between is
+    /// invisible to this request and the next request is refused. Opened only when a
+    /// field filter is present (the only reader the generation protects) and only when
+    /// no transaction is open already (the hybrid path opens one for both legs; a leg
+    /// called on its own opens its own). A deferred transaction takes no write lock, so
+    /// it never blocks the writer whose commits it is shielded from.
+    pub(crate) fn field_filter_snapshot(
+        &self,
+        filters: &SearchFilters<'_>,
+    ) -> Result<Option<rusqlite::Transaction<'_>>> {
+        let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
+            || filters.fields_not.is_some_and(|f| !f.is_empty());
+        if field_filtered && self.conn.is_autocommit() {
+            Ok(Some(self.conn.unchecked_transaction()?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// (feature-58, codex P2 round 10 on PR #291) A `fields` / `fields_not` filter
@@ -621,6 +675,25 @@ impl Database {
     /// [`VEC_KNN_MAX_K`] 以下には収まる (AU-01 の事前確保の話は
     /// [`Self::fetch_vec_page`] 側の注記を参照)。
     pub(crate) fn search_vec_candidates_excluding(
+        &self,
+        query_embedding: &[f32],
+        limit: u32,
+        filters: &SearchFilters<'_>,
+        excluded: &HashSet<i64>,
+    ) -> Result<Vec<(i64, SearchResult)>> {
+        // Pin the snapshot for the pending check and every page (see `field_filter_snapshot`).
+        let snapshot = self.field_filter_snapshot(filters)?;
+        let hits =
+            self.search_vec_candidates_excluding_pinned(query_embedding, limit, filters, excluded)?;
+        if let Some(tx) = snapshot {
+            tx.commit()?;
+        }
+        Ok(hits)
+    }
+
+    /// The body of [`Self::search_vec_candidates_excluding`], run inside whatever
+    /// snapshot that wrapper (or the hybrid path) opened.
+    fn search_vec_candidates_excluding_pinned(
         &self,
         query_embedding: &[f32],
         limit: u32,
