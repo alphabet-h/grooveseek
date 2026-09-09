@@ -2219,8 +2219,8 @@ mod tests {
     }
 
     /// The MCP shape for a declared-field filter is array-only (feature-58
-    /// review round 1): `key -> string[]`, the same shape `tags_any` already
-    /// uses, never `key -> string | string[]`. An untagged `string | Vec`
+    /// review round 1): `key -> string[]`, the same shape [`Self::tags_any`]
+    /// already uses, never `key -> string | string[]`. An untagged `string | Vec`
     /// enum would have advertised `anyOf`, the union `schema_compat.rs`
     /// exists to strip for runtimes that cannot compile one into a decoding
     /// grammar (issue #75) — this pins that `fields` / `fields_not` never put

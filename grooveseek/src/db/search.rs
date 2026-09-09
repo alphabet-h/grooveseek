@@ -543,7 +543,7 @@ impl Database {
     /// corpus の残りとは無関係に起きる。field filter と `-除外語` を併用した
     /// クエリだけ、本当は再取得すれば埋まる場面で 1 周で打ち切りうる —
     /// 結果が誤るわけではなく recall が落ちるだけ ([`Self::fetch_vec_page`] の
-    /// `rows_seen` の注記も参照)。
+    /// [`VecPage::rows_seen`] の注記も参照)。
     ///
     /// 2 つ目が「`excluded` が空」ではないのが要点 (round 2)。category / path / date /
     /// quality の filter で `limit` に届かないのは feature-26 以来の既存挙動で、ここで

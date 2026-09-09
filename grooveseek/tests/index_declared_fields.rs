@@ -27,8 +27,8 @@ fn run(kb: &Path, args: &[&str]) -> (String, String, ExitStatus) {
 /// `grooveseek/src/config.rs:554-600`), never from `--kb-path`. A `groove.toml`
 /// written under the temp KB directory itself is therefore never found by a
 /// plain `run`; a test that needs one active (e.g. `fail_on_frontmatter_error`)
-/// has to write it beside the KB (`TempKbLayout::root()`, a sibling of `kb()`
-/// that is not walked as content) and hand it over explicitly, exactly as
+/// has to write it beside the KB ([`TempKbLayout::root`], a sibling of
+/// [`TempKbLayout::kb`] that is not walked as content) and hand it over explicitly, exactly as
 /// `index_frontmatter_unparsed.rs::strict_config` does.
 fn run_with_config(
     kb: &Path,
@@ -74,9 +74,10 @@ fn declared_meta(kb: &Path) -> Option<String> {
 
 const SCHEMA: &str = "[fields.status]\nenum = [\"active\", \"deprecated\"]\n[fields.environment]\n";
 
-/// `TempKbLayout` (tests/common/temp.rs): `kb()` is the `--kb-path`, `root()`
-/// its parent (where `.groove.db` lands), `write(rel, content)` writes under
-/// `kb()`. Dropping it removes the root.
+/// [`TempKbLayout`] (tests/common/temp.rs): [`TempKbLayout::kb`] is the
+/// `--kb-path`, [`TempKbLayout::root`] its parent (where `.groove.db` lands),
+/// [`TempKbLayout::write`] writes under [`TempKbLayout::kb`]. Dropping it
+/// removes the root.
 fn corpus() -> TempKbLayout {
     let kb = TempKbLayout::new("groove-declared-fields");
     kb.write(

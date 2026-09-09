@@ -1829,7 +1829,7 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// empty list. Recorded without a refresh pass, since there is nothing to write.
 pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
 
-/// The declared-field list the last completed `rebuild_index` recorded, read
+/// The declared-field list the last completed [`rebuild_index`] recorded, read
 /// back via [`Database::read_declared_fields`] and parsed out of its JSON.
 /// `None` (no generation key stored yet) becomes an empty list, matching
 /// [`declared_field_names`]`(None)`.
