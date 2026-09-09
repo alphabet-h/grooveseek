@@ -343,9 +343,6 @@ Flags:
   `<kb-path>/groove-schema.toml`. This is the only way to point `validate` at a
   schema that does not sit beside the knowledge base — one shared schema for
   several bases, or a stricter one kept in CI.
-
-`groove index` reads the same `<kb-path>/groove-schema.toml` (v1.9.0+): the keys it declares are stored per document so `groove search --field` can filter on them. A schema that does not load stops `groove index`, the way a `groove.toml` that does not load stops the binary.
-
 - `--strict` (v1.9.0+) — report a frontmatter key the schema does not declare
   as an `undeclared_field` violation, one per key. Same effect as
   `[options] allow_unknown_fields = false` in the schema; the flag only ever
@@ -356,6 +353,8 @@ Flags:
   when stdout is not a TTY, so this is for the case where it is one.
 
 Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). A file whose frontmatter block is not valid YAML counts as one violation (`frontmatter_unparsed`, v1.8.0+), so it exits 1 like any other. When `groove-schema.toml` is absent under `--kb-path`, the command exits 0 with a short "no schema found" note, so adding `groove validate` to an existing workflow is non-disruptive until you actually write a schema.
+
+`groove index` reads the same `<kb-path>/groove-schema.toml` (v1.9.0+): the keys it declares are stored per document so `groove search --field` can filter on them. A schema that does not load stops `groove index`, the way a `groove.toml` that does not load stops the binary.
 
 ## Check the index itself (v0.23.0+)
 

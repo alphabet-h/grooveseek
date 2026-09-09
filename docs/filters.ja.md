@@ -20,8 +20,8 @@
 | `min_quality` | number | `0.5` | quality filter の閾値 (`[quality_filter].threshold`) をこの呼び出しだけ上書き |
 | `include_low_quality` | bool | `true` | この呼び出しでは quality filter を無効化 (`min_quality: 0.0` と等価、意図が明示的) |
 | `min_confidence_ratio` | number | `1.5` | `low_confidence` フラグの閾値 |
-| `fields` | object | `{"status": "active", "environment": ["dev", "prod"]}` | スキーマが宣言した frontmatter key (v1.9.0+): 各 key が列挙値のいずれかを持つ |
-| `fields_not` | object | `{"status": "deprecated"}` | 列挙値のいずれかを持つ文書を除外。key を持たない文書は残る |
+| `fields` | object | `{"status": ["active"], "environment": ["dev", "prod"]}` | スキーマが宣言した frontmatter key (v1.9.0+): 各 key が列挙値のいずれかを持つ |
+| `fields_not` | object | `{"status": ["deprecated"]}` | 列挙値のいずれかを持つ文書を除外。key を持たない文書は残る |
 
 ## `path_globs`
 
@@ -111,8 +111,8 @@ YAML frontmatter が parse できなかった Markdown (v1.7.0+) にも、同じ
 
 ```jsonc
 {
-  "fields":     { "status": "active", "environment": ["dev", "prod"] },
-  "fields_not": { "team": "archived" }
+  "fields":     { "status": ["active"], "environment": ["dev", "prod"] },
+  "fields_not": { "team": ["archived"] }
   // = status is active, environment is dev or prod, and team is not archived
 }
 ```
@@ -221,7 +221,7 @@ rank 1 で正解**しているのに **14 件で発火**した。そして同じ
   "path_globs": ["docs/**"],
   "tags_all":   ["rust"],
   "date_from":  "2026-01-01",
-  "fields_not": { "status": "deprecated" }
+  "fields_not": { "status": ["deprecated"] }
   // = docs/ 配下、"rust" タグ、2026 年以降、deprecated ではない
 }
 ```

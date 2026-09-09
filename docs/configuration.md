@@ -95,7 +95,9 @@ max_chunk_chars = 3500
 # `depth` / `tags` — are stored per document as the values `search --field`
 # filters on. There is no key for the path; it is the file `groove validate`
 # reads. A schema that fails to load stops the index with the load error
-# rather than indexing without it.
+# rather than indexing without it. `groove index` reads only that one path;
+# a schema kept elsewhere and passed to `groove validate --schema <path>` is
+# not seen by the index, so `search --field` filters on it answer empty.
 
 # Live-sync file watcher. When `groove serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally

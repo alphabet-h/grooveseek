@@ -342,9 +342,6 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 - `--schema <PATH>` — `<kb-path>/groove-schema.toml` 以外からスキーマを読む。
   **ナレッジベースの隣に置かないスキーマを使う唯一の手段** — 複数のベースで
   1 つのスキーマを共有する、CI 用に厳しめのものを別に置く、といった場合
-
-`groove index` も同じ `<kb-path>/groove-schema.toml` を読む (v1.9.0+): 宣言された key は文書ごとに保存され、`groove search --field` がそれを filter に使う。スキーマの読み込みに失敗すると `groove.toml` の読み込み失敗がバイナリを止めるのと同様に `groove index` が止まる。
-
 - `--strict` (v1.9.0+) — スキーマが宣言していない frontmatter key を `undeclared_field`
   違反として key ごとに 1 件報告する。スキーマの `[options] allow_unknown_fields = false`
   と同じ効果で、flag は厳しくする方向にしか働かない。スキーマファイルが無ければ従来どおり exit 0
@@ -354,6 +351,8 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
   元から色は付かないので、TTY のときに落としたい場合のフラグ
 
 終了コード: `0` (違反なし) / `1` (違反あり) / `2` (スキーマロードエラー)。frontmatter ブロックが YAML として不正なファイルは違反 1 件 (`frontmatter_unparsed`、v1.8.0+) として数えるので、他の違反と同じく exit 1 になる。`--kb-path` 直下に `groove-schema.toml` が無いときは短い "no schema found" メッセージと共に exit 0 となるため、既存ワークフローへの `groove validate` 追加は実際にスキーマを書くまで非破壊。
+
+`groove index` も同じ `<kb-path>/groove-schema.toml` を読む (v1.9.0+): 宣言された key は文書ごとに保存され、`groove search --field` がそれを filter に使う。スキーマの読み込みに失敗すると `groove.toml` の読み込み失敗がバイナリを止めるのと同様に `groove index` が止まる。
 
 ## 索引そのものを検査する (v0.23.0+)
 

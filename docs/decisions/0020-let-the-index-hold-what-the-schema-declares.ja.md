@@ -94,6 +94,9 @@ key に限る。
   この脚は他のフィルタが既にそうしているのと同じく、クエリの後に Rust 側でフィルタする形へ
   退避する
 - **`doctor` はまだこのテーブルを見ない。`status` もこれを数えない**
+- **`groove index` が読むのは `<kb_path>/groove-schema.toml` だけである。** 別の
+  場所に置いて `groove validate --schema <path>` に渡している schema は索引から
+  見えないので、それに対する `--field` / `--field-not` フィルタは空を返す
 
 ## 参考
 

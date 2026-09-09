@@ -20,8 +20,8 @@ with **AND** semantics — all conditions must match for a chunk to appear in
 | `min_quality` | number | `0.5` | Per-call override of the quality-filter threshold (`[quality_filter].threshold`) |
 | `include_low_quality` | bool | `true` | Disable the quality filter for this call (equivalent to `min_quality: 0.0`, but explicit) |
 | `min_confidence_ratio` | number | `1.5` | Threshold for `low_confidence` flag |
-| `fields` | object | `{"status": "active", "environment": ["dev", "prod"]}` | Declared frontmatter keys (v1.9.0+): each key must hold one of its values |
-| `fields_not` | object | `{"status": "deprecated"}` | Drop a document holding one of the values; a document without the key stays |
+| `fields` | object | `{"status": ["active"], "environment": ["dev", "prod"]}` | Declared frontmatter keys (v1.9.0+): each key must hold one of its values |
+| `fields_not` | object | `{"status": ["deprecated"]}` | Drop a document holding one of the values; a document without the key stays |
 
 ## `path_globs`
 
@@ -111,8 +111,8 @@ index, so filtering on it matches nothing and is not an error.
 
 ```jsonc
 {
-  "fields":     { "status": "active", "environment": ["dev", "prod"] },
-  "fields_not": { "team": "archived" }
+  "fields":     { "status": ["active"], "environment": ["dev", "prod"] },
+  "fields_not": { "team": ["archived"] }
   // = status is active, environment is dev or prod, and team is not archived
 }
 ```
@@ -228,7 +228,7 @@ Filters compose with **AND**:
   "path_globs": ["docs/**"],
   "tags_all":   ["rust"],
   "date_from":  "2026-01-01",
-  "fields_not": { "status": "deprecated" }
+  "fields_not": { "status": ["deprecated"] }
   // = under docs/, tagged "rust", from 2026 onward, not deprecated
 }
 ```

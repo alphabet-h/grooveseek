@@ -99,6 +99,9 @@ The question this answers: **who brings a declared key into the index, and when
   refuse it, the leg falls back to filtering in Rust after the query, the way
   the other filters already work.
 - `doctor` does not yet look at the table. `status` does not count it.
+- `groove index` reads only `<kb_path>/groove-schema.toml`. A schema kept
+  elsewhere and passed to `groove validate --schema <path>` is not seen by
+  the index, so `--field` / `--field-not` filters on it answer empty.
 
 ## References
 

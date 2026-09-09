@@ -91,7 +91,9 @@ max_chunk_chars = 3500
 # の他に — は文書ごとに保存され、`search --field` が filter する値になる。
 # path 用の key は無い — それは `groove validate` が読むファイルである。
 # スキーマの読み込みに失敗すると、index せずに続けるのではなく、その
-# load error で index を止める。
+# load error で index を止める。`groove index` が読むのはこの 1 か所だけ:
+# 別の場所に置いて `groove validate --schema <path>` に渡しているスキーマは
+# index からは見えないので、それに対する `search --field` filter は空を返す。
 
 # ライブ同期ファイルウォッチャ。`groove serve` 実行中、
 # kb_path 配下の変更が `debounce_ms` 窓内に検出され、該当ファイルのみ
