@@ -852,6 +852,7 @@ pub fn rebuild_index(
             DeclaredSet::Known {
                 list: &declared_fields,
                 pass: pass_token.as_deref(),
+                generation: &declared_json,
             },
         )?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
@@ -2059,6 +2060,12 @@ pub(crate) enum DeclaredSet<'a> {
     Known {
         list: &'a [String],
         pass: Option<&'a str>,
+        /// The JSON of `list`, the generation this run will record at its finish (codex P2
+        /// round 14 on PR #291): a write that finds **no** pass open but a *different*
+        /// generation recorded has been overtaken by a pass that already finished -- its
+        /// rows would sit under that generation -- and clears the key so the index reads
+        /// as pending until the next run refreshes.
+        generation: &'a str,
     },
     /// The caller does not know it and must not guess: the watcher paths
     /// ([`reindex_single_file`], [`rename_single_file`]), which write what the last
@@ -2090,10 +2097,15 @@ fn write_declared_rows_or_mark_dirty(
     extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
     declared: DeclaredSet<'_>,
 ) -> Result<()> {
-    let (resolved, my_pass): (Option<Vec<String>>, Option<&str>) = match declared {
-        DeclaredSet::Known { list, pass } => (Some(list.to_vec()), pass),
-        DeclaredSet::FromIndex => (declared_fields_recorded(db)?, None),
-    };
+    let (resolved, my_pass, my_generation): (Option<Vec<String>>, Option<&str>, Option<&str>) =
+        match declared {
+            DeclaredSet::Known {
+                list,
+                pass,
+                generation,
+            } => (Some(list.to_vec()), pass, Some(generation)),
+            DeclaredSet::FromIndex => (declared_fields_recorded(db)?, None, None),
+        };
     if let Some(list) = &resolved {
         db.replace_document_fields(rel, &declared_field_rows(extra, list))?;
     }
@@ -2102,13 +2114,28 @@ fn write_declared_rows_or_mark_dirty(
     // watcher -- and it may already have processed this document. The rows just written are
     // this caller's answer, not that pass's, so that pass must not record its generation
     // over them: mark it dirty, exactly as a watcher does for an absent generation.
-    let foreign_pass_running = match (db.read_declared_fields_pass()?, my_pass) {
+    let current_pass = db.read_declared_fields_pass()?;
+    let foreign_pass_running = match (current_pass.as_deref(), my_pass) {
         (Some(current), Some(mine)) => current != mine,
         (Some(_), None) => true,
         (None, _) => false,
     };
     if resolved.is_none() || foreign_pass_running {
         db.mark_declared_fields_dirty()?;
+    }
+    // (codex P2 round 14 on PR #291) No pass open, but the generation recorded is not the
+    // one this run writes under: a pass that began after this run *finished* already --
+    // recorded its set and cleared its token -- and the rows just written sit under that
+    // set as if they belonged to it. Nothing is running to mark, so the key itself goes:
+    // an absent generation refuses field filters and makes the next run refresh, and this
+    // run's own finish, finding its observation or token gone, records nothing.
+    if let Some(mine) = my_generation
+        && current_pass.is_none()
+        && db
+            .read_declared_fields()?
+            .is_some_and(|recorded| recorded != mine)
+    {
+        db.clear_declared_fields()?;
     }
     Ok(())
 }
@@ -3772,6 +3799,7 @@ mod tests {
             DeclaredSet::Known {
                 list: &list_a,
                 pass: Some(&token_a),
+                generation: r#"["a"]"#,
             },
         )
         .unwrap();
@@ -3799,6 +3827,7 @@ mod tests {
             DeclaredSet::Known {
                 list: &list_a,
                 pass: None,
+                generation: r#"["a"]"#,
             },
         )
         .unwrap();
@@ -3862,6 +3891,68 @@ mod tests {
         assert!(
             finish_declared_fields_pass(&db, None, observed_by_a.as_deref(), r#"["a"]"#, true)
                 .unwrap()
+        );
+    }
+
+    /// (codex P2 round 14 on PR #291) B begins after A, finishes first (records `[b]`, clears
+    /// its token), and only then does A write a document under `[a]`. No pass is open to
+    /// mark, and the row would sit under `[b]` as if it belonged to it. The write must
+    /// clear the generation instead, so the index reads as pending, A's own finish records
+    /// nothing, and the next run refreshes.
+    #[test]
+    fn a_write_after_a_later_pass_already_recorded_leaves_the_generation_pending() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document("x.md", Some("t"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let list_a = vec!["a".to_string()];
+
+        let token_a = begin_declared_fields_pass(&db).unwrap();
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#)
+        );
+        assert_eq!(db.read_declared_fields_pass().unwrap(), None);
+
+        // A, still running, writes a document under its own set.
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: Some(&token_a),
+                generation: r#"["a"]"#,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap(),
+            None,
+            "the recorded `[b]` would have claimed A's `[a]` rows; the key must be cleared"
+        );
+        // A finishes: its token is gone, so it records nothing, and the index stays pending.
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), None, r#"["a"]"#, true).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+
+        // Control: a write whose generation matches the recorded one leaves it in place.
+        db.write_declared_fields(r#"["a"]"#).unwrap();
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: None,
+                generation: r#"["a"]"#,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["a"]"#)
         );
     }
 
@@ -4232,6 +4323,7 @@ mod tests {
             DeclaredSet::Known {
                 list: &[],
                 pass: None,
+                generation: "[]",
             },
         )
         .unwrap();
@@ -4278,6 +4370,7 @@ mod tests {
             DeclaredSet::Known {
                 list: &[],
                 pass: None,
+                generation: "[]",
             },
         )
         .unwrap();
