@@ -149,7 +149,7 @@ plugin の `prompts/adversarial-review.md` の `User focus:` に差し込まれ�
 
 `claim_guard` C1 は focus 文にも効く (`4096 rows` + `every` で止まった)。数を書くなら定数名で書く。
 
-### 結果の読み方
+### ローカルの結果の読み方 (GitHub round の「結果の読み方」とは別の表)
 
 stdout の並びは header (`# Codex Adversarial Review`) / `Target:` / **`Verdict: approve|needs-attention`** /
 summary 1 段落 / `Findings:` か `No material findings.` (plugin の `scripts/lib/render.mjs` の
