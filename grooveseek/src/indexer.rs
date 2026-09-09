@@ -849,7 +849,10 @@ pub fn rebuild_index(
             registry,
             mode,
             context_mode,
-            DeclaredSet::Known(&declared_fields),
+            DeclaredSet::Known {
+                list: &declared_fields,
+                pass: pass_token.as_deref(),
+            },
         )?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
         // as: if this was a forced reparse across a parser boundary and it did not end in
@@ -2021,9 +2024,17 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// round 9 / 12 on PR #291, local Codex after round 12).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DeclaredSet<'a> {
-    /// The caller knows the set: [`rebuild_index`], which just read the schema and owns
-    /// the generation for the length of its pass. Written as given.
-    Known(&'a [String]),
+    /// The caller knows the set: [`rebuild_index`], which just read the schema. Written as
+    /// given. `pass` is the token of the pass this run began ([`begin_declared_fields_pass`]),
+    /// or `None` when it had nothing to refresh; either way, a write that finds **another**
+    /// pass's token in the database marks that pass dirty (local Codex on PR #291 after
+    /// round 12, second pass: two [`rebuild_index`] runs in separate processes can overlap,
+    /// and the later one must not record its generation over rows the earlier one wrote
+    /// after it had passed them).
+    Known {
+        list: &'a [String],
+        pass: Option<&'a str>,
+    },
     /// The caller does not know it and must not guess: the watcher paths
     /// ([`reindex_single_file`], [`rename_single_file`]), which write what the last
     /// completed pass recorded. Resolved **inside the write transaction**, after the
@@ -2054,14 +2065,27 @@ fn write_declared_rows_or_mark_dirty(
     extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
     declared: DeclaredSet<'_>,
 ) -> Result<()> {
-    let resolved: Option<Vec<String>> = match declared {
-        DeclaredSet::Known(list) => Some(list.to_vec()),
-        DeclaredSet::FromIndex => declared_fields_recorded(db)?,
+    let (resolved, my_pass): (Option<Vec<String>>, Option<&str>) = match declared {
+        DeclaredSet::Known { list, pass } => (Some(list.to_vec()), pass),
+        DeclaredSet::FromIndex => (declared_fields_recorded(db)?, None),
     };
-    match resolved {
-        Some(list) => db.replace_document_fields(rel, &declared_field_rows(extra, &list)),
-        None => db.mark_declared_fields_dirty(),
+    if let Some(list) = &resolved {
+        db.replace_document_fields(rel, &declared_field_rows(extra, list))?;
     }
+    // (local Codex on PR #291 after round 12, second pass) A pass that is not this caller's
+    // is running -- another process's `rebuild_index`, overlapping this one or this
+    // watcher -- and it may already have processed this document. The rows just written are
+    // this caller's answer, not that pass's, so that pass must not record its generation
+    // over them: mark it dirty, exactly as a watcher does for an absent generation.
+    let foreign_pass_running = match (db.read_declared_fields_pass()?, my_pass) {
+        (Some(current), Some(mine)) => current != mine,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if resolved.is_none() || foreign_pass_running {
+        db.mark_declared_fields_dirty()?;
+    }
+    Ok(())
 }
 
 /// (codex P2 round 12 on PR #291) Start a declared-field refresh pass: clear the generation
@@ -2071,7 +2095,14 @@ fn write_declared_rows_or_mark_dirty(
 /// *this* pass. Returns the token for [`finish_declared_fields_pass`].
 ///
 /// A previous pass's leftover token or dirty mark is replaced here: whatever that pass left
-/// behind, this one rewrites every document's rows before it finishes.
+/// behind, this one rewrites every document's rows before it finishes. That includes a pass
+/// that is **still running** in another process (local Codex on PR #291 after round 12,
+/// second pass): refusing or waiting would let a crashed pass's token block every later
+/// run for good, so the later pass takes over instead, and the earlier one finds at
+/// [`finish_declared_fields_pass`] that it no longer owns the token and records nothing --
+/// while any document it writes after this point marks the new pass dirty
+/// ([`write_declared_rows_or_mark_dirty`]), so the new pass records nothing either and
+/// the run after that refreshes again.
 fn begin_declared_fields_pass(db: &Database) -> Result<String> {
     let token = format!(
         "{}-{}",
@@ -2114,6 +2145,32 @@ fn finish_declared_fields_pass(
     record: bool,
 ) -> Result<bool> {
     let tx = db.begin_immediate_transaction()?;
+    // (local Codex on PR #291 after round 12, second pass) Ownership first: the token in the
+    // database is this pass's only if no other process began a pass since. If another did,
+    // its generation is the one in flight -- this run's rows were written under a set that
+    // pass will rewrite, or already has -- so this run must neither clear that pass's token
+    // and mark nor record a generation of its own; it leaves everything to the owner. A run
+    // that never began a pass (`token == None`, nothing to refresh) likewise must not record
+    // while some other process's pass is open: writing the key would end that pass's
+    // "pending" from outside.
+    let current = db.read_declared_fields_pass()?;
+    let superseded = match (token, current.as_deref()) {
+        (Some(mine), Some(theirs)) => mine != theirs,
+        // This pass's token is gone: only another pass's begin (which replaces it) or its
+        // finish (which, being the owner by then, clears it) can have removed it. Either way
+        // that pass rewrote or is rewriting rows this run had already passed.
+        (Some(_), None) => true,
+        (None, Some(_)) => true,
+        (None, None) => false,
+    };
+    if superseded {
+        tx.commit()?;
+        tracing::warn!(
+            "another `groove index` run began while this one was refreshing the declared \
+             fields; this run leaves the declared-field set to that run"
+        );
+        return Ok(false);
+    }
     let dirty_under_this_pass = match (token, db.read_declared_fields_dirty()?) {
         (Some(mine), Some(dirty)) => mine == dirty,
         _ => false,
@@ -3619,6 +3676,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (local Codex on PR #291 after round 12, second pass) Two [`rebuild_index`] runs in two
+    /// processes overlap: B begins after A and takes the token over. Whatever A does from then
+    /// on must not end in a recorded generation -- A's finish sees it no longer owns the
+    /// token and records nothing, and a document A writes meanwhile marks B's pass dirty, so
+    /// B records nothing either and the next run refreshes again. A run that began no pass
+    /// (nothing to refresh) must not record while another process's pass is open, since the
+    /// key it would write is what ends that pass's "pending".
+    #[test]
+    fn an_overlapping_pass_in_another_process_is_never_recorded_over() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_document("x.md", Some("t"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        let extra = std::collections::BTreeMap::new();
+        let list_a = vec!["a".to_string()];
+
+        // A begins, then B begins: B owns the token now.
+        let token_a = begin_declared_fields_pass(&db).unwrap();
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        assert_ne!(token_a, token_b);
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token_b.as_str())
+        );
+
+        // A finishes first: superseded, records nothing, leaves B's token alone.
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), r#"["a"]"#, true).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token_b.as_str()),
+            "a superseded pass must not clear the owner's token"
+        );
+        // B finishes with no mark against it: records.
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), r#"["b"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#)
+        );
+
+        // Same overlap, but A writes a document after B took over: B's pass is marked dirty
+        // and B records nothing; A, superseded, records nothing either.
+        let token_a = begin_declared_fields_pass(&db).unwrap();
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: Some(&token_a),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap().as_deref(),
+            Some(token_b.as_str()),
+            "A's write under B's pass marks B, not A"
+        );
+        assert!(!finish_declared_fields_pass(&db, Some(&token_b), r#"["b"]"#, true).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), r#"["a"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap(),
+            None,
+            "still pending: the next run refreshes"
+        );
+
+        // A run with no pass of its own (nothing to refresh) writes a changed document while
+        // another process's pass is open: it marks that pass and does not record at the end.
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        write_declared_rows_or_mark_dirty(
+            &db,
+            "x.md",
+            &extra,
+            DeclaredSet::Known {
+                list: &list_a,
+                pass: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap().as_deref(),
+            Some(token_b.as_str())
+        );
+        assert!(!finish_declared_fields_pass(&db, None, r#"["a"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token_b.as_str()),
+            "a pass-less run leaves the open pass untouched"
+        );
+        assert!(!finish_declared_fields_pass(&db, Some(&token_b), r#"["b"]"#, true).unwrap());
+
+        // With no pass open at all, a pass-less run records as before.
+        assert!(finish_declared_fields_pass(&db, None, r#"["a"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["a"]"#)
+        );
+    }
+
     /// (codex P2 round 12 on PR #291) The crossed-parser twins are distinct outcomes: the
     /// watcher's diagnostic is chosen by variant, and "content kept" versus "document
     /// dropped" must not collapse into one arm.
@@ -3974,7 +4131,10 @@ mod tests {
                 refresh_fields: false,
             },
             ContextMode::Off,
-            DeclaredSet::Known(&[]),
+            DeclaredSet::Known {
+                list: &[],
+                pass: None,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -4017,7 +4177,10 @@ mod tests {
                 refresh_fields: false,
             },
             ContextMode::Off,
-            DeclaredSet::Known(&[]),
+            DeclaredSet::Known {
+                list: &[],
+                pass: None,
+            },
         )
         .unwrap();
         assert_eq!(
