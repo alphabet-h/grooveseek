@@ -497,7 +497,17 @@ impl Database {
     /// no transaction is open already (the hybrid path opens one for both legs; a leg
     /// called on its own opens its own). A deferred transaction takes no write lock, so
     /// it never blocks the writer whose commits it is shielded from.
-    pub(crate) fn field_filter_snapshot(
+    ///
+    /// `pub`, because the front ends open it **around the whole request** (local Codex on
+    /// PR #291 after round 12, fourth pass): the candidates are not the last thing a
+    /// request reads -- the MMR pool fetches the candidates' embeddings and the parent
+    /// retriever reads neighbouring chunks after the legs return -- so the command line and
+    /// the MCP tool open the snapshot before [`crate::server::run_search_pipeline`] and commit it after the
+    /// parent retriever, and the legs, finding a transaction open, add none of their own
+    /// (`eval` runs its golden queries without filters and opens nothing). A chunk a concurrent reindex replaced is then still the chunk the
+    /// request searched, not a hole in the answer. (An unfiltered search keeps the
+    /// pre-existing behaviour: no snapshot, each statement on the state committed then.)
+    pub fn field_filter_snapshot(
         &self,
         filters: &SearchFilters<'_>,
     ) -> Result<Option<rusqlite::Transaction<'_>>> {

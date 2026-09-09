@@ -5502,6 +5502,43 @@ mod tests {
         );
     }
 
+    /// (local Codex on PR #291 after round 12, fourth pass) The front ends open the snapshot
+    /// around the whole request -- pipeline, MMR pool, parent retriever -- and the legs,
+    /// finding a transaction already open, must add none of their own (`BEGIN` inside an
+    /// open transaction is an error). A hybrid search under a caller-held snapshot must
+    /// therefore succeed and answer from that snapshot, and the caller commits it after.
+    #[test]
+    fn a_hybrid_search_under_a_caller_held_snapshot_opens_no_transaction_of_its_own() {
+        let db = db_with_declared_fields();
+        let active = field_map(&[("status", &["active"])]);
+        let filtered = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        let snapshot = db
+            .field_filter_snapshot(&filtered)
+            .unwrap()
+            .expect("a snapshot");
+        assert!(!db.conn.is_autocommit());
+        let hits = db
+            .search_hybrid(
+                "fieldfilter_unique_keyword",
+                &dummy_embedding(0.1),
+                10,
+                &filtered,
+                FusionParams::default(),
+            )
+            .expect("the legs join the caller's snapshot instead of opening a second one");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.md");
+        assert!(
+            !db.conn.is_autocommit(),
+            "the caller's snapshot is still open after the search"
+        );
+        snapshot.commit().unwrap();
+        assert!(db.conn.is_autocommit());
+    }
+
     #[test]
     fn fields_filter_keeps_only_documents_holding_one_of_the_values() {
         let db = db_with_declared_fields();

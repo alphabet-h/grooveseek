@@ -220,6 +220,18 @@ impl KbCore {
             None
         };
 
+        // (local Codex on PR #291 after round 12, fourth pass) A field-filtered request
+        // reads one committed state from here to the end of the parent retriever -- see
+        // `Database::field_filter_snapshot`. `None` when no field filter is on.
+        let snapshot = match db.field_filter_snapshot(&filters) {
+            Ok(s) => s,
+            Err(e) => {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: format!("Search failed: {e}. Try running rebuild_index first."),
+                })
+                .unwrap_or_default();
+            }
+        };
         let after_mmr = match run_search_pipeline(
             &db,
             reranker_arg,
@@ -275,6 +287,15 @@ impl KbCore {
             resolved.parent_retriever_enabled,
             parent_params,
         );
+        // The last DB read of this request is behind us; release the snapshot.
+        if let Some(tx) = snapshot
+            && let Err(e) = tx.commit()
+        {
+            return serde_json::to_string_pretty(&ErrorResponse {
+                error: format!("Search failed: {e}. Try running rebuild_index first."),
+            })
+            .unwrap_or_default();
+        }
         // match_spans は Parent retriever 拡張後の content に対して計算する
         // (`expand_parent` は defensive に None クリアするので必ず再計算が要る)。
         for h in &mut hits {

@@ -1175,6 +1175,10 @@ fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
+            // (local Codex on PR #291 after round 12, fourth pass) A field-filtered request
+            // reads one committed state from here to the end of the parent retriever --
+            // see `Database::field_filter_snapshot`. `None` when no field filter is on.
+            let snapshot = db.field_filter_snapshot(&filters)?;
             let pipeline = grooveseek::server::run_search_pipeline(
                 &db,
                 reranker_obj.as_mut(),
@@ -1206,6 +1210,10 @@ fn main() -> anyhow::Result<()> {
                     resolved.parent_retriever_enabled,
                     parent_params,
                 );
+            // The last DB read of this request is behind us; release the snapshot.
+            if let Some(tx) = snapshot {
+                tx.commit()?;
+            }
             // match_spans は Parent retriever 拡張後の content に対して計算する
             // (`expand_parent` は defensive に None クリアするので必ず再計算が要る)。
             for h in &mut hits {
