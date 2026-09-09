@@ -143,10 +143,13 @@ retrieval に触れる変更 (クエリのコンパイル、fusion、chunk 分�
 fail する):
 
 ```bash
-cargo install --locked --features cli cargo-about
+cargo install --locked --version 0.9.2 --features cli cargo-about
 cargo about generate --locked --fail -c about.toml -o THIRD-PARTY-LICENSES.md about.hbs
 ```
 
+版を固定しているのは、file の形を決めるのが generator 側だから — lock file が同じでも新しい
+cargo-about は出力を変え得るし、nightly job も同じ版を install する。上げるときは
+ここと `.github/workflows/nightly.yml` の pin を一緒に上げ、同じ PR で再生成する。
 `--fail` は「crate X のライセンス本文が見つからない」を error にする。直すのは
 `about.toml` 側 — cargo-about に組み込みがあれば `workarounds` に crate 名を足し、
 無ければ `[<crate>.clarify]` block を書く。生成物を手で編集しない。

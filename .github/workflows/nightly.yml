@@ -295,10 +295,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # 生成物は cargo-about の版に依存する (license の探索と描画は generator 側)。
+      # commit 済みの file を作った版に固定し、上げる時は再生成と同じ PR で上げる。
+      # CONTRIBUTING の install 行と同じ版であること。
       - name: Install cargo-about
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-about@0.9
+          tool: cargo-about@0.9.2
 
       # about.toml は 4 target を列挙するので、この Linux runner でも Windows 専用
       # crate (tray-icon / tao / windows) の source が要る。cargo-about 0.9 は

@@ -147,10 +147,14 @@ release archive, so a dependency change has to regenerate it in the same PR
 (the nightly workflow fails when the committed copy has drifted):
 
 ```bash
-cargo install --locked --features cli cargo-about
+cargo install --locked --version 0.9.2 --features cli cargo-about
 cargo about generate --locked --fail -c about.toml -o THIRD-PARTY-LICENSES.md about.hbs
 ```
 
+The version is pinned because the generator decides what the file looks like:
+a newer cargo-about can change the output with an unchanged lock file, and the
+nightly job installs the same version. Bump the pin here and in
+`.github/workflows/nightly.yml` together, regenerating in the same PR.
 `--fail` turns "could not find a license text for crate X" into an error. Fix
 one by adding the crate to `workarounds` in `about.toml` when cargo-about has
 a built-in for it, or a `[<crate>.clarify]` block otherwise — never by editing
