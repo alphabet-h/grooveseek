@@ -205,8 +205,8 @@ loopback origin** である。
 | `filter_applied.date_to` | string | 指定時のみ |
 | `filter_applied.min_confidence_ratio` | number | 指定時のみ |
 | `filter_applied.excluded_terms` | string の array | query に除外があったときのみ |
-| `filter_applied.fields` | object: string → string の array | 指定時のみ (v1.9.0+)。常に list 形式、key はソート済み |
-| `filter_applied.fields_not` | object: string → string の array | 指定時のみ (v1.9.0+) |
+| `filter_applied.fields` | object | 指定時のみ (v1.9.0+)。宣言された key ごとに string の array を持つ。常に list 形式、key はソート済み |
+| `filter_applied.fields_not` | object | 指定時のみ (v1.9.0+)。宣言された key ごとに string の array を持つ |
 | `error` | string | **上の全体の代わりに**これだけが返る。MCP tool が拒否・失敗したとき。後述 |
 
 **search の応答は 2 つの形のうちどちらか。** 最終行より上が成功時。MCP tool が

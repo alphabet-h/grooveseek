@@ -218,8 +218,8 @@ different each time.
 | `filter_applied.date_to` | string | omitted unless given |
 | `filter_applied.min_confidence_ratio` | number | omitted unless given |
 | `filter_applied.excluded_terms` | array of strings | omitted unless the query excluded something |
-| `filter_applied.fields` | object: string → array of strings | omitted unless given (v1.9.0+) — always the list form, keys sorted |
-| `filter_applied.fields_not` | object: string → array of strings | omitted unless given (v1.9.0+) |
+| `filter_applied.fields` | object | omitted unless given (v1.9.0+) — each declared key maps to an array of strings, always the list form, keys sorted |
+| `filter_applied.fields_not` | object | omitted unless given (v1.9.0+) — each declared key maps to an array of strings |
 | `error` | string | **the whole response instead of the above**, when the MCP tool refuses or fails — see below |
 
 **A search answers with one of two shapes.** Everything above the last row is

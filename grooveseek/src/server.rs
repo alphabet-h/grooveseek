@@ -4169,6 +4169,17 @@ mod tests {
         }
     }
 
+    /// Paths whose object keys are caller-chosen data, not part of the documented shape.
+    ///
+    /// (codex round 2 on PR #291) `fields` / `fields_not` are `key -> array of strings` for
+    /// whatever keys `groove-schema.toml` declares (feature-58) — the sample this walker reads
+    /// has to use *some* concrete key to show the map is non-empty, and recursing into it would
+    /// ask the contract to name that key (`filter_applied.fields.status`) as if it were a fixed
+    /// field, the way `results[].expanded_from`'s tagged-enum keys are. It is not: the next
+    /// schema could name it `team` instead. [`walk_with_kinds`] still records the path itself
+    /// (`filter_applied.fields`, kind `object`) — only its children are skipped.
+    const OPAQUE_MAP_PATHS: &[&str] = &["filter_applied.fields", "filter_applied.fields_not"];
+
     /// [`walk_fields`] plus what each path serialized as.
     ///
     /// A path can be seen more than once with different kinds — `title` is a
@@ -4190,7 +4201,9 @@ mod tests {
                     };
                     out.insert(path.clone());
                     kinds.entry(path.clone()).or_default().insert(json_kind(v));
-                    walk_with_kinds(v, &path, out, kinds);
+                    if !OPAQUE_MAP_PATHS.contains(&path.as_str()) {
+                        walk_with_kinds(v, &path, out, kinds);
+                    }
                 }
             }
             // Every element, not just the first: `expanded_from` is a tagged
@@ -4289,6 +4302,11 @@ mod tests {
 
     /// Through `new`, like both surfaces: a sample assembled another way could
     /// claim a shape neither of them produces.
+    ///
+    /// `fields` / `fields_not` are non-empty (codex round 2 on PR #291):
+    /// [`SearchFilterEcho::new`] omits an empty map, so an empty sample here would never emit
+    /// `filter_applied.fields` / `filter_applied.fields_not`, and the contract
+    /// guard that walks this sample would not know those two rows exist.
     fn maximal_echo() -> SearchFilterEcho {
         SearchFilterEcho::new(
             Some("c".to_string()),
@@ -4300,8 +4318,8 @@ mod tests {
             Some("2026-12-31".to_string()),
             Some(1.5),
             vec!["async".to_string()],
-            crate::db::FieldFilters::new(),
-            crate::db::FieldFilters::new(),
+            crate::db::FieldFilters::from([("status".to_string(), vec!["active".to_string()])]),
+            crate::db::FieldFilters::from([("team".to_string(), vec!["archived".to_string()])]),
         )
     }
 
