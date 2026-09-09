@@ -223,6 +223,7 @@ The `search` tool / CLI also gained these filters in v0.3.0:
 groove search "tokio spawn" \
   --path-glob "docs/**" --path-glob "!docs/draft/**" \
   --tag-any rust,async \
+  --field status=active --field-not environment=staging \
   --date-from 2026-01-01 \
   --min-confidence-ratio 1.5
 ```
@@ -231,6 +232,8 @@ groove search "tokio spawn" \
 - `--tag-any <a,b,c>` — pass if the chunk has **any** of these tags. MCP param: `tags_any`.
 - `--tag-all <a,b,c>` — pass only if the chunk has **all** of these tags. MCP param: `tags_all`.
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — lex comparison; chunks with no `date` are excluded strictly when either bound is set. MCP params: `date_from` / `date_to`.
+- `--field <KEY=VALUE>` (repeatable, v1.9.0+) — keep documents whose frontmatter holds that value for that key; the key must be one `groove-schema.toml` declared when the index was built. The same key twice is OR, two different keys are AND; split at the first `=`, so the value may contain `=` or a comma. MCP param: `fields`.
+- `--field-not <KEY=VALUE>` (repeatable, v1.9.0+) — drop documents holding that value; a document without the key is kept. MCP param: `fields_not`.
 - `--min-confidence-ratio <N>` — per-query override of the `low_confidence` threshold. Must be finite and `>= 0.0`; `0.0` is how the check is turned off. The CLI rejects anything else before it loads a model, because a non-finite ratio compares false against every score and would quietly disable the flag rather than tighten it. The MCP parameter of the same name cannot refuse a value mid-conversation, so it substitutes instead: a non-finite ratio is logged and replaced by the server's own value, and a negative one is clamped to `0.0` — which disables the check rather than failing the call.
 
 CLI `groove search --format json` answers with the same wrapper — `results`, `low_confidence`, `filter_applied` — and the same hit fields, with one exception: an MCP hit also carries a `uri` when the document is one the server will hand over, and a CLI hit never does. [docs/mcp-tools.md](mcp-tools.md) describes when that field is present. See [docs/citations.md](citations.md) for `match_spans` / byte-offset details and [docs/filters.md](filters.md) for the full filter reference.
@@ -340,6 +343,9 @@ Flags:
   `<kb-path>/groove-schema.toml`. This is the only way to point `validate` at a
   schema that does not sit beside the knowledge base — one shared schema for
   several bases, or a stricter one kept in CI.
+
+`groove index` reads the same `<kb-path>/groove-schema.toml` (v1.9.0+): the keys it declares are stored per document so `groove search --field` can filter on them. A schema that does not load stops `groove index`, the way a `groove.toml` that does not load stops the binary.
+
 - `--strict` (v1.9.0+) — report a frontmatter key the schema does not declare
   as an `undeclared_field` violation, one per key. Same effect as
   `[options] allow_unknown_fields = false` in the schema; the flag only ever

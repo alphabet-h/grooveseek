@@ -90,6 +90,13 @@ max_chunk_chars = 3500
 # [index]
 # fail_on_frontmatter_error = true
 
+# `groove index` also reads `<kb_path>/groove-schema.toml` when it exists
+# (v1.9.0+). The keys it declares — beyond `title` / `date` / `topic` /
+# `depth` / `tags` — are stored per document as the values `search --field`
+# filters on. There is no key for the path; it is the file `groove validate`
+# reads. A schema that fails to load stops the index with the load error
+# rather than indexing without it.
+
 # Live-sync file watcher. When `groove serve` is running, changes
 # under kb_path are detected and the affected files are re-indexed incrementally
 # within `debounce_ms`. Complementary to the PostToolUse hook: covers manual

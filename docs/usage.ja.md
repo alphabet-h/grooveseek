@@ -223,6 +223,7 @@ v0.3.0 で `search` ツール / CLI に追加されたフィルタ:
 groove search "tokio spawn" \
   --path-glob "docs/**" --path-glob "!docs/draft/**" \
   --tag-any rust,async \
+  --field status=active --field-not environment=staging \
   --date-from 2026-01-01 \
   --min-confidence-ratio 1.5
 ```
@@ -231,6 +232,8 @@ groove search "tokio spawn" \
 - `--tag-any <a,b,c>` — チャンクが**いずれか**のタグを持つときのみ通過。MCP param: `tags_any`
 - `--tag-all <a,b,c>` — チャンクが**すべての**タグを持つときのみ通過。MCP param: `tags_all`
 - `--date-from <YYYY-MM-DD>` / `--date-to <YYYY-MM-DD>` — 辞書順比較。どちらかが指定された場合、`date` 未設定のチャンクは厳密に除外される。MCP params: `date_from` / `date_to`
+- `--field <KEY=VALUE>` (繰り返し可、v1.9.0+) — その key について frontmatter がその値を持つ文書だけ残す。key は index 構築時に `groove-schema.toml` が宣言していたものに限る。同じ key を 2 回指定すると OR、違う key は AND。最初の `=` で分けるので値に `=` やカンマを含められる。MCP param: `fields`
+- `--field-not <KEY=VALUE>` (繰り返し可、v1.9.0+) — その値を持つ文書を除外する。key を持たない文書は残る。MCP param: `fields_not`
 - `--min-confidence-ratio <N>` — `low_confidence` 閾値の per-query 上書き。**有限かつ `>= 0.0`** であること。判定を切るのは `0.0`。それ以外の値は CLI がモデル読み込みの前に弾く — 非有限値はどのスコアと比較しても false になり、**閾値をきつくしたつもりが判定そのものを黙って無効化する**ため。MCP の同名パラメータは会話の途中で値を拒めないので、**弾かずに置き換える**: 非有限値は warn してサーバ既定値に戻し、負値は `0.0` に clamp する (= 呼び出しを失敗させる代わりに判定を切る)
 
 CLI `groove search --format json` のラッパ (`results` / `low_confidence` / `filter_applied`) は MCP と同じで、hit のフィールドも 1 点を除いて同じ: **MCP の hit はサーバが引き渡せる文書のとき `uri` を持つ**が、CLI の hit は持たない。`uri` が付く条件は [docs/mcp-tools.ja.md](mcp-tools.ja.md) 参照。`match_spans` / byte offset の詳細は [docs/citations.ja.md](citations.ja.md)、フィルタの完全リファレンスは [docs/filters.ja.md](filters.ja.md) 参照。
@@ -339,6 +342,9 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 - `--schema <PATH>` — `<kb-path>/groove-schema.toml` 以外からスキーマを読む。
   **ナレッジベースの隣に置かないスキーマを使う唯一の手段** — 複数のベースで
   1 つのスキーマを共有する、CI 用に厳しめのものを別に置く、といった場合
+
+`groove index` も同じ `<kb-path>/groove-schema.toml` を読む (v1.9.0+): 宣言された key は文書ごとに保存され、`groove search --field` がそれを filter に使う。スキーマの読み込みに失敗すると `groove.toml` の読み込み失敗がバイナリを止めるのと同様に `groove index` が止まる。
+
 - `--strict` (v1.9.0+) — スキーマが宣言していない frontmatter key を `undeclared_field`
   違反として key ごとに 1 件報告する。スキーマの `[options] allow_unknown_fields = false`
   と同じ効果で、flag は厳しくする方向にしか働かない。スキーマファイルが無ければ従来どおり exit 0

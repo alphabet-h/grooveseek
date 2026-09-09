@@ -20,6 +20,8 @@ with **AND** semantics — all conditions must match for a chunk to appear in
 | `min_quality` | number | `0.5` | Per-call override of the quality-filter threshold (`[quality_filter].threshold`) |
 | `include_low_quality` | bool | `true` | Disable the quality filter for this call (equivalent to `min_quality: 0.0`, but explicit) |
 | `min_confidence_ratio` | number | `1.5` | Threshold for `low_confidence` flag |
+| `fields` | object | `{"status": "active", "environment": ["dev", "prod"]}` | Declared frontmatter keys (v1.9.0+): each key must hold one of its values |
+| `fields_not` | object | `{"status": "deprecated"}` | Drop a document holding one of the values; a document without the key stays |
 
 ## `path_globs`
 
@@ -87,6 +89,46 @@ and `topic` are empty, so no other filter can reach it.
 
 > **Mixing date formats** (e.g., `"2026-04-26 12:00:00 +0900"` vs
 > `"2026-04-26T12:00:00+09:00"`) breaks lex ordering. Choose one format per KB.
+
+## `fields` and `fields_not` (v1.9.0+)
+
+These match against `document_fields`, the values of the frontmatter keys
+`groove-schema.toml` declared when the index was built — not `documents.tags`
+and not `documents.category`. A key the schema does not declare is not in the
+index, so filtering on it matches nothing and is not an error.
+
+- **`fields`** = for each key, the document must hold one of the listed values
+  (OR within a key); every key must match (AND across keys). A document
+  without the key does not match.
+- **`fields_not`** = a document holding one of the listed values for any key is
+  dropped. A document without the key is kept.
+- A value is compared exactly, as the string the frontmatter holds: `status:
+  active` matches `"active"` and nothing else. A list (`environment: [dev,
+  prod]`) matches when any element does.
+- A key maps to a list of strings — one spelling, the same shape as
+  `tags_any`, so the tool's schema stays free of union types — and
+  `filter_applied` echoes the list back.
+
+```jsonc
+{
+  "fields":     { "status": "active", "environment": ["dev", "prod"] },
+  "fields_not": { "team": "archived" }
+  // = status is active, environment is dev or prod, and team is not archived
+}
+```
+
+The index follows the schema: `groove index` reads `groove-schema.toml` from the
+knowledge base root on every run, and when the set of declared keys changes it
+reads every unchanged Markdown document once more and rewrites its rows without
+re-embedding. Only `.md` documents carry these values.
+
+On the command line the same filter is `--field key=value` (repeatable; the same
+key twice is OR, two keys are AND) and `--field-not key=value`. The pair is split
+at the first `=`, so a value may contain `=` or a comma.
+
+The benchmark case `docs/eval.md` records as *deprecated-trap* — a deprecated
+runbook outranking its replacement — is what `--field-not status=deprecated`
+is for.
 
 ## `low_confidence` and `min_confidence_ratio`
 
@@ -185,8 +227,9 @@ Filters compose with **AND**:
 {
   "path_globs": ["docs/**"],
   "tags_all":   ["rust"],
-  "date_from":  "2026-01-01"
-  // = under docs/, tagged "rust", from 2026 onward
+  "date_from":  "2026-01-01",
+  "fields_not": { "status": "deprecated" }
+  // = under docs/, tagged "rust", from 2026 onward, not deprecated
 }
 ```
 

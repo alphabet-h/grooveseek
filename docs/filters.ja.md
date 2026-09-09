@@ -20,6 +20,8 @@
 | `min_quality` | number | `0.5` | quality filter の閾値 (`[quality_filter].threshold`) をこの呼び出しだけ上書き |
 | `include_low_quality` | bool | `true` | この呼び出しでは quality filter を無効化 (`min_quality: 0.0` と等価、意図が明示的) |
 | `min_confidence_ratio` | number | `1.5` | `low_confidence` フラグの閾値 |
+| `fields` | object | `{"status": "active", "environment": ["dev", "prod"]}` | スキーマが宣言した frontmatter key (v1.9.0+): 各 key が列挙値のいずれかを持つ |
+| `fields_not` | object | `{"status": "deprecated"}` | 列挙値のいずれかを持つ文書を除外。key を持たない文書は残る |
 
 ## `path_globs`
 
@@ -87,6 +89,46 @@ YAML frontmatter が parse できなかった Markdown (v1.7.0+) にも、同じ
 > **date 形式が混在**するとき (`"2026-04-26 12:00:00 +0900"` と
 > `"2026-04-26T12:00:00+09:00"` など) は lex 順序が崩れる。KB 内で形式を
 > 統一すること。
+
+## `fields` と `fields_not` (v1.9.0+)
+
+これらは `document_fields` を対象にする — `groove-schema.toml` が index 構築時に
+宣言していた frontmatter key の値であって、`documents.tags` でも
+`documents.category` でもない。スキーマが宣言していない key は index に無いので、
+その key で filter しても何にもマッチしない (エラーにはならない)。
+
+- **`fields`** = key ごとに、文書は列挙された値のいずれかを持たねばならない
+  (key 内は OR)。すべての key が一致すること (key をまたいでは AND)。
+  key を持たない文書はマッチしない
+- **`fields_not`** = いずれかの key で列挙値のいずれかを持つ文書は除外される。
+  key を持たない文書は残る
+- 値は frontmatter が持つ文字列として**完全一致**で比較される: `status:
+  active` は `"active"` にのみマッチする。list (`environment: [dev, prod]`)
+  は要素のいずれかが一致すれば通る
+- key は string の list にマッピングされる — 綴りは 1 つだけで、`tags_any`
+  と同じ形にすることで tool の schema に union 型を持ち込まない —
+  `filter_applied` は list をそのまま echo する
+
+```jsonc
+{
+  "fields":     { "status": "active", "environment": ["dev", "prod"] },
+  "fields_not": { "team": "archived" }
+  // = status is active, environment is dev or prod, and team is not archived
+}
+```
+
+index はスキーマに従う: `groove index` は毎回 knowledge base root の
+`groove-schema.toml` を読み、宣言 key の集合が変わったときは変更の無い
+Markdown 文書も全部読み直して、re-embedding なしで行を書き換える。この値を
+持つのは `.md` 文書だけ。
+
+コマンドラインでは同じ filter が `--field key=value` (繰り返し可; 同じ key
+2 回は OR、違う key は AND) と `--field-not key=value`。ペアは最初の `=` で
+分けるので、値に `=` やカンマを含められる。
+
+`docs/eval.ja.md` が *deprecated-trap* として記録しているベンチマークケース
+(deprecated な runbook が後継より上位に来る) は、まさに
+`--field-not status=deprecated` が解決するものである。
 
 ## `low_confidence` と `min_confidence_ratio`
 
@@ -178,8 +220,9 @@ rank 1 で正解**しているのに **14 件で発火**した。そして同じ
 {
   "path_globs": ["docs/**"],
   "tags_all":   ["rust"],
-  "date_from":  "2026-01-01"
-  // = docs/ 配下、"rust" タグ、2026 年以降
+  "date_from":  "2026-01-01",
+  "fields_not": { "status": "deprecated" }
+  // = docs/ 配下、"rust" タグ、2026 年以降、deprecated ではない
 }
 ```
 

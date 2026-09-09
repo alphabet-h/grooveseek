@@ -205,6 +205,8 @@ loopback origin** である。
 | `filter_applied.date_to` | string | 指定時のみ |
 | `filter_applied.min_confidence_ratio` | number | 指定時のみ |
 | `filter_applied.excluded_terms` | string の array | query に除外があったときのみ |
+| `filter_applied.fields` | object: string → string の array | 指定時のみ (v1.9.0+)。常に list 形式、key はソート済み |
+| `filter_applied.fields_not` | object: string → string の array | 指定時のみ (v1.9.0+) |
 | `error` | string | **上の全体の代わりに**これだけが返る。MCP tool が拒否・失敗したとき。後述 |
 
 **search の応答は 2 つの形のうちどちらか。** 最終行より上が成功時。MCP tool が
@@ -319,7 +321,9 @@ snake_case で、配列は複数形。よって `--path-glob` と `path_globs` �
 - **キー名・型・既定値。** キーの追加は minor
 - **`groove-schema.toml` もこの意味での設定ファイルである**: `[fields.*]` の
   rule key と `[options]` の key は名前で凍結されており、未知の key は拒否される。
-  field の**名前**はこちらのものではなく運用者のものである (v1.9.0+)
+  field の**名前**はこちらのものではなく運用者のものである (v1.9.0+)。
+  `groove index` も同じファイルを読む (v1.9.0+): 宣言された key が `search` で
+  filter できる対象を決めるので、スキーマの読み込みに失敗すると index も止まる
 - **設定ファイルに前方互換性は無い。** 未知のキーは拒否されるので、1.0.x の
   バイナリは 1.1 向けに書かれた設定を受け付けない。これは意図的である —
   代わりに黙って無視すると、`modle = "bge-m3"` のような打ち間違いがそのまま通り、
