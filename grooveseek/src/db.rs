@@ -850,6 +850,23 @@ impl Database {
         Ok(self.conn.unchecked_transaction()?)
     }
 
+    /// [`Self::begin_transaction`], but `BEGIN IMMEDIATE`: the write lock is taken
+    /// **before the first statement**, so what the transaction then reads is what
+    /// it will write over -- no other connection (another process included) can
+    /// commit in between (local Codex on PR #291 after round 12). For a
+    /// read-then-decide-then-write sequence a deferred transaction is not enough:
+    /// under WAL its reads run on a snapshot and the write only takes the lock
+    /// afterwards, so a writer that committed in the gap is either invisible to
+    /// the decision or turns the write into `SQLITE_BUSY_SNAPSHOT`. The connection's
+    /// busy timeout ([`Self::init`]) makes this wait rather than fail when the
+    /// lock is held.
+    pub fn begin_immediate_transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?)
+    }
+
     /// 開いたまま残った transaction を巻き戻す (BU-18)。
     ///
     /// 通常、unwind は `Transaction` の Drop を走らせるので ROLLBACK は自動で

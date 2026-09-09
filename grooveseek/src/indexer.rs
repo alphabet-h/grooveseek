@@ -849,7 +849,7 @@ pub fn rebuild_index(
             registry,
             mode,
             context_mode,
-            Some(&declared_fields),
+            DeclaredSet::Known(&declared_fields),
         )?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
         // as: if this was a forced reparse across a parser boundary and it did not end in
@@ -1078,18 +1078,13 @@ enum Reindex {
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
 /// 同時呼び出し不可)。呼び出し側で Mutex 経由の相互排他を保証すること。
 ///
-/// `declared_fields` is one of three states (codex P2 round 9 on PR #291; see
-/// [`declared_fields_recorded`]'s doc for the caller that reads them off `index_meta`): `None`
-/// means *pending* -- the caller does not yet know what the schema currently declares, because
-/// a [`rebuild_index`] refresh has cleared the generation key and not yet rewritten it, or has
-/// not run at all -- and every `document_fields` write below is skipped, leaving whatever the
-/// last completed pass wrote untouched until it (or the next one) completes and calls again
-/// with a real answer. `Some(&[])` means the schema (or its absence) declares nothing, and
-/// `Some(list)` means it declares exactly that list; both are answers, not guesses, and are
-/// written as always -- an empty list still replaces stale rows from an undeclared key. Callers:
-/// [`rebuild_index`] always knows (it just read the schema) and passes `Some(&declared_fields)`;
-/// the watcher paths ([`reindex_single_file`], [`rename_single_file`]) pass whatever
-/// [`declared_fields_recorded`] read, `None` included.
+/// `declared` says where the declared-field set comes from -- see [`DeclaredSet`]. With
+/// [`DeclaredSet::Known`] every `document_fields` write below uses that list (an empty list
+/// still replaces stale rows from an undeclared key). With [`DeclaredSet::FromIndex`] the
+/// list is read off `index_meta` **inside each write transaction**, right before the rows
+/// are written, and an absent generation (pending: a [`rebuild_index`] refresh has cleared
+/// the key and not yet rewritten it, or has not run at all) leaves the rows untouched and
+/// marks the running pass instead ([`write_declared_rows_or_mark_dirty`]).
 #[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
     db: &Database,
@@ -1099,7 +1094,7 @@ fn index_single_disk_entry(
     registry: &Registry,
     mode: Reindex,
     context_mode: ContextMode,
-    declared_fields: Option<&[String]>,
+    declared: DeclaredSet<'_>,
 ) -> Result<SingleResult> {
     let force = mode == Reindex::Force;
     let (refresh_frontmatter, refresh_fields) = match mode {
@@ -1261,12 +1256,7 @@ fn index_single_disk_entry(
         // know the current set (see this fn's doc) -- leave the row as the last completed pass
         // left it rather than write nothing where something declared may already exist.
         if refresh_fields {
-            write_declared_rows_or_mark_dirty(
-                db,
-                &entry.rel,
-                &parsed.frontmatter.extra,
-                declared_fields,
-            )?;
+            write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
         }
         tx.commit()?;
         return Ok(SingleResult::MetadataRefreshed {
@@ -1344,12 +1334,7 @@ fn index_single_disk_entry(
             // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the
             // frontmatter-only path above: a `None` here must not overwrite a document's rows
             // with an empty set just because the caller does not yet know the real one.
-            write_declared_rows_or_mark_dirty(
-                db,
-                &entry.rel,
-                &parsed.frontmatter.extra,
-                declared_fields,
-            )?;
+            write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
             // (feature-56) The chunk texts match, so the embeddings still stand — but the
             // *positions* may not. Inserting a blank line above a function, or trimming a
             // comment short enough to be dropped as a thin gap, moves every definition below
@@ -1413,7 +1398,7 @@ fn index_single_disk_entry(
     // a `None` here writes nothing, so a freshly written or newly changed document simply has
     // no `document_fields` rows until a completed [`rebuild_index`] pass gives a real answer --
     // preferable to a wrong one guessed as empty.
-    write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared_fields)?;
+    write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared)?;
     tx.commit()?;
 
     Ok(SingleResult::Updated {
@@ -1601,11 +1586,11 @@ pub fn reindex_single_file(
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
-    // recorded; they do not read the schema themselves. (codex P2 round 9 on PR #291)
-    // `None` here means a refresh has the generation key cleared right now -- see
-    // [`declared_fields_recorded`]'s doc -- and `index_single_disk_entry` leaves
-    // `document_fields` untouched rather than reading it as "declares nothing".
-    let declared_fields = declared_fields_recorded(db)?;
+    // recorded; they do not read the schema themselves. (codex P2 round 9 on PR #291,
+    // local Codex after round 12) Resolved by `index_single_disk_entry` **inside its
+    // write transaction**, not read here ahead of the file I/O and the embedding: a
+    // `rebuild_index` in another process can clear the generation in that window, and a
+    // list read before it would be written over rows the new pass never sees again.
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     index_single_disk_entry(
         db,
@@ -1618,7 +1603,7 @@ pub fn reindex_single_file(
             refresh_fields: false,
         },
         context_mode,
-        declared_fields.as_deref(),
+        DeclaredSet::FromIndex,
     )
 }
 
@@ -1821,11 +1806,9 @@ pub fn rename_single_file(
         size: new_bytes.len() as u64,
     };
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
-    // recorded; they do not read the schema themselves. (codex P2 round 9 on PR #291)
-    // `None` here means a refresh has the generation key cleared right now -- see
-    // [`declared_fields_recorded`]'s doc -- and `index_single_disk_entry` leaves
-    // `document_fields` untouched rather than reading it as "declares nothing".
-    let declared_fields = declared_fields_recorded(db)?;
+    // recorded; they do not read the schema themselves -- and (local Codex after round
+    // 12) do not read the generation here either: `index_single_disk_entry` resolves
+    // `DeclaredSet::FromIndex` inside its write transaction, see `reindex_single_file`.
     // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
     // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
     // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
@@ -1844,7 +1827,7 @@ pub fn rename_single_file(
             }
         },
         context_mode,
-        declared_fields.as_deref(),
+        DeclaredSet::FromIndex,
     )?;
     // (codex P2 round 9 on PR #291) Crossed a parser: whatever the reparse came back with,
     // settle it the same way `rebuild_index`'s rename loop does. See
@@ -2034,12 +2017,32 @@ pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
 /// [`CODE_CHUNK_POLICY`]: it changes when what the parser writes changes.
 pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 
+/// Where [`index_single_disk_entry`] gets the declared-field set from (feature-58; codex P2
+/// round 9 / 12 on PR #291, local Codex after round 12).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DeclaredSet<'a> {
+    /// The caller knows the set: [`rebuild_index`], which just read the schema and owns
+    /// the generation for the length of its pass. Written as given.
+    Known(&'a [String]),
+    /// The caller does not know it and must not guess: the watcher paths
+    /// ([`reindex_single_file`], [`rename_single_file`]), which write what the last
+    /// completed pass recorded. Resolved **inside the write transaction**, after the
+    /// document row was written and so under the write lock, never ahead of the file I/O
+    /// and the embedding -- a [`rebuild_index`] in another process can clear the
+    /// generation in that window, and a list read before it would then be written over
+    /// rows the new pass has already processed and will never revisit (local Codex after
+    /// round 12; before, the watcher read the list up front and passed `Option`).
+    FromIndex,
+}
+
 /// (feature-58, codex P2 round 9 / 12 on PR #291) Write a document's `document_fields` rows
-/// when the declared set is known, and when it is **not** -- a watcher path running while
-/// [`rebuild_index`] has the generation cleared, `declared_fields: None` -- leave the rows
-/// alone and record that this document was written under the pass that is running
-/// ([`Database::mark_declared_fields_dirty`]). The three write paths of
-/// [`index_single_disk_entry`] all come through here so the rule has one home.
+/// when the declared set is known, and when it is **not** -- [`DeclaredSet::FromIndex`]
+/// resolving to an absent generation, because a [`rebuild_index`] refresh has it cleared
+/// right now -- leave the rows alone and record that this document was written under the
+/// pass that is running ([`Database::mark_declared_fields_dirty`]). The three write paths of
+/// [`index_single_disk_entry`] all come through here so the rule has one home, and each
+/// calls it inside its transaction after a document write, so the read of `index_meta` and
+/// the rows it decides are one atomic unit against any other connection.
 ///
 /// The mark is what closes the cross-process window round 12 found: the rebuild in another
 /// process may already have processed this document; its rows are then the *previous*
@@ -2049,10 +2052,14 @@ fn write_declared_rows_or_mark_dirty(
     db: &Database,
     rel: &str,
     extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
-    declared: Option<&[String]>,
+    declared: DeclaredSet<'_>,
 ) -> Result<()> {
-    match declared {
-        Some(declared) => db.replace_document_fields(rel, &declared_field_rows(extra, declared)),
+    let resolved: Option<Vec<String>> = match declared {
+        DeclaredSet::Known(list) => Some(list.to_vec()),
+        DeclaredSet::FromIndex => declared_fields_recorded(db)?,
+    };
+    match resolved {
+        Some(list) => db.replace_document_fields(rel, &declared_field_rows(extra, &list)),
         None => db.mark_declared_fields_dirty(),
     }
 }
@@ -2074,7 +2081,7 @@ fn begin_declared_fields_pass(db: &Database) -> Result<String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let tx = db.begin_transaction()?;
+    let tx = db.begin_immediate_transaction()?;
     db.clear_declared_fields()?;
     db.clear_declared_fields_pass()?;
     db.write_declared_fields_pass(&token)?;
@@ -2094,17 +2101,23 @@ fn begin_declared_fields_pass(db: &Database) -> Result<String> {
 ///
 /// A dirty mark carrying an *older* token is a write under a pass that never finished; the
 /// refresh that just ran rewrote that document's rows too, so it is dropped with the token.
+///
+/// The mark is read **inside** an immediate transaction ([`Database::begin_immediate_transaction`]):
+/// the write lock is held from before the read until the decision is committed, so a
+/// watcher in another process cannot commit a document and its mark between "no mark seen"
+/// and "generation recorded" (local Codex after round 12 -- reading the mark first and
+/// opening the transaction afterwards left exactly that gap).
 fn finish_declared_fields_pass(
     db: &Database,
     token: Option<&str>,
     declared_json: &str,
     record: bool,
 ) -> Result<bool> {
+    let tx = db.begin_immediate_transaction()?;
     let dirty_under_this_pass = match (token, db.read_declared_fields_dirty()?) {
         (Some(mine), Some(dirty)) => mine == dirty,
         _ => false,
     };
-    let tx = db.begin_transaction()?;
     db.clear_declared_fields_pass()?;
     let recorded = record && !dirty_under_this_pass;
     if recorded {
@@ -3542,6 +3555,70 @@ mod tests {
         assert_eq!(db.read_declared_fields_pass().unwrap(), None);
     }
 
+    /// (local Codex on PR #291 after round 12) The finish side of the handshake against a
+    /// **second connection**, the shape another process takes. Connection B holds the write
+    /// lock (an immediate transaction) while it commits a watcher's document write and its
+    /// dirty mark; connection A calls [`finish_declared_fields_pass`] in that window. Because
+    /// A reads the mark inside its own immediate transaction, it waits for B's lock (the
+    /// connection's busy timeout) and then sees the mark -- and must not record the
+    /// generation. Reading the mark first and opening the transaction afterwards let B's
+    /// commit land in between, and A recorded the generation over rows B left stale.
+    ///
+    /// Deterministic without a pause hook: B takes the lock *before* A is called, and holds
+    /// it for longer than A needs to reach its `BEGIN IMMEDIATE`; A cannot proceed until B
+    /// commits, so the only order the lock permits is the one asserted.
+    #[test]
+    fn a_mark_committed_while_the_pass_finishes_still_keeps_the_generation_pending() {
+        let dir = crate::test_support::unique_temp_path("groove-pass-race");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(".groove.db");
+        let a = Database::open(db_path.to_str().unwrap()).unwrap();
+        let b = Database::open(db_path.to_str().unwrap()).unwrap();
+
+        let token = begin_declared_fields_pass(&a).unwrap();
+        assert_eq!(a.read_declared_fields().unwrap(), None);
+
+        // B: the other process's watcher, mid-commit, holding the write lock.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let token_for_b = token.clone();
+        let db_path_for_b = db_path.clone();
+        let b_thread = std::thread::spawn(move || {
+            drop(b);
+            let b = Database::open(db_path_for_b.to_str().unwrap()).unwrap();
+            let tx = b.begin_immediate_transaction().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            b.mark_declared_fields_dirty().unwrap();
+            assert_eq!(
+                b.read_declared_fields_dirty().unwrap().as_deref(),
+                Some(token_for_b.as_str())
+            );
+            tx.commit().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        // A: the pass finishing while B holds the lock. It must wait, then see the mark.
+        let started = std::time::Instant::now();
+        let recorded =
+            finish_declared_fields_pass(&a, Some(&token), r#"["status"]"#, true).unwrap();
+        b_thread.join().unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "A must have waited for B's lock, not read around it: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !recorded,
+            "B's mark landed under A's token before A decided, so the generation stays pending"
+        );
+        assert_eq!(a.read_declared_fields().unwrap(), None);
+        assert_eq!(a.read_declared_fields_dirty().unwrap(), None);
+        assert_eq!(a.read_declared_fields_pass().unwrap(), None);
+
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (codex P2 round 12 on PR #291) The crossed-parser twins are distinct outcomes: the
     /// watcher's diagnostic is chosen by variant, and "content kept" versus "document
     /// dropped" must not collapse into one arm.
@@ -3897,7 +3974,7 @@ mod tests {
                 refresh_fields: false,
             },
             ContextMode::Off,
-            Some(&[]),
+            DeclaredSet::Known(&[]),
         )
         .unwrap();
         assert_eq!(
@@ -3940,7 +4017,7 @@ mod tests {
                 refresh_fields: false,
             },
             ContextMode::Off,
-            Some(&[]),
+            DeclaredSet::Known(&[]),
         )
         .unwrap();
         assert_eq!(
