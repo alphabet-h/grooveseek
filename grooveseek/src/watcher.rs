@@ -796,6 +796,15 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                  document dropped from the index)"
             );
         }
+        // (local Codex on PR #291 after round 13) Not a success: the reparse wrote nothing,
+        // so the previous content (and, in Static mode, the previous path's breadcrumb)
+        // is what the new path serves until the file is indexed again.
+        Ok(indexer::RenameOutcome::RenamedButNotReindexed) => {
+            wdiag!(
+                "watcher: renamed {old_rel} -> {new_rel} (reparse skipped, previous content \
+                 kept under the new path; see the reason above)"
+            );
+        }
         Ok(indexer::RenameOutcome::RenamedButRefusedAndDropped) => {
             wdiag!(
                 "watcher: renamed {old_rel} -> {new_rel} (the new parser could not index it, \

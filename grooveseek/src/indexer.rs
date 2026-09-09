@@ -1664,6 +1664,13 @@ pub enum RenameOutcome {
     /// them, or found nothing to chunk -- so the old parser's row was **dropped**; "content
     /// left as it was" would be false, hence the separate variant.
     RenamedButRefusedAndDropped,
+    /// (local Codex on PR #291 after round 13) path は UPDATE 済で、同じ parser の再 parse
+    /// (Static モードが同 bytes の rename に強制するもの、または内容が変わった通常の parse) が
+    /// [`SingleResult::Skipped`] で終わった: 行は書き換えられず、**以前の内容** (Static なら以前の path 由来の
+    /// breadcrumb も) が新 path の下に残っている。行は消さない (skip の理由は stderr に出ている)
+    /// が、[`RenameOutcome::Renamed`] (= 内容同一で path だけ更新) と区別して watcher が「古い内容のまま」と言える
+    /// ようにする。
+    RenamedButNotReindexed,
 }
 
 /// 単一ファイルの rename を処理する。
@@ -1866,9 +1873,17 @@ pub fn rename_single_file(
         // refusal in the first place, and it would swallow the next variant too.
         // `MetadataRefreshed` cannot come back here (the check is off on this
         // path) and is named so that adding a variant stays a compile error.
-        SingleResult::Unchanged
-        | SingleResult::Skipped { .. }
-        | SingleResult::MetadataRefreshed { .. } => Ok(RenameOutcome::Renamed),
+        // (local Codex on PR #291 after round 13) `Skipped` is not `Renamed`: the reparse
+        // this arm was reached through -- forced by Static mode for a same-byte rename, or
+        // the ordinary changed-content parse -- wrote nothing, so the row under the new
+        // path still holds the previous content and, in Static mode, the previous path's
+        // breadcrumb. The row is kept (the bytes it was built from were once indexable and
+        // the reason for the skip is already on stderr), but the outcome says so, and the
+        // watcher's line no longer reports a plain success over stale content.
+        SingleResult::Unchanged | SingleResult::MetadataRefreshed { .. } => {
+            Ok(RenameOutcome::Renamed)
+        }
+        SingleResult::Skipped { .. } => Ok(RenameOutcome::RenamedButNotReindexed),
     }
 }
 
@@ -3865,6 +3880,15 @@ mod tests {
         );
         assert_ne!(
             RenameOutcome::RenamedSizeCappedAndDropped,
+            RenameOutcome::RenamedButRefusedAndDropped
+        );
+        // (local Codex after round 13) "not reindexed" is neither a plain rename nor a drop.
+        assert_ne!(
+            RenameOutcome::RenamedButNotReindexed,
+            RenameOutcome::Renamed
+        );
+        assert_ne!(
+            RenameOutcome::RenamedButNotReindexed,
             RenameOutcome::RenamedButRefusedAndDropped
         );
     }

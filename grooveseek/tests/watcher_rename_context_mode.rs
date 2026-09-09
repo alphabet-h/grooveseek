@@ -468,3 +468,59 @@ fn test_reindex_under_a_pending_generation_keeps_the_rows_and_marks_the_pass() {
         "the watcher never records a generation"
     );
 }
+
+/// (local Codex on PR #291 after round 13) A same-parser rename in Static mode is forced
+/// through a reparse so the path-derived breadcrumb follows the new name. When that reparse
+/// comes back [`grooveseek::indexer::SingleResult::Skipped`] -- here, the one heading is
+/// excluded, so there is nothing to chunk --
+/// nothing was written: the row under the new path still holds the previous chunks and the
+/// previous path's breadcrumb. The row is deliberately kept, but the outcome must not be the
+/// plain [`grooveseek::indexer::RenameOutcome::Renamed`] (= content identical, path updated)
+/// the watcher reports as a success.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_static_mode_rename_whose_forced_reparse_is_skipped_reports_it() {
+    let layout = TempKbLayout::new("groove-watcher-rename-static-skipped");
+    layout.write("old-widget-doc.md", NO_TITLE_MD);
+    let (db, mut embedder, registry, db_path) = build_initial_index(&layout, ContextMode::Static);
+    let (id_before, ctx_before) = chunk_row_for_path(&db_path, "old-widget-doc.md");
+    assert!(
+        ctx_before
+            .as_deref()
+            .is_some_and(|c| c.contains("old widget doc"))
+    );
+
+    std::fs::rename(
+        layout.kb().join("old-widget-doc.md"),
+        layout.kb().join("new-gadget-doc.md"),
+    )
+    .expect("rename on disk");
+
+    // The forced reparse runs under a heading exclusion that leaves nothing to chunk.
+    let exclude = vec!["Section".to_string()];
+    let outcome = indexer::rename_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "old-widget-doc.md",
+        "new-gadget-doc.md",
+        Some(&exclude),
+        &registry,
+    )
+    .expect("rename_single_file");
+    assert_eq!(
+        outcome,
+        RenameOutcome::RenamedButNotReindexed,
+        "the forced reparse was skipped, so the outcome must say the row was not rewritten: {outcome:?}"
+    );
+
+    let (id_after, ctx_after) = chunk_row_for_path(&db_path, "new-gadget-doc.md");
+    assert_eq!(
+        id_before, id_after,
+        "the row is kept, not rewritten and not dropped"
+    );
+    assert_eq!(
+        ctx_before, ctx_after,
+        "and it still carries the previous path's breadcrumb -- which is what the outcome reports"
+    );
+}
