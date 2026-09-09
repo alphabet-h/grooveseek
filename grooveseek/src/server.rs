@@ -2246,10 +2246,42 @@ mod tests {
             .to_string();
         assert!(err.starts_with("fields is too large"), "{err}");
 
-        let just_under = build(FILTER_ITEM_MAX_BYTES - 5);
+        // (codex P2 round 7 on PR #291) The cap is spent against the map's JSON encoding, which
+        // costs more than the raw strings: `"k000":["xxx..xxx"]` adds two key quotes, a colon,
+        // brackets, two value quotes, and a comma between entries -- 8 bytes of overhead per
+        // entry here (all-ASCII values add none of their own past that). 1,000-byte values keep
+        // every per-list bound satisfied and land comfortably under the aggregate cap even with
+        // that overhead counted.
+        let just_under = build(1_000);
         assert!(
             validate_field_filters("fields", &just_under).is_ok(),
             "a map just under the aggregate cap must still pass"
+        );
+    }
+
+    /// (codex P2 round 7 on PR #291) A control character decodes to one byte but encodes to
+    /// a six-byte escape, so a map whose decoded lengths sit comfortably under
+    /// [`FIELD_FILTERS_MAX_BYTES`] can still encode past it -- the shape the round 6 aggregate
+    /// check (summed `.len()`s) missed.
+    #[test]
+    fn a_field_filters_map_of_control_characters_is_refused_by_its_encoded_size() {
+        use crate::db::FieldFilters;
+
+        // FILTER_LIST_MAX_ITEMS keys (the key-list bound), one 200-byte value of the control
+        // character U+0001 each (well under FILTER_ITEM_MAX_BYTES decoded, so every per-list
+        // bound stays satisfied): decoded, that is ~13 KiB, comfortably under the 64 KiB
+        // aggregate cap. Encoded, each of the 12,800 control characters costs six bytes
+        // instead of one, so the map is well over the cap.
+        let mut m = FieldFilters::new();
+        for i in 0..FILTER_LIST_MAX_ITEMS {
+            m.insert(format!("k{i:03}"), vec!["\u{1}".repeat(200)]);
+        }
+        let err = validate_field_filters("fields", &m)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields is too large") && err.contains("bytes encoded"),
+            "{err}"
         );
     }
 

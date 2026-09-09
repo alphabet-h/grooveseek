@@ -835,6 +835,13 @@ pub(crate) const FILTER_ITEM_MAX_BYTES: usize = SEARCH_QUERY_MAX_BYTES;
 /// documented per-list limits accept can still never reach this validation over HTTP. Capping a
 /// whole map at what one list already may cost keeps what the limits document in agreement with
 /// what the transport actually admits.
+///
+/// (codex P2 round 7 on PR #291) The budget is spent against the map's **encoded** size, not
+/// the sum of its decoded string lengths: the transport limit this constant exists to stay
+/// under measures the JSON-RPC request body, where a control character costs six encoded bytes
+/// (the escape `\u0001`) against one decoded byte. A map whose decoded lengths sit under
+/// this cap can still encode past it, so [`validate_field_filters`] checks the length of
+/// `serde_json::to_string` of the map, not `.len()` summed over its strings.
 pub(crate) const FIELD_FILTERS_MAX_BYTES: usize = FILTER_LIST_MAX_ITEMS * FILTER_ITEM_MAX_BYTES;
 
 /// list 型 filter の件数・要素長を検証する (AU-17)。
@@ -881,11 +888,12 @@ pub(crate) fn field_filters_from_params(
 /// bound runs. Neither the command line nor the tool should accept one
 /// silently.
 ///
-/// (codex P2 round 6 on PR #291) After the per-key bounds, the whole map's total bytes are
+/// (codex P2 round 6 on PR #291) After the per-key bounds, the whole map's aggregate size is
 /// checked against [`FIELD_FILTERS_MAX_BYTES`]: a map can be legal at every one of the
 /// per-list bounds above and still be far larger than the aggregate cap allows, because those
 /// bounds are per-list, not per-map. See [`FIELD_FILTERS_MAX_BYTES`]'s doc for why the map
-/// needs its own bound at all.
+/// needs its own bound at all, and (codex P2 round 7 on PR #291) why that aggregate is the
+/// map's JSON-**encoded** length rather than the sum of its decoded string lengths.
 pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> anyhow::Result<()> {
     if filters.keys().any(|k| k.is_empty()) {
         anyhow::bail!("{name} has an empty key");
@@ -898,14 +906,22 @@ pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> 
         }
         validate_filter_list(&format!("{name}.{key}"), values)?;
     }
-    let total_bytes: usize = filters
-        .iter()
-        .map(|(key, values)| key.len() + values.iter().map(String::len).sum::<usize>())
-        .sum();
-    if total_bytes > FIELD_FILTERS_MAX_BYTES {
+    // (codex P2 round 7 on PR #291) The transport limit this budget exists to stay under
+    // measures the JSON-RPC request body, not the decoded strings a map's `.len()`s sum to --
+    // a control character costs six encoded bytes (\u0001) against one decoded, so a map
+    // could pass a decoded-byte sum here and still encode past the cap. `to_string` on a
+    // `BTreeMap<String, Vec<String>>` is infallible in practice (no non-finite floats, no
+    // non-UTF-8 data — Rust strings already are), but its `Result` still has to be handled;
+    // an error is treated as "too large" rather than unwrapped, since refusing an encode
+    // failure is safe and panicking on one is not.
+    let encoded_bytes = match serde_json::to_string(filters) {
+        Ok(encoded) => encoded.len(),
+        Err(_) => usize::MAX,
+    };
+    if encoded_bytes > FIELD_FILTERS_MAX_BYTES {
         anyhow::bail!(
-            "{name} is too large: {total_bytes} bytes (max {FIELD_FILTERS_MAX_BYTES} bytes). \
-             Narrow the filter, or issue several calls."
+            "{name} is too large: {encoded_bytes} bytes encoded (max {FIELD_FILTERS_MAX_BYTES} \
+             bytes). Narrow the filter, or issue several calls."
         );
     }
     Ok(())
