@@ -217,7 +217,7 @@ impl Database {
     ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
-        self.refuse_field_filters_while_pending(filters)?;
+        self.refuse_field_filters_while_pending(filters.fields, filters.fields_not)?;
         // 切り詰めの警告は 1 検索 1 回。ここが「クエリを FTS に投げる」唯一の経路。
         query.warn_if_truncated();
         let Some(fts_query) = query.match_expr() else {
@@ -483,9 +483,21 @@ impl Database {
     /// per leg, and only when a field filter is present. An empty map is not a filter
     /// and is not refused; `[]` (a completed pass that declared nothing) is a recorded
     /// answer, and a filter against it simply matches nothing, as documented.
-    fn refuse_field_filters_while_pending(&self, filters: &SearchFilters<'_>) -> Result<()> {
-        let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
-            || filters.fields_not.is_some_and(|f| !f.is_empty());
+    ///
+    /// `pub`, and taking the two maps rather than a whole [`SearchFilters`], because the
+    /// front ends ask it **early** as well (codex P2 round 11 on PR #291): the command
+    /// line right after opening the database and before
+    /// [`crate::embedder::Embedder::with_model`] (a
+    /// request this refuses must not first pay for a model download), the MCP tool
+    /// before embedding the query. The legs keep asking too -- they are the check that
+    /// cannot be bypassed; the early calls only move the answer forward.
+    pub fn refuse_field_filters_while_pending(
+        &self,
+        fields: Option<&FieldFilters>,
+        fields_not: Option<&FieldFilters>,
+    ) -> Result<()> {
+        let field_filtered =
+            fields.is_some_and(|f| !f.is_empty()) || fields_not.is_some_and(|f| !f.is_empty());
         if field_filtered && self.read_declared_fields()?.is_none() {
             anyhow::bail!("{FIELD_FILTERS_PENDING}");
         }
@@ -615,7 +627,7 @@ impl Database {
         filters: &SearchFilters<'_>,
         excluded: &HashSet<i64>,
     ) -> Result<Vec<(i64, SearchResult)>> {
-        self.refuse_field_filters_while_pending(filters)?;
+        self.refuse_field_filters_while_pending(filters.fields, filters.fields_not)?;
         // filter 指定があれば over-fetch する (詳細は SearchFilters::has_any)。
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。

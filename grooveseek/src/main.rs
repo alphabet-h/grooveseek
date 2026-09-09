@@ -1117,6 +1117,12 @@ fn main() -> anyhow::Result<()> {
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
+            // (codex P2 round 11 on PR #291) A field filter the index cannot answer yet
+            // (its declared set is pending) is refused here, on the opened database and
+            // before `Embedder::with_model` below -- the search legs refuse it too, but
+            // only after the model was loaded and the query embedded. Same ordering
+            // argument as `--field` bounds above and the schema read in `Commands::Index`.
+            db.refuse_field_filters_while_pending(Some(&fields), Some(&fields_not))?;
             let dim = model.dimension() as u32;
             db.verify_embedding_meta(model.model_id(), dim)?;
 

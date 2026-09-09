@@ -289,3 +289,90 @@ fn test_changed_bytes_cross_parser_rename_that_the_new_parser_refuses_drops_the_
         );
     }
 }
+
+/// (codex P2 round 11 on PR #291) The two exits of [`grooveseek::indexer::rename_single_file`]
+/// that return
+/// **before** any parse -- the size cap, and the read refusal -- used to sit ahead of the
+/// parser-crossing check, so a Markdown row renamed to an oversized `.pdf` kept the
+/// Markdown parser's chunks and `document_fields` under the new path, and a later full
+/// index preserved it as an oversized skip. The crossing is now decided right after the row
+/// moves, and both exits settle it the way the reparse arms do: the row is dropped.
+///
+/// The size cap is exercised here (a `.pdf` past the binary cap); the read refusal shares
+/// the same three lines and the same helper, and has no deterministic trigger from a test.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_cross_parser_rename_to_an_oversized_destination_drops_the_row() {
+    let layout = TempKbLayout::new("groove-watcher-rename-cross-parser-oversized");
+    layout.write("runbook.md", NO_TITLE_MD);
+    let db_path = layout.root().join(".groove.db");
+    let db = Database::open(db_path.to_str().expect("db path utf-8")).expect("open db");
+    db.verify_embedding_meta(
+        ModelChoice::BgeSmallEnV15.model_id(),
+        ModelChoice::BgeSmallEnV15.dimension() as u32,
+    )
+    .expect("verify_embedding_meta");
+    let mut embedder = Embedder::with_model(ModelChoice::BgeSmallEnV15).expect("load embedder");
+    let registry =
+        Registry::from_enabled(&["md".to_string(), "pdf".to_string()]).expect("md + pdf registry");
+    let schema = grooveseek::indexer::load_declared_schema(layout.kb()).unwrap();
+    indexer::rebuild_index(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        schema,
+        false,
+        None,
+        &[],
+        &registry,
+        ProgressReporter::new(ProgressMode::Quiet),
+        ContextMode::Off,
+    )
+    .expect("initial rebuild_index");
+    let _ = chunk_row_for_path(&db_path, "runbook.md");
+
+    // Rename across parsers and make the destination one byte past the binary cap, so
+    // `rename_single_file` takes the size-cap exit before reading or parsing anything.
+    std::fs::rename(
+        layout.kb().join("runbook.md"),
+        layout.kb().join("runbook.pdf"),
+    )
+    .expect("rename on disk");
+    let oversized = std::fs::File::create(layout.kb().join("runbook.pdf")).expect("create");
+    oversized
+        .set_len(grooveseek::parser::MAX_RAW_BINARY_BYTES + 1)
+        .expect("grow past the cap");
+    drop(oversized);
+
+    let outcome = indexer::rename_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "runbook.md",
+        "runbook.pdf",
+        None,
+        &registry,
+    )
+    .expect("rename_single_file");
+    assert_eq!(
+        outcome,
+        RenameOutcome::RenamedSizeCapped,
+        "the destination is past the cap, so the size-cap exit is the one taken: {outcome:?}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
+    for path in ["runbook.md", "runbook.pdf"] {
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "{path}: the rename crossed a parser and nothing rewrote the row, so the size-cap \
+             exit must drop it rather than keep the Markdown parser's row under the new path"
+        );
+    }
+}

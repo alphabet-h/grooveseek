@@ -1645,6 +1645,9 @@ pub enum RenameOutcome {
     /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
     /// content_hash は旧内容のまま据え置き、次回 full rebuild の
     /// `scan_disk_entries` の size-cap 判定に委ねる (§4.2 skip 統一原則)。
+    /// (codex P2 round 11 on PR #291) rename が parser を跨いでいた場合は据え置かず
+    /// 行を消す (旧 parser の行が新拡張子の下に残る形)。variant は同じ —
+    /// 「rename は成立、size 超過で index せず」は変わらないため。
     RenamedSizeCapped,
     /// (BU-20) path は UPDATE 済だが、新 path を開いた handle が
     /// 「集めた時のファイルではない」と答えた (hardlink / symlink / 非通常
@@ -1656,6 +1659,8 @@ pub enum RenameOutcome {
     /// することで、呼び出し側と読み手の両方に「rename は成立、内容は据え置き、
     /// 理由は refusal」と伝わる。DB の content_hash は旧内容のままで、
     /// 次回 full rebuild の walk-time check が row ごと取り除く。
+    /// (codex P2 round 11 on PR #291) parser を跨ぐ rename なら
+    /// [`RenameOutcome::RenamedSizeCapped`] と同じく行を消す。
     RenamedButRefused,
 }
 
@@ -1695,6 +1700,14 @@ pub fn rename_single_file(
 
     db.rename_document(old_rel, new_rel)?;
 
+    // (codex P2 round 11 on PR #291) Decided here, right after the row moved and before any
+    // of the early returns below: a rename that crosses a parser leaves the *old* parser's
+    // row under the new path until something rewrites it, and the size-cap and read-refusal
+    // exits below rewrite nothing. Each of them settles the crossing the same way the reparse
+    // arms further down do (`settle_cross_parser_rename`'s doc), so the row is dropped rather
+    // than kept as a stale hit a later full index would preserve as an oversized skip.
+    let crosses_a_parser = rename_crosses_a_parser(registry, old_rel, new_rel);
+
     // 新 path の実体 hash を読み直し、DB 側 (= old_hash) と比較
     let full = kb_path.join(new_rel);
     if !full.exists() {
@@ -1719,6 +1732,12 @@ pub fn rename_single_file(
     ) {
         let kind = size_cap_kind(is_binary_ext);
         eprintln!("Skipping {new_rel}: {kind} file too large ({len} bytes > {cap} limit)");
+        // (codex P2 round 11 on PR #291) Crossed a parser: the row is the old parser's
+        // and nothing below will rewrite it. Settle before recording a size for it.
+        if crosses_a_parser {
+            settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
+            return Ok(RenameOutcome::RenamedSizeCapped);
+        }
         // (codex P2 round 7) The rename has already been applied, so the row is
         // under `new_rel` with the size it had when it was small enough to
         // index. Measuring the file and returning without writing leaves it
@@ -1741,6 +1760,12 @@ pub fn rename_single_file(
         // (codex P2 round 6) The rename target has the same stat-then-read
         // window as every other reader, and this was the last caller still
         // dropping the length the refusal measured.
+        // (codex P2 round 11 on PR #291) Same as the size-cap exit above: a crossed
+        // parser's stale row is dropped rather than left under the new path.
+        if crosses_a_parser {
+            settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
+            return Ok(RenameOutcome::RenamedButRefused);
+        }
         if let Some(len) = measured
             && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
         {
@@ -1769,7 +1794,6 @@ pub fn rename_single_file(
     // 更新されないまま残ってしまうため。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     let same_hash = new_hash == old_hash;
-    let crosses_a_parser = rename_crosses_a_parser(registry, old_rel, new_rel);
     if same_hash && context_mode != ContextMode::Static && !crosses_a_parser {
         return Ok(RenameOutcome::Renamed);
     }

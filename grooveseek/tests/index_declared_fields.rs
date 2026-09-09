@@ -1015,3 +1015,50 @@ fn a_field_list_past_the_bound_is_refused_before_the_database_is_opened() {
         "a request the arguments alone refuse must not open (and so create) the database"
     );
 }
+
+/// (codex P2 round 11 on PR #291) The pending-state refusal is asked of the opened database
+/// **before** the embedding model is loaded, not only inside the search legs. The model
+/// load itself is not observable from outside, but its immediate predecessor is: the
+/// embedding-meta check, which rejects a `--model` that does not match the index and runs
+/// right before [`grooveseek::embedder::Embedder::with_model`]. Asking for `bge-m3` on this
+/// BGE-small index while
+/// the declared set is pending therefore tells the order -- the pending refusal must win,
+/// and the model mismatch (and the download it precedes) must never be reached.
+#[test]
+fn a_pending_field_filter_is_refused_before_the_model_is_checked_or_loaded() {
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    clear_declared_meta(kb.kb());
+
+    let (out, err, status) = run(
+        kb.kb(),
+        &[
+            "search",
+            "restart script",
+            "--model",
+            "bge-m3",
+            "--field",
+            "status=active",
+        ],
+    );
+    assert!(!status.success(), "stdout: {out}");
+    assert!(
+        err.contains(grooveseek::db::FIELD_FILTERS_PENDING),
+        "the pending refusal must come first, got: {err}"
+    );
+    assert!(
+        !err.contains("bge-m3"),
+        "the model mismatch check sits just before the model load; reaching it means the \
+         pending refusal came too late, got: {err}"
+    );
+
+    // Control: the same request without the field filter does reach the model check.
+    let (_, err, status) = run(kb.kb(), &["search", "restart script", "--model", "bge-m3"]);
+    assert!(!status.success());
+    assert!(
+        err.contains("bge-m3"),
+        "without a field filter the model mismatch is the first refusal, got: {err}"
+    );
+}

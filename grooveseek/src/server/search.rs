@@ -144,6 +144,22 @@ impl KbCore {
             None => None,
         };
 
+        // (codex P2 round 11 on PR #291) A field filter the index cannot answer yet is
+        // refused before the query is embedded, not after: the search legs refuse it
+        // too, but the embedding they would have been handed is wasted work. The lock
+        // is taken and released here on its own, before the embedder's, so the order
+        // the pipeline takes them in below (embedder, reranker, db) is not nested.
+        {
+            let db = recover_db(self.db.lock());
+            if let Err(e) = db.refuse_field_filters_while_pending(Some(&fields), Some(&fields_not))
+            {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: format!("Search failed: {e}. Try running rebuild_index first."),
+                })
+                .unwrap_or_default();
+            }
+        }
+
         // query embedding
         let query_embedding = {
             let mut embedder = recover(self.embedder.lock(), "embedder");
