@@ -787,6 +787,21 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                 "watcher: renamed {old_rel} -> {new_rel} (binary too large, hash check skipped)"
             );
         }
+        // (codex P2 round 12 on PR #291) The crossed-parser twins say the document is gone,
+        // because it is: "content left as it was" would send a reader looking for a row
+        // that was dropped.
+        Ok(indexer::RenameOutcome::RenamedSizeCappedAndDropped) => {
+            wdiag!(
+                "watcher: renamed {old_rel} -> {new_rel} (too large for the new parser, \
+                 document dropped from the index)"
+            );
+        }
+        Ok(indexer::RenameOutcome::RenamedButRefusedAndDropped) => {
+            wdiag!(
+                "watcher: renamed {old_rel} -> {new_rel} (new path refused by the new parser, \
+                 document dropped from the index)"
+            );
+        }
         // (BU-20) The reason is already on stderr from `read_for_index`; this
         // line says what happened to the document, which the reason does not.
         Ok(indexer::RenameOutcome::RenamedButRefused) => {

@@ -322,6 +322,82 @@ impl Database {
         Ok(())
     }
 
+    /// `index_meta.declared_fields_pass`: the token of the refresh pass that is
+    /// currently running, written by [`crate::indexer::rebuild_index`] together with
+    /// [`Database::clear_declared_fields`] and removed when the pass finishes (codex P2
+    /// round 12 on PR #291). `None` = no pass has the generation cleared right now.
+    ///
+    /// Why a token and not a flag: a watcher in **another process** (the server's,
+    /// while `groove index` runs) can write a document after this pass already
+    /// processed it and before the pass records the generation. That document's
+    /// `document_fields` rows are then whatever the *previous* generation left, under a
+    /// hash the pass will consider current. The watcher cannot replace the rows (it
+    /// does not know the set -- `indexer.rs`'s private `declared_fields_recorded`
+    /// returns `None`), so it
+    /// records instead that it wrote *during* this pass: [`Database::mark_declared_fields_dirty`]
+    /// stores the token it read here, and the pass, on finishing, keeps the generation
+    /// pending when the stored token is its own. A write that happened under an older,
+    /// interrupted pass carries that pass's token and is ignored -- the refresh this pass
+    /// just ran rewrote every document's rows anyway.
+    pub fn read_declared_fields_pass(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'declared_fields_pass'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record the token of the refresh pass that starts now (see
+    /// [`Database::read_declared_fields_pass`]).
+    pub fn write_declared_fields_pass(&self, token: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('declared_fields_pass', ?1)",
+            params![token],
+        )?;
+        Ok(())
+    }
+
+    /// A watcher path wrote a document while the generation was pending: remember the
+    /// pass token it saw, so that pass keeps the generation pending when it finishes
+    /// (see [`Database::read_declared_fields_pass`]). Without a running pass there is
+    /// no token to remember, and nothing to do -- the next refresh rewrites every row.
+    pub fn mark_declared_fields_dirty(&self) -> Result<()> {
+        if let Some(token) = self.read_declared_fields_pass()? {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('declared_fields_dirty', ?1)",
+                params![token],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The pass token a watcher write recorded (see [`Database::mark_declared_fields_dirty`]).
+    pub fn read_declared_fields_dirty(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'declared_fields_dirty'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Remove the pass token and the dirty mark together: a pass is over, whether it
+    /// recorded the generation or left it pending.
+    pub fn clear_declared_fields_pass(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_meta WHERE key IN ('declared_fields_pass', 'declared_fields_dirty')",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
     /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {

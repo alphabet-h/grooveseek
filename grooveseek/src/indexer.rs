@@ -666,9 +666,14 @@ pub fn rebuild_index(
     // kind of partial state and clears the key for the same reason. See
     // `Database::clear_declared_fields`'s doc for why "absent" is safe in both directions,
     // now that `Database::document_fields_is_empty` (round 2) backs the empty-set shortcut.
-    if refresh_fields || force {
-        db.clear_declared_fields()?;
-    }
+    // (codex P2 round 12 on PR #291) The clear is paired with a pass token, so a watcher in
+    // another process that writes a document while this pass runs can say *which* pass it
+    // wrote under -- see `begin_declared_fields_pass` / `finish_declared_fields_pass`.
+    let pass_token = if refresh_fields || force {
+        Some(begin_declared_fields_pass(db)?)
+    } else {
+        None
+    };
     let refresh_any = refresh_frontmatter || refresh_fields;
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
@@ -963,10 +968,16 @@ pub fn rebuild_index(
     // the sweep, leaves it absent and the next run refreshes again rather than trusting a set
     // some documents (visited or pruned) were never brought in line with. Rewriting an unchanged
     // value is harmless, and it is how an index with nothing to declare gets its `[]` without a
-    // pass.
-    if force || !refresh_fields || !refresh_pending {
-        db.write_declared_fields(&declared_json)?;
-    }
+    // pass. (codex P2 round 12) Recorded through `finish_declared_fields_pass`, which leaves
+    // the generation pending instead when a watcher in another process wrote a document
+    // under this pass's token -- that document's rows are the previous generation's, and
+    // recording the new set over them would make them current for good.
+    finish_declared_fields_pass(
+        db,
+        pass_token.as_deref(),
+        &declared_json,
+        force || !refresh_fields || !refresh_pending,
+    )?;
 
     // Count total documents remaining (includes unchanged ones)
     let total_documents = db.document_count()?;
@@ -1249,10 +1260,12 @@ fn index_single_disk_entry(
         // (codex P2 round 9 on PR #291) `declared_fields: None` means the caller does not yet
         // know the current set (see this fn's doc) -- leave the row as the last completed pass
         // left it rather than write nothing where something declared may already exist.
-        if refresh_fields && let Some(declared) = declared_fields {
-            db.replace_document_fields(
+        if refresh_fields {
+            write_declared_rows_or_mark_dirty(
+                db,
                 &entry.rel,
-                &declared_field_rows(&parsed.frontmatter.extra, declared),
+                &parsed.frontmatter.extra,
+                declared_fields,
             )?;
         }
         tx.commit()?;
@@ -1331,12 +1344,12 @@ fn index_single_disk_entry(
             // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the
             // frontmatter-only path above: a `None` here must not overwrite a document's rows
             // with an empty set just because the caller does not yet know the real one.
-            if let Some(declared) = declared_fields {
-                db.replace_document_fields(
-                    &entry.rel,
-                    &declared_field_rows(&parsed.frontmatter.extra, declared),
-                )?;
-            }
+            write_declared_rows_or_mark_dirty(
+                db,
+                &entry.rel,
+                &parsed.frontmatter.extra,
+                declared_fields,
+            )?;
             // (feature-56) The chunk texts match, so the embeddings still stand — but the
             // *positions* may not. Inserting a blank line above a function, or trimming a
             // comment short enough to be dropped as a thin gap, moves every definition below
@@ -1400,12 +1413,7 @@ fn index_single_disk_entry(
     // a `None` here writes nothing, so a freshly written or newly changed document simply has
     // no `document_fields` rows until a completed [`rebuild_index`] pass gives a real answer --
     // preferable to a wrong one guessed as empty.
-    if let Some(declared) = declared_fields {
-        db.replace_document_fields(
-            &entry.rel,
-            &declared_field_rows(&parsed.frontmatter.extra, declared),
-        )?;
-    }
+    write_declared_rows_or_mark_dirty(db, &entry.rel, &parsed.frontmatter.extra, declared_fields)?;
     tx.commit()?;
 
     Ok(SingleResult::Updated {
@@ -1645,10 +1653,12 @@ pub enum RenameOutcome {
     /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
     /// content_hash は旧内容のまま据え置き、次回 full rebuild の
     /// `scan_disk_entries` の size-cap 判定に委ねる (§4.2 skip 統一原則)。
-    /// (codex P2 round 11 on PR #291) rename が parser を跨いでいた場合は据え置かず
-    /// 行を消す (旧 parser の行が新拡張子の下に残る形)。variant は同じ —
-    /// 「rename は成立、size 超過で index せず」は変わらないため。
     RenamedSizeCapped,
+    /// (codex P2 round 11 / 12 on PR #291) [`RenameOutcome::RenamedSizeCapped`], but the rename
+    /// crossed a parser, so the old parser's row was **dropped** rather than left under the
+    /// new extension. A variant of its own because the watcher's diagnostic says what happened
+    /// to the document, and "hash check skipped, content kept" would be false here.
+    RenamedSizeCappedAndDropped,
     /// (BU-20) path は UPDATE 済だが、新 path を開いた handle が
     /// 「集めた時のファイルではない」と答えた (hardlink / symlink / 非通常
     /// ファイル / handle 側の size 超過) ため hash 再計算 / reindex はスキップした。
@@ -1659,9 +1669,11 @@ pub enum RenameOutcome {
     /// することで、呼び出し側と読み手の両方に「rename は成立、内容は据え置き、
     /// 理由は refusal」と伝わる。DB の content_hash は旧内容のままで、
     /// 次回 full rebuild の walk-time check が row ごと取り除く。
-    /// (codex P2 round 11 on PR #291) parser を跨ぐ rename なら
-    /// [`RenameOutcome::RenamedSizeCapped`] と同じく行を消す。
     RenamedButRefused,
+    /// (codex P2 round 11 / 12 on PR #291) [`RenameOutcome::RenamedButRefused`], but the rename
+    /// crossed a parser, so the old parser's row was **dropped**; "content left as it was"
+    /// would be false, hence the separate variant.
+    RenamedButRefusedAndDropped,
 }
 
 /// 単一ファイルの rename を処理する。
@@ -1736,7 +1748,7 @@ pub fn rename_single_file(
         // and nothing below will rewrite it. Settle before recording a size for it.
         if crosses_a_parser {
             settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
-            return Ok(RenameOutcome::RenamedSizeCapped);
+            return Ok(RenameOutcome::RenamedSizeCappedAndDropped);
         }
         // (codex P2 round 7) The rename has already been applied, so the row is
         // under `new_rel` with the size it had when it was small enough to
@@ -1764,7 +1776,7 @@ pub fn rename_single_file(
         // parser's stale row is dropped rather than left under the new path.
         if crosses_a_parser {
             settle_cross_parser_rename(db, new_rel, &SingleResult::Refused)?;
-            return Ok(RenameOutcome::RenamedButRefused);
+            return Ok(RenameOutcome::RenamedButRefusedAndDropped);
         }
         if let Some(len) = measured
             && let Err(e) = db.record_document_sizes(&[(new_rel, len)])
@@ -2021,6 +2033,92 @@ pub(crate) const CODE_CHUNK_POLICY: &str = "degrade";
 /// [`rebuild_index`] would never read them again. The value is a generation, like
 /// [`CODE_CHUNK_POLICY`]: it changes when what the parser writes changes.
 pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
+
+/// (feature-58, codex P2 round 9 / 12 on PR #291) Write a document's `document_fields` rows
+/// when the declared set is known, and when it is **not** -- a watcher path running while
+/// [`rebuild_index`] has the generation cleared, `declared_fields: None` -- leave the rows
+/// alone and record that this document was written under the pass that is running
+/// ([`Database::mark_declared_fields_dirty`]). The three write paths of
+/// [`index_single_disk_entry`] all come through here so the rule has one home.
+///
+/// The mark is what closes the cross-process window round 12 found: the rebuild in another
+/// process may already have processed this document; its rows are then the *previous*
+/// generation's under a hash the rebuild considers current, and only the rebuild can act on
+/// that -- by not recording the new generation ([`finish_declared_fields_pass`]).
+fn write_declared_rows_or_mark_dirty(
+    db: &Database,
+    rel: &str,
+    extra: &std::collections::BTreeMap<String, crate::parser::FieldValue>,
+    declared: Option<&[String]>,
+) -> Result<()> {
+    match declared {
+        Some(declared) => db.replace_document_fields(rel, &declared_field_rows(extra, declared)),
+        None => db.mark_declared_fields_dirty(),
+    }
+}
+
+/// (codex P2 round 12 on PR #291) Start a declared-field refresh pass: clear the generation
+/// key ([`Database::clear_declared_fields`], the round 3 rule) and record a token naming
+/// this pass ([`Database::write_declared_fields_pass`]) in the same transaction, so a
+/// watcher in another process that writes a document meanwhile can say it did so under
+/// *this* pass. Returns the token for [`finish_declared_fields_pass`].
+///
+/// A previous pass's leftover token or dirty mark is replaced here: whatever that pass left
+/// behind, this one rewrites every document's rows before it finishes.
+fn begin_declared_fields_pass(db: &Database) -> Result<String> {
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tx = db.begin_transaction()?;
+    db.clear_declared_fields()?;
+    db.clear_declared_fields_pass()?;
+    db.write_declared_fields_pass(&token)?;
+    tx.commit()?;
+    Ok(token)
+}
+
+/// (codex P2 round 12 on PR #291) End a pass: remove its token and any dirty mark, then
+/// record `declared_json` as the generation -- unless `record` is false (the caller's
+/// existing reasons for leaving the key absent: a refresh that could not read every
+/// document), or the dirty mark carries **this pass's** token, meaning a watcher in another
+/// process wrote a document after this pass may have processed it. That document's rows are
+/// the previous generation's under a hash this pass considers current; recording the new set
+/// would make them current for good, so the key stays absent, the next run refreshes again
+/// (absent != declared, the round 3 rule), and the operator is told why. Returns whether the
+/// generation was recorded.
+///
+/// A dirty mark carrying an *older* token is a write under a pass that never finished; the
+/// refresh that just ran rewrote that document's rows too, so it is dropped with the token.
+fn finish_declared_fields_pass(
+    db: &Database,
+    token: Option<&str>,
+    declared_json: &str,
+    record: bool,
+) -> Result<bool> {
+    let dirty_under_this_pass = match (token, db.read_declared_fields_dirty()?) {
+        (Some(mine), Some(dirty)) => mine == dirty,
+        _ => false,
+    };
+    let tx = db.begin_transaction()?;
+    db.clear_declared_fields_pass()?;
+    let recorded = record && !dirty_under_this_pass;
+    if recorded {
+        db.write_declared_fields(declared_json)?;
+    }
+    tx.commit()?;
+    if dirty_under_this_pass {
+        tracing::warn!(
+            "another process updated a document while this run was refreshing the declared \
+             fields; the declared-field set is left pending -- run `groove index` again"
+        );
+    }
+    Ok(recorded)
+}
 
 /// (feature-58) What `index_meta.declared_fields` holds when the schema declares
 /// no key beyond the five named ones, or there is no schema: the JSON of an
@@ -3368,6 +3466,101 @@ mod tests {
     /// [`Embedder`] always touches the model cache/download, so every existing test that goes
     /// through [`index_single_disk_entry`] is `#[ignore]`d, and this fn alone -- the only *new*
     /// production code this round adds -- has no such cost).
+    /// (codex P2 round 12 on PR #291) The pass token / dirty mark handshake between
+    /// [`begin_declared_fields_pass`], a watcher write under a pending generation
+    /// ([`Database::mark_declared_fields_dirty`], which [`write_declared_rows_or_mark_dirty`]
+    /// calls), and [`finish_declared_fields_pass`]: a write under *this* pass keeps the
+    /// generation pending; a write under an older pass, or none, lets it be recorded.
+    /// Database-only, like the test below -- the watcher side that produces the mark through
+    /// [`index_single_disk_entry`] is covered in-process by
+    /// `tests/watcher_rename_context_mode.rs` (`#[ignore]`, model load).
+    #[test]
+    fn a_watcher_write_under_the_running_pass_keeps_the_generation_pending() {
+        let db = Database::open_in_memory().unwrap();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+
+        // No pass running: a watcher mark is a no-op, and a finish with no token records.
+        db.mark_declared_fields_dirty().unwrap();
+        assert_eq!(db.read_declared_fields_dirty().unwrap(), None);
+        assert!(finish_declared_fields_pass(&db, None, r#"["status"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["status"]"#)
+        );
+
+        // A pass starts: the key is cleared and the token recorded, atomically.
+        let token = begin_declared_fields_pass(&db).unwrap();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(
+            db.read_declared_fields_pass().unwrap().as_deref(),
+            Some(token.as_str())
+        );
+
+        // A watcher (another process) writes a document meanwhile and marks the pass.
+        db.mark_declared_fields_dirty().unwrap();
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap().as_deref(),
+            Some(token.as_str())
+        );
+
+        // The pass finishes: it must NOT record the generation, and it cleans up after itself.
+        assert!(
+            !finish_declared_fields_pass(&db, Some(&token), r#"["status","team"]"#, true).unwrap(),
+            "a write under this pass leaves the generation pending"
+        );
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(db.read_declared_fields_pass().unwrap(), None);
+        assert_eq!(db.read_declared_fields_dirty().unwrap(), None);
+
+        // The next pass finds no mark of its own (the old one was dropped) and records.
+        let next = begin_declared_fields_pass(&db).unwrap();
+        assert_ne!(next, token);
+        assert!(
+            finish_declared_fields_pass(&db, Some(&next), r#"["status","team"]"#, true).unwrap()
+        );
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["status","team"]"#)
+        );
+
+        // A mark left by an older, unfinished pass does not stop a newer pass from recording.
+        let stale = begin_declared_fields_pass(&db).unwrap();
+        db.mark_declared_fields_dirty().unwrap();
+        let newer = begin_declared_fields_pass(&db).unwrap();
+        assert_ne!(newer, stale);
+        assert_eq!(
+            db.read_declared_fields_dirty().unwrap(),
+            None,
+            "beginning a pass drops the previous pass's mark with its token"
+        );
+        assert!(finish_declared_fields_pass(&db, Some(&newer), "[]", true).unwrap());
+
+        // `record == false` (the caller's own reasons to leave the key absent) still cleans up.
+        let t = begin_declared_fields_pass(&db).unwrap();
+        assert!(!finish_declared_fields_pass(&db, Some(&t), "[]", false).unwrap());
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        assert_eq!(db.read_declared_fields_pass().unwrap(), None);
+    }
+
+    /// (codex P2 round 12 on PR #291) The crossed-parser twins are distinct outcomes: the
+    /// watcher's diagnostic is chosen by variant, and "content kept" versus "document
+    /// dropped" must not collapse into one arm.
+    #[test]
+    fn the_dropped_rename_outcomes_are_distinct_from_the_kept_ones() {
+        assert_ne!(
+            RenameOutcome::RenamedSizeCappedAndDropped,
+            RenameOutcome::RenamedSizeCapped
+        );
+        assert_ne!(
+            RenameOutcome::RenamedButRefusedAndDropped,
+            RenameOutcome::RenamedButRefused
+        );
+        assert_ne!(
+            RenameOutcome::RenamedSizeCappedAndDropped,
+            RenameOutcome::RenamedButRefusedAndDropped
+        );
+    }
+
     #[test]
     fn declared_fields_recorded_tells_absent_from_declared_nothing_from_a_list() {
         let db = Database::open_in_memory().unwrap();

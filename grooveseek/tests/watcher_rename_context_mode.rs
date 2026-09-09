@@ -356,8 +356,9 @@ fn test_cross_parser_rename_to_an_oversized_destination_drops_the_row() {
     .expect("rename_single_file");
     assert_eq!(
         outcome,
-        RenameOutcome::RenamedSizeCapped,
-        "the destination is past the cap, so the size-cap exit is the one taken: {outcome:?}"
+        RenameOutcome::RenamedSizeCappedAndDropped,
+        "the destination is past the cap and the rename crossed a parser, so the size-cap exit \
+         is the one taken and it reports the drop (codex P2 round 12): {outcome:?}"
     );
 
     let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
@@ -375,4 +376,93 @@ fn test_cross_parser_rename_to_an_oversized_destination_drops_the_row() {
              exit must drop it rather than keep the Markdown parser's row under the new path"
         );
     }
+}
+
+/// (codex P2 round 12 on PR #291) The watcher side of the pass-token handshake: while a
+/// refresh pass in another process has the generation cleared (its token is recorded), a
+/// watcher reindex of a changed document writes the document -- new hash, new chunks -- but
+/// leaves its `document_fields` rows exactly as the previous generation left them, and
+/// records the pass token as the dirty mark, so that pass will not record the new
+/// generation over rows it never rewrote. The pass side of the handshake is
+/// `grooveseek/src/indexer.rs`'s unit test
+/// `a_watcher_write_under_the_running_pass_keeps_the_generation_pending`.
+///
+/// Same `#[ignore]` policy as the tests above: the reindex embeds the changed document.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_reindex_under_a_pending_generation_keeps_the_rows_and_marks_the_pass() {
+    let layout = TempKbLayout::new("groove-watcher-reindex-pending");
+    layout.write("groove-schema.toml", "[fields.status]\n");
+    layout.write(
+        "runbook.md",
+        "---\nstatus: active\n---\n\n## Section\n\nBody content that is long enough to pass the quality filter comfortably, mentioning the pending generation handshake.\n",
+    );
+    let (db, mut embedder, registry, db_path) = build_initial_index(&layout, ContextMode::Off);
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
+    let rows_of = |path: &str| -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.key, f.value FROM document_fields f JOIN documents d ON d.id = f.document_id \
+                 WHERE d.path = ?1 ORDER BY f.key, f.value",
+            )
+            .unwrap();
+        stmt.query_map([path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows_of("runbook.md"),
+        vec![("status".to_string(), "active".to_string())],
+        "the completed index wrote the declared row"
+    );
+    let (id_before, _) = chunk_row_for_path(&db_path, "runbook.md");
+
+    // Another process starts a refresh pass: generation cleared, token recorded. (The
+    // private `begin_declared_fields_pass` does exactly these two writes in one transaction.)
+    db.clear_declared_fields().expect("clear generation");
+    db.write_declared_fields_pass("other-process-pass")
+        .expect("record pass token");
+
+    // The document changes and the watcher reindexes it while the pass is still running.
+    layout.write(
+        "runbook.md",
+        "---\nstatus: deprecated\n---\n\n## Section\n\nBody content that is long enough to pass the quality filter comfortably, mentioning the pending generation handshake, edited.\n",
+    );
+    let outcome = indexer::reindex_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "runbook.md",
+        None,
+        &registry,
+    )
+    .expect("reindex_single_file");
+    assert!(
+        matches!(outcome, indexer::SingleResult::Updated { .. }),
+        "the content changed, so the watcher reindexes it: {outcome:?}"
+    );
+
+    let (id_after, _) = chunk_row_for_path(&db_path, "runbook.md");
+    assert_ne!(
+        id_before, id_after,
+        "the document was rewritten (new chunk row)"
+    );
+    assert_eq!(
+        rows_of("runbook.md"),
+        vec![("status".to_string(), "active".to_string())],
+        "the rows are the previous generation's, untouched: the watcher does not know the set"
+    );
+    assert_eq!(
+        db.read_declared_fields_dirty()
+            .expect("read dirty mark")
+            .as_deref(),
+        Some("other-process-pass"),
+        "the watcher recorded that it wrote under the running pass"
+    );
+    assert_eq!(
+        db.read_declared_fields().expect("read generation"),
+        None,
+        "the watcher never records a generation"
+    );
 }
