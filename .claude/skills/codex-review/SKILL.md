@@ -97,6 +97,13 @@ round に使う** — 2026-09-09 の user 判断。役割は **ローカル = �
 ローカルが approve でも GitHub は P2 を出す (同 summary の r7〜r9) し、focus を当てればローカルが
 GitHub より先に本物を拾う (同 r4 / r5、round 10 後の 2 件)。どちらか一方で済ませない。
 
+**plugin / CLI が無い環境では前掃除なしで GitHub round のみ**。無いときは push 前の実行が
+黙って skip にはならず止まる (plugin 未 install は `Cannot find module` で exit 1、CLI 無しは
+`ensureCodexAvailable` の install 案内)。**未 login だけは事前に検査されない** — review は
+`ensureCodexAvailable` (CLI の有無だけ) しか通らず、認証は app-server が起動してから失敗する。
+login 状態は自分で `/codex:setup` を打って確かめ、無ければ `codex login`。止まった時点で
+入れるか諦めるかを決め、諦めたなら下の GitHub round を最初から回す。
+
 **打つのは、この branch を push するたび** (上の sweep と同じ)。PR を開く前も、GitHub round の
 指摘を直した後も同じ。
 
