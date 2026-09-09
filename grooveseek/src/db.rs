@@ -303,17 +303,27 @@ pub type FieldFilters = std::collections::BTreeMap<String, Vec<String>>;
 
 /// Build a [`FieldFilters`] from raw `(key, values)` pairs. The same key
 /// given twice is one entry with the lists joined; a duplicate value is kept
-/// once; a key left with no value is dropped, because it would narrow nothing
-/// and the echo reports what had an effect.
+/// once, at its first occurrence; a key left with no value is dropped,
+/// because it would narrow nothing and the echo reports what had an effect.
+///
+/// (codex P2 round 8 on PR #291) Dedup goes through a per-key `seen` set
+/// rather than `Vec::contains`: a linear scan per value makes the whole
+/// function O(n²) in the list's length, and [`crate::server::validate_raw_field_filters`]
+/// exists precisely so the *raw* list is bounded before this function ever
+/// runs -- a caller could still hand this function a large list directly, so
+/// the O(n) shape belongs here, not only at the validation boundary.
 pub fn normalize_field_filters<I>(raw: I) -> FieldFilters
 where
     I: IntoIterator<Item = (String, Vec<String>)>,
 {
     let mut out = FieldFilters::new();
+    let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     for (key, values) in raw {
-        let entry = out.entry(key).or_default();
+        let entry = out.entry(key.clone()).or_default();
+        let seen_values = seen.entry(key).or_default();
         for v in values {
-            if !entry.contains(&v) {
+            if seen_values.insert(v.clone()) {
                 entry.push(v);
             }
         }
@@ -5447,6 +5457,44 @@ mod tests {
         assert!(
             !n.contains_key("team"),
             "a key whose list is empty narrows nothing and is dropped"
+        );
+    }
+
+    /// (codex P2 round 8 on PR #291) [`normalize_field_filters`]'s dedup goes through a per-key
+    /// seen-set (O(n) in the list length) rather than the old `Vec::contains` scan per value
+    /// (O(n²)). No timing assert -- that would be its own kind of flaky -- but 10,000 distinct
+    /// entries have to come back as 10,000, not hang or panic, which is what the O(n) path
+    /// buys over the quadratic one; and the seen-set has to keep the same first-occurrence
+    /// order the old scan gave, which the small interleaved-duplicates check below pins.
+    #[test]
+    fn normalize_field_filters_handles_a_large_distinct_list_and_keeps_first_occurrence_order() {
+        let distinct: Vec<String> = (0..10_000usize).map(|i| format!("v{i:05}")).collect();
+        let n = normalize_field_filters(vec![("status".to_string(), distinct.clone())]);
+        assert_eq!(
+            n.get("status").unwrap().len(),
+            10_000,
+            "10,000 already-distinct values must all survive"
+        );
+        assert_eq!(n.get("status").unwrap(), &distinct);
+
+        let interleaved = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+            "d".to_string(),
+        ];
+        let n = normalize_field_filters(vec![("status".to_string(), interleaved)]);
+        assert_eq!(
+            n.get("status").unwrap(),
+            &vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ],
+            "duplicates interleaved throughout the list must not disturb first-occurrence order"
         );
     }
 

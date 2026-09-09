@@ -477,6 +477,22 @@ fn parse_field_pair(s: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+/// The `--field` / `--field-not` pairs a repeated flag collects, grouped by key -- one value
+/// per occurrence, in the order clap saw them, with no deduplication (codex P2 round 8 on PR
+/// #291): this is the *raw* map [`grooveseek::server::validate_raw_field_filters`] bounds
+/// before [`grooveseek::db::normalize_field_filters`] dedups it, matching the MCP path's raw
+/// `fields` / `fields_not` object one key can also repeat values under.
+fn group_field_pairs(
+    pairs: Vec<(String, String)>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut raw: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (key, value) in pairs {
+        raw.entry(key).or_default().push(value);
+    }
+    raw
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct SearchCliArgs {
     /// Search query text (positional)
@@ -1105,12 +1121,15 @@ fn main() -> anyhow::Result<()> {
             grooveseek::server::validate_filter_list("tags_any", &tags_any)?;
             grooveseek::server::validate_filter_list("tags_all", &tags_all)?;
 
-            let fields = grooveseek::db::normalize_field_filters(
-                fields.into_iter().map(|(k, v)| (k, vec![v])),
-            );
-            let fields_not = grooveseek::db::normalize_field_filters(
-                fields_not.into_iter().map(|(k, v)| (k, vec![v])),
-            );
+            // (codex P2 round 8 on PR #291) The raw, pre-dedup map is bounded first -- a
+            // repeated `--field status=x` past the per-list limit is refused by its raw count,
+            // not the count `normalize_field_filters`'s dedup would leave behind.
+            let fields_raw = group_field_pairs(fields);
+            grooveseek::server::validate_raw_field_filters("fields", &fields_raw)?;
+            let fields_not_raw = group_field_pairs(fields_not);
+            grooveseek::server::validate_raw_field_filters("fields_not", &fields_not_raw)?;
+            let fields = grooveseek::db::normalize_field_filters(fields_raw);
+            let fields_not = grooveseek::db::normalize_field_filters(fields_not_raw);
             grooveseek::server::validate_field_filters("fields", &fields)?;
             grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
 

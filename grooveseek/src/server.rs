@@ -64,7 +64,7 @@ use documents::{
 pub use search::{
     RERANK_BY_DEFAULT, SEARCH_LIMIT_MAX, clamp_search_limit, compile_path_globs,
     compute_low_confidence, compute_match_spans, run_search_pipeline, should_rerank,
-    validate_field_filters, validate_filter_list,
+    validate_field_filters, validate_filter_list, validate_raw_field_filters,
 };
 
 // The rest are reached only from tests, and the compiler is what said so: left
@@ -2282,6 +2282,49 @@ mod tests {
         assert!(
             err.starts_with("fields is too large") && err.contains("bytes encoded"),
             "{err}"
+        );
+    }
+
+    /// (codex P2 round 8 on PR #291) A raw list of one more copy of one value than
+    /// [`FILTER_LIST_MAX_ITEMS`] allows must be refused by its own, raw, count -- before this
+    /// fix, only the *normalised* map was bounded, and [`crate::db::normalize_field_filters`]
+    /// collapsed those repeated copies down to one occurrence (well under the limit) before
+    /// [`validate_field_filters`] ever ran, so the rest were never counted.
+    #[test]
+    fn a_raw_field_list_of_repeated_values_past_the_limit_is_refused_before_dedup() {
+        let mut raw: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        raw.insert(
+            "status".to_string(),
+            vec!["active".to_string(); FILTER_LIST_MAX_ITEMS + 1],
+        );
+        let err = validate_raw_field_filters("fields", &raw)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields.status has too many entries"),
+            "{err}"
+        );
+    }
+
+    /// The companion positive case (codex P2 round 8 on PR #291): a raw list at exactly the
+    /// key-list bound, every value distinct, passes the raw check and normalises to the same
+    /// count -- there is nothing for dedup to collapse.
+    #[test]
+    fn a_raw_field_list_of_distinct_values_at_the_limit_passes_and_normalises_unchanged() {
+        let mut raw: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        raw.insert(
+            "status".to_string(),
+            (0..FILTER_LIST_MAX_ITEMS)
+                .map(|i| format!("v{i:03}"))
+                .collect(),
+        );
+        assert!(validate_raw_field_filters("fields", &raw).is_ok());
+        let normalised = crate::db::normalize_field_filters(raw);
+        assert_eq!(
+            normalised.get("status").unwrap().len(),
+            FILTER_LIST_MAX_ITEMS
         );
     }
 

@@ -99,6 +99,26 @@ impl KbCore {
         // feature-58: declared-field filter. Same bounds as the list filters
         // above, through `validate_field_filters` so the numbers stay in one
         // place; keys first, then each key's values, in key order.
+        //
+        // (codex P2 round 8 on PR #291) The *raw* maps are bounded first, before
+        // `field_filters_from_params` (-> `normalize_field_filters`) dedups them --
+        // `validate_raw_field_filters`'s doc says why the order matters: a raw list past the
+        // limit must be refused by its own count, not by the count dedup would have left, and
+        // the O(n²) dedup this call runs must never see more than the limits allow in the
+        // first place.
+        for (name, raw) in [
+            ("fields", &params.fields),
+            ("fields_not", &params.fields_not),
+        ] {
+            if let Some(raw) = raw
+                && let Err(e) = validate_raw_field_filters(name, raw)
+            {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default();
+            }
+        }
         let fields = field_filters_from_params(params.fields.clone());
         let fields_not = field_filters_from_params(params.fields_not.clone());
         for (name, f) in [("fields", &fields), ("fields_not", &fields_not)] {
@@ -880,21 +900,31 @@ pub(crate) fn field_filters_from_params(
     crate::db::normalize_field_filters(raw.into_iter().flatten())
 }
 
-/// The bounds of a declared-field filter, through [`validate_filter_list`]
-/// so the numbers and the wording have one home: the key list first under
-/// `name` (entry count and key length), then each key's value list under
-/// `name.<key>` in key order. An empty key is refused before the key-list
-/// bound runs; an empty value is refused before that key's own value-list
-/// bound runs. Neither the command line nor the tool should accept one
-/// silently.
+/// The bounds of a declared-field filter, through [`validate_filter_list`] so the numbers and
+/// the wording have one home: the key list first under `name` (entry count and key length),
+/// then each key's value list under `name.<key>` in key order, then the whole map's encoded
+/// size. Shared by [`validate_field_filters`] (the normalised map) and
+/// [`validate_raw_field_filters`] (codex P2 round 8 on PR #291; the raw map, before
+/// [`crate::db::normalize_field_filters`] dedups it) so the sequence has one definition instead
+/// of two copies that could drift (AGENTS "one question gets one implementation") -- the two
+/// callers ask the same questions of whatever map they hold, raw or normalised, since
+/// [`crate::db::FieldFilters`] is not a distinct type from the raw shape, only a name for what
+/// it means once deduped.
+///
+/// An empty key is refused before the key-list bound runs; an empty value is refused before
+/// that key's own value-list bound runs. Neither the command line nor the tool should accept
+/// one silently.
 ///
 /// (codex P2 round 6 on PR #291) After the per-key bounds, the whole map's aggregate size is
-/// checked against [`FIELD_FILTERS_MAX_BYTES`]: a map can be legal at every one of the
-/// per-list bounds above and still be far larger than the aggregate cap allows, because those
-/// bounds are per-list, not per-map. See [`FIELD_FILTERS_MAX_BYTES`]'s doc for why the map
-/// needs its own bound at all, and (codex P2 round 7 on PR #291) why that aggregate is the
-/// map's JSON-**encoded** length rather than the sum of its decoded string lengths.
-pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> anyhow::Result<()> {
+/// checked against [`FIELD_FILTERS_MAX_BYTES`]: a map can pass each of the per-list bounds
+/// above and still be far larger than the aggregate cap allows, because those bounds are
+/// per-list, not per-map. See [`FIELD_FILTERS_MAX_BYTES`]'s doc for why the map needs its own
+/// bound at all, and (codex P2 round 7 on PR #291) why that aggregate is the map's
+/// JSON-**encoded** length rather than the sum of its decoded string lengths.
+fn validate_field_filters_shape(
+    name: &str,
+    filters: &std::collections::BTreeMap<String, Vec<String>>,
+) -> anyhow::Result<()> {
     if filters.keys().any(|k| k.is_empty()) {
         anyhow::bail!("{name} has an empty key");
     }
@@ -908,10 +938,11 @@ pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> 
     }
     // (codex P2 round 7 on PR #291) The transport limit this budget exists to stay under
     // measures the JSON-RPC request body, not the decoded strings a map's `.len()`s sum to --
-    // a control character costs six encoded bytes (\u0001) against one decoded, so a map
-    // could pass a decoded-byte sum here and still encode past the cap. `to_string` on a
-    // `BTreeMap<String, Vec<String>>` is infallible in practice (no non-finite floats, no
-    // non-UTF-8 data — Rust strings already are), but its `Result` still has to be handled;
+    // a control character costs six encoded bytes (the escape `\u0001`) against one
+    // decoded, so a map could pass a decoded-byte sum here and still encode past the cap.
+    // `to_string` on a `BTreeMap<String, Vec<String>>` is infallible in practice (no
+    // non-finite floats, no non-UTF-8 data -- Rust strings already are), but its `Result`
+    // still has to be handled;
     // an error is treated as "too large" rather than unwrapped, since refusing an encode
     // failure is safe and panicking on one is not.
     let encoded_bytes = match serde_json::to_string(filters) {
@@ -925,6 +956,36 @@ pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> 
         );
     }
     Ok(())
+}
+
+/// [`validate_field_filters_shape`] on the map [`crate::db::normalize_field_filters`] already
+/// deduped -- the shape [`crate::db::FieldFilters`] documents as its own invariant.
+pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> anyhow::Result<()> {
+    validate_field_filters_shape(name, filters)
+}
+
+/// [`validate_field_filters_shape`] on the map exactly as a caller gave it -- before
+/// [`crate::db::normalize_field_filters`] dedups and joins same-key entries (codex P2 round 8
+/// on PR #291).
+///
+/// [`crate::db::normalize_field_filters`]'s dedup is O(n) in the list length (round 8: a
+/// per-key seen-set, not a linear scan per value), but nothing bounded the list it dedups
+/// *before* this fix -- a body under the transport's own byte limit could still hold far more
+/// raw entries than [`FILTER_LIST_MAX_ITEMS`] allows, paying preprocessing work before
+/// [`validate_field_filters`] ever ran, and a value repeated past the limit collapsed to one
+/// occurrence and slipped under it. Bounding the raw map first, with the same numbers this
+/// module already gives every other filter, closes both: [`crate::db::normalize_field_filters`]
+/// never sees more than the limits allow, and a list of duplicates is refused by its *raw* count rather
+/// than the count dedup would have left.
+///
+/// `pub`, not `pub(crate)`: the CLI's `Commands::Search` arm (`main.rs`) is a separate crate
+/// from this library and calls this directly, the same way it already calls
+/// [`validate_field_filters`] -- a `pub(crate)` item is invisible across that boundary.
+pub fn validate_raw_field_filters(
+    name: &str,
+    raw: &std::collections::BTreeMap<String, Vec<String>>,
+) -> anyhow::Result<()> {
+    validate_field_filters_shape(name, raw)
 }
 
 /// `search` が受理する `limit` の上限。
