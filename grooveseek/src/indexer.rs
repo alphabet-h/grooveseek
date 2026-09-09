@@ -524,6 +524,13 @@ pub fn rebuild_index(
         .canonicalize()
         .with_context(|| format!("failed to canonicalize kb_path: {}", kb_path.display()))?;
 
+    // (feature-58, codex P1 round 1 on PR #291) Load the schema before anything below can
+    // delete data. `reset_and_resolve_context_mode` further down calls `reset_for_model` when
+    // `force` is set, which empties the index; a malformed schema must fail this run before
+    // that reset, not after it. See `load_declared_schema`'s doc for why `main.rs` also loads
+    // it, ahead of its own earlier `--force` reset.
+    let schema = load_declared_schema(&kb_path)?;
+
     // legacy DB を引き継いだケースで FTS が空のままにならないよう、
     // まず既存 chunks のうち FTS 未登録のものを backfill する。
     let backfilled = db.backfill_fts()?;
@@ -573,13 +580,12 @@ pub fn rebuild_index(
         !force && db.read_frontmatter_policy()?.as_deref() != Some(FRONTMATTER_POLICY);
 
     // (feature-58) The keys the schema declares are what `document_fields` holds.
-    // Read here, on every run, from the same path `groove validate` uses; a
-    // schema that does not load stops the run the way a config that does not
-    // load stops the binary -- silently indexing without it would make every
-    // `--field` answer empty and say nothing. Compared with what the last
-    // completed run recorded: on a difference every unchanged Markdown document
-    // is read once more so its rows follow the schema, without re-embedding.
-    let schema = crate::schema::Schema::load_optional(&kb_path.join("groove-schema.toml"))?;
+    // `schema` was already loaded above, before the destructive reset, from the
+    // same path `groove validate` uses -- silently indexing without it would
+    // make every `--field` answer empty and say nothing. Compared with what the
+    // last completed run recorded: on a difference every unchanged Markdown
+    // document is read once more so its rows follow the schema, without
+    // re-embedding.
     let declared_fields = declared_field_names(schema.as_ref());
     let declared_json = serde_json::to_string(&declared_fields)?;
     let stored_declared = db.read_declared_fields()?;
@@ -1839,6 +1845,22 @@ fn declared_fields_recorded(db: &Database) -> Result<Vec<String>> {
             .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}")),
         None => Ok(Vec::new()),
     }
+}
+
+/// Reads `<kb_path>/groove-schema.toml` — the same file `groove validate`
+/// reads — and compiles it, without deriving anything from it yet.
+///
+/// (feature-58, codex P1 round 1 on PR #291) Call this as the FIRST thing
+/// [`rebuild_index`] does, before any destructive reset runs: a schema that
+/// does not load must stop the run before anything is deleted, the way a
+/// `groove.toml` that does not load stops the binary before it opens the
+/// database. [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call can
+/// empty the index on `--force`, and the CLI's `index --force` arm (in
+/// `main.rs`) resets even earlier, before [`rebuild_index`] is entered — so
+/// `main.rs` calls this too, ahead of its own reset. A second file read is
+/// cheap next to a reset that empties the index.
+pub fn load_declared_schema(kb_path: &Path) -> Result<Option<crate::schema::Schema>> {
+    crate::schema::Schema::load_optional(&kb_path.join("groove-schema.toml"))
 }
 
 /// The keys `groove-schema.toml` declares that the parser keeps in

@@ -152,6 +152,56 @@ fn a_schema_that_does_not_load_stops_the_index_and_names_the_file() {
 }
 
 #[test]
+fn a_schema_that_does_not_load_leaves_a_forced_rebuild_untouched() {
+    // (codex P1 round 1 on PR #291) `--force` calls `reset_for_model` before
+    // `rebuild_index` is even entered (`main.rs`'s `Commands::Index` arm), so
+    // a schema load failure has to be checked before that reset runs, not
+    // only inside `rebuild_index`. This pins that a malformed schema stops a
+    // forced run before it empties the index.
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    let declared_before = fields_of(kb.kb(), "active.md");
+    assert_eq!(
+        declared_before,
+        pairs(&[
+            ("environment", "dev"),
+            ("environment", "prod"),
+            ("status", "active")
+        ])
+    );
+
+    kb.write(
+        "groove-schema.toml",
+        "[fields.status]\ntype = \"integer\"\n",
+    );
+    let (_, err, status) = run(kb.kb(), &["index", "--force"]);
+    assert!(
+        !status.success(),
+        "a malformed schema must fail --force too"
+    );
+    assert!(err.contains("groove-schema.toml"), "{err}");
+
+    let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+    let doc_count: i64 = conn
+        .query_row("SELECT count(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        doc_count, 3,
+        "a --force that fails on the schema must not have emptied the index"
+    );
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        declared_before,
+        "document_fields must survive the failed forced rebuild too"
+    );
+}
+
+// No MCP-tool variant: `tests/common/mcp.rs` has no helper for the `rebuild_index`
+// tool (only `mcp_search_call`), so this scenario is covered on the CLI path only.
+
+#[test]
 fn an_index_built_before_the_schema_gains_its_rows_without_re_embedding_or_a_frontmatter_failure() {
     let kb = corpus();
     // `groove.toml` config discovery never looks under `--kb-path` (see

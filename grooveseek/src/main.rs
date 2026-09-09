@@ -930,6 +930,11 @@ fn main() -> anyhow::Result<()> {
             }
             let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
             if force {
+                // (feature-58, codex P1 round 1 on PR #291) A malformed schema must fail
+                // before this reset empties the index, not after -- the same reasoning
+                // `load_declared_schema` in `indexer` carries. `rebuild_index` below loads it
+                // again; a second file read is cheap next to a reset that empties the index.
+                grooveseek::indexer::load_declared_schema(&kb_path)?;
                 db.reset_for_model(embedder.model_id(), dim)?;
             }
             eprintln!("Indexing {}...", kb_path.display());

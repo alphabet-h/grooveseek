@@ -534,16 +534,14 @@ impl Database {
     /// - `limit` 件埋まった
     /// - そのページが除外で 1 行も落としていない ([`VecPage::dropped_by_exclusion`] が 0 =
     ///   **filter をすべて通った行**を除外で落とした数が 0)
-    /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
+    /// - `fields` / `fields_not` が指定されていないときに限り、KNN が `fetch_k` に
+    ///   満たない行数を返した = corpus を読み切った
     /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
     ///
-    /// ただし 3 つ目は `fields` / `fields_not` が SQL 側の `WHERE` に入った今は
-    /// 「corpus を読み切った」と等値ではない。sqlite-vec が返した `fetch_k` 件を
-    /// `EXISTS` / `NOT EXISTS` が後段で落とすので、`fetch_k` 未満で返ることは
-    /// corpus の残りとは無関係に起きる。field filter と `-除外語` を併用した
-    /// クエリだけ、本当は再取得すれば埋まる場面で 1 周で打ち切りうる —
-    /// 結果が誤るわけではなく recall が落ちるだけ ([`Self::fetch_vec_page`] の
-    /// [`VecPage::rows_seen`] の注記も参照)。
+    /// 3 つ目に field filter の除外を付けたのは (codex P2 round 1 on PR #291)、
+    /// `fields` / `fields_not` が SQL 側の `WHERE` で落とした行は
+    /// [`VecPage::rows_seen`] に数えられないため、field filter があるときの
+    /// `fetch_k` 未満は corpus の残りと無関係に起きるからである。
     ///
     /// 2 つ目が「`excluded` が空」ではないのが要点 (round 2)。category / path / date /
     /// quality の filter で `limit` に届かないのは feature-26 以来の既存挙動で、ここで
@@ -593,11 +591,17 @@ impl Database {
         .min(VEC_KNN_MAX_K);
         let embedding_json = serde_json::to_string(query_embedding)?;
 
+        // (codex P2 round 1 on PR #291) A field predicate lives inside the KNN SQL's
+        // `WHERE`, so `rows_seen` only counts rows that survived it -- a page shorter
+        // than `fetch_k` no longer proves the corpus is exhausted when one is active.
+        let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
+            || filters.fields_not.is_some_and(|f| !f.is_empty());
+
         loop {
             let page = self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
             if page.hits.len() >= limit as usize
                 || page.dropped_by_exclusion == 0
-                || page.rows_seen < fetch_k as usize
+                || (!field_filtered && page.rows_seen < fetch_k as usize)
                 || fetch_k >= VEC_KNN_MAX_K
             {
                 return Ok(page.hits);
@@ -609,8 +613,10 @@ impl Database {
     /// KNN を 1 回だけ引き、行ごとの連言 (filter 群 → 除外) を通したものを返す。
     ///
     /// [`VecPage::rows_seen`] が `fetch_k` に満たなければ corpus を読み切ったということ
-    /// なので、呼び出し側はそこで再取得をやめる。[`VecPage::dropped_by_exclusion`] が 0 なら
-    /// 足りない原因は除外ではない (= filter) ので、やはりやめる。
+    /// なので、呼び出し側はそこで再取得をやめる — ただし field filter があるときは除く
+    /// (codex P2 round 1 on PR #291、理由は [`Database::search_vec_candidates_excluding`]
+    /// の doc を参照)。[`VecPage::dropped_by_exclusion`] が 0 なら足りない原因は除外では
+    /// ない (= filter) ので、やはりやめる。
     ///
     /// `limit` 件埋まった時点で読むのをやめるため、その場合はどちらの数も**途中まで**の
     /// 値になる。ただしそのときは呼び出し側の「埋まった」条件が先に成立するので、

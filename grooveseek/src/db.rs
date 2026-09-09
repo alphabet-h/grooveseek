@@ -5278,6 +5278,108 @@ mod tests {
         assert_eq!(paths_fts(&db, &f), vec!["b.md"]);
     }
 
+    /// (codex P2 round 1 on PR #291) A field predicate sits inside the KNN SQL's
+    /// `WHERE`, so `rows_seen` (`db/search.rs`'s private `VecPage`) only counts
+    /// rows that already passed it. Before the fix, a page shorter than
+    /// `fetch_k` was treated as "corpus exhausted" even when it was really the
+    /// field predicate, not the corpus, that shrank the page -- so the retry
+    /// loop stopped without ever reaching eligible rows sitting past the first
+    /// window.
+    ///
+    /// Corpus (60 chunks, closest to farthest from the query embedding):
+    /// - 25 "near" chunks: `status = active`, hold the word `banana`, all placed
+    ///   in `excluded` by chunk id (they are the field filter's honest matches,
+    ///   just not what this query wants back).
+    /// - 30 "noise" chunks next: no declared `status` at all, so the field
+    ///   predicate drops them in SQL -- this is what shrinks `rows_seen` below
+    ///   `fetch_k` on the first page without the corpus being exhausted (60
+    ///   chunks exist; the first page only asks for 50).
+    /// - 5 "far" chunks: `status = active`, hold the word `cherry`, past the
+    ///   first page entirely.
+    ///
+    /// With the bug, the first page returns `rows_seen = 25` (the 25 "near"
+    /// chunks; SQL already dropped the 25 "noise" chunks sharing that window)
+    /// and `dropped_by_exclusion = 25`, so `rows_seen < fetch_k` (25 < 50) stops
+    /// the loop with zero hits -- the 5 "far" chunks that satisfy the query, the
+    /// filter, and the exclusion are never reached. Fixed, the loop widens once
+    /// more, the second page covers the whole 60-chunk corpus, and the 5 "far"
+    /// chunks fill `limit`.
+    #[test]
+    fn a_field_filter_shortfall_still_widens_past_an_exclusion_heavy_window() {
+        let db = db_with_384();
+        let add = |path: &str, content: &str, e: f32, active: bool| -> i64 {
+            let doc = db
+                .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)
+                .unwrap();
+            if active {
+                db.replace_document_fields(path, &[("status".to_string(), "active".to_string())])
+                    .unwrap();
+            }
+            db.insert_chunk(doc, 0, None, None, content, None, &vec![e; 384], 1.0)
+                .unwrap()
+        };
+
+        let mut excluded = HashSet::new();
+        // Closest 25: status=active, hold "banana", excluded by chunk id.
+        for i in 0..25 {
+            let id = add(
+                &format!("near{i:02}.md"),
+                "banana body",
+                0.5 - (i as f32 + 1.0) * 0.001,
+                true,
+            );
+            excluded.insert(id);
+        }
+        // Next 30: no declared field at all -- the field predicate, not the
+        // exclusion set, is what drops these.
+        for i in 25..55 {
+            add(
+                &format!("noise{i:02}.md"),
+                "noise body",
+                0.5 - (i as f32 + 1.0) * 0.001,
+                false,
+            );
+        }
+        // Farthest 5: status=active, hold "cherry", past the first fetch_k window.
+        for i in 55..60 {
+            add(
+                &format!("far{i:02}.md"),
+                "cherry body",
+                0.5 - (i as f32 + 1.0) * 0.001,
+                true,
+            );
+        }
+
+        let active = field_map(&[("status", &["active"])]);
+        let filters = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 5, &filters, &excluded)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            5,
+            "the 5 eligible chunks sit past a window the field predicate and the \
+             exclusion both emptied; the loop must widen past it"
+        );
+        let paths: std::collections::BTreeSet<&str> =
+            hits.iter().map(|(_, r)| r.path.as_str()).collect();
+        assert!(
+            paths.iter().all(|p| p.starts_with("far")),
+            "only the far, non-excluded, status=active chunks should come back: {paths:?}"
+        );
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            2,
+            "the first window (25 excluded + 30 field-dropped) was not the whole \
+             corpus, so the KNN had to be widened once"
+        );
+    }
+
     #[test]
     fn field_filters_count_as_a_filter_for_over_fetch_and_normalise_one_way() {
         let m = field_map(&[("status", &["active"])]);
