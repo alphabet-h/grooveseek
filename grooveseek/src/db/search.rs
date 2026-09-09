@@ -45,6 +45,15 @@ use super::*;
 pub(super) const FILTER_OVERFETCH_FACTOR: u32 = 10;
 const FILTER_OVERFETCH_CAP: u32 = 10_000;
 
+/// The one sentence a `fields` / `fields_not` filter is refused with while the
+/// index has no recorded declared-field set (feature-58, codex P2 round 10 on
+/// PR #291; see [`Database::refuse_field_filters_while_pending`]). `pub` so the
+/// subprocess tests assert the CLI's stderr and the MCP tool's error envelope
+/// against the same text rather than two copies of it.
+pub const FIELD_FILTERS_PENDING: &str = "fields / fields_not cannot be applied: the index has \
+    no recorded declared-field set (a `groove index` run is in progress, was interrupted, or \
+    has not run since the index was created); let `groove index` complete and retry";
+
 /// The `AND …` text and the values to bind for the declared-field filters
 /// (feature-58), numbered from `first`. Both search legs append this to their
 /// `WHERE`; the FTS leg starts at `?6` and the vector leg at `?3`, because
@@ -438,12 +447,42 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<(CandidateHits, CandidateHits)> {
+        self.refuse_field_filters_while_pending(filters)?;
         let parsed = parse_query(query_text);
         let excluded = self.excluded_chunk_ids(parsed.negative_match().as_deref())?;
         let vec_hits =
             self.search_vec_candidates_excluding(query_embedding, candidates, filters, &excluded)?;
         let fts_hits = self.search_fts_candidates_parsed(&parsed, candidates, filters, fusion)?;
         Ok((vec_hits, fts_hits))
+    }
+
+    /// (feature-58, codex P2 round 10 on PR #291) A `fields` / `fields_not` filter
+    /// is refused while `index_meta.declared_fields` is **absent**.
+    ///
+    /// `rebuild_index` clears that key when a schema refresh starts and writes it
+    /// back only when the pass completed (`Database::clear_declared_fields`'s doc
+    /// has the state machine). In between -- a refresh in progress, or one that
+    /// was interrupted or stopped short on an unreadable document -- `document_fields`
+    /// can hold rows from **both** the old and the new declared set, so a predicate
+    /// that reads it would answer from a mixture and call it a result. The
+    /// watcher paths already treat that state as "do not touch the rows"
+    /// (`declared_fields_recorded` returning `None`); this is the same rule on the
+    /// read side.
+    ///
+    /// Here rather than in the CLI arm or the MCP tool body: every search that
+    /// can carry a field filter -- `groove search`, the MCP `search` tool, `eval`,
+    /// `tune` -- comes through [`Database::search_split_candidates`], so the
+    /// refusal has one home and the two front ends cannot drift (AGENTS.md "one
+    /// question gets one implementation"). An empty map is not a filter and is
+    /// not refused; `[]` (a completed pass that declared nothing) is a recorded
+    /// answer, and a filter against it simply matches nothing, as documented.
+    fn refuse_field_filters_while_pending(&self, filters: &SearchFilters<'_>) -> Result<()> {
+        let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
+            || filters.fields_not.is_some_and(|f| !f.is_empty());
+        if field_filtered && self.read_declared_fields()?.is_none() {
+            anyhow::bail!("{FIELD_FILTERS_PENDING}");
+        }
+        Ok(())
     }
 
     /// 負の式にマッチする chunk id。vector 半身から落とす集合 (F-4)。

@@ -22,8 +22,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   frontmatter key `groove-schema.toml` declares — the same key twice is OR,
   two keys are AND, and a document without the key survives an exclusion.
   `groove index` stores those values per document and rewrites them, without
-  re-embedding, when the declared set changes. `filter_applied` echoes both
-  as `key → list`. (#289)
+  re-embedding, when the declared set changes; while that rewrite is pending
+  (in progress, interrupted, or not yet run on an older index) a search
+  carrying either filter is refused rather than answered from mixed rows.
+  `filter_applied` echoes both as `key → list`. (#289)
 - **A schema can name any frontmatter key.** `[fields.<name>]` in
   `groove-schema.toml` accepts any name; an empty table declares the key
   without checking it, and the existing rules (`required` / `type` /

@@ -395,8 +395,10 @@ fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) ->
     parser_of(old_rel) != parser_of(new_rel)
 }
 
-/// After a same-byte rename [`rename_crosses_a_parser`] said crosses parsers, the caller forces
-/// a reparse under the destination parser (codex P2 round 5 on PR #291). When that reparse does
+/// After a rename [`rename_crosses_a_parser`] said crosses parsers, the caller reparses the
+/// file under the destination parser -- forced when the bytes did not change (codex P2 round 5
+/// on PR #291), or through the ordinary changed-content arm when they did (codex P2 round 10:
+/// [`rename_single_file`] settles both, not only the same-byte case). When that reparse does
 /// not end in [`SingleResult::Updated`] -- the new parser refuses the bytes
 /// ([`SingleResult::Refused`]), fails to parse them (a [`SingleResult::Skipped`] whose reason is
 /// "parse failed"), or finds nothing to chunk (a [`SingleResult::Skipped`] whose reason is
@@ -1808,10 +1810,16 @@ pub fn rename_single_file(
         context_mode,
         declared_fields.as_deref(),
     )?;
-    // (codex P2 round 9 on PR #291) Same-byte rename, crossed a parser: whatever this forced
-    // reparse came back with, settle it the same way `rebuild_index`'s rename loop does. See
-    // `settle_cross_parser_rename`'s doc.
-    if same_hash && crosses_a_parser {
+    // (codex P2 round 9 on PR #291) Crossed a parser: whatever the reparse came back with,
+    // settle it the same way `rebuild_index`'s rename loop does. See
+    // `settle_cross_parser_rename`'s doc. (codex P2 round 10) On `crosses_a_parser` alone,
+    // not `same_hash && crosses_a_parser`: a watcher rename whose bytes also changed goes
+    // through the `Incremental` arm above instead of `Force`, but when the destination
+    // parser then refuses or fails to parse those bytes the row under `new_rel` is still
+    // whatever the *old* parser wrote -- the same stale row the same-byte case left, reached
+    // by a different arm. `rebuild_index`'s loop has no such gap: `detect_renames` only pairs
+    // paths by equal hash, so every rename it settles is same-byte by construction.
+    if crosses_a_parser {
         settle_cross_parser_rename(db, new_rel, &single_result)?;
     }
     match single_result {

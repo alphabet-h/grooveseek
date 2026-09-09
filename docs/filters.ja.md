@@ -122,6 +122,12 @@ index はスキーマに従う: `groove index` は毎回 knowledge base root の
 Markdown 文書も全部読み直して、re-embedding なしで行を書き換える。この値を
 持つのは `.md` 文書だけ。
 
+その書き換えの最中 — あるいは中断された後、または旧版で作った index に対して
+`groove index` をまだ一度も回していないとき — index には宣言 key の集合が記録されて
+おらず、`fields` / `fields_not` を伴う検索は 1 つのエラーで拒まれる (コマンドラインでも
+tool の `error` でも同じ 1 文)。行が新旧どちらの宣言のものか判別できないため。
+どちらの filter も付けない検索には影響しない。`groove index` を完了させてから再試行する。
+
 コマンドラインでは同じ filter が `--field key=value` (繰り返し可; 同じ key
 2 回は OR、違う key は AND) と `--field-not key=value`。ペアは最初の `=` で
 分けるので、値に `=` やカンマを含められる。

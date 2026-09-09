@@ -198,3 +198,93 @@ fn test_off_mode_watcher_rename_keeps_fast_path() {
         "Off mode never stores context_text, got: {ctx_after:?}"
     );
 }
+
+/// (codex P2 round 10 on PR #291) A watcher rename that crosses a parser **and** changes the
+/// bytes -- here a Markdown document renamed to `.pdf` with its content edited, so the
+/// stored hash no longer matches -- goes through the changed-content arm of
+/// `rename_single_file` rather than the forced same-byte reparse round 9 settled. When the
+/// destination parser then refuses the bytes (the PDF parser cannot read Markdown), the row
+/// under the new path is still whatever the Markdown parser wrote: chunks, title,
+/// `document_fields`. Round 10 settles that arm too, so the row is dropped exactly as it is
+/// for the same-byte case
+/// (`tests/index_declared_fields.rs::a_cross_parser_rename_whose_destination_parser_refuses_the_bytes_drops_the_row`).
+///
+/// Same `#[ignore]` policy as the tests above: building the initial index loads the model.
+#[test]
+#[ignore = "requires embedding model download"]
+fn test_changed_bytes_cross_parser_rename_that_the_new_parser_refuses_drops_the_row() {
+    let layout = TempKbLayout::new("groove-watcher-rename-cross-parser");
+    layout.write("runbook.md", NO_TITLE_MD);
+    let db_path = layout.root().join(".groove.db");
+    let db = Database::open(db_path.to_str().expect("db path utf-8")).expect("open db");
+    db.verify_embedding_meta(
+        ModelChoice::BgeSmallEnV15.model_id(),
+        ModelChoice::BgeSmallEnV15.dimension() as u32,
+    )
+    .expect("verify_embedding_meta");
+    let mut embedder = Embedder::with_model(ModelChoice::BgeSmallEnV15).expect("load embedder");
+    // `.pdf` is not in `Registry::defaults()`; the rename has to land on a parser that is
+    // registered, or the crossing would be into "no parser at all" rather than into one
+    // that reads the bytes and refuses them.
+    let registry =
+        Registry::from_enabled(&["md".to_string(), "pdf".to_string()]).expect("md + pdf registry");
+    let schema = grooveseek::indexer::load_declared_schema(layout.kb()).unwrap();
+    indexer::rebuild_index(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        schema,
+        false,
+        None,
+        &[],
+        &registry,
+        ProgressReporter::new(ProgressMode::Quiet),
+        ContextMode::Off,
+    )
+    .expect("initial rebuild_index");
+    let _ = chunk_row_for_path(&db_path, "runbook.md");
+
+    // Rename across parsers *and* change the bytes, so the stored hash no longer matches
+    // and the same-byte forced-reparse arm is not the one taken.
+    std::fs::rename(
+        layout.kb().join("runbook.md"),
+        layout.kb().join("runbook.pdf"),
+    )
+    .expect("rename on disk");
+    std::fs::write(
+        layout.kb().join("runbook.pdf"),
+        format!("{NO_TITLE_MD}\nEdited after the rename, so the hash differs.\n"),
+    )
+    .expect("edit after rename");
+
+    let outcome = indexer::rename_single_file(
+        &db,
+        &mut embedder,
+        layout.kb(),
+        "runbook.md",
+        "runbook.pdf",
+        None,
+        &registry,
+    )
+    .expect("rename_single_file");
+    assert!(
+        !matches!(outcome, RenameOutcome::RenamedAndReindexed { .. }),
+        "the PDF parser cannot read Markdown bytes, so this must not report a reindex: {outcome:?}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");
+    for path in ["runbook.md", "runbook.pdf"] {
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "{path}: the destination parser refused the bytes, so the Markdown parser's \
+             stale row must be dropped, not kept under the new path"
+        );
+    }
+}

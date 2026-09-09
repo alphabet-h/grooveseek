@@ -21,6 +21,7 @@ mod storage;
 // outside this module as `grooveseek::db::parse_query`; `search.rs` reaches it
 // through `use super::*`.
 pub use fts_query::{ParsedQuery, parse_query};
+pub use search::FIELD_FILTERS_PENDING;
 // (feature-56) The indexer names this when it hands a code chunk's line range and definition
 // kind to the storage layer; every other caller uses the constructor that defaults it away.
 pub use storage::CodeMeta;
@@ -5230,6 +5231,72 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// (codex P2 round 10 on PR #291) The hybrid path -- the one every front end
+    /// takes -- refuses a `fields` / `fields_not` filter while
+    /// `index_meta.declared_fields` is absent, and only then: `[]` and a real
+    /// list are recorded answers, and a request without a field filter is not
+    /// gated at all. [`Database::refuse_field_filters_while_pending`]'s doc has
+    /// why the absent state cannot be answered from.
+    #[test]
+    fn a_field_filter_is_refused_until_the_index_records_its_declared_set() {
+        let db = db_with_declared_fields();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+        let active = field_map(&[("status", &["active"])]);
+        let with_filter = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        let hybrid = |f: &SearchFilters<'_>| {
+            db.search_hybrid(
+                "fieldfilter_unique_keyword",
+                &dummy_embedding(0.1),
+                10,
+                f,
+                FusionParams::default(),
+            )
+        };
+
+        let err = hybrid(&with_filter).unwrap_err();
+        assert_eq!(err.to_string(), FIELD_FILTERS_PENDING);
+        let not_filter = SearchFilters {
+            fields_not: Some(&active),
+            ..Default::default()
+        };
+        assert_eq!(
+            hybrid(&not_filter).unwrap_err().to_string(),
+            FIELD_FILTERS_PENDING,
+            "fields_not is gated the same way"
+        );
+
+        // No field filter: the pending state is not the search's concern.
+        assert_eq!(hybrid(&SearchFilters::default()).unwrap().len(), 3);
+        let empty = FieldFilters::new();
+        let empty_filter = SearchFilters {
+            fields: Some(&empty),
+            fields_not: Some(&empty),
+            ..Default::default()
+        };
+        assert_eq!(
+            hybrid(&empty_filter).unwrap().len(),
+            3,
+            "an empty map is not a filter and is not refused"
+        );
+
+        // `[]` is a completed answer ("declares nothing"), not the pending state:
+        // the call is not refused once the key is recorded. (The fixture wrote
+        // its rows by hand, so what the filter then returns is not asserted --
+        // a `[]` generation beside rows is a state `rebuild_index` never leaves.)
+        db.write_declared_fields("[]").unwrap();
+        assert!(hybrid(&with_filter).is_ok());
+        db.write_declared_fields(r#"["status","team"]"#).unwrap();
+        let paths: Vec<String> = hybrid(&with_filter)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(paths, vec!["a.md"]);
     }
 
     #[test]

@@ -122,6 +122,14 @@ knowledge base root on every run, and when the set of declared keys changes it
 reads every unchanged Markdown document once more and rewrites its rows without
 re-embedding. Only `.md` documents carry these values.
 
+While that rewrite is in progress — or after one was interrupted, or before
+`groove index` has run at all on an index created by an older version — the
+index has no recorded declared-field set, and a search carrying `fields` or
+`fields_not` is refused with one error (the same sentence on the command line
+and in the tool's `error`), because the rows could belong to both the old and
+the new declaration. A search without either filter is not affected. Let
+`groove index` complete and retry.
+
 On the command line the same filter is `--field key=value` (repeatable; the same
 key twice is OR, two keys are AND) and `--field-not key=value`. The pair is split
 at the first `=`, so a value may contain `=` or a comma.

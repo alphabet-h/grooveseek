@@ -1089,6 +1089,23 @@ fn main() -> anyhow::Result<()> {
             let parsed = grooveseek::db::parse_query(&query);
             parsed.require_positive()?;
 
+            // (codex P2 round 8 on PR #291) The raw, pre-dedup map is bounded first -- a
+            // repeated `--field status=x` past the per-list limit is refused by its raw count,
+            // not the count `normalize_field_filters`'s dedup would leave behind.
+            // (codex P2 round 10) Up here with the query check, **before `Database::open` and
+            // `Embedder::with_model` below**, for the same reason `Commands::Index` reads the
+            // schema before loading the model: these bounds need nothing but the arguments,
+            // and a request they refuse must not first open the DB and pay for a model load
+            // (BGE-M3 uncached: ~2.3 GB) it was never going to use.
+            let fields_raw = group_field_pairs(fields);
+            grooveseek::server::validate_raw_field_filters("fields", &fields_raw)?;
+            let fields_not_raw = group_field_pairs(fields_not);
+            grooveseek::server::validate_raw_field_filters("fields_not", &fields_not_raw)?;
+            let fields = grooveseek::db::normalize_field_filters(fields_raw);
+            let fields_not = grooveseek::db::normalize_field_filters(fields_not_raw);
+            grooveseek::server::validate_field_filters("fields", &fields)?;
+            grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
+
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
             // `--reranker` given here is a choice about this query; a model that
@@ -1127,18 +1144,8 @@ fn main() -> anyhow::Result<()> {
             // AU-17: `tags_*` は glob と違って compile を通らないので、ここで検査する。
             grooveseek::server::validate_filter_list("tags_any", &tags_any)?;
             grooveseek::server::validate_filter_list("tags_all", &tags_all)?;
-
-            // (codex P2 round 8 on PR #291) The raw, pre-dedup map is bounded first -- a
-            // repeated `--field status=x` past the per-list limit is refused by its raw count,
-            // not the count `normalize_field_filters`'s dedup would leave behind.
-            let fields_raw = group_field_pairs(fields);
-            grooveseek::server::validate_raw_field_filters("fields", &fields_raw)?;
-            let fields_not_raw = group_field_pairs(fields_not);
-            grooveseek::server::validate_raw_field_filters("fields_not", &fields_not_raw)?;
-            let fields = grooveseek::db::normalize_field_filters(fields_raw);
-            let fields_not = grooveseek::db::normalize_field_filters(fields_not_raw);
-            grooveseek::server::validate_field_filters("fields", &fields)?;
-            grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
+            // `--field` / `--field-not` were bounded and normalised above, before the DB
+            // was opened (codex P2 round 10 on PR #291).
 
             let filters = grooveseek::db::SearchFilters {
                 category: category.as_deref(),

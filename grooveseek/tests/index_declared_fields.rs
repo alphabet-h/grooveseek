@@ -873,3 +873,143 @@ fn the_mcp_search_tool_filters_on_declared_fields_and_echoes_them() {
         "fields.status has an empty value"
     );
 }
+
+/// Delete `index_meta.declared_fields` the way an interrupted refresh leaves it
+/// (`rebuild_index` clears the key when a refresh starts and writes it back only
+/// at the end of a completed pass), without touching the rows it protects.
+fn clear_declared_meta(kb: &Path) {
+    let conn = rusqlite::Connection::open(kb.parent().unwrap().join(".groove.db")).unwrap();
+    conn.execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])
+        .unwrap();
+}
+
+/// (codex P2 round 10 on PR #291) While the generation key is absent, `document_fields`
+/// may hold rows from both the old and the new declared set, so a search that filters on
+/// it is refused rather than answered from a mixture -- on the command line here and
+/// through the MCP tool below, with the one sentence
+/// [`grooveseek::db::FIELD_FILTERS_PENDING`] both front ends read off the shared database
+/// path. A search without the filter is untouched.
+#[test]
+fn the_command_line_refuses_a_field_filter_while_the_declared_set_is_pending() {
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert!(declared_meta(kb.kb()).is_some());
+
+    clear_declared_meta(kb.kb());
+    assert_eq!(declared_meta(kb.kb()), None);
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        pairs(&[
+            ("environment", "dev"),
+            ("environment", "prod"),
+            ("status", "active")
+        ]),
+        "the rows themselves are still there; only the generation key is gone"
+    );
+
+    for flag in ["--field", "--field-not"] {
+        let (out, err, status) = run(
+            kb.kb(),
+            &[
+                "search",
+                "restart script",
+                "--format",
+                "json",
+                flag,
+                "status=active",
+            ],
+        );
+        assert!(
+            !status.success(),
+            "{flag} must be refused while the declared set is pending; stdout: {out}"
+        );
+        assert!(
+            err.contains(grooveseek::db::FIELD_FILTERS_PENDING),
+            "stderr must carry the shared sentence, got: {err}"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "a refused search writes nothing to stdout, got: {out}"
+        );
+    }
+
+    // No field filter: the pending state is not this search's concern.
+    let (paths, _) = search_paths(kb.kb(), &[]);
+    assert_eq!(paths, vec!["active.md", "old.md", "plain.md"]);
+}
+
+#[test]
+fn the_mcp_search_tool_refuses_a_field_filter_while_the_declared_set_is_pending() {
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    clear_declared_meta(kb.kb());
+
+    let cfg_path = kb.root().join("groove.toml");
+    std::fs::write(&cfg_path, "[watch]\nenabled = false\n").unwrap();
+    let (_guard, base) = spawn_mcp_server(kb.kb(), &cfg_path);
+    let session = mcp_initialize(&base);
+    let query = "restart script for the gateway service";
+
+    for key in ["fields", "fields_not"] {
+        let v = mcp_search_call(
+            &base,
+            &session,
+            serde_json::json!({"query": query, "limit": 10, key: {"status": ["active"]}}),
+        );
+        let error = v["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} must be refused, got: {v}"));
+        assert!(
+            error.contains(grooveseek::db::FIELD_FILTERS_PENDING),
+            "the tool's error must carry the same sentence the CLI prints, got: {error}"
+        );
+        assert!(
+            v.get("filter_applied").is_none(),
+            "a refused search echoes no filter, got: {v}"
+        );
+    }
+
+    let v = mcp_search_call(
+        &base,
+        &session,
+        serde_json::json!({"query": query, "limit": 10}),
+    );
+    assert_eq!(
+        v["results"].as_array().map(Vec::len),
+        Some(3),
+        "without a field filter the search is untouched: {v}"
+    );
+}
+
+/// (codex P2 round 10 on PR #291) A `--field` list past the per-list bound is refused by the
+/// arguments alone, **before** the database is opened or the embedding model loaded: the
+/// knowledge base here has never been indexed, and after the refused call there must still
+/// be no `.groove.db` beside it. (The model load is not observable from outside; the database
+/// file is, and in `Commands::Search` the two sit together, the check now ahead of both.)
+#[test]
+fn a_field_list_past_the_bound_is_refused_before_the_database_is_opened() {
+    let kb = corpus();
+    let db_file = kb.root().join(".groove.db");
+    assert!(!db_file.exists(), "the corpus starts unindexed");
+
+    let too_many: Vec<String> = (0..=64).map(|i| format!("status=v{i}")).collect();
+    let mut args: Vec<&str> = vec!["search", "restart script"];
+    for v in &too_many {
+        args.push("--field");
+        args.push(v);
+    }
+    let (out, err, status) = run(kb.kb(), &args);
+    assert!(!status.success(), "stdout: {out}");
+    assert!(
+        err.contains("fields.status has too many entries"),
+        "the bound names the list it refused, got: {err}"
+    );
+    assert!(
+        !db_file.exists(),
+        "a request the arguments alone refuse must not open (and so create) the database"
+    );
+}
