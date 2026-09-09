@@ -339,6 +339,50 @@ fn declaring_another_key_adds_its_rows_and_undeclaring_removes_them() {
     assert_eq!(fields_of(kb.kb(), "old.md"), pairs(&[("team", "core")]));
 }
 
+#[test]
+fn an_interrupted_run_s_leftover_rows_are_cleared_when_the_schema_goes_away() {
+    // (codex P2 round 2 on PR #291) `refresh_fields`'s shortcut treated "no
+    // generation key" as "no rows" -- true for a fresh 1.8.0-shaped index, but
+    // not for a run that declared keys, wrote some documents' rows, and was
+    // interrupted before recording the generation key. Delete only the
+    // generation key here (not `document_fields`) to simulate that, then
+    // remove the schema so the target set becomes `[]`: the refresh pass must
+    // still run and clear the leftover rows, not just record `[]` over them.
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        pairs(&[
+            ("environment", "dev"),
+            ("environment", "prod"),
+            ("status", "active")
+        ])
+    );
+
+    {
+        let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+        conn.execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])
+            .unwrap();
+    }
+    std::fs::remove_file(kb.kb().join("groove-schema.toml")).unwrap();
+
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains(
+            "Recorded the declared frontmatter fields of 3 unchanged Markdown document(s)"
+        ),
+        "the refresh pass must run rather than short-circuit: {err}"
+    );
+    assert!(
+        fields_of(kb.kb(), "active.md").is_empty(),
+        "leftover rows from before the interruption must be cleared"
+    );
+    assert_eq!(declared_meta(kb.kb()).as_deref(), Some("[]"));
+}
+
 fn search_paths(kb: &Path, extra: &[&str]) -> (Vec<String>, serde_json::Value) {
     let mut args = vec![
         "search",

@@ -685,6 +685,24 @@ impl Database {
         Ok(rows)
     }
 
+    /// Whether `document_fields` holds no row at all, across every document.
+    ///
+    /// (codex P2 round 2 on PR #291) [`crate::indexer::rebuild_index`] uses this
+    /// to tell "an index that has never declared a field" from "an index whose
+    /// generation key was lost mid-run but whose per-document rows are still
+    /// there" -- an absent `index_meta.declared_fields` key alone cannot, since
+    /// [`Database::replace_document_fields`] writes those rows before
+    /// [`Database::write_declared_fields`] records the set that produced them.
+    pub fn document_fields_is_empty(&self) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT NOT EXISTS (SELECT 1 FROM document_fields)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Delete a document and all associated chunks / vectors / FTS rows.
     pub fn delete_document(&self, path: &str) -> Result<()> {
         // Delete vector entries first (no FK from virtual table)

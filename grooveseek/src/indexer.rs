@@ -589,9 +589,19 @@ pub fn rebuild_index(
     let declared_fields = declared_field_names(schema.as_ref());
     let declared_json = serde_json::to_string(&declared_fields)?;
     let stored_declared = db.read_declared_fields()?;
+    // (codex P2 round 2 on PR #291) "absent generation key + empty declared set" is safe to
+    // skip only when `document_fields` is actually empty, not merely assumed to be. A run that
+    // declared keys, wrote some documents' rows via `replace_document_fields`, and was
+    // interrupted before `write_declared_fields` recorded the set leaves both: no generation
+    // key stored AND leftover rows. If the schema is then removed (`declared_json ==
+    // DECLARED_FIELDS_NONE`), the shortcut must not fire -- it would record `[]` over rows the
+    // refresh pass exists to clear, and `--field` would keep matching keys the completed index
+    // no longer declares.
     let refresh_fields = !force
         && stored_declared.as_deref() != Some(declared_json.as_str())
-        && !(stored_declared.is_none() && declared_json == DECLARED_FIELDS_NONE);
+        && !(stored_declared.is_none()
+            && declared_json == DECLARED_FIELDS_NONE
+            && db.document_fields_is_empty()?);
     let refresh_any = refresh_frontmatter || refresh_fields;
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
@@ -1832,7 +1842,11 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 
 /// (feature-58) What `index_meta.declared_fields` holds when the schema declares
 /// no key beyond the five named ones, or there is no schema: the JSON of an
-/// empty list. Recorded without a refresh pass, since there is nothing to write.
+/// empty list. An absent generation key skips the refresh pass and is recorded
+/// as this value directly only when there is nothing to write **and** nothing
+/// left over from an earlier, interrupted run -- `document_fields` must be
+/// empty too (codex P2 round 2 on PR #291; see
+/// [`Database::document_fields_is_empty`]'s use in [`rebuild_index`]).
 pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
 
 /// The declared-field list the last completed [`rebuild_index`] recorded, read
