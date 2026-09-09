@@ -460,6 +460,23 @@ fn parse_confidence_ratio(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
+/// `--field` / `--field-not` take `key=value`, split at the **first** `=`, so a
+/// value may itself contain `=`, commas or spaces. A missing `=`, an empty key
+/// or an empty value is a usage error (exit 2) before any model is loaded:
+/// the MCP tool refuses the same inputs with its error envelope.
+fn parse_field_pair(s: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = s.split_once('=') else {
+        return Err(format!("expected key=value, got {s:?}"));
+    };
+    if key.is_empty() {
+        return Err("the key before '=' is empty".into());
+    }
+    if value.is_empty() {
+        return Err("the value after '=' is empty".into());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct SearchCliArgs {
     /// Search query text (positional)
@@ -516,6 +533,15 @@ pub(crate) struct SearchCliArgs {
     /// date filter 上限 (両端含む)
     #[arg(long = "date-to")]
     pub(crate) date_to: Option<String>,
+    /// 宣言 key の値で絞る (`--field status=active`)。**繰り返して**指定する。
+    /// 同じ key は OR、違う key は AND。最初の `=` で分けるので値に `=` や
+    /// カンマがあってもそのまま。MCP param: `fields`
+    #[arg(long = "field", value_name = "KEY=VALUE", value_parser = parse_field_pair)]
+    pub(crate) fields: Vec<(String, String)>,
+    /// 宣言 key の値を持つ文書を除外する (`--field-not status=deprecated`)。
+    /// key を持たない文書は残る。MCP param: `fields_not`
+    #[arg(long = "field-not", value_name = "KEY=VALUE", value_parser = parse_field_pair)]
+    pub(crate) fields_not: Vec<(String, String)>,
     /// rank-based low_confidence ratio (default: 1.5、0.0 で判定無効)
     #[arg(
         long = "min-confidence-ratio",
@@ -1009,6 +1035,8 @@ fn main() -> anyhow::Result<()> {
                 tags_all,
                 date_from,
                 date_to,
+                fields,
+                fields_not,
                 min_confidence_ratio,
                 // MMR / parent-retriever flags are wired through `overrides` above.
                 mmr: _,
@@ -1070,6 +1098,15 @@ fn main() -> anyhow::Result<()> {
             grooveseek::server::validate_filter_list("tags_any", &tags_any)?;
             grooveseek::server::validate_filter_list("tags_all", &tags_all)?;
 
+            let fields = grooveseek::db::normalize_field_filters(
+                fields.into_iter().map(|(k, v)| (k, vec![v])),
+            );
+            let fields_not = grooveseek::db::normalize_field_filters(
+                fields_not.into_iter().map(|(k, v)| (k, vec![v])),
+            );
+            grooveseek::server::validate_field_filters("fields", &fields)?;
+            grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
+
             let filters = grooveseek::db::SearchFilters {
                 category: category.as_deref(),
                 topic: topic.as_deref(),
@@ -1079,10 +1116,8 @@ fn main() -> anyhow::Result<()> {
                 tags_all: &tags_all,
                 date_from: date_from.as_deref(),
                 date_to: date_to.as_deref(),
-                // fields / fields_not (feature-58): not yet wired to a CLI
-                // flag, so this call site defaults to "no filter" like every
-                // other unset field here. A later task wires the surface.
-                ..Default::default()
+                fields: Some(&fields),
+                fields_not: Some(&fields_not),
             };
 
             // Both CLI and MCP go through the shared MMR-aware pipeline so the
@@ -1148,6 +1183,8 @@ fn main() -> anyhow::Result<()> {
                 topic.as_deref(),
                 min_confidence_ratio,
                 parsed.exclude(),
+                &fields,
+                &fields_not,
                 format,
             );
         }
@@ -1933,6 +1970,8 @@ fn print_search_results(
     topic: Option<&str>,
     explicit_ratio: Option<f32>,
     excluded_terms: &[String],
+    fields: &grooveseek::db::FieldFilters,
+    fields_not: &grooveseek::db::FieldFilters,
     format: SearchFormat,
 ) {
     let scores: Vec<f32> = hits.iter().map(|h| h.score).collect();
@@ -1964,11 +2003,8 @@ fn print_search_results(
                     date_to.map(str::to_owned),
                     explicit_ratio,
                     excluded_terms.to_vec(),
-                    // feature-58: the CLI has no `--field` / `--field-not` flag
-                    // yet, so this call site always echoes "no filter" — the
-                    // same state every other unset filter here starts from.
-                    grooveseek::db::FieldFilters::new(),
-                    grooveseek::db::FieldFilters::new(),
+                    fields.clone(),
+                    fields_not.clone(),
                 ),
             };
             println!(
@@ -2022,6 +2058,62 @@ fn print_search_results(
     }
 }
 
+#[cfg(test)]
+mod field_flag {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_field_pair_splits_at_the_first_equals_and_keeps_the_rest_verbatim() {
+        assert_eq!(
+            parse_field_pair("status=active").unwrap(),
+            ("status".into(), "active".into())
+        );
+        assert_eq!(
+            parse_field_pair("url=a=b,c d").unwrap(),
+            ("url".into(), "a=b,c d".into())
+        );
+        assert!(parse_field_pair("status").is_err());
+        assert!(parse_field_pair("=active").is_err());
+        assert!(parse_field_pair("status=").is_err());
+    }
+
+    #[test]
+    fn groove_search_refuses_a_field_without_a_value_as_a_usage_error() {
+        // `Cli` does not derive `Debug` (nor do several types it is built
+        // from), so `.unwrap_err()` cannot be used here -- it requires the
+        // `Ok` side to implement `Debug` for the panic message. A match
+        // extracts the error without that bound.
+        let err = match Cli::try_parse_from(["groove", "search", "q", "--field", "status"]) {
+            Ok(_) => panic!("--field status (no value) must be a usage error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let ok = Cli::try_parse_from([
+            "groove",
+            "search",
+            "q",
+            "--field",
+            "status=active",
+            "--field",
+            "team=core",
+            "--field-not",
+            "status=deprecated",
+        ])
+        .unwrap();
+        match ok.command {
+            Commands::Search(a) => {
+                assert_eq!(a.fields.len(), 2);
+                assert_eq!(
+                    a.fields_not,
+                    vec![("status".to_string(), "deprecated".to_string())]
+                );
+            }
+            _ => panic!("not a search"),
+        }
+    }
+}
+
 /// The command line and the MCP tools are two namespaces that
 /// [`docs/stability.md`] freezes separately, and the promise made there is that
 /// where both expose the same concept they use the same noun. Nothing enforces
@@ -2052,6 +2144,8 @@ mod naming_surface {
         ("category", "category"),
         ("date_from", "date-from"),
         ("date_to", "date-to"),
+        ("fields", "field"),
+        ("fields_not", "field-not"),
         ("include_low_quality", "include-low-quality"),
         ("limit", "limit"),
         ("min_confidence_ratio", "min-confidence-ratio"),
@@ -2214,6 +2308,8 @@ mod naming_surface {
         ("search", "path-glob", Multiplicity::Repeatable),
         ("search", "tag-any", Multiplicity::CommaList),
         ("search", "tag-all", Multiplicity::CommaList),
+        ("search", "field", Multiplicity::Repeatable),
+        ("search", "field-not", Multiplicity::Repeatable),
         ("graph", "exclude-paths", Multiplicity::CommaList),
     ];
 
@@ -3106,6 +3202,8 @@ mod tests {
             tags_all: Vec::new(),
             date_from: None,
             date_to: None,
+            fields: Vec::new(),
+            fields_not: Vec::new(),
             min_confidence_ratio: None,
             mmr: None,
             mmr_lambda: None,
