@@ -6,9 +6,45 @@ the crates ship it, followed by the crates that carry it. This file is
 generated from `Cargo.lock` by cargo-about (`about.toml`, `about.hbs`); edit
 those, not this file.
 
-Not crates, and therefore not listed by the generator: the ONNX Runtime library
-that `ort-sys` links statically (MIT, Microsoft Corporation) and SQLite, linked
-statically through `libsqlite3-sys` (public domain).
+Two components are not crates and are therefore not seen by the generator.
+They are linked statically into `groove` all the same, so their notices are
+written into this template by hand:
+
+- **ONNX Runtime** (Microsoft Corporation, MIT), the inference library that
+  `ort-sys` downloads as a prebuilt binary and links. Its notice is the first
+  section below, before the generated ones.
+- **SQLite**, linked through `libsqlite3-sys`. SQLite is in the public domain
+  and carries no notice to reproduce.
+
+## ONNX Runtime
+
+Used by:
+
+- ort-sys (prebuilt ONNX Runtime binary, https://github.com/microsoft/onnxruntime)
+
+```text
+MIT License
+
+Copyright (c) Microsoft Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ## Summary
 
