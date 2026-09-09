@@ -395,6 +395,27 @@ fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) ->
     parser_of(old_rel) != parser_of(new_rel)
 }
 
+/// After a same-byte rename [`rename_crosses_a_parser`] said crosses parsers, the caller forces
+/// a reparse under the destination parser (codex P2 round 5 on PR #291). When that reparse does
+/// not end in [`SingleResult::Updated`] -- the new parser refuses the bytes
+/// ([`SingleResult::Refused`]), fails to parse them (a [`SingleResult::Skipped`] whose reason is
+/// "parse failed"), or finds nothing to chunk (a [`SingleResult::Skipped`] whose reason is
+/// [`SKIPPED_NO_CHUNKS`]) -- the document row at `rel` is still whatever the *old* parser last
+/// wrote there: chunks, metadata, `document_fields`, none of which the new path's parser stands
+/// behind (codex P2 round 9 on PR #291, a regression the round 5 fix introduced: it forces the
+/// reparse but never checked what the reparse came back with). Delete the row so it matches
+/// what a fresh file the new parser cannot read already gets: nothing.
+///
+/// Shared by [`rebuild_index`]'s rename loop and [`rename_single_file`], the only two callers
+/// of [`rename_crosses_a_parser`], so the decision has one home (AGENTS.md "one question gets
+/// one implementation") rather than being reimplemented at each call site.
+fn settle_cross_parser_rename(db: &Database, rel: &str, outcome: &SingleResult) -> Result<()> {
+    if !matches!(outcome, SingleResult::Updated { .. }) {
+        db.delete_document(rel)?;
+    }
+    Ok(())
+}
+
 /// この document path を現在の registry で開けるか。
 ///
 /// 「どの行を提供できるか」と「どの行が registry から外れたか」(AU-06) を
@@ -712,6 +733,13 @@ pub fn rebuild_index(
     // `rename_crosses_a_parser` は watcher 側の `rename_single_file` とも共有する
     // 1 つの判定 (AGENTS "one question gets one implementation")。
     let mut renamed_new_paths: HashSet<String> = HashSet::new();
+    // (codex P2 round 9 on PR #291) A narrower set than `renamed_new_paths`: only the renames
+    // that actually crossed a parser, not every rename Static mode also forces a reparse for.
+    // `settle_cross_parser_rename` below must fire only for the former -- a same-parser rename
+    // forced by Static mode that happens to end in `Skipped` (e.g. the content shrank to
+    // nothing) is a pre-existing edit-time gap this round does not touch, not a stale
+    // cross-parser row.
+    let mut crossed_parser_renames: HashSet<String> = HashSet::new();
     let renamed: u32 = if force {
         0
     } else {
@@ -722,10 +750,12 @@ pub fn rebuild_index(
         db.rename_documents_atomic(&pairs)?;
         for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
-            if context_mode == ContextMode::Static
-                || rename_crosses_a_parser(registry, old_path, new_path)
-            {
+            let crossed = rename_crosses_a_parser(registry, old_path, new_path);
+            if context_mode == ContextMode::Static || crossed {
                 renamed_new_paths.insert(new_path.clone());
+            }
+            if crossed {
+                crossed_parser_renames.insert(new_path.clone());
             }
         }
         pairs.len() as u32
@@ -804,7 +834,7 @@ pub fn rebuild_index(
             }
         };
 
-        match index_single_disk_entry(
+        let single_result = index_single_disk_entry(
             db,
             embedder,
             entry,
@@ -812,8 +842,16 @@ pub fn rebuild_index(
             registry,
             mode,
             context_mode,
-            &declared_fields,
-        )? {
+            Some(&declared_fields),
+        )?;
+        // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
+        // as: if this was a forced reparse across a parser boundary and it did not end in
+        // `Updated`, the row is stale under the new path and must go. See
+        // `settle_cross_parser_rename`'s doc for why.
+        if crossed_parser_renames.contains(&entry.rel) {
+            settle_cross_parser_rename(db, &entry.rel, &single_result)?;
+        }
+        match single_result {
             SingleResult::Updated {
                 chunks,
                 frontmatter_unparsed: fm_unparsed,
@@ -1026,6 +1064,19 @@ enum Reindex {
 /// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
 /// 同時呼び出し不可)。呼び出し側で Mutex 経由の相互排他を保証すること。
+///
+/// `declared_fields` is one of three states (codex P2 round 9 on PR #291; see
+/// [`declared_fields_recorded`]'s doc for the caller that reads them off `index_meta`): `None`
+/// means *pending* -- the caller does not yet know what the schema currently declares, because
+/// a [`rebuild_index`] refresh has cleared the generation key and not yet rewritten it, or has
+/// not run at all -- and every `document_fields` write below is skipped, leaving whatever the
+/// last completed pass wrote untouched until it (or the next one) completes and calls again
+/// with a real answer. `Some(&[])` means the schema (or its absence) declares nothing, and
+/// `Some(list)` means it declares exactly that list; both are answers, not guesses, and are
+/// written as always -- an empty list still replaces stale rows from an undeclared key. Callers:
+/// [`rebuild_index`] always knows (it just read the schema) and passes `Some(&declared_fields)`;
+/// the watcher paths ([`reindex_single_file`], [`rename_single_file`]) pass whatever
+/// [`declared_fields_recorded`] read, `None` included.
 #[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
     db: &Database,
@@ -1035,7 +1086,7 @@ fn index_single_disk_entry(
     registry: &Registry,
     mode: Reindex,
     context_mode: ContextMode,
-    declared_fields: &[String],
+    declared_fields: Option<&[String]>,
 ) -> Result<SingleResult> {
     let force = mode == Reindex::Force;
     let (refresh_frontmatter, refresh_fields) = match mode {
@@ -1193,10 +1244,13 @@ fn index_single_disk_entry(
                 size_bytes,
             )?;
         }
-        if refresh_fields {
+        // (codex P2 round 9 on PR #291) `declared_fields: None` means the caller does not yet
+        // know the current set (see this fn's doc) -- leave the row as the last completed pass
+        // left it rather than write nothing where something declared may already exist.
+        if refresh_fields && let Some(declared) = declared_fields {
             db.replace_document_fields(
                 &entry.rel,
-                &declared_field_rows(&parsed.frontmatter.extra, declared_fields),
+                &declared_field_rows(&parsed.frontmatter.extra, declared),
             )?;
         }
         tx.commit()?;
@@ -1272,10 +1326,15 @@ fn index_single_disk_entry(
             size_bytes,
         )?;
         if updated {
-            db.replace_document_fields(
-                &entry.rel,
-                &declared_field_rows(&parsed.frontmatter.extra, declared_fields),
-            )?;
+            // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the
+            // frontmatter-only path above: a `None` here must not overwrite a document's rows
+            // with an empty set just because the caller does not yet know the real one.
+            if let Some(declared) = declared_fields {
+                db.replace_document_fields(
+                    &entry.rel,
+                    &declared_field_rows(&parsed.frontmatter.extra, declared),
+                )?;
+            }
             // (feature-56) The chunk texts match, so the embeddings still stand — but the
             // *positions* may not. Inserting a blank line above a function, or trimming a
             // comment short enough to be dropped as a thin gap, moves every definition below
@@ -1335,10 +1394,16 @@ fn index_single_disk_entry(
         topic.as_deref(),
         category.as_deref(),
     )?;
-    db.replace_document_fields(
-        &entry.rel,
-        &declared_field_rows(&parsed.frontmatter.extra, declared_fields),
-    )?;
+    // (codex P2 round 9 on PR #291) Same "pending means leave it" rule as the two paths above:
+    // a `None` here writes nothing, so a freshly written or newly changed document simply has
+    // no `document_fields` rows until a completed [`rebuild_index`] pass gives a real answer --
+    // preferable to a wrong one guessed as empty.
+    if let Some(declared) = declared_fields {
+        db.replace_document_fields(
+            &entry.rel,
+            &declared_field_rows(&parsed.frontmatter.extra, declared),
+        )?;
+    }
     tx.commit()?;
 
     Ok(SingleResult::Updated {
@@ -1526,7 +1591,10 @@ pub fn reindex_single_file(
     // watcher は config-desired を持たないので DB 側モードに従う (E-11)。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
-    // recorded; they do not read the schema themselves.
+    // recorded; they do not read the schema themselves. (codex P2 round 9 on PR #291)
+    // `None` here means a refresh has the generation key cleared right now -- see
+    // [`declared_fields_recorded`]'s doc -- and `index_single_disk_entry` leaves
+    // `document_fields` untouched rather than reading it as "declares nothing".
     let declared_fields = declared_fields_recorded(db)?;
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     index_single_disk_entry(
@@ -1540,7 +1608,7 @@ pub fn reindex_single_file(
             refresh_fields: false,
         },
         context_mode,
-        &declared_fields,
+        declared_fields.as_deref(),
     )
 }
 
@@ -1699,10 +1767,8 @@ pub fn rename_single_file(
     // 更新されないまま残ってしまうため。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     let same_hash = new_hash == old_hash;
-    if same_hash
-        && context_mode != ContextMode::Static
-        && !rename_crosses_a_parser(registry, old_rel, new_rel)
-    {
+    let crosses_a_parser = rename_crosses_a_parser(registry, old_rel, new_rel);
+    if same_hash && context_mode != ContextMode::Static && !crosses_a_parser {
         return Ok(RenameOutcome::Renamed);
     }
 
@@ -1717,12 +1783,15 @@ pub fn rename_single_file(
         size: new_bytes.len() as u64,
     };
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
-    // recorded; they do not read the schema themselves.
+    // recorded; they do not read the schema themselves. (codex P2 round 9 on PR #291)
+    // `None` here means a refresh has the generation key cleared right now -- see
+    // [`declared_fields_recorded`]'s doc -- and `index_single_disk_entry` leaves
+    // `document_fields` untouched rather than reading it as "declares nothing".
     let declared_fields = declared_fields_recorded(db)?;
     // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
     // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
     // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
-    match index_single_disk_entry(
+    let single_result = index_single_disk_entry(
         db,
         embedder,
         &entry,
@@ -1737,8 +1806,15 @@ pub fn rename_single_file(
             }
         },
         context_mode,
-        &declared_fields,
-    )? {
+        declared_fields.as_deref(),
+    )?;
+    // (codex P2 round 9 on PR #291) Same-byte rename, crossed a parser: whatever this forced
+    // reparse came back with, settle it the same way `rebuild_index`'s rename loop does. See
+    // `settle_cross_parser_rename`'s doc.
+    if same_hash && crosses_a_parser {
+        settle_cross_parser_rename(db, new_rel, &single_result)?;
+    }
+    match single_result {
         SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
         // (codex P2 round 1 on PR #157) `index_single_disk_entry` reads the file
         // a **second** time, and the whole premise of this guard is that a path
@@ -1924,14 +2000,28 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
 
 /// The declared-field list the last completed [`rebuild_index`] recorded, read
-/// back via [`Database::read_declared_fields`] and parsed out of its JSON.
-/// `None` (no generation key stored yet) becomes an empty list, matching
-/// [`declared_field_names`]`(None)`.
-fn declared_fields_recorded(db: &Database) -> Result<Vec<String>> {
+/// back via [`Database::read_declared_fields`] and parsed out of its JSON --
+/// for the watcher paths ([`reindex_single_file`], [`rename_single_file`]),
+/// which do not derive their own list from a schema the way [`rebuild_index`]
+/// does.
+///
+/// Three states, not two (codex P2 round 9 on PR #291): the generation key can be **absent**
+/// (a refresh is in progress -- see [`Database::clear_declared_fields`]'s doc for when
+/// [`rebuild_index`] clears it at the *start* of a pass -- or a run ended before writing it),
+/// hold **`[]`** (the schema declares nothing, or there is no schema), or hold a **non-empty
+/// list**. Only the first is genuinely unknown: `[]` is a completed answer meaning "no declared
+/// keys", exactly like an empty list from a schema with none. Returning `None` for "absent" and
+/// `Some(vec![])` for "declared nothing" is what lets [`index_single_disk_entry`]'s
+/// `declared_fields` parameter tell "I do not know yet" from "there is nothing to write" --
+/// before this fix, an absent key collapsed to an empty list here, and a watcher event that
+/// landed while a refresh was clearing and rewriting the key would wipe a document's valid
+/// `document_fields` rows down to nothing.
+fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
     match db.read_declared_fields()? {
         Some(json) => serde_json::from_str(&json)
+            .map(Some)
             .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}")),
-        None => Ok(Vec::new()),
+        None => Ok(None),
     }
 }
 
@@ -1956,6 +2046,12 @@ fn declared_fields_recorded(db: &Database) -> Result<Vec<String>> {
 /// what happens to be closed after (codex P1 round 1); the reverse ordering is not something an
 /// in-process test can force, since it requires a second process editing the file between two
 /// reads this process makes microseconds apart.
+///
+/// (codex P2 round 9 on PR #291) The CLI's `Commands::Index` arm also calls this ahead of
+/// [`Embedder::with_model`], not only ahead of the resets: a malformed schema is refused before a
+/// run that is already doomed pays for a model download or load (BGE-M3: ~2.3 GB) it was never
+/// going to use, the same "cheap checks first" reasoning `main.rs` already applies to
+/// `[parsers].enabled` validation.
 pub fn load_declared_schema(kb_path: &Path) -> Result<Option<crate::schema::Schema>> {
     crate::schema::Schema::load_optional(&kb_path.join("groove-schema.toml"))
 }
@@ -2288,6 +2384,66 @@ mod tests {
         assert!(
             !rename_crosses_a_parser(&reg, "note.xyz", "other.xyz"),
             "two unregistered extensions do not cross -- neither side has a parser to lose"
+        );
+    }
+
+    /// (codex P2 round 9 on PR #291) [`settle_cross_parser_rename`] is the decision, not the
+    /// I/O -- it needs only a [`Database`] and a [`SingleResult`], no embedder, so this pins the
+    /// decision directly rather than through a full rename E2E (see
+    /// `tests/index_declared_fields.rs` for the subprocess-level coverage of the bug this
+    /// closes: a cross-parser rename whose destination parser refuses the bytes used to leave
+    /// the old parser's row behind).
+    #[test]
+    fn settle_cross_parser_rename_deletes_the_row_unless_the_reparse_updated_it() {
+        let db = Database::open_in_memory().unwrap();
+        // `delete_document` also deletes from `vec_chunks`, a table `open_in_memory` alone does
+        // not create -- it exists at a fixed dimension, set up the same way a real run's
+        // `verify_embedding_meta` call would (`db_with_384` in `db.rs`'s own tests does the
+        // same for the same reason).
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        assert_eq!(db.document_count().unwrap(), 1);
+
+        settle_cross_parser_rename(
+            &db,
+            "note.md",
+            &SingleResult::Skipped {
+                reason: "parse failed",
+                frontmatter_unparsed: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.document_count().unwrap(),
+            0,
+            "Skipped is not Updated, so the stale row must be dropped"
+        );
+
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        settle_cross_parser_rename(&db, "note.md", &SingleResult::Refused).unwrap();
+        assert_eq!(
+            db.document_count().unwrap(),
+            0,
+            "Refused is not Updated either"
+        );
+
+        db.upsert_document("note.md", None, None, None, None, &[], None, "h1", 10)
+            .unwrap();
+        settle_cross_parser_rename(
+            &db,
+            "note.md",
+            &SingleResult::Updated {
+                chunks: 1,
+                frontmatter_unparsed: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.document_count().unwrap(),
+            1,
+            "Updated means the new parser wrote a fresh row -- it must be left alone"
         );
     }
 
@@ -3170,6 +3326,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // feature-58: declared fields, generation key (DB-backed)
+    // -----------------------------------------------------------------------
+
+    /// (codex P2 round 9 on PR #291) The three states [`declared_fields_recorded`]'s doc
+    /// describes, pinned directly against [`Database::open_in_memory`] -- no embedder needed,
+    /// unlike a test through [`index_single_disk_entry`] or its watcher callers (see this
+    /// round's final-review.md entry for why no such test was added: constructing an
+    /// [`Embedder`] always touches the model cache/download, so every existing test that goes
+    /// through [`index_single_disk_entry`] is `#[ignore]`d, and this fn alone -- the only *new*
+    /// production code this round adds -- has no such cost).
+    #[test]
+    fn declared_fields_recorded_tells_absent_from_declared_nothing_from_a_list() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            None,
+            "no generation key written yet: pending, not an empty answer"
+        );
+
+        db.write_declared_fields("[]").unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            Some(Vec::new()),
+            "`[]` is a completed answer: the schema declares nothing"
+        );
+
+        db.write_declared_fields(r#"["environment","status"]"#)
+            .unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            Some(vec!["environment".to_string(), "status".to_string()])
+        );
+
+        db.clear_declared_fields().unwrap();
+        assert_eq!(
+            declared_fields_recorded(&db).unwrap(),
+            None,
+            "clearing the key (what a refresh does at its start) must read back as pending again, \
+             not as the list that was there a moment ago"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // feature-58: declared fields (pure fn)
     // -----------------------------------------------------------------------
 
@@ -3473,7 +3672,7 @@ mod tests {
                 refresh_fields: false,
             },
             ContextMode::Off,
-            &[],
+            Some(&[]),
         )
         .unwrap();
         assert_eq!(
@@ -3516,7 +3715,7 @@ mod tests {
                 refresh_fields: false,
             },
             ContextMode::Off,
-            &[],
+            Some(&[]),
         )
         .unwrap();
         assert_eq!(

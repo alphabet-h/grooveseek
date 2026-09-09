@@ -916,6 +916,13 @@ fn main() -> anyhow::Result<()> {
             // `.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当だった設定の
             // まま upgrade した人がこの経路に入る。
             let registry = cfg.build_parser_registry(&kb_path)?;
+            // (feature-58, codex P2 round 9 on PR #291) Read next to `[parsers].enabled`
+            // above, not after `Embedder::with_model` below: this needs only `kb_path`, the
+            // same as the registry check, and a malformed schema is refused before a run that
+            // is already doomed pays for a model download it was never going to use (see
+            // `load_declared_schema`'s doc for the full "cheap checks first" ordering this
+            // extends -- the resets it was already ahead of are further down still).
+            let schema = grooveseek::indexer::load_declared_schema(&kb_path)?;
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             let db_path_str = db_path.to_string_lossy();
@@ -945,12 +952,12 @@ fn main() -> anyhow::Result<()> {
                 db.verify_embedding_meta(model.model_id(), dim)?;
             }
             let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
-            // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) Read the schema once, here,
-            // before any reset -- a malformed schema must fail before `--force` empties the
-            // index, not after. `rebuild_index` no longer reads the file itself (round 3): this
-            // snapshot is what it gets, so the file is read exactly once per run rather than
-            // once here and once more inside it.
-            let schema = grooveseek::indexer::load_declared_schema(&kb_path)?;
+            // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) `schema` was already read
+            // above, before any reset -- a malformed schema must fail before `--force` empties
+            // the index, not after. `rebuild_index` no longer reads the file itself (round 3):
+            // that snapshot is what it gets, so the file is read exactly once per run rather
+            // than once above and once more inside it. (codex P2 round 9) Moved above this
+            // `Embedder::with_model` call too -- see `load_declared_schema`'s doc.
             if force {
                 db.reset_for_model(embedder.model_id(), dim)?;
             }

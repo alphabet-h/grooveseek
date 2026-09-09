@@ -530,6 +530,68 @@ fn a_same_bytes_rename_from_md_to_txt_drops_its_declared_rows() {
     );
 }
 
+/// (codex P2 round 9 on PR #291) A same-byte rename across parsers forces a reparse under the
+/// destination parser (round 5's fix, the two tests above). Before this round, that reparse's
+/// *outcome* was never checked: if the destination parser refuses the bytes -- here, the .pdf
+/// parser cannot extract Markdown text as a PDF -- the reparse ends in a
+/// [`grooveseek::indexer::SingleResult::Skipped`], not a
+/// [`grooveseek::indexer::SingleResult::Updated`], and the document row was left exactly as the
+/// .md parser wrote it, now sitting under a `.pdf` path with its declared-field rows still
+/// attached. The fix drops the row instead: the same "nothing indexed" state a `.pdf` that was
+/// never readable would have.
+#[test]
+fn a_cross_parser_rename_whose_destination_parser_refuses_the_bytes_drops_the_row() {
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, "[parsers]\nenabled = [\"md\", \"pdf\"]\n").unwrap();
+    let (_, err, status) = run_with_config(kb.kb(), Some(&cfg), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        pairs(&[
+            ("environment", "dev"),
+            ("environment", "prod"),
+            ("status", "active")
+        ]),
+        "active.md must carry its declared fields before the rename: {err}"
+    );
+
+    std::fs::rename(kb.kb().join("active.md"), kb.kb().join("active.pdf")).unwrap();
+    let (_, err, status) = run_with_config(kb.kb(), Some(&cfg), &["index"]);
+    assert!(status.success(), "{err}");
+
+    assert!(
+        fields_of(kb.kb(), "active.pdf").is_empty(),
+        "the .pdf parser refused the Markdown bytes, so no declared-field rows must survive \
+         under the new path: {err}"
+    );
+    let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+    let old_rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents WHERE path = 'active.md'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_rows, 0,
+        "the active.md row must be gone after the rename"
+    );
+    let new_rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents WHERE path = 'active.pdf'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        new_rows, 0,
+        "the .pdf parser refused the bytes, so the row must be dropped rather than keep the \
+         .md parser's stale chunks under the new path: {err}"
+    );
+}
+
 #[test]
 fn an_orphan_restored_after_an_interrupted_pass_is_refreshed() {
     // (codex P2 round 6 on PR #291) The two generation writes
@@ -591,6 +653,74 @@ fn an_orphan_restored_after_an_interrupted_pass_is_refreshed() {
     assert_eq!(
         declared_meta(kb.kb()).as_deref(),
         Some("[\"status\",\"team\"]")
+    );
+}
+
+/// (codex P2 round 9 on PR #291) The actual regression this round fixes lives in the watcher
+/// paths ([`grooveseek::indexer::reindex_single_file`] /
+/// [`grooveseek::indexer::rename_single_file`]): an event that lands while
+/// [`grooveseek::indexer::rebuild_index`]
+/// has the generation key cleared (mid-refresh -- [`grooveseek::db::Database::clear_declared_fields`]
+/// runs at the *start* of a pass, round 3) used to read that absence as "the schema declares
+/// nothing" and wipe a document's `document_fields` rows to empty. This subprocess suite has no
+/// cheap way to drive that watcher path: `groove serve --watch` needs the real embedding model
+/// and platform file-watching support, which is why `tests/watcher_e2e.rs`'s own coverage of it
+/// is `#[ignore]`d. `grooveseek/src/indexer.rs` instead carries two unit tests, private to that
+/// module and so not linkable from here, that pin the fix directly and cheaply (no embedder
+/// needed): `declared_fields_recorded_tells_absent_from_declared_nothing_from_a_list` (the
+/// three states an absent/`[]`/populated generation key reads back as) and
+/// `settle_cross_parser_rename_deletes_the_row_unless_the_reparse_updated_it` (a different fix
+/// in this same round, unrelated to this one).
+///
+/// What follows instead pins the property [`grooveseek::indexer::rebuild_index`] itself must
+/// keep holding: a pass that ends without completing the refresh (generation key left absent)
+/// must not have disturbed the rows of documents it *did* finish refreshing. Honesty about what
+/// this does and does not discriminate: [`grooveseek::indexer::rebuild_index`]'s own per-entry writes always pass a
+/// concrete, schema-derived list (`Some(&declared_fields)`, never `None`) to the private
+/// `index_single_disk_entry`, so this specific code path was never the buggy one and this test
+/// would pass identically without this round's fix -- it is a recovery-property /
+/// non-regression check on the surrounding machinery, not a reproduction of the bug.
+#[test]
+fn other_documents_declared_rows_survive_a_pass_that_leaves_the_generation_key_absent() {
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "old.md"),
+        pairs(&[("status", "deprecated")])
+    );
+
+    // Simulate the state a run leaves mid-refresh (round 3's `clear_declared_fields`, at the
+    // *start* of a pass): the generation key absent. Declare one more key so the next run
+    // actually attempts a refresh instead of short-circuiting on an unchanged set.
+    {
+        let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+        conn.execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])
+            .unwrap();
+    }
+    kb.write("groove-schema.toml", &format!("{SCHEMA}[fields.team]\n"));
+    // plain.md's row exists from the first run; corrupting it to invalid UTF-8 makes the next
+    // run's read of it fail (`SingleResult::Skipped { reason: "parse failed", .. }`), the same
+    // technique `tests/index_frontmatter_unparsed.rs::test_upgrade_check_stays_pending_when_a_legacy_file_cannot_be_parsed`
+    // uses for the sibling #251 mechanism. That keeps this run's refresh from completing for
+    // every document, so `refresh_pending` stays true and the generation key is left absent at
+    // the end (`rebuild_index`'s own doc explains why: a run that stops partway must not claim
+    // the new set).
+    std::fs::write(kb.kb().join("plain.md"), [0xff, 0xfe, 0xfd]).unwrap();
+
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        declared_meta(kb.kb()),
+        None,
+        "a pass that could not finish the refresh must leave the generation key absent: {err}"
+    );
+    assert_eq!(
+        fields_of(kb.kb(), "old.md"),
+        pairs(&[("status", "deprecated"), ("team", "core")]),
+        "a document this same pass DID refresh must keep its rows even though the pass as a \
+         whole did not complete: {err}"
     );
 }
 
