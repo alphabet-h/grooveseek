@@ -738,6 +738,16 @@ impl Database {
         // than `fetch_k` no longer proves the corpus is exhausted when one is active.
         let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
             || filters.fields_not.is_some_and(|f| !f.is_empty());
+        // (local Codex on PR #291 after round 13, sixth pass) The one exhaustion signal that
+        // survives a field predicate: the corpus size. Read once per request, inside the
+        // request's snapshot; a page whose `fetch_k` already covers every chunk cannot be
+        // widened into anything, whatever the predicate let through. Without it a filter
+        // that matches nothing walked the KNN up to the cap on a corpus of a few chunks.
+        let corpus_chunks = if field_filtered {
+            Some(self.chunk_count()?)
+        } else {
+            None
+        };
 
         loop {
             let page = self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
@@ -746,10 +756,10 @@ impl Database {
             // predicate let through (round 1), and `dropped_by_exclusion == 0` only says the
             // *exclusion* dropped nothing -- the predicate may have emptied the whole page
             // by itself, with a matching chunk sitting just past it. A field-filtered page
-            // therefore keeps widening until `limit` is filled or the KNN cap is reached;
-            // an unfiltered one stops as before.
+            // therefore keeps widening until `limit` is filled, the KNN cap is reached, or
+            // the page already spans the whole corpus; an unfiltered one stops as before.
             let widening_cannot_help = if field_filtered {
-                false
+                corpus_chunks.is_some_and(|total| fetch_k >= total)
             } else {
                 page.dropped_by_exclusion == 0 || page.rows_seen < fetch_k as usize
             };

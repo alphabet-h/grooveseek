@@ -5692,6 +5692,47 @@ mod tests {
         );
     }
 
+    /// (local Codex on PR #291 after round 13, sixth pass) The counterpart of the test above:
+    /// a field filter that matches nothing on a corpus smaller than the first page must not
+    /// keep widening -- the page already spans the whole corpus, so one KNN is the answer.
+    #[test]
+    fn a_field_filter_matching_nothing_on_a_small_corpus_asks_the_knn_once() {
+        let db = db_with_384();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+        for i in 0..3 {
+            let doc = db
+                .upsert_document(
+                    &format!("d{i}.md"),
+                    Some("t"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &format!("h{i}"),
+                    0,
+                )
+                .unwrap();
+            db.insert_chunk(doc, 0, None, None, "body", None, &vec![0.5; 384], 1.0)
+                .unwrap();
+        }
+        let absent = field_map(&[("status", &["absent"])]);
+        let filters = SearchFilters {
+            fields: Some(&absent),
+            ..Default::default()
+        };
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 1, &filters, &HashSet::new())
+            .unwrap();
+        assert!(hits.is_empty());
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            1,
+            "the first page already covered the whole corpus; widening cannot help"
+        );
+    }
+
     #[test]
     fn a_field_filter_shortfall_still_widens_past_an_exclusion_heavy_window() {
         let db = db_with_384();
