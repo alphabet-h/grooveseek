@@ -55,9 +55,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 - **The Markdown parser keeps every top-level frontmatter key**, not only the
   five it has fields for. `groove validate` checks the extra keys against the
-  schema, and `groove index` stores the ones the schema declares so `search`
-  can filter on them (see Added above); a key the schema does not declare is
-  neither stored nor searchable. `get_document` and every other parser are
+  schema, and `groove index` stores the additional ones the schema declares —
+  beyond `title` / `date` / `topic` / `depth` / `tags`, which keep their own
+  columns and filters — so `search` can filter on them (see Added above); a
+  key the schema does not declare is neither stored nor searchable. `get_document` and every other parser are
   unchanged, and the YAML merge key `<<` is still dropped. A retained value is
   read for its shape only and the nesting under it is skipped rather than
   buffered, so the parser's recursion and repetition budgets apply exactly as

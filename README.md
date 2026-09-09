@@ -15,7 +15,7 @@ command is `groove`.
 
 Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`, plus Rust source since v1.2.0, and Python since v1.3.0 and PHP since v1.5.0, whose grammars you download and place) files with YAML frontmatter, splits them into heading-based chunks — or, for source code, one chunk per definition, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
-A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `groove validate`, and since v1.9.0 the keys it declares are stored by `groove index` so `groove search --field` can filter on them.
+A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `groove validate`, and since v1.9.0 the additional keys it declares (beyond `title` / `date` / `topic` / `depth` / `tags`) are stored by `groove index` so `groove search --field` can filter on them.
 
 A third-party benchmark against QMD on a 57-document synthetic corpus — like-for-like
 numbers, the classes GrooveSeek lost or tied, and what decided it — is reproduced with
