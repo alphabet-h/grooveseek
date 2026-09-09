@@ -877,24 +877,6 @@ pub fn rebuild_index(
         }
     }
 
-    // (#251) Every unchanged Markdown document has now been looked at under this policy, so
-    // the next run can take the fast path again. Written after the loop on purpose: a run
-    // that stops halfway leaves the key absent and the next run looks again -- and so does
-    // one that could not read a document it holds a row for.
-    if force || (refresh_frontmatter && !refresh_pending) {
-        db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
-    }
-    // (feature-58) Recorded after the loop for the same reason as the policy above: a run that
-    // stopped halfway must not claim the new set. Before round 3 (codex P2 on PR #291) that
-    // meant leaving the old value in place; now the key was already cleared, ahead of the loop,
-    // whenever a refresh (or `force`) was going to touch a row -- see the `clear_declared_fields`
-    // call above -- so a run that stops halfway leaves it absent and the next run refreshes
-    // again rather than trusting a set some documents were never brought in line with.
-    // Rewriting an unchanged value is harmless, and it is how an index with nothing to declare
-    // gets its `[]` without a pass.
-    if force || !refresh_fields || !refresh_pending {
-        db.write_declared_fields(&declared_json)?;
-    }
     if refreshed > 0 {
         eprintln!(
             "Tagged {refreshed} unchanged Markdown document(s) whose YAML frontmatter had failed to parse \
@@ -916,6 +898,34 @@ pub fn rebuild_index(
         db.delete_document(&db_path)?;
         deleted += 1;
         progress.report_deleted(&db_path);
+    }
+
+    // (#251, codex P2 round 6 on PR #291) Every unchanged Markdown document has now been
+    // looked at under this policy, so the next run can take the fast path again. Written
+    // after the deletion sweep above, not merely after the loop: a Markdown file the schema
+    // change is meant to cover can be absent from disk during this run (renamed away,
+    // temporarily moved) and so is never visited by the loop at all -- only the sweep decides
+    // its row is gone. A run that stops between the loop and the sweep must not claim the pass
+    // completed, or a same-hash file restored later would take the fast path over a row the
+    // sweep never got to prune. Written after the loop on purpose either way: a run that stops
+    // halfway leaves the key absent and the next run looks again -- and so does one that could
+    // not read a document it holds a row for.
+    if force || (refresh_frontmatter && !refresh_pending) {
+        db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
+    }
+    // (feature-58, codex P2 round 6 on PR #291) Recorded after the deletion sweep for the same
+    // reason as the policy above, not only after the loop: a run that stopped halfway must not
+    // claim the new set, and an orphaned document the loop never visited is only accounted for
+    // once the sweep prunes it. Before round 3 (codex P2 on PR #291) stopping halfway meant
+    // leaving the old value in place; now the key was already cleared, ahead of the loop,
+    // whenever a refresh (or `force`) was going to touch a row -- see the `clear_declared_fields`
+    // call above -- so a run that stopped halfway, whether inside the loop or between the loop and
+    // the sweep, leaves it absent and the next run refreshes again rather than trusting a set
+    // some documents (visited or pruned) were never brought in line with. Rewriting an unchanged
+    // value is harmless, and it is how an index with nothing to declare gets its `[]` without a
+    // pass.
+    if force || !refresh_fields || !refresh_pending {
+        db.write_declared_fields(&declared_json)?;
     }
 
     // Count total documents remaining (includes unchanged ones)

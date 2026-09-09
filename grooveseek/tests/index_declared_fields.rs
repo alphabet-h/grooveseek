@@ -530,6 +530,70 @@ fn a_same_bytes_rename_from_md_to_txt_drops_its_declared_rows() {
     );
 }
 
+#[test]
+fn an_orphan_restored_after_an_interrupted_pass_is_refreshed() {
+    // (codex P2 round 6 on PR #291) The two generation writes
+    // (`write_frontmatter_policy` / `write_declared_fields`) now run after the
+    // deletion sweep, not only after the refresh loop: a Markdown file absent
+    // from disk during a schema change is never visited by the loop at all,
+    // only accounted for by the sweep, so a run that stops between the two
+    // must not have already claimed the new generation.
+    //
+    // **Honesty about what this test can and cannot show** (matching the
+    // round-3 report for `clear_declared_fields`): a subprocess `index` run
+    // is atomic from this test's point of view -- it either completes or it
+    // does not run at all -- so there is no way to make it stop between the
+    // loop and the sweep. What follows constructs, by hand, the state such a
+    // stop would leave (generation key absent, old.md's row still holding
+    // schema A's fields, old.md back on disk with unchanged bytes) and checks
+    // that the *next* run recovers correctly. Verified below to still pass
+    // when the two writes are temporarily moved back to before the sweep --
+    // it does not discriminate the fix, for the same structural reason round
+    // 3's E2E did not: whichever code produced the "generation absent, old.md
+    // present" state, the next run's `stored != declared` check already
+    // forces a refresh on its own. Kept as a recovery-property regression
+    // test regardless. No cheap seam (mock `Database`, injectable loop
+    // callback, or similar) exists in `rebuild_index` to unit-test the write
+    // occurring after the sweep more directly -- it is one large function
+    // over a real `rusqlite::Connection`, not something built behind a trait
+    // this test could substitute a spy into.
+    let kb = corpus();
+    let schema_a = "[fields.status]\nenum = [\"active\", \"deprecated\"]\n";
+    kb.write("groove-schema.toml", schema_a);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "old.md"),
+        pairs(&[("status", "deprecated")])
+    );
+
+    let old_md_path = kb.kb().join("old.md");
+    let old_md_bytes = std::fs::read(&old_md_path).unwrap();
+    std::fs::remove_file(&old_md_path).unwrap();
+
+    let schema_b = format!("{schema_a}[fields.team]\n");
+    kb.write("groove-schema.toml", &schema_b);
+
+    {
+        let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+        conn.execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])
+            .unwrap();
+    }
+    std::fs::write(&old_md_path, &old_md_bytes).unwrap();
+
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "old.md"),
+        pairs(&[("status", "deprecated"), ("team", "core")]),
+        "old.md must gain the newly declared `team` row: {err}"
+    );
+    assert_eq!(
+        declared_meta(kb.kb()).as_deref(),
+        Some("[\"status\",\"team\"]")
+    );
+}
+
 fn search_paths(kb: &Path, extra: &[&str]) -> (Vec<String>, serde_json::Value) {
     let mut args = vec![
         "search",

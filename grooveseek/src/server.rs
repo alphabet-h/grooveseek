@@ -75,12 +75,14 @@ pub use search::{
 // dropped entirely.
 //
 // `pub(crate)` on the first line because `transport::http`'s own tests reach
-// two of them by path (`crate::server::FILTER_LIST_MAX_ITEMS`).
+// these by path (e.g. `crate::server::FILTER_LIST_MAX_ITEMS`).
 // `MATCH_SPAN_MAX_TERMS` is deliberately absent: it survives only inside doc
 // comments and assertion messages, so re-importing it would be a name kept
 // alive by prose.
 #[cfg(test)]
-pub(crate) use search::{FILTER_ITEM_MAX_BYTES, FILTER_LIST_MAX_ITEMS, SEARCH_QUERY_MAX_BYTES};
+pub(crate) use search::{
+    FIELD_FILTERS_MAX_BYTES, FILTER_ITEM_MAX_BYTES, FILTER_LIST_MAX_ITEMS, SEARCH_QUERY_MAX_BYTES,
+};
 #[cfg(test)]
 use search::{
     MATCH_SPAN_CONTENT_MAX_BYTES, MATCH_SPAN_MAX_COUNT, compute_reranker_input_limit,
@@ -2218,6 +2220,36 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "fields.status has an empty value"
+        );
+    }
+
+    /// (codex P2 round 6 on PR #291) Each key's own value list can be individually legal at
+    /// every per-list bound above -- [`FILTER_LIST_MAX_ITEMS`] keys, each with
+    /// [`FILTER_ITEM_MAX_BYTES`] worth of value -- while the whole map costs far more than
+    /// [`FIELD_FILTERS_MAX_BYTES`] allows, because the per-list checks never look at the map
+    /// as a whole.
+    #[test]
+    fn a_field_filters_map_within_every_per_list_bound_can_still_exceed_the_aggregate_cap() {
+        use crate::db::FieldFilters;
+
+        let build = |value_len: usize| {
+            let mut m = FieldFilters::new();
+            for i in 0..FILTER_LIST_MAX_ITEMS {
+                m.insert(format!("k{i:03}"), vec!["x".repeat(value_len)]);
+            }
+            m
+        };
+
+        let too_large = build(FILTER_ITEM_MAX_BYTES);
+        let err = validate_field_filters("fields", &too_large)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("fields is too large"), "{err}");
+
+        let just_under = build(FILTER_ITEM_MAX_BYTES - 5);
+        assert!(
+            validate_field_filters("fields", &just_under).is_ok(),
+            "a map just under the aggregate cap must still pass"
         );
     }
 

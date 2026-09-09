@@ -822,6 +822,21 @@ pub(crate) const FILTER_LIST_MAX_ITEMS: usize = 64;
 /// エラーにするが、そこに至るまで 2.8 s かかる。
 pub(crate) const FILTER_ITEM_MAX_BYTES: usize = SEARCH_QUERY_MAX_BYTES;
 
+/// A whole `fields` / `fields_not` map's aggregate byte budget (feature-58, codex P2 round 6
+/// on PR #291).
+///
+/// [`validate_filter_list`] bounds each key's own value list independently -- [`FILTER_LIST_MAX_ITEMS`]
+/// entries of [`FILTER_ITEM_MAX_BYTES`] bytes each -- so a map with [`FILTER_LIST_MAX_ITEMS`]
+/// keys, every one of them individually legal at that per-list bound, can still cost up to
+/// `FILTER_LIST_MAX_ITEMS * FILTER_LIST_MAX_ITEMS * FILTER_ITEM_MAX_BYTES` ~= 4 MiB (twice that
+/// across `fields` and `fields_not` in the same request) while every per-list check passes. The
+/// Streamable HTTP transport refuses a body over [`crate::transport::http::REQUEST_BODY_MAX_BYTES`]
+/// (1 MiB) with a 413 before [`KbCore::search_blocking`] runs at all, so a request the
+/// documented per-list limits accept can still never reach this validation over HTTP. Capping a
+/// whole map at what one list already may cost keeps what the limits document in agreement with
+/// what the transport actually admits.
+pub(crate) const FIELD_FILTERS_MAX_BYTES: usize = FILTER_LIST_MAX_ITEMS * FILTER_ITEM_MAX_BYTES;
+
 /// list 型 filter の件数・要素長を検証する (AU-17)。
 ///
 /// `compile_path_globs` の内側と MCP の入口の両方から呼ぶ。前者は CLI を
@@ -865,6 +880,12 @@ pub(crate) fn field_filters_from_params(
 /// bound runs; an empty value is refused before that key's own value-list
 /// bound runs. Neither the command line nor the tool should accept one
 /// silently.
+///
+/// (codex P2 round 6 on PR #291) After the per-key bounds, the whole map's total bytes are
+/// checked against [`FIELD_FILTERS_MAX_BYTES`]: a map can be legal at every one of the
+/// per-list bounds above and still be far larger than the aggregate cap allows, because those
+/// bounds are per-list, not per-map. See [`FIELD_FILTERS_MAX_BYTES`]'s doc for why the map
+/// needs its own bound at all.
 pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> anyhow::Result<()> {
     if filters.keys().any(|k| k.is_empty()) {
         anyhow::bail!("{name} has an empty key");
@@ -876,6 +897,16 @@ pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> 
             anyhow::bail!("{name}.{key} has an empty value");
         }
         validate_filter_list(&format!("{name}.{key}"), values)?;
+    }
+    let total_bytes: usize = filters
+        .iter()
+        .map(|(key, values)| key.len() + values.iter().map(String::len).sum::<usize>())
+        .sum();
+    if total_bytes > FIELD_FILTERS_MAX_BYTES {
+        anyhow::bail!(
+            "{name} is too large: {total_bytes} bytes (max {FIELD_FILTERS_MAX_BYTES} bytes). \
+             Narrow the filter, or issue several calls."
+        );
     }
     Ok(())
 }
