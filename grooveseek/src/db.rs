@@ -5636,6 +5636,62 @@ mod tests {
     /// filter, and the exclusion are never reached. Fixed, the loop widens once
     /// more, the second page covers the whole 60-chunk corpus, and the 5 "far"
     /// chunks fill `limit`.
+    /// (local Codex on PR #291 after round 13) The field predicate sits in the KNN SQL, so
+    /// it can empty the first page on its own -- no exclusion involved, the page's
+    /// exclusion count stays 0 -- while the one matching chunk sits just past that page. The old stop rule
+    /// read "the exclusion dropped nothing" as "widening cannot help" and returned empty;
+    /// under a field filter the leg must keep widening until `limit` is filled or the KNN
+    /// cap is reached.
+    #[test]
+    fn a_field_filter_that_empties_the_first_page_still_widens_to_the_match_past_it() {
+        let db = db_with_384();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+        let add = |path: &str, e: f32, active: bool| {
+            let doc = db
+                .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)
+                .unwrap();
+            if active {
+                db.replace_document_fields(path, &[("status".to_string(), "active".to_string())])
+                    .unwrap();
+            }
+            db.insert_chunk(doc, 0, None, None, "body", None, &vec![e; 384], 1.0)
+                .unwrap();
+        };
+        // With `limit == 1` and a filter, the first page is `1 * FILTER_OVERFETCH_FACTOR`
+        // rows. Fill exactly that many with the nearest chunks that carry no field...
+        for i in 0..search::FILTER_OVERFETCH_FACTOR {
+            add(
+                &format!("near{i:02}.md"),
+                0.5 - (i as f32 + 1.0) * 0.001,
+                false,
+            );
+        }
+        // ...and put the only matching chunk one rank past the page.
+        add("match.md", 0.5 - 0.05, true);
+
+        let active = field_map(&[("status", &["active"])]);
+        let filters = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        VEC_KNN_ATTEMPTS.with(|c| c.set(0));
+        let hits = db
+            .search_vec_candidates_excluding(&dummy_embedding(0.5), 1, &filters, &HashSet::new())
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|(_, r)| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["match.md"],
+            "the matching chunk past the first page must be found, not dropped as \
+             \"nothing to widen for\""
+        );
+        assert_eq!(
+            VEC_KNN_ATTEMPTS.with(|c| c.get()),
+            2,
+            "the first page held no match, so the KNN had to be widened once"
+        );
+    }
+
     #[test]
     fn a_field_filter_shortfall_still_widens_past_an_exclusion_heavy_window() {
         let db = db_with_384();

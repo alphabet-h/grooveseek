@@ -741,10 +741,19 @@ impl Database {
 
         loop {
             let page = self.fetch_vec_page(&embedding_json, fetch_k, limit, filters, excluded)?;
-            if page.hits.len() >= limit as usize
-                || page.dropped_by_exclusion == 0
-                || (!field_filtered && page.rows_seen < fetch_k as usize)
-                || fetch_k >= VEC_KNN_MAX_K
+            // (local Codex on PR #291 after round 13) Under a field filter neither of the
+            // two "widening will not help" signals holds: `rows_seen` counts rows the SQL
+            // predicate let through (round 1), and `dropped_by_exclusion == 0` only says the
+            // *exclusion* dropped nothing -- the predicate may have emptied the whole page
+            // by itself, with a matching chunk sitting just past it. A field-filtered page
+            // therefore keeps widening until `limit` is filled or the KNN cap is reached;
+            // an unfiltered one stops as before.
+            let widening_cannot_help = if field_filtered {
+                false
+            } else {
+                page.dropped_by_exclusion == 0 || page.rows_seen < fetch_k as usize
+            };
+            if page.hits.len() >= limit as usize || widening_cannot_help || fetch_k >= VEC_KNN_MAX_K
             {
                 return Ok(page.hits);
             }
