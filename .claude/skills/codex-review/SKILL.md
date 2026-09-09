@@ -213,6 +213,7 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 | exit 7 | `max_rounds` に到達、**何も投稿していない** (罠 16 / 28) | user に報告 (続行 / 妥協 / scope 縮小の判断)。自分で上限を上げて再実行しない |
 | exit 8 | 投稿前の読み取り (repo 名 / baseline / trigger 履歴) で `gh api` が失敗、**何も投稿していない** | `gh auth status` / rate limit を確認して再実行 |
 | exit 9 | round の delta を計算できなかった (罠 59)。**trigger は投稿済み** | そのまま再実行。**空欄を「指摘なし」と読まない** — 判定材料が無いだけ |
+| exit 10 | `Provided git ref <sha> does not exist` — push 直後の trigger で codex 側にまだ ref が無い (罠 60、PR #258 / #265 / #293 で 3 回)。本文は exit 4 と同じ語彙だが transient | `gh api repos/<o>/<r>/commits/<sha>` で head の存在を確かめ、body file 付きで **1 回だけ** 再 trigger (1 round と数える)。避けるには push と `gh pr create` の間を空ける |
 
 `=== Inline, this round - ALL of them ===` は badge の有無を問わず全部出す (罠 23: 列挙の外に指摘が来る)。
 P-badge の計数が 0 でもここを読む。

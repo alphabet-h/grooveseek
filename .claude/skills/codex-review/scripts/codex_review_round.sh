@@ -15,6 +15,7 @@
 #   2  bad arguments
 #   3  codex acknowledged (reaction present) but did not answer within timeout (trap 9)
 #   4  codex returned a terminal error body; retry will not help (trap 10 / 56)
+#  10  codex could not see the PR head yet ("Provided git ref ... does not exist"); re-trigger once (trap 60)
 #   5  trigger comment got no reaction = codex never received it (trap 47)
 #   6  trigger POST failed 3 times; do not wait, re-run later (trap 50)
 #   7  round limit reached; nothing was posted (trap 16 / 28)
@@ -377,6 +378,17 @@ HEAD_SHA=$(gh api "repos/${OWNER_REPO}/pulls/${PR}" --jq .head.sha)
 # Codex usage limits for code reviews." が来た。語彙が既存 3 つと重ならないので、
 # pattern に足さないと**素通りする**。retry しても復帰しない。
 TERMINAL_ERROR_PATTERN="Something went wrong|Script exited|Try again later|usage limits|rate limit"
+# 罠 60: "Provided git ref <sha> does not exist" は上の pattern に一致する本文で来るが
+# terminal ではない — push 直後に trigger すると codex 側の clone に ref がまだ無いだけで、
+# 再 trigger で通る (PR #258 / #265 / #293、3 回目で script 側に移した)。terminal より先に
+# 見て別の exit にする。再 trigger は controller の手 (body file 付きで次 round、1 round と数える)。
+TRANSIENT_REF_PATTERN="Provided git ref [0-9a-f]+ does not exist"
+if echo "$LATEST_ISSUE_BODY" | grep -qE "$TRANSIENT_REF_PATTERN"; then
+  diag "TRANSIENT: codex could not see the PR head yet (trap 60). Body follows on stdout."
+  diag "Action: confirm the head sha exists (gh api repos/<o>/<r>/commits/<sha>), then re-trigger once with a body file. It counts as a round."
+  echo "$LATEST_ISSUE_BODY"
+  exit 10
+fi
 if echo "$LATEST_ISSUE_BODY" | grep -qE "$TERMINAL_ERROR_PATTERN"; then
   diag "ERROR: codex returned a terminal failure body (trap 10). Body follows on stdout."
   diag "Action: do not retry. Escalate; try again later or on another PR."
