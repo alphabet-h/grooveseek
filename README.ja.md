@@ -14,7 +14,7 @@ Markdown / プレーンテキストのナレッジベースに対するセマン
 
 YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`、v1.2.0 以降は Rust のソース、grammar を自分で置けば v1.3.0 以降は Python、v1.5.0 以降は PHP も) をパースし、見出し単位で — ソースコードなら定義 1 つを 1 chunk として — チャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
 
-ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`groove validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。
+ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`groove validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。v1.9.0 以降はスキーマが宣言した key を `groove index` が保存し、`groove search --field` で絞り込める。
 
 57 文書の合成 corpus で QMD と比較した第三者の benchmark — 同条件の数値、GrooveSeek が
 負けたか同点だった class、決め手 — を帰属を明記して
