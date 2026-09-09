@@ -1,6 +1,6 @@
 ---
 name: codex-review
-description: PR で `@codex review` を trigger し、3 endpoint (inline / reviews / issue) を `(id, updated_at)` set diff で同時 polling、state-base convergence + P0/P1 absence + sentinel text の 3 layer で判定、wall-clock timeout / error string detect / cost-aware retry cap で hardening したオーケストレータ
+description: push 前に doc comment の名前を洗い、ローカルの Codex (adversarial-review) で前掃除してから、PR で `@codex review` を trigger し、3 endpoint (inline / reviews / issue) を `(id, updated_at)` set diff で同時 polling、state-base convergence + P0/P1 absence + sentinel text の 3 layer で判定、wall-clock timeout / error string detect / cost-aware retry cap で hardening したオーケストレータ
 argument-hint: <PR#> [max_rounds] [per_round_timeout_sec]
 ---
 
@@ -88,6 +88,94 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
 そちらは `cargo doc` と review 側の仕事。分類の実例は
 `.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表。
 
+## push する前にローカルの Codex で前掃除する
+
+GitHub の round は 1 回 25 credits と 10 分強を使い、fix を push するたびに P2 が返る連鎖に
+なりやすい (feature-58 / PR #291 は 15 round、内訳は `.dev/knowledge/feature-58-summary.md` の
+「codex round」節)。**同じ目 (Codex CLI) に push 前の diff を見せて収束させ、GitHub は確認の
+round に使う** — 2026-09-09 の user 判断。役割は **ローカル = 明白な違反の前掃除、GitHub = 最終確認**:
+ローカルが approve でも GitHub は P2 を出す (同 summary の r7〜r9) し、focus を当てればローカルが
+GitHub より先に本物を拾う (同 r4 / r5、round 10 後の 2 件)。どちらか一方で済ませない。
+
+**打つのは、この branch を push するたび** (上の sweep と同じ)。PR を開く前も、GitHub round の
+指摘を直した後も同じ。
+
+前提: plugin `codex@openai-codex` が install 済 (`~/.claude/plugins/installed_plugins.json` に載る)、
+`codex --version` が 0.153.4 以上 (古いと review の既定 model `gpt-5.3-codex` を ChatGPT アカウントが
+400 で拒む)、`codex login` 済 (`/codex:setup` が状態を出す)。
+
+### 実行形
+
+下の `codex_review_round.sh` と同じ受け方 — controller (= main agent) が `run_in_background` で打ち、
+stdout / stderr を scratchpad の file に分ける。**subagent `codex:codex-rescue` に打たせない**:
+plugin の agent 定義は `task` だけを forward し、`adversarial-review` は呼ばないと決めている
+(plugin の `agents/codex-rescue.md`「Forwarding rules」)。2026-09-09 はそれに反する prompt で動いて
+いたが、plugin の更新で壊れる形なので採らない:
+
+```bash
+S=<scratchpad>
+CODEX_PLUGIN=$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ | sort -V | tail -1)
+node "${CODEX_PLUGIN}scripts/codex-companion.mjs" adversarial-review --wait --base main --model gpt-5.6-terra --cwd <abs repo> "$(cat "$S/local-1-focus.txt")" > "$S/local-1.out" 2> "$S/local-1.err"; echo exit=$?
+```
+
+- path は `ls | sort -V | tail -1` で解決する。`${CLAUDE_PLUGIN_ROOT}` は plugin 自身の command /
+  agent の中でしか定義されず、version の directory を literal で書くと plugin の更新で外れる
+- `--model` は明示する。既定の `gpt-6-astra` は混雑で落ちることがあり、`gpt-5.3-codex*` は ChatGPT
+  アカウントで 400。通る model の表と runtime の罠は `.dev/knowledge/codex-plugin-review-model-pitfalls.md`
+  (ここに写さない)
+- **focus は Write で file にして `"$(cat file)"` で渡す**。二重引用符の中に直接書くと backtick が
+  command substitution される (`tune: command not found`、kuriya trap #159)
+- npm で `@openai/codex` を更新した直後は、更新前に起動した shared runtime の `codex.exe` が残って
+  同じ 400 を返す。`Get-Process codex` の StartTime が更新より前なら `taskkill` する (desktop app の
+  `AppData\Local\OpenAI\Codex\bin\…\codex.exe` は別物、触らない)
+- 対象を決めるのは **`--base main`** (= `main...HEAD` の diff。plugin の `scripts/lib/git.mjs` の
+  `resolveReviewTarget` は `base` があれば `scope` を見ない)。`--scope branch` は `--base` 無しの時に
+  default branch を検出する別経路なので、`--base main` と並べて書かない (ローカル r1 の medium)。
+  **未 commit の変更は対象外** — commit してから打つ。`.md` だけの diff でも動く
+
+### focus の書き方
+
+plugin の `prompts/adversarial-review.md` の `User focus:` に差し込まれ、「weight it heavily」で読まれる。
+効いた形は 3 要素 (feature-58 の r4 / r5 と round 10 後、`.dev/knowledge/feature-58-summary.md` の
+「ローカル terra」の段落):
+
+1. **判定基準の名指し**: `AGENTS.md` の Code Review Rules と同じ基準で、P1 (壊れる) / P2 (edge case) を
+   分けて列挙させる
+2. **過去指摘の一覧 + 「その先を探せ」**: GitHub / ローカルで既に受けた指摘を箇条書きにし、同じ軸 —
+   中断の状態機械 / 再 parse を飛ばす経路 / 上限の合成 (transport との整合) / 別入口の漏れ — で
+   まだ指摘されていないものを探させる
+3. **対象 module / 概念の名指し**: 「`document_fields` の全 reader / writer を辿れ」の形。名指しの無い
+   round は approve が浅く、GitHub が次の round で P2 を出した (r7〜r9)
+
+`claim_guard` C1 は focus 文にも効く (`4096 rows` + `every` で止まった)。数を書くなら定数名で書く。
+
+### ローカルの結果の読み方 (GitHub round の「結果の読み方」とは別の表)
+
+stdout の並びは header (`# Codex Adversarial Review`) / `Target:` / **`Verdict: approve|needs-attention`** /
+summary 1 段落 / `Findings:` か `No material findings.` (plugin の `scripts/lib/render.mjs` の
+`renderReviewResult`)。finding は `- [<severity>] <title> (<file>:<line>)` + 本文 + `Recommendation:` で、
+severity は **`critical` / `high` / `medium` / `low`** の 4 段 (同 file の `severityRank`、この順に並ぶ)。
+`grep -n '^Verdict:'` と `grep -n '^- \['` で引く — 隣接に頼らない。
+
+| Verdict | controller の手 |
+|---|---|
+| `approve` | sweep を済ませて push |
+| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。`[low]` だけなら内容を見て即決: **skip なら push してよい、取り込むなら diff が変わるので次の round を打つ** (その round も上限に数える) |
+| exit ≠ 0 / `Verdict` 行が無い | `local-N.err` を読む。model 拒否 (400 / 404) / capacity / runtime の残留を切り分ける。判定材料が無いだけで「指摘なし」ではない |
+
+**上限は push 1 回につき 3 round** — 打った回数で数える (approve で終わる round も、`[low]` を取り込んで
+打ち直した round も 1 つ)。上限の出所は 2026-09-09 の user 判断「ローカルで収束させてから GitHub round」
+(`.dev/knowledge/feature-58-summary.md` の「後続」節に記録。GitHub round の上限が 3 / 5 なのと同じ理由 =
+cost と、収束しない loop は spec の問題という判定)。**3 round 目が `needs-attention` で終わったら**:
+`[critical]` / `[high]` が残っているなら fix が次の指摘を生んでいる (台帳 category 6) = user に相談
+(介入ポイント 3)。`[medium]` / `[low]` だけなら取り込んで **4 round 目は打たず push** し、取り込んだ内容を
+PR 本文に書いて GitHub round に確認させる (GitHub が最終確認、の役割どおり)。自分で上限を上げない。
+**fix を書いたら「その fix の最悪ケース」を自分で 1 つ書いてから出す** — r10 の fix (KNN の page が
+空でも広げる) は r11 で「match 0 の corpus が cap まで広げ続ける」と返った。
+
+ローカルは GitHub の代わりにならない。GitHub round (下の節) は残し、sentinel / P-badge の判定は
+これまでどおり script が持つ。
+
 ## 1 round の回し方 (controller = main agent)
 
 Phase A 最大 600 s + quiet window 180 s で **tool の 10 分上限を超え得る**ので、`run_in_background` で回し、
@@ -125,6 +213,7 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 | exit 7 | `max_rounds` に到達、**何も投稿していない** (罠 16 / 28) | user に報告 (続行 / 妥協 / scope 縮小の判断)。自分で上限を上げて再実行しない |
 | exit 8 | 投稿前の読み取り (repo 名 / baseline / trigger 履歴) で `gh api` が失敗、**何も投稿していない** | `gh auth status` / rate limit を確認して再実行 |
 | exit 9 | round の delta を計算できなかった (罠 59)。**trigger は投稿済み** | そのまま再実行。**空欄を「指摘なし」と読まない** — 判定材料が無いだけ |
+| exit 10 | `Provided git ref <sha> does not exist` — push 直後の trigger で codex 側にまだ ref が無い (罠 60、PR #258 / #265 / #293 で 3 回)。本文は exit 4 と同じ語彙だが transient | `gh api repos/<o>/<r>/commits/<sha>` で head の存在を確かめ、body file 付きで **1 回だけ** 再 trigger (1 round と数える)。**2 回目も exit 10 なら止めて user 報告** (stdout / stderr を残す。#293 は 5 分空けた再 trigger も同じ本文だった = 待ち時間の根拠が無い。次に打つなら新しい push の後か、user が時刻を決める)。避けるには push と `gh pr create` の間を空ける。同じ round に quota 等の terminal 本文が並ぶと exit 4 が勝つ (script が comment ごとに分類) |
 
 `=== Inline, this round - ALL of them ===` は badge の有無を問わず全部出す (罠 23: 列挙の外に指摘が来る)。
 P-badge の計数が 0 でもここを読む。
@@ -140,6 +229,10 @@ CLAUDE.local.md guardrail「5 round 経過で user 報告」と揃えて **明�
 
 - 罠の発見経緯: `.dev/knowledge/codex-review-loop-pitfalls.md` (script が構造で防いでいないものも含む)
 - caller: `.claude/commands/feature-flow.md` Phase 6 / CLAUDE.local.md の常時 guardrail 節
+- ローカル前掃除の実体: plugin `codex@openai-codex` (`~/.claude/plugins/cache/openai-codex/codex/<version>/`) の
+  `commands/adversarial-review.md` (公式の実行形) / `agents/codex-rescue.md` (`task` 専用、review には使わない) /
+  `prompts/adversarial-review.md` (focus の差し込み先)。model / runtime の罠は
+  `.dev/knowledge/codex-plugin-review-model-pitfalls.md`、効いた focus の実例は `.dev/knowledge/feature-58-summary.md`
 - 公式: [Codex GitHub integration](https://developers.openai.com/codex/integrations/github) /
   [Codex pricing](https://developers.openai.com/codex/pricing) /
   [GitHub REST: pull request reviews](https://docs.github.com/en/rest/pulls/reviews)
