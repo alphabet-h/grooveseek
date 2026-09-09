@@ -651,10 +651,26 @@ impl KbCore {
         let mut embedder = recover(self.embedder.lock(), "embedder");
         let db = recover_db(self.db.lock());
 
+        // (feature-58, codex P2 round 3 on PR #291) Read the schema once, here, before
+        // `rebuild_index` -- it no longer reads the file itself and takes this snapshot
+        // instead. Unlike the CLI's `index --force` arm, there is no reset ahead of this call
+        // on the MCP path, so this load already runs before anything destructive; a failure is
+        // reported through the same `Err(e)` -> "Rebuild failed" shape `rebuild_index` uses.
+        let schema = match indexer::load_declared_schema(&self.kb_path) {
+            Ok(schema) => schema,
+            Err(e) => {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: format!("Rebuild failed: {e}"),
+                })
+                .unwrap_or_default();
+            }
+        };
+
         match indexer::rebuild_index(
             &db,
             &mut embedder,
             &self.kb_path,
+            schema,
             force,
             self.exclude_headings.as_deref(),
             &self.exclude_dirs,

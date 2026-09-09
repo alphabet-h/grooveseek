@@ -383,6 +383,62 @@ fn an_interrupted_run_s_leftover_rows_are_cleared_when_the_schema_goes_away() {
     assert_eq!(declared_meta(kb.kb()).as_deref(), Some("[]"));
 }
 
+#[test]
+fn an_interrupted_schema_change_is_refreshed_again_on_the_next_run() {
+    // (codex P2 round 3 on PR #291) Before this fix, the generation key held
+    // whatever the *last completed* run recorded, so an interrupted refresh
+    // -- some documents' rows committed, the process died before the
+    // end-of-run write -- left the OLD key in place. If the schema was then
+    // restored to what it was before the interrupted change, the next run
+    // compared stored-old == declared-old, skipped the refresh, and left the
+    // partial rows behind forever. The fix clears the key as soon as a run
+    // decides to refresh, so an interruption leaves it absent instead.
+    //
+    // This simulates the state such an interruption leaves rather than
+    // literally killing a subprocess mid-run: delete the generation key (what
+    // the fix's `clear_declared_fields` call does at the start of a refresh)
+    // and hand-insert one row a schema declaring `team` would have written
+    // (what a partial pass committed before dying). Schema A never changes on
+    // disk -- the interrupted run's own schema edit and its revert are not
+    // needed to see whether the *next* run recovers.
+    let kb = corpus();
+    let schema_a = "[fields.status]\nenum = [\"active\", \"deprecated\"]\n";
+    kb.write("groove-schema.toml", schema_a);
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        pairs(&[("status", "active")])
+    );
+    assert_eq!(declared_meta(kb.kb()).as_deref(), Some("[\"status\"]"));
+
+    {
+        let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+        conn.execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO document_fields SELECT id, 'team', 'core' FROM documents WHERE path = 'active.md'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let (_, err, status) = run(kb.kb(), &["index"]);
+    assert!(status.success(), "{err}");
+    assert!(
+        err.contains(
+            "Recorded the declared frontmatter fields of 3 unchanged Markdown document(s)"
+        ),
+        "the refresh pass must run again rather than trust the leftover key: {err}"
+    );
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        pairs(&[("status", "active")]),
+        "the hand-inserted `team` row from the interrupted run must be gone"
+    );
+    assert_eq!(declared_meta(kb.kb()).as_deref(), Some("[\"status\"]"));
+}
+
 fn search_paths(kb: &Path, extra: &[&str]) -> (Vec<String>, serde_json::Value) {
     let mut args = vec![
         "search",

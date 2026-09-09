@@ -929,12 +929,13 @@ fn main() -> anyhow::Result<()> {
                 db.verify_embedding_meta(model.model_id(), dim)?;
             }
             let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
+            // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) Read the schema once, here,
+            // before any reset -- a malformed schema must fail before `--force` empties the
+            // index, not after. `rebuild_index` no longer reads the file itself (round 3): this
+            // snapshot is what it gets, so the file is read exactly once per run rather than
+            // once here and once more inside it.
+            let schema = grooveseek::indexer::load_declared_schema(&kb_path)?;
             if force {
-                // (feature-58, codex P1 round 1 on PR #291) A malformed schema must fail
-                // before this reset empties the index, not after -- the same reasoning
-                // `load_declared_schema` in `indexer` carries. `rebuild_index` below loads it
-                // again; a second file read is cheap next to a reset that empties the index.
-                grooveseek::indexer::load_declared_schema(&kb_path)?;
                 db.reset_for_model(embedder.model_id(), dim)?;
             }
             eprintln!("Indexing {}...", kb_path.display());
@@ -951,6 +952,7 @@ fn main() -> anyhow::Result<()> {
                 &db,
                 &mut embedder,
                 &kb_path,
+                schema,
                 force,
                 cfg.exclude_headings.as_deref(),
                 &exclude_dirs,

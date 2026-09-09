@@ -1059,6 +1059,21 @@ mod tests {
         assert_eq!(db.read_declared_fields().unwrap().as_deref(), Some("[]"));
     }
 
+    /// (codex P2 round 3 on PR #291) [`Database::clear_declared_fields`] leaves the key
+    /// absent, not merely unchanged -- the point is to undo a prior
+    /// [`Database::write_declared_fields`], not to be a no-op beside it.
+    #[test]
+    fn clear_declared_fields_leaves_the_key_absent() {
+        let db = db_with_384();
+        db.write_declared_fields("[\"status\"]").unwrap();
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some("[\"status\"]")
+        );
+        db.clear_declared_fields().unwrap();
+        assert_eq!(db.read_declared_fields().unwrap(), None);
+    }
+
     /// sqlite-vec's KNN (`embedding MATCH ?1 AND k = ?2`) with an `EXISTS`
     /// predicate on the joined `documents` row: the query is accepted, rows
     /// whose document lacks the field are not returned, and no more than `k`

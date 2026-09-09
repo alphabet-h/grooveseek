@@ -71,10 +71,15 @@ fn build_initial_index(
     .expect("verify_embedding_meta");
     let mut embedder = Embedder::with_model(ModelChoice::BgeSmallEnV15).expect("load embedder");
     let registry = Registry::defaults();
+    // (codex P2 round 3 on PR #291) `rebuild_index` takes the loaded schema rather than
+    // reading the path itself; this KB has none, so `None` is exactly what a real caller's
+    // `load_declared_schema` would read back too.
+    let schema = grooveseek::indexer::load_declared_schema(layout.kb()).unwrap();
     indexer::rebuild_index(
         &db,
         &mut embedder,
         layout.kb(),
+        schema,
         false,
         None,
         &[],

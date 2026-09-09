@@ -304,6 +304,24 @@ impl Database {
         Ok(())
     }
 
+    /// Delete `index_meta.declared_fields`, leaving it absent (codex P2 round 3 on PR #291).
+    ///
+    /// [`crate::indexer::rebuild_index`] calls this right after it decides a declared-field
+    /// refresh will run (or `force`, which rewrites every document anyway), before the loop
+    /// that writes `document_fields` rows starts. An interrupted pass -- the process dies after
+    /// committing some documents' rows but before the end-of-run [`Database::write_declared_fields`]
+    /// -- must leave the generation key absent, not the value it had before the refresh began:
+    /// restoring the *old* schema afterward would otherwise compare stored-old == declared-old,
+    /// skip the refresh, and leave the newer rows in place indefinitely. Absent is safe in both
+    /// directions once [`Database::document_fields_is_empty`] backs the empty-set shortcut
+    /// (codex P2 round 2): a genuinely fresh index reads as "nothing to refresh", and an
+    /// interrupted one reads as "refresh again".
+    pub fn clear_declared_fields(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM index_meta WHERE key = 'declared_fields'", [])?;
+        Ok(())
+    }
+
     /// 指定 path の documents.title を読む (E-8 の title 変更検知用)。
     /// 未 index / title NULL は `None`。Task 2.7 の frontmatter-only skip title gate で消費される。
     pub fn get_document_title(&self, path: &str) -> Result<Option<String>> {

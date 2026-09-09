@@ -506,11 +506,18 @@ pub enum SingleResult {
 /// - `None` → use [`crate::parser::DEFAULT_EXCLUDED_HEADINGS`]
 /// - `Some(list)` → completely overrides the default list (pass `&[]` to
 ///   disable heading-based exclusion entirely).
+///
+/// `schema` is [`load_declared_schema`]'s result, not a path (codex P2 round 3 on PR #291):
+/// the caller reads `groove-schema.toml` once, before anything destructive it is about to do,
+/// and hands the snapshot in here rather than letting this function read the file again after
+/// the fact. See [`load_declared_schema`]'s doc for why a second read, on a schema a caller has
+/// already validated, would only reopen the TOCTOU window `--force` closed (codex P1 round 1).
 #[allow(clippy::too_many_arguments)] // D-10 で 8 個に。config struct 化は別 cycle
 pub fn rebuild_index(
     db: &Database,
     embedder: &mut Embedder,
     kb_path: &Path,
+    schema: Option<crate::schema::Schema>,
     force: bool,
     exclude_headings: Option<&[String]>,
     exclude_dirs: &[String],
@@ -523,13 +530,6 @@ pub fn rebuild_index(
     let kb_path = kb_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize kb_path: {}", kb_path.display()))?;
-
-    // (feature-58, codex P1 round 1 on PR #291) Load the schema before anything below can
-    // delete data. `reset_and_resolve_context_mode` further down calls `reset_for_model` when
-    // `force` is set, which empties the index; a malformed schema must fail this run before
-    // that reset, not after it. See `load_declared_schema`'s doc for why `main.rs` also loads
-    // it, ahead of its own earlier `--force` reset.
-    let schema = load_declared_schema(&kb_path)?;
 
     // legacy DB を引き継いだケースで FTS が空のままにならないよう、
     // まず既存 chunks のうち FTS 未登録のものを backfill する。
@@ -602,6 +602,19 @@ pub fn rebuild_index(
         && !(stored_declared.is_none()
             && declared_json == DECLARED_FIELDS_NONE
             && db.document_fields_is_empty()?);
+    // (codex P2 round 3 on PR #291) Clear the generation key before the refresh writes a single
+    // `document_fields` row, not after. An interrupted pass -- some documents' rows committed,
+    // the process dies before the end-of-run `write_declared_fields` below -- must leave the key
+    // absent, so the next run refreshes again even if it finds the *old* schema restored: with
+    // the key still holding the old value, stored-old == declared-old would compare equal and
+    // skip the refresh, leaving the newer rows behind indefinitely. `force` rewrites every
+    // document's rows the same way a refresh does, so an interruption mid-force leaves the same
+    // kind of partial state and clears the key for the same reason. See
+    // `Database::clear_declared_fields`'s doc for why "absent" is safe in both directions,
+    // now that `Database::document_fields_is_empty` (round 2) backs the empty-set shortcut.
+    if refresh_fields || force {
+        db.clear_declared_fields()?;
+    }
     let refresh_any = refresh_frontmatter || refresh_fields;
 
     // (feature-49) `.grooveignore` は **毎回ここで読み直す**。CLI `index` と MCP
@@ -832,10 +845,14 @@ pub fn rebuild_index(
     if force || (refresh_frontmatter && !refresh_pending) {
         db.write_frontmatter_policy(FRONTMATTER_POLICY)?;
     }
-    // (feature-58) Recorded after the loop for the same reason as the policy
-    // above: a run that stopped halfway leaves the old value and the next run
-    // looks again. Rewriting an unchanged value is harmless, and it is how an
-    // index with nothing to declare gets its `[]` without a pass.
+    // (feature-58) Recorded after the loop for the same reason as the policy above: a run that
+    // stopped halfway must not claim the new set. Before round 3 (codex P2 on PR #291) that
+    // meant leaving the old value in place; now the key was already cleared, ahead of the loop,
+    // whenever a refresh (or `force`) was going to touch a row -- see the `clear_declared_fields`
+    // call above -- so a run that stops halfway leaves it absent and the next run refreshes
+    // again rather than trusting a set some documents were never brought in line with.
+    // Rewriting an unchanged value is harmless, and it is how an index with nothing to declare
+    // gets its `[]` without a pass.
     if force || !refresh_fields || !refresh_pending {
         db.write_declared_fields(&declared_json)?;
     }
@@ -1864,15 +1881,24 @@ fn declared_fields_recorded(db: &Database) -> Result<Vec<String>> {
 /// Reads `<kb_path>/groove-schema.toml` — the same file `groove validate`
 /// reads — and compiles it, without deriving anything from it yet.
 ///
-/// (feature-58, codex P1 round 1 on PR #291) Call this as the FIRST thing
-/// [`rebuild_index`] does, before any destructive reset runs: a schema that
-/// does not load must stop the run before anything is deleted, the way a
-/// `groove.toml` that does not load stops the binary before it opens the
-/// database. [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call can
-/// empty the index on `--force`, and the CLI's `index --force` arm (in
-/// `main.rs`) resets even earlier, before [`rebuild_index`] is entered — so
-/// `main.rs` calls this too, ahead of its own reset. A second file read is
-/// cheap next to a reset that empties the index.
+/// (feature-58, codex P1 round 1, P2 round 3 on PR #291) Read once by the caller, before
+/// anything destructive, and handed to [`rebuild_index`] rather than read again inside it: a
+/// schema that does not load must stop the run before anything is deleted, the way a
+/// `groove.toml` that does not load stops the binary before it opens the database.
+/// [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call can empty the index on
+/// `--force`, and the CLI's `index --force` arm (in `main.rs`) resets even earlier, before
+/// [`rebuild_index`] is entered — so `main.rs` calls this before either reset. The MCP path
+/// (`server.rs`'s `rebuild_index_blocking`) has no reset of its own ahead of the call, but
+/// calls this first anyway, for the same "fail before anything runs" reason and so both callers
+/// give [`rebuild_index`] the same kind of snapshot.
+///
+/// A second read inside [`rebuild_index`], after the caller's own validation and reset, would
+/// only reopen the window between the two reads to a schema that changes out from under the
+/// run — the file could be replaced with something malformed in between and the reset would
+/// already be done. Reading once, before either side of that window, is what removes it, not
+/// what happens to be closed after (codex P1 round 1); the reverse ordering is not something an
+/// in-process test can force, since it requires a second process editing the file between two
+/// reads this process makes microseconds apart.
 pub fn load_declared_schema(kb_path: &Path) -> Result<Option<crate::schema::Schema>> {
     crate::schema::Schema::load_optional(&kb_path.join("groove-schema.toml"))
 }
