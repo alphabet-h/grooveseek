@@ -140,6 +140,22 @@ So: if you add a module, add tests with it. When the floor trips, the offending 
    warns about.
 4. Open a PR describing the problem and the change; link any related issues
 
+### When a change touches `Cargo.lock`
+
+`THIRD-PARTY-LICENSES.md` is generated from the lock file and shipped in every
+release archive, so a dependency change has to regenerate it in the same PR
+(the nightly workflow fails when the committed copy has drifted):
+
+```bash
+cargo install --locked --features cli cargo-about
+cargo about generate --locked --fail -c about.toml -o THIRD-PARTY-LICENSES.md about.hbs
+```
+
+`--fail` turns "could not find a license text for crate X" into an error. Fix
+one by adding the crate to `workarounds` in `about.toml` when cargo-about has
+a built-in for it, or a `[<crate>.clarify]` block otherwise — never by editing
+the generated file.
+
 ## Reporting bugs
 
 Include:

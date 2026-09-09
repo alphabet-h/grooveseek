@@ -1,0 +1,56 @@
+# cargo-about configuration. Regenerate the third-party notice with
+#
+#   cargo about generate --locked --fail -c about.toml -o THIRD-PARTY-LICENSES.md about.hbs
+#
+# The generated THIRD-PARTY-LICENSES.md is committed and copied into every
+# release archive (`include` in dist-workspace.toml). The nightly workflow
+# regenerates it and fails when the committed copy has drifted from Cargo.lock.
+
+# Priority order: when a crate offers `A OR B`, the first entry here that
+# matches is the one recorded. Apache-2.0 first, MIT second — the same pair
+# this project itself is licensed under.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "CC0-1.0",
+    "Apache-2.0 WITH LLVM-exception",
+    # libbz2-rs-sys (via the PDF / Office parsers' compression path).
+    "bzip2-1.0.6",
+]
+
+# Every target dist builds (dist-workspace.toml). `targets` filters the
+# dependency graph rather than the host, so listing x86_64-pc-windows-msvc is
+# what keeps the Windows-only crates (groove-tray's tao / tray-icon / windows,
+# groove's windows-sys) in the notice when it is generated on Linux.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+# Nothing from build.rs (cc, bindgen, winresource) or from tests ships in an
+# archive, so neither needs attribution there.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Built-in workarounds for crates whose license files cargo-about cannot read
+# on its own. Added only when a `--fail` run named them.
+workarounds = []
+
+# The workspace's own crates (all `publish = false`) are not third parties.
+# (Tables go last: every key after a `[table]` header belongs to that table.)
+[private]
+ignore = true

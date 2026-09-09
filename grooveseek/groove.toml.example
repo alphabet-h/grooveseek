@@ -48,7 +48,8 @@
 # Default cross-encoder reranker.
 #   none       … disabled (the default)
 #   bge-v2-m3  … BAAI/bge-reranker-v2-m3 (multilingual, ~2.3 GB; recommended for Japanese)
-#   jina-v2-ml … jinaai/jina-reranker-v2-base-multilingual (~1.2 GB, lighter multilingual)
+#   jina-v2-ml … jinaai/jina-reranker-v2-base-multilingual (~1.2 GB, lighter multilingual;
+#                CC-BY-NC-4.0: research and evaluation only, no commercial use)
 #   bge-base   … BAAI/bge-reranker-base (English/Chinese, ~280 MB)
 # Index-independent: switching rerankers does not require re-indexing.
 #reranker = "bge-v2-m3"

@@ -1,0 +1,32 @@
+# Third-party licenses
+
+`groove`, `groove-tray`, `groove-svc` and the `groove-grammar-*` plugins are
+built from the Rust crates listed below. Each section is one license text as
+the crates ship it, followed by the crates that carry it. This file is
+generated from `Cargo.lock` by cargo-about (`about.toml`, `about.hbs`); edit
+those, not this file.
+
+Not crates, and therefore not listed by the generator: the ONNX Runtime library
+that `ort-sys` links statically (MIT, Microsoft Corporation) and SQLite, linked
+statically through `libsqlite3-sys` (public domain).
+
+## Summary
+
+{{#each overview}}
+- {{{name}}} ({{{id}}}): {{{count}}}
+{{/each}}
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}

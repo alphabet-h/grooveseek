@@ -14,6 +14,35 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **Every release archive now carries `THIRD-PARTY-LICENSES.md`.** The notice
+  is generated from `Cargo.lock` by cargo-about (`about.toml` / `about.hbs`),
+  committed, and copied into each archive through cargo-dist's `include`; the
+  nightly workflow regenerates it and fails when the committed copy has
+  drifted. Until now an archive shipped only GrooveSeek's own two license
+  files, which does not satisfy the notice clause of the MIT / ISC / BSD crates
+  linked into the binaries.
+- **Release archives are signed with GitHub artifact attestations**
+  (`github-attestations` in cargo-dist). `gh attestation verify <archive>
+  --owner alphabet-h` checks that a download was built by this repository's
+  release workflow.
+- **`SECURITY.md`.** Vulnerabilities go through GitHub's private reporting,
+  not public issues; the file states the response target, which versions are
+  fixed, and what is a documented limit rather than a defect. README links to
+  it from a new Security section.
+
+### Documentation
+
+- **`--reranker jina-v2-ml` is now marked non-commercial.** The model is
+  licensed CC-BY-NC-4.0 by Jina AI (research and evaluation only); `--help`,
+  `docs/usage.md` and `groove.toml.example` say so and point commercial users
+  at `bge-v2-m3` (Apache-2.0). The option itself is unchanged.
+- **README's first line matches what the binary does.** It names hybrid
+  search over Markdown plus the opt-in formats, and is followed by a plain
+  statement of what works with no configuration: English Markdown with the
+  default model. Japanese needs `--model bge-m3`; other formats are opt-ins.
+
 ## [1.9.0] - 2026-09-10
 
 ### Added
