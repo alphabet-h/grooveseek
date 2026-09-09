@@ -364,6 +364,37 @@ fn detect_renames(
     pairs
 }
 
+/// Whether renaming `old_rel` to `new_rel` moves the file to a different parser
+/// (feature-58, codex P2 round 5 on PR #291).
+///
+/// A same-hash rename normally skips re-parsing on both paths that see one --
+/// [`rebuild_index`]'s rename-detection loop and the watcher's
+/// [`rename_single_file`] -- because the bytes did not change, so there is
+/// nothing new to embed. That shortcut is wrong when the rename also crosses
+/// parsers: `document_fields`, `title`, and `tags` all came from whichever
+/// parser last read the file, and a `.txt` renamed to `.md` (or back) with the
+/// same bytes needs the *other* parser's reading, not none. [`Registry::by_extension`]
+/// (case-insensitive, same lookup [`indexed_markdown_hash`] and the rename
+/// code already use) resolving to `None` on one side and `Some` on the other
+/// counts as a crossing too -- an unregistered extension has no parser at
+/// all, which is as different from any registered one as two registered
+/// parsers are from each other.
+///
+/// One predicate rather than the check duplicated at each of the two call
+/// sites (AGENTS "one question gets one implementation"): the parser-crossing
+/// decision has one definition, and both rename paths ask it the same
+/// question.
+fn rename_crosses_a_parser(registry: &Registry, old_rel: &str, new_rel: &str) -> bool {
+    let parser_of = |rel: &str| {
+        let ext = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        registry.by_extension(ext).map(|p| p.extension())
+    };
+    parser_of(old_rel) != parser_of(new_rel)
+}
+
 /// この document path を現在の registry で開けるか。
 ///
 /// 「どの行を提供できるか」と「どの行が registry から外れたか」(AU-06) を
@@ -674,6 +705,12 @@ pub fn rebuild_index(
     // stem 由来 (E-1) にもかかわらず再 parse されず、breadcrumb (chunk.context)
     // が旧 filename のまま stale 化する。Off モードは context を embed に使わない
     // ため無害 = 従来通り fast path を維持する。
+    // (codex P2 round 5 on PR #291) **parser を跨ぐ rename は mode を問わず force する。**
+    // `.txt` ↔ `.md` のような rename は bytes が同じでも読む parser が変わるので、
+    // 旧 parser が書いた `document_fields` / title / tags がそのまま残ってしまう
+    // (Off モードで fast path に乗ると一生直らない -- hash も世代 key も一致するため)。
+    // `rename_crosses_a_parser` は watcher 側の `rename_single_file` とも共有する
+    // 1 つの判定 (AGENTS "one question gets one implementation")。
     let mut renamed_new_paths: HashSet<String> = HashSet::new();
     let renamed: u32 = if force {
         0
@@ -685,7 +722,9 @@ pub fn rebuild_index(
         db.rename_documents_atomic(&pairs)?;
         for (old_path, new_path) in &pairs {
             progress.report_renamed(old_path, new_path);
-            if context_mode == ContextMode::Static {
+            if context_mode == ContextMode::Static
+                || rename_crosses_a_parser(registry, old_path, new_path)
+            {
                 renamed_new_paths.insert(new_path.clone());
             }
         }
@@ -1643,9 +1682,17 @@ pub fn rename_single_file(
     // filename stem 由来 (E-1) のため、再 parse しない限り旧 filename のまま
     // stale 化してしまう。Off モードは context を embed に使わないため無害 =
     // 従来通り fast path を維持する。
+    // (codex P2 round 5 on PR #291) **parser を跨ぐ rename も同様に無効化する**:
+    // mode を問わず、`rename_crosses_a_parser` (`rebuild_index` の一括 rename と
+    // 共有する 1 つの判定) が true なら fast path から外す。bytes は同じでも
+    // 旧 parser が書いた `document_fields` / title / tags が新 parser の読みへ
+    // 更新されないまま残ってしまうため。
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     let same_hash = new_hash == old_hash;
-    if same_hash && context_mode != ContextMode::Static {
+    if same_hash
+        && context_mode != ContextMode::Static
+        && !rename_crosses_a_parser(registry, old_rel, new_rel)
+    {
         return Ok(RenameOutcome::Renamed);
     }
 
@@ -1662,9 +1709,9 @@ pub fn rename_single_file(
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
     // recorded; they do not read the schema themselves.
     let declared_fields = declared_fields_recorded(db)?;
-    // same_hash (= Static-mode-forced) の場合のみ force=true で
-    // hash 一致 fast path をバイパスする。内容が変わっている場合は
-    // 通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
+    // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
+    // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
+    // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
     match index_single_disk_entry(
         db,
         embedder,
@@ -2202,6 +2249,36 @@ mod tests {
         let skipped: HashSet<String> = ["a.md".to_string()].into_iter().collect();
         let pairs = detect_renames(&disk, &db, &skipped);
         assert!(pairs.is_empty());
+    }
+
+    /// (codex P2 round 5 on PR #291) `.txt` ↔ `.md` is exactly the crossing the fix exists
+    /// for -- see `an_interrupted_...`-style E2E coverage in
+    /// `tests/index_declared_fields.rs` for the `document_fields` consequence; this pins the
+    /// predicate itself, both directions and the unregistered-extension edge.
+    #[test]
+    fn rename_crosses_a_parser_is_true_for_txt_md_and_an_unknown_extension() {
+        let reg = Registry::from_enabled(&["md".into(), "txt".into()]).unwrap();
+        assert!(
+            rename_crosses_a_parser(&reg, "note.txt", "note.md"),
+            "txt -> md changes which parser reads the same bytes"
+        );
+        assert!(
+            rename_crosses_a_parser(&reg, "note.md", "note.txt"),
+            "the reverse direction crosses too"
+        );
+        assert!(
+            !rename_crosses_a_parser(&reg, "old.md", "new.md"),
+            "an .md -> .md rename never changes the parser"
+        );
+        assert!(
+            rename_crosses_a_parser(&reg, "note.xyz", "note.md"),
+            "an unregistered extension (no parser at all) is as different from `.md` as any \
+             other parser would be"
+        );
+        assert!(
+            !rename_crosses_a_parser(&reg, "note.xyz", "other.xyz"),
+            "two unregistered extensions do not cross -- neither side has a parser to lose"
+        );
     }
 
     #[test]

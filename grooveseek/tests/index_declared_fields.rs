@@ -439,6 +439,97 @@ fn an_interrupted_schema_change_is_refreshed_again_on_the_next_run() {
     assert_eq!(declared_meta(kb.kb()).as_deref(), Some("[\"status\"]"));
 }
 
+/// `[parsers].enabled = ["md", "txt"]` -- opts the `.txt` parser in, which does not read
+/// frontmatter at all. Written beside the KB and passed with `--config`, same reasoning as
+/// [`run_with_config`]'s doc: `groove.toml` discovery never looks under `--kb-path`.
+const MD_AND_TXT_PARSERS: &str = "[parsers]\nenabled = [\"md\", \"txt\"]\n";
+
+#[test]
+fn a_same_bytes_rename_from_txt_to_md_gains_its_declared_rows() {
+    // (codex P2 round 5 on PR #291) A same-hash rename that crosses parsers must be parsed
+    // again, not skipped by the rename fast path. `.txt`'s parser stores no frontmatter, so a
+    // file that starts as `note.txt` never gets `document_fields` rows even when its bytes are
+    // already a valid Markdown document with a declared key. Renamed to `note.md` with the
+    // same bytes (default context mode is `Off`, the mode this bug lived in), the rename
+    // detection in `rebuild_index` must still re-parse it under the `.md` parser.
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, MD_AND_TXT_PARSERS).unwrap();
+    kb.write(
+        "note.txt",
+        "---\ntitle: Note\nstatus: active\n---\n\n# Note\n\nBody long enough to pass the quality filter comfortably, about renaming a file between parsers.\n",
+    );
+    let (_, err, status) = run_with_config(kb.kb(), Some(&cfg), &["index"]);
+    assert!(status.success(), "{err}");
+    assert!(
+        fields_of(kb.kb(), "note.txt").is_empty(),
+        "the .txt parser does not read frontmatter, so it declares nothing yet"
+    );
+
+    std::fs::rename(kb.kb().join("note.txt"), kb.kb().join("note.md")).unwrap();
+    let (_, err, status) = run_with_config(kb.kb(), Some(&cfg), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "note.md"),
+        pairs(&[("status", "active")]),
+        "the same bytes, now read by the .md parser, must gain their declared rows: {err}"
+    );
+    let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+    let old_row_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents WHERE path = 'note.txt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_row_count, 0,
+        "the note.txt document row itself must be gone after the rename"
+    );
+}
+
+#[test]
+fn a_same_bytes_rename_from_md_to_txt_drops_its_declared_rows() {
+    // (codex P2 round 5 on PR #291) The reverse crossing: a same-hash rename from `.md` to
+    // `.txt` must also be parsed again, or the rows the `.md` parser wrote survive under a
+    // parser that would never have produced them.
+    let kb = corpus();
+    kb.write("groove-schema.toml", SCHEMA);
+    let cfg = kb.root().join("groove.toml");
+    std::fs::write(&cfg, MD_AND_TXT_PARSERS).unwrap();
+    let (_, err, status) = run_with_config(kb.kb(), Some(&cfg), &["index"]);
+    assert!(status.success(), "{err}");
+    assert_eq!(
+        fields_of(kb.kb(), "active.md"),
+        pairs(&[
+            ("environment", "dev"),
+            ("environment", "prod"),
+            ("status", "active")
+        ])
+    );
+
+    std::fs::rename(kb.kb().join("active.md"), kb.kb().join("active.txt")).unwrap();
+    let (_, err, status) = run_with_config(kb.kb(), Some(&cfg), &["index"]);
+    assert!(status.success(), "{err}");
+    assert!(
+        fields_of(kb.kb(), "active.txt").is_empty(),
+        "the .txt parser does not read frontmatter, so the old .md rows must not survive: {err}"
+    );
+    let conn = rusqlite::Connection::open(kb.root().join(".groove.db")).unwrap();
+    let old_row_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents WHERE path = 'active.md'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        old_row_count, 0,
+        "the active.md document row itself must be gone after the rename"
+    );
+}
+
 fn search_paths(kb: &Path, extra: &[&str]) -> (Vec<String>, serde_json::Value) {
     let mut args = vec![
         "search",
