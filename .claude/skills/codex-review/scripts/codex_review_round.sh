@@ -382,8 +382,15 @@ TERMINAL_ERROR_PATTERN="Something went wrong|Script exited|Try again later|usage
 # terminal ではない — push 直後に trigger すると codex 側の clone に ref がまだ無いだけで、
 # 再 trigger で通る (PR #258 / #265 / #293、3 回目で script 側に移した)。terminal より先に
 # 見て別の exit にする。再 trigger は controller の手 (body file 付きで次 round、1 round と数える)。
-TRANSIENT_REF_PATTERN="Provided git ref [0-9a-f]+ does not exist"
-if echo "$LATEST_ISSUE_BODY" | grep -qE "$TRANSIENT_REF_PATTERN"; then
+# ローカル codex (PR #293 の push 2、high): この round の comment は複数ありうる (罠 32/34) ので、
+# 繋いだ本文で grep すると ref error と quota 切れが同じ round に来た時に transient が勝つ。
+# comment ごとに分類し、ref error 以外で terminal に当たる comment が 1 つでもあれば下の exit 4 に落とす。
+TRANSIENT_REF_PATTERN="Provided git ref [0-9a-f]{40} does not exist"
+REF_ERROR_COMMENTS=$(echo "$NEW_ISSUES" | jq --arg re "$TRANSIENT_REF_PATTERN" \
+  '[.[] | .body // "" | select(test($re))] | length')
+OTHER_TERMINAL_COMMENTS=$(echo "$NEW_ISSUES" | jq --arg re "$TRANSIENT_REF_PATTERN" --arg term "$TERMINAL_ERROR_PATTERN" \
+  '[.[] | .body // "" | select(test($term) and (test($re) | not))] | length')
+if [ "$REF_ERROR_COMMENTS" -gt 0 ] && [ "$OTHER_TERMINAL_COMMENTS" -eq 0 ]; then
   diag "TRANSIENT: codex could not see the PR head yet (trap 60). Body follows on stdout."
   diag "Action: confirm the head sha exists (gh api repos/<o>/<r>/commits/<sha>), then re-trigger once with a body file. It counts as a round."
   echo "$LATEST_ISSUE_BODY"
