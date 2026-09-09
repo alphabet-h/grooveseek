@@ -96,6 +96,20 @@ impl KbCore {
             }
         }
 
+        // feature-58: declared-field filter. Same bounds as the list filters
+        // above, through `validate_field_filters` so the numbers stay in one
+        // place; keys first, then each key's values, in key order.
+        let fields = field_filters_from_params(params.fields.clone());
+        let fields_not = field_filters_from_params(params.fields_not.clone());
+        for (name, f) in [("fields", &fields), ("fields_not", &fields_not)] {
+            if let Err(e) = validate_field_filters(name, f) {
+                return serde_json::to_string_pretty(&ErrorResponse {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default();
+            }
+        }
+
         // path_globs を事前 compile。エラー時は ErrorResponse を返却。
         let cpg = match params.path_globs.as_ref() {
             Some(globs) => match compile_path_globs(globs) {
@@ -149,10 +163,8 @@ impl KbCore {
             tags_all,
             date_from: params.date_from.as_deref(),
             date_to: params.date_to.as_deref(),
-            // fields / fields_not (feature-58): not yet wired to an MCP tool
-            // param, so this call site defaults to "no filter" like every
-            // other unset field here. A later task wires the surface.
-            ..Default::default()
+            fields: Some(&fields),
+            fields_not: Some(&fields_not),
         };
 
         // feature-28 Task 2.9: MMR / parent_retriever の effective config を解決し、
@@ -244,6 +256,8 @@ impl KbCore {
             params.date_to.clone(),
             params.min_confidence_ratio,
             parsed.exclude().to_vec(),
+            fields.clone(),
+            fields_not.clone(),
         );
 
         // The `uri` on a hit and the URIs `resources/list` offers have to be the
@@ -826,6 +840,44 @@ pub fn validate_filter_list(name: &str, items: &[String]) -> anyhow::Result<()> 
             "{name} has an entry that is too large: {} bytes (max {FILTER_ITEM_MAX_BYTES} bytes).",
             too_long.len()
         );
+    }
+    Ok(())
+}
+
+/// The declared-field filters of a request as one [`crate::db::FieldFilters`]
+/// (feature-58): a string becomes a one-element list, lists are joined per
+/// key, duplicates and keys left empty are dropped. `None` is an empty map.
+///
+/// `FieldValues` stays `pub(crate)` — it is the untagged JSON bridge type the
+/// `fields` / `fields_not` tool parameters deserialize into, not part of the
+/// public API — while this function is `pub` so `main.rs`, a separate crate,
+/// can still reach it (in practice always with `None`, since the type it
+/// would otherwise have to name is not visible there). The mismatch is
+/// intentional, not a leak to fix; `private_interfaces` is silenced for it.
+#[allow(private_interfaces)]
+pub fn field_filters_from_params(
+    raw: Option<std::collections::BTreeMap<String, crate::server::FieldValues>>,
+) -> crate::db::FieldFilters {
+    crate::db::normalize_field_filters(raw.into_iter().flatten().map(|(k, v)| (k, v.into_vec())))
+}
+
+/// The bounds of a declared-field filter, through [`validate_filter_list`]
+/// so the numbers and the wording have one home: the key list first under
+/// `name` (entry count and key length), then each key's value list under
+/// `name.<key>` in key order. An empty key or value is refused before either,
+/// because the command line cannot produce one and the tool should not
+/// accept one silently.
+pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> anyhow::Result<()> {
+    if filters.keys().any(|k| k.is_empty()) {
+        anyhow::bail!("{name} has an empty key");
+    }
+    let keys: Vec<String> = filters.keys().cloned().collect();
+    validate_filter_list(name, &keys)?;
+    for (key, values) in filters {
+        if values.iter().any(|v| v.is_empty()) {
+            anyhow::bail!("{name}.{key} has an empty value");
+        }
+        validate_filter_list(&format!("{name}.{key}"), values)?;
     }
     Ok(())
 }

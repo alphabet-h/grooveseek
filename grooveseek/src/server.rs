@@ -63,8 +63,8 @@ use documents::{
 
 pub use search::{
     RERANK_BY_DEFAULT, SEARCH_LIMIT_MAX, clamp_search_limit, compile_path_globs,
-    compute_low_confidence, compute_match_spans, run_search_pipeline, should_rerank,
-    validate_filter_list,
+    compute_low_confidence, compute_match_spans, field_filters_from_params, run_search_pipeline,
+    should_rerank, validate_field_filters, validate_filter_list,
 };
 
 // The rest are reached only from tests, and the compiler is what said so: left
@@ -166,6 +166,26 @@ pub struct KbServer {
 // Tool parameter types
 // ---------------------------------------------------------------------------
 
+/// One value or a list of values for a declared-field filter (feature-58).
+/// The tool accepts both spellings so `{"status": "active"}` and
+/// `{"status": ["active"]}` are the same request; the echo always answers
+/// with the list.
+#[derive(Deserialize, schemars::JsonSchema, Clone, Debug)]
+#[serde(untagged)]
+pub(crate) enum FieldValues {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl FieldValues {
+    pub(crate) fn into_vec(self) -> Vec<String> {
+        match self {
+            FieldValues::One(s) => vec![s],
+            FieldValues::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 struct SearchParams {
@@ -204,6 +224,19 @@ struct SearchParams {
     date_from: Option<String>,
     /// Inclusive upper bound on `frontmatter.date` (lexicographic, ISO-8601 friendly).
     date_to: Option<String>,
+    /// (v1.9.0+) Keep only documents whose frontmatter holds one of the given
+    /// values for each key: `{"status": "active", "environment": ["dev", "prod"]}`
+    /// means status is active AND environment is dev or prod. Exact string
+    /// comparison. Only keys `groove-schema.toml` declared when the index was
+    /// built are in the index; a key it did not declare matches nothing.
+    /// A document without the key does not match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fields: Option<std::collections::BTreeMap<String, FieldValues>>,
+    /// (v1.9.0+) Drop documents whose frontmatter holds one of the given
+    /// values for any key: `{"status": "deprecated"}`. A document without the
+    /// key is kept. Same shape and rules as `fields`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fields_not: Option<std::collections::BTreeMap<String, FieldValues>>,
 
     // ----- low-confidence cutoff -----
     /// Rank-based ratio threshold for trimming low-confidence tail results.
@@ -531,6 +564,10 @@ pub struct SearchFilterEcho {
     min_confidence_ratio: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     excluded_terms: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields: Option<crate::db::FieldFilters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fields_not: Option<crate::db::FieldFilters>,
 }
 
 impl SearchFilterEcho {
@@ -552,6 +589,12 @@ impl SearchFilterEcho {
     /// "none given" and "an empty list" are the same fact. They are the
     /// phrases that were **applied**, not the `-groups` the query was written
     /// with — see [`crate::db::ParsedQuery::exclude`].
+    ///
+    /// `fields` / `fields_not` are the normalised maps as-is: a key with no
+    /// values would not be in the map to begin with (`normalize_field_filters`
+    /// already drops it), so an empty map is the only "no filter" state and
+    /// is omitted the same way an empty list is; a present map's values are
+    /// always arrays, never a bare string.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         category: Option<String>,
@@ -563,6 +606,8 @@ impl SearchFilterEcho {
         date_to: Option<String>,
         min_confidence_ratio: Option<f32>,
         excluded_terms: Vec<String>,
+        fields: crate::db::FieldFilters,
+        fields_not: crate::db::FieldFilters,
     ) -> Self {
         let with_effect = |v: Option<Vec<String>>| v.filter(|l| !l.is_empty());
         Self {
@@ -575,6 +620,8 @@ impl SearchFilterEcho {
             date_to,
             min_confidence_ratio,
             excluded_terms: with_effect(Some(excluded_terms)),
+            fields: Some(fields).filter(|m| !m.is_empty()),
+            fields_not: Some(fields_not).filter(|m| !m.is_empty()),
         }
     }
 }
@@ -2115,6 +2162,82 @@ mod tests {
         // 「filter 無効」を表す空配列は、上限の観点では常に OK。
         // (`path_globs` の空配列は compile_path_globs 側で別途エラーになる)
         assert!(validate_filter_list("tags_any", &[]).is_ok());
+    }
+
+    #[test]
+    fn field_filters_are_validated_keys_first_then_each_value_list_in_key_order() {
+        use crate::db::FieldFilters;
+        let mut ok = FieldFilters::new();
+        ok.insert("status".into(), vec!["active".into()]);
+        assert!(validate_field_filters("fields", &ok).is_ok());
+
+        let mut too_many_keys = FieldFilters::new();
+        for i in 0..=FILTER_LIST_MAX_ITEMS {
+            too_many_keys.insert(format!("k{i:03}"), vec!["v".into()]);
+        }
+        let err = validate_field_filters("fields", &too_many_keys)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("fields has too many entries"), "{err}");
+
+        let mut too_many_values = FieldFilters::new();
+        too_many_values.insert(
+            "status".into(),
+            (0..=FILTER_LIST_MAX_ITEMS)
+                .map(|i| format!("v{i}"))
+                .collect(),
+        );
+        let err = validate_field_filters("fields_not", &too_many_values)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields_not.status has too many entries"),
+            "{err}"
+        );
+
+        let mut long_value = FieldFilters::new();
+        long_value.insert("status".into(), vec!["x".repeat(FILTER_ITEM_MAX_BYTES + 1)]);
+        let err = validate_field_filters("fields", &long_value)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("fields.status has an entry that is too large"),
+            "{err}"
+        );
+
+        let mut empty_key = FieldFilters::new();
+        empty_key.insert(String::new(), vec!["v".into()]);
+        assert_eq!(
+            validate_field_filters("fields", &empty_key)
+                .unwrap_err()
+                .to_string(),
+            "fields has an empty key"
+        );
+
+        let mut empty_value = FieldFilters::new();
+        empty_value.insert("status".into(), vec![String::new()]);
+        assert_eq!(
+            validate_field_filters("fields", &empty_value)
+                .unwrap_err()
+                .to_string(),
+            "fields.status has an empty value"
+        );
+    }
+
+    #[test]
+    fn a_string_and_a_one_element_list_are_the_same_field_filter() {
+        let raw: std::collections::BTreeMap<String, FieldValues> = serde_json::from_str(
+            r#"{"status": "active", "team": ["core", "core", "infra"], "empty": []}"#,
+        )
+        .unwrap();
+        let f = field_filters_from_params(Some(raw));
+        assert_eq!(f.get("status").unwrap(), &vec!["active".to_string()]);
+        assert_eq!(
+            f.get("team").unwrap(),
+            &vec!["core".to_string(), "infra".to_string()]
+        );
+        assert!(!f.contains_key("empty"));
+        assert!(field_filters_from_params(None).is_empty());
     }
 
     #[test]
@@ -4147,7 +4270,45 @@ mod tests {
             Some("2026-12-31".to_string()),
             Some(1.5),
             vec!["async".to_string()],
+            crate::db::FieldFilters::new(),
+            crate::db::FieldFilters::new(),
         )
+    }
+
+    #[test]
+    fn the_echo_carries_field_filters_as_arrays_and_omits_empty_maps() {
+        use crate::db::FieldFilters;
+        let mut fields = FieldFilters::new();
+        fields.insert("status".into(), vec!["active".into()]);
+        let echo = SearchFilterEcho::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            fields,
+            FieldFilters::new(),
+        );
+        let v = serde_json::to_value(&echo).unwrap();
+        assert_eq!(v, serde_json::json!({"fields": {"status": ["active"]}}));
+        let empty = SearchFilterEcho::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            FieldFilters::new(),
+            FieldFilters::new(),
+        );
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
     }
 
     /// A response with every optional left out.
@@ -4246,6 +4407,8 @@ mod tests {
             None,
             None,
             Vec::new(),
+            crate::db::FieldFilters::new(),
+            crate::db::FieldFilters::new(),
         );
         let value = serde_json::to_value(&echo).expect("the echo serializes");
         assert_eq!(
@@ -4266,6 +4429,8 @@ mod tests {
             None,
             Some(1.25),
             Vec::new(),
+            crate::db::FieldFilters::new(),
+            crate::db::FieldFilters::new(),
         );
         assert_eq!(
             serde_json::to_value(&ratio_only).expect("the echo serializes"),
@@ -4286,7 +4451,17 @@ mod tests {
     fn the_echo_lists_the_applied_exclusions_and_omits_an_empty_list() {
         let echo = |excluded: Vec<String>| {
             serde_json::to_value(SearchFilterEcho::new(
-                None, None, None, None, None, None, None, None, excluded,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                excluded,
+                crate::db::FieldFilters::new(),
+                crate::db::FieldFilters::new(),
             ))
             .expect("the echo serializes")
         };

@@ -1964,6 +1964,11 @@ fn print_search_results(
                     date_to.map(str::to_owned),
                     explicit_ratio,
                     excluded_terms.to_vec(),
+                    // feature-58: the CLI has no `--field` / `--field-not` flag
+                    // yet, so this call site always echoes "no filter" — the
+                    // same state every other unset filter here starts from.
+                    grooveseek::db::FieldFilters::new(),
+                    grooveseek::db::FieldFilters::new(),
                 ),
             };
             println!(
