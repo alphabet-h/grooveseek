@@ -1057,6 +1057,41 @@ mod tests {
         assert_eq!(n, 0, "reset_for_model must empty document_fields");
     }
 
+    /// (local Codex on PR #291 after round 10) The generation key goes with the
+    /// rows it vouches for: after `reset_for_model` wiped `document_fields`, the
+    /// key must be absent (pending) in the same commit, not still naming a set no
+    /// row was written under -- otherwise a field-filtered search in the gap
+    /// before `rebuild_index` clears it answers "no match" instead of refusing.
+    #[test]
+    fn reset_for_model_leaves_the_declared_set_pending_with_the_rows_it_wiped() {
+        let db = db_with_384();
+        db.upsert_document("a.md", Some("t"), None, None, None, &[], None, "h", 0)
+            .unwrap();
+        db.replace_document_fields("a.md", &[("status".to_string(), "active".to_string())])
+            .unwrap();
+        db.write_declared_fields(r#"["status"]"#).unwrap();
+
+        db.reset_for_model("bge-small-en-v1.5", 384).unwrap();
+
+        assert_eq!(
+            db.read_declared_fields().unwrap(),
+            None,
+            "the key must fall with the rows, in the same transaction"
+        );
+        let active = field_map(&[("status", &["active"])]);
+        let f = SearchFilters {
+            fields: Some(&active),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_similar(&dummy_embedding(0.1), 10, &f)
+                .unwrap_err()
+                .to_string(),
+            FIELD_FILTERS_PENDING,
+            "a search in the gap after the reset is refused, not answered as empty"
+        );
+    }
+
     #[test]
     fn declared_fields_meta_round_trips() {
         let db = db_with_384();
@@ -5193,6 +5228,10 @@ mod tests {
         .unwrap();
         db.replace_document_fields("b.md", &[("status".to_string(), "deprecated".to_string())])
             .unwrap();
+        // The generation key a completed `rebuild_index` would have recorded for
+        // these rows: without it every field-filtered search below is refused as
+        // pending (`Database::refuse_field_filters_while_pending`).
+        db.write_declared_fields(r#"["status","team"]"#).unwrap();
         db
     }
 
@@ -5233,15 +5272,17 @@ mod tests {
         v
     }
 
-    /// (codex P2 round 10 on PR #291) The hybrid path -- the one every front end
-    /// takes -- refuses a `fields` / `fields_not` filter while
-    /// `index_meta.declared_fields` is absent, and only then: `[]` and a real
-    /// list are recorded answers, and a request without a field filter is not
-    /// gated at all. [`Database::refuse_field_filters_while_pending`]'s doc has
-    /// why the absent state cannot be answered from.
+    /// (codex P2 round 10 on PR #291) Every search leg refuses a `fields` /
+    /// `fields_not` filter while `index_meta.declared_fields` is absent, and only
+    /// then: `[]` and a real list are recorded answers, and a request without a
+    /// field filter is not gated at all. [`Database::refuse_field_filters_while_pending`]'s
+    /// doc has why the absent state cannot be answered from. The hybrid path and
+    /// (local Codex after round 10) the single-leg entry points `search_similar` /
+    /// `search_fts_candidates` are all asserted, since the guard sits in the legs.
     #[test]
     fn a_field_filter_is_refused_until_the_index_records_its_declared_set() {
         let db = db_with_declared_fields();
+        db.clear_declared_fields().unwrap();
         assert_eq!(db.read_declared_fields().unwrap(), None);
         let active = field_map(&[("status", &["active"])]);
         let with_filter = SearchFilters {
@@ -5268,6 +5309,25 @@ mod tests {
             hybrid(&not_filter).unwrap_err().to_string(),
             FIELD_FILTERS_PENDING,
             "fields_not is gated the same way"
+        );
+        assert_eq!(
+            db.search_similar(&dummy_embedding(0.1), 10, &with_filter)
+                .unwrap_err()
+                .to_string(),
+            FIELD_FILTERS_PENDING,
+            "the vector leg alone is gated too"
+        );
+        assert_eq!(
+            db.search_fts_candidates(
+                "fieldfilter_unique_keyword",
+                10,
+                &with_filter,
+                FusionParams::default()
+            )
+            .unwrap_err()
+            .to_string(),
+            FIELD_FILTERS_PENDING,
+            "the FTS leg alone is gated too"
         );
 
         // No field filter: the pending state is not the search's concern.
@@ -5399,6 +5459,9 @@ mod tests {
     #[test]
     fn a_field_filter_shortfall_still_widens_past_an_exclusion_heavy_window() {
         let db = db_with_384();
+        // The vector leg refuses a field filter until the declared set is recorded
+        // (round 10); this test is about the widening, so record it up front.
+        db.write_declared_fields(r#"["status"]"#).unwrap();
         let add = |path: &str, content: &str, e: f32, active: bool| -> i64 {
             let doc = db
                 .upsert_document(path, Some(path), None, None, None, &[], None, path, 0)

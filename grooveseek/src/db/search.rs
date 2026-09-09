@@ -217,6 +217,7 @@ impl Database {
     ) -> Result<Vec<(i64, SearchResult)>> {
         #[cfg(test)]
         FTS_CANDIDATE_CALLS.with(|c| c.set(c.get() + 1));
+        self.refuse_field_filters_while_pending(filters)?;
         // 切り詰めの警告は 1 検索 1 回。ここが「クエリを FTS に投げる」唯一の経路。
         query.warn_if_truncated();
         let Some(fts_query) = query.match_expr() else {
@@ -447,7 +448,6 @@ impl Database {
         filters: &SearchFilters<'_>,
         fusion: FusionParams,
     ) -> Result<(CandidateHits, CandidateHits)> {
-        self.refuse_field_filters_while_pending(filters)?;
         let parsed = parse_query(query_text);
         let excluded = self.excluded_chunk_ids(parsed.negative_match().as_deref())?;
         let vec_hits =
@@ -469,12 +469,19 @@ impl Database {
     /// (`declared_fields_recorded` returning `None`); this is the same rule on the
     /// read side.
     ///
-    /// Here rather than in the CLI arm or the MCP tool body: every search that
-    /// can carry a field filter -- `groove search`, the MCP `search` tool, `eval`,
-    /// `tune` -- comes through [`Database::search_split_candidates`], so the
-    /// refusal has one home and the two front ends cannot drift (AGENTS.md "one
-    /// question gets one implementation"). An empty map is not a filter and is
-    /// not refused; `[]` (a completed pass that declared nothing) is a recorded
+    /// Here rather than in the CLI arm or the MCP tool body, and in **both legs**
+    /// rather than only where the hybrid search joins them: the refusal has one
+    /// implementation, called from the two places that build the field predicate
+    /// ([`Database::search_vec_candidates_excluding`] and
+    /// [`Database::search_fts_candidates_parsed`]), so no entry point can reach the
+    /// predicate around it -- `groove search`, the MCP `search` tool, `eval`, `tune`,
+    /// and the single-leg `pub` / `pub(crate)` methods ([`Database::search_similar`],
+    /// [`Database::search_fts_candidates`]) a library caller or a sweep uses directly
+    /// (local Codex on PR #291 after round 10: gating only
+    /// [`Database::search_split_candidates`] left `search_similar` answering from the
+    /// pending state). A hybrid search therefore asks twice, one tiny `index_meta` read
+    /// per leg, and only when a field filter is present. An empty map is not a filter
+    /// and is not refused; `[]` (a completed pass that declared nothing) is a recorded
     /// answer, and a filter against it simply matches nothing, as documented.
     fn refuse_field_filters_while_pending(&self, filters: &SearchFilters<'_>) -> Result<()> {
         let field_filtered = filters.fields.is_some_and(|f| !f.is_empty())
@@ -608,6 +615,7 @@ impl Database {
         filters: &SearchFilters<'_>,
         excluded: &HashSet<i64>,
     ) -> Result<Vec<(i64, SearchResult)>> {
+        self.refuse_field_filters_while_pending(filters)?;
         // filter 指定があれば over-fetch する (詳細は SearchFilters::has_any)。
         // category/topic/path_globs/tags/date は Rust 側フィルタなので
         // 必ず over-fetch が必要、min_quality 単独でも fail-safe で広げる。
