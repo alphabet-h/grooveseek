@@ -25,8 +25,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   linked into the binaries.
 - **Release archives are signed with GitHub artifact attestations**
   (`github-attestations` in cargo-dist). `gh attestation verify <archive>
-  --repo alphabet-h/grooveseek` checks that a download was built by this repository's
-  release workflow.
+  --repo alphabet-h/grooveseek` checks that a download was built by GitHub Actions in this
+  repository.
 - **`SECURITY.md`.** Vulnerabilities go through GitHub's private reporting,
   not public issues; the file states the response target, which versions are
   fixed, and what is a documented limit rather than a defect. README links to
