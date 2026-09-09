@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-10
+
 ### Added
 
 - **Search filters on the keys the schema declares.** `groove search --field
@@ -52,16 +54,25 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Changed
 
 - **The Markdown parser keeps every top-level frontmatter key**, not only the
-  five it has fields for. Nothing but `groove validate` reads the extra keys:
-  the index, its filters, `get_document` and every other parser are unchanged,
-  and the YAML merge key `<<` is still dropped. A retained value is read for
-  its shape only and the nesting under it is skipped rather than buffered, so
-  the parser's recursion and repetition budgets apply exactly as they did
-  before — a document 1.8.0 indexed still indexes.
+  five it has fields for. `groove validate` checks the extra keys against the
+  schema, and `groove index` stores the additional ones the schema declares —
+  beyond `title` / `date` / `topic` / `depth` / `tags`, which keep their own
+  columns and filters — so `search` can filter on them (see Added above); a
+  key the schema does not declare is neither stored nor searchable. `get_document` and every other parser are
+  unchanged, and the YAML merge key `<<` is still dropped. A retained value is
+  read for its shape only and the nesting under it is skipped rather than
+  buffered, so the parser's recursion and repetition budgets apply exactly as
+  they did before — a document 1.8.0 indexed still indexes.
 - **`groove index` reads `groove-schema.toml`.** The file `groove validate`
   reads is now also read at index time, from the knowledge base root, to
   learn which keys to store; a schema that does not load stops the index
   with its load error instead of indexing without it. (#289)
+
+### Documentation
+
+- `docs/eval.md` reproduces a third-party benchmark against QMD on this
+  corpus, with attribution, and records the gap `--field-not
+  status=deprecated` is meant to close once `status` is a declared key. (#288)
 
 ## [1.8.0] - 2026-09-08
 
@@ -5328,7 +5339,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/alphabet-h/grooveseek/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/alphabet-h/grooveseek/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/alphabet-h/grooveseek/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/alphabet-h/grooveseek/compare/v1.5.0...v1.6.0
