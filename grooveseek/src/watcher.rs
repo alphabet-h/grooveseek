@@ -798,7 +798,7 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         }
         Ok(indexer::RenameOutcome::RenamedButRefusedAndDropped) => {
             wdiag!(
-                "watcher: renamed {old_rel} -> {new_rel} (new path refused by the new parser, \
+                "watcher: renamed {old_rel} -> {new_rel} (the new parser could not index it, \
                  document dropped from the index)"
             );
         }

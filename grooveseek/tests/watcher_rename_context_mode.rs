@@ -268,9 +268,11 @@ fn test_changed_bytes_cross_parser_rename_that_the_new_parser_refuses_drops_the_
         &registry,
     )
     .expect("rename_single_file");
-    assert!(
-        !matches!(outcome, RenameOutcome::RenamedAndReindexed { .. }),
-        "the PDF parser cannot read Markdown bytes, so this must not report a reindex: {outcome:?}"
+    assert_eq!(
+        outcome,
+        RenameOutcome::RenamedButRefusedAndDropped,
+        "the PDF parser cannot read Markdown bytes, and the row was dropped, so the outcome \
+         must say so (codex P2 round 13): {outcome:?}"
     );
 
     let conn = rusqlite::Connection::open(&db_path).expect("open db for inspection");

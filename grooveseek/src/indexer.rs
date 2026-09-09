@@ -978,6 +978,7 @@ pub fn rebuild_index(
     finish_declared_fields_pass(
         db,
         pass_token.as_deref(),
+        stored_declared.as_deref(),
         &declared_json,
         force || !refresh_fields || !refresh_pending,
     )?;
@@ -1658,9 +1659,10 @@ pub enum RenameOutcome {
     /// 理由は refusal」と伝わる。DB の content_hash は旧内容のままで、
     /// 次回 full rebuild の walk-time check が row ごと取り除く。
     RenamedButRefused,
-    /// (codex P2 round 11 / 12 on PR #291) [`RenameOutcome::RenamedButRefused`], but the rename
-    /// crossed a parser, so the old parser's row was **dropped**; "content left as it was"
-    /// would be false, hence the separate variant.
+    /// (codex P2 round 11 / 12 / 13 on PR #291) The rename crossed a parser and the new
+    /// parser could not index the bytes -- it refused them at either read, failed to parse
+    /// them, or found nothing to chunk -- so the old parser's row was **dropped**; "content
+    /// left as it was" would be false, hence the separate variant.
     RenamedButRefusedAndDropped,
 }
 
@@ -1843,6 +1845,14 @@ pub fn rename_single_file(
     // paths by equal hash, so every rename it settles is same-byte by construction.
     if crosses_a_parser {
         settle_cross_parser_rename(db, new_rel, &single_result)?;
+    }
+    // (codex P2 round 13 on PR #291) Once the settlement above dropped the row, the outcome
+    // must say so whatever the reparse came back with: the second-read refusal and a parse
+    // that failed or found nothing all leave the same state -- no document under the new
+    // path -- and `RenamedButRefused` / `Renamed` would both tell the watcher's reader the
+    // content was kept.
+    if crosses_a_parser && !matches!(single_result, SingleResult::Updated { .. }) {
+        return Ok(RenameOutcome::RenamedButRefusedAndDropped);
     }
     match single_result {
         SingleResult::Updated { chunks, .. } => Ok(RenameOutcome::RenamedAndReindexed { chunks }),
@@ -2141,10 +2151,26 @@ fn begin_declared_fields_pass(db: &Database) -> Result<String> {
 fn finish_declared_fields_pass(
     db: &Database,
     token: Option<&str>,
+    observed_at_start: Option<&str>,
     declared_json: &str,
     record: bool,
 ) -> Result<bool> {
     let tx = db.begin_immediate_transaction()?;
+    // (codex P2 round 13 on PR #291) A run that began no pass (its schema matched the
+    // recorded generation) still must not write over a generation some other process
+    // recorded meanwhile: B changes the schema, refreshes every row, records `[b]` and
+    // clears its token before A gets here, and A -- token-less, seeing no pass open --
+    // would rewrite `[a]` over rows B produced. The evidence A has is the generation it
+    // observed when it started; if the key no longer reads that, another run finished in
+    // between and A's answer is stale.
+    if token.is_none() && db.read_declared_fields()?.as_deref() != observed_at_start {
+        tx.commit()?;
+        tracing::warn!(
+            "another `groove index` run recorded a different declared-field set while this \
+             one was running; this run leaves that set in place"
+        );
+        return Ok(false);
+    }
     // (local Codex on PR #291 after round 12, second pass) Ownership first: the token in the
     // database is this pass's only if no other process began a pass since. If another did,
     // its generation is the one in flight -- this run's rows were written under a set that
@@ -3552,7 +3578,10 @@ mod tests {
         // No pass running: a watcher mark is a no-op, and a finish with no token records.
         db.mark_declared_fields_dirty().unwrap();
         assert_eq!(db.read_declared_fields_dirty().unwrap(), None);
-        assert!(finish_declared_fields_pass(&db, None, r#"["status"]"#, true).unwrap());
+        assert!(
+            finish_declared_fields_pass(&db, None, Some(r#"["status"]"#), r#"["status"]"#, true)
+                .unwrap()
+        );
         assert_eq!(
             db.read_declared_fields().unwrap().as_deref(),
             Some(r#"["status"]"#)
@@ -3575,7 +3604,8 @@ mod tests {
 
         // The pass finishes: it must NOT record the generation, and it cleans up after itself.
         assert!(
-            !finish_declared_fields_pass(&db, Some(&token), r#"["status","team"]"#, true).unwrap(),
+            !finish_declared_fields_pass(&db, Some(&token), None, r#"["status","team"]"#, true)
+                .unwrap(),
             "a write under this pass leaves the generation pending"
         );
         assert_eq!(db.read_declared_fields().unwrap(), None);
@@ -3586,7 +3616,8 @@ mod tests {
         let next = begin_declared_fields_pass(&db).unwrap();
         assert_ne!(next, token);
         assert!(
-            finish_declared_fields_pass(&db, Some(&next), r#"["status","team"]"#, true).unwrap()
+            finish_declared_fields_pass(&db, Some(&next), None, r#"["status","team"]"#, true)
+                .unwrap()
         );
         assert_eq!(
             db.read_declared_fields().unwrap().as_deref(),
@@ -3603,11 +3634,11 @@ mod tests {
             None,
             "beginning a pass drops the previous pass's mark with its token"
         );
-        assert!(finish_declared_fields_pass(&db, Some(&newer), "[]", true).unwrap());
+        assert!(finish_declared_fields_pass(&db, Some(&newer), None, "[]", true).unwrap());
 
         // `record == false` (the caller's own reasons to leave the key absent) still cleans up.
         let t = begin_declared_fields_pass(&db).unwrap();
-        assert!(!finish_declared_fields_pass(&db, Some(&t), "[]", false).unwrap());
+        assert!(!finish_declared_fields_pass(&db, Some(&t), None, "[]", false).unwrap());
         assert_eq!(db.read_declared_fields().unwrap(), None);
         assert_eq!(db.read_declared_fields_pass().unwrap(), None);
     }
@@ -3657,7 +3688,7 @@ mod tests {
         // A: the pass finishing while B holds the lock. It must wait, then see the mark.
         let started = std::time::Instant::now();
         let recorded =
-            finish_declared_fields_pass(&a, Some(&token), r#"["status"]"#, true).unwrap();
+            finish_declared_fields_pass(&a, Some(&token), None, r#"["status"]"#, true).unwrap();
         b_thread.join().unwrap();
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(300),
@@ -3701,7 +3732,7 @@ mod tests {
         );
 
         // A finishes first: superseded, records nothing, leaves B's token alone.
-        assert!(!finish_declared_fields_pass(&db, Some(&token_a), r#"["a"]"#, true).unwrap());
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), None, r#"["a"]"#, true).unwrap());
         assert_eq!(db.read_declared_fields().unwrap(), None);
         assert_eq!(
             db.read_declared_fields_pass().unwrap().as_deref(),
@@ -3709,7 +3740,7 @@ mod tests {
             "a superseded pass must not clear the owner's token"
         );
         // B finishes with no mark against it: records.
-        assert!(finish_declared_fields_pass(&db, Some(&token_b), r#"["b"]"#, true).unwrap());
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
         assert_eq!(
             db.read_declared_fields().unwrap().as_deref(),
             Some(r#"["b"]"#)
@@ -3734,9 +3765,9 @@ mod tests {
             Some(token_b.as_str()),
             "A's write under B's pass marks B, not A"
         );
-        assert!(!finish_declared_fields_pass(&db, Some(&token_b), r#"["b"]"#, true).unwrap());
+        assert!(!finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
         assert_eq!(db.read_declared_fields().unwrap(), None);
-        assert!(!finish_declared_fields_pass(&db, Some(&token_a), r#"["a"]"#, true).unwrap());
+        assert!(!finish_declared_fields_pass(&db, Some(&token_a), None, r#"["a"]"#, true).unwrap());
         assert_eq!(
             db.read_declared_fields().unwrap(),
             None,
@@ -3760,19 +3791,62 @@ mod tests {
             db.read_declared_fields_dirty().unwrap().as_deref(),
             Some(token_b.as_str())
         );
-        assert!(!finish_declared_fields_pass(&db, None, r#"["a"]"#, true).unwrap());
+        assert!(!finish_declared_fields_pass(&db, None, None, r#"["a"]"#, true).unwrap());
         assert_eq!(
             db.read_declared_fields_pass().unwrap().as_deref(),
             Some(token_b.as_str()),
             "a pass-less run leaves the open pass untouched"
         );
-        assert!(!finish_declared_fields_pass(&db, Some(&token_b), r#"["b"]"#, true).unwrap());
+        assert!(!finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
 
         // With no pass open at all, a pass-less run records as before.
-        assert!(finish_declared_fields_pass(&db, None, r#"["a"]"#, true).unwrap());
+        assert!(finish_declared_fields_pass(&db, None, None, r#"["a"]"#, true).unwrap());
         assert_eq!(
             db.read_declared_fields().unwrap().as_deref(),
             Some(r#"["a"]"#)
+        );
+    }
+
+    /// (codex P2 round 13 on PR #291) A run that began no pass -- its schema matched the
+    /// recorded generation -- finishes after another process changed the schema, refreshed
+    /// every row, recorded the new generation and cleared its token. No pass is open, so
+    /// the ownership check alone would let the first run rewrite its stale set over rows
+    /// the other produced. The evidence it has is the generation it observed at its start;
+    /// when the key no longer reads that, it records nothing.
+    #[test]
+    fn a_pass_less_run_does_not_write_over_a_generation_recorded_while_it_ran() {
+        let db = Database::open_in_memory().unwrap();
+        db.write_declared_fields(r#"["a"]"#).unwrap();
+        // A starts: schema `[a]` matches the recorded generation, so no pass, and it
+        // remembers what it observed.
+        let observed_by_a = db.read_declared_fields().unwrap();
+        assert_eq!(observed_by_a.as_deref(), Some(r#"["a"]"#));
+
+        // B: schema changed to `[b]`, a full pass, recorded, token cleared.
+        let token_b = begin_declared_fields_pass(&db).unwrap();
+        assert!(finish_declared_fields_pass(&db, Some(&token_b), None, r#"["b"]"#, true).unwrap());
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#)
+        );
+
+        // A finishes: no pass open, but the key is not what A observed -- it must not
+        // write `[a]` back over B's rows.
+        assert!(
+            !finish_declared_fields_pass(&db, None, observed_by_a.as_deref(), r#"["a"]"#, true)
+                .unwrap()
+        );
+        assert_eq!(
+            db.read_declared_fields().unwrap().as_deref(),
+            Some(r#"["b"]"#),
+            "B's generation stands; A's stale set was not written over it"
+        );
+
+        // Control: had nothing changed, the same run rewrites its (unchanged) value.
+        db.write_declared_fields(r#"["a"]"#).unwrap();
+        assert!(
+            finish_declared_fields_pass(&db, None, observed_by_a.as_deref(), r#"["a"]"#, true)
+                .unwrap()
         );
     }
 
