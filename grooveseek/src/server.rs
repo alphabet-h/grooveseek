@@ -571,8 +571,9 @@ impl SearchFilterEcho {
     /// with — see [`crate::db::ParsedQuery::exclude`].
     ///
     /// `fields` / `fields_not` are the normalised maps as-is: a key with no
-    /// values would not be in the map to begin with (`normalize_field_filters`
-    /// already drops it), so an empty map is the only "no filter" state and
+    /// values would not be in the map to begin with
+    /// ([`crate::db::normalize_field_filters`] already drops it), so an empty
+    /// map is the only "no filter" state and
     /// is omitted the same way an empty list is; a present map's values are
     /// always arrays, never a bare string.
     #[allow(clippy::too_many_arguments)]

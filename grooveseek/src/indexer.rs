@@ -475,7 +475,7 @@ pub enum SingleResult {
         frontmatter_unparsed: bool,
     },
     /// (#251 / feature-58) 内容は変わっていないが metadata だけ書き直した。embedding は触らない。
-    /// `rebuild_index` の upgrade 経路でしか返らない。`frontmatter_unparsed` は
+    /// [`rebuild_index`] の upgrade 経路でしか返らない。`frontmatter_unparsed` は
     /// **この文書の frontmatter が壊れていたか** — 集計はそれだけを
     /// [`IndexResult::frontmatter_unparsed`] に数える。宣言 key の書き直しだけで
     /// 通った文書は `false` で返り、`[index].fail_on_frontmatter_error` を動かさない。
@@ -944,6 +944,7 @@ enum Reindex {
 /// rebuild_index 本体と、将来 watcher から呼ばれる `reindex_single_file` の
 /// 両方で共通利用される核の処理。embedder は `&mut` で要求する (fastembed は
 /// 同時呼び出し不可)。呼び出し側で Mutex 経由の相互排他を保証すること。
+#[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
     db: &Database,
     embedder: &mut Embedder,
@@ -1444,11 +1445,7 @@ pub fn reindex_single_file(
     let context_mode = db.read_context_mode()?.unwrap_or(ContextMode::Off);
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
     // recorded; they do not read the schema themselves.
-    let declared_fields: Vec<String> = match db.read_declared_fields()? {
-        Some(json) => serde_json::from_str(&json)
-            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}"))?,
-        None => Vec::new(),
-    };
+    let declared_fields = declared_fields_recorded(db)?;
     // (#251) The one-time frontmatter check belongs to `rebuild_index`.
     index_single_disk_entry(
         db,
@@ -1631,11 +1628,7 @@ pub fn rename_single_file(
     };
     // (feature-58) The watcher paths write what the last completed `rebuild_index`
     // recorded; they do not read the schema themselves.
-    let declared_fields: Vec<String> = match db.read_declared_fields()? {
-        Some(json) => serde_json::from_str(&json)
-            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}"))?,
-        None => Vec::new(),
-    };
+    let declared_fields = declared_fields_recorded(db)?;
     // same_hash (= Static-mode-forced) の場合のみ force=true で
     // hash 一致 fast path をバイパスする。内容が変わっている場合は
     // 通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
@@ -1835,6 +1828,18 @@ pub(crate) const FRONTMATTER_POLICY: &str = "tag-unparsed";
 /// no key beyond the five named ones, or there is no schema: the JSON of an
 /// empty list. Recorded without a refresh pass, since there is nothing to write.
 pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
+
+/// The declared-field list the last completed `rebuild_index` recorded, read
+/// back via [`Database::read_declared_fields`] and parsed out of its JSON.
+/// `None` (no generation key stored yet) becomes an empty list, matching
+/// [`declared_field_names`]`(None)`.
+fn declared_fields_recorded(db: &Database) -> Result<Vec<String>> {
+    match db.read_declared_fields()? {
+        Some(json) => serde_json::from_str(&json)
+            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}")),
+        None => Ok(Vec::new()),
+    }
+}
 
 /// The keys `groove-schema.toml` declares that the parser keeps in
 /// [`crate::parser::Frontmatter::extra`] — every `[fields.<name>]` except the

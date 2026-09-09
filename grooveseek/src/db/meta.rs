@@ -6,13 +6,14 @@
 //! writing `index_meta` (embedding model, dimension, context mode, the tags
 //! parse-failure counter), counting what is stored, and the operations that
 //! rewrite or relabel the whole index — `backfill_fts`, `backfill_quality`,
-//! `reset_for_model`, the renames.
+//! [`crate::db::Database::reset_for_model`], the renames.
 //!
-//! `reset_for_model` is the sharpest of these: six writes (four DELETEs, the
-//! `vec_chunks` rebuild, the `index_meta` update) that have to land as one
-//! transaction, because a partial failure leaves a state no re-run repairs —
-//! documents present with no chunks, or `vec_chunks` at a new dimension while
-//! `index_meta` still names the old model.
+//! [`crate::db::Database::reset_for_model`] is the sharpest of these: six
+//! writes (four DELETEs, the `vec_chunks` rebuild, the `index_meta` update)
+//! that have to land as one transaction, because a partial failure leaves a
+//! state no re-run repairs — documents present with no chunks, or
+//! `vec_chunks` at a new dimension while `index_meta` still names the old
+//! model.
 //!
 //! Split out of `db.rs` in AU-25 (PR-4), completing the item. The methods are
 //! byte-identical and keep their visibility.

@@ -229,7 +229,7 @@ impl Database {
         // feature-47 D-4: 重みは **番号付き** bind parameter で渡す。匿名 `?` は
         // SELECT と ORDER BY で別々に採番されて既存の `?1`/`?2` と衝突し
         // "statement uses 6, 5 supplied" になるため使ってはならない。feature-58
-        // の `?6` 以降は [`field_predicates`] が同じ理由で採番する。
+        // の `?6` 以降は `field_predicates` が同じ理由で採番する。
         // NaN / inf は bind 経路を silent に通ってしまうので、値域の防波堤は
         // `Config::validate()` 唯一 (D-2 / E-2)。
         let (pred, pred_binds) = field_predicates(6, filters.fields, filters.fields_not);
@@ -536,6 +536,14 @@ impl Database {
     ///   **filter をすべて通った行**を除外で落とした数が 0)
     /// - KNN が `fetch_k` に満たない行数を返した = corpus を読み切った
     /// - `fetch_k` が [`VEC_KNN_MAX_K`] に達した
+    ///
+    /// ただし 3 つ目は `fields` / `fields_not` が SQL 側の `WHERE` に入った今は
+    /// 「corpus を読み切った」と等値ではない。sqlite-vec が返した `fetch_k` 件を
+    /// `EXISTS` / `NOT EXISTS` が後段で落とすので、`fetch_k` 未満で返ることは
+    /// corpus の残りとは無関係に起きる。field filter と `-除外語` を併用した
+    /// クエリだけ、本当は再取得すれば埋まる場面で 1 周で打ち切りうる —
+    /// 結果が誤るわけではなく recall が落ちるだけ ([`Self::fetch_vec_page`] の
+    /// `rows_seen` の注記も参照)。
     ///
     /// 2 つ目が「`excluded` が空」ではないのが要点 (round 2)。category / path / date /
     /// quality の filter で `limit` に届かないのは feature-26 以来の既存挙動で、ここで

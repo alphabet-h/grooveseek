@@ -861,9 +861,10 @@ pub(crate) fn field_filters_from_params(
 /// The bounds of a declared-field filter, through [`validate_filter_list`]
 /// so the numbers and the wording have one home: the key list first under
 /// `name` (entry count and key length), then each key's value list under
-/// `name.<key>` in key order. An empty key or value is refused before either,
-/// because the command line cannot produce one and the tool should not
-/// accept one silently.
+/// `name.<key>` in key order. An empty key is refused before the key-list
+/// bound runs; an empty value is refused before that key's own value-list
+/// bound runs. Neither the command line nor the tool should accept one
+/// silently.
 pub fn validate_field_filters(name: &str, filters: &crate::db::FieldFilters) -> anyhow::Result<()> {
     if filters.keys().any(|k| k.is_empty()) {
         anyhow::bail!("{name} has an empty key");
