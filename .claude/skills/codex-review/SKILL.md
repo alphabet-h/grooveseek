@@ -98,8 +98,10 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
   名前に変えると `error: unresolved link` で exit 101 = lint は生きている)。**「private」の一語で
   下の行へ振らない** — 台帳 #43 はそれで P2 を受けた
 - **リンクにできない item は backtick のまま残し、持ち主を名指す** — 持ち主の module が
-  link できるなら **必ず `` [`crate::…`] `` で link する** (`AGENTS.md`「Link the module and leave the
-  item in prose」: **他** module に private な item、`tests/` crate から見た lib の `pub(crate)` item)。
+  link できるなら **必ず link する**。path は書く側で決まる: lib の中からは `` [`crate::…`] ``、
+  `tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (表の `PRIVATE_ELSEWHERE` と同じ。
+  `AGENTS.md`「Link the module and leave the item in prose」: **他** module に private な item、
+  `tests/` crate から見た lib の `pub(crate)` item)。
   散文だけで済ませてよいのは、link できる持ち主が無い場合だけ: 非 test の doc から名指した
   `#[cfg(test)] mod tests` の中の item (module 自体が rustdoc に無い) / 別の `tests/` crate の
   test fn。**item だけが `#[cfg(test)]` で gate されている** (`db.rs` の `rrf_topk`、`config.rs` の
