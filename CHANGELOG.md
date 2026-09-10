@@ -34,6 +34,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   Retires the "does not yet look at the table" consequence of
   [ADR-0020](docs/decisions/0020-let-the-index-hold-what-the-schema-declares.md).
 
+### Documentation
+
+- **The third-party benchmark in `docs/eval.md` now carries QMD's
+  *deprecated-trap* figure.** The author corrected the per-class results in
+  issue #252 (QMD won three classes on P@1, not one); the class this project
+  tracks as a to-do read `0.000` with no opponent figure, and now reads
+  `0.000 against QMD's 0.250`. The correction is linked from the citation.
+
 ## [1.10.0] - 2026-09-10
 
 ### Added

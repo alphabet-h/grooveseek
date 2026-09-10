@@ -366,7 +366,9 @@ CI 例:
 以下の数値は **Johannes Engler
 ([@johannes-engler-mw](https://github.com/johannes-engler-mw))** 氏が
 [issue #252](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5586388455)
-で計測・公開したもので、許可を得て帰属を明記して転載している。本プロジェクト自身の
+で計測・公開したもの (class 別の数値は著者自身が
+[後続コメント](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5587593614)
+で訂正) で、許可を得て帰属を明記して転載している。本プロジェクト自身の
 計測ではない。条件と負けた項目も勝った項目と一緒に写している — それを省いた引用には
 価値が無いため。
 
@@ -390,7 +392,7 @@ hit を返し、同じ方法で文書単位に dedup。
 | QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
 
 **GrooveSeek が負けた、または同点だった項目。** *typo* (n=6): P@1 0.500 対 QMD 0.833、全 class の中で
-QMD 側の差が最も大きい。*deprecated-trap* (n=4): P@1 **0.000** — keyword の重なりが多い deprecated
+QMD 側の差が最も大きい。*deprecated-trap* (n=4): P@1 **0.000** 対 QMD 0.250 — keyword の重なりが多い deprecated
 runbook が、現行の後継を毎回 rank 1 で押しのける。*environment-filtered* (n=5): 0.200 で
 同点 — ただし著者はこれを retrieval ではなく corpus に起因すると跡付けている: 74 文書中
 69 文書は、出典が environment を明記していないため一律 `[dev, test, prod]` を持ち、その

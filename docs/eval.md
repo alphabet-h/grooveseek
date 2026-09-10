@@ -384,7 +384,9 @@ when the previous run's fingerprint differs.
 
 The numbers below were measured and published by **Johannes Engler
 ([@johannes-engler-mw](https://github.com/johannes-engler-mw))** in
-[issue #252](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5586388455),
+[issue #252](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5586388455)
+(per-class figures corrected by the author in a
+[follow-up](https://github.com/alphabet-h/grooveseek/issues/252#issuecomment-5587593614)),
 and are reproduced here with permission and attribution. They are not this
 project's own measurements; the conditions and the losses are copied along
 with the wins, because a citation that omits them is not worth much.
@@ -413,8 +415,8 @@ reported as unsupported and excluded rather than scored as failures, leaving
 | QMD `search` (BM25) | 43 | 0.256 | 0.333 | 0.285 |
 
 **Where GrooveSeek lost or tied.** *typo* (n=6): P@1 0.500 against QMD's 0.833, the
-widest margin in QMD's favour of any class. *deprecated-trap* (n=4): P@1 **0.000** — a
-deprecated runbook with heavier keyword overlap beats its active replacement
+widest margin in QMD's favour of any class. *deprecated-trap* (n=4): P@1 **0.000** against
+QMD's 0.250 — a deprecated runbook with heavier keyword overlap beats its active replacement
 at rank 1 every time. *environment-filtered* (n=5): 0.200, tied — and traced by the corpus author to the corpus rather than to retrieval: 69 of its 74 documents carry a blanket `[dev, test, prod]` because the sources state no environment, so the filter removes one document, and the benchmark corpus has the same shape (38 of 57 carry both `env-staging` and `env-production`) (#289). *ambiguous*
 (n=4): 0.500 against 0.750. The cross-encoder reranker cost 51× median latency
 to lose 0.067 P@1 and is off in that deployment (65× at 1.2.0; the rerank path
