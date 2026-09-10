@@ -52,7 +52,7 @@ script の bucket と、それぞれの直し方 (角括弧を残して抽出し
 | bucket | 出力の項 | どうするか |
 |---|---|---|
 | `BARE_TREE_ITEM` | tree の中の item (fn / struct / const / module / field) が bare backtick で、この doc から張れる (同 file、または `pub` / `pub(crate)`)。**判定順は `TEST_FN_NAME` → `PRIVATE_ELSEWHERE` → ここ**: 当たりが test item だけなら同 file でも `TEST_FN_NAME` に行き、exit 1 にならない | `` [`path`] `` に直す。script が定義位置と候補 path を添える。当たりに test item と非 test item が混ざる (`, test` 印) なら、link するのは非 test の方 |
-| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | backtick のまま、**持ち主の module を link か散文で名指す** (下の「リンクにできないもの」)。exit 1 にしない |
+| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | item は backtick のまま、**持ち主の module を `` [`crate::…`] `` で link する** (`AGENTS.md` の「Link the module and leave the item in prose」。散文だけでは検査されない、codex P1 on #296)。exit 1 にしない |
 | `LINKED_NOT_IN_TREE` | tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
 | `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / workspace crate 名で始まらない。**`Self::` も含めて落とす** (module doc に `Self` は無い) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
 | `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
@@ -83,7 +83,11 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
 - **`#[cfg(test)]` の item へのリンクは `cargo doc` が検証しない。** 存在する名前でも
   存在しない名前でも `cargo doc --no-deps` は exit 0 (2026-09-04 に対照つきで確認)。
   rustdoc は test module を解決しないので、**リンクにすると「検証済みの参照」に見えて
-  何も検証していない**状態になる。非 test の doc から test 名を呼ぶときは backtick +
+  何も検証していない**状態になる。逆方向 = **非 test の doc から test item へは link を
+  書けない**: `cargo doc --no-deps -p grooveseek --all-features --document-private-items` が
+  `no item named 'tests' in module 'code'` で exit 101 (2026-09-10、`plugin.rs` の `pub(crate) fn`
+  に probe を置いて確認。`--document-private-items` 無しだと `pub(crate)` の doc は生成されず
+  exit 0 になる — probe は必ずこの flag で打つ)。非 test の doc から test 名を呼ぶときは backtick +
   持ち主を散文で書き、**stale 検出が要るなら test で書く** (`include_str!` して
   `fn <name>(` を探す形。PR #263 の
   `a_test_named_by_a_doc_comment_in_this_file_still_exists`)。codex はここをリンクにせよと
