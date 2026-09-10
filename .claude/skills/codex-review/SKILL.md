@@ -37,7 +37,9 @@ push すると、同じ形が次の round で返ってくる (#234 / #236 はそ
 python .dev/tools/doc_link_sweep.py
 ```
 
-**引数は無い。縮めない。** script が内部で `git diff main...HEAD -- '*.rs'` を固定で打ち、
+**push 前の呼び出しは引数なし。縮めない。** diff の範囲を変える引数は存在せず、受けるのは
+計測専用の `--whole-tree` だけ (下記。push 前には使わない)。script が内部で
+`git diff main...HEAD -- '*.rs'` を固定で打ち、
 tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
 bucket に振り分ける。exit 1 なら直してから push。**exit 0 は sweep の終わりではない** —
 下の表の advisory bucket (`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME`) を
