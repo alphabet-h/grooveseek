@@ -34,26 +34,38 @@ P0/P1 だけでなく**収束した round の P2/P3 を取り込んだ push も�
 push すると、同じ形が次の round で返ってくる (#234 / #236 はそれで round を溶かした):
 
 ```bash
-git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c
+python .dev/tools/doc_link_sweep.py
 ```
 
-pathspec は `'*.rs'` — **directory を並べない**。`grooveseek/src grooveseek/tests crates` と
-書くと `grooveseek/benches` が落ちる (codex P2 on #238。bench にも `//!` / `///` はあり、
-`` `compute_match_spans` `` のような tree の名前が今も入っている) し、crate が増えた日に黙って狭くなる。
+**引数は無い。縮めない。** script が内部で `git diff main...HEAD -- '*.rs'` を固定で打ち、
+tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
+bucket に振り分ける。exit 1 なら直してから push。手順として grep を打っていた時代
+(PR #238〜2026-09-10) に、範囲を `git diff -- '*.rs'` に縮めた (台帳 #39) / private だからと
+外した (#43) / 形で skip した (#52) の 3 つは、どれも「判断を挟める場所」があったから
+起きた。script はその場所を無くす。`.dev/` が無い環境では旧形を打つ:
+`` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
+(pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
 
-角括弧を残して抽出しているので、**bare backtick と `` [`..`] `` が同じ出力の中で区別できる** —
-sweep は両方向で、リンクにし忘れた項とリンクにしてはいけない項の両方がここに並ぶ:
+script の bucket と、それぞれの直し方 (角括弧を残して抽出しているので、**bare backtick と
+`` [`..`] `` が同じ出力の中で区別できる** — sweep は両方向):
 
-| 出力の項 | どうするか |
-|---|---|
-| tree の中の item (fn / struct / const / module / test fn) が bare backtick | `` [`path`] `` に直す |
-| tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
-| `::` / 演算子 / `{}` / `;` を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` | **中の名前を 1 つずつほどいて**上の 2 行を適用する。#237 round 1 の P1 はこの形 |
+| bucket | 出力の項 | どうするか |
+|---|---|---|
+| `BARE_TREE_ITEM` | tree の中の item (fn / struct / const / module / field) が bare backtick | `` [`path`] `` に直す。script が定義位置と候補 path を添える |
+| `LINKED_NOT_IN_TREE` | tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
+| `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` / workspace crate 名で始まらない | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
+| `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
+| `FILE_NAME` | `` `foo.rs` `` / `` `ADR-0013` `` で名指し | module link か markdown link か散文に。**file 名は書かない** (台帳 #41 / #42 / #46) |
+| `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `tests/` の item だけ | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
 
-**identifier だけに絞らない。** 2 つ目の `grep` を `` '\[?`[A-Za-z_][A-Za-z0-9_:]*`\]?' `` にすると
-項は減る (#237 の diff で 170 → 100。via: 上のコマンドの `grep -oE` をそれに差し替え、末尾を
-`sort -u | wc -l` にして `fe7ac23...70dc178` で実行) が、落ちるのは表の 3 行目
-= 実際に P1 を受けた形なので、絞ると意味が無くなる。
+exit 1 になるのは上 3 つ。`COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` は人が読む
+(誤検出もあるが、**形で skip すると #52 になる**)。`--whole-tree` は diff ではなく tree 全体を
+出す計測用で、push 前には使わない。
+
+**identifier だけに絞らない。** 旧 grep の 2 つ目を `` '\[?`[A-Za-z_][A-Za-z0-9_:]*`\]?' `` にすると
+項は減る (#237 の diff で 170 → 100。via: 旧コマンドの `grep -oE` をそれに差し替え、末尾を
+`sort -u | wc -l` にして `fe7ac23...70dc178` で実行) が、落ちるのは `COMPOSITE`
+= 実際に P1 を受けた形なので、絞ると意味が無くなる。script はこの理由で全 span を読む。
 
 `` [`..`] `` の path の作り方 (実測は `.dev/knowledge/comments-the-compiler-cannot-see.md`):
 
@@ -86,7 +98,8 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
 
 **見えるのは追加行だけ** (`^+` で絞っている)。既存行に残った古い名前はここには出ない —
 そちらは `cargo doc` と review 側の仕事。分類の実例は
-`.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表。
+`.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表、script の設計と tree 全体の
+計測値は `.dev/knowledge/doc-link-sweep-script.md`。
 
 ## push する前にローカルの Codex で前掃除する
 
