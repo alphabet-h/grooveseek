@@ -291,6 +291,39 @@ fn an_index_with_no_recorded_set_is_named_as_pending() {
     );
 }
 
+/// A database `Database::open` just created -- no documents, no run -- is pending too: the
+/// search gate refuses `--field` on it exactly as on a populated index, so `doctor` must not
+/// call it clean (local Codex round 4). `groove serve` makes one before its watcher runs.
+#[test]
+fn a_freshly_created_empty_database_is_pending_until_a_run_records_the_set() {
+    let layout = TempKbLayout::new("groove-doctor-empty-pending");
+    {
+        let db_path = grooveseek::resolve_db_path(layout.kb());
+        let db = grooveseek::db::Database::open(&db_path.to_string_lossy()).expect("open db");
+        db.verify_embedding_meta("bge-small-en-v1.5", 384)
+            .expect("meta");
+    }
+
+    let (code, stdout, _) = run_doctor(layout.kb(), true);
+    assert_eq!(
+        code, 1,
+        "an absent declared-field set is a finding even on an empty index"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--format json must emit JSON on stdout ({e}): {stdout}"));
+    let checks: Vec<&str> = parsed["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter_map(|f| f["check"].as_str())
+        .collect();
+    assert_eq!(
+        checks,
+        vec!["declared-fields-pending"],
+        "nothing else is wrong with an empty index, got {checks:?}"
+    );
+}
+
 /// A `groove-schema.toml` that does not load stops `groove index` and `groove validate`
 /// before they touch anything; [`grooveseek::doctor`] treats it the same way -- it could
 /// not look.

@@ -374,11 +374,10 @@ pub fn run(
 ///   [`crate::indexer::rebuild_index`] treats it as "nothing to refresh" and
 ///   records `[]` on its next run, which is exactly the remedy.
 ///
-/// The one absent state that is not reported is an index with **no documents
-/// at all**: that is a fresh database, not a broken one -- the rule the
-/// vector-table check already applies (an empty index without a vector table
-/// is not a finding), and the state `groove serve` creates before its watcher
-/// has seen a file. Nothing indexed means nothing a field filter could reach.
+/// An index with no documents at all is **not** exempt (local Codex round 4):
+/// the search gate does not exempt it either, so a freshly created database
+/// that no run has completed on -- what `groove serve` makes before its
+/// watcher has seen a file -- is pending until `groove index` records `[]`.
 ///
 /// A recorded set that differs from what the schema on disk declares is not
 /// wrong -- `--field` answers from the recorded set, consistently -- but it
@@ -400,15 +399,9 @@ fn declared_fields_findings(
         recorded,
         pass_open,
         rows,
-        documents,
     } = db.declared_fields_snapshot()?;
     let mut findings = Vec::new();
     match recorded {
-        // An index with no documents is fresh, not pending -- the same rule the
-        // vector-table check applies to an empty index (`groove serve` creates one
-        // before its watcher has seen a file). Nothing has been indexed for a
-        // field filter to reach, and the first run records the set.
-        None if documents == 0 && rows == 0 && !pass_open => {}
         None => {
             if pass_open {
                 findings.push(Finding {
@@ -596,6 +589,21 @@ mod tests {
             "summary was {:?}",
             f.summary
         );
+    }
+
+    #[test]
+    fn an_empty_database_no_run_has_recorded_is_pending_too() {
+        // Zero documents, zero rows, no token, no schema: what `Database::open` on a new
+        // path leaves before any run. The search gate refuses `--field` here exactly as on
+        // a populated index, so this is not a "fresh, not broken" case the way the missing
+        // vector table is (local Codex round 4).
+        let db = Database::open_in_memory().expect("open");
+        assert!(db.read_declared_fields().expect("read").is_none());
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = declared_fields_finding(&report).expect("a pending finding");
+        assert_eq!(f.check, "declared-fields-pending");
+        assert_eq!(f.count, 0);
+        assert!(!report.is_clean());
     }
 
     #[test]
@@ -968,6 +976,10 @@ mod tests {
     #[test]
     fn an_empty_index_without_a_vector_table_is_not_a_finding() {
         let db = Database::open_in_memory().expect("open");
+        // (D-19) The declared-field set is a separate question this test does not ask:
+        // record what a completed run with no schema records, so the only absent thing
+        // left is the vector table.
+        db.write_declared_fields("[]").expect("declared");
         assert!(
             run(&db, &registry_md(), None).expect("run").is_clean(),
             "a database with nothing in it has nothing wrong with it"

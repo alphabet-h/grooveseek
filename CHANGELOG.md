@@ -23,7 +23,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   until the search. `doctor` now reports `declared-fields-pending` (no
   recorded set — a refresh pass is open or was interrupted, or no `groove
   index` run has completed since the index was created or upgraded from
-  1.8.0; an index with no documents at all is fresh, not pending) and
+  1.8.0 — an index with no documents yet included) and
   `declared-fields-stale` (the recorded
   set differs from what the schema on disk declares, so `--field` answers
   from the old set until the next run), both warnings that one `groove index`

@@ -367,7 +367,7 @@ groove doctor --kb-path ... --format json | jq '.findings[]'
 
 さらに、**定義単位ではなく行単位で chunk 化されたソースファイル**も名指しする — 定義が入れ子の上限より深かったか、ファイルが 1 ファイルあたりの chunk 数の上限を超える chunk を要求したか、のいずれか。これらのファイルは欠けなく索引されて検索にも出るが、chunk が定義の symbol kind / 見出し / スコープを持たないので、定義の形をしたクエリでは辿り着けない。直し方はコマンドではなく**ファイルの側**にある — index を回し直しても同じ上限に当たって同じ判断になる。
 
-宣言 key の集合も見る (v1.11.0+): 索引に集合が記録されていない — 実行中の run がある / 中断された / 作成後または 1.8.0 からの更新後に `groove index` が一度も完走していない — 場合は `declared-fields-pending` として報告する。run が集合を記録するまで `--field` 付きの検索は拒否されるからで、`groove-schema.toml` の有無は問わない (document が 1 つも無い索引は fresh であって pending ではない)。記録済みの集合が schema の宣言と食い違っていれば `declared-fields-stale` — 次の run が行を書き直すまで `--field` は記録済みの集合で答える。どちらも warning で、`groove index` 1 回で (再 embedding なしに) 消える。読めない schema file は `groove index` / `groove validate` と同じ扱いで、DB を開く前にコマンドが止まる (終了コード `2`)。
+宣言 key の集合も見る (v1.11.0+): 索引に集合が記録されていない — 実行中の run がある / 中断された / 作成後または 1.8.0 からの更新後に `groove index` が一度も完走していない — 場合は `declared-fields-pending` として報告する。run が集合を記録するまで `--field` 付きの検索は拒否されるからで、`groove-schema.toml` の有無は問わず、document がまだ 1 つも無い索引でも同じ。記録済みの集合が schema の宣言と食い違っていれば `declared-fields-stale` — 次の run が行を書き直すまで `--field` は記録済みの集合で答える。どちらも warning で、`groove index` 1 回で (再 embedding なしに) 消える。読めない schema file は `groove index` / `groove validate` と同じ扱いで、DB を開く前にコマンドが止まる (終了コード `2`)。
 
 **v1.6.0 より前に作られた索引には、その前に別の答えが出る。** そのリリースまで、上限を超えたファイルは**切り捨てられて**いた。内容が変わらないファイルは再 chunk 化されないので、そういう索引は今も末尾の欠けたファイルを抱えている可能性があり、しかも**それを見つける手掛かりが document 側に無い**。`doctor` はそこで「異常なし」と答えるのではなく、**どの chunk 化ポリシーで作られた索引かが記録されているか**を見て、記録が無くソースファイルを含む索引については「まだ答えられない」と報告する。`groove index --force` で作り直せば消える。
 
