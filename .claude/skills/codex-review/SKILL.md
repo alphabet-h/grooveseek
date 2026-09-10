@@ -34,26 +34,46 @@ P0/P1 だけでなく**収束した round の P2/P3 を取り込んだ push も�
 push すると、同じ形が次の round で返ってくる (#234 / #236 はそれで round を溶かした):
 
 ```bash
-git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c
+python .dev/tools/doc_link_sweep.py
 ```
 
-pathspec は `'*.rs'` — **directory を並べない**。`grooveseek/src grooveseek/tests crates` と
-書くと `grooveseek/benches` が落ちる (codex P2 on #238。bench にも `//!` / `///` はあり、
-`` `compute_match_spans` `` のような tree の名前が今も入っている) し、crate が増えた日に黙って狭くなる。
+**push 前の呼び出しは引数なし。縮めない。** diff の範囲を変える引数は存在せず、受けるのは
+計測専用の `--whole-tree` だけ (下記。push 前には使わない)。script が内部で
+`git diff main...HEAD -- '*.rs'` を固定で打ち、
+tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
+bucket に振り分ける。exit 1 なら直してから push。**exit 0 は sweep の終わりではない** —
+下の表の advisory bucket (`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME`) を
+全部読んで初めて終わる。手順として grep を打っていた時代 (PR #238〜2026-09-10) に、範囲を
+`git diff -- '*.rs'` に縮めた (台帳 #39) / private だからと外した (#43) / 形で skip した (#52) の
+3 つは、どれも人が決めていた。script が消すのはその 3 つ = **diff の範囲、tree にあるかどうか、
+複合項の中の名前の列挙**。何を link にするかの判断は残る (だから bucket ごとに直し方が書いてある)。
+`.dev/` が無い環境では旧形を打つ:
+`` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
+(pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
 
-角括弧を残して抽出しているので、**bare backtick と `` [`..`] `` が同じ出力の中で区別できる** —
-sweep は両方向で、リンクにし忘れた項とリンクにしてはいけない項の両方がここに並ぶ:
+script の bucket と、それぞれの直し方 (角括弧を残して抽出しているので、**bare backtick と
+`` [`..`] `` が同じ出力の中で区別できる** — sweep は両方向):
 
-| 出力の項 | どうするか |
-|---|---|
-| tree の中の item (fn / struct / const / module / test fn) が bare backtick | `` [`path`] `` に直す |
-| tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
-| `::` / 演算子 / `{}` / `;` を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` | **中の名前を 1 つずつほどいて**上の 2 行を適用する。#237 round 1 の P1 はこの形 |
+| bucket | 出力の項 | どうするか |
+|---|---|---|
+| `BARE_TREE_ITEM` | tree の中の item (fn / struct / enum / const / module、および `Type::field` / `Enum::Variant` の形の field / variant) が bare backtick で、この doc から張れる (同 file、または `pub` / `pub(crate)`)。**単独の `` `field` `` / `` `Variant` `` は script の対象外** (同名 field を持つ全 struct に当たるので、`doc_link_sweep.py` の identifier 分岐は field / variant を除外している。単独の field 名は人が読む)。**判定順は `TEST_FN_NAME` → `PRIVATE_ELSEWHERE` → ここ**: 当たりが test item だけなら同 file でも `TEST_FN_NAME` に行き、exit 1 にならない | `` [`path`] `` に直す。script が定義位置と候補 path を添える。当たりに test item と非 test item が混ざる (`, test` 印) なら、link するのは非 test の方 |
+| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | item は backtick のまま、**持ち主の module を link する** — lib の中からは `` [`crate::…`] ``、`tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (`AGENTS.md` の「Link the module and leave the item in prose」。散文だけでは検査されない、codex P1 on #296 round 1 / 2)。持ち主の module 自体が **private で届かない** (`crate::parser::panic_guard` のような private な nested mod。privacy は module にも効く) なら、**到達できる一番近い祖先 module** (`` [`crate::parser`] ``) を link し、module 名と item は散文。module が rustdoc に無い (`#[cfg(test)] mod`、別の `tests/` crate) 時だけ散文のみ — 下の「リンクにできない item」と同じ。exit 1 にしない |
+| `LINKED_NOT_IN_TREE` | tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
+| `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / **他の** workspace crate 名で始まらない。**`Self::` も落とす** (module doc に `Self` は無い)。**lib 自身の `//!` で自分の crate 名 (`grooveseek::…`) も落とす** — `extern crate self as grooveseek` が無いので解決しない (`config.rs` の test が同じ理由で `crate::` を使う。codex P2 on #296 round 3) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
+| `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
+| `FILE_NAME` | `` `foo.rs` `` / `` `ADR-0013` `` で名指し | module link か markdown link か散文に。**file 名は書かない** (台帳 #41 / #42 / #46) |
+| `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `#[test]` / `tests/` の item だけ (同 file でも、ここが先)。**bare でも `` [`..`] `` でも出す** — link 済みは `linked:` 印 (`cargo doc` が検証しない link は通っていても未検証) | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
 
-**identifier だけに絞らない。** 2 つ目の `grep` を `` '\[?`[A-Za-z_][A-Za-z0-9_:]*`\]?' `` にすると
-項は減る (#237 の diff で 170 → 100。via: 上のコマンドの `grep -oE` をそれに差し替え、末尾を
-`sort -u | wc -l` にして `fe7ac23...70dc178` で実行) が、落ちるのは表の 3 行目
-= 実際に P1 を受けた形なので、絞ると意味が無くなる。
+exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_RELATIVE_LINK`。
+`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` は人が読む
+(誤検出もあるが、**形で skip すると #52 になる**)。script の「張れる」は近似 (同 file か
+`pub` 系か) なので、迷ったら下の規則の最後の行 = link にして `cargo doc --no-deps` を 1 回回す。`--whole-tree` は diff ではなく tree 全体を
+出す計測用で、push 前には使わない。
+
+**identifier だけに絞らない。** 旧 grep の 2 つ目を `` '\[?`[A-Za-z_][A-Za-z0-9_:]*`\]?' `` にすると
+項は減る (#237 の diff で 170 → 100。via: 旧コマンドの `grep -oE` をそれに差し替え、末尾を
+`sort -u | wc -l` にして `fe7ac23...70dc178` で実行) が、落ちるのは `COMPOSITE`
+= 実際に P1 を受けた形なので、絞ると意味が無くなる。script はこの理由で全 span を読む。
 
 `` [`..`] `` の path の作り方 (実測は `.dev/knowledge/comments-the-compiler-cannot-see.md`):
 
@@ -68,7 +88,11 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
 - **`#[cfg(test)]` の item へのリンクは `cargo doc` が検証しない。** 存在する名前でも
   存在しない名前でも `cargo doc --no-deps` は exit 0 (2026-09-04 に対照つきで確認)。
   rustdoc は test module を解決しないので、**リンクにすると「検証済みの参照」に見えて
-  何も検証していない**状態になる。非 test の doc から test 名を呼ぶときは backtick +
+  何も検証していない**状態になる。逆方向 = **非 test の doc から test item へは link を
+  書けない**: `cargo doc --no-deps -p grooveseek --all-features --document-private-items` が
+  `no item named 'tests' in module 'code'` で exit 101 (2026-09-10、`plugin.rs` の `pub(crate) fn`
+  に probe を置いて確認。`--document-private-items` 無しだと `pub(crate)` の doc は生成されず
+  exit 0 になる — probe は必ずこの flag で打つ)。非 test の doc から test 名を呼ぶときは backtick +
   持ち主を散文で書き、**stale 検出が要るなら test で書く** (`include_str!` して
   `fn <name>(` を探す形。PR #263 の
   `a_test_named_by_a_doc_comment_in_this_file_still_exists`)。codex はここをリンクにせよと
@@ -78,15 +102,26 @@ sweep は両方向で、リンクにし忘れた項とリンクにしてはい�
   (2026-09-04 に確認: リンク化して `cargo doc --no-deps` が exit 0、対照として 1 語を存在しない
   名前に変えると `error: unresolved link` で exit 101 = lint は生きている)。**「private」の一語で
   下の行へ振らない** — 台帳 #43 はそれで P2 を受けた
-- **リンクにできないものは backtick のまま残し、散文で持ち主 (module / file) を名指す**:
-  **他** module に private な item / 非 test の doc から名指した `#[cfg(test)]` の item /
-  `tests/` crate から見た lib の `pub(crate)` item / 別の `tests/` crate の test fn。
+- **リンクにできない item は backtick のまま残し、持ち主を名指す** — 持ち主の module が
+  link できるなら **必ず link する**。path は書く側で決まる: lib の中からは `` [`crate::…`] ``、
+  `tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (表の `PRIVATE_ELSEWHERE` と同じ。
+  `AGENTS.md`「Link the module and leave the item in prose」: **他** module に private な item、
+  `tests/` crate から見た lib の `pub(crate)` item)。持ち主の module が private な nested mod で
+  そこへも届かないなら、**到達できる一番近い祖先** を link する (privacy は module にも効く。
+  `fallback_whole_query` が `no item named 'fts_query' in module 'db'` で落ちたのはこの形、
+  `.dev/knowledge/comments-the-compiler-cannot-see.md`)。
+  散文だけで済ませてよいのは、link できる持ち主が無い場合だけ: 非 test の doc から名指した
+  `#[cfg(test)] mod tests` の中の item (module 自体が rustdoc に無い) / 別の `tests/` crate の
+  test fn。**item だけが `#[cfg(test)]` で gate されている** (`db.rs` の `rrf_topk`、`config.rs` の
+  `discover_at` のような形) なら持ち主 module は rustdoc にあるので、`` [`crate::db`] `` の
+  module link は要る (codex P1 on #296 round 2)。
   **迷ったらリンクにして `cargo doc --no-deps` を 1 回回す** — 張れないなら
   `unresolved link` で落ちるので、推測する必要が無い
 
 **見えるのは追加行だけ** (`^+` で絞っている)。既存行に残った古い名前はここには出ない —
 そちらは `cargo doc` と review 側の仕事。分類の実例は
-`.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表。
+`.dev/knowledge/archive/prs/pr237-feature-55-pr2-sweep.md` の表、script の設計と tree 全体の
+計測値は `.dev/knowledge/doc-link-sweep-script.md`。
 
 ## push する前にローカルの Codex で前掃除する
 
