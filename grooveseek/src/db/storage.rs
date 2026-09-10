@@ -703,19 +703,6 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// How many `(document, key, value)` rows `document_fields` holds across
-    /// every document -- one per scalar and one per list element, so this is a
-    /// count of values, not of documents or keys. `groove status` prints it and
-    /// `groove doctor` carries it as the `count` of its declared-field findings
-    /// (D-19); [`Database::document_fields_is_empty`] stays the indexer's
-    /// question, which only needs existence.
-    pub fn document_fields_count(&self) -> Result<u64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM document_fields", [], |row| row.get(0))?;
-        Ok(u64::try_from(n).unwrap_or(0))
-    }
-
     /// Delete a document and all associated chunks / vectors / FTS rows.
     pub fn delete_document(&self, path: &str) -> Result<()> {
         // Delete vector entries first (no FK from virtual table)
