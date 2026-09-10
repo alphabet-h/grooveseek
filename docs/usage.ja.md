@@ -179,7 +179,7 @@ tray は `127.0.0.1:<port>/api/admin/status` を polling するので、daemon �
 groove status --kb-path /path/to/knowledge-base
 ```
 
-既存 index の状態を **stdout に** 表示するので `groove status | …` が使える: document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
+既存 index の状態を **stdout に** 表示するので `groove status | …` が使える: document / chunk 数、`tags` frontmatter の parse に失敗した件数、index が構築された context mode (`static` / `off`)、そして index が記録している宣言 key の集合 (v1.11.0+) — `--field` で filter できる key と、`document_fields` が持つ値の行数。`pending` は「完走した `groove index` がまだ集合を記録していない」の意味で、いま `--field` 付きの検索を打つと拒否される ([docs/filters.ja.md](filters.ja.md))。品質フィルタを通過するチャンク数はもう 1 行で出るが、**実効閾値が 0 より大きいときだけ**なので、`[quality_filter] enabled = false` や `threshold = 0.0` では出力されない。
 
 索引がまだ無い場合、"No index found" の案内は **stderr** に出て stdout は空のままになる — 答えられなかったので結果を出していない、ということ。上の各行の**文面は凍結していない** ([docs/stability.ja.md](stability.ja.md))。2 つの件数を機械可読に取りたい場合は `groove doctor --format json` を使う。
 
@@ -366,6 +366,8 @@ groove doctor --kb-path ... --format json | jq '.findings[]'
 検索は 1 つの chunk について 3 つのテーブルが一致していることを前提にしている — 本文・embedding・全文検索行。**ずれてもエラーにはならない**: embedding の無い chunk は単にベクトル検索に出ず、全文検索行の無い chunk はキーワード検索に出ないだけ。これまでは full index を回して修復されるのを見るまで気付けなかった。`doctor` は直接それを問う。あわせて、MCP の resource 面が**どの索引済み文書を提示していないか、なぜか**も報告する — 現在の `[parsers].enabled` に無い拡張子 / resource read が返せるサイズを超える文書 / 以前のバージョンで索引されたため size が未記録の文書。
 
 さらに、**定義単位ではなく行単位で chunk 化されたソースファイル**も名指しする — 定義が入れ子の上限より深かったか、ファイルが 1 ファイルあたりの chunk 数の上限を超える chunk を要求したか、のいずれか。これらのファイルは欠けなく索引されて検索にも出るが、chunk が定義の symbol kind / 見出し / スコープを持たないので、定義の形をしたクエリでは辿り着けない。直し方はコマンドではなく**ファイルの側**にある — index を回し直しても同じ上限に当たって同じ判断になる。
+
+宣言 key の集合も見る (v1.11.0+): `groove-schema.toml` が宣言している key を索引がまだ記録していない — 実行中の run がある / 中断された / 作成後に一度も完走していない — 場合は `declared-fields-pending` として報告する。run が集合を記録するまで `--field` 付きの検索は拒否されるからだ。記録済みの集合が schema の宣言と食い違っていれば `declared-fields-stale` — 次の run が行を書き直すまで `--field` は記録済みの集合で答える。どちらも warning で、`groove index` 1 回で (再 embedding なしに) 消える。読めない schema file は `groove index` / `groove validate` と同じ扱いで、DB を開く前にコマンドが止まる (終了コード `2`)。
 
 **v1.6.0 より前に作られた索引には、その前に別の答えが出る。** そのリリースまで、上限を超えたファイルは**切り捨てられて**いた。内容が変わらないファイルは再 chunk 化されないので、そういう索引は今も末尾の欠けたファイルを抱えている可能性があり、しかも**それを見つける手掛かりが document 側に無い**。`doctor` はそこで「異常なし」と答えるのではなく、**どの chunk 化ポリシーで作られた索引かが記録されているか**を見て、記録が無くソースファイルを含む索引については「まだ答えられない」と報告する。`groove index --force` で作り直せば消える。
 

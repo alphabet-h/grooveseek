@@ -99,6 +99,12 @@ The question this answers: **who brings a declared key into the index, and when
   refuse it, the leg falls back to filtering in Rust after the query, the way
   the other filters already work.
 - `doctor` does not yet look at the table. `status` does not count it.
+  *(2026-09-10, v1.11.0)* Retired: `doctor` reports `declared-fields-pending`
+  (no recorded set while a schema declares keys, rows remain, or a pass is
+  open) and `declared-fields-stale` (recorded set differs from the schema on
+  disk), and `status` prints the recorded set with the row count. Both read
+  the same `index_meta` key the search consults and call the same
+  `declared_field_names` the indexer does; neither re-derives the rule.
 - `groove index` reads only `<kb_path>/groove-schema.toml`. A schema kept
   elsewhere and passed to `groove validate --schema <path>` is not seen by
   the index, so `--field` / `--field-not` filters on it answer empty.

@@ -251,3 +251,100 @@ fn the_chunk_policy_is_resolved_where_the_insertion_paths_meet() {
         "the policy is resolved twice; the shared path already covers this caller"
     );
 }
+
+// -- declared fields (D-19) --------------------------------------------------
+
+/// A schema that declares a key the index never recorded is the ordinary way a 1.8.0
+/// index, or a run that died mid-refresh, looks from the outside: `--field` is refused
+/// and nothing said so before this finding.
+#[test]
+fn a_schema_the_index_never_recorded_is_named_as_pending() {
+    let layout = TempKbLayout::new("groove-doctor-declared-pending");
+    layout.write("notes/a.md", "# A\n\nbody\n");
+    layout.write("groove-schema.toml", "[fields.status]\n");
+    seed_index(layout.kb());
+
+    let (code, stdout, _) = run_doctor(layout.kb(), true);
+    assert_eq!(code, 1, "a pending declared-field set is a finding");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--format json must emit JSON on stdout ({e}): {stdout}"));
+    let checks: Vec<&str> = parsed["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter_map(|f| f["check"].as_str())
+        .collect();
+    assert!(
+        checks.contains(&"declared-fields-pending"),
+        "expected the pending set to be named, got {checks:?}"
+    );
+}
+
+/// A `groove-schema.toml` that does not load stops `groove index` and `groove validate`
+/// before they touch anything; `doctor` treats it the same way -- it could not look.
+#[test]
+fn a_schema_that_will_not_load_exits_two() {
+    let layout = TempKbLayout::new("groove-doctor-badschema");
+    layout.write("notes/a.md", "# A\n\nbody\n");
+    layout.write("groove-schema.toml", "[fields.status\nthis is not toml\n");
+    seed_index(layout.kb());
+
+    let (code, stdout, stderr) = run_doctor(layout.kb(), false);
+    assert_eq!(
+        code, 2,
+        "a schema that will not load is a failure to run, not a finding"
+    );
+    assert!(
+        stdout.is_empty(),
+        "no report was produced, so stdout stays empty: {stdout}"
+    );
+    assert!(
+        stderr.contains("could not inspect the index"),
+        "the reason belongs on stderr: {stderr}"
+    );
+}
+
+/// `groove status` prints the recorded declared-field set next to the counts it already
+/// prints -- `pending` is the word for "a `--field` search would be refused right now".
+#[test]
+fn status_reports_the_declared_field_set_on_stdout() {
+    let layout = TempKbLayout::new("groove-status-declared");
+    layout.write("notes/a.md", "# A\n\nbody\n");
+    seed_index(layout.kb());
+
+    let status = |kb: &Path| -> String {
+        let out = Command::new(grooveseek_bin())
+            .args(["status", "--kb-path", &kb.display().to_string()])
+            .output()
+            .expect("groove status");
+        assert_eq!(
+            out.status.code().unwrap_or(-1),
+            0,
+            "status exits 0 on an index"
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let pending = status(layout.kb());
+    assert!(
+        pending.contains("Declared fields: pending (0 value rows)"),
+        "an index with no recorded set is pending, got:\n{pending}"
+    );
+
+    {
+        let db_path = grooveseek::resolve_db_path(layout.kb());
+        let db = grooveseek::db::Database::open(&db_path.to_string_lossy()).expect("open db");
+        db.write_declared_fields(r#"["source_type","status"]"#)
+            .expect("record");
+        db.replace_document_fields(
+            "notes/a.md",
+            &[("status".to_string(), "active".to_string())],
+        )
+        .expect("rows");
+    }
+    let recorded = status(layout.kb());
+    assert!(
+        recorded.contains("Declared fields: source_type, status (1 value rows)"),
+        "the recorded keys and the row count belong on stdout, got:\n{recorded}"
+    );
+}

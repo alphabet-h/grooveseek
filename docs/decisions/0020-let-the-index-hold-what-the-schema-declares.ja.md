@@ -94,6 +94,11 @@ key に限る。
   この脚は他のフィルタが既にそうしているのと同じく、クエリの後に Rust 側でフィルタする形へ
   退避する
 - **`doctor` はまだこのテーブルを見ない。`status` もこれを数えない**
+  *(2026-09-10、v1.11.0)* 解消: `doctor` は `declared-fields-pending` (schema が key を
+  宣言している / 行が残っている / pass が開いているのに集合が未記録) と
+  `declared-fields-stale` (記録済みの集合が disk 上の schema と食い違う) を報告し、
+  `status` は記録済みの集合と行数を出す。どちらも検索が見るのと同じ `index_meta` の
+  key を読み、indexer と同じ `declared_field_names` を呼ぶ — 規則を作り直してはいない
 - **`groove index` が読むのは `<kb_path>/groove-schema.toml` だけである。** 別の
   場所に置いて `groove validate --schema <path>` に渡している schema は索引から
   見えないので、それに対する `--field` / `--field-not` フィルタは空を返す

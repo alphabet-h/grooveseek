@@ -1,6 +1,9 @@
 //! `groove doctor` — ask the index whether it is in the state it should be.
 //!
-//! Three groups of question, and one deliberate omission.
+//! Three groups of question, and one deliberate omission. (Since 1.11.0 the
+//! servability group also asks about the declared-field set -- see
+//! [`Database::read_declared_fields`] and the two `declared-fields-*`
+//! findings in [`run`].)
 //!
 //! **Integrity.** Search reads three tables that have to agree about a chunk:
 //! `chunks` holds the text, `vec_chunks` the embedding, `fts_chunks` the
@@ -16,7 +19,14 @@
 //! the size check is [`crate::server::ServableRules`], the same values the
 //! server answers `resources/list` from. A doctor that computed its own
 //! equivalent would eventually disagree with the thing it is reporting on,
-//! which is the failure mode this whole feature is about.
+//! which is the failure mode this whole feature is about. The same rule holds
+//! for the declared-field set (D-19): whether `--field` / `fields` filters are
+//! refused is decided by [`Database::read_declared_fields`] being absent
+//! (`db/search.rs`'s `refuse_field_filters_while_pending`), and what the next
+//! `groove index` will refresh is decided by comparing that key with
+//! [`crate::indexer::declared_field_names`] of the schema on disk -- `doctor`
+//! reads the same key and calls the same function, it does not re-derive
+//! either rule.
 //!
 //! **What the chunker gave up on.** Which source files were chunked by lines
 //! rather than at their definitions, because one sat past the scope bound or
@@ -121,7 +131,17 @@ fn finding(
 /// what the chunker gave up on — because the first group means something is
 /// broken, the second means something is merely unavailable, and the third
 /// means everything arrived but in a coarser shape than usual.
-pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
+///
+/// `schema` is what `<kb_path>/groove-schema.toml` compiles to
+/// ([`crate::indexer::load_declared_schema`]), or `None` when there is no
+/// such file; the caller reads it so that a schema that does not load stops
+/// the command before the database is opened, the way `groove index` and
+/// `groove validate` already fail (exit 2, "could not look").
+pub fn run(
+    db: &Database,
+    registry: &Registry,
+    schema: Option<&crate::schema::Schema>,
+) -> Result<Report> {
     let mut findings = Vec::new();
 
     // Before the per-chunk comparisons, because those cannot see it: with the
@@ -266,6 +286,8 @@ pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
         });
     }
 
+    findings.extend(declared_fields_findings(db, schema)?);
+
     // -- what the chunker gave up on ----------------------------------------
 
     // Before the finding below, because it says whether that finding can answer at all: an
@@ -328,6 +350,113 @@ pub fn run(db: &Database, registry: &Registry) -> Result<Report> {
         chunks: db.chunk_count()?,
         findings,
     })
+}
+
+/// The declared-field set (feature-58 / ADR-0020), read the way the index and
+/// the search read it, and compared with the schema the way the next
+/// `groove index` will compare it.
+///
+/// `index_meta.declared_fields` has three states ([`crate::indexer`]'s
+/// `declared_fields_recorded` doc): **absent**, **`[]`** and a **non-empty
+/// list**. Only the first is a problem, and only sometimes:
+///
+/// - Absent while a pass token is stored ([`Database::read_declared_fields_pass`]):
+///   a `groove index` run is refreshing the rows right now, or died doing so.
+///   Either way `--field` is refused until a run records the set.
+/// - Absent with no token but with `document_fields` rows, or with a schema that
+///   declares keys: an index that was written before 1.9.0, or by a run that
+///   ended before recording. Same refusal, and the rows (if any) are of a
+///   generation nobody can name.
+/// - Absent with no token, no rows and nothing declared: the state the indexer
+///   itself treats as "nothing to refresh" (`rebuild_index`'s shortcut), and an
+///   index no schema has ever asked anything of. `--field` is refused here too,
+///   but there is no key it could name, so this is not reported -- it is also
+///   the state every pre-1.9.0 index and every test fixture starts in.
+///
+/// A recorded set that differs from what the schema on disk declares is not
+/// wrong -- `--field` answers from the recorded set, consistently -- but it
+/// is not what the next run will produce, so it is a Warning of the
+/// `extension-not-registered` kind: the index is consistent with itself and
+/// not with the configuration.
+fn declared_fields_findings(
+    db: &Database,
+    schema: Option<&crate::schema::Schema>,
+) -> Result<Vec<Finding>> {
+    const REMEDY: &str = "groove index (one run records the set, without re-embedding)";
+    let declared = crate::indexer::declared_field_names(schema);
+    let declared_json = serde_json::to_string(&declared)?;
+    let rows = db.document_fields_count()?;
+    let mut findings = Vec::new();
+    match db.read_declared_fields()? {
+        None => {
+            let pass_open = db.read_declared_fields_pass()?.is_some();
+            if pass_open {
+                findings.push(Finding {
+                    check: "declared-fields-pending",
+                    severity: Severity::Warning,
+                    summary: format!(
+                        "the declared-field set is not recorded: a groove index run is in \
+                         progress or was interrupted while refreshing {rows} document_fields \
+                         row(s), so --field / fields filters are refused until one completes"
+                    ),
+                    count: rows,
+                    samples: Vec::new(),
+                    remedy: REMEDY,
+                });
+            } else if rows > 0 || !declared.is_empty() {
+                findings.push(Finding {
+                    check: "declared-fields-pending",
+                    severity: Severity::Warning,
+                    summary: format!(
+                        "the declared-field set is not recorded while {rows} document_fields \
+                         row(s) remain and groove-schema.toml declares {}, so --field / fields \
+                         filters are refused until a groove index run completes",
+                        list_or_none(&declared)
+                    ),
+                    count: rows,
+                    samples: Vec::new(),
+                    remedy: REMEDY,
+                });
+            }
+        }
+        Some(recorded_json) => {
+            // The same parse the watcher paths apply: a value that is not a JSON list is
+            // not a finding, it is an index `doctor` cannot read -- exit 2, like a corrupt
+            // file (`indexer.rs`'s `declared_fields_recorded` bails the same way).
+            let recorded: Vec<String> = serde_json::from_str(&recorded_json).map_err(|e| {
+                anyhow::anyhow!(
+                    "index_meta.declared_fields is not a JSON list: {recorded_json} ({e})"
+                )
+            })?;
+            if recorded_json != declared_json {
+                findings.push(Finding {
+                    check: "declared-fields-stale",
+                    severity: Severity::Warning,
+                    summary: format!(
+                        "the index recorded declared fields {} but groove-schema.toml declares {}; \
+                         --field / fields filters answer from the recorded set until the next \
+                         groove index run refreshes the {rows} document_fields row(s)",
+                        list_or_none(&recorded),
+                        list_or_none(&declared)
+                    ),
+                    count: rows,
+                    samples: Vec::new(),
+                    remedy: REMEDY,
+                });
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// `[a, b]` for a summary line, `none` for an empty list -- so the text never
+/// prints a bare `[]` that reads like a formatting accident.
+fn list_or_none(keys: &[String]) -> String {
+    if keys.is_empty() {
+        "none".to_string()
+    } else {
+        format!("[{}]", keys.join(", "))
+    }
 }
 
 /// Turn a full list of paths into the same shape the SQL scans produce.
@@ -409,10 +538,179 @@ mod tests {
         db
     }
 
+    // -- declared fields (D-19) ---------------------------------------------
+
+    fn schema_declaring(keys: &[&str]) -> crate::schema::Schema {
+        let src: String = keys.iter().map(|k| format!("[fields.{k}]\n")).collect();
+        crate::schema::Schema::from_toml_str(&src).expect("schema")
+    }
+
+    fn declared_fields_finding(report: &Report) -> Option<&Finding> {
+        report
+            .findings
+            .iter()
+            .find(|f| f.check.starts_with("declared-fields-"))
+    }
+
+    #[test]
+    fn an_index_nothing_was_ever_declared_to_is_not_pending() {
+        // Absent key, no rows, no schema: the state every pre-1.9.0 index and every fixture
+        // in this file starts in, and the one `rebuild_index` short-circuits as "nothing to
+        // refresh". `--field` is refused, but there is no key it could name.
+        let db = db_with_one_chunk();
+        assert!(db.read_declared_fields().expect("read").is_none());
+        let report = run(&db, &registry_md(), None).expect("run");
+        assert!(
+            declared_fields_finding(&report).is_none(),
+            "findings were {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn an_open_refresh_pass_is_pending_and_says_so() {
+        let db = db_with_one_chunk();
+        db.write_declared_fields_pass("4242-1").expect("token");
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = declared_fields_finding(&report).expect("a pending finding");
+        assert_eq!(f.check, "declared-fields-pending");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(
+            f.summary.contains("in progress"),
+            "summary was {:?}",
+            f.summary
+        );
+        assert!(
+            f.remedy.contains("groove index"),
+            "remedy was {:?}",
+            f.remedy
+        );
+    }
+
+    #[test]
+    fn leftover_rows_under_no_recorded_set_are_pending_with_their_count() {
+        // A run wrote rows and died before `write_declared_fields`: rows of a generation
+        // nobody can name (`Database::clear_declared_fields`'s doc).
+        let db = db_with_one_chunk();
+        db.replace_document_fields(
+            "notes/a.md",
+            &[
+                ("status".to_string(), "active".to_string()),
+                ("kind".to_string(), "note".to_string()),
+            ],
+        )
+        .expect("rows");
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = declared_fields_finding(&report).expect("a pending finding");
+        assert_eq!(f.check, "declared-fields-pending");
+        assert_eq!(f.count, 2, "count is the number of value rows");
+        assert!(f.samples.is_empty(), "rows carry no path to sample");
+        assert!(
+            !f.summary.contains("in progress"),
+            "summary was {:?}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn a_schema_that_declares_keys_the_index_never_recorded_is_pending() {
+        let db = db_with_one_chunk();
+        let schema = schema_declaring(&["status"]);
+        let report = run(&db, &registry_md(), Some(&schema)).expect("run");
+        let f = declared_fields_finding(&report).expect("a pending finding");
+        assert_eq!(f.check, "declared-fields-pending");
+        assert_eq!(f.count, 0);
+        assert!(
+            f.summary.contains("[status]"),
+            "summary was {:?}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn a_recorded_set_that_differs_from_the_schema_is_stale() {
+        let db = db_with_one_chunk();
+        db.write_declared_fields(r#"["status"]"#).expect("record");
+        let schema = schema_declaring(&["kind", "status"]);
+        let report = run(&db, &registry_md(), Some(&schema)).expect("run");
+        let f = declared_fields_finding(&report).expect("a stale finding");
+        assert_eq!(f.check, "declared-fields-stale");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(
+            f.summary.contains("[status]") && f.summary.contains("[kind, status]"),
+            "summary was {:?}",
+            f.summary
+        );
+        assert!(
+            f.remedy.contains("groove index"),
+            "remedy was {:?}",
+            f.remedy
+        );
+    }
+
+    #[test]
+    fn a_schema_removed_after_the_index_recorded_keys_is_stale_too() {
+        // Recorded `["status"]`, no schema on disk: the next run refreshes to `[]`, and
+        // until then `--field status=...` still answers. The summary says `none`, never a
+        // bare `[]`.
+        let db = db_with_one_chunk();
+        db.write_declared_fields(r#"["status"]"#).expect("record");
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = declared_fields_finding(&report).expect("a stale finding");
+        assert_eq!(f.check, "declared-fields-stale");
+        assert!(
+            f.summary.contains("declares none"),
+            "summary was {:?}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn a_recorded_set_that_matches_the_schema_is_clean() {
+        let db = db_with_one_chunk();
+        db.write_declared_fields(r#"["status"]"#).expect("record");
+        let schema = schema_declaring(&["status"]);
+        let report = run(&db, &registry_md(), Some(&schema)).expect("run");
+        assert!(
+            declared_fields_finding(&report).is_none(),
+            "findings were {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn the_five_named_keys_do_not_count_as_declared() {
+        // `title` / `date` / `topic` / `depth` / `tags` have their own columns and filters;
+        // `declared_field_names` leaves them out, so a schema naming only those matches a
+        // recorded `[]` -- the same comparison `rebuild_index` makes.
+        let db = db_with_one_chunk();
+        db.write_declared_fields("[]").expect("record");
+        let schema = schema_declaring(&["title", "tags"]);
+        let report = run(&db, &registry_md(), Some(&schema)).expect("run");
+        assert!(
+            declared_fields_finding(&report).is_none(),
+            "findings were {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_recorded_set_that_is_not_a_list_is_could_not_look() {
+        // The watcher paths bail on this value too (`declared_fields_recorded`); a
+        // diagnostic must not turn an unreadable key into a Warning it then reasons from.
+        let db = db_with_one_chunk();
+        db.write_declared_fields("{not a list").expect("record");
+        let err = run(&db, &registry_md(), None).expect_err("must not report");
+        assert!(
+            err.to_string().contains("declared_fields"),
+            "error was {err:#}"
+        );
+    }
+
     #[test]
     fn a_healthy_index_has_nothing_to_report() {
         let db = db_with_one_chunk();
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         assert!(
             report.is_clean(),
             "a freshly built index should report nothing: {:?}",
@@ -426,7 +724,7 @@ mod tests {
         let db = db_with_one_chunk();
         db.execute_for_test("DELETE FROM vec_chunks").expect("del");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -442,7 +740,7 @@ mod tests {
         let db = db_with_one_chunk();
         db.execute_for_test("DELETE FROM fts_chunks").expect("del");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -465,7 +763,7 @@ mod tests {
         // the state a partially applied write would leave.
         db.execute_for_test("DELETE FROM chunks").expect("del");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
         assert!(checks.contains(&"orphan-embedding"), "{checks:?}");
         assert!(checks.contains(&"orphan-fts-row"), "{checks:?}");
@@ -482,7 +780,7 @@ mod tests {
         ))
         .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -514,7 +812,7 @@ mod tests {
         //     embedding, which is just as loud.
         {
             let db = Database::open(&dir.db()).expect("reopen");
-            let report = run(&db, &registry_md()).expect("run");
+            let report = run(&db, &registry_md(), None).expect("run");
             let checks: Vec<&str> = report.findings.iter().map(|f| f.check).collect();
             assert!(
                 !checks.contains(&"vector-table-missing"),
@@ -538,7 +836,7 @@ mod tests {
         //     otherwise report a healthy index while vector search returns
         //     nothing at all.
         let db = Database::open(&dir.db()).expect("reopen");
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -555,7 +853,7 @@ mod tests {
     fn an_empty_index_without_a_vector_table_is_not_a_finding() {
         let db = Database::open_in_memory().expect("open");
         assert!(
-            run(&db, &registry_md()).expect("run").is_clean(),
+            run(&db, &registry_md(), None).expect("run").is_clean(),
             "a database with nothing in it has nothing wrong with it"
         );
     }
@@ -576,7 +874,7 @@ mod tests {
         )
         .expect("orphan the chunk");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -608,7 +906,7 @@ mod tests {
         ))
         .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -627,7 +925,7 @@ mod tests {
         db.execute_for_test("UPDATE documents SET size_bytes = NULL")
             .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = report
             .findings
             .iter()
@@ -696,7 +994,7 @@ mod tests {
                 db.write_code_chunk_policy(policy).expect("policy");
             }
 
-            let report = run(&db, &registry_md()).expect("run");
+            let report = run(&db, &registry_md(), None).expect("run");
             let f = report
                 .findings
                 .iter()
@@ -714,7 +1012,7 @@ mod tests {
         // is only about files a code parser chunked.
         let db = db_with_one_chunk();
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         assert!(
             !report
                 .findings
@@ -731,7 +1029,7 @@ mod tests {
         with_tagged_document(&db, "src/lib.rs", &["code", "lang:rust"], true);
         with_the_current_chunk_policy(&db);
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         assert!(
             !report
                 .findings
@@ -749,7 +1047,7 @@ mod tests {
         with_tagged_document(&db, "src/deep.rs", &["code", "parse:too-deep"], true);
         with_tagged_document(&db, "src/wide.rs", &["code", "parse:too-many-chunks"], true);
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = chunked_without_definitions(&report)
             .expect("both files gave up their definitions, so both belong to this finding");
         assert_eq!(f.severity, Severity::Warning);
@@ -781,7 +1079,7 @@ mod tests {
             false,
         );
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         assert!(
             chunked_without_definitions(&report).is_none(),
             "findings were {:?}",
@@ -801,7 +1099,7 @@ mod tests {
         db.execute_for_test("UPDATE documents SET tags = '{not json' WHERE path = 'src/broken.rs'")
             .expect("update");
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         let f = chunked_without_definitions(&report).expect("the readable row is still found");
         assert_eq!(f.count, 1);
     }
@@ -811,7 +1109,7 @@ mod tests {
         let db = db_with_one_chunk();
         with_tagged_document(&db, "src/lib.rs", &["code", "lang:rust"], true);
 
-        let report = run(&db, &registry_md()).expect("run");
+        let report = run(&db, &registry_md(), None).expect("run");
         assert!(
             chunked_without_definitions(&report).is_none(),
             "findings were {:?}",
