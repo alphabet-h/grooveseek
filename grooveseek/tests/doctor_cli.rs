@@ -291,9 +291,10 @@ fn an_index_with_no_recorded_set_is_named_as_pending() {
     );
 }
 
-/// A database `Database::open` just created -- no documents, no run -- is pending too: the
-/// search gate refuses `--field` on it exactly as on a populated index, so `doctor` must not
-/// call it clean (local Codex round 4). `groove serve` makes one before its watcher runs.
+/// A database [`grooveseek::db::Database::open`] just created -- no documents, no run -- is
+/// pending too: the search gate refuses `--field` on it exactly as on a populated index, so
+/// [`grooveseek::doctor`] must not call it clean (local Codex round 4). `groove serve` makes
+/// one before its watcher runs.
 #[test]
 fn a_freshly_created_empty_database_is_pending_until_a_run_records_the_set() {
     let layout = TempKbLayout::new("groove-doctor-empty-pending");
