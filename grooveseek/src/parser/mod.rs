@@ -450,8 +450,14 @@ impl ParsersConfig {
     ///
     /// The floor is a quality bound, not an availability one: since ADR-0017 the chunker keeps
     /// the per-file chunk count under its cap by widening the budget, whatever the setting.
-    /// What a budget under the floor still does is cut every definition into fragments the
-    /// chunker itself treats as too short to keep, so no file would keep a definition whole.
+    /// [`code::MIN_FRAGMENT_CHARS`] is the smallest piece the chunker lets stand on its own —
+    /// a smaller piece is folded into its neighbour, or dropped when it lies between
+    /// definitions — so a budget under it asks for pieces the chunker then undoes, and no
+    /// definition can be kept whole.
+    ///
+    /// Both checks run where the file is read, before the trust of its location is applied
+    /// (see [`crate::config::Config::load_from`]): a value the file cannot mean is an error
+    /// wherever the file sits, the same as an unknown key or an out-of-range `[search]` value.
     pub fn validate(&self) -> Result<()> {
         if self.enabled.is_empty() {
             anyhow::bail!(
@@ -463,9 +469,9 @@ impl ParsersConfig {
             anyhow::bail!(
                 concat!(
                     "[parsers.code].max_chunk_chars must be >= {floor} ",
-                    "(a fragment under that many non-whitespace characters is what the code ",
-                    "chunker already treats as too short to keep; a budget below it would cut ",
-                    "every definition into such fragments), got {got}. ",
+                    "(the smallest piece the code chunker keeps on its own; a budget below it ",
+                    "asks for pieces the chunker merges or drops again, so no definition could ",
+                    "stay whole), got {got}. ",
                     "Remove the key to use the default {default}."
                 ),
                 floor = code::MIN_FRAGMENT_CHARS,

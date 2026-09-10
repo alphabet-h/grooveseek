@@ -3773,6 +3773,43 @@ lambda = 0.5
         }
     }
 
+    /// What the trust rule does not do: excuse a value the file cannot mean.
+    ///
+    /// `[parsers]` from an untrusted location is dropped, but the drop happens
+    /// in [`Config::restrict_untrusted`], after [`Config::load_from`] has already
+    /// refused a file that fails [`crate::parser::ParsersConfig::validate`] —
+    /// the same order an unknown key or an out-of-range `[search]` value has
+    /// always had. This pins that the `max_chunk_chars` floor sits where the
+    /// `enabled = []` check sits, so the two cannot drift apart: a reviewer who
+    /// wants a discovered file's invalid table ignored rather than refused is
+    /// asking to move both, and the `[search]` checks with them.
+    #[test]
+    fn an_untrusted_config_with_an_invalid_parsers_table_is_refused_like_a_trusted_one() {
+        let roots = roots_for(None, None);
+        for (name, table, needle) in [
+            ("empty", "enabled = []\n", "at least one id"),
+            (
+                "floor",
+                "enabled = [\"md\", \"rs\"]\n[parsers.code]\nmax_chunk_chars = 0\n",
+                "max_chunk_chars must be >= 30",
+            ),
+        ] {
+            let dir = TempDir::new(&format!("groove-untrusted-invalid-parsers-{name}"));
+            let toml = dir.path().join("groove.toml");
+            std::fs::write(&toml, format!("kb_path = \"kb\"\n[parsers]\n{table}")).unwrap();
+
+            let found = Config::discover_in(None, dir.path(), None, &roots)
+                .expect_err("an invalid [parsers] table is refused wherever the file sits");
+            let found = format!("{found:?}");
+            assert!(found.contains(needle), "{name}: discovered: {found}");
+
+            let named = Config::discover_in(Some(&toml), dir.path(), None, &roots)
+                .expect_err("naming the file does not make the value valid");
+            let named = format!("{named:?}");
+            assert!(named.contains(needle), "{name}: named: {named}");
+        }
+    }
+
     /// The other direction: the rule is about where the file was found, not
     /// about the value. Without this, a rule that always reset `[parsers]`
     /// would pass every test above.

@@ -36,13 +36,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 - **`[parsers.code].max_chunk_chars` must be at least 30.** A smaller value
   now fails when the config loads, naming the key, the floor and the value it
-  got. Until now any number was accepted, including `0`, and such a budget sent
-  every definition through the line fallback: no file kept a definition whole,
-  and `groove doctor` reported each one as `chunked-without-definitions` with a
-  remedy that pointed at the file rather than the setting. The floor is the
-  chunker's own threshold for a fragment worth keeping (ADR-0017's
-  consequences note the change). An index already cut at a smaller budget
-  keeps the existing `--force` warning once the setting is raised.
+  got. Until now any number was accepted, including `0`, and at such a budget
+  no definition fits, so every one was split by lines; a file whose pieces then
+  exceeded the per-file cap fell back to plain line chunks, and `groove doctor`
+  reported it as `chunked-without-definitions` with a remedy that pointed at
+  the file rather than the setting. The floor is the smallest piece the chunker
+  keeps on its own (ADR-0017's consequences note the change). An index already
+  cut at a smaller budget keeps the existing `--force` warning once the setting
+  is raised.
 
 ### Documentation
 

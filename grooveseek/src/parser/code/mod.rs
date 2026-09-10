@@ -125,8 +125,8 @@ const MAX_DEFINITION_SCOPE_DEPTH: usize = 64;
 /// threshold still scores above the default cutoff and would survive.
 ///
 /// It is also the floor [`crate::parser::ParsersConfig::validate`] puts under
-/// `[parsers.code].max_chunk_chars`: a budget below it would cut every definition into pieces
-/// this very constant says are not worth keeping.
+/// `[parsers.code].max_chunk_chars`: a budget below it asks for pieces that
+/// [`drop_thin_fragments`] or [`split_definition_by_lines`] then merge or drop again.
 pub(crate) const MIN_FRAGMENT_CHARS: usize = 30;
 
 /// A grammar plus the tags query that goes with it, ready to parse.
