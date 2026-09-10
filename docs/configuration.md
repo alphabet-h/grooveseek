@@ -77,7 +77,9 @@ enabled = ["md", "txt", "pdf", "docx", "xlsx", "pptx", "rs"]
 # non-whitespace characters: a definition that fits becomes one chunk, one that
 # does not is split into its nested definitions, or by lines when it has none
 # (the usual case for a long function). Lower it for finer-grained hits, raise
-# it to keep long bodies whole. Default 3500.
+# it to keep long bodies whole. Default 3500. Values under 30 are rejected when
+# the config loads: 30 is the smallest piece the chunker keeps on its own, so a
+# smaller budget asks for pieces it then merges or drops again.
 [parsers.code]
 max_chunk_chars = 3500
 
