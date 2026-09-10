@@ -57,7 +57,7 @@ script の bucket と、それぞれの直し方 (角括弧を残して抽出し
 | `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / workspace crate 名で始まらない。**`Self::` も含めて落とす** (module doc に `Self` は無い) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
 | `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
 | `FILE_NAME` | `` `foo.rs` `` / `` `ADR-0013` `` で名指し | module link か markdown link か散文に。**file 名は書かない** (台帳 #41 / #42 / #46) |
-| `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `#[test]` / `tests/` の item だけ (同 file でも、ここが先) | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
+| `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `#[test]` / `tests/` の item だけ (同 file でも、ここが先)。**bare でも `` [`..`] `` でも出す** — link 済みは `linked:` 印 (`cargo doc` が検証しない link は通っていても未検証) | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
 
 exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_RELATIVE_LINK`。
 `PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` は人が読む
