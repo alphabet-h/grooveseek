@@ -51,15 +51,18 @@ script の bucket と、それぞれの直し方 (角括弧を残して抽出し
 
 | bucket | 出力の項 | どうするか |
 |---|---|---|
-| `BARE_TREE_ITEM` | tree の中の item (fn / struct / const / module / field) が bare backtick | `` [`path`] `` に直す。script が定義位置と候補 path を添える |
+| `BARE_TREE_ITEM` | tree の中の item (fn / struct / const / module / field) が bare backtick で、この doc から張れる (同 file、または `pub` / `pub(crate)`) | `` [`path`] `` に直す。script が定義位置と候補 path を添える |
+| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | backtick のまま、**持ち主の module を link か散文で名指す** (下の「リンクにできないもの」)。exit 1 にしない |
 | `LINKED_NOT_IN_TREE` | tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
-| `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` / workspace crate 名で始まらない | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
+| `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / workspace crate 名で始まらない。**`Self::` も含めて落とす** (module doc に `Self` は無い) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
 | `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
 | `FILE_NAME` | `` `foo.rs` `` / `` `ADR-0013` `` で名指し | module link か markdown link か散文に。**file 名は書かない** (台帳 #41 / #42 / #46) |
 | `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `tests/` の item だけ | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
 
-exit 1 になるのは上 3 つ。`COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` は人が読む
-(誤検出もあるが、**形で skip すると #52 になる**)。`--whole-tree` は diff ではなく tree 全体を
+exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_RELATIVE_LINK`。
+`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME` は人が読む
+(誤検出もあるが、**形で skip すると #52 になる**)。script の「張れる」は近似 (同 file か
+`pub` 系か) なので、迷ったら下の規則の最後の行 = link にして `cargo doc --no-deps` を 1 回回す。`--whole-tree` は diff ではなく tree 全体を
 出す計測用で、push 前には使わない。
 
 **identifier だけに絞らない。** 旧 grep の 2 つ目を `` '\[?`[A-Za-z_][A-Za-z0-9_:]*`\]?' `` にすると
