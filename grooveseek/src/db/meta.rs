@@ -393,7 +393,7 @@ impl Database {
     /// branch, round 1).
     ///
     /// Read as three separate statements, a `groove index` run in another process can
-    /// finish between them: `doctor` would pair the generation key it read *before*
+    /// finish between them: [`crate::doctor`] would pair the generation key it read *before*
     /// the run recorded (absent) with the pass token it read *after* the run cleared
     /// it (also absent) and report `declared-fields-pending` for an index that is
     /// recorded and clean -- exit 1 in a CI gate, over a state that never existed.
