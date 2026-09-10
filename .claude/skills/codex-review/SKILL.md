@@ -39,10 +39,13 @@ python .dev/tools/doc_link_sweep.py
 
 **引数は無い。縮めない。** script が内部で `git diff main...HEAD -- '*.rs'` を固定で打ち、
 tree の item index (fn / struct / enum / field / variant / const / mod …) と突き合わせて
-bucket に振り分ける。exit 1 なら直してから push。手順として grep を打っていた時代
-(PR #238〜2026-09-10) に、範囲を `git diff -- '*.rs'` に縮めた (台帳 #39) / private だからと
-外した (#43) / 形で skip した (#52) の 3 つは、どれも「判断を挟める場所」があったから
-起きた。script はその場所を無くす。`.dev/` が無い環境では旧形を打つ:
+bucket に振り分ける。exit 1 なら直してから push。**exit 0 は sweep の終わりではない** —
+下の表の advisory bucket (`PRIVATE_ELSEWHERE` / `COMPOSITE` / `FILE_NAME` / `TEST_FN_NAME`) を
+全部読んで初めて終わる。手順として grep を打っていた時代 (PR #238〜2026-09-10) に、範囲を
+`git diff -- '*.rs'` に縮めた (台帳 #39) / private だからと外した (#43) / 形で skip した (#52) の
+3 つは、どれも人が決めていた。script が消すのはその 3 つ = **diff の範囲、tree にあるかどうか、
+複合項の中の名前の列挙**。何を link にするかの判断は残る (だから bucket ごとに直し方が書いてある)。
+`.dev/` が無い環境では旧形を打つ:
 `` git -C <abs> diff main...HEAD -- '*.rs' | grep -E '^\+\s*//[/!]' | grep -oE '\[?`[^`]+`\]?' | sort | uniq -c ``
 (pathspec は `'*.rs'` — directory を並べると `grooveseek/benches` が落ちる、codex P2 on #238)。
 
