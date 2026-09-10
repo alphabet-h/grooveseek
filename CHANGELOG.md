@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-09-10
+
 ### Added
 
 - **Every release archive now carries `THIRD-PARTY-LICENSES.md`.** The notice
@@ -5381,7 +5383,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.9.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/alphabet-h/grooveseek/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/alphabet-h/grooveseek/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/alphabet-h/grooveseek/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/alphabet-h/grooveseek/compare/v1.6.0...v1.7.0
