@@ -2,8 +2,8 @@
 //!
 //! Three groups of question, and one deliberate omission. (Since 1.11.0 the
 //! servability group also asks about the declared-field set -- see
-//! [`Database::read_declared_fields`] and the two `declared-fields-*`
-//! findings in [`run`].)
+//! [`crate::db::Database::read_declared_fields`] and the two
+//! `declared-fields-*` findings in [`crate::doctor::run`].)
 //!
 //! **Integrity.** Search reads three tables that have to agree about a chunk:
 //! `chunks` holds the text, `vec_chunks` the embedding, `fts_chunks` the
@@ -21,12 +21,12 @@
 //! equivalent would eventually disagree with the thing it is reporting on,
 //! which is the failure mode this whole feature is about. The same rule holds
 //! for the declared-field set (D-19): whether `--field` / `fields` filters are
-//! refused is decided by [`Database::read_declared_fields`] being absent
-//! (`db/search.rs`'s `refuse_field_filters_while_pending`), and what the next
-//! `groove index` will refresh is decided by comparing that key with
-//! [`crate::indexer::declared_field_names`] of the schema on disk -- `doctor`
-//! reads the same key and calls the same function, it does not re-derive
-//! either rule.
+//! refused is decided by [`crate::db::Database::read_declared_fields`] being
+//! absent ([`crate::db::Database::refuse_field_filters_while_pending`]), and
+//! what the next `groove index` will refresh is decided by comparing that key
+//! with [`crate::indexer::declared_field_names`] of the schema on disk -- this
+//! module reads the same key and calls the same function, it does not
+//! re-derive either rule.
 //!
 //! **What the chunker gave up on.** Which source files were chunked by lines
 //! rather than at their definitions, because one sat past the scope bound or
@@ -132,7 +132,7 @@ fn finding(
 /// broken, the second means something is merely unavailable, and the third
 /// means everything arrived but in a coarser shape than usual.
 ///
-/// `schema` is what `<kb_path>/groove-schema.toml` compiles to
+/// The third argument is what `<kb_path>/groove-schema.toml` compiles to
 /// ([`crate::indexer::load_declared_schema`]), or `None` when there is no
 /// such file; the caller reads it so that a schema that does not load stops
 /// the command before the database is opened, the way `groove index` and
@@ -360,7 +360,7 @@ pub fn run(
 /// `declared_fields_recorded` doc): **absent**, **`[]`** and a **non-empty
 /// list**. Only the first is a problem, and only sometimes:
 ///
-/// - Absent while a pass token is stored ([`Database::read_declared_fields_pass`]):
+/// - Absent while a pass token is stored ([`crate::db::Database::read_declared_fields_pass`]):
 ///   a `groove index` run is refreshing the rows right now, or died doing so.
 ///   Either way `--field` is refused until a run records the set.
 /// - Absent with no token but with `document_fields` rows, or with a schema that
@@ -368,7 +368,8 @@ pub fn run(
 ///   ended before recording. Same refusal, and the rows (if any) are of a
 ///   generation nobody can name.
 /// - Absent with no token, no rows and nothing declared: the state the indexer
-///   itself treats as "nothing to refresh" (`rebuild_index`'s shortcut), and an
+///   itself treats as "nothing to refresh" ([`crate::indexer::rebuild_index`]'s
+///   shortcut), and an
 ///   index no schema has ever asked anything of. `--field` is refused here too,
 ///   but there is no key it could name, so this is not reported -- it is also
 ///   the state every pre-1.9.0 index and every test fixture starts in.

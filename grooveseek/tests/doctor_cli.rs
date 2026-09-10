@@ -281,7 +281,8 @@ fn a_schema_the_index_never_recorded_is_named_as_pending() {
 }
 
 /// A `groove-schema.toml` that does not load stops `groove index` and `groove validate`
-/// before they touch anything; `doctor` treats it the same way -- it could not look.
+/// before they touch anything; [`grooveseek::doctor`] treats it the same way -- it could
+/// not look.
 #[test]
 fn a_schema_that_will_not_load_exits_two() {
     let layout = TempKbLayout::new("groove-doctor-badschema");
