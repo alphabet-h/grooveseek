@@ -1034,6 +1034,30 @@ fn main() -> anyhow::Result<()> {
             println!("Tags parse failures: {tags_failures}");
             let context_mode = db.read_context_mode()?.map(|m| m.as_str()).unwrap_or("off");
             println!("Context mode: {context_mode}");
+            // (D-19) The declared-field set as the index recorded it -- the same key
+            // `search` consults before honouring `--field`, so `pending` here means a
+            // field filter would be refused right now. The schema on disk is not read:
+            // whether the recorded set still matches it is `groove doctor`'s question.
+            // One snapshot for the key and the row count, so the line never pairs a
+            // count from one generation with a set from another (the torn-read case
+            // `Database::declared_fields_snapshot` documents).
+            let grooveseek::db::DeclaredFieldsSnapshot {
+                recorded,
+                rows: field_rows,
+                ..
+            } = db.declared_fields_snapshot()?;
+            let declared = match recorded {
+                None => "pending".to_string(),
+                Some(json) => {
+                    let keys = grooveseek::db::decode_declared_fields(&json)?;
+                    if keys.is_empty() {
+                        "none".to_string()
+                    } else {
+                        keys.join(", ")
+                    }
+                }
+            };
+            println!("Declared fields: {declared} ({field_rows} value rows)");
             // Quality filter: 設定済みの threshold で filter される件数を表示
             let qf = cfg.quality_filter.clone().unwrap_or_default();
             let threshold = qf.effective_threshold();
@@ -1680,9 +1704,14 @@ fn run_doctor(
     // exit 1 — the same code a successful run that found problems uses, so a CI
     // gate could not tell a corrupt database from a finding (codex P2 round 1).
     let looked = (|| -> Result<grooveseek::doctor::Report> {
+        // The schema first, before the database is opened: a `groove-schema.toml` that
+        // does not load is "could not look" (exit 2), and reading it ahead of `open`
+        // keeps a doomed run from applying migrations to the file (D-19; the same
+        // "cheap checks first" order `Commands::Index` uses).
+        let schema = grooveseek::indexer::load_declared_schema(kb_path)?;
         let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
         let registry = cfg.build_parser_registry(kb_path)?;
-        grooveseek::doctor::run(&db, &registry)
+        grooveseek::doctor::run(&db, &registry, schema.as_ref())
     })();
     let report = match looked {
         Ok(r) => r,

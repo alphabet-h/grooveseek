@@ -127,6 +127,8 @@ Markdown 文書も全部読み直して、re-embedding なしで行を書き換�
 おらず、`fields` / `fields_not` を伴う検索は 1 つのエラーで拒まれる (コマンドラインでも
 tool の `error` でも同じ 1 文)。行が新旧どちらの宣言のものか判別できないため。
 どちらの filter も付けない検索には影響しない。`groove index` を完了させてから再試行する。
+この状態は `groove status` が `Declared fields: pending` と出し、`groove doctor` が
+`declared-fields-pending` として、検索を打つ前に報告する (v1.11.0+)。
 
 コマンドラインでは同じ filter が `--field key=value` (繰り返し可; 同じ key
 2 回は OR、違う key は AND) と `--field-not key=value`。ペアは最初の `=` で

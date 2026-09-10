@@ -128,7 +128,9 @@ index has no recorded declared-field set, and a search carrying `fields` or
 `fields_not` is refused with one error (the same sentence on the command line
 and in the tool's `error`), because the rows could belong to both the old and
 the new declaration. A search without either filter is not affected. Let
-`groove index` complete and retry.
+`groove index` complete and retry. `groove status` shows this state as
+`Declared fields: pending`, and `groove doctor` reports it as
+`declared-fields-pending` before any search has to find out (v1.11.0+).
 
 On the command line the same filter is `--field key=value` (repeatable; the same
 key twice is OR, two keys are AND) and `--field-not key=value`. The pair is split

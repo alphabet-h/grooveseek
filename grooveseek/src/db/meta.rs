@@ -388,6 +388,35 @@ impl Database {
             .optional()?)
     }
 
+    /// The three values a diagnosis of the declared-field set needs, read in **one
+    /// statement** so they describe one moment (D-19; local Codex on the doctor
+    /// branch, round 1).
+    ///
+    /// Read as three separate statements, a `groove index` run in another process can
+    /// finish between them: [`crate::doctor`] would pair the generation key it read *before*
+    /// the run recorded (absent) with the pass token it read *after* the run cleared
+    /// it (also absent) and report `declared-fields-pending` for an index that is
+    /// recorded and clean -- exit 1 in a CI gate, over a state that never existed.
+    /// A single `SELECT` is one implicit read transaction, so the key, the token and
+    /// the row count come from the same snapshot whatever a writer does around it.
+    /// [`Database::read_declared_fields`] and the other single-key readers stay for
+    /// the indexer, which holds its own transaction where the pairing matters.
+    pub fn declared_fields_snapshot(&self) -> Result<DeclaredFieldsSnapshot> {
+        let (recorded, pass_open, rows): (Option<String>, bool, i64) = self.conn.query_row(
+            "SELECT \
+               (SELECT value FROM index_meta WHERE key = 'declared_fields'), \
+               (SELECT value FROM index_meta WHERE key = 'declared_fields_pass') IS NOT NULL, \
+               (SELECT count(*) FROM document_fields)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(DeclaredFieldsSnapshot {
+            recorded,
+            pass_open,
+            rows: u64::try_from(rows).unwrap_or(0),
+        })
+    }
+
     /// Remove the pass token and the dirty mark together: a pass is over, whether it
     /// recorded the generation or left it pending.
     pub fn clear_declared_fields_pass(&self) -> Result<()> {

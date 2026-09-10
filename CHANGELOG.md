@@ -14,6 +14,26 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **`groove doctor` looks at the declared-field set, and `groove status`
+  counts it.** Since v1.9.0 the index records which `groove-schema.toml` keys
+  its `document_fields` rows follow, and a search carrying `--field` /
+  `fields` is refused while that set is not recorded — but nothing said so
+  until the search. `doctor` now reports `declared-fields-pending` (no
+  recorded set — a refresh pass is open or was interrupted, or no `groove
+  index` run has completed since the index was created or upgraded from
+  1.8.0 — an index with no documents yet included) and
+  `declared-fields-stale` (the recorded
+  set differs from what the schema on disk declares, so `--field` answers
+  from the old set until the next run), both warnings that one `groove index`
+  clears without re-embedding. `status` prints a `Declared fields:` line with
+  the recorded keys (`pending` / `none`) and the number of value rows. A
+  `groove-schema.toml` that does not load stops `doctor` before it opens the
+  database (exit 2), the way it already stops `index` and `validate`.
+  Retires the "does not yet look at the table" consequence of
+  [ADR-0020](docs/decisions/0020-let-the-index-hold-what-the-schema-declares.md).
+
 ## [1.10.0] - 2026-09-10
 
 ### Added
