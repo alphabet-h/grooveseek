@@ -386,11 +386,18 @@ fn declared_fields_findings(
     const REMEDY: &str = "groove index (one run records the set, without re-embedding)";
     let declared = crate::indexer::declared_field_names(schema);
     let declared_json = serde_json::to_string(&declared)?;
-    let rows = db.document_fields_count()?;
+    // One statement, one moment: the key, the pass token and the row count must not
+    // straddle a `groove index` run finishing in another process (see the method's
+    // doc). Reading them one call at a time is exactly the torn read it exists to
+    // prevent, so this function does not call the single-key readers.
+    let crate::db::DeclaredFieldsSnapshot {
+        recorded,
+        pass_open,
+        rows,
+    } = db.declared_fields_snapshot()?;
     let mut findings = Vec::new();
-    match db.read_declared_fields()? {
+    match recorded {
         None => {
-            let pass_open = db.read_declared_fields_pass()?.is_some();
             if pass_open {
                 findings.push(Finding {
                     check: "declared-fields-pending",
@@ -706,6 +713,69 @@ mod tests {
             err.to_string().contains("declared_fields"),
             "error was {err:#}"
         );
+    }
+
+    #[test]
+    fn a_completed_refresh_reads_as_one_state_not_two() {
+        // The state a `groove index` run leaves behind when it finishes (recorded set, token
+        // cleared, rows written) is clean. Read as three statements, doctor could pair the
+        // pre-run absent key with the post-run absent token and call it pending (local Codex
+        // round 1); the snapshot below is the shape it must read instead.
+        let db = db_with_one_chunk();
+        db.write_declared_fields_pass("run-1").expect("token");
+        db.replace_document_fields(
+            "notes/a.md",
+            &[("status".to_string(), "active".to_string())],
+        )
+        .expect("rows");
+        db.clear_declared_fields_pass().expect("pass over");
+        db.write_declared_fields(r#"["status"]"#).expect("record");
+
+        let snap = db.declared_fields_snapshot().expect("snapshot");
+        assert_eq!(snap.recorded.as_deref(), Some(r#"["status"]"#));
+        assert!(!snap.pass_open);
+        assert_eq!(snap.rows, 1);
+
+        let schema = schema_declaring(&["status"]);
+        let report = run(&db, &registry_md(), Some(&schema)).expect("run");
+        assert!(
+            declared_fields_finding(&report).is_none(),
+            "findings were {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn the_declared_fields_diagnosis_reads_one_snapshot_only() {
+        // Source-shape pin, the way `doctor_cli.rs` pins where the chunk policy is resolved:
+        // the finding must be derived from `declared_fields_snapshot` alone. Any of the
+        // single-key readers appearing in its body reopens the torn read between a key and
+        // a token that a concurrent run can change in between.
+        let src = include_str!("doctor.rs");
+        let body = src
+            .split("fn declared_fields_findings(")
+            .nth(1)
+            .expect("the finding function still exists")
+            .split("\nfn ")
+            .next()
+            .expect("body");
+        assert!(
+            body.contains("declared_fields_snapshot()"),
+            "the diagnosis no longer reads the one-statement snapshot"
+        );
+        for reader in [
+            "read_declared_fields()",
+            "read_declared_fields_pass()",
+            "read_declared_fields_dirty()",
+            "document_fields_count()",
+            "document_fields_is_empty()",
+        ] {
+            assert!(
+                !body.contains(reader),
+                "{reader} inside the diagnosis is a second snapshot; read it from the one \
+                 `declared_fields_snapshot` returns"
+            );
+        }
     }
 
     #[test]

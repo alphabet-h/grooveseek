@@ -1038,8 +1038,15 @@ fn main() -> anyhow::Result<()> {
             // `search` consults before honouring `--field`, so `pending` here means a
             // field filter would be refused right now. The schema on disk is not read:
             // whether the recorded set still matches it is `groove doctor`'s question.
-            let field_rows = db.document_fields_count()?;
-            let declared = match db.read_declared_fields()? {
+            // One snapshot for the key and the row count, so the line never pairs a
+            // count from one generation with a set from another (the torn-read case
+            // `Database::declared_fields_snapshot` documents).
+            let grooveseek::db::DeclaredFieldsSnapshot {
+                recorded,
+                rows: field_rows,
+                ..
+            } = db.declared_fields_snapshot()?;
+            let declared = match recorded {
                 None => "pending".to_string(),
                 Some(json) => {
                     let keys: Vec<String> = serde_json::from_str(&json).with_context(|| {

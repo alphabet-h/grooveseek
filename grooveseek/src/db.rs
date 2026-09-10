@@ -434,6 +434,19 @@ impl IntegrityScan {
     }
 }
 
+/// The declared-field set as one moment of the index (D-19): what
+/// `index_meta.declared_fields` holds (`None` = absent, the pending state),
+/// whether a refresh pass token is stored, and how many `document_fields`
+/// value rows exist. Produced only by [`Database::declared_fields_snapshot`],
+/// which reads all three in a single statement -- see its doc for why the
+/// three single-key readers must not be combined by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredFieldsSnapshot {
+    pub recorded: Option<String>,
+    pub pass_open: bool,
+    pub rows: u64,
+}
+
 /// One directory beneath a `(category, topic)` group, as
 /// [`Database::list_topics`] reports it in [`TopicInfo::children`].
 ///
