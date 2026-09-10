@@ -97,9 +97,11 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
   (2026-09-04 に確認: リンク化して `cargo doc --no-deps` が exit 0、対照として 1 語を存在しない
   名前に変えると `error: unresolved link` で exit 101 = lint は生きている)。**「private」の一語で
   下の行へ振らない** — 台帳 #43 はそれで P2 を受けた
-- **リンクにできないものは backtick のまま残し、散文で持ち主 (module / file) を名指す**:
-  **他** module に private な item / 非 test の doc から名指した `#[cfg(test)]` の item /
-  `tests/` crate から見た lib の `pub(crate)` item / 別の `tests/` crate の test fn。
+- **リンクにできない item は backtick のまま残し、持ち主を名指す** — 持ち主の module が
+  link できるなら **必ず `` [`crate::…`] `` で link する** (`AGENTS.md`「Link the module and leave the
+  item in prose」: **他** module に private な item、`tests/` crate から見た lib の `pub(crate)` item)。
+  散文だけで済ませてよいのは、link できる持ち主が無い場合だけ: 非 test の doc から名指した
+  `#[cfg(test)]` の item (module 自体が rustdoc に無い) / 別の `tests/` crate の test fn。
   **迷ったらリンクにして `cargo doc --no-deps` を 1 回回す** — 張れないなら
   `unresolved link` で落ちるので、推測する必要が無い
 
