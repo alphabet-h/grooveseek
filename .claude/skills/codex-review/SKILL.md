@@ -52,9 +52,9 @@ script の bucket と、それぞれの直し方 (角括弧を残して抽出し
 | bucket | 出力の項 | どうするか |
 |---|---|---|
 | `BARE_TREE_ITEM` | tree の中の item (fn / struct / const / module / field) が bare backtick で、この doc から張れる (同 file、または `pub` / `pub(crate)`)。**判定順は `TEST_FN_NAME` → `PRIVATE_ELSEWHERE` → ここ**: 当たりが test item だけなら同 file でも `TEST_FN_NAME` に行き、exit 1 にならない | `` [`path`] `` に直す。script が定義位置と候補 path を添える。当たりに test item と非 test item が混ざる (`, test` 印) なら、link するのは非 test の方 |
-| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | item は backtick のまま、**持ち主の module を link する** — lib の中からは `` [`crate::…`] ``、`tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (`AGENTS.md` の「Link the module and leave the item in prose」。散文だけでは検査されない、codex P1 on #296 round 1 / 2)。持ち主の module 自体が rustdoc に無い (`#[cfg(test)] mod`、別の `tests/` crate) 時だけ散文 — 下の「リンクにできない item」と同じ。exit 1 にしない |
+| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | item は backtick のまま、**持ち主の module を link する** — lib の中からは `` [`crate::…`] ``、`tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (`AGENTS.md` の「Link the module and leave the item in prose」。散文だけでは検査されない、codex P1 on #296 round 1 / 2)。持ち主の module 自体が **private で届かない** (`crate::parser::panic_guard` のような private な nested mod。privacy は module にも効く) なら、**到達できる一番近い祖先 module** (`` [`crate::parser`] ``) を link し、module 名と item は散文。module が rustdoc に無い (`#[cfg(test)] mod`、別の `tests/` crate) 時だけ散文のみ — 下の「リンクにできない item」と同じ。exit 1 にしない |
 | `LINKED_NOT_IN_TREE` | tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
-| `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / workspace crate 名で始まらない。**`Self::` も含めて落とす** (module doc に `Self` は無い) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
+| `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / **他の** workspace crate 名で始まらない。**`Self::` も落とす** (module doc に `Self` は無い)。**lib 自身の `//!` で自分の crate 名 (`grooveseek::…`) も落とす** — `extern crate self as grooveseek` が無いので解決しない (`config.rs` の test が同じ理由で `crate::` を使う。codex P2 on #296 round 3) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
 | `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
 | `FILE_NAME` | `` `foo.rs` `` / `` `ADR-0013` `` で名指し | module link か markdown link か散文に。**file 名は書かない** (台帳 #41 / #42 / #46) |
 | `TEST_FN_NAME` | index の当たりが `#[cfg(test)]` / `#[test]` / `tests/` の item だけ (同 file でも、ここが先)。**bare でも `` [`..`] `` でも出す** — link 済みは `linked:` 印 (`cargo doc` が検証しない link は通っていても未検証) | 同じ test mod の中なら bare link、非 test の doc からは backtick + 散文 (下の規則)。script は決めない |
@@ -101,7 +101,10 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
   link できるなら **必ず link する**。path は書く側で決まる: lib の中からは `` [`crate::…`] ``、
   `tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (表の `PRIVATE_ELSEWHERE` と同じ。
   `AGENTS.md`「Link the module and leave the item in prose」: **他** module に private な item、
-  `tests/` crate から見た lib の `pub(crate)` item)。
+  `tests/` crate から見た lib の `pub(crate)` item)。持ち主の module が private な nested mod で
+  そこへも届かないなら、**到達できる一番近い祖先** を link する (privacy は module にも効く。
+  `fallback_whole_query` が `no item named 'fts_query' in module 'db'` で落ちたのはこの形、
+  `.dev/knowledge/comments-the-compiler-cannot-see.md`)。
   散文だけで済ませてよいのは、link できる持ち主が無い場合だけ: 非 test の doc から名指した
   `#[cfg(test)] mod tests` の中の item (module 自体が rustdoc に無い) / 別の `tests/` crate の
   test fn。**item だけが `#[cfg(test)]` で gate されている** (`db.rs` の `rrf_topk`、`config.rs` の
