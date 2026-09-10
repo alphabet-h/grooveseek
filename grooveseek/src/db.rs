@@ -445,6 +445,9 @@ pub struct DeclaredFieldsSnapshot {
     pub recorded: Option<String>,
     pub pass_open: bool,
     pub rows: u64,
+    /// `documents` row count from the same statement: an index with none is
+    /// fresh, not pending (`doctor`'s rule for the missing vector table).
+    pub documents: u64,
 }
 
 /// One directory beneath a `(category, topic)` group, as

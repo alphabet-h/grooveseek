@@ -402,18 +402,21 @@ impl Database {
     /// [`Database::read_declared_fields`] and the other single-key readers stay for
     /// the indexer, which holds its own transaction where the pairing matters.
     pub fn declared_fields_snapshot(&self) -> Result<DeclaredFieldsSnapshot> {
-        let (recorded, pass_open, rows): (Option<String>, bool, i64) = self.conn.query_row(
-            "SELECT \
-               (SELECT value FROM index_meta WHERE key = 'declared_fields'), \
-               (SELECT value FROM index_meta WHERE key = 'declared_fields_pass') IS NOT NULL, \
-               (SELECT count(*) FROM document_fields)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        let (recorded, pass_open, rows, documents): (Option<String>, bool, i64, i64) =
+            self.conn.query_row(
+                "SELECT \
+                   (SELECT value FROM index_meta WHERE key = 'declared_fields'), \
+                   (SELECT value FROM index_meta WHERE key = 'declared_fields_pass') IS NOT NULL, \
+                   (SELECT count(*) FROM document_fields), \
+                   (SELECT count(*) FROM documents)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
         Ok(DeclaredFieldsSnapshot {
             recorded,
             pass_open,
             rows: u64::try_from(rows).unwrap_or(0),
+            documents: u64::try_from(documents).unwrap_or(0),
         })
     }
 

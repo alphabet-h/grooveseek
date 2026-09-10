@@ -21,8 +21,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   its `document_fields` rows follow, and a search carrying `--field` /
   `fields` is refused while that set is not recorded — but nothing said so
   until the search. `doctor` now reports `declared-fields-pending` (no
-  recorded set while the schema declares keys, rows remain, or a refresh
-  pass is open or was interrupted) and `declared-fields-stale` (the recorded
+  recorded set — a refresh pass is open or was interrupted, or no `groove
+  index` run has completed since the index was created or upgraded from
+  1.8.0; an index with no documents at all is fresh, not pending) and
+  `declared-fields-stale` (the recorded
   set differs from what the schema on disk declares, so `--field` answers
   from the old set until the next run), both warnings that one `groove index`
   clears without re-embedding. `status` prints a `Declared fields:` line with

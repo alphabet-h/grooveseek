@@ -358,21 +358,27 @@ pub fn run(
 ///
 /// `index_meta.declared_fields` has three states ([`crate::indexer`]'s
 /// `declared_fields_recorded` doc): **absent**, **`[]`** and a **non-empty
-/// list**. Only the first is a problem, and only sometimes:
+/// list**. Only the first is a problem, and it always is: the search gate
+/// ([`crate::db::Database::refuse_field_filters_while_pending`]) refuses every
+/// `--field` / `fields` request while the key is absent, so every absent key is
+/// reported -- a `doctor` that exits 0 right before a field-filtered job is
+/// refused would be lying to the CI gate that asked it (local Codex round 3,
+/// user decision 2026-09-10). Two wordings, one check:
 ///
 /// - Absent while a pass token is stored ([`crate::db::Database::read_declared_fields_pass`]):
 ///   a `groove index` run is refreshing the rows right now, or died doing so.
-///   Either way `--field` is refused until a run records the set.
-/// - Absent with no token but with `document_fields` rows, or with a schema that
-///   declares keys: an index that was written before 1.9.0, or by a run that
-///   ended before recording. Same refusal, and the rows (if any) are of a
-///   generation nobody can name.
-/// - Absent with no token, no rows and nothing declared: the state the indexer
-///   itself treats as "nothing to refresh" ([`crate::indexer::rebuild_index`]'s
-///   shortcut), and an
-///   index no schema has ever asked anything of. `--field` is refused here too,
-///   but there is no key it could name, so this is not reported -- it is also
-///   the state every pre-1.9.0 index and every test fixture starts in.
+/// - Absent with no token: an index written before 1.9.0 that no run has
+///   completed on since, or a run that ended before recording. The rows (if
+///   any) are of a generation nobody can name; the schema (if any) has never
+///   been recorded. An index with no rows and no schema is in this state too --
+///   [`crate::indexer::rebuild_index`] treats it as "nothing to refresh" and
+///   records `[]` on its next run, which is exactly the remedy.
+///
+/// The one absent state that is not reported is an index with **no documents
+/// at all**: that is a fresh database, not a broken one -- the rule the
+/// vector-table check already applies (an empty index without a vector table
+/// is not a finding), and the state `groove serve` creates before its watcher
+/// has seen a file. Nothing indexed means nothing a field filter could reach.
 ///
 /// A recorded set that differs from what the schema on disk declares is not
 /// wrong -- `--field` answers from the recorded set, consistently -- but it
@@ -394,9 +400,15 @@ fn declared_fields_findings(
         recorded,
         pass_open,
         rows,
+        documents,
     } = db.declared_fields_snapshot()?;
     let mut findings = Vec::new();
     match recorded {
+        // An index with no documents is fresh, not pending -- the same rule the
+        // vector-table check applies to an empty index (`groove serve` creates one
+        // before its watcher has seen a file). Nothing has been indexed for a
+        // field filter to reach, and the first run records the set.
+        None if documents == 0 && rows == 0 && !pass_open => {}
         None => {
             if pass_open {
                 findings.push(Finding {
@@ -411,7 +423,7 @@ fn declared_fields_findings(
                     samples: Vec::new(),
                     remedy: REMEDY,
                 });
-            } else if rows > 0 || !declared.is_empty() {
+            } else {
                 findings.push(Finding {
                     check: "declared-fields-pending",
                     severity: Severity::Warning,
@@ -522,6 +534,9 @@ mod tests {
             .expect("upsert");
         db.insert_chunk(doc, 0, Some("H"), None, "body", None, &vec![0.1; 384], 1.0)
             .expect("chunk");
+        // What a completed `groove index` run leaves when there is no schema: the
+        // declared-field set recorded as empty (D-19; an absent key is pending).
+        db.write_declared_fields("[]").expect("declared");
     }
 
     fn db_with_one_chunk() -> Database {
@@ -543,6 +558,8 @@ mod tests {
             .expect("upsert");
         db.insert_chunk(doc, 0, Some("H"), None, "body", None, &vec![0.1; 384], 1.0)
             .expect("chunk");
+        // As in `seed`: a completed run with no schema records `[]`.
+        db.write_declared_fields("[]").expect("declared");
         db
     }
 
@@ -561,12 +578,36 @@ mod tests {
     }
 
     #[test]
-    fn an_index_nothing_was_ever_declared_to_is_not_pending() {
-        // Absent key, no rows, no schema: the state every pre-1.9.0 index and every fixture
-        // in this file starts in, and the one `rebuild_index` short-circuits as "nothing to
-        // refresh". `--field` is refused, but there is no key it could name.
+    fn an_index_no_run_has_recorded_is_pending_even_with_nothing_to_declare() {
+        // Absent key, no rows, no schema: every pre-1.9.0 index until its first run under
+        // 1.9.0+. `rebuild_index` treats it as "nothing to refresh" and records `[]` -- but
+        // until that run, the search gate refuses every `--field`, so doctor must not exit 0
+        // over it (local Codex round 3; user decision 2026-09-10 against the earlier
+        // exception).
         let db = db_with_one_chunk();
+        db.clear_declared_fields().expect("forget");
         assert!(db.read_declared_fields().expect("read").is_none());
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = declared_fields_finding(&report).expect("a pending finding");
+        assert_eq!(f.check, "declared-fields-pending");
+        assert_eq!(f.count, 0);
+        assert!(
+            f.summary.contains("declares none"),
+            "summary was {:?}",
+            f.summary
+        );
+    }
+
+    #[test]
+    fn a_recorded_empty_set_is_what_a_run_without_a_schema_leaves_and_is_clean() {
+        // The fixture's own state: `[]` recorded, no rows, no schema. This is the state the
+        // remedy for the test above produces, and the one every other fixture in this file
+        // starts from.
+        let db = db_with_one_chunk();
+        assert_eq!(
+            db.read_declared_fields().expect("read").as_deref(),
+            Some("[]")
+        );
         let report = run(&db, &registry_md(), None).expect("run");
         assert!(
             declared_fields_finding(&report).is_none(),
@@ -578,6 +619,8 @@ mod tests {
     #[test]
     fn an_open_refresh_pass_is_pending_and_says_so() {
         let db = db_with_one_chunk();
+        // `begin_declared_fields_pass` clears the key and stores the token together.
+        db.clear_declared_fields().expect("forget");
         db.write_declared_fields_pass("4242-1").expect("token");
         let report = run(&db, &registry_md(), None).expect("run");
         let f = declared_fields_finding(&report).expect("a pending finding");
@@ -600,6 +643,7 @@ mod tests {
         // A run wrote rows and died before `write_declared_fields`: rows of a generation
         // nobody can name (`Database::clear_declared_fields`'s doc).
         let db = db_with_one_chunk();
+        db.clear_declared_fields().expect("forget");
         db.replace_document_fields(
             "notes/a.md",
             &[
@@ -623,6 +667,7 @@ mod tests {
     #[test]
     fn a_schema_that_declares_keys_the_index_never_recorded_is_pending() {
         let db = db_with_one_chunk();
+        db.clear_declared_fields().expect("forget");
         let schema = schema_declaring(&["status"]);
         let report = run(&db, &registry_md(), Some(&schema)).expect("run");
         let f = declared_fields_finding(&report).expect("a pending finding");

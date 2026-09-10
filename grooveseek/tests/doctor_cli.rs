@@ -39,6 +39,17 @@ fn seed_index(kb: &Path) {
         .expect("upsert");
     db.insert_chunk(doc, 0, Some("H"), None, "body", None, &vec![0.1; 384], 1.0)
         .expect("chunk");
+    // What a completed `groove index` run records when there is no schema (D-19):
+    // without it the index reads as pending, which `doctor` reports.
+    db.write_declared_fields("[]").expect("declared");
+}
+
+/// Put the index back into the state a 1.8.0 index, or an interrupted run, leaves
+/// behind: no recorded declared-field set.
+fn forget_declared_fields(kb: &Path) {
+    let db_path = grooveseek::resolve_db_path(kb);
+    let db = grooveseek::db::Database::open(&db_path.to_string_lossy()).expect("open db");
+    db.clear_declared_fields().expect("clear");
 }
 
 fn run_doctor(kb: &Path, json: bool) -> (i32, String, String) {
@@ -254,15 +265,15 @@ fn the_chunk_policy_is_resolved_where_the_insertion_paths_meet() {
 
 // -- declared fields (D-19) --------------------------------------------------
 
-/// A schema that declares a key the index never recorded is the ordinary way a 1.8.0
-/// index, or a run that died mid-refresh, looks from the outside: `--field` is refused
-/// and nothing said so before this finding.
+/// An index with no recorded declared-field set is how a 1.8.0 index, or a run that
+/// died mid-refresh, looks from the outside: `--field` is refused and nothing said so
+/// before this finding. Whether a schema exists does not change the answer.
 #[test]
-fn a_schema_the_index_never_recorded_is_named_as_pending() {
+fn an_index_with_no_recorded_set_is_named_as_pending() {
     let layout = TempKbLayout::new("groove-doctor-declared-pending");
     layout.write("notes/a.md", "# A\n\nbody\n");
-    layout.write("groove-schema.toml", "[fields.status]\n");
     seed_index(layout.kb());
+    forget_declared_fields(layout.kb());
 
     let (code, stdout, _) = run_doctor(layout.kb(), true);
     assert_eq!(code, 1, "a pending declared-field set is a finding");
@@ -326,6 +337,13 @@ fn status_reports_the_declared_field_set_on_stdout() {
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
+    let none = status(layout.kb());
+    assert!(
+        none.contains("Declared fields: none (0 value rows)"),
+        "a run with no schema records an empty set, got:\n{none}"
+    );
+
+    forget_declared_fields(layout.kb());
     let pending = status(layout.kb());
     assert!(
         pending.contains("Declared fields: pending (0 value rows)"),
