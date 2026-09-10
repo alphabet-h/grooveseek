@@ -32,6 +32,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   fixed, and what is a documented limit rather than a defect. README links to
   it from a new Security section.
 
+### Changed
+
+- **`[parsers.code].max_chunk_chars` must be at least 30.** A smaller value
+  now fails when the config loads, naming the key, the floor and the value it
+  got. Until now any number was accepted, including `0`, and such a budget sent
+  every definition through the line fallback: no file kept a definition whole,
+  and `groove doctor` reported each one as `chunked-without-definitions` with a
+  remedy that pointed at the file rather than the setting. The floor is the
+  chunker's own threshold for a fragment worth keeping (ADR-0017's
+  consequences note the change). An index already cut at a smaller budget
+  keeps the existing `--force` warning once the setting is raised.
+
 ### Documentation
 
 - **`--reranker jina-v2-ml` is now marked non-commercial.** The model is

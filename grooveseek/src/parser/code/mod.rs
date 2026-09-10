@@ -123,7 +123,11 @@ const MAX_DEFINITION_SCOPE_DEPTH: usize = 64;
 /// The same threshold the quality filter uses for "too short to be worth much", reused rather
 /// than invented: the filter alone is not enough, because a two-line fragment under the
 /// threshold still scores above the default cutoff and would survive.
-const MIN_FRAGMENT_CHARS: usize = 30;
+///
+/// It is also the floor [`crate::parser::ParsersConfig::validate`] puts under
+/// `[parsers.code].max_chunk_chars`: a budget below it would cut every definition into pieces
+/// this very constant says are not worth keeping.
+pub(crate) const MIN_FRAGMENT_CHARS: usize = 30;
 
 /// A grammar plus the tags query that goes with it, ready to parse.
 ///
@@ -1452,9 +1456,11 @@ impl Counter {
 
     #[test]
     fn the_fallback_fits_the_bound_however_narrow_the_budget_is() {
-        // The budget decides how finely the fallback cuts, and `[parsers.code].max_chunk_chars`
-        // takes any number. Widening it rather than dropping pieces is what lets the bound and
-        // ADR-0012's "every byte" hold at once, so both are asserted for each budget.
+        // The budget decides how finely the fallback cuts. `ParsersConfig::validate` rejects
+        // `[parsers.code].max_chunk_chars` under `MIN_FRAGMENT_CHARS`, but the chunker itself
+        // takes any number and must stay correct for all of them. Widening it rather than
+        // dropping pieces is what lets the bound and ADR-0012's "every byte" hold at once, so
+        // both are asserted for each budget.
         let src = wide_source(60);
         let want: String = src.chars().filter(|c| !c.is_whitespace()).collect();
         for budget in [1usize, 5, 40] {

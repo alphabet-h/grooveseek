@@ -426,6 +426,8 @@ pub struct CodeParsersConfig {
     /// definitions where it has them, and by lines where it does not, which is the common case
     /// for a long function. Lowering this yields finer-grained hits at the cost of cutting
     /// bodies apart; raising it does the reverse.
+    ///
+    /// Values under [`code::MIN_FRAGMENT_CHARS`] are rejected by [`ParsersConfig::validate`].
     #[serde(default = "default_max_chunk_chars")]
     pub max_chunk_chars: usize,
 }
@@ -443,12 +445,32 @@ impl Default for CodeParsersConfig {
 }
 
 impl ParsersConfig {
-    /// `enabled` が空なら誤設定としてエラーを返す。load 時に呼ぶ。
+    /// `enabled` が空、または `[parsers.code].max_chunk_chars` が
+    /// [`code::MIN_FRAGMENT_CHARS`] 未満なら誤設定としてエラーを返す。load 時に呼ぶ。
+    ///
+    /// The floor is a quality bound, not an availability one: since ADR-0017 the chunker keeps
+    /// the per-file chunk count under its cap by widening the budget, whatever the setting.
+    /// What a budget under the floor still does is cut every definition into fragments the
+    /// chunker itself treats as too short to keep, so no file would keep a definition whole.
     pub fn validate(&self) -> Result<()> {
         if self.enabled.is_empty() {
             anyhow::bail!(
                 "[parsers].enabled must contain at least one id (got empty array). \
                  Remove the key entirely to use the default [\"md\"]."
+            );
+        }
+        if self.code.max_chunk_chars < code::MIN_FRAGMENT_CHARS {
+            anyhow::bail!(
+                concat!(
+                    "[parsers.code].max_chunk_chars must be >= {floor} ",
+                    "(a fragment under that many non-whitespace characters is what the code ",
+                    "chunker already treats as too short to keep; a budget below it would cut ",
+                    "every definition into such fragments), got {got}. ",
+                    "Remove the key to use the default {default}."
+                ),
+                floor = code::MIN_FRAGMENT_CHARS,
+                got = self.code.max_chunk_chars,
+                default = code::DEFAULT_MAX_CHUNK_CHARS,
             );
         }
         Ok(())
@@ -480,6 +502,54 @@ mod tests {
             code: CodeParsersConfig::default(),
         };
         cfg.validate().unwrap();
+    }
+
+    fn with_budget(max_chunk_chars: usize) -> ParsersConfig {
+        ParsersConfig {
+            enabled: vec!["md".to_string(), "rs".to_string()],
+            code: CodeParsersConfig { max_chunk_chars },
+        }
+    }
+
+    #[test]
+    fn test_parsers_config_rejects_zero_max_chunk_chars() {
+        let err = with_budget(0)
+            .validate()
+            .expect_err("a zero budget must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[parsers.code].max_chunk_chars must be >= 30"),
+            "{msg}"
+        );
+        assert!(msg.contains("got 0"), "{msg}");
+        assert!(msg.contains("default 3500"), "{msg}");
+    }
+
+    #[test]
+    fn test_parsers_config_rejects_max_chunk_chars_just_under_the_floor() {
+        let floor = code::MIN_FRAGMENT_CHARS;
+        let err = with_budget(floor - 1)
+            .validate()
+            .expect_err("one under the floor must be an error");
+        assert!(err.to_string().contains(&format!("got {}", floor - 1)));
+    }
+
+    #[test]
+    fn test_parsers_config_accepts_max_chunk_chars_at_the_floor() {
+        with_budget(code::MIN_FRAGMENT_CHARS).validate().unwrap();
+    }
+
+    #[test]
+    fn test_parsers_config_reports_empty_enabled_before_the_budget() {
+        // Both faults at once: the message names the first check, so a user fixing
+        // `enabled` is not left guessing which of the two the error was about.
+        let cfg = ParsersConfig {
+            enabled: vec![],
+            code: CodeParsersConfig { max_chunk_chars: 0 },
+        };
+        let msg = cfg.validate().expect_err("must fail").to_string();
+        assert!(msg.contains("[parsers].enabled"), "{msg}");
+        assert!(!msg.contains("max_chunk_chars"), "{msg}");
     }
 
     #[test]

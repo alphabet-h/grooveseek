@@ -172,7 +172,8 @@ enabled = ["md"]
 # max_chunk_chars is the budget for one chunk in non-whitespace characters. A
 # definition that fits becomes one chunk; one that does not is split into its
 # nested definitions, or by lines when it has none. Lower it for finer-grained
-# hits, raise it to keep long bodies whole.
+# hits, raise it to keep long bodies whole. Values under 30 are rejected when
+# the config loads (the chunker's own floor for a fragment worth keeping).
 [parsers.code]
 #max_chunk_chars = 3500
 

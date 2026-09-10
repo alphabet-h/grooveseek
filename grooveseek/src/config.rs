@@ -1987,6 +1987,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parsers_code_max_chunk_chars_below_floor_is_rejected() {
+        // `[parsers.code].max_chunk_chars = 0` used to load, and every definition then fell
+        // through to the line fallback. The floor lives in `ParsersConfig::validate`; this
+        // checks that `load_from` runs it and keeps the section name in the wrapped error.
+        let mut file = tempfile("groove-config-parsers-code-floor");
+        writeln!(
+            file,
+            "[parsers]\n\
+             enabled = [\"md\", \"rs\"]\n\
+             [parsers.code]\n\
+             max_chunk_chars = 0\n"
+        )
+        .unwrap();
+        let err = Config::load_from(file.path()).expect_err("must reject a zero budget");
+        let full = format!("{err:?}");
+        assert!(full.contains("invalid [parsers] config"), "{full}");
+        assert!(
+            full.contains("[parsers.code].max_chunk_chars must be >= 30"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn test_parsers_code_max_chunk_chars_at_floor_loads() {
+        let mut file = tempfile("groove-config-parsers-code-floor-ok");
+        writeln!(
+            file,
+            "[parsers]\n\
+             enabled = [\"md\", \"rs\"]\n\
+             [parsers.code]\n\
+             max_chunk_chars = 30\n"
+        )
+        .unwrap();
+        let cfg = Config::load_from(file.path()).unwrap();
+        assert_eq!(cfg.parsers.unwrap().code.max_chunk_chars, 30);
+    }
+
+    #[test]
     fn test_parsers_omitted_uses_md_default() {
         // [parsers] セクション自体が無い場合は cfg.parsers は None、
         // build_parser_registry() は Registry::defaults() = ["md"] を返す。

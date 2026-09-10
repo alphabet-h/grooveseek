@@ -115,6 +115,9 @@ changed is what happens when it does.
 - `[parsers.code].max_chunk_chars` still has no floor. After this decision it no longer
   decides how many chunks a file may contribute, so it is no longer an availability
   question — it only decides how finely files that fit the bound are cut.
+  *2026-09-10:* the config loader now rejects values under 30, the chunker's own threshold
+  for a fragment worth keeping. That floor is a quality bound, not the availability bound
+  this decision made unnecessary; the widening above still carries the chunk count on its own.
 - An index built before this release keeps its chunks for every file whose content has not
   changed, because such a file never reaches the parser again. Those files may still be
   missing the tails the old truncation cut, and nothing on the document says so — the tag is
