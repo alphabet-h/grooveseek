@@ -52,7 +52,7 @@ script の bucket と、それぞれの直し方 (角括弧を残して抽出し
 | bucket | 出力の項 | どうするか |
 |---|---|---|
 | `BARE_TREE_ITEM` | tree の中の item (fn / struct / const / module / field) が bare backtick で、この doc から張れる (同 file、または `pub` / `pub(crate)`)。**判定順は `TEST_FN_NAME` → `PRIVATE_ELSEWHERE` → ここ**: 当たりが test item だけなら同 file でも `TEST_FN_NAME` に行き、exit 1 にならない | `` [`path`] `` に直す。script が定義位置と候補 path を添える。当たりに test item と非 test item が混ざる (`, test` 印) なら、link するのは非 test の方 |
-| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | item は backtick のまま、**持ち主の module を `` [`crate::…`] `` で link する** (`AGENTS.md` の「Link the module and leave the item in prose」。散文だけでは検査されない、codex P1 on #296)。exit 1 にしない |
+| `PRIVATE_ELSEWHERE` | tree にはあるが張れない: 他 file の private item、`tests/` / `benches/` から見た lib の `pub(crate)` | item は backtick のまま、**持ち主の module を link する** — lib の中からは `` [`crate::…`] ``、`tests/` / `benches/` からは別 crate なので `` [`grooveseek::…`] `` (`AGENTS.md` の「Link the module and leave the item in prose」。散文だけでは検査されない、codex P1 on #296 round 1 / 2)。exit 1 にしない |
 | `LINKED_NOT_IN_TREE` | tree の外 (std / 依存 crate / SQL 語 / attribute / CLI 名 / file path / MCP tool 名) が `` [`..`] `` | backtick に戻す。**リンクにするのも P1** (#236 round 3 の `` `serde_json::Value` ``) |
 | `MODULE_DOC_RELATIVE_LINK` | `//!` の中の `` [`..`] `` が `crate::` / `std::` (`core::` / `alloc::`) / workspace crate 名で始まらない。**`Self::` も含めて落とす** (module doc に `Self` は無い) | 絶対 path に (台帳 #40。`cargo doc` は private import で通してしまう) |
 | `COMPOSITE` | `::` / 演算子 / `{}` / `;` / 空白を含む項 — `` `use super::*;` `` や `` `limit * FILTER_OVERFETCH_FACTOR` `` や `` `Database: Debug` `` | **中の名前を 1 つずつほどいて**上の行を適用する。#237 round 1 と台帳 #52 の P1 はこの形 |
@@ -101,7 +101,10 @@ exit 1 になるのは `BARE_TREE_ITEM` / `LINKED_NOT_IN_TREE` / `MODULE_DOC_REL
   link できるなら **必ず `` [`crate::…`] `` で link する** (`AGENTS.md`「Link the module and leave the
   item in prose」: **他** module に private な item、`tests/` crate から見た lib の `pub(crate)` item)。
   散文だけで済ませてよいのは、link できる持ち主が無い場合だけ: 非 test の doc から名指した
-  `#[cfg(test)]` の item (module 自体が rustdoc に無い) / 別の `tests/` crate の test fn。
+  `#[cfg(test)] mod tests` の中の item (module 自体が rustdoc に無い) / 別の `tests/` crate の
+  test fn。**item だけが `#[cfg(test)]` で gate されている** (`db.rs` の `rrf_topk`、`config.rs` の
+  `discover_at` のような形) なら持ち主 module は rustdoc にあるので、`` [`crate::db`] `` の
+  module link は要る (codex P1 on #296 round 2)。
   **迷ったらリンクにして `cargo doc --no-deps` を 1 回回す** — 張れないなら
   `unresolved link` で落ちるので、推測する必要が無い
 
