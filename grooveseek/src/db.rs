@@ -446,7 +446,7 @@ pub struct DeclaredFieldsSnapshot {
     pub pass_open: bool,
     pub rows: u64,
     /// `documents` row count from the same statement: an index with none is
-    /// fresh, not pending (`doctor`'s rule for the missing vector table).
+    /// fresh, not pending ([`crate::doctor`]'s rule for the missing vector table).
     pub documents: u64,
 }
 

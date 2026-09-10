@@ -361,7 +361,7 @@ pub fn run(
 /// list**. Only the first is a problem, and it always is: the search gate
 /// ([`crate::db::Database::refuse_field_filters_while_pending`]) refuses every
 /// `--field` / `fields` request while the key is absent, so every absent key is
-/// reported -- a `doctor` that exits 0 right before a field-filtered job is
+/// reported -- a report that exits 0 right before a field-filtered job is
 /// refused would be lying to the CI gate that asked it (local Codex round 3,
 /// user decision 2026-09-10). Two wordings, one check:
 ///
