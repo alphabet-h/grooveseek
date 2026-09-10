@@ -433,14 +433,10 @@ fn declared_fields_findings(
             }
         }
         Some(recorded_json) => {
-            // The same parse the watcher paths apply: a value that is not a JSON list is
-            // not a finding, it is an index `doctor` cannot read -- exit 2, like a corrupt
-            // file (`indexer.rs`'s `declared_fields_recorded` bails the same way).
-            let recorded: Vec<String> = serde_json::from_str(&recorded_json).map_err(|e| {
-                anyhow::anyhow!(
-                    "index_meta.declared_fields is not a JSON list: {recorded_json} ({e})"
-                )
-            })?;
+            // The one decoder the watcher paths and `status` use too: a value that is not
+            // a JSON list is not a finding, it is an index this report cannot read -- exit
+            // 2, like a corrupt file.
+            let recorded = crate::db::decode_declared_fields(&recorded_json)?;
             if recorded_json != declared_json {
                 findings.push(Finding {
                     check: "declared-fields-stale",

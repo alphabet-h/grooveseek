@@ -447,6 +447,17 @@ pub struct DeclaredFieldsSnapshot {
     pub rows: u64,
 }
 
+/// The one decoder for `index_meta.declared_fields` (GitHub Codex P1 on PR
+/// #299): the indexer's watcher paths, `groove doctor` and `groove status` all
+/// read the same stored JSON list, and a change to how it is validated or
+/// normalised must reach all three at once. A value that is not a JSON list
+/// is an error, not an empty set -- every caller treats it as "could not
+/// read", never as a finding or a count.
+pub fn decode_declared_fields(json: &str) -> Result<Vec<String>> {
+    serde_json::from_str(json)
+        .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}"))
+}
+
 /// One directory beneath a `(category, topic)` group, as
 /// [`Database::list_topics`] reports it in [`TopicInfo::children`].
 ///

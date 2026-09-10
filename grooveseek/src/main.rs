@@ -1049,9 +1049,7 @@ fn main() -> anyhow::Result<()> {
             let declared = match recorded {
                 None => "pending".to_string(),
                 Some(json) => {
-                    let keys: Vec<String> = serde_json::from_str(&json).with_context(|| {
-                        format!("index_meta.declared_fields is not a JSON list: {json}")
-                    })?;
+                    let keys = grooveseek::db::decode_declared_fields(&json)?;
                     if keys.is_empty() {
                         "none".to_string()
                     } else {

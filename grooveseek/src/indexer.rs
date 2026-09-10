@@ -2285,12 +2285,10 @@ pub(crate) const DECLARED_FIELDS_NONE: &str = "[]";
 /// landed while a refresh was clearing and rewriting the key would wipe a document's valid
 /// `document_fields` rows down to nothing.
 fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
-    match db.read_declared_fields()? {
-        Some(json) => serde_json::from_str(&json)
-            .map(Some)
-            .with_context(|| format!("index_meta.declared_fields is not a JSON list: {json}")),
-        None => Ok(None),
-    }
+    db.read_declared_fields()?
+        .as_deref()
+        .map(crate::db::decode_declared_fields)
+        .transpose()
 }
 
 /// Reads `<kb_path>/groove-schema.toml` — the same file `groove validate`
