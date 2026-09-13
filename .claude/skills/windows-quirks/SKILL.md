@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, and `os error 1455` (page file) at test start under the same default parallelism, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, paths longer than MAX_PATH (260) that `groove index` survives only as a side effect of `canonicalize` returning a `\\?\` path while `groove validate` walks the raw path, `Get-ChildItem -Include` being silently ignored next to `-LiteralPath` so an extension filter returns every file, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, and `os error 1455` (page file) at test start under the same default parallelism, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, paths longer than MAX_PATH (260), which Rust std already hands to Win32 with a `\\?\` prefix so neither `LongPathsEnabled` nor a `longPathAware` manifest decides whether `groove index` or `groove validate` can read them (the walk error names the path under `Caused by:`), `Get-ChildItem -Include` being silently ignored next to `-LiteralPath` so an extension filter returns every file, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -716,13 +716,12 @@ stderr が要る検証には使わない**。
 出典: 2026-08-21 (初出、`.dev/knowledge/archive/superseded/bash-tool-wrapper-parse-error.md:48-50`) /
 2026-09-06 AV-13 (`cargo test` の stack overflow 判定が当たらなかった、`.dev/knowledge/av-13-identical-ranges-pitfalls.md:139-144`)
 
-## 21. 長いパス (MAX_PATH 260): 索引は `canonicalize` の**副作用**で通る。`validate` は同じ保証を持たない
+## 21. 長いパス (MAX_PATH 260): Rust std が自分で `\\?\` を付けるので、groove の fs 呼び出しはレジストリにもマニフェストにも依存しない
 
-**症状**: 階層の深い日本語フォルダ (案件番号 + 顧問先名 + 年度 + 書類種別) を索引すると、
-260 文字を超えるパスのファイルが扱えない可能性がある。walk 中に失敗すると
+**心配されていた症状**: 階層の深い日本語フォルダ (案件番号 + 顧問先名 + 年度 + 書類種別) を索引すると、
+260 文字を超えるパスのファイルが扱えないのではないか。walk 中に失敗すると
 `grooveseek/src/indexer.rs:1949` の `entry.context("walkdir error")?` がそのまま伝播するので、
-**1 ファイルの失敗で KB 全体の索引が止まり、メッセージは汎用の `walkdir error` だけ**。
-現地で原因に辿り着けない形。
+**1 ファイルの失敗で KB 全体の索引が止まる** (これは事実。長いパスが原因になるかは下で否定する)。
 
 **実測 (2026-09-11)**: 291 文字の日本語パスを作って索引したら通った
 (via: `scratchpad/maxpath_probe.ps1` で KB を作り `groove.exe index --kb-path <kb>` → `Done in 49ms: 2 docs (2 updated, 0 renamed, 0 deleted, 0 skipped)`)。
@@ -732,27 +731,37 @@ stderr が要る検証には使わない**。
 同じ機械では `cmd.exe /c type` も 291 文字のファイルを開けたので、**差分テストでは切り分けできない** —
 レジストリが効いてしまう。
 
-**なぜ索引は安全と言えるか (実測ではなくコードで確定)**: `rebuild_index` は入口で
-`kb_path.canonicalize()` し (`grooveseek/src/indexer.rs:584-586`)、その結果が
-`collect_source_files` → `WalkDir::new(start)` (`grooveseek/src/indexer.rs:1938`) に渡る。
-**Windows の `canonicalize` は verbatim prefix (`\\?\`) を付けて返す**ことは、このリポジトリ自身が
-`grooveseek/src/config.rs:1611-1612` に書いている。extended-length path は MAX_PATH 検査を経由しないので、
-**レジストリにも実行ファイルのマニフェストにも依存しない**。
+**切り分けは std のソースで付く (実測ではない)**: Rust std の Windows 実装は、パスを Win32 に渡す前に
+`maybe_verbatim` を通す。`File::open` と `read_dir` は直接、`metadata` / `canonicalize` / `remove_file` /
+`rename` などは `with_native_path` 経由でここを通る。中の `get_long_path` は、短い絶対パスだけを素通しし、
+それ以外を `GetFullPathNameW` で絶対化して `\\?\` を付ける
+<!-- via: rustup stable の rust-src で library/std/src/sys/path/windows.rs:81-83 (maybe_verbatim), :99 LEGACY_MAX_PATH = 248, :121 (素通しの条件), :150 (prefix を付ける条件); library/std/src/sys/fs/mod.rs:111-112 (metadata), :147-148 (canonicalize); library/std/src/sys/fs/windows.rs:339 (File::open), :1246 (readdir) -->
+したがって **相対の KB ルートでも、KB ルート自体が長くても、`validate` が canonicalize せずに素のパスで歩いても**
+(`grooveseek/src/main.rs:1344-1345`)、std の fs 呼び出しである限り MAX_PATH には当たらない。
+`longPathAware` マニフェスト (`grooveseek/build.rs` は無い) にも `LongPathsEnabled` にも依存しない。
 
-**ただしこれは副作用であって設計ではない。** `longPathAware` を宣言したマニフェストは無く
-(`grooveseek/build.rs` も `.manifest` も存在しない。`build.rs` があるのは `crates/groove-tray/` だけ)、
-この性質を固定するテストも無い。canonicalize を外す変更が入れば黙って壊れる。
+**2026-09-11 版はここを誤読していた**: 「索引は `rebuild_index` の `kb_path.canonicalize()`
+(`grooveseek/src/indexer.rs:584-586`) が返す verbatim prefix の**副作用**で通り、`validate` は同じ保証を
+持たない」と書いていた。canonicalize が prefix を付けること自体は正しい (`grooveseek/src/config.rs:1611-1612`) が、
+**prefix が無くても std が長いパスに自分で付ける**ので、索引と validate の差にはならない。
+コードの 1 か所を読んで「これが理由だ」と決め、その下の層 (std) を読まなかった形。
 
-**`validate` は同じ保証を持たない**: `grooveseek/src/main.rs:1344-1345` が
-「canonicalize は使わない: … Windows の UNC (`\\?\`) prefix 漏れを避ける」と**意図的に**選んでいる。
-素のパスで歩くので、長パスの可否は OS 設定に依存する。**索引は通るのに validate だけ落ちる**食い違いが
-あり得る。**未確認** — 判定には `LongPathsEnabled = 0` の環境が要る。
+**残る範囲 (std の fs を通らないもの)**: Win32 API を直接呼ぶコード、C/C++ の依存へパス文字列を渡す箇所、
+長いパスを子プロセスの引数や cwd として渡す場合 (受け側のプログラムの制限になる)。
+groove の索引経路でこれに当たるものがあるかは**未調査**。`LongPathsEnabled = 0` の機械での実測も**未**
+(std の読みからは通る見込み)。
 
-**対策**: (1) 顧客環境では **`LongPathsEnabled` を先に読む**。読まずに「うちでは動いた」を持ち込まない。
-(2) 索引が `walkdir error` で止まったら、まず長いパスを疑う — メッセージからは分からない。
-(3) 製品として保証するなら、canonicalize 依存をテストで固定するか `longPathAware` マニフェストを足す。
+**walk が失敗したときのメッセージ**: `walkdir error` は外側に足した context で、原因は消えない。
+`main` は `anyhow::Result` を返し (`grooveseek/src/main.rs:718`)、`groove index` は `rebuild_index(...)?`
+(`grooveseek/src/main.rs:974-985`) で返すので、`Caused by:` の下に walkdir の
+`IO error for operation on <path>: <OS error>` が出る (walkdir 2.5.0 の `Error` の `Display`)。
 
-出典: 2026-09-11、社内文書検索 GUI (strategy §13.7) の事前調査。kuriya trap #187。
+**対策**: (1) 索引が `walkdir error` で止まったら、**`Caused by:` の行のパスと OS エラーを読む** —
+長いパスを最初に疑わない。(2) `LongPathsEnabled` を読むのは、上の「std の fs を通らないもの」を疑う時の材料として。
+(3) 製品として保証するなら、260 文字を超えるパスを作って `index` と `validate` を通すテストを Windows CI に置く。
+
+出典: 2026-09-11、社内文書検索 GUI (strategy §13.7) の事前調査。2026-09-14 に std のソースで訂正
+(きっかけは docs PR のローカル Codex review が「長い KB ルートは canonicalize の前に落ちる」と指摘したこと)。kuriya trap #187。
 関連: 罠 18 (同じ `\\?\` prefix が「片側だけ canonicalize」の形で噛む)
 
 ## 22. `Get-ChildItem -Include` は `-LiteralPath` と併用すると黙って無視される (全件が返る)
