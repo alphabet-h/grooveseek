@@ -822,7 +822,8 @@ Where .pdf    -> a.pdf,B.PDF
 $ext = '.pdf','.xlsx','.docx','.pptx','.txt','.md'
 $all = @(Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorVariable enumErr -ErrorAction SilentlyContinue)
 $f   = @($all | Where-Object { $ext -contains $_.Extension })
-"AllFiles=$($all.Count) TargetFiles=$($f.Count) EnumErrors=$($enumErr.Count)"
+$links = @(Get-ChildItem -LiteralPath $p -Recurse -Directory -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
+"AllFiles=$($all.Count) TargetFiles=$($f.Count) EnumErrors=$($enumErr.Count) ReparseDirs=$($links.Count)"
 ```
 
 **検算を必ず入れる**: 絞った件数と絞らない件数を**両方出す**。対象外の拡張子のファイルがあると分かっている場所で
@@ -833,9 +834,11 @@ $f   = @($all | Where-Object { $ext -contains $_.Extension })
 **`-Force` も要る**: 付けないと隠し属性のファイルと、隠しフォルダの配下が**列挙エラーを出さずに**外れる
 (`EnumErrors` はゼロのまま)。システム属性だけのファイルは `-Force` 無しでも出た。隠しファイルを見積もりから
 外したいなら `-Force` を外し、出力を「隠しファイルを除いた件数」と明記する。
-**ジャンクション**: この版の `-Recurse -File -Force` は、ツリーの外を指すジャンクションの先を辿らなかった
-(外のファイルは数えず、ジャンクション自体は `-Attributes ReparsePoint` で見つかる)。
-ディレクトリのシンボリックリンクは作成に権限が要るので未確認。
+**リンクのフォルダ (ReparsePoint)**: この版の `-Recurse -File -Force` は、ツリーの外を指すジャンクションの先を辿らなかった
+(外のファイルは数えず、ジャンクション自体は `-Attributes ReparsePoint` で見つかった)。
+ディレクトリのシンボリックリンクは作成に管理者権限が要り**未実測**で、Windows PowerShell 5.1 の `-Recurse` はこれを辿るという報告がある。
+そのため上のコマンドは `ReparseDirs` を並べて出す。**ゼロでなければ、ツリーの外のファイルや二重計上を含み得るので見積もりを信用しない**
+(シンボリックリンクも属性は ReparsePoint なので同じ数え方で拾える見込み — 推定)。
 顧客に投げるコマンドでは特にこれを入れる。
 <!-- via: scratchpad\gci_err_probe.ps1 を & ([scriptblock]::Create((Get-Content -Raw -Encoding UTF8 <path>))) で実行。ok\ に a.pdf b.zip、locked\ に c.pdf を置き、locked に icacls /deny "<user>:(OI)(CI)(RX)" を付けて比較 (finally で ACE を外して削除)。同じ probe で 案件[2026]\in-bracket.pdf と 案件2\in-sibling.pdf を置き -Path / -LiteralPath を比較。別の probe で gci-hidden-probe\ に plain.pdf / hidden.pdf (Hidden) / system.pdf (System) / hiddendir\inside.pdf (フォルダを Hidden) を置き、-Force の有無で Name と EnumErrors を比較。ジャンクションの probe: gci-junction-probe\tree\in.pdf と gci-junction-probe\outside\out.pdf を置き、tree\link-to-outside を New-Item -ItemType Junction で outside に向けて -Recurse -File -Force と -Recurse -Directory -Force -Attributes ReparsePoint を比較 (片付けは [System.IO.Directory]::Delete でリンクだけ外す) -->
 ```
