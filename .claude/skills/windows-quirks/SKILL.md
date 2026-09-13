@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, and `os error 1455` (page file) at test start under the same default parallelism, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, and `os error 1455` (page file) at test start under the same default parallelism, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, paths longer than MAX_PATH (260) that `groove index` survives only as a side effect of `canonicalize` returning a `\\?\` path while `groove validate` walks the raw path, `Get-ChildItem -Include` being silently ignored next to `-LiteralPath` so an extension filter returns every file, or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -715,6 +715,92 @@ stderr が要る検証には使わない**。
 
 出典: 2026-08-21 (初出、`.dev/knowledge/archive/superseded/bash-tool-wrapper-parse-error.md:48-50`) /
 2026-09-06 AV-13 (`cargo test` の stack overflow 判定が当たらなかった、`.dev/knowledge/av-13-identical-ranges-pitfalls.md:139-144`)
+
+## 21. 長いパス (MAX_PATH 260): 索引は `canonicalize` の**副作用**で通る。`validate` は同じ保証を持たない
+
+**症状**: 階層の深い日本語フォルダ (案件番号 + 顧問先名 + 年度 + 書類種別) を索引すると、
+260 文字を超えるパスのファイルが扱えない可能性がある。walk 中に失敗すると
+`grooveseek/src/indexer.rs:1949` の `entry.context("walkdir error")?` がそのまま伝播するので、
+**1 ファイルの失敗で KB 全体の索引が止まり、メッセージは汎用の `walkdir error` だけ**。
+現地で原因に辿り着けない形。
+
+**実測 (2026-09-11)**: 291 文字の日本語パスを作って索引したら通った
+(via: `scratchpad/maxpath_probe.ps1` で KB を作り `groove.exe index --kb-path <kb>` → `Done in 49ms: 2 docs (2 updated, 0 renamed, 0 deleted, 0 skipped)`)。
+**ただし測った機械は `LongPathsEnabled = 1`**
+(via: `Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled`)。
+**この結果だけでは、既定値のままの Windows Server で通る証拠にならない。**
+同じ機械では `cmd.exe /c type` も 291 文字のファイルを開けたので、**差分テストでは切り分けできない** —
+レジストリが効いてしまう。
+
+**なぜ索引は安全と言えるか (実測ではなくコードで確定)**: `rebuild_index` は入口で
+`kb_path.canonicalize()` し (`grooveseek/src/indexer.rs:584-586`)、その結果が
+`collect_source_files` → `WalkDir::new(start)` (`grooveseek/src/indexer.rs:1938`) に渡る。
+**Windows の `canonicalize` は verbatim prefix (`\\?\`) を付けて返す**ことは、このリポジトリ自身が
+`grooveseek/src/config.rs:1611-1612` に書いている。extended-length path は MAX_PATH 検査を経由しないので、
+**レジストリにも実行ファイルのマニフェストにも依存しない**。
+
+**ただしこれは副作用であって設計ではない。** `longPathAware` を宣言したマニフェストは無く
+(`grooveseek/build.rs` も `.manifest` も存在しない。`build.rs` があるのは `crates/groove-tray/` だけ)、
+この性質を固定するテストも無い。canonicalize を外す変更が入れば黙って壊れる。
+
+**`validate` は同じ保証を持たない**: `grooveseek/src/main.rs:1344-1345` が
+「canonicalize は使わない: … Windows の UNC (`\\?\`) prefix 漏れを避ける」と**意図的に**選んでいる。
+素のパスで歩くので、長パスの可否は OS 設定に依存する。**索引は通るのに validate だけ落ちる**食い違いが
+あり得る。**未確認** — 判定には `LongPathsEnabled = 0` の環境が要る。
+
+**対策**: (1) 顧客環境では **`LongPathsEnabled` を先に読む**。読まずに「うちでは動いた」を持ち込まない。
+(2) 索引が `walkdir error` で止まったら、まず長いパスを疑う — メッセージからは分からない。
+(3) 製品として保証するなら、canonicalize 依存をテストで固定するか `longPathAware` マニフェストを足す。
+
+出典: 2026-09-11、社内文書検索 GUI (strategy §13.7) の事前調査。kuriya trap #187。
+関連: 罠 18 (同じ `\\?\` prefix が「片側だけ canonicalize」の形で噛む)
+
+## 22. `Get-ChildItem -Include` は `-LiteralPath` と併用すると黙って無視される (全件が返る)
+
+**症状**: 拡張子で絞ったつもりの集計が、絞っていない値を返す。エラーは出ず、
+exit 0 で、数字もそれらしく見える。
+
+3 つの形を同じ一時ディレクトリに対して走らせた出力:
+
+<!-- via: PowerShell で一時 dir に a.pdf b.xlsx c.png d.zip e.txt を 2 階層に作り、3 形を比較 -->
+
+```
+total_files_created = 10
+expected_match = 6  (pdf,xlsx,txt x 2 dirs)
+form1_literalpath_include = 10     <- 絞れていない
+form2_path_include        = 6
+form3_where_extension     = 6
+
+form1: Get-ChildItem -LiteralPath $t -Recurse -File -Include *.pdf,*.xlsx,*.docx,*.pptx,*.txt,*.md
+form2: Get-ChildItem -Path        $t -Recurse -File -Include *.pdf,*.xlsx,*.docx,*.pptx,*.txt,*.md
+form3: Get-ChildItem -LiteralPath $t -Recurse -File | Where-Object { $ext -contains $_.Extension }
+```
+
+**根本原因**: `-Include` はパスの葉に対するワイルドカード照合として働くが、
+`-LiteralPath` はパスのワイルドカード解釈を無効にするため、照合の足場が無くなる。
+`-Recurse` を付けても復活しない。
+
+**なぜ危ないか**: `-LiteralPath` は「日本語パスや `[` を含むパスで安全側」という
+**正しい理由**で選ばれる。そこに `-Include` を足すと、安全側の選択がフィルタを殺す。
+**どちらの判断も妥当なのに、組み合わせだけが壊れる**ので review でも気付きにくい。
+
+**Fix**: 拡張子で絞るときは `-Include` を使わず `Where-Object` で `.Extension` を見る。
+ワイルドカードを含まないパスなら `-Path` でもよいが、日本語パスを扱う場面では
+`-LiteralPath` + `Where-Object` が唯一安全な組み合わせ。
+
+```powershell
+$ext = '.pdf','.xlsx','.docx','.pptx','.txt','.md'
+$f = Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue |
+     Where-Object { $ext -contains $_.Extension }
+```
+
+**検算を必ず入れる**: 絞った件数と絞らない件数を**両方出す**。同じ数なら
+フィルタが効いていない。顧客に投げるコマンドでは特にこれを入れる。
+
+出典: 2026-09-12、パイロット先に「索引対象文書の合計バイト数」を測ってもらうコマンドで踏んだ。
+返ってきた件数がそのディレクトリの総ファイル数と完全一致していたことで気付いた
+(気付かなければ、全ファイルのバイト数を索引対象のバイト数として稟議の見積に使っていた)。
+関連: 罠 21 (同じ調査コマンドの別の行)
 
 ## 診断の指針: 「Linux では動くのに Windows で失敗する」場合
 
