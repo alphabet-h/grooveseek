@@ -823,7 +823,7 @@ $ext = '.pdf','.xlsx','.docx','.pptx','.txt','.md'
 $all = @(Get-ChildItem -LiteralPath $p -Recurse -File -Force -ErrorVariable enumErr -ErrorAction SilentlyContinue)
 $f   = @($all | Where-Object { $ext -contains $_.Extension })
 $links = @(Get-ChildItem -LiteralPath $p -Recurse -Directory -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
-"AllFiles=$($all.Count) TargetFiles=$($f.Count) EnumErrors=$($enumErr.Count) ReparseDirs=$($links.Count)"
+Write-Output "AllFiles=$($all.Count) TargetFiles=$($f.Count) EnumErrors=$($enumErr.Count) ReparseDirs=$($links.Count)"
 ```
 
 **検算を必ず入れる**: 絞った件数と絞らない件数を**両方出す**。対象外の拡張子のファイルがあると分かっている場所で
