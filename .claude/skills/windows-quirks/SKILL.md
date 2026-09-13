@@ -1,6 +1,6 @@
 ---
 name: windows-quirks
-description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, and `os error 1455` (page file) at test start under the same default parallelism, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, paths longer than MAX_PATH (260), which Rust std already hands to Win32 with a `\\?\` prefix so neither `LongPathsEnabled` nor a `longPathAware` manifest decides whether `groove index` or `groove validate` can read them (the walk error names the path under `Caused by:`), `Get-ChildItem -Include` being silently ignored next to `-LiteralPath` so an extension filter returns every file, or diagnosing "works on Linux, fails on Windows" failures
+description: Field-verified Windows pitfalls from groove release cycles, each with symptom, root cause, and proven fix. Use when writing or debugging Windows-specific code in this repo — Task Scheduler / schtasks / Register-ScheduledTask integration (including which CI logon sessions can and cannot register tasks), subprocess spawning (conhost flash, CREATE_NO_WINDOW), background process lifecycle, Japanese-Windows encoding (CP932 mojibake, UTF-16 LE BOM, forcing UTF-8 out of powershell.exe), stderr assertions in subprocess tests, PowerShell 5.1 argument passing to native commands (embedded double quotes), PowerShell 5.1 `ConvertFrom-Json` emitting a JSON array as one object so `Where-Object` silently filters nothing, silently swallowing cargo/clippy diagnostics with `2>$null`, Git Bash / MSYS rewriting leading-slash arguments into filesystem paths (`gh api`), scripted file edits flipping LF to CRLF (Python text mode), which shows as a whole-file diff only where git is not normalising line endings, Python stdout defaulting to CP932 under redirection and dying mid-write on an em dash so the truncated output looks complete, escape miscounts turning a string continuation into a `\n` escape (both compile), `jq.exe` appending a carriage return to every line it writes while `gh --jq` does not, so a file or pipe comparison between the two reports every line as different, MSVC `link.exe` running out of memory (`LNK1102`) when cargo links many test binaries in parallel, and `os error 1455` (page file) at test start under the same default parallelism, appending LF-terminated lines to a file already saved with CRLF so the two endings mix and `git diff` shows only the added lines, comparing paths where only one side went through `canonicalize` so the `\\?\` verbatim prefix and 8.3 short names make `starts_with` answer false, directory junctions needing no elevation where symlinks did on the measured machine (Developer Mode not measured), and `..` being applied lexically across a junction (unlike POSIX), subprocess tests asserting on a startup log line that a later lifecycle event prints, so the assertion races the process and passes on one OS while failing on another, PowerShell 5.1 wrapping a native exe's stderr into `NativeCommandError` under `2>&1` so `$?` reads false on an exit-0 run whenever a stderr line came through and the output stops being strings, paths longer than MAX_PATH (260), which Rust std already hands to Win32 with a `\\?\` prefix so neither `LongPathsEnabled` nor a `longPathAware` manifest decides whether `groove index` or `groove validate` can read them (the walk error names the path under `Caused by:`), `Get-ChildItem -Include` being silently ignored next to `-LiteralPath` so an extension filter returns every file (and `-Filter '*.pdf'` also matching `.pdfx`, `-Path` on a folder name with `[ ]` returning nothing), or diagnosing "works on Linux, fails on Windows" failures
 ---
 
 # Windows Quirks (groove 蓄積罠集)
@@ -793,9 +793,28 @@ form3: Get-ChildItem -LiteralPath $t -Recurse -File | Where-Object { $ext -conta
 **正しい理由**で選ばれる。そこに `-Include` を足すと、安全側の選択がフィルタを殺す。
 **どちらの判断も妥当なのに、組み合わせだけが壊れる**ので review でも気付きにくい。
 
-**Fix**: 拡張子で絞るときは `-Include` を使わず `Where-Object` で `.Extension` を見る。
-ワイルドカードを含まないパスなら `-Path` でもよいが、日本語パスを扱う場面では
-`-LiteralPath` + `Where-Object` が唯一安全な組み合わせ。
+**Fix**: 拡張子で絞るときは `-Include` を使わず `Where-Object` で `.Extension` を見る
+(`-contains` は大文字小文字を区別しないので `B.PDF` も入る)。
+
+**`-Filter` は代わりにならない**: `-LiteralPath` と併用しても効くが、`-Filter '*.pdf'` は
+`e.pdfx` / `f.PDFX` にも当たった。Win32 側のワイルドカード照合なので、拡張子の完全一致にならない
+(8.3 短縮名が絡むかは未切り分け — `fsutil 8dot3name query C:` は管理者権限が無く `Access is denied`)。
+
+**`-LiteralPath` が要る理由は日本語ではなく `[` `]`**: 日本語の文字はワイルドカードではない。
+`案件[2026]` のようなフォルダ名を `-Path` に渡すと `[2026]` が文字クラスとして解釈され、
+エラーを出さずに何も返さない。「`-Path` にすれば `-Include` が効く」も安全ではない。
+<!-- via: PowerShell 5.1.26100.9444。scratchpad に gci-probe\ と gci-probe\案件[2026]\ を [System.IO.Directory]::CreateDirectory で作り (5.1 の New-Item には -LiteralPath が無い)、各々に a.pdf B.PDF c.txt d.zip を置いて Get-ChildItem の各形の Count を比較。続けて gci-probe2\ に a.pdf B.PDF e.pdfx f.PDFX g.pdf.bak を置き、-Filter '*.pdf' と Where-Object が返す Name を比較 -->
+```
+total_files                        = 8
+-LiteralPath + -Filter *.pdf       = 4
+-LiteralPath + -Include *.pdf      = 8     <- この罠
+-LiteralPath + Where .pdf,.txt     = 6
+-Path 案件[2026] + -Include *.pdf  = 0     <- [ ] で黙って空
+-LiteralPath 案件[2026] + -Filter  = 2
+
+-Filter *.pdf -> a.pdf,B.PDF,e.pdfx,f.PDFX   <- .pdfx にも当たる
+Where .pdf    -> a.pdf,B.PDF
+```
 
 ```powershell
 $ext = '.pdf','.xlsx','.docx','.pptx','.txt','.md'
