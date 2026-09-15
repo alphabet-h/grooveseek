@@ -32,7 +32,7 @@ controller 自身が読み取りのみで行う。ここで書き込みや branc
 
 1. **前提を確かめる** — `.dev/README.md` と `.dev/tools/handoff_tail.ps1` が存在し、`git -C .dev rev-parse --show-toplevel` が
    `/.dev` で終わること。どれか欠けていたら **owner 用 command で、この checkout では動かない**と 1 行で報告して
-   止まる (読みに行かない。介入ポイント 1)
+   止まる (読みに行かない。止まる条件 1)
 2. **`.dev/README.md` を読む** — 索引とワークフローの一次情報。handoff 鎖の規約もここにある
 3. **鎖の末端を取る**:
 
@@ -40,18 +40,19 @@ controller 自身が読み取りのみで行う。ここで書き込みや branc
 powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 ```
 
-   末端が 1 本ならその path が答え。**それ以外の本数なら script が exit 1 を返す** = 鎖が切れている
-   (新 handoff が `前の handoff:` を書き忘れた)。その場合は**推測で 1 本選ばず、user に報告して止まる**
-   (介入ポイント 2)
+   exit 0 だけが成功で、stdout の 1 行が末端の path。**exit 1 は鎖が切れている** (末端が 0 本か 2 本以上。
+   新 handoff が `前の handoff:` を書き忘れた) — **推測で 1 本選ばず、user に報告して止まる** (止まる条件 2)。
+   **それ以外の exit code は script 自体の失敗** — stdout を捨て、exit code と stderr を添えて報告して止まる (同じく条件 2)
 4. **末端を読む** — 「★ 次にやること」「持ち越し」「閉じる直前の状態」の各節。末端が
    「本体は前 handoff のまま」と書いていたら、その `前の handoff:` を遡って同じ節を読む
 5. **kuriya と突き合わせる** — `mcp__kuriya__status` の goal (item #78) の body に末端の path が入っている。
    handoff 側と食い違ったら **handoff を一次情報とし** (kuriya の report は遅れることがある)、
-   両方を user に見せる (介入ポイント 4)。`mcp__kuriya__status` が呼べない / エラーを返す時は止まらず、
+   両方を user に見せる (止まる条件 4)。`mcp__kuriya__status` が呼べない / エラーを返す時は止まらず、
    Phase 1 の報告に「kuriya 未接続、突き合わせ未実施」と 1 行書いて handoff だけで続ける
 6. **repo 状態を見る** — root で `git status --short --branch`。末端 handoff が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
-   uncommitted changes / 想定と違う branch は**想定外 state として報告する** (介入ポイント 3)
+   uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
+   その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない
 
 ## Phase 1 — user への報告
 
@@ -62,7 +63,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 - **repo 状態** (branch / clean か / 別 repo があればそれも)
 - **focus** — 上の FOCUS 行が空でなければ、「★ 次にやること」との関係を短く:
   含まれる (= そのまま着手) / 別件 (= user の今日の指示が優先。focus に着手し、「★ 次にやること」は
-  持ち越しとして報告する) / 矛盾する (= 介入ポイント 5、着手せず user に聞く)
+  持ち越しとして報告する) / 矛盾する (= 止まる条件 5、着手せず user に聞く)
 
 ## Phase 2 — 体制の宣言と着手
 
@@ -97,13 +98,15 @@ subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む
 そのまま invoke してこの command を終える。user 介入点 (spec / plan の承認、hosts 編集の依頼など) に
 当たったら**そこで止まって user に渡す**。
 
-## 本 command の介入ポイント
+## 止まる条件
 
-本 command が user を巻き込むのは次の 5 つ (`CLAUDE.local.md` guardrail 側の ①②③ とは別立て。Phase 0〜1 で止まる条件のこと):
+`CLAUDE.local.md` の介入ポイントは ①質問 phase ②spec 承認 ③軌道修正の 3 点のままで、本 command は
+それを増やさない。下の 5 つはどれも guardrail の「user 確認」に既に挙がっている**想定外の git state /
+前提が崩れた時**の具体形 (= ③ の一種) で、Phase 0〜1 で controller が判断を捏造せずに止まる条件:
 
 1. **前提が欠けている** (`.dev/` が無い、または private repo ではない = この checkout では動かない)
-2. **鎖が切れている** (Phase 0 step 3 が exit 1)
-3. **想定外の git state** (uncommitted changes / 別 branch)
+2. **鎖が切れている、または末端 script が失敗した** (Phase 0 step 3 が exit 0 以外)
+3. **想定外の git state** (uncommitted changes / 別 branch / handoff が挙げた repo の path が無い、git が失敗する)
 4. **handoff と kuriya の食い違い** (kuriya 未接続は含まない — その時は報告して続ける)
 5. **focus が「★ 次にやること」と矛盾する** (別件は矛盾ではない — focus に着手する)
 
