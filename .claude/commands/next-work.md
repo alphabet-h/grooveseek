@@ -58,7 +58,8 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
    uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
    その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない。
-   **FOCUS 行から repo を取るのは `repo=` の語だけ** — その値をそのまま `git -C` に渡す (path の形は判定しない。
+   **FOCUS 行から repo を取るのは `repo=` の語だけ** — `repo=` は 1 つまで。値を囲む引用符は外し、残りをそのまま
+   `git -C` の 1 引数に渡す (path の形は判定しない。`repo=` が 2 つ以上なら「focus の repo は未確認」扱いで Phase 1 に書く。
    存在しなければ上の条件 3)。`repo=` が無い focus (例: `gate GUI`) は path を推測せず、Phase 1 で
    「focus の repo は未確認」と 1 行報告して続ける (handoff が同じ repo を挙げていればそちらで見えている)
 
