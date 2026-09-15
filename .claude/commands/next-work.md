@@ -57,7 +57,9 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    step 4 で読んだ handoff (遡った分も含む)、または FOCUS 行が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
    uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
-   その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない
+   その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない。
+   **FOCUS 行の repo は絶対パスで書かれている時だけ見る** — 名前だけ (例: `gate GUI`) なら path を推測せず、
+   Phase 1 で「focus の repo は未確認」と 1 行報告して続ける (handoff が同じ repo を挙げていればそちらで見えている)
 
 ## Phase 1 — user への報告
 
@@ -111,7 +113,7 @@ subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む
 
 1. **前提が欠けている** (`.dev/` が無い、または private repo ではない = この checkout では動かない)
 2. **鎖が切れている、または末端 script が失敗した** (Phase 0 step 3 が exit 0 以外、または step 4 の遡り先が無い / 循環する)
-3. **想定外の git state** (root または `.dev` の uncommitted changes / 別 branch / handoff が挙げた repo の path が無い、git が失敗する)
+3. **想定外の git state** (root または `.dev` の uncommitted changes / 別 branch / handoff か FOCUS の絶対パスが挙げた repo の path が無い、git が失敗する)
 4. **handoff と kuriya の食い違い** (kuriya 未接続は含まない — その時は報告して続ける)
 5. **focus が「★ 次にやること」と矛盾する** (別件は矛盾ではない — focus に着手する)
 
