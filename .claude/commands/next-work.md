@@ -53,7 +53,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 6. **repo 状態を見る** — root で `git status --short --branch`、続けて nested repo の
    `git -C .dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
    commit し忘れていればここでしか分からない)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
-   末端 handoff が別 repo (例: grooveseek-gate) を
+   step 4 で読んだ handoff (遡った分も含む) が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
    uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
    その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない
