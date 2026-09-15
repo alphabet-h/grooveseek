@@ -46,14 +46,15 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 4. **末端を読む** — 「★ 次にやること」「持ち越し」「閉じる直前の状態」の各節。末端が
    「本体は前 handoff のまま」と書いていたら、その `前の handoff:` を遡って同じ節を読む。
    遡り先が `.dev/knowledge/` に無い、読めない、または同じ file に戻る (循環) なら鎖が壊れている = 止まる条件 2
-5. **kuriya と突き合わせる** — `mcp__kuriya__status` の goal (item #78) の body に末端の path が入っている。
+5. **kuriya と突き合わせる** — `mcp__kuriya__status` が返す**現在の goal** の body に末端の path が入っている
+   (README の運用。item 番号は固定しない — goal が入れ替わっても同じ手順)。
    handoff 側と食い違ったら **handoff を一次情報とし** (kuriya の report は遅れることがある)、
    両方を user に見せる (止まる条件 4)。`mcp__kuriya__status` が呼べない / エラーを返す時は止まらず、
    Phase 1 の報告に「kuriya 未接続、突き合わせ未実施」と 1 行書いて handoff だけで続ける
 6. **repo 状態を見る** — root で `git status --short --branch`、続けて nested repo の
    `git -C .dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
    commit し忘れていればここでしか分からない)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
-   step 4 で読んだ handoff (遡った分も含む) が別 repo (例: grooveseek-gate) を
+   step 4 で読んだ handoff (遡った分も含む)、または FOCUS 行が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
    uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
    その path が無い、または git が exit 0 以外を返す時も同じ条件 3 — その repo の状態を欠いたまま先へ進まない
