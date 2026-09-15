@@ -62,7 +62,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 
 **5 行以内**で出す。長い引用はしない (末端 handoff の path を書けば user は自分で読める):
 
-- **次にやること** — 末端 handoff の「★ 次にやること」から上位のものだけ
+- **次にやること** — step 4 で解決した handoff (「本体は前 handoff のまま」で遡ったなら遡った先) の「★ 次にやること」から上位のものだけ。Phase 2 の着手先もこれ
 - **user の手が要る前提** があれば明示 (例: hosts ファイルの編集、証明書のインストール、GUI 操作)
 - **repo 状態** (branch / clean か / 別 repo があればそれも)
 - **focus** — 上の FOCUS 行が空でなければ、「★ 次にやること」との関係を短く:
