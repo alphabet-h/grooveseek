@@ -37,9 +37,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Documentation
 
 - **The codex-review skill tables an invariant's write sites before a finding
-  is applied.** When a round returns a P0/P1 finding -- or a P2 the controller
-  decides to take -- of the read-then-write shape ("X is read, Y is written,
-  and Z can land between"), the controller states the invariant in one line
+  is applied.** When a review returns a finding of the read-then-write shape
+  ("X is read, Y is written, and Z can land between") -- a GitHub round's
+  P0/P1 or an adopted P2, or the local pre-push review's critical, high or
+  medium or an adopted low -- the controller states the invariant in one line
   and dispatches a subagent whose only job is to enumerate every write site
   that touches it. That subagent writes the table to a scratch file the
   controller names in the brief and returns the path, not the table.
