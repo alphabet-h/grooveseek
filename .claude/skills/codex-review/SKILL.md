@@ -212,6 +212,9 @@ cost と、収束しない loop は spec の問題という判定)。**3 round �
 `[critical]` / `[high]` が残っているなら fix が次の指摘を生んでいる (台帳 category 6) = user に相談
 (介入ポイント 3)。`[medium]` / `[low]` だけなら取り込んで **4 round 目は打たず push** し、取り込んだ内容を
 PR 本文に書いて GitHub round に確認させる (GitHub が最終確認、の役割どおり)。自分で上限を上げない。
+**ここで取り込むものが「読んでから書くまでに何かが挟まり得る」形なら、ここでも**
+**「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す** — 次のローカル round が
+無いので、残した兄弟の書き込み点は GitHub round まで残る。
 **fix を書いたら「その fix の最悪ケース」を自分で 1 つ書いてから出す** — r10 の fix (KNN の page が
 空でも広げる) は r11 で「match 0 の corpus が cap まで広げ続ける」と返った。
 
@@ -244,8 +247,8 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 | exit / stdout | 意味 | controller の手 |
 |---|---|---|
 | `CONVERGED=true` **かつ `first_invocation=true`** | PR を開いた直後の round。指摘は差分ではなく **baseline** 側にいる (罠 51) | stdout 冒頭の `=== Baseline ... ===` を読んでから収束を宣言する |
-| `CONVERGED=true` | 収束 (P2 / P3 の note が付くことがある) | P2 / P3 は内容を見て取り込み or skip を即決。merge へ |
-| `WARN P0/P1 issues present` | blocking な指摘あり | `=== Inline P0/P1 ===` と `=== Top-level summary ===` を読んで fix → push → 次 round。上限は script が見張る (exit 7) |
+| `CONVERGED=true` | 収束 (P2 / P3 の note が付くことがある) | P2 / P3 は内容を見て取り込み or skip を即決。**取り込むものが「読んでから書くまでに何かが挟まり得る」形なら、「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通してから**。merge へ |
+| `WARN P0/P1 issues present` | blocking な指摘あり | `=== Inline P0/P1 ===` と `=== Top-level summary ===` を読んで fix → push → 次 round。**指摘が「読んでから書くまでに何かが挟まり得る」形なら、fix の前に「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す**。上限は script が見張る (exit 7) |
 | `INDETERMINATE (... produced nothing ...)` | 3 endpoint とも 0 件 = **答えが無かった** (罠 57)。`state_ok` は前 round の残り香 | quota (罠 56) / 未達 (罠 47) / 沈黙 (罠 9) を切り分けて user 報告 |
 | `INDETERMINATE (no sentinel + no clean state)` | 判定材料不足 | `=== Inline, this round - ALL ===` を人が読む。必要なら再 trigger |
 | exit 3 | reaction はあるが答えない (罠 9) | user に escalate ("suspect stale connector") |
