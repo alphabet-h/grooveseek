@@ -37,13 +37,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Documentation
 
 - **The codex-review skill tables an invariant's write sites before a finding
-  is applied.** When a review returns a finding of the read-then-write shape
-  ("X is read, Y is written, and Z can land between") -- a GitHub round's
-  P0/P1 or an adopted P2, or the local pre-push review's critical, high or
-  medium or an adopted low -- the controller states the invariant in one line
-  and dispatches a subagent whose only job is to enumerate every write site
-  that touches it. That subagent writes the table to a scratch file the
-  controller names in the brief and returns the path, not the table.
+  is applied.** Whenever the controller adopts a finding of the read-then-write
+  shape ("X is read, Y is written, and Z can land between") -- any finding it
+  adopts, whatever its severity and wherever it came from -- it states the
+  invariant in one line and dispatches a subagent whose only job is to
+  enumerate every write site that touches it. That subagent writes the table
+  to a scratch file the controller names in the brief and returns the path,
+  not the table.
   Every row the table marks `no` goes into the same fix wave as the line that
   was pointed at; the `yes` rows stay in the table as the record of what was
   checked and found already covered. Fixing only the line that was pointed at

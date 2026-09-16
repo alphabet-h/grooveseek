@@ -202,7 +202,7 @@ severity は **`critical` / `high` / `medium` / `low`** の 4 段 (同 file の 
 | Verdict | controller の手 |
 |---|---|
 | `approve` | sweep を済ませて push |
-| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。**取り込む前に、指摘が「読んでから書くまでに何かが挟まり得る」形なら「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す** (severity は問わない。`[low]` を取り込む時も同じ — 兄弟の書き込み点を残すと、残り round をそこで使う)。`[low]` だけなら内容を見て即決: **skip なら push してよい、取り込むなら diff が変わるので次の round を打つ** (その round も上限に数える) |
+| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。**取り込む指摘なら severity を問わず、形が「読んでから書くまでに何かが挟まり得る」ものは「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通してから取り込む** (`[low]` も同じ — 兄弟の書き込み点を残すと、残り round をそこで使う)。`[low]` だけなら内容を見て即決: **skip なら push してよい、取り込むなら diff が変わるので次の round を打つ** (その round も上限に数える) |
 | exit ≠ 0 / `Verdict` 行が無い | `local-N.err` を読む。model 拒否 (400 / 404) / capacity / runtime の残留を切り分ける。判定材料が無いだけで「指摘なし」ではない |
 
 **上限は push 1 回につき 3 round** — 打った回数で数える (approve で終わる round も、`[low]` を取り込んで
@@ -212,7 +212,7 @@ cost と、収束しない loop は spec の問題という判定)。**3 round �
 `[critical]` / `[high]` が残っているなら fix が次の指摘を生んでいる (台帳 category 6) = user に相談
 (介入ポイント 3)。`[medium]` / `[low]` だけなら取り込んで **4 round 目は打たず push** し、取り込んだ内容を
 PR 本文に書いて GitHub round に確認させる (GitHub が最終確認、の役割どおり)。自分で上限を上げない。
-**ここで取り込むものが「読んでから書くまでに何かが挟まり得る」形なら、ここでも**
+**ここで取り込む指摘も severity を問わず、形が「読んでから書くまでに何かが挟まり得る」ものは**
 **「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す** — 次のローカル round が
 無いので、残した兄弟の書き込み点は GitHub round まで残る。
 **fix を書いたら「その fix の最悪ケース」を自分で 1 つ書いてから出す** — r10 の fix (KNN の page が
@@ -247,7 +247,7 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 | exit / stdout | 意味 | controller の手 |
 |---|---|---|
 | `CONVERGED=true` **かつ `first_invocation=true`** | PR を開いた直後の round。指摘は差分ではなく **baseline** 側にいる (罠 51) | stdout 冒頭の `=== Baseline ... ===` を読んでから収束を宣言する |
-| `CONVERGED=true` | 収束 (P2 / P3 の note が付くことがある) | P2 / P3 は内容を見て取り込み or skip を即決。**取り込むものが「読んでから書くまでに何かが挟まり得る」形なら、「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通してから**。merge へ |
+| `CONVERGED=true` | 収束 (P2 / P3 の note が付くことがある) | P2 / P3 は内容を見て取り込み or skip を即決。**取り込む指摘は P2 でも P3 でも、形が「読んでから書くまでに何かが挟まり得る」ものなら「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通してから**。merge へ |
 | `WARN P0/P1 issues present` | blocking な指摘あり | `=== Inline P0/P1 ===` と `=== Top-level summary ===` を読んで fix → push → 次 round。**指摘が「読んでから書くまでに何かが挟まり得る」形なら、fix の前に「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す**。上限は script が見張る (exit 7) |
 | `INDETERMINATE (... produced nothing ...)` | 3 endpoint とも 0 件 = **答えが無かった** (罠 57)。`state_ok` は前 round の残り香 | quota (罠 56) / 未達 (罠 47) / 沈黙 (罠 9) を切り分けて user 報告 |
 | `INDETERMINATE (no sentinel + no clean state)` | 判定材料不足 | `=== Inline, this round - ALL ===` を人が読む。必要なら再 trigger |
@@ -265,11 +265,12 @@ P-badge の計数が 0 でもここを読む。
 
 ## 指摘を fix に写す前に、不変条件の書き込み点を表にする
 
-**打つのは、指摘の形が「読んでから書くまでに何かが挟まり得る」ものだったとき。出どころは問わない** —
-GitHub round の P0/P1 (取り込むと決めた P2 も) でも、ローカル前掃除の `[critical]` / `[high]` /
-`[medium]` (取り込むと決めた `[low]` も) でも同じ。見分けるのは指摘の**形**であって、深刻度でも
-badge の体系でもない — 「X を読んでいる、その後 Y を書いている、その間に Z が挟まり得る」と
-読める指摘はここへ来る。
+**取り込むと決めた指摘なら、出どころも severity も badge の体系も問わず、形が「読んでから書くまでに
+何かが挟まり得る」ものは、この節を通してから fix に写す。** GitHub round の P0/P1 / P2 / P3 でも、
+ローカル前掃除の `[critical]` / `[high]` / `[medium]` / `[low]` でも同じ — **これは例であって
+条件ではない**。条件は「取り込む」と「形」の 2 つだけで、severity の列挙に読み替えない
+(列挙は必ず 1 つ足りなくなる)。見分けるのは指摘の**形**だけ — 「X を読んでいる、その後 Y を
+書いている、その間に Z が挟まり得る」と読める指摘はここへ来る。
 この形は**指摘された行だけ直すと、同じ不変条件の別の書き込み点が次の round で返る**。
 grooveseek-gate PR #3 は 1 つの不変条件 (「Argon2 を待つ前に読んだ判断 — hash / disabled /
 lock / session の有無 / 実行者自身の admin 権限と session — は、それが正当化する書き込みと
