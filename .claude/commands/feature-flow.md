@@ -72,7 +72,7 @@ spec を `.dev/specs/<feature-NN-name>.md` に起草する (groove の `CLAUDE.l
 その後 **subagent review loop** を回す:
 
 1. **dispatch**: `superpowers:code-reviewer` (or `feature-dev:code-reviewer`) に spec を渡し、低/中/高/重大の 4 段階で指摘を返させる
-2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
+2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。**読んでから書くまでに何かが挟まり得る形の指摘なら、不変条件を 1 行で spec に書く** (書き込み点がまだ無いので表は作らない — 表は実装後、`.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
 3. **re-dispatch**: 同じ subagent に「low-only に到達したか」を再評価させる
 4. **convergence**: low-only or "no major issues" が 2 round 連続で得られたら脱出。最大 5 round。5 round で収束しないなら spec 起草の前提が崩れている = ユーザに再相談
 
