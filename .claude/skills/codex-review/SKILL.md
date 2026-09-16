@@ -274,7 +274,9 @@ lock / session の有無 / 実行者自身の admin 権限と session — は、
 `grep -n 'CODEX round' .dev/archive/2026-09-16-plan3-web-gui-sdd/progress.md` で引ける。
 
 **step 1 — 不変条件を書く (controller)。** 指摘ごとに 1 行、**fix ではなく不変条件**を:
-「**X を読んでから Y を書くまでに Z が挟まり得る → X の再確認は Y と同じ文 / 同じ transaction**」。
+「**X を読んでから Y を書くまでに Z が挟まり得る → X の再確認は Y と同じ atomic な境界の中**」。
+**境界の名前は状態で変わる** (SQL なら同じ文 / 同じ transaction、in-memory なら lock を握った
+1 区間か compare-and-swap、file なら書き込みを一度に見せている rename / lock の protocol)。
 fix の文 (「reset で session を消す」) を先に書くと視野がその行に閉じる。そこが連鎖の入口だった。
 
 **step 2 — 列挙は subagent に出す。** **dispatch するのは 1 つだけ。model は opus、仕事は表を
@@ -295,7 +297,7 @@ state)、API 側の変更なら endpoint の handler。**SQL はその一例で�
 |---|---|
 | `file:line` | 書き込み点の位置 |
 | 守られているか | `yes` / `no` + 1 句の理由 (「同じ文で読み直している」/「別 statement で reset している」) |
-| 直す文 | 移す先の具体的な statement / transaction |
+| 直す先 | 移す先の atomic な境界 (同じ SQL 文 / transaction、lock を握った 1 区間、rename の手前など、状態に合ったもの) |
 
 **subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
 行が落ちる。**返させるのは表そのものではなく、その file の path** — inline text は truncate される。
@@ -306,7 +308,8 @@ fix の brief は**表をそのまま貼って始める**。指摘された行�
 
 **step 4 — 表に無い書き込み点が次の round で指摘されたら**、それは同じ category の新しい
 instance = **台帳に記録する**。あわせて **brief の grep 語を広げ、何が漏れていたかを書く**
-(column 名か、別入口の handler か、別 statement に分かれた reset か)。
+(column 名か、別入口の handler か、別 statement に分かれた reset か、そもそも grep していなかった
+状態の持ち方か)。
 
 **なぜ controller ではなく subagent か。** controller は既に fix を頭に置いていて、grep の結果を
 **確認**として読む — 当たっている行は見えるが、当たっていない行は目に入らない。gate PR #3 の
