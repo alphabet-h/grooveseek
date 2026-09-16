@@ -281,10 +281,14 @@ fix の文 (「reset で session を消す」) を先に書くと視野がその
 作ることだけ。** **Explore 型は使わない** — read-only な代わりに Write tool を持たないので、
 表を file に落とせない。出すのは general-purpose で、**出力先の path は controller が brief の中で
 名指しする** (scratchpad の下)。あわせて「**その file 以外は書かない、repo の中は読むだけ**」と
-書き添える。brief には step 1 の行と、**触る column 名 / store の method 名 / handler 名を名指しで**
-書く (名指しの無い brief は浅い — ローカル前掃除の focus と同じ)。引かせるのは
-`UPDATE` / `INSERT` / `DELETE`、それを包む store method、その method を呼ぶ handler の**全部**で、
-`grep -rn "UPDATE users" src/` のように column 側からも method 名側からも引かせる。
+書き添える。brief には step 1 の行と、**引く語を名指しで**書く (名指しの無い brief は浅い —
+ローカル前掃除の focus と同じ)。**語は step 1 が名指した状態と書き込み操作から引く**:
+SQL なら column 名 / store の method 名 / handler 名と `UPDATE` / `INSERT` / `DELETE`
+(`grep -rn "UPDATE users" src/` のように column 側からも method 名側からも引かせる)、file の状態なら
+write / rename / remove の呼び出しと path の定数 (`grooveseek/src/eval.rs` の history 保存 =
+tmp に書いて `std::fs::rename` で置く形)、in-memory の状態なら lock を取っている箇所と
+その field を書き換えている箇所の**全部** (`grooveseek/src/server.rs` の `Arc<Mutex<_>>` 越しの
+state)、API 側の変更なら endpoint の handler。**SQL はその一例であって定義ではない。**
 返させるのは 3 列の表だけ:
 
 | 列 | 中身 |
