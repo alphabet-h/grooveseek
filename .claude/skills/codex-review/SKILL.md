@@ -276,7 +276,10 @@ lock / session の有無 / 実行者自身の admin 権限と session — は、
 **step 1 — 不変条件を書く (controller)。** 指摘ごとに 1 行、**fix ではなく不変条件**を:
 「**X を読んでから Y を書くまでに Z が挟まり得る → X の再確認は Y と同じ atomic な境界の中**」。
 **境界の名前は状態で変わる** (SQL なら同じ文 / 同じ transaction、in-memory なら lock を握った
-1 区間か compare-and-swap、file なら書き込みを一度に見せている rename / lock の protocol)。
+1 区間か compare-and-swap、file なら**読みから公開までを覆う** lock / version 検査 (CAS) などの
+直列化)。**`rename` 単体を境界と書かない** — atomic になるのは公開だけで、2 つの書き手が同じ X を
+読んでから別々の版を rename すれば Z はやはり挟まる。rename を挙げてよいのは、読みを覆う
+直列化がある protocol の**最後の一歩**としてだけ。
 fix の文 (「reset で session を消す」) を先に書くと視野がその行に閉じる。そこが連鎖の入口だった。
 
 **step 2 — 列挙は subagent に出す。** **dispatch するのは 1 つだけ。model は opus、仕事は表を
@@ -287,8 +290,9 @@ fix の文 (「reset で session を消す」) を先に書くと視野がその
 ローカル前掃除の focus と同じ)。**語は step 1 が名指した状態と書き込み操作から引く**:
 SQL なら column 名 / store の method 名 / handler 名と `UPDATE` / `INSERT` / `DELETE`
 (`grep -rn "UPDATE users" src/` のように column 側からも method 名側からも引かせる)、file の状態なら
-write / rename / remove の呼び出しと path の定数 (`grooveseek/src/eval.rs` の history 保存 =
-tmp に書いて `std::fs::rename` で置く形)、in-memory の状態なら lock を取っている箇所と
+write / rename / remove の呼び出しと path の定数 (`grooveseek/src/eval.rs` の history 保存は tmp に
+書いて `std::fs::rename` で置いている。**引く語の在りかであって、境界の例ではない**)、
+in-memory の状態なら lock を取っている箇所と
 その field を書き換えている箇所の**全部** (`grooveseek/src/server.rs` の `Arc<Mutex<_>>` 越しの
 state)、API 側の変更なら endpoint の handler。**SQL はその一例であって定義ではない。**
 返させるのは 3 列の表だけ:
@@ -297,7 +301,7 @@ state)、API 側の変更なら endpoint の handler。**SQL はその一例で�
 |---|---|
 | `file:line` | 書き込み点の位置 |
 | 守られているか | `yes` / `no` + 1 句の理由 (「同じ文で読み直している」/「別 statement で reset している」) |
-| 直す先 | 移す先の atomic な境界 (同じ SQL 文 / transaction、lock を握った 1 区間、rename の手前など、状態に合ったもの) |
+| 直す先 | 移す先の atomic な境界 (同じ SQL 文 / transaction、lock を握った 1 区間、読みから公開までを覆う lock / version 検査 など、状態に合ったもの)。`rename` 単体は公開を atomic にするだけなので境界にならない |
 
 **subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
 行が落ちる。**返させるのは表そのものではなく、その file の path** — inline text は truncate される。
