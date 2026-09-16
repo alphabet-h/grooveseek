@@ -306,15 +306,16 @@ state)、API 側の変更なら endpoint の handler。**SQL はその一例で�
 | 列 | 中身 |
 |---|---|
 | `file:line` | 書き込み点の位置 |
-| 守られているか | `yes` / `no` + 1 句の理由 (「同じ文で読み直している」/「別 statement で reset している」) |
-| 直す先 | 移す先の atomic な境界 (同じ SQL 文 / transaction、lock を握った 1 区間、読みから公開までを覆う lock / version 検査 など、状態に合ったもの)。`rename` 単体は公開を atomic にするだけなので境界にならない |
+| 守られているか | `yes` / `no` / `n/a` + 1 句の理由 (「同じ文で読み直している」/「別 statement で reset している」)。**`n/a` はその経路が X を読んでいない書き込み点** — 初期化、import、意図的に上書きする管理者 reset のような、X に依存しない書き手。理由には**なぜそこで X を読まないのか**を書く。**判断を避けるための `n/a` は禁止** — 読まない理由を 1 句で書けないなら `no` にして controller に渡す |
+| 直す先 | 移す先の atomic な境界 (同じ SQL 文 / transaction、lock を握った 1 区間、読みから公開までを覆う lock / version 検査 など、状態に合ったもの)。`rename` 単体は公開を atomic にするだけなので境界にならない。`yes` / `n/a` の行は空でよい |
 
 **subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
 行が落ちる。**返させるのは表そのものではなく、その file の path** — inline text は truncate される。
 
 **step 3 — 表で `no` になった書き込み点は、指摘された行とまとめて同じ fix wave に入れる。**
 fix の brief は**表をそのまま貼って始める**。指摘された行だけ直して push すると、
-その push が次の round の指摘を作る。
+その push が次の round の指摘を作る。**`yes` と `n/a` の行は fix に入れず、表に残す** —
+何を見て、なぜ触らないと決めたかの記録がそこにしか無い。
 
 **step 4 — 表に無い書き込み点が次の round で指摘されたら**、それは同じ category の新しい
 instance = **台帳に記録する**。あわせて **brief の grep 語を広げ、何が漏れていたかを書く**

@@ -45,8 +45,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   to a scratch file the controller names in the brief and returns the path,
   not the table.
   Every row the table marks `no` goes into the same fix wave as the line that
-  was pointed at; the `yes` rows stay in the table as the record of what was
-  checked and found already covered. Fixing only the line that was pointed at
+  was pointed at; the rows marked `yes`, and those marked `n/a` because that
+  writer does not read the state at all, stay in the table as the record of
+  what was checked and why it was left alone. Fixing only the line that was pointed at
   is what made grooveseek-gate PR #3 spend six codex rounds on a single
   invariant, and a sweep run by the controller itself still missed two of the
   sites. `feature-flow` Phase 6 refers to the section rather than repeating it.
