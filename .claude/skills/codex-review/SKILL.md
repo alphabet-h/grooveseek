@@ -277,12 +277,15 @@ lock / session の有無 / 実行者自身の admin 権限と session — は、
 「**X を読んでから Y を書くまでに Z が挟まり得る → X の再確認は Y と同じ文 / 同じ transaction**」。
 fix の文 (「reset で session を消す」) を先に書くと視野がその行に閉じる。そこが連鎖の入口だった。
 
-**step 2 — 列挙は subagent に出す。** **dispatch するのは 1 つだけ。model は opus、read-only
-(Explore 型)、仕事は表を作ることだけ。** brief には step 1 の行と、**触る column 名 /
-store の method 名 / handler 名を名指しで**書く (名指しの無い brief は浅い — ローカル前掃除の
-focus と同じ)。引かせるのは `UPDATE` / `INSERT` / `DELETE`、それを包む store method、
-その method を呼ぶ handler の**全部**で、`grep -rn "UPDATE users" src/` のように column 側からも
-method 名側からも引かせる。返させるのは 3 列の表だけ:
+**step 2 — 列挙は subagent に出す。** **dispatch するのは 1 つだけ。model は opus、仕事は表を
+作ることだけ。** **Explore 型は使わない** — read-only な代わりに Write tool を持たないので、
+表を file に落とせない。出すのは general-purpose で、**出力先の path は controller が brief の中で
+名指しする** (scratchpad の下)。あわせて「**その file 以外は書かない、repo の中は読むだけ**」と
+書き添える。brief には step 1 の行と、**触る column 名 / store の method 名 / handler 名を名指しで**
+書く (名指しの無い brief は浅い — ローカル前掃除の focus と同じ)。引かせるのは
+`UPDATE` / `INSERT` / `DELETE`、それを包む store method、その method を呼ぶ handler の**全部**で、
+`grep -rn "UPDATE users" src/` のように column 側からも method 名側からも引かせる。
+返させるのは 3 列の表だけ:
 
 | 列 | 中身 |
 |---|---|
@@ -291,7 +294,7 @@ method 名側からも引かせる。返させるのは 3 列の表だけ:
 | 直す文 | 移す先の具体的な statement / transaction |
 
 **subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
-行が落ちる。**結果は file path で返させる** — inline text は truncate される。
+行が落ちる。**返させるのは表そのものではなく、その file の path** — inline text は truncate される。
 
 **step 3 — 表で `no` になった書き込み点は、指摘された行とまとめて同じ fix wave に入れる。**
 fix の brief は**表をそのまま貼って始める**。指摘された行だけ直して push すると、
