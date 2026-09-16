@@ -36,6 +36,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Documentation
 
+- **The codex-review skill tables an invariant's write sites before a finding
+  is applied.** When a round returns a finding about ordering or atomicity --
+  anything of the form "X is read, Y is written, and Z can land between" --
+  the controller states the invariant in one line, and a dedicated read-only
+  subagent whose only output is a table enumerates every write site that
+  touches it; every row of that table goes into the same fix wave as the line
+  that was pointed at. Fixing only the line that was pointed at is what made
+  grooveseek-gate PR #3 spend six codex rounds on a single invariant, and a
+  sweep run by the controller itself still missed two of the sites.
+  `feature-flow` Phase 6 refers to the section rather than repeating it.
+
 - **The third-party benchmark in `docs/eval.md` now carries QMD's
   *deprecated-trap* figure.** The author corrected the per-class results in
   issue #252 (QMD won three classes on P@1, not one); the class this project

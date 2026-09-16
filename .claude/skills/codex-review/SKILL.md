@@ -260,6 +260,53 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 `=== Inline, this round - ALL of them ===` は badge の有無を問わず全部出す (罠 23: 列挙の外に指摘が来る)。
 P-badge の計数が 0 でもここを読む。
 
+## 指摘を fix に写す前に、不変条件の書き込み点を表にする
+
+**打つのは、round が順序 / atomicity / 陳腐化しうる検査についての P0/P1 を返したとき**
+(取り込むと決めた P2 も同じ)。見分けるのは指摘の**形**であって深刻度ではない —
+「X を読んでいる、その後 Y を書いている、その間に Z が挟まり得る」と読める指摘はここへ来る。
+この形は**指摘された行だけ直すと、同じ不変条件の別の書き込み点が次の round で返る**。
+grooveseek-gate PR #3 は 1 つの不変条件 (「Argon2 を待つ前に読んだ判断 — hash / disabled /
+lock / session の有無 / 実行者自身の admin 権限と session — は、それが正当化する書き込みと
+同じ SQL 文で読み直す。状態変更と session 削除は 1 transaction にする」) に round を使い切った。
+台帳 `.dev/knowledge/repeat-offences-ledger.md` の category「自分の修正が次の指摘を生む連鎖」
+(**対策が効いていない**と印の付いた category) の最新 instance がこれで、経緯は
+`grep -n 'CODEX round' .dev/archive/2026-09-16-plan3-web-gui-sdd/progress.md` で引ける。
+
+**step 1 — 不変条件を書く (controller)。** 指摘ごとに 1 行、**fix ではなく不変条件**を:
+「**X を読んでから Y を書くまでに Z が挟まり得る → X の再確認は Y と同じ文 / 同じ transaction**」。
+fix の文 (「reset で session を消す」) を先に書くと視野がその行に閉じる。そこが連鎖の入口だった。
+
+**step 2 — 列挙は subagent に出す。** **dispatch するのは 1 つだけ。model は opus、read-only
+(Explore 型)、仕事は表を作ることだけ。** brief には step 1 の行と、**触る column 名 /
+store の method 名 / handler 名を名指しで**書く (名指しの無い brief は浅い — ローカル前掃除の
+focus と同じ)。引かせるのは `UPDATE` / `INSERT` / `DELETE`、それを包む store method、
+その method を呼ぶ handler の**全部**で、`grep -rn "UPDATE users" src/` のように column 側からも
+method 名側からも引かせる。返させるのは 3 列の表だけ:
+
+| 列 | 中身 |
+|---|---|
+| `file:line` | 書き込み点の位置 |
+| 守られているか | `yes` / `no` + 1 句の理由 (「同じ文で読み直している」/「別 statement で reset している」) |
+| 直す文 | 移す先の具体的な statement / transaction |
+
+**subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
+行が落ちる。**結果は file path で返させる** — inline text は truncate される。
+
+**step 3 — 表で `no` になった書き込み点は、指摘された行とまとめて同じ fix wave に入れる。**
+fix の brief は**表をそのまま貼って始める**。指摘された行だけ直して push すると、
+その push が次の round の指摘を作る。
+
+**step 4 — 表に無い書き込み点が次の round で指摘されたら**、それは同じ category の新しい
+instance = **台帳に記録する**。あわせて **brief の grep 語を広げ、何が漏れていたかを書く**
+(column 名か、別入口の handler か、別 statement に分かれた reset か)。
+
+**なぜ controller ではなく subagent か。** controller は既に fix を頭に置いていて、grep の結果を
+**確認**として読む — 当たっている行は見えるが、当たっていない行は目に入らない。gate PR #3 の
+round 4 は台帳のこの層をそのとおり controller 自身が打った round で、それでも実行者自身の
+session の有無 (round 5 で指摘) と、別 statement に分かれた期限切れ lock の reset (round 6 で指摘)
+が漏れた。列挙を「fix を知らない者の唯一の仕事」にするのがこの節の全部。
+
 ## max_rounds の根拠
 
 default 3 = cost-aware (25 credits × 3、Plus plan 月次 quota の 1-2%)。`/feature-flow` は
