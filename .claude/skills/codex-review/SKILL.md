@@ -295,7 +295,9 @@ fix の文 (「reset で session を消す」) を先に書くと視野がその
 書き添える。brief には step 1 の行と、**引く語を名指しで**書く (名指しの無い brief は浅い —
 ローカル前掃除の focus と同じ)。**語は step 1 が名指した状態と書き込み操作から引く**:
 SQL なら column 名 / store の method 名 / handler 名と `UPDATE` / `INSERT` / `DELETE`
-(`grep -rn "UPDATE users" src/` のように column 側からも method 名側からも引かせる)、file の状態なら
+(`grep -rn "UPDATE users" <crate>/src/` のように column 側からも method 名側からも引かせる。
+`<crate>` は review 対象の crate で、この repo なら `grooveseek/` — root 直下に `src/` は無い)、
+file の状態なら
 write / rename / remove の呼び出しと path の定数 (`grooveseek/src/eval.rs` の history 保存は tmp に
 書いて `std::fs::rename` で置いている。**引く語の在りかであって、境界の例ではない**)、
 in-memory の状態なら lock を取っている箇所と

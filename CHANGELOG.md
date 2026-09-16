@@ -41,13 +41,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   shape ("X is read, Y is written, and Z can land between") -- any finding it
   adopts, whatever its severity and wherever it came from -- it states the
   invariant in one line and dispatches a subagent whose only job is to
-  enumerate every write site that touches it. That subagent writes the table
-  to a scratch file the controller names in the brief and returns the path,
-  not the table.
-  Every row the table marks `no` goes into the same fix wave as the line that
-  was pointed at; the rows marked `yes`, and those marked `n/a` because that
-  writer does not read the state at all, stay in the table as the record of
-  what was checked and why it was left alone. Fixing only the line that was pointed at
+  enumerate every caller path that reaches a write of that state. The table
+  holds one row per path rather than per write location, so a shared helper
+  reached from several callers repeats across rows, and each path is marked
+  `yes`, `no` or `n/a` on its own. That subagent writes the table to a scratch
+  file the controller names in the brief and returns the path, not the table.
+  Only the rows marked `no` go into the same fix wave as the line that was
+  pointed at; the rows marked `yes`, and those marked `n/a` because that path
+  does not read the state at all, stay in the table as the record of what was
+  checked and why it was left alone. Fixing only the line that was pointed at
   is what made grooveseek-gate PR #3 spend six codex rounds on a single
   invariant, and a sweep run by the controller itself still missed two of the
   sites. `feature-flow` Phase 6 refers to the section rather than repeating it.
