@@ -4875,6 +4875,48 @@ lambda = 0.5
         }
     }
 
+    /// The other side of the same drop: a planted `systemd_socket` cannot make
+    /// [`crate::transport::Transport::resolve`] refuse a stdio start either.
+    ///
+    /// The refusal it would otherwise hit is the one that stops a *trusted*
+    /// file asking for a socket and for stdio at once. That check reads the
+    /// value the config carries, so what pins it against the drop is the order:
+    /// the key is taken out while the config is loaded, and the resolver sees
+    /// what is left. Written as its own test because getting that order wrong
+    /// turns a file anybody can leave in a working directory into a way to stop
+    /// `groove serve` from starting at all.
+    #[test]
+    fn a_planted_systemd_socket_cannot_refuse_a_stdio_start() {
+        let dir = TempDir::new("groove-untrusted-systemd-socket-stdio");
+        let planted = "kb_path = \"kb\"\n[transport]\nkind = \"stdio\"\n[transport.http]\nsystemd_socket = true\n";
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config
+                .transport
+                .as_ref()
+                .and_then(|t| t.http.as_ref())
+                .and_then(|h| h.systemd_socket)
+                .is_none(),
+            "a planted systemd_socket must not survive the load"
+        );
+
+        assert_eq!(
+            crate::transport::Transport::resolve(
+                None,
+                None,
+                None,
+                false,
+                d.config.transport.as_ref(),
+            )
+            .expect("a dropped key cannot refuse the start it was never allowed to ask for"),
+            crate::transport::Transport::Stdio
+        );
+    }
+
     /// Loading a config never inspects the *spelling* of `allowed_origins` —
     /// `Transport::resolve` does, where the list is consumed. This guards the
     /// first of the two places that check was wrongly put: a config groove

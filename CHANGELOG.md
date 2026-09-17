@@ -28,7 +28,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   another process, a `LISTEN_FDS` that is not exactly one, a descriptor
   that is not a listening stream socket, or an abstract socket — a
   `ListenStream=` whose name starts with `@`, which has no file for
-  `SocketMode=` to apply to — all stop startup. It is exclusive
+  `SocketMode=` to apply to — all stop startup, as does asking for it while
+  the transport resolves to stdio, which accepts no socket (an explicit
+  `--transport stdio` still runs such a config on stdio for that session).
+  It is exclusive
   with `--bind` / `--port` / `[transport.http].bind`, and a build for any
   operating system other than Linux refuses it outright: Windows has no
   `LISTEN_FDS` protocol, and macOS does not implement

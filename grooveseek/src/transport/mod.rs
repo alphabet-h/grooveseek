@@ -240,7 +240,10 @@ impl Transport {
             .unwrap_or(TransportKindConfig::Stdio);
 
         match kind {
-            TransportKindConfig::Stdio => Ok(Transport::Stdio),
+            TransportKindConfig::Stdio => {
+                refuse_config_systemd_socket_under_stdio(cli_transport, cfg)?;
+                Ok(Transport::Stdio)
+            }
             TransportKindConfig::Http => {
                 let http = cfg.and_then(|c| c.http.as_ref());
                 let wants_systemd =
@@ -342,6 +345,56 @@ pub(crate) const fn systemd_socket_supported() -> bool {
 /// name and ends with its own full stop.
 pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str =
     "needs a Linux build and a service manager that passes LISTEN_FDS, such as systemd.";
+
+/// A `systemd_socket = true` in the file that nothing is going to honour,
+/// because the transport resolved to stdio.
+///
+/// **Only the resolver can ask this, which is why it is here and not beside the
+/// flag's guard in the binary.** That guard answers "the operator passed
+/// `--systemd-socket` and got stdio"; this answers "the file asked for a socket
+/// and got stdio", and telling those apart needs `cli_transport` -- whether
+/// stdio was chosen on the command line or fell out of the file. One question
+/// each, in the one place that can see the inputs it takes.
+///
+/// **An explicit `--transport stdio` still wins**, and that is the reason the
+/// two are separate questions rather than one. A config carrying an HTTP
+/// section and a `systemd_socket` describes a socket-activated deployment;
+/// running `groove serve --transport stdio` against it to attach one local
+/// client for an afternoon is the same move as leaving `bind` in the file and
+/// letting it sit inert for that run. What must not pass is the silent case:
+/// the file says `systemd_socket = true` and `kind = "stdio"` together, so
+/// groove starts on stdin while nobody accepts the socket the unit bound --
+/// and under that unit stdin is already at EOF, so the process exits at once
+/// with nothing said about it.
+///
+/// **Where it sits in the order.** In the stdio arm, before that arm returns,
+/// and so before anything in [`resolve_systemd_listen`] -- which is the HTTP
+/// arm and cannot be reached from here. The order inside that function (the
+/// two-listener refusals first, the build gate last) is untouched: this check
+/// asks a question neither of those asks, and no input reaches both.
+///
+/// It reads the value **after** the config has been loaded and an untrusted one
+/// stripped -- `Config::discover_in`, `pub(crate)` in [`crate::config`] -- so a
+/// `systemd_socket` planted in a config groove merely found was already dropped
+/// and cannot stop a start here.
+fn refuse_config_systemd_socket_under_stdio(
+    cli_transport: Option<TransportKind>,
+    cfg: Option<&TransportConfig>,
+) -> Result<()> {
+    if cli_transport == Some(TransportKind::Stdio) {
+        return Ok(());
+    }
+    if cfg
+        .and_then(|c| c.http.as_ref())
+        .and_then(|h| h.systemd_socket)
+        .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "[transport.http].systemd_socket is true, but the transport resolved to stdio, which accepts no socket. Set [transport].kind = \"http\" so the socket is served, or remove systemd_socket. To run this config on stdio once without editing it, pass --transport stdio."
+        );
+    }
+    Ok(())
+}
 
 /// The refusals that can be answered before anything opens a socket: a second
 /// listener was named beside the one the service manager owns, or this build
@@ -1249,6 +1302,132 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // A `systemd_socket = true` the resolved transport cannot honour.
+    // -----------------------------------------------------------------------
+
+    /// `[transport.http]` on its own already means HTTP, so a file that sets
+    /// `systemd_socket` and forgets `kind` does **not** land on stdio.
+    ///
+    /// This is here because the sugar is what decides how narrow the refusal
+    /// below has to be. The key lives under `[transport.http]`, that section's
+    /// presence implies `kind = "http"`, and `cli_transport` is `None` -- so
+    /// the only way the key meets stdio is a file that says `kind = "stdio"`
+    /// in as many words, or a command line that says `--transport stdio`.
+    #[test]
+    fn a_config_key_without_kind_still_resolves_to_http_through_the_sugar() {
+        let cfg = TransportConfig {
+            kind: None,
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        // On Linux this resolves; elsewhere the build gate refuses it. Either
+        // way it is not stdio, which is the whole claim.
+        match Transport::resolve(None, None, None, false, Some(&cfg)) {
+            Ok(t) => assert!(
+                !matches!(t, Transport::Stdio),
+                "the [transport.http] sugar must not leave this on stdio: {t:?}"
+            ),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("LISTEN_FDS"),
+                    "the only refusal expected here is the build gate: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The case the sugar cannot save: the file asks for a socket and, in the
+    /// same file, asks for the transport that accepts none. Ignoring it starts
+    /// groove on stdin while the socket unit's listener goes unaccepted -- and
+    /// under that unit stdin is at EOF, so the process exits with nothing said.
+    #[test]
+    fn a_config_that_asks_for_a_socket_and_for_stdio_refuses_to_resolve() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let msg = format!(
+            "{:#}",
+            Transport::resolve(None, None, None, false, Some(&cfg))
+                .expect_err("a socket nobody accepts is not a configuration")
+        );
+        assert!(
+            msg.contains("[transport.http].systemd_socket"),
+            "the refusal must name the key that caused it: {msg}"
+        );
+        assert!(
+            msg.contains("[transport].kind"),
+            "the refusal must name the key that fixes it: {msg}"
+        );
+        assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
+    }
+
+    /// `--transport stdio` on the command line still wins, so a deployment's
+    /// own config can be run on stdio for one session without editing it.
+    ///
+    /// The same latitude `bind` already has: it stays in the file and sits
+    /// inert for that run. What the refusal above catches is the case where
+    /// nobody asked for stdio in the first place.
+    #[test]
+    fn an_explicit_cli_stdio_may_still_run_a_config_that_wants_a_socket() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert_eq!(
+            Transport::resolve(Some(TransportKind::Stdio), None, None, false, Some(&cfg))
+                .expect("an explicit --transport stdio is the operator's word"),
+            Transport::Stdio
+        );
+    }
+
+    /// The regression this refusal could have caused, written as its own test
+    /// because it is the shape a real deployment already has: a config that
+    /// carries a whole `[transport.http]` section **and** runs on stdio, which
+    /// is legal and must keep starting. Only `systemd_socket` is refused there,
+    /// not the section.
+    #[test]
+    fn a_stdio_config_carrying_http_settings_but_no_socket_key_still_starts() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                allowed_hosts: Some(vec!["kb.example.lan".to_string()]),
+                max_sessions: Some(8),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert_eq!(
+            Transport::resolve(None, None, None, false, Some(&cfg))
+                .expect("http settings beside a stdio transport are inert, not an error"),
+            Transport::Stdio
+        );
+        // And `= false` is not `= true`: it says "bind", which on stdio is the
+        // same nothing every other HTTP key is.
+        let off = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(false),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert_eq!(
+            Transport::resolve(None, None, None, false, Some(&off))
+                .expect("false is not a request"),
+            Transport::Stdio
+        );
     }
 
     /// The key is optional, like every other key in this section.

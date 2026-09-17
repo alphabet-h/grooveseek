@@ -320,6 +320,12 @@ bind = "127.0.0.1:3100"
 # An abstract socket -- a ListenStream= whose name starts with @ -- is refused
 # at startup, because it has no file for SocketMode= to apply to and every
 # account on the host could connect to it.
+#
+# This one key is NOT merely ignored while kind stays "stdio", unlike the rest
+# of this section: uncommenting it without also switching kind to "http" is
+# refused at startup, because stdio accepts no socket and starting anyway would
+# leave the unit's listener unaccepted with nothing said. Running this config on
+# stdio for one session is still possible -- pass --transport stdio.
 #systemd_socket = true
 
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------

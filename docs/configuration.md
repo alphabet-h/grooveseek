@@ -157,6 +157,11 @@ bind = "127.0.0.1:3100"
 # stream socket addressed to this process, serve exits (v1.11.0+).
 # An abstract socket -- a ListenStream= whose name starts with @ -- is refused
 # as well, because it has no file for SocketMode= to apply to.
+# It also needs a transport that accepts a socket: setting this while the
+# resolved transport is stdio is refused rather than ignored, because groove
+# would otherwise start on stdin while nobody accepts the socket the unit
+# bound. Passing --transport stdio on the command line still runs such a
+# config on stdio for that one session.
 # systemd_socket = true
 
 # Optional: `groove eval` (retrieval quality evaluation, power-user feature).
