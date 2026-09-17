@@ -203,7 +203,11 @@ static TAKEN: OnceLock<()> = OnceLock::new();
 ///
 /// Both conversions are the safe `From<OwnedFd>` impls, so this function has no
 /// `unsafe` at all. The one place the module builds an `OwnedFd` out of a raw
-/// number is [`take_listener`].
+/// number is [`take_listener`], which runs `check_listening_stream` on the raw
+/// number *before* it does — so that check runs twice per start. The
+/// duplication is deliberate: this function has to hold for any caller on its
+/// own, and two extra `getsockopt` calls once at start-up cost less than a
+/// contract only the caller who remembers to pre-check satisfies.
 pub(crate) fn adopt(fd: OwnedFd) -> Result<SystemdSocket> {
     check_listening_stream(fd.as_raw_fd())?;
     prepare_fd(fd.as_raw_fd())?;
@@ -237,13 +241,37 @@ pub(crate) fn take_listener() -> Result<SystemdSocket> {
         std::env::var("LISTEN_FDS").ok().as_deref(),
         std::process::id(),
     )?;
-    // SAFETY: the two lines above are the whole justification, and they are
-    // statements rather than a doc-comment promise. `claim` succeeded, so no
-    // earlier call in this process took descriptor 3 and nothing else here
-    // owns it; `check_listen_env` then confirmed `LISTEN_PID` names *this*
-    // process, so the descriptor is the one a service manager passed to us and
-    // not one an ancestor's environment described. This is the only place in
-    // the module that builds an `OwnedFd` out of a raw number.
+    // Refuse on the raw number, before anything here claims to own it.
+    //
+    // Up to this point the only thing saying descriptor 3 is ours is an
+    // environment variable, and `LISTEN_PID=$$ LISTEN_FDS=1 groove serve
+    // --systemd-socket` typed at a shell satisfies every check above while
+    // descriptor 3 is whatever groove itself opened third. Refusing after the
+    // `OwnedFd` exists would close that descriptor on the way out -- the
+    // double close this module spent two commits removing, arriving through
+    // the refusal path instead. `check_listening_stream` only reads the
+    // descriptor through `getsockopt`, so it needs no ownership to run.
+    check_listening_stream(LISTEN_FDS_START)?;
+    // SAFETY: two separate facts, and neither stands in for the other.
+    //
+    // `claim` succeeded, so this is the first call in this process to reach
+    // here and no `SystemdSocket` from an earlier one holds descriptor 3.
+    // That, and only that, is what `claim` says.
+    //
+    // What says the descriptor is ours to take is the protocol together with
+    // the two checks: `check_listen_env` confirmed `LISTEN_PID` names this
+    // process rather than an ancestor whose environment we inherited, and
+    // `check_listening_stream` confirmed descriptor 3 is a listening stream
+    // socket rather than a file, a pipe, a datagram socket or a connected one.
+    // A service manager following `sd_listen_fds(3)` passes exactly that and
+    // hands this process no other user of it. The checks are as loose as that
+    // page asks for, so what they cannot exclude is a listening stream socket
+    // this process opened itself at descriptor 3 -- which is why they run
+    // before the `OwnedFd` rather than after, leaving every shape they *can*
+    // name to be refused without touching the descriptor.
+    //
+    // This is the only place in the module that builds an `OwnedFd` out of a
+    // raw number.
     let fd = unsafe { OwnedFd::from_raw_fd(LISTEN_FDS_START) };
     adopt(fd)
 }
@@ -329,6 +357,27 @@ mod tests {
             !err.contains("SO_ACCEPTCONN"),
             "the type check must come first, or A-6 cannot be told from A-5: {err}"
         );
+    }
+
+    /// (N-I1) The shape the pre-check in [`take_listener`] exists for: the
+    /// descriptor is not a socket at all, because `LISTEN_FDS` was set by hand
+    /// and descriptor 3 is whatever this process opened third -- a database
+    /// handle, a log file. `getsockopt` answers `ENOTSOCK`, and the refusal has
+    /// to be reachable while the descriptor is still a borrowed number, or the
+    /// refusal closes a file somebody else is using.
+    #[test]
+    fn a_descriptor_that_is_not_a_socket_is_refused() {
+        let dir = crate::test_support::unique_temp_path("g");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("f");
+        let file = std::fs::File::create(&path).expect("a plain file");
+        let err = check_listening_stream(file.as_raw_fd())
+            .expect_err("a regular file is not a listening socket")
+            .to_string();
+        assert!(err.contains("getsockopt"), "must say which call failed: {err}");
+        assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The shape that passes, so the two refusals above are not passing for
