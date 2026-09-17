@@ -12,6 +12,18 @@ use serde::Deserialize;
 
 pub mod http;
 pub mod stdio;
+// (計画 4 段 A) The listening socket a service manager passed. Linux and other
+// Unix only: there is no LISTEN_FDS protocol on Windows.
+//
+// A plain comment and not a doc comment, on purpose. An outer doc comment here
+// is merged into the module's own documentation, but it also moves where
+// rustdoc resolves that documentation's intra-doc links: to *this* module
+// rather than to `systemd_fd`. Measured -- with a `///` on this line,
+// `cargo doc --no-deps --workspace --all-features --document-private-items`
+// fails the module's `//!` header with "no item named `take_listener` in
+// scope", while the same link on an item inside the file still resolves.
+#[cfg(unix)]
+pub mod systemd_fd;
 
 // ---------------------------------------------------------------------------
 // CLI / config enums
