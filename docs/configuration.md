@@ -148,6 +148,21 @@ bind = "127.0.0.1:3100"
 # the 2026-07-28 protocol has no sessions, so those requests hold nothing and
 # are never refused by this limit (v0.19.0+).
 # max_sessions = 256
+# Take the listening socket from the service manager instead of binding one.
+# Linux only: it needs a service manager that passes LISTEN_FDS, such as
+# systemd, and a build for any other operating system refuses the key.
+# Exclusive with bind above -- two listening addresses is not a configuration,
+# and groove refuses to start rather than pick one. With this set, groove never
+# falls back to TCP: if LISTEN_FDS does not describe exactly one listening
+# stream socket addressed to this process, serve exits (v1.11.0+).
+# An abstract socket -- a ListenStream= whose name starts with @ -- is refused
+# as well, because it has no file for SocketMode= to apply to.
+# It also needs a transport that accepts a socket: setting this while the
+# resolved transport is stdio is refused rather than ignored, because groove
+# would otherwise start on stdin while nobody accepts the socket the unit
+# bound. Passing --transport stdio on the command line still runs such a
+# config on stdio for that one session.
+# systemd_socket = true
 
 # Optional: `groove eval` (retrieval quality evaluation, power-user feature).
 # You only need this section if you run `groove eval` for tuning or
@@ -243,7 +258,7 @@ the machine, and who can reach it:
 | Field | From an untrusted config |
 | --- | --- |
 | `fastembed_cache_dir` | Ignored with a warning; the standard cache directory is used. It selects which `.onnx` file is loaded, and nothing verifies a model already present in a cache directory. (Related: `FASTEMBED_CACHE_DIR` must be an absolute path, and the model directory is never resolved relative to the working directory.) |
-| `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts`, `allowed_origins`, `healthz_public`, and `max_sessions` are dropped — the first three restore the loopback-only defaults, and the last falls back to the built-in limit, so that a planted `max_sessions = 1` cannot leave the server unable to accept a second client. Dropping `allowed_origins` matters in both directions: a planted list could name an attacker's origin, or be empty, which is how "do not validate Origin at all" is spelled. `kind` is honoured. |
+| `[transport.http].bind` | A non-loopback address keeps its port and moves to `127.0.0.1`, with a warning. `allowed_hosts`, `allowed_origins`, `healthz_public`, `max_sessions`, and `systemd_socket` are dropped — the first three restore the loopback-only defaults, and the last two fall back to the built-in limit and to binding a TCP address, so that neither a planted `max_sessions = 1` can leave the server unable to accept a second client, nor a planted `systemd_socket = true` keep it from starting at all where no socket was passed. Dropping `allowed_origins` matters in both directions: a planted list could name an attacker's origin, or be empty, which is how "do not validate Origin at all" is spelled. `kind` is honoured. |
 | `kb_path` | **Ignored with a warning** if it is a filesystem root, your home directory, an ancestor of it, or an ancestor of the directory holding the config file. `--kb-path` still applies, so you can override it; with neither, the command stops with the usual "`--kb-path` is required". |
 | `grammar_dir` | Ignored with a warning; the standard location is used. It selects which native library is `dlopen`ed into the process, and a grammar plugin is code, not data. Set for every untrusted config, present or not — omitting the key would otherwise be a way to influence the choice by saying nothing. If no standard location can be determined the key is dropped instead, and a command that needs a plugin then stops with a message naming `GROOVE_GRAMMAR_DIR`. |
 | `[parsers]` | Ignored with a warning; the default set — Markdown alone — is used. `enabled` decides which parsers run at all, so a config found beside a knowledge base could otherwise switch on the formats with the widest input surface (`pdf`, `xlsx`, `pptx`, `docx`) that the operator had left off, or name a language whose grammar plugin then gets `dlopen`ed. It is the switch `grammar_dir` only aims: no enabled language needs a plugin, and no plugin is looked for. Unlike the two above, an absent key needs no substitute — omitting `[parsers]` already lands on Markdown alone, which is where this rule puts it. `[parsers.code]` goes with it, having no parser left to configure. |

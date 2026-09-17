@@ -12,6 +12,22 @@ use serde::Deserialize;
 
 pub mod http;
 pub mod stdio;
+// (計画 4 段 A) The listening socket a service manager passed. Linux only.
+// Windows has no LISTEN_FDS protocol at all, and macOS has the protocol's
+// shape but not the check this module refuses on: `getsockopt(SO_ACCEPTCONN)`
+// answers ENOPROTOOPT there, so `check_listening_stream` could never pass. See
+// ADR-0021 for why the answer was to narrow the target rather than drop the
+// check.
+//
+// A plain comment and not a doc comment, on purpose. An outer doc comment here
+// is merged into the module's own documentation, but it also moves where
+// rustdoc resolves that documentation's intra-doc links: to *this* module
+// rather than to `systemd_fd`. Measured -- with a `///` on this line,
+// `cargo doc --no-deps --workspace --all-features --document-private-items`
+// fails the module's `//!` header with "no item named `take_listener` in
+// scope", while the same link on an item inside the file still resolves.
+#[cfg(target_os = "linux")]
+pub mod systemd_fd;
 
 // ---------------------------------------------------------------------------
 // CLI / config enums
@@ -98,6 +114,23 @@ pub struct HttpTransportConfig {
     /// (既存 session は影響を受けない)。
     #[serde(default)]
     pub max_sessions: Option<u32>,
+
+    /// (計画 4 段 A) Take the listening socket from the service manager
+    /// instead of binding one. `None` (omitted) and `Some(false)` both mean
+    /// "bind", which is what every release before 1.11.0 did.
+    ///
+    /// Exclusive with [`Self::bind`], and with `--bind` / `--port`: two
+    /// listening addresses is not a configuration, and the dangerous reading
+    /// of a silent winner is the one where the operator believes the daemon is
+    /// still reachable on the address they wrote. [`Transport::resolve`]
+    /// refuses the pair.
+    ///
+    /// **A config groove merely found does not get to set this.** It is
+    /// dropped with a warning beside `allowed_hosts` and `max_sessions`: a
+    /// file planted in a working directory would otherwise stop the daemon
+    /// starting at all, since without `LISTEN_FDS` there is no socket to take.
+    #[serde(default)]
+    pub systemd_socket: Option<bool>,
 }
 
 /// `[transport]` config section.
@@ -114,12 +147,39 @@ pub struct TransportConfig {
 // Runtime transport choice
 // ---------------------------------------------------------------------------
 
+/// Where the HTTP transport gets something to accept on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpListen {
+    /// An address groove binds itself.
+    Tcp(SocketAddr),
+    /// The descriptor a service manager already bound. Which address family it
+    /// carries is decided at run time, where the descriptor is adopted: the
+    /// systemd_fd module, named here in prose on purpose.
+    ///
+    /// **Prose rather than an intra-doc link, and that is deliberate.** That
+    /// module is compiled only on Linux while this enum is compiled
+    /// everywhere, so a link to it is unresolved on every other build, and
+    /// `broken_intra_doc_links = "deny"` turns an unresolved link into a failed
+    /// `cargo doc`. Measured on Windows, with the link written out in full:
+    /// `no item named systemd_fd in module transport`, exit 101. The same holds
+    /// for every mention of it from [`http`], from [`crate::server`] and from
+    /// the binary. The reverse direction is safe: that module's own doc
+    /// comments are compiled out along with it.
+    Systemd,
+}
+
 /// Resolved transport to use at runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
     Stdio,
     Http {
-        addr: SocketAddr,
+        /// Where this server gets something to accept on.
+        ///
+        /// An enum rather than an address plus a flag: with a flag the unused
+        /// address stays in the value, and the startup log, the non-loopback
+        /// bind warning and the admin allow-list would each go on describing a
+        /// bind that never happened.
+        listen: HttpListen,
         /// `None` = [`http::DEFAULT_LOOPBACK_HOSTS`]
         /// **+ bind したアドレスが loopback ならその表記**
         /// ([`http::effective_allowed_hosts`] が組み立てる)。
@@ -160,6 +220,7 @@ impl Transport {
         cli_transport: Option<TransportKind>,
         cli_bind: Option<SocketAddr>,
         cli_port: Option<u16>,
+        cli_systemd_socket: bool,
         cfg: Option<&TransportConfig>,
     ) -> Result<Self> {
         let kind = cli_transport
@@ -179,9 +240,19 @@ impl Transport {
             .unwrap_or(TransportKindConfig::Stdio);
 
         match kind {
-            TransportKindConfig::Stdio => Ok(Transport::Stdio),
+            TransportKindConfig::Stdio => {
+                refuse_config_systemd_socket_under_stdio(cli_transport, cfg)?;
+                Ok(Transport::Stdio)
+            }
             TransportKindConfig::Http => {
-                let addr = resolve_http_addr(cli_bind, cli_port, cfg)?;
+                let http = cfg.and_then(|c| c.http.as_ref());
+                let wants_systemd =
+                    cli_systemd_socket || http.and_then(|h| h.systemd_socket).unwrap_or(false);
+                let listen = if wants_systemd {
+                    resolve_systemd_listen(cli_bind, cli_port, http)?
+                } else {
+                    HttpListen::Tcp(resolve_http_addr(cli_bind, cli_port, cfg)?)
+                };
                 let allowed_hosts = cfg
                     .and_then(|c| c.http.as_ref())
                     .and_then(|h| h.allowed_hosts.clone());
@@ -204,7 +275,7 @@ impl Transport {
                     .and_then(|h| h.max_sessions)
                     .unwrap_or(crate::transport::http::DEFAULT_MAX_SESSIONS);
                 Ok(Transport::Http {
-                    addr,
+                    listen,
                     allowed_hosts,
                     allowed_origins,
                     healthz_public,
@@ -235,6 +306,147 @@ fn resolve_http_addr(
         });
     }
     Ok(SocketAddr::from(([127, 0, 0, 1], DEFAULT_HTTP_PORT)))
+}
+
+/// Whether this build can take a socket from a service manager.
+///
+/// A `const fn` rather than `#[cfg]` around the call site so that one pair of
+/// tests pins both builds: the non-Linux half asserts the refusal names the
+/// flag, the Linux half asserts the flag resolves.
+///
+/// `target_os = "linux"` and not `unix`. It was `unix` until the macOS leg of
+/// CI ran the descriptor checks: `getsockopt(SO_ACCEPTCONN)` is not
+/// implemented there and answers `ENOPROTOOPT`, so the listening check in the
+/// systemd_fd module — named in prose for the reason
+/// [`HttpListen::Systemd`] gives — fails on every descriptor, and a macOS
+/// build could never have served on a passed socket anyway. Narrowing the
+/// target is what ADR-0021 records; the alternative, skipping the check where
+/// the platform cannot answer it, would have dropped what separates a
+/// listening socket from a connected one.
+pub(crate) const fn systemd_socket_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// What `--systemd-socket` needs, in the one sentence every surface says it in.
+///
+/// **One question gets one implementation** (AGENTS.md). Two refusals name this
+/// requirement -- the build gate in [`resolve_systemd_listen`] below, and the
+/// `#[cfg(not(target_os = "linux"))]` arm of `open_listener` in [`http`] --
+/// and they differ
+/// either side of it, because one is answering an operator and the other is
+/// reporting that a check above it was removed. What must not differ is the
+/// sentence itself: plan decision 7 requires the help text, the documentation
+/// and both refusals to say one thing rather than four. That
+/// arm is unreachable while [`Transport::resolve`] refuses first, which is
+/// exactly why a copy there could drift for a release without anyone reading
+/// it.
+///
+/// It is a sentence fragment, not a whole message: it starts after the flag
+/// name and ends with its own full stop.
+pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str =
+    "needs a Linux build and a service manager that passes LISTEN_FDS, such as systemd.";
+
+/// A `systemd_socket = true` in the file that nothing is going to honour,
+/// because the transport resolved to stdio.
+///
+/// **Only the resolver can ask this, which is why it is here and not beside the
+/// flag's guard in the binary.** That guard answers "the operator passed
+/// `--systemd-socket` and got stdio"; this answers "the file asked for a socket
+/// and got stdio", and telling those apart needs `cli_transport` -- whether
+/// stdio was chosen on the command line or fell out of the file. One question
+/// each, in the one place that can see the inputs it takes.
+///
+/// **An explicit `--transport stdio` still wins**, and that is the reason the
+/// two are separate questions rather than one. A config carrying an HTTP
+/// section and a `systemd_socket` describes a socket-activated deployment;
+/// running `groove serve --transport stdio` against it to attach one local
+/// client for an afternoon is the same move as leaving `bind` in the file and
+/// letting it sit inert for that run. What must not pass is the silent case:
+/// the file says `systemd_socket = true` and `kind = "stdio"` together, so
+/// groove starts on stdin while nobody accepts the socket the unit bound --
+/// and under that unit stdin is already at EOF, so the process exits at once
+/// with nothing said about it.
+///
+/// **Where it sits in the order.** In the stdio arm, before that arm returns,
+/// and so before anything in [`resolve_systemd_listen`] -- which is the HTTP
+/// arm and cannot be reached from here. The order inside that function (the
+/// two-listener refusals first, the build gate last) is untouched: this check
+/// asks a question neither of those asks, and no input reaches both.
+///
+/// It reads the value **after** the config has been loaded and an untrusted one
+/// stripped, in [`crate::config::Config::discover_in`], so a `systemd_socket`
+/// planted in a config groove merely found was already dropped and cannot stop
+/// a start here.
+fn refuse_config_systemd_socket_under_stdio(
+    cli_transport: Option<TransportKind>,
+    cfg: Option<&TransportConfig>,
+) -> Result<()> {
+    if cli_transport == Some(TransportKind::Stdio) {
+        return Ok(());
+    }
+    if cfg
+        .and_then(|c| c.http.as_ref())
+        .and_then(|h| h.systemd_socket)
+        .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "[transport.http].systemd_socket is true, but the transport resolved to stdio, which accepts no socket. Set [transport].kind = \"http\" so the socket is served, or remove systemd_socket. To run this config on stdio once without editing it, pass --transport stdio."
+        );
+    }
+    Ok(())
+}
+
+/// The refusals that can be answered before anything opens a socket: a second
+/// listener was named beside the one the service manager owns, or this build
+/// has no such interface (spec 判断 4, conditions 1 and 5).
+///
+/// The environment and the descriptor itself are checked in the systemd_fd
+/// module, because only the running process can answer those. That module is
+/// Linux-only while this function is not, so it is named in prose here for the
+/// reason [`HttpListen::Systemd`] gives.
+///
+/// **The two-listener refusals come first, and the build gate last.** Both are
+/// refusals, so the order only decides which sentence the operator reads; what
+/// it also decides is whether the two-listener checks mean anything on a
+/// Windows build. With the build gate in front they can never be reached
+/// there, so every test of them would pass on Windows without running the
+/// check it names. The one input this reorders is a config carrying both
+/// `systemd_socket` and `bind` on Windows: it now hears "two listeners, pick
+/// one" and, once that is fixed, "this build has no such interface". From the
+/// command line the pair never arrives at all -- clap's `conflicts_with_all`
+/// refuses `--bind` / `--port` first -- and `--systemd-socket` on its own
+/// still gets the build gate, which is what 試験 A-13 pins.
+fn resolve_systemd_listen(
+    cli_bind: Option<SocketAddr>,
+    cli_port: Option<u16>,
+    http: Option<&HttpTransportConfig>,
+) -> Result<HttpListen> {
+    if let Some(bind) = cli_bind {
+        anyhow::bail!(
+            "--systemd-socket takes the socket the service manager already bound, so --bind {bind} names a second listener. Pick one."
+        );
+    }
+    if let Some(port) = cli_port {
+        anyhow::bail!(
+            "--systemd-socket takes the socket the service manager already bound, so --port {port} names a second listener. Pick one."
+        );
+    }
+    if let Some(bind) = http.and_then(|h| h.bind.as_deref()) {
+        anyhow::bail!(
+            "[transport.http].systemd_socket and [transport.http].bind = {bind} name two different listeners. The socket unit owns the address, so remove bind; leaving it in place would tell whoever reads this file that the daemon is still reachable there."
+        );
+    }
+    // `cfg!(target_os = "linux")`. Both Windows and macOS are refused here,
+    // where the operator can still see the command they typed: Windows has no
+    // LISTEN_FDS protocol, and macOS cannot run the descriptor checks (see
+    // `systemd_socket_supported`). The help text and the docs say the same
+    // sentence rather than three different ones (plan decision 7).
+    if !systemd_socket_supported() {
+        anyhow::bail!(
+            "--systemd-socket (and [transport.http].systemd_socket) {SYSTEMD_SOCKET_REQUIREMENT} This build has no such interface. Use bind instead."
+        );
+    }
+    Ok(HttpListen::Systemd)
 }
 
 /// (BU-01) `--bind` に非 loopback を明示した `serve` を `--i-know` で追認させる。
@@ -283,6 +495,15 @@ pub fn non_loopback_bind_refusal(bind: impl std::fmt::Display) -> String {
     )
 }
 
+/// (計画 4 段 A) [`HttpListen::Systemd`] still lives in [`Transport::Http`], so the
+/// `matches!` below does not take its early return for a systemd listener. What
+/// makes that harmless is the other side: `cli_bind` is `None`, because
+/// `--bind` and `--port` are refused both by clap's `conflicts_with_all` and by
+/// [`resolve_systemd_listen`].
+///
+/// **This function destructures with `{ .. }`, so turning the address into an
+/// enum does not make it fail to compile.** If either of those two refusals is
+/// ever removed, nothing here will say so.
 pub fn check_cli_bind_ack(
     transport: &Transport,
     cli_bind: Option<SocketAddr>,
@@ -315,17 +536,17 @@ mod tests {
 
     #[test]
     fn test_resolve_default_is_stdio() {
-        let t = Transport::resolve(None, None, None, None).unwrap();
+        let t = Transport::resolve(None, None, None, false, None).unwrap();
         assert_eq!(t, Transport::Stdio);
     }
 
     #[test]
     fn test_resolve_cli_http_default_bind() {
-        let t = Transport::resolve(Some(TransportKind::Http), None, None, None).unwrap();
+        let t = Transport::resolve(Some(TransportKind::Http), None, None, false, None).unwrap();
         assert_eq!(
             t,
             Transport::Http {
-                addr: "127.0.0.1:3100".parse().unwrap(),
+                listen: HttpListen::Tcp("127.0.0.1:3100".parse().unwrap()),
                 allowed_hosts: None,
                 allowed_origins: None,
                 healthz_public: true,
@@ -336,11 +557,12 @@ mod tests {
 
     #[test]
     fn test_resolve_cli_port_only() {
-        let t = Transport::resolve(Some(TransportKind::Http), None, Some(4000), None).unwrap();
+        let t =
+            Transport::resolve(Some(TransportKind::Http), None, Some(4000), false, None).unwrap();
         assert_eq!(
             t,
             Transport::Http {
-                addr: "127.0.0.1:4000".parse().unwrap(),
+                listen: HttpListen::Tcp("127.0.0.1:4000".parse().unwrap()),
                 allowed_hosts: None,
                 allowed_origins: None,
                 healthz_public: true,
@@ -355,13 +577,14 @@ mod tests {
             Some(TransportKind::Http),
             Some("0.0.0.0:9000".parse().unwrap()),
             Some(4000), // should be overridden by --bind
+            false,
             None,
         )
         .unwrap();
         assert_eq!(
             t,
             Transport::Http {
-                addr: "0.0.0.0:9000".parse().unwrap(),
+                listen: HttpListen::Tcp("0.0.0.0:9000".parse().unwrap()),
                 allowed_hosts: None,
                 allowed_origins: None,
                 healthz_public: true,
@@ -377,7 +600,8 @@ mod tests {
             http: None,
         };
         // CLI stdio wins over config http
-        let t = Transport::resolve(Some(TransportKind::Stdio), None, None, Some(&cfg)).unwrap();
+        let t =
+            Transport::resolve(Some(TransportKind::Stdio), None, None, false, Some(&cfg)).unwrap();
         assert_eq!(t, Transport::Stdio);
     }
 
@@ -392,11 +616,11 @@ mod tests {
                 ..HttpTransportConfig::default()
             }),
         };
-        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
         assert_eq!(
             t,
             Transport::Http {
-                addr: "127.0.0.1:5555".parse().unwrap(),
+                listen: HttpListen::Tcp("127.0.0.1:5555".parse().unwrap()),
                 allowed_hosts: None,
                 allowed_origins: None,
                 healthz_public: true,
@@ -415,7 +639,7 @@ mod tests {
                 ..HttpTransportConfig::default()
             }),
         };
-        let err = Transport::resolve(None, None, None, Some(&cfg)).expect_err("must reject");
+        let err = Transport::resolve(None, None, None, false, Some(&cfg)).expect_err("must reject");
         assert!(err.to_string().contains("SocketAddr"));
     }
 
@@ -434,10 +658,10 @@ mod tests {
                 ..HttpTransportConfig::default()
             }),
         };
-        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
         match t {
             Transport::Http {
-                addr,
+                listen: HttpListen::Tcp(addr),
                 allowed_hosts,
                 allowed_origins: _,
                 healthz_public: _,
@@ -470,7 +694,7 @@ mod tests {
                 ..HttpTransportConfig::default()
             }),
         };
-        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
         match t {
             Transport::Http {
                 allowed_origins, ..
@@ -500,7 +724,7 @@ mod tests {
         };
         let msg = format!(
             "{:#}",
-            Transport::resolve(None, None, None, Some(&cfg))
+            Transport::resolve(None, None, None, false, Some(&cfg))
                 .expect_err("an entry the matcher would drop must not reach a running server")
         );
         for needle in [
@@ -533,7 +757,7 @@ mod tests {
         };
         assert!(
             matches!(
-                Transport::resolve(None, None, None, Some(&cfg)),
+                Transport::resolve(None, None, None, false, Some(&cfg)),
                 Ok(Transport::Stdio)
             ),
             "an HTTP-only setting must not stop a transport that never reads it"
@@ -553,7 +777,7 @@ mod tests {
                 ..HttpTransportConfig::default()
             }),
         };
-        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
         match t {
             Transport::Http {
                 allowed_origins, ..
@@ -611,7 +835,7 @@ mod tests {
             kind: Some(TransportKindConfig::Stdio),
             http: None,
         };
-        let t = Transport::resolve(None, None, None, Some(&cfg)).unwrap();
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
         assert_eq!(t, Transport::Stdio);
     }
 
@@ -791,6 +1015,54 @@ mod tests {
         );
     }
 
+    /// (計画 4 段 A) The same shape for the `--systemd-socket` requirement
+    /// sentence, and it needs the scan more than the others do: the second
+    /// caller is the `#[cfg(not(target_os = "linux"))]` arm of `open_listener` in
+    /// [`crate::transport::http`], which [`Transport::resolve`] makes
+    /// unreachable. A copy there would compile on
+    /// one target, run on none, and drift for as long as nobody read it.
+    ///
+    /// The scan is on the literal rather than on behaviour for the reason the
+    /// loopback-alias test gives: a behavioural test still passes on the day
+    /// the copy is made.
+    #[test]
+    fn the_systemd_socket_requirement_has_no_second_spelling() {
+        let http = include_str!("http.rs");
+        assert!(
+            http.contains("SYSTEMD_SOCKET_REQUIREMENT"),
+            "http.rs must render the shared requirement sentence, not its own copy"
+        );
+        // The needle is the constant itself rather than a literal copy of it,
+        // for two reasons: the scan cannot drift from what it guards, and this
+        // test's own source never spells the sentence out. Spelling it here is
+        // what made the first version of this test fail on its own assert line.
+        for (name, src) in [("http.rs", http), ("mod.rs", include_str!("mod.rs"))] {
+            // The definition itself is the one place the words appear, and it
+            // is a *statement*, not a line: rustfmt moves the literal onto its
+            // own line as soon as wrapping makes it fit, which depends on how
+            // long the sentence is. Skipping one line therefore held only for
+            // the sentence this started with -- shortening it to name Linux
+            // wrapped the definition and this test failed on the continuation
+            // line. Skip to the `;` instead, so the guard answers to the rule
+            // it states rather than to the current formatting.
+            let mut in_definition = false;
+            for (n, line) in src.lines().enumerate() {
+                if in_definition || line.contains("pub(crate) const SYSTEMD_SOCKET_REQUIREMENT") {
+                    in_definition = !line.trim_end().ends_with(';');
+                    continue;
+                }
+                assert!(
+                    !line.contains(SYSTEMD_SOCKET_REQUIREMENT),
+                    "{name}:{} spells the requirement out again; render \
+                     SYSTEMD_SOCKET_REQUIREMENT instead so the help text, the \
+                     docs and both refusals cannot disagree -- line was: {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // BU-01: `serve --bind <non-loopback>` requires `--i-know`.
     // -----------------------------------------------------------------------
@@ -798,7 +1070,7 @@ mod tests {
     /// Build an HTTP transport whose address came from the CLI `--bind` flag.
     fn http_at(addr: &str) -> Transport {
         Transport::Http {
-            addr: addr.parse().unwrap(),
+            listen: HttpListen::Tcp(addr.parse().unwrap()),
             allowed_hosts: None,
             allowed_origins: None,
             healthz_public: true,
@@ -869,5 +1141,301 @@ mod tests {
         let bind: SocketAddr = "0.0.0.0:3100".parse().unwrap();
         check_cli_bind_ack(&Transport::Stdio, Some(bind), false)
             .expect("stdio listens on no port, so there is nothing to acknowledge");
+    }
+
+    // -----------------------------------------------------------------------
+    // (計画 4 段 A) `--systemd-socket`: take the socket, or refuse to start.
+    // -----------------------------------------------------------------------
+
+    /// (試験 A-2) The config half of the exclusion. A unit that sets
+    /// `systemd_socket = true` and leaves an old `bind =` behind has said two
+    /// incompatible things, and the dangerous reading is the silent one: the
+    /// operator believes the daemon is still reachable on that address.
+    #[test]
+    fn a_config_bind_beside_systemd_socket_refuses_to_resolve() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3101".into()),
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let msg = format!(
+            "{:#}",
+            Transport::resolve(None, None, None, false, Some(&cfg))
+                .expect_err("two listening addresses is not a configuration")
+        );
+        for needle in ["systemd_socket", "bind", "127.0.0.1:3101"] {
+            assert!(
+                msg.contains(needle),
+                "the refusal must contain {needle:?}: {msg}"
+            );
+        }
+        assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
+    }
+
+    /// The same refusal when the flag came from the command line and the
+    /// address from the file. `--bind` and `--port` are refused by clap
+    /// (`conflicts_with_all`), so the pair that reaches here is flag + file.
+    #[test]
+    fn the_flag_and_a_config_bind_are_refused_together() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3101".into()),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        Transport::resolve(None, None, None, true, Some(&cfg))
+            .expect_err("the flag does not silently win over the file");
+    }
+
+    /// A defensive twin of the clap rule: if `conflicts_with_all` is ever
+    /// removed, the resolver still refuses rather than choosing one.
+    #[test]
+    fn the_flag_and_a_cli_bind_are_refused_even_without_clap() {
+        Transport::resolve(
+            Some(TransportKind::Http),
+            Some("127.0.0.1:3101".parse().unwrap()),
+            None,
+            true,
+            None,
+        )
+        .expect_err("--systemd-socket and --bind name two different listeners");
+        Transport::resolve(Some(TransportKind::Http), None, Some(3101), true, None)
+            .expect_err("--systemd-socket and --port name two different listeners");
+    }
+
+    /// (試験 A-13) A build that cannot honour the flag refuses it where the
+    /// operator can still see the command they typed -- not at bind time, by a
+    /// daemon that will not start.
+    ///
+    /// `not(target_os = "linux")` covers both such builds with one arm, and it
+    /// has to: Windows has no `LISTEN_FDS` protocol, and macOS answers
+    /// `ENOPROTOOPT` to `getsockopt(SO_ACCEPTCONN)`, so the descriptor checks
+    /// could never pass there. Gating this on Windows alone left the macOS leg
+    /// of the matrix asserting nothing about the flag while the code still
+    /// accepted it.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn the_flag_is_refused_on_a_build_that_cannot_honour_it() {
+        let msg = format!(
+            "{:#}",
+            Transport::resolve(Some(TransportKind::Http), None, None, true, None)
+                .expect_err("this build cannot take a socket from a service manager")
+        );
+        assert!(
+            msg.contains("--systemd-socket"),
+            "must name the flag: {msg}"
+        );
+        assert!(
+            msg.contains("LISTEN_FDS"),
+            "must name the protocol it needs: {msg}"
+        );
+        assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
+    }
+
+    /// The other side of the same check, so both builds are pinned by one pair
+    /// of tests rather than by whichever one the author happened to run.
+    ///
+    /// `cfg(target_os = "linux")`, matching [`systemd_socket_supported`]. It
+    /// read `cfg(unix)` until the macOS leg of CI ran the descriptor checks and
+    /// found `getsockopt(SO_ACCEPTCONN)` unimplemented there, which made a
+    /// macOS build one that resolves the flag and can never honour it. The two
+    /// halves have to name the same condition, or one of them asserts about a
+    /// build the other does not describe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_flag_resolves_to_the_systemd_listener_where_it_is_supported() {
+        let t = Transport::resolve(Some(TransportKind::Http), None, None, true, None)
+            .expect("a Linux build takes the socket");
+        assert_eq!(
+            t,
+            Transport::Http {
+                listen: HttpListen::Systemd,
+                allowed_hosts: None,
+                allowed_origins: None,
+                healthz_public: true,
+                max_sessions: crate::transport::http::DEFAULT_MAX_SESSIONS,
+            }
+        );
+    }
+
+    /// `systemd_socket = true` in the file does the same thing as the flag.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_config_key_alone_resolves_to_the_systemd_listener() {
+        let cfg = TransportConfig {
+            kind: None,
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
+        assert!(matches!(
+            t,
+            Transport::Http {
+                listen: HttpListen::Systemd,
+                ..
+            }
+        ));
+    }
+
+    /// `systemd_socket = false` is not the same as absent, and neither one may
+    /// change what the default bind is.
+    #[test]
+    fn systemd_socket_false_leaves_the_default_bind_alone() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Http),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(false),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let t = Transport::resolve(None, None, None, false, Some(&cfg)).unwrap();
+        assert!(matches!(
+            t,
+            Transport::Http {
+                listen: HttpListen::Tcp(_),
+                ..
+            }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // A `systemd_socket = true` the resolved transport cannot honour.
+    // -----------------------------------------------------------------------
+
+    /// `[transport.http]` on its own already means HTTP, so a file that sets
+    /// `systemd_socket` and forgets `kind` does **not** land on stdio.
+    ///
+    /// This is here because the sugar is what decides how narrow the refusal
+    /// below has to be. The key lives under `[transport.http]`, that section's
+    /// presence implies `kind = "http"`, and `cli_transport` is `None` -- so
+    /// the only way the key meets stdio is a file that says `kind = "stdio"`
+    /// in as many words, or a command line that says `--transport stdio`.
+    #[test]
+    fn a_config_key_without_kind_still_resolves_to_http_through_the_sugar() {
+        let cfg = TransportConfig {
+            kind: None,
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        // On Linux this resolves; elsewhere the build gate refuses it. Either
+        // way it is not stdio, which is the whole claim.
+        match Transport::resolve(None, None, None, false, Some(&cfg)) {
+            Ok(t) => assert!(
+                !matches!(t, Transport::Stdio),
+                "the [transport.http] sugar must not leave this on stdio: {t:?}"
+            ),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("LISTEN_FDS"),
+                    "the only refusal expected here is the build gate: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The case the sugar cannot save: the file asks for a socket and, in the
+    /// same file, asks for the transport that accepts none. Ignoring it starts
+    /// groove on stdin while the socket unit's listener goes unaccepted -- and
+    /// under that unit stdin is at EOF, so the process exits with nothing said.
+    #[test]
+    fn a_config_that_asks_for_a_socket_and_for_stdio_refuses_to_resolve() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        let msg = format!(
+            "{:#}",
+            Transport::resolve(None, None, None, false, Some(&cfg))
+                .expect_err("a socket nobody accepts is not a configuration")
+        );
+        assert!(
+            msg.contains("[transport.http].systemd_socket"),
+            "the refusal must name the key that caused it: {msg}"
+        );
+        assert!(
+            msg.contains("[transport].kind"),
+            "the refusal must name the key that fixes it: {msg}"
+        );
+        assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
+    }
+
+    /// `--transport stdio` on the command line still wins, so a deployment's
+    /// own config can be run on stdio for one session without editing it.
+    ///
+    /// The same latitude `bind` already has: it stays in the file and sits
+    /// inert for that run. What the refusal above catches is the case where
+    /// nobody asked for stdio in the first place.
+    #[test]
+    fn an_explicit_cli_stdio_may_still_run_a_config_that_wants_a_socket() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(true),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert_eq!(
+            Transport::resolve(Some(TransportKind::Stdio), None, None, false, Some(&cfg))
+                .expect("an explicit --transport stdio is the operator's word"),
+            Transport::Stdio
+        );
+    }
+
+    /// The regression this refusal could have caused, written as its own test
+    /// because it is the shape a real deployment already has: a config that
+    /// carries a whole `[transport.http]` section **and** runs on stdio, which
+    /// is legal and must keep starting. Only `systemd_socket` is refused there,
+    /// not the section.
+    #[test]
+    fn a_stdio_config_carrying_http_settings_but_no_socket_key_still_starts() {
+        let cfg = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                bind: Some("127.0.0.1:3100".into()),
+                allowed_hosts: Some(vec!["kb.example.lan".to_string()]),
+                max_sessions: Some(8),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert_eq!(
+            Transport::resolve(None, None, None, false, Some(&cfg))
+                .expect("http settings beside a stdio transport are inert, not an error"),
+            Transport::Stdio
+        );
+        // And `= false` is not `= true`: it says "bind", which on stdio is the
+        // same nothing every other HTTP key is.
+        let off = TransportConfig {
+            kind: Some(TransportKindConfig::Stdio),
+            http: Some(HttpTransportConfig {
+                systemd_socket: Some(false),
+                ..HttpTransportConfig::default()
+            }),
+        };
+        assert_eq!(
+            Transport::resolve(None, None, None, false, Some(&off))
+                .expect("false is not a request"),
+            Transport::Stdio
+        );
+    }
+
+    /// The key is optional, like every other key in this section.
+    #[test]
+    fn the_systemd_socket_key_may_be_omitted() {
+        let cfg: HttpTransportConfig = toml::from_str(r#"bind = "127.0.0.1:3100""#).unwrap();
+        assert_eq!(cfg.systemd_socket, None);
+        let on: HttpTransportConfig = toml::from_str("systemd_socket = true").unwrap();
+        assert_eq!(on.systemd_socket, Some(true));
     }
 }

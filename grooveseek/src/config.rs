@@ -751,6 +751,18 @@ impl Config {
                      (using the built-in default)"
                 );
             }
+            // (計画 4 段 A) Same shape as `max_sessions` above, heavier in its
+            // consequence. Honouring a planted `systemd_socket = true` does
+            // not degrade the server, it stops it: with no LISTEN_FDS in the
+            // environment `serve` refuses to start, so a file left in a
+            // working directory would be enough to keep the daemon down.
+            // Dropping it restores the built-in default, which is a TCP bind.
+            if http.systemd_socket.take().is_some() {
+                tracing::warn!(
+                    config = %shown.display(),
+                    "ignoring [transport.http].systemd_socket from a config found in an untrusted location; pass --config to accept it"
+                );
+            }
         }
 
         // R3: 何を索引して LLM クライアントに渡すか。**唯一の致命的規則**。
@@ -2571,7 +2583,7 @@ lambda = 0.5
             .unwrap_or_else(|e| panic!("groove.toml.example must parse exactly as shipped: {e}"));
 
         let transport =
-            crate::transport::Transport::resolve(None, None, None, cfg.transport.as_ref())
+            crate::transport::Transport::resolve(None, None, None, false, cfg.transport.as_ref())
                 .expect("the shipped example must resolve to a transport");
         assert!(
             matches!(transport, crate::transport::Transport::Stdio),
@@ -4721,9 +4733,14 @@ lambda = 0.5
         );
 
         // And the value that actually reaches the runtime is the default, not 1.
-        let resolved =
-            crate::transport::Transport::resolve(None, None, None, d.config.transport.as_ref())
-                .expect("resolve ok");
+        let resolved = crate::transport::Transport::resolve(
+            None,
+            None,
+            None,
+            false,
+            d.config.transport.as_ref(),
+        )
+        .expect("resolve ok");
         match resolved {
             crate::transport::Transport::Http { max_sessions, .. } => assert_eq!(
                 max_sessions,
@@ -4766,9 +4783,14 @@ lambda = 0.5
 
         // What reaches the runtime is `None`, which `run_http` turns into the
         // loopback default -- not the planted origin.
-        let resolved =
-            crate::transport::Transport::resolve(None, None, None, d.config.transport.as_ref())
-                .expect("resolve ok");
+        let resolved = crate::transport::Transport::resolve(
+            None,
+            None,
+            None,
+            false,
+            d.config.transport.as_ref(),
+        )
+        .expect("resolve ok");
         match resolved {
             crate::transport::Transport::Http {
                 allowed_origins, ..
@@ -4801,6 +4823,97 @@ lambda = 0.5
         assert!(
             http.allowed_origins.is_none(),
             "an empty planted list disables validation, so it must be dropped too"
+        );
+    }
+
+    /// (試験 A-14 / 計画 4 段 A) A planted `systemd_socket = true` is dropped,
+    /// like `allowed_hosts` and `max_sessions` beside it.
+    ///
+    /// The reason is the one `max_sessions` already carries, only heavier.
+    /// Honouring a value nobody in this deployment wrote lets a file left in a
+    /// working directory decide how the daemon listens -- and here the effect
+    /// is not a degraded server but no server at all: with no `LISTEN_FDS` in
+    /// the environment, `serve` refuses to start. Dropping it restores the
+    /// built-in default, which is a TCP bind, and that does not weaken the
+    /// invariant: a socket is taken only when the operator said so with
+    /// `--config` or on the command line.
+    #[test]
+    fn an_untrusted_config_cannot_make_the_daemon_wait_for_a_socket() {
+        let dir = TempDir::new("groove-untrusted-systemd-socket");
+        let planted = format!("{}systemd_socket = true\n", planted_toml("kb"));
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+
+        let http = d
+            .config
+            .transport
+            .as_ref()
+            .and_then(|t| t.http.as_ref())
+            .expect("[transport.http] survives");
+        assert!(
+            http.systemd_socket.is_none(),
+            "a planted systemd_socket must not be honoured"
+        );
+
+        let resolved = crate::transport::Transport::resolve(
+            None,
+            None,
+            None,
+            false,
+            d.config.transport.as_ref(),
+        )
+        .expect("resolve ok");
+        match resolved {
+            crate::transport::Transport::Http { listen, .. } => assert!(
+                matches!(listen, crate::transport::HttpListen::Tcp(_)),
+                "dropping the key restores the built-in TCP bind"
+            ),
+            other => panic!("expected an HTTP transport, got {other:?}"),
+        }
+    }
+
+    /// The other side of the same drop: a planted `systemd_socket` cannot make
+    /// [`crate::transport::Transport::resolve`] refuse a stdio start either.
+    ///
+    /// The refusal it would otherwise hit is the one that stops a *trusted*
+    /// file asking for a socket and for stdio at once. That check reads the
+    /// value the config carries, so what pins it against the drop is the order:
+    /// the key is taken out while the config is loaded, and the resolver sees
+    /// what is left. Written as its own test because getting that order wrong
+    /// turns a file anybody can leave in a working directory into a way to stop
+    /// `groove serve` from starting at all.
+    #[test]
+    fn a_planted_systemd_socket_cannot_refuse_a_stdio_start() {
+        let dir = TempDir::new("groove-untrusted-systemd-socket-stdio");
+        let planted = "kb_path = \"kb\"\n[transport]\nkind = \"stdio\"\n[transport.http]\nsystemd_socket = true\n";
+        std::fs::write(dir.path().join("groove.toml"), planted).unwrap();
+        let roots = roots_for(None, None);
+
+        let d = Config::discover_in(None, dir.path(), None, &roots).expect("discover ok");
+        assert_eq!(d.trust, ConfigTrust::Untrusted);
+        assert!(
+            d.config
+                .transport
+                .as_ref()
+                .and_then(|t| t.http.as_ref())
+                .and_then(|h| h.systemd_socket)
+                .is_none(),
+            "a planted systemd_socket must not survive the load"
+        );
+
+        assert_eq!(
+            crate::transport::Transport::resolve(
+                None,
+                None,
+                None,
+                false,
+                d.config.transport.as_ref(),
+            )
+            .expect("a dropped key cannot refuse the start it was never allowed to ask for"),
+            crate::transport::Transport::Stdio
         );
     }
 

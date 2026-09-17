@@ -186,6 +186,17 @@ enum Commands {
         /// refused, matching `groove service install`.
         #[arg(long = "i-know", default_value_t = false)]
         i_know_non_loopback: bool,
+        /// Take the listening socket from the service manager instead of
+        /// binding one. Linux only: it needs a service manager that passes
+        /// LISTEN_FDS, such as systemd, and builds for other operating
+        /// systems refuse the flag. The socket unit owns the address, so this
+        /// cannot be combined with --bind or --port.
+        #[arg(
+            long = "systemd-socket",
+            default_value_t = false,
+            conflicts_with_all = ["bind", "port"]
+        )]
+        systemd_socket: bool,
     },
     /// Build or rebuild the search index
     Index {
@@ -784,6 +795,7 @@ fn main() -> anyhow::Result<()> {
             bind,
             port,
             i_know_non_loopback,
+            systemd_socket,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
             let model = model.or(cfg.model).unwrap_or_default();
@@ -819,6 +831,7 @@ fn main() -> anyhow::Result<()> {
                 cli_transport,
                 bind,
                 port,
+                systemd_socket,
                 cfg.transport.as_ref(),
             )?;
             // (BU-01) `--bind <non-loopback>` は `--i-know` で追認させる。
@@ -864,6 +877,17 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!(
                     "--bind / --port require `--transport http` (or `[transport].kind = \"http\"` in groove.toml); \
                      currently resolved to stdio which does not listen on any port."
+                );
+            }
+            // The same footgun as `--bind` next door: a flag that decides
+            // how to listen means nothing on a transport that listens on
+            // nothing, and ignoring it silently leaves the operator
+            // believing a socket unit is in play.
+            if matches!(resolved_transport, grooveseek::transport::Transport::Stdio)
+                && systemd_socket
+            {
+                anyhow::bail!(
+                    "--systemd-socket requires `--transport http` (or `[transport].kind = \"http\"` in groove.toml); currently resolved to stdio, which listens on no socket."
                 );
             }
 
@@ -3369,6 +3393,43 @@ mod tests {
         assert_eq!(o.mmr_lambda, Some(0.7));
         assert_eq!(o.mmr_same_doc_penalty, Some(0.1));
         assert_eq!(o.parent_retriever, Some(false));
+    }
+
+    /// (試験 A-1) `--systemd-socket` and `--bind` name two different
+    /// listeners, and clap refuses the pair with both spellings in the
+    /// message, so the operator is told which two flags disagreed.
+    ///
+    /// [`grooveseek::transport::Transport::resolve`] refuses the same pair, in
+    /// `resolve_systemd_listen` -- private to [`grooveseek::transport`], so
+    /// only the module is linked here. Two checks for one input is deliberate:
+    /// clap's is what the operator sees, and the resolver's is what holds if
+    /// the attribute is dropped.
+    #[test]
+    fn systemd_socket_conflicts_with_bind_and_port_on_the_command_line() {
+        for (flag, value) in [("--bind", "127.0.0.1:3100"), ("--port", "3100")] {
+            // `Cli` has no `Debug`, so `expect_err` will not compile here; the
+            // match is the shape this module already uses for the same reason.
+            let err = match Cli::try_parse_from([
+                "groove",
+                "serve",
+                "--transport",
+                "http",
+                "--systemd-socket",
+                flag,
+                value,
+            ]) {
+                Ok(_) => panic!("two listeners is not a command line"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--systemd-socket"),
+                "must name the flag: {msg}"
+            );
+            assert!(msg.contains(flag), "must name {flag}: {msg}");
+        }
+        Cli::try_parse_from(["groove", "serve", "--transport", "http", "--systemd-socket"])
+            .expect("the flag on its own is the supported form");
     }
 
     #[test]

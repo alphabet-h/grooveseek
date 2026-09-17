@@ -272,7 +272,7 @@ about `/mcp`.
 | Route | Peer must be loopback | `Host` | `Origin` | Can configuration open it? |
 |---|---|---|---|---|
 | stdio | — (no socket) | — | — | No — it is a child process |
-| `/ui`, `/api/admin/status` | **Yes** | `allowed_admin_hosts`: loopback aliases plus the bind address when that is loopback. No config key | shared `allowed_origins` | **No.** The peer check is not configurable at all |
+| `/ui`, `/api/admin/status` | **Yes** (TCP listener) | `allowed_admin_hosts`: loopback aliases plus the bind address when that is loopback. No config key | shared `allowed_origins` | **No.** The peer check is not configurable at all |
 | `/mcp` | No | `effective_allowed_hosts`, default as above; replaceable via `[transport.http].allowed_hosts` (config only, no CLI flag) | `effective_allowed_origins`, default the loopback origins of the bound port; replaceable via `allowed_origins` | **Yes** — see below |
 | `/healthz` | No | mounted with no gate at all by default; the `/mcp` list only when `healthz_public = false` | never validated | `healthz_public` only |
 
@@ -290,11 +290,56 @@ to the loopback origins of the port actually bound. A request carrying no
 `Origin` header still passes, per RFC 6454, so ordinary MCP clients and `curl`
 are unaffected. Setting the key *replaces* the default rather than extending it.
 
+**A listener that has no address.** With `[transport.http].systemd_socket` (or
+`--systemd-socket`) — Linux only, and refused outright by a build for any other
+operating system — the socket comes from a systemd `.socket` unit, and when
+that unit names a filesystem path there is no address and no port. The peer
+column then reads differently: `ConnectInfo<SocketAddr>` does not exist for a
+Unix listener, so the admin routes take `PeerRule::UnixLocal` and let the
+connection through — not because the peer is unknown, but because reaching the
+socket at all required the file permissions the unit set, which the kernel
+checked before the first byte. The `Host` default is the loopback aliases with
+no bound address to add, and the `Origin` default is their port-less spelling:
+an allow-list entry with no port matches every port on that host, so an `Origin`
+naming `localhost`, `127.0.0.1` or `[::1]` passes whatever port it carries, and
+any other `Origin` is refused.
+
+**A TCP socket passed by a unit is not this case** — it has an address, so the
+table above applies to it, with one exception: the admin `Host` row.
+`allowed_admin_hosts` is built from the resolved listener, and only an address
+this process bound itself is added to it, so a descriptor's address is not. The
+`/mcp` and `/healthz` lists do add it. The difference is visible only when the
+unit names a loopback address other than `127.0.0.1` — with
+`ListenStream=127.0.0.2:3100`, `Host: 127.0.0.2:3100` passes on `/mcp` and is
+refused on `/ui` — and **no configuration widens the admin list**;
+`allowed_hosts` feeds `/mcp` and `/healthz` only. Reach `/ui` through one of
+the loopback aliases, or have the unit listen on `127.0.0.1`.
+
+**Those file permissions are a setting you have to write.** The unit decides
+them through `SocketMode=`, with `SocketUser=` and `SocketGroup=` naming the
+owner, and `systemd.socket(5)` gives `SocketMode=` a default of `0666` — a
+socket every account on the host can open, which is the reachability a loopback
+TCP port already had. A unit carrying only `ListenStream=` therefore gains no
+separation, while the admin routes stop asking about the peer. GrooveSeek does
+not read the mode, does not report it, and cannot warn that it is wrong: the
+listener it was handed is the one it serves. The one shape it does refuse is an
+abstract socket — a `ListenStream=` whose name starts with `@` — which has no
+file for `SocketMode=` to apply to, so startup fails rather than serving the
+admin routes to every account on the host.
+
+One consequence for whatever forwards to that socket: the `Host` list is the
+loopback aliases, so a gateway that passes the browser's original `Host`
+through gets a `403` from `/mcp`, and no warning says so. Send a loopback
+`Host`, or name the public one in `allowed_hosts`. This is not new to Unix
+sockets — a proxy in front of a loopback TCP bind behaves the same way. See
+[ADR-0021](decisions/0021-take-the-socket-you-were-given.md).
+
 ### What this adds up to
 
 **The one route you can expose is the one that does not authenticate anyone.**
 
-`/ui` and `/api/admin/status` are closed by the peer check, which a caller cannot
+`/ui` and `/api/admin/status` are closed, on a TCP listener, by the peer check,
+which a caller cannot
 forge — **but a reverse proxy forges it for them, by being the peer.** A proxy on
 the same host is itself a loopback caller, and its default `Host` is on the
 admin allow-list, so mapping `/ui` through it hands the page to anyone who can
@@ -392,3 +437,4 @@ the database side alone.
 - [ADR-0008](decisions/0008-declare-what-1-0-freezes.md) — what 1.0.0 freezes
 - [ADR-0009](decisions/0009-one-dns-rebinding-gate.md) — one DNS-rebinding gate
 - [ADR-0010](decisions/0010-settle-what-the-1-0-command-line-freezes.md) — the three questions ADR-0008 left open
+- [ADR-0021](decisions/0021-take-the-socket-you-were-given.md) — taking the listening socket from a service manager

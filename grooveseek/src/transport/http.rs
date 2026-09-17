@@ -390,6 +390,43 @@ pub(crate) fn client_host_forms(ip: std::net::IpAddr) -> Vec<String> {
     }
 }
 
+/// The Host allow-list for a listener with no address of its own -- the socket
+/// systemd hands over when it is a Unix socket.
+///
+/// Same two rules as [`effective_allowed_hosts`]: an explicit list passes
+/// through untouched, and the default is the shared alias set. What it cannot
+/// do is add the bound address, because there is not one.
+pub(crate) fn effective_allowed_hosts_unix(configured: Option<Vec<String>>) -> Vec<String> {
+    configured.unwrap_or_else(|| {
+        DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .map(|h| (*h).to_string())
+            .collect()
+    })
+}
+
+/// The Origin allow-list for a listener with no port.
+///
+/// Built from [`DEFAULT_LOOPBACK_HOSTS`] rather than from
+/// [`default_allowed_origins`], which needs a port and adds the port-bearing
+/// spelling alongside the bare one at port 80. There is no port to name here,
+/// and naming none is not a narrowing: [`NormalizedAuthority::matches`] keeps
+/// rmcp's rule that an entry with no port matches *every* port on that host,
+/// which [`origin_matches_any_port`] documents and the startup warning says
+/// out loud. So this list admits the loopback spellings whatever port a
+/// caller writes, and refuses every other origin -- moot for a browser, which
+/// cannot open an `AF_UNIX` socket at all, and exactly what a gateway
+/// forwarding a browser's `Origin` needs. The list is deliberately not empty:
+/// empty is how "do not validate Origin at all" is spelled.
+pub(crate) fn effective_allowed_origins_unix(configured: Option<Vec<String>>) -> Vec<String> {
+    configured.unwrap_or_else(|| {
+        DEFAULT_LOOPBACK_HOSTS
+            .iter()
+            .map(|h| format!("http://{h}"))
+            .collect()
+    })
+}
+
 /// 設定値と **実際に bind したアドレス** から、有効な `Host` allow-list を決める。
 ///
 /// [`effective_allowed_origins`] と同じ形、同じ理由。**round 2 では「`allowed_hosts`
@@ -412,10 +449,7 @@ pub(crate) fn effective_allowed_hosts(
     if let Some(list) = configured {
         return list;
     }
-    let mut hosts: Vec<String> = DEFAULT_LOOPBACK_HOSTS
-        .iter()
-        .map(|h| h.to_string())
-        .collect();
+    let mut hosts = effective_allowed_hosts_unix(None);
     if is_loopback_peer(bound.ip()) {
         // port 付きにしないのは、allow-list 側が bare host なら **どの port でも**
         // 一致するため (`validate_host_header` の比較 semantics)。
@@ -816,9 +850,129 @@ fn forbidden_plain(msg: &str) -> Response {
         .expect("static response build")
 }
 
+/// The two things this server can accept on.
+enum ServeListener {
+    Tcp(tokio::net::TcpListener),
+    /// Only a passed descriptor ever becomes this, and only the systemd_fd
+    /// module produces one, so the variant is gated on the same
+    /// `target_os = "linux"` that module is. Widening it to `unix` would leave
+    /// a variant nothing can construct on macOS, and `-D warnings` reads that
+    /// as dead code.
+    #[cfg(target_os = "linux")]
+    Unix(tokio::net::UnixListener),
+}
+
+impl ServeListener {
+    /// What the startup line says it is listening on.
+    fn describe(&self) -> String {
+        match self {
+            Self::Tcp(l) => l
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "an address the OS will not report".to_string()),
+            #[cfg(target_os = "linux")]
+            Self::Unix(l) => l
+                .local_addr()
+                .ok()
+                .and_then(|a| a.as_pathname().map(|p| p.display().to_string()))
+                .unwrap_or_else(|| "an unnamed socket".to_string()),
+        }
+    }
+}
+
+/// The bind warning. One implementation, two callers: an address groove bound
+/// and a TCP descriptor a service manager bound. The address is the only
+/// access control either way, so the reasoning does not change with who called
+/// `bind(2)`.
+fn warn_if_non_loopback(addr: &SocketAddr, allowed_hosts: Option<&[String]>) {
+    if should_warn_non_loopback_bind(addr, allowed_hosts) {
+        tracing::warn!(
+            bind = %addr,
+            "{} groove has no authentication, and Host header validation is not a substitute for it (any peer can send `Host: localhost`), so the bind address is the only access control. Restrict reachability at the network layer.",
+            non_loopback_bind_symptom(allowed_hosts),
+        );
+    }
+}
+
+/// Ctrl-C, shared by both listener branches so the message cannot drift.
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    eprintln!("groove: shutdown signal received");
+}
+
+/// Where this server gets something to accept on, and the address it is bound
+/// to if it has one.
+///
+/// `None` for the address is how "this is a Unix socket" is said here. Four
+/// decisions read it -- the peer rule, the Host default, the Origin default
+/// and the startup line -- and reading one value keeps them from disagreeing
+/// in the case that is easy to miss: a service manager passing a *TCP*
+/// descriptor, which each of the four has to treat as a bind of our own.
+async fn open_listener(
+    listen: crate::transport::HttpListen,
+    allowed_hosts: Option<&[String]>,
+) -> Result<(ServeListener, Option<SocketAddr>)> {
+    match listen {
+        crate::transport::HttpListen::Tcp(addr) => {
+            warn_if_non_loopback(&addr, allowed_hosts);
+            // (codex P1 round 1 on PR #173) Bind before deriving the default:
+            // `--bind 127.0.0.1:0` asks the OS to choose the port.
+            let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+                format!(
+                    "failed to bind {addr}: is another groove instance running, or the port occupied?"
+                )
+            })?;
+            let bound = listener.local_addr().unwrap_or(addr);
+            Ok((ServeListener::Tcp(listener), Some(bound)))
+        }
+        #[cfg(target_os = "linux")]
+        crate::transport::HttpListen::Systemd => {
+            match crate::transport::systemd_fd::take_listener()? {
+                // `O_NONBLOCK` is not set again here. `systemd_fd::prepare_fd`
+                // sets it on the descriptor before `adopt` builds either
+                // listener, and test A-11 is what pins that. A second
+                // `set_nonblocking(true)` would be one question with two
+                // implementations (AGENTS.md), and the redundant one is the
+                // one a reader would trust.
+                crate::transport::systemd_fd::SystemdSocket::Tcp(std_listener) => {
+                    let bound = std_listener
+                        .local_addr()
+                        .context("reading the address of the socket systemd passed")?;
+                    warn_if_non_loopback(&bound, allowed_hosts);
+                    let listener = tokio::net::TcpListener::from_std(std_listener)
+                        .context("adopting the socket systemd passed")?;
+                    Ok((ServeListener::Tcp(listener), Some(bound)))
+                }
+                crate::transport::systemd_fd::SystemdSocket::Unix(std_listener) => {
+                    let listener = tokio::net::UnixListener::from_std(std_listener)
+                        .context("adopting the socket systemd passed")?;
+                    Ok((ServeListener::Unix(listener), None))
+                }
+            }
+        }
+        // The requirement sentence is `SYSTEMD_SOCKET_REQUIREMENT`, shared with
+        // `resolve_systemd_listen`'s build gate, because plan decision 7 says
+        // help, docs and refusals say one thing rather than three. Unreachable
+        // in practice: `Transport::resolve` refuses first -- which is why a
+        // copy of the sentence here could drift unread.
+        #[cfg(not(target_os = "linux"))]
+        crate::transport::HttpListen::Systemd => anyhow::bail!(
+            "--systemd-socket {} Transport::resolve refuses it on this build, so reaching here means that check was removed.",
+            crate::transport::SYSTEMD_SOCKET_REQUIREMENT
+        ),
+    }
+}
+
 /// Start an axum-based HTTP server that exposes the MCP service at `/mcp`.
 /// Blocks until SIGINT or a bind error. On bind failure, returns with a
 /// helpful context message.
+///
+/// `listen` says where the something to accept on comes from: an address this
+/// process binds ([`crate::transport::HttpListen::Tcp`]), or the descriptor a
+/// service manager already bound
+/// ([`crate::transport::HttpListen::Systemd`]). The second one can be a TCP
+/// socket or a Unix socket, and which it is is read off the descriptor at
+/// run time rather than declared here.
 ///
 /// `allowed_hosts`:
 /// - `None` → [`effective_allowed_hosts`] が [`DEFAULT_LOOPBACK_HOSTS`]
@@ -830,30 +984,26 @@ fn forbidden_plain(msg: &str) -> Response {
 ///   空 `Vec` を渡すと [`validate_host_header`] が **全 Host ヘッダを許可**
 ///   する (rmcp の `disable_allowed_hosts` 相当)。public 公開時は推奨されない。
 ///
-/// 加えて、bind が **非 loopback** (`0.0.0.0`、特定 LAN IP 等) の状態で
-/// `allowed_hosts` が `None` (= loopback only な default) のままなら、
-/// 起動時に `tracing::warn` を発してオペレータの注意を促す。loopback only
-/// の allow-list で外部 bind するのは「公開する気はあるが host 検証で
-/// reject される」というほぼ確実に意図しない構成なので。
+/// 加えて、**待ち受けアドレスがある**場合に限り、それが **非 loopback**
+/// (`0.0.0.0`、特定 LAN IP 等) で `allowed_hosts` が `None` (= loopback only な
+/// default) のままなら、起動時に `tracing::warn` を発してオペレータの注意を
+/// 促す。loopback only の allow-list で外部 bind するのは「公開する気はあるが
+/// host 検証で reject される」というほぼ確実に意図しない構成なので。
+///
+/// (計画 4 段 A) **アドレスを持たない listener ではこの警告は出ない** — 見る
+/// アドレスが無い。判定は [`open_listener`] の中にあり、そこだけが
+/// 「警告すべきアドレスがそもそも有るか」を知っている。
 pub async fn run_http(
-    addr: SocketAddr,
+    listen: crate::transport::HttpListen,
     allowed_hosts: Option<Vec<String>>,
     allowed_origins: Option<Vec<String>>,
     healthz_public: bool,
     max_sessions: u32,
     shared: KbServerShared,
 ) -> Result<()> {
-    // bind 範囲と allow-list の組合せが噛み合っていない時に warn を出す。
-    if should_warn_non_loopback_bind(&addr, allowed_hosts.as_deref()) {
-        tracing::warn!(
-            bind = %addr,
-            "{} groove has no authentication, and Host header validation is not a \
-             substitute for it (any peer can send `Host: localhost`), so the bind \
-             address is the only access control. Restrict reachability at the \
-             network layer.",
-            non_loopback_bind_symptom(allowed_hosts.as_deref()),
-        );
-    }
+    // Opening the listener is also where the bind warning is emitted, because
+    // only here is it known whether there is an address to warn about.
+    let (listener, bound) = open_listener(listen, allowed_hosts.as_deref()).await?;
 
     // Session manager: LocalSessionManager keeps per-session state in memory.
     // Suitable for a single-process server (our deployment model).
@@ -882,60 +1032,6 @@ pub async fn run_http(
     // per RFC 6454 and rmcp, a request that carries no `Origin` header still
     // passes. MCP clients, the tray and curl send none. What it stops is a web
     // page in the operator's own browser reaching this port cross-origin.
-    // (codex P1 round 1 on PR #173) Bind before deriving the default. The port
-    // that matters is the one the OS actually assigned: `--bind 127.0.0.1:0`
-    // asks it to choose, so a default built from `addr` would allow `:0` — an
-    // origin no browser can ever send — and answer 403 to the real one.
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
-        format!(
-            "failed to bind {addr}: is another groove instance running, or the \
-                 port occupied?"
-        )
-    })?;
-    let bound = listener.local_addr().unwrap_or(addr);
-
-    let origins = effective_allowed_origins(allowed_origins.clone(), bound);
-    if origins.is_empty() {
-        tracing::warn!(
-            "[transport.http].allowed_origins is empty, which disables Origin \
-             validation. The MCP specification requires servers to validate it \
-             to prevent DNS rebinding, so any web page loaded in a browser on \
-             this machine can now reach /mcp cross-origin. Remove the key to \
-             restore the loopback-only default."
-        );
-    } else if allowed_origins.is_some() && !origins.iter().any(|o| names_a_loopback_host(o)) {
-        // (Phase 4 PR-2) `/ui` searches through `/mcp` now, so it is subject to
-        // this list for the first time. An operator who replaced the default
-        // with only their public origin will find `/ui` answering 403 to its own
-        // requests, with nothing on screen to say why -- the page is served, and
-        // only the search fails. Say it here, where the cause is still visible.
-        // Same scope as the `allowed_hosts` warning below: no loopback entry at
-        // all. A list holding one loopback origin but not the scheme, name or
-        // port this page is opened with is refused without a word here.
-        tracing::warn!(
-            "[transport.http].allowed_origins names no loopback origin, so /ui \
-             opened on this machine cannot search: its requests to /mcp will be \
-             refused. Add the exact origins you browse with \
-             (http://127.0.0.1:{port}, http://localhost:{port}) alongside the \
-             public one. Setting the key replaces the default list rather than \
-             extending it, so an entry for one origin does not cover another.",
-            port = bound.port(),
-        );
-    } else if should_warn_wide_default(allowed_origins.as_deref(), &origins) {
-        // Today this is port 80 and only port 80, where `origins_for_host` adds
-        // the port-less spelling RFC 6454 requires. The condition asks about the
-        // list rather than the port so that it keeps describing the list if that
-        // function ever changes.
-        tracing::warn!(
-            "bound to port {port}, where the default Origin allow-list has to \
-             include the port-less spelling a browser sends (RFC 6454 omits the \
-             default port). An allow-list entry with no port matches EVERY port \
-             on that host, so a page served from any other local port can now \
-             reach /mcp cross-origin. Name the origins you actually browse with \
-             in [transport.http].allowed_origins to close this.",
-            port = bound.port(),
-        );
-    }
     // (codex P1 round 8 on PR #173) The `None` branch used to leave rmcp's own
     // default in place, which made `/mcp`'s Host check the one list not fed by
     // `DEFAULT_LOOPBACK_HOSTS` — so the next alias added to that constant would
@@ -946,14 +1042,80 @@ pub async fn run_http(
     // definition, and a change to rmcp's default can no longer move one of our
     // four lists without the others.
     //
-    // `should_warn_non_loopback_bind` above still reads the operator's
+    // `should_warn_non_loopback_bind` still reads the operator's
     // `allowed_hosts`, not this: the warning is about whether they said
-    // anything, and that question is unchanged.
+    // anything, and that question is unchanged. It now runs inside
+    // `open_listener`, which is the only place that knows whether there is an
+    // address to warn about at all.
     //
     // (codex P2 round 9 on PR #173) One effective Host list, shared by `/mcp`
     // and `/healthz`, and it includes the bound loopback address for the same
     // reason the Origin list does.
-    let effective_hosts = effective_allowed_hosts(allowed_hosts.clone(), bound);
+    //
+    // (計画 4 段 A) One `bound` decides both defaults. A listener with no
+    // address gets the port-less pair; a TCP descriptor a service manager
+    // bound is treated exactly like a bind of our own, because it is one.
+    let (origins, effective_hosts) = match bound {
+        Some(b) => (
+            effective_allowed_origins(allowed_origins.clone(), b),
+            effective_allowed_hosts(allowed_hosts.clone(), b),
+        ),
+        None => (
+            effective_allowed_origins_unix(allowed_origins.clone()),
+            effective_allowed_hosts_unix(allowed_hosts.clone()),
+        ),
+    };
+    if origins.is_empty() {
+        tracing::warn!(
+            "[transport.http].allowed_origins is empty, which disables Origin \
+             validation. The MCP specification requires servers to validate it \
+             to prevent DNS rebinding, so any web page loaded in a browser on \
+             this machine can now reach /mcp cross-origin. Remove the key to \
+             restore the loopback-only default."
+        );
+    } else if let Some(b) = bound {
+        if allowed_origins.is_some() && !origins.iter().any(|o| names_a_loopback_host(o)) {
+            // (Phase 4 PR-2) `/ui` searches through `/mcp` now, so it is subject to
+            // this list for the first time. An operator who replaced the default
+            // with only their public origin will find `/ui` answering 403 to its own
+            // requests, with nothing on screen to say why -- the page is served, and
+            // only the search fails. Say it here, where the cause is still visible.
+            // Same scope as the `allowed_hosts` warning below: no loopback entry at
+            // all. A list holding one loopback origin but not the scheme, name or
+            // port this page is opened with is refused without a word here.
+            tracing::warn!(
+                "[transport.http].allowed_origins names no loopback origin, so /ui \
+                 opened on this machine cannot search: its requests to /mcp will be \
+                 refused. Add the exact origins you browse with \
+                 (http://127.0.0.1:{port}, http://localhost:{port}) alongside the \
+                 public one. Setting the key replaces the default list rather than \
+                 extending it, so an entry for one origin does not cover another.",
+                port = b.port(),
+            );
+        } else if should_warn_wide_default(allowed_origins.as_deref(), &origins) {
+            // Today this is port 80 and only port 80, where `origins_for_host` adds
+            // the port-less spelling RFC 6454 requires. The condition asks about the
+            // list rather than the port so that it keeps describing the list if that
+            // function ever changes.
+            tracing::warn!(
+                "bound to port {port}, where the default Origin allow-list has to \
+                 include the port-less spelling a browser sends (RFC 6454 omits the \
+                 default port). An allow-list entry with no port matches EVERY port \
+                 on that host, so a page served from any other local port can now \
+                 reach /mcp cross-origin. Name the origins you actually browse with \
+                 in [transport.http].allowed_origins to close this.",
+                port = b.port(),
+            );
+        }
+    } else {
+        // (計画 4 段 A) `should_warn_wide_default` has no meaning without a
+        // port: it reports that the list ignores the port this server bound,
+        // and there is none to ignore. The same fact still has to be said, so
+        // it is said as information rather than as a warning.
+        tracing::info!(
+            "listening on the socket systemd passed, which has no port, so the default Origin allow-list is the port-less loopback spelling. An allow-list entry with no port matches every port on that host, so an Origin naming localhost, 127.0.0.1 or [::1] passes whatever port it carries, and any other Origin is refused with 403. Set [transport.http].allowed_origins to change this."
+        );
+    }
     // (codex P2 round 1 on PR #174) The symmetric warning, and the one that is
     // easier to hit: the documented LAN recipe is to set `allowed_hosts` to the
     // public name. `/ui` still opens through localhost, because the admin router
@@ -1021,7 +1183,7 @@ pub async fn run_http(
         .layer(middleware::from_fn_with_state(
             DnsRebindingGate {
                 surface: "/mcp",
-                peer_must_be_loopback: false,
+                peer: PeerRule::Any,
                 hosts: Arc::clone(&shared_hosts),
                 origins: Arc::clone(&shared_origins),
                 refusals: Arc::new(RefusalLog::new()),
@@ -1048,7 +1210,7 @@ pub async fn run_http(
             .layer(middleware::from_fn_with_state(
                 DnsRebindingGate {
                     surface: "/healthz",
-                    peer_must_be_loopback: false,
+                    peer: PeerRule::Any,
                     hosts: Arc::clone(&shared_hosts),
                     origins: Arc::new(Vec::new()),
                     refusals: Arc::new(RefusalLog::new()),
@@ -1083,7 +1245,7 @@ pub async fn run_http(
         .layer(middleware::from_fn_with_state(
             DnsRebindingGate {
                 surface: "/ui and /api/admin",
-                peer_must_be_loopback: true,
+                peer: admin_peer_rule(bound),
                 hosts: Arc::new(Some(factory_shared.allowed_admin_hosts.clone())),
                 origins: Arc::clone(&shared_origins),
                 refusals: Arc::new(RefusalLog::new()),
@@ -1101,23 +1263,32 @@ pub async fn run_http(
 
     eprintln!(
         "groove server ready (http transport, listening on {})",
-        listener.local_addr().unwrap_or(addr)
+        listener.describe()
     );
 
-    // codex P1 round 6 on PR #57: `into_make_service_with_connect_info::<SocketAddr>()`
-    // populates the `ConnectInfo<SocketAddr>` request extension so the
-    // admin Host check can verify peer.is_loopback() (= remote attackers
-    // cannot bypass via spoofed Host: 127.0.0.1).
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-        eprintln!("groove: shutdown signal received");
-    })
-    .await
-    .context("axum::serve failed")?;
+    match listener {
+        ServeListener::Tcp(l) => axum::serve(
+            l,
+            // codex P1 round 6 on PR #57: `ConnectInfo<SocketAddr>` is what
+            // the admin peer check reads.
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("axum::serve failed")?,
+        #[cfg(target_os = "linux")]
+        ServeListener::Unix(l) => axum::serve(
+            l,
+            // No `ConnectInfo<SocketAddr>`: `SocketAddr` does not implement
+            // `Connected` for a `UnixListener`, which is why the admin rule
+            // for this listener is `PeerRule::UnixLocal` rather than a check
+            // that silently finds nothing.
+            app.into_make_service(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("axum::serve failed")?,
+    }
     Ok(())
 }
 
@@ -1519,6 +1690,41 @@ impl Refusal {
     }
 }
 
+/// Which peer rule one route group applies.
+///
+/// It replaces a `bool`, and the reason is a silent failure the `bool` could
+/// not avoid. A `UnixListener` carries no `ConnectInfo<SocketAddr>` --
+/// `SocketAddr` does not implement `Connected` for it -- so on a Unix socket
+/// `peer_must_be_loopback: true` read as "on" while the `&&` chain broke at
+/// the missing extension, and every connection went through. The value now
+/// comes from the listener, in [`admin_peer_rule`], so the Unix case cannot
+/// pick the TCP rule at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerRule {
+    /// `/mcp` and `/healthz`: the peer is not part of the question.
+    Any,
+    /// Admin routes on a TCP listener. Unchanged from the old `true`,
+    /// including the case where no `ConnectInfo` is present: a request a test
+    /// built by hand still passes.
+    LoopbackTcp,
+    /// Admin routes on a Unix socket. A connection over `AF_UNIX` is local by
+    /// construction, and this is **not** "we cannot tell who it is" --
+    /// `UnixStream::peer_cred()` would tell us. Reachability belongs to the
+    /// socket's owner and mode, which the kernel enforced before the first
+    /// byte arrived, so the uid is not checked again here.
+    UnixLocal,
+}
+
+/// The rule the admin routes get, from the address the listener is bound to.
+///
+/// `None` is the Unix socket: it has no address at all.
+pub(crate) fn admin_peer_rule(bound: Option<SocketAddr>) -> PeerRule {
+    match bound {
+        Some(_) => PeerRule::LoopbackTcp,
+        None => PeerRule::UnixLocal,
+    }
+}
+
 /// What one route group compares an incoming request against.
 ///
 /// **The two list fields do not spell "off" the same way, and that is not an
@@ -1538,7 +1744,7 @@ struct DnsRebindingGate {
     /// Admin routes only. Host is caller-controlled, so on a `--bind 0.0.0.0`
     /// daemon a LAN peer can send `Host: 127.0.0.1`; the peer address cannot be
     /// spoofed that way (codex P1 round 6 on PR #57).
-    peer_must_be_loopback: bool,
+    peer: PeerRule,
     hosts: Arc<Option<Vec<String>>>,
     origins: Arc<Vec<String>>,
     /// One line a minute per surface, carrying the count it stands for. Without
@@ -1557,14 +1763,18 @@ impl DnsRebindingGate {
         // in front for the admin routes. Order is observable only when more
         // than one is wrong, and then only in which refusal is named; keeping
         // it uniform is what stops the surfaces from differing on that.
-        if self.peer_must_be_loopback
+        if self.peer == PeerRule::LoopbackTcp
             && let Some(axum::extract::ConnectInfo(peer)) =
                 req.extensions()
                     .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             && !is_loopback_peer(peer.ip())
         {
-            // The production listener always wraps with `connect_info`, so a
-            // missing extension means a test built the request by hand.
+            // The production TCP listener always wraps with `connect_info`, so
+            // a missing extension means a test built the request by hand. On a
+            // Unix listener there is no `ConnectInfo<SocketAddr>` to find at
+            // all, which is why that case gets `UnixLocal` and never reaches
+            // this branch -- the check would otherwise read as "on" and pass
+            // every connection.
             return Some(Refusal::NonLoopbackPeer(*peer));
         }
 
@@ -1932,7 +2142,7 @@ pub fn build_router_for_test(shared: Arc<KbServerShared>) -> axum::Router {
         .layer(middleware::from_fn_with_state(
             DnsRebindingGate {
                 surface: "/ui and /api/admin",
-                peer_must_be_loopback: true,
+                peer: PeerRule::LoopbackTcp,
                 hosts: Arc::new(Some(shared.allowed_admin_hosts.clone())),
                 // No bound port here, so no derived list — see the note above.
                 origins: Arc::new(Vec::new()),
@@ -2684,6 +2894,276 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // (計画 4 段 A) The admin peer rule is decided by the listener.
+    // -----------------------------------------------------------------------
+
+    /// (試験 A-7) The rule comes from the kind of listener, not from whether a
+    /// `ConnectInfo` extension happens to be on a request.
+    ///
+    /// This is the whole reason the field stopped being a `bool`. A
+    /// `UnixListener` cannot carry `ConnectInfo<SocketAddr>` -- `SocketAddr`
+    /// does not implement `Connected` for it -- so on a Unix socket the old
+    /// `peer_must_be_loopback: true` read as "on" while the `&&` chain broke
+    /// at the missing extension and let every request through.
+    /// **This is the only thing that pins the `peer` value.** No behavioural
+    /// test can: over a Unix listener [`DnsRebindingGate::decide`] skips its
+    /// peer block whichever
+    /// rule it holds, because `ConnectInfo<SocketAddr>` is never attached, so
+    /// `UnixLocal` and `LoopbackTcp` are observationally identical there.
+    /// Every input the function can be given is covered here, and the admin
+    /// surface never gets `Any` -- that value belongs to `/mcp` and
+    /// `/healthz`, which do not ask this function.
+    #[test]
+    fn the_admin_peer_rule_follows_the_listener() {
+        assert_eq!(
+            admin_peer_rule(Some("127.0.0.1:3100".parse().unwrap())),
+            PeerRule::LoopbackTcp
+        );
+        assert_eq!(
+            admin_peer_rule(Some("[::1]:3100".parse().unwrap())),
+            PeerRule::LoopbackTcp,
+            "the family of the address is not part of the question"
+        );
+        assert_eq!(
+            admin_peer_rule(Some("192.168.1.10:3100".parse().unwrap())),
+            PeerRule::LoopbackTcp,
+            "whether the address is loopback is decided per request, not here"
+        );
+        assert_eq!(admin_peer_rule(None), PeerRule::UnixLocal);
+        for bound in [
+            None,
+            Some("127.0.0.1:3100".parse().unwrap()),
+            Some("0.0.0.0:3100".parse().unwrap()),
+        ] {
+            assert_ne!(
+                admin_peer_rule(bound),
+                PeerRule::Any,
+                "the admin surface never stops looking at the peer for {bound:?}"
+            );
+        }
+    }
+
+    /// (試験 A-7、fail-closed でないこと) A Unix connection reaches the admin
+    /// routes. It is not "we cannot tell who this is" -- `peer_cred()` would
+    /// tell us -- it is that reachability is owned by the socket's owner and
+    /// mode, which the kernel enforced before the first byte arrived.
+    #[tokio::test]
+    async fn a_unix_listener_lets_the_admin_routes_answer() {
+        // No `use tower::ServiceExt` here: this module already has it further
+        // down, and a second import in the function is noise rather than
+        // isolation.
+        let gate = DnsRebindingGate {
+            surface: "test",
+            peer: PeerRule::UnixLocal,
+            hosts: Arc::new(Some(
+                DEFAULT_LOOPBACK_HOSTS
+                    .iter()
+                    .map(|h| (*h).to_string())
+                    .collect(),
+            )),
+            origins: Arc::new(Vec::new()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(gate, dns_rebinding_gate));
+        let req = Request::builder()
+            .uri("/probe")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    /// (試験 A-7、fail-open でないこと) The TCP rule is unchanged, including
+    /// the case it already covered: a peer that is not loopback is refused.
+    #[tokio::test]
+    async fn a_tcp_listener_still_refuses_a_non_loopback_peer() {
+        let gate = DnsRebindingGate {
+            surface: "test",
+            peer: PeerRule::LoopbackTcp,
+            hosts: Arc::new(Some(
+                DEFAULT_LOOPBACK_HOSTS
+                    .iter()
+                    .map(|h| (*h).to_string())
+                    .collect(),
+            )),
+            origins: Arc::new(Vec::new()),
+            refusals: Arc::new(RefusalLog::new()),
+        };
+        let mut req = Request::builder()
+            .uri("/probe")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let peer: std::net::SocketAddr = "192.168.1.10:51000".parse().unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(gate, dns_rebinding_gate));
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// The pair of lists [`run_http`] derives from a `bound` of `None`, behind
+    /// the peer rule [`admin_peer_rule`] picks for that same `None`.
+    ///
+    /// **Not a copy of any one production gate, and the name says "default"
+    /// rather than "admin" for that reason.** Over a Unix listener `/mcp`
+    /// gets these two lists with [`PeerRule::Any`], while the admin routes get
+    /// this peer rule but their own Host list --
+    /// `allowed_admin_hosts`, built in [`crate::server`] and handed
+    /// over where [`run_http`] composes the admin sub-router. What this
+    /// isolates is the pair, so the three tests below ask one construction.
+    fn unix_default_gate() -> DnsRebindingGate {
+        DnsRebindingGate {
+            surface: "test",
+            peer: admin_peer_rule(None),
+            hosts: Arc::new(Some(effective_allowed_hosts_unix(None))),
+            origins: Arc::new(effective_allowed_origins_unix(None)),
+            refusals: Arc::new(RefusalLog::new()),
+        }
+    }
+
+    /// One request through a gate, answered by a handler that only says "ok",
+    /// so the status is the gate's answer and nothing else.
+    async fn through(gate: DnsRebindingGate, headers: &[(&str, &str)]) -> StatusCode {
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(gate, dns_rebinding_gate));
+        let mut builder = Request::builder().uri("/probe");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        app.oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// (試験 A-8) `Host: localhost` / `127.0.0.1` / `[::1]` pass over a Unix
+    /// listener and `Host: evil.example` is refused with 403.
+    ///
+    /// The list's *contents* are pinned by the test below. This one asks the
+    /// question spec §7.1 actually asks -- what a request gets back -- because
+    /// a list that is right and a gate that never consults it look identical
+    /// from the list's side.
+    #[tokio::test]
+    async fn a_unix_listener_refuses_a_foreign_host_and_admits_the_loopback_aliases() {
+        for host in DEFAULT_LOOPBACK_HOSTS {
+            assert_eq!(
+                through(unix_default_gate(), &[("host", host)]).await,
+                StatusCode::OK,
+                "Host: {host} has to pass over a Unix listener"
+            );
+        }
+        assert_eq!(
+            through(unix_default_gate(), &[("host", "evil.example")]).await,
+            StatusCode::FORBIDDEN,
+            "Host validation still applies when the listener has no address"
+        );
+    }
+
+    /// (試験 A-9) The `Origin` default over a Unix listener admits the
+    /// loopback spellings whatever port they name, and refuses everything
+    /// else.
+    ///
+    /// **An allow-list entry with no port matches every port on that host.**
+    /// That is [`NormalizedAuthority::matches`]: `None` on the entry's port
+    /// short-circuits to `true`. It is wider than RFC 6454, which reads an
+    /// omitted port as the scheme's default, and [`origin_matches_any_port`]'s
+    /// own documentation, the startup warning and the configuration
+    /// documentation all say so in as many words. So a browser on
+    /// `http://localhost:3101` would
+    /// match -- moot, since a browser cannot open an `AF_UNIX` socket, but it
+    /// means the list is not doing its work by failing to match. What it does
+    /// is refuse a foreign origin, and a request with no `Origin` passes, so
+    /// the gate has neither become closed nor become open.
+    #[tokio::test]
+    async fn a_unix_listener_admits_a_loopback_origin_at_any_port_and_refuses_a_foreign_one() {
+        assert_eq!(
+            through(unix_default_gate(), &[("host", "localhost")]).await,
+            StatusCode::OK,
+            "a request with no Origin still passes (RFC 6454)"
+        );
+        assert_eq!(
+            through(
+                unix_default_gate(),
+                &[("host", "localhost"), ("origin", "http://localhost:3101")]
+            )
+            .await,
+            StatusCode::OK,
+            "the entry carries no port, and a port-less entry matches every port"
+        );
+        assert_eq!(
+            through(
+                unix_default_gate(),
+                &[("host", "localhost"), ("origin", "http://evil.example")]
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "a foreign origin is what this list exists to refuse"
+        );
+    }
+
+    /// (試験 A-8) The Host allow-list for a listener with no address: the
+    /// shared alias set and nothing else, because there is no bound address to
+    /// add.
+    #[test]
+    fn a_unix_listener_gets_the_loopback_aliases_and_no_more() {
+        let hosts = effective_allowed_hosts_unix(None);
+        assert_eq!(
+            hosts,
+            DEFAULT_LOOPBACK_HOSTS
+                .iter()
+                .map(|h| (*h).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(!hosts.iter().any(|h| h == "evil.example"));
+        let explicit = vec!["kb.example.lan".to_string()];
+        assert_eq!(
+            effective_allowed_hosts_unix(Some(explicit.clone())),
+            explicit,
+            "an explicit list passes through, as it does over TCP"
+        );
+    }
+
+    /// (試験 A-9) The contents of the Origin allow-list for a listener with
+    /// no port. What those contents *answer* is the test above; this one is
+    /// about the list itself.
+    ///
+    /// The entries carry no port because there is no port to name, and a
+    /// port-less entry matches every port on that host
+    /// ([`NormalizedAuthority::matches`]), so the spelling costs nothing here.
+    /// What the list must not be is empty, because an empty list is how "do
+    /// not validate Origin at all" is spelled -- and it must not carry an
+    /// entry [`check_origin_entry`] would refuse, because a dropped entry
+    /// leaves validation on with less to match.
+    #[test]
+    fn a_unix_listener_gets_a_port_less_origin_list_that_is_not_empty() {
+        let origins = effective_allowed_origins_unix(None);
+        assert!(!origins.is_empty(), "an empty list disables validation");
+        for entry in &origins {
+            assert!(
+                entry.starts_with("http://"),
+                "entries carry a scheme: {entry}"
+            );
+            assert!(
+                check_origin_entry(entry).is_ok(),
+                "an entry the matcher would drop must not be a default: {entry}"
+            );
+        }
+        assert!(origins.contains(&"http://localhost".to_string()));
+        assert!(
+            !origins.iter().any(|o| o.contains(":3101")),
+            "there is no port to name: {origins:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // F-64: /healthz Host check middleware (healthz_public opt-in).
     // -----------------------------------------------------------------------
 
@@ -2702,7 +3182,7 @@ mod tests {
                 .layer(middleware::from_fn_with_state(
                     DnsRebindingGate {
                         surface: "/healthz",
-                        peer_must_be_loopback: false,
+                        peer: PeerRule::Any,
                         hosts: Arc::new(allowed_hosts),
                         origins: Arc::new(Vec::new()),
                         refusals: Arc::new(RefusalLog::new()),
@@ -3982,7 +4462,7 @@ mod tests {
             let refusals = Arc::new(RefusalLog::new());
             let gate = DnsRebindingGate {
                 surface: "test",
-                peer_must_be_loopback: false,
+                peer: PeerRule::Any,
                 hosts: Arc::new(Some(
                     DEFAULT_LOOPBACK_HOSTS
                         .iter()

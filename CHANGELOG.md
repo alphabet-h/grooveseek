@@ -16,6 +16,33 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **`groove serve` can take the listening socket from systemd (Linux).**
+  `--systemd-socket`, or `[transport.http].systemd_socket = true`, makes
+  `serve` accept on the descriptor a `.socket` unit already bound instead of
+  binding an address of its own; the unit decides the path or address, its
+  owner and its mode, so reachability becomes a file permission the kernel
+  checks — one the unit has to set, since `SocketMode=` defaults to `0666` and
+  groove does not read it. It is an explicit opt-in — groove does not look at
+  `LISTEN_FDS`
+  unless told to — and it never falls back to TCP: a `LISTEN_PID` that names
+  another process, a `LISTEN_FDS` that is not exactly one, a descriptor
+  that is not a listening stream socket, or an abstract socket — a
+  `ListenStream=` whose name starts with `@`, which has no file for
+  `SocketMode=` to apply to — all stop startup, as does asking for it while
+  the transport resolves to stdio, which accepts no socket (an explicit
+  `--transport stdio` still runs such a config on stdio for that session).
+  It is exclusive
+  with `--bind` / `--port` / `[transport.http].bind`, and a build for any
+  operating system other than Linux refuses it outright: Windows has no
+  `LISTEN_FDS` protocol, and macOS does not implement
+  `getsockopt(SO_ACCEPTCONN)`, so the check that separates a listening socket
+  from a connected one cannot run there. Over a Unix socket the admin routes
+  (`/ui`,
+  `/api/admin/status`) treat the connection as local, because the socket's
+  owner and mode already decided who could open it; over TCP the loopback
+  peer check is unchanged. See
+  [ADR-0021](docs/decisions/0021-take-the-socket-you-were-given.md).
+
 - **`groove doctor` looks at the declared-field set, and `groove status`
   counts it.** Since v1.9.0 the index records which `groove-schema.toml` keys
   its `document_fields` rows follow, and a search carrying `--field` /
