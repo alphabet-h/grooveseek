@@ -60,7 +60,9 @@ pub(crate) fn check_listen_env(
         );
     };
     let Ok(named) = pid.parse::<u32>() else {
-        bail!("--systemd-socket was given but LISTEN_PID is not a number: {pid} (own pid {self_pid})");
+        bail!(
+            "--systemd-socket was given but LISTEN_PID is not a number: {pid} (own pid {self_pid})"
+        );
     };
     if named != self_pid {
         bail!(
@@ -134,8 +136,13 @@ fn socket_family(fd: RawFd) -> Result<libc::c_int> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     // SAFETY: `storage` is large enough for any family and `len` says so.
-    let rc =
-        unsafe { libc::getsockname(fd, (&raw mut storage).cast::<libc::sockaddr>(), &raw mut len) };
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&raw mut storage).cast::<libc::sockaddr>(),
+            &raw mut len,
+        )
+    };
     if rc != 0 {
         return Err(std::io::Error::last_os_error())
             .context("getsockname on the descriptor systemd passed");
@@ -281,7 +288,10 @@ mod tests {
         let err = check_listen_env(Some("999999"), Some("1"), 4242)
             .expect_err("LISTEN_PID from a parent must not be honoured");
         let msg = format!("{err:#}");
-        assert!(msg.contains("999999"), "the value read must be named: {msg}");
+        assert!(
+            msg.contains("999999"),
+            "the value read must be named: {msg}"
+        );
         assert!(msg.contains("4242"), "our own pid must be named too: {msg}");
         assert!(msg.is_ascii(), "diagnostics stay ASCII: {msg}");
     }
@@ -324,13 +334,20 @@ mod tests {
     fn a_socket_that_is_not_listening_is_refused() {
         // SAFETY: an ordinary AF_INET stream socket; `OwnedFd` closes it.
         let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        assert!(raw >= 0, "socket(2) failed: {}", std::io::Error::last_os_error());
+        assert!(
+            raw >= 0,
+            "socket(2) failed: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: `raw` is a fresh descriptor this scope owns.
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         let err = check_listening_stream(owned.as_raw_fd())
             .expect_err("a socket without listen(2) is not a listener")
             .to_string();
-        assert!(err.contains("SO_ACCEPTCONN"), "must say which check failed: {err}");
+        assert!(
+            err.contains("SO_ACCEPTCONN"),
+            "must say which check failed: {err}"
+        );
     }
 
     /// (試験 A-6) `sd_listen_fds(3)` calls the datagram/stream distinction the
@@ -343,7 +360,10 @@ mod tests {
         let err = check_listening_stream(udp.as_raw_fd())
             .expect_err("ListenDatagram= is not what this server serves")
             .to_string();
-        assert!(err.contains("SOCK_STREAM"), "must name the type wanted: {err}");
+        assert!(
+            err.contains("SOCK_STREAM"),
+            "must name the type wanted: {err}"
+        );
         assert!(
             !err.contains("SO_ACCEPTCONN"),
             "the type check must come first, or A-6 cannot be told from A-5: {err}"
@@ -365,7 +385,10 @@ mod tests {
         let err = check_listening_stream(file.as_raw_fd())
             .expect_err("a regular file is not a listening socket")
             .to_string();
-        assert!(err.contains("getsockopt"), "must say which call failed: {err}");
+        assert!(
+            err.contains("getsockopt"),
+            "must say which call failed: {err}"
+        );
         assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
         drop(file);
         let _ = std::fs::remove_dir_all(&dir);
@@ -422,7 +445,10 @@ mod tests {
         let err = adopt(OwnedFd::from(udp))
             .expect_err("ListenDatagram= is not what this server serves")
             .to_string();
-        assert!(err.contains("SOCK_STREAM"), "must name the type wanted: {err}");
+        assert!(
+            err.contains("SOCK_STREAM"),
+            "must name the type wanted: {err}"
+        );
         assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
     }
 

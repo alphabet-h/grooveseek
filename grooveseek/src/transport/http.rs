@@ -2984,7 +2984,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let peer: std::net::SocketAddr = "192.168.1.10:51000".parse().unwrap();
-        req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
         let app = Router::new()
             .route("/probe", get(|| async { "ok" }))
             .layer(middleware::from_fn_with_state(gate, dns_rebinding_gate));

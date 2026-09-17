@@ -258,7 +258,10 @@ mod linux {
         for (name, value) in headers {
             cmd.args(["-H", &format!("{name}: {value}")]);
         }
-        let out = cmd.arg(format!("http://{addr}{path}")).output().expect("curl");
+        let out = cmd
+            .arg(format!("http://{addr}{path}"))
+            .output()
+            .expect("curl");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -307,7 +310,11 @@ mod linux {
             ),
             (
                 "loopback Origin",
-                tcp_code(addr, ADMIN, &[("Origin", &format!("http://127.0.0.1:{port}"))]),
+                tcp_code(
+                    addr,
+                    ADMIN,
+                    &[("Origin", &format!("http://127.0.0.1:{port}"))],
+                ),
             ),
             (
                 "foreign Origin",
@@ -420,17 +427,15 @@ mod linux {
         let kb_arg = kb.kb().to_str().expect("a UTF-8 scratch path").to_string();
 
         let mut cmd = activator();
-        cmd.args(["-l", &sock_arg])
-            .arg(grooveseek_bin())
-            .args([
-                "serve",
-                "--kb-path",
-                &kb_arg,
-                "--no-watch",
-                "--transport",
-                "http",
-                "--systemd-socket",
-            ]);
+        cmd.args(["-l", &sock_arg]).arg(grooveseek_bin()).args([
+            "serve",
+            "--kb-path",
+            &kb_arg,
+            "--no-watch",
+            "--transport",
+            "http",
+            "--systemd-socket",
+        ]);
         let (child, _rx, log) = start(cmd);
         // Named rather than `_guard`: the socket path is read back from it
         // below, so the struct earns its `addr` field as well as its `Drop`.

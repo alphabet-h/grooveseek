@@ -3420,7 +3420,10 @@ mod tests {
                 Err(e) => e,
             };
             let msg = err.to_string();
-            assert!(msg.contains("--systemd-socket"), "must name the flag: {msg}");
+            assert!(
+                msg.contains("--systemd-socket"),
+                "must name the flag: {msg}"
+            );
             assert!(msg.contains(flag), "must name {flag}: {msg}");
         }
         Cli::try_parse_from(["groove", "serve", "--transport", "http", "--systemd-socket"])

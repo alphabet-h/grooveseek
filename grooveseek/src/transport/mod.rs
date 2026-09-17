@@ -467,7 +467,8 @@ mod tests {
 
     #[test]
     fn test_resolve_cli_port_only() {
-        let t = Transport::resolve(Some(TransportKind::Http), None, Some(4000), false, None).unwrap();
+        let t =
+            Transport::resolve(Some(TransportKind::Http), None, Some(4000), false, None).unwrap();
         assert_eq!(
             t,
             Transport::Http {
@@ -509,7 +510,8 @@ mod tests {
             http: None,
         };
         // CLI stdio wins over config http
-        let t = Transport::resolve(Some(TransportKind::Stdio), None, None, false, Some(&cfg)).unwrap();
+        let t =
+            Transport::resolve(Some(TransportKind::Stdio), None, None, false, Some(&cfg)).unwrap();
         assert_eq!(t, Transport::Stdio);
     }
 
@@ -1078,7 +1080,10 @@ mod tests {
             Transport::resolve(Some(TransportKind::Http), None, None, true, None)
                 .expect_err("a Windows build cannot take a socket from systemd")
         );
-        assert!(msg.contains("--systemd-socket"), "must name the flag: {msg}");
+        assert!(
+            msg.contains("--systemd-socket"),
+            "must name the flag: {msg}"
+        );
         assert!(
             msg.contains("LISTEN_FDS"),
             "must name the protocol it needs: {msg}"
