@@ -187,10 +187,10 @@ enum Commands {
         #[arg(long = "i-know", default_value_t = false)]
         i_know_non_loopback: bool,
         /// Take the listening socket from the service manager instead of
-        /// binding one. Needs a service manager that passes LISTEN_FDS
-        /// (systemd on Linux, and any other Unix that speaks the same
-        /// protocol); a Windows build refuses it. The socket unit owns the
-        /// address, so this cannot be combined with --bind or --port.
+        /// binding one. Linux only: it needs a service manager that passes
+        /// LISTEN_FDS, such as systemd, and builds for other operating
+        /// systems refuse the flag. The socket unit owns the address, so this
+        /// cannot be combined with --bind or --port.
         #[arg(
             long = "systemd-socket",
             default_value_t = false,

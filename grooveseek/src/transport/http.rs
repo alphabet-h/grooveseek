@@ -853,7 +853,12 @@ fn forbidden_plain(msg: &str) -> Response {
 /// The two things this server can accept on.
 enum ServeListener {
     Tcp(tokio::net::TcpListener),
-    #[cfg(unix)]
+    /// Only a passed descriptor ever becomes this, and only the systemd_fd
+    /// module produces one, so the variant is gated on the same
+    /// `target_os = "linux"` that module is. Widening it to `unix` would leave
+    /// a variant nothing can construct on macOS, and `-D warnings` reads that
+    /// as dead code.
+    #[cfg(target_os = "linux")]
     Unix(tokio::net::UnixListener),
 }
 
@@ -865,7 +870,7 @@ impl ServeListener {
                 .local_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "an address the OS will not report".to_string()),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Unix(l) => l
                 .local_addr()
                 .ok()
@@ -920,7 +925,7 @@ async fn open_listener(
             let bound = listener.local_addr().unwrap_or(addr);
             Ok((ServeListener::Tcp(listener), Some(bound)))
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         crate::transport::HttpListen::Systemd => {
             match crate::transport::systemd_fd::take_listener()? {
                 // `O_NONBLOCK` is not set again here. `systemd_fd::prepare_fd`
@@ -950,7 +955,7 @@ async fn open_listener(
         // help, docs and refusals say one thing rather than three. Unreachable
         // in practice: `Transport::resolve` refuses first -- which is why a
         // copy of the sentence here could drift unread.
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         crate::transport::HttpListen::Systemd => anyhow::bail!(
             "--systemd-socket {} Transport::resolve refuses it on this build, so reaching here means that check was removed.",
             crate::transport::SYSTEMD_SOCKET_REQUIREMENT
@@ -1271,7 +1276,7 @@ pub async fn run_http(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum::serve failed")?,
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         ServeListener::Unix(l) => axum::serve(
             l,
             // No `ConnectInfo<SocketAddr>`: `SocketAddr` does not implement

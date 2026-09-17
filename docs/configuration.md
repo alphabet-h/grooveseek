@@ -149,8 +149,8 @@ bind = "127.0.0.1:3100"
 # are never refused by this limit (v0.19.0+).
 # max_sessions = 256
 # Take the listening socket from the service manager instead of binding one.
-# Needs a service manager that passes LISTEN_FDS -- systemd on Linux, and any
-# other Unix that speaks the same protocol; a Windows build refuses the key.
+# Linux only: it needs a service manager that passes LISTEN_FDS, such as
+# systemd, and a build for any other operating system refuses the key.
 # Exclusive with bind above -- two listening addresses is not a configuration,
 # and groove refuses to start rather than pick one. With this set, groove never
 # falls back to TCP: if LISTEN_FDS does not describe exactly one listening

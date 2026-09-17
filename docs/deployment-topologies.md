@@ -291,7 +291,8 @@ to the loopback origins of the port actually bound. A request carrying no
 are unaffected. Setting the key *replaces* the default rather than extending it.
 
 **A listener that has no address.** With `[transport.http].systemd_socket` (or
-`--systemd-socket`) the socket comes from a systemd `.socket` unit, and when
+`--systemd-socket`) — Linux only, and refused outright by a build for any other
+operating system — the socket comes from a systemd `.socket` unit, and when
 that unit names a filesystem path there is no address and no port. The peer
 column then reads differently: `ConnectInfo<SocketAddr>` does not exist for a
 Unix listener, so the admin routes take `PeerRule::UnixLocal` and let the

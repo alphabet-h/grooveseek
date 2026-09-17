@@ -136,10 +136,27 @@ was promised.**
   (`resolve_systemd_listen` in `grooveseek/src/transport/mod.rs`). Two listening
   addresses is not a configuration, and picking one silently leaves the operator
   reading an address that nothing answers on.
-- **Where it works is where the protocol exists**: a Unix host whose service
-  manager passes `LISTEN_FDS` — systemd on Linux, and anything else that speaks
-  the same protocol. A Windows build refuses both the flag and the key
-  (`systemd_socket_supported` in `grooveseek/src/transport/mod.rs`).
+- **Where it works is Linux**, with a service manager that passes `LISTEN_FDS`
+  — systemd, or anything else speaking the same protocol. A build for any other
+  operating system refuses both the flag and the key
+  (`systemd_socket_supported` in `grooveseek/src/transport/mod.rs`). The next
+  entry is why that is narrower than it first was.
+- **Narrowed from every Unix to Linux, because one platform cannot answer the
+  listening check.** This was first released as a `cfg(unix)` feature: Windows
+  has no `LISTEN_FDS` protocol, every other Unix does, and macOS looked like it
+  would simply find no `LISTEN_PID` set. The macOS leg of CI said otherwise —
+  `getsockopt(SO_ACCEPTCONN)` is not implemented there and answers
+  `ENOPROTOOPT`, so the descriptor check failed on every socket, including ones
+  a service manager had correctly passed (reported by the macOS leg of CI,
+  2026-09-18). That left two
+  answers: skip the check where the platform cannot answer it, or stop claiming
+  the platform. Skipping it was refused — `SO_ACCEPTCONN` is what separates a
+  listening socket from a connected one here, the decision above makes
+  every refusal load-bearing, and a check that is absent on exactly the target
+  nobody can run locally is a check that rots unseen. So the target narrowed
+  instead. Another operating system can be added once someone has confirmed the
+  checks hold there, and the cost of being wrong about that is now a refusal at
+  startup rather than a daemon serving on a descriptor it never verified.
 - **The family is read off the descriptor**, not declared. A TCP socket a unit
   bound is served like one groove bound itself — the peer check and the `/mcp`
   defaults are derived from its address exactly as they would be from a bind;

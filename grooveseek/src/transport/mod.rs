@@ -12,8 +12,12 @@ use serde::Deserialize;
 
 pub mod http;
 pub mod stdio;
-// (計画 4 段 A) The listening socket a service manager passed. Linux and other
-// Unix only: there is no LISTEN_FDS protocol on Windows.
+// (計画 4 段 A) The listening socket a service manager passed. Linux only.
+// Windows has no LISTEN_FDS protocol at all, and macOS has the protocol's
+// shape but not the check this module refuses on: `getsockopt(SO_ACCEPTCONN)`
+// answers ENOPROTOOPT there, so `check_listening_stream` could never pass. See
+// ADR-0021 for why the answer was to narrow the target rather than drop the
+// check.
 //
 // A plain comment and not a doc comment, on purpose. An outer doc comment here
 // is merged into the module's own documentation, but it also moves where
@@ -22,7 +26,7 @@ pub mod stdio;
 // `cargo doc --no-deps --workspace --all-features --document-private-items`
 // fails the module's `//!` header with "no item named `take_listener` in
 // scope", while the same link on an item inside the file still resolves.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub mod systemd_fd;
 
 // ---------------------------------------------------------------------------
@@ -153,8 +157,8 @@ pub enum HttpListen {
     /// systemd_fd module, named here in prose on purpose.
     ///
     /// **Prose rather than an intra-doc link, and that is deliberate.** That
-    /// module is compiled only on Unix while this enum is compiled everywhere,
-    /// so a link to it is unresolved on a Windows build, and
+    /// module is compiled only on Linux while this enum is compiled
+    /// everywhere, so a link to it is unresolved on every other build, and
     /// `broken_intra_doc_links = "deny"` turns an unresolved link into a failed
     /// `cargo doc`. Measured on Windows, with the link written out in full:
     /// `no item named systemd_fd in module transport`, exit 101. The same holds
@@ -304,28 +308,39 @@ fn resolve_http_addr(
 /// Whether this build can take a socket from a service manager.
 ///
 /// A `const fn` rather than `#[cfg]` around the call site so that one pair of
-/// tests pins both builds: the Windows half asserts the refusal names the
-/// flag, the Unix half asserts the flag resolves.
+/// tests pins both builds: the non-Linux half asserts the refusal names the
+/// flag, the Linux half asserts the flag resolves.
+///
+/// `target_os = "linux"` and not `unix`. It was `unix` until the macOS leg of
+/// CI ran the descriptor checks: `getsockopt(SO_ACCEPTCONN)` is not
+/// implemented there and answers `ENOPROTOOPT`, so `check_listening_stream`
+/// fails on every descriptor and a macOS build could never have served on a
+/// passed socket anyway. Narrowing the target is what ADR-0021 records; the
+/// alternative, skipping the check where the platform cannot answer it, would
+/// have dropped the one test that separates a listening socket from a
+/// connected one.
 pub(crate) const fn systemd_socket_supported() -> bool {
-    cfg!(unix)
+    cfg!(target_os = "linux")
 }
 
 /// What `--systemd-socket` needs, in the one sentence every surface says it in.
 ///
 /// **One question gets one implementation** (AGENTS.md). Two refusals name this
 /// requirement -- the build gate in [`resolve_systemd_listen`] below, and the
-/// `#[cfg(not(unix))]` arm of `open_listener` in [`http`] -- and they differ
+/// `#[cfg(not(target_os = "linux"))]` arm of `open_listener` in [`http`] --
+/// and they differ
 /// either side of it, because one is answering an operator and the other is
 /// reporting that a check above it was removed. What must not differ is the
 /// sentence itself: plan decision 7 requires the help text, the documentation
-/// and both refusals to say one thing rather than four. The `#[cfg(not(unix))]`
+/// and both refusals to say one thing rather than four. That
 /// arm is unreachable while [`Transport::resolve`] refuses first, which is
 /// exactly why a copy there could drift for a release without anyone reading
 /// it.
 ///
 /// It is a sentence fragment, not a whole message: it starts after the flag
 /// name and ends with its own full stop.
-pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str = "needs a service manager that passes LISTEN_FDS: systemd on Linux, or another Unix that speaks the same protocol.";
+pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str =
+    "needs a Linux build and a service manager that passes LISTEN_FDS, such as systemd.";
 
 /// The refusals that can be answered before anything opens a socket: a second
 /// listener was named beside the one the service manager owns, or this build
@@ -333,7 +348,7 @@ pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str = "needs a service manager tha
 ///
 /// The environment and the descriptor itself are checked in the systemd_fd
 /// module, because only the running process can answer those. That module is
-/// Unix-only while this function is not, so it is named in prose here for the
+/// Linux-only while this function is not, so it is named in prose here for the
 /// reason [`HttpListen::Systemd`] gives.
 ///
 /// **The two-listener refusals come first, and the build gate last.** Both are
@@ -367,10 +382,11 @@ fn resolve_systemd_listen(
             "[transport.http].systemd_socket and [transport.http].bind = {bind} name two different listeners. The socket unit owns the address, so remove bind; leaving it in place would tell whoever reads this file that the daemon is still reachable there."
         );
     }
-    // `cfg!(unix)`, so macOS resolves the flag too and is told at
-    // `take_listener` that no LISTEN_PID was set. That is the gate spec 判断 4
-    // names -- "a Windows build" -- and the help text and docs say the same
-    // thing, rather than three different ones (plan decision 7).
+    // `cfg!(target_os = "linux")`. Both Windows and macOS are refused here,
+    // where the operator can still see the command they typed: Windows has no
+    // LISTEN_FDS protocol, and macOS cannot run the descriptor checks (see
+    // `systemd_socket_supported`). The help text and the docs say the same
+    // sentence rather than three different ones (plan decision 7).
     if !systemd_socket_supported() {
         anyhow::bail!(
             "--systemd-socket (and [transport.http].systemd_socket) {SYSTEMD_SOCKET_REQUIREMENT} This build has no such interface. Use bind instead."
@@ -947,7 +963,7 @@ mod tests {
 
     /// (計画 4 段 A) The same shape for the `--systemd-socket` requirement
     /// sentence, and it needs the scan more than the others do: the second
-    /// caller is the `#[cfg(not(unix))]` arm of `open_listener` in
+    /// caller is the `#[cfg(not(target_os = "linux"))]` arm of `open_listener` in
     /// [`crate::transport::http`], which [`Transport::resolve`] makes
     /// unreachable. A copy there would compile on
     /// one target, run on none, and drift for as long as nobody read it.
@@ -967,9 +983,18 @@ mod tests {
         // test's own source never spells the sentence out. Spelling it here is
         // what made the first version of this test fail on its own assert line.
         for (name, src) in [("http.rs", http), ("mod.rs", include_str!("mod.rs"))] {
+            // The definition itself is the one place the words appear, and it
+            // is a *statement*, not a line: rustfmt moves the literal onto its
+            // own line as soon as wrapping makes it fit, which depends on how
+            // long the sentence is. Skipping one line therefore held only for
+            // the sentence this started with -- shortening it to name Linux
+            // wrapped the definition and this test failed on the continuation
+            // line. Skip to the `;` instead, so the guard answers to the rule
+            // it states rather than to the current formatting.
+            let mut in_definition = false;
             for (n, line) in src.lines().enumerate() {
-                // The definition itself is the one place the words appear.
-                if line.contains("pub(crate) const SYSTEMD_SOCKET_REQUIREMENT") {
+                if in_definition || line.contains("pub(crate) const SYSTEMD_SOCKET_REQUIREMENT") {
+                    in_definition = !line.trim_end().ends_with(';');
                     continue;
                 }
                 assert!(
@@ -1128,16 +1153,23 @@ mod tests {
             .expect_err("--systemd-socket and --port name two different listeners");
     }
 
-    /// (試験 A-13) Windows has no `LISTEN_FDS` protocol, so the flag is
-    /// refused where the operator can still see the command they typed --
-    /// not at bind time, by a daemon that will not start.
-    #[cfg(windows)]
+    /// (試験 A-13) A build that cannot honour the flag refuses it where the
+    /// operator can still see the command they typed -- not at bind time, by a
+    /// daemon that will not start.
+    ///
+    /// `not(target_os = "linux")` covers both such builds with one arm, and it
+    /// has to: Windows has no `LISTEN_FDS` protocol, and macOS answers
+    /// `ENOPROTOOPT` to `getsockopt(SO_ACCEPTCONN)`, so the descriptor checks
+    /// could never pass there. Gating this on `windows` alone left the macOS
+    /// leg of the matrix asserting nothing about the flag while the code still
+    /// accepted it.
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn the_flag_is_refused_on_a_build_that_cannot_honour_it() {
         let msg = format!(
             "{:#}",
             Transport::resolve(Some(TransportKind::Http), None, None, true, None)
-                .expect_err("a Windows build cannot take a socket from systemd")
+                .expect_err("this build cannot take a socket from a service manager")
         );
         assert!(
             msg.contains("--systemd-socket"),
@@ -1153,18 +1185,17 @@ mod tests {
     /// The other side of the same check, so both builds are pinned by one pair
     /// of tests rather than by whichever one the author happened to run.
     ///
-    /// `cfg(unix)` rather than `cfg(target_os = "linux")` because
-    /// [`systemd_socket_supported`] is `cfg!(unix)`: macOS resolves the flag
-    /// too and finds out at [`crate::transport::systemd_fd::take_listener`]
-    /// that no `LISTEN_PID` was set. That
-    /// is deliberate -- the gate spec 判断 4 names is "a Windows build" -- and
-    /// this test passing on the macOS leg of the matrix is the point, not an
-    /// accident.
-    #[cfg(unix)]
+    /// `cfg(target_os = "linux")`, matching [`systemd_socket_supported`]. It
+    /// read `cfg(unix)` until the macOS leg of CI ran the descriptor checks and
+    /// found `getsockopt(SO_ACCEPTCONN)` unimplemented there, which made a
+    /// macOS build one that resolves the flag and can never honour it. The two
+    /// halves have to name the same condition, or one of them asserts about a
+    /// build the other does not describe.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_flag_resolves_to_the_systemd_listener_where_it_is_supported() {
         let t = Transport::resolve(Some(TransportKind::Http), None, None, true, None)
-            .expect("a Unix build takes the socket");
+            .expect("a Linux build takes the socket");
         assert_eq!(
             t,
             Transport::Http {
@@ -1178,7 +1209,7 @@ mod tests {
     }
 
     /// `systemd_socket = true` in the file does the same thing as the flag.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_config_key_alone_resolves_to_the_systemd_listener() {
         let cfg = TransportConfig {

@@ -6,8 +6,13 @@
 //! the kind of socket this server can serve on, and hands back an `std`
 //! listener. [`crate::transport::http::run_http`] turns that into a tokio one.
 //!
-//! **By hand, against the `libc` this crate already has on `cfg(unix)`, rather
-//! than through `libsystemd` or `listenfd`.** The reasoning is in [ADR-0021].
+//! **Linux only.** Windows has no `LISTEN_FDS` protocol, and macOS does not
+//! implement `getsockopt(SO_ACCEPTCONN)` — it answers `ENOPROTOOPT`, so
+//! [`check_listening_stream`] could never pass there. Narrowing the target was
+//! chosen over dropping the check; [ADR-0021] records why.
+//!
+//! **By hand, against the `libc` this crate already carries for Unix targets,
+//! rather than through `libsystemd` or `listenfd`.** Also [ADR-0021].
 //!
 //! [ADR-0021]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0021-take-the-socket-you-were-given.md
 //!
@@ -212,7 +217,8 @@ static TAKEN: OnceLock<()> = OnceLock::new();
 ///
 /// The two kinds are told apart through `std` rather than by reading
 /// `sun_path[0]`: an address that is neither a pathname nor unnamed is an
-/// abstract one, which is portable and needs no `unsafe`. The unnamed arm is
+/// abstract one, which needs no `unsafe` and no second spelling of what the
+/// kernel already encoded in the address. The unnamed arm is
 /// not reachable through [`take_listener`] — `listen(2)` refuses an unbound
 /// `AF_UNIX` socket with `EINVAL`, so such a descriptor has `SO_ACCEPTCONN`
 /// clear and [`check_listening_stream`] has already refused it — and it is
@@ -506,7 +512,6 @@ mod tests {
     /// connect -- while the admin routes would still read the peer as local.
     /// Refusing it at start-up is the whole point, so the message has to name
     /// which kind arrived.
-    #[cfg(target_os = "linux")]
     #[test]
     fn an_abstract_af_unix_socket_is_refused_and_named() {
         use std::os::linux::net::SocketAddrExt;
@@ -561,11 +566,11 @@ mod tests {
         ));
 
         // Both names are as short as they can be, because an `AF_UNIX` address
-        // is bounded by `sun_path` -- 108 bytes on Linux but 104 on macOS --
-        // and `unique_temp_path` already spends a pid, a nanosecond timestamp
-        // and a counter on top of `$TMPDIR`, which on a macOS runner is itself
-        // a `/var/folders/...` path. The assert is here so the tight runner
-        // says which limit it hit instead of failing inside `bind` as an
+        // is bounded by `sun_path` -- 108 bytes on Linux -- and
+        // `unique_temp_path` already spends a pid, a nanosecond timestamp and
+        // a counter on top of `$TMPDIR`, which a container or a CI runner can
+        // point somewhere long. The assert reads the array's real length, so
+        // it says which limit it hit instead of failing inside `bind` as an
         // opaque "invalid argument".
         let dir = crate::test_support::unique_temp_path("g");
         std::fs::create_dir_all(&dir).expect("scratch dir");

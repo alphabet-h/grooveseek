@@ -122,9 +122,25 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
   (`grooveseek/src/transport/mod.rs` の `resolve_systemd_listen`)。
   待ち受けアドレスが 2 つあるのは設定ではないし、黙って一方を勝たせれば
   **運用者は何も応答しないアドレスを読み続ける**ことになる
-- **動く場所は protocol がある場所**。`LISTEN_FDS` を渡す service manager を持つ Unix —
-  Linux の systemd、および同じ protocol を話す他のもの。**Windows ビルドはフラグもキーも拒否する**
-  (`grooveseek/src/transport/mod.rs` の `systemd_socket_supported`)
+- **動く場所は Linux**。`LISTEN_FDS` を渡す service manager (systemd、または同じ
+  protocol を話すもの) があること。**他の OS 向けビルドはフラグもキーも拒否する**
+  (`grooveseek/src/transport/mod.rs` の `systemd_socket_supported`)。
+  なぜ当初より狭いかは次項
+- **「あらゆる Unix」から Linux へ狭めた。listening の検査に答えられない platform が
+  あったため**。最初は `cfg(unix)` の機能として出した — Windows に `LISTEN_FDS`
+  protocol が無く、他の Unix にはあり、macOS は単に `LISTEN_PID` が無いと分かるだけ、
+  という読みだった。CI の macOS leg がそれを否定した: macOS は
+  `getsockopt(SO_ACCEPTCONN)` を実装しておらず `ENOPROTOOPT` を返すので、
+  **service manager が正しく渡した socket を含め、どの descriptor でも検査が失敗する**
+  (2026-09-18、CI の macOS leg が報告した)。取れる道は 2 つだった —
+  答えられない platform では検査を飛ばすか、その platform を名乗るのをやめるか。
+  **飛ばす方は採らなかった**: この module で listening な socket と接続済みの socket を
+  分けているのは `SO_ACCEPTCONN` だけであり、上の決定は拒否のひとつひとつを
+  要の位置に置いているうえ、**手元で誰も走らせられない target でだけ欠ける検査は、
+  気づかれずに腐る**。そこで target の側を狭めた。
+  他の OS は「そこでも検査が成り立つ」と確かめてから足せる。
+  その判断を誤った時の代償は、**未検証の descriptor で serve する daemon ではなく、
+  起動時の拒否**になった
 - **family は descriptor から読む**。宣言させない。unit が bind した TCP socket は
   groove 自身が bind したものと同じように扱われる — peer 検査も `/mcp` の既定値も、
   bind の場合とまったく同じようにそのアドレスから導かれる。Unix socket は

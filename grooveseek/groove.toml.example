@@ -298,9 +298,9 @@ bind = "127.0.0.1:3100"
 #max_sessions = 256
 
 # Take the listening socket from the service manager instead of binding one
-# (v1.11.0+). Needs a service manager that passes LISTEN_FDS -- systemd on
-# Linux, and any other Unix that speaks the same protocol; a Windows build
-# refuses the key. Exclusive with `bind` above: groove refuses to start rather
+# (v1.11.0+). Linux only: it needs a service manager that passes LISTEN_FDS,
+# such as systemd, and a build for any other operating system refuses the key.
+# Exclusive with `bind` above: groove refuses to start rather
 # than pick one. With this on, groove never falls back to TCP -- if LISTEN_FDS
 # does not describe exactly one listening stream socket addressed to this
 # process, `serve` exits. Honoured only from a trusted config (see "TRUST"

@@ -16,7 +16,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
-- **`groove serve` can take the listening socket from systemd.**
+- **`groove serve` can take the listening socket from systemd (Linux).**
   `--systemd-socket`, or `[transport.http].systemd_socket = true`, makes
   `serve` accept on the descriptor a `.socket` unit already bound instead of
   binding an address of its own; the unit decides the path or address, its
@@ -29,8 +29,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   that is not a listening stream socket, or an abstract socket — a
   `ListenStream=` whose name starts with `@`, which has no file for
   `SocketMode=` to apply to — all stop startup. It is exclusive
-  with `--bind` / `--port` / `[transport.http].bind`, and a Windows build
-  refuses it. Over a Unix socket the admin routes (`/ui`,
+  with `--bind` / `--port` / `[transport.http].bind`, and a build for any
+  operating system other than Linux refuses it outright: Windows has no
+  `LISTEN_FDS` protocol, and macOS does not implement
+  `getsockopt(SO_ACCEPTCONN)`, so the check that separates a listening socket
+  from a connected one cannot run there. Over a Unix socket the admin routes
+  (`/ui`,
   `/api/admin/status`) treat the connection as local, because the socket's
   owner and mode already decided who could open it; over TCP the loopback
   peer check is unchanged. See

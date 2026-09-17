@@ -271,7 +271,8 @@ loopback origin が既定になる。`Origin` ヘッダを持たないリクエ�
 **拡張ではなく置換**する。
 
 **アドレスを持たない listener。** `[transport.http].systemd_socket` (または
-`--systemd-socket`) を使うと、socket は systemd の `.socket` unit から来る。
+`--systemd-socket`) — **Linux 限定で、他の OS 向けビルドは拒否する** — を使うと、
+socket は systemd の `.socket` unit から来る。
 その unit がファイルシステム上のパスを名指している場合、**アドレスも port も無い**。
 そのとき peer の列の読み方が変わる: Unix listener には `ConnectInfo<SocketAddr>` が
 存在しないので、admin 経路は `PeerRule::UnixLocal` を取り、接続を通す。
