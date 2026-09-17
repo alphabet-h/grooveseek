@@ -374,9 +374,9 @@ pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str =
 /// asks a question neither of those asks, and no input reaches both.
 ///
 /// It reads the value **after** the config has been loaded and an untrusted one
-/// stripped -- `Config::discover_in`, `pub(crate)` in [`crate::config`] -- so a
-/// `systemd_socket` planted in a config groove merely found was already dropped
-/// and cannot stop a start here.
+/// stripped, in [`crate::config::Config::discover_in`], so a `systemd_socket`
+/// planted in a config groove merely found was already dropped and cannot stop
+/// a start here.
 fn refuse_config_systemd_socket_under_stdio(
     cli_transport: Option<TransportKind>,
     cfg: Option<&TransportConfig>,
