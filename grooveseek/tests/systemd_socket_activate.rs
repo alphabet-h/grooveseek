@@ -412,9 +412,9 @@ mod linux {
     ///
     /// **It does not pin the `peer` field, and no behavioural test can.** A
     /// Unix listener carries no `ConnectInfo<SocketAddr>`, so the peer block of
-    /// `DnsRebindingGate::decide` -- private to
-    /// [`grooveseek::transport::http`] -- is skipped whichever `PeerRule` it
-    /// holds: `UnixLocal` fails its first condition, `LoopbackTcp` fails the
+    /// `DnsRebindingGate` -- private to [`grooveseek::transport::http`], which
+    /// is also where its decide step lives -- is skipped whichever `PeerRule`
+    /// it holds: `UnixLocal` fails its first condition, `LoopbackTcp` fails the
     /// `let Some(...)` that follows, and both reach the Host check unchanged.
     /// The two are observationally identical today. What holds that field is
     /// the unit test of `admin_peer_rule` (also `pub(crate)` there) plus the
