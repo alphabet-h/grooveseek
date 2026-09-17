@@ -3399,9 +3399,11 @@ mod tests {
     /// listeners, and clap refuses the pair with both spellings in the
     /// message, so the operator is told which two flags disagreed.
     ///
-    /// `Transport::resolve` refuses the same pair (`resolve_systemd_listen`).
-    /// Two checks for one input is deliberate: clap's is what the operator
-    /// sees, and the resolver's is what holds if the attribute is dropped.
+    /// [`grooveseek::transport::Transport::resolve`] refuses the same pair, in
+    /// `resolve_systemd_listen` -- private to [`grooveseek::transport`], so
+    /// only the module is linked here. Two checks for one input is deliberate:
+    /// clap's is what the operator sees, and the resolver's is what holds if
+    /// the attribute is dropped.
     #[test]
     fn systemd_socket_conflicts_with_bind_and_port_on_the_command_line() {
         for (flag, value) in [("--bind", "127.0.0.1:3100"), ("--port", "3100")] {

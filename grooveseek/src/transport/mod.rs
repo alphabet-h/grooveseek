@@ -118,8 +118,8 @@ pub struct HttpTransportConfig {
     /// Exclusive with [`Self::bind`], and with `--bind` / `--port`: two
     /// listening addresses is not a configuration, and the dangerous reading
     /// of a silent winner is the one where the operator believes the daemon is
-    /// still reachable on the address they wrote. `Transport::resolve` refuses
-    /// the pair.
+    /// still reachable on the address they wrote. [`Transport::resolve`]
+    /// refuses the pair.
     ///
     /// **A config groove merely found does not get to set this.** It is
     /// dropped with a warning beside `allowed_hosts` and `max_sessions`: a
@@ -148,17 +148,19 @@ pub struct TransportConfig {
 pub enum HttpListen {
     /// An address groove binds itself.
     Tcp(SocketAddr),
-    /// The descriptor a service manager already bound. The family is decided
-    /// at run time by `systemd_fd::adopt`.
+    /// The descriptor a service manager already bound. Which address family it
+    /// carries is decided at run time, where the descriptor is adopted: the
+    /// systemd_fd module, named here in prose on purpose.
     ///
-    /// **A code span, not an intra-doc link, and that is deliberate.**
-    /// `systemd_fd` is `#[cfg(unix)]` while this enum is not, so a link would
-    /// resolve to nothing on a Windows build and
-    /// `[workspace.lints.rustdoc] broken_intra_doc_links = "deny"`
-    /// (`Cargo.toml`) turns that into a failed `cargo doc`. The same rule
-    /// applies to every mention of `systemd_fd` from `http.rs` and `server.rs`.
-    /// The reverse direction is safe: `systemd_fd`'s own doc comments vanish
-    /// with the module.
+    /// **Prose rather than an intra-doc link, and that is deliberate.** That
+    /// module is compiled only on Unix while this enum is compiled everywhere,
+    /// so a link to it is unresolved on a Windows build, and
+    /// `broken_intra_doc_links = "deny"` turns an unresolved link into a failed
+    /// `cargo doc`. Measured on Windows, with the link written out in full:
+    /// `no item named systemd_fd in module transport`, exit 101. The same holds
+    /// for every mention of it from [`http`], from [`crate::server`] and from
+    /// the binary. The reverse direction is safe: that module's own doc
+    /// comments are compiled out along with it.
     Systemd,
 }
 
@@ -317,7 +319,7 @@ pub(crate) const fn systemd_socket_supported() -> bool {
 /// reporting that a check above it was removed. What must not differ is the
 /// sentence itself: plan decision 7 requires the help text, the documentation
 /// and both refusals to say one thing rather than four. The `#[cfg(not(unix))]`
-/// arm is unreachable while `Transport::resolve` refuses first, which is
+/// arm is unreachable while [`Transport::resolve`] refuses first, which is
 /// exactly why a copy there could drift for a release without anyone reading
 /// it.
 ///
@@ -329,9 +331,10 @@ pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str = "needs a service manager tha
 /// listener was named beside the one the service manager owns, or this build
 /// has no such interface (spec 判断 4, conditions 1 and 5).
 ///
-/// The environment and the descriptor itself are checked in
-/// `crate::transport::systemd_fd`, because only the running process can
-/// answer those.
+/// The environment and the descriptor itself are checked in the systemd_fd
+/// module, because only the running process can answer those. That module is
+/// Unix-only while this function is not, so it is named in prose here for the
+/// reason [`HttpListen::Systemd`] gives.
 ///
 /// **The two-listener refusals come first, and the build gate last.** Both are
 /// refusals, so the order only decides which sentence the operator reads; what
@@ -422,7 +425,7 @@ pub fn non_loopback_bind_refusal(bind: impl std::fmt::Display) -> String {
     )
 }
 
-/// (計画 4 段 A) `HttpListen::Systemd` still lives in [`Transport::Http`], so the
+/// (計画 4 段 A) [`HttpListen::Systemd`] still lives in [`Transport::Http`], so the
 /// `matches!` below does not take its early return for a systemd listener. What
 /// makes that harmless is the other side: `cli_bind` is `None`, because
 /// `--bind` and `--port` are refused both by clap's `conflicts_with_all` and by
@@ -944,8 +947,9 @@ mod tests {
 
     /// (計画 4 段 A) The same shape for the `--systemd-socket` requirement
     /// sentence, and it needs the scan more than the others do: the second
-    /// caller is `open_listener`'s `#[cfg(not(unix))]` arm, which
-    /// `Transport::resolve` makes unreachable. A copy there would compile on
+    /// caller is the `#[cfg(not(unix))]` arm of `open_listener` in
+    /// [`crate::transport::http`], which [`Transport::resolve`] makes
+    /// unreachable. A copy there would compile on
     /// one target, run on none, and drift for as long as nobody read it.
     ///
     /// The scan is on the literal rather than on behaviour for the reason the
@@ -1151,7 +1155,8 @@ mod tests {
     ///
     /// `cfg(unix)` rather than `cfg(target_os = "linux")` because
     /// [`systemd_socket_supported`] is `cfg!(unix)`: macOS resolves the flag
-    /// too and finds out at `take_listener` that no `LISTEN_PID` was set. That
+    /// too and finds out at [`crate::transport::systemd_fd::take_listener`]
+    /// that no `LISTEN_PID` was set. That
     /// is deliberate -- the gate spec 判断 4 names is "a Windows build" -- and
     /// this test passing on the macOS leg of the matrix is the point, not an
     /// accident.

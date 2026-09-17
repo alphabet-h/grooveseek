@@ -2901,7 +2901,8 @@ mod tests {
     /// `peer_must_be_loopback: true` read as "on" while the `&&` chain broke
     /// at the missing extension and let every request through.
     /// **This is the only thing that pins the `peer` value.** No behavioural
-    /// test can: over a Unix listener `decide` skips its peer block whichever
+    /// test can: over a Unix listener [`DnsRebindingGate::decide`] skips its
+    /// peer block whichever
     /// rule it holds, because `ConnectInfo<SocketAddr>` is never attached, so
     /// `UnixLocal` and `LoopbackTcp` are observationally identical there.
     /// Every input the function can be given is covered here, and the admin
@@ -3002,15 +3003,15 @@ mod tests {
         );
     }
 
-    /// The pair of lists `run_http` derives from `bound == None`, behind the
-    /// peer rule `admin_peer_rule(None)` picks.
+    /// The pair of lists [`run_http`] derives from a `bound` of `None`, behind
+    /// the peer rule [`admin_peer_rule`] picks for that same `None`.
     ///
-    /// **Not a copy of any one production gate, and the name says `default`
-    /// rather than `admin` for that reason.** Over a Unix listener `/mcp`
-    /// gets these two lists with `PeerRule::Any`, while the admin routes get
+    /// **Not a copy of any one production gate, and the name says "default"
+    /// rather than "admin" for that reason.** Over a Unix listener `/mcp`
+    /// gets these two lists with [`PeerRule::Any`], while the admin routes get
     /// this peer rule but their own Host list --
-    /// `allowed_admin_hosts`, built in `grooveseek/src/server.rs` and handed
-    /// over where `run_http` composes the admin sub-router. What this
+    /// `allowed_admin_hosts`, built in [`crate::server`] and handed
+    /// over where [`run_http`] composes the admin sub-router. What this
     /// isolates is the pair, so the three tests below ask one construction.
     fn unix_default_gate() -> DnsRebindingGate {
         DnsRebindingGate {
@@ -3066,11 +3067,12 @@ mod tests {
     /// else.
     ///
     /// **An allow-list entry with no port matches every port on that host.**
-    /// That is `NormalizedAuthority::matches`: `None` on the entry's port
+    /// That is [`NormalizedAuthority::matches`]: `None` on the entry's port
     /// short-circuits to `true`. It is wider than RFC 6454, which reads an
-    /// omitted port as the scheme's default, and `origin_matches_any_port`'s
-    /// own documentation, the startup warning and `docs/configuration.md` all
-    /// say so in as many words. So a browser on `http://localhost:3101` would
+    /// omitted port as the scheme's default, and [`origin_matches_any_port`]'s
+    /// own documentation, the startup warning and the configuration
+    /// documentation all say so in as many words. So a browser on
+    /// `http://localhost:3101` would
     /// match -- moot, since a browser cannot open an `AF_UNIX` socket, but it
     /// means the list is not doing its work by failing to match. What it does
     /// is refuse a foreign origin, and a request with no `Origin` passes, so
@@ -3130,10 +3132,10 @@ mod tests {
     ///
     /// The entries carry no port because there is no port to name, and a
     /// port-less entry matches every port on that host
-    /// (`NormalizedAuthority::matches`), so the spelling costs nothing here.
+    /// ([`NormalizedAuthority::matches`]), so the spelling costs nothing here.
     /// What the list must not be is empty, because an empty list is how "do
     /// not validate Origin at all" is spelled -- and it must not carry an
-    /// entry `check_origin_entry` would refuse, because a dropped entry
+    /// entry [`check_origin_entry`] would refuse, because a dropped entry
     /// leaves validation on with less to match.
     #[test]
     fn a_unix_listener_gets_a_port_less_origin_list_that_is_not_empty() {

@@ -11,8 +11,9 @@ mod common;
 
 /// Everything below needs systemd. `macos-latest` sits in the same test matrix
 /// and has none, so the gate is `target_os = "linux"` rather than `unix` -- the
-/// shape `tests/http_lock_contention.rs` already uses. Gating the module rather
-/// than the crate keeps `mod common;` compiling on every platform.
+/// shape the lock-contention integration test next door already uses. Gating
+/// the module rather than the crate keeps [`crate::common`] compiling on every
+/// platform.
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::common::ansi::strip_ansi;
@@ -35,8 +36,9 @@ mod linux {
     /// here. So it is simply absent below.
     const ACTIVATE: &str = "/usr/bin/systemd-socket-activate";
 
-    /// The variable that names the embedding-model cache
-    /// (`grooveseek/src/embedder.rs::resolve_cache_dir`, which reads it first).
+    /// The variable that names the embedding-model cache. `resolve_cache_dir`
+    /// in [`grooveseek::embedder`] reads it first; it is private there, so only
+    /// the module is linked.
     const FASTEMBED_CACHE_ENV: &str = "FASTEMBED_CACHE_DIR";
 
     /// How many ports to try before giving up (see [`free_port`]).
@@ -90,9 +92,9 @@ mod linux {
 
     /// Start the process with both pipes captured and its stderr drained.
     ///
-    /// stderr rather than stdout on purpose: `Commands::Serve` writes nothing
-    /// to stdout, and the readiness line is an `eprintln!` in
-    /// `grooveseek/src/transport/http.rs`. The draining is shared with the
+    /// stderr rather than stdout on purpose: the `serve` subcommand writes
+    /// nothing to stdout, and the readiness line is an `eprintln!` in
+    /// [`grooveseek::transport::http`]. The draining is shared with the
     /// other integration tests rather than copied, because a second parser of
     /// that line starts answering a different question the moment the wording
     /// changes. A captured pipe nobody empties also blocks the process writing
@@ -111,8 +113,9 @@ mod linux {
 
     /// A server that binds its own address: wait for the address it prints.
     ///
-    /// One deadline for the whole wait, not one per message. `Ready` has a
-    /// second variant (`Armed`), and re-arming `recv_timeout` on every
+    /// One deadline for the whole wait, not one per message.
+    /// [`crate::common::mcp::Ready`] has a second variant (`Armed`), and
+    /// re-arming `recv_timeout` on every
     /// non-address message would let the total wait grow without a bound.
     fn spawn_bound(cmd: Command) -> Spawned {
         let (child, rx, log) = start(cmd);
@@ -164,8 +167,9 @@ mod linux {
     /// and its later ones are the wait.
     ///
     /// The activator's own line is `Listening on` with a capital L, while
-    /// `drain_stderr_keeping` splits on lowercase `listening on ` (the
-    /// wording of groove's own line), so the two cannot be confused.
+    /// [`crate::common::mcp::drain_stderr_keeping`] splits on lowercase
+    /// `listening on ` (the wording of groove's own line), so the two cannot
+    /// be confused.
     fn spawn_activated(bin: &std::path::Path, kb_arg: &str) -> Spawned {
         for _ in 0..ACTIVATE_ATTEMPTS {
             let port = free_port();
@@ -270,8 +274,8 @@ mod linux {
     ///
     /// The path is a parameter because two different Host lists answer here:
     /// the admin routes read `allowed_admin_hosts` and `/mcp` reads the list
-    /// `run_http` built. Asking only one of them would attribute its 403 to
-    /// the wrong function.
+    /// [`grooveseek::transport::http::run_http`] built. Asking only one of them
+    /// would attribute its 403 to the wrong function.
     fn unix_code(sock: &str, path: &str, headers: &[(&str, &str)]) -> String {
         let mut cmd = Command::new("curl");
         cmd.args([
@@ -376,15 +380,17 @@ mod linux {
         );
     }
 
-    /// The wiring no unit test reaches: that `run_http`, for a listener with
-    /// no address, builds the **Unix defaults** --
-    /// `effective_allowed_hosts_unix` and `effective_allowed_origins_unix` --
-    /// and hands each one to the surface that reads it.
+    /// The wiring no unit test reaches: that
+    /// [`grooveseek::transport::http::run_http`], for a listener with no
+    /// address, builds the **Unix defaults** -- `effective_allowed_hosts_unix`
+    /// and `effective_allowed_origins_unix`, both `pub(crate)` in
+    /// [`grooveseek::transport::http`] and so named in prose here -- and hands
+    /// each one to the surface that reads it.
     ///
     /// **Which surface reads which list is not the same for the two.** The
-    /// Host list `run_http` derives goes to `/mcp` (`shared_hosts`); the admin
-    /// routes keep their own, `allowed_admin_hosts`, built in
-    /// `grooveseek/src/server.rs`, which is not an `effective_allowed_*` list
+    /// Host list that function derives goes to `/mcp` (`shared_hosts`); the
+    /// admin routes keep their own, `allowed_admin_hosts`, built in
+    /// [`grooveseek::server`], which is not an `effective_allowed_*` list
     /// at all. The Origin list *is* shared (`shared_origins`), so the admin
     /// surface is where `effective_allowed_origins_unix` can be measured. The
     /// probes below are split accordingly: a foreign `Host` on `/mcp` names
@@ -392,25 +398,29 @@ mod linux {
     /// `allowed_admin_hosts`, and a foreign `Origin` on the admin path names
     /// `effective_allowed_origins_unix`.
     ///
-    /// `run_http` is not callable from a test -- its one caller is
-    /// `server.rs` -- and a `DnsRebindingGate` a test builds by hand agrees
-    /// with whatever the test wrote in it. This repo already knows that shape:
-    /// `build_router_for_test`'s own documentation says it "is not the
-    /// production router" and that Origin validation "is exercised where it
-    /// exists -- through a running server". So this does the same: a real
-    /// server, on a real Unix socket, answering real requests. A `hosts` field
-    /// left as `Arc::new(None)` makes `evil.example` answer 200 here; an
-    /// `origins` field left empty makes the foreign-Origin request answer 200.
+    /// [`grooveseek::transport::http::run_http`] is not callable from a test --
+    /// its one caller is in [`grooveseek::server`] -- and a `DnsRebindingGate`
+    /// (private to [`grooveseek::transport::http`]) that a test builds by hand
+    /// agrees with whatever the test wrote in it. This repo already knows that
+    /// shape: [`grooveseek::transport::http::build_router_for_test`]'s own
+    /// documentation says it "is not the production router" and that Origin
+    /// validation "is exercised where it exists -- through a running server".
+    /// So this does the same: a real server, on a real Unix socket, answering
+    /// real requests. A `hosts` field left as `Arc::new(None)` makes
+    /// `evil.example` answer 200 here; an `origins` field left empty makes the
+    /// foreign-Origin request answer 200.
     ///
     /// **It does not pin the `peer` field, and no behavioural test can.** A
-    /// Unix listener carries no `ConnectInfo<SocketAddr>`, so `decide`'s peer
-    /// block is skipped whichever `PeerRule` it holds -- `UnixLocal` fails its
-    /// first condition, `LoopbackTcp` fails the `let Some(...)` that follows,
-    /// and both reach the Host check unchanged. The two are observationally
-    /// identical today. What holds that field is `admin_peer_rule`'s own unit
-    /// test plus the fact that `run_http` has one place to call it from; the
-    /// day `Connected` is implemented for `UnixListener`, they stop being
-    /// identical and this test starts covering it too.
+    /// Unix listener carries no `ConnectInfo<SocketAddr>`, so the peer block of
+    /// `DnsRebindingGate::decide` -- private to
+    /// [`grooveseek::transport::http`] -- is skipped whichever `PeerRule` it
+    /// holds: `UnixLocal` fails its first condition, `LoopbackTcp` fails the
+    /// `let Some(...)` that follows, and both reach the Host check unchanged.
+    /// The two are observationally identical today. What holds that field is
+    /// the unit test of `admin_peer_rule` (also `pub(crate)` there) plus the
+    /// fact that [`grooveseek::transport::http::run_http`] has one place to
+    /// call it from; the day `Connected` is implemented for `UnixListener`,
+    /// they stop being identical and this test starts covering it too.
     #[test]
     #[ignore = "starts `groove serve` through systemd-socket-activate; the nightly ignored-tests job runs it on ubuntu"]
     fn a_unix_listener_serves_the_admin_surface_with_the_unix_host_and_origin_defaults() {

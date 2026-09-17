@@ -7,8 +7,9 @@
 //! listener. [`crate::transport::http::run_http`] turns that into a tokio one.
 //!
 //! **By hand, against the `libc` this crate already has on `cfg(unix)`, rather
-//! than through `libsystemd` or `listenfd`.** The reasoning is in ADR-0021
-//! (`docs/decisions/0021-take-the-socket-you-were-given.md`).
+//! than through `libsystemd` or `listenfd`.** The reasoning is in [ADR-0021].
+//!
+//! [ADR-0021]: https://github.com/alphabet-h/grooveseek/blob/main/docs/decisions/0021-take-the-socket-you-were-given.md
 //!
 //! **What `sd_listen_fds(3)` requires, and this module does.** Compare
 //! `$LISTEN_PID` with our own pid *first*, because a variable inherited from
@@ -20,8 +21,9 @@
 //!
 //! **The environment is left in place.** `std::env::remove_var` is `unsafe`
 //! in edition 2024 and undefined behaviour while another thread reads the
-//! environment. Instead [`take_listener`] can only succeed once per process,
-//! which is what unsetting the variables was going to buy.
+//! environment. Instead [`crate::transport::systemd_fd::take_listener`] can
+//! only succeed once per process, which is what unsetting the variables was
+//! going to buy.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
@@ -149,7 +151,7 @@ fn socket_family(fd: RawFd) -> Result<libc::c_int> {
     Ok(libc::c_int::from(storage.ss_family))
 }
 
-/// One `fcntl` that reads or writes a flag word.
+/// One wrapper around `libc::fcntl` that reads or writes a flag word.
 fn fcntl(fd: RawFd, cmd: libc::c_int, arg: libc::c_int) -> Result<libc::c_int> {
     // SAFETY: `cmd` is one of F_GETFD / F_SETFD / F_GETFL / F_SETFL, each of
     // which takes an `int` argument or ignores it.
@@ -194,7 +196,7 @@ static TAKEN: OnceLock<()> = OnceLock::new();
 
 /// Check a descriptor and take ownership of it. Reads no environment.
 ///
-/// The [`OwnedFd`] is the contract, not decoration. A caller cannot hand over
+/// The `OwnedFd` is the contract, not decoration. A caller cannot hand over
 /// a descriptor it merely borrowed, which is the mistake that ends with two
 /// owners closing one descriptor and the second `close(2)` landing on whatever
 /// the runtime handed out in between. Every refusal below drops the `OwnedFd`
@@ -204,7 +206,7 @@ static TAKEN: OnceLock<()> = OnceLock::new();
 ///
 /// Both conversions are the safe `From<OwnedFd>` impls, so this function has no
 /// `unsafe` at all. The one place the module builds an `OwnedFd` out of a raw
-/// number is [`take_listener`], which runs `check_listening_stream` on the raw
+/// number is [`take_listener`], which runs [`check_listening_stream`] on the raw
 /// number *before* it does — so that check runs twice per start. The
 /// duplication is deliberate: this function has to hold for any caller on its
 /// own, and two extra `getsockopt` calls once at start-up cost less than a
@@ -435,7 +437,7 @@ mod tests {
     /// A refusal from inside [`adopt`] consumes the descriptor it was handed:
     /// the `OwnedFd` moved in, and dropping it on the way out is what closes
     /// it exactly once. The closing itself belongs to the type, so what this
-    /// pins is the half that is this module's -- that `adopt` really does take
+    /// pins is the half that is this module's -- that [`adopt`] really does take
     /// ownership on the refusing path too, which a `RawFd` parameter left to a
     /// doc comment and to whoever wrote the caller.
     #[test]
