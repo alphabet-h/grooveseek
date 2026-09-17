@@ -67,7 +67,7 @@ groove serve --kb-path ... --transport http --port 3100         # HTTP、複数�
 groove serve --kb-path ... --no-watch                           # ライブ同期無効
 ```
 
-既定では stdio トランスポート (1 クライアント / サーバ) で MCP サーバを起動する。複数クライアントを同時接続するには `--transport http --port <PORT>` (または `--bind <SOCKETADDR>`) を渡し Streamable HTTP に切り替える — 詳細は [HTTP トランスポート (複数クライアント同時接続)](clients.ja.md#http-トランスポート-複数クライアント同時接続) 参照。loopback 外の `--bind` は、groove が認証を持たないため追加で `--i-know` が必要。`LISTEN_FDS` を渡す service manager がある環境 (Linux の systemd、および同じ protocol を話す他の Unix) では `--systemd-socket` で、その service manager が既に bind した待ち受け socket をそのまま受け取れる。`--bind` / `--port` とは同時に指定できず、socket が渡されていない場合は TCP に落ちずに起動に失敗する。Windows ビルドはこのフラグを拒否する。
+既定では stdio トランスポート (1 クライアント / サーバ) で MCP サーバを起動する。複数クライアントを同時接続するには `--transport http --port <PORT>` (または `--bind <SOCKETADDR>`) を渡し Streamable HTTP に切り替える — 詳細は [HTTP トランスポート (複数クライアント同時接続)](clients.ja.md#http-トランスポート-複数クライアント同時接続) 参照。loopback 外の `--bind` は、groove が認証を持たないため追加で `--i-know` が必要。`LISTEN_FDS` を渡す service manager がある環境 (Linux の systemd、および同じ protocol を話す他の Unix) では `--systemd-socket` で、その service manager が既に bind した待ち受け socket をそのまま受け取れる。`--bind` / `--port` とは同時に指定できず、socket が渡されていない場合は TCP に落ちずに起動に失敗する。abstract socket — 名前が `@` で始まる `ListenStream=` — も拒否する。`SocketMode=` を効かせるファイルが無いためである。Windows ビルドはこのフラグを拒否する。
 
 サーバは 6 つの MCP ツール ([docs/mcp-tools.ja.md](mcp-tools.ja.md)) を公開し、インデックスをプロセス内に保持して低レイテンシでクエリに答える。`--model` が現在の index を作ったモデルと一致しない場合、実行可能なエラーメッセージで起動を拒否する。ファイルウォッチャ (既定有効) が `--kb-path` 配下のコンテンツ変更を検知して再インデックスする — [ライブ同期 (file watcher)](clients.ja.md#ライブ同期-file-watcher) 参照。
 

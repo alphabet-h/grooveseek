@@ -150,6 +150,8 @@ bind = "127.0.0.1:3100"
 # groove はどちらかを選ばずに起動を拒否する。これを設定すると groove は TCP に
 # 落ちない: LISTEN_FDS がこのプロセス宛の listening stream socket をちょうど
 # 1 つ示していなければ、serve は終了する (v1.11.0+)。
+# abstract socket — 名前が @ で始まる ListenStream= — も拒否する。
+# 効かせるべき SocketMode= を持つファイルが存在しないため。
 # systemd_socket = true
 
 # 任意: `groove eval` (retrieval 品質評価、パワーユーザ機能)。

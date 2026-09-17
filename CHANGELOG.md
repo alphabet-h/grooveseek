@@ -25,8 +25,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   groove does not read it. It is an explicit opt-in — groove does not look at
   `LISTEN_FDS`
   unless told to — and it never falls back to TCP: a `LISTEN_PID` that names
-  another process, a `LISTEN_FDS` that is not exactly one, or a descriptor
-  that is not a listening stream socket all stop startup. It is exclusive
+  another process, a `LISTEN_FDS` that is not exactly one, a descriptor
+  that is not a listening stream socket, or an abstract socket — a
+  `ListenStream=` whose name starts with `@`, which has no file for
+  `SocketMode=` to apply to — all stop startup. It is exclusive
   with `--bind` / `--port` / `[transport.http].bind`, and a Windows build
   refuses it. Over a Unix socket the admin routes (`/ui`,
   `/api/admin/status`) treat the connection as local, because the socket's

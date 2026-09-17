@@ -316,6 +316,10 @@ bind = "127.0.0.1:3100"
 # host can open, which is the reachability a loopback TCP port already had.
 # groove does not read the mode, does not report it, and cannot warn that it is
 # wrong. See docs/decisions/0021-take-the-socket-you-were-given.md.
+#
+# An abstract socket -- a ListenStream= whose name starts with @ -- is refused
+# at startup, because it has no file for SocketMode= to apply to and every
+# account on the host could connect to it.
 #systemd_socket = true
 
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------

@@ -207,7 +207,11 @@ was promised.**
   a step on the operator that this record should not leave implicit:
   `systemd.socket(5)` gives `SocketMode=` a default of `0666`, so a unit that
   writes only `ListenStream=` hands back exactly the reachability the loopback
-  port in the Context above already had.
+  port in the Context above already had. The exception is the case where there
+  is nothing for the operator to set: an abstract socket — a `ListenStream=`
+  whose name starts with `@` — has no filesystem entry, so no owner and no mode
+  exist to be got right, and groove refuses it at startup rather than serve the
+  admin routes as local to every account on the host.
 - **The refusals are the interface.** With no fallback, every shape that cannot
   be served is a startup failure, and the sentence printed is what the operator
   has to work from. They stay ASCII, and they name the value that was read

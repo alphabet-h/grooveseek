@@ -321,7 +321,10 @@ socket every account on the host can open, which is the reachability a loopback
 TCP port already had. A unit carrying only `ListenStream=` therefore gains no
 separation, while the admin routes stop asking about the peer. GrooveSeek does
 not read the mode, does not report it, and cannot warn that it is wrong: the
-listener it was handed is the one it serves.
+listener it was handed is the one it serves. The one shape it does refuse is an
+abstract socket — a `ListenStream=` whose name starts with `@` — which has no
+file for `SocketMode=` to apply to, so startup fails rather than serving the
+admin routes to every account on the host.
 
 One consequence for whatever forwards to that socket: the `Host` list is the
 loopback aliases, so a gateway that passes the browser's original `Host`

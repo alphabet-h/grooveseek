@@ -39,8 +39,12 @@ pub(crate) enum SystemdSocket {
     /// `AF_INET` / `AF_INET6`. Served exactly like a socket groove bound
     /// itself, peer check included.
     Tcp(std::net::TcpListener),
-    /// `AF_UNIX`. No address and no port, which is what decides the admin
-    /// peer rule ([`crate::transport::http::admin_peer_rule`]).
+    /// `AF_UNIX`, bound to a filesystem path. No address and no port, which is
+    /// what decides the admin peer rule
+    /// ([`crate::transport::http::admin_peer_rule`]) — and the path is what
+    /// carries the owner and mode that rule leans on, so
+    /// [`check_pathname_socket`] refuses every other kind of `AF_UNIX`
+    /// address.
     Unix(std::os::unix::net::UnixListener),
 }
 
@@ -194,6 +198,43 @@ pub(crate) fn claim(cell: &OnceLock<()>) -> Result<()> {
 
 static TAKEN: OnceLock<()> = OnceLock::new();
 
+/// An `AF_UNIX` listener is served only when it is bound to a filesystem path.
+///
+/// The admin routes treat every peer of a Unix listener as local
+/// ([`crate::transport::http::admin_peer_rule`]), and the reason that is safe
+/// is that the peer had to open a file first: the socket's owner and its mode
+/// decided who could, and the kernel checked before the first byte. A Linux
+/// abstract socket (`ListenStream=@name`) has no filesystem entry at all, so
+/// there is no owner and no mode to check, and any account on the host may
+/// connect. Accepting one would leave `/ui` and `/api/admin/status` open to
+/// all of them while groove reported the peer as local, so it is refused at
+/// start-up instead.
+///
+/// The two kinds are told apart through `std` rather than by reading
+/// `sun_path[0]`: an address that is neither a pathname nor unnamed is an
+/// abstract one, which is portable and needs no `unsafe`. The unnamed arm is
+/// not reachable through [`take_listener`] — `listen(2)` refuses an unbound
+/// `AF_UNIX` socket with `EINVAL`, so such a descriptor has `SO_ACCEPTCONN`
+/// clear and [`check_listening_stream`] has already refused it — and it is
+/// kept because [`adopt`] must answer for any descriptor it is handed, not
+/// only for the one that path produces.
+fn check_pathname_socket(listener: &std::os::unix::net::UnixListener) -> Result<()> {
+    let addr = listener
+        .local_addr()
+        .context("getsockname on the AF_UNIX socket systemd passed")?;
+    if addr.as_pathname().is_some() {
+        return Ok(());
+    }
+    if addr.is_unnamed() {
+        bail!(
+            "the AF_UNIX socket systemd passed is not bound to any address, so it has no owner and no mode to decide who may connect; ListenStream= must name a filesystem path, and SocketMode= with SocketUser= on that path is what limits the peers that reach the admin routes"
+        );
+    }
+    bail!(
+        "the AF_UNIX socket systemd passed is bound to an abstract name (ListenStream=@name), which has no filesystem entry to carry an owner or a mode, so every account on this host may connect and groove would still report the peer as local; ListenStream= must name a filesystem path, and SocketMode= with SocketUser= on that path is what limits the peers that reach the admin routes"
+    );
+}
+
 /// Check a descriptor and take ownership of it. Reads no environment.
 ///
 /// The `OwnedFd` is the contract, not decoration. A caller cannot hand over
@@ -215,7 +256,14 @@ pub(crate) fn adopt(fd: OwnedFd) -> Result<SystemdSocket> {
     check_listening_stream(fd.as_raw_fd())?;
     prepare_fd(fd.as_raw_fd())?;
     match socket_family(fd.as_raw_fd())? {
-        libc::AF_UNIX => Ok(SystemdSocket::Unix(fd.into())),
+        libc::AF_UNIX => {
+            // The listener is built first so the address can be read through
+            // `local_addr`, and so a refusal closes the descriptor by dropping
+            // it rather than leaving it open.
+            let listener = std::os::unix::net::UnixListener::from(fd);
+            check_pathname_socket(&listener)?;
+            Ok(SystemdSocket::Unix(listener))
+        }
         libc::AF_INET | libc::AF_INET6 => Ok(SystemdSocket::Tcp(fd.into())),
         other => bail!(
             "the socket systemd passed has address family {other}, which groove cannot serve; ListenStream= must name a filesystem path or an address and port"
@@ -451,6 +499,54 @@ mod tests {
             "must name the type wanted: {err}"
         );
         assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
+    }
+
+    /// A Linux abstract socket carries no file, so `SocketMode=` and
+    /// `SocketUser=` have nothing to apply to and every account on the host can
+    /// connect -- while the admin routes would still read the peer as local.
+    /// Refusing it at start-up is the whole point, so the message has to name
+    /// which kind arrived.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_abstract_af_unix_socket_is_refused_and_named() {
+        use std::os::linux::net::SocketAddrExt;
+
+        let name = format!("groove-{}", crate::test_support::unique_suffix());
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+            .expect("an abstract name");
+        let ux = std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind abstract");
+        let err = adopt(OwnedFd::from(ux))
+            .expect_err("an abstract socket cannot be bounded by owner or mode")
+            .to_string();
+        assert!(
+            err.contains("abstract"),
+            "must say which kind arrived: {err}"
+        );
+        assert!(
+            err.contains("ListenStream="),
+            "must say what to write instead: {err}"
+        );
+        assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
+    }
+
+    /// The worst case of the refusal above: a legitimate pathname socket whose
+    /// file is gone by the time groove looks. A socket unit can be restarted,
+    /// and an operator can remove the file; if the path came from the
+    /// filesystem rather than from the socket, groove would start refusing the
+    /// listener it is supposed to serve. `getsockname` answers from the address
+    /// recorded at `bind`, so it does not.
+    #[test]
+    fn a_pathname_socket_is_still_accepted_after_its_file_is_unlinked() {
+        let dir = crate::test_support::unique_temp_path("g");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("s");
+        let ux = std::os::unix::net::UnixListener::bind(&path).expect("bind AF_UNIX");
+        std::fs::remove_file(&path).expect("unlink the socket file");
+        assert!(matches!(
+            adopt(OwnedFd::from(ux)).expect("an unlinked pathname socket is still one"),
+            SystemdSocket::Unix(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The family gate. `AF_INET` and `AF_UNIX` are both served; anything else

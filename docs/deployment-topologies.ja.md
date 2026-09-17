@@ -301,6 +301,9 @@ loopback を名指した時だけで、`ListenStream=127.0.0.2:3100` なら
 `ListenStream=` しか書かれていない unit では分離は 1 つも増えず、そのうえ admin 経路は
 peer を問わなくなる。GrooveSeek は mode を読まず、報告もせず、
 **間違っていても警告できない** — 渡された listener をそのまま serve するからである。
+唯一拒否する形が abstract socket — 名前が `@` で始まる `ListenStream=` — で、
+`SocketMode=` を効かせるファイルが無いため、ホスト上の全アカウントに admin 経路を
+開くのではなく起動を失敗させる。
 
 その socket へ転送する側にも 1 つ効いてくる: `Host` のリストは loopback の別名なので、
 **ブラウザが送ってきた元の `Host` をそのまま通す gateway は `/mcp` から 403 を受け取る**。

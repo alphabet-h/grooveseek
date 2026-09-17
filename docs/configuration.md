@@ -155,6 +155,8 @@ bind = "127.0.0.1:3100"
 # and groove refuses to start rather than pick one. With this set, groove never
 # falls back to TCP: if LISTEN_FDS does not describe exactly one listening
 # stream socket addressed to this process, serve exits (v1.11.0+).
+# An abstract socket -- a ListenStream= whose name starts with @ -- is refused
+# as well, because it has no file for SocketMode= to apply to.
 # systemd_socket = true
 
 # Optional: `groove eval` (retrieval quality evaluation, power-user feature).
