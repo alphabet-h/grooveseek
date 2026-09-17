@@ -35,6 +35,10 @@ mod linux {
     /// here. So it is simply absent below.
     const ACTIVATE: &str = "/usr/bin/systemd-socket-activate";
 
+    /// The variable that names the embedding-model cache
+    /// (`grooveseek/src/embedder.rs::resolve_cache_dir`, which reads it first).
+    const FASTEMBED_CACHE_ENV: &str = "FASTEMBED_CACHE_DIR";
+
     /// How many ports to try before giving up (see [`free_port`]).
     const ACTIVATE_ATTEMPTS: usize = 5;
 
@@ -55,6 +59,33 @@ mod linux {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    /// `systemd-socket-activate`, with the model cache pointed where the
+    /// parent's is.
+    ///
+    /// **The activator does not pass its environment on.** Measured by running
+    /// `/usr/bin/env` as its child inside this file's image: what arrives is
+    /// `HOME`, `LISTEN_FDS` and `LISTEN_PID`, and nothing else. So
+    /// `FASTEMBED_CACHE_DIR` is dropped -- and that variable is how a warmed
+    /// cache is reached both in CI (`.github/workflows/nightly.yml` sets it for
+    /// the whole `ignored-tests` job, which is also what `actions/cache`
+    /// restores into) and in the Docker recipe this file is run under. A child
+    /// that loses it resolves `dirs::cache_dir()` instead, finds nothing that
+    /// the job pre-warmed, and downloads BGE-small; with the two tests here
+    /// running in parallel that is two downloads racing for one blob lock, and
+    /// the loser fails with `Lock acquisition failed`.
+    ///
+    /// `-E NAME` forwards the parent's value (`systemd-socket-activate --help`:
+    /// `-E --setenv=NAME[=VALUE]   Pass an environment variable to children`).
+    /// When the parent has no such variable there is no value to forward, so
+    /// the flag is left off and the child's own fallback is the right answer.
+    fn activator() -> Command {
+        let mut cmd = Command::new(ACTIVATE);
+        if std::env::var_os(FASTEMBED_CACHE_ENV).is_some() {
+            cmd.args(["-E", FASTEMBED_CACHE_ENV]);
+        }
+        cmd
     }
 
     /// Start the process with both pipes captured and its stderr drained.
@@ -138,7 +169,7 @@ mod linux {
     fn spawn_activated(bin: &std::path::Path, kb_arg: &str) -> Spawned {
         for _ in 0..ACTIVATE_ATTEMPTS {
             let port = free_port();
-            let mut cmd = Command::new(ACTIVATE);
+            let mut cmd = activator();
             cmd.args(["-l", &format!("127.0.0.1:{port}")])
                 .arg(bin)
                 .args([
@@ -388,7 +419,7 @@ mod linux {
         let sock_arg = sock.to_str().expect("a UTF-8 scratch path").to_string();
         let kb_arg = kb.kb().to_str().expect("a UTF-8 scratch path").to_string();
 
-        let mut cmd = Command::new(ACTIVATE);
+        let mut cmd = activator();
         cmd.args(["-l", &sock_arg])
             .arg(grooveseek_bin())
             .args([
