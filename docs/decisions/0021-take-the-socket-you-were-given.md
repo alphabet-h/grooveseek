@@ -9,9 +9,10 @@
 
 GrooveSeek authenticates nobody, and says so in the refusal it prints when a
 non-loopback bind is asked for without `--i-know`
-(`grooveseek/src/transport/mod.rs:397-406`): anything that can reach the port
-can read the entire knowledge base. Reachability is therefore the whole of the
-access control — and until v1.10.0, reachability meant a TCP port. A loopback
+(`non_loopback_bind_refusal` in `grooveseek/src/transport/mod.rs`): anything
+that can reach the port can read the entire knowledge base. Reachability is
+therefore the whole of the access control — and until v1.10.0, reachability
+meant a TCP port. A loopback
 port is open to every account on the host, so several daemons on one machine,
 one per body of documents and each meant for one caller, were separated by
 nothing stronger than a convention about which port belonged to whom.
@@ -41,7 +42,8 @@ was promised.**
   safe. A second invention would be a second thing to get wrong.
 - The deployment this was built for gives each unit one `ListenStream=`, so
   "exactly one descriptor" costs nothing there and keeps every refusal able to
-  name what it read (`grooveseek/src/transport/systemd_fd.rs:78-82`).
+  name what it read (the `LISTEN_FDS` arm of `check_listen_env` in
+  `grooveseek/src/transport/systemd_fd.rs`).
 
 ## Options considered
 
@@ -55,7 +57,8 @@ was promised.**
    on, or a parent that set the variables for somebody else all reach `serve`
    the same way. The check `sd_listen_fds(3)` puts first exists precisely
    because the environment travels further than the descriptors do
-   (`grooveseek/src/transport/systemd_fd.rs:57-71`). Auto-detection would make
+   (the `LISTEN_PID` arms of `check_listen_env` in
+   `grooveseek/src/transport/systemd_fd.rs`). Auto-detection would make
    surviving that check the ordinary path rather than the opted-into one.
 
 3. **Bind a filesystem path of groove's own** (`--unix-socket <path>`).
@@ -126,20 +129,21 @@ was promised.**
   parent otherwise hands over somebody else's descriptor; `LISTEN_FDS` at
   exactly one; then `SO_TYPE` before `SO_ACCEPTCONN`, so a `ListenDatagram=`
   unit is reported for its type instead of for not listening
-  (`grooveseek/src/transport/systemd_fd.rs:52-130`).
+  (`check_listen_env` and `check_listening_stream` in
+  `grooveseek/src/transport/systemd_fd.rs`).
 - **Exclusive with an address of our own.** `--bind`, `--port` and
   `[transport.http].bind` each refuse to stand beside it
-  (`grooveseek/src/transport/mod.rs:330-360`). Two listening addresses is not a
-  configuration, and picking one silently leaves the operator reading an
-  address that nothing answers on.
+  (`resolve_systemd_listen` in `grooveseek/src/transport/mod.rs`). Two listening
+  addresses is not a configuration, and picking one silently leaves the operator
+  reading an address that nothing answers on.
 - **Where it works is where the protocol exists**: a Unix host whose service
   manager passes `LISTEN_FDS` — systemd on Linux, and anything else that speaks
   the same protocol. A Windows build refuses both the flag and the key
-  (`grooveseek/src/transport/mod.rs:307-309`).
+  (`systemd_socket_supported` in `grooveseek/src/transport/mod.rs`).
 - **The family is read off the descriptor**, not declared. A TCP socket a unit
   bound is served exactly like one groove bound itself, peer check and derived
   defaults included; a Unix socket becomes a listener with no address at all
-  (`grooveseek/src/transport/systemd_fd.rs:213-223`).
+  (`adopt` in `grooveseek/src/transport/systemd_fd.rs`).
 - **The socket file is not groove's to manage.** It is never `shutdown(2)`n and
   its path is never unlinked: the service manager keeps its own copy of the
   descriptor, and `systemd.socket(5)` says a service "must not unlink the
@@ -151,18 +155,18 @@ was promised.**
 ## Consequences
 
 - **A listener can now have no address at all**
-  (`grooveseek/src/transport/http.rs:898-956`). What reads that is the peer
-  rule, the `Host` default, the `Origin` default and the startup line, and each
-  of them reads the same `Option<SocketAddr>` that `open_listener` returned
-  (`grooveseek/src/transport/http.rs:1046-1055`, `:1236`). So the case that is
-  easy to miss — a unit passing a *TCP* descriptor — cannot be handled one way
-  in one of them and another way in the next.
+  (`open_listener` in `grooveseek/src/transport/http.rs`). What reads that is
+  the peer rule, the `Host` default, the `Origin` default and the startup line,
+  and each of them reads the same `Option<SocketAddr>` that `open_listener`
+  returned — the `match bound` in `run_http`, and the `peer:` it hands the admin
+  router. So the case that is easy to miss — a unit passing a *TCP* descriptor —
+  cannot be handled one way in one of them and another way in the next.
 - **The peer check is split by type rather than by a flag.** A `UnixListener`
   carries no `ConnectInfo<SocketAddr>`, so the boolean this replaces read as
   "on" while the condition it guarded quietly fell through.
   `PeerRule::UnixLocal` is the Unix case, and it means "the socket's owner and
   mode already decided this", not "we cannot tell who this is"
-  (`grooveseek/src/transport/http.rs:1681-1714`).
+  (`PeerRule` and `admin_peer_rule` in `grooveseek/src/transport/http.rs`).
 - **What a test can hold here is narrower than the decision.** Over a Unix
   listener the three `PeerRule` values are observationally identical, because
   the extension the check reads is never attached at all. A behavioural test
@@ -171,19 +175,21 @@ was promised.**
   the admin routes the value that function returned is held by review alone.**
 - **The `Origin` default becomes the port-less loopback spellings**, because
   there is no port to name. An allow-list entry with no port matches every port
-  on that host (`grooveseek/src/transport/http.rs:673-681`), so an `Origin`
+  on that host (`NormalizedAuthority::matches` in
+  `grooveseek/src/transport/http.rs`), so an `Origin`
   naming `localhost`, `127.0.0.1` or `[::1]` passes whatever port it carries,
   and every other `Origin` is refused. The list is deliberately not empty:
   empty is how "do not validate `Origin` at all" is spelled.
-- **`unsafe` enters the transport layer**, confined to `systemd_fd.rs`, where
-  every `unsafe` block is a `libc` call except the one line that turns a raw
-  descriptor number into an owner
-  (`grep -n "unsafe {" grooveseek/src/transport/systemd_fd.rs` answers `:93`,
-  `:136`, `:139`, `:157`, `:273`; from `:336` on it is `#[cfg(test)]`). **Ownership is created only at `take_listener`'s `:273`**,
-  and only after the checks that can be made without owning the descriptor have
-  run (`grooveseek/src/transport/systemd_fd.rs:253-274`). `adopt`
-  (`grooveseek/src/transport/systemd_fd.rs:213-223`) takes an `OwnedFd`, so no
-  `unsafe` appears inside it.
+- **`unsafe` enters the transport layer**, confined to `systemd_fd.rs`. Outside
+  its tests the blocks are: `getsockopt` and `getsockname`, reading the
+  descriptor; `fcntl`, setting two flags on it; a `mem::zeroed` filling the
+  `sockaddr_storage` that `getsockname` writes into; and
+  `OwnedFd::from_raw_fd`, which is the only one that creates anything. Run
+  `grep -n "unsafe {" grooveseek/src/transport/systemd_fd.rs` to see them — the
+  hits after those five are inside `#[cfg(test)]`. **Ownership is created only
+  in `take_listener`**, and only after the checks that can be made without
+  owning the descriptor have run. `adopt` takes an `OwnedFd`, so no `unsafe`
+  appears inside it.
 - **A version floor the operator meets before the unit file does.** v1.10.0 and
   earlier reject an unknown key, so a `groove.toml` carrying `systemd_socket`
   stops those releases from starting at all. Upgrade groove first, then change

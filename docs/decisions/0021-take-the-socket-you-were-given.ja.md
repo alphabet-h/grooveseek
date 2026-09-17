@@ -8,7 +8,8 @@
 ## 背景と課題
 
 GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind を求められたときに
-出す拒否文自体がそう書いている (`grooveseek/src/transport/mod.rs:397-406`) —
+出す拒否文自体がそう書いている
+(`grooveseek/src/transport/mod.rs` の `non_loopback_bind_refusal`) —
 **そのポートに到達できる者は、知識ベース全体を読める**。したがって到達性がアクセス制御の
 すべてであり、v1.10.0 まで到達性とは TCP ポートのことだった。loopback のポートは
 そのホスト上のすべてのアカウントに開いているので、1 台に複数の daemon を
@@ -37,7 +38,8 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
 - 本件の想定配置では unit ごとに `ListenStream=` は 1 つなので、
   「ちょうど 1 本」はそこでは何の代償にもならず、
   **すべての拒否が「読めた値」を名指しできる**状態を保てる
-  (`grooveseek/src/transport/systemd_fd.rs:78-82`)
+  (`grooveseek/src/transport/systemd_fd.rs` の `check_listen_env`、
+  `LISTEN_FDS` を見る分岐)
 
 ## 検討した選択肢
 
@@ -50,8 +52,9 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
    自分の descriptor を渡し込む supervisor、他者のために変数を設定した親 —
    どれも同じ形で `serve` に届く。`sd_listen_fds(3)` が最初に置いている検査は、
    まさに**環境変数が descriptor より遠くまで伝わる**から存在する
-   (`grooveseek/src/transport/systemd_fd.rs:57-71`)。自動検出にすると、
-   その検査を通り抜けることが「opt-in された経路」ではなく「通常の経路」になる。
+   (`grooveseek/src/transport/systemd_fd.rs` の `check_listen_env`、
+   `LISTEN_PID` を見る分岐)。自動検出にすると、その検査を通り抜けることが
+   「opt-in された経路」ではなく「通常の経路」になる。
 
 3. **groove 自身が path に bind する** (`--unix-socket <path>`)。却下。
    動きはするが、**socket を作る主体が 2 つになる**。所有者と mode は、groove と
@@ -84,14 +87,15 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
    axum の `Connected` trait は sealed ではなく
    (`axum-0.8.9/src/extract/connect_info.rs:80-83`)、axum 自身が `UnixListener` 向けの
    実装をコンパイル試験として持っている (`axum-0.8.9/src/serve/mod.rs:503-513`)。
-   `IncomingStream::io()` (`axum-0.8.9/src/serve/mod.rs:436-439`) から `UnixStream` が取れ、
-   その `peer_cred()` が答えを返す。
+   `IncomingStream::io()` (`axum-0.8.9/src/serve/mod.rs:436-439`) から
+   `UnixStream` が取れ、その `peer_cred()` が答えを返す。
 
    **それでも採らない。** socket の mode が、同じ問いを**より早い段階でカーネルに**
    立てさせている。アプリケーション層でもう一度問えば、1 つの条件が
    **socket の mode とアプリケーションのコードという、食い違いうる別々の場所へ
    分かれる**。加えて `Connected::connect_info` は
-   `io::Result` ではなく `Self` を返す (`axum-0.8.9/src/extract/connect_info.rs:82`) ので、
+   `io::Result` ではなく `Self` を返す
+   (`axum-0.8.9/src/extract/connect_info.rs:82`) ので、
    `peer_cred()` が失敗したときにそれを申告する先が無い。既定値は
    **fail-open か、理由の言えない拒否**のどちらかにしかならない。
 
@@ -111,31 +115,35 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
   (親から継承した変数は、そうしなければ**他人の descriptor**を掴ませる)、次に
   `LISTEN_FDS` がちょうど 1 であること、そして `SO_ACCEPTCONN` より先に `SO_TYPE` を見る
   (`ListenDatagram=` の unit を「listening でない」ではなく**型の誤り**として報告するため)
-  (`grooveseek/src/transport/systemd_fd.rs:52-130`)
+  (`grooveseek/src/transport/systemd_fd.rs` の `check_listen_env` と
+  `check_listening_stream`)
 - **自前のアドレスとは排他**。`--bind` / `--port` / `[transport.http].bind` のいずれも、
-  これと並んで立つことを拒否する (`grooveseek/src/transport/mod.rs:330-360`)。
+  これと並んで立つことを拒否する
+  (`grooveseek/src/transport/mod.rs` の `resolve_systemd_listen`)。
   待ち受けアドレスが 2 つあるのは設定ではないし、黙って一方を勝たせれば
   **運用者は何も応答しないアドレスを読み続ける**ことになる
 - **動く場所は protocol がある場所**。`LISTEN_FDS` を渡す service manager を持つ Unix —
   Linux の systemd、および同じ protocol を話す他のもの。**Windows ビルドはフラグもキーも拒否する**
-  (`grooveseek/src/transport/mod.rs:307-309`)
+  (`grooveseek/src/transport/mod.rs` の `systemd_socket_supported`)
 - **family は descriptor から読む**。宣言させない。unit が bind した TCP socket は
   groove 自身が bind したものとまったく同じように扱われ (peer 検査も既定値の導出も含めて)、
   Unix socket は**アドレスを一切持たない listener** になる
-  (`grooveseek/src/transport/systemd_fd.rs:213-223`)
+  (`grooveseek/src/transport/systemd_fd.rs` の `adopt`)
 - **socket ファイルは groove が管理するものではない**。`shutdown(2)` を呼ばず、
   path を unlink もしない。service manager が自分の descriptor の複製を持ち続けており、
-  `systemd.socket(5)` は service が "must not unlink the socket from a file system" と書いている
+  `systemd.socket(5)` は service が
+  "must not unlink the socket from a file system" と書いている
 - **依存を増やさない**。`getsockopt` / `getsockname` / `fcntl` を、この crate が
   `cfg(unix)` で既に持っている `libc` から呼ぶ。`libsystemd` や `listenfd` は足さない
 
 ## 結果と代償
 
 - **listener がアドレスを持たない状態がありうるようになった**
-  (`grooveseek/src/transport/http.rs:898-956`)。それを読む判断は、peer 規則・
+  (`grooveseek/src/transport/http.rs` の `open_listener`)。それを読む判断は、peer 規則・
   `Host` の既定・`Origin` の既定・起動時の行であり、いずれも
   `open_listener` が返す同じ `Option<SocketAddr>` から来る
-  (`grooveseek/src/transport/http.rs:1046-1055`、`:1236`)。だから
+  (`run_http` の `match bound` と、そこから admin router へ渡す `peer:`。
+  どちらも `grooveseek/src/transport/http.rs`)。だから
   **見落としやすい場合** (unit が *TCP* の descriptor を渡してきた場合) を、
   一方では一通りに、その隣では別の通りに扱う、ということが起きない
 - **peer 検査はフラグではなく型で分かれる**。`UnixListener` は
@@ -143,7 +151,8 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
   「有効」と読めているのに、守っているはずの条件が黙って素通りしていた。
   `PeerRule::UnixLocal` が Unix 側で、その意味は
   **「socket の所有者と mode が既に決めた」**であって、
-  **「誰だか分からない」ではない** (`grooveseek/src/transport/http.rs:1681-1714`)
+  **「誰だか分からない」ではない**
+  (`grooveseek/src/transport/http.rs` の `PeerRule` と `admin_peer_rule`)
 - **ここで試験が守れる範囲は、決定より狭い**。Unix listener では `PeerRule` の 3 値が
   観測上すべて同じ答えを返す。検査が読む extension がそもそも付かないからである。
   Unix listener に対する挙動試験が守るのは `Host` / `Origin` の配線であり、
@@ -152,19 +161,20 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
   レビューだけである**
 - **`Origin` の既定は port 無しの loopback の綴りになる**。名指す port が無いからである。
   **port を持たない allow-list の entry は、そのホストの全 port に一致する**
-  (`grooveseek/src/transport/http.rs:673-681`) ので、`localhost` / `127.0.0.1` / `[::1]` を
-  名乗る `Origin` は**どの port を載せていても通り**、それ以外の `Origin` は拒否される。
+  (`grooveseek/src/transport/http.rs` の `NormalizedAuthority::matches`) ので、
+  `localhost` / `127.0.0.1` / `[::1]` を名乗る `Origin` は
+  **どの port を載せていても通り**、それ以外の `Origin` は拒否される。
   リストを空にしないのは意図的で、空は「`Origin` を検証しない」の綴りだからである
-- **`unsafe` が transport 層に入る**。ただし `systemd_fd.rs` の中だけで、そこの
-  `unsafe` ブロックは、生の descriptor 番号を所有へ変える 1 行を除いてすべて
-  `libc` の呼び出しである
-  (`grep -n "unsafe {" grooveseek/src/transport/systemd_fd.rs` が
-  `:93` / `:136` / `:139` / `:157` / `:273` を返す。`:336` 以降は `#[cfg(test)]`)。
-  **所有権が生まれるのは `take_listener` の `:273` だけ**で、しかも
-  所有せずにできる検査を先に済ませたあとである
-  (`grooveseek/src/transport/systemd_fd.rs:253-274`)。`adopt`
-  (`grooveseek/src/transport/systemd_fd.rs:213-223`) は `OwnedFd` を受け取るので、
-  その中に `unsafe` は現れない
+- **`unsafe` が transport 層に入る**。ただし `systemd_fd.rs` の中だけである。
+  試験を除いたブロックの内訳は、descriptor を読む `getsockopt` と
+  `getsockname`、フラグを 2 つ立てる `fcntl`、`getsockname` の書き込み先である
+  `sockaddr_storage` を埋める `mem::zeroed`、そして**唯一何かを生み出す**
+  `OwnedFd::from_raw_fd` である。
+  `grep -n "unsafe {" grooveseek/src/transport/systemd_fd.rs` で一覧できる —
+  この 5 つより後のヒットは `#[cfg(test)]` の中にある。
+  **所有権が生まれるのは `take_listener` の中だけ**で、しかも
+  所有せずにできる検査を先に済ませたあとである。`adopt` は `OwnedFd` を
+  受け取るので、その中に `unsafe` は現れない
 - **unit ファイルより先に運用者が越える version の下限ができる**。v1.10.0 以前は
   未知のキーを拒否するので、`systemd_socket` を書いた `groove.toml` は
   **それらのリリースをそもそも起動させない**。groove を先に上げ、それから unit を変える
