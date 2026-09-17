@@ -305,8 +305,9 @@ bind = "127.0.0.1:3100"
 # does not describe exactly one listening stream socket addressed to this
 # process, `serve` exits. Honoured only from a trusted config (see "TRUST"
 # above): from a file groove merely found, the key is dropped with a warning
-# and groove binds the default TCP address instead, so the sentence above is
-# about a config you named with --config.
+# and groove binds a TCP address instead -- `bind` from that same file if it
+# carries one (downgraded to loopback), otherwise the default. So the sentence
+# above is about a config you named with --config.
 #
 # The socket unit decides the path or address, its owner and its mode, which is
 # what makes it an access control -- and that is a setting you have to write.

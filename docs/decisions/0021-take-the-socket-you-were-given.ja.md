@@ -126,9 +126,13 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
   Linux の systemd、および同じ protocol を話す他のもの。**Windows ビルドはフラグもキーも拒否する**
   (`grooveseek/src/transport/mod.rs` の `systemd_socket_supported`)
 - **family は descriptor から読む**。宣言させない。unit が bind した TCP socket は
-  groove 自身が bind したものとまったく同じように扱われ (peer 検査も既定値の導出も含めて)、
-  Unix socket は**アドレスを一切持たない listener** になる
-  (`grooveseek/src/transport/systemd_fd.rs` の `adopt`)
+  groove 自身が bind したものと同じように扱われる — peer 検査も `/mcp` の既定値も、
+  bind の場合とまったく同じようにそのアドレスから導かれる。Unix socket は
+  **アドレスを一切持たない listener** になる
+  (`grooveseek/src/transport/systemd_fd.rs` の `adopt`)。
+  **唯一これに従わないのが admin の `Host` allow-list** で、
+  `allowed_admin_hosts` に足されるのは**このプロセス自身が bind した**アドレスだけである
+  (`grooveseek/src/server.rs` の `run_server`。`HttpListen::Tcp` で分解している)
 - **socket ファイルは groove が管理するものではない**。`shutdown(2)` を呼ばず、
   path を unlink もしない。service manager が自分の descriptor の複製を持ち続けており、
   `systemd.socket(5)` は service が

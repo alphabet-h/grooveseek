@@ -301,8 +301,18 @@ checked before the first byte. The `Host` default is the loopback aliases with
 no bound address to add, and the `Origin` default is their port-less spelling:
 an allow-list entry with no port matches every port on that host, so an `Origin`
 naming `localhost`, `127.0.0.1` or `[::1]` passes whatever port it carries, and
-any other `Origin` is refused. A TCP socket passed by a unit is not this case —
-it has an address, so every row of the table above applies to it unchanged.
+any other `Origin` is refused.
+
+**A TCP socket passed by a unit is not this case** — it has an address, so the
+table above applies to it, with one exception: the admin `Host` row.
+`allowed_admin_hosts` is built from the resolved listener, and only an address
+this process bound itself is added to it, so a descriptor's address is not. The
+`/mcp` and `/healthz` lists do add it. The difference is visible only when the
+unit names a loopback address other than `127.0.0.1` — with
+`ListenStream=127.0.0.2:3100`, `Host: 127.0.0.2:3100` passes on `/mcp` and is
+refused on `/ui` — and **no configuration widens the admin list**;
+`allowed_hosts` feeds `/mcp` and `/healthz` only. Reach `/ui` through one of
+the loopback aliases, or have the unit listen on `127.0.0.1`.
 
 **Those file permissions are a setting you have to write.** The unit decides
 them through `SocketMode=`, with `SocketUser=` and `SocketGroup=` naming the
@@ -311,7 +321,13 @@ socket every account on the host can open, which is the reachability a loopback
 TCP port already had. A unit carrying only `ListenStream=` therefore gains no
 separation, while the admin routes stop asking about the peer. GrooveSeek does
 not read the mode, does not report it, and cannot warn that it is wrong: the
-listener it was handed is the one it serves. See
+listener it was handed is the one it serves.
+
+One consequence for whatever forwards to that socket: the `Host` list is the
+loopback aliases, so a gateway that passes the browser's original `Host`
+through gets a `403` from `/mcp`, and no warning says so. Send a loopback
+`Host`, or name the public one in `allowed_hosts`. This is not new to Unix
+sockets — a proxy in front of a loopback TCP bind behaves the same way. See
 [ADR-0021](decisions/0021-take-the-socket-you-were-given.md).
 
 ### What this adds up to

@@ -281,8 +281,18 @@ unit が設定したファイル権限を満たしたことを意味し、それ
 無いぶんそれだけになる。`Origin` の既定はその **port 無しの綴り**になり、
 **port を持たない allow-list の entry はそのホストの全 port に一致する**ので、
 `localhost` / `127.0.0.1` / `[::1]` を名乗る `Origin` は**どの port を載せていても通り**、
-それ以外の `Origin` は拒否される。**unit が渡してきたのが TCP socket ならこの場合には
-当たらない** — アドレスを持つので、上の表の各行がそのまま当てはまる。
+それ以外の `Origin` は拒否される。
+
+**unit が渡してきたのが TCP socket ならこの場合には当たらない** — アドレスを持つので
+上の表が当てはまる。ただし **admin の `Host` の行だけは例外である**。
+`allowed_admin_hosts` は解決済みの listener から組み立てられ、**このプロセス自身が
+bind したアドレスだけ**が足されるので、渡された descriptor のアドレスは入らない。
+`/mcp` と `/healthz` のリストには入る。差が見えるのは unit が `127.0.0.1` 以外の
+loopback を名指した時だけで、`ListenStream=127.0.0.2:3100` なら
+`Host: 127.0.0.2:3100` は `/mcp` で通り `/ui` で拒否される。そして
+**admin のリストを広げる設定は無い** — `allowed_hosts` が効くのは `/mcp` と
+`/healthz` だけである。`/ui` へは loopback の別名で到達するか、unit に
+`127.0.0.1` で listen させること。
 
 **そのファイル権限は、自分で書かねばならない設定である。** 決めるのは unit の
 `SocketMode=` で、所有者は `SocketUser=` / `SocketGroup=` が名指す。そして
@@ -291,6 +301,12 @@ unit が設定したファイル権限を満たしたことを意味し、それ
 `ListenStream=` しか書かれていない unit では分離は 1 つも増えず、そのうえ admin 経路は
 peer を問わなくなる。GrooveSeek は mode を読まず、報告もせず、
 **間違っていても警告できない** — 渡された listener をそのまま serve するからである。
+
+その socket へ転送する側にも 1 つ効いてくる: `Host` のリストは loopback の別名なので、
+**ブラウザが送ってきた元の `Host` をそのまま通す gateway は `/mcp` から 403 を受け取る**。
+しかもそれを告げる警告は出ない。loopback の `Host` を送るか、公開ホスト名を
+`allowed_hosts` に明示すること。これは Unix socket に固有の話ではない —
+loopback TCP bind の前に proxy を置いた場合も同じである。
 [ADR-0021](decisions/0021-take-the-socket-you-were-given.ja.md) を参照。
 
 ### これが何を意味するか

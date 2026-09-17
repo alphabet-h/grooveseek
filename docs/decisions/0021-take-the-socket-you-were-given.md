@@ -141,9 +141,14 @@ was promised.**
   the same protocol. A Windows build refuses both the flag and the key
   (`systemd_socket_supported` in `grooveseek/src/transport/mod.rs`).
 - **The family is read off the descriptor**, not declared. A TCP socket a unit
-  bound is served exactly like one groove bound itself, peer check and derived
-  defaults included; a Unix socket becomes a listener with no address at all
-  (`adopt` in `grooveseek/src/transport/systemd_fd.rs`).
+  bound is served like one groove bound itself — the peer check and the `/mcp`
+  defaults are derived from its address exactly as they would be from a bind;
+  a Unix socket becomes a listener with no address at all
+  (`adopt` in `grooveseek/src/transport/systemd_fd.rs`). The admin `Host`
+  allow-list is the one thing that does not follow, because
+  `allowed_admin_hosts` adds only an address this process bound
+  (`run_server` in `grooveseek/src/server.rs`, which matches on
+  `HttpListen::Tcp`).
 - **The socket file is not groove's to manage.** It is never `shutdown(2)`n and
   its path is never unlinked: the service manager keeps its own copy of the
   descriptor, and `systemd.socket(5)` says a service "must not unlink the
