@@ -393,7 +393,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The shape that passes, so the two refusals above are not passing for
+    /// The shape that passes, so the refusals above are not passing for
     /// some reason of their own.
     #[test]
     fn a_listening_stream_socket_passes() {

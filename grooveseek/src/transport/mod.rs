@@ -308,6 +308,23 @@ pub(crate) const fn systemd_socket_supported() -> bool {
     cfg!(unix)
 }
 
+/// What `--systemd-socket` needs, in the one sentence every surface says it in.
+///
+/// **One question gets one implementation** (AGENTS.md). Two refusals name this
+/// requirement -- the build gate in [`resolve_systemd_listen`] below, and the
+/// `#[cfg(not(unix))]` arm of `open_listener` in [`http`] -- and they differ
+/// either side of it, because one is answering an operator and the other is
+/// reporting that a check above it was removed. What must not differ is the
+/// sentence itself: plan decision 7 requires the help text, the documentation
+/// and both refusals to say one thing rather than four. The `#[cfg(not(unix))]`
+/// arm is unreachable while `Transport::resolve` refuses first, which is
+/// exactly why a copy there could drift for a release without anyone reading
+/// it.
+///
+/// It is a sentence fragment, not a whole message: it starts after the flag
+/// name and ends with its own full stop.
+pub(crate) const SYSTEMD_SOCKET_REQUIREMENT: &str = "needs a service manager that passes LISTEN_FDS: systemd on Linux, or another Unix that speaks the same protocol.";
+
 /// The refusals that can be answered before anything opens a socket: a second
 /// listener was named beside the one the service manager owns, or this build
 /// has no such interface (spec 判断 4, conditions 1 and 5).
@@ -353,7 +370,7 @@ fn resolve_systemd_listen(
     // thing, rather than three different ones (plan decision 7).
     if !systemd_socket_supported() {
         anyhow::bail!(
-            "--systemd-socket (and [transport.http].systemd_socket) needs a service manager that passes LISTEN_FDS: systemd on Linux, or another Unix that speaks the same protocol. This build has no such interface. Use bind instead."
+            "--systemd-socket (and [transport.http].systemd_socket) {SYSTEMD_SOCKET_REQUIREMENT} This build has no such interface. Use bind instead."
         );
     }
     Ok(HttpListen::Systemd)
@@ -923,6 +940,44 @@ mod tests {
             !install.contains("starts_with(\"127.\")"),
             "no private loopback predicate in install.rs; it drifts from the router"
         );
+    }
+
+    /// (計画 4 段 A) The same shape for the `--systemd-socket` requirement
+    /// sentence, and it needs the scan more than the others do: the second
+    /// caller is `open_listener`'s `#[cfg(not(unix))]` arm, which
+    /// `Transport::resolve` makes unreachable. A copy there would compile on
+    /// one target, run on none, and drift for as long as nobody read it.
+    ///
+    /// The scan is on the literal rather than on behaviour for the reason the
+    /// loopback-alias test gives: a behavioural test still passes on the day
+    /// the copy is made.
+    #[test]
+    fn the_systemd_socket_requirement_has_no_second_spelling() {
+        let http = include_str!("http.rs");
+        assert!(
+            http.contains("SYSTEMD_SOCKET_REQUIREMENT"),
+            "http.rs must render the shared requirement sentence, not its own copy"
+        );
+        // The needle is the constant itself rather than a literal copy of it,
+        // for two reasons: the scan cannot drift from what it guards, and this
+        // test's own source never spells the sentence out. Spelling it here is
+        // what made the first version of this test fail on its own assert line.
+        for (name, src) in [("http.rs", http), ("mod.rs", include_str!("mod.rs"))] {
+            for (n, line) in src.lines().enumerate() {
+                // The definition itself is the one place the words appear.
+                if line.contains("pub(crate) const SYSTEMD_SOCKET_REQUIREMENT") {
+                    continue;
+                }
+                assert!(
+                    !line.contains(SYSTEMD_SOCKET_REQUIREMENT),
+                    "{name}:{} spells the requirement out again; render \
+                     SYSTEMD_SOCKET_REQUIREMENT instead so the help text, the \
+                     docs and both refusals cannot disagree -- line was: {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

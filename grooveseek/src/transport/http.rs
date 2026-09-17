@@ -945,12 +945,15 @@ async fn open_listener(
                 }
             }
         }
-        // The wording matches `resolve_systemd_listen`'s, because plan
-        // decision 7 says help, docs and refusals say one thing rather than
-        // three. Unreachable in practice: `Transport::resolve` refuses first.
+        // The requirement sentence is `SYSTEMD_SOCKET_REQUIREMENT`, shared with
+        // `resolve_systemd_listen`'s build gate, because plan decision 7 says
+        // help, docs and refusals say one thing rather than three. Unreachable
+        // in practice: `Transport::resolve` refuses first -- which is why a
+        // copy of the sentence here could drift unread.
         #[cfg(not(unix))]
         crate::transport::HttpListen::Systemd => anyhow::bail!(
-            "--systemd-socket needs a service manager that passes LISTEN_FDS: systemd on Linux, or another Unix that speaks the same protocol. Transport::resolve refuses it on this build, so reaching here means that check was removed."
+            "--systemd-socket {} Transport::resolve refuses it on this build, so reaching here means that check was removed.",
+            crate::transport::SYSTEMD_SOCKET_REQUIREMENT
         ),
     }
 }
@@ -976,11 +979,15 @@ async fn open_listener(
 ///   空 `Vec` を渡すと [`validate_host_header`] が **全 Host ヘッダを許可**
 ///   する (rmcp の `disable_allowed_hosts` 相当)。public 公開時は推奨されない。
 ///
-/// 加えて、bind が **非 loopback** (`0.0.0.0`、特定 LAN IP 等) の状態で
-/// `allowed_hosts` が `None` (= loopback only な default) のままなら、
-/// 起動時に `tracing::warn` を発してオペレータの注意を促す。loopback only
-/// の allow-list で外部 bind するのは「公開する気はあるが host 検証で
-/// reject される」というほぼ確実に意図しない構成なので。
+/// 加えて、**待ち受けアドレスがある**場合に限り、それが **非 loopback**
+/// (`0.0.0.0`、特定 LAN IP 等) で `allowed_hosts` が `None` (= loopback only な
+/// default) のままなら、起動時に `tracing::warn` を発してオペレータの注意を
+/// 促す。loopback only の allow-list で外部 bind するのは「公開する気はあるが
+/// host 検証で reject される」というほぼ確実に意図しない構成なので。
+///
+/// (計画 4 段 A) **アドレスを持たない listener ではこの警告は出ない** — 見る
+/// アドレスが無い。判定は [`open_listener`] の中にあり、そこだけが
+/// 「警告すべきアドレスがそもそも有るか」を知っている。
 pub async fn run_http(
     listen: crate::transport::HttpListen,
     allowed_hosts: Option<Vec<String>>,
