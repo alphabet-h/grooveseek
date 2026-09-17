@@ -1480,7 +1480,14 @@ pub async fn run_server(
         // `IpAddr::is_loopback` here, a `[::ffff:127.0.0.1]` bind — which the
         // CLI now accepts as loopback — was left out of the allow-list, so the
         // operator's own Host got 403 from the admin routes.
-        if let crate::transport::Transport::Http { addr, .. } = &transport
+        // (計画 4 段 A) `HttpListen::Systemd` does not enter this `if`, so no
+        // bind address joins the admin allow-list. A Unix socket has none, and
+        // a TCP descriptor the service manager bound is described by the
+        // listener rather than by anything resolvable here.
+        if let crate::transport::Transport::Http {
+            listen: crate::transport::HttpListen::Tcp(addr),
+            ..
+        } = &transport
             && crate::transport::http::is_loopback_peer(addr.ip())
         {
             // (codex P2 round 5 on PR #173) Every spelling a client might use
@@ -1555,7 +1562,7 @@ pub async fn run_server(
     let result = match transport {
         crate::transport::Transport::Stdio => crate::transport::stdio::run_stdio(&shared).await,
         crate::transport::Transport::Http {
-            addr,
+            listen,
             allowed_hosts,
             allowed_origins,
             healthz_public,
@@ -1564,7 +1571,7 @@ pub async fn run_server(
             // move shared to http runner (no clone needed — stdio branch
             // consumes it only by reference and is mutually exclusive).
             crate::transport::http::run_http(
-                addr,
+                listen,
                 allowed_hosts,
                 allowed_origins,
                 healthz_public,

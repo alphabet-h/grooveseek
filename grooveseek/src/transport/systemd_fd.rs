@@ -33,18 +33,13 @@ use anyhow::{Context, Result, bail};
 pub(crate) const LISTEN_FDS_START: RawFd = 3;
 
 /// The socket `groove serve --systemd-socket` was handed.
-// The listeners inside are never read until the wiring commit hands them to
-// `run_http`; nothing in this module has a reason to look into one, and
-// `dead_code` reports an unread field even when the variant is constructed.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum SystemdSocket {
     /// `AF_INET` / `AF_INET6`. Served exactly like a socket groove bound
     /// itself, peer check included.
     Tcp(std::net::TcpListener),
     /// `AF_UNIX`. No address and no port, which is what decides the admin
-    /// peer rule (`admin_peer_rule` in `crate::transport::http`, which the
-    /// wiring commit adds).
+    /// peer rule ([`crate::transport::http::admin_peer_rule`]).
     Unix(std::os::unix::net::UnixListener),
 }
 
@@ -230,10 +225,6 @@ pub(crate) fn adopt(fd: OwnedFd) -> Result<SystemdSocket> {
 /// The claim is taken before the environment is read, so a *second* call
 /// reports the double adoption rather than whatever `LISTEN_PID` says. The
 /// first error is the real reason; there is nothing here to retry.
-// The only caller is `run_http`, which the wiring commit adds; this one lands
-// the module and its tests alone. `LISTEN_FDS_START` and `TAKEN` are reachable
-// from nowhere else, so allowing it here keeps those two live as well.
-#[allow(dead_code)]
 pub(crate) fn take_listener() -> Result<SystemdSocket> {
     claim(&TAKEN)?;
     check_listen_env(

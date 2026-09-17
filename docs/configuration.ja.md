@@ -143,6 +143,14 @@ bind = "127.0.0.1:3100"
 # **対象は MCP 2025-11-25 以前のクライアントだけ** — 2026-07-28 には session が
 # 無く (SEP-2567)、その要求がこの上限で断られることはない (v0.19.0+)。
 # max_sessions = 256
+# 自分で bind せず、service manager が渡してきた待ち受け socket を受け取る。
+# LISTEN_FDS を渡す service manager (Linux の systemd、および同じ protocol を
+# 話す他の Unix) が要る。Windows ビルドはこのキーを拒否する。
+# 上の bind とは排他 — 待ち受けアドレスが 2 つあるのは設定ではないので、
+# groove はどちらかを選ばずに起動を拒否する。これを設定すると groove は TCP に
+# 落ちない: LISTEN_FDS がこのプロセス宛の listening stream socket をちょうど
+# 1 つ示していなければ、serve は終了する (v1.11.0+)。
+# systemd_socket = true
 
 # 任意: `groove eval` (retrieval 品質評価、パワーユーザ機能)。
 # モデル比較や回帰追跡のために `groove eval` を使うときだけ必要。
