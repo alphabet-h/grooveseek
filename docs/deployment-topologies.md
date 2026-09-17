@@ -272,7 +272,7 @@ about `/mcp`.
 | Route | Peer must be loopback | `Host` | `Origin` | Can configuration open it? |
 |---|---|---|---|---|
 | stdio | — (no socket) | — | — | No — it is a child process |
-| `/ui`, `/api/admin/status` | **Yes** | `allowed_admin_hosts`: loopback aliases plus the bind address when that is loopback. No config key | shared `allowed_origins` | **No.** The peer check is not configurable at all |
+| `/ui`, `/api/admin/status` | **Yes** (TCP listener) | `allowed_admin_hosts`: loopback aliases plus the bind address when that is loopback. No config key | shared `allowed_origins` | **No.** The peer check is not configurable at all |
 | `/mcp` | No | `effective_allowed_hosts`, default as above; replaceable via `[transport.http].allowed_hosts` (config only, no CLI flag) | `effective_allowed_origins`, default the loopback origins of the bound port; replaceable via `allowed_origins` | **Yes** — see below |
 | `/healthz` | No | mounted with no gate at all by default; the `/mcp` list only when `healthz_public = false` | never validated | `healthz_public` only |
 
@@ -289,6 +289,21 @@ Origin validation is **on by default**. With `allowed_origins` unset it defaults
 to the loopback origins of the port actually bound. A request carrying no
 `Origin` header still passes, per RFC 6454, so ordinary MCP clients and `curl`
 are unaffected. Setting the key *replaces* the default rather than extending it.
+
+**A listener that has no address.** With `[transport.http].systemd_socket` (or
+`--systemd-socket`) the socket comes from a systemd `.socket` unit, and when
+that unit names a filesystem path there is no address and no port. The peer
+column then reads differently: `ConnectInfo<SocketAddr>` does not exist for a
+Unix listener, so the admin routes take `PeerRule::UnixLocal` and let the
+connection through — not because the peer is unknown, but because reaching the
+socket at all required the file permissions the unit set, which the kernel
+checked before the first byte. The `Host` default is the loopback aliases with
+no bound address to add, and the `Origin` default is their port-less spelling:
+an allow-list entry with no port matches every port on that host, so an `Origin`
+naming `localhost`, `127.0.0.1` or `[::1]` passes whatever port it carries, and
+any other `Origin` is refused. A TCP socket passed by a unit is not this case —
+it has an address, so every row of the table above applies to it unchanged. See
+[ADR-0021](decisions/0021-take-the-socket-you-were-given.md).
 
 ### What this adds up to
 
@@ -392,3 +407,4 @@ the database side alone.
 - [ADR-0008](decisions/0008-declare-what-1-0-freezes.md) — what 1.0.0 freezes
 - [ADR-0009](decisions/0009-one-dns-rebinding-gate.md) — one DNS-rebinding gate
 - [ADR-0010](decisions/0010-settle-what-the-1-0-command-line-freezes.md) — the three questions ADR-0008 left open
+- [ADR-0021](decisions/0021-take-the-socket-you-were-given.md) — taking the listening socket from a service manager

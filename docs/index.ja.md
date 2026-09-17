@@ -72,6 +72,7 @@ Architecture Decision Record — 何を選び、どの代替案を退け、そ�
 | 18. 同じ範囲は 1 つの定義として扱う | [en](decisions/0018-one-range-is-one-definition.md) | [ja](decisions/0018-one-range-is-one-definition.ja.md) |
 | 19. frontmatter の key はすべて保持し、名指しは schema に任せる | [en](decisions/0019-hold-every-frontmatter-key-and-let-the-schema-name-it.md) | [ja](decisions/0019-hold-every-frontmatter-key-and-let-the-schema-name-it.ja.md) |
 | 20. schema が宣言したものを索引に持たせる | [en](decisions/0020-let-the-index-hold-what-the-schema-declares.md) | [ja](decisions/0020-let-the-index-hold-what-the-schema-declares.ja.md) |
+| 21. 渡された socket だけを受け、自分では作らない | [en](decisions/0021-take-the-socket-you-were-given.md) | [ja](decisions/0021-take-the-socket-you-were-given.ja.md) |
 
 ADR-0003 のファイル名は今も `kb-mcpignore` のままです。そこで説明されているファイルは
 現在 `.grooveignore` ですが、**ADR は merge 後に編集しません**。2026-08-17 より前の

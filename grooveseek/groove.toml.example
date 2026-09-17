@@ -296,6 +296,17 @@ bind = "127.0.0.1:3100"
 # statelessly, hold nothing, and are never refused by this limit.
 #max_sessions = 256
 
+# Take the listening socket from the service manager instead of binding one
+# (v1.11.0+). Needs a service manager that passes LISTEN_FDS -- systemd on
+# Linux, and any other Unix that speaks the same protocol; a Windows build
+# refuses the key. Exclusive with `bind` above: groove refuses to start rather
+# than pick one. With this on, groove never falls back to TCP -- if LISTEN_FDS
+# does not describe exactly one listening stream socket addressed to this
+# process, `serve` exits. The socket unit decides the path or address, its
+# owner and its mode, which is what makes it an access control.
+# See docs/decisions/0021-take-the-socket-you-were-given.md.
+#systemd_socket = true
+
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------
 # Only needed if you run `groove eval`. See docs/eval.md. The commented values
 # are the built-in defaults.

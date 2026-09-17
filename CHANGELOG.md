@@ -16,6 +16,22 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Added
 
+- **`groove serve` can take the listening socket from systemd.**
+  `--systemd-socket`, or `[transport.http].systemd_socket = true`, makes
+  `serve` accept on the descriptor a `.socket` unit already bound instead of
+  binding an address of its own; the unit decides the path or address, its
+  owner and its mode, so reachability becomes a file permission the kernel
+  checks. It is an explicit opt-in — groove does not look at `LISTEN_FDS`
+  unless told to — and it never falls back to TCP: a `LISTEN_PID` that names
+  another process, a `LISTEN_FDS` that is not exactly one, or a descriptor
+  that is not a listening stream socket all stop startup. It is exclusive
+  with `--bind` / `--port` / `[transport.http].bind`, and a Windows build
+  refuses it. Over a Unix socket the admin routes (`/ui`,
+  `/api/admin/status`) treat the connection as local, because the socket's
+  owner and mode already decided who could open it; over TCP the loopback
+  peer check is unchanged. See
+  [ADR-0021](docs/decisions/0021-take-the-socket-you-were-given.md).
+
 - **`groove doctor` looks at the declared-field set, and `groove status`
   counts it.** Since v1.9.0 the index records which `groove-schema.toml` keys
   its `document_fields` rows follow, and a search carrying `--field` /

@@ -6,10 +6,10 @@
 //! the kind of socket this server can serve on, and hands back an `std`
 //! listener. [`crate::transport::http::run_http`] turns that into a tokio one.
 //!
-//! **Why by hand rather than through `libsystemd` or `listenfd`.** Everything
-//! needed is `getsockopt`, `getsockname` and `fcntl`, and `libc` is already a
-//! `cfg(unix)` dependency of this crate, so the shipped binary grows no new
-//! edge. That is ADR-0021.
+//! **By hand, against the `libc` this crate already has on `cfg(unix)`, rather
+//! than through `libsystemd` or `listenfd`.** The reasoning, and the four
+//! shapes compared and not taken, are in ADR-0021
+//! (`docs/decisions/0021-take-the-socket-you-were-given.md`).
 //!
 //! **What `sd_listen_fds(3)` requires, and this module does.** Compare
 //! `$LISTEN_PID` with our own pid *first*, because a variable inherited from
