@@ -24,7 +24,7 @@
 //! environment. Instead [`take_listener`] can only succeed once per process,
 //! which is what unsetting the variables was going to buy.
 
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
@@ -193,21 +193,23 @@ static TAKEN: OnceLock<()> = OnceLock::new();
 
 /// Check a descriptor and take ownership of it. Reads no environment.
 ///
-/// The caller must have claimed it first, because this consumes the
-/// descriptor: the returned listener closes it on drop.
-pub(crate) fn adopt(fd: RawFd) -> Result<SystemdSocket> {
-    check_listening_stream(fd)?;
-    prepare_fd(fd)?;
-    match socket_family(fd)? {
-        // SAFETY: nothing else in this process owns this descriptor -- `claim`
-        // makes `take_listener` the only caller in production -- and the checks
-        // above proved it is a listening stream socket of this family.
-        libc::AF_UNIX => Ok(SystemdSocket::Unix(unsafe {
-            std::os::unix::net::UnixListener::from_raw_fd(fd)
-        })),
-        libc::AF_INET | libc::AF_INET6 => Ok(SystemdSocket::Tcp(unsafe {
-            std::net::TcpListener::from_raw_fd(fd)
-        })),
+/// The [`OwnedFd`] is the contract, not decoration. A caller cannot hand over
+/// a descriptor it merely borrowed, which is the mistake that ends with two
+/// owners closing one descriptor and the second `close(2)` landing on whatever
+/// the runtime handed out in between. Every refusal below drops the `OwnedFd`
+/// and so closes the descriptor exactly once, which is what lets a caller
+/// recover from the error rather than leak it; on success it moves into the
+/// listener and is closed there instead.
+///
+/// Both conversions are the safe `From<OwnedFd>` impls, so this function has no
+/// `unsafe` at all. The one place the module builds an `OwnedFd` out of a raw
+/// number is [`take_listener`].
+pub(crate) fn adopt(fd: OwnedFd) -> Result<SystemdSocket> {
+    check_listening_stream(fd.as_raw_fd())?;
+    prepare_fd(fd.as_raw_fd())?;
+    match socket_family(fd.as_raw_fd())? {
+        libc::AF_UNIX => Ok(SystemdSocket::Unix(fd.into())),
+        libc::AF_INET | libc::AF_INET6 => Ok(SystemdSocket::Tcp(fd.into())),
         other => bail!(
             "the socket systemd passed has address family {other}, which groove cannot serve; ListenStream= must name a filesystem path or an address and port"
         ),
@@ -220,6 +222,10 @@ pub(crate) fn adopt(fd: RawFd) -> Result<SystemdSocket> {
 /// unlinked: the service manager keeps its own copy of the descriptor, and
 /// `systemd.socket(5)` says a service "must not unlink the socket from a file
 /// system".
+///
+/// The claim is taken before the environment is read, so a *second* call
+/// reports the double adoption rather than whatever `LISTEN_PID` says. The
+/// first error is the real reason; there is nothing here to retry.
 // The only caller is `run_http`, which the wiring commit adds; this one lands
 // the module and its tests alone. `LISTEN_FDS_START` and `TAKEN` are reachable
 // from nowhere else, so allowing it here keeps those two live as well.
@@ -231,7 +237,15 @@ pub(crate) fn take_listener() -> Result<SystemdSocket> {
         std::env::var("LISTEN_FDS").ok().as_deref(),
         std::process::id(),
     )?;
-    adopt(LISTEN_FDS_START)
+    // SAFETY: the two lines above are the whole justification, and they are
+    // statements rather than a doc-comment promise. `claim` succeeded, so no
+    // earlier call in this process took descriptor 3 and nothing else here
+    // owns it; `check_listen_env` then confirmed `LISTEN_PID` names *this*
+    // process, so the descriptor is the one a service manager passed to us and
+    // not one an ancestor's environment described. This is the only place in
+    // the module that builds an `OwnedFd` out of a raw number.
+    let fd = unsafe { OwnedFd::from_raw_fd(LISTEN_FDS_START) };
+    adopt(fd)
 }
 
 #[cfg(test)]
@@ -356,23 +370,58 @@ mod tests {
         assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
     }
 
+    /// A refusal from inside [`adopt`] consumes the descriptor it was handed:
+    /// the `OwnedFd` moved in, and dropping it on the way out is what closes
+    /// it exactly once. The closing itself belongs to the type, so what this
+    /// pins is the half that is this module's -- that `adopt` really does take
+    /// ownership on the refusing path too, which a `RawFd` parameter left to a
+    /// doc comment and to whoever wrote the caller.
+    #[test]
+    fn adopt_refuses_a_datagram_socket_and_consumes_the_descriptor() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let err = adopt(OwnedFd::from(udp))
+            .expect_err("ListenDatagram= is not what this server serves")
+            .to_string();
+        assert!(err.contains("SOCK_STREAM"), "must name the type wanted: {err}");
+        assert!(err.is_ascii(), "diagnostics stay ASCII: {err}");
+    }
+
     /// The family gate. `AF_INET` and `AF_UNIX` are both served; anything else
     /// is refused by name, because `ListenStream=` can say things this server
     /// has no listener for.
     #[test]
     fn adopt_reads_the_family_from_the_descriptor() {
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TCP");
-        let fd = tcp.as_raw_fd();
-        std::mem::forget(tcp); // `adopt` takes ownership of the descriptor.
-        assert!(matches!(adopt(fd).expect("an AF_INET listener"), SystemdSocket::Tcp(_)));
+        assert!(matches!(
+            adopt(OwnedFd::from(tcp)).expect("an AF_INET listener"),
+            SystemdSocket::Tcp(_)
+        ));
 
-        let dir = crate::test_support::unique_temp_path("groove-sdfd");
+        // Both names are as short as they can be, because an `AF_UNIX` address
+        // is bounded by `sun_path` -- 108 bytes on Linux but 104 on macOS --
+        // and `unique_temp_path` already spends a pid, a nanosecond timestamp
+        // and a counter on top of `$TMPDIR`, which on a macOS runner is itself
+        // a `/var/folders/...` path. The assert is here so the tight runner
+        // says which limit it hit instead of failing inside `bind` as an
+        // opaque "invalid argument".
+        let dir = crate::test_support::unique_temp_path("g");
         std::fs::create_dir_all(&dir).expect("scratch dir");
-        let path = dir.join("s.sock");
+        let path = dir.join("s");
+        // SAFETY: `sockaddr_un` is plain data and zero is a valid pattern; this
+        // reads the length of its `sun_path` array for the target we are on.
+        let sun: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        assert!(
+            path.as_os_str().len() < sun.sun_path.len(),
+            "the socket path must fit sun_path ({} bytes) with room for the NUL, but it is {} bytes: {}",
+            sun.sun_path.len(),
+            path.as_os_str().len(),
+            path.display()
+        );
         let ux = std::os::unix::net::UnixListener::bind(&path).expect("bind AF_UNIX");
-        let ufd = ux.as_raw_fd();
-        std::mem::forget(ux);
-        assert!(matches!(adopt(ufd).expect("an AF_UNIX listener"), SystemdSocket::Unix(_)));
+        assert!(matches!(
+            adopt(OwnedFd::from(ux)).expect("an AF_UNIX listener"),
+            SystemdSocket::Unix(_)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
