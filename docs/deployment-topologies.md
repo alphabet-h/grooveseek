@@ -302,14 +302,24 @@ no bound address to add, and the `Origin` default is their port-less spelling:
 an allow-list entry with no port matches every port on that host, so an `Origin`
 naming `localhost`, `127.0.0.1` or `[::1]` passes whatever port it carries, and
 any other `Origin` is refused. A TCP socket passed by a unit is not this case —
-it has an address, so every row of the table above applies to it unchanged. See
+it has an address, so every row of the table above applies to it unchanged.
+
+**Those file permissions are a setting you have to write.** The unit decides
+them through `SocketMode=`, with `SocketUser=` and `SocketGroup=` naming the
+owner, and `systemd.socket(5)` gives `SocketMode=` a default of `0666` — a
+socket every account on the host can open, which is the reachability a loopback
+TCP port already had. A unit carrying only `ListenStream=` therefore gains no
+separation, while the admin routes stop asking about the peer. GrooveSeek does
+not read the mode, does not report it, and cannot warn that it is wrong: the
+listener it was handed is the one it serves. See
 [ADR-0021](decisions/0021-take-the-socket-you-were-given.md).
 
 ### What this adds up to
 
 **The one route you can expose is the one that does not authenticate anyone.**
 
-`/ui` and `/api/admin/status` are closed by the peer check, which a caller cannot
+`/ui` and `/api/admin/status` are closed, on a TCP listener, by the peer check,
+which a caller cannot
 forge — **but a reverse proxy forges it for them, by being the peer.** A proxy on
 the same host is itself a loopback caller, and its default `Host` is on the
 admin allow-list, so mapping `/ui` through it hands the page to anyone who can

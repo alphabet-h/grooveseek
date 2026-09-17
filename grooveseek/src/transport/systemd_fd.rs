@@ -7,8 +7,7 @@
 //! listener. [`crate::transport::http::run_http`] turns that into a tokio one.
 //!
 //! **By hand, against the `libc` this crate already has on `cfg(unix)`, rather
-//! than through `libsystemd` or `listenfd`.** The reasoning, and the four
-//! shapes compared and not taken, are in ADR-0021
+//! than through `libsystemd` or `listenfd`.** The reasoning is in ADR-0021
 //! (`docs/decisions/0021-take-the-socket-you-were-given.md`).
 //!
 //! **What `sd_listen_fds(3)` requires, and this module does.** Compare

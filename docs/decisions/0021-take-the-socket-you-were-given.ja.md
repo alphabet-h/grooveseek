@@ -60,10 +60,8 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
    そこに置いたままにしておくことが**「誰がここへの到達可否を決めたか」に答えを 1 つだけ残す**。
 
 4. **unit と groove の間に `systemd-socket-proxyd` を挟む** (systemd の man の
-   namespace の例が採っている形)。proxy の 4 つの性質を根拠に却下。いずれも一次情報:
+   namespace の例が採っている形)。proxy の 3 つの性質を根拠に却下。いずれも一次情報:
 
-   - **上流が生きていなくても接続を受け付ける**ので、呼び出し元の死活確認は
-     「接続できた」と報告してから待たされる。失敗にはならない
    - **接続ごとの timeout も `SO_KEEPALIVE` も無い**
      (<https://github.com/systemd/systemd/issues/23320>)。MCP の Streamable HTTP は
      接続を張り続けるので、半死の接続が `--connections-max=` の枠を食う
@@ -73,7 +71,13 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
    - **1 つの proxy は 1 つの socket にしか対応しない**
      (<https://github.com/systemd/systemd/issues/15599>)。配置を 1 つ増やすたびに unit が増える
 
-   加えて daemon ごとにプロセスが 1 つ前に挟まる。descriptor を直接受け取る形なら 0 である。
+   4 つ目の懸念には裏付ける文書が無いので、**推定**としてここに残す:
+   proxy は上流への接続を持つ前に接続を受け付けるので、呼び出し元の死活確認は
+   「接続できた」と答えられてから待たされ、失敗にはならないと考えられる。
+   **これは実測していない。**する必要も無かった — 上の 3 つで足りている。
+
+   いずれにせよ daemon ごとにプロセスが 1 つ前に挟まる。descriptor を直接
+   受け取る形なら 0 である。
 
 5. **`SO_PEERCRED` で接続元の uid を照合する**。却下 — そして**この道が開いているのは
    選択肢 4 のおかげ**である。proxy を通さないことが、資格情報が届く状態を残している。
@@ -143,15 +147,18 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
 - **ここで試験が守れる範囲は、決定より狭い**。Unix listener では `PeerRule` の 3 値が
   観測上すべて同じ答えを返す。検査が読む extension がそもそも付かないからである。
   Unix listener に対する挙動試験が守るのは `Host` / `Origin` の配線であり、
-  `run_http` が `peer` に渡す値を守るのは `admin_peer_rule` の単体試験とレビューである
+  `admin_peer_rule` が listener ごとに何を返すかは単体試験が守る。
+  **`run_http` が admin 経路にその戻り値を渡していること自体を守るのは、
+  レビューだけである**
 - **`Origin` の既定は port 無しの loopback の綴りになる**。名指す port が無いからである。
   **port を持たない allow-list の entry は、そのホストの全 port に一致する**
   (`grooveseek/src/transport/http.rs:673-681`) ので、`localhost` / `127.0.0.1` / `[::1]` を
   名乗る `Origin` は**どの port を載せていても通り**、それ以外の `Origin` は拒否される。
   リストを空にしないのは意図的で、空は「`Origin` を検証しない」の綴りだからである
-- **`unsafe` が transport 層に入る**。ただし `systemd_fd.rs` の中だけで、そこでの
-  出現は `libc` の呼び出しと、生の descriptor 番号を所有へ変える 1 行である
-  (`grep -n "unsafe" grooveseek/src/transport/systemd_fd.rs` が
+- **`unsafe` が transport 層に入る**。ただし `systemd_fd.rs` の中だけで、そこの
+  `unsafe` ブロックは、生の descriptor 番号を所有へ変える 1 行を除いてすべて
+  `libc` の呼び出しである
+  (`grep -n "unsafe {" grooveseek/src/transport/systemd_fd.rs` が
   `:93` / `:136` / `:139` / `:157` / `:273` を返す。`:336` 以降は `#[cfg(test)]`)。
   **所有権が生まれるのは `take_listener` の `:273` だけ**で、しかも
   所有せずにできる検査を先に済ませたあとである
@@ -164,7 +171,11 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
 - **到達性が groove の知らないものになる**。socket の path・所有者・mode、および
   unit がその周りに設定するものがアクセス制御であり、そのどれもプロセスの中からは見えない。
   groove はそれを検査せず、報告せず、**間違っていても警告できない** —
-  非 loopback bind の警告は、この listener では見るものを持たない
+  非 loopback bind の警告は、この listener では見るものを持たない。
+  これは運用者側に 1 手を課すことであり、この記録が黙っていてよい話ではない:
+  `systemd.socket(5)` の `SocketMode=` の既定は `0666` なので、
+  `ListenStream=` しか書かれていない unit が返すのは、
+  **上の背景で挙げた loopback ポートとまったく同じ到達性**である
 - **拒否文がインタフェースである**。fallback が無い以上、serve できない形はすべて
   起動失敗であり、そこで表示される文が運用者の手がかりのすべてになる。
   拒否文は ASCII を保ち、**期待した値だけでなく読み取れた値も名指す**
@@ -172,8 +183,8 @@ GrooveSeek は誰も認証しない。`--i-know` 無しで非 loopback な bind 
 ## 参考
 
 - `sd_listen_fds(3)` — 受け渡しの protocol と検査の順序。`systemd.socket(5)` —
-  `Accept=no` と socket を unlink しないこと。`systemd-socket-proxyd(8)` —
-  proxy が転送しないもの
+  `Accept=no`、socket を unlink しないこと、および `SocketMode=` の既定 `0666`。
+  `systemd-socket-proxyd(8)` — proxy が転送しないもの
 - [ADR-0009](0009-one-dns-rebinding-gate.ja.md) — ここでの既定値が流れ込む gate、および
   `Host` / `Origin` を GrooveSeek 自身が答える理由
 - [deployment-topologies.ja.md](../deployment-topologies.ja.md) —

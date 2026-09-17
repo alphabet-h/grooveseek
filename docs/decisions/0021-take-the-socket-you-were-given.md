@@ -67,12 +67,9 @@ was promised.**
    this".
 
 4. **Put `systemd-socket-proxyd` between the unit and groove**, the arrangement
-   the systemd manual's own namespace example uses. Rejected on four properties
-   of the proxy, each from a primary source:
+   the systemd manual's own namespace example uses. Rejected on three
+   properties of the proxy, each from a primary source:
 
-   - it accepts a connection whether or not the upstream is alive, so a
-     caller's liveness check reports a connection and then waits, rather than
-     failing;
    - it has no per-connection timeout and no `SO_KEEPALIVE`
      (<https://github.com/systemd/systemd/issues/23320>), while MCP over
      Streamable HTTP holds connections open — half-dead ones would sit in its
@@ -84,8 +81,14 @@ was promised.**
      (<https://github.com/systemd/systemd/issues/15599>), so each added
      deployment adds a unit.
 
-   It also puts a second process in front of each daemon, where taking the
-   descriptor directly puts none.
+   A fourth concern has no document behind it and is recorded here as the
+   estimate it is: the proxy accepts a connection before it has one to the
+   upstream, so a caller's liveness check would be answered "connected" and
+   then left waiting, rather than failing. **This was not measured**, and it
+   did not have to be — the three above were enough on their own.
+
+   Either way it puts a second process in front of each daemon, where taking
+   the descriptor directly puts none.
 
 5. **Check the connecting uid with `SO_PEERCRED`.** Rejected — and option 4 is
    what makes it available to reject, since not going through the proxy is
@@ -163,9 +166,9 @@ was promised.**
 - **What a test can hold here is narrower than the decision.** Over a Unix
   listener the three `PeerRule` values are observationally identical, because
   the extension the check reads is never attached at all. A behavioural test
-  against such a listener pins the `Host` and `Origin` wiring; the value
-  `run_http` passes for `peer` is held by the unit test of `admin_peer_rule`
-  and by review.
+  against such a listener pins the `Host` and `Origin` wiring, and a unit test
+  pins what `admin_peer_rule` maps each listener to; **that `run_http` hands
+  the admin routes the value that function returned is held by review alone.**
 - **The `Origin` default becomes the port-less loopback spellings**, because
   there is no port to name. An allow-list entry with no port matches every port
   on that host (`grooveseek/src/transport/http.rs:673-681`), so an `Origin`
@@ -173,10 +176,10 @@ was promised.**
   and every other `Origin` is refused. The list is deliberately not empty:
   empty is how "do not validate `Origin` at all" is spelled.
 - **`unsafe` enters the transport layer**, confined to `systemd_fd.rs`, where
-  it is the `libc` calls plus the one line that turns a raw descriptor number
-  into an owner (`grep -n "unsafe" grooveseek/src/transport/systemd_fd.rs`
-  answers `:93`, `:136`, `:139`, `:157`, `:273`; from `:336` on it is
-  `#[cfg(test)]`). **Ownership is created only at `take_listener`'s `:273`**,
+  every `unsafe` block is a `libc` call except the one line that turns a raw
+  descriptor number into an owner
+  (`grep -n "unsafe {" grooveseek/src/transport/systemd_fd.rs` answers `:93`,
+  `:136`, `:139`, `:157`, `:273`; from `:336` on it is `#[cfg(test)]`). **Ownership is created only at `take_listener`'s `:273`**,
   and only after the checks that can be made without owning the descriptor have
   run (`grooveseek/src/transport/systemd_fd.rs:253-274`). `adopt`
   (`grooveseek/src/transport/systemd_fd.rs:213-223`) takes an `OwnedFd`, so no
@@ -189,7 +192,11 @@ was promised.**
   owner and mode, and whatever else the unit sets around it, are the access
   control, and none of it is visible from inside the process. groove does not
   check it, does not report it, and cannot warn that it is wrong — the
-  non-loopback bind warning has nothing to look at on this listener.
+  non-loopback bind warning has nothing to look at on this listener. That puts
+  a step on the operator that this record should not leave implicit:
+  `systemd.socket(5)` gives `SocketMode=` a default of `0666`, so a unit that
+  writes only `ListenStream=` hands back exactly the reachability the loopback
+  port in the Context above already had.
 - **The refusals are the interface.** With no fallback, every shape that cannot
   be served is a startup failure, and the sentence printed is what the operator
   has to work from. They stay ASCII, and they name the value that was read
@@ -198,8 +205,9 @@ was promised.**
 ## References
 
 - `sd_listen_fds(3)` for the handover protocol and the order of its checks;
-  `systemd.socket(5)` for `Accept=no` and for not unlinking the socket;
-  `systemd-socket-proxyd(8)` for what the proxy does not forward.
+  `systemd.socket(5)` for `Accept=no`, for not unlinking the socket, and for
+  `SocketMode=`'s default of `0666`; `systemd-socket-proxyd(8)` for what the
+  proxy does not forward.
 - [ADR-0009](0009-one-dns-rebinding-gate.md) for the gate these defaults feed,
   and for why GrooveSeek answers `Host` and `Origin` itself.
 - [deployment-topologies.md](../deployment-topologies.md) for what each route

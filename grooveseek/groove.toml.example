@@ -217,7 +217,8 @@ kind = "stdio"
 # decision. That holds only for a trusted config (see "TRUST" above): from a
 # file groove found in the working directory or a `.git` ancestor, a
 # non-loopback bind is moved back to 127.0.0.1 (keeping the port), and
-# allowed_hosts, allowed_origins, healthz_public and max_sessions below are
+# allowed_hosts, allowed_origins, healthz_public, max_sessions and
+# systemd_socket below are
 # dropped back to their defaults, each with a warning. groove ships NO
 # authentication of its own, so before exposing it to anything untrusted, set
 # `allowed_hosts` below and put a reverse proxy that does authenticate in front
@@ -302,9 +303,18 @@ bind = "127.0.0.1:3100"
 # refuses the key. Exclusive with `bind` above: groove refuses to start rather
 # than pick one. With this on, groove never falls back to TCP -- if LISTEN_FDS
 # does not describe exactly one listening stream socket addressed to this
-# process, `serve` exits. The socket unit decides the path or address, its
-# owner and its mode, which is what makes it an access control.
-# See docs/decisions/0021-take-the-socket-you-were-given.md.
+# process, `serve` exits. Honoured only from a trusted config (see "TRUST"
+# above): from a file groove merely found, the key is dropped with a warning
+# and groove binds the default TCP address instead, so the sentence above is
+# about a config you named with --config.
+#
+# The socket unit decides the path or address, its owner and its mode, which is
+# what makes it an access control -- and that is a setting you have to write.
+# Set SocketMode= on the .socket unit, with SocketUser= / SocketGroup= to say
+# who the owner is: the systemd default is 0666, a socket every account on the
+# host can open, which is the reachability a loopback TCP port already had.
+# groove does not read the mode, does not report it, and cannot warn that it is
+# wrong. See docs/decisions/0021-take-the-socket-you-were-given.md.
 #systemd_socket = true
 
 # --- [eval] — retrieval quality evaluation (power-user, optional) ---------

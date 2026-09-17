@@ -21,7 +21,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `serve` accept on the descriptor a `.socket` unit already bound instead of
   binding an address of its own; the unit decides the path or address, its
   owner and its mode, so reachability becomes a file permission the kernel
-  checks. It is an explicit opt-in — groove does not look at `LISTEN_FDS`
+  checks — one the unit has to set, since `SocketMode=` defaults to `0666` and
+  groove does not read it. It is an explicit opt-in — groove does not look at
+  `LISTEN_FDS`
   unless told to — and it never falls back to TCP: a `LISTEN_PID` that names
   another process, a `LISTEN_FDS` that is not exactly one, or a descriptor
   that is not a listening stream socket all stop startup. It is exclusive

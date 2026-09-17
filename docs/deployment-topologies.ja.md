@@ -283,13 +283,22 @@ unit が設定したファイル権限を満たしたことを意味し、それ
 `localhost` / `127.0.0.1` / `[::1]` を名乗る `Origin` は**どの port を載せていても通り**、
 それ以外の `Origin` は拒否される。**unit が渡してきたのが TCP socket ならこの場合には
 当たらない** — アドレスを持つので、上の表の各行がそのまま当てはまる。
+
+**そのファイル権限は、自分で書かねばならない設定である。** 決めるのは unit の
+`SocketMode=` で、所有者は `SocketUser=` / `SocketGroup=` が名指す。そして
+`systemd.socket(5)` の `SocketMode=` の既定は `0666` — **ホスト上のどのアカウントからも
+開ける socket** であり、これは loopback の TCP ポートが既に持っていた到達性と同じである。
+`ListenStream=` しか書かれていない unit では分離は 1 つも増えず、そのうえ admin 経路は
+peer を問わなくなる。GrooveSeek は mode を読まず、報告もせず、
+**間違っていても警告できない** — 渡された listener をそのまま serve するからである。
 [ADR-0021](decisions/0021-take-the-socket-you-were-given.ja.md) を参照。
 
 ### これが何を意味するか
 
 **外に出せる唯一の口が、誰も認証しない口である。**
 
-`/ui` と `/api/admin/status` は peer 検査で閉じている — これは呼び出し側が偽造できない。
+`/ui` と `/api/admin/status` は、**TCP listener では** peer 検査で閉じている —
+これは呼び出し側が偽造できない。
 **ただしリバースプロキシは「peer そのものになる」ことで偽造してしまう。** 同一ホストの
 proxy は自身が loopback の呼び出し元であり、既定の `Host` も admin の allow-list に
 載っているので、**`/ui` を proxy 経由で公開すると、その proxy に届く誰にでもページを
