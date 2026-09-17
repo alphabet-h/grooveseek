@@ -202,7 +202,7 @@ severity は **`critical` / `high` / `medium` / `low`** の 4 段 (同 file の 
 | Verdict | controller の手 |
 |---|---|
 | `approve` | sweep を済ませて push |
-| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。`[low]` だけなら内容を見て即決: **skip なら push してよい、取り込むなら diff が変わるので次の round を打つ** (その round も上限に数える) |
+| `needs-attention` | **`[critical]` / `[high]` / `[medium]` は push を止める** — 取り込むか、反証できる指摘は **実測つきの反証**を次の focus に書いて再実行 (「一理ある」で従わない — 台帳 category 6 の 23 回目)。**取り込む指摘なら severity を問わず、形が「読んでから書くまでに何かが挟まり得る」ものは「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通してから取り込む** (`[low]` も同じ — 兄弟の書き込み点を残すと、残り round をそこで使う)。`[low]` だけなら内容を見て即決: **skip なら push してよい、取り込むなら diff が変わるので次の round を打つ** (その round も上限に数える) |
 | exit ≠ 0 / `Verdict` 行が無い | `local-N.err` を読む。model 拒否 (400 / 404) / capacity / runtime の残留を切り分ける。判定材料が無いだけで「指摘なし」ではない |
 
 **上限は push 1 回につき 3 round** — 打った回数で数える (approve で終わる round も、`[low]` を取り込んで
@@ -212,6 +212,9 @@ cost と、収束しない loop は spec の問題という判定)。**3 round �
 `[critical]` / `[high]` が残っているなら fix が次の指摘を生んでいる (台帳 category 6) = user に相談
 (介入ポイント 3)。`[medium]` / `[low]` だけなら取り込んで **4 round 目は打たず push** し、取り込んだ内容を
 PR 本文に書いて GitHub round に確認させる (GitHub が最終確認、の役割どおり)。自分で上限を上げない。
+**ここで取り込む指摘も severity を問わず、形が「読んでから書くまでに何かが挟まり得る」ものは**
+**「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す** — 次のローカル round が
+無いので、残した兄弟の書き込み点は GitHub round まで残る。
 **fix を書いたら「その fix の最悪ケース」を自分で 1 つ書いてから出す** — r10 の fix (KNN の page が
 空でも広げる) は r11 で「match 0 の corpus が cap まで広げ続ける」と返った。
 
@@ -244,8 +247,8 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 | exit / stdout | 意味 | controller の手 |
 |---|---|---|
 | `CONVERGED=true` **かつ `first_invocation=true`** | PR を開いた直後の round。指摘は差分ではなく **baseline** 側にいる (罠 51) | stdout 冒頭の `=== Baseline ... ===` を読んでから収束を宣言する |
-| `CONVERGED=true` | 収束 (P2 / P3 の note が付くことがある) | P2 / P3 は内容を見て取り込み or skip を即決。merge へ |
-| `WARN P0/P1 issues present` | blocking な指摘あり | `=== Inline P0/P1 ===` と `=== Top-level summary ===` を読んで fix → push → 次 round。上限は script が見張る (exit 7) |
+| `CONVERGED=true` | 収束 (P2 / P3 の note が付くことがある) | P2 / P3 は内容を見て取り込み or skip を即決。**取り込む指摘は P2 でも P3 でも、形が「読んでから書くまでに何かが挟まり得る」ものなら「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通してから**。merge へ |
+| `WARN P0/P1 issues present` | blocking な指摘あり | `=== Inline P0/P1 ===` と `=== Top-level summary ===` を読んで fix → push → 次 round。**指摘が「読んでから書くまでに何かが挟まり得る」形なら、fix の前に「指摘を fix に写す前に、不変条件の書き込み点を表にする」節を通す**。上限は script が見張る (exit 7) |
 | `INDETERMINATE (... produced nothing ...)` | 3 endpoint とも 0 件 = **答えが無かった** (罠 57)。`state_ok` は前 round の残り香 | quota (罠 56) / 未達 (罠 47) / 沈黙 (罠 9) を切り分けて user 報告 |
 | `INDETERMINATE (no sentinel + no clean state)` | 判定材料不足 | `=== Inline, this round - ALL ===` を人が読む。必要なら再 trigger |
 | exit 3 | reaction はあるが答えない (罠 9) | user に escalate ("suspect stale connector") |
@@ -259,6 +262,81 @@ PR の `@codex review` 投稿履歴から導く。stderr 1 行目の `round N/M`
 
 `=== Inline, this round - ALL of them ===` は badge の有無を問わず全部出す (罠 23: 列挙の外に指摘が来る)。
 P-badge の計数が 0 でもここを読む。
+
+## 指摘を fix に写す前に、不変条件の書き込み点を表にする
+
+**取り込むと決めた、コードに対する指摘なら、出どころも severity も badge の体系も問わず、
+形が「読んでから書くまでに何かが挟まり得る」ものは、この節を通してから fix に写す。**
+対象は**既にあるコード**への指摘 — 実装後の task review / 最終 review / ローカル前掃除 /
+GitHub round。**spec や plan への指摘は書き込み点がまだ無いので表にしない**。その形の指摘を
+spec / plan の段階で受けたら、不変条件の 1 行をそこに書いておき、表は実装後に作る。
+GitHub round の P0/P1 / P2 / P3 でも、ローカル前掃除の `[critical]` / `[high]` / `[medium]` /
+`[low]` でも同じ — **これは例であって条件ではない**。条件は「取り込む」「コードに対する」「形」の
+3 つで、severity の列挙に読み替えない (列挙は必ず 1 つ足りなくなる)。形の見分けは badge ではなく
+文面でする — 「X を読んでいる、その後 Y を書いている、その間に Z が挟まり得る」と読める指摘が
+ここへ来る。
+この形は**指摘された行だけ直すと、同じ不変条件の別の書き込み点が次の round で返る**。
+grooveseek-gate PR #3 は 1 つの不変条件 (「Argon2 を待つ前に読んだ判断 — hash / disabled /
+lock / session の有無 / 実行者自身の admin 権限と session — は、それが正当化する書き込みと
+同じ SQL 文で読み直す。状態変更と session 削除は 1 transaction にする」) に round を使い切った。
+台帳 `.dev/knowledge/repeat-offences-ledger.md` の category「自分の修正が次の指摘を生む連鎖」
+(**対策が効いていない**と印の付いた category) の最新 instance がこれで、経緯は
+`grep -n 'CODEX round' .dev/archive/2026-09-16-plan3-web-gui-sdd/progress.md` で引ける。
+
+**step 1 — 不変条件を書く (controller)。** 指摘ごとに 1 行、**fix ではなく不変条件**を:
+「**X を読んでから Y を書くまでに Z が挟まり得る → X の再確認は Y と同じ atomic な境界の中**」。
+**境界の名前は状態で変わる** (SQL なら同じ文 / 同じ transaction、in-memory なら lock を握った
+1 区間か compare-and-swap、file なら**読みから公開までを覆う** lock / version 検査 (CAS) などの
+直列化)。**`rename` 単体を境界と書かない** — atomic になるのは公開だけで、2 つの書き手が同じ X を
+読んでから別々の版を rename すれば Z はやはり挟まる。rename を挙げてよいのは、読みを覆う
+直列化がある protocol の**最後の一歩**としてだけ。
+fix の文 (「reset で session を消す」) を先に書くと視野がその行に閉じる。そこが連鎖の入口だった。
+
+**step 2 — 列挙は subagent に出す。** **dispatch するのは 1 つだけ。model は opus、仕事は表を
+作ることだけ。** **Explore 型は使わない** — read-only な代わりに Write tool を持たないので、
+表を file に落とせない。出すのは general-purpose で、**出力先の path は controller が brief の中で
+名指しする** (scratchpad の下)。あわせて「**その file 以外は書かない、repo の中は読むだけ**」と
+書き添える。brief には step 1 の行と、**引く語を名指しで**書く (名指しの無い brief は浅い —
+ローカル前掃除の focus と同じ)。**語は step 1 が名指した状態と書き込み操作から引く**:
+SQL なら column 名 / store の method 名 / handler 名と `UPDATE` / `INSERT` / `DELETE`
+(`grep -rn "UPDATE users" <crate>/src/` のように column 側からも method 名側からも引かせる。
+`<crate>` は review 対象の crate で、この repo なら `grooveseek/` — root 直下に `src/` は無い)、
+file の状態なら
+write / rename / remove の呼び出しと path の定数 (`grooveseek/src/eval.rs` の history 保存は tmp に
+書いて `std::fs::rename` で置いている。**引く語の在りかであって、境界の例ではない**)、
+in-memory の状態なら lock を取っている箇所と
+その field を書き換えている箇所の**全部** (`grooveseek/src/server.rs` の `Arc<Mutex<_>>` 越しの
+state)、API 側の変更なら endpoint の handler。**SQL はその一例であって定義ではない。**
+返させるのは 4 列の表だけ。**1 行 = 1 つの呼び出し経路であって、1 つの書き込み位置ではない。**
+同じ書き込み点が複数の経路から呼ばれるなら**経路ごとに行を分け**、`file:line` は重複してよい —
+共有の mutation helper や 1 本の SQL 文が、X に依存する handler からも無条件の初期化 / import /
+reset からも呼ばれる形がある。1 行に畳むと、その行に `n/a` も `no` も書けなくなる:
+
+| 列 | 中身 |
+|---|---|
+| `file:line` | 書き込み点の位置。経路が違えば同じ値が何行あってもよい |
+| 経路 | そこへ到達する入口 — handler / CLI subcommand / 初期化などを `file:line` か関数名で |
+| 守られているか | `yes` / `no` / `n/a` + 1 句の理由 (「同じ文で読み直している」/「別 statement で reset している」)。**`n/a` はその経路が X を読んでいないとき** — 初期化、import、意図的に上書きする管理者 reset のような、X に依存しない書き手。理由には**なぜその経路が X を読まないのか**を書く。**判断を避けるための `n/a` は禁止** — 読まない理由を 1 句で書けないなら `no` にして controller に渡す |
+| 直す先 | 移す先の atomic な境界 (同じ SQL 文 / transaction、lock を握った 1 区間、読みから公開までを覆う lock / version 検査 など、状態に合ったもの)。`rename` 単体は公開を atomic にするだけなので境界にならない。`yes` / `n/a` の行は空でよい |
+
+**subagent は直さない。severity も付けない。列挙するだけ。** 判定を持たせると「これは重要でない」で
+行が落ちる。**返させるのは表そのものではなく、その file の path** — inline text は truncate される。
+
+**step 3 — 表で `no` になった経路は、指摘された行とまとめて同じ fix wave に入れる。**
+fix の brief は**表をそのまま貼って始める**。指摘された行だけ直して push すると、
+その push が次の round の指摘を作る。**`yes` と `n/a` の行は fix に入れず、表に残す** —
+何を見て、なぜ触らないと決めたかの記録がそこにしか無い。
+
+**step 4 — 表に無い書き込み点や経路が次の round で指摘されたら**、それは同じ category の新しい
+instance = **台帳に記録する**。あわせて **brief の grep 語を広げ、何が漏れていたかを書く**
+(column 名か、別入口の handler か、別 statement に分かれた reset か、同じ書き込み点へ届く別経路か、
+そもそも grep していなかった状態の持ち方か)。
+
+**なぜ controller ではなく subagent か。** controller は既に fix を頭に置いていて、grep の結果を
+**確認**として読む — 当たっている行は見えるが、当たっていない行は目に入らない。gate PR #3 の
+round 4 は台帳のこの層をそのとおり controller 自身が打った round で、それでも実行者自身の
+session の有無 (round 5 で指摘) と、別 statement に分かれた期限切れ lock の reset (round 6 で指摘)
+が漏れた。列挙を「fix を知らない者の唯一の仕事」にするのがこの節の全部。
 
 ## max_rounds の根拠
 

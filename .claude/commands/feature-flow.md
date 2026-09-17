@@ -72,7 +72,7 @@ spec を `.dev/specs/<feature-NN-name>.md` に起草する (groove の `CLAUDE.l
 その後 **subagent review loop** を回す:
 
 1. **dispatch**: `superpowers:code-reviewer` (or `feature-dev:code-reviewer`) に spec を渡し、低/中/高/重大の 4 段階で指摘を返させる
-2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
+2. **fix**: 指摘を spec に取り込む (controller agent 自身が edit)。**読んでから書くまでに何かが挟まり得る形の指摘なら、不変条件を 1 行で spec に書く** (書き込み点がまだ無いので表は作らない — 表は実装後、`.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節)。前段の判断が覆る指摘の場合のみユーザに確認 (← 介入ポイント 3)
 3. **re-dispatch**: 同じ subagent に「low-only に到達したか」を再評価させる
 4. **convergence**: low-only or "no major issues" が 2 round 連続で得られたら脱出。最大 5 round。5 round で収束しないなら spec 起草の前提が崩れている = ユーザに再相談
 
@@ -104,7 +104,7 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 `superpowers:subagent-driven-development` skill に plan を渡して実装を回す。**この skill 内部で**:
 
 - task ごとに implementer subagent + spec compliance reviewer + code quality reviewer の 3 段
-- review round の中間 fix もユーザ非介在
+- review round の中間 fix もユーザ非介在。**reviewer の指摘が `.claude/skills/codex-review/SKILL.md` の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形なら、その節どおり表にしてから fix に写す** (codex round を待たず、ここで兄弟の書き込み点を拾う)
 - task 単位で `feat(<scope>): ...` 形式のコミット 1 個
 - PR は phase 区切り (PR-1 / PR-2 / ...) で作成
 
@@ -122,8 +122,8 @@ plan も Phase 2 と同様に subagent self-review loop で収束させる (内�
 2. `gh pr create` で PR 作成 (title + body は controller が自動 draft)
 3. **`/codex-review <PR#> 5` skill を invoke** (= `.claude/skills/codex-review/SKILL.md`、`5` で max_rounds を CLAUDE.local.md guardrail と揃える — 揃えないと本 command と skill で default がずれる、PR #54 codex round 2 の P2)。1 round = `.claude/skills/codex-review/scripts/codex_review_round.sh` 1 回で、trigger / 3 endpoint polling / 収束判定 / 整形 / round 上限はすべて script の中
 4. controller (= main agent) は **script の verdict だけを読む** — stdout の `CONVERGED=` 行とその直前の判定行、および exit code。**判定の predicate (sentinel 文言 / P-badge の数え方 / 何を再 round にするか) をここに書き写さない**: 2 か所にあると script と食い違い、sentinel と P1 が同時に来た round で blocking な指摘を飛ばすか、P2 だけの round で無駄な 1 round を回す (codex P1 on PR #222、AGENTS.md "One question gets one implementation")。読み方の家は SKILL.md の **GitHub round 側**の「結果の読み方」の表 (「1 round の回し方」の次の節。step 0 (b) の「ローカルの結果の読み方」は別の表で、`CONVERGED` も exit code も持たない)。そこから本 phase の分岐だけ言い直すと:
-   - `CONVERGED=true` → step 5 へ。P2 / P3 の note が付いていたら内容を見て取り込み or skip を即決する (再 round はしない)
-   - `WARN P0/P1 issues present` → 取り込み、regression test を 1 件追加、**step 0 (sweep + ローカル Codex) を通してから** 再 push → goto step 3 (re-trigger body 付きで `/codex-review` 再 invoke)
+   - `CONVERGED=true` → step 5 へ。P2 / P3 の note が付いていたら内容を見て取り込み or skip を即決する。取り込む指摘は P2 でも P3 でも、SKILL.md の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形なら、その節どおり表にしてから取り込む。いずれの場合も再 round はしない
+   - `WARN P0/P1 issues present` → 指摘が SKILL.md の「指摘を fix に写す前に、不変条件の書き込み点を表にする」節の形 (読んでから書くまでに何かが挟まり得る) なら、その節どおり表にしてから取り込み、そうでなければそのまま取り込み (**verdict が決めるのは再 round の要否だけで、形の判定と不変条件を書くために読むのは inline の指摘本文** — 読み方は同 SKILL.md の「結果の読み方」の表)、regression test を 1 件追加、**step 0 (sweep + ローカル Codex) を通してから** 再 push → goto step 3 (re-trigger body 付きで `/codex-review` 再 invoke)
    - `INDETERMINATE` / exit 3〜9 → SKILL.md の表のとおり。**exit 7 (= 5 round 到達、何も投稿していない) → ユーザに相談** (← 介入ポイント 3)
 5. `CONVERGED=true` になったら `gh pr merge <N> --squash --delete-branch`
 6. **merge したら session を閉じる** — release worthy なら Phase 7、続けて Phase 8 を済ませ、
