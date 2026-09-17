@@ -8,8 +8,9 @@
 //!
 //! **Linux only.** Windows has no `LISTEN_FDS` protocol, and macOS does not
 //! implement `getsockopt(SO_ACCEPTCONN)` — it answers `ENOPROTOOPT`, so
-//! [`check_listening_stream`] could never pass there. Narrowing the target was
-//! chosen over dropping the check; [ADR-0021] records why.
+//! [`crate::transport::systemd_fd::check_listening_stream`] could never pass
+//! there. Narrowing the target was chosen over dropping the check;
+//! [ADR-0021] records why.
 //!
 //! **By hand, against the `libc` this crate already carries for Unix targets,
 //! rather than through `libsystemd` or `listenfd`.** Also [ADR-0021].

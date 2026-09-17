@@ -313,12 +313,13 @@ fn resolve_http_addr(
 ///
 /// `target_os = "linux"` and not `unix`. It was `unix` until the macOS leg of
 /// CI ran the descriptor checks: `getsockopt(SO_ACCEPTCONN)` is not
-/// implemented there and answers `ENOPROTOOPT`, so `check_listening_stream`
-/// fails on every descriptor and a macOS build could never have served on a
-/// passed socket anyway. Narrowing the target is what ADR-0021 records; the
-/// alternative, skipping the check where the platform cannot answer it, would
-/// have dropped the one test that separates a listening socket from a
-/// connected one.
+/// implemented there and answers `ENOPROTOOPT`, so the listening check in the
+/// systemd_fd module — named in prose for the reason
+/// [`HttpListen::Systemd`] gives — fails on every descriptor, and a macOS
+/// build could never have served on a passed socket anyway. Narrowing the
+/// target is what ADR-0021 records; the alternative, skipping the check where
+/// the platform cannot answer it, would have dropped what separates a
+/// listening socket from a connected one.
 pub(crate) const fn systemd_socket_supported() -> bool {
     cfg!(target_os = "linux")
 }
@@ -1160,8 +1161,8 @@ mod tests {
     /// `not(target_os = "linux")` covers both such builds with one arm, and it
     /// has to: Windows has no `LISTEN_FDS` protocol, and macOS answers
     /// `ENOPROTOOPT` to `getsockopt(SO_ACCEPTCONN)`, so the descriptor checks
-    /// could never pass there. Gating this on `windows` alone left the macOS
-    /// leg of the matrix asserting nothing about the flag while the code still
+    /// could never pass there. Gating this on Windows alone left the macOS leg
+    /// of the matrix asserting nothing about the flag while the code still
     /// accepted it.
     #[cfg(not(target_os = "linux"))]
     #[test]
