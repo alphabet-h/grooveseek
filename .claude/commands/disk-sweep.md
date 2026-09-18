@@ -55,7 +55,13 @@ powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Apply
 ```
 
 4. **exit code で読む**:
-   - `0` — 完了。末尾の `| N | ...` の行を `.dev/knowledge/target-dir-disk-hygiene.md` の履歴に回数を入れて貼る
+   - `0` — 完了。末尾の `| N | ...` の行を `.dev/knowledge/target-dir-disk-hygiene.md` の履歴に回数を入れて貼り、
+     **貼ったらその場で `.dev` を commit して push する**。`.dev` は tracked な private repo なので、貼っただけで止めると
+     未 commit の変更が残り、次の `/next-work` がそれを想定外の git state として止まる — 掃除が session の入口を塞ぐ。
+     **stage するのはそのノートだけ**。`.dev` がそれ自体の repository であることの確かめ方は
+     `.claude/commands/feature-flow.md` の「handoff と session の区切り」step 2 にあり、ここには写さない — ただし
+     あちらは session を閉じる時の手順で `.dev` 全体を stage する。ここではそうしない: この command を打つ前から `.dev` に
+     あった別の未 commit の変更は、この commit に巻き込まず、残っていることを user に伝える
    - `1` で末尾が `PRECHECK-REFUSED` — 事前確認が拒否した。**何も消えていない**。理由 (走っている cargo / rustc / link、
      `target` から動いている process や scheduled task) を user に伝える。止めてよいかを決めるのは user で、
      controller が process を止めて再実行しない
