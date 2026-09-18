@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-09-18
+
 ### Added
 
 - **`groove serve` can take the listening socket from systemd (Linux).**
@@ -40,7 +42,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (`/ui`,
   `/api/admin/status`) treat the connection as local, because the socket's
   owner and mode already decided who could open it; over TCP the loopback
-  peer check is unchanged. See
+  peer check is unchanged. A `systemd_socket` key in a config found in an
+  untrusted location is dropped with a warning, like `max_sessions` before
+  it, and for a heavier reason: honoured, it would not degrade the server but
+  stop it — with no `LISTEN_FDS` in the environment `serve` refuses to start,
+  so a file left in a working directory would keep the daemon down. Pass
+  `--config` to accept it. See
   [ADR-0021](docs/decisions/0021-take-the-socket-you-were-given.md).
 
 - **`groove doctor` looks at the declared-field set, and `groove status`
@@ -54,7 +61,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `declared-fields-stale` (the recorded
   set differs from what the schema on disk declares, so `--field` answers
   from the old set until the next run), both warnings that one `groove index`
-  clears without re-embedding. `status` prints a `Declared fields:` line with
+  clears without re-embedding. **This can turn a previously clean `groove
+  doctor` into exit 1**, with or without a `groove-schema.toml`: an index
+  that no `groove index` run has completed on since before 1.9.0 has no
+  recorded set, and `doctor` exits 1 on any finding. `status` prints a `Declared fields:` line with
   the recorded keys (`pending` / `none`) and the number of value rows. A
   `groove-schema.toml` that does not load stops `doctor` before it opens the
   database (exit 2), the way it already stops `index` and `validate`.
@@ -99,7 +109,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   fetch embedding models on behalf of `fastembed` — both outbound HTTP
   clients; no GrooveSeek code terminates TLS as a server. The bump carries
   `aws-lc-rs` 1.17.0 → 1.18.1, `aws-lc-sys` 0.41.0 → 0.45.0 and
-  `rustls-webpki` 0.103.13 → 0.103.15 with it.
+  `rustls-webpki` 0.103.13 → 0.103.15 with it. (#306)
 
 ## [1.10.0] - 2026-09-10
 
@@ -5470,7 +5480,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.10.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.11.0...HEAD
+[1.11.0]: https://github.com/alphabet-h/grooveseek/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/alphabet-h/grooveseek/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/alphabet-h/grooveseek/compare/v1.8.0...v1.9.0
 [1.8.0]: https://github.com/alphabet-h/grooveseek/compare/v1.7.0...v1.8.0
