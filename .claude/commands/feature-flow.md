@@ -147,7 +147,7 @@ phase が **release を構成する最終 PR** だった場合のみ:
 4. `/full-audit` 起動判断 (CLAUDE.local.md の trigger 該当時のみ)
 5. tag 作成: `git tag -a vX.Y.Z -m "..."` → `git push origin vX.Y.Z`
 6. `release.yml` (cargo-dist) が auto で binary build + GH Release を作成 (手動の `gh release create` は禁止)
-7. release run を待つ間に `/disk-sweep apply` — release を切った直後は、直前まで大量に build していて次の build 予定が最も薄い。**`target` は次の release までに数十 GB 単位で戻る**ので、日数ではなく release を契機にする。何を消し何を残すかの判定は command が呼ぶ script が持ち、ここには写さない
+7. release run を待つ間に **disk を測って user に見せる** — `powershell -NoProfile -File .dev/tools/disk-sweep.ps1` (引数なし = 報告のみ、何も消さない) の空きと `target` の TOTAL を伝え、「消すなら `/disk-sweep apply` と打ってください」と添える。**controller は `-Apply` を付けて実行しない** — `/disk-sweep` は `disable-model-invocation` で、削除は user が打った時にしか始まらない (この step がそれを迂回したら gate の意味が無い)。release を切った直後は、直前まで大量に build していて次の build 予定が最も薄い。**`target` は次の release までに数十 GB 単位で戻る**ので、日数ではなく release を契機にする。何を消し何を残すかの判定は script が持ち、ここには写さない
 
 途中で release-blocker な audit findings が出たら、Phase 5-6 にループバックして fix。
 
@@ -182,7 +182,7 @@ cycle 完了時に必ず:
    - オープン論点 / 注意
    - 完了基準 checklist
    - background task leak の確認 (`run_in_background` の polling が残っていないか)
-   - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。閾値を切っていたら、または release を切った session なら `/disk-sweep` の結果も書く。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
+   - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。閾値を切っていたら、または release を切った session なら Phase 7 step 7 の報告 (空きと `target` の TOTAL) も書く。消すのは user が `/disk-sweep apply` と打った時だけで、controller からは測るところまで。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
 2. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
    無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
    ```bash

@@ -12,14 +12,21 @@ disk の掃除。引数なしは**測るだけ**で、`apply` を付けた時だ
 
 ## 想定起動タイミング
 
-- **release を切った直後** (`/feature-flow` の Phase 7)。直前まで大量に build していて、次の build 予定が最も薄い
+- **release を切った直後**。`/feature-flow` の Phase 7 は controller が報告モードで測って数字を見せるところまでで、
+  そこから先 (削除) は user がこの command を打つ。直前まで大量に build していて、次の build 予定が最も薄い
 - SessionStart の `disk` 行が `LOW` を出した時
 - 大量に build する工程 (`/full-audit`、`--ignored` の test、cross build) の前
 - session を閉じる時に「クリーンアップした」と書く前 — worktree や branch を片付けたことは disk を掃除したことにならない
 
-引数 (任意): `/disk-sweep apply` で削除まで行う。それ以外の語 (空を含む) は報告のみ。
+引数 (任意): `/disk-sweep apply` で削除まで行う。
 
 MODE: $ARGUMENTS
+
+**削除に進むのは、上の MODE 行の値が `apply` の 5 文字と完全に一致する時だけ** (小文字、前後の空白を除いて他に何も無い)。
+それ以外は**すべて報告のみ**: 空、`Apply` / `APPLY` (大文字小文字が違う)、`apply please` / `apply now` (語が足されている)、
+`don't apply` / `not apply` (否定)、`-Apply` (script の flag をそのまま書いた)、日本語の「消して」。
+**引数を自然文として読んで意図を推し量らない** — ここは削除の唯一の gate で、曖昧なら報告で止まって
+「削除するなら `/disk-sweep apply` とだけ打ってください」と返す。推測で消すより 1 回打ち直してもらう方が安い。
 
 ## 前提
 
