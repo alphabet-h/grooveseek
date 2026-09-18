@@ -90,6 +90,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   tracks as a to-do read `0.000` with no opponent figure, and now reads
   `0.000 against QMD's 0.250`. The correction is linked from the citation.
 
+### Security
+
+- **`rustls` was updated 0.23.38 → 0.23.45 to clear RUSTSEC-2026-0285**
+  ("TLS 1.3 handshake messages incorrectly accepted across encryption level
+  boundaries"). It is a transitive dependency, reached through `reqwest`
+  (`groove-tray`'s HTTP client) and through `ureq`, which `hf-hub` uses to
+  fetch embedding models on behalf of `fastembed` — both outbound HTTP
+  clients; no GrooveSeek code terminates TLS as a server. The bump carries
+  `aws-lc-rs` 1.17.0 → 1.18.1, `aws-lc-sys` 0.41.0 → 0.45.0 and
+  `rustls-webpki` 0.103.13 → 0.103.15 with it.
+
 ## [1.10.0] - 2026-09-10
 
 ### Added

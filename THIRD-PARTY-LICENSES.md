@@ -6884,7 +6884,7 @@ Used by:
 - ring 0.17.14 (https://github.com/briansmith/ring)
 - rustix 1.1.4 (https://github.com/bytecodealliance/rustix)
 - rustls-native-certs 0.8.3 (https://github.com/rustls/rustls-native-certs)
-- rustls 0.23.38 (https://github.com/rustls/rustls)
+- rustls 0.23.45 (https://github.com/rustls/rustls)
 - scopeguard 1.2.0 (https://github.com/bluss/scopeguard)
 - security-framework-sys 2.17.0 (https://github.com/kornelski/rust-security-framework)
 - security-framework 3.7.0 (https://github.com/kornelski/rust-security-framework)
@@ -9321,7 +9321,7 @@ Used by:
 - anyhow 1.0.102 (https://github.com/dtolnay/anyhow)
 - arraydeque 0.5.1 (https://github.com/andylokandy/arraydeque)
 - async-trait 0.1.89 (https://github.com/dtolnay/async-trait)
-- aws-lc-sys 0.41.0 (https://github.com/aws/aws-lc-rs)
+- aws-lc-sys 0.45.0 (https://github.com/aws/aws-lc-rs)
 - constant_time_eq 0.4.2 (https://github.com/cesarb/constant_time_eq)
 - dary_heap 0.3.8 (https://github.com/hanmertens/dary_heap)
 - dirs-sys 0.5.0 (https://github.com/dirs-dev/dirs-sys-rs)
@@ -10139,7 +10139,7 @@ USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
-- aws-lc-sys 0.41.0 (https://github.com/aws/aws-lc-rs)
+- aws-lc-sys 0.45.0 (https://github.com/aws/aws-lc-rs)
 - exr 1.74.0 (https://github.com/johannesvollmer/exrs)
 
 ```text
@@ -10962,7 +10962,7 @@ THIS SOFTWARE.
 
 Used by:
 
-- rustls-webpki 0.103.13 (https://github.com/rustls/webpki)
+- rustls-webpki 0.103.15 (https://github.com/rustls/webpki)
 
 ```text
 Except as otherwise noted, this project is licensed under the following
@@ -10991,8 +10991,8 @@ third-party/chromium/LICENSE.
 
 Used by:
 
-- aws-lc-rs 1.17.0 (https://github.com/aws/aws-lc-rs)
-- aws-lc-sys 0.41.0 (https://github.com/aws/aws-lc-rs)
+- aws-lc-rs 1.18.1 (https://github.com/aws/aws-lc-rs)
+- aws-lc-sys 0.45.0 (https://github.com/aws/aws-lc-rs)
 
 ```text
 ISC License:
@@ -12865,7 +12865,7 @@ SOFTWARE.
 
 Used by:
 
-- aws-lc-sys 0.41.0 (https://github.com/aws/aws-lc-rs)
+- aws-lc-sys 0.45.0 (https://github.com/aws/aws-lc-rs)
 
 ```text
 The MIT License (MIT)
