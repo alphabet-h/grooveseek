@@ -411,6 +411,18 @@ tree-sitter などを静的リンクする。cargo は既定でコア数ぶん�
 **対処: `cargo test -j 2`** で通る。エラー文面を読まずに「さっきのコード変更が悪い」と
 diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **まず並列度**。
 
+★ **落ちるのは cargo だけとは限らない** (2026-09-18、PR #306 の作業中)。subagent への指示に
+`cargo test --workspace` を `-j` 無しで書いたところ、`LNK1102` と同じ瞬間にエディタ (Zed) が落ち、
+その中で動いていた Claude Code の session ごと失った。Application log の Event 1000
+(`Zed.exe`、例外コード 0xc0000409) と test log の最終書き込みが 1 秒差。**エディタとの因果は推定**
+(System log に resource exhaustion の Event 2004 は無かった)。以後、subagent に cargo を打たせる指示には
+次を定型として貼る:
+
+- `cargo test` は `-j 2` を必ず付ける
+- 重い cargo を 2 本同時に走らせない (subagent を並列にするのは cargo を打たない組だけ)
+- `run_in_background` を使わず foreground + timeout
+- status file は手順ごとに追記させる (途中で落ちても、続きを file から拾える)
+
 出典: 2026-09-04 PR #263。`cargo doc` / `cargo clippy` / `cargo test` を続けて回した後に出た
 
 ## 17. CRLF のファイルに LF を追記しても `git diff` に出ない — **どの設定でも出ない。残るかどうかが設定で変わる**

@@ -51,9 +51,10 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
    handoff 側と食い違ったら **handoff を一次情報とし** (kuriya の report は遅れることがある)、
    両方を user に見せる (止まる条件 4)。`mcp__kuriya__status` が呼べない / エラーを返す時は止まらず、
    Phase 1 の報告に「kuriya 未接続、突き合わせ未実施」と 1 行書いて handoff だけで続ける
-6. **repo 状態を見る** — root で `git status --short --branch`、続けて nested repo の
-   `git -C .dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
-   commit し忘れていればここでしか分からない)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
+6. **repo 状態を見る** — root は `git -C <repo root の絶対パス> status --short --branch`、続けて nested repo の
+   `git -C <repo root の絶対パス>/.dev status --short --branch` (root の status は `.dev/` を見ない。前 session が handoff を
+   commit し忘れていればここでしか分からない)。**root にも `-C` を付ける** — `-C` 無しの git は hook R5 が deny する
+   (cwd は呼び出しを跨いで残り、`.dev` が nested repo なので、cwd 依存の git は黙って別 repo の答えを返す)。どちらも exit 0 以外なら stderr を添えて止まる (止まる条件 3)。
    step 4 で読んだ handoff (遡った分も含む)、または FOCUS 行の `repo=<絶対パス>` が別 repo (例: grooveseek-gate) を
    挙げていれば、その絶対パスに対しても `git -C <絶対パス> status --short --branch`。
    uncommitted changes / 想定と違う branch は**想定外 state として報告する** (止まる条件 3)。
@@ -101,6 +102,7 @@ subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む
 - git は `git -C <絶対パス> …` をそのまま貼る (`cd` は hook R6 で止まる)
 - `run_in_background` の後は foreground で待つ (kuriya trap #219)
 - 結果は status ファイルの最終行に書く
+- cargo を打たせるなら: `cargo test` は `-j 2`、重い cargo を 2 本同時に走らせない、status ファイルは手順ごとに追記させる (`windows-quirks` skill の罠 16)
 
 **着手**: 着手先は Phase 1 の focus 判定に従う (focus 無し / 含まれる → 「★ 次にやること」の先頭、
 別件 → focus)。着手先が skill の起動 (`superpowers:writing-plans` など) を指しているなら、
