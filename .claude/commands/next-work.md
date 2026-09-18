@@ -100,9 +100,9 @@ subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む
 
 - `.dev/` は untracked なので `git add .dev/...` は silently スキップされる。`.dev/` の更新は commit に乗らない
 - git は `git -C <絶対パス> …` をそのまま貼る (`cd` は hook R6 で止まる)
-- `run_in_background` の後は foreground で待つ (kuriya trap #219)
+- cargo 以外で `run_in_background` を使ったら、その後は foreground で待つ (kuriya trap #219)。**cargo には `run_in_background` を使わない** (次の項)
 - 結果は status ファイルの最終行に書く
-- cargo を打たせるなら: `cargo test` は `-j 2`、重い cargo を 2 本同時に走らせない、status ファイルは手順ごとに追記させる (`windows-quirks` skill の罠 16)
+- cargo を打たせるなら 4 点 (`windows-quirks` skill の罠 16 と同じ並び): `cargo test` は `-j 2` / 重い cargo を 2 本同時に走らせない / `run_in_background` を使わず foreground + timeout / status ファイルは手順ごとに追記させる
 
 **着手**: 着手先は Phase 1 の focus 判定に従う (focus 無し / 含まれる → 「★ 次にやること」の先頭、
 別件 → focus)。着手先が skill の起動 (`superpowers:writing-plans` など) を指しているなら、
