@@ -182,7 +182,7 @@ cycle 完了時に必ず:
    - オープン論点 / 注意
    - 完了基準 checklist
    - background task leak の確認 (`run_in_background` の polling が残っていないか)
-   - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。閾値を切っていたら、または release を切った session なら Phase 7 step 7 の報告 (空きと `target` の TOTAL) も書く。消すのは user が `/disk-sweep apply` と打った時だけで、controller からは測るところまで。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
+   - **disk の空きを測った数字** (SessionStart の `disk` 行と同じ値)。**release を切った session** なら Phase 7 step 7 で取った報告 (空きと `target` の TOTAL) を書く。**release ではないが SessionStart が `LOW` を出していた session** は Phase 7 を通らないので、ここで同じ報告モード (`powershell -NoProfile -File .dev/tools/disk-sweep.ps1`、何も消さない) を打ち、その時点の空きと TOTAL を書いて user にも伝える — SessionStart の値は session の始めのもので、閉じる時には古い。どちらの場合も、消すのは user が `/disk-sweep apply` と打った時だけで、controller からは測るところまで。**worktree や branch を片付けたことは disk を掃除したことにならない** — 「クリーンアップした」と書く前に `target` 直下を測る (2026-09-18、release session を空き 20 GB で閉じていた)
 2. `.dev` が **それ自体の repository** であることを確かめてから push する (前提の節)。nested repo が
    無ければ `git -C .dev` は親 repo に向き、`add -A` が親の変更を staging して `push` は親の origin へ行く:
    ```bash
