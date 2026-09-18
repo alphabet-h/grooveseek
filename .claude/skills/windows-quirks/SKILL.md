@@ -415,8 +415,9 @@ diff を疑い始めると時間を溶かすので、`LNK1102` を見たら **�
 `cargo test --workspace` を `-j` 無しで書いたところ、`LNK1102` と同じ瞬間にエディタ (Zed) が落ち、
 その中で動いていた Claude Code の session ごと失った。Application log の Event 1000
 (`Zed.exe`、例外コード 0xc0000409) と test log の最終書き込みが 1 秒差。**エディタとの因果は推定**
-(System log に resource exhaustion の Event 2004 は無かった)。以後、subagent に cargo を打たせる指示には
-次を定型として貼る:
+(System log に resource exhaustion の Event 2004 は無かった)。実測で言えるのは上の
+「`-j 2` で `LNK1102` が出なくなる」までで、下の 4 点は原因の特定ではなく**用心**として、
+subagent に cargo を打たせる指示に貼る:
 
 - `cargo test` は `-j 2` を必ず付ける
 - 重い cargo を 2 本同時に走らせない (subagent を並列にするのは cargo を打たない組だけ)

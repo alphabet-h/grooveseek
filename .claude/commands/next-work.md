@@ -18,7 +18,7 @@ FOCUS: $ARGUMENTS
 
 ## 前提
 
-- `.dev/` が **それ自体の private repository** として初期化済 (`git -C .dev rev-parse --show-toplevel` が
+- `.dev/` が **それ自体の private repository** として初期化済 (`git -C <repo root の絶対パス>/.dev rev-parse --show-toplevel` が
   `/.dev` で終わる)。本 command が読む `.dev/README.md` / `.dev/knowledge/session-*-handoff.md` /
   `.dev/tools/handoff_tail.ps1` はすべてそちら側にあり、**公開 repo を clone しただけの checkout には
   無い**。= owner 用の workflow で、手順を公開側へ写して二重化することはしない
@@ -30,7 +30,7 @@ FOCUS: $ARGUMENTS
 
 controller 自身が読み取りのみで行う。ここで書き込みや branch 操作はしない。
 
-1. **前提を確かめる** — `.dev/README.md` と `.dev/tools/handoff_tail.ps1` が存在し、`git -C .dev rev-parse --show-toplevel` が
+1. **前提を確かめる** — `.dev/README.md` と `.dev/tools/handoff_tail.ps1` が存在し、`git -C <repo root の絶対パス>/.dev rev-parse --show-toplevel` が
    `/.dev` で終わること。どれか欠けていたら **owner 用 command で、この checkout では動かない**と 1 行で報告して
    止まる (読みに行かない。止まる条件 1)
 2. **`.dev/README.md` を読む** — 索引とワークフローの一次情報。handoff 鎖の規約もここにある
