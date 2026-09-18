@@ -72,8 +72,11 @@ powershell -NoProfile -File .dev/tools/disk-sweep.ps1 -Apply
 5. `proc-macro-srv` の段が「no deletion in this step」と出したら、その理由 (rust-analyzer が動いている、など) をそのまま伝える。
    飛ばされたのは設計どおりで、失敗ではない
 
-`-DeleteRelease` と `-SkipCheck` は **user が明示した時だけ**付ける。`target\release` は、どの commit から build したかを
-script が断定できないので既定では残る — 出力の「release provenance」の 3 行 (exe の mtime / HEAD / `--version`) を user に見せて判断を仰ぐ。
+**script の `-DeleteRelease` と `-SkipCheck` は、この command からは付けられない** — MODE は `apply` の完全一致だけなので、
+flag を足した引数は報告のみになる (上の節)。組み合わせごとに受け付ける形を増やすと、削除の唯一の gate が複雑になる。
+`target\release` は、どの commit から build したかを script が断定できないので既定では残る。出力の「release provenance」
+(exe の mtime / HEAD / `--version`) を user に見せ、消したいと言われたら **user 自身が script を打つ**よう伝える
+(prompt で `!` を付ければこの session の中で走る)。controller がこの 2 つの flag を付けて実行することはない。
 
 ## 止まる条件
 
