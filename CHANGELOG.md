@@ -20,7 +20,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   resolved the request and asked whether the result was inside `kb_path`; it
   never asked whether the request *was* that path. So `./a.md`, `a//b.md`,
   `a/../a.md`, an absolute path into the knowledge base, a route through a
-  symlinked directory and — on Windows and macOS — a different case, a
+  symlinked directory, a different case on Windows and macOS, and on Windows a
   backslash or an 8.3 short name all opened the same file. A gateway in front
   of groove that filters on the requested string (`!rules/secret/**`) was
   walked around by any of them; `rules/SECRET/pay.md` was enough. The resolved

@@ -3351,7 +3351,8 @@ mod tests {
         );
     }
 
-    /// Asserts that `rel` is refused as `NotFound`, and hands the message back.
+    /// Asserts that `rel` is refused as [`ValidatePathOutcome::NotFound`], and
+    /// hands the message back.
     fn expect_spelling_refused(kb: &TempKb, rel: &str) -> String {
         match validate_get_document_path(
             &kb.path,
@@ -3445,6 +3446,27 @@ mod tests {
         );
     }
 
+    /// On Unix `\` is an ordinary filename character, so `a\b.md` is one file
+    /// in the KB root and that string is its only spelling. Folding `\` into
+    /// `/` there would refuse the file under its own name (codex P2 on #310).
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_get_document_path_keeps_a_literal_backslash_name_reachable_on_unix() {
+        let kb = TempKb::new("gd-spell-backslash");
+        kb.write("a\\b.md", "# A\nbody\n");
+        let r = validate_get_document_path(
+            &kb.path,
+            "a\\b.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "a file literally named a\\b.md must open under that name: {r:?}"
+        );
+    }
+
     /// APFS is case-insensitive by default; the macOS CI leg is what runs this.
     #[cfg(target_os = "macos")]
     #[test]
@@ -3503,8 +3525,9 @@ mod tests {
         );
     }
 
-    /// The refusal is `NotFound`, not `Denied`: a template that is merely
-    /// spelled differently must not end the best-practice search.
+    /// The refusal is [`ValidatePathOutcome::NotFound`], not
+    /// [`ValidatePathOutcome::Denied`]: a template that is merely spelled
+    /// differently must not end the best-practice search.
     #[test]
     fn test_resolve_best_practice_misspelled_template_falls_through() {
         let kb = TempKb::new("bp-spell");

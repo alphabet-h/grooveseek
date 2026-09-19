@@ -452,7 +452,16 @@ pub(crate) fn validate_get_document_path(
         .strip_prefix(kb_path)
         .ok()
         .and_then(|rel| rel.to_str())
-        .map(|rel| rel.replace('\\', "/") == rel_path)
+        .map(|rel| {
+            // Only where `\` separates components. On Unix it is an ordinary
+            // filename character, never an alias for anything, and folding it
+            // would make a file named `a\b.md` unreachable under its own name.
+            if cfg!(windows) {
+                rel.replace('\\', "/") == rel_path
+            } else {
+                rel == rel_path
+            }
+        })
         .unwrap_or(false);
     if !spelled_canonically {
         return ValidatePathOutcome::NotFound(ErrorResponse {
