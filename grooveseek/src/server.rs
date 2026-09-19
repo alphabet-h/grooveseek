@@ -275,7 +275,9 @@ impl From<&SearchParams> for crate::config::SearchOverrides {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetDocumentParams {
-    /// Relative path to the document within knowledge-base/ (e.g. "deep-dive/mcp/overview.md")
+    /// Relative path to the document within knowledge-base/ (e.g. "deep-dive/mcp/overview.md").
+    /// Pass it exactly as `search` returned it: `/`-separated, no leading `./`, same case.
+    /// Any other spelling of the same file is answered "not found".
     path: String,
 }
 
@@ -822,7 +824,7 @@ impl KbServer {
 
     #[tool(
         name = "get_document",
-        description = "Get the full content and metadata of a document by its relative path within knowledge-base/."
+        description = "Get the full content and metadata of a document by its relative path within knowledge-base/. The path must be spelled exactly as `search` returned it; any other spelling of the same file is answered \"not found\"."
     )]
     async fn get_document(&self, Parameters(params): Parameters<GetDocumentParams>) -> String {
         let core = Arc::clone(&self.core);

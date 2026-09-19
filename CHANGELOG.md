@@ -34,7 +34,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 ### Changed
 
 - **Paths that used to work by accident no longer do.** Pass `get_document`
-  the `path` exactly as `search` returned it. For `get_best_practice`, write
+  the `path` exactly as `search` returned it; the tool's MCP description and
+  the `path` parameter's schema now say so, since that is where a model client
+  reads the contract. For `get_best_practice`, write
   `[best_practice].path_templates` relative to the knowledge base,
   `/`-separated, without a leading `./`, and in the case the files have on
   disk, and pass `target` in that case too: a template that reaches its file by

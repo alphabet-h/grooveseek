@@ -317,7 +317,7 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
 ///    - 2b. **canonical spelling** — canonical パスを kb_path 相対・`/` 区切り
 ///      (索引が持つ形) に戻し、要求された `rel_path` と byte 一致しなければ
-///      `NotFound`。要求側は正規化しない。`./`・`//`・`a/../a`・`\` 区切り・
+///      [`ValidatePathOutcome::NotFound`]。要求側は正規化しない。`./`・`//`・`a/../a`・`\` 区切り・
 ///      case 違い・8.3 短縮名・ディレクトリ symlink 経由が、同じファイルを開く
 ///      別綴りとして前段 gateway の glob 除外をすり抜けるのを 1 つの規則で塞ぐ。
 ///      拒否文言に正規の綴りは載せない (隠れたディレクトリの実名を教えない)
