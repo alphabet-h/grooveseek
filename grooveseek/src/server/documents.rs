@@ -1,6 +1,6 @@
 //! Reading a document out of the knowledge base, and deciding whether it may
 //! be read at all: the `get_document` and `get_best_practice` tool bodies, the
-//! four-stage path check they go through, and the size limits they are held to.
+//! staged path check they go through, and the size limits they are held to.
 //!
 //! Split out of `server.rs` in audit L-1 (PR-2), after the search half
 //! (PR-1) and on the same terms: bodies byte-identical, in their original
@@ -238,7 +238,7 @@ pub(super) fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> boo
 /// `ErrorResponse` を直接 JSON 化できる (= 既存 5 unit test の
 /// `err.error.contains("...")` assertion 完全保持)。
 ///
-/// - `Found(PathBuf)` — 4 段階防御を通過、canonical な絶対パス
+/// - `Found(PathBuf)` — 段階防御をすべて通過、canonical な絶対パス
 /// - `NotFound(ErrorResponse)` — file-not-found / canonicalize-failed /
 ///   outside-kb / extension-denied / size-exceeded の総称。`get_best_practice`
 ///   の template loop では「次 template を試す」価値ありと解釈
@@ -315,6 +315,12 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 /// 防御の順序:
 /// 1. **symlink reject** — `canonicalize` の前に拾う必要がある
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
+///    - 2b. **canonical spelling** — canonical パスを kb_path 相対・`/` 区切り
+///      (索引が持つ形) に戻し、要求された `rel_path` と byte 一致しなければ
+///      `NotFound`。要求側は正規化しない。`./`・`//`・`a/../a`・`\` 区切り・
+///      case 違い・8.3 短縮名・ディレクトリ symlink 経由が、同じファイルを開く
+///      別綴りとして前段 gateway の glob 除外をすり抜けるのを 1 つの規則で塞ぐ。
+///      拒否文言に正規の綴りは載せない (隠れたディレクトリの実名を教えない)
 /// 3. **extension membership** — indexer と同じ拡張子セットに限定。
 ///    `.git/config` のように registry に無い拡張子のファイルは読めない
 /// 4. **size cap** — RAM-OOM を防ぐ。**どちらの上限を使うかは canonical
@@ -327,6 +333,8 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 /// 拡張子は 3 文字に切られるので `.pptx`/`.xlsx`/`.docx` はいずれも registry に
 /// 無い legacy 拡張子に化け、text 上限 (1 MiB) が binary 上限 (50 MiB) の代わりに
 /// 適用される。1 MiB 超の Office 文書が短縮名経由で「File too large」になっていた。
+/// 短縮名での要求は今は 2b が先に拒否するが、canonical 側から cap を選ぶ規則は
+/// 防御の重ねとして残す。
 ///
 /// (BU-08) **`exclude_dirs` はここに効かない**。この fn は `exclude_dirs` を
 /// 引数に取っておらず、`.obsidian/note.md` のように「除外ディレクトリ配下だが
@@ -430,6 +438,32 @@ pub(crate) fn validate_get_document_path(
         });
     }
 
+    // 2b. One spelling per document. Rebuild the path the way the index writes
+    // it (relative to the KB, `/`-separated) and require the request to be
+    // that string byte for byte. The request is deliberately not normalised:
+    // `./a`, `a//b`, `a/../a`, `a\b`, a case variant, an 8.3 short name and a
+    // route through a directory symlink all fail the one comparison.
+    //
+    // `NotFound`, not `Denied`: `resolve_best_practice_path` moves on to the
+    // next template on `NotFound`, and a template spelled `./bp/x.md` is a
+    // config quirk, not an attack. The message never carries the canonical
+    // spelling -- the caller may be guessing at a directory it was never shown.
+    let spelled_canonically = canonical
+        .strip_prefix(kb_path)
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .map(|rel| rel.replace('\\', "/") == rel_path)
+        .unwrap_or(false);
+    if !spelled_canonically {
+        return ValidatePathOutcome::NotFound(ErrorResponse {
+            error: concat!(
+                "File not found: the requested path is not the canonical spelling of a ",
+                "document. Pass the `path` exactly as `search` returned it."
+            )
+            .to_string(),
+        });
+    }
+
     // 3. Extension membership check
     let ext = canonical.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !registry.has_extension(ext) {
@@ -520,8 +554,9 @@ pub(super) enum ResolveOutcome {
 }
 
 /// Best-practice resolver: テンプレート列に `{target}` を置換してファイルを探す。
-/// 先頭から順に試し、`validate_get_document_path` の 4 段階防御 (symlink reject /
-/// canonicalize+starts_with / extension membership / size cap) を通過した最初の
+/// 先頭から順に試し、`validate_get_document_path` の段階防御 (symlink reject /
+/// canonicalize+starts_with / canonical spelling / extension membership /
+/// size cap) を通過した最初の
 /// 候補を返す。`kb_path` は呼び出し側で既に canonicalize されている前提
 /// (`run_server` / tests で事前処理)。
 ///

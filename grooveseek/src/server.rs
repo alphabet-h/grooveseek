@@ -3351,6 +3351,155 @@ mod tests {
         );
     }
 
+    /// Asserts that `rel` is refused as `NotFound`, and hands the message back.
+    fn expect_spelling_refused(kb: &TempKb, rel: &str) -> String {
+        match validate_get_document_path(
+            &kb.path,
+            rel,
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        ) {
+            ValidatePathOutcome::NotFound(e) => e.error,
+            other => panic!(
+                "{rel:?} is a second spelling of a document and must be refused as \
+                 NotFound, got {other:?}"
+            ),
+        }
+    }
+
+    /// A gateway in front of this server filters on the requested string
+    /// (`!rules/secret/**`). Every spelling below opens the same file as
+    /// `docs/a.md`, so accepting any of them walks around that filter.
+    #[test]
+    fn test_validate_get_document_path_rejects_non_canonical_spelling() {
+        let kb = TempKb::new("gd-spell");
+        kb.write("docs/a.md", "# A\nbody\n");
+        for rel in ["./docs/a.md", "docs//a.md", "docs/../docs/a.md"] {
+            let msg = expect_spelling_refused(&kb, rel);
+            assert!(
+                msg.contains("spelling"),
+                "{rel:?} must be refused by the spelling check, not by accident: {msg}"
+            );
+        }
+    }
+
+    /// The refusal must not hand out the spelling it would have accepted: the
+    /// caller may be guessing at a directory it was never shown.
+    #[test]
+    fn test_validate_get_document_path_spelling_refusal_does_not_leak_canonical_name() {
+        let kb = TempKb::new("gd-spell-leak");
+        kb.write("HiddenVault/a.md", "# A\nbody\n");
+        let msg = expect_spelling_refused(&kb, "./HiddenVault/../HiddenVault/a.md");
+        assert!(
+            msg.contains("search"),
+            "the refusal should point the caller at `search`: {msg}"
+        );
+
+        // Only a case-insensitive filesystem lets a wrong-case guess reach the
+        // check at all; elsewhere it is a plain miss, which leaks nothing.
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let msg = expect_spelling_refused(&kb, "hiddenvault/a.md");
+            assert!(
+                !msg.contains("HiddenVault"),
+                "the refusal leaks the real directory name: {msg}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_get_document_path_rejects_case_and_separator_variants_on_windows() {
+        let kb = TempKb::new("gd-spell-win");
+        kb.write("docs/a.md", "# A\nbody\n");
+        for rel in ["DOCS/a.md", "docs/A.MD", "docs\\a.md"] {
+            let msg = expect_spelling_refused(&kb, rel);
+            assert!(
+                msg.contains("spelling"),
+                "{rel:?} must be refused by the spelling check: {msg}"
+            );
+        }
+    }
+
+    /// APFS is case-insensitive by default; the macOS CI leg is what runs this.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_validate_get_document_path_rejects_case_variants_on_macos() {
+        let kb = TempKb::new("gd-spell-mac");
+        kb.write("docs/a.md", "# A\nbody\n");
+        for rel in ["DOCS/a.md", "docs/A.MD"] {
+            let msg = expect_spelling_refused(&kb, rel);
+            assert!(
+                msg.contains("spelling"),
+                "{rel:?} must be refused by the spelling check: {msg}"
+            );
+        }
+    }
+
+    /// An 8.3 short name is one more spelling. Supplementary: a volume can have
+    /// short-name generation turned off, and then there is nothing to assert —
+    /// the case-variant test above carries the mandatory check.
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_get_document_path_rejects_8dot3_short_name() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let kb = TempKb::new("gd-spell-83");
+        let long_name = "a-rather-long-document-name.md";
+        let full = kb.write(long_name, "# A\nbody\n");
+
+        let wide: Vec<u16> = full.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `wide` is NUL-terminated and `buf` is as long as we say it is.
+        let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if n == 0 || n as usize >= buf.len() {
+            eprintln!("8.3 check skipped: GetShortPathNameW returned {n}");
+            return;
+        }
+        let short_full = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]));
+        let short_name = short_full
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if short_name.is_empty() || short_name.eq_ignore_ascii_case(long_name) {
+            eprintln!(
+                "8.3 check skipped: this volume generated no short name (got {short_name:?})"
+            );
+            return;
+        }
+        eprintln!("8.3 check running with short name {short_name:?}");
+        // `.md` survives the 3-character truncation, so without the spelling
+        // check this request clears every other stage.
+        let msg = expect_spelling_refused(&kb, &short_name);
+        assert!(
+            msg.contains("spelling"),
+            "{short_name:?} must be refused by the spelling check: {msg}"
+        );
+    }
+
+    /// The refusal is `NotFound`, not `Denied`: a template that is merely
+    /// spelled differently must not end the best-practice search.
+    #[test]
+    fn test_resolve_best_practice_misspelled_template_falls_through() {
+        let kb = TempKb::new("bp-spell");
+        kb.write("bp/rust.md", "# rust\n");
+        let templates = vec!["./bp/{target}.md".to_string(), "bp/{target}.md".to_string()];
+        let r = resolve_best_practice_path(
+            &kb.path,
+            &templates,
+            "rust",
+            &md_only_registry(),
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ResolveOutcome::Found(_)),
+            "the second template is spelled canonically and must be reached: {r:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // feature-28 Task 2.7: SearchParams MMR fields + From<&SearchParams>
     // -----------------------------------------------------------------------
