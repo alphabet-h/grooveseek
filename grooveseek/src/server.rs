@@ -276,7 +276,7 @@ impl From<&SearchParams> for crate::config::SearchOverrides {
 #[schemars(transform = crate::schema_compat::ClientCompat)]
 struct GetDocumentParams {
     /// Relative path to the document within knowledge-base/ (e.g. "deep-dive/mcp/overview.md").
-    /// Pass it exactly as `search` returned it: `/`-separated, no leading `./`, same case.
+    /// Pass it exactly as the search tool returned it: `/`-separated, no leading `./`, same case.
     /// Any other spelling of the same file is answered "not found".
     path: String,
 }
