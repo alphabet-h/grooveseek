@@ -444,6 +444,11 @@ pub(crate) fn validate_get_document_path(
     // `./a`, `a//b`, `a/../a`, `a\b`, a case variant, an 8.3 short name and a
     // route through a directory symlink all fail the one comparison.
     //
+    // This is about spellings of the tree as it stands. A parent directory
+    // swapped for a symlink between this check and the read is a race, not
+    // an alias, and stays out of reach here as it was before (docs/behavior.md,
+    // "Links are not followed").
+    //
     // `NotFound`, not `Denied`: `resolve_best_practice_path` moves on to the
     // next template on `NotFound`, and a template spelled `./bp/x.md` is a
     // config quirk, not an attack. The message never carries the canonical
