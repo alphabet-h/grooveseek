@@ -554,10 +554,9 @@ pub(super) enum ResolveOutcome {
 }
 
 /// Best-practice resolver: テンプレート列に `{target}` を置換してファイルを探す。
-/// 先頭から順に試し、`validate_get_document_path` の段階防御 (symlink reject /
+/// 先頭から順に試し、[`validate_get_document_path`] の段階防御 (symlink reject /
 /// canonicalize+starts_with / canonical spelling / extension membership /
-/// size cap) を通過した最初の
-/// 候補を返す。`kb_path` は呼び出し側で既に canonicalize されている前提
+/// size cap) を通過した最初の候補を返す。`kb_path` は呼び出し側で既に canonicalize されている前提
 /// (`run_server` / tests で事前処理)。
 ///
 /// fail 種別の挙動 (F-45):
