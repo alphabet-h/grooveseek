@@ -3395,6 +3395,12 @@ mod tests {
             msg.contains("search"),
             "the refusal should point the caller at `search`: {msg}"
         );
+        // The message echoes neither the request nor the canonical path, so
+        // this holds on every OS -- including the ones the block below skips.
+        assert!(
+            !msg.contains("HiddenVault"),
+            "the refusal carries a path: {msg}"
+        );
 
         // Only a case-insensitive filesystem lets a wrong-case guess reach the
         // check at all; elsewhere it is a plain miss, which leaks nothing.
@@ -3420,6 +3426,23 @@ mod tests {
                 "{rel:?} must be refused by the spelling check: {msg}"
             );
         }
+    }
+
+    /// Step 1 looks at the last component only, so a symlinked *directory*
+    /// inside the knowledge base gets past it and resolves to a real file
+    /// under `kb_path`. The spelling check is the only thing that stops it.
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_get_document_path_rejects_a_route_through_a_directory_symlink() {
+        let kb = TempKb::new("gd-spell-dirlink");
+        kb.write("real/a.md", "# A\nbody\n");
+        std::os::unix::fs::symlink(kb.path.join("real"), kb.path.join("alias"))
+            .expect("creating a directory symlink");
+        let msg = expect_spelling_refused(&kb, "alias/a.md");
+        assert!(
+            msg.contains("spelling"),
+            "alias/a.md must be refused by the spelling check: {msg}"
+        );
     }
 
     /// APFS is case-insensitive by default; the macOS CI leg is what runs this.

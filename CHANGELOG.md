@@ -14,6 +14,35 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **`get_document` opens a document by one spelling only.** The path check
+  resolved the request and asked whether the result was inside `kb_path`; it
+  never asked whether the request *was* that path. So `./a.md`, `a//b.md`,
+  `a/../a.md`, an absolute path into the knowledge base, a route through a
+  symlinked directory and — on Windows and macOS — a different case, a
+  backslash or an 8.3 short name all opened the same file. A gateway in front
+  of groove that filters on the requested string (`!rules/secret/**`) was
+  walked around by any of them; `rules/SECRET/pay.md` was enough. The resolved
+  path is now turned back into the form the index stores — relative to the
+  knowledge base, `/`-separated — and the request has to match it byte for
+  byte. Anything else is "not found", and the message does not carry the
+  accepted spelling, so a guessed name does not reveal the real one.
+  `resources/read` already required an exact match against the index and is
+  unchanged.
+
+### Changed
+
+- **Paths that used to work by accident no longer do.** Pass `get_document`
+  the `path` exactly as `search` returned it. For `get_best_practice`, write
+  `[best_practice].path_templates` relative to the knowledge base,
+  `/`-separated, without a leading `./`, and in the case the files have on
+  disk, and pass `target` in that case too: a template that reaches its file by
+  another spelling is now skipped like a missing one and the next template is
+  tried. On Linux only the `./`, `//`, `..`, absolute and symlinked-directory forms
+  are affected —
+  case never matched there.
+
 ## [1.11.0] - 2026-09-18
 
 ### Added
