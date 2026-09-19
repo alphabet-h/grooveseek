@@ -238,7 +238,7 @@ pub(super) fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> boo
 /// `ErrorResponse` を直接 JSON 化できる (= 既存 5 unit test の
 /// `err.error.contains("...")` assertion 完全保持)。
 ///
-/// - `Found(PathBuf)` — 段階防御をすべて通過、canonical な絶対パス
+/// - [`Self::Found`] (中身は canonical path) — 段階防御をすべて通過、canonical な絶対パス
 /// - `NotFound(ErrorResponse)` — file-not-found / canonicalize-failed /
 ///   outside-kb / extension-denied / size-exceeded の総称。`get_best_practice`
 ///   の template loop では「次 template を試す」価値ありと解釈
