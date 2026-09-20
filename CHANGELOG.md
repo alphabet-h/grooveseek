@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-20
+
 ### Security
 
 - **`get_document` opens a document by one spelling only.** The path check
@@ -5511,7 +5513,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/alphabet-h/grooveseek/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/alphabet-h/grooveseek/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/alphabet-h/grooveseek/compare/v1.9.0...v1.10.0
 [1.9.0]: https://github.com/alphabet-h/grooveseek/compare/v1.8.0...v1.9.0
