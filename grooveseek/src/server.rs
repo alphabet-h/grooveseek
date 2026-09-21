@@ -47,18 +47,21 @@ mod search;
 // the limit in three of its checks -- so it keeps `pub(crate)`. The rest are
 // named by this module and its tests only.
 pub(crate) use documents::GET_DOCUMENT_MAX_BYTES;
+// The indexer's legacy-row sweep reads a failed stat the same way
+// `get_document` does -- which errors say "not there" and which say "could not
+// look" is one question.
+pub(crate) use documents::path_probe_failed;
 use documents::{EXTRACTED_TEXT_MAX_BYTES, max_bytes_for};
 
 // Named only by `mod tests`, and again the compiler is what said so: left
 // unconditional, every name below warned as unused in the plain library build.
-// Their production callers moved with them, which is the point -- these eight
+// Their production callers moved with them, which is the point -- these
 // are the surface the tests hold the moved code to, not a surface the parent
 // still uses.
 #[cfg(test)]
 use documents::{
     ResolveOutcome, ValidatePathOutcome, best_practice_not_found_message, build_document_response,
-    path_probe_failed, resolve_best_practice_path, truncate_on_char_boundary,
-    validate_get_document_path,
+    resolve_best_practice_path, truncate_on_char_boundary, validate_get_document_path,
 };
 
 pub use search::{

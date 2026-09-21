@@ -1756,37 +1756,84 @@ fn names_a_walked_path(key: &str) -> bool {
 /// old one behind for good -- findable, carrying a resource link, and
 /// impossible to open -- until the next full index run.
 ///
-/// **Unambiguous** means nothing but a directory exists at the folded path. A
-/// real `secret/pay.md` owns that key, and its row is a different document's.
-/// Anything else found there (a symlink, a file the walk would refuse) is left
-/// for the full index run to judge: a row that outlives its document until
-/// then is the smaller mistake than deleting one that was right.
+/// **Unambiguous** means the index walk could not have a document of its own
+/// at the folded path ([`a_walked_document_may_be_at`]). A real
+/// `secret/pay.md` owns that key, and its row is a different document's.
 ///
-/// The filesystem is consulted only for a folded spelling that
-/// [`names_a_walked_path`]. A file literally named `\foo.md` folds to
-/// `/foo.md`, and `Path::join` with an absolute right-hand side discards
-/// `kb_path` altogether; `a\..\..\x.md` folds to something that climbs out.
-/// Either way the stat would land outside the knowledge base, and an unrelated
-/// file on the host would decide whether the row stays. No document can be
-/// spelled like that -- the walk only ever produces normal components under
-/// `kb_path` -- so such a row has no other owner and is removed without
-/// looking.
+/// The one rule behind every case: **nothing outside the knowledge base
+/// decides.** The folded spelling is looked up only if it
+/// [`names_a_walked_path`] -- `\foo.md` folds to `/foo.md`, which `Path::join`
+/// would resolve by discarding `kb_path`, and `a\..\..\x.md` folds to
+/// something that climbs out -- and then only by descending through real
+/// directories, so a symlinked ancestor cannot send the question elsewhere
+/// either. Where the walk could not have gone there is no document, and the
+/// row is removed without asking what is on the other side.
 pub fn sweep_legacy_folded_row(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
     let Some(legacy) = legacy_folded_spelling(rel) else {
         return Ok(false);
     };
-    if !names_a_walked_path(&legacy) {
-        return deindex_single_file(db, &legacy);
-    }
-    match std::fs::symlink_metadata(kb_path.join(&legacy)) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // `NotADirectory` and the like also mean "no file there", but reading
-        // an error as absence is how a row gets deleted by mistake; only the
-        // plain answer counts.
-        Ok(_) | Err(_) => return Ok(false),
+    if names_a_walked_path(&legacy) && a_walked_document_may_be_at(kb_path, &legacy) {
+        return Ok(false);
     }
     deindex_single_file(db, &legacy)
+}
+
+/// Whether the index walk could have a document at `key` under `kb_path`,
+/// decided by descending one component at a time from `kb_path` and never
+/// through anything but a real directory. `key` must already satisfy
+/// [`names_a_walked_path`].
+///
+/// A single `symlink_metadata(kb_path.join(key))` is not this: it declines to
+/// follow only the *last* component, so with `kb/alias -> /outside` a lookup of
+/// `alias/pay.md` is answered by `/outside/pay.md`. The walk never goes there
+/// ([`collect_source_files_under`] runs with `follow_links(false)` and takes
+/// only entries whose own type is a regular file, so a symlink is neither
+/// descended into nor indexed; the watcher's event filter refuses symlinks
+/// too), so whatever is there is no document of this index.
+///
+/// What each stat says, and how it is read:
+///
+/// | found                                   | at an ancestor  | at the leaf     |
+/// |-----------------------------------------|-----------------|-----------------|
+/// | a real directory                        | keep descending | no document     |
+/// | a regular file                          | no document     | **may be one**  |
+/// | a symlink, or any other kind of entry   | no document     | no document     |
+/// | `NotFound` / `NotADirectory`            | no document     | no document     |
+/// | any other error (permissions, I/O)      | **may be one**  | **may be one**  |
+///
+/// "May be one" keeps the row. The error split is the one `get_document`
+/// already uses ([`crate::server::path_probe_failed`]): those two kinds say the
+/// path is not there, everything else says the look itself failed, and a
+/// failed look is no reason to delete. A regular file at the leaf keeps the row
+/// even if the walk would refuse it (a hard link, an excluded name): it is
+/// inside the knowledge base, so leaving that to the next full run breaks no
+/// rule, and deleting a row that was right is the worse mistake.
+///
+/// `kb_path` itself is taken as given. `groove serve` canonicalizes it before
+/// the watcher sees it, and a knowledge base reached through a symlink is
+/// still the knowledge base the operator chose. A mount point below it is a
+/// real directory and is descended like any other. On a case-insensitive
+/// volume the folded spelling can land on a file whose name differs in case;
+/// that reads as "may be one" and keeps the row, the cautious side. The stats
+/// are separate calls, so a directory swapped for a symlink between two of
+/// them can still mislead one answer -- about one index row, which the next
+/// event or full run corrects.
+fn a_walked_document_may_be_at(kb_path: &Path, key: &str) -> bool {
+    let mut at = kb_path.to_path_buf();
+    let mut segments = key.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        at.push(segment);
+        let is_leaf = segments.peek().is_none();
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if is_leaf => return meta.file_type().is_file(),
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return false,
+            Err(e) => return crate::server::path_probe_failed(&e),
+        }
+    }
+    // Unreachable for a key that `names_a_walked_path`; an empty key names no
+    // document.
+    false
 }
 
 /// Rename の結果。`rename_single_file` の戻り値。
@@ -4863,6 +4910,88 @@ mod tests {
             .unwrap();
         assert!(sweep_legacy_folded_row(&db, &kb, "a\\..\\..\\x.md").unwrap());
         assert!(db.get_document_hash("a/../../x.md").unwrap().is_none());
+    }
+
+    /// `symlink_metadata` declines to follow only the last component, so a
+    /// single stat of `kb/alias/pay.md` is answered by the directory `alias`
+    /// points at. That `pay.md` exists here, outside the knowledge base, and
+    /// must not be what keeps the row: the walk does not descend a symlink, so
+    /// no document of this index is spelled `alias/pay.md`.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_does_not_look_through_a_symlinked_ancestor() {
+        let kb = mk_tmp("legacysweepalias-kb");
+        let outside = mk_tmp("legacysweepalias-out");
+        write_file(&outside.0, "pay.md", "# not part of the knowledge base");
+        std::os::unix::fs::symlink(&outside.0, kb.0.join("alias")).unwrap();
+        write_file(
+            &kb.0,
+            "alias\\pay.md",
+            "# a file with a backslash in its name",
+        );
+
+        let db = test_db();
+        db.upsert_document("alias/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &kb.0, "alias\\pay.md").unwrap());
+        assert!(db.get_document_hash("alias/pay.md").unwrap().is_none());
+    }
+
+    /// An ancestor that is a regular file: nothing can sit below it, so the
+    /// row has no other owner. (The stat of the whole path reports
+    /// `NotADirectory` here, which is "not there", not "could not look".)
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_removes_the_row_below_an_ancestor_that_is_a_file() {
+        let tmp = mk_tmp("legacysweepfileancestor");
+        write_file(&tmp.0, "secret", "a regular file, not a directory");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
+    }
+
+    /// A symlink at the leaf is not a document either: the walk takes only
+    /// entries that are themselves regular files. What it points at -- here a
+    /// real file inside the knowledge base -- has its own row under its own
+    /// name.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_removes_the_row_of_a_leaf_that_is_a_symlink() {
+        let tmp = mk_tmp("legacysweepleaflink");
+        write_file(&tmp.0, "real.md", "# real");
+        std::fs::create_dir_all(tmp.0.join("secret")).unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("real.md"), tmp.0.join("secret").join("pay.md"))
+            .unwrap();
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
+    }
+
+    /// The walk's side of the claim the sweep rests on, from the walk itself:
+    /// neither a symlinked directory's contents nor a symlinked file is
+    /// collected.
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_source_files_takes_nothing_through_or_at_a_symlink() {
+        let kb = mk_tmp("walknolinks-kb");
+        let outside = mk_tmp("walknolinks-out");
+        write_file(&outside.0, "pay.md", "# outside");
+        write_file(&kb.0, "real.md", "# real");
+        std::os::unix::fs::symlink(&outside.0, kb.0.join("alias")).unwrap();
+        std::os::unix::fs::symlink(kb.0.join("real.md"), kb.0.join("link.md")).unwrap();
+
+        assert_eq!(
+            scanned_rel_paths(&kb.0, &Registry::defaults()),
+            vec!["real.md".to_string()]
+        );
     }
 
     /// A directory at the folded path is not a document, so it does not make

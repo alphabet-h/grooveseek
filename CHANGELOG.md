@@ -42,8 +42,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   resident `groove serve` does not walk the knowledge base when it starts. Its
   watcher tidies one file at a time instead: the next time such a file is
   modified, renamed or deleted, the row an older version wrote under the folded
-  spelling is removed along with the change, unless a real file sits at that
-  folded path and owns the row. A file that sees no event keeps its old row in
+  spelling is removed along with the change, unless a regular file sits at that
+  folded path inside the knowledge base, reached through real directories only,
+  and so owns the row. Nothing outside the knowledge base, and nothing behind a
+  symlink, has a say. A file that sees no event keeps its old row in
   `search` results, under a spelling that no longer opens, until one of the
   two full runs. Exclusion and filtering now see it
   as what it is, a single file in the directory that holds it. A `.grooveignore`

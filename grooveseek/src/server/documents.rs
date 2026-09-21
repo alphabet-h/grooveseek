@@ -283,7 +283,7 @@ impl ValidatePathOutcome {
 /// file reports that, and the path cannot exist while it holds (codex P2 round
 /// 7 on PR #162). Everything else — a permission error, a device error — says
 /// the examination failed and tells the caller nothing about the path.
-pub(super) fn path_probe_failed(e: &std::io::Error) -> bool {
+pub(crate) fn path_probe_failed(e: &std::io::Error) -> bool {
     !matches!(
         e.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
