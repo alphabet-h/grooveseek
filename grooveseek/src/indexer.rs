@@ -241,8 +241,8 @@ fn fold_separators(spelled: &str) -> String {
 ///
 /// Everything that writes `documents.path`, decides exclusion, or compares a
 /// request against the index asks this question, and they have to agree --
-/// `get_document` opens a document only under the exact string the index
-/// stores ([`index_rel_path_exact`]). So the answer has one implementation
+/// the `get_document` tool ([`crate::server`]) opens a document only under the
+/// exact string the index stores ([`index_rel_path_exact`]). So the answer has one implementation
 /// (AGENTS.md, "One question gets one implementation"), in three shapes that
 /// differ only in what they do when there is no clean answer:
 ///

@@ -3512,8 +3512,8 @@ mod tests {
     }
 
     /// On Windows the same round trip, for the fold that does happen there:
-    /// the walk hands back `docs\a.md`, the index stores `docs/a.md`, and that
-    /// is the string `get_document` opens.
+    /// the walk hands back a `\`-separated path, the index stores it with `/`,
+    /// and that is the string [`validate_get_document_path`] accepts.
     #[test]
     fn test_the_spelling_the_index_stores_is_the_one_get_document_opens() {
         let kb = TempKb::new("gd-spell-index-roundtrip-nested");

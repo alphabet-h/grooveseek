@@ -2,15 +2,15 @@
 //!
 //! `get_document` opens a document only under the exact string the index
 //! stores for it, so the two sides have to spell a path the same way. They
-//! share one function for it now (`grooveseek::indexer::index_rel_path`); the
+//! share one function for it now ([`grooveseek::indexer::index_rel_path`]); the
 //! tests here are the ones that go through the real index, the real `search`
 //! and the real `get_document` rather than through that function, so they
 //! would still fail if one side stopped calling it.
 //!
 //! The lightweight half -- the spelling the index walk stores, fed to the
-//! `get_document` validator, with no embedding model -- lives next to the
-//! validator's tests in `src/server.rs` and runs on every pull request. These
-//! build an index, so they are `#[ignore]`.
+//! `get_document` validator, with no embedding model -- lives with the
+//! validator's own unit tests ([`grooveseek::server`]) and runs on every pull
+//! request. These build an index, so they are ignored by default.
 
 mod common;
 use common::mcp::{build_index, mcp_initialize, mcp_tool_call, spawn_mcp_server};
@@ -23,8 +23,8 @@ fn body(marker: &str) -> String {
     )
 }
 
-/// Index `layout`, serve it, search for `marker`, and return the first hit's
-/// `path` together with what `get_document` answers for that exact string.
+/// Index `layout`, serve it, search for `marker`, and return the path of the
+/// first hit together with what `get_document` answers for that exact string.
 fn search_then_open(layout: &TempKbLayout, marker: &str) -> (String, serde_json::Value) {
     build_index(layout.kb());
     let cfg = layout.root().join("groove.toml");
