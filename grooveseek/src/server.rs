@@ -3511,9 +3511,11 @@ mod tests {
         );
     }
 
-    /// On Windows the same round trip, for the fold that does happen there:
-    /// the walk hands back a `\`-separated path, the index stores it with `/`,
-    /// and that is the string [`validate_get_document_path`] accepts.
+    /// The same round trip for a nested document, on every platform. Windows
+    /// is where it has something to catch: the walk hands back a
+    /// `\`-separated path there, the index stores it with `/`, and that is
+    /// the string [`validate_get_document_path`] accepts. Elsewhere the two
+    /// are the same string to begin with.
     #[test]
     fn test_the_spelling_the_index_stores_is_the_one_get_document_opens() {
         let kb = TempKb::new("gd-spell-index-roundtrip-nested");

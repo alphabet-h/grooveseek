@@ -68,8 +68,11 @@ fn normalize_text(raw: &str) -> String {
 /// - do **not** touch the case (keep the source's case)
 /// - do **not** touch non-ASCII characters
 fn derive_title(path_hint: &str) -> Option<String> {
-    // Take the last path segment (handles both `/` and `\`, though our
-    // indexer normalizes to forward-slash before calling).
+    // Take the last path segment, splitting on both `/` and `\`. On Windows
+    // the indexer has already folded `\` into `/`, so only `/` occurs. On
+    // Unix `\` is a filename character and reaches here as it is on disk: a
+    // file named `secret\pay.txt` gets the title "pay", taken from after the
+    // `\`, not "secret\pay".
     let last = path_hint.rsplit(['/', '\\']).next().unwrap_or(path_hint);
 
     // Strip extension.

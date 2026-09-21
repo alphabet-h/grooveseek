@@ -33,10 +33,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **What moves on Linux and macOS, for such a file only.** The next
   `groove index` re-keys its row from the folded spelling to the real name
   (as a rename when the content is unchanged, otherwise as one deletion and
-  one addition), so nothing is left behind. `path_globs`, `.grooveignore` and
-  `exclude_dirs` now see it as what it is, a single file in the directory that
-  holds it: a `secret/` pattern no longer covers `secret\pay.md`, and a pattern
-  that names the file does.
+  one addition), so nothing is left behind. Exclusion and filtering now see it
+  as what it is, a single file in the directory that holds it. A `.grooveignore`
+  line `secret/` or a `path_globs` entry `secret/**` no longer covers
+  `secret\pay.md`, and `exclude_dirs = ["secret"]`, which only ever compares
+  directory names, no longer drops it either. To name the file in
+  `.grooveignore` or `path_globs`, remember that `\` in a pattern is an escape
+  there: write `secret\\pay.md`, or use a wildcard such as `secret*`.
 
 ## [1.12.0] - 2026-09-20
 
