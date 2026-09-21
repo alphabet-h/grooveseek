@@ -1729,6 +1729,24 @@ pub fn legacy_folded_spelling(rel: &str) -> Option<String> {
     Some(rel.replace('\\', "/"))
 }
 
+/// Whether `key` has the shape of a path the index walk could have produced:
+/// not empty, and every `/`-separated segment a normal component -- none
+/// empty (which also rules out a leading or trailing `/`), none `.` or `..`.
+///
+/// A string check on purpose. `Path::components` would quietly collapse the
+/// `//` and the `.` this has to notice, and it reads the string by the
+/// platform's rules while an index key is `/`-separated everywhere.
+///
+/// Not the traversal check in [`crate::resources`], which asks about a `kb://` URI and treats
+/// `\` by platform; this one asks about an index key, where `\` is whatever
+/// character it was on disk.
+fn names_a_walked_path(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 /// Remove the row an older version stored for `rel` under its
 /// [`legacy_folded_spelling`], if there is one and it is unambiguous.
 /// `Ok(true)` when a row was removed.
@@ -1743,10 +1761,23 @@ pub fn legacy_folded_spelling(rel: &str) -> Option<String> {
 /// Anything else found there (a symlink, a file the walk would refuse) is left
 /// for the full index run to judge: a row that outlives its document until
 /// then is the smaller mistake than deleting one that was right.
+///
+/// The filesystem is consulted only for a folded spelling that
+/// [`names_a_walked_path`]. A file literally named `\foo.md` folds to
+/// `/foo.md`, and `Path::join` with an absolute right-hand side discards
+/// `kb_path` altogether; `a\..\..\x.md` folds to something that climbs out.
+/// Either way the stat would land outside the knowledge base, and an unrelated
+/// file on the host would decide whether the row stays. No document can be
+/// spelled like that -- the walk only ever produces normal components under
+/// `kb_path` -- so such a row has no other owner and is removed without
+/// looking.
 pub fn sweep_legacy_folded_row(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
     let Some(legacy) = legacy_folded_spelling(rel) else {
         return Ok(false);
     };
+    if !names_a_walked_path(&legacy) {
+        return deindex_single_file(db, &legacy);
+    }
     match std::fs::symlink_metadata(kb_path.join(&legacy)) {
         Ok(meta) if meta.file_type().is_dir() => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -4762,6 +4793,76 @@ mod tests {
 
         assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
         assert!(db.get_document_hash("secret/pay.md").unwrap().is_some());
+    }
+
+    /// The shape of a key the walk could have produced. Strings only, so the
+    /// table is the same on every platform.
+    #[test]
+    fn test_names_a_walked_path_truth_table() {
+        for (key, expected) in [
+            ("notes/a.md", true),
+            ("a.md", true),
+            ("secret\\pay.md", true),
+            ("", false),
+            ("/foo.md", false),
+            ("a/../b.md", false),
+            ("a/../../x.md", false),
+            ("a//b.md", false),
+            ("./a.md", false),
+            ("a/./b.md", false),
+            ("a/", false),
+            ("..", false),
+        ] {
+            assert_eq!(names_a_walked_path(key), expected, "{key:?}");
+        }
+    }
+
+    /// A file literally named `\...\outside.md` folds to an absolute path, and
+    /// `Path::join` with an absolute right-hand side drops the knowledge base:
+    /// the stat used to land on the host. The name here is built from a file
+    /// this test creates outside the KB, so the file the old code would have
+    /// found really exists -- and the row goes anyway. Nothing on the host
+    /// outside this test's own temp directories is involved.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_does_not_ask_the_host_about_an_absolute_spelling() {
+        let kb = mk_tmp("legacysweepabs-kb");
+        let outside = mk_tmp("legacysweepabs-out");
+        write_file(&outside.0, "o.md", "# not part of the knowledge base");
+        let absolute = outside.0.join("o.md").to_str().unwrap().to_string();
+        assert!(absolute.starts_with('/'));
+        let name = absolute.replace('/', "\\");
+        assert!(name.len() <= 255, "the fixture name must fit in a filename");
+        write_file(&kb.0, &name, "# a file with backslashes in its name");
+
+        let db = test_db();
+        db.upsert_document(&absolute, None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &kb.0, &name).unwrap());
+        assert!(db.get_document_hash(&absolute).unwrap().is_none());
+    }
+
+    /// The same for a name that folds into something climbing out of the KB:
+    /// `a\..\..\x.md` becomes `a/../../x.md`, which from `kb/` is the `x.md`
+    /// beside it. That file exists here, and must not be what decides.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_does_not_climb_out_through_a_folded_dot_dot() {
+        let tmp = mk_tmp("legacysweepclimb");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(kb.join("a")).unwrap();
+        write_file(&tmp.0, "x.md", "# outside the knowledge base");
+        write_file(
+            &kb,
+            "a\\..\\..\\x.md",
+            "# a file with backslashes in its name",
+        );
+
+        let db = test_db();
+        db.upsert_document("a/../../x.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &kb, "a\\..\\..\\x.md").unwrap());
+        assert!(db.get_document_hash("a/../../x.md").unwrap().is_none());
     }
 
     /// A directory at the folded path is not a document, so it does not make
