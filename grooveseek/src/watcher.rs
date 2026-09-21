@@ -907,10 +907,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&kb);
     }
 
-    /// The watcher writes the same `documents.path` the full index walk does,
-    /// so it has to spell a literal `\` the same way: left alone on Unix. A
-    /// folded key here would also send the reindex to `kb/secret/pay.md`, a
-    /// path that does not exist.
     /// What the three dispatchers call after they have written or removed the
     /// real key, against an index a version up to 1.12.0 built: the folded row
     /// goes once the real key is in (modify / create / rename-to) or
@@ -957,6 +953,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&kb);
     }
 
+    /// The watcher writes the same `documents.path` the full index walk does,
+    /// so it has to spell a literal `\` the same way: left alone on Unix. A
+    /// folded key here would also send the reindex to `kb/secret/pay.md`, a
+    /// path that does not exist.
     #[cfg(unix)]
     #[test]
     fn test_to_rel_keeps_a_literal_backslash_on_unix() {
