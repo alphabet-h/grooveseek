@@ -1768,14 +1768,50 @@ fn names_a_walked_path(key: &str) -> bool {
 /// directories, so a symlinked ancestor cannot send the question elsewhere
 /// either. Where the walk could not have gone there is no document, and the
 /// row is removed without asking what is on the other side.
-pub fn sweep_legacy_folded_row(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
+///
+/// `require_real_key` is for a caller that has just *written* `rel`: the sweep
+/// then runs only if `rel` is in the index. A reindex that was refused or
+/// skipped leaves the index as it was on purpose, and for such a file the
+/// folded row is the index as it was -- the sweep follows the real key in,
+/// never ahead of it. A removal passes `false`: the file is gone under every
+/// spelling.
+///
+/// **The decision and the delete it justifies share one `BEGIN IMMEDIATE`
+/// transaction** ([`Database::begin_immediate_transaction`]). Other processes
+/// write this database too -- a `groove index` run, a second server -- and the
+/// caller's mutex does not serialize them. With the write lock held from
+/// before the first read, such a writer either committed a real document at
+/// the folded path before the look, in which case its file is there and the
+/// row is kept, or commits after the delete and puts its row back. Looking
+/// first and deleting afterwards would let it land in between and lose a row
+/// that was right. Nothing is opened when there is no folded spelling, so an
+/// ordinary path -- every path on Windows -- costs neither a lock nor a stat.
+///
+/// If the lock cannot be had within the connection's busy timeout (30 s, set
+/// in [`Database::init`]) this returns the error and deletes nothing; the row
+/// waits for the file's next event or the next full run. While the lock is
+/// held the work is one stat per path component and one document's deletes.
+pub fn sweep_legacy_folded_row(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    require_real_key: bool,
+) -> Result<bool> {
     let Some(legacy) = legacy_folded_spelling(rel) else {
         return Ok(false);
     };
+    // Every early return below drops `tx`, which rolls back; nothing has been
+    // written by then.
+    let tx = db.begin_immediate_transaction()?;
+    if require_real_key && db.get_document_hash(rel)?.is_none() {
+        return Ok(false);
+    }
     if names_a_walked_path(&legacy) && a_walked_document_may_be_at(kb_path, &legacy) {
         return Ok(false);
     }
-    deindex_single_file(db, &legacy)
+    let removed = deindex_single_file(db, &legacy)?;
+    tx.commit()?;
+    Ok(removed)
 }
 
 /// Whether the index walk could have a document at `key` under `kb_path`,
@@ -4804,7 +4840,7 @@ mod tests {
         let db = test_db();
         db.upsert_document("notes/a.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
-        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "notes/a.md").unwrap());
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "notes/a.md", false).unwrap());
         assert!(db.get_document_hash("notes/a.md").unwrap().is_some());
     }
 
@@ -4820,10 +4856,10 @@ mod tests {
         db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
 
-        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
         assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
         // Idempotent: the second event for the same file finds nothing.
-        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
     }
 
     /// A real `secret/pay.md` owns that key. Its row is a different document's
@@ -4838,7 +4874,7 @@ mod tests {
         db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
 
-        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
         assert!(db.get_document_hash("secret/pay.md").unwrap().is_some());
     }
 
@@ -4885,7 +4921,7 @@ mod tests {
         let db = test_db();
         db.upsert_document(&absolute, None, None, None, None, &[], None, "h", 0)
             .unwrap();
-        assert!(sweep_legacy_folded_row(&db, &kb.0, &name).unwrap());
+        assert!(sweep_legacy_folded_row(&db, &kb.0, &name, false).unwrap());
         assert!(db.get_document_hash(&absolute).unwrap().is_none());
     }
 
@@ -4908,8 +4944,131 @@ mod tests {
         let db = test_db();
         db.upsert_document("a/../../x.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
-        assert!(sweep_legacy_folded_row(&db, &kb, "a\\..\\..\\x.md").unwrap());
+        assert!(sweep_legacy_folded_row(&db, &kb, "a\\..\\..\\x.md", false).unwrap());
         assert!(db.get_document_hash("a/../../x.md").unwrap().is_none());
+    }
+
+    /// What the sweep's transaction is made of, on every platform (the sweep
+    /// itself has nothing to do where `\` separates components): a delete
+    /// inside a caller's immediate transaction joins it rather than opening
+    /// its own, takes effect on commit, and is undone when the transaction is
+    /// dropped instead.
+    #[test]
+    fn test_deindex_single_file_rides_a_callers_immediate_transaction() {
+        let db = test_db();
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        {
+            let _dropped = db.begin_immediate_transaction().unwrap();
+            assert!(deindex_single_file(&db, "a.md").unwrap());
+        }
+        assert!(db.get_document_hash("a.md").unwrap().is_some());
+
+        let tx = db.begin_immediate_transaction().unwrap();
+        assert!(deindex_single_file(&db, "a.md").unwrap());
+        tx.commit().unwrap();
+        assert!(db.get_document_hash("a.md").unwrap().is_none());
+    }
+
+    /// Two connections to one database file, the way a `groove index` run in
+    /// another process and a server's watcher share it. The look and the delete
+    /// sit in one immediate transaction, so the other writer can only commit
+    /// before the look or after the delete -- and both of those orders have to
+    /// come out right. This walks them one after the other; it does not stage
+    /// the race itself, which would need a hook inside the transaction that
+    /// the function should not carry.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_is_right_on_both_sides_of_another_writer() {
+        let tmp = mk_tmp("legacysweeptwoconn");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "secret\\pay.md", "# pay");
+        let db_file = tmp.0.join("index.db");
+        let open = || {
+            let db = Database::open(db_file.to_str().unwrap()).unwrap();
+            db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+            db
+        };
+        let watcher_side = open();
+        let other_process = open();
+        let seed = |db: &Database| {
+            db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        };
+
+        // The other writer first: it creates a real `secret/pay.md` and commits
+        // its row. The sweep's look, under the lock, finds the file and keeps
+        // the row -- it is that document's now.
+        write_file(&kb, "secret/pay.md", "# a different document");
+        seed(&other_process);
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+        assert!(
+            other_process
+                .get_document_hash("secret/pay.md")
+                .unwrap()
+                .is_some()
+        );
+
+        // The sweep first: no file there, so the stale row goes. The other
+        // writer then creates the file and commits; its row is in the index
+        // and the next sweep leaves it alone.
+        std::fs::remove_file(kb.join("secret").join("pay.md")).unwrap();
+        assert!(sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+        assert!(
+            other_process
+                .get_document_hash("secret/pay.md")
+                .unwrap()
+                .is_none()
+        );
+        write_file(&kb, "secret/pay.md", "# a different document");
+        seed(&other_process);
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+        assert!(
+            watcher_side
+                .get_document_hash("secret/pay.md")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A sweep that decides to keep the row writes nothing and leaves no
+    /// transaction open behind it: the connection is usable, and another
+    /// connection can take the write lock at once.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_releases_the_write_lock_when_it_keeps_the_row() {
+        let tmp = mk_tmp("legacysweeprelease");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "secret\\pay.md", "# pay");
+        write_file(&kb, "secret/pay.md", "# a different document");
+        let db_file = tmp.0.join("index.db");
+        let open = || {
+            let db = Database::open(db_file.to_str().unwrap()).unwrap();
+            db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+            db
+        };
+        let watcher_side = open();
+        let other_process = open();
+
+        // Kept because the real key is not in the index, then kept because a
+        // real file owns the folded path: the two early returns.
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", true).unwrap());
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+
+        let tx = other_process.begin_immediate_transaction().unwrap();
+        other_process
+            .upsert_document("other.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            watcher_side
+                .get_document_hash("other.md")
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// `symlink_metadata` declines to follow only the last component, so a
@@ -4933,7 +5092,7 @@ mod tests {
         let db = test_db();
         db.upsert_document("alias/pay.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
-        assert!(sweep_legacy_folded_row(&db, &kb.0, "alias\\pay.md").unwrap());
+        assert!(sweep_legacy_folded_row(&db, &kb.0, "alias\\pay.md", false).unwrap());
         assert!(db.get_document_hash("alias/pay.md").unwrap().is_none());
     }
 
@@ -4950,7 +5109,7 @@ mod tests {
         let db = test_db();
         db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
-        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
         assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
     }
 
@@ -4971,7 +5130,7 @@ mod tests {
         let db = test_db();
         db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
-        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
         assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
     }
 
@@ -5005,7 +5164,7 @@ mod tests {
         db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
             .unwrap();
 
-        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
         assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
     }
 

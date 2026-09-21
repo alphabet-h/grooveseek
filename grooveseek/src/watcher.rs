@@ -706,23 +706,16 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
 /// spelling ([`indexer::sweep_legacy_folded_row`]). A no-op on Windows and for
 /// any path without a `\` in it, which is every path but a handful.
 ///
-/// `only_if_indexed` is for the paths that *write* `rel`: a reindex that was
-/// refused or skipped leaves the index as it was on purpose, and for such a
-/// file the folded row is the index as it was. The sweep follows the real key
-/// in, never ahead of it. A removal passes `false` -- the file is gone under
-/// every spelling.
+/// `require_real_key` is passed straight through: `true` from the paths that
+/// *write* `rel`, `false` from a removal. Whether `rel` is in the index is read
+/// over there, inside the transaction that also decides and deletes, not here.
 ///
-/// Not one transaction with the write before it, and it does not need to be:
-/// the order is "real key first", so stopping in between leaves a duplicate
-/// row, which the next event for the file or the next full index removes.
-fn sweep_legacy_row(db: &Database, kb_path: &Path, rel: &str, only_if_indexed: bool) {
-    if indexer::legacy_folded_spelling(rel).is_none() {
-        return;
-    }
-    if only_if_indexed && !matches!(db.get_document_hash(rel), Ok(Some(_))) {
-        return;
-    }
-    match indexer::sweep_legacy_folded_row(db, kb_path, rel) {
+/// Not one transaction with the write of `rel` before it, and it does not need
+/// to be: the order is "real key first", so stopping in between leaves a
+/// duplicate row, which the next event for the file or the next full index
+/// removes.
+fn sweep_legacy_row(db: &Database, kb_path: &Path, rel: &str, require_real_key: bool) {
+    match indexer::sweep_legacy_folded_row(db, kb_path, rel, require_real_key) {
         Ok(true) => wdiag!(
             "watcher: removed the row an older version stored for {rel} under a folded spelling"
         ),
