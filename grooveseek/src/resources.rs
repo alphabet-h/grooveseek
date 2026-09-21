@@ -406,8 +406,8 @@ mod tests {
     }
 
     /// `\` is refused where it separates components and nowhere else. On Unix
-    /// the index holds a file named `secret\pay.md` under that name, `search`
-    /// hands out a URI for it, and a URI this module built has to read back.
+    /// the index holds a file named `secret\pay.md` under that name, a search
+    /// hit carries a URI for it, and a URI this module built has to read back.
     #[cfg(unix)]
     #[test]
     fn a_literal_backslash_name_survives_its_own_uri_on_unix() {

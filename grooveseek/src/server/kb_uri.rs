@@ -139,7 +139,7 @@ impl<'a> ServableRules<'a> {
 
     /// The last condition is about the URI rather than the document: a path
     /// [`crate::resources::parse`] would not read back gets no link. It is the
-    /// predicate `parse` itself runs, so the side that offers and the side that
+    /// predicate that parser itself runs, so the side that offers and the side that
     /// opens cannot disagree. In practice it only ever bites on a Unix file
     /// with a `..` between backslashes in its name, which `get_document` still
     /// opens.
