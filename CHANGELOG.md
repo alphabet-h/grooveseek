@@ -14,6 +14,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **On Linux and macOS, a file whose name contains a backslash is indexed
+  under its own name.** `\` separates path components only on Windows, but the
+  index folded it into `/` on every platform. So a file named `secret\pay.md`
+  in the knowledge base root was stored as `secret/pay.md`: `search` returned a
+  path `get_document` could not open (1.12.0 opens a document only under its
+  real spelling), and the real name opened while matching no rule a gateway had
+  written against the paths the index shows. A real `secret/pay.md` beside it
+  was given the same key. The index, the live watcher, `.grooveignore`
+  matching, `groove validate` and the `get_document` check now take the
+  spelling from one function, which folds `\` only on Windows. The `kb://doc/`
+  URI of such a document now opens with `resources/read` as well: the URI
+  parser refused any `\`, and refuses it only on Windows now. A `..` segment is
+  still refused whether it sits between `/` or `\`, on every platform, and a
+  path whose URI would not read back is not given a `uri` on its `search` hit.
+  The title derived from a file name reads it the same way: `secret\pay.txt`
+  is titled "secret\pay", where it used to be "pay". **Windows is unchanged.**
+
+### Changed
+
+- **What moves on Linux and macOS, for such a file only.** The next
+  `groove index` (or the `rebuild_index` tool) re-keys its row from the folded
+  spelling to the real name (as a rename when the content is unchanged,
+  otherwise as one deletion and one addition), so nothing is left behind. A
+  resident `groove serve` does not walk the knowledge base when it starts. Its
+  watcher tidies one file at a time instead: the next time such a file is
+  modified, renamed or deleted, the row an older version wrote under the folded
+  spelling is removed along with the change, unless a regular file sits at that
+  folded path inside the knowledge base, reached through real directories only,
+  and so owns the row. Nothing outside the knowledge base, and nothing behind a
+  symlink, has a say. A file that sees no event keeps its old row in
+  `search` results, under a spelling that no longer opens, until one of the
+  two full runs. Exclusion and filtering now see it
+  as what it is, a single file in the directory that holds it. A `.grooveignore`
+  line `secret/` or a `path_globs` entry `secret/**` no longer covers
+  `secret\pay.md`, and `exclude_dirs = ["secret"]`, which only ever compares
+  directory names, no longer drops it either. To name the file in
+  `.grooveignore` or `path_globs`, remember that `\` in a pattern is an escape
+  there: write `secret\\pay.md`, or use a wildcard such as `secret*`.
+
 ## [1.12.0] - 2026-09-20
 
 ### Security

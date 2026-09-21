@@ -220,6 +220,99 @@ fn size_cap_kind(is_binary_ext: bool) -> &'static str {
     if is_binary_ext { "binary" } else { "text" }
 }
 
+/// Whether `\` separates path components on this platform, or is an ordinary
+/// filename character.
+///
+/// Its own function because the fold below is not the only thing that has to
+/// know: [`crate::resources`] refuses a `\` in a `kb://doc/` URI exactly where
+/// this says it is a separator, and the two would otherwise each carry a
+/// `cfg!(windows)` that has to stay the same one.
+pub fn backslash_separates_components() -> bool {
+    cfg!(windows)
+}
+
+/// The separator fold, and the only place it is written.
+///
+/// `\` becomes `/` **only where `\` separates components**. On Unix it is an
+/// ordinary filename character: a file named `secret\pay.md` sits in the KB
+/// root, and folding it would store the spelling of a different path --
+/// `secret/pay.md` -- that `get_document` cannot open, while the real name
+/// stays reachable and matches no rule a gateway wrote against the index
+/// (codex P2 round 4 on PR #310).
+fn fold_separators(spelled: &str) -> String {
+    if backslash_separates_components() {
+        spelled.replace('\\', "/")
+    } else {
+        spelled.to_string()
+    }
+}
+
+/// The spelling the index holds for `full`: relative to `kb_path`, components
+/// joined with `/`. `None` when `full` is not under `kb_path`.
+///
+/// Everything that writes `documents.path`, decides exclusion, or compares a
+/// request against the index asks this question, and they have to agree --
+/// the `get_document` tool ([`crate::server`]) opens a document only under the
+/// exact string the index stores ([`index_rel_path_exact`]). So the answer has one implementation
+/// (AGENTS.md, "One question gets one implementation"), in three shapes that
+/// differ only in what they do when there is no clean answer:
+///
+/// - this one spells a name that is not UTF-8 lossily (U+FFFD), which is what
+///   the index has always stored for such a file;
+/// - [`index_rel_path_exact`] returns `None` for it instead;
+/// - [`index_rel_path_or_whole`] falls back to the whole path when `full` is
+///   outside `kb_path`.
+pub fn index_rel_path(kb_path: &Path, full: &Path) -> Option<String> {
+    full.strip_prefix(kb_path)
+        .ok()
+        .map(|rel| fold_separators(&rel.to_string_lossy()))
+}
+
+/// [`index_rel_path`], but `None` for a name that is not UTF-8 as well.
+///
+/// For a caller that compares the result against a string it was handed, where
+/// a lossy spelling would be compared as if it were the real one.
+pub fn index_rel_path_exact(kb_path: &Path, full: &Path) -> Option<String> {
+    full.strip_prefix(kb_path)
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .map(fold_separators)
+}
+
+/// [`index_rel_path`], or the whole of `full` spelled the same way when it is
+/// not under `kb_path`.
+///
+/// The fallback is what the index walk, `groove validate` and
+/// [`crate::exclusion::rel_key`] each did on their own before they shared
+/// this. Their inputs come from a walk rooted inside `kb_path`, so it is not
+/// expected to be taken.
+pub fn index_rel_path_or_whole(kb_path: &Path, full: &Path) -> String {
+    index_rel_path(kb_path, full).unwrap_or_else(|| fold_separators(&full.to_string_lossy()))
+}
+
+/// The `documents.path` a full index run would store for every file it would
+/// index under `kb_path`, without embedding anything.
+///
+/// Test-only, and deliberately built from the walk and the scan rather than
+/// from [`index_rel_path`]: a test that asked the helper directly would keep
+/// passing after the scan stopped calling it.
+#[cfg(test)]
+pub(crate) fn scanned_rel_paths(kb_path: &Path, registry: &Registry) -> Vec<String> {
+    let rules = crate::exclusion::ExclusionRules::load(kb_path, Vec::new());
+    let files = collect_source_files(kb_path, registry, &rules).expect("walking the test KB");
+    scan_disk_entries(
+        &files,
+        kb_path,
+        registry,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    )
+    .entries
+    .into_iter()
+    .map(|e| e.rel)
+    .collect()
+}
+
 /// disk 側の全 source file を走査し、raw バイト読み + バイト hash を計算する。
 ///
 /// - **エラー隔離**: `read` 失敗や size 超過は per-file skip し、rel path を `skipped`
@@ -240,11 +333,7 @@ fn scan_disk_entries(
     let mut oversize = Vec::new();
 
     for p in source_files {
-        let rel = p
-            .strip_prefix(kb_path)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = index_rel_path_or_whole(kb_path, p);
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
 
@@ -1621,6 +1710,166 @@ pub fn deindex_single_file(db: &Database, rel: &str) -> Result<bool> {
     }
     db.delete_document(rel)?;
     Ok(true)
+}
+
+/// The key a version up to 1.12.0 stored for `rel` on a platform where `\` is
+/// a filename character: `rel` with every `\` folded into `/`. `None` when
+/// that is the same key -- no `\` in `rel`, or a platform where `\` separates
+/// components and the fold is still what the index does.
+///
+/// **This exists for migration only.** Those versions folded `\` everywhere,
+/// so an index they built holds a file named `secret\pay.md` under
+/// `secret/pay.md`. The full index run re-keys such a row by itself
+/// ([`detect_renames`]); the watcher, which touches one path at a time, has to
+/// be told where the old row is, and this is the one place that says.
+pub fn legacy_folded_spelling(rel: &str) -> Option<String> {
+    if backslash_separates_components() || !rel.contains('\\') {
+        return None;
+    }
+    Some(rel.replace('\\', "/"))
+}
+
+/// Whether `key` has the shape of a path the index walk could have produced:
+/// not empty, and every `/`-separated segment a normal component -- none
+/// empty (which also rules out a leading or trailing `/`), none `.` or `..`.
+///
+/// A string check on purpose. `Path::components` would quietly collapse the
+/// `//` and the `.` this has to notice, and it reads the string by the
+/// platform's rules while an index key is `/`-separated everywhere.
+///
+/// Not the traversal check in [`crate::resources`], which asks about a `kb://` URI and treats
+/// `\` by platform; this one asks about an index key, where `\` is whatever
+/// character it was on disk.
+fn names_a_walked_path(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// Remove the row an older version stored for `rel` under its
+/// [`legacy_folded_spelling`], if there is one and it is unambiguous.
+/// `Ok(true)` when a row was removed.
+///
+/// The watcher calls this after it has written or removed the real key.
+/// Without it a modify leaves two rows for one file, and a delete leaves the
+/// old one behind for good -- findable, carrying a resource link, and
+/// impossible to open -- until the next full index run.
+///
+/// **Unambiguous** means the index walk could not have a document of its own
+/// at the folded path ([`a_walked_document_may_be_at`]). A real
+/// `secret/pay.md` owns that key, and its row is a different document's.
+///
+/// The one rule behind every case: **nothing outside the knowledge base
+/// decides.** The folded spelling is looked up only if it
+/// [`names_a_walked_path`] -- `\foo.md` folds to `/foo.md`, which `Path::join`
+/// would resolve by discarding `kb_path`, and `a\..\..\x.md` folds to
+/// something that climbs out -- and then only by descending through real
+/// directories, so a symlinked ancestor cannot send the question elsewhere
+/// either. Where the walk could not have gone there is no document, and the
+/// row is removed without asking what is on the other side.
+///
+/// `require_real_key` is for a caller that has just *written* `rel`: the sweep
+/// then runs only if `rel` is in the index. A reindex that was refused or
+/// skipped leaves the index as it was on purpose, and for such a file the
+/// folded row is the index as it was -- the sweep follows the real key in,
+/// never ahead of it. A removal passes `false`: the file is gone under every
+/// spelling.
+///
+/// **The decision and the delete it justifies share one `BEGIN IMMEDIATE`
+/// transaction** ([`Database::begin_immediate_transaction`]). Other processes
+/// write this database too -- a `groove index` run, a second server -- and the
+/// caller's mutex does not serialize them. With the write lock held from
+/// before the first read, such a writer either committed a real document at
+/// the folded path before the look, in which case its file is there and the
+/// row is kept, or commits after the delete and puts its row back. Looking
+/// first and deleting afterwards would let it land in between and lose a row
+/// that was right. Nothing is opened when there is no folded spelling, so an
+/// ordinary path -- every path on Windows -- costs neither a lock nor a stat.
+///
+/// If the lock cannot be had within the connection's busy timeout (30 s, set
+/// in [`Database::init`]) this returns the error and deletes nothing; the row
+/// waits for the file's next event or the next full run. While the lock is
+/// held the work is one stat per path component and one document's deletes.
+pub fn sweep_legacy_folded_row(
+    db: &Database,
+    kb_path: &Path,
+    rel: &str,
+    require_real_key: bool,
+) -> Result<bool> {
+    let Some(legacy) = legacy_folded_spelling(rel) else {
+        return Ok(false);
+    };
+    // Every early return below drops `tx`, which rolls back; nothing has been
+    // written by then.
+    let tx = db.begin_immediate_transaction()?;
+    if require_real_key && db.get_document_hash(rel)?.is_none() {
+        return Ok(false);
+    }
+    if names_a_walked_path(&legacy) && a_walked_document_may_be_at(kb_path, &legacy) {
+        return Ok(false);
+    }
+    let removed = deindex_single_file(db, &legacy)?;
+    tx.commit()?;
+    Ok(removed)
+}
+
+/// Whether the index walk could have a document at `key` under `kb_path`,
+/// decided by descending one component at a time from `kb_path` and never
+/// through anything but a real directory. `key` must already satisfy
+/// [`names_a_walked_path`].
+///
+/// A single `symlink_metadata(kb_path.join(key))` is not this: it declines to
+/// follow only the *last* component, so with `kb/alias -> /outside` a lookup of
+/// `alias/pay.md` is answered by `/outside/pay.md`. The walk never goes there
+/// ([`collect_source_files_under`] runs with `follow_links(false)` and takes
+/// only entries whose own type is a regular file, so a symlink is neither
+/// descended into nor indexed; the watcher's event filter refuses symlinks
+/// too), so whatever is there is no document of this index.
+///
+/// What each stat says, and how it is read:
+///
+/// | found                                   | at an ancestor  | at the leaf     |
+/// |-----------------------------------------|-----------------|-----------------|
+/// | a real directory                        | keep descending | no document     |
+/// | a regular file                          | no document     | **may be one**  |
+/// | a symlink, or any other kind of entry   | no document     | no document     |
+/// | `NotFound` / `NotADirectory`            | no document     | no document     |
+/// | any other error (permissions, I/O)      | **may be one**  | **may be one**  |
+///
+/// "May be one" keeps the row. The error split is the one `get_document`
+/// already uses ([`crate::server::path_probe_failed`]): those two kinds say the
+/// path is not there, everything else says the look itself failed, and a
+/// failed look is no reason to delete. A regular file at the leaf keeps the row
+/// even if the walk would refuse it (a hard link, an excluded name): it is
+/// inside the knowledge base, so leaving that to the next full run breaks no
+/// rule, and deleting a row that was right is the worse mistake.
+///
+/// `kb_path` itself is taken as given. `groove serve` canonicalizes it before
+/// the watcher sees it, and a knowledge base reached through a symlink is
+/// still the knowledge base the operator chose. A mount point below it is a
+/// real directory and is descended like any other. On a case-insensitive
+/// volume the folded spelling can land on a file whose name differs in case;
+/// that reads as "may be one" and keeps the row, the cautious side. The stats
+/// are separate calls, so a directory swapped for a symlink between two of
+/// them can still mislead one answer -- about one index row, which the next
+/// event or full run corrects.
+fn a_walked_document_may_be_at(kb_path: &Path, key: &str) -> bool {
+    let mut at = kb_path.to_path_buf();
+    let mut segments = key.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        at.push(segment);
+        let is_leaf = segments.peek().is_none();
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if is_leaf => return meta.file_type().is_file(),
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return false,
+            Err(e) => return crate::server::path_probe_failed(&e),
+        }
+    }
+    // Unreachable for a key that `names_a_walked_path`; an empty key names no
+    // document.
+    false
 }
 
 /// Rename の結果。`rename_single_file` の戻り値。
@@ -4456,6 +4705,467 @@ mod tests {
             RenameOutcome::RenamedSizeCapped,
             RenameOutcome::OldPathMissing
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // index_rel_path: the one spelling the index holds for a document
+    // -----------------------------------------------------------------------
+
+    /// The known-answer case, on every platform: components joined with `/`.
+    #[test]
+    fn test_index_rel_path_is_kb_relative_and_slash_separated() {
+        let kb = Path::new("kb");
+        let full = kb.join("notes").join("a.md");
+        assert_eq!(index_rel_path(kb, &full), Some("notes/a.md".to_string()));
+        assert_eq!(
+            index_rel_path_exact(kb, &full),
+            Some("notes/a.md".to_string())
+        );
+        assert_eq!(index_rel_path_or_whole(kb, &full), "notes/a.md");
+    }
+
+    /// Outside the knowledge base there is no relative spelling. The two
+    /// `Option` forms say so; the third keeps what its three callers always
+    /// did, which is to fall back to the path as given.
+    #[test]
+    fn test_index_rel_path_outside_the_kb_has_no_relative_spelling() {
+        let kb = Path::new("kb");
+        let outside = Path::new("elsewhere").join("a.md");
+        assert_eq!(index_rel_path(kb, &outside), None);
+        assert_eq!(index_rel_path_exact(kb, &outside), None);
+        assert_eq!(index_rel_path_or_whole(kb, &outside), "elsewhere/a.md");
+    }
+
+    /// Where `\` separates components it is folded, however the path was
+    /// written.
+    #[cfg(windows)]
+    #[test]
+    fn test_index_rel_path_folds_the_windows_separator() {
+        let kb = Path::new(r"C:\kb");
+        let full = Path::new(r"C:\kb\a\b.md");
+        assert_eq!(index_rel_path(kb, full), Some("a/b.md".to_string()));
+        assert_eq!(index_rel_path_exact(kb, full), Some("a/b.md".to_string()));
+        assert_eq!(index_rel_path_or_whole(kb, full), "a/b.md");
+    }
+
+    /// On Unix `\` is an ordinary filename character. `secret\pay.md` is one
+    /// file in the KB root, and folding it would store the spelling of a
+    /// different path -- `secret/pay.md` -- which `get_document` cannot open
+    /// and a gateway rule written against the index would not match (codex P2
+    /// round 4 on PR #310).
+    #[cfg(unix)]
+    #[test]
+    fn test_index_rel_path_keeps_a_literal_backslash_on_unix() {
+        let kb = Path::new("/kb");
+        let full = Path::new("/kb/secret\\pay.md");
+        assert_eq!(index_rel_path(kb, full), Some("secret\\pay.md".to_string()));
+        assert_eq!(
+            index_rel_path_exact(kb, full),
+            Some("secret\\pay.md".to_string())
+        );
+        assert_eq!(index_rel_path_or_whole(kb, full), "secret\\pay.md");
+    }
+
+    /// A name that is not UTF-8 is where the two `Option` forms differ, and
+    /// each keeps what its callers did before they shared this code: the index
+    /// stores a lossy spelling, `get_document` refuses to compare against one.
+    #[cfg(unix)]
+    #[test]
+    fn test_index_rel_path_lossy_and_exact_differ_only_on_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let kb = Path::new("/kb");
+        let full = kb.join(std::ffi::OsStr::from_bytes(b"caf\xe9.md"));
+        assert_eq!(
+            index_rel_path(kb, &full),
+            Some("caf\u{fffd}.md".to_string())
+        );
+        assert_eq!(index_rel_path_exact(kb, &full), None);
+    }
+
+    /// The scan is what writes `documents.path`, so this is the stored
+    /// spelling -- read from the scan rather than from the helper, which
+    /// would pass even if the scan stopped calling it.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_disk_entries_stores_a_literal_backslash_name_unfolded() {
+        let tmp = mk_tmp("scanbackslash");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+        write_file(&tmp.0, "secret/pay.md", "# a different document");
+        let mut rels = scanned_rel_paths(&tmp.0, &Registry::defaults());
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec!["secret/pay.md".to_string(), "secret\\pay.md".to_string()],
+            "two files, two spellings: folding `\\` would give both the same key"
+        );
+    }
+
+    /// What the next `groove index` does with a row an older version stored
+    /// folded (`secret/pay.md` for a file named `secret\pay.md`): the old
+    /// spelling is in the database and not on disk, the new one is on disk and
+    /// not in the database, and the bytes are the same -- so it is a rename,
+    /// not an orphan. Pure strings, so this runs on every platform.
+    #[test]
+    fn test_detect_renames_moves_a_folded_row_to_its_unfolded_spelling() {
+        let disk = vec![mk_entry("secret\\pay.md", "h1")];
+        let mut db = HashMap::new();
+        db.insert("secret/pay.md".to_string(), "h1".to_string());
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
+        assert_eq!(
+            pairs,
+            vec![("secret/pay.md".to_string(), "secret\\pay.md".to_string())]
+        );
+    }
+
+    /// Where `\` separates components no version ever stored a folded key
+    /// that differs from the real one, so there is nothing to migrate.
+    #[test]
+    fn test_legacy_folded_spelling_exists_only_where_backslash_is_a_filename_character() {
+        assert_eq!(legacy_folded_spelling("notes/a.md"), None);
+        if backslash_separates_components() {
+            assert_eq!(legacy_folded_spelling("secret\\pay.md"), None);
+        } else {
+            assert_eq!(
+                legacy_folded_spelling("secret\\pay.md"),
+                Some("secret/pay.md".to_string())
+            );
+        }
+    }
+
+    /// Nothing to sweep means nothing is touched: the ordinary case, and the
+    /// whole of what this function does on Windows.
+    #[test]
+    fn test_sweep_legacy_folded_row_leaves_an_ordinary_path_alone() {
+        let tmp = mk_tmp("legacysweepnoop");
+        let db = test_db();
+        db.upsert_document("notes/a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "notes/a.md", false).unwrap());
+        assert!(db.get_document_hash("notes/a.md").unwrap().is_some());
+    }
+
+    /// The row a version up to 1.12.0 stored for `secret\pay.md` sits under
+    /// `secret/pay.md`. Once the watcher writes or removes the real key, that
+    /// row describes nothing and has to go with it.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_removes_the_row_an_older_version_stored() {
+        let tmp = mk_tmp("legacysweep");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
+        // Idempotent: the second event for the same file finds nothing.
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
+    }
+
+    /// A real `secret/pay.md` owns that key. Its row is a different document's
+    /// and is not this sweep's to remove.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_keeps_the_row_of_a_real_file_at_that_path() {
+        let tmp = mk_tmp("legacysweepreal");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+        write_file(&tmp.0, "secret/pay.md", "# a different document");
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_some());
+    }
+
+    /// The shape of a key the walk could have produced. Strings only, so the
+    /// table is the same on every platform.
+    #[test]
+    fn test_names_a_walked_path_truth_table() {
+        for (key, expected) in [
+            ("notes/a.md", true),
+            ("a.md", true),
+            ("secret\\pay.md", true),
+            ("", false),
+            ("/foo.md", false),
+            ("a/../b.md", false),
+            ("a/../../x.md", false),
+            ("a//b.md", false),
+            ("./a.md", false),
+            ("a/./b.md", false),
+            ("a/", false),
+            ("..", false),
+        ] {
+            assert_eq!(names_a_walked_path(key), expected, "{key:?}");
+        }
+    }
+
+    /// A file literally named `\...\outside.md` folds to an absolute path, and
+    /// `Path::join` with an absolute right-hand side drops the knowledge base:
+    /// the stat used to land on the host. The name here is built from a file
+    /// this test creates outside the KB, so the file the old code would have
+    /// found really exists -- and the row goes anyway. Nothing on the host
+    /// outside this test's own temp directories is involved.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_does_not_ask_the_host_about_an_absolute_spelling() {
+        let kb = mk_tmp("legacysweepabs-kb");
+        let outside = mk_tmp("legacysweepabs-out");
+        write_file(&outside.0, "o.md", "# not part of the knowledge base");
+        let absolute = outside.0.join("o.md").to_str().unwrap().to_string();
+        assert!(absolute.starts_with('/'));
+        let name = absolute.replace('/', "\\");
+        assert!(name.len() <= 255, "the fixture name must fit in a filename");
+        write_file(&kb.0, &name, "# a file with backslashes in its name");
+
+        let db = test_db();
+        db.upsert_document(&absolute, None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &kb.0, &name, false).unwrap());
+        assert!(db.get_document_hash(&absolute).unwrap().is_none());
+    }
+
+    /// The same for a name that folds into something climbing out of the KB:
+    /// `a\..\..\x.md` becomes `a/../../x.md`, which from `kb/` is the `x.md`
+    /// beside it. That file exists here, and must not be what decides.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_does_not_climb_out_through_a_folded_dot_dot() {
+        let tmp = mk_tmp("legacysweepclimb");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(kb.join("a")).unwrap();
+        write_file(&tmp.0, "x.md", "# outside the knowledge base");
+        write_file(
+            &kb,
+            "a\\..\\..\\x.md",
+            "# a file with backslashes in its name",
+        );
+
+        let db = test_db();
+        db.upsert_document("a/../../x.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &kb, "a\\..\\..\\x.md", false).unwrap());
+        assert!(db.get_document_hash("a/../../x.md").unwrap().is_none());
+    }
+
+    /// What the sweep's transaction is made of, on every platform (the sweep
+    /// itself has nothing to do where `\` separates components): a delete
+    /// inside a caller's immediate transaction joins it rather than opening
+    /// its own, takes effect on commit, and is undone when the transaction is
+    /// dropped instead.
+    #[test]
+    fn test_deindex_single_file_rides_a_callers_immediate_transaction() {
+        let db = test_db();
+        db.upsert_document("a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        {
+            let _dropped = db.begin_immediate_transaction().unwrap();
+            assert!(deindex_single_file(&db, "a.md").unwrap());
+        }
+        assert!(db.get_document_hash("a.md").unwrap().is_some());
+
+        let tx = db.begin_immediate_transaction().unwrap();
+        assert!(deindex_single_file(&db, "a.md").unwrap());
+        tx.commit().unwrap();
+        assert!(db.get_document_hash("a.md").unwrap().is_none());
+    }
+
+    /// Two connections to one database file, the way a `groove index` run in
+    /// another process and a server's watcher share it. The look and the delete
+    /// sit in one immediate transaction, so the other writer can only commit
+    /// before the look or after the delete -- and both of those orders have to
+    /// come out right. This walks them one after the other; it does not stage
+    /// the race itself, which would need a hook inside the transaction that
+    /// the function should not carry.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_is_right_on_both_sides_of_another_writer() {
+        let tmp = mk_tmp("legacysweeptwoconn");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "secret\\pay.md", "# pay");
+        let db_file = tmp.0.join("index.db");
+        let open = || {
+            let db = Database::open(db_file.to_str().unwrap()).unwrap();
+            db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+            db
+        };
+        let watcher_side = open();
+        let other_process = open();
+        let seed = |db: &Database| {
+            db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        };
+
+        // The other writer first: it creates a real `secret/pay.md` and commits
+        // its row. The sweep's look, under the lock, finds the file and keeps
+        // the row -- it is that document's now.
+        write_file(&kb, "secret/pay.md", "# a different document");
+        seed(&other_process);
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+        assert!(
+            other_process
+                .get_document_hash("secret/pay.md")
+                .unwrap()
+                .is_some()
+        );
+
+        // The sweep first: no file there, so the stale row goes. The other
+        // writer then creates the file and commits; its row is in the index
+        // and the next sweep leaves it alone.
+        std::fs::remove_file(kb.join("secret").join("pay.md")).unwrap();
+        assert!(sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+        assert!(
+            other_process
+                .get_document_hash("secret/pay.md")
+                .unwrap()
+                .is_none()
+        );
+        write_file(&kb, "secret/pay.md", "# a different document");
+        seed(&other_process);
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+        assert!(
+            watcher_side
+                .get_document_hash("secret/pay.md")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A sweep that decides to keep the row writes nothing and leaves no
+    /// transaction open behind it: the connection is usable, and another
+    /// connection can take the write lock at once.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_releases_the_write_lock_when_it_keeps_the_row() {
+        let tmp = mk_tmp("legacysweeprelease");
+        let kb = tmp.0.join("kb");
+        std::fs::create_dir_all(&kb).unwrap();
+        write_file(&kb, "secret\\pay.md", "# pay");
+        write_file(&kb, "secret/pay.md", "# a different document");
+        let db_file = tmp.0.join("index.db");
+        let open = || {
+            let db = Database::open(db_file.to_str().unwrap()).unwrap();
+            db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+            db
+        };
+        let watcher_side = open();
+        let other_process = open();
+
+        // Kept because the real key is not in the index, then kept because a
+        // real file owns the folded path: the two early returns.
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", true).unwrap());
+        assert!(!sweep_legacy_folded_row(&watcher_side, &kb, "secret\\pay.md", false).unwrap());
+
+        let tx = other_process.begin_immediate_transaction().unwrap();
+        other_process
+            .upsert_document("other.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            watcher_side
+                .get_document_hash("other.md")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// `symlink_metadata` declines to follow only the last component, so a
+    /// single stat of `kb/alias/pay.md` is answered by the directory `alias`
+    /// points at. That `pay.md` exists here, outside the knowledge base, and
+    /// must not be what keeps the row: the walk does not descend a symlink, so
+    /// no document of this index is spelled `alias/pay.md`.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_does_not_look_through_a_symlinked_ancestor() {
+        let kb = mk_tmp("legacysweepalias-kb");
+        let outside = mk_tmp("legacysweepalias-out");
+        write_file(&outside.0, "pay.md", "# not part of the knowledge base");
+        std::os::unix::fs::symlink(&outside.0, kb.0.join("alias")).unwrap();
+        write_file(
+            &kb.0,
+            "alias\\pay.md",
+            "# a file with a backslash in its name",
+        );
+
+        let db = test_db();
+        db.upsert_document("alias/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &kb.0, "alias\\pay.md", false).unwrap());
+        assert!(db.get_document_hash("alias/pay.md").unwrap().is_none());
+    }
+
+    /// An ancestor that is a regular file: nothing can sit below it, so the
+    /// row has no other owner. (The stat of the whole path reports
+    /// `NotADirectory` here, which is "not there", not "could not look".)
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_removes_the_row_below_an_ancestor_that_is_a_file() {
+        let tmp = mk_tmp("legacysweepfileancestor");
+        write_file(&tmp.0, "secret", "a regular file, not a directory");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
+    }
+
+    /// A symlink at the leaf is not a document either: the walk takes only
+    /// entries that are themselves regular files. What it points at -- here a
+    /// real file inside the knowledge base -- has its own row under its own
+    /// name.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_removes_the_row_of_a_leaf_that_is_a_symlink() {
+        let tmp = mk_tmp("legacysweepleaflink");
+        write_file(&tmp.0, "real.md", "# real");
+        std::fs::create_dir_all(tmp.0.join("secret")).unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("real.md"), tmp.0.join("secret").join("pay.md"))
+            .unwrap();
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
+    }
+
+    /// The walk's side of the claim the sweep rests on, from the walk itself:
+    /// neither a symlinked directory's contents nor a symlinked file is
+    /// collected.
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_source_files_takes_nothing_through_or_at_a_symlink() {
+        let kb = mk_tmp("walknolinks-kb");
+        let outside = mk_tmp("walknolinks-out");
+        write_file(&outside.0, "pay.md", "# outside");
+        write_file(&kb.0, "real.md", "# real");
+        std::os::unix::fs::symlink(&outside.0, kb.0.join("alias")).unwrap();
+        std::os::unix::fs::symlink(kb.0.join("real.md"), kb.0.join("link.md")).unwrap();
+
+        assert_eq!(
+            scanned_rel_paths(&kb.0, &Registry::defaults()),
+            vec!["real.md".to_string()]
+        );
+    }
+
+    /// A directory at the folded path is not a document, so it does not make
+    /// the row ambiguous.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_is_not_stopped_by_a_directory_at_that_path() {
+        let tmp = mk_tmp("legacysweepdir");
+        std::fs::create_dir_all(tmp.0.join("secret").join("pay.md")).unwrap();
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md", false).unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------

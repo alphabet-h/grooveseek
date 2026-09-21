@@ -623,18 +623,16 @@ fn should_process_parts(
 
 /// 絶対パスを kb_path 相対 (forward-slash) に変換。kb_path 外ならエラーを
 /// ログに出して `None`。
+///
+/// 綴りそのものは [`indexer::index_rel_path`] が決める (full index の走査と
+/// 同じ `documents.path` を書くため)。ここが持つのは canonicalize の再試行だけ。
 fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
-    match full.strip_prefix(kb_path) {
-        Ok(rel) => Some(rel.to_string_lossy().replace('\\', "/")),
-        Err(_) => {
-            // canonicalize ズレで失敗することがある — 再度 canonicalize して再試行
-            full.canonicalize().ok().and_then(|c| {
-                c.strip_prefix(kb_path)
-                    .ok()
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-            })
-        }
-    }
+    indexer::index_rel_path(kb_path, full).or_else(|| {
+        // canonicalize ズレで失敗することがある — 再度 canonicalize して再試行
+        full.canonicalize()
+            .ok()
+            .and_then(|c| indexer::index_rel_path(kb_path, &c))
+    })
 }
 
 /// Index what a newly appeared directory brought in with it.
@@ -704,6 +702,28 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
     }
 }
 
+/// Drop the row a version up to 1.12.0 stored for `rel` under its folded
+/// spelling ([`indexer::sweep_legacy_folded_row`]). A no-op on Windows and for
+/// any path without a `\` in it, which is every path but a handful.
+///
+/// `require_real_key` is passed straight through: `true` from the paths that
+/// *write* `rel`, `false` from a removal. Whether `rel` is in the index is read
+/// over there, inside the transaction that also decides and deletes, not here.
+///
+/// Not one transaction with the write of `rel` before it, and it does not need
+/// to be: the order is "real key first", so stopping in between leaves a
+/// duplicate row, which the next event for the file or the next full index
+/// removes.
+fn sweep_legacy_row(db: &Database, kb_path: &Path, rel: &str, require_real_key: bool) {
+    match indexer::sweep_legacy_folded_row(db, kb_path, rel, require_real_key) {
+        Ok(true) => wdiag!(
+            "watcher: removed the row an older version stored for {rel} under a folded spelling"
+        ),
+        Ok(false) => {}
+        Err(e) => wdiag!("watcher: removing the folded-spelling row for {rel} failed: {e}"),
+    }
+}
+
 fn dispatch_reindex(state: &WatcherState, rel: &str) {
     let mut embedder = recover(state.embedder.lock(), "embedder");
     let db = recover_db(state.db.lock());
@@ -745,6 +765,7 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             wdiag!("watcher: reindex {rel} failed: {e}");
         }
     }
+    sweep_legacy_row(&db, &state.kb_path, rel, true);
 }
 
 fn dispatch_deindex(state: &WatcherState, rel: &str) {
@@ -754,6 +775,7 @@ fn dispatch_deindex(state: &WatcherState, rel: &str) {
         Ok(false) => { /* no-op: not in DB */ }
         Err(e) => wdiag!("watcher: deindex {rel} failed: {e}"),
     }
+    sweep_legacy_row(&db, &state.kb_path, rel, false);
 }
 
 fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
@@ -820,6 +842,10 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
         }
         Err(e) => wdiag!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
     }
+    // The file has left `old_rel` under every spelling; at `new_rel` the sweep
+    // follows the real key in, as it does after a reindex.
+    sweep_legacy_row(&db, &state.kb_path, old_rel, false);
+    sweep_legacy_row(&db, &state.kb_path, new_rel, true);
 }
 
 // ===========================================================================
@@ -872,6 +898,66 @@ mod tests {
         let full = full.canonicalize().unwrap();
         assert_eq!(to_rel(&kb, &full), Some("notes/a.md".to_string()));
         let _ = std::fs::remove_dir_all(&kb);
+    }
+
+    /// What the three dispatchers call after they have written or removed the
+    /// real key, against an index a version up to 1.12.0 built: the folded row
+    /// goes once the real key is in (modify / create / rename-to) or
+    /// unconditionally (delete / rename-from), and stays while the real key is
+    /// not in -- a refused or skipped reindex leaves the index as it was, and
+    /// for this file the folded row is the index as it was.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_row_follows_the_real_key_and_never_runs_ahead_of_it() {
+        let kb = crate::test_support::unique_temp_path("groove-watcher-legacy-row");
+        std::fs::create_dir_all(&kb).unwrap();
+        std::fs::write(kb.join("secret\\pay.md"), "# pay").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+        let seed = |path: &str| {
+            db.upsert_document(path, None, None, None, None, &[], None, "h", 0)
+                .unwrap();
+        };
+        let has = |path: &str| db.get_document_hash(path).unwrap().is_some();
+
+        // A reindex that wrote nothing: the folded row is all there is.
+        seed("secret/pay.md");
+        sweep_legacy_row(&db, &kb, "secret\\pay.md", true);
+        assert!(has("secret/pay.md"));
+
+        // The reindex wrote the real key: the duplicate goes.
+        seed("secret\\pay.md");
+        sweep_legacy_row(&db, &kb, "secret\\pay.md", true);
+        assert!(has("secret\\pay.md"));
+        assert!(!has("secret/pay.md"));
+
+        // A delete: the folded row goes whether or not the real key ever existed.
+        seed("secret/pay.md");
+        sweep_legacy_row(&db, &kb, "secret\\pay.md", false);
+        assert!(!has("secret/pay.md"));
+
+        // A real file at the folded path owns that row.
+        std::fs::create_dir_all(kb.join("secret")).unwrap();
+        std::fs::write(kb.join("secret").join("pay.md"), "# another").unwrap();
+        seed("secret/pay.md");
+        sweep_legacy_row(&db, &kb, "secret\\pay.md", false);
+        assert!(has("secret/pay.md"));
+
+        let _ = std::fs::remove_dir_all(&kb);
+    }
+
+    /// The watcher writes the same `documents.path` the full index walk does,
+    /// so it has to spell a literal `\` the same way: left alone on Unix. A
+    /// folded key here would also send the reindex to `kb/secret/pay.md`, a
+    /// path that does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn test_to_rel_keeps_a_literal_backslash_on_unix() {
+        let kb = Path::new("/kb");
+        assert_eq!(
+            to_rel(kb, Path::new("/kb/secret\\pay.md")),
+            Some("secret\\pay.md".to_string())
+        );
     }
 
     /// `should_process` は WatcherState のうち `kb_path` / `registry` /

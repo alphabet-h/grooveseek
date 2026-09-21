@@ -395,12 +395,28 @@ pub fn mcp_search_call(
     session_id: &str,
     arguments: serde_json::Value,
 ) -> serde_json::Value {
+    mcp_tool_call(base, session_id, "search", arguments)
+}
+
+/// POST a `tools/call` request for the tool `name` and return the
+/// deserialized JSON value of `result.content[0].text` -- the tool's own
+/// response, or the `ErrorResponse` it answered with.
+///
+/// [`mcp_search_call`] is this with the name filled in; it was the only tool
+/// the shared helpers covered until a test needed `search` and `get_document`
+/// against one server.
+pub fn mcp_tool_call(
+    base: &str,
+    session_id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "search",
+            "name": name,
             "arguments": arguments,
         }
     });

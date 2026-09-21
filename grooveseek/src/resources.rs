@@ -162,16 +162,45 @@ pub fn parse(uri: &str) -> Option<ResourceUri> {
     }
 }
 
+/// Whether `rel`, a path as the index spells it, can be named by a
+/// `kb://doc/` URI that [`parse`] will read back.
+///
+/// The side that hands a URI out asks this, and [`parse`] asks the same
+/// function underneath, so a link is never offered for a path the read would
+/// refuse on its spelling alone.
+pub fn doc_is_addressable(rel: &str) -> bool {
+    !rel.is_empty() && is_safe_relative(rel)
+}
+
 /// A decoded path may be used against the knowledge base only if it stays
 /// inside it and names something on this side of the OS's path syntax.
+///
+/// **`\` is refused only where it separates components**
+/// ([`crate::indexer::backslash_separates_components`], the same answer the
+/// index uses when it spells a path). On Unix it is an ordinary filename
+/// character: the index holds a file named `secret\pay.md` under exactly that
+/// name, and refusing it here left the server unable to read a URI it had
+/// handed out. Letting it through there is not a way out of the knowledge
+/// base -- `\` does not separate anything on that platform, the leading-slash
+/// check still refuses absolute paths, and the caller resolves what survives
+/// against the index rather than the filesystem, then through the same checks
+/// `get_document` applies.
+///
+/// The `..` check splits on `\` as well as `/`, on every platform. That is
+/// deliberately the cautious side: it gives up a Unix file literally named
+/// `a\..\b.md` (still reachable through `get_document`), and in return nothing
+/// downstream that reads `\` as a separator can ever be handed a `..`.
 fn is_safe_relative(p: &str) -> bool {
-    if p.contains('\0') || p.contains('\\') {
+    if p.contains('\0') {
+        return false;
+    }
+    if p.contains('\\') && crate::indexer::backslash_separates_components() {
         return false;
     }
     if p.starts_with('/') || starts_with_drive_designator(p) {
         return false;
     }
-    !p.split('/').any(|seg| seg == "..")
+    !p.split(['/', '\\']).any(|seg| seg == "..")
 }
 
 /// Whether `p` opens with a Windows drive designator — `C:` — which escapes the
@@ -374,6 +403,64 @@ mod tests {
             cfg!(windows),
             "the raw spelling follows the same platform rule as the encoded one"
         );
+    }
+
+    /// `\` is refused where it separates components and nowhere else. On Unix
+    /// the index holds a file named `secret\pay.md` under that name, a search
+    /// hit carries a URI for it, and a URI this module built has to read back.
+    #[cfg(unix)]
+    #[test]
+    fn a_literal_backslash_name_survives_its_own_uri_on_unix() {
+        assert_eq!(
+            parse("kb://doc/secret%5Cpay.md"),
+            Some(ResourceUri::Doc("secret\\pay.md".to_string()))
+        );
+        assert_eq!(
+            parse(&doc_uri("secret\\pay.md")),
+            Some(ResourceUri::Doc("secret\\pay.md".to_string()))
+        );
+        assert!(doc_is_addressable("secret\\pay.md"));
+    }
+
+    /// The `..` check splits on `\` as well, on every platform. That gives up
+    /// a Unix file literally named `a\..\b.md`; in return nothing downstream
+    /// that reads `\` as a separator can be handed a `..`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dot_dot_segment_between_backslashes_is_still_refused_on_unix() {
+        assert_eq!(parse("kb://doc/a%5C..%5Cb.md"), None);
+        assert!(!doc_is_addressable("a\\..\\b.md"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_is_refused_where_it_separates_components() {
+        assert_eq!(parse("kb://doc/secret%5Cpay.md"), None);
+        assert!(!doc_is_addressable("secret\\pay.md"));
+    }
+
+    /// What decides whether a URI is handed out is what decides whether it
+    /// reads back, so the two cannot disagree about a path.
+    #[test]
+    fn a_path_is_addressable_exactly_when_its_own_uri_parses() {
+        for rel in [
+            "notes/a.md",
+            "日本語/メモ.md",
+            "a b/c#d.md",
+            "",
+            "../a.md",
+            "a/../b.md",
+            "/abs.md",
+            "a\\b.md",
+            "a\\..\\b.md",
+            "C:/note.md",
+        ] {
+            assert_eq!(
+                doc_is_addressable(rel),
+                parse(&doc_uri(rel)) == Some(ResourceUri::Doc(rel.to_string())),
+                "{rel:?}"
+            );
+        }
     }
 
     #[test]

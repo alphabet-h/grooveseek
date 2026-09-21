@@ -47,18 +47,21 @@ mod search;
 // the limit in three of its checks -- so it keeps `pub(crate)`. The rest are
 // named by this module and its tests only.
 pub(crate) use documents::GET_DOCUMENT_MAX_BYTES;
+// The indexer's legacy-row sweep reads a failed stat the same way
+// `get_document` does -- which errors say "not there" and which say "could not
+// look" is one question.
+pub(crate) use documents::path_probe_failed;
 use documents::{EXTRACTED_TEXT_MAX_BYTES, max_bytes_for};
 
 // Named only by `mod tests`, and again the compiler is what said so: left
 // unconditional, every name below warned as unused in the plain library build.
-// Their production callers moved with them, which is the point -- these eight
+// Their production callers moved with them, which is the point -- these
 // are the surface the tests hold the moved code to, not a surface the parent
 // still uses.
 #[cfg(test)]
 use documents::{
     ResolveOutcome, ValidatePathOutcome, best_practice_not_found_message, build_document_response,
-    path_probe_failed, resolve_best_practice_path, truncate_on_char_boundary,
-    validate_get_document_path,
+    resolve_best_practice_path, truncate_on_char_boundary, validate_get_document_path,
 };
 
 pub use search::{
@@ -3469,6 +3472,72 @@ mod tests {
         );
     }
 
+    /// The same file, from the index's side: the spelling the index walk
+    /// stores for it is the spelling that opens it, and the folded spelling an
+    /// older version stored is not a second way in. The validator test above
+    /// only shows that the real name opens; nothing in it asks what the index
+    /// would have handed a client (codex P2 round 4 on #310).
+    #[cfg(unix)]
+    #[test]
+    fn test_the_spelling_the_index_stores_is_the_one_get_document_opens_on_unix() {
+        let kb = TempKb::new("gd-spell-index-roundtrip");
+        kb.write("secret\\pay.md", "# Pay\nbody\n");
+        let stored = crate::indexer::scanned_rel_paths(&kb.path, &md_only_registry());
+        assert_eq!(
+            stored,
+            vec!["secret\\pay.md".to_string()],
+            "the index must store the file under its own name"
+        );
+        let r = validate_get_document_path(
+            &kb.path,
+            &stored[0],
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "the stored spelling must open the document: {r:?}"
+        );
+        // `secret/pay.md` names a path that does not exist, so it cannot get as
+        // far as the spelling check; what matters is that it does not open.
+        let folded = validate_get_document_path(
+            &kb.path,
+            "secret/pay.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(folded, ValidatePathOutcome::NotFound(_)),
+            "the folded spelling is not a name this file has: {folded:?}"
+        );
+    }
+
+    /// The same round trip for a nested document, on every platform. Windows
+    /// is where it has something to catch: the walk hands back a
+    /// `\`-separated path there, the index stores it with `/`, and that is
+    /// the string [`validate_get_document_path`] accepts. Elsewhere the two
+    /// are the same string to begin with.
+    #[test]
+    fn test_the_spelling_the_index_stores_is_the_one_get_document_opens() {
+        let kb = TempKb::new("gd-spell-index-roundtrip-nested");
+        kb.write("docs/deep/a.md", "# A\nbody\n");
+        let stored = crate::indexer::scanned_rel_paths(&kb.path, &md_only_registry());
+        assert_eq!(stored, vec!["docs/deep/a.md".to_string()]);
+        let r = validate_get_document_path(
+            &kb.path,
+            &stored[0],
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "the stored spelling must open the document: {r:?}"
+        );
+    }
+
     /// APFS is case-insensitive by default; the macOS CI leg is what runs this.
     #[cfg(target_os = "macos")]
     #[test]
@@ -4370,6 +4439,24 @@ mod tests {
         let rules = ServableRules::new(&registry, Vec::new());
         assert!(!rules.allows("legacy/old.xls"));
         assert!(!rules.allows("no_extension"));
+    }
+
+    /// A link is offered exactly when `resources/read` would parse it: the
+    /// rules ask the predicate the URI parser runs, so a path whose URI does
+    /// not read back gets none. Which paths those are depends on whether `\`
+    /// separates components here.
+    #[test]
+    fn a_path_whose_uri_would_not_parse_is_not_offered() {
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        for path in ["notes/a.md", "secret\\pay.md", "a\\..\\b.md"] {
+            let reads_back = crate::resources::parse(&crate::resources::doc_uri(path))
+                == Some(crate::resources::ResourceUri::Doc(path.to_string()));
+            assert_eq!(rules.allows(path), reads_back, "{path:?}");
+        }
+        assert!(rules.allows("notes/a.md"));
+        assert!(!rules.allows("a\\..\\b.md"));
+        assert_eq!(rules.allows("secret\\pay.md"), !cfg!(windows));
     }
 
     /// The three surfaces have to answer alike about the same document.
