@@ -30,7 +30,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   parser refused any `\`, and refuses it only on Windows now. A `..` segment is
   still refused whether it sits between `/` or `\`, on every platform, and a
   path whose URI would not read back is not given a `uri` on its `search` hit.
-  **Windows is unchanged.**
+  The title derived from a file name reads it the same way: `secret\pay.txt`
+  is titled "secret\pay", where it used to be "pay". **Windows is unchanged.**
 
 ### Changed
 

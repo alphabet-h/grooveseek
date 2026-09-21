@@ -68,12 +68,16 @@ fn normalize_text(raw: &str) -> String {
 /// - do **not** touch the case (keep the source's case)
 /// - do **not** touch non-ASCII characters
 fn derive_title(path_hint: &str) -> Option<String> {
-    // Take the last path segment, splitting on both `/` and `\`. On Windows
-    // the indexer has already folded `\` into `/`, so only `/` occurs. On
-    // Unix `\` is a filename character and reaches here as it is on disk: a
-    // file named `secret\pay.txt` gets the title "pay", taken from after the
-    // `\`, not "secret\pay".
-    let last = path_hint.rsplit(['/', '\\']).next().unwrap_or(path_hint);
+    // Take the last path segment. `\` ends a directory only where it separates
+    // components -- the indexer's own answer, so the title and the index key
+    // read a name the same way. On Windows that keeps a hint that was never
+    // folded working as before; on Unix `\` is a filename character, and a
+    // file named `secret\pay.txt` is titled "secret\pay", not "pay".
+    let separates = crate::indexer::backslash_separates_components();
+    let last = path_hint
+        .rsplit(|c: char| c == '/' || (c == '\\' && separates))
+        .next()
+        .unwrap_or(path_hint);
 
     // Strip extension.
     let stem = match last.rfind('.') {
@@ -151,6 +155,25 @@ mod tests {
     fn test_derive_title_mixed_separators() {
         // `-` and `_` both become space; runs collapse to single space.
         assert_eq!(derive_title("a_b--c_d.txt").as_deref(), Some("a b c d"));
+    }
+
+    /// On Unix `\` is a filename character, so the index keys `secret\pay.txt`
+    /// as one name and the title has to read it as one name too.
+    #[cfg(unix)]
+    #[test]
+    fn test_derive_title_keeps_a_literal_backslash_on_unix() {
+        assert_eq!(
+            derive_title("notes/secret\\pay.txt").as_deref(),
+            Some("secret\\pay")
+        );
+    }
+
+    /// Where `\` separates components, a hint that was never folded still
+    /// yields the file's own stem, as it did before.
+    #[cfg(windows)]
+    #[test]
+    fn test_derive_title_splits_on_a_backslash_on_windows() {
+        assert_eq!(derive_title("notes\\pay.txt").as_deref(), Some("pay"));
     }
 
     #[test]
