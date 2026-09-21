@@ -1712,6 +1712,52 @@ pub fn deindex_single_file(db: &Database, rel: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The key a version up to 1.12.0 stored for `rel` on a platform where `\` is
+/// a filename character: `rel` with every `\` folded into `/`. `None` when
+/// that is the same key -- no `\` in `rel`, or a platform where `\` separates
+/// components and the fold is still what the index does.
+///
+/// **This exists for migration only.** Those versions folded `\` everywhere,
+/// so an index they built holds a file named `secret\pay.md` under
+/// `secret/pay.md`. The full index run re-keys such a row by itself
+/// ([`detect_renames`]); the watcher, which touches one path at a time, has to
+/// be told where the old row is, and this is the one place that says.
+pub fn legacy_folded_spelling(rel: &str) -> Option<String> {
+    if backslash_separates_components() || !rel.contains('\\') {
+        return None;
+    }
+    Some(rel.replace('\\', "/"))
+}
+
+/// Remove the row an older version stored for `rel` under its
+/// [`legacy_folded_spelling`], if there is one and it is unambiguous.
+/// `Ok(true)` when a row was removed.
+///
+/// The watcher calls this after it has written or removed the real key.
+/// Without it a modify leaves two rows for one file, and a delete leaves the
+/// old one behind for good -- findable, carrying a resource link, and
+/// impossible to open -- until the next full index run.
+///
+/// **Unambiguous** means nothing but a directory exists at the folded path. A
+/// real `secret/pay.md` owns that key, and its row is a different document's.
+/// Anything else found there (a symlink, a file the walk would refuse) is left
+/// for the full index run to judge: a row that outlives its document until
+/// then is the smaller mistake than deleting one that was right.
+pub fn sweep_legacy_folded_row(db: &Database, kb_path: &Path, rel: &str) -> Result<bool> {
+    let Some(legacy) = legacy_folded_spelling(rel) else {
+        return Ok(false);
+    };
+    match std::fs::symlink_metadata(kb_path.join(&legacy)) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // `NotADirectory` and the like also mean "no file there", but reading
+        // an error as absence is how a row gets deleted by mistake; only the
+        // plain answer counts.
+        Ok(_) | Err(_) => return Ok(false),
+    }
+    deindex_single_file(db, &legacy)
+}
+
 /// Rename の結果。`rename_single_file` の戻り値。
 #[derive(Debug, PartialEq)]
 pub enum RenameOutcome {
@@ -4655,6 +4701,82 @@ mod tests {
             pairs,
             vec![("secret/pay.md".to_string(), "secret\\pay.md".to_string())]
         );
+    }
+
+    /// Where `\` separates components no version ever stored a folded key
+    /// that differs from the real one, so there is nothing to migrate.
+    #[test]
+    fn test_legacy_folded_spelling_exists_only_where_backslash_is_a_filename_character() {
+        assert_eq!(legacy_folded_spelling("notes/a.md"), None);
+        if backslash_separates_components() {
+            assert_eq!(legacy_folded_spelling("secret\\pay.md"), None);
+        } else {
+            assert_eq!(
+                legacy_folded_spelling("secret\\pay.md"),
+                Some("secret/pay.md".to_string())
+            );
+        }
+    }
+
+    /// Nothing to sweep means nothing is touched: the ordinary case, and the
+    /// whole of what this function does on Windows.
+    #[test]
+    fn test_sweep_legacy_folded_row_leaves_an_ordinary_path_alone() {
+        let tmp = mk_tmp("legacysweepnoop");
+        let db = test_db();
+        db.upsert_document("notes/a.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "notes/a.md").unwrap());
+        assert!(db.get_document_hash("notes/a.md").unwrap().is_some());
+    }
+
+    /// The row a version up to 1.12.0 stored for `secret\pay.md` sits under
+    /// `secret/pay.md`. Once the watcher writes or removes the real key, that
+    /// row describes nothing and has to go with it.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_removes_the_row_an_older_version_stored() {
+        let tmp = mk_tmp("legacysweep");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
+        // Idempotent: the second event for the same file finds nothing.
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+    }
+
+    /// A real `secret/pay.md` owns that key. Its row is a different document's
+    /// and is not this sweep's to remove.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_keeps_the_row_of_a_real_file_at_that_path() {
+        let tmp = mk_tmp("legacysweepreal");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+        write_file(&tmp.0, "secret/pay.md", "# a different document");
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        assert!(!sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_some());
+    }
+
+    /// A directory at the folded path is not a document, so it does not make
+    /// the row ambiguous.
+    #[cfg(unix)]
+    #[test]
+    fn test_sweep_legacy_folded_row_is_not_stopped_by_a_directory_at_that_path() {
+        let tmp = mk_tmp("legacysweepdir");
+        std::fs::create_dir_all(tmp.0.join("secret").join("pay.md")).unwrap();
+        let db = test_db();
+        db.upsert_document("secret/pay.md", None, None, None, None, &[], None, "h", 0)
+            .unwrap();
+
+        assert!(sweep_legacy_folded_row(&db, &tmp.0, "secret\\pay.md").unwrap());
+        assert!(db.get_document_hash("secret/pay.md").unwrap().is_none());
     }
 
     // -----------------------------------------------------------------------

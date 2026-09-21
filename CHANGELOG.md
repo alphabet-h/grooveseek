@@ -38,9 +38,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `groove index` (or the `rebuild_index` tool) re-keys its row from the folded
   spelling to the real name (as a rename when the content is unchanged,
   otherwise as one deletion and one addition), so nothing is left behind. A
-  resident `groove serve` does not walk the knowledge base when it starts:
-  until one of the two has run, the row an older version wrote stays in
-  `search` results under the folded spelling, which no longer opens. Exclusion and filtering now see it
+  resident `groove serve` does not walk the knowledge base when it starts. Its
+  watcher tidies one file at a time instead: the next time such a file is
+  modified, renamed or deleted, the row an older version wrote under the folded
+  spelling is removed along with the change, unless a real file sits at that
+  folded path and owns the row. A file that sees no event keeps its old row in
+  `search` results, under a spelling that no longer opens, until one of the
+  two full runs. Exclusion and filtering now see it
   as what it is, a single file in the directory that holds it. A `.grooveignore`
   line `secret/` or a `path_globs` entry `secret/**` no longer covers
   `secret\pay.md`, and `exclude_dirs = ["secret"]`, which only ever compares
