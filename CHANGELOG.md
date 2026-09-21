@@ -14,6 +14,30 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Fixed
+
+- **On Linux and macOS, a file whose name contains a backslash is indexed
+  under its own name.** `\` separates path components only on Windows, but the
+  index folded it into `/` on every platform. So a file named `secret\pay.md`
+  in the knowledge base root was stored as `secret/pay.md`: `search` returned a
+  path `get_document` could not open (1.12.0 opens a document only under its
+  real spelling), and the real name opened while matching no rule a gateway had
+  written against the paths the index shows. A real `secret/pay.md` beside it
+  was given the same key. The index, the live watcher, `.grooveignore`
+  matching, `groove validate` and the `get_document` check now take the
+  spelling from one function, which folds `\` only on Windows. **Windows is
+  unchanged.**
+
+### Changed
+
+- **What moves on Linux and macOS, for such a file only.** The next
+  `groove index` re-keys its row from the folded spelling to the real name
+  (as a rename when the content is unchanged, otherwise as one deletion and
+  one addition), so nothing is left behind. `path_globs`, `.grooveignore` and
+  `exclude_dirs` now see it as what it is, a single file in the directory that
+  holds it: a `secret/` pattern no longer covers `secret\pay.md`, and a pattern
+  that names the file does.
+
 ## [1.12.0] - 2026-09-20
 
 ### Security

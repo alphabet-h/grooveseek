@@ -623,18 +623,16 @@ fn should_process_parts(
 
 /// 絶対パスを kb_path 相対 (forward-slash) に変換。kb_path 外ならエラーを
 /// ログに出して `None`。
+///
+/// 綴りそのものは [`indexer::index_rel_path`] が決める (full index の走査と
+/// 同じ `documents.path` を書くため)。ここが持つのは canonicalize の再試行だけ。
 fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
-    match full.strip_prefix(kb_path) {
-        Ok(rel) => Some(rel.to_string_lossy().replace('\\', "/")),
-        Err(_) => {
-            // canonicalize ズレで失敗することがある — 再度 canonicalize して再試行
-            full.canonicalize().ok().and_then(|c| {
-                c.strip_prefix(kb_path)
-                    .ok()
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-            })
-        }
-    }
+    indexer::index_rel_path(kb_path, full).or_else(|| {
+        // canonicalize ズレで失敗することがある — 再度 canonicalize して再試行
+        full.canonicalize()
+            .ok()
+            .and_then(|c| indexer::index_rel_path(kb_path, &c))
+    })
 }
 
 /// Index what a newly appeared directory brought in with it.
@@ -872,6 +870,20 @@ mod tests {
         let full = full.canonicalize().unwrap();
         assert_eq!(to_rel(&kb, &full), Some("notes/a.md".to_string()));
         let _ = std::fs::remove_dir_all(&kb);
+    }
+
+    /// The watcher writes the same `documents.path` the full index walk does,
+    /// so it has to spell a literal `\` the same way: left alone on Unix. A
+    /// folded key here would also send the reindex to `kb/secret/pay.md`, a
+    /// path that does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn test_to_rel_keeps_a_literal_backslash_on_unix() {
+        let kb = Path::new("/kb");
+        assert_eq!(
+            to_rel(kb, Path::new("/kb/secret\\pay.md")),
+            Some("secret\\pay.md".to_string())
+        );
     }
 
     /// `should_process` は WatcherState のうち `kb_path` / `registry` /

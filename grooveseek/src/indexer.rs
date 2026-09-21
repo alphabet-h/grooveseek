@@ -220,6 +220,88 @@ fn size_cap_kind(is_binary_ext: bool) -> &'static str {
     if is_binary_ext { "binary" } else { "text" }
 }
 
+/// The separator fold, and the only place it is written.
+///
+/// `\` becomes `/` **only where `\` separates components**. On Unix it is an
+/// ordinary filename character: a file named `secret\pay.md` sits in the KB
+/// root, and folding it would store the spelling of a different path --
+/// `secret/pay.md` -- that `get_document` cannot open, while the real name
+/// stays reachable and matches no rule a gateway wrote against the index
+/// (codex P2 round 4 on PR #310).
+fn fold_separators(spelled: &str) -> String {
+    if cfg!(windows) {
+        spelled.replace('\\', "/")
+    } else {
+        spelled.to_string()
+    }
+}
+
+/// The spelling the index holds for `full`: relative to `kb_path`, components
+/// joined with `/`. `None` when `full` is not under `kb_path`.
+///
+/// Everything that writes `documents.path`, decides exclusion, or compares a
+/// request against the index asks this question, and they have to agree --
+/// `get_document` opens a document only under the exact string the index
+/// stores ([`index_rel_path_exact`]). So the answer has one implementation
+/// (AGENTS.md, "One question gets one implementation"), in three shapes that
+/// differ only in what they do when there is no clean answer:
+///
+/// - this one spells a name that is not UTF-8 lossily (U+FFFD), which is what
+///   the index has always stored for such a file;
+/// - [`index_rel_path_exact`] returns `None` for it instead;
+/// - [`index_rel_path_or_whole`] falls back to the whole path when `full` is
+///   outside `kb_path`.
+pub fn index_rel_path(kb_path: &Path, full: &Path) -> Option<String> {
+    full.strip_prefix(kb_path)
+        .ok()
+        .map(|rel| fold_separators(&rel.to_string_lossy()))
+}
+
+/// [`index_rel_path`], but `None` for a name that is not UTF-8 as well.
+///
+/// For a caller that compares the result against a string it was handed, where
+/// a lossy spelling would be compared as if it were the real one.
+pub fn index_rel_path_exact(kb_path: &Path, full: &Path) -> Option<String> {
+    full.strip_prefix(kb_path)
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .map(fold_separators)
+}
+
+/// [`index_rel_path`], or the whole of `full` spelled the same way when it is
+/// not under `kb_path`.
+///
+/// The fallback is what the index walk, `groove validate` and
+/// [`crate::exclusion::rel_key`] each did on their own before they shared
+/// this. Their inputs come from a walk rooted inside `kb_path`, so it is not
+/// expected to be taken.
+pub fn index_rel_path_or_whole(kb_path: &Path, full: &Path) -> String {
+    index_rel_path(kb_path, full).unwrap_or_else(|| fold_separators(&full.to_string_lossy()))
+}
+
+/// The `documents.path` a full index run would store for every file it would
+/// index under `kb_path`, without embedding anything.
+///
+/// Test-only, and deliberately built from the walk and the scan rather than
+/// from [`index_rel_path`]: a test that asked the helper directly would keep
+/// passing after the scan stopped calling it.
+#[cfg(test)]
+pub(crate) fn scanned_rel_paths(kb_path: &Path, registry: &Registry) -> Vec<String> {
+    let rules = crate::exclusion::ExclusionRules::load(kb_path, Vec::new());
+    let files = collect_source_files(kb_path, registry, &rules).expect("walking the test KB");
+    scan_disk_entries(
+        &files,
+        kb_path,
+        registry,
+        crate::parser::MAX_RAW_BINARY_BYTES,
+        crate::parser::MAX_RAW_TEXT_BYTES,
+    )
+    .entries
+    .into_iter()
+    .map(|e| e.rel)
+    .collect()
+}
+
 /// disk 側の全 source file を走査し、raw バイト読み + バイト hash を計算する。
 ///
 /// - **エラー隔離**: `read` 失敗や size 超過は per-file skip し、rel path を `skipped`
@@ -240,11 +322,7 @@ fn scan_disk_entries(
     let mut oversize = Vec::new();
 
     for p in source_files {
-        let rel = p
-            .strip_prefix(kb_path)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = index_rel_path_or_whole(kb_path, p);
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
         let is_binary = binary_exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
 
@@ -4455,6 +4533,116 @@ mod tests {
         assert_ne!(
             RenameOutcome::RenamedSizeCapped,
             RenameOutcome::OldPathMissing
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // index_rel_path: the one spelling the index holds for a document
+    // -----------------------------------------------------------------------
+
+    /// The known-answer case, on every platform: components joined with `/`.
+    #[test]
+    fn test_index_rel_path_is_kb_relative_and_slash_separated() {
+        let kb = Path::new("kb");
+        let full = kb.join("notes").join("a.md");
+        assert_eq!(index_rel_path(kb, &full), Some("notes/a.md".to_string()));
+        assert_eq!(
+            index_rel_path_exact(kb, &full),
+            Some("notes/a.md".to_string())
+        );
+        assert_eq!(index_rel_path_or_whole(kb, &full), "notes/a.md");
+    }
+
+    /// Outside the knowledge base there is no relative spelling. The two
+    /// `Option` forms say so; the third keeps what its three callers always
+    /// did, which is to fall back to the path as given.
+    #[test]
+    fn test_index_rel_path_outside_the_kb_has_no_relative_spelling() {
+        let kb = Path::new("kb");
+        let outside = Path::new("elsewhere").join("a.md");
+        assert_eq!(index_rel_path(kb, &outside), None);
+        assert_eq!(index_rel_path_exact(kb, &outside), None);
+        assert_eq!(index_rel_path_or_whole(kb, &outside), "elsewhere/a.md");
+    }
+
+    /// Where `\` separates components it is folded, however the path was
+    /// written.
+    #[cfg(windows)]
+    #[test]
+    fn test_index_rel_path_folds_the_windows_separator() {
+        let kb = Path::new(r"C:\kb");
+        let full = Path::new(r"C:\kb\a\b.md");
+        assert_eq!(index_rel_path(kb, full), Some("a/b.md".to_string()));
+        assert_eq!(index_rel_path_exact(kb, full), Some("a/b.md".to_string()));
+        assert_eq!(index_rel_path_or_whole(kb, full), "a/b.md");
+    }
+
+    /// On Unix `\` is an ordinary filename character. `secret\pay.md` is one
+    /// file in the KB root, and folding it would store the spelling of a
+    /// different path -- `secret/pay.md` -- which `get_document` cannot open
+    /// and a gateway rule written against the index would not match (codex P2
+    /// round 4 on PR #310).
+    #[cfg(unix)]
+    #[test]
+    fn test_index_rel_path_keeps_a_literal_backslash_on_unix() {
+        let kb = Path::new("/kb");
+        let full = Path::new("/kb/secret\\pay.md");
+        assert_eq!(index_rel_path(kb, full), Some("secret\\pay.md".to_string()));
+        assert_eq!(
+            index_rel_path_exact(kb, full),
+            Some("secret\\pay.md".to_string())
+        );
+        assert_eq!(index_rel_path_or_whole(kb, full), "secret\\pay.md");
+    }
+
+    /// A name that is not UTF-8 is where the two `Option` forms differ, and
+    /// each keeps what its callers did before they shared this code: the index
+    /// stores a lossy spelling, `get_document` refuses to compare against one.
+    #[cfg(unix)]
+    #[test]
+    fn test_index_rel_path_lossy_and_exact_differ_only_on_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let kb = Path::new("/kb");
+        let full = kb.join(std::ffi::OsStr::from_bytes(b"caf\xe9.md"));
+        assert_eq!(
+            index_rel_path(kb, &full),
+            Some("caf\u{fffd}.md".to_string())
+        );
+        assert_eq!(index_rel_path_exact(kb, &full), None);
+    }
+
+    /// The scan is what writes `documents.path`, so this is the stored
+    /// spelling -- read from the scan rather than from the helper, which
+    /// would pass even if the scan stopped calling it.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_disk_entries_stores_a_literal_backslash_name_unfolded() {
+        let tmp = mk_tmp("scanbackslash");
+        write_file(&tmp.0, "secret\\pay.md", "# pay");
+        write_file(&tmp.0, "secret/pay.md", "# a different document");
+        let mut rels = scanned_rel_paths(&tmp.0, &Registry::defaults());
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec!["secret/pay.md".to_string(), "secret\\pay.md".to_string()],
+            "two files, two spellings: folding `\\` would give both the same key"
+        );
+    }
+
+    /// What the next `groove index` does with a row an older version stored
+    /// folded (`secret/pay.md` for a file named `secret\pay.md`): the old
+    /// spelling is in the database and not on disk, the new one is on disk and
+    /// not in the database, and the bytes are the same -- so it is a rename,
+    /// not an orphan. Pure strings, so this runs on every platform.
+    #[test]
+    fn test_detect_renames_moves_a_folded_row_to_its_unfolded_spelling() {
+        let disk = vec![mk_entry("secret\\pay.md", "h1")];
+        let mut db = HashMap::new();
+        db.insert("secret/pay.md".to_string(), "h1".to_string());
+        let pairs = detect_renames(&disk, &db, &HashSet::new());
+        assert_eq!(
+            pairs,
+            vec![("secret/pay.md".to_string(), "secret\\pay.md".to_string())]
         );
     }
 

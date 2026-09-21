@@ -3469,6 +3469,70 @@ mod tests {
         );
     }
 
+    /// The same file, from the index's side: the spelling the index walk
+    /// stores for it is the spelling that opens it, and the folded spelling an
+    /// older version stored is not a second way in. The validator test above
+    /// only shows that the real name opens; nothing in it asks what the index
+    /// would have handed a client (codex P2 round 4 on #310).
+    #[cfg(unix)]
+    #[test]
+    fn test_the_spelling_the_index_stores_is_the_one_get_document_opens_on_unix() {
+        let kb = TempKb::new("gd-spell-index-roundtrip");
+        kb.write("secret\\pay.md", "# Pay\nbody\n");
+        let stored = crate::indexer::scanned_rel_paths(&kb.path, &md_only_registry());
+        assert_eq!(
+            stored,
+            vec!["secret\\pay.md".to_string()],
+            "the index must store the file under its own name"
+        );
+        let r = validate_get_document_path(
+            &kb.path,
+            &stored[0],
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "the stored spelling must open the document: {r:?}"
+        );
+        // `secret/pay.md` names a path that does not exist, so it cannot get as
+        // far as the spelling check; what matters is that it does not open.
+        let folded = validate_get_document_path(
+            &kb.path,
+            "secret/pay.md",
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(folded, ValidatePathOutcome::NotFound(_)),
+            "the folded spelling is not a name this file has: {folded:?}"
+        );
+    }
+
+    /// On Windows the same round trip, for the fold that does happen there:
+    /// the walk hands back `docs\a.md`, the index stores `docs/a.md`, and that
+    /// is the string `get_document` opens.
+    #[test]
+    fn test_the_spelling_the_index_stores_is_the_one_get_document_opens() {
+        let kb = TempKb::new("gd-spell-index-roundtrip-nested");
+        kb.write("docs/deep/a.md", "# A\nbody\n");
+        let stored = crate::indexer::scanned_rel_paths(&kb.path, &md_only_registry());
+        assert_eq!(stored, vec!["docs/deep/a.md".to_string()]);
+        let r = validate_get_document_path(
+            &kb.path,
+            &stored[0],
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        );
+        assert!(
+            matches!(r, ValidatePathOutcome::Found(_)),
+            "the stored spelling must open the document: {r:?}"
+        );
+    }
+
     /// APFS is case-insensitive by default; the macOS CI leg is what runs this.
     #[cfg(target_os = "macos")]
     #[test]

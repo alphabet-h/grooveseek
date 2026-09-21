@@ -1831,11 +1831,7 @@ fn run_validate(
                 continue;
             }
         };
-        let rel = path
-            .strip_prefix(kb_path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = grooveseek::indexer::index_rel_path_or_whole(kb_path, &path);
         use grooveseek::parser::Parser as ParserTrait;
         let parsed = md_parser.parse(&raw, &rel, &[]);
         let violations = grooveseek::schema::validate_document(&parsed, &schema_obj);

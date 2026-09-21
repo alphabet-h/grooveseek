@@ -453,21 +453,14 @@ pub(crate) fn validate_get_document_path(
     // next template on `NotFound`, and a template spelled `./bp/x.md` is a
     // config quirk, not an attack. The message never carries the canonical
     // spelling -- the caller may be guessing at a directory it was never shown.
-    let spelled_canonically = canonical
-        .strip_prefix(kb_path)
-        .ok()
-        .and_then(|rel| rel.to_str())
-        .map(|rel| {
-            // Only where `\` separates components. On Unix it is an ordinary
-            // filename character, never an alias for anything, and folding it
-            // would make a file named `a\b.md` unreachable under its own name.
-            if cfg!(windows) {
-                rel.replace('\\', "/") == rel_path
-            } else {
-                rel == rel_path
-            }
-        })
-        .unwrap_or(false);
+    //
+    // "The way the index writes it" is literal: the indexer's own function,
+    // so the two cannot come to disagree about where `\` is a separator (on
+    // Unix it is an ordinary filename character, and a file named `a\b.md`
+    // stays reachable under its own name). The `_exact` form, because a name
+    // that is not UTF-8 has no string a request could equal.
+    let spelled_canonically = crate::indexer::index_rel_path_exact(kb_path, &canonical)
+        .is_some_and(|indexed| indexed == rel_path);
     if !spelled_canonically {
         return ValidatePathOutcome::NotFound(ErrorResponse {
             error: concat!(

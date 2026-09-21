@@ -289,11 +289,15 @@ fn compile(kb_path: &Path, source: &Path, bytes: &[u8]) -> (Option<Gitignore>, u
 /// error, it is matched against its own trailing components, so
 /// `D:/somewhere/else/drafts` comes back ignored under a `drafts/` pattern.
 /// Everything that decides exclusion goes through this function first.
+///
+/// The key *is* the document's spelling in the index -- the watcher already
+/// hands one string to both -- so the spelling itself comes from
+/// [`crate::indexer::index_rel_path_or_whole`] rather than being written again
+/// here. That includes where `\` is a separator and where it is not: on Unix a
+/// file named `secret\pay.md` is one component in the KB root, which is how a
+/// gitignore-style pattern would see it too.
 pub fn rel_key(kb_path: &Path, path: &Path) -> String {
-    path.strip_prefix(kb_path)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    crate::indexer::index_rel_path_or_whole(kb_path, path)
 }
 
 #[cfg(test)]
@@ -707,6 +711,25 @@ mod tests {
     fn rel_key_is_forward_slashed_and_relative() {
         let kb = Path::new("/kb");
         assert_eq!(rel_key(kb, &kb.join("notes").join("a.md")), "notes/a.md");
+    }
+
+    /// The key is the document's spelling in the index, so on Unix a file
+    /// named `secret\pay.md` is one component in the KB root: a `secret/`
+    /// pattern is about a directory this file is not in, and a pattern naming
+    /// the file itself is what excludes it.
+    #[cfg(unix)]
+    #[test]
+    fn rel_key_keeps_a_literal_backslash_on_unix() {
+        let kb = Path::new("/kb");
+        let key = rel_key(kb, Path::new("/kb/secret\\pay.md"));
+        assert_eq!(key, "secret\\pay.md");
+
+        let by_directory = rules("secret/\n", &[]);
+        assert!(!by_directory.is_excluded(&key, false));
+        assert!(by_directory.is_excluded("secret/pay.md", false));
+
+        let by_name = rules("secret*\n", &[]);
+        assert!(by_name.is_excluded(&key, false));
     }
 
     // -----------------------------------------------------------------------
