@@ -25,8 +25,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   written against the paths the index shows. A real `secret/pay.md` beside it
   was given the same key. The index, the live watcher, `.grooveignore`
   matching, `groove validate` and the `get_document` check now take the
-  spelling from one function, which folds `\` only on Windows. **Windows is
-  unchanged.**
+  spelling from one function, which folds `\` only on Windows. The `kb://doc/`
+  URI of such a document now opens with `resources/read` as well: the URI
+  parser refused any `\`, and refuses it only on Windows now. A `..` segment is
+  still refused whether it sits between `/` or `\`, on every platform, and a
+  path whose URI would not read back is not given a `uri` on its `search` hit.
+  **Windows is unchanged.**
 
 ### Changed
 

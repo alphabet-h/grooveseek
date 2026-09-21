@@ -4438,6 +4438,24 @@ mod tests {
         assert!(!rules.allows("no_extension"));
     }
 
+    /// A link is offered exactly when `resources/read` would parse it: the
+    /// rules ask the predicate the URI parser runs, so a path whose URI does
+    /// not read back gets none. Which paths those are depends on whether `\`
+    /// separates components here.
+    #[test]
+    fn a_path_whose_uri_would_not_parse_is_not_offered() {
+        let registry = md_and_pdf_registry();
+        let rules = ServableRules::new(&registry, Vec::new());
+        for path in ["notes/a.md", "secret\\pay.md", "a\\..\\b.md"] {
+            let reads_back = crate::resources::parse(&crate::resources::doc_uri(path))
+                == Some(crate::resources::ResourceUri::Doc(path.to_string()));
+            assert_eq!(rules.allows(path), reads_back, "{path:?}");
+        }
+        assert!(rules.allows("notes/a.md"));
+        assert!(!rules.allows("a\\..\\b.md"));
+        assert_eq!(rules.allows("secret\\pay.md"), !cfg!(windows));
+    }
+
     /// The three surfaces have to answer alike about the same document.
     ///
     /// `resources/list` builds its topic bodies from `servable_document_paths`,

@@ -220,6 +220,17 @@ fn size_cap_kind(is_binary_ext: bool) -> &'static str {
     if is_binary_ext { "binary" } else { "text" }
 }
 
+/// Whether `\` separates path components on this platform, or is an ordinary
+/// filename character.
+///
+/// Its own function because the fold below is not the only thing that has to
+/// know: [`crate::resources`] refuses a `\` in a `kb://doc/` URI exactly where
+/// this says it is a separator, and the two would otherwise each carry a
+/// `cfg!(windows)` that has to stay the same one.
+pub fn backslash_separates_components() -> bool {
+    cfg!(windows)
+}
+
 /// The separator fold, and the only place it is written.
 ///
 /// `\` becomes `/` **only where `\` separates components**. On Unix it is an
@@ -229,7 +240,7 @@ fn size_cap_kind(is_binary_ext: bool) -> &'static str {
 /// stays reachable and matches no rule a gateway wrote against the index
 /// (codex P2 round 4 on PR #310).
 fn fold_separators(spelled: &str) -> String {
-    if cfg!(windows) {
+    if backslash_separates_components() {
         spelled.replace('\\', "/")
     } else {
         spelled.to_string()
