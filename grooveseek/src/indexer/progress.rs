@@ -53,6 +53,11 @@ pub enum ProgressEvent<'a> {
     /// [`ProgressReporter::start_indexing`], **including when `total` is 0** —
     /// the other modes skip their lazy init there, but a consumer still has to
     /// be told there is nothing to index.
+    ///
+    /// Once really means once: [`ProgressReporter::start_indexing`] is `pub`,
+    /// and a second call on the same reporter is ignored outright — no further
+    /// [`ProgressEvent::Started`], and the `total` every later event carries
+    /// stays the one this event announced.
     Started { total: usize },
     /// A file was parsed and embedded. `done` counts the files reported so
     /// far, indexed and unchanged together, and `total` is the number
@@ -92,9 +97,10 @@ pub enum ProgressEvent<'a> {
     /// [`ProgressReporter::finish`]: that method consumes the reporter, so
     /// `Drop` runs right behind it and emitting from both would deliver two.
     /// A reporter dropped without [`ProgressReporter::finish`] emits no
-    /// `Finished`, and how the consumer hears that the run ended depends on
-    /// why: an early `?` return from [`crate::indexer::rebuild_index`] reports
-    /// it through the `Err` that call returns, while a panic — including one
+    /// [`ProgressEvent::Finished`], and how the consumer hears that the run
+    /// ended depends on why: an early `?` return from
+    /// [`crate::indexer::rebuild_index`] reports it through the `Err` that
+    /// call returns, while a panic — including one
     /// raised by the callback itself — unwinds straight out of the call, so
     /// there is no `Err` either. See [`ProgressReporter::with_callback`].
     Finished,
@@ -143,10 +149,17 @@ enum ProgressInner {
     /// `total` stays 0 until [`ProgressReporter::start_indexing`] supplies it;
     /// `count` carries `done` for the same reason [`ProgressInner::NonTty`]'s
     /// does — `report_*` take `&self`.
+    ///
+    /// `started` makes that first call the only one that counts, the way
+    /// [`ProgressInner::AutoPending`] is spent once it resolves. A plain
+    /// `bool` rather than an `AtomicBool`, because
+    /// [`ProgressReporter::start_indexing`] is the one method here that takes
+    /// `&mut self`.
     Callback {
         f: ProgressCallback,
         total: usize,
         count: AtomicU64,
+        started: bool,
     },
 }
 
@@ -246,6 +259,7 @@ impl ProgressReporter {
                 f,
                 total: 0,
                 count: AtomicU64::new(0),
+                started: false,
             },
         }
     }
@@ -260,10 +274,26 @@ impl ProgressReporter {
         // and no reason to honour the `total == 0` early return below: a
         // consumer drawing its own progress has to be told that the knowledge
         // base is empty, and `Started { total: 0 }` is how it hears it.
+        //
+        // The first call is the only one that counts. This method is `pub`, so
+        // a second call is reachable from outside; letting it through would
+        // emit a second `Started` against a doc that promises one, and -- worse
+        // -- rewrite `total` while leaving `count` where it was, so a later
+        // `done` could walk past the `total` it is reported against. `Auto`
+        // already spends itself this way (it leaves `AutoPending` on the first
+        // call and `matches!` fails afterwards); this is the same guard, made
+        // explicit because the Callback arm has no state machine to lean on.
         if let ProgressInner::Callback {
-            f, total: known, ..
+            f,
+            total: known,
+            started,
+            ..
         } = &mut self.inner
         {
+            if *started {
+                return;
+            }
+            *started = true;
             *known = total;
             f(ProgressEvent::Started { total });
             return;
@@ -321,7 +351,9 @@ impl ProgressReporter {
                 }
                 let _ = (rel, chunks);
             }
-            ProgressInner::Callback { f, total, count } => {
+            ProgressInner::Callback {
+                f, total, count, ..
+            } => {
                 let done = tick_done(count);
                 f(ProgressEvent::Indexed {
                     rel,
@@ -355,7 +387,9 @@ impl ProgressReporter {
                 }
                 let _ = rel;
             }
-            ProgressInner::Callback { f, total, count } => {
+            ProgressInner::Callback {
+                f, total, count, ..
+            } => {
                 let done = tick_done(count);
                 f(ProgressEvent::Unchanged {
                     rel,
@@ -402,9 +436,9 @@ impl ProgressReporter {
     /// Tear down (clear bar, emit [`ProgressEvent::Finished`], etc.). Owned
     /// consume so the caller can rely on "the reporter is done at this point".
     ///
-    /// This is the **only** place `Finished` is emitted. `self` is consumed
-    /// here, so `Drop` runs the instant this returns; a `Finished` from both
-    /// would reach the consumer twice.
+    /// This is the **only** place [`ProgressEvent::Finished`] is emitted.
+    /// `self` is consumed here, so `Drop` runs the instant this returns; a
+    /// [`ProgressEvent::Finished`] from both would reach the consumer twice.
     pub fn finish(self) {
         match &self.inner {
             ProgressInner::Tty(bar) => bar.finish_and_clear(),
@@ -749,6 +783,35 @@ mod tests {
         assert_eq!(
             recorded(&log),
             vec!["started:1", "indexed:worker.md:7:1/1", "finished"]
+        );
+    }
+
+    #[test]
+    fn test_callback_start_indexing_twice_emits_started_once() {
+        // `start_indexing` is `pub`, so a second call is reachable from an
+        // embedding application. Letting it through would emit a second
+        // `Started` against a doc that promises one, and would reset `total`
+        // while leaving `count` alone -- after which `done` walks past the
+        // `total` it is reported against. The second call is ignored instead.
+        let (log, f) = recorder();
+        let mut r = ProgressReporter::with_callback(f);
+        r.start_indexing(3);
+        r.start_indexing(99);
+        r.report_indexed("a.md", 2);
+        r.finish();
+
+        let got = recorded(&log);
+        assert_eq!(
+            got.iter()
+                .filter(|line| line.starts_with("started:"))
+                .count(),
+            1,
+            "the second start_indexing must emit nothing"
+        );
+        assert_eq!(
+            got,
+            vec!["started:3", "indexed:a.md:2:1/3", "finished"],
+            "the first total wins, and done is counted against it"
         );
     }
 
