@@ -91,10 +91,12 @@ pub enum ProgressEvent<'a> {
     /// The run reached its end. Emitted **only** from
     /// [`ProgressReporter::finish`]: that method consumes the reporter, so
     /// `Drop` runs right behind it and emitting from both would deliver two.
-    /// A reporter dropped without [`ProgressReporter::finish`] — an early `?`
-    /// return or a panic inside [`crate::indexer::rebuild_index`] — emits no
-    /// `Finished`, and the `Err` that call returns is what reports the end
-    /// instead.
+    /// A reporter dropped without [`ProgressReporter::finish`] emits no
+    /// `Finished`, and how the consumer hears that the run ended depends on
+    /// why: an early `?` return from [`crate::indexer::rebuild_index`] reports
+    /// it through the `Err` that call returns, while a panic — including one
+    /// raised by the callback itself — unwinds straight out of the call, so
+    /// there is no `Err` either. See [`ProgressReporter::with_callback`].
     Finished,
 }
 
@@ -180,11 +182,25 @@ impl ProgressReporter {
     ///
     /// What the callback replaces is the **reporter's** output, and only
     /// that. [`crate::indexer::rebuild_index`] writes its own diagnostics with
-    /// `eprintln!` whatever reporter it was handed — the scan-time
-    /// `Skipping ...` warnings, the `Found N source files` line, the backfill
-    /// line before the first [`ProgressEvent::Started`] and the summary lines
-    /// after the last event — so an embedding application whose stderr must
-    /// stay quiet has to capture or redirect it.
+    /// `eprintln!` whatever reporter it was handed, and they *interleave* with
+    /// the events rather than bracketing them: the backfill and
+    /// `Found N source files` lines come before [`ProgressEvent::Started`],
+    /// the `Skipping ...` warnings after it while the scan runs, and the
+    /// summary lines after the per-file loop but still ahead of any
+    /// [`ProgressEvent::Deleted`] and of [`ProgressEvent::Finished`]. So an
+    /// embedding application whose stderr must stay quiet has to capture or
+    /// redirect it, and one that interleaves the two streams cannot assume a
+    /// diagnostic it sees belongs to the event it saw last.
+    ///
+    /// # Panics
+    ///
+    /// Never on its own, but `f` must not panic. A panic inside the callback
+    /// unwinds out through whichever `report_*` or
+    /// [`ProgressReporter::finish`] called it and straight out of
+    /// [`crate::indexer::rebuild_index`], like any other panic: the caller
+    /// gets **neither** a [`ProgressEvent::Finished`] **nor** an `Err`, and
+    /// under `panic = "abort"` the process ends there. Catch inside the
+    /// closure if the consumer's own work can fail.
     ///
     /// The counter starts at zero and `total` stays zero until
     /// [`ProgressReporter::start_indexing`] supplies it, which is the same
@@ -412,9 +428,11 @@ impl Drop for ProgressReporter {
         // `finish(self)` consumes the reporter, so this runs immediately after
         // it -- a `Finished` emitted here would be the second one, and a
         // closure is not idempotent the way clearing a bar is. The cost is
-        // that a reporter dropped without `finish` emits no `Finished` at all;
-        // the consumer learns the run ended from the `Err` that
-        // `crate::indexer::rebuild_index` returns instead.
+        // that a reporter dropped without `finish` emits no `Finished` at all.
+        // On an early `?` return the consumer learns the run ended from the
+        // `Err` `crate::indexer::rebuild_index` returns; on an unwind -- a
+        // panic anywhere in that call, the callback included -- there is no
+        // `Err` either, and the panic is what reports the end.
         if let ProgressInner::Tty(bar) = &self.inner {
             bar.finish_and_clear();
         }
@@ -693,9 +711,12 @@ mod tests {
     #[test]
     fn test_callback_drop_without_finish_emits_no_finished() {
         // An interrupted run -- a `?` early return or a panic inside
-        // `rebuild_index` -- drops the reporter without calling `finish`. The
-        // consumer learns the run ended from the `Err` it gets back, not from
-        // an event, which is the price of never emitting `Finished` twice.
+        // `rebuild_index` -- drops the reporter without calling `finish`, and
+        // no `Finished` is emitted, which is the price of never emitting it
+        // twice. What tells the consumer the run ended is not an event: on the
+        // `?` return it is the `Err` it gets back, and on a panic there is no
+        // `Err` either -- the unwind carries out of the call. The panic half
+        // is pinned by `test_callback_panic_unwinds_out_of_report_and_emits_no_finished`.
         let (log, f) = recorder();
         {
             let mut r = ProgressReporter::with_callback(f);
@@ -728,6 +749,52 @@ mod tests {
         assert_eq!(
             recorded(&log),
             vec!["started:1", "indexed:worker.md:7:1/1", "finished"]
+        );
+    }
+
+    #[test]
+    fn test_callback_panic_unwinds_out_of_report_and_emits_no_finished() {
+        // A panicking callback is the consumer's bug, and the reporter does
+        // not contain it: the unwind carries out through `report_*` and, in a
+        // real run, out of `crate::indexer::rebuild_index`, so the caller gets
+        // neither `Finished` nor an `Err`. The rustdoc on `with_callback`
+        // promises exactly that, and this is what holds it to it.
+        //
+        // The default panic hook is left alone, and the output stays clean
+        // anyway: libtest captures what a test writes and prints it only when
+        // that test fails, so the message is swallowed on the green path and
+        // still there to read on a red one. Installing a silent hook would
+        // instead be process-wide while this binary runs its tests in
+        // parallel -- the race `crate::parser::panic_guard` documents and
+        // works around with a thread-local flag -- and it would blind the
+        // other tests to boot.
+        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let f: ProgressCallback = Box::new(move |ev| match ev {
+            ProgressEvent::Indexed { .. } => panic!("consumer bug"),
+            ProgressEvent::Finished => sink
+                .lock()
+                .expect("recorder mutex")
+                .push("finished".to_string()),
+            _ => sink
+                .lock()
+                .expect("recorder mutex")
+                .push("other".to_string()),
+        });
+
+        let mut r = ProgressReporter::with_callback(f);
+        r.start_indexing(1);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            r.report_indexed("a.md", 1);
+        }));
+        assert!(
+            unwound.is_err(),
+            "a panic in the callback must unwind out of report_indexed, not be swallowed"
+        );
+        assert!(
+            !recorded(&log).contains(&"finished".to_string()),
+            "finish() was never reached, so no Finished can have been emitted"
         );
     }
 }
