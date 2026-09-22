@@ -18,9 +18,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 - **An application that embeds the library can receive indexing progress as
   values instead of stderr lines.**
-  `indexer::progress::ProgressReporter::with_callback` takes a
-  `Fn(ProgressEvent<'_>) + Send` and hands it `Started { total }` once,
-  then `Indexed { rel, chunks, done, total }` or
+  `indexer::progress::ProgressReporter::with_callback` takes a boxed
+  `Fn(ProgressEvent<'_>) + Send` (`ProgressCallback`) and hands it
+  `Started { total }` once, then `Indexed { rel, chunks, done, total }` or
   `Unchanged { rel, done, total }` per file — `done` counts both, so it tracks
   the same anchor the non-TTY `Progress: N/M` lines report — plus `Renamed` and
   `Deleted` as they happen and `Finished` from `finish`. Nothing reaches stderr
@@ -33,8 +33,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   call returns reports the end there, and that is the price of never delivering
   two. Two counts that already differed keep differing: `done` stops short of
   `total` when the scan declined a file (over the size cap, unreadable, a hard
-  link), and `Renamed` / `Deleted` do not advance it. The Rust API remains
-  outside the compatibility promise ([docs/stability.md](docs/stability.md)).
+  link), and `Renamed` / `Deleted` do not advance it. `ProgressReporter` is now
+  `Send` but not `Sync` in every mode, including one built by `new`: a reporter
+  can be moved to a worker thread but not shared behind an `Arc` without a
+  `Mutex`. The Rust API remains outside the compatibility promise
+  ([docs/stability.md](docs/stability.md)).
 
 ### Fixed
 

@@ -172,6 +172,26 @@ impl ProgressReporter {
     /// [`ProgressReporter::start_indexing`] supplies it, which is the same
     /// ordering the bar-building modes already rely on.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grooveseek::indexer::progress::{ProgressEvent, ProgressReporter};
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let log = Arc::new(Mutex::new(Vec::new()));
+    /// let sink = Arc::clone(&log);
+    /// let mut reporter = ProgressReporter::with_callback(Box::new(move |ev| {
+    ///     if let ProgressEvent::Indexed { rel, done, total, .. } = ev {
+    ///         sink.lock().unwrap().push(format!("{rel} {done}/{total}"));
+    ///     }
+    /// }));
+    /// reporter.start_indexing(2);
+    /// reporter.report_indexed("a.md", 1);
+    /// reporter.finish();
+    ///
+    /// assert_eq!(*log.lock().unwrap(), ["a.md 1/2"]);
+    /// ```
+    ///
     /// # Threading
     ///
     /// [`ProgressReporter`] is `Send` but **not** `Sync`, and this
