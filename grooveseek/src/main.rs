@@ -798,7 +798,7 @@ fn main() -> anyhow::Result<()> {
             systemd_socket,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model);
             let reranker = reranker.or(cfg.reranker).unwrap_or_default();
             // rerank_by_default の既定は 1 か所 (reranker 有効時のみ意味を持つ)。
             let rerank_by_default = rerank_by_default
@@ -895,7 +895,7 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 grooveseek::server::run_server(
                     &kb_path,
-                    model,
+                    embedding,
                     reranker,
                     rerank_by_default,
                     exclude_headings,
@@ -922,7 +922,7 @@ fn main() -> anyhow::Result<()> {
             progress,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model);
 
             // `[parsers].enabled` の検証を **何より先** に置く (AU-06 codex P2)。
             //
@@ -971,11 +971,11 @@ fn main() -> anyhow::Result<()> {
             };
             // モデル DL (BGE-M3 なら ~2.3 GB) の前に meta 整合性を先に確認する。
             // そうしないと不整合時にユーザが不要な DL を待たされる。
-            let dim = model.dimension() as u32;
+            let dim = embedding.dimension() as u32;
             if !force {
-                db.verify_embedding_meta(model.model_id(), dim)?;
+                db.verify_embedding_meta(embedding.model_id(), dim)?;
             }
-            let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
+            let mut embedder = grooveseek::embedder::Embedder::with_settings(embedding)?;
             // (feature-58, codex P1 round 1 / P2 round 3 on PR #291) `schema` was already read
             // above, before any reset -- a malformed schema must fail before `--force` empties
             // the index, not after. `rebuild_index` no longer reads the file itself (round 3):
@@ -1155,7 +1155,7 @@ fn main() -> anyhow::Result<()> {
             grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model);
             // `--reranker` given here is a choice about this query; a model that
             // only came from groove.toml is subject to `rerank_by_default`.
             let reranker_explicit = reranker.is_some();
@@ -1171,10 +1171,10 @@ fn main() -> anyhow::Result<()> {
             // only after the model was loaded and the query embedded. Same ordering
             // argument as `--field` bounds above and the schema read in `Commands::Index`.
             db.refuse_field_filters_while_pending(Some(&fields), Some(&fields_not))?;
-            let dim = model.dimension() as u32;
-            db.verify_embedding_meta(model.model_id(), dim)?;
+            let dim = embedding.dimension() as u32;
+            db.verify_embedding_meta(embedding.model_id(), dim)?;
 
-            let mut embedder = grooveseek::embedder::Embedder::with_model(model)?;
+            let mut embedder = grooveseek::embedder::Embedder::with_settings(embedding)?;
             let query_embedding = embedder.embed_single(parsed.positive_text())?;
 
             let server_default = cfg
@@ -1307,7 +1307,7 @@ fn main() -> anyhow::Result<()> {
             format,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model);
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             // Status と同じく、DB がまだ作られていない状態を親切なエラーで弾く。
@@ -1319,7 +1319,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
-            db.verify_embedding_meta(model.model_id(), model.dimension() as u32)?;
+            db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
 
             let opts = grooveseek::graph::GraphOptions {
                 depth: depth.min(grooveseek::graph::MAX_DEPTH),
@@ -1407,7 +1407,7 @@ fn main() -> anyhow::Result<()> {
             } = args;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model_choice = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model);
             // Deliberately not `cli_should_rerank`: `groove search` answers a
             // question, `groove eval` measures a pipeline. The run fingerprint
             // records `reranker` and not `rerank_by_default`, so letting that key
@@ -1432,7 +1432,7 @@ fn main() -> anyhow::Result<()> {
             let opts = grooveseek::eval::RunOpts {
                 kb_path: kb_path.clone(),
                 golden_path,
-                model_choice,
+                embedding,
                 reranker_choice,
                 k_values,
                 limit: limit_val,
@@ -1560,7 +1560,7 @@ fn main() -> anyhow::Result<()> {
             } = args;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let model_choice = model.or(cfg.model).unwrap_or_default();
+            let embedding = cfg.resolve_embedding(model);
 
             let eval_cfg = cfg.eval.clone().unwrap_or_default();
             let golden_path = golden
@@ -1595,7 +1595,7 @@ fn main() -> anyhow::Result<()> {
             let opts = grooveseek::tune::TuneOpts {
                 kb_path,
                 golden_path,
-                model_choice,
+                embedding,
                 k_values,
                 limit: limit_val,
             };

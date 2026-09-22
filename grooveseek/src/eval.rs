@@ -1170,7 +1170,7 @@ pub fn is_regression(now: &EvalRun, prev: &EvalRun, threshold: f64) -> bool {
 pub struct RunOpts {
     pub kb_path: PathBuf,
     pub golden_path: PathBuf,
-    pub model_choice: crate::embedder::ModelChoice,
+    pub embedding: crate::embedder::EmbeddingSettings,
     pub reranker_choice: crate::embedder::RerankerChoice,
     pub k_values: Vec<usize>,
     pub limit: u32,
@@ -1475,11 +1475,9 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
         );
     }
     let db = crate::db::Database::open(&db_path.to_string_lossy())?;
-    db.verify_embedding_meta(
-        opts.model_choice.model_id(),
-        opts.model_choice.dimension() as u32,
-    )?;
-    let mut embedder = crate::embedder::Embedder::with_model(opts.model_choice)?;
+    let embedding_model_id = opts.embedding.model_id().to_string();
+    db.verify_embedding_meta(&embedding_model_id, opts.embedding.dimension() as u32)?;
+    let mut embedder = crate::embedder::Embedder::with_settings(opts.embedding.clone())?;
     let mut reranker = if opts.reranker_choice.is_enabled() {
         crate::embedder::Reranker::try_new(opts.reranker_choice)?
     } else {
@@ -1650,7 +1648,7 @@ pub fn run(opts: &RunOpts) -> Result<EvalRun> {
     Ok(EvalRun {
         timestamp: Utc::now(),
         fingerprint: ConfigFingerprint {
-            model: opts.model_choice.model_id().to_string(),
+            model: embedding_model_id,
             reranker: if opts.reranker_choice.is_enabled() {
                 Some(opts.reranker_choice.model_id().to_string())
             } else {

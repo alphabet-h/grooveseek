@@ -10,7 +10,7 @@ use rmcp::{ServerHandler, prompt_handler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Database, SearchHit, TopicInfo, TopicNode};
-use crate::embedder::{Embedder, ModelChoice, Reranker, RerankerChoice};
+use crate::embedder::{Embedder, EmbeddingSettings, Reranker, RerankerChoice};
 use crate::graph::{self, GraphOptions, SeedStrategy};
 use crate::parser::{ParserExt, Registry};
 use crate::poison::{recover, recover_db, recover_db_try, recover_try};
@@ -1398,7 +1398,7 @@ impl KbServerShared {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     kb_path: &std::path::Path,
-    model: ModelChoice,
+    embedding: EmbeddingSettings,
     reranker_choice: RerankerChoice,
     rerank_by_default: bool,
     exclude_headings: Option<Vec<String>>,
@@ -1421,7 +1421,7 @@ pub async fn run_server(
     let db = Database::open(&db_path.to_string_lossy())?;
 
     // モデル DL の前に meta 整合性を確認。不整合ならここで止めて DL を回避。
-    db.verify_embedding_meta(model.model_id(), model.dimension() as u32)?;
+    db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)?;
 
     // codex P2 (PR #73 F2): fresh DB (chunk 0 件、`index` 未実行のまま `serve`
     // 起動) かつ `[contextual] enabled = true` の場合、watcher 経由の
@@ -1454,7 +1454,7 @@ pub async fn run_server(
         }
     }
 
-    let embedder = Embedder::with_model(model)?;
+    let embedder = Embedder::with_settings(embedding)?;
     let reranker = Reranker::try_new(reranker_choice)?;
 
     let kb_path = kb_path

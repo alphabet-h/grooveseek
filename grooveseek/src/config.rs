@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use crate::embedder::{ModelChoice, RerankerChoice};
+use crate::embedder::{EmbeddingSettings, ModelChoice, RerankerChoice};
 use crate::parser::ParsersConfig;
 use crate::quality::QualityFilterConfig;
 use crate::transport::TransportConfig;
@@ -1187,9 +1187,17 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve the embedding settings once, with the same precedence as the
+    /// historical direct [`ModelChoice`] resolution: CLI, configuration, then
+    /// the built-in FastEmbed default.
+    pub fn resolve_embedding(&self, cli_model: Option<ModelChoice>) -> EmbeddingSettings {
+        EmbeddingSettings::fastembed(cli_model.or(self.model).unwrap_or_default())
+    }
+
     /// `fastembed_cache_dir` が設定されていて、かつ環境変数
     /// `FASTEMBED_CACHE_DIR` が未設定なら、プロセス環境に適用する。
-    /// `Embedder::with_model` が `resolve_cache_dir()` で拾う前に呼ぶこと。
+    /// [`crate::embedder::Embedder::with_settings`] がキャッシュディレクトリを
+    /// 解決する前に呼ぶこと。
     pub fn apply_cache_dir_env(&self) {
         // 空文字は「設定済み」に数えない (BU-07)。数えてしまうと config の値が
         // 捨てられ、`resolve_cache_dir` は空文字を**相対パス**として扱って
@@ -1870,6 +1878,25 @@ mod tests {
             cfg.exclude_headings.as_deref(),
             Some(&["次の深堀り候補".to_string(), "参考リンク".to_string()][..])
         );
+    }
+
+    #[test]
+    fn resolve_embedding_preserves_model_precedence_and_identity() {
+        let default = Config::default().resolve_embedding(None);
+        assert_eq!(default.model_id(), "bge-small-en-v1.5");
+        assert_eq!(default.dimension(), 384);
+
+        let configured = Config {
+            model: Some(ModelChoice::BgeM3),
+            ..Config::default()
+        };
+        let from_config = configured.resolve_embedding(None);
+        assert_eq!(from_config.model_id(), "bge-m3");
+        assert_eq!(from_config.dimension(), 1024);
+
+        let from_cli = configured.resolve_embedding(Some(ModelChoice::BgeSmallEnV15));
+        assert_eq!(from_cli.model_id(), "bge-small-en-v1.5");
+        assert_eq!(from_cli.dimension(), 384);
     }
 
     #[test]
