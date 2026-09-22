@@ -99,6 +99,11 @@ pub enum ProgressEvent<'a> {
 /// `Sync` — `dyn Fn + Send` is not — and it does not need to be:
 /// [`ProgressReporter`] is handed to [`crate::indexer::rebuild_index`] by
 /// value, and every `report_*` call is made from that one thread.
+///
+/// That missing `Sync` does not stay inside this alias. A
+/// [`ProgressReporter`] can hold one of these, and auto traits are decided
+/// per type rather than per value, so the struct as a whole is `Send` and not
+/// `Sync` — see [`ProgressReporter::with_callback`].
 pub type ProgressCallback = Box<dyn Fn(ProgressEvent<'_>) + Send>;
 
 /// Output reporter, owned by `rebuild_index`.
@@ -166,6 +171,21 @@ impl ProgressReporter {
     /// The counter starts at zero and `total` stays zero until
     /// [`ProgressReporter::start_indexing`] supplies it, which is the same
     /// ordering the bar-building modes already rely on.
+    ///
+    /// # Threading
+    ///
+    /// [`ProgressReporter`] is `Send` but **not** `Sync`, and this
+    /// constructor is why: the reporter can hold a [`ProgressCallback`],
+    /// which is not `Sync`, and auto traits are decided per type rather than
+    /// per value. So the bound is missing from *every* reporter, including
+    /// one built by [`ProgressReporter::new`] that holds no closure at all.
+    ///
+    /// That is enough for how the reporter is used — moved whole onto the
+    /// thread that runs the indexing, then handed to
+    /// [`crate::indexer::rebuild_index`] by value, which reports from that
+    /// one thread. What it rules out is sharing: a reporter cannot be placed
+    /// behind an `Arc` and reported to from several threads at once. Put a
+    /// `Mutex` around it if that is ever wanted.
     pub fn with_callback(f: ProgressCallback) -> Self {
         Self {
             inner: ProgressInner::Callback {
@@ -179,8 +199,8 @@ impl ProgressReporter {
     /// Initialise bar / counter once `total` is known (= after source-file
     /// discovery). `total == 0` keeps the reporter no-op for the rest of
     /// the run (= 罠 H1: empty KB の早期 no-op、bar 不構築)。
-    /// [`ProgressInner::Callback`] is the one exception — see the comment in
-    /// the body.
+    /// The callback mode created by [`ProgressReporter::with_callback`] is the
+    /// one exception — see the comment in the body.
     pub fn start_indexing(&mut self, total: usize) {
         // Callback is decided at construction, so it has no lazy init to run
         // and no reason to honour the `total == 0` early return below: a
