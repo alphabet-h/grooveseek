@@ -84,9 +84,10 @@ pub enum ProgressEvent<'a> {
     /// The run reached its end. Emitted **only** from
     /// [`ProgressReporter::finish`]: that method consumes the reporter, so
     /// `Drop` runs right behind it and emitting from both would deliver two.
-    /// A reporter dropped without `finish` — an early `?` return or a panic
-    /// inside [`crate::indexer::rebuild_index`] — emits no `Finished`, and the
-    /// `Err` that call returns is what reports the end instead.
+    /// A reporter dropped without [`ProgressReporter::finish`] — an early `?`
+    /// return or a panic inside [`crate::indexer::rebuild_index`] — emits no
+    /// `Finished`, and the `Err` that call returns is what reports the end
+    /// instead.
     Finished,
 }
 
@@ -369,7 +370,7 @@ impl ProgressReporter {
     /// consume so the caller can rely on "the reporter is done at this point".
     ///
     /// This is the **only** place `Finished` is emitted. `self` is consumed
-    /// here, so [`Drop`] runs the instant this returns; a `Finished` from both
+    /// here, so `Drop` runs the instant this returns; a `Finished` from both
     /// would reach the consumer twice.
     pub fn finish(self) {
         match &self.inner {
@@ -416,7 +417,7 @@ fn should_emit(count: u64, total: u64, step: u64) -> bool {
 
 /// Advance the callback counter and return `done` the way the events spell it.
 ///
-/// The counter is an [`AtomicU64`] to match [`ProgressInner::NonTty`]'s, while
+/// The counter is an `AtomicU64` to match [`ProgressInner::NonTty`]'s, while
 /// the event field is `usize` because `total` arrives as one. Saturating rather
 /// than `as`, so a 32-bit target cannot wrap a large count into a small number
 /// and hand a consumer a progress bar that walks backwards.

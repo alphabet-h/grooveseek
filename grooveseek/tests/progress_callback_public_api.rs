@@ -1,11 +1,11 @@
 //! The callback path is reachable from *outside* the crate.
 //!
-//! `src/indexer/progress.rs`'s own `mod tests` compiles inside the crate,
-//! where every item is visible whether or not it says `pub`. The application
-//! this path exists for (grooveseek-desktop) links the library and names these
-//! three items by path, so the visibility is itself the thing under test: each
-//! `tests/*.rs` is a separate crate, and this file stops compiling if any of
-//! them is narrowed to `pub(crate)` or moved.
+//! [`grooveseek::indexer::progress`]'s own `mod tests` compiles inside the
+//! crate, where every item is visible whether or not it says `pub`. The
+//! application this path exists for (grooveseek-desktop) links the library
+//! and names these three items by path, so the visibility is itself the thing
+//! under test: each `tests/*.rs` is a separate crate, and this file stops
+//! compiling if any of them is narrowed to `pub(crate)` or moved.
 //!
 //! No embedding model is loaded and no file is written, so this runs in the
 //! plain `cargo test` tier rather than behind `#[ignore]`.
