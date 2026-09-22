@@ -2563,7 +2563,7 @@ fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
 /// reads this process makes microseconds apart.
 ///
 /// (codex P2 round 9 on PR #291) The CLI's `Commands::Index` arm also calls this ahead of
-/// [`Embedder::with_model`], not only ahead of the resets: a malformed schema is refused before a
+/// [`Embedder::with_settings`], not only ahead of the resets: a malformed schema is refused before a
 /// run that is already doomed pays for a model download or load (BGE-M3: ~2.3 GB) it was never
 /// going to use, the same "cheap checks first" reasoning `main.rs` already applies to
 /// `[parsers].enabled` validation.

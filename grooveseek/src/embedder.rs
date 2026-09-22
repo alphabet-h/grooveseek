@@ -95,6 +95,7 @@ struct EmbeddingIdentity {
 }
 
 impl EmbeddingSettings {
+    /// Build settings for the FastEmbed provider and its stable index identity.
     pub fn fastembed(choice: ModelChoice) -> Self {
         Self {
             provider: ProviderSettings::FastEmbed(choice),
@@ -183,6 +184,9 @@ impl Embedder {
     }
 
     /// Initialize the provider selected by resolved configuration.
+    ///
+    /// FastEmbed providers obtain their cache directory through
+    /// [`resolve_cache_dir`].
     pub fn with_settings(settings: EmbeddingSettings) -> Result<Self> {
         let EmbeddingSettings { provider, identity } = settings;
         let provider: Box<dyn EmbeddingProvider> = match provider {
@@ -421,9 +425,9 @@ impl Reranker {
 mod tests {
     use super::*;
 
-    struct RecordingProvider;
+    struct StubProvider;
 
-    impl EmbeddingProvider for RecordingProvider {
+    impl EmbeddingProvider for StubProvider {
         fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|_| vec![1.0, 2.0]).collect())
         }
@@ -475,7 +479,7 @@ mod tests {
     fn embedder_routes_documents_and_queries_through_the_provider_boundary() {
         let settings = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15);
         let mut embedder =
-            Embedder::from_provider(Box::new(RecordingProvider), settings.identity.clone());
+            Embedder::from_provider(Box::new(StubProvider), settings.identity.clone());
 
         assert_eq!(
             embedder.embed_texts(&["one", "two"]).unwrap(),

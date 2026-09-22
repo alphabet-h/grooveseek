@@ -933,7 +933,7 @@ fn main() -> anyhow::Result<()> {
             //
             // - `Database::open` より後 → DB / WAL を作り、schema 移行まで走る
             //   (`ensure_fts_context_column` は FTS を DROP + CREATE + repopulate する)
-            // - `Embedder::with_model` より後 → 失敗すると分かっている実行のために
+            // - `Embedder::with_settings` より後 → 失敗すると分かっている実行のために
             //   モデルを DL する (BGE-M3 なら ~2.3 GB)
             // - `reset_for_model` より後 → **index を空にしてからエラー終了**
             //
@@ -941,7 +941,7 @@ fn main() -> anyhow::Result<()> {
             // まま upgrade した人がこの経路に入る。
             let registry = cfg.build_parser_registry(&kb_path)?;
             // (feature-58, codex P2 round 9 on PR #291) Read next to `[parsers].enabled`
-            // above, not after `Embedder::with_model` below: this needs only `kb_path`, the
+            // above, not after `Embedder::with_settings` below: this needs only `kb_path`, the
             // same as the registry check, and a malformed schema is refused before a run that
             // is already doomed pays for a model download it was never going to use (see
             // `load_declared_schema`'s doc for the full "cheap checks first" ordering this
@@ -981,7 +981,7 @@ fn main() -> anyhow::Result<()> {
             // the index, not after. `rebuild_index` no longer reads the file itself (round 3):
             // that snapshot is what it gets, so the file is read exactly once per run rather
             // than once above and once more inside it. (codex P2 round 9) Moved above this
-            // `Embedder::with_model` call too -- see `load_declared_schema`'s doc.
+            // `Embedder::with_settings` call too -- see `load_declared_schema`'s doc.
             if force {
                 db.reset_for_model(embedder.model_id(), dim)?;
             }
@@ -1141,7 +1141,7 @@ fn main() -> anyhow::Result<()> {
             // repeated `--field status=x` past the per-list limit is refused by its raw count,
             // not the count `normalize_field_filters`'s dedup would leave behind.
             // (codex P2 round 10) Up here with the query check, **before `Database::open` and
-            // `Embedder::with_model` below**, for the same reason `Commands::Index` reads the
+            // `Embedder::with_settings` below**, for the same reason `Commands::Index` reads the
             // schema before loading the model: these bounds need nothing but the arguments,
             // and a request they refuse must not first open the DB and pay for a model load
             // (BGE-M3 uncached: ~2.3 GB) it was never going to use.
@@ -1167,7 +1167,7 @@ fn main() -> anyhow::Result<()> {
             let db = grooveseek::db::Database::open(&db_path.to_string_lossy())?;
             // (codex P2 round 11 on PR #291) A field filter the index cannot answer yet
             // (its declared set is pending) is refused here, on the opened database and
-            // before `Embedder::with_model` below -- the search legs refuse it too, but
+            // before `Embedder::with_settings` below -- the search legs refuse it too, but
             // only after the model was loaded and the query embedded. Same ordering
             // argument as `--field` bounds above and the schema read in `Commands::Index`.
             db.refuse_field_filters_while_pending(Some(&fields), Some(&fields_not))?;

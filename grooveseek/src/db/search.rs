@@ -551,7 +551,7 @@ impl Database {
     /// `pub`, and taking the two maps rather than a whole [`SearchFilters`], because the
     /// front ends ask it **early** as well (codex P2 round 11 on PR #291): the command
     /// line right after opening the database and before
-    /// [`crate::embedder::Embedder::with_model`] (a
+    /// [`crate::embedder::Embedder::with_settings`] (a
     /// request this refuses must not first pay for a model download), the MCP tool
     /// before embedding the query. The legs keep asking too -- they are the check that
     /// cannot be bypassed; the early calls only move the answer forward.
