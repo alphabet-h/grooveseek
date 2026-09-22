@@ -100,7 +100,7 @@ impl Condition {
 pub struct TuneOpts {
     pub kb_path: PathBuf,
     pub golden_path: PathBuf,
-    pub model_choice: ModelChoice,
+    pub embedding: EmbeddingSettings,
     /// 報告する k のリスト。`primary_k` (=5) は常に含まれる。
     pub k_values: Vec<usize>,
     /// 1 query あたりの取得件数。production の `run_search_pipeline`

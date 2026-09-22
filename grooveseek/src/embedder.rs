@@ -72,13 +72,97 @@ impl ModelChoice {
     }
 }
 
-/// Thin wrapper around fastembed for generating text embeddings.
+/// Resolved settings for the embedding provider used by one command.
 ///
-/// モデルは [`ModelChoice`] で切替可能。ONNX モデルは初回実行時に
-/// [`resolve_cache_dir`] のキャッシュディレクトリへダウンロードされる。
-pub struct Embedder {
+/// FastEmbed is currently the only provider. Keeping its construction behind
+/// these settings lets another implementation be added without making the
+/// current provider the special case.
+#[derive(Clone, Debug)]
+pub struct EmbeddingSettings {
+    provider: ProviderSettings,
+    identity: EmbeddingIdentity,
+}
+
+#[derive(Clone, Debug)]
+enum ProviderSettings {
+    FastEmbed(ModelChoice),
+}
+
+#[derive(Clone, Debug)]
+struct EmbeddingIdentity {
+    model_id: String,
+    dimension: usize,
+}
+
+impl EmbeddingSettings {
+    /// Build settings for the FastEmbed provider and its stable index identity.
+    pub fn fastembed(choice: ModelChoice) -> Self {
+        Self {
+            provider: ProviderSettings::FastEmbed(choice),
+            identity: EmbeddingIdentity {
+                model_id: choice.model_id().to_string(),
+                dimension: choice.dimension(),
+            },
+        }
+    }
+
+    /// Stable identity recorded in `index_meta` and evaluation history.
+    pub fn model_id(&self) -> &str {
+        &self.identity.model_id
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.identity.dimension
+    }
+}
+
+/// The internal provider boundary. Query and document embedding stay separate
+/// so a later provider can preserve asymmetric retrieval without teaching the
+/// indexer or search pipeline about that provider.
+trait EmbeddingProvider: Send {
+    fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>>;
+}
+
+struct FastEmbedProvider {
     model: TextEmbedding,
     choice: ModelChoice,
+}
+
+impl FastEmbedProvider {
+    fn new(choice: ModelChoice) -> Result<Self> {
+        eprintln!(
+            "Loading embedding model: {} ({} dim, ~{} MB on first run)...",
+            choice.model_id(),
+            choice.dimension(),
+            choice.approx_download_mb()
+        );
+        let model = TextEmbedding::try_new(
+            InitOptions::new(choice.fastembed_model())
+                .with_cache_dir(resolve_cache_dir()?)
+                .with_show_download_progress(true),
+        )?;
+        Ok(Self { model, choice })
+    }
+}
+
+impl EmbeddingProvider for FastEmbedProvider {
+    fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.model.embed(texts, Some(self.choice.batch_size()))
+    }
+
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        let mut embeddings = self.embed_documents(&[text])?;
+        embeddings
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("embedding returned empty result"))
+    }
+}
+
+/// Provider-neutral entry point for generating text embeddings.
+pub struct Embedder {
+    provider: Box<dyn EmbeddingProvider>,
+    identity: EmbeddingIdentity,
 }
 
 impl Embedder {
@@ -96,43 +180,44 @@ impl Embedder {
 
     /// 明示的にモデルを指定して初期化する。
     pub fn with_model(choice: ModelChoice) -> Result<Self> {
-        eprintln!(
-            "Loading embedding model: {} ({} dim, ~{} MB on first run)...",
-            choice.model_id(),
-            choice.dimension(),
-            choice.approx_download_mb()
-        );
-        let model = TextEmbedding::try_new(
-            InitOptions::new(choice.fastembed_model())
-                .with_cache_dir(resolve_cache_dir()?)
-                .with_show_download_progress(true),
-        )?;
-        Ok(Self { model, choice })
+        Self::with_settings(EmbeddingSettings::fastembed(choice))
     }
 
-    /// Embed multiple texts in a batch. バッチサイズは `ModelChoice::batch_size()`
-    /// から決定 (大きなモデルで OOM を起こさないよう明示的に絞る)。
+    /// Initialize the provider selected by resolved configuration.
+    ///
+    /// FastEmbed providers obtain their cache directory through
+    /// [`resolve_cache_dir`].
+    pub fn with_settings(settings: EmbeddingSettings) -> Result<Self> {
+        let EmbeddingSettings { provider, identity } = settings;
+        let provider: Box<dyn EmbeddingProvider> = match provider {
+            ProviderSettings::FastEmbed(choice) => Box::new(FastEmbedProvider::new(choice)?),
+        };
+        Ok(Self::from_provider(provider, identity))
+    }
+
+    fn from_provider(provider: Box<dyn EmbeddingProvider>, identity: EmbeddingIdentity) -> Self {
+        Self { provider, identity }
+    }
+
+    /// Embed document texts. Provider-specific batching stays behind the
+    /// provider boundary.
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let embeddings = self.model.embed(texts, Some(self.choice.batch_size()))?;
-        Ok(embeddings)
+        self.provider.embed_documents(texts)
     }
 
     /// Embed a single text.
     pub fn embed_single(&mut self, text: &str) -> Result<Vec<f32>> {
-        let mut results = self.embed_texts(&[text])?;
-        results
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("embedding returned empty result"))
+        self.provider.embed_query(text)
     }
 
     /// 選択中のモデルの埋め込み次元数。
     pub fn dimension(&self) -> usize {
-        self.choice.dimension()
+        self.identity.dimension
     }
 
     /// 選択中のモデルの識別子 (index_meta に記録される)。
-    pub fn model_id(&self) -> &'static str {
-        self.choice.model_id()
+    pub fn model_id(&self) -> &str {
+        &self.identity.model_id
     }
 }
 
@@ -340,6 +425,18 @@ impl Reranker {
 mod tests {
     use super::*;
 
+    struct StubProvider;
+
+    impl EmbeddingProvider for StubProvider {
+        fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 2.0]).collect())
+        }
+
+        fn embed_query(&mut self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![3.0, 4.0])
+        }
+    }
+
     /// An absolute path for the current platform. `/models` is NOT absolute on
     /// Windows — it is drive-relative, so it still depends on process state —
     /// which is exactly why the check uses `is_absolute()` rather than
@@ -350,6 +447,47 @@ mod tests {
         } else {
             PathBuf::from("/").join(tail)
         }
+    }
+
+    #[test]
+    fn fastembed_settings_keep_the_existing_index_identity() {
+        for choice in [ModelChoice::BgeSmallEnV15, ModelChoice::BgeM3] {
+            let settings = EmbeddingSettings::fastembed(choice);
+            assert_eq!(settings.model_id(), choice.model_id());
+            assert_eq!(settings.dimension(), choice.dimension());
+        }
+    }
+
+    #[test]
+    fn resolved_fastembed_settings_accept_an_existing_index() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+
+        let same = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15);
+        db.verify_embedding_meta(same.model_id(), same.dimension() as u32)
+            .expect("the provider refactor must keep an existing FastEmbed index compatible");
+
+        let different = EmbeddingSettings::fastembed(ModelChoice::BgeM3);
+        assert!(
+            db.verify_embedding_meta(different.model_id(), different.dimension() as u32)
+                .is_err(),
+            "a different model and dimension must still require a rebuild"
+        );
+    }
+
+    #[test]
+    fn embedder_routes_documents_and_queries_through_the_provider_boundary() {
+        let settings = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15);
+        let mut embedder =
+            Embedder::from_provider(Box::new(StubProvider), settings.identity.clone());
+
+        assert_eq!(
+            embedder.embed_texts(&["one", "two"]).unwrap(),
+            vec![vec![1.0, 2.0], vec![1.0, 2.0]]
+        );
+        assert_eq!(embedder.embed_single("query").unwrap(), vec![3.0, 4.0]);
+        assert_eq!(embedder.model_id(), "bge-small-en-v1.5");
+        assert_eq!(embedder.dimension(), 384);
     }
 
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes

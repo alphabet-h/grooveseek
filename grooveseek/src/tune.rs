@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::db::{Database, FusionParams, SearchFilters};
-use crate::embedder::{Embedder, ModelChoice};
+use crate::embedder::{Embedder, EmbeddingSettings};
 use crate::eval::{ExpectedHit, GoldenSet, HitRecord};
 
 // AU-31: `tune.rs` was 3073 lines. Three groups came out — the parameter
@@ -801,11 +801,9 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
         );
     }
     let db = Database::open(&db_path.to_string_lossy())?;
-    db.verify_embedding_meta(
-        opts.model_choice.model_id(),
-        opts.model_choice.dimension() as u32,
-    )?;
-    let mut embedder = Embedder::with_model(opts.model_choice)?;
+    let embedding_model_id = opts.embedding.model_id().to_string();
+    db.verify_embedding_meta(&embedding_model_id, opts.embedding.dimension() as u32)?;
+    let mut embedder = Embedder::with_settings(opts.embedding.clone())?;
 
     // 主指標 nDCG@PRIMARY_K は必ず計算対象に含める。`run` は pub なので
     // CLI 以外の呼び出しでもこの不変条件をここで保証する (CLI 側は limit の
@@ -934,7 +932,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     Ok(TuneOutcome::Report(Box::new(TuneReport {
         kb_path: opts.kb_path.clone(),
         golden_path: opts.golden_path.clone(),
-        model: opts.model_choice.model_id().to_string(),
+        model: embedding_model_id,
         limit,
         pool_size: pre.pool_size,
         k_values,

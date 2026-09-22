@@ -1020,7 +1020,7 @@ fn a_field_list_past_the_bound_is_refused_before_the_database_is_opened() {
 /// **before** the embedding model is loaded, not only inside the search legs. The model
 /// load itself is not observable from outside, but its immediate predecessor is: the
 /// embedding-meta check, which rejects a `--model` that does not match the index and runs
-/// right before [`grooveseek::embedder::Embedder::with_model`]. Asking for `bge-m3` on this
+/// right before [`grooveseek::embedder::Embedder::with_settings`]. Asking for `bge-m3` on this
 /// BGE-small index while
 /// the declared set is pending therefore tells the order -- the pending refusal must win,
 /// and the model mismatch (and the download it precedes) must never be reached.

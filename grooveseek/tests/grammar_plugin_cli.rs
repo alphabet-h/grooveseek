@@ -9,7 +9,7 @@
 //! Every failing path is decided while the parser registry is built, which the `Commands::Index`
 //! arm in `src/main.rs` (a binary, so not linkable from here) does before
 //! [`grooveseek::db::Database::open`] and before
-//! [`grooveseek::embedder::Embedder::with_model`] — deliberately, so that a
+//! [`grooveseek::embedder::Embedder::with_settings`] — deliberately, so that a
 //! run known to fail cannot first create a database or download a model. So the refusals cost
 //! a process spawn and nothing else. Only the accepting path indexes for real, and that one is
 //! `#[ignore]` like the rest of the model-loading tests.
