@@ -14,6 +14,28 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Added
+
+- **An application that embeds the library can receive indexing progress as
+  values instead of stderr lines.**
+  `indexer::progress::ProgressReporter::with_callback` takes a
+  `Fn(ProgressEvent<'_>) + Send` and hands it `Started { total }` once,
+  then `Indexed { rel, chunks, done, total }` or
+  `Unchanged { rel, done, total }` per file — `done` counts both, so it tracks
+  the same anchor the non-TTY `Progress: N/M` lines report — plus `Renamed` and
+  `Deleted` as they happen and `Finished` from `finish`. Nothing reaches stderr
+  on this path, and nothing about `groove index`, its `--quiet` / `--progress`
+  flags or the MCP `rebuild_index` tool changes: no command line and no tool
+  selects it. `Started` is emitted even for an empty knowledge base, where the
+  other modes return early and build nothing, because "there is nothing to
+  index" is an answer a consumer has to be given. A reporter dropped without
+  `finish` — an interrupted or failed run — emits no `Finished`; the error the
+  call returns reports the end there, and that is the price of never delivering
+  two. Two counts that already differed keep differing: `done` stops short of
+  `total` when the scan declined a file (over the size cap, unreadable, a hard
+  link), and `Renamed` / `Deleted` do not advance it. The Rust API remains
+  outside the compatibility promise ([docs/stability.md](docs/stability.md)).
+
 ### Fixed
 
 - **On Linux and macOS, a file whose name contains a backslash is indexed
