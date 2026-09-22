@@ -16,10 +16,17 @@
 //! (v1.13.0+) One more destination, which `groove` itself never selects: a
 //! reporter built by
 //! [`crate::indexer::progress::ProgressReporter::with_callback`] hands every
-//! step to a closure as a [`crate::indexer::progress::ProgressEvent`] and
-//! writes nothing to stderr, so an application that embeds this crate draws
-//! its own progress from values instead of scraping lines. The command line
-//! has no flag for it.
+//! step to a closure as a [`crate::indexer::progress::ProgressEvent`] rather
+//! than writing it, so an application that embeds this crate draws its own
+//! progress from values instead of scraping lines. The command line has no
+//! flag for it.
+//!
+//! What that silences is the **reporter**, and only the reporter.
+//! [`crate::indexer::rebuild_index`] writes its own diagnostics with
+//! `eprintln!` whatever reporter it was handed — the scan-time `Skipping ...`
+//! warnings, the `Found N source files` line, the backfill line and the
+//! summary lines — so an embedding application whose stderr must stay quiet
+//! has to capture or redirect it.
 
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,7 +135,9 @@ enum ProgressInner {
         count: AtomicU64,
     },
     /// Built by [`ProgressReporter::with_callback`]: every `report_*` becomes
-    /// a [`ProgressEvent`] handed to `f`, and nothing is written to stderr.
+    /// a [`ProgressEvent`] handed to `f` rather than a line on stderr. Only
+    /// the reporter's own output is replaced — see that constructor for what
+    /// [`crate::indexer::rebuild_index`] keeps writing there.
     /// `total` stays 0 until [`ProgressReporter::start_indexing`] supplies it;
     /// `count` carries `done` for the same reason [`ProgressInner::NonTty`]'s
     /// does — `report_*` take `&self`.
@@ -161,13 +170,21 @@ impl ProgressReporter {
         }
     }
 
-    /// Build a reporter that hands every step to `f` instead of writing to
-    /// stderr.
+    /// Build a reporter that hands every step to `f` instead of writing the
+    /// reporter's per-file and progress output to stderr.
     ///
     /// `groove` itself never takes this path — no CLI flag and no MCP tool
     /// selects it. It exists for an application that embeds this crate and
     /// draws its own progress; see [`ProgressEvent`] for what arrives and
     /// when.
+    ///
+    /// What the callback replaces is the **reporter's** output, and only
+    /// that. [`crate::indexer::rebuild_index`] writes its own diagnostics with
+    /// `eprintln!` whatever reporter it was handed — the scan-time
+    /// `Skipping ...` warnings, the `Found N source files` line, the backfill
+    /// line before the first [`ProgressEvent::Started`] and the summary lines
+    /// after the last event — so an embedding application whose stderr must
+    /// stay quiet has to capture or redirect it.
     ///
     /// The counter starts at zero and `total` stays zero until
     /// [`ProgressReporter::start_indexing`] supplies it, which is the same

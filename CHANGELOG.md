@@ -23,8 +23,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `Started { total }` once, then `Indexed { rel, chunks, done, total }` or
   `Unchanged { rel, done, total }` per file — `done` counts both, so it tracks
   the same anchor the non-TTY `Progress: N/M` lines report — plus `Renamed` and
-  `Deleted` as they happen and `Finished` from `finish`. Nothing reaches stderr
-  on this path, and nothing about `groove index`, its `--quiet` / `--progress`
+  `Deleted` as they happen and `Finished` from `finish`. What that silences is
+  the *reporter*: `rebuild_index` writes its own diagnostics — the scan-time
+  `Skipping ...` warnings, the `Found N source files` line, the backfill line
+  and the summary lines — to stderr whatever reporter it was handed, so an
+  embedding application whose stderr must stay quiet has to capture or redirect
+  it. Nothing about `groove index`, its `--quiet` / `--progress`
   flags or the MCP `rebuild_index` tool changes: no command line and no tool
   selects it. `Started` is emitted even for an empty knowledge base, where the
   other modes return early and build nothing, because "there is nothing to
