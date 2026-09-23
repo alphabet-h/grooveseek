@@ -14,6 +14,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-09-23
+
 ### Added
 
 - **An application that embeds the library can receive indexing progress as
@@ -133,10 +135,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   [docs/stability.md](docs/stability.md). Changing the default provider is a
   major change for the same reason changing the default model is. (#316)
 - **`groove` now links reqwest 0.13's blocking client and the aws-lc-rs crypto
-  backend of rustls, even when no external provider is configured.** This is
-  estimated from `Cargo.lock`, not measured: before this release those crates
-  were reached only through the Windows-only tray binary, so on Linux and
-  macOS they are new to the release assets. (#316)
+  backend of rustls, even when no external provider is configured.** Before
+  this release those crates were reached only through the Windows-only tray
+  binary, so on Linux and macOS they are new to the release assets:
+  `cargo tree --workspace -e normal -i aws-lc-sys --target <triple>` prints
+  nothing for the Linux and macOS targets at v1.12.0, and only a path through
+  `groove-tray` for Windows. (#316)
 - **A `groove.toml` that carries `[embedding]` stops v1.12.0 and earlier from
   starting.** Unknown keys are rejected, so share such a config only with
   binaries from this release on. (#316)
@@ -5640,7 +5644,8 @@ First public release. An MCP server providing semantic hybrid search (sqlite-vec
 - `cargo fmt` / `cargo clippy --all-targets` clean
 - Personal dev artifacts moved to `.dev/` (excluded via `.git/info/exclude`)
 
-[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/alphabet-h/grooveseek/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/alphabet-h/grooveseek/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/alphabet-h/grooveseek/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/alphabet-h/grooveseek/compare/v1.10.0...v1.11.0
 [1.10.0]: https://github.com/alphabet-h/grooveseek/compare/v1.9.0...v1.10.0
