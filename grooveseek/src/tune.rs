@@ -787,6 +787,41 @@ pub enum TuneOutcome {
     Report(Box<TuneReport>),
 }
 
+/// Embed the golden queries [`usable_queries`] keeps, in its order, one vector
+/// per query.
+///
+/// They are embedded as queries, through [`Embedder::embed_queries`], because
+/// that is how `groove search`, the MCP search tool in [`crate::server`] and
+/// `groove eval` embed one. This used [`Embedder::embed_texts`], the document
+/// side: with an OpenAI-compatible endpoint that names a separate
+/// `query_model`, every condition was then measured with query vectors no
+/// search ever uses.
+///
+/// Split out of [`run`] so a test can hand it an embedder that needs no model
+/// or endpoint.
+pub(crate) fn embed_usable_queries(
+    embedder: &mut Embedder,
+    golden: &GoldenSet,
+) -> Result<Vec<Vec<f32>>> {
+    let usable = usable_queries(golden);
+    // What gets embedded is the query with its `-term` groups cut out, the
+    // same text the MCP tool and `groove search` embed. **Nothing is
+    // filtered or reordered here**: `preflight_from_embeddings` zips this
+    // list with `usable_queries_quiet` by position and bails on a length
+    // mismatch, so dropping a query would silently mis-pair every query
+    // after it with someone else's embedding. There is nothing to drop in
+    // any case — `GoldenSet::load` has already refused a golden holding a
+    // query that is nothing but exclusions.
+    let parsed: Vec<crate::db::ParsedQuery<'_>> = usable
+        .iter()
+        .map(|q| crate::db::parse_query(&q.query))
+        .collect();
+    let texts: Vec<&str> = parsed.iter().map(|p| p.positive_text()).collect();
+    embedder
+        .embed_queries(&texts)
+        .context("failed to embed golden queries")
+}
+
 /// golden を読み、pre-flight → grid 掃引 → 統計判定まで通す
 /// (`eval::run` と対になる orchestration 入口)。
 pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
@@ -817,25 +852,7 @@ pub fn run(opts: &TuneOpts) -> Result<TuneOutcome> {
     // query embedding をループ外で 1 回だけ (D-10-1)。現行 eval は query ごとに
     // `embed_single` を呼んでおりキャッシュも無いので、ここが tune の主な
     // 高速化ポイントになる。
-    let embeddings = {
-        let usable = usable_queries(&golden);
-        // What gets embedded is the query with its `-term` groups cut out, the
-        // same text the MCP tool and `groove search` embed. **Nothing is
-        // filtered or reordered here**: `preflight_from_embeddings` zips this
-        // list with `usable_queries_quiet` by position and bails on a length
-        // mismatch, so dropping a query would silently mis-pair every query
-        // after it with someone else's embedding. There is nothing to drop in
-        // any case — `GoldenSet::load` has already refused a golden holding a
-        // query that is nothing but exclusions.
-        let parsed: Vec<crate::db::ParsedQuery<'_>> = usable
-            .iter()
-            .map(|q| crate::db::parse_query(&q.query))
-            .collect();
-        let texts: Vec<&str> = parsed.iter().map(|p| p.positive_text()).collect();
-        embedder
-            .embed_texts(&texts)
-            .context("failed to embed golden queries")?
-    };
+    let embeddings = embed_usable_queries(&mut embedder, &golden)?;
 
     let mut meta: HashMap<i64, HitMeta> = HashMap::new();
     eprintln!("groove tune: pre-flight (measuring FTS candidates per query)...");

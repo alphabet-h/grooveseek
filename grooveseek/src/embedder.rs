@@ -19,12 +19,16 @@ use crate::db::SearchResult;
 /// BGE-M3 へ切り替えたい場合は CLI で明示オプトインする。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
 pub enum ModelChoice {
-    /// BAAI/bge-small-en-v1.5 (384 dim, 英語特化, ~130 MB)
+    // A variant's doc comment is also its line under `--model` in `--help`,
+    // so it is written in English, like the rest of the help.
+    /// BAAI/bge-small-en-v1.5 (384 dim, English-focused, ~130 MB first
+    /// download). The built-in default.
     #[default]
     #[value(name = "bge-small-en-v1.5")]
     #[serde(rename = "bge-small-en-v1.5")]
     BgeSmallEnV15,
-    /// BAAI/bge-m3 (1024 dim, 多言語, ~2.3 GB)
+    /// BAAI/bge-m3 (1024 dim, multilingual incl. Japanese, ~2.3 GB first
+    /// download). Recommended for Japanese-heavy knowledge bases.
     #[value(name = "bge-m3")]
     #[serde(rename = "bge-m3")]
     BgeM3,
@@ -237,6 +241,13 @@ impl OpenAiCompatibleConfig {
 trait EmbeddingProvider: Send {
     fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>>;
+
+    /// Embed several queries, in order. The default asks
+    /// [`EmbeddingProvider::embed_query`] once per text; a provider that can
+    /// send its query side as a batch overrides it.
+    fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        texts.iter().map(|text| self.embed_query(text)).collect()
+    }
 }
 
 struct FastEmbedProvider {
@@ -271,6 +282,12 @@ impl EmbeddingProvider for FastEmbedProvider {
         embeddings
             .pop()
             .ok_or_else(|| anyhow::anyhow!("embedding returned empty result"))
+    }
+
+    fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        // One model serves both sides here (see `embed_query` above), so a
+        // batch of queries is embedded exactly as a batch of documents.
+        self.embed_documents(texts)
     }
 }
 
@@ -424,6 +441,11 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
             .pop()
             .ok_or_else(|| anyhow::anyhow!("embedding returned empty result"))
     }
+
+    fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let model = self.config.query_model.clone();
+        self.embed(texts, &model)
+    }
 }
 
 fn escaped_body_snippet(body: &[u8]) -> String {
@@ -487,13 +509,32 @@ impl Embedder {
 
     /// Embed document texts. Provider-specific batching stays behind the
     /// provider boundary.
+    ///
+    /// This is the document side: an OpenAI-compatible endpoint answers it with
+    /// its `document_model`. Queries go through [`Embedder::embed_single`] or
+    /// [`Embedder::embed_queries`].
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         self.provider.embed_documents(texts)
     }
 
-    /// Embed a single text.
+    /// Embed one search query, on the query side of the provider (the
+    /// `query_model` of an OpenAI-compatible endpoint). Documents go through
+    /// [`Embedder::embed_texts`].
     pub fn embed_single(&mut self, text: &str) -> Result<Vec<f32>> {
         self.provider.embed_query(text)
+    }
+
+    /// Embed several search queries at once, in order, on the same query side
+    /// as [`Embedder::embed_single`]. Use this for queries and
+    /// [`Embedder::embed_texts`] for documents.
+    ///
+    /// The two sides are not interchangeable. FastEmbed embeds both with one
+    /// model, but an OpenAI-compatible endpoint may name a separate
+    /// `query_model` and `document_model`, and a query embedded as a document
+    /// is not the vector a search compares against the index. Nothing errors;
+    /// the results simply belong to a different query.
+    pub fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.provider.embed_queries(texts)
     }
 
     /// 選択中のモデルの埋め込み次元数。
@@ -566,20 +607,29 @@ fn cache_dir_from(env: Option<std::ffi::OsString>, os_cache: Option<PathBuf>) ->
 /// 明示的に選択する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
 pub enum RerankerChoice {
-    /// reranker 無効 (RRF 結果をそのまま返す)
+    // As with `ModelChoice`, each variant's doc comment is its line under
+    // `--reranker` in `--help`, so it is written in English. That matters most
+    // for `jina-v2-ml`: its license terms have to reach someone reading only
+    // the help of a release archive.
+    /// No reranker: the RRF hybrid ranking is returned as it is. The built-in
+    /// default.
     #[default]
     #[value(name = "none")]
     #[serde(rename = "none")]
     None,
-    /// BAAI/bge-reranker-v2-m3 (多言語 100+ 言語, ~2.3 GB)。日本語 KB 推奨
+    /// BAAI/bge-reranker-v2-m3 (multilingual, 100+ languages, ~2.3 GB first
+    /// download). Recommended for Japanese knowledge bases.
     #[value(name = "bge-v2-m3")]
     #[serde(rename = "bge-v2-m3")]
     BgeV2M3,
-    /// jinaai/jina-reranker-v2-base-multilingual (多言語, ~1.2 GB)。軽量多言語。CC-BY-NC-4.0 = 研究・評価用途のみ、商用利用不可
+    /// jinaai/jina-reranker-v2-base-multilingual (multilingual, ~1.2 GB first
+    /// download). A lighter multilingual alternative. Licensed CC-BY-NC-4.0:
+    /// research and evaluation only, no commercial use.
     #[value(name = "jina-v2-ml")]
     #[serde(rename = "jina-v2-ml")]
     JinaV2Multilingual,
-    /// BAAI/bge-reranker-base (英/中のみ, ~280 MB)。日本語用途には非推奨
+    /// BAAI/bge-reranker-base (English and Chinese only, ~280 MB first
+    /// download). Not recommended for Japanese.
     #[value(name = "bge-base")]
     #[serde(rename = "bge-base")]
     BgeBase,
@@ -898,6 +948,53 @@ mod tests {
         assert_eq!(embedder.dimension(), 384);
     }
 
+    /// `groove tune` has to embed its golden queries the way `groove search`
+    /// embeds a query: on the query side of the provider. It embedded them as
+    /// documents, which for an OpenAI-compatible endpoint configured with its
+    /// own `query_model` is a different model, so the sweep measured a vector
+    /// space no search runs in, and said nothing about it (AW-05).
+    ///
+    /// This sits with the embedder's tests rather than tune's because the stub
+    /// provider is here, and the stub is what makes the side visible: it
+    /// answers every query with one vector and every document with another.
+    #[test]
+    fn tune_embeds_golden_queries_on_the_query_side() {
+        let settings = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15);
+        let mut embedder =
+            Embedder::from_provider(Box::new(StubProvider), settings.identity.clone());
+        let query = |id: &str, text: &str, expected: &[&str]| crate::eval::GoldenQuery {
+            id: Some(id.to_string()),
+            query: text.to_string(),
+            expected: expected
+                .iter()
+                .map(|path| crate::eval::ExpectedHit {
+                    path: path.to_string(),
+                    heading: None,
+                })
+                .collect(),
+            tags: None,
+        };
+        let golden = crate::eval::GoldenSet {
+            defaults: None,
+            queries: vec![
+                query("q1", "vector search", &["a.md"]),
+                // No expected hit, so tune drops it before embedding anything.
+                query("q2", "unlabelled", &[]),
+                query("q3", "fusion -draft", &["b.md"]),
+            ],
+        };
+
+        let embeddings = crate::tune::embed_usable_queries(&mut embedder, &golden)
+            .expect("embed the golden queries");
+
+        assert_eq!(
+            embeddings,
+            vec![vec![3.0, 4.0], vec![3.0, 4.0]],
+            "tune must embed each usable golden query on the query side \
+             (the stub answers queries with [3, 4] and documents with [1, 2])"
+        );
+    }
+
     #[test]
     fn openai_compatible_can_be_constructed_inside_a_tokio_runtime() {
         let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
@@ -1038,6 +1135,32 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
         assert_eq!(body["model"], "query-model");
         assert_eq!(body["input"], serde_json::json!(["needle"]));
+        handle.join().expect("mock server thread");
+    }
+
+    /// Several queries go to the endpoint's `query_model` as one request, the
+    /// way several documents go to its `document_model` (AW-05: `groove tune`
+    /// embeds its whole golden set this way).
+    #[test]
+    fn openai_compatible_uses_query_model_for_query_batches() {
+        let response =
+            r#"{"data":[{"embedding":[3.0,4.0],"index":1},{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+
+        let vectors = embedder
+            .embed_queries(&["first", "second"])
+            .expect("embed query batch");
+        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let request = captured.recv().expect("captured request");
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["model"], "query-model");
+        assert_eq!(body["input"], serde_json::json!(["first", "second"]));
         handle.join().expect("mock server thread");
     }
 
