@@ -107,6 +107,8 @@ pub enum EmbeddingProviderKind {
     OpenaiCompatible,
 }
 
+const DEFAULT_EMBEDDING_TIMEOUT_SECONDS: u64 = 60;
+
 /// `[embedding]` configuration. The endpoint is only accepted from an
 /// explicitly selected, trusted configuration file.
 #[derive(Clone, Deserialize)]
@@ -125,7 +127,8 @@ pub struct EmbeddingConfig {
     pub dimension: Option<usize>,
     /// Optional bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence.
     pub api_key: Option<String>,
-    pub timeout_seconds: u64,
+    /// HTTP request timeout. Omitted values use 60 seconds.
+    pub timeout_seconds: Option<u64>,
 }
 
 impl std::fmt::Debug for EmbeddingConfig {
@@ -153,12 +156,17 @@ impl Default for EmbeddingConfig {
             document_model: None,
             dimension: None,
             api_key: None,
-            timeout_seconds: 60,
+            timeout_seconds: None,
         }
     }
 }
 
 impl EmbeddingConfig {
+    fn effective_timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+            .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS)
+    }
+
     fn validate_shape(&self) -> Result<()> {
         match self.provider {
             EmbeddingProviderKind::Fastembed => {
@@ -167,6 +175,7 @@ impl EmbeddingConfig {
                     || self.api_key.is_some()
                     || self.query_model.is_some()
                     || self.document_model.is_some()
+                    || self.timeout_seconds.is_some()
                 {
                     anyhow::bail!(
                         "[embedding] external provider fields require provider = \"openai-compatible\""
@@ -205,7 +214,7 @@ impl EmbeddingConfig {
                     "[embedding].dimension must be greater than zero for provider = \"openai-compatible\""
                 );
                 anyhow::ensure!(
-                    self.timeout_seconds > 0,
+                    self.effective_timeout_seconds() > 0,
                     "[embedding].timeout_seconds must be greater than zero"
                 );
             }
@@ -1407,7 +1416,7 @@ impl Config {
                     document_model,
                     embedding.dimension.expect("validated dimension"),
                     resolve_embedding_api_key(env_api_key, embedding.api_key.clone()),
-                    Duration::from_secs(embedding.timeout_seconds),
+                    Duration::from_secs(embedding.effective_timeout_seconds()),
                 )?;
                 Ok(EmbeddingSettings::openai_compatible(config))
             }
@@ -2130,7 +2139,7 @@ mod tests {
             document_model: Some("document-model".to_string()),
             dimension: Some(768),
             api_key: Some("config-secret".to_string()),
-            timeout_seconds: 30,
+            timeout_seconds: Some(30),
         }
     }
 
@@ -2214,7 +2223,7 @@ mod tests {
         );
 
         let mut embedding = external_embedding_config();
-        embedding.timeout_seconds = 0;
+        embedding.timeout_seconds = Some(0);
         assert!(
             embedding
                 .validate_shape()
@@ -2222,6 +2231,18 @@ mod tests {
                 .to_string()
                 .contains("timeout")
         );
+    }
+
+    #[test]
+    fn fastembed_embedding_rejects_http_only_timeout() {
+        let embedding = EmbeddingConfig {
+            timeout_seconds: Some(30),
+            ..EmbeddingConfig::default()
+        };
+        let err = embedding
+            .validate_shape()
+            .expect_err("FastEmbed must reject an HTTP-only timeout");
+        assert!(err.to_string().contains("external provider fields"));
     }
 
     #[test]
