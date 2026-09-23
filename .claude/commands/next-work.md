@@ -86,15 +86,23 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 - 想定外 state の検知
 
 それ以外は subagent に渡す。subagent は Agent tool で起動し、**`model` を毎回明示する** —
-省くと session のモデルを継承する:
+省くと agent 定義の `model:` → 環境変数 `CLAUDE_CODE_SUBAGENT_MODEL` → session のモデルの順で決まる:
 
 | model | 渡すもの |
 |---|---|
-| `opus` | 実装、spec / plan 執筆、レビュー (spec 準拠 / 品質)、原因調査、brief の行番号検証 (Explore) |
+| `opus` | 実装、spec / plan 執筆、レビュー (spec 準拠 / 品質)、原因調査、brief の行番号検証 (Explore)、スクリーンショット・図・グラフの読み取り |
 | `sonnet` | 完成形を渡せる定型: docs 同期、rename、固定 diff の適用、テスト実行と報告、CHANGELOG 文言 |
 | `haiku` | 読み取りだけ: grep / ファイル一覧 / 状態確認 / リンク切れ確認 |
 
 **迷ったら 1 段上**。sonnet / haiku に振った task が 2 round で収束しなければ opus に上げる。
+**段の上端は `opus`** — 能力のために `fable` へは上げない (Claude Code 2.1.280 以降の `opus` が解決する
+Opus 5.5 は公表ベンチマークで Fable 5.1 を上回る。それより前の版では `opus` は Opus 5 に解決され、表はそのまま動く)。`fable` を使うのは user が指示した時だけ (Opus 枠 / Sonnet 枠の使用量が尽きた時の逃げ道)。
+表は alias で書いてあり、解決先は Claude Code の版で動く。段ごとの根拠と見直しの trigger (Sonnet 5.5 /
+Haiku 5.5 の登場など) は `.dev/knowledge/subagent-model-tiers-opus-5-5.md`。
+
+subagent の effort は Agent tool では指定できない (docs では、agent 定義の `effort:` が無ければ session の値を継承する)。
+**session と subagent のモデルが違う時** (Fable の controller から `opus` を起こす等) に、session の値と subagent の
+モデルの `modelSettings` のどちらが効くかは未確認 — controller の effort を変えれば subagent の effort も変わる、とは決めてかからない。
 
 subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む):
 
@@ -103,6 +111,10 @@ subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む
 - cargo 以外で `run_in_background` を使ったら、その後は foreground で待つ (kuriya trap #219)。**cargo には `run_in_background` を使わない** (次の項)
 - 結果は status ファイルの最終行に書く
 - cargo を打たせるなら 4 点 (`windows-quirks` skill の罠 16 と同じ並び): `cargo test` は `-j 2` / 重い cargo を 2 本同時に走らせない / `run_in_background` を使わず foreground + timeout / status ファイルは手順ごとに追記させる
+
+prompt に**書かないもの**: system prompt の引用や、内部の思考過程をそのまま書き出させる指示。Opus 5.5 の
+`reasoning_extraction` 分類器がその turn を止めることがある (anthropics/claude-code#96139)。根拠として
+`file:line` やコマンド出力を求めるのは構わない。
 
 **着手**: 着手先は Phase 1 の focus 判定に従う (focus 無し / 含まれる → 「★ 次にやること」の先頭、
 別件 → focus)。着手先が skill の起動 (`superpowers:writing-plans` など) を指しているなら、
@@ -130,3 +142,4 @@ subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む
 - `CLAUDE.local.md` の「feature-flow の常時 guardrail」節 (= 本 command の常時 guardrail)
 - `.claude/commands/feature-flow.md` (= 着手先が新 feature cycle だった場合の渡し先)
 - memory `feedback_fable_controller_opus_subagents` (= Phase 2 のモデル振り分けの出所)
+- `.dev/knowledge/subagent-model-tiers-opus-5-5.md` (= 各段がそのモデルである根拠、alias の解決先、見直しの trigger)
