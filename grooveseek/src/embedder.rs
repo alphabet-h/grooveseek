@@ -911,6 +911,38 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_embeds_on_first_call_inside_a_tokio_runtime() {
+        // codex review round 2 on PR #316: constructing the provider inside
+        // `block_on` was not enough — the blocking `reqwest::Client` is built
+        // lazily on the *first* `embed` call. The file watcher's synchronous
+        // `handle_events` used to make that first call directly on a tokio
+        // worker and panicked; `watcher.rs::run_watch_loop` now runs it
+        // through `spawn_blocking` instead, which is the pattern under test
+        // here. Calling `embed_texts` straight from the `block_on` body
+        // (without `spawn_blocking`) still panics, as it must, since that is
+        // the misuse this test guards against regressing back to.
+        let response = r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        runtime.block_on(async {
+            tokio::task::spawn_blocking(move || {
+                let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+                    openai_config(endpoint, 2, Duration::from_secs(1)),
+                ))
+                .expect("provider construction must not create a blocking client");
+                embedder
+                    .embed_texts(&["first"])
+                    .expect("embed must succeed once the client build runs on the blocking pool");
+            })
+            .await
+            .expect("handle_events-style spawn_blocking task must not panic");
+        });
+        captured.recv().expect("captured request");
+        handle.join().expect("mock server thread");
+    }
+
+    #[test]
     fn openai_compatible_serializes_batches_and_restores_response_order() {
         let response =
             r#"{"data":[{"embedding":[3.0,4.0],"index":1},{"embedding":[1.0,2.0],"index":0}]}"#;
