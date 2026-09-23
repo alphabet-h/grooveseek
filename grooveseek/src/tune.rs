@@ -791,10 +791,11 @@ pub enum TuneOutcome {
 /// per query.
 ///
 /// They are embedded as queries, through [`Embedder::embed_queries`], because
-/// that is how `groove search`, the MCP `search` tool and `groove eval` embed
-/// one. This used [`Embedder::embed_texts`], the document side: with an
-/// OpenAI-compatible endpoint that names a separate `query_model`, every
-/// condition was then measured with query vectors no search ever uses.
+/// that is how `groove search`, the MCP search tool in [`crate::server`] and
+/// `groove eval` embed one. This used [`Embedder::embed_texts`], the document
+/// side: with an OpenAI-compatible endpoint that names a separate
+/// `query_model`, every condition was then measured with query vectors no
+/// search ever uses.
 ///
 /// Split out of [`run`] so a test can hand it an embedder that needs no model
 /// or endpoint.

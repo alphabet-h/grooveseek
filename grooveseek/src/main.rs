@@ -208,10 +208,9 @@ enum Commands {
         kb_path: Option<PathBuf>,
         /// Force a full re-index. Required whenever the embedding changes: a
         /// different `--model`, or a different `[embedding]` provider, model
-        /// (`model`, `query_model`, `document_model`) or `dimension`, since
-        /// the index records the model and dimension that built it and refuses
-        /// any other. Also replaces a `.groove.db` that cannot be opened as a
-        /// database.
+        /// alias or dimension, since the index records the model and dimension
+        /// that built it and refuses any other. Also replaces a `.groove.db`
+        /// that cannot be opened as a database.
         #[arg(long, default_value_t = false)]
         force: bool,
         /// FastEmbed model to index with. Selects FastEmbed for this run,
