@@ -1228,10 +1228,9 @@ pattern = '^\d{4}-\d{2}-\d{2}$'"#,
         assert_eq!(rc, 0, "could not create the fifo to test against");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let probe = path.clone();
         std::thread::spawn(move || {
             let _ = tx.send(
-                Schema::load_optional(&probe)
+                Schema::load_optional(&path)
                     .map(|s| s.is_some())
                     .map_err(|e| format!("{e:#}")),
             );
