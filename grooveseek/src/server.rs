@@ -3805,6 +3805,37 @@ mod tests {
         }
     }
 
+    /// (AW-01, Codex round 1 on #319) A Windows device name gets the answer a
+    /// misspelling gets, before the first stat. Joined onto a knowledge base
+    /// written without the verbatim prefix, `NUL` or `NUL:` is the null
+    /// device rather than a file -- measured with `GetFullPathNameW` -- and
+    /// older Windows reads `CON`, `COM1` and the rest the same way, with an
+    /// extension too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_device_names_are_refused_before_the_disk_is_touched() {
+        let t = KbWithOutside::new("gd-win-dev");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        for rel in [
+            "NUL",
+            "NUL.md",
+            "NUL:",
+            "CON",
+            "con.md",
+            "COM1",
+            "a/AUX/b.md",
+        ] {
+            assert_eq!(
+                ask_for_document(&t.kb, rel),
+                misspelled,
+                "{rel:?} must be refused by what it says, not by what is there"
+            );
+        }
+    }
+
     /// (AW-01) Inside the best-practice tool's template loop
     /// ([`resolve_best_practice_path`]) the same refusal is a miss, not a
     /// security event: the next template is tried.

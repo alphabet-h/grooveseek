@@ -205,6 +205,10 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// `a\..\b.md` -- through `get_document` too, since that asks this function
 /// as well -- and in return nothing downstream that reads `\` as a separator
 /// can ever be handed a `..`.
+///
+/// On Windows a segment that names a device is refused as well
+/// ([`names_a_windows_device`]), so no request reaches the null device or a
+/// port by being spelled `NUL` or `COM1` (Codex round 1 on #319).
 pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.contains('\0') {
         return false;
@@ -215,7 +219,84 @@ pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.starts_with('/') || starts_with_drive_designator(p) {
         return false;
     }
-    !p.split(['/', '\\']).any(|seg| seg == "..")
+    !p.split(['/', '\\'])
+        .any(|seg| seg == ".." || names_a_windows_device(seg))
+}
+
+/// The names Windows reserves for devices, as [`names_a_windows_device`]
+/// compares them (ASCII case ignored; the superscript digits have no case).
+const WINDOWS_DEVICE_NAMES: &[&str] = &[
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
+/// Whether `segment` is a name Windows can read as a device rather than a
+/// file -- `NUL`, `CON`, `COM1` and the rest -- in any case, followed by an
+/// extension, trailing spaces or dots, or a colon.
+///
+/// **Windows only**, like [`starts_with_drive_designator`] and for the same
+/// reason: elsewhere these are ordinary names.
+///
+/// The list is the reserved names of "Naming Files, Paths, and Namespaces"
+/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>),
+/// which also says `NUL.txt` and `NUL.tar.gz` are both `NUL`. Three kinds are
+/// added to it: `CONIN$` and `CONOUT$`, which Windows 11 (build 26200)
+/// reports as device names when they stand alone though the page does not
+/// list them; `COM0` and `LPT0`, which neither the page lists nor that build
+/// reads as devices, refused on the cautious side since the page's own
+/// namespace section shows a `COM0` device; and the trailing colon, since
+/// `<dir>\NUL:` becomes `\\.\NUL` there (all via `GetFullPathNameW` and
+/// `RtlIsDosDeviceName_U`, called from PowerShell on that build).
+///
+/// How much of this a given Windows still does varies, which is why the rule
+/// follows the page rather than one build: on build 26200 only `NUL` (with
+/// trailing dots, spaces or a colon) still turns into the device behind a
+/// directory, and under the verbatim `\\?\` prefix a canonical knowledge base
+/// carries, nothing does. The cost is a file that some Windows lets exist,
+/// such as `CON.md`, which neither `get_document` nor a `kb://doc/` URI can
+/// name.
+fn names_a_windows_device(segment: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let stem = segment
+        .split(['.', ':'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ');
+    WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
 }
 
 /// Whether `p` opens with a Windows drive designator — `C:` — which escapes the
@@ -453,6 +534,66 @@ mod tests {
     fn a_backslash_is_refused_where_it_separates_components() {
         assert_eq!(parse("kb://doc/secret%5Cpay.md"), None);
         assert!(!doc_is_addressable("secret\\pay.md"));
+    }
+
+    /// A Windows device name in any segment is refused there, with an
+    /// extension, in any case, with trailing dots or spaces, and with the
+    /// trailing colon Windows also reads as the device. Names that merely
+    /// start like one are not device names and stay.
+    #[cfg(windows)]
+    #[test]
+    fn a_device_name_in_any_segment_is_refused_on_windows() {
+        for p in [
+            "NUL",
+            "NUL.md",
+            "nul.tar.gz",
+            "con",
+            "COM1",
+            "com9.md",
+            "LPT\u{b9}.md",
+            "COM\u{b3}",
+            "a/AUX/b.md",
+            "PRN/x.md",
+            "NUL. ",
+            "NUL .md",
+            "NUL:",
+            "CONIN$",
+            "conout$.md",
+        ] {
+            assert!(!is_safe_relative(p), "{p:?} names a device on Windows");
+            assert_eq!(parse(&doc_uri(p)), None, "{p:?}");
+        }
+        for p in [
+            "NULL.md",
+            "console.md",
+            "COM10.md",
+            "LPT.md",
+            "nul-x.md",
+            "auxiliary/a.md",
+            "a/connect/b.md",
+        ] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name");
+        }
+    }
+
+    /// The same inputs are ordinary names on Unix, where no name is a device
+    /// by spelling: refusing them there would lose files for nothing.
+    #[cfg(unix)]
+    #[test]
+    fn device_names_are_ordinary_names_on_unix() {
+        for p in [
+            "NUL",
+            "NUL.md",
+            "con",
+            "COM1",
+            "LPT\u{b9}.md",
+            "a/AUX/b.md",
+            "NUL. ",
+            "NUL:",
+            "CONIN$",
+        ] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name on Unix");
+        }
     }
 
     /// What decides whether a URI is handed out is what decides whether it
