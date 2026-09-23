@@ -191,9 +191,13 @@ vendor 非依存のクライアントとする。**
 - **運用者がデータの流れについての判断を背負う**。`endpoint` で応答するものは、
   索引するすべての chunk と検索するすべての query を、URL が名指す transport の上で
   平文として受け取る。GrooveSeek はそれがどこか、誰が動かしているかを検査しない。
-  やるのは、資格情報を埋め込んだ URL を拒否すること、`Debug` 出力に `api_key` を出さないこと、
-  transport のエラーから URL を落とすこと、エラー本文を 512 byte で切って escape することで、
-  **表示する拒否文と warning は ASCII のまま、秘密を映し返さない**
+  **自分の秘密は表示するものに出さない**: 資格情報を埋め込んだ URL を拒否し、
+  `Debug` 出力では `api_key` を伏せ、transport のエラーから URL を落とす。
+  表示する文を ASCII に保つために、endpoint のエラー本文は 512 byte で切って escape する
+  (`grooveseek/src/embedder.rs` の `escaped_body_snippet`)。ただしその本文は
+  **escape するだけで、伏せはしない**: エラー応答に秘密を映し返す endpoint なら、
+  それは groove の stderr と、それを集めるログにそのまま載る。
+  endpoint が何を返すかは運用者の側のものである
 - **endpoint でどのモデルが応答するかを保つのは運用者である**。GrooveSeek が記録するのは
   alias であって、その裏のモデルではない。alias の裏のモデルを差し替えても索引は
   これまでどおり開き、以後の検索は古い document ベクトルを、別の embedding 空間の

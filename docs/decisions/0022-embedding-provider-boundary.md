@@ -216,10 +216,14 @@ stays the default implementation; the second is a vendor-neutral client for
 - **The operator now carries a data-flow decision.** Whatever answers at
   `endpoint` receives every chunk indexed and every query searched, in plain
   text over whatever transport the URL names. GrooveSeek does not check where
-  that is or who runs it. It refuses URLs that embed credentials, keeps
-  `api_key` out of its `Debug` output, strips the URL from transport errors, and
-  caps and escapes an error body to 512 bytes, so the refusal and warning text
-  it prints stays ASCII and does not echo a secret back.
+  that is or who runs it. It keeps its own secrets out of what it prints: it
+  refuses URLs that embed credentials, redacts `api_key` in its `Debug`
+  output, and strips the URL from transport errors. It keeps the printed text
+  ASCII by capping the endpoint's error body to 512 bytes and escaping it
+  (`escaped_body_snippet` in `grooveseek/src/embedder.rs`). That body is
+  escaped, not redacted: an endpoint that echoes a secret in an error response
+  puts it in groove's stderr and whatever log collects it. What the endpoint
+  returns is the operator's.
 - **Which model answers at the endpoint is the operator's to keep stable.**
   GrooveSeek records the alias, not the model behind it. Swapping the model
   behind an alias leaves the index opening as before, and from then on search
