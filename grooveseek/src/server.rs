@@ -3727,6 +3727,19 @@ mod tests {
         }
     }
 
+    /// (AW-01) The empty path names the knowledge base itself, which is not a
+    /// document, and is refused like a misspelling rather than by whatever a
+    /// later step makes of a directory -- on Unix a directory has more than
+    /// one link, so the link check would call it a hard link.
+    #[test]
+    fn an_empty_path_is_refused_like_a_misspelling() {
+        let t = KbWithOutside::new("gd-empty");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        assert_eq!(ask_for_document(&t.kb, ""), misspelled);
+    }
+
     /// (AW-01) The Windows spellings of "somewhere else": a UNC share, which
     /// looked at would be an SMB connection to that host; the verbatim form of
     /// one; a drive with and without a root, and with either separator; a
