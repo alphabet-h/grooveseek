@@ -57,7 +57,11 @@ bearer token として送られる。`GROOVE_EMBEDDING_API_KEY` が設定され�
 優先され、token をファイルに書かずに済む。
 
 provider、どちらかの model alias、または次元を変えると、実行時の設定が既存インデックスと
-合わなくなり `groove index --force` が必要になる。`--model` は従来どおりの意味を保ち、
+合わなくなり `groove index --force` が必要になる。`endpoint`、`api_key`、`timeout_seconds`
+を変えてもそうはならない。これらは記録される identity に含まれないので、alias の背後の
+model が変わっても groove には分からない。endpoint が同じ alias で別の model を返すように
+なったら、自分で `groove index --force` を実行すること。そうしないと、古い document の
+ベクトルと新しいクエリのベクトルがエラーも出ずに一緒に検索される。`--model` は従来どおりの意味を保ち、
 その 1 回の実行に限って FastEmbed を選び、`[embedding]` を上書きする。トップレベルの
 `model` キーは FastEmbed 専用で、`provider = "openai-compatible"` と同時に書いた config は
 groove が拒否する。provider を切り替える時はこのキーを消すこと。

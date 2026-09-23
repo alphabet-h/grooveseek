@@ -60,6 +60,11 @@ precedence and avoids storing the token in the file.
 
 Changing provider, either model alias, or dimension makes the runtime
 incompatible with the existing index and requires `groove index --force`.
+Changing `endpoint`, `api_key` or `timeout_seconds` does not, because they are
+not part of the recorded identity, so groove cannot tell when the model behind
+an alias changes. If the endpoint starts serving a different model under the
+same alias, run `groove index --force` yourself; otherwise old document
+vectors and new query vectors are searched together without an error.
 `--model` keeps its historical meaning and selects FastEmbed for that one
 invocation, overriding `[embedding]`. The top-level `model` key belongs to
 FastEmbed alone: groove refuses a config that sets it together with

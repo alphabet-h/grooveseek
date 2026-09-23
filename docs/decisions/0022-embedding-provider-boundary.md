@@ -88,6 +88,17 @@ who may turn outbound embedding on.**
    ([ADR-0016](0016-keep-the-plugin-directory-outside-the-knowledge-base.md)),
    and the same boundary is applied here as R7.
 
+6. **Fold the endpoint into the identity.** Rejected. A change of hostname,
+   port or scheme, or a load-balanced pair of servers, would then force a full
+   reindex although the vectors are unchanged. And the endpoint string still
+   would not identify the model actually deployed behind it: a redeploy at the
+   same URL is invisible either way. It buys a rebuild on every move and no
+   guarantee in return.
+
+   The condition that would reopen it: a server-side identifier of the
+   embedding space, such as a model fingerprint in the response, that
+   GrooveSeek could record instead of the URL.
+
 ## Decision
 
 **Embedding inference sits behind a private `EmbeddingProvider` trait. FastEmbed
@@ -110,14 +121,18 @@ stays the default implementation; the second is a vendor-neutral client for
   most 64 (`OPENAI_COMPATIBLE_BATCH_SIZE`). `dimensions` is sent only when
   `request_dimensions = true`, because not every server accepts it. Redirects
   are not followed.
-- **An index is identified by what changes its vectors.** The identity is the
-  provider kind, the document alias, the query alias and the declared
-  dimension, spelled
+- **An index is identified by what GrooveSeek can know about its vectors.** The
+  identity is the provider kind, the document alias, the query alias and the
+  declared dimension, spelled
   `openai-compatible:{document_model}|{query_model}:{12 hex}` where the hex is a
   SHA-256 over the two aliases, each length-prefixed, and the dimension
   (`OpenAiCompatibleConfig::new` in `grooveseek/src/embedder.rs`).
-  `endpoint`, `api_key` and `timeout_seconds` are operational: changing them
-  does not ask for a reindex.
+  `endpoint`, `api_key` and `timeout_seconds` are deliberately left out, so an
+  operator can move the service — host, port, TLS, key rotation — without a
+  rebuild. The cost is stated plainly: GrooveSeek cannot detect that the same
+  aliases at a different endpoint, or at the same endpoint after a redeploy,
+  now produce a different embedding space. When that happens the operator has
+  to run `groove index --force` themselves, and nothing warns them.
 - **GrooveSeek never probes the endpoint.** `dimension` is mandatory for the
   external provider. The identity is resolved into `EmbeddingSettings` before
   any provider exists, and `verify_embedding_meta`
@@ -205,6 +220,12 @@ stays the default implementation; the second is a vendor-neutral client for
   `api_key` out of its `Debug` output, strips the URL from transport errors, and
   caps and escapes an error body to 512 bytes, so the refusal and warning text
   it prints stays ASCII and does not echo a secret back.
+- **Which model answers at the endpoint is the operator's to keep stable.**
+  GrooveSeek records the alias, not the model behind it. Swapping the model
+  behind an alias leaves the index opening as before, and from then on search
+  compares the old document vectors with query vectors from a different
+  embedding space. Nothing reports it; the two spaces stay mixed until the
+  operator rebuilds the index.
 
 ## References
 

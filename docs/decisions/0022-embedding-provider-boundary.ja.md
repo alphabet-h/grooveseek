@@ -80,6 +80,15 @@ vendor ごとの作法を覚えるのではなく、という要望が出た (is
    ([ADR-0016](0016-keep-the-plugin-directory-outside-the-knowledge-base.ja.md))、
    同じ境界を R7 としてここにも適用する。
 
+6. **endpoint を identity に含める**。却下。hostname・port・scheme の変更や、
+   負荷分散された 2 台のサーバが、**ベクトルは変わっていないのに**索引の全面的な
+   作り直しを強いることになる。しかも endpoint の文字列は、その裏に実際にデプロイされている
+   モデルを識別しない — 同じ URL での再デプロイはどちらにしても見えない。
+   **移すたびに作り直しを払い、何の保証も得られない**。
+
+   **覆る条件**: 応答に含まれるモデルの fingerprint のように、embedding 空間を
+   サーバ側が識別する値が得られ、GrooveSeek が URL の代わりにそれを記録できるようになったとき。
+
 ## 決定
 
 **embedding の推論は非公開の `EmbeddingProvider` trait の後ろに置く。FastEmbed は
@@ -101,12 +110,17 @@ vendor 非依存のクライアントとする。**
   `document_model` で、query は `query_model` で、最大 64 件ずつ送る
   (`OPENAI_COMPATIBLE_BATCH_SIZE`)。`dimensions` は `request_dimensions = true` の
   ときだけ送る — 受け付けないサーバがあるからである。redirect は追わない
-- **索引は、ベクトルを変えるもので識別する**。identity は provider の種類・
-  document alias・query alias・宣言した次元であり、
+- **索引は、そのベクトルについて GrooveSeek が知りうるもので識別する**。
+  identity は provider の種類・document alias・query alias・宣言した次元であり、
   `openai-compatible:{document_model}|{query_model}:{12 桁の hex}` と綴る。
   hex は、2 つの alias をそれぞれ長さ前置したものと次元を SHA-256 にかけたもの
   (`grooveseek/src/embedder.rs` の `OpenAiCompatibleConfig::new`)。
-  `endpoint`・`api_key`・`timeout_seconds` は運用上の設定で、変えても reindex は求めない
+  `endpoint`・`api_key`・`timeout_seconds` は**意図して外してある** — 運用者が
+  サービスを動かしても (host・port・TLS・key の入れ替え) 作り直さずに済むようにである。
+  代償もはっきり書いておく: 同じ alias が別の endpoint で、あるいは同じ endpoint でも
+  再デプロイ後に、**別の embedding 空間を返すようになっても GrooveSeek は検知できない**。
+  そうなったときは運用者が自分で `groove index --force` を走らせる必要があり、
+  それを知らせるものは何も無い
 - **GrooveSeek は endpoint を probe しない**。外部 provider では `dimension` が必須である。
   identity は provider が存在する前に `EmbeddingSettings` へ解決され、
   `verify_embedding_meta` (`grooveseek/src/db/meta.rs`) はその settings に対して、
@@ -180,6 +194,11 @@ vendor 非依存のクライアントとする。**
   やるのは、資格情報を埋め込んだ URL を拒否すること、`Debug` 出力に `api_key` を出さないこと、
   transport のエラーから URL を落とすこと、エラー本文を 512 byte で切って escape することで、
   **表示する拒否文と warning は ASCII のまま、秘密を映し返さない**
+- **endpoint でどのモデルが応答するかを保つのは運用者である**。GrooveSeek が記録するのは
+  alias であって、その裏のモデルではない。alias の裏のモデルを差し替えても索引は
+  これまでどおり開き、以後の検索は古い document ベクトルを、別の embedding 空間の
+  query ベクトルと比べることになる。**それを知らせるものは無く**、運用者が索引を
+  作り直すまで 2 つの空間は混ざったままである
 
 ## 参考
 
