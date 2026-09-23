@@ -239,8 +239,9 @@ pub(super) fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> boo
 /// `err.error.contains("...")` assertion 完全保持)。
 ///
 /// - [`Self::Found`] (中身は canonical path) — 段階防御をすべて通過、canonical な絶対パス
-/// - `NotFound(ErrorResponse)` — file-not-found / canonicalize-failed /
-///   outside-kb / extension-denied / size-exceeded の総称。`get_best_practice`
+/// - `NotFound(ErrorResponse)` — not-a-relative-path (AW-01) / file-not-found /
+///   canonicalize-failed / outside-kb / not-canonical-spelling /
+///   extension-denied / size-exceeded の総称。`get_best_practice`
 ///   の template loop では「次 template を試す」価値ありと解釈
 /// - `Denied(ErrorResponse)` — symlink hit のみ (security event)。
 ///   `get_best_practice` の template loop では即 break = 攻撃 indicator を
@@ -313,6 +314,11 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 /// 拒否時は `ErrorResponse` を返し、呼び出し側が JSON 化する。
 ///
 /// 防御の順序:
+/// 0. **lexical check** (AW-01) — FS に触る前に、要求の文字列だけを
+///    [`crate::resources::is_safe_relative`] に通す (空文字列も拒否)。絶対パス・
+///    ドライブ指定・UNC・`..` は `Path::join` で `kb_path` の外を指すので、1 以降に
+///    進めると KB 外を stat してから拒否することになり、文言の差が KB 外の存在を
+///    教えていた。拒否は 2b と同じ文言の [`ValidatePathOutcome::NotFound`]
 /// 1. **symlink reject** — `canonicalize` の前に拾う必要がある
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
 ///    - 2b. **canonical spelling** — canonical パスを kb_path 相対・`/` 区切り
@@ -372,6 +378,18 @@ pub(crate) fn max_bytes_for(
     }
 }
 
+/// What a request that is not a document's one spelling is told, by the
+/// lexical check (step 0) and the spelling check (step 2b) alike.
+///
+/// One literal for both, so the step that answered cannot be read off the
+/// reply. It names no path: step 0 refuses before anything on disk is looked
+/// at, so its answer must not depend on what is there, and step 2b must not
+/// hand a caller who guessed at a directory the real name of it.
+const NOT_THE_CANONICAL_SPELLING: &str = concat!(
+    "File not found: the requested path is not the canonical spelling of a ",
+    "document. Pass the `path` exactly as `search` returned it."
+);
+
 pub(crate) fn validate_get_document_path(
     kb_path: &std::path::Path,
     rel_path: &str,
@@ -379,6 +397,24 @@ pub(crate) fn validate_get_document_path(
     text_max_bytes: u64,
     binary_max_bytes: u64,
 ) -> ValidatePathOutcome {
+    // 0. Lexical check, before the first stat (AW-01). `Path::join` replaces
+    // `kb_path` when the right-hand side is absolute, so everything below
+    // used to look at wherever an absolute path, a drive or a UNC share
+    // pointed -- outside the knowledge base, across the network on Windows --
+    // and only then refuse it, with a message that differed by whether
+    // something was there. The index never stores such a string, so it is not
+    // the spelling of any document and gets that answer, without a look.
+    //
+    // The rule is the one the `kb://` URI parser applies
+    // ([`crate::resources::is_safe_relative`]), not a second copy of it. The
+    // empty string is refused here on top: it names the knowledge base itself,
+    // which is not a document.
+    if rel_path.is_empty() || !crate::resources::is_safe_relative(rel_path) {
+        return ValidatePathOutcome::NotFound(ErrorResponse {
+            error: NOT_THE_CANONICAL_SPELLING.to_string(),
+        });
+    }
+
     let file_path = kb_path.join(rel_path);
 
     // 1. Symlink reject (canonicalize の前に判定)
@@ -416,7 +452,10 @@ pub(crate) fn validate_get_document_path(
         }
     }
 
-    // 2. Path traversal prevention
+    // 2. Path traversal prevention. Step 0 has already refused `..` and every
+    // absolute form, so what resolves outside `kb_path` here got there through
+    // a link inside the knowledge base -- a directory symlink, or on Windows a
+    // junction, which needs no privilege to make.
     let canonical = match file_path.canonicalize() {
         Ok(p) => p,
         Err(e) if path_probe_failed(&e) => {
@@ -463,11 +502,7 @@ pub(crate) fn validate_get_document_path(
         .is_some_and(|indexed| indexed == rel_path);
     if !spelled_canonically {
         return ValidatePathOutcome::NotFound(ErrorResponse {
-            error: concat!(
-                "File not found: the requested path is not the canonical spelling of a ",
-                "document. Pass the `path` exactly as `search` returned it."
-            )
-            .to_string(),
+            error: NOT_THE_CANONICAL_SPELLING.to_string(),
         });
     }
 
@@ -561,16 +596,17 @@ pub(super) enum ResolveOutcome {
 }
 
 /// Best-practice resolver: テンプレート列に `{target}` を置換してファイルを探す。
-/// 先頭から順に試し、[`validate_get_document_path`] の段階防御 (symlink reject /
-/// canonicalize+starts_with / canonical spelling / extension membership /
-/// size cap) を通過した最初の候補を返す。`kb_path` は呼び出し側で既に canonicalize されている前提
+/// 先頭から順に試し、[`validate_get_document_path`] の段階防御 (lexical check /
+/// symlink reject / canonicalize+starts_with / canonical spelling / extension
+/// membership / size cap) を通過した最初の候補を返す。`kb_path` は呼び出し側で既に canonicalize されている前提
 /// (`run_server` / tests で事前処理)。
 ///
 /// fail 種別の挙動 (F-45):
 /// - `Found(p)` → 即 return
-/// - `NotFound(_)` (file not found / canonicalize failed / outside-kb / extension
-///   denied / size exceeded) → 次 template を試行 (err 文言は捨てて `tried` に
-///   rel path のみ記録、info leak ゼロ)
+/// - `NotFound(_)` (not a relative path / file not found / canonicalize failed /
+///   outside-kb / extension denied / size exceeded) → 次 template を試行 (err
+///   文言は捨てて `tried` に rel path のみ記録、info leak ゼロ)。KB の外を指す
+///   template (絶対パスや `..` を含む `{target}`) は FS を見ずにここへ落ちる (AW-01)
 /// - `Denied(err)` (symlink hit = security event) → 即 return `ResolveOutcome::Denied(err)`
 ///   (= 文言保持、template ordering より security event 優先)
 pub(super) fn resolve_best_practice_path(

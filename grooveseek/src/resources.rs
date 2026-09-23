@@ -175,22 +175,36 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// A decoded path may be used against the knowledge base only if it stays
 /// inside it and names something on this side of the OS's path syntax.
 ///
+/// Two callers ask it. [`parse`] asks it of a `kb://` URI, and the path check
+/// in [`crate::server`] behind `get_document` and `get_best_practice`
+/// (`validate_get_document_path`) asks it of the requested string before
+/// anything on disk is looked at (AW-01): `Path::join` replaces
+/// the knowledge base with an absolute right-hand side, so an absolute path,
+/// a drive or a UNC share would otherwise be stat'ed wherever it points --
+/// outside the knowledge base, or across the network on Windows. Neither
+/// caller keeps a copy of the rule (AGENTS.md, "One question gets one
+/// implementation"). The empty string passes here and each caller decides
+/// about it: the URI parser reads it as the root topic group, while a
+/// document path has to name a document.
+///
 /// **`\` is refused only where it separates components**
 /// ([`crate::indexer::backslash_separates_components`], the same answer the
 /// index uses when it spells a path). On Unix it is an ordinary filename
 /// character: the index holds a file named `secret\pay.md` under exactly that
 /// name, and refusing it here left the server unable to read a URI it had
 /// handed out. Letting it through there is not a way out of the knowledge
-/// base -- `\` does not separate anything on that platform, the leading-slash
-/// check still refuses absolute paths, and the caller resolves what survives
-/// against the index rather than the filesystem, then through the same checks
-/// `get_document` applies.
+/// base -- `\` does not separate anything on that platform, so `\\host\x.md`
+/// is one filename in the knowledge base root, and the leading-slash check
+/// still refuses absolute paths. The URI caller then resolves what survives
+/// against the index rather than the filesystem, and both callers go on
+/// through the checks `get_document` applies.
 ///
 /// The `..` check splits on `\` as well as `/`, on every platform. That is
 /// deliberately the cautious side: it gives up a Unix file literally named
-/// `a\..\b.md` (still reachable through `get_document`), and in return nothing
-/// downstream that reads `\` as a separator can ever be handed a `..`.
-fn is_safe_relative(p: &str) -> bool {
+/// `a\..\b.md` -- through `get_document` too, since that asks this function
+/// as well -- and in return nothing downstream that reads `\` as a separator
+/// can ever be handed a `..`.
+pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.contains('\0') {
         return false;
     }
@@ -212,8 +226,9 @@ fn is_safe_relative(p: &str) -> bool {
 /// there: `a:b.md` and `C:/note.md` (a directory literally named `C:`) are both
 /// ordinary relative paths on Unix, and this module hands out URIs for them.
 /// Nothing is lost by the narrowing — the colon reaches here percent-decoded,
-/// the leading-slash check above already refuses Unix absolute paths, and the
-/// caller resolves what survives against the index rather than the filesystem.
+/// the leading-slash check above already refuses Unix absolute paths, and a
+/// name with a colon in it is inside the knowledge base on Unix, wherever it is
+/// then looked up.
 fn starts_with_drive_designator(p: &str) -> bool {
     if !cfg!(windows) {
         return false;

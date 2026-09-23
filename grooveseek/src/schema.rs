@@ -39,6 +39,17 @@ use serde::Deserialize;
 
 use crate::parser::{FieldValue, Frontmatter, ParsedDocument};
 
+/// Refuse to read more than this much of the schema file.
+///
+/// `<kb_path>/groove-schema.toml` lives inside the knowledge base, so it is
+/// written by whoever writes the notes, and the MCP rebuild tool reads it
+/// while holding the embedder and the database: an unbounded read of whatever
+/// lands on that name stalls every tool. The golden file's megabyte
+/// ([`crate::eval::MAX_GOLDEN_FILE_BYTES`]) rather than the 64 KiB
+/// `.grooveignore` gets, because both are written by a person and a schema
+/// listing long `enum`s can outgrow the smaller one.
+pub const MAX_SCHEMA_FILE_BYTES: u64 = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Schema types
 // ---------------------------------------------------------------------------
@@ -175,11 +186,35 @@ impl Schema {
     }
 
     /// ファイルパスから読み込み。存在しなければ `None` を返す。
+    ///
+    /// (AW-02) Read through [`crate::links::read_checked`], the route
+    /// `.grooveignore`, the golden file and every indexed document take: a hard
+    /// link, anything that is not a regular file (a named pipe included, which
+    /// the open does not wait on), a file over [`MAX_SCHEMA_FILE_BYTES`] and, on
+    /// Unix, a symlink are refused. A refusal is an **error**, not an absent
+    /// schema. `.grooveignore` fails open because what it bounds is noise in
+    /// the index; the schema decides which fields the index holds, so running
+    /// on without it would change the index. Every caller -- `groove index`,
+    /// `groove validate`, `groove doctor` and the MCP rebuild tool -- goes
+    /// through here, so they refuse alike.
+    ///
+    /// Absence is the open failing with "not found", rather than a
+    /// `Path::exists` taken first, so nothing can be put under the name between
+    /// the look and the read. Any other failure to open is an error, where
+    /// `Path::exists` used to answer "no schema" for it.
     pub fn load_optional(path: &Path) -> Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(path)
+        let bytes = match crate::links::read_checked(path, MAX_SCHEMA_FILE_BYTES) {
+            Ok(crate::links::Content::Bytes(bytes)) => bytes,
+            Ok(crate::links::Content::Refused(refused)) => {
+                anyhow::bail!("refusing to read the schema: {}", refused.log_line(path))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("failed to read schema: {}", path.display()));
+            }
+        };
+        let text = String::from_utf8(bytes)
             .with_context(|| format!("failed to read schema: {}", path.display()))?;
         let schema = Self::from_toml_str(&text)
             .with_context(|| format!("failed to compile schema: {}", path.display()))?;
@@ -1064,6 +1099,150 @@ pattern = '^\d{4}-\d{2}-\d{2}$'"#,
         let _ = std::fs::remove_file(&p);
         let s = Schema::load_optional(&p).unwrap();
         assert!(s.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // load_optional reads through the checks `.grooveignore` gets (AW-02)
+    // -----------------------------------------------------------------------
+
+    /// A scratch directory standing in for a knowledge base, removed on drop.
+    struct SchemaDir(std::path::PathBuf);
+
+    impl SchemaDir {
+        fn new(tag: &str) -> Self {
+            let dir = crate::test_support::unique_temp_path(tag);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for SchemaDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A schema that compiles and declares something, so "it was read" is a
+    /// field that can be looked for rather than only `is_some`.
+    const DECLARES_STATUS: &str = "[fields.status]\nenum = [\"active\"]\n";
+
+    /// The error `load_optional` returns for `path`, with its causes.
+    fn load_error(path: &Path) -> String {
+        match Schema::load_optional(path) {
+            Err(e) => format!("{e:#}"),
+            Ok(Some(_)) => panic!("{} was read and compiled", path.display()),
+            Ok(None) => panic!("{} was taken for no schema at all", path.display()),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_schema_file_still_loads() {
+        let dir = SchemaDir::new("groove-schema-plain");
+        let path = dir.join("groove-schema.toml");
+        std::fs::write(&path, DECLARES_STATUS).unwrap();
+        let s = Schema::load_optional(&path)
+            .expect("an ordinary file loads")
+            .expect("and is not taken for an absent one");
+        assert!(s.fields.contains_key("status"), "{:?}", s.fields.keys());
+    }
+
+    /// A second name for the file is refused, as it is for `.grooveignore`:
+    /// the schema decides which fields the index holds, and a file whoever
+    /// writes the notes could not read themselves must not be what decides it.
+    /// An error rather than "no schema" -- running on without the file would
+    /// change the index, not merely skip a note.
+    #[test]
+    fn a_hard_linked_schema_is_refused_not_read() {
+        let dir = SchemaDir::new("groove-schema-hardlink");
+        let source = dir.join("elsewhere.toml");
+        std::fs::write(&source, DECLARES_STATUS).unwrap();
+        let path = dir.join("groove-schema.toml");
+        std::fs::hard_link(&source, &path).expect("hard links need no privilege");
+
+        let err = load_error(&path);
+        assert!(err.contains("hard link"), "the refusal says why: {err}");
+    }
+
+    /// Past the cap is refused. The fixture is a schema that compiles if it is
+    /// read, padded with one comment line, so the cap is the only thing that
+    /// can make it fail to load.
+    #[test]
+    fn a_schema_past_the_cap_is_refused_not_read() {
+        let dir = SchemaDir::new("groove-schema-cap");
+        let path = dir.join("groove-schema.toml");
+        let pad = "#".repeat(usize::try_from(MAX_SCHEMA_FILE_BYTES).unwrap_or(0));
+        let body = format!("{DECLARES_STATUS}{pad}\n");
+        assert!(body.len() as u64 > MAX_SCHEMA_FILE_BYTES);
+        Schema::from_toml_str(&body).expect("the padded body is a schema that compiles");
+        std::fs::write(&path, &body).unwrap();
+
+        let err = load_error(&path);
+        assert!(
+            err.contains("byte limit"),
+            "the refusal names the cap: {err}"
+        );
+    }
+
+    /// On Unix the open refuses to follow a symlink in the final component, so
+    /// a link planted under the schema's name is refused rather than read
+    /// through. Windows is left out on purpose, as it is everywhere
+    /// [`crate::links`] is used: a symlink there needs a privilege this threat
+    /// model's attacker does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_schema_is_refused_not_followed() {
+        let dir = SchemaDir::new("groove-schema-symlink");
+        let target = dir.join("elsewhere.toml");
+        std::fs::write(&target, DECLARES_STATUS).unwrap();
+        let path = dir.join("groove-schema.toml");
+        std::os::unix::fs::symlink(&target, &path).expect("symlinks need no privilege on unix");
+        Schema::from_toml_str(&std::fs::read_to_string(&path).unwrap())
+            .expect("following the link would have produced a schema");
+
+        let err = load_error(&path);
+        assert!(
+            err.contains("not a regular file"),
+            "the refusal says why: {err}"
+        );
+    }
+
+    /// A named pipe under the schema's name must not park the reader waiting
+    /// for a writer. Over MCP that reader is the rebuild tool, which holds the
+    /// embedder and the database while it reads, so a hang here is every tool
+    /// hanging. The load runs on its own thread so that a regression fails this
+    /// test instead of hanging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_schema_is_refused_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = SchemaDir::new("groove-schema-fifo");
+        let path = dir.join("groove-schema.toml");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode; the call touches nothing else.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "could not create the fifo to test against");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                Schema::load_optional(&probe)
+                    .map(|s| s.is_some())
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+        let loaded = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("loading a named pipe as the schema did not return");
+        let err = loaded.expect_err("a named pipe is not a schema file");
+        assert!(
+            err.contains("not a regular file"),
+            "the refusal says why: {err}"
+        );
     }
 
     #[test]
