@@ -20,8 +20,8 @@
 //!   indexer::{reindex,deindex,rename}_single_file
 //! ```
 //!
-//! `run_watch_loop` hands each event batch to `tokio::task::spawn_blocking`
-//! because `handle_events` locks the embedder and, with the OpenAI-compatible
+//! [`crate::watcher::run_watch_loop`] hands each event batch to `tokio::task::spawn_blocking`
+//! because [`crate::watcher::handle_events`] locks the embedder and, with the OpenAI-compatible
 //! provider, may build a blocking HTTP client on its first embed call; doing
 //! either on a tokio worker thread would block it (the client build panics).
 //!

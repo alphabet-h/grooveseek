@@ -455,7 +455,7 @@ impl Embedder {
     ///    Windows: `%LOCALAPPDATA%\fastembed`)
     ///
     /// If neither names an absolute directory, this returns an error instead of
-    /// loading a model relative to the working directory (see `cache_dir_from`).
+    /// loading a model relative to the working directory (see [`cache_dir_from`]).
     pub fn new() -> Result<Self> {
         Self::with_model(ModelChoice::default())
     }
