@@ -86,7 +86,7 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 - 想定外 state の検知
 
 それ以外は subagent に渡す。subagent は Agent tool で起動し、**`model` を毎回明示する** —
-省くと agent 定義の `model:` になり、それも無ければ session のモデルを継承する:
+省くと agent 定義の `model:` → 環境変数 `CLAUDE_CODE_SUBAGENT_MODEL` → session のモデルの順で決まる:
 
 | model | 渡すもの |
 |---|---|
