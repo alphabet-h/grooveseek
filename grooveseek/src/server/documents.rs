@@ -602,13 +602,15 @@ pub(super) enum ResolveOutcome {
 /// (`run_server` / tests で事前処理)。
 ///
 /// fail 種別の挙動 (F-45):
-/// - `Found(p)` → 即 return
-/// - `NotFound(_)` (not a relative path / file not found / canonicalize failed /
-///   outside-kb / extension denied / size exceeded) → 次 template を試行 (err
-///   文言は捨てて `tried` に rel path のみ記録、info leak ゼロ)。KB の外を指す
-///   template (絶対パスや `..` を含む `{target}`) は FS を見ずにここへ落ちる (AW-01)
-/// - `Denied(err)` (symlink hit = security event) → 即 return `ResolveOutcome::Denied(err)`
-///   (= 文言保持、template ordering より security event 優先)
+/// - [`ValidatePathOutcome::Found`] → 即 return
+/// - [`ValidatePathOutcome::NotFound`] (not a relative path / file not found /
+///   canonicalize failed / outside-kb / extension denied / size exceeded) → 次
+///   template を試行 (err 文言は捨てて `tried` に rel path のみ記録、info leak
+///   ゼロ)。KB の外を指す template (絶対パスや `..` を含む `{target}`) は FS を
+///   見ずにここへ落ちる (AW-01)
+/// - [`ValidatePathOutcome::Denied`] (symlink hit = security event) → 即 return
+///   [`ResolveOutcome::Denied`] (= 同じ [`ErrorResponse`] を保持、template
+///   ordering より security event 優先)
 pub(super) fn resolve_best_practice_path(
     kb_path: &std::path::Path,
     templates: &[String],
