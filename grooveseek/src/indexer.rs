@@ -2222,6 +2222,21 @@ pub(crate) fn collect_source_files_under(
     collect_source_files_counted(kb_path, start, registry, rules).map(|c| c.files)
 }
 
+/// Whether the walk leaves `path` out for its name (ADR-0023): it lies under
+/// `kb_path` as spelled, and its relative path is one
+/// [`crate::resources::doc_is_addressable`] refuses.
+///
+/// Only a path under `kb_path` as spelled is judged. The watcher hands in raw
+/// event paths, and for one that does not share that spelling there is no
+/// relative path to judge -- [`crate::exclusion::rel_key`] would fall back to
+/// the whole absolute path, which no name passes, and refuse even `a.md`.
+/// Those are left to the watcher's own relativizing. The root relativizes to
+/// the empty string, which is no document name and must not be pruned.
+fn name_is_left_out(kb_path: &Path, path: &Path) -> bool {
+    index_rel_path(kb_path, path)
+        .is_some_and(|r| !r.is_empty() && !crate::resources::doc_is_addressable(&r))
+}
+
 /// What [`collect_source_files_counted`] collected, and how many entries it
 /// left out for their names.
 #[derive(Debug)]
@@ -2242,10 +2257,8 @@ pub(crate) struct CollectedSources {
 /// only a file that would otherwise have been indexed is named. Each is one
 /// warning, from [`crate::resources::unspellable_reason`].
 ///
-/// A directory is pruned only when it lies under `kb_path` as spelled: the
-/// watcher hands in raw event paths, and for one that does not share that
-/// spelling the relative key is the whole path, which says nothing about the
-/// directory's own name. The files under it are still checked one by one.
+/// Both levels ask [`name_is_left_out`], so a directory and a file are judged
+/// by the same key.
 pub(crate) fn collect_source_files_counted(
     kb_path: &Path,
     start: &Path,
@@ -2273,12 +2286,7 @@ pub(crate) fn collect_source_files_counted(
             if rules.is_excluded(&rel, e.file_type().is_dir()) {
                 return false;
             }
-            // The root is the empty string, which is no document name and
-            // must not be pruned.
-            if e.file_type().is_dir()
-                && index_rel_path(kb_path, e.path())
-                    .is_some_and(|r| !r.is_empty() && !crate::resources::doc_is_addressable(&r))
-            {
+            if e.file_type().is_dir() && name_is_left_out(kb_path, e.path()) {
                 leave_out(e.path(), true);
                 return false;
             }
@@ -2295,10 +2303,7 @@ pub(crate) fn collect_source_files_counted(
                 && let Some(ext_str) = ext.to_str()
                 && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
             {
-                if !crate::resources::doc_is_addressable(&crate::exclusion::rel_key(
-                    kb_path,
-                    entry.path(),
-                )) {
+                if name_is_left_out(kb_path, entry.path()) {
                     leave_out(entry.path(), false);
                     continue;
                 }
@@ -3825,24 +3830,36 @@ mod tests {
         assert_eq!(got.unspellable, 1);
     }
 
-    /// A directory the walk reaches under a spelling that is not below
-    /// `kb_path` (the watcher hands in raw event paths) is not pruned for its
-    /// name: its relative key is the whole path, which says nothing about the
-    /// directory. The files under it are still refused one by one.
+    /// A walk started under a spelling that is not below `kb_path` (the
+    /// watcher hands in raw event paths) judges no name, at either level:
+    /// there is no relative path to judge, and the whole-path fallback would
+    /// refuse even `ok.md`. Such paths are left to the watcher's own
+    /// relativizing.
     #[cfg(windows)]
     #[test]
-    fn test_collect_source_files_does_not_prune_a_directory_outside_kb_spelling() {
+    fn test_collect_source_files_judges_no_name_outside_kb_spelling() {
         let (tmp, _cleanup, kb) = kb_with_unspellable_names("unspellable-raw");
         // `tmp.0` is the same directory as `kb` without the verbatim prefix,
         // so nothing under `kb` strips it.
         let reg = Registry::defaults();
-        let got = collect_source_files_counted(&tmp.0, &kb.join("dir."), &reg, &excl(&tmp.0, &[]))
-            .unwrap();
-        assert!(got.files.is_empty(), "{:?}", got.files);
+        let got = collect_source_files_counted(&tmp.0, &kb, &reg, &excl(&tmp.0, &[])).unwrap();
+        let rels: Vec<String> = got
+            .files
+            .iter()
+            .map(|p| crate::exclusion::rel_key(&kb, p))
+            .collect();
         assert_eq!(
-            got.unspellable, 2,
-            "x.md and z.md, the directory not pruned"
+            rels,
+            vec![
+                "CON.md".to_string(),
+                "dir./x.md".to_string(),
+                "dir./z.md".to_string(),
+                "ok.md".to_string(),
+                "sp /y.md".to_string(),
+            ],
+            "an ordinary name is collected, and no directory is pruned"
         );
+        assert_eq!(got.unspellable, 0);
     }
 
     /// On every platform an ordinary knowledge base counts nothing.
