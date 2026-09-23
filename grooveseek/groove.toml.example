@@ -17,10 +17,10 @@
 #
 # TRUST DEPENDS ON WHERE THE FILE WAS FOUND. A file reached through (2) or (3)
 # was found, not named, so it is trusted only in part: everything about how the
-# knowledge base is presented is honoured, but the six settings that decide
+# knowledge base is presented is honoured, but the seven settings that decide
 # which code runs, what is read or leaves the machine and who can reach the
 # server -- kb_path (in part), [parsers], grammar_dir, fastembed_cache_dir,
-# [eval].golden and the [transport.http] gates -- are reset to safe defaults
+# [embedding], [eval].golden and the [transport.http] gates -- are reset to safe defaults
 # with a warning. Name the
 # file with `--config` (1) to have it honoured in full; (4) is trusted as well,
 # and so is a file that (2) or (3) finds inside the config home that
@@ -121,6 +121,23 @@
 # excluded file never appears in search, but get_document still returns it to a
 # caller that knows its path. Keep anything that must not be readable outside
 # kb_path. See ".grooveignore" in docs/behavior.md.
+
+# Optional OpenAI-compatible embedding endpoint. Omit this section to keep
+# FastEmbed as the default, with no embedding traffic leaving the process.
+# Document chunks are sent while indexing and queries while searching, so this
+# section is honoured only from a trusted config (see "TRUST" above). Name a
+# project-local file with `--config` to opt in. `endpoint` is the full URL,
+# including `/v1/embeddings`; groove does not probe it to discover the model or
+# dimension. Use `model` for both roles, or set both role-specific aliases.
+# `GROOVE_EMBEDDING_API_KEY` overrides `api_key` when present.
+#[embedding]
+#provider = "openai-compatible"
+#endpoint = "http://127.0.0.1:8001/v1/embeddings"
+#query_model = "query-model"
+#document_model = "document-model"
+#dimension = 768
+#api_key = "secret"
+#timeout_seconds = 60
 
 # --- [quality_filter] — per-chunk quality filter --------------------------
 # On by default with threshold 0.3, which is what the two lines below spell

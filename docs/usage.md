@@ -23,6 +23,42 @@ Scans source files under the given directory, skipping the default `exclude_dirs
 
 Switching models on an existing index requires `--force` (the DB records the model/dim in `index_meta` and rejects mismatched runtimes).
 
+### External OpenAI-compatible embeddings
+
+FastEmbed remains the default and keeps embedding inference in-process. To use
+an HTTP embedding service instead, put an `[embedding]` section in a
+`groove.toml` that groove trusts and name it with `--config` when the file is
+project-local:
+
+```toml
+[embedding]
+provider = "openai-compatible"
+endpoint = "http://127.0.0.1:8001/v1/embeddings"
+query_model = "query-model"
+document_model = "document-model"
+dimension = 768
+timeout_seconds = 60
+```
+
+The endpoint receives document chunks during indexing and search text during
+queries. A config that groove merely discovers under the current directory or
+a Git ancestor has this section ignored, restoring FastEmbed; see
+[Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
+
+Each request uses the OpenAI-compatible `POST /v1/embeddings` JSON shape with
+`model`, `input`, and `dimensions`. Set one `model` alias for both roles, or set
+both `query_model` and `document_model` as above. `dimension` is mandatory:
+groove uses it to open or validate the vector index before constructing the
+HTTP provider, then rejects any response whose vectors have a different size.
+It does not probe the endpoint. An optional `api_key` is sent as a bearer token;
+`GROOVE_EMBEDDING_API_KEY` takes precedence and avoids storing the token in the
+file.
+
+Changing provider, either model alias, or dimension makes the runtime
+incompatible with the existing index and requires `groove index --force`.
+`--model` keeps its historical meaning and selects FastEmbed for that one
+invocation, overriding `[embedding]`.
+
 `--force` is also the repair for a `.groove.db` that cannot be opened as a database — a truncated write or a process killed mid-migration is enough. Any command that opens the file then fails with a message naming the file (it lives in the **parent** of `--kb-path`) and the two ways out: delete it and run `groove index`, or run `groove index --force`, which replaces the file and its `-wal` / `-shm` sidecars and rebuilds from scratch. The index is entirely derived from the corpus, so nothing is lost. Without `--force` the file is never touched.
 
 ### Progress reporting flags (v0.7.8+)

@@ -798,7 +798,7 @@ fn main() -> anyhow::Result<()> {
             systemd_socket,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let embedding = cfg.resolve_embedding(model);
+            let embedding = cfg.resolve_embedding(model)?;
             let reranker = reranker.or(cfg.reranker).unwrap_or_default();
             // rerank_by_default の既定は 1 か所 (reranker 有効時のみ意味を持つ)。
             let rerank_by_default = rerank_by_default
@@ -922,7 +922,7 @@ fn main() -> anyhow::Result<()> {
             progress,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let embedding = cfg.resolve_embedding(model);
+            let embedding = cfg.resolve_embedding(model)?;
 
             // `[parsers].enabled` の検証を **何より先** に置く (AU-06 codex P2)。
             //
@@ -1155,7 +1155,7 @@ fn main() -> anyhow::Result<()> {
             grooveseek::server::validate_field_filters("fields_not", &fields_not)?;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let embedding = cfg.resolve_embedding(model);
+            let embedding = cfg.resolve_embedding(model)?;
             // `--reranker` given here is a choice about this query; a model that
             // only came from groove.toml is subject to `rerank_by_default`.
             let reranker_explicit = reranker.is_some();
@@ -1307,7 +1307,7 @@ fn main() -> anyhow::Result<()> {
             format,
         } => {
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let embedding = cfg.resolve_embedding(model);
+            let embedding = cfg.resolve_embedding(model)?;
 
             let db_path = grooveseek::resolve_db_path(&kb_path);
             // Status と同じく、DB がまだ作られていない状態を親切なエラーで弾く。
@@ -1407,7 +1407,7 @@ fn main() -> anyhow::Result<()> {
             } = args;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let embedding = cfg.resolve_embedding(model);
+            let embedding = cfg.resolve_embedding(model)?;
             // Deliberately not `cli_should_rerank`: `groove search` answers a
             // question, `groove eval` measures a pipeline. The run fingerprint
             // records `reranker` and not `rerank_by_default`, so letting that key
@@ -1560,7 +1560,7 @@ fn main() -> anyhow::Result<()> {
             } = args;
 
             let kb_path = require_kb_path(kb_path, cfg.kb_path.clone())?;
-            let embedding = cfg.resolve_embedding(model);
+            let embedding = cfg.resolve_embedding(model)?;
 
             let eval_cfg = cfg.eval.clone().unwrap_or_default();
             let golden_path = golden

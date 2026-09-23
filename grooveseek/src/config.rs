@@ -7,8 +7,9 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crate::embedder::{EmbeddingSettings, ModelChoice, RerankerChoice};
+use crate::embedder::{EmbeddingSettings, ModelChoice, OpenAiCompatibleConfig, RerankerChoice};
 use crate::parser::ParsersConfig;
 use crate::quality::QualityFilterConfig;
 use crate::transport::TransportConfig;
@@ -37,6 +38,9 @@ pub struct Config {
     pub kb_path: Option<PathBuf>,
     /// `--model` の既定値 (例: `"bge-m3"`)。
     pub model: Option<ModelChoice>,
+    /// Embedding provider. Omit this section to preserve the default FastEmbed
+    /// behavior controlled by `model` / `--model`.
+    pub embedding: Option<EmbeddingConfig>,
     /// `--reranker` の既定値 (例: `"bge-v2-m3"`)。
     pub reranker: Option<RerankerChoice>,
     /// `--rerank-by-default` の既定値。
@@ -93,6 +97,140 @@ pub struct Config {
     /// `[index]` セクション (#251)。`groove index` と MCP `rebuild_index` の設定。
     /// 省略時 (`None`) は [`IndexConfig::default()`] (fail_on_frontmatter_error=false)。
     pub index: Option<IndexConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingProviderKind {
+    #[default]
+    Fastembed,
+    OpenaiCompatible,
+}
+
+/// `[embedding]` configuration. The endpoint is only accepted from an
+/// explicitly selected, trusted configuration file.
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub provider: EmbeddingProviderKind,
+    /// Full OpenAI-compatible embeddings endpoint, including `/v1/embeddings`.
+    pub endpoint: Option<String>,
+    /// Shared model alias for both query and document requests.
+    pub model: Option<String>,
+    /// Query model alias. Overrides `model` for query requests.
+    pub query_model: Option<String>,
+    /// Document model alias. Overrides `model` for document requests.
+    pub document_model: Option<String>,
+    /// Expected output dimension, known before any request is sent.
+    pub dimension: Option<usize>,
+    /// Optional bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence.
+    pub api_key: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingConfig")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("query_model", &self.query_model)
+            .field("document_model", &self.document_model)
+            .field("dimension", &self.dimension)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("timeout_seconds", &self.timeout_seconds)
+            .finish()
+    }
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: EmbeddingProviderKind::Fastembed,
+            endpoint: None,
+            model: None,
+            query_model: None,
+            document_model: None,
+            dimension: None,
+            api_key: None,
+            timeout_seconds: 60,
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    fn validate_shape(&self) -> Result<()> {
+        match self.provider {
+            EmbeddingProviderKind::Fastembed => {
+                if self.endpoint.is_some()
+                    || self.dimension.is_some()
+                    || self.api_key.is_some()
+                    || self.query_model.is_some()
+                    || self.document_model.is_some()
+                {
+                    anyhow::bail!(
+                        "[embedding] external provider fields require provider = \"openai-compatible\""
+                    );
+                }
+                if let Some(model) = self.model.as_deref() {
+                    parse_fastembed_model(model)?;
+                }
+            }
+            EmbeddingProviderKind::OpenaiCompatible => {
+                anyhow::ensure!(
+                    self.endpoint
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty()),
+                    "[embedding].endpoint is required for provider = \"openai-compatible\""
+                );
+                let has_shared = self
+                    .model
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_query = self
+                    .query_model
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                let has_document = self
+                    .document_model
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty());
+                anyhow::ensure!(
+                    has_shared || (has_query && has_document),
+                    "[embedding] requires `model`, or both `query_model` and `document_model`, \
+                     for provider = \"openai-compatible\""
+                );
+                anyhow::ensure!(
+                    self.dimension.is_some_and(|value| value > 0),
+                    "[embedding].dimension must be greater than zero for provider = \"openai-compatible\""
+                );
+                anyhow::ensure!(
+                    self.timeout_seconds > 0,
+                    "[embedding].timeout_seconds must be greater than zero"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_fastembed_model(model: &str) -> Result<ModelChoice> {
+    match model {
+        "bge-small-en-v1.5" => Ok(ModelChoice::BgeSmallEnV15),
+        "bge-m3" => Ok(ModelChoice::BgeM3),
+        _ => anyhow::bail!(
+            "unsupported FastEmbed model {model:?}; expected bge-small-en-v1.5 or bge-m3"
+        ),
+    }
+}
+
+fn resolve_embedding_api_key(
+    env_api_key: Option<String>,
+    configured_api_key: Option<String>,
+) -> Option<String> {
+    env_api_key
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| configured_api_key.filter(|key| !key.trim().is_empty()))
 }
 
 /// `[index]` section (`groove.toml`), #251. Settings that apply to
@@ -932,6 +1070,19 @@ impl Config {
             );
         }
 
+        // R7: an external embedding endpoint can send indexed document text
+        // and user queries out of the machine. Discovery does not establish
+        // operator intent, so the whole section is ignored unless the config
+        // path was selected explicitly (the same trust boundary as R5).
+        if self.embedding.take().is_some() {
+            tracing::warn!(
+                config = %shown.display(),
+                "ignoring [embedding] from a config found in an untrusted location \
+                 (it can send document text and queries to an external endpoint); \
+                 pass --config to accept it"
+            );
+        }
+
         Ok(())
     }
 
@@ -986,6 +1137,7 @@ impl Config {
     pub fn is_empty(&self) -> bool {
         self.kb_path.is_none()
             && self.model.is_none()
+            && self.embedding.is_none()
             && self.reranker.is_none()
             && self.rerank_by_default.is_none()
             && self.fastembed_cache_dir.is_none()
@@ -1106,6 +1258,17 @@ impl Config {
     /// 消費点である `Transport::resolve` の HTTP arm が見る
     /// (`transport::http::check_origin_list` の doc が理由を持っている)。
     pub fn validate(&self) -> Result<()> {
+        if let Some(embedding) = &self.embedding {
+            embedding.validate_shape()?;
+            if matches!(embedding.provider, EmbeddingProviderKind::OpenaiCompatible)
+                && self.model.is_some()
+            {
+                anyhow::bail!(
+                    "top-level `model` config is only for FastEmbed; remove it when \
+                     [embedding].provider = \"openai-compatible\""
+                );
+            }
+        }
         if let Some(s) = &self.search {
             // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
             // CLI の `--min-confidence-ratio` と共有する。toml 経路にゲートが要るのは
@@ -1187,11 +1350,68 @@ impl Config {
         Ok(())
     }
 
-    /// Resolve the embedding settings once, with the same precedence as the
-    /// historical direct [`ModelChoice`] resolution: CLI, configuration, then
-    /// the built-in FastEmbed default.
-    pub fn resolve_embedding(&self, cli_model: Option<ModelChoice>) -> EmbeddingSettings {
-        EmbeddingSettings::fastembed(cli_model.or(self.model).unwrap_or_default())
+    /// Resolve the provider used by indexing and querying. An explicit
+    /// `--model` keeps its historical meaning and selects FastEmbed, overriding
+    /// `[embedding]` for that invocation.
+    pub fn resolve_embedding(&self, cli_model: Option<ModelChoice>) -> Result<EmbeddingSettings> {
+        self.resolve_embedding_from(cli_model, std::env::var("GROOVE_EMBEDDING_API_KEY").ok())
+    }
+
+    fn resolve_embedding_from(
+        &self,
+        cli_model: Option<ModelChoice>,
+        env_api_key: Option<String>,
+    ) -> Result<EmbeddingSettings> {
+        if let Some(choice) = cli_model {
+            return Ok(EmbeddingSettings::fastembed(choice));
+        }
+
+        let Some(embedding) = &self.embedding else {
+            return Ok(EmbeddingSettings::fastembed(self.model.unwrap_or_default()));
+        };
+        embedding.validate_shape()?;
+        match embedding.provider {
+            EmbeddingProviderKind::Fastembed => {
+                let choice = match embedding.model.as_deref() {
+                    Some(model) => parse_fastembed_model(model)?,
+                    None => self.model.unwrap_or_default(),
+                };
+                Ok(EmbeddingSettings::fastembed(choice))
+            }
+            EmbeddingProviderKind::OpenaiCompatible => {
+                anyhow::ensure!(
+                    self.model.is_none(),
+                    "top-level `model` config is only for FastEmbed; remove it when \
+                     [embedding].provider = \"openai-compatible\""
+                );
+                let shared = embedding.model.as_deref();
+                let query_model = embedding
+                    .query_model
+                    .as_deref()
+                    .or(shared)
+                    .expect("validated query model")
+                    .to_string();
+                let document_model = embedding
+                    .document_model
+                    .as_deref()
+                    .or(shared)
+                    .expect("validated document model")
+                    .to_string();
+                let config = OpenAiCompatibleConfig::new(
+                    embedding
+                        .endpoint
+                        .as_ref()
+                        .expect("validated endpoint")
+                        .clone(),
+                    query_model,
+                    document_model,
+                    embedding.dimension.expect("validated dimension"),
+                    resolve_embedding_api_key(env_api_key, embedding.api_key.clone()),
+                    Duration::from_secs(embedding.timeout_seconds),
+                )?;
+                Ok(EmbeddingSettings::openai_compatible(config))
+            }
+        }
     }
 
     /// `fastembed_cache_dir` が設定されていて、かつ環境変数
@@ -1882,7 +2102,7 @@ mod tests {
 
     #[test]
     fn resolve_embedding_preserves_model_precedence_and_identity() {
-        let default = Config::default().resolve_embedding(None);
+        let default = Config::default().resolve_embedding(None).unwrap();
         assert_eq!(default.model_id(), "bge-small-en-v1.5");
         assert_eq!(default.dimension(), 384);
 
@@ -1890,13 +2110,145 @@ mod tests {
             model: Some(ModelChoice::BgeM3),
             ..Config::default()
         };
-        let from_config = configured.resolve_embedding(None);
+        let from_config = configured.resolve_embedding(None).unwrap();
         assert_eq!(from_config.model_id(), "bge-m3");
         assert_eq!(from_config.dimension(), 1024);
 
-        let from_cli = configured.resolve_embedding(Some(ModelChoice::BgeSmallEnV15));
+        let from_cli = configured
+            .resolve_embedding(Some(ModelChoice::BgeSmallEnV15))
+            .unwrap();
         assert_eq!(from_cli.model_id(), "bge-small-en-v1.5");
         assert_eq!(from_cli.dimension(), 384);
+    }
+
+    fn external_embedding_config() -> EmbeddingConfig {
+        EmbeddingConfig {
+            provider: EmbeddingProviderKind::OpenaiCompatible,
+            endpoint: Some("http://127.0.0.1:8001/v1/embeddings".to_string()),
+            model: None,
+            query_model: Some("query-model".to_string()),
+            document_model: Some("document-model".to_string()),
+            dimension: Some(768),
+            api_key: Some("config-secret".to_string()),
+            timeout_seconds: 30,
+        }
+    }
+
+    #[test]
+    fn resolve_external_embedding_uses_explicit_identity_and_env_key_precedence() {
+        let cfg = Config {
+            embedding: Some(external_embedding_config()),
+            ..Config::default()
+        };
+        let from_config = cfg
+            .resolve_embedding_from(None, None)
+            .expect("resolve external provider");
+        let from_env = cfg
+            .resolve_embedding_from(None, Some("env-secret".to_string()))
+            .expect("resolve external provider with env key");
+        assert_eq!(from_config.dimension(), 768);
+        assert!(from_config.model_id().starts_with("openai-compatible:"));
+        assert_eq!(from_config.model_id(), from_env.model_id());
+        assert_eq!(
+            resolve_embedding_api_key(
+                Some("env-secret".to_string()),
+                Some("config-secret".to_string())
+            )
+            .as_deref(),
+            Some("env-secret")
+        );
+        assert_eq!(
+            resolve_embedding_api_key(Some("  ".to_string()), Some("config-secret".to_string()))
+                .as_deref(),
+            Some("config-secret")
+        );
+
+        let debug = format!("{:?}", cfg.embedding.as_ref().unwrap());
+        assert!(!debug.contains("config-secret"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn cli_model_overrides_external_embedding_for_one_invocation() {
+        let cfg = Config {
+            embedding: Some(external_embedding_config()),
+            ..Config::default()
+        };
+        let settings = cfg
+            .resolve_embedding_from(Some(ModelChoice::BgeM3), None)
+            .expect("CLI FastEmbed override");
+        assert_eq!(settings.model_id(), "bge-m3");
+        assert_eq!(settings.dimension(), 1024);
+    }
+
+    #[test]
+    fn external_embedding_requires_endpoint_models_dimension_and_timeout() {
+        let mut embedding = external_embedding_config();
+        embedding.endpoint = None;
+        assert!(
+            embedding
+                .validate_shape()
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint")
+        );
+
+        let mut embedding = external_embedding_config();
+        embedding.query_model = None;
+        assert!(
+            embedding
+                .validate_shape()
+                .unwrap_err()
+                .to_string()
+                .contains("both")
+        );
+
+        let mut embedding = external_embedding_config();
+        embedding.dimension = Some(0);
+        assert!(
+            embedding
+                .validate_shape()
+                .unwrap_err()
+                .to_string()
+                .contains("dimension")
+        );
+
+        let mut embedding = external_embedding_config();
+        embedding.timeout_seconds = 0;
+        assert!(
+            embedding
+                .validate_shape()
+                .unwrap_err()
+                .to_string()
+                .contains("timeout")
+        );
+    }
+
+    #[test]
+    fn external_embedding_shared_model_populates_both_roles() {
+        let mut embedding = external_embedding_config();
+        embedding.model = Some("shared-model".to_string());
+        embedding.query_model = None;
+        embedding.document_model = None;
+        let cfg = Config {
+            embedding: Some(embedding),
+            ..Config::default()
+        };
+        let settings = cfg
+            .resolve_embedding_from(None, None)
+            .expect("shared model is valid");
+        assert!(settings.model_id().contains("shared-model|shared-model"));
+    }
+
+    #[test]
+    fn external_embedding_rejects_top_level_fastembed_model() {
+        let cfg = Config {
+            model: Some(ModelChoice::BgeM3),
+            embedding: Some(external_embedding_config()),
+            ..Config::default()
+        };
+        let err = cfg.validate().expect_err("ambiguous model configuration");
+        assert!(err.to_string().contains("top-level `model`"));
     }
 
     #[test]
@@ -4003,6 +4355,58 @@ lambda = 0.5
             .and_then(|e| e.golden.clone())
             .expect("a named config keeps its golden file");
         assert_eq!(golden, chosen);
+    }
+
+    // -----------------------------------------------------------------------
+    // R7: external embedding endpoint and outbound document/query text
+    // -----------------------------------------------------------------------
+
+    fn planted_embedding() -> &'static str {
+        "kb_path = \"kb\"\n\
+         [embedding]\n\
+         provider = \"openai-compatible\"\n\
+         endpoint = \"https://example.invalid/v1/embeddings\"\n\
+         model = \"external-model\"\n\
+         dimension = 768\n"
+    }
+
+    #[test]
+    fn an_untrusted_config_cannot_enable_outbound_embeddings() {
+        let dir = TempDir::new("groove-untrusted-embedding");
+        std::fs::write(dir.path().join("groove.toml"), planted_embedding()).unwrap();
+        let roots = roots_for(None, None);
+
+        let discovered =
+            Config::discover_in(None, dir.path(), None, &roots).expect("discover config");
+        assert_eq!(discovered.trust, ConfigTrust::Untrusted);
+        assert!(
+            discovered.config.embedding.is_none(),
+            "a discovered config must not enable outbound document or query text"
+        );
+        let settings = discovered
+            .config
+            .resolve_embedding_from(None, None)
+            .expect("fall back to FastEmbed");
+        assert_eq!(settings.model_id(), "bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn an_explicit_config_keeps_its_external_embedding_endpoint() {
+        let dir = TempDir::new("groove-trusted-embedding");
+        let toml = dir.path().join("groove.toml");
+        std::fs::write(&toml, planted_embedding()).unwrap();
+        let roots = roots_for(None, None);
+
+        let explicit = Config::discover_in(Some(&toml), dir.path(), None, &roots)
+            .expect("explicit config is trusted");
+        assert_eq!(explicit.source, ConfigSource::Explicit);
+        assert_eq!(explicit.trust, ConfigTrust::Trusted);
+        let settings = explicit
+            .config
+            .resolve_embedding_from(None, None)
+            .expect("external provider remains configured");
+        assert!(settings.model_id().starts_with("openai-compatible:"));
+        assert_eq!(settings.dimension(), 768);
     }
 
     /// R4 keeps its own coverage now that R5 stands in front of it.

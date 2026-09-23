@@ -48,6 +48,20 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # everything.
 # exclude_dirs = [".obsidian", ".git", "node_modules", "target", ".vscode", ".idea", "dist", ".next"]
 
+# Optional external embedding provider. FastEmbed remains the default when this
+# section is absent. `endpoint` is the full OpenAI-compatible embeddings URL;
+# document chunks and search queries are sent there. Use one shared `model`, or
+# set both role-specific aliases. `dimension` is required and is checked on
+# every response without probing the endpoint first.
+[embedding]
+provider = "openai-compatible"
+endpoint = "http://127.0.0.1:8001/v1/embeddings"
+query_model = "query-model"
+document_model = "document-model"
+dimension = 768
+# api_key = "secret" # GROOVE_EMBEDDING_API_KEY takes precedence
+timeout_seconds = 60
+
 # Per-chunk quality filter. Enabled by default, threshold 0.3.
 # Set `enabled = false` to restore the previous (filter-off) behavior (return every chunk).
 [quality_filter]
@@ -214,7 +228,7 @@ bind = "127.0.0.1:3100"
 # enabled = true
 ```
 
-With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags — **provided groove trusts where the file is**. One it merely found, which is what a project-root or `.git`-ancestor placement means, keeps everything about presentation but has `kb_path`, `[parsers]`, `grammar_dir`, `fastembed_cache_dir` and the `[transport.http]` gates reset to safe defaults. Name it — `groove --config ./groove.toml index` — to have it honoured in full. [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations) says which keys and why; `index` is the one to get right first, since it deletes documents whose extension the parser set no longer covers. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` from the real environment overrides the file entry.
+With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags — **provided groove trusts where the file is**. One it merely found, which is what a project-root or `.git`-ancestor placement means, keeps everything about presentation but has `kb_path`, `[parsers]`, `[embedding]`, `grammar_dir`, `fastembed_cache_dir` and the `[transport.http]` gates reset to safe defaults. Name it — `groove --config ./groove.toml index` — to have it honoured in full. [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations) says which keys and why; `index` is the one to get right first, since it deletes documents whose extension the parser set no longer covers. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` and `GROOVE_EMBEDDING_API_KEY` from the real environment override their file entries.
 
 ## Config file discovery
 
@@ -251,7 +265,7 @@ it as yours:
 
 An untrusted config still loads, and everything that shapes *how* a knowledge
 base is presented — `[search]`, `[quality_filter]`, `exclude_dirs`,
-`[watch]`, `[contextual]`, `[index]` — is honoured unchanged. Six fields
+`[watch]`, `[contextual]`, `[index]` — is honoured unchanged. Seven fields
 are restricted, because they decide which code runs, what is read or leaves
 the machine, and who can reach it:
 
@@ -263,6 +277,7 @@ the machine, and who can reach it:
 | `grammar_dir` | Ignored with a warning; the standard location is used. It selects which native library is `dlopen`ed into the process, and a grammar plugin is code, not data. Set for every untrusted config, present or not — omitting the key would otherwise be a way to influence the choice by saying nothing. If no standard location can be determined the key is dropped instead, and a command that needs a plugin then stops with a message naming `GROOVE_GRAMMAR_DIR`. |
 | `[parsers]` | Ignored with a warning; the default set — Markdown alone — is used. `enabled` decides which parsers run at all, so a config found beside a knowledge base could otherwise switch on the formats with the widest input surface (`pdf`, `xlsx`, `pptx`, `docx`) that the operator had left off, or name a language whose grammar plugin then gets `dlopen`ed. It is the switch `grammar_dir` only aims: no enabled language needs a plugin, and no plugin is looked for. Unlike the two above, an absent key needs no substitute — omitting `[parsers]` already lands on Markdown alone, which is where this rule puts it. `[parsers.code]` goes with it, having no parser left to configure. |
 | `[eval].golden` | Ignored with a warning; `groove eval` and `groove tune` fall back to `<kb_path>/.groove-eval.yml`, and `--golden` still applies. It names the file those commands read, and as an absolute path it can name any file on the machine. The read is bounded (1 MiB) and parsed as YAML, so what a planted path could expose is a bounded read surfaced through a parse error — not code execution — but a config found beside a knowledge base has no business choosing it. Like `[parsers]`, an absent key needs no substitute: the fallback is a constant under the knowledge base the run uses. The other `[eval]` keys are honoured. |
+| `[embedding]` | Ignored with a warning, restoring the built-in FastEmbed provider. An external endpoint receives document chunks while indexing and queries while searching, so only a config named with `--config` (or another trusted location above) may opt in to that outbound traffic. |
 
 The `kb_path` rule bounds rather than confines: `kb_path = "./docs"` and
 `kb_path = "/srv/kb/knowledge-base"` are fine, so a project-local
