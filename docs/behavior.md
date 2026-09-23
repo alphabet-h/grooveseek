@@ -6,7 +6,7 @@ which files are refused, and how search combines its two indexes.
 > **日本語版**: [behavior.ja.md](./behavior.ja.md)
 
 - **Embedding provider**: FastEmbed is the default. On first run, its selected ONNX model is downloaded to an OS-standard cache directory; subsequent runs reuse the cached model. Resolution order:
-  1. `FASTEMBED_CACHE_DIR` environment variable, if set (must be absolute; a relative value stops groove).
+  1. `FASTEMBED_CACHE_DIR` environment variable, if set (must be absolute; a non-empty relative value stops groove, an empty value counts as unset).
   2. OS cache dir joined with `fastembed` (Linux: `~/.cache/fastembed`, macOS: `~/Library/Caches/fastembed`, Windows: `%LOCALAPPDATA%\fastembed`).
 
   If neither can name an absolute directory, groove stops instead of loading a model relative to the working directory. A trusted `[embedding]` section can opt into an OpenAI-compatible HTTP endpoint instead; that endpoint receives document chunks and search queries. See [External OpenAI-compatible embeddings](usage.md#external-openai-compatible-embeddings).

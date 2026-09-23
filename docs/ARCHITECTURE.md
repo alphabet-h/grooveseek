@@ -121,7 +121,7 @@ Static Contextual Retrieval (feature-46) prepends a document-structure breadcrum
 
 `embedder.rs::resolve_cache_dir()` picks in order:
 
-1. `FASTEMBED_CACHE_DIR` env var (highest priority; must be absolute, and a relative value stops groove)
+1. `FASTEMBED_CACHE_DIR` env var (highest priority; must be absolute; a non-empty relative value stops groove, an empty value counts as unset)
 2. OS-standard cache directory joined with `fastembed`:
    - Linux: `~/.cache/fastembed`
    - macOS: `~/Library/Caches/fastembed`

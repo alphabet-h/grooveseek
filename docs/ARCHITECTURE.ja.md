@@ -120,7 +120,7 @@ v0.7.0 のフルパイプラインは **`RRF → reranker → MMR → parent ret
 
 `embedder.rs::resolve_cache_dir()` が以下の順で解決する:
 
-1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先。絶対パス必須で、相対パスなら groove は停止する)
+1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先。絶対パス必須。空でない相対パスなら停止、空文字は未設定扱い)
 2. OS 標準キャッシュディレクトリ + `fastembed`:
    - Linux: `~/.cache/fastembed`
    - macOS: `~/Library/Caches/fastembed`

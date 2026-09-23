@@ -6,7 +6,7 @@
 > **English version**: [behavior.md](./behavior.md)
 
 - **埋め込み provider**: 既定は FastEmbed。初回実行時、選択した ONNX モデルが OS 標準のキャッシュディレクトリに DL され、2 回目以降は再利用される。解決順:
-  1. `FASTEMBED_CACHE_DIR` 環境変数 (設定されていれば。絶対パス必須で、相対パスなら停止)
+  1. `FASTEMBED_CACHE_DIR` 環境変数 (設定されていれば。絶対パス必須。空でない相対パスなら停止、空文字は未設定扱い)
   2. OS キャッシュ + `fastembed` (Linux: `~/.cache/fastembed`、macOS: `~/Library/Caches/fastembed`、Windows: `%LOCALAPPDATA%\fastembed`)
 
   どちらも絶対パスのディレクトリを決められなければ、作業ディレクトリ相対でモデルを読み込むことはせず groove は停止する。信頼された `[embedding]` セクションを書けば、代わりに OpenAI 互換の HTTP endpoint を opt-in できる。その endpoint は document のチャンクと検索クエリを受け取る。[外部の OpenAI 互換 embedding](usage.ja.md#外部の-openai-互換-embedding) を参照

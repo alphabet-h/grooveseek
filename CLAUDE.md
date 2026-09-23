@@ -74,7 +74,7 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 `grooveseek/src/embedder.rs::resolve_cache_dir()` が以下の順でキャッシュディレクトリを決定する:
 
-1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先。絶対パス必須で、相対パスなら停止)
+1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先。絶対パス必須。空でない相対パスなら停止、空文字は未設定扱い)
 2. OS 標準キャッシュディレクトリ + `fastembed`
    - Linux: `~/.cache/fastembed`
    - macOS: `~/Library/Caches/fastembed`
