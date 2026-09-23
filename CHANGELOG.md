@@ -57,6 +57,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   schema at all; only a path where nothing exists counts as no schema now. A file whose own permissions
   refuse the read was already an error. `groove validate --schema <path>` is
   held to the same checks.
+- **`groove eval` words a refused golden or history file as a refusal.** The
+  message used to end in a line written for files that are skipped ("was
+  skipped"), though `eval` stops; it now ends in the reason alone, the way the
+  schema's refusal does. Which files `eval` refuses is unchanged.
 - **On Linux and macOS, `get_document` no longer opens a file whose name holds
   `..` between backslashes**, such as one literally named `a\..\b.md`. Its
   `kb://doc/` URI was already refused for the same reason: nothing that reads
