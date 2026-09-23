@@ -318,7 +318,9 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 ///    [`crate::resources::is_safe_relative`] に通す (空文字列も拒否)。絶対パス・
 ///    ドライブ指定・UNC・`..` は `Path::join` で `kb_path` の外を指すので、1 以降に
 ///    進めると KB 外を stat してから拒否することになり、文言の差が KB 外の存在を
-///    教えていた。拒否は 2b と同じ文言の [`ValidatePathOutcome::NotFound`]
+///    教えていた。Windows ではさらに `:` を含むもの (ドライブ指定・代替データ
+///    ストリーム) と予約デバイス名 (`NUL` / `COM1` など) も拒否する。拒否は 2b と
+///    同じ文言の [`ValidatePathOutcome::NotFound`]
 /// 1. **symlink reject** — `canonicalize` の前に拾う必要がある
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
 ///    - 2b. **canonical spelling** — canonical パスを kb_path 相対・`/` 区切り

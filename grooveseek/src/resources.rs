@@ -206,7 +206,9 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// as well -- and in return nothing downstream that reads `\` as a separator
 /// can ever be handed a `..`.
 ///
-/// On Windows a segment that names a device is refused as well
+/// On Windows two more things are refused: a colon anywhere
+/// ([`holds_a_windows_colon`] -- a drive or an alternate data stream, Codex
+/// round 2 on #319), and a segment that names a device
 /// ([`names_a_windows_device`]), so no request reaches the null device or a
 /// port by being spelled `NUL` or `COM1` (Codex round 1 on #319).
 pub(crate) fn is_safe_relative(p: &str) -> bool {
@@ -216,7 +218,7 @@ pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.contains('\\') && crate::indexer::backslash_separates_components() {
         return false;
     }
-    if p.starts_with('/') || starts_with_drive_designator(p) {
+    if p.starts_with('/') || holds_a_windows_colon(p) {
         return false;
     }
     !p.split(['/', '\\'])
@@ -262,20 +264,20 @@ const WINDOWS_DEVICE_NAMES: &[&str] = &[
 
 /// Whether `segment` is a name Windows can read as a device rather than a
 /// file -- `NUL`, `CON`, `COM1` and the rest -- in any case, followed by an
-/// extension, trailing spaces or dots, or a colon.
+/// extension or by trailing spaces or dots. The colon form, `NUL:`, never
+/// reaches here: [`holds_a_windows_colon`] refuses every colon first.
 ///
-/// **Windows only**, like [`starts_with_drive_designator`] and for the same
-/// reason: elsewhere these are ordinary names.
+/// **Windows only**, like [`holds_a_windows_colon`] and for the same reason:
+/// elsewhere these are ordinary names.
 ///
 /// The list is the reserved names of "Naming Files, Paths, and Namespaces"
 /// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>),
-/// which also says `NUL.txt` and `NUL.tar.gz` are both `NUL`. Three kinds are
+/// which also says `NUL.txt` and `NUL.tar.gz` are both `NUL`. Two kinds are
 /// added to it: `CONIN$` and `CONOUT$`, which Windows 11 (build 26200)
 /// reports as device names when they stand alone though the page does not
-/// list them; `COM0` and `LPT0`, which neither the page lists nor that build
-/// reads as devices, refused on the cautious side since the page's own
-/// namespace section shows a `COM0` device; and the trailing colon, since
-/// `<dir>\NUL:` becomes `\\.\NUL` there (all via `GetFullPathNameW` and
+/// list them; and `COM0` and `LPT0`, which neither the page lists nor that
+/// build reads as devices, refused on the cautious side since the page's own
+/// namespace section shows a `COM0` device (via `GetFullPathNameW` and
 /// `RtlIsDosDeviceName_U`, called from PowerShell on that build).
 ///
 /// How much of this a given Windows still does varies, which is why the rule
@@ -290,7 +292,7 @@ fn names_a_windows_device(segment: &str) -> bool {
         return false;
     }
     let stem = segment
-        .split(['.', ':'])
+        .split('.')
         .next()
         .unwrap_or("")
         .trim_end_matches(' ');
@@ -299,24 +301,34 @@ fn names_a_windows_device(segment: &str) -> bool {
         .any(|name| stem.eq_ignore_ascii_case(name))
 }
 
-/// Whether `p` opens with a Windows drive designator — `C:` — which escapes the
-/// knowledge base. Every form of it does, the drive-*relative* `C:notes.md`
-/// included, since that resolves against that drive's own current directory.
+/// Whether `p` holds a colon, on Windows, where a colon in a request can only
+/// be path syntax and never part of a name:
 ///
-/// **Windows only.** A drive designator is Windows path syntax, so applying the
-/// rule anywhere else refuses legal names for a danger that does not exist
-/// there: `a:b.md` and `C:/note.md` (a directory literally named `C:`) are both
+/// - a drive designator, which escapes the knowledge base in every form --
+///   `C:\x`, `C:/x`, and the drive-*relative* `C:notes.md`, which resolves
+///   against that drive's own current directory;
+/// - an alternate data stream of a file, `note.md:secret` or the default
+///   stream `note.md::$DATA` (Codex round 2 on #319), which the stat would
+///   answer about before the spelling check refused it;
+/// - the colon form of a device, `NUL:`, which becomes `\\.\NUL` behind a
+///   directory on Windows 11 build 26200 (via `GetFullPathNameW`, called from
+///   PowerShell on that build).
+///
+/// Refusing it anywhere loses no document: "Naming Files, Paths, and
+/// Namespaces" (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>)
+/// lists the colon among the characters a Windows file or directory name
+/// cannot contain, so no file the index walked has one. This replaces the
+/// drive-designator check that stood here, which it covers completely.
+///
+/// **Windows only.** Elsewhere a colon is an ordinary filename character:
+/// `a:b.md` and `C:/note.md` (a directory literally named `C:`) are both
 /// ordinary relative paths on Unix, and this module hands out URIs for them.
-/// Nothing is lost by the narrowing — the colon reaches here percent-decoded,
-/// the leading-slash check above already refuses Unix absolute paths, and a
-/// name with a colon in it is inside the knowledge base on Unix, wherever it is
+/// Nothing is lost by the narrowing -- the colon reaches here percent-decoded,
+/// the leading-slash check already refuses Unix absolute paths, and a name
+/// with a colon in it is inside the knowledge base on Unix, wherever it is
 /// then looked up.
-fn starts_with_drive_designator(p: &str) -> bool {
-    if !cfg!(windows) {
-        return false;
-    }
-    let b = p.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+fn holds_a_windows_colon(p: &str) -> bool {
+    cfg!(windows) && p.contains(':')
 }
 
 /// Percent-encode everything outside the unreserved set, leaving `/` as the
@@ -573,6 +585,31 @@ mod tests {
             "a/connect/b.md",
         ] {
             assert!(is_safe_relative(p), "{p:?} is an ordinary name");
+        }
+    }
+
+    /// A colon anywhere is refused on Windows, where no file or directory name
+    /// can hold one: in a request it can only open a drive or an alternate
+    /// data stream of a file (Codex round 2 on #319). The URI side refuses it
+    /// too, raw and percent-encoded.
+    #[cfg(windows)]
+    #[test]
+    fn a_colon_anywhere_is_refused_on_windows() {
+        for p in ["note.md:secret", "note.md::$DATA", "a/b.md:x.md"] {
+            assert!(!is_safe_relative(p), "{p:?} names a stream on Windows");
+            assert_eq!(parse(&doc_uri(p)), None, "{p:?}");
+            assert_eq!(parse(&format!("kb://doc/{p}")), None, "{p:?} unencoded");
+        }
+    }
+
+    /// On Unix a colon is an ordinary filename character, so the same inputs
+    /// are names a file can have.
+    #[cfg(unix)]
+    #[test]
+    fn a_colon_is_an_ordinary_character_on_unix() {
+        for p in ["note.md:secret", "note.md::$DATA", "a/b.md:x.md"] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name on Unix");
+            assert_eq!(parse(&doc_uri(p)), Some(ResourceUri::Doc(p.to_string())));
         }
     }
 

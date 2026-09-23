@@ -3836,6 +3836,29 @@ mod tests {
         }
     }
 
+    /// (AW-01, Codex round 2 on #319) An alternate data stream gets the answer
+    /// a misspelling gets, before the first stat. `note.md::$DATA` is the
+    /// document's own default stream -- the stat finds it -- and
+    /// `note.md:secret` is a named one that may or may not exist, so looking
+    /// would answer differently for the two.
+    #[cfg(windows)]
+    #[test]
+    fn windows_alternate_data_streams_are_refused_before_the_disk_is_touched() {
+        let t = KbWithOutside::new("gd-win-ads");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        fs::write(t.kb.join("note.md"), "# Note\n").unwrap();
+
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        for rel in ["note.md:secret", "note.md::$DATA", "a/b.md:x.md"] {
+            assert_eq!(
+                ask_for_document(&t.kb, rel),
+                misspelled,
+                "{rel:?} must be refused by what it says, not by what is there"
+            );
+        }
+    }
+
     /// (AW-01) Inside the best-practice tool's template loop
     /// ([`resolve_best_practice_path`]) the same refusal is a miss, not a
     /// security event: the next template is tried.

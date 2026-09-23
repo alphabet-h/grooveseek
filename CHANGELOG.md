@@ -26,8 +26,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   use that to learn which files exist outside the knowledge base, and on
   Windows a UNC path made the server reach out to the host it named. A request
   that cannot name anything inside the knowledge base — absolute, empty,
-  holding a `..` segment, and on Windows a drive, a UNC share, a backslash or
-  a reserved device name such as `NUL`, `CON` or `COM1` in any segment —
+  holding a `..` segment, and on Windows a drive, a UNC share, a backslash, a
+  colon anywhere (an alternate data stream such as `note.md:secret`) or a
+  reserved device name such as `NUL`, `CON` or `COM1` in any segment —
   is now refused before anything on disk is looked at, with the answer a
   misspelled path already gets. It is the rule `kb://doc/` URIs were already
   held to. `get_best_practice` skips such a template like a missing one and
@@ -66,7 +67,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   served**, even where the file can exist: a `CON.md` or a directory named
   `aux` is refused by `get_document` and gets no `kb://doc/` URI. Windows
   documents these names as reserved, and depending on the version reads them
-  as devices rather than files.
+  as devices rather than files. A colon anywhere in the path is refused there
+  too, which loses no document — no Windows file name can hold one — but
+  closes the alternate data streams of a document (`note.md:secret`,
+  `note.md::$DATA`) to `get_document`.
 - **On Linux and macOS, `get_document` no longer opens a file whose name holds
   `..` between backslashes**, such as one literally named `a\..\b.md`. Its
   `kb://doc/` URI was already refused for the same reason: nothing that reads
