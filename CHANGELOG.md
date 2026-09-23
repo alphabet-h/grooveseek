@@ -83,6 +83,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `kb://doc/` URI was already refused for the same reason: nothing that reads
   `\` as a separator is ever handed a `..`.
 
+### Fixed
+
+- **`groove tune` embeds its golden queries the way a search embeds a query.**
+  It embedded them as documents, so with `provider = "openai-compatible"` and a
+  `query_model` that differs from `document_model` the queries went to
+  `document_model`, and every condition in the sweep was measured with query
+  vectors no search uses — without a word about it. They now go to
+  `query_model`, in batches of at most 64 as documents already did. FastEmbed,
+  and an endpoint configured with one `model` for both roles, get exactly the
+  vectors they got before. The library gains `Embedder::embed_queries` for
+  embedding several queries at once; `embed_texts` stays the document side.
+
 ## [1.13.0] - 2026-09-23
 
 ### Added
