@@ -320,7 +320,11 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 ///    進めると KB 外を stat してから拒否することになり、文言の差が KB 外の存在を
 ///    教えていた。Windows ではさらに `:` を含むもの (ドライブ指定・代替データ
 ///    ストリーム) と予約デバイス名 (`NUL` / `COM1` など) も拒否する。拒否は 2b と
-///    同じ文言の [`ValidatePathOutcome::NotFound`]
+///    同じ文言の [`ValidatePathOutcome::NotFound`]。保証するのは「KB の外を指す
+///    綴りを FS に触る前に拒否する」ところまで。KB の中の別綴り (`./`・`//`、
+///    Windows では `.` の区間や末尾のドット / 空白) は step 0 を通り、FS に触った
+///    後で 2b が拒否する — 触るのは KB の中だけで、応答から分かるのも KB の中の
+///    その場所に何かがあるかどうかだけ
 /// 1. **symlink reject** — `canonicalize` の前に拾う必要がある
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
 ///    - 2b. **canonical spelling** — canonical パスを kb_path 相対・`/` 区切り
@@ -410,6 +414,13 @@ pub(crate) fn validate_get_document_path(
     // the index does store and which is given up here for the reason the URI
     // parser gives it up: nothing that reads `\` as a separator is ever handed
     // a `..`.
+    //
+    // What this guarantees is that a spelling leading out of the knowledge
+    // base is never looked at. Another spelling of a path inside it -- `./a.md`,
+    // `a//b.md`, on Windows a `.` segment or trailing dots and spaces -- passes
+    // here and is refused by the spelling check (2b) after the look. That look
+    // stays inside the knowledge base, and the reply can tell only whether
+    // something is at that place in it.
     //
     // The rule is the one the `kb://` URI parser applies
     // ([`crate::resources::is_safe_relative`]), not a second copy of it. The

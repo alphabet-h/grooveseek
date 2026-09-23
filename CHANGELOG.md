@@ -32,7 +32,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is now refused before anything on disk is looked at, with the answer a
   misspelled path already gets. It is the rule `kb://doc/` URIs were already
   held to. `get_best_practice` skips such a template like a missing one and
-  tries the next. One route keeps the two replies apart: a directory symlink
+  tries the next. What is kept from the disk is a spelling that leads out of
+  the knowledge base. Another spelling of a path inside it — `./a.md`,
+  `a//b.md`, and on Windows a `.` segment or trailing dots and spaces, which
+  Windows resolves to the same file — is still looked at first, inside the
+  knowledge base only, and refused by the spelling check that follows; what
+  that reply can tell is whether something is at that place in the knowledge
+  base, which asking under the path's own spelling tells anyway. One route
+  keeps the two replies apart: a directory symlink
   (or on Windows a junction) placed inside the knowledge base that leads out
   of it still gets "outside the knowledge base" when something is at the far
   end and "File not found" when nothing is — but that route needs write access

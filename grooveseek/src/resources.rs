@@ -182,7 +182,11 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// is looked at (AW-01): `Path::join` replaces the knowledge base with an
 /// absolute right-hand side, so an absolute path, a drive or a UNC share would
 /// otherwise be stat'ed wherever it points -- outside the knowledge base, or
-/// across the network on Windows. Neither surface keeps a copy of the rule
+/// across the network on Windows. What it keeps from the disk is a path that
+/// leads out of the knowledge base: another spelling of a path inside it
+/// (`./a.md`, `a//b.md`, on Windows trailing dots or spaces) passes here, and
+/// the document path check refuses it after a look that stays inside. Neither
+/// surface keeps a copy of the rule
 /// (AGENTS.md, "One question gets one implementation"). The empty string
 /// passes here and each caller decides about it: [`parse`] reads it as the
 /// root topic group, while [`doc_is_addressable`] and the document path check
