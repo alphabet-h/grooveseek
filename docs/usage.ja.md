@@ -23,6 +23,49 @@ groove index --kb-path /path/to/knowledge-base --model bge-m3 --force  # BGE-M3 
 
 既存インデックスでのモデル切替には `--force` が必須 (DB の `index_meta` テーブルにモデル / 次元が記録されており、不一致時は起動が拒否される)。
 
+### 外部の OpenAI 互換 embedding
+
+既定は FastEmbed のままで、embedding の推論はプロセス内で行われる。代わりに HTTP の
+embedding サービスを使うには、groove が信頼する `groove.toml` に `[embedding]`
+セクションを書き、そのファイルがプロジェクトローカルなら `--config` で名指しする:
+
+```toml
+[embedding]
+provider = "openai-compatible"
+endpoint = "http://127.0.0.1:8001/v1/embeddings"
+query_model = "query-model"
+document_model = "document-model"
+dimension = 768
+request_dimensions = false
+timeout_seconds = 60
+```
+
+endpoint はインデックス時に document のチャンクを、検索時に検索テキストを受け取る。
+groove がカレントディレクトリや Git の祖先で**見つけただけ**の config では、この
+セクションは無視されて FastEmbed に戻る。[信頼する置き場所 / しない置き場所](configuration.ja.md#信頼する置き場所--しない置き場所)
+を参照。
+
+各リクエストは OpenAI 互換の `POST /v1/embeddings` の JSON 形 (`model` と `input`)
+を使う。任意の `dimensions` 欄に対応した endpoint に限り、`request_dimensions = true`
+にする。両 role 共通の `model` alias を 1 つ書くか、上の例のように `query_model` と
+`document_model` を両方書く。`dimension` は必須: groove は HTTP provider を作る前に
+この値でベクトル索引を開くか検証し、その後はベクトルの長さが異なるレスポンスを
+すべて拒否する。リクエストは 1 回あたり最大 64 入力のバッチで送る。groove は
+endpoint を probe しない (次元を必須にし probe しない理由は
+[ADR-0022](decisions/0022-embedding-provider-boundary.ja.md))。任意の `api_key` は
+bearer token として送られる。`GROOVE_EMBEDDING_API_KEY` が設定されていればそちらが
+優先され、token をファイルに書かずに済む。
+
+provider、どちらかの model alias、または次元を変えると、実行時の設定が既存インデックスと
+合わなくなり `groove index --force` が必要になる。`endpoint`、`api_key`、
+`request_dimensions`、`timeout_seconds` を変えてもそうはならない。これらは記録される identity に含まれないので、alias の背後の
+model が変わっても groove には分からない。endpoint が同じ alias で別の model を返すように
+なったら、自分で `groove index --force` を実行すること。そうしないと、古い document の
+ベクトルと新しいクエリのベクトルがエラーも出ずに一緒に検索される。`--model` は従来どおりの意味を保ち、
+その 1 回の実行に限って FastEmbed を選び、`[embedding]` を上書きする。トップレベルの
+`model` キーは FastEmbed 専用で、`provider = "openai-compatible"` と同時に書いた config は
+groove が拒否する。provider を切り替える時はこのキーを消すこと。
+
 `--force` は、SQLite として開けなくなった `.groove.db` の修復手段でもある (書き込み途中の切断や、migration 中に kill されたプロセスで起きる)。その状態では file を開くすべてのコマンドが、file の場所 (`--kb-path` の**親ディレクトリ**にある) と 2 通りの直し方を message で示して失敗する: file を消して `groove index` を実行するか、`groove index --force` を実行する。後者は file と `-wal` / `-shm` の付随 file を置き換えて最初から作り直す。索引は corpus から完全に導出できるので失うものは無い。`--force` 無しでは file に触らない。
 
 ### 進捗出力フラグ (v0.7.8+)

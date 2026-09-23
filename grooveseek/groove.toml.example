@@ -124,11 +124,11 @@
 
 # Optional OpenAI-compatible embedding endpoint. Omit this section to keep
 # FastEmbed as the default, with no embedding traffic leaving the process.
-# Document chunks are sent while indexing and queries while searching, so this
-# section is honoured only from a trusted config (see "TRUST" above). Name a
-# project-local file with `--config` to opt in. `endpoint` is the full URL,
-# including `/v1/embeddings`; groove does not probe it to discover the model or
-# dimension. Use `model` for both roles, or set both role-specific aliases.
+# The endpoint receives every indexed chunk and every query, so this section is
+# honoured only from a trusted config (see "TRUST" above; reasons in ADR-0022).
+# Name a project-local file with `--config` to opt in. `endpoint` is the full
+# URL, including `/v1/embeddings`; `dimension` is required because groove never
+# probes it. Use `model` for both roles, or set both role-specific aliases.
 # `GROOVE_EMBEDDING_API_KEY` overrides `api_key` when present.
 #[embedding]
 #provider = "openai-compatible"

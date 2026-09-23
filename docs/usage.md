@@ -53,14 +53,23 @@ or set both `query_model` and `document_model` as above. `dimension` is mandator
 groove uses it to open or validate the vector index before constructing the
 HTTP provider, then rejects any response whose vectors have a different size.
 Requests are sent in batches of at most 64 inputs. Groove does not probe the
-endpoint. An optional `api_key` is sent as a bearer token;
-`GROOVE_EMBEDDING_API_KEY` takes precedence and avoids storing the token in the
-file.
+endpoint; the reasoning is in
+[ADR-0022](decisions/0022-embedding-provider-boundary.md). An optional
+`api_key` is sent as a bearer token; `GROOVE_EMBEDDING_API_KEY` takes
+precedence and avoids storing the token in the file.
 
 Changing provider, either model alias, or dimension makes the runtime
 incompatible with the existing index and requires `groove index --force`.
+Changing `endpoint`, `api_key`, `request_dimensions` or `timeout_seconds` does
+not, because they are not part of the recorded identity, so groove cannot tell
+when the model behind an alias changes. If the endpoint starts serving a
+different model under the same alias, run `groove index --force` yourself;
+otherwise old document vectors and new query vectors are searched together
+without an error.
 `--model` keeps its historical meaning and selects FastEmbed for that one
-invocation, overriding `[embedding]`.
+invocation, overriding `[embedding]`. The top-level `model` key belongs to
+FastEmbed alone: groove refuses a config that sets it together with
+`provider = "openai-compatible"`, so remove it when switching providers.
 
 `--force` is also the repair for a `.groove.db` that cannot be opened as a database — a truncated write or a process killed mid-migration is enough. Any command that opens the file then fails with a message naming the file (it lives in the **parent** of `--kb-path`) and the two ways out: delete it and run `groove index`, or run `groove index --force`, which replaces the file and its `-wal` / `-shm` sidecars and rebuilds from scratch. The index is entirely derived from the corpus, so nothing is lost. Without `--force` the file is never touched.
 

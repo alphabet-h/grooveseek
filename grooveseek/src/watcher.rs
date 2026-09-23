@@ -12,10 +12,18 @@
 //!        │  tokio::mpsc::UnboundedSender
 //!        ▼
 //!   tokio task (run_watch_loop)
+//!        │  one spawn_blocking per event batch
+//!        ▼
+//!   handle_events (blocking pool)
 //!        │  classify events, lookup Mutex<Database> / Mutex<Embedder>
 //!        ▼
 //!   indexer::{reindex,deindex,rename}_single_file
 //! ```
+//!
+//! [`crate::watcher::run_watch_loop`] hands each event batch to `tokio::task::spawn_blocking`
+//! because [`crate::watcher::handle_events`] locks the embedder and, with the OpenAI-compatible
+//! provider, may build a blocking HTTP client on its first embed call; doing
+//! either on a tokio worker thread would block it (the client build panics).
 //!
 //! The bridge thread is necessary because `notify-debouncer-full` ships with
 //! `std::sync::mpsc` and must run synchronously. Keeping the dispatch side on

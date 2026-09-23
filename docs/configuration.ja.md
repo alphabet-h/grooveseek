@@ -47,6 +47,21 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # `[]` を明示すると全ディレクトリを走査する。
 # exclude_dirs = [".obsidian", ".git", "node_modules", "target", ".vscode", ".idea", "dist", ".next"]
 
+# 任意の外部 embedding provider。このセクションが無ければ FastEmbed が既定のまま。
+# `endpoint` は OpenAI 互換 embeddings の完全な URL で、document のチャンクと
+# 検索クエリがそこへ送られる。共通の `model` を 1 つ書くか、role 別の alias を
+# 両方書く。`dimension` は必須で、endpoint を事前に probe することなく
+# 毎回のレスポンスで検査される。
+# [embedding]
+# provider = "openai-compatible"
+# endpoint = "http://127.0.0.1:8001/v1/embeddings"
+# query_model = "query-model"
+# document_model = "document-model"
+# dimension = 768
+# request_dimensions = false
+# api_key = "secret" # GROOVE_EMBEDDING_API_KEY が優先
+# timeout_seconds = 60
+
 # チャンク単位の品質フィルタ。既定で有効、閾値 0.3。
 # `enabled = false` で 従来挙動 (全チャンク返却) に戻せる。
 [quality_filter]
@@ -207,7 +222,7 @@ bind = "127.0.0.1:3100"
 # enabled = true
 ```
 
-この設定ファイルを置けば `groove serve` / `index` / `status` / `graph` / `search` のどれも対応フラグを省略して動かせる — **ただし groove がその置き場所を信頼する場合**。プロジェクトルートや `.git` 祖先に置く = groove が**見つけただけ**なので、見せ方に関するキーはそのまま効くが、`kb_path` / `[parsers]` / `grammar_dir` / `fastembed_cache_dir` / `[transport.http]` のゲートは安全な既定へ戻される。丸ごと効かせたいなら名指しすること — `groove --config ./groove.toml index`。どのキーがなぜ制限されるかは [信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。**まず直すべきは `index`** — parser 集合が対象外にした拡張子の document を削除するため。未知のキーはタイポ対策のため拒否される。`FASTEMBED_CACHE_DIR` の実環境変数は設定ファイルの同項目より優先される。
+この設定ファイルを置けば `groove serve` / `index` / `status` / `graph` / `search` のどれも対応フラグを省略して動かせる — **ただし groove がその置き場所を信頼する場合**。プロジェクトルートや `.git` 祖先に置く = groove が**見つけただけ**なので、見せ方に関するキーはそのまま効くが、`kb_path` / `[parsers]` / `[embedding]` / `grammar_dir` / `fastembed_cache_dir` / `[transport.http]` のゲートは安全な既定へ戻される。丸ごと効かせたいなら名指しすること — `groove --config ./groove.toml index`。どのキーがなぜ制限されるかは [信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。**まず直すべきは `index`** — parser 集合が対象外にした拡張子の document を削除するため。未知のキーはタイポ対策のため拒否される。`FASTEMBED_CACHE_DIR` と `GROOVE_EMBEDDING_API_KEY` の実環境変数は、設定ファイルのそれぞれの項目より優先される。
 
 ## 設定ファイルの探索順
 
@@ -242,7 +257,7 @@ bind = "127.0.0.1:3100"
 
 信頼しない config も**読み込みはする**。KB の見せ方を決めるだけのもの
 (`[search]` / `[quality_filter]` / `exclude_dirs` / `[watch]` /
-`[contextual]` / `[index]`) はそのまま効く。制限するのは 6 つだけで、これらは「どのコードを
+`[contextual]` / `[index]`) はそのまま効く。制限するのは 7 つだけで、これらは「どのコードを
 実行するか」「何を読み、何が外に出るか」「誰から届くか」を決めるため:
 
 | フィールド | 信頼しない config の場合 |
@@ -253,6 +268,7 @@ bind = "127.0.0.1:3100"
 | `grammar_dir` | 警告して無視し、標準の置き場を使う。プロセスへ `dlopen` されるネイティブライブラリを選ぶ値であり、grammar plugin はデータではなくコードであるため。**キーの有無に関わらず必ず設定する** — 書かないことで選択に影響できてしまうため。標準の置き場が決められない場合は代わりにキーを落とし、plugin を必要とするコマンドが `GROOVE_GRAMMAR_DIR` を案内して停止する |
 | `[parsers]` | 警告して無視し、既定の集合 (Markdown のみ) を使う。`enabled` は**そもそもどの parser を走らせるか**を決めるので、KB の隣で見つかった config が、運用者が外していた最も入力面の広い形式 (`pdf` / `xlsx` / `pptx` / `docx`) を再有効化したり、grammar plugin が `dlopen` される言語を名指ししたりできてしまう。`grammar_dir` が向きだけを決めているスイッチがこちら — 有効な言語が plugin を必要としなければ、plugin は探されない。上 2 つと違い**キーが無い場合の差し替えは不要** — `[parsers]` を省略した時点で Markdown のみに落ちており、この規則が行き着く先と同じだから。`[parsers.code]` も一緒に落ちる (設定する対象の parser が残らないため) |
 | `[eval].golden` | 警告して無視し、`groove eval` / `groove tune` は `<kb_path>/.groove-eval.yml` に落ちる。`--golden` は従来どおり効く。この値は**それらのコマンドが読むファイル**を名指しするもので、絶対パスならマシン上のどのファイルでも指せる。読みは 1 MiB で bound され YAML として parse されるので、植えられたパスが晒せるのは「bound された読み出しの中身が parse error 経由で表に出る」までで、コード実行ではない — それでも、KB の隣で見つかった config が選んでよいものではない。`[parsers]` と同じく**キーが無い場合の差し替えは不要** — 落ちた先は実行時の KB に対する定数だから。`[eval]` の他のキーはそのまま効く |
+| `[embedding]` | 警告して無視し、組み込みの FastEmbed provider に戻す。外部 endpoint はインデックス時に document のチャンクを、検索時にクエリを受け取るので、その外向き通信を opt-in できるのは `--config` で名指しした config (または上に挙げた他の信頼する置き場所) だけ |
 
 `kb_path` の規則は「閉じ込め」ではなく「境界弾き」で、`kb_path = "./docs"` も
 `kb_path = "/srv/kb/knowledge-base"` も通る (project-local な `groove.toml` に

@@ -362,7 +362,9 @@ both sides**: `seed_strategy` takes `all_chunks` and `all-chunks` either way.
 
 Changing which model is used by default is a **major** change. The model identifier
 is recorded in the index and must match exactly at startup, so a new default would
-stop every existing installation from starting until it reindexed.
+stop every existing installation from starting until it reindexed. Changing the
+default provider (FastEmbed) is a **major** change for the same reason: the
+identity recorded in the index would no longer match.
 
 ### Names that land on your machine
 
