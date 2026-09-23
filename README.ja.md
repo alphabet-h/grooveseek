@@ -14,7 +14,7 @@ Markdown のナレッジベース — opt-in でプレーンテキスト / PDF /
 [![docs](https://img.shields.io/badge/docs-grooveseek.github.io-blue)](https://alphabet-h.github.io/grooveseek/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#ライセンス)
 
-YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`、v1.2.0 以降は Rust のソース、grammar を自分で置けば v1.3.0 以降は Python、v1.5.0 以降は PHP も) をパースし、見出し単位で — ソースコードなら定義 1 つを 1 chunk として — チャンク化、選択可能な埋め込みモデル (既定は BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
+YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`、v1.2.0 以降は Rust のソース、grammar を自分で置けば v1.3.0 以降は Python、v1.5.0 以降は PHP も) をパースし、見出し単位で — ソースコードなら定義 1 つを 1 chunk として — チャンク化、既定では FastEmbed (BGE-small-en-v1.5、多言語 / 日本語向けには BGE-M3) でベクトルを生成して、sqlite-vec 搭載の SQLite に格納する。信頼された設定を書けば、代わりに [OpenAI 互換 embedding endpoint](docs/usage.ja.md#外部の-openai-互換-embedding) を opt-in できる。stdio (既定、1 クライアント) または Streamable HTTP (複数クライアント) トランスポート経由で Claude Code / Cursor など MCP 互換クライアントに接続する。
 
 ライブ同期ファイルウォッチャにより、手動編集・`git pull`・外部スクリプトによる変更でもインデックスが最新に保たれる。`groove validate` で任意の TOML スキーマに基づく frontmatter 検証も可能。v1.9.0 以降はスキーマが宣言した追加の key (`title` / `date` / `topic` / `depth` / `tags` 以外) を `groove index` が保存し、`groove search --field` で絞り込める。
 
@@ -55,7 +55,7 @@ YAML frontmatter 付きの Markdown (および任意で `.txt` / `.pdf` / `.docx
 
 各アーカイブにはバイナリの他に `CHANGELOG.md` / `LICENSE-MIT` / `LICENSE-APACHE` / `THIRD-PARTY-LICENSES.md` (リンクされている全 crate の notice) / `README.md` が同梱される。実行前にリリースに添付された `sha256.sum` または各アーカイブ用 `*.sha256` で SHA-256 チェックサムを照合すること。アーカイブには GitHub の artifact attestation も付いており、`gh attestation verify <archive> --repo alphabet-h/grooveseek` で「この repo の GitHub Actions が build した物か」を検証できる。
 
-ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](docs/clients.ja.md#huggingface-の-tls-失敗への対処-初回-dl-時) を参照。
+ONNX runtime と SQLite はバイナリに静的リンクされているので、追加 DLL は不要。既定の FastEmbed provider では、Embedding モデル (ONNX) は初回実行時に HuggingFace から DL される — ネットワークがそれをブロックする場合は [HuggingFace の TLS 失敗への対処](docs/clients.ja.md#huggingface-の-tls-失敗への対処-初回-dl-時) を参照。
 
 ### ソースからビルド
 

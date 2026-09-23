@@ -42,6 +42,40 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   can be moved to a worker thread but not shared behind an `Arc` without a
   `Mutex`. The Rust API remains outside the compatibility promise
   ([docs/stability.md](docs/stability.md)).
+- **Embeddings can come from an OpenAI-compatible HTTP endpoint instead of
+  FastEmbed, opted into with `[embedding]` in a trusted `groove.toml`.**
+  `provider = "openai-compatible"` selects it; `endpoint` is the full
+  embeddings URL (including `/v1/embeddings`); one `model` serves both roles,
+  or `query_model` and `document_model` name them separately. `dimension` is
+  required and every response is checked against it; `request_dimensions`
+  (default `false`) sends the optional `dimensions` field; `api_key` is sent
+  as a bearer token, and `GROOVE_EMBEDDING_API_KEY` takes precedence so the
+  token need not be stored in the file; `timeout_seconds` defaults to 60.
+  Requests carry at most 64 inputs, and groove never probes the endpoint to
+  discover a model or dimension. The endpoint receives every chunk that is
+  indexed and every search query, which is why only a trusted config may turn
+  it on (see Security below). Nothing changes for a config without the
+  section: FastEmbed remains the default, and `--model` keeps selecting
+  FastEmbed for the invocation it is given to, overriding `[embedding]`. A
+  top-level `model` key is FastEmbed's alone: a config that also selects
+  `provider = "openai-compatible"` is refused until that key is removed. The
+  embedder now sits behind an internal provider boundary (#314), and the Rust
+  API remains outside the compatibility promise. Reasoning:
+  [ADR-0022](docs/decisions/0022-embedding-provider-boundary.md).
+  See [docs/usage.md](docs/usage.md#external-openai-compatible-embeddings).
+  (#316)
+
+### Security
+
+- **An `[embedding]` section in a config groove merely discovered is ignored.**
+  A `groove.toml` found under the current directory or a Git ancestor, outside
+  a trusted location, has the section dropped with a warning, restoring
+  FastEmbed, because an external endpoint would receive the knowledge base's
+  chunks and the queries made against it. Only a config named with
+  `--config`, or another
+  [trusted location](docs/configuration.md#trusted-and-untrusted-config-locations),
+  may opt into that outbound traffic. The fields an untrusted config cannot
+  set go from six to seven. (#316)
 
 ### Fixed
 
@@ -83,6 +117,24 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   directory names, no longer drops it either. To name the file in
   `.grooveignore` or `path_globs`, remember that `\` in a pattern is an escape
   there: write `secret\\pay.md`, or use a wildcard such as `secret*`.
+- **Changing the embedding provider, either model alias or the dimension
+  requires `groove index --force`.** Each of them is part of the identity
+  recorded in the index, so a runtime that differs in any of them is
+  refused as incompatible, the way switching `--model` always was. The hint
+  that refusal prints now names `--config`, since an external provider is
+  configured there rather than on the command line. An index built with the
+  default FastEmbed model is unaffected. (#316)
+- **`GROOVE_EMBEDDING_API_KEY` joins the frozen environment variables** in
+  [docs/stability.md](docs/stability.md). Changing the default provider is a
+  major change for the same reason changing the default model is. (#316)
+- **`groove` now links reqwest 0.13's blocking client and the aws-lc-rs crypto
+  backend of rustls, even when no external provider is configured.** This is
+  estimated from `Cargo.lock`, not measured: before this release those crates
+  were reached only through the Windows-only tray binary, so on Linux and
+  macOS they are new to the release assets. (#316)
+- **A `groove.toml` that carries `[embedding]` stops v1.12.0 and earlier from
+  starting.** Unknown keys are rejected, so share such a config only with
+  binaries from this release on. (#316)
 
 ## [1.12.0] - 2026-09-20
 

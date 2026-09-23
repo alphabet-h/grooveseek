@@ -449,11 +449,13 @@ impl Embedder {
     /// デフォルトモデル ([`ModelChoice::default`]) で初期化する。
     ///
     /// Cache directory resolution (in order):
-    /// 1. `FASTEMBED_CACHE_DIR` environment variable if set
+    /// 1. `FASTEMBED_CACHE_DIR` environment variable if set (must be absolute)
     /// 2. OS-standard cache directory joined with `fastembed`
     ///    (Linux: `~/.cache/fastembed`, macOS: `~/Library/Caches/fastembed`,
     ///    Windows: `%LOCALAPPDATA%\fastembed`)
-    /// 3. `.fastembed_cache` relative to the working directory (fastembed's own default)
+    ///
+    /// If neither names an absolute directory, this returns an error instead of
+    /// loading a model relative to the working directory (see `cache_dir_from`).
     pub fn new() -> Result<Self> {
         Self::with_model(ModelChoice::default())
     }

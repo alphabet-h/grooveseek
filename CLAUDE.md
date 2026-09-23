@@ -74,12 +74,13 @@ Windows では `groove.exe` になる。ONNX runtime (`ort-sys`) は静的リン
 
 `grooveseek/src/embedder.rs::resolve_cache_dir()` が以下の順でキャッシュディレクトリを決定する:
 
-1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先)
+1. `FASTEMBED_CACHE_DIR` 環境変数 (最優先。絶対パス必須で、相対パスなら停止)
 2. OS 標準キャッシュディレクトリ + `fastembed`
    - Linux: `~/.cache/fastembed`
    - macOS: `~/Library/Caches/fastembed`
    - Windows: `%LOCALAPPDATA%\fastembed`
-3. `.fastembed_cache/` (CWD 直下、最終フォールバック)
+
+1 と 2 のどちらも絶対パスを決められなければ、groove は CWD 相対でモデルを読まずに停止する (CWD の `.fastembed_cache` フォールバックは無い)。
 
 初回実行時に HuggingFace hub 互換キャッシュが作られる (BGE-small: ~130 MB、BGE-M3: ~2.3 GB、BGE-reranker-v2-m3: ~2.3 GB)。2 回目以降は再 DL されない。TLS 接続エラー時は [docs/clients.ja.md](./docs/clients.ja.md) の「HuggingFace の TLS 失敗への対処」節の迂回手順を参照。
 
