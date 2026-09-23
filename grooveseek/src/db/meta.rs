@@ -528,13 +528,21 @@ impl Database {
                 // init 時に meta が無くて vec_chunks を作れなかったケースをここで補う。
                 self.ensure_vec_chunks_table(dim)
             }
-            Some((db_model, db_dim)) => anyhow::bail!(
-                "embedding model mismatch.\n  \
-                 DB was indexed with: {db_model} ({db_dim} dim)\n  \
-                 Current runtime:     {model} ({dim} dim)\n\n\
-                 Run `groove index --kb-path <path> --force --model {model}` to rebuild the index, \
-                 or switch back to the previous model."
-            ),
+            Some((db_model, db_dim)) => {
+                let rebuild = if crate::embedder::ModelChoice::from_model_id(model).is_ok() {
+                    format!(
+                        "Run `groove index --kb-path <path> --force --model {model}` to rebuild the index"
+                    )
+                } else {
+                    "Run `groove --config <cfg> index --kb-path <path> --force` with the current embedding configuration to rebuild the index".to_string()
+                };
+                anyhow::bail!(
+                    "embedding model mismatch.\n  \
+                     DB was indexed with: {db_model} ({db_dim} dim)\n  \
+                     Current runtime:     {model} ({dim} dim)\n\n\
+                     {rebuild}, or switch back to the previous provider/model."
+                )
+            }
         }
     }
 

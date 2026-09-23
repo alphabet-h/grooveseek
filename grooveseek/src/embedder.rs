@@ -1,9 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fastembed::{
     EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::db::SearchResult;
 
@@ -28,6 +31,12 @@ pub enum ModelChoice {
 }
 
 impl ModelChoice {
+    /// Parse the stable model id shared by configuration and CLI values.
+    pub(crate) fn from_model_id(model: &str) -> Result<Self> {
+        <Self as clap::ValueEnum>::from_str(model, false)
+            .map_err(|error| anyhow::anyhow!("unsupported FastEmbed model {model:?}: {error}"))
+    }
+
     pub fn model_id(self) -> &'static str {
         match self {
             Self::BgeSmallEnV15 => "bge-small-en-v1.5",
@@ -74,9 +83,8 @@ impl ModelChoice {
 
 /// Resolved settings for the embedding provider used by one command.
 ///
-/// FastEmbed is currently the only provider. Keeping its construction behind
-/// these settings lets another implementation be added without making the
-/// current provider the special case.
+/// The provider identity is resolved before construction so index compatibility
+/// checks never need to contact an external endpoint.
 #[derive(Clone, Debug)]
 pub struct EmbeddingSettings {
     provider: ProviderSettings,
@@ -86,6 +94,7 @@ pub struct EmbeddingSettings {
 #[derive(Clone, Debug)]
 enum ProviderSettings {
     FastEmbed(ModelChoice),
+    OpenAiCompatible(OpenAiCompatibleConfig),
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +115,17 @@ impl EmbeddingSettings {
         }
     }
 
+    /// Build settings for an OpenAI-compatible HTTP provider.
+    pub fn openai_compatible(config: OpenAiCompatibleConfig) -> Self {
+        Self {
+            identity: EmbeddingIdentity {
+                model_id: config.index_model_id.clone(),
+                dimension: config.dimension,
+            },
+            provider: ProviderSettings::OpenAiCompatible(config),
+        }
+    }
+
     /// Stable identity recorded in `index_meta` and evaluation history.
     pub fn model_id(&self) -> &str {
         &self.identity.model_id
@@ -113,6 +133,101 @@ impl EmbeddingSettings {
 
     pub fn dimension(&self) -> usize {
         self.identity.dimension
+    }
+}
+
+/// Fully resolved configuration for an OpenAI-compatible embedding endpoint.
+#[derive(Clone)]
+pub struct OpenAiCompatibleConfig {
+    endpoint: String,
+    endpoint_display: String,
+    query_model: String,
+    document_model: String,
+    dimension: usize,
+    request_dimensions: bool,
+    api_key: Option<String>,
+    timeout: Duration,
+    index_model_id: String,
+}
+
+impl fmt::Debug for OpenAiCompatibleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiCompatibleConfig")
+            .field("endpoint", &self.endpoint_display)
+            .field("query_model", &self.query_model)
+            .field("document_model", &self.document_model)
+            .field("dimension", &self.dimension)
+            .field("request_dimensions", &self.request_dimensions)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl OpenAiCompatibleConfig {
+    pub fn new(
+        endpoint: String,
+        query_model: String,
+        document_model: String,
+        dimension: usize,
+        request_dimensions: bool,
+        api_key: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let endpoint = endpoint.trim().to_string();
+        let query_model = query_model.trim().to_string();
+        let document_model = document_model.trim().to_string();
+        let parsed = reqwest::Url::parse(&endpoint)
+            .context("[embedding].endpoint must be a valid absolute URL")?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "[embedding].endpoint must use http or https"
+        );
+        anyhow::ensure!(
+            !parsed.has_authority()
+                || (parsed.username().is_empty() && parsed.password().is_none()),
+            "[embedding].endpoint must not contain credentials; use api_key or GROOVE_EMBEDDING_API_KEY"
+        );
+        let endpoint_display =
+            format!("{}{}", parsed.origin().ascii_serialization(), parsed.path());
+        anyhow::ensure!(
+            !query_model.trim().is_empty() && !document_model.trim().is_empty(),
+            "[embedding] requires `model`, or both `query_model` and `document_model`, \
+             for provider = \"openai-compatible\""
+        );
+        anyhow::ensure!(
+            dimension > 0,
+            "[embedding].dimension must be greater than zero"
+        );
+        anyhow::ensure!(
+            !timeout.is_zero(),
+            "[embedding].timeout_seconds must be greater than zero"
+        );
+
+        let api_key = api_key.filter(|key| !key.trim().is_empty());
+        let mut hasher = Sha256::new();
+        for value in [document_model.as_str(), query_model.as_str()] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        hasher.update((dimension as u64).to_le_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        let index_model_id = format!(
+            "openai-compatible:{document_model}|{query_model}:{}",
+            &digest[..12]
+        );
+
+        Ok(Self {
+            endpoint,
+            endpoint_display,
+            query_model,
+            document_model,
+            dimension,
+            request_dimensions,
+            api_key,
+            timeout,
+            index_model_id,
+        })
     }
 }
 
@@ -159,6 +274,171 @@ impl EmbeddingProvider for FastEmbedProvider {
     }
 }
 
+#[derive(Serialize)]
+struct OpenAiEmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a [&'a str],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiEmbeddingResponse {
+    data: Vec<OpenAiEmbeddingItem>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiEmbeddingItem {
+    embedding: Vec<f32>,
+    index: usize,
+}
+
+struct OpenAiCompatibleProvider {
+    client: Option<reqwest::blocking::Client>,
+    config: OpenAiCompatibleConfig,
+}
+
+const OPENAI_COMPATIBLE_BATCH_SIZE: usize = 64;
+const MAX_HTTP_ERROR_BODY_BYTES: usize = 512;
+
+impl OpenAiCompatibleProvider {
+    fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
+        eprintln!(
+            "Using OpenAI-compatible embedding models: document={} query={} ({} dim) at {}",
+            config.document_model, config.query_model, config.dimension, config.endpoint_display
+        );
+        Ok(Self {
+            client: None,
+            config,
+        })
+    }
+
+    fn client(&mut self) -> Result<&reqwest::blocking::Client> {
+        if self.client.is_none() {
+            self.client = Some(
+                reqwest::blocking::Client::builder()
+                    .timeout(self.config.timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .context("failed to build OpenAI-compatible embedding client")?,
+            );
+        }
+        Ok(self.client.as_ref().expect("client initialized above"))
+    }
+
+    fn embed(&mut self, texts: &[&str], model: &str) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(OPENAI_COMPATIBLE_BATCH_SIZE) {
+            embeddings.extend(self.embed_batch(batch, model)?);
+        }
+        Ok(embeddings)
+    }
+
+    fn embed_batch(&mut self, texts: &[&str], model: &str) -> Result<Vec<Vec<f32>>> {
+        let request = OpenAiEmbeddingRequest {
+            model,
+            input: texts,
+            dimensions: self
+                .config
+                .request_dimensions
+                .then_some(self.config.dimension),
+        };
+        let endpoint = self.config.endpoint.clone();
+        let api_key = self.config.api_key.clone();
+        let mut builder = self.client()?.post(endpoint).json(&request);
+        if let Some(api_key) = api_key {
+            builder = builder.bearer_auth(api_key);
+        }
+        let response = builder.send().map_err(|error| {
+            anyhow::anyhow!("embedding request failed: {}", error.without_url())
+        })?;
+        let status = response.status();
+        let body = response.bytes().map_err(|error| {
+            anyhow::anyhow!(
+                "failed to read embedding response body: {}",
+                error.without_url()
+            )
+        })?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "embedding endpoint returned HTTP {}: {}",
+                status.as_u16(),
+                escaped_body_snippet(&body)
+            );
+        }
+        let parsed: OpenAiEmbeddingResponse =
+            serde_json::from_slice(&body).context("embedding endpoint returned malformed JSON")?;
+        anyhow::ensure!(
+            parsed.data.len() == texts.len(),
+            "embedding endpoint returned {} vectors for {} inputs",
+            parsed.data.len(),
+            texts.len()
+        );
+
+        let mut ordered: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        for item in parsed.data {
+            anyhow::ensure!(
+                item.index < ordered.len(),
+                "embedding endpoint returned out-of-range index {} for {} inputs",
+                item.index,
+                ordered.len()
+            );
+            anyhow::ensure!(
+                item.embedding.len() == self.config.dimension,
+                "embedding endpoint returned dimension {} at index {}; expected {}",
+                item.embedding.len(),
+                item.index,
+                self.config.dimension
+            );
+            anyhow::ensure!(
+                ordered[item.index].is_none(),
+                "embedding endpoint returned duplicate index {}",
+                item.index
+            );
+            ordered[item.index] = Some(item.embedding);
+        }
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| {
+                embedding.ok_or_else(|| anyhow::anyhow!("embedding endpoint omitted index {index}"))
+            })
+            .collect()
+    }
+}
+
+impl EmbeddingProvider for OpenAiCompatibleProvider {
+    fn embed_documents(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let model = self.config.document_model.clone();
+        self.embed(texts, &model)
+    }
+
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>> {
+        let model = self.config.query_model.clone();
+        let mut embeddings = self.embed(&[text], &model)?;
+        embeddings
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("embedding returned empty result"))
+    }
+}
+
+fn escaped_body_snippet(body: &[u8]) -> String {
+    let mut snippet = String::new();
+    for byte in body.iter().take(MAX_HTTP_ERROR_BODY_BYTES) {
+        snippet.extend(std::ascii::escape_default(*byte).map(char::from));
+    }
+    if snippet.is_empty() {
+        snippet.push_str("<empty>");
+    } else if body.len() > MAX_HTTP_ERROR_BODY_BYTES {
+        snippet.push_str("...");
+    }
+    snippet
+}
+
 /// Provider-neutral entry point for generating text embeddings.
 pub struct Embedder {
     provider: Box<dyn EmbeddingProvider>,
@@ -191,6 +471,9 @@ impl Embedder {
         let EmbeddingSettings { provider, identity } = settings;
         let provider: Box<dyn EmbeddingProvider> = match provider {
             ProviderSettings::FastEmbed(choice) => Box::new(FastEmbedProvider::new(choice)?),
+            ProviderSettings::OpenAiCompatible(config) => {
+                Box::new(OpenAiCompatibleProvider::new(config)?)
+            }
         };
         Ok(Self::from_provider(provider, identity))
     }
@@ -424,6 +707,10 @@ impl Reranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     struct StubProvider;
 
@@ -435,6 +722,124 @@ mod tests {
         fn embed_query(&mut self, _text: &str) -> Result<Vec<f32>> {
             Ok(vec![3.0, 4.0])
         }
+    }
+
+    fn mock_embedding_server(
+        status: &str,
+        response_body: &str,
+        delay: Duration,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server address");
+        let status = status.to_string();
+        let response_body = response_body.to_string();
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            tx.send(read_http_request(&mut stream))
+                .expect("send captured request");
+            thread::sleep(delay);
+            write_http_response(&mut stream, &status, &response_body);
+        });
+        (format!("http://{addr}/v1/embeddings"), rx, handle)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let (header_end, content_length) = loop {
+            let read = stream.read(&mut buf).expect("read mock request");
+            assert!(read > 0, "request ended before its headers");
+            request.extend_from_slice(&buf[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let end = end + 4;
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                break (end, len);
+            }
+        };
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buf).expect("read mock body");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    fn mock_batching_server(
+        request_count: usize,
+        dimension: usize,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server address");
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let request = read_http_request(&mut stream);
+                let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+                let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+                let input_count = body["input"].as_array().expect("input array").len();
+                let data: Vec<serde_json::Value> = (0..input_count)
+                    .map(|index| {
+                        serde_json::json!({
+                            "embedding": vec![index as f32; dimension],
+                            "index": index,
+                        })
+                    })
+                    .collect();
+                tx.send(request).expect("send captured request");
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    &serde_json::json!({ "data": data }).to_string(),
+                );
+            }
+        });
+        (format!("http://{addr}/v1/embeddings"), rx, handle)
+    }
+
+    fn openai_config(
+        endpoint: String,
+        dimension: usize,
+        timeout: Duration,
+    ) -> OpenAiCompatibleConfig {
+        openai_config_with_dimensions(endpoint, dimension, false, timeout)
+    }
+
+    fn openai_config_with_dimensions(
+        endpoint: String,
+        dimension: usize,
+        request_dimensions: bool,
+        timeout: Duration,
+    ) -> OpenAiCompatibleConfig {
+        OpenAiCompatibleConfig::new(
+            endpoint,
+            "query-model".to_string(),
+            "document-model".to_string(),
+            dimension,
+            request_dimensions,
+            Some("test-key".to_string()),
+            timeout,
+        )
+        .expect("valid OpenAI-compatible config")
     }
 
     /// An absolute path for the current platform. `/models` is NOT absolute on
@@ -488,6 +893,349 @@ mod tests {
         assert_eq!(embedder.embed_single("query").unwrap(), vec![3.0, 4.0]);
         assert_eq!(embedder.model_id(), "bge-small-en-v1.5");
         assert_eq!(embedder.dimension(), 384);
+    }
+
+    #[test]
+    fn openai_compatible_can_be_constructed_inside_a_tokio_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        runtime.block_on(async {
+            let config = openai_config(
+                "http://127.0.0.1:1/v1/embeddings".to_string(),
+                2,
+                Duration::from_secs(1),
+            );
+            let embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(config))
+                .expect("provider construction must not create a blocking client");
+            assert_eq!(embedder.dimension(), 2);
+        });
+    }
+
+    #[test]
+    fn openai_compatible_embeds_on_first_call_inside_a_tokio_runtime() {
+        // codex review round 2 on PR #316: constructing the provider inside
+        // `block_on` was not enough — the blocking `reqwest::Client` is built
+        // lazily on the *first* `embed` call. The file watcher's synchronous
+        // `handle_events` used to make that first call directly on a tokio
+        // worker and panicked; `watcher.rs::run_watch_loop` now runs it
+        // through `spawn_blocking` instead, which is the pattern under test
+        // here. Calling `embed_texts` straight from the `block_on` body
+        // (without `spawn_blocking`) still panics, as it must, since that is
+        // the misuse this test guards against regressing back to.
+        let response = r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let runtime = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        runtime.block_on(async {
+            tokio::task::spawn_blocking(move || {
+                let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+                    openai_config(endpoint, 2, Duration::from_secs(1)),
+                ))
+                .expect("provider construction must not create a blocking client");
+                embedder
+                    .embed_texts(&["first"])
+                    .expect("embed must succeed once the client build runs on the blocking pool");
+            })
+            .await
+            .expect("handle_events-style spawn_blocking task must not panic");
+        });
+        captured.recv().expect("captured request");
+        handle.join().expect("mock server thread");
+    }
+
+    #[test]
+    fn openai_compatible_serializes_batches_and_restores_response_order() {
+        let response =
+            r#"{"data":[{"embedding":[3.0,4.0],"index":1},{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+
+        let vectors = embedder
+            .embed_texts(&["first", "second"])
+            .expect("embed batch");
+        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        let request = captured.recv().expect("captured request");
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request_lower.starts_with("post /v1/embeddings http/1.1"));
+        assert!(request_lower.contains("authorization: bearer test-key"));
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["model"], "document-model");
+        assert_eq!(body["input"], serde_json::json!(["first", "second"]));
+        assert!(
+            body.get("dimensions").is_none(),
+            "dimensions is opt-in for compatibility with servers that reject it"
+        );
+        handle.join().expect("mock server thread");
+    }
+
+    #[test]
+    fn openai_compatible_sends_dimensions_when_requested() {
+        let response = r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let config = openai_config_with_dimensions(endpoint, 2, true, Duration::from_secs(1));
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(config))
+            .expect("build embedder");
+
+        embedder.embed_single("needle").expect("embed query");
+        let request = captured.recv().expect("captured request");
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["dimensions"], 2);
+        handle.join().expect("mock server thread");
+    }
+
+    #[test]
+    fn openai_compatible_splits_large_batches() {
+        let texts: Vec<String> = (0..129).map(|index| format!("text-{index}")).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let (endpoint, captured, handle) = mock_batching_server(3, 2);
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+
+        let vectors = embedder.embed_texts(&refs).expect("embed large batch");
+        assert_eq!(vectors.len(), 129);
+        assert_eq!(vectors[63], vec![63.0, 63.0]);
+        assert_eq!(vectors[64], vec![0.0, 0.0]);
+        assert_eq!(vectors[128], vec![0.0, 0.0]);
+
+        let batch_sizes: Vec<usize> = (0..3)
+            .map(|_| {
+                let request = captured.recv().expect("captured request");
+                let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+                serde_json::from_str::<serde_json::Value>(body).expect("request JSON")["input"]
+                    .as_array()
+                    .expect("input array")
+                    .len()
+            })
+            .collect();
+        assert_eq!(batch_sizes, vec![64, 64, 1]);
+        handle.join().expect("mock server thread");
+    }
+
+    #[test]
+    fn openai_compatible_uses_query_model_for_single_queries() {
+        let response = r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+
+        embedder.embed_single("needle").expect("embed query");
+        let request = captured.recv().expect("captured request");
+        let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["model"], "query-model");
+        assert_eq!(body["input"], serde_json::json!(["needle"]));
+        handle.join().expect("mock server thread");
+    }
+
+    #[test]
+    fn openai_compatible_rejects_invalid_response_shapes() {
+        for (response, expected) in [
+            (
+                r#"{"data":[{"embedding":[1.0],"index":0},{"embedding":[3.0,4.0],"index":1}]}"#,
+                "expected 2",
+            ),
+            (
+                r#"{"data":[{"embedding":[1.0,2.0],"index":0},{"embedding":[3.0,4.0],"index":0}]}"#,
+                "duplicate index 0",
+            ),
+            (
+                r#"{"data":[{"embedding":[1.0,2.0],"index":2},{"embedding":[3.0,4.0],"index":0}]}"#,
+                "out-of-range index 2",
+            ),
+            (
+                r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#,
+                "1 vectors for 2 inputs",
+            ),
+        ] {
+            let (endpoint, _captured, handle) =
+                mock_embedding_server("200 OK", response, Duration::ZERO);
+            let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+                openai_config(endpoint, 2, Duration::from_secs(1)),
+            ))
+            .expect("build embedder");
+            let err = embedder
+                .embed_texts(&["first", "second"])
+                .expect_err("invalid response must fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+            handle.join().expect("mock server thread");
+        }
+    }
+
+    #[test]
+    fn openai_compatible_reports_http_malformed_timeout_and_unavailable() {
+        let cases = [
+            (
+                "503 Service Unavailable",
+                "retry\nlater",
+                Duration::ZERO,
+                "retry\\nlater",
+            ),
+            ("200 OK", "not-json", Duration::ZERO, "malformed JSON"),
+            (
+                "200 OK",
+                r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#,
+                Duration::from_millis(100),
+                "embedding request failed",
+            ),
+        ];
+        for (status, response, delay, expected) in cases {
+            let (endpoint, _captured, handle) = mock_embedding_server(status, response, delay);
+            let timeout = if delay.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(10)
+            };
+            let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+                openai_config(endpoint, 2, timeout),
+            ))
+            .expect("build embedder");
+            let err = embedder
+                .embed_single("needle")
+                .expect_err("request must fail");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?}, got {err}"
+            );
+            handle.join().expect("mock server thread");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind unavailable endpoint");
+        let endpoint = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("listener address")
+        );
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept unavailable request");
+            drop(stream);
+        });
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_millis(100)),
+        ))
+        .expect("build embedder");
+        let _err = embedder
+            .embed_single("needle")
+            .expect_err("unavailable endpoint must fail");
+        handle.join().expect("unavailable endpoint thread");
+    }
+
+    #[test]
+    fn http_error_body_snippet_is_bounded_and_escaped() {
+        assert_eq!(
+            escaped_body_snippet(b"bad\n\tresponse"),
+            "bad\\n\\tresponse"
+        );
+        let long = vec![b'x'; MAX_HTTP_ERROR_BODY_BYTES + 100];
+        let snippet = escaped_body_snippet(&long);
+        assert_eq!(snippet.len(), MAX_HTTP_ERROR_BODY_BYTES + 3);
+        assert!(snippet.ends_with("..."));
+    }
+
+    #[test]
+    fn openai_compatible_does_not_follow_a_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("listener address")
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_http_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/v1/embeddings\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write redirect");
+        });
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+        let err = embedder
+            .embed_single("private document text")
+            .expect_err("redirect must be rejected");
+        assert!(err.to_string().contains("HTTP 307"), "{err}");
+        handle.join().expect("redirect server thread");
+    }
+
+    #[test]
+    fn openai_compatible_empty_batch_does_not_make_a_request() {
+        let config = openai_config(
+            "http://127.0.0.1:1/v1/embeddings".to_string(),
+            2,
+            Duration::from_millis(10),
+        );
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(config))
+            .expect("build embedder");
+        assert!(embedder.embed_texts(&[]).expect("empty batch").is_empty());
+    }
+
+    #[test]
+    fn openai_compatible_identity_covers_both_models_and_dimension() {
+        let make = |query: &str, document: &str, dimension: usize, request_dimensions: bool| {
+            EmbeddingSettings::openai_compatible(
+                OpenAiCompatibleConfig::new(
+                    "http://127.0.0.1:8001/v1/embeddings".to_string(),
+                    query.to_string(),
+                    document.to_string(),
+                    dimension,
+                    request_dimensions,
+                    None,
+                    Duration::from_secs(1),
+                )
+                .expect("valid config"),
+            )
+        };
+        let original = make("query", "document", 2, false);
+        assert_ne!(
+            original.model_id(),
+            make("other", "document", 2, false).model_id()
+        );
+        assert_ne!(
+            original.model_id(),
+            make("query", "other", 2, false).model_id()
+        );
+        assert_ne!(
+            original.model_id(),
+            make("query", "document", 3, false).model_id()
+        );
+        assert_eq!(
+            original.model_id(),
+            make("query", "document", 2, true).model_id()
+        );
+        assert!(original.model_id().starts_with("openai-compatible:"));
+        assert_eq!(original.dimension(), 2);
+    }
+
+    #[test]
+    fn openai_compatible_diagnostics_omit_endpoint_query_and_fragment() {
+        let config = OpenAiCompatibleConfig::new(
+            "http://127.0.0.1:8001/v1/embeddings?token=secret#fragment".to_string(),
+            "query".to_string(),
+            "document".to_string(),
+            2,
+            false,
+            None,
+            Duration::from_secs(1),
+        )
+        .expect("valid config");
+        let debug = format!("{config:?}");
+        assert!(debug.contains("http://127.0.0.1:8001/v1/embeddings"));
+        assert!(!debug.contains("token=secret"));
+        assert!(!debug.contains("fragment"));
     }
 
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes

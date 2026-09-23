@@ -273,7 +273,18 @@ pub async fn run_watch_loop(mut state: WatcherState) -> Result<()> {
     );
 
     while let Some(events) = rx_async.recv().await {
-        handle_events(&mut state, &events);
+        // `handle_events` locks `embedder` and, on the first embed call, builds
+        // the blocking reqwest client — both happen synchronously here, so
+        // running it inline on this tokio worker panics exactly like the
+        // pre-fix search path did (`Cannot drop a runtime in a context where
+        // blocking is not allowed`). Move to the blocking pool per batch
+        // (not around the whole receive loop) so shutdown still responds.
+        state = tokio::task::spawn_blocking(move || {
+            handle_events(&mut state, &events);
+            state
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("watcher: handle_events task panicked: {e}"))?;
     }
 
     Ok(())

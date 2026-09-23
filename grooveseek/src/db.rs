@@ -4586,6 +4586,20 @@ mod tests {
         assert!(msg.contains("bge-small-en-v1.5"), "msg: {msg}");
         assert!(msg.contains("bge-m3"), "msg: {msg}");
         assert!(msg.contains("--force"), "msg: {msg}");
+        assert!(msg.contains("--model bge-m3"), "msg: {msg}");
+    }
+
+    #[test]
+    fn test_verify_embedding_meta_external_provider_uses_config_hint() {
+        let db = Database::open_in_memory().unwrap();
+        db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+
+        let err = db
+            .verify_embedding_meta("openai-compatible:document|query:123456789abc", 768)
+            .expect_err("mismatch must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("--config <cfg>"), "msg: {msg}");
+        assert!(!msg.contains("--model openai-compatible"), "msg: {msg}");
     }
 
     #[test]

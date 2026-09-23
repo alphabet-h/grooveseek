@@ -18,7 +18,7 @@ with YAML frontmatter. Japanese or other multilingual content needs
 [![docs](https://img.shields.io/badge/docs-grooveseek.github.io-blue)](https://alphabet-h.github.io/grooveseek/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`, plus Rust source since v1.2.0, and Python since v1.3.0 and PHP since v1.5.0, whose grammars you download and place) files with YAML frontmatter, splits them into heading-based chunks — or, for source code, one chunk per definition, generates embeddings with a selectable model (BGE-small-en-v1.5 by default, BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
+Parses Markdown (and optionally `.txt` / `.pdf` / `.docx` / `.xlsx` / `.pptx`, plus Rust source since v1.2.0, and Python since v1.3.0 and PHP since v1.5.0, whose grammars you download and place) files with YAML frontmatter, splits them into heading-based chunks — or, for source code, one chunk per definition, generates embeddings with FastEmbed by default (BGE-small-en-v1.5, or BGE-M3 for multilingual/Japanese knowledge bases), and stores everything in SQLite with sqlite-vec for vector similarity search. A trusted configuration can instead opt into an [OpenAI-compatible embedding endpoint](docs/usage.md#external-openai-compatible-embeddings). Connects to Claude Code, Cursor, or any MCP-compatible client via stdio (default, 1 client) or Streamable HTTP (many clients) transport.
 
 A live-sync file watcher keeps the index fresh on manual edits, `git pull`, and external scripts; an optional TOML schema can validate frontmatter conventions via `groove validate`, and since v1.9.0 the additional keys it declares (beyond `title` / `date` / `topic` / `depth` / `tags`) are stored by `groove index` so `groove search --field` can filter on them.
 
@@ -59,7 +59,7 @@ Download the archive for your platform from the [latest GitHub release](https://
 
 Each archive ships the binary plus `CHANGELOG.md`, `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY-LICENSES.md` (the notices of every crate linked in), and `README.md`. Verify the SHA-256 checksum (each release exposes `sha256.sum` and per-archive `*.sha256` files) before running. Archives are also signed with a GitHub artifact attestation; `gh attestation verify <archive> --repo alphabet-h/grooveseek` checks that a download was built by GitHub Actions in this repository.
 
-ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. Embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](docs/clients.md#working-around-huggingface-tls-failures-on-first-download) if your network blocks that.
+ONNX runtime and SQLite are statically linked into the binary, so no extra DLLs are required. With the default FastEmbed provider, embedding models (ONNX) are downloaded from HuggingFace on first run — see [Working around HuggingFace TLS failures](docs/clients.md#working-around-huggingface-tls-failures-on-first-download) if your network blocks that.
 
 ### Build from source
 
