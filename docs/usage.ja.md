@@ -397,6 +397,8 @@ groove validate --kb-path ... --format github         # CI 用 ::error annotatio
 
 `groove index` も同じ `<kb-path>/groove-schema.toml` を読む (v1.9.0+): 宣言された key は文書ごとに保存され、`groove search --field` がそれを filter に使う。スキーマの読み込みに失敗すると `groove.toml` の読み込み失敗がバイナリを止めるのと同様に `groove index` が止まる。
 
+スキーマファイルは `.grooveignore` と同じ検査を通して読む: hardlink・通常ファイルでないもの・1 MiB 超、そして Unix では symlink を拒否し、「存在しない」以外の理由で開けないファイルも拒否する。スキーマの場合、拒否は「スキーマ無し」ではなく**ロードエラー**になる — `validate` は exit `2`、`index`・`doctor`・MCP `rebuild_index` は止まる。スキーマは索引がどのフィールドを持つかを決めるため。`--schema` で渡したパスにも同じ検査がかかる。詳細は [補足 (挙動リファレンス)](behavior.ja.md)。
+
 ## 索引そのものを検査する (v0.23.0+)
 
 `groove validate` が検査するのは**文書**。`groove doctor` が検査するのは**索引**:

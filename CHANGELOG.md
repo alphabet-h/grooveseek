@@ -14,6 +14,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **`get_document` and `get_best_practice` no longer look at a path outside the
+  knowledge base before refusing it.** The path check joined the request onto
+  the knowledge base, and joining an absolute path replaces what it is joined
+  to, so an absolute request — and on Windows a drive or a UNC share — was
+  stat'ed and resolved wherever it pointed, and only then refused, with a reply
+  that differed by whether something was there ("path is outside the knowledge
+  base" against "File not found"). Any client that can reach the server could
+  use that to learn which files exist outside the knowledge base, and on
+  Windows a UNC path made the server reach out to the host it named. A request
+  that cannot name anything inside the knowledge base — absolute, empty,
+  holding a `..` segment, and on Windows a drive, a UNC share or a backslash —
+  is now refused before anything on disk is looked at, with the answer a
+  misspelled path already gets. It is the rule `kb://doc/` URIs were already
+  held to. `get_best_practice` skips such a template like a missing one and
+  tries the next.
+- **`groove-schema.toml` is read through the same checks as `.grooveignore`.**
+  It was the one file in the knowledge base read without them: no size limit,
+  a symlink followed, a named pipe waited on. The MCP `rebuild_index` tool
+  reads it while holding the embedder and the database, so a pipe or a very
+  large file left under that name stalled every tool. It is now read from the
+  handle its checks were made on, up to 1 MiB, and a hard link, something that
+  is not a regular file and, on Unix, a symlink are refused.
+
+### Changed
+
+- **A `groove-schema.toml` that exists but is refused stops the command.**
+  `groove index`, `groove validate` (exit `2`), `groove doctor` (exit `2`) and
+  the `rebuild_index` tool report it as a schema load error instead of running
+  without it, since the schema decides which fields the index holds. That
+  includes a hard-linked schema and, on Unix, a symlinked one, both of which
+  were read through until now: replace the link with a copy. A schema file
+  that cannot be opened for another reason than being absent, such as a
+  permission error, is an error too, where it used to be taken for no schema.
+  `groove validate --schema <path>` is held to the same checks.
+- **On Linux and macOS, `get_document` no longer opens a file whose name holds
+  `..` between backslashes**, such as one literally named `a\..\b.md`. Its
+  `kb://doc/` URI was already refused for the same reason: nothing that reads
+  `\` as a separator is ever handed a `..`.
+
 ## [1.13.0] - 2026-09-23
 
 ### Added
