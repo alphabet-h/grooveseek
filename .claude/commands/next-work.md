@@ -95,8 +95,8 @@ powershell -NoProfile -File .dev/tools/handoff_tail.ps1
 | `haiku` | 読み取りだけ: grep / ファイル一覧 / 状態確認 / リンク切れ確認 |
 
 **迷ったら 1 段上**。sonnet / haiku に振った task が 2 round で収束しなければ opus に上げる。
-**段の上端は `opus`** — 能力のために `fable` へは上げない (`opus` が解決する Opus 5.5 は公表ベンチマークで
-Fable 5.1 を上回る)。`fable` を使うのは user が指示した時だけ (Opus 枠 / Sonnet 枠の使用量が尽きた時の逃げ道)。
+**段の上端は `opus`** — 能力のために `fable` へは上げない (Claude Code 2.1.280 以降の `opus` が解決する
+Opus 5.5 は公表ベンチマークで Fable 5.1 を上回る。それより前の版では `opus` は Opus 5 に解決され、表はそのまま動く)。`fable` を使うのは user が指示した時だけ (Opus 枠 / Sonnet 枠の使用量が尽きた時の逃げ道)。
 表は alias で書いてあり、解決先は Claude Code の版で動く。段ごとの根拠と見直しの trigger (Sonnet 5.5 /
 Haiku 5.5 の登場など) は `.dev/knowledge/subagent-model-tiers-opus-5-5.md`。
 
