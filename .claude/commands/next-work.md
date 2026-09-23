@@ -100,7 +100,9 @@ Opus 5.5 は公表ベンチマークで Fable 5.1 を上回る。それより前
 表は alias で書いてあり、解決先は Claude Code の版で動く。段ごとの根拠と見直しの trigger (Sonnet 5.5 /
 Haiku 5.5 の登場など) は `.dev/knowledge/subagent-model-tiers-opus-5-5.md`。
 
-subagent の effort は Agent tool では指定できない (agent 定義の `effort:` が無ければ session の値を継承する)。
+subagent の effort は Agent tool では指定できない (docs では、agent 定義の `effort:` が無ければ session の値を継承する)。
+**session と subagent のモデルが違う時** (Fable の controller から `opus` を起こす等) に、session の値と subagent の
+モデルの `modelSettings` のどちらが効くかは未確認 — controller の effort を変えれば subagent の effort も変わる、とは決めてかからない。
 
 subagent prompt に**毎回貼る定型** (抜けた分だけ subagent が踏む):
 
