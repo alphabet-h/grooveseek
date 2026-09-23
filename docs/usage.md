@@ -404,6 +404,8 @@ Exit codes: `0` (no violations), `1` (violations), `2` (schema load error). A fi
 
 `groove index` reads the same `<kb-path>/groove-schema.toml` (v1.9.0+): the keys it declares are stored per document so `groove search --field` can filter on them. A schema that does not load stops `groove index`, the way a `groove.toml` that does not load stops the binary.
 
+The schema file is read through the checks `.grooveignore` gets: a hard link, something that is not a regular file, a file over 1 MiB and, on Unix, a symlink are refused, and so is a file that cannot be opened for any reason other than not being there. For the schema a refusal is a load error — `validate` exits `2`, and `index`, `doctor` and the MCP `rebuild_index` tool stop — rather than a missing schema, because the schema decides which fields the index holds. A path given with `--schema` is held to the same checks. See [Behavior notes](behavior.md).
+
 ## Check the index itself (v0.23.0+)
 
 `groove validate` checks your documents. `groove doctor` checks the **index**:

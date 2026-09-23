@@ -3618,6 +3618,355 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // AW-01: a path that cannot name anything inside the knowledge base is
+    // refused before anything on disk is looked at
+    // -----------------------------------------------------------------------
+
+    /// An outcome as the two things a caller can tell apart: the variant, and
+    /// the message it carries.
+    fn answer_to(r: ValidatePathOutcome) -> (&'static str, String) {
+        match r {
+            ValidatePathOutcome::Found(p) => ("Found", p.display().to_string()),
+            ValidatePathOutcome::NotFound(e) => ("NotFound", e.error),
+            ValidatePathOutcome::Denied(e) => ("Denied", e.error),
+            ValidatePathOutcome::Unavailable(e) => ("Unavailable", e.error),
+        }
+    }
+
+    fn ask_for_document(kb: &std::path::Path, rel: &str) -> (&'static str, String) {
+        answer_to(validate_get_document_path(
+            kb,
+            rel,
+            &md_only_registry(),
+            1024 * 1024,
+            1024 * 1024,
+        ))
+    }
+
+    /// A knowledge base and a directory beside it, under one scratch root, so
+    /// a test can reach the outside by `..` as well as by an absolute path and
+    /// all of it is removed in one piece.
+    struct KbWithOutside {
+        _root: TempKb,
+        kb: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl KbWithOutside {
+        fn new(prefix: &str) -> Self {
+            let root = TempKb::new(prefix);
+            let kb = root.path.join("kb");
+            let outside = root.path.join("outside");
+            fs::create_dir_all(&kb).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            Self {
+                _root: root,
+                kb,
+                outside,
+            }
+        }
+    }
+
+    /// Every form of the given path a caller could type: the canonical
+    /// absolute path, and on Windows the same path without the verbatim
+    /// `\\?\` prefix that `canonicalize` adds -- the form a person would
+    /// actually write.
+    fn absolute_spellings(path: &std::path::Path) -> Vec<String> {
+        let canonical = path.to_str().expect("scratch paths are UTF-8").to_string();
+        let mut out = vec![canonical.clone()];
+        if let Some(plain) = canonical.strip_prefix(r"\\?\") {
+            out.push(plain.to_string());
+        }
+        out
+    }
+
+    /// (AW-01) A request that names somewhere outside the knowledge base gets
+    /// one answer, whatever is at that place.
+    ///
+    /// The three targets are chosen so that looking at them would tell them
+    /// apart: a plain file, which the range check would call "outside the
+    /// knowledge base"; a hard link, which the link check would deny; and a
+    /// name with nothing behind it, which the first stat would call "File not
+    /// found" with the request echoed. Each is asked for by an absolute path
+    /// and by a `..` route. The answer they all have to share is the one a
+    /// misspelled document already gets, so the refusal says nothing a
+    /// misspelling would not.
+    #[test]
+    fn a_path_out_of_the_knowledge_base_gets_one_answer_whatever_is_there() {
+        let t = KbWithOutside::new("gd-oracle");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        fs::write(t.outside.join("plain.md"), "secret").unwrap();
+        fs::write(t.outside.join("source.md"), "secret").unwrap();
+        fs::hard_link(t.outside.join("source.md"), t.outside.join("linked.md"))
+            .expect("hard links need no privilege");
+        assert!(
+            crate::links::is_multiply_linked(&t.outside.join("linked.md")),
+            "the fixture must hold a real second name"
+        );
+        assert!(
+            !t.outside.join("missing.md").exists(),
+            "the fixture must hold a real absence"
+        );
+
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(
+            misspelled.0, "NotFound",
+            "the reference answer is a refusal: {misspelled:?}"
+        );
+
+        let mut requests = Vec::new();
+        for name in ["plain.md", "linked.md", "missing.md"] {
+            requests.extend(absolute_spellings(&t.outside.join(name)));
+            requests.push(format!("../outside/{name}"));
+        }
+        for rel in &requests {
+            assert_eq!(
+                ask_for_document(&t.kb, rel),
+                misspelled,
+                "{rel:?} must get the answer a misspelling gets, whatever is at that path"
+            );
+        }
+    }
+
+    /// (AW-01) The empty path names the knowledge base itself, which is not a
+    /// document, and is refused like a misspelling rather than by whatever a
+    /// later step makes of a directory -- on Unix a directory has more than
+    /// one link, so the link check would call it a hard link.
+    #[test]
+    fn an_empty_path_is_refused_like_a_misspelling() {
+        let t = KbWithOutside::new("gd-empty");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        assert_eq!(ask_for_document(&t.kb, ""), misspelled);
+    }
+
+    /// (AW-01) The spelling check's refusal still names nothing, for spellings
+    /// that reach it. The older no-leak test asks with a `..` in the path,
+    /// which the lexical check now answers first -- in the same words, so that
+    /// test stays green whatever the spelling check says. These clear the
+    /// lexical check (asserted below), so the spelling check is what answers.
+    #[test]
+    fn the_spelling_refusal_names_nothing_for_spellings_the_lexical_check_lets_through() {
+        let kb = TempKb::new("gd-spell-leak-2b");
+        kb.write("HiddenVault/a.md", "# A\nbody\n");
+        for rel in [
+            "./HiddenVault/a.md",
+            "HiddenVault//a.md",
+            "HiddenVault/./a.md",
+        ] {
+            assert!(
+                crate::resources::is_safe_relative(rel),
+                "{rel:?} must get past the lexical check for this to test the spelling check"
+            );
+            let (variant, message) = ask_for_document(&kb.path, rel);
+            assert_eq!(variant, "NotFound", "{rel:?}: {message}");
+            assert!(
+                message.contains("spelling") && message.contains("search"),
+                "{rel:?} must be refused by the spelling check, pointing at `search`: {message}"
+            );
+            assert!(
+                !message.contains("HiddenVault"),
+                "the refusal carries a path: {message}"
+            );
+        }
+    }
+
+    /// (AW-01) The Windows spellings of "somewhere else": a UNC share, which
+    /// looked at would be an SMB connection to that host; the verbatim form of
+    /// one; a drive with and without a root, and with either separator; a
+    /// rooted path on the current drive; and `..` walked with backslashes to a
+    /// file that is really there.
+    #[cfg(windows)]
+    #[test]
+    fn windows_routes_out_of_the_knowledge_base_are_refused_before_the_disk_is_touched() {
+        let t = KbWithOutside::new("gd-win-out");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        fs::write(t.outside.join("plain.md"), "secret").unwrap();
+
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        for rel in [
+            r"\\localhost\c$\Windows\win.ini",
+            r"\\?\UNC\localhost\c$\Windows\win.ini",
+            "//localhost/c$/Windows/win.ini",
+            r"C:\Windows\win.ini",
+            "C:/Windows/win.ini",
+            "C:foo.md",
+            r"\Windows\win.ini",
+            r"..\outside\plain.md",
+            r"a\..\..\outside\plain.md",
+        ] {
+            assert_eq!(
+                ask_for_document(&t.kb, rel),
+                misspelled,
+                "{rel:?} must be refused by what it says, not by what is there"
+            );
+        }
+    }
+
+    /// (AW-01, Codex round 1 on #319) A Windows device name gets the answer a
+    /// misspelling gets, before the first stat. Joined onto a knowledge base
+    /// written without the verbatim prefix, `NUL` or `NUL:` is the null
+    /// device rather than a file -- measured with `GetFullPathNameW` -- and
+    /// older Windows reads `CON`, `COM1` and the rest the same way, with an
+    /// extension too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_device_names_are_refused_before_the_disk_is_touched() {
+        let t = KbWithOutside::new("gd-win-dev");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        for rel in [
+            "NUL",
+            "NUL.md",
+            "NUL:",
+            "CON",
+            "con.md",
+            "COM1",
+            "a/AUX/b.md",
+        ] {
+            assert_eq!(
+                ask_for_document(&t.kb, rel),
+                misspelled,
+                "{rel:?} must be refused by what it says, not by what is there"
+            );
+        }
+    }
+
+    /// (AW-01, Codex round 2 on #319) An alternate data stream gets the answer
+    /// a misspelling gets, before the first stat. `note.md::$DATA` is the
+    /// document's own default stream -- the stat finds it -- and
+    /// `note.md:secret` is a named one that may or may not exist, so looking
+    /// would answer differently for the two.
+    #[cfg(windows)]
+    #[test]
+    fn windows_alternate_data_streams_are_refused_before_the_disk_is_touched() {
+        let t = KbWithOutside::new("gd-win-ads");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        fs::write(t.kb.join("note.md"), "# Note\n").unwrap();
+
+        let misspelled = ask_for_document(&t.kb, "./a.md");
+        assert_eq!(misspelled.0, "NotFound", "{misspelled:?}");
+        for rel in ["note.md:secret", "note.md::$DATA", "a/b.md:x.md"] {
+            assert_eq!(
+                ask_for_document(&t.kb, rel),
+                misspelled,
+                "{rel:?} must be refused by what it says, not by what is there"
+            );
+        }
+    }
+
+    /// (AW-01) Inside the best-practice tool's template loop
+    /// ([`resolve_best_practice_path`]) the same refusal is a miss, not a
+    /// security event: the next template is tried.
+    ///
+    /// The target is a hard link outside the knowledge base because looking at
+    /// it would end the loop -- the link check answers
+    /// [`ValidatePathOutcome::Denied`], and that stops the search -- so reaching
+    /// the second template also shows the first was never looked at.
+    #[test]
+    fn a_template_naming_a_place_outside_the_knowledge_base_falls_through_unlooked_at() {
+        let t = KbWithOutside::new("bp-out");
+        fs::create_dir_all(t.kb.join("bp")).unwrap();
+        fs::write(t.kb.join("bp").join("fallback.md"), "# fallback\n").unwrap();
+        fs::write(t.outside.join("source.md"), "secret").unwrap();
+        fs::hard_link(t.outside.join("source.md"), t.outside.join("linked.md"))
+            .expect("hard links need no privilege");
+        let templates = vec!["{target}".to_string(), "bp/fallback.md".to_string()];
+
+        let mut targets = absolute_spellings(&t.outside.join("linked.md"));
+        targets.push("../outside/linked.md".to_string());
+        for target in &targets {
+            match resolve_best_practice_path(
+                &t.kb,
+                &templates,
+                target,
+                &md_only_registry(),
+                1024 * 1024,
+            ) {
+                ResolveOutcome::Found(p) => assert!(
+                    p.ends_with("bp/fallback.md") || p.ends_with(r"bp\fallback.md"),
+                    "{target:?} resolved to the wrong file: {p:?}"
+                ),
+                other => {
+                    panic!("{target:?} must fall through to the second template, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Asserts that `rel` is refused by the range check (step 2) rather than by
+    /// the spelling check after it, which would refuse it too.
+    ///
+    /// The two are told apart by one fact only: the spelling check's message
+    /// is the one a misspelled document gets, so the range check's must not
+    /// be. The knowledge base has to hold `a.md` for that reference answer.
+    /// What the range check says beyond that is left open on purpose -- its
+    /// message still differs by whether something is at the far end of the
+    /// link, and this test must not be what stops that from being made
+    /// uniform.
+    fn expect_range_refusal(kb: &std::path::Path, rel: &str) {
+        let misspelled = ask_for_document(kb, "./a.md");
+        assert_eq!(
+            misspelled.0, "NotFound",
+            "the reference answer needs `a.md` in the knowledge base: {misspelled:?}"
+        );
+        let (variant, message) = ask_for_document(kb, rel);
+        assert_eq!(
+            variant, "NotFound",
+            "{rel:?} leads out of the knowledge base: {message}"
+        );
+        assert_ne!(
+            message, misspelled.1,
+            "{rel:?} must be refused by the range check, not by the spelling check after it"
+        );
+    }
+
+    /// (AW-01, audit M-6) The range check answering by itself. A directory
+    /// link inside the knowledge base that leads out of it is the one route
+    /// that clears the lexical check and still resolves elsewhere. The
+    /// spelling check after it would refuse the same request with its own
+    /// message, which is how this tells the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_out_of_the_knowledge_base_is_refused_by_the_range_check() {
+        let t = KbWithOutside::new("gd-range-unix");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        fs::write(t.outside.join("secret.md"), "secret").unwrap();
+        std::os::unix::fs::symlink(&t.outside, t.kb.join("escape"))
+            .expect("creating a directory symlink");
+        expect_range_refusal(&t.kb, "escape/secret.md");
+    }
+
+    /// The same on Windows, through a junction: it needs no elevation there,
+    /// where a symlink does, and `canonicalize` follows it. Asserted rather
+    /// than skipped, like the grammar-directory twin in [`crate::config`].
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_out_of_the_knowledge_base_is_refused_by_the_range_check() {
+        let t = KbWithOutside::new("gd-range-win");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
+        fs::write(t.outside.join("secret.md"), "secret").unwrap();
+        let link = t.kb.join("escape");
+        // `mklink` is handed the paths without the verbatim prefix.
+        let plain = |p: &std::path::Path| absolute_spellings(p).pop().unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", &plain(&link), &plain(&t.outside)])
+            .status()
+            .expect("mklink must be runnable");
+        assert!(made.success(), "mklink /J needs no elevation");
+        assert_eq!(
+            link.canonicalize().unwrap(),
+            t.outside.canonicalize().unwrap(),
+            "the junction really does lead out of the knowledge base"
+        );
+        expect_range_refusal(&t.kb, "escape/secret.md");
+    }
+
+    // -----------------------------------------------------------------------
     // feature-28 Task 2.7: SearchParams MMR fields + From<&SearchParams>
     // -----------------------------------------------------------------------
 

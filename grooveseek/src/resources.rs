@@ -175,51 +175,164 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// A decoded path may be used against the knowledge base only if it stays
 /// inside it and names something on this side of the OS's path syntax.
 ///
+/// Two surfaces ask it. The `kb://` side asks through [`parse`], for a URI
+/// being read, and [`doc_is_addressable`], for a URI about to be handed out.
+/// The path check in [`crate::server`] behind `get_document` and
+/// `get_best_practice` asks it of the requested string before anything on disk
+/// is looked at (AW-01): `Path::join` replaces the knowledge base with an
+/// absolute right-hand side, so an absolute path, a drive or a UNC share would
+/// otherwise be stat'ed wherever it points -- outside the knowledge base, or
+/// across the network on Windows. What it keeps from the disk is a path that
+/// leads out of the knowledge base: another spelling of a path inside it
+/// (`./a.md`, `a//b.md`, on Windows trailing dots or spaces) passes here, and
+/// the document path check refuses it after a look that stays inside. Neither
+/// surface keeps a copy of the rule
+/// (AGENTS.md, "One question gets one implementation"). The empty string
+/// passes here and each caller decides about it: [`parse`] reads it as the
+/// root topic group, while [`doc_is_addressable`] and the document path check
+/// refuse it, since a document path has to name a document.
+///
 /// **`\` is refused only where it separates components**
 /// ([`crate::indexer::backslash_separates_components`], the same answer the
 /// index uses when it spells a path). On Unix it is an ordinary filename
 /// character: the index holds a file named `secret\pay.md` under exactly that
 /// name, and refusing it here left the server unable to read a URI it had
 /// handed out. Letting it through there is not a way out of the knowledge
-/// base -- `\` does not separate anything on that platform, the leading-slash
-/// check still refuses absolute paths, and the caller resolves what survives
-/// against the index rather than the filesystem, then through the same checks
-/// `get_document` applies.
+/// base -- `\` does not separate anything on that platform, so `\\host\x.md`
+/// is one filename in the knowledge base root, and the leading-slash check
+/// still refuses absolute paths. The URI caller then resolves what survives
+/// against the index rather than the filesystem, and both callers go on
+/// through the checks `get_document` applies.
 ///
 /// The `..` check splits on `\` as well as `/`, on every platform. That is
 /// deliberately the cautious side: it gives up a Unix file literally named
-/// `a\..\b.md` (still reachable through `get_document`), and in return nothing
-/// downstream that reads `\` as a separator can ever be handed a `..`.
-fn is_safe_relative(p: &str) -> bool {
+/// `a\..\b.md` -- through `get_document` too, since that asks this function
+/// as well -- and in return nothing downstream that reads `\` as a separator
+/// can ever be handed a `..`.
+///
+/// On Windows two more things are refused: a colon anywhere
+/// ([`holds_a_windows_colon`] -- a drive or an alternate data stream, Codex
+/// round 2 on #319), and a segment that names a device
+/// ([`names_a_windows_device`]), so no request reaches the null device or a
+/// port by being spelled `NUL` or `COM1` (Codex round 1 on #319).
+pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.contains('\0') {
         return false;
     }
     if p.contains('\\') && crate::indexer::backslash_separates_components() {
         return false;
     }
-    if p.starts_with('/') || starts_with_drive_designator(p) {
+    if p.starts_with('/') || holds_a_windows_colon(p) {
         return false;
     }
-    !p.split(['/', '\\']).any(|seg| seg == "..")
+    !p.split(['/', '\\'])
+        .any(|seg| seg == ".." || names_a_windows_device(seg))
 }
 
-/// Whether `p` opens with a Windows drive designator — `C:` — which escapes the
-/// knowledge base. Every form of it does, the drive-*relative* `C:notes.md`
-/// included, since that resolves against that drive's own current directory.
+/// The names Windows reserves for devices, as [`names_a_windows_device`]
+/// compares them (ASCII case ignored; the superscript digits have no case).
+const WINDOWS_DEVICE_NAMES: &[&str] = &[
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
+/// Whether `segment` is a name Windows can read as a device rather than a
+/// file -- `NUL`, `CON`, `COM1` and the rest -- in any case, followed by an
+/// extension or by trailing spaces or dots. The colon form, `NUL:`, never
+/// reaches here: [`holds_a_windows_colon`] refuses every colon first.
 ///
-/// **Windows only.** A drive designator is Windows path syntax, so applying the
-/// rule anywhere else refuses legal names for a danger that does not exist
-/// there: `a:b.md` and `C:/note.md` (a directory literally named `C:`) are both
-/// ordinary relative paths on Unix, and this module hands out URIs for them.
-/// Nothing is lost by the narrowing — the colon reaches here percent-decoded,
-/// the leading-slash check above already refuses Unix absolute paths, and the
-/// caller resolves what survives against the index rather than the filesystem.
-fn starts_with_drive_designator(p: &str) -> bool {
+/// **Windows only**, like [`holds_a_windows_colon`] and for the same reason:
+/// elsewhere these are ordinary names.
+///
+/// The list is the reserved names of "Naming Files, Paths, and Namespaces"
+/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>),
+/// which also says `NUL.txt` and `NUL.tar.gz` are both `NUL`. Two kinds are
+/// added to it: `CONIN$` and `CONOUT$`, which Windows 11 (build 26200)
+/// reports as device names when they stand alone though the page does not
+/// list them; and `COM0` and `LPT0`, which neither the page lists nor that
+/// build reads as devices, refused on the cautious side since the page's own
+/// namespace section shows a `COM0` device (via `GetFullPathNameW` and
+/// `RtlIsDosDeviceName_U`, called from PowerShell on that build).
+///
+/// How much of this a given Windows still does varies, which is why the rule
+/// follows the page rather than one build: on build 26200 only `NUL` (with
+/// trailing dots, spaces or a colon) still turns into the device behind a
+/// directory, and under the verbatim `\\?\` prefix a canonical knowledge base
+/// carries, nothing does. The cost is a file that some Windows lets exist,
+/// such as `CON.md`, which neither `get_document` nor a `kb://doc/` URI can
+/// name.
+fn names_a_windows_device(segment: &str) -> bool {
     if !cfg!(windows) {
         return false;
     }
-    let b = p.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ');
+    WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
+}
+
+/// Whether `p` holds a colon, on Windows, where a colon in a request can only
+/// be path syntax and never part of a name:
+///
+/// - a drive designator, which escapes the knowledge base in every form --
+///   `C:\x`, `C:/x`, and the drive-*relative* `C:notes.md`, which resolves
+///   against that drive's own current directory;
+/// - an alternate data stream of a file, `note.md:secret` or the default
+///   stream `note.md::$DATA` (Codex round 2 on #319), which the stat would
+///   answer about before the spelling check refused it;
+/// - the colon form of a device, `NUL:`, which becomes `\\.\NUL` behind a
+///   directory on Windows 11 build 26200 (via `GetFullPathNameW`, called from
+///   PowerShell on that build).
+///
+/// Refusing it anywhere loses no document: "Naming Files, Paths, and
+/// Namespaces" (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>)
+/// lists the colon among the characters a Windows file or directory name
+/// cannot contain, so no file the index walked has one. This replaces the
+/// drive-designator check that stood here, which it covers completely.
+///
+/// **Windows only.** Elsewhere a colon is an ordinary filename character:
+/// `a:b.md` and `C:/note.md` (a directory literally named `C:`) are both
+/// ordinary relative paths on Unix, and this module hands out URIs for them.
+/// Nothing is lost by the narrowing -- the colon reaches here percent-decoded,
+/// the leading-slash check already refuses Unix absolute paths, and a name
+/// with a colon in it is inside the knowledge base on Unix, wherever it is
+/// then looked up.
+fn holds_a_windows_colon(p: &str) -> bool {
+    cfg!(windows) && p.contains(':')
 }
 
 /// Percent-encode everything outside the unreserved set, leaving `/` as the
@@ -437,6 +550,91 @@ mod tests {
     fn a_backslash_is_refused_where_it_separates_components() {
         assert_eq!(parse("kb://doc/secret%5Cpay.md"), None);
         assert!(!doc_is_addressable("secret\\pay.md"));
+    }
+
+    /// A Windows device name in any segment is refused there, with an
+    /// extension, in any case, with trailing dots or spaces, and with the
+    /// trailing colon Windows also reads as the device. Names that merely
+    /// start like one are not device names and stay.
+    #[cfg(windows)]
+    #[test]
+    fn a_device_name_in_any_segment_is_refused_on_windows() {
+        for p in [
+            "NUL",
+            "NUL.md",
+            "nul.tar.gz",
+            "con",
+            "COM1",
+            "com9.md",
+            "LPT\u{b9}.md",
+            "COM\u{b3}",
+            "a/AUX/b.md",
+            "PRN/x.md",
+            "NUL. ",
+            "NUL .md",
+            "NUL:",
+            "CONIN$",
+            "conout$.md",
+        ] {
+            assert!(!is_safe_relative(p), "{p:?} names a device on Windows");
+            assert_eq!(parse(&doc_uri(p)), None, "{p:?}");
+        }
+        for p in [
+            "NULL.md",
+            "console.md",
+            "COM10.md",
+            "LPT.md",
+            "nul-x.md",
+            "auxiliary/a.md",
+            "a/connect/b.md",
+        ] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name");
+        }
+    }
+
+    /// A colon anywhere is refused on Windows, where no file or directory name
+    /// can hold one: in a request it can only open a drive or an alternate
+    /// data stream of a file (Codex round 2 on #319). The URI side refuses it
+    /// too, raw and percent-encoded.
+    #[cfg(windows)]
+    #[test]
+    fn a_colon_anywhere_is_refused_on_windows() {
+        for p in ["note.md:secret", "note.md::$DATA", "a/b.md:x.md"] {
+            assert!(!is_safe_relative(p), "{p:?} names a stream on Windows");
+            assert_eq!(parse(&doc_uri(p)), None, "{p:?}");
+            assert_eq!(parse(&format!("kb://doc/{p}")), None, "{p:?} unencoded");
+        }
+    }
+
+    /// On Unix a colon is an ordinary filename character, so the same inputs
+    /// are names a file can have.
+    #[cfg(unix)]
+    #[test]
+    fn a_colon_is_an_ordinary_character_on_unix() {
+        for p in ["note.md:secret", "note.md::$DATA", "a/b.md:x.md"] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name on Unix");
+            assert_eq!(parse(&doc_uri(p)), Some(ResourceUri::Doc(p.to_string())));
+        }
+    }
+
+    /// The same inputs are ordinary names on Unix, where no name is a device
+    /// by spelling: refusing them there would lose files for nothing.
+    #[cfg(unix)]
+    #[test]
+    fn device_names_are_ordinary_names_on_unix() {
+        for p in [
+            "NUL",
+            "NUL.md",
+            "con",
+            "COM1",
+            "LPT\u{b9}.md",
+            "a/AUX/b.md",
+            "NUL. ",
+            "NUL:",
+            "CONIN$",
+        ] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name on Unix");
+        }
     }
 
     /// What decides whether a URI is handed out is what decides whether it

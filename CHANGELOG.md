@@ -14,6 +14,75 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ## [Unreleased]
 
+### Security
+
+- **`get_document` and `get_best_practice` no longer look at a path outside the
+  knowledge base before refusing it.** The path check joined the request onto
+  the knowledge base, and joining an absolute path replaces what it is joined
+  to, so an absolute request — and on Windows a drive or a UNC share — was
+  stat'ed and resolved wherever it pointed, and only then refused, with a reply
+  that differed by whether something was there ("path is outside the knowledge
+  base" against "File not found"). Any client that can reach the server could
+  use that to learn which files exist outside the knowledge base, and on
+  Windows a UNC path made the server reach out to the host it named. A request
+  that cannot name anything inside the knowledge base — absolute, empty,
+  holding a `..` segment, and on Windows a drive, a UNC share, a backslash, a
+  colon anywhere (an alternate data stream such as `note.md:secret`) or a
+  reserved device name such as `NUL`, `CON` or `COM1` in any segment —
+  is now refused before anything on disk is looked at, with the answer a
+  misspelled path already gets. It is the rule `kb://doc/` URIs were already
+  held to. `get_best_practice` skips such a template like a missing one and
+  tries the next. What is kept from the disk is a spelling that leads out of
+  the knowledge base. Another spelling of a path inside it — `./a.md`,
+  `a//b.md`, and on Windows a `.` segment or trailing dots and spaces, which
+  Windows resolves to the same file — is still looked at first, inside the
+  knowledge base only, and refused by the spelling check that follows; what
+  that reply can tell is whether something is at that place in the knowledge
+  base, which asking under the path's own spelling tells anyway. One route
+  keeps the two replies apart: a directory symlink
+  (or on Windows a junction) placed inside the knowledge base that leads out
+  of it still gets "outside the knowledge base" when something is at the far
+  end and "File not found" when nothing is — but that route needs write access
+  to the knowledge base.
+- **`groove-schema.toml` is read through the same checks as `.grooveignore`.**
+  It was the one file in the knowledge base read without them: no size limit,
+  a symlink followed, a named pipe waited on. The MCP `rebuild_index` tool
+  reads it while holding the embedder and the database, so a pipe or a very
+  large file left under that name stalled every tool. It is now read from the
+  handle its checks were made on, up to 1 MiB, and a hard link, something that
+  is not a regular file and, on Unix, a symlink are refused.
+
+### Changed
+
+- **A `groove-schema.toml` that exists but is refused stops the command.**
+  `groove index`, `groove validate` (exit `2`), `groove doctor` (exit `2`) and
+  the `rebuild_index` tool report it as a schema load error instead of running
+  without it, since the schema decides which fields the index holds. That
+  includes a hard-linked schema and, on Unix, a symlinked one, both of which
+  were read through until now: replace the link with a copy. A schema path
+  that cannot even be looked at — a directory on the way that cannot be
+  entered, a symlink loop and, on Unix, a path component that is a file or a
+  dangling symlink — stops the command too, where it used to be taken for no
+  schema at all; only a path where nothing exists counts as no schema now. A file whose own permissions
+  refuse the read was already an error. `groove validate --schema <path>` is
+  held to the same checks.
+- **`groove eval` words a refused golden or history file as a refusal.** The
+  message used to end in a line written for files that are skipped ("was
+  skipped"), though `eval` stops; it now ends in the reason alone, the way the
+  schema's refusal does. Which files `eval` refuses is unchanged.
+- **On Windows, a path with a reserved device name in it is no longer
+  served**, even where the file can exist: a `CON.md` or a directory named
+  `aux` is refused by `get_document` and gets no `kb://doc/` URI. Windows
+  documents these names as reserved, and depending on the version reads them
+  as devices rather than files. A colon anywhere in the path is refused there
+  too, which loses no document — no Windows file name can hold one — but
+  closes the alternate data streams of a document (`note.md:secret`,
+  `note.md::$DATA`) to `get_document`.
+- **On Linux and macOS, `get_document` no longer opens a file whose name holds
+  `..` between backslashes**, such as one literally named `a\..\b.md`. Its
+  `kb://doc/` URI was already refused for the same reason: nothing that reads
+  `\` as a separator is ever handed a `..`.
+
 ## [1.13.0] - 2026-09-23
 
 ### Added

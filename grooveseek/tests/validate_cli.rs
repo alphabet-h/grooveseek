@@ -194,6 +194,35 @@ pattern = '[unclosed'
     assert!(err.contains("schema load error"));
 }
 
+/// (AW-02) A schema file that is there but refused is a schema load error
+/// (exit 2), not an absent schema (exit 0 with "no schema found"). A hard link
+/// is the refused form here because it needs no privilege on any platform.
+/// The schema compiles and the note satisfies it, so if the file were read
+/// the run would exit 0: the refusal is the only way to get 2.
+#[test]
+fn test_validate_refused_schema_exits_two_instead_of_running_without_it() {
+    let Some(bin) = grooveseek_bin() else {
+        eprintln!("groove binary not built -- skipping");
+        return;
+    };
+    let kb = TempKb::new("kb-validate-linkedschema");
+    kb.write("a.md", "---\ntitle: X\n---\n# body\n");
+    kb.write("elsewhere.toml", "[fields.title]\nrequired = true\n");
+    std::fs::hard_link(
+        kb.path.join("elsewhere.toml"),
+        kb.path.join("groove-schema.toml"),
+    )
+    .expect("hard links need no privilege");
+
+    let (code, _out, err) = run(&bin, &["validate", "--kb-path", kb.path.to_str().unwrap()]);
+    assert_eq!(
+        code, 2,
+        "a refused schema is a load error, not a missing one: stderr={err}"
+    );
+    assert!(err.contains("schema load error"), "stderr={err}");
+    assert!(err.contains("hard link"), "the error says why: {err}");
+}
+
 #[test]
 fn test_validate_ok_case_exit_zero() {
     let Some(bin) = grooveseek_bin() else {

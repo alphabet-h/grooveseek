@@ -242,6 +242,26 @@ impl Refused {
         }
     }
 
+    /// Why the file was refused, and nothing else: no path, and no word about
+    /// what happens next.
+    ///
+    /// [`Self::log_line`] is written for the callers that skip the file and
+    /// carry on -- it says "was skipped" -- so a caller that stops instead
+    /// names the file itself and puts this after it. ASCII, like the log line.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Refused::MultiplyLinked => "it has more than one name (a hard link)".to_string(),
+            Refused::NotAPlainFile => concat!(
+                "it is not a regular file (a symlink, a directory, a device or a ",
+                "named pipe is in its place)"
+            )
+            .to_string(),
+            Refused::TooLarge { len, cap } => {
+                format!("it is {len} bytes, over the {cap} byte limit")
+            }
+        }
+    }
+
     /// The caller-facing line for MCP responses. Says nothing about the server's
     /// filesystem (BU-23).
     pub(crate) fn client_message(&self) -> &'static str {
@@ -310,6 +330,34 @@ pub(crate) fn read_checked(path: &Path, cap: u64) -> std::io::Result<Content> {
         return Ok(Content::Refused(Refused::TooLarge { len: read, cap }));
     }
     Ok(Content::Bytes(bytes))
+}
+
+/// [`read_checked`] for a file the command cannot go on without reading: the
+/// golden file, the eval history, the frontmatter schema.
+///
+/// `Ok(None)` when nothing is there -- the open failed with "not found" --
+/// so each caller decides what absence means. A refusal is an error naming
+/// the file and [`Refused::reason`], worded as a refusal rather than a skip,
+/// since these callers stop. Any other failure to open or read is an error
+/// naming the file. `what` is how a reader knows the file ("golden file",
+/// "schema").
+///
+/// One conversion for all of them (AGENTS.md, "One question gets one
+/// implementation"); eval and the schema loader each carried their own copy.
+pub(crate) fn read_required(path: &Path, cap: u64, what: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use anyhow::Context as _;
+
+    match read_checked(path, cap) {
+        Ok(Content::Bytes(bytes)) => Ok(Some(bytes)),
+        Ok(Content::Refused(refused)) => anyhow::bail!(
+            "refusing to read the {what}: {}: {}",
+            path.display(),
+            refused.reason()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("failed to read the {what}: {}", path.display())),
+    }
 }
 
 /// Open a path for reading, refusing to follow a symlink in its final component
@@ -665,6 +713,34 @@ mod tests {
             Refused::NotAPlainFile,
             "a named pipe is not a note, and waiting on one would hang the run"
         );
+    }
+
+    /// The reason alone is for a caller that stops rather than skips: it must
+    /// not say "skipped", must not carry a path (the caller names the file
+    /// itself), and reaches stderr and MCP replies, so it is ASCII. Each one
+    /// still says which refusal it was.
+    #[test]
+    fn a_refusal_reason_names_the_cause_and_nothing_else() {
+        for (refused, cause) in [
+            (Refused::MultiplyLinked, "hard link"),
+            (Refused::NotAPlainFile, "not a regular file"),
+            (
+                Refused::TooLarge {
+                    len: 4096,
+                    cap: 1024,
+                },
+                "over the 1024 byte limit",
+            ),
+        ] {
+            let reason = refused.reason();
+            assert!(reason.contains(cause), "{refused:?}: {reason}");
+            assert!(!reason.contains("skipped"), "{refused:?}: {reason}");
+            assert!(
+                !reason.contains('/') && !reason.contains('\\'),
+                "{refused:?}: {reason}"
+            );
+            assert!(reason.is_ascii(), "{refused:?}: {reason}");
+        }
     }
 
     /// Every refusal reaches stderr, and AGENTS.md keeps stderr ASCII.
