@@ -3849,10 +3849,11 @@ mod tests {
     ///
     /// The two are told apart by one fact only: the spelling check's message
     /// is the one a misspelled document gets, so the range check's must not
-    /// be. `kb` has to hold `a.md` for that reference answer. What the range
-    /// check says beyond that is left open on purpose -- its message still
-    /// differs by whether something is at the far end of the link, and this
-    /// test must not be what stops that from being made uniform.
+    /// be. The knowledge base has to hold `a.md` for that reference answer.
+    /// What the range check says beyond that is left open on purpose -- its
+    /// message still differs by whether something is at the far end of the
+    /// link, and this test must not be what stops that from being made
+    /// uniform.
     fn expect_range_refusal(kb: &std::path::Path, rel: &str) {
         let misspelled = ask_for_document(kb, "./a.md");
         assert_eq!(

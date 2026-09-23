@@ -335,7 +335,7 @@ pub(crate) fn read_checked(path: &Path, cap: u64) -> std::io::Result<Content> {
 /// [`read_checked`] for a file the command cannot go on without reading: the
 /// golden file, the eval history, the frontmatter schema.
 ///
-/// `Ok(None)` when nothing is at `path` -- the open failed with "not found" --
+/// `Ok(None)` when nothing is there -- the open failed with "not found" --
 /// so each caller decides what absence means. A refusal is an error naming
 /// the file and [`Refused::reason`], worded as a refusal rather than a skip,
 /// since these callers stop. Any other failure to open or read is an error
