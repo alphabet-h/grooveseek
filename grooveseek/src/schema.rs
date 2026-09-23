@@ -1129,7 +1129,8 @@ pattern = '^\d{4}-\d{2}-\d{2}$'"#,
     /// field that can be looked for rather than only `is_some`.
     const DECLARES_STATUS: &str = "[fields.status]\nenum = [\"active\"]\n";
 
-    /// The error `load_optional` returns for `path`, with its causes.
+    /// The error [`Schema::load_optional`] returns for the given file, with its
+    /// causes.
     fn load_error(path: &Path) -> String {
         match Schema::load_optional(path) {
             Err(e) => format!("{e:#}"),

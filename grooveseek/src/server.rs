@@ -3667,9 +3667,10 @@ mod tests {
         }
     }
 
-    /// Every form of `path` a caller could type: the canonical absolute path,
-    /// and on Windows the same path without the verbatim `\\?\` prefix that
-    /// `canonicalize` adds -- the form a person would actually write.
+    /// Every form of the given path a caller could type: the canonical
+    /// absolute path, and on Windows the same path without the verbatim
+    /// `\\?\` prefix that `canonicalize` adds -- the form a person would
+    /// actually write.
     fn absolute_spellings(path: &std::path::Path) -> Vec<String> {
         let canonical = path.to_str().expect("scratch paths are UTF-8").to_string();
         let mut out = vec![canonical.clone()];

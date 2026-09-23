@@ -176,12 +176,12 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// inside it and names something on this side of the OS's path syntax.
 ///
 /// Two callers ask it. [`parse`] asks it of a `kb://` URI, and the path check
-/// in [`crate::server`] behind `get_document` and `get_best_practice`
-/// (`validate_get_document_path`) asks it of the requested string before
-/// anything on disk is looked at (AW-01): `Path::join` replaces
-/// the knowledge base with an absolute right-hand side, so an absolute path,
-/// a drive or a UNC share would otherwise be stat'ed wherever it points --
-/// outside the knowledge base, or across the network on Windows. Neither
+/// in [`crate::server`] behind `get_document` and `get_best_practice` asks it
+/// of the requested string before anything on disk is looked at (AW-01):
+/// `Path::join` replaces the knowledge base with an absolute right-hand side,
+/// so an absolute path, a drive or a UNC share would otherwise be stat'ed
+/// wherever it points -- outside the knowledge base, or across the network on
+/// Windows. Neither
 /// caller keeps a copy of the rule (AGENTS.md, "One question gets one
 /// implementation"). The empty string passes here and each caller decides
 /// about it: the URI parser reads it as the root topic group, while a
