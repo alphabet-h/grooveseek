@@ -239,11 +239,11 @@ pub(super) fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> boo
 /// `err.error.contains("...")` assertion 完全保持)。
 ///
 /// - [`Self::Found`] (中身は canonical path) — 段階防御をすべて通過、canonical な絶対パス
-/// - `NotFound(ErrorResponse)` — not-a-relative-path (AW-01) / file-not-found /
+/// - [`Self::NotFound`] — not-a-relative-path (AW-01) / file-not-found /
 ///   canonicalize-failed / outside-kb / not-canonical-spelling /
 ///   extension-denied / size-exceeded の総称。`get_best_practice`
 ///   の template loop では「次 template を試す」価値ありと解釈
-/// - `Denied(ErrorResponse)` — symlink hit のみ (security event)。
+/// - [`Self::Denied`] — symlink hit のみ (security event)。
 ///   `get_best_practice` の template loop では即 break = 攻撃 indicator を
 ///   surface
 #[derive(Debug)]
