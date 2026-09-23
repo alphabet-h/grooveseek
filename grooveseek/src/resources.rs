@@ -379,13 +379,6 @@ fn holds_a_character_win32_refuses(p: &str) -> bool {
 /// because [`doc_is_addressable`] refuses its name (ADR-0023). One function so
 /// the two stay in step, the way [`crate::links::refusal_reason`] does for
 /// hard links. ASCII, since it goes to stderr (AGENTS.md).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the index walk and the watcher are not wired to it yet"
-    )
-)]
 pub(crate) fn unspellable_reason(path: &std::path::Path, is_dir: bool) -> String {
     format!(
         concat!(
