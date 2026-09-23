@@ -53,14 +53,15 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # document chunks and search queries are sent there. Use one shared `model`, or
 # set both role-specific aliases. `dimension` is required and is checked on
 # every response without probing the endpoint first.
-[embedding]
-provider = "openai-compatible"
-endpoint = "http://127.0.0.1:8001/v1/embeddings"
-query_model = "query-model"
-document_model = "document-model"
-dimension = 768
+# [embedding]
+# provider = "openai-compatible"
+# endpoint = "http://127.0.0.1:8001/v1/embeddings"
+# query_model = "query-model"
+# document_model = "document-model"
+# dimension = 768
+# request_dimensions = false
 # api_key = "secret" # GROOVE_EMBEDDING_API_KEY takes precedence
-timeout_seconds = 60
+# timeout_seconds = 60
 
 # Per-chunk quality filter. Enabled by default, threshold 0.3.
 # Set `enabled = false` to restore the previous (filter-off) behavior (return every chunk).

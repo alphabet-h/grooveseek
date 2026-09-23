@@ -136,6 +136,7 @@
 #query_model = "query-model"
 #document_model = "document-model"
 #dimension = 768
+#request_dimensions = false
 #api_key = "secret"
 #timeout_seconds = 60
 

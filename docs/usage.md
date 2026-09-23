@@ -37,6 +37,7 @@ endpoint = "http://127.0.0.1:8001/v1/embeddings"
 query_model = "query-model"
 document_model = "document-model"
 dimension = 768
+request_dimensions = false
 timeout_seconds = 60
 ```
 
@@ -46,11 +47,13 @@ a Git ancestor has this section ignored, restoring FastEmbed; see
 [Trusted and untrusted config locations](configuration.md#trusted-and-untrusted-config-locations).
 
 Each request uses the OpenAI-compatible `POST /v1/embeddings` JSON shape with
-`model`, `input`, and `dimensions`. Set one `model` alias for both roles, or set
-both `query_model` and `document_model` as above. `dimension` is mandatory:
+`model` and `input`. Set `request_dimensions = true` only for an endpoint that
+supports the optional `dimensions` field. Set one `model` alias for both roles,
+or set both `query_model` and `document_model` as above. `dimension` is mandatory:
 groove uses it to open or validate the vector index before constructing the
 HTTP provider, then rejects any response whose vectors have a different size.
-It does not probe the endpoint. An optional `api_key` is sent as a bearer token;
+Requests are sent in batches of at most 64 inputs. Groove does not probe the
+endpoint. An optional `api_key` is sent as a bearer token;
 `GROOVE_EMBEDDING_API_KEY` takes precedence and avoids storing the token in the
 file.
 

@@ -125,6 +125,8 @@ pub struct EmbeddingConfig {
     pub document_model: Option<String>,
     /// Expected output dimension, known before any request is sent.
     pub dimension: Option<usize>,
+    /// Send the non-universal `dimensions` request field when true.
+    pub request_dimensions: Option<bool>,
     /// Optional bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence.
     pub api_key: Option<String>,
     /// HTTP request timeout. Omitted values use 60 seconds.
@@ -140,6 +142,7 @@ impl std::fmt::Debug for EmbeddingConfig {
             .field("query_model", &self.query_model)
             .field("document_model", &self.document_model)
             .field("dimension", &self.dimension)
+            .field("request_dimensions", &self.request_dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("timeout_seconds", &self.timeout_seconds)
             .finish()
@@ -155,6 +158,7 @@ impl Default for EmbeddingConfig {
             query_model: None,
             document_model: None,
             dimension: None,
+            request_dimensions: None,
             api_key: None,
             timeout_seconds: None,
         }
@@ -167,69 +171,45 @@ impl EmbeddingConfig {
             .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS)
     }
 
-    fn validate_shape(&self) -> Result<()> {
-        match self.provider {
-            EmbeddingProviderKind::Fastembed => {
-                if self.endpoint.is_some()
-                    || self.dimension.is_some()
-                    || self.api_key.is_some()
-                    || self.query_model.is_some()
-                    || self.document_model.is_some()
-                    || self.timeout_seconds.is_some()
-                {
-                    anyhow::bail!(
-                        "[embedding] external provider fields require provider = \"openai-compatible\""
-                    );
-                }
-                if let Some(model) = self.model.as_deref() {
-                    parse_fastembed_model(model)?;
-                }
-            }
-            EmbeddingProviderKind::OpenaiCompatible => {
-                anyhow::ensure!(
-                    self.endpoint
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "[embedding].endpoint is required for provider = \"openai-compatible\""
-                );
-                let has_shared = self
-                    .model
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty());
-                let has_query = self
-                    .query_model
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty());
-                let has_document = self
-                    .document_model
-                    .as_ref()
-                    .is_some_and(|value| !value.trim().is_empty());
-                anyhow::ensure!(
-                    has_shared || (has_query && has_document),
-                    "[embedding] requires `model`, or both `query_model` and `document_model`, \
-                     for provider = \"openai-compatible\""
-                );
-                anyhow::ensure!(
-                    self.dimension.is_some_and(|value| value > 0),
-                    "[embedding].dimension must be greater than zero for provider = \"openai-compatible\""
-                );
-                anyhow::ensure!(
-                    self.effective_timeout_seconds() > 0,
-                    "[embedding].timeout_seconds must be greater than zero"
-                );
-            }
+    fn resolve_fastembed(&self, fallback: ModelChoice) -> Result<EmbeddingSettings> {
+        if self.endpoint.is_some()
+            || self.dimension.is_some()
+            || self.request_dimensions.is_some()
+            || self.api_key.is_some()
+            || self.query_model.is_some()
+            || self.document_model.is_some()
+            || self.timeout_seconds.is_some()
+        {
+            anyhow::bail!(
+                "[embedding] external provider fields require provider = \"openai-compatible\""
+            );
         }
-        Ok(())
+        let choice = match self.model.as_deref() {
+            Some(model) => ModelChoice::from_model_id(model)?,
+            None => fallback,
+        };
+        Ok(EmbeddingSettings::fastembed(choice))
     }
-}
 
-fn parse_fastembed_model(model: &str) -> Result<ModelChoice> {
-    match model {
-        "bge-small-en-v1.5" => Ok(ModelChoice::BgeSmallEnV15),
-        "bge-m3" => Ok(ModelChoice::BgeM3),
-        _ => anyhow::bail!(
-            "unsupported FastEmbed model {model:?}; expected bge-small-en-v1.5 or bge-m3"
-        ),
+    fn resolve_openai_compatible(&self, env_api_key: Option<String>) -> Result<EmbeddingSettings> {
+        let endpoint = self.endpoint.clone().unwrap_or_default();
+        let shared = self.model.as_deref();
+        let query_model = self.query_model.as_deref().or(shared).unwrap_or_default();
+        let document_model = self
+            .document_model
+            .as_deref()
+            .or(shared)
+            .unwrap_or_default();
+        let config = OpenAiCompatibleConfig::new(
+            endpoint,
+            query_model.to_string(),
+            document_model.to_string(),
+            self.dimension.unwrap_or_default(),
+            self.request_dimensions.unwrap_or(false),
+            resolve_embedding_api_key(env_api_key, self.api_key.clone()),
+            Duration::from_secs(self.effective_timeout_seconds()),
+        )?;
+        Ok(EmbeddingSettings::openai_compatible(config))
     }
 }
 
@@ -1267,17 +1247,7 @@ impl Config {
     /// 消費点である `Transport::resolve` の HTTP arm が見る
     /// (`transport::http::check_origin_list` の doc が理由を持っている)。
     pub fn validate(&self) -> Result<()> {
-        if let Some(embedding) = &self.embedding {
-            embedding.validate_shape()?;
-            if matches!(embedding.provider, EmbeddingProviderKind::OpenaiCompatible)
-                && self.model.is_some()
-            {
-                anyhow::bail!(
-                    "top-level `model` config is only for FastEmbed; remove it when \
-                     [embedding].provider = \"openai-compatible\""
-                );
-            }
-        }
+        self.resolve_configured_embedding_from(None)?;
         if let Some(s) = &self.search {
             // low_confidence 閾値。規則は `check_confidence_ratio` に 1 つだけ置き、
             // CLI の `--min-confidence-ratio` と共有する。toml 経路にゲートが要るのは
@@ -1375,17 +1345,19 @@ impl Config {
             return Ok(EmbeddingSettings::fastembed(choice));
         }
 
+        self.resolve_configured_embedding_from(env_api_key)
+    }
+
+    fn resolve_configured_embedding_from(
+        &self,
+        env_api_key: Option<String>,
+    ) -> Result<EmbeddingSettings> {
         let Some(embedding) = &self.embedding else {
             return Ok(EmbeddingSettings::fastembed(self.model.unwrap_or_default()));
         };
-        embedding.validate_shape()?;
         match embedding.provider {
             EmbeddingProviderKind::Fastembed => {
-                let choice = match embedding.model.as_deref() {
-                    Some(model) => parse_fastembed_model(model)?,
-                    None => self.model.unwrap_or_default(),
-                };
-                Ok(EmbeddingSettings::fastembed(choice))
+                embedding.resolve_fastembed(self.model.unwrap_or_default())
             }
             EmbeddingProviderKind::OpenaiCompatible => {
                 anyhow::ensure!(
@@ -1393,32 +1365,7 @@ impl Config {
                     "top-level `model` config is only for FastEmbed; remove it when \
                      [embedding].provider = \"openai-compatible\""
                 );
-                let shared = embedding.model.as_deref();
-                let query_model = embedding
-                    .query_model
-                    .as_deref()
-                    .or(shared)
-                    .expect("validated query model")
-                    .to_string();
-                let document_model = embedding
-                    .document_model
-                    .as_deref()
-                    .or(shared)
-                    .expect("validated document model")
-                    .to_string();
-                let config = OpenAiCompatibleConfig::new(
-                    embedding
-                        .endpoint
-                        .as_ref()
-                        .expect("validated endpoint")
-                        .clone(),
-                    query_model,
-                    document_model,
-                    embedding.dimension.expect("validated dimension"),
-                    resolve_embedding_api_key(env_api_key, embedding.api_key.clone()),
-                    Duration::from_secs(embedding.effective_timeout_seconds()),
-                )?;
-                Ok(EmbeddingSettings::openai_compatible(config))
+                embedding.resolve_openai_compatible(env_api_key)
             }
         }
     }
@@ -2138,6 +2085,7 @@ mod tests {
             query_model: Some("query-model".to_string()),
             document_model: Some("document-model".to_string()),
             dimension: Some(768),
+            request_dimensions: None,
             api_key: Some("config-secret".to_string()),
             timeout_seconds: Some(30),
         }
@@ -2192,11 +2140,18 @@ mod tests {
 
     #[test]
     fn external_embedding_requires_endpoint_models_dimension_and_timeout() {
+        let resolve = |embedding| {
+            Config {
+                embedding: Some(embedding),
+                ..Config::default()
+            }
+            .resolve_embedding_from(None, None)
+        };
+
         let mut embedding = external_embedding_config();
         embedding.endpoint = None;
         assert!(
-            embedding
-                .validate_shape()
+            resolve(embedding)
                 .unwrap_err()
                 .to_string()
                 .contains("endpoint")
@@ -2204,19 +2159,12 @@ mod tests {
 
         let mut embedding = external_embedding_config();
         embedding.query_model = None;
-        assert!(
-            embedding
-                .validate_shape()
-                .unwrap_err()
-                .to_string()
-                .contains("both")
-        );
+        assert!(resolve(embedding).unwrap_err().to_string().contains("both"));
 
         let mut embedding = external_embedding_config();
         embedding.dimension = Some(0);
         assert!(
-            embedding
-                .validate_shape()
+            resolve(embedding)
                 .unwrap_err()
                 .to_string()
                 .contains("dimension")
@@ -2225,8 +2173,7 @@ mod tests {
         let mut embedding = external_embedding_config();
         embedding.timeout_seconds = Some(0);
         assert!(
-            embedding
-                .validate_shape()
+            resolve(embedding)
                 .unwrap_err()
                 .to_string()
                 .contains("timeout")
@@ -2240,8 +2187,20 @@ mod tests {
             ..EmbeddingConfig::default()
         };
         let err = embedding
-            .validate_shape()
+            .resolve_fastembed(ModelChoice::default())
             .expect_err("FastEmbed must reject an HTTP-only timeout");
+        assert!(err.to_string().contains("external provider fields"));
+    }
+
+    #[test]
+    fn fastembed_embedding_rejects_explicit_http_only_dimensions_flag() {
+        let embedding = EmbeddingConfig {
+            request_dimensions: Some(false),
+            ..EmbeddingConfig::default()
+        };
+        let err = embedding
+            .resolve_fastembed(ModelChoice::default())
+            .expect_err("FastEmbed must reject an explicit HTTP-only setting");
         assert!(err.to_string().contains("external provider fields"));
     }
 
