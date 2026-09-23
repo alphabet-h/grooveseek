@@ -32,8 +32,11 @@ who may turn outbound embedding on.**
 ## Decision drivers
 
 - The default must not move. A FastEmbed index built by v1.12.0 has to open
-  unchanged, and an installation that says nothing about providers must send
-  nothing anywhere.
+  unchanged, and in an installation that says nothing about providers no
+  document chunk and no query may leave the process. The default's only
+  outbound traffic stays the one-time model download from Hugging Face on a
+  first run without a cache (`FastEmbedProvider` and `resolve_cache_dir` in
+  `grooveseek/src/embedder.rs`).
 - Retrieval models are often asymmetric: a query and a document are embedded
   differently, sometimes by different model aliases. The seam has to keep the
   two apart so the indexer and search pipeline never learn which provider does
@@ -133,6 +136,13 @@ stays the default implementation; the second is a vendor-neutral client for
   aliases at a different endpoint, or at the same endpoint after a redeploy,
   now produce a different embedding space. When that happens the operator has
   to run `groove index --force` themselves, and nothing warns them.
+  `request_dimensions` is left out too (the test
+  `openai_compatible_identity_covers_both_models_and_dimension` pins that
+  toggling it keeps the identity). The declared `dimension` is checked on every
+  response regardless, so toggling whether `dimensions` is sent cannot change
+  the vector size unnoticed. It can change which vectors a server returns, if
+  the server shortens its output differently from how it answers without the
+  field, and that too is the operator's to keep stable.
 - **GrooveSeek never probes the endpoint.** `dimension` is mandatory for the
   external provider. The identity is resolved into `EmbeddingSettings` before
   any provider exists, and `verify_embedding_meta`

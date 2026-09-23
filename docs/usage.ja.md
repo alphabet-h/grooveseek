@@ -57,8 +57,8 @@ bearer token として送られる。`GROOVE_EMBEDDING_API_KEY` が設定され�
 優先され、token をファイルに書かずに済む。
 
 provider、どちらかの model alias、または次元を変えると、実行時の設定が既存インデックスと
-合わなくなり `groove index --force` が必要になる。`endpoint`、`api_key`、`timeout_seconds`
-を変えてもそうはならない。これらは記録される identity に含まれないので、alias の背後の
+合わなくなり `groove index --force` が必要になる。`endpoint`、`api_key`、
+`request_dimensions`、`timeout_seconds` を変えてもそうはならない。これらは記録される identity に含まれないので、alias の背後の
 model が変わっても groove には分からない。endpoint が同じ alias で別の model を返すように
 なったら、自分で `groove index --force` を実行すること。そうしないと、古い document の
 ベクトルと新しいクエリのベクトルがエラーも出ずに一緒に検索される。`--model` は従来どおりの意味を保ち、

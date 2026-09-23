@@ -31,7 +31,10 @@ vendor ごとの作法を覚えるのではなく、という要望が出た (is
 ## 判断の軸
 
 - **既定は動かさない**。v1.12.0 が作った FastEmbed の索引はそのまま開けなければならず、
-  provider について何も書いていない環境は、どこへも何も送ってはならない
+  provider について何も書いていない環境では、**document の chunk も query も
+  プロセスの外へ出てはならない**。既定の外向き通信は、キャッシュの無い初回実行で
+  Hugging Face からモデルを 1 度ダウンロードすることだけのまま保つ
+  (`grooveseek/src/embedder.rs` の `FastEmbedProvider` と `resolve_cache_dir`)
 - retrieval のモデルは非対称なことが多い: query と document は別の埋め込み方をされ、
   別の model alias を使うこともある。継ぎ目はその 2 つを分けたまま保ち、
   **indexer や検索パイプラインがどの provider が何をするかを知らずに済む**ようにする
@@ -120,7 +123,13 @@ vendor 非依存のクライアントとする。**
   代償もはっきり書いておく: 同じ alias が別の endpoint で、あるいは同じ endpoint でも
   再デプロイ後に、**別の embedding 空間を返すようになっても GrooveSeek は検知できない**。
   そうなったときは運用者が自分で `groove index --force` を走らせる必要があり、
-  それを知らせるものは何も無い
+  それを知らせるものは何も無い。
+  `request_dimensions` も外してある (試験
+  `openai_compatible_identity_covers_both_models_and_dimension` が、切り替えても
+  identity が変わらないことを固定している)。宣言した `dimension` はどのみち応答ごとに
+  検査されるので、`dimensions` を送るかどうかを切り替えても、ベクトルの大きさが
+  気づかれずに変わることはない。ただし、フィールドがある時と無い時でサーバの出力の
+  縮め方が違えば、**返ってくるベクトルそのものは変わりうる**。それを保つのも運用者である
 - **GrooveSeek は endpoint を probe しない**。外部 provider では `dimension` が必須である。
   identity は provider が存在する前に `EmbeddingSettings` へ解決され、
   `verify_embedding_meta` (`grooveseek/src/db/meta.rs`) はその settings に対して、

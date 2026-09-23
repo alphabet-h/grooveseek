@@ -123,11 +123,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   refused as incompatible, the way switching `--model` always was. The hint
   that refusal prints now names `--config`, since an external provider is
   configured there rather than on the command line. An index built with the
-  default FastEmbed model is unaffected. `endpoint`, `api_key` and
-  `timeout_seconds` are outside the identity, so the operator owns the
-  guarantee that an alias keeps meaning the same model: groove cannot detect a
-  redeployed endpoint or another one serving a different model under the same
-  alias, and needs `groove index --force` run by hand in that case. (#316)
+  default FastEmbed model is unaffected. `endpoint`, `api_key`,
+  `request_dimensions` and `timeout_seconds` are outside the identity, so the
+  operator owns the guarantee that an alias keeps meaning the same model:
+  groove cannot detect a redeployed endpoint or another one serving a
+  different model under the same alias, and needs `groove index --force` run
+  by hand in that case. (#316)
 - **`GROOVE_EMBEDDING_API_KEY` joins the frozen environment variables** in
   [docs/stability.md](docs/stability.md). Changing the default provider is a
   major change for the same reason changing the default model is. (#316)
