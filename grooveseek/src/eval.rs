@@ -70,10 +70,15 @@ fn is_present(path: &Path) -> Result<bool> {
 
 /// Read one of those two files, bounded, from the handle the check was made on.
 ///
-/// [`crate::links::read_checked`] is the same route `.grooveignore` takes, so a
-/// hard link, a FIFO, something that is not a regular file, or a file over the
-/// cap is a **refusal** rather than an unbounded read. The refusal message
-/// names the path and the reason.
+/// [`crate::links::read_required`] is the checked read `.grooveignore` takes,
+/// with a refusal made an error, so a hard link, a FIFO, something that is not
+/// a regular file, or a file over the cap is a **refusal** rather than an
+/// unbounded read. The refusal message names the path and the reason. The
+/// schema loader goes through the same function, so the two cannot come to
+/// word a refusal differently.
+///
+/// [`is_present`] has already said the name is taken, so a file that is gone
+/// by the time it is opened is a failure to read it, not an absence.
 ///
 /// **The symlink half is Unix-only**, and that is `links`'s decision rather
 /// than an omission here: its module documentation records that making one on
@@ -82,14 +87,12 @@ fn is_present(path: &Path) -> Result<bool> {
 /// placeholder. Saying "a symlink is refused" without that scope would be a
 /// promise this does not keep (codex P2 on PR #203).
 fn read_bounded(path: &Path, cap: u64, what: &str) -> Result<Vec<u8>> {
-    match crate::links::read_checked(path, cap) {
-        Ok(crate::links::Content::Bytes(b)) => Ok(b),
-        Ok(crate::links::Content::Refused(r)) => {
-            anyhow::bail!("refusing to read the {what}: {}", r.log_line(path))
-        }
-        Err(e) => Err(anyhow::Error::new(e))
-            .with_context(|| format!("failed to read the {what}: {}", path.display())),
-    }
+    crate::links::read_required(path, cap, what)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to read the {what}: {}: it was gone by the time it was opened",
+            path.display()
+        )
+    })
 }
 
 // ---------- Golden ----------

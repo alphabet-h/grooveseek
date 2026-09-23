@@ -30,7 +30,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is now refused before anything on disk is looked at, with the answer a
   misspelled path already gets. It is the rule `kb://doc/` URIs were already
   held to. `get_best_practice` skips such a template like a missing one and
-  tries the next.
+  tries the next. One route keeps the two replies apart: a directory symlink
+  (or on Windows a junction) placed inside the knowledge base that leads out
+  of it still gets "outside the knowledge base" when something is at the far
+  end and "File not found" when nothing is — but that route needs write access
+  to the knowledge base.
 - **`groove-schema.toml` is read through the same checks as `.grooveignore`.**
   It was the one file in the knowledge base read without them: no size limit,
   a symlink followed, a named pipe waited on. The MCP `rebuild_index` tool
@@ -46,10 +50,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   the `rebuild_index` tool report it as a schema load error instead of running
   without it, since the schema decides which fields the index holds. That
   includes a hard-linked schema and, on Unix, a symlinked one, both of which
-  were read through until now: replace the link with a copy. A schema file
-  that cannot be opened for another reason than being absent, such as a
-  permission error, is an error too, where it used to be taken for no schema.
-  `groove validate --schema <path>` is held to the same checks.
+  were read through until now: replace the link with a copy. A schema path
+  that cannot even be looked at — a directory on the way that cannot be
+  entered, a symlink loop and, on Unix, a path component that is a file or a
+  dangling symlink — stops the command too, where it used to be taken for no
+  schema at all; only a path where nothing exists counts as no schema now. A file whose own permissions
+  refuse the read was already an error. `groove validate --schema <path>` is
+  held to the same checks.
 - **On Linux and macOS, `get_document` no longer opens a file whose name holds
   `..` between backslashes**, such as one literally named `a\..\b.md`. Its
   `kb://doc/` URI was already refused for the same reason: nothing that reads

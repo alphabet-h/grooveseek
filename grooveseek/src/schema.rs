@@ -46,8 +46,9 @@ use crate::parser::{FieldValue, Frontmatter, ParsedDocument};
 /// while holding the embedder and the database: an unbounded read of whatever
 /// lands on that name stalls every tool. The golden file's megabyte
 /// ([`crate::eval::MAX_GOLDEN_FILE_BYTES`]) rather than the 64 KiB
-/// `.grooveignore` gets, because both are written by a person and a schema
-/// listing long `enum`s can outgrow the smaller one.
+/// `.grooveignore` gets ([`crate::exclusion::MAX_IGNORE_FILE_BYTES`]),
+/// because both are written by a person and a schema listing long `enum`s can
+/// outgrow the smaller one.
 pub const MAX_SCHEMA_FILE_BYTES: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -187,35 +188,34 @@ impl Schema {
 
     /// ファイルパスから読み込み。存在しなければ `None` を返す。
     ///
-    /// (AW-02) Read through [`crate::links::read_checked`], the route
-    /// `.grooveignore`, the golden file and every indexed document take: a hard
-    /// link, anything that is not a regular file (a named pipe included, which
-    /// the open does not wait on), a file over [`MAX_SCHEMA_FILE_BYTES`] and, on
-    /// Unix, a symlink are refused. A refusal is an **error**, not an absent
-    /// schema. `.grooveignore` fails open because what it bounds is noise in
-    /// the index; the schema decides which fields the index holds, so running
-    /// on without it would change the index. Every caller -- `groove index`,
-    /// `groove validate`, `groove doctor` and the MCP rebuild tool -- goes
-    /// through here, so they refuse alike.
+    /// (AW-02) Read through [`crate::links::read_required`], as the golden file
+    /// is: the checked read [`crate::links::read_checked`] that `.grooveignore`
+    /// and every indexed document also go through, with its refusals made
+    /// errors. A hard link, anything that is not a regular file (a named pipe
+    /// included, which the open does not wait on), a file over
+    /// [`MAX_SCHEMA_FILE_BYTES`] and, on Unix, a symlink are refused. A refusal
+    /// is an **error**, not an absent schema. `.grooveignore` fails open
+    /// because what it bounds is noise in the index; the schema decides which
+    /// fields the index holds, so running on without it would change the
+    /// index. Every caller -- `groove index`, `groove validate`, `groove
+    /// doctor` and the MCP rebuild tool -- goes through here, so they refuse
+    /// alike.
     ///
     /// Absence is the open failing with "not found", rather than a
     /// `Path::exists` taken first, so nothing can be put under the name between
-    /// the look and the read. Any other failure to open is an error, where
-    /// `Path::exists` used to answer "no schema" for it.
+    /// the look and the read. `Path::exists` is a stat that follows links, and
+    /// it answered "no schema" whenever that stat failed -- a directory on the
+    /// way that cannot be entered, a symlink loop and, on Unix, a component
+    /// that is a file or a dangling symlink. Those are errors now. A file whose
+    /// own permissions refuse the read passed the stat and failed at the read,
+    /// so it was an error before as well.
     pub fn load_optional(path: &Path) -> Result<Option<Self>> {
-        let bytes = match crate::links::read_checked(path, MAX_SCHEMA_FILE_BYTES) {
-            Ok(crate::links::Content::Bytes(bytes)) => bytes,
-            Ok(crate::links::Content::Refused(refused)) => {
-                anyhow::bail!("refusing to read the schema: {}", refused.log_line(path))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("failed to read schema: {}", path.display()));
-            }
+        let Some(bytes) = crate::links::read_required(path, MAX_SCHEMA_FILE_BYTES, "schema")?
+        else {
+            return Ok(None);
         };
         let text = String::from_utf8(bytes)
-            .with_context(|| format!("failed to read schema: {}", path.display()))?;
+            .with_context(|| format!("failed to read the schema: {}", path.display()))?;
         let schema = Self::from_toml_str(&text)
             .with_context(|| format!("failed to compile schema: {}", path.display()))?;
         Ok(Some(schema))
@@ -1184,6 +1184,22 @@ pattern = '^\d{4}-\d{2}-\d{2}$'"#,
         assert!(
             err.contains("byte limit"),
             "the refusal names the cap: {err}"
+        );
+    }
+
+    /// A directory under the schema's name is an error, not an absent schema,
+    /// on both platforms -- by a different road on each: Unix opens it and the
+    /// file-type check refuses it, Windows fails the open itself.
+    #[test]
+    fn a_directory_under_the_schema_name_is_an_error_not_an_absent_schema() {
+        let dir = SchemaDir::new("groove-schema-dir");
+        let path = dir.join("groove-schema.toml");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let err = load_error(&path);
+        assert!(
+            err.contains("groove-schema.toml"),
+            "the error names the file: {err}"
         );
     }
 

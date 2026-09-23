@@ -175,17 +175,18 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// A decoded path may be used against the knowledge base only if it stays
 /// inside it and names something on this side of the OS's path syntax.
 ///
-/// Two callers ask it. [`parse`] asks it of a `kb://` URI, and the path check
-/// in [`crate::server`] behind `get_document` and `get_best_practice` asks it
-/// of the requested string before anything on disk is looked at (AW-01):
-/// `Path::join` replaces the knowledge base with an absolute right-hand side,
-/// so an absolute path, a drive or a UNC share would otherwise be stat'ed
-/// wherever it points -- outside the knowledge base, or across the network on
-/// Windows. Neither
-/// caller keeps a copy of the rule (AGENTS.md, "One question gets one
-/// implementation"). The empty string passes here and each caller decides
-/// about it: the URI parser reads it as the root topic group, while a
-/// document path has to name a document.
+/// Two surfaces ask it. The `kb://` side asks through [`parse`], for a URI
+/// being read, and [`doc_is_addressable`], for a URI about to be handed out.
+/// The path check in [`crate::server`] behind `get_document` and
+/// `get_best_practice` asks it of the requested string before anything on disk
+/// is looked at (AW-01): `Path::join` replaces the knowledge base with an
+/// absolute right-hand side, so an absolute path, a drive or a UNC share would
+/// otherwise be stat'ed wherever it points -- outside the knowledge base, or
+/// across the network on Windows. Neither surface keeps a copy of the rule
+/// (AGENTS.md, "One question gets one implementation"). The empty string
+/// passes here and each caller decides about it: [`parse`] reads it as the
+/// root topic group, while [`doc_is_addressable`] and the document path check
+/// refuse it, since a document path has to name a document.
 ///
 /// **`\` is refused only where it separates components**
 /// ([`crate::indexer::backslash_separates_components`], the same answer the

@@ -243,7 +243,7 @@ pub(super) fn truncate_on_char_boundary(s: &mut String, max_bytes: usize) -> boo
 ///   canonicalize-failed / outside-kb / not-canonical-spelling /
 ///   extension-denied / size-exceeded の総称。`get_best_practice`
 ///   の template loop では「次 template を試す」価値ありと解釈
-/// - [`Self::Denied`] — symlink hit のみ (security event)。
+/// - [`Self::Denied`] — symlink か hard link に当たった時 (security event)。
 ///   `get_best_practice` の template loop では即 break = 攻撃 indicator を
 ///   surface
 #[derive(Debug)]
@@ -402,8 +402,12 @@ pub(crate) fn validate_get_document_path(
     // used to look at wherever an absolute path, a drive or a UNC share
     // pointed -- outside the knowledge base, across the network on Windows --
     // and only then refuse it, with a message that differed by whether
-    // something was there. The index never stores such a string, so it is not
-    // the spelling of any document and gets that answer, without a look.
+    // something was there. Such a request gets the misspelling answer, without
+    // a look. It is almost never a spelling the index holds -- the exception
+    // is a Unix file literally named with a `..` between backslashes, which
+    // the index does store and which is given up here for the reason the URI
+    // parser gives it up: nothing that reads `\` as a separator is ever handed
+    // a `..`.
     //
     // The rule is the one the `kb://` URI parser applies
     // ([`crate::resources::is_safe_relative`]), not a second copy of it. The
@@ -589,8 +593,8 @@ pub(super) enum ResolveOutcome {
     Found(PathBuf),
     /// どのテンプレートにもマッチしなかった。試行した相対パス列。
     NotFound(Vec<String>),
-    /// security event (= symlink hit) で即 break した。`validate_get_document_path`
-    /// から bubble up した `ErrorResponse` を内蔵し、handler は文言生成や prefix 追加
+    /// security event (= symlink か hard link) で即 break した。[`validate_get_document_path`]
+    /// から bubble up した [`ErrorResponse`] を内蔵し、handler は文言生成や prefix 追加
     /// なしで `serde_json::to_string_pretty(&err)` で直接 client に返却する。
     Denied(ErrorResponse),
 }
@@ -604,11 +608,11 @@ pub(super) enum ResolveOutcome {
 /// fail 種別の挙動 (F-45):
 /// - [`ValidatePathOutcome::Found`] → 即 return
 /// - [`ValidatePathOutcome::NotFound`] (not a relative path / file not found /
-///   canonicalize failed / outside-kb / extension denied / size exceeded) → 次
-///   template を試行 (err 文言は捨てて `tried` に rel path のみ記録、info leak
-///   ゼロ)。KB の外を指す template (絶対パスや `..` を含む `{target}`) は FS を
-///   見ずにここへ落ちる (AW-01)
-/// - [`ValidatePathOutcome::Denied`] (symlink hit = security event) → 即 return
+///   canonicalize failed / outside-kb / not the canonical spelling / extension
+///   denied / size exceeded) → 次 template を試行 (err 文言は捨てて `tried` に
+///   rel path のみ記録、info leak ゼロ)。KB の外を指す template (絶対パスや
+///   `..` という区間を含む `{target}`) は FS を見ずにここへ落ちる (AW-01)
+/// - [`ValidatePathOutcome::Denied`] (symlink か hard link = security event) → 即 return
 ///   [`ResolveOutcome::Denied`] (= 同じ [`ErrorResponse`] を保持、template
 ///   ordering より security event 優先)
 pub(super) fn resolve_best_practice_path(
