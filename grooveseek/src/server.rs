@@ -3741,6 +3741,37 @@ mod tests {
         assert_eq!(ask_for_document(&t.kb, ""), misspelled);
     }
 
+    /// (AW-01) The spelling check's refusal still names nothing, for spellings
+    /// that reach it. The older no-leak test asks with a `..` in the path,
+    /// which the lexical check now answers first -- in the same words, so that
+    /// test stays green whatever the spelling check says. These clear the
+    /// lexical check (asserted below), so the spelling check is what answers.
+    #[test]
+    fn the_spelling_refusal_names_nothing_for_spellings_the_lexical_check_lets_through() {
+        let kb = TempKb::new("gd-spell-leak-2b");
+        kb.write("HiddenVault/a.md", "# A\nbody\n");
+        for rel in [
+            "./HiddenVault/a.md",
+            "HiddenVault//a.md",
+            "HiddenVault/./a.md",
+        ] {
+            assert!(
+                crate::resources::is_safe_relative(rel),
+                "{rel:?} must get past the lexical check for this to test the spelling check"
+            );
+            let (variant, message) = ask_for_document(&kb.path, rel);
+            assert_eq!(variant, "NotFound", "{rel:?}: {message}");
+            assert!(
+                message.contains("spelling") && message.contains("search"),
+                "{rel:?} must be refused by the spelling check, pointing at `search`: {message}"
+            );
+            assert!(
+                !message.contains("HiddenVault"),
+                "the refusal carries a path: {message}"
+            );
+        }
+    }
+
     /// (AW-01) The Windows spellings of "somewhere else": a UNC share, which
     /// looked at would be an SMB connection to that host; the verbatim form of
     /// one; a drive with and without a root, and with either separator; a
@@ -3813,17 +3844,29 @@ mod tests {
         }
     }
 
-    /// Asserts that `rel` is refused by the range check (step 2), which is the
-    /// only step whose message says "outside the knowledge base".
+    /// Asserts that `rel` is refused by the range check (step 2) rather than by
+    /// the spelling check after it, which would refuse it too.
+    ///
+    /// The two are told apart by one fact only: the spelling check's message
+    /// is the one a misspelled document gets, so the range check's must not
+    /// be. `kb` has to hold `a.md` for that reference answer. What the range
+    /// check says beyond that is left open on purpose -- its message still
+    /// differs by whether something is at the far end of the link, and this
+    /// test must not be what stops that from being made uniform.
     fn expect_range_refusal(kb: &std::path::Path, rel: &str) {
+        let misspelled = ask_for_document(kb, "./a.md");
+        assert_eq!(
+            misspelled.0, "NotFound",
+            "the reference answer needs `a.md` in the knowledge base: {misspelled:?}"
+        );
         let (variant, message) = ask_for_document(kb, rel);
         assert_eq!(
             variant, "NotFound",
             "{rel:?} leads out of the knowledge base: {message}"
         );
-        assert!(
-            message.contains("outside the knowledge base"),
-            "{rel:?} must be refused by the range check, not by a later step: {message}"
+        assert_ne!(
+            message, misspelled.1,
+            "{rel:?} must be refused by the range check, not by the spelling check after it"
         );
     }
 
@@ -3836,6 +3879,7 @@ mod tests {
     #[test]
     fn a_directory_symlink_out_of_the_knowledge_base_is_refused_by_the_range_check() {
         let t = KbWithOutside::new("gd-range-unix");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
         fs::write(t.outside.join("secret.md"), "secret").unwrap();
         std::os::unix::fs::symlink(&t.outside, t.kb.join("escape"))
             .expect("creating a directory symlink");
@@ -3849,6 +3893,7 @@ mod tests {
     #[test]
     fn a_junction_out_of_the_knowledge_base_is_refused_by_the_range_check() {
         let t = KbWithOutside::new("gd-range-win");
+        fs::write(t.kb.join("a.md"), "# A\n").unwrap();
         fs::write(t.outside.join("secret.md"), "secret").unwrap();
         let link = t.kb.join("escape");
         // `mklink` is handed the paths without the verbatim prefix.
