@@ -621,6 +621,13 @@ fn should_process_parts(
     {
         return false;
     }
+    // (ADR-0023) Below the extension filter, as in the walk, so only a file
+    // that would otherwise have been indexed is named in a warning. Reindex,
+    // Deindex and both ends of a rename come through here, so a rename onto
+    // such a name deindexes the old row.
+    if !name_is_addressable(rel, full, is_dir) {
+        return false;
+    }
     // (BU-20) A hard link is the same attack with no symlink to see: a second
     // name for a file that may live outside the KB, creatable without read
     // access to it and without any privilege on Windows.
@@ -638,6 +645,26 @@ fn should_process_parts(
         return false;
     }
     true
+}
+
+/// (ADR-0023) Whether the index can hold `rel`, logging the refusal when it
+/// cannot: the same predicate the full walk, `get_document` and the
+/// `kb://doc/` URI side ask ([`crate::resources::doc_is_addressable`]).
+///
+/// Judged on `rel` as [`to_rel`] recovered it, never on the raw event path.
+/// The walk judges no name under a spelling of the knowledge base other than
+/// `kb_path`'s (there is no relative path to judge there), and leaves those to
+/// this relativizing. The empty string is the knowledge base itself, which is
+/// no document name and is turned away elsewhere.
+fn name_is_addressable(rel: &str, full: &Path, is_dir: bool) -> bool {
+    if rel.is_empty() || crate::resources::doc_is_addressable(rel) {
+        return true;
+    }
+    wdiag!(
+        "watcher: {}",
+        crate::resources::unspellable_reason(full, is_dir)
+    );
+    false
 }
 
 /// 絶対パスを kb_path 相対 (forward-slash) に変換。kb_path 外ならエラーを
@@ -668,16 +695,12 @@ fn to_rel(kb_path: &Path, full: &Path) -> Option<String> {
 ///
 /// Filtering is [`crate::indexer::collect_source_files_under`]'s, i.e. the full
 /// index walk's, so a directory drop and a later `groove index` agree about
-/// what belongs in the index. Re-checking with [`should_process`] here would be
+/// what belongs in the index -- plus the one name check the walk leaves to the
+/// watcher ([`new_directory_rels`]). Re-checking with [`should_process`] here would be
 /// a second implementation of the same question, which is exactly how the
 /// watcher and the walk drifted apart twice before (AU-03, BU-19).
 fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
-    let found = match crate::indexer::collect_source_files_under(
-        &state.kb_path,
-        dir,
-        &state.registry,
-        &state.rules,
-    ) {
+    let found = match new_directory_rels(&state.kb_path, dir, &state.registry, &state.rules) {
         Ok(found) => found,
         Err(e) => {
             // Not retried, and the consequence is stated rather than implied
@@ -714,11 +737,31 @@ fn dispatch_new_directory(state: &WatcherState, dir: &Path, rel: &str) {
         found.len(),
         if found.len() == 1 { "" } else { "s" }
     );
-    for f in &found {
-        if let Some(frel) = to_rel(&state.kb_path, f) {
-            dispatch_reindex(state, &frel);
-        }
+    for frel in &found {
+        dispatch_reindex(state, frel);
     }
+}
+
+/// The relative paths [`dispatch_new_directory`] reindexes: the walk's files
+/// under `dir`, relativized by [`to_rel`], minus a name the index cannot hold.
+///
+/// (ADR-0023) The walk already leaves such names out under `kb_path` as
+/// spelled, but an event can arrive under another spelling of the same
+/// directory, where the walk judges no name ([`name_is_addressable`]). The
+/// name is judged here on the recovered `rel`, the one that would be written,
+/// which is the one question the walk left to the watcher -- not a second
+/// filter over the rest.
+fn new_directory_rels(
+    kb_path: &Path,
+    dir: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> Result<Vec<String>> {
+    let found = crate::indexer::collect_source_files_under(kb_path, dir, registry, rules)?;
+    Ok(found
+        .iter()
+        .filter_map(|f| to_rel(kb_path, f).filter(|r| name_is_addressable(r, f, false)))
+        .collect())
 }
 
 /// Drop the row a version up to 1.12.0 stored for `rel` under its folded
@@ -1312,6 +1355,121 @@ mod tests {
         assert!(
             walked.contains("notes/deep/x.md"),
             "`notes/*.md` must not reach a deeper level"
+        );
+    }
+
+    /// (ADR-0023) The walk and the watcher agree about names Windows cannot
+    /// open as written, and the answer is "not indexed": a device name at file
+    /// level, a directory ending in a dot or a space above the file. A rename
+    /// onto such a name is then a deindex (`rename_action(true, false)`).
+    #[cfg(windows)]
+    #[test]
+    fn the_index_walk_and_the_watcher_agree_about_names_win32_cannot_spell() {
+        let scratch = crate::test_support::unique_temp_path("kb-watch-unspellable");
+        std::fs::create_dir_all(&scratch).unwrap();
+        // The verbatim form, the only one under which these names are entries
+        // on disk; removed through it too.
+        let kb = scratch.canonicalize().unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+
+        // Backslashes: under `\\?\` a `/` is not a separator.
+        let cases = ["ok.md", "CON.md", "nul.md", r"dir.\x.md", r"sp \y.md"];
+        for rel in cases {
+            let full = kb.join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "# x\n").unwrap();
+            assert!(full.is_file(), "the fixture must hold {rel:?}");
+        }
+
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        let walked: std::collections::HashSet<String> =
+            crate::indexer::collect_source_files(&kb, &reg, &rules)
+                .unwrap()
+                .iter()
+                .map(|p| crate::exclusion::rel_key(&kb, p))
+                .collect();
+
+        for native in cases {
+            let rel = native.replace('\\', "/");
+            let full = kb.join(native);
+            let watcher_takes_it = should_process_parts(&rel, &full, &reg, &rules);
+            assert_eq!(
+                walked.contains(&rel),
+                watcher_takes_it,
+                "the index walk and the watcher disagree about {rel}"
+            );
+            assert_eq!(watcher_takes_it, rel == "ok.md", "{rel}");
+        }
+    }
+
+    /// (ADR-0023) An event can name a file under a spelling of the knowledge
+    /// base other than `kb_path`'s -- here the directory's own name in another
+    /// case. The walk judges no name there, so the watcher judges it on the
+    /// `rel` that `to_rel` recovers: a device name or a trailing-dot directory
+    /// is still refused, an ordinary file there is still processed, on the
+    /// single-file path and in a directory that just arrived.
+    #[cfg(windows)]
+    #[test]
+    fn the_watcher_refuses_names_win32_cannot_spell_under_another_spelling_of_the_kb() {
+        let scratch = crate::test_support::unique_temp_path("kb-watch-unspellable-alt");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let kb = scratch.canonicalize().unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(kb.clone());
+
+        let leaf = kb.file_name().unwrap().to_str().unwrap().to_uppercase();
+        let alt = kb.parent().unwrap().join(&leaf);
+        assert_ne!(alt, kb, "the other spelling must differ as a path");
+
+        // Backslashes: under `\\?\` a `/` is not a separator.
+        let cases = [r"sub\ok.md", r"sub\CON.md", r"sub\dir.\x.md"];
+        for native in cases {
+            let full = kb.join(native);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "# x\n").unwrap();
+        }
+
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+
+        for native in cases {
+            let rel = native.replace('\\', "/");
+            let raw = alt.join(native);
+            assert_eq!(
+                indexer::index_rel_path(&kb, &raw),
+                None,
+                "the event path must not be under kb_path as spelled, or this proves nothing"
+            );
+            let recovered = to_rel(&kb, &raw);
+            assert_eq!(recovered.as_deref(), Some(rel.as_str()));
+            assert_eq!(
+                should_process_parts(&rel, &raw, &reg, &rules),
+                rel == "sub/ok.md",
+                "{rel}"
+            );
+        }
+
+        // The walk under the other spelling keeps all three, so what drops
+        // two of them below is the watcher's own check.
+        let walked =
+            crate::indexer::collect_source_files_under(&kb, &alt.join("sub"), &reg, &rules)
+                .unwrap();
+        assert_eq!(walked.len(), 3, "{walked:?}");
+        assert_eq!(
+            new_directory_rels(&kb, &alt.join("sub"), &reg, &rules).unwrap(),
+            vec!["sub/ok.md".to_string()]
         );
     }
 
