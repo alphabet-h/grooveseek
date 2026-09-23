@@ -19,12 +19,16 @@ use crate::db::SearchResult;
 /// BGE-M3 へ切り替えたい場合は CLI で明示オプトインする。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
 pub enum ModelChoice {
-    /// BAAI/bge-small-en-v1.5 (384 dim, 英語特化, ~130 MB)
+    // A variant's doc comment is also its line under `--model` in `--help`,
+    // so it is written in English, like the rest of the help.
+    /// BAAI/bge-small-en-v1.5 (384 dim, English-focused, ~130 MB first
+    /// download). The built-in default.
     #[default]
     #[value(name = "bge-small-en-v1.5")]
     #[serde(rename = "bge-small-en-v1.5")]
     BgeSmallEnV15,
-    /// BAAI/bge-m3 (1024 dim, 多言語, ~2.3 GB)
+    /// BAAI/bge-m3 (1024 dim, multilingual incl. Japanese, ~2.3 GB first
+    /// download). Recommended for Japanese-heavy knowledge bases.
     #[value(name = "bge-m3")]
     #[serde(rename = "bge-m3")]
     BgeM3,
@@ -603,20 +607,29 @@ fn cache_dir_from(env: Option<std::ffi::OsString>, os_cache: Option<PathBuf>) ->
 /// 明示的に選択する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum, Deserialize)]
 pub enum RerankerChoice {
-    /// reranker 無効 (RRF 結果をそのまま返す)
+    // As with `ModelChoice`, each variant's doc comment is its line under
+    // `--reranker` in `--help`, so it is written in English. That matters most
+    // for `jina-v2-ml`: its license terms have to reach someone reading only
+    // the help of a release archive.
+    /// No reranker: the RRF hybrid ranking is returned as it is. The built-in
+    /// default.
     #[default]
     #[value(name = "none")]
     #[serde(rename = "none")]
     None,
-    /// BAAI/bge-reranker-v2-m3 (多言語 100+ 言語, ~2.3 GB)。日本語 KB 推奨
+    /// BAAI/bge-reranker-v2-m3 (multilingual, 100+ languages, ~2.3 GB first
+    /// download). Recommended for Japanese knowledge bases.
     #[value(name = "bge-v2-m3")]
     #[serde(rename = "bge-v2-m3")]
     BgeV2M3,
-    /// jinaai/jina-reranker-v2-base-multilingual (多言語, ~1.2 GB)。軽量多言語。CC-BY-NC-4.0 = 研究・評価用途のみ、商用利用不可
+    /// jinaai/jina-reranker-v2-base-multilingual (multilingual, ~1.2 GB first
+    /// download). A lighter multilingual alternative. Licensed CC-BY-NC-4.0:
+    /// research and evaluation only, no commercial use.
     #[value(name = "jina-v2-ml")]
     #[serde(rename = "jina-v2-ml")]
     JinaV2Multilingual,
-    /// BAAI/bge-reranker-base (英/中のみ, ~280 MB)。日本語用途には非推奨
+    /// BAAI/bge-reranker-base (English and Chinese only, ~280 MB first
+    /// download). Not recommended for Japanese.
     #[value(name = "bge-base")]
     #[serde(rename = "bge-base")]
     BgeBase,

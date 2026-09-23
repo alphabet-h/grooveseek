@@ -144,7 +144,10 @@ enum Commands {
         /// Path to the knowledge-base directory
         #[arg(long)]
         kb_path: Option<PathBuf>,
-        /// Embedding model to use (must match the one that built the index)
+        /// FastEmbed model to use (must match the one that built the index).
+        /// Selects FastEmbed for this run, overriding any `[embedding]` in
+        /// groove.toml; without it, the embedding groove.toml configures is
+        /// used (bge-small-en-v1.5 if none).
         #[arg(long, value_enum)]
         model: Option<ModelChoice>,
         /// Optional cross-encoder reranker applied after RRF hybrid search.
@@ -203,11 +206,18 @@ enum Commands {
         /// Path to the knowledge-base directory
         #[arg(long)]
         kb_path: Option<PathBuf>,
-        /// Force full re-index. Required when switching `--model`. Also
-        /// replaces a `.groove.db` that cannot be opened as a database.
+        /// Force a full re-index. Required whenever the embedding changes: a
+        /// different `--model`, or a different `[embedding]` provider, model
+        /// (`model`, `query_model`, `document_model`) or `dimension`, since
+        /// the index records the model and dimension that built it and refuses
+        /// any other. Also replaces a `.groove.db` that cannot be opened as a
+        /// database.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Embedding model to use
+        /// FastEmbed model to index with. Selects FastEmbed for this run,
+        /// overriding any `[embedding]` in groove.toml; without it, the
+        /// embedding groove.toml configures is used (bge-small-en-v1.5 if
+        /// none). Switching to another model needs `--force`.
         #[arg(long, value_enum)]
         model: Option<ModelChoice>,
         /// Suppress per-file progress output (only print start/end summary).
@@ -235,7 +245,10 @@ enum Commands {
         /// Path to the knowledge-base directory
         #[arg(long)]
         kb_path: Option<PathBuf>,
-        /// Embedding model (must match the index; defaults to config or built-in)
+        /// FastEmbed model to use (must match the one that built the index).
+        /// Selects FastEmbed for this run, overriding any `[embedding]` in
+        /// groove.toml; without it, the embedding groove.toml configures is
+        /// used (bge-small-en-v1.5 if none).
         #[arg(long, value_enum)]
         model: Option<ModelChoice>,
         /// BFS depth (default 2, clamped to max 3)
@@ -283,10 +296,14 @@ enum Commands {
     },
     /// Check the index for inconsistencies and report them.
     ///
-    /// Answers two kinds of question. Whether the three tables search reads —
-    /// chunks, their embeddings, their full-text rows — still agree, since when
-    /// they stop agreeing nothing errors and results are simply lost. And which
-    /// indexed documents the MCP resource surface is holding back, and why.
+    /// Asks whether the three tables search reads -- chunks, their embeddings,
+    /// their full-text rows -- still agree, since when they stop agreeing
+    /// nothing errors and results are simply lost. Which indexed documents the
+    /// MCP resource surface is holding back, and why. Whether the index has
+    /// recorded the frontmatter keys `--field` filters on, and whether they
+    /// still match groove-schema.toml. And which source files were chunked by
+    /// lines rather than at their definitions, where a query shaped like a
+    /// definition cannot reach them.
     ///
     /// Reports only; it never modifies the index. Each finding names the
     /// command that fixes it.
@@ -343,7 +360,7 @@ enum Commands {
     /// quality on THIS knowledge base (optional, power-user feature).
     ///
     /// Runs a grid search over the golden query set and reports a
-    /// statistically guarded recommendation. Applies nothing automatically —
+    /// statistically guarded recommendation. Applies nothing automatically:
     /// the output is either a paste-ready `[search.fusion]` snippet or the
     /// conclusion that the built-in defaults should be kept.
     ///
@@ -352,7 +369,8 @@ enum Commands {
     /// skipped. Details: docs/eval.md
     Tune(TuneCliArgs),
     /// Register groove as an OS-level user service (auto-start at login).
-    /// Phase 1: Linux systemd-user / macOS LaunchAgent / Windows Task Scheduler.
+    /// Per-user, so no admin or sudo is needed: systemd-user on Linux, a
+    /// LaunchAgent on macOS, Task Scheduler on Windows.
     Service {
         #[command(subcommand)]
         action: ServiceSubcommand,
@@ -511,7 +529,10 @@ pub(crate) struct SearchCliArgs {
     /// Path to the knowledge-base directory
     #[arg(long)]
     pub(crate) kb_path: Option<PathBuf>,
-    /// Embedding model (must match the index; defaults to config or built-in)
+    /// FastEmbed model to use (must match the one that built the index).
+    /// Selects FastEmbed for this run, overriding any `[embedding]` in
+    /// groove.toml; without it, the embedding groove.toml configures is used
+    /// (bge-small-en-v1.5 if none).
     #[arg(long, value_enum)]
     pub(crate) model: Option<ModelChoice>,
     /// Optional cross-encoder reranker. Improves precision, and on CPU costs
@@ -539,37 +560,48 @@ pub(crate) struct SearchCliArgs {
     /// `--min-quality 0.0`).
     #[arg(long = "include-low-quality", default_value_t = false)]
     pub(crate) include_low_quality: bool,
-    /// path glob (`!`-prefix で除外)。**繰り返して**指定する。
-    /// 例: `--path-glob "docs/**" --path-glob "!docs/draft/**"`
-    ///
-    /// カンマでは区切らない。glob の構文自体がカンマを使う
-    /// (`docs/{a,b}/**`) ので、区切ると値が壊れる — `docs/{a` は
-    /// "unclosed alternate group" で落ちる。docs はもともとこのフラグを
-    /// 「(repeatable)」としか書いていない。
+    // No `value_delimiter` here, unlike `--tag-any`: splitting on commas broke
+    // any glob that uses them, `docs/{a` failing as an "unclosed alternate
+    // group". docs/usage.md only ever called this flag "(repeatable)", so no
+    // documented use relied on the split.
+    /// Include or exclude by path glob; a `!` prefix excludes. Repeatable:
+    /// give it once per pattern, e.g.
+    /// `--path-glob "docs/**" --path-glob "!docs/draft/**"`. It does not split
+    /// on commas, because a glob's own syntax uses them (`docs/{a,b}/**` is
+    /// one pattern). MCP param: `path_globs`
     #[arg(long = "path-glob")]
     pub(crate) path_globs: Vec<String>,
-    /// tags_any (OR)。複数指定可。例: `--tag-any rust,async`
+    /// Keep a chunk that has any of these tags (OR). Comma-separated, e.g.
+    /// `--tag-any rust,async`. MCP param: `tags_any`
     #[arg(long = "tag-any", value_delimiter = ',')]
     pub(crate) tags_any: Vec<String>,
-    /// tags_all (AND)。複数指定可。
+    /// Keep a chunk only if it has all of these tags (AND). Comma-separated.
+    /// MCP param: `tags_all`
     #[arg(long = "tag-all", value_delimiter = ',')]
     pub(crate) tags_all: Vec<String>,
-    /// date filter 下限 (YYYY-MM-DD or RFC3339, lex 比較)
+    /// Lower bound on the frontmatter `date`, inclusive (YYYY-MM-DD or
+    /// RFC 3339, compared as text). Once either bound is set, a chunk with no
+    /// `date` is excluded. MCP param: `date_from`
     #[arg(long = "date-from")]
     pub(crate) date_from: Option<String>,
-    /// date filter 上限 (両端含む)
+    /// Upper bound on the frontmatter `date`, inclusive; compared the same way
+    /// as `--date-from`. MCP param: `date_to`
     #[arg(long = "date-to")]
     pub(crate) date_to: Option<String>,
-    /// 宣言 key の値で絞る (`--field status=active`)。**繰り返して**指定する。
-    /// 同じ key は OR、違う key は AND。最初の `=` で分けるので値に `=` や
-    /// カンマがあってもそのまま。MCP param: `fields`
+    /// Keep documents whose frontmatter holds VALUE for KEY
+    /// (`--field status=active`); KEY must be one `groove-schema.toml`
+    /// declared when the index was built. Repeatable: the same key twice is
+    /// OR, two different keys are AND. Split at the first `=`, so the value
+    /// may contain `=` or a comma. MCP param: `fields`
     #[arg(long = "field", value_name = "KEY=VALUE", value_parser = parse_field_pair)]
     pub(crate) fields: Vec<(String, String)>,
-    /// 宣言 key の値を持つ文書を除外する (`--field-not status=deprecated`)。
-    /// key を持たない文書は残る。MCP param: `fields_not`
+    /// Drop documents whose frontmatter holds VALUE for KEY
+    /// (`--field-not status=deprecated`); a document without the key is kept.
+    /// Repeatable. MCP param: `fields_not`
     #[arg(long = "field-not", value_name = "KEY=VALUE", value_parser = parse_field_pair)]
     pub(crate) fields_not: Vec<(String, String)>,
-    /// rank-based low_confidence ratio (default: 1.5、0.0 で判定無効)
+    /// Threshold of the rank-based `low_confidence` flag for this query
+    /// (default 1.5; 0.0 turns the check off). Must be finite and >= 0.0.
     #[arg(
         long = "min-confidence-ratio",
         value_parser = parse_confidence_ratio,
@@ -598,7 +630,10 @@ pub(crate) struct EvalCliArgs {
     /// Override golden file path. Default: <kb_path>/.groove-eval.yml or `[eval].golden`.
     #[arg(long)]
     pub(crate) golden: Option<PathBuf>,
-    /// Embedding model (must match the index)
+    /// FastEmbed model to use (must match the one that built the index).
+    /// Selects FastEmbed for this run, overriding any `[embedding]` in
+    /// groove.toml; without it, the embedding groove.toml configures is used
+    /// (bge-small-en-v1.5 if none).
     #[arg(long, value_enum)]
     pub(crate) model: Option<ModelChoice>,
     /// Optional cross-encoder reranker for this run.
@@ -655,7 +690,10 @@ pub(crate) struct TuneCliArgs {
     /// Override golden file path. Default: <kb_path>/.groove-eval.yml or `[eval].golden`.
     #[arg(long)]
     pub(crate) golden: Option<PathBuf>,
-    /// Embedding model (must match the index)
+    /// FastEmbed model to use (must match the one that built the index).
+    /// Selects FastEmbed for this run, overriding any `[embedding]` in
+    /// groove.toml; without it, the embedding groove.toml configures is used
+    /// (bge-small-en-v1.5 if none).
     #[arg(long, value_enum)]
     pub(crate) model: Option<ModelChoice>,
     /// Comma-separated k list to report (default: `[eval].k_values` or 1,5,10).

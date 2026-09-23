@@ -94,6 +94,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   and an endpoint configured with one `model` for both roles, get exactly the
   vectors they got before. The library gains `Embedder::embed_queries` for
   embedding several queries at once; `embed_texts` stays the document side.
+- **`--help` is in English throughout, and says what the flags do now.** The
+  descriptions of `search`'s filter flags and of the `--model` and
+  `--reranker` values were in Japanese, so the `jina-v2-ml` reranker's
+  CC-BY-NC-4.0 terms (research and evaluation only, no commercial use) never
+  reached a reader of the help in English. `--model` now says that it selects
+  FastEmbed and overrides `[embedding]`; `index --force` names every change it
+  is required for (the `[embedding]` provider, model or dimension, not only
+  `--model`); `doctor` lists the questions it asks today, including the
+  declared-field set and line-chunked source files.
 
 ## [1.13.0] - 2026-09-23
 
