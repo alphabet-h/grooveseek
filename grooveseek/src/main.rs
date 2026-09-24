@@ -972,7 +972,7 @@ fn main() -> anyhow::Result<()> {
             //   (`ensure_fts_context_column` は FTS を DROP + CREATE + repopulate する)
             // - `Embedder::with_settings` より後 → 失敗すると分かっている実行のために
             //   モデルを DL する (BGE-M3 なら ~2.3 GB)
-            // - `reset_for_model` より後 → **index を空にしてからエラー終了**
+            // - `rebuild_index` 内の `reset_for_model` より後 → **index を空にしてからエラー終了**
             //
             // `.xls` を取り下げた (AU-06) ことで、旧バージョンでは妥当だった設定の
             // まま upgrade した人がこの経路に入る。
@@ -1019,9 +1019,10 @@ fn main() -> anyhow::Result<()> {
             // that snapshot is what it gets, so the file is read exactly once per run rather
             // than once above and once more inside it. (codex P2 round 9) Moved above this
             // `Embedder::with_settings` call too -- see `load_declared_schema`'s doc.
-            if force {
-                db.reset_for_model(embedder.model_id(), dim)?;
-            }
+            //
+            // (AW-03) No reset here: `rebuild_index` resets for `--force` itself, after it has
+            // heard from the embedding provider (ADR-0024). A reset in this arm would run
+            // before that probe and empty the index a failing endpoint then leaves empty.
             eprintln!("Indexing {}...", kb_path.display());
             let exclude_dirs = cfg.resolve_exclude_dirs();
             let progress_reporter =

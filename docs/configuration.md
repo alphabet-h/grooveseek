@@ -53,7 +53,9 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # document chunks and search queries are sent there. Use one shared `model`,
 # role-specific aliases, or both (see "The [embedding] section" below for which
 # wins). `dimension` is required and is checked on
-# every response without probing the endpoint first.
+# every response without probing the endpoint first. The one probe is a fixed
+# text sent before `groove index --force` (or MCP `rebuild_index` with `force`)
+# empties the index (ADR-0024).
 # [embedding]
 # provider = "openai-compatible"
 # endpoint = "http://127.0.0.1:8001/v1/embeddings"

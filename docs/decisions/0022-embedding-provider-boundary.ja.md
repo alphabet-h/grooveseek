@@ -1,6 +1,6 @@
 # 22. embedding を provider 境界の後ろに置き、既定は FastEmbed のままにする
 
-- Status: accepted
+- Status: accepted; partially superseded by [ADR-0024](0024-probe-the-endpoint-before-a-forced-rebuild.ja.md) (強制再構築は reset の前に endpoint を probe する)
 - Date: 2026-09-23
 - Deciders: プロジェクトオーナー
 - Applies to: v1.13.0

@@ -51,7 +51,8 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # `endpoint` は OpenAI 互換 embeddings の完全な URL で、document のチャンクと
 # 検索クエリがそこへ送られる。共通の `model`、role 別の alias、またはその両方を
 # 書く (どちらが勝つかは下の「[embedding] セクション」)。`dimension` は必須で、endpoint を事前に probe することなく
-# 毎回のレスポンスで検査される。
+# 毎回のレスポンスで検査される。唯一の probe は、`groove index --force`
+# (または MCP `rebuild_index` の `force`) が索引を空にする前に送る固定の文字列 (ADR-0024)。
 # [embedding]
 # provider = "openai-compatible"
 # endpoint = "http://127.0.0.1:8001/v1/embeddings"

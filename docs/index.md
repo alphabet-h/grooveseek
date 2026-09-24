@@ -76,6 +76,7 @@ describes when a decision is recorded and when a changelog entry is enough.
 | 21. Take the socket you were given | [en](decisions/0021-take-the-socket-you-were-given.md) | [ja](decisions/0021-take-the-socket-you-were-given.ja.md) |
 | 22. Put embedding behind a provider boundary, and keep FastEmbed the default | [en](decisions/0022-embedding-provider-boundary.md) | [ja](decisions/0022-embedding-provider-boundary.ja.md) |
 | 23. Index only the names the server can open, and ask one predicate for all of them | [en](decisions/0023-index-only-names-the-server-can-open.md) | [ja](decisions/0023-index-only-names-the-server-can-open.ja.md) |
+| 24. Probe the embedding endpoint before a forced rebuild empties the index | [en](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md) | [ja](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md) |
 
 ADR-0003's filename still says `kb-mcpignore`. The file it describes is now
 `.grooveignore`; an ADR is not edited after it is merged, and

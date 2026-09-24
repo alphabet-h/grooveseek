@@ -1,6 +1,6 @@
 # 22. Put embedding behind a provider boundary, and keep FastEmbed the default
 
-- Status: accepted
+- Status: accepted; partially superseded by [ADR-0024](0024-probe-the-endpoint-before-a-forced-rebuild.md) (a forced rebuild probes the endpoint before its reset)
 - Date: 2026-09-23
 - Deciders: project owner
 - Applies to: v1.13.0
