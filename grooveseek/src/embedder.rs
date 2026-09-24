@@ -1520,7 +1520,9 @@ mod tests {
     ///
     /// The server reads the request and then never answers, holding the
     /// socket open until the client has its error, so the only way out is
-    /// the client timeout, however loaded the machine is.
+    /// the client timeout, however loaded the machine is. Every wait on the
+    /// server side, the accept included, ends by a deadline, so a client
+    /// that never connects fails this test instead of hanging it.
     #[test]
     fn openai_compatible_request_errors_omit_the_endpoint() {
         let timeout = Duration::from_millis(200);
@@ -1532,12 +1534,34 @@ mod tests {
         let (received_tx, received_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            received_tx
-                .send(read_http_request(&mut stream))
-                .expect("send captured request");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if release_rx.try_recv().is_ok() || std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("accept request: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            stream
+                .set_read_timeout(Some(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .max(Duration::from_millis(1)),
+                ))
+                .expect("read timeout");
+            let _ = received_tx.send(read_http_request(&mut stream));
             // Hold the connection, unanswered, until the client gave up.
-            let _ = release_rx.recv();
+            let _ = release_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
             drop(stream);
         });
         let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
@@ -1546,17 +1570,22 @@ mod tests {
         .expect("build embedder");
 
         let started = std::time::Instant::now();
-        let err = embedder
-            .embed_single("needle")
-            .expect_err("an unanswered request must time out");
+        let result = embedder.embed_single("needle");
         let elapsed = started.elapsed();
-        release_tx.send(()).expect("release silent server");
-        handle.join().expect("silent server thread");
+        let _ = release_tx.send(());
+        let server = handle.join();
 
         // The whole request reached the server and the client waited out its
         // timeout: this failed by timing out, not by some other error.
-        let request = received_rx.recv().expect("captured request");
-        assert!(request.contains("needle"), "{request}");
+        let request = received_rx
+            .try_recv()
+            .expect("the server never received the request");
+        assert!(server.is_ok(), "the silent server thread panicked");
+        assert!(
+            request.contains("needle"),
+            "the server received a request without the text"
+        );
+        let err = result.expect_err("an unanswered request must time out");
         assert!(
             elapsed >= timeout,
             "the request failed after {elapsed:?}, before its {timeout:?} timeout"

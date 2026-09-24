@@ -2211,8 +2211,11 @@ mod tests {
         assert!(err.to_string().contains("external provider fields"));
     }
 
-    /// AW-07: FastEmbed refuses every HTTP-only key, not just the two above.
-    /// One key per case, so dropping any single arm of the check fails here.
+    /// AW-07: FastEmbed refuses each HTTP-only key on its own, not just the
+    /// two above. One key per case pins each arm of the OR in
+    /// `resolve_fastembed`, so dropping any single arm fails here. The error
+    /// is one message for all seven keys and does not name the key; this
+    /// test does not claim that it does.
     #[test]
     fn fastembed_embedding_rejects_every_http_only_field() {
         let cases = [
@@ -2267,14 +2270,14 @@ mod tests {
             ),
         ];
         for (key, embedding) in cases {
-            let err = embedding
-                .resolve_fastembed(ModelChoice::default())
-                .expect_err("FastEmbed must reject an HTTP-only field");
+            let Err(err) = embedding.resolve_fastembed(ModelChoice::default()) else {
+                panic!("FastEmbed accepted `{key}` set on its own");
+            };
             assert!(
                 err.to_string().contains(
                     "[embedding] external provider fields require provider = \"openai-compatible\""
                 ),
-                "{key}: {err}"
+                "`{key}` alone was refused with a different error: {err}"
             );
         }
     }
