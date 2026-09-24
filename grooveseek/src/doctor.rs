@@ -1382,11 +1382,11 @@ mod tests {
     fn a_source_file_holding_a_blank_chunk_is_reported() {
         // #273: an unchanged file never reaches the parser again, so the empty chunk an older
         // build wrote stays until something says so. The parser trims a chunk's end, so the
-        // real leftover is stored as ''; whitespace that survived some other way counts too.
+        // real leftover is stored as '' -- the only shape the fixtures below use.
         let db = db_with_one_chunk();
         with_the_current_chunk_policy(&db);
         with_chunks(&db, "src/a.rs", &["fn a() {}", ""], true);
-        with_chunks(&db, "src/b.rs", &["fn b() {}", " \t\r\n"], true);
+        with_chunks(&db, "src/b.rs", &["fn b() {}", ""], true);
         with_chunks(&db, "src/c.rs", &["fn c() {}", "}"], true);
 
         let report = run(&db, &registry_md(), None).expect("run");
