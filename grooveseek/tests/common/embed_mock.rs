@@ -17,7 +17,7 @@
 //! the answer (AW-03's 401, AW-04's 413 / 429).
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
@@ -299,6 +299,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
             break pos;
         }
         match stream.read(&mut chunk) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => return None,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
@@ -319,6 +320,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < len {
         match stream.read(&mut chunk) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => return None,
             Ok(n) => body.extend_from_slice(&chunk[..n]),
         }

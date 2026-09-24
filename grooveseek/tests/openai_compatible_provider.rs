@@ -171,8 +171,9 @@ fn hermetic_strips_proxies_and_the_env_api_key_from_the_child() {
     hermetic(&mut cmd, cache.path());
     // Keyed uppercase: Windows environment names are case-insensitive, and
     // `get_envs` there reports `http_proxy` and `HTTP_PROXY` as one entry under
-    // whichever spelling came first. On Unix the two spellings are two entries
-    // with the same value, so folding them loses nothing.
+    // whichever spelling came first. On Unix the two spellings are two entries,
+    // and the fold would hide a lowercase one going missing -- the block below
+    // checks those by their raw names.
     let envs: std::collections::HashMap<String, Option<String>> = cmd
         .get_envs()
         .map(|(k, v)| {
@@ -195,6 +196,25 @@ fn hermetic_strips_proxies_and_the_env_api_key_from_the_child() {
         envs["FASTEMBED_CACHE_DIR"].as_deref(),
         Some(cache.path().to_string_lossy().as_ref())
     );
+
+    // reqwest reads the lowercase spellings too, and on Unix they are separate
+    // variables: each must be handled under its own name.
+    #[cfg(not(windows))]
+    {
+        let raw: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for removed in ["http_proxy", "https_proxy", "all_proxy"] {
+            assert_eq!(raw.get(removed), Some(&None), "{removed} must be removed");
+        }
+        assert_eq!(raw["no_proxy"].as_deref(), Some("127.0.0.1,localhost"));
+    }
 }
 
 #[test]
