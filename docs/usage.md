@@ -48,8 +48,11 @@ a Git ancestor has this section ignored, restoring FastEmbed; see
 
 Each request uses the OpenAI-compatible `POST /v1/embeddings` JSON shape with
 `model` and `input`. Set `request_dimensions = true` only for an endpoint that
-supports the optional `dimensions` field. Set one `model` alias for both roles,
-or set both `query_model` and `document_model` as above. `dimension` is mandatory:
+supports the optional `dimensions` field. Every role needs a model alias:
+`query_model` and `document_model` each override the shared `model` for their
+role, and the shared `model` fills whichever role is left unset — so one
+`model` alone, both role aliases as above, or `model` plus one role alias all
+work. `dimension` is mandatory:
 groove uses it to open or validate the vector index before constructing the
 HTTP provider, then rejects any response whose vectors have a different size.
 Requests are sent in batches of at most 64 inputs. Groove does not probe the
@@ -69,7 +72,9 @@ without an error.
 `--model` keeps its historical meaning and selects FastEmbed for that one
 invocation, overriding `[embedding]`. The top-level `model` key belongs to
 FastEmbed alone: groove refuses a config that sets it together with
-`provider = "openai-compatible"`, so remove it when switching providers.
+`provider = "openai-compatible"`, so remove it when switching providers. With
+FastEmbed (the default provider) it and `[embedding].model` name the same
+thing, so a config that sets both is refused as well: keep one.
 
 `--force` is also the repair for a `.groove.db` that cannot be opened as a database — a truncated write or a process killed mid-migration is enough. Any command that opens the file then fails with a message naming the file (it lives in the **parent** of `--kb-path`) and the two ways out: delete it and run `groove index`, or run `groove index --force`, which replaces the file and its `-wal` / `-shm` sidecars and rebuilds from scratch. The index is entirely derived from the corpus, so nothing is lost. Without `--force` the file is never touched.
 

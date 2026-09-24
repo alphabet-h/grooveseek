@@ -50,8 +50,9 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 
 # Optional external embedding provider. FastEmbed remains the default when this
 # section is absent. `endpoint` is the full OpenAI-compatible embeddings URL;
-# document chunks and search queries are sent there. Use one shared `model`, or
-# set both role-specific aliases. `dimension` is required and is checked on
+# document chunks and search queries are sent there. Use one shared `model`,
+# role-specific aliases, or both (see "The [embedding] section" below for which
+# wins). `dimension` is required and is checked on
 # every response without probing the endpoint first.
 # [embedding]
 # provider = "openai-compatible"
@@ -230,6 +231,43 @@ bind = "127.0.0.1:3100"
 ```
 
 With the file in place `groove serve` / `index` / `status` / `graph` / `search` all work without any of those flags — **provided groove trusts where the file is**. One it merely found, which is what a project-root or `.git`-ancestor placement means, keeps everything about presentation but has `kb_path`, `[parsers]`, `[embedding]`, `grammar_dir`, `fastembed_cache_dir` and the `[transport.http]` gates reset to safe defaults. Name it — `groove --config ./groove.toml index` — to have it honoured in full. [Trusted and untrusted config locations](#trusted-and-untrusted-config-locations) says which keys and why; `index` is the one to get right first, since it deletes documents whose extension the parser set no longer covers. Unknown keys are rejected to catch typos early. `FASTEMBED_CACHE_DIR` and `GROOVE_EMBEDDING_API_KEY` from the real environment override their file entries.
+
+### The `[embedding]` section
+
+Omitting the section keeps FastEmbed with the model chosen by the top-level
+`model` key (default `bge-small-en-v1.5`). Every key in the section is optional
+to the parser; which ones are required depends on `provider`.
+
+| Key | Values | Default | Notes |
+| --- | ------ | ------- | ----- |
+| `provider` | `"fastembed"`, `"openai-compatible"` | `"fastembed"` | Selects the embedding backend. |
+| `model` | FastEmbed: `"bge-small-en-v1.5"`, `"bge-m3"`. openai-compatible: any alias the endpoint accepts | none | FastEmbed: selects the model, like the top-level `model`. openai-compatible: the shared alias for both roles. |
+| `query_model` | Any alias (openai-compatible only) | none | Overrides `model` for queries. |
+| `document_model` | Any alias (openai-compatible only) | none | Overrides `model` for document chunks. |
+| `endpoint` | Full `http` / `https` URL of the embeddings endpoint, without credentials (openai-compatible only) | none | Required for openai-compatible. |
+| `dimension` | Integer greater than 0 (openai-compatible only) | none | Required for openai-compatible. |
+| `request_dimensions` | `true`, `false` (openai-compatible only) | `false` | Sends the optional `dimensions` request field when `true`. |
+| `api_key` | String (openai-compatible only) | none | Sent as a bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence. |
+| `timeout_seconds` | Integer greater than 0 (openai-compatible only) | `60` | HTTP request timeout. |
+
+Which model is used:
+
+- **`--model` on the command line** selects FastEmbed with that model for the
+  one invocation, overriding `[embedding]` and the top-level `model`. It does
+  not count as setting either key, so it never trips the rules below — but it
+  does not rescue a file that breaks them either, because the file is checked
+  when it loads, before the flag is looked at.
+- **FastEmbed** takes its model from `[embedding].model` or from the top-level
+  `model`, whichever is set; with neither, `bge-small-en-v1.5`. **Setting both
+  is refused when the config loads.** Earlier releases let `[embedding].model`
+  win silently. Remove one of them.
+- **openai-compatible** resolves each role separately: `query_model` or
+  `document_model` wins for its role, and `model` fills a role left unset.
+  Both roles must end up with an alias. The top-level `model` is FastEmbed's
+  alone and is refused alongside this provider.
+- A FastEmbed config that sets any key marked "openai-compatible only" is
+  refused, including `request_dimensions = false` or `timeout_seconds = 60`
+  written out explicitly.
 
 ## Config file discovery
 

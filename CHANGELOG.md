@@ -104,6 +104,18 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `kb://doc/` URI was already refused for the same reason: nothing that reads
   `\` as a separator is ever handed a `..`. Such a file is now left out of the
   index as well; see the ADR-0023 entry above.
+- **A `groove.toml` that sets both the top-level `model` and `[embedding].model`
+  with the FastEmbed provider no longer loads.** With `provider = "fastembed"`,
+  written out or left to its default, both keys choose the FastEmbed model, and
+  `[embedding].model` used to win without a word, so the index could be built
+  with a model other than the one the file seemed to name. Config loading now
+  fails with a message naming both keys, the way a top-level `model` next to
+  `provider = "openai-compatible"` already did. Remove one of the two keys.
+  Each key alone, and `query_model` / `document_model` alongside the shared
+  `[embedding].model` for openai-compatible, are unaffected; `--model` still
+  overrides for one invocation but does not rescue a file that sets both.
+  A configuration file that loaded before is refused now, which
+  [docs/stability.md](docs/stability.md#configuration) records.
 
 ### Fixed
 

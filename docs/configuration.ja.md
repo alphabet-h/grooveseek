@@ -49,8 +49,8 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 
 # 任意の外部 embedding provider。このセクションが無ければ FastEmbed が既定のまま。
 # `endpoint` は OpenAI 互換 embeddings の完全な URL で、document のチャンクと
-# 検索クエリがそこへ送られる。共通の `model` を 1 つ書くか、role 別の alias を
-# 両方書く。`dimension` は必須で、endpoint を事前に probe することなく
+# 検索クエリがそこへ送られる。共通の `model`、role 別の alias、またはその両方を
+# 書く (どちらが勝つかは下の「[embedding] セクション」)。`dimension` は必須で、endpoint を事前に probe することなく
 # 毎回のレスポンスで検査される。
 # [embedding]
 # provider = "openai-compatible"
@@ -223,6 +223,39 @@ bind = "127.0.0.1:3100"
 ```
 
 この設定ファイルを置けば `groove serve` / `index` / `status` / `graph` / `search` のどれも対応フラグを省略して動かせる — **ただし groove がその置き場所を信頼する場合**。プロジェクトルートや `.git` 祖先に置く = groove が**見つけただけ**なので、見せ方に関するキーはそのまま効くが、`kb_path` / `[parsers]` / `[embedding]` / `grammar_dir` / `fastembed_cache_dir` / `[transport.http]` のゲートは安全な既定へ戻される。丸ごと効かせたいなら名指しすること — `groove --config ./groove.toml index`。どのキーがなぜ制限されるかは [信頼する置き場所 / しない置き場所](#信頼する置き場所--しない置き場所) を参照。**まず直すべきは `index`** — parser 集合が対象外にした拡張子の document を削除するため。未知のキーはタイポ対策のため拒否される。`FASTEMBED_CACHE_DIR` と `GROOVE_EMBEDDING_API_KEY` の実環境変数は、設定ファイルのそれぞれの項目より優先される。
+
+### `[embedding]` セクション
+
+セクションを省くと FastEmbed のままで、model はトップレベルの `model` キーで決まる
+(既定 `bge-small-en-v1.5`)。parser にとってはセクション内のどのキーも省略可能で、
+どれが必須になるかは `provider` で決まる。
+
+| キー | 値 | 既定値 | 説明 |
+| ---- | -- | ------ | ---- |
+| `provider` | `"fastembed"`, `"openai-compatible"` | `"fastembed"` | embedding の backend を選ぶ。 |
+| `model` | FastEmbed: `"bge-small-en-v1.5"`, `"bge-m3"`。openai-compatible: endpoint が受け付ける任意の alias | なし | FastEmbed: トップレベルの `model` と同じく model を選ぶ。openai-compatible: 両 role 共通の alias。 |
+| `query_model` | 任意の alias (openai-compatible 専用) | なし | クエリについて `model` より優先。 |
+| `document_model` | 任意の alias (openai-compatible 専用) | なし | document のチャンクについて `model` より優先。 |
+| `endpoint` | embeddings endpoint の完全な `http` / `https` URL。認証情報は含めない (openai-compatible 専用) | なし | openai-compatible では必須。 |
+| `dimension` | 0 より大きい整数 (openai-compatible 専用) | なし | openai-compatible では必須。 |
+| `request_dimensions` | `true`, `false` (openai-compatible 専用) | `false` | `true` なら任意の `dimensions` 欄をリクエストに付ける。 |
+| `api_key` | 文字列 (openai-compatible 専用) | なし | bearer token として送る。`GROOVE_EMBEDDING_API_KEY` が優先。 |
+| `timeout_seconds` | 0 より大きい整数 (openai-compatible 専用) | `60` | HTTP リクエストの timeout。 |
+
+どの model が使われるか:
+
+- **コマンドラインの `--model`** は、その 1 回の実行に限って指定の model で FastEmbed を
+  選び、`[embedding]` とトップレベルの `model` を上書きする。どちらのキーを書いたことにも
+  ならないので下の規則には触れない。ただし規則に反するファイルを救うこともない —
+  ファイルはフラグを見る前、読み込んだ時点で検査される。
+- **FastEmbed** は `[embedding].model` かトップレベルの `model` の、書かれている方から
+  model を取る。どちらも無ければ `bge-small-en-v1.5`。**両方書くと config の読み込みで
+  拒否される。** 以前のリリースでは `[embedding].model` が黙って勝っていた。どちらか一方を消すこと。
+- **openai-compatible** は role ごとに解決する: `query_model` / `document_model` がそれぞれの
+  role で勝ち、書かれていない role は `model` が埋める。両 role とも alias が決まらなければ
+  ならない。トップレベルの `model` は FastEmbed 専用で、この provider と同時に書くと拒否される。
+- FastEmbed の config に「openai-compatible 専用」のキーを 1 つでも書くと拒否される。
+  `request_dimensions = false` や `timeout_seconds = 60` のように既定値を明示した場合も同じ。
 
 ## 設定ファイルの探索順
 
