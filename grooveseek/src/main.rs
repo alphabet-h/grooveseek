@@ -1044,17 +1044,7 @@ fn main() -> anyhow::Result<()> {
                 progress_reporter,
                 context_mode_desired,
             )?;
-            eprintln!(
-                "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped, {} frontmatter unparsed), {} chunks",
-                result.duration_ms,
-                result.total_documents,
-                result.updated,
-                result.renamed,
-                result.deleted,
-                result.skipped,
-                result.frontmatter_unparsed,
-                result.total_chunks
-            );
+            eprintln!("{}", result.summary_line());
             // (#251) Strictness changes the exit code, not the run: every file
             // was indexed and every broken one named above, so the summary is
             // printed first and one failure covers the whole corpus.

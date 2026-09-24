@@ -581,6 +581,12 @@ pub struct IndexResult {
     /// re-parsed and so is not re-counted once the check has run; the `force`
     /// argument of [`rebuild_index`] re-parses everything.
     pub frontmatter_unparsed: u32,
+    /// (ADR-0023) Entries the walk left out because their name is not one the
+    /// index can hold ([`crate::resources::doc_is_addressable`]): a file, or a
+    /// directory together with everything under it, counted once each and
+    /// each named on stderr. Not part of [`Self::skipped`], which counts files
+    /// that were collected and then could not be read or parsed.
+    pub unspellable: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
 }
@@ -593,6 +599,30 @@ impl IndexResult {
     /// they cannot come to disagree (codex P1, round 4).
     pub fn fails_strict_frontmatter(&self, fail_on_frontmatter_error: bool) -> bool {
         fail_on_frontmatter_error && self.frontmatter_unparsed > 0
+    }
+
+    /// The `Done in ...` line `groove index` prints. [`Self::unspellable`] is
+    /// appended only when it is not zero, so the line an ordinary run prints
+    /// -- which tests and scripts match -- does not change.
+    pub fn summary_line(&self) -> String {
+        let mut line = format!(
+            "Done in {}ms: {} docs ({} updated, {} renamed, {} deleted, {} skipped, {} frontmatter unparsed), {} chunks",
+            self.duration_ms,
+            self.total_documents,
+            self.updated,
+            self.renamed,
+            self.deleted,
+            self.skipped,
+            self.frontmatter_unparsed,
+            self.total_chunks
+        );
+        if self.unspellable > 0 {
+            line.push_str(&format!(
+                ", {} not indexed (a name get_document cannot take, see the warnings above)",
+                self.unspellable
+            ));
+        }
+        line
     }
 }
 
@@ -780,7 +810,10 @@ pub fn rebuild_index(
 
     // Registry の対応拡張子リストで source files を収集する。
     // 旧 collect_md_files は .md 固定だったが、.txt 等にも対応。
-    let source_files = collect_source_files(&kb_path, registry, &rules)?;
+    let CollectedSources {
+        files: source_files,
+        unspellable,
+    } = collect_source_files_counted(&kb_path, &kb_path, registry, &rules)?;
     eprintln!(
         "Found {} source files (extensions: {:?})",
         source_files.len(),
@@ -1089,6 +1122,7 @@ pub fn rebuild_index(
         deleted,
         skipped: skipped_count,
         frontmatter_unparsed,
+        unspellable,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })
@@ -2150,6 +2184,10 @@ pub fn rename_single_file(
 /// `pub(crate)` only so `watcher.rs` can put this walk and `should_process` side
 /// by side in one test and assert they answer the same way. Keeping them in
 /// separate test modules is how they drifted apart in the first place.
+///
+/// Test-only since [`rebuild_index`] takes [`collect_source_files_counted`]
+/// for the count it reports (ADR-0023).
+#[cfg(test)]
 pub(crate) fn collect_source_files(
     kb_path: &Path,
     registry: &Registry,
@@ -2181,8 +2219,62 @@ pub(crate) fn collect_source_files_under(
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
 ) -> Result<Vec<std::path::PathBuf>> {
+    collect_source_files_counted(kb_path, start, registry, rules).map(|c| c.files)
+}
+
+/// Whether the walk leaves the given path out for its name (ADR-0023): it
+/// lies under `kb_path` as spelled, and its relative path is one
+/// [`crate::resources::doc_is_addressable`] refuses.
+///
+/// Only a path under `kb_path` as spelled is judged. The watcher hands in raw
+/// event paths, and for one that does not share that spelling there is no
+/// relative path to judge -- [`crate::exclusion::rel_key`] would fall back to
+/// the whole absolute path, which no name passes, and refuse even `a.md`.
+/// Those are left to the watcher's own relativizing. The root relativizes to
+/// the empty string, which is no document name and must not be pruned.
+fn name_is_left_out(kb_path: &Path, path: &Path) -> bool {
+    index_rel_path(kb_path, path)
+        .is_some_and(|r| !r.is_empty() && !crate::resources::doc_is_addressable(&r))
+}
+
+/// What [`collect_source_files_counted`] collected, and how many entries it
+/// left out for their names.
+#[derive(Debug)]
+pub(crate) struct CollectedSources {
+    pub(crate) files: Vec<std::path::PathBuf>,
+    /// See [`IndexResult::unspellable`].
+    pub(crate) unspellable: u32,
+}
+
+/// [`collect_source_files_under`], also counting what it left out because the
+/// name is not one the index can hold.
+///
+/// (ADR-0023) A name [`crate::resources::doc_is_addressable`] refuses would be
+/// a search hit that `get_document` of [`crate::server`] refuses and no
+/// `kb://doc/` URI names --
+/// on Windows `CON.md`, or anything under `dir./`, both of which the verbatim
+/// `\\?\` prefix lets exist. A directory is pruned in `filter_entry`, so its
+/// subtree is never read; a file is checked after the extension filter, so
+/// only a file that would otherwise have been indexed is named. Each is one
+/// warning, from [`crate::resources::unspellable_reason`].
+///
+/// Both levels ask [`name_is_left_out`], so a directory and a file are judged
+/// by the same key.
+pub(crate) fn collect_source_files_counted(
+    kb_path: &Path,
+    start: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> Result<CollectedSources> {
     let mut files = Vec::new();
     let extensions = registry.extensions();
+    // A `Cell`, because `filter_entry` holds its closure for as long as the
+    // loop body runs and both of them count.
+    let unspellable = std::cell::Cell::new(0u32);
+    let leave_out = |path: &Path, is_dir: bool| {
+        tracing::warn!("{}", crate::resources::unspellable_reason(path, is_dir));
+        unspellable.set(unspellable.get() + 1);
+    };
 
     for entry in WalkDir::new(start)
         .follow_links(false)
@@ -2192,7 +2284,14 @@ pub(crate) fn collect_source_files_under(
             // excluded — otherwise a pattern like `*` would prune the root and
             // the walk would produce nothing.
             let rel = crate::exclusion::rel_key(kb_path, e.path());
-            !rules.is_excluded(&rel, e.file_type().is_dir())
+            if rules.is_excluded(&rel, e.file_type().is_dir()) {
+                return false;
+            }
+            if e.file_type().is_dir() && name_is_left_out(kb_path, e.path()) {
+                leave_out(e.path(), true);
+                return false;
+            }
+            true
         })
     {
         let entry = entry.context("walkdir error")?;
@@ -2205,6 +2304,10 @@ pub(crate) fn collect_source_files_under(
                 && let Some(ext_str) = ext.to_str()
                 && extensions.iter().any(|e| e.eq_ignore_ascii_case(ext_str))
             {
+                if name_is_left_out(kb_path, entry.path()) {
+                    leave_out(entry.path(), false);
+                    continue;
+                }
                 // (BU-20) A hard link is a second name for a file that may live
                 // outside the KB, and unlike a symlink nothing in the walk
                 // shows it: `follow_links(false)` has nothing to follow.
@@ -2225,7 +2328,10 @@ pub(crate) fn collect_source_files_under(
     }
 
     files.sort();
-    Ok(files)
+    Ok(CollectedSources {
+        files,
+        unspellable: unspellable.get(),
+    })
 }
 
 /// Extract `(category, topic)` from a relative path.
@@ -3632,6 +3738,160 @@ mod tests {
         );
     }
 
+    /// Removes a scratch directory through the verbatim path `canonicalize`
+    /// returns, the only spelling under which `CON.md` or `dir.` is the entry
+    /// on disk rather than a device or a trimmed name. Declare it after the
+    /// [`TmpDir`] it covers so it is dropped first.
+    #[cfg(windows)]
+    struct VerbatimCleanup(std::path::PathBuf);
+    #[cfg(windows)]
+    impl Drop for VerbatimCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A knowledge base holding, besides `ok.md`, names that only the verbatim
+    /// prefix lets exist: a device name, a directory ending in a dot (with two
+    /// files under it), one ending in a space, and two files whose trailing
+    /// dot or space leaves them with no registered extension. Returned with
+    /// its cleanup guard.
+    #[cfg(windows)]
+    fn kb_with_unspellable_names(prefix: &str) -> (TmpDir, VerbatimCleanup, std::path::PathBuf) {
+        let tmp = mk_tmp(prefix);
+        let kb = tmp.0.canonicalize().unwrap();
+        assert!(
+            kb.to_string_lossy().starts_with(r"\\?\"),
+            "the fixture needs the verbatim prefix: {}",
+            kb.display()
+        );
+        let cleanup = VerbatimCleanup(kb.clone());
+        // Backslashes: under `\\?\` a `/` is not a separator.
+        for rel in [
+            "ok.md",
+            "CON.md",
+            r"dir.\x.md",
+            r"dir.\z.md",
+            r"sp \y.md",
+            "b.md.",
+            "b.md ",
+        ] {
+            write_file(&kb, rel, "# x\n");
+            assert!(
+                std::fs::metadata(kb.join(rel)).is_ok_and(|m| m.is_file()),
+                "the fixture must hold a real file at {rel:?}"
+            );
+        }
+        (tmp, cleanup, kb)
+    }
+
+    /// (ADR-0023, AW-43) The walk leaves out what
+    /// [`crate::resources::doc_is_addressable`] refuses: `CON.md` at file
+    /// level, `dir.` and `sp ` at directory level
+    /// with everything under them. `b.md.` and `b.md ` never reach the check
+    /// -- `Path::extension` reads them as `""` and `"md "` -- so they are not
+    /// counted, and were never indexed before this either.
+    ///
+    /// `dir.` holds two files, so the count tells a pruned directory (one
+    /// entry, 3 in all) from one whose files were refused one by one (two
+    /// entries, 4 in all).
+    #[cfg(windows)]
+    #[test]
+    fn test_collect_source_files_leaves_out_names_win32_cannot_spell() {
+        let (_tmp, _cleanup, kb) = kb_with_unspellable_names("unspellable");
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&kb, &kb, &reg, &excl(&kb, &[])).unwrap();
+        let rels: Vec<String> = got
+            .files
+            .iter()
+            .map(|p| crate::exclusion::rel_key(&kb, p))
+            .collect();
+        assert_eq!(rels, vec!["ok.md".to_string()]);
+        assert_eq!(
+            got.unspellable, 3,
+            "CON.md, dir. and sp -- each directory once, not once per file under it"
+        );
+        assert_eq!(
+            collect_source_files(&kb, &reg, &excl(&kb, &[])).unwrap(),
+            got.files,
+            "the plain walk is the counted walk minus the count"
+        );
+    }
+
+    /// The watcher walks a directory that just appeared from that directory
+    /// (`dispatch_new_directory` of [`crate::watcher`]). Started at `dir.`, the walk yields nothing
+    /// and counts the directory once, not its two files.
+    #[cfg(windows)]
+    #[test]
+    fn test_collect_source_files_from_a_start_directory_it_cannot_spell() {
+        let (_tmp, _cleanup, kb) = kb_with_unspellable_names("unspellable-start");
+        let reg = Registry::defaults();
+        let got =
+            collect_source_files_counted(&kb, &kb.join("dir."), &reg, &excl(&kb, &[])).unwrap();
+        assert!(got.files.is_empty(), "{:?}", got.files);
+        assert_eq!(got.unspellable, 1);
+    }
+
+    /// A walk started under a spelling that is not below `kb_path` (the
+    /// watcher hands in raw event paths) judges no name, at either level:
+    /// there is no relative path to judge, and the whole-path fallback would
+    /// refuse even `ok.md`. Such paths are left to the watcher's own
+    /// relativizing.
+    #[cfg(windows)]
+    #[test]
+    fn test_collect_source_files_judges_no_name_outside_kb_spelling() {
+        let (tmp, _cleanup, kb) = kb_with_unspellable_names("unspellable-raw");
+        // `tmp.0` is the same directory as `kb` without the verbatim prefix,
+        // so nothing under `kb` strips it.
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&tmp.0, &kb, &reg, &excl(&tmp.0, &[])).unwrap();
+        let rels: Vec<String> = got
+            .files
+            .iter()
+            .map(|p| crate::exclusion::rel_key(&kb, p))
+            .collect();
+        assert_eq!(
+            rels,
+            vec![
+                "CON.md".to_string(),
+                "dir./x.md".to_string(),
+                "dir./z.md".to_string(),
+                "ok.md".to_string(),
+                "sp /y.md".to_string(),
+            ],
+            "an ordinary name is collected, and no directory is pruned"
+        );
+        assert_eq!(got.unspellable, 0);
+    }
+
+    /// On every platform an ordinary knowledge base counts nothing.
+    #[test]
+    fn test_collect_source_files_counts_nothing_in_an_ordinary_kb() {
+        let tmp = mk_tmp("unspellable-none");
+        write_file(&tmp.0, "a.md", "# a");
+        write_file(&tmp.0, "dir.x/b.md", "# b");
+        write_file(&tmp.0, ".hidden/c.md", "# c");
+        let reg = Registry::defaults();
+        let got = collect_source_files_counted(&tmp.0, &tmp.0, &reg, &excl(&tmp.0, &[])).unwrap();
+        assert_eq!(got.files.len(), 3, "{:?}", got.files);
+        assert_eq!(got.unspellable, 0);
+    }
+
+    /// A row stored for a name the walk no longer collects is gone after the
+    /// next full run: the sweep deletes what was neither visited nor skipped
+    /// (spec §2, no new code -- this pins the contract the design leans on).
+    #[test]
+    fn test_documents_to_delete_drops_a_row_the_walk_no_longer_collects() {
+        let db_paths = vec!["CON.md".to_string(), "ok.md".to_string()];
+        let visited: std::collections::HashSet<String> =
+            ["ok.md".to_string()].into_iter().collect();
+        let skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            documents_to_delete(&db_paths, &visited, &skipped),
+            vec!["CON.md".to_string()]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // scan_disk_entries
     // -----------------------------------------------------------------------
@@ -4647,6 +4907,40 @@ mod tests {
         assert!(!clean.fails_strict_frontmatter(true));
         assert!(!broken.fails_strict_frontmatter(false));
         assert!(broken.fails_strict_frontmatter(true));
+    }
+
+    /// (ADR-0023) The `Done in` line is the one an ordinary run has always
+    /// printed -- tests and scripts match it -- and gains a clause only when
+    /// the walk left something out for its name.
+    #[test]
+    fn test_summary_line_names_unspellable_entries_only_when_there_are_some() {
+        let clean = IndexResult {
+            total_documents: 3,
+            updated: 1,
+            total_chunks: 7,
+            duration_ms: 12,
+            ..IndexResult::default()
+        };
+        assert_eq!(
+            clean.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks"
+            )
+        );
+        let with = IndexResult {
+            unspellable: 2,
+            ..clean
+        };
+        assert_eq!(
+            with.summary_line(),
+            concat!(
+                "Done in 12ms: 3 docs (1 updated, 0 renamed, 0 deleted, 0 skipped, ",
+                "0 frontmatter unparsed), 7 chunks, 2 not indexed (a name get_document ",
+                "cannot take, see the warnings above)"
+            )
+        );
+        assert!(with.summary_line().is_ascii());
     }
 
     /// #251 (codex P2, round 1): a frontmatter-only stub with broken YAML is

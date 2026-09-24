@@ -414,6 +414,8 @@ groove doctor --kb-path ... --format json | jq '.findings[]'
 
 宣言 key の集合も見る (v1.11.0+): 索引に集合が記録されていない — 実行中の run がある / 中断された / 作成後または 1.8.0 からの更新後に `groove index` が一度も完走していない — 場合は `declared-fields-pending` として報告する。run が集合を記録するまで `--field` 付きの検索は拒否されるからで、`groove-schema.toml` の有無は問わず、document がまだ 1 つも無い索引でも同じ。記録済みの集合が schema の宣言と食い違っていれば `declared-fields-stale` — 次の run が行を書き直すまで `--field` は記録済みの集合で答える。どちらも warning で、`groove index` 1 回で (再 embedding なしに) 消える。読めない schema file は `groove index` / `groove validate` と同じ扱いで、DB を開く前にコマンドが止まる (終了コード `2`)。
 
+Windows では、以前の版が「Windows が書いたとおりには開けない名前」— `CON.md` のような予約デバイス名、末尾がドットか空白の区間を含むパス、Windows が名前に使わせない文字を含むパス — で索引した文書も `name-not-spellable-on-windows` (warning) として名指しする。そういう名前は今は索引しないので、次の `groove index` で行が消える。残したいならファイル名を変える。[ADR-0023](decisions/0023-index-only-names-the-server-can-open.ja.md) を参照。
+
 **v1.6.0 より前に作られた索引には、その前に別の答えが出る。** そのリリースまで、上限を超えたファイルは**切り捨てられて**いた。内容が変わらないファイルは再 chunk 化されないので、そういう索引は今も末尾の欠けたファイルを抱えている可能性があり、しかも**それを見つける手掛かりが document 側に無い**。`doctor` はそこで「異常なし」と答えるのではなく、**どの chunk 化ポリシーで作られた索引かが記録されているか**を見て、記録が無くソースファイルを含む索引については「まだ答えられない」と報告する。`groove index --force` で作り直せば消える。
 
 終了コード: `0` (報告なし) / `1` (検出あり) / `2` (実行できない — 大抵は索引が無いか、開けない。stderr の message が file と修復コマンドを示す)。**報告するだけで修復はしない**。各検出には直し方が併記される (構造的なものはすべて `groove index` か `groove index --force`、コマンドでは直せないものは文書そのものへの変更)。

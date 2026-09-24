@@ -314,23 +314,25 @@ pub(super) fn best_practice_not_found_message(target: &str, tried: &[String]) ->
 /// 拒否時は `ErrorResponse` を返し、呼び出し側が JSON 化する。
 ///
 /// 防御の順序:
-/// 0. **lexical check** (AW-01) — FS に触る前に、要求の文字列だけを
-///    [`crate::resources::is_safe_relative`] に通す (空文字列も拒否)。絶対パス・
-///    ドライブ指定・UNC・`..` は `Path::join` で `kb_path` の外を指すので、1 以降に
-///    進めると KB 外を stat してから拒否することになり、文言の差が KB 外の存在を
-///    教えていた。Windows ではさらに `:` を含むもの (ドライブ指定・代替データ
-///    ストリーム) と予約デバイス名 (`NUL` / `COM1` など) も拒否する。拒否は 2b と
-///    同じ文言の [`ValidatePathOutcome::NotFound`]。保証するのは「KB の外を指す
-///    綴りを FS に触る前に拒否する」ところまで。KB の中の別綴り (`./`・`//`、
-///    Windows では `.` の区間や末尾のドット / 空白) は step 0 を通り、FS に触った
-///    後で 2b が拒否する — 触るのは KB の中だけで、応答から分かるのも KB の中の
-///    その場所に何かがあるかどうかだけ
+/// 0. **lexical check** (AW-01 / ADR-0023) — FS に触る前に、要求の文字列だけを
+///    [`crate::resources::doc_is_addressable`] に通す。索引が持ちうる名前の唯一の
+///    述語で、index の walk・watcher・`groove doctor`・`kb://doc/` URI も同じものを
+///    訊く。絶対パス・ドライブ指定・UNC・`..` は `Path::join` で `kb_path` の外を指すので、
+///    1 以降に進めると KB 外を stat してから拒否することになり、文言の差が KB 外の存在を
+///    教えていた。空文字列・`.` の区間・空の区間 (`./a.md`・`a//b.md`・末尾 `/`) も
+///    ここで拒否する。Windows ではさらに `:` を含むもの (ドライブ指定・代替データ
+///    ストリーム)・予約デバイス名 (`NUL` / `COM1` など)・末尾がドットか空白の区間・
+///    `< > " | ? *` と制御文字を含むものも拒否する。拒否は 2b と同じ文言の
+///    [`ValidatePathOutcome::NotFound`]。保証するのは「**索引が持ちうる名前以外の綴りは
+///    FS に触る前に拒否する**」こと。2b に残るのは、字句の上では索引が持ちうるが正規の
+///    綴りと一致しないもの (大文字小文字の揺れ・8.3 短縮名・ディレクトリ symlink 経由)
+///    だけで、2b が見るのは KB の中だけ
 /// 1. **symlink reject** — `canonicalize` の前に拾う必要がある
 /// 2. **canonicalize + starts_with(kb_path)** — `..` 抜け道を defeat
 ///    - 2b. **canonical spelling** — canonical パスを kb_path 相対・`/` 区切り
 ///      (索引が持つ形) に戻し、要求された `rel_path` と byte 一致しなければ
-///      [`ValidatePathOutcome::NotFound`]。要求側は正規化しない。`./`・`//`・`a/../a`・`\` 区切り・
-///      case 違い・8.3 短縮名・ディレクトリ symlink 経由が、同じファイルを開く
+///      [`ValidatePathOutcome::NotFound`]。要求側は正規化しない。case 違い・8.3 短縮名・
+///      ディレクトリ symlink 経由が (`./`・`//`・`a/../a`・`\` 区切りは step 0 が先に拒否する)、同じファイルを開く
 ///      別綴りとして前段 gateway の glob 除外をすり抜けるのを 1 つの規則で塞ぐ。
 ///      拒否文言に正規の綴りは載せない (隠れたディレクトリの実名を教えない)
 /// 3. **extension membership** — indexer と同じ拡張子セットに限定。
@@ -409,24 +411,23 @@ pub(crate) fn validate_get_document_path(
     // pointed -- outside the knowledge base, across the network on Windows --
     // and only then refuse it, with a message that differed by whether
     // something was there. Such a request gets the misspelling answer, without
-    // a look. It is almost never a spelling the index holds -- the exception
-    // is a Unix file literally named with a `..` between backslashes, which
-    // the index does store and which is given up here for the reason the URI
-    // parser gives it up: nothing that reads `\` as a separator is ever handed
-    // a `..`.
+    // a look.
     //
-    // What this guarantees is that a spelling leading out of the knowledge
-    // base is never looked at. Another spelling of a path inside it -- `./a.md`,
-    // `a//b.md`, on Windows a `.` segment or trailing dots and spaces -- passes
-    // here and is refused by the spelling check (2b) after the look. That look
-    // stays inside the knowledge base, and the reply can tell only whether
-    // something is at that place in it.
+    // What this guarantees (ADR-0023) is that a spelling which is not a name
+    // the index can hold is never looked at: out of the knowledge base, empty,
+    // a `.` or empty segment (`./a.md`, `a//b.md`, a trailing `/`), and on
+    // Windows a name Win32 would trim or refuse. The index walk leaves out
+    // every name refused here, so none of them is a spelling the index holds
+    // -- except a row an earlier version stored, which stays until the next
+    // full index (see `ServableRules::allows` in `kb_uri.rs`). What reaches the spelling check (2b) is a name the index could hold that
+    // is not this document's one spelling -- a case variant, an 8.3 short
+    // name, a route through a directory symlink -- and that look stays inside
+    // the knowledge base.
     //
-    // The rule is the one the `kb://` URI parser applies
-    // ([`crate::resources::is_safe_relative`]), not a second copy of it. The
-    // empty string is refused here on top: it names the knowledge base itself,
-    // which is not a document.
-    if rel_path.is_empty() || !crate::resources::is_safe_relative(rel_path) {
+    // The rule is the one the index walk, the watcher, `groove doctor` and the
+    // `kb://doc/` URI side apply ([`crate::resources::doc_is_addressable`]),
+    // not a second copy of it.
+    if !crate::resources::doc_is_addressable(rel_path) {
         return ValidatePathOutcome::NotFound(ErrorResponse {
             error: NOT_THE_CANONICAL_SPELLING.to_string(),
         });

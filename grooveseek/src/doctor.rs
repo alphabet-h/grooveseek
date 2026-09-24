@@ -17,9 +17,12 @@
 //! back, and why. This is *not* a second implementation of that rule: the
 //! extension check is [`crate::indexer::paths_with_unregistered_extension`] and
 //! the size check is [`crate::server::ServableRules`], the same values the
-//! server answers `resources/list` from. A doctor that computed its own
-//! equivalent would eventually disagree with the thing it is reporting on,
-//! which is the failure mode this whole feature is about. The same rule holds
+//! server answers `resources/list` from, and on Windows the name check is
+//! [`crate::resources::doc_is_addressable`], the predicate the walk, the
+//! watcher and `get_document` of [`crate::server`] ask (ADR-0023). A doctor
+//! that computed its own equivalent would eventually disagree with the thing
+//! it is reporting on, which is the failure mode this whole feature is about.
+//! The same rule holds
 //! for the declared-field set (D-19): whether `--field` / `fields` filters are
 //! refused is decided by [`crate::db::Database::read_declared_fields`] being
 //! absent ([`crate::db::Database::refuse_field_filters_while_pending`]), and
@@ -249,6 +252,35 @@ pub fn run(
         truncated(stale),
         "restore the extension in [parsers].enabled, or run groove index to drop the rows",
     ));
+
+    // (ADR-0023) Rows stored under a name the index can no longer hold -- on
+    // Windows a reserved device name, a segment ending in a dot or a space, a
+    // character Win32 refuses. The walk and the watcher leave such names out
+    // now, and the next `groove index` sweeps the rows (the walk no longer
+    // collects them); a daemon started on the old index does not, which is
+    // the state this reports. From the database alone, like everything here:
+    // doctor does not walk the knowledge base. Windows only, because elsewhere
+    // these are ordinary names.
+    if cfg!(windows) {
+        let unspellable: Vec<String> = all_paths
+            .iter()
+            .filter(|p| !crate::resources::doc_is_addressable(p))
+            .cloned()
+            .collect();
+        findings.extend(finding(
+            "name-not-spellable-on-windows",
+            Severity::Warning,
+            format!(
+                concat!(
+                    "{} indexed document(s) have a name Windows cannot open as written, ",
+                    "so a search can find them and get_document cannot open them"
+                ),
+                unspellable.len()
+            ),
+            truncated(unspellable),
+            "groove index (the next run leaves them out of the index; rename the files to keep them)",
+        ));
+    }
 
     let rules = crate::server::ServableRules::new(
         registry,
@@ -908,6 +940,74 @@ mod tests {
             .expect("the oversized document must be explained");
         assert_eq!(f.severity, Severity::Warning);
         assert_eq!(f.samples, vec!["notes/a.md".to_string()]);
+    }
+
+    /// Adds a document with one chunk under the given path, so the only
+    /// thing wrong with it is its name.
+    fn with_document_named(db: &Database, path: &str) {
+        let doc = db
+            .upsert_document(path, Some("X"), None, None, None, &[], None, "hx", 12)
+            .expect("upsert");
+        db.insert_chunk(doc, 0, Some("H"), None, "body", None, &vec![0.1; 384], 1.0)
+            .expect("chunk");
+    }
+
+    /// (ADR-0023) A row an earlier version indexed under a name Windows cannot
+    /// open as written stays until the next full run, and a daemon started on
+    /// that index does not sweep it. doctor names it from the database alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_document_indexed_under_a_name_windows_cannot_spell_is_reported() {
+        let db = db_with_one_chunk();
+        with_document_named(&db, "CON.md");
+        with_document_named(&db, "dir./x.md");
+
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.check == "name-not-spellable-on-windows")
+            .expect("the unspellable rows must be reported");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.count, 2);
+        assert_eq!(
+            f.samples,
+            vec!["CON.md".to_string(), "dir./x.md".to_string()]
+        );
+        assert!(
+            f.remedy.starts_with("groove index"),
+            "the remedy is an ordinary index run: {}",
+            f.remedy
+        );
+        assert!(f.summary.is_ascii() && f.remedy.is_ascii());
+    }
+
+    /// Elsewhere the same names are ordinary, so the same rows are no finding.
+    #[cfg(unix)]
+    #[test]
+    fn names_windows_cannot_spell_are_no_finding_on_unix() {
+        let db = db_with_one_chunk();
+        with_document_named(&db, "CON.md");
+        with_document_named(&db, "dir./x.md");
+        let report = run(&db, &registry_md(), None).expect("run");
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.check != "name-not-spellable-on-windows"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Ordinary names near the boundary are no finding anywhere.
+    #[test]
+    fn ordinary_names_are_not_reported_as_unspellable() {
+        let db = db_with_one_chunk();
+        with_document_named(&db, "dir.x/a.b.md");
+        with_document_named(&db, ".hidden/NULL.md");
+        let report = run(&db, &registry_md(), None).expect("run");
+        assert!(report.is_clean(), "{:?}", report.findings);
     }
 
     /// codex P1 round 1 + P2 round 2. Two ways to lose the vector table, and

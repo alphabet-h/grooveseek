@@ -3772,6 +3772,72 @@ mod tests {
         }
     }
 
+    /// (ADR-0023, AW-42) A `.` segment or an empty one is not a name the
+    /// index can hold, so step 0 answers it before anything on disk is looked
+    /// at. `missing.md` does not exist: had the disk been asked, the reply
+    /// would be the one that echoes the path and says how paths are written.
+    #[test]
+    fn a_dot_or_empty_segment_is_refused_before_the_disk_is_touched() {
+        let kb = TempKb::new("gd-dot-empty");
+        kb.write("a.md", "# A\n");
+        for rel in [
+            "./missing.md",
+            "sub//missing.md",
+            "sub/./missing.md",
+            "missing/",
+            "./a.md",
+            "a.md/",
+        ] {
+            let (variant, message) = ask_for_document(&kb.path, rel);
+            assert_eq!(variant, "NotFound", "{rel:?}: {message}");
+            assert!(
+                message.contains("canonical spelling") && message.contains("search"),
+                "{rel:?} must get the misspelling answer: {message}"
+            );
+            assert!(
+                !message.contains("Path should be relative"),
+                "{rel:?} was looked up on disk: {message}"
+            );
+        }
+    }
+
+    /// (ADR-0023, AW-42, AW-40) On Windows a name Win32 would trim or refuse
+    /// is answered by step 0 too. The knowledge base is spelled with the
+    /// verbatim prefix ([`TempKb`] canonicalizes), under which `a.md.` is not
+    /// `a.md`, so a look would have said "File not found: a.md." -- and
+    /// `a?b.md` would have been `ERROR_INVALID_NAME`, answered "unavailable".
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_win32_trims_or_refuses_are_refused_before_the_disk_is_touched() {
+        let kb = TempKb::new("gd-win-unspellable");
+        kb.write("a.md", "# A\n");
+        for rel in [
+            "a.md.",
+            "a.md ",
+            "a.md. .",
+            "sub./a.md",
+            "sub /a.md",
+            "a?b.md",
+            "a*.md",
+            "a<b.md",
+            "a>b.md",
+            "a|b.md",
+            "a\"b.md",
+            "a\u{1}b.md",
+        ] {
+            let (variant, message) = ask_for_document(&kb.path, rel);
+            assert_eq!(variant, "NotFound", "{rel:?}: {message}");
+            assert!(
+                message.contains("canonical spelling"),
+                "{rel:?} must get the misspelling answer: {message}"
+            );
+            assert!(
+                !message.contains("Path should be relative") && !message.contains("Failed to"),
+                "{rel:?} was looked up on disk: {message}"
+            );
+        }
+    }
+
     /// (AW-01) The Windows spellings of "somewhere else": a UNC share, which
     /// looked at would be an SMB connection to that host; the verbatim form of
     /// one; a drive with and without a root, and with either separator; a

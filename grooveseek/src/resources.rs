@@ -150,47 +150,57 @@ pub fn parse(uri: &str) -> Option<ResourceUri> {
     };
 
     let decoded = decode_path(rest)?;
-    if !is_safe_relative(&decoded) {
-        return None;
-    }
     match kind {
-        "doc" if decoded.is_empty() => None,
-        "doc" => Some(ResourceUri::Doc(decoded)),
-        _ => Some(ResourceUri::Topic(
+        "doc" if doc_is_addressable(&decoded) => Some(ResourceUri::Doc(decoded)),
+        "doc" => None,
+        _ if is_safe_relative(&decoded) => Some(ResourceUri::Topic(
             decoded.trim_end_matches('/').to_string(),
         )),
+        _ => None,
     }
 }
 
-/// Whether `rel`, a path as the index spells it, can be named by a
-/// `kb://doc/` URI that [`parse`] will read back.
+/// Whether `rel` is a name the index can hold -- and so one a `kb://doc/` URI
+/// can carry and [`parse`] will read back, and one `get_document` of
+/// [`crate::server`] will look up.
 ///
-/// The side that hands a URI out asks this, and [`parse`] asks the same
-/// function underneath, so a link is never offered for a path the read would
-/// refuse on its spelling alone.
+/// **The one predicate for that question** (ADR-0023). The index walk and the
+/// watcher skip what it refuses, `groove doctor` reports rows that fail it,
+/// the side that hands a URI out asks it, [`parse`] asks it of a `kb://doc/`
+/// URI, and the document path check behind `get_document` of [`crate::server`]
+/// asks it before anything on disk is looked at. So a search hit can never
+/// name a document that cannot be opened by the name it was given.
+///
+/// On top of [`is_safe_relative`], which also answers for topic prefixes, a
+/// document name may not be empty and may hold no `.` segment and no empty
+/// one (`./a.md`, `a//b.md`, a trailing `/`). Those are other spellings of a
+/// path, on every platform; the walk never produces one. Split on `/` only:
+/// where `\` is an ordinary filename character (Unix), `\\host\x.md` is one
+/// name, not two empty segments.
 pub fn doc_is_addressable(rel: &str) -> bool {
-    !rel.is_empty() && is_safe_relative(rel)
+    !rel.is_empty()
+        && is_safe_relative(rel)
+        && !rel.split('/').any(|seg| seg.is_empty() || seg == ".")
 }
 
 /// A decoded path may be used against the knowledge base only if it stays
 /// inside it and names something on this side of the OS's path syntax.
 ///
-/// Two surfaces ask it. The `kb://` side asks through [`parse`], for a URI
-/// being read, and [`doc_is_addressable`], for a URI about to be handed out.
-/// The path check in [`crate::server`] behind `get_document` and
-/// `get_best_practice` asks it of the requested string before anything on disk
-/// is looked at (AW-01): `Path::join` replaces the knowledge base with an
-/// absolute right-hand side, so an absolute path, a drive or a UNC share would
-/// otherwise be stat'ed wherever it points -- outside the knowledge base, or
-/// across the network on Windows. What it keeps from the disk is a path that
-/// leads out of the knowledge base: another spelling of a path inside it
-/// (`./a.md`, `a//b.md`, on Windows trailing dots or spaces) passes here, and
-/// the document path check refuses it after a look that stays inside. Neither
-/// surface keeps a copy of the rule
+/// Two surfaces ask it, and for a document name both ask it through
+/// [`doc_is_addressable`], the predicate for that question. The `kb://` side
+/// does so in [`parse`], for a URI being read, and before a URI is handed out;
+/// [`parse`] asks this function directly only for a topic prefix. The path
+/// check in [`crate::server`] behind `get_document` and `get_best_practice`
+/// asks [`doc_is_addressable`] of the requested string before anything on
+/// disk is looked at (AW-01, ADR-0023): `Path::join` replaces the knowledge
+/// base with an absolute right-hand side, so an absolute path, a drive or a
+/// UNC share would otherwise be stat'ed wherever it points -- outside the
+/// knowledge base, or across the network on Windows. [`doc_is_addressable`]
+/// adds what only a document name has to satisfy (not empty, no `.` or empty
+/// segment); topic prefixes come here directly.
+/// Neither surface keeps a copy of the rule
 /// (AGENTS.md, "One question gets one implementation"). The empty string
-/// passes here and each caller decides about it: [`parse`] reads it as the
-/// root topic group, while [`doc_is_addressable`] and the document path check
-/// refuse it, since a document path has to name a document.
+/// passes here: [`parse`] reads it as the root topic group.
 ///
 /// **`\` is refused only where it separates components**
 /// ([`crate::indexer::backslash_separates_components`], the same answer the
@@ -210,11 +220,15 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// as well -- and in return nothing downstream that reads `\` as a separator
 /// can ever be handed a `..`.
 ///
-/// On Windows two more things are refused: a colon anywhere
+/// On Windows four more things are refused: a colon anywhere
 /// ([`holds_a_windows_colon`] -- a drive or an alternate data stream, Codex
-/// round 2 on #319), and a segment that names a device
+/// round 2 on #319); a segment that names a device
 /// ([`names_a_windows_device`]), so no request reaches the null device or a
-/// port by being spelled `NUL` or `COM1` (Codex round 1 on #319).
+/// port by being spelled `NUL` or `COM1` (Codex round 1 on #319); a segment
+/// that ends in a dot or a space ([`ends_where_win32_trims`]); and a character
+/// Win32 refuses in a name ([`holds_a_character_win32_refuses`]). Every one of
+/// them is a name Win32 either reads as something else or will not open, so a
+/// file the index holds under it could be found and never opened (ADR-0023).
 pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.contains('\0') {
         return false;
@@ -222,11 +236,11 @@ pub(crate) fn is_safe_relative(p: &str) -> bool {
     if p.contains('\\') && crate::indexer::backslash_separates_components() {
         return false;
     }
-    if p.starts_with('/') || holds_a_windows_colon(p) {
+    if p.starts_with('/') || holds_a_windows_colon(p) || holds_a_character_win32_refuses(p) {
         return false;
     }
     !p.split(['/', '\\'])
-        .any(|seg| seg == ".." || names_a_windows_device(seg))
+        .any(|seg| seg == ".." || names_a_windows_device(seg) || ends_where_win32_trims(seg))
 }
 
 /// The names Windows reserves for devices, as [`names_a_windows_device`]
@@ -288,9 +302,9 @@ const WINDOWS_DEVICE_NAMES: &[&str] = &[
 /// follows the page rather than one build: on build 26200 only `NUL` (with
 /// trailing dots, spaces or a colon) still turns into the device behind a
 /// directory, and under the verbatim `\\?\` prefix a canonical knowledge base
-/// carries, nothing does. The cost is a file that some Windows lets exist,
-/// such as `CON.md`, which neither `get_document` nor a `kb://doc/` URI can
-/// name.
+/// carries, nothing does. A file some Windows lets exist under such a name,
+/// `CON.md` for one, is not indexed either: the walk and the watcher ask
+/// [`doc_is_addressable`] too (ADR-0023), so no search hit names it.
 fn names_a_windows_device(segment: &str) -> bool {
     if !cfg!(windows) {
         return false;
@@ -333,6 +347,54 @@ fn names_a_windows_device(segment: &str) -> bool {
 /// then looked up.
 fn holds_a_windows_colon(p: &str) -> bool {
     cfg!(windows) && p.contains(':')
+}
+
+/// Whether `segment` ends in a dot or a space, on Windows, where Win32 strips
+/// both from the end of a path component before it looks anything up: `b.md.`
+/// and `b.md ` open `b.md`, and `dir./x.md` opens `dir/x.md` -- another file,
+/// or none. `.` and `..` are segments of their own and are answered elsewhere
+/// ([`doc_is_addressable`], and the `..` check in [`is_safe_relative`]).
+///
+/// **Windows only.** Elsewhere a trailing dot or space is part of the name.
+fn ends_where_win32_trims(segment: &str) -> bool {
+    cfg!(windows) && segment != "." && segment != ".." && segment.ends_with(['.', ' '])
+}
+
+/// Whether `p` holds a character "Naming Files, Paths, and Namespaces"
+/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>)
+/// says a Windows name cannot contain -- `< > " | ? *` and the control
+/// characters 1 through 31 -- on Windows. A request holding one used to reach
+/// the disk and come back as `ERROR_INVALID_NAME`, answered "unavailable"
+/// rather than "not found" (AW-40). The colon is [`holds_a_windows_colon`];
+/// NUL is refused on every platform in [`is_safe_relative`].
+///
+/// **Windows only.** Elsewhere these are ordinary filename characters.
+fn holds_a_character_win32_refuses(p: &str) -> bool {
+    cfg!(windows)
+        && p.chars()
+            .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | '\u{1}'..='\u{1f}'))
+}
+
+/// The line the index walk and the watcher log for each entry they leave out
+/// because [`doc_is_addressable`] refuses its name (ADR-0023). One function so
+/// the two stay in step, the way [`crate::links::refusal_reason`] does for
+/// hard links. ASCII, since it goes to stderr (AGENTS.md).
+pub(crate) fn unspellable_reason(path: &std::path::Path, is_dir: bool) -> String {
+    format!(
+        concat!(
+            "{}{} was skipped: its name is not one get_document or a kb:// URI can take ",
+            "(on Windows: a reserved device name such as CON, a name ending in a dot or ",
+            "a space, or one of < > \" | ? * or a control character), so indexing it ",
+            "would leave a search hit nobody can open (ADR-0023). Rename it if it belongs ",
+            "in the index."
+        ),
+        path.display(),
+        if is_dir {
+            " and everything under it"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Percent-encode everything outside the unreserved set, leaving `/` as the
@@ -384,16 +446,16 @@ mod tests {
             // is an encoder nobody has checked.
             "日本語/ノート.md",
             "with space/and #hash.md",
-            "a%b/c?d.md",
             "emoji-🦀/x.md",
         ]
         .into_iter()
         // `:` is a filename byte on Unix and a drive designator on Windows, so
         // these are only round-trippable where such a file can exist. See
-        // `a_drive_designator_is_refused_only_where_drives_exist`.
+        // `a_drive_designator_is_refused_only_where_drives_exist`. `?` is the
+        // same kind of character (ADR-0023): Windows refuses it in a name.
         .chain(
             cfg!(not(windows))
-                .then_some(["a:b.md", "C:/note.md"])
+                .then_some(["a:b.md", "C:/note.md", "a%b/c?d.md"])
                 .into_iter()
                 .flatten(),
         ) {
@@ -659,6 +721,128 @@ mod tests {
                 "{rel:?}"
             );
         }
+    }
+
+    /// (ADR-0023, AW-42) A `.` segment or an empty one is another spelling of
+    /// some path, never the name of a document, on every platform: the index
+    /// walk cannot produce one. The rule is on document names only -- the
+    /// root topic group is the empty string and a topic URI may end in `/`,
+    /// and neither changes.
+    #[test]
+    fn a_dot_or_empty_segment_is_not_a_document_name() {
+        for p in ["./a.md", "a/./b.md", "a//b.md", "a/", "a/b/", ".", "a/."] {
+            assert!(!doc_is_addressable(p), "{p:?}");
+            assert_eq!(parse(&doc_uri(p)), None, "{p:?}");
+            assert_eq!(parse(&format!("kb://doc/{p}")), None, "{p:?} unencoded");
+        }
+        assert_eq!(
+            parse(&topic_uri("")),
+            Some(ResourceUri::Topic(String::new())),
+            "the root group is still addressable"
+        );
+        assert_eq!(
+            parse("kb://topic/notes/"),
+            Some(ResourceUri::Topic("notes".to_string())),
+            "a topic URI with a trailing slash still reads as its group"
+        );
+    }
+
+    /// On Unix `\` is a filename character, so a name that starts with two of
+    /// them has no empty segment: the new rule splits on `/` alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_leading_double_backslash_is_still_a_name_on_unix() {
+        assert!(doc_is_addressable("\\\\host\\x.md"));
+        assert_eq!(
+            parse(&doc_uri("\\\\host\\x.md")),
+            Some(ResourceUri::Doc("\\\\host\\x.md".to_string()))
+        );
+    }
+
+    /// (ADR-0023, AW-42, AW-40) On Windows a segment ending in a dot or a
+    /// space names a different file once Win32 trims it, and `< > " | ? *` or
+    /// a control character is a name Win32 refuses outright. None of them is
+    /// a name the index can hold there. Names that only resemble them stay.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_win32_would_rewrite_or_refuse_is_refused_on_windows() {
+        for p in [
+            "b.md.",
+            "b.md ",
+            "b.md. .",
+            "dir./x.md",
+            "dir /x.md",
+            "a/b.md...",
+            "a<b.md",
+            "a>b.md",
+            "a\"b.md",
+            "a|b.md",
+            "a/b?.md",
+            "a*b.md",
+            "a\u{1}b.md",
+            "a\u{1f}b.md",
+            "dir\tx/b.md",
+        ] {
+            assert!(!is_safe_relative(p), "{p:?} is not a name on Windows");
+            assert!(!doc_is_addressable(p), "{p:?}");
+            assert_eq!(parse(&doc_uri(p)), None, "{p:?}");
+        }
+        for p in [
+            "a.b.md",
+            ".hidden.md",
+            "a/.x/b.md",
+            "a b.md",
+            "dir.x/a.md",
+            "x.md~",
+            "a%b.md",
+            "a#b.md",
+            "日本語/メモ.md",
+        ] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name");
+            assert!(doc_is_addressable(p), "{p:?}");
+            assert_eq!(parse(&doc_uri(p)), Some(ResourceUri::Doc(p.to_string())));
+        }
+    }
+
+    /// The same inputs are ordinary names on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn trailing_dots_spaces_and_win32_reserved_characters_are_ordinary_names_on_unix() {
+        for p in [
+            "b.md.",
+            "b.md ",
+            "dir./x.md",
+            "dir /x.md",
+            "a<b.md",
+            "a>b.md",
+            "a\"b.md",
+            "a|b.md",
+            "a/b?.md",
+            "a*b.md",
+            "a\u{1}b.md",
+            "dir\tx/b.md",
+        ] {
+            assert!(is_safe_relative(p), "{p:?} is an ordinary name on Unix");
+            assert!(doc_is_addressable(p), "{p:?}");
+            assert_eq!(parse(&doc_uri(p)), Some(ResourceUri::Doc(p.to_string())));
+        }
+    }
+
+    /// The message every skip for a name logs: ASCII, names the path, and
+    /// says whether a whole directory went with it.
+    #[test]
+    fn the_skip_reason_is_ascii_and_names_what_was_skipped() {
+        let file = unspellable_reason(std::path::Path::new("kb/CON.md"), false);
+        assert!(file.is_ascii(), "{file}");
+        assert!(file.contains("CON.md"), "{file}");
+        assert!(file.contains("ADR-0023"), "{file}");
+        assert!(!file.contains("everything under it"), "{file}");
+        let dir = unspellable_reason(std::path::Path::new("kb/dir."), true);
+        assert!(dir.is_ascii(), "{dir}");
+        assert!(
+            dir.contains("dir. and everything under it was skipped"),
+            "{dir}"
+        );
     }
 
     #[test]

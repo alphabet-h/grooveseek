@@ -32,13 +32,12 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is now refused before anything on disk is looked at, with the answer a
   misspelled path already gets. It is the rule `kb://doc/` URIs were already
   held to. `get_best_practice` skips such a template like a missing one and
-  tries the next. What is kept from the disk is a spelling that leads out of
-  the knowledge base. Another spelling of a path inside it — `./a.md`,
-  `a//b.md`, and on Windows a `.` segment or trailing dots and spaces, which
-  Windows resolves to the same file — is still looked at first, inside the
-  knowledge base only, and refused by the spelling check that follows; what
-  that reply can tell is whether something is at that place in the knowledge
-  base, which asking under the path's own spelling tells anyway. One route
+  tries the next. Another spelling of a path inside the knowledge base —
+  `./a.md`, `a//b.md`, and on Windows trailing dots and spaces — is refused
+  the same way before the disk is looked at (see Changed); a case variant, an
+  8.3 short name or a route through a directory symlink is looked at first,
+  inside the knowledge base only, and refused by the spelling check that
+  follows. One route
   keeps the two replies apart: a directory symlink
   (or on Windows a junction) placed inside the knowledge base that leads out
   of it still gets "outside the knowledge base" when something is at the far
@@ -54,6 +53,27 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Changed
 
+- **On Windows, a document whose name Windows cannot open as written is no
+  longer indexed** ([ADR-0023](docs/decisions/0023-index-only-names-the-server-can-open.md)).
+  A reserved device name such as `CON.md` or `nul.md`, and anything under a
+  directory whose name ends in a dot or a space, can exist through the `\\?\`
+  prefix; the index took them in, `search` found them, and `get_document`
+  refused them while no `kb://doc/` URI named them. The index walk and the
+  watcher now ask the predicate `get_document` and the URI side use: such a
+  file is left out with one warning naming it, and `groove index` adds
+  `, N not indexed (...)` to its `Done in` line when there were any (the MCP
+  `rebuild_index` reply does not carry that count). A row an earlier version
+  stored for such a name is removed by the next `groove index` or
+  `rebuild_index`, or by the watcher when the file is deleted or renamed to a
+  name the index can hold; until then `groove doctor` reports it
+  as `name-not-spellable-on-windows` (a warning, so exit `1`). On every
+  platform `get_document` now refuses a `.` or empty segment (`./a.md`,
+  `a//b.md`, a trailing `/`) before anything on disk is looked at, and on
+  Windows a segment ending in a dot or a space and `< > " | ? *` or a control
+  character too; the reply is the one those spellings already got, except
+  that `a?b.md` used to be answered as unavailable. On Unix a file whose name
+  holds `..` between backslashes (`a\..\b.md`), which `get_document` already
+  refused, is left out of the index the same way.
 - **A `groove-schema.toml` that exists but is refused stops the command.**
   `groove index`, `groove validate` (exit `2`), `groove doctor` (exit `2`) and
   the `rebuild_index` tool report it as a schema load error instead of running
@@ -77,11 +97,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   as devices rather than files. A colon anywhere in the path is refused there
   too, which loses no document — no Windows file name can hold one — but
   closes the alternate data streams of a document (`note.md:secret`,
-  `note.md::$DATA`) to `get_document`.
+  `note.md::$DATA`) to `get_document`. Such a file is now left out of the
+  index as well; see the ADR-0023 entry above.
 - **On Linux and macOS, `get_document` no longer opens a file whose name holds
   `..` between backslashes**, such as one literally named `a\..\b.md`. Its
   `kb://doc/` URI was already refused for the same reason: nothing that reads
-  `\` as a separator is ever handed a `..`.
+  `\` as a separator is ever handed a `..`. Such a file is now left out of the
+  index as well; see the ADR-0023 entry above.
 
 ### Fixed
 
