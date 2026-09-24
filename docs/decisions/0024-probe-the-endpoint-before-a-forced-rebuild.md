@@ -114,6 +114,11 @@ the index. Nothing else probes.**
   halfway, an outage mid-run — still stops the rebuild with part of the index
   written. Option 2 is what would close that; until then the remedy is to run
   the forced rebuild again.
+- **A database `--force` could not open is replaced before the probe.**
+  `groove index --force` swaps out a file that is not a usable SQLite database
+  (`open_or_replace_corrupt`, in `main.rs`'s `Commands::Index` arm) before
+  `rebuild_index` runs. If the probe then fails, the message still says the
+  index was not modified, but there was no usable index to keep.
 - **Text leaves the machine one request earlier than before.** It is the fixed
   string, not knowledge-base content, and it goes only where the operator has
   already chosen to send every chunk by running a forced rebuild.

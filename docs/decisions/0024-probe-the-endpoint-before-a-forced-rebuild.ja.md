@@ -97,6 +97,11 @@ ADR-0022 は **GrooveSeek は endpoint を probe しない** と決めた。理�
   probe の後で断り始めた endpoint — 途中で当たった rate limit、実行中の停止 — は、
   やはり索引を一部だけ書いたところで再構築を止める。それを塞ぐのは選択肢 2 で、それまでの
   対処は強制再構築をもう一度打つこと。
+- **`--force` が開けなかった database は、probe より前に置き換わる。**
+  `groove index --force` は、使える SQLite database でないファイルを
+  `rebuild_index` の前に差し替える (`main.rs` の `Commands::Index` arm にある
+  `open_or_replace_corrupt`)。その後で probe が失敗すると、メッセージはやはり
+  索引は変更していないと述べるが、残すべき使える索引はもともと無かった。
 - **マシンの外へ出る文字列が、以前より 1 リクエスト早くなる。** それは固定の文字列で
   知識ベースの中身ではなく、行き先は運用者が強制再構築を打つことで全チャンクを送ると
   既に決めた先だけ。
