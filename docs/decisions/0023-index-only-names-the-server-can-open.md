@@ -72,9 +72,9 @@ Chosen option: 3.
   knowledge base is judged too. It asks wherever a row may be written — a
   reindex, the new end of a rename, and the files a newly arrived directory
   brought in — so a rename onto such a name deindexes. It does not ask where
-  a row is only removed: a delete, and the old end of a rename once the old
-  file is gone, so a row an earlier version stored under such a name leaves
-  with its file.
+  a row is only removed or moved away: a delete, and the old end of a rename
+  (whether or not a file under the old name exists again by then), so a row
+  an earlier version stored under such a name leaves with its file.
 - `get_document` asks it before the first stat. What its spelling check still
   answers is a name the index could hold that is not the document's one
   spelling: a case variant, an 8.3 short name, a symlinked directory.

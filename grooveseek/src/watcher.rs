@@ -551,11 +551,14 @@ fn rename_action(old_ok: bool, new_ok: bool) -> RenameAction {
 
 /// The [`RenameAction`] for a rename event, both ends judged by [`gate_parts`].
 ///
-/// (ADR-0023) The old end is judged as a removal when the old file is gone,
-/// which is the ordinary case: all that end does is move or drop a row, and a
-/// row an older version stored under a name the index no longer holds (say
-/// `CON.md`) must still follow a rename to `console.md`, the remedy the
-/// refusal itself suggests. The new end is a write and keeps the name check.
+/// (ADR-0023) The old end is judged as a removal: all it decides is whether
+/// the existing row is moved or dropped, and nothing is written under the old
+/// name. So a row an older version stored under a name the index no longer
+/// holds (say `CON.md`) still follows a rename to `console.md`, the remedy
+/// the refusal itself suggests -- even when a file under the old name exists
+/// again by the time the debounced rename is handled (codex P2 on PR #322).
+/// The new end is a write and keeps the name check, so a bad name still
+/// cannot enter the index.
 fn rename_decision(
     old_rel: &str,
     from: &Path,
@@ -565,7 +568,7 @@ fn rename_decision(
     rules: &crate::exclusion::ExclusionRules,
 ) -> RenameAction {
     rename_action(
-        gate_parts(old_rel, from, registry, rules, Gate::RenameSource),
+        gate_parts(old_rel, from, registry, rules, Gate::Removal),
         gate_parts(new_rel, to, registry, rules, Gate::Write),
     )
 }
@@ -583,21 +586,20 @@ fn deindex_passes(
 }
 
 /// What a path is being judged for, which decides whether the name check
-/// ([`name_is_addressable`]) applies. Every other check is the same for all
-/// three.
+/// ([`name_is_addressable`]) applies. Every other check is the same for both.
+///
+/// Keyed on what the event does to the row, never on whether the file is
+/// there: on Windows a non-verbatim event path through a directory ending in
+/// a dot has the dot trimmed by Win32 and can come back with no metadata
+/// while naming a file that would be written, and a bad old name can exist
+/// again when its rename is handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
     /// The path may be written as a row: reindex, the new end of a rename.
     Write,
-    /// A remove event: the row, if any, is deleted.
+    /// The row, if any, is only deleted or moved away: a remove event, the
+    /// old end of a rename.
     Removal,
-    /// The old end of a rename: a removal when the old file is gone, a write
-    /// otherwise ("gone" = `symlink_metadata` fails). The rule is not
-    /// extended to [`Gate::Write`]: on Windows a non-verbatim event path
-    /// through a directory ending in a dot has the dot trimmed by Win32 and
-    /// can come back with no metadata while naming a file that would be
-    /// written.
-    RenameSource,
 }
 
 /// 対象ファイルの拡張子が `registry` にあり、除外対象でないこと。
@@ -684,15 +686,10 @@ fn gate_parts(
     // (ADR-0023) Below the extension filter, as in the walk, so only a file
     // that would otherwise have been indexed is named in a warning. Only a
     // path that may be written is asked (see [`Gate`]): a rename onto such a
-    // name deindexes the old row, while removing one, or renaming it away
-    // once it is gone, still reaches a row an older version stored under it
-    // -- and names no file that was skipped, so there is nothing to warn of.
-    let name_matters = match gate {
-        Gate::Write => true,
-        Gate::Removal => false,
-        Gate::RenameSource => meta.is_some(),
-    };
-    if name_matters && !name_is_addressable(rel, full, is_dir) {
+    // name deindexes the old row, while deleting one or renaming it away still
+    // reaches a row an older version stored under it. A removal skips no file,
+    // so there is nothing to warn of either.
+    if gate == Gate::Write && !name_is_addressable(rel, full, is_dir) {
         return false;
     }
     // (BU-20) A hard link is the same attack with no symlink to see: a second
@@ -1629,8 +1626,7 @@ mod tests {
     }
 
     /// (ADR-0023) The removal exemption does not reach a write: a bad-named
-    /// file that exists is refused for a reindex, and a rename whose old end
-    /// still exists under such a name is judged as a write on both ends.
+    /// file that exists is refused for a reindex.
     #[cfg(windows)]
     #[test]
     fn a_name_win32_cannot_spell_that_exists_is_still_not_written() {
@@ -1638,13 +1634,40 @@ mod tests {
         let reg = Registry::defaults();
         let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
         std::fs::write(kb.join("CON.md"), "# x\n").unwrap();
-        std::fs::write(kb.join("nul.md"), "# x\n").unwrap();
         assert!(!should_process_parts(
             "CON.md",
             &kb.join("CON.md"),
             &reg,
             &rules
         ));
+    }
+
+    /// (ADR-0023, codex P2 on PR #322) The old end of a rename is a removal
+    /// even while a file exists under the old name again -- recreated before
+    /// the debounced rename is handled. The row still moves to a good new
+    /// name, or is dropped when the new name is bad too; otherwise the row an
+    /// older version stored would stay, and the recreated file's own event is
+    /// refused, so nothing else would remove it before a full index.
+    #[cfg(windows)]
+    #[test]
+    fn the_old_end_of_a_rename_is_a_removal_even_when_the_old_name_exists_again() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-rc");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("CON.md"), "# recreated\n").unwrap();
+        std::fs::write(kb.join("console.md"), "# x\n").unwrap();
+        std::fs::write(kb.join("nul.md"), "# x\n").unwrap();
+        assert_eq!(
+            rename_decision(
+                "CON.md",
+                &kb.join("CON.md"),
+                "console.md",
+                &kb.join("console.md"),
+                &reg,
+                &rules
+            ),
+            RenameAction::Rename
+        );
         assert_eq!(
             rename_decision(
                 "CON.md",
@@ -1654,7 +1677,7 @@ mod tests {
                 &reg,
                 &rules
             ),
-            RenameAction::Skip
+            RenameAction::Deindex
         );
     }
 
