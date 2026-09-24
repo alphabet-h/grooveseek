@@ -153,22 +153,33 @@ fn embed_mock_stops_promptly_while_a_client_holds_a_connection_open() {
         common::embed_mock::wait_until(Duration::from_secs(5), || mock.connection_count() >= 1),
         "the mock never accepted the connection"
     );
-    let started = Instant::now();
-    drop(mock);
-    let took = started.elapsed();
+    // Dropped on another thread: a mock stuck in its read would otherwise
+    // hang this test instead of failing it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(mock);
+        let _ = tx.send(started.elapsed());
+    });
+    let took = rx.recv_timeout(Duration::from_secs(5));
     drop(held);
+    let took = took.expect("Drop did not return within 5 s while a client held a connection open");
     assert!(
         took < Duration::from_secs(2),
         "Drop must not wait out a half-open connection, took {took:?}"
     );
 }
 
+/// Linux and macOS only, on purpose. Backpressure cannot be induced on a
+/// Windows loopback connection: Windows takes a blocking write like this whole
+/// (measured: 512 MiB returned `Ok` in 66 ms to a client that never read), so
+/// there the test would pass with or without the bounded write. The bounded
+/// write itself ships on every OS.
 #[test]
+#[cfg(not(windows))]
 fn embed_mock_stops_promptly_while_a_client_stops_reading_the_response() {
     // Far more than Linux or macOS buffers on a loopback connection, so the
-    // write meets backpressure from a client that never reads. Windows takes
-    // a blocking write like this whole (512 MiB returned `Ok` in 66 ms when
-    // measured), so there this passes with or without the write timeout.
+    // write meets backpressure from a client that never reads.
     const BODY: usize = 64 * 1024 * 1024;
     let mock = EmbedMock::with_responder(|_| common::embed_mock::MockResponse {
         status: 200,
