@@ -151,6 +151,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is required for (the `[embedding]` provider, model or dimension, not only
   `--model`); `doctor` lists the questions it asks today, including the
   declared-field set and line-chunked source files.
+- **A source file no longer produces a chunk of nothing but blank lines.** When
+  a line had already used up the chunk budget on its own, a blank line after
+  it still started a new piece, so the tail of a line-chunked file could come
+  out as a whitespace-only chunk that was embedded and indexed. A line with no
+  visible characters now never starts a piece. (#273)
 
 ## [1.13.0] - 2026-09-23
 
