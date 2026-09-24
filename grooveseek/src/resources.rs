@@ -161,17 +161,17 @@ pub fn parse(uri: &str) -> Option<ResourceUri> {
 }
 
 /// Whether `rel` is a name the index can hold -- and so one a `kb://doc/` URI
-/// can carry and [`parse`] will read back, and one `get_document` will look up.
+/// can carry and [`parse`] will read back, and one `get_document` of
+/// [`crate::server`] will look up.
 ///
 /// **The one predicate for that question** (ADR-0023). The index walk and the
 /// watcher skip what it refuses, `groove doctor` reports rows that fail it,
 /// the side that hands a URI out asks it, [`parse`] asks it of a `kb://doc/`
-/// URI, and the document path check behind `get_document` asks it before
-/// anything on disk is looked at. So a search hit can never name a document
-/// that cannot be opened by the name it was given.
+/// URI, and the document path check behind `get_document` of [`crate::server`]
+/// asks it before anything on disk is looked at. So a search hit can never
+/// name a document that cannot be opened by the name it was given.
 ///
-/// On top of `is_safe_relative` (plain code, not a link: this item is `pub`
-/// and that one is not), which also answers for topic prefixes, a
+/// On top of [`is_safe_relative`], which also answers for topic prefixes, a
 /// document name may not be empty and may hold no `.` segment and no empty
 /// one (`./a.md`, `a//b.md`, a trailing `/`). Those are other spellings of a
 /// path, on every platform; the walk never produces one. Split on `/` only:

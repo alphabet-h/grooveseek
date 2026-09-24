@@ -3,8 +3,8 @@
 //! # Why this is a single type
 //!
 //! Three call sites walk or watch the knowledge base — the full index walk
-//! ([`crate::indexer::collect_source_files_counted`]), the `validate` walk
-//! (`validate_collect_md_files` in `src/main.rs`) and the live watcher
+//! ([`crate::indexer::collect_source_files_counted`]), the `groove validate`
+//! walk (`validate_collect_md_files` in `src/main.rs`) and the live watcher
 //! ([`crate::watcher`]) — and they have drifted apart twice. AU-03 landed with
 //! the watcher missing the hardcoded denylist the other two applied, so a
 //! narrowed `exclude_dirs` let `npm install` pour `node_modules/` into the

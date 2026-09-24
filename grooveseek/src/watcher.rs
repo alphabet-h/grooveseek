@@ -715,8 +715,9 @@ fn gate_parts(
 }
 
 /// (ADR-0023) Whether the index can hold `rel`, logging the refusal when it
-/// cannot: the same predicate the full walk, `get_document` and the
-/// `kb://doc/` URI side ask ([`crate::resources::doc_is_addressable`]).
+/// cannot: the same predicate the full walk, `get_document` of
+/// [`crate::server`] and the `kb://doc/` URI side ask
+/// ([`crate::resources::doc_is_addressable`]).
 ///
 /// Judged on `rel` as [`to_rel`] recovered it, never on the raw event path.
 /// The walk judges no name under a spelling of the knowledge base other than
@@ -1479,7 +1480,7 @@ mod tests {
     /// (ADR-0023) An event can name a file under a spelling of the knowledge
     /// base other than `kb_path`'s -- here the directory's own name in another
     /// case. The walk judges no name there, so the watcher judges it on the
-    /// `rel` that `to_rel` recovers: a device name or a trailing-dot directory
+    /// `rel` that [`to_rel`] recovers: a device name or a trailing-dot directory
     /// is still refused, an ordinary file there is still processed, on the
     /// single-file path and in a directory that just arrived.
     #[cfg(windows)]

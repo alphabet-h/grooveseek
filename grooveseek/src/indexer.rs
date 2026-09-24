@@ -2222,8 +2222,8 @@ pub(crate) fn collect_source_files_under(
     collect_source_files_counted(kb_path, start, registry, rules).map(|c| c.files)
 }
 
-/// Whether the walk leaves `path` out for its name (ADR-0023): it lies under
-/// `kb_path` as spelled, and its relative path is one
+/// Whether the walk leaves the given path out for its name (ADR-0023): it
+/// lies under `kb_path` as spelled, and its relative path is one
 /// [`crate::resources::doc_is_addressable`] refuses.
 ///
 /// Only a path under `kb_path` as spelled is judged. The watcher hands in raw
@@ -2250,7 +2250,8 @@ pub(crate) struct CollectedSources {
 /// name is not one the index can hold.
 ///
 /// (ADR-0023) A name [`crate::resources::doc_is_addressable`] refuses would be
-/// a search hit that `get_document` refuses and no `kb://doc/` URI names --
+/// a search hit that `get_document` of [`crate::server`] refuses and no
+/// `kb://doc/` URI names --
 /// on Windows `CON.md`, or anything under `dir./`, both of which the verbatim
 /// `\\?\` prefix lets exist. A directory is pruned in `filter_entry`, so its
 /// subtree is never read; a file is checked after the extension filter, so
@@ -3740,7 +3741,7 @@ mod tests {
     /// Removes a scratch directory through the verbatim path `canonicalize`
     /// returns, the only spelling under which `CON.md` or `dir.` is the entry
     /// on disk rather than a device or a trimmed name. Declare it after the
-    /// `TmpDir` it covers so it is dropped first.
+    /// [`TmpDir`] it covers so it is dropped first.
     #[cfg(windows)]
     struct VerbatimCleanup(std::path::PathBuf);
     #[cfg(windows)]
@@ -3784,8 +3785,9 @@ mod tests {
         (tmp, cleanup, kb)
     }
 
-    /// (ADR-0023, AW-43) The walk leaves out what `doc_is_addressable`
-    /// refuses: `CON.md` at file level, `dir.` and `sp ` at directory level
+    /// (ADR-0023, AW-43) The walk leaves out what
+    /// [`crate::resources::doc_is_addressable`] refuses: `CON.md` at file
+    /// level, `dir.` and `sp ` at directory level
     /// with everything under them. `b.md.` and `b.md ` never reach the check
     /// -- `Path::extension` reads them as `""` and `"md "` -- so they are not
     /// counted, and were never indexed before this either.
@@ -3817,7 +3819,7 @@ mod tests {
     }
 
     /// The watcher walks a directory that just appeared from that directory
-    /// (`dispatch_new_directory`). Started at `dir.`, the walk yields nothing
+    /// (`dispatch_new_directory` of [`crate::watcher`]). Started at `dir.`, the walk yields nothing
     /// and counts the directory once, not its two files.
     #[cfg(windows)]
     #[test]

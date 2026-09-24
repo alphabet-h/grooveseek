@@ -3803,7 +3803,7 @@ mod tests {
 
     /// (ADR-0023, AW-42, AW-40) On Windows a name Win32 would trim or refuse
     /// is answered by step 0 too. The knowledge base is spelled with the
-    /// verbatim prefix (`TempKb` canonicalizes), under which `a.md.` is not
+    /// verbatim prefix ([`TempKb`] canonicalizes), under which `a.md.` is not
     /// `a.md`, so a look would have said "File not found: a.md." -- and
     /// `a?b.md` would have been `ERROR_INVALID_NAME`, answered "unavailable".
     #[cfg(windows)]

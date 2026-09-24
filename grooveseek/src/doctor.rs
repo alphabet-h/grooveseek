@@ -19,9 +19,10 @@
 //! the size check is [`crate::server::ServableRules`], the same values the
 //! server answers `resources/list` from, and on Windows the name check is
 //! [`crate::resources::doc_is_addressable`], the predicate the walk, the
-//! watcher and `get_document` ask (ADR-0023). A doctor that computed its own
-//! equivalent would eventually disagree with the thing it is reporting on,
-//! which is the failure mode this whole feature is about. The same rule holds
+//! watcher and `get_document` of [`crate::server`] ask (ADR-0023). A doctor
+//! that computed its own equivalent would eventually disagree with the thing
+//! it is reporting on, which is the failure mode this whole feature is about.
+//! The same rule holds
 //! for the declared-field set (D-19): whether `--field` / `fields` filters are
 //! refused is decided by [`crate::db::Database::read_declared_fields`] being
 //! absent ([`crate::db::Database::refuse_field_filters_while_pending`]), and
@@ -941,8 +942,8 @@ mod tests {
         assert_eq!(f.samples, vec!["notes/a.md".to_string()]);
     }
 
-    /// Adds a document with one chunk under `path`, so the only thing wrong
-    /// with it is its name.
+    /// Adds a document with one chunk under the given path, so the only
+    /// thing wrong with it is its name.
     fn with_document_named(db: &Database, path: &str) {
         let doc = db
             .upsert_document(path, Some("X"), None, None, None, &[], None, "hx", 12)
