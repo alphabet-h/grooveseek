@@ -778,7 +778,7 @@ impl Database {
     ///
     /// `content` is the column asked because it is the chunk's own text: the FTS `content`
     /// column is written from it and it is what a search returns. The embedded text is
-    /// `context_text` plus this, so under `ContextMode::Static` the vector of a blank chunk is
+    /// `context_text` plus this, so under [`crate::db::ContextMode::Static`] the vector of a blank chunk is
     /// the breadcrumb alone -- still a chunk that says nothing. The parser trims the end of
     /// what it stores, so the leftover is `''`; ASCII whitespace is trimmed here as well so a
     /// row that kept some is not missed.

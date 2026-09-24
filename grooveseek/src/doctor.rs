@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(f.count, 1);
     }
 
-    /// Add a document at `path` whose chunks store `contents`, each with a line range or none
+    /// Add a document at the given path whose chunks store `contents`, each with a line range or none
     /// -- one blank entry is the shape a build before #273 could leave in a source file.
     fn with_chunks(db: &Database, path: &str, contents: &[&str], line_numbers: bool) {
         let doc = db
