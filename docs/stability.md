@@ -357,6 +357,14 @@ both sides**: `seed_strategy` takes `all_chunks` and `all-chunks` either way.
   the knowledge base is indexed with the wrong model. Failing to start is the safer
   direction. Configurations are matched to the binary that reads them, not shared
   across versions.
+- **A combination that names one setting twice may start being refused.** Key
+  names, types and defaults stay frozen, but a pair of keys that set the same
+  thing, where one silently won, is a bug in the reading rather than a feature
+  of the file. The case this was written for: with the FastEmbed provider, the
+  top-level `model` and `[embedding].model` both choose the model, and
+  `[embedding].model` used to win. A file that sets both loaded in v1.13.0 and
+  earlier and is refused after it; remove one of the two keys. See
+  [The `[embedding]` section](configuration.md#the-embedding-section).
 
 ### The default embedding model
 

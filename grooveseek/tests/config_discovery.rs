@@ -387,3 +387,43 @@ fn test_untrusted_config_announces_the_parser_substitution() {
         "and what was asked for, so the reader can tell which config it means: {plain}"
     );
 }
+
+/// AW-10: a file that sets both FastEmbed model keys is refused when it loads,
+/// so a `--model` on the same command line does not rescue it — the flag is
+/// only looked at after the config has loaded.
+///
+/// `FASTEMBED_CACHE_DIR` is set to a relative path so that, if the refusal ever
+/// went missing, the run would stop at the cache-dir check with a different
+/// message instead of downloading a model.
+#[test]
+fn test_both_fastembed_model_keys_fail_even_with_cli_model() {
+    let Some(_) = grooveseek_bin() else {
+        eprintln!("groove binary not built — skipping");
+        return;
+    };
+    let dir = TempDir::new("groove-disc-aw10");
+    let kb = dir.path().join("kb");
+    std::fs::create_dir_all(&kb).unwrap();
+    dir.write(
+        "both.toml",
+        "model = \"bge-m3\"\n[embedding]\nmodel = \"bge-small-en-v1.5\"\n",
+    );
+    let bin = grooveseek_bin().expect("groove binary must be built");
+    let out = Command::new(bin)
+        .current_dir(dir.path())
+        .env("FASTEMBED_CACHE_DIR", "relative-cache")
+        .args(["--config", "both.toml", "index", "--kb-path"])
+        .arg(&kb)
+        .args(["--model", "bge-small-en-v1.5"])
+        .output()
+        .expect("spawn groove");
+    let stderr = strip_ansi(&stderr_str(&out));
+    assert!(
+        !out.status.success(),
+        "a config with both model keys must not run: {stderr}"
+    );
+    assert!(
+        stderr.contains("top-level `model`") && stderr.contains("[embedding].model"),
+        "the refusal must name both keys, not some later failure: {stderr}"
+    );
+}

@@ -1357,6 +1357,13 @@ impl Config {
         };
         match embedding.provider {
             EmbeddingProviderKind::Fastembed => {
+                // AW-10: both keys name the FastEmbed model. Letting one win
+                // silently hides which model the index was built with.
+                anyhow::ensure!(
+                    self.model.is_none() || embedding.model.is_none(),
+                    "top-level `model` and [embedding].model both select the FastEmbed \
+                     model; remove one of them when [embedding].provider = \"fastembed\""
+                );
                 embedding.resolve_fastembed(self.model.unwrap_or_default())
             }
             EmbeddingProviderKind::OpenaiCompatible => {
@@ -2229,6 +2236,127 @@ mod tests {
         };
         let err = cfg.validate().expect_err("ambiguous model configuration");
         assert!(err.to_string().contains("top-level `model`"));
+    }
+
+    /// AW-10: with FastEmbed, `[embedding].model` and the top-level `model`
+    /// name the same thing. Setting both used to let `[embedding].model` win
+    /// silently; it is now refused, the way the openai-compatible arm refuses
+    /// a top-level `model`.
+    #[test]
+    fn fastembed_embedding_rejects_top_level_model_alongside_embedding_model() {
+        let cfg = Config {
+            model: Some(ModelChoice::BgeM3),
+            embedding: Some(EmbeddingConfig {
+                model: Some("bge-small-en-v1.5".to_string()),
+                ..EmbeddingConfig::default()
+            }),
+            ..Config::default()
+        };
+        let err = cfg.validate().expect_err("two FastEmbed model keys");
+        let msg = err.to_string();
+        assert!(msg.contains("top-level `model`"), "{msg}");
+        assert!(msg.contains("[embedding].model"), "{msg}");
+    }
+
+    /// AW-10, through the file: the conflict stops [`Config::load_from`], whether the
+    /// provider is written out or left to its default.
+    #[test]
+    fn a_config_file_with_both_fastembed_model_keys_fails_to_load() {
+        for provider_line in ["provider = \"fastembed\"\n", ""] {
+            let mut file = tempfile("groove-config-aw10-conflict");
+            write!(
+                file,
+                "model = \"bge-m3\"\n[embedding]\n{provider_line}model = \"bge-small-en-v1.5\"\n"
+            )
+            .unwrap();
+            let err = Config::load_from(file.path()).expect_err("conflicting model keys");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("top-level `model`"), "{msg}");
+        }
+    }
+
+    /// AW-10: each FastEmbed model key alone still loads and selects its model,
+    /// and a CLI `--model` still overrides either one for the invocation.
+    #[test]
+    fn each_fastembed_model_key_alone_still_selects_the_model() {
+        let top_level = Config {
+            model: Some(ModelChoice::BgeM3),
+            embedding: Some(EmbeddingConfig::default()),
+            ..Config::default()
+        };
+        top_level.validate().expect("top-level model alone");
+        assert_eq!(
+            top_level
+                .resolve_embedding_from(None, None)
+                .unwrap()
+                .model_id(),
+            "bge-m3"
+        );
+        assert_eq!(
+            top_level
+                .resolve_embedding_from(Some(ModelChoice::BgeSmallEnV15), None)
+                .unwrap()
+                .model_id(),
+            "bge-small-en-v1.5"
+        );
+
+        let sectioned = Config {
+            embedding: Some(EmbeddingConfig {
+                model: Some("bge-m3".to_string()),
+                ..EmbeddingConfig::default()
+            }),
+            ..Config::default()
+        };
+        sectioned.validate().expect("[embedding].model alone");
+        assert_eq!(
+            sectioned
+                .resolve_embedding_from(None, None)
+                .unwrap()
+                .model_id(),
+            "bge-m3"
+        );
+        assert_eq!(
+            sectioned
+                .resolve_embedding_from(Some(ModelChoice::BgeSmallEnV15), None)
+                .unwrap()
+                .model_id(),
+            "bge-small-en-v1.5"
+        );
+    }
+
+    /// AW-10 docs: with openai-compatible, the shared `model` and one role
+    /// alias may be set together. The alias wins for its role and the shared
+    /// alias serves the other one. The identity is spelled
+    /// `openai-compatible:{document}|{query}:{digest}`.
+    #[test]
+    fn external_embedding_shared_model_fills_the_role_its_alias_leaves_unset() {
+        let resolve = |query_model: Option<&str>, document_model: Option<&str>| {
+            let mut embedding = external_embedding_config();
+            embedding.model = Some("shared-model".to_string());
+            embedding.query_model = query_model.map(str::to_string);
+            embedding.document_model = document_model.map(str::to_string);
+            let cfg = Config {
+                embedding: Some(embedding),
+                ..Config::default()
+            };
+            cfg.validate().expect("shared model plus one role alias");
+            cfg.resolve_embedding_from(None, None)
+                .expect("shared model plus one role alias")
+                .model_id()
+                .to_string()
+        };
+
+        let query_alias = resolve(Some("query-model"), None);
+        assert!(
+            query_alias.starts_with("openai-compatible:shared-model|query-model:"),
+            "{query_alias}"
+        );
+
+        let document_alias = resolve(None, Some("document-model"));
+        assert!(
+            document_alias.starts_with("openai-compatible:document-model|shared-model:"),
+            "{document_alias}"
+        );
     }
 
     #[test]
