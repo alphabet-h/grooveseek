@@ -861,7 +861,7 @@ fn rate_limited(_: &Recorded) -> MockResponse {
     )
 }
 
-/// A 200 whose vectors are half as long as `dimension` says: the endpoint
+/// A 200 whose vectors are half as long as the configured dimension: the endpoint
 /// serves a different model from the one the index was built with.
 fn wrong_dimension(req: &Recorded) -> MockResponse {
     default_response(req, DIM / 2)

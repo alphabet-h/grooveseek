@@ -2669,10 +2669,10 @@ fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
 /// schema that does not load must stop the run before anything is deleted, the way a
 /// `groove.toml` that does not load stops the binary before it opens the database.
 /// [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call empties the index on
-/// `--force` -- since AW-03 (ADR-0024) the only reset on either path. `main.rs`'s
-/// `Commands::Index` arm and the MCP path (`server.rs`'s `rebuild_index_blocking`) both call
-/// this before entering [`rebuild_index`], so a schema that does not load stops the run before
-/// that reset, and both give it the same kind of snapshot.
+/// `--force` -- since AW-03 (ADR-0024) the only reset on either path. The CLI's `index`
+/// subcommand and the MCP `rebuild_index` tool (`rebuild_index_blocking` in [`crate::server`])
+/// both call this before entering [`rebuild_index`], so a schema that does not load stops the
+/// run before that reset, and both give it the same kind of snapshot.
 ///
 /// A second read inside [`rebuild_index`], after the caller's own validation, would
 /// only reopen the window between the two reads to a schema that changes out from under the
@@ -2860,7 +2860,7 @@ pub(crate) fn resolve_context_mode(
 /// force 時は必ず reset → resolve の順序を DB 層で強制する。
 ///
 /// 呼び出し側は reset しない (AW-03)。CLI の `index --force` もかつて先に
-/// reset していたが、それは `rebuild_index` 冒頭の provider probe (ADR-0024)
+/// reset していたが、それは [`rebuild_index`] 冒頭の provider probe (ADR-0024)
 /// より前に index を空にするので外した。force 時の reset はここだけ。
 pub(crate) fn reset_and_resolve_context_mode(
     db: &Database,
