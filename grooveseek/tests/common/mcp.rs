@@ -16,7 +16,38 @@ pub fn grooveseek_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_groove"))
 }
 
+/// Flags every `curl` these helpers launch carries first.
+///
+/// Without a bound, a handler that never answers leaves `Command::output`
+/// waiting for good: the test neither passes nor fails, and the
+/// [`ServerGuard`] that would kill the server is never dropped. 120 s leaves
+/// room for the `#[ignore]` tests whose first search loads a real model. `-S`
+/// keeps curl's error message on stderr despite `-s`, so a failure says why.
+const CURL_BOUNDS: [&str; 5] = ["-S", "--connect-timeout", "10", "--max-time", "120"];
+
+/// The failure message for a `curl` that exited non-zero: its exit code
+/// (28 is curl's "operation timed out"), and its stderr.
+fn curl_failure(what: &str, out: &std::process::Output) -> String {
+    let code = out.status.code();
+    let timed_out = if code == Some(28) {
+        format!(
+            " -- timed out: no answer within {}",
+            CURL_BOUNDS[1..].join(" ")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "curl {what} failed with exit code {code:?}{timed_out}: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 /// Poll `<url>` until 200 or `deadline` expires.
+///
+/// Each probe is bounded by [`CURL_BOUNDS`], so a `/healthz` that accepts and
+/// never answers ends the wait instead of hanging it; the overall wait can
+/// then overrun `deadline` by at most one probe's `--max-time`.
 ///
 /// **TODO (feature-34 / F-55, Windows compatibility)**: `curl -o /dev/null`
 /// uses the POSIX null-device path; the formal cross-platform spelling is
@@ -29,6 +60,7 @@ pub fn wait_http_200(url: &str, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
         let out = Command::new("curl")
+            .args(CURL_BOUNDS)
             .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", url])
             .output();
         if let Ok(out) = out
@@ -153,6 +185,20 @@ fn spawn_serve(
     extra_args: &[&str],
     startup: Duration,
 ) -> (ServerGuard, String) {
+    spawn_serve_configured(kb_path, config_path, watch, extra_args, startup, |_| {})
+}
+
+/// [`spawn_serve`] with a last say over the child's `Command` before it is
+/// spawned -- its environment, in practice. `configure` runs after the helper
+/// has set `RUST_LOG`, so a caller can override that too.
+fn spawn_serve_configured(
+    kb_path: &Path,
+    config_path: &Path,
+    watch: bool,
+    extra_args: &[&str],
+    startup: Duration,
+    configure: impl FnOnce(&mut Command),
+) -> (ServerGuard, String) {
     let bin = grooveseek_bin();
     assert!(
         bin.exists(),
@@ -189,13 +235,13 @@ fn spawn_serve(
     // so 21 of the 23 tests in `http_origin.rs` pass under `RUST_LOG=error`
     // with this line removed, and only the two that read warnings fail. The
     // filter is a warning-reading concern, not a startup one.
-    let child = Command::new(&bin)
-        .args(&args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args)
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn groove serve");
+        .stderr(Stdio::piped());
+    configure(&mut cmd);
+    let child = cmd.spawn().expect("spawn groove serve");
 
     let mut guard = ServerGuard {
         child: Some(child),
@@ -284,6 +330,23 @@ pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (Serve
     spawn_serve(kb_path, config_path, true, &[], DEFAULT_STARTUP)
 }
 
+/// [`spawn_mcp_server`] / [`spawn_mcp_server_with_watch`] with the child's
+/// `Command` handed to `configure` before it is spawned.
+///
+/// Used by the AW-06 OpenAI-compatible provider tests, whose server must see
+/// a pinned environment (no proxy, no API key from the runner, an empty
+/// `FASTEMBED_CACHE_DIR`) to reach the in-process embeddings mock
+/// ([`crate::common::embed_mock`]) and nothing else. The spawning and the readiness wait stay here for the reason
+/// [`spawn_mcp_server_with_args`] gives.
+pub fn spawn_serve_with(
+    kb_path: &Path,
+    config_path: &Path,
+    watch: bool,
+    configure: impl FnOnce(&mut Command),
+) -> (ServerGuard, String) {
+    spawn_serve_configured(kb_path, config_path, watch, &[], DEFAULT_STARTUP, configure)
+}
+
 /// Stand up a one-document knowledge base with the given `groove.toml`, and
 /// serve it.
 ///
@@ -355,6 +418,7 @@ impl Drop for ServerGuard {
 pub fn mcp_initialize(base: &str) -> String {
     let init_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"it","version":"0.1"}}}"#;
     let out = Command::new("curl")
+        .args(CURL_BOUNDS)
         .args([
             "-s",
             "-i",
@@ -370,11 +434,7 @@ pub fn mcp_initialize(base: &str) -> String {
         ])
         .output()
         .expect("curl initialize");
-    assert!(
-        out.status.success(),
-        "curl initialize failed: stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", curl_failure("initialize", &out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let lower = stdout.to_ascii_lowercase();
     let h = "mcp-session-id:";
@@ -422,6 +482,7 @@ pub fn mcp_tool_call(
     });
     let body_str = serde_json::to_string(&body).unwrap();
     let out = Command::new("curl")
+        .args(CURL_BOUNDS)
         .args([
             "-s",
             "-X",
@@ -440,11 +501,7 @@ pub fn mcp_tool_call(
         ])
         .output()
         .expect("curl tools/call");
-    assert!(
-        out.status.success(),
-        "curl tools/call failed: stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", curl_failure("tools/call", &out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let payload = stdout
         .lines()
