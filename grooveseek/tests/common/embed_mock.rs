@@ -6,10 +6,10 @@
 //! never arrive here:
 //! - `accept` is non-blocking and polled against a stop flag and a lifetime
 //!   deadline, so a regression that never connects cannot hang the test;
-//! - reads on an accepted connection time out after a short poll and look at
-//!   the same stop flag, so a client that connects and then says nothing
-//!   cannot hold up `Drop` (it still has the whole per-request budget to send
-//!   its request while the mock runs);
+//! - reads and writes on an accepted connection time out after a short poll
+//!   and look at the same stop flag, so a client that connects and then says
+//!   nothing, or stops reading the answer, cannot hold up `Drop` (while the
+//!   mock runs, a connection still has its whole budget);
 //! - a connection closed before it wrote anything (`read == 0`) is dropped,
 //!   not asserted on;
 //! - every response carries `Connection: close`, so one request is one
@@ -40,10 +40,12 @@ pub const QUERY_MODEL: &str = "query-model";
 
 /// How long a mock may live. A leaked one stops on its own after this.
 const MAX_LIFETIME: Duration = Duration::from_secs(300);
-/// How long one connection may take to send its request.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one read may block before the stop flag is looked at again.
-const READ_POLL: Duration = Duration::from_millis(50);
+/// How long one connection may take, reading its request and writing the
+/// answer together.
+const CONNECTION_BUDGET: Duration = Duration::from_secs(10);
+/// How long one read or write may block before the stop flag is looked at
+/// again.
+const IO_POLL: Duration = Duration::from_millis(50);
 /// Pause between `accept` polls.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// Pause between [`wait_until`] polls.
@@ -192,6 +194,10 @@ impl EmbedMock {
 
     /// A mock that answers with `responder`. Requests are recorded before the
     /// responder runs, whatever it answers.
+    ///
+    /// `responder` runs on the mock's one serving thread and nothing
+    /// interrupts it, so it has to return promptly: one that blocks holds up
+    /// every later connection and `Drop`.
     pub fn with_responder(
         responder: impl Fn(&Recorded) -> MockResponse + Send + Sync + 'static,
     ) -> Self {
@@ -281,8 +287,8 @@ fn accept_loop(
 /// and turn every later request into a hang.
 ///
 /// The socket option calls are the exception: a failure there panics, because a
-/// read without its short timeout would block past the stop flag, and `Drop`
-/// would then wait on it for good.
+/// read or write without its short timeout would block past the stop flag, and
+/// `Drop` would then wait on it for good.
 fn serve_one(
     mut stream: TcpStream,
     requests: &Mutex<Vec<Recorded>>,
@@ -293,9 +299,12 @@ fn serve_one(
         .set_nonblocking(false)
         .expect("blocking mock connection");
     stream
-        .set_read_timeout(Some(READ_POLL))
+        .set_read_timeout(Some(IO_POLL))
         .expect("read timeout on mock connection");
-    let deadline = Instant::now() + READ_TIMEOUT;
+    stream
+        .set_write_timeout(Some(IO_POLL))
+        .expect("write timeout on mock connection");
+    let deadline = Instant::now() + CONNECTION_BUDGET;
     let Some(recorded) = read_request(&mut stream, stop, deadline) else {
         return;
     };
@@ -310,19 +319,30 @@ fn serve_one(
         reason(resp.status),
         resp.body.len()
     );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&resp.body);
-    let _ = stream.flush();
+    if write_bounded(&mut stream, head.as_bytes(), stop, deadline) {
+        write_bounded(&mut stream, &resp.body, stop, deadline);
+    }
 }
 
-/// One read that gives up when the mock is stopping or the request is out of
-/// time. `None` means abandon the connection: closed, failed, stopped, or past
-/// the deadline.
+/// Whether an I/O error on a mock connection is worth another try.
 ///
-/// The socket's read timeout is [`READ_POLL`], so a client that connects and
-/// then says nothing costs the serving thread at most that long before it
-/// looks at the stop flag again. A timed-out read is `WouldBlock` on Unix and
-/// `TimedOut` on Windows.
+/// The socket timeouts are [`IO_POLL`], so a client that says nothing, or
+/// stops reading what it is sent, costs the serving thread at most that long
+/// before it looks at the stop flag and the connection's deadline again. A
+/// timed-out call is `WouldBlock` on Unix and `TimedOut` on Windows.
+fn worth_retrying(e: &std::io::Error, stop: &AtomicBool, deadline: Instant) -> bool {
+    match e.kind() {
+        ErrorKind::Interrupted => true,
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+            !stop.load(Ordering::SeqCst) && Instant::now() < deadline
+        }
+        _ => false,
+    }
+}
+
+/// One read that gives up when the mock is stopping or the connection is out
+/// of time. `None` means abandon the connection: closed, failed, stopped, or
+/// past the deadline.
 fn read_some(
     stream: &mut TcpStream,
     chunk: &mut [u8],
@@ -333,15 +353,30 @@ fn read_some(
         match stream.read(chunk) {
             Ok(0) => return None,
             Ok(n) => return Some(n),
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
-                    return None;
-                }
-            }
+            Err(e) if worth_retrying(&e, stop, deadline) => {}
             Err(_) => return None,
         }
     }
+}
+
+/// Write all of `buf` unless the mock is stopping or the connection is out of
+/// time. `false` means abandon the connection: closed, failed, stopped, or past
+/// the deadline.
+fn write_bounded(
+    stream: &mut TcpStream,
+    mut buf: &[u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> bool {
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => return false,
+            Ok(n) => buf = &buf[n..],
+            Err(e) if worth_retrying(&e, stop, deadline) => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn read_request(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) -> Option<Recorded> {

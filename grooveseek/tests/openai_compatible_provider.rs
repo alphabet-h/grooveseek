@@ -164,6 +164,46 @@ fn embed_mock_stops_promptly_while_a_client_holds_a_connection_open() {
 }
 
 #[test]
+fn embed_mock_stops_promptly_while_a_client_stops_reading_the_response() {
+    // Far more than Linux or macOS buffers on a loopback connection, so the
+    // write meets backpressure from a client that never reads. Windows takes
+    // a blocking write like this whole (512 MiB returned `Ok` in 66 ms when
+    // measured), so there this passes with or without the write timeout.
+    const BODY: usize = 64 * 1024 * 1024;
+    let mock = EmbedMock::with_responder(|_| common::embed_mock::MockResponse {
+        status: 200,
+        body: vec![b' '; BODY],
+    });
+    let mut held = TcpStream::connect(mock.addr()).expect("connect");
+    let body = r#"{"model":"m","input":["x"]}"#;
+    let req = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n{body}",
+        mock.addr(),
+        body.len()
+    );
+    held.write_all(req.as_bytes()).expect("write request");
+    assert!(
+        wait_until(Duration::from_secs(5), || mock.requests().len() == 1),
+        "the mock never recorded the request"
+    );
+    // Dropped on another thread: a mock stuck in its write would otherwise
+    // hang this test instead of failing it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(mock);
+        let _ = tx.send(started.elapsed());
+    });
+    let took = rx.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    let took = took.expect("Drop did not return within 5 s while the client stopped reading");
+    assert!(
+        took < Duration::from_secs(2),
+        "Drop must not wait on a client that stopped reading, took {took:?}"
+    );
+}
+
+#[test]
 fn the_config_helper_writes_an_openai_compatible_section_and_no_top_level_model() {
     let with_key = openai_config_toml("http://127.0.0.1:9/v1/embeddings", Some("   "), 32);
     let parsed: toml::Table = with_key.parse().expect("helper writes valid TOML");
