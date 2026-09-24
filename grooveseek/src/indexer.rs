@@ -2669,9 +2669,9 @@ fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
 /// schema that does not load must stop the run before anything is deleted, the way a
 /// `groove.toml` that does not load stops the binary before it opens the database.
 /// [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call empties the index on
-/// `--force` -- since AW-03 (ADR-0024) the only reset on either path. The CLI's `index`
-/// subcommand and the MCP `rebuild_index` tool (`rebuild_index_blocking` in [`crate::server`])
-/// both call this before entering [`rebuild_index`], so a schema that does not load stops the
+/// `--force` -- since AW-03 (ADR-0024) the only reset on either path. `groove index` and the
+/// MCP tool of the same name as [`rebuild_index`] (`rebuild_index_blocking` in
+/// [`crate::server`]) both call this before entering [`rebuild_index`], so a schema that does not load stops the
 /// run before that reset, and both give it the same kind of snapshot.
 ///
 /// A second read inside [`rebuild_index`], after the caller's own validation, would
