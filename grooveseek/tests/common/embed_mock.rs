@@ -2,19 +2,22 @@
 //! the test process, plus what a test needs to point `groove` at it.
 //!
 //! Hand-written HTTP/1.1 on `std::net`: no crate is added for this. It is built
-//! so the flaws AW-18 found in the unit-test mock in `embedder.rs` never arrive
-//! here:
+//! so the flaws AW-18 found in the unit-test mock in [`grooveseek::embedder`]
+//! never arrive here:
 //! - `accept` is non-blocking and polled against a stop flag and a lifetime
 //!   deadline, so a regression that never connects cannot hang the test;
 //! - a connection closed before it wrote anything (`read == 0`) is dropped,
 //!   not asserted on;
 //! - every response carries `Connection: close`, so one request is one
-//!   connection and `connection_count` means something.
+//!   connection and [`crate::common::embed_mock::connection_count`] means
+//!   something.
 //!
-//! The default answer is a deterministic bag-of-words vector ([`embed_text`]):
-//! a query and a document sharing a word end up close, so a test can assert
-//! the ranking and not only that a request arrived. `with_responder` replaces
-//! the answer (AW-03's 401, AW-04's 413 / 429).
+//! The default answer is a deterministic bag-of-words vector
+//! ([`crate::common::embed_mock::embed_text`]): a query and a document
+//! sharing a word end up close, so a test can assert the ranking and not
+//! only that a request arrived.
+//! [`crate::common::embed_mock::with_responder`] replaces the answer (AW-03's
+//! 401, AW-04's 413 / 429).
 
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
@@ -92,7 +95,8 @@ impl MockResponse {
 }
 
 /// The answer an OpenAI-compatible endpoint gives: one vector per input, in
-/// order, `dimension` long. A body without an `input` array gets a 400.
+/// order, as long as the dimension parameter says. A body without an
+/// `input` array gets a 400.
 pub fn default_response(req: &Recorded, dimension: usize) -> MockResponse {
     let Some(inputs) = req.body.get("input").and_then(|v| v.as_array()) else {
         return MockResponse::json(
@@ -350,7 +354,7 @@ fn reason(status: u16) -> &'static str {
 /// A `groove.toml` that selects the OpenAI-compatible provider at `endpoint`.
 ///
 /// Pass it with `--config` **before** the subcommand: a config found by
-/// discovery has its `[embedding]` section dropped (R7, `config.rs`). No
+/// discovery has its `[embedding]` section dropped (R7, [`grooveseek::config`]). No
 /// top-level `model` (refused with this provider) and no reranker (it would
 /// download one). `timeout_seconds` is short so a mock that stops answering
 /// fails the test inside its deadline rather than after the 60 s default.

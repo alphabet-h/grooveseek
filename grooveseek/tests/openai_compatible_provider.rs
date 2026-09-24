@@ -359,12 +359,13 @@ fn describe(reqs: &[Recorded]) -> String {
         .join("\n")
 }
 
-/// `index` embeds with `document_model`, `search` with `query_model`, and the
-/// vectors that come back are the ones the ranking uses.
+/// `groove index` embeds with `document_model`, `groove search` with
+/// `query_model`, and the vectors that come back are the ones the ranking
+/// uses.
 ///
-/// Red if `embed_query` sends `document_model` (the two sides are not
-/// interchangeable: `embedder.rs`, `Embedder::embed_queries`), or if either
-/// command stops reaching the endpoint.
+/// Red if the query side sends `document_model` (the two sides are not
+/// interchangeable; see [`grooveseek::embedder`]), or if either command
+/// stops reaching the endpoint.
 #[test]
 fn index_then_search_round_trips_through_an_openai_compatible_endpoint() {
     let fx = fixture("groove-aw06-cli", None, "");
@@ -461,11 +462,12 @@ const FRESH_MARKER: &str = "quillfeatherstone";
 ///
 /// The provider's HTTP client is reqwest's blocking one, and every blocking
 /// send enters reqwest's blocking wait, which in a debug build panics when it
-/// runs on a tokio worker thread. `run_watch_loop` keeps it off the workers by
-/// handing each event batch to `spawn_blocking` around `handle_events`; red if
-/// that `spawn_blocking` is removed. The file is written before any MCP call,
-/// so the watcher makes this server's first embed and nothing else has
-/// touched the client before it.
+/// runs on a tokio worker thread. [`grooveseek::watcher::run_watch_loop`]
+/// keeps it off the workers by handing each event batch to `spawn_blocking`
+/// around `handle_events` (see [`grooveseek::watcher`]); red if that
+/// `spawn_blocking` is removed. The file is written before any MCP call, so
+/// the watcher makes this server's first embed and nothing else has touched
+/// the client before it.
 #[test]
 fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
     let fx = fixture(
@@ -533,14 +535,14 @@ fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
     assert_dir_empty(&fx.cache);
 }
 
-/// `graph` and `doctor` answer from the index alone.
+/// `groove graph` and `groove doctor` answer from the index alone.
 ///
-/// `graph` resolves the embedding config only to check the index was built
-/// with it (`verify_embedding_meta`) and never builds an embedder, so it needs
-/// the same `--config` or that check refuses the index; `doctor` does not
-/// resolve it at all and runs no such check. Red if either starts embedding
-/// -- for `graph`, re-embedding the start document instead of reading its
-/// stored vectors.
+/// `groove graph` resolves the embedding config only to check the index was
+/// built with it (see verify_embedding_meta in [`grooveseek::db`]) and never
+/// builds an embedder, so it needs the same `--config` or that check refuses
+/// the index; `groove doctor` does not resolve it at all and runs no such
+/// check. Red if either starts embedding -- for `groove graph`, re-embedding
+/// the start document instead of reading its stored vectors.
 #[test]
 fn graph_and_doctor_never_contact_the_endpoint() {
     let fx = fixture("groove-aw06-graph", None, "");
@@ -589,9 +591,10 @@ fn graph_and_doctor_never_contact_the_endpoint() {
 ///
 /// Table-driven, one knowledge base per row. The third row is the control:
 /// without it, "no header" would also pass when the mock lost headers.
-/// Blank keys are filtered twice (`config.rs`, `resolve_embedding_api_key`,
-/// and `embedder.rs`, `OpenAiCompatibleConfig::new`); this test goes through
-/// the config, so it is red only when both filters are gone.
+/// Blank keys are filtered twice (resolve_embedding_api_key in
+/// [`grooveseek::config`], and `OpenAiCompatibleConfig::new` in
+/// [`grooveseek::embedder`]); this test goes through the config, so it is red
+/// only when both filters are gone.
 #[test]
 fn no_authorization_header_is_sent_when_the_api_key_is_absent_or_blank() {
     let cases: [(Option<&str>, Option<&str>); 3] = [
