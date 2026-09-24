@@ -2258,7 +2258,7 @@ mod tests {
         assert!(msg.contains("[embedding].model"), "{msg}");
     }
 
-    /// AW-10, through the file: the conflict stops `load_from`, whether the
+    /// AW-10, through the file: the conflict stops [`Config::load_from`], whether the
     /// provider is written out or left to its default.
     #[test]
     fn a_config_file_with_both_fastembed_model_keys_fails_to_load() {
