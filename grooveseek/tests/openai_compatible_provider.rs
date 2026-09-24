@@ -15,7 +15,7 @@ use common::embed_mock::{
     DOC_MODEL, EmbedMock, QUERY_MODEL, Recorded, assert_dir_empty, embed_text, hermetic,
     openai_config_toml,
 };
-use common::mcp::grooveseek_bin;
+use common::mcp::{grooveseek_bin, mcp_initialize, mcp_search_call, spawn_serve_with};
 use common::temp::TempKbLayout;
 
 use std::io::{Read, Write};
@@ -404,5 +404,51 @@ fn index_then_search_round_trips_through_an_openai_compatible_endpoint() {
         top_path(&resp).ends_with("alpha.md"),
         "the document sharing the query's word must rank first: {resp}"
     );
+    assert_dir_empty(&fx.cache);
+}
+
+/// MCP `search` arguments that switch off everything able to drop or reorder
+/// a hit for reasons other than the vectors: quality filter, confidence
+/// trimming, MMR.
+fn mcp_search_args(query: &str) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "limit": 5,
+        "include_low_quality": true,
+        "min_confidence_ratio": 0.0,
+        "mmr": false,
+    })
+}
+
+/// The MCP `search` tool embeds its query through the provider, on the query
+/// side, from inside the server's runtime.
+///
+/// Red if the server's search path sends `document_model`, or loses the
+/// endpoint (the config reaches `serve` only through `--config`).
+#[test]
+fn the_mcp_search_tool_embeds_the_query_through_the_http_provider() {
+    let fx = fixture("groove-aw06-mcp", None, "");
+    fx.index();
+    let before = fx.mock.requests().len();
+
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    let resp = mcp_search_call(&base, &session, mcp_search_args(ALPHA_MARKER));
+
+    let all = fx.mock.requests();
+    let new = &all[before..];
+    assert_eq!(
+        new.len(),
+        1,
+        "one MCP search must send one request:\n{}\nserver stderr:\n{}",
+        describe(new),
+        guard.stderr().lines().join("\n")
+    );
+    assert_eq!(new[0].model(), Some(QUERY_MODEL));
+    assert_eq!(new[0].inputs(), vec![ALPHA_MARKER.to_string()]);
+    assert!(top_path(&resp).ends_with("alpha.md"), "{resp}");
+    drop(guard);
     assert_dir_empty(&fx.cache);
 }
