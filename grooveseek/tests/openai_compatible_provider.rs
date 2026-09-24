@@ -583,3 +583,34 @@ fn graph_and_doctor_never_contact_the_endpoint() {
     );
     assert_dir_empty(&fx.cache);
 }
+
+/// A missing or blank `api_key` sends no `Authorization` header; a real one
+/// sends `Bearer <key>`.
+///
+/// Table-driven, one knowledge base per row. The third row is the control:
+/// without it, "no header" would also pass when the mock lost headers.
+/// Blank keys are filtered twice (`config.rs`, `resolve_embedding_api_key`,
+/// and `embedder.rs`, `OpenAiCompatibleConfig::new`); this test goes through
+/// the config, so it is red only when both filters are gone.
+#[test]
+fn no_authorization_header_is_sent_when_the_api_key_is_absent_or_blank() {
+    let cases: [(Option<&str>, Option<&str>); 3] = [
+        (None, None),
+        (Some("   "), None),
+        (Some("k"), Some("Bearer k")),
+    ];
+    for (i, (api_key, expected)) in cases.into_iter().enumerate() {
+        let fx = fixture(&format!("groove-aw06-auth-{i}"), api_key, "");
+        fx.index();
+        let reqs = fx.mock.requests();
+        assert!(!reqs.is_empty(), "api_key {api_key:?}: index sent nothing");
+        for r in &reqs {
+            assert_eq!(
+                r.header("authorization"),
+                expected,
+                "api_key {api_key:?}: headers were {:?}",
+                r.headers
+            );
+        }
+    }
+}
