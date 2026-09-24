@@ -97,6 +97,12 @@ Chosen option: 3.
   which `get_document` already refused, is now left out of the index as well.
   `groove doctor` does not report a row an earlier version stored for it,
   since its finding is Windows only; the next full index removes the row.
+- Bad: a name that is not valid Unicode (invalid bytes on Unix, an unpaired
+  surrogate on Windows) is still indexed, under a spelling with U+FFFD in
+  place of what could not be decoded, and `get_document` cannot open that
+  spelling. The predicate judges that lossy spelling and accepts it, so the
+  first Good point above does not hold for such names. This record does not
+  change that; it is tracked separately.
 - Neutral: a daemon started on an index built before this keeps such rows
   until a full index runs; on Windows `doctor` exits `1` over them meanwhile.
   The watcher removes such a row sooner when its file goes: deleting the file
