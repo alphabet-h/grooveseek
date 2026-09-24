@@ -11,7 +11,10 @@
 
 mod common;
 
-use common::embed_mock::{EmbedMock, Recorded, embed_text};
+use common::embed_mock::{
+    DOC_MODEL, EmbedMock, QUERY_MODEL, Recorded, assert_dir_empty, embed_text, hermetic,
+    openai_config_toml,
+};
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -133,4 +136,73 @@ fn embed_mock_stops_promptly_when_dropped() {
         "Drop must stop the accept loop, took {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn the_config_helper_writes_an_openai_compatible_section_and_no_top_level_model() {
+    let with_key = openai_config_toml("http://127.0.0.1:9/v1/embeddings", Some("   "), 32);
+    let parsed: toml::Table = with_key.parse().expect("helper writes valid TOML");
+    let emb = parsed["embedding"].as_table().expect("[embedding] table");
+    assert_eq!(emb["provider"].as_str(), Some("openai-compatible"));
+    assert_eq!(
+        emb["endpoint"].as_str(),
+        Some("http://127.0.0.1:9/v1/embeddings")
+    );
+    assert_eq!(emb["document_model"].as_str(), Some(DOC_MODEL));
+    assert_eq!(emb["query_model"].as_str(), Some(QUERY_MODEL));
+    assert_eq!(emb["dimension"].as_integer(), Some(32));
+    assert_eq!(
+        emb["api_key"].as_str(),
+        Some("   "),
+        "a blank key is written as given"
+    );
+    assert!(
+        !parsed.contains_key("model"),
+        "top-level `model` is refused with openai-compatible"
+    );
+    let without = openai_config_toml("http://127.0.0.1:9/v1/embeddings", None, 32);
+    assert!(!without.contains("api_key"));
+}
+
+#[test]
+fn hermetic_strips_proxies_and_the_env_api_key_from_the_child() {
+    let cache = common::temp::TempRoot::new("groove-aw06-hermetic");
+    let mut cmd = std::process::Command::new("unused");
+    hermetic(&mut cmd, cache.path());
+    // Keyed uppercase: Windows environment names are case-insensitive, and
+    // `get_envs` there reports `http_proxy` and `HTTP_PROXY` as one entry under
+    // whichever spelling came first. On Unix the two spellings are two entries
+    // with the same value, so folding them loses nothing.
+    let envs: std::collections::HashMap<String, Option<String>> = cmd
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().to_ascii_uppercase(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    for removed in [
+        "GROOVE_EMBEDDING_API_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ] {
+        assert_eq!(envs.get(removed), Some(&None), "{removed} must be removed");
+    }
+    assert_eq!(envs["NO_PROXY"].as_deref(), Some("127.0.0.1,localhost"));
+    assert_eq!(
+        envs["FASTEMBED_CACHE_DIR"].as_deref(),
+        Some(cache.path().to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+#[should_panic(expected = "must stay empty")]
+fn assert_dir_empty_fires_when_a_file_lands_in_the_cache() {
+    // The tripwire the provider tests lean on: without this, an
+    // `assert_dir_empty` that never fires would pass them all.
+    let cache = common::temp::TempRoot::new("groove-aw06-tripwire");
+    std::fs::write(cache.path().join("model.onnx"), b"x").expect("write into cache");
+    assert_dir_empty(cache.path());
 }

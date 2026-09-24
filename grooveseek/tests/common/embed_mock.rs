@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -341,4 +343,82 @@ fn reason(status: u16) -> &'static str {
         500 => "Internal Server Error",
         _ => "Status",
     }
+}
+
+/// A `groove.toml` that selects the OpenAI-compatible provider at `endpoint`.
+///
+/// Pass it with `--config` **before** the subcommand: a config found by
+/// discovery has its `[embedding]` section dropped (R7, `config.rs`). No
+/// top-level `model` (refused with this provider) and no reranker (it would
+/// download one). `timeout_seconds` is short so a mock that stops answering
+/// fails the test inside its deadline rather than after the 60 s default.
+pub fn openai_config_toml(endpoint: &str, api_key: Option<&str>, dimension: usize) -> String {
+    let mut s = format!(
+        "[embedding]\n\
+         provider = \"openai-compatible\"\n\
+         endpoint = {}\n\
+         document_model = {}\n\
+         query_model = {}\n\
+         dimension = {dimension}\n\
+         timeout_seconds = 15\n",
+        toml_str(endpoint),
+        toml_str(DOC_MODEL),
+        toml_str(QUERY_MODEL),
+    );
+    if let Some(key) = api_key {
+        s.push_str(&format!("api_key = {}\n", toml_str(key)));
+    }
+    s
+}
+
+/// A TOML basic string. Only ASCII without quotes or backslashes reaches this.
+fn toml_str(s: &str) -> String {
+    assert!(
+        s.chars()
+            .all(|c| c.is_ascii() && c != '"' && c != '\\' && !c.is_control()),
+        "toml_str only handles plain ASCII: {s:?}"
+    );
+    format!("\"{s}\"")
+}
+
+/// Pin the environment a child `groove` sees, so it reaches the mock and
+/// nothing else.
+///
+/// - `GROOVE_EMBEDDING_API_KEY` is removed: it overrides `api_key`, and a
+///   developer's real key would both leak to the mock and break the
+///   authorization test.
+/// - Proxy variables are removed (both cases; reqwest reads either) and
+///   `NO_PROXY` covers loopback, so a runner's proxy never sees the request.
+/// - `FASTEMBED_CACHE_DIR` points at `fastembed_dir`, which the caller keeps
+///   empty and checks with [`assert_dir_empty`]: nothing on these paths may
+///   download a model, and a file appearing there says one did.
+pub fn hermetic<'a>(cmd: &'a mut Command, fastembed_dir: &Path) -> &'a mut Command {
+    for var in [
+        "GROOVE_EMBEDDING_API_KEY",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .env("FASTEMBED_CACHE_DIR", fastembed_dir)
+}
+
+/// Panic unless `dir` exists and is empty. The model-download tripwire.
+pub fn assert_dir_empty(dir: &Path) {
+    let entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "{} must stay empty (a model was downloaded?): {entries:?}",
+        dir.display()
+    );
 }
