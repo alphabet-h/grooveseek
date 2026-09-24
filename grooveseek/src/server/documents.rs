@@ -417,8 +417,9 @@ pub(crate) fn validate_get_document_path(
     // the index can hold is never looked at: out of the knowledge base, empty,
     // a `.` or empty segment (`./a.md`, `a//b.md`, a trailing `/`), and on
     // Windows a name Win32 would trim or refuse. The index walk leaves out
-    // every name refused here, so none of them is a spelling the index holds.
-    // What reaches the spelling check (2b) is a name the index could hold that
+    // every name refused here, so none of them is a spelling the index holds
+    // -- except a row an earlier version stored, which stays until the next
+    // full index (see `ServableRules::allows` in `kb_uri.rs`). What reaches the spelling check (2b) is a name the index could hold that
     // is not this document's one spelling -- a case variant, an 8.3 short
     // name, a route through a directory symlink -- and that look stays inside
     // the knowledge base.

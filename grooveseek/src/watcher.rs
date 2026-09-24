@@ -470,9 +470,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
                 // `.git/` や `node_modules/` へ rename すると
                 // `rename_single_file` が **denylist 配下の新パスへ DB を
                 // 書き換えて残す**。除外したはずのファイルが index に居座る。
-                let old_ok = should_process(&old_rel, from, state);
-                let new_ok = should_process(&new_rel, to, state);
-                match rename_action(old_ok, new_ok) {
+                match rename_decision(&old_rel, from, &new_rel, to, &state.registry, &state.rules) {
                     RenameAction::Rename => dispatch_rename(state, &old_rel, &new_rel),
                     RenameAction::Deindex => dispatch_deindex(state, &old_rel),
                     RenameAction::Reindex => dispatch_reindex(state, &new_rel),
@@ -514,7 +512,7 @@ fn handle_events(state: &mut WatcherState, events: &[DebouncedEvent]) {
             Classified::Deindex(paths) => {
                 for p in paths {
                     if let Some(rel) = to_rel(&state.kb_path, p)
-                        && should_process(&rel, p, state)
+                        && deindex_passes(&rel, p, &state.registry, &state.rules)
                     {
                         dispatch_deindex(state, &rel);
                     }
@@ -551,6 +549,57 @@ fn rename_action(old_ok: bool, new_ok: bool) -> RenameAction {
     }
 }
 
+/// The [`RenameAction`] for a rename event, both ends judged by [`gate_parts`].
+///
+/// (ADR-0023) The old end is judged as a removal when the old file is gone,
+/// which is the ordinary case: all that end does is move or drop a row, and a
+/// row an older version stored under a name the index no longer holds (say
+/// `CON.md`) must still follow a rename to `console.md`, the remedy the
+/// refusal itself suggests. The new end is a write and keeps the name check.
+fn rename_decision(
+    old_rel: &str,
+    from: &Path,
+    new_rel: &str,
+    to: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> RenameAction {
+    rename_action(
+        gate_parts(old_rel, from, registry, rules, Gate::RenameSource),
+        gate_parts(new_rel, to, registry, rules, Gate::Write),
+    )
+}
+
+/// Whether a remove event's path is deindexed: [`gate_parts`] as a removal,
+/// which only ever deletes a row, so a name the index cannot hold is no reason
+/// to keep one (ADR-0023).
+fn deindex_passes(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+) -> bool {
+    gate_parts(rel, full, registry, rules, Gate::Removal)
+}
+
+/// What a path is being judged for, which decides whether the name check
+/// ([`name_is_addressable`]) applies. Every other check is the same for all
+/// three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// The path may be written as a row: reindex, the new end of a rename.
+    Write,
+    /// A remove event: the row, if any, is deleted.
+    Removal,
+    /// The old end of a rename: a removal when the old file is gone, a write
+    /// otherwise ("gone" = `symlink_metadata` fails). The rule is not
+    /// extended to [`Gate::Write`]: on Windows a non-verbatim event path
+    /// through a directory ending in a dot has the dot trimmed by Win32 and
+    /// can come back with no metadata while naming a file that would be
+    /// written.
+    RenameSource,
+}
+
 /// 対象ファイルの拡張子が `registry` にあり、除外対象でないこと。
 ///
 /// `WatcherState` のうち `registry` / `rules` しか見ないので、判定本体は
@@ -560,12 +609,23 @@ fn should_process(rel: &str, full: &Path, state: &WatcherState) -> bool {
     should_process_parts(rel, full, &state.registry, &state.rules)
 }
 
-/// [`should_process`] の判定本体。
+/// [`should_process`] の判定本体 ([`Gate::Write`] としての [`gate_parts`])。
 fn should_process_parts(
     rel: &str,
     full: &Path,
     registry: &Registry,
     rules: &crate::exclusion::ExclusionRules,
+) -> bool {
+    gate_parts(rel, full, registry, rules, Gate::Write)
+}
+
+/// [`should_process_parts`] / [`deindex_passes`] / [`rename_decision`] の判定本体。
+fn gate_parts(
+    rel: &str,
+    full: &Path,
+    registry: &Registry,
+    rules: &crate::exclusion::ExclusionRules,
+    gate: Gate,
 ) -> bool {
     // 1 回の stat を 2 つの判定で使い回す: ディレクトリかどうか (末尾スラッシュ
     // の `.grooveignore` パターンの効き方が変わる) と、symlink かどうか。
@@ -622,10 +682,17 @@ fn should_process_parts(
         return false;
     }
     // (ADR-0023) Below the extension filter, as in the walk, so only a file
-    // that would otherwise have been indexed is named in a warning. Reindex,
-    // Deindex and both ends of a rename come through here, so a rename onto
-    // such a name deindexes the old row.
-    if !name_is_addressable(rel, full, is_dir) {
+    // that would otherwise have been indexed is named in a warning. Only a
+    // path that may be written is asked (see [`Gate`]): a rename onto such a
+    // name deindexes the old row, while removing one, or renaming it away
+    // once it is gone, still reaches a row an older version stored under it
+    // -- and names no file that was skipped, so there is nothing to warn of.
+    let name_matters = match gate {
+        Gate::Write => true,
+        Gate::Removal => false,
+        Gate::RenameSource => meta.is_some(),
+    };
+    if name_matters && !name_is_addressable(rel, full, is_dir) {
         return false;
     }
     // (BU-20) A hard link is the same attack with no symlink to see: a second
@@ -1470,6 +1537,123 @@ mod tests {
         assert_eq!(
             new_directory_rels(&kb, &alt.join("sub"), &reg, &rules).unwrap(),
             vec!["sub/ok.md".to_string()]
+        );
+    }
+
+    /// A verbatim scratch knowledge base, so `CON.md` is a file name there
+    /// and not the console, removed when the guard drops.
+    #[cfg(windows)]
+    fn verbatim_scratch_kb(tag: &str) -> (std::path::PathBuf, impl Drop) {
+        let scratch = crate::test_support::unique_temp_path(tag);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let kb = scratch.canonicalize().unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        (kb.clone(), Cleanup(kb))
+    }
+
+    /// (ADR-0023) Good -> bad: the new end is a write and is refused, so the
+    /// old row goes.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_onto_a_name_win32_cannot_spell_deindexes_the_old_row() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-rn1");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("CON.md"), "# x\n").unwrap();
+        assert_eq!(
+            rename_decision(
+                "ok.md",
+                &kb.join("ok.md"),
+                "CON.md",
+                &kb.join("CON.md"),
+                &reg,
+                &rules
+            ),
+            RenameAction::Deindex
+        );
+    }
+
+    /// (ADR-0023) Bad (gone) -> good, the remedy the refusal suggests: the row
+    /// an older version stored under the bad name moves, rather than staying
+    /// behind as an unopenable hit next to a reindexed copy.
+    #[cfg(windows)]
+    #[test]
+    fn renaming_a_name_win32_cannot_spell_away_moves_its_row() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-rn2");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("console.md"), "# x\n").unwrap();
+        std::fs::create_dir_all(kb.join("dir")).unwrap();
+        std::fs::write(kb.join(r"dir\x.md"), "# x\n").unwrap();
+        for (old_rel, old_native, new_rel, new_native) in [
+            ("CON.md", "CON.md", "console.md", "console.md"),
+            ("dir./x.md", r"dir.\x.md", "dir/x.md", r"dir\x.md"),
+        ] {
+            assert_eq!(
+                rename_decision(
+                    old_rel,
+                    &kb.join(old_native),
+                    new_rel,
+                    &kb.join(new_native),
+                    &reg,
+                    &rules
+                ),
+                RenameAction::Rename,
+                "{old_rel} -> {new_rel}"
+            );
+        }
+    }
+
+    /// (ADR-0023) Deleting a file under a name the index no longer holds still
+    /// deindexes the row an older version stored for it.
+    #[cfg(windows)]
+    #[test]
+    fn deleting_a_name_win32_cannot_spell_deindexes_its_row() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-rm");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        for (rel, native) in [("CON.md", "CON.md"), ("dir./x.md", r"dir.\x.md")] {
+            let full = kb.join(native);
+            assert!(
+                std::fs::symlink_metadata(&full).is_err(),
+                "{rel} must be gone"
+            );
+            assert!(deindex_passes(rel, &full, &reg, &rules), "{rel}");
+        }
+    }
+
+    /// (ADR-0023) The removal exemption does not reach a write: a bad-named
+    /// file that exists is refused for a reindex, and a rename whose old end
+    /// still exists under such a name is judged as a write on both ends.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_win32_cannot_spell_that_exists_is_still_not_written() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-wr");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("CON.md"), "# x\n").unwrap();
+        std::fs::write(kb.join("nul.md"), "# x\n").unwrap();
+        assert!(!should_process_parts(
+            "CON.md",
+            &kb.join("CON.md"),
+            &reg,
+            &rules
+        ));
+        assert_eq!(
+            rename_decision(
+                "CON.md",
+                &kb.join("CON.md"),
+                "nul.md",
+                &kb.join("nul.md"),
+                &reg,
+                &rules
+            ),
+            RenameAction::Skip
         );
     }
 
