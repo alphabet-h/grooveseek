@@ -15,9 +15,13 @@ use common::embed_mock::{
     DOC_MODEL, EmbedMock, QUERY_MODEL, Recorded, assert_dir_empty, embed_text, hermetic,
     openai_config_toml,
 };
+use common::mcp::grooveseek_bin;
+use common::temp::TempKbLayout;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// POST `body` to the mock with a raw socket and return `(status, body)`.
@@ -225,4 +229,180 @@ fn assert_dir_empty_fires_when_a_file_lands_in_the_cache() {
     let cache = common::temp::TempRoot::new("groove-aw06-tripwire");
     std::fs::write(cache.path().join("model.onnx"), b"x").expect("write into cache");
     assert_dir_empty(cache.path());
+}
+
+/// Vector length the mock answers with and the config declares.
+const DIM: usize = 256;
+/// A word only `alpha.md` contains, so a query for it has one right answer
+/// on both the vector and the keyword side.
+const ALPHA_MARKER: &str = "zebracornium";
+
+/// A two-document knowledge base, a mock endpoint, and a `groove.toml` that
+/// points at the mock.
+///
+/// Fields drop in declaration order: the mock first, the directories last,
+/// so nothing is removed from under a thread still using it. A `ServerGuard`
+/// a test holds is a separate local declared after its `Fixture` and so
+/// drops before it.
+struct Fixture {
+    mock: EmbedMock,
+    config: PathBuf,
+    cache: PathBuf,
+    layout: TempKbLayout,
+}
+
+fn fixture(prefix: &str, api_key: Option<&str>, extra_toml: &str) -> Fixture {
+    let layout = TempKbLayout::new(prefix);
+    layout.write(
+        "alpha.md",
+        &format!(
+            "---\ntitle: Alpha\n---\n\n## Grazing\n\nThe {ALPHA_MARKER} grazes on the \
+             northern slope and is seen only at dawn.\n"
+        ),
+    );
+    layout.write(
+        "beta.md",
+        "---\ntitle: Beta\n---\n\n## Runtime\n\nA tokio runtime worker thread must not \
+         block on network input or output.\n",
+    );
+    let mock = EmbedMock::start(DIM);
+    let config = layout.root().join("groove.toml");
+    std::fs::write(
+        &config,
+        openai_config_toml(&mock.endpoint(), api_key, DIM) + extra_toml,
+    )
+    .expect("write groove.toml");
+    let cache = layout.root().join("fastembed-tripwire");
+    std::fs::create_dir_all(&cache).expect("create tripwire dir");
+    Fixture {
+        mock,
+        config,
+        cache,
+        layout,
+    }
+}
+
+impl Fixture {
+    fn kb(&self) -> &Path {
+        self.layout.kb()
+    }
+
+    /// `groove --config <cfg>` with the pinned environment; the caller adds
+    /// the subcommand.
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(grooveseek_bin());
+        cmd.arg("--config").arg(&self.config);
+        hermetic(&mut cmd, &self.cache);
+        cmd
+    }
+
+    fn index(&self) {
+        let out = self
+            .cmd()
+            .arg("index")
+            .arg("--kb-path")
+            .arg(self.kb())
+            .output()
+            .expect("spawn groove index");
+        assert!(
+            out.status.success(),
+            "groove index failed: {}\nrequests: {}",
+            String::from_utf8_lossy(&out.stderr),
+            describe(&self.mock.requests())
+        );
+    }
+
+    fn search_cli(&self, query: &str) -> serde_json::Value {
+        let out = self
+            .cmd()
+            .args(["search", query, "--kb-path"])
+            .arg(self.kb())
+            .args([
+                "--format",
+                "json",
+                "--limit",
+                "5",
+                "--include-low-quality",
+                "--min-confidence-ratio",
+                "0",
+            ])
+            .output()
+            .expect("spawn groove search");
+        assert!(
+            out.status.success(),
+            "groove search failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "search stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+}
+
+/// The path of the first hit, or `""` when there is none.
+fn top_path(resp: &serde_json::Value) -> String {
+    resp.pointer("/results/0/path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// One line per request, for failure messages.
+fn describe(reqs: &[Recorded]) -> String {
+    reqs.iter()
+        .map(|r| format!("{:?} {:?}", r.model(), r.inputs()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `index` embeds with `document_model`, `search` with `query_model`, and the
+/// vectors that come back are the ones the ranking uses.
+///
+/// Red if `embed_query` sends `document_model` (the two sides are not
+/// interchangeable: `embedder.rs`, `Embedder::embed_queries`), or if either
+/// command stops reaching the endpoint.
+#[test]
+fn index_then_search_round_trips_through_an_openai_compatible_endpoint() {
+    let fx = fixture("groove-aw06-cli", None, "");
+    fx.index();
+
+    let indexed = fx.mock.requests();
+    assert!(!indexed.is_empty(), "index sent nothing to the endpoint");
+    assert!(
+        indexed.iter().all(|r| r.model() == Some(DOC_MODEL)),
+        "every index request must name the document model:\n{}",
+        describe(&indexed)
+    );
+    assert!(
+        indexed
+            .iter()
+            .flat_map(Recorded::inputs)
+            .any(|i| i.contains(ALPHA_MARKER)),
+        "alpha.md's text never reached the endpoint:\n{}",
+        describe(&indexed)
+    );
+
+    let resp = fx.search_cli(ALPHA_MARKER);
+    let all = fx.mock.requests();
+    let new = &all[indexed.len()..];
+    assert_eq!(
+        new.len(),
+        1,
+        "search must send exactly one request:\n{}",
+        describe(new)
+    );
+    assert_eq!(
+        new[0].model(),
+        Some(QUERY_MODEL),
+        "search must name the query model"
+    );
+    assert_eq!(new[0].inputs(), vec![ALPHA_MARKER.to_string()]);
+    assert!(
+        top_path(&resp).ends_with("alpha.md"),
+        "the document sharing the query's word must rank first: {resp}"
+    );
+    assert_dir_empty(&fx.cache);
 }
