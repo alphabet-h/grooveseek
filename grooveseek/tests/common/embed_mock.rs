@@ -6,6 +6,10 @@
 //! never arrive here:
 //! - `accept` is non-blocking and polled against a stop flag and a lifetime
 //!   deadline, so a regression that never connects cannot hang the test;
+//! - reads on an accepted connection time out after a short poll and look at
+//!   the same stop flag, so a client that connects and then says nothing
+//!   cannot hold up `Drop` (it still has the whole per-request budget to send
+//!   its request while the mock runs);
 //! - a connection closed before it wrote anything (`read == 0`) is dropped,
 //!   not asserted on;
 //! - every response carries `Connection: close`, so one request is one
@@ -38,6 +42,8 @@ pub const QUERY_MODEL: &str = "query-model";
 const MAX_LIFETIME: Duration = Duration::from_secs(300);
 /// How long one connection may take to send its request.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one read may block before the stop flag is looked at again.
+const READ_POLL: Duration = Duration::from_millis(50);
 /// Pause between `accept` polls.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// Pause between [`wait_until`] polls.
@@ -260,7 +266,7 @@ fn accept_loop(
         match listener.accept() {
             Ok((stream, _)) => {
                 connections.fetch_add(1, Ordering::SeqCst);
-                serve_one(stream, requests, responder);
+                serve_one(stream, requests, responder, stop);
             }
             // `WouldBlock` is the usual case (nobody is connecting). Any other
             // error is transient for a loopback listener; the loop tries again
@@ -273,10 +279,24 @@ fn accept_loop(
 /// Read one request, record it, answer it, close. Anything malformed or cut
 /// short is dropped without a panic: a panic here would kill the accept loop
 /// and turn every later request into a hang.
-fn serve_one(mut stream: TcpStream, requests: &Mutex<Vec<Recorded>>, responder: &Responder) {
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let Some(recorded) = read_request(&mut stream) else {
+///
+/// The socket option calls are the exception: a failure there panics, because a
+/// read without its short timeout would block past the stop flag, and `Drop`
+/// would then wait on it for good.
+fn serve_one(
+    mut stream: TcpStream,
+    requests: &Mutex<Vec<Recorded>>,
+    responder: &Responder,
+    stop: &AtomicBool,
+) {
+    stream
+        .set_nonblocking(false)
+        .expect("blocking mock connection");
+    stream
+        .set_read_timeout(Some(READ_POLL))
+        .expect("read timeout on mock connection");
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let Some(recorded) = read_request(&mut stream, stop, deadline) else {
         return;
     };
     requests
@@ -295,18 +315,44 @@ fn serve_one(mut stream: TcpStream, requests: &Mutex<Vec<Recorded>>, responder: 
     let _ = stream.flush();
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
+/// One read that gives up when the mock is stopping or the request is out of
+/// time. `None` means abandon the connection: closed, failed, stopped, or past
+/// the deadline.
+///
+/// The socket's read timeout is [`READ_POLL`], so a client that connects and
+/// then says nothing costs the serving thread at most that long before it
+/// looks at the stop flag again. A timed-out read is `WouldBlock` on Unix and
+/// `TimedOut` on Windows.
+fn read_some(
+    stream: &mut TcpStream,
+    chunk: &mut [u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Option<usize> {
+    loop {
+        match stream.read(chunk) {
+            Ok(0) => return None,
+            Ok(n) => return Some(n),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream, stop: &AtomicBool, deadline: Instant) -> Option<Recorded> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let header_end = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             break pos;
         }
-        match stream.read(&mut chunk) {
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Ok(0) | Err(_) => return None,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-        }
+        let n = read_some(stream, &mut chunk, stop, deadline)?;
+        buf.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
     let mut lines = head.split("\r\n");
@@ -323,11 +369,8 @@ fn read_request(stream: &mut TcpStream) -> Option<Recorded> {
         .unwrap_or(0);
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < len {
-        match stream.read(&mut chunk) {
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Ok(0) | Err(_) => return None,
-            Ok(n) => body.extend_from_slice(&chunk[..n]),
-        }
+        let n = read_some(stream, &mut chunk, stop, deadline)?;
+        body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(len);
     let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);

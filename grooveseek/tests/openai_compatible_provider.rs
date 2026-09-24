@@ -144,6 +144,26 @@ fn embed_mock_stops_promptly_when_dropped() {
 }
 
 #[test]
+fn embed_mock_stops_promptly_while_a_client_holds_a_connection_open() {
+    let mock = EmbedMock::start(8);
+    // Connected, nothing written, not closed: the serving thread is inside
+    // the read for this connection when the mock is dropped.
+    let held = TcpStream::connect(mock.addr()).expect("connect");
+    assert!(
+        common::embed_mock::wait_until(Duration::from_secs(5), || mock.connection_count() >= 1),
+        "the mock never accepted the connection"
+    );
+    let started = Instant::now();
+    drop(mock);
+    let took = started.elapsed();
+    drop(held);
+    assert!(
+        took < Duration::from_secs(2),
+        "Drop must not wait out a half-open connection, took {took:?}"
+    );
+}
+
+#[test]
 fn the_config_helper_writes_an_openai_compatible_section_and_no_top_level_model() {
     let with_key = openai_config_toml("http://127.0.0.1:9/v1/embeddings", Some("   "), 32);
     let parsed: toml::Table = with_key.parse().expect("helper writes valid TOML");
