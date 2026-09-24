@@ -153,10 +153,11 @@ fn a_schema_that_does_not_load_stops_the_index_and_names_the_file() {
 
 #[test]
 fn a_schema_that_does_not_load_leaves_a_forced_rebuild_untouched() {
-    // (codex P1 round 1 on PR #291) `--force` calls `reset_for_model` before
-    // `rebuild_index` is even entered (`main.rs`'s `Commands::Index` arm), so
-    // a schema load failure has to be checked before that reset runs, not
-    // only inside `rebuild_index`. This pins that a malformed schema stops a
+    // (codex P1 round 1 on PR #291) `--force` empties the index inside
+    // `rebuild_index` (`reset_and_resolve_context_mode`); since AW-03 the CLI
+    // arm no longer resets ahead of it. `main.rs`'s `Commands::Index` arm still
+    // reads the schema before `rebuild_index` is entered, so a load failure
+    // stops the run before any reset. This pins that a malformed schema stops a
     // forced run before it empties the index.
     let kb = corpus();
     kb.write("groove-schema.toml", SCHEMA);

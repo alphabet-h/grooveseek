@@ -119,6 +119,20 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Fixed
 
+- **`groove index --force` and MCP `rebuild_index {force: true}` no longer
+  empty the index when the embedding endpoint refuses.** With
+  `provider = "openai-compatible"` both reset the index before the endpoint was
+  first contacted, so a wrong `api_key`, an endpoint that was down, a 429, or a
+  server answering with vectors of another dimension left an empty index
+  behind. A forced rebuild now first embeds one fixed text
+  (`GrooveSeek endpoint probe`, nothing from the knowledge base) under
+  `document_model`, through the checks indexing applies, and stops with an
+  error saying nothing was removed from the index when that fails
+  ([ADR-0024](docs/decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md)).
+  That is one extra request per forced rebuild; runs without `--force`,
+  `serve` startup and `validate` send nothing new, and FastEmbed is unaffected.
+  An endpoint that fails after the probe, partway through the rebuild, still
+  leaves a partial index.
 - **`groove tune` embeds its golden queries the way a search embeds a query.**
   It embedded them as documents, so with `provider = "openai-compatible"` and a
   `query_model` that differs from `document_model` the queries went to

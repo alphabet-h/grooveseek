@@ -704,11 +704,26 @@ pub fn rebuild_index(
         .canonicalize()
         .with_context(|| format!("failed to canonicalize kb_path: {}", kb_path.display()))?;
 
+    // (AW-03, ADR-0024) `force` empties the index below, in a transaction of its own that
+    // commits before the first document is embedded. Hear from the provider first, before
+    // this function writes anything, so a wrong key or an endpoint that is down fails a run
+    // that has removed nothing from the index. This is the only reset `index --force` and MCP
+    // `rebuild_index {force: true}` both reach, so each sends exactly one probe.
+    if force {
+        embedder.probe_before_reset()?;
+    }
+
     // legacy DB を引き継いだケースで FTS が空のままにならないよう、
     // まず既存 chunks のうち FTS 未登録のものを backfill する。
-    let backfilled = db.backfill_fts()?;
-    if backfilled > 0 {
-        eprintln!("Backfilled {backfilled} chunks into FTS index");
+    //
+    // **force のときは走らせない** (AW-03)。すぐ下の reset が既存 chunks ごと
+    // 消すので仕事は捨てられるうえ、legacy DB で backfill が失敗すると、それを
+    // 直すための `--force` まで止めてしまう。
+    if !force {
+        let backfilled = db.backfill_fts()?;
+        if backfilled > 0 {
+            eprintln!("Backfilled {backfilled} chunks into FTS index");
+        }
     }
 
     // legacy DB のチャンクを一度だけ再評価する。既に正しいスコアが入っている行は
@@ -2653,14 +2668,13 @@ fn declared_fields_recorded(db: &Database) -> Result<Option<Vec<String>>> {
 /// anything destructive, and handed to [`rebuild_index`] rather than read again inside it: a
 /// schema that does not load must stop the run before anything is deleted, the way a
 /// `groove.toml` that does not load stops the binary before it opens the database.
-/// [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call can empty the index on
-/// `--force`, and the CLI's `index --force` arm (in `main.rs`) resets even earlier, before
-/// [`rebuild_index`] is entered — so `main.rs` calls this before either reset. The MCP path
-/// (`server.rs`'s `rebuild_index_blocking`) has no reset of its own ahead of the call, but
-/// calls this first anyway, for the same "fail before anything runs" reason and so both callers
-/// give [`rebuild_index`] the same kind of snapshot.
+/// [`rebuild_index`]'s own [`reset_and_resolve_context_mode`] call empties the index on
+/// `--force` -- since AW-03 (ADR-0024) the only reset on either path. `groove index` and the
+/// MCP tool of the same name as [`rebuild_index`] (`rebuild_index_blocking` in
+/// [`crate::server`]) both call this before entering [`rebuild_index`], so a schema that does not load stops the
+/// run before that reset, and both give it the same kind of snapshot.
 ///
-/// A second read inside [`rebuild_index`], after the caller's own validation and reset, would
+/// A second read inside [`rebuild_index`], after the caller's own validation, would
 /// only reopen the window between the two reads to a schema that changes out from under the
 /// run — the file could be replaced with something malformed in between and the reset would
 /// already be done. Reading once, before either side of that window, is what removes it, not
@@ -2845,8 +2859,9 @@ pub(crate) fn resolve_context_mode(
 /// なり得た。呼び出し元 (`rebuild_index`) の先頭でこの関数を通すことで、
 /// force 時は必ず reset → resolve の順序を DB 層で強制する。
 ///
-/// `reset_for_model` の DELETE は冪等なので、CLI 経路のように呼び出し側で
-/// 既に reset 済みの場合にここでもう一度呼んでも無害。
+/// 呼び出し側は reset しない (AW-03)。CLI の `index --force` もかつて先に
+/// reset していたが、それは [`rebuild_index`] 冒頭の provider probe (ADR-0024)
+/// より前に index を空にするので外した。force 時の reset はここだけ。
 pub(crate) fn reset_and_resolve_context_mode(
     db: &Database,
     model_id: &str,

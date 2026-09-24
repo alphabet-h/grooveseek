@@ -19,13 +19,16 @@ use common::embed_mock::{
     DOC_MODEL, EmbedMock, MockResponse, QUERY_MODEL, Recorded, assert_dir_empty, default_response,
     embed_text, hermetic, openai_config_toml, wait_until,
 };
-use common::mcp::{grooveseek_bin, mcp_initialize, mcp_search_call, spawn_serve_with};
+use common::mcp::{
+    grooveseek_bin, mcp_initialize, mcp_search_call, mcp_tool_call, spawn_serve_with,
+};
 use common::temp::TempKbLayout;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// POST `body` to the mock with a raw socket and return `(status, body)`.
@@ -395,6 +398,10 @@ fn steered_response(req: &Recorded) -> MockResponse {
     default_response(req, DIM)
 }
 
+/// What [`Fixture::fail_with`] makes the mock answer with.
+type Failure = fn(&Recorded) -> MockResponse;
+type FailureSlot = Arc<Mutex<Option<Failure>>>;
+
 /// A two-document knowledge base, a mock endpoint, and a `groove.toml` that
 /// points at the mock.
 ///
@@ -404,6 +411,9 @@ fn steered_response(req: &Recorded) -> MockResponse {
 /// declared after its [`Fixture`] and so drops before it.
 struct Fixture {
     mock: EmbedMock,
+    /// When set, what the mock answers every request with instead of
+    /// [`steered_response`] ([`Fixture::fail_with`]).
+    failure: FailureSlot,
     config: PathBuf,
     cache: PathBuf,
     layout: TempKbLayout,
@@ -422,7 +432,14 @@ fn fixture(prefix: &str, api_key: Option<&str>, extra_toml: &str) -> Fixture {
         "beta.md",
         &format!("---\ntitle: Beta\n---\n\n## Runtime\n\n{BETA_BODY}\n"),
     );
-    let mock = EmbedMock::with_responder(steered_response);
+    let failure: FailureSlot = Arc::new(Mutex::new(None));
+    let mock = {
+        let failure = failure.clone();
+        EmbedMock::with_responder(move |req| match *failure.lock().expect("failure lock") {
+            Some(fail) => fail(req),
+            None => steered_response(req),
+        })
+    };
     let config = layout.root().join("groove.toml");
     std::fs::write(
         &config,
@@ -433,6 +450,7 @@ fn fixture(prefix: &str, api_key: Option<&str>, extra_toml: &str) -> Fixture {
     std::fs::create_dir_all(&cache).expect("create tripwire dir");
     Fixture {
         mock,
+        failure,
         config,
         cache,
         layout,
@@ -442,6 +460,43 @@ fn fixture(prefix: &str, api_key: Option<&str>, extra_toml: &str) -> Fixture {
 impl Fixture {
     fn kb(&self) -> &Path {
         self.layout.kb()
+    }
+
+    /// Answer every later request with `failure`, or, given `None`, go back
+    /// to [`steered_response`].
+    fn fail_with(&self, failure: Option<Failure>) {
+        *self.failure.lock().expect("failure lock") = failure;
+    }
+
+    /// `groove index --force`, returning its output whatever the exit code.
+    fn index_force(&self) -> std::process::Output {
+        self.cmd()
+            .args(["index", "--force", "--kb-path"])
+            .arg(self.kb())
+            .output()
+            .expect("spawn groove index --force")
+    }
+
+    /// The `Documents:` and `Chunks:` lines `groove status` prints.
+    fn counts(&self) -> Vec<String> {
+        let out = self
+            .cmd()
+            .args(["status", "--kb-path"])
+            .arg(self.kb())
+            .output()
+            .expect("spawn groove status");
+        assert!(
+            out.status.success(),
+            "groove status failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("Documents:") || l.starts_with("Chunks:"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(lines.len(), 2, "status printed no counts: {lines:?}");
+        lines
     }
 
     /// `groove --config <cfg>` with the pinned environment; the caller adds
@@ -788,4 +843,222 @@ fn no_authorization_header_is_sent_when_the_api_key_is_absent_or_blank() {
             );
         }
     }
+}
+
+/// Text only [`unauthorized`]'s body holds, so a test can tell whether the
+/// endpoint's body reached a reply.
+const BODY_SENTINEL: &str = "SENTINEL-SECRET-4d1f";
+
+/// What the probe's error says about the index, on both paths.
+const NOTHING_REMOVED: &str = "nothing was removed from the index";
+
+/// A 401 with an OpenAI-shaped error body: a wrong or revoked `api_key`. The
+/// body carries [`BODY_SENTINEL`].
+fn unauthorized(_: &Recorded) -> MockResponse {
+    MockResponse::json(
+        401,
+        &serde_json::json!({"error": {"message": format!("mock: invalid api key {BODY_SENTINEL}")}}),
+    )
+}
+
+/// A 429: the endpoint is up and the key is good, but it will not answer now.
+fn rate_limited(_: &Recorded) -> MockResponse {
+    MockResponse::json(
+        429,
+        &serde_json::json!({"error": {"message": "mock: rate limited"}}),
+    )
+}
+
+/// A 200 whose vectors are half as long as the configured dimension: the endpoint
+/// serves a different model from the one the index was built with.
+fn wrong_dimension(req: &Recorded) -> MockResponse {
+    default_response(req, DIM / 2)
+}
+
+/// How many requests carried [`grooveseek::embedder::ENDPOINT_PROBE_TEXT`].
+fn probes(reqs: &[Recorded]) -> usize {
+    reqs.iter()
+        .filter(|r| {
+            r.inputs()
+                .iter()
+                .any(|i| i == grooveseek::embedder::ENDPOINT_PROBE_TEXT)
+        })
+        .count()
+}
+
+/// `groove index --force` against an endpoint answering `failure` fails and
+/// leaves the index it found as it was: the same counts, and a search still
+/// ranks through the vectors stored before.
+///
+/// Red if `--force` empties the index before it has heard from the endpoint
+/// (AW-03): the counts drop to 0 and the search finds nothing.
+fn assert_index_force_leaves_the_index_intact(prefix: &str, failure: Failure, expect: &str) {
+    let fx = fixture(prefix, None, "");
+    fx.index();
+    let before = fx.counts();
+
+    fx.fail_with(Some(failure));
+    let out = fx.index_force();
+    fx.fail_with(None);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !out.status.success(),
+        "{prefix}: index --force against a failing endpoint must fail; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        fx.counts(),
+        before,
+        "{prefix}: the index changed; stderr:\n{stderr}"
+    );
+    let resp = fx.search_cli(BETA_PROBE);
+    assert!(
+        top_path(&resp).ends_with("beta.md"),
+        "{prefix}: the stored vectors must still rank: {resp}"
+    );
+    assert!(
+        stderr.contains(expect) && stderr.contains(NOTHING_REMOVED),
+        "{prefix}: the error must name the failure ({expect:?}) and say nothing was removed \
+         from the index; stderr:\n{stderr}"
+    );
+    assert_dir_empty(&fx.cache);
+}
+
+/// AW-03: a 401 (a wrong key) on `groove index --force` leaves the index intact.
+#[test]
+fn index_force_against_a_401_endpoint_leaves_the_existing_index_intact() {
+    assert_index_force_leaves_the_index_intact("groove-aw03-401", unauthorized, "HTTP 401");
+}
+
+/// AW-03, the other ways an endpoint refuses: a 429, and a 200 carrying
+/// vectors of the wrong length (the response checks the probe goes through
+/// are the ones indexing uses).
+#[test]
+fn index_force_against_a_failing_endpoint_leaves_the_existing_index_intact() {
+    let cases: [(&str, Failure, &str); 2] = [
+        ("groove-aw03-429", rate_limited, "HTTP 429"),
+        (
+            "groove-aw03-dim",
+            wrong_dimension,
+            "embedding endpoint returned dimension",
+        ),
+    ];
+    for (prefix, failure, expect) in cases {
+        assert_index_force_leaves_the_index_intact(prefix, failure, expect);
+    }
+}
+
+/// `groove index --force` sends exactly one probe, as its first request, on
+/// the document side, holding the fixed text and nothing from the knowledge
+/// base.
+///
+/// Red if the probe is sent after the documents (it would come after the
+/// reset), twice (the CLI once reset in two places), or with `query_model`.
+#[test]
+fn index_force_probes_the_endpoint_exactly_once_before_resetting() {
+    let fx = fixture("groove-aw03-once", None, "");
+    fx.index();
+    let before = fx.mock.requests().len();
+
+    let out = fx.index_force();
+    assert!(
+        out.status.success(),
+        "groove index --force failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let all = fx.mock.requests();
+    let new = &all[before..];
+    assert!(
+        new.len() > 1,
+        "--force sent no documents:\n{}",
+        describe(new)
+    );
+    assert_eq!(
+        new[0].inputs(),
+        vec![grooveseek::embedder::ENDPOINT_PROBE_TEXT.to_string()],
+        "the first request of --force must be the probe alone:\n{}",
+        describe(new)
+    );
+    assert_eq!(
+        new[0].model(),
+        Some(DOC_MODEL),
+        "the probe is a document embed"
+    );
+    assert_eq!(probes(new), 1, "exactly one probe:\n{}", describe(new));
+    assert_dir_empty(&fx.cache);
+}
+
+/// Without `--force` nothing is about to be emptied, so nothing is probed:
+/// the first index of an empty database, a run with nothing changed, and a
+/// run with one changed file send documents only.
+///
+/// Red if the probe is sent on every run rather than only before a reset.
+#[test]
+fn incremental_index_does_not_probe() {
+    let fx = fixture("groove-aw03-incr", None, "");
+    fx.index();
+    fx.index();
+    let unchanged = fx.mock.requests().len();
+    fx.layout.write(
+        "beta.md",
+        &format!("---\ntitle: Beta\n---\n\n## Runtime\n\n{BETA_BODY} Edited.\n"),
+    );
+    fx.index();
+    let reqs = fx.mock.requests();
+    assert!(
+        reqs.len() > unchanged,
+        "the edit was not re-embedded:\n{}",
+        describe(&reqs)
+    );
+    assert_eq!(
+        probes(&reqs),
+        0,
+        "a run without --force probed:\n{}",
+        describe(&reqs)
+    );
+}
+
+/// AW-03 through MCP: `rebuild_index {force: true}` against a 401 answers
+/// with an error and leaves the index the server is serving intact.
+///
+/// Red if the MCP path empties the index before the endpoint has answered;
+/// it reaches the reset through [`grooveseek::indexer::rebuild_index`] as the
+/// CLI does, so one probe there covers both.
+#[test]
+fn mcp_rebuild_index_force_against_a_401_endpoint_leaves_the_existing_index_intact() {
+    let fx = fixture("groove-aw03-mcp", None, "");
+    fx.index();
+    let before = fx.counts();
+
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    fx.fail_with(Some(unauthorized));
+    let resp = mcp_tool_call(
+        &base,
+        &session,
+        "rebuild_index",
+        serde_json::json!({"force": true}),
+    );
+    fx.fail_with(None);
+    let search = mcp_search_call(&base, &session, mcp_search_args(BETA_PROBE));
+    drop(guard);
+    assert_eq!(fx.counts(), before, "the index changed: {resp}");
+    assert!(
+        top_path(&search).ends_with("beta.md"),
+        "the served index must still rank: {search}"
+    );
+    let error = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        error.contains(NOTHING_REMOVED),
+        "rebuild_index must fail saying nothing was removed from the index: {resp}"
+    );
+    // The reply carries the outermost message only, as it did before the
+    // probe: the endpoint's response body stays out of what an MCP caller
+    // sees (Local Codex r1 on AW-03).
+    assert!(
+        !error.contains(BODY_SENTINEL),
+        "the endpoint's response body reached the MCP reply: {resp}"
+    );
+    assert_dir_empty(&fx.cache);
 }

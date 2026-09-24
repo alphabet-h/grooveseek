@@ -56,8 +56,15 @@ work. `dimension` is mandatory:
 groove uses it to open or validate the vector index before constructing the
 HTTP provider, then rejects any response whose vectors have a different size.
 Requests are sent in batches of at most 64 inputs. Groove does not probe the
-endpoint; the reasoning is in
-[ADR-0022](decisions/0022-embedding-provider-boundary.md). An optional
+endpoint to open, validate or serve an index; the reasoning is in
+[ADR-0022](decisions/0022-embedding-provider-boundary.md). The one exception
+is a forced rebuild: `groove index --force` and the MCP tool `rebuild_index`
+with `force: true` first embed one fixed text, `GrooveSeek endpoint probe`
+(nothing from the knowledge base), under `document_model`, and if the endpoint
+refuses it or answers with the wrong dimension they stop with an error saying
+nothing was removed from the index
+([ADR-0024](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md)).
+Without `--force` nothing is probed. An optional
 `api_key` is sent as a bearer token; `GROOVE_EMBEDDING_API_KEY` takes
 precedence and avoids storing the token in the file.
 

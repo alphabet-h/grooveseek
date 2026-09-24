@@ -53,8 +53,14 @@ role を埋める。したがって `model` 1 つだけ、上の例のように 
 `model` と role 別 alias 1 つ、のどれでもよい。`dimension` は必須: groove は HTTP provider を作る前に
 この値でベクトル索引を開くか検証し、その後はベクトルの長さが異なるレスポンスを
 すべて拒否する。リクエストは 1 回あたり最大 64 入力のバッチで送る。groove は
-endpoint を probe しない (次元を必須にし probe しない理由は
-[ADR-0022](decisions/0022-embedding-provider-boundary.ja.md))。任意の `api_key` は
+索引を開く・検証する・配信するために endpoint を probe しない (次元を必須にし
+probe しない理由は [ADR-0022](decisions/0022-embedding-provider-boundary.ja.md))。
+例外は強制再構築だけで、`groove index --force` と MCP ツール `rebuild_index` の
+`force: true` は、まず固定の文字列 `GrooveSeek endpoint probe` (知識ベースの中身は
+含まない) を `document_model` で 1 件 embedding し、endpoint が断るか次元の違う
+応答を返したら、索引から何も消していないと述べるエラーで止まる
+([ADR-0024](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md))。
+`--force` が無ければ probe はしない。任意の `api_key` は
 bearer token として送られる。`GROOVE_EMBEDDING_API_KEY` が設定されていればそちらが
 優先され、token をファイルに書かずに済む。
 

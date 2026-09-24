@@ -75,6 +75,7 @@ Architecture Decision Record — 何を選び、どの代替案を退け、そ�
 | 21. 渡された socket だけを受け、自分では作らない | [en](decisions/0021-take-the-socket-you-were-given.md) | [ja](decisions/0021-take-the-socket-you-were-given.ja.md) |
 | 22. embedding を provider 境界の後ろに置き、既定は FastEmbed のままにする | [en](decisions/0022-embedding-provider-boundary.md) | [ja](decisions/0022-embedding-provider-boundary.ja.md) |
 | 23. サーバが開ける名前だけを索引し、その判定を 1 つの述語に集める | [en](decisions/0023-index-only-names-the-server-can-open.md) | [ja](decisions/0023-index-only-names-the-server-can-open.ja.md) |
+| 24. 強制再構築が索引を空にする前に embedding endpoint を試す | [en](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md) | [ja](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md) |
 
 ADR-0003 のファイル名は今も `kb-mcpignore` のままです。そこで説明されているファイルは
 現在 `.grooveignore` ですが、**ADR は merge 後に編集しません**。2026-08-17 より前の

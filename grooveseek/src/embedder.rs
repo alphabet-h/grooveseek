@@ -248,6 +248,13 @@ trait EmbeddingProvider: Send {
     fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|text| self.embed_query(text)).collect()
     }
+
+    /// Check the provider answers before a forced rebuild empties the index
+    /// (ADR-0024). A local model has nothing to reach, so the default does
+    /// nothing.
+    fn probe(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct FastEmbedProvider {
@@ -314,6 +321,10 @@ struct OpenAiCompatibleProvider {
     client: Option<reqwest::blocking::Client>,
     config: OpenAiCompatibleConfig,
 }
+
+/// The one text [`Embedder::probe_before_reset`] sends. Fixed and ASCII, so the
+/// probe carries nothing from the knowledge base.
+pub const ENDPOINT_PROBE_TEXT: &str = "GrooveSeek endpoint probe";
 
 const OPENAI_COMPATIBLE_BATCH_SIZE: usize = 64;
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 512;
@@ -446,6 +457,12 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
         let model = self.config.query_model.clone();
         self.embed(texts, &model)
     }
+
+    /// One document-side embed of [`ENDPOINT_PROBE_TEXT`], through the same
+    /// response checks (status, count, dimension) indexing relies on.
+    fn probe(&mut self) -> Result<()> {
+        self.embed_documents(&[ENDPOINT_PROBE_TEXT]).map(drop)
+    }
 }
 
 fn escaped_body_snippet(body: &[u8]) -> String {
@@ -535,6 +552,24 @@ impl Embedder {
     /// the results simply belong to a different query.
     pub fn embed_queries(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         self.provider.embed_queries(texts)
+    }
+
+    /// Before a forced rebuild empties the index, check the provider answers
+    /// (ADR-0024). An OpenAI-compatible endpoint is sent one fixed text,
+    /// [`ENDPOINT_PROBE_TEXT`], on the document side; FastEmbed does nothing.
+    ///
+    /// The error says nothing was removed from the index, because a caller
+    /// runs this before its reset and returns on failure.
+    ///
+    /// That sentence is context and the provider's error stays its source:
+    /// the CLI prints the whole chain, HTTP status included, while the MCP
+    /// `rebuild_index {force: true}` reply shows the outermost message only,
+    /// so the endpoint's response body does not reach an MCP caller.
+    pub fn probe_before_reset(&mut self) -> Result<()> {
+        self.provider.probe().context(
+            "the embedding endpoint check before the forced rebuild failed, \
+             so nothing was removed from the index",
+        )
     }
 
     /// 選択中のモデルの埋め込み次元数。
