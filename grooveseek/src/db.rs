@@ -2260,6 +2260,98 @@ mod tests {
         );
     }
 
+    /// (#326) `groove doctor` asks for blank code chunks on every run, and a clean index has
+    /// none. Walking every chunk to find that out cost ~5 s on 300k chunks; the partial
+    /// index holds only the blank rows, so the answer costs what the leftovers cost. Assert
+    /// the plan, not the clock, as the seed-read test above does.
+    #[test]
+    fn the_blank_chunk_query_reads_the_partial_index_not_the_chunks() {
+        let db = db_with_384();
+        let doc_id = db
+            .upsert_document("src/a.rs", None, None, None, None, &[], None, "h1", 0)
+            .unwrap();
+        for i in 0..5 {
+            db.insert_chunk_with_code(
+                doc_id,
+                i,
+                None,
+                None,
+                if i == 4 { "" } else { "fn f() {}" },
+                None,
+                &dummy_embedding(0.1),
+                1.0,
+                CodeMeta {
+                    line_range: Some((1, 2)),
+                    symbol_kind: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let plan: Vec<String> = db
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                meta::blank_source_chunks_sql()
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        let joined = plan.join(" | ");
+
+        assert!(
+            joined.contains("idx_chunks_blank"),
+            "the blank rows must be found through the partial index, got: {joined}"
+        );
+        // `b` and `c` are the query's two aliases of `chunks`; `d` is `documents`.
+        for line in &plan {
+            let scans_chunks = ["SCAN b", "SCAN c", "SCAN chunks"]
+                .iter()
+                .any(|p| line.starts_with(p));
+            assert!(
+                !scans_chunks || line.contains("idx_chunks_blank"),
+                "a scan of chunks outside the partial index walks every chunk: {joined}"
+            );
+        }
+    }
+
+    /// An index written before the partial index existed gains it on the next open, like
+    /// every other `ensure_*` in `schema.rs` -- doctor must not fall back to a full walk on
+    /// the indexes that most need the check.
+    #[test]
+    fn an_existing_index_gains_the_blank_chunk_index_on_open() {
+        let dir = TempDir::new("blank-idx");
+        let path = dir.path().join("groove.db");
+        let path = path.to_str().unwrap();
+        {
+            let db = Database::open(path).unwrap();
+            db.verify_embedding_meta("bge-small-en-v1.5", 384).unwrap();
+            // The shape a previous release left behind: no partial index.
+            db.conn
+                .execute_batch("DROP INDEX IF EXISTS idx_chunks_blank;")
+                .unwrap();
+        }
+        let has_index = |db: &Database| -> bool {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'idx_chunks_blank'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        };
+        let db = Database::open(path).unwrap();
+        assert!(has_index(&db), "reopening must create idx_chunks_blank");
+        drop(db);
+        // Idempotent: a second open is a no-op, not an error.
+        let db = Database::open(path).unwrap();
+        assert!(has_index(&db));
+    }
+
     #[test]
     fn test_get_chunk_embedding_roundtrip() {
         let db = db_with_384();

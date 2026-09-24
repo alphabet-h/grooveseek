@@ -348,6 +348,23 @@ pub fn run(
         });
     }
 
+    // (#326) Asked of the stored chunks rather than folded into the generation above: that
+    // one records how an oversized file is handled, and bumping it would send every index with
+    // source files to --force whether it holds a blank chunk or not. This one is exact.
+    let scan = db.source_files_with_blank_chunks(SAMPLE_LIMIT)?;
+    findings.extend(finding(
+        "blank-code-chunks",
+        Severity::Warning,
+        format!(
+            "{} indexed source file(s) hold a chunk with no visible text, left by a build \
+             before blank pieces stopped being cut; it is embedded and indexed but says nothing",
+            scan.count
+        ),
+        scan,
+        // An unchanged file is not re-chunked by a plain run.
+        "groove index --force (re-chunks and re-embeds them)",
+    ));
+
     let without_definitions = crate::parser::code::TAGS_WITHOUT_DEFINITIONS;
     // Only documents a parser gave line numbers to are asked, because `tags` alone proves
     // nothing: it is frontmatter, so a note about code parsing can declare `parse:too-deep`
@@ -1326,6 +1343,90 @@ mod tests {
         let report = run(&db, &registry_md(), None).expect("run");
         let f = chunked_without_definitions(&report).expect("the readable row is still found");
         assert_eq!(f.count, 1);
+    }
+
+    /// Add a document at the given path whose chunks store `contents`, each with a line range or none
+    /// -- one blank entry is the shape a build before #326 could leave in a source file.
+    fn with_chunks(db: &Database, path: &str, contents: &[&str], line_numbers: bool) {
+        let doc = db
+            .upsert_document(path, Some("T"), None, None, None, &[], None, "h3", 12)
+            .expect("upsert");
+        for (i, content) in contents.iter().enumerate() {
+            let line = u32::try_from(i).expect("few chunks") + 1;
+            db.insert_chunk_with_code(
+                doc,
+                i32::try_from(i).expect("few chunks"),
+                None,
+                None,
+                content,
+                None,
+                &vec![0.1; 384],
+                1.0,
+                crate::db::CodeMeta {
+                    line_range: line_numbers.then_some((line, line)),
+                    symbol_kind: None,
+                },
+            )
+            .expect("chunk");
+        }
+    }
+
+    fn blank_code_chunks(report: &Report) -> Option<&Finding> {
+        report
+            .findings
+            .iter()
+            .find(|f| f.check == "blank-code-chunks")
+    }
+
+    #[test]
+    fn a_source_file_holding_a_blank_chunk_is_reported() {
+        // #326: an unchanged file never reaches the parser again, so the empty chunk an older
+        // build wrote stays until something says so. The parser trims a chunk's end, so the
+        // real leftover is stored as '' -- the only shape the fixtures below use.
+        let db = db_with_one_chunk();
+        with_the_current_chunk_policy(&db);
+        with_chunks(&db, "src/a.rs", &["fn a() {}", ""], true);
+        with_chunks(&db, "src/b.rs", &["fn b() {}", ""], true);
+        with_chunks(&db, "src/c.rs", &["fn c() {}", "}"], true);
+
+        let report = run(&db, &registry_md(), None).expect("run");
+        let f = blank_code_chunks(&report).expect("both files hold a blank chunk");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.count, 2);
+        assert_eq!(
+            f.samples,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        assert!(f.remedy.contains("--force"), "remedy was {:?}", f.remedy);
+    }
+
+    #[test]
+    fn an_index_whose_source_chunks_all_have_text_says_nothing_about_blank_chunks() {
+        let db = db_with_one_chunk();
+        with_the_current_chunk_policy(&db);
+        with_chunks(&db, "src/lib.rs", &["fn f() {", "}"], true);
+
+        let report = run(&db, &registry_md(), None).expect("run");
+        assert!(
+            blank_code_chunks(&report).is_none(),
+            "findings were {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_blank_chunk_in_a_document_without_line_numbers_is_not_counted() {
+        // The finding is about what the code chunker left behind, and the population is the
+        // one every source-file check uses: documents a parser gave line numbers to.
+        let db = db_with_one_chunk();
+        with_chunks(&db, "notes/n.md", &["# N", ""], false);
+
+        let report = run(&db, &registry_md(), None).expect("run");
+        assert!(
+            blank_code_chunks(&report).is_none(),
+            "findings were {:?}",
+            report.findings
+        );
     }
 
     #[test]

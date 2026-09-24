@@ -34,6 +34,20 @@ use std::collections::BTreeMap;
 const SOURCE_FILE_PREDICATE: &str =
     "EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.id AND c.start_line IS NOT NULL)";
 
+/// The query behind [`Database::source_files_with_blank_chunks`], held apart so a test can
+/// read its plan.
+///
+/// Driven from the blank rows, so the partial index `idx_chunks_blank` answers it and a
+/// clean index costs nothing to ask -- not from the documents, which would walk every one.
+/// `content = ''` has to match the index's own predicate word for word for SQLite to use it.
+pub(super) fn blank_source_chunks_sql() -> String {
+    format!(
+        "SELECT DISTINCT d.path FROM chunks b JOIN documents d ON d.id = b.document_id \
+         WHERE b.content = '' AND {SOURCE_FILE_PREDICATE} \
+         ORDER BY d.path"
+    )
+}
+
 /// What one [`Database::backfill_quality`] pass did.
 ///
 /// Two numbers rather than one because they answer different questions and only the first is
@@ -768,6 +782,25 @@ impl Database {
              ORDER BY path",
             sample_limit,
         )
+    }
+
+    /// Source files holding a chunk with no visible text, in path order (#326).
+    ///
+    /// A build before the fix could cut a piece of bare newlines off the end of a line-chunked
+    /// file, and an unchanged file never reaches the parser again, so the row stays. The
+    /// population is [`SOURCE_FILE_PREDICATE`], the one every source-file question uses.
+    ///
+    /// `content` is the column asked because it is the chunk's own text: the FTS `content`
+    /// column is written from it and it is what a search returns. The embedded text is
+    /// `context_text` plus this, so under [`crate::db::ContextMode::Static`] the vector of a blank chunk is
+    /// the breadcrumb alone -- still a chunk that says nothing.
+    ///
+    /// `''` is exact, not an approximation: every code chunk, plugin grammars included, is
+    /// built at one site in `parser/code/mod.rs` that `trim_end()`s it, and the one
+    /// production INSERT stores it unchanged, so a whitespace-only piece is always stored
+    /// empty.
+    pub fn source_files_with_blank_chunks(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(&blank_source_chunks_sql(), sample_limit)
     }
 
     /// legacy / 前回 index 済み DB のチャンクを [`crate::quality::chunk_quality_score`]

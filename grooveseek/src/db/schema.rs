@@ -143,6 +143,7 @@ impl Database {
         // (BU-33) 起点ドキュメントのチャンクを chunk_index 順に読む索引。
         // 既存 DB でも open のたびに張られる (IF NOT EXISTS)。
         self.ensure_chunk_order_index()?;
+        self.ensure_blank_chunk_index()?;
 
         // legacy DB 互換: chunks.level 列が無ければ ALTER で追加する
         // (NULL のまま — 値は再 index 時に埋まる)。
@@ -220,6 +221,21 @@ impl Database {
     fn ensure_chunk_order_index(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chunks_doc_order ON chunks(document_id, chunk_index);",
+        )?;
+        Ok(())
+    }
+
+    /// A partial index over the chunks whose content is empty (idempotent, #326).
+    ///
+    /// `groove doctor` asks on every run which source files still hold a blank chunk an
+    /// older build left behind ([`Database::source_files_with_blank_chunks`]), and a clean
+    /// index has none. Without this the answer walks every chunk row: 5.1 s on a synthetic
+    /// 300k-chunk index, most of doctor's 8.4 s. The index holds only the blank rows, so the
+    /// query reads what the leftovers are; building it on an existing index of that size
+    /// took about 1 s, once.
+    fn ensure_blank_chunk_index(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_blank ON chunks(document_id) WHERE content = '';",
         )?;
         Ok(())
     }

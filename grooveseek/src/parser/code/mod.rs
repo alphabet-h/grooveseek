@@ -846,7 +846,7 @@ fn split_by_lines(text: &str, range: &Range<usize>, budget: usize) -> Vec<Range<
     let mut cursor = range.start;
     for line in slice.split_inclusive('\n') {
         let weight = line.chars().filter(|c| !c.is_whitespace()).count();
-        if used > 0 && used + weight > budget {
+        if weight > 0 && used > 0 && used + weight > budget {
             out.push(start..cursor);
             start = cursor;
             used = 0;
@@ -1578,6 +1578,79 @@ impl Counter {
                     "{lines} line(s) at a bound of {limit} split into {}",
                     pieces.len()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn split_by_lines_does_not_cut_a_whitespace_only_piece() {
+        // #326: once a line has overrun the budget on its own, a trailing blank line
+        // weighs nothing but still tripped the cut, leaving a piece of bare newlines behind.
+        let src = "ab\ncd\n\n\n";
+        for budget in 1usize..=4 {
+            let pieces = split_by_lines(src, &(0..src.len()), budget);
+            for p in &pieces {
+                assert!(
+                    !src[p.clone()].trim().is_empty(),
+                    "budget {budget} cut a whitespace-only piece {p:?} out of {pieces:?}"
+                );
+            }
+            assert_eq!(pieces.first().map(|p| p.start), Some(0), "budget {budget}");
+            assert_eq!(
+                pieces.last().map(|p| p.end),
+                Some(src.len()),
+                "budget {budget}"
+            );
+            for w in pieces.windows(2) {
+                assert_eq!(w[0].end, w[1].start, "budget {budget}: {pieces:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_trailing_blank_line_does_not_become_an_empty_chunk() {
+        // #326, through the line fallback: a nested module refused by a scope limit of
+        // one, with the budget already spent by the line before the blank ones.
+        let doc = parse_capped_with("mod m{fn f(){}}\n\n", 1, 1);
+        for (i, chunk) in doc.chunks.iter().enumerate() {
+            assert!(
+                !chunk.content.trim().is_empty(),
+                "chunk {i} has no content: {:?}",
+                doc.chunks.iter().map(|c| &c.content).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn the_source_from_issue_273_yields_no_empty_chunk() {
+        // The shrunk proptest input from CI. The failing bounds were not recorded, so the
+        // small end of each bound is swept, which is where a budget runs out one line early.
+        let src =
+            "mod m0{\nmod m1{\ntype T2 = u8;\n}\n}\nfn g5(a: u32) -> u32 { a + 1 }fn f6(){}\n\n";
+        let grammar = static_rust::grammar().expect("rust grammar builds");
+        for budget in 1usize..=40 {
+            for scope_depth in 1usize..=3 {
+                for chunks in 1usize..=6 {
+                    let doc = chunk_source_capped(
+                        &grammar,
+                        budget,
+                        src.as_bytes(),
+                        src,
+                        "src/lib.rs",
+                        Bounds {
+                            scope_depth,
+                            chunks,
+                        },
+                    )
+                    .expect("the issue's source parses");
+                    for (i, chunk) in doc.chunks.iter().enumerate() {
+                        assert!(
+                            !chunk.content.trim().is_empty(),
+                            "budget {budget}, scope_depth {scope_depth}, chunks {chunks}: \
+                             chunk {i} has no content"
+                        );
+                    }
+                }
             }
         }
     }

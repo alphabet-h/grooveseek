@@ -151,6 +151,17 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   is required for (the `[embedding]` provider, model or dimension, not only
   `--model`); `doctor` lists the questions it asks today, including the
   declared-field set and line-chunked source files.
+- **A source file no longer produces a chunk of nothing but blank lines.** When
+  a line had already used up the chunk budget on its own, a blank line after
+  it still started a new piece, so the tail of a line-chunked file could come
+  out as a whitespace-only chunk that was embedded and indexed. A line with no
+  visible characters now never starts a piece. `groove doctor` now reports
+  indexes that still hold such chunks (`blank-code-chunks`), and
+  `groove index --force` removes them. The check reads a partial index
+  (`idx_chunks_blank`) that is created on open, idempotently, for new and
+  existing databases alike: on a synthetic 300,000-chunk index the first open
+  spent about 6 s building it, once, and the check then takes about 1 ms
+  instead of about 5 s. (#326)
 
 ## [1.13.0] - 2026-09-23
 
