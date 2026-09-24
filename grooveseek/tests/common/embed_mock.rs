@@ -6,10 +6,11 @@
 //! never arrive here:
 //! - `accept` is non-blocking and polled against a stop flag and a lifetime
 //!   deadline, so a regression that never connects cannot hang the test;
-//! - reads and writes on an accepted connection time out after a short poll
-//!   and look at the same stop flag, so a client that connects and then says
-//!   nothing, or stops reading the answer, cannot hold up `Drop` (while the
-//!   mock runs, a connection still has its whole budget);
+//! - every read and write on an accepted connection is preceded by a look at
+//!   the same stop flag and the connection's deadline, and times out after a
+//!   short poll, so a client that says nothing, trickles its request, or stops
+//!   reading the answer cannot hold up `Drop` (while the mock runs, a
+//!   connection still has its whole budget);
 //! - a connection closed before it wrote anything (`read == 0`) is dropped,
 //!   not asserted on;
 //! - every response carries `Connection: close`, so one request is one
@@ -325,20 +326,28 @@ fn serve_one(
     }
 }
 
+/// Whether the connection may make another read or write: the mock is not
+/// stopping and the connection's deadline is still ahead.
+///
+/// Asked before every attempt, not only after a timed-out one. A client that
+/// trickles its request, or drains the answer steadily, makes every call
+/// succeed inside the poll, and a check that waited for a timeout would never
+/// run.
+fn still_serving(stop: &AtomicBool, deadline: Instant) -> bool {
+    !stop.load(Ordering::SeqCst) && Instant::now() < deadline
+}
+
 /// Whether an I/O error on a mock connection is worth another try.
 ///
 /// The socket timeouts are [`IO_POLL`], so a client that says nothing, or
 /// stops reading what it is sent, costs the serving thread at most that long
-/// before it looks at the stop flag and the connection's deadline again. A
-/// timed-out call is `WouldBlock` on Unix and `TimedOut` on Windows.
-fn worth_retrying(e: &std::io::Error, stop: &AtomicBool, deadline: Instant) -> bool {
-    match e.kind() {
-        ErrorKind::Interrupted => true,
-        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-            !stop.load(Ordering::SeqCst) && Instant::now() < deadline
-        }
-        _ => false,
-    }
+/// before [`still_serving`] is asked again. A timed-out call is `WouldBlock`
+/// on Unix and `TimedOut` on Windows.
+fn worth_retrying(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+    )
 }
 
 /// One read that gives up when the mock is stopping or the connection is out
@@ -350,14 +359,15 @@ fn read_some(
     stop: &AtomicBool,
     deadline: Instant,
 ) -> Option<usize> {
-    loop {
+    while still_serving(stop, deadline) {
         match stream.read(chunk) {
             Ok(0) => return None,
             Ok(n) => return Some(n),
-            Err(e) if worth_retrying(&e, stop, deadline) => {}
+            Err(e) if worth_retrying(&e) => {}
             Err(_) => return None,
         }
     }
+    None
 }
 
 /// Write all of `buf` unless the mock is stopping or the connection is out of
@@ -370,10 +380,13 @@ fn write_bounded(
     deadline: Instant,
 ) -> bool {
     while !buf.is_empty() {
+        if !still_serving(stop, deadline) {
+            return false;
+        }
         match stream.write(buf) {
             Ok(0) => return false,
             Ok(n) => buf = &buf[n..],
-            Err(e) if worth_retrying(&e, stop, deadline) => {}
+            Err(e) if worth_retrying(&e) => {}
             Err(_) => return false,
         }
     }

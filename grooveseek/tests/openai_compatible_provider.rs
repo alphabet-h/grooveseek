@@ -171,6 +171,54 @@ fn embed_mock_stops_promptly_while_a_client_holds_a_connection_open() {
     );
 }
 
+#[test]
+fn embed_mock_stops_promptly_while_a_client_trickles_a_request_it_never_finishes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mock = EmbedMock::start(8);
+    let addr = mock.addr();
+    // One byte of a header every 10 ms, never the blank line that ends it:
+    // every read the mock makes succeeds well inside its poll, so only a check
+    // made before each read sees the stop flag. The trickler gives up on its
+    // own after 8 s, so this test ends even if the mock never lets go.
+    let quit = Arc::new(AtomicBool::new(false));
+    let trickler = {
+        let quit = quit.clone();
+        std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            let _ = stream.set_nodelay(true);
+            let end = Instant::now() + Duration::from_secs(8);
+            while !quit.load(Ordering::SeqCst) && Instant::now() < end {
+                if stream.write_all(b"X").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || mock.connection_count() >= 1),
+        "the mock never accepted the connection"
+    );
+    // Let a few bytes through so the serving thread is in its read loop.
+    std::thread::sleep(Duration::from_millis(100));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(mock);
+        let _ = tx.send(started.elapsed());
+    });
+    let took = rx.recv_timeout(Duration::from_secs(5));
+    quit.store(true, Ordering::SeqCst);
+    trickler.join().expect("trickler thread");
+    let took = took.expect("Drop did not return within 5 s while a client trickled bytes");
+    assert!(
+        took < Duration::from_secs(2),
+        "Drop must not wait on a client that keeps sending, took {took:?}"
+    );
+}
+
 /// Linux and macOS only, on purpose. Backpressure cannot be induced on a
 /// Windows loopback connection: Windows takes a blocking write like this whole
 /// (measured: 512 MiB returned `Ok` in 66 ms to a client that never read), so
