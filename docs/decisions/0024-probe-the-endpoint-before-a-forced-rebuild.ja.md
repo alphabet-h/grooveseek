@@ -82,9 +82,12 @@ ADR-0022 は **GrooveSeek は endpoint を probe しない** と決めた。理�
   として — 再構築がこれから使う側である `document_model` で — embedding し、応答を
   索引作成のすべての応答と同じ検査に通す: HTTP status、ベクトルの件数、index の範囲と
   重複、宣言した `dimension`。FastEmbed は何もしない (モデルは既に読み込まれている)。
-- **失敗したら**、索引は変更していないと述べるエラーに provider 自身のエラー (例えば
-  `embedding endpoint returned HTTP 401: ...`) を続けて止まる。MCP ではそれがツールの
-  エラー応答になる。
+- **失敗したら**、索引から何も消していないと述べるエラーで止まる。provider 自身の
+  エラー (例えば `embedding endpoint returned HTTP 401: ...`) はその原因として保持する:
+  CLI はそれをメッセージの下に表示し、MCP ツールのエラー応答はメッセージだけを運ぶので、
+  endpoint の応答 body は MCP の呼び出し側に届かない。述べているのは削除についてだけで、
+  その前に database を開いた時点で、どのコマンドでも走る中身を保つ schema 移行は既に
+  走っていることがある。
 - **変わらないもの**: 索引を開くこと、`Config::validate`、`serve` の起動、incremental
   な `index`、`search`、watcher は probe しない。ADR-0022 の規則はそのすべてに残り、
   この記録は上の例外 1 つだけそれを狭める。
@@ -101,7 +104,7 @@ ADR-0022 は **GrooveSeek は endpoint を probe しない** と決めた。理�
   `groove index --force` は、使える SQLite database でないファイルを
   `rebuild_index` の前に差し替える (`main.rs` の `Commands::Index` arm にある
   `open_or_replace_corrupt`)。その後で probe が失敗すると、メッセージはやはり
-  索引は変更していないと述べるが、残すべき使える索引はもともと無かった。
+  索引から何も消していないと述べるが、残すべき使える索引はもともと無かった。
 - **マシンの外へ出る文字列が、以前より 1 リクエスト早くなる。** それは固定の文字列で
   知識ベースの中身ではなく、行き先は運用者が強制再構築を打つことで全チャンクを送ると
   既に決めた先だけ。

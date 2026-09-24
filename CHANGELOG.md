@@ -127,7 +127,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   behind. A forced rebuild now first embeds one fixed text
   (`GrooveSeek endpoint probe`, nothing from the knowledge base) under
   `document_model`, through the checks indexing applies, and stops with an
-  error saying the index was not modified when that fails
+  error saying nothing was removed from the index when that fails
   ([ADR-0024](docs/decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md)).
   That is one extra request per forced rebuild; runs without `--force`,
   `serve` startup and `validate` send nothing new, and FastEmbed is unaffected.

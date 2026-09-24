@@ -845,11 +845,19 @@ fn no_authorization_header_is_sent_when_the_api_key_is_absent_or_blank() {
     }
 }
 
-/// A 401 with an OpenAI-shaped error body: a wrong or revoked `api_key`.
+/// Text only [`unauthorized`]'s body holds, so a test can tell whether the
+/// endpoint's body reached a reply.
+const BODY_SENTINEL: &str = "SENTINEL-SECRET-4d1f";
+
+/// What the probe's error says about the index, on both paths.
+const NOTHING_REMOVED: &str = "nothing was removed from the index";
+
+/// A 401 with an OpenAI-shaped error body: a wrong or revoked `api_key`. The
+/// body carries [`BODY_SENTINEL`].
 fn unauthorized(_: &Recorded) -> MockResponse {
     MockResponse::json(
         401,
-        &serde_json::json!({"error": {"message": "mock: invalid api key"}}),
+        &serde_json::json!({"error": {"message": format!("mock: invalid api key {BODY_SENTINEL}")}}),
     )
 }
 
@@ -908,9 +916,9 @@ fn assert_index_force_leaves_the_index_intact(prefix: &str, failure: Failure, ex
         "{prefix}: the stored vectors must still rank: {resp}"
     );
     assert!(
-        stderr.contains(expect) && stderr.contains("index was not modified"),
-        "{prefix}: the error must name the failure ({expect:?}) and say the index was not \
-         modified; stderr:\n{stderr}"
+        stderr.contains(expect) && stderr.contains(NOTHING_REMOVED),
+        "{prefix}: the error must name the failure ({expect:?}) and say nothing was removed \
+         from the index; stderr:\n{stderr}"
     );
     assert_dir_empty(&fx.cache);
 }
@@ -1042,8 +1050,15 @@ fn mcp_rebuild_index_force_against_a_401_endpoint_leaves_the_existing_index_inta
     );
     let error = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
-        error.contains("HTTP 401") && error.contains("index was not modified"),
-        "rebuild_index must fail naming the 401 and the untouched index: {resp}"
+        error.contains(NOTHING_REMOVED),
+        "rebuild_index must fail saying nothing was removed from the index: {resp}"
+    );
+    // The reply carries the outermost message only, as it did before the
+    // probe: the endpoint's response body stays out of what an MCP caller
+    // sees (Local Codex r1 on AW-03).
+    assert!(
+        !error.contains(BODY_SENTINEL),
+        "the endpoint's response body reached the MCP reply: {resp}"
     );
     assert_dir_empty(&fx.cache);
 }

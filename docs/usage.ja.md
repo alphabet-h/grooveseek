@@ -58,7 +58,7 @@ probe しない理由は [ADR-0022](decisions/0022-embedding-provider-boundary.j
 例外は強制再構築だけで、`groove index --force` と MCP ツール `rebuild_index` の
 `force: true` は、まず固定の文字列 `GrooveSeek endpoint probe` (知識ベースの中身は
 含まない) を `document_model` で 1 件 embedding し、endpoint が断るか次元の違う
-応答を返したら、索引は変更していないと述べるエラーで止まる
+応答を返したら、索引から何も消していないと述べるエラーで止まる
 ([ADR-0024](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md))。
 `--force` が無ければ probe はしない。任意の `api_key` は
 bearer token として送られる。`GROOVE_EMBEDDING_API_KEY` が設定されていればそちらが

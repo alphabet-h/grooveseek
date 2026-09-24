@@ -97,10 +97,14 @@ the index. Nothing else probes.**
   to use — and runs the answer through the same checks every indexing response
   gets: HTTP status, vector count, index range and uniqueness, and the declared
   `dimension`. FastEmbed does nothing; its model is already loaded.
-- **On failure** the command stops with an error that says the index was not
-  modified, followed by the provider's own error (for example
-  `embedding endpoint returned HTTP 401: ...`). Over MCP that is the tool's
-  error reply.
+- **On failure** the command stops with an error that says nothing was removed
+  from the index. The provider's own error (for example
+  `embedding endpoint returned HTTP 401: ...`) is kept as its cause: the CLI
+  prints it below the message, while the MCP tool's error reply carries the
+  message alone, so the endpoint's response body does not reach an MCP caller.
+  The claim is about removal only: opening the database beforehand may already
+  have run its content-preserving schema migrations, as it does for every
+  command.
 - **Unchanged**: opening an index, `Config::validate`, `serve` startup, an
   incremental `index`, `search` and the watcher never probe. ADR-0022's rule
   stands for all of them; this record narrows it by the one exception above.
@@ -117,8 +121,8 @@ the index. Nothing else probes.**
 - **A database `--force` could not open is replaced before the probe.**
   `groove index --force` swaps out a file that is not a usable SQLite database
   (`open_or_replace_corrupt`, in `main.rs`'s `Commands::Index` arm) before
-  `rebuild_index` runs. If the probe then fails, the message still says the
-  index was not modified, but there was no usable index to keep.
+  `rebuild_index` runs. If the probe then fails, the message still says
+  nothing was removed from the index, but there was no usable index to keep.
 - **Text leaves the machine one request earlier than before.** It is the fixed
   string, not knowledge-base content, and it goes only where the operator has
   already chosen to send every chunk by running a forced rebuild.

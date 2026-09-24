@@ -558,15 +558,18 @@ impl Embedder {
     /// (ADR-0024). An OpenAI-compatible endpoint is sent one fixed text,
     /// [`ENDPOINT_PROBE_TEXT`], on the document side; FastEmbed does nothing.
     ///
-    /// The error says the index was not modified, because a caller runs this
-    /// before its reset and returns on failure.
+    /// The error says nothing was removed from the index, because a caller
+    /// runs this before its reset and returns on failure.
+    ///
+    /// That sentence is context and the provider's error stays its source:
+    /// the CLI prints the whole chain, HTTP status included, while the MCP
+    /// `rebuild_index {force: true}` reply shows the outermost message only,
+    /// so the endpoint's response body does not reach an MCP caller.
     pub fn probe_before_reset(&mut self) -> Result<()> {
-        self.provider.probe().map_err(|error| {
-            anyhow::anyhow!(
-                "the embedding endpoint check before the forced rebuild failed, \
-                 so the index was not modified: {error:#}"
-            )
-        })
+        self.provider.probe().context(
+            "the embedding endpoint check before the forced rebuild failed, \
+             so nothing was removed from the index",
+        )
     }
 
     /// 選択中のモデルの埋め込み次元数。

@@ -707,7 +707,7 @@ pub fn rebuild_index(
     // (AW-03, ADR-0024) `force` empties the index below, in a transaction of its own that
     // commits before the first document is embedded. Hear from the provider first, before
     // this function writes anything, so a wrong key or an endpoint that is down fails a run
-    // that has not touched the index. This is the only reset `index --force` and MCP
+    // that has removed nothing from the index. This is the only reset `index --force` and MCP
     // `rebuild_index {force: true}` both reach, so each sends exactly one probe.
     if force {
         embedder.probe_before_reset()?;
