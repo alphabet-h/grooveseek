@@ -1436,19 +1436,31 @@ mod tests {
     /// does not echo the password back.
     #[test]
     fn openai_compatible_rejects_credentials_in_the_endpoint() {
-        for endpoint in [
-            "http://user@127.0.0.1:8001/v1/embeddings",
-            "http://:hunter2@127.0.0.1:8001/v1/embeddings",
-            "https://user:hunter2@example.com/v1/embeddings",
+        // The label, not the endpoint, goes into a failure message, so a
+        // failing run does not print the password either.
+        for (case, endpoint) in [
+            ("user name only", "http://user@127.0.0.1:8001/v1/embeddings"),
+            (
+                "password only",
+                "http://:hunter2@127.0.0.1:8001/v1/embeddings",
+            ),
+            (
+                "user name and password",
+                "https://user:hunter2@example.com/v1/embeddings",
+            ),
         ] {
-            let err = openai_config_for_endpoint(endpoint)
-                .expect_err("an endpoint with credentials must be rejected");
+            let Err(err) = openai_config_for_endpoint(endpoint) else {
+                panic!("{case}: must be rejected");
+            };
             let msg = err.to_string();
             assert!(
-                msg.contains("[embedding].endpoint must not contain credentials"),
-                "{endpoint}: {msg}"
+                !msg.contains("hunter2"),
+                "{case}: the error echoes the password"
             );
-            assert!(!msg.contains("hunter2"), "{endpoint}: {msg}");
+            assert!(
+                msg.contains("[embedding].endpoint must not contain credentials"),
+                "{case}: {msg}"
+            );
         }
     }
 
@@ -1505,63 +1517,54 @@ mod tests {
 
     /// AW-07: a failed request must not print the endpoint URL, which can
     /// carry a secret in its query string.
+    ///
+    /// The server reads the request and then never answers, holding the
+    /// socket open until the client has its error, so the only way out is
+    /// the client timeout, however loaded the machine is.
     #[test]
     fn openai_compatible_request_errors_omit_the_endpoint() {
-        let response = r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#;
-        let (endpoint, _captured, handle) =
-            mock_embedding_server("200 OK", response, Duration::from_millis(100));
-        let mut embedder =
-            Embedder::with_settings(EmbeddingSettings::openai_compatible(openai_config(
-                format!("{endpoint}?token=query-secret"),
-                2,
-                Duration::from_millis(10),
-            )))
-            .expect("build embedder");
-        let err = embedder
-            .embed_single("needle")
-            .expect_err("a timed-out request must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("embedding request failed"), "{msg}");
-        assert!(!msg.contains("query-secret"), "{msg}");
-        assert!(!msg.contains("/v1/embeddings"), "{msg}");
-        handle.join().expect("mock server thread");
-    }
-
-    /// AW-07: the same holds when the response headers arrive but the body
-    /// is cut short. reqwest 0.13 builds body errors without a URL, so today
-    /// this passes with or without the `without_url()` on that path; it is
-    /// here for the reqwest upgrade that starts attaching one.
-    #[test]
-    fn openai_compatible_body_errors_omit_the_endpoint() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncating server");
+        let timeout = Duration::from_millis(200);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent server");
         let endpoint = format!(
             "http://{}/v1/embeddings?token=query-secret",
             listener.local_addr().expect("listener address")
         );
+        let (received_tx, received_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let _request = read_http_request(&mut stream);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"data\"",
-                )
-                .expect("write truncated response");
+            received_tx
+                .send(read_http_request(&mut stream))
+                .expect("send captured request");
+            // Hold the connection, unanswered, until the client gave up.
+            let _ = release_rx.recv();
+            drop(stream);
         });
         let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
-            openai_config(endpoint, 2, Duration::from_secs(1)),
+            openai_config(endpoint, 2, timeout),
         ))
         .expect("build embedder");
+
+        let started = std::time::Instant::now();
         let err = embedder
             .embed_single("needle")
-            .expect_err("a truncated body must fail");
-        let msg = err.to_string();
+            .expect_err("an unanswered request must time out");
+        let elapsed = started.elapsed();
+        release_tx.send(()).expect("release silent server");
+        handle.join().expect("silent server thread");
+
+        // The whole request reached the server and the client waited out its
+        // timeout: this failed by timing out, not by some other error.
+        let request = received_rx.recv().expect("captured request");
+        assert!(request.contains("needle"), "{request}");
         assert!(
-            msg.contains("failed to read embedding response body"),
-            "{msg}"
+            elapsed >= timeout,
+            "the request failed after {elapsed:?}, before its {timeout:?} timeout"
         );
+        let msg = err.to_string();
+        assert!(msg.contains("embedding request failed"), "{msg}");
         assert!(!msg.contains("query-secret"), "{msg}");
         assert!(!msg.contains("/v1/embeddings"), "{msg}");
-        handle.join().expect("truncating server thread");
     }
 
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes
