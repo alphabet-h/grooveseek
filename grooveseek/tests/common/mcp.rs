@@ -153,6 +153,20 @@ fn spawn_serve(
     extra_args: &[&str],
     startup: Duration,
 ) -> (ServerGuard, String) {
+    spawn_serve_configured(kb_path, config_path, watch, extra_args, startup, |_| {})
+}
+
+/// [`spawn_serve`] with a last say over the child's `Command` before it is
+/// spawned -- its environment, in practice. `configure` runs after the helper
+/// has set `RUST_LOG`, so a caller can override that too.
+fn spawn_serve_configured(
+    kb_path: &Path,
+    config_path: &Path,
+    watch: bool,
+    extra_args: &[&str],
+    startup: Duration,
+    configure: impl FnOnce(&mut Command),
+) -> (ServerGuard, String) {
     let bin = grooveseek_bin();
     assert!(
         bin.exists(),
@@ -189,13 +203,13 @@ fn spawn_serve(
     // so 21 of the 23 tests in `http_origin.rs` pass under `RUST_LOG=error`
     // with this line removed, and only the two that read warnings fail. The
     // filter is a warning-reading concern, not a startup one.
-    let child = Command::new(&bin)
-        .args(&args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(&args)
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn groove serve");
+        .stderr(Stdio::piped());
+    configure(&mut cmd);
+    let child = cmd.spawn().expect("spawn groove serve");
 
     let mut guard = ServerGuard {
         child: Some(child),
@@ -282,6 +296,23 @@ pub fn spawn_mcp_server_with_args(
 /// the moment `debouncer.watch()` succeeds, and [`spawn_serve`] waits for it.
 pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (ServerGuard, String) {
     spawn_serve(kb_path, config_path, true, &[], DEFAULT_STARTUP)
+}
+
+/// [`spawn_mcp_server`] / [`spawn_mcp_server_with_watch`] with the child's
+/// `Command` handed to `configure` before it is spawned.
+///
+/// Used by `tests/openai_compatible_provider.rs`, whose server must see a
+/// pinned environment (no proxy, no API key from the runner, an empty
+/// `FASTEMBED_CACHE_DIR`) to reach the in-process embeddings mock and nothing
+/// else. The spawning and the readiness wait stay here for the reason
+/// [`spawn_mcp_server_with_args`] gives.
+pub fn spawn_serve_with(
+    kb_path: &Path,
+    config_path: &Path,
+    watch: bool,
+    configure: impl FnOnce(&mut Command),
+) -> (ServerGuard, String) {
+    spawn_serve_configured(kb_path, config_path, watch, &[], DEFAULT_STARTUP, configure)
 }
 
 /// Stand up a one-document knowledge base with the given `groove.toml`, and
