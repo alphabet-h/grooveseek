@@ -532,3 +532,54 @@ fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
     drop(guard);
     assert_dir_empty(&fx.cache);
 }
+
+/// `graph` and `doctor` answer from the index alone.
+///
+/// `graph` resolves the embedding config only to check the index was built
+/// with it (`verify_embedding_meta`) and never builds an embedder, so it needs
+/// the same `--config` or that check refuses the index; `doctor` does not
+/// resolve it at all and runs no such check. Red if either starts embedding
+/// -- for `graph`, re-embedding the start document instead of reading its
+/// stored vectors.
+#[test]
+fn graph_and_doctor_never_contact_the_endpoint() {
+    let fx = fixture("groove-aw06-graph", None, "");
+    fx.index();
+    let connections = fx.mock.connection_count();
+    let requests = fx.mock.requests().len();
+
+    let graph = fx
+        .cmd()
+        .args(["graph", "--start", "alpha.md", "--kb-path"])
+        .arg(fx.kb())
+        .output()
+        .expect("spawn groove graph");
+    assert!(
+        graph.status.success(),
+        "groove graph failed: {}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+
+    let doctor = fx
+        .cmd()
+        .arg("doctor")
+        .arg("--kb-path")
+        .arg(fx.kb())
+        .output()
+        .expect("spawn groove doctor");
+    assert_eq!(
+        doctor.status.code(),
+        Some(0),
+        "groove doctor: stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+
+    assert_eq!(
+        fx.mock.connection_count(),
+        connections,
+        "graph or doctor opened a connection to the endpoint:\n{}",
+        describe(&fx.mock.requests()[requests..])
+    );
+    assert_dir_empty(&fx.cache);
+}
