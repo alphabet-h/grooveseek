@@ -1596,7 +1596,11 @@ impl Counter {
                 );
             }
             assert_eq!(pieces.first().map(|p| p.start), Some(0), "budget {budget}");
-            assert_eq!(pieces.last().map(|p| p.end), Some(src.len()), "budget {budget}");
+            assert_eq!(
+                pieces.last().map(|p| p.end),
+                Some(src.len()),
+                "budget {budget}"
+            );
             for w in pieces.windows(2) {
                 assert_eq!(w[0].end, w[1].start, "budget {budget}: {pieces:?}");
             }
@@ -1621,7 +1625,8 @@ impl Counter {
     fn the_source_from_issue_273_yields_no_empty_chunk() {
         // The shrunk proptest input from CI. The failing bounds were not recorded, so the
         // small end of each bound is swept, which is where a budget runs out one line early.
-        let src = "mod m0{\nmod m1{\ntype T2 = u8;\n}\n}\nfn g5(a: u32) -> u32 { a + 1 }fn f6(){}\n\n";
+        let src =
+            "mod m0{\nmod m1{\ntype T2 = u8;\n}\n}\nfn g5(a: u32) -> u32 { a + 1 }fn f6(){}\n\n";
         let grammar = static_rust::grammar().expect("rust grammar builds");
         for budget in 1usize..=40 {
             for scope_depth in 1usize..=3 {
@@ -1632,7 +1637,10 @@ impl Counter {
                         src.as_bytes(),
                         src,
                         "src/lib.rs",
-                        Bounds { scope_depth, chunks },
+                        Bounds {
+                            scope_depth,
+                            chunks,
+                        },
                     )
                     .expect("the issue's source parses");
                     for (i, chunk) in doc.chunks.iter().enumerate() {
