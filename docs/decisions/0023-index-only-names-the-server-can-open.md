@@ -39,7 +39,7 @@ fourth patch.**
   side and `get_document` must not be able to answer differently.
 - Nothing is lost that can be opened today; Unix keeps its names.
 
-## Considered options
+## Options considered
 
 1. **Index such names and make them readable** — open them through the
    verbatim prefix, and give them URIs. Rejected: every consumer of the path
@@ -51,7 +51,7 @@ fourth patch.**
    produced three findings in a row, and the next one would be the same patch.
 3. **One predicate, asked everywhere; leave such names out of the index.**
 
-## Decision outcome
+## Decision
 
 Chosen option: 3.
 
@@ -69,9 +69,12 @@ Chosen option: 3.
   spells it.
 - The watcher asks it after the extension filter, of the relative path it
   recovered from the event, so a path reached under another spelling of the
-  knowledge base is judged too. It asks for every event it lets through —
-  reindex, deindex and both ends of a rename — and for the files a newly
-  arrived directory brought in, so a rename onto such a name deindexes.
+  knowledge base is judged too. It asks wherever a row may be written — a
+  reindex, the new end of a rename, and the files a newly arrived directory
+  brought in — so a rename onto such a name deindexes. It does not ask where
+  a row is only removed: a delete, and the old end of a rename once the old
+  file is gone, so a row an earlier version stored under such a name leaves
+  with its file.
 - `get_document` asks it before the first stat. What its spelling check still
   answers is a name the index could hold that is not the document's one
   spelling: a case variant, an 8.3 short name, a symlinked directory.
@@ -80,11 +83,12 @@ Chosen option: 3.
   Until then `groove doctor` reports them on Windows as
   `name-not-spellable-on-windows`, from the database alone.
 
-### Consequences
+## Consequences
 
 - Good: a search hit always carries a name `get_document` and a `kb://doc/`
   URI accept; the next finding on this axis is a line in one function.
-- Good: `a?b.md` and `a.md.` get the misspelling answer without a look.
+- Good: on Windows, `a?b.md` and `a.md.` get the misspelling answer without a
+  look.
 - Bad: a Windows file named `CON.md` or kept under `dir./` is not searchable
   until it is renamed. The warning and the `Done in` count say so.
 - Bad: on Unix a file whose name holds `..` between backslashes (`a\..\b.md`),
@@ -93,9 +97,8 @@ Chosen option: 3.
   since its finding is Windows only; the next full index removes the row.
 - Neutral: a daemon started on an index built before this keeps such rows
   until a full index runs; on Windows `doctor` exits `1` over them meanwhile.
-  The watcher refuses such a name on a delete as well, so deleting the file,
-  or renaming it to a name the index can hold, leaves the old row in place
-  until that full index.
+  The watcher removes such a row sooner when its file goes: deleting the file
+  deindexes it, and renaming it to a name the index can hold moves the row.
 - Neutral: the test
   `the_spelling_refusal_names_nothing_for_spellings_the_lexical_check_lets_through`
   in `grooveseek/src/server.rs` was left unedited, as tests are in this
@@ -103,15 +106,12 @@ Chosen option: 3.
   the lexical check, so it no longer reaches the spelling check and its doc
   comment describes the older order. Both checks give the same reply, so what
   it asserts — the refusal names no path — still holds.
+- What the tests hold: unit tests in `grooveseek/src/resources.rs`,
+  `indexer.rs`, `watcher.rs`, `doctor.rs` and `server.rs` pin each clause per
+  platform, and `grooveseek/tests/index_unspellable_names.rs` runs
+  `groove index` on Windows over a knowledge base holding `CON.md`.
 
-### Confirmation
-
-Unit tests in `grooveseek/src/resources.rs`, `indexer.rs`, `watcher.rs`,
-`doctor.rs` and `server.rs` pin each clause per platform, and
-`grooveseek/tests/index_unspellable_names.rs` runs `groove index` on Windows
-over a knowledge base holding `CON.md`.
-
-## More information
+## References
 
 - [ADR-0004](./0004-resource-reads-are-bounded-by-the-index.md) — resource reads
   are bounded by the index.

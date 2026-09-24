@@ -59,9 +59,11 @@ URI は付かず `get_document` は拒否した (AW-43)。逆向きの穴もあ�
   出す (MCP の `rebuild_index` の返答には件数は載らない)。walk が名前を判定するのは、
   `kb_path` の綴りのままの KB の配下にあるパスだけ。
 - watcher は拡張子の判定の後で、イベントから取り戻した相対パスについて同じ述語に訊く。
-  だから KB の別の綴りで届いたパスも判定される。訊くのは通すイベントすべて —
-  reindex・deindex・rename の両端 — と、新しく現れたディレクトリが持ち込んだファイル。
-  そういう名前への rename は deindex になる。
+  だから KB の別の綴りで届いたパスも判定される。訊くのは行を書きうるところ —
+  reindex・rename の新しい側・新しく現れたディレクトリが持ち込んだファイル — で、
+  そういう名前への rename は deindex になる。行を消すだけのところ — 削除と、
+  旧ファイルがもう無い rename の旧い側 — では訊かないので、以前の版がそういう名前で
+  入れた行はファイルと一緒に出ていく。
 - `get_document` は最初の stat の前にこの述語に訊く。綴りの検査 (2b) に残るのは、
   索引が持ちうる名前だが文書の正規の綴りではないもの — 大文字小文字の揺れ・8.3 短縮名・
   symlink のディレクトリ経由 — だけ。
@@ -69,11 +71,11 @@ URI は付かず `get_document` は拒否した (AW-43)。逆向きの穴もあ�
   walk が集めなかったものを消す)。それまでは `groove doctor` が Windows で
   `name-not-spellable-on-windows` として、DB だけを見て報告する。
 
-### 帰結
+## 結果と代償
 
 - 良い: search hit は必ず `get_document` と `kb://doc/` URI が受け付ける名前を持つ。
   この軸の次の指摘は 1 関数の 1 行になる。
-- 良い: `a?b.md` や `a.md.` は、ディスクを見ずに綴り違いの答えを返す。
+- 良い: Windows で `a?b.md` や `a.md.` は、ディスクを見ずに綴り違いの答えを返す。
 - 悪い: Windows で `CON.md` という名前のファイル、`dir./` の配下のファイルは、
   名前を変えるまで検索に出ない。warning と `Done in` の件数がそれを伝える。
 - 悪い: Unix で、名前の中にバックスラッシュで挟まれた `..` を持つファイル
@@ -81,23 +83,21 @@ URI は付かず `get_document` は拒否した (AW-43)。逆向きの穴もあ�
   `groove doctor` の検出は Windows だけなので、以前の版がそれについて入れた行は
   報告されない。行は次の full index が消す。
 - 中立: この変更の前に作った索引で起動した daemon は、full index が走るまでその行を
-  持ち続ける。その間 Windows では `doctor` が終了コード `1` を返す。watcher は削除の
-  イベントでもそういう名前を拒否するので、ファイルを消しても、索引が持ちうる名前へ
-  rename しても、古い行はその full index まで残る。
+  持ち続ける。その間 Windows では `doctor` が終了コード `1` を返す。ファイルが
+  無くなれば watcher がそれより早くその行を消す: ファイルを消せば deindex し、
+  索引が持ちうる名前へ rename すれば行を付け替える。
 - 中立: `grooveseek/src/server.rs` のテスト
   `the_spelling_refusal_names_nothing_for_spellings_the_lexical_check_lets_through`
   は、このプロジェクトではテストを編集しないので、そのままにした。その入力
   (`./HiddenVault/a.md` など) は今は字句検査で拒否されるので、綴りの検査までは届かず、
   doc comment は以前の順序を説明したままになっている。2 つの検査は同じ返答を返すので、
   テストが確かめていること — 拒否がパスを名指ししない — は変わらず成り立つ。
+- テストが押さえていること: `grooveseek/src/resources.rs`・`indexer.rs`・`watcher.rs`・
+  `doctor.rs`・`server.rs` の unit test が各規則を OS ごとに固定し、
+  `grooveseek/tests/index_unspellable_names.rs` が Windows で `CON.md` を含む KB に
+  `groove index` を実行する。
 
-### 確認方法
-
-`grooveseek/src/resources.rs`・`indexer.rs`・`watcher.rs`・`doctor.rs`・`server.rs` の
-unit test が各規則を OS ごとに固定し、`grooveseek/tests/index_unspellable_names.rs` が
-Windows で `CON.md` を含む KB に `groove index` を実行する。
-
-## 補足
+## 参考
 
 - [ADR-0004](./0004-resource-reads-are-bounded-by-the-index.ja.md) — resource の read は索引で縛る
 - "Naming Files, Paths, and Namespaces":

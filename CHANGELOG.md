@@ -64,7 +64,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   `, N not indexed (...)` to its `Done in` line when there were any (the MCP
   `rebuild_index` reply does not carry that count). A row an earlier version
   stored for such a name is removed by the next `groove index` or
-  `rebuild_index`, not by the watcher; until then `groove doctor` reports it
+  `rebuild_index`, or by the watcher when the file is deleted or renamed to a
+  name the index can hold; until then `groove doctor` reports it
   as `name-not-spellable-on-windows` (a warning, so exit `1`). On every
   platform `get_document` now refuses a `.` or empty segment (`./a.md`,
   `a//b.md`, a trailing `/`) before anything on disk is looked at, and on
@@ -96,11 +97,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   as devices rather than files. A colon anywhere in the path is refused there
   too, which loses no document — no Windows file name can hold one — but
   closes the alternate data streams of a document (`note.md:secret`,
-  `note.md::$DATA`) to `get_document`.
+  `note.md::$DATA`) to `get_document`. Such a file is now left out of the
+  index as well; see the ADR-0023 entry above.
 - **On Linux and macOS, `get_document` no longer opens a file whose name holds
   `..` between backslashes**, such as one literally named `a\..\b.md`. Its
   `kb://doc/` URI was already refused for the same reason: nothing that reads
-  `\` as a separator is ever handed a `..`.
+  `\` as a separator is ever handed a `..`. Such a file is now left out of the
+  index as well; see the ADR-0023 entry above.
 
 ### Fixed
 
