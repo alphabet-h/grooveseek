@@ -2211,6 +2211,74 @@ mod tests {
         assert!(err.to_string().contains("external provider fields"));
     }
 
+    /// AW-07: FastEmbed refuses every HTTP-only key, not just the two above.
+    /// One key per case, so dropping any single arm of the check fails here.
+    #[test]
+    fn fastembed_embedding_rejects_every_http_only_field() {
+        let cases = [
+            (
+                "endpoint",
+                EmbeddingConfig {
+                    endpoint: Some("http://127.0.0.1:8001/v1/embeddings".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "dimension",
+                EmbeddingConfig {
+                    dimension: Some(768),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "request_dimensions",
+                EmbeddingConfig {
+                    request_dimensions: Some(true),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "api_key",
+                EmbeddingConfig {
+                    api_key: Some("config-secret".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "query_model",
+                EmbeddingConfig {
+                    query_model: Some("query-model".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "document_model",
+                EmbeddingConfig {
+                    document_model: Some("document-model".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "timeout_seconds",
+                EmbeddingConfig {
+                    timeout_seconds: Some(30),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+        ];
+        for (key, embedding) in cases {
+            let err = embedding
+                .resolve_fastembed(ModelChoice::default())
+                .expect_err("FastEmbed must reject an HTTP-only field");
+            assert!(
+                err.to_string().contains(
+                    "[embedding] external provider fields require provider = \"openai-compatible\""
+                ),
+                "{key}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn external_embedding_shared_model_populates_both_roles() {
         let mut embedding = external_embedding_config();

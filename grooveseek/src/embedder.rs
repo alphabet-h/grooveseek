@@ -1399,6 +1399,171 @@ mod tests {
         assert!(!debug.contains("fragment"));
     }
 
+    fn openai_config_for_endpoint(endpoint: &str) -> Result<OpenAiCompatibleConfig> {
+        OpenAiCompatibleConfig::new(
+            endpoint.to_string(),
+            "query".to_string(),
+            "document".to_string(),
+            2,
+            false,
+            None,
+            Duration::from_secs(1),
+        )
+    }
+
+    /// AW-07: the endpoint is where document text is sent, so only HTTP(S) is
+    /// accepted. Nothing else exercised this check.
+    #[test]
+    fn openai_compatible_rejects_a_non_http_endpoint() {
+        for endpoint in [
+            "ftp://127.0.0.1:8001/v1/embeddings",
+            "file:///v1/embeddings",
+            "ws://127.0.0.1:8001/v1/embeddings",
+        ] {
+            let err = openai_config_for_endpoint(endpoint)
+                .expect_err("a non-HTTP endpoint must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("[embedding].endpoint must use http or https"),
+                "{endpoint}: {err}"
+            );
+        }
+    }
+
+    /// AW-07: credentials in the endpoint would ride along in every request
+    /// and every diagnostic that prints the URL. A user name alone and a
+    /// password alone are each refused, not only the pair, and the refusal
+    /// does not echo the password back.
+    #[test]
+    fn openai_compatible_rejects_credentials_in_the_endpoint() {
+        for endpoint in [
+            "http://user@127.0.0.1:8001/v1/embeddings",
+            "http://:hunter2@127.0.0.1:8001/v1/embeddings",
+            "https://user:hunter2@example.com/v1/embeddings",
+        ] {
+            let err = openai_config_for_endpoint(endpoint)
+                .expect_err("an endpoint with credentials must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("[embedding].endpoint must not contain credentials"),
+                "{endpoint}: {msg}"
+            );
+            assert!(!msg.contains("hunter2"), "{endpoint}: {msg}");
+        }
+    }
+
+    /// AW-07: each role needs its own model. The config tests only leave out
+    /// `query_model`; a blank `document_model` has to fail as well.
+    #[test]
+    fn openai_compatible_requires_both_models() {
+        for (query, document) in [
+            ("query", ""),
+            ("query", "   "),
+            ("", "document"),
+            ("\t", "document"),
+        ] {
+            let err = OpenAiCompatibleConfig::new(
+                "http://127.0.0.1:8001/v1/embeddings".to_string(),
+                query.to_string(),
+                document.to_string(),
+                2,
+                false,
+                None,
+                Duration::from_secs(1),
+            )
+            .expect_err("a blank model must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("both `query_model` and `document_model`"),
+                "query={query:?} document={document:?}: {err}"
+            );
+        }
+    }
+
+    /// AW-07: a blank key must not become `Authorization: Bearer   `. Config
+    /// resolution filters blank keys too, which hid this filter from the
+    /// end-to-end test, so the constructor is called directly here.
+    #[test]
+    fn openai_compatible_drops_a_blank_api_key() {
+        let with_key = |api_key: &str| {
+            OpenAiCompatibleConfig::new(
+                "http://127.0.0.1:8001/v1/embeddings".to_string(),
+                "query".to_string(),
+                "document".to_string(),
+                2,
+                false,
+                Some(api_key.to_string()),
+                Duration::from_secs(1),
+            )
+            .expect("valid config")
+        };
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(with_key(blank).api_key, None, "{blank:?}");
+        }
+        assert_eq!(with_key("test-key").api_key.as_deref(), Some("test-key"));
+    }
+
+    /// AW-07: a failed request must not print the endpoint URL, which can
+    /// carry a secret in its query string.
+    #[test]
+    fn openai_compatible_request_errors_omit_the_endpoint() {
+        let response = r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#;
+        let (endpoint, _captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::from_millis(100));
+        let mut embedder =
+            Embedder::with_settings(EmbeddingSettings::openai_compatible(openai_config(
+                format!("{endpoint}?token=query-secret"),
+                2,
+                Duration::from_millis(10),
+            )))
+            .expect("build embedder");
+        let err = embedder
+            .embed_single("needle")
+            .expect_err("a timed-out request must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("embedding request failed"), "{msg}");
+        assert!(!msg.contains("query-secret"), "{msg}");
+        assert!(!msg.contains("/v1/embeddings"), "{msg}");
+        handle.join().expect("mock server thread");
+    }
+
+    /// AW-07: the same holds when the response headers arrive but the body
+    /// is cut short. reqwest 0.13 builds body errors without a URL, so today
+    /// this passes with or without the `without_url()` on that path; it is
+    /// here for the reqwest upgrade that starts attaching one.
+    #[test]
+    fn openai_compatible_body_errors_omit_the_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncating server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings?token=query-secret",
+            listener.local_addr().expect("listener address")
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_http_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"data\"",
+                )
+                .expect("write truncated response");
+        });
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+        let err = embedder
+            .embed_single("needle")
+            .expect_err("a truncated body must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to read embedding response body"),
+            "{msg}"
+        );
+        assert!(!msg.contains("query-secret"), "{msg}");
+        assert!(!msg.contains("/v1/embeddings"), "{msg}");
+        handle.join().expect("truncating server thread");
+    }
+
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes
     /// the model directory the process's working directory — which is the
     /// directory a planted config is trying to get models loaded from. An
