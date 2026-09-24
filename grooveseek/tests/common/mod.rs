@@ -32,6 +32,11 @@
 //!   code-parser tests read. Shared by the `#[ignore]` end-to-end suite
 //!   (`code_formats_cli.rs`) and the in-process one that runs on every pull
 //!   request (`code_formats_light.rs`, AV-16).
+//! - [`crate::common::embed_mock`] — a stand-in OpenAI-compatible embeddings
+//!   endpoint, the `groove.toml` that points at it, and the environment a
+//!   child `groove` needs to reach it and nothing else. One caller today
+//!   (`openai_compatible_provider.rs`, AW-06); here so the HTTP-error tests
+//!   that build on it (AW-03 / 04) reuse it rather than copy it.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -42,6 +47,7 @@
 pub mod ansi;
 pub mod code_fixtures;
 pub mod docs;
+pub mod embed_mock;
 pub mod eval_gate;
 pub mod mcp;
 pub mod source;
