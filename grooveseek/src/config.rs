@@ -2286,7 +2286,10 @@ mod tests {
         };
         top_level.validate().expect("top-level model alone");
         assert_eq!(
-            top_level.resolve_embedding_from(None, None).unwrap().model_id(),
+            top_level
+                .resolve_embedding_from(None, None)
+                .unwrap()
+                .model_id(),
             "bge-m3"
         );
 
@@ -2299,7 +2302,10 @@ mod tests {
         };
         sectioned.validate().expect("[embedding].model alone");
         assert_eq!(
-            sectioned.resolve_embedding_from(None, None).unwrap().model_id(),
+            sectioned
+                .resolve_embedding_from(None, None)
+                .unwrap()
+                .model_id(),
             "bge-m3"
         );
         assert_eq!(
