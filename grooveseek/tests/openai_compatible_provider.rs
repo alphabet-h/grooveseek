@@ -306,8 +306,8 @@ fn assert_dir_empty_fires_when_a_file_lands_in_the_cache() {
 
 /// Vector length the mock answers with and the config declares.
 const DIM: usize = 256;
-/// A word only `alpha.md` contains, to tell its text apart in what `index`
-/// sends.
+/// A word only `alpha.md` contains, to tell its text apart in what
+/// `groove index` sends.
 const ALPHA_MARKER: &str = "zebracornium";
 /// The body of `beta.md`.
 const BETA_BODY: &str = "A tokio runtime worker thread must not block on network input or output.";
@@ -471,7 +471,8 @@ fn describe(reqs: &[Recorded]) -> String {
 ///
 /// The query is [`BETA_PROBE`], which the keyword side cannot find, so
 /// `beta.md` ranks first only through the vectors: the one [`steered_response`]
-/// returned for the query and the ones `index` stored for the documents.
+/// returned for the query and the ones `groove index` stored for the
+/// documents.
 ///
 /// Red if the query side sends `document_model` (the two sides are not
 /// interchangeable; see [`grooveseek::embedder`]), if either command stops
