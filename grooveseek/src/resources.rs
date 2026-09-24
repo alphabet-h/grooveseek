@@ -191,13 +191,13 @@ pub fn doc_is_addressable(rel: &str) -> bool {
 /// does so in [`parse`], for a URI being read, and before a URI is handed out;
 /// [`parse`] asks this function directly only for a topic prefix. The path
 /// check in [`crate::server`] behind `get_document` and `get_best_practice`
-/// asks it of the requested string before anything on disk
-/// is looked at (AW-01): `Path::join` replaces the knowledge base with an
-/// absolute right-hand side, so an absolute path, a drive or a UNC share would
-/// otherwise be stat'ed wherever it points -- outside the knowledge base, or
-/// across the network on Windows. Document names go through
-/// [`doc_is_addressable`], which adds what only a document name has to satisfy
-/// (not empty, no `.` or empty segment); topic prefixes come here directly.
+/// asks [`doc_is_addressable`] of the requested string before anything on
+/// disk is looked at (AW-01, ADR-0023): `Path::join` replaces the knowledge
+/// base with an absolute right-hand side, so an absolute path, a drive or a
+/// UNC share would otherwise be stat'ed wherever it points -- outside the
+/// knowledge base, or across the network on Windows. [`doc_is_addressable`]
+/// adds what only a document name has to satisfy (not empty, no `.` or empty
+/// segment); topic prefixes come here directly.
 /// Neither surface keeps a copy of the rule
 /// (AGENTS.md, "One question gets one implementation"). The empty string
 /// passes here: [`parse`] reads it as the root topic group.

@@ -140,9 +140,10 @@ impl<'a> ServableRules<'a> {
     /// The last condition is about the URI rather than the document: a path
     /// [`crate::resources::parse`] would not read back gets no link. It is the
     /// predicate that parser itself runs, so the side that offers and the side that
-    /// opens cannot disagree. Of the paths an index can hold, the only one it
-    /// turns away is a Unix file with a `..` between backslashes in its name,
-    /// which `get_document` still opens.
+    /// opens cannot disagree. Since ADR-0023 the index walk asks it as well, so a
+    /// path the index holds is turned away here only when an earlier version
+    /// stored it; `groove doctor` names those on Windows
+    /// (`name-not-spellable-on-windows`), and the next `groove index` removes them.
     pub(crate) fn allows(&self, path: &str) -> bool {
         self.sizes_known
             && crate::indexer::extension_is_registered(path, self.registry)
