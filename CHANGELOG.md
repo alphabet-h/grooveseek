@@ -157,7 +157,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   out as a whitespace-only chunk that was embedded and indexed. A line with no
   visible characters now never starts a piece. `groove doctor` now reports
   indexes that still hold such chunks (`blank-code-chunks`), and
-  `groove index --force` removes them. (#273)
+  `groove index --force` removes them. The check reads a partial index
+  (`idx_chunks_blank`) that is created on open, idempotently, for new and
+  existing databases alike: on a synthetic 300,000-chunk index the first open
+  spent about 6 s building it, once, and the check then takes about 1 ms
+  instead of about 5 s. (#273)
 
 ## [1.13.0] - 2026-09-23
 
