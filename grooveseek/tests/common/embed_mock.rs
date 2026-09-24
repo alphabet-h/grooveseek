@@ -35,9 +35,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// The `document_model` [`openai_config_toml`] writes.
+/// The `document_model` ([`grooveseek::config::EmbeddingConfig::document_model`])
+/// [`openai_config_toml`] writes.
 pub const DOC_MODEL: &str = "doc-model";
-/// The `query_model` [`openai_config_toml`] writes.
+/// The `query_model` ([`grooveseek::config::EmbeddingConfig::query_model`])
+/// [`openai_config_toml`] writes.
 pub const QUERY_MODEL: &str = "query-model";
 
 /// How long a mock may live. A leaked one stops on its own after this.
@@ -232,7 +234,8 @@ impl EmbedMock {
         self.addr
     }
 
-    /// The full endpoint URL, `/v1/embeddings` included, as `[embedding].endpoint` wants it.
+    /// The full endpoint URL, `/v1/embeddings` included, as `[embedding].endpoint`
+    /// ([`grooveseek::config::EmbeddingConfig::endpoint`]) wants it.
     pub fn endpoint(&self) -> String {
         format!("http://{}/v1/embeddings", self.addr)
     }
@@ -446,10 +449,14 @@ fn reason(status: u16) -> &'static str {
 /// A `groove.toml` that selects the OpenAI-compatible provider at `endpoint`.
 ///
 /// Pass it with `--config` **before** the subcommand: a config found by
-/// discovery has its `[embedding]` section dropped (R7, [`grooveseek::config`]). No
-/// top-level `model` (refused with this provider) and no reranker (it would
-/// download one). `timeout_seconds` is short so a mock that stops answering
-/// fails the test inside its deadline rather than after the 60 s default.
+/// discovery has its `[embedding]` section
+/// ([`grooveseek::config::Config::embedding`]) dropped (R7,
+/// [`grooveseek::config`]). No top-level `model`
+/// ([`grooveseek::config::Config::model`], refused with this provider) and no
+/// reranker (it would download one). `timeout_seconds`
+/// ([`grooveseek::config::EmbeddingConfig::timeout_seconds`]) is short so a
+/// mock that stops answering fails the test inside its deadline rather than
+/// after the 60 s default.
 pub fn openai_config_toml(endpoint: &str, api_key: Option<&str>, dimension: usize) -> String {
     let mut s = format!(
         "[embedding]\n\
@@ -482,9 +489,9 @@ fn toml_str(s: &str) -> String {
 /// Pin the environment a child `groove` sees, so it reaches the mock and
 /// nothing else.
 ///
-/// - `GROOVE_EMBEDDING_API_KEY` is removed: it overrides `api_key`, and a
-///   developer's real key would both leak to the mock and break the
-///   authorization test.
+/// - `GROOVE_EMBEDDING_API_KEY` is removed: it overrides `api_key`
+///   ([`grooveseek::config::EmbeddingConfig::api_key`]), and a developer's
+///   real key would both leak to the mock and break the authorization test.
 /// - Proxy variables are removed (both cases; reqwest reads either) and
 ///   `NO_PROXY` covers loopback, so a runner's proxy never sees the request.
 /// - `FASTEMBED_CACHE_DIR` points at `fastembed_dir`, which the caller keeps

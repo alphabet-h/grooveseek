@@ -35,7 +35,7 @@
 //! - [`crate::common::embed_mock`] — a stand-in OpenAI-compatible embeddings
 //!   endpoint, the `groove.toml` that points at it, and the environment a
 //!   child `groove` needs to reach it and nothing else. One caller today
-//!   (`openai_compatible_provider.rs`, AW-06); here so the HTTP-error tests
+//!   (the AW-06 OpenAI-compatible provider tests); here so the HTTP-error tests
 //!   that build on it (AW-03 / 04) reuse it rather than copy it.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is

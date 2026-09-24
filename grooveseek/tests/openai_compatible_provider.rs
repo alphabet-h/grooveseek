@@ -1,8 +1,10 @@
 //! AW-06: the OpenAI-compatible embedding provider, driven end to end.
 //!
-//! `[embedding] provider = "openai-compatible"` reaches the network from four
-//! places -- `groove index`, `groove search`, the MCP `search` tool and the
-//! file watcher -- and none of them had a test on the pull-request gate. These
+//! `[embedding] provider = "openai-compatible"`
+//! ([`grooveseek::config::EmbeddingConfig::provider`]) reaches the network
+//! from four places -- `groove index`, `groove search`, the MCP `search` tool
+//! and the file watcher -- and none of them had a test on the pull-request
+//! gate. These
 //! run a stand-in endpoint inside the test process
 //! ([`crate::common::embed_mock`]), so nothing is downloaded and nothing is
 //! `#[ignore]`d.
@@ -397,9 +399,9 @@ fn steered_response(req: &Recorded) -> MockResponse {
 /// points at the mock.
 ///
 /// Fields drop in declaration order: the mock first, the directories last,
-/// so nothing is removed from under a thread still using it. A `ServerGuard`
-/// a test holds is a separate local declared after its `Fixture` and so
-/// drops before it.
+/// so nothing is removed from under a thread still using it. A
+/// [`crate::common::mcp::ServerGuard`] a test holds is a separate local
+/// declared after its [`Fixture`] and so drops before it.
 struct Fixture {
     mock: EmbedMock,
     config: PathBuf,
@@ -513,9 +515,10 @@ fn describe(reqs: &[Recorded]) -> String {
         .join("\n")
 }
 
-/// `groove index` embeds with `document_model`, `groove search` with
-/// `query_model`, and the vectors that come back are the ones the ranking
-/// uses.
+/// `groove index` embeds with `document_model`
+/// ([`grooveseek::config::EmbeddingConfig::document_model`]), `groove search`
+/// with `query_model` ([`grooveseek::config::EmbeddingConfig::query_model`]),
+/// and the vectors that come back are the ones the ranking uses.
 ///
 /// The query is [`BETA_PROBE`], which the keyword side cannot find, so
 /// `beta.md` ranks first only through the vectors: the one [`steered_response`]
@@ -586,7 +589,8 @@ fn mcp_search_args(query: &str) -> serde_json::Value {
 /// side, from inside the server's runtime, and ranks by the vector it got
 /// back ([`BETA_PROBE`], as in the CLI round trip).
 ///
-/// Red if the server's search path sends `document_model`, loses the
+/// Red if the server's search path sends `document_model`
+/// ([`grooveseek::config::EmbeddingConfig::document_model`]), loses the
 /// endpoint (the config reaches `serve` only through `--config`), or stops
 /// ranking by the returned vector.
 #[test]
@@ -705,11 +709,11 @@ fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
 /// `groove graph` and `groove doctor` answer from the index alone.
 ///
 /// `groove graph` resolves the embedding config only to check the index was
-/// built with it (see verify_embedding_meta in [`grooveseek::db`]) and never
-/// builds an embedder, so it needs the same `--config` or that check refuses
-/// the index; `groove doctor` does not resolve it at all and runs no such
-/// check. Red if either starts embedding -- for `groove graph`, re-embedding
-/// the start document instead of reading its stored vectors.
+/// built with it ([`grooveseek::db::Database::verify_embedding_meta`]) and
+/// never builds an embedder, so it needs the same `--config` or that check
+/// refuses the index; `groove doctor` does not resolve it at all and runs no
+/// such check. Red if either starts embedding -- for `groove graph`,
+/// re-embedding the start document instead of reading its stored vectors.
 #[test]
 fn graph_and_doctor_never_contact_the_endpoint() {
     let fx = fixture("groove-aw06-graph", None, "");
@@ -753,15 +757,16 @@ fn graph_and_doctor_never_contact_the_endpoint() {
     assert_dir_empty(&fx.cache);
 }
 
-/// A missing or blank `api_key` sends no `Authorization` header; a real one
-/// sends `Bearer <key>`.
+/// A missing or blank `api_key`
+/// ([`grooveseek::config::EmbeddingConfig::api_key`]) sends no
+/// `Authorization` header; a real one sends `Bearer <key>`.
 ///
 /// Table-driven, one knowledge base per row. The third row is the control:
 /// without it, "no header" would also pass when the mock lost headers.
-/// Blank keys are filtered twice (resolve_embedding_api_key in
-/// [`grooveseek::config`], and OpenAiCompatibleConfig::new in
-/// [`grooveseek::embedder`]); this test goes through the config, so it is red
-/// only when both filters are gone.
+/// Blank keys are filtered twice (resolve_embedding_api_key, private to
+/// [`grooveseek::config`], and
+/// [`grooveseek::embedder::OpenAiCompatibleConfig::new`]); this test goes
+/// through the config, so it is red only when both filters are gone.
 #[test]
 fn no_authorization_header_is_sent_when_the_api_key_is_absent_or_blank() {
     let cases: [(Option<&str>, Option<&str>); 3] = [

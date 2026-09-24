@@ -333,10 +333,10 @@ pub fn spawn_mcp_server_with_watch(kb_path: &Path, config_path: &Path) -> (Serve
 /// [`spawn_mcp_server`] / [`spawn_mcp_server_with_watch`] with the child's
 /// `Command` handed to `configure` before it is spawned.
 ///
-/// Used by `tests/openai_compatible_provider.rs`, whose server must see a
-/// pinned environment (no proxy, no API key from the runner, an empty
-/// `FASTEMBED_CACHE_DIR`) to reach the in-process embeddings mock and nothing
-/// else. The spawning and the readiness wait stay here for the reason
+/// Used by the AW-06 OpenAI-compatible provider tests, whose server must see
+/// a pinned environment (no proxy, no API key from the runner, an empty
+/// `FASTEMBED_CACHE_DIR`) to reach the in-process embeddings mock
+/// ([`crate::common::embed_mock`]) and nothing else. The spawning and the readiness wait stay here for the reason
 /// [`spawn_mcp_server_with_args`] gives.
 pub fn spawn_serve_with(
     kb_path: &Path,
