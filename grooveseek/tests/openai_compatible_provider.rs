@@ -11,9 +11,10 @@
 
 mod common;
 
+use common::ansi::strip_ansi;
 use common::embed_mock::{
     DOC_MODEL, EmbedMock, QUERY_MODEL, Recorded, assert_dir_empty, embed_text, hermetic,
-    openai_config_toml,
+    openai_config_toml, wait_until,
 };
 use common::mcp::{grooveseek_bin, mcp_initialize, mcp_search_call, spawn_serve_with};
 use common::temp::TempKbLayout;
@@ -449,6 +450,85 @@ fn the_mcp_search_tool_embeds_the_query_through_the_http_provider() {
     assert_eq!(new[0].model(), Some(QUERY_MODEL));
     assert_eq!(new[0].inputs(), vec![ALPHA_MARKER.to_string()]);
     assert!(top_path(&resp).ends_with("alpha.md"), "{resp}");
+    drop(guard);
+    assert_dir_empty(&fx.cache);
+}
+
+/// A word only the file written while the server runs contains.
+const FRESH_MARKER: &str = "quillfeatherstone";
+
+/// The watcher embeds a new file through the provider without panicking.
+///
+/// The provider's HTTP client is reqwest's blocking one, and every blocking
+/// send enters reqwest's blocking wait, which in a debug build panics when it
+/// runs on a tokio worker thread. `run_watch_loop` keeps it off the workers by
+/// handing each event batch to `spawn_blocking` around `handle_events`; red if
+/// that `spawn_blocking` is removed. The file is written before any MCP call,
+/// so the watcher makes this server's first embed and nothing else has
+/// touched the client before it.
+#[test]
+fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
+    let fx = fixture(
+        "groove-aw06-watch",
+        None,
+        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
+    );
+    fx.index();
+
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
+        hermetic(c, &fx.cache);
+    });
+    // `spawn_serve_with(.., true, ..)` returns only after `watcher: watching`,
+    // so the write below cannot fall before the debouncer is armed.
+    fx.layout.write(
+        "fresh.md",
+        &format!(
+            "---\ntitle: Fresh\n---\n\n## Fresh\n\nThe {FRESH_MARKER} arrived after the server started.\n"
+        ),
+    );
+
+    let stderr = || -> Vec<String> {
+        guard
+            .stderr()
+            .lines()
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect()
+    };
+    let embedded = fx.mock.wait_for(Duration::from_secs(30), |reqs| {
+        reqs.iter().any(|r| {
+            r.model() == Some(DOC_MODEL) && r.inputs().iter().any(|i| i.contains(FRESH_MARKER))
+        })
+    });
+    let reindexed = wait_until(Duration::from_secs(30), || {
+        stderr()
+            .iter()
+            .any(|l| l.contains("watcher: reindexed fresh.md"))
+    });
+    // Checked first so that, when the watcher panics, the panic is what the
+    // failure says; the two waits above have to be over by now, or a panic
+    // line not yet written would pass this.
+    let lines = stderr();
+    assert!(
+        !lines.iter().any(|l| l.contains("panicked")),
+        "the watcher panicked:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        embedded,
+        "the watcher never sent fresh.md to the endpoint with the document model:\n{}\nstderr:\n{}",
+        describe(&fx.mock.requests()),
+        lines.join("\n")
+    );
+    assert!(
+        reindexed,
+        "no `watcher: reindexed fresh.md` line:\n{}",
+        lines.join("\n")
+    );
+
+    let session = mcp_initialize(&base);
+    let resp = mcp_search_call(&base, &session, mcp_search_args(FRESH_MARKER));
+    assert!(top_path(&resp).ends_with("fresh.md"), "{resp}");
     drop(guard);
     assert_dir_empty(&fx.cache);
 }
