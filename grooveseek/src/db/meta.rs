@@ -784,7 +784,7 @@ impl Database {
         )
     }
 
-    /// Source files holding a chunk with no visible text, in path order (#273).
+    /// Source files holding a chunk with no visible text, in path order (#326).
     ///
     /// A build before the fix could cut a piece of bare newlines off the end of a line-chunked
     /// file, and an unchanged file never reaches the parser again, so the row stays. The

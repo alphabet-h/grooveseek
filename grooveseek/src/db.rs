@@ -2260,7 +2260,7 @@ mod tests {
         );
     }
 
-    /// (#273) `groove doctor` asks for blank code chunks on every run, and a clean index has
+    /// (#326) `groove doctor` asks for blank code chunks on every run, and a clean index has
     /// none. Walking every chunk to find that out cost ~5 s on 300k chunks; the partial
     /// index holds only the blank rows, so the answer costs what the leftovers cost. Assert
     /// the plan, not the clock, as the seed-read test above does.

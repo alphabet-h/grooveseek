@@ -161,7 +161,7 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   (`idx_chunks_blank`) that is created on open, idempotently, for new and
   existing databases alike: on a synthetic 300,000-chunk index the first open
   spent about 6 s building it, once, and the check then takes about 1 ms
-  instead of about 5 s. (#273)
+  instead of about 5 s. (#326)
 
 ## [1.13.0] - 2026-09-23
 

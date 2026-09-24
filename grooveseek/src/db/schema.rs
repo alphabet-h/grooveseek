@@ -225,7 +225,7 @@ impl Database {
         Ok(())
     }
 
-    /// A partial index over the chunks whose content is empty (idempotent, #273).
+    /// A partial index over the chunks whose content is empty (idempotent, #326).
     ///
     /// `groove doctor` asks on every run which source files still hold a blank chunk an
     /// older build left behind ([`Database::source_files_with_blank_chunks`]), and a clean

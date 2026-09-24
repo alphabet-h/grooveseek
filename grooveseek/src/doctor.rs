@@ -348,7 +348,7 @@ pub fn run(
         });
     }
 
-    // (#273) Asked of the stored chunks rather than folded into the generation above: that
+    // (#326) Asked of the stored chunks rather than folded into the generation above: that
     // one records how an oversized file is handled, and bumping it would send every index with
     // source files to --force whether it holds a blank chunk or not. This one is exact.
     let scan = db.source_files_with_blank_chunks(SAMPLE_LIMIT)?;
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     /// Add a document at the given path whose chunks store `contents`, each with a line range or none
-    /// -- one blank entry is the shape a build before #273 could leave in a source file.
+    /// -- one blank entry is the shape a build before #326 could leave in a source file.
     fn with_chunks(db: &Database, path: &str, contents: &[&str], line_numbers: bool) {
         let doc = db
             .upsert_document(path, Some("T"), None, None, None, &[], None, "h3", 12)
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn a_source_file_holding_a_blank_chunk_is_reported() {
-        // #273: an unchanged file never reaches the parser again, so the empty chunk an older
+        // #326: an unchanged file never reaches the parser again, so the empty chunk an older
         // build wrote stays until something says so. The parser trims a chunk's end, so the
         // real leftover is stored as '' -- the only shape the fixtures below use.
         let db = db_with_one_chunk();

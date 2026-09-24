@@ -1584,7 +1584,7 @@ impl Counter {
 
     #[test]
     fn split_by_lines_does_not_cut_a_whitespace_only_piece() {
-        // Issue #273: once a line has overrun the budget on its own, a trailing blank line
+        // #326: once a line has overrun the budget on its own, a trailing blank line
         // weighs nothing but still tripped the cut, leaving a piece of bare newlines behind.
         let src = "ab\ncd\n\n\n";
         for budget in 1usize..=4 {
@@ -1609,7 +1609,7 @@ impl Counter {
 
     #[test]
     fn a_trailing_blank_line_does_not_become_an_empty_chunk() {
-        // Issue #273, through the line fallback: a nested module refused by a scope limit of
+        // #326, through the line fallback: a nested module refused by a scope limit of
         // one, with the budget already spent by the line before the blank ones.
         let doc = parse_capped_with("mod m{fn f(){}}\n\n", 1, 1);
         for (i, chunk) in doc.chunks.iter().enumerate() {
