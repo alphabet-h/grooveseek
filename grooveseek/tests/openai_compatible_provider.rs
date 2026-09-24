@@ -592,7 +592,7 @@ fn graph_and_doctor_never_contact_the_endpoint() {
 /// Table-driven, one knowledge base per row. The third row is the control:
 /// without it, "no header" would also pass when the mock lost headers.
 /// Blank keys are filtered twice (resolve_embedding_api_key in
-/// [`grooveseek::config`], and `OpenAiCompatibleConfig::new` in
+/// [`grooveseek::config`], and OpenAiCompatibleConfig::new in
 /// [`grooveseek::embedder`]); this test goes through the config, so it is red
 /// only when both filters are gone.
 #[test]
