@@ -2292,6 +2292,13 @@ mod tests {
                 .model_id(),
             "bge-m3"
         );
+        assert_eq!(
+            top_level
+                .resolve_embedding_from(Some(ModelChoice::BgeSmallEnV15), None)
+                .unwrap()
+                .model_id(),
+            "bge-small-en-v1.5"
+        );
 
         let sectioned = Config {
             embedding: Some(EmbeddingConfig {
@@ -2314,6 +2321,41 @@ mod tests {
                 .unwrap()
                 .model_id(),
             "bge-small-en-v1.5"
+        );
+    }
+
+    /// AW-10 docs: with openai-compatible, the shared `model` and one role
+    /// alias may be set together. The alias wins for its role and the shared
+    /// alias serves the other one. The identity is spelled
+    /// `openai-compatible:{document}|{query}:{digest}`.
+    #[test]
+    fn external_embedding_shared_model_fills_the_role_its_alias_leaves_unset() {
+        let resolve = |query_model: Option<&str>, document_model: Option<&str>| {
+            let mut embedding = external_embedding_config();
+            embedding.model = Some("shared-model".to_string());
+            embedding.query_model = query_model.map(str::to_string);
+            embedding.document_model = document_model.map(str::to_string);
+            let cfg = Config {
+                embedding: Some(embedding),
+                ..Config::default()
+            };
+            cfg.validate().expect("shared model plus one role alias");
+            cfg.resolve_embedding_from(None, None)
+                .expect("shared model plus one role alias")
+                .model_id()
+                .to_string()
+        };
+
+        let query_alias = resolve(Some("query-model"), None);
+        assert!(
+            query_alias.starts_with("openai-compatible:shared-model|query-model:"),
+            "{query_alias}"
+        );
+
+        let document_alias = resolve(None, Some("document-model"));
+        assert!(
+            document_alias.starts_with("openai-compatible:document-model|shared-model:"),
+            "{document_alias}"
         );
     }
 
