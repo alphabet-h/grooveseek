@@ -3,8 +3,9 @@
 //! `[embedding] provider = "openai-compatible"` reaches the network from four
 //! places -- `groove index`, `groove search`, the MCP `search` tool and the
 //! file watcher -- and none of them had a test on the pull-request gate. These
-//! run a stand-in endpoint inside the test process (`common::embed_mock`), so
-//! nothing is downloaded and nothing is `#[ignore]`d.
+//! run a stand-in endpoint inside the test process
+//! ([`crate::common::embed_mock`]), so nothing is downloaded and nothing is
+//! `#[ignore]`d.
 //!
 //! What each test pins, and the change that turns it red, is written next to
 //! the test.
@@ -13,8 +14,8 @@ mod common;
 
 use common::ansi::strip_ansi;
 use common::embed_mock::{
-    DOC_MODEL, EmbedMock, QUERY_MODEL, Recorded, assert_dir_empty, embed_text, hermetic,
-    openai_config_toml, wait_until,
+    DOC_MODEL, EmbedMock, MockResponse, QUERY_MODEL, Recorded, assert_dir_empty, default_response,
+    embed_text, hermetic, openai_config_toml, wait_until,
 };
 use common::mcp::{grooveseek_bin, mcp_initialize, mcp_search_call, spawn_serve_with};
 use common::temp::TempKbLayout;
@@ -305,9 +306,44 @@ fn assert_dir_empty_fires_when_a_file_lands_in_the_cache() {
 
 /// Vector length the mock answers with and the config declares.
 const DIM: usize = 256;
-/// A word only `alpha.md` contains, so a query for it has one right answer
-/// on both the vector and the keyword side.
+/// A word only `alpha.md` contains, to tell its text apart in what `index`
+/// sends.
 const ALPHA_MARKER: &str = "zebracornium";
+/// The body of `beta.md`.
+const BETA_BODY: &str = "A tokio runtime worker thread must not block on network input or output.";
+/// A query that is a substring of no document, path or title, so the keyword
+/// side finds nothing for it. [`steered_response`] answers it with
+/// [`BETA_BODY`]'s vector, so the only way `beta.md` ranks first for it is
+/// through the vector the endpoint returned.
+const BETA_PROBE: &str = "qxjvwk";
+
+/// Where a probe query's vector points: at one document's text.
+fn probe_target(query: &str) -> Option<&'static str> {
+    match query {
+        BETA_PROBE => Some(BETA_BODY),
+        FRESH_PROBE => Some(FRESH_BODY),
+        _ => None,
+    }
+}
+
+/// The mock's answer: [`default_response`], except that a probe query (see
+/// [`probe_target`]) sent with the query model gets the vector of the text it
+/// points at.
+///
+/// Without this a search result proves nothing about the vectors: a query
+/// word that is also in the document ranks it first through the keyword side
+/// alone, whatever vector came back.
+fn steered_response(req: &Recorded) -> MockResponse {
+    if req.model() == Some(QUERY_MODEL)
+        && let [query] = req.inputs().as_slice()
+        && let Some(target) = probe_target(query)
+    {
+        let mut steered = req.clone();
+        steered.body["input"] = serde_json::json!([target]);
+        return default_response(&steered, DIM);
+    }
+    default_response(req, DIM)
+}
 
 /// A two-document knowledge base, a mock endpoint, and a `groove.toml` that
 /// points at the mock.
@@ -334,10 +370,9 @@ fn fixture(prefix: &str, api_key: Option<&str>, extra_toml: &str) -> Fixture {
     );
     layout.write(
         "beta.md",
-        "---\ntitle: Beta\n---\n\n## Runtime\n\nA tokio runtime worker thread must not \
-         block on network input or output.\n",
+        &format!("---\ntitle: Beta\n---\n\n## Runtime\n\n{BETA_BODY}\n"),
     );
-    let mock = EmbedMock::start(DIM);
+    let mock = EmbedMock::with_responder(steered_response);
     let config = layout.root().join("groove.toml");
     std::fs::write(
         &config,
@@ -434,9 +469,14 @@ fn describe(reqs: &[Recorded]) -> String {
 /// `query_model`, and the vectors that come back are the ones the ranking
 /// uses.
 ///
+/// The query is [`BETA_PROBE`], which the keyword side cannot find, so
+/// `beta.md` ranks first only through the vectors: the one [`steered_response`]
+/// returned for the query and the ones `index` stored for the documents.
+///
 /// Red if the query side sends `document_model` (the two sides are not
-/// interchangeable; see [`grooveseek::embedder`]), or if either command
-/// stops reaching the endpoint.
+/// interchangeable; see [`grooveseek::embedder`]), if either command stops
+/// reaching the endpoint, or if the returned vectors stop deciding the
+/// ranking.
 #[test]
 fn index_then_search_round_trips_through_an_openai_compatible_endpoint() {
     let fx = fixture("groove-aw06-cli", None, "");
@@ -458,7 +498,7 @@ fn index_then_search_round_trips_through_an_openai_compatible_endpoint() {
         describe(&indexed)
     );
 
-    let resp = fx.search_cli(ALPHA_MARKER);
+    let resp = fx.search_cli(BETA_PROBE);
     let all = fx.mock.requests();
     let new = &all[indexed.len()..];
     assert_eq!(
@@ -472,10 +512,10 @@ fn index_then_search_round_trips_through_an_openai_compatible_endpoint() {
         Some(QUERY_MODEL),
         "search must name the query model"
     );
-    assert_eq!(new[0].inputs(), vec![ALPHA_MARKER.to_string()]);
+    assert_eq!(new[0].inputs(), vec![BETA_PROBE.to_string()]);
     assert!(
-        top_path(&resp).ends_with("alpha.md"),
-        "the document sharing the query's word must rank first: {resp}"
+        top_path(&resp).ends_with("beta.md"),
+        "the document the query's vector points at must rank first: {resp}"
     );
     assert_dir_empty(&fx.cache);
 }
@@ -494,10 +534,12 @@ fn mcp_search_args(query: &str) -> serde_json::Value {
 }
 
 /// The MCP `search` tool embeds its query through the provider, on the query
-/// side, from inside the server's runtime.
+/// side, from inside the server's runtime, and ranks by the vector it got
+/// back ([`BETA_PROBE`], as in the CLI round trip).
 ///
-/// Red if the server's search path sends `document_model`, or loses the
-/// endpoint (the config reaches `serve` only through `--config`).
+/// Red if the server's search path sends `document_model`, loses the
+/// endpoint (the config reaches `serve` only through `--config`), or stops
+/// ranking by the returned vector.
 #[test]
 fn the_mcp_search_tool_embeds_the_query_through_the_http_provider() {
     let fx = fixture("groove-aw06-mcp", None, "");
@@ -508,7 +550,7 @@ fn the_mcp_search_tool_embeds_the_query_through_the_http_provider() {
         hermetic(c, &fx.cache);
     });
     let session = mcp_initialize(&base);
-    let resp = mcp_search_call(&base, &session, mcp_search_args(ALPHA_MARKER));
+    let resp = mcp_search_call(&base, &session, mcp_search_args(BETA_PROBE));
 
     let all = fx.mock.requests();
     let new = &all[before..];
@@ -520,14 +562,19 @@ fn the_mcp_search_tool_embeds_the_query_through_the_http_provider() {
         guard.stderr().lines().join("\n")
     );
     assert_eq!(new[0].model(), Some(QUERY_MODEL));
-    assert_eq!(new[0].inputs(), vec![ALPHA_MARKER.to_string()]);
-    assert!(top_path(&resp).ends_with("alpha.md"), "{resp}");
+    assert_eq!(new[0].inputs(), vec![BETA_PROBE.to_string()]);
+    assert!(top_path(&resp).ends_with("beta.md"), "{resp}");
     drop(guard);
     assert_dir_empty(&fx.cache);
 }
 
 /// A word only the file written while the server runs contains.
 const FRESH_MARKER: &str = "quillfeatherstone";
+/// The body of that file.
+const FRESH_BODY: &str = "The quillfeatherstone arrived after the server started.";
+/// [`BETA_PROBE`]'s counterpart for `fresh.md`: found by no keyword, answered
+/// with [`FRESH_BODY`]'s vector.
+const FRESH_PROBE: &str = "vqzxjk";
 
 /// The watcher embeds a new file through the provider without panicking.
 ///
@@ -555,9 +602,7 @@ fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
     // so the write below cannot fall before the debouncer is armed.
     fx.layout.write(
         "fresh.md",
-        &format!(
-            "---\ntitle: Fresh\n---\n\n## Fresh\n\nThe {FRESH_MARKER} arrived after the server started.\n"
-        ),
+        &format!("---\ntitle: Fresh\n---\n\n## Fresh\n\n{FRESH_BODY}\n"),
     );
 
     let stderr = || -> Vec<String> {
@@ -599,8 +644,10 @@ fn the_watcher_embeds_a_new_file_through_the_http_provider_without_panicking() {
         lines.join("\n")
     );
 
+    // A keyword-free probe, so `fresh.md` ranks first only through the vector
+    // the watcher stored for it.
     let session = mcp_initialize(&base);
-    let resp = mcp_search_call(&base, &session, mcp_search_args(FRESH_MARKER));
+    let resp = mcp_search_call(&base, &session, mcp_search_args(FRESH_PROBE));
     assert!(top_path(&resp).ends_with("fresh.md"), "{resp}");
     drop(guard);
     assert_dir_empty(&fx.cache);

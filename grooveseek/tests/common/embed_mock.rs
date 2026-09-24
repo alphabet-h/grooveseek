@@ -13,15 +13,16 @@
 //! - a connection closed before it wrote anything (`read == 0`) is dropped,
 //!   not asserted on;
 //! - every response carries `Connection: close`, so one request is one
-//!   connection and [`crate::common::embed_mock::connection_count`] means
+//!   connection and
+//!   [`crate::common::embed_mock::EmbedMock::connection_count`] means
 //!   something.
 //!
 //! The default answer is a deterministic bag-of-words vector
 //! ([`crate::common::embed_mock::embed_text`]): a query and a document
 //! sharing a word end up close, so a test can assert the ranking and not
 //! only that a request arrived.
-//! [`crate::common::embed_mock::with_responder`] replaces the answer (AW-03's
-//! 401, AW-04's 413 / 429).
+//! [`crate::common::embed_mock::EmbedMock::with_responder`] replaces the
+//! answer (AW-03's 401, AW-04's 413 / 429).
 
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
