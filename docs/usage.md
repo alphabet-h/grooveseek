@@ -437,6 +437,8 @@ On Windows it also names documents that an earlier version indexed under a name 
 
 An index built before v1.6.0 gets a different answer first. Up to that release a file over the chunk limit was **truncated**, and a file whose content has not changed is never re-chunked, so such an index may still hold files whose tails are missing — with nothing on the document to find them by. `doctor` says so rather than reporting a clean bill: it checks whether the index recorded which chunking policy built it, and where it did not and the index holds source files, it reports that the question cannot be answered yet. `groove index --force` re-chunks them and the note goes away.
 
+An index built by v1.13.0 or earlier may also hold a source file with a chunk that has no visible text: a file chunked by lines could end in a piece of nothing but blank lines, which was embedded and indexed like any other chunk. The same rule keeps it — an unchanged file is not re-chunked — so `doctor` reads the stored chunks and names those files as `blank-code-chunks` (a warning). `groove index --force` re-chunks them and the finding goes away.
+
 Exit codes: `0` (nothing to report), `1` (findings), `2` (could not run — usually no index, or one that cannot be opened; the message on stderr names the file and the command that repairs it). Findings are reported, never repaired: each one names what fixes it, which is `groove index` or `groove index --force` for everything structural, and a change to the document itself where no command can.
 
 > Like `search` and `eval`, this opens the database, and opening it applies any pending schema migration. It is read-only about its findings, not about the file.

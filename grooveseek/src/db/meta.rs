@@ -770,6 +770,30 @@ impl Database {
         )
     }
 
+    /// Source files holding a chunk with no visible text, in path order (#273).
+    ///
+    /// A build before the fix could cut a piece of bare newlines off the end of a line-chunked
+    /// file, and an unchanged file never reaches the parser again, so the row stays. The
+    /// population is [`SOURCE_FILE_PREDICATE`], the one every source-file question uses.
+    ///
+    /// `content` is the column asked because it is the chunk's own text: the FTS `content`
+    /// column is written from it and it is what a search returns. The embedded text is
+    /// `context_text` plus this, so under `ContextMode::Static` the vector of a blank chunk is
+    /// the breadcrumb alone -- still a chunk that says nothing. The parser trims the end of
+    /// what it stores, so the leftover is `''`; ASCII whitespace is trimmed here as well so a
+    /// row that kept some is not missed.
+    pub fn source_files_with_blank_chunks(&self, sample_limit: usize) -> Result<IntegrityScan> {
+        self.scan(
+            &format!(
+                "SELECT d.path FROM documents d WHERE {SOURCE_FILE_PREDICATE} \
+                 AND EXISTS (SELECT 1 FROM chunks b WHERE b.document_id = d.id \
+                 AND trim(b.content, char(32, 9, 10, 11, 12, 13)) = '') \
+                 ORDER BY d.path"
+            ),
+            sample_limit,
+        )
+    }
+
     /// legacy / 前回 index 済み DB のチャンクを [`crate::quality::chunk_quality_score`]
     /// で再計算して UPDATE する (冪等)。
     ///

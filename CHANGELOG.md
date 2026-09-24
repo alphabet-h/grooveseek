@@ -155,7 +155,9 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   a line had already used up the chunk budget on its own, a blank line after
   it still started a new piece, so the tail of a line-chunked file could come
   out as a whitespace-only chunk that was embedded and indexed. A line with no
-  visible characters now never starts a piece. (#273)
+  visible characters now never starts a piece. `groove doctor` now reports
+  indexes that still hold such chunks (`blank-code-chunks`), and
+  `groove index --force` removes them. (#273)
 
 ## [1.13.0] - 2026-09-23
 
