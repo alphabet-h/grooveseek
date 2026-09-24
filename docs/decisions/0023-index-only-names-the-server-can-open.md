@@ -74,7 +74,9 @@ Chosen option: 3.
   brought in — so a rename onto such a name deindexes. It does not ask where
   a row is only removed or moved away: a delete, and the old end of a rename
   (whether or not a file under the old name exists again by then), so a row
-  an earlier version stored under such a name leaves with its file.
+  an earlier version stored under such a name leaves with its file. There a
+  refused name also skips the watcher's other checks (exclusion, extension,
+  links), since no such row can be one this version wrote.
 - `get_document` asks it before the first stat. What its spelling check still
   answers is a name the index could hold that is not the document's one
   spelling: a case variant, an 8.3 short name, a symlinked directory.

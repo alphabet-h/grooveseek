@@ -599,6 +599,13 @@ enum Gate {
     Write,
     /// The row, if any, is only deleted or moved away: a remove event, the
     /// old end of a rename.
+    ///
+    /// A key [`crate::resources::doc_is_addressable`] refuses passes at once,
+    /// before the exclusion, extension, lock-file, symlink and hard-link
+    /// checks: no such row can be one this version wrote, so moving or
+    /// dropping it is always right, whatever sits at the path now (a file
+    /// recreated there as a link, say). Every other key goes through all of
+    /// those checks as before.
     Removal,
 }
 
@@ -629,6 +636,11 @@ fn gate_parts(
     rules: &crate::exclusion::ExclusionRules,
     gate: Gate,
 ) -> bool {
+    // (ADR-0023) See [`Gate::Removal`]. The empty key is the knowledge base
+    // itself, which names no row and takes the ordinary path.
+    if gate == Gate::Removal && !rel.is_empty() && !crate::resources::doc_is_addressable(rel) {
+        return true;
+    }
     // 1 回の stat を 2 つの判定で使い回す: ディレクトリかどうか (末尾スラッシュ
     // の `.grooveignore` パターンの効き方が変わる) と、symlink かどうか。
     // `symlink_metadata` が失敗するのは対象が既に無い時 = 削除イベントで、
@@ -1678,6 +1690,82 @@ mod tests {
                 &rules
             ),
             RenameAction::Deindex
+        );
+    }
+
+    /// (ADR-0023, local Codex round 2 on PR #322) A key the index cannot hold
+    /// passes the removal gate before any check that reads what is on disk
+    /// now: recreated as a hard link or a symlink, or sitting under an
+    /// excluded directory, its row still moves with a rename or goes with a
+    /// delete. No such row can be one this version wrote.
+    #[cfg(windows)]
+    #[test]
+    fn a_key_win32_cannot_spell_passes_the_removal_gate_whatever_is_on_disk() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-rg");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("good.md"), "# x\n").unwrap();
+        let other = kb.join("other.md");
+        std::fs::write(&other, "# other\n").unwrap();
+        let rename_to_good = |old_rel: &str, old: &Path| {
+            rename_decision(old_rel, old, "good.md", &kb.join("good.md"), &reg, &rules)
+        };
+
+        // Hard link: the check that would refuse it reads the link count.
+        std::fs::hard_link(&other, kb.join("CON.md")).unwrap();
+        assert!(crate::links::is_multiply_linked(&kb.join("CON.md")));
+        assert_eq!(
+            rename_to_good("CON.md", &kb.join("CON.md")),
+            RenameAction::Rename
+        );
+        assert!(deindex_passes("CON.md", &kb.join("CON.md"), &reg, &rules));
+
+        // Under an excluded directory (`.obsidian` in `default_exclude_dirs`).
+        std::fs::create_dir_all(kb.join(".obsidian")).unwrap();
+        std::fs::write(kb.join(r".obsidian\nul.md"), "# x\n").unwrap();
+        assert_eq!(
+            rename_to_good(".obsidian/nul.md", &kb.join(r".obsidian\nul.md")),
+            RenameAction::Rename
+        );
+
+        // Symlink: needs Developer Mode or elevation on Windows.
+        if std::os::windows::fs::symlink_file(&other, kb.join("aux.md")).is_ok() {
+            assert_eq!(
+                rename_to_good("aux.md", &kb.join("aux.md")),
+                RenameAction::Rename
+            );
+        } else {
+            eprintln!(
+                "a_key_win32_cannot_spell_passes_the_removal_gate_whatever_is_on_disk: \
+                 could not create a symlink, so the symlink case is skipped."
+            );
+        }
+    }
+
+    /// (ADR-0023) The early pass is for keys the index cannot hold only: an
+    /// ordinary old key recreated as a hard link still fails the removal gate,
+    /// exactly as before.
+    #[cfg(windows)]
+    #[test]
+    fn an_addressable_key_keeps_every_removal_gate() {
+        let (kb, _cleanup) = verbatim_scratch_kb("kb-watch-unspellable-rk");
+        let reg = Registry::defaults();
+        let rules = crate::exclusion::ExclusionRules::load(&kb, default_exclude_dirs());
+        std::fs::write(kb.join("good.md"), "# x\n").unwrap();
+        let other = kb.join("other.md");
+        std::fs::write(&other, "# other\n").unwrap();
+        std::fs::hard_link(&other, kb.join("old.md")).unwrap();
+        assert!(!deindex_passes("old.md", &kb.join("old.md"), &reg, &rules));
+        assert_eq!(
+            rename_decision(
+                "old.md",
+                &kb.join("old.md"),
+                "good.md",
+                &kb.join("good.md"),
+                &reg,
+                &rules
+            ),
+            RenameAction::Reindex
         );
     }
 
