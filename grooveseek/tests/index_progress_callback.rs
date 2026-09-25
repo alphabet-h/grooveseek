@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::embed_mock::{EmbedMock, MockResponse, openai_config_toml};
+use common::embed_mock::{EmbedMock, MockResponse, default_response, openai_config_toml};
 use common::temp::TempKbLayout;
 
 use grooveseek::config::Config;
@@ -25,6 +25,7 @@ use grooveseek::indexer::progress::{ProgressCallback, ProgressEvent, ProgressRep
 use grooveseek::indexer::{IndexResult, load_declared_schema, rebuild_index};
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The mock's vector length. Small, since nothing here ranks anything.
@@ -52,8 +53,12 @@ fn unchanged(rel: &str, done: usize, total: usize) -> Ev {
     Ev::Unchanged(rel.to_string(), done, total)
 }
 
-/// A callback that appends every event to a log, and the log.
-fn recorder() -> (Arc<Mutex<Vec<Ev>>>, ProgressCallback) {
+/// What a test runs inside the callback, after the event is logged.
+type Hook = Box<dyn Fn(&Ev) + Send>;
+
+/// A callback that appends every event to a log and then hands it to `hook`,
+/// and the log.
+fn recorder(hook: Hook) -> (Arc<Mutex<Vec<Ev>>>, ProgressCallback) {
     let log = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&log);
     let f: ProgressCallback = Box::new(move |ev| {
@@ -67,7 +72,8 @@ fn recorder() -> (Arc<Mutex<Vec<Ev>>>, ProgressCallback) {
             ProgressEvent::Deleted { rel } => Ev::Deleted(rel.to_string()),
             ProgressEvent::Finished => Ev::Finished,
         };
-        sink.lock().expect("recorder mutex").push(owned);
+        sink.lock().expect("recorder mutex").push(owned.clone());
+        hook(&owned);
     });
     (log, f)
 }
@@ -103,6 +109,12 @@ impl Fixture {
     /// that differs from the command line's: no CLI flag selects a callback,
     /// and it is what is under test.
     fn run(&self) -> (anyhow::Result<IndexResult>, Vec<Ev>) {
+        self.run_with(Box::new(|_| {}))
+    }
+
+    /// [`Fixture::run`], with `hook` called from inside the callback after
+    /// each event is logged.
+    fn run_with(&self, hook: Hook) -> (anyhow::Result<IndexResult>, Vec<Ev>) {
         let kb = self.layout.kb();
         let cfg = Config::load_from(&self.config).expect("load groove.toml");
         let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
@@ -121,7 +133,7 @@ impl Fixture {
         } else {
             ContextMode::Off
         };
-        let (log, f) = recorder();
+        let (log, f) = recorder(hook);
         let result = rebuild_index(
             &db,
             &mut embedder,
@@ -278,8 +290,12 @@ fn rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_dele
 /// at all from one that returned `Err`.
 ///
 /// An endpoint that answers 500 fails the first embed, and
-/// [`grooveseek::indexer::rebuild_index`] returns through `?` after `Started`. The consumer learns the run ended
-/// from that `Err`; a `Finished` as well would tell it the run completed.
+/// [`grooveseek::indexer::rebuild_index`] returns through `?` after
+/// `Started`. The consumer learns the run ended from that `Err`; a `Finished`
+/// as well would tell it the run completed. A failure later in the run is
+/// covered by
+/// [`rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file`]
+/// and [`rebuild_index_emits_no_finished_when_the_last_step_before_it_fails`].
 #[test]
 fn rebuild_index_emits_finished_only_on_success() {
     let ok = Fixture::new("groove-aw08-finished-ok", EmbedMock::start(DIM));
@@ -310,6 +326,81 @@ fn rebuild_index_emits_finished_only_on_success() {
     assert_eq!(
         events,
         vec![Ev::Started(1)],
+        "a run that returned Err must not report Finished"
+    );
+}
+
+/// A run that fails partway through the per-file loop, after a file was
+/// already reported, emits no `Finished` either.
+///
+/// The endpoint answers the first embed request and fails every later one.
+/// Each small file here is one request, so exactly one file is `Indexed`
+/// before the second fails; which file that is depends on the walk's order,
+/// and the assertions do not.
+#[test]
+fn rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file() {
+    let served = AtomicUsize::new(0);
+    let fx = Fixture::new(
+        "groove-aw08-midway",
+        EmbedMock::with_responder(move |req| {
+            if served.fetch_add(1, Ordering::SeqCst) == 0 {
+                default_response(req, DIM)
+            } else {
+                MockResponse::json(
+                    500,
+                    &serde_json::json!({"error": {"message": "mock: down"}}),
+                )
+            }
+        }),
+    );
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+
+    let (result, events) = fx.run();
+    assert!(
+        result.is_err(),
+        "the second embed failure must reach the caller"
+    );
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0], Ev::Started(2), "{events:?}");
+    assert!(
+        matches!(&events[1], Ev::Indexed(rel, 1, 2) if rel == "a.md" || rel == "b.md"),
+        "one file is reported before the failure: {events:?}"
+    );
+    assert!(!events.contains(&Ev::Finished), "{events:?}");
+}
+
+/// A run that fails after the per-file loop, in the last fallible step before
+/// the reporter is finished, emits no `Finished`.
+///
+/// The hook drops the `chunks` table from a second connection as the last
+/// file is reported. Nothing between that report and the chunk count
+/// [`grooveseek::indexer::rebuild_index`] takes just before finishing the
+/// reporter reads that table (no file vanished, so the deletion sweep removes
+/// nothing), so the count is the step that fails. Red if the reporter is
+/// finished ahead of any fallible step after the loop.
+#[test]
+fn rebuild_index_emits_no_finished_when_the_last_step_before_it_fails() {
+    let fx = Fixture::new("groove-aw08-tail", EmbedMock::start(DIM));
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    let db_path = grooveseek::resolve_db_path(fx.layout.kb());
+
+    let (result, events) = fx.run_with(Box::new(move |ev| {
+        if let Ev::Indexed(_, done, total) = ev
+            && done == total
+        {
+            rusqlite::Connection::open(&db_path)
+                .expect("second connection")
+                .execute_batch("DROP TABLE chunks")
+                .expect("drop chunks");
+        }
+    }));
+    let err = format!("{:#}", result.expect_err("the chunk count must fail"));
+    assert!(err.contains("chunks"), "failed somewhere else: {err}");
+    assert_eq!(
+        events,
+        vec![Ev::Started(2), indexed("a.md", 1, 2), indexed("b.md", 2, 2)],
         "a run that returned Err must not report Finished"
     );
 }
