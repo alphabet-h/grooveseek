@@ -282,6 +282,11 @@ fn the_watcher_reports_a_rejected_file_as_skipped() {
 /// Red if [`grooveseek::indexer::rename_single_file`] maps the rejection skip to
 /// [`grooveseek::indexer::RenameOutcome::OldPathMissing`]
 /// (`watcher: rename target pending.md not in DB, indexed moved.md`).
+///
+/// Not every backend pairs a rename: macOS (FSEvents) can deliver it as a
+/// removal and a creation, which the watcher handles as a plain reindex of
+/// `moved.md` (`watcher: skipped moved.md (...)`). What must hold either way
+/// is asserted on every OS; the rename line is checked only when it appeared.
 #[test]
 fn the_watcher_reports_a_rejected_rename_target_as_refused_not_indexed() {
     let notes = three_notes();
@@ -309,38 +314,45 @@ fn the_watcher_reports_a_rejected_rename_target_as_refused_not_indexed() {
             .map(|l| strip_ansi(l))
             .collect()
     };
+    const RENAME_LINE: &str = "watcher: rename target pending.md not in DB";
+    const REINDEX_LINE: &str = "watcher: skipped moved.md (embedding endpoint rejected the input)";
     let reported = wait_until(Duration::from_secs(30), || {
         lines()
             .iter()
-            .any(|l| l.contains("watcher: rename target pending.md not in DB"))
+            .any(|l| l.contains(RENAME_LINE) || l.contains(REINDEX_LINE))
     });
     let all = lines();
-    assert!(reported, "no watcher rename line:\n{}", all.join("\n"));
-    assert!(
-        all.iter()
-            .any(|l| l
-                .contains("watcher: rename target pending.md not in DB, and moved.md was refused")),
-        "{}",
-        all.join("\n")
-    );
-    assert!(
-        !all.iter().any(|l| l.contains("indexed moved.md")),
-        "{}",
-        all.join("\n")
-    );
-    assert!(
-        all.iter()
-            .any(|l| l
-                .contains("warning: moved.md: embedding endpoint rejected the input (HTTP 413)")),
-        "{}",
-        all.join("\n")
-    );
-    assert!(
-        !all.iter().any(|l| l.contains(BODY_SENTINEL)),
-        "{}",
-        all.join("\n")
-    );
     drop(guard);
+    fx.answer_normally();
+    assert!(
+        reported,
+        "neither a rename nor a reindex line:\n{}",
+        all.join("\n")
+    );
+    let has = |needle: &str| all.iter().any(|l| l.contains(needle));
+    if has(RENAME_LINE) {
+        // A paired rename (Linux, Windows).
+        assert!(
+            has("watcher: rename target pending.md not in DB, and moved.md was refused"),
+            "{}",
+            all.join("\n")
+        );
+    } else {
+        // An unpaired one (macOS): the creation of moved.md is a plain reindex.
+        assert!(has(REINDEX_LINE), "{}", all.join("\n"));
+    }
+    assert!(
+        has(
+            "warning: moved.md: embedding endpoint rejected the input (HTTP 413); skipped, \
+             this file is not in the index"
+        ),
+        "{}",
+        all.join("\n")
+    );
+    assert!(!has("indexed moved.md"), "{}", all.join("\n"));
+    assert!(!has("keeps what it had"), "{}", all.join("\n"));
+    assert!(!has(BODY_SENTINEL), "{}", all.join("\n"));
+    assert_eq!(fx.documents(), 3, "moved.md must have no row");
     assert_dir_empty(&fx.cache);
 }
 
@@ -943,6 +955,12 @@ fn index_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
 /// warning must say the file is not in the index.
 ///
 /// Red if the warning's tail is decided before the rename is settled.
+///
+/// Not every backend pairs a rename: macOS (FSEvents) can deliver it as a
+/// removal of `note.txt` (deindexed) and a creation of `note.md` (a plain
+/// reindex, refused, no row). The end state and the warning are the same
+/// either way and are asserted on every OS; the rename line is checked only
+/// when it appeared.
 #[test]
 fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
     let txt = marked_txt_note();
@@ -967,30 +985,39 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
             .map(|l| strip_ansi(l))
             .collect()
     };
+    const RENAME_LINE: &str = "watcher: renamed note.txt -> note.md";
+    const REINDEX_LINE: &str = "watcher: skipped note.md (embedding endpoint rejected the input)";
+    const DEINDEX_LINE: &str = "watcher: deindexed note.txt";
+    // Unpaired, both halves have to have been handled before the end state is read.
     let reported = wait_until(Duration::from_secs(30), || {
-        lines()
-            .iter()
-            .any(|l| l.contains("watcher: renamed note.txt -> note.md"))
+        let all = lines();
+        let has = |needle: &str| all.iter().any(|l| l.contains(needle));
+        has(RENAME_LINE) || (has(REINDEX_LINE) && has(DEINDEX_LINE))
     });
     let all = lines();
     drop(guard);
     fx.answer_normally();
-    assert!(reported, "no watcher rename line:\n{}", all.join("\n"));
     assert!(
-        all.iter().any(|l| l.contains(CROSSED_REJECTED_WARNING)),
-        "{}",
+        reported,
+        "neither a rename line nor a reindex plus deindex:\n{}",
         all.join("\n")
     );
-    assert!(
-        !all.iter().any(|l| l.contains("keeps what it had")),
-        "{}",
-        all.join("\n")
-    );
-    assert!(
-        !all.iter().any(|l| l.contains(BODY_SENTINEL)),
-        "{}",
-        all.join("\n")
-    );
+    let has = |needle: &str| all.iter().any(|l| l.contains(needle));
+    if has(RENAME_LINE) {
+        // A paired rename (Linux, Windows): the cross-parser arm drops the row.
+        assert!(
+            has(
+                "watcher: renamed note.txt -> note.md (the new parser could not index it, \
+                 document dropped from the index)"
+            ),
+            "{}",
+            all.join("\n")
+        );
+    }
+    assert!(has(CROSSED_REJECTED_WARNING), "{}", all.join("\n"));
+    assert!(!has("indexed note.md"), "{}", all.join("\n"));
+    assert!(!has("keeps what it had"), "{}", all.join("\n"));
+    assert!(!has(BODY_SENTINEL), "{}", all.join("\n"));
     assert_eq!(fx.documents(), 1, "the old parser's row must be gone");
     assert_dir_empty(&fx.cache);
 }
