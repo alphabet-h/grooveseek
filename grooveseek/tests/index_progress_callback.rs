@@ -18,8 +18,8 @@
 //! [`crate::common::embed_mock::hermetic`] gives the CLI tests (no API key
 //! from the runner, an empty `FASTEMBED_CACHE_DIR`, no proxy variables),
 //! which a test cannot set on its own process while others run beside it.
-//! The loopback proxy bypass itself (AW-13) is pinned by
-//! `openai_compatible_proxy.rs`.
+//! The loopback proxy bypass itself (AW-13) is pinned by the
+//! `openai_compatible_proxy` integration test.
 
 mod common;
 
