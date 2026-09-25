@@ -74,7 +74,9 @@ successful.
      healthy knowledge base would fail every run.
    - **Exit non-zero only when the run had a rejection and embedded no file.**
      Taken. That pattern points at `model` / `document_model` or `endpoint`
-     rather than at the files.
+     rather than at the files. A file refused only after the endpoint
+     accepted an earlier batch of it does not count as such a rejection: the
+     accepted batch shows the configuration works.
 
 ## Decision
 
@@ -122,7 +124,10 @@ only saw rejections fails after it has finished.**
   400, 413 or 422 there points at the configuration, and the rebuild stops
   before the reset as ADR-0024 intends.
 - **A run with rejections and nothing embedded fails after it has finished**
-  (`IndexResult::fails_all_inputs_rejected`). The run is not cut short: the
+  (`IndexResult::fails_all_inputs_rejected`). A file of more than one batch
+  (64 chunks) that the endpoint refused only after accepting an earlier batch
+  of it is skipped the same way, but is not counted as a rejection here. The
+  run is not cut short: the
   deletion sweep and the bookkeeping complete, and `rebuild_index` still
   returns its counts. Then `groove index` exits non-zero and MCP
   `rebuild_index` returns an `error` beside the counts, both with the message

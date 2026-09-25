@@ -594,7 +594,10 @@ pub struct IndexResult {
     /// that were collected and then could not be read or parsed.
     pub unspellable: u32,
     /// (AW-04) Files skipped because the embedding endpoint refused their
-    /// input. Also counted in [`Self::skipped`].
+    /// input before accepting any of it. Also counted in [`Self::skipped`]. A
+    /// file refused only after the endpoint accepted an earlier batch of it is
+    /// skipped (and in [`Self::skipped`]) but not counted here: the accepted
+    /// batch shows the configuration works.
     pub embed_rejected: u32,
     /// (AW-04) Files this run sent to the embedder and got vectors for. Not
     /// [`Self::updated`]: a metadata-only update counts there without
@@ -615,8 +618,9 @@ impl IndexResult {
     }
 
     /// (AW-04) Whether this run had the endpoint refuse at least one file's
-    /// input and embedded nothing -- which points at the configuration (model,
-    /// endpoint) rather than at the files. One decision, rendered twice:
+    /// input outright ([`Self::embed_rejected`]) and embedded nothing -- which
+    /// points at the configuration (model, endpoint) rather than at the files.
+    /// A refusal after an accepted batch does not count. One decision, rendered twice:
     /// `groove index` exits non-zero, MCP `rebuild_index` answers with an
     /// `error`. The run itself completed, deletions included.
     pub fn fails_all_inputs_rejected(&self) -> bool {
@@ -1020,6 +1024,9 @@ pub fn rebuild_index(
             }
         };
 
+        // (AW-04) Read before the call, so a refusal below can tell whether the endpoint
+        // accepted part of this file first.
+        let refused_after_accepting_before = embedder.documents_refused_after_accepting();
         let single_result = index_single_disk_entry(
             db,
             embedder,
@@ -1059,7 +1066,12 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
             } => {
                 skipped_count += 1;
-                if reason == SKIPPED_EMBED_REJECTED {
+                // A refusal that came after an accepted batch of the same file proves the
+                // endpoint works, so it is not counted toward "every input rejected".
+                if reason == SKIPPED_EMBED_REJECTED
+                    && embedder.documents_refused_after_accepting()
+                        == refused_after_accepting_before
+                {
                     embed_rejected += 1;
                 }
                 if fm_unparsed {

@@ -60,6 +60,8 @@
      1 つあるだけで、毎回の run が失敗になる。
    - **拒否があり、かつ embed できたファイルが 1 つも無いときだけ exit 非 0。** 採用。
      この形はファイルではなく `model` / `document_model` か `endpoint` を指している。
+     endpoint が前のバッチを受け付けた後で断ったファイルは、この拒否に数えない:
+     受け付けたバッチが設定の正しさを示している。
 
 ## 決定
 
@@ -102,7 +104,9 @@ run は最後まで済ませてから失敗にする。**
   probe の文字列は固定の短い ASCII なので、そこでの 400・413・422 は設定の誤りを指し、
   ADR-0024 の意図どおり reset の前に再構築を止める。
 - **拒否があり何も embed できなかった run は、最後まで済ませた後で失敗にする**
-  (`IndexResult::fails_all_inputs_rejected`)。run を途中で切らない: 削除の sweep と
+  (`IndexResult::fails_all_inputs_rejected`)。複数バッチ (64 チャンク超) のファイルを
+  endpoint が前のバッチを受け付けた後で断った場合も同じく skip するが、ここでの拒否には
+  数えない。run を途中で切らない: 削除の sweep と
   後処理は完了し、`rebuild_index` は件数を返す。その上で `groove index` は exit 非 0 で
   終わり、MCP `rebuild_index` は件数の隣に `error` を返す。どちらも文言は
   `IndexResult::all_inputs_rejected_message` から取る。watcher は 1 ファイルずつ

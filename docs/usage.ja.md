@@ -82,7 +82,8 @@ provider) ではこのキーと `[embedding].model` が同じものを指すの�
 ファイルは、そのファイルだけが skip される: `groove index` は
 `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`
 を出し、`skipped` に数え、そのファイルの既存の row を残して先へ進む。run が 1 つでも
-ファイルを断られ、1 つも embed できなかった場合は、run を最後まで (削除も含めて) 済ませた
+ファイルを (そのどのバッチも受け付けられないまま) 断られ、1 つも embed できなかった
+場合は、run を最後まで (削除も含めて) 済ませた
 うえで exit 非 0 で終わる: この形はファイルではなく `model` / `document_model` か
 `endpoint` の誤りを指している。MCP `rebuild_index` は同じ run に `error` を返す。
 HTTP 429・5xx・timeout・接続失敗は再試行し (`max_retries`)、401・403 とその他の 4xx は

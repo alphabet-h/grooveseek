@@ -89,7 +89,8 @@ thing, so a config that sets both is refused as well: keep one.
 with HTTP 400, 413 or 422 is skipped on its own: `groove index` prints
 `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`,
 counts it under `skipped`, keeps the row it already had, and goes on. If the
-run refused a file and embedded none, it still finishes (deletions included)
+run had a file refused before any batch of it was accepted, and embedded none,
+it still finishes (deletions included)
 and then exits non-zero: that pattern points at `model` / `document_model` or
 `endpoint`, not at the files. MCP `rebuild_index` answers the same run with an
 `error`. HTTP 429, 5xx, timeouts and failed connections are retried

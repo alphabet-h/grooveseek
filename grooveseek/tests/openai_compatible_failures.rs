@@ -609,3 +609,122 @@ fn mcp_rebuild_index_reports_an_error_when_every_input_was_rejected() {
     );
     assert_dir_empty(&fx.cache);
 }
+
+/// A refusal whose body never arrives is still a refusal: the endpoint sends
+/// 413 headers, promises more body than it writes and holds the connection.
+/// The file is skipped on its own, the refused batch is sent once, and the
+/// run goes on and exits 0.
+///
+/// Red if the status is classified only after the body is read: the body's
+/// timeout is then retried as a transient failure, and the run stops with a
+/// timeout after its retries.
+#[test]
+fn index_skips_a_file_whose_refusal_body_never_arrives() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-stall", &files(&notes), "");
+    // A one-second request timeout, so the stalled body fails fast.
+    let config = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    assert!(config.contains("timeout_seconds = 15\n"), "{config}");
+    std::fs::write(
+        &fx.config,
+        config.replace("timeout_seconds = 15\n", "timeout_seconds = 1\n"),
+    )
+    .expect("write groove.toml");
+    fx.index();
+
+    fx.layout.write(
+        "alpha.md",
+        &note("Alpha", &format!("{ALPHA} {REJECT_MARKER}")),
+    );
+    fx.layout
+        .write("beta.md", &note("Beta", &format!("{BETA} Edited.")));
+    let before = fx.mock.requests().len();
+    fx.answer_with(|req| {
+        if req.inputs().iter().any(|i| i.contains(REJECT_MARKER)) {
+            let mut stalled = reply(413, &[]);
+            stalled.stall_body = true;
+            stalled
+        } else {
+            MockReply::plain(default_response(req, DIM))
+        }
+    });
+    let out = fx.run_index();
+    fx.answer_normally();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: alpha.md: embedding endpoint rejected the input (HTTP 413)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("1 updated") && stderr.contains("1 skipped"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    let refused = fx
+        .requests_since(before)
+        .iter()
+        .filter(|r| r.inputs().iter().any(|i| i.contains(REJECT_MARKER)))
+        .count();
+    assert_eq!(refused, 1, "a refusal is never retried: {stderr}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// A long file is the only file changed, and the endpoint accepts its first
+/// batch and refuses the second. The file is skipped, but the accepted batch
+/// shows the endpoint and model work, so the run is not "every input
+/// rejected": exit 0.
+///
+/// Red if a refusal after an accepted batch counts toward the all-rejected
+/// check (the run would exit non-zero).
+#[test]
+fn index_exits_zero_when_its_only_changed_file_is_refused_after_an_accepted_batch() {
+    let sections = |last: &str| -> String {
+        let mut s = String::from("---\ntitle: Long\n---\n\n");
+        for i in 0..69 {
+            s.push_str(&format!(
+                "## Section {i}\n\nParagraph number {i} talks about harbour cranes and tides.\n\n"
+            ));
+        }
+        s.push_str(&format!("## Section 69\n\n{last}\n"));
+        s
+    };
+    let long = sections("The final paragraph talks about harbour cranes too.");
+    let short = note(
+        "Short",
+        "A single paragraph about the harbour master's logbook.",
+    );
+    let fx = fixture(
+        "groove-aw04-partial",
+        &[("long.md", long.as_str()), ("short.md", short.as_str())],
+        "",
+    );
+    fx.index();
+
+    let before = fx.mock.requests().len();
+    fx.layout.write(
+        "long.md",
+        &sections(&format!("The final paragraph talks about {REJECT_MARKER}.")),
+    );
+    fx.answer_with(rejects_marker(413));
+    let out = fx.run_index();
+    fx.answer_normally();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains(ALL_REJECTED), "{stderr}");
+    assert!(
+        stderr.contains("warning: long.md: embedding endpoint rejected the input (HTTP 413)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("0 updated") && stderr.contains("1 skipped"),
+        "{stderr}"
+    );
+    assert!(
+        fx.requests_since(before)
+            .iter()
+            .any(|r| r.inputs().len() == 64),
+        "the first batch must have been sent (and answered) before the refusal"
+    );
+    assert_dir_empty(&fx.cache);
+}

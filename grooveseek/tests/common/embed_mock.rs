@@ -114,7 +114,15 @@ impl MockResponse {
 pub struct MockReply {
     pub response: MockResponse,
     pub headers: Vec<(String, String)>,
+    /// Promise [`STALLED_BODY_EXTRA`] more body bytes than are written, then
+    /// hold the connection until the client gives up: headers arrive, the
+    /// body never finishes (AW-04, a refusal whose body stalls).
+    pub stall_body: bool,
 }
+
+/// How many bytes a [`MockReply::stall_body`] reply's `Content-Length`
+/// promises beyond the body it writes.
+const STALLED_BODY_EXTRA: usize = 1024;
 
 impl MockReply {
     /// `response` with no extra headers.
@@ -122,6 +130,7 @@ impl MockReply {
         Self {
             response,
             headers: Vec::new(),
+            stall_body: false,
         }
     }
 }
@@ -349,19 +358,26 @@ fn serve_one(
     let MockReply {
         response: resp,
         headers,
+        stall_body,
     } = responder(&recorded);
     let extra: String = headers
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect();
+    let promised = resp.body.len() + if stall_body { STALLED_BODY_EXTRA } else { 0 };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {promised}\r\n{extra}Connection: close\r\n\r\n",
         resp.status,
         reason(resp.status),
-        resp.body.len()
     );
-    if write_bounded(&mut stream, head.as_bytes(), stop, deadline) {
-        write_bounded(&mut stream, &resp.body, stop, deadline);
+    if write_bounded(&mut stream, head.as_bytes(), stop, deadline)
+        && write_bounded(&mut stream, &resp.body, stop, deadline)
+        && stall_body
+    {
+        // Hold the connection, bounded like every other wait here, until the
+        // client closes it (its timeout) or the budget runs out.
+        let mut chunk = [0u8; 1024];
+        while read_some(&mut stream, &mut chunk, stop, deadline).is_some() {}
     }
 }
 

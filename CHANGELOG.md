@@ -75,7 +75,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - **An openai-compatible endpoint's refusal no longer stops `groove index` or
   MCP `rebuild_index`.** A file whose input is refused with HTTP 400, 413 or
   422 is skipped with a warning, keeps its previous row, and the run goes on to
-  its deletions and exits 0, unless the run refused a file and embedded none:
+  its deletions and exits 0, unless the run had a file refused before any
+  batch of it was accepted and embedded none:
   that run exits non-zero (MCP: an `error` beside the counts) after it has
   finished. 429, 5xx, timeouts and failed connections are retried before the
   run stops; a connection the server drops after accepting it, 401, 403 and

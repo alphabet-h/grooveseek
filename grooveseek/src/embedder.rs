@@ -379,6 +379,27 @@ impl fmt::Display for EmbedInputRejected {
 
 impl std::error::Error for EmbedInputRejected {}
 
+/// (AW-04) Context on an [`EmbedInputRejected`] that came after the endpoint had
+/// accepted earlier batches of the same call. The call still fails and the
+/// indexer still finds the [`EmbedInputRejected`] underneath and skips the
+/// file, but [`Embedder::embed_texts`] counts it apart: an accepted batch shows
+/// the endpoint and model work, so the file is no sign of a wrong configuration.
+#[derive(Debug)]
+struct RejectedAfterAccepting {
+    accepted_inputs: usize,
+}
+
+impl fmt::Display for RejectedAfterAccepting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the embedding endpoint accepted the first {} input(s) of this call, \
+             then refused a later batch",
+            self.accepted_inputs
+        )
+    }
+}
+
 /// The one wording of a non-2xx answer, typed ([`EmbedInputRejected`]) or not.
 fn http_status_message(status: u16, snippet: &str) -> String {
     format!("embedding endpoint returned HTTP {status}: {snippet}")
@@ -497,7 +518,15 @@ impl OpenAiCompatibleProvider {
 
         let mut embeddings = Vec::with_capacity(texts.len());
         for batch in texts.chunks(OPENAI_COMPATIBLE_BATCH_SIZE) {
-            embeddings.extend(self.embed_batch(batch, model)?);
+            match self.embed_batch(batch, model) {
+                Ok(batch_embeddings) => embeddings.extend(batch_embeddings),
+                Err(error) if !embeddings.is_empty() && error.is::<EmbedInputRejected>() => {
+                    return Err(error.context(RejectedAfterAccepting {
+                        accepted_inputs: embeddings.len(),
+                    }));
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(embeddings)
     }
@@ -566,8 +595,13 @@ impl OpenAiCompatibleProvider {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after(value, SystemTime::now()));
+        // Classified from the status line, before the body is read: a refusal whose body
+        // stalls or breaks off is still a refusal, and must not come back as a retryable
+        // timeout that ends the run (AW-04). Its body only feeds the snippet.
+        let class = classify_status(status);
         let body = match response.bytes() {
             Ok(body) => body,
+            Err(_) if class == StatusClass::InputRejected => Default::default(),
             Err(error) => {
                 let timed_out = error.is_timeout();
                 let error = anyhow::anyhow!(
@@ -587,7 +621,7 @@ impl OpenAiCompatibleProvider {
         };
         let http_error =
             || anyhow::anyhow!(http_status_message(status, &escaped_body_snippet(&body)));
-        match classify_status(status) {
+        match class {
             StatusClass::Success => {}
             StatusClass::InputRejected => {
                 return Err(AttemptFailure::Fatal(anyhow::Error::new(
@@ -791,6 +825,7 @@ pub struct Embedder {
     provider: Box<dyn EmbeddingProvider>,
     identity: EmbeddingIdentity,
     documents_embedded: u64,
+    documents_refused_after_accepting: u64,
 }
 
 impl Embedder {
@@ -834,6 +869,7 @@ impl Embedder {
             provider,
             identity,
             documents_embedded: 0,
+            documents_refused_after_accepting: 0,
         }
     }
 
@@ -844,9 +880,18 @@ impl Embedder {
     /// its `document_model`. Queries go through [`Embedder::embed_single`] or
     /// [`Embedder::embed_queries`].
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let embeddings = self.provider.embed_documents(texts)?;
-        self.documents_embedded += 1;
-        Ok(embeddings)
+        match self.provider.embed_documents(texts) {
+            Ok(embeddings) => {
+                self.documents_embedded += 1;
+                Ok(embeddings)
+            }
+            Err(error) => {
+                if error.is::<RejectedAfterAccepting>() {
+                    self.documents_refused_after_accepting += 1;
+                }
+                Err(error)
+            }
+        }
     }
 
     /// How many [`Embedder::embed_texts`] calls have succeeded. The indexer
@@ -854,6 +899,14 @@ impl Embedder {
     /// number of files embedded (AW-04). Queries and the probe are not counted.
     pub(crate) fn documents_embedded(&self) -> u64 {
         self.documents_embedded
+    }
+
+    /// How many [`Embedder::embed_texts`] calls the endpoint refused only after
+    /// accepting an earlier batch of the same call (AW-04). Such a file is
+    /// skipped like any refused one, but it is not counted as a sign the
+    /// configuration is wrong: the endpoint did answer.
+    pub(crate) fn documents_refused_after_accepting(&self) -> u64 {
+        self.documents_refused_after_accepting
     }
 
     /// Embed one search query, on the query side of the provider (the
@@ -2430,5 +2483,49 @@ mod tests {
         let mut refused = Embedder::from_provider(Box::new(RefusingProvider), identity);
         assert!(refused.embed_texts(&["a"]).is_err());
         assert_eq!(refused.documents_embedded(), 0);
+    }
+
+    /// Refuses every call the way a later batch is refused after an earlier
+    /// one was accepted.
+    struct RefusingAfterAcceptingProvider;
+
+    impl EmbeddingProvider for RefusingAfterAcceptingProvider {
+        fn embed_documents(&mut self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Err(anyhow::Error::new(EmbedInputRejected {
+                status: 413,
+                body_snippet: String::new(),
+            })
+            .context(RejectedAfterAccepting {
+                accepted_inputs: OPENAI_COMPATIBLE_BATCH_SIZE,
+            }))
+        }
+
+        fn embed_query(&mut self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![3.0, 4.0])
+        }
+    }
+
+    /// (AW-04) A refusal after an accepted batch is counted apart, and the
+    /// indexer still finds the typed rejection underneath to skip the file.
+    #[test]
+    fn documents_refused_after_accepting_counts_only_refusals_after_an_accepted_batch() {
+        let identity = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15).identity;
+        let mut partial =
+            Embedder::from_provider(Box::new(RefusingAfterAcceptingProvider), identity.clone());
+        let err = partial.embed_texts(&["a"]).expect_err("refused");
+        assert_eq!(
+            err.downcast_ref::<EmbedInputRejected>().map(|r| r.status),
+            Some(413)
+        );
+        assert_eq!(partial.documents_refused_after_accepting(), 1);
+        assert_eq!(partial.documents_embedded(), 0);
+
+        let mut outright = Embedder::from_provider(Box::new(RefusingProvider), identity.clone());
+        assert!(outright.embed_texts(&["a"]).is_err());
+        assert_eq!(outright.documents_refused_after_accepting(), 0);
+
+        let mut ok = Embedder::from_provider(Box::new(StubProvider), identity);
+        ok.embed_texts(&["a"]).unwrap();
+        assert_eq!(ok.documents_refused_after_accepting(), 0);
     }
 }
