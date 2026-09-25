@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::db::SearchResult;
 
@@ -476,6 +476,106 @@ fn escaped_body_snippet(body: &[u8]) -> String {
         snippet.push_str("...");
     }
     snippet
+}
+
+/// The longest wait before a retry: the cap on the exponential backoff, and
+/// the longest `Retry-After` honoured. A server asking for more is not waited
+/// for; the request fails at once (spec AW-04).
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// `text` cut to at most `max` characters (Unicode scalar values), on a
+/// character boundary so that a multi-byte character is never split.
+#[allow(dead_code)] // wired into the provider by the next commit
+fn truncate_to_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((byte, _)) => &text[..byte],
+        None => text,
+    }
+}
+
+/// A `Retry-After` value: delta-seconds, or an IMF-fixdate HTTP-date measured
+/// from `now` (a date in the past is zero). A delta too large for `u64` is
+/// [`Duration::MAX`], longer than any wait honoured. `None` for anything else,
+/// including the obsolete RFC 850 and asctime date forms: the caller then
+/// falls back to its own backoff.
+#[allow(dead_code)] // wired into the provider by the next commit
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::MAX),
+        );
+    }
+    let at = SystemTime::from(chrono::DateTime::parse_from_rfc2822(value).ok()?);
+    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// How one HTTP status is handled by the OpenAI-compatible provider.
+#[allow(dead_code)] // wired into the provider by the next commit
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusClass {
+    Success,
+    /// 400 / 413 / 422: the input was refused; not retried, and the indexer
+    /// skips the file.
+    InputRejected,
+    /// 429 and 5xx: retried.
+    Retryable,
+    /// Every other status: not retried.
+    Fatal,
+}
+
+#[allow(dead_code)] // wired into the provider by the next commit
+fn classify_status(status: u16) -> StatusClass {
+    match status {
+        200..=299 => StatusClass::Success,
+        400 | 413 | 422 => StatusClass::InputRejected,
+        429 | 500..=599 => StatusClass::Retryable,
+        _ => StatusClass::Fatal,
+    }
+}
+
+/// The backoff before retry number `retry` (1-based) when the server named no
+/// `Retry-After`: 1 s, 2 s, 4 s, ... capped at [`MAX_RETRY_AFTER`].
+#[allow(dead_code)] // wired into the provider by the next commit
+fn backoff_base(retry: u32) -> Duration {
+    let secs = 1u64
+        .checked_shl(retry.saturating_sub(1))
+        .unwrap_or(u64::MAX);
+    Duration::from_secs(secs).min(MAX_RETRY_AFTER)
+}
+
+#[allow(dead_code)] // wired into the provider by the next commit
+#[derive(Debug, PartialEq, Eq)]
+enum Wait {
+    /// Sleep this long, then send again.
+    After(Duration),
+    /// The server asked for this much, more than [`MAX_RETRY_AFTER`]: give up now.
+    GiveUp(Duration),
+}
+
+/// What to do before retry number `retry` (1-based). A `Retry-After` the
+/// server sent wins and is waited exactly; without one, [`backoff_base`] plus
+/// whatever `jitter` adds for that base.
+#[allow(dead_code)] // wired into the provider by the next commit
+fn wait_before_retry(
+    retry: u32,
+    retry_after: Option<Duration>,
+    jitter: &mut dyn FnMut(Duration) -> Duration,
+) -> Wait {
+    match retry_after {
+        Some(asked) if asked > MAX_RETRY_AFTER => Wait::GiveUp(asked),
+        Some(asked) => Wait::After(asked),
+        None => {
+            let base = backoff_base(retry);
+            Wait::After(base + jitter(base))
+        }
+    }
 }
 
 /// Provider-neutral entry point for generating text embeddings.
@@ -1771,5 +1871,116 @@ mod tests {
             .embed_single("こんにちは、世界")
             .expect("failed to embed");
         assert_eq!(emb.len(), 1024);
+    }
+
+    #[test]
+    fn truncate_to_chars_cuts_on_a_char_boundary_and_leaves_short_text_alone() {
+        let ascii = "x".repeat(9000);
+        assert_eq!(truncate_to_chars(&ascii, 8000).chars().count(), 8000);
+        let kana = "あ".repeat(9000);
+        let cut = truncate_to_chars(&kana, 8000);
+        assert_eq!(cut.chars().count(), 8000);
+        assert!(cut.chars().all(|c| c == 'あ'));
+        // An emoji is one char of four bytes: a byte slice at 8000 would panic.
+        let emoji = "\u{1F600}".repeat(10);
+        assert_eq!(truncate_to_chars(&emoji, 3), "\u{1F600}\u{1F600}\u{1F600}");
+        assert_eq!(truncate_to_chars("short", 8000), "short");
+        assert_eq!(truncate_to_chars("exact", 5), "exact");
+    }
+
+    #[test]
+    fn retry_after_reads_delta_seconds_and_http_dates_and_ignores_the_rest() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777); // Sun, 06 Nov 1994 08:49:37 GMT
+        assert_eq!(parse_retry_after("1", now), Some(Duration::from_secs(1)));
+        assert_eq!(parse_retry_after(" 0 ", now), Some(Duration::ZERO));
+        assert_eq!(
+            parse_retry_after("120", now),
+            Some(Duration::from_secs(120))
+        );
+        // Larger than u64: longer than any wait groove honours, not "absent".
+        assert_eq!(
+            parse_retry_after("99999999999999999999999", now),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:47 GMT", now),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:27 GMT", now),
+            Some(Duration::ZERO),
+            "a date in the past means retry now"
+        );
+        for garbage in [
+            "",
+            "   ",
+            "-1",
+            "1.5",
+            "soon",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+        ] {
+            assert_eq!(parse_retry_after(garbage, now), None, "{garbage:?}");
+        }
+    }
+
+    #[test]
+    fn status_classes_split_input_rejections_transient_failures_and_the_rest() {
+        let cases = [
+            (200, StatusClass::Success),
+            (204, StatusClass::Success),
+            (400, StatusClass::InputRejected),
+            (413, StatusClass::InputRejected),
+            (422, StatusClass::InputRejected),
+            (429, StatusClass::Retryable),
+            (500, StatusClass::Retryable),
+            (502, StatusClass::Retryable),
+            (503, StatusClass::Retryable),
+            (504, StatusClass::Retryable),
+            (599, StatusClass::Retryable),
+            (401, StatusClass::Fatal),
+            (403, StatusClass::Fatal),
+            (404, StatusClass::Fatal),
+            (408, StatusClass::Fatal),
+            (301, StatusClass::Fatal),
+        ];
+        for (status, class) in cases {
+            assert_eq!(classify_status(status), class, "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn backoff_is_capped_at_sixty_seconds_for_large_attempt_numbers() {
+        assert_eq!(backoff_base(1), Duration::from_secs(1));
+        assert_eq!(backoff_base(2), Duration::from_secs(2));
+        assert_eq!(backoff_base(3), Duration::from_secs(4));
+        assert_eq!(backoff_base(7), MAX_RETRY_AFTER);
+        assert_eq!(backoff_base(40), MAX_RETRY_AFTER);
+        assert_eq!(backoff_base(u32::MAX), MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn wait_before_retry_prefers_retry_after_and_gives_up_past_sixty_seconds() {
+        let mut quarter = |base: Duration| base / 4;
+        assert_eq!(
+            wait_before_retry(1, None, &mut quarter),
+            Wait::After(Duration::from_millis(1250))
+        );
+        assert_eq!(
+            wait_before_retry(3, None, &mut quarter),
+            Wait::After(Duration::from_secs(5))
+        );
+        assert_eq!(
+            wait_before_retry(3, Some(Duration::from_secs(1)), &mut quarter),
+            Wait::After(Duration::from_secs(1)),
+            "Retry-After is waited exactly, without jitter"
+        );
+        assert_eq!(
+            wait_before_retry(1, Some(MAX_RETRY_AFTER), &mut quarter),
+            Wait::After(MAX_RETRY_AFTER)
+        );
+        assert_eq!(
+            wait_before_retry(1, Some(Duration::from_secs(61)), &mut quarter),
+            Wait::GiveUp(Duration::from_secs(61))
+        );
     }
 }
