@@ -1064,7 +1064,7 @@ pub fn rebuild_index(
         // accepted part of this file first.
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
         let crossed = crossed_parser_renames.contains(&entry.rel);
-        let single_result = index_entry(
+        let single_result = index_single_disk_entry(
             db,
             embedder,
             entry,
@@ -1341,40 +1341,14 @@ enum Reindex {
 /// the key and not yet rewritten it, or has not run at all) leaves the rows untouched and
 /// marks the running pass instead ([`write_declared_rows_or_mark_dirty`]).
 ///
-/// [`index_entry`] with `row_dropped_unless_updated` false: for callers that do not
-/// settle a rename across parsers afterwards.
+/// `row_dropped_unless_updated` is true for the destination of a rename that
+/// [`rename_crosses_a_parser`]: the caller then settles it with
+/// [`settle_cross_parser_rename`], which drops the row the old parser left under this path
+/// unless the result is [`SingleResult::Updated`]. A refusal is worded for that final
+/// state -- not in the index -- rather than for the row it sees now (local Codex before
+/// round 2 on PR #329). Every other caller passes false.
 #[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
-    db: &Database,
-    embedder: &mut Embedder,
-    entry: &DiskEntry,
-    exclude_headings: Option<&[String]>,
-    registry: &Registry,
-    mode: Reindex,
-    context_mode: ContextMode,
-    declared: DeclaredSet<'_>,
-) -> Result<SingleResult> {
-    index_entry(
-        db,
-        embedder,
-        entry,
-        exclude_headings,
-        registry,
-        mode,
-        context_mode,
-        declared,
-        false,
-    )
-}
-
-/// The body of [`index_single_disk_entry`]. `row_dropped_unless_updated` is true for
-/// the destination of a rename that [`rename_crosses_a_parser`]: the caller then
-/// settles it with [`settle_cross_parser_rename`], which drops the row the old parser
-/// left under this path unless the result is [`SingleResult::Updated`]. A refusal is
-/// worded for that final state -- not in the index -- rather than for the row it sees
-/// now (local Codex before round 2 on PR #329).
-#[allow(clippy::too_many_arguments)]
-fn index_entry(
     db: &Database,
     embedder: &mut Embedder,
     entry: &DiskEntry,
@@ -1920,6 +1894,7 @@ pub fn reindex_single_file(
         },
         context_mode,
         DeclaredSet::FromIndex,
+        false,
     )
 }
 
@@ -2305,7 +2280,7 @@ pub fn rename_single_file(
     // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
     // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
     // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
-    let single_result = index_entry(
+    let single_result = index_single_disk_entry(
         db,
         embedder,
         &entry,
@@ -5030,6 +5005,7 @@ mod tests {
                 pass: None,
                 generation: "[]",
             },
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -5077,6 +5053,7 @@ mod tests {
                 pass: None,
                 generation: "[]",
             },
+            false,
         )
         .unwrap();
         assert_eq!(
