@@ -279,12 +279,13 @@ fn one_note() -> [(&'static str, String); 1] {
     )]
 }
 
-/// A 429 with `Retry-After: 1` is waited out and the batch sent again.
+/// A 429 with `Retry-After: 2` is waited out and the batch sent again.
 /// The exact wait is pinned by the `retry_loop` unit tests in `embedder.rs`;
 /// this pins that the binary retries at all and honours the header.
 ///
-/// Red if the provider stops retrying (exit non-zero) or ignores the header
-/// and resends at once (under 1 s).
+/// Red if the provider stops retrying (exit non-zero) or ignores the header.
+/// Without it, the first retry waits the 1 s backoff plus under 0.25 s of
+/// jitter, which stays below the 2 s this checks for.
 #[test]
 fn index_waits_out_a_429_retry_after_and_then_succeeds() {
     let notes = one_note();
@@ -295,7 +296,7 @@ fn index_waits_out_a_429_retry_after_and_then_succeeds() {
         fx.answer_with(move |req| {
             let mut first = first.lock().expect("first lock");
             if std::mem::replace(&mut *first, false) {
-                reply(429, &[("Retry-After", "1")])
+                reply(429, &[("Retry-After", "2")])
             } else {
                 MockReply::plain(default_response(req, DIM))
             }
@@ -307,8 +308,8 @@ fn index_waits_out_a_429_retry_after_and_then_succeeds() {
     assert!(out.status.success(), "{}", stderr_of(&out));
     assert_eq!(fx.mock.requests().len(), 2, "one 429, one success");
     assert!(
-        took >= Duration::from_secs(1),
-        "Retry-After: 1 was not waited: {took:?}"
+        took >= Duration::from_secs(2),
+        "Retry-After: 2 was not waited: {took:?}"
     );
     assert_dir_empty(&fx.cache);
 }
@@ -351,8 +352,10 @@ fn index_does_not_retry_a_401() {
     let fx = fixture("groove-aw04-401", &files(&notes), "");
     fx.answer_with(|_| reply(401, &[("Retry-After", "0")]));
     let out = fx.run_index();
-    assert!(!out.status.success(), "{}", stderr_of(&out));
-    assert_eq!(fx.mock.requests().len(), 1);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert!(stderr.contains("HTTP 401"), "{stderr}");
     assert_dir_empty(&fx.cache);
 }
 
@@ -399,7 +402,9 @@ fn index_sends_long_inputs_cut_to_max_input_chars() {
 /// A `Retry-After` over 60 s is not waited for: the run stops at once and
 /// says what the server asked for.
 ///
-/// Red if the cap is dropped (the run would wait 120 s and miss the bound).
+/// Red if the cap is dropped: the run would then wait 120 s before each of
+/// its three retries, about 360 s in all, and fail the 30 s bound only once
+/// it ends.
 #[test]
 fn index_stops_without_waiting_when_retry_after_exceeds_sixty_seconds() {
     let notes = one_note();
@@ -410,8 +415,8 @@ fn index_stops_without_waiting_when_retry_after_exceeds_sixty_seconds() {
     let took = started.elapsed();
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
-    assert!(took < Duration::from_secs(30), "waited {took:?}");
-    assert_eq!(fx.mock.requests().len(), 1);
+    assert!(took < Duration::from_secs(30), "waited {took:?}: {stderr}");
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
     assert!(stderr.contains("asked to retry after 120 s"), "{stderr}");
     assert_dir_empty(&fx.cache);
 }
