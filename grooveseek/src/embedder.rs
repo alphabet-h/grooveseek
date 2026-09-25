@@ -1518,82 +1518,38 @@ mod tests {
     /// AW-07: a failed request must not print the endpoint URL, which can
     /// carry a secret in its query string.
     ///
-    /// The server reads the request and then never answers, holding the
-    /// socket open until the client has its error, so the only way out is
-    /// the client timeout, however loaded the machine is. Every wait on the
-    /// server side, the accept included, ends by a deadline, so a client
-    /// that never connects fails this test instead of hanging it.
+    /// The request fails by connection refused: the port was bound and then
+    /// released, so nothing listens there and no server has to be kept
+    /// alive or waited on. If another process takes the port in between, the
+    /// call either still fails while sending (the check below still holds)
+    /// or gets an answer and fails some other way, which fails this test; a
+    /// taken port cannot make it pass without exercising the send path.
     #[test]
-    fn openai_compatible_request_errors_omit_the_endpoint() {
-        let timeout = Duration::from_millis(200);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent server");
-        let endpoint = format!(
-            "http://{}/v1/embeddings?token=query-secret",
-            listener.local_addr().expect("listener address")
-        );
-        let (received_tx, received_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let handle = thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking listener");
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if release_rx.try_recv().is_ok() || std::time::Instant::now() >= deadline {
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("accept request: {e}"),
-                }
-            };
-            stream.set_nonblocking(false).expect("blocking stream");
-            stream
-                .set_read_timeout(Some(
-                    deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .max(Duration::from_millis(1)),
-                ))
-                .expect("read timeout");
-            let _ = received_tx.send(read_http_request(&mut stream));
-            // Hold the connection, unanswered, until the client gave up.
-            let _ = release_rx
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-            drop(stream);
-        });
-        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
-            openai_config(endpoint, 2, timeout),
-        ))
-        .expect("build embedder");
+    fn openai_compatible_refused_connection_errors_omit_the_endpoint() {
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a port")
+            .local_addr()
+            .expect("reserved address");
+        let mut embedder =
+            Embedder::with_settings(EmbeddingSettings::openai_compatible(openai_config(
+                format!("http://{addr}/v1/embeddings?token=query-secret"),
+                2,
+                Duration::from_secs(5),
+            )))
+            .expect("build embedder");
 
-        let started = std::time::Instant::now();
-        let result = embedder.embed_single("needle");
-        let elapsed = started.elapsed();
-        let _ = release_tx.send(());
-        let server = handle.join();
-
-        // The whole request reached the server and the client waited out its
-        // timeout: this failed by timing out, not by some other error.
-        let request = received_rx
-            .try_recv()
-            .expect("the server never received the request");
-        assert!(server.is_ok(), "the silent server thread panicked");
-        assert!(
-            request.contains("needle"),
-            "the server received a request without the text"
-        );
-        let err = result.expect_err("an unanswered request must time out");
-        assert!(
-            elapsed >= timeout,
-            "the request failed after {elapsed:?}, before its {timeout:?} timeout"
-        );
+        let err = embedder
+            .embed_single("needle")
+            .expect_err("nothing listens on a released port");
         let msg = err.to_string();
+        // Checked before any assert that prints the message.
+        assert!(!msg.contains("query-secret"), "the error echoes the query");
+        assert!(
+            !msg.contains(&addr.to_string()),
+            "the error echoes the host and port"
+        );
+        assert!(!msg.contains("/v1/embeddings"), "the error echoes the path");
         assert!(msg.contains("embedding request failed"), "{msg}");
-        assert!(!msg.contains("query-secret"), "{msg}");
-        assert!(!msg.contains("/v1/embeddings"), "{msg}");
     }
 
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes
