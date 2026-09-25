@@ -158,6 +158,8 @@ pub struct OpenAiCompatibleConfig {
     max_input_chars: Option<usize>,
     /// How many times one batch is sent again after a transient failure.
     max_retries: u32,
+    /// (AW-13) The endpoint is on this machine, so the client skips any proxy.
+    endpoint_is_loopback: bool,
 }
 
 impl fmt::Debug for OpenAiCompatibleConfig {
@@ -172,6 +174,7 @@ impl fmt::Debug for OpenAiCompatibleConfig {
             .field("timeout", &self.timeout)
             .field("max_input_chars", &self.max_input_chars)
             .field("max_retries", &self.max_retries)
+            .field("endpoint_is_loopback", &self.endpoint_is_loopback)
             .finish()
     }
 }
@@ -202,6 +205,7 @@ impl OpenAiCompatibleConfig {
         );
         let endpoint_display =
             format!("{}{}", parsed.origin().ascii_serialization(), parsed.path());
+        let loopback = endpoint_is_loopback(&parsed);
         anyhow::ensure!(
             !query_model.trim().is_empty() && !document_model.trim().is_empty(),
             "[embedding] requires `model`, or both `query_model` and `document_model`, \
@@ -241,6 +245,7 @@ impl OpenAiCompatibleConfig {
             index_model_id,
             max_input_chars: None,
             max_retries: 0,
+            endpoint_is_loopback: loopback,
         })
     }
 
@@ -566,9 +571,7 @@ impl OpenAiCompatibleProvider {
             let mut builder = reqwest::blocking::Client::builder()
                 .timeout(self.config.timeout)
                 .redirect(reqwest::redirect::Policy::none());
-            // `new` already parsed the endpoint, so a parse failure cannot
-            // happen here; treating it as remote keeps today's behaviour.
-            if reqwest::Url::parse(&self.config.endpoint).is_ok_and(|u| endpoint_is_loopback(&u)) {
+            if self.config.endpoint_is_loopback {
                 // Drops both the proxy environment variables and the OS proxy.
                 builder = builder.no_proxy();
             }

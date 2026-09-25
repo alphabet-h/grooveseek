@@ -1,5 +1,6 @@
 //! AW-13: a loopback OpenAI-compatible endpoint is contacted directly, even
-//! when the environment names a proxy.
+//! when the environment names a proxy; any other endpoint still goes through
+//! that proxy.
 //!
 //! The document text and the API key are meant for a server on this machine;
 //! a proxy set for the outside world must not see them. The test drives the
@@ -12,9 +13,10 @@
 
 mod common;
 
-use common::embed_cli::{fixture, note, stderr_of};
+use common::embed_cli::{Fixture, fixture, note, stderr_of};
 
 use std::net::TcpListener;
+use std::process::Output;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -93,6 +95,69 @@ fn loopback_endpoint_bypasses_proxy_environment() {
     );
     let proxy = CountingProxy::start();
 
+    let out = index_through(&fx, &proxy);
+    let stderr = stderr_of(&out);
+
+    assert_eq!(
+        proxy.accepted(),
+        0,
+        "the proxy saw a connection meant for a loopback endpoint:\n{stderr}"
+    );
+    assert!(out.status.success(), "groove index failed:\n{stderr}");
+    assert!(
+        !fx.mock.requests().is_empty(),
+        "the loopback endpoint was never reached:\n{stderr}"
+    );
+}
+
+/// The other half of the rule: an endpoint that is not loopback still goes
+/// through the proxy the environment names.
+///
+/// `.invalid` never resolves (RFC 6761), so the only way a connection reaches
+/// the listener is a request the client routed through it. `groove index` is
+/// expected to fail, since the stand-in proxy drops what it accepts.
+///
+/// Red if every endpoint gets `no_proxy()`: the client then looks the name up
+/// itself, fails, and the proxy sees nothing.
+#[test]
+fn remote_endpoint_still_uses_proxy_environment() {
+    let fx = fixture(
+        "groove-aw13-remote",
+        &[(
+            "alpha.md",
+            &note("Alpha", "The lighthouse keeper logs ships."),
+        )],
+        "max_retries = 0\n",
+    );
+    let remote = format!(
+        "http://embed.invalid:{}/v1/embeddings",
+        fx.mock.addr().port()
+    );
+    let toml = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    assert!(
+        toml.contains(&fx.mock.endpoint()),
+        "groove.toml does not name the mock endpoint:\n{toml}"
+    );
+    std::fs::write(&fx.config, toml.replace(&fx.mock.endpoint(), &remote))
+        .expect("rewrite groove.toml");
+    let proxy = CountingProxy::start();
+
+    let out = index_through(&fx, &proxy);
+    let stderr = stderr_of(&out);
+
+    assert!(
+        proxy.accepted() >= 1,
+        "a non-loopback endpoint bypassed the proxy:\n{stderr}"
+    );
+    assert!(
+        fx.mock.requests().is_empty(),
+        "the mock was reached directly:\n{stderr}"
+    );
+}
+
+/// `groove index` on `fx`'s knowledge base with every proxy variable (both
+/// cases) pointed at `proxy` and no `NO_PROXY`, whatever the exit code.
+fn index_through(fx: &Fixture, proxy: &CountingProxy) -> Output {
     let mut cmd = fx.cmd();
     for var in ["NO_PROXY", "no_proxy"] {
         cmd.env_remove(var);
@@ -107,21 +172,8 @@ fn loopback_endpoint_bypasses_proxy_environment() {
     ] {
         cmd.env(var, &proxy.url);
     }
-    let out = cmd
-        .args(["index", "--kb-path"])
+    cmd.args(["index", "--kb-path"])
         .arg(fx.kb())
         .output()
-        .expect("spawn groove index");
-    let stderr = stderr_of(&out);
-
-    assert_eq!(
-        proxy.accepted(),
-        0,
-        "the proxy saw a connection meant for a loopback endpoint:\n{stderr}"
-    );
-    assert!(out.status.success(), "groove index failed:\n{stderr}");
-    assert!(
-        !fx.mock.requests().is_empty(),
-        "the loopback endpoint was never reached:\n{stderr}"
-    );
+        .expect("spawn groove index")
 }
