@@ -1,11 +1,11 @@
 //! AW-08: [`grooveseek::indexer::rebuild_index`] drives a callback reporter.
 //!
 //! [`grooveseek::indexer::progress`]'s own tests call the reporter's methods
-//! by hand, and `index_progress_cli.rs` only reads the stderr lines of the
-//! other modes. Neither notices when `rebuild_index` stops calling one of
-//! those methods, and the application that embeds this crate
-//! (grooveseek-desktop) draws its progress from nothing else. These run
-//! `rebuild_index` in-process with
+//! by hand, and the CLI progress tests only read the stderr lines of the
+//! other modes. Neither notices when [`grooveseek::indexer::rebuild_index`]
+//! stops calling one of those methods, and the application that embeds this
+//! crate (grooveseek-desktop) draws its progress from nothing else. These run
+//! [`grooveseek::indexer::rebuild_index`] in-process with
 //! [`grooveseek::indexer::progress::ProgressReporter::with_callback`] and
 //! read back what the callback was handed.
 //!
@@ -97,7 +97,7 @@ impl Fixture {
         }
     }
 
-    /// One incremental `rebuild_index` run, wired the way `groove index`
+    /// One incremental [`grooveseek::indexer::rebuild_index`] run, wired the way `groove index`
     /// wires it, with a callback reporter; its result and every event the
     /// callback received.
     fn run(&self) -> (anyhow::Result<IndexResult>, Vec<Ev>) {
@@ -137,13 +137,17 @@ fn doc(title: &str, body: &str) -> String {
 
 /// Every file the scan hands the loop is reported exactly once, as
 /// `Indexed` when it was embedded and as `Unchanged` when it was not, and
-/// `done` counts them one by one against the `total` `Started` announced.
+/// the done count goes up one file at a time against the total `Started`
+/// announced.
 ///
 /// `stub.md` is frontmatter and nothing else, so the loop skips it for having
 /// no chunks; that skip is still one step of the run. The second run finds
-/// every hash unchanged. Red if `rebuild_index` stops calling
-/// `start_indexing`, `report_indexed`, `finish`, or `report_unchanged` in the
-/// arm for a skipped file or for an unchanged one.
+/// every hash unchanged. Red if [`grooveseek::indexer::rebuild_index`] stops
+/// calling [`grooveseek::indexer::progress::ProgressReporter::start_indexing`],
+/// [`grooveseek::indexer::progress::ProgressReporter::report_indexed`],
+/// [`grooveseek::indexer::progress::ProgressReporter::finish`], or
+/// [`grooveseek::indexer::progress::ProgressReporter::report_unchanged`] in
+/// the arm for a skipped file or for an unchanged one.
 #[test]
 fn rebuild_index_reports_each_scanned_file_once_through_the_callback() {
     let fx = Fixture::new("groove-aw08-each", EmbedMock::start(DIM));
@@ -186,7 +190,8 @@ fn rebuild_index_reports_each_scanned_file_once_through_the_callback() {
 ///
 /// Declaring a schema after the first run makes the second one read every
 /// unchanged Markdown document again for its declared fields, without
-/// re-embedding it. Red if `rebuild_index` stops calling `report_unchanged`
+/// re-embedding it. Red if [`grooveseek::indexer::rebuild_index`] stops
+/// calling [`grooveseek::indexer::progress::ProgressReporter::report_unchanged`]
 /// in the arm for a metadata-only refresh.
 #[test]
 fn rebuild_index_reports_a_metadata_only_refresh_as_unchanged() {
@@ -223,11 +228,12 @@ fn rebuild_index_reports_a_metadata_only_refresh_as_unchanged() {
 }
 
 /// A file moved with its bytes unchanged is reported as `Renamed`, and a
-/// file gone from disk as `Deleted`, and neither advances `done`.
+/// file gone from disk as `Deleted`, and neither advances the done count.
 ///
 /// `Renamed` comes before the per-file loop and `Deleted` after it, which is
-/// where `rebuild_index` detects each. Red if it stops calling
-/// `report_renamed` or `report_deleted`.
+/// where [`grooveseek::indexer::rebuild_index`] detects each. Red if it stops
+/// calling [`grooveseek::indexer::progress::ProgressReporter::report_renamed`]
+/// or [`grooveseek::indexer::progress::ProgressReporter::report_deleted`].
 #[test]
 fn rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_deleted() {
     let fx = Fixture::new("groove-aw08-move", EmbedMock::start(DIM));
@@ -263,8 +269,8 @@ fn rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_dele
 /// `Finished` arrives once, at the end of a run that returned `Ok`, and not
 /// at all from one that returned `Err`.
 ///
-/// An endpoint that answers 500 fails the first embed, and `rebuild_index`
-/// returns through `?` after `Started`. The consumer learns the run ended
+/// An endpoint that answers 500 fails the first embed, and
+/// [`grooveseek::indexer::rebuild_index`] returns through `?` after `Started`. The consumer learns the run ended
 /// from that `Err`; a `Finished` as well would tell it the run completed.
 #[test]
 fn rebuild_index_emits_finished_only_on_success() {
@@ -300,13 +306,15 @@ fn rebuild_index_emits_finished_only_on_success() {
     );
 }
 
-/// `done` stops short of `total` by exactly the files the scan declined.
+/// The done count stops short of the total by exactly the files the scan
+/// declined.
 ///
-/// `total` is what the walk found; a file over the size cap is declined by
+/// The total is what the walk found; a file over the size cap is declined by
 /// the scan before the loop, so it reaches neither `Indexed` nor `Unchanged`
-/// and `done` never counts it. That is the contract the rustdoc on
+/// and the done count never includes it. That is the contract the rustdoc on
 /// [`grooveseek::indexer::progress::ProgressEvent::Indexed`] states, so a
-/// consumer does not read `done < total` at `Finished` as a failure.
+/// consumer does not read a done count below the total at `Finished` as a
+/// failure.
 /// `set_len` makes the oversized file without writing its bytes: the scan
 /// decides from its metadata and never reads it.
 #[test]

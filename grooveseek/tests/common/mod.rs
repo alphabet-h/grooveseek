@@ -36,7 +36,7 @@
 //!   endpoint, the `groove.toml` that points at it, and the environment a
 //!   child `groove` needs to reach it and nothing else. Used by the AW-06
 //!   OpenAI-compatible provider tests and, in-process, by the AW-08 progress
-//!   callback tests (`index_progress_callback.rs`); here so the HTTP-error
+//!   callback tests; here so the HTTP-error
 //!   tests that build on it (AW-03 / 04) reuse it rather than copy it.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
