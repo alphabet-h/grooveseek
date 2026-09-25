@@ -97,9 +97,11 @@ impl Fixture {
         }
     }
 
-    /// One incremental [`grooveseek::indexer::rebuild_index`] run, wired the way `groove index`
-    /// wires it, with a callback reporter; its result and every event the
-    /// callback received.
+    /// One incremental [`grooveseek::indexer::rebuild_index`] run, wired the
+    /// way `groove index` wires it, with a callback reporter; its result and
+    /// every event the callback received. The reporter is the one argument
+    /// that differs from the command line's: no CLI flag selects a callback,
+    /// and it is what is under test.
     fn run(&self) -> (anyhow::Result<IndexResult>, Vec<Ev>) {
         let kb = self.layout.kb();
         let cfg = Config::load_from(&self.config).expect("load groove.toml");
@@ -113,6 +115,12 @@ impl Fixture {
         db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
             .expect("embedding meta");
         let mut embedder = Embedder::with_settings(embedding).expect("build the embedder");
+        let exclude_dirs = cfg.resolve_exclude_dirs();
+        let context_mode = if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+            ContextMode::Static
+        } else {
+            ContextMode::Off
+        };
         let (log, f) = recorder();
         let result = rebuild_index(
             &db,
@@ -120,11 +128,11 @@ impl Fixture {
             kb,
             schema,
             false,
-            None,
-            &[],
+            cfg.exclude_headings.as_deref(),
+            &exclude_dirs,
             &registry,
             ProgressReporter::with_callback(f),
-            ContextMode::Off,
+            context_mode,
         );
         let events = log.lock().expect("recorder mutex").clone();
         (result, events)
