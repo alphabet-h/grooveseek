@@ -1159,11 +1159,17 @@ fn embed_input_for(chunk: &crate::parser::Chunk, mode: ContextMode) -> String {
     }
 }
 
-/// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed. The
-/// one-time frontmatter check (#251) treats every other skip as "not read", because those
-/// return before the parser runs; this one counts as read only when the bytes parsed are
-/// the bytes the retained row holds.
+/// The one [`SingleResult::Skipped`] reason that is decided *after* the file was parsed and
+/// counts as having read it. The one-time frontmatter check (#251) treats every other skip
+/// as "not read" -- the ones that return before the parser runs, and
+/// [`SKIPPED_EMBED_REJECTED`], which parsed the file but wrote nothing from it; this one
+/// counts as read only when the bytes parsed are the bytes the retained row holds.
 const SKIPPED_NO_CHUNKS: &str = "no embeddable chunks";
+
+/// The [`SingleResult::Skipped`] reason for a file whose input the embedding endpoint
+/// refused ([`crate::embedder::EmbedInputRejected`], HTTP 400 / 413 / 422, AW-04). The
+/// file is skipped on its own and the run goes on; the row it had stays.
+const SKIPPED_EMBED_REJECTED: &str = "embedding endpoint rejected the input";
 
 /// The [`SingleResult::Skipped`] reason the one-time frontmatter check (#251) returns when
 /// the bytes it read are not the bytes the scan hashed: the file was swapped between the
@@ -1516,9 +1522,26 @@ fn index_single_disk_entry(
         .map(|c| embed_input_for(c, context_mode))
         .collect();
     let texts: Vec<&str> = embed_inputs.iter().map(String::as_str).collect();
-    let embeddings = embedder
-        .embed_texts(&texts)
-        .with_context(|| format!("failed to embed chunks for {}", entry.rel))?;
+    let embeddings = match embedder.embed_texts(&texts) {
+        Ok(embeddings) => embeddings,
+        Err(e) => {
+            // (AW-04) A refusal of this file's input is this file's problem: skip it and
+            // let the run go on. Only the status is printed -- the error's text carries
+            // the endpoint's response body (trap #275).
+            if let Some(rejected) = e.downcast_ref::<crate::embedder::EmbedInputRejected>() {
+                eprintln!(
+                    "warning: {}: embedding endpoint rejected the input (HTTP {}); skipped, \
+                     the index keeps what it had for this file",
+                    entry.rel, rejected.status
+                );
+                return Ok(SingleResult::Skipped {
+                    reason: SKIPPED_EMBED_REJECTED,
+                    frontmatter_unparsed: parsed.frontmatter_error.is_some(),
+                });
+            }
+            return Err(e).with_context(|| format!("failed to embed chunks for {}", entry.rel));
+        }
+    };
 
     // Per-file atomicity (F-32): wrap upsert_document + N x insert_chunk
     // in a single tx so that a partial failure (e.g. vec_chunks dim
