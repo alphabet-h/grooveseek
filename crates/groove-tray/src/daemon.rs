@@ -469,6 +469,19 @@ mod tests {
     /// Set on the child [`probe_daemon_ignores_the_proxy_environment`] starts,
     /// so the child runs the probe instead of starting another child.
     const PROXY_CHILD: &str = "GROOVE_TRAY_AW13_PROXY_CHILD";
+    /// Set by the parent to the same value as [`PROXY_CHILD`]. A marker that
+    /// leaked in from the runner has no matching nonce, so the child refuses
+    /// to run instead of passing without the proxy setup.
+    const PROXY_NONCE: &str = "GROOVE_TRAY_AW13_PROXY_NONCE";
+    /// The proxy variables the parent points at the stand-in proxy.
+    const PROXY_VARS: [&str; 6] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
 
     /// AW-13: the admin probe reaches a loopback daemon directly, even when
     /// every proxy variable names a proxy and `NO_PROXY` is unset.
@@ -485,6 +498,7 @@ mod tests {
     #[test]
     fn probe_daemon_ignores_the_proxy_environment() {
         if std::env::var_os(PROXY_CHILD).is_some() {
+            assert_proxy_child_setup();
             probe_through_proxy_environment_in_child();
             return;
         }
@@ -509,6 +523,14 @@ mod tests {
             })
         };
 
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("test binary"));
         cmd.args([
             "daemon::tests::probe_daemon_ignores_the_proxy_environment",
@@ -516,17 +538,11 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(PROXY_CHILD, "1")
+        .env(PROXY_CHILD, &nonce)
+        .env(PROXY_NONCE, &nonce)
         .env_remove("NO_PROXY")
         .env_remove("no_proxy");
-        for var in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-        ] {
+        for var in PROXY_VARS {
             cmd.env(var, &proxy_url);
         }
         let out = cmd.output().expect("run the test in a child");
@@ -548,6 +564,32 @@ mod tests {
             stdout.contains("test result: ok. 1 passed"),
             "the child ran no test:\n{stdout}\n{stderr}"
         );
+    }
+
+    /// Panic unless this process is the child the parent set up: the marker
+    /// matches the nonce, every proxy variable is set and `NO_PROXY` is not.
+    /// Without this a marker leaked from the runner would run the probe with
+    /// no proxy anywhere and pass without testing anything.
+    fn assert_proxy_child_setup() {
+        let marker = std::env::var(PROXY_CHILD).unwrap_or_default();
+        let nonce = std::env::var(PROXY_NONCE).unwrap_or_default();
+        assert!(
+            !marker.is_empty() && marker == nonce,
+            "{PROXY_CHILD} is set but does not match {PROXY_NONCE}: not started by the parent \
+             test (leaked from the environment?)"
+        );
+        for var in PROXY_VARS {
+            assert!(
+                std::env::var_os(var).is_some_and(|v| !v.is_empty()),
+                "{var} is not set in the child: the proxy setup did not happen"
+            );
+        }
+        for var in ["NO_PROXY", "no_proxy"] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} is set in the child: it could exempt loopback and hide the bug"
+            );
+        }
     }
 
     /// The child side: answer one status request on loopback with a pid, and
