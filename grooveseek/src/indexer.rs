@@ -1063,7 +1063,8 @@ pub fn rebuild_index(
         // (AW-04) Read before the call, so a refusal below can tell whether the endpoint
         // accepted part of this file first.
         let refused_after_accepting_before = embedder.documents_refused_after_accepting();
-        let single_result = index_single_disk_entry(
+        let crossed = crossed_parser_renames.contains(&entry.rel);
+        let single_result = index_entry(
             db,
             embedder,
             entry,
@@ -1076,12 +1077,13 @@ pub fn rebuild_index(
                 pass: pass_token.as_deref(),
                 generation: &declared_json,
             },
+            crossed,
         )?;
         // (codex P2 round 9 on PR #291) Before the match below decides what this entry counts
         // as: if this was a forced reparse across a parser boundary and it did not end in
         // `Updated`, the row is stale under the new path and must go. See
         // `settle_cross_parser_rename`'s doc for why.
-        if crossed_parser_renames.contains(&entry.rel) {
+        if crossed {
             settle_cross_parser_rename(db, &entry.rel, &single_result)?;
         }
         match single_result {
@@ -1338,6 +1340,9 @@ enum Reindex {
 /// are written, and an absent generation (pending: a [`rebuild_index`] refresh has cleared
 /// the key and not yet rewritten it, or has not run at all) leaves the rows untouched and
 /// marks the running pass instead ([`write_declared_rows_or_mark_dirty`]).
+///
+/// [`index_entry`] with `row_dropped_unless_updated` false: for callers that do not
+/// settle a rename across parsers afterwards.
 #[allow(clippy::too_many_arguments)]
 fn index_single_disk_entry(
     db: &Database,
@@ -1348,6 +1353,37 @@ fn index_single_disk_entry(
     mode: Reindex,
     context_mode: ContextMode,
     declared: DeclaredSet<'_>,
+) -> Result<SingleResult> {
+    index_entry(
+        db,
+        embedder,
+        entry,
+        exclude_headings,
+        registry,
+        mode,
+        context_mode,
+        declared,
+        false,
+    )
+}
+
+/// The body of [`index_single_disk_entry`]. `row_dropped_unless_updated` is true for
+/// the destination of a rename that [`rename_crosses_a_parser`]: the caller then
+/// settles it with [`settle_cross_parser_rename`], which drops the row the old parser
+/// left under this path unless the result is [`SingleResult::Updated`]. A refusal is
+/// worded for that final state -- not in the index -- rather than for the row it sees
+/// now (local Codex before round 2 on PR #329).
+#[allow(clippy::too_many_arguments)]
+fn index_entry(
+    db: &Database,
+    embedder: &mut Embedder,
+    entry: &DiskEntry,
+    exclude_headings: Option<&[String]>,
+    registry: &Registry,
+    mode: Reindex,
+    context_mode: ContextMode,
+    declared: DeclaredSet<'_>,
+    row_dropped_unless_updated: bool,
 ) -> Result<SingleResult> {
     let force = mode == Reindex::Force;
     let (refresh_frontmatter, refresh_fields) = match mode {
@@ -1633,14 +1669,16 @@ fn index_single_disk_entry(
             // let the run go on. Only the status is printed -- the error's text carries
             // the endpoint's response body (trap #275).
             if let Some(rejected) = e.downcast_ref::<crate::embedder::EmbedInputRejected>() {
-                // Worded from the index as it stands (codex P1 on PR #329): a file with a
-                // row keeps it; one without -- every file in a forced rebuild, whose reset
-                // emptied the index, and a new file -- is simply not in it.
-                let outcome = if db.get_document_hash(&entry.rel)?.is_some() {
-                    "the index keeps what it had for this file"
-                } else {
-                    "this file is not in the index"
-                };
+                // Worded for the row's state once the caller is done (codex P1 on PR #329):
+                // a file with a row keeps it; one without -- every file in a forced rebuild,
+                // whose reset emptied the index, and a new file -- is simply not in it, and
+                // so is the destination of a cross-parser rename, whose row the caller drops.
+                let outcome =
+                    if !row_dropped_unless_updated && db.get_document_hash(&entry.rel)?.is_some() {
+                        "the index keeps what it had for this file"
+                    } else {
+                        "this file is not in the index"
+                    };
                 eprintln!(
                     "warning: {}: embedding endpoint rejected the input (HTTP {}); skipped, \
                      {outcome}",
@@ -2267,7 +2305,7 @@ pub fn rename_single_file(
     // same_hash (= Static モードでの強制、または parser を跨いだ rename) の
     // 場合のみ force=true で hash 一致 fast path をバイパスする。内容が変わって
     // いる場合は通常の force=false 経路 (frontmatter-only skip 判定含む) に任せる。
-    let single_result = index_single_disk_entry(
+    let single_result = index_entry(
         db,
         embedder,
         &entry,
@@ -2283,6 +2321,7 @@ pub fn rename_single_file(
         },
         context_mode,
         DeclaredSet::FromIndex,
+        crosses_a_parser,
     )?;
     // (codex P2 round 9 on PR #291) Crossed a parser: whatever the reparse came back with,
     // settle it the same way `rebuild_index`'s rename loop does. See

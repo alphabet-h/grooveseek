@@ -881,3 +881,115 @@ fn mcp_rebuild_index_force_reports_an_error_when_one_file_is_rejected() {
     );
     assert_dir_empty(&fx.cache);
 }
+
+/// `.txt` and `.md` are read by different parsers, so a rename between them is
+/// re-parsed under the new one, and a reparse that does not end in an update
+/// drops the row the old parser wrote.
+const TXT_AND_MD: &str = "\n[parsers]\nenabled = [\"md\", \"txt\"]\n";
+
+/// The per-file warning for a rejected cross-parser rename, which ends with
+/// the row gone.
+const CROSSED_REJECTED_WARNING: &str = "warning: note.md: embedding endpoint rejected the input \
+     (HTTP 413); skipped, this file is not in the index";
+
+/// A text note carrying the reject marker, indexed while the mock answers
+/// normally, so it has a row before it is renamed.
+fn marked_txt_note() -> String {
+    format!("A plain text note about the harbour {REJECT_MARKER} and its tides.\n")
+}
+
+/// `groove index` pairs `note.txt` -> `note.md` as a rename that crosses a
+/// parser, re-parses it under the Markdown parser, and the endpoint refuses
+/// it. The old parser's row is then dropped, so the warning must say the file
+/// is not in the index, not that the index kept what it had.
+///
+/// Red if the warning's tail is decided from the row before the rename is
+/// settled (it would say "keeps what it had" over a row that is deleted).
+#[test]
+fn index_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
+    let txt = marked_txt_note();
+    let alpha = note("Alpha", ALPHA);
+    let beta = note("Beta", BETA);
+    let fx = fixture(
+        "groove-aw04-cross-rebuild",
+        &[
+            ("alpha.md", alpha.as_str()),
+            ("beta.md", beta.as_str()),
+            ("note.txt", txt.as_str()),
+        ],
+        TXT_AND_MD,
+    );
+    fx.index();
+    assert_eq!(fx.documents(), 3);
+
+    std::fs::rename(fx.kb().join("note.txt"), fx.kb().join("note.md")).expect("rename note.txt");
+    fx.layout
+        .write("beta.md", &note("Beta", &format!("{BETA} Edited.")));
+    fx.answer_with(rejects_marker(413));
+    let out = fx.run_index();
+    fx.answer_normally();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains(CROSSED_REJECTED_WARNING), "{stderr}");
+    assert!(!stderr.contains("keeps what it had"), "{stderr}");
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_eq!(fx.documents(), 2, "the old parser's row must be gone");
+    assert_dir_empty(&fx.cache);
+}
+
+/// The watcher meets the same cross-parser rename one event at a time: its
+/// `rename_single_file` drops the old parser's row after the refusal, so the
+/// warning must say the file is not in the index.
+///
+/// Red if the warning's tail is decided before the rename is settled.
+#[test]
+fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
+    let txt = marked_txt_note();
+    let alpha = note("Alpha", ALPHA);
+    let fx = fixture(
+        "groove-aw04-cross-watch",
+        &[("alpha.md", alpha.as_str()), ("note.txt", txt.as_str())],
+        &format!("{TXT_AND_MD}\n[watch]\nenabled = true\ndebounce_ms = 300\n"),
+    );
+    fx.index();
+    assert_eq!(fx.documents(), 2);
+    fx.answer_with(rejects_marker(413));
+    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
+        hermetic(c, &fx.cache);
+    });
+    std::fs::rename(fx.kb().join("note.txt"), fx.kb().join("note.md")).expect("rename note.txt");
+    let lines = || -> Vec<String> {
+        guard
+            .stderr()
+            .lines()
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect()
+    };
+    let reported = wait_until(Duration::from_secs(30), || {
+        lines()
+            .iter()
+            .any(|l| l.contains("watcher: renamed note.txt -> note.md"))
+    });
+    let all = lines();
+    drop(guard);
+    fx.answer_normally();
+    assert!(reported, "no watcher rename line:\n{}", all.join("\n"));
+    assert!(
+        all.iter().any(|l| l.contains(CROSSED_REJECTED_WARNING)),
+        "{}",
+        all.join("\n")
+    );
+    assert!(
+        !all.iter().any(|l| l.contains("keeps what it had")),
+        "{}",
+        all.join("\n")
+    );
+    assert!(
+        !all.iter().any(|l| l.contains(BODY_SENTINEL)),
+        "{}",
+        all.join("\n")
+    );
+    assert_eq!(fx.documents(), 1, "the old parser's row must be gone");
+    assert_dir_empty(&fx.cache);
+}
