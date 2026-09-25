@@ -2213,7 +2213,8 @@ mod tests {
 
     /// AW-07: FastEmbed refuses each HTTP-only key on its own, not just the
     /// two above. One key per case pins each arm of the OR in
-    /// `resolve_fastembed`, so dropping any single arm fails here. The error
+    /// [`EmbeddingConfig::resolve_fastembed`], so dropping any single arm
+    /// fails here. The error
     /// is one message for all seven keys and does not name the key; this
     /// test does not claim that it does.
     #[test]
