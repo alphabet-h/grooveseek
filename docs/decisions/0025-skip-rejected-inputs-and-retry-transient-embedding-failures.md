@@ -159,6 +159,11 @@ only saw rejections fails after it has finished.**
 - **Japanese text can exceed a token limit within 8000 characters**, since a
   character can take more than one token. Those files are skipped with a
   warning; lowering `max_input_chars` brings them back.
+- **A Markdown file refused on every run holds back a changed schema.** After
+  the keys `groove-schema.toml` declares change, a refused file counts as not
+  read, so the new declared-field set is not recorded and `fields` /
+  `fields_not` filters are refused until the file is fixed, `max_input_chars`
+  is lowered, or `groove index --force` is run.
 - **Tests hold it**, in `grooveseek/tests/openai_compatible_failures.rs`
   (skipping on 400 / 413 / 422, the probe rejection, retries, `Retry-After`,
   truncation of documents and queries, the run that only saw rejections, over

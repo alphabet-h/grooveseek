@@ -98,7 +98,11 @@ retries it holds the embedder, so searches wait with it; set `max_retries = 0`
 where that matters. Inputs are cut to `max_input_chars` characters first.
 Japanese text can take more than one token per character, so a server with an
 8192-token limit may still refuse 8000 characters; lower `max_input_chars` if
-the warnings name many files. The details are in
+the warnings name many files. A refused Markdown file also counts as not
+read when the keys `groove-schema.toml` declares have changed, so while the
+endpoint keeps refusing it the new declared-field set is not recorded, and
+search refuses `fields` / `fields_not` filters until the file is fixed,
+`max_input_chars` is lowered, or `groove index --force` is run. The details are in
 [ADR-0025](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md).
 
 `--force` is also the repair for a `.groove.db` that cannot be opened as a database — a truncated write or a process killed mid-migration is enough. Any command that opens the file then fails with a message naming the file (it lives in the **parent** of `--kb-path`) and the two ways out: delete it and run `groove index`, or run `groove index --force`, which replaces the file and its `-wal` / `-shm` sidecars and rebuilds from scratch. The index is entirely derived from the corpus, so nothing is lost. Without `--force` the file is never touched.

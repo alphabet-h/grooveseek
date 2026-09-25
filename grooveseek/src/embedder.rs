@@ -709,7 +709,7 @@ fn truncate_to_chars(text: &str, max: usize) -> &str {
 
 /// A `Retry-After` value: delta-seconds, or an IMF-fixdate HTTP-date measured
 /// from `now` (a date in the past is zero). A delta too large for `u64` is
-/// [`Duration::MAX`], longer than any wait honoured. `None` for anything else,
+/// `Duration::MAX`, longer than any wait honoured. `None` for anything else,
 /// including the obsolete RFC 850 and asctime date forms: the caller then
 /// falls back to its own backoff.
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -2206,7 +2206,7 @@ mod tests {
         );
     }
 
-    /// A scripted attempt sequence for `retry_loop`: each call pops the next
+    /// A scripted attempt sequence for [`retry_loop`]: each call pops the next
     /// outcome and counts itself.
     fn scripted(
         outcomes: Vec<std::result::Result<u32, AttemptFailure>>,
@@ -2234,7 +2234,7 @@ mod tests {
         }
     }
 
-    /// Run `retry_loop` with a sleeper that records instead of sleeping, and no jitter.
+    /// Run [`retry_loop`] with a sleeper that records instead of sleeping, and no jitter.
     fn run_retry_loop(
         max_retries: u32,
         attempt: impl FnMut() -> std::result::Result<u32, AttemptFailure>,

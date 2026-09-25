@@ -134,6 +134,11 @@ run は最後まで済ませてから失敗にする。**
 - **日本語は 8000 文字以内でも token 上限を超えることがある。** 1 文字が 1 token を超える
   ことがあるため。そういうファイルは warning 付きで skip され、`max_input_chars` を下げれば
   戻る。
+- **毎回断られる Markdown ファイルは、変わった schema の反映を止める。**
+  `groove-schema.toml` の宣言キーが変わった後、断られたファイルは「読めていない」ものとして
+  数えられるので、新しい宣言フィールドの集合が記録されず、そのファイルを直すか、
+  `max_input_chars` を下げるか、`groove index --force` を打つまで、`fields` /
+  `fields_not` の filter は断られる。
 - **test が保つ**: `grooveseek/tests/openai_compatible_failures.rs` (400 / 413 / 422 での
   skip、probe の拒否、再試行、`Retry-After`、document と query の切り詰め、拒否しか
   起きなかった run を CLI と MCP で)、および `grooveseek/src/embedder.rs`・

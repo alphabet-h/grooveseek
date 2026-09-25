@@ -90,7 +90,10 @@ HTTP 429・5xx・timeout・接続失敗は再試行し (`max_retries`)、401・4
 待たされる。それが困る所では `max_retries = 0` にする。入力は先に `max_input_chars`
 文字で切られる。日本語は 1 文字が 1 token を超えることがあるので、上限 8192 token の
 サーバでも 8000 文字を断る場合がある。warning が多くのファイルを挙げるなら
-`max_input_chars` を下げる。詳細は
+`max_input_chars` を下げる。`groove-schema.toml` の宣言キーが変わった後は、断られた
+Markdown ファイルは「読めていない」ものとして数えられるので、endpoint が断り続ける間は
+新しい宣言フィールドの集合が記録されず、そのファイルを直すか、`max_input_chars` を下げるか、
+`groove index --force` を打つまで、検索は `fields` / `fields_not` の filter を断る。詳細は
 [ADR-0025](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md)。
 
 `--force` は、SQLite として開けなくなった `.groove.db` の修復手段でもある (書き込み途中の切断や、migration 中に kill されたプロセスで起きる)。その状態では file を開くすべてのコマンドが、file の場所 (`--kb-path` の**親ディレクトリ**にある) と 2 通りの直し方を message で示して失敗する: file を消して `groove index` を実行するか、`groove index --force` を実行する。後者は file と `-wal` / `-shm` の付随 file を置き換えて最初から作り直す。索引は corpus から完全に導出できるので失うものは無い。`--force` 無しでは file に触らない。
