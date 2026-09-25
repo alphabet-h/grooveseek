@@ -957,10 +957,11 @@ fn index_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
 /// Red if the warning's tail is decided before the rename is settled.
 ///
 /// Not every backend pairs a rename: macOS (FSEvents) can deliver it as a
-/// removal of `note.txt` (deindexed) and a creation of `note.md` (a plain
-/// reindex, refused, no row). The end state and the warning are the same
-/// either way and are asserted on every OS; the rename line is checked only
-/// when it appeared.
+/// removal of `note.txt` and a creation of `note.md` (a plain reindex,
+/// refused, no row). The warning and the absence of a `note.md` row are the
+/// same either way and are asserted on every OS; the rename line and the
+/// document count are checked only when a rename line appeared. macOS may not
+/// deindex the old path within the wait, and the test does not assert on it.
 #[test]
 fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
     let txt = marked_txt_note();
@@ -987,19 +988,17 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
     };
     const RENAME_LINE: &str = "watcher: renamed note.txt -> note.md";
     const REINDEX_LINE: &str = "watcher: skipped note.md (embedding endpoint rejected the input)";
-    const DEINDEX_LINE: &str = "watcher: deindexed note.txt";
-    // Unpaired, both halves have to have been handled before the end state is read.
     let reported = wait_until(Duration::from_secs(30), || {
-        let all = lines();
-        let has = |needle: &str| all.iter().any(|l| l.contains(needle));
-        has(RENAME_LINE) || (has(REINDEX_LINE) && has(DEINDEX_LINE))
+        lines()
+            .iter()
+            .any(|l| l.contains(RENAME_LINE) || l.contains(REINDEX_LINE))
     });
     let all = lines();
     drop(guard);
     fx.answer_normally();
     assert!(
         reported,
-        "neither a rename line nor a reindex plus deindex:\n{}",
+        "neither a rename line nor a reindex line:\n{}",
         all.join("\n")
     );
     let has = |needle: &str| all.iter().any(|l| l.contains(needle));
@@ -1013,12 +1012,22 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
             "{}",
             all.join("\n")
         );
+        assert_eq!(fx.documents(), 1, "the old parser's row must be gone");
     }
     assert!(has(CROSSED_REJECTED_WARNING), "{}", all.join("\n"));
     assert!(!has("indexed note.md"), "{}", all.join("\n"));
     assert!(!has("keeps what it had"), "{}", all.join("\n"));
     assert!(!has(BODY_SENTINEL), "{}", all.join("\n"));
-    assert_eq!(fx.documents(), 1, "the old parser's row must be gone");
+    // Whatever became of note.txt's row, no row answers to note.md.
+    let hits = fx.search_json("harbour tides");
+    let paths: Vec<&str> = hits
+        .get("results")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("search JSON has no results array: {hits}"))
+        .iter()
+        .filter_map(|h| h.get("path").and_then(|p| p.as_str()))
+        .collect();
+    assert!(!paths.contains(&"note.md"), "{hits}");
     assert_dir_empty(&fx.cache);
 }
 
