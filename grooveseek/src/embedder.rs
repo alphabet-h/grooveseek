@@ -597,17 +597,17 @@ impl OpenAiCompatibleProvider {
             .and_then(|value| parse_retry_after(value, SystemTime::now()));
         // Classified from the status line, before the body is read, and a body that stalls
         // or breaks off never changes that class (AW-04): a refusal stays a refusal (not a
-        // retryable timeout that ends the run), and a 429 / 5xx stays retryable, with its
+        // retryable timeout that ends the run), a 429 / 5xx stays retryable, with its
         // `Retry-After`, even when an overloaded proxy cuts its body short (codex P2 round 2
-        // on PR #329). For both the body only feeds the snippet, left empty here.
+        // on PR #329), and any other non-2xx stays fatal, so a 401 whose body stalls does not
+        // send the key again (local Codex before round 3). For all of them the body only
+        // feeds the snippet, left empty here.
         let class = classify_status(status);
         let body = match response.bytes() {
             Ok(body) => body,
-            Err(_) if matches!(class, StatusClass::InputRejected | StatusClass::Retryable) => {
-                Default::default()
-            }
-            // A 2xx, or a status that stops the run anyway: a timeout is retried, any other
-            // broken body is not.
+            Err(_) if class != StatusClass::Success => Default::default(),
+            // A 2xx whose vectors never arrived: a timeout is retried, any other broken body
+            // is not.
             Err(error) => {
                 let timed_out = error.is_timeout();
                 let error = anyhow::anyhow!(

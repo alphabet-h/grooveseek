@@ -1029,3 +1029,35 @@ fn index_retries_a_503_whose_body_is_cut_short() {
     assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
     assert_dir_empty(&fx.cache);
 }
+
+/// A 401 whose body never arrives is still a 401: the run stops after the one
+/// request, with `max_retries` at its default. Sending the key again would
+/// only repeat a credential the endpoint has refused, while holding the
+/// embedder.
+///
+/// Red if a body-read timeout is retried whatever the status said: the run
+/// would send 1 + `max_retries` requests before it stops.
+#[test]
+fn index_does_not_retry_a_401_whose_body_stalls() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-401-stall", &files(&notes), "");
+    // A one-second request timeout, so the stalled body fails fast.
+    let config = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    assert!(config.contains("timeout_seconds = 15\n"), "{config}");
+    std::fs::write(
+        &fx.config,
+        config.replace("timeout_seconds = 15\n", "timeout_seconds = 1\n"),
+    )
+    .expect("write groove.toml");
+    fx.answer_with(|_| {
+        let mut stalled = reply(401, &[("Retry-After", "0")]);
+        stalled.stall_body = true;
+        stalled
+    });
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_dir_empty(&fx.cache);
+}
