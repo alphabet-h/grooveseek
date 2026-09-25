@@ -25,8 +25,8 @@ use grooveseek::indexer::progress::{ProgressCallback, ProgressEvent, ProgressRep
 use grooveseek::indexer::{IndexResult, load_declared_schema, rebuild_index};
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The mock's vector length. Small, since nothing here ranks anything.
 const DIM: usize = 8;
@@ -333,52 +333,62 @@ fn rebuild_index_emits_finished_only_on_success() {
 /// A run that fails partway through the per-file loop, after a file was
 /// already reported, emits no `Finished` either.
 ///
-/// The endpoint answers the first embed request and fails every later one.
-/// Each small file here is one request, so exactly one file is `Indexed`
-/// before the second fails; which file that is depends on the walk's order,
-/// and the assertions do not.
+/// The endpoint fails every embed request whose input carries
+/// [`FAIL_MARKER`], and only `b.md` holds it. What decides the failure is the
+/// content of a request, not how many came before it, so the case holds
+/// however the provider batches, retries or splits a file into chunks. The
+/// walk sorts the files it collects, so `a.md` is embedded and reported
+/// first and `b.md` fails second.
 #[test]
 fn rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file() {
-    let served = AtomicUsize::new(0);
     let fx = Fixture::new(
         "groove-aw08-midway",
-        EmbedMock::with_responder(move |req| {
-            if served.fetch_add(1, Ordering::SeqCst) == 0 {
-                default_response(req, DIM)
-            } else {
+        EmbedMock::with_responder(|req| {
+            if req.inputs().iter().any(|i| i.contains(FAIL_MARKER)) {
                 MockResponse::json(
                     500,
                     &serde_json::json!({"error": {"message": "mock: down"}}),
                 )
+            } else {
+                default_response(req, DIM)
             }
         }),
     );
     fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
-    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout
+        .write("b.md", &doc("Beta", &format!("beta body {FAIL_MARKER}")));
 
     let (result, events) = fx.run();
-    assert!(
-        result.is_err(),
-        "the second embed failure must reach the caller"
+    assert!(result.is_err(), "the failure on b.md must reach the caller");
+    assert_eq!(
+        events,
+        vec![Ev::Started(2), indexed("a.md", 1, 2)],
+        "a.md is reported, and a run that returned Err must not report Finished"
     );
-    assert_eq!(events.len(), 2, "{events:?}");
-    assert_eq!(events[0], Ev::Started(2), "{events:?}");
-    assert!(
-        matches!(&events[1], Ev::Indexed(rel, 1, 2) if rel == "a.md" || rel == "b.md"),
-        "one file is reported before the failure: {events:?}"
-    );
-    assert!(!events.contains(&Ev::Finished), "{events:?}");
 }
 
-/// A run that fails after the per-file loop, in the last fallible step before
-/// the reporter is finished, emits no `Finished`.
+/// The word that makes the endpoint in
+/// [`rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file`]
+/// fail a request.
+const FAIL_MARKER: &str = "zqxfailmarkerzqx";
+
+/// A run that fails after the per-file loop emits no `Finished`.
 ///
-/// The hook drops the `chunks` table from a second connection as the last
-/// file is reported. Nothing between that report and the chunk count
+/// That is what this pins, not which step fails. The hook drops the `chunks`
+/// table from a second connection as the last file is reported. Today
+/// nothing between that report and the chunk count
 /// [`grooveseek::indexer::rebuild_index`] takes just before finishing the
 /// reporter reads that table (no file vanished, so the deletion sweep removes
-/// nothing), so the count is the step that fails. Red if the reporter is
-/// finished ahead of any fallible step after the loop.
+/// nothing), so the count is the step that fails, and moving the reporter's
+/// finish ahead of it turns this red. If a step that reads `chunks` is ever
+/// added between the loop and the count, the failure moves there and the
+/// property checked stays the same.
+///
+/// The drop needs the write lock, and no transaction is open on the indexing
+/// connection while the callback runs (each file's transaction commits before
+/// it is reported). The second connection still waits up to a few seconds
+/// for the lock rather than failing at once, in case a platform's SQLite
+/// holds it a moment longer.
 #[test]
 fn rebuild_index_emits_no_finished_when_the_last_step_before_it_fails() {
     let fx = Fixture::new("groove-aw08-tail", EmbedMock::start(DIM));
@@ -390,14 +400,18 @@ fn rebuild_index_emits_no_finished_when_the_last_step_before_it_fails() {
         if let Ev::Indexed(_, done, total) = ev
             && done == total
         {
-            rusqlite::Connection::open(&db_path)
-                .expect("second connection")
-                .execute_batch("DROP TABLE chunks")
+            let conn = rusqlite::Connection::open(&db_path).expect("second connection");
+            conn.busy_timeout(Duration::from_secs(5))
+                .expect("busy timeout on the second connection");
+            conn.execute_batch("DROP TABLE chunks")
                 .expect("drop chunks");
         }
     }));
-    let err = format!("{:#}", result.expect_err("the chunk count must fail"));
-    assert!(err.contains("chunks"), "failed somewhere else: {err}");
+    let err = format!("{:#}", result.expect_err("a step after the loop must fail"));
+    assert!(
+        err.contains("no such table: chunks"),
+        "the run failed for a reason other than the dropped table: {err}"
+    );
     assert_eq!(
         events,
         vec![Ev::Started(2), indexed("a.md", 1, 2), indexed("b.md", 2, 2)],
