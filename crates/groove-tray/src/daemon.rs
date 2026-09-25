@@ -246,9 +246,9 @@ fn probe_liveness(authority: &str) -> Liveness {
 }
 
 /// The one HTTP client the tray talks to its daemon with, for the stop probe
-/// here and the status polling in `poll.rs`.
+/// here and the status polling in [`crate::poll`].
 ///
-/// Every admin URL is loopback (`config.rs` rebuilds it as `127.0.0.1`,
+/// Every admin URL is loopback ([`crate::config`] rebuilds it as `127.0.0.1`,
 /// `[::1]` or `localhost`), so the client never uses a proxy (AW-13): a proxy
 /// from the environment or the OS settings would otherwise receive, or block,
 /// `/api/admin/status`.
