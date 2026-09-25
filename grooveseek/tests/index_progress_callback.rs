@@ -12,11 +12,21 @@
 //! The embedder is the OpenAI-compatible provider pointed at
 //! [`crate::common::embed_mock`], so nothing is downloaded and nothing is
 //! `#[ignore]`d.
+//!
+//! Each test runs its body in a child of this test binary, through
+//! [`crate::run_in_hermetic_child`]. The provider's HTTP client takes its proxy from
+//! the environment and does not exempt loopback on its own, so a runner that
+//! exports a proxy would otherwise send the mock's requests through it; the
+//! child gets the environment [`crate::common::embed_mock::hermetic`] gives
+//! the CLI tests, which a test cannot set on its own process while others
+//! run beside it.
 
 mod common;
 
-use common::embed_mock::{EmbedMock, MockResponse, default_response, openai_config_toml};
-use common::temp::TempKbLayout;
+use common::embed_mock::{
+    EmbedMock, MockResponse, assert_dir_empty, default_response, hermetic, openai_config_toml,
+};
+use common::temp::{TempKbLayout, TempRoot};
 
 use grooveseek::config::Config;
 use grooveseek::db::{ContextMode, Database};
@@ -25,11 +35,49 @@ use grooveseek::indexer::progress::{ProgressCallback, ProgressEvent, ProgressRep
 use grooveseek::indexer::{IndexResult, load_declared_schema, rebuild_index};
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The mock's vector length. Small, since nothing here ranks anything.
 const DIM: usize = 8;
+
+/// Set on the child [`run_in_hermetic_child`] starts, so the child runs the
+/// test body instead of starting another child.
+const HERMETIC_CHILD: &str = "GROOVE_AW08_HERMETIC_CHILD";
+
+/// Run the test named `name` again in a child of this test binary, under the
+/// environment [`crate::common::embed_mock::hermetic`] pins: no proxy
+/// variables, loopback in `NO_PROXY`, no API key from the environment, and an
+/// empty model cache that must stay empty.
+///
+/// Returns `true` in the parent, after asserting the child passed, so the
+/// caller returns; `false` in the child, which then runs the body. The child
+/// has to report exactly one passed test: a `name` that matches no test would
+/// otherwise run nothing and still exit 0.
+fn run_in_hermetic_child(name: &str) -> bool {
+    if std::env::var_os(HERMETIC_CHILD).is_some() {
+        return false;
+    }
+    let cache = TempRoot::new("groove-aw08-fastembed");
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(HERMETIC_CHILD, "1");
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("run the test in a child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed in the child:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the child ran no test named {name}:\n{stdout}\n{stderr}"
+    );
+    assert_dir_empty(cache.path());
+    true
+}
 
 /// One [`ProgressEvent`], owned so it can outlive the call that delivered it.
 ///
@@ -170,6 +218,9 @@ fn doc(title: &str, body: &str) -> String {
 /// the arm for a skipped file or for an unchanged one.
 #[test]
 fn rebuild_index_reports_each_scanned_file_once_through_the_callback() {
+    if run_in_hermetic_child("rebuild_index_reports_each_scanned_file_once_through_the_callback") {
+        return;
+    }
     let fx = Fixture::new("groove-aw08-each", EmbedMock::start(DIM));
     fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
     fx.layout.write("b.md", &doc("Beta", "beta body text"));
@@ -215,6 +266,9 @@ fn rebuild_index_reports_each_scanned_file_once_through_the_callback() {
 /// in the arm for a metadata-only refresh.
 #[test]
 fn rebuild_index_reports_a_metadata_only_refresh_as_unchanged() {
+    if run_in_hermetic_child("rebuild_index_reports_a_metadata_only_refresh_as_unchanged") {
+        return;
+    }
     let fx = Fixture::new("groove-aw08-refresh", EmbedMock::start(DIM));
     fx.layout.write(
         "a.md",
@@ -256,6 +310,11 @@ fn rebuild_index_reports_a_metadata_only_refresh_as_unchanged() {
 /// or [`grooveseek::indexer::progress::ProgressReporter::report_deleted`].
 #[test]
 fn rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_deleted() {
+    if run_in_hermetic_child(
+        "rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_deleted",
+    ) {
+        return;
+    }
     let fx = Fixture::new("groove-aw08-move", EmbedMock::start(DIM));
     fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
     fx.layout.write("b.md", &doc("Beta", "beta body text"));
@@ -298,6 +357,9 @@ fn rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_dele
 /// and [`rebuild_index_emits_no_finished_when_the_last_step_before_it_fails`].
 #[test]
 fn rebuild_index_emits_finished_only_on_success() {
+    if run_in_hermetic_child("rebuild_index_emits_finished_only_on_success") {
+        return;
+    }
     let ok = Fixture::new("groove-aw08-finished-ok", EmbedMock::start(DIM));
     ok.layout.write("a.md", &doc("Alpha", "alpha body text"));
     let (result, events) = ok.run();
@@ -341,6 +403,11 @@ fn rebuild_index_emits_finished_only_on_success() {
 /// first and `b.md` fails second.
 #[test]
 fn rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file() {
+    if run_in_hermetic_child(
+        "rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file",
+    ) {
+        return;
+    }
     let fx = Fixture::new(
         "groove-aw08-midway",
         EmbedMock::with_responder(|req| {
@@ -391,6 +458,9 @@ const FAIL_MARKER: &str = "zqxfailmarkerzqx";
 /// holds it a moment longer.
 #[test]
 fn rebuild_index_emits_no_finished_when_the_last_step_before_it_fails() {
+    if run_in_hermetic_child("rebuild_index_emits_no_finished_when_the_last_step_before_it_fails") {
+        return;
+    }
     let fx = Fixture::new("groove-aw08-tail", EmbedMock::start(DIM));
     fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
     fx.layout.write("b.md", &doc("Beta", "beta body text"));
@@ -432,6 +502,11 @@ fn rebuild_index_emits_no_finished_when_the_last_step_before_it_fails() {
 /// decides from its metadata and never reads it.
 #[test]
 fn callback_done_stops_short_of_total_exactly_by_the_files_the_scan_declined() {
+    if run_in_hermetic_child(
+        "callback_done_stops_short_of_total_exactly_by_the_files_the_scan_declined",
+    ) {
+        return;
+    }
     let fx = Fixture::new("groove-aw08-short", EmbedMock::start(DIM));
     fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
     fx.layout.write("b.md", &doc("Beta", "beta body text"));
