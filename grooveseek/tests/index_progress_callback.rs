@@ -1,0 +1,531 @@
+//! AW-08: [`grooveseek::indexer::rebuild_index`] drives a callback reporter.
+//!
+//! [`grooveseek::indexer::progress`]'s own tests call the reporter's methods
+//! by hand, and the CLI progress tests only read the stderr lines of the
+//! other modes. Neither notices when [`grooveseek::indexer::rebuild_index`]
+//! stops calling one of those methods, and the application that embeds this
+//! crate (grooveseek-desktop) draws its progress from nothing else. These run
+//! [`grooveseek::indexer::rebuild_index`] in-process with
+//! [`grooveseek::indexer::progress::ProgressReporter::with_callback`] and
+//! read back what the callback was handed.
+//!
+//! The embedder is the OpenAI-compatible provider pointed at
+//! [`crate::common::embed_mock`], so nothing is downloaded and nothing is
+//! `#[ignore]`d.
+//!
+//! Each test runs its body in a child of this test binary, through
+//! [`crate::run_in_hermetic_child`]. The provider's HTTP client takes its proxy from
+//! the environment and does not exempt loopback on its own, so a runner that
+//! exports a proxy would otherwise send the mock's requests through it; the
+//! child gets the environment [`crate::common::embed_mock::hermetic`] gives
+//! the CLI tests, which a test cannot set on its own process while others
+//! run beside it.
+
+mod common;
+
+use common::embed_mock::{
+    EmbedMock, MockResponse, assert_dir_empty, default_response, hermetic, openai_config_toml,
+};
+use common::temp::{TempKbLayout, TempRoot};
+
+use grooveseek::config::Config;
+use grooveseek::db::{ContextMode, Database};
+use grooveseek::embedder::Embedder;
+use grooveseek::indexer::progress::{ProgressCallback, ProgressEvent, ProgressReporter};
+use grooveseek::indexer::{IndexResult, load_declared_schema, rebuild_index};
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// The mock's vector length. Small, since nothing here ranks anything.
+const DIM: usize = 8;
+
+/// Set on the child [`run_in_hermetic_child`] starts, so the child runs the
+/// test body instead of starting another child.
+const HERMETIC_CHILD: &str = "GROOVE_AW08_HERMETIC_CHILD";
+
+/// Run the test named `name` again in a child of this test binary, under the
+/// environment [`crate::common::embed_mock::hermetic`] pins: no proxy
+/// variables, loopback in `NO_PROXY`, no API key from the environment, and an
+/// empty model cache that must stay empty.
+///
+/// Returns `true` in the parent, after asserting the child passed, so the
+/// caller returns; `false` in the child, which then runs the body. The child
+/// has to report exactly one passed test: a `name` that matches no test would
+/// otherwise run nothing and still exit 0.
+fn run_in_hermetic_child(name: &str) -> bool {
+    if std::env::var_os(HERMETIC_CHILD).is_some() {
+        return false;
+    }
+    let cache = TempRoot::new("groove-aw08-fastembed");
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(HERMETIC_CHILD, "1");
+    hermetic(&mut cmd, cache.path());
+    let out = cmd.output().expect("run the test in a child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} failed in the child:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the child ran no test named {name}:\n{stdout}\n{stderr}"
+    );
+    assert_dir_empty(cache.path());
+    true
+}
+
+/// One [`ProgressEvent`], owned so it can outlive the call that delivered it.
+///
+/// `Indexed` leaves out `chunks`: how many chunks a file is cut into belongs
+/// to the parser, and nothing here is about that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ev {
+    Started(usize),
+    Indexed(String, usize, usize),
+    Unchanged(String, usize, usize),
+    Renamed(String, String),
+    Deleted(String),
+    Finished,
+}
+
+fn indexed(rel: &str, done: usize, total: usize) -> Ev {
+    Ev::Indexed(rel.to_string(), done, total)
+}
+
+fn unchanged(rel: &str, done: usize, total: usize) -> Ev {
+    Ev::Unchanged(rel.to_string(), done, total)
+}
+
+/// What a test runs inside the callback, after the event is logged.
+type Hook = Box<dyn Fn(&Ev) + Send>;
+
+/// A callback that appends every event to a log and then hands it to `hook`,
+/// and the log.
+fn recorder(hook: Hook) -> (Arc<Mutex<Vec<Ev>>>, ProgressCallback) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    let f: ProgressCallback = Box::new(move |ev| {
+        let owned = match ev {
+            ProgressEvent::Started { total } => Ev::Started(total),
+            ProgressEvent::Indexed {
+                rel, done, total, ..
+            } => indexed(rel, done, total),
+            ProgressEvent::Unchanged { rel, done, total } => unchanged(rel, done, total),
+            ProgressEvent::Renamed { old, new } => Ev::Renamed(old.to_string(), new.to_string()),
+            ProgressEvent::Deleted { rel } => Ev::Deleted(rel.to_string()),
+            ProgressEvent::Finished => Ev::Finished,
+        };
+        sink.lock().expect("recorder mutex").push(owned.clone());
+        hook(&owned);
+    });
+    (log, f)
+}
+
+/// A knowledge base, the mock it embeds through, and the `groove.toml` that
+/// points at the mock.
+///
+/// The config sits in [`TempKbLayout::root`], next to `.groove.db` and
+/// outside the knowledge base, so it is never one of the files the scan
+/// counts.
+struct Fixture {
+    layout: TempKbLayout,
+    mock: EmbedMock,
+    config: PathBuf,
+}
+
+impl Fixture {
+    fn new(prefix: &str, mock: EmbedMock) -> Self {
+        let layout = TempKbLayout::new(prefix);
+        let config = layout.root().join("groove.toml");
+        std::fs::write(&config, openai_config_toml(&mock.endpoint(), None, DIM))
+            .expect("write groove.toml");
+        Self {
+            layout,
+            mock,
+            config,
+        }
+    }
+
+    /// One incremental [`grooveseek::indexer::rebuild_index`] run, wired the
+    /// way `groove index` wires it, with a callback reporter; its result and
+    /// every event the callback received. The reporter is the one argument
+    /// that differs from the command line's: no CLI flag selects a callback,
+    /// and it is what is under test.
+    fn run(&self) -> (anyhow::Result<IndexResult>, Vec<Ev>) {
+        self.run_with(Box::new(|_| {}))
+    }
+
+    /// [`Fixture::run`], with `hook` called from inside the callback after
+    /// each event is logged.
+    fn run_with(&self, hook: Hook) -> (anyhow::Result<IndexResult>, Vec<Ev>) {
+        let kb = self.layout.kb();
+        let cfg = Config::load_from(&self.config).expect("load groove.toml");
+        let embedding = cfg.resolve_embedding(None).expect("resolve [embedding]");
+        let registry = cfg.build_parser_registry(kb).expect("parser registry");
+        let schema = load_declared_schema(kb).expect("groove-schema.toml");
+        let db_path = grooveseek::resolve_db_path(kb);
+        let db = Database::open(&db_path.to_string_lossy()).expect("open the index");
+        // `groove index` does this before building the embedder, and it is
+        // what creates the vector table on a fresh index.
+        db.verify_embedding_meta(embedding.model_id(), embedding.dimension() as u32)
+            .expect("embedding meta");
+        let mut embedder = Embedder::with_settings(embedding).expect("build the embedder");
+        let exclude_dirs = cfg.resolve_exclude_dirs();
+        let context_mode = if cfg.contextual.as_ref().map(|c| c.enabled).unwrap_or(false) {
+            ContextMode::Static
+        } else {
+            ContextMode::Off
+        };
+        let (log, f) = recorder(hook);
+        let result = rebuild_index(
+            &db,
+            &mut embedder,
+            kb,
+            schema,
+            false,
+            cfg.exclude_headings.as_deref(),
+            &exclude_dirs,
+            &registry,
+            ProgressReporter::with_callback(f),
+            context_mode,
+        );
+        let events = log.lock().expect("recorder mutex").clone();
+        (result, events)
+    }
+}
+
+fn doc(title: &str, body: &str) -> String {
+    format!("---\ntitle: {title}\n---\n\n## {title}\n\n{body}\n")
+}
+
+/// Every file the scan hands the loop is reported exactly once, as
+/// `Indexed` when it was embedded and as `Unchanged` when it was not, and
+/// the done count goes up one file at a time against the total `Started`
+/// announced.
+///
+/// `stub.md` is frontmatter and nothing else, so the loop skips it for having
+/// no chunks; that skip is still one step of the run. The second run finds
+/// every hash unchanged. Red if [`grooveseek::indexer::rebuild_index`] stops
+/// calling [`grooveseek::indexer::progress::ProgressReporter::start_indexing`],
+/// [`grooveseek::indexer::progress::ProgressReporter::report_indexed`],
+/// [`grooveseek::indexer::progress::ProgressReporter::finish`], or
+/// [`grooveseek::indexer::progress::ProgressReporter::report_unchanged`] in
+/// the arm for a skipped file or for an unchanged one.
+#[test]
+fn rebuild_index_reports_each_scanned_file_once_through_the_callback() {
+    if run_in_hermetic_child("rebuild_index_reports_each_scanned_file_once_through_the_callback") {
+        return;
+    }
+    let fx = Fixture::new("groove-aw08-each", EmbedMock::start(DIM));
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout.write("stub.md", "---\ntitle: Stub\n---\n");
+
+    let (result, events) = fx.run();
+    let result = result.expect("first run");
+    assert_eq!((result.updated, result.skipped), (2, 1), "{result:?}");
+    assert_eq!(
+        events,
+        vec![
+            Ev::Started(3),
+            indexed("a.md", 1, 3),
+            indexed("b.md", 2, 3),
+            unchanged("stub.md", 3, 3),
+            Ev::Finished,
+        ],
+        "first run"
+    );
+
+    let (result, events) = fx.run();
+    let result = result.expect("second run");
+    assert_eq!(result.updated, 0, "{result:?}");
+    assert_eq!(
+        events,
+        vec![
+            Ev::Started(3),
+            unchanged("a.md", 1, 3),
+            unchanged("b.md", 2, 3),
+            unchanged("stub.md", 3, 3),
+            Ev::Finished,
+        ],
+        "second run: nothing changed on disk"
+    );
+}
+
+/// A run that only rewrites metadata still reports each file as a step.
+///
+/// Declaring a schema after the first run makes the second one read every
+/// unchanged Markdown document again for its declared fields, without
+/// re-embedding it. Red if [`grooveseek::indexer::rebuild_index`] stops
+/// calling [`grooveseek::indexer::progress::ProgressReporter::report_unchanged`]
+/// in the arm for a metadata-only refresh.
+#[test]
+fn rebuild_index_reports_a_metadata_only_refresh_as_unchanged() {
+    if run_in_hermetic_child("rebuild_index_reports_a_metadata_only_refresh_as_unchanged") {
+        return;
+    }
+    let fx = Fixture::new("groove-aw08-refresh", EmbedMock::start(DIM));
+    fx.layout.write(
+        "a.md",
+        "---\ntitle: Alpha\nstatus: active\n---\n\n## Alpha\n\nalpha body text\n",
+    );
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.run().0.expect("first run");
+    let embeds_before = fx.mock.requests().len();
+
+    fx.layout.write(
+        "groove-schema.toml",
+        "[fields.status]\nenum = [\"active\", \"deprecated\"]\n",
+    );
+    let (result, events) = fx.run();
+    let result = result.expect("second run");
+    assert_eq!(result.updated, 0, "{result:?}");
+    assert_eq!(
+        fx.mock.requests().len(),
+        embeds_before,
+        "a metadata-only refresh must not embed anything"
+    );
+    assert_eq!(
+        events,
+        vec![
+            Ev::Started(2),
+            unchanged("a.md", 1, 2),
+            unchanged("b.md", 2, 2),
+            Ev::Finished,
+        ]
+    );
+}
+
+/// A file moved with its bytes unchanged is reported as `Renamed`, and a
+/// file gone from disk as `Deleted`, and neither advances the done count.
+///
+/// `Renamed` comes before the per-file loop and `Deleted` after it, which is
+/// where [`grooveseek::indexer::rebuild_index`] detects each. Red if it stops
+/// calling [`grooveseek::indexer::progress::ProgressReporter::report_renamed`]
+/// or [`grooveseek::indexer::progress::ProgressReporter::report_deleted`].
+#[test]
+fn rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_deleted() {
+    if run_in_hermetic_child(
+        "rebuild_index_reports_a_same_hash_move_as_renamed_and_a_vanished_file_as_deleted",
+    ) {
+        return;
+    }
+    let fx = Fixture::new("groove-aw08-move", EmbedMock::start(DIM));
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout.write("c.md", &doc("Gamma", "gamma body text"));
+    fx.run().0.expect("first run");
+
+    let kb = fx.layout.kb();
+    std::fs::rename(kb.join("a.md"), kb.join("moved.md")).expect("move a.md");
+    std::fs::remove_file(kb.join("b.md")).expect("remove b.md");
+
+    let (result, events) = fx.run();
+    let result = result.expect("second run");
+    assert_eq!(
+        (result.renamed, result.deleted, result.updated),
+        (1, 1, 0),
+        "{result:?}"
+    );
+    assert_eq!(
+        events,
+        vec![
+            Ev::Started(2),
+            Ev::Renamed("a.md".to_string(), "moved.md".to_string()),
+            unchanged("c.md", 1, 2),
+            unchanged("moved.md", 2, 2),
+            Ev::Deleted("b.md".to_string()),
+            Ev::Finished,
+        ]
+    );
+}
+
+/// `Finished` arrives once, at the end of a run that returned `Ok`, and not
+/// at all from one that returned `Err`.
+///
+/// An endpoint that answers 500 fails the first embed, and
+/// [`grooveseek::indexer::rebuild_index`] returns through `?` after
+/// `Started`. The consumer learns the run ended from that `Err`; a `Finished`
+/// as well would tell it the run completed. A failure later in the run is
+/// covered by
+/// [`rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file`]
+/// and [`rebuild_index_emits_no_finished_when_the_last_step_before_it_fails`].
+#[test]
+fn rebuild_index_emits_finished_only_on_success() {
+    if run_in_hermetic_child("rebuild_index_emits_finished_only_on_success") {
+        return;
+    }
+    let ok = Fixture::new("groove-aw08-finished-ok", EmbedMock::start(DIM));
+    ok.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    let (result, events) = ok.run();
+    result.expect("a run against a working endpoint");
+    assert_eq!(
+        events.iter().filter(|e| **e == Ev::Finished).count(),
+        1,
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&Ev::Finished), "{events:?}");
+
+    let failing = Fixture::new(
+        "groove-aw08-finished-err",
+        EmbedMock::with_responder(|_| {
+            MockResponse::json(
+                500,
+                &serde_json::json!({"error": {"message": "mock: down"}}),
+            )
+        }),
+    );
+    failing
+        .layout
+        .write("a.md", &doc("Alpha", "alpha body text"));
+    let (result, events) = failing.run();
+    assert!(result.is_err(), "the embed failure must reach the caller");
+    assert_eq!(
+        events,
+        vec![Ev::Started(1)],
+        "a run that returned Err must not report Finished"
+    );
+}
+
+/// A run that fails partway through the per-file loop, after a file was
+/// already reported, emits no `Finished` either.
+///
+/// The endpoint fails every embed request whose input carries
+/// [`FAIL_MARKER`], and only `b.md` holds it. What decides the failure is the
+/// content of a request, not how many came before it, so the case holds
+/// however the provider batches, retries or splits a file into chunks. The
+/// walk sorts the files it collects, so `a.md` is embedded and reported
+/// first and `b.md` fails second.
+#[test]
+fn rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file() {
+    if run_in_hermetic_child(
+        "rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file",
+    ) {
+        return;
+    }
+    let fx = Fixture::new(
+        "groove-aw08-midway",
+        EmbedMock::with_responder(|req| {
+            if req.inputs().iter().any(|i| i.contains(FAIL_MARKER)) {
+                MockResponse::json(
+                    500,
+                    &serde_json::json!({"error": {"message": "mock: down"}}),
+                )
+            } else {
+                default_response(req, DIM)
+            }
+        }),
+    );
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout
+        .write("b.md", &doc("Beta", &format!("beta body {FAIL_MARKER}")));
+
+    let (result, events) = fx.run();
+    assert!(result.is_err(), "the failure on b.md must reach the caller");
+    assert_eq!(
+        events,
+        vec![Ev::Started(2), indexed("a.md", 1, 2)],
+        "a.md is reported, and a run that returned Err must not report Finished"
+    );
+}
+
+/// The word that makes the endpoint in
+/// [`rebuild_index_emits_no_finished_when_an_embed_fails_after_the_first_file`]
+/// fail a request.
+const FAIL_MARKER: &str = "zqxfailmarkerzqx";
+
+/// A run that fails after the per-file loop emits no `Finished`.
+///
+/// That is what this pins, not which step fails. The hook drops the `chunks`
+/// table from a second connection as the last file is reported. Today
+/// nothing between that report and the chunk count
+/// [`grooveseek::indexer::rebuild_index`] takes just before finishing the
+/// reporter reads that table (no file vanished, so the deletion sweep removes
+/// nothing), so the count is the step that fails, and moving the reporter's
+/// finish ahead of it turns this red. If a step that reads `chunks` is ever
+/// added between the loop and the count, the failure moves there and the
+/// property checked stays the same.
+///
+/// The drop needs the write lock, and no transaction is open on the indexing
+/// connection while the callback runs (each file's transaction commits before
+/// it is reported). The second connection still waits up to a few seconds
+/// for the lock rather than failing at once, in case a platform's SQLite
+/// holds it a moment longer.
+#[test]
+fn rebuild_index_emits_no_finished_when_the_last_step_before_it_fails() {
+    if run_in_hermetic_child("rebuild_index_emits_no_finished_when_the_last_step_before_it_fails") {
+        return;
+    }
+    let fx = Fixture::new("groove-aw08-tail", EmbedMock::start(DIM));
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    let db_path = grooveseek::resolve_db_path(fx.layout.kb());
+
+    let (result, events) = fx.run_with(Box::new(move |ev| {
+        if let Ev::Indexed(_, done, total) = ev
+            && done == total
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("second connection");
+            conn.busy_timeout(Duration::from_secs(5))
+                .expect("busy timeout on the second connection");
+            conn.execute_batch("DROP TABLE chunks")
+                .expect("drop chunks");
+        }
+    }));
+    let err = format!("{:#}", result.expect_err("a step after the loop must fail"));
+    assert!(
+        err.contains("no such table: chunks"),
+        "the run failed for a reason other than the dropped table: {err}"
+    );
+    assert_eq!(
+        events,
+        vec![Ev::Started(2), indexed("a.md", 1, 2), indexed("b.md", 2, 2)],
+        "a run that returned Err must not report Finished"
+    );
+}
+
+/// The done count stops short of the total by exactly the files the scan
+/// declined.
+///
+/// The total is what the walk found; a file over the size cap is declined by
+/// the scan before the loop, so it reaches neither `Indexed` nor `Unchanged`
+/// and the done count never includes it. That is the contract the rustdoc on
+/// [`grooveseek::indexer::progress::ProgressEvent::Indexed`] states, so a
+/// consumer does not read a done count below the total at `Finished` as a
+/// failure.
+/// `set_len` makes the oversized file without writing its bytes: the scan
+/// decides from its metadata and never reads it.
+#[test]
+fn callback_done_stops_short_of_total_exactly_by_the_files_the_scan_declined() {
+    if run_in_hermetic_child(
+        "callback_done_stops_short_of_total_exactly_by_the_files_the_scan_declined",
+    ) {
+        return;
+    }
+    let fx = Fixture::new("groove-aw08-short", EmbedMock::start(DIM));
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    let huge = std::fs::File::create(fx.layout.kb().join("huge.md")).expect("create huge.md");
+    huge.set_len(grooveseek::parser::MAX_RAW_TEXT_BYTES + 1)
+        .expect("grow huge.md past the text cap");
+    drop(huge);
+
+    let (result, events) = fx.run();
+    let result = result.expect("run");
+    assert_eq!((result.updated, result.skipped), (2, 1), "{result:?}");
+    assert_eq!(
+        events,
+        vec![
+            Ev::Started(3),
+            indexed("a.md", 1, 3),
+            indexed("b.md", 2, 3),
+            Ev::Finished,
+        ],
+        "huge.md is in total but in no per-file event, so done ends at total - 1"
+    );
+}
