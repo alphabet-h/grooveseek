@@ -790,6 +790,7 @@ fn wait_before_retry(
 pub struct Embedder {
     provider: Box<dyn EmbeddingProvider>,
     identity: EmbeddingIdentity,
+    documents_embedded: u64,
 }
 
 impl Embedder {
@@ -829,7 +830,11 @@ impl Embedder {
     }
 
     fn from_provider(provider: Box<dyn EmbeddingProvider>, identity: EmbeddingIdentity) -> Self {
-        Self { provider, identity }
+        Self {
+            provider,
+            identity,
+            documents_embedded: 0,
+        }
     }
 
     /// Embed document texts. Provider-specific batching stays behind the
@@ -839,7 +844,16 @@ impl Embedder {
     /// its `document_model`. Queries go through [`Embedder::embed_single`] or
     /// [`Embedder::embed_queries`].
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.provider.embed_documents(texts)
+        let embeddings = self.provider.embed_documents(texts)?;
+        self.documents_embedded += 1;
+        Ok(embeddings)
+    }
+
+    /// How many [`Embedder::embed_texts`] calls have succeeded. The indexer
+    /// calls it once per file it embeds, so the difference across a run is the
+    /// number of files embedded (AW-04). Queries and the probe are not counted.
+    pub(crate) fn documents_embedded(&self) -> u64 {
+        self.documents_embedded
     }
 
     /// Embed one search query, on the query side of the provider (the
@@ -2381,5 +2395,40 @@ mod tests {
             plain.contains("max_input_chars: None") && plain.contains("max_retries: 0"),
             "{plain}"
         );
+    }
+
+    struct RefusingProvider;
+
+    impl EmbeddingProvider for RefusingProvider {
+        fn embed_documents(&mut self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Err(anyhow::Error::new(EmbedInputRejected {
+                status: 413,
+                body_snippet: String::new(),
+            }))
+        }
+
+        fn embed_query(&mut self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![3.0, 4.0])
+        }
+    }
+
+    #[test]
+    fn documents_embedded_counts_only_successful_document_embeds() {
+        let identity = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15).identity;
+        let mut ok = Embedder::from_provider(Box::new(StubProvider), identity.clone());
+        ok.embed_texts(&["a"]).unwrap();
+        ok.embed_texts(&["b", "c"]).unwrap();
+        ok.embed_single("query").unwrap();
+        ok.embed_queries(&["q1", "q2"]).unwrap();
+        ok.probe_before_reset().unwrap();
+        assert_eq!(
+            ok.documents_embedded(),
+            2,
+            "one per successful embed_texts call"
+        );
+
+        let mut refused = Embedder::from_provider(Box::new(RefusingProvider), identity);
+        assert!(refused.embed_texts(&["a"]).is_err());
+        assert_eq!(refused.documents_embedded(), 0);
     }
 }

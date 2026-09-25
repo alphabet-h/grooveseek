@@ -561,6 +561,12 @@ fn documents_to_delete(
         .collect()
 }
 
+/// (AW-04) Where [`IndexResult::all_inputs_rejected_message`] says the skipped
+/// files were named, for `groove index`.
+pub const REJECTIONS_NAMED_ABOVE: &str = "see the warnings above";
+/// The same, for MCP `rebuild_index`, whose caller does not see the server's stderr.
+pub const REJECTIONS_NAMED_ON_SERVER_STDERR: &str = "each named on the server's stderr";
+
 /// Summary returned by [`rebuild_index`].
 #[derive(Debug, Default)]
 pub struct IndexResult {
@@ -587,6 +593,13 @@ pub struct IndexResult {
     /// each named on stderr. Not part of [`Self::skipped`], which counts files
     /// that were collected and then could not be read or parsed.
     pub unspellable: u32,
+    /// (AW-04) Files skipped because the embedding endpoint refused their
+    /// input. Also counted in [`Self::skipped`].
+    pub embed_rejected: u32,
+    /// (AW-04) Files this run sent to the embedder and got vectors for. Not
+    /// [`Self::updated`]: a metadata-only update counts there without
+    /// embedding anything.
+    pub embedded: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
 }
@@ -599,6 +612,29 @@ impl IndexResult {
     /// they cannot come to disagree (codex P1, round 4).
     pub fn fails_strict_frontmatter(&self, fail_on_frontmatter_error: bool) -> bool {
         fail_on_frontmatter_error && self.frontmatter_unparsed > 0
+    }
+
+    /// (AW-04) Whether this run had the endpoint refuse at least one file's
+    /// input and embedded nothing -- which points at the configuration (model,
+    /// endpoint) rather than at the files. One decision, rendered twice:
+    /// `groove index` exits non-zero, MCP `rebuild_index` answers with an
+    /// `error`. The run itself completed, deletions included.
+    pub fn fails_all_inputs_rejected(&self) -> bool {
+        self.embed_rejected > 0 && self.embedded == 0
+    }
+
+    /// The error both surfaces give when [`Self::fails_all_inputs_rejected`]
+    /// (spec 3.4). `named` says where the skipped files were named:
+    /// [`REJECTIONS_NAMED_ABOVE`] for `groove index`, whose warnings are just
+    /// above it, [`REJECTIONS_NAMED_ON_SERVER_STDERR`] for MCP, whose caller
+    /// does not see them.
+    pub fn all_inputs_rejected_message(&self, named: &str) -> String {
+        format!(
+            "the embedding endpoint rejected every input this run tried to embed ({} file(s), \
+             {named}); nothing was embedded. Check [embedding] model / document_model and \
+             endpoint. The rest of the run (deletions, bookkeeping) completed.",
+            self.embed_rejected
+        )
     }
 
     /// The `Done in ...` line `groove index` prints. [`Self::unspellable`] is
@@ -942,6 +978,12 @@ pub fn rebuild_index(
         Err(e) => tracing::warn!("failed to record document sizes: {e}"),
     }
 
+    // (AW-04) Files embedded this run, measured on the embedder rather than counted from
+    // `Updated`, which a metadata-only update also returns. MCP holds the embedder's lock
+    // for the whole run (`server.rs`), so no watcher embed falls in between.
+    let embedded_before = embedder.documents_embedded();
+    let mut embed_rejected: u32 = 0;
+
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
     let mut updated: u32 = 0;
@@ -1017,6 +1059,9 @@ pub fn rebuild_index(
                 frontmatter_unparsed: fm_unparsed,
             } => {
                 skipped_count += 1;
+                if reason == SKIPPED_EMBED_REJECTED {
+                    embed_rejected += 1;
+                }
                 if fm_unparsed {
                     frontmatter_unparsed += 1;
                 }
@@ -1062,6 +1107,8 @@ pub fn rebuild_index(
             }
         }
     }
+    let embedded =
+        u32::try_from(embedder.documents_embedded() - embedded_before).unwrap_or(u32::MAX);
 
     if refreshed > 0 {
         eprintln!(
@@ -1138,6 +1185,8 @@ pub fn rebuild_index(
         skipped: skipped_count,
         frontmatter_unparsed,
         unspellable,
+        embed_rejected,
+        embedded,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })
@@ -5747,5 +5796,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(embed_input_for(&ch, ContextMode::Static), "body");
+    }
+
+    /// (AW-04) A run fails only when it refused at least one file's input and
+    /// embedded nothing. A run that embedded a file, or refused none, is not a
+    /// failure.
+    #[test]
+    fn fails_all_inputs_rejected_needs_a_rejection_and_no_embedded_file() {
+        for (embed_rejected, embedded, fails) in [
+            (0, 0, false),
+            (1, 0, true),
+            (3, 0, true),
+            (1, 3, false),
+            (0, 3, false),
+        ] {
+            let result = IndexResult {
+                embed_rejected,
+                embedded,
+                ..IndexResult::default()
+            };
+            assert_eq!(
+                result.fails_all_inputs_rejected(),
+                fails,
+                "rejected {embed_rejected}, embedded {embedded}"
+            );
+        }
+        let message = IndexResult {
+            embed_rejected: 2,
+            ..IndexResult::default()
+        }
+        .all_inputs_rejected_message(REJECTIONS_NAMED_ABOVE);
+        assert!(message.is_ascii(), "{message}");
+        assert_eq!(
+            message,
+            "the embedding endpoint rejected every input this run tried to embed (2 file(s), \
+             see the warnings above); nothing was embedded. Check [embedding] model / \
+             document_model and endpoint. The rest of the run (deletions, bookkeeping) completed."
+        );
+        assert!(
+            IndexResult {
+                embed_rejected: 1,
+                ..IndexResult::default()
+            }
+            .all_inputs_rejected_message(REJECTIONS_NAMED_ON_SERVER_STDERR)
+            .contains("(1 file(s), each named on the server's stderr); nothing was embedded"),
+            "{message}"
+        );
     }
 }

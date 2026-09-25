@@ -489,7 +489,8 @@ struct IndexStats {
 
 /// (#251) The MCP `rebuild_index` tool's reply under `[index].fail_on_frontmatter_error`
 /// when the count is non-zero: the run did happen, so the counts are still
-/// there, flattened beside the `error` a client keys on.
+/// there, flattened beside the `error` a client keys on. (AW-04) Also the reply
+/// to a run whose every embed the endpoint refused.
 #[derive(Serialize)]
 struct StrictIndexFailure {
     error: String,
@@ -696,6 +697,15 @@ impl KbCore {
                     total_chunks: result.total_chunks,
                     duration_ms: result.duration_ms,
                 };
+                if result.fails_all_inputs_rejected() {
+                    let reply = StrictIndexFailure {
+                        error: result.all_inputs_rejected_message(
+                            indexer::REJECTIONS_NAMED_ON_SERVER_STDERR,
+                        ),
+                        stats,
+                    };
+                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                }
                 if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
                     let reply = StrictIndexFailure {
                         error: format!(

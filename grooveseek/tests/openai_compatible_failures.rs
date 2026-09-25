@@ -18,7 +18,7 @@ use common::embed_mock::{
     DOC_MODEL, EmbedMock, MockReply, QUERY_MODEL, assert_dir_empty, default_response, hermetic,
     wait_until,
 };
-use common::mcp::spawn_serve_with;
+use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -440,5 +440,101 @@ fn search_sends_a_long_query_cut_to_max_input_chars() {
         .collect();
     assert_eq!(queries.len(), 1, "one query embed");
     assert_eq!(queries[0].chars().count(), 8000);
+    assert_dir_empty(&fx.cache);
+}
+
+const ALL_REJECTED: &str = "the embedding endpoint rejected every input this run tried to embed";
+
+/// Every file the run tried to embed was refused and none was embedded: the
+/// run still finishes its deletions and bookkeeping, then exits non-zero with
+/// a message that points at the configuration.
+///
+/// Red if the check is missing (exit 0), or if it fails the run before the
+/// deletion sweep (gamma.md's row would survive).
+#[test]
+fn index_fails_after_its_sweep_when_the_endpoint_rejected_every_input_it_tried() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-all", &files(&notes), "");
+    fx.index();
+    assert_eq!(fx.documents(), 3);
+
+    std::fs::remove_file(fx.kb().join("gamma.md")).expect("remove gamma.md");
+    fx.layout
+        .write("alpha.md", &note("Alpha", &format!("{ALPHA} Edited.")));
+    fx.layout
+        .write("beta.md", &note("Beta", &format!("{BETA} Edited.")));
+    fx.answer_with(|_| reply(413, &[]));
+    let out = fx.run_index();
+    fx.answer_normally();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains(ALL_REJECTED), "{stderr}");
+    assert!(
+        stderr.contains("Done in ") && stderr.contains("1 deleted, 2 skipped"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_eq!(fx.documents(), 2, "the sweep must have removed gamma.md");
+    assert_dir_empty(&fx.cache);
+}
+
+/// One file refused while another was embedded in the same run is an
+/// ordinary run: exit 0.
+///
+/// Red if the success count misses real embeds (it would read zero and fail
+/// the run).
+#[test]
+fn index_exits_zero_when_one_file_is_rejected_and_another_is_embedded() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-one", &files(&notes), "");
+    fx.index();
+    fx.layout.write(
+        "alpha.md",
+        &note("Alpha", &format!("{ALPHA} {REJECT_MARKER}")),
+    );
+    fx.layout
+        .write("beta.md", &note("Beta", &format!("{BETA} Edited.")));
+    fx.answer_with(rejects_marker(413));
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("1 skipped"), "{stderr}");
+    assert!(!stderr.contains(ALL_REJECTED), "{stderr}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// MCP `rebuild_index` answers the same run with an `error` beside its
+/// counts, and without the endpoint's response body.
+///
+/// Red if the server skips the check the CLI makes.
+#[test]
+fn mcp_rebuild_index_reports_an_error_when_every_input_was_rejected() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-mcp", &files(&notes), "");
+    fx.index();
+    std::fs::remove_file(fx.kb().join("gamma.md")).expect("remove gamma.md");
+    fx.layout
+        .write("alpha.md", &note("Alpha", &format!("{ALPHA} Edited.")));
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    fx.answer_with(|_| reply(413, &[]));
+    let resp = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    fx.answer_normally();
+    drop(guard);
+    let error = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(error.contains(ALL_REJECTED), "{resp}");
+    assert!(!resp.to_string().contains(BODY_SENTINEL), "{resp}");
+    assert_eq!(
+        resp.get("deleted").and_then(|v| v.as_u64()),
+        Some(1),
+        "{resp}"
+    );
+    assert_eq!(
+        resp.get("skipped").and_then(|v| v.as_u64()),
+        Some(1),
+        "{resp}"
+    );
     assert_dir_empty(&fx.cache);
 }
