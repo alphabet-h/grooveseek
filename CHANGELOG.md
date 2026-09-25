@@ -51,7 +51,38 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   handle its checks were made on, up to 1 MiB, and a hard link, something that
   is not a regular file and, on Unix, a symlink are refused.
 
+### Added
+
+- **`[embedding] max_input_chars` and `max_retries`** (openai-compatible only).
+  Inputs are cut to `max_input_chars` characters before they are sent (default
+  8000; 0 is refused). A batch is sent again up to `max_retries` times after
+  HTTP 429, a 5xx, a timeout or a failed connection (default 3; 0 sends once;
+  at most 10), honouring `Retry-After` up to 60 s. Neither key is part of the
+  index identity. FastEmbed refuses both, like the other endpoint keys. See
+  [ADR-0025](docs/decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md).
+- Library: `embedder::EmbedInputRejected`, `embedder::MAX_EMBEDDING_RETRIES`,
+  `OpenAiCompatibleConfig::with_limits`, `IndexResult::embed_rejected` /
+  `embedded` / `fails_all_inputs_rejected` / `all_inputs_rejected_message`,
+  `indexer::REJECTIONS_NAMED_ABOVE` / `REJECTIONS_NAMED_ON_SERVER_STDERR`.
+  `rebuild_index` still returns `Ok` for a run whose every embed was refused;
+  a library caller reads `fails_all_inputs_rejected` to treat it as the CLI
+  does. The two new public fields break code that builds an `IndexResult`
+  with a struct literal naming every field; `..Default::default()` keeps
+  compiling.
+
 ### Changed
+
+- **An openai-compatible endpoint's refusal no longer stops `groove index` or
+  MCP `rebuild_index`.** A file whose input is refused with HTTP 400, 413 or
+  422 is skipped with a warning, keeps its previous row, and the run goes on to
+  its deletions and exits 0, unless the run refused a file and embedded none:
+  that run exits non-zero (MCP: an `error` beside the counts) after it has
+  finished. 429, 5xx, timeouts and failed connections are retried before the
+  run stops; a connection the server drops after accepting it, 401, 403 and
+  other 4xx are not. **An existing index keeps the vectors of chunks longer
+  than 8000 characters** until they change or you run `groove index --force`.
+  A retry waits while holding the MCP server's embedder, so searches wait with
+  it; set `max_retries = 0` on a daemon that must answer quickly.
 
 - **On Windows, a document whose name Windows cannot open as written is no
   longer indexed** ([ADR-0023](docs/decisions/0023-index-only-names-the-server-can-open.md)).

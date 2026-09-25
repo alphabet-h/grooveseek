@@ -139,6 +139,8 @@
 #request_dimensions = false
 #api_key = "secret"
 #timeout_seconds = 60
+#max_input_chars = 8000
+#max_retries = 3
 
 # --- [quality_filter] — per-chunk quality filter --------------------------
 # On by default with threshold 0.3, which is what the two lines below spell
