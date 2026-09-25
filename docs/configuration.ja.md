@@ -245,7 +245,7 @@ bind = "127.0.0.1:3100"
 | `api_key` | 文字列 (openai-compatible 専用) | なし | bearer token として送る。`GROOVE_EMBEDDING_API_KEY` が優先。 |
 | `timeout_seconds` | 0 より大きい整数 (openai-compatible 専用) | `60` | HTTP リクエストの timeout。 |
 | `max_input_chars` | 0 より大きい整数 (openai-compatible 専用) | `8000` | 送信前に各入力をこの文字数 (token ではない) で切る。document と query の両方。index identity に含まれないので、変えても索引済みの文書は再 embed されない。 |
-| `max_retries` | 0-10 の整数 (openai-compatible 専用) | `3` | HTTP 429・5xx・timeout・接続失敗のあと batch を送り直す回数。待ちは 1 秒・2 秒・4 秒… (60 秒で頭打ちにし、その待ちの 4 分の 1 未満の jitter を足す) か `Retry-After` の値ちょうど。60 秒を超える `Retry-After` は待たずに失敗。`0` なら 1 回だけ送る。 |
+| `max_retries` | 0-10 の整数 (openai-compatible 専用) | `3` | HTTP 429・5xx、または status 行が届く前の timeout・接続失敗 (2xx で body が timeout した場合も含む) のあと batch を送り直す回数。待ちは 1 秒・2 秒・4 秒… (60 秒で頭打ちにし、その待ちの 4 分の 1 未満の jitter を足す) か `Retry-After` の値ちょうど。60 秒を超える `Retry-After` は待たずに失敗。`0` なら 1 回だけ送る。 |
 
 どの model が使われるか:
 

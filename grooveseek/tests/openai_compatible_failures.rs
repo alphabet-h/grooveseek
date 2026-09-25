@@ -1072,3 +1072,39 @@ fn index_does_not_retry_a_401_whose_body_stalls() {
     assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
     assert_dir_empty(&fx.cache);
 }
+
+/// MCP `search` whose query the endpoint answers with 401 reports the status
+/// and not the response body: the body may echo anything the endpoint holds,
+/// and every MCP client would see it (ADR-0025).
+///
+/// Red if the reply is built from the provider error's text, which carries
+/// the body snippet.
+#[test]
+fn mcp_search_reports_a_query_side_401_without_the_response_body() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-mcp-search-401", &files(&notes), "");
+    fx.index();
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    fx.answer_with(|req| {
+        if req.model() == Some(QUERY_MODEL) {
+            reply(401, &[])
+        } else {
+            MockReply::plain(default_response(req, DIM))
+        }
+    });
+    let resp = mcp_tool_call(
+        &base,
+        &session,
+        "search",
+        serde_json::json!({"query": "lighthouse keeper ship"}),
+    );
+    fx.answer_normally();
+    drop(guard);
+    let error = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(error.contains("HTTP 401"), "{resp}");
+    assert!(!resp.to_string().contains(BODY_SENTINEL), "{resp}");
+    assert_dir_empty(&fx.cache);
+}

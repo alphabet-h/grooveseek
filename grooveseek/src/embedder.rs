@@ -379,6 +379,42 @@ impl fmt::Display for EmbedInputRejected {
 
 impl std::error::Error for EmbedInputRejected {}
 
+/// Any other non-2xx answer (429, 5xx, 401, 403, 404, ...), worded the same
+/// way. Typed so that [`body_free_message`] can name the status without the
+/// body; the CLI prints this text, snippet included, to the operator.
+#[derive(Debug)]
+struct EmbedHttpStatus {
+    status: u16,
+    body_snippet: String,
+}
+
+impl fmt::Display for EmbedHttpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&http_status_message(self.status, &self.body_snippet))
+    }
+}
+
+impl std::error::Error for EmbedHttpStatus {}
+
+/// The outermost message of an embedding error, fit for a caller who must not
+/// see the endpoint's response body -- an MCP client (ADR-0025). When that
+/// message is a non-2xx answer ([`EmbedInputRejected`] or any other status),
+/// it names the status only. Every other outermost message groove words
+/// itself (a context, a timeout, a malformed answer) and is returned as it
+/// is: [`anyhow::Error`]'s `Display` never prints the causes underneath.
+pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
+    let outermost = error.chain().next();
+    let status = outermost.and_then(|e| {
+        e.downcast_ref::<EmbedInputRejected>()
+            .map(|r| r.status)
+            .or_else(|| e.downcast_ref::<EmbedHttpStatus>().map(|s| s.status))
+    });
+    match status {
+        Some(status) => format!("embedding endpoint returned HTTP {status}"),
+        None => error.to_string(),
+    }
+}
+
 /// (AW-04) Context on an [`EmbedInputRejected`] that came after the endpoint had
 /// accepted earlier batches of the same call. The call still fails and the
 /// indexer still finds the [`EmbedInputRejected`] underneath and skips the
@@ -625,8 +661,12 @@ impl OpenAiCompatibleProvider {
                 });
             }
         };
-        let http_error =
-            || anyhow::anyhow!(http_status_message(status, &escaped_body_snippet(&body)));
+        let http_error = || {
+            anyhow::Error::new(EmbedHttpStatus {
+                status,
+                body_snippet: escaped_body_snippet(&body),
+            })
+        };
         match class {
             StatusClass::Success => {}
             StatusClass::InputRejected => {
@@ -2533,5 +2573,46 @@ mod tests {
         let mut ok = Embedder::from_provider(Box::new(StubProvider), identity);
         ok.embed_texts(&["a"]).unwrap();
         assert_eq!(ok.documents_refused_after_accepting(), 0);
+    }
+
+    /// (AW-04) What an MCP reply may say about an embedding error: a non-2xx
+    /// answer by its status only, any message groove worded itself as it is.
+    #[test]
+    fn body_free_message_names_the_status_and_never_the_body() {
+        let secret = "SECRET-BODY";
+        let status = anyhow::Error::new(EmbedHttpStatus {
+            status: 401,
+            body_snippet: secret.to_string(),
+        });
+        assert!(
+            status.to_string().contains(secret),
+            "the CLI keeps the body"
+        );
+        assert_eq!(
+            body_free_message(&status),
+            "embedding endpoint returned HTTP 401"
+        );
+        let rejected = anyhow::Error::new(EmbedInputRejected {
+            status: 413,
+            body_snippet: secret.to_string(),
+        });
+        assert_eq!(
+            body_free_message(&rejected),
+            "embedding endpoint returned HTTP 413"
+        );
+        let wrapped = anyhow::Error::new(EmbedHttpStatus {
+            status: 503,
+            body_snippet: secret.to_string(),
+        })
+        .context("embedding endpoint still failing after 4 attempts (last: HTTP 503)");
+        assert_eq!(
+            body_free_message(&wrapped),
+            "embedding endpoint still failing after 4 attempts (last: HTTP 503)"
+        );
+        let other = anyhow::anyhow!("embedding endpoint returned malformed JSON");
+        assert_eq!(
+            body_free_message(&other),
+            "embedding endpoint returned malformed JSON"
+        );
     }
 }

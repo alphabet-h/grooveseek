@@ -730,8 +730,11 @@ impl KbCore {
                 }
                 serde_json::to_string_pretty(&stats).unwrap_or_default()
             }
+            // (AW-04) Through `body_free_message`, like the search tool's embed error: the
+            // indexer wraps every embed failure it returns in its own context today, and this
+            // keeps a response body out of the reply should one ever arrive unwrapped.
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Rebuild failed: {e}"),
+                error: format!("Rebuild failed: {}", crate::embedder::body_free_message(&e)),
             })
             .unwrap_or_default(),
         }

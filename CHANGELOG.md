@@ -16,6 +16,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **MCP `search` no longer passes an embedding endpoint's response body to the
+  client.** With `provider = "openai-compatible"`, a query the endpoint
+  answered with a status that is not retried (401, 403, 404, 400 / 413 / 422,
+  ...) came back as `Failed to embed query: embedding endpoint returned HTTP
+  <status>: <body>`, and the body can hold whatever the endpoint chose to echo.
+  The MCP reply now names the status only; `groove search` on the command line
+  still prints the body to the operator. MCP `rebuild_index` errors go through
+  the same wording. See
+  [ADR-0025](docs/decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md).
 - **`get_document` and `get_best_practice` no longer look at a path outside the
   knowledge base before refusing it.** The path check joined the request onto
   the knowledge base, and joining an absolute path replaces what it is joined

@@ -99,8 +99,11 @@ accepted no batch at all,
 it still finishes (deletions included)
 and then exits non-zero: that pattern points at `model` / `document_model` or
 `endpoint`, not at the files. MCP `rebuild_index` answers the same run with an
-`error`. HTTP 429, 5xx, timeouts and failed connections are retried
-(`max_retries`); 401, 403 and other 4xx stop the run at once. While a daemon
+`error`. HTTP 429 and 5xx are retried (`max_retries`); 401, 403 and other 4xx
+stop the run at once. Before a status line arrives, a timeout or a failed
+connection is retried and any other transport error stops the run; once a
+status line has arrived it decides, and a body that stalls or breaks off never
+changes that (a 2xx whose body times out is retried). While a daemon
 retries it holds the embedder, so searches wait with it; set `max_retries = 0`
 where that matters. Inputs are cut to `max_input_chars` characters first.
 Japanese text can take more than one token per character, so a server with an

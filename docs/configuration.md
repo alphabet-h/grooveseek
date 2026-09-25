@@ -254,7 +254,7 @@ to the parser; which ones are required depends on `provider`.
 | `api_key` | String (openai-compatible only) | none | Sent as a bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence. |
 | `timeout_seconds` | Integer greater than 0 (openai-compatible only) | `60` | HTTP request timeout. |
 | `max_input_chars` | Integer greater than 0 (openai-compatible only) | `8000` | Each input is cut to this many characters (not tokens) before it is sent, documents and queries alike. Not part of the index identity: changing it does not re-embed what is already indexed. |
-| `max_retries` | Integer 0-10 (openai-compatible only) | `3` | How many times a batch is sent again after HTTP 429, a 5xx, a timeout or a failed connection. Waits 1 s, 2 s, 4 s ... (capped at 60 s, plus a jitter below a quarter of that wait) or exactly what `Retry-After` asks; a `Retry-After` over 60 s fails at once. `0` sends once. |
+| `max_retries` | Integer 0-10 (openai-compatible only) | `3` | How many times a batch is sent again after HTTP 429, a 5xx, or a timeout or failed connection before the status line (a 2xx whose body times out counts too). Waits 1 s, 2 s, 4 s ... (capped at 60 s, plus a jitter below a quarter of that wait) or exactly what `Retry-After` asks; a `Retry-After` over 60 s fails at once. `0` sends once. |
 
 Which model is used:
 

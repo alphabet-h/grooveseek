@@ -91,8 +91,10 @@ run が 1 つでも
 場合は、run を最後まで (削除も含めて) 済ませた
 うえで exit 非 0 で終わる: この形はファイルではなく `model` / `document_model` か
 `endpoint` の誤りを指している。MCP `rebuild_index` は同じ run に `error` を返す。
-HTTP 429・5xx・timeout・接続失敗は再試行し (`max_retries`)、401・403 とその他の 4xx は
-その場で run を止める。daemon は再試行の間 embedder を握ったままなので、検索もその間
+HTTP 429・5xx は再試行し (`max_retries`)、401・403 とその他の 4xx はその場で run を
+止める。status 行が届く前の timeout・接続失敗は再試行し、その他の通信エラーは run を
+止める。status 行が届いたらその status で決まり、body が止まっても途中で切れても変わら
+ない (2xx で body が timeout したときは再試行する)。daemon は再試行の間 embedder を握ったままなので、検索もその間
 待たされる。それが困る所では `max_retries = 0` にする。入力は先に `max_input_chars`
 文字で切られる。日本語は 1 文字が 1 token を超えることがあるので、上限 8192 token の
 サーバでも 8000 文字を断る場合がある。warning が多くのファイルを挙げるなら
