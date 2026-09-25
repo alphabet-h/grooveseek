@@ -973,6 +973,10 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
     );
     fx.index();
     assert_eq!(fx.documents(), 2);
+    // The positive control for the absence check at the end: this query finds
+    // the note while it is indexed.
+    let before = search_paths(&fx, NOTE_QUERY);
+    assert!(before.iter().any(|p| p == "note.txt"), "{before:?}");
     fx.answer_with(rejects_marker(413));
     let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
         hermetic(c, &fx.cache);
@@ -1018,17 +1022,28 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
     assert!(!has("indexed note.md"), "{}", all.join("\n"));
     assert!(!has("keeps what it had"), "{}", all.join("\n"));
     assert!(!has(BODY_SENTINEL), "{}", all.join("\n"));
-    // Whatever became of note.txt's row, no row answers to note.md.
-    let hits = fx.search_json("harbour tides");
-    let paths: Vec<&str> = hits
-        .get("results")
+    // Whatever became of note.txt's row, no row answers to note.md. The same
+    // query found the note before the rename (checked above), and it must
+    // still list alpha.md, so an empty or broken search cannot pass this.
+    let paths = search_paths(&fx, NOTE_QUERY);
+    assert!(paths.iter().any(|p| p == "alpha.md"), "{paths:?}");
+    assert!(!paths.iter().any(|p| p == "note.md"), "{paths:?}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// A query the text of [`marked_txt_note`] answers.
+const NOTE_QUERY: &str = "harbour tides";
+
+/// The paths `groove search` returns for `query`, which must have a results
+/// array.
+fn search_paths(fx: &common::embed_cli::Fixture, query: &str) -> Vec<String> {
+    let hits = fx.search_json(query);
+    hits.get("results")
         .and_then(|r| r.as_array())
         .unwrap_or_else(|| panic!("search JSON has no results array: {hits}"))
         .iter()
-        .filter_map(|h| h.get("path").and_then(|p| p.as_str()))
-        .collect();
-    assert!(!paths.contains(&"note.md"), "{hits}");
-    assert_dir_empty(&fx.cache);
+        .filter_map(|h| h.get("path").and_then(|p| p.as_str()).map(str::to_owned))
+        .collect()
 }
 
 /// A 503 whose body is cut short (the connection closes before the promised
