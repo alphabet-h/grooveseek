@@ -90,10 +90,17 @@ only saw rejections fails after it has finished.**
   |---|---|
   | HTTP 400, 413, 422 | `EmbedInputRejected`: not retried. The indexer skips the file |
   | HTTP 429, 500-599 | Retried |
-  | A timeout, or a failed connection | Retried |
+  | A timeout, or a failed connection, before a status line arrives | Retried |
   | Any other status (401, 403, 404, 408, ...) | The run stops at once |
-  | A 2xx whose body is not valid JSON, or whose vectors have the wrong count, index or dimension | The run stops at once |
-  | Any other transport error (for example a connection the server drops after accepting it) | The run stops at once |
+  | A 2xx whose body times out | Retried |
+  | A 2xx whose body breaks off, is not valid JSON, or whose vectors have the wrong count, index or dimension | The run stops at once |
+  | Any other transport error before a status line arrives (for example a connection the server drops before answering) | The run stops at once |
+
+  Once a status line has arrived, its row decides, and a body that then stalls
+  or breaks off never changes it: a 429 or 5xx is still retried, honouring its
+  `Retry-After`; a 400, 413 or 422 still skips the file; any other non-2xx
+  status still stops the run. The body only feeds the error text, which is
+  left empty when it could not be read.
 
 - **Skipping**: the indexer prints
   `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`

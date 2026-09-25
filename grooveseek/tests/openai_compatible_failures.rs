@@ -996,10 +996,13 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
 }
 
 /// A 503 whose body is cut short (the connection closes before the promised
-/// `Content-Length`) is still a 503: it is retried, and the retry succeeds.
+/// `Content-Length`) is still a 503: it is retried after the `Retry-After` its
+/// headers carried, and the retry succeeds.
 ///
 /// Red if a body that breaks off (not a timeout) makes the failure fatal
-/// whatever the status said: the run would stop after one request.
+/// whatever the status said (the run would stop after one request), or if
+/// the failed body read drops `Retry-After: 2`: the backoff alone waits 1 s
+/// plus under 0.25 s of jitter, below the 2 s checked for.
 #[test]
 fn index_retries_a_503_whose_body_is_cut_short() {
     let notes = one_note();
@@ -1010,7 +1013,7 @@ fn index_retries_a_503_whose_body_is_cut_short() {
         fx.answer_with(move |req| {
             let mut first = first.lock().expect("first lock");
             if std::mem::replace(&mut *first, false) {
-                let mut cut = reply(503, &[("Retry-After", "0")]);
+                let mut cut = reply(503, &[("Retry-After", "2")]);
                 cut.truncate_body = true;
                 cut
             } else {
@@ -1018,13 +1021,19 @@ fn index_retries_a_503_whose_body_is_cut_short() {
             }
         });
     }
+    let started = Instant::now();
     let out = fx.run_index();
+    let took = started.elapsed();
     let stderr = stderr_of(&out);
     assert!(out.status.success(), "{stderr}");
     assert_eq!(
         fx.mock.requests().len(),
         2,
         "one cut 503, one success: {stderr}"
+    );
+    assert!(
+        took >= Duration::from_secs(2),
+        "Retry-After: 2 was not waited: {took:?}"
     );
     assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
     assert_dir_empty(&fx.cache);
@@ -1036,7 +1045,8 @@ fn index_retries_a_503_whose_body_is_cut_short() {
 /// embedder.
 ///
 /// Red if a body-read timeout is retried whatever the status said: the run
-/// would send 1 + `max_retries` requests before it stops.
+/// would send 1 + `max_retries` requests before it stops. Red too if the
+/// error stops naming the status (`HTTP 401: <empty>`, the body unread).
 #[test]
 fn index_does_not_retry_a_401_whose_body_stalls() {
     let notes = one_note();
@@ -1058,6 +1068,7 @@ fn index_does_not_retry_a_401_whose_body_stalls() {
     let stderr = stderr_of(&out);
     assert!(!out.status.success(), "{stderr}");
     assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert!(stderr.contains("HTTP 401: <empty>"), "{stderr}");
     assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
     assert_dir_empty(&fx.cache);
 }

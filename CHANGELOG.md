@@ -84,9 +84,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   finished. Under `groove index --force` (MCP `rebuild_index {force: true}`)
   one refused file is enough to fail the run the same way, since the rebuild
   emptied the index first and the file is not in it; its warning says so
-  instead of claiming the index kept anything. 429, 5xx, timeouts and failed connections are retried before the
-  run stops; a connection the server drops after accepting it, 401, 403 and
-  other 4xx are not. **An existing index keeps the vectors of chunks longer
+  instead of claiming the index kept anything. 429, 5xx, timeouts and failed
+  connections are retried before the run stops; a connection the server drops
+  before answering, 401, 403 and other 4xx are not. Once a status line has
+  arrived it decides, even when the body then stalls or is cut short: a 429 or
+  5xx is still retried, a 401 still stops the run. **An existing index keeps the vectors of chunks longer
   than 8000 characters** until they change or you run `groove index --force`.
   A retry waits while holding the MCP server's embedder, so searches wait with
   it; set `max_retries = 0` on a daemon that must answer quickly.

@@ -74,10 +74,16 @@ run は最後まで済ませてから失敗にする。**
   |---|---|
   | HTTP 400、413、422 | `EmbedInputRejected`: 再試行しない。indexer はそのファイルを skip する |
   | HTTP 429、500-599 | 再試行する |
-  | timeout、接続の失敗 | 再試行する |
+  | status 行が届く前の timeout、接続の失敗 | 再試行する |
   | その他の status (401、403、404、408 …) | その場で run を止める |
-  | 2xx で body が正しい JSON でない、またはベクトルの件数・index・次元が合わない | その場で run を止める |
-  | その他の通信エラー (例えば、サーバが受け付けた後に切った接続) | その場で run を止める |
+  | 2xx で body が timeout した | 再試行する |
+  | 2xx で body が途中で切れた、正しい JSON でない、またはベクトルの件数・index・次元が合わない | その場で run を止める |
+  | status 行が届く前のその他の通信エラー (例えば、サーバが答える前に切った接続) | その場で run を止める |
+
+  status 行が届いたら、その行の扱いで決まり、その後に body が止まっても途中で切れても
+  変わらない: 429・5xx は `Retry-After` に従って再試行し、400・413・422 はそのファイルを
+  skip し、その他の 2xx 以外の status は run を止める。body はエラー文に使うだけで、
+  読めなかったときは空になる。
 
 - **skip**: indexer は
   `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`
