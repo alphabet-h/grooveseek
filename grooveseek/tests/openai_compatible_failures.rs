@@ -12,14 +12,18 @@ mod common;
 
 use common::ansi::strip_ansi;
 use common::embed_cli::{
-    BODY_SENTINEL, REJECT_MARKER, files, fixture, note, rejects_marker, reply, stderr_of,
+    BODY_SENTINEL, DIM, REJECT_MARKER, files, fixture, note, rejects_marker, reply, stderr_of,
 };
-use common::embed_mock::{EmbedMock, assert_dir_empty, hermetic, wait_until};
+use common::embed_mock::{
+    DOC_MODEL, EmbedMock, MockReply, QUERY_MODEL, assert_dir_empty, default_response, hermetic,
+    wait_until,
+};
 use common::mcp::spawn_serve_with;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The mock writes the headers a reply responder returns.
 ///
@@ -265,5 +269,171 @@ fn the_watcher_reports_a_rejected_file_as_skipped() {
         all.join("\n")
     );
     drop(guard);
+    assert_dir_empty(&fx.cache);
+}
+
+fn one_note() -> [(&'static str, String); 1] {
+    [(
+        "only.md",
+        note("Only", "The ferry leaves at noon from the western pier."),
+    )]
+}
+
+/// A 429 with `Retry-After: 1` is waited out and the batch sent again.
+/// The exact wait is pinned by the `retry_loop` unit tests in `embedder.rs`;
+/// this pins that the binary retries at all and honours the header.
+///
+/// Red if the provider stops retrying (exit non-zero) or ignores the header
+/// and resends at once (under 1 s).
+#[test]
+fn index_waits_out_a_429_retry_after_and_then_succeeds() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-429", &files(&notes), "");
+    let first = Arc::new(Mutex::new(true));
+    {
+        let first = first.clone();
+        fx.answer_with(move |req| {
+            let mut first = first.lock().expect("first lock");
+            if std::mem::replace(&mut *first, false) {
+                reply(429, &[("Retry-After", "1")])
+            } else {
+                MockReply::plain(default_response(req, DIM))
+            }
+        });
+    }
+    let started = Instant::now();
+    let out = fx.run_index();
+    let took = started.elapsed();
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(fx.mock.requests().len(), 2, "one 429, one success");
+    assert!(
+        took >= Duration::from_secs(1),
+        "Retry-After: 1 was not waited: {took:?}"
+    );
+    assert_dir_empty(&fx.cache);
+}
+
+/// A 503 that never clears stops the run after `1 + max_retries` attempts
+/// and says how many; `max_retries = 0` sends once and says nothing about
+/// attempts. `Retry-After: 0` keeps the test from sleeping.
+///
+/// Red on an off-by-one in the loop, or if `max_retries` from the config
+/// never reaches the provider.
+#[test]
+fn index_gives_up_after_one_plus_max_retries_attempts_on_a_persistent_503() {
+    for (extra, attempts) in [("", 4usize), ("max_retries = 0\n", 1)] {
+        let notes = one_note();
+        let fx = fixture("groove-aw04-503", &files(&notes), extra);
+        fx.answer_with(|_| reply(503, &[("Retry-After", "0")]));
+        let out = fx.run_index();
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{extra:?}: {stderr}");
+        assert_eq!(fx.mock.requests().len(), attempts, "{extra:?}: {stderr}");
+        assert!(stderr.contains("HTTP 503"), "{stderr}");
+        if attempts == 4 {
+            assert!(
+                stderr.contains("still failing after 4 attempts (last: HTTP 503)"),
+                "{stderr}"
+            );
+        } else {
+            assert!(!stderr.contains("attempts"), "{stderr}");
+        }
+        assert_dir_empty(&fx.cache);
+    }
+}
+
+/// A 401 is a wrong key, not a busy server: one request, then the run stops.
+///
+/// Red if 401 is classified as retryable (four requests).
+#[test]
+fn index_does_not_retry_a_401() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-401", &files(&notes), "");
+    fx.answer_with(|_| reply(401, &[("Retry-After", "0")]));
+    let out = fx.run_index();
+    assert!(!out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(fx.mock.requests().len(), 1);
+    assert_dir_empty(&fx.cache);
+}
+
+/// Inputs longer than `max_input_chars` arrive cut to it, on a character
+/// boundary, for ASCII and for multi-byte text alike; a configured value
+/// replaces the default 8000.
+///
+/// Red if the provider stops cutting, or never receives the configured value.
+#[test]
+fn index_sends_long_inputs_cut_to_max_input_chars() {
+    for (extra, limit) in [("", 8000usize), ("max_input_chars = 100\n", 100)] {
+        let ascii = note("Ascii", &"x".repeat(9000));
+        let kana = note("Kana", &"あ".repeat(9000));
+        let fx = fixture(
+            "groove-aw04-cut",
+            &[("ascii.md", ascii.as_str()), ("kana.md", kana.as_str())],
+            extra,
+        );
+        fx.index();
+        let inputs: Vec<String> = fx
+            .mock
+            .requests()
+            .iter()
+            .filter(|r| r.model() == Some(DOC_MODEL))
+            .flat_map(|r| r.inputs())
+            .collect();
+        assert!(
+            inputs.iter().all(|i| i.chars().count() <= limit),
+            "{extra:?}"
+        );
+        for ch in ['x', 'あ'] {
+            assert!(
+                inputs
+                    .iter()
+                    .any(|i| i.chars().count() == limit && i.ends_with(ch)),
+                "{extra:?}: no input of {limit} chars ending in {ch:?}; lengths {:?}",
+                inputs.iter().map(|i| i.chars().count()).collect::<Vec<_>>()
+            );
+        }
+        assert_dir_empty(&fx.cache);
+    }
+}
+
+/// A `Retry-After` over 60 s is not waited for: the run stops at once and
+/// says what the server asked for.
+///
+/// Red if the cap is dropped (the run would wait 120 s and miss the bound).
+#[test]
+fn index_stops_without_waiting_when_retry_after_exceeds_sixty_seconds() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-120", &files(&notes), "");
+    fx.answer_with(|_| reply(429, &[("Retry-After", "120")]));
+    let started = Instant::now();
+    let out = fx.run_index();
+    let took = started.elapsed();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(took < Duration::from_secs(30), "waited {took:?}");
+    assert_eq!(fx.mock.requests().len(), 1);
+    assert!(stderr.contains("asked to retry after 120 s"), "{stderr}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// Review Focus 3: the query side is cut too. A 9000-character query reaches
+/// the endpoint under `query_model` as 8000 characters.
+///
+/// Red if truncation is applied to documents only.
+#[test]
+fn search_sends_a_long_query_cut_to_max_input_chars() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-query", &files(&notes), "");
+    fx.index();
+    let before = fx.mock.requests().len();
+    fx.search_json(&"q".repeat(9000));
+    let queries: Vec<String> = fx
+        .requests_since(before)
+        .iter()
+        .filter(|r| r.model() == Some(QUERY_MODEL))
+        .flat_map(|r| r.inputs())
+        .collect();
+    assert_eq!(queries.len(), 1, "one query embed");
+    assert_eq!(queries[0].chars().count(), 8000);
     assert_dir_empty(&fx.cache);
 }
