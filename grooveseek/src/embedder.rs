@@ -152,6 +152,12 @@ pub struct OpenAiCompatibleConfig {
     api_key: Option<String>,
     timeout: Duration,
     index_model_id: String,
+    /// Inputs are cut to this many characters before they are sent. `None`
+    /// sends them whole (the default of [`OpenAiCompatibleConfig::new`];
+    /// configuration sets 8000).
+    max_input_chars: Option<usize>,
+    /// How many times one batch is sent again after a transient failure.
+    max_retries: u32,
 }
 
 impl fmt::Debug for OpenAiCompatibleConfig {
@@ -164,6 +170,8 @@ impl fmt::Debug for OpenAiCompatibleConfig {
             .field("request_dimensions", &self.request_dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("timeout", &self.timeout)
+            .field("max_input_chars", &self.max_input_chars)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -231,7 +239,25 @@ impl OpenAiCompatibleConfig {
             api_key,
             timeout,
             index_model_id,
+            max_input_chars: None,
+            max_retries: 0,
         })
+    }
+
+    /// Set the input cap and the retry count (`[embedding] max_input_chars` /
+    /// `max_retries`). Neither is part of the index identity.
+    pub fn with_limits(mut self, max_input_chars: Option<usize>, max_retries: u32) -> Result<Self> {
+        anyhow::ensure!(
+            max_input_chars != Some(0),
+            "[embedding].max_input_chars must be greater than zero"
+        );
+        anyhow::ensure!(
+            max_retries <= MAX_EMBEDDING_RETRIES,
+            "[embedding].max_retries must be at most {MAX_EMBEDDING_RETRIES}"
+        );
+        self.max_input_chars = max_input_chars;
+        self.max_retries = max_retries;
+        Ok(self)
     }
 }
 
@@ -329,6 +355,111 @@ pub const ENDPOINT_PROBE_TEXT: &str = "GrooveSeek endpoint probe";
 const OPENAI_COMPATIBLE_BATCH_SIZE: usize = 64;
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 512;
 
+/// The most `[embedding] max_retries` accepts.
+pub const MAX_EMBEDDING_RETRIES: u32 = 10;
+
+/// An OpenAI-compatible endpoint refused a batch because of what it held:
+/// HTTP 400, 413 or 422. Not retried. The indexer downcasts to this and skips
+/// the file instead of stopping the run; it reads [`EmbedInputRejected::status`]
+/// and never this error's text, which carries the response body.
+#[derive(Debug)]
+pub struct EmbedInputRejected {
+    pub status: u16,
+    body_snippet: String,
+}
+
+impl fmt::Display for EmbedInputRejected {
+    // Worded exactly as the untyped non-2xx error in `send_batch_once`
+    // (`http_error`), so a CLI error chain reads the same whichever status it
+    // was (spec 3.1). The indexer never prints this.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "embedding endpoint returned HTTP {}: {}",
+            self.status, self.body_snippet
+        )
+    }
+}
+
+impl std::error::Error for EmbedInputRejected {}
+
+/// How one attempt at a batch failed.
+enum AttemptFailure {
+    /// 429, 5xx, a timeout or a failed connection: worth sending again.
+    Retryable {
+        error: anyhow::Error,
+        retry_after: Option<Duration>,
+        /// `HTTP 503`, `timed out` or `connection failed`, for the final message.
+        last: String,
+    },
+    /// Anything else, [`EmbedInputRejected`] included: returned as it is.
+    Fatal(anyhow::Error),
+}
+
+/// How [`retry_loop`] waits: injected so tests record the waits instead of
+/// sleeping them.
+struct Backoff<'a> {
+    sleep: &'a mut dyn FnMut(Duration),
+    jitter: &'a mut dyn FnMut(Duration) -> Duration,
+}
+
+/// Run `attempt` until it succeeds, fails for good, or has been retried
+/// `max_retries` times. With `max_retries == 0` the first error comes back
+/// exactly as it was; otherwise a gave-up error is wrapped in a context that
+/// names the attempts, the last error staying its source.
+fn retry_loop<T>(
+    max_retries: u32,
+    backoff: &mut Backoff<'_>,
+    mut attempt: impl FnMut() -> std::result::Result<T, AttemptFailure>,
+) -> Result<T> {
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let (error, retry_after, last) = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(AttemptFailure::Fatal(error)) => return Err(error),
+            Err(AttemptFailure::Retryable {
+                error,
+                retry_after,
+                last,
+            }) => (error, retry_after, last),
+        };
+        if max_retries == 0 {
+            return Err(error);
+        }
+        if attempts > max_retries {
+            return Err(error.context(format!(
+                "embedding endpoint still failing after {attempts} attempts (last: {last})"
+            )));
+        }
+        match wait_before_retry(attempts, retry_after, backoff.jitter) {
+            Wait::GiveUp(asked) => {
+                return Err(error.context(format!(
+                    "embedding endpoint asked to retry after {} s, more than the {} s groove \
+                     waits; gave up after {attempts} attempt(s)",
+                    asked.as_secs(),
+                    MAX_RETRY_AFTER.as_secs()
+                )));
+            }
+            Wait::After(wait) => (backoff.sleep)(wait),
+        }
+    }
+}
+
+/// A jitter in `[0, base / 4)` from the clock's sub-second nanoseconds: enough
+/// to keep processes that failed together from retrying in step. Not random in
+/// any stronger sense, and it need not be.
+fn jitter_from_clock(base: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    // Integer arithmetic, so no float rounding can land on the bound itself.
+    let quarter = u128::from(u64::try_from((base / 4).as_nanos()).unwrap_or(u64::MAX));
+    let jitter = quarter * u128::from(nanos) / 1_000_000_000;
+    Duration::from_nanos(u64::try_from(jitter).unwrap_or(u64::MAX))
+}
+
 impl OpenAiCompatibleProvider {
     fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
         eprintln!(
@@ -358,6 +489,10 @@ impl OpenAiCompatibleProvider {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let texts: Vec<&str> = match self.config.max_input_chars {
+            Some(max) => texts.iter().map(|t| truncate_to_chars(t, max)).collect(),
+            None => texts.to_vec(),
+        };
 
         let mut embeddings = Vec::with_capacity(texts.len());
         for batch in texts.chunks(OPENAI_COMPATIBLE_BATCH_SIZE) {
@@ -366,7 +501,27 @@ impl OpenAiCompatibleProvider {
         Ok(embeddings)
     }
 
+    /// One batch, sent again on a transient failure (see [`retry_loop`]).
     fn embed_batch(&mut self, texts: &[&str], model: &str) -> Result<Vec<Vec<f32>>> {
+        let max_retries = self.config.max_retries;
+        let mut sleep = std::thread::sleep;
+        let mut jitter = jitter_from_clock;
+        let mut backoff = Backoff {
+            sleep: &mut sleep,
+            jitter: &mut jitter,
+        };
+        retry_loop(max_retries, &mut backoff, || {
+            self.send_batch_once(texts, model)
+        })
+    }
+
+    /// Send one batch once and check the answer. How a failure is classified
+    /// decides whether [`retry_loop`] sends it again.
+    fn send_batch_once(
+        &mut self,
+        texts: &[&str],
+        model: &str,
+    ) -> std::result::Result<Vec<Vec<f32>>, AttemptFailure> {
         let request = OpenAiEmbeddingRequest {
             model,
             input: texts,
@@ -377,65 +532,86 @@ impl OpenAiCompatibleProvider {
         };
         let endpoint = self.config.endpoint.clone();
         let api_key = self.config.api_key.clone();
-        let mut builder = self.client()?.post(endpoint).json(&request);
+        let dimension = self.config.dimension;
+        let client = self.client().map_err(AttemptFailure::Fatal)?;
+        let mut builder = client.post(endpoint).json(&request);
         if let Some(api_key) = api_key {
             builder = builder.bearer_auth(api_key);
         }
-        let response = builder.send().map_err(|error| {
-            anyhow::anyhow!("embedding request failed: {}", error.without_url())
-        })?;
-        let status = response.status();
-        let body = response.bytes().map_err(|error| {
+        let response = match builder.send() {
+            Ok(response) => response,
+            Err(error) => {
+                let last = if error.is_timeout() {
+                    Some("timed out")
+                } else if error.is_connect() {
+                    Some("connection failed")
+                } else {
+                    None
+                };
+                let error = anyhow::anyhow!("embedding request failed: {}", error.without_url());
+                return Err(match last {
+                    Some(last) => AttemptFailure::Retryable {
+                        error,
+                        retry_after: None,
+                        last: last.to_string(),
+                    },
+                    None => AttemptFailure::Fatal(error),
+                });
+            }
+        };
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, SystemTime::now()));
+        let body = match response.bytes() {
+            Ok(body) => body,
+            Err(error) => {
+                let timed_out = error.is_timeout();
+                let error = anyhow::anyhow!(
+                    "failed to read embedding response body: {}",
+                    error.without_url()
+                );
+                return Err(if timed_out {
+                    AttemptFailure::Retryable {
+                        error,
+                        retry_after,
+                        last: "timed out".to_string(),
+                    }
+                } else {
+                    AttemptFailure::Fatal(error)
+                });
+            }
+        };
+        // The one place the untyped non-2xx error is worded; the typed one
+        // (`EmbedInputRejected`'s `Display`) keeps the same text on purpose.
+        let http_error = || {
             anyhow::anyhow!(
-                "failed to read embedding response body: {}",
-                error.without_url()
-            )
-        })?;
-        if !status.is_success() {
-            anyhow::bail!(
-                "embedding endpoint returned HTTP {}: {}",
-                status.as_u16(),
+                "embedding endpoint returned HTTP {status}: {}",
                 escaped_body_snippet(&body)
-            );
+            )
+        };
+        match classify_status(status) {
+            StatusClass::Success => {}
+            StatusClass::InputRejected => {
+                return Err(AttemptFailure::Fatal(anyhow::Error::new(
+                    EmbedInputRejected {
+                        status,
+                        body_snippet: escaped_body_snippet(&body),
+                    },
+                )));
+            }
+            StatusClass::Retryable => {
+                return Err(AttemptFailure::Retryable {
+                    error: http_error(),
+                    retry_after,
+                    last: format!("HTTP {status}"),
+                });
+            }
+            StatusClass::Fatal => return Err(AttemptFailure::Fatal(http_error())),
         }
-        let parsed: OpenAiEmbeddingResponse =
-            serde_json::from_slice(&body).context("embedding endpoint returned malformed JSON")?;
-        anyhow::ensure!(
-            parsed.data.len() == texts.len(),
-            "embedding endpoint returned {} vectors for {} inputs",
-            parsed.data.len(),
-            texts.len()
-        );
-
-        let mut ordered: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        for item in parsed.data {
-            anyhow::ensure!(
-                item.index < ordered.len(),
-                "embedding endpoint returned out-of-range index {} for {} inputs",
-                item.index,
-                ordered.len()
-            );
-            anyhow::ensure!(
-                item.embedding.len() == self.config.dimension,
-                "embedding endpoint returned dimension {} at index {}; expected {}",
-                item.embedding.len(),
-                item.index,
-                self.config.dimension
-            );
-            anyhow::ensure!(
-                ordered[item.index].is_none(),
-                "embedding endpoint returned duplicate index {}",
-                item.index
-            );
-            ordered[item.index] = Some(item.embedding);
-        }
-        ordered
-            .into_iter()
-            .enumerate()
-            .map(|(index, embedding)| {
-                embedding.ok_or_else(|| anyhow::anyhow!("embedding endpoint omitted index {index}"))
-            })
-            .collect()
+        parse_embedding_response(&body, texts.len(), dimension).map_err(AttemptFailure::Fatal)
     }
 }
 
@@ -465,6 +641,50 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
     }
 }
 
+/// Check a 2xx answer and put its vectors in input order: one per input, each
+/// index in range and unique, none missing, each of the declared dimension.
+/// Never retried: the server would give the same answer again.
+fn parse_embedding_response(body: &[u8], inputs: usize, dimension: usize) -> Result<Vec<Vec<f32>>> {
+    let parsed: OpenAiEmbeddingResponse =
+        serde_json::from_slice(body).context("embedding endpoint returned malformed JSON")?;
+    anyhow::ensure!(
+        parsed.data.len() == inputs,
+        "embedding endpoint returned {} vectors for {} inputs",
+        parsed.data.len(),
+        inputs
+    );
+
+    let mut ordered: Vec<Option<Vec<f32>>> = vec![None; inputs];
+    for item in parsed.data {
+        anyhow::ensure!(
+            item.index < ordered.len(),
+            "embedding endpoint returned out-of-range index {} for {} inputs",
+            item.index,
+            ordered.len()
+        );
+        anyhow::ensure!(
+            item.embedding.len() == dimension,
+            "embedding endpoint returned dimension {} at index {}; expected {}",
+            item.embedding.len(),
+            item.index,
+            dimension
+        );
+        anyhow::ensure!(
+            ordered[item.index].is_none(),
+            "embedding endpoint returned duplicate index {}",
+            item.index
+        );
+        ordered[item.index] = Some(item.embedding);
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            embedding.ok_or_else(|| anyhow::anyhow!("embedding endpoint omitted index {index}"))
+        })
+        .collect()
+}
+
 fn escaped_body_snippet(body: &[u8]) -> String {
     let mut snippet = String::new();
     for byte in body.iter().take(MAX_HTTP_ERROR_BODY_BYTES) {
@@ -485,7 +705,6 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// `text` cut to at most `max` characters (Unicode scalar values), on a
 /// character boundary so that a multi-byte character is never split.
-#[allow(dead_code)] // wired into the provider by the next commit
 fn truncate_to_chars(text: &str, max: usize) -> &str {
     match text.char_indices().nth(max) {
         Some((byte, _)) => &text[..byte],
@@ -498,7 +717,6 @@ fn truncate_to_chars(text: &str, max: usize) -> &str {
 /// [`Duration::MAX`], longer than any wait honoured. `None` for anything else,
 /// including the obsolete RFC 850 and asctime date forms: the caller then
 /// falls back to its own backoff.
-#[allow(dead_code)] // wired into the provider by the next commit
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if value.is_empty() {
@@ -517,7 +735,6 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
 }
 
 /// How one HTTP status is handled by the OpenAI-compatible provider.
-#[allow(dead_code)] // wired into the provider by the next commit
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusClass {
     Success,
@@ -530,7 +747,6 @@ enum StatusClass {
     Fatal,
 }
 
-#[allow(dead_code)] // wired into the provider by the next commit
 fn classify_status(status: u16) -> StatusClass {
     match status {
         200..=299 => StatusClass::Success,
@@ -542,7 +758,6 @@ fn classify_status(status: u16) -> StatusClass {
 
 /// The backoff before retry number `retry` (1-based) when the server named no
 /// `Retry-After`: 1 s, 2 s, 4 s, ... capped at [`MAX_RETRY_AFTER`].
-#[allow(dead_code)] // wired into the provider by the next commit
 fn backoff_base(retry: u32) -> Duration {
     let secs = 1u64
         .checked_shl(retry.saturating_sub(1))
@@ -550,7 +765,6 @@ fn backoff_base(retry: u32) -> Duration {
     Duration::from_secs(secs).min(MAX_RETRY_AFTER)
 }
 
-#[allow(dead_code)] // wired into the provider by the next commit
 #[derive(Debug, PartialEq, Eq)]
 enum Wait {
     /// Sleep this long, then send again.
@@ -562,7 +776,6 @@ enum Wait {
 /// What to do before retry number `retry` (1-based). A `Retry-After` the
 /// server sent wins and is waited exactly; without one, [`backoff_base`] plus
 /// whatever `jitter` adds for that base.
-#[allow(dead_code)] // wired into the provider by the next commit
 fn wait_before_retry(
     retry: u32,
     retry_after: Option<Duration>,
@@ -573,7 +786,7 @@ fn wait_before_retry(
         Some(asked) => Wait::After(asked),
         None => {
             let base = backoff_base(retry);
-            Wait::After(base + jitter(base))
+            Wait::After(base.saturating_add(jitter(base)))
         }
     }
 }
@@ -1981,6 +2194,197 @@ mod tests {
         assert_eq!(
             wait_before_retry(1, Some(Duration::from_secs(61)), &mut quarter),
             Wait::GiveUp(Duration::from_secs(61))
+        );
+    }
+
+    /// A scripted attempt sequence for `retry_loop`: each call pops the next
+    /// outcome and counts itself.
+    fn scripted(
+        outcomes: Vec<std::result::Result<u32, AttemptFailure>>,
+    ) -> (
+        impl FnMut() -> std::result::Result<u32, AttemptFailure>,
+        std::rc::Rc<std::cell::Cell<u32>>,
+    ) {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = calls.clone();
+        let mut outcomes = outcomes.into_iter();
+        let attempt = move || {
+            counter.set(counter.get() + 1);
+            outcomes
+                .next()
+                .expect("retry_loop asked for more attempts than scripted")
+        };
+        (attempt, calls)
+    }
+
+    fn transient(status: u16, retry_after: Option<Duration>) -> AttemptFailure {
+        AttemptFailure::Retryable {
+            error: anyhow::anyhow!("embedding endpoint returned HTTP {status}: body-{status}"),
+            retry_after,
+            last: format!("HTTP {status}"),
+        }
+    }
+
+    /// Run `retry_loop` with a sleeper that records instead of sleeping, and no jitter.
+    fn run_retry_loop(
+        max_retries: u32,
+        attempt: impl FnMut() -> std::result::Result<u32, AttemptFailure>,
+    ) -> (Result<u32>, Vec<Duration>) {
+        let mut slept = Vec::new();
+        let result = {
+            let mut sleep = |d: Duration| slept.push(d);
+            let mut jitter = |_: Duration| Duration::ZERO;
+            let mut backoff = Backoff {
+                sleep: &mut sleep,
+                jitter: &mut jitter,
+            };
+            retry_loop(max_retries, &mut backoff, attempt)
+        };
+        (result, slept)
+    }
+
+    #[test]
+    fn retry_loop_backs_off_one_two_four_seconds_then_gives_up_naming_the_attempts() {
+        let (attempt, calls) = scripted((0..4).map(|_| Err(transient(503, None))).collect());
+        let (result, slept) = run_retry_loop(3, attempt);
+        let err = result.expect_err("four 503s must fail");
+        assert_eq!(calls.get(), 4);
+        assert_eq!(
+            slept,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4)
+            ]
+        );
+        assert_eq!(
+            err.to_string(),
+            "embedding endpoint still failing after 4 attempts (last: HTTP 503)"
+        );
+        assert!(
+            format!("{err:#}").contains("HTTP 503: body-503"),
+            "the last error stays the source: {err:#}"
+        );
+    }
+
+    #[test]
+    fn retry_loop_waits_exactly_what_retry_after_says_and_then_succeeds() {
+        let (attempt, calls) = scripted(vec![
+            Err(transient(429, Some(Duration::from_secs(1)))),
+            Ok(7),
+        ]);
+        let (result, slept) = run_retry_loop(3, attempt);
+        assert_eq!(result.expect("the second attempt succeeds"), 7);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(slept, vec![Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn retry_loop_gives_up_at_once_when_retry_after_exceeds_sixty_seconds() {
+        let (attempt, calls) = scripted(vec![Err(transient(429, Some(Duration::from_secs(120))))]);
+        let (result, slept) = run_retry_loop(3, attempt);
+        let err = result.expect_err("a 120 s Retry-After is not waited for");
+        assert_eq!(calls.get(), 1);
+        assert!(slept.is_empty(), "nothing may be slept: {slept:?}");
+        assert_eq!(
+            err.to_string(),
+            "embedding endpoint asked to retry after 120 s, more than the 60 s groove waits; \
+             gave up after 1 attempt(s)"
+        );
+    }
+
+    #[test]
+    fn retry_loop_does_not_retry_a_fatal_failure_and_keeps_its_type() {
+        let rejected = anyhow::Error::new(EmbedInputRejected {
+            status: 413,
+            body_snippet: "too long".to_string(),
+        });
+        let (attempt, calls) = scripted(vec![Err(AttemptFailure::Fatal(rejected))]);
+        let (result, slept) = run_retry_loop(3, attempt);
+        let err = result.expect_err("a rejection fails");
+        assert_eq!(calls.get(), 1);
+        assert!(slept.is_empty());
+        assert_eq!(
+            err.downcast_ref::<EmbedInputRejected>().map(|r| r.status),
+            Some(413)
+        );
+        assert_eq!(
+            err.to_string(),
+            "embedding endpoint returned HTTP 413: too long"
+        );
+
+        let (attempt, calls) = scripted(vec![Err(AttemptFailure::Fatal(anyhow::anyhow!(
+            "embedding endpoint returned HTTP 401: nope"
+        )))]);
+        let (result, _) = run_retry_loop(3, attempt);
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "a 401 is not retried");
+    }
+
+    #[test]
+    fn retry_loop_with_no_retries_returns_the_first_error_unwrapped() {
+        let (attempt, calls) = scripted(vec![Err(transient(503, None))]);
+        let (result, slept) = run_retry_loop(0, attempt);
+        let err = result.expect_err("fails");
+        assert_eq!(calls.get(), 1);
+        assert!(slept.is_empty());
+        assert_eq!(
+            err.to_string(),
+            "embedding endpoint returned HTTP 503: body-503"
+        );
+
+        let (attempt, calls) = scripted(vec![Err(transient(429, Some(Duration::from_secs(120))))]);
+        let (result, _) = run_retry_loop(0, attempt);
+        assert_eq!(
+            result.expect_err("fails").to_string(),
+            "embedding endpoint returned HTTP 429: body-429"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn retry_loop_with_ten_retries_caps_every_wait_at_sixty_seconds() {
+        let (attempt, calls) = scripted((0..11).map(|_| Err(transient(503, None))).collect());
+        let (result, slept) = run_retry_loop(MAX_EMBEDDING_RETRIES, attempt);
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 11);
+        let secs: Vec<u64> = slept.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 16, 32, 60, 60, 60, 60]);
+    }
+
+    #[test]
+    fn jitter_from_clock_stays_below_a_quarter_of_the_base() {
+        for base in [Duration::from_secs(1), Duration::from_secs(60)] {
+            for _ in 0..100 {
+                assert!(jitter_from_clock(base) < base / 4, "{base:?}");
+            }
+        }
+        assert_eq!(jitter_from_clock(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn with_limits_rejects_zero_chars_and_more_than_ten_retries() {
+        let config = || openai_config_for_endpoint("http://127.0.0.1:8001/v1/embeddings").unwrap();
+        let err = config().with_limits(Some(0), 3).expect_err("0 chars");
+        assert!(
+            err.to_string()
+                .contains("[embedding].max_input_chars must be greater than zero")
+        );
+        let err = config()
+            .with_limits(Some(8000), 11)
+            .expect_err("11 retries");
+        assert!(
+            err.to_string()
+                .contains("[embedding].max_retries must be at most 10")
+        );
+        let ok = config().with_limits(Some(8000), 10).expect("10 retries");
+        let debug = format!("{ok:?}");
+        assert!(debug.contains("max_input_chars: Some(8000)"), "{debug}");
+        assert!(debug.contains("max_retries: 10"), "{debug}");
+        let plain = format!("{:?}", config());
+        assert!(
+            plain.contains("max_input_chars: None") && plain.contains("max_retries: 0"),
+            "{plain}"
         );
     }
 }
