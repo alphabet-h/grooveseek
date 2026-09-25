@@ -16,6 +16,14 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **A loopback embedding endpoint is no longer reached through a proxy.** With
+  `provider = "openai-compatible"`, the HTTP client took `HTTP_PROXY` /
+  `HTTPS_PROXY` / `ALL_PROXY` and the OS proxy settings even for an endpoint
+  such as `http://127.0.0.1:8001/v1/embeddings`, so document text, queries and
+  the API key meant for a server on this machine could pass through a proxy
+  set for the outside world. An endpoint on 127.0.0.0/8, `::1` or `localhost`
+  is now always contacted directly; any other endpoint still follows the
+  proxy settings.
 - **MCP `search` no longer passes an embedding endpoint's response body to the
   client.** With `provider = "openai-compatible"`, a query the endpoint
   answered with a status that is not retried (401, 403, 404, 400 / 413 / 422,
