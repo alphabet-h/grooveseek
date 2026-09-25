@@ -72,11 +72,12 @@ successful.
      with 400 would look like a clean run with many skips.
    - Exit non-zero on any rejection. Rejected: one oversized chunk in a large,
      healthy knowledge base would fail every run.
-   - **Exit non-zero only when the run had a rejection and embedded no file.**
-     Taken. That pattern points at `model` / `document_model` or `endpoint`
-     rather than at the files. A file refused only after the endpoint
-     accepted an earlier batch of it does not count as such a rejection: the
-     accepted batch shows the configuration works.
+   - **Exit non-zero only when the run had a rejection and the endpoint
+     accepted nothing.** Taken. That pattern points at `model` /
+     `document_model` or `endpoint` rather than at the files. A file refused
+     only after the endpoint accepted an earlier batch of it counts as
+     accepted, not as such a rejection: the accepted batch shows the
+     configuration works.
 
 ## Decision
 
@@ -123,11 +124,12 @@ only saw rejections fails after it has finished.**
   of the probe is **not** skipped: the probe text is fixed, short ASCII, so a
   400, 413 or 422 there points at the configuration, and the rebuild stops
   before the reset as ADR-0024 intends.
-- **A run with rejections and nothing embedded fails after it has finished**
-  (`IndexResult::fails_all_inputs_rejected`). A file of more than one batch
-  (64 chunks) that the endpoint refused only after accepting an earlier batch
-  of it is skipped the same way, but is not counted as a rejection here. The
-  run is not cut short: the
+- **A run with rejections in which the endpoint accepted nothing fails after
+  it has finished** (`IndexResult::fails_all_inputs_rejected`). A file of more
+  than one batch (64 chunks) that the endpoint refused only after accepting an
+  earlier batch of it is skipped the same way, but counts as accepted
+  (`IndexResult::embedded`), not as a rejection, so such a run does not fail.
+  The run is not cut short: the
   deletion sweep and the bookkeeping complete, and `rebuild_index` still
   returns its counts. Then `groove index` exits non-zero and MCP
   `rebuild_index` returns an `error` beside the counts, both with the message
@@ -160,7 +162,8 @@ only saw rejections fails after it has finished.**
   the rule as decided: the run cannot tell a lone oversized file from a
   configuration error.
 - **A configuration error can still pass unnoticed** if the endpoint refuses
-  only some inputs and another file is embedded in the same run.
+  only some inputs and another file is embedded in the same run, or accepts a
+  file's first batch and refuses a later one.
 - **Japanese text can exceed a token limit within 8000 characters**, since a
   character can take more than one token. Those files are skipped with a
   warning; lowering `max_input_chars` brings them back.

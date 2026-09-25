@@ -597,9 +597,13 @@ pub struct IndexResult {
     /// input before accepting any of it. Also counted in [`Self::skipped`]. A
     /// file refused only after the endpoint accepted an earlier batch of it is
     /// skipped (and in [`Self::skipped`]) but not counted here: the accepted
-    /// batch shows the configuration works.
+    /// batch shows the configuration works; it is counted in
+    /// [`Self::embedded`] instead.
     pub embed_rejected: u32,
-    /// (AW-04) Files this run sent to the embedder and got vectors for. Not
+    /// (AW-04) Files for which the embedding endpoint accepted at least one
+    /// batch this run: every file embedded whole, plus every file refused
+    /// only after an earlier batch of it was accepted (skipped, and in
+    /// [`Self::skipped`]). Either shows the endpoint and model work. Not
     /// [`Self::updated`]: a metadata-only update counts there without
     /// embedding anything.
     pub embedded: u32,
@@ -618,9 +622,10 @@ impl IndexResult {
     }
 
     /// (AW-04) Whether this run had the endpoint refuse at least one file's
-    /// input outright ([`Self::embed_rejected`]) and embedded nothing -- which
-    /// points at the configuration (model, endpoint) rather than at the files.
-    /// A refusal after an accepted batch does not count. One decision, rendered twice:
+    /// input outright ([`Self::embed_rejected`]) and accept nothing at all
+    /// ([`Self::embedded`], which counts a batch accepted before a refusal) --
+    /// which points at the configuration (model, endpoint) rather than at the
+    /// files. One decision, rendered twice:
     /// `groove index` exits non-zero, MCP `rebuild_index` answers with an
     /// `error`. The run itself completed, deletions included.
     pub fn fails_all_inputs_rejected(&self) -> bool {
@@ -982,10 +987,12 @@ pub fn rebuild_index(
         Err(e) => tracing::warn!("failed to record document sizes: {e}"),
     }
 
-    // (AW-04) Files embedded this run, measured on the embedder rather than counted from
-    // `Updated`, which a metadata-only update also returns. MCP holds the embedder's lock
-    // for the whole run (`server.rs`), so no watcher embed falls in between.
+    // (AW-04) Files the endpoint accepted at least one batch of this run, measured on the
+    // embedder rather than counted from `Updated`, which a metadata-only update also
+    // returns. MCP holds the embedder's lock for the whole run (`server.rs`), so no
+    // watcher embed falls in between.
     let embedded_before = embedder.documents_embedded();
+    let run_refused_after_accepting_before = embedder.documents_refused_after_accepting();
     let mut embed_rejected: u32 = 0;
 
     // Track paths we visit so we can detect deletions later.
@@ -1119,8 +1126,9 @@ pub fn rebuild_index(
             }
         }
     }
-    let embedded =
-        u32::try_from(embedder.documents_embedded() - embedded_before).unwrap_or(u32::MAX);
+    let accepted_files = (embedder.documents_embedded() - embedded_before)
+        + (embedder.documents_refused_after_accepting() - run_refused_after_accepting_before);
+    let embedded = u32::try_from(accepted_files).unwrap_or(u32::MAX);
 
     if refreshed > 0 {
         eprintln!(

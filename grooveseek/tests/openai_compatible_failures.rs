@@ -728,3 +728,78 @@ fn index_exits_zero_when_its_only_changed_file_is_refused_after_an_accepted_batc
     );
     assert_dir_empty(&fx.cache);
 }
+
+/// A note of 70 sections, which the indexer sends in two batches (64 + 6);
+/// `last` is the body of the last section, so it lands in the second batch.
+/// The same shape the two long-file tests above build inline.
+fn two_batch_note(last: &str) -> String {
+    let mut s = String::from("---\ntitle: Long\n---\n\n");
+    for i in 0..69 {
+        s.push_str(&format!(
+            "## Section {i}\n\nParagraph number {i} talks about harbour cranes and tides.\n\n"
+        ));
+    }
+    s.push_str(&format!("## Section 69\n\n{last}\n"));
+    s
+}
+
+/// In one run a short file is refused on its first (only) batch and a long
+/// file is refused only after its first batch was accepted; nothing else
+/// changed. The accepted batch shows the endpoint works, so the run is not
+/// "every input rejected" even though no file was embedded whole: exit 0.
+///
+/// Red if the all-rejected check reads only whole-file successes as proof the
+/// endpoint accepted something (it would see one outright refusal, zero
+/// embedded files, and fail the run).
+#[test]
+fn index_exits_zero_when_an_outright_refusal_meets_a_refusal_after_an_accepted_batch() {
+    let long = two_batch_note("The final paragraph talks about harbour cranes too.");
+    let short = note(
+        "Short",
+        "A single paragraph about the harbour master's logbook.",
+    );
+    let fx = fixture(
+        "groove-aw04-mixed",
+        &[("long.md", long.as_str()), ("short.md", short.as_str())],
+        "",
+    );
+    fx.index();
+
+    let before = fx.mock.requests().len();
+    fx.layout.write(
+        "long.md",
+        &two_batch_note(&format!("The final paragraph talks about {REJECT_MARKER}.")),
+    );
+    fx.layout.write(
+        "short.md",
+        &note(
+            "Short",
+            &format!("A single paragraph about the harbour master's {REJECT_MARKER}."),
+        ),
+    );
+    fx.answer_with(rejects_marker(413));
+    let out = fx.run_index();
+    fx.answer_normally();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains(ALL_REJECTED), "{stderr}");
+    assert!(
+        stderr.contains("0 updated") && stderr.contains("2 skipped"),
+        "{stderr}"
+    );
+    for file in ["long.md", "short.md"] {
+        assert!(
+            stderr.contains(&format!(
+                "warning: {file}: embedding endpoint rejected the input (HTTP 413)"
+            )),
+            "{stderr}"
+        );
+    }
+    assert!(
+        fx.requests_since(before)
+            .iter()
+            .any(|r| r.inputs().len() == 64),
+        "long.md's first batch must have been sent (and answered) before its refusal"
+    );
+    assert_dir_empty(&fx.cache);
+}
