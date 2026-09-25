@@ -396,23 +396,29 @@ impl fmt::Display for EmbedHttpStatus {
 
 impl std::error::Error for EmbedHttpStatus {}
 
-/// The outermost message of an embedding error, fit for a caller who must not
-/// see the endpoint's response body -- an MCP client (ADR-0025). When that
-/// message is a non-2xx answer ([`EmbedInputRejected`] or any other status),
-/// it names the status only. Every other outermost message groove words
-/// itself (a context, a timeout, a malformed answer) and is returned as it
-/// is: `anyhow::Error`'s `Display` never prints the causes underneath.
+/// An embedding error worded for a caller who must not see the endpoint's
+/// response body -- an MCP client (ADR-0025). When a non-2xx answer
+/// ([`EmbedInputRejected`] or any other status) is anywhere in the chain, the
+/// result is every message above it -- contexts groove wrote itself, such as
+/// the indexer's `failed to embed chunks for <path>` or the retry loop's
+/// give-up line -- followed by that status alone, so the answer's text (which
+/// carries the body) is never used. Without one, it is the outermost message,
+/// also groove's own (a timeout, a malformed answer): `anyhow::Error`'s
+/// `Display` never prints the causes underneath.
 pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
-    let outermost = error.chain().next();
-    let status = outermost.and_then(|e| {
-        e.downcast_ref::<EmbedInputRejected>()
+    let mut above = Vec::new();
+    for cause in error.chain() {
+        let status = cause
+            .downcast_ref::<EmbedInputRejected>()
             .map(|r| r.status)
-            .or_else(|| e.downcast_ref::<EmbedHttpStatus>().map(|s| s.status))
-    });
-    match status {
-        Some(status) => format!("embedding endpoint returned HTTP {status}"),
-        None => error.to_string(),
+            .or_else(|| cause.downcast_ref::<EmbedHttpStatus>().map(|s| s.status));
+        if let Some(status) = status {
+            above.push(format!("embedding endpoint returned HTTP {status}"));
+            return above.join(": ");
+        }
+        above.push(cause.to_string());
     }
+    error.to_string()
 }
 
 /// (AW-04) Context on an [`EmbedInputRejected`] that came after the endpoint had
@@ -639,6 +645,19 @@ impl OpenAiCompatibleProvider {
         // send the key again (local Codex before round 3). For all of them the body only
         // feeds the snippet, left empty here.
         let class = classify_status(status);
+        // A 429 / 5xx asking for more than `retry_loop` will wait is given up on as it stands:
+        // reading its body first would only let a stalled one hold the run, and a daemon's
+        // embedder, for the request timeout (codex P2 round 3 on PR #329).
+        if class == StatusClass::Retryable && retry_after.is_some_and(|w| w > MAX_RETRY_AFTER) {
+            return Err(AttemptFailure::Retryable {
+                error: anyhow::Error::new(EmbedHttpStatus {
+                    status,
+                    body_snippet: escaped_body_snippet(&[]),
+                }),
+                retry_after,
+                last: format!("HTTP {status}"),
+            });
+        }
         let body = match response.bytes() {
             Ok(body) => body,
             Err(_) if class != StatusClass::Success => Default::default(),
@@ -2607,12 +2626,43 @@ mod tests {
         .context("embedding endpoint still failing after 4 attempts (last: HTTP 503)");
         assert_eq!(
             body_free_message(&wrapped),
-            "embedding endpoint still failing after 4 attempts (last: HTTP 503)"
+            "embedding endpoint still failing after 4 attempts (last: HTTP 503): \
+             embedding endpoint returned HTTP 503"
         );
         let other = anyhow::anyhow!("embedding endpoint returned malformed JSON");
         assert_eq!(
             body_free_message(&other),
             "embedding endpoint returned malformed JSON"
         );
+    }
+
+    /// (AW-04, codex P2 round 3 on PR #329) The indexer wraps a document-side
+    /// refusal in its own context, sometimes over the retry loop's; the status
+    /// is found under both and every context above it is kept.
+    #[test]
+    fn body_free_message_finds_the_status_under_several_contexts() {
+        let secret = "SECRET-BODY";
+        let nested = anyhow::Error::new(EmbedHttpStatus {
+            status: 401,
+            body_snippet: secret.to_string(),
+        })
+        .context("failed to embed chunks for note.md");
+        assert_eq!(
+            body_free_message(&nested),
+            "failed to embed chunks for note.md: embedding endpoint returned HTTP 401"
+        );
+        let twice = anyhow::Error::new(EmbedHttpStatus {
+            status: 503,
+            body_snippet: secret.to_string(),
+        })
+        .context("embedding endpoint still failing after 4 attempts (last: HTTP 503)")
+        .context("failed to embed chunks for note.md");
+        let message = body_free_message(&twice);
+        assert_eq!(
+            message,
+            "failed to embed chunks for note.md: embedding endpoint still failing after 4 \
+             attempts (last: HTTP 503): embedding endpoint returned HTTP 503"
+        );
+        assert!(!message.contains(secret), "{message}");
     }
 }

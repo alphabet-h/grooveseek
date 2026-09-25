@@ -1108,3 +1108,70 @@ fn mcp_search_reports_a_query_side_401_without_the_response_body() {
     assert!(!resp.to_string().contains(BODY_SENTINEL), "{resp}");
     assert_dir_empty(&fx.cache);
 }
+
+/// MCP `rebuild_index` whose document embed the endpoint answers with 401
+/// names the file and the status, still without the response body. The
+/// indexer wraps the typed error in its own context, so the status has to be
+/// found below the outermost message.
+///
+/// Red if only the outermost message is looked at: the reply would say
+/// `failed to embed chunks for alpha.md` and never name HTTP 401.
+#[test]
+fn mcp_rebuild_index_names_a_document_side_401_without_the_response_body() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-mcp-rebuild-401", &files(&notes), "");
+    fx.index();
+    fx.layout
+        .write("alpha.md", &note("Alpha", &format!("{ALPHA} Edited.")));
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    fx.answer_with(|_| reply(401, &[]));
+    let resp = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    fx.answer_normally();
+    drop(guard);
+    let error = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        error.contains("failed to embed chunks for alpha.md: embedding endpoint returned HTTP 401"),
+        "{resp}"
+    );
+    assert!(!resp.to_string().contains(BODY_SENTINEL), "{resp}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// A 429 asking for more than 60 s is given up on at once, without reading
+/// its body: a body that stalls must not hold the run (and a daemon's
+/// embedder) for the request timeout.
+///
+/// Red if the body is read before the `Retry-After` is looked at: the run
+/// would wait for the stalled body (the mock holds it for up to 10 s) before
+/// it gives up.
+#[test]
+fn index_gives_up_on_a_long_retry_after_without_reading_a_stalled_body() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-429-stall", &files(&notes), "");
+    // A request timeout well above the time the test allows for the run.
+    let config = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    assert!(config.contains("timeout_seconds = 15\n"), "{config}");
+    std::fs::write(
+        &fx.config,
+        config.replace("timeout_seconds = 15\n", "timeout_seconds = 20\n"),
+    )
+    .expect("write groove.toml");
+    fx.answer_with(|_| {
+        let mut stalled = reply(429, &[("Retry-After", "120")]);
+        stalled.stall_body = true;
+        stalled
+    });
+    let started = Instant::now();
+    let out = fx.run_index();
+    let took = started.elapsed();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert!(stderr.contains("asked to retry after 120 s"), "{stderr}");
+    assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_dir_empty(&fx.cache);
+}
