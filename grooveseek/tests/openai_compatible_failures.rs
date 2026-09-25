@@ -279,7 +279,8 @@ fn the_watcher_reports_a_rejected_file_as_skipped() {
 /// `pending.md` is written after the index was built and carries the marker,
 /// so it never gets a row, whether or not the daemon looks at it on startup.
 ///
-/// Red if [`grooveseek::indexer::rename_single_file`] maps the rejection skip to `OldPathMissing`
+/// Red if [`grooveseek::indexer::rename_single_file`] maps the rejection skip to
+/// [`grooveseek::indexer::RenameOutcome::OldPathMissing`]
 /// (`watcher: rename target pending.md not in DB, indexed moved.md`).
 #[test]
 fn the_watcher_reports_a_rejected_rename_target_as_refused_not_indexed() {
@@ -938,7 +939,7 @@ fn index_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
 }
 
 /// The watcher meets the same cross-parser rename one event at a time: its
-/// `rename_single_file` drops the old parser's row after the refusal, so the
+/// [`grooveseek::indexer::rename_single_file`] drops the old parser's row after the refusal, so the
 /// warning must say the file is not in the index.
 ///
 /// Red if the warning's tail is decided before the rename is settled.
