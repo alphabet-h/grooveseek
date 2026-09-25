@@ -272,6 +272,77 @@ fn the_watcher_reports_a_rejected_file_as_skipped() {
     assert_dir_empty(&fx.cache);
 }
 
+/// A rename whose old path has no row makes the watcher index the new path as
+/// a new file. When the endpoint refuses that file, no row is created, so the
+/// watcher must say the new path was refused, not that it was indexed.
+///
+/// `pending.md` is written after the index was built and carries the marker,
+/// so it never gets a row, whether or not the daemon looks at it on startup.
+///
+/// Red if `rename_single_file` maps the rejection skip to `OldPathMissing`
+/// (`watcher: rename target pending.md not in DB, indexed moved.md`).
+#[test]
+fn the_watcher_reports_a_rejected_rename_target_as_refused_not_indexed() {
+    let notes = three_notes();
+    let fx = fixture(
+        "groove-aw04-watch-rename",
+        &files(&notes),
+        "\n[watch]\nenabled = true\ndebounce_ms = 300\n",
+    );
+    fx.index();
+    fx.layout.write(
+        "pending.md",
+        &note("Pending", &format!("Text still waiting {REJECT_MARKER}.")),
+    );
+    fx.answer_with(rejects_marker(413));
+    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
+        hermetic(c, &fx.cache);
+    });
+    std::fs::rename(fx.kb().join("pending.md"), fx.kb().join("moved.md"))
+        .expect("rename pending.md");
+    let lines = || -> Vec<String> {
+        guard
+            .stderr()
+            .lines()
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect()
+    };
+    let reported = wait_until(Duration::from_secs(30), || {
+        lines()
+            .iter()
+            .any(|l| l.contains("watcher: rename target pending.md not in DB"))
+    });
+    let all = lines();
+    assert!(reported, "no watcher rename line:\n{}", all.join("\n"));
+    assert!(
+        all.iter()
+            .any(|l| l
+                .contains("watcher: rename target pending.md not in DB, and moved.md was refused")),
+        "{}",
+        all.join("\n")
+    );
+    assert!(
+        !all.iter().any(|l| l.contains("indexed moved.md")),
+        "{}",
+        all.join("\n")
+    );
+    assert!(
+        all.iter()
+            .any(|l| l
+                .contains("warning: moved.md: embedding endpoint rejected the input (HTTP 413)")),
+        "{}",
+        all.join("\n")
+    );
+    assert!(
+        !all.iter().any(|l| l.contains(BODY_SENTINEL)),
+        "{}",
+        all.join("\n")
+    );
+    drop(guard);
+    assert_dir_empty(&fx.cache);
+}
+
 fn one_note() -> [(&'static str, String); 1] {
     [(
         "only.md",

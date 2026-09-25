@@ -2008,6 +2008,9 @@ pub enum RenameOutcome {
     /// `OldPathMissing` と分けるのは、あちらが「新 path を index した」を
     /// 意味するため (codex P2 round 2 on PR #157)。DB に row は作られていない
     /// のに watcher が「indexed」と報告するのは、その後の調査を狂わせる。
+    ///
+    /// (AW-04) embedding endpoint が新 path の入力を拒否した skip
+    /// (`SKIPPED_EMBED_REJECTED`) もここに入る。同じく row は作られていない。
     OldPathMissingAndRefused,
     /// path は UPDATE 済だが、新 path の binary size が cap 超過のため
     /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
@@ -2069,7 +2072,12 @@ pub fn rename_single_file(
         // (codex P2 round 2 on PR #157)。
         return Ok(
             match reindex_single_file(db, embedder, kb_path, new_rel, exclude_headings, registry)? {
-                SingleResult::Refused => RenameOutcome::OldPathMissingAndRefused,
+                // (AW-04) An endpoint rejection writes no row either, so it is not "indexed".
+                SingleResult::Refused
+                | SingleResult::Skipped {
+                    reason: SKIPPED_EMBED_REJECTED,
+                    ..
+                } => RenameOutcome::OldPathMissingAndRefused,
                 SingleResult::Updated { .. }
                 | SingleResult::Unchanged
                 | SingleResult::Skipped { .. }
