@@ -1046,6 +1046,24 @@ fn main() -> anyhow::Result<()> {
                 context_mode_desired,
             )?;
             eprintln!("{}", result.summary_line());
+            // (AW-04) Checked before strictness: a run whose every embed was refused says
+            // more about the configuration than any frontmatter does.
+            if result.fails_all_inputs_rejected() {
+                anyhow::bail!(
+                    "{}",
+                    result.all_inputs_rejected_message(grooveseek::indexer::REJECTIONS_NAMED_ABOVE)
+                );
+            }
+            // (AW-04, codex P1 on PR #329) A forced rebuild emptied the index, so a refused
+            // file is a gap in it, not an old row kept: one refusal fails the run.
+            if result.fails_forced_rebuild_rejections() {
+                anyhow::bail!(
+                    "{}",
+                    result.forced_rebuild_rejections_message(
+                        grooveseek::indexer::REJECTIONS_NAMED_ABOVE
+                    )
+                );
+            }
             // (#251) Strictness changes the exit code, not the run: every file
             // was indexed and every broken one named above, so the summary is
             // printed first and one failure covers the whole corpus.

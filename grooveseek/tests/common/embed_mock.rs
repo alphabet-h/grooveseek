@@ -23,7 +23,10 @@
 //! sharing a word end up close, so a test can assert the ranking and not
 //! only that a request arrived.
 //! [`crate::common::embed_mock::EmbedMock::with_responder`] replaces the
-//! answer (AW-03's 401, AW-04's 413 / 429).
+//! answer (AW-03's 401), and
+//! [`crate::common::embed_mock::EmbedMock::with_reply_responder`] its headers
+//! too (AW-04's 413 / 429 and `Retry-After`, through
+//! [`crate::common::embed_cli`]).
 
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
@@ -106,6 +109,38 @@ impl MockResponse {
     }
 }
 
+/// A [`MockResponse`] plus headers the mock writes with it (AW-04's
+/// `Retry-After`).
+pub struct MockReply {
+    pub response: MockResponse,
+    pub headers: Vec<(String, String)>,
+    /// Promise [`STALLED_BODY_EXTRA`] more body bytes than are written, then
+    /// hold the connection until the client gives up: headers arrive, the
+    /// body never finishes (AW-04, a refusal whose body stalls).
+    pub stall_body: bool,
+    /// Promise [`STALLED_BODY_EXTRA`] more body bytes than are written, then
+    /// close the connection at once: the body ends short, which the client
+    /// sees as a broken body rather than a timeout (AW-04, an overloaded proxy
+    /// cutting off a 5xx).
+    pub truncate_body: bool,
+}
+
+/// How many bytes a [`MockReply::stall_body`] or [`MockReply::truncate_body`]
+/// reply's `Content-Length` promises beyond the body it writes.
+const STALLED_BODY_EXTRA: usize = 1024;
+
+impl MockReply {
+    /// `response` with no extra headers.
+    pub fn plain(response: MockResponse) -> Self {
+        Self {
+            response,
+            headers: Vec::new(),
+            stall_body: false,
+            truncate_body: false,
+        }
+    }
+}
+
 /// The answer an OpenAI-compatible endpoint gives: one vector per input, in
 /// order, as long as the dimension parameter says. A body without an
 /// `input` array gets a 400.
@@ -179,7 +214,7 @@ pub fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
-type Responder = dyn Fn(&Recorded) -> MockResponse + Send + Sync;
+type Responder = dyn Fn(&Recorded) -> MockReply + Send + Sync;
 
 /// The running mock. Dropping it stops the accept loop and joins the thread.
 pub struct EmbedMock {
@@ -204,6 +239,15 @@ impl EmbedMock {
     /// every later connection and `Drop`.
     pub fn with_responder(
         responder: impl Fn(&Recorded) -> MockResponse + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_reply_responder(move |req| MockReply::plain(responder(req)))
+    }
+
+    /// A mock that answers with `responder`, headers included. Requests are
+    /// recorded before the responder runs, and the same promptness rule as
+    /// [`EmbedMock::with_responder`] applies.
+    pub fn with_reply_responder(
+        responder: impl Fn(&Recorded) -> MockReply + Send + Sync + 'static,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
         listener
@@ -317,15 +361,33 @@ fn serve_one(
         .lock()
         .expect("mock requests lock")
         .push(recorded.clone());
-    let resp = responder(&recorded);
+    let MockReply {
+        response: resp,
+        headers,
+        stall_body,
+        truncate_body,
+    } = responder(&recorded);
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    // A truncated body is written short and the connection dropped when this
+    // function returns, like any other reply.
+    let short = stall_body || truncate_body;
+    let promised = resp.body.len() + if short { STALLED_BODY_EXTRA } else { 0 };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {promised}\r\n{extra}Connection: close\r\n\r\n",
         resp.status,
         reason(resp.status),
-        resp.body.len()
     );
-    if write_bounded(&mut stream, head.as_bytes(), stop, deadline) {
-        write_bounded(&mut stream, &resp.body, stop, deadline);
+    if write_bounded(&mut stream, head.as_bytes(), stop, deadline)
+        && write_bounded(&mut stream, &resp.body, stop, deadline)
+        && stall_body
+    {
+        // Hold the connection, bounded like every other wait here, until the
+        // client closes it (its timeout) or the budget runs out.
+        let mut chunk = [0u8; 1024];
+        while read_some(&mut stream, &mut chunk, stop, deadline).is_some() {}
     }
 }
 
@@ -440,8 +502,10 @@ fn reason(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         413 => "Payload Too Large",
+        422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Status",
     }
 }

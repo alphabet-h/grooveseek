@@ -76,6 +76,7 @@ Architecture Decision Record — 何を選び、どの代替案を退け、そ�
 | 22. embedding を provider 境界の後ろに置き、既定は FastEmbed のままにする | [en](decisions/0022-embedding-provider-boundary.md) | [ja](decisions/0022-embedding-provider-boundary.ja.md) |
 | 23. サーバが開ける名前だけを索引し、その判定を 1 つの述語に集める | [en](decisions/0023-index-only-names-the-server-can-open.md) | [ja](decisions/0023-index-only-names-the-server-can-open.ja.md) |
 | 24. 強制再構築が索引を空にする前に embedding endpoint を試す | [en](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.md) | [ja](decisions/0024-probe-the-endpoint-before-a-forced-rebuild.ja.md) |
+| 25. embedding endpoint が断った入力は skip し、一時的な失敗は再試行する | [en](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md) | [ja](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md) |
 
 ADR-0003 のファイル名は今も `kb-mcpignore` のままです。そこで説明されているファイルは
 現在 `.grooveignore` ですが、**ADR は merge 後に編集しません**。2026-08-17 より前の

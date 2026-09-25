@@ -65,6 +65,8 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # request_dimensions = false
 # api_key = "secret" # GROOVE_EMBEDDING_API_KEY takes precedence
 # timeout_seconds = 60
+# max_input_chars = 8000   # inputs are cut to this many characters before sending
+# max_retries = 3          # resends after 429 / 5xx / timeout; 0 sends once; at most 10
 
 # Per-chunk quality filter. Enabled by default, threshold 0.3.
 # Set `enabled = false` to restore the previous (filter-off) behavior (return every chunk).
@@ -251,6 +253,8 @@ to the parser; which ones are required depends on `provider`.
 | `request_dimensions` | `true`, `false` (openai-compatible only) | `false` | Sends the optional `dimensions` request field when `true`. |
 | `api_key` | String (openai-compatible only) | none | Sent as a bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence. |
 | `timeout_seconds` | Integer greater than 0 (openai-compatible only) | `60` | HTTP request timeout. |
+| `max_input_chars` | Integer greater than 0 (openai-compatible only) | `8000` | Each input is cut to this many characters (not tokens) before it is sent, documents and queries alike. Not part of the index identity: changing it does not re-embed what is already indexed. |
+| `max_retries` | Integer 0-10 (openai-compatible only) | `3` | How many times a batch is sent again after HTTP 429, a 5xx, or a timeout or failed connection before the status line (a 2xx whose body times out counts too). Waits 1 s, 2 s, 4 s ... (capped at 60 s, plus a jitter below a quarter of that wait) or exactly what `Retry-After` asks; a `Retry-After` over 60 s fails at once. `0` sends once. |
 
 Which model is used:
 
@@ -268,8 +272,8 @@ Which model is used:
   Both roles must end up with an alias. The top-level `model` is FastEmbed's
   alone and is refused alongside this provider.
 - A FastEmbed config that sets any key marked "openai-compatible only" is
-  refused, including `request_dimensions = false` or `timeout_seconds = 60`
-  written out explicitly.
+  refused, including `request_dimensions = false`, `timeout_seconds = 60`,
+  `max_input_chars = 8000` or `max_retries = 3` written out explicitly.
 
 ## Config file discovery
 

@@ -38,6 +38,8 @@ document_model = "document-model"
 dimension = 768
 request_dimensions = false
 timeout_seconds = 60
+max_input_chars = 8000
+max_retries = 3
 ```
 
 endpoint はインデックス時に document のチャンクを、検索時に検索テキストを受け取る。
@@ -66,7 +68,7 @@ bearer token として送られる。`GROOVE_EMBEDDING_API_KEY` が設定され�
 
 provider、どちらかの model alias、または次元を変えると、実行時の設定が既存インデックスと
 合わなくなり `groove index --force` が必要になる。`endpoint`、`api_key`、
-`request_dimensions`、`timeout_seconds` を変えてもそうはならない。これらは記録される identity に含まれないので、alias の背後の
+`request_dimensions`、`timeout_seconds`、`max_input_chars`、`max_retries` を変えてもそうはならない。これらは記録される identity に含まれないので、alias の背後の
 model が変わっても groove には分からない。endpoint が同じ alias で別の model を返すように
 なったら、自分で `groove index --force` を実行すること。そうしないと、古い document の
 ベクトルと新しいクエリのベクトルがエラーも出ずに一緒に検索される。`--model` は従来どおりの意味を保ち、
@@ -75,6 +77,32 @@ model が変わっても groove には分からない。endpoint が同じ alias
 groove が拒否する。provider を切り替える時はこのキーを消すこと。FastEmbed (既定の
 provider) ではこのキーと `[embedding].model` が同じものを指すので、両方を書いた config も
 拒否される。どちらか一方を残すこと。
+
+**endpoint が断った時・失敗した時。** endpoint が HTTP 400・413・422 で入力を断った
+ファイルは、そのファイルだけが skip される: `groove index` は
+`warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`
+を出し、`skipped` に数え、そのファイルの既存の row を残して先へ進む。まだ row の無い
+ファイルは代わりに `skipped, this file is not in the index` と名指しされる。
+**`--force` のとき** (MCP `rebuild_index {force: true}` も) は、再構築が先に索引を空に
+するので全ファイルがこの立場になる: 断られたファイルが 1 つでもあれば、他のファイルを
+すべて索引し run を最後まで済ませたうえで exit 非 0 になる (MCP は counter の隣に `error`)。
+run が 1 つでも
+ファイルを (そのどのバッチも受け付けられないまま) 断られ、endpoint がどのバッチも受け付けなかった
+場合は、run を最後まで (削除も含めて) 済ませた
+うえで exit 非 0 で終わる: この形はファイルではなく `model` / `document_model` か
+`endpoint` の誤りを指している。MCP `rebuild_index` は同じ run に `error` を返す。
+HTTP 429・5xx は再試行し (`max_retries`)、401・403 とその他の 4xx はその場で run を
+止める。status 行が届く前の timeout・接続失敗は再試行し、その他の通信エラーは run を
+止める。status 行が届いたらその status で決まり、body が止まっても途中で切れても変わら
+ない (2xx で body が timeout したときは再試行する)。daemon は再試行の間 embedder を握ったままなので、検索もその間
+待たされる。それが困る所では `max_retries = 0` にする。入力は先に `max_input_chars`
+文字で切られる。日本語は 1 文字が 1 token を超えることがあるので、上限 8192 token の
+サーバでも 8000 文字を断る場合がある。warning が多くのファイルを挙げるなら
+`max_input_chars` を下げる。`groove-schema.toml` の宣言キーが変わった後は、断られた
+Markdown ファイルは「読めていない」ものとして数えられるので、endpoint が断り続ける間は
+新しい宣言フィールドの集合が記録されず、そのファイルを直すか、`max_input_chars` を下げるか、
+`groove index --force` を打つまで、検索は `fields` / `fields_not` の filter を断る。詳細は
+[ADR-0025](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.ja.md)。
 
 `--force` は、SQLite として開けなくなった `.groove.db` の修復手段でもある (書き込み途中の切断や、migration 中に kill されたプロセスで起きる)。その状態では file を開くすべてのコマンドが、file の場所 (`--kb-path` の**親ディレクトリ**にある) と 2 通りの直し方を message で示して失敗する: file を消して `groove index` を実行するか、`groove index --force` を実行する。後者は file と `-wal` / `-shm` の付随 file を置き換えて最初から作り直す。索引は corpus から完全に導出できるので失うものは無い。`--force` 無しでは file に触らない。
 

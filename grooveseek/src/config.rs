@@ -108,6 +108,8 @@ pub enum EmbeddingProviderKind {
 }
 
 const DEFAULT_EMBEDDING_TIMEOUT_SECONDS: u64 = 60;
+const DEFAULT_EMBEDDING_MAX_INPUT_CHARS: usize = 8000;
+const DEFAULT_EMBEDDING_MAX_RETRIES: u32 = 3;
 
 /// `[embedding]` configuration. The endpoint is only accepted from an
 /// explicitly selected, trusted configuration file.
@@ -131,6 +133,13 @@ pub struct EmbeddingConfig {
     pub api_key: Option<String>,
     /// HTTP request timeout. Omitted values use 60 seconds.
     pub timeout_seconds: Option<u64>,
+    /// Inputs are cut to this many characters before they are sent. Omitted
+    /// values use 8000; 0 is refused. Not part of the index identity.
+    pub max_input_chars: Option<usize>,
+    /// How many times a batch is sent again after a 429, a 5xx, a timeout or
+    /// a failed connection. Omitted values use 3; 0 sends once; at most 10.
+    /// Not part of the index identity.
+    pub max_retries: Option<u32>,
 }
 
 impl std::fmt::Debug for EmbeddingConfig {
@@ -145,6 +154,8 @@ impl std::fmt::Debug for EmbeddingConfig {
             .field("request_dimensions", &self.request_dimensions)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("timeout_seconds", &self.timeout_seconds)
+            .field("max_input_chars", &self.max_input_chars)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -161,6 +172,8 @@ impl Default for EmbeddingConfig {
             request_dimensions: None,
             api_key: None,
             timeout_seconds: None,
+            max_input_chars: None,
+            max_retries: None,
         }
     }
 }
@@ -171,6 +184,15 @@ impl EmbeddingConfig {
             .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECONDS)
     }
 
+    fn effective_max_input_chars(&self) -> usize {
+        self.max_input_chars
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_INPUT_CHARS)
+    }
+
+    fn effective_max_retries(&self) -> u32 {
+        self.max_retries.unwrap_or(DEFAULT_EMBEDDING_MAX_RETRIES)
+    }
+
     fn resolve_fastembed(&self, fallback: ModelChoice) -> Result<EmbeddingSettings> {
         if self.endpoint.is_some()
             || self.dimension.is_some()
@@ -179,6 +201,8 @@ impl EmbeddingConfig {
             || self.query_model.is_some()
             || self.document_model.is_some()
             || self.timeout_seconds.is_some()
+            || self.max_input_chars.is_some()
+            || self.max_retries.is_some()
         {
             anyhow::bail!(
                 "[embedding] external provider fields require provider = \"openai-compatible\""
@@ -208,6 +232,10 @@ impl EmbeddingConfig {
             self.request_dimensions.unwrap_or(false),
             resolve_embedding_api_key(env_api_key, self.api_key.clone()),
             Duration::from_secs(self.effective_timeout_seconds()),
+        )?
+        .with_limits(
+            Some(self.effective_max_input_chars()),
+            self.effective_max_retries(),
         )?;
         Ok(EmbeddingSettings::openai_compatible(config))
     }
@@ -2095,6 +2123,8 @@ mod tests {
             request_dimensions: None,
             api_key: Some("config-secret".to_string()),
             timeout_seconds: Some(30),
+            max_input_chars: None,
+            max_retries: None,
         }
     }
 
@@ -2215,7 +2245,7 @@ mod tests {
     /// two above. One key per case pins each arm of the OR in
     /// [`EmbeddingConfig::resolve_fastembed`], so dropping any single arm
     /// fails here. The error
-    /// is one message for all seven keys and does not name the key; this
+    /// is one message for all nine keys and does not name the key; this
     /// test does not claim that it does.
     #[test]
     fn fastembed_embedding_rejects_every_http_only_field() {
@@ -2266,6 +2296,20 @@ mod tests {
                 "timeout_seconds",
                 EmbeddingConfig {
                     timeout_seconds: Some(30),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "max_input_chars",
+                EmbeddingConfig {
+                    max_input_chars: Some(4000),
+                    ..EmbeddingConfig::default()
+                },
+            ),
+            (
+                "max_retries",
+                EmbeddingConfig {
+                    max_retries: Some(0),
                     ..EmbeddingConfig::default()
                 },
             ),
@@ -5664,6 +5708,109 @@ lambda = 0.5
                 .and_then(|t| t.http.as_ref())
                 .and_then(|h| h.bind.as_deref()),
             Some("127.0.0.1:3100")
+        );
+    }
+
+    #[test]
+    fn openai_compatible_embedding_rejects_a_zero_max_input_chars() {
+        let mut embedding = external_embedding_config();
+        embedding.max_input_chars = Some(0);
+        let cfg = Config {
+            embedding: Some(embedding),
+            ..Config::default()
+        };
+        let err = cfg
+            .resolve_embedding_from(None, None)
+            .expect_err("0 characters is refused");
+        assert!(
+            err.to_string()
+                .contains("[embedding].max_input_chars must be greater than zero"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn openai_compatible_embedding_accepts_ten_retries_and_rejects_eleven() {
+        for (retries, ok) in [(0, true), (10, true), (11, false), (u32::MAX, false)] {
+            let mut embedding = external_embedding_config();
+            embedding.max_retries = Some(retries);
+            let cfg = Config {
+                embedding: Some(embedding),
+                ..Config::default()
+            };
+            match cfg.resolve_embedding_from(None, None) {
+                Ok(_) => assert!(ok, "max_retries = {retries} must be refused"),
+                Err(err) => {
+                    assert!(!ok, "max_retries = {retries} was refused: {err}");
+                    assert!(
+                        err.to_string()
+                            .contains("[embedding].max_retries must be at most 10"),
+                        "{err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn openai_compatible_embedding_defaults_to_8000_chars_and_3_retries() {
+        let cfg = Config {
+            embedding: Some(external_embedding_config()),
+            ..Config::default()
+        };
+        let settings = cfg.resolve_embedding_from(None, None).expect("resolve");
+        let debug = format!("{settings:?}");
+        assert!(debug.contains("max_input_chars: Some(8000)"), "{debug}");
+        assert!(debug.contains("max_retries: 3"), "{debug}");
+
+        let mut embedding = external_embedding_config();
+        embedding.max_input_chars = Some(100);
+        embedding.max_retries = Some(0);
+        let cfg = Config {
+            embedding: Some(embedding),
+            ..Config::default()
+        };
+        let debug = format!(
+            "{:?}",
+            cfg.resolve_embedding_from(None, None).expect("resolve")
+        );
+        assert!(debug.contains("max_input_chars: Some(100)"), "{debug}");
+        assert!(debug.contains("max_retries: 0"), "{debug}");
+    }
+
+    #[test]
+    fn max_input_chars_and_max_retries_leave_the_index_identity_alone() {
+        let identity = |chars: Option<usize>, retries: Option<u32>| {
+            let mut embedding = external_embedding_config();
+            embedding.max_input_chars = chars;
+            embedding.max_retries = retries;
+            Config {
+                embedding: Some(embedding),
+                ..Config::default()
+            }
+            .resolve_embedding_from(None, None)
+            .expect("resolve")
+            .model_id()
+            .to_string()
+        };
+        let base = identity(None, None);
+        assert_eq!(identity(Some(100), None), base);
+        assert_eq!(identity(None, Some(0)), base);
+        assert_eq!(identity(Some(20000), Some(10)), base);
+    }
+
+    #[test]
+    fn embedding_section_parses_max_input_chars_and_max_retries_from_toml() {
+        let parsed: EmbeddingConfig = toml::from_str(
+            "provider = \"openai-compatible\"\nmax_input_chars = 4000\nmax_retries = 5\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.max_input_chars, Some(4000));
+        assert_eq!(parsed.max_retries, Some(5));
+        let refused = toml::from_str::<EmbeddingConfig>("max_retry = 5\n");
+        assert!(
+            refused.is_err(),
+            "deny_unknown_fields must catch a misspelt key"
         );
     }
 }

@@ -16,6 +16,15 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 
 ### Security
 
+- **MCP `search` no longer passes an embedding endpoint's response body to the
+  client.** With `provider = "openai-compatible"`, a query the endpoint
+  answered with a status that is not retried (401, 403, 404, 400 / 413 / 422,
+  ...) came back as `Failed to embed query: embedding endpoint returned HTTP
+  <status>: <body>`, and the body can hold whatever the endpoint chose to echo.
+  The MCP reply now names the status only; `groove search` on the command line
+  still prints the body to the operator. MCP `rebuild_index` errors go through
+  the same wording. See
+  [ADR-0025](docs/decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md).
 - **`get_document` and `get_best_practice` no longer look at a path outside the
   knowledge base before refusing it.** The path check joined the request onto
   the knowledge base, and joining an absolute path replaces what it is joined
@@ -51,7 +60,47 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   handle its checks were made on, up to 1 MiB, and a hard link, something that
   is not a regular file and, on Unix, a symlink are refused.
 
+### Added
+
+- **`[embedding] max_input_chars` and `max_retries`** (openai-compatible only).
+  Inputs are cut to `max_input_chars` characters before they are sent (default
+  8000; 0 is refused). A batch is sent again up to `max_retries` times after
+  HTTP 429, a 5xx, a timeout or a failed connection (default 3; 0 sends once;
+  at most 10), honouring `Retry-After` up to 60 s. Neither key is part of the
+  index identity. FastEmbed refuses both, like the other endpoint keys. See
+  [ADR-0025](docs/decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md).
+- Library: `embedder::EmbedInputRejected`, `embedder::MAX_EMBEDDING_RETRIES`,
+  `OpenAiCompatibleConfig::with_limits`, `IndexResult::embed_rejected` /
+  `embedded` / `fails_all_inputs_rejected` / `all_inputs_rejected_message`,
+  `IndexResult::forced_rejected` / `fails_forced_rebuild_rejections` /
+  `forced_rebuild_rejections_message`,
+  `indexer::REJECTIONS_NAMED_ABOVE` / `REJECTIONS_NAMED_ON_SERVER_STDERR`.
+  `rebuild_index` still returns `Ok` for a run whose every embed was refused,
+  and for a forced run with a refused file; a library caller reads
+  `fails_all_inputs_rejected` and `fails_forced_rebuild_rejections` to treat
+  them as the CLI does. The three new public fields break code that builds an `IndexResult`
+  with a struct literal naming every field; `..Default::default()` keeps
+  compiling.
+
 ### Changed
+
+- **An openai-compatible endpoint's refusal no longer stops `groove index` or
+  MCP `rebuild_index`.** A file whose input is refused with HTTP 400, 413 or
+  422 is skipped with a warning, keeps its previous row, and the run goes on to
+  its deletions and exits 0, unless the run had a file refused before any
+  batch of it was accepted and the endpoint accepted no batch at all:
+  that run exits non-zero (MCP: an `error` beside the counts) after it has
+  finished. Under `groove index --force` (MCP `rebuild_index {force: true}`)
+  one refused file is enough to fail the run the same way, since the rebuild
+  emptied the index first and the file is not in it; its warning says so
+  instead of claiming the index kept anything. 429, 5xx, timeouts and failed
+  connections are retried before the run stops; a connection the server drops
+  before answering, 401, 403 and other 4xx are not. Once a status line has
+  arrived it decides, even when the body then stalls or is cut short: a 429 or
+  5xx is still retried, a 401 still stops the run. **An existing index keeps the vectors of chunks longer
+  than 8000 characters** until they change or you run `groove index --force`.
+  A retry waits while holding the MCP server's embedder, so searches wait with
+  it; set `max_retries = 0` on a daemon that must answer quickly.
 
 - **On Windows, a document whose name Windows cannot open as written is no
   longer indexed** ([ADR-0023](docs/decisions/0023-index-only-names-the-server-can-open.md)).

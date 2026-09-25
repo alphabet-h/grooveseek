@@ -39,6 +39,8 @@ document_model = "document-model"
 dimension = 768
 request_dimensions = false
 timeout_seconds = 60
+max_input_chars = 8000
+max_retries = 3
 ```
 
 The endpoint receives document chunks during indexing and search text during
@@ -70,8 +72,8 @@ precedence and avoids storing the token in the file.
 
 Changing provider, either model alias, or dimension makes the runtime
 incompatible with the existing index and requires `groove index --force`.
-Changing `endpoint`, `api_key`, `request_dimensions` or `timeout_seconds` does
-not, because they are not part of the recorded identity, so groove cannot tell
+Changing `endpoint`, `api_key`, `request_dimensions`, `timeout_seconds`,
+`max_input_chars` or `max_retries` does not, because they are not part of the recorded identity, so groove cannot tell
 when the model behind an alias changes. If the endpoint starts serving a
 different model under the same alias, run `groove index --force` yourself;
 otherwise old document vectors and new query vectors are searched together
@@ -82,6 +84,36 @@ FastEmbed alone: groove refuses a config that sets it together with
 `provider = "openai-compatible"`, so remove it when switching providers. With
 FastEmbed (the default provider) it and `[embedding].model` name the same
 thing, so a config that sets both is refused as well: keep one.
+
+**When the endpoint refuses or fails.** A file whose input the endpoint refuses
+with HTTP 400, 413 or 422 is skipped on its own: `groove index` prints
+`warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`,
+counts it under `skipped`, keeps the row it already had, and goes on. A file
+with no row yet is named with `skipped, this file is not in the index`
+instead. **Under `--force`** (and MCP `rebuild_index {force: true}`) every
+file is in that position, because the rebuild empties the index first: one
+refused file makes the run exit non-zero (MCP: an `error` beside the counts)
+after every other file was indexed and the run finished. If the
+run had a file refused before any batch of it was accepted, and the endpoint
+accepted no batch at all,
+it still finishes (deletions included)
+and then exits non-zero: that pattern points at `model` / `document_model` or
+`endpoint`, not at the files. MCP `rebuild_index` answers the same run with an
+`error`. HTTP 429 and 5xx are retried (`max_retries`); 401, 403 and other 4xx
+stop the run at once. Before a status line arrives, a timeout or a failed
+connection is retried and any other transport error stops the run; once a
+status line has arrived it decides, and a body that stalls or breaks off never
+changes that (a 2xx whose body times out is retried). While a daemon
+retries it holds the embedder, so searches wait with it; set `max_retries = 0`
+where that matters. Inputs are cut to `max_input_chars` characters first.
+Japanese text can take more than one token per character, so a server with an
+8192-token limit may still refuse 8000 characters; lower `max_input_chars` if
+the warnings name many files. A refused Markdown file also counts as not
+read when the keys `groove-schema.toml` declares have changed, so while the
+endpoint keeps refusing it the new declared-field set is not recorded, and
+search refuses `fields` / `fields_not` filters until the file is fixed,
+`max_input_chars` is lowered, or `groove index --force` is run. The details are in
+[ADR-0025](decisions/0025-skip-rejected-inputs-and-retry-transient-embedding-failures.md).
 
 `--force` is also the repair for a `.groove.db` that cannot be opened as a database — a truncated write or a process killed mid-migration is enough. Any command that opens the file then fails with a message naming the file (it lives in the **parent** of `--kb-path`) and the two ways out: delete it and run `groove index`, or run `groove index --force`, which replaces the file and its `-wal` / `-shm` sidecars and rebuilds from scratch. The index is entirely derived from the corpus, so nothing is lost. Without `--force` the file is never touched.
 

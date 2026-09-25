@@ -38,6 +38,11 @@
 //!   OpenAI-compatible provider tests and, in-process, by the AW-08 progress
 //!   callback tests; here so the HTTP-error
 //!   tests that build on it (AW-03 / 04) reuse it rather than copy it.
+//! - [`crate::common::embed_cli`] — a knowledge base, an `embed_mock` endpoint
+//!   whose answer (headers included) a test can swap mid-run, and the CLI
+//!   calls made against it. Used by the AW-04 failure tests
+//!   (`openai_compatible_failures.rs`); `openai_compatible_provider.rs` keeps
+//!   its own older copy because existing tests are not edited.
 //!
 //! Note: this module is referenced from PR-B's `benches/` after F-39 is
 //! complete. The intent is for `benches/*.rs` to also share the same
@@ -48,6 +53,7 @@
 pub mod ansi;
 pub mod code_fixtures;
 pub mod docs;
+pub mod embed_cli;
 pub mod embed_mock;
 pub mod eval_gate;
 pub mod mcp;

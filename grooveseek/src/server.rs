@@ -489,7 +489,9 @@ struct IndexStats {
 
 /// (#251) The MCP `rebuild_index` tool's reply under `[index].fail_on_frontmatter_error`
 /// when the count is non-zero: the run did happen, so the counts are still
-/// there, flattened beside the `error` a client keys on.
+/// there, flattened beside the `error` a client keys on. (AW-04) Also the reply
+/// to a run whose every embed the endpoint refused, and to a forced rebuild in
+/// which the endpoint refused any file.
 #[derive(Serialize)]
 struct StrictIndexFailure {
     error: String,
@@ -696,6 +698,24 @@ impl KbCore {
                     total_chunks: result.total_chunks,
                     duration_ms: result.duration_ms,
                 };
+                if result.fails_all_inputs_rejected() {
+                    let reply = StrictIndexFailure {
+                        error: result.all_inputs_rejected_message(
+                            indexer::REJECTIONS_NAMED_ON_SERVER_STDERR,
+                        ),
+                        stats,
+                    };
+                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                }
+                if result.fails_forced_rebuild_rejections() {
+                    let reply = StrictIndexFailure {
+                        error: result.forced_rebuild_rejections_message(
+                            indexer::REJECTIONS_NAMED_ON_SERVER_STDERR,
+                        ),
+                        stats,
+                    };
+                    return serde_json::to_string_pretty(&reply).unwrap_or_default();
+                }
                 if result.fails_strict_frontmatter(self.fail_on_frontmatter_error) {
                     let reply = StrictIndexFailure {
                         error: format!(
@@ -710,8 +730,11 @@ impl KbCore {
                 }
                 serde_json::to_string_pretty(&stats).unwrap_or_default()
             }
+            // (AW-04) Through `body_free_message`, like the search tool's embed error: the
+            // indexer wraps every embed failure it returns in its own context today, and this
+            // keeps a response body out of the reply should one ever arrive unwrapped.
             Err(e) => serde_json::to_string_pretty(&ErrorResponse {
-                error: format!("Rebuild failed: {e}"),
+                error: format!("Rebuild failed: {}", crate::embedder::body_free_message(&e)),
             })
             .unwrap_or_default(),
         }

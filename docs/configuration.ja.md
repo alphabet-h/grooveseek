@@ -62,6 +62,8 @@ exclude_headings = ["次の深堀り候補", "参考リンク"]
 # request_dimensions = false
 # api_key = "secret" # GROOVE_EMBEDDING_API_KEY が優先
 # timeout_seconds = 60
+# max_input_chars = 8000   # 送信前に各入力をこの文字数で切る
+# max_retries = 3          # 429 / 5xx / timeout のあと送り直す回数。0 なら 1 回だけ送る。上限 10
 
 # チャンク単位の品質フィルタ。既定で有効、閾値 0.3。
 # `enabled = false` で 従来挙動 (全チャンク返却) に戻せる。
@@ -242,6 +244,8 @@ bind = "127.0.0.1:3100"
 | `request_dimensions` | `true`, `false` (openai-compatible 専用) | `false` | `true` なら任意の `dimensions` 欄をリクエストに付ける。 |
 | `api_key` | 文字列 (openai-compatible 専用) | なし | bearer token として送る。`GROOVE_EMBEDDING_API_KEY` が優先。 |
 | `timeout_seconds` | 0 より大きい整数 (openai-compatible 専用) | `60` | HTTP リクエストの timeout。 |
+| `max_input_chars` | 0 より大きい整数 (openai-compatible 専用) | `8000` | 送信前に各入力をこの文字数 (token ではない) で切る。document と query の両方。index identity に含まれないので、変えても索引済みの文書は再 embed されない。 |
+| `max_retries` | 0-10 の整数 (openai-compatible 専用) | `3` | HTTP 429・5xx、または status 行が届く前の timeout・接続失敗 (2xx で body が timeout した場合も含む) のあと batch を送り直す回数。待ちは 1 秒・2 秒・4 秒… (60 秒で頭打ちにし、その待ちの 4 分の 1 未満の jitter を足す) か `Retry-After` の値ちょうど。60 秒を超える `Retry-After` は待たずに失敗。`0` なら 1 回だけ送る。 |
 
 どの model が使われるか:
 
@@ -256,7 +260,8 @@ bind = "127.0.0.1:3100"
   role で勝ち、書かれていない role は `model` が埋める。両 role とも alias が決まらなければ
   ならない。トップレベルの `model` は FastEmbed 専用で、この provider と同時に書くと拒否される。
 - FastEmbed の config に「openai-compatible 専用」のキーを 1 つでも書くと拒否される。
-  `request_dimensions = false` や `timeout_seconds = 60` のように既定値を明示した場合も同じ。
+  `request_dimensions = false`・`timeout_seconds = 60`・`max_input_chars = 8000`・
+  `max_retries = 3` のように既定値を明示した場合も同じ。
 
 ## 設定ファイルの探索順
 

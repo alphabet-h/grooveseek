@@ -167,7 +167,12 @@ impl KbCore {
                 Ok(emb) => emb,
                 Err(e) => {
                     return serde_json::to_string_pretty(&ErrorResponse {
-                        error: format!("Failed to embed query: {e}"),
+                        // (AW-04) Never the provider's text as it is: a non-2xx answer's
+                        // carries the endpoint's response body.
+                        error: format!(
+                            "Failed to embed query: {}",
+                            crate::embedder::body_free_message(&e)
+                        ),
                     })
                     .unwrap_or_default();
                 }
