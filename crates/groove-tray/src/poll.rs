@@ -13,10 +13,7 @@ use tao::event_loop::EventLoopProxy;
 pub async fn run(status_url: String, proxy: EventLoopProxy<UserEvent>) {
     let mut state = StatusState::new();
     let mut interval = tokio::time::interval(Duration::from_secs(5));
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-    {
+    let client = match crate::daemon::status_client() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("reqwest client build failed: {e}, polling task exiting");

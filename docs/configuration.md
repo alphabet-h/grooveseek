@@ -248,7 +248,7 @@ to the parser; which ones are required depends on `provider`.
 | `model` | FastEmbed: `"bge-small-en-v1.5"`, `"bge-m3"`. openai-compatible: any alias the endpoint accepts | none | FastEmbed: selects the model, like the top-level `model`. openai-compatible: the shared alias for both roles. |
 | `query_model` | Any alias (openai-compatible only) | none | Overrides `model` for queries. |
 | `document_model` | Any alias (openai-compatible only) | none | Overrides `model` for document chunks. |
-| `endpoint` | Full `http` / `https` URL of the embeddings endpoint, without credentials (openai-compatible only) | none | Required for openai-compatible. A loopback endpoint (127.0.0.0/8, `::1`, `localhost`) is always contacted directly; any other endpoint follows `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and the OS proxy settings. |
+| `endpoint` | Full `http` / `https` URL of the embeddings endpoint, without credentials (openai-compatible only) | none | Required for openai-compatible. A loopback endpoint (127.0.0.0/8, `::1`, `localhost`) is always contacted directly; any other endpoint follows `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` and, on Windows and macOS, the OS proxy settings. |
 | `dimension` | Integer greater than 0 (openai-compatible only) | none | Required for openai-compatible. |
 | `request_dimensions` | `true`, `false` (openai-compatible only) | `false` | Sends the optional `dimensions` request field when `true`. |
 | `api_key` | String (openai-compatible only) | none | Sent as a bearer token. `GROOVE_EMBEDDING_API_KEY` takes precedence. |
