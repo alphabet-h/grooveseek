@@ -88,7 +88,12 @@ thing, so a config that sets both is refused as well: keep one.
 **When the endpoint refuses or fails.** A file whose input the endpoint refuses
 with HTTP 400, 413 or 422 is skipped on its own: `groove index` prints
 `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`,
-counts it under `skipped`, keeps the row it already had, and goes on. If the
+counts it under `skipped`, keeps the row it already had, and goes on. A file
+with no row yet is named with `skipped, this file is not in the index`
+instead. **Under `--force`** (and MCP `rebuild_index {force: true}`) every
+file is in that position, because the rebuild empties the index first: one
+refused file makes the run exit non-zero (MCP: an `error` beside the counts)
+after every other file was indexed and the run finished. If the
 run had a file refused before any batch of it was accepted, and the endpoint
 accepted no batch at all,
 it still finishes (deletions included)

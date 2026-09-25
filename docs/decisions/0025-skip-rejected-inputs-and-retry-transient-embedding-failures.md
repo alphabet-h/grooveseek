@@ -98,7 +98,9 @@ only saw rejections fails after it has finished.**
 - **Skipping**: the indexer prints
   `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`
   (the status only, never the response body), counts the file under
-  `skipped`, keeps the row it already had, and goes on. When one file needs
+  `skipped`, keeps the row it already had, and goes on. A file with no row
+  (a new file, or any file in a forced rebuild, whose reset emptied the index)
+  is named with `skipped, this file is not in the index` instead. When one file needs
   several batches and a later one is rejected, the vectors of the earlier ones
   are discarded and nothing of the file is written.
 - **`[embedding] max_input_chars`**, openai-compatible only, default 8000,
@@ -136,6 +138,15 @@ only saw rejections fails after it has finished.**
   from `IndexResult::all_inputs_rejected_message`. The watcher reindexes one
   file at a time and does not apply this rule; it reports a rejected file as
   `watcher: skipped <file> (embedding endpoint rejected the input)`.
+- **A forced rebuild with any refused file fails after it has finished**
+  (`IndexResult::fails_forced_rebuild_rejections`, added after codex P1 on
+  PR #329). `groove index --force` and MCP `rebuild_index {force: true}`
+  empty the index before they re-embed, so a refused file has no previous row
+  to fall back on: it is missing from the index, and an exit 0 would hide
+  that. Every other file is still indexed and the run completes in the same
+  way as above; then the same two surfaces fail, with
+  `IndexResult::forced_rebuild_rejections_message`. When both rules apply,
+  the all-rejected message is the one given.
 
 ## Consequences
 
@@ -161,6 +172,10 @@ only saw rejections fails after it has finished.**
   exits non-zero**, because no other file was embedded in that run. This is
   the rule as decided: the run cannot tell a lone oversized file from a
   configuration error.
+- **A forced rebuild that meets one over-long file fails.** A scheduled
+  `groove index --force` job now reports a failure instead of leaving a silent
+  gap in the index; the file is named in the warnings, and fixing it or
+  lowering `max_input_chars` and running `groove index` fills the gap.
 - **A configuration error can still pass unnoticed** if the endpoint refuses
   only some inputs and another file is embedded in the same run, or accepts a
   file's first batch and refuses a later one.

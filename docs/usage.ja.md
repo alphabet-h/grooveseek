@@ -81,7 +81,12 @@ provider) ではこのキーと `[embedding].model` が同じものを指すの�
 **endpoint が断った時・失敗した時。** endpoint が HTTP 400・413・422 で入力を断った
 ファイルは、そのファイルだけが skip される: `groove index` は
 `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`
-を出し、`skipped` に数え、そのファイルの既存の row を残して先へ進む。run が 1 つでも
+を出し、`skipped` に数え、そのファイルの既存の row を残して先へ進む。まだ row の無い
+ファイルは代わりに `skipped, this file is not in the index` と名指しされる。
+**`--force` のとき** (MCP `rebuild_index {force: true}` も) は、再構築が先に索引を空に
+するので全ファイルがこの立場になる: 断られたファイルが 1 つでもあれば、他のファイルを
+すべて索引し run を最後まで済ませたうえで exit 非 0 になる (MCP は counter の隣に `error`)。
+run が 1 つでも
 ファイルを (そのどのバッチも受け付けられないまま) 断られ、endpoint がどのバッチも受け付けなかった
 場合は、run を最後まで (削除も含めて) 済ませた
 うえで exit 非 0 で終わる: この形はファイルではなく `model` / `document_model` か

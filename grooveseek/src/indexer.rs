@@ -607,6 +607,11 @@ pub struct IndexResult {
     /// [`Self::updated`]: a metadata-only update counts there without
     /// embedding anything.
     pub embedded: u32,
+    /// (AW-04, codex P1 on PR #329) In a forced rebuild, the files the embedding
+    /// endpoint refused, outright or after an accepted batch. The rebuild emptied
+    /// the index first, so each of them is missing from it. Zero in an
+    /// incremental run, where a refused file keeps its previous row.
+    pub forced_rejected: u32,
     pub total_chunks: u32,
     pub duration_ms: u64,
 }
@@ -643,6 +648,29 @@ impl IndexResult {
              {named}); nothing was embedded. Check [embedding] model / document_model and \
              endpoint. The rest of the run (deletions, bookkeeping) completed.",
             self.embed_rejected
+        )
+    }
+
+    /// (AW-04, codex P1 on PR #329) Whether a forced rebuild had the endpoint
+    /// refuse any file ([`Self::forced_rejected`]). The reset emptied the index,
+    /// so unlike an incremental run no previous row stands in for the file: one
+    /// refusal is a gap in the index, and the run fails once it has completed.
+    /// Rendered like [`Self::fails_all_inputs_rejected`], which the surfaces
+    /// check first.
+    pub fn fails_forced_rebuild_rejections(&self) -> bool {
+        self.forced_rejected > 0
+    }
+
+    /// The error both surfaces give when
+    /// [`Self::fails_forced_rebuild_rejections`]. `named` is as for
+    /// [`Self::all_inputs_rejected_message`].
+    pub fn forced_rebuild_rejections_message(&self, named: &str) -> String {
+        format!(
+            "the embedding endpoint rejected the input of {} file(s) during a forced rebuild \
+             ({named}); the rebuild emptied the index first, so those files are not in it. \
+             Fix them or lower [embedding] max_input_chars, then run `groove index`. \
+             The rest of the run (deletions, bookkeeping) completed.",
+            self.forced_rejected
         )
     }
 
@@ -994,6 +1022,7 @@ pub fn rebuild_index(
     let embedded_before = embedder.documents_embedded();
     let run_refused_after_accepting_before = embedder.documents_refused_after_accepting();
     let mut embed_rejected: u32 = 0;
+    let mut forced_rejected: u32 = 0;
 
     // Track paths we visit so we can detect deletions later.
     let mut visited_paths: HashSet<String> = HashSet::new();
@@ -1080,6 +1109,11 @@ pub fn rebuild_index(
                         == refused_after_accepting_before
                 {
                     embed_rejected += 1;
+                }
+                // (codex P1 on PR #329) In a forced rebuild any refusal counts: the reset
+                // emptied the index, so no previous row stands in for the file.
+                if force && reason == SKIPPED_EMBED_REJECTED {
+                    forced_rejected += 1;
                 }
                 if fm_unparsed {
                     frontmatter_unparsed += 1;
@@ -1207,6 +1241,7 @@ pub fn rebuild_index(
         unspellable,
         embed_rejected,
         embedded,
+        forced_rejected,
         total_chunks: total_chunks_in_db,
         duration_ms,
     })
@@ -1598,9 +1633,17 @@ fn index_single_disk_entry(
             // let the run go on. Only the status is printed -- the error's text carries
             // the endpoint's response body (trap #275).
             if let Some(rejected) = e.downcast_ref::<crate::embedder::EmbedInputRejected>() {
+                // Worded from the index as it stands (codex P1 on PR #329): a file with a
+                // row keeps it; one without -- every file in a forced rebuild, whose reset
+                // emptied the index, and a new file -- is simply not in it.
+                let outcome = if db.get_document_hash(&entry.rel)?.is_some() {
+                    "the index keeps what it had for this file"
+                } else {
+                    "this file is not in the index"
+                };
                 eprintln!(
                     "warning: {}: embedding endpoint rejected the input (HTTP {}); skipped, \
-                     the index keeps what it had for this file",
+                     {outcome}",
                     entry.rel, rejected.status
                 );
                 return Ok(SingleResult::Skipped {
@@ -2029,8 +2072,9 @@ pub enum RenameOutcome {
     /// 意味するため (codex P2 round 2 on PR #157)。DB に row は作られていない
     /// のに watcher が「indexed」と報告するのは、その後の調査を狂わせる。
     ///
-    /// (AW-04) embedding endpoint が新 path の入力を拒否した skip
-    /// (`SKIPPED_EMBED_REJECTED`) もここに入る。同じく row は作られていない。
+    /// (AW-04) embedding endpoint が新 path の入力を拒否した skip ([`crate::indexer`] の
+    /// private const `SKIPPED_EMBED_REJECTED` を reason に持つもの) もここに入る。
+    /// 同じく row は作られていない。
     OldPathMissingAndRefused,
     /// path は UPDATE 済だが、新 path の binary size が cap 超過のため
     /// hash 再計算 / reindex はスキップした (codex P2 round 3)。DB の
@@ -5868,6 +5912,47 @@ mod tests {
             }
             .all_inputs_rejected_message(REJECTIONS_NAMED_ON_SERVER_STDERR)
             .contains("(1 file(s), each named on the server's stderr); nothing was embedded"),
+            "{message}"
+        );
+    }
+
+    /// (AW-04, codex P1 on PR #329) A forced rebuild fails on a single refused file: its
+    /// reset emptied the index, so the file is missing from it. An incremental run with the
+    /// same refusal keeps the file's old row and is not failed by this check.
+    #[test]
+    fn fails_forced_rebuild_rejections_needs_a_refusal_in_a_forced_run() {
+        for (forced_rejected, fails) in [(0, false), (1, true), (4, true)] {
+            let result = IndexResult {
+                forced_rejected,
+                embedded: 5,
+                ..IndexResult::default()
+            };
+            assert_eq!(
+                result.fails_forced_rebuild_rejections(),
+                fails,
+                "forced_rejected {forced_rejected}"
+            );
+        }
+        let message = IndexResult {
+            forced_rejected: 2,
+            ..IndexResult::default()
+        }
+        .forced_rebuild_rejections_message(REJECTIONS_NAMED_ABOVE);
+        assert!(message.is_ascii(), "{message}");
+        assert_eq!(
+            message,
+            "the embedding endpoint rejected the input of 2 file(s) during a forced rebuild \
+             (see the warnings above); the rebuild emptied the index first, so those files are \
+             not in it. Fix them or lower [embedding] max_input_chars, then run `groove index`. \
+             The rest of the run (deletions, bookkeeping) completed."
+        );
+        assert!(
+            IndexResult {
+                forced_rejected: 1,
+                ..IndexResult::default()
+            }
+            .forced_rebuild_rejections_message(REJECTIONS_NAMED_ON_SERVER_STDERR)
+            .contains("1 file(s) during a forced rebuild (each named on the server's stderr)"),
             "{message}"
         );
     }

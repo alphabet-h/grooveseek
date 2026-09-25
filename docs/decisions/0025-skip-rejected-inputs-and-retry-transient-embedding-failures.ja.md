@@ -82,7 +82,9 @@ run は最後まで済ませてから失敗にする。**
 - **skip**: indexer は
   `warning: <file>: embedding endpoint rejected the input (HTTP <status>); skipped, the index keeps what it had for this file`
   を出し (status だけで、応答 body は出さない)、そのファイルを `skipped` に数え、既存の
-  row を残して先へ進む。1 ファイルが複数のバッチになり後のバッチが断られたときは、前の
+  row を残して先へ進む。row の無いファイル (新しいファイル、または reset が索引を空にした
+  強制再構築でのすべてのファイル) は代わりに `skipped, this file is not in the index` と
+  名指しされる。1 ファイルが複数のバッチになり後のバッチが断られたときは、前の
   バッチのベクトルは捨て、そのファイルについては何も書かない。
 - **`[embedding] max_input_chars`**: openai-compatible 専用、既定 8000、`0` は拒否。
   送る前に各入力をこの文字数で切る。document と query の両方。database のチャンク本文と
@@ -113,6 +115,13 @@ run は最後まで済ませてから失敗にする。**
   `IndexResult::all_inputs_rejected_message` から取る。watcher は 1 ファイルずつ
   索引し直すのでこの規則を当てず、断られたファイルを
   `watcher: skipped <file> (embedding endpoint rejected the input)` と報告する。
+- **断られたファイルが 1 つでもある強制再構築は、最後まで済ませた後で失敗にする**
+  (`IndexResult::fails_forced_rebuild_rejections`、PR #329 の codex P1 を受けて追加)。
+  `groove index --force` と MCP `rebuild_index {force: true}` は embedding し直す前に索引を
+  空にするので、断られたファイルには戻る先の row が無い: 索引から抜け落ち、exit 0 はそれを
+  隠してしまう。他のファイルはすべて索引し、run は上と同じく最後まで済ませる。その上で
+  同じ 2 つの面が `IndexResult::forced_rebuild_rejections_message` の文言で失敗する。両方の
+  規則が当たるときは、拒否しか起きなかった旨の文言を出す。
 
 ## 結果と代償
 
@@ -134,6 +143,9 @@ run は最後まで済ませてから失敗にする。**
 - **変更したファイルが 1 本だけで、それを endpoint が断った incremental run は exit 非 0
   になる。** その run では他に embed したファイルが無いため。決定どおりの規則で、run には
   1 本だけ長すぎるファイルと設定の誤りを見分ける手段が無い。
+- **長すぎるファイルが 1 本ある強制再構築は失敗する。** 定期実行の `groove index --force`
+  は、索引に黙って穴を残す代わりに失敗を報告する。ファイルは warning で名指しされ、直すか
+  `max_input_chars` を下げて `groove index` を打てば穴は埋まる。
 - **設定の誤りが見逃されることはまだある。** endpoint が一部の入力だけを断り、同じ run で
   別のファイルが embed できた場合、またはあるファイルの最初のバッチを受け付けて後のバッチを
   断った場合。

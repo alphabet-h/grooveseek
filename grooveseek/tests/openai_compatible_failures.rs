@@ -279,7 +279,7 @@ fn the_watcher_reports_a_rejected_file_as_skipped() {
 /// `pending.md` is written after the index was built and carries the marker,
 /// so it never gets a row, whether or not the daemon looks at it on startup.
 ///
-/// Red if `rename_single_file` maps the rejection skip to `OldPathMissing`
+/// Red if [`grooveseek::indexer::rename_single_file`] maps the rejection skip to `OldPathMissing`
 /// (`watcher: rename target pending.md not in DB, indexed moved.md`).
 #[test]
 fn the_watcher_reports_a_rejected_rename_target_as_refused_not_indexed() {
@@ -800,6 +800,84 @@ fn index_exits_zero_when_an_outright_refusal_meets_a_refusal_after_an_accepted_b
             .iter()
             .any(|r| r.inputs().len() == 64),
         "long.md's first batch must have been sent (and answered) before its refusal"
+    );
+    assert_dir_empty(&fx.cache);
+}
+
+const FORCED_REJECTED: &str = "during a forced rebuild";
+
+/// `groove index --force` empties the index before it re-embeds, so a file the
+/// endpoint refuses there is missing from the index, not kept. One such file
+/// fails the run -- after every other file was indexed -- and its warning does
+/// not claim the index kept anything.
+///
+/// Red if a forced run with one refusal exits 0 (the other two files were
+/// embedded), or if the warning still says the index keeps what it had.
+#[test]
+fn index_force_fails_when_the_endpoint_rejects_one_file() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-force-one", &files(&notes), "");
+    fx.index();
+    assert_eq!(fx.documents(), 3);
+
+    fx.layout.write(
+        "alpha.md",
+        &note("Alpha", &format!("{ALPHA} {REJECT_MARKER}")),
+    );
+    fx.answer_with(rejects_marker(413));
+    let out = fx.index_force();
+    fx.answer_normally();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains(FORCED_REJECTED), "{stderr}");
+    assert!(
+        stderr.contains("warning: alpha.md: embedding endpoint rejected the input (HTTP 413)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("keeps what it had"), "{stderr}");
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_eq!(fx.documents(), 2, "beta.md and gamma.md must be indexed");
+    assert_dir_empty(&fx.cache);
+}
+
+/// MCP `rebuild_index {force: true}` answers the same run with an `error`
+/// beside its counts, without the endpoint's response body.
+///
+/// Red if the server skips the forced-run check the CLI makes.
+#[test]
+fn mcp_rebuild_index_force_reports_an_error_when_one_file_is_rejected() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw04-mcp-force", &files(&notes), "");
+    fx.index();
+    fx.layout.write(
+        "alpha.md",
+        &note("Alpha", &format!("{ALPHA} {REJECT_MARKER}")),
+    );
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    fx.answer_with(rejects_marker(413));
+    let resp = mcp_tool_call(
+        &base,
+        &session,
+        "rebuild_index",
+        serde_json::json!({"force": true}),
+    );
+    fx.answer_normally();
+    drop(guard);
+    let error = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(error.contains(FORCED_REJECTED), "{resp}");
+    assert!(!resp.to_string().contains(BODY_SENTINEL), "{resp}");
+    assert_eq!(
+        resp.get("skipped").and_then(|v| v.as_u64()),
+        Some(1),
+        "{resp}"
+    );
+    assert_eq!(
+        resp.get("total_documents").and_then(|v| v.as_u64()),
+        Some(2),
+        "{resp}"
     );
     assert_dir_empty(&fx.cache);
 }

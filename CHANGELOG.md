@@ -63,10 +63,13 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
 - Library: `embedder::EmbedInputRejected`, `embedder::MAX_EMBEDDING_RETRIES`,
   `OpenAiCompatibleConfig::with_limits`, `IndexResult::embed_rejected` /
   `embedded` / `fails_all_inputs_rejected` / `all_inputs_rejected_message`,
+  `IndexResult::forced_rejected` / `fails_forced_rebuild_rejections` /
+  `forced_rebuild_rejections_message`,
   `indexer::REJECTIONS_NAMED_ABOVE` / `REJECTIONS_NAMED_ON_SERVER_STDERR`.
-  `rebuild_index` still returns `Ok` for a run whose every embed was refused;
-  a library caller reads `fails_all_inputs_rejected` to treat it as the CLI
-  does. The two new public fields break code that builds an `IndexResult`
+  `rebuild_index` still returns `Ok` for a run whose every embed was refused,
+  and for a forced run with a refused file; a library caller reads
+  `fails_all_inputs_rejected` and `fails_forced_rebuild_rejections` to treat
+  them as the CLI does. The three new public fields break code that builds an `IndexResult`
   with a struct literal naming every field; `..Default::default()` keeps
   compiling.
 
@@ -78,7 +81,10 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   its deletions and exits 0, unless the run had a file refused before any
   batch of it was accepted and the endpoint accepted no batch at all:
   that run exits non-zero (MCP: an `error` beside the counts) after it has
-  finished. 429, 5xx, timeouts and failed connections are retried before the
+  finished. Under `groove index --force` (MCP `rebuild_index {force: true}`)
+  one refused file is enough to fail the run the same way, since the rebuild
+  emptied the index first and the file is not in it; its warning says so
+  instead of claiming the index kept anything. 429, 5xx, timeouts and failed connections are retried before the
   run stops; a connection the server drops after accepting it, 401, 403 and
   other 4xx are not. **An existing index keeps the vectors of chunks longer
   than 8000 characters** until they change or you run `groove index --force`.
