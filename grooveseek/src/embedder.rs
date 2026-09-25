@@ -401,7 +401,7 @@ impl std::error::Error for EmbedHttpStatus {}
 /// message is a non-2xx answer ([`EmbedInputRejected`] or any other status),
 /// it names the status only. Every other outermost message groove words
 /// itself (a context, a timeout, a malformed answer) and is returned as it
-/// is: [`anyhow::Error`]'s `Display` never prints the causes underneath.
+/// is: `anyhow::Error`'s `Display` never prints the causes underneath.
 pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
     let outermost = error.chain().next();
     let status = outermost.and_then(|e| {
