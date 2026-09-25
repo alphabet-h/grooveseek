@@ -1399,6 +1399,159 @@ mod tests {
         assert!(!debug.contains("fragment"));
     }
 
+    fn openai_config_for_endpoint(endpoint: &str) -> Result<OpenAiCompatibleConfig> {
+        OpenAiCompatibleConfig::new(
+            endpoint.to_string(),
+            "query".to_string(),
+            "document".to_string(),
+            2,
+            false,
+            None,
+            Duration::from_secs(1),
+        )
+    }
+
+    /// AW-07: the endpoint is where document text is sent, so only HTTP(S) is
+    /// accepted. Nothing else exercised this check.
+    #[test]
+    fn openai_compatible_rejects_a_non_http_endpoint() {
+        for endpoint in [
+            "ftp://127.0.0.1:8001/v1/embeddings",
+            "file:///v1/embeddings",
+            "ws://127.0.0.1:8001/v1/embeddings",
+        ] {
+            let err = openai_config_for_endpoint(endpoint)
+                .expect_err("a non-HTTP endpoint must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("[embedding].endpoint must use http or https"),
+                "{endpoint}: {err}"
+            );
+        }
+    }
+
+    /// AW-07: credentials in the endpoint would ride along in every request
+    /// and every diagnostic that prints the URL. A user name alone and a
+    /// password alone are each refused, not only the pair, and the refusal
+    /// does not echo the password back.
+    #[test]
+    fn openai_compatible_rejects_credentials_in_the_endpoint() {
+        // The label, not the endpoint, goes into a failure message, so a
+        // failing run does not print the password either.
+        for (case, endpoint) in [
+            ("user name only", "http://user@127.0.0.1:8001/v1/embeddings"),
+            (
+                "password only",
+                "http://:hunter2@127.0.0.1:8001/v1/embeddings",
+            ),
+            (
+                "user name and password",
+                "https://user:hunter2@example.com/v1/embeddings",
+            ),
+        ] {
+            let Err(err) = openai_config_for_endpoint(endpoint) else {
+                panic!("{case}: must be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("hunter2"),
+                "{case}: the error echoes the password"
+            );
+            assert!(
+                msg.contains("[embedding].endpoint must not contain credentials"),
+                "{case}: {msg}"
+            );
+        }
+    }
+
+    /// AW-07: each role needs its own model. The config tests only leave out
+    /// `query_model`; a blank `document_model` has to fail as well.
+    #[test]
+    fn openai_compatible_requires_both_models() {
+        for (query, document) in [
+            ("query", ""),
+            ("query", "   "),
+            ("", "document"),
+            ("\t", "document"),
+        ] {
+            let err = OpenAiCompatibleConfig::new(
+                "http://127.0.0.1:8001/v1/embeddings".to_string(),
+                query.to_string(),
+                document.to_string(),
+                2,
+                false,
+                None,
+                Duration::from_secs(1),
+            )
+            .expect_err("a blank model must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("both `query_model` and `document_model`"),
+                "query={query:?} document={document:?}: {err}"
+            );
+        }
+    }
+
+    /// AW-07: a blank key must not become `Authorization: Bearer   `. Config
+    /// resolution filters blank keys too, which hid this filter from the
+    /// end-to-end test, so the constructor is called directly here.
+    #[test]
+    fn openai_compatible_drops_a_blank_api_key() {
+        let with_key = |api_key: &str| {
+            OpenAiCompatibleConfig::new(
+                "http://127.0.0.1:8001/v1/embeddings".to_string(),
+                "query".to_string(),
+                "document".to_string(),
+                2,
+                false,
+                Some(api_key.to_string()),
+                Duration::from_secs(1),
+            )
+            .expect("valid config")
+        };
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(with_key(blank).api_key, None, "{blank:?}");
+        }
+        assert_eq!(with_key("test-key").api_key.as_deref(), Some("test-key"));
+    }
+
+    /// AW-07: a failed request must not print the endpoint URL, which can
+    /// carry a secret in its query string.
+    ///
+    /// The request fails by connection refused: the port was bound and then
+    /// released, so nothing listens there and no server has to be kept
+    /// alive or waited on. If another process takes the port in between, the
+    /// call either still fails while sending (the check below still holds)
+    /// or gets an answer and fails some other way, which fails this test; a
+    /// taken port cannot make it pass without exercising the send path.
+    #[test]
+    fn openai_compatible_refused_connection_errors_omit_the_endpoint() {
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a port")
+            .local_addr()
+            .expect("reserved address");
+        let mut embedder =
+            Embedder::with_settings(EmbeddingSettings::openai_compatible(openai_config(
+                format!("http://{addr}/v1/embeddings?token=query-secret"),
+                2,
+                Duration::from_secs(5),
+            )))
+            .expect("build embedder");
+
+        let err = embedder
+            .embed_single("needle")
+            .expect_err("nothing listens on a released port");
+        let msg = err.to_string();
+        // Checked before any assert that prints the message.
+        assert!(!msg.contains("query-secret"), "the error echoes the query");
+        assert!(
+            !msg.contains(&addr.to_string()),
+            "the error echoes the host and port"
+        );
+        assert!(!msg.contains("/v1/embeddings"), "the error echoes the path");
+        assert!(msg.contains("embedding request failed"), "{msg}");
+    }
+
     /// (BU-07) `PathBuf::from("")` is a *relative* path, so returning it makes
     /// the model directory the process's working directory — which is the
     /// directory a planted config is trying to get models loaded from. An
