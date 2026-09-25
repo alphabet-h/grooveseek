@@ -118,10 +118,15 @@ pub struct MockReply {
     /// hold the connection until the client gives up: headers arrive, the
     /// body never finishes (AW-04, a refusal whose body stalls).
     pub stall_body: bool,
+    /// Promise [`STALLED_BODY_EXTRA`] more body bytes than are written, then
+    /// close the connection at once: the body ends short, which the client
+    /// sees as a broken body rather than a timeout (AW-04, an overloaded proxy
+    /// cutting off a 5xx).
+    pub truncate_body: bool,
 }
 
-/// How many bytes a [`MockReply::stall_body`] reply's `Content-Length`
-/// promises beyond the body it writes.
+/// How many bytes a [`MockReply::stall_body`] or [`MockReply::truncate_body`]
+/// reply's `Content-Length` promises beyond the body it writes.
 const STALLED_BODY_EXTRA: usize = 1024;
 
 impl MockReply {
@@ -131,6 +136,7 @@ impl MockReply {
             response,
             headers: Vec::new(),
             stall_body: false,
+            truncate_body: false,
         }
     }
 }
@@ -359,12 +365,16 @@ fn serve_one(
         response: resp,
         headers,
         stall_body,
+        truncate_body,
     } = responder(&recorded);
     let extra: String = headers
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect();
-    let promised = resp.body.len() + if stall_body { STALLED_BODY_EXTRA } else { 0 };
+    // A truncated body is written short and the connection dropped when this
+    // function returns, like any other reply.
+    let short = stall_body || truncate_body;
+    let promised = resp.body.len() + if short { STALLED_BODY_EXTRA } else { 0 };
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {promised}\r\n{extra}Connection: close\r\n\r\n",
         resp.status,

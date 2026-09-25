@@ -595,13 +595,19 @@ impl OpenAiCompatibleProvider {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after(value, SystemTime::now()));
-        // Classified from the status line, before the body is read: a refusal whose body
-        // stalls or breaks off is still a refusal, and must not come back as a retryable
-        // timeout that ends the run (AW-04). Its body only feeds the snippet.
+        // Classified from the status line, before the body is read, and a body that stalls
+        // or breaks off never changes that class (AW-04): a refusal stays a refusal (not a
+        // retryable timeout that ends the run), and a 429 / 5xx stays retryable, with its
+        // `Retry-After`, even when an overloaded proxy cuts its body short (codex P2 round 2
+        // on PR #329). For both the body only feeds the snippet, left empty here.
         let class = classify_status(status);
         let body = match response.bytes() {
             Ok(body) => body,
-            Err(_) if class == StatusClass::InputRejected => Default::default(),
+            Err(_) if matches!(class, StatusClass::InputRejected | StatusClass::Retryable) => {
+                Default::default()
+            }
+            // A 2xx, or a status that stops the run anyway: a timeout is retried, any other
+            // broken body is not.
             Err(error) => {
                 let timed_out = error.is_timeout();
                 let error = anyhow::anyhow!(

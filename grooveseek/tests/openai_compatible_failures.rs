@@ -994,3 +994,38 @@ fn the_watcher_says_not_in_the_index_when_a_cross_parser_rename_is_rejected() {
     assert_eq!(fx.documents(), 1, "the old parser's row must be gone");
     assert_dir_empty(&fx.cache);
 }
+
+/// A 503 whose body is cut short (the connection closes before the promised
+/// `Content-Length`) is still a 503: it is retried, and the retry succeeds.
+///
+/// Red if a body that breaks off (not a timeout) makes the failure fatal
+/// whatever the status said: the run would stop after one request.
+#[test]
+fn index_retries_a_503_whose_body_is_cut_short() {
+    let notes = one_note();
+    let fx = fixture("groove-aw04-503-cut", &files(&notes), "");
+    let first = Arc::new(Mutex::new(true));
+    {
+        let first = first.clone();
+        fx.answer_with(move |req| {
+            let mut first = first.lock().expect("first lock");
+            if std::mem::replace(&mut *first, false) {
+                let mut cut = reply(503, &[("Retry-After", "0")]);
+                cut.truncate_body = true;
+                cut
+            } else {
+                MockReply::plain(default_response(req, DIM))
+            }
+        });
+    }
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        fx.mock.requests().len(),
+        2,
+        "one cut 503, one success: {stderr}"
+    );
+    assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
+    assert_dir_empty(&fx.cache);
+}

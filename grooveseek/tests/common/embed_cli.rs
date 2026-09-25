@@ -203,6 +203,7 @@ pub fn reply(status: u16, headers: &[(&str, &str)]) -> MockReply {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         stall_body: false,
+        truncate_body: false,
     }
 }
 
