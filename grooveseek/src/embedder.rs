@@ -369,19 +369,20 @@ pub struct EmbedInputRejected {
 }
 
 impl fmt::Display for EmbedInputRejected {
-    // Worded exactly as the untyped non-2xx error in `send_batch_once`
-    // (`http_error`), so a CLI error chain reads the same whichever status it
-    // was (spec 3.1). The indexer never prints this.
+    // Worded by `http_status_message`, as the untyped non-2xx error is, so a
+    // CLI error chain reads the same whichever status it was (spec 3.1). The
+    // indexer never prints this.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "embedding endpoint returned HTTP {}: {}",
-            self.status, self.body_snippet
-        )
+        f.write_str(&http_status_message(self.status, &self.body_snippet))
     }
 }
 
 impl std::error::Error for EmbedInputRejected {}
+
+/// The one wording of a non-2xx answer, typed ([`EmbedInputRejected`]) or not.
+fn http_status_message(status: u16, snippet: &str) -> String {
+    format!("embedding endpoint returned HTTP {status}: {snippet}")
+}
 
 /// How one attempt at a batch failed.
 enum AttemptFailure {
@@ -584,14 +585,8 @@ impl OpenAiCompatibleProvider {
                 });
             }
         };
-        // The one place the untyped non-2xx error is worded; the typed one
-        // (`EmbedInputRejected`'s `Display`) keeps the same text on purpose.
-        let http_error = || {
-            anyhow::anyhow!(
-                "embedding endpoint returned HTTP {status}: {}",
-                escaped_body_snippet(&body)
-            )
-        };
+        let http_error =
+            || anyhow::anyhow!(http_status_message(status, &escaped_body_snippet(&body)));
         match classify_status(status) {
             StatusClass::Success => {}
             StatusClass::InputRejected => {
