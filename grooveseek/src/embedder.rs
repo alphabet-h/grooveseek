@@ -643,6 +643,9 @@ impl OpenAiCompatibleProvider {
         if let Some(api_key) = api_key {
             builder = builder.bearer_auth(api_key);
         }
+        // (AW-11) One timeout for the attempt, headers and body together: taken before the
+        // request, so the time the headers took is not given again to the body.
+        let deadline = std::time::Instant::now().checked_add(timeout);
         let mut response = match builder.send() {
             Ok(response) => response,
             Err(error) => {
@@ -696,47 +699,35 @@ impl OpenAiCompatibleProvider {
         // anything is read. A longer 2xx is fatal, like any other wrong 2xx: the same inputs
         // would bring the same answer again. Any other status is read only as far as its
         // snippet shows, the byte after it deciding the `...`.
-        let cap = (class == StatusClass::Success)
-            .then(|| max_embedding_response_bytes(texts.len(), dimension));
-        if let Some(cap) = cap
-            && response.content_length().is_some_and(|length| length > cap)
-        {
-            return Err(AttemptFailure::Fatal(response_too_large(
-                cap,
-                texts.len(),
-                dimension,
-            )));
-        }
-        let max_bytes = match cap {
-            Some(cap) => cap.saturating_add(1),
-            None => MAX_HTTP_ERROR_BODY_BYTES as u64 + 1,
-        };
-        let body = match read_capped_body(&mut response, max_bytes, timeout) {
-            Ok(body) => body,
-            Err(_) if class != StatusClass::Success => Vec::new(),
-            // A 2xx whose vectors never arrived: a timeout is retried, any other broken body
-            // is not.
-            Err(BodyReadFailure { error, timed_out }) => {
-                return Err(if timed_out {
-                    AttemptFailure::Retryable {
-                        error,
-                        retry_after,
-                        last: "timed out".to_string(),
-                    }
-                } else {
-                    AttemptFailure::Fatal(error)
-                });
+        let body = if class == StatusClass::Success {
+            let cap = max_embedding_response_bytes(texts.len(), dimension);
+            match read_success_body(&mut response, cap, deadline, timeout) {
+                Ok(body) => body,
+                Err(SuccessBodyFailure::TooLarge) => {
+                    return Err(AttemptFailure::Fatal(response_too_large(
+                        cap,
+                        texts.len(),
+                        dimension,
+                    )));
+                }
+                // A 2xx whose vectors never arrived: a timeout is retried, any other broken
+                // body is not.
+                Err(SuccessBodyFailure::Read(BodyReadFailure { error, timed_out })) => {
+                    return Err(if timed_out {
+                        AttemptFailure::Retryable {
+                            error,
+                            retry_after,
+                            last: "timed out".to_string(),
+                        }
+                    } else {
+                        AttemptFailure::Fatal(error)
+                    });
+                }
             }
+        } else {
+            let max_bytes = MAX_HTTP_ERROR_BODY_BYTES as u64 + 1;
+            read_capped_body(&mut response, max_bytes, deadline, timeout).unwrap_or_default()
         };
-        if let Some(cap) = cap
-            && body.len() as u64 > cap
-        {
-            return Err(AttemptFailure::Fatal(response_too_large(
-                cap,
-                texts.len(),
-                dimension,
-            )));
-        }
         let http_error = || {
             anyhow::Error::new(EmbedHttpStatus {
                 status,
@@ -878,10 +869,17 @@ const RESPONSE_BYTES_PER_ITEM: u64 = 512;
 const RESPONSE_BYTES_SLACK: u64 = 64 * 1024;
 /// How much of a body one read asks for.
 const RESPONSE_READ_CHUNK: usize = 64 * 1024;
+/// The most [`max_embedding_response_bytes`] ever allows: 256 MiB. A full
+/// batch of 64 at dimension 65,536 comes to about 268 MB, far beyond any real
+/// model (dimension 3072 is about 12 MiB), and a cap below `u64::MAX` keeps
+/// `cap + 1` -- the byte that tells an answer went over -- representable. A
+/// saturated cap would otherwise read without limit.
+const MAX_EMBEDDING_RESPONSE_BYTES_CEILING: u64 = 256 * 1024 * 1024;
 
 /// (AW-11) The most groove reads of a 2xx answer to `inputs` inputs of
 /// `dimension`: `inputs * (dimension * 64 + 512) + 64 KiB`, saturating, since
-/// neither number has an upper bound of its own. JSON allows any amount of
+/// neither number has an upper bound of its own, and never more than
+/// [`MAX_EMBEDDING_RESPONSE_BYTES_CEILING`]. JSON allows any amount of
 /// whitespace, so without a cap a valid answer could be any size.
 fn max_embedding_response_bytes(inputs: usize, dimension: usize) -> u64 {
     let inputs = u64::try_from(inputs).unwrap_or(u64::MAX);
@@ -891,6 +889,7 @@ fn max_embedding_response_bytes(inputs: usize, dimension: usize) -> u64 {
         .saturating_add(RESPONSE_BYTES_PER_ITEM)
         .saturating_mul(inputs)
         .saturating_add(RESPONSE_BYTES_SLACK)
+        .min(MAX_EMBEDDING_RESPONSE_BYTES_CEILING)
 }
 
 /// The error for a 2xx answer longer than
@@ -910,19 +909,49 @@ struct BodyReadFailure {
     timed_out: bool,
 }
 
+/// How [`read_success_body`] failed.
+enum SuccessBodyFailure {
+    /// More than the cap was promised or sent.
+    TooLarge,
+    Read(BodyReadFailure),
+}
+
+/// (AW-11) Read a 2xx body of at most `cap` bytes. A `Content-Length` over
+/// `cap` is refused before anything is read; otherwise one byte beyond `cap`
+/// is asked for, and its arrival means the answer went over.
+fn read_success_body(
+    response: &mut reqwest::blocking::Response,
+    cap: u64,
+    deadline: Option<std::time::Instant>,
+    timeout: Duration,
+) -> std::result::Result<Vec<u8>, SuccessBodyFailure> {
+    if response.content_length().is_some_and(|length| length > cap) {
+        return Err(SuccessBodyFailure::TooLarge);
+    }
+    let body = read_capped_body(response, cap.saturating_add(1), deadline, timeout)
+        .map_err(SuccessBodyFailure::Read)?;
+    if body.len() as u64 > cap {
+        return Err(SuccessBodyFailure::TooLarge);
+    }
+    Ok(body)
+}
+
 /// (AW-11) Read at most `max_bytes` of `response`'s body, stopping there; a
 /// caller that wants to know whether more was sent asks for one byte beyond
-/// its limit. `timeout` bounds the whole body: `reqwest`'s own timeout applies
-/// to each read separately, so without this a server sending a byte at a time
-/// could hold the embedder for as long as it kept sending. The worst case is
-/// about twice `timeout` (estimated: the last read may wait a full timeout).
+/// its limit. `deadline` is the attempt's, taken before the request was sent
+/// (`timeout` names it in the error): `reqwest`'s own timeout applies to each
+/// read separately, so without it a server sending a byte at a time could
+/// hold the embedder for as long as it kept sending. Headers and body share
+/// the one timeout, so an attempt lasts at most about twice `timeout`
+/// (estimated: the read under way when the deadline passes may wait a full
+/// timeout of its own), as it did when the body was read with `bytes()`.
 fn read_capped_body(
     response: &mut reqwest::blocking::Response,
     max_bytes: u64,
+    deadline: Option<std::time::Instant>,
     timeout: Duration,
 ) -> std::result::Result<Vec<u8>, BodyReadFailure> {
     use std::io::Read;
-    let deadline = std::time::Instant::now().checked_add(timeout);
     let mut limited = response.take(max_bytes);
     let mut body = Vec::new();
     let mut chunk = vec![0u8; RESPONSE_READ_CHUNK];
@@ -930,7 +959,7 @@ fn read_capped_body(
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(BodyReadFailure {
                 error: anyhow::anyhow!(
-                    "failed to read embedding response body: timed out, the body took longer \
+                    "failed to read embedding response body: timed out, the answer took longer \
                      than the {timeout:?} request timeout"
                 ),
                 timed_out: true,
@@ -1946,10 +1975,12 @@ mod tests {
     /// AW-11: the response cap is wide enough for the widest answer a real
     /// server plausibly sends -- Python's `json.dumps(..., indent=4)` of floats
     /// widened to f64, each printed with 17 significant digits and an exponent
-    /// -- for the largest batch at a large dimension, and it cannot overflow.
+    /// -- for the largest batch at a large dimension, and it neither overflows
+    /// nor grows past its ceiling.
     ///
     /// Red if the per-float allowance drops to 32, if the input count is left
-    /// out of the product, or if the arithmetic stops saturating (it panics).
+    /// out of the product, if the arithmetic stops saturating (it panics), or
+    /// if the ceiling is not applied.
     #[test]
     fn embedding_response_cap_covers_pretty_printed_worst_case_floats() {
         let (inputs, dimension) = (OPENAI_COMPATIBLE_BATCH_SIZE, 3072);
@@ -1979,10 +2010,41 @@ mod tests {
 
         assert_eq!(max_embedding_response_bytes(64, 1024), 4_292_608);
         assert_eq!(max_embedding_response_bytes(1, 16), 67_072);
-        assert_eq!(
-            max_embedding_response_bytes(usize::MAX, usize::MAX),
-            u64::MAX
-        );
+        // Past the ceiling the cap stops growing, and one byte beyond it still
+        // fits in a u64: a saturated cap would never see that byte arrive.
+        let ceiling = max_embedding_response_bytes(usize::MAX, usize::MAX);
+        assert_eq!(ceiling, MAX_EMBEDDING_RESPONSE_BYTES_CEILING);
+        assert!(ceiling.checked_add(1).is_some());
+    }
+
+    /// AW-11: the cap is inclusive. A 2xx of exactly `cap` bytes is read whole,
+    /// its `Content-Length` (equal to the cap) passing the check made before
+    /// reading; one byte more is refused.
+    ///
+    /// Red if either comparison against the cap becomes `>=`.
+    #[test]
+    fn a_2xx_body_of_exactly_the_cap_is_read_and_one_byte_more_is_refused() {
+        let cap = 64u64;
+        let timeout = Duration::from_secs(5);
+        let response = |len: u64| -> reqwest::blocking::Response {
+            http::Response::new(vec![b' '; len as usize]).into()
+        };
+
+        let mut exact = response(cap);
+        assert_eq!(exact.content_length(), Some(cap));
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        match read_success_body(&mut exact, cap, deadline, timeout) {
+            Ok(body) => assert_eq!(body.len() as u64, cap),
+            Err(SuccessBodyFailure::TooLarge) => panic!("a body of exactly the cap was refused"),
+            Err(SuccessBodyFailure::Read(failure)) => panic!("{:#}", failure.error),
+        }
+
+        let mut over = response(cap + 1);
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        assert!(matches!(
+            read_success_body(&mut over, cap, deadline, timeout),
+            Err(SuccessBodyFailure::TooLarge)
+        ));
     }
 
     /// AW-11: a value too large for f32 is refused, never stored. serde_json
@@ -2172,6 +2234,70 @@ mod tests {
         assert!(took < timeout * 3, "took {took:?}");
         drop(embedder);
         handle.join().expect("trickling server thread");
+    }
+
+    /// AW-11: one attempt shares a single timeout between waiting for the
+    /// headers and reading the body, so it stays within about twice the
+    /// timeout (the last read may wait a full one), as `bytes()` did. A body
+    /// deadline started only once the headers arrived would add the header
+    /// wait on top: up to about three times.
+    ///
+    /// The server holds the headers for 0.6 T, then sends two bytes at
+    /// 0.85 T, 1.35 T, 1.85 T, ... (every T / 2, a quarter of a period off the
+    /// deadlines so that no chunk lands on one). With the deadline taken
+    /// before the request, it passes at 1 T and the read returning at 1.35 T
+    /// ends the attempt; started after the headers, it passes at 1.6 T and
+    /// the attempt ends at 1.85 T. The bound, 1.6 T, sits half a second (at
+    /// T = 2 s) from both, which a loaded CI runner on any OS should not
+    /// cross. T is 2 s rather than 1 s to buy that margin; the header wait,
+    /// 1.2 s, stays 0.8 s inside the timeout `send` applies.
+    ///
+    /// Red if the body deadline is taken after `send` returns.
+    #[test]
+    fn openai_compatible_counts_the_header_wait_against_the_body_deadline() {
+        let timeout = Duration::from_secs(2);
+        let body = r#"{"data":[{"embedding":[3.0,4.0],"index":0}]}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("listener address")
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_http_request(&mut stream);
+            thread::sleep(timeout.mul_f64(0.6));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            thread::sleep(timeout / 4);
+            for piece in body.as_bytes().chunks(2) {
+                if stream
+                    .write_all(piece)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+                thread::sleep(timeout / 2);
+            }
+        });
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, timeout),
+        ))
+        .expect("build embedder");
+        let started = std::time::Instant::now();
+        let result = embedder.embed_single("needle");
+        let took = started.elapsed();
+        let err = result.expect_err("a body trickled past the timeout must fail");
+        let text = format!("{err:#}");
+        assert!(text.contains("timed out"), "{text}");
+        assert!(took < timeout.mul_f64(1.6), "took {took:?}");
+        drop(embedder);
+        handle.join().expect("slow server thread");
     }
 
     #[test]
