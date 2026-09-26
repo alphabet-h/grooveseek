@@ -533,25 +533,22 @@ fn jitter_from_clock(base: Duration) -> Duration {
 /// `::ffff:127.x.y.z`) or `localhost`. Such an endpoint is contacted directly,
 /// because a proxy set for the outside world would otherwise receive the
 /// document text and the API key meant for a local server.
+///
+/// The decision itself is the crate's one loopback-host predicate,
+/// [`crate::transport::http::is_loopback_host`].
 fn endpoint_is_loopback(url: &reqwest::Url) -> bool {
+    use crate::transport::http::{is_loopback_host, normalize_host};
     let Some(host) = url.host_str() else {
         return false;
     };
-    // `host_str` keeps the brackets of an IPv6 literal.
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    match bare.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
-        Ok(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-        Err(_) => host
-            .strip_suffix('.')
-            .unwrap_or(host)
-            .eq_ignore_ascii_case("localhost"),
-    }
+    // A trailing dot is the fully qualified spelling of the same name, and the
+    // resolver sends `localhost.` to this machine as well. The dot is dropped
+    // here rather than in the shared predicate: its other callers judge
+    // `Host` / `Origin` allow-list entries, which the HTTP gate compares
+    // verbatim, so `localhost.` there does not admit a browser on
+    // `localhost` and must not count as local.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    is_loopback_host(&normalize_host(host))
 }
 
 impl OpenAiCompatibleProvider {

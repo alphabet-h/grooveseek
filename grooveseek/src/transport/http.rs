@@ -635,11 +635,7 @@ impl NormalizedAuthority {
     /// 既に parse 済の `Authority` から作る (= incoming Host header 用、infallible)。
     fn from_authority(authority: &http::uri::Authority) -> Self {
         Self {
-            host: authority
-                .host()
-                .trim_matches('[')
-                .trim_matches(']')
-                .to_ascii_lowercase(),
+            host: normalize_host(authority.host()),
             port: authority.port_u16(),
         }
     }
@@ -660,10 +656,7 @@ impl NormalizedAuthority {
         // try_from 失敗 = fallback: raw を host-only として保存
         // (= unbracketed IPv6 `"::1"` のような config 形式を救済)
         Self {
-            host: trimmed
-                .trim_matches('[')
-                .trim_matches(']')
-                .to_ascii_lowercase(),
+            host: normalize_host(trimmed),
             port: None,
         }
     }
@@ -679,6 +672,15 @@ impl NormalizedAuthority {
             None => true,                        // port-agnostic
         }
     }
+}
+
+/// The host form [`NormalizedAuthority`] compares: IPv6 brackets stripped,
+/// ASCII lowercase. `pub(crate)` so a caller of [`is_loopback_host`] outside
+/// this file (the embedder, AW-13) normalises the same way.
+pub(crate) fn normalize_host(host: &str) -> String {
+    host.trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase()
 }
 
 /// `host:port` form の port 部分が空でない explicit port suffix を持つか判定。
@@ -1895,7 +1897,17 @@ pub(crate) fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
 /// spent PR #173 collapsing them.
 fn names_a_loopback_host(entry: &str) -> bool {
     let authority = entry.split_once("://").map_or(entry, |(_, rest)| rest);
-    let host = NormalizedAuthority::from_allowed_entry(authority).host;
+    is_loopback_host(&NormalizedAuthority::from_allowed_entry(authority).host)
+}
+
+/// Is this host — no scheme, no port — a local name or a loopback address?
+///
+/// The host half of [`names_a_loopback_host`], shared with the embedder's
+/// proxy decision (AW-13) so the crate keeps one notion of a local host:
+/// [`DEFAULT_LOOPBACK_HOSTS`] for the names, [`is_loopback_peer`] for the
+/// addresses. `host` must already be in the form [`normalize_host`] gives
+/// (brackets stripped, ASCII lowercase).
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     if host.is_empty() {
         return false;
     }
