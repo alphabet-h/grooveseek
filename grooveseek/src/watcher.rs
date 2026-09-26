@@ -982,6 +982,8 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
+        // (AW-16) The helper the reindex arm uses, which the integration tests cover; a
+        // rename is not driven there, since macOS (FSEvents) does not pair renames.
         Err(e) => wdiag!(
             "watcher: rename {old_rel} -> {new_rel} failed: {}",
             crate::embedder::body_free_message(&e)

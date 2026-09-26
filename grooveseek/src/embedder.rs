@@ -405,11 +405,13 @@ impl std::error::Error for EmbedHttpStatus {}
 /// response body -- an MCP client and the watcher's log (ADR-0025). Every
 /// message in the chain is kept, joined with `: `, so the cause shows under
 /// contexts such as the indexer's `failed to embed chunks for <path>` (AW-16).
-/// Two kinds of layer carry the body and are cut short, ending the message:
-/// a non-2xx answer ([`EmbedInputRejected`] or any other status) becomes its
-/// status alone, and a `serde_json` error, which quotes the value it could not
-/// read, becomes `malformed response (<category>)`. Every other layer is
-/// groove's own wording or a transport error, which has no body to carry.
+/// Only the two kinds of layer that may carry a response body are cut short,
+/// ending the message: a non-2xx answer ([`EmbedInputRejected`] or any other
+/// status) becomes its status alone, and a `serde_json` error, which quotes
+/// the value it could not read, becomes `malformed JSON (<category>)`.
+/// Everything else passes through whole, including errors that have nothing
+/// to do with embedding: OS and SQLite text, and the absolute paths a
+/// directory walk names.
 pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
     let mut layers = Vec::new();
     for cause in error.chain() {
@@ -428,7 +430,7 @@ pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
                 serde_json::error::Category::Data => "data",
                 serde_json::error::Category::Eof => "eof",
             };
-            layers.push(format!("malformed response ({category})"));
+            layers.push(format!("malformed JSON ({category})"));
             break;
         }
         layers.push(cause.to_string());
@@ -1018,7 +1020,9 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
 /// (AW-16) A `reqwest` error without its URL, followed by its causes joined
 /// with `: `: its `Display` alone (`error sending request`) does not tell a
 /// timeout from a refused connection. A nested `reqwest::Error` ends the
-/// list, since its `Display` could name the URL again.
+/// list, since its `Display` could name the URL again. The URL's path and
+/// query never appear, but a cause may name the host (a TLS certificate that
+/// does not match the name, for one).
 fn transport_message(error: reqwest::Error) -> String {
     let error = error.without_url();
     let mut message = error.to_string();
@@ -1259,7 +1263,8 @@ impl Embedder {
     /// That sentence is context and the provider's error stays its source:
     /// the CLI prints the whole chain, response body snippet included, while
     /// the MCP `rebuild_index {force: true}` reply goes through
-    /// [`body_free_message`], which keeps the chain but not the body.
+    /// [`body_free_message`], which keeps the chain whole except the two
+    /// layers that may carry the body: the HTTP status's and `serde_json`'s.
     pub fn probe_before_reset(&mut self) -> Result<()> {
         self.provider.probe().context(
             "the embedding endpoint check before the forced rebuild failed, \
@@ -3308,7 +3313,7 @@ mod tests {
         assert_eq!(
             message,
             "failed to embed chunks for note.md: embedding endpoint returned malformed JSON: \
-             malformed response (data)"
+             malformed JSON (data)"
         );
         assert!(!message.contains(secret), "{message}");
     }

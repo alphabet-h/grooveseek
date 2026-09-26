@@ -250,17 +250,20 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   vectors that were not unit length, rebuild with `groove index --force`, and
   if you are not sure, rebuild.** An endpoint that already normalises gets the
   same vectors to within rounding and needs no rebuild. (#331)
-- **The watcher and MCP `rebuild_index` say why an embedding failed.** When
-  the endpoint failed while a file was being indexed, the watcher's log line
-  and the `rebuild_index` reply said only `failed to embed chunks for <path>`,
-  so a wrong `api_key`, a timeout and an answer that was not valid JSON all
-  looked the same. Both now carry the cause below that line — the HTTP status,
-  `malformed response (<kind>)`, or the timeout — as does a failed `search`
-  query. The endpoint's response body is still left out, including the value
-  a malformed answer would have quoted; the CLI prints the whole error, body
-  snippet included, as before. A request that got no answer at all now also
-  names its cause (for example a timeout or a refused connection) after
-  `error sending request`, still without the URL.
+- **The watcher says why an embedding failed, and MCP names more causes.**
+  When the endpoint failed while the watcher was indexing a file, its log
+  line said only `failed to embed chunks for <path>`, so a wrong `api_key`, a
+  timeout and an answer that was not valid JSON all looked the same. It now
+  carries the cause below that line: the HTTP status, `malformed JSON
+  (<kind>)`, a timeout or a failed connection. MCP `rebuild_index` and
+  `search` already named an HTTP status; they now name those other causes
+  too. The endpoint's response body is still left out of both, including the
+  value a malformed answer would have quoted; the CLI prints the whole error,
+  body snippet included, as before. A request that got no answer at all now
+  also names its cause (for example a timeout or a refused connection) after
+  `error sending request`. The URL's path and query still never appear, but
+  such a cause may name the endpoint's host (a TLS certificate that does not
+  match the name, for one).
 
 ## [1.13.0] - 2026-09-23
 

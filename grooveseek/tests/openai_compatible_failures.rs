@@ -1643,12 +1643,12 @@ fn the_watcher_names_a_401_without_the_response_body() {
 /// response, without the value `serde_json` would have quoted from it.
 ///
 /// Red if the watcher prints the outermost message alone (no
-/// `malformed response`), or if the serde error's own text is joined in (the
+/// `malformed JSON (data)`), or if the serde error's own text is joined in (the
 /// sentinel it quotes reaches stderr).
 #[test]
 fn the_watcher_names_a_malformed_answer_without_quoting_it() {
     let line = watcher_failure_line("groove-aw16-watch-malformed", "", false, malformed_answer);
-    assert!(line.contains("malformed response"), "{line}");
+    assert!(line.contains("malformed JSON (data)"), "{line}");
 }
 
 /// AW-16: a 2xx whose body never arrives is named as a timeout.
@@ -1709,16 +1709,19 @@ fn error_of(resp: &serde_json::Value) -> &str {
 ///
 /// Red if `body_free_message` joins the serde error's text (the sentinel
 /// appears), or keeps only the outermost message (neither reply would say
-/// `malformed response`).
+/// `malformed JSON (data)`).
 #[test]
 fn mcp_names_a_malformed_answer_without_quoting_it() {
     let (rebuild, search) = mcp_replies("groove-aw16-mcp-malformed", "", false, malformed_answer);
     assert!(
         error_of(&rebuild).contains("failed to embed chunks for alpha.md: ")
-            && error_of(&rebuild).contains("malformed response"),
+            && error_of(&rebuild).contains("malformed JSON (data)"),
         "{rebuild}"
     );
-    assert!(error_of(&search).contains("malformed response"), "{search}");
+    assert!(
+        error_of(&search).contains("malformed JSON (data)"),
+        "{search}"
+    );
     assert!(!rebuild.to_string().contains(BODY_SENTINEL), "{rebuild}");
     assert!(!search.to_string().contains(BODY_SENTINEL), "{search}");
 }
