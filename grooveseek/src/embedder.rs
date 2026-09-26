@@ -402,28 +402,40 @@ impl fmt::Display for EmbedHttpStatus {
 impl std::error::Error for EmbedHttpStatus {}
 
 /// An embedding error worded for a caller who must not see the endpoint's
-/// response body -- an MCP client (ADR-0025). When a non-2xx answer
-/// ([`EmbedInputRejected`] or any other status) is anywhere in the chain, the
-/// result is every message above it -- contexts groove wrote itself, such as
-/// the indexer's `failed to embed chunks for <path>` or the retry loop's
-/// give-up line -- followed by that status alone, so the answer's text (which
-/// carries the body) is never used. Without one, it is the outermost message,
-/// also groove's own (a timeout, a malformed answer): `anyhow::Error`'s
-/// `Display` never prints the causes underneath.
+/// response body -- an MCP client and the watcher's log (ADR-0025). Every
+/// message in the chain is kept, joined with `: `, so the cause shows under
+/// contexts such as the indexer's `failed to embed chunks for <path>` (AW-16).
+/// Only the two kinds of layer that may carry a response body are cut short,
+/// ending the message: a non-2xx answer ([`EmbedInputRejected`] or any other
+/// status) becomes its status alone, and a `serde_json` error, which quotes
+/// the value it could not read, becomes `malformed JSON (<category>)`.
+/// Everything else passes through whole, including errors that have nothing
+/// to do with embedding: OS and SQLite text, and the absolute paths a
+/// directory walk names.
 pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
-    let mut above = Vec::new();
+    let mut layers = Vec::new();
     for cause in error.chain() {
         let status = cause
             .downcast_ref::<EmbedInputRejected>()
             .map(|r| r.status)
             .or_else(|| cause.downcast_ref::<EmbedHttpStatus>().map(|s| s.status));
         if let Some(status) = status {
-            above.push(format!("embedding endpoint returned HTTP {status}"));
-            return above.join(": ");
+            layers.push(format!("embedding endpoint returned HTTP {status}"));
+            break;
         }
-        above.push(cause.to_string());
+        if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
+            let category = match json.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            layers.push(format!("malformed JSON ({category})"));
+            break;
+        }
+        layers.push(cause.to_string());
     }
-    error.to_string()
+    layers.join(": ")
 }
 
 /// (AW-04) Context on an [`EmbedInputRejected`] that came after the endpoint had
@@ -656,7 +668,8 @@ impl OpenAiCompatibleProvider {
                 } else {
                     None
                 };
-                let error = anyhow::anyhow!("embedding request failed: {}", error.without_url());
+                let error =
+                    anyhow::anyhow!("embedding request failed: {}", transport_message(error));
                 return Err(match last {
                     Some(last) => AttemptFailure::Retryable {
                         error,
@@ -993,14 +1006,68 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
         return BodyReadFailure {
             error: anyhow::anyhow!(
                 "failed to read embedding response body: {}",
-                inner.without_url()
+                transport_message(inner)
             ),
             timed_out,
         };
     }
     BodyReadFailure {
-        error: anyhow::anyhow!("failed to read embedding response body: {error}"),
+        error: anyhow::anyhow!(
+            "failed to read embedding response body: {}",
+            ascii_io_error(&error)
+        ),
         timed_out: kind_timed_out,
+    }
+}
+
+/// (AW-16) A `reqwest` error without its URL, followed by its causes joined
+/// with `: `: its `Display` alone (`error sending request`) does not tell a
+/// timeout from a refused connection. A nested `reqwest::Error` ends the
+/// list, since its `Display` could name the URL again. Each cause is written
+/// in ASCII ([`ascii_cause`]). The URL's path and query never appear, but a
+/// cause may name the host (a TLS certificate that does not match the name,
+/// for one).
+fn transport_message(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    with_ascii_causes(error.to_string(), std::error::Error::source(&error))
+}
+
+/// `message` (a URL-free `reqwest` error's own text) followed by `source` and
+/// the causes under it, each through [`ascii_cause`], joined with `: `; a
+/// nested `reqwest::Error` ends the list ([`transport_message`]).
+fn with_ascii_causes(
+    mut message: String,
+    mut source: Option<&(dyn std::error::Error + 'static)>,
+) -> String {
+    while let Some(cause) = source {
+        if cause.is::<reqwest::Error>() {
+            break;
+        }
+        message.push_str(": ");
+        message.push_str(&ascii_cause(cause));
+        source = cause.source();
+    }
+    message
+}
+
+/// (codex P1 round 1 on PR #332) One cause of a transport error, in ASCII:
+/// stderr stays ASCII (AGENTS.md). An `io::Error` is named by its kind and
+/// OS error code ([`ascii_io_error`]); any other cause keeps its text,
+/// escaped where it is not ASCII.
+fn ascii_cause(cause: &(dyn std::error::Error + 'static)) -> String {
+    match cause.downcast_ref::<std::io::Error>() {
+        Some(io) => ascii_io_error(io),
+        None => crate::watcher::ascii_diag(&cause.to_string()),
+    }
+}
+
+/// An `io::Error` as `ConnectionRefused (os error 10061)`: its text comes
+/// from the OS, which words it in the local language on a non-English
+/// Windows, while the kind and code are the same everywhere.
+fn ascii_io_error(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{:?} (os error {code})", error.kind()),
+        None => format!("{:?}", error.kind()),
     }
 }
 
@@ -1227,9 +1294,10 @@ impl Embedder {
     /// runs this before its reset and returns on failure.
     ///
     /// That sentence is context and the provider's error stays its source:
-    /// the CLI prints the whole chain, HTTP status included, while the MCP
-    /// `rebuild_index {force: true}` reply shows the outermost message only,
-    /// so the endpoint's response body does not reach an MCP caller.
+    /// the CLI prints the whole chain, response body snippet included, while
+    /// the MCP `rebuild_index {force: true}` reply goes through
+    /// [`body_free_message`], which keeps the chain whole except the two
+    /// layers that may carry the body: the HTTP status's and `serde_json`'s.
     pub fn probe_before_reset(&mut self) -> Result<()> {
         self.provider.probe().context(
             "the embedding endpoint check before the forced rebuild failed, \
@@ -3255,5 +3323,147 @@ mod tests {
              attempts (last: HTTP 503): embedding endpoint returned HTTP 503"
         );
         assert!(!message.contains(secret), "{message}");
+    }
+
+    /// (AW-16) A 2xx whose JSON has the wrong shape is named by the kind of
+    /// fault only: `serde_json` quotes the offending value, and that value is
+    /// the endpoint's response body.
+    ///
+    /// Red if the serde layer's own text is joined into the message: the
+    /// sentinel the body carries would be quoted in it.
+    #[test]
+    fn body_free_message_names_a_malformed_answer_without_quoting_it() {
+        let secret = "SECRET-BODY";
+        let body = format!(r#"{{"data":[{{"index":0,"embedding":"{secret}"}}]}}"#);
+        let error = parse_embedding_response(body.as_bytes(), 1, 2)
+            .expect_err("a string where the vector should be")
+            .context("failed to embed chunks for note.md");
+        assert!(
+            format!("{error:#}").contains(secret),
+            "the CLI keeps serde's text: {error:#}"
+        );
+        let message = body_free_message(&error);
+        assert_eq!(
+            message,
+            "failed to embed chunks for note.md: embedding endpoint returned malformed JSON: \
+             malformed JSON (data)"
+        );
+        assert!(!message.contains(secret), "{message}");
+    }
+
+    /// (AW-16) Without a status or a serde error in the chain, every layer is
+    /// groove's own wording, and all of them are kept: the outermost alone
+    /// (`failed to embed chunks for <path>`) never says what went wrong.
+    #[test]
+    fn body_free_message_joins_every_layer_of_a_chain_without_a_status() {
+        let error = anyhow::anyhow!("failed to read embedding response body: timed out")
+            .context("failed to embed chunks for note.md");
+        assert_eq!(
+            body_free_message(&error),
+            "failed to embed chunks for note.md: failed to read embedding response body: \
+             timed out"
+        );
+    }
+
+    /// (AW-16) A request that never got an answer keeps what `reqwest` said
+    /// caused it, still without the URL: `error sending request` alone does
+    /// not tell a timeout from a refused connection.
+    ///
+    /// Red if the transport error is built from the `reqwest::Error`'s
+    /// `Display` alone, which never prints its source.
+    #[test]
+    fn a_transport_error_names_its_cause_without_the_url() {
+        let (endpoint, _captured, handle) = mock_embedding_server(
+            "200 OK",
+            r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#,
+            Duration::from_millis(200),
+        );
+        let host = endpoint
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("host:port")
+            .to_string();
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_millis(10)),
+        ))
+        .expect("build embedder");
+        let err = embedder
+            .embed_single("needle")
+            .expect_err("request must time out");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("embedding request failed: error sending request: "),
+            "{chain}"
+        );
+        assert!(chain.contains("timed out"), "{chain}");
+        assert!(!chain.contains(&host), "the URL leaked: {chain}");
+        handle.join().expect("mock server thread");
+    }
+
+    /// (codex P1 round 1 on PR #332) An `io::Error` under a transport error
+    /// is named by its kind (and OS error code), not by its text: on a
+    /// non-English Windows the OS words that text in the local language, and
+    /// stderr stays ASCII. Any other cause is escaped to ASCII.
+    ///
+    /// Red if [`ascii_cause`] appends a cause's `Display` as it is.
+    #[test]
+    fn a_transport_cause_is_written_in_ascii() {
+        let localized = "接続が拒否されました";
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, localized);
+        let text = ascii_cause(&refused);
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.contains("ConnectionRefused"), "{text}");
+        assert!(!text.contains(localized), "{text}");
+
+        let os = std::io::Error::from_raw_os_error(10061);
+        let text = ascii_cause(&os);
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.ends_with(" (os error 10061)"), "{text}");
+
+        // Built from a variable, not an `anyhow!` literal: the stderr ASCII
+        // scanner reads every diagnostic macro, test code included.
+        let localized_other = "証明書 mismatch";
+        let other = anyhow::Error::msg(localized_other);
+        let text = ascii_cause(other.as_ref());
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.contains("mismatch"), "{text}");
+    }
+
+    /// (local Codex round 2 on PR #332) The walk [`transport_message`] runs
+    /// ([`with_ascii_causes`]) writes every cause in ASCII, an OS error by its
+    /// kind: the test above checks one cause, this one the chain as the
+    /// transport error builds it.
+    ///
+    /// Red if the walk appends a cause's `Display` instead of going through
+    /// [`ascii_cause`].
+    #[test]
+    fn the_transport_cause_walk_writes_every_cause_in_ascii() {
+        #[derive(Debug)]
+        struct Connect(std::io::Error);
+        impl fmt::Display for Connect {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("tcp connect error")
+            }
+        }
+        impl std::error::Error for Connect {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let localized = "接続が拒否されました";
+        let connect = Connect(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            localized,
+        ));
+        let text = with_ascii_causes("error sending request".to_string(), Some(&connect));
+        assert!(text.is_ascii(), "{text}");
+        assert!(
+            text.starts_with("error sending request: tcp connect error: "),
+            "{text}"
+        );
+        assert!(text.contains("ConnectionRefused"), "{text}");
+        assert!(!text.contains(localized), "{text}");
     }
 }

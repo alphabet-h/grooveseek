@@ -374,7 +374,8 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
 /// scan feeds already-existing printers ([`dispatch_reindex`] and friends), so
 /// "escape the lines this branch adds" has no stable boundary — every path that
 /// newly reaches an old `eprintln!` is a new stderr path. One printer, one rule.
-fn ascii_diag(s: &str) -> String {
+/// The embedder's transport errors escape their causes with it too (AW-16).
+pub(crate) fn ascii_diag(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c == ' ' || c.is_ascii_graphic() {
@@ -901,7 +902,10 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             wdiag!("watcher: skipped {rel} ({reason})");
         }
         Err(e) => {
-            wdiag!("watcher: reindex {rel} failed: {e}");
+            wdiag!(
+                "watcher: reindex {rel} failed: {}",
+                crate::embedder::body_free_message(&e)
+            );
         }
     }
     sweep_legacy_row(&db, &state.kb_path, rel, true);
@@ -979,7 +983,12 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
-        Err(e) => wdiag!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
+        // (AW-16) The helper the reindex arm uses, which the integration tests cover; a
+        // rename is not driven there, since macOS (FSEvents) does not pair renames.
+        Err(e) => wdiag!(
+            "watcher: rename {old_rel} -> {new_rel} failed: {}",
+            crate::embedder::body_free_message(&e)
+        ),
     }
     // The file has left `old_rel` under every spelling; at `new_rel` the sweep
     // follows the real key in, as it does after a reindex.
