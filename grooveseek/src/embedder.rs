@@ -3406,7 +3406,7 @@ mod tests {
     /// non-English Windows the OS words that text in the local language, and
     /// stderr stays ASCII. Any other cause is escaped to ASCII.
     ///
-    /// Red if a cause's `Display` is appended as it is.
+    /// Red if [`ascii_cause`] appends a cause's `Display` as it is.
     #[test]
     fn a_transport_cause_is_written_in_ascii() {
         let localized = "接続が拒否されました";
@@ -3427,12 +3427,13 @@ mod tests {
         assert!(text.contains("mismatch"), "{text}");
     }
 
-    /// (local Codex round 2 on PR #332) The walk `transport_message` runs
-    /// writes every cause in ASCII, an OS error by its kind: the test above
-    /// checks one cause, this one the chain as the transport error builds it.
+    /// (local Codex round 2 on PR #332) The walk [`transport_message`] runs
+    /// ([`with_ascii_causes`]) writes every cause in ASCII, an OS error by its
+    /// kind: the test above checks one cause, this one the chain as the
+    /// transport error builds it.
     ///
     /// Red if the walk appends a cause's `Display` instead of going through
-    /// `ascii_cause`.
+    /// [`ascii_cause`].
     #[test]
     fn the_transport_cause_walk_writes_every_cause_in_ascii() {
         #[derive(Debug)]
