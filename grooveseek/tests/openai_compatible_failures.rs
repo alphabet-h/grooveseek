@@ -1707,7 +1707,7 @@ fn error_of(resp: &serde_json::Value) -> &str {
 /// AW-16: MCP `rebuild_index` and `search` name a malformed 2xx as such,
 /// without the value `serde_json` quotes from the body.
 ///
-/// Red if `body_free_message` joins the serde error's text (the sentinel
+/// Red if `body_free_message` in [`grooveseek::embedder`] joins the serde error's text (the sentinel
 /// appears), or keeps only the outermost message (neither reply would say
 /// `malformed JSON (data)`).
 #[test]
