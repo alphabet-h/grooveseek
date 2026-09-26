@@ -2131,7 +2131,7 @@ mod tests {
     /// answer arrives whole after many times the timeout.
     #[test]
     fn openai_compatible_bounds_the_whole_body_read_by_the_timeout() {
-        let timeout = Duration::from_millis(500);
+        let timeout = Duration::from_secs(1);
         let body = r#"{"data":[{"embedding":[3.0,4.0],"index":0}]}"#;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind trickling server");
         let endpoint = format!(

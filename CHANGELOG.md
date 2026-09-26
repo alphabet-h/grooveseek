@@ -234,8 +234,8 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   cause. It is not retried: the same inputs would bring the same answer. Any
   other status is read only as far as the 512 bytes its error message shows.
   The request timeout now bounds the body as a whole, not each read of it, so
-  a server sending a few bytes at a time can no longer hold the run beyond
-  about twice the timeout; a body that times out is still retried. A vector
+  a server sending a few bytes at a time can no longer hold a single attempt
+  beyond about twice the timeout; a body that times out is still retried. A vector
   holding a value too large for a 32-bit float (which reads as infinity) or
   holding only zeros now stops the run instead of reaching the index.
 - **Vectors from an OpenAI-compatible endpoint are stored at unit length.**
