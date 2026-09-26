@@ -123,6 +123,22 @@ pub struct MockReply {
     /// sees as a broken body rather than a timeout (AW-04, an overloaded proxy
     /// cutting off a 5xx).
     pub truncate_body: bool,
+    /// How the body's length is told to the client (AW-11).
+    pub framing: Framing,
+}
+
+/// How a [`MockReply`] tells the client its body's length.
+pub enum Framing {
+    /// `Content-Length` is the body's length (plus [`STALLED_BODY_EXTRA`] for
+    /// a stalled or truncated body).
+    Exact,
+    /// `Transfer-Encoding: chunked`: the body as one chunk, then the last
+    /// chunk. A stalled body holds the connection instead of writing the last
+    /// chunk; a truncated one closes it there.
+    Chunked,
+    /// `Content-Length` is this number, whatever the body's length. A stalled
+    /// body holds the connection after the body.
+    Declared(u64),
 }
 
 /// How many bytes a [`MockReply::stall_body`] or [`MockReply::truncate_body`]
@@ -137,6 +153,7 @@ impl MockReply {
             headers: Vec::new(),
             stall_body: false,
             truncate_body: false,
+            framing: Framing::Exact,
         }
     }
 }
@@ -366,6 +383,7 @@ fn serve_one(
         headers,
         stall_body,
         truncate_body,
+        framing,
     } = responder(&recorded);
     let extra: String = headers
         .iter()
@@ -374,14 +392,29 @@ fn serve_one(
     // A truncated body is written short and the connection dropped when this
     // function returns, like any other reply.
     let short = stall_body || truncate_body;
-    let promised = resp.body.len() + if short { STALLED_BODY_EXTRA } else { 0 };
+    let (length_header, body) = match framing {
+        Framing::Exact => {
+            let promised = resp.body.len() + if short { STALLED_BODY_EXTRA } else { 0 };
+            (format!("Content-Length: {promised}"), resp.body)
+        }
+        Framing::Chunked => {
+            let mut body = format!("{:x}\r\n", resp.body.len()).into_bytes();
+            body.extend_from_slice(&resp.body);
+            body.extend_from_slice(b"\r\n");
+            if !short {
+                body.extend_from_slice(b"0\r\n\r\n");
+            }
+            ("Transfer-Encoding: chunked".to_string(), body)
+        }
+        Framing::Declared(n) => (format!("Content-Length: {n}"), resp.body),
+    };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {promised}\r\n{extra}Connection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{length_header}\r\n{extra}Connection: close\r\n\r\n",
         resp.status,
         reason(resp.status),
     );
     if write_bounded(&mut stream, head.as_bytes(), stop, deadline)
-        && write_bounded(&mut stream, &resp.body, stop, deadline)
+        && write_bounded(&mut stream, &body, stop, deadline)
         && stall_body
     {
         // Hold the connection, bounded like every other wait here, until the
