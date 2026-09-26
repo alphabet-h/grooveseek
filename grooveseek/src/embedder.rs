@@ -3421,7 +3421,10 @@ mod tests {
         assert!(text.is_ascii(), "{text}");
         assert!(text.ends_with(" (os error 10061)"), "{text}");
 
-        let other = anyhow::anyhow!("証明書 mismatch");
+        // Built from a variable, not an `anyhow!` literal: the stderr ASCII
+        // scanner reads every diagnostic macro, test code included.
+        let localized_other = "証明書 mismatch";
+        let other = anyhow::Error::msg(localized_other);
         let text = ascii_cause(other.as_ref());
         assert!(text.is_ascii(), "{text}");
         assert!(text.contains("mismatch"), "{text}");
