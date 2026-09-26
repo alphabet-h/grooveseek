@@ -374,7 +374,8 @@ fn classify(evt: &DebouncedEvent) -> Classified<'_> {
 /// scan feeds already-existing printers ([`dispatch_reindex`] and friends), so
 /// "escape the lines this branch adds" has no stable boundary — every path that
 /// newly reaches an old `eprintln!` is a new stderr path. One printer, one rule.
-fn ascii_diag(s: &str) -> String {
+/// The embedder's transport errors escape their causes with it too (AW-16).
+pub(crate) fn ascii_diag(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c == ' ' || c.is_ascii_graphic() {

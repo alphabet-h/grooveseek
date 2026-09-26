@@ -261,9 +261,11 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   value a malformed answer would have quoted; the CLI prints the whole error,
   body snippet included, as before. A request that got no answer at all now
   also names its cause (for example a timeout or a refused connection) after
-  `error sending request`. The URL's path and query still never appear, but
-  such a cause may name the endpoint's host (a TLS certificate that does not
-  match the name, for one). (#332)
+  `error sending request`, in ASCII: an operating-system error appears as its
+  kind and code (`ConnectionRefused (os error 10061)`), not as the message
+  the OS words in its own language. The URL's path and query still never
+  appear, but such a cause may name the endpoint's host (a TLS certificate
+  that does not match the name, for one). (#332)
 
 ## [1.13.0] - 2026-09-23
 

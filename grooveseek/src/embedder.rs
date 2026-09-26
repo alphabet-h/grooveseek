@@ -1012,7 +1012,10 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
         };
     }
     BodyReadFailure {
-        error: anyhow::anyhow!("failed to read embedding response body: {error}"),
+        error: anyhow::anyhow!(
+            "failed to read embedding response body: {}",
+            ascii_io_error(&error)
+        ),
         timed_out: kind_timed_out,
     }
 }
@@ -1020,9 +1023,10 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
 /// (AW-16) A `reqwest` error without its URL, followed by its causes joined
 /// with `: `: its `Display` alone (`error sending request`) does not tell a
 /// timeout from a refused connection. A nested `reqwest::Error` ends the
-/// list, since its `Display` could name the URL again. The URL's path and
-/// query never appear, but a cause may name the host (a TLS certificate that
-/// does not match the name, for one).
+/// list, since its `Display` could name the URL again. Each cause is written
+/// in ASCII ([`ascii_cause`]). The URL's path and query never appear, but a
+/// cause may name the host (a TLS certificate that does not match the name,
+/// for one).
 fn transport_message(error: reqwest::Error) -> String {
     let error = error.without_url();
     let mut message = error.to_string();
@@ -1032,10 +1036,31 @@ fn transport_message(error: reqwest::Error) -> String {
             break;
         }
         message.push_str(": ");
-        message.push_str(&cause.to_string());
+        message.push_str(&ascii_cause(cause));
         source = cause.source();
     }
     message
+}
+
+/// (codex P1 round 1 on PR #332) One cause of a transport error, in ASCII:
+/// stderr stays ASCII (AGENTS.md). An `io::Error` is named by its kind and
+/// OS error code ([`ascii_io_error`]); any other cause keeps its text,
+/// escaped where it is not ASCII.
+fn ascii_cause(cause: &(dyn std::error::Error + 'static)) -> String {
+    match cause.downcast_ref::<std::io::Error>() {
+        Some(io) => ascii_io_error(io),
+        None => crate::watcher::ascii_diag(&cause.to_string()),
+    }
+}
+
+/// An `io::Error` as `ConnectionRefused (os error 10061)`: its text comes
+/// from the OS, which words it in the local language on a non-English
+/// Windows, while the kind and code are the same everywhere.
+fn ascii_io_error(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{:?} (os error {code})", error.kind()),
+        None => format!("{:?}", error.kind()),
+    }
 }
 
 fn escaped_body_snippet(body: &[u8]) -> String {
@@ -3366,5 +3391,31 @@ mod tests {
         assert!(chain.contains("timed out"), "{chain}");
         assert!(!chain.contains(&host), "the URL leaked: {chain}");
         handle.join().expect("mock server thread");
+    }
+
+    /// (codex P1 round 1 on PR #332) An `io::Error` under a transport error
+    /// is named by its kind (and OS error code), not by its text: on a
+    /// non-English Windows the OS words that text in the local language, and
+    /// stderr stays ASCII. Any other cause is escaped to ASCII.
+    ///
+    /// Red if a cause's `Display` is appended as it is.
+    #[test]
+    fn a_transport_cause_is_written_in_ascii() {
+        let localized = "接続が拒否されました";
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, localized);
+        let text = ascii_cause(&refused);
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.contains("ConnectionRefused"), "{text}");
+        assert!(!text.contains(localized), "{text}");
+
+        let os = std::io::Error::from_raw_os_error(10061);
+        let text = ascii_cause(&os);
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.ends_with(" (os error 10061)"), "{text}");
+
+        let other = anyhow::anyhow!("証明書 mismatch");
+        let text = ascii_cause(other.as_ref());
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.contains("mismatch"), "{text}");
     }
 }
