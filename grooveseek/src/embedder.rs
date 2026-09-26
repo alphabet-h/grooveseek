@@ -637,12 +637,16 @@ impl OpenAiCompatibleProvider {
         let endpoint = self.config.endpoint.clone();
         let api_key = self.config.api_key.clone();
         let dimension = self.config.dimension;
+        let timeout = self.config.timeout;
         let client = self.client().map_err(AttemptFailure::Fatal)?;
         let mut builder = client.post(endpoint).json(&request);
         if let Some(api_key) = api_key {
             builder = builder.bearer_auth(api_key);
         }
-        let response = match builder.send() {
+        // (AW-11) One timeout for the attempt, headers and body together: taken before the
+        // request, so the time the headers took is not given again to the body.
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let mut response = match builder.send() {
             Ok(response) => response,
             Err(error) => {
                 let last = if error.is_timeout() {
@@ -690,27 +694,39 @@ impl OpenAiCompatibleProvider {
                 last: format!("HTTP {status}"),
             });
         }
-        let body = match response.bytes() {
-            Ok(body) => body,
-            Err(_) if class != StatusClass::Success => Default::default(),
-            // A 2xx whose vectors never arrived: a timeout is retried, any other broken body
-            // is not.
-            Err(error) => {
-                let timed_out = error.is_timeout();
-                let error = anyhow::anyhow!(
-                    "failed to read embedding response body: {}",
-                    error.without_url()
-                );
-                return Err(if timed_out {
-                    AttemptFailure::Retryable {
-                        error,
-                        retry_after,
-                        last: "timed out".to_string(),
-                    }
-                } else {
-                    AttemptFailure::Fatal(error)
-                });
+        // (AW-11) A 2xx is read up to the cap its inputs and dimension allow, one byte more
+        // telling that the cap was passed; a `Content-Length` over the cap is refused before
+        // anything is read. A longer 2xx is fatal, like any other wrong 2xx: the same inputs
+        // would bring the same answer again. Any other status is read only as far as its
+        // snippet shows, the byte after it deciding the `...`.
+        let body = if class == StatusClass::Success {
+            let cap = max_embedding_response_bytes(texts.len(), dimension);
+            match read_success_body(&mut response, cap, deadline, timeout) {
+                Ok(body) => body,
+                Err(SuccessBodyFailure::TooLarge) => {
+                    return Err(AttemptFailure::Fatal(response_too_large(
+                        cap,
+                        texts.len(),
+                        dimension,
+                    )));
+                }
+                // A 2xx whose vectors never arrived: a timeout is retried, any other broken
+                // body is not.
+                Err(SuccessBodyFailure::Read(BodyReadFailure { error, timed_out })) => {
+                    return Err(if timed_out {
+                        AttemptFailure::Retryable {
+                            error,
+                            retry_after,
+                            last: "timed out".to_string(),
+                        }
+                    } else {
+                        AttemptFailure::Fatal(error)
+                    });
+                }
             }
+        } else {
+            let max_bytes = MAX_HTTP_ERROR_BODY_BYTES as u64 + 1;
+            read_capped_body(&mut response, max_bytes, deadline, timeout).unwrap_or_default()
         };
         let http_error = || {
             anyhow::Error::new(EmbedHttpStatus {
@@ -768,8 +784,10 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
 }
 
 /// Check a 2xx answer and put its vectors in input order: one per input, each
-/// index in range and unique, none missing, each of the declared dimension.
-/// Never retried: the server would give the same answer again.
+/// index in range and unique, none missing, each of the declared dimension,
+/// finite and not all zeros, and scaled to unit length
+/// ([`normalize_embedding`]). Never retried: the server would give the same
+/// answer again.
 fn parse_embedding_response(body: &[u8], inputs: usize, dimension: usize) -> Result<Vec<Vec<f32>>> {
     let parsed: OpenAiEmbeddingResponse =
         serde_json::from_slice(body).context("embedding endpoint returned malformed JSON")?;
@@ -781,7 +799,7 @@ fn parse_embedding_response(body: &[u8], inputs: usize, dimension: usize) -> Res
     );
 
     let mut ordered: Vec<Option<Vec<f32>>> = vec![None; inputs];
-    for item in parsed.data {
+    for mut item in parsed.data {
         anyhow::ensure!(
             item.index < ordered.len(),
             "embedding endpoint returned out-of-range index {} for {} inputs",
@@ -795,6 +813,7 @@ fn parse_embedding_response(body: &[u8], inputs: usize, dimension: usize) -> Res
             item.index,
             dimension
         );
+        normalize_embedding(&mut item.embedding, item.index)?;
         anyhow::ensure!(
             ordered[item.index].is_none(),
             "embedding endpoint returned duplicate index {}",
@@ -809,6 +828,180 @@ fn parse_embedding_response(body: &[u8], inputs: usize, dimension: usize) -> Res
             embedding.ok_or_else(|| anyhow::anyhow!("embedding endpoint omitted index {index}"))
         })
         .collect()
+}
+
+/// (AW-11 / AW-12) Refuse a vector with a non-finite value or no length, and
+/// scale the rest to unit length, as FastEmbed's already are: the index
+/// compares vectors by L2 distance and `groove graph` reads that distance as
+/// a cosine, which only holds between unit vectors. The squares are summed in
+/// f64, so no finite f32 vector overflows to infinity or underflows to zero on
+/// the way. `index` is the vector's place in groove's input order.
+fn normalize_embedding(embedding: &mut [f32], index: usize) -> Result<()> {
+    anyhow::ensure!(
+        embedding.iter().all(|x| x.is_finite()),
+        "embedding endpoint returned a non-finite value at index {index}"
+    );
+    let norm = embedding
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        .sqrt();
+    anyhow::ensure!(
+        norm > 0.0,
+        "embedding endpoint returned an all-zero vector at index {index}; \
+         it has no direction to compare"
+    );
+    for x in embedding.iter_mut() {
+        *x = (f64::from(*x) / norm) as f32;
+    }
+    Ok(())
+}
+
+/// Bytes allowed per float in [`max_embedding_response_bytes`]: the longest
+/// float a server prints (`-1.2345678918743134e-05`, an f32 widened to f64)
+/// is 23 bytes, 25 with its separator, about 42 when pretty-printed with
+/// `indent=4` (estimated).
+const RESPONSE_BYTES_PER_FLOAT: u64 = 64;
+/// Bytes allowed per vector for its envelope (`{"object":"embedding","index":..,
+/// "embedding":[..]}`, about 50 bytes compact) and any fields a server adds.
+const RESPONSE_BYTES_PER_ITEM: u64 = 512;
+/// Bytes allowed once per answer: `object`, a long `model`, `usage`, `id`.
+const RESPONSE_BYTES_SLACK: u64 = 64 * 1024;
+/// How much of a body one read asks for.
+const RESPONSE_READ_CHUNK: usize = 64 * 1024;
+/// The most [`max_embedding_response_bytes`] ever allows: 256 MiB. A full
+/// batch of 64 at dimension 65,536 comes to about 268 MB, far beyond any real
+/// model (dimension 3072 is about 12 MiB), and a cap below `u64::MAX` keeps
+/// `cap + 1` -- the byte that tells an answer went over -- representable. A
+/// saturated cap would otherwise read without limit.
+const MAX_EMBEDDING_RESPONSE_BYTES_CEILING: u64 = 256 * 1024 * 1024;
+
+/// (AW-11) The most groove reads of a 2xx answer to `inputs` inputs of
+/// `dimension`: `inputs * (dimension * 64 + 512) + 64 KiB`, saturating, since
+/// neither number has an upper bound of its own, and never more than
+/// [`MAX_EMBEDDING_RESPONSE_BYTES_CEILING`]. JSON allows any amount of
+/// whitespace, so without a cap a valid answer could be any size.
+fn max_embedding_response_bytes(inputs: usize, dimension: usize) -> u64 {
+    let inputs = u64::try_from(inputs).unwrap_or(u64::MAX);
+    let dimension = u64::try_from(dimension).unwrap_or(u64::MAX);
+    dimension
+        .saturating_mul(RESPONSE_BYTES_PER_FLOAT)
+        .saturating_add(RESPONSE_BYTES_PER_ITEM)
+        .saturating_mul(inputs)
+        .saturating_add(RESPONSE_BYTES_SLACK)
+        .min(MAX_EMBEDDING_RESPONSE_BYTES_CEILING)
+}
+
+/// The error for a 2xx answer longer than
+/// [`max_embedding_response_bytes`], whether its `Content-Length` said so or
+/// its bytes did. It carries nothing from the body.
+fn response_too_large(cap: u64, inputs: usize, dimension: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "embedding endpoint answered with more than {cap} bytes for {inputs} input(s) of \
+         dimension {dimension}; groove reads at most that much (check [embedding].dimension)"
+    )
+}
+
+/// How [`read_capped_body`] failed.
+struct BodyReadFailure {
+    error: anyhow::Error,
+    /// A read, or the body as a whole, ran past the request timeout.
+    timed_out: bool,
+}
+
+/// How [`read_success_body`] failed.
+enum SuccessBodyFailure {
+    /// More than the cap was promised or sent.
+    TooLarge,
+    Read(BodyReadFailure),
+}
+
+/// (AW-11) Read a 2xx body of at most `cap` bytes. A `Content-Length` over
+/// `cap` is refused before anything is read; otherwise one byte beyond `cap`
+/// is asked for, and its arrival means the answer went over.
+fn read_success_body(
+    response: &mut reqwest::blocking::Response,
+    cap: u64,
+    deadline: Option<std::time::Instant>,
+    timeout: Duration,
+) -> std::result::Result<Vec<u8>, SuccessBodyFailure> {
+    if response.content_length().is_some_and(|length| length > cap) {
+        return Err(SuccessBodyFailure::TooLarge);
+    }
+    let body = read_capped_body(response, cap.saturating_add(1), deadline, timeout)
+        .map_err(SuccessBodyFailure::Read)?;
+    if body.len() as u64 > cap {
+        return Err(SuccessBodyFailure::TooLarge);
+    }
+    Ok(body)
+}
+
+/// (AW-11) Read at most `max_bytes` of `response`'s body, stopping there; a
+/// caller that wants to know whether more was sent asks for one byte beyond
+/// its limit. `deadline` is the attempt's, taken before the request was sent
+/// (`timeout` names it in the error): `reqwest`'s own timeout applies to each
+/// read separately, so without it a server sending a byte at a time could
+/// hold the embedder for as long as it kept sending. Headers and body share
+/// the one timeout, so an attempt lasts at most about twice `timeout`
+/// (estimated: the read under way when the deadline passes may wait a full
+/// timeout of its own), as it did when the body was read with `bytes()`.
+fn read_capped_body(
+    response: &mut reqwest::blocking::Response,
+    max_bytes: u64,
+    deadline: Option<std::time::Instant>,
+    timeout: Duration,
+) -> std::result::Result<Vec<u8>, BodyReadFailure> {
+    use std::io::Read;
+    let mut limited = response.take(max_bytes);
+    let mut body = Vec::new();
+    let mut chunk = vec![0u8; RESPONSE_READ_CHUNK];
+    loop {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(BodyReadFailure {
+                error: anyhow::anyhow!(
+                    "failed to read embedding response body: timed out, the answer took longer \
+                     than the {timeout:?} request timeout"
+                ),
+                timed_out: true,
+            });
+        }
+        match limited.read(&mut chunk) {
+            Ok(0) => return Ok(body),
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(body_read_failure(error)),
+        }
+    }
+}
+
+/// A failed read of a response body, worded as `bytes()` worded it. A read
+/// through `reqwest`'s `Read` fails with the `reqwest::Error` inside an
+/// `io::Error`; it is taken out so that its URL can be dropped and its timeout
+/// seen.
+fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
+    let kind_timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<reqwest::Error>())
+    {
+        let inner = *error
+            .into_inner()
+            .expect("get_ref was Some")
+            .downcast::<reqwest::Error>()
+            .expect("is::<reqwest::Error>() was true");
+        let timed_out = kind_timed_out || inner.is_timeout();
+        return BodyReadFailure {
+            error: anyhow::anyhow!(
+                "failed to read embedding response body: {}",
+                inner.without_url()
+            ),
+            timed_out,
+        };
+    }
+    BodyReadFailure {
+        error: anyhow::anyhow!("failed to read embedding response body: {error}"),
+        timed_out: kind_timed_out,
+    }
 }
 
 fn escaped_body_snippet(body: &[u8]) -> String {
@@ -1360,7 +1553,9 @@ mod tests {
                 let data: Vec<serde_json::Value> = (0..input_count)
                     .map(|index| {
                         serde_json::json!({
-                            "embedding": vec![index as f32; dimension],
+                            "embedding": (0..dimension)
+                                .map(|d| if d == 0 { 1.0 } else { index as f32 + 1.0 })
+                                .collect::<Vec<f32>>(),
                             "index": index,
                         })
                     })
@@ -1563,7 +1758,7 @@ mod tests {
         let vectors = embedder
             .embed_texts(&["first", "second"])
             .expect("embed batch");
-        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        assert_eq!(vectors, vec![vec![0.4472136, 0.8944272], vec![0.6, 0.8]]);
         let request = captured.recv().expect("captured request");
         let request_lower = request.to_ascii_lowercase();
         assert!(request_lower.starts_with("post /v1/embeddings http/1.1"));
@@ -1608,9 +1803,9 @@ mod tests {
 
         let vectors = embedder.embed_texts(&refs).expect("embed large batch");
         assert_eq!(vectors.len(), 129);
-        assert_eq!(vectors[63], vec![63.0, 63.0]);
-        assert_eq!(vectors[64], vec![0.0, 0.0]);
-        assert_eq!(vectors[128], vec![0.0, 0.0]);
+        assert_eq!(vectors[63], vec![0.015623093, 0.9998779]);
+        assert_eq!(vectors[64], vec![0.70710677, 0.70710677]);
+        assert_eq!(vectors[128], vec![0.70710677, 0.70710677]);
 
         let batch_sizes: Vec<usize> = (0..3)
             .map(|_| {
@@ -1662,7 +1857,7 @@ mod tests {
         let vectors = embedder
             .embed_queries(&["first", "second"])
             .expect("embed query batch");
-        assert_eq!(vectors, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        assert_eq!(vectors, vec![vec![0.4472136, 0.8944272], vec![0.6, 0.8]]);
         let request = captured.recv().expect("captured request");
         let (_, body) = request.split_once("\r\n\r\n").expect("HTTP body");
         let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
@@ -1775,6 +1970,334 @@ mod tests {
         let snippet = escaped_body_snippet(&long);
         assert_eq!(snippet.len(), MAX_HTTP_ERROR_BODY_BYTES + 3);
         assert!(snippet.ends_with("..."));
+    }
+
+    /// AW-11: the response cap is wide enough for the widest answer a real
+    /// server plausibly sends -- Python's `json.dumps(..., indent=4)` of floats
+    /// widened to f64, each printed with 17 significant digits and an exponent
+    /// -- for the largest batch at a large dimension, and it neither overflows
+    /// nor grows past its ceiling.
+    ///
+    /// Red if the per-float allowance drops to 32, if the input count is left
+    /// out of the product, if the arithmetic stops saturating (it panics), or
+    /// if the ceiling is not applied.
+    #[test]
+    fn embedding_response_cap_covers_pretty_printed_worst_case_floats() {
+        let (inputs, dimension) = (OPENAI_COMPATIBLE_BATCH_SIZE, 3072);
+        let values = vec!["                -1.2345678918743134e-05"; dimension].join(",\n");
+        let data: Vec<String> = (0..inputs)
+            .map(|index| {
+                format!(
+                    "        {{\n            \"object\": \"embedding\",\n            \
+                     \"index\": {index},\n            \"embedding\": [\n{values}\n            \
+                     ]\n        }}"
+                )
+            })
+            .collect();
+        let body = format!(
+            "{{\n    \"object\": \"list\",\n    \"data\": [\n{}\n    ],\n    \"model\": \"{}\",\n    \
+             \"usage\": {{\n        \"prompt_tokens\": 8191000,\n        \
+             \"total_tokens\": 8191000\n    }}\n}}",
+            data.join(",\n"),
+            "m".repeat(256)
+        );
+        let cap = max_embedding_response_bytes(inputs, dimension);
+        assert!(body.len() as u64 <= cap, "{} bytes > cap {cap}", body.len());
+        // The body is an answer groove accepts, not only a byte count.
+        let vectors = parse_embedding_response(body.as_bytes(), inputs, dimension)
+            .expect("the worst-case body parses");
+        assert_eq!(vectors.len(), inputs);
+
+        assert_eq!(max_embedding_response_bytes(64, 1024), 4_292_608);
+        assert_eq!(max_embedding_response_bytes(1, 16), 67_072);
+        // Past the ceiling the cap stops growing, and one byte beyond it still
+        // fits in a u64: a saturated cap would never see that byte arrive.
+        let ceiling = max_embedding_response_bytes(usize::MAX, usize::MAX);
+        assert_eq!(ceiling, MAX_EMBEDDING_RESPONSE_BYTES_CEILING);
+        assert!(ceiling.checked_add(1).is_some());
+    }
+
+    /// AW-11: the cap is inclusive. A 2xx of exactly `cap` bytes is read whole,
+    /// its `Content-Length` (equal to the cap) passing the check made before
+    /// reading; one byte more is refused.
+    ///
+    /// Red if either comparison against the cap becomes `>=`.
+    #[test]
+    fn a_2xx_body_of_exactly_the_cap_is_read_and_one_byte_more_is_refused() {
+        let cap = 64u64;
+        let timeout = Duration::from_secs(5);
+        let response = |len: u64| -> reqwest::blocking::Response {
+            http::Response::new(vec![b' '; len as usize]).into()
+        };
+
+        let mut exact = response(cap);
+        assert_eq!(exact.content_length(), Some(cap));
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        match read_success_body(&mut exact, cap, deadline, timeout) {
+            Ok(body) => assert_eq!(body.len() as u64, cap),
+            Err(SuccessBodyFailure::TooLarge) => panic!("a body of exactly the cap was refused"),
+            Err(SuccessBodyFailure::Read(failure)) => panic!("{:#}", failure.error),
+        }
+
+        let mut over = response(cap + 1);
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        assert!(matches!(
+            read_success_body(&mut over, cap, deadline, timeout),
+            Err(SuccessBodyFailure::TooLarge)
+        ));
+    }
+
+    /// AW-11: a value too large for f32 is refused, never stored. serde_json
+    /// narrows an f64 to f32 without complaint, so `1e39` arrives as infinity
+    /// (pinned here, since the check exists because of it); `1e400` does not
+    /// fit f64 either and is already malformed JSON. Neither message carries
+    /// the body.
+    ///
+    /// Red if the finite check is removed.
+    #[test]
+    fn parse_embedding_response_rejects_non_finite_values() {
+        assert_eq!(
+            serde_json::from_str::<f32>("1e39").expect("1e39 reads as f32"),
+            f32::INFINITY
+        );
+        let sentinel = "SENTINEL-AW11-3f9a";
+        for value in ["1e39", "-1e39"] {
+            let body = format!(
+                r#"{{"data":[{{"embedding":[1.0,2.0],"index":0}},{{"embedding":[{value},0.0],"index":1}}],"model":"{sentinel}"}}"#
+            );
+            let err = parse_embedding_response(body.as_bytes(), 2, 2).expect_err(value);
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("embedding endpoint returned a non-finite value at index 1"),
+                "{value}: {text}"
+            );
+            assert!(!text.contains(sentinel), "{text}");
+        }
+        let body =
+            format!(r#"{{"data":[{{"embedding":[1e400,0.0],"index":0}}],"model":"{sentinel}"}}"#);
+        let err = parse_embedding_response(body.as_bytes(), 1, 2).expect_err("1e400");
+        let text = format!("{err:#}");
+        assert!(text.contains("malformed JSON"), "{text}");
+        assert!(!text.contains(sentinel), "{text}");
+    }
+
+    /// AW-11: a vector of zeros has no direction, so no distance to it means
+    /// anything. `1e-50` is not zero in the JSON but becomes zero as f32.
+    ///
+    /// Red if the zero check is removed (the vector would come back as NaN).
+    #[test]
+    fn parse_embedding_response_rejects_an_all_zero_vector() {
+        for zeros in ["0.0,0.0", "1e-50,0"] {
+            let body = format!(
+                r#"{{"data":[{{"embedding":[1.0,2.0],"index":0}},{{"embedding":[{zeros}],"index":1}}]}}"#
+            );
+            let err = parse_embedding_response(body.as_bytes(), 2, 2).expect_err(zeros);
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(
+                    "embedding endpoint returned an all-zero vector at index 1; \
+                     it has no direction to compare"
+                ),
+                "{zeros}: {text}"
+            );
+        }
+    }
+
+    /// AW-12: every vector an endpoint returns is stored at unit length, as
+    /// FastEmbed's are, whatever its scale. The squares are summed in f64: in
+    /// f32, `1e30` squared is infinity and `1e-30` squared is zero.
+    ///
+    /// Red if the scaling is removed, or if the sum is taken in f32.
+    #[test]
+    fn parse_embedding_response_scales_vectors_to_unit_length() {
+        let body = br#"{"data":[{"embedding":[3.0,4.0],"index":0},{"embedding":[1e30,1e30],"index":1},{"embedding":[1e-30,1e-30],"index":2}]}"#;
+        let vectors = parse_embedding_response(body, 3, 2).expect("scaled vectors");
+        let expected = [
+            [0.6, 0.8],
+            [0.70710677, 0.70710677],
+            [0.70710677, 0.70710677],
+        ];
+        for (vector, expected) in vectors.iter().zip(expected) {
+            assert!(
+                vector
+                    .iter()
+                    .zip(expected)
+                    .all(|(got, want)| (got - want).abs() < 1e-6),
+                "{vectors:?}"
+            );
+        }
+    }
+
+    /// AW-12: the query side is scaled too. A query compared against unit
+    /// document vectors must be a unit vector itself.
+    ///
+    /// Red if the scaling runs for document embeds only.
+    #[test]
+    fn openai_compatible_normalizes_query_vectors_too() {
+        let response = r#"{"data":[{"embedding":[3.0,4.0],"index":0}]}"#;
+        let (endpoint, _captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+        assert_eq!(
+            embedder.embed_single("needle").expect("embed query"),
+            vec![0.6, 0.8]
+        );
+        handle.join().expect("mock server thread");
+
+        let response =
+            r#"{"data":[{"embedding":[3.0,4.0],"index":0},{"embedding":[30.0,40.0],"index":1}]}"#;
+        let (endpoint, _captured, handle) =
+            mock_embedding_server("200 OK", response, Duration::ZERO);
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_secs(1)),
+        ))
+        .expect("build embedder");
+        assert_eq!(
+            embedder
+                .embed_queries(&["first", "second"])
+                .expect("embed queries"),
+            vec![vec![0.6, 0.8], vec![0.6, 0.8]]
+        );
+        handle.join().expect("mock server thread");
+    }
+
+    /// AW-12: the scaling belongs to the OpenAI-compatible provider alone.
+    /// FastEmbed already returns unit vectors, and scaling them again in the
+    /// [`Embedder`] would change their last bits; a provider's vectors pass
+    /// through the wrapper exactly as the provider returned them.
+    ///
+    /// Red if the scaling moves into the [`Embedder`] wrapper.
+    #[test]
+    fn embedder_leaves_a_provider_vector_as_the_provider_returned_it() {
+        let settings = EmbeddingSettings::fastembed(ModelChoice::BgeSmallEnV15);
+        let mut embedder =
+            Embedder::from_provider(Box::new(StubProvider), settings.identity.clone());
+        assert_eq!(
+            embedder.embed_texts(&["one"]).expect("embed document"),
+            vec![vec![1.0, 2.0]]
+        );
+        assert_eq!(
+            embedder.embed_single("query").expect("embed query"),
+            vec![3.0, 4.0]
+        );
+    }
+
+    /// AW-11: the request timeout bounds the whole body, not each read. A
+    /// server trickling a valid answer a few bytes at a time, each read inside
+    /// the timeout, must not hold the embedder for longer.
+    ///
+    /// Red if the whole-body deadline is dropped: every read succeeds, and the
+    /// answer arrives whole after many times the timeout.
+    #[test]
+    fn openai_compatible_bounds_the_whole_body_read_by_the_timeout() {
+        let timeout = Duration::from_secs(1);
+        let body = r#"{"data":[{"embedding":[3.0,4.0],"index":0}]}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind trickling server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("listener address")
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_http_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for piece in body.as_bytes().chunks(2) {
+                thread::sleep(timeout / 2);
+                if stream
+                    .write_all(piece)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, timeout),
+        ))
+        .expect("build embedder");
+        let started = std::time::Instant::now();
+        let result = embedder.embed_single("needle");
+        let took = started.elapsed();
+        let err = result.expect_err("a body trickled past the timeout must fail");
+        let text = format!("{err:#}");
+        assert!(text.contains("timed out"), "{text}");
+        assert!(took < timeout * 3, "took {took:?}");
+        drop(embedder);
+        handle.join().expect("trickling server thread");
+    }
+
+    /// AW-11: one attempt shares a single timeout between waiting for the
+    /// headers and reading the body, so it stays within about twice the
+    /// timeout (the last read may wait a full one), as `bytes()` did. A body
+    /// deadline started only once the headers arrived would add the header
+    /// wait on top: up to about three times.
+    ///
+    /// The server holds the headers for 0.6 T, then sends two bytes at
+    /// 0.85 T, 1.35 T, 1.85 T, ... (every T / 2, a quarter of a period off the
+    /// deadlines so that no chunk lands on one). With the deadline taken
+    /// before the request, it passes at 1 T and the read returning at 1.35 T
+    /// ends the attempt; started after the headers, it passes at 1.6 T and
+    /// the attempt ends at 1.85 T. The bound, 1.6 T, sits half a second (at
+    /// T = 2 s) from both, which a loaded CI runner on any OS should not
+    /// cross. T is 2 s rather than 1 s to buy that margin; the header wait,
+    /// 1.2 s, stays 0.8 s inside the timeout `send` applies.
+    ///
+    /// Red if the body deadline is taken after `send` returns.
+    #[test]
+    fn openai_compatible_counts_the_header_wait_against_the_body_deadline() {
+        let timeout = Duration::from_secs(2);
+        let body = r#"{"data":[{"embedding":[3.0,4.0],"index":0}]}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("listener address")
+        );
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let _request = read_http_request(&mut stream);
+            thread::sleep(timeout.mul_f64(0.6));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            thread::sleep(timeout / 4);
+            for piece in body.as_bytes().chunks(2) {
+                if stream
+                    .write_all(piece)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+                thread::sleep(timeout / 2);
+            }
+        });
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, timeout),
+        ))
+        .expect("build embedder");
+        let started = std::time::Instant::now();
+        let result = embedder.embed_single("needle");
+        let took = started.elapsed();
+        let err = result.expect_err("a body trickled past the timeout must fail");
+        let text = format!("{err:#}");
+        assert!(text.contains("timed out"), "{text}");
+        assert!(took < timeout.mul_f64(1.6), "took {took:?}");
+        drop(embedder);
+        handle.join().expect("slow server thread");
     }
 
     #[test]

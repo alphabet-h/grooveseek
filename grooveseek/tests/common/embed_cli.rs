@@ -11,7 +11,8 @@
 
 use super::ansi::strip_ansi;
 use super::embed_mock::{
-    EmbedMock, MockReply, MockResponse, Recorded, default_response, hermetic, openai_config_toml,
+    EmbedMock, Framing, MockReply, MockResponse, Recorded, default_response, hermetic,
+    openai_config_toml,
 };
 use super::mcp::grooveseek_bin;
 use super::temp::TempKbLayout;
@@ -204,6 +205,7 @@ pub fn reply(status: u16, headers: &[(&str, &str)]) -> MockReply {
             .collect(),
         stall_body: false,
         truncate_body: false,
+        framing: Framing::Exact,
     }
 }
 

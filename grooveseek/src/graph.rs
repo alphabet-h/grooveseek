@@ -320,12 +320,14 @@ pub struct ConnectionGraph {
 
 /// sqlite-vec の L2 distance を cos sim 近似値 (0-1) に変換する。
 ///
-/// BGE 系の embedding は内部で L2 正規化されているため、正規化ベクトル
+/// どの provider も単位ベクトルを格納する (FastEmbed は crate 内で、
+/// openai-compatible は groove が受信時に L2 正規化する — AW-12) ため、正規化ベクトル
 /// a, b 間の L2^2 と cos sim は `cos = 1 - l2^2 / 2` の関係にある。
 /// `search_vec_candidates` が返す `SearchResult.score` は
 /// `vec_chunks.v.distance` そのもの (L2 distance) なので、ここで近似変換する。
 ///
-/// 万が一正規化されていない embedding が入っていた場合も、近傍ランク付けには
+/// AW-12 より前の groove が、単位長でないベクトルを返す endpoint で作った index
+/// には正規化されていない embedding が入っている。その場合も近傍ランク付けには
 /// 使えるよう `0.0..=1.0` にクランプする (厳密性より安定性優先)。
 fn distance_to_cos_sim(distance: f32) -> f32 {
     let cos = 1.0 - (distance * distance) / 2.0;
