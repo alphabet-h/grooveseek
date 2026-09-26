@@ -901,7 +901,10 @@ fn dispatch_reindex(state: &WatcherState, rel: &str) {
             wdiag!("watcher: skipped {rel} ({reason})");
         }
         Err(e) => {
-            wdiag!("watcher: reindex {rel} failed: {e}");
+            wdiag!(
+                "watcher: reindex {rel} failed: {}",
+                crate::embedder::body_free_message(&e)
+            );
         }
     }
     sweep_legacy_row(&db, &state.kb_path, rel, true);
@@ -979,7 +982,10 @@ fn dispatch_rename(state: &WatcherState, old_rel: &str, new_rel: &str) {
                 "watcher: renamed {old_rel} -> {new_rel} (new path refused, content left as it was)"
             );
         }
-        Err(e) => wdiag!("watcher: rename {old_rel} -> {new_rel} failed: {e}"),
+        Err(e) => wdiag!(
+            "watcher: rename {old_rel} -> {new_rel} failed: {}",
+            crate::embedder::body_free_message(&e)
+        ),
     }
     // The file has left `old_rel` under every spelling; at `new_rel` the sweep
     // follows the real key in, as it does after a reindex.

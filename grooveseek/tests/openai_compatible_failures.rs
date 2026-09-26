@@ -1538,3 +1538,210 @@ fn search_orders_results_the_same_when_the_endpoint_returns_scaled_vectors() {
     assert_dir_empty(&unit.cache);
     assert_dir_empty(&scaled.cache);
 }
+
+const WATCH_TOML: &str = "\n[watch]\nenabled = true\ndebounce_ms = 300\n";
+
+/// Cut `fx`'s request timeout to one second, so a stalled body fails fast.
+fn one_second_timeout(fx: &common::embed_cli::Fixture) {
+    let config = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    assert!(config.contains("timeout_seconds = 15\n"), "{config}");
+    std::fs::write(
+        &fx.config,
+        config.replace("timeout_seconds = 15\n", "timeout_seconds = 1\n"),
+    )
+    .expect("write groove.toml");
+}
+
+/// A 2xx whose one vector is a string quoting [`BODY_SENTINEL`]:
+/// `serde_json`'s error names the value it could not read.
+fn malformed_answer(_: &Recorded) -> MockReply {
+    MockReply::plain(MockResponse {
+        status: 200,
+        body: format!(r#"{{"data":[{{"index":0,"embedding":"{BODY_SENTINEL}"}}]}}"#).into_bytes(),
+    })
+}
+
+/// A 2xx whose body never finishes.
+fn stalled_answer(req: &Recorded) -> MockReply {
+    let mut stalled = framed_default(req, Framing::Exact);
+    stalled.stall_body = true;
+    stalled
+}
+
+/// Start `groove serve` with the watcher, switch the endpoint to `answer`,
+/// create `fresh.md`, and return the watcher's `reindex fresh.md failed` line
+/// once it appears, after checking that no stderr line carries
+/// [`BODY_SENTINEL`]. The file is created, never renamed: macOS (FSEvents)
+/// does not always pair a rename.
+fn watcher_failure_line(
+    prefix: &str,
+    extra_toml: &str,
+    stall: bool,
+    answer: impl Fn(&Recorded) -> MockReply + Send + Sync + 'static,
+) -> String {
+    let notes = three_notes();
+    let fx = fixture(prefix, &files(&notes), &format!("{extra_toml}{WATCH_TOML}"));
+    if stall {
+        one_second_timeout(&fx);
+    }
+    fx.index();
+    let (guard, _base) = spawn_serve_with(fx.kb(), &fx.config, true, |c| {
+        hermetic(c, &fx.cache);
+    });
+    fx.answer_with(answer);
+    fx.layout.write(
+        "fresh.md",
+        &note("Fresh", "Brand new text about the tides."),
+    );
+    let lines = || -> Vec<String> {
+        guard
+            .stderr()
+            .lines()
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect()
+    };
+    let failed_prefix = "watcher: reindex fresh.md failed: ";
+    let failed = wait_until(Duration::from_secs(30), || {
+        lines().iter().any(|l| l.contains(failed_prefix))
+    });
+    fx.answer_normally();
+    let all = lines();
+    drop(guard);
+    assert!(
+        !all.iter().any(|l| l.contains("panicked")),
+        "{}",
+        all.join("\n")
+    );
+    assert!(failed, "no watcher failure line:\n{}", all.join("\n"));
+    assert!(
+        !all.iter().any(|l| l.contains(BODY_SENTINEL)),
+        "the response body reached stderr:\n{}",
+        all.join("\n")
+    );
+    assert_dir_empty(&fx.cache);
+    all.into_iter()
+        .find(|l| l.contains(failed_prefix))
+        .expect("the failure line was seen")
+}
+
+/// AW-16: the watcher names what failed when an indexing embed fails, down to
+/// the HTTP status, and still never prints the response body.
+///
+/// Red if the watcher prints the error's outermost message alone
+/// (`failed to embed chunks for fresh.md`), which never says why.
+#[test]
+fn the_watcher_names_a_401_without_the_response_body() {
+    let line = watcher_failure_line("groove-aw16-watch-401", "", false, |_| reply(401, &[]));
+    assert!(
+        line.contains("failed to embed chunks for fresh.md: embedding endpoint returned HTTP 401"),
+        "{line}"
+    );
+}
+
+/// AW-16: a 2xx whose JSON has the wrong shape is named as a malformed
+/// response, without the value `serde_json` would have quoted from it.
+///
+/// Red if the watcher prints the outermost message alone (no
+/// `malformed response`), or if the serde error's own text is joined in (the
+/// sentinel it quotes reaches stderr).
+#[test]
+fn the_watcher_names_a_malformed_answer_without_quoting_it() {
+    let line = watcher_failure_line("groove-aw16-watch-malformed", "", false, malformed_answer);
+    assert!(line.contains("malformed response"), "{line}");
+}
+
+/// AW-16: a 2xx whose body never arrives is named as a timeout.
+///
+/// Red if the watcher prints the outermost message alone, which does not say
+/// `timed out`.
+#[test]
+fn the_watcher_names_a_timed_out_answer() {
+    let line = watcher_failure_line(
+        "groove-aw16-watch-timeout",
+        "max_retries = 0\n",
+        true,
+        stalled_answer,
+    );
+    assert!(line.contains("timed out"), "{line}");
+}
+
+/// MCP `rebuild_index` (an edited `alpha.md`) and then `search`, both while
+/// the endpoint answers with `answer`. Returns the two replies.
+fn mcp_replies(
+    prefix: &str,
+    extra_toml: &str,
+    stall: bool,
+    answer: impl Fn(&Recorded) -> MockReply + Send + Sync + 'static,
+) -> (serde_json::Value, serde_json::Value) {
+    let notes = three_notes();
+    let fx = fixture(prefix, &files(&notes), extra_toml);
+    if stall {
+        one_second_timeout(&fx);
+    }
+    fx.index();
+    fx.layout
+        .write("alpha.md", &note("Alpha", &format!("{ALPHA} Edited.")));
+    let (guard, base) = spawn_serve_with(fx.kb(), &fx.config, false, |c| {
+        hermetic(c, &fx.cache);
+    });
+    let session = mcp_initialize(&base);
+    fx.answer_with(answer);
+    let rebuild = mcp_tool_call(&base, &session, "rebuild_index", serde_json::json!({}));
+    let search = mcp_tool_call(
+        &base,
+        &session,
+        "search",
+        serde_json::json!({"query": "lighthouse keeper ship"}),
+    );
+    fx.answer_normally();
+    drop(guard);
+    assert_dir_empty(&fx.cache);
+    (rebuild, search)
+}
+
+fn error_of(resp: &serde_json::Value) -> &str {
+    resp.get("error").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// AW-16: MCP `rebuild_index` and `search` name a malformed 2xx as such,
+/// without the value `serde_json` quotes from the body.
+///
+/// Red if `body_free_message` joins the serde error's text (the sentinel
+/// appears), or keeps only the outermost message (neither reply would say
+/// `malformed response`).
+#[test]
+fn mcp_names_a_malformed_answer_without_quoting_it() {
+    let (rebuild, search) = mcp_replies("groove-aw16-mcp-malformed", "", false, malformed_answer);
+    assert!(
+        error_of(&rebuild).contains("failed to embed chunks for alpha.md: ")
+            && error_of(&rebuild).contains("malformed response"),
+        "{rebuild}"
+    );
+    assert!(error_of(&search).contains("malformed response"), "{search}");
+    assert!(!rebuild.to_string().contains(BODY_SENTINEL), "{rebuild}");
+    assert!(!search.to_string().contains(BODY_SENTINEL), "{search}");
+}
+
+/// AW-16: MCP `rebuild_index` and `search` name a 2xx whose body never
+/// arrives as a timeout.
+///
+/// Red if `rebuild_index` keeps only the outermost message
+/// (`failed to embed chunks for alpha.md`).
+#[test]
+fn mcp_names_a_timed_out_answer() {
+    let (rebuild, search) = mcp_replies(
+        "groove-aw16-mcp-timeout",
+        "max_retries = 0\n",
+        true,
+        stalled_answer,
+    );
+    assert!(
+        error_of(&rebuild).contains("failed to embed chunks for alpha.md: ")
+            && error_of(&rebuild).contains("timed out"),
+        "{rebuild}"
+    );
+    assert!(error_of(&search).contains("timed out"), "{search}");
+    assert!(!rebuild.to_string().contains(BODY_SENTINEL), "{rebuild}");
+    assert!(!search.to_string().contains(BODY_SENTINEL), "{search}");
+}

@@ -402,28 +402,38 @@ impl fmt::Display for EmbedHttpStatus {
 impl std::error::Error for EmbedHttpStatus {}
 
 /// An embedding error worded for a caller who must not see the endpoint's
-/// response body -- an MCP client (ADR-0025). When a non-2xx answer
-/// ([`EmbedInputRejected`] or any other status) is anywhere in the chain, the
-/// result is every message above it -- contexts groove wrote itself, such as
-/// the indexer's `failed to embed chunks for <path>` or the retry loop's
-/// give-up line -- followed by that status alone, so the answer's text (which
-/// carries the body) is never used. Without one, it is the outermost message,
-/// also groove's own (a timeout, a malformed answer): `anyhow::Error`'s
-/// `Display` never prints the causes underneath.
+/// response body -- an MCP client and the watcher's log (ADR-0025). Every
+/// message in the chain is kept, joined with `: `, so the cause shows under
+/// contexts such as the indexer's `failed to embed chunks for <path>` (AW-16).
+/// Two kinds of layer carry the body and are cut short, ending the message:
+/// a non-2xx answer ([`EmbedInputRejected`] or any other status) becomes its
+/// status alone, and a `serde_json` error, which quotes the value it could not
+/// read, becomes `malformed response (<category>)`. Every other layer is
+/// groove's own wording or a transport error, which has no body to carry.
 pub(crate) fn body_free_message(error: &anyhow::Error) -> String {
-    let mut above = Vec::new();
+    let mut layers = Vec::new();
     for cause in error.chain() {
         let status = cause
             .downcast_ref::<EmbedInputRejected>()
             .map(|r| r.status)
             .or_else(|| cause.downcast_ref::<EmbedHttpStatus>().map(|s| s.status));
         if let Some(status) = status {
-            above.push(format!("embedding endpoint returned HTTP {status}"));
-            return above.join(": ");
+            layers.push(format!("embedding endpoint returned HTTP {status}"));
+            break;
         }
-        above.push(cause.to_string());
+        if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
+            let category = match json.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            layers.push(format!("malformed response ({category})"));
+            break;
+        }
+        layers.push(cause.to_string());
     }
-    error.to_string()
+    layers.join(": ")
 }
 
 /// (AW-04) Context on an [`EmbedInputRejected`] that came after the endpoint had
@@ -656,7 +666,8 @@ impl OpenAiCompatibleProvider {
                 } else {
                     None
                 };
-                let error = anyhow::anyhow!("embedding request failed: {}", error.without_url());
+                let error =
+                    anyhow::anyhow!("embedding request failed: {}", transport_message(error));
                 return Err(match last {
                     Some(last) => AttemptFailure::Retryable {
                         error,
@@ -993,7 +1004,7 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
         return BodyReadFailure {
             error: anyhow::anyhow!(
                 "failed to read embedding response body: {}",
-                inner.without_url()
+                transport_message(inner)
             ),
             timed_out,
         };
@@ -1002,6 +1013,25 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
         error: anyhow::anyhow!("failed to read embedding response body: {error}"),
         timed_out: kind_timed_out,
     }
+}
+
+/// (AW-16) A `reqwest` error without its URL, followed by its causes joined
+/// with `: `: its `Display` alone (`error sending request`) does not tell a
+/// timeout from a refused connection. A nested `reqwest::Error` ends the
+/// list, since its `Display` could name the URL again.
+fn transport_message(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        if cause.is::<reqwest::Error>() {
+            break;
+        }
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn escaped_body_snippet(body: &[u8]) -> String {
@@ -1227,9 +1257,9 @@ impl Embedder {
     /// runs this before its reset and returns on failure.
     ///
     /// That sentence is context and the provider's error stays its source:
-    /// the CLI prints the whole chain, HTTP status included, while the MCP
-    /// `rebuild_index {force: true}` reply shows the outermost message only,
-    /// so the endpoint's response body does not reach an MCP caller.
+    /// the CLI prints the whole chain, response body snippet included, while
+    /// the MCP `rebuild_index {force: true}` reply goes through
+    /// [`body_free_message`], which keeps the chain but not the body.
     pub fn probe_before_reset(&mut self) -> Result<()> {
         self.provider.probe().context(
             "the embedding endpoint check before the forced rebuild failed, \
@@ -3255,5 +3285,81 @@ mod tests {
              attempts (last: HTTP 503): embedding endpoint returned HTTP 503"
         );
         assert!(!message.contains(secret), "{message}");
+    }
+
+    /// (AW-16) A 2xx whose JSON has the wrong shape is named by the kind of
+    /// fault only: `serde_json` quotes the offending value, and that value is
+    /// the endpoint's response body.
+    ///
+    /// Red if the serde layer's own text is joined into the message: the
+    /// sentinel the body carries would be quoted in it.
+    #[test]
+    fn body_free_message_names_a_malformed_answer_without_quoting_it() {
+        let secret = "SECRET-BODY";
+        let body = format!(r#"{{"data":[{{"index":0,"embedding":"{secret}"}}]}}"#);
+        let error = parse_embedding_response(body.as_bytes(), 1, 2)
+            .expect_err("a string where the vector should be")
+            .context("failed to embed chunks for note.md");
+        assert!(
+            format!("{error:#}").contains(secret),
+            "the CLI keeps serde's text: {error:#}"
+        );
+        let message = body_free_message(&error);
+        assert_eq!(
+            message,
+            "failed to embed chunks for note.md: embedding endpoint returned malformed JSON: \
+             malformed response (data)"
+        );
+        assert!(!message.contains(secret), "{message}");
+    }
+
+    /// (AW-16) Without a status or a serde error in the chain, every layer is
+    /// groove's own wording, and all of them are kept: the outermost alone
+    /// (`failed to embed chunks for <path>`) never says what went wrong.
+    #[test]
+    fn body_free_message_joins_every_layer_of_a_chain_without_a_status() {
+        let error = anyhow::anyhow!("failed to read embedding response body: timed out")
+            .context("failed to embed chunks for note.md");
+        assert_eq!(
+            body_free_message(&error),
+            "failed to embed chunks for note.md: failed to read embedding response body: \
+             timed out"
+        );
+    }
+
+    /// (AW-16) A request that never got an answer keeps what `reqwest` said
+    /// caused it, still without the URL: `error sending request` alone does
+    /// not tell a timeout from a refused connection.
+    ///
+    /// Red if the transport error is built from the `reqwest::Error`'s
+    /// `Display` alone, which never prints its source.
+    #[test]
+    fn a_transport_error_names_its_cause_without_the_url() {
+        let (endpoint, _captured, handle) = mock_embedding_server(
+            "200 OK",
+            r#"{"data":[{"embedding":[1.0,2.0],"index":0}]}"#,
+            Duration::from_millis(200),
+        );
+        let host = endpoint
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("host:port")
+            .to_string();
+        let mut embedder = Embedder::with_settings(EmbeddingSettings::openai_compatible(
+            openai_config(endpoint, 2, Duration::from_millis(10)),
+        ))
+        .expect("build embedder");
+        let err = embedder
+            .embed_single("needle")
+            .expect_err("request must time out");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("embedding request failed: error sending request: "),
+            "{chain}"
+        );
+        assert!(chain.contains("timed out"), "{chain}");
+        assert!(!chain.contains(&host), "the URL leaked: {chain}");
+        handle.join().expect("mock server thread");
     }
 }
