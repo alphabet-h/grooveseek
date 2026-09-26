@@ -223,6 +223,33 @@ Do not reach for `format-local` here: it renders in the *reader's* timezone, so 
   existing databases alike: on a synthetic 300,000-chunk index the first open
   spent about 6 s building it, once, and the check then takes about 1 ms
   instead of about 5 s. (#326)
+- **An embedding endpoint's answer is read only up to a limit, and a value
+  that is not a number stops the run.** With `provider = "openai-compatible"`
+  every response body was read whole, however large, before anything looked
+  at it. A 2xx is now read up to `inputs × (dimension × 64 + 512) + 64 KiB`
+  (about 4.1 MiB for a full batch of 64 at dimension 1024); a
+  `Content-Length` over that is refused before anything is read, and a longer
+  answer stops the run with a message that points at `[embedding].dimension`,
+  since a server returning far more dimensions than configured is the likely
+  cause. It is not retried: the same inputs would bring the same answer. Any
+  other status is read only as far as the 512 bytes its error message shows.
+  The request timeout now bounds the body as a whole, not each read of it, so
+  a server sending a few bytes at a time can no longer hold the run beyond
+  about twice the timeout; a body that times out is still retried. A vector
+  holding a value too large for a 32-bit float (which reads as infinity) or
+  holding only zeros now stops the run instead of reaching the index.
+- **Vectors from an OpenAI-compatible endpoint are stored at unit length.**
+  They were stored as the endpoint sent them, while the index's L2 distances,
+  `groove graph`'s `1 - d²/2` similarity and its default `min_similarity` of
+  0.3 all assume unit vectors, as FastEmbed's are. Against an endpoint that
+  does not normalise, `groove graph` could find no neighbours at all and
+  search ranked by vector length as much as by meaning. Document vectors,
+  query vectors and the `--force` probe are now scaled to unit length as they
+  arrive; FastEmbed's vectors are untouched. The index identity is unchanged,
+  so an existing index is not rebuilt for you: **if your endpoint returned
+  vectors that were not unit length, rebuild with `groove index --force`, and
+  if you are not sure, rebuild.** An endpoint that already normalises gets the
+  same vectors to within rounding and needs no rebuild.
 
 ## [1.13.0] - 2026-09-23
 
