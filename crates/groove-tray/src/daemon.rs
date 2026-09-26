@@ -245,9 +245,17 @@ fn probe_liveness(authority: &str) -> Liveness {
     }
 }
 
-fn status_client() -> Result<reqwest::Client> {
+/// The one HTTP client the tray talks to its daemon with, for the stop probe
+/// here and the status polling in [`crate::poll`].
+///
+/// Every admin URL is loopback ([`crate::config`] rebuilds it as `127.0.0.1`,
+/// `[::1]` or `localhost`), so the client never uses a proxy (AW-13): a proxy
+/// from the environment or the OS settings would otherwise receive, or block,
+/// `/api/admin/status`.
+pub(crate) fn status_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
+        .no_proxy()
         .build()
         .context("build status http client")
 }
@@ -456,6 +464,172 @@ mod tests {
             .expect("stopping an already-stopped daemon must succeed");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set on the child [`probe_daemon_ignores_the_proxy_environment`] starts,
+    /// so the child runs the probe instead of starting another child.
+    const PROXY_CHILD: &str = "GROOVE_TRAY_AW13_PROXY_CHILD";
+    /// Set by the parent to the same value as [`PROXY_CHILD`]. A marker that
+    /// leaked in from the runner has no matching nonce, so the child refuses
+    /// to run instead of passing without the proxy setup.
+    const PROXY_NONCE: &str = "GROOVE_TRAY_AW13_PROXY_NONCE";
+    /// The proxy variables the parent points at the stand-in proxy.
+    const PROXY_VARS: [&str; 6] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+
+    /// AW-13: the admin probe reaches a loopback daemon directly, even when
+    /// every proxy variable names a proxy and `NO_PROXY` is unset.
+    ///
+    /// The proxy variables have to be in the environment before the client is
+    /// built, and a test cannot change its own process's environment while
+    /// others run beside it, so the parent re-runs this test in a child of
+    /// this test binary with them set. The parent holds the stand-in proxy
+    /// (it accepts, counts and drops); the child serves a status answer on
+    /// loopback and probes it.
+    ///
+    /// Red if [`status_client`] stops calling `no_proxy()`: the probe then
+    /// goes to the proxy, which drops it, so the child sees no pid.
+    #[test]
+    fn probe_daemon_ignores_the_proxy_environment() {
+        if std::env::var_os(PROXY_CHILD).is_some() {
+            assert_proxy_child_setup();
+            probe_through_proxy_environment_in_child();
+            return;
+        }
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        proxy.set_nonblocking(true).expect("non-blocking proxy");
+        let proxy_url = format!("http://{}", proxy.local_addr().expect("proxy addr"));
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let counter = {
+            let (accepted, stop) = (accepted.clone(), stop.clone());
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                while !stop.load(Ordering::SeqCst) {
+                    match proxy.accept() {
+                        Ok((stream, _)) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            drop(stream);
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        cmd.args([
+            "daemon::tests::probe_daemon_ignores_the_proxy_environment",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROXY_CHILD, &nonce)
+        .env(PROXY_NONCE, &nonce)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+        for var in PROXY_VARS {
+            cmd.env(var, &proxy_url);
+        }
+        let out = cmd.output().expect("run the test in a child");
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        counter.join().expect("proxy thread");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the proxy saw a connection meant for the loopback daemon:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            out.status.success(),
+            "the probe failed in the child:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child ran no test:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// Panic unless this process is the child the parent set up: the marker
+    /// matches the nonce, every proxy variable is set and `NO_PROXY` is not.
+    /// Without this a marker leaked from the runner would run the probe with
+    /// no proxy anywhere and pass without testing anything.
+    fn assert_proxy_child_setup() {
+        let marker = std::env::var(PROXY_CHILD).unwrap_or_default();
+        let nonce = std::env::var(PROXY_NONCE).unwrap_or_default();
+        assert!(
+            !marker.is_empty() && marker == nonce,
+            "{PROXY_CHILD} is set but does not match {PROXY_NONCE}: not started by the parent \
+             test (leaked from the environment?)"
+        );
+        for var in PROXY_VARS {
+            assert!(
+                std::env::var_os(var).is_some_and(|v| !v.is_empty()),
+                "{var} is not set in the child: the proxy setup did not happen"
+            );
+        }
+        for var in ["NO_PROXY", "no_proxy"] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} is set in the child: it could exempt loopback and hide the bug"
+            );
+        }
+    }
+
+    /// The child side: answer one status request on loopback with a pid, and
+    /// require [`probe_daemon`] to read it.
+    fn probe_through_proxy_environment_in_child() {
+        use std::io::{Read, Write};
+        let daemon = std::net::TcpListener::bind("127.0.0.1:0").expect("bind daemon");
+        let status_url = format!(
+            "http://{}/api/admin/status",
+            daemon.local_addr().expect("daemon addr")
+        );
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = daemon.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let body = r#"{"daemon":{"pid":4242}}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.block_on(probe_daemon(&status_url)),
+            DaemonProbe::Pid(4242),
+            "the probe did not reach the loopback daemon"
+        );
     }
 
     fn scratch_dir(prefix: &str) -> std::path::PathBuf {

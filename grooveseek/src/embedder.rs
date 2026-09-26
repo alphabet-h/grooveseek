@@ -158,6 +158,8 @@ pub struct OpenAiCompatibleConfig {
     max_input_chars: Option<usize>,
     /// How many times one batch is sent again after a transient failure.
     max_retries: u32,
+    /// (AW-13) The endpoint is on this machine, so the client skips any proxy.
+    endpoint_is_loopback: bool,
 }
 
 impl fmt::Debug for OpenAiCompatibleConfig {
@@ -172,6 +174,7 @@ impl fmt::Debug for OpenAiCompatibleConfig {
             .field("timeout", &self.timeout)
             .field("max_input_chars", &self.max_input_chars)
             .field("max_retries", &self.max_retries)
+            .field("endpoint_is_loopback", &self.endpoint_is_loopback)
             .finish()
     }
 }
@@ -202,6 +205,7 @@ impl OpenAiCompatibleConfig {
         );
         let endpoint_display =
             format!("{}{}", parsed.origin().ascii_serialization(), parsed.path());
+        let loopback = endpoint_is_loopback(&parsed);
         anyhow::ensure!(
             !query_model.trim().is_empty() && !document_model.trim().is_empty(),
             "[embedding] requires `model`, or both `query_model` and `document_model`, \
@@ -241,6 +245,7 @@ impl OpenAiCompatibleConfig {
             index_model_id,
             max_input_chars: None,
             max_retries: 0,
+            endpoint_is_loopback: loopback,
         })
     }
 
@@ -524,6 +529,28 @@ fn jitter_from_clock(base: Duration) -> Duration {
     Duration::from_nanos(u64::try_from(jitter).unwrap_or(u64::MAX))
 }
 
+/// (AW-13) Whether `url` names this machine: 127.0.0.0/8, `::1` (also as
+/// `::ffff:127.x.y.z`) or `localhost`. Such an endpoint is contacted directly,
+/// because a proxy set for the outside world would otherwise receive the
+/// document text and the API key meant for a local server.
+///
+/// The decision itself is the crate's one loopback-host predicate,
+/// [`crate::transport::http::is_loopback_host`].
+fn endpoint_is_loopback(url: &reqwest::Url) -> bool {
+    use crate::transport::http::{is_loopback_host, normalize_host};
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // A trailing dot is the fully qualified spelling of the same name, and the
+    // resolver sends `localhost.` to this machine as well. The dot is dropped
+    // here rather than in the shared predicate: its other callers judge
+    // `Host` / `Origin` allow-list entries, which the HTTP gate compares
+    // verbatim, so `localhost.` there does not admit a browser on
+    // `localhost` and must not count as local.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    is_loopback_host(&normalize_host(host))
+}
+
 impl OpenAiCompatibleProvider {
     fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
         eprintln!(
@@ -538,10 +565,15 @@ impl OpenAiCompatibleProvider {
 
     fn client(&mut self) -> Result<&reqwest::blocking::Client> {
         if self.client.is_none() {
+            let mut builder = reqwest::blocking::Client::builder()
+                .timeout(self.config.timeout)
+                .redirect(reqwest::redirect::Policy::none());
+            if self.config.endpoint_is_loopback {
+                // Drops both the proxy environment variables and the OS proxy.
+                builder = builder.no_proxy();
+            }
             self.client = Some(
-                reqwest::blocking::Client::builder()
-                    .timeout(self.config.timeout)
-                    .redirect(reqwest::redirect::Policy::none())
+                builder
                     .build()
                     .context("failed to build OpenAI-compatible embedding client")?,
             );
@@ -1837,6 +1869,42 @@ mod tests {
         assert!(debug.contains("http://127.0.0.1:8001/v1/embeddings"));
         assert!(!debug.contains("token=secret"));
         assert!(!debug.contains("fragment"));
+    }
+
+    /// AW-13: only a loopback endpoint skips the proxy. A name that merely
+    /// starts with `localhost` or `127.0.0.1` resolves elsewhere, so it keeps
+    /// whatever proxy the environment sets.
+    #[test]
+    fn endpoint_is_loopback_accepts_only_loopback_hosts() {
+        for endpoint in [
+            "http://127.0.0.1:8001/v1/embeddings",
+            "http://127.1.2.3/v1/embeddings",
+            "https://127.255.255.254/",
+            "http://[::1]:8001/v1/embeddings",
+            "http://[::ffff:127.0.0.1]:8001/",
+            "http://localhost:8001/v1/embeddings",
+            "http://LocalHost/v1/embeddings",
+            "http://localhost.:8001/",
+        ] {
+            let url = reqwest::Url::parse(endpoint).expect("valid url");
+            assert!(endpoint_is_loopback(&url), "{endpoint} must be loopback");
+        }
+        for endpoint in [
+            "http://localhost.example.com/v1/embeddings",
+            "http://127.0.0.1.nip.io/v1/embeddings",
+            "http://10.0.0.1:8001/v1/embeddings",
+            "http://128.0.0.1/",
+            "http://[::2]/",
+            "http://[::ffff:10.0.0.1]/",
+            "https://example.com/v1/embeddings",
+            "http://mylocalhost/",
+        ] {
+            let url = reqwest::Url::parse(endpoint).expect("valid url");
+            assert!(
+                !endpoint_is_loopback(&url),
+                "{endpoint} must not be loopback"
+            );
+        }
     }
 
     fn openai_config_for_endpoint(endpoint: &str) -> Result<OpenAiCompatibleConfig> {

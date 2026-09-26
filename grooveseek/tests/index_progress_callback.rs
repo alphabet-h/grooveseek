@@ -14,12 +14,12 @@
 //! `#[ignore]`d.
 //!
 //! Each test runs its body in a child of this test binary, through
-//! [`crate::run_in_hermetic_child`]. The provider's HTTP client takes its proxy from
-//! the environment and does not exempt loopback on its own, so a runner that
-//! exports a proxy would otherwise send the mock's requests through it; the
-//! child gets the environment [`crate::common::embed_mock::hermetic`] gives
-//! the CLI tests, which a test cannot set on its own process while others
-//! run beside it.
+//! [`crate::run_in_hermetic_child`]. The child gets the environment
+//! [`crate::common::embed_mock::hermetic`] gives the CLI tests (no API key
+//! from the runner, an empty `FASTEMBED_CACHE_DIR`, no proxy variables),
+//! which a test cannot set on its own process while others run beside it.
+//! The loopback proxy bypass itself (AW-13) is pinned by the
+//! `openai_compatible_proxy` integration test.
 
 mod common;
 

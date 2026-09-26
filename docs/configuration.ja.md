@@ -239,7 +239,7 @@ bind = "127.0.0.1:3100"
 | `model` | FastEmbed: `"bge-small-en-v1.5"`, `"bge-m3"`。openai-compatible: endpoint が受け付ける任意の alias | なし | FastEmbed: トップレベルの `model` と同じく model を選ぶ。openai-compatible: 両 role 共通の alias。 |
 | `query_model` | 任意の alias (openai-compatible 専用) | なし | クエリについて `model` より優先。 |
 | `document_model` | 任意の alias (openai-compatible 専用) | なし | document のチャンクについて `model` より優先。 |
-| `endpoint` | embeddings endpoint の完全な `http` / `https` URL。認証情報は含めない (openai-compatible 専用) | なし | openai-compatible では必須。 |
+| `endpoint` | embeddings endpoint の完全な `http` / `https` URL。認証情報は含めない (openai-compatible 専用) | なし | openai-compatible では必須。loopback の endpoint (127.0.0.0/8、`::1`、`localhost`) には常に直接接続する。それ以外の endpoint は `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` に従い、Windows と macOS では OS のプロキシ設定にも従う。 |
 | `dimension` | 0 より大きい整数 (openai-compatible 専用) | なし | openai-compatible では必須。 |
 | `request_dimensions` | `true`, `false` (openai-compatible 専用) | `false` | `true` なら任意の `dimensions` 欄をリクエストに付ける。 |
 | `api_key` | 文字列 (openai-compatible 専用) | なし | bearer token として送る。`GROOVE_EMBEDDING_API_KEY` が優先。 |
