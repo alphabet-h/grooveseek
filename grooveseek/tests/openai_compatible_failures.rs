@@ -15,8 +15,8 @@ use common::embed_cli::{
     BODY_SENTINEL, DIM, REJECT_MARKER, files, fixture, note, rejects_marker, reply, stderr_of,
 };
 use common::embed_mock::{
-    DOC_MODEL, EmbedMock, MockReply, QUERY_MODEL, assert_dir_empty, default_response, hermetic,
-    wait_until,
+    DOC_MODEL, EmbedMock, Framing, MockReply, MockResponse, QUERY_MODEL, Recorded,
+    assert_dir_empty, default_response, hermetic, wait_until,
 };
 use common::mcp::{mcp_initialize, mcp_tool_call, spawn_serve_with};
 
@@ -1225,4 +1225,309 @@ fn index_gives_up_on_a_long_retry_after_without_reading_a_stalled_body() {
     assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
     assert!(!stderr.contains(BODY_SENTINEL), "{stderr}");
     assert_dir_empty(&fx.cache);
+}
+
+/// Send one embedding request to `mock` over raw TCP and return the whole
+/// answer, head and body as they were written.
+fn raw_answer(mock: &EmbedMock) -> String {
+    let mut stream = TcpStream::connect(mock.addr()).expect("connect");
+    let body = r#"{"model":"m","input":["x"]}"#;
+    write!(
+        stream,
+        "POST /v1/embeddings HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n\r\n{body}",
+        mock.addr(),
+        body.len()
+    )
+    .expect("write request");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).expect("read answer");
+    answer
+}
+
+/// The mock frames a body as one chunk and the last chunk, or under the
+/// `Content-Length` it was told, as [`MockReply::framing`] says (AW-11).
+///
+/// Red if `serve_one` ignores [`MockReply::framing`].
+#[test]
+fn embed_mock_writes_a_chunked_body_and_a_declared_content_length() {
+    let payload = String::from_utf8(reply(200, &[]).response.body).expect("UTF-8 payload");
+
+    let chunked = EmbedMock::with_reply_responder(|_| {
+        let mut chunked = reply(200, &[]);
+        chunked.framing = Framing::Chunked;
+        chunked
+    });
+    let answer = raw_answer(&chunked);
+    let (head, body) = answer.split_once("\r\n\r\n").expect("head and body");
+    assert!(
+        head.contains("\r\nTransfer-Encoding: chunked\r\n"),
+        "{answer}"
+    );
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "{answer}"
+    );
+    assert_eq!(
+        body,
+        format!("{:x}\r\n{payload}\r\n0\r\n\r\n", payload.len()),
+        "{answer}"
+    );
+
+    let declared = EmbedMock::with_reply_responder(|_| {
+        let mut declared = reply(200, &[]);
+        declared.framing = Framing::Declared(12345);
+        declared
+    });
+    let answer = raw_answer(&declared);
+    let (head, body) = answer.split_once("\r\n\r\n").expect("head and body");
+    assert!(head.contains("\r\nContent-Length: 12345\r\n"), "{answer}");
+    assert_eq!(body, payload, "{answer}");
+}
+
+/// [`default_response`] for `req`, framed as `framing`.
+fn framed_default(req: &Recorded, framing: Framing) -> MockReply {
+    let mut framed = MockReply::plain(default_response(req, DIM));
+    framed.framing = framing;
+    framed
+}
+
+const CAP_EXCEEDED: &str = "embedding endpoint answered with more than";
+
+/// AW-11: a 2xx whose `Content-Length` is over the cap is refused before a
+/// byte of it is read, and the run stops: the same inputs would bring the
+/// same answer again, so it is not retried. The mock holds the connection
+/// after its short body (for up to 10 s), so a client that started reading
+/// would still be waiting.
+///
+/// Red if the `Content-Length` check is dropped (the run waits on the stalled
+/// body and fails on it instead), or if the refusal is made retryable (four
+/// requests).
+#[test]
+fn index_stops_without_reading_a_2xx_whose_content_length_exceeds_the_cap() {
+    let notes = one_note();
+    let fx = fixture("groove-aw11-declared", &files(&notes), "");
+    fx.answer_with(|req| {
+        let mut huge = framed_default(req, Framing::Declared(1 << 30));
+        huge.stall_body = true;
+        huge
+    });
+    let started = Instant::now();
+    let out = fx.run_index();
+    let took = started.elapsed();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains(CAP_EXCEEDED), "{stderr}");
+    assert!(stderr.contains("check [embedding].dimension"), "{stderr}");
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// AW-11: a chunked 2xx, which names no length, is read only up to the cap.
+/// The answer here is valid JSON padded with 1 MiB of whitespace, so only the
+/// cap can refuse it.
+///
+/// Red if the read is not bounded (the padded answer parses and the run
+/// succeeds).
+#[test]
+fn index_stops_on_a_chunked_2xx_larger_than_the_cap() {
+    let notes = one_note();
+    let fx = fixture("groove-aw11-chunked-big", &files(&notes), "");
+    fx.answer_with(|req| {
+        let mut padded = framed_default(req, Framing::Chunked);
+        let body = std::mem::take(&mut padded.response.body);
+        assert_eq!(body.first(), Some(&b'{'), "a JSON object");
+        padded.response.body = [b"{".as_slice(), &vec![b' '; 1 << 20], &body[1..]].concat();
+        padded
+    });
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains(CAP_EXCEEDED), "{stderr}");
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// AW-11: a chunked 2xx within the cap is an ordinary answer. A body without
+/// a `Content-Length` is not refused for that alone.
+///
+/// Red if a missing `Content-Length` is treated as a refusal.
+#[test]
+fn index_accepts_a_chunked_2xx_within_the_cap() {
+    let notes = three_notes();
+    let fx = fixture("groove-aw11-chunked-ok", &files(&notes), "");
+    fx.answer_with(|req| framed_default(req, Framing::Chunked));
+    fx.index();
+    assert!(fx.chunks() > 0, "nothing was indexed");
+    assert_dir_empty(&fx.cache);
+}
+
+/// AW-11: a non-2xx is read only as far as its snippet shows. A 503 whose
+/// long body then stalls is reported (the snippet's 512 bytes and `...`) at
+/// once, not after the mock gives up holding it (10 s).
+///
+/// Red if a non-2xx body is read whole: the run waits on the stalled body, and
+/// the body read then fails, leaving the snippet empty.
+#[test]
+fn index_retries_a_503_without_waiting_for_the_rest_of_a_long_stalled_body() {
+    let notes = one_note();
+    let fx = fixture("groove-aw11-503-long", &files(&notes), "max_retries = 0\n");
+    fx.answer_with(|_| {
+        let mut long = MockReply::plain(MockResponse {
+            status: 503,
+            body: vec![b'x'; 2048],
+        });
+        long.stall_body = true;
+        long
+    });
+    let started = Instant::now();
+    let out = fx.run_index();
+    let took = started.elapsed();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("HTTP 503: {}...", "x".repeat(512))),
+        "{stderr}"
+    );
+    assert_eq!(fx.mock.requests().len(), 1, "{stderr}");
+    assert!(took < Duration::from_secs(5), "waited {took:?}: {stderr}");
+    assert_dir_empty(&fx.cache);
+}
+
+/// AW-11: a 2xx whose body stalls is still retried (ADR-0025, "2xx whose
+/// body times out"), now that the body is read a chunk at a time and a
+/// timed-out read arrives as an `io::Error`.
+///
+/// Red if that `io::Error` is not recognised as a timeout: the failure is
+/// then fatal and only one request is sent.
+#[test]
+fn index_retries_a_2xx_whose_body_stalls() {
+    let notes = one_note();
+    let fx = fixture("groove-aw11-2xx-stall", &files(&notes), "max_retries = 1\n");
+    // A one-second request timeout, so the stalled body fails fast.
+    let config = std::fs::read_to_string(&fx.config).expect("read groove.toml");
+    assert!(config.contains("timeout_seconds = 15\n"), "{config}");
+    std::fs::write(
+        &fx.config,
+        config.replace("timeout_seconds = 15\n", "timeout_seconds = 1\n"),
+    )
+    .expect("write groove.toml");
+    fx.answer_with(|req| {
+        let mut stalled = framed_default(req, Framing::Exact);
+        stalled.stall_body = true;
+        stalled
+    });
+    let out = fx.run_index();
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success(), "{stderr}");
+    assert_eq!(fx.mock.requests().len(), 2, "{stderr}");
+    assert!(
+        stderr.contains("still failing after 2 attempts (last: timed out)"),
+        "{stderr}"
+    );
+    assert_dir_empty(&fx.cache);
+}
+
+/// Notes that share words, so their bag-of-words vectors
+/// ([`common::embed_mock::embed_text`]) are close, plus one that shares none.
+fn harbour_notes() -> [(&'static str, String); 4] {
+    [
+        (
+            "harbour.md",
+            note("Harbour", "Harbour cranes lift ships at the harbour."),
+        ),
+        (
+            "cranes.md",
+            note("Cranes", "Harbour cranes and ships crowd the harbour."),
+        ),
+        (
+            "tides.md",
+            note("Tides", "Ships wait for tides before harbour cranes lift."),
+        ),
+        (
+            "bread.md",
+            note("Bread", "Sourdough needs a long cold proof to rise."),
+        ),
+    ]
+}
+
+/// [`default_response`] with each vector multiplied by a factor its input
+/// decides (2 to 14): the same directions at lengths that differ from input
+/// to input, as an endpoint that does not normalise returns them.
+fn scaled_response(req: &Recorded) -> MockReply {
+    let inputs = req.inputs();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&default_response(req, DIM).body).expect("default JSON");
+    for item in value["data"].as_array_mut().expect("data array") {
+        let index = item["index"].as_u64().expect("index") as usize;
+        let factor = 2.0 + 3.0 * (inputs[index].len() % 5) as f64;
+        for x in item["embedding"].as_array_mut().expect("embedding array") {
+            *x = serde_json::json!(x.as_f64().expect("number") * factor);
+        }
+    }
+    MockReply::plain(MockResponse::json(200, &value))
+}
+
+/// The same knowledge base indexed twice: once against unit vectors, once
+/// against the same vectors scaled.
+fn unit_and_scaled_fixtures(prefix: &str) -> [common::embed_cli::Fixture; 2] {
+    let notes = harbour_notes();
+    let unit = fixture(&format!("{prefix}-unit"), &files(&notes), "");
+    let scaled = fixture(&format!("{prefix}-scaled"), &files(&notes), "");
+    scaled.answer_with(scaled_response);
+    unit.index();
+    scaled.index();
+    [unit, scaled]
+}
+
+/// The paths of the nodes `groove graph --start harbour.md` finds, sorted.
+fn graph_paths(fx: &common::embed_cli::Fixture) -> Vec<String> {
+    let out = fx
+        .cmd()
+        .args(["graph", "--start", "harbour.md", "--kb-path"])
+        .arg(fx.kb())
+        .output()
+        .expect("spawn groove graph");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let graph: serde_json::Value = serde_json::from_slice(&out.stdout).expect("graph JSON");
+    let mut paths: Vec<String> = graph["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("graph JSON has no nodes array: {graph}"))
+        .iter()
+        .filter_map(|n| n["path"].as_str().map(str::to_owned))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// AW-12, the audit's own check: `groove graph` reads L2 distance as a cosine,
+/// which holds only between unit vectors. An endpoint returning the same
+/// directions at other lengths must give the same graph.
+///
+/// Red if the vectors are stored as the endpoint sent them: the scaled
+/// distances are too long, their cosines clamp to 0, and the nodes are lost.
+#[test]
+fn graph_finds_the_same_nodes_when_the_endpoint_returns_scaled_vectors() {
+    let [unit, scaled] = unit_and_scaled_fixtures("groove-aw12-graph");
+    let expected = graph_paths(&unit);
+    assert!(!expected.is_empty(), "the unit-vector graph found no nodes");
+    assert_eq!(graph_paths(&scaled), expected);
+    assert_dir_empty(&unit.cache);
+    assert_dir_empty(&scaled.cache);
+}
+
+/// AW-12: search ranks the same when the endpoint scales its vectors, the
+/// query's included.
+///
+/// Red if the vectors are stored as the endpoint sent them: the ranking then
+/// follows their lengths as much as their directions.
+#[test]
+fn search_orders_results_the_same_when_the_endpoint_returns_scaled_vectors() {
+    let [unit, scaled] = unit_and_scaled_fixtures("groove-aw12-search");
+    let query = "harbour cranes lift ships";
+    let expected = search_paths(&unit, query);
+    assert!(expected.len() > 1, "{expected:?}");
+    assert_eq!(search_paths(&scaled, query), expected);
+    assert_dir_empty(&unit.cache);
+    assert_dir_empty(&scaled.cache);
 }
