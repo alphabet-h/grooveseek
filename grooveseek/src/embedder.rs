@@ -1029,8 +1029,16 @@ fn body_read_failure(error: std::io::Error) -> BodyReadFailure {
 /// for one).
 fn transport_message(error: reqwest::Error) -> String {
     let error = error.without_url();
-    let mut message = error.to_string();
-    let mut source = std::error::Error::source(&error);
+    with_ascii_causes(error.to_string(), std::error::Error::source(&error))
+}
+
+/// `message` (a URL-free `reqwest` error's own text) followed by `source` and
+/// the causes under it, each through [`ascii_cause`], joined with `: `; a
+/// nested `reqwest::Error` ends the list ([`transport_message`]).
+fn with_ascii_causes(
+    mut message: String,
+    mut source: Option<&(dyn std::error::Error + 'static)>,
+) -> String {
     while let Some(cause) = source {
         if cause.is::<reqwest::Error>() {
             break;
@@ -3417,5 +3425,41 @@ mod tests {
         let text = ascii_cause(other.as_ref());
         assert!(text.is_ascii(), "{text}");
         assert!(text.contains("mismatch"), "{text}");
+    }
+
+    /// (local Codex round 2 on PR #332) The walk `transport_message` runs
+    /// writes every cause in ASCII, an OS error by its kind: the test above
+    /// checks one cause, this one the chain as the transport error builds it.
+    ///
+    /// Red if the walk appends a cause's `Display` instead of going through
+    /// `ascii_cause`.
+    #[test]
+    fn the_transport_cause_walk_writes_every_cause_in_ascii() {
+        #[derive(Debug)]
+        struct Connect(std::io::Error);
+        impl fmt::Display for Connect {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("tcp connect error")
+            }
+        }
+        impl std::error::Error for Connect {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let localized = "接続が拒否されました";
+        let connect = Connect(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            localized,
+        ));
+        let text = with_ascii_causes("error sending request".to_string(), Some(&connect));
+        assert!(text.is_ascii(), "{text}");
+        assert!(
+            text.starts_with("error sending request: tcp connect error: "),
+            "{text}"
+        );
+        assert!(text.contains("ConnectionRefused"), "{text}");
+        assert!(!text.contains(localized), "{text}");
     }
 }
