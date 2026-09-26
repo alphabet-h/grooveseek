@@ -1430,11 +1430,16 @@ fn index_retries_a_2xx_whose_body_stalls() {
 
 /// Notes that share words, so their bag-of-words vectors
 /// ([`common::embed_mock::embed_text`]) are close, plus one that shares none.
+/// `harbour.md` is the longest and says the query's words most often.
 fn harbour_notes() -> [(&'static str, String); 4] {
     [
         (
             "harbour.md",
-            note("Harbour", "Harbour cranes lift ships at the harbour."),
+            note(
+                "Harbour",
+                "Harbour cranes lift ships. Harbour cranes lift ships at the harbour. \
+                 Harbour cranes lift ships all day while the harbour cranes lift more ships.",
+            ),
         ),
         (
             "cranes.md",
@@ -1451,16 +1456,18 @@ fn harbour_notes() -> [(&'static str, String); 4] {
     ]
 }
 
-/// [`default_response`] with each vector multiplied by a factor its input
-/// decides (2 to 14): the same directions at lengths that differ from input
-/// to input, as an endpoint that does not normalise returns them.
+/// [`default_response`] with each vector multiplied by a factor that grows
+/// with its input's length (1 + bytes / 10): the same directions at lengths
+/// that differ from input to input, as an endpoint that does not normalise
+/// returns them. The long note in [`harbour_notes`] is the best match, and
+/// its vector the longest.
 fn scaled_response(req: &Recorded) -> MockReply {
     let inputs = req.inputs();
     let mut value: serde_json::Value =
         serde_json::from_slice(&default_response(req, DIM).body).expect("default JSON");
     for item in value["data"].as_array_mut().expect("data array") {
         let index = item["index"].as_u64().expect("index") as usize;
-        let factor = 2.0 + 3.0 * (inputs[index].len() % 5) as f64;
+        let factor = 1.0 + inputs[index].len() as f64 / 10.0;
         for x in item["embedding"].as_array_mut().expect("embedding array") {
             *x = serde_json::json!(x.as_f64().expect("number") * factor);
         }
