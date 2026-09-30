@@ -611,6 +611,20 @@ fn documents_to_delete(
         .collect()
 }
 
+/// (feature-60) The order the per-document loop in [`rebuild_index`] visits `entries`: those
+/// whose `rel` is in `first` (the renames that force a re-parse), then the rest, each group in
+/// the order `entries` already has -- the walk's, which sorts `PathBuf`s component by
+/// component. Split rather than re-sorted: sorting by the `rel` string would move `a-b/x.md`
+/// ahead of `a/b.md` and change the order of runs that have no rename at all. Putting the
+/// forced re-parses first bounds the stretch in which the loop does not stop for a cancel
+/// (it never stops before one of them) to their number.
+fn processing_order<'a>(entries: &'a [DiskEntry], first: &HashSet<String>) -> Vec<&'a DiskEntry> {
+    let (mut order, rest): (Vec<&DiskEntry>, Vec<&DiskEntry>) =
+        entries.iter().partition(|e| first.contains(&e.rel));
+    order.extend(rest);
+    order
+}
+
 /// (AW-04) Where [`IndexResult::all_inputs_rejected_message`] says the skipped
 /// files were named, for `groove index`.
 pub const REJECTIONS_NAMED_ABOVE: &str = "see the warnings above";
@@ -837,6 +851,12 @@ pub enum SingleResult {
 /// and hands the snapshot in here rather than letting this function read the file again after
 /// the fact. See [`load_declared_schema`]'s doc for why a second read, on a schema a caller has
 /// already validated, would only reopen the TOCTOU window `--force` closed (codex P1 round 1).
+///
+/// (v1.14.0+) A reporter carrying a [`progress::CancelToken`]
+/// ([`progress::ProgressReporter::with_cancel`]) can stop the run at a check point: after each
+/// scanned file, before the renames, before each document, and before the deletion sweep. The
+/// run then returns `Ok` with [`IndexResult::cancelled`] set; see [`progress::CancelToken`] for
+/// how late a stop can come and [`IndexResult::cancelled`] for the index it leaves.
 #[allow(clippy::too_many_arguments)] // D-10 で 8 個に。config struct 化は別 cycle
 pub fn rebuild_index(
     db: &Database,
@@ -1155,7 +1175,26 @@ pub fn rebuild_index(
     }
 
     // 2. Process each file
-    for entry in &disk_entries {
+    //
+    // (feature-60) Forced re-parses after a rename first, then the rest; see `processing_order`.
+    for entry in processing_order(&disk_entries, &renamed_new_paths) {
+        // (feature-60) Check point C3, before this document's embed starts. Not for a forced
+        // re-parse after a rename: the rename is already applied and the hash still matches,
+        // so a run stopped here would leave the next one to take the fast path and keep the
+        // old parser's title, tags and fields (or the old breadcrumb) until `--force`. Those
+        // documents come first, so this holds a cancel back by at most
+        // `renamed_new_paths.len()` documents.
+        if !renamed_new_paths.contains(&entry.rel) && progress.is_cancelled() {
+            return stop_cancelled_run(
+                db,
+                embedder,
+                progress,
+                pass_to_close,
+                tally,
+                Some(embedded_since),
+                start,
+            );
+        }
         visited_paths.insert(entry.rel.clone());
 
         // rename された entry (Static モードのみ) は force=true で再 parse/embed
@@ -1270,6 +1309,22 @@ pub fn rebuild_index(
                 progress.report_unchanged(&entry.rel);
             }
         }
+    }
+
+    // (feature-60) Check point C4: every document is done; the summary lines, the deletion
+    // sweep and the generation keys are not. C3 looks before a document, so a token set from
+    // the callback of the last document's event is seen only here. Past this point a cancel
+    // is too late: the sweep and the keys run to the end and the run reports `Finished`.
+    if progress.is_cancelled() {
+        return stop_cancelled_run(
+            db,
+            embedder,
+            progress,
+            pass_to_close,
+            tally,
+            Some(embedded_since),
+            start,
+        );
     }
 
     if refreshed > 0 {
@@ -4359,6 +4414,39 @@ mod tests {
         let rels: Vec<&str> = full.entries.iter().map(|e| e.rel.as_str()).collect();
         assert_eq!(rels, ["a.md", "b.md", "c.md"]);
         assert_eq!(full.skipped, vec!["0-gone.md".to_string()]);
+    }
+
+    /// (feature-60) Review Focus 1. The loop visits the forced re-parses first and the rest
+    /// after, each group in the order the entries already have -- the walk's, which sorts
+    /// `PathBuf`s component by component. That order puts `a/b.md` before `a-b/x.md`,
+    /// although the string `"a-b/x.md"` sorts first; sorting by `rel` would reorder a run
+    /// that has no rename at all.
+    #[test]
+    fn processing_order_puts_forced_reparses_first_and_keeps_the_walk_order_in_each_group() {
+        fn rels<'a>(order: &[&'a DiskEntry]) -> Vec<&'a str> {
+            order.iter().map(|e| e.rel.as_str()).collect()
+        }
+        let entries = vec![
+            mk_entry("a/b.md", "h1"),
+            mk_entry("a-b/x.md", "h2"),
+            mk_entry("c.md", "h3"),
+            mk_entry("d.md", "h4"),
+        ];
+
+        assert_eq!(
+            rels(&processing_order(&entries, &HashSet::new())),
+            ["a/b.md", "a-b/x.md", "c.md", "d.md"],
+            "no forced re-parse: the walk order, untouched"
+        );
+
+        let first: HashSet<String> = ["d.md".to_string(), "a-b/x.md".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            rels(&processing_order(&entries, &first)),
+            ["a-b/x.md", "d.md", "a/b.md", "c.md"],
+            "forced re-parses first, then the rest, each in the walk order"
+        );
     }
 
     /// The other half of the same wiring: a plain file still reads, so the test

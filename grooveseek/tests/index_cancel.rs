@@ -477,3 +477,324 @@ fn cancel_mid_scan_counts_the_files_it_declined_as_skipped() {
         vec![Ev::Started(2), Ev::Scanning(1, 2), Ev::Cancelled(0, 2)]
     );
 }
+
+/// Criterion 6 (C3): a token set from the first document's event stops the
+/// run before the second document's embed starts. The first document is
+/// committed, and the next run finds it unchanged and does not embed it
+/// again. A stopped run records no frontmatter policy; the completing run
+/// does.
+#[test]
+fn cancel_after_a_document_keeps_it_and_the_next_run_skips_it() {
+    if run_in_hermetic_child("cancel_after_a_document_keeps_it_and_the_next_run_skips_it") {
+        return;
+    }
+    let fx = Fixture::new("groove-f60-c3");
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout.write("c.md", &doc("Gamma", "gamma body text"));
+
+    let (result, events) = fx.run_cancelling(
+        false,
+        Box::new(|ev| matches!(ev, Ev::Indexed(rel, _, _) if rel == "a.md")),
+    );
+    let result = result.expect("a stopped run returns Ok");
+    assert!(result.cancelled, "{result:?}");
+    assert_eq!(result.updated, 1, "{result:?}");
+    let mut expected = vec![Ev::Started(3)];
+    expected.extend(scanning(3));
+    expected.extend([indexed("a.md", 1, 3), Ev::Cancelled(1, 3)]);
+    assert_eq!(events, expected);
+    assert_eq!(fx.paths(), ["a.md"]);
+    assert_eq!(
+        fx.db().read_frontmatter_policy().expect("policy"),
+        None,
+        "a stopped run must not record the frontmatter policy"
+    );
+
+    let requests_before = fx.requests();
+    let (result, events) = fx.run(false);
+    let result = result.expect("the next run");
+    assert!(!result.cancelled, "{result:?}");
+    assert_eq!(result.updated, 2, "{result:?}");
+    let mut expected = vec![Ev::Started(3)];
+    expected.extend(scanning(3));
+    expected.extend([
+        unchanged("a.md", 1, 3),
+        indexed("b.md", 2, 3),
+        indexed("c.md", 3, 3),
+        Ev::Finished,
+    ]);
+    assert_eq!(events, expected);
+    assert!(
+        fx.mock.requests()[requests_before..].iter().all(|req| req
+            .inputs()
+            .iter()
+            .all(|input| !input.contains("alpha body text"))),
+        "a.md was committed by the stopped run and must not be embedded again"
+    );
+    assert!(
+        fx.db().read_frontmatter_policy().expect("policy").is_some(),
+        "the completed run records the policy"
+    );
+}
+
+/// Criterion 7 (C4): a token set from the last document's event is seen after
+/// the loop, before the deletion sweep. The vanished file's row stays, no
+/// generation key is written, and the pass this run opened for the new schema
+/// is closed. The next run sweeps, records the declared set and finishes.
+#[test]
+fn cancel_after_the_last_document_leaves_deleted_rows_and_generation_keys() {
+    if run_in_hermetic_child(
+        "cancel_after_the_last_document_leaves_deleted_rows_and_generation_keys",
+    ) {
+        return;
+    }
+    let fx = Fixture::new("groove-f60-c4");
+    fx.layout.write(
+        "a.md",
+        "---\ntitle: Alpha\nstatus: active\n---\n\n## Alpha\n\nalpha body text\n",
+    );
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout.write("gone.md", &doc("Gone", "gone body text"));
+    fx.run(false).0.expect("first run");
+    let policy_before = fx.db().read_frontmatter_policy().expect("policy");
+    assert!(policy_before.is_some(), "the first run completed");
+    assert_eq!(
+        fx.db().read_declared_fields().expect("declared").as_deref(),
+        Some("[]")
+    );
+
+    std::fs::remove_file(fx.layout.kb().join("gone.md")).expect("remove gone.md");
+    // A schema change makes this run open a declared-field pass, which clears
+    // the generation key before the loop.
+    fx.layout.write(
+        "groove-schema.toml",
+        "[fields.status]\nenum = [\"active\", \"deprecated\"]\n",
+    );
+
+    let (result, events) = fx.run_cancelling(
+        false,
+        Box::new(|ev| {
+            matches!(ev, Ev::Indexed(_, done, total) | Ev::Unchanged(_, done, total) if done == total)
+        }),
+    );
+    let result = result.expect("a stopped run returns Ok");
+    assert!(result.cancelled, "{result:?}");
+    assert_eq!(result.deleted, 0, "{result:?}");
+    let mut expected = vec![Ev::Started(2)];
+    expected.extend(scanning(2));
+    expected.extend([
+        unchanged("a.md", 1, 2),
+        unchanged("b.md", 2, 2),
+        Ev::Cancelled(2, 2),
+    ]);
+    assert_eq!(events, expected, "no Deleted before Cancelled");
+    assert_eq!(
+        fx.paths(),
+        ["a.md", "b.md", "gone.md"],
+        "the vanished file's row waits for a completed run"
+    );
+    let db = fx.db();
+    assert_eq!(
+        db.read_frontmatter_policy().expect("policy"),
+        policy_before,
+        "the policy key is left as it was"
+    );
+    assert_eq!(
+        db.read_declared_fields().expect("declared"),
+        None,
+        "the pass cleared the key and a stopped run does not record it"
+    );
+    assert_eq!(
+        db.read_declared_fields_pass().expect("pass"),
+        None,
+        "a stopped run leaves no pass token of its own"
+    );
+    drop(db);
+
+    let (result, events) = fx.run(false);
+    let result = result.expect("the next run");
+    assert_eq!(result.deleted, 1, "{result:?}");
+    assert!(
+        events.contains(&Ev::Deleted("gone.md".to_string())),
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&Ev::Finished), "{events:?}");
+    let db = fx.db();
+    assert_eq!(
+        db.read_declared_fields().expect("declared").as_deref(),
+        Some("[\"status\"]")
+    );
+    assert_eq!(db.read_declared_fields_pass().expect("pass"), None);
+}
+
+/// Criterion 9: once the deletion sweep has begun a token is too late. The
+/// run completes, reports `Finished`, and returns with `cancelled == false`.
+#[test]
+fn cancel_during_the_deletion_sweep_is_too_late_and_the_run_finishes() {
+    if run_in_hermetic_child("cancel_during_the_deletion_sweep_is_too_late_and_the_run_finishes") {
+        return;
+    }
+    let fx = Fixture::new("groove-f60-late");
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout.write("c.md", &doc("Gamma", "gamma body text"));
+    fx.run(false).0.expect("first run");
+    let kb = fx.layout.kb();
+    std::fs::remove_file(kb.join("b.md")).expect("remove b.md");
+    std::fs::remove_file(kb.join("c.md")).expect("remove c.md");
+
+    let (result, events) = fx.run_cancelling(false, Box::new(|ev| matches!(ev, Ev::Deleted(_))));
+    let result = result.expect("the run");
+    assert!(!result.cancelled, "{result:?}");
+    assert_eq!(result.deleted, 2, "{result:?}");
+    assert_eq!(
+        events,
+        vec![
+            Ev::Started(1),
+            Ev::Scanning(1, 1),
+            unchanged("a.md", 1, 1),
+            Ev::Deleted("b.md".to_string()),
+            Ev::Deleted("c.md".to_string()),
+            Ev::Finished,
+        ]
+    );
+    assert_eq!(fx.paths(), ["a.md"]);
+}
+
+/// Criterion 13, first half: a `force` run stopped after its first document
+/// leaves only that document in the index (the reset came before it), and
+/// the incremental run after it adds the rest as `Indexed`.
+#[test]
+fn cancel_mid_force_keeps_committed_documents_and_an_incremental_run_completes() {
+    if run_in_hermetic_child(
+        "cancel_mid_force_keeps_committed_documents_and_an_incremental_run_completes",
+    ) {
+        return;
+    }
+    let fx = Fixture::new("groove-f60-force");
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.layout.write("c.md", &doc("Gamma", "gamma body text"));
+    fx.run(false).0.expect("first run");
+
+    let (result, events) = fx.run_cancelling(
+        true,
+        Box::new(|ev| matches!(ev, Ev::Indexed(rel, _, _) if rel == "a.md")),
+    );
+    let result = result.expect("a stopped run returns Ok");
+    assert!(result.cancelled, "{result:?}");
+    let mut expected = vec![Ev::Started(3)];
+    expected.extend(scanning(3));
+    expected.extend([indexed("a.md", 1, 3), Ev::Cancelled(1, 3)]);
+    assert_eq!(events, expected);
+    assert_eq!(
+        fx.paths(),
+        ["a.md"],
+        "only what was committed before the stop"
+    );
+
+    let (result, events) = fx.run(false);
+    let result = result.expect("the incremental run");
+    assert!(!result.cancelled, "{result:?}");
+    let mut expected = vec![Ev::Started(3)];
+    expected.extend(scanning(3));
+    expected.extend([
+        unchanged("a.md", 1, 3),
+        indexed("b.md", 2, 3),
+        indexed("c.md", 3, 3),
+        Ev::Finished,
+    ]);
+    assert_eq!(events, expected);
+    assert_eq!(fx.paths(), ["a.md", "b.md", "c.md"]);
+}
+
+/// Criterion 13, second half: with no schema, a stopped `force` run still
+/// closes the pass it opened, so the next incremental run -- which opens no
+/// pass of its own -- records the empty declared set and the index recovers
+/// without another `--force`.
+#[test]
+fn cancel_mid_force_without_a_schema_leaves_no_pass_token() {
+    if run_in_hermetic_child("cancel_mid_force_without_a_schema_leaves_no_pass_token") {
+        return;
+    }
+    let fx = Fixture::new("groove-f60-force-noschema");
+    fx.layout.write("a.md", &doc("Alpha", "alpha body text"));
+    fx.layout.write("b.md", &doc("Beta", "beta body text"));
+    fx.run(false).0.expect("first run");
+
+    let (result, _events) = fx.run_cancelling(
+        true,
+        Box::new(|ev| matches!(ev, Ev::Indexed(rel, _, _) if rel == "a.md")),
+    );
+    assert!(result.expect("a stopped run returns Ok").cancelled);
+    let db = fx.db();
+    assert_eq!(
+        db.read_declared_fields_pass().expect("pass"),
+        None,
+        "the stopped run must close its own pass"
+    );
+    assert_eq!(db.read_declared_fields().expect("declared"), None);
+    drop(db);
+
+    let (result, events) = fx.run(false);
+    assert!(!result.expect("the incremental run").cancelled);
+    assert_eq!(events.last(), Some(&Ev::Finished), "{events:?}");
+    let db = fx.db();
+    assert_eq!(
+        db.read_declared_fields().expect("declared").as_deref(),
+        Some("[]"),
+        "the incremental run records the empty declared set"
+    );
+    assert_eq!(db.read_declared_fields_pass().expect("pass"), None);
+}
+
+/// Criterion 15: a `.txt` to `.md` rename forces a re-parse under the `.md`
+/// parser. A token set from `Renamed` does not stop the run before that
+/// re-parse: the renamed document comes first -- ahead of `a-new.md`, which
+/// the walk puts before it -- is re-parsed as `Indexed`, and only then does
+/// the run stop, leaving the new document for the next run.
+#[test]
+fn cancel_after_a_cross_parser_rename_reparses_it_first() {
+    if run_in_hermetic_child("cancel_after_a_cross_parser_rename_reparses_it_first") {
+        return;
+    }
+    let fx = Fixture::with_extra_config(
+        "groove-f60-xparser",
+        "[parsers]\nenabled = [\"md\", \"txt\"]\n",
+    );
+    fx.layout.write("note.txt", &doc("Note", "note body text"));
+    fx.run(false).0.expect("first run");
+    let kb = fx.layout.kb();
+    std::fs::rename(kb.join("note.txt"), kb.join("note.md")).expect("rename note.txt");
+    fx.layout.write("a-new.md", &doc("New", "new body text"));
+
+    let (result, events) = fx.run_cancelling(false, Box::new(|ev| matches!(ev, Ev::Renamed(..))));
+    let result = result.expect("a stopped run returns Ok");
+    assert!(result.cancelled, "{result:?}");
+    assert_eq!((result.renamed, result.updated), (1, 1), "{result:?}");
+    let mut expected = vec![Ev::Started(2)];
+    expected.extend(scanning(2));
+    expected.extend([
+        Ev::Renamed("note.txt".to_string(), "note.md".to_string()),
+        indexed("note.md", 1, 2),
+        Ev::Cancelled(1, 2),
+    ]);
+    assert_eq!(events, expected);
+    assert_eq!(
+        fx.paths(),
+        ["note.md"],
+        "the new document was not processed"
+    );
+
+    let (result, events) = fx.run(false);
+    assert!(!result.expect("the next run").cancelled);
+    let mut expected = vec![Ev::Started(2)];
+    expected.extend(scanning(2));
+    expected.extend([
+        indexed("a-new.md", 1, 2),
+        unchanged("note.md", 2, 2),
+        Ev::Finished,
+    ]);
+    assert_eq!(events, expected, "no rename this time, so the walk order");
+}
